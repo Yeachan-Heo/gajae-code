@@ -205,6 +205,45 @@ describe("model selector profiles", () => {
 		expect(rendered).not.toContain("Codex Eco");
 		expect(rendered).not.toContain("profile-a");
 	});
+
+	test("landing header shows the session's current preset, model, and role assignments", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {}, {
+			currentModel: defaultModel,
+			currentThinkingLevel: ThinkingLevel.High,
+			activeModelProfile: "profile-a",
+			settings: Settings.isolated({
+				"task.agentModelOverrides": { executor: "provider-a/alternate" },
+			}),
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Current: preset Profile Alpha · provider-a/default (high)");
+		expect(rendered).toContain("DEFAULT: provider-a/default (high)");
+		expect(rendered).toContain("EXECUTOR: provider-a/alternate");
+		expect(rendered).toContain("(current)");
+	});
+
+	test("enter toggles a usable provider group's expansion", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("CODEX");
+		expect(rendered).not.toContain("Codex Eco");
+
+		selector.handleInput("\r");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Codex Eco");
+
+		selector.handleInput("\r");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).not.toContain("Codex Eco");
+	});
 	test("preset search keeps first typed character before subsequent input", async () => {
 		installTestTheme();
 		const selector = createSelector(() => {});

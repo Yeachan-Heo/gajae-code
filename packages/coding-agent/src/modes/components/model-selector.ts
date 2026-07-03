@@ -1030,11 +1030,51 @@ export class ModelSelectorComponent extends Container {
 		this.#filterModels(this.#searchInput.getValue());
 	}
 
+	/**
+	 * "What is this session running right now" summary for the preset landing
+	 * header: active preset (when one is applied), the effective current model
+	 * and thinking level, and one line per assigned role (default, executor,
+	 * planner, critic, architect).
+	 */
+	#formatCurrentSessionLines(): string[] {
+		const lines: string[] = [];
+		const parts: string[] = [];
+		if (this.#activeModelProfile) {
+			const profile = this.#getProfileByName(this.#activeModelProfile);
+			const displayName = profile ? getModelProfilePresentation(profile).displayName : this.#activeModelProfile;
+			parts.push(`preset ${theme.fg("accent", displayName)}`);
+		}
+		if (this.#currentModel) {
+			parts.push(this.#formatAssignedModelLabel(this.#currentModel, this.#currentThinkingLevel));
+		}
+		if (parts.length > 0) lines.push(theme.fg("muted", `Current: ${parts.join(" · ")}`));
+		for (const role of PROFILE_ROLE_PREVIEW_ORDER) {
+			const assigned = this.#roles[role];
+			if (!assigned) continue;
+			const label = GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase();
+			lines.push(
+				theme.fg("dim", `  ${label}: ${this.#formatAssignedModelLabel(assigned.model, assigned.thinkingLevel)}`),
+			);
+		}
+		return lines;
+	}
+
+	#formatAssignedModelLabel(model: Model, thinkingLevel: ThinkingLevel | undefined): string {
+		let label = `${model.provider}/${model.id}`;
+		if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+			label += ` (${getThinkingLevelMetadata(thinkingLevel).label})`;
+		}
+		return label;
+	}
+
 	#renderPresetLanding(): void {
 		this.#headerContainer.clear();
 		this.#tabBar = null;
 		this.#listContainer.clear();
 		this.#headerContainer.addChild(new Text(theme.fg("accent", "Model presets"), 0, 0));
+		for (const line of this.#formatCurrentSessionLines()) {
+			this.#headerContainer.addChild(new Text(line, 0, 0));
+		}
 		const rows = this.#getPresetRows();
 		for (let i = 0; i < rows.length; i++) {
 			const row = rows[i];
@@ -1065,17 +1105,23 @@ export class ModelSelectorComponent extends Container {
 			if (row.kind === "group") {
 				const authenticated = this.#isPresetGroupUsable(row.profiles);
 				const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+				const containsActive =
+					this.#activeModelProfile !== undefined &&
+					row.profiles.some(profile => profile.name === this.#activeModelProfile);
 				const label = `${mark} ${row.groupId}`;
 				const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
-				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
+				const activeSuffix = containsActive ? theme.fg("muted", " (current)") : "";
+				this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}${activeSuffix}`, 0, 0));
 				continue;
 			}
 			const presentation = getModelProfilePresentation(row.profile);
 			const authenticated = this.#isPresetAuthenticated(row.profile);
 			const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+			const isActive = row.profile.name === this.#activeModelProfile;
 			const label = `  ${mark} ${presentation.displayName}`;
 			const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
-			this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}`, 0, 0));
+			const activeSuffix = isActive ? theme.fg("muted", " (current)") : "";
+			this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}${activeSuffix}`, 0, 0));
 		}
 		if (this.#presetLoginHint) {
 			this.#listContainer.addChild(new Spacer(1));
@@ -1538,7 +1584,17 @@ export class ModelSelectorComponent extends Container {
 				const missing = this.#getMissingProviders(row.profiles);
 				this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
 				this.#renderPresetLanding();
+				return;
 			}
+			// Enter toggles a usable group's expansion so drilling into presets
+			// works without reaching for the arrow keys (right/left still work).
+			if (this.#expandedPresetProviderId === row.groupId) {
+				this.#collapseSelectedPresetProvider();
+			} else {
+				this.#expandSelectedPresetProvider();
+			}
+			this.#presetLoginHint = undefined;
+			this.#renderPresetLanding();
 			return;
 		}
 		const missing = this.#getMissingProviders(row.profile);
