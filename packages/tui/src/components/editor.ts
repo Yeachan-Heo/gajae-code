@@ -1505,10 +1505,34 @@ export class Editor implements Component, Focusable {
 					}
 
 					if (hasCursorInChunk) {
+						let displayChunkText = chunk.text;
+						let displayCursorPos = adjustedCursorPos;
+						if (displayCursorPos > displayChunkText.length) {
+							let hiddenWhitespaceWidth = displayCursorPos - displayChunkText.length;
+							const displayChunkWidth = visibleWidth(displayChunkText);
+							if (displayChunkWidth + hiddenWhitespaceWidth <= contentWidth) {
+								displayChunkText += padding(hiddenWhitespaceWidth);
+							} else {
+								layoutLines.push({
+									text: displayChunkText,
+									hasCursor: false,
+								});
+								hiddenWhitespaceWidth -= Math.max(0, contentWidth - displayChunkWidth);
+								while (hiddenWhitespaceWidth > contentWidth) {
+									layoutLines.push({
+										text: padding(contentWidth),
+										hasCursor: false,
+									});
+									hiddenWhitespaceWidth -= contentWidth;
+								}
+								displayChunkText = padding(hiddenWhitespaceWidth);
+								displayCursorPos = hiddenWhitespaceWidth;
+							}
+						}
 						layoutLines.push({
-							text: chunk.text,
+							text: displayChunkText,
 							hasCursor: true,
-							cursorPos: adjustedCursorPos,
+							cursorPos: displayCursorPos,
 						});
 					} else {
 						layoutLines.push({

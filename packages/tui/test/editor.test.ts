@@ -419,6 +419,36 @@ describe("Editor component", () => {
 			expect(narrow).toBeGreaterThan(wide);
 		});
 
+		it("renders cursor movement immediately after a trailing space on wrapped input", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setBorderVisible(false);
+			editor.setPaddingX(0);
+			editor.focused = true;
+
+			for (const char of "aaaaaaaaaa") editor.handleInput(char);
+			const beforeSpace = editor.render(10).map(line => stripVTControlCharacters(line));
+
+			editor.handleInput(" ");
+			const afterSpace = editor.render(10);
+			const afterSpacePlain = afterSpace.map(line => stripVTControlCharacters(line));
+
+			expect(editor.getText()).toBe("aaaaaaaaaa ");
+			expect(beforeSpace).toHaveLength(1);
+			expect(afterSpace).toHaveLength(2);
+			expect(afterSpacePlain[0]).toBe("aaaaaaaaaa");
+			expect(afterSpace[1]).toContain("\x1b[5m|\x1b[0m");
+
+			editor.handleInput("bbb");
+			const beforeWrappedSpace = editor.render(10);
+
+			editor.handleInput(" ");
+			const afterWrappedSpace = editor.render(10);
+
+			expect(editor.getText()).toBe("aaaaaaaaaa bbb ");
+			expect(beforeWrappedSpace[1]).toContain("bbb\x1b_pi:c\u0007\x1b[5m|\x1b[0m");
+			expect(afterWrappedSpace[1]).toContain("bbb \x1b_pi:c\u0007\x1b[5m|\x1b[0m");
+		});
+
 		it("recomputes layout after synchronous autocomplete replacement", () => {
 			const editor = new Editor(defaultEditorTheme);
 			editor.setBorderVisible(false);
