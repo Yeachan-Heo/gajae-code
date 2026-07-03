@@ -5,6 +5,7 @@
 ### Added
 
 - `gjc mcp import <claude|codex|opencode|cursor|all>` copies MCP server definitions from another host's config into GJC's own config as a single collision-safe, dry-run-capable migration routed through the migrate planner (adding a cursor migrate adapter and an `only` filter to `runMigrate`). Importing never inherits live runtime and never reads secret-indirection fields, and a README subsection documents the workflow.
+- Adds MCP autoload and connect management surfaces: `gjc mcp autoload <name> on|off` toggles whether a configured server connects at session startup, `/mcp connect|disconnect|autoload` are handled in both the interactive TUI controller and the ACP slash-command handlers, and `gjc mcp list` now reports configured/connected/autoload state per server. This completes the on-demand connect workflow that the import command's help and README point to.
 
 ### Fixed
 

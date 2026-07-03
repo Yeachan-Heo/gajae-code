@@ -7,11 +7,17 @@
  * once written, GJC owns runtime execution, auth, and lifecycle.
  */
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
-import { getMCPServer, readMCPConfigFile, removeMCPServer, upsertMCPServer } from "../runtime-mcp/config-writer";
+import {
+	getMCPServer,
+	readMCPConfigFile,
+	removeMCPServer,
+	setServerAutoload,
+	upsertMCPServer,
+} from "../runtime-mcp/config-writer";
 import type { MCPConfigFile, MCPServerConfig } from "../runtime-mcp/types";
 import { runMigrateCommand } from "./migrate-cli";
 
-export type MCPAction = "add" | "list" | "remove" | "import";
+export type MCPAction = "add" | "list" | "remove" | "autoload" | "import";
 
 /** Friendly aliases for `gjc mcp import <source>`. */
 const IMPORT_SOURCE_ALIASES: Record<string, string> = {
@@ -185,11 +191,12 @@ function writeJson(value: unknown): void {
 
 function renderServerLine(entry: RedactedServerEntry): string {
 	const config = entry.config;
+	const autoload = config.autoload === false ? "\tautoload:off" : "";
 	if (config.type === "http" || config.type === "sse") {
-		return `${entry.name}\t${config.type}\t${config.url}`;
+		return `${entry.name}\t${config.type}\t${config.url}${autoload}`;
 	}
 	const args = config.args && config.args.length > 0 ? ` ${config.args.join(" ")}` : "";
-	return `${entry.name}\tstdio\t${config.command}${args}`;
+	return `${entry.name}\tstdio\t${config.command}${args}${autoload}`;
 }
 
 function renderDetails(entry: RedactedServerEntry): string {
@@ -289,8 +296,40 @@ async function runImport(args: MCPCommandArgs): Promise<void> {
 	});
 
 	if (!args.flags.json && !args.flags.dryRun) {
-		process.stdout.write("\nImport complete. Use `gjc mcp list` to review.\n");
+		process.stdout.write(
+			"\nImported servers connect at session startup. Use `gjc mcp autoload <name> off` to keep one configured without auto-connecting, and `gjc mcp list` to review.\n",
+		);
 	}
+}
+
+async function runAutoload(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
+	if (!args.name) throw new MCPArgsError("`gjc mcp autoload` requires a server name.");
+	const value = args.commandArgs?.[0]?.toLowerCase();
+	if (value !== "on" && value !== "off") {
+		throw new MCPArgsError("`gjc mcp autoload <name> on|off` requires an on/off value.");
+	}
+	const existing = await getMCPServer(scoped.path, args.name);
+	if (!existing) {
+		throw new MCPArgsError(`MCP server "${args.name}" not found in ${scoped.scope} config.`);
+	}
+	const autoload = value === "on";
+	await setServerAutoload(scoped.path, args.name, autoload);
+	if (args.flags.json) {
+		writeJson({
+			action: "autoload",
+			status: "updated",
+			name: args.name,
+			scope: scoped.scope,
+			path: scoped.path,
+			autoload,
+		});
+		return;
+	}
+	process.stdout.write(
+		autoload
+			? `Autoload enabled for "${args.name}" in ${scoped.scope} config — it connects at session startup.\n`
+			: `Autoload disabled for "${args.name}" in ${scoped.scope} config — connect it on demand with /mcp connect ${args.name}.\n`,
+	);
 }
 
 export async function runMCPCommand(args: MCPCommandArgs): Promise<void> {
@@ -305,6 +344,9 @@ export async function runMCPCommand(args: MCPCommandArgs): Promise<void> {
 				return;
 			case "remove":
 				await runRemove(args, scoped);
+				return;
+			case "autoload":
+				await runAutoload(args, scoped);
 				return;
 			case "import":
 				await runImport(args);

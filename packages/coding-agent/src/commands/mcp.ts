@@ -4,7 +4,7 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { type MCPAction, type MCPCommandArgs, runMCPCommand } from "../cli/mcp-cli";
 
-const ACTIONS: MCPAction[] = ["add", "list", "remove", "import"];
+const ACTIONS: MCPAction[] = ["add", "list", "remove", "autoload", "import"];
 
 export default class MCP extends Command {
 	static description = "Register standalone MCP servers explicitly in GJC config";
@@ -15,6 +15,7 @@ export default class MCP extends Command {
 		"gjc mcp add docs --type http --url https://example.test/mcp --header Authorization=Bearer_TOKEN",
 		"gjc mcp import claude",
 		"gjc mcp import codex --dry-run",
+		"gjc mcp autoload context7 off",
 		"gjc mcp list --json",
 		"gjc mcp remove context7",
 	];
@@ -88,14 +89,15 @@ export default class MCP extends Command {
 		process.stdout.write(`Register standalone MCP servers explicitly in GJC config
 
 USAGE
-  $ gjc mcp [add|list|remove|import] [NAME] [COMMAND_OR_URL] [ARGS...] [FLAGS]
+  $ gjc mcp [add|list|remove|autoload|import] [NAME] [COMMAND_OR_URL] [ARGS...] [FLAGS]
 
 COMMANDS
-  add     Add an explicit user-provided MCP server definition
-  list    List registered servers with env/header/auth values redacted
-  remove  Remove a registered server and print the removed definition redacted
-  import  Copy MCP servers from another host into GJC config:
-          gjc mcp import <claude|codex|opencode|cursor|all> [--dry-run] [--force] [--project]
+  add       Add an explicit user-provided MCP server definition
+  list      List registered servers with env/header/auth values redacted
+  remove    Remove a registered server and print the removed definition redacted
+  autoload  Toggle connecting a server at session startup: gjc mcp autoload <name> on|off
+  import    Copy MCP servers from another host into GJC config:
+            gjc mcp import <claude|codex|opencode|cursor|all> [--dry-run] [--force] [--project]
 
 FLAGS
       --project          Use project scope (./.gjc/mcp.json) instead of user scope
@@ -115,6 +117,7 @@ EXAMPLES
   $ gjc mcp add docs --type http --url https://example.test/mcp --header Authorization=Bearer_TOKEN
   $ gjc mcp import claude
   $ gjc mcp import codex --dry-run
+  $ gjc mcp autoload context7 off
   $ gjc mcp list --json
   $ gjc mcp remove context7
 

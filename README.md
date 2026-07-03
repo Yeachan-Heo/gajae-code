@@ -236,6 +236,8 @@ gjc mcp import all --dry-run
 
 `gjc mcp import <claude|codex|opencode|cursor|all>` copies MCP server definitions from another host's config into GJC's own config. This is a one-time migration, not live inheritance: once imported, GJC owns the runtime, auth, and lifecycle of those servers. Use `--dry-run` to preview, `--force` to overwrite collisions, and `--project` to write to `./.gjc/mcp.json`. Secret-indirection fields are never read, and output redacts secrets the same way `gjc mcp list` does.
 
+Imported servers connect automatically at session startup. To keep one configured without auto-connecting, run `gjc mcp autoload <name> off`, then use `/mcp connect <name>` to connect it on demand within a session.
+
 ## Configuration
 
 Provider retry budgets live in `~/.gjc/config.yml`:
