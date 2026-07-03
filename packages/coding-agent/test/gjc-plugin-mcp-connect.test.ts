@@ -33,7 +33,13 @@ describe("plugin MCP live connection", () => {
 
 		expect(result.errors.size).toBe(0);
 		// The bundled server advertises a "lookup" tool; MCP tools are namespaced.
-		expect(result.tools.some(t => t.name.includes("lookup"))).toBe(true);
+		const lookup = result.tools.find(t => t.name.includes("lookup"));
+		const lookupMetadata = lookup as
+			| { mcpSourceProvider?: string; mcpDiscoveryScope?: "selectable" | "always-on" }
+			| undefined;
+		expect(lookup).toBeDefined();
+		expect(lookupMetadata?.mcpSourceProvider).toBe("gjc-plugins");
+		expect(lookupMetadata?.mcpDiscoveryScope).toBe("always-on");
 	}, 30_000);
 
 	test("plugin stdio configs request no-env isolation and the child cannot read host secrets", async () => {

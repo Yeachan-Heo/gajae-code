@@ -657,6 +657,9 @@ function customToolToDefinition(tool: CustomTool): ToolDefinition {
 		deferrable: tool.deferrable,
 		mcpServerName: tool.mcpServerName,
 		mcpToolName: tool.mcpToolName,
+		mcpSourceProvider: tool.mcpSourceProvider,
+		mcpSourceProviderName: tool.mcpSourceProviderName,
+		mcpDiscoveryScope: tool.mcpDiscoveryScope,
 		execute: (toolCallId, params, signal, onUpdate, ctx) =>
 			tool.execute(toolCallId, params, onUpdate, createCustomToolContext(ctx), signal),
 		onSession: tool.onSession ? (event, ctx) => tool.onSession?.(event, createCustomToolContext(ctx)) : undefined,
