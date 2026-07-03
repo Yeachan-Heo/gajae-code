@@ -571,6 +571,40 @@ fn trim_end_spaces_in_place(line: &mut Vec<u16>) {
 	}
 }
 
+fn is_escaped_u16(data: &[u16], index: usize) -> bool {
+	let mut backslashes = 0usize;
+	let mut i = index;
+	while i > 0 {
+		i -= 1;
+		if data[i] != b'\\' as u16 {
+			break;
+		}
+		backslashes += 1;
+	}
+	backslashes % 2 == 1
+}
+
+fn inline_math_end(data: &[u16], start: usize) -> Option<usize> {
+	if data.get(start).copied() != Some(b'$' as u16)
+		|| data.get(start + 1).copied() == Some(b'$' as u16)
+	{
+		return None;
+	}
+
+	let mut i = start + 1;
+	while i < data.len() {
+		let ch = data[i];
+		if ch == b'\n' as u16 || ch == b'\r' as u16 {
+			return None;
+		}
+		if ch == b'$' as u16 && i > start + 1 && !is_escaped_u16(data, i) {
+			return Some(i + 1);
+		}
+		i += 1;
+	}
+	None
+}
+
 fn split_into_tokens_with_ansi(line: &[u16]) -> SmallVec<[Vec<u16>; 4]> {
 	let mut tokens = SmallVec::<[Vec<u16>; 4]>::new();
 	let mut current = Vec::<u16>::new();
@@ -588,6 +622,24 @@ fn split_into_tokens_with_ansi(line: &[u16]) -> SmallVec<[Vec<u16>; 4]> {
 		}
 
 		let ch = line[i];
+		if ch == b'$' as u16
+			&& let Some(math_end) = inline_math_end(line, i)
+		{
+			if !current.is_empty() {
+				tokens.push(current);
+				current = Vec::new();
+			}
+			if !pending_ansi.is_empty() {
+				current.extend_from_slice(&pending_ansi);
+				pending_ansi.clear();
+			}
+			current.extend_from_slice(&line[i..math_end]);
+			tokens.push(current);
+			current = Vec::new();
+			in_whitespace = false;
+			i = math_end;
+			continue;
+		}
 		let char_is_space = ch == b' ' as u16;
 		if char_is_space != in_whitespace && !current.is_empty() {
 			tokens.push(current);
@@ -1378,5 +1430,19 @@ mod tests {
 			assert!(line_text.contains("38;5;196"));
 			assert!(line_text.contains("48;5;236"));
 		}
+	}
+
+	#[test]
+	fn test_wrap_text_with_ansi_keeps_inline_math_with_cjk() {
+		let data = to_u16("비정상성: $C$와 $\\kappa$는 제도");
+		let lines = wrap_text_with_ansi_impl(&data, 12, DEFAULT_TAB_WIDTH);
+		let rendered: Vec<String> = lines
+			.iter()
+			.map(|line| String::from_utf16_lossy(line))
+			.collect();
+
+		assert!(rendered.iter().any(|line| line.contains("$C$")), "{rendered:?}");
+		assert!(rendered.iter().any(|line| line.contains("$\\kappa$")), "{rendered:?}");
+		assert!(!rendered.iter().any(|line| line.ends_with('$')), "{rendered:?}");
 	}
 }

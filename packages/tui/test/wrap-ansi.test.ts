@@ -142,6 +142,18 @@ describe("wrapTextWithAnsi", () => {
 			expect(visibleWidth(twoSpacesWrappedToWidth1[0]) <= 1).toBe(true);
 		});
 
+		it("keeps inline math adjacent to Korean text intact across narrow wraps", () => {
+			const text = "비정상성: $C$와 $\\kappa$는 제도";
+			const wrapped = wrapTextWithAnsi(text, 12);
+
+			expect(wrapped.some(line => line.includes("$C$"))).toBe(true);
+			expect(wrapped.some(line => line.includes("$\\kappa$"))).toBe(true);
+			expect(wrapped.some(line => line.endsWith("$") || line.startsWith("\\kappa$"))).toBe(false);
+			for (const line of wrapped) {
+				expect(visibleWidth(line) <= 12).toBe(true);
+			}
+		});
+
 		it("should preserve color codes across wraps", () => {
 			const red = "\x1b[31m";
 			const reset = "\x1b[0m";
