@@ -223,6 +223,9 @@ export async function applyStartupModelProfiles(args: {
 	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
 
 	const defaultProfile = args.settings.get("modelProfile.default");
+	if (defaultProfile || args.parsedArgs.mpreset) {
+		await args.modelRegistry.refresh("online-if-uncached");
+	}
 	if (defaultProfile) {
 		await applyProfile(defaultProfile, false);
 	}
