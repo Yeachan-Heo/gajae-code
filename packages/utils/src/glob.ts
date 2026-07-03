@@ -145,6 +145,8 @@ export async function globPaths(patterns: string | string[], options: GlobPathsO
 		effectiveExclude = [...effectiveExclude, ...gitignorePatterns];
 	}
 
+	const excludeGlobs = effectiveExclude.map(pattern => new Glob(pattern));
+
 	const base = cwd ?? getProjectDir();
 	const allResults: string[] = [];
 
@@ -171,17 +173,10 @@ export async function globPaths(patterns: string | string[], options: GlobPathsO
 
 			// Check exclusion patterns
 			const normalized = entry.replace(/\\/g, "/");
-			let excluded = false;
-			for (const excludePattern of effectiveExclude) {
-				const excludeGlob = new Glob(excludePattern);
-				if (excludeGlob.match(normalized)) {
-					excluded = true;
-					break;
-				}
+			if (excludeGlobs.some(excludeGlob => excludeGlob.match(normalized))) {
+				continue;
 			}
-			if (!excluded) {
-				allResults.push(normalized);
-			}
+			allResults.push(normalized);
 		}
 	}
 
