@@ -78,7 +78,9 @@ describe("cursor adapter", () => {
 	test("reads mcpServers from ~/.cursor/mcp.json", async () => {
 		await writeFile(
 			".cursor/mcp.json",
-			JSON.stringify({ mcpServers: { srv: { command: "bin", args: ["--x"] }, docs: { url: "https://d.test/mcp" } } }),
+			JSON.stringify({
+				mcpServers: { srv: { command: "bin", args: ["--x"] }, docs: { url: "https://d.test/mcp" } },
+			}),
 		);
 		const result = await getAdapter("cursor").collect({ homeDir: home });
 		expect(result.mcpCandidates).toEqual([

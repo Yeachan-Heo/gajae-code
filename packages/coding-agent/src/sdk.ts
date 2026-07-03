@@ -1940,7 +1940,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const initialRequestedActiveToolNames = options.toolNames
 			? requestedActiveToolNames
 			: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name));
-		const discoverableMCPToolNames = new Set(collectDiscoverableMCPTools(toolRegistry.values()).map(tool => tool.name));
+		const discoverableMCPToolNames = new Set(
+			collectDiscoverableMCPTools(toolRegistry.values()).map(tool => tool.name),
+		);
 		const explicitlyRequestedMCPToolNames = options.toolNames
 			? requestedActiveToolNames.filter(name => discoverableMCPToolNames.has(name))
 			: [];
@@ -1948,7 +1950,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			(settings.get("mcp.discoveryDefaultServers") ?? []).map(serverName => serverName.trim()).filter(Boolean),
 		);
 		const discoveryDefaultServerToolNames = mcpDiscoveryEnabled
-			? selectDiscoverableMCPToolNamesByServer(collectDiscoverableMCPTools(toolRegistry.values()), discoveryDefaultServers)
+			? selectDiscoverableMCPToolNamesByServer(
+					collectDiscoverableMCPTools(toolRegistry.values()),
+					discoveryDefaultServers,
+				)
 			: [];
 		let initialSelectedMCPToolNames: string[] = [];
 		let defaultSelectedMCPToolNames: string[] = [];

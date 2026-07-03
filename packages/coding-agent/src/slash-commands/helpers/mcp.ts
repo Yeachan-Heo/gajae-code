@@ -1,4 +1,5 @@
 import { getMCPConfigPath, logger } from "@gajae-code/utils";
+import { detectImportableMcpSources, formatImportHintLine } from "../../migrate/import-hint";
 import { connectToServer, disconnectServer, listPrompts, listResources, listTools } from "../../runtime-mcp/client";
 import {
 	addMCPServer,
@@ -9,7 +10,6 @@ import {
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
-import { detectImportableMcpSources, formatImportHintLine } from "../../migrate/import-hint";
 import { MCPManager } from "../../runtime-mcp/manager";
 import { getSmitheryApiKey } from "../../runtime-mcp/smithery-auth";
 import { searchSmitheryRegistry } from "../../runtime-mcp/smithery-registry";
@@ -466,7 +466,10 @@ async function handleAutoloadCommand(rest: string, runtime: SlashCommandRuntime)
 	try {
 		const userPath = getMCPConfigPath("user", runtime.cwd);
 		const projectPath = getMCPConfigPath("project", runtime.cwd);
-		const [userConfig, projectConfig] = await Promise.all([readMCPConfigFile(userPath), readMCPConfigFile(projectPath)]);
+		const [userConfig, projectConfig] = await Promise.all([
+			readMCPConfigFile(userPath),
+			readMCPConfigFile(projectPath),
+		]);
 		const filePath = userConfig.mcpServers?.[name]
 			? userPath
 			: projectConfig.mcpServers?.[name]

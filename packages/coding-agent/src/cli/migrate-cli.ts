@@ -36,7 +36,9 @@ export class MigrateArgsError extends Error {}
 /** Expand `all`/repeated `--from`, validate, and return sources in canonical order. */
 export function resolveSources(from: string[]): MigrateSource[] {
 	if (from.length === 0) {
-		throw new MigrateArgsError("No source selected. Use --from <claude-code|codex|opencode|cursor|all> (repeatable).");
+		throw new MigrateArgsError(
+			"No source selected. Use --from <claude-code|codex|opencode|cursor|all> (repeatable).",
+		);
 	}
 	const selected = new Set<MigrateSource>();
 	for (const raw of from) {

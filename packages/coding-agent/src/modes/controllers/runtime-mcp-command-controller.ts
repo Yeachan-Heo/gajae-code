@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { Spacer, Text } from "@gajae-code/tui";
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
+import { detectImportableMcpSources } from "../../migrate/import-hint";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
 import { connectToServer, disconnectServer, listTools } from "../../runtime-mcp/client";
 import {
@@ -18,7 +19,6 @@ import {
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
-import { detectImportableMcpSources } from "../../migrate/import-hint";
 import { MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
 import {
 	clearSmitheryApiKey,
@@ -1499,7 +1499,9 @@ export class MCPCommandController {
 				this.#showMessage(lines.join("\n"));
 			}
 		} catch (error) {
-			this.ctx.showError(`Failed to connect to "${name}": ${error instanceof Error ? error.message : String(error)}`);
+			this.ctx.showError(
+				`Failed to connect to "${name}": ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 	}
 
@@ -1562,7 +1564,10 @@ export class MCPCommandController {
 			await setServerAutoload(found.filePath, name, autoload);
 			const lines = [
 				"",
-				theme.fg("success", `✓ Autoload ${autoload ? "enabled" : "disabled"} for "${name}" (${found.scope} config)`),
+				theme.fg(
+					"success",
+					`✓ Autoload ${autoload ? "enabled" : "disabled"} for "${name}" (${found.scope} config)`,
+				),
 			];
 			if (autoload) {
 				lines.push(theme.fg("muted", "  The server will connect automatically at session startup."));

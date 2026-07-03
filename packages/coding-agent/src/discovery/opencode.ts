@@ -19,7 +19,7 @@
  * Priority: 55 (tool-specific provider)
  */
 import * as path from "node:path";
-import { logger, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
+import { parseFrontmatter, tryParseJson } from "@gajae-code/utils";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
@@ -43,22 +43,6 @@ import {
 const PROVIDER_ID = "opencode";
 const DISPLAY_NAME = "OpenCode";
 const PRIORITY = 55;
-
-// =============================================================================
-// JSON Config Loading
-// =============================================================================
-
-async function loadJsonConfig(configPath: string): Promise<Record<string, unknown> | null> {
-	const content = await readFile(configPath);
-	if (!content) return null;
-
-	const parsed = tryParseJson<Record<string, unknown>>(content);
-	if (!parsed) {
-		logger.warn("Failed to parse OpenCode JSON config", { path: configPath });
-		return null;
-	}
-	return parsed;
-}
 
 // =============================================================================
 // Context Files (AGENTS.md)

@@ -7,6 +7,7 @@
  * once written, GJC owns runtime execution, auth, and lifecycle.
  */
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
+import { detectImportableMcpSources, formatImportHintLine } from "../migrate/import-hint";
 import {
 	getMCPServer,
 	readMCPConfigFile,
@@ -14,7 +15,6 @@ import {
 	setServerAutoload,
 	upsertMCPServer,
 } from "../runtime-mcp/config-writer";
-import { detectImportableMcpSources, formatImportHintLine } from "../migrate/import-hint";
 import type { MCPConfigFile, MCPServerConfig } from "../runtime-mcp/types";
 import { runMigrateCommand } from "./migrate-cli";
 
