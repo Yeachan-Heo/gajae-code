@@ -14,6 +14,7 @@ import {
 	setServerAutoload,
 	upsertMCPServer,
 } from "../runtime-mcp/config-writer";
+import { detectImportableMcpSources, formatImportHintLine } from "../migrate/import-hint";
 import type { MCPConfigFile, MCPServerConfig } from "../runtime-mcp/types";
 import { runMigrateCommand } from "./migrate-cli";
 
@@ -48,6 +49,8 @@ export interface MCPCommandArgs {
 		timeout?: number;
 	};
 	cwd?: string;
+	/** Test seam: override home dir for the empty-list import hint. */
+	homeDir?: string;
 }
 
 export class MCPArgsError extends Error {}
@@ -237,6 +240,10 @@ async function runList(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> 
 	}
 	if (entries.length === 0) {
 		process.stdout.write(`No MCP servers registered in ${scoped.scope} config: ${scoped.path}\n`);
+		const importable = await detectImportableMcpSources(args.homeDir);
+		for (const source of importable) {
+			process.stdout.write(`${formatImportHintLine(source)}\n`);
+		}
 		return;
 	}
 	process.stdout.write(`MCP servers in ${scoped.scope} config: ${scoped.path}\n`);

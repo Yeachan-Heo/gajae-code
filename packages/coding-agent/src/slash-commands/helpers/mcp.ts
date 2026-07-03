@@ -9,6 +9,7 @@ import {
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
+import { detectImportableMcpSources, formatImportHintLine } from "../../migrate/import-hint";
 import { MCPManager } from "../../runtime-mcp/manager";
 import { getSmitheryApiKey } from "../../runtime-mcp/smithery-auth";
 import { searchSmitheryRegistry } from "../../runtime-mcp/smithery-registry";
@@ -378,7 +379,9 @@ async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCom
 			if (!entries.some(entry => entry.name === name)) entries.push({ name, config, scope: "project" });
 		}
 		if (entries.length === 0) {
-			await runtime.output("No MCP servers configured.");
+			const importable = await detectImportableMcpSources();
+			const lines = ["No MCP servers configured.", ...importable.map(formatImportHintLine)];
+			await runtime.output(lines.join("\n"));
 			return commandConsumed();
 		}
 		await runtime.output(

@@ -18,6 +18,7 @@ import {
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
+import { detectImportableMcpSources } from "../../migrate/import-hint";
 import { MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
 import {
 	clearSmitheryApiKey,
@@ -985,15 +986,19 @@ export class MCPCommandController {
 				discoveredServers.length === 0 &&
 				disabledServerNames.size === 0
 			) {
-				this.#showMessage(
-					[
-						"",
-						theme.fg("muted", "No MCP servers configured."),
-						"",
-						`Use ${theme.fg("accent", "/mcp add")} to add a server.`,
-						"",
-					].join("\n"),
-				);
+				const importable = await detectImportableMcpSources();
+				const emptyLines = ["", theme.fg("muted", "No MCP servers configured."), ""];
+				for (const source of importable) {
+					const servers = source.count === 1 ? "1 MCP server" : `${source.count} MCP servers`;
+					emptyLines.push(
+						theme.fg(
+							"muted",
+							`Found ${servers} in ${source.displayName} config — run ${theme.fg("accent", `gjc mcp import ${source.importArg}`)} to copy them.`,
+						),
+					);
+				}
+				emptyLines.push(`Use ${theme.fg("accent", "/mcp add")} to add a server.`, "");
+				this.#showMessage(emptyLines.join("\n"));
 				return;
 			}
 
