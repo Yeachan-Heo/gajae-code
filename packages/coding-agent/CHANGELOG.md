@@ -14,6 +14,7 @@
 - The cmux workspace auto-rename is now ownership-guarded: GJC reads the current workspace title via `cmux workspace list` and only renames a workspace that still has its default title, so it no longer overwrites a user-pinned workspace name or thrash a shared workspace title across multiple sessions running under the same `CMUX_WORKSPACE_ID`. Opt out with `GJC_NO_CMUX_RENAME`.
 - `gjc --tmux --resume` now reaches the session picker/resume target instead of auto-attaching a same-branch managed tmux session before the inner resume resolver runs.
 - `gjc --tmux` now preserves a newly created managed tmux session when `attach-session` exits after the parent SSH/PTY closes but the tmux server still reports the session live, so closing a Windows Terminal tab no longer kills the Mac host session before reattach.
+- Managed `gjc --tmux` launches now size the inner tmux window to the caller terminal minus inherited tmux status lines, preventing the bottom of the GJC input from being clipped when the user's tmux status bar is visible.
 
 ### Changed
 

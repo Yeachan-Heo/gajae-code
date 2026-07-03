@@ -380,6 +380,39 @@ describe("default GJC tmux launch", () => {
 		]);
 	});
 
+	it("reserves caller terminal rows for tmux status lines", () => {
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: { stdin: true, stdout: true, columns: 178, rows: 35 },
+			tmuxAvailable: true,
+			tmuxStatusLines: 1,
+			currentBranch: "",
+			existingBranchSessionName: null,
+		});
+
+		expect(plan).toBeDefined();
+		if (!plan) throw new Error("expected tmux plan");
+		expect(plan.initialSize).toEqual({ columns: 178, rows: 34 });
+		expect(plan.newSessionArgs.slice(0, 10)).toEqual([
+			"new-session",
+			"-d",
+			"-x",
+			"178",
+			"-y",
+			"34",
+			"-s",
+			plan.sessionName,
+			"-c",
+			"/repo",
+		]);
+	});
+
 	it("omits detached tmux sizing when caller dimensions are unknown", () => {
 		const plan = buildDefaultTmuxLaunchPlan({
 			parsed: args({ messages: ["hello world"], tmux: true }),

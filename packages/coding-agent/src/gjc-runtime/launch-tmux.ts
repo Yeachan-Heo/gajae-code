@@ -60,6 +60,7 @@ export interface TmuxLaunchContext {
 	tty?: TtyState;
 	spawnSync?: TmuxSpawnSync;
 	tmuxAvailable?: boolean;
+	tmuxStatusLines?: number;
 	worktreeBranch?: string | null;
 	currentBranch?: string | null;
 	existingBranchSessionName?: string | null;
@@ -561,12 +562,38 @@ function normalizeTmuxTerminalDimension(value: number | undefined): number | und
 	return value;
 }
 
-function resolveCallerTmuxTerminalSize(tty: TtyState): TmuxTerminalSize | undefined {
+function normalizeTmuxStatusLineCount(value: number | undefined): number {
+	if (value === undefined || !Number.isSafeInteger(value) || value <= 0) return 0;
+	return value;
+}
+
+function parseTmuxStatusLineCount(value: string): number {
+	const normalized = value.trim().toLowerCase();
+	if (normalized.length === 0 || normalized === "off" || normalized === "0") return 0;
+	if (normalized === "on") return 1;
+	const parsed = Number.parseInt(normalized, 10);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function readTmuxStatusLineCount(tmuxCommand: string, cwd: string, env: NodeJS.ProcessEnv): number {
+	const result = Bun.spawnSync([tmuxCommand, "show-options", "-gqv", "status"], {
+		cwd,
+		env,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) return 0;
+	return parseTmuxStatusLineCount(new TextDecoder().decode(result.stdout));
+}
+
+function resolveCallerTmuxTerminalSize(tty: TtyState, tmuxStatusLines = 0): TmuxTerminalSize | undefined {
 	if (!tty.stdout) return undefined;
 	const columns = normalizeTmuxTerminalDimension(tty.columns);
 	const rows = normalizeTmuxTerminalDimension(tty.rows);
 	if (columns === undefined || rows === undefined) return undefined;
-	return { columns, rows };
+	const adjustedRows = Math.max(1, rows - normalizeTmuxStatusLineCount(tmuxStatusLines));
+	return { columns, rows: adjustedRows };
 }
 
 function buildTmuxNewSessionSizeArgs(size: TmuxTerminalSize | undefined): string[] {
@@ -653,7 +680,10 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		},
 		context.rawArgs,
 	);
-	const initialSize = resolveCallerTmuxTerminalSize(tty);
+	const tmuxStatusLines =
+		context.tmuxStatusLines ??
+		(context.tmuxAvailable === undefined ? readTmuxStatusLineCount(tmuxCommand, cwd, env) : 0);
+	const initialSize = resolveCallerTmuxTerminalSize(tty, tmuxStatusLines);
 	return {
 		tmuxCommand,
 		isPsmux: resolvedBinary.isPsmux,
