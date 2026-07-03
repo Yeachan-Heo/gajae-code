@@ -847,11 +847,14 @@ async function writeJsonAtomic(
 			forced: options?.force ?? false,
 		},
 	});
-	// `writeResult.revision` is computed inside the writer lock, so it is the revision this
-	// write actually owns. Prefer it over a post-lock file re-read, which a concurrent writer
-	// could have advanced before the read — that race could otherwise let this payload be
-	// published with another writer's newer revision.
-	return { warning, stamped: (await readJsonFile(filePath)) ?? {}, revision: writeResult.revision };
+	// `writeResult.stamped` and `.revision` are computed inside the writer lock, so they are
+	// the envelope/revision this write actually owns. Never post-lock re-read here: a concurrent
+	// writer could advance the file before that read and make this payload publish another
+	// writer's newer revision into the derived active-state cache.
+	if (!writeResult.written || !isPlainObject(writeResult.stamped)) {
+		throw new Error(`state writer did not return a stamped workflow envelope for ${filePath}`);
+	}
+	return { warning, stamped: writeResult.stamped, revision: writeResult.revision };
 }
 
 function parseFieldsFlag(args: readonly string[]): StateProjectionField[] | undefined {

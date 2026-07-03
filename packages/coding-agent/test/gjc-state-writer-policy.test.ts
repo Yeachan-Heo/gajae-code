@@ -115,7 +115,12 @@ describe("GJC state writer revision policy", () => {
 			{ cwd: root, policy: "cache", sourceRevision: 3 },
 		);
 
-		expect(result).toEqual({ path: path.join(root, target), written: true, revision: 2 });
+		expect(result).toMatchObject({
+			path: path.join(root, target),
+			written: true,
+			revision: 2,
+			stamped: { value: "new", source_state_revision: 3, state_revision: 2 },
+		});
 		await expect(readJson(root, target)).resolves.toMatchObject({
 			value: "new",
 			source_state_revision: 3,

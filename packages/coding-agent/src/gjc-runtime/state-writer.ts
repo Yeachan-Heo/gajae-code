@@ -99,7 +99,7 @@ export interface GuardedStateWriterOptions extends StateWriterOptions {
 }
 
 export type GuardedWriteResult =
-	| { path: string; written: true; revision: number }
+	| { path: string; written: true; revision: number; stamped: unknown }
 	| { path: string; written: false; reason: "stale-skip"; revision: number };
 
 export interface StateWriterOptions {
@@ -511,7 +511,7 @@ async function writeGuardedResolvedJsonAtomic(
 				const next = stampStateRevision(withWorkflowReceipt(value, buildReceipt(options)), currentRevision + 1);
 				await atomicWrite(filePath, jsonText(next));
 				await maybeAudit(filePath, options);
-				return { path: filePath, written: true, revision: currentRevision + 1 };
+				return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 			}
 
 			const incomingSourceRevision =
@@ -526,7 +526,7 @@ async function writeGuardedResolvedJsonAtomic(
 			);
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
-			return { path: filePath, written: true, revision: currentRevision + 1 };
+			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 		},
 		options.lock,
 	);
@@ -574,7 +574,7 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 				}
 				await atomicWrite(filePath, jsonText(next));
 				await maybeAudit(filePath, options);
-				return { path: filePath, written: true, revision: currentRevision + 1 };
+				return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 			}
 
 			const incomingSourceRevision =
@@ -599,7 +599,7 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 			}
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
-			return { path: filePath, written: true, revision: currentRevision + 1 };
+			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 		},
 		options.lock,
 	);
