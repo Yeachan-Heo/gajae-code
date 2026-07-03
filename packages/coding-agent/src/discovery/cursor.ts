@@ -9,98 +9,27 @@
  * - Project: .cursor/ (cwd only)
  *
  * Capabilities:
- * - mcps: From mcp.json with mcpServers key
  * - rules: From rules/*.mdc files with MDC frontmatter (description, globs, alwaysApply)
  * - settings: From settings.json if present
+ *
+ * MCP servers are intentionally NOT inherited live from Cursor config: GJC owns
+ * MCP runtime execution. Use `gjc mcp import cursor` to copy definitions into
+ * GJC's own mcp.json instead.
  */
 
 import { tryParseJson } from "@gajae-code/utils";
 import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
-import { type MCPServer, mcpCapability } from "../capability/mcp";
 import type { Rule } from "../capability/rule";
 import { ruleCapability } from "../capability/rule";
 import type { Settings } from "../capability/settings";
 import { settingsCapability } from "../capability/settings";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
-import {
-	buildRuleFromMarkdown,
-	createSourceMeta,
-	expandEnvVarsDeep,
-	getProjectPath,
-	getUserPath,
-	loadFilesFromDir,
-} from "./helpers";
+import { buildRuleFromMarkdown, createSourceMeta, getProjectPath, getUserPath, loadFilesFromDir } from "./helpers";
 
 const PROVIDER_ID = "cursor";
 const DISPLAY_NAME = "Cursor";
 const PRIORITY = 50;
-
-// =============================================================================
-// MCP Servers
-// =============================================================================
-
-function parseMCPServers(
-	content: string,
-	path: string,
-	level: "user" | "project",
-): { items: MCPServer[]; warning?: string } {
-	const items: MCPServer[] = [];
-
-	const parsed = tryParseJson<{ mcpServers?: Record<string, unknown> }>(content);
-	if (!parsed?.mcpServers) {
-		return { items, warning: `${path}: missing or invalid 'mcpServers' key` };
-	}
-
-	const servers = expandEnvVarsDeep(parsed.mcpServers);
-	for (const [name, config] of Object.entries(servers)) {
-		const serverConfig = config as Record<string, unknown>;
-		items.push({
-			name,
-			command: serverConfig.command as string | undefined,
-			args: serverConfig.args as string[] | undefined,
-			env: serverConfig.env as Record<string, string> | undefined,
-			url: serverConfig.url as string | undefined,
-			headers: serverConfig.headers as Record<string, string> | undefined,
-			transport: ["stdio", "sse", "http"].includes(serverConfig.type as string)
-				? (serverConfig.type as "stdio" | "sse" | "http")
-				: undefined,
-			timeout: typeof serverConfig.timeout === "number" ? serverConfig.timeout : undefined,
-			_source: createSourceMeta(PROVIDER_ID, path, level),
-		});
-	}
-
-	return { items };
-}
-
-async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> {
-	const items: MCPServer[] = [];
-	const warnings: string[] = [];
-
-	const userPath = getUserPath(ctx, "cursor", "mcp.json");
-
-	const [userContent, projectPath] = await Promise.all([
-		userPath ? readFile(userPath) : Promise.resolve(null),
-		getProjectPath(ctx, "cursor", "mcp.json"),
-	]);
-
-	const projectContentPromise = projectPath ? readFile(projectPath) : Promise.resolve(null);
-
-	if (userContent && userPath) {
-		const result = parseMCPServers(userContent, userPath, "user");
-		items.push(...result.items);
-		if (result.warning) warnings.push(result.warning);
-	}
-
-	const projectContent = await projectContentPromise;
-	if (projectContent && projectPath) {
-		const result = parseMCPServers(projectContent, projectPath, "project");
-		items.push(...result.items);
-		if (result.warning) warnings.push(result.warning);
-	}
-
-	return { items, warnings };
-}
 
 // =============================================================================
 // Rules
@@ -194,14 +123,6 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 // =============================================================================
 // Provider Registration
 // =============================================================================
-
-registerProvider(mcpCapability.id, {
-	id: PROVIDER_ID,
-	displayName: DISPLAY_NAME,
-	description: "Load MCP servers from ~/.cursor/mcp.json and .cursor/mcp.json",
-	priority: PRIORITY,
-	load: loadMCPServers,
-});
 
 registerProvider(ruleCapability.id, {
 	id: PROVIDER_ID,

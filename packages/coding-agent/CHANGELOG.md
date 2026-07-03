@@ -6,6 +6,7 @@
 
 - The `/model` preset landing now shows the session's current preset, model, and per-role assignments in the header, marks the active preset with `(current)`, and Enter now expands/collapses provider groups (right/left arrows still work).
 - MCP server definitions now accept an optional per-server `autoload` boolean that controls whether a configured server connects at session startup. The flag is threaded through the config schema, both parsers (the `mcp-json` discovery reader and the runtime-mcp config loader), an `autoloadOnly` load option on `discoverAndLoadMCPTools`, and a `setServerAutoload` config writer, establishing the config contract that the opt-in runtime and the autoload/connect management surfaces wire up in follow-up changes.
+- GJC no longer inherits MCP servers live from other hosts. The MCP capability registrations were removed from the Cursor, Gemini, OpenCode, and Windsurf discovery providers and the MCP-only VS Code discovery provider was deleted, so GJC MCP servers now come only from GJC's own config, plugin bundles, or an explicit import rather than being read live out of another host's configuration; rules, settings, and skills discovery are unchanged.
 
 - Added a `statusLine.maxRows` setting (Appearance → Status Line Rows). When it is greater than 1, status line segments that overflow a narrow terminal now wrap onto additional rows instead of being dropped; the default of 1 keeps the existing single-line, drop-on-overflow behavior. The Appearance preview reflects the wrapped layout.
 
