@@ -181,6 +181,41 @@ describe("gjc mcp CLI helpers", () => {
 		expect(output).not.toContain("super-secret");
 	});
 
+	it("suggests importing when the config is empty and another host has MCP servers", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const fakeHome = path.join(tmpDir, "home");
+		await fs.mkdir(fakeHome, { recursive: true });
+		await fs.writeFile(
+			path.join(fakeHome, ".claude.json"),
+			JSON.stringify({ mcpServers: { a: { command: "bin" }, b: { command: "bin2" } } }),
+		);
+
+		await runMCPCommand({ action: "list", flags: {}, cwd: projectDir, homeDir: fakeHome });
+
+		const output = stdoutText(stdout);
+		expect(output).toContain("No MCP servers registered");
+		expect(output).toContain("found 2 MCP servers in Claude Code config");
+		expect(output).toContain("gjc mcp import claude");
+	});
+
+	it("omits the import tip from --json list output", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const fakeHome = path.join(tmpDir, "home");
+		await fs.mkdir(fakeHome, { recursive: true });
+		await fs.writeFile(
+			path.join(fakeHome, ".claude.json"),
+			JSON.stringify({ mcpServers: { a: { command: "bin" } } }),
+		);
+
+		await runMCPCommand({ action: "list", flags: { json: true }, cwd: projectDir, homeDir: fakeHome });
+
+		const output = stdoutText(stdout);
+		expect(output).not.toContain("import claude");
+		expect(output).not.toContain("Tip:");
+		// JSON shape stays a plain empty server list.
+		expect(output).toContain('"servers": []');
+	});
+
 	it("redacts auth and OAuth output through explicit safe fields", async () => {
 		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 		const configPath = getMCPConfigPath("user", projectDir);
