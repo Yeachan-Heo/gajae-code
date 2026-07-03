@@ -147,6 +147,8 @@ export interface MCPDiscoverOptions {
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
+	/** Only connect servers with autoload !== false (default: false) */
+	autoloadOnly?: boolean;
 	/** Called when starting to connect to servers */
 	onConnecting?: (serverNames: string[]) => void;
 }
@@ -325,6 +327,7 @@ export class MCPManager {
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,
+			autoloadOnly: options?.autoloadOnly,
 		});
 		const result = await this.connectServers(configs, sources, options?.onConnecting);
 		result.exaApiKeys = exaApiKeys;

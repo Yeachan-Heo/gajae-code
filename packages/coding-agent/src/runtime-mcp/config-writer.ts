@@ -238,6 +238,34 @@ export async function listMCPServers(filePath: string): Promise<string[]> {
 }
 
 /**
+ * Set a server's autoload flag (connect automatically at session startup).
+ *
+ * Autoload defaults to true, so turning it on removes the key to keep the
+ * config file free of redundant fields; turning it off writes `autoload: false`.
+ *
+ * @throws Error if the server doesn't exist
+ */
+export async function setServerAutoload(filePath: string, name: string, autoload: boolean): Promise<void> {
+	const existing = await readMCPConfigFile(filePath);
+	const server = existing.mcpServers?.[name];
+	if (!server) {
+		throw new Error(`Server "${name}" not found in ${filePath}`);
+	}
+
+	const { autoload: _removed, ...rest } = server;
+	const updatedServer = (autoload ? rest : { ...rest, autoload: false }) as MCPServerConfig;
+	const updated: MCPConfigFile = {
+		...existing,
+		mcpServers: {
+			...existing.mcpServers,
+			[name]: updatedServer,
+		},
+	};
+
+	await writeMCPConfigFile(filePath, updated);
+}
+
+/**
  * Read the disabled servers list from a config file.
  */
 export async function readDisabledServers(filePath: string): Promise<string[]> {

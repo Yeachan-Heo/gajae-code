@@ -15,6 +15,8 @@ export interface MCPServer {
 	name: string;
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
+	/** Whether to connect automatically at session startup (default: true) */
+	autoload?: boolean;
 	/** Connection timeout in milliseconds */
 	timeout?: number;
 	/** Command to run (for stdio transport) */

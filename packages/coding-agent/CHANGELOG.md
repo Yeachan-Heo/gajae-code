@@ -5,6 +5,7 @@
 ### Added
 
 - The `/model` preset landing now shows the session's current preset, model, and per-role assignments in the header, marks the active preset with `(current)`, and Enter now expands/collapses provider groups (right/left arrows still work).
+- MCP server definitions now accept an optional per-server `autoload` boolean that controls whether a configured server connects at session startup. The flag is threaded through the config schema, both parsers (the `mcp-json` discovery reader and the runtime-mcp config loader), an `autoloadOnly` load option on `discoverAndLoadMCPTools`, and a `setServerAutoload` config writer, establishing the config contract that the opt-in runtime and the autoload/connect management surfaces wire up in follow-up changes.
 
 ### Fixed
 
