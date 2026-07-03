@@ -20,13 +20,17 @@ describe("GJC MCP quarantine surface", () => {
 		expect(barrel).not.toContain("mcp-protocol");
 	});
 
-	it("does not discover or proxy MCP tools into agent or subagent sessions", async () => {
+	it("keeps MCP runtime discovery opt-in and quarantined from subagent sessions", async () => {
 		const sdk = await source("sdk.ts");
 		const taskExecutor = await source("task", "executor.ts");
 		const taskIndex = await source("task", "index.ts");
 
-		expect(sdk).not.toContain("discoverAndLoadMCPTools");
+		// User/project MCP discovery is allowed for top-level sessions but must
+		// stay gated behind the explicit enableMCP option (the CLI surface opts
+		// in; embedders, ACP, and subagents stay off by default).
+		expect(sdk).toContain("options.enableMCP ?? false");
 		expect(sdk).not.toContain("discoverMCPServers");
+		// Subagents inherit the parent's manager and never proxy or discover.
 		expect(taskExecutor).not.toContain("createMCPProxyTools");
 		expect(taskExecutor).not.toContain("runtime-mcp/client");
 		expect(taskIndex).not.toContain("MCPManager.instance()");
