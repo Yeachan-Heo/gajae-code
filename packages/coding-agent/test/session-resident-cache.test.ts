@@ -5,12 +5,7 @@ import * as path from "node:path";
 import type { AssistantMessage, UserMessage } from "@gajae-code/ai";
 
 import { exportFromFile, exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
-import {
-	BlobStore,
-	EphemeralBlobStore,
-	externalizeImageDataSync,
-	ResidentBlobMissingError,
-} from "@gajae-code/coding-agent/session/blob-store";
+import { BlobStore, EphemeralBlobStore, externalizeImageDataSync } from "@gajae-code/coding-agent/session/blob-store";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
 import { logger } from "@gajae-code/utils";
 
@@ -86,30 +81,22 @@ async function createPersistedLargeTextSession(
 	return { sm, sessionFile, artifactsDir, cacheDir, entryId };
 }
 
-function expectMissingBlob(fn: () => unknown): void {
-	try {
-		fn();
-		throw new Error("Expected ResidentBlobMissingError");
-	} catch (err) {
-		expectResidentBlobMissing(err);
-	}
+function expectResidentPlaceholder(value: unknown): void {
+	const serialized = JSON.stringify(value);
+	expect(serialized).toContain("Session resident text blob missing");
+	expect(serialized).toContain("original content unavailable");
+	expect(serialized).not.toContain("blob:sha256:");
+	expect(serialized).not.toContain("__gjcResidentBlob");
 }
 
-async function expectMissingBlobAsync(fn: () => Promise<unknown>): Promise<void> {
-	try {
-		await fn();
-		throw new Error("Expected ResidentBlobMissingError");
-	} catch (err) {
-		expectResidentBlobMissing(err);
-	}
-}
-
-function expectResidentBlobMissing(err: unknown): void {
-	expect(err).toBeInstanceOf(ResidentBlobMissingError);
-	const missing = err as ResidentBlobMissingError;
-	expect(missing.hash).toMatch(/^[a-f0-9]{64}$/);
-	expect(missing.kind).toBe("text");
-	expect(missing.message).not.toContain("blob:sha256:");
+async function expectFileContainsResidentPlaceholder(filePath: string): Promise<void> {
+	const bytes = await Bun.file(filePath).text();
+	const match = bytes.match(/<script id="session-data" type="application\/json">([^<]*)<\/script>/);
+	const decoded = match ? Buffer.from(match[1]!, "base64").toString("utf8") : bytes;
+	expect(decoded).toContain("Session resident text blob missing");
+	expect(decoded).toContain("original content unavailable");
+	expect(decoded).not.toContain("blob:sha256:");
+	expect(decoded).not.toContain("__gjcResidentBlob");
 }
 
 async function fileDoesNotContainBlobRef(filePath: string): Promise<void> {
@@ -119,7 +106,7 @@ async function fileDoesNotContainBlobRef(filePath: string): Promise<void> {
 }
 
 describe("resident text cache missing-blob and reference hygiene", () => {
-	it("throws typed ResidentBlobMissingError from public materialization APIs when the resident text blob is missing", async () => {
+	it("uses a public-safe placeholder from read/context APIs when a resident text blob is missing", async () => {
 		const sentinel = `missing resident text ${"x".repeat(2048)}`;
 		const { sm, sessionFile, cacheDir, entryId } = await createPersistedLargeTextSession(sentinel);
 		await sm.close();
@@ -136,10 +123,11 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 			return BlobStore.prototype.getSync.call(this, hash);
 		});
 
-		expectMissingBlob(() => reopened.getEntries());
-		expectMissingBlob(() => reopened.getEntry(entryId));
-		expectMissingBlob(() => reopened.getBranch());
-		expectMissingBlob(() => reopened.buildSessionContext());
+		expectResidentPlaceholder(reopened.getEntries());
+		expectResidentPlaceholder(reopened.getEntry(entryId));
+		expectResidentPlaceholder(reopened.getBranch());
+		await expect(Promise.resolve().then(() => reopened.buildSessionContext())).resolves.toEqual(expect.any(Object));
+		expectResidentPlaceholder(reopened.buildSessionContext());
 		await reopened.close();
 	});
 
@@ -166,34 +154,41 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		await fileDoesNotContainBlobRef(sessionFile);
 	});
 
-	it("surfaces typed missing resident text errors from exports and persists a placeholder on rewrite after disk cache deletion", async () => {
+	it("exports and rewrites a public-safe placeholder after disk cache deletion", async () => {
 		const sentinel = `corrupt resident text ${"z".repeat(2048)}`;
 		const { sm, sessionFile } = await createPersistedLargeTextSession(sentinel);
 		const liveCacheDir = activeResidentCacheDir(sm);
 		await fs.promises.rm(liveCacheDir, { recursive: true, force: true });
+		vi.spyOn(EphemeralBlobStore.prototype, "getSync").mockImplementation(function (
+			this: EphemeralBlobStore,
+			hash: string,
+		) {
+			return BlobStore.prototype.getSync.call(this, hash);
+		});
 
-		await expectMissingBlobAsync(() =>
-			exportSessionToHtml(sm, undefined, { outputPath: path.join(makeTempDir(), "live-corrupt.html") }),
-		);
+		const liveHtml = path.join(makeTempDir(), "live-corrupt.html");
+		await exportSessionToHtml(sm, undefined, { outputPath: liveHtml });
+		await expectFileContainsResidentPlaceholder(liveHtml);
 		await sm.close();
 
 		const standalone = await SessionManager.open(sessionFile);
 		const standaloneCacheDir = activeResidentCacheDir(standalone);
 		await fs.promises.rm(standaloneCacheDir, { recursive: true, force: true });
-		await expectMissingBlobAsync(() =>
-			exportSessionToHtml(standalone, undefined, {
-				outputPath: path.join(makeTempDir(), "standalone-corrupt.html"),
-			}),
-		);
-		await standalone.close();
-		await expectMissingBlobAsync(async () => {
-			const exportManager = await SessionManager.open(sessionFile);
-			const exportCacheDir = activeResidentCacheDir(exportManager);
-			await fs.promises.rm(exportCacheDir, { recursive: true, force: true });
-			await exportSessionToHtml(exportManager, undefined, {
-				outputPath: path.join(makeTempDir(), "from-file-corrupt.html"),
-			});
+		const standaloneHtml = path.join(makeTempDir(), "standalone-corrupt.html");
+		await exportSessionToHtml(standalone, undefined, {
+			outputPath: standaloneHtml,
 		});
+		await expectFileContainsResidentPlaceholder(standaloneHtml);
+		await standalone.close();
+		const fromFileHtml = path.join(makeTempDir(), "from-file-corrupt.html");
+		const exportManager = await SessionManager.open(sessionFile);
+		const exportCacheDir = activeResidentCacheDir(exportManager);
+		await fs.promises.rm(exportCacheDir, { recursive: true, force: true });
+		await exportSessionToHtml(exportManager, undefined, {
+			outputPath: fromFileHtml,
+		});
+		await exportManager.close();
+		await expectFileContainsResidentPlaceholder(fromFileHtml);
 
 		const rewrite = await SessionManager.open(sessionFile);
 		const rewriteCacheDir = activeResidentCacheDir(rewrite);
@@ -208,9 +203,9 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 	});
 
 	it("keeps warm materialized resident text readable until entry revision invalidation after cache deletion", async () => {
-		// Plan contract: "typed corruption for active materialization" — data that predates
-		// corruption remains readable from the warm in-memory view, equivalent to a
-		// caller-held array, but the next rematerialization must surface ResidentBlobMissingError.
+		// Data that predates corruption remains readable from the warm in-memory view,
+		// equivalent to a caller-held array. The next rematerialization degrades to a
+		// public-safe placeholder instead of throwing an unhandled rejection.
 		const sentinel = `warm sabotage resident text ${"w".repeat(2048)}`;
 		const { sm } = await createPersistedLargeTextSession(sentinel);
 		const warmEntries = sm.getEntries();
@@ -221,7 +216,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
 
 		sm.appendMessage(assistantMessage("invalidate warm resident view"));
-		expectMissingBlob(() => sm.getEntries());
+		expectResidentPlaceholder(sm.getEntries());
 		await sm.close().catch(() => {});
 	});
 	it("keeps encrypted reasoning replay strings inline instead of resident-blob externalizing them", async () => {

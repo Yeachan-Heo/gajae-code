@@ -1461,9 +1461,25 @@ function materializeResidentEntrySync<T extends FileEntry | SessionEntry>(
 function materializeResidentEntriesSync<T extends FileEntry | SessionEntry>(
 	entries: T[],
 	stores: ResidentBlobStores,
+	missingPolicy: ResidentBlobMissingPolicy = "throw",
 ): T[] {
 	const cache = new Map<string, string>();
-	return entries.map(entry => materializeResidentEntrySync(entry, stores, cache));
+	return entries.map(entry => materializeResidentEntrySync(entry, stores, cache, missingPolicy));
+}
+
+function materializeResidentEntryForReadSync<T extends FileEntry | SessionEntry>(
+	entry: T,
+	stores: ResidentBlobStores,
+	cache: Map<string, string>,
+): T {
+	return materializeResidentEntrySync(entry, stores, cache, "placeholder");
+}
+
+function materializeResidentEntriesForReadSync<T extends FileEntry | SessionEntry>(
+	entries: T[],
+	stores: ResidentBlobStores,
+): T[] {
+	return materializeResidentEntriesSync(entries, stores, "placeholder");
 }
 
 function materializeResidentEntryForPersistenceSync<T extends FileEntry | SessionEntry>(
@@ -1520,12 +1536,24 @@ function cloneSessionEntry(entry: SessionEntry): SessionEntry {
 function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: ResidentBlobStores): SessionEntry {
 	if (entry.type === "compaction") {
 		const cache = new Map<string, string>();
-		const summary = materializeResidentValueSync(entry.summary, stores, "summary", cache);
-		const shortSummary = materializeResidentValueSync(entry.shortSummary, stores, "shortSummary", cache);
+		const summary = materializeResidentValueSync(entry.summary, stores, "summary", cache, "placeholder");
+		const shortSummary = materializeResidentValueSync(
+			entry.shortSummary,
+			stores,
+			"shortSummary",
+			cache,
+			"placeholder",
+		);
 		const remote = entry.preserveData?.openaiRemoteCompaction;
 		const remoteRecord = isRecord(remote) ? remote : undefined;
 		const replacementHistory = remoteRecord
-			? materializeResidentValueSync(remoteRecord.replacementHistory, stores, "replacementHistory", cache)
+			? materializeResidentValueSync(
+					remoteRecord.replacementHistory,
+					stores,
+					"replacementHistory",
+					cache,
+					"placeholder",
+				)
 			: undefined;
 		const preserveData =
 			remoteRecord && replacementHistory !== undefined && replacementHistory !== remoteRecord.replacementHistory
@@ -1545,7 +1573,13 @@ function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: Reside
 		};
 	}
 	if (entry.type === "branch_summary") {
-		const summary = materializeResidentValueSync(entry.summary, stores, "summary", new Map<string, string>());
+		const summary = materializeResidentValueSync(
+			entry.summary,
+			stores,
+			"summary",
+			new Map<string, string>(),
+			"placeholder",
+		);
 		return typeof summary === "string" ? { ...entry, summary } : { ...entry };
 	}
 	return cloneSessionEntry(entry);
@@ -2751,7 +2785,10 @@ export class SessionManager {
 	}
 
 	captureState(): SessionManagerStateSnapshot {
-		const materializedFileEntries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores());
+		const materializedFileEntries = materializeResidentEntriesForReadSync(
+			this.#fileEntries,
+			this.#residentBlobStores(),
+		);
 		return {
 			sessionId: this.#sessionId,
 			sessionName: this.#sessionName,
@@ -2875,7 +2912,7 @@ export class SessionManager {
 
 		const oldSessionFile = this.#sessionFile;
 		const oldSessionId = this.#sessionId;
-		const materializedEntries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores());
+		const materializedEntries = materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores());
 
 		// Close the current writer
 		await this.#closePersistWriter();
@@ -2947,7 +2984,10 @@ export class SessionManager {
 			hadSessionFile = this.storage.existsSync(oldSessionFile);
 			let movedSessionFile = false;
 			let movedArtifactDir = false;
-			const materializedEntries = materializeResidentEntriesSync(this.#fileEntries, this.#residentBlobStores());
+			const materializedEntries = materializeResidentEntriesForReadSync(
+				this.#fileEntries,
+				this.#residentBlobStores(),
+			);
 			const restoreResidentStateAfterFailure = (): void => {
 				this.#fileEntries = materializedEntries;
 				this.#resetResidentTextBlobStore();
@@ -4006,7 +4046,7 @@ export class SessionManager {
 	getLeafEntry(): SessionEntry | undefined {
 		if (!this.#leafId) return undefined;
 		const entry = this.#byId.get(this.#leafId);
-		return entry ? materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map()) : undefined;
+		return entry ? materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()) : undefined;
 	}
 
 	/**
@@ -4176,7 +4216,7 @@ export class SessionManager {
 		const entry = this.#byId.get(id);
 		return entry
 			? rehydrateColdSpillEntry(
-					materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map()),
+					materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()),
 					this.#blobStore,
 					this.#residentBlobStoresForColdRehydrate(),
 				)
@@ -4193,7 +4233,7 @@ export class SessionManager {
 			visited.add(current.id);
 			path.push(
 				rehydrateColdSpillEntry(
-					materializeResidentEntrySync(current, this.#residentBlobStores(), cache),
+					materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache),
 					this.#blobStore,
 					this.#residentBlobStoresForColdRehydrate(),
 				),
@@ -4233,7 +4273,7 @@ export class SessionManager {
 			.filter((entry): entry is SessionEntry => entry.type !== "session")
 			.map(entry =>
 				rehydrateColdSpillEntry(
-					materializeResidentEntrySync(entry, this.#residentBlobStores(), cache),
+					materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache),
 					this.#blobStore,
 					this.#residentBlobStoresForColdRehydrate(),
 				),
@@ -4244,7 +4284,7 @@ export class SessionManager {
 		this.#publicMaterializerCallCount++;
 		this.#getEntryMaterializerCallCount++;
 		const entry = this.#byId.get(id);
-		return entry ? materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map()) : undefined;
+		return entry ? materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()) : undefined;
 	}
 
 	/**
@@ -4255,7 +4295,7 @@ export class SessionManager {
 		const children: SessionEntry[] = [];
 		for (const entry of this.#byId.values()) {
 			if (entry.parentId === parentId) {
-				children.push(materializeResidentEntrySync(entry, this.#residentBlobStores(), cache));
+				children.push(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache));
 			}
 		}
 		return children;
@@ -4310,7 +4350,7 @@ export class SessionManager {
 		while (current) {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
-			path.push(materializeResidentEntrySync(current, this.#residentBlobStores(), cache));
+			path.push(materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache));
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
 		path.reverse();
@@ -4375,7 +4415,7 @@ export class SessionManager {
 		}
 		if (entry.type !== "message" && entry.type !== "custom_message")
 			return materializeProviderVisibleEntrySync(entry, this.#residentBlobStores());
-		const materialized = materializeResidentEntrySync(entry, this.#residentBlobStores(), new Map());
+		const materialized = materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map());
 		const rehydrated = rehydrateColdSpillEntry(
 			materialized,
 			this.#blobStore,
@@ -4434,7 +4474,7 @@ export class SessionManager {
 		const resolvedTextBlobCache = new Map<string, string>();
 		const materializedEntries = this.#fileEntries
 			.filter((e): e is SessionEntry => e.type !== "session")
-			.map(entry => materializeResidentEntrySync(entry, this.#residentBlobStores(), resolvedTextBlobCache));
+			.map(entry => materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), resolvedTextBlobCache));
 		this.#materializedEntriesCache = materializedEntries;
 		this.#materializedEntriesRevision = this.#entryRevision;
 		return materializedEntries;
@@ -4591,7 +4631,7 @@ export class SessionManager {
 
 		// Filter out LabelEntry from path - we'll recreate them from the resolved map
 		const pathWithoutLabels = branchPath.filter(e => e.type !== "label");
-		const materializedPathWithoutLabels = materializeResidentEntriesSync(
+		const materializedPathWithoutLabels = materializeResidentEntriesForReadSync(
 			pathWithoutLabels,
 			this.#residentBlobStores(),
 		);
