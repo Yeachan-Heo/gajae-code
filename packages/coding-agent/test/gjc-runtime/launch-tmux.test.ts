@@ -255,6 +255,34 @@ describe("default GJC tmux launch", () => {
 		expect(writeSpy).not.toHaveBeenCalled();
 	});
 
+	it("honors the documented GJC_NO_TITLE alias while launching managed tmux", () => {
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: { GJC_NO_TITLE: "1" },
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			currentBranch: "feature/demo",
+			spawnSync: (command, spawnArgs) => {
+				calls.push({ command, args: spawnArgs });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.some(call => call.args.includes("set-titles") || call.args.includes("set-titles-string"))).toBe(
+			false,
+		);
+		expect(writeSpy).not.toHaveBeenCalled();
+	});
+
 	it("passes prefixed tmux window titles after the tmux option separator", () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
 		const handled = launchDefaultTmuxIfNeeded({

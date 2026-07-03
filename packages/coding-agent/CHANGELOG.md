@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The managed tmux launch root-terminal-title guard now honors the documented `GJC_NO_TITLE` alias in addition to `PI_NO_TITLE`; previously the documented flag did not suppress the tmux root terminal title.
+
 ### Added
 
 - The `/model` preset landing now shows the session's current preset, model, and per-role assignments in the header, marks the active preset with `(current)`, and Enter now expands/collapses provider groups (right/left arrows still work).
