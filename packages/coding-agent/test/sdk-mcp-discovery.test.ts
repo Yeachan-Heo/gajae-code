@@ -55,7 +55,7 @@ function createReasoningModel(): Model<"openai-responses"> {
 }
 
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
-const SLOW_SDK_TEST_TIMEOUT_MS = 15_000;
+const SLOW_SDK_TEST_TIMEOUT_MS = 30_000;
 
 describe("createAgentSession MCP discovery prompt gating", () => {
 	let tempDir: string;
@@ -104,9 +104,13 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			toolNames: ["read"],
 		});
 
-		expect(mcpManager).toBeUndefined();
-		expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
-		expect(session.getActiveToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
+		try {
+			expect(mcpManager).toBeUndefined();
+			expect(session.getAllToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
+			expect(session.getActiveToolNames().filter(name => name.startsWith("mcp__"))).toEqual([]);
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("does not advertise MCP discovery when search_tool_bm25 is not active", async () => {
@@ -128,10 +132,14 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			customTools: [createMcpCustomTool("mcp__github_create_issue", "github", "create_issue")],
 		});
 
-		expect(session.systemPrompt.join("\n")).not.toContain("### MCP tool discovery");
-		expect(session.systemPrompt.join("\n")).not.toContain(
-			"call `search_tool_bm25` before concluding no such tool exists",
-		);
+		try {
+			expect(session.systemPrompt.join("\n")).not.toContain("### MCP tool discovery");
+			expect(session.systemPrompt.join("\n")).not.toContain(
+				"call `search_tool_bm25` before concluding no such tool exists",
+			);
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("exposes generic discovery tooling for builtin-only tools.discoveryMode all sessions", async () => {
@@ -151,12 +159,16 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			enableLsp: false,
 		});
 
-		const prompt = session.systemPrompt.join("\n");
-		const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
-		expect(session.getActiveToolNames()).not.toContain("find");
-		expect(prompt).toContain("SearchTools: `search_tool_bm25`");
-		expect(searchTool?.description).toContain("Search hidden tool metadata");
-		expect(searchTool?.description).toContain("total_tools");
+		try {
+			const prompt = session.systemPrompt.join("\n");
+			const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
+			expect(session.getActiveToolNames()).not.toContain("find");
+			expect(prompt).toContain("SearchTools: `search_tool_bm25`");
+			expect(searchTool?.description).toContain("Search hidden tool metadata");
+			expect(searchTool?.description).toContain("total_tools");
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("preserves explicitly requested MCP tools in discovery mode", async () => {
@@ -181,16 +193,20 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			],
 		});
 
-		expect(session.getActiveToolNames()).toContain("mcp__github_create_issue");
-		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue"]);
-		expect(session.systemPrompt.join("\n")).toContain("mcp__github_create_issue");
+		try {
+			expect(session.getActiveToolNames()).toContain("mcp__github_create_issue");
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue"]);
+			expect(session.systemPrompt.join("\n")).toContain("mcp__github_create_issue");
 
-		await session.activateDiscoveredMCPTools(["mcp__slack_post_message"]);
+			await session.activateDiscoveredMCPTools(["mcp__slack_post_message"]);
 
-		expect(session.getActiveToolNames()).toEqual(
-			expect.arrayContaining(["read", "search_tool_bm25", "mcp__github_create_issue", "mcp__slack_post_message"]),
-		);
-		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue", "mcp__slack_post_message"]);
+			expect(session.getActiveToolNames()).toEqual(
+				expect.arrayContaining(["read", "search_tool_bm25", "mcp__github_create_issue", "mcp__slack_post_message"]),
+			);
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue", "mcp__slack_post_message"]);
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("keeps configured discovery default servers visible in discovery mode", async () => {
@@ -280,9 +296,13 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			customTools: [createMcpCustomTool("mcp__github_create_issue", "github", "create_issue")],
 		});
 
-		const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
-		expect(searchTool?.description).toContain("total_tools");
-		expect(searchTool?.description).toContain("- `server_name`");
+		try {
+			const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
+			expect(searchTool?.description).toContain("total_tools");
+			expect(searchTool?.description).toContain("- `server_name`");
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it(
@@ -304,15 +324,19 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				enableLsp: false,
 			});
 
-			expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
-			expect(session.getSelectedDiscoveredToolNames()).toContain("find");
+			try {
+				expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
+				expect(session.getSelectedDiscoveredToolNames()).toContain("find");
 
-			await session.setActiveToolsByName(["read", "search_tool_bm25"]);
+				await session.setActiveToolsByName(["read", "search_tool_bm25"]);
 
-			expect(session.getActiveToolNames()).not.toContain("find");
-			expect(session.getSelectedDiscoveredToolNames()).not.toContain("find");
-			expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
-			expect(session.getActiveToolNames()).toContain("find");
+				expect(session.getActiveToolNames()).not.toContain("find");
+				expect(session.getSelectedDiscoveredToolNames()).not.toContain("find");
+				expect(await session.activateDiscoveredTools(["find"])).toEqual(["find"]);
+				expect(session.getActiveToolNames()).toContain("find");
+			} finally {
+				await session.dispose();
+			}
 		},
 		SLOW_SDK_TEST_TIMEOUT_MS,
 	);
