@@ -4,7 +4,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import { $flag, getDebugLogPath, logger } from "@gajae-code/utils";
+import { $flag, $pickflag, getDebugLogPath, logger } from "@gajae-code/utils";
 import { getKeybindings } from "./keybindings";
 import { isKeyRelease } from "./keys";
 import { renderMetrics } from "./metrics";
@@ -346,12 +346,12 @@ export class TUI extends Container {
 	#sixelProbeBuffer = "";
 	#sixelProbeTimeout?: NodeJS.Timeout;
 	#sixelProbeUnsubscribe?: () => void;
-	#showHardwareCursor = $flag("PI_HARDWARE_CURSOR");
+	#showHardwareCursor = $pickflag("GJC_HARDWARE_CURSOR", "PI_HARDWARE_CURSOR");
 	// macOS: steady-block cursor anchors CJK IME overlays; disable with GJC_TUI_IME_CURSOR=0.
 	readonly #useImeBlockCursor = $flag("GJC_TUI_IME_CURSOR", process.platform === "darwin");
 	// showHardwareCursor=false but cursor is shown for IME anchoring (macOS).
 	#imeCursorActive = false;
-	#clearOnShrink = $flag("PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
+	#clearOnShrink = $pickflag("GJC_CLEAR_ON_SHRINK", "PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
 	// Opt-in: reuse the previous normalized off-screen prefix and only normalize/diff the
 	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical.
 	#virtualViewport = $flag("PI_TUI_VIRTUAL_VIEWPORT");
@@ -1505,7 +1505,7 @@ export class TUI extends Container {
 			buffer += "\x1b[?2026l";
 			if (!this.#writeTerminal(buffer)) return;
 
-			if ($flag("PI_DEBUG_REDRAW")) {
+			if ($pickflag("GJC_DEBUG_REDRAW", "PI_DEBUG_REDRAW")) {
 				const logPath = getDebugLogPath();
 				const msg = `[${new Date().toISOString()}] multiplexerViewportRepaint: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
 				fs.appendFileSync(logPath, msg);
@@ -1522,7 +1522,7 @@ export class TUI extends Container {
 			this.#previousHeight = height;
 		};
 
-		const debugRedraw = $flag("PI_DEBUG_REDRAW");
+		const debugRedraw = $pickflag("GJC_DEBUG_REDRAW", "PI_DEBUG_REDRAW");
 		const logRedraw = (reason: string): void => {
 			if (!debugRedraw) return;
 			const logPath = getDebugLogPath();
@@ -1750,7 +1750,7 @@ export class TUI extends Container {
 		buffer += seq;
 		buffer += "\x1b[?2026l"; // End synchronized output
 
-		if ($flag("PI_TUI_DEBUG")) {
+		if ($pickflag("GJC_TUI_DEBUG", "PI_TUI_DEBUG")) {
 			const debugDir = "/tmp/tui";
 			fs.mkdirSync(debugDir, { recursive: true });
 			const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);

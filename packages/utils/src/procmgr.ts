@@ -43,7 +43,7 @@ function isExecutable(path: string): boolean {
  * Build the spawn environment (cached).
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
-	const noCI = $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
+	const noCI = $env.GJC_BASH_NO_CI || $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
 	return {
 		...filterProcessEnv(Bun.env),
 		SHELL: shell,
@@ -57,10 +57,10 @@ function buildSpawnEnv(shell: string): Record<string, string> {
 
 /**
  * Get shell args, optionally including login shell flag.
- * Supports PI_BASH_NO_LOGIN and ANTHROPIC_MODEL_BASH_NO_LOGIN to skip -l.
+ * Supports GJC_BASH_NO_LOGIN (legacy: PI_BASH_NO_LOGIN, CLAUDE_BASH_NO_LOGIN) to skip -l.
  */
 function getShellArgs(): string[] {
-	const noLogin = $env.PI_BASH_NO_LOGIN || $env.CLAUDE_BASH_NO_LOGIN;
+	const noLogin = $env.GJC_BASH_NO_LOGIN || $env.PI_BASH_NO_LOGIN || $env.CLAUDE_BASH_NO_LOGIN;
 	return noLogin ? ["-c"] : ["-l", "-c"];
 }
 
@@ -68,7 +68,7 @@ function getShellArgs(): string[] {
  * Get shell prefix for wrapping commands (profilers, strace, etc.).
  */
 function getShellPrefix(): string | undefined {
-	return $env.PI_SHELL_PREFIX || $env.CLAUDE_CODE_SHELL_PREFIX;
+	return $env.GJC_SHELL_PREFIX || $env.PI_SHELL_PREFIX || $env.CLAUDE_CODE_SHELL_PREFIX;
 }
 
 /**

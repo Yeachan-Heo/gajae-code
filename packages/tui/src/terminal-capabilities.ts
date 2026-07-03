@@ -1,5 +1,5 @@
 import { encodeSixel } from "@gajae-code/natives";
-import { $env } from "@gajae-code/utils";
+import { $pickenv } from "@gajae-code/utils";
 
 export enum ImageProtocol {
 	Kitty = "\x1b_G",
@@ -48,13 +48,17 @@ export class TerminalInfo {
 }
 
 export function isNotificationSuppressed(): boolean {
-	const value = $env.PI_NOTIFICATIONS;
-	if (!value) return false;
-	return value === "off" || value === "0" || value === "false";
+	// GJC_NOTIFICATIONS also carries daemon-enable values ("1"/token), so an
+	// explicit suppression value on EITHER name wins rather than the first
+	// non-empty name (e.g. RPC mode sets PI_NOTIFICATIONS=off while a user
+	// session may export GJC_NOTIFICATIONS=1 for the notifications daemon).
+	const isSuppression = (value: string | undefined): boolean =>
+		value === "off" || value === "0" || value === "false";
+	return isSuppression($pickenv("GJC_NOTIFICATIONS")) || isSuppression($pickenv("PI_NOTIFICATIONS"));
 }
 
 function getForcedImageProtocol(): ImageProtocol | null | undefined {
-	const raw = $env.PI_FORCE_IMAGE_PROTOCOL?.trim().toLowerCase();
+	const raw = $pickenv("GJC_FORCE_IMAGE_PROTOCOL", "PI_FORCE_IMAGE_PROTOCOL")?.trim().toLowerCase();
 	if (!raw) return undefined;
 	if (raw === "kitty") return ImageProtocol.Kitty;
 	if (raw === "iterm2" || raw === "iterm") return ImageProtocol.Iterm2;

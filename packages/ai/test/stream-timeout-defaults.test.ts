@@ -11,6 +11,9 @@ import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs } from "../src/uti
  */
 
 const ENV_KEYS = [
+	"GJC_STREAM_IDLE_TIMEOUT_MS",
+	"GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS",
+	"GJC_STREAM_FIRST_EVENT_TIMEOUT_MS",
 	"PI_STREAM_IDLE_TIMEOUT_MS",
 	"PI_OPENAI_STREAM_IDLE_TIMEOUT_MS",
 	"PI_STREAM_FIRST_EVENT_TIMEOUT_MS",
@@ -50,6 +53,17 @@ describe("getStreamIdleTimeoutMs(fallbackMs)", () => {
 		Bun.env.PI_STREAM_IDLE_TIMEOUT_MS = "0";
 		expect(getStreamIdleTimeoutMs(300_000)).toBeUndefined();
 	});
+
+	it("lets the documented GJC_STREAM_IDLE_TIMEOUT_MS name override the per-provider fallback", () => {
+		Bun.env.GJC_STREAM_IDLE_TIMEOUT_MS = "42";
+		expect(getStreamIdleTimeoutMs(300_000)).toBe(42);
+	});
+
+	it("prefers GJC_STREAM_IDLE_TIMEOUT_MS over the legacy PI_ name when both are set", () => {
+		Bun.env.GJC_STREAM_IDLE_TIMEOUT_MS = "42";
+		Bun.env.PI_STREAM_IDLE_TIMEOUT_MS = "99";
+		expect(getStreamIdleTimeoutMs(300_000)).toBe(42);
+	});
 });
 
 describe("getStreamFirstEventTimeoutMs(idleTimeoutMs, fallbackMs)", () => {
@@ -73,6 +87,11 @@ describe("getStreamFirstEventTimeoutMs(idleTimeoutMs, fallbackMs)", () => {
 	it("treats PI_STREAM_FIRST_EVENT_TIMEOUT_MS=0 as a watchdog disable", () => {
 		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "0";
 		expect(getStreamFirstEventTimeoutMs(undefined, 300_000)).toBeUndefined();
+	});
+
+	it("lets the documented GJC_STREAM_FIRST_EVENT_TIMEOUT_MS name override the per-provider fallback", () => {
+		Bun.env.GJC_STREAM_FIRST_EVENT_TIMEOUT_MS = "42";
+		expect(getStreamFirstEventTimeoutMs(undefined, 300_000)).toBe(42);
 	});
 
 	it("falls back to the 100s global default when no fallback or env is provided", () => {

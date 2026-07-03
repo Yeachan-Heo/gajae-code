@@ -20,7 +20,7 @@ Most runtime lookups use `$env` from `@gajae-code/utils` (`packages/utils/src/en
 4. Config-root `.env` (`~/.gjc/.env`, respecting `GJC_CONFIG_DIR`) for keys not already set
 5. Home `.env` (`~/.env`) for keys not already set
 
-Additional rule inside each `.env` file: `GJC_*` keys are mirrored to `GJC_*` keys in that parsed file.
+Naming rule: `GJC_*` is the current name for every GJC-owned variable. Where a variable predates the rebrand, the legacy `PI_*`-prefixed name (and, for Claude Code-inherited variables, the `CLAUDE_*` name) remains supported as a fallback — the `GJC_*` name wins when both are set.
 
 ---
 
@@ -34,7 +34,7 @@ These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless not
 | ------------------------------- | ------------------------------------------------ | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `ANTHROPIC_OAUTH_TOKEN`         | Anthropic API auth                               | Using Anthropic with OAuth token auth                          | Takes precedence over `ANTHROPIC_API_KEY` for provider auth resolution                              |
 | `ANTHROPIC_API_KEY`             | Anthropic API auth                               | Using Anthropic without OAuth token                            | Fallback after `ANTHROPIC_OAUTH_TOKEN`                                                              |
-| `ANTHROPIC_FOUNDRY_API_KEY`     | Anthropic via Azure Foundry / enterprise gateway | `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` enabled                              | Takes precedence over `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` when Foundry mode is enabled  |
+| `ANTHROPIC_FOUNDRY_API_KEY`     | Anthropic via Azure Foundry / enterprise gateway | `CLAUDE_CODE_USE_FOUNDRY` enabled                              | Takes precedence over `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` when Foundry mode is enabled  |
 | `OPENAI_API_KEY`                | OpenAI auth                                      | Using OpenAI-family providers without explicit apiKey argument | Used by OpenAI Completions/Responses providers                                                      |
 | `GEMINI_API_KEY`                | Google Gemini auth                               | Using `google` provider models                                 | Primary key for Gemini provider mapping                                                             |
 | `GOOGLE_API_KEY`                | Gemini image tool auth fallback                  | Using `gemini_image` tool without `GEMINI_API_KEY`             | Used by coding-agent image tool fallback path                                                       |
@@ -111,27 +111,27 @@ When more than one OAuth credential is stored for the same provider (e.g. severa
 
 ### Anthropic Foundry Gateway (Azure / enterprise proxy)
 
-When `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to Foundry mode:
+When `CLAUDE_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to Foundry mode:
 
 - Base URL resolves from `FOUNDRY_BASE_URL` (fallback remains model/default base URL if unset).
 - API key resolution for provider `anthropic` becomes:
   `ANTHROPIC_FOUNDRY_API_KEY` → `ANTHROPIC_OAUTH_TOKEN` → `ANTHROPIC_API_KEY`.
 - `ANTHROPIC_CUSTOM_HEADERS` is parsed as comma/newline-separated `key: value` pairs and merged into request headers.
 - TLS client/server material can be injected from env values:
-  `NODE_EXTRA_CA_CERTS`, `ANTHROPIC_MODEL_CODE_CLIENT_CERT`, `ANTHROPIC_MODEL_CODE_CLIENT_KEY`.
+  `NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`.
   Each accepts either:
   - a filesystem path to PEM content, or
   - inline PEM (including escaped `\n` sequences).
 
 | Variable                    | Value type                                     | Behavior                                                                      |
 | --------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------- |
-| `ANTHROPIC_MODEL_CODE_USE_FOUNDRY`   | Boolean-like string (`1`, `true`, `yes`, `on`) | Enables Foundry mode for Anthropic provider                                   |
+| `CLAUDE_CODE_USE_FOUNDRY`   | Boolean-like string (`1`, `true`, `yes`, `on`) | Enables Foundry mode for Anthropic provider                                   |
 | `FOUNDRY_BASE_URL`          | URL string                                     | Anthropic endpoint base URL in Foundry mode                                   |
 | `ANTHROPIC_FOUNDRY_API_KEY` | Token string                                   | Used for `Authorization: Bearer <token>`                                      |
 | `ANTHROPIC_CUSTOM_HEADERS`  | Header list string                             | Extra headers; format `header-a: value, header-b: value` or newline-separated |
 | `NODE_EXTRA_CA_CERTS`       | PEM path or inline PEM                         | Extra CA chain for server certificate validation                              |
-| `ANTHROPIC_MODEL_CODE_CLIENT_CERT`   | PEM path or inline PEM                         | mTLS client certificate                                                       |
-| `ANTHROPIC_MODEL_CODE_CLIENT_KEY`    | PEM path or inline PEM                         | mTLS client private key (must be paired with cert)                            |
+| `CLAUDE_CODE_CLIENT_CERT`   | PEM path or inline PEM                         | mTLS client certificate                                                       |
+| `CLAUDE_CODE_CLIENT_KEY`    | PEM path or inline PEM                         | mTLS client private key (must be paired with cert)                            |
 
 ### Amazon Bedrock
 
@@ -223,15 +223,6 @@ providers:
 ```
 
 `models.yml` is strict: unsupported provider/model keys fail validation before the provider request is dispatched.
-
-### GJC workflow bridge commands
-
-`gjc ralplan`, `gjc deep-interview`, and `gjc state` are private runtime bridge commands. They require `GJC_RUNTIME_BINARY` (or legacy `GJC_LEGACY_RUNTIME_BINARY`) to point at the private runtime executable; public bundled workflow use remains through `/skill:ralplan` and `/skill:deep-interview` inside a GJC session.
-
-| Variable | Behavior |
-| --- | --- |
-| `GJC_RUNTIME_BINARY` | Private runtime bridge binary for `gjc ralplan`, `gjc deep-interview`, and `gjc state` |
-| `GJC_LEGACY_RUNTIME_BINARY` | Legacy fallback bridge binary name |
 
 ### Interactive `--tmux` startup and scroll/mouse profile
 
@@ -347,11 +338,12 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | ------------------------------------ | ---------------------------------------------------- |
 | `GJC_OPENAI_CODE_DEBUG`                     | `1`/`true` enables OpenAI code provider debug logging      |
 | `GJC_OPENAI_CODE_WEBSOCKET`                 | `1`/`true` enables websocket transport preference    |
-| `GJC_OPENAI_CODE_WEBSOCKET_V2`              | `1`/`true` enables websocket v2 path                 |
 | `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS` | Positive integer override (default 300000)           |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_BUDGET`    | Non-negative integer override (default 5)            |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_DELAY_MS`  | Positive integer base backoff override (default 500) |
 | `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS`   | Positive integer OpenAI stream idle timeout override |
+| `GJC_STREAM_IDLE_TIMEOUT_MS`   | Positive integer stream idle timeout override for all provider streaming transports; `0` disables the watchdog |
+| `GJC_STREAM_FIRST_EVENT_TIMEOUT_MS`   | Positive integer timeout while waiting for the first stream event; `0` disables the watchdog |
 
 ### Cursor provider debug
 
@@ -397,7 +389,7 @@ SearXNG also reads the equivalent `searxng.endpoint`, `searxng.token`, `searxng.
 Anthropic web search uses `findAnthropicAuth()` from `packages/ai/src/utils/anthropic-auth.ts` in this order:
 
 1. `ANTHROPIC_SEARCH_API_KEY` (+ optional `ANTHROPIC_SEARCH_BASE_URL`)
-2. `ANTHROPIC_FOUNDRY_API_KEY` when `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` is enabled
+2. `ANTHROPIC_FOUNDRY_API_KEY` when `CLAUDE_CODE_USE_FOUNDRY` is enabled
 3. Anthropic OAuth credentials from `agent.db` (must not expire within 5-minute buffer)
 4. Anthropic API-key credentials from `agent.db`
 5. Generic Anthropic env fallback: provider key (`ANTHROPIC_FOUNDRY_API_KEY` in Foundry mode, otherwise `ANTHROPIC_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`) + optional `ANTHROPIC_BASE_URL` (`FOUNDRY_BASE_URL` when Foundry mode is enabled)
@@ -423,7 +415,7 @@ Related vars:
 
 | Variable                  | Default / behavior                                                                                                  |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `GJC_PY`                   | Eval backend override: `0`/`bash`=JavaScript only, `1`/`py`=Python only, `mix`/`both`=both; invalid values ignored |
+| `GJC_PY` / `GJC_JS`         | Per-backend eval overrides. Each is a boolean flag (`1`/`true` enables, anything else disables); unset defers to the `eval.py` / `eval.js` settings (default enabled) |
 | `GJC_PYTHON_SKIP_CHECK`    | If `1`, skips Python interpreter availability checks (subprocess runner still starts on demand)                     |
 | `GJC_PYTHON_INTEGRATION`   | If `1`, opts gated integration tests in (e.g. `python-runner.integration.test.ts`) into running against real Python |
 | `GJC_PYTHON_IPC_TRACE`     | If `1`, logs NDJSON frames exchanged with the Python runner subprocess                                              |
@@ -488,15 +480,15 @@ These are consumed via `@gajae-code/utils/dirs` and affect where coding-agent st
 | Variable                   | Behavior                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------ |
 | `GJC_BASH_NO_CI`            | Suppresses automatic `CI=true` injection into spawned shell env                |
-| `ANTHROPIC_MODEL_BASH_NO_CI`        | Legacy alias fallback for `GJC_BASH_NO_CI`                                      |
+| `PI_BASH_NO_CI` / `CLAUDE_BASH_NO_CI` | Legacy alias fallbacks for `GJC_BASH_NO_CI`                          |
 | `GJC_BASH_NO_LOGIN`         | Disables login-shell mode; shell args become `['-c']` instead of `['-l','-c']` |
-| `ANTHROPIC_MODEL_BASH_NO_LOGIN`     | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                   |
+| `PI_BASH_NO_LOGIN` / `CLAUDE_BASH_NO_LOGIN` | Legacy alias fallbacks for `GJC_BASH_NO_LOGIN`                  |
 | `GJC_SHELL_PREFIX`          | Optional command prefix wrapper                                                |
-| `ANTHROPIC_MODEL_CODE_SHELL_PREFIX` | Legacy alias fallback for `GJC_SHELL_PREFIX`                                    |
+| `PI_SHELL_PREFIX` / `CLAUDE_CODE_SHELL_PREFIX` | Legacy alias fallbacks for `GJC_SHELL_PREFIX`                |
 | `VISUAL`                   | Preferred external editor command                                              |
 | `EDITOR`                   | Fallback external editor command                                               |
 
-Current implementation: `GJC_BASH_NO_LOGIN`/`ANTHROPIC_MODEL_BASH_NO_LOGIN` are active; when either is set, `getShellArgs()` returns `['-c']`.
+Current implementation: `GJC_BASH_NO_LOGIN` (or a legacy alias) being set makes `getShellArgs()` return `['-c']`.
 
 ---
 
@@ -572,7 +564,7 @@ Treat these as secrets; do not log or commit them:
 - Provider/API keys and OAuth/bearer credentials (all `*_API_KEY`, `*_TOKEN`, OAuth access/refresh tokens)
 - Cloud credentials (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS` path may expose service-account material)
 - Search/provider auth vars (`EXA_API_KEY`, `BRAVE_API_KEY`, `PERPLEXITY_API_KEY`, Anthropic search keys)
-- Foundry mTLS material (`ANTHROPIC_MODEL_CODE_CLIENT_CERT`, `ANTHROPIC_MODEL_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
+- Foundry mTLS material (`CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
 - Bridge auth/TLS material (`GJC_BRIDGE_TOKEN` and the `GJC_BRIDGE_TLS_KEY` private key; never commit cert/key/token material)
 
 Python runtime also explicitly strips many common key vars before spawning kernel subprocesses (`packages/coding-agent/src/eval/py/runtime.ts`).

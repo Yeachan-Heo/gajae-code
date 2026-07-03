@@ -1,5 +1,5 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { prompt } from "@gajae-code/utils";
+import { $pickenv, prompt } from "@gajae-code/utils";
 import type * as z from "zod/v4";
 import {
 	executeHashlineSingle,
@@ -76,7 +76,7 @@ function resolveConfiguredEditMode(rawEditMode: string): EditMode | undefined {
 
 	const editMode = normalizeEditMode(rawEditMode);
 	if (!editMode) {
-		throw new Error(`Invalid PI_EDIT_VARIANT: ${rawEditMode}`);
+		throw new Error(`Invalid GJC_EDIT_VARIANT: ${rawEditMode}`);
 	}
 
 	return editMode;
@@ -288,11 +288,9 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #pendingDeferredFetches = new Map<string, AbortController>();
 
 	constructor(private readonly session: ToolSession) {
-		const {
-			PI_EDIT_FUZZY: editFuzzy = "auto",
-			PI_EDIT_FUZZY_THRESHOLD: editFuzzyThreshold = "auto",
-			PI_EDIT_VARIANT: envEditVariant = "auto",
-		} = Bun.env;
+		const editFuzzy = $pickenv("GJC_EDIT_FUZZY", "PI_EDIT_FUZZY") ?? "auto";
+		const editFuzzyThreshold = $pickenv("GJC_EDIT_FUZZY_THRESHOLD", "PI_EDIT_FUZZY_THRESHOLD") ?? "auto";
+		const envEditVariant = $pickenv("GJC_EDIT_VARIANT", "PI_EDIT_VARIANT") ?? "auto";
 
 		this.#editMode = resolveConfiguredEditMode(envEditVariant);
 		this.#allowFuzzy = resolveAllowFuzzy(session, editFuzzy);

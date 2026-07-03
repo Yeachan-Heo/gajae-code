@@ -276,3 +276,14 @@ export function $flag(name: string, def: boolean = false): boolean {
 	if (!value) return def;
 	return TRUTHY[value] === true;
 }
+
+/**
+ * Boolean-flag counterpart of {@link $pickenv}: the first key with a non-empty
+ * value decides the flag, so an explicit `GJC_X=0` wins over a legacy `PI_X=1`
+ * fallback listed after it.
+ */
+export function $pickflag(...keys: string[]): boolean {
+	const value = $pickenv(...keys);
+	if (!value) return false;
+	return TRUTHY[value] === true;
+}

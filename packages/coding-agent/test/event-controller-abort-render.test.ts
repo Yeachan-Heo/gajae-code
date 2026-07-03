@@ -152,18 +152,18 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		await controller.handleEvent({ type: "message_end", message });
 
 		expect(message.errorMessage).toBe(
-			"Aborted after 1 retry attempt: Anthropic stream stalled while waiting for the next event. Hint: set PI_STREAM_IDLE_TIMEOUT_MS=300000 for slow reasoning/proxy streams, or PI_STREAM_IDLE_TIMEOUT_MS=0 to disable the watchdog.",
+			"Aborted after 1 retry attempt: Anthropic stream stalled while waiting for the next event. Hint: set GJC_STREAM_IDLE_TIMEOUT_MS=300000 for slow reasoning/proxy streams, or GJC_STREAM_IDLE_TIMEOUT_MS=0 to disable the watchdog.",
 		);
 		expect(streamingComponent.updateContent).toHaveBeenCalledTimes(1);
 		const arg = streamingComponent.updateContent.mock.calls[0]![0] as AssistantMessage;
 		expect(arg).toBe(message);
 		expect(arg.stopReason).toBe("aborted");
-		expect(arg.errorMessage).toContain("PI_STREAM_IDLE_TIMEOUT_MS=300000");
+		expect(arg.errorMessage).toContain("GJC_STREAM_IDLE_TIMEOUT_MS=300000");
 	});
 
 	it("C5: replayed formatted abort label -> does not double-prefix or duplicate hints", async () => {
 		const formatted =
-			"Aborted after 1 retry attempt: Anthropic stream stalled while waiting for the next event. Hint: set PI_STREAM_IDLE_TIMEOUT_MS=300000 for slow reasoning/proxy streams, or PI_STREAM_IDLE_TIMEOUT_MS=0 to disable the watchdog.";
+			"Aborted after 1 retry attempt: Anthropic stream stalled while waiting for the next event. Hint: set GJC_STREAM_IDLE_TIMEOUT_MS=300000 for slow reasoning/proxy streams, or GJC_STREAM_IDLE_TIMEOUT_MS=0 to disable the watchdog.";
 		const message = makeAssistantMessage({
 			stopReason: "aborted",
 			errorMessage: formatted,

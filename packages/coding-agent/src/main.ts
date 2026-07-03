@@ -11,7 +11,7 @@ import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { ImageContent } from "@gajae-code/ai";
 import {
-	$env,
+	$pickenv,
 	getProjectDir,
 	logger,
 	normalizePathForComparison,
@@ -812,6 +812,7 @@ export async function runRootCommand(
 	}
 	modelRegistry.applyConfiguredModelBindings(settingsInstance);
 	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
+		Bun.env.GJC_NO_PTY = "1";
 		Bun.env.PI_NO_PTY = "1";
 	}
 	if (
@@ -821,6 +822,7 @@ export async function runRootCommand(
 		parsedArgs.mode === "acp" ||
 		parsedArgs.mode === "bridge"
 	) {
+		Bun.env.GJC_NO_TITLE = "1";
 		Bun.env.PI_NO_TITLE = "1";
 	}
 	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
@@ -847,9 +849,9 @@ export async function runRootCommand(
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
 	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
-	const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;
-	const slowModel = parsedArgs.slow ?? $env.PI_SLOW_MODEL;
-	const planModel = parsedArgs.plan ?? $env.PI_PLAN_MODEL;
+	const smolModel = parsedArgs.smol ?? $pickenv("GJC_SMOL_MODEL", "PI_SMOL_MODEL");
+	const slowModel = parsedArgs.slow ?? $pickenv("GJC_SLOW_MODEL", "PI_SLOW_MODEL");
+	const planModel = parsedArgs.plan ?? $pickenv("GJC_PLAN_MODEL", "PI_PLAN_MODEL");
 	if (smolModel || slowModel || planModel) {
 		settingsInstance.overrideModelRoles({
 			smol: smolModel,
@@ -1070,9 +1072,10 @@ export async function runRootCommand(
 				process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
 			}
 
-			if ($env.PI_TIMING) {
+			const timing = $pickenv("GJC_TIMING", "PI_TIMING");
+			if (timing) {
 				logger.printTimings();
-				if ($env.PI_TIMING === "x") {
+				if (timing === "x") {
 					process.exit(0);
 				}
 			}
@@ -1101,7 +1104,7 @@ export async function runRootCommand(
 				initialImages,
 				suppressProcessExit: deps.suppressProcessExit,
 			});
-			if ($env.PI_TIMING) {
+			if ($pickenv("GJC_TIMING", "PI_TIMING")) {
 				logger.printTimings();
 			}
 			if (!deps.suppressProcessExit) {

@@ -1,6 +1,6 @@
 import process from "node:process";
 
-import { $env } from "@gajae-code/utils";
+import { $pickenv } from "@gajae-code/utils";
 
 interface GjcCommand {
 	cmd: string;
@@ -12,7 +12,7 @@ const DEFAULT_CMD = process.platform === "win32" ? "gjc.cmd" : "gjc";
 const DEFAULT_SHELL = process.platform === "win32";
 
 export function resolveGjcCommand(): GjcCommand {
-	const envCmd = $env.PI_SUBPROCESS_CMD;
+	const envCmd = $pickenv("GJC_SUBPROCESS_CMD", "PI_SUBPROCESS_CMD");
 	if (envCmd?.trim()) {
 		return { cmd: envCmd, args: [], shell: DEFAULT_SHELL };
 	}

@@ -25,13 +25,13 @@ describe("buildAbortDisplayMessage", () => {
 				retryAttempt: 1,
 			}),
 		).toBe(
-			"Aborted after 1 retry attempt: Anthropic stream stalled while waiting for the next event. Hint: set PI_STREAM_IDLE_TIMEOUT_MS=300000 for slow reasoning/proxy streams, or PI_STREAM_IDLE_TIMEOUT_MS=0 to disable the watchdog.",
+			"Aborted after 1 retry attempt: Anthropic stream stalled while waiting for the next event. Hint: set GJC_STREAM_IDLE_TIMEOUT_MS=300000 for slow reasoning/proxy streams, or GJC_STREAM_IDLE_TIMEOUT_MS=0 to disable the watchdog.",
 		);
 	});
 
 	it("is idempotent for replayed abort display labels without retry context", () => {
 		const formatted =
-			"Aborted after 1 retry attempt: Anthropic stream stalled while waiting for the next event. Hint: set PI_STREAM_IDLE_TIMEOUT_MS=300000 for slow reasoning/proxy streams, or PI_STREAM_IDLE_TIMEOUT_MS=0 to disable the watchdog.";
+			"Aborted after 1 retry attempt: Anthropic stream stalled while waiting for the next event. Hint: set GJC_STREAM_IDLE_TIMEOUT_MS=300000 for slow reasoning/proxy streams, or GJC_STREAM_IDLE_TIMEOUT_MS=0 to disable the watchdog.";
 		expect(buildAbortDisplayMessage({ errorMessage: formatted, retryAttempt: 0 })).toBe(formatted);
 		expect(buildAbortDisplayMessage({ errorMessage: "Operation aborted: fetch failed", retryAttempt: 0 })).toBe(
 			"Operation aborted: fetch failed",

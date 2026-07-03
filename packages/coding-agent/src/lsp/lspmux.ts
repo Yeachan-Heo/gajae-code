@@ -1,6 +1,6 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import { $flag, $which, logger } from "@gajae-code/utils";
+import { $pickflag, $which, logger } from "@gajae-code/utils";
 import { TOML } from "bun";
 import { spawnOwnedProcess } from "../runtime/process-lifecycle";
 
@@ -151,7 +151,7 @@ function drainStream(stream: ReadableStream<Uint8Array> | null | undefined): voi
  * Detect lspmux availability and state.
  * Results are cached for STATE_CACHE_TTL_MS.
  *
- * Set PI_DISABLE_LSPMUX=1 to disable.
+ * Set GJC_DISABLE_LSPMUX=1 (legacy: PI_DISABLE_LSPMUX=1) to disable.
  */
 export async function detectLspmux(): Promise<LspmuxState> {
 	const now = Date.now();
@@ -159,7 +159,7 @@ export async function detectLspmux(): Promise<LspmuxState> {
 		return cachedState;
 	}
 
-	if ($flag("PI_DISABLE_LSPMUX")) {
+	if ($pickflag("GJC_DISABLE_LSPMUX", "PI_DISABLE_LSPMUX")) {
 		cachedState = { available: false, running: false, binaryPath: null, config: null };
 		cacheTimestamp = now;
 		return cachedState;

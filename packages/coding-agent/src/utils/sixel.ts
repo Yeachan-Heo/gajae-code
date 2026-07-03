@@ -1,4 +1,4 @@
-import { $env, $flag } from "@gajae-code/utils";
+import { $pickenv, $pickflag } from "@gajae-code/utils";
 
 const SIXEL_START_REGEX = /\x1bP(?:[0-9;]*)q/u;
 const SIXEL_END_SEQUENCE = "\x1b\\";
@@ -10,12 +10,13 @@ const SIXEL_PLACEHOLDER_PREFIX = "__GJC_SIXEL_SEQUENCE_";
  * Returns whether SIXEL passthrough is explicitly enabled.
  *
  * Both gates must be enabled to preserve SIXEL control sequences:
- * - PI_FORCE_IMAGE_PROTOCOL=sixel
- * - PI_ALLOW_SIXEL_PASSTHROUGH=1
+ * - GJC_FORCE_IMAGE_PROTOCOL=sixel
+ * - GJC_ALLOW_SIXEL_PASSTHROUGH=1
+ * (legacy PI_-prefixed names remain supported as fallbacks)
  */
 export function isSixelPassthroughEnabled(): boolean {
-	const forcedProtocol = $env.PI_FORCE_IMAGE_PROTOCOL?.trim().toLowerCase();
-	return forcedProtocol === "sixel" && $flag("PI_ALLOW_SIXEL_PASSTHROUGH");
+	const forcedProtocol = $pickenv("GJC_FORCE_IMAGE_PROTOCOL", "PI_FORCE_IMAGE_PROTOCOL")?.trim().toLowerCase();
+	return forcedProtocol === "sixel" && $pickflag("GJC_ALLOW_SIXEL_PASSTHROUGH", "PI_ALLOW_SIXEL_PASSTHROUGH");
 }
 /** Returns true when the text contains a SIXEL start sequence. */
 export function containsSixelSequence(text: string): boolean {

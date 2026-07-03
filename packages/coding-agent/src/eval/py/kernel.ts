@@ -11,7 +11,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $flag, isBunTestRuntime, logger, Snowflake } from "@gajae-code/utils";
+import { $pickflag, isBunTestRuntime, logger, Snowflake } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import { $ } from "bun";
 import { Settings } from "../../config/settings";
@@ -23,7 +23,7 @@ import { ensurePythonRuntime, filterEnv, type PythonRuntimeOptions } from "./run
 export type { KernelDisplayOutput, PythonStatusEvent } from "./display";
 export { renderKernelDisplay } from "./display";
 
-const TRACE_IPC = $flag("PI_PYTHON_IPC_TRACE");
+const TRACE_IPC = $pickflag("GJC_PYTHON_IPC_TRACE", "PI_PYTHON_IPC_TRACE");
 
 // Cache the runner script on disk so the subprocess loads it normally. Cached
 // per script hash so installs don't race across versions.
@@ -125,7 +125,7 @@ export async function checkPythonKernelAvailability(
 	cwd: string,
 	runtimeOptions?: PythonRuntimeOptions,
 ): Promise<PythonKernelAvailability> {
-	if (isBunTestRuntime() || $flag("PI_PYTHON_SKIP_CHECK")) {
+	if (isBunTestRuntime() || $pickflag("GJC_PYTHON_SKIP_CHECK", "PI_PYTHON_SKIP_CHECK")) {
 		return { ok: true };
 	}
 	try {

@@ -1,8 +1,8 @@
 import * as os from "node:os";
 import { scheduler } from "node:timers/promises";
 import {
-	$env,
-	$flag,
+	$pickenv,
+	$pickflag,
 	asRecord,
 	extractHttpStatusFromError,
 	fetchWithRetry,
@@ -96,7 +96,7 @@ export interface OpenAICodexResponsesOptions extends StreamOptions {
 	serviceTier?: ServiceTier;
 }
 
-const CODEX_DEBUG = $flag("PI_CODEX_DEBUG");
+const CODEX_DEBUG = $pickflag("GJC_OPENAI_CODE_DEBUG", "PI_CODEX_DEBUG");
 const CODEX_MAX_RETRIES = 5;
 const CODEX_RETRY_DELAY_MS = 500;
 const CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS = 10000;
@@ -290,24 +290,34 @@ function parseCodexPositiveInteger(value: string | undefined, fallback: number):
 }
 
 function isCodexWebSocketEnvEnabled(): boolean {
-	return $flag("PI_CODEX_WEBSOCKET");
+	return $pickflag("GJC_OPENAI_CODE_WEBSOCKET", "PI_CODEX_WEBSOCKET");
 }
 
 function getCodexWebSocketRetryBudget(options?: Pick<OpenAICodexResponsesOptions, "streamMaxRetries">): number {
 	if (options?.streamMaxRetries !== undefined) {
 		return resolveRetryBudget(options.streamMaxRetries, CODEX_WEBSOCKET_RETRY_BUDGET);
 	}
-	return parseCodexNonNegativeInteger($env.PI_CODEX_WEBSOCKET_RETRY_BUDGET, CODEX_WEBSOCKET_RETRY_BUDGET);
+	return parseCodexNonNegativeInteger(
+		$pickenv("GJC_OPENAI_CODE_WEBSOCKET_RETRY_BUDGET", "PI_CODEX_WEBSOCKET_RETRY_BUDGET"),
+		CODEX_WEBSOCKET_RETRY_BUDGET,
+	);
 }
 
 function getCodexWebSocketRetryDelayMs(retry: number): number {
-	const baseDelay = parseCodexPositiveInteger($env.PI_CODEX_WEBSOCKET_RETRY_DELAY_MS, CODEX_RETRY_DELAY_MS);
+	const baseDelay = parseCodexPositiveInteger(
+		$pickenv("GJC_OPENAI_CODE_WEBSOCKET_RETRY_DELAY_MS", "PI_CODEX_WEBSOCKET_RETRY_DELAY_MS"),
+		CODEX_RETRY_DELAY_MS,
+	);
 	return baseDelay * Math.max(1, retry);
 }
 
 function getCodexWebSocketIdleTimeoutMs(overrideMs?: number): number {
 	return (
-		overrideMs ?? parseCodexPositiveInteger($env.PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS, CODEX_WEBSOCKET_IDLE_TIMEOUT_MS)
+		overrideMs ??
+		parseCodexPositiveInteger(
+			$pickenv("GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS", "PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS"),
+			CODEX_WEBSOCKET_IDLE_TIMEOUT_MS,
+		)
 	);
 }
 
@@ -315,7 +325,7 @@ function getCodexWebSocketFirstEventTimeoutMs(idleTimeoutMs: number, overrideMs?
 	return (
 		overrideMs ??
 		parseCodexPositiveInteger(
-			$env.PI_CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS,
+			$pickenv("GJC_OPENAI_CODE_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS", "PI_CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS"),
 			Math.min(CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS, idleTimeoutMs),
 		)
 	);

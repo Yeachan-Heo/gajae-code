@@ -9,7 +9,7 @@
 import * as os from "node:os";
 import { type AuthStorage, getBundledModels } from "@gajae-code/ai";
 import { decodeJwt } from "@gajae-code/ai/utils/oauth/openai-codex";
-import { $env, readSseJson } from "@gajae-code/utils";
+import { $pickenv, readSseJson } from "@gajae-code/utils";
 import packageJson from "../../../../package.json" with { type: "json" };
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
@@ -36,7 +36,7 @@ const DEFAULT_INSTRUCTIONS =
 	"You are a helpful assistant with web search capabilities. Search the web to answer the user's question accurately and cite your sources.";
 
 function getConfiguredModel(): string | undefined {
-	const configuredModel = $env.PI_CODEX_WEB_SEARCH_MODEL?.trim();
+	const configuredModel = $pickenv("GJC_OPENAI_CODE_WEB_SEARCH_MODEL", "PI_CODEX_WEB_SEARCH_MODEL")?.trim();
 	return configuredModel ? configuredModel : undefined;
 }
 

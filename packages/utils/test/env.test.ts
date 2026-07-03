@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
+import { $pickflag, filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
 
 const tempDirs: string[] = [];
 
@@ -315,5 +315,48 @@ describe("filterProcessEnv", () => {
 			"ProgramFiles(x86)": "C:\\Program Files (x86)",
 			"CommonProgramFiles(x86)": "C:\\Program Files (x86)\\Common Files",
 		});
+	});
+});
+
+describe("$pickflag", () => {
+	const KEYS = ["GJC_PICKFLAG_TEST", "PI_PICKFLAG_TEST"] as const;
+	const original: Partial<Record<(typeof KEYS)[number], string | undefined>> = {};
+
+	afterEach(() => {
+		for (const key of KEYS) {
+			const prior = original[key];
+			if (prior === undefined) {
+				delete Bun.env[key];
+			} else {
+				Bun.env[key] = prior;
+			}
+		}
+	});
+
+	function setEnv(key: (typeof KEYS)[number], value: string | undefined): void {
+		if (!(key in original)) original[key] = Bun.env[key];
+		if (value === undefined) {
+			delete Bun.env[key];
+		} else {
+			Bun.env[key] = value;
+		}
+	}
+
+	it("returns false when no key is set", () => {
+		setEnv("GJC_PICKFLAG_TEST", undefined);
+		setEnv("PI_PICKFLAG_TEST", undefined);
+		expect($pickflag(...KEYS)).toBe(false);
+	});
+
+	it("falls back to the legacy key when the primary is unset", () => {
+		setEnv("GJC_PICKFLAG_TEST", undefined);
+		setEnv("PI_PICKFLAG_TEST", "1");
+		expect($pickflag(...KEYS)).toBe(true);
+	});
+
+	it("lets an explicit falsy primary win over a truthy legacy fallback", () => {
+		setEnv("GJC_PICKFLAG_TEST", "0");
+		setEnv("PI_PICKFLAG_TEST", "1");
+		expect($pickflag(...KEYS)).toBe(false);
 	});
 });

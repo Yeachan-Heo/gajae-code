@@ -1,6 +1,6 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai";
-import { $env, $flag, logger } from "@gajae-code/utils";
+import { $pickenv, $pickflag, logger } from "@gajae-code/utils";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
@@ -423,17 +423,18 @@ export interface EvalBackendsAllowance {
 }
 
 /**
- * Parse PI_PY / PI_JS environment variables. Each is a boolean flag; unset
- * means "not specified, defer to settings". Returns null when neither is set
- * so the caller can fall through to `readEvalBackendsAllowance` per key.
+ * Parse GJC_PY / GJC_JS environment variables (legacy: PI_PY / PI_JS). Each is
+ * a boolean flag; unset means "not specified, defer to settings". Returns null
+ * when neither is set so the caller can fall through to
+ * `readEvalBackendsAllowance` per key.
  */
 function getEvalBackendsFromEnv(): EvalBackendsAllowance | null {
-	const pyEnv = $env.PI_PY;
-	const jsEnv = $env.PI_JS;
+	const pyEnv = $pickenv("GJC_PY", "PI_PY");
+	const jsEnv = $pickenv("GJC_JS", "PI_JS");
 	if (pyEnv === undefined && jsEnv === undefined) return null;
 	return {
-		python: pyEnv === undefined ? true : $flag("PI_PY"),
-		js: jsEnv === undefined ? true : $flag("PI_JS"),
+		python: pyEnv === undefined ? true : $pickflag("GJC_PY", "PI_PY"),
+		js: jsEnv === undefined ? true : $pickflag("GJC_JS", "PI_JS"),
 	};
 }
 
@@ -446,7 +447,7 @@ export function readEvalBackendsAllowance(session: ToolSession): EvalBackendsAll
 }
 
 /**
- * Materialize the active eval backend allowance: PI_PY / PI_JS env flags
+ * Materialize the active eval backend allowance: GJC_PY / GJC_JS env flags
  * override the per-key settings; otherwise settings (defaults true) win.
  */
 export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance {

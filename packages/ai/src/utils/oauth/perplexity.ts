@@ -12,7 +12,7 @@
  * Architecture reverse-engineered from Perplexity macOS app (ai.perplexity.mac).
  */
 import * as os from "node:os";
-import { $env } from "@gajae-code/utils";
+import { $pickenv } from "@gajae-code/utils";
 import { $ } from "bun";
 import type { OAuthController, OAuthCredentials } from "./types";
 
@@ -191,8 +191,8 @@ export async function loginPerplexity(ctrl: OAuthController): Promise<OAuthCrede
 		throw new Error("Perplexity login requires onPrompt callback");
 	}
 
-	// Path 1: Native macOS app JWT (skip if PI_AUTH_NO_BORROW=1)
-	if (!$env.PI_AUTH_NO_BORROW) {
+	// Path 1: Native macOS app JWT (skip if GJC_AUTH_NO_BORROW / legacy PI_AUTH_NO_BORROW is set)
+	if (!$pickenv("GJC_AUTH_NO_BORROW", "PI_AUTH_NO_BORROW")) {
 		ctrl.onProgress?.("Checking for Perplexity desktop app...");
 		const nativeJwt = await extractFromNativeApp();
 		if (nativeJwt) {

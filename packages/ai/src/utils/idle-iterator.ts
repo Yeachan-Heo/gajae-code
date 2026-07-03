@@ -1,4 +1,4 @@
-import { $env } from "@gajae-code/utils";
+import { $pickenv } from "@gajae-code/utils";
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS = 100_000;
@@ -14,25 +14,39 @@ function normalizeIdleTimeoutMs(value: string | undefined, fallback: number): nu
 /**
  * Returns the idle timeout used for provider streaming transports.
  *
- * `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` is accepted as a backward-compatible alias.
- * Set `PI_STREAM_IDLE_TIMEOUT_MS=0` to disable the watchdog.
+ * `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS` (and the legacy `PI_`-prefixed names) are
+ * accepted as backward-compatible aliases.
+ * Set `GJC_STREAM_IDLE_TIMEOUT_MS=0` to disable the watchdog.
  *
  * Providers that legitimately stream much slower than the global default can pass
  * `fallbackMs` to widen the floor used when neither env var nor caller option is set.
  * Caller options still take precedence; env overrides still trump the fallback.
  */
 export function getStreamIdleTimeoutMs(fallbackMs: number = DEFAULT_STREAM_IDLE_TIMEOUT_MS): number | undefined {
-	return normalizeIdleTimeoutMs($env.PI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS, fallbackMs);
+	return normalizeIdleTimeoutMs(
+		$pickenv(
+			"GJC_STREAM_IDLE_TIMEOUT_MS",
+			"PI_STREAM_IDLE_TIMEOUT_MS",
+			"GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS",
+			"PI_OPENAI_STREAM_IDLE_TIMEOUT_MS",
+		),
+		fallbackMs,
+	);
 }
 
 /**
  * Returns the idle timeout used for OpenAI-family streaming transports.
  *
- * Set `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS=0` to disable the watchdog.
+ * Set `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS=0` to disable the watchdog.
  */
 export function getOpenAIStreamIdleTimeoutMs(): number | undefined {
 	return normalizeIdleTimeoutMs(
-		$env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_STREAM_IDLE_TIMEOUT_MS,
+		$pickenv(
+			"GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS",
+			"PI_OPENAI_STREAM_IDLE_TIMEOUT_MS",
+			"GJC_STREAM_IDLE_TIMEOUT_MS",
+			"PI_STREAM_IDLE_TIMEOUT_MS",
+		),
 		DEFAULT_STREAM_IDLE_TIMEOUT_MS,
 	);
 }
@@ -42,7 +56,7 @@ export function getOpenAIStreamIdleTimeoutMs(): number | undefined {
  * The first token can legitimately take longer than later inter-event gaps,
  * so the default never undershoots the steady-state idle timeout.
  *
- * Set `PI_STREAM_FIRST_EVENT_TIMEOUT_MS=0` to disable the watchdog.
+ * Set `GJC_STREAM_FIRST_EVENT_TIMEOUT_MS=0` to disable the watchdog.
  *
  * Providers whose first response can legitimately take longer (heavy reasoning,
  * slow cold-start proxies) can pass `fallbackMs` to widen the floor used when
@@ -54,7 +68,10 @@ export function getStreamFirstEventTimeoutMs(
 	fallbackMs: number = DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS,
 ): number | undefined {
 	const fallback = idleTimeoutMs === undefined ? fallbackMs : Math.max(fallbackMs, idleTimeoutMs);
-	return normalizeIdleTimeoutMs($env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS, fallback);
+	return normalizeIdleTimeoutMs(
+		$pickenv("GJC_STREAM_FIRST_EVENT_TIMEOUT_MS", "PI_STREAM_FIRST_EVENT_TIMEOUT_MS"),
+		fallback,
+	);
 }
 
 export type Watchdog = NodeJS.Timeout | undefined;

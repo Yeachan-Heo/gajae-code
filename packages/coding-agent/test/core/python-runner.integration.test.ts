@@ -1,8 +1,9 @@
 /**
  * End-to-end exercise of the new subprocess-backed Python runner.
  *
- * Gated by `PI_PYTHON_INTEGRATION=1` so CI without a real Python interpreter
- * (or sandboxes where subprocess spawning is restricted) does not fail.
+ * Gated by `GJC_PYTHON_INTEGRATION=1` (legacy: `PI_PYTHON_INTEGRATION=1`) so CI
+ * without a real Python interpreter (or sandboxes where subprocess spawning is
+ * restricted) does not fail.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
@@ -10,7 +11,7 @@ import { disposeAllKernelSessions, executePythonWithKernel } from "@gajae-code/c
 import { PythonKernel } from "@gajae-code/coding-agent/eval/py/kernel";
 import { TempDir } from "@gajae-code/utils";
 
-const SHOULD_RUN = Bun.env.PI_PYTHON_INTEGRATION === "1";
+const SHOULD_RUN = (Bun.env.GJC_PYTHON_INTEGRATION ?? Bun.env.PI_PYTHON_INTEGRATION) === "1";
 
 describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 	afterEach(async () => {
