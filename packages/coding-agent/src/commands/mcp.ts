@@ -4,7 +4,7 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { type MCPAction, type MCPCommandArgs, runMCPCommand } from "../cli/mcp-cli";
 
-const ACTIONS: MCPAction[] = ["add", "list", "remove"];
+const ACTIONS: MCPAction[] = ["add", "list", "remove", "import"];
 
 export default class MCP extends Command {
 	static description = "Register standalone MCP servers explicitly in GJC config";
@@ -13,6 +13,8 @@ export default class MCP extends Command {
 	static examples = [
 		"gjc mcp add context7 npx -y @upstash/context7-mcp",
 		"gjc mcp add docs --type http --url https://example.test/mcp --header Authorization=Bearer_TOKEN",
+		"gjc mcp import claude",
+		"gjc mcp import codex --dry-run",
 		"gjc mcp list --json",
 		"gjc mcp remove context7",
 	];
@@ -29,7 +31,8 @@ export default class MCP extends Command {
 
 	static flags = {
 		project: Flags.boolean({ description: "Write/read project scope (./.gjc/mcp.json) instead of user scope" }),
-		force: Flags.boolean({ description: "Overwrite an existing server during add", default: false }),
+		force: Flags.boolean({ description: "Overwrite an existing server during add/import", default: false }),
+		"dry-run": Flags.boolean({ description: "Preview an import without writing anything", default: false }),
 		json: Flags.boolean({
 			char: "j",
 			description: "Emit machine-readable JSON with sensitive values redacted",
@@ -67,6 +70,7 @@ export default class MCP extends Command {
 				project: flags.project,
 				force: flags.force,
 				json: flags.json,
+				dryRun: flags["dry-run"],
 				type: flags.type as MCPCommandArgs["flags"]["type"],
 				command: flags.command,
 				url: flags.url,
@@ -84,12 +88,14 @@ export default class MCP extends Command {
 		process.stdout.write(`Register standalone MCP servers explicitly in GJC config
 
 USAGE
-  $ gjc mcp [add|list|remove] [NAME] [COMMAND_OR_URL] [ARGS...] [FLAGS]
+  $ gjc mcp [add|list|remove|import] [NAME] [COMMAND_OR_URL] [ARGS...] [FLAGS]
 
 COMMANDS
   add     Add an explicit user-provided MCP server definition
   list    List registered servers with env/header/auth values redacted
   remove  Remove a registered server and print the removed definition redacted
+  import  Copy MCP servers from another host into GJC config:
+          gjc mcp import <claude|codex|opencode|cursor|all> [--dry-run] [--force] [--project]
 
 FLAGS
       --project          Use project scope (./.gjc/mcp.json) instead of user scope
@@ -107,11 +113,13 @@ FLAGS
 EXAMPLES
   $ gjc mcp add context7 npx -y @upstash/context7-mcp
   $ gjc mcp add docs --type http --url https://example.test/mcp --header Authorization=Bearer_TOKEN
+  $ gjc mcp import claude
+  $ gjc mcp import codex --dry-run
   $ gjc mcp list --json
   $ gjc mcp remove context7
 
 SECURITY
-  This command writes only the server definition supplied on this invocation. It does not import or inherit Claude Code, Codex, OpenCode, or other live MCP configs. Public output redacts env, header, auth, and OAuth credential values.
+  \`add\` writes only the server definition supplied on this invocation. \`import\` copies definitions from another host's config exactly once — GJC never inherits live MCP runtime from Claude Code, Codex, OpenCode, or Cursor, and secret-indirection fields are omitted rather than read. Public output redacts env, header, auth, and OAuth credential values.
 `);
 	}
 }

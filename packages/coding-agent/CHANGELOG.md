@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `gjc mcp import <claude|codex|opencode|cursor|all>` copies MCP server definitions from another host's config into GJC's own config as a single collision-safe, dry-run-capable migration routed through the migrate planner (adding a cursor migrate adapter and an `only` filter to `runMigrate`). Importing never inherits live runtime and never reads secret-indirection fields, and a README subsection documents the workflow.
+
 ### Fixed
 
 - Goal completion now preserves the terminal `goal({op: "complete"})` state even when a `goal_updated` extension hook throws, preventing hook-side write errors from trapping a verified ultragoal run in the continuation loop.

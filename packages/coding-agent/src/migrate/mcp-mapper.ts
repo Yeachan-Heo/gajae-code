@@ -34,6 +34,7 @@ const SECRET_INDIRECTION_FIELDS: Record<MigrateSource, string[]> = {
 	"claude-code": [],
 	codex: ["env_vars", "env_http_headers", "bearer_token_env_var"],
 	opencode: [],
+	cursor: [],
 };
 
 /** Fields recognized for a source (handled or intentionally omitted). Anything else is omitted-with-warning. */
@@ -59,6 +60,8 @@ const RECOGNIZED_FIELDS: Record<MigrateSource, ReadonlySet<string>> = {
 		"disabled_tools",
 	]),
 	opencode: new Set(["type", "command", "args", "env", "url", "headers", "enabled", "timeout", "cwd"]),
+	// Cursor's ~/.cursor/mcp.json uses the standard mcpServers shape.
+	cursor: new Set(["type", "command", "args", "env", "url", "headers", "enabled", "timeout", "cwd"]),
 };
 
 /** Fields with no GJC equivalent: omitted-with-warning (named explicitly so the warning is precise). */
@@ -66,6 +69,7 @@ const OMITTED_FIELDS: Record<MigrateSource, string[]> = {
 	"claude-code": [],
 	codex: ["startup_timeout_sec", "enabled_tools", "disabled_tools"],
 	opencode: [],
+	cursor: [],
 };
 
 export function mapMcpEntry(source: MigrateSource, name: string, raw: unknown): McpMapOutcome {
