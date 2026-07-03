@@ -8,9 +8,9 @@
 import type { MCPServerConfig } from "../runtime-mcp/types";
 
 /** Supported migration sources. */
-export type MigrateSource = "claude-code" | "codex" | "opencode";
+export type MigrateSource = "claude-code" | "codex" | "opencode" | "cursor";
 
-export const MIGRATE_SOURCES: readonly MigrateSource[] = ["claude-code", "codex", "opencode"];
+export const MIGRATE_SOURCES: readonly MigrateSource[] = ["claude-code", "codex", "opencode", "cursor"];
 
 /** Canonical, deterministic ordering used when expanding `--from all` / repeated `--from`. */
 export const CANONICAL_SOURCE_ORDER: readonly MigrateSource[] = MIGRATE_SOURCES;

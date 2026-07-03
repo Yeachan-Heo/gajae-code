@@ -11,6 +11,7 @@ import { normalizeSkill } from "../skill-normalizer";
 import type { AdapterResult, MigrateSource, SkillCandidate, SourceDiagnostic } from "../types";
 import { claudeCodeAdapter } from "./claude-code";
 import { codexAdapter } from "./codex";
+import { cursorAdapter } from "./cursor";
 import { opencodeAdapter } from "./opencode";
 
 export interface AdapterOptions {
@@ -27,6 +28,7 @@ const ADAPTERS: Record<MigrateSource, Adapter> = {
 	"claude-code": claudeCodeAdapter,
 	codex: codexAdapter,
 	opencode: opencodeAdapter,
+	cursor: cursorAdapter,
 };
 
 export function getAdapter(source: MigrateSource): Adapter {

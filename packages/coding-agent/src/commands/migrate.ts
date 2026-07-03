@@ -5,7 +5,7 @@ import { Command, Flags } from "@gajae-code/utils/cli";
 import { type MigrateCommandArgs, runMigrateCommand } from "../cli/migrate-cli";
 
 export default class Migrate extends Command {
-	static description = "Import MCP servers and skills from Claude Code, Codex, or OpenCode";
+	static description = "Import MCP servers and skills from Claude Code, Codex, OpenCode, or Cursor";
 
 	static examples = [
 		"gjc migrate --from claude-code",
@@ -16,7 +16,7 @@ export default class Migrate extends Command {
 
 	static flags = {
 		from: Flags.string({
-			description: "Source agent to import from (repeatable): claude-code | codex | opencode | all",
+			description: "Source agent to import from (repeatable): claude-code | codex | opencode | cursor | all",
 			multiple: true,
 			required: true,
 		}),

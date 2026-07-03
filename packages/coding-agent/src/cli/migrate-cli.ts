@@ -23,6 +23,8 @@ export interface MigrateCommandArgs {
 	force: boolean;
 	dryRun: boolean;
 	json: boolean;
+	/** Restrict migration to one item type (e.g. `gjc mcp import` passes "mcp"). */
+	only?: "mcp" | "skill";
 	/** Test seam: override home dir for source discovery. */
 	homeDir?: string;
 	/** Test seam: override cwd for project-scope destinations. */
@@ -34,7 +36,7 @@ export class MigrateArgsError extends Error {}
 /** Expand `all`/repeated `--from`, validate, and return sources in canonical order. */
 export function resolveSources(from: string[]): MigrateSource[] {
 	if (from.length === 0) {
-		throw new MigrateArgsError("No source selected. Use --from <claude-code|codex|opencode|all> (repeatable).");
+		throw new MigrateArgsError("No source selected. Use --from <claude-code|codex|opencode|cursor|all> (repeatable).");
 	}
 	const selected = new Set<MigrateSource>();
 	for (const raw of from) {
@@ -64,10 +66,22 @@ export async function runMigrate(args: MigrateCommandArgs): Promise<MigrateRepor
 	const homeDir = args.homeDir ?? os.homedir();
 	const destinations = resolveDestinations(args.project, cwd);
 
-	const results: AdapterResult[] = [];
+	const collected: AdapterResult[] = [];
 	for (const source of sources) {
-		results.push(await getAdapter(source).collect({ homeDir }));
+		collected.push(await getAdapter(source).collect({ homeDir }));
 	}
+
+	// `only` narrows the migration to one item type: candidates and their
+	// per-type diagnostics for the other type are dropped before planning.
+	const results: AdapterResult[] =
+		args.only === undefined
+			? collected
+			: collected.map(result => ({
+					...result,
+					mcpCandidates: args.only === "mcp" ? result.mcpCandidates : [],
+					skillCandidates: args.only === "skill" ? result.skillCandidates : [],
+					diagnostics: result.diagnostics.filter(d => d.type === args.only || d.type === "source"),
+				}));
 
 	const { actions, warnings } = await planMigration({ results, destinations, force: args.force });
 	const finalActions = args.dryRun ? actions : await executeActions(actions);

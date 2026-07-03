@@ -67,6 +67,34 @@ describe("codex adapter", () => {
 	});
 });
 
+describe("cursor adapter", () => {
+	test("absent config yields skipped_absent_source diagnostics, no candidates", async () => {
+		const result = await getAdapter("cursor").collect({ homeDir: home });
+		expect(result.mcpCandidates).toHaveLength(0);
+		expect(result.skillCandidates).toHaveLength(0);
+		expect(result.diagnostics.every(d => d.status === "skipped_absent_source")).toBe(true);
+	});
+
+	test("reads mcpServers from ~/.cursor/mcp.json", async () => {
+		await writeFile(
+			".cursor/mcp.json",
+			JSON.stringify({ mcpServers: { srv: { command: "bin", args: ["--x"] }, docs: { url: "https://d.test/mcp" } } }),
+		);
+		const result = await getAdapter("cursor").collect({ homeDir: home });
+		expect(result.mcpCandidates).toEqual([
+			{ source: "cursor", name: "srv", raw: { command: "bin", args: ["--x"] } },
+			{ source: "cursor", name: "docs", raw: { url: "https://d.test/mcp" } },
+		]);
+		expect(result.skillCandidates).toHaveLength(0);
+	});
+
+	test("malformed mcp config yields failed_invalid_source", async () => {
+		await writeFile(".cursor/mcp.json", "{ not json");
+		const result = await getAdapter("cursor").collect({ homeDir: home });
+		expect(result.diagnostics.some(d => d.status === "failed_invalid_source")).toBe(true);
+	});
+});
+
 describe("opencode adapter", () => {
 	test("reads mcp, skills, and command conversions", async () => {
 		await writeFile(
