@@ -36,6 +36,7 @@ describe("questionToGate", () => {
 		expect(gate.schema.properties?.selected?.items?.enum).toEqual(["JWT", "OAuth2", "Session cookies"]);
 		expect(gate.schema.properties?.other?.type).toBe("boolean");
 		expect(gate.schema.properties?.action?.enum).toEqual(["answer", "clarify"]);
+		expect(gate.schema.properties?.custom?.pattern).toBe("\\S");
 		expect(gate.context?.stage_state).toMatchObject({
 			question_id: "q1",
 			multi: false,
@@ -110,6 +111,18 @@ describe("end-to-end via the broker", () => {
 		});
 		expect(combined.status).toBe("rejected");
 		expect(combined.error?.errors.some(e => e.keyword === "anyOf")).toBe(true);
+		const blankOther = await broker.resolve({
+			gate_id: gate.gate_id,
+			answer: { selected: [], other: true, custom: " \t\n " },
+		});
+		expect(blankOther.status).toBe("rejected");
+		expect(blankOther.error?.errors.some(e => e.keyword === "pattern")).toBe(true);
+		const blankClarification = await broker.resolve({
+			gate_id: gate.gate_id,
+			answer: { action: "clarify", question: " \t\n " },
+		});
+		expect(blankClarification.status).toBe("rejected");
+		expect(blankClarification.error?.errors.some(e => e.keyword === "pattern")).toBe(true);
 		// A schema-valid answer is accepted and decodes to the human-path result.
 		const good = await broker.resolve({ gate_id: gate.gate_id, answer: { selected: ["JWT"] } });
 		expect(good.status).toBe("accepted");

@@ -435,6 +435,7 @@ export interface RpcJsonSchema {
 	items?: RpcJsonSchema;
 	minLength?: number;
 	maxLength?: number;
+	pattern?: string;
 	minItems?: number;
 	maxItems?: number;
 	uniqueItems?: boolean;

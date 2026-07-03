@@ -11,7 +11,7 @@ import {
 
 describe("workflow-gate-schema", () => {
 	it("rejects unsupported keywords at construction", () => {
-		const schema = { type: "string", pattern: "^x" } as unknown as RpcJsonSchema;
+		const schema = { type: "string", format: "email" } as unknown as RpcJsonSchema;
 		expect(() => assertSupportedGateSchema(schema)).toThrow(WorkflowGateSchemaError);
 	});
 
@@ -39,6 +39,8 @@ describe("workflow-gate-schema", () => {
 			{ type: "array", uniqueItems: "yes" }, // non-boolean
 			{ type: "number", minimum: Number.POSITIVE_INFINITY }, // non-finite
 			{ type: "string", title: 5 }, // non-string meta
+			{ type: "string", pattern: 5 }, // non-string pattern
+			{ type: "string", pattern: "[" }, // invalid pattern
 		];
 		for (const c of cases) {
 			expect(() => assertSupportedGateSchema(c as RpcJsonSchema)).toThrow(WorkflowGateSchemaError);
@@ -59,6 +61,12 @@ describe("workflow-gate-schema", () => {
 		expect(err?.code).toBe("invalid_workflow_gate_answer");
 		expect(err?.gate_id).toBe("g1");
 		expect(err?.errors[0]?.keyword).toBe("enum");
+	});
+
+	it("validates string patterns", () => {
+		const compiled = compileGateSchema({ type: "string", pattern: "\\S" });
+		expect(validateGateAnswer(compiled, "g-pattern", "has text")).toBeNull();
+		expect(validateGateAnswer(compiled, "g-pattern", "   ")?.errors[0]?.keyword).toBe("pattern");
 	});
 
 	it("validates object required + additionalProperties:false", () => {

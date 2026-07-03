@@ -25,6 +25,7 @@ const SUPPORTED_KEYWORDS = new Set<keyof RpcJsonSchema>([
 	"items",
 	"minLength",
 	"maxLength",
+	"pattern",
 	"minItems",
 	"maxItems",
 	"uniqueItems",
@@ -105,6 +106,17 @@ function walkSchema(schema: RpcJsonSchema, depth: number, path: string): void {
 	for (const meta of ["title", "description"] as const) {
 		if (schema[meta] !== undefined && typeof schema[meta] !== "string") {
 			throw new WorkflowGateSchemaError(`${meta} at ${path} must be a string`);
+		}
+	}
+	if (schema.pattern !== undefined) {
+		if (typeof schema.pattern !== "string") {
+			throw new WorkflowGateSchemaError(`pattern at ${path} must be a string`);
+		}
+		try {
+			new RegExp(schema.pattern);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new WorkflowGateSchemaError(`pattern at ${path} must be a valid regular expression: ${message}`);
 		}
 	}
 	for (const limit of ["minLength", "maxLength", "minItems", "maxItems"] as const) {
@@ -240,6 +252,14 @@ function validateValue(schema: RpcJsonSchema, value: unknown, path: string, erro
 				keyword: "maxLength",
 				message: `longer than ${schema.maxLength}`,
 				expected: schema.maxLength,
+			});
+		}
+		if (schema.pattern !== undefined && !new RegExp(schema.pattern).test(value)) {
+			errors.push({
+				path,
+				keyword: "pattern",
+				message: `does not match pattern ${schema.pattern}`,
+				expected: schema.pattern,
 			});
 		}
 	}

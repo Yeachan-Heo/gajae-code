@@ -131,7 +131,12 @@ function questionAnswerSchema(question: AskGateQuestion, labels: string[]): RpcJ
 		properties: {
 			selected: selectedBase,
 			other: { type: "boolean", description: "set true to provide a free-text answer in `custom`" },
-			custom: { type: "string", minLength: 1, description: "free-text answer; required when `other` is true" },
+			custom: {
+				type: "string",
+				minLength: 1,
+				pattern: "\\S",
+				description: "free-text answer; required when `other` is true",
+			},
 			action: {
 				type: "string",
 				enum: ["answer", "clarify"],
@@ -140,6 +145,7 @@ function questionAnswerSchema(question: AskGateQuestion, labels: string[]): RpcJ
 			question: {
 				type: "string",
 				minLength: 1,
+				pattern: "\\S",
 				description: "clarification question; required when action is `clarify`",
 			},
 		},
@@ -156,7 +162,7 @@ function questionAnswerSchema(question: AskGateQuestion, labels: string[]): RpcJ
 				properties: {
 					selected: selectedWithOther,
 					other: { const: true },
-					custom: { type: "string", minLength: 1 },
+					custom: { type: "string", minLength: 1, pattern: "\\S" },
 					action: { const: "answer" },
 				},
 				required: ["selected", "other", "custom"],
@@ -166,7 +172,7 @@ function questionAnswerSchema(question: AskGateQuestion, labels: string[]): RpcJ
 				type: "object",
 				properties: {
 					action: { const: "clarify" },
-					question: { type: "string", minLength: 1 },
+					question: { type: "string", minLength: 1, pattern: "\\S" },
 				},
 				required: ["action", "question"],
 				additionalProperties: false,
