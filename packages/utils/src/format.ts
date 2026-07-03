@@ -33,9 +33,9 @@ export function formatDuration(ms: number): string {
 export function formatNumber(n: number): string {
 	if (n < 1_000) return n.toString();
 	if (n < 10_000) return `${trim1(n / 1_000)}K`;
-	if (n < 1_000_000) return `${Math.round(n / 1_000)}K`;
+	if (n < 1_000_000) return `${roundBelow(n / 1_000, 1_000)}K`;
 	if (n < 10_000_000) return `${trim1(n / 1_000_000)}M`;
-	if (n < 1_000_000_000) return `${Math.round(n / 1_000_000)}M`;
+	if (n < 1_000_000_000) return `${roundBelow(n / 1_000_000, 1_000)}M`;
 	if (n < 10_000_000_000) return `${trim1(n / 1_000_000_000)}B`;
 	return `${Math.round(n / 1_000_000_000)}B`;
 }
@@ -46,15 +46,26 @@ function trim1(n: number): string {
 	return s.endsWith(".0") ? s.slice(0, -2) : s;
 }
 
+/** Round to an integer without crossing the next compact suffix boundary. */
+function roundBelow(n: number, nextUnit: number): number {
+	return Math.min(Math.round(n), nextUnit - 1);
+}
+
 /**
  * Format a byte count to a human-readable string.
  * Examples: "512B", "1.5KB", "2.3MB", "1.2GB"
  */
 export function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes}B`;
-	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-	if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-	return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+	if (bytes < 1024 * 1024) return `${formatByteUnit(bytes, 1024)}KB`;
+	if (bytes < 1024 * 1024 * 1024) return `${formatByteUnit(bytes, 1024 * 1024)}MB`;
+	return `${formatByteUnit(bytes, 1024 * 1024 * 1024)}GB`;
+}
+
+/** Format bytes to 1 decimal without rounding up into the next byte unit. */
+function formatByteUnit(bytes: number, unit: number): string {
+	const tenths = Math.min(Math.round((bytes / unit) * 10), 1024 * 10 - 1);
+	return (tenths / 10).toFixed(1);
 }
 
 /**
