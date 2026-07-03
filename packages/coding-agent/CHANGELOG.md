@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Native Windows terminals now default `app.message.queue` to `Alt+Q` instead of `Alt+Enter`, avoiding the Windows Terminal fullscreen shortcut conflict (#1422).
 - Coordinator MCP tmux prompt delivery now submits with tmux `Enter` instead of `C-m`, while preserving runtime prompt-ack/`turn_start` as the delivery success gate (#1409).
 - Coordinator MCP tmux prompt delivery now uses a paste buffer for prompt text before submitting with `Enter`, preserving multiline delegated `/skill:*` prompt separators that `send-keys -l` could flatten into an unstarted visible prompt (#1416).
 
