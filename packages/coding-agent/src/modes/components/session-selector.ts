@@ -50,6 +50,14 @@ class SessionList implements Component {
 		};
 	}
 
+	#clampSelectedIndex(): void {
+		if (this.#filteredSessions.length === 0) {
+			this.#selectedIndex = 0;
+			return;
+		}
+		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, this.#filteredSessions.length - 1));
+	}
+
 	#filterSessions(query: string): void {
 		this.#filteredSessions = fuzzyFilter(this.allSessions, query, session => {
 			const parts = [
@@ -62,7 +70,7 @@ class SessionList implements Component {
 			];
 			return parts.filter(Boolean).join(" ");
 		});
-		this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, this.#filteredSessions.length - 1));
+		this.#clampSelectedIndex();
 	}
 
 	removeSession(sessionPath: string): void {
@@ -71,10 +79,6 @@ class SessionList implements Component {
 		this.allSessions.splice(index, 1);
 		// Re-filter to update filteredSessions
 		this.#filterSessions(this.#searchInput.getValue());
-		// Adjust selectedIndex if we deleted the last item or beyond
-		if (this.#selectedIndex >= this.#filteredSessions.length) {
-			this.#selectedIndex = Math.max(0, this.#filteredSessions.length - 1);
-		}
 	}
 
 	invalidate(): void {
@@ -182,6 +186,12 @@ class SessionList implements Component {
 	}
 
 	handleInput(keyData: string): void {
+		const moveSelection = (delta: number): void => {
+			if (this.#filteredSessions.length === 0) return;
+			this.#selectedIndex += delta;
+			this.#clampSelectedIndex();
+		};
+
 		// Delete key - request delete confirmation from parent
 		if (matchesKey(keyData, "delete")) {
 			const selected = this.#filteredSessions[this.#selectedIndex];
@@ -193,22 +203,22 @@ class SessionList implements Component {
 
 		// Up arrow
 		if (matchesKey(keyData, "up")) {
-			this.#selectedIndex = Math.max(0, this.#selectedIndex - 1);
+			moveSelection(-1);
 			return;
 		}
 		// Down arrow
 		if (matchesKey(keyData, "down")) {
-			this.#selectedIndex = Math.min(this.#filteredSessions.length - 1, this.#selectedIndex + 1);
+			moveSelection(1);
 			return;
 		}
 		// Page up - jump up by maxVisible items
 		if (matchesKey(keyData, "pageUp")) {
-			this.#selectedIndex = Math.max(0, this.#selectedIndex - this.#maxVisible);
+			moveSelection(-this.#maxVisible);
 			return;
 		}
 		// Page down - jump down by maxVisible items
 		if (matchesKey(keyData, "pageDown")) {
-			this.#selectedIndex = Math.min(this.#filteredSessions.length - 1, this.#selectedIndex + this.#maxVisible);
+			moveSelection(this.#maxVisible);
 			return;
 		}
 		// Enter

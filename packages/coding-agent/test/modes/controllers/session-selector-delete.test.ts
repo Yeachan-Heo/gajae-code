@@ -26,10 +26,13 @@ function createSession(id: string, title: string): SessionInfo {
 	};
 }
 
-function createSelector(onDelete: (session: SessionInfo) => Promise<boolean>): SessionSelectorComponent {
+function createSelector(
+	onDelete: (session: SessionInfo) => Promise<boolean>,
+	onSelect: (sessionPath: string) => void = () => {},
+): SessionSelectorComponent {
 	return new SessionSelectorComponent(
 		[createSession("session-a", "Alpha"), createSession("session-b", "Beta")],
-		() => {},
+		onSelect,
 		() => {},
 		() => {},
 		onDelete,
@@ -37,7 +40,7 @@ function createSelector(onDelete: (session: SessionInfo) => Promise<boolean>): S
 }
 
 function renderText(selector: SessionSelectorComponent): string {
-	return selector.render(120).join("\n");
+	return Bun.stripANSI(selector.render(120).join("\n"));
 }
 
 describe("SessionSelectorComponent delete confirmation", () => {
@@ -89,5 +92,24 @@ describe("SessionSelectorComponent delete confirmation", () => {
 		expect(onDelete).toHaveBeenCalledTimes(1);
 		expect(rendered).not.toContain("Alpha");
 		expect(rendered).toContain("Beta");
+	});
+	it("keeps selection valid after navigating empty search results", () => {
+		const onSelect = vi.fn();
+		const selector = createSelector(async () => false, onSelect);
+
+		for (const char of "zzz") selector.handleInput(char);
+		expect(renderText(selector)).toContain("No sessions in current folder");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[6~");
+		for (let i = 0; i < 3; i++) selector.handleInput("\x7f");
+
+		const rendered = renderText(selector);
+		expect(rendered).toContain("Alpha");
+		expect(rendered).toContain("❯ Alpha");
+
+		selector.handleInput("\n");
+
+		expect(onSelect).toHaveBeenCalledWith("/tmp/session-a.jsonl");
 	});
 });

@@ -9,6 +9,7 @@
 ### Fixed
 
 - The Python `gjc_rpc` client no longer tears down its reader loop on real server frames it had not modeled: OAuth `open_url` extension-UI requests emitted during `login`, `workflow_gate` frames carrying structured `{value, label, description}` options (the `next_workflow_gate()` queue path re-parsed them with a legacy strings-only parser), and `max`/`inherit` thinking levels returned by `get_state`/model info. `install_headless_ui` now answers interactive UI requests with `extension_ui_response` frames instead of misrouting them as `workflow_gate_response` commands, and `get_pending_workflow_gates()` is exposed as a typed method. Previously dropped payloads (`notice`, `thinking_level_changed`, `goal_updated`, `irc_message`, `subagent_steer_message` events; `agent_end.stopReason`/`telemetry`/`coverage`; `auto_retry_start.unbounded`; `auto_compaction_end.continuationSkipReason`; gate `required`) now parse into typed models, and the env-gated real-binary lane covers the new surface.
+- The session picker now keeps its selection index valid after an empty search result is navigated and then cleared, so Enter still resumes the first restored session instead of leaving the list with no selected row.
 
 ## [0.7.11] - 2026-07-03
 
