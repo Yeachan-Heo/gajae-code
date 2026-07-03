@@ -526,7 +526,7 @@ export class TUI extends Container {
 			data => this.#handleInput(data),
 			() => {
 				this.invalidate();
-				this.requestRender(!(isMultiplexerSession() && !useLegacyMultiplexerFullRender()), "resize");
+				this.requestResizeRender();
 			},
 		);
 		this.#hideCursor();
@@ -768,6 +768,22 @@ export class TUI extends Container {
 		this.#lineTruncationCache.clear();
 		this.#previousWidth = 0;
 		this.#previousHeight = 0;
+	}
+
+	/**
+	 * Multiplexer-aware resize render request.
+	 *
+	 * A forced full redraw (`requestRender(true)`) resets `#previousWidth`/`#previousHeight`
+	 * to -1, which makes `#doRender` treat the frame as a width change and fall into the
+	 * `fullRender` path. In terminal multiplexers that path skips the scrollback-clearing
+	 * `3J` escape (users navigate scrollback history), so replaying every transcript line
+	 * piles it back on top of scrollback — the "top of screen scrolls down to the prompt at
+	 * high speed" resize storm. Here we keep force off in multiplexers so `#doRender`'s
+	 * height-change branch takes the viewport-only `multiplexerViewportRepaint` path instead.
+	 * Set `PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER=1` to restore the legacy forced redraw.
+	 */
+	requestResizeRender(): void {
+		this.requestRender(!(isMultiplexerSession() && !useLegacyMultiplexerFullRender()), "resize");
 	}
 
 	requestRender(force = false, source = "unknown"): void {
