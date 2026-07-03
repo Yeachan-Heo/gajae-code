@@ -5,6 +5,11 @@ const stdinIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isT
 const stdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
 const originalKeyboardProtocolEnv = Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
+const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+
+function setPlatform(platform: NodeJS.Platform): void {
+	Object.defineProperty(process, "platform", { value: platform, configurable: true });
+}
 
 // Kitty keyboard protocol query and the xterm modifyOtherKeys level-2 fallback.
 const KITTY_QUERY = "\x1b[?u";
@@ -40,6 +45,7 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		restoreProperty(process.stdout, "isTTY", stdoutIsTtyDescriptor);
 		restoreProperty(process.stdin, "setRawMode", stdinSetRawModeDescriptor);
 		restoreEnv("GJC_TUI_KEYBOARD_PROTOCOL", originalKeyboardProtocolEnv);
+		restoreProperty(process, "platform", platformDescriptor);
 	});
 
 	function setupTerminal() {
@@ -63,8 +69,9 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		return { terminal, writes, received };
 	}
 
-	it("enables the keyboard protocol by default (query + modifyOtherKeys fallback)", () => {
+	it("enables the keyboard protocol by default on non-win32 (query + modifyOtherKeys fallback)", () => {
 		vi.useFakeTimers();
+		setPlatform("linux");
 		delete Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
 		expect(keyboardEnhancementEnabled()).toBe(true);
 
@@ -87,6 +94,24 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		const { terminal, writes } = setupTerminal();
 
 		expect(writes).not.toContain(KITTY_QUERY);
+
+		vi.advanceTimersByTime(150);
+		expect(writes).not.toContain(MODIFY_OTHER_KEYS);
+
+		terminal.stop();
+	});
+
+	it("skips only the modifyOtherKeys fallback on win32 to preserve IME composition", () => {
+		vi.useFakeTimers();
+		setPlatform("win32");
+		delete Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
+		expect(keyboardEnhancementEnabled()).toBe(true);
+
+		const { terminal, writes } = setupTerminal();
+
+		// The Kitty query is still emitted (harmless where unsupported), but the
+		// modifyOtherKeys fallback that breaks Windows Hangul/CJK IME is skipped.
+		expect(writes).toContain(KITTY_QUERY);
 
 		vi.advanceTimersByTime(150);
 		expect(writes).not.toContain(MODIFY_OTHER_KEYS);
