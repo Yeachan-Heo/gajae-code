@@ -3,16 +3,16 @@
 	"name": "@gajae-code/bridge-client",
 	"version": "0.7.11",
 	"description": "TypeScript client SDK for the GJC backend bridge protocol",
-	"homepage": "https://gaebal-gajae.dev",
+	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/gajae-ai/gajae-code.git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-code.git",
 		"directory": "packages/bridge-client"
 	},
 	"bugs": {
-		"url": "https://github.com/gajae-ai/gajae-code/issues"
+		"url": "https://github.com/Yeachan-Heo/gajae-code/issues"
 	},
 	"keywords": [
 		"gjc",

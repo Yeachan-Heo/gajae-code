@@ -1,11 +1,11 @@
 blank_issues_enabled: true
 contact_links:
   - name: Model Configuration
-    url: https://github.com/can1357/gajae-code/blob/main/docs/models.md
+    url: https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/models.md
     about: How to add custom providers and models via models.yml
-  - name: Extensions Guide
-    url: https://github.com/can1357/gajae-code/blob/main/docs/extensions.md
-    about: Build custom tools, commands, and integrations
+  - name: Plugin Bundles
+    url: https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/gjc-plugins.md
+    about: Build and distribute GJC plugin bundles
   - name: Skills Documentation
-    url: https://github.com/can1357/gajae-code/blob/main/docs/skills.md
-    about: How to create and use skills
+    url: https://gajae-code.com/docs/skills.html
+    about: Create and use workflow skills
