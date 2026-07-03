@@ -26,6 +26,7 @@ import { getPreset } from "./status-line/presets";
 import { renderSegment, type SegmentContext } from "./status-line/segments";
 import { getSeparator } from "./status-line/separators";
 import { calculateTokensPerSecond } from "./status-line/token-rate";
+import type { SeparatorDef } from "./status-line/types";
 
 export interface StatusLineSegmentOptions {
 	model?: { showThinkingLevel?: boolean };
@@ -45,10 +46,28 @@ export interface StatusLineSettings {
 	showHookStatus?: boolean;
 	showSkillHud?: boolean;
 	sessionAccent?: boolean;
+	maxRows?: number;
 }
 
 export interface StatusLineComponentOptions {
 	version?: string;
+}
+
+interface CollectedStatusSegments {
+	ctx: SegmentContext;
+	separatorDef: SeparatorDef;
+	bgAnsi: string;
+	fgAnsi: string;
+	sepAnsi: string;
+	left: string[];
+	leftSegIds: StatusLineSegmentId[];
+	right: string[];
+	previewHighlightSegment: StatusLineSegmentId | undefined;
+	sessionAccent: boolean | undefined;
+	leftSepWidth: number;
+	rightSepWidth: number;
+	leftCapWidth: number;
+	rightCapWidth: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -215,6 +234,7 @@ export class StatusLineComponent implements Component {
 			showSkillHud: settings.get("statusLine.showSkillHud"),
 			segmentOptions: settings.getGroup("statusLine").segmentOptions,
 			sessionAccent: settings.get("statusLine.sessionAccent"),
+			maxRows: settings.get("statusLine.maxRows"),
 		};
 		this.#version = options.version?.trim() || undefined;
 	}
@@ -702,7 +722,70 @@ export class StatusLineComponent implements Component {
 		};
 	}
 
-	#buildStatusLine(width: number): string {
+	#groupWidth(parts: string[], capWidth: number, sepWidth: number): number {
+		if (parts.length === 0) return 0;
+		const partsWidth = parts.reduce((sum, part) => sum + visibleWidth(part), 0);
+		const sepTotal = Math.max(0, parts.length - 1) * (sepWidth + 2);
+		return partsWidth + sepTotal + 2 + capWidth;
+	}
+
+	#renderStatusGroup(
+		parts: string[],
+		direction: "left" | "right",
+		separatorDef: SeparatorDef,
+		bgAnsi: string,
+		fgAnsi: string,
+		sepAnsi: string,
+	): string {
+		if (parts.length === 0) return "";
+		const sep = direction === "left" ? separatorDef.left : separatorDef.right;
+		const cap = separatorDef.endCaps
+			? direction === "left"
+				? separatorDef.endCaps.right
+				: separatorDef.endCaps.left
+			: "";
+		const capPrefix = separatorDef.endCaps?.useBgAsFg ? bgAnsi.replace("\x1b[48;", "\x1b[38;") : bgAnsi + sepAnsi;
+		const capText = cap ? `${capPrefix}${cap}\x1b[0m` : "";
+
+		let content = bgAnsi + fgAnsi;
+		content += ` ${parts.join(` ${sepAnsi}${sep}${fgAnsi} `)} `;
+		content += "\x1b[0m";
+
+		if (capText) {
+			return direction === "right" ? capText + content : content + capText;
+		}
+		return content;
+	}
+
+	#shrinkPathToWidth(content: string, ctx: SegmentContext, shrinkBy: number): string | null {
+		const currentPathVW = visibleWidth(content);
+		const minPathVW = 8; // icon + ellipsis + a few chars
+		const shrinkable = currentPathVW - minPathVW;
+		if (shrinkable <= 0 || shrinkBy <= 0) return null;
+		const targetShrink = Math.min(shrinkable, shrinkBy);
+		const currentMaxLen = ctx.options.path?.maxLength ?? 40;
+		let newMaxLen = Math.max(4, Math.min(currentMaxLen, currentPathVW) - targetShrink);
+		const pathCtx = (maxLen: number): SegmentContext => ({
+			...ctx,
+			options: { ...ctx.options, path: { ...ctx.options.path, maxLength: maxLen } },
+		});
+		let reRendered = renderSegment("path", pathCtx(newMaxLen));
+		if (!reRendered.visible || !reRendered.content) return null;
+		// maxLength governs path text, not icon prefix; iterate to compensate.
+		for (let i = 0; i < 8; i++) {
+			const saved = currentPathVW - visibleWidth(reRendered.content);
+			if (saved >= targetShrink) break;
+			const nextMaxLen = Math.max(4, newMaxLen - (targetShrink - saved));
+			if (nextMaxLen >= newMaxLen) break; // no progress or hit floor
+			newMaxLen = nextMaxLen;
+			const adjusted = renderSegment("path", pathCtx(newMaxLen));
+			if (!adjusted.visible || !adjusted.content) break;
+			reRendered = adjusted;
+		}
+		return reRendered.content;
+	}
+
+	#collectStatusSegments(width: number): CollectedStatusSegments {
 		const ctx = this.#buildSegmentContext(width);
 		const effectiveSettings = this.#resolveSettings();
 		const separatorDef = getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
@@ -715,25 +798,25 @@ export class StatusLineComponent implements Component {
 		const fgAnsi = theme.getFgAnsi("text");
 		const sepAnsi = theme.getFgAnsi("statusLineSep");
 
-		// Collect visible segment contents
+		const previewHighlightSegment = effectiveSettings.previewHighlightSegment;
 		const highlightSegment = (segId: StatusLineSegmentId, content: string): string =>
-			effectiveSettings.previewHighlightSegment === segId ? `\x1b[7m${content}\x1b[27m` : content;
+			previewHighlightSegment === segId ? `\x1b[7m${content}\x1b[27m` : content;
 
-		const leftParts: string[] = [];
+		const left: string[] = [];
 		const leftSegIds: StatusLineSegmentId[] = [];
 		for (const segId of effectiveSettings.leftSegments) {
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
-				leftParts.push(highlightSegment(segId, rendered.content));
+				left.push(highlightSegment(segId, rendered.content));
 				leftSegIds.push(segId);
 			}
 		}
 
-		const rightParts: string[] = [];
+		const right: string[] = [];
 		for (const segId of effectiveSettings.rightSegments) {
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
-				rightParts.push(highlightSegment(segId, rendered.content));
+				right.push(highlightSegment(segId, rendered.content));
 			}
 		}
 
@@ -742,114 +825,150 @@ export class StatusLineComponent implements Component {
 		if (runningBackgroundJobs > 0) {
 			const icon = theme.icon.agents ? `${theme.icon.agents} ` : "";
 			const label = `${formatCount("job", runningBackgroundJobs)} running`;
-			rightParts.push(theme.fg("statusLineSubagents", `${icon}${label}`));
+			right.push(theme.fg("statusLineSubagents", `${icon}${label}`));
 		}
 		if (this.#version) {
-			rightParts.push(theme.fg("dim", `v${this.#version}`));
+			right.push(theme.fg("dim", `v${this.#version}`));
 		}
-		const topFillWidth = Math.max(0, width);
-		const left = [...leftParts];
-		const right = [...rightParts];
 
-		const leftSepWidth = visibleWidth(separatorDef.left);
-		const rightSepWidth = visibleWidth(separatorDef.right);
-		const leftCapWidth = separatorDef.endCaps ? visibleWidth(separatorDef.endCaps.right) : 0;
-		const rightCapWidth = separatorDef.endCaps ? visibleWidth(separatorDef.endCaps.left) : 0;
-
-		const groupWidth = (parts: string[], capWidth: number, sepWidth: number): number => {
-			if (parts.length === 0) return 0;
-			const partsWidth = parts.reduce((sum, part) => sum + visibleWidth(part), 0);
-			const sepTotal = Math.max(0, parts.length - 1) * (sepWidth + 2);
-			return partsWidth + sepTotal + 2 + capWidth;
+		return {
+			ctx,
+			separatorDef,
+			bgAnsi,
+			fgAnsi,
+			sepAnsi,
+			left,
+			leftSegIds,
+			right,
+			previewHighlightSegment,
+			sessionAccent: effectiveSettings.sessionAccent,
+			leftSepWidth: visibleWidth(separatorDef.left),
+			rightSepWidth: visibleWidth(separatorDef.right),
+			leftCapWidth: separatorDef.endCaps ? visibleWidth(separatorDef.endCaps.right) : 0,
+			rightCapWidth: separatorDef.endCaps ? visibleWidth(separatorDef.endCaps.left) : 0,
 		};
+	}
 
-		let leftWidth = groupWidth(left, leftCapWidth, leftSepWidth);
-		let rightWidth = groupWidth(right, rightCapWidth, rightSepWidth);
+	#resolveMaxRows(): number {
+		const raw = this.#settings.maxRows ?? 1;
+		if (!Number.isFinite(raw)) return 1;
+		return Math.max(1, Math.min(3, Math.trunc(raw)));
+	}
+
+	#buildStatusLine(width: number, precollected?: CollectedStatusSegments): string {
+		const seg = precollected ?? this.#collectStatusSegments(width);
+		const { ctx, separatorDef, bgAnsi, fgAnsi, sepAnsi, previewHighlightSegment } = seg;
+		const { leftSepWidth, rightSepWidth, leftCapWidth, rightCapWidth } = seg;
+		const left = [...seg.left];
+		const leftIds = [...seg.leftSegIds];
+		const right = [...seg.right];
+		const topFillWidth = Math.max(0, width);
+
+		let leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
+		let rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
 		const totalWidth = () => leftWidth + rightWidth + (left.length > 0 && right.length > 0 ? 1 : 0);
 
 		if (topFillWidth > 0) {
 			while (totalWidth() > topFillWidth && right.length > 0) {
 				right.pop();
-				rightWidth = groupWidth(right, rightCapWidth, rightSepWidth);
+				rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
 			}
 			// Shrink path before dropping left segments — path is the only elastic segment
-			const pathIdx = leftSegIds.indexOf("path");
+			const pathIdx = leftIds.indexOf("path");
 			if (pathIdx >= 0 && totalWidth() > topFillWidth) {
 				const overflow = totalWidth() - topFillWidth;
-				const currentPathVW = visibleWidth(left[pathIdx]);
-				const minPathVW = 8; // icon + ellipsis + a few chars
-				const shrinkable = currentPathVW - minPathVW;
-				if (shrinkable > 0) {
-					const shrinkBy = Math.min(shrinkable, overflow);
-					const currentMaxLen = ctx.options.path?.maxLength ?? 40;
-					let newMaxLen = Math.max(4, Math.min(currentMaxLen, currentPathVW) - shrinkBy);
-					const pathCtx = (maxLen: number): SegmentContext => ({
-						...ctx,
-						options: { ...ctx.options, path: { ...ctx.options.path, maxLength: maxLen } },
-					});
-					let reRendered = renderSegment("path", pathCtx(newMaxLen));
-					if (reRendered.visible && reRendered.content) {
-						// maxLength governs path text, not icon prefix; iterate to compensate
-						for (let i = 0; i < 8; i++) {
-							const saved = currentPathVW - visibleWidth(reRendered.content);
-							if (saved >= shrinkBy) break;
-							const nextMaxLen = Math.max(4, newMaxLen - (shrinkBy - saved));
-							if (nextMaxLen >= newMaxLen) break; // no progress or hit floor
-							newMaxLen = nextMaxLen;
-							const adjusted = renderSegment("path", pathCtx(newMaxLen));
-							if (!adjusted.visible || !adjusted.content) break;
-							reRendered = adjusted;
-						}
-						left[pathIdx] = highlightSegment("path", reRendered.content);
-						leftWidth = groupWidth(left, leftCapWidth, leftSepWidth);
-					}
+				const shrunk = this.#shrinkPathToWidth(left[pathIdx], ctx, overflow);
+				if (shrunk !== null) {
+					left[pathIdx] = previewHighlightSegment === "path" ? `\x1b[7m${shrunk}\x1b[27m` : shrunk;
+					leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
 				}
 			}
 			while (totalWidth() > topFillWidth && left.length > 0) {
 				left.pop();
-				leftSegIds.pop();
-				leftWidth = groupWidth(left, leftCapWidth, leftSepWidth);
+				leftIds.pop();
+				leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
 			}
 		}
 
-		const renderGroup = (parts: string[], direction: "left" | "right"): string => {
-			if (parts.length === 0) return "";
-			const sep = direction === "left" ? separatorDef.left : separatorDef.right;
-			const cap = separatorDef.endCaps
-				? direction === "left"
-					? separatorDef.endCaps.right
-					: separatorDef.endCaps.left
-				: "";
-			const capPrefix = separatorDef.endCaps?.useBgAsFg ? bgAnsi.replace("\x1b[48;", "\x1b[38;") : bgAnsi + sepAnsi;
-			const capText = cap ? `${capPrefix}${cap}\x1b[0m` : "";
-
-			let content = bgAnsi + fgAnsi;
-			content += ` ${parts.join(` ${sepAnsi}${sep}${fgAnsi} `)} `;
-			content += "\x1b[0m";
-
-			if (capText) {
-				return direction === "right" ? capText + content : content + capText;
-			}
-			return content;
-		};
-
-		const leftGroup = renderGroup(left, "left");
-		const rightGroup = renderGroup(right, "right");
+		const leftGroup = this.#renderStatusGroup(left, "left", separatorDef, bgAnsi, fgAnsi, sepAnsi);
+		const rightGroup = this.#renderStatusGroup(right, "right", separatorDef, bgAnsi, fgAnsi, sepAnsi);
 		if (!leftGroup && !rightGroup) return "";
 
 		if (topFillWidth === 0 || left.length === 0 || right.length === 0) {
 			return leftGroup + (leftGroup && rightGroup ? " " : "") + rightGroup;
 		}
 
-		leftWidth = groupWidth(left, leftCapWidth, leftSepWidth);
-		rightWidth = groupWidth(right, rightCapWidth, rightSepWidth);
+		leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
+		rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
 		const gapWidth = Math.max(1, topFillWidth - leftWidth - rightWidth);
-		const sessionName =
-			effectiveSettings.sessionAccent !== false ? this.session.sessionManager?.getSessionName() : undefined;
+		const sessionName = seg.sessionAccent !== false ? this.session.sessionManager?.getSessionName() : undefined;
 		const accentHex = sessionName ? getSessionAccentHex(sessionName) : undefined;
 		const gapColor = getSessionAccentAnsi(accentHex) ?? theme.getFgAnsi("border");
 		const gapFill = `${gapColor}${theme.boxRound.horizontal.repeat(gapWidth)}\x1b[39m`;
 		return leftGroup + gapFill + rightGroup;
+	}
+
+	/**
+	 * Multi-row status line. When `maxRows > 1` and the single-line layout would
+	 * overflow, segments wrap onto additional left-justified rows instead of
+	 * being dropped. Falls back to the polished justified single row whenever
+	 * everything fits on one line.
+	 */
+	#buildStatusRows(width: number, maxRows: number): string[] {
+		const seg = this.#collectStatusSegments(width);
+		if (seg.left.length === 0 && seg.right.length === 0) return [];
+
+		const topFillWidth = Math.max(1, width);
+		const leftWidth = this.#groupWidth(seg.left, seg.leftCapWidth, seg.leftSepWidth);
+		const rightWidth = this.#groupWidth(seg.right, seg.rightCapWidth, seg.rightSepWidth);
+		const gap = seg.left.length > 0 && seg.right.length > 0 ? 1 : 0;
+		const fitsSingleRow = leftWidth + rightWidth + gap <= topFillWidth;
+
+		if (maxRows <= 1 || fitsSingleRow) {
+			const single = this.#buildStatusLine(width, seg);
+			return single ? [single] : [];
+		}
+
+		// Ordered sequence: left segments first (in order), then right segments.
+		const items: { content: string; isPath: boolean }[] = [
+			...seg.left.map((content, i) => ({ content, isPath: seg.leftSegIds[i] === "path" })),
+			...seg.right.map(content => ({ content, isPath: false })),
+		];
+
+		// Pre-shrink an over-wide path so it never blows out a row on its own.
+		for (const item of items) {
+			if (!item.isPath) continue;
+			const alone = this.#groupWidth([item.content], seg.leftCapWidth, seg.leftSepWidth);
+			if (alone > topFillWidth) {
+				const shrunk = this.#shrinkPathToWidth(item.content, seg.ctx, alone - topFillWidth);
+				if (shrunk !== null) item.content = shrunk;
+			}
+		}
+
+		// Greedy pack into up to `maxRows` left-justified rows.
+		const rows: string[][] = [];
+		let current: string[] = [];
+		for (const item of items) {
+			if (current.length === 0) {
+				current.push(item.content);
+				continue;
+			}
+			const tentative = [...current, item.content];
+			if (this.#groupWidth(tentative, seg.leftCapWidth, seg.leftSepWidth) <= topFillWidth) {
+				current = tentative;
+			} else {
+				rows.push(current);
+				current = [item.content];
+				if (rows.length >= maxRows) break;
+			}
+		}
+		if (rows.length < maxRows && current.length > 0) {
+			rows.push(current);
+		}
+
+		return rows.map(row =>
+			this.#renderStatusGroup(row, "left", seg.separatorDef, seg.bgAnsi, seg.fgAnsi, seg.sepAnsi),
+		);
 	}
 
 	getTopBorder(width: number): { content: string; width: number } {
@@ -860,6 +979,16 @@ export class StatusLineComponent implements Component {
 		};
 	}
 
+	/**
+	 * Multi-row-aware content for the settings preview: the wrapped rows joined
+	 * with newlines so a single `Text` renders them stacked. Honors the current
+	 * `maxRows`; identical to the single status line when `maxRows` is 1 or when
+	 * everything fits on one row.
+	 */
+	getPreviewContent(width: number): string {
+		return this.#buildStatusRows(width, this.#resolveMaxRows()).join("\n");
+	}
+
 	render(width: number): string[] {
 		const lines: string[] = [];
 		this.#refreshSkillHudInBackground();
@@ -868,9 +997,9 @@ export class StatusLineComponent implements Component {
 			lines.push(skillHud);
 		}
 
-		const statusLine = this.#buildStatusLine(width);
-		if (statusLine) {
-			lines.push(truncateToWidth(statusLine, width));
+		const statusRows = this.#buildStatusRows(width, this.#resolveMaxRows());
+		for (const statusRow of statusRows) {
+			if (statusRow) lines.push(truncateToWidth(statusRow, width));
 		}
 
 		const showHooks = this.#settings.showHookStatus ?? true;

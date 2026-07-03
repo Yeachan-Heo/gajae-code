@@ -15,7 +15,7 @@ import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from
 import { GJC_MODEL_ASSIGNMENT_TARGETS } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
-import { settings } from "../../config/settings";
+import { type Settings, settings } from "../../config/settings";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -85,6 +85,7 @@ import {
 import { SessionObserverOverlayComponent } from "../components/session-observer-overlay";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
+import type { StatusLineSettings } from "../components/status-line";
 import { ThemeSelectorComponent } from "../components/theme-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
 import { TreeSelectorComponent } from "../components/tree-selector";
@@ -106,6 +107,24 @@ const MANUAL_LOGIN_TIP = "Tip: You can complete pairing with /login <redirect UR
 
 function isThemePreviewSuperseded(result: { success: boolean; error?: string }): boolean {
 	return !result.success && result.error?.includes("superseded by a newer request") === true;
+}
+
+/**
+ * Snapshot the persisted status-line settings that the status-line component
+ * cares about. Preview, cancel-restore, and commit paths all share this so the
+ * previewed row count (and every other field) can never drift out of sync.
+ */
+export function buildStatusLineSettings(settingsInstance: Settings): StatusLineSettings {
+	return {
+		preset: settingsInstance.get("statusLine.preset"),
+		leftSegments: settingsInstance.get("statusLine.leftSegments"),
+		rightSegments: settingsInstance.get("statusLine.rightSegments"),
+		separator: settingsInstance.get("statusLine.separator"),
+		showHookStatus: settingsInstance.get("statusLine.showHookStatus"),
+		sessionAccent: settingsInstance.get("statusLine.sessionAccent"),
+		maxRows: settingsInstance.get("statusLine.maxRows"),
+		segmentOptions: settingsInstance.get("statusLine.segmentOptions"),
+	};
 }
 
 function formatProviderOnboardingCommandGuide(): string {
@@ -442,13 +461,7 @@ export class SelectorController {
 						onStatusLinePreview: previewSettings => {
 							// Update status line with preview settings
 							this.ctx.statusLine.updateSettings({
-								preset: settings.get("statusLine.preset"),
-								leftSegments: settings.get("statusLine.leftSegments"),
-								rightSegments: settings.get("statusLine.rightSegments"),
-								separator: settings.get("statusLine.separator"),
-								showHookStatus: settings.get("statusLine.showHookStatus"),
-								sessionAccent: settings.get("statusLine.sessionAccent"),
-								segmentOptions: settings.get("statusLine.segmentOptions"),
+								...buildStatusLineSettings(settings),
 								...previewSettings,
 							});
 							this.ctx.updateEditorTopBorder();
@@ -458,7 +471,7 @@ export class SelectorController {
 							// Return the rendered status line for inline preview
 							const availableWidth =
 								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
-							return this.ctx.statusLine.getTopBorder(availableWidth).content;
+							return this.ctx.statusLine.getPreviewContent(availableWidth);
 						},
 						onPluginsChanged: () => {
 							this.ctx.ui.requestRender();
@@ -466,15 +479,7 @@ export class SelectorController {
 						onCancel: () => {
 							done();
 							// Restore status line to saved settings
-							this.ctx.statusLine.updateSettings({
-								preset: settings.get("statusLine.preset"),
-								leftSegments: settings.get("statusLine.leftSegments"),
-								rightSegments: settings.get("statusLine.rightSegments"),
-								separator: settings.get("statusLine.separator"),
-								showHookStatus: settings.get("statusLine.showHookStatus"),
-								sessionAccent: settings.get("statusLine.sessionAccent"),
-								segmentOptions: settings.get("statusLine.segmentOptions"),
-							});
+							this.ctx.statusLine.updateSettings(buildStatusLineSettings(settings));
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
 						},
@@ -718,6 +723,7 @@ export class SelectorController {
 			case "statusLineShowHooks":
 			case "statusLine.showHookStatus":
 			case "statusLine.sessionAccent":
+			case "statusLine.maxRows":
 			case "statusLine.leftSegments":
 			case "statusLine.rightSegments":
 			case "statusLine.segmentOptions":
@@ -732,16 +738,7 @@ export class SelectorController {
 			case "statusLineGitShowUntracked":
 			case "statusLineTimeFormat":
 			case "statusLineTimeShowSeconds": {
-				const statusLineSettings = {
-					preset: settings.get("statusLine.preset"),
-					leftSegments: settings.get("statusLine.leftSegments"),
-					rightSegments: settings.get("statusLine.rightSegments"),
-					separator: settings.get("statusLine.separator"),
-					showHookStatus: settings.get("statusLine.showHookStatus"),
-					sessionAccent: settings.get("statusLine.sessionAccent"),
-					segmentOptions: settings.get("statusLine.segmentOptions"),
-				};
-				this.ctx.statusLine.updateSettings(statusLineSettings);
+				this.ctx.statusLine.updateSettings(buildStatusLineSettings(settings));
 				this.ctx.updateEditorTopBorder();
 				this.ctx.ui.requestRender();
 				break;

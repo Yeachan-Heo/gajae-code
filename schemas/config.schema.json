@@ -299,6 +299,11 @@
 					"description": "Use the session name color for the editor border and status line gap",
 					"default": true
 				},
+				"maxRows": {
+					"type": "number",
+					"description": "Maximum rows for the status line. When greater than 1, overflowing segments wrap onto additional rows instead of being dropped.",
+					"default": 1
+				},
 				"showHookStatus": {
 					"type": "boolean",
 					"default": false

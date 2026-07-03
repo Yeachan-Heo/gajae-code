@@ -670,6 +670,7 @@ export interface StatusLinePreviewSettings {
 	segmentOptions?: StatusLineSegmentOptions;
 	previewHighlightSegment?: StatusLineSegmentId;
 	sessionAccent?: boolean;
+	maxRows?: number;
 }
 
 export interface SettingsCallbacks {
@@ -906,6 +907,18 @@ export class SettingsSelectorComponent extends Container {
 			onPreviewCancel = () => {
 				const separator = settings.get("statusLine.separator");
 				this.callbacks.onStatusLinePreview?.({ separator, previewHighlightSegment: undefined });
+				this.#updateStatusPreview();
+			};
+		} else if (def.path === "statusLine.maxRows") {
+			onPreview = value => {
+				this.callbacks.onStatusLinePreview?.({ maxRows: Number(value) });
+				this.#updateStatusPreview();
+			};
+			onPreviewCancel = () => {
+				this.callbacks.onStatusLinePreview?.({
+					maxRows: settings.get("statusLine.maxRows"),
+					previewHighlightSegment: undefined,
+				});
 				this.#updateStatusPreview();
 			};
 		}
