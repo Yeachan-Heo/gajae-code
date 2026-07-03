@@ -14,6 +14,13 @@ import { isNotebookPath, readEditableNotebookText, serializeEditedNotebookText }
  */
 export const MAX_EDIT_FILE_BYTES = 8 * 1024 * 1024;
 
+const UTF8_BOM = [0xef, 0xbb, 0xbf] as const;
+
+async function fileHasUtf8Bom(file: Bun.BunFile): Promise<boolean> {
+	const bytes = await file.slice(0, UTF8_BOM.length).bytes();
+	return UTF8_BOM.every((byte, index) => bytes[index] === byte);
+}
+
 export async function readEditFileText(absolutePath: string, path: string): Promise<string> {
 	try {
 		const file = Bun.file(absolutePath);
@@ -28,7 +35,8 @@ export async function readEditFileText(absolutePath: string, path: string): Prom
 		// Guard BEFORE the notebook fast-path: a >8 MiB .ipynb would otherwise load + JSON-parse
 		// + convert the whole file via readEditableNotebookText, bypassing the F19 freeze guard.
 		if (isNotebookPath(absolutePath)) return await readEditableNotebookText(absolutePath, path);
-		return await file.text();
+		const text = await file.text();
+		return (await fileHasUtf8Bom(file)) && !text.startsWith("\uFEFF") ? `\uFEFF${text}` : text;
 	} catch (error) {
 		if (isEnoent(error)) {
 			throw new Error(`File not found: ${path}`);
