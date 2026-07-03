@@ -60,8 +60,6 @@ class TextInputSubmenu extends Container {
 		this.#input = new Input();
 		if (currentValue) {
 			this.#input.setValue(currentValue);
-			// Move cursor to end of pre-filled value (ctrl+e = cursorLineEnd).
-			this.#input.handleInput("\x05");
 		}
 		this.#input.onSubmit = value => {
 			this.onSubmit(value); // empty string clears the setting

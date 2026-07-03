@@ -23,6 +23,22 @@ describe("Input component", () => {
 		return input;
 	}
 
+	it("places cursor at the end after setValue prefill", () => {
+		const input = new Input();
+		input.setValue("cla");
+		input.handleInput("u");
+		expect(input.getValue()).toBe("clau");
+	});
+
+	it("resets pending type coalescing after setValue", () => {
+		const input = new Input();
+		input.handleInput("a");
+		input.setValue("bc");
+		input.handleInput("d");
+		input.handleInput("\x1f"); // Ctrl+/ undo
+		expect(input.getValue()).toBe("bc");
+	});
+
 	it("moves by CJK and punctuation blocks (backward)", () => {
 		const text = "天气不错，去散步吧！";
 

@@ -1014,7 +1014,6 @@ export class ModelSelectorComponent extends Container {
 
 	#setSearchInputValue(value: string): void {
 		this.#searchInput.setValue(value);
-		this.#searchInput.handleInput("\x05"); // Move cursor to end after programmatic prefill.
 	}
 
 	#switchToModelMode(seed?: string): void {

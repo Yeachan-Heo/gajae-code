@@ -58,7 +58,8 @@ export class Input implements Component, Focusable {
 	setValue(value: string): void {
 		const normalized = value.normalize("NFC");
 		this.#value = normalized;
-		this.#cursor = Math.min(this.#cursor, normalized.length);
+		this.#cursor = normalized.length;
+		this.#lastAction = null;
 	}
 
 	handleInput(data: string): void {
