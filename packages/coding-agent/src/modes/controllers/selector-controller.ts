@@ -448,6 +448,7 @@ export class SelectorController {
 								separator: settings.get("statusLine.separator"),
 								showHookStatus: settings.get("statusLine.showHookStatus"),
 								sessionAccent: settings.get("statusLine.sessionAccent"),
+								maxRows: settings.get("statusLine.maxRows"),
 								segmentOptions: settings.get("statusLine.segmentOptions"),
 								...previewSettings,
 							});
@@ -458,7 +459,7 @@ export class SelectorController {
 							// Return the rendered status line for inline preview
 							const availableWidth =
 								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
-							return this.ctx.statusLine.getTopBorder(availableWidth).content;
+							return this.ctx.statusLine.getPreviewContent(availableWidth);
 						},
 						onPluginsChanged: () => {
 							this.ctx.ui.requestRender();
@@ -718,6 +719,7 @@ export class SelectorController {
 			case "statusLineShowHooks":
 			case "statusLine.showHookStatus":
 			case "statusLine.sessionAccent":
+			case "statusLine.maxRows":
 			case "statusLine.leftSegments":
 			case "statusLine.rightSegments":
 			case "statusLine.segmentOptions":
@@ -739,6 +741,7 @@ export class SelectorController {
 					separator: settings.get("statusLine.separator"),
 					showHookStatus: settings.get("statusLine.showHookStatus"),
 					sessionAccent: settings.get("statusLine.sessionAccent"),
+					maxRows: settings.get("statusLine.maxRows"),
 					segmentOptions: settings.get("statusLine.segmentOptions"),
 				};
 				this.ctx.statusLine.updateSettings(statusLineSettings);
