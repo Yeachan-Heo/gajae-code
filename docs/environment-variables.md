@@ -443,7 +443,7 @@ Extra conditional behavior:
 | `GJC_SMOL_MODEL`              | Ephemeral model-role override for `smol` (CLI `--smol` takes precedence)                           |
 | `GJC_SLOW_MODEL`              | Ephemeral model-role override for `slow` (CLI `--slow` takes precedence)                           |
 | `GJC_PLAN_MODEL`              | Ephemeral model-role override for `plan` (CLI `--plan` takes precedence)                           |
-| `GJC_NO_TITLE`                | If set (any non-empty value), disables auto session title generation on first user message         |
+| `GJC_NO_TITLE`                | If set (any non-empty value), disables auto session title generation and periodic title refresh    |
 | `GJC_NO_CMUX_RENAME`         | If set (any non-empty value), disables renaming the containing cmux workspace to the current session name |
 | `NULL_PROMPT`                | If `true`, system prompt builder returns empty string                                              |
 | `GJC_BLOCKED_AGENT`           | Blocks a specific subagent type in task tool                                                       |

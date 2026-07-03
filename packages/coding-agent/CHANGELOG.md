@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Session titles now refresh automatically as the conversation topic drifts: after every 8 user messages, an auto-generated title is regenerated from the trailing user messages (weighting the newest highest). User-set names (`/rename`) are never overwritten, and legacy titles without a recorded source are treated as user-owned. Interactive mode also now generates an initial title for resumed sessions that never got one, and retries on the same bounded interval after silent generation failures (previously the title was attempted exactly once, on the first message of a brand-new session). `PI_NO_TITLE` still disables all title generation.
+
 ## [0.7.11] - 2026-07-03
 ### Fixed
 
