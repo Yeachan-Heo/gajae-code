@@ -60,6 +60,10 @@ declare module "@gajae-code/tui" {
 	interface Keybindings extends AppKeybindings {}
 }
 
+export function defaultMessageQueueKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId {
+	return platform === "win32" ? "alt+q" : "alt+enter";
+}
+
 /**
  * All keybindings definitions: TUI + app-specific.
  */
@@ -126,7 +130,7 @@ export const KEYBINDINGS = {
 		description: "Send follow-up message (no default; Ctrl+Enter submits)",
 	},
 	"app.message.queue": {
-		defaultKeys: "alt+enter",
+		defaultKeys: defaultMessageQueueKeysForPlatform(),
 		description: "Queue message for next turn",
 	},
 	"app.message.dequeue": {

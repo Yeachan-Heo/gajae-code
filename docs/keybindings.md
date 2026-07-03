@@ -41,7 +41,7 @@ Set an action to an empty array to disable it:
 | `app.thinking.cycle` | `Shift+Tab` | Cycle thinking level |
 | `app.editor.external` | `Ctrl+G` | Edit the draft in `$VISUAL` / `$EDITOR` |
 | `app.message.followUp` | _(none)_ | Optional remap for a follow-up message; `Ctrl+Enter` is reserved for editor newline |
-| `app.message.queue` | `Alt+Enter` | Explicitly queue a message for the next turn |
+| `app.message.queue` | `Alt+Enter` (`Alt+Q` on win32) | Explicitly queue a message for the next turn |
 | `app.message.dequeue` | `Alt+Up` | Dequeue a queued message back into the editor |
 
 | `app.clipboard.copyLine` | `Alt+Shift+L` | Copy the current line |
@@ -49,6 +49,8 @@ Set an action to an empty array to disable it:
 | `app.stt.toggle` | `Alt+H` | Toggle speech-to-text recording |
 
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
+
+On native Windows terminals, GJC defaults `app.message.queue` to `Alt+Q` because Windows Terminal and PowerShell commonly reserve `Alt+Enter` for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
 
 ## Auditing default-key collisions
 
@@ -133,7 +135,7 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.tool.backgroundFold` | `ctrl+b` | |
 | `app.editor.external` | `ctrl+g` | |
 | `app.message.followUp` | _(none)_ | `Ctrl+Enter` remains newline unless the user explicitly remaps this action; while idle the chord still falls through to newline |
-| `app.message.queue` | `alt+enter` | |
+| `app.message.queue` | `alt+enter` (`alt+q` on win32) | platform-aware; avoids the Windows Terminal fullscreen shortcut |
 | `app.message.dequeue` | `alt+up` | |
 | `app.clipboard.pasteImage` | `ctrl+v` (`alt+v` on win32) | platform-aware; single source of truth in `KEYBINDINGS` |
 | `app.clipboard.copyLine` | `alt+shift+l` | registry-backed via input-controller custom handler |

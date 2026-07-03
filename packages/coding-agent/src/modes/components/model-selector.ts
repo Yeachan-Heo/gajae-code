@@ -405,7 +405,7 @@ export class ModelSelectorComponent extends Container {
 		// Create search input
 		this.#searchInput = new Input();
 		if (initialSearchInput) {
-			this.#searchInput.setValue(initialSearchInput);
+			this.#setSearchInputValue(initialSearchInput);
 		}
 		this.#searchInput.onSubmit = () => {
 			const selectedItem = this.#getSelectedItem();
@@ -1012,6 +1012,11 @@ export class ModelSelectorComponent extends Container {
 		if (!this.#relocatePresetCursor(targetIdentity)) this.#clampPresetCursor();
 	}
 
+	#setSearchInputValue(value: string): void {
+		this.#searchInput.setValue(value);
+		this.#searchInput.handleInput("\x05"); // Move cursor to end after programmatic prefill.
+	}
+
 	#switchToModelMode(seed?: string): void {
 		this.#viewMode = "models";
 		this.#expandedPresetProviderId = undefined;
@@ -1021,7 +1026,7 @@ export class ModelSelectorComponent extends Container {
 		this.#presetLoginHint = undefined;
 		this.#activeTabIndex = 0;
 		this.#selectedIndex = 0;
-		this.#searchInput.setValue(seed ?? this.#searchInput.getValue());
+		this.#setSearchInputValue(seed ?? this.#searchInput.getValue());
 		this.#updateTabBar();
 		this.#filterModels(this.#searchInput.getValue());
 	}

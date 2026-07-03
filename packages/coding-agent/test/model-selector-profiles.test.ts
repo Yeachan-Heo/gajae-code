@@ -205,6 +205,29 @@ describe("model selector profiles", () => {
 		expect(rendered).not.toContain("Codex Eco");
 		expect(rendered).not.toContain("profile-a");
 	});
+	test("preset search keeps first typed character before subsequent input", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		selector.handleInput("c");
+		selector.handleInput("l");
+		selector.handleInput("a");
+
+		expect(selector.getSearchInput().getValue()).toBe("cla");
+	});
+
+	test("initial search input appends new typing at the end", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {}, { initialSearchInput: "cla" });
+		await Bun.sleep(10);
+		installTestTheme();
+
+		selector.handleInput("u");
+
+		expect(selector.getSearchInput().getValue()).toBe("clau");
+	});
 
 	test("temporary-only mode hides Profiles", async () => {
 		installTestTheme();

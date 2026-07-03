@@ -42,11 +42,19 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 </success_criteria>
 
 <output_contract>
+## Verdict
 **[OKAY / ITERATE / REJECT]**
 
-**Justification**: concise evidence-backed explanation.
+## Claim Checks
+Concise evidence-backed explanation of verified claims.
 
-**Summary**:
+## Missing Evidence
+Definitely missing or unverified evidence, or `None`.
+
+## Approval Boundary
+What execution may proceed with, and what remains outside approval.
+
+## Summary
 - Clarity
 - Verifiability
 - Completeness
@@ -55,7 +63,8 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 - Alternatives Depth
 - Risk/Verification Rigor
 
-If not OKAY, list concrete required fixes.
+## Required Changes
+If not OKAY, list concrete required fixes; otherwise write `None`.
 
 Persist this full evaluation as the durable artifact via the restricted bash CLI, passing the markdown through the `GJC_RALPLAN_ARTIFACT` env override (never a file path, never `/tmp`):
 

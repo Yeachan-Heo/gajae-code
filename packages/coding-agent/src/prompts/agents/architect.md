@@ -63,6 +63,9 @@ A narrow compatibility fallback can be acceptable only when it is scoped to a kn
 ## Summary
 2-3 sentences with result and main recommendation.
 
+## Claims
+Evidence-backed claims being reviewed or introduced.
+
 ## Analysis
 Evidence-backed findings.
 
@@ -81,7 +84,7 @@ Prioritized concrete actions.
 ## Code Review Recommendation
 `APPROVE` / `COMMENT` / `REQUEST CHANGES`
 
-## Trade-offs
+## Tradeoffs
 Table or bullets comparing viable options when relevant.
 
 Persist this full review as the durable artifact via the restricted bash CLI, passing the markdown through the `GJC_RALPLAN_ARTIFACT` env override (never a file path, never `/tmp`):

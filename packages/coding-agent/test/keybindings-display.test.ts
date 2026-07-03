@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { KeybindingsManager } from "../src/config/keybindings";
+import { defaultMessageQueueKeysForPlatform, KeybindingsManager } from "../src/config/keybindings";
 import type { Extension, ExtensionRuntime } from "../src/extensibility/extensions";
 import { ExtensionRunner } from "../src/extensibility/extensions";
 
@@ -36,6 +36,12 @@ describe("message keybinding defaults", () => {
 		expect(keybindings.getKeys("app.message.followUp")).toEqual([]);
 		expect(keybindings.getDisplayString("app.message.followUp")).toBe("");
 		expect(keybindings.getDisplayString("app.message.queue")).toBe("Alt+Enter");
+	});
+
+	it("uses Alt+Q for the native Windows queue shortcut", () => {
+		expect(defaultMessageQueueKeysForPlatform("win32")).toBe("alt+q");
+		expect(defaultMessageQueueKeysForPlatform("linux")).toBe("alt+enter");
+		expect(defaultMessageQueueKeysForPlatform("darwin")).toBe("alt+enter");
 	});
 });
 
