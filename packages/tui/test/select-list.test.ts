@@ -168,4 +168,24 @@ describe("SelectList", () => {
 
 		expect(selectedValue).toBe("run");
 	});
+	it("cancels even when the active filter has no matches", () => {
+		const items = [{ value: "run", label: "run" }];
+		const list = new SelectList(items, 5, testTheme);
+		let cancelCount = 0;
+		let selectedValue: string | undefined;
+		list.onCancel = () => {
+			cancelCount += 1;
+		};
+		list.onSelect = item => {
+			selectedValue = item.value;
+		};
+
+		list.setFilter("missing");
+		expect(list.render(80)).toEqual(["  No matching commands"]);
+		list.handleInput("\x1b");
+		list.handleInput("\n");
+
+		expect(cancelCount).toBe(1);
+		expect(selectedValue).toBeUndefined();
+	});
 });

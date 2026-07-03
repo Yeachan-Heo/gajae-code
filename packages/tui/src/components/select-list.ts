@@ -117,8 +117,15 @@ export class SelectList implements Component {
 	}
 
 	handleInput(keyData: string): void {
-		if (this.#filteredItems.length === 0) return;
 		const kb = getKeybindings();
+		// Escape or Ctrl+C must work even when the current filter has no matches.
+		if (kb.matches(keyData, "tui.select.cancel")) {
+			if (this.onCancel) {
+				this.onCancel();
+			}
+			return;
+		}
+		if (this.#filteredItems.length === 0) return;
 		// Up arrow - wrap to bottom when at top
 		if (kb.matches(keyData, "tui.select.up")) {
 			this.#selectedIndex = this.#selectedIndex === 0 ? this.#filteredItems.length - 1 : this.#selectedIndex - 1;
@@ -144,12 +151,6 @@ export class SelectList implements Component {
 			const selectedItem = this.#filteredItems[this.#selectedIndex];
 			if (selectedItem && this.onSelect) {
 				this.onSelect(selectedItem);
-			}
-		}
-		// Escape or Ctrl+C
-		else if (kb.matches(keyData, "tui.select.cancel")) {
-			if (this.onCancel) {
-				this.onCancel();
 			}
 		}
 	}
