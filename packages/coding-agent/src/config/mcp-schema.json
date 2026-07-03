@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/can1357/gajae-code/main/packages/coding-agent/src/config/mcp-schema.json",
+  "$id": "https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/packages/coding-agent/src/config/mcp-schema.json",
   "title": "GJC MCP configuration",
   "description": "Schema for mcp.json, .mcp.json, .gjc/mcp.json, and ~/.gjc/agent/mcp.json used by the GJC coding agent.",
   "type": "object",

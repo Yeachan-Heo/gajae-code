@@ -3,7 +3,7 @@
 	"name": "@gajae-code/coding-agent",
 	"version": "0.7.11",
 	"description": "Gajae Code CLI with read, bash, edit, write tools and session management",
-	"homepage": "https://gaebal-gajae.dev",
+	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo",
 	"contributors": [
 		"Mario Zechner"
@@ -11,11 +11,11 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/gajae-ai/gajae-code.git",
+		"url": "git+https://github.com/Yeachan-Heo/gajae-code.git",
 		"directory": "packages/coding-agent"
 	},
 	"bugs": {
-		"url": "https://github.com/gajae-ai/gajae-code/issues"
+		"url": "https://github.com/Yeachan-Heo/gajae-code/issues"
 	},
 	"keywords": [
 		"coding-agent",
