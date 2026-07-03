@@ -1,14 +1,27 @@
 /**
  * Direct MCP server registration CLI helpers.
  *
- * This surface only writes explicit user-provided server definitions to GJC's
- * own MCP config. It never imports or inherits live configs from other agents.
+ * This surface writes server definitions to GJC's own MCP config — either
+ * explicit user-provided ones (`add`) or copies imported from another host's
+ * config (`import`, a one-time migration). It never inherits live configs:
+ * once written, GJC owns runtime execution, auth, and lifecycle.
  */
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import { getMCPServer, readMCPConfigFile, removeMCPServer, upsertMCPServer } from "../runtime-mcp/config-writer";
 import type { MCPConfigFile, MCPServerConfig } from "../runtime-mcp/types";
+import { runMigrateCommand } from "./migrate-cli";
 
-export type MCPAction = "add" | "list" | "remove";
+export type MCPAction = "add" | "list" | "remove" | "import";
+
+/** Friendly aliases for `gjc mcp import <source>`. */
+const IMPORT_SOURCE_ALIASES: Record<string, string> = {
+	claude: "claude-code",
+	"claude-code": "claude-code",
+	codex: "codex",
+	opencode: "opencode",
+	cursor: "cursor",
+	all: "all",
+};
 
 export interface MCPCommandArgs {
 	action: MCPAction;
@@ -18,6 +31,7 @@ export interface MCPCommandArgs {
 		project?: boolean;
 		force?: boolean;
 		json?: boolean;
+		dryRun?: boolean;
 		type?: "stdio" | "http" | "sse";
 		command?: string;
 		url?: string;
@@ -247,6 +261,38 @@ async function runRemove(args: MCPCommandArgs, scoped: ScopedPath): Promise<void
 	process.stdout.write(`${renderDetails(entry)}\n`);
 }
 
+async function runImport(args: MCPCommandArgs): Promise<void> {
+	const rawSource = args.name;
+	if (!rawSource) {
+		throw new MCPArgsError(
+			"`gjc mcp import` requires a source: claude-code (alias: claude), codex, opencode, cursor, or all.",
+		);
+	}
+	const resolved = IMPORT_SOURCE_ALIASES[rawSource.toLowerCase()];
+	if (!resolved) {
+		throw new MCPArgsError(
+			`Unknown import source "${rawSource}". Valid: claude-code (alias: claude), codex, opencode, cursor, all.`,
+		);
+	}
+
+	// Import is a one-time copy into GJC config via the migrate planner
+	// (collision-safe, dry-run capable, secrets never read). Runtime stays
+	// fully GJC-owned afterwards — no live dependency on the source host.
+	await runMigrateCommand({
+		from: [resolved],
+		project: args.flags.project ?? false,
+		force: args.flags.force ?? false,
+		dryRun: args.flags.dryRun ?? false,
+		json: args.flags.json ?? false,
+		only: "mcp",
+		cwd: args.cwd,
+	});
+
+	if (!args.flags.json && !args.flags.dryRun) {
+		process.stdout.write("\nImported servers connect at session startup. Use `gjc mcp list` to review.\n");
+	}
+}
+
 export async function runMCPCommand(args: MCPCommandArgs): Promise<void> {
 	const scoped = resolvePath(args);
 	try {
@@ -259,6 +305,9 @@ export async function runMCPCommand(args: MCPCommandArgs): Promise<void> {
 				return;
 			case "remove":
 				await runRemove(args, scoped);
+				return;
+			case "import":
+				await runImport(args);
 				return;
 		}
 	} catch (error) {

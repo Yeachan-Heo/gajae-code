@@ -223,6 +223,15 @@ gjc setup defaults --check
 
 For standalone MCP support boundaries, see [`docs/standalone-mcp.md`](docs/standalone-mcp.md). For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), and [`docs/bridge.md`](docs/bridge.md).
 
+### Import MCP servers from another host
+
+```sh
+gjc mcp import claude
+gjc mcp import all --dry-run
+```
+
+`gjc mcp import <claude|codex|opencode|cursor|all>` copies MCP server definitions from another host's config into GJC's own config. This is a one-time migration, not live inheritance: once imported, GJC owns the runtime, auth, and lifecycle of those servers. Use `--dry-run` to preview, `--force` to overwrite collisions, and `--project` to write to `./.gjc/mcp.json`. Secret-indirection fields are never read, and output redacts secrets the same way `gjc mcp list` does.
+
 ## Configuration
 
 Provider retry budgets live in `~/.gjc/config.yml`:

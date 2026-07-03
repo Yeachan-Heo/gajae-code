@@ -37,7 +37,7 @@ afterEach(async () => {
 
 describe("resolveSources", () => {
 	test("expands all", () => {
-		expect(resolveSources(["all"])).toEqual(["claude-code", "codex", "opencode"]);
+		expect(resolveSources(["all"])).toEqual(["claude-code", "codex", "opencode", "cursor"]);
 	});
 	test("dedupes and returns canonical order regardless of input order", () => {
 		expect(resolveSources(["opencode", "claude-code", "opencode"])).toEqual(["claude-code", "opencode"]);
@@ -65,6 +65,22 @@ describe("runMigrate", () => {
 		expect(report.actions.length).toBeGreaterThan(0);
 		expect(await exists(path.join(cwd, ".gjc", "mcp.json"))).toBe(false);
 		expect(await exists(path.join(cwd, ".gjc", "skills"))).toBe(false);
+	});
+
+	test("only: 'mcp' plans MCP imports and drops skill candidates entirely", async () => {
+		const report = await runMigrate({
+			from: ["claude-code"],
+			project: true,
+			force: false,
+			dryRun: true,
+			json: true,
+			only: "mcp",
+			homeDir: home,
+			cwd,
+		});
+		expect(report.actions.some(a => a.type === "mcp" && a.status === "imported")).toBe(true);
+		expect(report.actions.some(a => a.type === "skill")).toBe(false);
+		expect(report.warnings.every(w => w.type !== "skill")).toBe(true);
 	});
 
 	test("--json report carries taxonomy counts by total/type/source", async () => {
