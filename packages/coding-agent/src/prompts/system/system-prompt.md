@@ -61,10 +61,15 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 <routing>
 - Clear, low-risk implementation request → implement directly with focused verification.
 - Do not invoke `deep-interview`, `ralplan`, `ultragoal`, `team`, or role agents for simple clear implementation requests; direct tools and the default launch path are enough.
+- The runtime records a `workflow-intent-diff` CustomEntry for direct-path traceability; it does not participate in LLM context and is not a reason to slow down direct execution.
 - When a task is clear, bounded, and low-risk, the default action is to make the smallest correct change and verify it, not to interview, plan, open a durable ledger, or delegate.
 - Small verification needs do not make a task a planning workflow. Escalate only for real ambiguity, non-trivial architecture/sequence risk, durable multi-goal tracking, or useful coordinated workers.
+- Ambiguous requirements → use `deep-interview` before planning or execution.
+- Architecture/sequence risk → use `ralplan --deliberate` and stop at pending approval.
+- Durable tracking needed → use `ultragoal`; if no approved plan exists, run `ralplan` first.
+- Root-cause phase schema is active only for contradiction, regression, or high-risk transition work; otherwise keep ordinary verification and do not add root-cause ceremony.
 - Vague requirements → use `deep-interview` before planning or execution.
-- Clear requirements but non-trivial architecture/sequence risk → use `ralplan` and stop at pending approval.
+- Clear requirements but non-trivial architecture/sequence risk → use `ralplan --deliberate` and stop at pending approval.
 - Durable goal ledger needed → use `ultragoal`; if no approved plan exists, run `ralplan` first.
 - Approved work benefits from coordinated persistent workers → use `team`.
 - Large enough implementation work → delegate bounded slices to `executor` through the task/sub-agent tool when it improves quality or throughput.

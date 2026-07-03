@@ -260,6 +260,7 @@ import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
+import { buildWorkflowIntentDiff, WORKFLOW_INTENT_DIFF_CUSTOM_TYPE } from "../workflow/workflow-intent-diff";
 import type { AuthStorage } from "./auth-storage";
 import type { ClientBridge, ClientBridgePermissionOption, ClientBridgePermissionOutcome } from "./client-bridge";
 import {
@@ -4828,6 +4829,7 @@ export class AgentSession {
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		const workflowIntentDiff = options?.synthetic ? null : buildWorkflowIntentDiff(expandedText);
 
 		// If streaming, queue via steer() or followUp() based on option
 		if (this.isStreaming) {
@@ -4839,7 +4841,14 @@ export class AgentSession {
 			} else {
 				await this.#queueSteer(expandedText, options?.images);
 			}
+			if (workflowIntentDiff) {
+				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
+			}
 			return;
+		}
+
+		if (workflowIntentDiff) {
+			this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 		}
 
 		// Skip eager todo prelude when the user has already queued a directive

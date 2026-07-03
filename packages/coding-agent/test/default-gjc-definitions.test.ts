@@ -318,8 +318,15 @@ Project executor override body.
 
 		expect(routing).toMatch(/Clear,\s+low-risk implementation request\s+→\s+implement directly/i);
 		expect(routing).toMatch(/simple clear implementation requests[\s\S]*direct tools[\s\S]*default launch path/i);
+		expect(routing).toMatch(/workflow-intent-diff[\s\S]*CustomEntry[\s\S]*does not participate in LLM context/i);
 		expect(routing).toMatch(/clear,\s+bounded,\s+and low-risk[\s\S]*smallest correct change[\s\S]*verify/i);
 		expect(routing).toMatch(/Small verification needs[\s\S]*do not make[\s\S]*planning workflow/i);
+		expect(routing).toMatch(/Architecture\/sequence risk[\s\S]*`ralplan --deliberate`/i);
+		expect(routing).toMatch(/Ambiguous requirements[\s\S]*`deep-interview`/i);
+		expect(routing).toMatch(/Durable tracking[\s\S]*`ultragoal`/i);
+		expect(routing).toMatch(
+			/root-cause phase schema[\s\S]*only[\s\S]*contradiction[\s\S]*regression[\s\S]*high-risk transition/i,
+		);
 		for (const escalationTrigger of [
 			"Vague requirements",
 			"non-trivial architecture/sequence risk",
