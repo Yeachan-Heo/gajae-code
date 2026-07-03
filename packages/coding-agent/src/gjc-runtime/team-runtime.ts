@@ -1931,16 +1931,14 @@ export function buildWorkerCommand(
 	const workspace = worker.worktree_path
 		? `Worker worktree: ${worker.worktree_path}.`
 		: `Worker cwd: ${config.leader.cwd}.`;
-	// The worker prompt body is dispatched into the pane through
-	// `tmux send-keys`, which treats embedded LF characters as Enter
-	// keypresses. A multi-line prompt therefore lands in the pane as
-	// multiple prompt bodies followed by premature Enter presses, which on
-	// Windows + psmux/ConPTY causes the worker CLI to bail out before the
-	// startup ACK fires. Normalize the body to a single line by replacing
-	// any LF/CRLF with a space, and strip a defensive U+FEFF in case a
-	// caller managed to inject a UTF-8 BOM into the task text. Empty /
-	// whitespace-only bodies fall back to a one-line placeholder so the
-	// worker never sits idle at an empty prompt.
+	// The worker prompt body must stay single-line because fallback startup on
+	// Windows/psmux dispatches the command through `tmux send-keys`, where
+	// embedded LF characters are treated as Enter keypresses. POSIX tmux starts
+	// workers by passing the command directly to `split-window`, but keeping the
+	// body normalized there too makes fake-tmux logs and shell argv handling
+	// deterministic. Strip a defensive U+FEFF in case a caller managed to inject
+	// a UTF-8 BOM into the task text. Empty / whitespace-only bodies fall back to
+	// a one-line placeholder so the worker never sits idle at an empty prompt.
 	const normalizePrompt = (raw: string): string =>
 		raw
 			.replace(/[\uFEFF\u200B]/g, "")
@@ -1995,6 +1993,11 @@ export function buildWorkerCommand(
 	}
 	return `${joined} ${config.worker_command} ${quote(prompt)}`;
 }
+
+function shouldDispatchWorkerWithSendKeys(tmuxCommand: string, platform: NodeJS.Platform = process.platform): boolean {
+	return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";
+}
+
 interface GjcTeamInitialLane {
 	label: string;
 	title: string;
@@ -2098,22 +2101,24 @@ async function startTmuxSession(
 			const splitDirection: string = worker.index === 1 ? "-h" : "-v";
 			const splitTarget: string =
 				worker.index === 1 ? config.leader.pane_id : (rightStackRootPaneId ?? config.leader.pane_id);
-			const split: Bun.SyncSubprocess<"pipe", "pipe"> = Bun.spawnSync(
-				[
-					config.tmux_command,
-					"split-window",
-					splitDirection,
-					"-t",
-					splitTarget,
-					"-d",
-					"-P",
-					"-F",
-					"#{pane_id}",
-					"-c",
-					worker.worktree_path ?? config.leader.cwd,
-				],
-				{ stdout: "pipe", stderr: "pipe" },
-			);
+			const workerCommand = buildWorkerCommand(config, worker);
+			const workerCwd = worker.worktree_path ?? config.leader.cwd;
+			const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(config.tmux_command);
+			const splitArgs = [
+				config.tmux_command,
+				"split-window",
+				splitDirection,
+				"-t",
+				splitTarget,
+				"-d",
+				"-P",
+				"-F",
+				"#{pane_id}",
+				"-c",
+				workerCwd,
+				...(useSendKeysFallback ? [] : [workerCommand]),
+			];
+			const split: Bun.SyncSubprocess<"pipe", "pipe"> = Bun.spawnSync(splitArgs, { stdout: "pipe", stderr: "pipe" });
 			if (split.exitCode !== 0)
 				throw new Error(split.stderr.toString().trim() || `tmux_split_failed:${config.tmux_target}:${worker.id}`);
 			const paneId: string = split.stdout.toString().trim().split(/\r?\n/)[0]?.trim() ?? "";
@@ -2121,31 +2126,31 @@ async function startTmuxSession(
 			rollbackPaneIds.push(paneId);
 			if (worker.index === 1) rightStackRootPaneId = paneId;
 			workers.push({ ...worker, pane_id: paneId });
-			// On psmux/ConPTY (Windows pwsh default-shell) panes, tmux writes the
-			// split-window command argv to the new pane's stdin but pwsh's
-			// readline never receives an Enter, so the worker never starts.
-			// Create the pane without a command, then dispatch the worker
-			// command through send-keys + Enter so it actually executes.
-			// Two-step dispatch because tmux's `-l` (literal mode) flag is
-			// global per send-keys invocation, not per arg: passing `-l
-			// <body> Enter` would treat "Enter" as literal text too. Sending
-			// the body in literal mode first and the Enter keypress second
-			// keeps the body verbatim while still submitting the prompt as a
-			// keystroke.
-			const body = buildWorkerCommand(config, worker);
-			Bun.spawnSync([config.tmux_command, "send-keys", "-l", "-t", paneId, body], {
-				stdout: "ignore",
-				stderr: "ignore",
-			});
-			const sendKeys = Bun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "Enter"], {
-				stdout: "ignore",
-				stderr: "ignore",
-			});
-			// void-cast the exit code so the linter does not flag an unused
-			// expression; the value is intentionally discarded here because
-			// the actual spawn outcome is recovered by the leader through
-			// the worker startup-ack watcher, not via the spawn exit code.
-			void sendKeys.exitCode;
+			if (useSendKeysFallback) {
+				// On psmux/ConPTY (Windows pwsh default-shell) panes, tmux writes the
+				// split-window command argv to the new pane's stdin but pwsh's readline
+				// never receives an Enter, so the worker never starts. Create the pane
+				// without a command, then dispatch the worker command through send-keys +
+				// Enter so it actually executes.
+				// Two-step dispatch because tmux's `-l` (literal mode) flag is global per
+				// send-keys invocation, not per arg: passing `-l <body> Enter` would treat
+				// "Enter" as literal text too. Sending the body in literal mode first and
+				// the Enter keypress second keeps the body verbatim while still submitting
+				// the prompt as a keystroke.
+				Bun.spawnSync([config.tmux_command, "send-keys", "-l", "-t", paneId, workerCommand], {
+					stdout: "ignore",
+					stderr: "ignore",
+				});
+				const sendKeys = Bun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "Enter"], {
+					stdout: "ignore",
+					stderr: "ignore",
+				});
+				// void-cast the exit code so the linter does not flag an unused expression;
+				// the value is intentionally discarded here because the actual spawn outcome
+				// is recovered by the leader through the worker startup-ack watcher, not via
+				// the spawn exit code.
+				void sendKeys.exitCode;
+			}
 		}
 		Bun.spawnSync([config.tmux_command, "select-layout", "-t", config.tmux_target, "main-vertical"], {
 			stdout: "ignore",

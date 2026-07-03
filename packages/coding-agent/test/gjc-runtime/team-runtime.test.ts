@@ -55,11 +55,18 @@ function runGit(cwd: string, args: string[]): string {
 
 async function createFakeTmuxBin(
 	root: string,
-	options: { failDisplay?: boolean; failSplit?: boolean; gjcProfile?: boolean; untaggableProfile?: boolean } = {},
+	options: {
+		failDisplay?: boolean;
+		failSplit?: boolean;
+		gjcProfile?: boolean;
+		untaggableProfile?: boolean;
+		commandName?: string;
+	} = {},
 ): Promise<string> {
 	const binDir = path.join(root, ".test-bin");
 	await fs.mkdir(binDir, { recursive: true });
 	const logPath = path.join(root, "tmux.log");
+	const commandName = options.commandName ?? "tmux";
 	const script = `#!/usr/bin/env bash
 echo "$@" >> ${JSON.stringify(logPath)}
 case "$1" in
@@ -118,9 +125,9 @@ case "$1" in
     ;;
 esac
 `;
-	await Bun.write(path.join(binDir, "tmux"), script);
-	await fs.chmod(path.join(binDir, "tmux"), 0o755);
-	return path.join(binDir, "tmux");
+	await Bun.write(path.join(binDir, commandName), script);
+	await fs.chmod(path.join(binDir, commandName), 0o755);
+	return path.join(binDir, commandName);
 }
 
 async function createGitRepo(): Promise<string> {
@@ -515,7 +522,7 @@ describe("native gjc team runtime", () => {
 		expect(separatedShort.task).toBe("ship it");
 	});
 
-	it("creates worker worktrees by default for the tmux launch path", async () => {
+	it("starts native team runtime workers in sibling panes", async () => {
 		cleanupRoot = await createGitRepo();
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
 		const snapshot = await startGjcTeam({
@@ -558,6 +565,9 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("worker-startup-ack");
 		expect(tmuxLog).toContain("protocol_version");
 		expect(tmuxLog).toContain("claim-task/transition-task-status");
+		expect(tmuxLog).toContain("GJC_TEAM_WORKER='worktree-team/worker-1'");
+		expect(tmuxLog).toContain("true 'You are worker-1 in gjc team worktree-team.");
+		expect(tmuxLog).not.toContain("send-keys -l");
 		expect(tmuxLog).toContain("select-layout -t test-session:0 main-vertical");
 		expect(tmuxLog).toContain("set-option -t test-session:0 mouse on");
 		expect(tmuxLog).toContain("set-option -t test-session:0 set-clipboard on");
@@ -589,6 +599,7 @@ describe("native gjc team runtime", () => {
 		expect(config.tmux_target).toBe("test-session:0");
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
 		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
+		expect(tmuxLog).not.toContain("send-keys -l");
 	});
 
 	it("starts multiple runtime workers before tmux state mutation", async () => {
@@ -614,7 +625,39 @@ describe("native gjc team runtime", () => {
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
 		expect(tmuxLog).toContain("split-window -h -t %1");
 		expect(tmuxLog).toContain("split-window -v -t %2");
+		expect(tmuxLog).toContain("GJC_TEAM_WORKER='multi-team/worker-1'");
+		expect(tmuxLog).toContain("GJC_TEAM_WORKER='multi-team/worker-2'");
+		expect(tmuxLog).not.toContain("send-keys -l");
 		expect(tmuxLog).not.toContain("new-session");
+	});
+
+	it("keeps psmux worker startup on empty-pane send-keys fallback", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakePsmux = await createFakeTmuxBin(cleanupRoot, { commandName: "psmux" });
+
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Start psmux worker",
+			teamName: "psmux-team",
+			cwd: cleanupRoot,
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				PATH: process.env.PATH ?? "",
+				GJC_TEAM_WORKER_COMMAND: "true",
+				GJC_TEAM_TMUX_COMMAND: fakePsmux,
+			},
+		});
+
+		expect(snapshot.workers).toHaveLength(1);
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		const splitLines = tmuxLog.split(/\r?\n/).filter(line => line.startsWith("split-window"));
+		expect(splitLines).toHaveLength(1);
+		expect(splitLines[0]).toContain("split-window -h -t %1 -d -P -F #{pane_id} -c ");
+		expect(splitLines[0]).not.toContain("worker-startup-ack");
+		expect(tmuxLog).toContain("send-keys -l -t %2");
+		expect(tmuxLog).toContain("worker-startup-ack");
+		expect(tmuxLog).toContain("send-keys -t %2 Enter");
 	});
 	it("distributes explicit markdown lane sections into worker-owned initial tasks", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
