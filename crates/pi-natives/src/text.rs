@@ -584,9 +584,15 @@ fn is_escaped_u16(data: &[u16], index: usize) -> bool {
 	backslashes % 2 == 1
 }
 
+fn is_adjacent_dollar_u16(data: &[u16], index: usize) -> bool {
+	data.get(index.wrapping_sub(1)).copied() == Some(b'$' as u16)
+		|| data.get(index + 1).copied() == Some(b'$' as u16)
+}
+
 fn inline_math_end(data: &[u16], start: usize) -> Option<usize> {
 	if data.get(start).copied() != Some(b'$' as u16)
-		|| data.get(start + 1).copied() == Some(b'$' as u16)
+		|| is_escaped_u16(data, start)
+		|| is_adjacent_dollar_u16(data, start)
 	{
 		return None;
 	}
@@ -597,7 +603,11 @@ fn inline_math_end(data: &[u16], start: usize) -> Option<usize> {
 		if ch == b'\n' as u16 || ch == b'\r' as u16 {
 			return None;
 		}
-		if ch == b'$' as u16 && i > start + 1 && !is_escaped_u16(data, i) {
+		if ch == b'$' as u16
+			&& i > start + 1
+			&& !is_escaped_u16(data, i)
+			&& !is_adjacent_dollar_u16(data, i)
+		{
 			return Some(i + 1);
 		}
 		i += 1;
@@ -1444,5 +1454,36 @@ mod tests {
 		assert!(rendered.iter().any(|line| line.contains("$C$")), "{rendered:?}");
 		assert!(rendered.iter().any(|line| line.contains("$\\kappa$")), "{rendered:?}");
 		assert!(!rendered.iter().any(|line| line.ends_with('$')), "{rendered:?}");
+	}
+
+	#[test]
+	fn test_inline_math_rejects_display_math_dollar_adjacency() {
+		let data = to_u16("abc $$x$$ def");
+		assert_eq!(inline_math_end(&data, 4), None);
+		assert_eq!(inline_math_end(&data, 5), None);
+
+		let lines = wrap_text_with_ansi_impl(&data, 6, DEFAULT_TAB_WIDTH);
+		let rendered: Vec<String> = lines
+			.iter()
+			.map(|line| String::from_utf16_lossy(line))
+			.collect();
+
+		assert!(rendered.iter().any(|line| line.contains("$$x$$")), "{rendered:?}");
+		assert!(!rendered.iter().any(|line| line == "abc $"), "{rendered:?}");
+	}
+
+	#[test]
+	fn test_inline_math_rejects_escaped_dollar_opener() {
+		let data = to_u16("\\$5 and $x$");
+		assert_eq!(inline_math_end(&data, 1), None);
+
+		let lines = wrap_text_with_ansi_impl(&data, 6, DEFAULT_TAB_WIDTH);
+		let rendered: Vec<String> = lines
+			.iter()
+			.map(|line| String::from_utf16_lossy(line))
+			.collect();
+
+		assert!(rendered.iter().any(|line| line.contains("$x$")), "{rendered:?}");
+		assert!(!rendered.iter().any(|line| line.contains("\\$5 and $")), "{rendered:?}");
 	}
 }

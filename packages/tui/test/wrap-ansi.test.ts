@@ -154,6 +154,28 @@ describe("wrapTextWithAnsi", () => {
 			}
 		});
 
+		it("does not treat display math dollars as inline math", () => {
+			const text = "abc $$x$$ def";
+			const wrapped = wrapTextWithAnsi(text, 6);
+
+			expect(wrapped.some(line => line.includes("$$x$$"))).toBe(true);
+			expect(wrapped.some(line => line === "abc $")).toBe(false);
+			for (const line of wrapped) {
+				expect(visibleWidth(line) <= 6).toBe(true);
+			}
+		});
+
+		it("does not treat escaped dollars as inline math openers", () => {
+			const text = "\\$5 and $x$";
+			const wrapped = wrapTextWithAnsi(text, 6);
+
+			expect(wrapped.some(line => line.includes("$x$"))).toBe(true);
+			expect(wrapped.some(line => line.includes("\\$5 and $"))).toBe(false);
+			for (const line of wrapped) {
+				expect(visibleWidth(line) <= 6).toBe(true);
+			}
+		});
+
 		it("should preserve color codes across wraps", () => {
 			const red = "\x1b[31m";
 			const reset = "\x1b[0m";
