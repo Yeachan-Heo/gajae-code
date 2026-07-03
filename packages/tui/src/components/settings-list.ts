@@ -75,16 +75,20 @@ export class SettingsList implements Component {
 	 */
 	setItems(items: SettingItem[]): void {
 		this.#items = items;
-		if (this.#items.length === 0) {
-			this.#selectedIndex = 0;
-		} else if (this.#selectedIndex >= this.#items.length) {
-			this.#selectedIndex = this.#items.length - 1;
-		}
+		this.#clampSelectedIndex();
 		this.#notifySelectionChange();
 	}
 
 	invalidate(): void {
 		this.#submenuComponent?.invalidate?.();
+	}
+
+	#clampSelectedIndex(): void {
+		if (this.#items.length === 0) {
+			this.#selectedIndex = 0;
+			return;
+		}
+		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, this.#items.length - 1));
 	}
 
 	#notifySelectionChange(): void {
@@ -186,6 +190,11 @@ export class SettingsList implements Component {
 
 		// Main list input handling
 		const kb = getKeybindings();
+		if (kb.matches(data, "tui.select.cancel")) {
+			this.#onCancel();
+			return;
+		}
+		if (this.#items.length === 0) return;
 		if (kb.matches(data, "tui.select.up")) {
 			this.#selectedIndex = this.#selectedIndex === 0 ? this.#items.length - 1 : this.#selectedIndex - 1;
 			this.#notifySelectionChange();
@@ -194,8 +203,6 @@ export class SettingsList implements Component {
 			this.#notifySelectionChange();
 		} else if (kb.matches(data, "tui.select.confirm") || data === " " || data === "\n") {
 			this.#activateItem();
-		} else if (kb.matches(data, "tui.select.cancel")) {
-			this.#onCancel();
 		}
 	}
 
@@ -228,6 +235,7 @@ export class SettingsList implements Component {
 		// Restore selection to the item that opened the submenu
 		if (this.#submenuItemIndex !== null) {
 			this.#selectedIndex = this.#submenuItemIndex;
+			this.#clampSelectedIndex();
 			this.#submenuItemIndex = null;
 			this.#notifySelectionChange();
 		}

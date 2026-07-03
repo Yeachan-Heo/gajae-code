@@ -44,4 +44,55 @@ describe("SettingsList", () => {
 
 		expect(changes).toEqual([["mode", "on"]]);
 	});
+	it("keeps selection valid after navigation while empty then repopulating", () => {
+		const changes: Array<[string, string]> = [];
+		let cancelCount = 0;
+		const list = new SettingsList(
+			[],
+			5,
+			testTheme,
+			(id, value) => {
+				changes.push([id, value]);
+			},
+			() => {
+				cancelCount += 1;
+			},
+		);
+
+		list.handleInput("\x1b[A");
+		list.handleInput("\x1b[B");
+		list.handleInput("\n");
+		list.setItems([
+			{
+				id: "mode",
+				label: "Mode",
+				currentValue: "off",
+				values: ["off", "on"],
+			},
+		]);
+		list.handleInput("\n");
+
+		expect(changes).toEqual([["mode", "on"]]);
+		expect(cancelCount).toBe(0);
+	});
+
+	it("cancels from an empty list", () => {
+		let cancelCount = 0;
+		const list = new SettingsList(
+			[],
+			5,
+			testTheme,
+			() => {
+				throw new Error("change should not be called");
+			},
+			() => {
+				cancelCount += 1;
+			},
+		);
+
+		expect(list.render(80)).toEqual(["  No settings available"]);
+		list.handleInput("\x1b");
+
+		expect(cancelCount).toBe(1);
+	});
 });
