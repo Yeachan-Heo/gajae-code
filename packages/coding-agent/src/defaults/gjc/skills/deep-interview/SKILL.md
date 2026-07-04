@@ -385,11 +385,22 @@ Ambiguity-raising triggers:
 
 Use **mechanism A** for every ambiguity rise: a trigger LOWERS the affected component/dimension clarity score, and the existing weighted formula raises ambiguity. There is **no separate penalty term**; ambiguity remains bounded by the same greenfield/brownfield formula.
 
+**Deterministic ambiguity floor (runtime-enforced).** The runtime independently computes a code-level floor from persisted state and clamps every reported ambiguity to `max(reported, floor)` at write time — the scorer cannot under-report below what code can objectively measure:
+
+- `+0.10` per established fact marked `disputed` that has no `superseded_by` resolution (contradiction pressure)
+- `+0.05` per active topology component whose goal/constraints/criteria clarity is still unscored (gap pressure — persist `topology.components[].clarity_scores` every round or the floor blocks convergence)
+- `+0.05 × (auto-answered rounds / scored rounds)` (assumption dilution)
+
+Cooperate with the floor rather than fight it:
+- Replacing an already-scored answer for the same round (a retraction/pivot) automatically marks that round's established facts as disputed; ambiguity rises mechanically even when no trigger is reported. Treat a floor-driven rise as trigger evidence and score the affected dimensions accordingly.
+- A disputed fact keeps the floor at or above `0.10` — above the default threshold — so convergence is blocked until the dispute is resolved: either the user re-confirms the original fact (set `disputed: false`) or the superseding decision is recorded as a new established fact and the old fact gets `superseded_by: <new fact id>`. Never delete the contradicted fact.
+- When the effective score was clamped upward, the persisted round carries `reported_ambiguity` (your raw score) and `ambiguity_floor`; report the floor and its dominant cause in the Step 2d table instead of pretending the raw score held.
+
 The rise is SILENT: no modal, no forced-resolution step, and no dedicated conflict UI. Surface it through the normal per-round report and by targeting the next question at the affected component/dimension.
 
 Structured scorer output is required. Include `triggers`, `trigger_status`, `affected_component`, `affected_dimension`, `prior_dimension_score`, `new_dimension_score`, `prior_ambiguity`, `new_ambiguity`, `evidence`, `contradicted_established_fact` when relevant, and `disputed_unresolved_rationale` when applicable.
 
-Established-facts maintenance: promote stable confirmed decisions into `state.established_facts` with source/evidence; when a new answer contradicts an established fact, mark the fact disputed and preserve the contradicted fact instead of deleting it.
+Established-facts maintenance: promote stable confirmed decisions into `state.established_facts` with source/evidence; when a new answer contradicts an established fact, mark the fact disputed and preserve the contradicted fact instead of deleting it. When the user later confirms the new direction, record the superseding decision as a new established fact and set `superseded_by: <new fact id>` on the disputed fact — that is the only way to release the deterministic floor pressure while keeping the audit trail.
 
 TRANSITION VALIDATION: if a trigger is present, the affected dimension must not improve and overall ambiguity must rise vs the prior scored round, unless the trigger is explicitly marked disputed or unresolved with rationale.
 
@@ -483,6 +494,7 @@ Round {n} complete.
 | Success Criteria | {s} | {w} | {s*w} | {gap or "Clear"} |
 | Context (brownfield) | {s} | {w} | {s*w} | {gap or "Clear"} |
 | **Ambiguity** | | | **{prior_score}% -> {score}% {up|down|flat}** | {if up: trigger name such as "A direct contradiction"} |
+| **Floor** (only when clamped) | | | **{floor}%** | {dominant cause: disputed fact / unscored component / auto-answer dilution} |
 
 **Topology:** Targeted {target_component_name} | Active: {active_component_count} | Deferred: {deferred_component_count} | Next rotation after: {last_targeted_component_id}
 
@@ -543,7 +555,7 @@ When ambiguity ≤ threshold (or hard cap / early exit):
 
 **Before generating the spec, two gates must pass, in order:**
 
-**4a. Closure / Acceptance Guard.** Even when ambiguity ≤ threshold, do not treat the math as completion. Run an independent readiness audit from the full main-session perspective (including explore findings, established facts, and triggers the scorer may not have fully weighed). Confirm every active topology component has goal/constraint/criteria coverage, no unresolved or disputed trigger remains on a path that matters, and no low-confidence auto-answer is standing in for user-confirmed truth above the clarity cap. If a material gap exists, explicitly override the gate to the user — "The math says ready, but I am not accepting it yet because {gap}" — and ask the single highest-impact follow-up, returning to Phase 2. Record any override in `state.closure_overrides`.
+**4a. Closure / Acceptance Guard.** Even when ambiguity ≤ threshold, do not treat the math as completion. Run an independent readiness audit from the full main-session perspective (including explore findings, established facts, and triggers the scorer may not have fully weighed). Confirm every active topology component has goal/constraint/criteria coverage, no unresolved or disputed trigger remains on a path that matters, no disputed established fact lacks a `superseded_by` resolution, and no low-confidence auto-answer is standing in for user-confirmed truth above the clarity cap. If a material gap exists, explicitly override the gate to the user — "The math says ready, but I am not accepting it yet because {gap}" — and ask the single highest-impact follow-up, returning to Phase 2. Record any override in `state.closure_overrides`.
 
 **4b. Restate gate.** Once closure passes, collapse the agreed answers into ONE sentence goal that covers every active component, and confirm it with a single `ask`: "If someone read only this line, would they reach the same outcome you have in mind?" Offer **Yes, crystallize**, **Adjust wording**, and **Missing scope**, plus free-text, applying `language.instruction` when present. Because this gate has options, it MUST go through `ask`: do not print the Restate question and options as assistant prose with `Question:`/`Options:` labels. If the Restate gate was already printed that way, immediately call `ask` with the same question/options before accepting or waiting for any answer. On "Adjust wording" / "Missing scope", collect the exact correction with one follow-up `ask`, route it back through Step 2c scoring and established-facts maintenance (a correction can change ambiguity), then re-run closure and ask the Restate gate again. Cap at two loops; if alignment is not reached, return to Phase 2 with a targeted question instead of forcing a goal line. Persist the confirmed line as `state.restated_goal`.
 

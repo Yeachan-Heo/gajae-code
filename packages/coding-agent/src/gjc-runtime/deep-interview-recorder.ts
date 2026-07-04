@@ -2,6 +2,11 @@ import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import {
+	clampReportedAmbiguity,
+	computeAmbiguityFloor,
+	disputeFactsFromRetractedRound,
+} from "./deep-interview-ambiguity";
+import {
 	answerHash,
 	type DeepInterviewEstablishedFact,
 	type DeepInterviewRoundRecord,
@@ -14,6 +19,7 @@ import {
 import { writeSessionActivityMarker } from "./session-resolution";
 import { readExistingStateForMutation, writeGuardedWorkflowEnvelopeAtomic } from "./state-writer";
 
+export * from "./deep-interview-ambiguity";
 export * from "./deep-interview-state";
 
 /**
@@ -395,30 +401,55 @@ export async function syncDeepInterviewRecorderHud(
 	await syncRecorderHud(cwd, normalizeDeepInterviewEnvelope(read.value), sessionId);
 }
 
-/** Record an `answered` shell for one round (append-or-merge by durable key). */
+/**
+ * Record an `answered` shell for one round (append-or-merge by durable key).
+ *
+ * Retraction dynamics: replacing an already-`scored` answer is a mechanical
+ * contradiction signal (the user pivoted). The facts that round established are
+ * marked disputed, which raises the deterministic ambiguity floor immediately —
+ * without waiting for the LLM scorer to self-report a trigger.
+ */
 export async function appendOrMergeDeepInterviewRound(
 	cwd: string,
 	statePath: string,
 	input: DeepInterviewAnswerInput,
 	options: { sessionId?: string } = {},
-): Promise<{ action: AppendOrMergeAction; record: DeepInterviewRoundRecord }> {
+): Promise<{ action: AppendOrMergeAction; record: DeepInterviewRoundRecord; disputedFactIds?: string[] }> {
 	const envelope = await readEnvelope(statePath);
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const shell = buildAnswerShell({ ...input, interviewId });
 	const rounds = readRounds(envelope);
+	const priorRecord = rounds.find(r => r.round_key === shell.round_key);
 	const result = appendOrMergeRound(rounds, shell);
 	if (result.action === "noop") {
 		await repairRecorderHudFromPersisted(cwd, statePath, options.sessionId);
 		return { action: result.action, record: result.record };
 	}
-	(envelope.state as Record<string, unknown>).rounds = result.rounds;
+	const inner = envelope.state as Record<string, unknown>;
+	inner.rounds = result.rounds;
+	let disputedFactIds: string[] | undefined;
+	if (result.action === "replaced" && priorRecord?.lifecycle === "scored") {
+		const facts = Array.isArray(inner.established_facts) ? inner.established_facts : [];
+		const disputed = disputeFactsFromRetractedRound(facts, shell.round);
+		if (disputed.disputedIds.length > 0) {
+			inner.established_facts = disputed.facts;
+			disputedFactIds = disputed.disputedIds;
+			// Surface the rise right away: the retraction changed the evidence, so the
+			// gating score must reflect the new floor before the next scoring pass.
+			const breakdown = computeAmbiguityFloor(inner);
+			inner.ambiguity_floor = breakdown;
+			if (typeof inner.current_ambiguity === "number") {
+				inner.current_ambiguity = clampReportedAmbiguity(inner.current_ambiguity, breakdown.floor).effective;
+			}
+		}
+	}
 	await persistEnvelope(cwd, statePath, envelope, options.sessionId, "gjc deep-interview record-answer");
 	try {
 		await syncRecorderHud(cwd, envelope, options.sessionId);
 	} catch {
 		// HUD sync is best-effort cache maintenance and must not change record semantics.
 	}
-	return { action: result.action, record: result.record };
+	return { action: result.action, record: result.record, disputedFactIds };
 }
 
 /**
@@ -459,12 +490,34 @@ export async function enrichDeepInterviewRoundScoring(
 	const envelope = await readEnvelope(statePath);
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const rounds = readRounds(envelope);
-	const { rounds: nextRounds, record } = enrichRoundWithScoring(rounds, { ...input, interviewId });
+	const { rounds: enrichedRounds, record: reportedRecord } = enrichRoundWithScoring(rounds, {
+		...input,
+		interviewId,
+	});
+	// Deterministic floor (Ouroboros principle): the LLM-reported ambiguity is only a
+	// lower-bound input. Evidence persisted in state — unresolved disputed facts,
+	// unscored active components, auto-answer dilution — sets a code-computed floor
+	// the reported score can never fall under, so a pivot mechanically raises the
+	// gating score even when the scorer omits triggers.
+	const inner = envelope.state as Record<string, unknown>;
+	const breakdown = computeAmbiguityFloor({ ...inner, rounds: enrichedRounds });
+	const clampResult = clampReportedAmbiguity(input.ambiguity, breakdown.floor);
+	let record = reportedRecord;
+	let nextRounds = enrichedRounds;
+	if (clampResult.clamped) {
+		record = {
+			...reportedRecord,
+			ambiguity: clampResult.effective,
+			reported_ambiguity: input.ambiguity,
+			ambiguity_floor: breakdown.floor,
+		};
+		nextRounds = enrichedRounds.map(item => (item.round_key === record.round_key ? record : item));
+	}
 	// Fail closed: a scored transition that violates the bidirectional invariant
 	// (an active trigger that improves the affected dimension or fails to raise
 	// overall ambiguity, or a disputed/unresolved trigger lacking a rationale) must
 	// never be persisted — storing it lets the interview falsely converge. Validate
-	// against the most recent prior scored round before writing any durable state.
+	// the effective (floor-clamped) record against the most recent prior scored round.
 	const prior = latestPriorScoredRound(rounds, record.round_key, record.round);
 	const validation = validateDeepInterviewScoredTransition(prior, record);
 	if (!validation.ok) {
@@ -472,8 +525,9 @@ export async function enrichDeepInterviewRoundScoring(
 			`deep-interview scored transition for round ${record.round} is invalid and was refused: ${validation.violations.join("; ")}`,
 		);
 	}
-	(envelope.state as Record<string, unknown>).rounds = nextRounds;
-	(envelope.state as Record<string, unknown>).current_ambiguity = input.ambiguity;
+	inner.rounds = nextRounds;
+	inner.current_ambiguity = clampResult.effective;
+	inner.ambiguity_floor = breakdown;
 	await persistEnvelope(cwd, statePath, envelope, options.sessionId, "gjc deep-interview score-round");
 	await syncRecorderHud(cwd, envelope, options.sessionId);
 	return { record };

@@ -31,6 +31,13 @@ export interface DeepInterviewEstablishedFact {
 	dimension?: string;
 	evidence?: string;
 	disputed: boolean;
+	/**
+	 * Resolution pointer for a disputed fact: the id of the fact that replaced it
+	 * after the user confirmed a pivot. A disputed fact without `superseded_by`
+	 * keeps the deterministic ambiguity floor elevated; setting it releases the
+	 * pressure while preserving the contradicted fact for audit.
+	 */
+	superseded_by?: string;
 }
 
 export interface DeepInterviewTriggerMetadata {
@@ -66,7 +73,12 @@ export interface DeepInterviewRoundRecord {
 	answered_at: string;
 	scored_at?: string;
 	scores?: Record<string, number>;
+	/** Effective ambiguity after the deterministic floor clamp (`max(reported, floor)`). */
 	ambiguity?: number;
+	/** Original LLM-reported ambiguity, preserved for audit when the floor clamped it. */
+	reported_ambiguity?: number;
+	/** Deterministic floor in effect when this round was scored, when it clamped. */
+	ambiguity_floor?: number;
 	triggers?: DeepInterviewTriggerMetadata[];
 }
 
@@ -125,6 +137,7 @@ const TRANSCRIPT_STATE_FIELDS = [
 	"rounds",
 	"established_facts",
 	"current_ambiguity",
+	"ambiguity_floor",
 	"topology",
 	"ontology_snapshots",
 	"auto_researched_rounds",

@@ -26,6 +26,7 @@ import {
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
+import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
 import { mergeDeepInterviewEnvelope, normalizeDeepInterviewEnvelope } from "./deep-interview-state";
 import { activeSnapshotPath, auditPath, modeStatePath, sessionStateDir } from "./session-layout";
 import {
@@ -1158,7 +1159,12 @@ export async function reconcileWorkflowSkillState(options: {
 
 	const merged =
 		mode === "deep-interview"
-			? (mergeDeepInterviewEnvelope(existingPayload, payload) as Record<string, unknown>)
+			? // Enforce the deterministic ambiguity floor on every reconcile so a
+				// self-reported score can never undercut persisted contradiction evidence.
+				(applyAmbiguityFloorToEnvelope(mergeDeepInterviewEnvelope(existingPayload, payload)).envelope as Record<
+					string,
+					unknown
+				>)
 			: mergeWithNullDelete(existingPayload, payload);
 	merged.skill = mode;
 	merged.current_phase = trimmedPhase;
@@ -1355,7 +1361,11 @@ async function handleWrite(
 	if (mode === "deep-interview") {
 		// Deep-interview keeps interview data nested under `state` and merges rounds
 		// losslessly by durable key; never flatten or delete `state` (that drops recorder history).
-		merged = mergeDeepInterviewEnvelope(existingPayload, payload, { replace: hasFlag(args, "--replace") });
+		// The deterministic ambiguity floor is applied after the merge so a reported
+		// score written through the CLI can never undercut persisted contradiction evidence.
+		merged = applyAmbiguityFloorToEnvelope(
+			mergeDeepInterviewEnvelope(existingPayload, payload, { replace: hasFlag(args, "--replace") }),
+		).envelope;
 	} else if (hasFlag(args, "--replace")) {
 		merged = { ...payload };
 	} else {
