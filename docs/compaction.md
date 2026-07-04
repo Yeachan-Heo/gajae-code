@@ -125,11 +125,12 @@ Default prune policy:
 
 - Protect newest `40_000` tool-output tokens.
 - Require at least `20_000` total estimated savings.
-- Never prune tool results from `skill` or `read`.
+- Never prune `skill` tool results. `read` results are protected too, **except** when superseded — a later `read` of the same file, or a later successful edit/write to that file, waives `read` protection so the stale result may be pruned (`staleOverridableTools: ["read"]`). The most recent result per target is never treated as superseded.
 
-Pruned tool results are replaced with:
+Pruned tool results are replaced with a truncation notice:
 
-- `[Output truncated - N tokens]`
+- generic form: `[Output truncated - N tokens]`
+- for `bash`/`search`/`grep`, a short digest is appended: `[Output truncated - N tokens; <digest>]` (e.g. `exit=…; tail=…` for `bash`, `matches=…; files=…` for `search`/`grep`).
 
 If pruning changes entries, session storage is rewritten and agent message state is refreshed before compaction decisions.
 
