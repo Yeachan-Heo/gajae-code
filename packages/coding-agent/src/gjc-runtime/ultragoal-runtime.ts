@@ -1101,7 +1101,6 @@ function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
 	)
 		return "tool";
 	if (
-		normalized === "packages/coding-agent/src/tools/index.ts" ||
 		normalized === "packages/coding-agent/src/tools/renderers.ts" ||
 		normalized === "packages/coding-agent/src/config/settings-schema.ts"
 	)
@@ -1119,15 +1118,15 @@ function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
 function isComputerControlSurfaceCategory(category: UltragoalChangeCategory): boolean {
 	// The computer-use red-team suite is conditional, not universal (see the
 	// ultragoal SKILL): require it only when the change actually touches
-	// computer-control source — the computer tool (`tool`), its settings/registry
-	// wiring (`settings-registry`), or computer Rust (`code`). A bare regeneration
-	// of the SHARED native binding (`generated-binding`: packages/natives/native/
-	// index.{d.ts,js}) is NOT by itself a computer-use change: that file is
-	// generated from Rust, so any real computer-use behavior change must also
-	// touch one of the categories above and will still trigger the suite. Treating
-	// the regenerated aggregate binding as a computer surface forced the suite on
-	// unrelated features (e.g. notifications), which the SKILL explicitly warns
-	// against, so it is excluded here.
+	// computer-control source — the computer tool (`tool`), its behavior-bearing
+	// settings/renderer wiring (`settings-registry`), or computer Rust (`code`).
+	// A bare regeneration of the SHARED native binding (`generated-binding`:
+	// packages/natives/native/index.{d.ts,js}) is NOT by itself a computer-use
+	// change: that file is generated from Rust, so any real computer-use behavior
+	// change must also touch one of the categories above and will still trigger
+	// the suite. Treating aggregate binding or registration files as a computer
+	// surface forced the suite on unrelated changes, which the SKILL explicitly
+	// warns against, so they are excluded here.
 	return category === "code" || category === "tool" || category === "settings-registry";
 }
 

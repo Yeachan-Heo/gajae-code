@@ -324,6 +324,19 @@ describe("computer red-team fixture matrix", () => {
 		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
 	});
 
+	it("does not trigger from non-computer edit to tools index registration", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(root, "packages/coding-agent/src/tools/index.ts");
+		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+			row => row.id !== "blast-radius",
+		);
+		const qa = executorQa({ computerTouching: false, cases, surface: "native" });
+		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+	});
+
 	it("allows non-operational docs-only computer tiering", async () => {
 		const root = await tempDir();
 		await initRepo(root);

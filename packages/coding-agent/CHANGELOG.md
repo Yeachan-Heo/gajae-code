@@ -5,6 +5,7 @@
 ### Fixed
 
 - Goal completion now preserves the terminal `goal({op: "complete"})` state even when a `goal_updated` extension hook throws, preventing hook-side write errors from trapping a verified ultragoal run in the continuation loop.
+- Ultragoal completion no longer requires the computer-use red-team suite for non-computer changes that only touch the shared `tools/index.ts` registration file.
 
 ## [0.8.1] - 2026-07-04
 
