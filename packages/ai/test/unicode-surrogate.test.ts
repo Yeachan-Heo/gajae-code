@@ -368,6 +368,26 @@ describe("toolCall argument surrogate sanitization", () => {
 		}
 	});
 
+	it("deep-sanitizes OpenAI Responses custom tool input before response serialization", () => {
+		const llm = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
+		const knownCallIds = new Set<string>();
+		const message = assistantWithSurrogateToolCall(llm);
+		const toolCall = message.content[0];
+		if (toolCall.type !== "toolCall") throw new Error("expected tool call");
+		toolCall.customWireName = "custom_probe";
+		toolCall.arguments = { input: `raw ${loneSurrogate}` };
+
+		const items = convertResponsesAssistantMessage(message, llm, 0, knownCallIds);
+
+		expectNoSerializedLoneSurrogate(items);
+		const customToolCall = items.find(item => item.type === "custom_tool_call");
+		expect(customToolCall?.type).toBe("custom_tool_call");
+		if (customToolCall?.type === "custom_tool_call") {
+			expect(customToolCall.input).toContain("�");
+			expect(customToolCall.input).not.toContain("\\ud92c");
+		}
+	});
+
 	it("deep-sanitizes Google functionCall args before request serialization", () => {
 		const llm = getBundledModel("google", "gemini-2.5-flash") as Model<"google-generative-ai">;
 		const contents = convertGoogleMessages(llm, { messages: [assistantWithSurrogateToolCall(llm)] });

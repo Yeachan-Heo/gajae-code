@@ -613,7 +613,8 @@ function buildOutputItems(message: AssistantMessage): OutputItem[] {
 		} else if (part.type === "toolCall") {
 			flushMessage();
 			if (part.customWireName) {
-				const rawInput = typeof part.arguments?.input === "string" ? (part.arguments.input as string) : "";
+				const rawInput =
+					typeof part.arguments?.input === "string" ? (part.arguments.input as string).toWellFormed() : "";
 				out.push({
 					type: "custom_tool_call",
 					id: part.thoughtSignature ?? makeCustomCallId(),
