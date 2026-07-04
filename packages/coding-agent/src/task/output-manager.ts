@@ -24,7 +24,7 @@ function escapeRegExp(value: string): string {
  */
 export class AgentOutputManager {
 	#nextId = 0;
-	#initialized = false;
+	#initPromise: Promise<void> | undefined;
 	readonly #getArtifactsDir: () => string | null;
 	readonly #parentPrefix: string | undefined;
 
@@ -34,13 +34,23 @@ export class AgentOutputManager {
 	}
 
 	/**
+	 * Memoize the in-flight scan so concurrent `allocate*`/`peekNextIndex`
+	 * calls await the SAME `readdir` before `#nextId` is derived. Assigning the
+	 * promise synchronously (before any `await`) closes the TOCTOU window where a
+	 * boolean "initialized" flag, flipped ahead of the awaited scan, let a second
+	 * caller allocate at `#nextId === 0` while the first was still scanning —
+	 * producing duplicate indices that overwrite prior outputs on resume.
+	 */
+	#ensureInitialized(): Promise<void> {
+		this.#initPromise ??= this.#scanExistingOutputs();
+		return this.#initPromise;
+	}
+
+	/**
 	 * Scan existing agent output files to find the next available ID.
 	 * This ensures we don't overwrite outputs when resuming a session.
 	 */
-	async #ensureInitialized(): Promise<void> {
-		if (this.#initialized) return;
-		this.#initialized = true;
-
+	async #scanExistingOutputs(): Promise<void> {
 		const dir = this.#getArtifactsDir();
 		if (!dir) return;
 
@@ -103,6 +113,6 @@ export class AgentOutputManager {
 	 */
 	reset(): void {
 		this.#nextId = 0;
-		this.#initialized = false;
+		this.#initPromise = undefined;
 	}
 }

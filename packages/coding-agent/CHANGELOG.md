@@ -6,6 +6,7 @@
 
 - Goal completion now preserves the terminal `goal({op: "complete"})` state even when a `goal_updated` extension hook throws, preventing hook-side write errors from trapping a verified ultragoal run in the continuation loop.
 - Ultragoal completion no longer requires the computer-use red-team suite for non-computer changes that only touch the shared `tools/index.ts` registration file.
+- Task subagent output-ID allocation (`AgentOutputManager`) is now concurrency-safe. `#ensureInitialized` previously set a boolean flag *before* the awaited `readdir`, so when two `task` calls are dispatched in the same turn (they run concurrently as shared-concurrency tools on one session-scoped manager) the second allocation short-circuited initialization and started from index `0` while the first scan was still in flight — colliding with existing `N-*.md` outputs and duplicating ids across batches, which overwrote prior subagent outputs on resume. The scan is now memoized as a promise so concurrent `allocate`/`allocateBatch`/`peekNextIndex` calls await the same `readdir` before `#nextId` is derived.
 
 ## [0.8.1] - 2026-07-04
 
