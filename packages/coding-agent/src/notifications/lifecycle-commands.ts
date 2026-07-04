@@ -15,6 +15,19 @@ import * as os from "node:os";
 import type { SessionCloseTarget, SessionCreateTarget, SessionLifecycleResponse, SessionResumeTarget } from "./index";
 
 export type LifecycleCommandVerb = "session_create" | "session_close" | "session_resume";
+function normalizeLifecycleCommandToken(
+	token: string,
+	ctx: { chatType?: string; botUsername?: string } = {},
+): string | undefined {
+	const at = token.indexOf("@");
+	const command = at === -1 ? token : token.slice(0, at);
+	if (!/^\/session_(create|close|resume|recent)\b/.test(command)) return undefined;
+	if (at === -1) return ctx.chatType === undefined || ctx.chatType === "private" ? command : undefined;
+
+	const botUsername = ctx.botUsername;
+	if (!botUsername || token.slice(at + 1).toLowerCase() !== botUsername.toLowerCase()) return undefined;
+	return command;
+}
 
 /** A parsed, validated lifecycle command (transport identity added by caller). */
 export type ParsedLifecycleCommand =
@@ -37,9 +50,13 @@ const USAGE = [
 ].join("\n");
 
 /** True when the text begins a /session_* command (cheap pre-gate). */
-export function isLifecycleCommandText(text: string | undefined): boolean {
+export function isLifecycleCommandText(
+	text: string | undefined,
+	ctx: { chatType?: string; botUsername?: string } = {},
+): boolean {
 	if (!text) return false;
-	return /^\/session_(create|close|resume|recent)\b/.test(text.trim());
+	const [rawCommand] = text.trim().split(/\s+/, 1);
+	return normalizeLifecycleCommandToken(rawCommand ?? "", ctx) !== undefined;
 }
 
 /**
@@ -50,9 +67,14 @@ export function isLifecycleCommandText(text: string | undefined): boolean {
  * The caller MUST have already enforced paired-chat authorization; this function
  * performs grammar + target validation only.
  */
-export function parseLifecycleCommand(text: string | undefined): ParsedLifecycleCommand {
-	if (!isLifecycleCommandText(text)) return { kind: "none" };
+export function parseLifecycleCommand(
+	text: string | undefined,
+	ctx: { chatType?: string; botUsername?: string } = {},
+): ParsedLifecycleCommand {
 	const raw = (text ?? "").trim();
+	const [rawCommand, ...args] = raw.split(/\s+/);
+	const command = normalizeLifecycleCommandToken(rawCommand ?? "", ctx);
+	if (command === undefined) return { kind: "none" };
 
 	// MVP: reject any initial-prompt separator outright (no prompt handling yet).
 	if (/\s--(\s|$)/.test(raw)) {
@@ -62,8 +84,6 @@ export function parseLifecycleCommand(text: string | undefined): ParsedLifecycle
 			message: `Initial prompts (\`-- <prompt>\`) are not supported yet. Create the session, then send a normal message in its thread.\n\n${USAGE}`,
 		};
 	}
-
-	const [command, ...args] = raw.split(/\s+/);
 
 	if (command === "/session_recent") {
 		const which = args[0];

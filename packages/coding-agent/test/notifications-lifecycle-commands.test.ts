@@ -64,6 +64,45 @@ describe("lifecycle command parser (G009)", () => {
 		expect(parseLifecycleCommand("/session_recent")).toEqual({ kind: "recent", which: "all" });
 		expect(parseLifecycleCommand("/session_recent create")).toEqual({ kind: "recent", which: "create" });
 	});
+	it("accepts only this bot's Telegram username suffix in non-private chats", () => {
+		const groupCtx = { chatType: "supergroup", botUsername: "GajaeCodeBot" };
+		expect(isLifecycleCommandText("/session_recent@GajaeCodeBot", groupCtx)).toBe(true);
+		expect(parseLifecycleCommand("/session_recent@GajaeCodeBot", groupCtx)).toEqual({
+			kind: "recent",
+			which: "all",
+		});
+		expect(parseLifecycleCommand("/session_create@GajaeCodeBot path /repo", groupCtx)).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+		});
+		expect(parseLifecycleCommand("/session_create@GajaeCodeBot worktree /repo feat/x", groupCtx)).toEqual({
+			kind: "create",
+			target: { kind: "worktree", repo: "/repo", branch: "feat/x" },
+		});
+		expect(parseLifecycleCommand("/session_create@GajaeCodeBot dir /new/dir", groupCtx)).toEqual({
+			kind: "create",
+			target: { kind: "plain_dir", path: "/new/dir" },
+		});
+		expect(parseLifecycleCommand("/session_close@GajaeCodeBot sess-1", groupCtx)).toEqual({
+			kind: "close",
+			target: { sessionId: "sess-1" },
+		});
+		expect(parseLifecycleCommand("/session_resume@GajaeCodeBot abc", groupCtx)).toEqual({
+			kind: "resume",
+			target: { sessionIdOrPrefix: "abc" },
+		});
+		expect(
+			parseLifecycleCommand("/session_recent@GajaeCodeBot", { chatType: "group", botUsername: "gajaecodebot" }),
+		).toEqual({
+			kind: "recent",
+			which: "all",
+		});
+		expect(parseLifecycleCommand("/session_recent", groupCtx)).toEqual({ kind: "none" });
+		expect(parseLifecycleCommand("/session_recent@OtherBot", groupCtx)).toEqual({ kind: "none" });
+		expect(parseLifecycleCommand("/session_recent@GajaeCodeBot", { chatType: "supergroup" })).toEqual({
+			kind: "none",
+		});
+	});
 
 	it("rejects an initial prompt (MVP) with usage and no frame", () => {
 		const out = parseLifecycleCommand("/session_create path /repo -- do the thing");

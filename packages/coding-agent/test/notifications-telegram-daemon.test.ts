@@ -72,6 +72,7 @@ class FakeBotApi {
 	updates: any[] = [];
 	activeGetUpdates = 0;
 	maxConcurrentGetUpdates = 0;
+	botUsername: string | undefined = undefined;
 	async call(method: string, body: unknown): Promise<unknown> {
 		this.calls.push({ method, body });
 		if (method === "getUpdates") {
@@ -83,6 +84,8 @@ class FakeBotApi {
 			this.updates = [];
 			return { ok: true, result };
 		}
+		if (method === "getMe")
+			return { ok: true, result: this.botUsername ? { id: 1, username: this.botUsername } : { id: 1 } };
 		if (method === "getFile") return { ok: true, result: { file_path: "docs/file_7.bin" } };
 		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: this.calls.length } };
 		if (method === "sendMessage") return { ok: true, result: { message_id: this.calls.length } };
@@ -863,6 +866,54 @@ test("daemon registers in-thread config and lifecycle commands and drops stale r
 	expect(cmds).not.toContain("answer");
 	expect(cmds).not.toContain("attach");
 	expect(cmds).not.toContain("detach");
+});
+test("forum lifecycle commands must target this bot username", async () => {
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+	});
+	Object.assign(daemon, { lifecycleControlActive: true, botUsername: "GajaeCodeBot" });
+
+	await daemon.handleTelegramUpdate({
+		update_id: 101,
+		message: { chat: { id: -10042, type: "supergroup" }, text: "/session_recent", message_id: 1 },
+	});
+	await daemon.handleTelegramUpdate({
+		update_id: 102,
+		message: { chat: { id: -10042, type: "supergroup" }, text: "/session_recent@OtherBot", message_id: 2 },
+	});
+	expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
+
+	await daemon.handleTelegramUpdate({
+		update_id: 103,
+		message: { chat: { id: -10042, type: "supergroup" }, text: "/session_recent@GajaeCodeBot", message_id: 3 },
+	});
+	const sends = bot.calls.filter(c => c.method === "sendMessage");
+	expect(sends).toHaveLength(1);
+	expect(String(sends[0]!.body.text)).toContain("No recent sessions.");
+});
+
+test("forum lifecycle commands fail closed when bot username is unavailable", async () => {
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+	});
+	Object.assign(daemon, { lifecycleControlActive: true });
+
+	await daemon.handleTelegramUpdate({
+		update_id: 104,
+		message: { chat: { id: -10042, type: "supergroup" }, text: "/session_recent@GajaeCodeBot", message_id: 4 },
+	});
+
+	expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
 });
 
 test("ensureTelegramDaemonRunning spawns the daemon subcommand with owner-id and agent-dir", async () => {
