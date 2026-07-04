@@ -285,6 +285,19 @@ describe("CustomEditor bracketed paste interception", () => {
 		expect(editor.getText()).toBe("hello");
 	});
 
+	it("keeps prefix text when coding-agent consumes paste after a split start marker", async () => {
+		const editor = createEditor();
+		const onPasteText = vi.fn(() => true);
+		editor.onPasteText = onPasteText;
+
+		editor.handleInput("prefix\x1b[200~pay");
+		editor.handleInput("load\x1b[201~");
+		await Bun.sleep(0);
+
+		expect(onPasteText).toHaveBeenCalledWith("payload");
+		expect(editor.getText()).toBe("prefix");
+	});
+
 	it("keeps later input behind a pending async consumed paste", async () => {
 		const editor = createEditor();
 		const pasteDecision = Promise.withResolvers<boolean>();

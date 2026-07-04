@@ -241,6 +241,9 @@ export class CustomEditor extends Editor {
 		if (this.onPasteText) {
 			const paste = this.#pasteHandler.process(data);
 			if (paste.handled) {
+				if (paste.normalText !== undefined) {
+					super.handleInput(paste.normalText);
+				}
 				if (paste.pasteContent !== undefined) {
 					this.#handleBracketedPaste(paste.pasteContent, paste.remaining);
 				}

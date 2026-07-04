@@ -1057,6 +1057,9 @@ export class Editor implements Component, Focusable {
 		// Handle bracketed paste mode
 		const paste = this.#pasteHandler.process(data);
 		if (paste.handled) {
+			if (paste.normalText !== undefined) {
+				this.#handleNormalInput(paste.normalText);
+			}
 			if (paste.pasteContent !== undefined) {
 				this.#handlePaste(paste.pasteContent);
 				if (paste.remaining.length > 0) {
@@ -1065,6 +1068,12 @@ export class Editor implements Component, Focusable {
 			}
 			return;
 		}
+
+		this.#handleNormalInput(data);
+	}
+
+	#handleNormalInput(data: string): void {
+		const kb = getKeybindings();
 
 		// Handle special key combinations first
 
