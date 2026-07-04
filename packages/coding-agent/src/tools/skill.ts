@@ -50,7 +50,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 	readonly name = "skill";
 	readonly label = "Skill";
 	readonly summary = "Chain into another available skill in the current turn";
-	readonly loadMode = "discoverable";
+	readonly loadMode = "essential";
 	readonly description: string;
 	readonly parameters = skillSchema;
 	readonly strict = true;
