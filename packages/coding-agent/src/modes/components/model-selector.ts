@@ -1765,7 +1765,13 @@ export class ModelSelectorComponent extends Container {
 }
 
 function requiresExplicitThinkingChoice(model: Model): boolean {
-	return model.reasoning === true && (model.provider === "openai" || model.provider === "openai-codex");
+	if (model.reasoning !== true) return false;
+	return (
+		model.provider === "openai" ||
+		model.provider === "openai-codex" ||
+		model.api === "anthropic-messages" ||
+		(model.api === "bedrock-converse-stream" && /(?:^|[/.])claude[-.]/i.test(model.id))
+	);
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {

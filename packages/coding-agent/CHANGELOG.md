@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The model selector now asks for an explicit reasoning level when assigning Claude reasoning models, matching the existing OpenAI/Codex reasoning-model flow.
+
 ## [0.8.1] - 2026-07-04
 
 ### Added

@@ -161,9 +161,14 @@ describe("ModelSelector canonical model selection", () => {
 		});
 
 		let selected: SelectionCapture | undefined;
-		const selector = createSelector(model, settings, selection => {
-			if (selection.kind === "assignment") selected = selection;
-		});
+		const selector = createSelector(
+			model,
+			settings,
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			{ explicitThinkingLevel: true },
+		);
 		await Bun.sleep(0);
 		installTestTheme();
 
@@ -211,9 +216,14 @@ describe("ModelSelector canonical model selection", () => {
 		});
 
 		let selected: SelectionCapture | undefined;
-		const selector = createSelector(model, settings, selection => {
-			if (selection.kind === "assignment") selected = selection;
-		});
+		const selector = createSelector(
+			model,
+			settings,
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			{ explicitThinkingLevel: true },
+		);
 		await Bun.sleep(0);
 		installTestTheme();
 
@@ -246,7 +256,7 @@ describe("ModelSelector canonical model selection", () => {
 			selection => {
 				if (selection.kind === "assignment") selected = selection;
 			},
-			{ temporaryOnly: true, thinkingLevel: ThinkingLevel.Low },
+			{ temporaryOnly: true, thinkingLevel: ThinkingLevel.Low, explicitThinkingLevel: true },
 		);
 		await Bun.sleep(0);
 		installTestTheme();
@@ -291,7 +301,7 @@ describe("ModelSelector canonical model selection", () => {
 			selection => {
 				if (selection.kind === "assignment") selected = selection;
 			},
-			{ modelRegistry, thinkingLevel: ThinkingLevel.Medium },
+			{ modelRegistry, thinkingLevel: ThinkingLevel.Medium, explicitThinkingLevel: true },
 		);
 		await Bun.sleep(0);
 		installTestTheme();
@@ -429,6 +439,46 @@ describe("ModelSelector canonical model selection", () => {
 		if (!selectedAfterThinking) throw new Error("Expected OpenAI selection after off choice");
 		expect(selectedAfterThinking.role).toBe("default");
 		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.Off);
+		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("prompts for reasoning before assigning Claude default models", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+		const settings = Settings.isolated({});
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+
+		expect(selected).toBeUndefined();
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Default");
+		expect(thinkingRendered).toContain("off");
+		expect(thinkingRendered).toContain("xhigh");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const selectedAfterThinking = selected;
+		if (!selectedAfterThinking) throw new Error("Expected Claude selection after reasoning choice");
+		expect(selectedAfterThinking.role).toBe("default");
+		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
 	});
 
