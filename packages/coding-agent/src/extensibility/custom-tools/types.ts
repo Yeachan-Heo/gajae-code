@@ -194,6 +194,12 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	/** Source provider for source-aware MCP discovery gating. */
+	mcpSourceProvider?: string;
+	/** Source provider display name for source-aware MCP discovery gating. */
+	mcpSourceProviderName?: string;
+	/** Discovery eligibility for source-aware MCP gating. */
+	mcpDiscoveryScope?: "selectable" | "always-on";
 	/**
 	 * Execute the tool.
 	 * @param toolCallId - Unique ID for this tool call
