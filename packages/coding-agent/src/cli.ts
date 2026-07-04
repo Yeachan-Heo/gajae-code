@@ -4,6 +4,7 @@
  * CLI entry point — registers all commands explicitly and delegates to the
  * lightweight CLI runner from pi-utils.
  */
+import { THINKING_EFFORTS } from "@gajae-code/ai";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 
@@ -28,7 +29,10 @@ export const commands: CommandEntry[] = [
 	{ name: "setup", load: () => import("./commands/setup").then(m => m.default) },
 	{ name: "acp", load: () => import("./commands/acp").then(m => m.default) },
 	{ name: "skills", load: () => import("./commands/skills").then(m => m.default) },
+	{ name: "agents", load: () => import("./commands/agents").then(m => m.default) },
 	{ name: "session", load: () => import("./commands/session").then(m => m.default) },
+	{ name: "stats", load: () => import("./commands/stats").then(m => m.default) },
+	{ name: "worktree", aliases: ["wt"], load: () => import("./commands/worktree").then(m => m.default) },
 	{ name: "harness", load: () => import("./commands/harness").then(m => m.default) },
 	{ name: "coordinator", load: () => import("./commands/coordinator").then(m => m.default) },
 	{ name: "team", load: () => import("./commands/team").then(m => m.default) },
@@ -36,10 +40,17 @@ export const commands: CommandEntry[] = [
 	{ name: "gc", load: () => import("./commands/gc").then(m => m.default) },
 	{ name: "ralplan", load: () => import("./commands/ralplan").then(m => m.default) },
 	{ name: "config", load: () => import("./commands/config").then(m => m.default) },
+	{ name: "auth-broker", load: () => import("./commands/auth-broker").then(m => m.default) },
+	{ name: "auth-gateway", load: () => import("./commands/auth-gateway").then(m => m.default) },
+	{ name: "local-provider", load: () => import("./commands/local-provider").then(m => m.default) },
+	{ name: "ssh", load: () => import("./commands/ssh").then(m => m.default) },
 	{ name: "notify", load: () => import("./commands/notify").then(m => m.default) },
 	{ name: "daemon", load: () => import("./commands/daemon").then(m => m.default) },
 	{ name: "web-search", aliases: ["q"], load: () => import("./commands/web-search").then(m => m.default) },
-	{ name: "local-provider", load: () => import("./commands/local-provider").then(m => m.default) },
+	{ name: "read", load: () => import("./commands/read").then(m => m.default) },
+	{ name: "grep", load: () => import("./commands/grep").then(m => m.default) },
+	{ name: "shell", load: () => import("./commands/shell").then(m => m.default) },
+	{ name: "commit", load: () => import("./commands/commit").then(m => m.default) },
 	{ name: "mcp-serve", load: () => import("./commands/mcp-serve").then(m => m.default) },
 	{ name: "mcp", load: () => import("./commands/mcp").then(m => m.default) },
 	{
@@ -146,10 +157,16 @@ class RootHelpCommand extends Command {
 		"no-lsp": Flags.boolean({ description: "Disable LSP tools, formatting, and diagnostics" }),
 		"no-pty": Flags.boolean({ description: "Disable PTY-based interactive bash execution" }),
 		tmux: Flags.boolean({ description: "Launch interactive startup inside tmux" }),
+		worktree: Flags.string({
+			char: "w",
+			description: "Launch in a GJC-managed sibling git worktree; optional name creates/reuses that branch",
+			valueName: "name",
+			optionalValue: true,
+		}),
 		tools: Flags.string({ description: "Comma-separated list of tools to enable (default: all)" }),
 		thinking: Flags.string({
-			description: "Set thinking level: ultra, high, medium, low",
-			options: ["ultra", "high", "medium", "low"],
+			description: `Set thinking level: ${THINKING_EFFORTS.join(", ")}`,
+			options: [...THINKING_EFFORTS],
 		}),
 		hook: Flags.string({ description: "Load a hook/extension file (can be used multiple times)", multiple: true }),
 		extension: Flags.string({

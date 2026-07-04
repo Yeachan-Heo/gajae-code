@@ -22,7 +22,10 @@ describe("GJC public CLI command surface", () => {
 			"setup",
 			"acp",
 			"skills",
+			"agents",
 			"session",
+			"stats",
+			"worktree",
 			"harness",
 			"coordinator",
 			"team",
@@ -30,10 +33,17 @@ describe("GJC public CLI command surface", () => {
 			"gc",
 			"ralplan",
 			"config",
+			"auth-broker",
+			"auth-gateway",
+			"local-provider",
+			"ssh",
 			"notify",
 			"daemon",
 			"web-search",
-			"local-provider",
+			"read",
+			"grep",
+			"shell",
+			"commit",
 			"mcp-serve",
 			"mcp",
 			"contribute-pr",
@@ -60,6 +70,42 @@ describe("GJC public CLI command surface", () => {
 		expect(stdout).toContain("Check for and install updates");
 		expect(combined).not.toContain("What's New");
 		expect(combined).not.toContain("chatContainer");
+	}, 30_000);
+
+	it("routes documented utility command help instead of falling back to root launch help", () => {
+		for (const [command, expected] of [
+			["stats", "View usage statistics"],
+			["auth-broker", "Manage the gjc auth-broker"],
+			["auth-gateway", "Run an auth-gateway forward proxy"],
+			["commit", "Generate a commit message"],
+		]) {
+			const result = Bun.spawnSync(["bun", cliEntry, command, "--help"], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+
+			expect(result.exitCode, output).toBe(0);
+			expect(output).toContain(expected);
+			expect(output).not.toContain("USAGE\n  $ gjc [COMMAND]");
+		}
+	}, 30_000);
+
+	it("keeps root launch help aligned with accepted flags and current tool names", () => {
+		const result = Bun.spawnSync(["bun", cliEntry, "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+
+		expect(result.exitCode, output).toBe(0);
+		expect(output).toContain("-w, --worktree[=<name>]");
+		expect(output).toContain("Set thinking level: minimal, low, medium, high, xhigh, max");
+		expect(output).toContain("search        - Search file contents");
+		expect(output).not.toContain("grep          - Search file contents");
+		expect(output).not.toContain("python        - Execute Python code");
 	}, 30_000);
 
 	it("documents the native CLI surface in command help", async () => {

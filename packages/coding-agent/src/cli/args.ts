@@ -265,8 +265,6 @@ export function getExtraHelpText(): string {
   GJC_SLOW_MODEL              - Override slow/reasoning model (see --slow)
   GJC_PLAN_MODEL              - Override planning model (see --plan)
   GJC_NO_PTY                  - Disable PTY-based interactive bash execution
-  --tmux                       - Launch interactive startup inside a fresh tmux session
-  gjc session                  - List, inspect, create, remove, or attach tagged GJC-managed tmux sessions
   GJC_LAUNCH_POLICY           - Launch policy for --tmux startup: tmux or direct
   GJC_TMUX_SESSION            - Explicit tmux session name override for --tmux startup
   GJC_TMUX_PROFILE            - Apply GJC tmux scroll/mouse/clipboard profile to --tmux sessions (set 0/off to skip)
@@ -274,16 +272,21 @@ export function getExtraHelpText(): string {
 
   For complete environment variable reference, see:
   ${chalk.dim("docs/environment-variables.md")}
+
+${chalk.bold("Launch Helpers:")}
+  --tmux                      - Launch interactive startup inside a fresh tmux session
+  --worktree[=<name>]         - Launch inside a GJC-managed sibling git worktree
+  gjc session                 - List, inspect, create, remove, or attach tagged GJC-managed tmux sessions
+
 ${chalk.bold("Available Tools (default-enabled unless noted):")}
   read          - Read file contents
   bash          - Execute bash commands
-  edit          - Edit files with find/replace
+  edit          - Edit files with line-anchored patches
   write         - Write files (creates/overwrites)
-  grep          - Search file contents
+  search        - Search file contents
   find          - Find files by glob pattern
+  eval          - Execute Python or JavaScript snippets when enabled
   lsp           - Language server protocol (code intelligence)
-  python        - Execute Python code (requires: ${APP_NAME} setup python)
-  notebook      - Edit Jupyter notebooks
   browser       - Browser automation (Puppeteer)
   task          - Launch sub-agents for parallel tasks
   todo_write    - Manage todo/task lists

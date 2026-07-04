@@ -5,7 +5,10 @@ export function getExtraHelpText(): string {
   ${APP_NAME} [prompt]             - Start an interactive coding session (default launch command)
   ${APP_NAME} launch               - Start an explicit launch/session workflow
   ${APP_NAME} setup                - Install GJC defaults or optional dependencies
+  ${APP_NAME} acp                  - Run Agent Client Protocol mode
   ${APP_NAME} session              - List, inspect, create, remove, or attach sessions
+  ${APP_NAME} stats                - View usage statistics
+  ${APP_NAME} worktree             - List or clear agent-managed git worktrees (alias: wt)
   ${APP_NAME} state                - Inspect or manage persisted GJC state
   ${APP_NAME} harness              - Run harness control-plane commands
   ${APP_NAME} coordinator          - Manage coordinator/runtime coordination helpers
@@ -14,7 +17,12 @@ export function getExtraHelpText(): string {
   ${APP_NAME} ralplan              - Run consensus planning workflow
   ${APP_NAME} deep-interview       - Run requirements interview workflow
   ${APP_NAME} skills               - List/read embedded workflow skills
+  ${APP_NAME} agents               - Manage bundled task agents
   ${APP_NAME} config               - List, get, and set configuration values
+  ${APP_NAME} auth-broker          - Manage the credential vault
+  ${APP_NAME} auth-gateway         - Run a broker-backed auth forward proxy
+  ${APP_NAME} local-provider       - Manage local provider helpers
+  ${APP_NAME} ssh                  - Manage SSH host configurations
   ${APP_NAME} notify               - Send or test notifications
   ${APP_NAME} daemon               - Manage background daemon helpers
   ${APP_NAME} mcp                  - Manage MCP server registrations
@@ -25,6 +33,10 @@ export function getExtraHelpText(): string {
   ${APP_NAME} update               - Update GJC installation artifacts
   ${APP_NAME} plugin               - Install, remove, and list plugins
   ${APP_NAME} web-search           - Search the web from the CLI (alias: q)
+  ${APP_NAME} read                 - Preview read-tool output for a path or URL
+  ${APP_NAME} grep                 - Test native grep search
+  ${APP_NAME} shell                - Open an interactive shell console
+  ${APP_NAME} commit               - Generate a commit message and changelogs
   ${APP_NAME} codex-native-hook    - Run Codex native hook integration
   ${APP_NAME} gc                   - Run garbage-collection/cleanup helpers
   ${APP_NAME} <command> --help     - Show command-specific help
@@ -78,8 +90,6 @@ Environment Variables:
   GJC_SLOW_MODEL              - Override slow/reasoning model (see --slow)
   GJC_PLAN_MODEL              - Override planning model (see --plan)
   GJC_NO_PTY                  - Disable PTY-based interactive bash execution
-  --tmux                       - Launch interactive startup inside a fresh tmux session
-  gjc session                  - List, inspect, create, remove, or attach tagged GJC-managed tmux sessions
   GJC_LAUNCH_POLICY           - Launch policy for --tmux startup: tmux or direct
   GJC_TMUX_SESSION            - Explicit tmux session name override for --tmux startup
   GJC_TMUX_PROFILE            - Apply GJC tmux scroll/mouse/clipboard profile to --tmux sessions (set 0/off to skip)
@@ -87,16 +97,21 @@ Environment Variables:
 
   For complete environment variable reference, see:
   docs/environment-variables.md
+
+Launch Helpers:
+  --tmux                      - Launch interactive startup inside a fresh tmux session
+  --worktree[=<name>]         - Launch inside a GJC-managed sibling git worktree
+  gjc session                 - List, inspect, create, remove, or attach tagged GJC-managed tmux sessions
+
 Available Tools (default-enabled unless noted):
   read          - Read file contents
   bash          - Execute bash commands
-  edit          - Edit files with find/replace
+  edit          - Edit files with line-anchored patches
   write         - Write files (creates/overwrites)
-  grep          - Search file contents
+  search        - Search file contents
   find          - Find files by glob pattern
+  eval          - Execute Python or JavaScript snippets when enabled
   lsp           - Language server protocol (code intelligence)
-  python        - Execute Python code (requires: ${APP_NAME} setup python)
-  notebook      - Edit Jupyter notebooks
   browser       - Browser automation (Puppeteer)
   task          - Launch sub-agents for parallel tasks
   todo_write    - Manage todo/task lists

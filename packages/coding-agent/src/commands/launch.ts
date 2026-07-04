@@ -133,6 +133,12 @@ export default class Index extends Command {
 		tmux: Flags.boolean({
 			description: "Launch interactive startup inside tmux",
 		}),
+		worktree: Flags.string({
+			char: "w",
+			description: "Launch in a GJC-managed sibling git worktree; optional name creates/reuses that branch",
+			valueName: "name",
+			optionalValue: true,
+		}),
 		tools: Flags.string({
 			description: "Comma-separated list of tools to enable (default: all)",
 		}),

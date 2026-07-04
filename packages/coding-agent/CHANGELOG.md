@@ -6,6 +6,8 @@
 
 - The Telegram notification daemon now tombstones a session endpoint generation after `session_closed`, preventing the scan loop from reconnecting to the still-live old endpoint and recreating an empty topic immediately after deleting the original topic.
 - `/contribute-pr` in the interactive TUI now prepares the redacted manifest and worker prompt without spawning a second GJC process on the same terminal, avoiding competing TUI renderers that make the chat viewport jump around. Run the generated worker prompt from a separate terminal instead.
+- `gjc stats --help`, `gjc auth-broker --help`, `gjc auth-gateway --help`, and `gjc commit --help` now route to their command-specific help instead of falling back to root launch help; root help also documents the accepted `--worktree` flag, current thinking levels, and the renamed `search` / `eval` tool names.
+- Goal tool result cards now include a top breathing row inside the colored block, making completed goal summaries less visually cramped in the TUI transcript.
 
 ## [0.8.0] - 2026-07-04
 

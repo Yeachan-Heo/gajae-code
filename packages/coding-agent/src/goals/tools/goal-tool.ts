@@ -1,6 +1,5 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { Component } from "@gajae-code/tui";
-import { Text } from "@gajae-code/tui";
+import { type Component, Container, Spacer, Text } from "@gajae-code/tui";
 import { formatNumber, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
@@ -194,6 +193,13 @@ interface GoalRenderArgs {
 	objective?: string;
 }
 
+function renderGoalTextBlock(text: string): Component {
+	const container = new Container();
+	container.addChild(new Spacer(1));
+	container.addChild(new Text(text, 0, 0));
+	return container;
+}
+
 export const goalToolRenderer = {
 	renderCall(args: GoalRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {
 		const description = describeOp(args.op);
@@ -204,7 +210,7 @@ export const goalToolRenderer = {
 			meta.push(uiTheme.italic(uiTheme.fg("muted", `"${objective}"`)));
 		}
 		const text = renderStatusLine({ icon: "pending", title: "Goal", description, meta }, uiTheme);
-		return new Text(text, 0, 0);
+		return renderGoalTextBlock(text);
 	},
 
 	renderResult(
@@ -221,14 +227,14 @@ export const goalToolRenderer = {
 		if (result.isError) {
 			const header = renderStatusLine({ icon: "error", title: "Goal", description }, uiTheme);
 			const body = formatErrorMessage(fallbackText || "Goal tool failed", uiTheme);
-			return new Text([header, body].join("\n"), 0, 0);
+			return renderGoalTextBlock([header, body].join("\n"));
 		}
 
 		const goal = details?.goal ?? null;
 		if (!goal) {
 			const header = renderStatusLine({ icon: "warning", title: "Goal", description }, uiTheme);
 			const body = uiTheme.fg("muted", "No active goal.");
-			return new Text([header, body].join("\n"), 0, 0);
+			return renderGoalTextBlock([header, body].join("\n"));
 		}
 
 		const lines: string[] = [];
@@ -252,7 +258,7 @@ export const goalToolRenderer = {
 			lines.push(`  ${uiTheme.fg("dim", `${formatDuration(goal.timeUsedSeconds * 1000)} elapsed`)}`);
 		}
 
-		return new Text(lines.join("\n"), 0, 0);
+		return renderGoalTextBlock(lines.join("\n"));
 	},
 
 	mergeCallAndResult: true,

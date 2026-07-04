@@ -23,6 +23,8 @@ export interface FlagDescriptor<K extends "string" | "boolean" | "integer" = "st
 	multiple?: boolean;
 	options?: readonly string[];
 	required?: boolean;
+	valueName?: string;
+	optionalValue?: boolean;
 }
 
 export interface ArgDescriptor {
@@ -40,6 +42,8 @@ interface FlagInput {
 	multiple?: boolean;
 	options?: readonly string[];
 	required?: boolean;
+	valueName?: string;
+	optionalValue?: boolean;
 }
 
 interface ArgInput {
@@ -317,7 +321,9 @@ function renderCommandBody(lines: string[], Cmd: CommandCtor): void {
 		for (const [name, desc] of flagEntries) {
 			const charPart = desc.char ? `-${desc.char}, ` : "    ";
 			const namePart = `--${name}`;
-			const typePart = desc.kind === "boolean" ? "" : desc.kind === "integer" ? "=<int>" : "=<value>";
+			const valueName = desc.valueName ?? (desc.kind === "integer" ? "int" : "value");
+			const typePart =
+				desc.kind === "boolean" ? "" : desc.optionalValue ? `[=<${valueName}>]` : `=<${valueName}>`;
 			formatted.push([`  ${charPart}${namePart}${typePart}`, desc.description ?? ""]);
 		}
 		const maxLeft = Math.max(...formatted.map(([l]) => l.length));
