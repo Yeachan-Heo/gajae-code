@@ -102,8 +102,50 @@ class SyncSlashProvider implements AutocompleteProvider {
 	callCount = 0;
 }
 
+class InlineSkillProvider implements AutocompleteProvider {
+	async getSuggestions(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
+		this.suggestionCalls += 1;
+		const line = lines[cursorLine] || "";
+		const textBeforeCursor = line.slice(0, cursorCol);
+		const match = textBeforeCursor.match(/(?:^|\s)(\/[^\s]*)$/);
+		const prefix = match?.[1];
+		if (!prefix) return null;
+		if (prefix !== "/" && !"/skill:team".startsWith(prefix) && !"/skill-team".startsWith(prefix)) {
+			return null;
+		}
+		return {
+			prefix,
+			items: [{ value: "skill:team", label: "skill:team" }],
+		};
+	}
+
+	applyCompletion(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		item: AutocompleteItem,
+		prefix: string,
+	): { lines: string[]; cursorLine: number; cursorCol: number; onApplied?: () => void } {
+		const line = lines[cursorLine] || "";
+		const beforePrefix = line.slice(0, cursorCol - prefix.length);
+		const afterCursor = line.slice(cursorCol);
+		const nextLines = [...lines];
+		nextLines[cursorLine] = `${beforePrefix}/${item.value} ${afterCursor}`;
+		return {
+			lines: nextLines,
+			cursorLine,
+			cursorCol: beforePrefix.length + item.value.length + 2,
+		};
+	}
+
+	suggestionCalls = 0;
+}
 describe("Editor Enter handler sync slash completion", () => {
-	it("does not trigger slash autocomplete after prior prompt text", async () => {
+	it("does not auto-trigger slash autocomplete from a bare slash after prior prompt text", async () => {
 		let suggestionCalls = 0;
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider({
@@ -123,6 +165,34 @@ describe("Editor Enter handler sync slash completion", () => {
 
 		expect(suggestionCalls).toBe(0);
 		expect(editor.isShowingAutocomplete()).toBe(false);
+	});
+
+	it("auto-triggers inline slash skill autocomplete after prompt text", async () => {
+		const provider = new InlineSkillProvider();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(provider);
+
+		editor.handleInput("explain with /skill-te");
+		await Bun.sleep(0);
+
+		expect(provider.suggestionCalls).toBeGreaterThan(0);
+		expect(editor.isShowingAutocomplete()).toBe(true);
+	});
+
+	it("applies inline slash skill completion before submitting", async () => {
+		const provider = new InlineSkillProvider();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(provider);
+		let submitted = "";
+		editor.onSubmit = text => {
+			submitted = text;
+		};
+
+		editor.handleInput("explain with /skill-te");
+		await Bun.sleep(0);
+		editor.handleInput("\r");
+
+		expect(submitted).toBe("explain with /skill:team");
 	});
 
 	it("completes slash command synchronously before async resolves and submits", () => {

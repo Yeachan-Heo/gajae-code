@@ -63,8 +63,17 @@ describe("parseSkillInvocations", () => {
 		]);
 	});
 
-	it("requires the prompt to start with a recognized canonical skill command", () => {
-		expect(parseSkillInvocations("normal text /skill:alpha later", skillsByCommandName)).toEqual([]);
+	it("extracts canonical skill invocations from inline prompt text", () => {
+		expect(parseSkillInvocations("normal text /skill:alpha later", skillsByCommandName)).toEqual([
+			{ commandName: "skill:alpha", args: "normal text later", skill: alpha },
+		]);
+		expect(parseSkillInvocations("use /skill:alpha and /skill:beta for this", skillsByCommandName)).toEqual([
+			{ commandName: "skill:alpha", args: "use and for this", skill: alpha },
+			{ commandName: "skill:beta", args: "use and for this", skill: beta },
+		]);
+	});
+
+	it("does not treat aliases or unknown leading skill commands as invocations", () => {
 		expect(parseSkillInvocations("/alpha autocomplete alias is not invocation", skillsByCommandName)).toEqual([]);
 		expect(parseSkillInvocations("/skill:unknown /skill:alpha later", skillsByCommandName)).toEqual([]);
 	});

@@ -644,19 +644,18 @@ export class InputController {
 
 	/**
 	 * Dispatch skill slash invocation(s) (`/skill:<name>`) through custom messages
-	 * using the supplied `streamingBehavior`. Returns true if the text was a
-	 * recognised skill command chain and was dispatched. A failure to load a skill
-	 * file is surfaced via `showError` but still returns true — the editor was
-	 * already cleared on the success path, so falling through to plain-text
-	 * handling at that point would double-submit. Returns false when the text
-	 * isn't a `/skill:` prefix or the command name isn't a registered skill,
-	 * so the caller can fall through to plain-text handling (this branch
+	 * using the supplied `streamingBehavior`. Returns true if the text contains a
+	 * recognised canonical skill command or command chain and was dispatched. A
+	 * failure to load a skill file is surfaced via `showError` but still returns
+	 * true — the editor was already cleared on the success path, so falling
+	 * through to plain-text handling at that point would double-submit. Returns
+	 * false when the text has no registered canonical skill invocation, so the
+	 * caller can fall through to plain-text handling (this branch
 	 * leaves the editor state untouched). `streamingBehavior` is only consulted
 	 * while the agent is streaming; the idle path of `promptCustomMessage`
 	 * ignores it.
 	 */
 	async #invokeSkillCommand(text: string, streamingBehavior: "steer" | "followUp"): Promise<boolean> {
-		if (!text.startsWith("/")) return false;
 		const invocations = parseSkillInvocations(text, this.ctx.skillCommands ?? new Map());
 		if (invocations.length === 0) return false;
 		this.ctx.editor.addToHistory(text);

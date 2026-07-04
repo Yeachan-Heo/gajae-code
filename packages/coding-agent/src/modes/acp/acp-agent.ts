@@ -710,9 +710,6 @@ export class AcpAgent implements Agent {
 		text: string,
 		options: { directAliasMayCollide?: boolean } = {},
 	): Promise<boolean> {
-		if (!text.startsWith("/")) {
-			return false;
-		}
 		if (!record.session.skillsSettings?.enableSkillCommands) {
 			return false;
 		}

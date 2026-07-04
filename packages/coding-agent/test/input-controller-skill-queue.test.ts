@@ -290,6 +290,22 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		expect(messageArg.details.__pendingDisplayTag).toBeUndefined();
 	});
 
+	it("dispatches inline canonical skill commands with surrounding prompt text as args", async () => {
+		const { ctx, editor, promptCustomMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("please use /skill:test-skill for this plan");
+		await editor.onSubmit?.("please use /skill:test-skill for this plan");
+
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("Do the thing.");
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("User: please use for this plan");
+	});
+
 	it("dispatches chained canonical skill commands in order while idle", async () => {
 		const secondSkillPath = writeSkillFile(tempDir.path(), "second-skill", "Do the second thing.");
 		skillCommands.set("skill:second-skill", {

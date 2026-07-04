@@ -326,12 +326,28 @@ interface SkillTokenMatch {
 	skill: Skill;
 }
 
+function buildInlineSkillInvocationArgs(text: string, matches: readonly SkillTokenMatch[]): string {
+	const pieces: string[] = [];
+	let cursor = 0;
+	for (const match of matches) {
+		pieces.push(text.slice(cursor, match.index));
+		cursor = match.end;
+	}
+	pieces.push(text.slice(cursor));
+	return pieces
+		.join("")
+		.replace(/[ \t]{2,}/g, " ")
+		.replace(/[ \t]+\n/g, "\n")
+		.replace(/\n[ \t]+/g, "\n")
+		.trim();
+}
+
 export function parseSkillInvocations(
 	text: string,
 	skillsByCommandName: ReadonlyMap<string, Skill>,
 ): ParsedSkillInvocation[] {
 	const trimmedText = text.trim();
-	if (!trimmedText.startsWith("/")) return [];
+	if (!trimmedText) return [];
 	const canonicalSkillCommandPattern = /(^|\s)\/(skill:[^\s]+)/g;
 	const matches: SkillTokenMatch[] = [];
 	for (const match of trimmedText.matchAll(canonicalSkillCommandPattern)) {
@@ -348,7 +364,19 @@ export function parseSkillInvocations(
 			skill,
 		});
 	}
-	if (matches.length === 0 || matches[0]?.index !== 0) return [];
+	if (matches.length === 0) return [];
+	if (matches[0]?.index !== 0) {
+		// Preserve leading slash-command semantics: `/skill:unknown /skill:alpha`
+		// should remain plain text rather than silently skipping the unknown
+		// leading command and invoking the later known one.
+		if (trimmedText.startsWith("/")) return [];
+		const args = buildInlineSkillInvocationArgs(trimmedText, matches);
+		return matches.map(match => ({
+			commandName: match.commandName,
+			args,
+			skill: match.skill,
+		}));
+	}
 	return matches.map((match, index) => {
 		const next = matches[index + 1];
 		return {
