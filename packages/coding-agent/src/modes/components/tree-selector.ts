@@ -135,6 +135,14 @@ class TreeList implements Component {
 		return this.#filteredNodes.length - 1;
 	}
 
+	#clampSelectedIndex(): void {
+		if (this.#filteredNodes.length === 0) {
+			this.#selectedIndex = 0;
+			return;
+		}
+		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, this.#filteredNodes.length - 1));
+	}
+
 	#flattenTree(roots: SessionTreeNode[]): FlatNode[] {
 		const result: FlatNode[] = [];
 		this.#toolCallMap.clear();
@@ -333,12 +341,11 @@ class TreeList implements Component {
 			return true;
 		});
 
-		// Try to preserve cursor on the same node, or find nearest visible ancestor
+		// Try to preserve cursor on the same node, or keep the index in range.
 		if (this.#lastSelectedId) {
 			this.#selectedIndex = this.#findNearestVisibleIndex(this.#lastSelectedId);
-		} else if (this.#selectedIndex >= this.#filteredNodes.length) {
-			// Clamp index if out of bounds
-			this.#selectedIndex = Math.max(0, this.#filteredNodes.length - 1);
+		} else {
+			this.#clampSelectedIndex();
 		}
 
 		// Update lastSelectedId to the actual selection (may have changed due to parent walk)
@@ -710,16 +717,29 @@ class TreeList implements Component {
 	}
 
 	handleInput(keyData: string): void {
+		const moveSelection = (delta: number, wrap: boolean): void => {
+			if (this.#filteredNodes.length === 0) return;
+			if (wrap) {
+				const next = this.#selectedIndex + delta;
+				this.#selectedIndex =
+					next < 0 ? this.#filteredNodes.length - 1 : next >= this.#filteredNodes.length ? 0 : next;
+			} else {
+				this.#selectedIndex += delta;
+				this.#clampSelectedIndex();
+			}
+			this.#lastSelectedId = this.#filteredNodes[this.#selectedIndex]?.node.entry.id ?? this.#lastSelectedId;
+		};
+
 		if (matchesKey(keyData, "up")) {
-			this.#selectedIndex = this.#selectedIndex === 0 ? this.#filteredNodes.length - 1 : this.#selectedIndex - 1;
+			moveSelection(-1, true);
 		} else if (matchesKey(keyData, "down")) {
-			this.#selectedIndex = this.#selectedIndex === this.#filteredNodes.length - 1 ? 0 : this.#selectedIndex + 1;
+			moveSelection(1, true);
 		} else if (matchesKey(keyData, "left")) {
 			// Page up
-			this.#selectedIndex = Math.max(0, this.#selectedIndex - this.maxVisibleLines);
+			moveSelection(-this.maxVisibleLines, false);
 		} else if (matchesKey(keyData, "right")) {
 			// Page down
-			this.#selectedIndex = Math.min(this.#filteredNodes.length - 1, this.#selectedIndex + this.maxVisibleLines);
+			moveSelection(this.maxVisibleLines, false);
 		} else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			const selected = this.#filteredNodes[this.#selectedIndex];
 			if (selected && this.onSelect) {
