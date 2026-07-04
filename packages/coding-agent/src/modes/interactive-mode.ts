@@ -1372,6 +1372,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
+		// Leaving plan mode invalidates the plan-mode steering and standing
+		// resolve handler that the in-flight turn may still be acting on. Abort
+		// before clearing that state so the model cannot continue from stale
+		// plan-mode context and retry `resolve` against a retired handler.
+		await this.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS });
+
 		const previousTools = this.#planModePreviousTools;
 		if (previousTools && previousTools.length > 0) {
 			await this.session.setActiveToolsByName(previousTools);

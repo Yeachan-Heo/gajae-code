@@ -71,6 +71,7 @@ describe("issue #816 — plan mode pendingModelSwitch leak", () => {
 		});
 		// Avoid kicking off real session work during plan mode entry.
 		vi.spyOn(session, "sendPlanModeContext").mockResolvedValue(undefined);
+		vi.spyOn(session, "abort").mockResolvedValue(undefined);
 
 		const setModelSpy = vi.spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
 
@@ -90,6 +91,43 @@ describe("issue #816 — plan mode pendingModelSwitch leak", () => {
 		// Otherwise the next user turn lands on the plan-role model even though
 		// the user is no longer in plan mode.
 		expect(setModelSpy).not.toHaveBeenCalled();
+	});
+
+	it("issue #1588: toggling plan mode off aborts before retiring plan-mode resolve state", async () => {
+		await mode.handlePlanModeCommand();
+		expect(mode.planModeEnabled).toBe(true);
+		expect(session.getPlanModeState()?.enabled).toBe(true);
+		expect(session.peekStandingResolveHandler()).toBeDefined();
+
+		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
+		const abortSpy = vi.spyOn(session, "abort").mockImplementation(async () => {
+			expect(mode.planModeEnabled).toBe(true);
+			expect(session.getPlanModeState()?.enabled).toBe(true);
+			expect(session.peekStandingResolveHandler()).toBeDefined();
+		});
+
+		await mode.handlePlanModeCommand();
+
+		expect(abortSpy).toHaveBeenCalledWith({ timeoutMs: 5_000 });
+		expect(mode.planModeEnabled).toBe(false);
+		expect(mode.planModePaused).toBe(true);
+		expect(session.getPlanModeState()).toBeUndefined();
+		expect(session.peekStandingResolveHandler()).toBeUndefined();
+	});
+
+	it("issue #1588: cancelled plan-mode exit keeps the in-flight turn and resolve handler intact", async () => {
+		await mode.handlePlanModeCommand();
+		expect(session.peekStandingResolveHandler()).toBeDefined();
+
+		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(false);
+		const abortSpy = vi.spyOn(session, "abort").mockResolvedValue(undefined);
+
+		await mode.handlePlanModeCommand();
+
+		expect(abortSpy).not.toHaveBeenCalled();
+		expect(mode.planModeEnabled).toBe(true);
+		expect(session.getPlanModeState()?.enabled).toBe(true);
+		expect(session.peekStandingResolveHandler()).toBeDefined();
 	});
 
 	it("does not enter plan mode when plan.enabled is false", async () => {
