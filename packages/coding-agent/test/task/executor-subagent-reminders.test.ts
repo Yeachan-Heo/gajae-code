@@ -5,7 +5,7 @@ import { Settings } from "../../src/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
-import type { AgentSession, AgentSessionEvent, PromptOptions } from "../../src/session/agent-session";
+import type { AgentSession, AgentSessionEvent, ForkContextSeed, PromptOptions } from "../../src/session/agent-session";
 import type { AuthStorage } from "../../src/session/auth-storage";
 import { runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
 import type { AgentDefinition } from "../../src/task/types";
@@ -114,6 +114,23 @@ describe("runSubprocess yield reminders", () => {
 		modelRegistry: { refresh: async () => {} } as unknown as import("../../src/config/model-registry").ModelRegistry,
 		enableLsp: false,
 	};
+
+	function createForkContextSeed(): ForkContextSeed {
+		return {
+			messages: [],
+			agentMessages: [],
+			metadata: {
+				sourceSessionId: "parent-session",
+				parentMessageCount: 3,
+				includedMessages: 1,
+				skippedMessages: 2,
+				approximateTokens: 64,
+				maxMessages: 5,
+				maxTokens: 100,
+				skippedReasons: {},
+			},
+		};
+	}
 
 	it("waits for session_start extension user messages before prompting the subagent", async () => {
 		let extensionSendUserMessage: ExtensionActions["sendUserMessage"] | undefined;
@@ -232,6 +249,68 @@ describe("runSubprocess yield reminders", () => {
 		expect(systemPrompt?.[3]).toBe("now");
 		expect(userPrompt).not.toContain("[CONTEXT]");
 		expect(userPrompt).not.toContain("Shared task background");
+	});
+
+	it("does not mention IRC in fork-context notice when IRC is unavailable", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fork-context-no-irc",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-fork-context-no-irc",
+			forkContextSeed: createForkContextSeed(),
+			ircAvailable: false,
+		});
+
+		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
+		expect(systemPromptBuilder).toBeFunction();
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const systemPrompt = systemPromptBuilder(["system", "now"]);
+
+		expect(systemPrompt.join("\n")).toContain("forked snapshot of the parent conversation");
+		expect(systemPrompt.join("\n")).not.toContain("IRC");
+		expect(systemPrompt.join("\n")).toContain("Rely on the explicit assignment and supplied context");
+	});
+
+	it("mentions IRC in fork-context notice when IRC is available", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fork-context-irc",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-fork-context-irc",
+			forkContextSeed: createForkContextSeed(),
+			ircAvailable: true,
+		});
+
+		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
+		expect(systemPromptBuilder).toBeFunction();
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const systemPrompt = systemPromptBuilder(["system", "now"]);
+
+		expect(systemPrompt.join("\n")).toContain("Use IRC for live coordination.");
 	});
 
 	it("sends reminder prompt when subagent stops without yield", async () => {

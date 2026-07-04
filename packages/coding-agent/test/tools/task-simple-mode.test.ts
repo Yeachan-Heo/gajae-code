@@ -110,6 +110,71 @@ describe("task.simple", () => {
 			expect(properties.spawnPlan).toBeDefined();
 		}
 	});
+	it("hides IRC guidance when the IRC tool is not available", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+
+		const tool = await TaskTool.create(createSession({ "irc.enabled": true }, { getToolByName: () => undefined }));
+
+		expect(tool.description).not.toContain("Coordinate with running tasks via `irc`");
+		expect(tool.description).not.toContain("via the `irc` tool");
+		expect(tool.description).toContain("Use `subagent` action `inspect` or `list`");
+	});
+
+	it("shows IRC guidance when the IRC tool is available", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+
+		const tool = await TaskTool.create(
+			createSession(
+				{ "irc.enabled": true },
+				{ getToolByName: name => (name === "irc" ? ({ name: "irc" } as never) : undefined) },
+			),
+		);
+
+		expect(tool.description).toContain("Coordinate with running tasks via `irc`");
+		expect(tool.description).toContain("via the `irc` tool");
+		expect(tool.description).not.toContain("Use `subagent` action `inspect` or `list`");
+	});
+
+	it("omits IRC launch hints when tool lookup metadata is missing", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: TEST_AGENTS,
+			projectAgentsDir: null,
+		});
+		const captured: CapturedRegister[] = [];
+		const manager = {
+			register: (
+				type: "bash" | "task",
+				label: string,
+				_run: (ctx: {
+					jobId: string;
+					signal: AbortSignal;
+					reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
+				}) => Promise<string>,
+				options?: AsyncJobRegisterOptions,
+			): string => {
+				captured.push({ type, label, options });
+				return options?.id ?? label;
+			},
+		};
+		AsyncJobManager.setInstance(manager as unknown as AsyncJobManager);
+
+		const tool = await TaskTool.create(createSession({ "irc.enabled": true }));
+		const result = await tool.execute("tool-no-irc", {
+			agent: "task",
+			tasks: [{ id: "One", description: "label", assignment: "Do work." }],
+		} as TaskParams);
+
+		expect(captured).toHaveLength(1);
+		const text = getFirstText(result);
+		expect(text).not.toContain("DM these ids via `irc`");
+		expect(text).toContain("Use `subagent` to list, inspect, or await");
+	});
 
 	it("rejects a five-task batch before scheduling without spawnPlan", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({

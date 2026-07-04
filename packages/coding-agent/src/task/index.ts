@@ -178,6 +178,10 @@ export {
 /**
  * Render the tool description from a cached agent list and current settings.
  */
+function hasAvailableIrcTool(session: ToolSession): boolean {
+	return session.settings.get("irc.enabled") === true && session.getToolByName?.("irc") !== undefined;
+}
+
 function renderDescription(
 	agents: AgentDefinition[],
 	maxConcurrency: number,
@@ -381,7 +385,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			true,
 			disabledAgents,
 			this.#getTaskSimpleMode(),
-			this.session.settings.get("irc.enabled") === true,
+			hasAvailableIrcTool(this.session),
 			this.session.getSessionSpawns() ?? "*",
 		);
 	}
@@ -814,7 +818,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? ` Failed to schedule ${failedSchedules.length} task${failedSchedules.length === 1 ? "" : "s"}.`
 				: "";
 
-		const ircEnabled = this.session.settings.get("irc.enabled") === true;
+		const ircEnabled = hasAvailableIrcTool(this.session);
 		const taskIdByItemId = new Map<string, string>();
 		for (let i = 0; i < taskItems.length; i++) {
 			taskIdByItemId.set(taskItems[i].id, uniqueIds[i]);
@@ -1171,7 +1175,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			// Write parent conversation context for subagents. When IRC is available,
 			// subagents should ask live peers instead of reading a stale markdown dump.
 			await fs.mkdir(effectiveArtifactsDir, { recursive: true });
-			const shouldWriteConversationContext = this.session.settings.get("irc.enabled") !== true;
+			const shouldWriteConversationContext = !hasAvailableIrcTool(this.session);
 			const compactContext = shouldWriteConversationContext ? this.session.getCompactContext?.() : undefined;
 			let contextFilePath: string | undefined;
 			if (compactContext) {
@@ -1298,6 +1302,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						persistArtifacts: !!artifactsDir,
 						artifactsDir: effectiveArtifactsDir,
 						contextFile: contextFilePath,
+						ircAvailable: hasAvailableIrcTool(this.session),
 						enableLsp: subagentLspEnabled,
 						signal,
 						eventBus: this.session.eventBus,
@@ -1360,6 +1365,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						persistArtifacts: !!artifactsDir,
 						artifactsDir: effectiveArtifactsDir,
 						contextFile: contextFilePath,
+						ircAvailable: hasAvailableIrcTool(this.session),
 						enableLsp: subagentLspEnabled,
 						signal,
 						eventBus: this.session.eventBus,

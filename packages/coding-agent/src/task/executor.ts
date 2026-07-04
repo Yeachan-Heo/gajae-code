@@ -139,6 +139,8 @@ export interface ExecutorOptions {
 	artifactsDir?: string;
 	/** Path to parent conversation context file */
 	contextFile?: string;
+	/** Whether the parent runtime actually exposes IRC coordination. */
+	ircAvailable?: boolean;
 	eventBus?: EventBus;
 	contextFiles?: ContextFileEntry[];
 	skills?: Skill[];
@@ -623,7 +625,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				: agent.spawns.join(",");
 
 	const lspEnabled = enableLsp ?? true;
-	const ircEnabled = subagentSettings.get("irc.enabled") === true;
+	const ircEnabled = options.ircAvailable === true;
 	const contextFileForPrompt = ircEnabled ? undefined : options.contextFile;
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
 
@@ -1232,7 +1234,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
 
 			const forkContextNotice = options.forkContextSeed
-				? `This subagent was started with a forked snapshot of the parent conversation. Included ${options.forkContextSeed.metadata.includedMessages} message(s), skipped ${options.forkContextSeed.metadata.skippedMessages}, approximately ${options.forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live; use IRC for live coordination when enabled.`
+				? `This subagent was started with a forked snapshot of the parent conversation. Included ${options.forkContextSeed.metadata.includedMessages} message(s), skipped ${options.forkContextSeed.metadata.skippedMessages}, approximately ${options.forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live.${ircEnabled ? " Use IRC for live coordination." : " Rely on the explicit assignment and supplied context for coordination."}`
 				: "";
 
 			const agentSubskillBlock = await buildAgentSubskillInjection({
