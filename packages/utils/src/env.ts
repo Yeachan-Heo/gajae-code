@@ -279,3 +279,14 @@ export function $flag(name: string, def: boolean = false): boolean {
 	// would silently read as false while only `FOO=TRUE`/`FOO=1` worked.
 	return TRUTHY[value.toUpperCase()] === true;
 }
+
+/**
+ * True when any of the given env vars resolves to a truthy flag.
+ *
+ * Use for a canonical name plus legacy aliases so a renamed flag keeps working
+ * under both spellings, e.g. `$flagAny("GJC_HARDWARE_CURSOR", "PI_HARDWARE_CURSOR")`
+ * (mirrors the `GJC_* ?? PI_*` precedence used for directory env vars in `dirs.ts`).
+ */
+export function $flagAny(...names: string[]): boolean {
+	return names.some(name => $flag(name));
+}

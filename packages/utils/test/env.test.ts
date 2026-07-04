@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { $flag, filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
+import { $flag, $flagAny, filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
 
 const tempDirs: string[] = [];
 
@@ -341,5 +341,31 @@ describe("$flag", () => {
 	it("returns the default when the variable is unset", () => {
 		expect($flag(NAME)).toBe(false);
 		expect($flag(NAME, true)).toBe(true);
+	});
+});
+
+describe("$flagAny", () => {
+	const CANON = "__PI_UTILS_FLAGANY_CANON";
+	const LEGACY = "__PI_UTILS_FLAGANY_LEGACY";
+	afterEach(() => {
+		delete process.env[CANON];
+		delete process.env[LEGACY];
+	});
+
+	it("is true when the canonical name is set", () => {
+		process.env[CANON] = "1";
+		expect($flagAny(CANON, LEGACY)).toBe(true);
+	});
+
+	it("falls back to a legacy alias when the canonical name is unset", () => {
+		process.env[LEGACY] = "1";
+		expect($flagAny(CANON, LEGACY)).toBe(true);
+	});
+
+	it("is false when no alias is set or all are falsy", () => {
+		expect($flagAny(CANON, LEGACY)).toBe(false);
+		process.env[CANON] = "0";
+		process.env[LEGACY] = "";
+		expect($flagAny(CANON, LEGACY)).toBe(false);
 	});
 });

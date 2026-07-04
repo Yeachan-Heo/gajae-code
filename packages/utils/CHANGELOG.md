@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `$flagAny(...names)` to resolve a boolean flag from the first matching env var, so a canonical name plus legacy aliases (e.g. `$flagAny("GJC_X", "PI_X")`) both keep working.
+
 ### Fixed
 
 - Deduplicated `globPaths` results so a path is returned at most once even when overlapping glob patterns (e.g. `["**/*.ts", "src/*.ts"]`) both match the same file.

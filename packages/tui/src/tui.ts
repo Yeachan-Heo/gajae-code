@@ -4,7 +4,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import { $flag, getDebugLogPath, logger } from "@gajae-code/utils";
+import { $flag, $flagAny, getDebugLogPath, logger } from "@gajae-code/utils";
 import { getKeybindings } from "./keybindings";
 import { isKeyRelease } from "./keys";
 import { renderMetrics } from "./metrics";
@@ -348,12 +348,12 @@ export class TUI extends Container {
 	#sixelProbeBuffer = "";
 	#sixelProbeTimeout?: NodeJS.Timeout;
 	#sixelProbeUnsubscribe?: () => void;
-	#showHardwareCursor = $flag("PI_HARDWARE_CURSOR");
+	#showHardwareCursor = $flagAny("GJC_HARDWARE_CURSOR", "PI_HARDWARE_CURSOR");
 	// macOS: steady-block cursor anchors CJK IME overlays; disable with GJC_TUI_IME_CURSOR=0.
 	readonly #useImeBlockCursor = $flag("GJC_TUI_IME_CURSOR", process.platform === "darwin");
 	// showHardwareCursor=false but cursor is shown for IME anchoring (macOS).
 	#imeCursorActive = false;
-	#clearOnShrink = $flag("PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
+	#clearOnShrink = $flagAny("GJC_CLEAR_ON_SHRINK", "PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
 	// Opt-in: reuse the previous normalized off-screen prefix and only normalize/diff the
 	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical.
 	#virtualViewport = $flag("PI_TUI_VIRTUAL_VIEWPORT");
@@ -1451,7 +1451,7 @@ export class TUI extends Container {
 		buffer += "\x1b[?2026l";
 		if (!this.#writeTerminal(buffer)) return false;
 
-		if ($flag("PI_DEBUG_REDRAW")) {
+		if ($flagAny("GJC_DEBUG_REDRAW", "PI_DEBUG_REDRAW")) {
 			const logPath = getDebugLogPath();
 			const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (lines=${lines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
 			fs.appendFileSync(logPath, msg);
@@ -1710,7 +1710,7 @@ export class TUI extends Container {
 
 		// Content shrunk below the previous render and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
-		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
+		// Configurable via setClearOnShrink() or GJC_CLEAR_ON_SHRINK=0 env var (PI_ legacy alias honored)
 		if (this.#clearOnShrink && newLines.length < this.#previousLines.length && this.overlayStack.length === 0) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
 			fullRender(true, "clearOnShrink");
@@ -1899,7 +1899,7 @@ export class TUI extends Container {
 		buffer += seq;
 		buffer += "\x1b[?2026l"; // End synchronized output
 
-		if ($flag("PI_TUI_DEBUG")) {
+		if ($flagAny("GJC_TUI_DEBUG", "PI_TUI_DEBUG")) {
 			const debugDir = "/tmp/tui";
 			fs.mkdirSync(debugDir, { recursive: true });
 			const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
