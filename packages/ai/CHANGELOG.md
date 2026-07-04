@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Stopped stale usage-cache snapshots from poisoning Codex/Anthropic credential rotation: reports older than the routing freshness window no longer block or demote credentials, past-reset exhausted windows are ignored for routing, and expired last-good usage reports are retired instead of being resurrected after repeated probe failures.
+
 ## [0.7.9] - 2026-07-01
 
 ### Fixed

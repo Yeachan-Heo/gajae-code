@@ -432,6 +432,12 @@ const USAGE_CACHE_PREFIX = "usage_cache:";
 // data (5h / 7d / monthly limits) is fine being a few minutes stale.
 const USAGE_REPORT_TTL_MS = 5 * 60_000;
 const USAGE_LAST_GOOD_RETENTION_MS = 24 * 60 * 60_000;
+// Routing decisions (block / deprioritize a credential) trust usage evidence only
+// this fresh. The display tolerates staleness up to USAGE_LAST_GOOD_RETENTION_MS, but a
+// stale "exhausted" snapshot (e.g. from a persistently failing /usage probe) must never
+// DEMOTE a credential in selection — otherwise a frozen snapshot sidelines a genuinely
+// healthy account. 3x the report TTL: fresh, with generous margin against TTL jitter.
+const USAGE_ROUTING_MAX_AGE_MS = 15 * 60_000;
 /**
  * Per-credential cool-down after a usage fetch fails. While this window is
  * active we serve the last successful value to avoid dropping the credential
@@ -655,6 +661,11 @@ class AuthStorageUsageCache implements UsageCache {
 		return parseUsageCacheEntry<T>(raw);
 	}
 
+	// NOTE: `durableExpiresAt` row-expiry is advisory only. `cleanup()` (below) has no
+	// caller on the selection/poll paths and `getStale` reads with includeExpired, so
+	// expired rows are never actually deleted by this math. Authority to stop serving a
+	// stale value lives in the READ path (#fetchUsageCached failure branch), gated on
+	// `UsageReport.fetchedAt` age — not here.
 	set<T>(key: string, entry: UsageCacheEntry<T>): void {
 		const payload = JSON.stringify({ value: entry.value, expiresAt: entry.expiresAt });
 		const durableExpiresAt =
@@ -2053,6 +2064,25 @@ export class AuthStorage {
 			// don't write — let the next poll retry.
 			const lastGood = this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
 			if (lastGood !== null) {
+				// Retire last-good that has aged past the retention bound instead of
+				// re-serving it. `cleanup()` has no caller and `getStale` reads with
+				// includeExpired, so durable row-expiry never deletes anything — the
+				// authority to STOP serving a stale value lives here, on fetchedAt age.
+				// Without this, a persistently failing probe re-serves (and via set()
+				// re-extends) a stale "exhausted" snapshot every backoff cycle forever,
+				// poisoning both the /usage display and credential routing.
+				const fetchedAt = lastGood.fetchedAt;
+				const retired =
+					typeof fetchedAt !== "number" ||
+					!Number.isFinite(fetchedAt) ||
+					Date.now() - fetchedAt > USAGE_LAST_GOOD_RETENTION_MS;
+				if (retired) {
+					this.#usageLogger?.debug("Usage last-good retired (age)", {
+						cacheKey,
+						ageMs: typeof fetchedAt === "number" ? Date.now() - fetchedAt : undefined,
+					});
+					return null;
+				}
 				const backoffJitter = USAGE_FAILURE_BACKOFF_MS * (Math.random() * 0.5 - 0.25);
 				const coolDown = Date.now() + USAGE_FAILURE_BACKOFF_MS + backoffJitter;
 				this.#usageCache.set(cacheKey, { value: lastGood, expiresAt: coolDown });
@@ -2254,6 +2284,69 @@ export class AuthStorage {
 		}
 		if (candidates.length === 0) return undefined;
 		return Math.min(...candidates);
+	}
+
+	/** Age of a usage report in ms; undefined when fetchedAt is missing/non-finite (legacy/corrupt cache row). */
+	#usageAgeMs(report: UsageReport, nowMs: number): number | undefined {
+		const fetchedAt = report.fetchedAt;
+		if (typeof fetchedAt !== "number" || !Number.isFinite(fetchedAt)) return undefined;
+		return nowMs - fetchedAt;
+	}
+
+	/**
+	 * True when a usage report is fresh enough to drive ROUTING decisions (block,
+	 * order, or plan-gate a credential). Stale or undated reports are not trusted
+	 * for routing — they still populate the /usage display, but must never demote
+	 * or promote a credential in selection. A future fetchedAt (clock skew) is fresh.
+	 */
+	#isUsageFreshForRouting(report: UsageReport, nowMs: number): boolean {
+		const ageMs = this.#usageAgeMs(report, nowMs);
+		return ageMs !== undefined && ageMs <= USAGE_ROUTING_MAX_AGE_MS;
+	}
+
+	#usageForRouting(report: UsageReport | null | undefined, nowMs: number): UsageReport | undefined {
+		if (!report || !this.#isUsageFreshForRouting(report, nowMs)) return undefined;
+		return report;
+	}
+
+	#isUsageLimitAuthoritativeForRouting(limit: UsageLimit | undefined, nowMs: number): limit is UsageLimit {
+		if (!limit) return false;
+		if (!this.#isUsageLimitExhausted(limit)) return true;
+		const resetsAt = limit.window?.resetsAt;
+		return !(typeof resetsAt === "number" && Number.isFinite(resetsAt) && resetsAt <= nowMs);
+	}
+
+	#hasOpenAICodexProPlanForRouting(report: UsageReport | null | undefined, nowMs: number): boolean {
+		return this.#usageForRouting(report, nowMs) !== undefined && hasOpenAICodexProPlan(report ?? null);
+	}
+
+	/**
+	 * Routing-authoritative variant of #isUsageLimitReached. An exhausted limit whose
+	 * window has already reset (`resetsAt <= nowMs`) is skipped: either the window rolled
+	 * over or the provider reported a past/garbage reset, so the exhaustion claim is not
+	 * current and must not block selection. An exhausted limit with a future reset, or
+	 * with no resetsAt at all (a fresh hard cap), still counts.
+	 */
+	#isUsageLimitReachedForRouting(report: UsageReport, nowMs: number): boolean {
+		return report.limits.some(
+			limit => this.#isUsageLimitExhausted(limit) && this.#isUsageLimitAuthoritativeForRouting(limit, nowMs),
+		);
+	}
+
+	/** durationMs of the exhausted limit with the earliest future reset — the window the block-extension clamp anchors to. */
+	#exhaustedWindowDurationMs(report: UsageReport, nowMs: number): number | undefined {
+		let bestReset: number | undefined;
+		let bestDuration: number | undefined;
+		for (const limit of report.limits) {
+			if (!this.#isUsageLimitExhausted(limit)) continue;
+			const resetsAt = limit.window?.resetsAt;
+			if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt) || resetsAt <= nowMs) continue;
+			if (bestReset === undefined || resetsAt < bestReset) {
+				bestReset = resetsAt;
+				bestDuration = limit.window?.durationMs;
+			}
+		}
+		return typeof bestDuration === "number" && Number.isFinite(bestDuration) ? bestDuration : undefined;
 	}
 
 	async #getUsageReport(
@@ -2508,12 +2601,31 @@ export class AuthStorage {
 		if (sessionCredential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
 			const credential = this.#getCredentialsForProvider(provider)[sessionCredential.index];
 			if (credential?.type === "oauth") {
+				const nowForExtension = Date.now();
 				const report = await this.#getUsageReport(provider, credential, options);
-				if (report && this.#isUsageLimitReached(report)) {
-					const resetAtMs = this.#getUsageResetAtMs(report, Date.now());
+				// Only let the usage report EXTEND the reactive block when it is fresh
+				// enough to trust for routing AND still reports the limit reached with a
+				// current (future) reset. A stale or past-reset report must not stretch a
+				// retry-after/default block into a multi-hour park on a credential that has
+				// actually recovered; the provider retry-after (folded into the base above)
+				// stays the floor. Clamp any extension to at most one full window from now
+				// so a far-future reset can't over-park either.
+				if (
+					report &&
+					this.#isUsageFreshForRouting(report, nowForExtension) &&
+					this.#isUsageLimitReachedForRouting(report, nowForExtension)
+				) {
+					const resetAtMs = this.#getUsageResetAtMs(report, nowForExtension);
 					if (resetAtMs && resetAtMs > blockedUntil) {
-						blockedUntil = resetAtMs;
+						const windowDurationMs = this.#exhaustedWindowDurationMs(report, nowForExtension);
+						const cap = nowForExtension + (windowDurationMs ?? USAGE_ROUTING_MAX_AGE_MS);
+						blockedUntil = Math.min(resetAtMs, cap);
 					}
+				} else if (report && !this.#isUsageFreshForRouting(report, nowForExtension)) {
+					this.#usageLogger?.debug("Block extension rejected: stale usage", {
+						provider,
+						ageMs: this.#usageAgeMs(report, nowForExtension),
+					});
 				}
 			}
 		}
@@ -2590,6 +2702,7 @@ export class AuthStorage {
 			selection: { credential: OAuthCredential; index: number };
 			usage: UsageReport | null;
 			usageChecked: boolean;
+			routingUsage?: UsageReport;
 			blocked: boolean;
 			blockedUntil?: number;
 			hasPriorityBoost: boolean;
@@ -2642,20 +2755,38 @@ export class AuthStorage {
 			const { selection, usage, usageChecked } = result;
 			let { blockedUntil } = result;
 			let blocked = blockedUntil !== undefined;
-			if (!blocked && usage && this.#isUsageLimitReached(usage)) {
-				const resetAtMs = this.#getUsageResetAtMs(usage, nowMs);
+			const usageForRouting = this.#usageForRouting(usage, nowMs);
+			if (!blocked && usageForRouting && this.#isUsageLimitReachedForRouting(usageForRouting, nowMs)) {
+				const resetAtMs = this.#getUsageResetAtMs(usageForRouting, nowMs);
 				blockedUntil = resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs;
 				this.#markCredentialBlocked(args.providerKey, selection.index, blockedUntil);
 				blocked = true;
+			} else if (!blocked && usage && !usageForRouting && this.#isUsageLimitReached(usage)) {
+				this.#usageLogger?.debug("Routing ignored stale usage", {
+					provider: args.provider,
+					ageMs: this.#usageAgeMs(usage, nowMs),
+					maxAgeMs: USAGE_ROUTING_MAX_AGE_MS,
+					decision: "not-blocked",
+				});
 			}
-			const windows = usage ? strategy.findWindowLimits(usage) : undefined;
-			const primary = windows?.primary;
-			const secondary = windows?.secondary;
+			// Ordering inputs only trust routing-authoritative usage; a stale snapshot
+			// or past-reset exhausted window degrades to the unknown path (undefined
+			// windows) so frozen quota data never ranks a healthy account last/first.
+			const windows = usageForRouting ? strategy.findWindowLimits(usageForRouting) : undefined;
+			const primaryCandidate = windows?.primary;
+			const secondaryCandidate = windows?.secondary;
+			const primary = this.#isUsageLimitAuthoritativeForRouting(primaryCandidate, nowMs)
+				? primaryCandidate
+				: undefined;
+			const secondary = this.#isUsageLimitAuthoritativeForRouting(secondaryCandidate, nowMs)
+				? secondaryCandidate
+				: undefined;
 			const secondaryTarget = secondary ?? primary;
 			ranked.push({
 				selection,
 				usage,
 				usageChecked,
+				routingUsage: usageForRouting,
 				blocked,
 				blockedUntil,
 				hasPriorityBoost: strategy.hasPriorityBoost?.(primary) ?? false,
@@ -2683,8 +2814,8 @@ export class AuthStorage {
 				return left.orderPos - right.orderPos;
 			}
 			if (requiresOpenAICodexProModel(args.provider, args.options?.modelId)) {
-				const leftPlanPriority = getOpenAICodexPlanPriority(left.usage);
-				const rightPlanPriority = getOpenAICodexPlanPriority(right.usage);
+				const leftPlanPriority = getOpenAICodexPlanPriority(left.routingUsage ?? null);
+				const rightPlanPriority = getOpenAICodexPlanPriority(right.routingUsage ?? null);
 				if (leftPlanPriority !== rightPlanPriority) return leftPlanPriority - rightPlanPriority;
 			}
 			if (left.hasPriorityBoost !== right.hasPriorityBoost) return left.hasPriorityBoost ? -1 : 1;
@@ -2788,8 +2919,10 @@ export class AuthStorage {
 
 		// Skip the Pro-plan filter when no candidate is confirmed Pro, so users with only
 		// non-Pro accounts can still attempt Spark requests (e.g. trial/grandfathered access).
+		const proRequirementNow = Date.now();
 		const enforceProRequirement =
-			requiresProModel && candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
+			requiresProModel &&
+			candidates.some(candidate => this.#hasOpenAICodexProPlanForRouting(candidate.usage, proRequirementNow));
 
 		const fallback = candidates[0];
 
@@ -2969,10 +3102,16 @@ export class AuthStorage {
 				});
 				usageChecked = true;
 			}
-			if (applyProFilter && !hasOpenAICodexProPlan(usage)) {
+			if (applyProFilter && !this.#hasOpenAICodexProPlanForRouting(usage, Date.now())) {
 				return undefined;
 			}
-			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
+			if (
+				checkUsage &&
+				!allowBlocked &&
+				usage &&
+				this.#isUsageFreshForRouting(usage, Date.now()) &&
+				this.#isUsageLimitReachedForRouting(usage, Date.now())
+			) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
 				this.#markCredentialBlocked(
 					providerKey,
@@ -3035,10 +3174,16 @@ export class AuthStorage {
 					});
 					usageChecked = true;
 				}
-				if (applyProFilter && !hasOpenAICodexProPlan(usage)) {
+				if (applyProFilter && !this.#hasOpenAICodexProPlanForRouting(usage, Date.now())) {
 					return undefined;
 				}
-				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
+				if (
+					checkUsage &&
+					!allowBlocked &&
+					usage &&
+					this.#isUsageFreshForRouting(usage, Date.now()) &&
+					this.#isUsageLimitReachedForRouting(usage, Date.now())
+				) {
 					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
 					this.#markCredentialBlocked(
 						providerKey,
