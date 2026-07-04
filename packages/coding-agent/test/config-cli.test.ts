@@ -127,4 +127,46 @@ describe("config CLI schema coverage", () => {
 			value: 600,
 		});
 	});
+	it("redacts secret settings in config output unless explicitly requested", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const token = "1234567890:super-secret-telegram-token";
+
+		await runConfigCommand({
+			action: "set",
+			key: "notifications.telegram.botToken",
+			value: token,
+			flags: { json: true },
+		});
+		await runConfigCommand({ action: "get", key: "notifications.telegram.botToken", flags: { json: true } });
+		await runConfigCommand({ action: "list", flags: { json: true } });
+		await runConfigCommand({
+			action: "get",
+			key: "notifications.telegram.botToken",
+			flags: { json: true, showSecrets: true },
+		});
+
+		const setPayload = JSON.parse(String(logSpy.mock.calls.at(-4)?.[0])) as { value: unknown };
+		const getPayload = JSON.parse(String(logSpy.mock.calls.at(-3)?.[0])) as { value: unknown };
+		const listPayload = JSON.parse(String(logSpy.mock.calls.at(-2)?.[0])) as Record<string, { value: unknown }>;
+		const unsafeGetPayload = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as { value: unknown };
+
+		expect(setPayload.value).toBe("<redacted>");
+		expect(getPayload.value).toBe("<redacted>");
+		expect(listPayload["notifications.telegram.botToken"].value).toBe("<redacted>");
+		expect(unsafeGetPayload.value).toBe(token);
+	});
+
+	it("does not redact non-secret settings that mention tokens", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await runConfigCommand({ action: "set", key: "display.showTokenUsage", value: "true", flags: { json: true } });
+		await runConfigCommand({ action: "get", key: "display.showTokenUsage", flags: { json: true } });
+
+		const payload = logSpy.mock.calls.at(-1)?.[0];
+		expect(typeof payload).toBe("string");
+		expect(JSON.parse(String(payload))).toMatchObject({
+			key: "display.showTokenUsage",
+			value: true,
+		});
+	});
 });

@@ -1,8 +1,9 @@
 # Changelog
 
 ## [Unreleased]
-
 ### Fixed
+
+- `gjc config list/get/set` now redacts secret-like setting values by default, while preserving an explicit `--show-secrets` opt-in for raw local inspection.
 
 - Goal completion now preserves the terminal `goal({op: "complete"})` state even when a `goal_updated` extension hook throws, preventing hook-side write errors from trapping a verified ultragoal run in the continuation loop.
 - Ultragoal completion no longer requires the computer-use red-team suite for non-computer changes that only touch the shared `tools/index.ts` registration file.
