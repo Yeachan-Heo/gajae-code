@@ -205,6 +205,7 @@ export class ExtensionRunner {
 		private readonly cwd: string,
 		private readonly sessionManager: SessionManager,
 		private readonly modelRegistry: ModelRegistry,
+		private readonly sessionMetadata?: ExtensionContext["sessionMetadata"],
 	) {
 		this.#uiContext = noOpUIContext;
 	}
@@ -458,6 +459,7 @@ export class ExtensionRunner {
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
+			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
 			get model() {
 				return getModel();

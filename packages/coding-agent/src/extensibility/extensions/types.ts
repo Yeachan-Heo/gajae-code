@@ -285,6 +285,13 @@ export interface CompactOptions {
 	onError?: (error: Error) => void;
 }
 
+export interface ExtensionSessionMetadata {
+	kind: "main" | "sub";
+	taskDepth: number;
+	parentTaskPrefix?: string;
+	currentAgentType?: string;
+}
+
 /**
  * Context passed to extension event handlers.
  */
@@ -306,6 +313,8 @@ export interface ExtensionContext {
 	cwd: string;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
+	/** Session classification supplied by the SDK for extension policy decisions. */
+	sessionMetadata?: ExtensionSessionMetadata;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
 	/** Current model (may be undefined) */

@@ -1214,8 +1214,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
-	const resolvedAgentDisplayName =
-		options.agentDisplayName ?? ((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? "sub" : "main");
+	const isSubSession = taskDepth > 0 || Boolean(options.parentTaskPrefix) || Boolean(options.currentAgentType);
+	const resolvedAgentDisplayName = options.agentDisplayName ?? (isSubSession ? "sub" : "main");
 	const evalKernelOwnerId = `agent-session:${Snowflake.next()}`;
 
 	try {
@@ -1530,6 +1530,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cfg: notificationCfg,
 				taskDepth,
 				parentTaskPrefix: options.parentTaskPrefix,
+				currentAgentType: options.currentAgentType,
 			})
 		) {
 			inlineExtensions.push(api => createNotificationsExtension(api, { settings }));
@@ -1639,6 +1640,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cwd,
 				sessionManager,
 				modelRegistry,
+				{
+					kind: isSubSession ? "sub" : "main",
+					taskDepth,
+					...(options.parentTaskPrefix ? { parentTaskPrefix: options.parentTaskPrefix } : {}),
+					...(options.currentAgentType ? { currentAgentType: options.currentAgentType } : {}),
+				},
 			);
 		}
 
@@ -1931,7 +1938,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		agentRegistry.register({
 			id: resolvedAgentId,
 			displayName: resolvedAgentDisplayName,
-			kind: (options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? "sub" : "main",
+			kind: isSubSession ? "sub" : "main",
 			parentId: options.parentTaskPrefix,
 			session: null,
 			sessionFile: sessionManager.getSessionFile() ?? null,

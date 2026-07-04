@@ -56,8 +56,10 @@ export function shouldRegisterNotificationsExtension(input: {
 	taskDepth?: number;
 	/** Parent subagent id/prefix; present for helper/subagent sessions even when depth is omitted. */
 	parentTaskPrefix?: string;
+	/** Role-agent type/name; present for task sessions even if depth metadata is lost. */
+	currentAgentType?: string;
 }): boolean {
-	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix) return false;
+	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix || input.currentAgentType) return false;
 	if (input.env.GJC_NOTIFICATIONS === "0") return false;
 	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
 	return input.cfg ? isGloballyConfigured(input.cfg) : false;

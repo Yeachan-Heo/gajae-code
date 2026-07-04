@@ -531,10 +531,14 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		return isSessionNotificationsEnabled({ cfg, env: process.env, sessionDisabled: disabledSessions.has(id) });
 	}
 
+	function isNotificationEligibleContext(ctx: ExtensionContext): boolean {
+		return ctx.sessionMetadata?.kind !== "sub";
+	}
+
 	async function startSession(ctx: ExtensionContext): Promise<"started" | "already" | "disabled" | "failed"> {
 		const id = sessionId(ctx);
 		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
-		if (!isEnabledForSession(id, cfg)) return "disabled";
+		if (!isNotificationEligibleContext(ctx) || !isEnabledForSession(id, cfg)) return "disabled";
 		if (runtimes.has(id)) return "already";
 
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
@@ -783,6 +787,10 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 			}
 
 			if (command === "on") {
+				if (!isNotificationEligibleContext(ctx)) {
+					ctx.ui.notify("Notifications are disabled for subagent sessions.", "warning");
+					return;
+				}
 				if (process.env.GJC_NOTIFICATIONS === "0") {
 					ctx.ui.notify(
 						"Notifications remain disabled: GJC_NOTIFICATIONS=0 is an authoritative opt-out.",

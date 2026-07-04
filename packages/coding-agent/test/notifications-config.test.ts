@@ -16,6 +16,7 @@ import {
 	shouldRegisterNotificationsExtension,
 	tokenFingerprint,
 } from "../src/notifications/config";
+import { createNotificationsExtension } from "../src/notifications/index";
 import { createAgentSession } from "../src/sdk";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -174,6 +175,13 @@ describe("notifications config", () => {
 				parentTaskPrefix: "0-Sub",
 			}),
 		).toBe(false);
+		expect(
+			shouldRegisterNotificationsExtension({
+				cfg: GLOBAL_CFG,
+				env: { GJC_NOTIFICATIONS: "1" },
+				currentAgentType: "executor",
+			}),
+		).toBe(false);
 	});
 	test("settings-enabled subagent sessions do not register the notifications extension", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-subagent-"));
@@ -242,9 +250,45 @@ describe("notifications config", () => {
 				parentTaskPrefix: "0-Sub",
 			});
 			disposers.push(() => parentPrefixSubagent.session.dispose());
+			const agentTypeOnlySubagent = await createAgentSession({
+				cwd,
+				agentDir: cwd,
+				sessionManager: SessionManager.inMemory(cwd),
+				settings,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				currentAgentType: "executor",
+			});
+			disposers.push(() => agentTypeOnlySubagent.session.dispose());
+			const explicitExtensionSubagent = await createAgentSession({
+				cwd,
+				agentDir: cwd,
+				sessionManager: SessionManager.inMemory(cwd),
+				settings,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				extensions: [api => createNotificationsExtension(api, { settings })],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				taskDepth: 1,
+			});
+			disposers.push(() => explicitExtensionSubagent.session.dispose());
 			await topLevel.session.extensionRunner?.emit({ type: "session_start" });
 			await subagent.session.extensionRunner?.emit({ type: "session_start" });
 			await parentPrefixSubagent.session.extensionRunner?.emit({ type: "session_start" });
+			await agentTypeOnlySubagent.session.extensionRunner?.emit({ type: "session_start" });
+			await explicitExtensionSubagent.session.extensionRunner?.emit({ type: "session_start" });
 			const topLevelEndpoint = path.join(
 				cwd,
 				".gjc",
@@ -266,9 +310,25 @@ describe("notifications config", () => {
 				"notifications",
 				`${parentPrefixSubagent.session.sessionId}.json`,
 			);
+			const agentTypeOnlySubagentEndpoint = path.join(
+				cwd,
+				".gjc",
+				"state",
+				"notifications",
+				`${agentTypeOnlySubagent.session.sessionId}.json`,
+			);
+			const explicitExtensionSubagentEndpoint = path.join(
+				cwd,
+				".gjc",
+				"state",
+				"notifications",
+				`${explicitExtensionSubagent.session.sessionId}.json`,
+			);
 			expect(fs.existsSync(topLevelEndpoint)).toBe(true);
 			expect(fs.existsSync(subagentEndpoint)).toBe(false);
 			expect(fs.existsSync(parentPrefixSubagentEndpoint)).toBe(false);
+			expect(fs.existsSync(agentTypeOnlySubagentEndpoint)).toBe(false);
+			expect(fs.existsSync(explicitExtensionSubagentEndpoint)).toBe(false);
 		} finally {
 			await Promise.all(disposers.reverse().map(dispose => dispose()));
 			if (previous === undefined) {
@@ -278,7 +338,7 @@ describe("notifications config", () => {
 			}
 			resetSettingsForTest();
 		}
-	});
+	}, 30000);
 
 	test("maskToken handles unset tokens and never reveals the raw token", () => {
 		expect(maskToken(undefined)).toBe("(unset)");
