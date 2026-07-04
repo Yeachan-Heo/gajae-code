@@ -954,6 +954,11 @@ export async function runRootCommand(
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
+	// The CLI product surface owns the MCP runtime: autoload servers from
+	// user/project mcp.json connect at session startup. The ACP factory below
+	// forces this off (the ACP client owns MCP), and subagent sessions inherit
+	// the parent's manager instead of discovering their own.
+	sessionOptions.enableMCP = true;
 	sessionOptions.settings = settingsInstance;
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
 

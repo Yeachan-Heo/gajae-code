@@ -57,6 +57,10 @@
 
 - Skills can now be invoked inline within a prompt (for example, mid-message `/skill:*` references) instead of only as a standalone prompt, with matching autocomplete, input-controller queueing, and ACP dispatch support.
 
+### Added
+
+- GJC restores an opt-in MCP runtime for user- and project-scoped servers, gated behind a new `enableMCP` session option that only the CLI turns on while embedders, ACP, and subagents stay off. Top-level sessions always own an `MCPManager` so `/mcp` reload/connect work even with zero connected servers, autoload-eligible servers connect at session startup, and `mcp.discoveryMode` is the sole switch for MCP discovery — kept deliberately independent of `tools.discoveryMode`, which now defaults to `"all"`. MCP discovery is source-aware per tool: `gjc-plugins` provider tools are always-on, while user-config server tools stay selectable behind `search_tool_bm25` until explicitly activated.
+
 ### Fixed
 
 - The Telegram notification daemon now tombstones a session endpoint generation after `session_closed`, preventing the scan loop from reconnecting to the still-live old endpoint and recreating an empty topic immediately after deleting the original topic.
