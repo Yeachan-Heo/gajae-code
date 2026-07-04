@@ -125,6 +125,36 @@ function isSelectableMCPBridgeTool(tool: {
 	return isMCPBridgeTool(tool) && tool.mcpSourceProvider !== "gjc-plugins" && tool.mcpDiscoveryScope !== "always-on";
 }
 
+/**
+ * Server names whose MCP `instructions` may be surfaced in the system prompt.
+ *
+ * A server is eligible only when it owns at least one bridge tool that is
+ * either always-on (gjc-plugins bundle or scope "always-on") or currently
+ * active/selected. This mirrors the tool gating in isSelectableMCPBridgeTool:
+ * server-controlled instructions must not reach the prompt before the user
+ * opts into that server's tool surface (prompt-injection / quarantine bypass).
+ */
+export function collectMCPInstructionEligibleServerNames(
+	tools: Iterable<{
+		name: string;
+		mcpServerName?: unknown;
+		mcpToolName?: unknown;
+		mcpSourceProvider?: unknown;
+		mcpDiscoveryScope?: unknown;
+	}>,
+	activeToolNames: ReadonlySet<string>,
+): Set<string> {
+	const eligible = new Set<string>();
+	for (const tool of tools) {
+		if (!isMCPBridgeTool(tool)) continue;
+		const alwaysOn = tool.mcpSourceProvider === "gjc-plugins" || tool.mcpDiscoveryScope === "always-on";
+		if (alwaysOn || activeToolNames.has(tool.name)) {
+			eligible.add(tool.mcpServerName as string);
+		}
+	}
+	return eligible;
+}
+
 function getSchemaPropertyKeys(parameters: unknown): string[] {
 	if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) return [];
 	const properties = (parameters as { properties?: unknown }).properties;
