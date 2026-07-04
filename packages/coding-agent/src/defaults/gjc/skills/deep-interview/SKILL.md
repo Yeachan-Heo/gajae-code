@@ -1,7 +1,7 @@
 ---
 name: deep-interview
 description: Socratic deep interview with mathematical ambiguity gating before explicit execution approval
-argument-hint: "[--quick|--standard|--deep] <idea or vague description>"
+argument-hint: "[--trace] [--quick|--standard|--deep] <idea or vague description>"
 pipeline: [deep-interview, plan]
 handoff-policy: approval-required
 handoff: .gjc/_session-{sessionid}/specs/deep-interview-{slug}.md
@@ -22,6 +22,7 @@ Deep Interview implements Ouroboros-inspired Socratic questioning with mathemati
 - Task is complex enough that jumping to code would waste cycles on scope discovery
 - User wants mathematically-validated clarity before committing to execution
 - User explicitly requests deep-interview even after being told the request is already clear, bounded, and low-risk
+- User requests a trace/research pre-step before the interview, e.g. `/skill:deep-interview --trace <idea>`
 </Use_When>
 
 <Do_Not_Use_When>
@@ -62,6 +63,7 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 - Refine free-text answers into a structured interpretation and confirm nothing is lost before scoring
 - After 3 consecutive agent-resolved answers (accepted auto-research candidates or auto-answers), route the next question to the user (dialectic rhythm guard)
 - Run an independent closure audit and a one-sentence goal restatement, each requiring explicit user confirmation, before crystallizing the spec
+- When `--trace` is active, use the bounded trace evidence summary as pre-question context; never dump raw logs, raw files, or unbounded search output into questions, scoring, specs, or handoffs
 </Execution_Policy>
 
 <Internal_Auto_Mode_Protocol>
@@ -133,6 +135,16 @@ If `{{ARGUMENTS}}` is already clear, bounded, low-risk, and asks for a quick fix
 
 This gate exists to prevent deep-interview from making easy problems harder. A small verification need does not make a request interview-worthy.
 
+## Phase 0.75: Optional Trace Pre-Step
+
+Run this phase only when the active deep-interview state or invocation indicates `--trace` / `state.trace.enabled === true`. It is a pre-interview research step, not an implementation phase.
+
+1. Read the native trace summary from active deep-interview state (`trace`, `state.trace`, or `state.trace_summary`). The native seed must have produced this summary before any interview question.
+2. Treat the summary as compact evidence: project hints, relevant paths, and path-level findings only. Do not expand it by dumping raw files, raw logs, or unbounded command output.
+3. Store or preserve it under `state.trace_summary` and fold it into `codebase_context` with citations to the summarized paths.
+4. Use trace findings to influence Round 0 topology, Phase 2 question targeting, requirement wording, acceptance criteria, and final Technical Context. Normal no-trace interviews must behave exactly as before.
+5. If `--trace` was requested but no valid bounded summary exists, increment `architect_failures` or record an internal audit note, then continue with the normal no-trace path without surfacing tool noise.
+
 ## Phase 1: Initialize
 
 1. **Parse the user's idea** from `{{ARGUMENTS}}`
@@ -177,6 +189,7 @@ This gate exists to prevent deep-interview from making easy problems harder. A s
     "threshold": <resolvedThreshold>,
     "threshold_source": "<resolvedThresholdSource>",
     "language": "<existing language object from active state, if present>",
+    "trace_summary": "<bounded trace summary when --trace is active, else null>",
     "codebase_context": null,
     "topology": {
       "status": "pending|confirmed|legacy_missing",
@@ -222,6 +235,7 @@ Run this gate exactly once after Phase 1 initialization and before any Phase 2 a
    - Extract top-level verbs/nouns, workstreams, surfaces, integrations, or deliverables that can succeed or fail independently.
    - Prefer 1-6 components. If more than 6 candidates appear, group siblings at the highest useful level and note the grouping rationale.
    - Do not treat implementation tasks, fields, or sub-features as top-level components unless the user framed them as independent outcomes.
+   - When `--trace` is active, include trace-summarized paths as topology evidence, but do not add implementation sub-tasks as top-level components solely because trace found files.
 2. **Ask one confirmation question** before Round 1:
 
 ```
@@ -289,6 +303,7 @@ Build the question generation prompt with:
 - Current clarity scores per dimension (which is weakest?)
 - Lateral-review panel findings (if convened this round -- see Phase 3)
 - Brownfield codebase context (if applicable), summarized to cited paths/symbols/patterns instead of raw dumps
+- Bounded trace summary (when `--trace` is active): project hints, relevant paths, and findings only; cite paths instead of raw content
 - Locked topology from Round 0, including active components, deferred components, prior per-component scores, and `last_targeted_component_id`
 
 - `language` from active state when present; apply `language.instruction` to all natural-language user-facing question text, rationale, and options
@@ -395,6 +410,9 @@ Locked topology:
 
 Established facts:
 {state.established_facts}
+
+Trace summary:
+{state.trace_summary if --trace was active, else "not requested"}
 
 Score each active component on each dimension, then provide the overall dimension scores as the minimum or coverage-weighted weakest score across active components. Deferred components are excluded from ambiguity math but must remain listed in topology and the final spec.
 
@@ -615,8 +633,8 @@ Spec structure:
 | {assumption} | {how it was questioned} | {what was decided} |
 
 ## Technical Context
-{brownfield: relevant codebase findings from focused repo inspection or canonical role-agent fact-finding}
-{greenfield: technology choices and constraints}
+{brownfield: relevant codebase findings from focused repo inspection, canonical role-agent fact-finding, and bounded trace summary when --trace was active}
+{greenfield: technology choices and constraints, plus bounded trace findings when --trace was active and relevant}
 
 ## Ontology (Key Entities)
 {Fill from the FINAL round's ontology extraction, not just crystallization-time generation}

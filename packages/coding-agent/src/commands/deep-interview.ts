@@ -8,6 +8,7 @@ export default class DeepInterview extends Command {
 		quick: Flags.boolean({ description: "Seed a quick deep-interview run" }),
 		standard: Flags.boolean({ description: "Seed a standard deep-interview run" }),
 		deep: Flags.boolean({ description: "Seed a deep deep-interview run" }),
+		trace: Flags.boolean({ description: "Run a bounded trace evidence pre-step before interview questions" }),
 		threshold: Flags.string({ description: "Override ambiguity threshold for kickoff" }),
 		"threshold-source": Flags.string({ description: "Describe the threshold override source" }),
 		"session-id": Flags.string({
@@ -25,7 +26,7 @@ export default class DeepInterview extends Command {
 		json: Flags.boolean({ description: "Output JSON" }),
 	};
 	static examples = [
-		'$ gjc deep-interview --standard "<idea>"',
+		'$ gjc deep-interview --trace --standard "<idea>"',
 		"$ gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md",
 		"$ gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md --deliberate",
 	];

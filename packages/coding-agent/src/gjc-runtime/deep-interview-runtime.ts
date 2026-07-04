@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { YAML } from "bun";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -19,7 +20,7 @@ export * from "./deep-interview-recorder";
  *
  * The CLI itself does not run the Socratic interview; that lives inside the `/skill:deep-interview`
  * skill executed by the agent. This handler validates the documented argument-hint surface
- * (`[--quick|--standard|--deep] <idea>`), seeds `.gjc/state/deep-interview-state.json`, and
+ * (`[--trace] [--quick|--standard|--deep] <idea>`), seeds `.gjc/state/deep-interview-state.json`, and
  * updates the shared HUD rail via `syncSkillActiveState` so the active interview is visible to
  * the TUI.
  */
@@ -39,6 +40,68 @@ const RESOLUTION_THRESHOLDS = {
 	standard: 0.5,
 	deep: 0.35,
 } as const;
+
+const TRACE_MAX_RELEVANT_PATHS = 12;
+const TRACE_MAX_PACKAGE_HINTS = 8;
+const TRACE_MAX_DIRECTORY_VISITS = 1200;
+const TRACE_MAX_ENTRY_VISITS = 5000;
+const TRACE_MAX_PENDING_DIRECTORIES = 1200;
+const TRACE_SKIP_DIRS = new Set([
+	".git",
+	".gjc",
+	"node_modules",
+	"dist",
+	"build",
+	"coverage",
+	".next",
+	".turbo",
+	".cache",
+	"vendor",
+	"target",
+	".venv",
+	"venv",
+	"__pycache__",
+	".pytest_cache",
+	"tmp",
+	"temp",
+	"logs",
+	"out",
+]);
+const TRACE_SOURCE_EXTENSIONS = new Set([
+	".ts",
+	".tsx",
+	".js",
+	".jsx",
+	".mts",
+	".cts",
+	".py",
+	".rs",
+	".go",
+	".java",
+	".kt",
+	".swift",
+	".md",
+	".json",
+	".yml",
+	".yaml",
+]);
+
+interface DeepInterviewTraceSummary {
+	enabled: true;
+	generated_at: string;
+	bounded: true;
+	limits: {
+		max_relevant_paths: number;
+		max_package_hints: number;
+		max_directory_visits: number;
+		max_entry_visits: number;
+		max_pending_directories: number;
+	};
+	idea_terms: string[];
+	project_hints: string[];
+	relevant_paths: Array<{ path: string; reason: string }>;
+	findings: string[];
+}
 
 type DeepInterviewResolution = keyof typeof RESOLUTION_THRESHOLDS;
 
@@ -107,6 +170,136 @@ async function resolveSpecContent(rawSpec: string, cwd: string): Promise<string>
 	return rawSpec;
 }
 
+function traceTerms(idea: string): string[] {
+	const terms = new Set<string>();
+	for (const match of idea.toLowerCase().matchAll(/[a-z0-9][a-z0-9_-]{2,}/g)) {
+		const value = match[0];
+		if (["the", "and", "for", "with", "that", "this", "from", "into", "should", "would"].includes(value)) continue;
+		terms.add(value);
+		if (terms.size >= 12) break;
+	}
+	return [...terms];
+}
+
+function relativePathReason(relativePath: string, terms: readonly string[]): string | undefined {
+	const normalized = relativePath.toLowerCase();
+	const matched = terms.find(term => normalized.includes(term));
+	if (matched) return `path matches idea term "${matched}"`;
+	if (/deep[-_]?interview/i.test(relativePath)) return "path matches deep-interview workflow surface";
+	if (/skill|workflow|runtime|state/i.test(relativePath)) return "path matches workflow/runtime surface";
+	return undefined;
+}
+
+async function readPackageHints(cwd: string): Promise<string[]> {
+	const packagePath = path.join(cwd, "package.json");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await fs.readFile(packagePath, "utf-8"));
+	} catch {
+		return [];
+	}
+	const manifest = parsed as {
+		name?: unknown;
+		workspaces?: unknown;
+		scripts?: Record<string, unknown>;
+		dependencies?: Record<string, unknown>;
+		devDependencies?: Record<string, unknown>;
+	};
+	const hints: string[] = [];
+	if (typeof manifest.name === "string") hints.push(`package: ${manifest.name}`);
+	if (manifest.workspaces) hints.push("workspace: package.json declares workspaces");
+	const scripts = Object.keys(manifest.scripts ?? {}).slice(0, TRACE_MAX_PACKAGE_HINTS);
+	if (scripts.length > 0) hints.push(`scripts: ${scripts.join(", ")}`);
+	const deps = [...Object.keys(manifest.dependencies ?? {}), ...Object.keys(manifest.devDependencies ?? {})]
+		.filter(name => /typescript|bun|react|vite|zod|winston|commander|oclif/i.test(name))
+		.slice(0, TRACE_MAX_PACKAGE_HINTS);
+	if (deps.length > 0) hints.push(`notable dependencies: ${deps.join(", ")}`);
+	return hints.slice(0, TRACE_MAX_PACKAGE_HINTS);
+}
+
+async function collectRelevantTracePaths(
+	cwd: string,
+	terms: readonly string[],
+): Promise<Array<{ path: string; reason: string }>> {
+	const results: Array<{ path: string; reason: string; score: number }> = [];
+	const pending: Array<{ absolutePath: string; depth: number }> = [{ absolutePath: cwd, depth: 0 }];
+	let visitedDirectories = 0;
+	let visitedEntries = 0;
+	while (
+		pending.length > 0 &&
+		visitedDirectories < TRACE_MAX_DIRECTORY_VISITS &&
+		visitedEntries < TRACE_MAX_ENTRY_VISITS
+	) {
+		const current = pending.shift();
+		if (!current) break;
+		visitedDirectories += 1;
+		try {
+			const directory = await fs.opendir(current.absolutePath);
+			for await (const entry of directory) {
+				visitedEntries += 1;
+				if (visitedEntries > TRACE_MAX_ENTRY_VISITS) break;
+				if (TRACE_SKIP_DIRS.has(entry.name)) continue;
+				const absolutePath = path.join(current.absolutePath, entry.name);
+				const relativePath = path.relative(cwd, absolutePath).split(path.sep).join("/");
+				if (entry.isDirectory()) {
+					if (current.depth < 6 && pending.length < TRACE_MAX_PENDING_DIRECTORIES) {
+						pending.push({ absolutePath, depth: current.depth + 1 });
+					}
+					continue;
+				}
+				if (!entry.isFile() || !TRACE_SOURCE_EXTENSIONS.has(path.extname(entry.name))) continue;
+				const reason = relativePathReason(relativePath, terms);
+				if (!reason) continue;
+				const termScore = terms.reduce(
+					(score, term) => score + (relativePath.toLowerCase().includes(term) ? 2 : 0),
+					0,
+				);
+				const surfaceScore = /deep[-_]?interview|skill|workflow|runtime|state/i.test(relativePath) ? 1 : 0;
+				results.push({ path: relativePath, reason, score: termScore + surfaceScore });
+			}
+		} catch {
+			continue;
+		}
+	}
+	return results
+		.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+		.slice(0, TRACE_MAX_RELEVANT_PATHS)
+		.map(({ path: relativePath, reason }) => ({ path: relativePath, reason }));
+}
+
+async function buildDeepInterviewTraceSummary(cwd: string, idea: string): Promise<DeepInterviewTraceSummary> {
+	const terms = traceTerms(idea);
+	const [projectHints, relevantPaths] = await Promise.all([
+		readPackageHints(cwd),
+		collectRelevantTracePaths(cwd, terms),
+	]);
+	const findings = [
+		projectHints.length > 0
+			? "Project manifest was summarized into bounded package/script/dependency hints."
+			: "No readable package.json manifest was found at the project root.",
+		relevantPaths.length > 0
+			? `Relevant path scan captured ${relevantPaths.length} bounded path hint(s) before interview questions.`
+			: "Relevant path scan found no matching source/documentation paths before interview questions.",
+		"Trace summary intentionally stores path-level evidence only; raw files and logs are excluded.",
+	];
+	return {
+		enabled: true,
+		generated_at: new Date().toISOString(),
+		bounded: true,
+		limits: {
+			max_relevant_paths: TRACE_MAX_RELEVANT_PATHS,
+			max_package_hints: TRACE_MAX_PACKAGE_HINTS,
+			max_directory_visits: TRACE_MAX_DIRECTORY_VISITS,
+			max_entry_visits: TRACE_MAX_ENTRY_VISITS,
+			max_pending_directories: TRACE_MAX_PENDING_DIRECTORIES,
+		},
+		idea_terms: terms,
+		project_hints: projectHints,
+		relevant_paths: relevantPaths,
+		findings,
+	};
+}
+
 interface ResolvedDeepInterviewArgs {
 	resolution: DeepInterviewResolution;
 	threshold: number;
@@ -114,6 +307,7 @@ interface ResolvedDeepInterviewArgs {
 	sessionId: string;
 	idea: string;
 	language?: DeepInterviewLanguagePreference;
+	trace?: DeepInterviewTraceSummary;
 	json: boolean;
 }
 
@@ -199,7 +393,7 @@ async function readModernSettingsAmbiguityThreshold(): Promise<{ threshold: numb
 	const modernConfigPath = modernSettingsPath();
 	let parsed: unknown;
 	try {
-		parsed = (await import("bun")).YAML.parse(await fs.readFile(modernConfigPath, "utf-8"));
+		parsed = YAML.parse(await fs.readFile(modernConfigPath, "utf-8"));
 	} catch {
 		return undefined;
 	}
@@ -371,6 +565,7 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 			skipNext = true;
 			continue;
 		}
+		if (arg === "--trace") continue;
 		if (arg === "--quick" || arg === "--standard" || arg === "--deep" || arg === "--json") continue;
 		if (arg.startsWith("-")) {
 			throw new DeepInterviewCommandError(2, `unknown flag for gjc deep-interview: ${arg}`);
@@ -379,6 +574,7 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 	}
 	const idea = ideaParts.join(" ").trim();
 	const effectiveResolution: DeepInterviewResolution = resolution ?? "standard";
+	const trace = hasFlag(args, "--trace") && idea ? await buildDeepInterviewTraceSummary(cwd, idea) : undefined;
 	return {
 		resolution: effectiveResolution,
 		threshold,
@@ -386,6 +582,7 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 		sessionId,
 		idea,
 		language: resolveDeepInterviewLanguagePreference(idea),
+		trace,
 		json: hasFlag(args, "--json"),
 	};
 }
@@ -507,6 +704,17 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		},
 		updated_at: now,
 	};
+	if (resolved.trace) {
+		payload.trace = resolved.trace;
+		(payload.state as Record<string, unknown>).trace = resolved.trace;
+		(payload.state as Record<string, unknown>).trace_summary = resolved.trace;
+		(payload.state as Record<string, unknown>).codebase_context = {
+			source: "trace",
+			summary: resolved.trace.findings,
+			relevant_paths: resolved.trace.relevant_paths,
+			project_hints: resolved.trace.project_hints,
+		};
+	}
 	if (resolved.language) {
 		payload.language = resolved.language;
 		(payload.state as Record<string, unknown>).language = resolved.language;
@@ -646,6 +854,7 @@ export async function runNativeDeepInterviewCommand(
 			threshold_source: resolved.thresholdSource,
 			idea: resolved.idea,
 			language: resolved.language,
+			trace: resolved.trace,
 			state_path: statePath,
 			handoff: "/skill:deep-interview",
 		};
@@ -654,6 +863,7 @@ export async function runNativeDeepInterviewCommand(
 			: [
 					`deep-interview seed state_path=${statePath}`,
 					`resolution=${resolved.resolution} threshold=${resolved.threshold} threshold_source=${resolved.thresholdSource}`,
+					resolved.trace ? `trace=enabled bounded_paths=${resolved.trace.relevant_paths.length}` : undefined,
 					"handoff=/skill:deep-interview",
 					"",
 				].join("\n");

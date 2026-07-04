@@ -62,6 +62,7 @@ describe("native gjc deep-interview runtime", () => {
 		expect(source).toContain("slug: Flags.string");
 		expect(source).toContain("spec: Flags.string");
 		expect(source).toContain("deliberate: Flags.boolean");
+		expect(source).toContain("trace: Flags.boolean");
 		expect(source).toContain("handoff: Flags.string");
 	});
 
@@ -272,6 +273,84 @@ describe("native gjc deep-interview runtime", () => {
 		expect(state.threshold_source).toBe("default");
 		expect(state.state.initial_idea).toBe("my vague idea");
 		expect(state.state.established_facts).toEqual([]);
+	});
+
+	it("runs an optional bounded trace pre-step before deep-interview questions", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, "packages/coding-agent/src/gjc-runtime"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, "package.json"),
+			JSON.stringify({ name: "trace-fixture", scripts: { test: "bun test", check: "bun check" } }),
+		);
+		await fs.writeFile(
+			path.join(root, "packages/coding-agent/src/gjc-runtime/deep-interview-runtime.ts"),
+			"raw content must not be copied into the trace summary\n".repeat(200),
+		);
+
+		const result = await runNativeDeepInterviewCommand(
+			["--trace", "--json", "Add trace pre-skill option to deep-interview"],
+			root,
+		);
+
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.trace).toMatchObject({ enabled: true, bounded: true });
+		expect(payload.trace.relevant_paths.length).toBeLessThanOrEqual(12);
+		expect(
+			payload.trace.relevant_paths.some((entry: { path: string }) =>
+				entry.path.includes("deep-interview-runtime.ts"),
+			),
+		).toBe(true);
+
+		const state = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
+		expect(state.state.rounds).toEqual([]);
+		expect(state.state.trace_summary).toEqual(payload.trace);
+		expect(state.state.codebase_context).toMatchObject({ source: "trace" });
+		expect(JSON.stringify(state.state.trace_summary)).not.toContain("raw content must not be copied");
+	});
+
+	it("keeps trace path scanning on a hard budget and skips heavy directories", async () => {
+		const root = await tempDir();
+		await fs.writeFile(path.join(root, "package.json"), JSON.stringify({ name: "trace-budget-fixture" }));
+		await fs.mkdir(path.join(root, "vendor", "deep-interview"), { recursive: true });
+		await fs.writeFile(path.join(root, "vendor", "deep-interview", "secret-token.ts"), "token should not be listed");
+		await fs.mkdir(path.join(root, "target", "deep-interview"), { recursive: true });
+		await fs.writeFile(path.join(root, "target", "deep-interview", "generated.ts"), "generated should not be listed");
+		for (let index = 0; index < 80; index += 1) {
+			await fs.mkdir(path.join(root, `src-${index}`), { recursive: true });
+			await fs.writeFile(path.join(root, `src-${index}`, `deep-interview-${index}.ts`), "bounded path hint only");
+		}
+
+		const result = await runNativeDeepInterviewCommand(["--trace", "--json", "deep interview budget"], root);
+
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.trace.limits).toMatchObject({
+			max_directory_visits: 1200,
+			max_entry_visits: 5000,
+			max_pending_directories: 1200,
+		});
+		expect(payload.trace.relevant_paths.length).toBeLessThanOrEqual(12);
+		expect(payload.trace.relevant_paths.map((entry: { path: string }) => entry.path)).not.toContain(
+			"vendor/deep-interview/secret-token.ts",
+		);
+		expect(payload.trace.relevant_paths.map((entry: { path: string }) => entry.path)).not.toContain(
+			"target/deep-interview/generated.ts",
+		);
+	});
+
+	it("keeps the normal no-trace deep-interview seed path unchanged", async () => {
+		const root = await tempDir();
+		const result = await runNativeDeepInterviewCommand(["--json", "my vague idea"], root);
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.trace).toBeUndefined();
+
+		const state = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
+		expect(state.trace).toBeUndefined();
+		expect(state.state.trace).toBeUndefined();
+		expect(state.state.trace_summary).toBeUndefined();
+		expect(state.state.codebase_context).toBeUndefined();
 	});
 
 	it("honors gjc.deepInterview.ambiguityThreshold in project .gjc/settings.json", async () => {
