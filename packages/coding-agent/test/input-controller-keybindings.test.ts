@@ -1,7 +1,10 @@
-import { describe, expect, it, vi } from "bun:test";
+import { beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
 import { InputController } from "../src/modes/controllers/input-controller";
+import { initTheme } from "../src/modes/theme/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext } from "../src/modes/types";
+import type { QueuedMessageEditEntry } from "../src/session/agent-session";
 
 type FakeEditor = {
 	onEscape?: () => void;
@@ -44,6 +47,7 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		"app.model.select": ["ctrl+l"],
 		"app.message.queue": ["alt+enter"],
 		"app.message.followUp": options?.followUpKeys ?? [],
+		"app.message.dequeue": ["alt+up", "alt+down"],
 	};
 
 	const setActionKeys = vi.fn();
@@ -62,6 +66,26 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		showStatus("Queued message for after compaction");
 	});
 	const popLastQueuedMessage = vi.fn(() => sessionQueuedMessages.pop());
+	const getQueuedMessageEntries = vi.fn(() =>
+		sessionQueuedMessages
+			.map(
+				(text, index): QueuedMessageEditEntry => ({
+					id: `followUp:${index}`,
+					text,
+					mode: "followUp",
+					label: "Queued",
+				}),
+			)
+			.reverse(),
+	);
+	const removeQueuedMessageForEditing = vi.fn((id: string) => {
+		const [mode, indexText] = id.split(":");
+		if (mode !== "followUp" || indexText === undefined) return undefined;
+		const index = Number(indexText);
+		if (!Number.isInteger(index)) return undefined;
+		const [removed] = sessionQueuedMessages.splice(index, 1);
+		return removed;
+	});
 	const clearQueue = vi.fn(() => {
 		const followUp = [...sessionQueuedMessages];
 		sessionQueuedMessages.length = 0;
@@ -82,9 +106,19 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		setCustomKeyHandler: vi.fn(),
 		clearCustomKeyHandlers: vi.fn(),
 	};
+	const editorContainerChildren: unknown[] = [];
+	const editorContainer = {
+		clear: vi.fn(() => {
+			editorContainerChildren.length = 0;
+		}),
+		addChild: vi.fn((child: unknown) => {
+			editorContainerChildren.push(child);
+		}),
+	};
 	const ctx = {
 		editor: editor as unknown as InteractiveModeContext["editor"],
-		ui: { requestRender: vi.fn() } as unknown as InteractiveModeContext["ui"],
+		ui: { requestRender: vi.fn(), setFocus: vi.fn() } as unknown as InteractiveModeContext["ui"],
+		editorContainer: editorContainer as unknown as InteractiveModeContext["editorContainer"],
 		loadingAnimation: undefined,
 		autoCompactionLoader: undefined,
 		retryLoader: undefined,
@@ -102,6 +136,8 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			popLastQueuedMessage,
 			clearQueue,
 			getQueuedMessages: () => ({ steering: [], followUp: [...sessionQueuedMessages] }),
+			getQueuedMessageEntries,
+			removeQueuedMessageForEditing,
 		} as unknown as InteractiveModeContext["session"],
 		keybindings: {
 			getKeys(action: string) {
@@ -186,13 +222,20 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			queueCompactionMessage,
 			popLastQueuedMessage,
 			clearQueue,
+			getQueuedMessageEntries,
+			removeQueuedMessageForEditing,
 		},
 		queues: {
 			compactionQueuedMessages,
 			sessionQueuedMessages,
+			editorContainerChildren,
 		},
 	};
 }
+
+beforeAll(() => {
+	initTheme();
+});
 
 describe("InputController keybinding setup", () => {
 	it("registers temporary and persisted model selector actions separately", async () => {
@@ -226,6 +269,7 @@ describe("InputController keybinding setup", () => {
 		await Bun.sleep(0);
 
 		expect(spies.setActionKeys).toHaveBeenCalledWith("app.message.queue", ["alt+enter"]);
+		expect(spies.setActionKeys).toHaveBeenCalledWith("app.message.dequeue", ["alt+up", "alt+down"]);
 		expect(ctx.locallySubmittedUserSignatures.has("queue after current response\u00000")).toBe(true);
 		expect(spies.prompt).toHaveBeenCalledWith("queue after current response", {
 			streamingBehavior: "followUp",
@@ -328,24 +372,36 @@ describe("InputController keybinding setup", () => {
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 
-	it("restores only the newest compaction queued message for editing", async () => {
+	it("restores a single compaction queued message for editing", async () => {
 		const { InputController, ctx, editor, spies, queues } = await createContext();
-		queues.compactionQueuedMessages.push(
-			{ text: "older compaction queue", mode: "followUp" },
-			{ text: "newest compaction queue", mode: "followUp" },
-		);
+		queues.compactionQueuedMessages.push({ text: "single compaction queue", mode: "followUp" });
 		editor.setText("current draft");
 		const controller = new InputController(ctx);
 
 		controller.handleDequeue();
 
-		expect(editor.getText()).toBe("newest compaction queue");
-		expect(queues.compactionQueuedMessages.map(entry => entry.text)).toEqual(["older compaction queue"]);
+		expect(editor.getText()).toBe("single compaction queue");
+		expect(queues.compactionQueuedMessages).toEqual([]);
 		expect(spies.popLastQueuedMessage).not.toHaveBeenCalled();
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 
-	it("restores only the newest session queued message for editing", async () => {
+	it("restores a single session queued message for editing", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		queues.sessionQueuedMessages.push("single session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		expect(editor.getText()).toBe("single session queue");
+		expect(queues.sessionQueuedMessages).toEqual([]);
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("followUp:0");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("opens a selector so older queued messages can be restored", async () => {
 		const { InputController, ctx, editor, spies, queues } = await createContext();
 		queues.sessionQueuedMessages.push("older session queue", "newest session queue");
 		editor.setText("current draft");
@@ -353,9 +409,17 @@ describe("InputController keybinding setup", () => {
 
 		controller.handleDequeue();
 
-		expect(editor.getText()).toBe("newest session queue");
-		expect(queues.sessionQueuedMessages).toEqual(["older session queue"]);
-		expect(spies.clearQueue).not.toHaveBeenCalled();
+		const selector = queues.editorContainerChildren[0];
+		if (!(selector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to be shown");
+		}
+		expect(editor.getText()).toBe("current draft");
+		selector.getSelectList().setSelectedIndex(1);
+		selector.getSelectList().handleInput("\n");
+
+		expect(editor.getText()).toBe("older session queue");
+		expect(queues.sessionQueuedMessages).toEqual(["newest session queue"]);
+		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("followUp:0");
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 

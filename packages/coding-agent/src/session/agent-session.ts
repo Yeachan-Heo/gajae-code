@@ -908,6 +908,14 @@ function extractPermissionLocations(
  *  rely on the existing text-equality match. `sequence` preserves cross-queue
  *  insertion order for one-at-a-time dequeue/edit UX. */
 type QueuedDisplayEntry = { text: string; tag?: string; sequence: number };
+export type QueuedMessageEditMode = "steer" | "followUp";
+
+export interface QueuedMessageEditEntry {
+	id: string;
+	text: string;
+	mode: QueuedMessageEditMode;
+	label: string;
+}
 
 /** A custom message contributed at the before-agent-start point. */
 export type BeforeAgentStartInternalMessage = Pick<
@@ -1645,6 +1653,9 @@ export class AgentSession {
 		return entry;
 	}
 
+	#queuedMessageEditId(mode: QueuedMessageEditMode, sequence: number): string {
+		return `${mode}:${sequence}`;
+	}
 	/** Register a compact display string for a custom message that the caller is
 	 *  about to dispatch via `promptCustomMessage` / `sendCustomMessage`.
 	 *  Returns a stable tag the caller MUST embed in
@@ -5719,6 +5730,50 @@ export class AgentSession {
 		};
 	}
 
+	getQueuedMessageEntries(): QueuedMessageEditEntry[] {
+		const entries: Array<QueuedMessageEditEntry & { sequence: number }> = [];
+		for (const entry of this.#steeringMessages) {
+			entries.push({
+				id: this.#queuedMessageEditId("steer", entry.sequence),
+				text: entry.text,
+				mode: "steer",
+				label: "Steer",
+				sequence: entry.sequence,
+			});
+		}
+		for (const entry of this.#followUpMessages) {
+			entries.push({
+				id: this.#queuedMessageEditId("followUp", entry.sequence),
+				text: entry.text,
+				mode: "followUp",
+				label: "Queued",
+				sequence: entry.sequence,
+			});
+		}
+		return entries
+			.sort((a, b) => b.sequence - a.sequence)
+			.map(({ id, text, mode, label }) => ({ id, text, mode, label }));
+	}
+
+	removeQueuedMessageForEditing(id: string): string | undefined {
+		const [mode, sequenceText] = id.split(":");
+		if ((mode !== "steer" && mode !== "followUp") || sequenceText === undefined) return undefined;
+		const sequence = Number(sequenceText);
+		if (!Number.isInteger(sequence)) return undefined;
+
+		const queue = mode === "steer" ? this.#steeringMessages : this.#followUpMessages;
+		const index = queue.findIndex(entry => entry.sequence === sequence);
+		if (index === -1) return undefined;
+
+		const [entry] = queue.splice(index, 1);
+		if (mode === "steer") {
+			this.agent.removeSteerAt(index);
+		} else {
+			this.agent.removeFollowUpAt(index);
+		}
+		return entry?.text;
+	}
+
 	/**
 	 * Pop the newest queued message across steering and follow-up queues.
 	 * Used by dequeue keybinding to restore messages to editor one at a time.
@@ -5730,15 +5785,11 @@ export class AgentSession {
 		const followUpEntry = this.#followUpMessages.at(-1);
 
 		if (steeringEntry && (!followUpEntry || steeringEntry.sequence > followUpEntry.sequence)) {
-			const entry = this.#steeringMessages.pop();
-			this.agent.popLastSteer();
-			return entry?.text;
+			return this.removeQueuedMessageForEditing(this.#queuedMessageEditId("steer", steeringEntry.sequence));
 		}
 
 		if (followUpEntry) {
-			const entry = this.#followUpMessages.pop();
-			this.agent.popLastFollowUp();
-			return entry?.text;
+			return this.removeQueuedMessageForEditing(this.#queuedMessageEditId("followUp", followUpEntry.sequence));
 		}
 
 		return undefined;

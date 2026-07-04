@@ -35,7 +35,16 @@ describe("message keybinding defaults", () => {
 
 		expect(keybindings.getKeys("app.message.followUp")).toEqual([]);
 		expect(keybindings.getDisplayString("app.message.followUp")).toBe("");
-		expect(keybindings.getDisplayString("app.message.queue")).toBe("Alt+Enter");
+		expect(keybindings.getDisplayString("app.message.queue")).toBe(
+			process.platform === "win32" ? "Alt+Q" : "Alt+Enter",
+		);
+	});
+
+	it("binds queue editing to both Alt+Up and Alt+Down by default", () => {
+		const keybindings = KeybindingsManager.inMemory();
+
+		expect(keybindings.getKeys("app.message.dequeue")).toEqual(["alt+up", "alt+down"]);
+		expect(keybindings.getDisplayString("app.message.dequeue")).toBe("Alt+Up/Alt+Down");
 	});
 
 	it("uses Alt+Q for the native Windows queue shortcut", () => {
