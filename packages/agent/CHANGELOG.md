@@ -5,6 +5,10 @@
 
 - Agent queues now expose ordered move helpers for steering and follow-up messages so callers can reorder pending work without removing and re-adding messages.
 
+### Fixed
+
+- Preserved inherited fork-context seed messages when a compacted child rebase receives only child-local normalized messages, avoiding seed loss after task-child compaction (#1567).
+
 ## [0.7.7] - 2026-06-28
 
 ### Fixed
