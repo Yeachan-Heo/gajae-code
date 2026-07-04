@@ -1569,9 +1569,14 @@ export class AgentSession {
 			const sanitized = sanitizeMessage(providerMessages[i]!);
 			if (!sanitized) continue;
 			const messageTokens = estimateMessageTokensHeuristic(sanitized);
+			// Stop at the first message that overflows the token budget. The loop walks
+			// newest→oldest, so `break` keeps the seed a CONTIGUOUS run of the most recent
+			// messages. `continue` here would skip the oversized recent message and scavenge
+			// smaller OLDER ones, yielding a non-contiguous seed that misrepresents the
+			// conversation and violates the recency contract of the receipt/last-turn/bounded modes.
 			if (maxTokens > 0 && approximateTokens + messageTokens > maxTokens) {
 				recordSkip("token-limit");
-				continue;
+				break;
 			}
 			selected.unshift(sanitized);
 			approximateTokens += messageTokens;
