@@ -67,17 +67,79 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 }
 
+file_size_bytes() {
+  local file_path="${1:-}"
+  python3 - "$file_path" <<'PY'
+import os
+import sys
+
+try:
+    print(os.path.getsize(sys.argv[1]))
+except OSError:
+    print(0)
+PY
+}
+
+wait_for_evidence_log_quiet() {
+  local previous_size="-1"
+  local current_size="0"
+  for _ in $(seq 1 20); do
+    current_size="$(file_size_bytes "$EVIDENCE_LOG")"
+    if [[ "$current_size" == "$previous_size" ]]; then
+      printf '%s\n' "$current_size"
+      return 0
+    fi
+    previous_size="$current_size"
+    sleep 0.1
+  done
+  printf '%s\n' "$(file_size_bytes "$EVIDENCE_LOG")"
+}
+
 has_turn_evidence() {
   local log_path="${1:-}"
   local log_offset="${2:-0}"
+  local prompt_text="${3:-}"
   if [[ -n "$log_path" && -f "$log_path" ]]; then
-    local log_size
-    log_size="$(wc -c <"$log_path" | tr -d ' ')"
-    if [[ "$log_size" -gt "$log_offset" ]] && tail -c +$((log_offset + 1)) "$log_path" | grep -Eiq "$TURN_EVIDENCE_PATTERN"; then
-      return 0
-    fi
+    python3 - "$log_path" "$log_offset" "$TURN_EVIDENCE_PATTERN" "$prompt_text" <<'PY'
+import re
+import sys
+
+log_path, offset_raw, pattern, prompt_text = sys.argv[1:]
+try:
+    offset = int(offset_raw)
+except ValueError:
+    offset = 0
+try:
+    with open(log_path, "rb") as handle:
+        handle.seek(max(offset, 0))
+        data = handle.read()
+except OSError:
+    sys.exit(1)
+
+text = data.decode("utf-8", errors="replace")
+if prompt_text:
+    text = text.replace(prompt_text, "")
+if re.search(pattern, text, re.IGNORECASE):
+    sys.exit(0)
+sys.exit(1)
+PY
+    return $?
   fi
   return 1
+}
+
+print_redacted_tail() {
+  local prompt_text="${TEXT:-}"
+  python3 - "$prompt_text" <<'PY'
+import sys
+
+prompt = sys.argv[1]
+text = sys.stdin.read()
+if prompt:
+    text = text.replace(prompt, "[prompt redacted]")
+for line in text.splitlines()[-40:]:
+    print(line)
+PY
 }
 
 show_missing_session_diagnostics() {
@@ -95,7 +157,7 @@ show_missing_session_diagnostics() {
     echo "durable events: $state_dir/events.log" >&2
   fi
   echo "--- durable pane log tail ---" >&2
-  tail -40 "$log_path" >&2
+  tail -40 "$log_path" | print_redacted_tail >&2
 }
 
 if [[ "$TEXT_ARG" == @* ]]; then
@@ -119,36 +181,63 @@ fi
 if ! printf '%s\n' "$PANE_TEXT" | grep -qE 'Gajae forge|Type your message|> Type your message|Working'; then
   echo "refusing to paste prompt: GJC TUI is not ready in session $SESSION" >&2
   echo "--- pane tail ---" >&2
-  printf '%s\n' "$PANE_TEXT" | tail -40 >&2
+  printf '%s\n' "$PANE_TEXT" | print_redacted_tail >&2
   exit 1
 fi
 
-# Establish freshness before sending. Prompt acceptance must come from output
-# captured after this boundary. Do not use a later capture-pane slice as the
-# freshness source: tmux's scrollback window can move and reclassify stale lines
-# as "new" after we paste a long prompt. A temporary pipe-pane log records only
-# bytes emitted after the boundary.
-EVIDENCE_LOG="$(mktemp "${TMPDIR:-/tmp}/gjc-session-prompt-evidence.XXXXXX")"
+# Establish freshness before submission. Prompt acceptance must come from bytes
+# captured after the local paste echo has drained, but before Enter submits the
+# turn. Prefer the durable pane log when session state provides one so this
+# script does not replace an existing tmux pipe-pane logger.
+EVIDENCE_LOG=""
+EVIDENCE_LOG_IS_TEMP=0
+if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
+  EVIDENCE_LOG="$GJC_SESSION_STATE_DIR/pane.log"
+else
+  durable_log_candidates=()
+  mapfile -t durable_log_candidates < <(find_durable_pane_logs)
+  if [[ "${#durable_log_candidates[@]}" -gt 0 ]]; then
+    EVIDENCE_LOG="${durable_log_candidates[0]}"
+  else
+    EVIDENCE_LOG="$(mktemp "${TMPDIR:-/tmp}/gjc-session-prompt-evidence.XXXXXX")"
+    EVIDENCE_LOG_IS_TEMP=1
+  fi
+fi
 EVIDENCE_LOG_OFFSET=0
 cleanup_evidence_log() {
-  "${TMUX_CMD[@]}" pipe-pane -t "$SESSION":0.0 2>/dev/null || true
-  rm -f "$EVIDENCE_LOG"
+  if [[ "$EVIDENCE_LOG_IS_TEMP" == "1" ]]; then
+    "${TMUX_CMD[@]}" pipe-pane -t "$SESSION":0.0 2>/dev/null || true
+    rm -f "$EVIDENCE_LOG"
+  fi
 }
 trap cleanup_evidence_log EXIT
-"${TMUX_CMD[@]}" pipe-pane -t "$SESSION":0.0 "cat >> '$EVIDENCE_LOG'"
+if [[ "$EVIDENCE_LOG_IS_TEMP" == "1" ]]; then
+  "${TMUX_CMD[@]}" pipe-pane -t "$SESSION":0.0 "cat >> '$EVIDENCE_LOG'"
+fi
 
 "${TMUX_CMD[@]}" send-keys -t "$SESSION" -l "$TEXT"
 sleep 0.5
+EVIDENCE_LOG_OFFSET="$(wait_for_evidence_log_quiet)"
 # Multiple Enters work around terminal focus/submission edge cases. Prompt visibility is not acceptance;
 # verify Working/tool activity afterwards.
 "${TMUX_CMD[@]}" send-keys -t "$SESSION" Enter
 sleep 1
-"${TMUX_CMD[@]}" send-keys -t "$SESSION" Enter
+if has_turn_evidence "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET" "$TEXT"; then
+  record_prompt_accepted
+  echo "sent to $SESSION with durable turn evidence"
+  exit 0
+fi
+"${TMUX_CMD[@]}" send-keys -t "$SESSION" Enter 2>/dev/null || true
 sleep 1
-"${TMUX_CMD[@]}" send-keys -t "$SESSION" Enter
+"${TMUX_CMD[@]}" send-keys -t "$SESSION" Enter 2>/dev/null || true
 
 for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
   sleep 1
+  if has_turn_evidence "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET" "$TEXT"; then
+    record_prompt_accepted
+    echo "sent to $SESSION with durable turn evidence"
+    exit 0
+  fi
   PANE_TEXT="$(${TMUX_CMD[@]} capture-pane -t "$SESSION":0.0 -p -S -120 2>/dev/null || true)"
   if [[ -z "$PANE_TEXT" ]]; then
     mapfile -t candidates < <(find_durable_pane_logs)
@@ -159,14 +248,14 @@ for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
     fi
     exit 1
   fi
-  if has_turn_evidence "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET"; then
+  if has_turn_evidence "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET" "$TEXT"; then
     record_prompt_accepted
-    echo "sent to $SESSION with durable turn evidence: ${TEXT:0:80}..."
+    echo "sent to $SESSION with durable turn evidence"
     exit 0
   fi
 done
 
 echo "prompt acceptance failed: no durable turn evidence appeared in session $SESSION" >&2
 echo "--- pane tail ---" >&2
-printf '%s\n' "$PANE_TEXT" | tail -40 >&2
+printf '%s\n' "$PANE_TEXT" | print_redacted_tail >&2
 exit 1

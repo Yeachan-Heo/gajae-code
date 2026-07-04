@@ -41,6 +41,11 @@ async function waitForFile(file: string, timeoutMs = 7000): Promise<void> {
 	throw new Error(`timed out waiting for ${file}`);
 }
 
+function startPaneLog(session: string, stateDir: string): void {
+	const paneLog = path.join(stateDir, "pane.log");
+	expect(Bun.spawnSync(["tmux", "pipe-pane", "-t", `${session}:0.0`, `cat >> '${paneLog}'`]).exitCode).toBe(0);
+}
+
 afterEach(async () => {
 	for (const session of tmuxSessions.splice(0)) {
 		Bun.spawnSync(["tmux", "kill-session", "-t", session], { stderr: "pipe", stdout: "pipe" });
@@ -235,6 +240,7 @@ sleep 60
 			]).exitCode,
 		).toBe(0);
 		await Bun.sleep(500);
+		startPaneLog(session, stateDir);
 
 		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "do work"], {
 			env: {
@@ -269,6 +275,7 @@ sleep 60
 			]).exitCode,
 		).toBe(0);
 		await Bun.sleep(500);
+		startPaneLog(session, stateDir);
 
 		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "new prompt that sleeping process will not accept"], {
 			env: {
@@ -284,6 +291,46 @@ sleep 60
 		expect(result.stderr.toString()).toContain("prompt acceptance failed: no durable turn evidence appeared");
 		expect(result.stdout.toString()).not.toContain("sent to");
 	}, 20000);
+	test("prompt echo cannot satisfy durable turn evidence", async () => {
+		const session = `gjc_issue_1496_prompt_echo_${process.pid}_${Date.now()}`;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-echo-"));
+		tempRoots.push(root);
+		const stateDir = path.join(root, "state");
+		await fs.mkdir(stateDir, { recursive: true });
+		await Bun.write(path.join(stateDir, "pane.log"), "");
+		tmuxSessions.push(session);
+		expect(
+			Bun.spawnSync([
+				"tmux",
+				"new-session",
+				"-d",
+				"-s",
+				session,
+				"printf 'Gajae forge\\n> Type your message\\n'; sleep 20",
+			]).exitCode,
+		).toBe(0);
+		await Bun.sleep(500);
+		startPaneLog(session, stateDir);
+
+		const rawPrompt = "Working Tool prompt echo must not count";
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, rawPrompt], {
+			env: {
+				...process.env,
+				GJC_SESSION_STATE_DIR: stateDir,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "1",
+			},
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain("prompt acceptance failed: no durable turn evidence appeared");
+		expect(result.stdout.toString()).not.toContain("sent to");
+		expect(result.stdout.toString()).not.toContain(rawPrompt);
+		expect(result.stderr.toString()).not.toContain(rawPrompt);
+		expect(await Bun.file(path.join(stateDir, "prompt-accepted.json")).exists()).toBe(false);
+	}, 20000);
+
 
 	test("prompt ignores stale evidence when capture window shifts after send", async () => {
 		const session = `gjc_issue_1385_prompt_window_${process.pid}_${Date.now()}`;
@@ -296,6 +343,7 @@ sleep 60
 		const script = `for i in $(seq 1 150); do if [ "$i" = 120 ]; then printf 'Working on previous prompt\n'; else printf 'filler %03d\n' "$i"; fi; done; printf '> Type your message\n'; sleep 20`;
 		expect(Bun.spawnSync(["tmux", "new-session", "-d", "-s", session, "bash", "-lc", script]).exitCode).toBe(0);
 		await Bun.sleep(500);
+		startPaneLog(session, stateDir);
 
 		const result = Bun.spawnSync(
 			["bash", "scripts/gjc-session/prompt.sh", session, "new prompt sleeping process should not accept"],
@@ -334,8 +382,10 @@ sleep 60
 			]).exitCode,
 		).toBe(0);
 		await Bun.sleep(500);
+		startPaneLog(session, stateDir);
 
-		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "do accepted work"], {
+		const rawPrompt = "Working Tool accepted prompt still needs owner output";
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, rawPrompt], {
 			env: {
 				...process.env,
 				GJC_SESSION_STATE_DIR: stateDir,
@@ -347,5 +397,118 @@ sleep 60
 
 		expect(result.exitCode).toBe(0);
 		expect(result.stdout.toString()).toContain("sent to");
+		expect(result.stdout.toString()).not.toContain(rawPrompt);
+		expect(await Bun.file(path.join(stateDir, "prompt-accepted.json")).exists()).toBe(true);
+	}, 20000);
+	test("prompt accepts durable evidence when owner exits immediately after output", async () => {
+		const session = `gjc_issue_1496_prompt_exit_after_evidence_${process.pid}_${Date.now()}`;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-exit-after-evidence-"));
+		tempRoots.push(root);
+		const stateDir = path.join(root, "state");
+		await fs.mkdir(stateDir, { recursive: true });
+		await Bun.write(path.join(stateDir, "pane.log"), "");
+		tmuxSessions.push(session);
+		expect(
+			Bun.spawnSync([
+				"tmux",
+				"new-session",
+				"-d",
+				"-s",
+				session,
+				"bash -lc \"printf 'Gajae forge\\n> Type your message\\n'; IFS= read -r line; printf '\\nWorking then exiting\\n'\"",
+			]).exitCode,
+		).toBe(0);
+		await Bun.sleep(500);
+		startPaneLog(session, stateDir);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "exit after evidence"], {
+			env: {
+				...process.env,
+				GJC_SESSION_STATE_DIR: stateDir,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "2",
+			},
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString()).toContain("sent to");
+		expect(await Bun.file(path.join(stateDir, "prompt-accepted.json")).exists()).toBe(true);
+		expect(await Bun.file(path.join(stateDir, "pane.log")).text()).toContain("Working then exiting");
+	}, 20000);
+	test("prompt echo after submit cannot satisfy durable turn evidence", async () => {
+		const session = `gjc_issue_1496_prompt_post_submit_echo_${process.pid}_${Date.now()}`;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-post-submit-echo-"));
+		tempRoots.push(root);
+		const stateDir = path.join(root, "state");
+		await fs.mkdir(stateDir, { recursive: true });
+		await Bun.write(path.join(stateDir, "pane.log"), "");
+		tmuxSessions.push(session);
+		expect(
+			Bun.spawnSync([
+				"tmux",
+				"new-session",
+				"-d",
+				"-s",
+				session,
+				"bash -lc \"printf 'Gajae forge\\n> Type your message\\n'; IFS= read -r line; printf '%s\\n' \\\"$line\\\"; sleep 20\"",
+			]).exitCode,
+		).toBe(0);
+		await Bun.sleep(500);
+		startPaneLog(session, stateDir);
+
+		const rawPrompt = "Working Tool post submit echo only";
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, rawPrompt], {
+			env: {
+				...process.env,
+				GJC_SESSION_STATE_DIR: stateDir,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "1",
+			},
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain("prompt acceptance failed: no durable turn evidence appeared");
+		expect(result.stdout.toString()).not.toContain("sent to");
+		expect(result.stdout.toString()).not.toContain(rawPrompt);
+		expect(result.stderr.toString()).not.toContain(rawPrompt);
+		expect(await Bun.file(path.join(stateDir, "prompt-accepted.json")).exists()).toBe(false);
+	}, 20000);
+	test("prompt uses discovered durable pane log without state dir", async () => {
+		const session = `gjc_issue_1496_prompt_discovery_${process.pid}_${Date.now()}`;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-discovery-"));
+		tempRoots.push(root);
+		const stateDir = path.join(root, ".gjc-session-state", session);
+		await fs.mkdir(stateDir, { recursive: true });
+		await Bun.write(path.join(stateDir, "pane.log"), "");
+		tmuxSessions.push(session);
+		expect(
+			Bun.spawnSync([
+				"tmux",
+				"new-session",
+				"-d",
+				"-s",
+				session,
+				"bash -lc \"printf 'Gajae forge\\n> Type your message\\n'; IFS= read -r line; printf '\\nWorking from discovered durable log\\n'; sleep 20\"",
+			]).exitCode,
+		).toBe(0);
+		await Bun.sleep(500);
+		startPaneLog(session, stateDir);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "discovery prompt"], {
+			env: {
+				...process.env,
+				GJC_SESSION_LOG_SEARCH_ROOT: root,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "1",
+			},
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString()).toContain("sent to");
+		expect(await Bun.file(path.join(stateDir, "prompt-accepted.json")).exists()).toBe(true);
+		expect(await Bun.file(path.join(stateDir, "pane.log")).text()).toContain("Working from discovered durable log");
 	}, 20000);
 });
