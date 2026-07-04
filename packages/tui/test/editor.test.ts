@@ -2050,6 +2050,26 @@ describe("Editor component", () => {
 			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
 		});
 
+		it("keeps normal prefix outside paste when the bracketed start marker is split", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("prefix\x1b[200");
+			expect(editor.getText()).toBe("prefix");
+
+			editor.handleInput("~payload\x1b[201~");
+			expect(editor.getText()).toBe("prefixpayload");
+		});
+
+		it("keeps normal prefix outside paste when a complete start marker shares the first chunk", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("prefix\x1b[200~pay");
+			expect(editor.getText()).toBe("prefix");
+
+			editor.handleInput("load\x1b[201~");
+			expect(editor.getText()).toBe("prefixpayload");
+		});
+
 		it("removes a transient undo trigger even when there is no earlier edit to restore", () => {
 			const editor = new Editor(defaultEditorTheme);
 

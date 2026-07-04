@@ -182,6 +182,38 @@ describe("Input component", () => {
 		expect(input.getValue()).toBe(`a${" ".repeat(getIndentation())}bc`);
 	});
 
+	it("keeps normal prefix outside paste when the bracketed start marker is split", () => {
+		const input = setupAtEnd("");
+
+		input.handleInput("prefix\x1b[200");
+		expect(input.getValue()).toBe("prefix");
+
+		input.handleInput("~payload\x1b[201~");
+		expect(input.getValue()).toBe("prefixpayload");
+	});
+
+	it("keeps normal prefix outside paste when a complete start marker shares the first chunk", () => {
+		const input = setupAtEnd("");
+
+		input.handleInput("prefix\x1b[200~pay");
+		expect(input.getValue()).toBe("prefix");
+
+		input.handleInput("load\x1b[201~");
+		expect(input.getValue()).toBe("prefixpayload");
+	});
+
+	it("still treats standalone escape as cancel instead of paste buffering", () => {
+		const input = setupAtEnd("");
+		let didEscape = false;
+		input.onEscape = () => {
+			didEscape = true;
+		};
+
+		input.handleInput("\x1b");
+
+		expect(didEscape).toBe(true);
+	});
+
 	it("never renders a line wider than the terminal width (wide chars)", () => {
 		const input = new Input();
 		input.focused = true;

@@ -17,6 +17,7 @@
 ### Fixed
 
 - Escape now reliably cancels active context maintenance, handoff generation, retry backoff, and workflow ask dialogs even when transient UI focus or typed drafts would previously consume the key.
+- Bracketed paste handling now preserves normal text typed before the paste start marker when terminal input splits or prefixes the marker, so pasted content no longer absorbs the preceding composer text.
 - The session tree picker now keeps its selection index valid when it starts on an empty filter mode, receives navigation input, and then switches back to a populated filter.
 - The main composer now uses `PageUp` / `PageDown` to page the visible transcript viewport instead of duplicating prompt-history navigation; `Up` / `Down` and `Ctrl+R` remain the prompt-history paths, and autocomplete lists keep their own page navigation.
 - Shared the duplicated two-column dashboard renderer used by agent and extension dashboards, keeping narrow-width truncation behavior in one tested component.
