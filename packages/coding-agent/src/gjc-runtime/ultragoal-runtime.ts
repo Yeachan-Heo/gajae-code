@@ -458,8 +458,8 @@ function latestRelevantLedgerEventId(
 	for (const event of [...ledger].reverse()) {
 		const eventId = ledgerEventId(event);
 		if (eventId && eventId === excludeEventId) continue;
-		const goalId = typeof event.goalId === "string" ? event.goalId : null;
-		if (!goalId || relevant.has(goalId)) return eventId;
+		const goalId = typeof event.goalId === "string" ? event.goalId.trim() : "";
+		if (goalId && relevant.has(goalId)) return eventId;
 	}
 	return null;
 }

@@ -398,6 +398,14 @@ async function passingLiveQualityGate(root: string): Promise<string> {
 	return passingQualityGate();
 }
 
+async function appendTestLedgerEntry(root: string, entry: Record<string, unknown>): Promise<void> {
+	const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+	await fs.appendFile(
+		ledgerPath,
+		`${JSON.stringify({ eventId: `test-${Date.now()}-${Math.random()}`, timestamp: new Date().toISOString(), ...entry })}\n`,
+	);
+}
+
 async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {
 	return (await Bun.file(filePath).json()) as Record<string, unknown>;
 }
@@ -1484,6 +1492,96 @@ describe("native GJC ultragoal runtime", () => {
 
 		expect(plan.goals[1]).toMatchObject({ id: "G002", status: "active" });
 		expect(diagnostic.state).toBe("active_verified_complete");
+	});
+
+	it("keeps receipts fresh after no-goalId annotate_ledger steering", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"steer",
+				"--kind",
+				"annotate_ledger",
+				"--evidence",
+				"operator recorded audit-only completion context after verification",
+				"--rationale",
+				"Audit-only ledger notes must not change completed goal evidence freshness.",
+			],
+			root,
+		);
+		const diagnostic = validateCompletionReceipt({
+			plan,
+			ledger: await readUltragoalLedger(root),
+			goal: plan.goals[0]!,
+			receiptKind: "final-aggregate",
+		});
+
+		expect(result.status).toBe(0);
+		expect(diagnostic.state).toBe("active_verified_complete");
+	});
+
+	it("keeps receipts fresh after no-goalId nudge ledger events", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		await appendTestLedgerEntry(root, {
+			event: "nudge",
+			surface: "ask",
+			reason: "audit-only stale completion prompt without a selected goal",
+		});
+		const diagnostic = validateCompletionReceipt({
+			plan,
+			ledger: await readUltragoalLedger(root),
+			goal: plan.goals[0]!,
+			receiptKind: "final-aggregate",
+		});
+
+		expect(diagnostic.state).toBe("active_verified_complete");
+	});
+
+	it("treats receipts as stale after goal-scoped ledger events", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		await appendTestLedgerEntry(root, {
+			event: "nudge",
+			goalId: "G001",
+			surface: "ask",
+			reason: "goal-scoped post-verification event must invalidate completion freshness",
+		});
+		const diagnostic = validateCompletionReceipt({
+			plan,
+			ledger: await readUltragoalLedger(root),
+			goal: plan.goals[0]!,
+			receiptKind: "final-aggregate",
+		});
+
+		expect(diagnostic.state).toBe("active_stale_receipt");
 	});
 
 	it("treats receipts as stale after target goal mutation", async () => {
