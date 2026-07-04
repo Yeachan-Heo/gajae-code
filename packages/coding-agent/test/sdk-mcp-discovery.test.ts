@@ -11,19 +11,36 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import type { MCPManager } from "../src/runtime-mcp/manager";
 
-function createMcpCustomTool(name: string, serverName: string, mcpToolName: string): CustomTool {
+function createMcpCustomTool(
+	name: string,
+	serverName: string,
+	mcpToolName: string,
+	extra?: { mcpSourceProvider?: string; mcpDiscoveryScope?: "selectable" | "always-on" },
+): CustomTool {
 	return {
 		name,
 		label: `${serverName}/${mcpToolName}`,
 		description: `Tool ${mcpToolName} from ${serverName}`,
 		mcpServerName: serverName,
 		mcpToolName,
+		...(extra?.mcpSourceProvider ? { mcpSourceProvider: extra.mcpSourceProvider } : {}),
+		...(extra?.mcpDiscoveryScope ? { mcpDiscoveryScope: extra.mcpDiscoveryScope } : {}),
 		parameters: z.object({ query: z.string() }),
 		async execute() {
 			return { content: [{ type: "text", text: `${name} executed` }] };
 		},
 	} as CustomTool;
+}
+
+// Minimal stub for the supplied-manager path: createAgentSession skips all
+// callback wiring when options.mcpManager is provided (the
+// `if (mcpManager && !options.mcpManager)` guard), so only getServerInstructions
+// is invoked when building the system prompt.
+function createInstructionsManagerStub(instructions: Record<string, string>): MCPManager {
+	const map = new Map<string, string>(Object.entries(instructions));
+	return { getServerInstructions: () => map } as unknown as MCPManager;
 }
 
 function createLocalCustomTool(name: string): CustomTool {
@@ -550,4 +567,94 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		},
 		SLOW_SDK_TEST_TIMEOUT_MS,
 	);
+
+	const DOCS_INSTRUCTIONS = "DOCS_SERVER_INSTRUCTIONS_SENTINEL_A1B2";
+	const PLUG_INSTRUCTIONS = "PLUG_SERVER_INSTRUCTIONS_SENTINEL_C3D4";
+
+	it("omits instructions for a connected-but-unselected user MCP server in discovery mode", async () => {
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableLsp: false,
+			toolNames: ["read", "search_tool_bm25"],
+			customTools: [createMcpCustomTool("mcp__docs_search", "docs", "search")],
+			mcpManager: createInstructionsManagerStub({ docs: DOCS_INSTRUCTIONS }),
+		});
+
+		try {
+			// The docs tool stays discoverable/unselected, so its server-controlled
+			// instructions must not leak into the prompt before the user opts in.
+			expect(session.getActiveToolNames()).not.toContain("mcp__docs_search");
+			expect(session.systemPrompt.join("\n")).not.toContain(DOCS_INSTRUCTIONS);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("includes instructions for a user MCP server once its tool is selected", async () => {
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableLsp: false,
+			toolNames: ["read", "search_tool_bm25", "mcp__docs_search"],
+			customTools: [createMcpCustomTool("mcp__docs_search", "docs", "search")],
+			mcpManager: createInstructionsManagerStub({ docs: DOCS_INSTRUCTIONS }),
+		});
+
+		try {
+			expect(session.getActiveToolNames()).toContain("mcp__docs_search");
+			expect(session.systemPrompt.join("\n")).toContain(DOCS_INSTRUCTIONS);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("includes instructions for an always-on gjc-plugins MCP server even when unselected", async () => {
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableLsp: false,
+			toolNames: ["read", "search_tool_bm25"],
+			customTools: [
+				createMcpCustomTool("mcp__plug_do", "plug", "do", {
+					mcpSourceProvider: "gjc-plugins",
+					mcpDiscoveryScope: "always-on",
+				}),
+			],
+			mcpManager: createInstructionsManagerStub({ plug: PLUG_INSTRUCTIONS }),
+		});
+
+		try {
+			expect(session.systemPrompt.join("\n")).toContain(PLUG_INSTRUCTIONS);
+		} finally {
+			await session.dispose();
+		}
+	});
 });
