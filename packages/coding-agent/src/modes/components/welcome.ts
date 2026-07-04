@@ -1,6 +1,7 @@
 import { type Component, padding, TERMINAL, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { APP_NAME } from "@gajae-code/utils";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
+import { IMAGE_LOGO_ART_VARIANTS, type ImageLogoArtVariant } from "./welcome-logo-art";
 
 export interface RecentSession {
 	name: string;
@@ -21,9 +22,21 @@ export interface WelcomeComponentOptions {
 	collapseChangelog?: boolean;
 }
 
-const WELCOME_FIXED_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 13;
+const WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 9;
 const DEFAULT_WHATS_NEW_ROWS = 3;
 const MAX_WHATS_NEW_ROWS = 12;
+const FLOW_KEY_ITEMS: ReadonlyArray<{ key: string; label: string }> = [
+	{ key: "/", label: "commands" },
+	{ key: "#", label: "actions" },
+	{ key: "!", label: "shell" },
+	{ key: "$", label: "python" },
+	{ key: "?", label: "keymap" },
+	{ key: "ctrl+l", label: "model" },
+	{ key: "shift+tab", label: "reasoning" },
+	{ key: "tab", label: "complete" },
+	{ key: "alt+enter", label: "newline" },
+	{ key: "ctrl+c", label: "clear" },
+];
 
 /**
  * GJC-native launch surface with compact command affordances, project
@@ -105,8 +118,7 @@ export class WelcomeComponent implements Component {
 		const minRightCol = 24;
 		const modelPill = this.#pill(theme.icon.model || "model", this.modelName, "statusLineModel");
 		const providerPill = this.#pill(theme.icon.package || "provider", this.providerName, "statusLinePath");
-		const logoLines = this.#logoLines();
-		const logoMinWidth = Math.max(...logoLines.map(line => visibleWidth(line)));
+		const logoMinWidth = this.#minimumLogoWidth();
 		const leftMinContentWidth = Math.max(
 			minLeftCol,
 			logoMinWidth,
@@ -127,7 +139,7 @@ export class WelcomeComponent implements Component {
 		const leftCol = showRightColumn ? dualLeftCol : boxWidth - 2;
 		const rightCol = showRightColumn ? dualRightCol : 0;
 
-		const logoColored = this.#currentLogoFrame(logoLines);
+		const logoColored = this.#logoLines(leftCol, targetContentRows);
 
 		const leftLines = [
 			"",
@@ -163,9 +175,22 @@ export class WelcomeComponent implements Component {
 			}
 		}
 
-		const changelogRowLimit = this.#whatsNewRowLimit(targetContentRows, lspLines.length);
+		const flowPreferredRows = this.#flowKeyRows(rightColumnWidth).length;
+		const changelogRowLimit = this.#whatsNewRowLimit(targetContentRows, lspLines.length, flowPreferredRows);
 		const changelogLines = this.#whatsNewLines(rightColumnWidth, changelogRowLimit);
-		const sessionLimit = this.#sessionTrailLimit(targetContentRows, changelogLines.length, lspLines.length);
+		const flowRowLimit = this.#flowKeyRowLimit(
+			targetContentRows,
+			changelogLines.length,
+			lspLines.length,
+			rightColumnWidth,
+		);
+		const flowLines = this.#flowKeyLines(rightColumnWidth, flowRowLimit);
+		const sessionLimit = this.#sessionTrailLimit(
+			targetContentRows,
+			changelogLines.length,
+			lspLines.length,
+			flowLines.length,
+		);
 		const sessionLines = this.#sessionTrailLines(rightColumnWidth, sessionLimit);
 
 		const rightLines = [
@@ -174,19 +199,7 @@ export class WelcomeComponent implements Component {
 			...changelogLines,
 			separator,
 			` ${theme.bold(theme.fg("accent", "Flow keys"))}`,
-			` ${theme.fg("dim", "/")}${theme.fg("muted", " commands")} ${theme.fg("dim", "·")} ${theme.fg(
-				"dim",
-				"#",
-			)}${theme.fg("muted", " actions")}`,
-			` ${theme.fg("dim", "!")}${theme.fg("muted", " shell")} ${theme.fg("dim", "·")} ${theme.fg("dim", "$")}${theme.fg(
-				"muted",
-				" python",
-			)}`,
-			` ${theme.fg("dim", "?")}${theme.fg("muted", " keymap")} ${theme.fg("dim", "·")} ${theme.fg(
-				"dim",
-				"ctrl+l",
-			)}${theme.fg("muted", " model")}`,
-			` ${theme.fg("dim", "shift+tab")}${theme.fg("muted", " reasoning")}`,
+			...flowLines,
 			separator,
 			` ${theme.bold(theme.fg("accent", "Project pulse"))}`,
 			...lspLines,
@@ -305,13 +318,67 @@ export class WelcomeComponent implements Component {
 		return [...Array.from({ length: topPad }, () => ""), ...clipped, ...Array.from({ length: bottomPad }, () => "")];
 	}
 
-	#whatsNewRowLimit(targetContentRows: number | undefined, lspLineCount: number): number {
+	#flowKeyItemText(item: { key: string; label: string }): string {
+		return `${theme.fg("dim", item.key)}${theme.fg("muted", ` ${item.label}`)}`;
+	}
+
+	#flowKeyRows(width: number): string[] {
+		const contentWidth = Math.max(1, width - 1);
+		const separator = ` ${theme.fg("dim", "·")} `;
+		const rows: string[] = [];
+		let current = "";
+		for (const item of FLOW_KEY_ITEMS) {
+			const segment = this.#flowKeyItemText(item);
+			const next = current ? `${current}${separator}${segment}` : segment;
+			if (current && visibleWidth(next) > contentWidth) {
+				rows.push(` ${current}`);
+				current = segment;
+			} else {
+				current = next;
+			}
+		}
+		if (current) rows.push(` ${current}`);
+		return rows.length > 0 ? rows : [` ${theme.fg("dim", "No flow keys")}`];
+	}
+
+	#flowKeyLines(width: number, maxRows: number): string[] {
+		const rows = this.#flowKeyRows(width);
+		const rowLimit = Math.max(1, Math.floor(maxRows));
+		if (rows.length <= rowLimit) return rows;
+		if (rowLimit === 1) {
+			const firstItem = FLOW_KEY_ITEMS[0];
+			const firstSegment = firstItem ? this.#flowKeyItemText(firstItem) : theme.fg("dim", "keys");
+			return [this.#fitToWidth(` ${firstSegment} ${theme.fg("dim", "· … ")}${theme.bold("/help")}`, width)];
+		}
+		return [...rows.slice(0, rowLimit - 1), ` ${theme.fg("dim", `… ${theme.bold("/help")} for more`)}`];
+	}
+
+	#flowKeyRowLimit(
+		targetContentRows: number | undefined,
+		changelogLineCount: number,
+		lspLineCount: number,
+		rightColumnWidth: number,
+	): number {
+		const preferredRows = this.#flowKeyRows(rightColumnWidth).length;
+		if (targetContentRows === undefined) return preferredRows;
+
+		const sessionBaselineRows = this.recentSessions.length === 0 ? 1 : Math.min(3, this.recentSessions.length);
+		const availableRows =
+			targetContentRows -
+			WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS -
+			changelogLineCount -
+			lspLineCount -
+			sessionBaselineRows;
+		return Math.max(1, Math.min(preferredRows, availableRows));
+	}
+
+	#whatsNewRowLimit(targetContentRows: number | undefined, lspLineCount: number, flowLineCount: number): number {
 		if (targetContentRows === undefined) return 5;
 
 		const sessionBaselineRows = this.recentSessions.length === 0 ? 1 : Math.min(3, this.recentSessions.length);
 		const dynamicRows = Math.max(
 			1,
-			targetContentRows - WELCOME_FIXED_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS - lspLineCount,
+			targetContentRows - WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS - flowLineCount - lspLineCount,
 		);
 		const rowsAfterBaselineSessions = Math.max(1, dynamicRows - sessionBaselineRows);
 		const spareRows = Math.max(0, rowsAfterBaselineSessions - DEFAULT_WHATS_NEW_ROWS);
@@ -321,14 +388,23 @@ export class WelcomeComponent implements Component {
 		);
 	}
 
-	#sessionTrailLimit(targetContentRows: number | undefined, changelogLineCount: number, lspLineCount: number): number {
+	#sessionTrailLimit(
+		targetContentRows: number | undefined,
+		changelogLineCount: number,
+		lspLineCount: number,
+		flowLineCount: number,
+	): number {
 		if (this.recentSessions.length === 0) return 0;
 
 		const defaultLimit = Math.min(3, this.recentSessions.length);
 		if (targetContentRows === undefined) return defaultLimit;
 
 		const rowsWithDefaultTrail =
-			WELCOME_FIXED_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS + changelogLineCount + lspLineCount + defaultLimit;
+			WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS +
+			changelogLineCount +
+			flowLineCount +
+			lspLineCount +
+			defaultLimit;
 		const extraRows = Math.max(0, targetContentRows - rowsWithDefaultTrail);
 		return Math.min(this.recentSessions.length, defaultLimit + extraRows);
 	}
@@ -433,11 +509,11 @@ export class WelcomeComponent implements Component {
 		)}`;
 	}
 
-	/** Pick the logo frame for the current intro phase, or the resting frame. */
-	#currentLogoFrame(logoLines: readonly string[]): readonly string[] {
-		if (this.#animStart == null) return REST_FRAMES[this.logoMode];
+	#introAnimation(): ImageLogoAnimation | null {
+		if (this.#animStart == null) return null;
 		const elapsed = performance.now() - this.#animStart;
-		if (elapsed >= INTRO_MS) return REST_FRAMES[this.logoMode];
+		if (elapsed >= INTRO_MS) return null;
+
 		// Ease-out cubic so the spin decelerates into the resting state.
 		const progress = elapsed / INTRO_MS;
 		const eased = 1 - (1 - progress) ** 3;
@@ -447,15 +523,146 @@ export class WelcomeComponent implements Component {
 		// Shine traverses the diagonal at a steady pace, decoupled from the
 		// gradient phase so the two layers parallax. Strength fades out with
 		// the same ease-out curve so the highlight is gone by the resting frame.
-		const shinePos = (((progress * INTRO_SHINE_TRAVERSALS) % 1) + 1) % 1;
-		const shineStrength = (1 - eased) ** 1.5;
-		return gradientLogo(logoLines, phase, { strength: shineStrength, pos: shinePos });
+		const pos = (((progress * INTRO_SHINE_TRAVERSALS) % 1) + 1) % 1;
+		const strength = (1 - eased) ** 1.5;
+		return { phase, pos, strength };
 	}
 
-	#logoLines(): readonly string[] {
+	/** Pick the legacy vector-logo frame for the current intro phase, or the resting frame. */
+	#currentLogoFrame(logoLines: readonly string[]): readonly string[] {
+		const animation = this.#introAnimation();
+		if (!animation) return REST_FRAMES[this.logoMode];
+		return gradientLogo(logoLines, animation.phase, { strength: animation.strength, pos: animation.pos });
+	}
+
+	#legacyLogoLines(): readonly string[] {
 		if (this.logoMode === "ascii") return ASCII_CLAW_LOGO;
 		if (this.logoMode === "square") return SQUARE_CLAW_LOGO;
 		return RED_CLAW_LOGO;
+	}
+
+	#minimumLogoWidth(): number {
+		if (this.logoMode === "unicode" && IMAGE_LOGO_ART_VARIANTS.length > 0) {
+			return Math.min(...IMAGE_LOGO_ART_VARIANTS.map(variant => variant.width));
+		}
+		return Math.max(...this.#legacyLogoLines().map(line => visibleWidth(line)));
+	}
+
+	#logoLines(width: number, targetContentRows: number | undefined): readonly string[] {
+		if (this.logoMode !== "unicode") {
+			return this.#currentLogoFrame(this.#legacyLogoLines());
+		}
+
+		const variant = this.#selectImageLogoVariant(width, targetContentRows);
+		if (!variant) {
+			return this.#currentLogoFrame(RED_CLAW_LOGO);
+		}
+		return this.#currentImageLogoFrame(variant);
+	}
+
+	#selectImageLogoVariant(width: number, targetContentRows: number | undefined): ImageLogoArtVariant | null {
+		const usableWidth = Math.max(1, width - 2);
+		const maxRows = targetContentRows === undefined ? 28 : Math.max(4, targetContentRows - 8);
+		const widthCandidates = IMAGE_LOGO_ART_VARIANTS.filter(variant => variant.width <= usableWidth);
+		const candidates = widthCandidates.filter(variant => variant.rows <= maxRows);
+		const pool = candidates.length > 0 ? candidates : widthCandidates;
+		return pool.reduce<ImageLogoArtVariant | null>((best, variant) => {
+			if (!best) return variant;
+			const bestArea = best.width * best.rows;
+			const variantArea = variant.width * variant.rows;
+			return variantArea > bestArea ? variant : best;
+		}, null);
+	}
+
+	#currentImageLogoFrame(variant: ImageLogoArtVariant): readonly string[] {
+		const animation = this.#introAnimation();
+		return variant.data.map((row, rowIndex) => this.#renderImageLogoRow(row, variant, rowIndex, animation));
+	}
+
+	#renderImageLogoRow(
+		encodedRow: string,
+		variant: ImageLogoArtVariant,
+		rowIndex: number,
+		animation: ImageLogoAnimation | null,
+	): string {
+		let output = "";
+		let activeStyle = "";
+		const setStyle = (style: string): void => {
+			if (style === activeStyle) return;
+			output += style || "\x1b[0m";
+			activeStyle = style;
+		};
+
+		for (let x = 0; x < variant.width; x++) {
+			const cellOffset = x * 6;
+			const upper = this.#decodeImageLogoColor(
+				encodedRow.slice(cellOffset, cellOffset + 3),
+				x,
+				rowIndex * 2,
+				variant,
+				animation,
+			);
+			const lower = this.#decodeImageLogoColor(
+				encodedRow.slice(cellOffset + 3, cellOffset + 6),
+				x,
+				rowIndex * 2 + 1,
+				variant,
+				animation,
+			);
+
+			if (!upper && !lower) {
+				setStyle("");
+				output += " ";
+			} else if (upper && lower) {
+				setStyle(`${this.#ansiRgb(upper, false)}${this.#ansiRgb(lower, true)}`);
+				output += "▀";
+			} else if (upper) {
+				setStyle(this.#ansiRgb(upper, false));
+				output += "▀";
+			} else if (lower) {
+				setStyle(this.#ansiRgb(lower, false));
+				output += "▄";
+			}
+		}
+
+		if (activeStyle) output += "\x1b[0m";
+		return output;
+	}
+
+	#decodeImageLogoColor(
+		hex: string,
+		x: number,
+		pixelY: number,
+		variant: ImageLogoArtVariant,
+		animation: ImageLogoAnimation | null,
+	): [number, number, number] | null {
+		if (hex === "...") return null;
+		const r = Number.parseInt(hex[0] ?? "0", 16) * 17;
+		const g = Number.parseInt(hex[1] ?? "0", 16) * 17;
+		const b = Number.parseInt(hex[2] ?? "0", 16) * 17;
+		if (!animation || animation.strength <= 0) return [r, g, b];
+
+		const span = Math.max(1, variant.width + variant.rows * 2 - 1);
+		const t = ((((x + pixelY + animation.phase * span) % span) + span) % span) / span;
+		const dist = Math.min(Math.abs(t - animation.pos), 1 - Math.abs(t - animation.pos));
+		const intensity = Math.max(0, 1 - dist / SHINE_HALF_WIDTH) * animation.strength;
+		if (intensity <= 0) return [r, g, b];
+
+		return [
+			Math.round(r + (255 - r) * intensity),
+			Math.round(g + (255 - g) * intensity),
+			Math.round(b + (255 - b) * intensity),
+		];
+	}
+
+	#ansiRgb(rgb: [number, number, number], background: boolean): string {
+		const [r, g, b] = rgb;
+		if (TERMINAL.trueColor) {
+			return `\x1b[${background ? 48 : 38};2;${r};${g};${b}m`;
+		}
+
+		const ansi = 16 + 36 * Math.round((r / 255) * 5) + 6 * Math.round((g / 255) * 5) + Math.round((b / 255) * 5);
+		return `\x1b[${background ? 48 : 38};5;${ansi}m`;
 	}
 }
 
@@ -509,6 +716,12 @@ interface ShineConfig {
 	strength: number;
 	/** Center of the shine band along the diagonal, in [0, 1]. */
 	pos: number;
+}
+
+interface ImageLogoAnimation {
+	phase: number;
+	pos: number;
+	strength: number;
 }
 
 /**
