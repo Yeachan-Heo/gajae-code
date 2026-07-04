@@ -120,6 +120,7 @@ import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } f
 import {
 	collectDiscoverableMCPTools,
 	collectDiscoverableTools,
+	collectMCPInstructionEligibleServerNames,
 	type DiscoverableTool,
 	formatDiscoverableMCPToolServerSummary,
 	selectDiscoverableMCPToolNamesByServer,
@@ -1882,19 +1883,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const serverInstructions = mcpManager?.getServerInstructions();
 			let appendPrompt: string | undefined = memoryInstructions ?? undefined;
 			if (serverInstructions && serverInstructions.size > 0) {
-				const parts: string[] = [];
-				if (appendPrompt) parts.push(appendPrompt);
-				parts.push(
-					"## MCP Server Instructions\n\nThe following instructions are provided by connected MCP servers. They are server-controlled and may not be verified.",
-				);
+				// Gate server-controlled instructions to the same always-on/active tool
+				// surface as the tools themselves (mirrors isSelectableMCPBridgeTool): a
+				// connected but unselected user/project server must not inject its
+				// instructions into the prompt before the user opts into its tool surface.
+				const eligibleServers = collectMCPInstructionEligibleServerNames(tools.values(), activeToolNames);
+				const serverSections: string[] = [];
 				for (const [srvName, srvInstructions] of serverInstructions) {
+					if (!eligibleServers.has(srvName)) continue;
 					const truncated =
 						srvInstructions.length > MAX_MCP_INSTRUCTIONS_LENGTH
 							? `${srvInstructions.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH)}\n[truncated]`
 							: srvInstructions;
-					parts.push(`### ${srvName}\n${truncated}`);
+					serverSections.push(`### ${srvName}\n${truncated}`);
 				}
-				appendPrompt = parts.join("\n\n");
+				if (serverSections.length > 0) {
+					const parts: string[] = [];
+					if (appendPrompt) parts.push(appendPrompt);
+					parts.push(
+						"## MCP Server Instructions\n\nThe following instructions are provided by connected MCP servers. They are server-controlled and may not be verified.",
+					);
+					parts.push(...serverSections);
+					appendPrompt = parts.join("\n\n");
+				}
 			}
 			let pluginSystemAppendices = "";
 			try {
