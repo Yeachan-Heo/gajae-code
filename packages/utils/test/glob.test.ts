@@ -43,4 +43,15 @@ describe("globPaths", () => {
 
 		expect(results.sort()).toEqual(["src/keep.ts"]);
 	});
+	it("returns each path once when patterns overlap", async () => {
+		const cwd = await makeTempDir();
+		await mkdir(join(cwd, "src"), { recursive: true });
+		await writeFile(join(cwd, "src", "a.ts"), "export {};\n");
+		await writeFile(join(cwd, "src", "b.ts"), "export {};\n");
+
+		const results = await globPaths(["**/*.ts", "src/*.ts"], { cwd });
+
+		expect(results.sort()).toEqual(["src/a.ts", "src/b.ts"]);
+		expect(results.length).toBe(new Set(results).size);
+	});
 });

@@ -149,6 +149,9 @@ export async function globPaths(patterns: string | string[], options: GlobPathsO
 
 	const base = cwd ?? getProjectDir();
 	const allResults: string[] = [];
+	// Overlapping patterns (e.g. `["**/*.ts", "src/*.ts"]`) can both match the same
+	// file; dedupe so a path is returned at most once regardless of pattern overlap.
+	const seen = new Set<string>();
 
 	// Combine timeout and abort signals
 	const timeoutSignal = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
@@ -176,6 +179,10 @@ export async function globPaths(patterns: string | string[], options: GlobPathsO
 			if (excludeGlobs.some(excludeGlob => excludeGlob.match(normalized))) {
 				continue;
 			}
+			if (seen.has(normalized)) {
+				continue;
+			}
+			seen.add(normalized);
 			allResults.push(normalized);
 		}
 	}
