@@ -413,6 +413,12 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	/** Source provider for source-aware MCP discovery gating. */
+	mcpSourceProvider?: string;
+	/** Source provider display name for source-aware MCP discovery gating. */
+	mcpSourceProviderName?: string;
+	/** Discovery eligibility for source-aware MCP gating. */
+	mcpDiscoveryScope?: "selectable" | "always-on";
 	/** Execute the tool. */
 	execute(
 		toolCallId: string,
