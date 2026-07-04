@@ -54,7 +54,7 @@ This repository includes a portable implementation in `scripts/gjc-session/`. It
 
 The `scripts/gjc-session/` directory contains the public version of the operator helpers:
 
-- `create.sh` validates a dedicated git worktree, starts interactive `gjc` in tmux, preserves the pane after exit, prints and writes the session-specific durable state path, writes `metadata.json`, mirrors pane output to `pane.log`, records lifecycle events in `events.log`, writes normal-exit `final.json`, and optionally registers a Clawhip-style `tmux watch`.
+- `create.sh` validates a dedicated git worktree, starts interactive `gjc` in tmux, preserves the pane after exit, prints and writes the session-specific durable state path, writes `metadata.json`, mirrors pane output to `pane.log`, records lifecycle events in `events.log`, bridges the inner `gjc` process to a public-safe `runtime-state.json`, writes normal-exit `final.json`, and optionally registers a Clawhip-style `tmux watch`.
 - `prompt.sh` sends a text or `@file` prompt only after the pane looks like a ready GJC TUI; if the tmux session vanished, it refuses injection and prints the durable metadata/log/final/events recovery paths plus the last pane-log excerpt.
 - `tail.sh` captures bounded pane output for readiness and acceptance checks, with durable metadata, pane-log, event-log, and final-status fallback when tmux vanished.
 - `harness-tmux-owner-start.sh` starts the GJC harness control plane with the RuntimeOwner resident inside tmux for dogfood/debug cases that need visible owner liveness.
@@ -149,7 +149,7 @@ After prompt delivery, require one of these before reporting that the session is
 - a GitHub comment/review/PR URL,
 - a terminal verdict such as `MERGE_READY` or `REQUEST_CHANGES`.
 
-A prompt being visible in tmux scrollback is not acceptance by itself. If tmux disappears before terminal verdict, inspect the state path printed by `create.sh`: `metadata.json` identifies the worktree/session, `pane.log` contains the mirrored transcript, `events.log` records launch/exit milestones, and `final.json` is present when `gjc` exited normally. Use `tail.sh <session-name> [lines]` to surface these artifacts without a live tmux server.
+A prompt being visible in tmux scrollback is not acceptance by itself. If tmux disappears before terminal verdict, inspect the state path printed by `create.sh`: `metadata.json` identifies the worktree/session and links `runtime-state.json`; `runtime-state.json` contains public-safe GJC lifecycle state (`completed` / `errored`, timestamps, cwd/workdir, branch, session file, exit code/signal/error when available) without pane logs, prompts, transcripts, tokens, config, environment dumps, or raw tool output; `pane.log` contains the private mirrored transcript; `events.log` records launch/exit milestones; `final.json` is present when the wrapper observed `gjc` exit; and `vanished.json` is present when the external monitor observed the tmux session disappear. Use `tail.sh <session-name> [lines]` to surface these artifacts without a live tmux server.
 
 ## Anti-patterns
 

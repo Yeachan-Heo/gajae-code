@@ -48,6 +48,7 @@ show_recovery_hint() {
   echo "durable events: $STATE_DIR/events.log" >&2
   echo "durable final status: $STATE_DIR/final.json" >&2
   echo "durable vanished status: $STATE_DIR/vanished.json" >&2
+  echo "durable runtime state: $RUNTIME_STATE_JSON" >&2
   if [[ -s "$STATE_DIR/pane.log" ]]; then
     echo "--- durable pane log tail ---" >&2
     tail -40 "$STATE_DIR/pane.log" >&2
@@ -74,6 +75,7 @@ if [[ -z "$BRANCH" || "$BRANCH" == "HEAD" ]]; then
 fi
 
 STATE_DIR="${GJC_SESSION_STATE_DIR:-$WORKDIR/.gjc-session-state/$SESSION}"
+RUNTIME_STATE_JSON="$STATE_DIR/runtime-state.json"
 mkdir -p "$STATE_DIR"
 CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 {
@@ -87,6 +89,7 @@ CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '  "paneLog": "%s",\n' "$(printf '%s' "$STATE_DIR/pane.log" | json_escape)"
   printf '  "eventsLog": "%s",\n' "$(printf '%s' "$STATE_DIR/events.log" | json_escape)"
   printf '  "finalStatus": "%s",\n' "$(printf '%s' "$STATE_DIR/final.json" | json_escape)"
+  printf '  "runtimeState": "%s",\n' "$(printf '%s' "$RUNTIME_STATE_JSON" | json_escape)"
   printf '  "vanishedStatus": "%s"\n' "$(printf '%s' "$STATE_DIR/vanished.json" | json_escape)"
   printf '}\n'
 } >"$STATE_DIR/metadata.json"
@@ -102,6 +105,7 @@ printf '[%s] runner started session=%s branch=%s cwd=%s\n' "$started_at" "$GJC_S
 echo "[gjc-session] session=$GJC_SESSION_NAME branch=$GJC_SESSION_BRANCH cwd=$GJC_SESSION_WORKDIR"
 echo "[gjc-session] durable state=$GJC_SESSION_STATE_DIR"
 echo "[gjc-session] durable pane log=$GJC_SESSION_PANE_LOG"
+echo "[gjc-session] durable runtime state=$GJC_COORDINATOR_SESSION_STATE_FILE"
 "$GJC_SESSION_GJC_BIN" $GJC_SESSION_FLAGS
 rc=$?
 finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -116,11 +120,11 @@ if [[ "$turn_evidence" != "true" ]]; then
   owner_exit_reason="owner_exited_before_turn_evidence"
   owner_exit_severity="failure"
 fi
-python3 - "$GJC_SESSION_FINAL_JSON" "$GJC_SESSION_NAME" "$rc" "$started_at" "$finished_at" "$GJC_SESSION_PANE_LOG" "$turn_evidence" "$owner_exit_reason" "$owner_exit_severity" <<'PY'
+python3 - "$GJC_SESSION_FINAL_JSON" "$GJC_SESSION_NAME" "$rc" "$started_at" "$finished_at" "$GJC_SESSION_PANE_LOG" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$turn_evidence" "$owner_exit_reason" "$owner_exit_severity" <<'PY'
 import json
 import sys
 
-path, session, status, started_at, finished_at, pane_log, turn_evidence, owner_exit_reason, owner_exit_severity = sys.argv[1:]
+path, session, status, started_at, finished_at, pane_log, runtime_state, turn_evidence, owner_exit_reason, owner_exit_severity = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -129,6 +133,7 @@ with open(path, "w", encoding="utf-8") as handle:
             "startedAt": started_at,
             "finishedAt": finished_at,
             "paneLog": pane_log,
+            "runtimeState": runtime_state,
             "turnEvidencePresent": turn_evidence == "true",
             "ownerExitReason": owner_exit_reason,
             "severity": owner_exit_severity,
@@ -183,11 +188,11 @@ PYFINAL
     severity="closed_after_final"
   fi
   printf '[%s] tmux session vanished final_present=%s severity=%s\n' "$detected_at" "$final_present" "$severity" >>"$GJC_SESSION_EVENTS_LOG"
-  python3 - "$GJC_SESSION_VANISHED_JSON" "$GJC_SESSION_NAME" "$detected_at" "$GJC_SESSION_WORKDIR" "$GJC_SESSION_BRANCH" "$GJC_SESSION_PANE_LOG" "$GJC_SESSION_EVENTS_LOG" "$GJC_SESSION_FINAL_JSON" "$final_present" "$severity" "$final_severity" <<'PYINNER'
+  python3 - "$GJC_SESSION_VANISHED_JSON" "$GJC_SESSION_NAME" "$detected_at" "$GJC_SESSION_WORKDIR" "$GJC_SESSION_BRANCH" "$GJC_SESSION_PANE_LOG" "$GJC_SESSION_EVENTS_LOG" "$GJC_SESSION_FINAL_JSON" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$final_present" "$severity" "$final_severity" <<'PYINNER'
 import json
 import sys
 
-(path, session, detected_at, workdir, branch, pane_log, events_log, final_json, final_present, severity, final_severity) = sys.argv[1:]
+(path, session, detected_at, workdir, branch, pane_log, events_log, final_json, runtime_state, final_present, severity, final_severity) = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -198,6 +203,7 @@ with open(path, "w", encoding="utf-8") as handle:
             "paneLog": pane_log,
             "eventsLog": events_log,
             "finalStatus": final_json,
+            "runtimeState": runtime_state,
             "finalPresent": final_present == "true",
             "severity": severity,
             "reason": "tmux_session_missing",
@@ -236,6 +242,9 @@ LAUNCH_CMD=(
   "GJC_SESSION_EVENTS_LOG=$STATE_DIR/events.log"
   "GJC_SESSION_FINAL_JSON=$STATE_DIR/final.json"
   "GJC_SESSION_VANISHED_JSON=$STATE_DIR/vanished.json"
+  "GJC_COORDINATOR_SESSION_ID=$SESSION"
+  "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON"
+  "GJC_COORDINATOR_SESSION_BRANCH=$BRANCH"
   "GJC_SESSION_TURN_EVIDENCE_PATTERN=$TURN_EVIDENCE_PATTERN"
   "GJC_SESSION_GJC_BIN=$GJC_BIN"
   "GJC_SESSION_FLAGS=$GJC_FLAGS"
@@ -264,6 +273,7 @@ if [[ "${GJC_SESSION_MONITOR_DISABLE:-0}" != "1" ]]; then
     "GJC_SESSION_EVENTS_LOG=$STATE_DIR/events.log"
     "GJC_SESSION_FINAL_JSON=$STATE_DIR/final.json"
     "GJC_SESSION_VANISHED_JSON=$STATE_DIR/vanished.json"
+    "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON"
     "GJC_SESSION_TMUX_BIN=$TMUX_BIN"
     "GJC_SESSION_MONITOR_INTERVAL=${GJC_SESSION_MONITOR_INTERVAL:-5}"
     "GJC_SESSION_ROUTER_BIN=$ROUTER_BIN"
@@ -318,6 +328,7 @@ echo "  state:   $STATE_DIR"
 echo "  log:     $STATE_DIR/pane.log"
 echo "  events:  $STATE_DIR/events.log"
 echo "  final:   $STATE_DIR/final.json"
+echo "  runtime: $RUNTIME_STATE_JSON"
 echo "  vanish:  $STATE_DIR/vanished.json"
 echo "  tail:    $(dirname "$0")/tail.sh $SESSION"
 echo "  prompt:  $(dirname "$0")/prompt.sh $SESSION @/path/to/prompt.md"

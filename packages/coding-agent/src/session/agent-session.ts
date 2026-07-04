@@ -192,7 +192,10 @@ import {
 	modeStatePath as sessionModeStatePath,
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
-import { persistCoordinatorRuntimeStateFromEvent } from "../gjc-runtime/session-state-sidecar";
+import {
+	persistCoordinatorRuntimeStateFromEvent,
+	registerCoordinatorRuntimeStateFinalizer,
+} from "../gjc-runtime/session-state-sidecar";
 import { writeArtifact } from "../gjc-runtime/state-writer";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
 import { GoalRuntime } from "../goals/runtime";
@@ -1010,6 +1013,7 @@ export class AgentSession {
 	#evalKernelOwnerId: string;
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
+	#unregisterRuntimeStateFinalizer?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -1235,6 +1239,11 @@ export class AgentSession {
 				settings: this.settings,
 			});
 		}
+		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
@@ -3350,6 +3359,8 @@ export class AgentSession {
 		// No-op when this session opened no tabs. Failure is logged, not thrown.
 		this.#unregisterResourceGc?.();
 		this.#unregisterResourceGc = undefined;
+		this.#unregisterRuntimeStateFinalizer?.();
+		this.#unregisterRuntimeStateFinalizer = undefined;
 		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
 			logger.warn("session dispose: releaseTabsForOwner failed", { error }),
 		);

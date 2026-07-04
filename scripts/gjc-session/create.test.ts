@@ -57,7 +57,23 @@ describe("gjc-session create", () => {
 		const worktree = await makeGitWorktree(root);
 		const stateDir = path.join(root, "state");
 		const fakeGjc = path.join(root, "bin", "gjc");
-		await makeExecutable(fakeGjc, "#!/usr/bin/env bash\necho 'booted without accepting work'\nexit 0\n");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+python3 - <<'PY'
+import json
+import os
+with open(os.path.join(os.environ["GJC_SESSION_STATE_DIR"], "env.json"), "w", encoding="utf-8") as handle:
+    json.dump({
+        "sessionId": os.environ.get("GJC_COORDINATOR_SESSION_ID"),
+        "stateFile": os.environ.get("GJC_COORDINATOR_SESSION_STATE_FILE"),
+        "branch": os.environ.get("GJC_COORDINATOR_SESSION_BRANCH"),
+    }, handle)
+PY
+echo 'booted without accepting work'
+exit 0
+`,
+		);
 
 		const result = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
 			env: {
@@ -73,15 +89,30 @@ describe("gjc-session create", () => {
 
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr.toString()).toContain("GJC owner exited before durable turn evidence");
+		expect(result.stderr.toString()).toContain(`durable runtime state: ${path.join(stateDir, "runtime-state.json")}`);
+		const metadata = (await Bun.file(path.join(stateDir, "metadata.json")).json()) as { runtimeState: string };
+		expect(metadata.runtimeState).toBe(path.join(stateDir, "runtime-state.json"));
+		const envDump = (await Bun.file(path.join(stateDir, "env.json")).json()) as {
+			sessionId: string;
+			stateFile: string;
+			branch: string;
+		};
+		expect(envDump).toEqual({
+			sessionId: session,
+			stateFile: path.join(stateDir, "runtime-state.json"),
+			branch: "issue-1385-test",
+		});
 		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as {
 			ownerExitReason: string;
 			severity: string;
 			turnEvidencePresent: boolean;
+			runtimeState: string;
 		};
 		expect(finalStatus).toMatchObject({
 			ownerExitReason: "owner_exited_before_turn_evidence",
 			severity: "failure",
 			turnEvidencePresent: false,
+			runtimeState: path.join(stateDir, "runtime-state.json"),
 		});
 	});
 
@@ -119,12 +150,14 @@ describe("gjc-session create", () => {
 			finalPresent: boolean;
 			reason: string;
 			severity: string;
+			runtimeState: string;
 		};
 		expect(vanished).toMatchObject({
 			finalPresent: false,
 			reason: "tmux_session_missing",
 			severity: "failure",
 		});
+		expect(vanished.runtimeState).toBe(path.join(stateDir, "runtime-state.json"));
 		expect(await Bun.file(routerLog).text()).toContain("tmux stale --session");
 	});
 	test("prompt refuses success without durable turn evidence", async () => {
