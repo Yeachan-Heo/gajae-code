@@ -1555,6 +1555,10 @@ export class AgentSession {
 						recordSkip(`unsupported-content-${block.type}`);
 					}
 				}
+				if (sanitizedContent.length === 0) {
+					recordSkip("empty-content");
+					return undefined;
+				}
 				return { ...cloned, content: sanitizedContent } as Message;
 			}
 			return cloned;

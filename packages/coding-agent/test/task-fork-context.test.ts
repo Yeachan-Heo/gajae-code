@@ -410,6 +410,40 @@ describe("fork context policy surface", () => {
 		expect(renderedPrompt?.join("\n")).toContain("forked snapshot of the parent conversation");
 	});
 
+	test("suppresses fork-context prompt notice for zero-message seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seed = createSeed();
+		seed.messages = [];
+		seed.agentMessages = [];
+		seed.metadata.includedMessages = 0;
+		seed.metadata.skippedMessages = 1;
+		seed.metadata.approximateTokens = 0;
+		seed.metadata.skippedReasons = { "empty-content": 1 };
+		const seedBuilder = vi.fn(async () => seed);
+		const { getOptions } = mockCreateAgentSession();
+		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "EmptyForkSeed",
+					description: "seed",
+					assignment: "Use inherited context.",
+					inheritContext: "bounded",
+				},
+			],
+		});
+
+		expect(getOptions()?.forkContextSeed).toBe(seed);
+		const systemPromptOption = getOptions()?.systemPrompt;
+		const renderedPrompt =
+			typeof systemPromptOption === "function" ? systemPromptOption(["base", "tail"]) : systemPromptOption;
+		const rendered = renderedPrompt?.join("\n") ?? "";
+		expect(rendered).not.toContain("Forked Conversation Snapshot");
+		expect(rendered).not.toContain("forked snapshot of the parent conversation");
+	});
+
 	test("uses configured maxMessages to cap bounded fork-context seeds", async () => {
 		mockAgents([createAgent("executor", "allowed")]);
 		const seed = createSeed();

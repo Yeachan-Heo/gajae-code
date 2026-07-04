@@ -3,7 +3,8 @@ import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel, getBundledModels } from "@gajae-code/ai";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
-import { AgentSession } from "../../src/session/agent-session";
+import { AgentSession, type ForkContextSeed } from "../../src/session/agent-session";
+
 import { AuthStorage } from "../../src/session/auth-storage";
 import { SessionManager } from "../../src/session/session-manager";
 
@@ -28,6 +29,11 @@ const assistant = (text: string) =>
 		stopReason: "stop",
 		timestamp: Date.now(),
 	}) as never;
+const thinkingOnlyAssistant = () => {
+	const message = assistant("hidden") as { content: unknown };
+	message.content = [{ type: "thinking", thinking: "hidden chain of thought" }];
+	return message as never;
+};
 
 async function sessionWith(messages: never[]): Promise<{ session: AgentSession; authStorage: AuthStorage }> {
 	const agent = new Agent({ initialState: { model, systemPrompt: ["sys"], tools: [], messages } });
@@ -42,8 +48,8 @@ async function sessionWith(messages: never[]): Promise<{ session: AgentSession; 
 }
 
 interface SeededResult {
-	messages: Array<{ content?: unknown; providerPayload?: unknown }>;
-	metadata: { includedMessages: number; skippedReasons: Record<string, number> };
+	messages: Array<{ content?: unknown }>;
+	metadata: Pick<ForkContextSeed["metadata"], "includedMessages" | "skippedMessages" | "skippedReasons">;
 }
 
 function buildSeed(session: AgentSession, maxMessages: number, maxTokens: number): Promise<SeededResult> {
@@ -112,6 +118,34 @@ describe("buildForkContextSeed selection", () => {
 			expect(seedTexts(seed)).toEqual(["payload should be stripped"]);
 			expect(seed.messages).toHaveLength(1);
 			expect(seed.messages.every(message => !("providerPayload" in message))).toBe(true);
+		} finally {
+			await session.dispose?.();
+			authStorage.close?.();
+		}
+	});
+
+	it("skips messages whose sanitized content is empty", async () => {
+		const { session, authStorage } = await sessionWith([user("A-old"), thinkingOnlyAssistant(), user("C-recent")]);
+		try {
+			const seed = await buildSeed(session, 10, 10_000);
+			expect(seedTexts(seed)).toEqual(["A-old", "C-recent"]);
+			expect(seed.metadata.includedMessages).toBe(2);
+			expect(seed.metadata.skippedMessages).toBe(1);
+			expect(seed.metadata.skippedReasons["empty-content"]).toBe(1);
+		} finally {
+			await session.dispose?.();
+			authStorage.close?.();
+		}
+	});
+
+	it("returns a zero-message seed when every recent message sanitizes to empty", async () => {
+		const { session, authStorage } = await sessionWith([thinkingOnlyAssistant()]);
+		try {
+			const seed = await buildSeed(session, 10, 10_000);
+			expect(seed.messages).toEqual([]);
+			expect(seed.metadata.includedMessages).toBe(0);
+			expect(seed.metadata.skippedMessages).toBe(1);
+			expect(seed.metadata.skippedReasons["empty-content"]).toBe(1);
 		} finally {
 			await session.dispose?.();
 			authStorage.close?.();
