@@ -1354,6 +1354,69 @@ test("session_closed deletes the topic and resume creates a fresh visible topic"
 	);
 });
 
+test("session_closed tombstones its endpoint generation so scans do not recreate an empty topic", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
+	const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
+	fs.mkdirSync(endpointDir, { recursive: true });
+	fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://live", token: "ts", pid: 4242 }));
+
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		pidAlive: (pid: number) => pid === 4242,
+	});
+
+	const waitForCreate = async () => {
+		for (let i = 0; i < 20; i++) {
+			const create = bot.calls.find(c => c.method === "createForumTopic");
+			if (create) return create;
+			await new Promise(resolve => setTimeout(resolve, 1));
+		}
+		throw new Error("createForumTopic was not called");
+	};
+
+	const waitForTopicRecord = async () => {
+		const topicsFile = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		for (let i = 0; i < 20; i++) {
+			if (fs.existsSync(topicsFile) && fs.readFileSync(topicsFile, "utf8").includes('"S"')) return;
+			await new Promise(resolve => setTimeout(resolve, 1));
+		}
+		throw new Error("topic registry was not persisted");
+	};
+
+	await daemon.scanRoots();
+	expect(FakeWs.instances).toHaveLength(1);
+	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+	await waitForCreate();
+	await waitForTopicRecord();
+
+	bot.calls = [];
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "session_closed", sessionId: "S" });
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(true);
+	expect(daemon.sessions.has("S")).toBe(false);
+
+	bot.calls = [];
+	await daemon.scanRoots();
+	expect(FakeWs.instances).toHaveLength(1);
+	expect(bot.calls.some(c => c.method === "createForumTopic")).toBe(false);
+
+	fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://resumed", token: "ts2", pid: 4242 }));
+	await daemon.scanRoots();
+	expect(FakeWs.instances).toHaveLength(2);
+	FakeWs.instances[1]!.dispatchEvent(new Event("open"));
+	const resumedCreate = await waitForCreate();
+	expect(resumedCreate.body.name).toBe("GJC S");
+});
+
 test("inbound thread message gets a queued reaction, flipped to consumed on ack", async () => {
 	FakeWs.instances = [];
 	const agentDir = tempAgentDir();

@@ -142,6 +142,9 @@ function splitTelegramPlainText(text: string, max = TELEGRAM_MESSAGE_LIMIT): str
 	if (out) chunks.push(out);
 	return chunks;
 }
+function endpointGenerationKey(url: string, token: string): string {
+	return `${url}\0${token}`;
+}
 
 /**
  * Whether `err` is a transient network failure worth retrying. Telegram API
@@ -772,6 +775,7 @@ export interface TelegramDaemonOptions {
 interface SessionSocket {
 	sessionId: string;
 	token: string;
+	endpointKey: string;
 	ws: WebSocket;
 	pending: Map<string, { sessionId: string; actionId: string }>;
 	/** True once the server advertised the `client_ping_pong` capability. */
@@ -808,6 +812,8 @@ export class TelegramNotificationDaemon {
 	private readonly topicOwnerByIdentity = new Map<string, string>();
 	/** Non-identity frames held until identity creates the correct thread. */
 	private readonly pendingThreadedFrames = new Map<string, PendingThreadedFrame[]>();
+	/** Endpoint generation tombstones for sessions that already sent session_closed. */
+	private readonly closedEndpointKeys = new Map<string, string>();
 	/** True once the daemon has nudged the user to enable Threaded Mode. */
 	private threadedFallbackNoticeSent = false;
 	/** Sessions whose identity header was already sent flat (Threaded Mode off). */
@@ -1223,7 +1229,9 @@ export class TelegramNotificationDaemon {
 				matches: msg => msg.type === "session_closed",
 				handle: async session => {
 					this.busy.delete(session.sessionId);
+					this.closedEndpointKeys.set(session.sessionId, session.endpointKey);
 					await this.deleteTopic(session.sessionId);
+					this.dropSession(session, "session_closed");
 				},
 			});
 	}
@@ -1260,6 +1268,9 @@ export class TelegramNotificationDaemon {
 					// would chase a dead, token-bearing record forever.
 					const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
 					if (endpoint.stale || (endpoint.pid !== undefined && !pidAlive(endpoint.pid))) continue;
+					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
+					if (this.closedEndpointKeys.get(sessionId) === endpointKey) continue;
+					this.closedEndpointKeys.delete(sessionId);
 					this.connectSession(sessionId, endpoint.url, endpoint.token);
 				} catch {}
 			}
@@ -1269,9 +1280,12 @@ export class TelegramNotificationDaemon {
 	connectSession(sessionId: string, url: string, token: string): void {
 		const WS = this.opts.WebSocketImpl ?? WebSocket;
 		const ws = new WS(`${url}/?token=${encodeURIComponent(token)}`);
+		const endpointKey = endpointGenerationKey(url, token);
+		this.closedEndpointKeys.delete(sessionId);
 		const session: SessionSocket = {
 			sessionId,
 			token,
+			endpointKey,
 			ws,
 			pending: new Map(),
 			capable: false,

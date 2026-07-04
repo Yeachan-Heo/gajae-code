@@ -18,6 +18,7 @@
 
 - Escape now reliably cancels active context maintenance, handoff generation, retry backoff, and workflow ask dialogs even when transient UI focus or typed drafts would previously consume the key.
 - The session tree picker now keeps its selection index valid when it starts on an empty filter mode, receives navigation input, and then switches back to a populated filter.
+- The Telegram notification daemon now tombstones a session endpoint generation after `session_closed`, preventing the scan loop from reconnecting to the still-live old endpoint and recreating an empty topic immediately after deleting the original topic.
 - The main composer now uses `PageUp` / `PageDown` to page the visible transcript viewport instead of duplicating prompt-history navigation; `Up` / `Down` and `Ctrl+R` remain the prompt-history paths, and autocomplete lists keep their own page navigation.
 - Shared the duplicated two-column dashboard renderer used by agent and extension dashboards, keeping narrow-width truncation behavior in one tested component.
 - Avoided duplicate line splitting when formatting `ast_grep` matches, reducing allocation in large structural-search result rendering.
