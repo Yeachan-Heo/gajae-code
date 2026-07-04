@@ -6,6 +6,10 @@
 
 - Deduplicated `globPaths` results so a path is returned at most once even when overlapping glob patterns (e.g. `["**/*.ts", "src/*.ts"]`) both match the same file.
 
+### Fixed
+
+- Made `$flag` case-insensitive so documented boolean-like env values work regardless of case. Previously only `1` and uppercase `TRUE`/`YES`/`ON`/`Y` were truthy, so the common lowercase spellings (`true`/`yes`/`on`) documented for flags such as `AWS_BEDROCK_SKIP_AUTH`, `PI_HARDWARE_CURSOR`, and `PI_CODEX_DEBUG` silently read as `false`.
+
 ## [0.5.2] - 2026-06-15
 
 ### Fixed

@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
+import { $flag, filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
 
 const tempDirs: string[] = [];
 
@@ -315,5 +315,31 @@ describe("filterProcessEnv", () => {
 			"ProgramFiles(x86)": "C:\\Program Files (x86)",
 			"CommonProgramFiles(x86)": "C:\\Program Files (x86)\\Common Files",
 		});
+	});
+});
+
+describe("$flag", () => {
+	const NAME = "__PI_UTILS_FLAG_PROBE";
+	afterEach(() => {
+		delete process.env[NAME];
+	});
+
+	it("treats documented boolean-like values as truthy regardless of case", () => {
+		for (const value of ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON", "y", "Y", " true "]) {
+			process.env[NAME] = value;
+			expect($flag(NAME)).toBe(true);
+		}
+	});
+
+	it("treats non-boolean-like and falsy values as false", () => {
+		for (const value of ["0", "false", "FALSE", "off", "no", "n", "2", "enabled", ""]) {
+			process.env[NAME] = value;
+			expect($flag(NAME)).toBe(false);
+		}
+	});
+
+	it("returns the default when the variable is unset", () => {
+		expect($flag(NAME)).toBe(false);
+		expect($flag(NAME, true)).toBe(true);
 	});
 });

@@ -272,7 +272,10 @@ export function isCompiledBinary(): boolean {
 
 const TRUTHY: Dict<boolean> = { "1": true, Y: true, TRUE: true, YES: true, ON: true };
 export function $flag(name: string, def: boolean = false): boolean {
-	const value = $env[name];
+	const value = $env[name]?.trim();
 	if (!value) return def;
-	return TRUTHY[value] === true;
+	// Boolean-like env values are documented as case-insensitive (`1`/`true`/`yes`/`on`),
+	// so normalize before the lookup — otherwise `FOO=true` (the common lowercase spelling)
+	// would silently read as false while only `FOO=TRUE`/`FOO=1` worked.
+	return TRUTHY[value.toUpperCase()] === true;
 }
