@@ -966,24 +966,53 @@ function hasTmuxIdentity(session: Record<string, unknown>): boolean {
 	);
 }
 
+function unavailableSessionReason(turn: TurnRecord, reason: string): string {
+	if (
+		reason === "tmux_session_missing" &&
+		turn.delivery.tmux_keys_sent === true &&
+		turn.delivery.prompt_acknowledged === true
+	) {
+		return "tmux_session_missing_after_prompt_acknowledgement";
+	}
+	return reason;
+}
+
+function unavailableSessionEvidence(turn: TurnRecord, reason: string, timestamp: string): Record<string, unknown>[] {
+	if (reason !== "tmux_session_missing_after_prompt_acknowledgement") return turn.evidence;
+	return [
+		...turn.evidence,
+		{
+			type: reason,
+			message:
+				"The tmux session disappeared after GJC runtime acknowledged the prompt, before any terminal final_response or error was recorded. Treat this as an in-flight vanished session and inspect/restart with recovery evidence rather than resubmitting blindly.",
+			tmux_keys_sent: true,
+			prompt_acknowledged: true,
+			prior_status: turn.status,
+			created_at: timestamp,
+		},
+	];
+}
+
 async function markTurnFailedForUnavailableSession(
 	namespaceDir: string,
 	turn: TurnRecord,
 	reason: string,
 ): Promise<TurnRecord> {
 	const timestamp = new Date().toISOString();
+	const durableReason = unavailableSessionReason(turn, reason);
 	const failed: TurnRecord = {
 		...turn,
 		status: "failed",
 		final_response: {
-			text: `Coordinator session unavailable: ${reason}`,
+			text: `Coordinator session unavailable: ${durableReason}`,
 			format: "markdown",
 			source: "coordinator_liveness",
 			artifact_path: null,
 			truncated: false,
 		},
-		error: { code: "session_unavailable", message: reason, recoverable: true },
-		liveness: { checked_at: timestamp, live: false, reason },
+		evidence: unavailableSessionEvidence(turn, durableReason, timestamp),
+		error: { code: "session_unavailable", message: durableReason, recoverable: true },
+		liveness: { checked_at: timestamp, live: false, reason: durableReason },
 		updated_at: timestamp,
 		completed_at: timestamp,
 	};
@@ -992,7 +1021,7 @@ async function markTurnFailedForUnavailableSession(
 	await writeSessionState(namespaceDir, failed.session_id, "stale", {
 		lastTurnId: failed.turn_id,
 		live: false,
-		reason,
+		reason: durableReason,
 	});
 	return failed;
 }

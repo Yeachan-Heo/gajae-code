@@ -620,6 +620,97 @@ describe("Coordinator MCP server protocol", () => {
 		);
 	});
 
+	it("records a durable reason when tmux disappears after prompt acknowledgement", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "acknowledged-tmux-vanish");
+		let tmuxLive = true;
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				commandRunner: async command => {
+					if (command[1] === "has-session") return { exitCode: tmuxLive ? 0 : 1, stdout: "", stderr: "" };
+					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
+					if (command[1] === "capture-pane") return { exitCode: 0, stdout: "working\n", stderr: "" };
+					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+				},
+			},
+		});
+
+		await server.callTool("gjc_coordinator_register_session", {
+			session_id: "visible-session",
+			cwd: root,
+			tmux_session: "visible-session",
+			tmux_target: "visible-session:0.0",
+			visible: true,
+			allow_mutation: true,
+		});
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "do acknowledged work before tmux disappears",
+			allow_mutation: true,
+		});
+		const turnId = sent.turn_id as string;
+		const sessionStatesDir = path.join(stateRoot, "local", "repo", "session-states");
+		await fs.mkdir(sessionStatesDir, { recursive: true });
+		await Bun.write(
+			path.join(sessionStatesDir, "visible-session.json"),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "visible-session",
+				state: "running",
+				ready_for_input: false,
+				current_turn_id: turnId,
+				last_turn_id: null,
+				updated_at: "2026-06-28T00:00:01.000Z",
+				source: "agent_session_event",
+				live: true,
+				reason: "turn_start",
+			}),
+		);
+
+		let read = await server.callTool("gjc_coordinator_read_turn", {
+			session_id: "visible-session",
+			turn_id: turnId,
+		});
+		expect(read).toMatchObject({
+			ok: true,
+			turn: { delivery: { tmux_keys_sent: true, prompt_acknowledged: true, state: "acknowledged" } },
+		});
+
+		tmuxLive = false;
+		read = await server.callTool("gjc_coordinator_read_turn", {
+			session_id: "visible-session",
+			turn_id: turnId,
+		});
+
+		expect(read).toMatchObject({
+			ok: true,
+			turn: {
+				status: "failed",
+				error: {
+					code: "session_unavailable",
+					message: "tmux_session_missing_after_prompt_acknowledgement",
+				},
+				liveness: { live: false, reason: "tmux_session_missing_after_prompt_acknowledgement" },
+			},
+			session_state: { state: "stale", reason: "tmux_session_missing_after_prompt_acknowledgement" },
+		});
+		expect((read.turn as { evidence: Array<Record<string, unknown>> }).evidence).toContainEqual(
+			expect.objectContaining({
+				type: "tmux_session_missing_after_prompt_acknowledgement",
+				tmux_keys_sent: true,
+				prompt_acknowledged: true,
+			}),
+		);
+	});
+
 	it("preserves session-missing failure precedence over runtime ack timeout", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "missing-session-precedence");
