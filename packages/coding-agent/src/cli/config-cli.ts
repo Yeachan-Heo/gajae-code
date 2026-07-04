@@ -33,6 +33,7 @@ export interface ConfigCommandArgs {
 	value?: string;
 	flags: {
 		json?: boolean;
+		showSecrets?: boolean;
 	};
 }
 // =============================================================================
@@ -47,6 +48,19 @@ type CliSettingDef = {
 };
 
 const ALL_SETTING_PATHS = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
+const REDACTED_SECRET_VALUE = "<redacted>";
+const SECRET_SETTING_SEGMENT_PATTERN = /(?:api[-_]?key|token|secret|password|passwd|pwd|credential)/i;
+
+function isSecretSettingPath(path: string): boolean {
+	return path.split(".").some(segment => SECRET_SETTING_SEGMENT_PATTERN.test(segment));
+}
+
+function redactConfigValue(path: string, value: unknown, showSecrets?: boolean): unknown {
+	if (showSecrets || typeof value !== "string" || !isSecretSettingPath(path)) {
+		return value;
+	}
+	return REDACTED_SECRET_VALUE;
+}
 
 /** Find setting definition by path */
 function findSettingDef(path: string): CliSettingDef | undefined {
@@ -105,6 +119,8 @@ export function parseConfigArgs(args: string[]): ConfigCommandArgs | undefined {
 		const arg = args[i];
 		if (arg === "--json") {
 			result.flags.json = true;
+		} else if (arg === "--show-secrets") {
+			result.flags.showSecrets = true;
 		} else if (!arg.startsWith("-")) {
 			positionalArgs.push(arg);
 		}
@@ -265,14 +281,15 @@ export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
 	}
 }
 
-function handleList(flags: { json?: boolean }): void {
+function handleList(flags: { json?: boolean; showSecrets?: boolean }): void {
 	const defs = ALL_SETTING_PATHS.map(path => findSettingDef(path)).filter((def): def is CliSettingDef => !!def);
 
 	if (flags.json) {
 		const result: Record<string, { value: unknown; type: string; description: string }> = {};
 		for (const def of defs) {
+			const value = settings.get(def.path);
 			result[def.path] = {
-				value: settings.get(def.path),
+				value: redactConfigValue(def.path, value, flags.showSecrets),
 				type: def.type,
 				description: def.description,
 			};
@@ -301,7 +318,8 @@ function handleList(flags: { json?: boolean }): void {
 		console.log(chalk.bold.blue(`[${group}]`));
 		for (const def of groups[group]) {
 			const value = settings.get(def.path);
-			const valueStr = formatValue(value);
+			const displayValue = redactConfigValue(def.path, value, flags.showSecrets);
+			const valueStr = formatValue(displayValue);
 			const typeStr = getTypeDisplay(def);
 			console.log(`  ${chalk.white(def.path)} = ${valueStr} ${chalk.dim(typeStr)}`);
 		}
@@ -309,7 +327,7 @@ function handleList(flags: { json?: boolean }): void {
 	}
 }
 
-function handleGet(key: string | undefined, flags: { json?: boolean }): void {
+function handleGet(key: string | undefined, flags: { json?: boolean; showSecrets?: boolean }): void {
 	if (!key) {
 		console.error(chalk.red(`Usage: ${APP_NAME} config get <key>`));
 		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
@@ -324,16 +342,23 @@ function handleGet(key: string | undefined, flags: { json?: boolean }): void {
 	}
 
 	const value = settings.get(def.path);
+	const displayValue = redactConfigValue(def.path, value, flags.showSecrets);
 
 	if (flags.json) {
-		console.log(JSON.stringify({ key: def.path, value, type: def.type, description: def.description }, null, 2));
+		console.log(
+			JSON.stringify({ key: def.path, value: displayValue, type: def.type, description: def.description }, null, 2),
+		);
 		return;
 	}
 
-	console.log(formatValue(value));
+	console.log(formatValue(displayValue));
 }
 
-async function handleSet(key: string | undefined, value: string | undefined, flags: { json?: boolean }): Promise<void> {
+async function handleSet(
+	key: string | undefined,
+	value: string | undefined,
+	flags: { json?: boolean; showSecrets?: boolean },
+): Promise<void> {
 	if (!key || value === undefined) {
 		console.error(chalk.red(`Usage: ${APP_NAME} config set <key> <value>`));
 		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
@@ -355,11 +380,12 @@ async function handleSet(key: string | undefined, value: string | undefined, fla
 	}
 
 	const newValue = settings.get(def.path);
+	const displayValue = redactConfigValue(def.path, newValue, flags.showSecrets);
 
 	if (flags.json) {
-		console.log(JSON.stringify({ key: def.path, value: newValue }));
+		console.log(JSON.stringify({ key: def.path, value: displayValue }));
 	} else {
-		console.log(chalk.green(`${theme.status.success} Set ${def.path} = ${formatValue(newValue)}`));
+		console.log(chalk.green(`${theme.status.success} Set ${def.path} = ${formatValue(displayValue)}`));
 	}
 }
 
@@ -409,6 +435,7 @@ ${chalk.bold("Commands:")}
 
 ${chalk.bold("Options:")}
   --json             Output as JSON
+  --show-secrets     Show secret-like setting values without redaction (unsafe)
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} config list
@@ -418,6 +445,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} config set defaultThinkingLevel medium
   ${APP_NAME} config reset steeringMode
   ${APP_NAME} config list --json
+  ${APP_NAME} config get auth.broker.token --show-secrets
   ${APP_NAME} config init-xdg
 
 ${chalk.bold("Boolean Values:")}

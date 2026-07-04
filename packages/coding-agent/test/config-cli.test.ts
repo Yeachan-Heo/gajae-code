@@ -127,4 +127,80 @@ describe("config CLI schema coverage", () => {
 			value: 600,
 		});
 	});
+
+	describe("secret redaction", () => {
+		it("redacts secret-like values in list, get, and set output by default", async () => {
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			const brokerSecret = "broker-token-secret-123";
+			const apiSecret = "hindsight-api-token-secret-123";
+
+			await runConfigCommand({
+				action: "set",
+				key: "auth.broker.token",
+				value: brokerSecret,
+				flags: { json: true },
+			});
+			await runConfigCommand({ action: "set", key: "hindsight.apiToken", value: apiSecret, flags: { json: true } });
+			await runConfigCommand({ action: "get", key: "auth.broker.token", flags: { json: true } });
+			await runConfigCommand({ action: "list", flags: { json: true } });
+
+			const setPayload = JSON.parse(String(logSpy.mock.calls.at(-4)?.[0])) as { value: unknown };
+			const apiTokenSetPayload = JSON.parse(String(logSpy.mock.calls.at(-3)?.[0])) as { value: unknown };
+			const getPayload = JSON.parse(String(logSpy.mock.calls.at(-2)?.[0])) as { value: unknown };
+			const listPayload = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as Record<string, { value: unknown }>;
+
+			expect(setPayload.value).toBe("<redacted>");
+			expect(apiTokenSetPayload.value).toBe("<redacted>");
+			expect(getPayload.value).toBe("<redacted>");
+			expect(listPayload["auth.broker.token"]?.value).toBe("<redacted>");
+			expect(listPayload["hindsight.apiToken"]?.value).toBe("<redacted>");
+			expect(JSON.stringify(setPayload)).not.toContain(brokerSecret);
+			expect(JSON.stringify(apiTokenSetPayload)).not.toContain(apiSecret);
+			expect(JSON.stringify(getPayload)).not.toContain(brokerSecret);
+			expect(JSON.stringify(listPayload)).not.toContain(brokerSecret);
+			expect(JSON.stringify(listPayload)).not.toContain(apiSecret);
+		});
+
+		it("keeps non-secret booleans visible while redacting secret-shaped keys in text output", async () => {
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			const secret = "telegram-token-secret-456";
+
+			await runConfigCommand({
+				action: "set",
+				key: "notifications.telegram.botToken",
+				value: secret,
+				flags: { json: true },
+			});
+			await runConfigCommand({ action: "set", key: "notifications.enabled", value: "true", flags: { json: true } });
+			await runConfigCommand({ action: "get", key: "notifications.enabled", flags: {} });
+			const enabledGet = Bun.stripANSI(String(logSpy.mock.calls.at(-1)?.[0]));
+			await runConfigCommand({ action: "list", flags: {} });
+
+			const listOutput = logSpy.mock.calls.map(call => Bun.stripANSI(String(call[0] ?? ""))).join("\n");
+
+			expect(enabledGet).toBe("true");
+			expect(listOutput).toContain("notifications.enabled = true");
+			expect(listOutput).toContain("notifications.telegram.botToken = <redacted>");
+			expect(listOutput).not.toContain(secret);
+		});
+
+		it("shows secret-like values only with the explicit unsafe opt-in", async () => {
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			const secret = "broker-token-secret-789";
+
+			await runConfigCommand({
+				action: "set",
+				key: "auth.broker.token",
+				value: secret,
+				flags: { json: true, showSecrets: true },
+			});
+			await runConfigCommand({ action: "get", key: "auth.broker.token", flags: { json: true, showSecrets: true } });
+
+			const setPayload = JSON.parse(String(logSpy.mock.calls.at(-2)?.[0])) as { value: unknown };
+			const getPayload = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as { value: unknown };
+
+			expect(setPayload.value).toBe(secret);
+			expect(getPayload.value).toBe(secret);
+		});
+	});
 });

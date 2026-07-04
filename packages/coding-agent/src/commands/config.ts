@@ -29,6 +29,7 @@ export default class Config extends Command {
 
 	static flags = {
 		json: Flags.boolean({ description: "Output JSON" }),
+		"show-secrets": Flags.boolean({ description: "Show secret-like setting values without redaction (unsafe)" }),
 	};
 
 	async run(): Promise<void> {
@@ -42,6 +43,7 @@ export default class Config extends Command {
 			value,
 			flags: {
 				json: flags.json,
+				showSecrets: flags["show-secrets"],
 			},
 		};
 
