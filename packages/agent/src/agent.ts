@@ -960,7 +960,6 @@ export class Agent {
 		return removed;
 	}
 
-
 	/**
 	 * Remove and return the last follow-up message from the queue (LIFO).
 	 * Used by dequeue keybinding.
