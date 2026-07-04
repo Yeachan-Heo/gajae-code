@@ -160,6 +160,62 @@ exit 0
 		expect(vanished.runtimeState).toBe(path.join(stateDir, "runtime-state.json"));
 		expect(await Bun.file(routerLog).text()).toContain("tmux stale --session");
 	});
+	test("external monitor records vanished sessions after prompt acceptance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-post-accept-vanish-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_post_accept_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+printf 'Gajae forge\\n> Type your message\\n'
+IFS= read -r line
+printf '\\nWorking on accepted prompt\\n'
+sleep 60
+`,
+		);
+
+		const created = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: {
+				...process.env,
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_INTERVAL: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			},
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(created.exitCode).toBe(0);
+
+		const prompted = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "do accepted work"], {
+			env: {
+				...process.env,
+				GJC_SESSION_STATE_DIR: stateDir,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "1",
+			},
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(prompted.exitCode).toBe(0);
+
+		Bun.spawnSync(["tmux", "kill-session", "-t", session], { stderr: "pipe", stdout: "pipe" });
+		await waitForFile(path.join(stateDir, "vanished.json"));
+
+		const vanished = (await Bun.file(path.join(stateDir, "vanished.json")).json()) as {
+			promptAccepted: boolean;
+			reason: string;
+			severity: string;
+		};
+		expect(vanished).toMatchObject({
+			promptAccepted: true,
+			reason: "tmux_session_missing_after_prompt_acceptance",
+			severity: "failure",
+		});
+	}, 20000);
 	test("prompt refuses success without durable turn evidence", async () => {
 		const session = `gjc_issue_1385_prompt_${process.pid}_${Date.now()}`;
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-"));

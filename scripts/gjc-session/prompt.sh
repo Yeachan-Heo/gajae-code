@@ -24,6 +24,49 @@ find_durable_pane_logs() {
   fi
 }
 
+prompt_accepted_path() {
+  if [[ -n "${GJC_SESSION_STATE_DIR:-}" ]]; then
+    printf '%s\n' "$GJC_SESSION_STATE_DIR/prompt-accepted.json"
+    return 0
+  fi
+  local candidates=()
+  mapfile -t candidates < <(find_durable_pane_logs)
+  if [[ "${#candidates[@]}" -gt 0 ]]; then
+    printf '%s\n' "$(dirname "${candidates[0]}")/prompt-accepted.json"
+  fi
+}
+
+record_prompt_accepted() {
+  local accepted_path
+  accepted_path="$(prompt_accepted_path)"
+  if [[ -z "$accepted_path" ]]; then
+    return 0
+  fi
+  local accepted_at
+  accepted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  mkdir -p "$(dirname "$accepted_path")"
+  local accepted_dir
+  accepted_dir="$(dirname "$accepted_path")"
+  python3 - "$accepted_path" "$SESSION" "$accepted_at" "$accepted_dir/pane.log" <<'PY'
+import json
+import sys
+
+path, session, accepted_at, pane_log = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "session": session,
+            "acceptedAt": accepted_at,
+            "evidence": "durable_turn_evidence",
+            "paneLog": pane_log,
+        },
+        handle,
+        indent=2,
+    )
+    handle.write("\n")
+PY
+}
+
 has_turn_evidence() {
   local log_path="${1:-}"
   local log_offset="${2:-0}"
@@ -117,6 +160,7 @@ for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
     exit 1
   fi
   if has_turn_evidence "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET"; then
+    record_prompt_accepted
     echo "sent to $SESSION with durable turn evidence: ${TEXT:0:80}..."
     exit 0
   fi

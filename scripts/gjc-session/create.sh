@@ -90,7 +90,8 @@ CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '  "eventsLog": "%s",\n' "$(printf '%s' "$STATE_DIR/events.log" | json_escape)"
   printf '  "finalStatus": "%s",\n' "$(printf '%s' "$STATE_DIR/final.json" | json_escape)"
   printf '  "runtimeState": "%s",\n' "$(printf '%s' "$RUNTIME_STATE_JSON" | json_escape)"
-  printf '  "vanishedStatus": "%s"\n' "$(printf '%s' "$STATE_DIR/vanished.json" | json_escape)"
+  printf '  "vanishedStatus": "%s",\n' "$(printf '%s' "$STATE_DIR/vanished.json" | json_escape)"
+  printf '  "promptAcceptedStatus": "%s"\n' "$(printf '%s' "$STATE_DIR/prompt-accepted.json" | json_escape)"
   printf '}\n'
 } >"$STATE_DIR/metadata.json"
 : >"$STATE_DIR/pane.log"
@@ -183,16 +184,22 @@ except Exception:
 PYFINAL
 )"
   fi
+  prompt_accepted=false
+  [[ -s "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}" ]] && prompt_accepted=true
+  vanish_reason="tmux_session_missing"
+  if [[ "$prompt_accepted" == "true" && "$final_present" != "true" ]]; then
+    vanish_reason="tmux_session_missing_after_prompt_acceptance"
+  fi
   severity="failure"
   if [[ "$final_present" == "true" && "$final_severity" == "normal" ]]; then
     severity="closed_after_final"
   fi
-  printf '[%s] tmux session vanished final_present=%s severity=%s\n' "$detected_at" "$final_present" "$severity" >>"$GJC_SESSION_EVENTS_LOG"
-  python3 - "$GJC_SESSION_VANISHED_JSON" "$GJC_SESSION_NAME" "$detected_at" "$GJC_SESSION_WORKDIR" "$GJC_SESSION_BRANCH" "$GJC_SESSION_PANE_LOG" "$GJC_SESSION_EVENTS_LOG" "$GJC_SESSION_FINAL_JSON" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$final_present" "$severity" "$final_severity" <<'PYINNER'
+  printf '[%s] tmux session vanished final_present=%s prompt_accepted=%s severity=%s reason=%s\n' "$detected_at" "$final_present" "$prompt_accepted" "$severity" "$vanish_reason" >>"$GJC_SESSION_EVENTS_LOG"
+  python3 - "$GJC_SESSION_VANISHED_JSON" "$GJC_SESSION_NAME" "$detected_at" "$GJC_SESSION_WORKDIR" "$GJC_SESSION_BRANCH" "$GJC_SESSION_PANE_LOG" "$GJC_SESSION_EVENTS_LOG" "$GJC_SESSION_FINAL_JSON" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$final_present" "$severity" "$final_severity" "$prompt_accepted" "$vanish_reason" "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}" <<'PYINNER'
 import json
 import sys
 
-(path, session, detected_at, workdir, branch, pane_log, events_log, final_json, runtime_state, final_present, severity, final_severity) = sys.argv[1:]
+(path, session, detected_at, workdir, branch, pane_log, events_log, final_json, runtime_state, final_present, severity, final_severity, prompt_accepted, reason, prompt_accepted_json) = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -206,8 +213,10 @@ with open(path, "w", encoding="utf-8") as handle:
             "runtimeState": runtime_state,
             "finalPresent": final_present == "true",
             "severity": severity,
-            "reason": "tmux_session_missing",
+            "reason": reason,
             "finalSeverity": final_severity,
+            "promptAccepted": prompt_accepted == "true",
+            "promptAcceptedStatus": prompt_accepted_json or None,
         },
         handle,
         indent=2,
@@ -273,6 +282,7 @@ if [[ "${GJC_SESSION_MONITOR_DISABLE:-0}" != "1" ]]; then
     "GJC_SESSION_EVENTS_LOG=$STATE_DIR/events.log"
     "GJC_SESSION_FINAL_JSON=$STATE_DIR/final.json"
     "GJC_SESSION_VANISHED_JSON=$STATE_DIR/vanished.json"
+    "GJC_SESSION_PROMPT_ACCEPTED_JSON=$STATE_DIR/prompt-accepted.json"
     "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON"
     "GJC_SESSION_TMUX_BIN=$TMUX_BIN"
     "GJC_SESSION_MONITOR_INTERVAL=${GJC_SESSION_MONITOR_INTERVAL:-5}"
