@@ -1520,12 +1520,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		let notificationCfg: NotificationConfig | undefined;
 		try {
-			notificationCfg = getNotificationConfig(Settings.instance);
+			notificationCfg = getNotificationConfig(settings);
 		} catch {
 			notificationCfg = undefined;
 		}
-		if (shouldRegisterNotificationsExtension({ env: process.env, cfg: notificationCfg })) {
-			inlineExtensions.push(createNotificationsExtension);
+		if (
+			shouldRegisterNotificationsExtension({
+				env: process.env,
+				cfg: notificationCfg,
+				taskDepth,
+				parentTaskPrefix: options.parentTaskPrefix,
+			})
+		) {
+			inlineExtensions.push(api => createNotificationsExtension(api, { settings }));
 		}
 
 		// Extension/module discovery is quarantined; retain only the private

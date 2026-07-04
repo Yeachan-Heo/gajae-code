@@ -52,7 +52,12 @@ export function isGloballyConfigured(cfg: NotificationConfig): boolean {
 export function shouldRegisterNotificationsExtension(input: {
 	env: NodeJS.ProcessEnv;
 	cfg?: NotificationConfig;
+	/** Task recursion depth; helper/subagent sessions must not spawn remote surfaces. */
+	taskDepth?: number;
+	/** Parent subagent id/prefix; present for helper/subagent sessions even when depth is omitted. */
+	parentTaskPrefix?: string;
 }): boolean {
+	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix) return false;
 	if (input.env.GJC_NOTIFICATIONS === "0") return false;
 	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
 	return input.cfg ? isGloballyConfigured(input.cfg) : false;

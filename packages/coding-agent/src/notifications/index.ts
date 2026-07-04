@@ -28,7 +28,7 @@ import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger, postmortem } from "@gajae-code/utils";
 import { Settings } from "../config/settings";
-import type { ExtensionCommandContext, ExtensionContext, ExtensionFactory } from "../extensibility/extensions";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../extensibility/extensions";
 import { registerAskAnswerSource } from "../tools/ask-answer-registry";
 import { registerTelegramFileSink } from "./attachment-registry";
 import {
@@ -379,7 +379,9 @@ export function notificationsEnabled(): boolean {
 	return process.env.GJC_NOTIFICATIONS === "1" || Boolean(process.env.GJC_NOTIFICATIONS_TOKEN);
 }
 
-function resolveSettings(): ResolvedSettings {
+function resolveSettings(settingsOverride?: Settings): ResolvedSettings {
+	if (settingsOverride)
+		return { settings: settingsOverride, cfg: getNotificationConfig(settingsOverride), settingsAvailable: true };
 	try {
 		const settings = Settings.instance;
 		return { settings, cfg: getNotificationConfig(settings), settingsAvailable: true };
@@ -491,7 +493,7 @@ function sessionIdFromFile(file: string | undefined): string | undefined {
 	return underscore >= 0 ? base.slice(underscore + 1) : undefined;
 }
 
-export const createNotificationsExtension: ExtensionFactory = api => {
+export function createNotificationsExtension(api: ExtensionAPI, options: { settings?: Settings } = {}): void {
 	const runtimes = new Map<string, SessionRuntime>();
 	const disabledSessions = new Set<string>();
 	const sessionId = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
@@ -531,7 +533,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 
 	async function startSession(ctx: ExtensionContext): Promise<"started" | "already" | "disabled" | "failed"> {
 		const id = sessionId(ctx);
-		const { settings, cfg, settingsAvailable } = resolveSettings();
+		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
 		if (!isEnabledForSession(id, cfg)) return "disabled";
 		if (runtimes.has(id)) return "already";
 
@@ -761,7 +763,7 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 		async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
 			const id = sessionId(ctx);
 			const command = args.trim().split(/\s+/, 1)[0]?.toLowerCase() || "status";
-			const resolved = resolveSettings();
+			const resolved = resolveSettings(options.settings);
 			const enabledWithoutLocalOff = isSessionNotificationsEnabled({
 				cfg: resolved.cfg,
 				env: process.env,
@@ -1099,4 +1101,4 @@ export const createNotificationsExtension: ExtensionFactory = api => {
 	api.on("session_shutdown", async (_event, ctx) => {
 		await stopSession(sessionId(ctx));
 	});
-};
+}
