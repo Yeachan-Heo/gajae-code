@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
+import { getBundledProviders } from "@gajae-code/ai";
 import { YAML } from "bun";
 import { type ModelsConfig, ModelsConfigSchema } from "../config/models-config-schema";
 
@@ -354,5 +355,65 @@ export function formatProviderSetupResult(result: ProviderSetupResult): string {
 		`Base URL: ${result.baseUrl}`,
 		`API key: ${result.credentialSource === "env" ? `${result.redactedApiKey} (environment variable)` : result.redactedApiKey}`,
 		`Config: ${result.modelsPath}`,
+	].join("\n");
+}
+
+export interface ProviderRemoveInput {
+	providerId: string;
+	modelsPath?: string;
+}
+
+export interface ProviderRemoveResult {
+	providerId: string;
+	modelsPath: string;
+	remainingProviders: string[];
+}
+
+function isBundledProvider(providerId: string): boolean {
+	return (getBundledProviders() as readonly string[]).includes(providerId);
+}
+
+export async function removeProvider(input: ProviderRemoveInput): Promise<ProviderRemoveResult> {
+	const providerId = normalizeProviderId(input.providerId);
+	if (!providerId) throw new Error("Provider id is required.");
+	const modelsPath = input.modelsPath ?? getDefaultModelsPath();
+
+	if (!(await Bun.file(modelsPath).exists())) {
+		throw new Error(`No models config found at ${modelsPath}; nothing to remove.`);
+	}
+
+	const existing = await readModelsConfig(modelsPath);
+	// INV1: user-config presence wins over bundled detection. Only consult the
+	// bundled catalog to choose the error message when the id is absent here.
+	if (!existing.providers?.[providerId]) {
+		if (isBundledProvider(providerId)) {
+			throw new Error(
+				`Provider '${providerId}' is a bundled provider and cannot be removed; only user-added providers in ${modelsPath} can be removed.`,
+			);
+		}
+		throw new Error(`Provider '${providerId}' is not configured in ${modelsPath}.`);
+	}
+
+	const remainingEntries = Object.entries(existing.providers).filter(([id]) => id !== providerId);
+	const next: ModelsConfig = { ...existing };
+	if (remainingEntries.length === 0) {
+		delete next.providers;
+	} else {
+		next.providers = Object.fromEntries(remainingEntries);
+	}
+	await writeModelsConfig(modelsPath, next);
+
+	return {
+		providerId,
+		modelsPath,
+		remainingProviders: remainingEntries.map(([id]) => id).sort((a, b) => a.localeCompare(b)),
+	};
+}
+
+export function formatProviderRemoveResult(result: ProviderRemoveResult): string {
+	return [
+		`Provider '${result.providerId}' removed.`,
+		`Config: ${result.modelsPath}`,
+		`Remaining providers: ${result.remainingProviders.length > 0 ? result.remainingProviders.join(", ") : "none"}`,
 	].join("\n");
 }

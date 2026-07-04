@@ -29,8 +29,10 @@ import { buildHostPluginSetup, formatHostPluginSetup, type HostPluginKind } from
 import {
 	addApiCompatibleProvider,
 	formatProviderPresetList,
+	formatProviderRemoveResult,
 	formatProviderSetupResult,
 	parseProviderCompatibility,
+	removeProvider,
 } from "../setup/provider-onboarding";
 
 export type SetupComponent =
@@ -53,6 +55,7 @@ export interface SetupCommandArgs {
 		preset?: string;
 		compat?: string;
 		provider?: string;
+		remove?: string;
 		baseUrl?: string;
 		apiKeyEnv?: string;
 		model?: string[];
@@ -98,7 +101,8 @@ function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 		flags.baseUrl !== undefined ||
 		flags.apiKeyEnv !== undefined ||
 		flags.model !== undefined ||
-		flags.modelsPath !== undefined
+		flags.modelsPath !== undefined ||
+		flags.remove !== undefined
 	);
 }
 
@@ -179,6 +183,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.preset = args[++i];
 		} else if (arg === "--provider") {
 			flags.provider = args[++i];
+		} else if (arg === "--remove") {
+			flags.remove = args[++i];
 		} else if (arg === "--base-url") {
 			flags.baseUrl = args[++i];
 		} else if (arg === "--api-key") {
@@ -275,7 +281,11 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 			await handleHooksSetup(cmd.flags);
 			break;
 		case "provider":
-			await handleProviderSetup(cmd.flags);
+			if (cmd.flags.remove !== undefined) {
+				await handleProviderRemoval(cmd.flags);
+			} else {
+				await handleProviderSetup(cmd.flags);
+			}
 			break;
 		case "python":
 			await handlePythonSetup(cmd.flags);
@@ -325,6 +335,64 @@ function handleHostPluginSetup(host: HostPluginKind, flags: SetupCommandArgs["fl
 	process.stdout.write(`${chalk.green(`${theme.status.success} ${label} plugin setup ready`)}\n`);
 	process.stdout.write(`${chalk.dim(formatHostPluginSetup(result))}\n`);
 }
+export function resolveProviderRemovalTarget(flags: {
+	remove?: string;
+	preset?: string;
+	compat?: string;
+	provider?: string;
+	baseUrl?: string;
+	apiKeyEnv?: string;
+	model?: string[];
+}): string {
+	const target = (flags.remove ?? "").trim();
+	if (!target) {
+		throw new Error("--remove requires a provider id, e.g. --remove my-oai.");
+	}
+	const conflicting: string[] = [];
+	if (flags.preset) conflicting.push("--preset");
+	if (flags.compat) conflicting.push("--compat");
+	if (flags.provider) conflicting.push("--provider");
+	if (flags.baseUrl) conflicting.push("--base-url");
+	if (flags.apiKeyEnv) conflicting.push("--api-key-env");
+	if (flags.model && flags.model.length > 0) conflicting.push("--model");
+	if (conflicting.length > 0) {
+		throw new Error(`--remove cannot be combined with provider add option(s): ${conflicting.join(", ")}.`);
+	}
+	return target;
+}
+
+async function handleProviderRemoval(flags: {
+	json?: boolean;
+	remove?: string;
+	modelsPath?: string;
+	preset?: string;
+	compat?: string;
+	provider?: string;
+	baseUrl?: string;
+	apiKeyEnv?: string;
+	model?: string[];
+}): Promise<void> {
+	try {
+		const target = resolveProviderRemovalTarget(flags);
+		const result = await removeProvider({ providerId: target, modelsPath: flags.modelsPath });
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify({ ok: true, ...result }, null, 2)}\n`);
+			return;
+		}
+		process.stdout.write(`${chalk.green(`${theme.status.success} Provider removed`)}\n`);
+		process.stdout.write(`${chalk.dim(formatProviderRemoveResult(result))}\n`);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
+		} else {
+			process.stderr.write(`${chalk.red(`${theme.status.error} Provider removal failed`)}\n`);
+			process.stderr.write(`${chalk.dim(message)}\n`);
+		}
+		process.exit(1);
+	}
+}
+
 async function handleProviderSetup(flags: {
 	json?: boolean;
 	force?: boolean;
@@ -726,6 +794,7 @@ ${chalk.bold("Provider example:")}
   ${APP_NAME} setup provider --preset minimax
   ${APP_NAME} setup provider --preset glm
   MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --model gpt-example
+  ${APP_NAME} setup provider --remove my-oai
 
 ${chalk.bold("Hermes example:")}
   ${APP_NAME} setup hermes --root /path/to/repo
@@ -740,6 +809,7 @@ ${chalk.bold("Options:")}
   --preset          Provider preset: minimax, minimax-cn, or glm (aliases include minimax-code and zai)
   --compat          Provider compatibility: openai or anthropic
   --provider        Provider id to add to models.yml
+  --remove          Provider id to remove from models.yml (rejects add flags)
   --base-url        Provider API base URL
   --api-key-env     Read provider API key from this environment variable
   --model, --models Model id to add (repeat or comma-separate)
