@@ -57,6 +57,45 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		expect(mcpManager?.getConnectedServers()).toEqual([]);
 	}, 30_000);
 
+	test("keeps plugin-bundle MCP tools always-on when MCP discovery is enabled", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-discovery-"));
+
+		tempDirs.push(cwd);
+		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+
+		const { session, mcpManager } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			sessionManager: SessionManager.inMemory(cwd),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		try {
+			expect(mcpManager).toBeDefined();
+			expect(mcpManager?.getConnectedServers()).toContain("domain_docs");
+
+			const lookup = session.getAllToolNames().find(n => n.includes("lookup"));
+			expect(lookup).toBeDefined();
+			expect(session.getActiveToolNames()).toContain(lookup as string);
+			expect(session.getDiscoverableMCPTools().map(tool => tool.name)).not.toContain(lookup as string);
+			expect(session.getSelectedMCPToolNames()).not.toContain(lookup as string);
+			expect(session.systemPrompt.join("\n")).not.toContain("### MCP tool discovery");
+		} finally {
+			await session.dispose();
+		}
+
+		expect(mcpManager?.getConnectedServers()).toEqual([]);
+	}, 30_000);
+
 	test("does not connect any MCP server when no plugin bundle is installed", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-empty-"));
 		tempDirs.push(cwd);

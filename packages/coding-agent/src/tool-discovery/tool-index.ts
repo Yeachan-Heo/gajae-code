@@ -115,6 +115,16 @@ export function isMCPBridgeTool(tool: { name: string; mcpServerName?: unknown; m
 	);
 }
 
+function isSelectableMCPBridgeTool(tool: {
+	name: string;
+	mcpServerName?: unknown;
+	mcpToolName?: unknown;
+	mcpSourceProvider?: unknown;
+	mcpDiscoveryScope?: unknown;
+}): boolean {
+	return isMCPBridgeTool(tool) && tool.mcpSourceProvider !== "gjc-plugins" && tool.mcpDiscoveryScope !== "always-on";
+}
+
 function getSchemaPropertyKeys(parameters: unknown): string[] {
 	if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) return [];
 	const properties = (parameters as { properties?: unknown }).properties;
@@ -315,9 +325,11 @@ export function getDiscoverableMCPTool(tool: AgentTool): DiscoverableMCPTool | n
 		description?: string;
 		mcpServerName?: string;
 		mcpToolName?: string;
+		mcpSourceProvider?: string;
+		mcpDiscoveryScope?: "selectable" | "always-on";
 		parameters?: unknown;
 	};
-	if (!isMCPBridgeTool(toolRecord)) return null;
+	if (!isSelectableMCPBridgeTool(toolRecord)) return null;
 	return {
 		name: tool.name,
 		label: typeof toolRecord.label === "string" ? toolRecord.label : tool.name,

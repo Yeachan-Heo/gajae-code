@@ -217,6 +217,12 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly mcpToolName: string;
 	/** Server name */
 	readonly mcpServerName: string;
+	/** Source provider that registered this MCP tool, when known. */
+	readonly mcpSourceProvider: string | undefined;
+	/** Human-readable source provider name, when known. */
+	readonly mcpSourceProviderName: string | undefined;
+	/** Discovery eligibility for source-aware MCP gating. */
+	readonly mcpDiscoveryScope: "selectable" | "always-on";
 
 	/** Create MCPTool instances for all tools from an MCP server connection */
 	static fromTools(connection: MCPServerConnection, tools: MCPToolDefinition[], reconnect?: MCPReconnect): MCPTool[] {
@@ -234,6 +240,9 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
 		this.mcpToolName = tool.name;
 		this.mcpServerName = connection.name;
+		this.mcpSourceProvider = connection._source?.provider;
+		this.mcpSourceProviderName = connection._source?.providerName;
+		this.mcpDiscoveryScope = this.mcpSourceProvider === "gjc-plugins" ? "always-on" : "selectable";
 	}
 
 	renderCall(args: unknown, _options: RenderResultOptions, theme: Theme) {
@@ -300,6 +309,12 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly mcpToolName: string;
 	/** Server name */
 	readonly mcpServerName: string;
+	/** Source provider that registered this MCP tool, when known. */
+	readonly mcpSourceProvider: string | undefined;
+	/** Human-readable source provider name, when known. */
+	readonly mcpSourceProviderName: string | undefined;
+	/** Discovery eligibility for source-aware MCP gating. */
+	readonly mcpDiscoveryScope: "selectable" | "always-on";
 	readonly #fallbackProvider: string | undefined;
 	readonly #fallbackProviderName: string | undefined;
 
@@ -329,6 +344,9 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.mcpServerName = serverName;
 		this.#fallbackProvider = source?.provider;
 		this.#fallbackProviderName = source?.providerName;
+		this.mcpSourceProvider = source?.provider;
+		this.mcpSourceProviderName = source?.providerName;
+		this.mcpDiscoveryScope = this.mcpSourceProvider === "gjc-plugins" ? "always-on" : "selectable";
 	}
 
 	renderCall(args: unknown, _options: RenderResultOptions, theme: Theme) {
