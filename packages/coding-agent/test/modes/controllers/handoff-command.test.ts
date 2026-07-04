@@ -77,7 +77,7 @@ describe("/handoff command", () => {
 		expect(ctx.session.handoff).toHaveBeenCalledWith("focus on tests");
 	});
 
-	it("runs contribution-prep without rebuilding or switching the active chat", async () => {
+	it("prepares contribution-pr artifacts without spawning a competing TUI worker", async () => {
 		const statusContainer = createContainer();
 		const chatContainer = createContainer();
 		const requestRender = vi.fn();
@@ -89,7 +89,7 @@ describe("/handoff command", () => {
 					workerPromptPath: "/tmp/prep/worker-prompt.md",
 					artifactDir: "/tmp/prep",
 					changedFiles: [],
-					spawned: true,
+					spawned: false,
 				})),
 			},
 			statusContainer,
@@ -107,11 +107,12 @@ describe("/handoff command", () => {
 
 		expect(ctx.session.prepareContributionPrep).toHaveBeenCalledWith({
 			customInstructions: "focus on repro",
-			spawnWorker: true,
+			spawnWorker: false,
 		});
 		expect(ctx.rebuildChatFromMessages).not.toHaveBeenCalled();
 		expect(ctx.statusLine.invalidate).not.toHaveBeenCalled();
 		expect(ctx.showStatus).toHaveBeenCalledWith(expect.stringContaining("Manifest: /tmp/prep/manifest.json"));
+		expect(ctx.showStatus).toHaveBeenCalledWith(expect.stringContaining("separate terminal"));
 		expect(chatContainer.children).toHaveLength(1);
 		expect(requestRender).toHaveBeenCalled();
 	});

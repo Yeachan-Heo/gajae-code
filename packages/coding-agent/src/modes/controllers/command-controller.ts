@@ -1276,17 +1276,18 @@ export class CommandController {
 	async handleContributionPrepCommand(customInstructions?: string): Promise<void> {
 		this.ctx.editor.setText("");
 		try {
-			const result = await this.ctx.session.prepareContributionPrep({ customInstructions, spawnWorker: true });
+			const result = await this.ctx.session.prepareContributionPrep({ customInstructions, spawnWorker: false });
 			this.ctx.showStatus(
 				[
 					"Contribution prep artifacts written.",
 					`Manifest: ${result.manifestPath}`,
 					`Worker prompt: ${result.workerPromptPath}`,
+					"Open the worker prompt from a separate terminal to keep this TUI session stable.",
 				].join("\n"),
 			);
 			this.ctx.chatContainer.addChild(
 				new Text(
-					`${theme.fg("accent", `${theme.status.success} Contribution prep ready`)}\nManifest: ${result.manifestPath}`,
+					`${theme.fg("accent", `${theme.status.success} Contribution prep ready`)}\nWorker prompt: ${result.workerPromptPath}`,
 					1,
 					1,
 				),
