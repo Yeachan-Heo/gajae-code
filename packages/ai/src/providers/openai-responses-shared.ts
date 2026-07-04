@@ -28,7 +28,7 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 } from "../types";
-import { normalizeResponsesToolCallId } from "../utils";
+import { normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
@@ -275,7 +275,7 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 		}
 		knownCallIds.add(normalized.callId);
 		if (block.customWireName) {
-			const rawInput = typeof block.arguments?.input === "string" ? block.arguments.input : "";
+			const rawInput = typeof block.arguments?.input === "string" ? block.arguments.input.toWellFormed() : "";
 			customCallIds?.add(normalized.callId);
 			outputItems.push({
 				type: "custom_tool_call",
@@ -291,7 +291,7 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 			id: itemId,
 			call_id: normalized.callId,
 			name: block.name,
-			arguments: JSON.stringify(block.arguments),
+			arguments: JSON.stringify(sanitizeJsonStrings(block.arguments ?? {})),
 		});
 	}
 

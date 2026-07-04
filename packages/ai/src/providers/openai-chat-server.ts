@@ -19,6 +19,7 @@ import type {
 	ToolResultMessage,
 	TSchema,
 } from "../types";
+import { sanitizeJsonStrings } from "../utils";
 import {
 	type OpenAIChatContentPart,
 	type OpenAIChatMessage,
@@ -453,9 +454,9 @@ function isOnlyRaw(args: Record<string, unknown>): boolean {
 
 function stringifyArgs(args: Record<string, unknown>): string {
 	// `__raw` is our fallback marker for un-parseable inbound args; preserve it verbatim on the way out.
-	if (typeof args.__raw === "string" && isOnlyRaw(args)) return args.__raw;
+	if (typeof args.__raw === "string" && isOnlyRaw(args)) return args.__raw.toWellFormed();
 	try {
-		return JSON.stringify(args);
+		return JSON.stringify(sanitizeJsonStrings(args));
 	} catch {
 		return "{}";
 	}

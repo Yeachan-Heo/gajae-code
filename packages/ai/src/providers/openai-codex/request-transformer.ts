@@ -1,6 +1,7 @@
 import type { Effort } from "../../model-thinking";
 import { requireSupportedEffort } from "../../model-thinking";
 import type { Api, Model } from "../../types";
+import { sanitizeJsonStrings } from "../../utils";
 
 export interface ReasoningConfig {
 	effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -109,6 +110,10 @@ function normalizeInputTextPartFields(input: InputItem[] | undefined): InputItem
 		}
 		if (normalizedItem.type === "message") {
 			normalizedItem.content = normalizeTextPartFields(normalizedItem.content, `input[${itemIndex}].content`);
+		} else if (normalizedItem.type === "function_call" && "arguments" in itemRecord) {
+			itemRecord.arguments = sanitizeJsonStrings(itemRecord.arguments);
+		} else if (normalizedItem.type === "custom_tool_call" && typeof itemRecord.input === "string") {
+			itemRecord.input = itemRecord.input.toWellFormed();
 		}
 		return normalizedItem;
 	});

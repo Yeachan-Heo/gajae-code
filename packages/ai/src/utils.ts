@@ -11,6 +11,34 @@ export function normalizeSystemPrompts(systemPrompt: readonly string[] | string 
 	return prompts.map(prompt => prompt.toWellFormed()).filter(prompt => prompt.length > 0);
 }
 
+export function sanitizeJsonStrings(value: unknown): unknown {
+	return sanitizeJsonStringsInner(value, new WeakMap<object, unknown>());
+}
+
+function sanitizeJsonStringsInner(value: unknown, seen: WeakMap<object, unknown>): unknown {
+	if (typeof value === "string") return value.toWellFormed();
+	if (!value || typeof value !== "object") return value;
+
+	const cached = seen.get(value);
+	if (cached !== undefined) return cached;
+
+	if (Array.isArray(value)) {
+		const sanitized: unknown[] = [];
+		seen.set(value, sanitized);
+		for (const item of value) {
+			sanitized.push(sanitizeJsonStringsInner(item, seen));
+		}
+		return sanitized;
+	}
+
+	const sanitized: Record<string, unknown> = {};
+	seen.set(value, sanitized);
+	for (const [key, nestedValue] of Object.entries(value)) {
+		sanitized[key.toWellFormed()] = sanitizeJsonStringsInner(nestedValue, seen);
+	}
+	return sanitized;
+}
+
 export function toNumber(value: unknown): number | undefined {
 	if (typeof value === "number" && Number.isFinite(value)) return value;
 	if (typeof value === "string" && value.trim()) {

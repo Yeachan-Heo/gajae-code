@@ -53,6 +53,7 @@ import {
 	normalizeSystemPrompts,
 	normalizeToolCallId,
 	resolveCacheRetention,
+	sanitizeJsonStrings,
 } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
@@ -2491,7 +2492,7 @@ export function convertAnthropicMessages(
 						type: "tool_use",
 						id: block.id,
 						name: isOAuthToken ? applyClaudeToolPrefix(block.name) : block.name,
-						input: block.arguments ?? {},
+						input: sanitizeJsonStrings(block.arguments ?? {}),
 					});
 				}
 			}

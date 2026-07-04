@@ -35,7 +35,7 @@ import {
 	type ToolChoice,
 	type ToolResultMessage,
 } from "../types";
-import { normalizeSystemPrompts } from "../utils";
+import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { toFirepassWireModelId, toFireworksWireModelId } from "../utils/fireworks-model-id";
@@ -166,7 +166,7 @@ function normalizeStreamingContentText(content: unknown): string {
 function serializeToolArguments(value: unknown): string {
 	if (value && typeof value === "object" && !Array.isArray(value)) {
 		try {
-			return JSON.stringify(value);
+			return JSON.stringify(sanitizeJsonStrings(value));
 		} catch {
 			return "{}";
 		}
@@ -178,7 +178,7 @@ function serializeToolArguments(value: unknown): string {
 		try {
 			const parsed = JSON.parse(trimmed);
 			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				return JSON.stringify(parsed);
+				return JSON.stringify(sanitizeJsonStrings(parsed));
 			}
 		} catch {}
 		return "{}";

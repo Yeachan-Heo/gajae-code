@@ -18,7 +18,7 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types";
-import { normalizeSystemPrompts } from "../utils";
+import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
@@ -237,7 +237,7 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 					const part: Part = {
 						functionCall: {
 							name: block.name,
-							args: block.arguments ?? {},
+							args: sanitizeJsonStrings(block.arguments ?? {}) as Record<string, unknown>,
 							...(requiresToolCallId(model.id) ? { id: block.id } : {}),
 						},
 					};
@@ -467,7 +467,7 @@ export function pushToolCallEvents(
 	stream.push({
 		type: "toolcall_delta",
 		contentIndex,
-		delta: JSON.stringify(toolCall.arguments),
+		delta: JSON.stringify(sanitizeJsonStrings(toolCall.arguments)),
 		partial: output,
 	});
 	stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });

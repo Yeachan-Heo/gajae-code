@@ -1,12 +1,56 @@
 import { describe, expect, it } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
+import { convertAnthropicMessages } from "@gajae-code/ai/providers/anthropic";
+import { convertMessages as convertGoogleMessages } from "@gajae-code/ai/providers/google-shared";
+import {
+	convertMessages as convertOpenAICompletionsMessages,
+	detectCompat,
+} from "@gajae-code/ai/providers/openai-completions";
+import { convertResponsesAssistantMessage } from "@gajae-code/ai/providers/openai-responses-shared";
 import { complete } from "@gajae-code/ai/stream";
-import type { Api, Context, Model, OptionsForApi, ToolResultMessage } from "@gajae-code/ai/types";
+import type { Api, AssistantMessage, Context, Model, OptionsForApi, ToolResultMessage } from "@gajae-code/ai/types";
 import * as z from "zod/v4";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Empty schema for test tools - must be proper OBJECT type for Cloud Code Assist
 const emptySchema = z.object({});
+const loneSurrogate = String.fromCharCode(0xd92c);
+
+function assistantWithSurrogateToolCall(model: Model<Api>): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [
+			{
+				type: "toolCall",
+				id: "test_1",
+				name: "test_tool",
+				arguments: {
+					command: `echo broken ${loneSurrogate}`,
+					nested: { text: `inner ${loneSurrogate}` },
+					list: [`array ${loneSurrogate}`],
+					[`key_${loneSurrogate}`]: "key should also be well-formed",
+				},
+			},
+		],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	};
+}
+
+function expectNoSerializedLoneSurrogate(value: unknown) {
+	expect(JSON.stringify(value)).not.toContain("\\ud92c");
+}
 
 // Resolve OAuth tokens at module level (async, runs before tests)
 const oauthTokens = await Promise.all([
@@ -275,6 +319,65 @@ async function testUnpairedHighSurrogate<TApi extends Api>(llm: Model<TApi>, opt
 	expect(response.errorMessage).toBeFalsy();
 	expect(response.content.length).toBeGreaterThan(0);
 }
+
+describe("toolCall argument surrogate sanitization", () => {
+	it("deep-sanitizes Anthropic tool_use input before request serialization", () => {
+		const llm = getBundledModel("anthropic", "claude-haiku-4-5-20251001") as Model<"anthropic-messages">;
+		const params = convertAnthropicMessages([assistantWithSurrogateToolCall(llm)], llm, false);
+
+		expectNoSerializedLoneSurrogate(params);
+		const content = params[0]?.content;
+		expect(Array.isArray(content)).toBe(true);
+		if (!Array.isArray(content)) return;
+		const toolUse = content[0];
+		expect(toolUse?.type).toBe("tool_use");
+		if (toolUse?.type === "tool_use") {
+			const input = toolUse.input as Record<string, unknown>;
+			expect(input.command).toContain("�");
+			expect(input).toHaveProperty("key_�");
+		}
+	});
+
+	it("deep-sanitizes OpenAI-compatible tool call arguments before JSON stringification", () => {
+		const llm = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+		const compat = detectCompat(llm);
+		const messages = convertOpenAICompletionsMessages(
+			llm,
+			{ messages: [assistantWithSurrogateToolCall(llm)] },
+			compat,
+		);
+
+		expectNoSerializedLoneSurrogate(messages);
+		const assistantMessage = messages[0] as { tool_calls?: Array<{ function: { arguments: string } }> } | undefined;
+		const toolCalls = assistantMessage?.tool_calls;
+		expect(toolCalls?.[0]?.function.arguments).toContain("�");
+		expect(toolCalls?.[0]?.function.arguments).not.toContain("\\ud92c");
+	});
+
+	it("deep-sanitizes OpenAI Responses function_call arguments before request serialization", () => {
+		const llm = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
+		const knownCallIds = new Set<string>();
+		const items = convertResponsesAssistantMessage(assistantWithSurrogateToolCall(llm), llm, 0, knownCallIds);
+
+		expectNoSerializedLoneSurrogate(items);
+		const functionCall = items.find(item => item.type === "function_call");
+		expect(functionCall?.type).toBe("function_call");
+		if (functionCall?.type === "function_call") {
+			expect(functionCall.arguments).toContain("�");
+			expect(functionCall.arguments).not.toContain("\\ud92c");
+		}
+	});
+
+	it("deep-sanitizes Google functionCall args before request serialization", () => {
+		const llm = getBundledModel("google", "gemini-2.5-flash") as Model<"google-generative-ai">;
+		const contents = convertGoogleMessages(llm, { messages: [assistantWithSurrogateToolCall(llm)] });
+
+		expectNoSerializedLoneSurrogate(contents);
+		const functionCall = contents[0]?.parts?.[0]?.functionCall;
+		expect(functionCall?.args).toHaveProperty("key_�");
+		expect(JSON.stringify(functionCall?.args)).toContain("�");
+	});
+});
 
 describe("AI Providers Unicode Surrogate Pair Tests", () => {
 	describe.skipIf(!e2eApiKey("GEMINI_API_KEY"))("Google Provider Unicode Handling", () => {

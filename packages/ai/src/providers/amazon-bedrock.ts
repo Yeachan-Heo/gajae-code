@@ -28,7 +28,7 @@ import type {
 	ToolChoice,
 	ToolResultMessage,
 } from "../types";
-import { normalizeToolCallId, resolveCacheRetention } from "../utils";
+import { normalizeToolCallId, resolveCacheRetention, sanitizeJsonStrings } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { parseStreamingJson } from "../utils/json-parse";
@@ -701,7 +701,7 @@ function convertMessages(
 								toolUse: {
 									toolUseId: normalizeToolCallId(c.id),
 									name: c.name,
-									input: c.arguments,
+									input: sanitizeJsonStrings(c.arguments),
 								},
 							});
 							break;

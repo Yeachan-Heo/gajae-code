@@ -13,6 +13,7 @@ import type {
 	ToolResultMessage,
 	UserMessage,
 } from "../types";
+import { sanitizeJsonStrings } from "../utils";
 import {
 	type AnthropicAssistantContentBlock,
 	type AnthropicMessage,
@@ -433,7 +434,7 @@ function encodeContentBlocks(message: AssistantMessage): Record<string, unknown>
 				blocks.push({ type: "redacted_thinking", data: c.data });
 				break;
 			case "toolCall":
-				blocks.push({ type: "tool_use", id: c.id, name: c.name, input: c.arguments ?? {} });
+				blocks.push({ type: "tool_use", id: c.id, name: c.name, input: sanitizeJsonStrings(c.arguments ?? {}) });
 				break;
 		}
 	}
