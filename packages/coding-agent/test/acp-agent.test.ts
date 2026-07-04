@@ -1177,6 +1177,39 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("executes inline ACP skill commands through custom skill messages", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const skillDir = path.join(harness.cwdA, ".skills", "sample");
+		const skillPath = path.join(skillDir, "SKILL.md");
+		await fs.promises.mkdir(skillDir, { recursive: true });
+		await fs.promises.writeFile(skillPath, "---\ndescription: Sample skill\n---\n# Sample\nDo work.\n");
+		session.skills = [
+			{
+				name: "sample",
+				description: "Sample skill",
+				filePath: skillPath,
+				baseDir: skillDir,
+				source: "test",
+			},
+		];
+
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-0000000000a1",
+			prompt: [{ type: "text", text: "please use /skill:sample for this" }],
+		} as PromptRequest);
+
+		expect(session.promptCalls).toEqual([]);
+		expect(session.customMessages).toHaveLength(1);
+		expect(session.customMessages[0]!.content).toContain("# Sample\nDo work.");
+		expect(session.customMessages[0]!.content).toContain("User: please use for this");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("executes chained ACP skill commands in source order", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });

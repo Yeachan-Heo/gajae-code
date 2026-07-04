@@ -755,9 +755,13 @@ export class AcpAgent implements Agent {
 			}
 			return true;
 		}
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
+		const slashText = text.trimStart();
+		if (!slashText.startsWith("/")) {
+			return false;
+		}
+		const spaceIndex = slashText.indexOf(" ");
+		const commandName = spaceIndex === -1 ? slashText.slice(1) : slashText.slice(1, spaceIndex);
+		const args = spaceIndex === -1 ? "" : slashText.slice(spaceIndex + 1).trim();
 		if (
 			!isNamespacedSkillSlashCommandName(commandName) &&
 			options.directAliasMayCollide !== true &&
