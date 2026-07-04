@@ -1057,6 +1057,9 @@ export class Editor implements Component, Focusable {
 		// Handle bracketed paste mode
 		const paste = this.#pasteHandler.process(data);
 		if (paste.handled) {
+			if (paste.normalText) {
+				this.handleInput(paste.normalText);
+			}
 			if (paste.pasteContent !== undefined) {
 				this.#handlePaste(paste.pasteContent);
 				if (paste.remaining.length > 0) {

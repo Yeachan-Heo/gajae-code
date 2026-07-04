@@ -817,8 +817,16 @@ export class MCPAddWizard extends Container {
 				}
 				break;
 			case "scope":
-				// Go back to last authentication step
-				if (this.#state.authMethod === "oauth") {
+				// Go back to the last configuration step. No-auth flows come straight
+				// from the transport connection step; manual/OAuth flows come from
+				// their respective auth detail steps.
+				if (this.#state.authMethod === "none") {
+					if (this.#state.transport === "stdio") {
+						this.#currentStep = "args";
+					} else {
+						this.#currentStep = "url";
+					}
+				} else if (this.#state.authMethod === "oauth") {
 					this.#currentStep = "oauth-scopes";
 				} else {
 					// manual - go back to env var name or header name

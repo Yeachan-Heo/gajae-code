@@ -28,6 +28,10 @@
 - The main composer now uses `PageUp` / `PageDown` to page the visible transcript viewport instead of duplicating prompt-history navigation; `Up` / `Down` and `Ctrl+R` remain the prompt-history paths, and autocomplete lists keep their own page navigation.
 - Shared the duplicated two-column dashboard renderer used by agent and extension dashboards, keeping narrow-width truncation behavior in one tested component.
 - Avoided duplicate line splitting when formatting `ast_grep` matches, reducing allocation in large structural-search result rendering.
+- `/contribute-pr` in the interactive TUI now prepares the redacted manifest and worker prompt without spawning a second GJC process on the same terminal, avoiding competing TUI renderers that make the chat viewport jump around. Run the generated worker prompt from a separate terminal instead.
+- The interactive MCP add wizard now returns from no-auth scope selection to the URL/args step on Escape instead of jumping into the unrelated HTTP header-name prompt.
+
+### Fixed
 
 - Tab now queues prompt drafts immediately while the agent is streaming or compacting instead of opening/applying forced file autocomplete first.
 

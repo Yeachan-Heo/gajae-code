@@ -9,6 +9,7 @@
 - Added manual transcript viewport paging support so applications can repaint older terminal output with PageUp/PageDown without reusing editor history navigation.
 
 - Empty select/settings lists now still honor cancel while preserving populated-list keybinding precedence, and settings lists keep selection indices clamped when items disappear or submenus close after list shrinkage.
+- Bracketed paste handling now buffers a start marker split across input chunks instead of leaking raw `\x1b[200~` fragments into editors/search fields.
 
 - Fixed Windows Hangul/CJK IME composition breaking the queue-message shortcut (Alt+Enter/Alt+Q): the app no longer enables the xterm `modifyOtherKeys` fallback on win32, where Windows Terminal/conhost do not support the Kitty keyboard protocol anyway. `modifyOtherKeys` made modified-key chords bypass the IME commit, so a syllable still being composed was dropped and the queue action fired on empty text unless the user typed a trailing space first. Legacy encodings still deliver Alt+Enter and the newline chords; opt back into the enhancement with `GJC_TUI_KEYBOARD_PROTOCOL`.
 
