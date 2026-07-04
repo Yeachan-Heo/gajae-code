@@ -3227,11 +3227,15 @@ export class AgentSession {
 				maxAttempts: event.maxAttempts,
 			});
 		} else if (event.type === "goal_updated") {
-			await this.#extensionRunner.emit({
-				type: "goal_updated",
-				goal: event.goal,
-				state: event.state,
-			});
+			try {
+				await this.#extensionRunner.emit({
+					type: "goal_updated",
+					goal: event.goal,
+					state: event.state,
+				});
+			} catch (error) {
+				logger.warn("Goal updated extension hook failed", { error: String(error) });
+			}
 		}
 	}
 

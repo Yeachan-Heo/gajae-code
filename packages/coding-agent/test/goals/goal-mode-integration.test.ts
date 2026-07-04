@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions";
 import { GoalTool } from "@gajae-code/coding-agent/goals/tools/goal-tool";
 import { InteractiveMode } from "@gajae-code/coding-agent/modes/interactive-mode";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -33,7 +34,7 @@ type GoalHarness = {
 	cleanup: () => Promise<void>;
 };
 
-async function createGoalHarness(): Promise<GoalHarness> {
+async function createGoalHarness(options: { extensionRunner?: ExtensionRunner } = {}): Promise<GoalHarness> {
 	resetSettingsForTest();
 	const tempDir = TempDir.createSync("@pi-goal-mode-");
 	await Settings.init({ inMemory: true, cwd: tempDir.path() });
@@ -67,6 +68,7 @@ async function createGoalHarness(): Promise<GoalHarness> {
 		modelRegistry,
 		toolRegistry,
 		rebuildSystemPrompt: async () => ({ systemPrompt: ["Test"] }),
+		extensionRunner: options.extensionRunner,
 	});
 	const mode = new InteractiveMode(session, "test");
 	const toolSession = createToolSession(tempDir.path(), settings, {
@@ -360,6 +362,30 @@ describe("InteractiveMode goal mode integration", () => {
 		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
 		await nextTurn;
 	});
+
+	it("completes goal state even when a goal_updated extension hook throws", async () => {
+		await harness.cleanup();
+		const extensionError = new TypeError(
+			'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received undefined',
+		);
+		const emit = vi.fn(async (event: { type: string }) => {
+			if (event.type === "goal_updated") throw extensionError;
+		});
+		harness = await createGoalHarness({
+			extensionRunner: { emit, getRegisteredCommands: () => [] } as unknown as ExtensionRunner,
+		});
+		await harness.mode.handleGoalModeCommand("Ship the release");
+
+		const tool = new GoalTool(harness.toolSession);
+		const result = await tool.execute("call-complete", { op: "complete" });
+
+		expect(result.details).toMatchObject({ op: "complete" });
+		expect(result.details?.goal?.status).toBe("complete");
+		expect(harness.session.getGoalModeState()?.goal.status).toBe("complete");
+		expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
+		expect(emit).toHaveBeenCalledWith(expect.objectContaining({ type: "goal_updated" }));
+	});
+
 	it("does not loop AgentBusyError when a busy/orphaned session triggers goal continuation", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		expect(harness.mode.goalModeEnabled).toBe(true);
