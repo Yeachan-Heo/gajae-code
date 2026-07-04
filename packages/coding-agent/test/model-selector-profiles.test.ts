@@ -352,4 +352,33 @@ describe("model selector profiles", () => {
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original-executor" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 	});
+
+	test("settings Default Model Profile applies the profile live and persists it", async () => {
+		const { ctx, session, flush, setCalls } = createControllerContext();
+		const controller = new SelectorController(ctx as never);
+
+		controller.handleSettingChange("modelProfile.default", "profile-a");
+		await Bun.sleep(10);
+
+		expect(session.setModelTemporaryCalls).toHaveLength(1);
+		expect(session.model?.id).toBe("default");
+		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(flush).toHaveBeenCalledTimes(1);
+		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
+	});
+
+	test("settings Default Model Profile surfaces credential errors without switching", async () => {
+		const { ctx, settings, session } = createControllerContext({ missingCredentials: true });
+		const controller = new SelectorController(ctx as never);
+
+		controller.handleSettingChange("modelProfile.default", "profile-a");
+		await Bun.sleep(10);
+
+		expect(ctx.showError).toHaveBeenCalledWith(
+			'Model profile "Profile Alpha" requires credentials for: provider-a. Run /login and configure the missing provider(s), then retry.',
+		);
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.model).toBe(alternateModel);
+		expect(settings.get("modelProfile.default")).toBe("old-profile");
+	});
 });

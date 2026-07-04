@@ -40,6 +40,7 @@ function createSelector(options: SelectorOptions = {}) {
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["red-claw", "blue-crab"],
+			availableModelProfiles: [],
 			cwd: process.cwd(),
 		},
 		{

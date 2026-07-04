@@ -438,6 +438,7 @@ export class SelectorController {
 						availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
 						thinkingLevel: this.ctx.session.thinkingLevel,
 						availableThemes,
+						availableModelProfiles: [...this.ctx.session.modelRegistry.getModelProfiles().keys()],
 						cwd: getProjectDir(),
 					},
 					{
@@ -634,6 +635,18 @@ export class SelectorController {
 				this.ctx.updateEditorBorderColor();
 				break;
 
+			case "modelProfile.default": {
+				// Applying the default profile live mirrors the /model preset flow so the
+				// running session switches immediately, not only on next startup.
+				const profileName = typeof value === "string" ? value : "";
+				if (!profileName) break;
+				this.#applyModelProfile(profileName, true)
+					.then(() => this.ctx.ui.requestRender())
+					.catch(error => {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					});
+				break;
+			}
 			case "clearOnShrink":
 				this.ctx.ui.setClearOnShrink(value as boolean);
 				break;
@@ -784,6 +797,29 @@ export class SelectorController {
 		}
 	}
 
+	/**
+	 * Activate a model profile through the shared /model + /settings path: swap the
+	 * live session model (and, when persistDefault, persist it as the startup
+	 * default) then refresh the status surfaces. Rethrows so callers surface errors.
+	 */
+	async #applyModelProfile(profileName: string, persistDefault: boolean): Promise<void> {
+		const profileLabel = formatModelProfileDisplayLabel(
+			this.ctx.session.modelRegistry.getModelProfile(profileName) ?? { name: profileName },
+		);
+		await activateModelProfile(
+			{
+				session: this.ctx.session,
+				modelRegistry: this.ctx.session.modelRegistry,
+				settings: this.ctx.settings,
+				profileName,
+			},
+			{ persistDefault },
+		);
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
+		this.ctx.showStatus(persistDefault ? `Default model profile: ${profileLabel}` : `Model profile: ${profileLabel}`);
+	}
+
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
 		this.showSelector(done => {
 			let modelSelector: ModelSelectorComponent;
@@ -809,27 +845,7 @@ export class SelectorController {
 							return;
 						}
 						if (selection.kind === "profile") {
-							const profileLabel = formatModelProfileDisplayLabel(
-								this.ctx.session.modelRegistry.getModelProfile(selection.profileName) ?? {
-									name: selection.profileName,
-								},
-							);
-							await activateModelProfile(
-								{
-									session: this.ctx.session,
-									modelRegistry: this.ctx.session.modelRegistry,
-									settings: this.ctx.settings,
-									profileName: selection.profileName,
-								},
-								{ persistDefault: selection.setDefault },
-							);
-							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorBorderColor();
-							this.ctx.showStatus(
-								selection.setDefault
-									? `Default model profile: ${profileLabel}`
-									: `Model profile: ${profileLabel}`,
-							);
+							await this.#applyModelProfile(selection.profileName, selection.setDefault);
 							done();
 							this.ctx.ui.requestRender();
 							return;

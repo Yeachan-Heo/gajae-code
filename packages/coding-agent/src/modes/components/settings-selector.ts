@@ -657,6 +657,8 @@ export interface SettingsRuntimeContext {
 	thinkingLevel: ThinkingLevel | undefined;
 	/** Available themes */
 	availableThemes: string[];
+	/** Available model profile names (from the model registry) */
+	availableModelProfiles: string[];
 	/** Working directory for plugins tab */
 	cwd: string;
 }
@@ -847,6 +849,8 @@ export class SettingsSelectorComponent extends Container {
 			});
 		} else if (def.path === "theme.dark" || def.path === "theme.light") {
 			options = this.context.availableThemes.map(t => ({ value: t, label: t }));
+		} else if (def.path === "modelProfile.default") {
+			options = this.context.availableModelProfiles.map(p => ({ value: p, label: p }));
 		}
 		if (def.path === "statusLine.preset") {
 			options = options.filter(option => option.value !== "custom");

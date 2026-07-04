@@ -43,6 +43,7 @@ function createSelector(): SelectorHarness {
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: THEMES,
+			availableModelProfiles: [],
 			cwd: process.cwd(),
 		},
 		{
