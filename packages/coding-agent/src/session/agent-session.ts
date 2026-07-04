@@ -1541,10 +1541,9 @@ export class AgentSession {
 				recordSkip("unsupported-role");
 				return undefined;
 			}
-			const cloned = cloneJsonValueForForkSeed(message) as Message;
-			if ("providerPayload" in cloned) {
-				delete (cloned as { providerPayload?: unknown }).providerPayload;
-			}
+			const messageWithoutProviderPayload = { ...message } as Message & { providerPayload?: unknown };
+			delete messageWithoutProviderPayload.providerPayload;
+			const cloned = cloneJsonValueForForkSeed(messageWithoutProviderPayload) as Message;
 			if (Array.isArray(cloned.content)) {
 				const sanitizedContent: TextContent[] = [];
 				for (const block of cloned.content) {

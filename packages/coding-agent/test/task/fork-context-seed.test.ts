@@ -42,7 +42,7 @@ async function sessionWith(messages: never[]): Promise<{ session: AgentSession; 
 }
 
 interface SeededResult {
-	messages: Array<{ content?: unknown }>;
+	messages: Array<{ content?: unknown; providerPayload?: unknown }>;
 	metadata: { includedMessages: number; skippedReasons: Record<string, number> };
 }
 
@@ -93,6 +93,25 @@ describe("buildForkContextSeed selection", () => {
 			const seed = await buildSeed(session, 10, 10_000);
 			expect(seedTexts(seed)).toEqual(["A-old", "B-mid", "C-recent"]);
 			expect(seed.metadata.includedMessages).toBe(3);
+		} finally {
+			await session.dispose?.();
+			authStorage.close?.();
+		}
+	});
+
+	it("omits non-JSON provider payloads before cloning seeded messages", async () => {
+		const { session, authStorage } = await sessionWith([
+			{
+				role: "user",
+				content: [{ type: "text", text: "payload should be stripped" }],
+				providerPayload: { type: "openaiResponsesHistory", items: [{ id: 1584n }] },
+			} as never,
+		]);
+		try {
+			const seed = await buildSeed(session, 10, 10_000);
+			expect(seedTexts(seed)).toEqual(["payload should be stripped"]);
+			expect(seed.messages).toHaveLength(1);
+			expect(seed.messages.every(message => !("providerPayload" in message))).toBe(true);
 		} finally {
 			await session.dispose?.();
 			authStorage.close?.();
