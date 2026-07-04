@@ -104,6 +104,28 @@ describe("task result receipts", () => {
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 	});
 
+	it("caps review.overallCorrectness so a child cannot flood parent context", () => {
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				extractedToolData: {
+					yield: [{ data: { overall_correctness: "X".repeat(50_000) } }],
+					report_finding: [{ severity: "high", summary: "Y".repeat(50_000) }],
+				},
+			}),
+		);
+		// Findings are already bounded (200 chars); overallCorrectness must be bounded too
+		// so a verbose/misbehaving child cannot pipe an unbounded string into parent context.
+		expect(receipt.review?.findings?.[0]?.summary.length).toBeLessThanOrEqual(200);
+		expect(receipt.review?.overallCorrectness?.length).toBeLessThanOrEqual(200);
+	});
+
+	it("keeps a short review.overallCorrectness verbatim", () => {
+		const receipt = buildTaskReceipt(
+			makeRaw({ extractedToolData: { yield: [{ data: { overall_correctness: "correct" } }] } }),
+		);
+		expect(receipt.review?.overallCorrectness).toBe("correct");
+	});
+
 	it("buildTaskReceipt marks output unavailable when no artifact metadata is present", () => {
 		const receipt = buildTaskReceipt(makeRaw());
 		expect(receipt.outputRef).toBeUndefined();

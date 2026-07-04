@@ -128,8 +128,10 @@ function buildReview(raw: SingleResult): TaskResultReceipt["review"] | undefined
 	});
 	if (!reviewYield && findings.length === 0) return undefined;
 	return {
-		overallCorrectness:
+		overallCorrectness: truncateText(
 			typeof reviewYield?.overall_correctness === "string" ? reviewYield.overall_correctness : undefined,
+			200,
+		),
 		findingCount: rawFindings.length,
 		findings: findings.length > 0 ? findings : undefined,
 	};
