@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { TaskResultReceipt } from "../../src/task/receipt";
+import { buildTaskReceipt, type TaskResultReceipt } from "../../src/task/receipt";
 import { reconcileSpawnRoi } from "../../src/task/roi-reconciliation";
 import type { SpawnPlanReceipt } from "../../src/task/spawn-gate";
 
@@ -182,6 +182,32 @@ describe("spawn ROI reconciliation", () => {
 
 		expect(result?.children[0]?.inlineTokens).toBe(4);
 		expect(result?.overBudgetChildIds).toEqual(["reviewed-child"]);
+	});
+
+	it("counts bounded review correctness from task receipts", () => {
+		const receipt = buildTaskReceipt({
+			index: 0,
+			id: "reviewed-child",
+			agent: "executor",
+			agentSource: "bundled",
+			task: "task",
+			exitCode: 0,
+			output: "small",
+			stderr: "",
+			truncated: false,
+			durationMs: 1,
+			tokens: 10,
+			extractedToolData: {
+				yield: [{ data: { overall_correctness: "x".repeat(50_000) } }],
+			},
+		});
+
+		const result = reconcileSpawnRoi(plan(60), [receipt]);
+
+		expect(receipt.review?.overallCorrectness).toHaveLength(200);
+		expect(result?.children[0]?.inlineTokens).toBe(61);
+		expect(result?.overBudgetChildIds).toEqual(["reviewed-child"]);
+		expect(result?.totalOverageTokens).toBe(1);
 	});
 
 	it("is advisory-only and does not mutate receipts or expose status mutation fields", () => {

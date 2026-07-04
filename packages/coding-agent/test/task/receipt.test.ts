@@ -104,6 +104,47 @@ describe("task result receipts", () => {
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 	});
 
+	it("bounds child-controlled overall correctness in review receipts", () => {
+		const oversizedCorrectness = `${"safe ".repeat(40)}LEAK_SENTINEL_DO_NOT_DIGEST`;
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				extractedToolData: {
+					yield: [{ data: { overall_correctness: oversizedCorrectness } }],
+					report_finding: [{ severity: "medium", summary: `${"finding ".repeat(40)}LEAK_SENTINEL_DO_NOT_DIGEST` }],
+				},
+			}),
+		);
+
+		expect(receipt.review?.overallCorrectness).toBe(oversizedCorrectness.slice(0, 200));
+		expect(receipt.review?.overallCorrectness).toHaveLength(200);
+		expect(receipt.review?.findings?.[0]?.summary).toHaveLength(200);
+		expect(JSON.stringify(receipt)).not.toContain("LEAK_SENTINEL_DO_NOT_DIGEST");
+		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
+	it("normalizes hostile review finding severity and priority values", () => {
+		const hostileSeverity = `${"x".repeat(1000)}LEAK_SENTINEL_DO_NOT_DIGEST`;
+		const hostilePriority = `${"P".repeat(1000)}LEAK_SENTINEL_DO_NOT_DIGEST`;
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				extractedToolData: {
+					report_finding: [
+						{ severity: hostileSeverity, summary: "short" },
+						{ priority: hostilePriority, summary: "short" },
+						{ severity: hostileSeverity, priority: "p2", summary: "short" },
+						{ priority: 1, summary: "short" },
+					],
+				},
+			}),
+		);
+
+		expect(receipt.review?.findings?.map(finding => finding.severity)).toEqual([undefined, undefined, "P2", "P1"]);
+		expect(JSON.stringify(receipt)).not.toContain("LEAK_SENTINEL_DO_NOT_DIGEST");
+		expect(JSON.stringify(receipt)).not.toContain("x".repeat(1000));
+		expect(JSON.stringify(receipt)).not.toContain("P".repeat(1000));
+		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
 	it("buildTaskReceipt marks output unavailable when no artifact metadata is present", () => {
 		const receipt = buildTaskReceipt(makeRaw());
 		expect(receipt.outputRef).toBeUndefined();
