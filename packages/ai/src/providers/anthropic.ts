@@ -2281,8 +2281,6 @@ function buildParams(
 					params.output_config = { effort } as typeof params.output_config;
 				}
 			}
-		} else if (options?.thinkingEnabled === false) {
-			params.thinking = { type: "disabled" };
 		}
 	}
 

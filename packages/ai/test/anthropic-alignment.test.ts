@@ -1028,7 +1028,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.thinking).toBeUndefined();
 	});
 
-	it("sends disabled thinking for reasoning models when thinking is explicitly disabled", async () => {
+	it("omits thinking for reasoning models when thinking is explicitly disabled", async () => {
 		const payload = (await captureAnthropicPayload(
 			ANTHROPIC_MODEL,
 			{
@@ -1038,7 +1038,7 @@ describe("Anthropic request fingerprint alignment", () => {
 			{ thinkingEnabled: false },
 		)) as { thinking?: { type?: string } };
 
-		expect(payload.thinking).toEqual({ type: "disabled" });
+		expect(payload.thinking).toBeUndefined();
 	});
 
 	it("drops temperature and sampling params for Opus 4.7 without enabled thinking", async () => {
