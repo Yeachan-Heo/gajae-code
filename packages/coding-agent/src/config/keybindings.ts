@@ -134,8 +134,8 @@ export const KEYBINDINGS = {
 		description: "Queue message for next turn",
 	},
 	"app.message.dequeue": {
-		defaultKeys: "alt+up",
-		description: "Dequeue message",
+		defaultKeys: ["alt+up", "alt+down"],
+		description: "Select queued message to edit",
 	},
 	"app.clipboard.pasteImage": {
 		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",

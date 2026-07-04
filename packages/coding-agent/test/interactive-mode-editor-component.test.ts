@@ -96,6 +96,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(rendered).toContain("Type your message...");
 		expect(rendered).toContain(expectedNewlineShortcutHint());
 		expect(rendered).toContain("Ctrl+C: Clear");
+		expect(rendered).toContain("Shift+Tab: Reasoning");
 		expect(rendered).not.toContain("Enter: Steer");
 		expect(rendered).not.toContain(expectedQueueShortcutHint());
 

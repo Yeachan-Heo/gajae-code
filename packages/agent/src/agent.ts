@@ -954,6 +954,12 @@ export class Agent {
 	popLastSteer(): AgentMessage | undefined {
 		return this.#steeringQueue.pop();
 	}
+	removeSteerAt(index: number): AgentMessage | undefined {
+		if (index < 0 || index >= this.#steeringQueue.length) return undefined;
+		const [removed] = this.#steeringQueue.splice(index, 1);
+		return removed;
+	}
+
 
 	/**
 	 * Remove and return the last follow-up message from the queue (LIFO).
@@ -961,6 +967,11 @@ export class Agent {
 	 */
 	popLastFollowUp(): AgentMessage | undefined {
 		return this.#followUpQueue.pop();
+	}
+	removeFollowUpAt(index: number): AgentMessage | undefined {
+		if (index < 0 || index >= this.#followUpQueue.length) return undefined;
+		const [removed] = this.#followUpQueue.splice(index, 1);
+		return removed;
 	}
 
 	/** Remove queued steering+follow-up messages matching `predicate`, preserving order of the rest. */

@@ -21,9 +21,24 @@ export interface WelcomeComponentOptions {
 	collapseChangelog?: boolean;
 }
 
-const WELCOME_FIXED_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 13;
+const WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 9;
 const DEFAULT_WHATS_NEW_ROWS = 3;
 const MAX_WHATS_NEW_ROWS = 12;
+const NEWLINE_FLOW_KEY =
+	process.platform === "win32" ? { key: "alt+enter", label: "newline" } : { key: "ctrl+j", label: "newline" };
+
+const FLOW_KEY_ITEMS: ReadonlyArray<{ key: string; label: string }> = [
+	{ key: "/", label: "commands" },
+	{ key: "#", label: "actions" },
+	{ key: "!", label: "shell" },
+	{ key: "$", label: "python" },
+	{ key: "?", label: "keymap" },
+	{ key: "ctrl+l", label: "model" },
+	{ key: "shift+tab", label: "reasoning" },
+	{ key: "tab", label: "complete" },
+	NEWLINE_FLOW_KEY,
+	{ key: "ctrl+c", label: "clear" },
+];
 
 /**
  * GJC-native launch surface with compact command affordances, project
@@ -163,9 +178,22 @@ export class WelcomeComponent implements Component {
 			}
 		}
 
-		const changelogRowLimit = this.#whatsNewRowLimit(targetContentRows, lspLines.length);
+		const flowPreferredRows = this.#flowKeyRows(rightColumnWidth).length;
+		const changelogRowLimit = this.#whatsNewRowLimit(targetContentRows, lspLines.length, flowPreferredRows);
 		const changelogLines = this.#whatsNewLines(rightColumnWidth, changelogRowLimit);
-		const sessionLimit = this.#sessionTrailLimit(targetContentRows, changelogLines.length, lspLines.length);
+		const flowRowLimit = this.#flowKeyRowLimit(
+			targetContentRows,
+			changelogLines.length,
+			lspLines.length,
+			rightColumnWidth,
+		);
+		const flowLines = this.#flowKeyLines(rightColumnWidth, flowRowLimit);
+		const sessionLimit = this.#sessionTrailLimit(
+			targetContentRows,
+			changelogLines.length,
+			lspLines.length,
+			flowLines.length,
+		);
 		const sessionLines = this.#sessionTrailLines(rightColumnWidth, sessionLimit);
 
 		const rightLines = [
@@ -174,19 +202,7 @@ export class WelcomeComponent implements Component {
 			...changelogLines,
 			separator,
 			` ${theme.bold(theme.fg("accent", "Flow keys"))}`,
-			` ${theme.fg("dim", "/")}${theme.fg("muted", " commands")} ${theme.fg("dim", "·")} ${theme.fg(
-				"dim",
-				"#",
-			)}${theme.fg("muted", " actions")}`,
-			` ${theme.fg("dim", "!")}${theme.fg("muted", " shell")} ${theme.fg("dim", "·")} ${theme.fg("dim", "$")}${theme.fg(
-				"muted",
-				" python",
-			)}`,
-			` ${theme.fg("dim", "?")}${theme.fg("muted", " keymap")} ${theme.fg("dim", "·")} ${theme.fg(
-				"dim",
-				"ctrl+l",
-			)}${theme.fg("muted", " model")}`,
-			` ${theme.fg("dim", "shift+tab")}${theme.fg("muted", " reasoning")}`,
+			...flowLines,
 			separator,
 			` ${theme.bold(theme.fg("accent", "Project pulse"))}`,
 			...lspLines,
@@ -305,13 +321,67 @@ export class WelcomeComponent implements Component {
 		return [...Array.from({ length: topPad }, () => ""), ...clipped, ...Array.from({ length: bottomPad }, () => "")];
 	}
 
-	#whatsNewRowLimit(targetContentRows: number | undefined, lspLineCount: number): number {
+	#flowKeyItemText(item: { key: string; label: string }): string {
+		return `${theme.fg("dim", item.key)}${theme.fg("muted", ` ${item.label}`)}`;
+	}
+
+	#flowKeyRows(width: number): string[] {
+		const contentWidth = Math.max(1, width - 1);
+		const separator = ` ${theme.fg("dim", "·")} `;
+		const rows: string[] = [];
+		let current = "";
+		for (const item of FLOW_KEY_ITEMS) {
+			const segment = this.#flowKeyItemText(item);
+			const next = current ? `${current}${separator}${segment}` : segment;
+			if (current && visibleWidth(next) > contentWidth) {
+				rows.push(` ${current}`);
+				current = segment;
+			} else {
+				current = next;
+			}
+		}
+		if (current) rows.push(` ${current}`);
+		return rows.length > 0 ? rows : [` ${theme.fg("dim", "No flow keys")}`];
+	}
+
+	#flowKeyLines(width: number, maxRows: number): string[] {
+		const rows = this.#flowKeyRows(width);
+		const rowLimit = Math.max(1, Math.floor(maxRows));
+		if (rows.length <= rowLimit) return rows;
+		if (rowLimit === 1) {
+			const firstItem = FLOW_KEY_ITEMS[0];
+			const firstSegment = firstItem ? this.#flowKeyItemText(firstItem) : theme.fg("dim", "keys");
+			return [this.#fitToWidth(` ${firstSegment} ${theme.fg("dim", "· … ")}${theme.bold("/help")}`, width)];
+		}
+		return [...rows.slice(0, rowLimit - 1), ` ${theme.fg("dim", `… ${theme.bold("/help")} for more`)}`];
+	}
+
+	#flowKeyRowLimit(
+		targetContentRows: number | undefined,
+		changelogLineCount: number,
+		lspLineCount: number,
+		rightColumnWidth: number,
+	): number {
+		const preferredRows = this.#flowKeyRows(rightColumnWidth).length;
+		if (targetContentRows === undefined) return preferredRows;
+
+		const sessionBaselineRows = this.recentSessions.length === 0 ? 1 : Math.min(3, this.recentSessions.length);
+		const availableRows =
+			targetContentRows -
+			WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS -
+			changelogLineCount -
+			lspLineCount -
+			sessionBaselineRows;
+		return Math.max(1, Math.min(preferredRows, availableRows));
+	}
+
+	#whatsNewRowLimit(targetContentRows: number | undefined, lspLineCount: number, flowLineCount: number): number {
 		if (targetContentRows === undefined) return 5;
 
 		const sessionBaselineRows = this.recentSessions.length === 0 ? 1 : Math.min(3, this.recentSessions.length);
 		const dynamicRows = Math.max(
 			1,
-			targetContentRows - WELCOME_FIXED_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS - lspLineCount,
+			targetContentRows - WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS - flowLineCount - lspLineCount,
 		);
 		const rowsAfterBaselineSessions = Math.max(1, dynamicRows - sessionBaselineRows);
 		const spareRows = Math.max(0, rowsAfterBaselineSessions - DEFAULT_WHATS_NEW_ROWS);
@@ -321,14 +391,23 @@ export class WelcomeComponent implements Component {
 		);
 	}
 
-	#sessionTrailLimit(targetContentRows: number | undefined, changelogLineCount: number, lspLineCount: number): number {
+	#sessionTrailLimit(
+		targetContentRows: number | undefined,
+		changelogLineCount: number,
+		lspLineCount: number,
+		flowLineCount: number,
+	): number {
 		if (this.recentSessions.length === 0) return 0;
 
 		const defaultLimit = Math.min(3, this.recentSessions.length);
 		if (targetContentRows === undefined) return defaultLimit;
 
 		const rowsWithDefaultTrail =
-			WELCOME_FIXED_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS + changelogLineCount + lspLineCount + defaultLimit;
+			WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS +
+			changelogLineCount +
+			flowLineCount +
+			lspLineCount +
+			defaultLimit;
 		const extraRows = Math.max(0, targetContentRows - rowsWithDefaultTrail);
 		return Math.min(this.recentSessions.length, defaultLimit + extraRows);
 	}
@@ -510,7 +589,6 @@ interface ShineConfig {
 	/** Center of the shine band along the diagonal, in [0, 1]. */
 	pos: number;
 }
-
 /**
  * Apply a multi-stop diagonal gradient (bottom-left → top-right) plus an
  * optional sliding shine band across multi-line art. `phase` (0..1) shifts the

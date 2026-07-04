@@ -28,6 +28,26 @@ function renderedColumnWidths(lines: string[]): { left: number; right: number } 
 	throw new Error("Expected two-column welcome layout");
 }
 
+function renderedRightColumn(lines: string[]): string[] {
+	return lines.map(stripRenderControls).flatMap(line => {
+		const separators = Array.from(line.matchAll(/│/g), match => match.index ?? -1);
+		if (separators.length < 3) return [];
+		const [, divider, rightEdge] = separators;
+		return [line.slice(divider + 1, rightEdge)];
+	});
+}
+
+function flowKeyContentRows(lines: string[]): string[] {
+	const rightColumn = renderedRightColumn(lines);
+	const start = rightColumn.findIndex(line => line.includes("Flow keys"));
+	const end = rightColumn.findIndex((line, index) => index > start && line.includes("Project pulse"));
+	if (start === -1 || end === -1) throw new Error("Expected Flow keys and Project pulse sections");
+	return rightColumn.slice(start + 1, end).filter(line => {
+		const text = line.trim();
+		return text.length > 0 && !/[─━-]{3,}/.test(text);
+	});
+}
+
 describe("WelcomeComponent viewport sizing", () => {
 	it("uses the full terminal width on wide initial forge viewports", () => {
 		const welcome = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii");
@@ -68,7 +88,6 @@ describe("WelcomeComponent viewport sizing", () => {
 		expect(lines.some(line => line.includes("GJC Forge"))).toBe(true);
 		expect(lines.some(line => line.includes("What's New"))).toBe(true);
 	});
-
 	it("integrates changelog highlights without overflowing narrow CJK content", () => {
 		const welcome = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii", {
 			getViewportRows: () => 16,
@@ -151,8 +170,51 @@ describe("WelcomeComponent viewport sizing", () => {
 		const compactText = compact.render(100).join("\n");
 		const roomyText = roomy.render(100).join("\n");
 
-		expect(compactText).toContain("trail-session-3");
-		expect(compactText).not.toContain("trail-session-4");
+		expect(compactText).toContain("trail-session-4");
+		expect(compactText).not.toContain("trail-session-5");
 		expect(roomyText).toContain("trail-session-8");
+	});
+
+	it("packs Flow keys across the available section width", () => {
+		const narrow = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii");
+		const wide = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii");
+
+		const narrowFlowRows = flowKeyContentRows(narrow.render(70));
+		const wideFlowRows = flowKeyContentRows(wide.render(160));
+		const wideText = wideFlowRows.join("\n");
+
+		expect(wideFlowRows.length).toBeLessThan(narrowFlowRows.length);
+		expect(wideText).toContain("/ commands");
+		expect(wideText).toContain("ctrl+c clear");
+	});
+
+	it("does not advertise Alt+Enter as newline when it is the queue shortcut", () => {
+		const welcome = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii");
+		const flowText = flowKeyContentRows(welcome.render(160)).join("\n");
+
+		if (process.platform === "win32") {
+			expect(flowText).toContain("alt+enter newline");
+		} else {
+			expect(flowText).toContain("ctrl+j newline");
+			expect(flowText).not.toContain("alt+enter newline");
+		}
+	});
+
+	it("clips Flow keys to the viewport row budget before session trail rows", () => {
+		const recentSessions = Array.from({ length: 6 }, (_, index) => ({
+			name: `trail-session-${index + 1}`,
+			timeAgo: `${index + 1}m ago`,
+		}));
+		const compact = new WelcomeComponent("1.2.3", "test-model", "test-provider", recentSessions, [], "ascii", {
+			getViewportRows: () => 18,
+			getReservedBottomRows: () => 4,
+		});
+
+		const lines = compact.render(80);
+		const flowRows = flowKeyContentRows(lines);
+
+		expect(lines).toHaveLength(14);
+		expect(flowRows.length).toBeLessThanOrEqual(2);
+		expect(lines.join("\n")).toContain("/help");
 	});
 });

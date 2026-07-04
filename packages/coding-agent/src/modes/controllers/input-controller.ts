@@ -11,7 +11,7 @@ import { createPromptActionAutocompleteProvider } from "../../modes/prompt-actio
 import { theme } from "../../modes/theme/theme";
 import { scrollTmuxToPreviousUserInput as scrollTmuxPaneToPreviousUserInput } from "../../modes/tmux-scroll";
 import type { InteractiveModeContext } from "../../modes/types";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
@@ -19,6 +19,7 @@ import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
+import { QueuedMessageSelectorComponent } from "../components/queued-message-selector";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
@@ -607,12 +608,95 @@ export class InputController {
 	}
 
 	handleDequeue(): void {
-		const restored = this.restoreLatestQueuedMessageToEditor();
-		if (restored === 0) {
+		const entries = this.#getEditableQueuedMessages();
+		if (entries.length === 0) {
+			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.showStatus("No queued messages to restore");
-		} else {
-			this.ctx.showStatus(`Restored ${restored} queued message${restored > 1 ? "s" : ""} to editor`);
+			return;
 		}
+		if (entries.length === 1) {
+			const restored = this.#restoreQueuedMessageToEditor(entries[0]);
+			this.ctx.showStatus(
+				restored === 0 ? "Queued message is no longer available" : "Restored queued message to editor",
+			);
+			return;
+		}
+		this.#showQueuedMessageSelector(entries);
+	}
+
+	#compactionQueuedMessageId(index: number): string {
+		return `compaction:${index}`;
+	}
+
+	#getEditableQueuedMessages(): QueuedMessageEditEntry[] {
+		const compactionEntries = this.ctx.compactionQueuedMessages
+			.map((entry, index): QueuedMessageEditEntry => {
+				const label = entry.mode === "steer" ? "Steer" : "Queued";
+				return {
+					id: this.#compactionQueuedMessageId(index),
+					text: entry.text,
+					mode: entry.mode,
+					label,
+				};
+			})
+			.reverse();
+		return [...compactionEntries, ...this.ctx.session.getQueuedMessageEntries()];
+	}
+
+	#restoreEditorFocus(): void {
+		this.ctx.editorContainer.clear();
+		this.ctx.editorContainer.addChild(this.ctx.editor);
+		this.ctx.ui.setFocus(this.ctx.editor);
+	}
+
+	#showQueuedMessageSelector(entries: QueuedMessageEditEntry[]): void {
+		const selector = new QueuedMessageSelectorComponent(
+			entries,
+			entry => {
+				const restored = this.#restoreQueuedMessageToEditor(entry);
+				this.#restoreEditorFocus();
+				this.ctx.showStatus(
+					restored === 0 ? "Queued message is no longer available" : "Restored queued message to editor",
+				);
+				this.ctx.ui.requestRender();
+			},
+			() => {
+				this.#restoreEditorFocus();
+				this.ctx.ui.requestRender();
+			},
+		);
+		this.ctx.editorContainer.clear();
+		this.ctx.editorContainer.addChild(selector);
+		this.ctx.ui.setFocus(selector);
+		this.ctx.ui.requestRender();
+	}
+
+	#removeQueuedMessageForEditing(id: string): string | undefined {
+		const compactionPrefix = "compaction:";
+		if (id.startsWith(compactionPrefix)) {
+			const index = Number(id.slice(compactionPrefix.length));
+			if (!Number.isInteger(index)) return undefined;
+			const [entry] = this.ctx.compactionQueuedMessages.splice(index, 1);
+			return entry?.text;
+		}
+		return this.ctx.session.removeQueuedMessageForEditing(id);
+	}
+
+	#restoreQueuedMessageToEditor(entry: QueuedMessageEditEntry | undefined): number {
+		if (!entry) {
+			this.ctx.updatePendingMessagesDisplay();
+			return 0;
+		}
+		const queuedText = this.#removeQueuedMessageForEditing(entry.id);
+		if (!queuedText) {
+			this.ctx.updatePendingMessagesDisplay();
+			return 0;
+		}
+
+		this.ctx.locallySubmittedUserSignatures.delete(`${queuedText}\u00000`);
+		this.ctx.editor.setText(queuedText);
+		this.ctx.updatePendingMessagesDisplay();
+		return 1;
 	}
 
 	/**

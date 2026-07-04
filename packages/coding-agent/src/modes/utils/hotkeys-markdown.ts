@@ -23,6 +23,7 @@ export function buildHotkeysMarkdown(bindings: HotkeysMarkdownBindings): string 
 		"|-----|--------|",
 		"| `Enter` | Send / queue while busy |",
 		`| \`${appKey(bindings, "app.message.queue")}\` | Queue message for next turn |`,
+		`| \`${appKey(bindings, "app.message.dequeue")}\` | Select queued message to edit |`,
 		"| `Shift+Enter` / `Ctrl+J` | New line |",
 		"| `Ctrl+W` / `Option+Backspace` | Delete word backwards |",
 		"| `Ctrl+U` | Delete to start of line |",
