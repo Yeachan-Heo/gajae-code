@@ -92,6 +92,19 @@ function renderIrcPeerRoster(selfId: string): string {
 	return peers.map(peer => `- \`${peer.id}\` — ${peer.displayName} (${peer.kind}, ${peer.status})`).join("\n");
 }
 
+/**
+ * Whether a subagent should receive IRC coordination prompt text (the peer roster and the
+ * "reach other agents via the `irc` tool" instructions). IRC must be enabled AND the subagent
+ * must actually have the `irc` tool. Role agents such as `architect`/`planner`/`critic` declare
+ * a `tools` allowlist without `irc`, so injecting the roster there advertised a tool they cannot
+ * call. `undefined` toolNames means the agent takes the full default toolset (which includes
+ * `irc` when enabled).
+ */
+export function subagentIrcActive(ircEnabled: boolean, toolNames: string[] | undefined): boolean {
+	if (!ircEnabled) return false;
+	return toolNames === undefined || toolNames.includes("irc");
+}
+
 function getReportFindingKey(value: unknown): string | null {
 	if (!value || typeof value !== "object") return null;
 	const record = value as Record<string, unknown>;
@@ -624,6 +637,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const lspEnabled = enableLsp ?? true;
 	const ircEnabled = subagentSettings.get("irc.enabled") === true;
+	const ircActive = subagentIrcActive(ircEnabled, toolNames);
 	const contextFileForPrompt = ircEnabled ? undefined : options.contextFile;
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
 
@@ -1274,8 +1288,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							worktree: worktree ?? "",
 							outputSchema: normalizedOutputSchema,
 							contextFile: contextFileForPrompt,
-							ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
-							ircSelfId: ircEnabled ? id : "",
+							ircPeers: ircActive ? renderIrcPeerRoster(id) : "",
+							ircSelfId: ircActive ? id : "",
 							forkContext: forkContextNotice,
 						});
 						// Order: base agent prompt -> agent appendix -> Tier-1 advertisement -> Tier-2 body.
