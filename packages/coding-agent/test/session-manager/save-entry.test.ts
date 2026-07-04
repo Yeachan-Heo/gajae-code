@@ -1,6 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import { type CustomEntry, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
+function hasUndefinedPlainObjectField(value: unknown): boolean {
+	if (value === undefined) return true;
+	if (value === null || typeof value !== "object") return false;
+	if (Array.isArray(value)) return value.some(item => hasUndefinedPlainObjectField(item));
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return false;
+	return Object.values(value).some(item => item === undefined || hasUndefinedPlainObjectField(item));
+}
+
 describe("SessionManager.saveCustomEntry", () => {
 	it("saves custom entries and includes them in tree traversal", () => {
 		const session = SessionManager.inMemory();
@@ -62,5 +71,39 @@ describe("SessionManager.saveCustomEntry", () => {
 			provider: "openai",
 			items: nativeHistory,
 		});
+	});
+
+	it("normalizes optional undefined fields before live session-entry persistence", () => {
+		const session = SessionManager.inMemory();
+
+		session.appendModeChange("goal", {
+			goal: {
+				id: "goal-1",
+				objective: "finish issue",
+				status: "complete",
+				tokensUsed: undefined,
+			},
+		});
+		session.appendCustomMessageEntry(
+			"ask.prompt",
+			"Choose an option",
+			false,
+			{
+				customInput: undefined,
+				selectedOptions: ["Done"],
+				nested: { clarificationQuestion: undefined, retained: true },
+			},
+			"agent",
+		);
+		session.appendCustomEntry("goal-completed", {
+			objective: "finish issue",
+			tokensUsed: undefined,
+			timeUsedSeconds: undefined,
+		});
+
+		const entries = session.getEntries();
+		expect(entries).toHaveLength(3);
+		expect(entries.some(entry => hasUndefinedPlainObjectField(entry))).toBe(false);
+		expect(JSON.stringify(entries)).not.toContain("undefined");
 	});
 });
