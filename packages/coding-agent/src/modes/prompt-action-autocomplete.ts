@@ -177,6 +177,9 @@ function getSlashTokenPrefix(textBeforeCursor: string): string | null {
 	return token;
 }
 
+function isLeadingSlashToken(textBeforeCursor: string, slashPrefix: string): boolean {
+	return textBeforeCursor.trimStart() === slashPrefix;
+}
 export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	#baseProvider: CombinedAutocompleteProvider;
 	#actions: PromptActionDefinition[];
@@ -223,10 +226,14 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 
 		const slashPrefix = getSlashTokenPrefix(textBeforeCursor);
 		if (slashPrefix) {
-			const baseSuggestions = withoutSkillCommandSuggestions(
-				await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol),
-			);
-			const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor);
+			const isLeading = isLeadingSlashToken(textBeforeCursor, slashPrefix);
+			const baseSuggestions = isLeading
+				? withoutSkillCommandSuggestions(await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol))
+				: null;
+			const skillCommandSuggestions =
+				isLeading || slashPrefix.startsWith("/skill")
+					? this.#getSkillCommandSuggestions(textBeforeCursor, { includeEmpty: isLeading })
+					: null;
 			return sortSlashCommandSuggestions(
 				mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
 				this.#commands,
@@ -300,7 +307,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		const baseSuggestions = withoutSkillCommandSuggestions(
 			this.#baseProvider.trySyncSlashCompletion?.(textBeforeCursor) ?? null,
 		);
-		const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor);
+		const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor, { includeEmpty: false });
 		return sortSlashCommandSuggestions(
 			mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
 			this.#commands,
@@ -311,11 +318,14 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		return tryEmojiInlineReplace(textBeforeCursor);
 	}
 
-	#getSkillCommandSuggestions(textBeforeCursor: string): { items: AutocompleteItem[]; prefix: string } | null {
+	#getSkillCommandSuggestions(
+		textBeforeCursor: string,
+		options: { includeEmpty: boolean },
+	): { items: AutocompleteItem[]; prefix: string } | null {
 		const prefix = getSlashTokenPrefix(textBeforeCursor);
 		if (!prefix) return null;
 		const query = prefix.slice(1).toLowerCase();
-		if (query.length === 0) return null;
+		if (query.length === 0 && !options.includeEmpty) return null;
 		const normalizedQuery = query.startsWith("skill-") ? `skill:${query.slice("skill-".length)}` : query;
 		const exactNonSkillCommand = this.#commands.some(
 			command => command.name === query && !command.name.startsWith("skill:"),

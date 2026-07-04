@@ -1152,7 +1152,7 @@ export class Editor implements Component, Focusable {
 					// Check for stale autocomplete state due to debounce
 					const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
 					const currentTextBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-					if (currentTextBeforeCursor !== this.#autocompletePrefix) {
+					if (!currentTextBeforeCursor.endsWith(this.#autocompletePrefix)) {
 						// Autocomplete is stale - cancel and fall through to normal submission
 						this.#cancelAutocomplete();
 					} else {
@@ -1290,8 +1290,8 @@ export class Editor implements Component, Focusable {
 				const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
 				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 				if (
-					textBeforeCursor.startsWith("/") &&
-					this.#isInSubmittedSlashCommandContext() &&
+					(this.#isInSubmittedSlashCommandContext() ||
+						this.#getSlashTokenBeforeCursor()?.startsWith("/skill") === true) &&
 					this.#autocompleteProvider?.trySyncSlashCompletion
 				) {
 					const syncResult = this.#autocompleteProvider.trySyncSlashCompletion(textBeforeCursor);
@@ -1728,7 +1728,8 @@ export class Editor implements Component, Focusable {
 
 		// Check if we should trigger or update autocomplete
 		if (!this.#autocompleteState) {
-			// Auto-trigger for "/" at the start of a line (slash commands)
+			// Auto-trigger for "/" at the start of a submitted command.
+			// Inline skill autocomplete starts after the token becomes "/skill...".
 			if (char === "/" && this.#isAtStartOfSubmittedMessage()) {
 				this.#tryTriggerAutocomplete();
 			}
@@ -1750,8 +1751,8 @@ export class Editor implements Component, Focusable {
 			else if (/[a-zA-Z0-9.\-_/]/.test(char)) {
 				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-				// Check if we're in a slash command (with or without space for arguments)
-				if (this.#isInSubmittedSlashCommandContext()) {
+				// Check if we're in a slash command or inline slash token
+				if (this.#isInSubmittedSlashCommandContext() || this.#isInSlashTokenContext()) {
 					this.#tryTriggerAutocomplete();
 				}
 				// Check if we're in an @ file reference context
@@ -1946,8 +1947,8 @@ export class Editor implements Component, Focusable {
 			// If autocomplete was cancelled (no matches), re-trigger if we're in a completable context
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-			// Slash command context
-			if (this.#isInSubmittedSlashCommandContext()) {
+			// Slash command or inline slash token context
+			if (this.#isInSubmittedSlashCommandContext() || this.#isInSlashTokenContext()) {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
@@ -2103,7 +2104,7 @@ export class Editor implements Component, Focusable {
 		} else {
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-			if (this.#isInSubmittedSlashCommandContext()) {
+			if (this.#isInSubmittedSlashCommandContext() || this.#isInSlashTokenContext()) {
 				this.#tryTriggerAutocomplete();
 			} else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
 				this.#tryTriggerAutocomplete();
@@ -2417,8 +2418,8 @@ export class Editor implements Component, Focusable {
 		} else {
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-			// Slash command context
-			if (this.#isInSubmittedSlashCommandContext()) {
+			// Slash command or inline slash token context
+			if (this.#isInSubmittedSlashCommandContext() || this.#isInSlashTokenContext()) {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
@@ -2645,6 +2646,17 @@ export class Editor implements Component, Focusable {
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
 		return this.#hasOnlyWhitespaceBeforeCursorLine() && beforeCursor.trimStart().startsWith("/");
+	}
+
+	#getSlashTokenBeforeCursor(): string | null {
+		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
+		const match = beforeCursor.match(/(?:^|\s)(\/[^\s]*)$/);
+		return match?.[1] ?? null;
+	}
+
+	#isInSlashTokenContext(): boolean {
+		return this.#getSlashTokenBeforeCursor()?.startsWith("/skill") === true;
 	}
 
 	#isSlashCommandNameAutocompleteSelection(): boolean {
