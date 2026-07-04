@@ -1074,6 +1074,7 @@ interface UltragoalChangeSet extends JsonObject {
 	mergeBase?: string;
 	paths: UltragoalChangeSetPath[];
 	rawDiffStat?: string;
+	rawDiff?: string;
 	trusted: true;
 }
 
@@ -1086,9 +1087,14 @@ const MANDATORY_COMPUTER_CASE_IDS = [
 	"runaway-loop-halt",
 	"blast-radius",
 ] as const;
+const TOOLS_INDEX_PATH = "packages/coding-agent/src/tools/index.ts";
 
 function normalizeRepoPath(value: string): string {
 	return value.replaceAll("\\\\", "/").replace(/^\.\//, "");
+}
+
+function isToolsIndexPath(value: string): boolean {
+	return normalizeRepoPath(value) === TOOLS_INDEX_PATH;
 }
 
 function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
@@ -1130,6 +1136,32 @@ function isComputerControlSurfaceCategory(category: UltragoalChangeCategory): bo
 	return category === "code" || category === "tool" || category === "settings-registry";
 }
 
+function isComputerSpecificToolsIndexDiff(diff: string | undefined, targetPath: string): boolean {
+	if (!diff || !isToolsIndexPath(targetPath)) return false;
+	let inTargetFile = false;
+	for (const line of diff.split("\n")) {
+		if (line.startsWith("diff --git ")) {
+			const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+			inTargetFile = !!match && (isToolsIndexPath(match[1]!) || isToolsIndexPath(match[2]!));
+			continue;
+		}
+		if (!inTargetFile || line.startsWith("+++") || line.startsWith("---")) continue;
+		if (!line.startsWith("+") && !line.startsWith("-")) continue;
+		const changedLine = line.slice(1);
+		if (
+			/\bComputerTool\b/.test(changedLine) ||
+			/\bisComputerCallable\b/.test(changedLine) ||
+			/\bisComputerLoadablePlatform\b/.test(changedLine) ||
+			/["']computer["']/.test(changedLine) ||
+			/["']\.\/computer["']/.test(changedLine) ||
+			/\bcomputer\s*:/.test(changedLine)
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
 function isComputerControlSurfaceChangePath(row: UltragoalChangeSetPath): boolean {
 	const category = row.category ?? categorizeComputerChangePath(row.path);
 	const oldCategory = row.oldPath ? categorizeComputerChangePath(row.oldPath) : category;
@@ -1138,7 +1170,13 @@ function isComputerControlSurfaceChangePath(row: UltragoalChangeSetPath): boolea
 
 function trustedChangeSetRequiresComputerSuite(changeSet: UltragoalChangeSet | undefined): boolean {
 	if (!changeSet?.trusted) return false;
-	return changeSet.paths.some(isComputerControlSurfaceChangePath);
+	return changeSet.paths.some(row => {
+		if (isComputerControlSurfaceChangePath(row)) return true;
+		return (
+			isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.path) ||
+			(row.oldPath ? isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.oldPath) : false)
+		);
+	});
 }
 
 function requiresComputerRedTeamSuite(executorQa: JsonObject, changeSet: UltragoalChangeSet | undefined): boolean {
@@ -3183,15 +3221,17 @@ function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChang
 async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeSet | undefined> {
 	const inGit = await spawnText(["git", "rev-parse", "--is-inside-work-tree"], { cwd, timeoutMs: 3000 });
 	if (!inGit.ok || inGit.stdout.trim() !== "true") return undefined;
-	if (!(await Bun.file(path.join(cwd, ".git")).exists())) return undefined;
 	const baseRef = await resolveGitBase(cwd);
 	const base = baseRef;
 	const mergeBase = await spawnText(["git", "merge-base", "HEAD", baseRef], { cwd, timeoutMs: 3000 });
-	const [committed, unstaged, staged, stat] = await Promise.all([
+	const [committed, unstaged, staged, stat, committedDiff, unstagedDiff, stagedDiff] = await Promise.all([
 		spawnText(["git", "diff", "--name-status", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--name-status"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--cached", "--name-status"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 	]);
 	if (!committed.ok && !unstaged.ok && !staged.ok) return undefined;
 	return {
@@ -3205,6 +3245,7 @@ async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeS
 			parseGitNameStatus(staged.stdout),
 		]),
 		rawDiffStat: stat.stdout,
+		rawDiff: [committedDiff.stdout, unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n"),
 		trusted: true,
 	};
 }
@@ -3235,6 +3276,7 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 			source: "review-pr",
 			paths: parseUnifiedDiffPaths(source.diff),
 			rawDiffStat: source.diff,
+			rawDiff: source.diff,
 			trusted: true,
 		};
 	const local = qualityGateObject(source.local);
@@ -3244,6 +3286,7 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 			source: "review-worktree",
 			paths: parseGitNameStatus(String(source.nameStatus ?? source.status ?? "")),
 			rawDiffStat: String(source.diffStat ?? ""),
+			rawDiff: String(source.diff ?? ""),
 			trusted: true,
 		};
 	if (kind === "branch" || kind === "pr-fallback")
@@ -3253,6 +3296,7 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 			headRef: "HEAD",
 			paths: parseGitNameStatus(String(source.nameStatus ?? "")),
 			rawDiffStat: String(source.diffStat ?? ""),
+			rawDiff: String(source.diff ?? ""),
 			trusted: true,
 		};
 	return undefined;
@@ -3260,25 +3304,36 @@ function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | und
 
 async function localDiffSource(cwd: string, sourceKind: string, branch?: string): Promise<JsonObject> {
 	if (sourceKind === "worktree") {
-		const [status, diff, unstaged, staged] = await Promise.all([
+		const [status, diffStat, unstaged, staged, unstagedDiff, stagedDiff] = await Promise.all([
 			spawnText(["git", "status", "--short"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff", "--stat"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff", "--name-status"], { cwd, timeoutMs: 5000 }),
 			spawnText(["git", "diff", "--cached", "--name-status"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
+			spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 		]);
 		return {
 			kind: "worktree",
 			status: status.stdout,
-			diffStat: diff.stdout,
+			diffStat: diffStat.stdout,
+			diff: [unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n"),
 			nameStatus: `${unstaged.stdout}\n${staged.stdout}`,
 		};
 	}
 	const base = await resolveGitBase(cwd, branch);
-	const [diff, nameStatus] = await Promise.all([
+	const [diffStat, nameStatus, diff] = await Promise.all([
 		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--name-status", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
 	]);
-	return { kind: sourceKind, base, branch, diffStat: diff.stdout, nameStatus: nameStatus.stdout };
+	return {
+		kind: sourceKind,
+		base,
+		branch,
+		diffStat: diffStat.stdout,
+		diff: diff.stdout,
+		nameStatus: nameStatus.stdout,
+	};
 }
 
 async function resolveReviewSource(
