@@ -32,9 +32,14 @@ function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): Assist
 }
 
 /** Minimal mock of AgentSession for print-mode text output path */
-function createMockSession(messages: Message[]): AgentSession {
+function createMockSession(
+	messages: Message[],
+	opts?: { contextWindow?: number; autoCompactionEnabled?: boolean },
+): AgentSession {
 	return {
 		state: { messages },
+		model: opts?.contextWindow !== undefined ? { contextWindow: opts.contextWindow } : undefined,
+		autoCompactionEnabled: opts?.autoCompactionEnabled ?? false,
 		sessionManager: {
 			getHeader: () => undefined,
 		},
@@ -150,5 +155,115 @@ describe("Print-mode last-assistant output regression (#484)", () => {
 
 		const stdoutText = stdoutOutput.join("");
 		expect(stdoutText).toContain("@gajae-code/coding-agent");
+	});
+});
+
+/**
+ * Contract: in TEXT mode only, a terminal context-overflow assistant message is
+ * surfaced with an actionable diagnostic and a distinct exit code
+ * (CONTEXT_OVERFLOW_EXIT_CODE) so `gjc -p` callers can detect context exhaustion.
+ * JSON mode is intentionally out of scope (it streams events and never runs this
+ * terminal branch) — the last test documents that boundary.
+ */
+describe("Print-mode context-overflow terminal handling (text mode)", () => {
+	let exitSpy: ReturnType<typeof vi.spyOn>;
+	let stderrOutput: string[];
+
+	beforeEach(() => {
+		stderrOutput = [];
+		vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+			stderrOutput.push(String(chunk));
+			return true;
+		});
+		exitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		vi.spyOn(process.stdout, "write").mockImplementation((...args: unknown[]) => {
+			const last = args[args.length - 1];
+			if (typeof last === "function") last();
+			return true;
+		});
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("emits an actionable diagnostic and a distinct exit code on context overflow", async () => {
+		const { runPrintMode, CONTEXT_OVERFLOW_EXIT_CODE } = await import("../src/modes/print-mode");
+
+		// The exact string a Codex/OpenAI-code backend surfaces on context_length_exceeded.
+		const overflowMsg = makeAssistantMessage({
+			stopReason: "error",
+			errorMessage:
+				"Codex error event: Your input exceeds the context window of this model. Please adjust your input and try again. (code=context_length_exceeded)",
+			content: [],
+		});
+
+		const session = createMockSession([overflowMsg], { contextWindow: 272000, autoCompactionEnabled: true });
+		await runPrintMode(session, { mode: "text" });
+
+		const stderrText = stderrOutput.join("");
+		// Actionable guidance replaces the opaque provider crash line.
+		expect(stderrText).toContain("Context window exhausted");
+		expect(stderrText).toContain("larger-context model");
+		// Raw provider detail is preserved for debugging.
+		expect(stderrText).toContain("context_length_exceeded");
+		// Distinct exit code so text-mode automation can detect context exhaustion.
+		expect(exitSpy).toHaveBeenCalledWith(CONTEXT_OVERFLOW_EXIT_CODE);
+		expect(exitSpy).not.toHaveBeenCalledWith(1);
+	});
+
+	it("tells the operator to enable auto-compaction when it is disabled", async () => {
+		const { runPrintMode } = await import("../src/modes/print-mode");
+
+		const overflowMsg = makeAssistantMessage({
+			stopReason: "error",
+			errorMessage: "prompt is too long: 300000 tokens > 272000 maximum",
+			content: [],
+		});
+
+		const session = createMockSession([overflowMsg], { contextWindow: 272000, autoCompactionEnabled: false });
+		await runPrintMode(session, { mode: "text" });
+
+		const stderrText = stderrOutput.join("");
+		expect(stderrText).toContain("automatic compaction is disabled");
+	});
+
+	it("still exits 1 with the raw message for non-overflow errors", async () => {
+		const { runPrintMode, CONTEXT_OVERFLOW_EXIT_CODE } = await import("../src/modes/print-mode");
+
+		const errorMsg = makeAssistantMessage({
+			stopReason: "error",
+			errorMessage: "Internal server error (status=500)",
+			content: [],
+		});
+
+		const session = createMockSession([errorMsg], { contextWindow: 272000, autoCompactionEnabled: true });
+		await runPrintMode(session, { mode: "text" });
+
+		const stderrText = stderrOutput.join("");
+		expect(stderrText).toContain("Internal server error");
+		expect(stderrText).not.toContain("Context window exhausted");
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(exitSpy).not.toHaveBeenCalledWith(CONTEXT_OVERFLOW_EXIT_CODE);
+	});
+
+	it("scope boundary: JSON mode does not apply the context-overflow exit code", async () => {
+		const { runPrintMode, CONTEXT_OVERFLOW_EXIT_CODE } = await import("../src/modes/print-mode");
+
+		// Same terminal overflow message, but JSON mode streams events and never runs
+		// the text-mode terminal-error branch, so the exit code is intentionally not applied.
+		const overflowMsg = makeAssistantMessage({
+			stopReason: "error",
+			errorMessage:
+				"Codex error event: Your input exceeds the context window of this model. (code=context_length_exceeded)",
+			content: [],
+		});
+
+		const session = createMockSession([overflowMsg], { contextWindow: 272000, autoCompactionEnabled: true });
+		await runPrintMode(session, { mode: "json" });
+
+		const stderrText = stderrOutput.join("");
+		expect(stderrText).not.toContain("Context window exhausted");
+		expect(exitSpy).not.toHaveBeenCalledWith(CONTEXT_OVERFLOW_EXIT_CODE);
 	});
 });
