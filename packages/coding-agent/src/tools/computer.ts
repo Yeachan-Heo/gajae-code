@@ -407,7 +407,15 @@ function captureScreenshot(
 	deadline: ComputerDeadline | undefined,
 	signal?: AbortSignal,
 ): Promise<unknown> {
-	return runComputerOperation(() => controller.screenshot?.(), deadline, signal);
+	const screenshot = controller.screenshot;
+	if (!screenshot) missingNativeMethod("screenshot", "screenshot");
+	return runComputerOperation(() => screenshot(), deadline, signal);
+}
+
+function missingNativeMethod(action: string, method: string): never {
+	throw new ToolError(`COMPUTER_UNAVAILABLE: Native ComputerController.${method} is unavailable for ${action}.`, {
+		code: "COMPUTER_UNAVAILABLE",
+	});
 }
 
 function shouldCapturePostActionScreenshot(
@@ -508,20 +516,25 @@ function dispatchComputerAction(
 		() => {
 			switch (params.action) {
 				case "screenshot":
-					return controller.screenshot?.();
+					if (!controller.screenshot) missingNativeMethod("screenshot", "screenshot");
+					return controller.screenshot();
 				case "click":
 					validatePointerCoordinates("click", params.x, params.y, context);
-					return controller.click?.(expectedEpoch, params.x, params.y, params.button ?? "left");
+					if (!controller.click) missingNativeMethod("click", "click");
+					return controller.click(expectedEpoch, params.x, params.y, params.button ?? "left");
 				case "double_click":
 					validatePointerCoordinates("double_click", params.x, params.y, context);
-					return controller.doubleClick?.(expectedEpoch, params.x, params.y, params.button ?? "left");
+					if (!controller.doubleClick) missingNativeMethod("double_click", "doubleClick");
+					return controller.doubleClick(expectedEpoch, params.x, params.y, params.button ?? "left");
 				case "move":
 					validatePointerCoordinates("move", params.x, params.y, context);
-					return controller.move?.(expectedEpoch, params.x, params.y);
+					if (!controller.move) missingNativeMethod("move", "move");
+					return controller.move(expectedEpoch, params.x, params.y);
 				case "drag":
 					validatePointerCoordinates("drag start", params.x, params.y, context);
 					validatePointerCoordinates("drag end", params.to_x, params.to_y, context);
-					return controller.drag?.(
+					if (!controller.drag) missingNativeMethod("drag", "drag");
+					return controller.drag(
 						expectedEpoch,
 						params.x,
 						params.y,
@@ -531,13 +544,17 @@ function dispatchComputerAction(
 					);
 				case "scroll":
 					validatePointerCoordinates("scroll", params.x, params.y, context);
-					return controller.scroll?.(expectedEpoch, params.x, params.y, params.scroll_x, params.scroll_y);
+					if (!controller.scroll) missingNativeMethod("scroll", "scroll");
+					return controller.scroll(expectedEpoch, params.x, params.y, params.scroll_x, params.scroll_y);
 				case "type":
-					return controller.type?.(undefined, params.text);
+					if (!controller.type) missingNativeMethod("type", "type");
+					return controller.type(undefined, params.text);
 				case "keypress":
-					return controller.keypress?.(undefined, params.keys);
+					if (!controller.keypress) missingNativeMethod("keypress", "keypress");
+					return controller.keypress(undefined, params.keys);
 				case "wait":
-					return controller.wait?.(undefined, capWaitMs(params.ms, remainingComputerTimeoutMs(deadline)));
+					if (!controller.wait) missingNativeMethod("wait", "wait");
+					return controller.wait(undefined, capWaitMs(params.ms, remainingComputerTimeoutMs(deadline)));
 			}
 		},
 		deadline,

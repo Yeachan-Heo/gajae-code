@@ -318,6 +318,19 @@ describe("computer tool dispatch", () => {
 		expect(calls).toEqual([{ method: "click", args: [undefined, 1, 2, "left"] }]);
 	});
 
+	it("fails closed when a native controller method is missing", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		setComputerControllerFactoryForTests(() => ({}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("missing-click", { action: "click", x: 1, y: 2 });
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
+		expect(textOf(result)).toContain("ComputerController.click is unavailable");
+	});
+
 	it("bounds oversized screenshot images sent inline while preserving the full-resolution artifact", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
