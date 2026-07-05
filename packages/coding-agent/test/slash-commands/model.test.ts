@@ -147,6 +147,6 @@ describe("/model batch assignments", () => {
 
 		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:high");
 		expect(session.thinkingLevel).toBe("high");
-		expect(output).toEqual(["DEFAULT model set to anthropic/claude-3-5-sonnet:high."]);
+		expect(output).toEqual(["Default model set to anthropic/claude-3-5-sonnet:high."]);
 	});
 });

@@ -363,8 +363,8 @@ function formatModelAssignmentSuccess(
 	if (targetId === "all-targets") {
 		return `All model targets set to ${selector} for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.`;
 	}
-	if (targetId === "default") return `DEFAULT model set to ${selector}.`;
-	return `${targetId.toUpperCase()} agent model set to ${selector}.`;
+	if (targetId === "default") return `Default model set to ${selector}.`;
+	return `${targetId} agent model set to ${selector}.`;
 }
 
 function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: string): string {
@@ -513,21 +513,13 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						assignments,
 					});
 					if (!materializedProfile) {
-						const nextOverrides = { ...overrides };
 						for (const [targetId, selector] of assignments) {
 							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
 							if (target.settingsPath === "modelRoles") {
 								runtime.settings.setModelRole(targetId, selector);
 							} else {
-								nextOverrides[targetId] = selector;
+								runtime.settings.setAgentModelOverride(targetId, selector);
 							}
-						}
-						if (
-							targetIds.some(
-								targetId => GJC_MODEL_ASSIGNMENT_TARGETS[targetId].settingsPath === "task.agentModelOverrides",
-							)
-						) {
-							runtime.settings.set("task.agentModelOverrides", nextOverrides);
 						}
 					}
 					runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
