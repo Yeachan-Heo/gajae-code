@@ -143,6 +143,34 @@ function readPromptText(payload: HookPayload): string {
 	return safeString(payload.prompt ?? payload.user_prompt ?? payload.userPrompt).trim();
 }
 
+const QUESTION_ONLY_ADVISORY_CONTEXT =
+	"Question-only prompt advisory: Treat bare '?' and unambiguous informational questions as answer-only/read-only; do not modify files, run commands, or execute workflow changes unless the user explicitly asks for action.";
+
+const QUESTION_EXPLICIT_ACTION_PATTERN =
+	/\b(add|apply|build|change|commit|create|delete|edit|execute|fix|implement|install|merge|modify|move|patch|refactor|remove|rename|replace|run|ship|start|stop|test|update|write)\b/i;
+const QUESTION_START_PATTERN =
+	/^(what|why|how|when|where|who|which|does|do|did|is|are|was|were|can|could|should|would)\b/i;
+
+function classifyQuestionOnlyPrompt(prompt: string): string | null {
+	const normalized = prompt.trim().replace(/\s+/g, " ");
+	if (!normalized) {
+		return null;
+	}
+	if (normalized === "?") {
+		return QUESTION_ONLY_ADVISORY_CONTEXT;
+	}
+	if (!normalized.endsWith("?")) {
+		return null;
+	}
+	if (QUESTION_EXPLICIT_ACTION_PATTERN.test(normalized)) {
+		return null;
+	}
+	if (!QUESTION_START_PATTERN.test(normalized)) {
+		return null;
+	}
+	return QUESTION_ONLY_ADVISORY_CONTEXT;
+}
+
 function readSessionId(payload: HookPayload): string | undefined {
 	return safeString(payload.session_id ?? payload.sessionId).trim() || undefined;
 }
@@ -221,6 +249,7 @@ export async function dispatchGjcNativeSkillHook(
 		const additionalContext = [
 			skillState ? buildSkillActivationAdditionalContext(skillState, effectiveSkillConfig) : activeUltragoalContext,
 			recoveryContext,
+			classifyQuestionOnlyPrompt(prompt),
 		]
 			.filter((value): value is string => Boolean(value))
 			.join(" ");

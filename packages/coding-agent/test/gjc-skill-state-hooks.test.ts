@@ -207,6 +207,41 @@ describe("GJC native skill-state hooks", () => {
 		expect(detectSkillKeywords("please run a consensus plan")[0]?.skill).toBe("ralplan");
 	});
 
+	it("UserPromptSubmit adds advisory answer-only context for question-only prompts", async () => {
+		const root = await cwd();
+		for (const prompt of ["?", "what does /model planner mean?"]) {
+			const result = await dispatchGjcNativeSkillHook({
+				hookEventName: "UserPromptSubmit",
+				userPrompt: prompt,
+				cwd: root,
+				sessionId: `session-question-${prompt === "?" ? "bare" : "model"}`,
+			});
+			const context = String(
+				(result.outputJson?.hookSpecificOutput as { additionalContext?: unknown } | undefined)?.additionalContext ??
+					"",
+			);
+			expect(result.outputJson).not.toMatchObject({ decision: "block" });
+			expect(context).toContain("Question-only prompt advisory");
+			expect(context).toContain("answer-only/read-only");
+		}
+	});
+
+	it("UserPromptSubmit does not add question-only advisory context for explicit action prompts", async () => {
+		const root = await cwd();
+		const result = await dispatchGjcNativeSkillHook({
+			hookEventName: "UserPromptSubmit",
+			userPrompt: "fix the failing model selector test",
+			cwd: root,
+			sessionId: "session-question-action",
+		});
+		const context = String(
+			(result.outputJson?.hookSpecificOutput as { additionalContext?: unknown } | undefined)?.additionalContext ??
+				"",
+		);
+		expect(result.outputJson).not.toEqual(expect.objectContaining({ decision: "block" }));
+		expect(context).not.toContain("Question-only prompt advisory");
+	});
+
 	it("UserPromptSubmit persists session-scoped skill-active and mode state", async () => {
 		const root = await cwd();
 		const result = await dispatchGjcNativeSkillHook(
