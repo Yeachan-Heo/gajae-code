@@ -285,6 +285,8 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 					timeoutMs,
 					hotkey,
 					latestScreenshotContexts.get(this.session),
+					shouldCapturePostActionScreenshot(params, this.session),
+					Boolean(this.session.settings.get("computer.autoScreenshot")),
 				);
 				details.steps = batchResult.steps;
 				if (batchResult.screenshot) {
@@ -317,12 +319,15 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 							.done()
 					: toolResult(details).text(details.message).done();
 			}
-			const result = await dispatchComputerAction(
+			let result = await dispatchComputerAction(
 				controller,
 				params,
 				timeoutMs,
 				latestScreenshotContexts.get(this.session),
 			);
+			if (shouldCapturePostActionScreenshot(params, this.session)) {
+				result = await captureScreenshot(controller);
+			}
 			const screenshot = normalizeScreenshot(result);
 			if (screenshot) {
 				details.screenshot = screenshot;
@@ -395,6 +400,20 @@ function rememberLatestScreenshot(session: ToolSession, screenshot: ComputerScre
 	});
 }
 
+function captureScreenshot(controller: NativeController): Promise<unknown> | unknown {
+	return controller.screenshot?.();
+}
+
+function shouldCapturePostActionScreenshot(
+	params: Pick<ComputerParams, "action" | "include_screenshot">,
+	session: Pick<ToolSession, "settings">,
+): boolean {
+	return (
+		params.action !== "screenshot" &&
+		(params.include_screenshot === true || Boolean(session.settings.get("computer.autoScreenshot")))
+	);
+}
+
 function dispatchComputerAction(
 	controller: NativeController,
 	params: SingleComputerParams,
@@ -443,6 +462,8 @@ async function dispatchBatchComputerActions(
 	timeoutMs: number | undefined,
 	hotkey?: string,
 	initialContext?: ScreenshotContext,
+	includeBatchScreenshot = false,
+	autoScreenshot = false,
 ): Promise<BatchDispatchResult> {
 	const steps: ComputerToolDetails[] = [];
 	let lastScreenshot: ComputerScreenshotDetails | undefined;
@@ -451,7 +472,12 @@ async function dispatchBatchComputerActions(
 	for (const single of actions) {
 		const stepDetails = detailsFromParams(single);
 		try {
-			const result = await dispatchComputerAction(controller, single, timeoutMs, context);
+			const stepTimeoutMs = stepTimeoutFromParams(single, timeoutMs);
+			let result = await dispatchComputerAction(controller, single, stepTimeoutMs, context);
+			if (single.action !== "screenshot" && (single.include_screenshot === true || autoScreenshot)) {
+				result = await captureScreenshot(controller);
+			}
+
 			const screenshot = normalizeScreenshot(result);
 			if (screenshot) {
 				stepDetails.screenshot = screenshot;
@@ -477,7 +503,17 @@ async function dispatchBatchComputerActions(
 		}
 		steps.push(stepDetails);
 	}
+	if (includeBatchScreenshot) {
+		lastScreenshotSource = await captureScreenshot(controller);
+		lastScreenshot = normalizeScreenshot(lastScreenshotSource) ?? lastScreenshot;
+	}
 	return { steps, screenshot: lastScreenshot, screenshotSource: lastScreenshotSource };
+}
+
+function stepTimeoutFromParams(params: SingleComputerParams, batchTimeoutMs: number | undefined): number | undefined {
+	if (params.timeout === undefined) return batchTimeoutMs;
+	const timeoutSeconds = clampTimeout("computer", params.timeout);
+	return timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
 }
 
 function detailsFromParams(params: ComputerParams): ComputerToolDetails {

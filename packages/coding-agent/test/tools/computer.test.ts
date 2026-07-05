@@ -412,6 +412,119 @@ describe("computer tool dispatch", () => {
 		}
 	});
 
+	it("captures a bounded post-action screenshot when include_screenshot is requested", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls.push("click");
+			},
+			screenshot: () => {
+				calls.push("screenshot");
+				return { widthPx: 40, heightPx: 30, png: new Uint8Array([4, 5, 6]) };
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("click-shot", { action: "click", x: 1, y: 2, include_screenshot: true });
+
+		expect(result.isError).not.toBe(true);
+		expect(calls).toEqual(["click", "screenshot"]);
+		expect(result.details?.screenshot).toMatchObject({ widthPx: 40, heightPx: 30, pngBytes: 3 });
+		expect(result.content.find(block => block.type === "image")).toMatchObject({
+			type: "image",
+			mimeType: "image/png",
+			data: "BAUG",
+		});
+	});
+
+	it("uses computer.autoScreenshot for post-action screenshots", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			type: () => {
+				calls.push("type");
+			},
+			screenshot: () => {
+				calls.push("screenshot");
+				return { widthPx: 80, heightPx: 60, png: new Uint8Array([7, 8, 9]) };
+			},
+		}));
+		const tool = new ComputerTool(
+			createSession(Settings.isolated({ "computer.enabled": true, "computer.autoScreenshot": true })),
+		);
+
+		const result = await tool.execute("auto-shot", { action: "type", text: "hello" });
+
+		expect(result.isError).not.toBe(true);
+		expect(calls).toEqual(["type", "screenshot"]);
+		expect(result.details?.screenshot).toMatchObject({ widthPx: 80, heightPx: 60, pngBytes: 3 });
+		expect(result.content.find(block => block.type === "image")).toMatchObject({ data: "BwgJ" });
+	});
+
+	it("captures batch and per-step screenshots according to explicit options", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		let capture = 0;
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls.push("click");
+			},
+			type: () => {
+				calls.push("type");
+			},
+			screenshot: () => {
+				capture += 1;
+				calls.push(`screenshot-${capture}`);
+				return { widthPx: 100 + capture, heightPx: 50 + capture, png: new Uint8Array([capture]) };
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("batch-shot", {
+			action: "batch",
+			include_screenshot: true,
+			actions: [
+				{ action: "click", x: 1, y: 2, include_screenshot: true },
+				{ action: "type", text: "done" },
+			],
+		});
+
+		expect(result.isError).not.toBe(true);
+		expect(calls).toEqual(["click", "screenshot-1", "type", "screenshot-2"]);
+		expect(result.details?.steps?.[0]?.screenshot).toMatchObject({ widthPx: 101, heightPx: 51 });
+		expect(result.details?.steps?.[1]?.screenshot).toBeUndefined();
+		expect(result.details?.screenshot).toMatchObject({ widthPx: 102, heightPx: 52 });
+		expect(result.content.find(block => block.type === "image")).toMatchObject({ data: "Ag==" });
+	});
+
+	it("honors nested per-step timeout values inside batches", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const waits: number[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			wait: (_expectedEpoch, ms) => {
+				waits.push(ms);
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("batch-timeouts", {
+			action: "batch",
+			timeout: 5,
+			actions: [
+				{ action: "wait", ms: 10_000 },
+				{ action: "wait", ms: 10_000, timeout: 1 },
+			],
+		});
+
+		expect(result.isError).not.toBe(true);
+		expect(waits).toEqual([5_000, 1_000]);
+	});
+
 	it("executes batch actions sequentially and reports per-step results", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
