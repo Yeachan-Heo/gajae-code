@@ -407,9 +407,14 @@ function captureScreenshot(
 	deadline: ComputerDeadline | undefined,
 	signal?: AbortSignal,
 ): Promise<unknown> {
-	const screenshot = controller.screenshot;
-	if (!screenshot) missingNativeMethod("screenshot", "screenshot");
-	return runComputerOperation(() => screenshot(), deadline, signal);
+	return runComputerOperation(
+		() => {
+			if (!controller.screenshot) missingNativeMethod("screenshot", "screenshot");
+			return controller.screenshot();
+		},
+		deadline,
+		signal,
+	);
 }
 
 function missingNativeMethod(action: string, method: string): never {

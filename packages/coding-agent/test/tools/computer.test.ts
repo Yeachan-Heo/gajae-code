@@ -318,17 +318,81 @@ describe("computer tool dispatch", () => {
 		expect(calls).toEqual([{ method: "click", args: [undefined, 1, 2, "left"] }]);
 	});
 
-	it("fails closed when a native controller method is missing", async () => {
+	it("fails closed when native controller methods are missing", async () => {
+		const cases: Array<{ name: string; params: Parameters<ComputerTool["execute"]>[1]; method: string }> = [
+			{ name: "screenshot", params: { action: "screenshot" }, method: "screenshot" },
+			{ name: "click", params: { action: "click", x: 1, y: 2 }, method: "click" },
+			{ name: "double-click", params: { action: "double_click", x: 1, y: 2 }, method: "doubleClick" },
+			{ name: "move", params: { action: "move", x: 1, y: 2 }, method: "move" },
+			{ name: "drag", params: { action: "drag", x: 1, y: 2, to_x: 3, to_y: 4 }, method: "drag" },
+			{ name: "scroll", params: { action: "scroll", x: 1, y: 2, scroll_x: 0, scroll_y: -1 }, method: "scroll" },
+			{ name: "type", params: { action: "type", text: "hello" }, method: "type" },
+			{ name: "keypress", params: { action: "keypress", keys: ["Meta", "K"] }, method: "keypress" },
+			{ name: "wait", params: { action: "wait", ms: 1 }, method: "wait" },
+		];
+
+		for (const testCase of cases) {
+			setComputerPlatformForTests("darwin");
+			setComputerArchForTests("arm64");
+			setComputerControllerFactoryForTests(() => ({}));
+			const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+			const result = await tool.execute(`missing-${testCase.name}`, testCase.params);
+
+			expect(result.isError).toBe(true);
+			expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
+			expect(textOf(result)).toContain(`ComputerController.${testCase.method} is unavailable`);
+		}
+	});
+
+	it("fails closed when a requested post-action screenshot method is missing", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
-		setComputerControllerFactoryForTests(() => ({}));
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls.push("click");
+			},
+		}));
 		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
 
-		const result = await tool.execute("missing-click", { action: "click", x: 1, y: 2 });
+		const result = await tool.execute("missing-post-action-shot", {
+			action: "click",
+			x: 1,
+			y: 2,
+			include_screenshot: true,
+		});
 
 		expect(result.isError).toBe(true);
 		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
-		expect(textOf(result)).toContain("ComputerController.click is unavailable");
+		expect(textOf(result)).toContain("ComputerController.screenshot is unavailable");
+		expect(calls).toEqual(["click"]);
+	});
+
+	it("fails closed when batch auto-screenshot requires a missing screenshot method", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls.push("click");
+			},
+		}));
+		const tool = new ComputerTool(
+			createSession(Settings.isolated({ "computer.enabled": true, "computer.autoScreenshot": true })),
+		);
+
+		const result = await tool.execute("missing-batch-auto-shot", {
+			action: "batch",
+			actions: [{ action: "click", x: 1, y: 2 }],
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
+		expect(result.details?.steps).toHaveLength(1);
+		expect(result.details?.steps?.[0]?.code).toBe("COMPUTER_UNAVAILABLE");
+		expect(textOf(result)).toContain("ComputerController.screenshot is unavailable");
+		expect(calls).toEqual(["click"]);
 	});
 
 	it("bounds oversized screenshot images sent inline while preserving the full-resolution artifact", async () => {
