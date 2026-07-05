@@ -31,4 +31,22 @@ describe("CLI command registry", () => {
 		expect(cmd).toBeDefined();
 		expect(cmd?.description ?? "").toMatch(/MCP/i);
 	});
+
+	it("registers the `stats` command so `gjc stats` resolves instead of routing to launch", () => {
+		// Regression: `src/commands/stats.ts` (and the `@gajae-code/stats`
+		// dependency it drives via `src/cli/stats-cli.ts`) existed, but the
+		// entry was never added to the `commands` registry in cli.ts.
+		// `isSubcommand()` therefore returned false for "stats", so `gjc stats`
+		// fell through to the default `launch` command and was treated as a chat
+		// message — the usage-statistics command was completely unreachable.
+		const entry = commands.find(c => c.name === "stats");
+		expect(entry).toBeDefined();
+	});
+
+	it("lazily resolves the registered `stats` entry to the Stats command class", async () => {
+		const entry = commands.find(c => c.name === "stats");
+		const cmd = (await entry?.load()) as { description?: string } | undefined;
+		expect(cmd).toBeDefined();
+		expect(cmd?.description ?? "").toMatch(/usage statistics/i);
+	});
 });

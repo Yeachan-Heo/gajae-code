@@ -15,6 +15,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} deep-interview       - Run requirements interview workflow
   ${APP_NAME} skills               - List/read embedded workflow skills
   ${APP_NAME} config               - List, get, and set configuration values
+  ${APP_NAME} stats                - View AI usage statistics (tokens, cost, requests)
   ${APP_NAME} notify               - Send or test notifications
   ${APP_NAME} daemon               - Manage background daemon helpers
   ${APP_NAME} mcp                  - Manage MCP server registrations
