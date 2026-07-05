@@ -2328,7 +2328,7 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tools",
 			label: "Computer",
-			description: "Enable the macOS computer tool for this session. Off by default.",
+			description: "Enable the macOS computer tool for this session. Off by default; must be explicitly enabled.",
 		},
 	},
 

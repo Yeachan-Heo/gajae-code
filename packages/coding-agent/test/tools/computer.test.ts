@@ -172,24 +172,24 @@ describe("computer tool gating", () => {
 		setComputerArchForTests(undefined);
 	});
 
-	it("is callable and discoverable by default on Apple Silicon macOS", async () => {
+	it("is not callable or discoverable by default on Apple Silicon macOS (off by default)", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
 		const session = createSession(Settings.isolated({ "tools.discoveryMode": "all" }));
 		const tools = await createTools(session);
 		const names = tools.map(t => t.name);
-		expect(names).toContain("computer");
+		expect(names).not.toContain("computer");
 		const discoverable = tools.filter(t => t.loadMode === "discoverable").map(t => t.name);
-		expect(discoverable).toContain("computer");
+		expect(discoverable).not.toContain("computer");
 	});
 
 	it("exposes honest static capability catalog metadata for computer", () => {
 		const catalogEntry = BUILTIN_CAPABILITY_CATALOG.find(entry => entry.name === "computer");
 		if (isComputerLoadablePlatform()) {
-			expect(catalogEntry).toMatchObject({ callableBuiltin: false, defaultEnabled: true });
+			expect(catalogEntry).toMatchObject({ callableBuiltin: false, defaultEnabled: false });
 			expect(catalogEntry?.summary ?? "").not.toBe("");
-			expect((catalogEntry?.summary ?? "").toLowerCase()).not.toContain("off by default");
-			expect(catalogEntry?.summary ?? "").not.toContain("Explicitly enabled");
+			expect((catalogEntry?.summary ?? "").toLowerCase()).toContain("off by default");
+			expect(catalogEntry?.summary ?? "").not.toContain("enabled by default");
 		} else {
 			expect(catalogEntry).toBeUndefined();
 		}

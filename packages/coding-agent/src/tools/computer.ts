@@ -221,7 +221,7 @@ export function isComputerEnabled(session: Pick<ToolSession, "settings">): boole
 	if (session.settings.get("computer.enabled")) return true;
 	if (session.settings.has("computer.enabled")) return false;
 	if (session.settings.has("computer.alwaysOn")) return Boolean(session.settings.get("computer.alwaysOn"));
-	return true;
+	return false;
 }
 
 export function isComputerCallable(
@@ -237,7 +237,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 	readonly label = "Computer";
 	readonly loadMode = "discoverable";
 	readonly summary =
-		"Control the macOS desktop (Apple Silicon) with screenshot, pointer, keyboard, scroll, and wait actions; available by default on supported hosts and supervisor-gated";
+		"Control the macOS desktop (Apple Silicon) with screenshot, pointer, keyboard, scroll, and wait actions; off by default — set computer.enabled=true or computer.alwaysOn=true to enable; supervisor-gated when active";
 	readonly parameters = computerSchema;
 	readonly strict = true;
 	#description?: string;
@@ -266,7 +266,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 			details.status = "disabled";
 			details.code = COMPUTER_DISABLED_CODE;
 			details.message =
-				"The computer tool is disabled or unsupported. It requires Apple Silicon macOS; set computer.alwaysOn=false to disable, or computer.enabled=true to manually enable on a supported host.";
+						"The computer tool is disabled or unsupported. It requires Apple Silicon macOS; set computer.enabled=true or computer.alwaysOn=true to enable on a supported host.";
 			await writeComputerAuditLog(this.session, details);
 			return { ...toolResult(details).text(`${COMPUTER_DISABLED_CODE}: ${details.message}`).done(), isError: true };
 		}

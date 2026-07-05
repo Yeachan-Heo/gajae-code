@@ -48,7 +48,7 @@ The bundled Telegram flow adds a threaded per-session surface with context updat
   <img src="assets/computer-use.png" alt="computer-use desktop control — See. Click. Type. Control." width="100%" />
 </p>
 
-**`computer-use`** — an experimental, opt-in desktop-control tool surface. Backed by native screenshot/input bindings and gated through settings/tool registration, it lets the agent see the screen and drive mouse/keyboard for local desktop coordination.
+**`computer-use`** — an experimental, opt-in desktop-control tool surface. Off by default; backed by native screenshot/input bindings and gated through settings/tool registration, it must be explicitly enabled via `computer.enabled` or `computer.alwaysOn` to let the agent see the screen and drive mouse/keyboard for local desktop coordination.
 
 ## Website
 

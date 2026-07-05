@@ -1,11 +1,11 @@
 # computer
 
-`computer` is available by default on supported Apple Silicon macOS. It controls the real desktop, so use it only when the task genuinely needs real desktop screenshot or input control.
+`computer` is off by default. It must be explicitly enabled via `computer.enabled=true` or `computer.alwaysOn=true` on supported Apple Silicon macOS. It controls the real desktop, so use it only when the task genuinely needs real desktop screenshot or input control.
 
 ## Safety contract
 
 - Disabled means disabled: when the tool is disabled (`computer.alwaysOn=false` with `computer.enabled` unset/false) or the platform is unsupported, every action including `screenshot` fails with `COMPUTER_DISABLED` and captures nothing.
-- Callable only on Apple Silicon macOS (`arm64` darwin); available by default there, with `computer.alwaysOn=false` as the off-switch and `computer.enabled=true` as the manual enable path.
+- Callable only on Apple Silicon macOS (`arm64` darwin); off by default. Set `computer.enabled=true` for per-session enable or `computer.alwaysOn=true` for persistent enable. Use `computer.alwaysOn=false` with `computer.enabled` unset/false to keep it off.
 - Native execution remains supervisor-gated. If the stop/suspend supervisor is unavailable, stale, suspended, permissioned off, display-stale, or cancelled, the action fails closed with a `COMPUTER_*` code. Coordinate actions carry the latest known screenshot display epoch when one is available so display-topology changes fail with `COMPUTER_DISPLAY_STALE`.
 - Respect the user's stop/suspend request immediately. Do not loop desktop actions after a stop/suspend/error.
 - The user can stop or suspend the session at any time with the configured kill-switch hotkey (default `Control+Option+Command+Escape`). If you see `COMPUTER_CANCELLED` or `COMPUTER_SUPERVISOR_NOT_LIVE`, stop and wait for the user.
