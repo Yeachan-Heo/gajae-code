@@ -118,17 +118,29 @@ turn_evidence=false
 if [[ -s "$GJC_SESSION_PANE_LOG" ]] && grep -Eiq "$GJC_SESSION_TURN_EVIDENCE_PATTERN" "$GJC_SESSION_PANE_LOG"; then
   turn_evidence=true
 fi
+prompt_accepted=false
+for _ in $(seq 1 20); do
+  if [[ -s "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}" ]]; then
+    prompt_accepted=true
+    break
+  fi
+  [[ "$turn_evidence" == "true" ]] || break
+  sleep 0.1
+done
 owner_exit_reason="normal_exit"
 owner_exit_severity="normal"
 if [[ "$turn_evidence" != "true" ]]; then
   owner_exit_reason="owner_exited_before_turn_evidence"
   owner_exit_severity="failure"
+elif [[ "$prompt_accepted" == "true" ]]; then
+  owner_exit_reason="owner_exited_after_prompt_acceptance_before_terminal_status"
+  owner_exit_severity="failure"
 fi
-python3 - "$GJC_SESSION_FINAL_JSON" "$GJC_SESSION_NAME" "$rc" "$started_at" "$finished_at" "$GJC_SESSION_PANE_LOG" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$turn_evidence" "$owner_exit_reason" "$owner_exit_severity" <<'PY'
+python3 - "$GJC_SESSION_FINAL_JSON" "$GJC_SESSION_NAME" "$rc" "$started_at" "$finished_at" "$GJC_SESSION_PANE_LOG" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$turn_evidence" "$prompt_accepted" "$owner_exit_reason" "$owner_exit_severity" <<'PY'
 import json
 import sys
 
-path, session, status, started_at, finished_at, pane_log, runtime_state, turn_evidence, owner_exit_reason, owner_exit_severity = sys.argv[1:]
+path, session, status, started_at, finished_at, pane_log, runtime_state, turn_evidence, prompt_accepted, owner_exit_reason, owner_exit_severity = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -139,6 +151,7 @@ with open(path, "w", encoding="utf-8") as handle:
             "paneLog": pane_log,
             "runtimeState": runtime_state,
             "turnEvidencePresent": turn_evidence == "true",
+            "promptAccepted": prompt_accepted == "true",
             "ownerExitReason": owner_exit_reason,
             "severity": owner_exit_severity,
         },
@@ -239,6 +252,7 @@ LAUNCH_CMD=(
   "GJC_SESSION_EVENTS_LOG=$STATE_DIR/events.log"
   "GJC_SESSION_FINAL_JSON=$STATE_DIR/final.json"
   "GJC_SESSION_VANISHED_JSON=$STATE_DIR/vanished.json"
+  "GJC_SESSION_PROMPT_ACCEPTED_JSON=$STATE_DIR/prompt-accepted.json"
   "GJC_COORDINATOR_SESSION_ID=$SESSION"
   "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON"
   "GJC_COORDINATOR_SESSION_BRANCH=$BRANCH"
