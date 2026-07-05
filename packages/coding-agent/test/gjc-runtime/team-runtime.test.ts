@@ -2834,4 +2834,49 @@ describe("resolveGjcWorkerCommand bun prefix for script entrypoints", () => {
 		expect(out).toContain("bun");
 		expect(out).toContain("cli.mjs");
 	});
+
+	it("does not emit Bun virtual packaged entrypoints as POSIX worker executables", async () => {
+		process.argv = ["gjc", "/$bunfs/root/gjc-linux-x64"];
+		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
+		const out = resolveGjcWorkerCommand("/repo", {}, "linux", process.argv, "/opt/gjc/gjc-linux-x64", () => null);
+
+		expect(out).toBe("'/opt/gjc/gjc-linux-x64'");
+		expect(out).not.toContain("$bunfs");
+	});
+
+	it("falls back to a PATH-resolved gjc when the packaged process executable is also virtual", async () => {
+		process.argv = ["gjc", "/$bunfs/root/gjc-linux-x64"];
+		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
+		const out = resolveGjcWorkerCommand("/repo", {}, "linux", process.argv, "/$bunfs/root/gjc-linux-x64", command =>
+			command === "gjc" ? "/usr/local/bin/gjc" : null,
+		);
+
+		expect(out).toBe("'/usr/local/bin/gjc'");
+		expect(out).not.toContain("$bunfs");
+	});
+
+	it("falls back to plain gjc when packaged entrypoint and PATH probe are not usable", async () => {
+		process.argv = ["gjc", "/$bunfs/root/gjc-linux-x64"];
+		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
+		const out = resolveGjcWorkerCommand("/repo", {}, "linux", process.argv, "/$bunfs/root/gjc-linux-x64", () => null);
+
+		expect(out).toBe("gjc");
+		expect(out).not.toContain("$bunfs");
+	});
+
+	it("does not emit Bun virtual packaged entrypoints as Windows worker executables", async () => {
+		process.argv = ["gjc", "\\$bunfs\\root\\gjc-windows-x64.exe"];
+		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
+		const out = resolveGjcWorkerCommand(
+			"C:\\repo",
+			{},
+			"win32",
+			process.argv,
+			"C:\\Program Files\\gjc\\gjc.exe",
+			() => null,
+		);
+
+		expect(out).toBe("'C:\\Program Files\\gjc\\gjc.exe'");
+		expect(out).not.toContain("$bunfs");
+	});
 });

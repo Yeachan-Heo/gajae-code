@@ -1896,16 +1896,39 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	}
 	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
 }
+type CommandPathResolver = (command: string) => string | null;
+
+function isBunVirtualPath(candidate: string | undefined): boolean {
+	const normalized = candidate?.trim().replace(/\\/g, "/");
+	return normalized === "/$bunfs" || normalized?.startsWith("/$bunfs/") === true;
+}
+
+function resolveFallbackGjcWorkerCommand(
+	platform: NodeJS.Platform,
+	execPath: string,
+	which: CommandPathResolver,
+): string {
+	const pathModule = platform === "win32" ? path.win32 : path;
+	const quote = platform === "win32" ? powershellQuote : shellQuote;
+	const executable = execPath.trim();
+	if (executable && !isBunVirtualPath(executable) && pathModule.isAbsolute(executable)) return quote(executable);
+	const gjcPath = which("gjc")?.trim();
+	if (gjcPath && !isBunVirtualPath(gjcPath)) return quote(gjcPath);
+	return "gjc";
+}
+
 export function resolveGjcWorkerCommand(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 	platform: NodeJS.Platform = process.platform,
 	argv: string[] = process.argv,
 	execPath = process.execPath,
+	which: CommandPathResolver = Bun.which,
 ): string {
 	const explicit = env.GJC_TEAM_WORKER_COMMAND?.trim();
 	if (explicit) return explicit;
 	const entrypoint = argv[1];
+	if (isBunVirtualPath(entrypoint)) return resolveFallbackGjcWorkerCommand(platform, execPath, which);
 	if (!entrypoint) return "gjc";
 	const pathModule = platform === "win32" ? path.win32 : path;
 	const resolvedEntrypoint = pathModule.isAbsolute(entrypoint) ? entrypoint : pathModule.resolve(cwd, entrypoint);
