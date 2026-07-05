@@ -8,6 +8,7 @@
 - Added `gjc completion inshellisense`, which generates or installs a Fig/withfig-compatible `gjc` completion spec for Microsoft inshellisense without adding inshellisense as a runtime dependency.
 
 ### Fixed
+- `telegram_send` now rejects files over Telegram's document upload limit before reading them into memory or handing them to the notification sink.
 - Telegram notify setup now hides the interactive BotFather token prompt input, preventing the raw bot token from being echoed into terminal scrollback while pairing notifications.
 - Telegram unattended workflow-gate listeners are now disposed when a notification session stops, preventing stale stopped servers from retaining future gate emissions after shutdown or notification restart.
 - Telegram notification setup and daemon delivery now reject non-private Telegram chat ids before saving configuration, creating forum topics, or sending session content, preserving the private-chat-only routing boundary.
