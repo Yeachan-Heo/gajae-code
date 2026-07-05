@@ -243,6 +243,20 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("`job` remains the generic background-job tool");
 	});
 
+	test("system-prompt distinguishes informational questions from explicit implementation requests", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+		const rendered = prompt.render(template, baseRenderContext);
+
+		expect(countOccurrences(rendered, "Informational questions, bare `?`, and unambiguous explanatory prompts")).toBe(
+			1,
+		);
+		expect(rendered).toContain("answer-only/read-only");
+		expect(rendered).toContain("unless the user explicitly asks to change, run, implement, or execute something");
+		expect(rendered).toMatch(/Clear, low-risk implementation request\s+→\s+implement directly/i);
+		expect(rendered).toMatch(/Ambiguous implementation asks[\s\S]*require clarification[\s\S]*before mutation/i);
+	});
+
 	test("buildSystemPrompt keeps system and project as separate ordered blocks with date context in project", async () => {
 		await withTempDir(async dir => {
 			const { systemPrompt } = await buildSystemPrompt({

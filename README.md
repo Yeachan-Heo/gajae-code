@@ -235,7 +235,7 @@ gjc setup defaults --check
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
 | External controller / bot | `gjc --mode rpc` for a subprocess worker, or Bridge/HTTPS surfaces where configured | External controllers drive GJC through generic RPC/bridge contracts, not scrollback scraping. |
 
-For standalone MCP support boundaries, see [`docs/standalone-mcp.md`](docs/standalone-mcp.md). For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), and [`docs/bridge.md`](docs/bridge.md).
+For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/rpc.md`](docs/rpc.md) and [`docs/bridge.md`](docs/bridge.md).
 
 ## Configuration
 

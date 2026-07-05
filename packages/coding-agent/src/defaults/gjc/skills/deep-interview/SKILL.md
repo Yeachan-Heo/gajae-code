@@ -20,6 +20,7 @@ Deep Interview implements Ouroboros-inspired Socratic questioning with mathemati
 - User says "ouroboros", "socratic", "I have a vague idea", "not sure exactly what I want"
 - User wants to avoid "that's not what I meant" outcomes from autonomous execution
 - Task is complex enough that jumping to code would waste cycles on scope discovery
+- User asks for implementation but the target, scope, acceptance criteria, or safety boundary is ambiguous enough that mutation would require guessing
 - User wants mathematically-validated clarity before committing to execution
 - User explicitly requests deep-interview even after being told the request is already clear, bounded, and low-risk
 - User requests a trace/research pre-step before the interview, e.g. `/skill:deep-interview --trace <idea>`
@@ -27,6 +28,7 @@ Deep Interview implements Ouroboros-inspired Socratic questioning with mathemati
 
 <Do_Not_Use_When>
 - User has a detailed, specific request with file paths, function names, or acceptance criteria -- execute directly
+- User has an explicit concrete low-risk implementation request with enough target, scope, and acceptance criteria to execute safely -- execute directly
 - User wants to explore options or brainstorm -- use `ralplan` skill instead
 - User wants a quick fix or single change -- use direct execution, not deep-interview or role-agent delegation
 - User says "just do it" or "skip the questions" without an explicit execution path -- respect their intent by exiting deep-interview, not by writing a `pending approval` spec
@@ -52,6 +54,7 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 - When the locked topology has multiple active components, score and target each component explicitly so depth-first clarity on one component cannot hide ambiguity in siblings
 - Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts
 - If the user's initial context is oversized, create a concise prompt-safe summary first and wait for that summary before ambiguity scoring, question generation, or downstream execution handoff
+- Route ambiguous implementation asks to clarification, deep-interview, or downstream `ralplan` before mutation; do not infer missing target, scope, acceptance criteria, or safety boundary just to start coding.
 - Do not proceed to execution until ambiguity ≤ the resolved threshold for this run and the user explicitly approves a scoped execution path
 - Treat user wording such as `implementation`, "implementation plan", Korean `구현`, or "구현 계획" as describing the eventual target, not permission to implement now.
 - While still in deep-interview, do not implement, edit/write code, launch implementation workers, or start task/skill/ultragoal implementation; continue interviewing for scope, risks, acceptance criteria, and unknowns.

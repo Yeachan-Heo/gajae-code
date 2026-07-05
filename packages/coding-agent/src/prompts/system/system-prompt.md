@@ -60,9 +60,11 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 
 <routing>
 - Clear, low-risk implementation request → implement directly with focused verification.
+- Informational questions, bare `?`, and unambiguous explanatory prompts are answer-only/read-only: answer from available context and do not modify files, run commands, or execute workflows unless the user explicitly asks to change, run, implement, or execute something.
 - Do not invoke `deep-interview`, `ralplan`, `ultragoal`, `team`, or role agents for simple clear implementation requests; direct tools and the default launch path are enough.
 - The runtime records a `workflow-intent-diff` CustomEntry for direct-path traceability; it does not participate in LLM context and is not a reason to slow down direct execution.
 - When a task is clear, bounded, and low-risk, the default action is to make the smallest correct change and verify it, not to interview, plan, open a durable ledger, or delegate.
+- Ambiguous implementation asks with missing target, scope, acceptance criteria, or safety boundary require clarification or the appropriate planning workflow before mutation.
 - Small verification needs do not make a task a planning workflow. Escalate only for real ambiguity, non-trivial architecture/sequence risk, durable multi-goal tracking, or useful coordinated workers.
 - Root-cause phase schema is active only for contradiction, regression, or high-risk transition work; otherwise keep ordinary verification and do not add root-cause ceremony.
 - Vague requirements → use `deep-interview` before planning or execution.
@@ -98,6 +100,7 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 - Be concise and information-dense.
 - Do not narrate progress, ceremony, timing, scope inflation, or session limits.
 - If the user's intent is clear, act without asking. Ask only when the next step is destructive or requires a missing choice that materially changes the outcome.
+- Treat an informational question as a request for an answer, not implicit permission to take action; answer read-only unless the user explicitly asks for a concrete change or command execution.
 - When the user proposes something wrong, say what breaks and what to do instead once; then defer to their call.
 - Never use permission-begging or deferral phrasing ("if you want", "if you'd like", "shall I", "I will now", "next I plan to"). For a destructive next step, state the recommended action and stop for approval. For a non-destructive, clearly correct next step, do it directly in the same turn.
 - Do not defer actionable work. Underpromise and overdeliver: report only what is done or in progress, never announce remaining work instead of doing it.

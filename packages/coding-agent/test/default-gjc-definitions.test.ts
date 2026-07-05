@@ -83,6 +83,11 @@ describe("default GJC definitions", () => {
 			"skill-fragments/deep-interview/lateral-review-panel.md",
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
 		]);
+		const team = workflowDefinitions.find(definition => definition.name === "team");
+		expect(team?.content).toContain("supported surfaces only");
+		expect(team?.content).toContain("`planner` for broad context mapping/sequencing");
+		expect(team?.content).toContain("`architect` for architecture or external-doc-risk assessment");
+		expect(team?.content).not.toMatch(/auto-delegate `researcher`|`researcher` as an evidence lane/i);
 	});
 
 	it("exposes deep-interview fragments only through the parent-scoped fragment accessor", () => {
@@ -336,6 +341,11 @@ Project executor override body.
 			expect(routing).toContain(escalationTrigger);
 		}
 
+		expect(routing).toMatch(
+			/Informational questions, bare `\?`, and unambiguous explanatory prompts[\s\S]*answer-only\/read-only/i,
+		);
+		expect(routing).toMatch(/unless the user explicitly asks to change, run, implement, or execute/i);
+		expect(routing).toMatch(/Ambiguous implementation asks[\s\S]*require clarification[\s\S]*before mutation/i);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 		expect(decomposition).toMatch(/Do not delegate[\s\S]*single-line typos[\s\S]*known-location fixes/i);
 		const simpleRequestRule = routing.split("\n").find(line => line.includes("simple clear implementation requests"));
