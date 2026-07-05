@@ -1413,6 +1413,49 @@ describe("native GJC ultragoal runtime", () => {
 		expect(diagnostic.state).toBe("active_verified_complete");
 	});
 
+	it("rejects a ledger repair retry whose quality gate diverges from the completion receipt", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+		const withoutCheckpoint = (await Bun.file(ledgerPath).text())
+			.split("\n")
+			.filter(line => line.length > 0 && !line.includes('"goal_checkpointed"'))
+			.map(line => `${line}\n`)
+			.join("");
+		await Bun.write(ledgerPath, withoutCheckpoint);
+
+		// Same status and evidence, but a quality gate that hashes differently from the persisted
+		// completion receipt: the repair path must not let it rewrite the receipt.
+		const divergentGate = JSON.parse(await passingLiveQualityGate(root)) as Record<string, Record<string, unknown>>;
+		divergentGate.executorQa = { ...divergentGate.executorQa, evidence: "executor reran a different QA suite" };
+
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "tests passed",
+				qualityGateJson: JSON.stringify(divergentGate),
+			}),
+		).rejects.toThrow("Cannot repair the G001 complete checkpoint with a different quality gate");
+
+		// The divergent attempt must not have appended a checkpoint row.
+		const checkpoints = (await readUltragoalLedger(root)).filter(
+			event => event.event === "goal_checkpointed" && event.goalId === "G001" && event.status === "complete",
+		);
+		expect(checkpoints).toHaveLength(0);
+	});
+
 	it("completes from durable active goal state", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });

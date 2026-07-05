@@ -2567,6 +2567,16 @@ export async function checkpointUltragoalGoal(input: {
 			: input.qualityGateJson
 				? await readStructuredValue(input.cwd, input.qualityGateJson)
 				: undefined;
+	if (input.status === "complete" && isLedgerRepairRetry) {
+		// A ledger repair must not become a back door for rewriting the completion receipt: when the
+		// goal already carries a receipt, the resubmitted quality gate has to hash to the same value.
+		const persistedHash = goal.completionVerification?.qualityGateHash;
+		if (persistedHash !== undefined && hashStructuredValue(qualityGateJson) !== persistedHash) {
+			throw new Error(
+				`Cannot repair the ${goal.id} complete checkpoint with a different quality gate; resubmit the quality gate recorded in its completion receipt.`,
+			);
+		}
+	}
 	const now = new Date().toISOString();
 	const beforeStatus = goal.status;
 	if (input.status === "complete") {
