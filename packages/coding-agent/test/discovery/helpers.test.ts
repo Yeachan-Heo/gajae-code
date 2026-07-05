@@ -138,6 +138,28 @@ Body content`;
 			/Failed to parse YAML frontmatter/,
 		);
 	});
+	test("rejects top-level YAML arrays instead of coercing numeric keys", () => {
+		const content = `---
+- one
+- two
+---
+Body content`;
+
+		expect(() => parseFrontmatter(content, { source: "tests:frontmatter", level: "fatal" })).toThrow(
+			/Failed to parse YAML frontmatter.*root must be an object/s,
+		);
+	});
+
+	test("rejects scalar YAML roots instead of accepting empty metadata", () => {
+		const content = `---
+true
+---
+Body content`;
+
+		expect(() => parseFrontmatter(content, { source: "tests:frontmatter", level: "fatal" })).toThrow(
+			/Failed to parse YAML frontmatter.*root must be an object/s,
+		);
+	});
 
 	test("handles missing frontmatter", () => {
 		const content = "Just body content";

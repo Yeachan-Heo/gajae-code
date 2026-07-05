@@ -101,8 +101,23 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect(acquired).toBe(true);
 		expect(await fs.exists(lockDir)).toBe(false);
 	});
+
+	test("release refuses to remove a lock that no longer has this owner token", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const replacement = { pid: LIVE_PID, timestamp: Date.now() + 1_000 };
+
+		await withFileLock(lockedFile, async () => {
+			await writeInfo(lockDir, replacement);
+		});
+
+		expect(await fs.exists(lockDir)).toBe(true);
+		const onDisk = JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8"));
+		expect(onDisk).toEqual(replacement);
+	});
 });
-describe("removeFileLockDirForGc owner-token guard (#606)", () => {
+describe("file lock owner-token removal guard (#606)", () => {
 	test("removes the dir when the on-disk token matches the expected owner", async () => {
 		const base = await makeTemp();
 		const lockDir = path.join(base, "match.lock");

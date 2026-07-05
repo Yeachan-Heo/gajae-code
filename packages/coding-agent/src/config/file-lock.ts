@@ -1,3 +1,4 @@
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 
@@ -22,9 +23,10 @@ function getLockPath(filePath: string): string {
 	return `${filePath}.lock`;
 }
 
-async function writeLockInfo(lockPath: string): Promise<void> {
+async function writeLockInfo(lockPath: string): Promise<LockInfo> {
 	const info: LockInfo = { pid: process.pid, timestamp: Date.now() };
 	await Bun.write(`${lockPath}/info`, JSON.stringify(info));
+	return info;
 }
 
 async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
@@ -51,17 +53,30 @@ export interface FileLockOwnerToken {
 	timestamp: number;
 }
 
-/** Outcome of a guarded GC removal attempt (`removeFileLockDirForGc`). */
+/** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
 export type FileLockGcRemoval = "removed" | "owner_changed" | "missing";
+
+interface LockDirStatToken {
+	dev: number;
+	ino: number;
+	mtimeMs: number;
+	ctimeMs: number;
+}
+
+type LockStaleSnapshot =
+	| { stale: false }
+	| { stale: true; owner: FileLockOwnerToken }
+	| { stale: true; owner: null; stat: LockDirStatToken };
 
 /**
  * @internal
- * Fail-closed removal of a dead lock dir for GC. Re-reads the on-disk owner
- * token as close to the unlink as possible and only deletes the dir when it
- * STILL holds the exact `{pid, timestamp}` identity the caller observed dead.
+ * Fail-closed removal of a lock dir whose owner is expected to be dead or
+ * finished. Re-reads the on-disk owner token as close to the unlink as possible
+ * and only deletes the dir when it STILL holds the exact `{pid, timestamp}`
+ * identity the caller observed.
  *
- * Closes the prune-time TOCTOU window (#606): between GC's dead re-read/probe
- * and the unlink, a live process can reclaim a stale lock at the same path
+ * Closes stale-cleanup TOCTOU windows (#606): between a dead/stale re-read and
+ * the unlink, a live process can reclaim a stale lock at the same path
  * (`acquireLock` rms the stale dir, then re-`mkdir`s and rewrites `info` with a
  * fresh pid+timestamp). Deleting by path alone would reap that LIVE lock. Any
  * mismatch (`owner_changed`) or absent/unreadable info (`missing` — e.g. a
@@ -99,14 +114,28 @@ function ownerLiveness(pid: number): OwnerLiveness {
 	}
 }
 
-async function isLockStale(lockPath: string, staleMs: number): Promise<boolean> {
+function statToken(stats: Stats): LockDirStatToken {
+	return {
+		dev: stats.dev,
+		ino: stats.ino,
+		mtimeMs: stats.mtimeMs,
+		ctimeMs: stats.ctimeMs,
+	};
+}
+
+function sameStatToken(a: LockDirStatToken, b: LockDirStatToken): boolean {
+	return a.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+}
+
+async function staleLockSnapshot(lockPath: string, staleMs: number): Promise<LockStaleSnapshot> {
 	const info = await readLockInfo(lockPath);
 	if (!info) {
 		try {
 			const stats = await fs.stat(lockPath);
-			return Date.now() - stats.mtimeMs > staleMs;
+			if (Date.now() - stats.mtimeMs <= staleMs) return { stale: false };
+			return { stale: true, owner: null, stat: statToken(stats) };
 		} catch (err) {
-			if (isEnoent(err)) return false;
+			if (isEnoent(err)) return { stale: false };
 			throw err;
 		}
 	}
@@ -115,35 +144,25 @@ async function isLockStale(lockPath: string, staleMs: number): Promise<boolean> 
 	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
 	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
 	const liveness = ownerLiveness(info.pid);
-	if (liveness === "dead") return true;
-	if (liveness === "alive") return false;
-	return Date.now() - info.timestamp > staleMs;
-}
-
-async function tryAcquireLock(lockPath: string): Promise<boolean> {
-	try {
-		await fs.mkdir(lockPath);
-		await writeLockInfo(lockPath);
-		return true;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-			return false;
-		}
-		throw error;
+	if (liveness === "alive") return { stale: false };
+	if (liveness === "dead" || Date.now() - info.timestamp > staleMs) {
+		return { stale: true, owner: { pid: info.pid, timestamp: info.timestamp } };
 	}
+	return { stale: false };
 }
 
-async function releaseLock(lockPath: string): Promise<void> {
-	try {
-		await fs.rm(lockPath, { recursive: true });
-	} catch {
-		// Ignore errors on release
+async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSnapshot): Promise<boolean> {
+	if (!snapshot.stale) return false;
+	if (snapshot.owner) {
+		return (await removeFileLockDirForGc(lockPath, snapshot.owner)) === "removed";
 	}
-}
 
-async function lockExists(lockPath: string): Promise<boolean> {
+	const currentInfo = await readLockInfo(lockPath);
+	if (currentInfo) return false;
 	try {
-		await fs.stat(lockPath);
+		const currentStats = await fs.stat(lockPath);
+		if (!sameStatToken(statToken(currentStats), snapshot.stat)) return false;
+		await fs.rm(lockPath, { recursive: true, force: true });
 		return true;
 	} catch (err) {
 		if (isEnoent(err)) return false;
@@ -151,17 +170,37 @@ async function lockExists(lockPath: string): Promise<boolean> {
 	}
 }
 
+async function tryAcquireLock(lockPath: string): Promise<LockInfo | null> {
+	try {
+		await fs.mkdir(lockPath);
+		return await writeLockInfo(lockPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			return null;
+		}
+		throw error;
+	}
+}
+
+async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise<void> {
+	try {
+		await removeFileLockDirForGc(lockPath, owner);
+	} catch {
+		// Ignore errors on release
+	}
+}
 async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
 
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
-		if (await tryAcquireLock(lockPath)) {
-			return () => releaseLock(lockPath);
+		const owner = await tryAcquireLock(lockPath);
+		if (owner) {
+			return () => releaseLock(lockPath, owner);
 		}
 
-		if ((await lockExists(lockPath)) && (await isLockStale(lockPath, opts.staleMs))) {
-			await releaseLock(lockPath);
+		const stale = await staleLockSnapshot(lockPath, opts.staleMs);
+		if (await removeStaleLockForAcquire(lockPath, stale)) {
 			continue;
 		}
 

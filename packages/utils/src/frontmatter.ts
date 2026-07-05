@@ -17,15 +17,27 @@ function stripLooseScalarTrailingCommas(metadata: string): string {
 		.join("\n");
 }
 
+function asFrontmatterRecord(parsed: unknown): Record<string, unknown> | null {
+	if (parsed === null) return null;
+	if (typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("YAML frontmatter root must be an object");
+	}
+	const prototype = Object.getPrototypeOf(parsed);
+	if (prototype !== Object.prototype && prototype !== null) {
+		throw new Error("YAML frontmatter root must be an object");
+	}
+	return parsed as Record<string, unknown>;
+}
+
 function parseYamlMetadata(metadata: string): Record<string, unknown> | null {
 	const normalized = metadata.replaceAll("\t", "  ");
 	try {
-		return YAML.parse(normalized) as Record<string, unknown> | null;
+		return asFrontmatterRecord(YAML.parse(normalized));
 	} catch (strictError) {
 		const loose = stripLooseScalarTrailingCommas(normalized);
 		if (loose === normalized) throw strictError;
 		try {
-			return YAML.parse(loose) as Record<string, unknown> | null;
+			return asFrontmatterRecord(YAML.parse(loose));
 		} catch {
 			throw strictError;
 		}
