@@ -1,3 +1,9 @@
+import {
+	buildWorkflowIntentReport,
+	type WorkflowClaimsLedger,
+	type WorkflowConsensusReport,
+} from "./workflow-intent-report";
+
 export const WORKFLOW_INTENT_DIFF_CUSTOM_TYPE = "workflow-intent-diff";
 
 export type WorkflowIntentRoute = "direct" | "deep-interview" | "ralplan" | "ultragoal" | "team";
@@ -16,6 +22,8 @@ export interface WorkflowIntentDiff {
 		readonly status: RootCausePhaseStatus;
 		readonly triggers: readonly string[];
 	};
+	readonly claimsLedger: WorkflowClaimsLedger;
+	readonly consensusReport: WorkflowConsensusReport;
 	readonly promptPreview: string;
 }
 
@@ -182,6 +190,19 @@ export function buildWorkflowIntentDiff(text: string): WorkflowIntentDiff | null
 	const rootCauseTriggers = collectRootCauseTriggers(text);
 	const rootCauseActive = rootCauseTriggers.length > 0;
 	const direct = route.route === "direct";
+	const rootCauseStatus: RootCausePhaseStatus = rootCauseActive ? "active" : "inactive";
+	const rootCausePhase = {
+		status: rootCauseStatus,
+		triggers: rootCauseTriggers,
+	};
+	const report = buildWorkflowIntentReport({
+		route: route.route,
+		reason: route.reason,
+		direct,
+		recommendedInvocation: route.recommendedInvocation,
+		triggers: route.triggers,
+		rootCausePhase,
+	});
 
 	return {
 		version: 1,
@@ -190,10 +211,9 @@ export function buildWorkflowIntentDiff(text: string): WorkflowIntentDiff | null
 		directTracking: direct ? "custom-entry-only" : "not-direct",
 		...(direct ? {} : { recommendedSkill: route.route, recommendedInvocation: route.recommendedInvocation }),
 		triggers: route.triggers,
-		rootCausePhase: {
-			status: rootCauseActive ? "active" : "inactive",
-			triggers: rootCauseTriggers,
-		},
+		rootCausePhase,
+		claimsLedger: report.claimsLedger,
+		consensusReport: report.consensusReport,
 		promptPreview,
 	};
 }
