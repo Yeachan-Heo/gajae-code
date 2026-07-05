@@ -1153,6 +1153,8 @@ export class AgentSession {
 	#obfuscator: SecretObfuscator | undefined;
 	#checkpointState: CheckpointState | undefined = undefined;
 	#providerReplaySourceCache = new WeakMap<AgentMessage, ProviderReplaySourceCacheEntry>();
+	#lastOversizedAutoMaintenanceAttemptSignature: string | undefined = undefined;
+
 	#pendingRewindReport: string | undefined = undefined;
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
 	#promptGeneration = 0;
@@ -7757,6 +7759,41 @@ export class AgentSession {
 		return false;
 	}
 
+	#buildAutoMaintenanceAttemptSignature(
+		action: "context-full" | "handoff",
+		preparation: CompactionPreparation,
+		hookPrompt: string | undefined,
+		hookContext: string[] | undefined,
+		candidateModels: readonly Model[],
+	): string {
+		const source = JSON.stringify({
+			action,
+			model: this.model ? this.#getModelKey(this.model) : undefined,
+			candidates: candidateModels.map(model => this.#getModelKey(model)),
+			isSplitTurn: preparation.isSplitTurn,
+			previousSummary: preparation.previousSummary,
+			previousPreserveData: preparation.previousPreserveData,
+			hookPrompt,
+			hookContext,
+			messagesToSummarize: preparation.messagesToSummarize.map(message =>
+				this.#normalizeSessionMessageForProviderReplay(message),
+			),
+			turnPrefixMessages: preparation.turnPrefixMessages.map(message =>
+				this.#normalizeSessionMessageForProviderReplay(message),
+			),
+			recentMessages: preparation.recentMessages.map(message =>
+				this.#normalizeSessionMessageForProviderReplay(message),
+			),
+		});
+		return `${this.#hashProviderReplaySource(source).toString(16)}:${source.length}`;
+	}
+
+	#isOversizedMaintenanceError(errorMessage: string): boolean {
+		return /context_length_exceeded|exceeds? (the )?context window|maximum context length|payload too large|request entity too large/i.test(
+			errorMessage,
+		);
+	}
+
 	#getModelKey(model: Model): string {
 		return `${model.provider}/${model.id}`;
 	}
@@ -8027,6 +8064,7 @@ export class AgentSession {
 		const autoCompactionAbortController = new AbortController();
 		this.#autoCompactionAbortController = autoCompactionAbortController;
 		const autoCompactionSignal = autoCompactionAbortController.signal;
+		let maintenanceAttemptSignature: string | undefined;
 
 		try {
 			if (compactionSettings.strategy === "handoff" && reason !== "overflow") {
@@ -8174,6 +8212,26 @@ export class AgentSession {
 				preserveData = compactionPrep.preserveData;
 			} else {
 				const candidates = this.#getCompactionModelCandidates(availableModels);
+				maintenanceAttemptSignature = this.#buildAutoMaintenanceAttemptSignature(
+					action,
+					preparation,
+					compactionPrep.hookPrompt,
+					compactionPrep.hookContext,
+					candidates,
+				);
+				if (this.#lastOversizedAutoMaintenanceAttemptSignature === maintenanceAttemptSignature) {
+					await this.#emitSessionEvent({
+						type: "auto_compaction_end",
+						action,
+						result: undefined,
+						aborted: false,
+						willRetry: false,
+						skipped: true,
+						errorMessage:
+							"Auto-compaction skipped: previous unchanged maintenance request exceeded the model context window; change or reduce the conversation before retrying maintenance.",
+					});
+					return;
+				}
 				const retrySettings = this.settings.getGroup("retry");
 				const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 				let compactResult: CompactionResult | undefined;
@@ -8306,6 +8364,8 @@ export class AgentSession {
 				details,
 				preserveData,
 			};
+			this.#lastOversizedAutoMaintenanceAttemptSignature = undefined;
+
 			const continuationSkipReason = willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
@@ -8343,6 +8403,9 @@ export class AgentSession {
 				return;
 			}
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
+			if (maintenanceAttemptSignature && this.#isOversizedMaintenanceError(errorMessage)) {
+				this.#lastOversizedAutoMaintenanceAttemptSignature = maintenanceAttemptSignature;
+			}
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
 				action,
