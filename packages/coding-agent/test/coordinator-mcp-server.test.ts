@@ -711,6 +711,98 @@ describe("Coordinator MCP server protocol", () => {
 		);
 	});
 
+	it("wakes watch on runtime ack and records vanished tmux after prompt acceptance", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "watch-ack-vanish");
+		let tmuxLive = true;
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				commandRunner: async command => {
+					if (command[1] === "has-session") return { exitCode: tmuxLive ? 0 : 1, stdout: "", stderr: "" };
+					if (command[1] === "display-message") return { exitCode: 0, stdout: "%24\n", stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
+					return { exitCode: 0, stdout: "", stderr: "" };
+				},
+			},
+		});
+		await server.callTool("gjc_coordinator_register_session", {
+			session_id: "omx-issue-3059-state-root-resolution",
+			cwd: root,
+			tmux_session: "omx-issue-3059-state-root-resolution",
+			tmux_target: "omx-issue-3059-state-root-resolution:0.0",
+			visible: true,
+			allow_mutation: true,
+		});
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "omx-issue-3059-state-root-resolution",
+			prompt: "/skill:ralplan plan OmX #3059 fix",
+			allow_mutation: true,
+		});
+		const turnId = sent.turn_id as string;
+		const ackWatch = server.callTool("gjc_coordinator_watch_events", {
+			after_seq: 0,
+			event_types: ["turn.acknowledged"],
+			timeout_ms: 1000,
+		});
+		const sessionStatePath = path.join(
+			stateRoot,
+			"local",
+			"repo",
+			"session-states",
+			"omx-issue-3059-state-root-resolution.json",
+		);
+		await Bun.sleep(25);
+		await Bun.write(
+			sessionStatePath,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "omx-issue-3059-state-root-resolution",
+				state: "running",
+				ready_for_input: false,
+				current_turn_id: turnId,
+				last_turn_id: null,
+				updated_at: "2026-07-05T18:58:00.000Z",
+				source: "agent_session_event",
+				live: true,
+				reason: "turn_start",
+			}),
+		);
+		const acknowledged = await ackWatch;
+		expect(acknowledged).toMatchObject({ ok: true, timed_out: false });
+		expect(acknowledged.events as Array<{ kind: string; turn_id?: string }>).toContainEqual(
+			expect.objectContaining({ kind: "turn.acknowledged", turn_id: turnId }),
+		);
+
+		tmuxLive = false;
+		const failed = await server.callTool("gjc_coordinator_watch_events", {
+			after_seq: (acknowledged.latest_seq as number) ?? 0,
+			event_types: ["turn.failed"],
+			timeout_ms: 5,
+		});
+
+		expect(failed).toMatchObject({ ok: true, timed_out: false });
+		expect(failed.events as Array<{ kind: string; turn_id?: string }>).toContainEqual(
+			expect.objectContaining({ kind: "turn.failed", turn_id: turnId }),
+		);
+		const read = await server.callTool("gjc_coordinator_read_turn", {
+			session_id: "omx-issue-3059-state-root-resolution",
+			turn_id: turnId,
+		});
+		expect(read).toMatchObject({
+			turn: {
+				status: "failed",
+				error: { message: "tmux_session_missing_after_prompt_acknowledgement" },
+			},
+		});
+	});
+
 	it("preserves session-missing failure precedence over runtime ack timeout", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "missing-session-precedence");

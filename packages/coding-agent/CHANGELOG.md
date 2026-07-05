@@ -20,6 +20,7 @@
 - Skill autocomplete now supports direct skill-name prefixes after prompt text (for example, `please /ra` → `/skill:ralplan`) while keeping bare `/` menus free of skill entries.
 - `gjc --tmux` on native Windows/psmux now keeps the status line and composer pinned to the bottom after viewport redraws by honoring the GJC tmux launch marker as a multiplexer signal even when `$TMUX` is absent.
 - Provider safety refusals (e.g. Anthropic `stop_reason: "refusal"` → `Refusal (<category>): …`, and `sensitive` → `Content flagged by safety filters`) are now classified as terminal retry errors and surface immediately. They previously fell through to the unbounded `"unknown"` retry class, and because a refusal is deterministic for the submitted context, the session looped refusal → retry → refusal forever — resubmitting the full context every `retry.maxDelayMs` and re-billing it as a prompt-cache write whenever the backoff outlived the cache TTL (#1655).
+- Coordinator event watches now wake on runtime sidecar state changes and emit a bounded `turn.acknowledged` event, so a tmux-resident session that accepts a prompt and then vanishes is durably classified as recoverable `tmux_session_missing_after_prompt_acknowledgement` instead of leaving only a watch registration with no terminal verdict (#1496).
 
 - `gjc config list`, `gjc config get`, and `gjc config set` now redact secret-like string settings by default, with `--show-secrets` as an explicit unsafe opt-in.
 

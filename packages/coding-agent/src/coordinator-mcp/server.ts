@@ -175,6 +175,7 @@ type CoordinatorEventKind =
 	| "turn.queued"
 	| "turn.delivering"
 	| "turn.active"
+	| "turn.acknowledged"
 	| "turn.waiting_for_answer"
 	| "turn.completed"
 	| "turn.failed"
@@ -1121,6 +1122,18 @@ async function markTurnAcknowledgedFromRuntimeState(
 	};
 	await writeTurnRecord(namespaceDir, acknowledged);
 	await writeActiveTurn(namespaceDir, acknowledged);
+	await appendCoordinatorEvent(namespaceDir, {
+		kind: "turn.acknowledged",
+		sessionId: acknowledged.session_id,
+		turnId: acknowledged.turn_id,
+		summary: `Turn ${acknowledged.turn_id} was acknowledged by the GJC runtime`,
+		payloadRef: path.relative(namespaceDir, turnFile(namespaceDir, acknowledged.turn_id)),
+		metadata: {
+			status: acknowledged.status,
+			tmux_keys_sent: acknowledged.delivery.tmux_keys_sent ?? null,
+			prompt_acknowledged: true,
+		},
+	});
 	return acknowledged;
 }
 
@@ -1533,14 +1546,27 @@ async function waitForCoordinatorEvents(namespaceDir: string, timeoutMs: number)
 	};
 	const timer = setTimeout(finish, Math.max(timeoutMs, 0));
 	timer.unref?.();
-	await ensureDir(eventsDir(namespaceDir));
-	try {
-		const watcher = nodeFs.watch(eventsDir(namespaceDir), (_eventType, filename) => {
-			if (filename === "event-journal.jsonl" || filename === "latest-seq.json") finish();
-		});
-		watchers.push(watcher);
-	} catch {
-		// Directory may not exist yet; the timeout remains a bounded fallback.
+	const eventDir = eventsDir(namespaceDir);
+	const watchedDirs = [
+		eventDir,
+		turnsDir(namespaceDir),
+		path.join(namespaceDir, "active-turns"),
+		path.join(namespaceDir, "session-states"),
+	];
+	for (const dir of watchedDirs) {
+		await ensureDir(dir);
+		try {
+			const watcher = nodeFs.watch(dir, (_eventType, filename) => {
+				if (dir === eventDir) {
+					if (filename === "event-journal.jsonl" || filename === "latest-seq.json") finish();
+					return;
+				}
+				if (typeof filename === "string" && filename.endsWith(".json")) finish();
+			});
+			watchers.push(watcher);
+		} catch {
+			// Directory may not be watchable on this platform; the timeout remains a bounded fallback.
+		}
 	}
 	return deferred.promise;
 }
