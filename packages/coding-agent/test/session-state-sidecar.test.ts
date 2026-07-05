@@ -23,6 +23,11 @@ async function tempRoot(): Promise<string> {
 	return dir;
 }
 
+function git(cwd: string, args: string[]): void {
+	const proc = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	if (proc.exitCode !== 0) throw new Error(proc.stderr.toString() || `git ${args.join(" ")} failed`);
+}
+
 afterEach(async () => {
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
@@ -149,6 +154,63 @@ describe("coordinator runtime state sidecar", () => {
 			session_file: path.join(root, "session.jsonl"),
 			error: { code: "sigterm", recoverable: true },
 		});
+		expect(payload).not.toHaveProperty("messages");
+		expect(payload).not.toHaveProperty("transcript");
+		expect(payload).not.toHaveProperty("paneLog");
+	});
+
+	it("marks zero-code post-acceptance process exit as recoverable instead of completed", async () => {
+		const root = await tempRoot();
+		const workspace = path.join(root, "worktree");
+		await fs.mkdir(workspace);
+		git(workspace, ["init"]);
+		git(workspace, ["config", "user.email", "test@example.com"]);
+		git(workspace, ["config", "user.name", "Test User"]);
+		await Bun.write(path.join(workspace, "README.md"), "base\n");
+		git(workspace, ["add", "README.md"]);
+		git(workspace, ["commit", "-m", "init"]);
+		await Bun.write(path.join(workspace, "README.md"), "base\nrecoverable dirty change\n");
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "post-acceptance-session";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "post-acceptance-session",
+				state: "running",
+				ready_for_input: false,
+				cwd: workspace,
+				session_file: path.join(root, "session.jsonl"),
+				current_turn_id: "turn-after-prompt-acceptance",
+			}),
+		);
+		const previousExitCode = process.exitCode;
+		process.exitCode = 0;
+		try {
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+				sessionId: "fallback",
+				cwd: workspace,
+				sessionFile: path.join(root, "session.jsonl"),
+			});
+		} finally {
+			process.exitCode = previousExitCode;
+		}
+
+		const payload = JSON.parse(await Bun.file(stateFile).text());
+		expect(payload).toMatchObject({
+			schema_version: 1,
+			session_id: "post-acceptance-session",
+			state: "errored",
+			ready_for_input: false,
+			source: "process_postmortem",
+			reason: "process_exit_before_terminal_state",
+			exit_code: 0,
+			previous_runtime_state: "running",
+			error: { code: "process_exit_before_terminal_state", recoverable: true },
+			recovery: { action: "recover_or_resume_session" },
+		});
+		expect(await Bun.file(path.join(workspace, "README.md")).text()).toContain("recoverable dirty change");
 		expect(payload).not.toHaveProperty("messages");
 		expect(payload).not.toHaveProperty("transcript");
 		expect(payload).not.toHaveProperty("paneLog");

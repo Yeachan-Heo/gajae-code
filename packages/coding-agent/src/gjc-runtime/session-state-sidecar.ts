@@ -193,29 +193,50 @@ function numericProcessExitCode(defaultCode: number | null): number | null {
 	return typeof process.exitCode === "number" ? process.exitCode : defaultCode;
 }
 
-function postmortemExitDetails(reason: postmortem.Reason): {
+function postmortemExitDetails(
+	reason: postmortem.Reason,
+	previous: RuntimeStateSidecarPayload,
+): {
 	state: RuntimeState;
 	reason: string;
 	exitKind: string;
 	exitCode: number | null;
 	signal: string | null;
 	error?: { code: string; message: string; recoverable: true };
+	recovery?: { action: string; reason: string };
 } {
 	if (reason === postmortem.Reason.EXIT || reason === postmortem.Reason.MANUAL) {
 		const exitCode = numericProcessExitCode(0) ?? 0;
-		const state: RuntimeState = exitCode === 0 ? "completed" : "errored";
+		const exitedBeforeTerminalState =
+			exitCode === 0 && reason === postmortem.Reason.EXIT && previous.state === "running";
+		const state: RuntimeState = exitCode === 0 && !exitedBeforeTerminalState ? "completed" : "errored";
+		const exitReason = exitedBeforeTerminalState
+			? "process_exit_before_terminal_state"
+			: reason === postmortem.Reason.EXIT
+				? "process_exit"
+				: "manual_cleanup";
 		return {
 			state,
-			reason: reason === postmortem.Reason.EXIT ? "process_exit" : "manual_cleanup",
+			reason: exitReason,
 			exitKind: reason,
 			exitCode,
 			signal: null,
 			...(state === "errored"
 				? {
 						error: {
-							code: "process_exit",
-							message: publicSafeErrorMessage(`GJC process exited with code ${exitCode}`),
+							code: exitReason,
+							message: publicSafeErrorMessage(
+								exitedBeforeTerminalState
+									? "GJC process exited before emitting terminal agent state"
+									: `GJC process exited with code ${exitCode}`,
+							),
 							recoverable: true,
+						},
+						recovery: {
+							action: "recover_or_resume_session",
+							reason: exitedBeforeTerminalState
+								? "previous runtime state was non-terminal; preserve the worktree and inspect the session before retrying"
+								: "process exited with a non-zero status",
 						},
 					}
 				: {}),
@@ -233,6 +254,7 @@ function postmortemExitDetails(reason: postmortem.Reason): {
 		exitCode: numericProcessExitCode(null),
 		signal: signalByReason[reason] ?? null,
 		error: { code: reason, message: errorMessageForPostmortem(reason), recoverable: true },
+		recovery: { action: "recover_or_resume_session", reason: "process cleanup ran before terminal agent state" },
 	};
 }
 
@@ -287,7 +309,7 @@ export function persistCoordinatorRuntimeStateFromPostmortem(
 	const previous = readPreviousPayload(stateFile);
 	if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload)) return;
 	const now = new Date().toISOString();
-	const details = postmortemExitDetails(reason);
+	const details = postmortemExitDetails(reason, previous as RuntimeStateSidecarPayload);
 	const payload = {
 		...basePayload({
 			context,
@@ -304,6 +326,8 @@ export function persistCoordinatorRuntimeStateFromPostmortem(
 		exit_code: details.exitCode,
 		signal: details.signal,
 		...(details.error ? { error: details.error } : {}),
+		...(details.recovery ? { recovery: details.recovery } : {}),
+		previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
 	};
 	try {
 		writeStateFileSync(stateFile, payload);
