@@ -77,6 +77,16 @@ bun install -g gajae-code
 
 The scoped package is also available as `@gajae-code/coding-agent`.
 
+### Shell completion
+
+GJC can generate a Fig/withfig-compatible spec for [Microsoft inshellisense](https://github.com/microsoft/inshellisense):
+
+```sh
+gjc completion inshellisense --install
+```
+
+The installer writes `gjc.js` plus a minimal `index.js` into inshellisense's default local spec directory (`~/.fig/autocomplete/build`). If that directory already has an unrelated `index.js`, GJC refuses to clobber it unless `--force` is explicit; use `--dir <path>` for a separate GJC-only spec directory.
+
 ### Supported platforms
 
 Prebuilt standalone release binaries are published only for:

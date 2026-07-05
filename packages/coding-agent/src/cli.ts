@@ -52,6 +52,7 @@ export const commands: CommandEntry[] = [
 	{ name: "rlm", load: () => import("./commands/rlm").then(m => m.default) },
 	{ name: "update", load: () => import("./commands/update").then(m => m.default) },
 	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
+	{ name: "completion", load: () => import("./commands/completion").then(m => m.default) },
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
 ];
 
@@ -110,7 +111,7 @@ function hasRootVersionFlag(argv: string[]): boolean {
 	return hasRootFastFlag(argv, versionFlags);
 }
 
-class RootHelpCommand extends Command {
+export class RootHelpCommand extends Command {
 	static description = "Red-claw AI coding assistant";
 	static hidden = true;
 	static args = {
