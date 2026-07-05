@@ -58,6 +58,11 @@ interface TelegramUser {
 	allows_users_to_create_topics?: boolean;
 }
 
+interface TelegramChat {
+	id?: number | string;
+	type?: string;
+}
+
 type ThreadedModeState = "enabled" | "disabled" | "unknown";
 type ThreadedModeFinalLabel = "verified" | "unverified" | "unknown";
 
@@ -148,6 +153,7 @@ async function runSetup(deps: NotifyCommandDeps): Promise<void> {
 	let chatId: string;
 	if (deps.setupChatId?.trim()) {
 		chatId = deps.setupChatId.trim();
+		await verifyPrivateChatId(fetchImpl, apiBase, token, chatId);
 		process.stdout.write(`Using provided chat id ${chatId} (non-interactive).\n`);
 	} else {
 		const stale = await getUpdates(fetchImpl, apiBase, token, { timeout: 0, allowed_updates: ["message"] });
@@ -221,6 +227,24 @@ async function getMe(fetchImpl: typeof fetch, apiBase: string, token: string): P
 		throw new Error("Telegram getMe returned invalid Telegram response: missing valid User result.");
 	}
 	return user;
+}
+
+async function verifyPrivateChatId(
+	fetchImpl: typeof fetch,
+	apiBase: string,
+	token: string,
+	chatId: string,
+): Promise<void> {
+	const chat = (await callTelegram<unknown>(fetchImpl, apiBase, token, "getChat", { chat_id: chatId })) as
+		| TelegramChat
+		| undefined;
+	if (!chat || typeof chat !== "object") {
+		throw new Error("Telegram getChat returned invalid Telegram response: missing valid Chat result.");
+	}
+	if (chat.type !== "private") {
+		const type = typeof chat.type === "string" && chat.type ? chat.type : "unknown";
+		throw new Error(`Provided chat id ${chatId} is a ${type} chat; pairing requires a private Telegram chat.`);
+	}
 }
 
 function threadedModeState(user: TelegramUser): ThreadedModeState {

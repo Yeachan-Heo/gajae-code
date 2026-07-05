@@ -22,7 +22,12 @@ function makeFetch(results: Record<string, unknown[]>): { fetchImpl: typeof fetc
 		const body = init?.body ? JSON.parse(String(init.body)) : {};
 		calls.push({ method, body });
 		const queue = results[method] ?? [];
-		const payload = queue.length > 0 ? queue.shift() : { ok: true, result: [] };
+		const payload =
+			queue.length > 0
+				? queue.shift()
+				: method === "getChat"
+					? { ok: true, result: { id: body.chat_id, type: "private" } }
+					: { ok: true, result: [] };
 		return new Response(JSON.stringify(payload), {
 			status: (payload as { ok?: boolean }).ok === false ? 400 : 200,
 			headers: { "content-type": "application/json" },
@@ -189,15 +194,23 @@ describe("notify setup cli", () => {
 	});
 });
 
-test("non-interactive setup with --token and --chat-id writes config without polling", async () => {
+test("non-interactive setup with --token and --chat-id verifies private chat without polling", async () => {
 	const settings = Settings.isolated({});
 	let getUpdatesCalls = 0;
-	const fetchImpl = (async (url: any) => {
+	let getChatCalls = 0;
+	const fetchImpl = (async (url: any, init?: RequestInit) => {
 		const u = String(url);
+		const body = init?.body ? JSON.parse(String(init.body)) : {};
 		if (u.includes("/getMe"))
 			return new Response(JSON.stringify({ ok: true, result: { id: 1, is_bot: true } }), {
 				headers: { "content-type": "application/json" },
 			});
+		if (u.includes("/getChat")) {
+			getChatCalls++;
+			return new Response(JSON.stringify({ ok: true, result: { id: body.chat_id, type: "private" } }), {
+				headers: { "content-type": "application/json" },
+			});
+		}
 		if (u.includes("/getUpdates")) {
 			getUpdatesCalls++;
 			return new Response(JSON.stringify({ ok: true, result: [] }), {
@@ -216,7 +229,28 @@ test("non-interactive setup with --token and --chat-id writes config without pol
 	expect(cfg.chatId).toBe("999");
 	expect(cfg.redact).toBe(true);
 	expect(cfg.botToken).toBe("123:abc");
+	expect(getChatCalls).toBe(1);
 	expect(getUpdatesCalls).toBe(0);
+});
+
+test("non-interactive setup rejects non-private chat ids without writing config", async () => {
+	for (const type of ["group", "supergroup", "channel"]) {
+		const settings = Settings.isolated({});
+		const { fetchImpl, calls } = makeFetch({
+			getMe: [{ ok: true, result: { id: 1, is_bot: true, has_topics_enabled: true } }],
+			getChat: [{ ok: true, result: { id: -100, type } }],
+		});
+		const cmd = parseNotifyArgs(["notify", "setup", "--token", "123:abc", "--chat-id", "-100"]);
+
+		await expect(runNotifyCommand(cmd!, { settings, fetchImpl, setupInteractive: false })).rejects.toThrow(
+			`Provided chat id -100 is a ${type} chat`,
+		);
+
+		expect(getNotificationConfig(settings).enabled).toBe(false);
+		expect(getNotificationConfig(settings).botToken).toBeUndefined();
+		expect(getNotificationConfig(settings).chatId).toBeUndefined();
+		expect(calls.filter(call => call.method === "getUpdates")).toHaveLength(0);
+	}
 });
 
 function privateUpdates(chatId = 555111): unknown[] {

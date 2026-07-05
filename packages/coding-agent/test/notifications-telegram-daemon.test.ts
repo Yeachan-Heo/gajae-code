@@ -86,6 +86,8 @@ class FakeBotApi {
 		}
 		if (method === "getMe")
 			return { ok: true, result: this.botUsername ? { id: 1, username: this.botUsername } : { id: 1 } };
+		if (method === "getChat")
+			return { ok: true, result: { id: (body as { chat_id?: unknown }).chat_id, type: "private" } };
 		if (method === "getFile") return { ok: true, result: { file_path: "docs/file_7.bin" } };
 		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: this.calls.length } };
 		if (method === "sendMessage") return { ok: true, result: { message_id: this.calls.length } };
@@ -1280,7 +1282,9 @@ test("stale identity after loadTopics reuses the persisted repo branch owner", a
 	});
 
 	expect(bot.calls.filter(c => c.method === "createForumTopic").map(c => c.body.name)).toEqual(["gajae-code/dev"]);
-	expect(bot.calls.filter(c => c.method === "sendMessage").map(c => c.body.message_thread_id)).toEqual([1]);
+	const threadedSends = bot.calls.filter(c => c.method === "sendMessage").map(c => c.body.message_thread_id);
+	expect(threadedSends).toHaveLength(1);
+	expect(Number(threadedSends[0])).toBeGreaterThan(0);
 });
 
 test("threaded mode off: frames fall back to the flat paired chat with a one-time notice", async () => {
@@ -1409,15 +1413,16 @@ test("threaded mode off: image_attachment uploads flat without message_thread_id
 	expect(notice).toHaveLength(1);
 });
 
-test("threaded off + non-private chat: fails closed (no flat send, no notice)", async () => {
+test("non-private chat: fails closed before topic creation or flat delivery", async () => {
 	for (const chatType of ["supergroup", "group", "channel"]) {
 		const agentDir = tempAgentDir();
 		const bot = new FakeBotApi();
-		// Topics off AND the paired chat is not a private DM: must drop fail-closed
-		// so session content never lands in a shared chat.
+		// Even if the target chat would accept forum topic creation, the paired chat
+		// contract is private-only, so the daemon must fail closed before creating
+		// topics or sending session content into a shared chat.
 		bot.call = (async (method: string, body: any) => {
 			bot.calls.push({ method, body });
-			if (method === "createForumTopic") return { ok: true, result: {} };
+			if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 777 } };
 			if (method === "getChat") return { ok: true, result: { type: chatType } };
 			if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
 			return { ok: true, result: true };
@@ -1451,8 +1456,8 @@ test("threaded off + non-private chat: fails closed (no flat send, no notice)", 
 			options: ["Yes"],
 		});
 
-		const sends = bot.calls.filter(c => c.method === "sendMessage");
-		expect(sends).toHaveLength(0);
+		expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(0);
+		expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
 	}
 });
 
