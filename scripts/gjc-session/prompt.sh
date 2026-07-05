@@ -20,7 +20,7 @@ if [[ "$PROMPT_EVIDENCE_ATTEMPTS" -lt 1 ]]; then
 fi
 
 find_durable_pane_logs() {
-  if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
+  if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -z "${GJC_SESSION_LOG_SEARCH_ROOT:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
     printf '%s\n' "$GJC_SESSION_STATE_DIR/pane.log"
   else
     find "${GJC_SESSION_LOG_SEARCH_ROOT:-$HOME/Workspace}" \( -path "*/.gjc-session-state/$SESSION/pane.log" -o -path "*/$SESSION/pane.log" \) -type f 2>/dev/null | sort
@@ -28,7 +28,7 @@ find_durable_pane_logs() {
 }
 
 prompt_accepted_path() {
-  if [[ -n "${GJC_SESSION_STATE_DIR:-}" ]]; then
+  if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -z "${GJC_SESSION_LOG_SEARCH_ROOT:-}" ]]; then
     printf '%s\n' "$GJC_SESSION_STATE_DIR/prompt-accepted.json"
     return 0
   fi
@@ -182,8 +182,8 @@ write_pre_prompt_vanished() {
   fi
   [[ -n "$state_dir" ]] || return 0
   mkdir -p "$state_dir"
-  local workdir="${GJC_SESSION_WORKDIR:-}"
-  if [[ -z "$workdir" && -f "$state_dir/metadata.json" ]]; then
+  local workdir=""
+  if [[ -f "$state_dir/metadata.json" ]]; then
     workdir="$(python3 - "$state_dir/metadata.json" <<'PYMETA'
 import json
 import sys
@@ -255,7 +255,7 @@ fi
 # script does not replace an existing tmux pipe-pane logger.
 EVIDENCE_LOG=""
 EVIDENCE_LOG_IS_TEMP=0
-if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
+if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -z "${GJC_SESSION_LOG_SEARCH_ROOT:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
   EVIDENCE_LOG="$GJC_SESSION_STATE_DIR/pane.log"
 else
   durable_log_candidates=()
