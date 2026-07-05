@@ -86,6 +86,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#cache: Map<string, CacheEntry> = new Map();
 	#usageCache?: UsageCacheEntry;
 	#usageInflight?: Promise<UsageReport[] | null>;
+	#usageCacheEpoch = 0;
 	#closed = false;
 	/**
 	 * `true` once the SSE consumer received its first frame and hasn't dropped
@@ -465,6 +466,19 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
+	deleteCachePrefix(prefix: string): void {
+		for (const key of this.#cache.keys()) {
+			if (key.startsWith(prefix)) this.#cache.delete(key);
+		}
+		if (prefix.startsWith("usage_cache:")) this.#invalidateUsageCache();
+	}
+
+	#invalidateUsageCache(): void {
+		this.#usageCache = undefined;
+		this.#usageInflight = undefined;
+		this.#usageCacheEpoch += 1;
+	}
+
 	/**
 	 * Store-level hook consumed by `AuthStorage` — routes refresh through the
 	 * broker so the actual refresh token never leaves the broker host. Returns
@@ -561,10 +575,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			return Promise.resolve(cached.reports);
 		}
 		if (this.#usageInflight) return this.#usageInflight;
+		const epoch = this.#usageCacheEpoch;
 		const inflight = this.#client
 			.fetchUsage()
 			.then(body => {
-				this.#usageCache = { reports: body.reports, fetchedAt: Date.now() };
+				if (this.#usageCacheEpoch === epoch) this.#usageCache = { reports: body.reports, fetchedAt: Date.now() };
 				return body.reports;
 			})
 			.catch(error => {
@@ -572,7 +587,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				return null;
 			})
 			.finally(() => {
-				this.#usageInflight = undefined;
+				if (this.#usageCacheEpoch === epoch) this.#usageInflight = undefined;
 			});
 		this.#usageInflight = inflight;
 		return inflight;

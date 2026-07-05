@@ -8,6 +8,7 @@ import {
 	type AuthCredentialIfAbsentResult,
 	type AuthCredentialStore,
 	AuthStorage,
+	type OAuthCredential,
 	REMOTE_REFRESH_SENTINEL,
 	SqliteAuthCredentialStore,
 } from "../src/auth-storage";
@@ -18,7 +19,7 @@ const SUPPRESS_ANTHROPIC_ENV = {
 	ANTHROPIC_OAUTH_TOKEN: undefined,
 } as const;
 
-function oauth(suffix = "1"): AuthCredential {
+function oauth(suffix = "1"): OAuthCredential {
 	return {
 		type: "oauth",
 		access: `access-${suffix}`,
@@ -50,6 +51,10 @@ class CountingStore implements AuthCredentialStore {
 	}
 	upsertAuthCredentialForProviderIfAbsent(provider: string, credential: AuthCredential): AuthCredentialIfAbsentResult {
 		this.ifAbsentCalls += 1;
+		const existing = this.rows.filter(row => row.provider === provider && row.disabledCause === null);
+		if (existing.length > 0) {
+			return { inserted: false, reason: "skipped-existing", provider, entries: existing };
+		}
 		this.rows = [{ id: 1, provider, credential, disabledCause: null }];
 		return { inserted: true, reason: "inserted", provider, entries: this.rows };
 	}
@@ -58,6 +63,10 @@ class CountingStore implements AuthCredentialStore {
 		credential: AuthCredential,
 	): Promise<AuthCredentialIfAbsentResult> {
 		this.remoteIfAbsentCalls += 1;
+		const existing = this.rows.filter(row => row.provider === provider && row.disabledCause === null);
+		if (existing.length > 0) {
+			return { inserted: false, reason: "skipped-existing", provider, entries: existing };
+		}
 		this.rows = [{ id: 2, provider, credential, disabledCause: null }];
 		return { inserted: true, reason: "inserted", provider, entries: this.rows };
 	}
@@ -66,6 +75,7 @@ class CountingStore implements AuthCredentialStore {
 		return null;
 	}
 	setCache(): void {}
+	deleteCachePrefix(): void {}
 	cleanExpiredCache(): void {}
 }
 
@@ -81,7 +91,7 @@ describe("if-absent auth credential writes", () => {
 		await fs.rm(tempDir, { recursive: true, force: true });
 	});
 
-	test("SqliteAuthCredentialStore inserts when empty and skips when any active row exists", async () => {
+	test("SqliteAuthCredentialStore inserts when empty, skips other identities, and updates matching OAuth rows", async () => {
 		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		try {
 			const inserted = store.upsertAuthCredentialForProviderIfAbsent("anthropic", oauth("a"));
@@ -93,6 +103,23 @@ describe("if-absent auth credential writes", () => {
 			expect(skippedOauth.inserted).toBe(false);
 			expect(skippedOauth.reason).toBe("skipped-existing");
 			expect(skippedOauth.entries).toHaveLength(1);
+
+			const refreshed = store.upsertAuthCredentialForProviderIfAbsent("anthropic", {
+				...oauth("fresh"),
+				accountId: "acct-a",
+				email: "user-a@example.com",
+			});
+			expect(refreshed.inserted).toBe(true);
+			expect(refreshed.reason).toBe("updated-existing");
+			expect(refreshed.entries).toHaveLength(1);
+			expect(refreshed.entries[0]?.id).toBe(inserted.entries[0]?.id);
+			expect(refreshed.entries[0]?.credential).toMatchObject({
+				type: "oauth",
+				access: "access-fresh",
+				refresh: "refresh-fresh",
+				accountId: "acct-a",
+				email: "user-a@example.com",
+			});
 
 			const apiStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "api.db"));
 			try {
@@ -267,7 +294,7 @@ try {
 			expect((await stored.importCredentialIfAbsent("anthropic", oauth("incoming"))).reason).toBe(
 				"skipped-existing",
 			);
-			expect(storedStore.ifAbsentCalls).toBe(0);
+			expect(storedStore.remoteIfAbsentCalls).toBe(1);
 
 			const fallbackStore = new CountingStore();
 			const fallback = new AuthStorage(fallbackStore);
@@ -314,6 +341,62 @@ try {
 				expect(result.reason).toBe("inserted");
 				expect(storage.has("anthropic")).toBe(true);
 				expect(result.entries).toHaveLength(1);
+			} finally {
+				storage.close();
+			}
+		});
+	});
+
+	test("AuthStorage.importCredentialIfAbsent refreshes matching local OAuth and clears provider usage cache", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "refresh.db"));
+			const storage = new AuthStorage(store);
+			try {
+				await storage.reload();
+				const initial = await storage.importCredentialIfAbsent("anthropic", oauth("cached"));
+				expect(initial.reason).toBe("inserted");
+
+				const cacheKey =
+					"usage_cache:report:anthropic:default:oauth|account:acct-cached|email:user-cached@example.com";
+				store.setCache(
+					cacheKey,
+					JSON.stringify({
+						value: {
+							provider: "anthropic",
+							fetchedAt: Date.now(),
+							limits: [
+								{
+									id: "weekly",
+									label: "Weekly",
+									scope: { provider: "anthropic" },
+									amount: { unit: "unknown" },
+								},
+							],
+							metadata: { email: "user-cached@example.com" },
+						},
+						expiresAt: Date.now() + 3_600_000,
+					}),
+					Math.floor((Date.now() + 3_600_000) / 1000),
+				);
+				expect(store.getCache(cacheKey, { includeExpired: true })).not.toBeNull();
+
+				const refreshed = await storage.importCredentialIfAbsent("anthropic", {
+					...oauth("refreshed"),
+					accountId: "acct-cached",
+					email: "user-cached@example.com",
+				});
+
+				expect(refreshed.inserted).toBe(true);
+				expect(refreshed.reason).toBe("updated-existing");
+				expect(refreshed.entries).toHaveLength(1);
+				expect(refreshed.entries[0]?.id).toBe(initial.entries[0]?.id);
+				expect(refreshed.entries[0]?.credential).toMatchObject({
+					type: "oauth",
+					access: "access-refreshed",
+					accountId: "acct-cached",
+					email: "user-cached@example.com",
+				});
+				expect(store.getCache(cacheKey, { includeExpired: true })).toBeNull();
 			} finally {
 				storage.close();
 			}

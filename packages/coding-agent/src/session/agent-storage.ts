@@ -420,6 +420,10 @@ FROM model_usage_legacy
 		this.#authStore.setCache(key, value, expiresAtSec);
 	}
 
+	deleteCachePrefix(prefix: string): void {
+		this.#authStore.deleteCachePrefix?.(prefix);
+	}
+
 	/**
 	 * Deletes expired cache entries. Call periodically for cleanup.
 	 */

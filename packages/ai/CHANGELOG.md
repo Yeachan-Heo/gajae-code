@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Refreshed matching existing OAuth credentials during `importCredentialIfAbsent` and cleared provider usage caches after the write, so external credential import no longer keeps stale tokens or stale usage-limit reports for the same account.
+
 ## [0.7.9] - 2026-07-01
 
 ### Fixed

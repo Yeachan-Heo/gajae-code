@@ -154,6 +154,7 @@ export interface AuthCredentialSnapshotEntry {
 
 export type AuthCredentialIfAbsentReason =
 	| "inserted"
+	| "updated-existing"
 	| "skipped-existing"
 	| "skipped-existing-runtime"
 	| "skipped-existing-config"
@@ -210,6 +211,7 @@ export interface AuthCredentialStore {
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
+	deleteCachePrefix?(prefix: string): void;
 	cleanExpiredCache(): void;
 	/**
 	 * Optional store-supplied OAuth refresh. When present, `AuthStorage` uses
@@ -472,6 +474,7 @@ interface UsageCache {
 	get<T>(key: string): UsageCacheEntry<T> | undefined;
 	getStale<T>(key: string): UsageCacheEntry<T> | undefined;
 	set<T>(key: string, entry: UsageCacheEntry<T>): void;
+	deletePrefix?(prefix: string): void;
 	cleanup?(): void;
 }
 
@@ -660,6 +663,10 @@ class AuthStorageUsageCache implements UsageCache {
 		const durableExpiresAt =
 			entry.value === null ? entry.expiresAt : Math.max(entry.expiresAt, Date.now() + USAGE_LAST_GOOD_RETENTION_MS);
 		this.store.setCache(`${USAGE_CACHE_PREFIX}${key}`, payload, Math.floor(durableExpiresAt / 1000));
+	}
+
+	deletePrefix(prefix: string): void {
+		this.store.deleteCachePrefix?.(`${USAGE_CACHE_PREFIX}${prefix}`);
 	}
 
 	cleanup(): void {
@@ -1297,8 +1304,6 @@ export class AuthStorage {
 			return this.#snapshotSkipResult(storageProvider, "skipped-existing-runtime");
 		if (this.#configOverrides.has(storageProvider))
 			return this.#snapshotSkipResult(storageProvider, "skipped-existing-config");
-		if (this.#getCredentialsForProvider(storageProvider).length > 0)
-			return this.#snapshotSkipResult(storageProvider, "skipped-existing");
 		if (getEnvApiKey(storageProvider)) return this.#snapshotSkipResult(storageProvider, "skipped-existing-env");
 		if (this.#fallbackResolver?.(storageProvider))
 			return this.#snapshotSkipResult(storageProvider, "skipped-existing-fallback");
@@ -1311,6 +1316,7 @@ export class AuthStorage {
 			result.entries.map(entry => ({ id: entry.id, credential: entry.credential })),
 		);
 		this.#resetProviderAssignments(storageProvider);
+		if (result.inserted) this.#invalidateUsageCacheForProvider(storageProvider);
 		return {
 			inserted: result.inserted,
 			reason: result.reason,
@@ -1328,6 +1334,13 @@ export class AuthStorage {
 			stored.map(record => ({ id: record.id, credential: record.credential })),
 		);
 		this.#resetProviderAssignments(provider);
+		this.#invalidateUsageCacheForProvider(provider);
+	}
+
+	#invalidateUsageCacheForProvider(provider: string): void {
+		this.#usageRequestInFlight.clear();
+		this.#usageReportsInFlight.clear();
+		this.#usageCache.deletePrefix?.(`report:${provider}:`);
 	}
 
 	/**
@@ -3705,6 +3718,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#getCacheStmt: Statement;
 	#getCacheIncludingExpiredStmt: Statement;
 	#upsertCacheStmt: Statement;
+	#deleteCachePrefixStmt: Statement;
 	#deleteExpiredCacheStmt: Statement;
 	#closed = false;
 
@@ -3744,6 +3758,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#upsertCacheStmt = this.#db.prepare(
 			"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at",
 		);
+		this.#deleteCachePrefixStmt = this.#db.prepare("DELETE FROM cache WHERE substr(key, 1, ?) = ?");
 		this.#deleteExpiredCacheStmt = this.#db.prepare(`DELETE FROM cache WHERE expires_at <= ${SQLITE_NOW_EPOCH}`);
 	}
 
@@ -4102,16 +4117,58 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		}
 
 		const writeIfAbsent = this.#db.transaction(
-			(providerName: string, record: SerializedCredentialRecord): AuthCredentialIfAbsentResult => {
+			(
+				providerName: string,
+				item: AuthCredential,
+				record: SerializedCredentialRecord,
+			): AuthCredentialIfAbsentResult => {
 				const existingRows = this.#listActiveByProviderStmt.all(providerName) as AuthRow[];
-				const existing: StoredAuthCredential[] = [];
+				const existing: Array<{
+					id: number;
+					credential: AuthCredential;
+					identityKey: string | null;
+				}> = [];
 				for (const row of existingRows) {
 					const activeCredential = deserializeCredential(row);
 					if (!activeCredential) continue;
-					existing.push(toStoredAuthCredential(row, activeCredential));
+					existing.push({
+						id: row.id,
+						credential: activeCredential,
+						identityKey: resolveRowCredentialIdentityKey(providerName, row),
+					});
 				}
 				if (existing.length > 0) {
-					return { inserted: false, reason: "skipped-existing", provider: providerName, entries: existing };
+					let targetId: number | null = null;
+					for (const row of existing) {
+						if (!matchesReplacementCredential(providerName, row.credential, row.identityKey, item)) continue;
+						if (targetId === null) {
+							targetId = row.id;
+							this.#updateStmt.run(record.credentialType, record.data, record.identityKey, row.id);
+						} else {
+							this.#deleteStmt.run("replaced by newer credential", row.id);
+						}
+					}
+
+					if (targetId !== null) {
+						return {
+							inserted: true,
+							reason: "updated-existing",
+							provider: providerName,
+							entries: this.listAuthCredentials(providerName),
+						};
+					}
+
+					return {
+						inserted: false,
+						reason: "skipped-existing",
+						provider: providerName,
+						entries: existing.map(row => ({
+							id: row.id,
+							provider: providerName,
+							credential: row.credential,
+							disabledCause: null,
+						})),
+					};
 				}
 
 				this.#insertStmt.get(providerName, record.credentialType, record.data, record.identityKey);
@@ -4124,7 +4181,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			},
 		);
 
-		return writeIfAbsent.immediate(provider, serialized);
+		const result = writeIfAbsent.immediate(provider, credential, serialized);
+		if (result.inserted) this.#purgeSupersededDisabledRows(provider, result.entries);
+		return result;
 	}
 
 	/**
@@ -4221,6 +4280,13 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
+	deleteCachePrefix(prefix: string): void {
+		if (prefix.length === 0) return;
+		try {
+			this.#deleteCachePrefixStmt.run(prefix.length, prefix);
+		} catch {}
+	}
+
 	cleanExpiredCache(): void {
 		try {
 			this.#deleteExpiredCacheStmt.run();
@@ -4311,6 +4377,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#getCacheStmt.finalize();
 		this.#getCacheIncludingExpiredStmt.finalize();
 		this.#upsertCacheStmt.finalize();
+		this.#deleteCachePrefixStmt.finalize();
 		this.#deleteExpiredCacheStmt.finalize();
 		this.#db.close();
 	}

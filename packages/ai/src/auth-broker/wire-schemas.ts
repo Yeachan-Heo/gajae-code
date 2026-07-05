@@ -187,6 +187,7 @@ export const credentialDisableResponseSchema = z
 // ─── Upload ────────────────────────────────────────────────────────────────
 const credentialIfAbsentReasonSchema = z.enum([
 	"inserted",
+	"updated-existing",
 	"skipped-existing",
 	"skipped-existing-runtime",
 	"skipped-existing-config",
