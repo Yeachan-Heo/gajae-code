@@ -1524,7 +1524,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} catch {
 			notificationCfg = undefined;
 		}
-		if (shouldRegisterNotificationsExtension({ env: process.env, cfg: notificationCfg })) {
+		// Subagent sessions never own a notification endpoint: one Telegram
+		// topic per top-level session, not per task-tool helper.
+		if (
+			shouldRegisterNotificationsExtension({
+				env: process.env,
+				cfg: notificationCfg,
+				isSubagent: (options.taskDepth ?? 0) > 0 || Boolean(options.parentTaskPrefix),
+			})
+		) {
 			inlineExtensions.push(createNotificationsExtension);
 		}
 

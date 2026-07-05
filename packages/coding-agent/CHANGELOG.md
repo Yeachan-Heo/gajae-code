@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Task-tool subagent sessions no longer register the notifications extension, so they no longer open their own notification endpoints or per-session Telegram topics; only the top-level session surfaces in Telegram.
+
 ## [0.8.1] - 2026-07-04
 
 ### Added

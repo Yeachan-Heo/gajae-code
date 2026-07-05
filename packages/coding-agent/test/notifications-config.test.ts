@@ -149,6 +149,15 @@ describe("notifications config", () => {
 		expect(shouldRegisterNotificationsExtension({ cfg: GLOBAL_CFG, env: {} })).toBe(true);
 		expect(shouldRegisterNotificationsExtension({ cfg: BASE_CFG, env: {} })).toBe(false);
 		expect(shouldRegisterNotificationsExtension({ env: {} })).toBe(false);
+		expect(shouldRegisterNotificationsExtension({ cfg: GLOBAL_CFG, env: {}, isSubagent: true })).toBe(false);
+		expect(
+			shouldRegisterNotificationsExtension({
+				cfg: GLOBAL_CFG,
+				env: { GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TOKEN: "token" },
+				isSubagent: true,
+			}),
+		).toBe(false);
+		expect(shouldRegisterNotificationsExtension({ cfg: GLOBAL_CFG, env: {}, isSubagent: false })).toBe(true);
 	});
 
 	test("maskToken handles unset tokens and never reveals the raw token", () => {

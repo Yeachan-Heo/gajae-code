@@ -48,11 +48,21 @@ export function isGloballyConfigured(cfg: NotificationConfig): boolean {
 	);
 }
 
-/** Resolve whether the notifications extension should be registered at SDK startup. */
+/**
+ * Resolve whether the notifications extension should be registered at SDK startup.
+ *
+ * Subagent (task-tool helper) sessions never register: they share the parent
+ * process env and repo state root, so registering would give every helper its
+ * own notification endpoint — and therefore its own Telegram topic — even
+ * though only the top-level session is remotely steerable.
+ */
 export function shouldRegisterNotificationsExtension(input: {
 	env: NodeJS.ProcessEnv;
 	cfg?: NotificationConfig;
+	/** True for task-tool subagent sessions (`parentTaskPrefix` present). */
+	isSubagent?: boolean;
 }): boolean {
+	if (input.isSubagent) return false;
 	if (input.env.GJC_NOTIFICATIONS === "0") return false;
 	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
 	return input.cfg ? isGloballyConfigured(input.cfg) : false;
