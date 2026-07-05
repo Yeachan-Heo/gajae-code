@@ -241,6 +241,49 @@ describe("AgentSession resilient retry", () => {
 		expect(last.errorMessage).toContain("401");
 	});
 
+	it("surfaces provider safety refusals without retrying", async () => {
+		// Anthropic stop_reason "refusal"/"sensitive" maps to stopReason "error"
+		// with an engine-generated label (packages/ai anthropic.ts). Refusals are
+		// deterministic for the submitted context, so every retry re-sends the
+		// full conversation and deterministically refuses again (#1655).
+		const refusals = [
+			"Refusal (cyber): This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy. To learn more, see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback.",
+			"Refusal (no details provided)",
+			"Content flagged by safety filters",
+		];
+		for (const refusal of refusals) {
+			session = buildSession({ responses: [{ throw: refusal }] });
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt("trigger provider refusal");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			const last = lastAssistant(session);
+			expect(last.stopReason).toBe("error");
+			expect(last.errorMessage).toBe(refusal);
+			await session.dispose();
+			session = undefined;
+		}
+	});
+
+	it("still retries errors that merely mention a refusal mid-sentence", async () => {
+		// Guard the anchored match: transient copy that contains the word
+		// "refusal" in passing must not be terminalized.
+		session = buildSession({
+			responses: [{ throw: "connection error after upstream refusal handshake" }, { content: ["recovered"] }],
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("mid-sentence refusal mention");
+		await session.waitForIdle();
+
+		expect(retryStartEvents.length).toBeGreaterThanOrEqual(1);
+		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+
 	it("surfaces deliberate request aborts without retrying", async () => {
 		session = buildSession({ responses: [{ throw: "Request was aborted." }] });
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);

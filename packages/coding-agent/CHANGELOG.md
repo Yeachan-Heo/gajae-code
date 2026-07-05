@@ -19,6 +19,7 @@
 - Telegram daemon autostart now refuses to attach a new session to a live daemon whose persisted bot-token fingerprint or chat id differs from the current settings, and it avoids registering the session root until ownership is trusted so rotated Telegram credentials cannot keep leaking through the old daemon.
 - Skill autocomplete now supports direct skill-name prefixes after prompt text (for example, `please /ra` → `/skill:ralplan`) while keeping bare `/` menus free of skill entries.
 - `gjc --tmux` on native Windows/psmux now keeps the status line and composer pinned to the bottom after viewport redraws by honoring the GJC tmux launch marker as a multiplexer signal even when `$TMUX` is absent.
+- Provider safety refusals (e.g. Anthropic `stop_reason: "refusal"` → `Refusal (<category>): …`, and `sensitive` → `Content flagged by safety filters`) are now classified as terminal retry errors and surface immediately. They previously fell through to the unbounded `"unknown"` retry class, and because a refusal is deterministic for the submitted context, the session looped refusal → retry → refusal forever — resubmitting the full context every `retry.maxDelayMs` and re-billing it as a prompt-cache write whenever the backoff outlived the cache TTL (#1655).
 
 - `gjc config list`, `gjc config get`, and `gjc config set` now redact secret-like string settings by default, with `--show-secrets` as an explicit unsafe opt-in.
 

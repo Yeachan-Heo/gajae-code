@@ -8467,6 +8467,16 @@ export class AgentSession {
 		);
 	}
 
+	#isRefusalErrorMessage(errorMessage: string): boolean {
+		// Provider safety-refusal stops. Matches the engine-generated Anthropic
+		// labels from packages/ai ("Refusal (<category>): …", "Refusal (no
+		// details provided)", "Content flagged by safety filters") plus generic
+		// usage-policy refusal copy.
+		return /^refusal(\s*\(|:|$)|content flagged by safety filters|blocked under .{0,40}usage policy/i.test(
+			errorMessage,
+		);
+	}
+
 	#extractExplicitHttpStatusFromErrorMessage(errorMessage: string): number | undefined {
 		// Parse only explicit HTTP/status wording. Do not treat generic
 		// `error: 400` as an HTTP status because rate-limit copy can say
@@ -8487,6 +8497,13 @@ export class AgentSession {
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return "overflow";
 		const err = message.errorMessage;
+		// Provider safety refusals (e.g. Anthropic stop_reason "refusal" /
+		// "sensitive") are deterministic for the submitted context: replaying
+		// the identical conversation re-triggers the identical refusal, so an
+		// auto-retry loop can never succeed and only re-bills the full context
+		// on every attempt (#1655). Surface immediately instead of joining the
+		// unbounded "unknown" retry class.
+		if (this.#isRefusalErrorMessage(err)) return "terminal";
 		if (isLocalModelEndpoint(this.model) && this.#isLocalProviderAvailabilityErrorMessage(err)) {
 			return "local_unavailable";
 		}
