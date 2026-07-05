@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Fixed backward jump-to-character (`ctrl+alt+]`) matching the character under the cursor when the cursor is at column 0: `lastIndexOf` clamps a negative start position to 0, so the jump stopped in place instead of skipping the cursor position and continuing into earlier lines.
 - GJC-launched psmux panes are now treated as multiplexer sessions even when they do not expose `$TMUX`, so resize and forced redraw paths repaint the live viewport instead of replaying/clearing scrollback and leaving the bottom-pinned composer area above stale blank rows.
 
 ## [0.8.0] - 2026-07-04

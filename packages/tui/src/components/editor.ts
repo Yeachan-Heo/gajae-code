@@ -2602,6 +2602,12 @@ export class Editor implements Component, Focusable {
 					: this.#state.cursorCol - 1
 				: undefined;
 
+			// Backward from column 0: lastIndexOf clamps a negative position to 0,
+			// which would match the character under the cursor instead of skipping it
+			if (!isForward && searchFrom !== undefined && searchFrom < 0) {
+				continue;
+			}
+
 			const idx = isForward ? line.indexOf(char, searchFrom) : line.lastIndexOf(char, searchFrom);
 
 			if (idx !== -1) {

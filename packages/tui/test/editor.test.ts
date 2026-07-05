@@ -2326,4 +2326,54 @@ describe("Editor component", () => {
 			expect(rendered).not.toMatch(/[\u1100-\u1112]/);
 		});
 	});
+
+	describe("Jump to character", () => {
+		it("jumps backward to an earlier occurrence on the same line", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abca");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 4 });
+
+			editor.handleInput("\x1b[93;7u"); // ctrl+alt+] - enter jump-backward mode
+			editor.handleInput("b");
+
+			expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+		});
+
+		it("jumps backward into the previous line when the cursor is at column 0", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("xa\nab");
+			editor.handleInput("\x01"); // ctrl+a - move to start of current line
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+
+			editor.handleInput("\x1b[93;7u"); // ctrl+alt+] - enter jump-backward mode
+			editor.handleInput("a"); // must skip the 'a' under the cursor
+
+			expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+		});
+
+		it("stays in place when jumping backward from column 0 with no earlier match", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("xb\nab");
+			editor.handleInput("\x01"); // ctrl+a - move to start of current line
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+
+			editor.handleInput("\x1b[93;7u"); // ctrl+alt+] - enter jump-backward mode
+			editor.handleInput("a"); // only occurrence is under the cursor - no match
+
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+		});
+
+		it("jumps forward across lines from the cursor position", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("ab\nxa");
+			editor.handleInput("\x1b[A"); // up arrow
+			editor.handleInput("\x01"); // ctrl+a - move to start of current line
+			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+
+			editor.handleInput("\x1b[93;5u"); // ctrl+] - enter jump-forward mode
+			editor.handleInput("a"); // must skip the 'a' under the cursor
+
+			expect(editor.getCursor()).toEqual({ line: 1, col: 1 });
+		});
+	});
 });
