@@ -252,7 +252,17 @@ export async function handleLifecycleRequest(
 		return { status: "error", reason: "rate_limited", message: "create rate limit exceeded" };
 	}
 
-	// 4. Preallocate ids + write in_progress (fsynced) BEFORE any spawn.
+	// 4. Close is intentionally force-only until a graceful close contract exists.
+	if (frame.type === "session_close" && frame.force !== true) {
+		await deps.audit({ ...baseAudit, event: "rejected", reason: "invalid_target" });
+		return {
+			status: "error",
+			reason: "invalid_target",
+			message: "session_close requires force=true; graceful close is not supported",
+		};
+	}
+
+	// 5. Preallocate ids + write in_progress (fsynced) BEFORE any spawn.
 	const lifecycleRequestId = frame.type === "session_create" ? frame.lifecycleRequestId : deps.newLifecycleRequestId();
 	const intendedSessionId =
 		frame.type === "session_create" ? frame.intendedSessionId || deps.newSessionId() : deps.newSessionId();
@@ -344,15 +354,18 @@ export async function handleLifecycleRequest(
 		await deps.audit({ ...baseAudit, event: "success", sessionId: resumed.sessionId });
 		return { status: "ok", entry, mode: resumed.mode };
 	} catch (err) {
-		// A side effect may have occurred; do not auto-respawn. Mark terminal
-		// uncertain so a retry reconciles instead of duplicating.
+		// A side effect may have occurred; do not repeat it automatically. Mark
+		// terminal-uncertain so a retry reconciles instead of duplicating work.
+		let reason: LifecycleErrorReason = "terminal_uncertain";
+		if (frame.type === "session_create") reason = "spawn_failed";
+		if (frame.type === "session_close") reason = "close_refused";
 		Object.assign(entry, {
 			state: "terminal_uncertain",
 			updatedAt: deps.now(),
-			reason: "spawn_failed",
+			reason,
 		});
 		await deps.store.write(doc);
-		await deps.audit({ ...baseAudit, event: "terminal_uncertain", reason: "spawn_failed" });
-		return { status: "error", reason: "terminal_uncertain", message: `lifecycle effect failed: ${String(err)}` };
+		await deps.audit({ ...baseAudit, event: "terminal_uncertain", reason });
+		return { status: "error", reason: "terminal_uncertain", message: `${frame.type} effect failed: ${String(err)}` };
 	}
 }
