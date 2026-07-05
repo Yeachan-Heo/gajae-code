@@ -1456,6 +1456,53 @@ describe("native GJC ultragoal runtime", () => {
 		expect(checkpoints).toHaveLength(0);
 	});
 
+	it("rejects a ledger repair retry when the completion receipt is missing", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		// Strip both the goal_checkpointed ledger row and the persisted completion receipt: with no
+		// durable receipt left to compare against, the repair path must fail closed instead of
+		// accepting an arbitrary replacement quality gate.
+		const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+		const withoutCheckpoint = (await Bun.file(ledgerPath).text())
+			.split("\n")
+			.filter(line => line.length > 0 && !line.includes('"goal_checkpointed"'))
+			.map(line => `${line}\n`)
+			.join("");
+		await Bun.write(ledgerPath, withoutCheckpoint);
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const goalsDoc = (await Bun.file(goalsPath).json()) as { goals: Array<Record<string, unknown>> };
+		delete goalsDoc.goals[0]?.completionVerification;
+		await Bun.write(goalsPath, JSON.stringify(goalsDoc, null, 2));
+
+		const divergentGate = JSON.parse(await passingLiveQualityGate(root)) as Record<string, Record<string, unknown>>;
+		divergentGate.executorQa = { ...divergentGate.executorQa, evidence: "executor reran a different QA suite" };
+
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "tests passed",
+				qualityGateJson: JSON.stringify(divergentGate),
+			}),
+		).rejects.toThrow("Cannot repair the G001 complete checkpoint because its durable completion receipt is missing");
+
+		const checkpoints = (await readUltragoalLedger(root)).filter(
+			event => event.event === "goal_checkpointed" && event.goalId === "G001" && event.status === "complete",
+		);
+		expect(checkpoints).toHaveLength(0);
+	});
+
 	it("completes from durable active goal state", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });

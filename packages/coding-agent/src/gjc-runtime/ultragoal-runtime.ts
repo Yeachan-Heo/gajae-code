@@ -2568,10 +2568,17 @@ export async function checkpointUltragoalGoal(input: {
 				? await readStructuredValue(input.cwd, input.qualityGateJson)
 				: undefined;
 	if (input.status === "complete" && isLedgerRepairRetry) {
-		// A ledger repair must not become a back door for rewriting the completion receipt: when the
-		// goal already carries a receipt, the resubmitted quality gate has to hash to the same value.
+		// A ledger repair must not become a back door for rewriting the completion receipt: the retry
+		// is only trusted when the goal still carries its persisted receipt and the resubmitted
+		// quality gate hashes to the receipt's value. Fail closed when the receipt is missing, since
+		// there is nothing durable left to compare the resubmitted gate against.
 		const persistedHash = goal.completionVerification?.qualityGateHash;
-		if (persistedHash !== undefined && hashStructuredValue(qualityGateJson) !== persistedHash) {
+		if (persistedHash === undefined) {
+			throw new Error(
+				`Cannot repair the ${goal.id} complete checkpoint because its durable completion receipt is missing; only checkpoints whose persisted receipt matches the resubmitted quality gate can be repaired.`,
+			);
+		}
+		if (hashStructuredValue(qualityGateJson) !== persistedHash) {
 			throw new Error(
 				`Cannot repair the ${goal.id} complete checkpoint with a different quality gate; resubmit the quality gate recorded in its completion receipt.`,
 			);
