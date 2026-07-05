@@ -1155,6 +1155,7 @@ export class TelegramNotificationDaemon {
 		commandCtx: { chatType?: string; botUsername?: string },
 	): Promise<boolean> {
 		if (!isLifecycleCommandText(text, commandCtx)) return false;
+		if (!(await this.pairedChatIsPrivate())) return true;
 		const reply = async (body: string): Promise<void> => {
 			for (const text of splitTelegramPlainText(body)) {
 				await this.botApi
@@ -1818,7 +1819,7 @@ export class TelegramNotificationDaemon {
 
 	/** Tell the user once (per daemon run) how to enable Threaded Mode. */
 	private async notifyThreadedFallback(): Promise<void> {
-		if (this.threadedFallbackNoticeSent) return;
+		if (this.threadedFallbackNoticeSent || !(await this.pairedChatIsPrivate())) return;
 		this.threadedFallbackNoticeSent = true;
 		try {
 			await this.botApi.call("sendMessage", {
@@ -2015,6 +2016,7 @@ export class TelegramNotificationDaemon {
 
 	private async sendStaleGuidance(callbackId: unknown): Promise<void> {
 		await this.answerCallbackQueryBestEffort(callbackId, "Button is stale");
+		if (!(await this.pairedChatIsPrivate())) return;
 		await this.botApi.call("sendMessage", {
 			chat_id: this.opts.chatId,
 			text: "This button is stale after notification daemon restart. Please answer locally in the GJC session or wait for a fresh notification.",
@@ -2035,12 +2037,12 @@ export class TelegramNotificationDaemon {
 			const cmdText = typeof m?.text === "string" ? m.text : undefined;
 			const commandCtx = { chatType, botUsername: this.botUsername };
 			if (m !== undefined && String(chatId) === String(this.opts.chatId)) {
+				if (chatType !== undefined && chatType !== "private" && isLifecycleCommandLikeText(cmdText)) return;
 				if (isLifecycleCommandText(cmdText, commandCtx)) {
 					const updateId = (update as { update_id?: number }).update_id;
 					const threadId = typeof m.message_thread_id === "number" ? (m.message_thread_id as number) : undefined;
 					if (await this.handleLifecycleCommand(cmdText, updateId, threadId, commandCtx)) return;
 				}
-				if (chatType !== undefined && chatType !== "private" && isLifecycleCommandLikeText(cmdText)) return;
 			}
 		}
 		// Threaded injection: a free-text message in a known topic (not a button

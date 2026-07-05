@@ -481,6 +481,35 @@ describe("telegram daemon", () => {
 		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
 	});
 
+	test("stale callbacks in non-private chats do not send guidance messages", async () => {
+		FakeWs.instances = [];
+		const bot = new FakeBotApi();
+		bot.call = (async (method: string, body: any) => {
+			bot.calls.push({ method, body });
+			if (method === "getChat") return { ok: true, result: { id: body.chat_id, type: "supergroup" } };
+			if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+			return { ok: true, result: true };
+		}) as any;
+		const agentDir = tempAgentDir();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "-10042",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("A", "ws://a", "ta");
+
+		await daemon.handleTelegramUpdate({
+			callback_query: { id: "cb", data: "missing", message: { chat: { id: -10042 } } },
+		});
+
+		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
+		expect(bot.calls.some(c => c.method === "answerCallbackQuery" && c.body.text === "Button is stale")).toBe(true);
+		expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
+	});
+
 	test("known alias with dead target is stale guidance with zero frames", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
@@ -988,8 +1017,14 @@ test("daemon registers in-thread config and lifecycle commands and drops stale r
 	expect(cmds).not.toContain("attach");
 	expect(cmds).not.toContain("detach");
 });
-test("forum lifecycle commands must target this bot username", async () => {
+test("forum lifecycle commands fail closed even when addressed to this bot username", async () => {
 	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { id: body.chat_id, type: "supergroup" } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
 	const daemon = new TelegramNotificationDaemon({
 		settings: settings(tempAgentDir()),
 		ownerId: "owner",
@@ -1007,15 +1042,13 @@ test("forum lifecycle commands must target this bot username", async () => {
 		update_id: 102,
 		message: { chat: { id: -10042, type: "supergroup" }, text: "/session_recent@OtherBot", message_id: 2 },
 	});
-	expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
-
 	await daemon.handleTelegramUpdate({
 		update_id: 103,
 		message: { chat: { id: -10042, type: "supergroup" }, text: "/session_recent@GajaeCodeBot", message_id: 3 },
 	});
-	const sends = bot.calls.filter(c => c.method === "sendMessage");
-	expect(sends).toHaveLength(1);
-	expect(String(sends[0]!.body.text)).toContain("No recent sessions.");
+
+	expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
+	expect(bot.calls.filter(c => c.method === "getChat")).toHaveLength(0);
 });
 
 test("forum lifecycle commands fail closed when bot username is unavailable", async () => {
