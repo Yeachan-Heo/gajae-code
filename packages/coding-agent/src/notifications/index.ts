@@ -360,6 +360,8 @@ interface ResolvedSettings {
 	settingsAvailable: boolean;
 }
 
+const TELEGRAM_FILE_REDACTION_ERROR = "Telegram file attachments are disabled while notifications redaction is on.";
+
 const defaultConfig: NotificationConfig = {
 	enabled: false,
 	botToken: undefined,
@@ -675,6 +677,10 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 				tag,
 			);
 			const disposeFileSink = registerTelegramFileSink(id, async file => {
+				if (runtime?.redact ?? redact) {
+					return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
+				}
+
 				try {
 					const data = await fs.promises.readFile(file.path);
 					server.pushFrame(
@@ -898,6 +904,10 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 			rt.sessionTag,
 		);
 		rt.disposeFileSink = registerTelegramFileSink(newId, async file => {
+			if (rt.redact) {
+				return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
+			}
+
 			try {
 				const data = await fs.promises.readFile(file.path);
 				rt.server.pushFrame(

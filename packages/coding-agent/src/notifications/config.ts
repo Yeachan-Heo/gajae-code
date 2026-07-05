@@ -119,7 +119,8 @@ export interface RedactableAction {
  * When redact is false, return the action unchanged.
  *
  * Redaction still applies to streamed content frames (turn_stream, context_update,
- * image_attachment) which are suppressed at their emit sites, not here.
+ * image_attachment) which are suppressed at their emit sites, not here. Explicit
+ * `telegram_send` file attachments are rejected before the file is read or forwarded.
  */
 export function buildRedactedAction(
 	action: RedactableAction,
