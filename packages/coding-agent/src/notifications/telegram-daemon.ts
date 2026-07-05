@@ -126,6 +126,7 @@ const TYPING_REFRESH_INTERVAL_MS = 4_000;
 // messages: queued on receipt, consumed once a turn picks the message up.
 const QUEUED_REACTION = "👀";
 const PENDING_TOPIC_FRAME_LIMIT = 20;
+const SEEN_UPDATE_ID_LIMIT = 1_000;
 const CONSUMED_REACTION = "✅";
 
 function splitTelegramPlainText(text: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
@@ -1187,7 +1188,7 @@ export class TelegramNotificationDaemon {
 			return true;
 		}
 		if (updateId !== undefined && this.dispatchState.seenUpdateIds.has(updateId)) return true;
-		if (updateId !== undefined) this.dispatchState.seenUpdateIds.add(updateId);
+		if (updateId !== undefined) await this.rememberSeenUpdateId(updateId);
 
 		if (parsed.kind === "usage" || parsed.kind === "reject") {
 			await reply(parsed.message);
@@ -1332,6 +1333,51 @@ export class TelegramNotificationDaemon {
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
 		await ensureDir(this.fsImpl, paths.dir);
 		await writeJsonAtomic(this.fsImpl, paths.aliases, this.aliasTable.serialize());
+	}
+
+	async loadSeenUpdateIds(): Promise<void> {
+		const raw = await readJson<{ updateIds?: unknown }>(
+			this.fsImpl,
+			daemonPaths(this.opts.settings.getAgentDir()).seenUpdates,
+		);
+		this.dispatchState.seenUpdateIds.clear();
+		const updateIds = Array.isArray(raw?.updateIds) ? raw.updateIds : [];
+		for (const updateId of updateIds) {
+			if (Number.isSafeInteger(updateId) && Number(updateId) >= 0) {
+				this.dispatchState.seenUpdateIds.add(Number(updateId));
+			}
+		}
+		this.pruneSeenUpdateIds();
+	}
+
+	async persistSeenUpdateIds(): Promise<void> {
+		const paths = daemonPaths(this.opts.settings.getAgentDir());
+		await ensureDir(this.fsImpl, paths.dir);
+		await writeJsonAtomic(this.fsImpl, paths.seenUpdates, {
+			version: 1,
+			updateIds: [...this.dispatchState.seenUpdateIds].slice(-SEEN_UPDATE_ID_LIMIT),
+		});
+	}
+
+	private pruneSeenUpdateIds(): void {
+		let extra = this.dispatchState.seenUpdateIds.size - SEEN_UPDATE_ID_LIMIT;
+		if (extra <= 0) return;
+		for (const updateId of this.dispatchState.seenUpdateIds) {
+			this.dispatchState.seenUpdateIds.delete(updateId);
+			extra -= 1;
+			if (extra <= 0) break;
+		}
+	}
+
+	private async rememberSeenUpdateId(updateId: number): Promise<void> {
+		if (!Number.isSafeInteger(updateId) || updateId < 0) return;
+		this.dispatchState.seenUpdateIds.add(updateId);
+		this.pruneSeenUpdateIds();
+		try {
+			await this.persistSeenUpdateIds();
+		} catch (err) {
+			logger.warn(`notifications: failed to persist Telegram update id ${updateId}: ${String(err)}`);
+		}
 	}
 
 	async scanRoots(): Promise<void> {
@@ -2080,7 +2126,6 @@ export class TelegramNotificationDaemon {
 			});
 			if (inbound.kind === "duplicate") return;
 			if (inbound.kind === "inject") {
-				this.dispatchState.seenUpdateIds.add(inbound.updateId);
 				const session = this.sessions.get(inbound.sessionId);
 				if (session?.ws.readyState === WebSocket.OPEN) {
 					const attachmentResult = inbound.attachment
@@ -2105,6 +2150,7 @@ export class TelegramNotificationDaemon {
 								token: session.token,
 							}),
 						);
+						await this.rememberSeenUpdateId(inbound.updateId);
 						if (inbound.messageId !== undefined) await this.setReaction(inbound.messageId, QUEUED_REACTION);
 						return;
 					}
@@ -2123,6 +2169,7 @@ export class TelegramNotificationDaemon {
 									},
 						),
 					);
+					await this.rememberSeenUpdateId(inbound.updateId);
 					// User turns get a native delivery double-check: queued on receipt,
 					// flipped to consumed when the session acks the turn that picks it
 					// up. Config commands are not user turns and get no reaction.
@@ -2196,6 +2243,7 @@ export class TelegramNotificationDaemon {
 			await this.registerBotCommands();
 			await this.loadAliases();
 			await this.loadTopics();
+			await this.loadSeenUpdateIds();
 			await this.runScan();
 			// Owner-only: start the session-lifecycle control server now that
 			// ownership is confirmed (singleton-safe). Best-effort; degrades.
@@ -2256,6 +2304,7 @@ export class TelegramNotificationDaemon {
 			// (e.g. after reload) reloads aliases/topics seamlessly.
 			await this.persistAliases().catch(() => undefined);
 			await this.persistTopics().catch(() => undefined);
+			await this.persistSeenUpdateIds().catch(() => undefined);
 			await this.opts.control?.clear?.(this.opts.ownerId).catch(() => undefined);
 			await releaseDaemonOwnership({
 				settings: this.opts.settings,
