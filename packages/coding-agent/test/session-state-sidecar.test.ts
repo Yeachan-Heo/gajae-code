@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
+import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -211,6 +212,52 @@ describe("coordinator runtime state sidecar", () => {
 			recovery: { action: "recover_or_resume_session" },
 		});
 		expect(await Bun.file(path.join(workspace, "README.md")).text()).toContain("recoverable dirty change");
+		expect(payload).not.toHaveProperty("messages");
+		expect(payload).not.toHaveProperty("transcript");
+		expect(payload).not.toHaveProperty("paneLog");
+	});
+
+	it("persists raw session runtime state without coordinator env", async () => {
+		const root = await tempRoot();
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		const sessionId = "raw-tmux-session";
+		const stateFile = path.join(sessionRuntimeDir(root, sessionId), "runtime-state.json");
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId, cwd: root, sessionFile: null },
+		);
+		const running = JSON.parse(await Bun.file(stateFile).text());
+		expect(running).toMatchObject({
+			session_id: sessionId,
+			state: "running",
+			source: "agent_session_event",
+			event: "turn_start",
+		});
+
+		const previousExitCode = process.exitCode;
+		process.exitCode = 0;
+		try {
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+				sessionId,
+				cwd: root,
+				sessionFile: null,
+			});
+		} finally {
+			process.exitCode = previousExitCode;
+		}
+
+		const payload = JSON.parse(await Bun.file(stateFile).text());
+		expect(payload).toMatchObject({
+			session_id: sessionId,
+			state: "errored",
+			source: "process_postmortem",
+			reason: "process_exit_before_terminal_state",
+			exit_code: 0,
+			previous_runtime_state: "running",
+			error: { code: "process_exit_before_terminal_state", recoverable: true },
+		});
 		expect(payload).not.toHaveProperty("messages");
 		expect(payload).not.toHaveProperty("transcript");
 		expect(payload).not.toHaveProperty("paneLog");

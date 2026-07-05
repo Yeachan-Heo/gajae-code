@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { logger, postmortem } from "@gajae-code/utils";
+import { sessionRuntimeDir } from "./session-layout";
 
 export const GJC_COORDINATOR_SESSION_STATE_FILE_ENV = "GJC_COORDINATOR_SESSION_STATE_FILE";
 export const GJC_COORDINATOR_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
@@ -148,6 +149,12 @@ function shouldPreserveTerminalPayload(previous: RuntimeStateSidecarPayload): bo
 	return source === "agent_end" || source === "launch_error";
 }
 
+function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
+	const explicit = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	if (explicit) return explicit;
+	if (!context.sessionId.trim()) return null;
+	return path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json");
+}
 function branchForContext(context: RuntimeStateContext): string | null {
 	return context.branch ?? (process.env[GJC_COORDINATOR_SESSION_BRANCH_ENV]?.trim() || null);
 }
@@ -160,10 +167,11 @@ function basePayload(input: {
 	source: string;
 	event: string;
 	reason: string | null;
+	sessionId: string;
 }): Record<string, unknown> {
 	return {
 		schema_version: 1,
-		session_id: process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || input.context.sessionId,
+		session_id: input.sessionId,
 		state: input.state,
 		ready_for_input: input.state === "completed" || input.state === "ready_for_input",
 		updated_at: input.now,
@@ -272,15 +280,27 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	event: RuntimeStateEvent,
 	context: RuntimeStateContext,
 ): Promise<void> {
-	const stateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
 	const state = stateForEvent(event);
 	if (!state) return;
 	const now = new Date().toISOString();
 	const previous = readPreviousPayload(stateFile);
 	const finalResponse = finalResponseForEvent(event);
+	const sessionId = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim()
+		? process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId
+		: context.sessionId;
 	const payload = {
-		...basePayload({ context, previous, state, now, source: "agent_session_event", event: event.type, reason: null }),
+		...basePayload({
+			context,
+			previous,
+			state,
+			now,
+			source: "agent_session_event",
+			event: event.type,
+			reason: null,
+			sessionId,
+		}),
 		...(state === "completed" || state === "errored" ? { ended_at: now } : {}),
 		...(finalResponse ? { final_response: finalResponse } : {}),
 		...(state === "errored"
@@ -304,12 +324,15 @@ export function persistCoordinatorRuntimeStateFromPostmortem(
 	reason: postmortem.Reason,
 	context: RuntimeStateContext,
 ): void {
-	const stateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
 	const previous = readPreviousPayload(stateFile);
 	if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload)) return;
 	const now = new Date().toISOString();
 	const details = postmortemExitDetails(reason, previous as RuntimeStateSidecarPayload);
+	const sessionId = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim()
+		? process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId
+		: context.sessionId;
 	const payload = {
 		...basePayload({
 			context,
@@ -319,6 +342,7 @@ export function persistCoordinatorRuntimeStateFromPostmortem(
 			source: "process_postmortem",
 			event: "process_exit",
 			reason: details.reason,
+			sessionId,
 		}),
 		ended_at: now,
 		detected_at: now,
@@ -337,7 +361,7 @@ export function persistCoordinatorRuntimeStateFromPostmortem(
 }
 
 export function registerCoordinatorRuntimeStateFinalizer(context: RuntimeStateContext): () => void {
-	if (!process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim()) return () => {};
+	if (!runtimeStateFileForContext(context)) return () => {};
 	return postmortem.register("coordinator-runtime-state", reason => {
 		persistCoordinatorRuntimeStateFromPostmortem(reason, context);
 	});
