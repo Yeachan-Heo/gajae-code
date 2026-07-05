@@ -2554,7 +2554,12 @@ export async function checkpointUltragoalGoal(input: {
 		// instead of silently dropping it.
 		return plan;
 	}
-	if (input.status === "complete") validateCompleteCheckpointTargetGoal(goal);
+	// A same-status, same-evidence retry only reaches this point when the matching goal_checkpointed
+	// ledger row is missing (plan persisted, ledger append lost). Skip the pre-status validation so
+	// the retry can repair the ledger as the guard above documents, instead of rejecting the goal as
+	// already complete.
+	const isLedgerRepairRetry = goal.status === input.status && goal.evidence === evidence;
+	if (input.status === "complete" && !isLedgerRepairRetry) validateCompleteCheckpointTargetGoal(goal);
 	const changeSet = input.status === "complete" ? await computeCheckpointChangeSet(input.cwd) : undefined;
 	const qualityGateJson =
 		input.status === "complete"

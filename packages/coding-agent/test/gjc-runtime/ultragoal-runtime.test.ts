@@ -1366,6 +1366,53 @@ describe("native GJC ultragoal runtime", () => {
 		expect(await countCheckpoints()).toBe(2);
 	});
 
+	it("re-appends a missing complete checkpoint ledger row on an identical retry", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		// Simulate a crash between the plan write and the ledger append: goals.json already says
+		// complete, but the goal_checkpointed row never made it into the ledger.
+		const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+		const withoutCheckpoint = (await Bun.file(ledgerPath).text())
+			.split("\n")
+			.filter(line => line.length > 0 && !line.includes('"goal_checkpointed"'))
+			.map(line => `${line}\n`)
+			.join("");
+		await Bun.write(ledgerPath, withoutCheckpoint);
+
+		// Retrying the identical checkpoint must repair the missing ledger row instead of rejecting
+		// the goal as already complete.
+		const plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		const checkpoints = (await readUltragoalLedger(root)).filter(
+			event => event.event === "goal_checkpointed" && event.goalId === "G001" && event.status === "complete",
+		);
+		expect(checkpoints).toHaveLength(1);
+		expect(plan.goals[0]?.status).toBe("complete");
+		const diagnostic = validateCompletionReceipt({
+			plan,
+			ledger: await readUltragoalLedger(root),
+			goal: plan.goals[0]!,
+			receiptKind: "final-aggregate",
+		});
+		expect(diagnostic.state).toBe("active_verified_complete");
+	});
+
 	it("completes from durable active goal state", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
