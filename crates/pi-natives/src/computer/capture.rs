@@ -109,6 +109,8 @@ impl fmt::Display for CaptureError {
 impl std::error::Error for CaptureError {}
 
 static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
+const JS_SAFE_INTEGER_BITS: u32 = 53;
+const DISPLAY_EPOCH_MASK: u64 = (1_u64 << JS_SAFE_INTEGER_BITS) - 1;
 
 /// A captured primary-display frame.
 pub struct CapturedFrame {
@@ -260,7 +262,10 @@ fn display_epoch(display: &NormalizedDisplay) -> u64 {
 	display.scale_y.to_bits().hash(&mut hasher);
 	display.origin_x.to_bits().hash(&mut hasher);
 	display.origin_y.to_bits().hash(&mut hasher);
-	hasher.finish()
+	// The N-API surface transports display epochs as JavaScript numbers. Keep the
+	// hash within the 53-bit safe-integer range so screenshot -> action roundtrips
+	// exactly and the stale-display gate can compare epochs without false rejects.
+	hasher.finish() & DISPLAY_EPOCH_MASK
 }
 
 fn next_capture_id() -> u32 {
@@ -280,7 +285,16 @@ fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CaptureEr
 
 #[cfg(test)]
 mod tests {
-	use super::capture_primary_display;
+	use super::{capture_primary_display, display_epoch};
+	use crate::computer::coords::NormalizedDisplay;
+
+	#[test]
+	fn display_epoch_roundtrips_through_javascript_number() {
+		let display = NormalizedDisplay::new(3024, 1964, 2.0, 2.0, -1728.0, 0.0);
+		let epoch = display_epoch(&display);
+
+		assert_eq!((epoch as f64) as u64, epoch);
+	}
 
 	/// Exercises the real OS capture path, so it is ignored by default and run
 	/// explicitly (`cargo test -p pi-natives --ignored`) on a macOS host with

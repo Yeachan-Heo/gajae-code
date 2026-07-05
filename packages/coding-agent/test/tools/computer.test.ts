@@ -258,7 +258,7 @@ describe("computer tool dispatch", () => {
 		setComputerControllerFactoryForTests(() => ({
 			screenshot: () => {
 				calls.push({ method: "screenshot", args: [] });
-				return { widthPx: 20, heightPx: 10, png: new Uint8Array([1, 2, 3]), captureId: "cap-1" };
+				return { widthPx: 20, heightPx: 10, png: new Uint8Array([1, 2, 3]), displayEpoch: 42, captureId: "cap-1" };
 			},
 			doubleClick: (...args) => {
 				calls.push({ method: "doubleClick", args });
@@ -278,7 +278,13 @@ describe("computer tool dispatch", () => {
 		await tool.execute("drag", { action: "drag", x: 1, y: 2, to_x: 3, to_y: 4 });
 		await tool.execute("scroll", { action: "scroll", x: 1, y: 2, scroll_x: 5, scroll_y: -6 });
 
-		expect(shot.details?.screenshot).toMatchObject({ widthPx: 20, heightPx: 10, pngBytes: 3, captureId: "cap-1" });
+		expect(shot.details?.screenshot).toMatchObject({
+			widthPx: 20,
+			heightPx: 10,
+			displayEpoch: 42,
+			pngBytes: 3,
+			captureId: "cap-1",
+		});
 		expect(shot.content.some(block => block.type === "image")).toBe(true);
 		const image = shot.content.find(block => block.type === "image");
 		expect(image).toMatchObject({ type: "image", mimeType: "image/png", data: "AQID" });
@@ -286,9 +292,26 @@ describe("computer tool dispatch", () => {
 		expect(await fs.stat(shot.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
 		expect(calls.map(call => call.method)).toEqual(["screenshot", "doubleClick", "drag", "scroll"]);
 		// Positional native ABI: (expectedEpoch, x, y, ...rest)
-		expect(calls[1].args).toEqual([undefined, 1, 2, "right"]);
-		expect(calls[2].args).toEqual([undefined, 1, 2, 3, 4, "left"]);
-		expect(calls[3].args).toEqual([undefined, 1, 2, 5, -6]);
+		expect(calls[1].args).toEqual([42, 1, 2, "right"]);
+		expect(calls[2].args).toEqual([42, 1, 2, 3, 4, "left"]);
+		expect(calls[3].args).toEqual([42, 1, 2, 5, -6]);
+	});
+
+	it("does not invent a display epoch before any screenshot context exists", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: Array<{ method: string; args: unknown[] }> = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: (...args) => {
+				calls.push({ method: "click", args });
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("click", { action: "click", x: 1, y: 2 });
+
+		expect(result.isError).not.toBe(true);
+		expect(calls).toEqual([{ method: "click", args: [undefined, 1, 2, "left"] }]);
 	});
 
 	it("bounds oversized screenshot images sent inline while preserving the full-resolution artifact", async () => {
@@ -396,7 +419,7 @@ describe("computer tool dispatch", () => {
 		setComputerControllerFactoryForTests(() => ({
 			screenshot: () => {
 				calls.push({ method: "screenshot", args: [] });
-				return { widthPx: 100, heightPx: 50, png: new Uint8Array([1, 2, 3]) };
+				return { widthPx: 100, heightPx: 50, png: new Uint8Array([1, 2, 3]), displayEpoch: 99 };
 			},
 			click: (...args) => {
 				calls.push({ method: "click", args });
@@ -423,6 +446,45 @@ describe("computer tool dispatch", () => {
 		expect(result.details?.screenshot?.path).toBeTruthy();
 		expect(await fs.stat(result.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
 		expect(calls.map(call => call.method)).toEqual(["screenshot", "click", "type"]);
+		expect(calls[1].args).toEqual([99, 10, 20, "left"]);
+		expect(calls[2].args).toEqual([undefined, "hello"]);
+	});
+
+	it("stops batch when native reports a stale display", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: Array<{ method: string; args: unknown[] }> = [];
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => {
+				calls.push({ method: "screenshot", args: [] });
+				return { widthPx: 100, heightPx: 50, png: new Uint8Array([1, 2, 3]), displayEpoch: 123 };
+			},
+			click: (...args) => {
+				calls.push({ method: "click", args });
+				const error = new Error("COMPUTER_DISPLAY_STALE: display epoch changed") as Error & {
+					code: string;
+				};
+				error.code = "GenericFailure";
+				throw error;
+			},
+			type: (...args) => {
+				calls.push({ method: "type", args });
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("batch", {
+			action: "batch",
+			actions: [{ action: "screenshot" }, { action: "click", x: 10, y: 20 }, { action: "type", text: "skipped" }],
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.steps).toHaveLength(2);
+		expect(result.details?.steps?.[0]?.status).toBe("success");
+		expect(result.details?.steps?.[1]?.code).toBe("COMPUTER_DISPLAY_STALE");
+		expect(result.details?.code).toBe("COMPUTER_DISPLAY_STALE");
+		expect(calls.map(call => call.method)).toEqual(["screenshot", "click"]);
+		expect(calls[1].args).toEqual([123, 10, 20, "left"]);
 	});
 
 	it("stops batch execution on first failure and reports the failing step", async () => {

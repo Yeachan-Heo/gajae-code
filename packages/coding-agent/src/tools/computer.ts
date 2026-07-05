@@ -98,7 +98,7 @@ export interface ComputerScreenshotDetails {
 	scaleY?: number;
 	originX?: number;
 	originY?: number;
-	displayEpoch?: string;
+	displayEpoch?: number;
 	captureId?: string;
 	pngBytes?: number;
 	path?: string;
@@ -144,7 +144,7 @@ type NativeScreenshot = {
 	scaleY?: number;
 	originX?: number;
 	originY?: number;
-	displayEpoch?: string;
+	displayEpoch?: number;
 	captureId?: string;
 };
 
@@ -175,6 +175,7 @@ let controllerFactory: ComputerControllerFactory = createNativeComputerControlle
 let platformOverrideForTests: NodeJS.Platform | undefined;
 let archOverrideForTests: NodeJS.Architecture | undefined;
 const screenshotFallbackDirs = new WeakMap<ToolSession, Promise<string>>();
+const latestScreenshotContexts = new WeakMap<ToolSession, ScreenshotContext>();
 
 const COMPUTER_INLINE_SCREENSHOT_MAX_WIDTH = 1568;
 const COMPUTER_INLINE_SCREENSHOT_MAX_HEIGHT = 1568;
@@ -278,9 +279,18 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 			// Native ComputerController methods are synchronous and accept no AbortSignal,
 			// so cancellation is honored before dispatch and wait() is bounded by timeoutMs.
 			if (params.action === "batch") {
-				const batchResult = await dispatchBatchComputerActions(controller, params.actions, timeoutMs, hotkey);
+				const batchResult = await dispatchBatchComputerActions(
+					controller,
+					params.actions,
+					timeoutMs,
+					hotkey,
+					latestScreenshotContexts.get(this.session),
+				);
 				details.steps = batchResult.steps;
-				if (batchResult.screenshot) details.screenshot = batchResult.screenshot;
+				if (batchResult.screenshot) {
+					details.screenshot = batchResult.screenshot;
+					rememberLatestScreenshot(this.session, batchResult.screenshot);
+				}
 				details.status = batchResult.failedStep ? "error" : "success";
 				if (batchResult.failedStep) {
 					details.code = batchResult.failedStep.code;
@@ -307,9 +317,17 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 							.done()
 					: toolResult(details).text(details.message).done();
 			}
-			const result = await dispatchComputerAction(controller, params, timeoutMs);
+			const result = await dispatchComputerAction(
+				controller,
+				params,
+				timeoutMs,
+				latestScreenshotContexts.get(this.session),
+			);
 			const screenshot = normalizeScreenshot(result);
-			if (screenshot) details.screenshot = screenshot;
+			if (screenshot) {
+				details.screenshot = screenshot;
+				rememberLatestScreenshot(this.session, screenshot);
+			}
 			details.status = "success";
 			details.message = describeComputerSuccess(details);
 			if (screenshot) {
@@ -342,6 +360,10 @@ interface CoordinateBounds {
 	originY?: number;
 }
 
+interface ScreenshotContext extends CoordinateBounds {
+	displayEpoch?: number;
+}
+
 function validatePointerCoordinates(action: string, x: number, y: number, bounds: CoordinateBounds | undefined): void {
 	if (!bounds) return;
 	const minX = bounds.originX ?? 0;
@@ -355,33 +377,50 @@ function validatePointerCoordinates(action: string, x: number, y: number, bounds
 	}
 }
 
+function expectedEpochFromContext(context: ScreenshotContext | undefined): number | undefined {
+	return typeof context?.displayEpoch === "number" &&
+		Number.isFinite(context.displayEpoch) &&
+		context.displayEpoch >= 0
+		? context.displayEpoch
+		: undefined;
+}
+
+function rememberLatestScreenshot(session: ToolSession, screenshot: ComputerScreenshotDetails): void {
+	latestScreenshotContexts.set(session, {
+		widthPx: screenshot.widthPx,
+		heightPx: screenshot.heightPx,
+		originX: screenshot.originX,
+		originY: screenshot.originY,
+		displayEpoch: screenshot.displayEpoch,
+	});
+}
+
 function dispatchComputerAction(
 	controller: NativeController,
 	params: SingleComputerParams,
 	timeoutMs: number | undefined,
-	bounds?: CoordinateBounds,
+	context?: ScreenshotContext,
 ): Promise<unknown> | unknown {
-	// expectedEpoch is undefined until lossless epoch transport lands (follow-up):
-	// the native gate skips the stale-display check when the epoch is absent.
+	const expectedEpoch = expectedEpochFromContext(context);
 	switch (params.action) {
 		case "screenshot":
 			return controller.screenshot?.();
 		case "click":
-			validatePointerCoordinates("click", params.x, params.y, bounds);
-			return controller.click?.(undefined, params.x, params.y, params.button ?? "left");
+			validatePointerCoordinates("click", params.x, params.y, context);
+			return controller.click?.(expectedEpoch, params.x, params.y, params.button ?? "left");
 		case "double_click":
-			validatePointerCoordinates("double_click", params.x, params.y, bounds);
-			return controller.doubleClick?.(undefined, params.x, params.y, params.button ?? "left");
+			validatePointerCoordinates("double_click", params.x, params.y, context);
+			return controller.doubleClick?.(expectedEpoch, params.x, params.y, params.button ?? "left");
 		case "move":
-			validatePointerCoordinates("move", params.x, params.y, bounds);
-			return controller.move?.(undefined, params.x, params.y);
+			validatePointerCoordinates("move", params.x, params.y, context);
+			return controller.move?.(expectedEpoch, params.x, params.y);
 		case "drag":
-			validatePointerCoordinates("drag start", params.x, params.y, bounds);
-			validatePointerCoordinates("drag end", params.to_x, params.to_y, bounds);
-			return controller.drag?.(undefined, params.x, params.y, params.to_x, params.to_y, params.button ?? "left");
+			validatePointerCoordinates("drag start", params.x, params.y, context);
+			validatePointerCoordinates("drag end", params.to_x, params.to_y, context);
+			return controller.drag?.(expectedEpoch, params.x, params.y, params.to_x, params.to_y, params.button ?? "left");
 		case "scroll":
-			validatePointerCoordinates("scroll", params.x, params.y, bounds);
-			return controller.scroll?.(undefined, params.x, params.y, params.scroll_x, params.scroll_y);
+			validatePointerCoordinates("scroll", params.x, params.y, context);
+			return controller.scroll?.(expectedEpoch, params.x, params.y, params.scroll_x, params.scroll_y);
 		case "type":
 			return controller.type?.(undefined, params.text);
 		case "keypress":
@@ -403,21 +442,22 @@ async function dispatchBatchComputerActions(
 	actions: readonly SingleComputerParams[],
 	timeoutMs: number | undefined,
 	hotkey?: string,
+	initialContext?: ScreenshotContext,
 ): Promise<BatchDispatchResult> {
 	const steps: ComputerToolDetails[] = [];
 	let lastScreenshot: ComputerScreenshotDetails | undefined;
 	let lastScreenshotSource: unknown;
-	let bounds: CoordinateBounds | undefined;
+	let context = initialContext;
 	for (const single of actions) {
 		const stepDetails = detailsFromParams(single);
 		try {
-			const result = await dispatchComputerAction(controller, single, timeoutMs, bounds);
+			const result = await dispatchComputerAction(controller, single, timeoutMs, context);
 			const screenshot = normalizeScreenshot(result);
 			if (screenshot) {
 				stepDetails.screenshot = screenshot;
 				lastScreenshot = screenshot;
 				lastScreenshotSource = result;
-				bounds = screenshot;
+				context = screenshot;
 			}
 			stepDetails.status = "success";
 			stepDetails.message = describeComputerSuccess(stepDetails);
@@ -476,10 +516,14 @@ function normalizeScreenshot(value: unknown): ComputerScreenshotDetails | undefi
 		scaleY: shot.scaleY,
 		originX: shot.originX,
 		originY: shot.originY,
-		displayEpoch: shot.displayEpoch,
+		displayEpoch: normalizeDisplayEpoch(shot.displayEpoch),
 		captureId: shot.captureId,
 		pngBytes: getPngByteLength(shot.png),
 	};
+}
+
+function normalizeDisplayEpoch(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 function fullResolutionImageContentFromNativeResult(value: unknown): ImageContent | undefined {
