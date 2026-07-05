@@ -93,6 +93,16 @@ class FakeBotApi {
 	}
 }
 
+class FailingCallbackAckBotApi extends FakeBotApi {
+	override async call(method: string, body: unknown): Promise<unknown> {
+		if (method === "answerCallbackQuery") {
+			this.calls.push({ method, body });
+			throw new Error("callback ack failed");
+		}
+		return super.call(method, body);
+	}
+}
+
 describe("telegram daemon", () => {
 	test("N concurrent ensureTelegramDaemonRunning creates exactly one owner", async () => {
 		const agentDir = tempAgentDir();
@@ -365,6 +375,40 @@ describe("telegram daemon", () => {
 		});
 		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
 		expect(JSON.parse(FakeWs.instances[1]!.sent[0]!)).toEqual({ type: "reply", id: "askB", answer: 0, token: "tb" });
+		expect(bot.calls.some(c => c.method === "answerCallbackQuery")).toBe(true);
+	});
+
+	test("callback alias reply is delivered when Telegram callback ack fails", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FailingCallbackAckBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Q",
+			options: ["Y"],
+		});
+		const alias = bot.calls.find(c => c.method === "sendMessage")!.body.reply_markup.inline_keyboard[0][0]
+			.callback_data;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 1,
+			callback_query: { id: "cb", data: alias, message: { chat: { id: 42 } } },
+		});
+
+		expect(JSON.parse(FakeWs.instances[0]!.sent[0]!)).toEqual({ type: "reply", id: "ask", answer: 0, token: "ts" });
+		expect(bot.calls.some(c => c.method === "answerCallbackQuery")).toBe(true);
 	});
 
 	test("unknown and expired aliases are stale guidance with zero frames", async () => {
