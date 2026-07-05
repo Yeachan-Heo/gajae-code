@@ -5,6 +5,7 @@ import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/them
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
+import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import * as sshConfig from "../src/ssh/config-writer";
 
 interface FakeAcpBuiltinSession {
@@ -409,13 +410,14 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).not.toContain("Quick");
 	});
 
-	it("model: returns ACP usage message when args provided", async () => {
+	it("model: returns model usage message when args cannot resolve", async () => {
 		const { output, runtime } = createRuntime();
 
 		const result = await executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(output[0]?.toLowerCase()).toContain("acp");
+		expect(output[0]).toContain("Unknown model: claude-3-5-sonnet");
+		expect(output[0]).toContain("/model <target> <model[:effort]>");
 	});
 
 	it("model: applies known id and emits both title + config change notifications", async () => {
@@ -535,6 +537,33 @@ describe("ACP builtin slash commands", () => {
 		});
 	});
 
+	it("model: updates the live role-agent override when a runtime profile is active", async () => {
+		const { runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
+		runtime.settings.set("task.agentModelOverrides", {
+			executor: "anthropic/persisted-executor:low",
+		});
+		runtime.settings.override("task.agentModelOverrides", {
+			executor: "anthropic/profile-executor:high",
+			planner: "anthropic/profile-planner:low",
+		});
+
+		const result = await executeAcpBuiltinSlashCommand("/model planner anthropic/claude-3-5-sonnet:high", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/profile-executor:high",
+			planner: "anthropic/claude-3-5-sonnet:high",
+		});
+
+		runtime.settings.clearOverride("task.agentModelOverrides");
+
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/persisted-executor:low",
+			planner: "anthropic/claude-3-5-sonnet:high",
+		});
+	});
+
 	it("model: preserves canonical selectors for text role-agent assignments", async () => {
 		const { output, runtime, session } = createRuntime();
 		const available = [{ provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 }];
@@ -549,6 +578,44 @@ describe("ACP builtin slash commands", () => {
 			executor: "claude-sonnet:low",
 		});
 		expect(output[0]).toContain("executor agent model set to claude-sonnet:low");
+	});
+
+	it("model: TUI args assign a role-agent target instead of reopening the selector", async () => {
+		const { runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
+
+		const statuses: string[] = [];
+		let configNotified = 0;
+		const showModelSelector = spyOn({ showModelSelector() {} }, "showModelSelector");
+		const ctx = {
+			session: runtime.session,
+			sessionManager: runtime.sessionManager,
+			settings: runtime.settings,
+			showStatus: (text: string) => statuses.push(text),
+			showError: (_text: string) => {},
+			showModelSelector,
+			editor: { setText: spyOn({ setText(_text: string) {} }, "setText") },
+			statusLine: { invalidate: spyOn({ invalidate() {} }, "invalidate") },
+			updateEditorBorderColor: spyOn({ updateEditorBorderColor() {} }, "updateEditorBorderColor"),
+			ui: { requestRender: spyOn({ requestRender() {} }, "requestRender") },
+			refreshSlashCommandState: async () => {},
+			notifyConfigChanged: () => {
+				configNotified++;
+			},
+		};
+
+		const result = await executeBuiltinSlashCommand("/model executor anthropic/claude-3-5-sonnet:low", {
+			ctx: ctx as never,
+			handleBackgroundCommand: () => {},
+		});
+
+		expect(result).toBe(true);
+		expect(showModelSelector).not.toHaveBeenCalled();
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/claude-3-5-sonnet:low",
+		});
+		expect(statuses[0]).toContain("executor agent model set to anthropic/claude-3-5-sonnet:low");
+		expect(configNotified).toBe(1);
 	});
 
 	it("model: does not emit config change when id is unknown", async () => {

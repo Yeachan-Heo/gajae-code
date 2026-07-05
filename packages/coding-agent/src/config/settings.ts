@@ -475,6 +475,28 @@ export class Settings {
 			this.override("modelRoles", { ...shallowStringRecord(runtimeOverrides), [role]: modelId });
 		}
 	}
+	/**
+	 * Set an agent model override while keeping any live runtime override aligned.
+	 *
+	 * Runtime model profiles override `task.agentModelOverrides` for the current
+	 * session. A user-selected role assignment must win immediately in that same
+	 * session, but only the explicit agent change should be persisted.
+	 */
+	setAgentModelOverride(agentName: string, modelId: string): void {
+		const current = shallowStringRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
+		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
+		const updateRuntimeOverride =
+			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
+
+		this.set("task.agentModelOverrides", { ...current, [agentName]: modelId });
+
+		if (updateRuntimeOverride) {
+			this.override("task.agentModelOverrides", {
+				...shallowStringRecord(runtimeOverrides),
+				[agentName]: modelId,
+			});
+		}
+	}
 
 	/**
 	 * Get a model role (helper for modelRoles record).

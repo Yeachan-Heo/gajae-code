@@ -907,8 +907,7 @@ export class SelectorController {
 								if (target.settingsPath === "modelRoles") {
 									this.ctx.settings.setModelRole(role, value);
 								} else {
-									const overrides = this.ctx.settings.get("task.agentModelOverrides");
-									this.ctx.settings.set("task.agentModelOverrides", { ...overrides, [role]: value });
+									this.ctx.settings.setAgentModelOverride(role, value);
 								}
 							}
 							modelSelector.refreshRoleAssignments({
@@ -918,6 +917,9 @@ export class SelectorController {
 									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
 							});
 							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+							this.ctx.statusLine.invalidate();
+							this.ctx.updateEditorBorderColor();
+							await this.ctx.notifyConfigChanged?.();
 							this.ctx.showStatus(`${role} agent model: ${value}`);
 							done();
 							this.ctx.ui.requestRender();

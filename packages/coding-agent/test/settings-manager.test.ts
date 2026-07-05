@@ -212,6 +212,30 @@ describe("Settings", () => {
 
 			expect(settings.getModelRole("default")).toBe("anthropic/claude-opus-4-5");
 		});
+
+		it("keeps live agent model overrides aligned without persisting profile entries", () => {
+			const settings = Settings.isolated();
+
+			settings.set("task.agentModelOverrides", { executor: "persisted/executor" });
+			settings.override("task.agentModelOverrides", {
+				executor: "profile/executor",
+				planner: "profile/planner",
+			});
+
+			settings.setAgentModelOverride("planner", "user/planner:high");
+
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "profile/executor",
+				planner: "user/planner:high",
+			});
+
+			settings.clearOverride("task.agentModelOverrides");
+
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "persisted/executor",
+				planner: "user/planner:high",
+			});
+		});
 	});
 
 	describe("migrations", () => {
