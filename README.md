@@ -26,7 +26,20 @@
 
 > Gajae-Code is an experimental, beta-stage project. Expect rough edges and verify outputs before relying on it for important work.
 
-## New in 0.7.0
+## New in 0.8.1
+
+**Recent release highlights** — `v0.8.1` ships a focused round of fixes and workflow polish across the coding-agent, TUI, coordinator, and skill surfaces. Highlights include:
+
+- safer tool-call argument string sanitization
+- inline skill invocation support
+- a fix for reopening closed Telegram topics
+- a fix for nested `contribute-pr` workers in the TUI
+- better classification of vanished acknowledged tmux turns
+- default registration of the skill tool instead of discoverable-only wiring
+
+See the full release notes in [v0.8.1](https://github.com/Yeachan-Heo/gajae-code/releases/tag/v0.8.1).
+
+## Also new in 0.7.0
 
 <p align="center">
   <img src="assets/telegram-mobile-hero.png" alt="Gajae Code 0.7.0 mobile answers for coding agents hero illustration" width="100%" />
