@@ -33,6 +33,10 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 	return result.content.map(c => c.text ?? "").join("\n");
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function crc32(bytes: Uint8Array): number {
 	let crc = 0xffffffff;
 	for (const byte of bytes) {
@@ -523,6 +527,63 @@ describe("computer tool dispatch", () => {
 
 		expect(result.isError).not.toBe(true);
 		expect(waits).toEqual([5_000, 1_000]);
+	});
+
+	it("times out slow native promises instead of reporting success", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: async () => {
+				calls.push("screenshot-start");
+				await sleep(1_100);
+				calls.push("screenshot-end");
+				return { widthPx: 10, heightPx: 10, png: new Uint8Array([1, 2, 3]) };
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const started = Date.now();
+		const result = await tool.execute("slow-shot", { action: "screenshot", timeout: 1 });
+
+		expect(Date.now() - started).toBeLessThan(1_090);
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_CANCELLED");
+		expect(calls).toEqual(["screenshot-start"]);
+	});
+
+	it("honors abort signals between batch steps", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: async () => {
+				calls.push("click-start");
+				await sleep(80);
+				calls.push("click-end");
+			},
+			type: () => {
+				calls.push("type");
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 20);
+
+		await expect(
+			tool.execute(
+				"abort-batch",
+				{
+					action: "batch",
+					actions: [
+						{ action: "click", x: 1, y: 2 },
+						{ action: "type", text: "skipped" },
+					],
+				},
+				controller.signal,
+			),
+		).rejects.toThrow("Operation aborted");
+		expect(calls).toEqual(["click-start"]);
 	});
 
 	it("executes batch actions sequentially and reports per-step results", async () => {

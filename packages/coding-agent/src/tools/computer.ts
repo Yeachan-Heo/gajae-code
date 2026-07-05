@@ -276,8 +276,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 			const timeoutSeconds = clampTimeout("computer", params.timeout);
 			const timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
 			const controller = controllerFactory();
-			// Native ComputerController methods are synchronous and accept no AbortSignal,
-			// so cancellation is honored before dispatch and wait() is bounded by timeoutMs.
+			const deadline = createComputerDeadline(timeoutMs);
 			if (params.action === "batch") {
 				const batchResult = await dispatchBatchComputerActions(
 					controller,
@@ -287,6 +286,8 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 					latestScreenshotContexts.get(this.session),
 					shouldCapturePostActionScreenshot(params, this.session),
 					Boolean(this.session.settings.get("computer.autoScreenshot")),
+					signal,
+					deadline,
 				);
 				details.steps = batchResult.steps;
 				if (batchResult.screenshot) {
@@ -322,11 +323,12 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 			let result = await dispatchComputerAction(
 				controller,
 				params,
-				timeoutMs,
+				deadline,
 				latestScreenshotContexts.get(this.session),
+				signal,
 			);
 			if (shouldCapturePostActionScreenshot(params, this.session)) {
-				result = await captureScreenshot(controller);
+				result = await captureScreenshot(controller, deadline, signal);
 			}
 			const screenshot = normalizeScreenshot(result);
 			if (screenshot) {
@@ -400,8 +402,12 @@ function rememberLatestScreenshot(session: ToolSession, screenshot: ComputerScre
 	});
 }
 
-function captureScreenshot(controller: NativeController): Promise<unknown> | unknown {
-	return controller.screenshot?.();
+function captureScreenshot(
+	controller: NativeController,
+	deadline: ComputerDeadline | undefined,
+	signal?: AbortSignal,
+): Promise<unknown> {
+	return runComputerOperation(() => controller.screenshot?.(), deadline, signal);
 }
 
 function shouldCapturePostActionScreenshot(
@@ -414,39 +420,129 @@ function shouldCapturePostActionScreenshot(
 	);
 }
 
+interface ComputerDeadline {
+	expiresAtMs: number;
+}
+
+class ComputerTimeoutError extends Error {
+	constructor() {
+		super("Computer action timed out.");
+		this.name = "TimeoutError";
+	}
+}
+
+function createComputerDeadline(
+	timeoutMs: number | undefined,
+	parent?: ComputerDeadline,
+): ComputerDeadline | undefined {
+	const localExpiresAt = timeoutMs && timeoutMs > 0 ? performance.now() + timeoutMs : undefined;
+	const parentExpiresAt = parent?.expiresAtMs;
+	const expiresAtMs =
+		localExpiresAt === undefined
+			? parentExpiresAt
+			: parentExpiresAt === undefined
+				? localExpiresAt
+				: Math.min(localExpiresAt, parentExpiresAt);
+	return expiresAtMs === undefined ? undefined : { expiresAtMs };
+}
+
+function remainingComputerTimeoutMs(deadline: ComputerDeadline | undefined): number | undefined {
+	if (!deadline) return undefined;
+	const remaining = Math.ceil(deadline.expiresAtMs - performance.now());
+	if (remaining <= 0) throw new ComputerTimeoutError();
+	return remaining;
+}
+
+function assertComputerDeadline(deadline: ComputerDeadline | undefined): void {
+	remainingComputerTimeoutMs(deadline);
+}
+
+async function runComputerOperation<T>(
+	operation: () => Promise<T> | T,
+	deadline: ComputerDeadline | undefined,
+	signal?: AbortSignal,
+): Promise<T> {
+	throwIfAborted(signal);
+	const timeoutMs = remainingComputerTimeoutMs(deadline);
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	let removeAbortListener: (() => void) | undefined;
+	const operationPromise = Promise.resolve().then(operation);
+	operationPromise.catch(() => undefined);
+	const guards: Array<Promise<never>> = [];
+	if (timeoutMs !== undefined) {
+		guards.push(
+			new Promise((_, reject) => {
+				timeout = setTimeout(() => reject(new ComputerTimeoutError()), timeoutMs);
+			}),
+		);
+	}
+	if (signal) {
+		guards.push(
+			new Promise((_, reject) => {
+				const onAbort = () => reject(new ToolAbortError());
+				signal.addEventListener("abort", onAbort, { once: true });
+				removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+			}),
+		);
+	}
+	try {
+		const result = await (guards.length > 0 ? Promise.race([operationPromise, ...guards]) : operationPromise);
+		throwIfAborted(signal);
+		assertComputerDeadline(deadline);
+		return result;
+	} finally {
+		if (timeout) clearTimeout(timeout);
+		removeAbortListener?.();
+	}
+}
+
 function dispatchComputerAction(
 	controller: NativeController,
 	params: SingleComputerParams,
-	timeoutMs: number | undefined,
+	deadline: ComputerDeadline | undefined,
 	context?: ScreenshotContext,
-): Promise<unknown> | unknown {
+	signal?: AbortSignal,
+): Promise<unknown> {
 	const expectedEpoch = expectedEpochFromContext(context);
-	switch (params.action) {
-		case "screenshot":
-			return controller.screenshot?.();
-		case "click":
-			validatePointerCoordinates("click", params.x, params.y, context);
-			return controller.click?.(expectedEpoch, params.x, params.y, params.button ?? "left");
-		case "double_click":
-			validatePointerCoordinates("double_click", params.x, params.y, context);
-			return controller.doubleClick?.(expectedEpoch, params.x, params.y, params.button ?? "left");
-		case "move":
-			validatePointerCoordinates("move", params.x, params.y, context);
-			return controller.move?.(expectedEpoch, params.x, params.y);
-		case "drag":
-			validatePointerCoordinates("drag start", params.x, params.y, context);
-			validatePointerCoordinates("drag end", params.to_x, params.to_y, context);
-			return controller.drag?.(expectedEpoch, params.x, params.y, params.to_x, params.to_y, params.button ?? "left");
-		case "scroll":
-			validatePointerCoordinates("scroll", params.x, params.y, context);
-			return controller.scroll?.(expectedEpoch, params.x, params.y, params.scroll_x, params.scroll_y);
-		case "type":
-			return controller.type?.(undefined, params.text);
-		case "keypress":
-			return controller.keypress?.(undefined, params.keys);
-		case "wait":
-			return controller.wait?.(undefined, capWaitMs(params.ms, timeoutMs));
-	}
+	return runComputerOperation(
+		() => {
+			switch (params.action) {
+				case "screenshot":
+					return controller.screenshot?.();
+				case "click":
+					validatePointerCoordinates("click", params.x, params.y, context);
+					return controller.click?.(expectedEpoch, params.x, params.y, params.button ?? "left");
+				case "double_click":
+					validatePointerCoordinates("double_click", params.x, params.y, context);
+					return controller.doubleClick?.(expectedEpoch, params.x, params.y, params.button ?? "left");
+				case "move":
+					validatePointerCoordinates("move", params.x, params.y, context);
+					return controller.move?.(expectedEpoch, params.x, params.y);
+				case "drag":
+					validatePointerCoordinates("drag start", params.x, params.y, context);
+					validatePointerCoordinates("drag end", params.to_x, params.to_y, context);
+					return controller.drag?.(
+						expectedEpoch,
+						params.x,
+						params.y,
+						params.to_x,
+						params.to_y,
+						params.button ?? "left",
+					);
+				case "scroll":
+					validatePointerCoordinates("scroll", params.x, params.y, context);
+					return controller.scroll?.(expectedEpoch, params.x, params.y, params.scroll_x, params.scroll_y);
+				case "type":
+					return controller.type?.(undefined, params.text);
+				case "keypress":
+					return controller.keypress?.(undefined, params.keys);
+				case "wait":
+					return controller.wait?.(undefined, capWaitMs(params.ms, remainingComputerTimeoutMs(deadline)));
+			}
+		},
+		deadline,
+		signal,
+	);
 }
 
 interface BatchDispatchResult {
@@ -464,6 +560,8 @@ async function dispatchBatchComputerActions(
 	initialContext?: ScreenshotContext,
 	includeBatchScreenshot = false,
 	autoScreenshot = false,
+	signal?: AbortSignal,
+	deadline?: ComputerDeadline,
 ): Promise<BatchDispatchResult> {
 	const steps: ComputerToolDetails[] = [];
 	let lastScreenshot: ComputerScreenshotDetails | undefined;
@@ -472,10 +570,13 @@ async function dispatchBatchComputerActions(
 	for (const single of actions) {
 		const stepDetails = detailsFromParams(single);
 		try {
+			throwIfAborted(signal);
+			assertComputerDeadline(deadline);
 			const stepTimeoutMs = stepTimeoutFromParams(single, timeoutMs);
-			let result = await dispatchComputerAction(controller, single, stepTimeoutMs, context);
+			const stepDeadline = createComputerDeadline(stepTimeoutMs, deadline);
+			let result = await dispatchComputerAction(controller, single, stepDeadline, context, signal);
 			if (single.action !== "screenshot" && (single.include_screenshot === true || autoScreenshot)) {
-				result = await captureScreenshot(controller);
+				result = await captureScreenshot(controller, stepDeadline, signal);
 			}
 
 			const screenshot = normalizeScreenshot(result);
@@ -504,7 +605,7 @@ async function dispatchBatchComputerActions(
 		steps.push(stepDetails);
 	}
 	if (includeBatchScreenshot) {
-		lastScreenshotSource = await captureScreenshot(controller);
+		lastScreenshotSource = await captureScreenshot(controller, deadline, signal);
 		lastScreenshot = normalizeScreenshot(lastScreenshotSource) ?? lastScreenshot;
 	}
 	return { steps, screenshot: lastScreenshot, screenshotSource: lastScreenshotSource };
