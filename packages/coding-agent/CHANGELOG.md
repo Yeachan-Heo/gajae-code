@@ -8,6 +8,7 @@
 - Added `gjc completion inshellisense`, which generates or installs a Fig/withfig-compatible `gjc` completion spec for Microsoft inshellisense without adding inshellisense as a runtime dependency.
 
 ### Fixed
+- Telegram unattended workflow-gate listeners are now disposed when a notification session stops, preventing stale stopped servers from retaining future gate emissions after shutdown or notification restart.
 - Telegram notification setup and daemon delivery now reject non-private Telegram chat ids before saving configuration, creating forum topics, or sending session content, preserving the private-chat-only routing boundary.
 - Telegram daemon autostart now refuses to attach a new session to a live daemon whose persisted bot-token fingerprint or chat id differs from the current settings, and it avoids registering the session root until ownership is trusted so rotated Telegram credentials cannot keep leaking through the old daemon.
 - Skill autocomplete now supports direct skill-name prefixes after prompt text (for example, `please /ra` → `/skill:ralplan`) while keeping bare `/` menus free of skill entries.

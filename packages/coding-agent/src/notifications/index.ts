@@ -336,6 +336,8 @@ interface SessionRuntime {
 	disposeAnswerSource: () => void;
 	/** Deregisters this session's Telegram file sink. */
 	disposeFileSink: () => void;
+	/** Deregisters this session's unattended workflow-gate listener. */
+	disposeGateListener: () => void;
 	redact: boolean;
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
@@ -505,8 +507,15 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		runtimes.delete(id);
 		try {
 			rt.cancelPostmortemCleanup();
+		} catch {}
+		try {
 			rt.disposeAnswerSource();
+		} catch {}
+		try {
 			rt.disposeFileSink();
+		} catch {}
+		try {
+			rt.disposeGateListener();
 		} catch {}
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
 		for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
@@ -689,6 +698,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 				pendingInteractive,
 				disposeAnswerSource,
 				disposeFileSink,
+				disposeGateListener: () => {},
 				cancelPostmortemCleanup: () => {},
 				redact,
 				verbosity,
@@ -732,7 +742,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 
 			// Unattended: a real ask emits a workflow gate; register it repliable by gate_id.
 			if (unattended && gate?.onGateEmitted) {
-				gate.onGateEmitted(g => {
+				runtime.disposeGateListener = gate.onGateEmitted(g => {
 					const options = (g.options ?? []).map(o => String((o as { label?: unknown }).label ?? ""));
 					gateOptions.set(g.gate_id, options);
 					const promptCtx = g.context as { prompt?: unknown; title?: unknown } | undefined;
