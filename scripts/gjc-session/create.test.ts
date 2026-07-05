@@ -159,10 +159,12 @@ exit 0
 		};
 		expect(vanished).toMatchObject({
 			finalPresent: false,
-			reason: "tmux_session_missing",
+			reason: "tmux_session_missing_before_prompt_acceptance",
+			phase: "before_prompt_acceptance",
 			severity: "failure",
+			tuiReadyObserved: true,
 		});
-		expect(vanished.runtimeState).toBe(path.join(stateDir, "runtime-state.json"));
+		expect(vanished.runtimeState).toBe(path.relative(worktree, path.join(stateDir, "runtime-state.json")));
 		expect(await Bun.file(routerLog).text()).toContain("tmux stale --session");
 	});
 	test("external monitor records vanished sessions after prompt acceptance", async () => {
@@ -221,6 +223,45 @@ sleep 60
 			severity: "failure",
 		});
 	}, 20000);
+
+	test("prompt records vanished status and refuses to paste when tmux session is missing", async () => {
+		const session = `gjc_issue_1496_prompt_missing_${process.pid}_${Date.now()}`;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-missing-"));
+		tempRoots.push(root);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		await fs.mkdir(stateDir, { recursive: true });
+		await Bun.write(path.join(stateDir, "pane.log"), "Gajae forge\n> Type your message\n");
+		await Bun.write(path.join(stateDir, "metadata.json"), JSON.stringify({ session, workdir: worktree }, null, 2));
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "do not paste this prompt"], {
+			env: {
+				...process.env,
+				GJC_SESSION_STATE_DIR: stateDir,
+			},
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain("refusing to paste prompt: tmux session");
+		expect(result.stderr.toString()).not.toContain("do not paste this prompt");
+		const vanished = (await Bun.file(path.join(stateDir, "vanished.json")).json()) as {
+			phase: string;
+			reason: string;
+			promptAccepted: boolean;
+			finalPresent: boolean;
+			runtimeState: string;
+		};
+		expect(vanished).toMatchObject({
+			phase: "before_prompt_injection",
+			reason: "tmux_session_missing_before_prompt_injection",
+			promptAccepted: false,
+			finalPresent: false,
+		});
+		expect(vanished.runtimeState).toBe(path.relative(worktree, path.join(stateDir, "runtime-state.json")));
+	}, 20000);
+
 	test("prompt refuses success without durable turn evidence", async () => {
 		const session = `gjc_issue_1385_prompt_${process.pid}_${Date.now()}`;
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-"));

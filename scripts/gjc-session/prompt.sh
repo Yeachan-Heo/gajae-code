@@ -3,6 +3,9 @@
 # Usage: prompt.sh <session-name> "<prompt-text>" OR prompt.sh <session-name> @/path/to/prompt.md
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=postmortem.sh
+source "$SCRIPT_DIR/postmortem.sh"
 SESSION="${1:?Usage: $0 <session-name> <text|@file>}"
 TEXT_ARG="${2:?Usage: $0 <session-name> <text|@file>}"
 TMUX_BIN="${GJC_SESSION_TMUX_BIN:-tmux}"
@@ -160,6 +163,59 @@ show_missing_session_diagnostics() {
   tail -40 "$log_path" | print_redacted_tail >&2
 }
 
+
+state_dir_from_log() {
+  local log_path="${1:-}"
+  [[ -n "$log_path" ]] && dirname "$log_path"
+}
+
+write_pre_prompt_vanished() {
+  local reason="${1:?reason required}"
+  local phase="${2:?phase required}"
+  local tui_ready="${3:-false}"
+  local log_path="${4:-}"
+  local state_dir=""
+  state_dir="$(state_dir_from_log "$log_path")"
+  if [[ -z "$state_dir" && -n "${GJC_SESSION_STATE_DIR:-}" ]]; then
+    state_dir="$GJC_SESSION_STATE_DIR"
+    log_path="$state_dir/pane.log"
+  fi
+  [[ -n "$state_dir" ]] || return 0
+  mkdir -p "$state_dir"
+  local workdir="${GJC_SESSION_WORKDIR:-}"
+  if [[ -z "$workdir" && -f "$state_dir/metadata.json" ]]; then
+    workdir="$(python3 - "$state_dir/metadata.json" <<'PYMETA'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get("workdir") or "")
+except Exception:
+    print("")
+PYMETA
+)"
+  fi
+  if [[ -z "$workdir" ]]; then
+    workdir="$state_dir"
+  fi
+  printf '[%s] prompt preflight vanished phase=%s reason=%s tui_ready=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$phase" "$reason" "$tui_ready" >>"$state_dir/events.log"
+  gjc_session_write_vanished_json \
+    "$state_dir/vanished.json" \
+    "$SESSION" \
+    "$workdir" \
+    "$reason" \
+    "$phase" \
+    failure \
+    false \
+    false \
+    "$tui_ready" \
+    "$log_path" \
+    "$state_dir/events.log" \
+    "$state_dir/final.json" \
+    "$state_dir/runtime-state.json" \
+    "$state_dir/prompt-accepted.json"
+}
+
 if [[ "$TEXT_ARG" == @* ]]; then
   FILE="${TEXT_ARG#@}"
   [[ -f "$FILE" ]] || { echo "prompt file not found: $FILE" >&2; exit 1; }
@@ -172,13 +228,21 @@ PANE_TEXT="$(${TMUX_CMD[@]} capture-pane -t "$SESSION":0.0 -p -S -80 2>/dev/null
 if [[ -z "$PANE_TEXT" ]]; then
   mapfile -t candidates < <(find_durable_pane_logs)
   if [[ "${#candidates[@]}" -gt 0 ]]; then
+    write_pre_prompt_vanished "tmux_session_missing_before_prompt_injection" "before_prompt_injection" false "${candidates[0]}"
     show_missing_session_diagnostics "${candidates[0]}"
   else
+    write_pre_prompt_vanished "tmux_session_missing_before_prompt_injection" "before_prompt_injection" false ""
     echo "refusing to paste prompt: tmux session $SESSION is not readable and no durable pane log was found" >&2
   fi
   exit 1
 fi
 if ! printf '%s\n' "$PANE_TEXT" | grep -qE 'Gajae forge|Type your message|> Type your message|Working'; then
+  mapfile -t candidates < <(find_durable_pane_logs)
+  if [[ "${#candidates[@]}" -gt 0 ]]; then
+    write_pre_prompt_vanished "tmux_session_unready_before_prompt_injection" "before_prompt_injection" false "${candidates[0]}"
+  else
+    write_pre_prompt_vanished "tmux_session_unready_before_prompt_injection" "before_prompt_injection" false ""
+  fi
   echo "refusing to paste prompt: GJC TUI is not ready in session $SESSION" >&2
   echo "--- pane tail ---" >&2
   printf '%s\n' "$PANE_TEXT" | print_redacted_tail >&2
@@ -242,8 +306,10 @@ for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
   if [[ -z "$PANE_TEXT" ]]; then
     mapfile -t candidates < <(find_durable_pane_logs)
     if [[ "${#candidates[@]}" -gt 0 ]]; then
+      write_pre_prompt_vanished "tmux_session_missing_before_prompt_acceptance" "before_prompt_acceptance" true "${candidates[0]}"
       show_missing_session_diagnostics "${candidates[0]}"
     else
+      write_pre_prompt_vanished "tmux_session_missing_before_prompt_acceptance" "before_prompt_acceptance" true ""
       echo "prompt acceptance failed: tmux session $SESSION vanished before durable turn evidence" >&2
     fi
     exit 1

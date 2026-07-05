@@ -17,6 +17,9 @@
 #   GJC_SESSION_MONITOR_DISABLE=1 disable external vanished-session monitor
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=postmortem.sh
+source "$SCRIPT_DIR/postmortem.sh"
 
 SESSION="${1:?Usage: $0 <session-name> <worktree-path> [channel-id] [mention]}"
 WORKDIR="${2:?Usage: $0 <session-name> <worktree-path> [channel-id] [mention]}"
@@ -154,6 +157,8 @@ chmod +x "$STATE_DIR/runner.sh"
 cat >"$STATE_DIR/monitor.sh" <<'MONITOR'
 #!/usr/bin/env bash
 set +e
+# shellcheck source=postmortem.sh
+source "${GJC_SESSION_POSTMORTEM_SH:?}"
 interval="${GJC_SESSION_MONITOR_INTERVAL:-5}"
 case "$interval" in
   ''|*[!0-9]*) interval=5 ;;
@@ -170,59 +175,42 @@ while true; do
   detected_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   final_present=false
   [[ -s "$GJC_SESSION_FINAL_JSON" ]] && final_present=true
-  final_severity=""
   if [[ "$final_present" == "true" ]]; then
-    final_severity="$(python3 - "$GJC_SESSION_FINAL_JSON" <<'PYFINAL'
-import json
-import sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        data = json.load(handle)
-    print(data.get("severity") or "normal")
-except Exception:
-    print("unreadable_final_status")
-PYFINAL
-)"
+    printf '[%s] tmux session closed after final status; no vanished failure marker written\n' "$detected_at" >>"$GJC_SESSION_EVENTS_LOG"
+    exit 0
   fi
   prompt_accepted=false
   [[ -s "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}" ]] && prompt_accepted=true
-  vanish_reason="tmux_session_missing"
-  if [[ "$prompt_accepted" == "true" && "$final_present" != "true" ]]; then
+  tui_ready=false
+  if [[ -s "$GJC_SESSION_PANE_LOG" ]] && grep -Eq 'Gajae forge|Type your message|> Type your message|Working' "$GJC_SESSION_PANE_LOG"; then
+    tui_ready=true
+  fi
+  vanish_phase="before_tui_readiness"
+  vanish_reason="tmux_session_missing_before_tui_readiness"
+  if [[ "$prompt_accepted" == "true" ]]; then
+    vanish_phase="after_prompt_acceptance"
     vanish_reason="tmux_session_missing_after_prompt_acceptance"
+  elif [[ "$tui_ready" == "true" ]]; then
+    vanish_phase="before_prompt_acceptance"
+    vanish_reason="tmux_session_missing_before_prompt_acceptance"
   fi
   severity="failure"
-  if [[ "$final_present" == "true" && "$final_severity" == "normal" ]]; then
-    severity="closed_after_final"
-  fi
-  printf '[%s] tmux session vanished final_present=%s prompt_accepted=%s severity=%s reason=%s\n' "$detected_at" "$final_present" "$prompt_accepted" "$severity" "$vanish_reason" >>"$GJC_SESSION_EVENTS_LOG"
-  python3 - "$GJC_SESSION_VANISHED_JSON" "$GJC_SESSION_NAME" "$detected_at" "$GJC_SESSION_WORKDIR" "$GJC_SESSION_BRANCH" "$GJC_SESSION_PANE_LOG" "$GJC_SESSION_EVENTS_LOG" "$GJC_SESSION_FINAL_JSON" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$final_present" "$severity" "$final_severity" "$prompt_accepted" "$vanish_reason" "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}" <<'PYINNER'
-import json
-import sys
-
-(path, session, detected_at, workdir, branch, pane_log, events_log, final_json, runtime_state, final_present, severity, final_severity, prompt_accepted, reason, prompt_accepted_json) = sys.argv[1:]
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(
-        {
-            "session": session,
-            "detectedAt": detected_at,
-            "workdir": workdir,
-            "branch": branch,
-            "paneLog": pane_log,
-            "eventsLog": events_log,
-            "finalStatus": final_json,
-            "runtimeState": runtime_state,
-            "finalPresent": final_present == "true",
-            "severity": severity,
-            "reason": reason,
-            "finalSeverity": final_severity,
-            "promptAccepted": prompt_accepted == "true",
-            "promptAcceptedStatus": prompt_accepted_json or None,
-        },
-        handle,
-        indent=2,
-    )
-    handle.write("\n")
-PYINNER
+  printf '[%s] tmux session vanished final_present=%s prompt_accepted=%s tui_ready=%s phase=%s severity=%s reason=%s\n' "$detected_at" "$final_present" "$prompt_accepted" "$tui_ready" "$vanish_phase" "$severity" "$vanish_reason" >>"$GJC_SESSION_EVENTS_LOG"
+  gjc_session_write_vanished_json \
+    "$GJC_SESSION_VANISHED_JSON" \
+    "$GJC_SESSION_NAME" \
+    "$GJC_SESSION_WORKDIR" \
+    "$vanish_reason" \
+    "$vanish_phase" \
+    "$severity" \
+    "$prompt_accepted" \
+    false \
+    "$tui_ready" \
+    "$GJC_SESSION_PANE_LOG" \
+    "$GJC_SESSION_EVENTS_LOG" \
+    "$GJC_SESSION_FINAL_JSON" \
+    "$GJC_COORDINATOR_SESSION_STATE_FILE" \
+    "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}"
   if [[ "$severity" == "failure" && -n "${GJC_SESSION_ROUTER_BIN:-}" && -n "${GJC_SESSION_CHANNEL:-}" ]]; then
     "$GJC_SESSION_ROUTER_BIN" tmux stale \
       --session "$GJC_SESSION_NAME" \
@@ -285,6 +273,7 @@ if [[ "${GJC_SESSION_MONITOR_DISABLE:-0}" != "1" ]]; then
     "GJC_SESSION_PROMPT_ACCEPTED_JSON=$STATE_DIR/prompt-accepted.json"
     "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON"
     "GJC_SESSION_TMUX_BIN=$TMUX_BIN"
+    "GJC_SESSION_POSTMORTEM_SH=$SCRIPT_DIR/postmortem.sh"
     "GJC_SESSION_MONITOR_INTERVAL=${GJC_SESSION_MONITOR_INTERVAL:-5}"
     "GJC_SESSION_ROUTER_BIN=$ROUTER_BIN"
     "GJC_SESSION_CHANNEL=$CHANNEL"
