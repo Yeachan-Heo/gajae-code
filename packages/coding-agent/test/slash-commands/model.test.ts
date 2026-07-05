@@ -136,4 +136,17 @@ describe("/model batch assignments", () => {
 			"All model targets set to claude-sonnet:low for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		]);
 	});
+
+	test("/model preserves existing DEFAULT effort when selector has no explicit effort", async () => {
+		const { output, runtime, settings, session } = createRuntime();
+		settings.setModelRole("default", "anthropic/original-model:high");
+
+		await expect(executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet", runtime)).resolves.toEqual({
+			consumed: true,
+		});
+
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:high");
+		expect(session.thinkingLevel).toBe("high");
+		expect(output).toEqual(["DEFAULT model set to anthropic/claude-3-5-sonnet:high."]);
+	});
 });

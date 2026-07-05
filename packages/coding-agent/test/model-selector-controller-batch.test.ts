@@ -1,0 +1,142 @@
+import { beforeAll, describe, expect, test, vi } from "bun:test";
+import { ThinkingLevel } from "@gajae-code/agent-core";
+import type { Model } from "@gajae-code/ai";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
+import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
+import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+
+let testTheme = await getThemeByName("red-claw");
+
+function installTestTheme(): void {
+	if (!testTheme) throw new Error("Failed to load test theme");
+	setThemeInstance(testTheme);
+}
+
+const model = (provider: string, id: string): Model =>
+	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
+
+const selectedModel = model("provider-a", "selected");
+
+function createControllerContext() {
+	const settings = Settings.isolated();
+	settings.set("modelRoles", { default: "provider-a/original-default:medium" });
+	settings.set("task.agentModelOverrides", { executor: "provider-a/original-executor:low" });
+	settings.set("modelProfile.default", undefined);
+	const setModelCalls: Array<{
+		model: Model;
+		role: string;
+		options?: { selector?: string; thinkingLevel?: ThinkingLevel };
+	}> = [];
+	const session = {
+		model: model("provider-a", "current") as Model | undefined,
+		thinkingLevel: ThinkingLevel.Medium as ThinkingLevel | undefined,
+		sessionId: "session-1",
+		scopedModels: [],
+		modelRegistry: {
+			getAvailable: () => [selectedModel],
+			refresh: vi.fn(async () => {}),
+			getAll: () => [selectedModel],
+			getError: () => undefined,
+			getCanonicalModels: () => [],
+			getDiscoverableProviders: () => [],
+			getAvailableModelProfileNames: () => [],
+			getModelProfiles: () => new Map(),
+			resolveCanonicalModel: () => undefined,
+			getApiKey: vi.fn(async () => "key"),
+		},
+		async setModel(nextModel: Model, role: string, options?: { selector?: string; thinkingLevel?: ThinkingLevel }) {
+			setModelCalls.push({ model: nextModel, role, options });
+			this.model = nextModel;
+			if (options?.thinkingLevel) this.thinkingLevel = options.thinkingLevel;
+		},
+		async setModelTemporary() {},
+		setThinkingLevel(thinkingLevel: ThinkingLevel) {
+			this.thinkingLevel = thinkingLevel;
+		},
+		getActiveModelProfile: () => undefined,
+		isFastForProvider: () => false,
+		isFastForSubagentProvider: () => false,
+		isFastModeActive: () => false,
+	};
+	const ctx = {
+		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
+		editor: {},
+		settings,
+		session,
+		statusLine: { invalidate: vi.fn() },
+		updateEditorBorderColor: vi.fn(),
+		showStatus: vi.fn(),
+		showError: vi.fn(),
+		notifyConfigChanged: vi.fn(async () => {}),
+	};
+	return { ctx, settings, session, setModelCalls };
+}
+
+async function openSelector(ctx: ReturnType<typeof createControllerContext>["ctx"]): Promise<ModelSelectorComponent> {
+	new SelectorController(ctx as never).showModelSelector();
+	return ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+}
+
+describe("SelectorController model batch assignments", () => {
+	beforeAll(async () => {
+		testTheme = await getThemeByName("red-claw");
+		installTestTheme();
+	});
+	test("all role agents selection writes every role-agent override and leaves DEFAULT unchanged", async () => {
+		const { ctx, settings, setModelCalls } = createControllerContext();
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			roles: ["executor", "architect", "planner", "critic"],
+			thinkingLevel: ThinkingLevel.Low,
+			selector: "provider-a/selected:low",
+		});
+
+		expect(setModelCalls).toEqual([]);
+		expect(settings.getModelRole("default")).toBe("provider-a/original-default:medium");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/selected:low",
+			architect: "provider-a/selected:low",
+			planner: "provider-a/selected:low",
+			critic: "provider-a/selected:low",
+		});
+		expect(ctx.showStatus).toHaveBeenCalledWith(
+			"Role-agent models set to provider-a/selected:low for EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
+		);
+	});
+
+	test("all targets selection writes DEFAULT plus every role-agent override", async () => {
+		const { ctx, settings, setModelCalls } = createControllerContext();
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			roles: ["default", "executor", "architect", "planner", "critic"],
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/selected:high",
+		});
+
+		expect(setModelCalls).toEqual([
+			{
+				model: selectedModel,
+				role: "default",
+				options: { selector: "provider-a/selected", thinkingLevel: ThinkingLevel.High },
+			},
+		]);
+		expect(settings.getModelRole("default")).toBe("provider-a/selected:high");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/selected:high",
+			architect: "provider-a/selected:high",
+			planner: "provider-a/selected:high",
+			critic: "provider-a/selected:high",
+		});
+		expect(ctx.showStatus).toHaveBeenCalledWith(
+			"All model targets set to provider-a/selected:high for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
+		);
+	});
+});

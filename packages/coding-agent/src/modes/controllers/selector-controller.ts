@@ -860,6 +860,79 @@ export class SelectorController {
 							this.ctx.showStatus(`Temporary model: ${selectedSelector ?? model.id}`);
 							done();
 							this.ctx.ui.requestRender();
+						} else if (selection.roles) {
+							const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles;
+							const includesDefault = targetRoles.includes("default");
+							const includesRoleAgent = targetRoles.some(targetRole => targetRole !== "default");
+							if (includesRoleAgent) {
+								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+									model,
+									this.ctx.session.sessionId,
+								);
+								if (!apiKey) {
+									throw new Error(`No API key for ${model.provider}/${model.id}`);
+								}
+							}
+							const value =
+								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
+							const assignments = new Map<GjcModelAssignmentTargetId, string>();
+							for (const targetRole of targetRoles) assignments.set(targetRole, value);
+							const defaultSelector =
+								selectedSelector && thinkingLevel && selectedSelector.endsWith(`:${thinkingLevel}`)
+									? selectedSelector.slice(0, -thinkingLevel.length - 1)
+									: selectedSelector;
+
+							if (includesDefault) {
+								await this.ctx.session.setModel(model, "default", {
+									selector: defaultSelector,
+									thinkingLevel,
+								});
+								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+									this.ctx.session.setThinkingLevel(thinkingLevel);
+								}
+							}
+							const materializedProfile = materializeActiveModelProfileAssignments({
+								session: this.ctx.session,
+								settings: this.ctx.settings,
+								assignments,
+							});
+							if (!materializedProfile) {
+								const overrides = this.ctx.settings.get("task.agentModelOverrides");
+								const nextOverrides = { ...overrides };
+								let writesOverrides = false;
+								for (const targetRole of targetRoles) {
+									const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+									if (target.settingsPath === "modelRoles") {
+										this.ctx.settings.setModelRole(targetRole, value);
+									} else {
+										nextOverrides[targetRole] = value;
+										writesOverrides = true;
+									}
+								}
+								if (writesOverrides) {
+									this.ctx.settings.set("task.agentModelOverrides", nextOverrides);
+								}
+							}
+							modelSelector.refreshRoleAssignments({
+								currentModel: this.ctx.session.model,
+								currentThinkingLevel: this.ctx.session.thinkingLevel,
+								activeModelProfile:
+									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
+							});
+							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+							this.ctx.statusLine.invalidate();
+							this.ctx.updateEditorBorderColor();
+							await this.ctx.notifyConfigChanged?.();
+							const labels = targetRoles.map(
+								targetRole => GJC_MODEL_ASSIGNMENT_TARGETS[targetRole].tag ?? targetRole.toUpperCase(),
+							);
+							this.ctx.showStatus(
+								includesDefault
+									? `All model targets set to ${value} for ${labels.join(", ")}.`
+									: `Role-agent models set to ${value} for ${labels.join(", ")}.`,
+							);
+							done();
+							this.ctx.ui.requestRender();
 						} else if (role === "default") {
 							// Default: update agent state and persist as the active default model.
 							await this.ctx.session.setModel(model, role, {
@@ -895,31 +968,23 @@ export class SelectorController {
 							if (!apiKey) {
 								throw new Error(`No API key for ${model.provider}/${model.id}`);
 							}
-							const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles ?? [role];
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
-							const assignments = new Map<GjcModelAssignmentTargetId, string>();
-							for (const targetRole of targetRoles) assignments.set(targetRole, value);
+							const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
 							const materializedProfile = materializeActiveModelProfileAssignments({
 								session: this.ctx.session,
 								settings: this.ctx.settings,
 								assignments,
 							});
 							if (!materializedProfile) {
-								const overrides = this.ctx.settings.get("task.agentModelOverrides");
-								const nextOverrides = { ...overrides };
-								let writesOverrides = false;
-								for (const targetRole of targetRoles) {
-									const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
-									if (target.settingsPath === "modelRoles") {
-										this.ctx.settings.setModelRole(targetRole, value);
-									} else {
-										nextOverrides[targetRole] = value;
-										writesOverrides = true;
-									}
-								}
-								if (writesOverrides) {
-									this.ctx.settings.set("task.agentModelOverrides", nextOverrides);
+								const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+								if (target.settingsPath === "modelRoles") {
+									this.ctx.settings.setModelRole(role, value);
+								} else {
+									this.ctx.settings.set("task.agentModelOverrides", {
+										...this.ctx.settings.get("task.agentModelOverrides"),
+										[role]: value,
+									});
 								}
 							}
 							modelSelector.refreshRoleAssignments({
@@ -932,18 +997,7 @@ export class SelectorController {
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							await this.ctx.notifyConfigChanged?.();
-							if (selection.roles) {
-								const labels = targetRoles.map(
-									targetRole => GJC_MODEL_ASSIGNMENT_TARGETS[targetRole].tag ?? targetRole.toUpperCase(),
-								);
-								this.ctx.showStatus(
-									targetRoles.includes("default")
-										? `All model targets set to ${value} for ${labels.join(", ")}.`
-										: `Role-agent models set to ${value} for ${labels.join(", ")}.`,
-								);
-							} else {
-								this.ctx.showStatus(`${role} agent model: ${value}`);
-							}
+							this.ctx.showStatus(`${role} agent model: ${value}`);
 							done();
 							this.ctx.ui.requestRender();
 						}

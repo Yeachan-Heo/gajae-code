@@ -1788,6 +1788,11 @@ export class ModelSelectorComponent extends Container {
 	async __testSelectProfile(profileName: string, setDefault: boolean): Promise<void> {
 		await this.#onSelectCallback({ kind: "profile", profileName, setDefault });
 	}
+	async __testSelectAssignment(
+		selection: Omit<Extract<ModelSelectorSelection, { kind: "assignment" }>, "kind">,
+	): Promise<void> {
+		await this.#onSelectCallback({ kind: "assignment", ...selection });
+	}
 	async __testSelectPresetAction(profileName: string, action: "rename" | "delete"): Promise<void> {
 		await this.#onSelectCallback({
 			kind: action === "rename" ? "renameProfile" : "deleteProfile",

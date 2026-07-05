@@ -480,7 +480,13 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 
 					const overrides = runtime.settings.get("task.agentModelOverrides");
 					const assignments = new Map<GjcModelAssignmentTargetId, string>();
-					const persistedSelector = formatModelSelectorValue(selection.selector, selection.thinkingLevel);
+					const existingDefaultThinkingLevel =
+						selection.thinkingLevel !== undefined
+							? selection.thinkingLevel
+							: runtime.session.getActiveModelProfile?.()
+								? undefined
+								: extractExplicitThinkingSelector(runtime.settings.getModelRole("default"), runtime.settings);
+					const persistedSelector = formatModelSelectorValue(selection.selector, existingDefaultThinkingLevel);
 					for (const targetId of targetIds) {
 						if (targetId === "default") {
 							assignments.set(targetId, persistedSelector);
@@ -494,10 +500,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					if (includesDefault) {
 						await runtime.session.setModel(selection.model, "default", {
 							selector: selection.selector,
-							thinkingLevel: selection.thinkingLevel,
+							thinkingLevel: existingDefaultThinkingLevel,
 						});
-						if (selection.thinkingLevel) {
-							runtime.session.setThinkingLevel(selection.thinkingLevel);
+						if (existingDefaultThinkingLevel) {
+							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
 						}
 					}
 
