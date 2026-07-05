@@ -54,4 +54,72 @@ describe("globPaths", () => {
 		expect(results.sort()).toEqual(["src/a.ts", "src/b.ts"]);
 		expect(results.length).toBe(new Set(results).size);
 	});
+
+	it("anchors slash-containing gitignore patterns to the gitignore directory", async () => {
+		const cwd = await makeTempDir();
+		await mkdir(join(cwd, "sub"), { recursive: true });
+		await mkdir(join(cwd, "other", "sub"), { recursive: true });
+		await writeFile(join(cwd, ".gitignore"), "sub/skip.ts\n");
+		await writeFile(join(cwd, "sub", "skip.ts"), "export {};\n");
+		await writeFile(join(cwd, "other", "sub", "skip.ts"), "export {};\n");
+
+		const results = await globPaths("**/*.ts", { cwd, gitignore: true });
+
+		expect(results.sort()).toEqual(["other/sub/skip.ts"]);
+	});
+
+	it("anchors slash-containing directory gitignore patterns to the gitignore directory", async () => {
+		const cwd = await makeTempDir();
+		await mkdir(join(cwd, "sub", "dist"), { recursive: true });
+		await mkdir(join(cwd, "other", "sub", "dist"), { recursive: true });
+		await writeFile(join(cwd, ".gitignore"), "sub/dist/\n");
+		await writeFile(join(cwd, "sub", "dist", "skip.ts"), "export {};\n");
+		await writeFile(join(cwd, "other", "sub", "dist", "keep.ts"), "export {};\n");
+
+		const results = await globPaths("**/*.ts", { cwd, gitignore: true });
+
+		expect(results.sort()).toEqual(["other/sub/dist/keep.ts"]);
+	});
+
+	it("matches slash-free gitignore patterns at any depth", async () => {
+		const cwd = await makeTempDir();
+		await mkdir(join(cwd, "sub"), { recursive: true });
+		await mkdir(join(cwd, "other", "sub"), { recursive: true });
+		await writeFile(join(cwd, ".gitignore"), "skip.ts\n");
+		await writeFile(join(cwd, "sub", "skip.ts"), "export {};\n");
+		await writeFile(join(cwd, "other", "sub", "skip.ts"), "export {};\n");
+		await writeFile(join(cwd, "sub", "keep.ts"), "export {};\n");
+
+		const results = await globPaths("**/*.ts", { cwd, gitignore: true });
+
+		expect(results.sort()).toEqual(["sub/keep.ts"]);
+	});
+
+	it("matches **/-prefixed gitignore patterns at any depth", async () => {
+		const cwd = await makeTempDir();
+		await mkdir(join(cwd, "sub"), { recursive: true });
+		await mkdir(join(cwd, "other", "sub"), { recursive: true });
+		await writeFile(join(cwd, ".gitignore"), "**/sub/skip.ts\n");
+		await writeFile(join(cwd, "sub", "skip.ts"), "export {};\n");
+		await writeFile(join(cwd, "other", "sub", "skip.ts"), "export {};\n");
+		await writeFile(join(cwd, "sub", "keep.ts"), "export {};\n");
+
+		const results = await globPaths("**/*.ts", { cwd, gitignore: true });
+
+		expect(results.sort()).toEqual(["sub/keep.ts"]);
+	});
+
+	it("anchors parent-directory gitignore patterns relative to that gitignore", async () => {
+		const root = await makeTempDir();
+		const cwd = join(root, "proj");
+		await mkdir(join(cwd, "sub"), { recursive: true });
+		await mkdir(join(cwd, "other", "sub"), { recursive: true });
+		await writeFile(join(root, ".gitignore"), "proj/sub/skip.ts\n");
+		await writeFile(join(cwd, "sub", "skip.ts"), "export {};\n");
+		await writeFile(join(cwd, "other", "sub", "skip.ts"), "export {};\n");
+
+		const results = await globPaths("**/*.ts", { cwd, gitignore: true });
+
+		expect(results.sort()).toEqual(["other/sub/skip.ts"]);
+	});
 });

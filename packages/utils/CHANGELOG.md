@@ -5,6 +5,7 @@
 ### Fixed
 
 - Deduplicated `globPaths` results so a path is returned at most once even when overlapping glob patterns (e.g. `["**/*.ts", "src/*.ts"]`) both match the same file.
+- Anchored slash-containing `.gitignore` patterns (e.g. `sub/skip.ts`) to their `.gitignore`'s directory per git semantics instead of matching them at any depth, so `globPaths` with `gitignore: true` no longer drops same-named paths (e.g. `other/sub/skip.ts`) that git actually tracks.
 
 ### Fixed
 
