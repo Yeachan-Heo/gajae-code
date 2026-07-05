@@ -7789,8 +7789,26 @@ export class AgentSession {
 	}
 
 	#isOversizedMaintenanceError(errorMessage: string): boolean {
-		return /context_length_exceeded|exceeds? (the )?context window|maximum context length|payload too large|request entity too large/i.test(
-			errorMessage,
+		return isContextOverflow(
+			{
+				role: "assistant",
+				content: [],
+				api: this.model?.api ?? "anthropic-messages",
+				provider: this.model?.provider ?? "unknown",
+				model: this.model?.id ?? "unknown",
+				stopReason: "error",
+				errorMessage,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			} as AssistantMessage,
+			this.model?.contextWindow,
 		);
 	}
 
