@@ -1921,10 +1921,21 @@ export class TelegramNotificationDaemon {
 		return result;
 	};
 
-	private async sendStaleGuidance(callbackId: unknown): Promise<void> {
-		if (typeof callbackId === "string") {
-			await this.botApi.call("answerCallbackQuery", { callback_query_id: callbackId, text: "Button is stale" });
+	private async answerCallbackQueryBestEffort(callbackId: unknown, text?: string): Promise<void> {
+		if (typeof callbackId !== "string") return;
+		try {
+			await this.botApi.call("answerCallbackQuery", {
+				callback_query_id: callbackId,
+				...(text === undefined ? {} : { text }),
+			});
+		} catch {
+			// Telegram callback acknowledgements only dismiss the client-side spinner;
+			// they must never block the already-validated local reply path.
 		}
+	}
+
+	private async sendStaleGuidance(callbackId: unknown): Promise<void> {
+		await this.answerCallbackQueryBestEffort(callbackId, "Button is stale");
 		await this.botApi.call("sendMessage", {
 			chat_id: this.opts.chatId,
 			text: "This button is stale after notification daemon restart. Please answer locally in the GJC session or wait for a fresh notification.",
@@ -2042,11 +2053,10 @@ export class TelegramNotificationDaemon {
 				await this.sendStaleGuidance(callbackId);
 				return;
 			}
-			if (typeof callbackId === "string")
-				await this.botApi.call("answerCallbackQuery", { callback_query_id: callbackId });
 			session.ws.send(
 				JSON.stringify({ type: "reply", id: decision.actionId, answer: decision.answer, token: session.token }),
 			);
+			await this.answerCallbackQueryBestEffort(callbackId);
 		} else if (decision.kind === "stale") {
 			await this.sendStaleGuidance(callbackId);
 		}
