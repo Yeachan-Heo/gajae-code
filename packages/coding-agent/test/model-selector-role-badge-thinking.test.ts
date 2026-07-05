@@ -187,7 +187,12 @@ describe("ModelSelector canonical model selection", () => {
 		expect(actionRendered).not.toContain("Set as TASK");
 
 		selector.handleInput("\n");
+		expect(selected).toBeUndefined();
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Default");
+		expect(thinkingRendered).toContain("low");
 		installTestTheme();
+		selector.handleInput("\n");
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected Enter to select a model");
 		expect(selectedAfterEnter.model).toBe(model);
@@ -220,12 +225,60 @@ describe("ModelSelector canonical model selection", () => {
 		selector.handleInput("\n");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
+		expect(selected).toBeUndefined();
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Executor");
+		expect(thinkingRendered).toContain("xhigh");
+		selector.handleInput("\n");
 
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected role-agent selection");
 		expect(selectedAfterEnter.role).toBe("executor");
 		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
+	});
+
+	test("role assignment updates live runtime override for next selector render", async () => {
+		installTestTheme();
+		const model = createOpenAIModel("openai", "gpt-live-override-test");
+		const settings = Settings.isolated();
+		settings.set("task.agentModelOverrides", {
+			planner: `${model.provider}/${model.id}:low`,
+		});
+		settings.override("task.agentModelOverrides", {
+			planner: `${model.provider}/${model.id}:low`,
+		});
+
+		const selector = createSelector(model, settings, selection => {
+			if (selection.kind === "assignment" && selection.role) {
+				settings.setAgentModelOverride(selection.role, selection.selector ?? `${model.provider}/${model.id}`);
+			}
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const nextSelector = createSelector(model, settings);
+		await Bun.sleep(0);
+		installTestTheme();
+		const rendered = normalizeRenderedText(nextSelector.render(220).join("\n"));
+
+		expect(rendered).toContain("PLANNER (high)");
+
+		settings.clearOverride("task.agentModelOverrides");
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			planner: `${model.provider}/${model.id}:high`,
+		});
 	});
 
 	test("temporary scoped model selection carries selected reasoning", async () => {
@@ -299,6 +352,7 @@ describe("ModelSelector canonical model selection", () => {
 		selector.handleInput("\t");
 		selector.handleInput("\n");
 		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
 		selector.handleInput("\n");
 
 		const selectedAfterEnter = selected;
@@ -525,9 +579,9 @@ describe("ModelSelector canonical model selection", () => {
 		selector.handleInput("\n");
 
 		const selectedAfterThinking = selected;
-		if (!selectedAfterThinking) throw new Error("Expected OpenAI selection after explicit off choice");
+		if (!selectedAfterThinking) throw new Error("Expected OpenAI selection after scoped reasoning choice");
 		expect(selectedAfterThinking.role).toBe("default");
-		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.Off);
+		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
 	});
 

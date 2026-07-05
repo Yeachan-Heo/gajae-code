@@ -1699,6 +1699,21 @@ export class ModelSelectorComponent extends Container {
 			this.#updateList();
 		}
 	}
+	#getInitialThinkingChoiceIndex(item: ModelItem | CanonicalModelItem, levels: ThinkingLevel[]): number {
+		const preferred = this.#getPreferredThinkingLevel(item);
+		if (preferred && preferred !== ThinkingLevel.Inherit) {
+			const index = levels.indexOf(preferred);
+			if (index !== -1) return index;
+		}
+		return 0;
+	}
+
+	#getPreferredThinkingLevel(item: ModelItem | CanonicalModelItem): ThinkingLevel | undefined {
+		if (item.thinkingLevel && item.thinkingLevel !== ThinkingLevel.Inherit) {
+			return item.thinkingLevel;
+		}
+		return undefined;
+	}
 
 	#handleSelect(
 		item: ModelItem | CanonicalModelItem,
@@ -1707,9 +1722,10 @@ export class ModelSelectorComponent extends Container {
 	): void {
 		const itemThinkingLevel = thinkingLevel ?? item.thinkingLevel;
 		const hasExplicitThinkingChoice = thinkingLevel !== undefined || item.explicitThinkingLevel === true;
-		if (!hasExplicitThinkingChoice && requiresExplicitThinkingChoice(item.model)) {
-			this.#pendingThinkingChoice = { item, role, levels: getSelectableThinkingLevels(item.model) };
-			this.#selectedThinkingIndex = 0;
+		if (!hasExplicitThinkingChoice && requiresExplicitThinkingChoice(item.model, role)) {
+			const levels = getSelectableThinkingLevels(item.model);
+			this.#pendingThinkingChoice = { item, role, levels };
+			this.#selectedThinkingIndex = this.#getInitialThinkingChoiceIndex(item, levels);
 			this.#updateList();
 			return;
 		}
@@ -1764,8 +1780,10 @@ export class ModelSelectorComponent extends Container {
 	}
 }
 
-function requiresExplicitThinkingChoice(model: Model): boolean {
-	return model.reasoning === true && (model.provider === "openai" || model.provider === "openai-codex");
+function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
+	if (model.reasoning !== true) return false;
+	if (model.provider === "openai" || model.provider === "openai-codex") return true;
+	return role !== null;
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {
