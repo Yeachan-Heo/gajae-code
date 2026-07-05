@@ -56,7 +56,7 @@ import { decideThreadedInbound, type InboundAttachment } from "./threaded-inboun
 import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
 import { TopicRegistry, type TopicRegistryState } from "./topic-registry";
 
-export type EnsureDaemonResult = "owner_spawned" | "attached" | "disabled";
+export type EnsureDaemonResult = "owner_spawned" | "attached" | "disabled" | "blocked";
 
 export interface DaemonState {
 	pid: number;
@@ -267,7 +267,7 @@ export async function registerNotificationRoot(input: {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	await ensureDir(fsImpl, paths.dir);
-	const root = path.join(input.cwd, ".gjc", "state");
+	const root = notificationRootForCwd(input.cwd);
 	await withFileLock(
 		paths.roots,
 		async () => {
@@ -286,6 +286,29 @@ export async function registerNotificationRoot(input: {
 	return root;
 }
 
+function notificationRootForCwd(cwd: string): string {
+	return path.join(cwd, ".gjc", "state");
+}
+
+function ownerIdentityMatches(state: DaemonState, tokenFingerprint: string, chatId: string): boolean {
+	return state.tokenFingerprint === tokenFingerprint && state.chatId === chatId;
+}
+
+function liveOwnerUsesDifferentIdentity(input: {
+	state: DaemonState | undefined;
+	tokenFingerprint: string;
+	chatId: string;
+	pidAlive: (pid: number) => boolean;
+}): boolean {
+	const { state } = input;
+	return Boolean(
+		state &&
+			state.version === DAEMON_VERSION &&
+			!ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
+			input.pidAlive(state.pid),
+	);
+}
+
 export function isFreshLiveOwner(input: {
 	state: DaemonState | undefined;
 	now: number;
@@ -297,8 +320,7 @@ export function isFreshLiveOwner(input: {
 	return Boolean(
 		state &&
 			state.version === DAEMON_VERSION &&
-			state.tokenFingerprint === input.tokenFingerprint &&
-			state.chatId === input.chatId &&
+			ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
 			input.now - state.heartbeatAt <= HEARTBEAT_TTL_MS &&
 			input.pidAlive(state.pid),
 	);
@@ -314,7 +336,13 @@ export async function acquireDaemonOwnership(input: {
 	pid?: number;
 	pidAlive?: (pid: number) => boolean;
 	randomId?: () => string;
-}): Promise<{ acquired: boolean; ownerId?: string; attached?: boolean }> {
+}): Promise<{
+	acquired: boolean;
+	ownerId?: string;
+	attached?: boolean;
+	blocked?: boolean;
+	reason?: "identity_mismatch";
+}> {
 	const fsImpl = input.fs ?? nodeFs;
 	const now = input.now ?? Date.now;
 	const pid = input.pid ?? process.pid;
@@ -324,6 +352,16 @@ export async function acquireDaemonOwnership(input: {
 	const ownerId = input.randomId?.() ?? `${pid}-${now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 	const roots = input.roots ?? (await readJson<{ roots?: string[] }>(fsImpl, paths.roots))?.roots ?? [];
 	const existing = await readJson<DaemonState>(fsImpl, paths.state);
+	if (
+		liveOwnerUsesDifferentIdentity({
+			state: existing,
+			tokenFingerprint: input.tokenFingerprint,
+			chatId: input.chatId,
+			pidAlive,
+		})
+	) {
+		return { acquired: false, blocked: true, reason: "identity_mismatch" };
+	}
 	if (
 		isFreshLiveOwner({
 			state: existing,
@@ -350,6 +388,16 @@ export async function acquireDaemonOwnership(input: {
 	}
 	const afterLock = await readJson<DaemonState>(fsImpl, paths.state);
 	if (
+		liveOwnerUsesDifferentIdentity({
+			state: afterLock,
+			tokenFingerprint: input.tokenFingerprint,
+			chatId: input.chatId,
+			pidAlive,
+		})
+	) {
+		return { acquired: false, blocked: true, reason: "identity_mismatch" };
+	}
+	if (
 		isFreshLiveOwner({
 			state: afterLock,
 			now: now(),
@@ -374,6 +422,16 @@ export async function acquireDaemonOwnership(input: {
 			})
 		) {
 			return { acquired: false, attached: true };
+		}
+		if (
+			liveOwnerUsesDifferentIdentity({
+				state: rechecked,
+				tokenFingerprint: input.tokenFingerprint,
+				chatId: input.chatId,
+				pidAlive,
+			})
+		) {
+			return { acquired: false, blocked: true, reason: "identity_mismatch" };
 		}
 		if (rechecked && pidAlive(rechecked.pid)) {
 			return { acquired: false, attached: true };
@@ -552,7 +610,16 @@ export async function spawnTelegramDaemonOwner(
 		ownerId: ownership.ownerId ?? "",
 		agentDir,
 	});
-	if (!ownership.acquired) return { result: "attached", runtime, warnings: [] };
+	if (!ownership.acquired) {
+		if (ownership.blocked) {
+			return {
+				result: "blocked",
+				runtime,
+				warnings: ["live telegram daemon uses a different bot token or chat; refusing to attach"],
+			};
+		}
+		return { result: "attached", runtime, warnings: [] };
+	}
 	const spawnImpl = deps.spawn ?? defaultDaemonSpawn;
 	const child = spawnImpl(command, args, {
 		detached: true,
@@ -569,12 +636,17 @@ export async function ensureTelegramDaemonRunning(
 ): Promise<EnsureDaemonResult> {
 	const cfg = getNotificationConfig(input.settings);
 	if (!isGloballyConfigured(cfg) || !cfg.botToken || !cfg.chatId) return "disabled";
-	const root = await registerNotificationRoot({ ...input, fs: deps.fs });
+	const root = notificationRootForCwd(input.cwd);
 	const fp = tokenFingerprint(cfg.botToken);
 	const spawned = await spawnTelegramDaemonOwner(
 		{ settings: input.settings, roots: [root], tokenFingerprint: fp, chatId: cfg.chatId },
 		deps,
 	);
+	if (spawned.result === "blocked") {
+		logger.warn(`notifications: failed to ensure Telegram daemon: ${spawned.warnings.join("; ")}`);
+		return spawned.result;
+	}
+	await registerNotificationRoot({ ...input, fs: deps.fs });
 	return spawned.result;
 }
 

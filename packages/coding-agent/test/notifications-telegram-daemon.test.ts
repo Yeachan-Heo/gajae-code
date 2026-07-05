@@ -291,6 +291,49 @@ describe("telegram daemon", () => {
 		expect(result).toEqual({ acquired: false, attached: true });
 	});
 
+	test("live owner token/chat mismatch blocks attach without registering a root", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, "");
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 999,
+				ownerId: "old",
+				tokenFingerprint: "old-fp",
+				chatId: "old-chat",
+				startedAt: 100,
+				heartbeatAt: 100,
+				roots: [],
+				version: DAEMON_VERSION,
+			}),
+		);
+
+		let spawns = 0;
+		const result = await ensureTelegramDaemonRunning(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				now: () => 101,
+				pidAlive: pid => pid === 999,
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			},
+		);
+
+		expect(result).toBe("blocked");
+		expect(spawns).toBe(0);
+		expect(fs.existsSync(paths.roots)).toBe(false);
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
+			ownerId: "old",
+			tokenFingerprint: "old-fp",
+			chatId: "old-chat",
+		});
+	});
+
 	test("idle self-exit after timeout releases ownership", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);

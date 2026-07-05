@@ -269,6 +269,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 				{ settings: this.settings, roots, tokenFingerprint: fp, chatId },
 				this.spawnDeps(),
 			);
+			warnings.push(...spawned.warnings);
 			const after = await this.status();
 			return this.result(
 				action,
@@ -351,6 +352,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			{ settings: this.settings, roots, tokenFingerprint: fp, chatId },
 			this.spawnDeps(),
 		);
+		warnings.push(...spawned.warnings);
 		const after = await this.status();
 		if (spawned.result === "attached") {
 			// A live owner already exists; attaching to it is a valid running end-state.
@@ -360,7 +362,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		}
 		return this.result(
 			action,
-			spawned.result !== "disabled",
+			spawned.result !== "disabled" && spawned.result !== "blocked",
 			`reloaded telegram daemon (${spawned.result})`,
 			before,
 			after,
