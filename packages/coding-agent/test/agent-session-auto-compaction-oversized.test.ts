@@ -74,7 +74,7 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 		});
 		const compactSpy = vi
 			.spyOn(compactionModule, "compact")
-			.mockRejectedValue(new Error("context_length_exceeded: request exceeds the context window"));
+			.mockRejectedValue(new Error("prompt is too long: 213462 tokens > 200000 maximum"));
 
 		await session.runIdleCompaction();
 		await session.runIdleCompaction();
@@ -84,7 +84,7 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 		expect(compactSpy).toHaveBeenCalledTimes(2);
 		expect(events).toHaveLength(2);
 		expect(events[0]).toMatchObject({
-			errorMessage: expect.stringContaining("context_length_exceeded"),
+			errorMessage: expect.stringContaining("prompt is too long"),
 			willRetry: false,
 		});
 		expect(events[0].skipped).toBeUndefined();
@@ -97,9 +97,7 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 
 	it("allows a new oversized maintenance attempt after the conversation changes", async () => {
 		appendConversation("initial");
-		const compactSpy = vi
-			.spyOn(compactionModule, "compact")
-			.mockRejectedValue(new Error("maximum context length exceeded"));
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockRejectedValue(new Error("request_too_large"));
 
 		await session.runIdleCompaction();
 		await session.runIdleCompaction();
