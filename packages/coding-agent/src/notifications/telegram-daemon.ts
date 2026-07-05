@@ -1453,19 +1453,31 @@ export class TelegramNotificationDaemon {
 	 * (so a delayed old close cannot delete a replacement), and best-effort closes
 	 * the socket. `scanRoots()` then reconnects the session.
 	 */
-	private dropSession(session: SessionSocket, _reason: string): void {
+	private dropSession(session: SessionSocket, reason: string): void {
 		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
 		if (session.pingTimer) {
 			clearIntervalImpl(session.pingTimer);
 			session.pingTimer = undefined;
 		}
-		if (this.sessions.get(session.sessionId) === session) {
+		const isCurrentSession = this.sessions.get(session.sessionId) === session;
+		if (isCurrentSession || reason === "session_closed") {
+			this.deleteMessageRoutes(session.sessionId);
+		}
+		if (isCurrentSession) {
 			this.sessions.delete(session.sessionId);
 		}
 		if (session.ws.readyState !== WebSocket.CLOSED) {
 			try {
 				session.ws.close();
 			} catch {}
+		}
+	}
+
+	private deleteMessageRoutes(sessionId: string, actionId?: string): void {
+		for (const [messageId, route] of this.messageRoutes.entries()) {
+			if (route.sessionId === sessionId && (actionId === undefined || route.actionId === actionId)) {
+				this.messageRoutes.delete(messageId);
+			}
 		}
 	}
 
@@ -1994,6 +2006,7 @@ export class TelegramNotificationDaemon {
 			await this.persistAliases();
 		} else if (msg.type === "action_resolved" && msg.id) {
 			session.pending.delete(msg.id);
+			this.deleteMessageRoutes(session.sessionId, msg.id);
 			for (const [alias, route] of this.aliasTable.entries()) {
 				if (route.sessionId === session.sessionId && route.actionId === msg.id) this.aliasTable.delete(alias);
 			}

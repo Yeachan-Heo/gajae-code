@@ -575,6 +575,86 @@ describe("telegram daemon", () => {
 		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("stale"))).toBe(true);
 	});
 
+	test("action_resolved clears reply message routes for that ask", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Q",
+			options: ["Y"],
+		});
+		const askMessageId = [...daemon.messageRoutes.entries()].find(
+			([, route]) => route.sessionId === "S" && route.actionId === "ask",
+		)?.[0];
+		expect(askMessageId).toBeDefined();
+		daemon.messageRoutes.set("same-session-other", { sessionId: "S", actionId: "other" });
+		daemon.messageRoutes.set("other-session", { sessionId: "T", actionId: "ask" });
+
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "action_resolved", id: "ask" });
+
+		expect(daemon.messageRoutes.has(askMessageId!)).toBe(false);
+		expect(daemon.messageRoutes.get("same-session-other")).toEqual({ sessionId: "S", actionId: "other" });
+		expect(daemon.messageRoutes.get("other-session")).toEqual({ sessionId: "T", actionId: "ask" });
+	});
+
+	test("delayed close from replaced socket preserves fresh reply message routes", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://old", "old-token");
+		const oldSocket = FakeWs.instances[0]!;
+		daemon.connectSession("S", "ws://new", "new-token");
+		const newSocket = FakeWs.instances[1]!;
+		const newSession = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(newSession, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask-new",
+			question: "Q",
+			options: ["Y"],
+		});
+		const askMessageId = [...daemon.messageRoutes.entries()].find(
+			([, route]) => route.sessionId === "S" && route.actionId === "ask-new",
+		)?.[0];
+		expect(askMessageId).toBeDefined();
+
+		oldSocket.close();
+
+		expect(daemon.sessions.get("S")).toBe(newSession);
+		expect(daemon.messageRoutes.has(askMessageId!)).toBe(true);
+		await daemon.handleTelegramUpdate({
+			message: { chat: { id: 42 }, text: "ok", reply_to_message: { message_id: Number(askMessageId) } },
+		});
+		expect(JSON.parse(newSocket.sent.at(-1)!)).toEqual({
+			type: "reply",
+			id: "ask-new",
+			answer: "ok",
+			token: "new-token",
+		});
+	});
+
 	test("reply_to_message routes and non-paired chat leaks nothing", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
@@ -1682,6 +1762,31 @@ test("session_closed deletes the topic and resume creates a fresh visible topic"
 	);
 });
 
+test("session_closed clears reply message routes for the closed session", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("S", "ws://s", "ts");
+	daemon.connectSession("T", "ws://t", "tt");
+	daemon.messageRoutes.set("s-ask", { sessionId: "S", actionId: "ask" });
+	daemon.messageRoutes.set("s-other", { sessionId: "S", actionId: "other" });
+	daemon.messageRoutes.set("t-ask", { sessionId: "T", actionId: "ask" });
+
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "session_closed", sessionId: "S" });
+
+	expect([...daemon.messageRoutes.values()].some(route => route.sessionId === "S")).toBe(false);
+	expect(daemon.messageRoutes.get("t-ask")).toEqual({ sessionId: "T", actionId: "ask" });
+});
+
 test("session_closed tombstones its endpoint generation so scans do not recreate an empty topic", async () => {
 	FakeWs.instances = [];
 	const agentDir = tempAgentDir();
@@ -2279,6 +2384,10 @@ test("requestStop aborts the active long poll and run() exits, releasing ownersh
 		pid: process.pid,
 		randomId: () => "owner",
 	});
+	let markPollStarted!: () => void;
+	const pollStarted = new Promise<void>(resolve => {
+		markPollStarted = resolve;
+	});
 	const bot = {
 		call: (method: string, _body: unknown, opts?: { signal?: AbortSignal }) => {
 			if (method === "getUpdates") {
@@ -2286,6 +2395,7 @@ test("requestStop aborts the active long poll and run() exits, releasing ownersh
 					opts?.signal?.addEventListener("abort", () =>
 						reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
 					);
+					markPollStarted();
 				});
 			}
 			return Promise.resolve({ ok: true, result: true });
@@ -2308,7 +2418,7 @@ test("requestStop aborts the active long poll and run() exits, releasing ownersh
 	});
 	daemon.connectSession("S", "ws://s", "t");
 	const runPromise = daemon.run();
-	await new Promise(resolve => setTimeout(resolve, 5));
+	await pollStarted;
 	daemon.requestStop("signal");
 	await runPromise;
 	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
