@@ -2569,20 +2569,57 @@ export async function checkpointUltragoalGoal(input: {
 				: undefined;
 	if (input.status === "complete" && isLedgerRepairRetry) {
 		// A ledger repair must not become a back door for rewriting the completion receipt: the retry
-		// is only trusted when the goal still carries its persisted receipt and the resubmitted
-		// quality gate hashes to the receipt's value. Fail closed when the receipt is missing, since
-		// there is nothing durable left to compare the resubmitted gate against.
-		const persistedHash = goal.completionVerification?.qualityGateHash;
-		if (persistedHash === undefined) {
+		// is only trusted when the goal still carries its durable, well-formed receipt whose identity
+		// matches this goal and whose quality-gate hash matches the resubmitted gate. Fail closed
+		// otherwise, and repair by re-appending the missing ledger row for the persisted receipt
+		// instead of minting a replacement receipt.
+		const receipt = goal.completionVerification;
+		if (!receipt) {
 			throw new Error(
-				`Cannot repair the ${goal.id} complete checkpoint because its durable completion receipt is missing; only checkpoints whose persisted receipt matches the resubmitted quality gate can be repaired.`,
+				`Cannot repair the ${goal.id} complete checkpoint because its durable completion receipt is missing or malformed; only checkpoints with a valid persisted receipt can be repaired.`,
 			);
 		}
-		if (hashStructuredValue(qualityGateJson) !== persistedHash) {
+		if (
+			receipt.schemaVersion !== 1 ||
+			!nonEmptyString(receipt.receiptId) ||
+			receipt.goalId !== goal.id ||
+			receipt.receiptKind !== chooseReceiptKind(plan, goal, input.status) ||
+			!nonEmptyString(receipt.planGeneration) ||
+			!nonEmptyString(receipt.checkpointLedgerEventId) ||
+			receipt.verifiedAt !== goal.updatedAt
+		) {
+			throw new Error(
+				`Cannot repair the ${goal.id} complete checkpoint because its durable completion receipt is missing or malformed; only checkpoints with a valid persisted receipt can be repaired.`,
+			);
+		}
+		if (hashStructuredValue(qualityGateJson) !== receipt.qualityGateHash) {
 			throw new Error(
 				`Cannot repair the ${goal.id} complete checkpoint with a different quality gate; resubmit the quality gate recorded in its completion receipt.`,
 			);
 		}
+		const generation = computeUltragoalPlanGeneration({
+			plan,
+			ledger: ledgerBefore,
+			goal,
+			receiptKind: receipt.receiptKind,
+			beforeStatus: receipt.goalStatusBeforeCheckpoint,
+			excludeEventId: receipt.checkpointLedgerEventId,
+		});
+		if (generation.planGeneration !== receipt.planGeneration) {
+			throw new Error(
+				`Cannot repair the ${goal.id} complete checkpoint because its durable completion receipt is stale for the current plan state.`,
+			);
+		}
+		await appendLedger(input.cwd, {
+			eventId: receipt.checkpointLedgerEventId,
+			event: "goal_checkpointed",
+			goalId: goal.id,
+			status: input.status,
+			evidence,
+			qualityGateJson,
+			completionVerification: receipt,
+		});
+		return plan;
 	}
 	const now = new Date().toISOString();
 	const beforeStatus = goal.status;

@@ -1388,6 +1388,10 @@ describe("native GJC ultragoal runtime", () => {
 			.map(line => `${line}\n`)
 			.join("");
 		await Bun.write(ledgerPath, withoutCheckpoint);
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const goalsBeforeRepair = await Bun.file(goalsPath).text();
+		const persistedReceipt = (await readUltragoalPlan(root))?.goals[0]?.completionVerification;
+		expect(persistedReceipt).toBeDefined();
 
 		// Retrying the identical checkpoint must repair the missing ledger row instead of rejecting
 		// the goal as already complete.
@@ -1404,6 +1408,11 @@ describe("native GJC ultragoal runtime", () => {
 		);
 		expect(checkpoints).toHaveLength(1);
 		expect(plan.goals[0]?.status).toBe("complete");
+		// The repair re-appends the missing row for the persisted receipt identity - it must not
+		// mint a replacement receipt or rewrite the plan.
+		expect(checkpoints[0]?.eventId).toBe(persistedReceipt?.checkpointLedgerEventId);
+		expect(plan.goals[0]?.completionVerification?.receiptId).toBe(persistedReceipt?.receiptId);
+		expect(await Bun.file(goalsPath).text()).toBe(goalsBeforeRepair);
 		const diagnostic = validateCompletionReceipt({
 			plan,
 			ledger: await readUltragoalLedger(root),
@@ -1496,6 +1505,56 @@ describe("native GJC ultragoal runtime", () => {
 				qualityGateJson: JSON.stringify(divergentGate),
 			}),
 		).rejects.toThrow("Cannot repair the G001 complete checkpoint because its durable completion receipt is missing");
+
+		const checkpoints = (await readUltragoalLedger(root)).filter(
+			event => event.event === "goal_checkpointed" && event.goalId === "G001" && event.status === "complete",
+		);
+		expect(checkpoints).toHaveLength(0);
+	});
+
+	it("rejects a ledger repair retry whose persisted receipt is malformed", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const qualityGateJson = await passingLiveQualityGate(root);
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "tests passed",
+			qualityGateJson,
+		});
+
+		// Strip the ledger row and replace the persisted receipt with a hash-only object: a matching
+		// qualityGateHash alone must not authorize the repair to mint a full replacement receipt.
+		const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+		const withoutCheckpoint = (await Bun.file(ledgerPath).text())
+			.split("\n")
+			.filter(line => line.length > 0 && !line.includes('"goal_checkpointed"'))
+			.map(line => `${line}\n`)
+			.join("");
+		await Bun.write(ledgerPath, withoutCheckpoint);
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const goalsDoc = (await Bun.file(goalsPath).json()) as {
+			goals: Array<{ completionVerification?: { qualityGateHash: string } }>;
+		};
+		const persistedHash = goalsDoc.goals[0]?.completionVerification?.qualityGateHash;
+		expect(persistedHash).toBeDefined();
+		goalsDoc.goals[0]!.completionVerification = { qualityGateHash: persistedHash! };
+		await Bun.write(goalsPath, JSON.stringify(goalsDoc, null, 2));
+
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "tests passed",
+				qualityGateJson: await passingLiveQualityGate(root),
+			}),
+		).rejects.toThrow(
+			"Cannot repair the G001 complete checkpoint because its durable completion receipt is missing or malformed",
+		);
 
 		const checkpoints = (await readUltragoalLedger(root)).filter(
 			event => event.event === "goal_checkpointed" && event.goalId === "G001" && event.status === "complete",
