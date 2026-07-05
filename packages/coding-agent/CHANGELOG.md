@@ -8,6 +8,7 @@
 - Added `gjc completion inshellisense`, which generates or installs a Fig/withfig-compatible `gjc` completion spec for Microsoft inshellisense without adding inshellisense as a runtime dependency.
 
 ### Fixed
+- Skill autocomplete now supports direct skill-name prefixes after prompt text (for example, `please /ra` → `/skill:ralplan`) while keeping bare `/` menus free of skill entries.
 - `gjc --tmux` on native Windows/psmux now keeps the status line and composer pinned to the bottom after viewport redraws by honoring the GJC tmux launch marker as a multiplexer signal even when `$TMUX` is absent.
 
 - `gjc config list`, `gjc config get`, and `gjc config set` now redact secret-like string settings by default, with `--show-secrets` as an explicit unsafe opt-in.

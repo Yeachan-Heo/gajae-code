@@ -233,7 +233,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			);
 			if (isRootPathSuggestionResult(baseSuggestions)) return baseSuggestions;
 			const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor, {
-				includeEmpty: slashPrefix === "/",
+				includeEmpty: false,
 			});
 			return sortSlashCommandSuggestions(
 				mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
