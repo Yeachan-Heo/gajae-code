@@ -176,16 +176,76 @@ async function runSetup(deps: NotifyCommandDeps): Promise<void> {
 	);
 }
 
-async function promptForToken(): Promise<string> {
-	if (!process.stdin.isTTY) {
+type TokenPromptInput = NodeJS.ReadStream & {
+	isRaw?: boolean;
+	setRawMode?: (mode: boolean) => unknown;
+};
+
+type TokenPromptOutput = Pick<NodeJS.WriteStream, "write">;
+
+export async function promptForToken(
+	input: TokenPromptInput = process.stdin,
+	output: TokenPromptOutput = process.stdout,
+): Promise<string> {
+	if (!input.isTTY) {
 		throw new Error("notify setup requires an interactive TTY unless setupToken is injected.");
 	}
-	const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
-	try {
-		return (await rl.question("Telegram BotFather token: ")).trim();
-	} finally {
-		rl.close();
+	if (typeof input.setRawMode !== "function") {
+		throw new Error("notify setup requires a TTY with raw input support unless setupToken is injected.");
 	}
+
+	output.write("Telegram BotFather token: ");
+	const wasRaw = input.isRaw === true;
+	input.setRawMode(true);
+
+	return await new Promise<string>((resolve, reject) => {
+		let value = "";
+		let settled = false;
+
+		const cleanup = () => {
+			input.off("data", onData);
+			input.off("error", onError);
+			input.setRawMode?.(wasRaw);
+			output.write("\n");
+		};
+
+		const finish = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			callback();
+		};
+
+		const accept = () => finish(() => resolve(value.trim()));
+		const cancel = () => finish(() => reject(new Error("Telegram bot token prompt cancelled.")));
+		const onError = (error: Error) => finish(() => reject(error));
+		const onData = (chunk: Buffer | string) => {
+			for (const char of String(chunk)) {
+				if (char === "\r" || char === "\n") {
+					accept();
+					return;
+				}
+				if (char === "\u0003") {
+					cancel();
+					return;
+				}
+				if (char === "\u0004") {
+					if (value) accept();
+					else cancel();
+					return;
+				}
+				if (char === "\u007f" || char === "\b") {
+					value = value.slice(0, -1);
+					continue;
+				}
+				if (char >= " ") value += char;
+			}
+		};
+
+		input.on("data", onData);
+		input.once("error", onError);
+		input.resume();
+	});
 }
 
 const THREADED_ENABLED_SUCCESS =

@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { parseNotifyArgs, runNotifyCommand } from "../src/cli/notify-cli";
+import { parseNotifyArgs, promptForToken, runNotifyCommand } from "../src/cli/notify-cli";
 import { Settings } from "../src/config/settings";
 import { getNotificationConfig, maskToken } from "../src/notifications/config";
 import {
@@ -60,6 +61,31 @@ async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string
 
 const token = "1234:super-secret-token";
 
+class FakeTokenInput extends EventEmitter {
+	isTTY = true;
+	isRaw = false;
+	resumeCalls = 0;
+
+	setRawMode(mode: boolean): this {
+		this.isRaw = mode;
+		return this;
+	}
+
+	resume(): this {
+		this.resumeCalls++;
+		return this;
+	}
+}
+
+class FakeTokenOutput {
+	text = "";
+
+	write(chunk: string | Uint8Array): boolean {
+		this.text += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+		return true;
+	}
+}
+
 describe("notify setup cli", () => {
 	test("parseNotifyArgs recognizes notify subcommands", () => {
 		expect(parseNotifyArgs(["shell"])).toBeUndefined();
@@ -75,6 +101,22 @@ describe("notify setup cli", () => {
 			smoke: true,
 			rawArgs: ["--smoke"],
 		});
+	});
+
+	test("interactive token prompt disables echo and does not write raw token", async () => {
+		const input = new FakeTokenInput();
+		const output = new FakeTokenOutput();
+
+		const prompt = promptForToken(input as unknown as NodeJS.ReadStream, output);
+		expect(input.isRaw).toBe(true);
+		input.emit("data", Buffer.from(token));
+		input.emit("data", Buffer.from("\n"));
+
+		await expect(prompt).resolves.toBe(token);
+		expect(input.isRaw).toBe(false);
+		expect(input.resumeCalls).toBe(1);
+		expect(output.text).toContain("Telegram BotFather token: ");
+		expect(output.text).not.toContain(token);
 	});
 
 	test("getMe ok plus private message writes settings and reads via config helper", async () => {
