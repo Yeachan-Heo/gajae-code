@@ -266,7 +266,7 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 			details.status = "disabled";
 			details.code = COMPUTER_DISABLED_CODE;
 			details.message =
-						"The computer tool is disabled or unsupported. It requires Apple Silicon macOS; set computer.enabled=true or computer.alwaysOn=true to enable on a supported host.";
+				"The computer tool is disabled or unsupported. It requires Apple Silicon macOS; set computer.enabled=true or computer.alwaysOn=true to enable on a supported host.";
 			await writeComputerAuditLog(this.session, details);
 			return { ...toolResult(details).text(`${COMPUTER_DISABLED_CODE}: ${details.message}`).done(), isError: true };
 		}
