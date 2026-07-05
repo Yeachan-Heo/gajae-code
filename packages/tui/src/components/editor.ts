@@ -4,6 +4,7 @@ import {
 	type CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 } from "../autocomplete";
+import { resolveAutocompleteSelectListLayout } from "../autocomplete-layout";
 import { BracketedPasteHandler } from "../bracketed-paste";
 import { getKeybindings, type KeybindingsManager } from "../keybindings";
 import { extractPrintableText, matchesKey } from "../keys";
@@ -22,12 +23,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "../utils";
-import { SelectList, type SelectListLayoutOptions, type SelectListTheme } from "./select-list";
-
-const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
-	minPrimaryColumnWidth: 12,
-	maxPrimaryColumnWidth: 32,
-};
+import { SelectList, type SelectListTheme } from "./select-list";
 
 function sanitizeLoadedText(text: string): string {
 	// Normalize CRLF/CR → LF, then strip C0 control chars except \n.
@@ -2725,11 +2721,8 @@ export class Editor implements Component, Focusable {
 		prefix: string,
 		items: Array<{ value: string; label: string; description?: string }>,
 	): SelectList {
-		// Layout options prepared for future SelectList enhancements (e.g., for slash commands)
-		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
-		// TODO: Pass layout to SelectList when constructor is updated to support it
-		void layout; // Use layout variable to avoid lint warnings
-		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList);
+		const layout = resolveAutocompleteSelectListLayout(prefix);
+		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList, layout);
 	}
 
 	#handleTabCompletion(): void {
