@@ -521,6 +521,38 @@ describe("telegram daemon", () => {
 		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
 	});
 
+	test("no-topic plain text does not answer the only pending ask", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+
+		await daemon.handleTelegramUpdate({
+			update_id: 2,
+			message: { chat: { id: 42 }, text: "my typed answer", message_id: 100 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent.some(frame => frame.type === "reply")).toBe(false);
+		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
+	});
+
 	test("plain text injects a user turn when no ask is pending", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();

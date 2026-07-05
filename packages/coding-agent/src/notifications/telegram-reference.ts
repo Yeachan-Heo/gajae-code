@@ -197,15 +197,9 @@ export type RouteDecision =
 	| { kind: "stale"; reason: string }
 	| { kind: "ignore" };
 
-export interface PendingAsk {
-	sessionId: string;
-	actionId: string;
-}
-
 export interface RouteInboundContext {
 	aliasTable: Pick<AliasTable, "get">;
 	messageRoutes: Map<string | number, CallbackRoute | Omit<CallbackRoute, "answer">>;
-	pendingBySession: (sessionId?: string) => PendingAsk[];
 	pairedChatId: string;
 }
 
@@ -250,16 +244,6 @@ export function routeInboundUpdate(update: unknown, ctx: RouteInboundContext): R
 		if (!route) return { kind: "stale", reason: "unknown_reply_message" };
 		return { kind: "reply", ...routeWithAnswer(route, text) };
 	}
-
-	if (text) {
-		const allPending = ctx.pendingBySession(undefined);
-		if (allPending.length === 1) {
-			const [pending] = allPending;
-			return { kind: "reply", sessionId: pending!.sessionId, actionId: pending!.actionId, answer: text };
-		}
-		if (allPending.length > 1) return { kind: "stale", reason: "ambiguous_plain_text" };
-	}
-
 	return { kind: "ignore" };
 }
 

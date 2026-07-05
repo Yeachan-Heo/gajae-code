@@ -49,7 +49,6 @@ import {
 	buildActionMessage,
 	type CallbackRoute,
 	createAliasTable,
-	type PendingAsk,
 	readEndpoint,
 	routeInboundUpdate,
 } from "./telegram-reference";
@@ -1912,14 +1911,6 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
-	pendingBySession = (sessionId?: string): PendingAsk[] => {
-		const result: PendingAsk[] = [];
-		for (const session of this.sessions.values()) {
-			if (sessionId && session.sessionId !== sessionId) continue;
-			result.push(...session.pending.values());
-		}
-		return result;
-	};
 
 	private async sendStaleGuidance(callbackId: unknown): Promise<void> {
 		if (typeof callbackId === "string") {
@@ -2033,7 +2024,6 @@ export class TelegramNotificationDaemon {
 		const decision = routeInboundUpdate(update, {
 			aliasTable: this.aliasTable,
 			messageRoutes: this.messageRoutes,
-			pendingBySession: this.pendingBySession,
 			pairedChatId: this.opts.chatId,
 		});
 		if (decision.kind === "reply") {

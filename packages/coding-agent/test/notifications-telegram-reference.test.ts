@@ -44,7 +44,7 @@ describe("telegram reference client helpers", () => {
 		expect(
 			routeInboundUpdate(
 				{ callback_query: { data: alias, message: { chat: { id: "bad" } } } },
-				{ aliasTable: table, messageRoutes: new Map(), pendingBySession: () => [], pairedChatId: "chat" },
+				{ aliasTable: table, messageRoutes: new Map(), pairedChatId: "chat" },
 			),
 		).toEqual({ kind: "ignore" });
 	});
@@ -52,7 +52,7 @@ describe("telegram reference client helpers", () => {
 	test("routeInboundUpdate routes callback aliases and fails closed for unknown aliases", () => {
 		const table = createAliasTable();
 		const alias = table.put({ sessionId: "s2", actionId: "a2", answer: "yes" });
-		const ctx = { aliasTable: table, messageRoutes: new Map(), pendingBySession: () => [], pairedChatId: "42" };
+		const ctx = { aliasTable: table, messageRoutes: new Map(), pairedChatId: "42" };
 		expect(routeInboundUpdate({ callback_query: { data: alias, message: { chat: { id: 42 } } } }, ctx)).toEqual({
 			kind: "reply",
 			sessionId: "s2",
@@ -65,16 +65,11 @@ describe("telegram reference client helpers", () => {
 		});
 	});
 
-	test("routeInboundUpdate: reply_to_message wins; ambiguous plain text is stale (tag commands removed)", () => {
+	test("routeInboundUpdate: reply_to_message wins; plain text without routing context is ignored", () => {
 		const messageRoutes = new Map([["10", { sessionId: "reply-session", actionId: "reply-action" }]]);
-		const pending = [
-			{ sessionId: "s1", actionId: "a1" },
-			{ sessionId: "s2", actionId: "a2" },
-		];
 		const ctx = {
 			aliasTable: createAliasTable(),
 			messageRoutes,
-			pendingBySession: (sessionId?: string) => pending.filter(item => !sessionId || item.sessionId === sessionId),
 			pairedChatId: "42",
 		};
 		// reply_to_message routes to the replied message's action.
@@ -84,26 +79,17 @@ describe("telegram reference client helpers", () => {
 				ctx,
 			),
 		).toEqual({ kind: "reply", sessionId: "reply-session", actionId: "reply-action", answer: "looks good" });
-		// Plain text with multiple pending asks is ambiguous; /answer tag commands are gone.
-		expect(routeInboundUpdate({ message: { chat: { id: 42 }, text: "plain" } }, ctx)).toEqual({
-			kind: "stale",
-			reason: "ambiguous_plain_text",
-		});
+		// Plain text without an alias or reply-to message does not guess from global pending asks.
+		expect(routeInboundUpdate({ message: { chat: { id: 42 }, text: "plain" } }, ctx)).toEqual({ kind: "ignore" });
 	});
 
-	test("routeInboundUpdate plain text routes only when unambiguous", () => {
+	test("routeInboundUpdate ignores no-topic plain text even when exactly one ask is pending globally", () => {
 		const ctx = {
 			aliasTable: createAliasTable(),
 			messageRoutes: new Map(),
-			pendingBySession: () => [{ sessionId: "only", actionId: "ask" }],
 			pairedChatId: "42",
 		};
-		expect(routeInboundUpdate({ message: { chat: { id: 42 }, text: "answer" } }, ctx)).toEqual({
-			kind: "reply",
-			sessionId: "only",
-			actionId: "ask",
-			answer: "answer",
-		});
+		expect(routeInboundUpdate({ message: { chat: { id: 42 }, text: "answer" } }, ctx)).toEqual({ kind: "ignore" });
 	});
 
 	test("buildActionMessage renders full options in body with compact inline keyboard", () => {
