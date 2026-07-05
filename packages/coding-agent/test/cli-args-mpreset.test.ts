@@ -11,15 +11,30 @@ import type { AgentSession } from "../src/session/agent-session";
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
 
-function fakeRegistry(profiles: ModelProfileDefinition[]) {
-	const profileMap = new Map(profiles.map(profile => [profile.name, profile]));
-	return {
-		getModelProfile: (name: string) => profileMap.get(name),
-		getModelProfiles: () => new Map(profileMap),
-		getAvailableModelProfileNames: () => [...profileMap.keys()].sort(),
+function fakeRegistry(
+	profiles: ModelProfileDefinition[],
+	options: { profilesAfterRefresh?: ModelProfileDefinition[]; modelsAfterRefresh?: Model[] } = {},
+) {
+	let activeProfiles = profiles;
+	let activeModels = [model("profile-provider", "default"), model("cli-provider", "explicit")];
+	const registry = {
+		refreshCalls: [] as string[],
+		refreshInBackgroundCalls: [] as string[],
+		getModelProfile: (name: string) => new Map(activeProfiles.map(profile => [profile.name, profile])).get(name),
+		getModelProfiles: () => new Map(activeProfiles.map(profile => [profile.name, profile])),
+		getAvailableModelProfileNames: () => activeProfiles.map(profile => profile.name).sort(),
 		getApiKeyForProvider: async () => "key",
-		getAll: () => [model("profile-provider", "default"), model("cli-provider", "explicit")],
+		getAll: () => activeModels,
+		async refresh(strategy = "online-if-uncached") {
+			registry.refreshCalls.push(strategy);
+			activeProfiles = options.profilesAfterRefresh ?? activeProfiles;
+			activeModels = options.modelsAfterRefresh ?? activeModels;
+		},
+		refreshInBackground(strategy = "online-if-uncached") {
+			registry.refreshInBackgroundCalls.push(strategy);
+		},
 	};
+	return registry;
 }
 
 function fakeSession(initial = model("initial-provider", "initial")) {
@@ -154,4 +169,58 @@ test("ACP session factory applies default profile and --mpreset before returning
 	expect(
 		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:medium", "cli-provider/explicit:high"]);
+});
+
+test("ACP session factory refreshes registry before applying project default profile", async () => {
+	const settings = Settings.isolated();
+	const projectSettings = Settings.isolated({ "modelProfile.default": "project-profile" });
+	const settingsWithProjectClone = settings as Settings & { cloneForCwd: (cwd: string) => Promise<Settings> };
+	settingsWithProjectClone.cloneForCwd = async () => projectSettings;
+	const session = fakeSession();
+	const registry = fakeRegistry([], {
+		profilesAfterRefresh: [
+			{
+				name: "project-profile",
+				requiredProviders: ["project-provider"],
+				modelMapping: { default: "project-provider/discovered:medium" },
+				source: "user",
+			},
+		],
+		modelsAfterRefresh: [model("project-provider", "discovered")],
+	});
+	const createSessionContexts: Array<{ skipPostCreateModelRefresh?: boolean } | undefined> = [];
+	const createSession = async (
+		_options: CreateAgentSessionOptions,
+		context?: { skipPostCreateModelRefresh?: boolean },
+	): Promise<CreateAgentSessionResult> => {
+		createSessionContexts.push(context);
+		if (!context?.skipPostCreateModelRefresh) {
+			registry.refreshInBackground();
+		}
+		return {
+			session,
+			setToolUIContext: () => {},
+			extensionsResult: {},
+			eventBus: {},
+		} as unknown as CreateAgentSessionResult;
+	};
+	const factory = createAcpSessionFactory({
+		baseOptions: {} as CreateAgentSessionOptions,
+		settings,
+		authStorage: { setRuntimeApiKey: () => {} } as never,
+		modelRegistry: registry as never,
+		parsedArgs: {},
+		rawArgs: [],
+		createSession,
+	});
+
+	const result = await factory(process.cwd());
+
+	expect(result).toBe(session);
+	expect(createSessionContexts).toEqual([{ skipPostCreateModelRefresh: true }]);
+	expect(registry.refreshCalls).toEqual(["online-if-uncached"]);
+	expect(registry.refreshInBackgroundCalls).toEqual([]);
+	expect(
+		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+	).toEqual(["project-provider/discovered:medium"]);
 });

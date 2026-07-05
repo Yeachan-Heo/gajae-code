@@ -189,6 +189,11 @@ function applyExtensionFlagValues(session: AgentSession, rawArgs: string[]): Map
 	return extensionRunner.getFlagValues();
 }
 
+type CreateSessionForMain = (
+	options: CreateAgentSessionOptions,
+	context?: { skipPostCreateModelRefresh?: boolean },
+) => Promise<CreateAgentSessionResult>;
+
 type AcpSessionFactory = (cwd: string) => Promise<AgentSession>;
 
 export interface AcpSessionFactoryOptions {
@@ -199,7 +204,7 @@ export interface AcpSessionFactoryOptions {
 	modelRegistry: ModelRegistry;
 	parsedArgs: Pick<Args, "apiKey" | "default" | "model" | "mpreset" | "thinking">;
 	rawArgs: string[];
-	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+	createSession: CreateSessionForMain;
 }
 
 export async function applyStartupModelProfiles(args: {
@@ -221,8 +226,11 @@ export async function applyStartupModelProfiles(args: {
 	// override it. startupModel covers the eager path; session.model covers the
 	// deferred `--model <pattern>` path resolved inside createAgentSession.
 	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
-
 	const defaultProfile = args.settings.get("modelProfile.default");
+	if (defaultProfile || args.parsedArgs.mpreset) {
+		await args.modelRegistry.refresh("online-if-uncached");
+	}
+
 	if (defaultProfile) {
 		await applyProfile(defaultProfile, false);
 	}
@@ -263,19 +271,23 @@ export async function applyStartupModelProfilesOrExit(
 export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
 	return async cwd => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
+		const hasStartupProfile = Boolean(nextSettings.get("modelProfile.default") || args.parsedArgs.mpreset);
 		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
-		const { session: nextSession } = await args.createSession({
-			...args.baseOptions,
-			cwd,
-			sessionManager: nextSessionManager,
-			settings: nextSettings,
-			authStorage: args.authStorage,
-			modelRegistry: args.modelRegistry,
-			agentId,
-			hasUI: false,
-			enableMCP: false,
-		});
+		const { session: nextSession } = await args.createSession(
+			{
+				...args.baseOptions,
+				cwd,
+				sessionManager: nextSessionManager,
+				settings: nextSettings,
+				authStorage: args.authStorage,
+				modelRegistry: args.modelRegistry,
+				agentId,
+				hasUI: false,
+				enableMCP: false,
+			},
+			{ skipPostCreateModelRefresh: hasStartupProfile },
+		);
 		await applyStartupModelProfilesOrExit({
 			session: nextSession,
 			settings: nextSettings,
@@ -944,6 +956,7 @@ export async function runRootCommand(
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 	sessionOptions.settings = settingsInstance;
+	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
 
 	// Research-mode (RLM) preset: augment session options before session creation.
 	deps.rlmPreset?.applyOptions(sessionOptions, settingsInstance);
@@ -962,12 +975,15 @@ export async function runRootCommand(
 	}
 
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
-	const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
+	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
 		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
 		// Kick off background model discovery only after createAgentSession finishes its parallel
 		// discovery arms; running these concurrently contends for the event loop and stretches
-		// every parallel arm by ~30ms.
-		modelRegistry.refreshInBackground();
+		// every parallel arm by ~30ms. Startup model profiles do their own foreground refresh
+		// before activation so project-scoped defaults can resolve freshly discovered models.
+		if (!context?.skipPostCreateModelRefresh) {
+			modelRegistry.refreshInBackground();
+		}
 		return result;
 	};
 
@@ -984,8 +1000,10 @@ export async function runRootCommand(
 		});
 		await (deps.runAcpMode ?? (await import("./modes/acp")).runAcpMode)(createAcpSession);
 	} else {
-		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, eventBus } =
-			await createSession(sessionOptions);
+		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, eventBus } = await createSession(
+			sessionOptions,
+			{ skipPostCreateModelRefresh: hasRootStartupProfile },
+		);
 		if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 		}
