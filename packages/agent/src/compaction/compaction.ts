@@ -679,6 +679,49 @@ export interface SummaryOptions {
 	preferWebsockets?: boolean;
 }
 
+/**
+ * Cap the serialized conversation fed to a summarization request so the request
+ * itself fits inside the model's context window.
+ *
+ * Without this, summarizing a near-full context serializes (nearly) the entire
+ * history back into a single summary request; on strict backends (e.g.
+ * OpenAI-code/Codex `context_length_exceeded`) that request itself overflows and
+ * throws, so context-overflow recovery cannot produce a summary and the agent
+ * fails to compact-and-continue — a non-interactive `gjc -p` run then terminates
+ * on the very overflow the recovery was meant to absorb.
+ *
+ * The budget reserves the summary's own output tokens plus prompt/system/template
+ * overhead, and applies a conservative safety factor because the chars/4 heuristic
+ * undercounts dense or CJK text (the reason the original overflow was missed).
+ * Truncation keeps the head (origin/goals) and the tail (most recent state) and
+ * elides the middle; it is a last resort that only triggers when the input would
+ * otherwise not fit.
+ */
+export function boundConversationTextForSummary(
+	conversationText: string,
+	model: Model,
+	outputMaxTokens: number,
+): string {
+	const contextWindow = model.contextWindow;
+	if (!Number.isFinite(contextWindow) || contextWindow <= 0) return conversationText;
+
+	const OVERHEAD_TOKENS = 4096;
+	const SAFETY_FACTOR = 0.6;
+	const inputBudgetTokens = Math.floor(
+		(contextWindow - Math.max(0, outputMaxTokens) - OVERHEAD_TOKENS) * SAFETY_FACTOR,
+	);
+	if (inputBudgetTokens <= 0) return conversationText;
+	if (estimateTextTokensHeuristic(conversationText) <= inputBudgetTokens) return conversationText;
+
+	const budgetChars = inputBudgetTokens * HEURISTIC_BYTES_PER_TOKEN;
+	const headChars = Math.floor(budgetChars * 0.35);
+	const tailChars = Math.max(0, budgetChars - headChars);
+	const head = conversationText.slice(0, headChars);
+	const tail = tailChars > 0 ? conversationText.slice(conversationText.length - tailChars) : "";
+	const elided = conversationText.length - head.length - tail.length;
+	return `${head}\n\n[... ${elided} characters of older conversation elided so this summarization request fits within the model context window ...]\n\n${tail}`;
+}
+
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model,
@@ -703,7 +746,7 @@ export async function generateSummary(
 	// Serialize conversation to text so model doesn't try to continue it
 	// Convert to LLM messages first (handles custom app messages when caller provides a transformer).
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
 
 	// Build the prompt with conversation wrapped in tags
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
@@ -859,7 +902,7 @@ async function generateShortSummary(
 ): Promise<string> {
 	const maxTokens = Math.min(512, Math.floor(0.2 * reserveTokens));
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(recentMessages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
 
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (historySummary) {
@@ -1235,7 +1278,7 @@ async function generateTurnPrefixSummary(
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(messages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [
 		{
