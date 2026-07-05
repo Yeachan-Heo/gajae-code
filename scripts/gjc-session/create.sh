@@ -163,8 +163,11 @@ PY
 echo
 echo "[gjc-session] GJC exited with status $rc"
 echo "[gjc-session] final status: $GJC_SESSION_FINAL_JSON"
-echo "[gjc-session] pane preserved for postmortem; press Ctrl-D to close"
-exec bash -l
+echo "[gjc-session] pane preserved for postmortem; press Ctrl-C to release hold"
+trap 'exit 0' INT TERM
+while true; do
+  sleep 3600
+done
 RUNNER
 chmod +x "$STATE_DIR/runner.sh"
 cat >"$STATE_DIR/monitor.sh" <<'MONITOR'
@@ -188,12 +191,36 @@ while true; do
   detected_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   final_present=false
   [[ -s "$GJC_SESSION_FINAL_JSON" ]] && final_present=true
+  final_severity=""
+  final_prompt_accepted=false
   if [[ "$final_present" == "true" ]]; then
-    printf '[%s] tmux session closed after final status; no vanished failure marker written\n' "$detected_at" >>"$GJC_SESSION_EVENTS_LOG"
-    exit 0
+    final_summary="$(python3 - "$GJC_SESSION_FINAL_JSON" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    data = {}
+print(data.get("severity") or "")
+print("true" if data.get("promptAccepted") is True else "false")
+PY
+)"
+    final_severity="$(printf '%s\n' "$final_summary" | sed -n '1p')"
+    final_prompt_accepted="$(printf '%s\n' "$final_summary" | sed -n '2p')"
+  fi
+  if [[ "$final_present" == "true" ]]; then
+    if [[ "$final_severity" != "failure" ]]; then
+      printf '[%s] tmux session closed after final status severity=%s; no vanished failure marker written\n' "$detected_at" "${final_severity:-unknown}" >>"$GJC_SESSION_EVENTS_LOG"
+      exit 0
+    fi
+    printf '[%s] tmux session missing after failure final; preserving vanished marker too\n' "$detected_at" >>"$GJC_SESSION_EVENTS_LOG"
   fi
   prompt_accepted=false
-  [[ -s "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}" ]] && prompt_accepted=true
+  if [[ -s "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}" || "$final_prompt_accepted" == "true" ]]; then
+    prompt_accepted=true
+  fi
   tui_ready=false
   if [[ -s "$GJC_SESSION_PANE_LOG" ]] && grep -Eq 'Gajae forge|Type your message|> Type your message|Working' "$GJC_SESSION_PANE_LOG"; then
     tui_ready=true
@@ -203,12 +230,15 @@ while true; do
   if [[ "$prompt_accepted" == "true" ]]; then
     vanish_phase="after_prompt_acceptance"
     vanish_reason="tmux_session_missing_after_prompt_acceptance"
+    if [[ "$final_present" == "true" ]]; then
+      vanish_reason="tmux_session_missing_after_prompt_acceptance_failure_final"
+    fi
   elif [[ "$tui_ready" == "true" ]]; then
     vanish_phase="before_prompt_acceptance"
     vanish_reason="tmux_session_missing_before_prompt_acceptance"
   fi
   severity="failure"
-  printf '[%s] tmux session vanished final_present=%s prompt_accepted=%s tui_ready=%s phase=%s severity=%s reason=%s\n' "$detected_at" "$final_present" "$prompt_accepted" "$tui_ready" "$vanish_phase" "$severity" "$vanish_reason" >>"$GJC_SESSION_EVENTS_LOG"
+  printf '[%s] tmux session vanished final_present=%s final_severity=%s prompt_accepted=%s tui_ready=%s phase=%s severity=%s reason=%s\n' "$detected_at" "$final_present" "${final_severity:-none}" "$prompt_accepted" "$tui_ready" "$vanish_phase" "$severity" "$vanish_reason" >>"$GJC_SESSION_EVENTS_LOG"
   gjc_session_write_vanished_json \
     "$GJC_SESSION_VANISHED_JSON" \
     "$GJC_SESSION_NAME" \
@@ -217,7 +247,7 @@ while true; do
     "$vanish_phase" \
     "$severity" \
     "$prompt_accepted" \
-    false \
+    "$final_present" \
     "$tui_ready" \
     "$GJC_SESSION_PANE_LOG" \
     "$GJC_SESSION_EVENTS_LOG" \

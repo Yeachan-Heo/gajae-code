@@ -496,6 +496,64 @@ exit 0
 		});
 	}, 20000);
 
+	test("monitor preserves vanished marker when failure-final hold disappears after prompt acceptance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-failure-final-vanish-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_failure_final_vanish_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+printf 'Gajae forge\n> Type your message\n'
+IFS= read -r line
+printf '\nWorking then owner exits before terminal status\n'
+exit 0
+`,
+		);
+
+		const created = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_INTERVAL: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(created.exitCode).toBe(0);
+
+		const prompted = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "accepted then failure final"], {
+			env: isolatedEnv({
+				GJC_SESSION_STATE_DIR: stateDir,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "2",
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(prompted.exitCode).toBe(0);
+		await waitForFile(path.join(stateDir, "final.json"));
+
+		Bun.spawnSync(["tmux", "kill-session", "-t", session], { stderr: "pipe", stdout: "pipe" });
+		await waitForFile(path.join(stateDir, "vanished.json"));
+
+		const vanished = (await Bun.file(path.join(stateDir, "vanished.json")).json()) as {
+			finalPresent: boolean;
+			promptAccepted: boolean;
+			reason: string;
+			severity: string;
+		};
+		expect(vanished).toMatchObject({
+			finalPresent: true,
+			promptAccepted: true,
+			reason: "tmux_session_missing_after_prompt_acceptance_failure_final",
+			severity: "failure",
+		});
+	}, 20000);
+
 	test("prompt accepts durable evidence when owner exits immediately after output", async () => {
 		const session = `gjc_issue_1496_prompt_exit_after_evidence_${process.pid}_${Date.now()}`;
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-prompt-exit-after-evidence-"));
