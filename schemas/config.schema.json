@@ -1936,6 +1936,10 @@
 					"type": "boolean",
 					"default": false
 				},
+				"enableStandalone": {
+					"type": "boolean",
+					"default": false
+				},
 				"discoveryMode": {
 					"type": "boolean",
 					"default": false

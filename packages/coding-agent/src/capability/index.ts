@@ -67,6 +67,12 @@ export function registerProvider<T>(capabilityId: string, provider: Provider<T>)
 		throw new Error(`Unknown capability: "${capabilityId}". Define it first with defineCapability().`);
 	}
 
+	const providers = capability.providers as Provider<T>[];
+	if (providers.some(p => p.id === provider.id)) {
+		logger.warn("Ignoring duplicate provider registration", { capability: capabilityId, provider: provider.id });
+		return;
+	}
+
 	// Store provider metadata (for cross-capability display)
 	if (!providerMeta.has(provider.id)) {
 		providerMeta.set(provider.id, {
@@ -82,7 +88,6 @@ export function registerProvider<T>(capabilityId: string, provider: Provider<T>)
 	providerCapabilities.get(provider.id)!.add(capabilityId);
 
 	// Insert in priority order (highest first)
-	const providers = capability.providers as Provider<T>[];
 	const idx = providers.findIndex(p => p.priority < provider.priority);
 	if (idx === -1) {
 		providers.push(provider);

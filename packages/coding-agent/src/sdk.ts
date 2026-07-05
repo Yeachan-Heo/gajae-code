@@ -581,6 +581,10 @@ const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
 
 /** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
+const STANDALONE_STARTUP_MCP_PROVIDERS = ["native", "mcp-json"] as const;
+const STANDALONE_STARTUP_MCP_MAX_SERVERS = 8;
+const STANDALONE_STARTUP_MCP_MAX_CONCURRENT_CONNECTS = 4;
+
 
 let sshCleanupRegistered = false;
 
@@ -1365,6 +1369,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// always-on tools per the plugin product contract.
 		let mcpManager: MCPManager | undefined = options.mcpManager;
 		let ownsMcpManager = false;
+		let installedMcpManagerSingleton: MCPManager | undefined;
 		const customTools: CustomTool[] = [];
 
 		// Add image tools when the active model or configured image providers can generate images.
@@ -1491,11 +1496,57 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 		}
+		const standaloneMcpEnabled = settings.getGlobal("mcp.enableStandalone") === true;
+		const standaloneProjectMcpEnabled = settings.getGlobal("mcp.enableProjectConfig") === true;
+		// Standalone MCP can execute configured commands; this gate intentionally uses getGlobal so
+		// project settings cannot enable standalone MCP or authorize project MCP. Never weaken to
+		// merged settings.get.
+		if (standaloneMcpEnabled && !options.parentTaskPrefix) {
+			const target = mcpManager ?? new MCPManager(cwd);
+			const createdForStandalone = !mcpManager;
+			target.setAuthStorage(authStorage);
+			const preexistingServers = new Set(target.getConnectedServers());
+			try {
+				const result = await target.discoverAndConnect({
+					providers: [...STANDALONE_STARTUP_MCP_PROVIDERS],
+					enableProjectConfig: standaloneProjectMcpEnabled,
+					filterExa: true,
+					filterBrowser: builtinTools.some(tool => tool.name === "browser"),
+					autoloadOnly: true,
+					maxServers: STANDALONE_STARTUP_MCP_MAX_SERVERS,
+					maxConcurrentConnects: STANDALONE_STARTUP_MCP_MAX_CONCURRENT_CONNECTS,
+					forceNoInheritEnvForStdio: true,
+				});
+				for (const [server, error] of result.errors) {
+					logger.warn("Standalone MCP connect failed", { path: `mcp:${server}`, error });
+				}
+				if (result.connectedServers.length > 0) {
+					mcpManager = target;
+					if (createdForStandalone) ownsMcpManager = true;
+					customTools.push(...(result.tools as CustomTool[]));
+				} else if (createdForStandalone) {
+					await target.disconnectAll().catch(() => {});
+				}
+			} catch (error) {
+				if (createdForStandalone) {
+					await target.disconnectAll().catch(() => {});
+				} else {
+					for (const name of target.getConnectedServers()) {
+						if (!preexistingServers.has(name)) await target.disconnectServer(name).catch(() => {});
+					}
+				}
+				logger.warn("Failed to wire standalone MCP servers", { error });
+			}
+		}
+
 		// Only top-level sessions own the global MCPManager. Subagents already
 		// receive the parent's manager via options.mcpManager; reassigning the
 		// singleton to the same value is a no-op. Keep the gate explicit to mirror
 		// the AsyncJobManager ownership rule.
-		if (mcpManager && !options.parentTaskPrefix) MCPManager.setInstance(mcpManager);
+		if (mcpManager && !options.parentTaskPrefix) {
+			MCPManager.setInstance(mcpManager);
+			installedMcpManagerSingleton = mcpManager;
+		}
 
 		// Custom tool and extension discovery is quarantined from the public GJC utility surface.
 		// Explicit SDK extension factories are still honored; callers use them to
@@ -2268,6 +2319,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				try {
 					await originalDispose();
 				} finally {
+					if (installedMcpManagerSingleton && MCPManager.instance() === installedMcpManagerSingleton) {
+						MCPManager.setInstance(undefined);
+					}
 					agentRegistry.unregister(resolvedAgentId);
 					unsubscribeCredentialDisabled?.();
 				}

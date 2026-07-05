@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Added
+- Added a default-off, user-global `mcp.enableStandalone` opt-in that connects explicitly configured standalone MCP servers (`native` + `mcp-json` sources) into top-level sessions; project `.mcp.json` requires user-global `mcp.enableProjectConfig`, standalone stdio defaults to `noInheritEnv:true`, and startup is capped at 8 servers / 4 concurrent connects.
 
 - Queued message selector entries can now be reordered with `Ctrl+Up` / `Ctrl+Down`, with `Ctrl+Shift+Up` / `Ctrl+Shift+Down` still accepted when the terminal forwards them, while keeping the current draft intact.
 

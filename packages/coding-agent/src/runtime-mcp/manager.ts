@@ -149,6 +149,14 @@ export interface MCPDiscoverOptions {
 	filterBrowser?: boolean;
 	/** Only connect servers with autoload !== false (default: false) */
 	autoloadOnly?: boolean;
+	/** Capability provider id allow-list. When omitted, all registered providers are loaded. */
+	providers?: string[];
+	/** Maximum number of eligible servers to return after filtering. */
+	maxServers?: number;
+	/** Maximum number of concurrent connection attempts. When omitted, existing parallel behavior is preserved. */
+	maxConcurrentConnects?: number;
+	/** Force stdio servers to receive only the minimal inherited environment plus explicit env. */
+	forceNoInheritEnvForStdio?: boolean;
 	/** Called when starting to connect to servers */
 	onConnecting?: (serverNames: string[]) => void;
 }
@@ -328,8 +336,11 @@ export class MCPManager {
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,
 			autoloadOnly: options?.autoloadOnly,
+			providers: options?.providers,
+			maxServers: options?.maxServers,
+			forceNoInheritEnvForStdio: options?.forceNoInheritEnvForStdio,
 		});
-		const result = await this.connectServers(configs, sources, options?.onConnecting);
+		const result = await this.connectServers(configs, sources, options?.onConnecting, options?.maxConcurrentConnects);
 		result.exaApiKeys = exaApiKeys;
 		return result;
 	}
@@ -342,6 +353,7 @@ export class MCPManager {
 		configs: Record<string, MCPServerConfig>,
 		sources: Record<string, SourceMeta>,
 		onConnecting?: (serverNames: string[]) => void,
+		maxConcurrentConnects?: number,
 	): Promise<MCPLoadResult> {
 		type ConnectionTask = {
 			name: string;
@@ -359,6 +371,41 @@ export class MCPManager {
 		const reportedErrors = new Set<string>();
 		let allowBackgroundLogging = false;
 		let shouldPublishToolSnapshot = true;
+		const connectionLimit =
+			typeof maxConcurrentConnects === "number" && Number.isInteger(maxConcurrentConnects) && maxConcurrentConnects > 0
+				? maxConcurrentConnects
+				: undefined;
+		let activeConnectionStarts = 0;
+		const waitingConnectionStarts: Array<() => void> = [];
+		const acquireConnectionSlot = async (signal: AbortSignal): Promise<() => void> => {
+			if (connectionLimit === undefined) return () => {};
+			if (signal.aborted) throw new Error("MCP connection aborted before start");
+			if (activeConnectionStarts < connectionLimit) {
+				activeConnectionStarts += 1;
+			} else {
+				await new Promise<void>((resolve, reject) => {
+					const wake = () => {
+						signal.removeEventListener("abort", abort);
+						resolve();
+					};
+					const abort = () => {
+						const index = waitingConnectionStarts.indexOf(wake);
+						if (index >= 0) waitingConnectionStarts.splice(index, 1);
+						reject(new Error("MCP connection aborted before start"));
+					};
+					signal.addEventListener("abort", abort, { once: true });
+					waitingConnectionStarts.push(wake);
+				});
+				activeConnectionStarts += 1;
+			}
+			let released = false;
+			return () => {
+				if (released) return;
+				released = true;
+				activeConnectionStarts -= 1;
+				waitingConnectionStarts.shift()?.();
+			};
+		};
 
 		// Prepare connection tasks
 		const connectionTasks: ConnectionTask[] = [];
@@ -404,16 +451,21 @@ export class MCPManager {
 			this.#pendingConnectionControllers.set(name, connectionAbort);
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			const connectionPromise = (async () => {
-				const resolvedConfig = await this.#resolveAuthConfig(config);
-				return connectToServer(name, resolvedConfig, {
-					signal: connectionAbort.signal,
-					onNotification: (method, params) => {
-						this.#handleServerNotification(name, method, params);
-					},
-					onRequest: (method, params) => {
-						return this.#handleServerRequest(method, params);
-					},
-				});
+				const releaseConnectionSlot = await acquireConnectionSlot(connectionAbort.signal);
+				try {
+					const resolvedConfig = await this.#resolveAuthConfig(config);
+					return await connectToServer(name, resolvedConfig, {
+						signal: connectionAbort.signal,
+						onNotification: (method, params) => {
+							this.#handleServerNotification(name, method, params);
+						},
+						onRequest: (method, params) => {
+							return this.#handleServerRequest(method, params);
+						},
+					});
+				} finally {
+					releaseConnectionSlot();
+				}
 			})().then(
 				async connection => {
 					// Store original config (without resolved tokens) to keep

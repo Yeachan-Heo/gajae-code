@@ -4,13 +4,13 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
-import { getMCPConfigPath } from "@gajae-code/utils";
+import { getMCPConfigPath, logger } from "@gajae-code/utils";
 import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { readDisabledServers } from "./config-writer";
-import type { MCPServerConfig } from "./types";
+import type { MCPServerConfig, MCPStdioServerConfig } from "./types";
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
@@ -22,6 +22,12 @@ export interface LoadMCPConfigsOptions {
 	filterBrowser?: boolean;
 	/** Only include servers eligible for startup connection, i.e. autoload !== false (default: false) */
 	autoloadOnly?: boolean;
+	/** Capability provider id allow-list. When omitted, all registered providers are loaded. */
+	providers?: string[];
+	/** Maximum number of eligible servers to return after filtering. */
+	maxServers?: number;
+	/** Force stdio servers to receive only the minimal inherited environment plus explicit env. */
+	forceNoInheritEnvForStdio?: boolean;
 }
 
 /** Result of loading MCP configs */
@@ -37,6 +43,10 @@ export interface LoadMCPConfigsResult {
 /**
  * Convert canonical MCPServer to legacy MCPServerConfig.
  */
+function isStdioConfig(config: MCPServerConfig): config is MCPStdioServerConfig {
+	return config.type === "stdio" || (!config.type && "command" in config);
+}
+
 function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 	// Determine transport type
 	const transport = server.transport ?? (server.command ? "stdio" : server.url ? "http" : "stdio");
@@ -100,9 +110,10 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	const filterExa = options?.filterExa ?? true;
 	const filterBrowser = options?.filterBrowser ?? false;
 	const autoloadOnly = options?.autoloadOnly ?? false;
+	const loadOptions = options?.providers === undefined ? { cwd } : { cwd, providers: options.providers };
 
 	// Load MCP servers via capability system
-	const result = await loadCapability<MCPServer>(mcpCapability.id, { cwd });
+	const result = await loadCapability<MCPServer>(mcpCapability.id, loadOptions);
 
 	// Filter out project-level configs if disabled
 	const servers = enableProjectConfig
@@ -139,6 +150,35 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		const browserResult = filterBrowserMCPServers(configs, sources);
 		configs = browserResult.configs;
 		sources = browserResult.sources;
+	}
+
+	if (options?.forceNoInheritEnvForStdio) {
+		for (const config of Object.values(configs)) {
+			if (isStdioConfig(config)) {
+				config.noInheritEnv = true;
+			}
+		}
+	}
+
+	if (typeof options?.maxServers === "number" && Object.keys(configs).length > options.maxServers) {
+		const keptNames = Object.keys(configs).sort().slice(0, Math.max(0, options.maxServers));
+		const kept = new Set(keptNames);
+		const droppedNames = Object.keys(configs).filter(name => !kept.has(name)).sort();
+		const cappedConfigs: Record<string, MCPServerConfig> = {};
+		const cappedSources: Record<string, SourceMeta> = {};
+		for (const name of keptNames) {
+			cappedConfigs[name] = configs[name];
+			if (sources[name]) {
+				cappedSources[name] = sources[name];
+			}
+		}
+		configs = cappedConfigs;
+		sources = cappedSources;
+		logger.warn("Standalone MCP server cap exceeded", {
+			kept: keptNames.length,
+			dropped: droppedNames.length,
+			skipped: droppedNames.map(name => `mcp:${name}`),
+		});
 	}
 
 	return { configs, exaApiKeys, sources };

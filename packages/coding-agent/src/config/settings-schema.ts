@@ -2518,6 +2518,11 @@ export const SETTINGS_SCHEMA = {
 		default: false,
 	},
 
+	"mcp.enableStandalone": {
+		type: "boolean",
+		default: false,
+	},
+
 	"mcp.discoveryMode": {
 		type: "boolean",
 		default: false,
