@@ -7,6 +7,7 @@ export interface DaemonPaths {
 	roots: string;
 	steal: string;
 	aliases: string;
+	seenUpdates: string;
 }
 
 export function daemonPaths(agentDir: string): DaemonPaths {
@@ -18,5 +19,6 @@ export function daemonPaths(agentDir: string): DaemonPaths {
 		roots: path.join(dir, "telegram-daemon.roots.json"),
 		steal: path.join(dir, "telegram-daemon.steal"),
 		aliases: path.join(dir, "telegram-callback-aliases.json"),
+		seenUpdates: path.join(dir, "telegram-seen-updates.json"),
 	};
 }

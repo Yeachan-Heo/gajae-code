@@ -786,6 +786,61 @@ describe("telegram daemon", () => {
 		expect(sent.some(frame => frame.type === "reply")).toBe(false);
 	});
 
+	test("persisted seen update ids suppress duplicate threaded injection after restart", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 77,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "repeat once", message_id: 100 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent.some(frame => frame.type === "user_message" && frame.text === "repeat once")).toBe(true);
+		const seenState = JSON.parse(fs.readFileSync(daemonPaths(agentDir).seenUpdates, "utf8")) as {
+			updateIds: number[];
+		};
+		expect(seenState.updateIds).toContain(77);
+
+		FakeWs.instances = [];
+		const restarted = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner-2",
+			botToken: "tok",
+			chatId: "42",
+			botApi: new FakeBotApi(),
+			WebSocketImpl: FakeWs as any,
+		});
+		await restarted.loadTopics();
+		await restarted.loadSeenUpdateIds();
+		restarted.connectSession("S", "ws://s2", "ts2");
+
+		await restarted.handleTelegramUpdate({
+			update_id: 77,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "repeat once", message_id: 101 },
+		});
+
+		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
+	});
+
 	test("runDaemonSmoke exits without polling and emits no token", async () => {
 		const agentDir = tempAgentDir();
 		await runDaemonSmoke({ agentDir });
