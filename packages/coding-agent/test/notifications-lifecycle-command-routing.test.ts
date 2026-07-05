@@ -32,6 +32,7 @@ function spyBot(): { calls: Call[]; api: never } {
 	const api = {
 		call: async (method: string, body: Record<string, unknown> | null) => {
 			calls.push({ method, body });
+			if (method === "getChat") return { ok: true, result: { id: body?.chat_id, type: "private" } };
 			return { ok: true, result: [] };
 		},
 	} as never;
