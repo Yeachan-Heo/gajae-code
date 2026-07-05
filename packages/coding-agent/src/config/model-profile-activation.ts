@@ -76,6 +76,34 @@ export interface MaterializeModelProfileAssignmentOptions {
 	selector: string;
 }
 
+export interface MaterializeModelProfileAssignmentsOptions {
+	session: Pick<
+		ModelProfileActivationSession,
+		"model" | "thinkingLevel" | "setActiveModelProfile" | "getActiveModelProfile"
+	>;
+	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set">;
+	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string> | Partial<Record<GjcModelAssignmentTargetId, string>>;
+}
+
+function isReadonlyAssignmentMap(
+	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string> | Partial<Record<GjcModelAssignmentTargetId, string>>,
+): assignments is ReadonlyMap<GjcModelAssignmentTargetId, string> {
+	return typeof (assignments as { entries?: unknown }).entries === "function";
+}
+
+function getMaterializedAssignments(
+	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string> | Partial<Record<GjcModelAssignmentTargetId, string>>,
+): Array<[GjcModelAssignmentTargetId, string]> {
+	if (isReadonlyAssignmentMap(assignments)) return [...assignments.entries()];
+	const assignmentRecord: Partial<Record<GjcModelAssignmentTargetId, string>> = assignments;
+	const result: Array<[GjcModelAssignmentTargetId, string]> = [];
+	for (const role of Object.keys(assignmentRecord) as GjcModelAssignmentTargetId[]) {
+		const selector = assignmentRecord[role];
+		if (selector !== undefined) result.push([role, selector]);
+	}
+	return result;
+}
+
 export function materializeActiveModelProfileAssignment(options: MaterializeModelProfileAssignmentOptions): boolean {
 	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
 	if (!activeProfile) return false;
@@ -97,6 +125,43 @@ export function materializeActiveModelProfileAssignment(options: MaterializeMode
 		nextModelRoles[options.role] = options.selector;
 	} else {
 		nextAgentModelOverrides[options.role] = options.selector;
+	}
+
+	options.settings.set("modelRoles", nextModelRoles);
+	options.settings.set("task.agentModelOverrides", nextAgentModelOverrides);
+	options.settings.set("modelProfile.default", undefined);
+	options.settings.clearOverride("modelProfile.default");
+	options.settings.override("modelRoles", nextModelRoles);
+	options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
+	options.session.setActiveModelProfile?.(undefined);
+	return true;
+}
+
+export function materializeActiveModelProfileAssignments(options: MaterializeModelProfileAssignmentsOptions): boolean {
+	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
+	if (!activeProfile) return false;
+
+	const materializedAssignments = getMaterializedAssignments(options.assignments);
+	if (materializedAssignments.length === 0) return true;
+
+	const nextModelRoles = { ...options.settings.get("modelRoles") };
+	const nextAgentModelOverrides = { ...options.settings.get("task.agentModelOverrides") };
+	const includesDefault = materializedAssignments.some(([role]) => role === "default");
+
+	if (!includesDefault && !nextModelRoles.default && options.session.model) {
+		nextModelRoles.default = formatModelSelectorValue(
+			`${options.session.model.provider}/${options.session.model.id}`,
+			options.session.thinkingLevel,
+		);
+	}
+
+	for (const [role, selector] of materializedAssignments) {
+		const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+		if (target.settingsPath === "modelRoles") {
+			nextModelRoles[role] = selector;
+		} else {
+			nextAgentModelOverrides[role] = selector;
+		}
 	}
 
 	options.settings.set("modelRoles", nextModelRoles);

@@ -6,6 +6,7 @@ import {
 	applyPreparedModelProfileActivation,
 	formatModelProfileCredentialError,
 	materializeActiveModelProfileAssignment,
+	materializeActiveModelProfileAssignments,
 	prepareModelProfileActivation,
 } from "../src/config/model-profile-activation";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
@@ -232,6 +233,55 @@ describe("model profile activation", () => {
 			default: "provider-c/default:low",
 		});
 		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("batch materialization writes role agents once and clears the active profile once", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({
+			"modelProfile.default": "profile-a",
+			"task.agentModelOverrides": { critic: "provider-a/old-critic" },
+		});
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+		let clearedActiveProfile = 0;
+		const originalSetActiveModelProfile = session.setActiveModelProfile.bind(session);
+		session.setActiveModelProfile = (name: string | undefined) => {
+			if (name === undefined) clearedActiveProfile++;
+			originalSetActiveModelProfile(name);
+		};
+
+		const materialized = materializeActiveModelProfileAssignments({
+			session,
+			settings,
+			assignments: new Map([
+				["executor", "provider-c/executor:low"],
+				["architect", "provider-c/architect:medium"],
+			]),
+		});
+
+		expect(materialized).toBe(true);
+		expect(clearedActiveProfile).toBe(1);
+		expect(settings.get("modelRoles")).toEqual({ default: "provider-a/default:high" });
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "provider-a/old-critic",
+			executor: "provider-c/executor:low",
+			architect: "provider-c/architect:medium",
+		});
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("batch materialization is inactive without an active profile", () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "task.agentModelOverrides": { critic: "provider-a/old-critic" } });
+
+		const materialized = materializeActiveModelProfileAssignments({
+			session,
+			settings,
+			assignments: { executor: "provider-c/executor:low" },
+		});
+
+		expect(materialized).toBe(false);
+		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "provider-a/old-critic" });
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 

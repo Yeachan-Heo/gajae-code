@@ -96,6 +96,7 @@ export type ModelSelectorSelection =
 			kind: "assignment";
 			model: Model;
 			role: GjcModelAssignmentTargetId | null;
+			roles?: readonly GjcModelAssignmentTargetId[];
 			thinkingLevel?: ThinkingLevel;
 			selector?: string;
 	  }
@@ -1360,7 +1361,11 @@ export class ModelSelectorComponent extends Container {
 		for (let i = 0; i < actionCount; i++) {
 			const prefix = i === this.#selectedActionIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[i];
-			const label = `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name})`;
+			const label = role
+				? `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name})`
+				: i === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length
+					? "Set for all role agents"
+					: "Set for all targets";
 			this.#listContainer.addChild(
 				new Text(`${prefix}${i === this.#selectedActionIndex ? theme.fg("accent", label) : label}`, 0, 0),
 			);
@@ -1389,7 +1394,7 @@ export class ModelSelectorComponent extends Container {
 		return this.#roles[role]?.thinkingLevel ?? ThinkingLevel.Inherit;
 	}
 	#getActionCount(_model: Model): number {
-		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length;
+		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + 2;
 	}
 
 	#getSelectedItem(): ModelItem | CanonicalModelItem | undefined {
@@ -1660,7 +1665,15 @@ export class ModelSelectorComponent extends Container {
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			this.#pendingActionItem = undefined;
 			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[this.#selectedActionIndex];
-			if (role) this.#handleSelect(item, role);
+			if (role) {
+				this.#handleSelect(item, role);
+				return;
+			}
+			const roles =
+				this.#selectedActionIndex === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length
+					? (["executor", "architect", "planner", "critic"] as const)
+					: GJC_MODEL_ASSIGNMENT_TARGET_IDS;
+			this.#handleSelect(item, "default", undefined, roles);
 			return;
 		}
 		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
@@ -1719,6 +1732,7 @@ export class ModelSelectorComponent extends Container {
 		item: ModelItem | CanonicalModelItem,
 		role: GjcModelAssignmentTargetId | null,
 		thinkingLevel?: ThinkingLevel,
+		roles?: readonly GjcModelAssignmentTargetId[],
 	): void {
 		const itemThinkingLevel = thinkingLevel ?? item.thinkingLevel;
 		const hasExplicitThinkingChoice = thinkingLevel !== undefined || item.explicitThinkingLevel === true;
@@ -1743,17 +1757,23 @@ export class ModelSelectorComponent extends Container {
 		}
 
 		const selectedThinkingLevel = itemThinkingLevel ?? this.#getCurrentRoleThinkingLevel(role);
-		const selectorValue =
-			role === "default" ? item.selector : formatModelSelectorValue(item.selector, selectedThinkingLevel);
+		const selectorValue = roles
+			? formatModelSelectorValue(item.selector, selectedThinkingLevel)
+			: role === "default"
+				? item.selector
+				: formatModelSelectorValue(item.selector, selectedThinkingLevel);
 
 		// Update local state for UI
-		this.#roles[role] = { model: item.model, thinkingLevel: selectedThinkingLevel };
+		for (const targetRole of roles ?? [role]) {
+			this.#roles[targetRole] = { model: item.model, thinkingLevel: selectedThinkingLevel };
+		}
 
 		// Notify caller (for updating agent state if needed)
 		this.#onSelectCallback({
 			kind: "assignment",
 			model: item.model,
 			role,
+			roles,
 			thinkingLevel: selectedThinkingLevel,
 			selector: selectorValue,
 		});

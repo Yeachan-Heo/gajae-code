@@ -6,12 +6,13 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { Spacer, Text } from "@gajae-code/tui";
 import { setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
-import { materializeActiveModelProfileAssignment } from "../config/model-profile-activation";
+import { materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	type GjcModelAssignmentTargetId,
 } from "../config/model-registry";
+
 import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
@@ -50,6 +51,13 @@ export type { BuiltinSlashCommand, SubcommandDef } from "./types";
 
 /** TUI-specific runtime accepted by `executeBuiltinSlashCommand`. */
 export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime;
+
+type GjcModelBatchAssignmentTargetId = "all-role-agents" | "all-targets";
+type ParsedModelCommandArgs =
+	| { kind: "summary" }
+	| { kind: "assign"; targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId; selector: string };
+
+const GJC_MODEL_ROLE_AGENT_TARGET_IDS: GjcModelAssignmentTargetId[] = ["executor", "architect", "planner", "critic"];
 
 function fastStatusRoleTargets(): Array<{ id: GjcModelAssignmentTargetId; label: string; isSubagentRole: boolean }> {
 	return GJC_MODEL_ASSIGNMENT_TARGET_IDS.map(id => ({
@@ -172,22 +180,37 @@ function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
 	return lines.join("\n");
 }
 
-function parseModelCommandArgs(args: string): { targetId: GjcModelAssignmentTargetId; selector: string } {
+function parseModelCommandArgs(args: string): ParsedModelCommandArgs {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
 	const first = tokens[0]?.toLowerCase();
-	const explicitTarget = GJC_MODEL_ASSIGNMENT_TARGET_IDS.includes(first as GjcModelAssignmentTargetId)
-		? (first as GjcModelAssignmentTargetId)
-		: undefined;
+	if (first === "roles" || first === "assignments") return { kind: "summary" };
+
+	const parseTarget = (
+		token: string | undefined,
+	): GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId | undefined => {
+		const normalized = token?.toLowerCase();
+		if (GJC_MODEL_ASSIGNMENT_TARGET_IDS.includes(normalized as GjcModelAssignmentTargetId)) {
+			return normalized as GjcModelAssignmentTargetId;
+		}
+		if (normalized === "all-role-agents" || normalized === "all-targets") return normalized;
+		return undefined;
+	};
+
+	if (first === "assign") {
+		const targetId = parseTarget(tokens[1]);
+		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" ") };
+		return { kind: "assign", targetId: "default", selector: tokens.slice(1).join(" ") };
+	}
+
+	const explicitTarget = parseTarget(first);
 	if (explicitTarget) {
-		return { targetId: explicitTarget, selector: tokens.slice(1).join(" ") };
+		return { kind: "assign", targetId: explicitTarget, selector: tokens.slice(1).join(" ") };
 	}
 	if (first === "set") {
-		const second = tokens[1]?.toLowerCase();
-		if (GJC_MODEL_ASSIGNMENT_TARGET_IDS.includes(second as GjcModelAssignmentTargetId)) {
-			return { targetId: second as GjcModelAssignmentTargetId, selector: tokens.slice(2).join(" ") };
-		}
+		const targetId = parseTarget(tokens[1]);
+		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" ") };
 	}
-	return { targetId: "default", selector: args.trim() };
+	return { kind: "assign", targetId: "default", selector: args.trim() };
 }
 
 function splitExplicitThinkingSelector(selector: string): { baseSelector: string; thinkingLevel?: ThinkingLevel } {
@@ -322,6 +345,28 @@ async function resolveModelCommandSelection(
 	};
 }
 
+function getModelAssignmentTargetIds(
+	targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId,
+): GjcModelAssignmentTargetId[] {
+	if (targetId === "all-role-agents") return [...GJC_MODEL_ROLE_AGENT_TARGET_IDS];
+	if (targetId === "all-targets") return [...GJC_MODEL_ASSIGNMENT_TARGET_IDS];
+	return [targetId];
+}
+
+function formatModelAssignmentSuccess(
+	targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId,
+	selector: string,
+): string {
+	if (targetId === "all-role-agents") {
+		return `Role-agent models set to ${selector} for EXECUTOR, ARCHITECT, PLANNER, CRITIC.`;
+	}
+	if (targetId === "all-targets") {
+		return `All model targets set to ${selector} for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.`;
+	}
+	if (targetId === "default") return `DEFAULT model set to ${selector}.`;
+	return `${targetId.toUpperCase()} agent model set to ${selector}.`;
+}
+
 function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: string): string {
 	return [
 		currentModelLine,
@@ -402,6 +447,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			if (command.args) {
 				const parsedArgs = parseModelCommandArgs(command.args);
+				if (parsedArgs.kind === "summary") {
+					await runtime.output(formatModelAssignmentSummary(runtime));
+					return commandConsumed();
+				}
+
+				const targetIds = getModelAssignmentTargetIds(parsedArgs.targetId);
 				const modelId = parsedArgs.selector;
 				if (!modelId) {
 					return usage(
@@ -415,24 +466,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				}
 				const { selection } = resolution;
 				try {
-					const persistedSelector = formatModelSelectorValue(selection.selector, selection.thinkingLevel);
-					if (parsedArgs.targetId === "default") {
-						await runtime.session.setModel(selection.model, "default", {
-							selector: selection.selector,
-							thinkingLevel: selection.thinkingLevel,
-						});
-						materializeActiveModelProfileAssignment({
-							session: runtime.session,
-							settings: runtime.settings,
-							role: parsedArgs.targetId,
-							selector: persistedSelector,
-						});
-						if (selection.thinkingLevel) {
-							runtime.session.setThinkingLevel(selection.thinkingLevel);
-						}
-						await runtime.output(`Default model set to ${persistedSelector}.`);
-						await runtime.notifyTitleChanged?.();
-					} else {
+					const includesDefault = targetIds.includes("default");
+					const includesRoleAgent = targetIds.some(role => role !== "default");
+					if (includesRoleAgent) {
 						const apiKey = await runtime.session.modelRegistry.getApiKey(
 							selection.model,
 							runtime.session.sessionId,
@@ -440,28 +476,62 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						if (!apiKey) {
 							throw new Error(`No API key for ${selection.model.provider}/${selection.model.id}`);
 						}
-						const overrides = runtime.settings.get("task.agentModelOverrides");
+					}
+
+					const overrides = runtime.settings.get("task.agentModelOverrides");
+					const assignments = new Map<GjcModelAssignmentTargetId, string>();
+					const persistedSelector = formatModelSelectorValue(selection.selector, selection.thinkingLevel);
+					for (const targetId of targetIds) {
+						if (targetId === "default") {
+							assignments.set(targetId, persistedSelector);
+							continue;
+						}
 						const thinkingLevel =
-							selection.thinkingLevel ??
-							extractExplicitThinkingSelector(overrides[parsedArgs.targetId], runtime.settings);
-						const roleSelector = formatModelSelectorValue(selection.selector, thinkingLevel);
-						const materializedProfile = materializeActiveModelProfileAssignment({
-							session: runtime.session,
-							settings: runtime.settings,
-							role: parsedArgs.targetId,
-							selector: roleSelector,
+							selection.thinkingLevel ?? extractExplicitThinkingSelector(overrides[targetId], runtime.settings);
+						assignments.set(targetId, formatModelSelectorValue(selection.selector, thinkingLevel));
+					}
+
+					if (includesDefault) {
+						await runtime.session.setModel(selection.model, "default", {
+							selector: selection.selector,
+							thinkingLevel: selection.thinkingLevel,
 						});
-						if (!materializedProfile) {
-							const target = GJC_MODEL_ASSIGNMENT_TARGETS[parsedArgs.targetId];
+						if (selection.thinkingLevel) {
+							runtime.session.setThinkingLevel(selection.thinkingLevel);
+						}
+					}
+
+					const materializedProfile = materializeActiveModelProfileAssignments({
+						session: runtime.session,
+						settings: runtime.settings,
+						assignments,
+					});
+					if (!materializedProfile) {
+						const nextOverrides = { ...overrides };
+						for (const [targetId, selector] of assignments) {
+							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
 							if (target.settingsPath === "modelRoles") {
-								runtime.settings.setModelRole(parsedArgs.targetId, roleSelector);
+								runtime.settings.setModelRole(targetId, selector);
 							} else {
-								runtime.settings.setAgentModelOverride(parsedArgs.targetId, roleSelector);
+								nextOverrides[targetId] = selector;
 							}
 						}
-						runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
-						await runtime.output(`${parsedArgs.targetId} agent model set to ${roleSelector}.`);
+						if (
+							targetIds.some(
+								targetId => GJC_MODEL_ASSIGNMENT_TARGETS[targetId].settingsPath === "task.agentModelOverrides",
+							)
+						) {
+							runtime.settings.set("task.agentModelOverrides", nextOverrides);
+						}
 					}
+					runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
+					await runtime.output(
+						formatModelAssignmentSuccess(
+							parsedArgs.targetId,
+							assignments.get(targetIds[0] ?? "default") ?? persistedSelector,
+						),
+					);
+					if (includesDefault) await runtime.notifyTitleChanged?.();
 					await runtime.notifyConfigChanged?.();
 					return commandConsumed();
 				} catch (err) {

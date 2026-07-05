@@ -29,6 +29,7 @@ interface SelectionCapture {
 	role: GjcModelAssignmentTargetId | null;
 	thinkingLevel?: ThinkingLevel;
 	selector?: string;
+	roles?: readonly GjcModelAssignmentTargetId[];
 }
 
 type TestModelSelectorSelection = {
@@ -37,6 +38,7 @@ type TestModelSelectorSelection = {
 	role: GjcModelAssignmentTargetId | null;
 	thinkingLevel?: ThinkingLevel;
 	selector?: string;
+	roles?: readonly GjcModelAssignmentTargetId[];
 };
 
 interface CreateSelectorOptions {
@@ -182,6 +184,8 @@ describe("ModelSelector canonical model selection", () => {
 		expect(actionRendered).toContain("Set as ARCHITECT (Architect)");
 		expect(actionRendered).toContain("Set as PLANNER (Planner)");
 		expect(actionRendered).toContain("Set as CRITIC (Critic)");
+		expect(actionRendered).toContain("Set for all role agents");
+		expect(actionRendered).toContain("Set for all targets");
 		expect(actionRendered).not.toContain("Set as custom-fast");
 		expect(actionRendered).not.toContain("Set as SMOL");
 		expect(actionRendered).not.toContain("Set as TASK");
@@ -273,6 +277,52 @@ describe("ModelSelector canonical model selection", () => {
 		expect(settings.get("task.agentModelOverrides")).toEqual({
 			planner: `${model.provider}/${model.id}:high`,
 		});
+	});
+
+	test("selects batch role-agent assignment action", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(model, Settings.isolated(), selection => {
+			if (selection.kind === "assignment") selected = selection;
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		for (let i = 0; i < 5; i++) selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const selectedAfterEnter = selected;
+		if (!selectedAfterEnter) throw new Error("Expected batch role-agent selection");
+		expect(selectedAfterEnter.role).toBe("default");
+		expect(selectedAfterEnter.roles).toEqual(["executor", "architect", "planner", "critic"]);
+		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
+	});
+
+	test("selects batch all-targets assignment action", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(model, Settings.isolated(), selection => {
+			if (selection.kind === "assignment") selected = selection;
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		for (let i = 0; i < 6; i++) selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const selectedAfterEnter = selected;
+		if (!selectedAfterEnter) throw new Error("Expected all-targets selection");
+		expect(selectedAfterEnter.role).toBe("default");
+		expect(selectedAfterEnter.roles).toEqual(["default", "executor", "architect", "planner", "critic"]);
+		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
 	});
 
 	test("temporary scoped model selection carries selected reasoning", async () => {

@@ -8,11 +8,12 @@ import {
 	activateModelProfile,
 	type MaterializeModelProfileForDeletionResult,
 	materializeActiveModelProfileAssignment,
+	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	restoreMaterializedModelProfileForDeletion,
 } from "../../config/model-profile-activation";
 import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
-import { GJC_MODEL_ASSIGNMENT_TARGETS } from "../../config/model-registry";
+import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { type Settings, settings } from "../../config/settings";
@@ -894,20 +895,31 @@ export class SelectorController {
 							if (!apiKey) {
 								throw new Error(`No API key for ${model.provider}/${model.id}`);
 							}
+							const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles ?? [role];
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
-							const materializedProfile = materializeActiveModelProfileAssignment({
+							const assignments = new Map<GjcModelAssignmentTargetId, string>();
+							for (const targetRole of targetRoles) assignments.set(targetRole, value);
+							const materializedProfile = materializeActiveModelProfileAssignments({
 								session: this.ctx.session,
 								settings: this.ctx.settings,
-								role,
-								selector: value,
+								assignments,
 							});
 							if (!materializedProfile) {
-								const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
-								if (target.settingsPath === "modelRoles") {
-									this.ctx.settings.setModelRole(role, value);
-								} else {
-									this.ctx.settings.setAgentModelOverride(role, value);
+								const overrides = this.ctx.settings.get("task.agentModelOverrides");
+								const nextOverrides = { ...overrides };
+								let writesOverrides = false;
+								for (const targetRole of targetRoles) {
+									const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+									if (target.settingsPath === "modelRoles") {
+										this.ctx.settings.setModelRole(targetRole, value);
+									} else {
+										nextOverrides[targetRole] = value;
+										writesOverrides = true;
+									}
+								}
+								if (writesOverrides) {
+									this.ctx.settings.set("task.agentModelOverrides", nextOverrides);
 								}
 							}
 							modelSelector.refreshRoleAssignments({
@@ -920,7 +932,18 @@ export class SelectorController {
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							await this.ctx.notifyConfigChanged?.();
-							this.ctx.showStatus(`${role} agent model: ${value}`);
+							if (selection.roles) {
+								const labels = targetRoles.map(
+									targetRole => GJC_MODEL_ASSIGNMENT_TARGETS[targetRole].tag ?? targetRole.toUpperCase(),
+								);
+								this.ctx.showStatus(
+									targetRoles.includes("default")
+										? `All model targets set to ${value} for ${labels.join(", ")}.`
+										: `Role-agent models set to ${value} for ${labels.join(", ")}.`,
+								);
+							} else {
+								this.ctx.showStatus(`${role} agent model: ${value}`);
+							}
 							done();
 							this.ctx.ui.requestRender();
 						}
