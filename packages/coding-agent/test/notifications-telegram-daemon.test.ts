@@ -1126,6 +1126,44 @@ test("transient identity for an existing repo branch does not create a duplicate
 	expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(1);
 });
 
+test("stale identity after loadTopics reuses the persisted repo branch owner", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const firstDaemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const live = { sessionId: "LIVE", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	await firstDaemon.handleSessionMessage(live as any, {
+		type: "identity_header",
+		sessionId: "LIVE",
+		repo: "gajae-code",
+		branch: "dev",
+	});
+
+	const restartedDaemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	await restartedDaemon.loadTopics();
+	const stale = { sessionId: "DEAD", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	await restartedDaemon.handleSessionMessage(stale as any, {
+		type: "identity_header",
+		sessionId: "DEAD",
+		repo: "gajae-code",
+		branch: "dev",
+	});
+
+	expect(bot.calls.filter(c => c.method === "createForumTopic").map(c => c.body.name)).toEqual(["gajae-code/dev"]);
+	expect(bot.calls.filter(c => c.method === "sendMessage").map(c => c.body.message_thread_id)).toEqual([1]);
+});
+
 test("threaded mode off: frames fall back to the flat paired chat with a one-time notice", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();

@@ -1426,10 +1426,27 @@ export class TelegramNotificationDaemon {
 		return `${repo}\0${branch}`;
 	}
 
+	private topicIdentityBase(msg: { repo?: unknown; branch?: unknown }): string | undefined {
+		const repo = typeof msg?.repo === "string" && msg.repo.trim() ? msg.repo.trim() : undefined;
+		if (!repo) return undefined;
+		const branch = typeof msg?.branch === "string" && msg.branch.trim() ? msg.branch.trim() : undefined;
+		return branch ? `${repo}/${branch}` : repo;
+	}
+
 	private topicOwnerForIdentity(msg: { repo?: unknown; branch?: unknown }): string | undefined {
 		const identityKey = this.topicIdentityKey(msg);
 		const remembered = identityKey ? this.topicOwnerByIdentity.get(identityKey) : undefined;
-		return remembered && this.topics.get(remembered) ? remembered : undefined;
+		if (remembered && this.topics.get(remembered)) return remembered;
+		const base = this.topicIdentityBase(msg);
+		if (!identityKey || !base) return undefined;
+		for (const sessionId of this.topics.sessionIds()) {
+			const name = this.topics.get(sessionId)?.name;
+			if (name === base || name?.startsWith(`${base} - `)) {
+				this.topicOwnerByIdentity.set(identityKey, sessionId);
+				return sessionId;
+			}
+		}
+		return undefined;
 	}
 
 	private sessionCanClaimIdentity(session: SessionSocket, msg: { repo?: unknown; branch?: unknown }): boolean {
