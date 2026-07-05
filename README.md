@@ -26,17 +26,17 @@
 
 > Gajae-Code is an experimental, beta-stage project. Expect rough edges and verify outputs before relying on it for important work.
 
-## New in 0.7.0
+## Recent highlights
 
 <p align="center">
-  <img src="assets/telegram-mobile-hero.png" alt="Gajae Code 0.7.0 mobile answers for coding agents hero illustration" width="100%" />
+  <img src="assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
 </p>
 
 **Mobile answers for coding agents** — Gajae-Code now ships a configure-once notifications SDK and managed Telegram reference daemon. Each session exposes a loopback WebSocket discovery file and a generic `action_needed`/`reply` protocol so Telegram, Discord, Slack, mobile apps, or local tools can surface pending asks and route answers back without terminal scraping.
 
 The bundled Telegram flow adds a threaded per-session surface with context updates, live/finalized output, image attachments, inline buttons, free-text replies, typing indicators, and double-check acknowledgements. `gjc daemon` keeps one safe long-poll owner per bot token so new sessions attach cleanly instead of tripping Telegram 409 conflicts.
 
-## Also new in 0.6.0
+## Research and desktop-control highlights
 
 <p align="center">
   <img src="assets/rlm.png" alt="rlm research/REPL mode — Research. Experiment. Iterate." width="100%" />
