@@ -1783,7 +1783,7 @@ export class ModelSelectorComponent extends Container {
 function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
 	if (model.reasoning !== true) return false;
 	if (model.provider === "openai" || model.provider === "openai-codex") return true;
-	return role !== null;
+	return role !== null && GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "task.agentModelOverrides";
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {

@@ -187,12 +187,6 @@ describe("ModelSelector canonical model selection", () => {
 		expect(actionRendered).not.toContain("Set as TASK");
 
 		selector.handleInput("\n");
-		expect(selected).toBeUndefined();
-		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(thinkingRendered).toContain("Reasoning for Default");
-		expect(thinkingRendered).toContain("low");
-		installTestTheme();
-		selector.handleInput("\n");
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected Enter to select a model");
 		expect(selectedAfterEnter.model).toBe(model);
