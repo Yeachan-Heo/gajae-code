@@ -923,10 +923,22 @@ function resolveCustomModelReference(modelId: string): Model<Api> | undefined {
 }
 
 function applyStandaloneCustomModelPolicies(model: CustomModelOverlay): CustomModelOverlay {
-	if (model.id !== "gpt-5.4" || model.provider === "github-copilot" || model.contextWindow !== undefined) {
+	if (model.contextWindow !== undefined) {
 		return model;
 	}
-	return { ...model, contextWindow: 1_000_000 };
+	if (model.id === "gpt-5.4" && model.provider !== "github-copilot") {
+		return { ...model, contextWindow: 1_000_000 };
+	}
+	// Custom GPT-5.5 endpoints that are not first-party `openai-responses` are
+	// typically Codex passthrough proxies (e.g. CLIProxyAPI fronting
+	// chatgpt.com/backend-api/codex), where the request path enforces the 272K
+	// prompt budget even though the model advertises a 1M total window.
+	// Without this default the bundled reference resolves to 1M, compaction
+	// never fires in time, and requests die with context_length_exceeded.
+	if (model.id === "gpt-5.5" && model.api !== "openai-responses") {
+		return { ...model, contextWindow: 272_000 };
+	}
+	return model;
 }
 
 function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuildOptions): Model<Api> {

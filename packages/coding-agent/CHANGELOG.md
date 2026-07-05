@@ -8,6 +8,7 @@
 - Added `gjc completion inshellisense`, which generates or installs a Fig/withfig-compatible `gjc` completion spec for Microsoft inshellisense without adding inshellisense as a runtime dependency.
 
 ### Fixed
+- Custom-provider `gpt-5.5` entries without an explicit `contextWindow` now default to the 272K Codex prompt budget unless the provider uses first-party `openai-responses`, so Codex passthrough proxies (e.g. CLIProxyAPI) compact in time instead of dying with `context_length_exceeded` at ~272K while the registry advertises 1M.
 - `telegram_send` now rejects files over Telegram's document upload limit before reading them into memory or handing them to the notification sink.
 - `telegram_send` now rejects file attachments while Telegram notification redaction is enabled, preventing explicit file sends from bypassing the redaction boundary.
 - Telegram notification daemons now persist consumed update ids so threaded replies are not reinjected after a daemon restart replays old `getUpdates` entries.

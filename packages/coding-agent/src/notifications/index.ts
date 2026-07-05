@@ -100,7 +100,7 @@ export interface SessionCloseFrame {
 	chatId: string;
 	token: string;
 	target: SessionCloseTarget;
-	/** Hard-kill even if a live pane is attached (GJC-managed only). */
+	/** Required force-only close flag; false/omitted is rejected by daemon policy. */
 	force?: boolean;
 }
 

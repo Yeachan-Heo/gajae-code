@@ -103,7 +103,7 @@ pub struct SessionClose {
 	pub token:      String,
 	/// Which session to close.
 	pub target:     SessionCloseTarget,
-	/// Hard-kill even if a live pane is attached (GJC-managed only).
+	/// Required force-only close flag; `false` is rejected by daemon policy.
 	#[serde(default)]
 	pub force:      bool,
 }

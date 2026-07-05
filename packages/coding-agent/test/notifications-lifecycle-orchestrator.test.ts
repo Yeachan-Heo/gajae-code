@@ -204,8 +204,71 @@ describe("lifecycle orchestrator", () => {
 		expect(audit.some(e => e.event === "failure" && e.reason === "not_found")).toBe(true);
 	});
 
-	it("closes a session", async () => {
-		const { deps: d } = deps();
+	it("rejects session_close without force before any close side effect", async () => {
+		const { deps: d, audit, store } = deps();
+		let closed = false;
+		const frame: SessionCloseFrame = {
+			type: "session_close",
+			requestId: "lc_c_no_force",
+			updateId: 299,
+			chatId: PAIRED,
+			token: "control-token",
+			target: { sessionId: "sess-1", tmuxSession: "gjc-1" },
+		};
+		const out = await handleLifecycleRequest(frame, {
+			...d,
+			closeSession: async () => {
+				closed = true;
+				throw new Error("must not close");
+			},
+		});
+		expect(out.status).toBe("error");
+		if (out.status === "error") {
+			expect(out.reason).toBe("invalid_target");
+			expect(out.message).toBe("session_close requires force=true; graceful close is not supported");
+		}
+		expect(closed).toBe(false);
+		expect((await store.read()).entries[`${PAIRED}:299`]).toBeUndefined();
+		expect(audit.at(-1)).toMatchObject({ event: "rejected", reason: "invalid_target" });
+	});
+
+	it("rejects session_close with force=false before any close side effect", async () => {
+		const { deps: d, audit, store } = deps();
+		let closed = false;
+		const frame: SessionCloseFrame = {
+			type: "session_close",
+			requestId: "lc_c_force_false",
+			updateId: 301,
+			chatId: PAIRED,
+			token: "control-token",
+			target: { sessionId: "sess-1", tmuxSession: "gjc-1" },
+			force: false,
+		};
+		const out = await handleLifecycleRequest(frame, {
+			...d,
+			closeSession: async () => {
+				closed = true;
+				throw new Error("must not close");
+			},
+		});
+		expect(out.status).toBe("error");
+		if (out.status === "error") {
+			expect(out.reason).toBe("invalid_target");
+			expect(out.message).toBe("session_close requires force=true; graceful close is not supported");
+		}
+		expect(closed).toBe(false);
+		expect((await store.read()).entries[`${PAIRED}:301`]).toBeUndefined();
+		expect(audit.at(-1)).toMatchObject({ event: "rejected", reason: "invalid_target" });
+	});
+
+	it("closes a session when force is true", async () => {
+		let closeCalls = 0;
+		const { deps: d } = deps({
+			closeSession: async () => {
+				closeCalls++;
+				return { processGone: true };
+			},
+		});
 		const frame: SessionCloseFrame = {
 			type: "session_close",
 			requestId: "lc_c",
@@ -217,6 +280,36 @@ describe("lifecycle orchestrator", () => {
 		};
 		const out = await handleLifecycleRequest(frame, d);
 		expect(out.status).toBe("ok");
+		expect(closeCalls).toBe(1);
+	});
+
+	it("records close failures as close_refused diagnostics, not spawn failures", async () => {
+		const {
+			deps: d,
+			audit,
+			store,
+		} = deps({
+			closeSession: async () => {
+				throw new Error("tmux session mismatch");
+			},
+		});
+		const frame: SessionCloseFrame = {
+			type: "session_close",
+			requestId: "lc_c_refused",
+			updateId: 302,
+			chatId: PAIRED,
+			token: "control-token",
+			target: { sessionId: "sess-1", tmuxSession: "gjc-1" },
+			force: true,
+		};
+		const out = await handleLifecycleRequest(frame, d);
+		expect(out.status).toBe("error");
+		if (out.status === "error") {
+			expect(out.reason).toBe("terminal_uncertain");
+			expect(out.message).toContain("session_close effect failed");
+		}
+		expect((await store.read()).entries[`${PAIRED}:302`]?.reason).toBe("close_refused");
+		expect(audit.at(-1)).toMatchObject({ event: "terminal_uncertain", reason: "close_refused" });
 	});
 
 	it("classifyDuplicate / requestHash / summarizeTarget are stable", () => {
