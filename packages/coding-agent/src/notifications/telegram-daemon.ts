@@ -1911,7 +1911,6 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
-
 	private async sendStaleGuidance(callbackId: unknown): Promise<void> {
 		if (typeof callbackId === "string") {
 			await this.botApi.call("answerCallbackQuery", { callback_query_id: callbackId, text: "Button is stale" });
