@@ -1459,6 +1459,7 @@ export class TelegramNotificationDaemon {
 			clearIntervalImpl(session.pingTimer);
 			session.pingTimer = undefined;
 		}
+		this.deleteMessageRoutes(session.sessionId);
 		if (this.sessions.get(session.sessionId) === session) {
 			this.sessions.delete(session.sessionId);
 		}
@@ -1466,6 +1467,14 @@ export class TelegramNotificationDaemon {
 			try {
 				session.ws.close();
 			} catch {}
+		}
+	}
+
+	private deleteMessageRoutes(sessionId: string, actionId?: string): void {
+		for (const [messageId, route] of this.messageRoutes.entries()) {
+			if (route.sessionId === sessionId && (actionId === undefined || route.actionId === actionId)) {
+				this.messageRoutes.delete(messageId);
+			}
 		}
 	}
 
@@ -1994,6 +2003,7 @@ export class TelegramNotificationDaemon {
 			await this.persistAliases();
 		} else if (msg.type === "action_resolved" && msg.id) {
 			session.pending.delete(msg.id);
+			this.deleteMessageRoutes(session.sessionId, msg.id);
 			for (const [alias, route] of this.aliasTable.entries()) {
 				if (route.sessionId === session.sessionId && route.actionId === msg.id) this.aliasTable.delete(alias);
 			}
