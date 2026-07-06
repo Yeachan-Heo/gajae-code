@@ -3,14 +3,17 @@ import * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	buildReleaseBinaryUrlForTest,
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
+	fsyncFileForTest,
 	replaceBinaryForUpdate,
 	resolveNpmManagedTargetForTest,
 	resolveUpdateMethodForTest,
+	runBinaryUpdateFlow,
 	runPackageManagerUpdateForTest,
 } from "../src/cli/update-cli";
 
@@ -303,5 +306,126 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(targetPath).text()).toBe("new binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+});
+
+describe("update-cli download durability", () => {
+	it("fsyncs a written file without altering its contents", async () => {
+		const dir = await makeTempDir();
+		const filePath = path.join(dir, "gjc.new");
+		await Bun.write(filePath, "downloaded binary bytes");
+
+		await fsyncFileForTest(filePath);
+
+		expect(await Bun.file(filePath).text()).toBe("downloaded binary bytes");
+	});
+
+	it("rejects when the target file does not exist", async () => {
+		const dir = await makeTempDir();
+		await expect(fsyncFileForTest(path.join(dir, "missing.new"))).rejects.toThrow();
+	});
+
+	it("closes the fsync file descriptor on success", async () => {
+		const close = vi.fn(async () => {});
+		const open = vi.spyOn(fsNode.promises, "open").mockResolvedValue({
+			sync: async () => {},
+			close,
+		} as unknown as Awaited<ReturnType<typeof fsNode.promises.open>>);
+		try {
+			await fsyncFileForTest("/irrelevant/path");
+			expect(close).toHaveBeenCalledTimes(1);
+		} finally {
+			open.mockRestore();
+		}
+	});
+
+	it("closes the fsync file descriptor even when sync fails", async () => {
+		const close = vi.fn(async () => {});
+		const open = vi.spyOn(fsNode.promises, "open").mockResolvedValue({
+			sync: async () => {
+				throw new Error("EIO: sync failed");
+			},
+			close,
+		} as unknown as Awaited<ReturnType<typeof fsNode.promises.open>>);
+		try {
+			await expect(fsyncFileForTest("/irrelevant/path")).rejects.toThrow("sync failed");
+			expect(close).toHaveBeenCalledTimes(1);
+		} finally {
+			open.mockRestore();
+		}
+	});
+});
+
+describe("update-cli binary update flow", () => {
+	it("downloads, fsyncs, then replaces and verifies in that order", async () => {
+		const calls: string[] = [];
+		const targetPath = "/opt/gjc/bin/gjc";
+		const flow: BinaryUpdateFlow = {
+			download: async (url, tempPath) => {
+				calls.push(`download ${url} -> ${tempPath}`);
+			},
+			fsync: async filePath => {
+				calls.push(`fsync ${filePath}`);
+			},
+			replace: async options => {
+				calls.push(`replace ${options.tempPath} -> ${options.targetPath}`);
+				return options.verifyInstalledVersion(options.expectedVersion);
+			},
+			verifyInstalledVersion: async expected => {
+				calls.push(`verify ${expected}`);
+				return { ok: true, actual: expected, path: targetPath };
+			},
+			removeTemp: async filePath => {
+				calls.push(`removeTemp ${filePath}`);
+			},
+			beforeReplace: () => {
+				calls.push("beforeReplace");
+			},
+		};
+
+		const result = await runBinaryUpdateFlow(targetPath, "https://example.test/gjc", "1.2.3", flow);
+
+		expect(result.ok).toBe(true);
+		expect(calls).toEqual([
+			`download https://example.test/gjc -> ${targetPath}.new`,
+			`fsync ${targetPath}.new`,
+			"beforeReplace",
+			`replace ${targetPath}.new -> ${targetPath}`,
+			"verify 1.2.3",
+		]);
+		expect(calls).not.toContain(`removeTemp ${targetPath}.new`);
+	});
+
+	it("aborts before replacement/verification when fsync fails", async () => {
+		const calls: string[] = [];
+		const targetPath = "/opt/gjc/bin/gjc";
+		const flow: BinaryUpdateFlow = {
+			download: async (_url, tempPath) => {
+				calls.push(`download ${tempPath}`);
+			},
+			fsync: async () => {
+				calls.push("fsync");
+				throw new Error("EIO: fsync failed");
+			},
+			replace: async () => {
+				calls.push("replace");
+				return { ok: true };
+			},
+			verifyInstalledVersion: async () => {
+				calls.push("verify");
+				return { ok: true };
+			},
+			removeTemp: async filePath => {
+				calls.push(`removeTemp ${filePath}`);
+			},
+		};
+
+		await expect(runBinaryUpdateFlow(targetPath, "https://example.test/gjc", "1.2.3", flow)).rejects.toThrow(
+			"fsync failed",
+		);
+
+		expect(calls).toEqual([`download ${targetPath}.new`, "fsync", `removeTemp ${targetPath}.new`]);
+		expect(calls).not.toContain("replace");
+		expect(calls).not.toContain("verify");
 	});
 });

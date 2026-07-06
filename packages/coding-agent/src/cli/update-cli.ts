@@ -552,31 +552,107 @@ async function updateViaNpm(packageName: string, expectedVersion: string): Promi
 }
 
 /**
- * Download a release binary to a target path, replacing an existing file.
+ * Flush a freshly written file's data to stable storage.
+ *
+ * Critical on network filesystems (e.g. NFS home directories): `pipeline`
+ * resolving does not guarantee the downloaded bytes are durable on the
+ * server, so the post-install `gjc --version` check can exec a binary whose
+ * pages are not yet consistent. The child then faults, the version check
+ * fails, and the update is rolled back with "could not verify updated
+ * version" even though the download itself succeeded. Explicitly fsyncing
+ * before the rename/exec avoids the race.
  */
-async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
-	const binaryName = getBinaryName();
-	const url = buildReleaseBinaryUrl(expectedVersion);
+async function fsyncFile(filePath: string): Promise<void> {
+	const handle = await fs.promises.open(filePath, "r+");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
 
-	const tempPath = `${targetPath}.new`;
-	const backupPath = `${targetPath}.bak`;
-	console.log(chalk.dim(`Downloading ${binaryName}…`));
+export async function fsyncFileForTest(filePath: string): Promise<void> {
+	return fsyncFile(filePath);
+}
 
+/**
+ * Download a release binary to a temp path, throwing a friendly error when the
+ * release asset cannot be fetched.
+ */
+async function downloadBinaryTo(url: string, tempPath: string, binaryName: string): Promise<void> {
 	const response = await fetch(url, { redirect: "follow" });
 	if (!response.ok || !response.body) {
 		throw new Error(formatBinaryDownloadFailureMessage(binaryName, url, response.statusText || response.status));
 	}
 	const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
 	await pipeline(response.body, fileStream);
+}
 
-	console.log(chalk.dim("Installing update..."));
-	const verification = await replaceBinaryForUpdate({
+/** Injectable steps of the binary update flow (seams for testing ordering). */
+export interface BinaryUpdateFlow {
+	download(url: string, tempPath: string): Promise<void>;
+	fsync(filePath: string): Promise<void>;
+	replace(options: BinaryReplacementOptions): Promise<InstalledVersionVerification>;
+	verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification>;
+	/** Best-effort cleanup of the temp file when the flow aborts before replace. */
+	removeTemp?(filePath: string): Promise<void>;
+	/** Called once fsync has succeeded, right before replacement begins. */
+	beforeReplace?(): void;
+}
+
+/**
+ * Orchestrate download → fsync → replace → verify with a strict ordering
+ * contract: the downloaded temp binary MUST be flushed to stable storage
+ * before it is published (renamed into place) or exec'd for verification.
+ *
+ * If fsync fails the temp bytes are not durable, so we abort before
+ * replacement/verification and clean up the temp file rather than installing a
+ * possibly-truncated binary.
+ */
+export async function runBinaryUpdateFlow(
+	targetPath: string,
+	url: string,
+	expectedVersion: string,
+	flow: BinaryUpdateFlow,
+): Promise<InstalledVersionVerification> {
+	const tempPath = `${targetPath}.new`;
+	const backupPath = `${targetPath}.bak`;
+
+	await flow.download(url, tempPath);
+	try {
+		await flow.fsync(tempPath);
+	} catch (err) {
+		if (flow.removeTemp) await flow.removeTemp(tempPath);
+		throw err;
+	}
+
+	flow.beforeReplace?.();
+	return flow.replace({
 		targetPath,
 		tempPath,
 		backupPath,
 		expectedVersion,
-		verifyInstalledVersion: verifyInstalledRuntime,
+		verifyInstalledVersion: flow.verifyInstalledVersion,
 	});
+}
+
+/**
+ * Download a release binary to a target path, replacing an existing file.
+ */
+async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
+	const binaryName = getBinaryName();
+	const url = buildReleaseBinaryUrl(expectedVersion);
+	console.log(chalk.dim(`Downloading ${binaryName}…`));
+
+	const verification = await runBinaryUpdateFlow(targetPath, url, expectedVersion, {
+		download: (downloadUrl, tempPath) => downloadBinaryTo(downloadUrl, tempPath, binaryName),
+		fsync: fsyncFile,
+		replace: replaceBinaryForUpdate,
+		verifyInstalledVersion: verifyInstalledRuntime,
+		removeTemp: unlinkIfExists,
+		beforeReplace: () => console.log(chalk.dim("Installing update...")),
+	});
+
 	printVerifiedVersion(expectedVersion);
 	if (verification.cleanupWarning) console.warn(chalk.yellow(verification.cleanupWarning));
 	printRestartGuidance();
