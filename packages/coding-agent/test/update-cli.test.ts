@@ -8,6 +8,7 @@ import {
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
+	fsyncFileForTest,
 	replaceBinaryForUpdate,
 	resolveNpmManagedTargetForTest,
 	resolveUpdateMethodForTest,
@@ -303,5 +304,22 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(targetPath).text()).toBe("new binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+});
+
+describe("update-cli download durability", () => {
+	it("fsyncs a written file without altering its contents", async () => {
+		const dir = await makeTempDir();
+		const filePath = path.join(dir, "gjc.new");
+		await Bun.write(filePath, "downloaded binary bytes");
+
+		await fsyncFileForTest(filePath);
+
+		expect(await Bun.file(filePath).text()).toBe("downloaded binary bytes");
+	});
+
+	it("rejects when the target file does not exist", async () => {
+		const dir = await makeTempDir();
+		await expect(fsyncFileForTest(path.join(dir, "missing.new"))).rejects.toThrow();
 	});
 });

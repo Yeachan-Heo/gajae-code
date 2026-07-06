@@ -552,6 +552,30 @@ async function updateViaNpm(packageName: string, expectedVersion: string): Promi
 }
 
 /**
+ * Flush a freshly written file's data to stable storage.
+ *
+ * Critical on network filesystems (e.g. NFS home directories): `pipeline`
+ * resolving does not guarantee the downloaded bytes are durable on the
+ * server, so the post-install `gjc --version` check can exec a binary whose
+ * pages are not yet consistent. The child then faults, the version check
+ * fails, and the update is rolled back with "could not verify updated
+ * version" even though the download itself succeeded. Explicitly fsyncing
+ * before the rename/exec avoids the race.
+ */
+async function fsyncFile(filePath: string): Promise<void> {
+	const handle = await fs.promises.open(filePath, "r+");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
+
+export async function fsyncFileForTest(filePath: string): Promise<void> {
+	return fsyncFile(filePath);
+}
+
+/**
  * Download a release binary to a target path, replacing an existing file.
  */
 async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
@@ -568,6 +592,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 	}
 	const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
 	await pipeline(response.body, fileStream);
+	await fsyncFile(tempPath);
 
 	console.log(chalk.dim("Installing update..."));
 	const verification = await replaceBinaryForUpdate({
