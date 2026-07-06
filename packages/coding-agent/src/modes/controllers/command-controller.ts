@@ -540,7 +540,7 @@ export class CommandController {
 		const title = showFull ? "Full Changelog" : "Recent Changes";
 		const hint = showFull
 			? ""
-			: `\n\n${theme.fg("dim", "Use")} ${theme.bold("/changelog full")} ${theme.fg("dim", "to view the complete changelog.")}`;
+			: `\n\n${theme.fg("dim", "Use")} ${theme.bold("/changelog --full")} ${theme.fg("dim", "to view the complete changelog.")}`;
 
 		this.ctx.chatContainer.addChild(new Spacer(1));
 		this.ctx.chatContainer.addChild(new DynamicBorder());
