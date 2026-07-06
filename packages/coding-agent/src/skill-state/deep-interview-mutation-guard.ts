@@ -33,10 +33,12 @@ function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
 	return DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE;
 }
 
-const BLOCKED_TOOL_NAMES = new Set(["edit", "write", "ast_edit"]);
+const BLOCKED_TOOL_NAMES = new Set(["edit", "write", "ast_edit", "bash"]);
 const ARCHIVE_OR_SQLITE_BASE_RE = /^(.+?\.(?:tar\.gz|sqlite3|sqlite|db3|zip|tgz|tar|db))(?:$|:)/i;
 const INTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\r|\n|$)/i;
+const BASH_MUTATION_COMMAND_RE =
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:tee|touch|rm|mkdir|cp|mv|install)\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
 
 type ToolWithEditMode = AgentTool & {
 	mode?: unknown;
@@ -329,11 +331,41 @@ function extractEditTargets(args: unknown, tool: ToolWithEditMode): ExtractedTar
 	if (targets.paths.length === 0) targets.unknown = true;
 	return targets;
 }
+function extractBashTargets(args: unknown): ExtractedTargets {
+	const record = getRecord(args);
+	const command = safeString(record?.command);
+	const targets: ExtractedTargets = { paths: [], unknown: false };
+	if (!command.trim()) {
+		targets.unknown = true;
+		return targets;
+	}
+	for (const match of command.matchAll(BASH_MUTATION_COMMAND_RE)) {
+		const redirected = match[2]?.trim();
+		if (redirected) {
+			addPath(targets, redirected.replace(/^['"]|['"]$/g, ""));
+			continue;
+		}
+		const argsText = match[1] ?? "";
+		const parts = argsText.match(/(?:[^\s'"\\]+|'[^']*'|"[^"]*")+/g) ?? [];
+		const commandName = match[0]
+			?.match(/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(tee|touch|rm|mkdir|cp|mv|install)\b/i)?.[1]
+			?.toLowerCase();
+		const targetParts =
+			commandName === "cp" || commandName === "mv" || commandName === "install" ? parts.slice(-1) : parts;
+		for (const part of targetParts) {
+			const cleaned = part.replace(/^['"]|['"]$/g, "");
+			if (!cleaned || cleaned.startsWith("-")) continue;
+			addPath(targets, cleaned);
+		}
+	}
+	return targets;
+}
 
 function extractTargets(tool: ToolWithEditMode, args: unknown): ExtractedTargets {
 	if (tool.name === "write") return extractWriteTargets(args);
 	if (tool.name === "ast_edit") return extractAstEditTargets(args);
 	if (tool.name === "edit") return extractEditTargets(args, tool);
+	if (tool.name === "bash") return extractBashTargets(args);
 	return { paths: [], unknown: true };
 }
 
@@ -490,6 +522,7 @@ async function isNeutralTempPath(cwd: string, rawPath: string): Promise<boolean>
 async function planningBlockedTargets(cwd: string, targets: ExtractedTargets): Promise<string[]> {
 	const blocked: string[] = [];
 	for (const rawPath of targets.paths) {
+		if (isAllowlistedPath(cwd, rawPath)) continue;
 		if (!(await isNeutralTempPath(cwd, rawPath))) blocked.push(rawPath);
 	}
 	return blocked;
@@ -523,7 +556,7 @@ export async function getDeepInterviewMutationDecision(
 ): Promise<DeepInterviewMutationDecision> {
 	if (!BLOCKED_TOOL_NAMES.has(input.tool.name)) return { blocked: false, targets: [] };
 	const targets = extractTargets(input.tool, input.args);
-	if (input.enforceWorkflowState !== false && hasBlockedGjcTarget(input.cwd, targets)) {
+	if (input.tool.name !== "bash" && input.enforceWorkflowState !== false && hasBlockedGjcTarget(input.cwd, targets)) {
 		const stateSkill = firstBlockedWorkflowStateSkill(input.cwd, targets);
 		const command = stateSkill ? sanctionedWorkflowStateCommand(stateSkill) : "gjc <workflow-command>";
 		return {
