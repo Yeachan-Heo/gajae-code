@@ -218,6 +218,16 @@ describe("HookSelectorComponent inline custom input", () => {
 		expect(calls.selected).toEqual(["2. Option B"]);
 	});
 
+	it("reports inline-input state via isInlineInputActive across enter/escape", () => {
+		const { component } = createSelector();
+		expect(component.isInlineInputActive()).toBe(false);
+		moveToOther(component);
+		component.handleInput("\r");
+		expect(component.isInlineInputActive()).toBe(true);
+		component.handleInput("\x1b");
+		expect(component.isInlineInputActive()).toBe(false);
+	});
+
 	it("escape in selection mode still cancels the dialog", () => {
 		const { component, calls } = createSelector();
 		component.handleInput("\x1b");
