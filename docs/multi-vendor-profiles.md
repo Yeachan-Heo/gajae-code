@@ -68,7 +68,30 @@ profiles:
       planner:   google-antigravity/gemini-3.1-pro-low:high
       architect: anthropic/claude-opus-4-8:high
       critic:    opencode-go/glm-5.2
+
+  reviewer:              # review/audit stance — the author-mode role split, inverted
+    required_providers: [anthropic, openai-codex, google-antigravity]
+    model_mapping:
+      default:   anthropic/claude-opus-4-8:high                 # aggregator restraint: preserve raw reviewer verdicts
+      executor:  openai-codex/gpt-5.5:high                      # support — repro PoCs, failing tests, harnesses
+      planner:   google-antigravity/gemini-3.1-pro-low:high     # review checklists / audit scoping
+      architect: anthropic/claude-opus-4-8:high                 # lead 1 — primary code-review judge (effective long-context)
+      critic:    openai-codex/gpt-5.5:high                      # lead 2 — merge gate, cross-family vs Claude-authored code
 ```
+
+## Reviewer stance and the external review gate
+
+The profiles above assume an **authoring** stance: `executor` is the lead and `architect`/`critic` verify its work. In a session whose primary job is reviewing or auditing (not writing) code, the roles invert — `architect`/`critic` become the leads and `executor` is support (reproduction PoCs, failing tests). The `reviewer` profile encodes that inversion, with one generalized provenance rule: **the reviewing model family must differ from the family that authored the code under review**, not merely from the session's own executor.
+
+A verified use is the cross-session final review gate: the authoring session launches a fresh, stateless reviewer sub-session so the finished diff is judged without the authoring context:
+
+```sh
+gjc --mpreset reviewer -p --no-session --tools read,search,find "<review prompt: diff + spec paths, severity findings, final line VERDICT: APPROVE|REQUEST_CHANGES>"
+```
+
+The `--tools` allowlist is part of the contract: it enforces the reviewer's read-only boundary at the tool surface instead of trusting the prompt. Profile names in this document live in the user namespace — a user profile overrides a builtin preset only on an exact name match, and a future builtin with the same name would be silently shadowed by your copy.
+
+See [Extragoal local skill template](./extragoal-skill-template.md) for the full gate workflow (verdict contract, findings triage, bounded re-sign loop, secret-scan and injection guards) built on this recipe.
 
 ## Model cheatsheet (by need)
 
