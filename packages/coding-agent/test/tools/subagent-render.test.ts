@@ -134,6 +134,19 @@ describe("subagentToolRenderer", () => {
 		}
 	});
 
+	it("treats queued subagents as awaited active work in the aggregate header", () => {
+		const out = render(
+			{
+				subagents: [snapshot({ id: "0-Queued", status: "queued", liveProgressAvailable: true })],
+			},
+			false,
+		);
+		const lines = out.split("\n");
+		expect(lines[0]).toContain("awaiting 1 of 1");
+		expect(lines[1]).toContain("(ctrl+s to observe sessions)");
+		expect(out).toContain("running, no activity yet");
+	});
+
 	it("omits the ctrl+s observe hint when no subagent is running (AC4)", () => {
 		const out = render({
 			subagents: [
@@ -144,26 +157,101 @@ describe("subagentToolRenderer", () => {
 		expect(out).not.toContain("ctrl+s");
 	});
 
-	it("caps the result preview at one line collapsed and at four lines expanded (AC2)", () => {
+	it("uses digest-sized result previews when collapsed and agent-card-sized previews when expanded (AC2)", () => {
 		const details: SubagentToolDetails = {
 			subagents: [
 				snapshot({
 					id: "0-Preview",
 					status: "completed",
-					resultText: "line one\nline two\nline three\nline four\nline five",
+					resultText:
+						"line one\nline two\nline three\nline four\nline five\nline six\nline seven\nline eight\nline nine\nline ten\nline eleven\nline twelve\nline thirteen",
 				}),
 			],
 		};
 
 		const collapsed = render(details, false);
+		expect(collapsed).toContain("Result:");
 		expect(collapsed).toContain("line one");
-		expect(collapsed).not.toContain("line two");
+		expect(collapsed).toContain("line three");
+		expect(collapsed).not.toContain("line four");
 
 		const expanded = render(details, true);
 		expect(expanded).toContain("line one");
-		expect(expanded).toContain("line four");
-		// PREVIEW_LINES_EXPANDED=4 is an upper bound, not a minimum.
-		expect(expanded).not.toContain("line five");
+		expect(expanded).toContain("line twelve");
+		expect(expanded).not.toContain("line thirteen");
+	});
+
+	it("turns task-summary XML into user-facing findings instead of showing wrapper tags", () => {
+		const out = render(
+			{
+				subagents: [
+					snapshot({
+						id: "0-Panel",
+						status: "completed",
+						resultText: `<task-summary>
+<header>3/3 succeeded [2m13s]</header>
+
+<agent id="ResearcherLens" agent="architect">
+<status>completed</status>
+<synopsis>
+Supabase/static-site boundary needs confirmation before the next round.
+</synopsis>
+</agent>
+</task-summary>`,
+					}),
+				],
+			},
+			false,
+		);
+
+		expect(out).toContain("Findings:");
+		expect(out).toContain("Outcome: 3/3 succeeded [2m13s]");
+		expect(out).toContain("ResearcherLens: Supabase/static-site boundary needs confirmation");
+		expect(out).not.toContain("<task-summary>");
+		expect(out).not.toContain("<header>");
+	});
+
+	it("fails closed for wrapper-only task-summary payloads in both digest and agent-card stages", () => {
+		const details: SubagentToolDetails = {
+			subagents: [
+				snapshot({
+					id: "0-EmptySummary",
+					status: "completed",
+					resultText: "<task-summary>\n</task-summary>",
+				}),
+			],
+		};
+
+		for (const expanded of [false, true]) {
+			const out = render(details, expanded);
+			expect(out).toContain("Findings:");
+			expect(out).toContain("Task summary produced no previewable findings.");
+			expect(out).not.toContain("<task-summary>");
+		}
+	});
+
+	it("renders merge-summary findings and decodes XML entities", () => {
+		const out = render(
+			{
+				subagents: [
+					snapshot({
+						id: "0-MergeSummary",
+						status: "completed",
+						resultText: `<task-summary>
+<header>1/1 succeeded &amp; checked</header>
+<merge-summary>
+Verdict &quot;usable&quot; for Array&lt;string&gt; &amp; ready.
+</merge-summary>
+</task-summary>`,
+					}),
+				],
+			},
+			false,
+		);
+
+		expect(out).toContain("Outcome: 1/1 succeeded & checked");
+		expect(out).toContain('Merged: Verdict "usable" for Array<string> & ready.');
+		expect(out).not.toContain("<merge-summary>");
 	});
 
 	it("renders the placeholder when a live producer exists but no progress yet", () => {
@@ -226,6 +314,67 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("final answer");
 		expect(out).toContain("Preview truncated");
 		expect(out).toContain("terminal");
+	});
+
+	it("keeps collapsed subagent panels focused on digest content instead of metadata", () => {
+		const details: SubagentToolDetails = {
+			subagents: [
+				snapshot({
+					id: "0-Done",
+					jobId: "job-done",
+					status: "completed",
+					agent: "executor",
+					description: "did the thing",
+					assignment: "Do the work carefully.\nInclude extra details.",
+					outputRef: "agent://0-Done",
+					resultText: "final answer",
+					effectiveModel: "anthropic/claude-opus-4-8",
+				}),
+			],
+		};
+
+		const collapsed = render(details, false);
+		expect(collapsed).toContain("final answer");
+		expect(collapsed).not.toContain("Job: job-done");
+		expect(collapsed).not.toContain("Agent: executor");
+		expect(collapsed).not.toContain("Model: anthropic/claude-opus-4-8");
+		expect(collapsed).not.toContain("Assignment:");
+		expect(collapsed).not.toContain("agent://0-Done");
+
+		const expanded = render(details, true);
+		expect(expanded).toContain("Job: job-done");
+		expect(expanded).toContain("Agent: executor");
+		expect(expanded).toContain("Model: anthropic/claude-opus-4-8");
+		expect(expanded).toContain("Focus: did the thing");
+		expect(expanded).toContain("Assignment:");
+		expect(expanded).toContain("agent://0-Done");
+	});
+
+	it("keeps failed subagent previews error-first while preserving two-stage log disclosure", () => {
+		const details: SubagentToolDetails = {
+			subagents: [
+				snapshot({
+					id: "0-Fail",
+					status: "failed",
+					errorText: "boom\nstack line",
+					resultText: "should not render",
+					outputRef: "agent://0-Fail",
+					truncated: true,
+				}),
+			],
+		};
+
+		const collapsed = render(details, false);
+		expect(collapsed).toContain("Error:");
+		expect(collapsed).toContain("boom");
+		expect(collapsed).toContain("stack line");
+		expect(collapsed).not.toContain("should not render");
+		expect(collapsed).not.toContain("agent://0-Fail");
+
+		const expanded = render(details, true);
+		expect(expanded).toContain("Error:");
+		expect(expanded).toContain("Log: agent://0-Fail");
+		expect(expanded).toContain("Preview truncated");
 	});
 
 	it("intentionally suppresses an unknown agent line (no noisy 'Agent: unknown')", () => {
@@ -338,6 +487,21 @@ describe("subagent await renderer body cache (PR2)", () => {
 		// Back to the first key -> cache hit, no new render.
 		renderWith(live("0-A", { currentTool: "read" }));
 		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(4);
+	});
+
+	it("re-renders the heavy body when terminal result metadata changes", () => {
+		const first: SubagentToolDetails = {
+			subagents: [snapshot({ id: "0-Terminal", status: "completed", resultText: "first result" })],
+		};
+		const second: SubagentToolDetails = {
+			subagents: [snapshot({ id: "0-Terminal", status: "completed", resultText: "second result" })],
+		};
+		renderWith(first);
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+		renderWith(second);
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(2);
+		renderWith(first);
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(2);
 	});
 
 	it("ignores time-only churn in the body cache key", () => {

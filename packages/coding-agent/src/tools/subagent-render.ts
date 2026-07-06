@@ -15,6 +15,8 @@ import { renderSubagentLiveProgress } from "../task/render";
 import { Ellipsis, Hasher, renderStatusLine } from "../tui";
 import {
 	formatDuration,
+	formatExpandHint,
+	formatMoreItems,
 	formatStatusIcon,
 	getPreviewLines,
 	replaceTabs,
@@ -23,9 +25,97 @@ import {
 } from "./render-utils";
 import { type SubagentSnapshot, type SubagentToolDetails, subagentAwaitRenderedStateSignature } from "./subagent";
 
-const PREVIEW_LINES_COLLAPSED = 1;
-const PREVIEW_LINES_EXPANDED = 4;
-const PREVIEW_LINE_WIDTH = 80;
+const RESULT_PREVIEW_LINES_COLLAPSED = 3;
+const RESULT_PREVIEW_LINES_EXPANDED = 12;
+const ASSIGNMENT_PREVIEW_LINES_EXPANDED = 3;
+const PREVIEW_LINE_WIDTH = 96;
+
+interface PreviewBlock {
+	label: "Error" | "Findings" | "Result";
+	tone: "dim" | "error";
+	lines: string[];
+	remainingLines: number;
+}
+
+function decodeXmlEntities(text: string): string {
+	return text
+		.replace(/&quot;/g, '"')
+		.replace(/&apos;/g, "'")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&amp;/g, "&");
+}
+
+function extractXmlAttribute(attrs: string, name: string): string | undefined {
+	const match = new RegExp(`${name}="([^"]*)"`).exec(attrs);
+	return match ? decodeXmlEntities(match[1]!) : undefined;
+}
+
+function cleanTaskSummaryText(text: string): string {
+	const normalized = text
+		.replace(/<[^>]+>/g, " ")
+		.split("\n")
+		.map(line => line.trim())
+		.filter(Boolean)
+		.join(" ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return decodeXmlEntities(normalized);
+}
+
+function taskSummaryPreviewLines(text: string): string[] | undefined {
+	if (!text.includes("<task-summary")) return undefined;
+
+	const lines: string[] = [];
+	const header = /<header>([\s\S]*?)<\/header>/.exec(text)?.[1];
+	const cleanHeader = header ? cleanTaskSummaryText(header) : "";
+	if (cleanHeader) lines.push(`Outcome: ${cleanHeader}`);
+
+	const agentPattern = /<agent\b([^>]*)>([\s\S]*?)<\/agent>/g;
+	for (const match of text.matchAll(agentPattern)) {
+		const attrs = match[1] ?? "";
+		const body = match[2] ?? "";
+		const id = extractXmlAttribute(attrs, "id") ?? extractXmlAttribute(attrs, "agent") ?? "agent";
+		const synopsis = /<synopsis\b[^>]*>([\s\S]*?)<\/synopsis>/.exec(body)?.[1];
+		const status = /<status>([\s\S]*?)<\/status>/.exec(body)?.[1];
+		const cleanSynopsis = synopsis ? cleanTaskSummaryText(synopsis) : "";
+		const cleanStatus = status ? cleanTaskSummaryText(status) : "";
+		if (cleanSynopsis) {
+			lines.push(`${id}: ${cleanSynopsis}`);
+		} else if (cleanStatus) {
+			lines.push(`${id}: ${cleanStatus}`);
+		}
+	}
+
+	const mergeSummary = /<merge-summary>([\s\S]*?)<\/merge-summary>/.exec(text)?.[1];
+	const cleanMergeSummary = mergeSummary ? cleanTaskSummaryText(mergeSummary) : "";
+	if (cleanMergeSummary) lines.push(`Merged: ${cleanMergeSummary}`);
+
+	return lines.length > 0 ? lines : ["Task summary produced no previewable findings."];
+}
+
+function previewLines(text: string, width: number): string[] {
+	return text
+		.split("\n")
+		.map(line => line.trim())
+		.filter(Boolean)
+		.map(line => truncateToWidth(line, width, Ellipsis.Unicode));
+}
+
+function snapshotPreviewBlock(snapshot: SubagentSnapshot, maxLines: number): PreviewBlock | undefined {
+	const raw = snapshot.errorText?.trim() || snapshot.resultText?.trim();
+	if (!raw) return undefined;
+
+	const summaryLines = snapshot.errorText ? undefined : taskSummaryPreviewLines(raw);
+	const allLines = summaryLines ?? previewLines(raw, PREVIEW_LINE_WIDTH);
+	const lines = allLines.slice(0, maxLines);
+	return {
+		label: snapshot.errorText ? "Error" : summaryLines ? "Findings" : "Result",
+		tone: snapshot.errorText ? "error" : "dim",
+		lines,
+		remainingLines: Math.max(0, allLines.length - lines.length),
+	};
+}
 
 /**
  * Bounded, content-addressed cache for each subagent's heavy body lines (the
@@ -140,29 +230,50 @@ function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spin
 function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolean, theme: Theme): string[] {
 	const lines: string[] = [];
 
-	// Static receipt fields (parity with the markdown content for non-await actions).
-	if (snapshot.jobId !== snapshot.id) lines.push(`  ${theme.fg("dim", `Job: ${snapshot.jobId}`)}`);
-	if (snapshot.agent && snapshot.agent !== "unknown") {
-		lines.push(`  ${theme.fg("dim", `Agent: ${snapshot.agent} (${snapshot.agentSource})`)}`);
-	}
-	if (snapshot.effectiveModel) {
-		if (snapshot.modelFellBack && snapshot.requestedModel) {
-			lines.push(
-				`  ${theme.fg("warning", `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`)}`,
-			);
-		} else {
-			lines.push(`  ${theme.fg("dim", `Model: ${snapshot.effectiveModel}`)}`);
+	const previewMaxLines = expanded ? RESULT_PREVIEW_LINES_EXPANDED : RESULT_PREVIEW_LINES_COLLAPSED;
+	const preview = snapshotPreviewBlock(snapshot, previewMaxLines);
+	if (preview) {
+		lines.push(`  ${theme.fg("dim", `${preview.label}:`)}`);
+		for (const pl of preview.lines) {
+			lines.push(`    ${theme.fg(preview.tone, replaceTabs(pl))}`);
+		}
+		if (preview.remainingLines > 0) {
+			const hint = formatExpandHint(theme, expanded, true);
+			const suffix = hint ? ` ${hint}` : "";
+			lines.push(`    ${theme.fg("dim", `${formatMoreItems(preview.remainingLines, "line")}${suffix}`)}`);
 		}
 	}
-	if (snapshot.description) lines.push(`  ${theme.fg("dim", `Description: ${snapshot.description}`)}`);
-	if (snapshot.outputRef) lines.push(`  ${theme.fg("dim", `Output: ${snapshot.outputRef}`)}`);
-	if (snapshot.assignment) {
-		lines.push(`  ${theme.fg("dim", "Assignment:")}`);
-		for (const al of snapshot.assignment.split("\n")) lines.push(`    ${theme.fg("toolOutput", replaceTabs(al))}`);
+
+	// Metadata is useful in the expanded Agent Cards stage, but it crowds out the
+	// collapsed Panel Digest. Keep collapsed output focused on findings/results.
+	if (expanded) {
+		if (snapshot.jobId !== snapshot.id) lines.push(`  ${theme.fg("dim", `Job: ${snapshot.jobId}`)}`);
+		if (snapshot.agent && snapshot.agent !== "unknown") {
+			lines.push(`  ${theme.fg("dim", `Agent: ${snapshot.agent} (${snapshot.agentSource})`)}`);
+		}
+		if (snapshot.effectiveModel) {
+			if (snapshot.modelFellBack && snapshot.requestedModel) {
+				lines.push(
+					`  ${theme.fg("warning", `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`)}`,
+				);
+			} else {
+				lines.push(`  ${theme.fg("dim", `Model: ${snapshot.effectiveModel}`)}`);
+			}
+		}
+		if (snapshot.description) lines.push(`  ${theme.fg("dim", `Focus: ${snapshot.description}`)}`);
+		if (snapshot.outputRef) lines.push(`  ${theme.fg("dim", `Log: ${snapshot.outputRef}`)}`);
+		if (snapshot.assignment) {
+			lines.push(`  ${theme.fg("dim", "Assignment:")}`);
+			const maxLines = ASSIGNMENT_PREVIEW_LINES_EXPANDED;
+			for (const al of getPreviewLines(snapshot.assignment, maxLines, PREVIEW_LINE_WIDTH, Ellipsis.Unicode)) {
+				lines.push(`    ${theme.fg("toolOutput", replaceTabs(al))}`);
+			}
+		}
 	}
+
 	if (snapshot.steerMessage) {
 		lines.push(`  ${theme.fg("accent", `Steer (${snapshot.steerState ?? "queued"})`)}`);
-		const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
+		const maxLines = expanded ? RESULT_PREVIEW_LINES_EXPANDED : RESULT_PREVIEW_LINES_COLLAPSED;
 		for (const pl of getPreviewLines(snapshot.steerMessage, maxLines, PREVIEW_LINE_WIDTH, Ellipsis.Unicode)) {
 			lines.push(`    ${theme.fg("toolOutput", replaceTabs(pl))}`);
 		}
@@ -181,18 +292,10 @@ function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolea
 		lines.push(`  ${theme.fg("dim", "running, no activity yet")}`);
 	}
 
-	const preview = snapshot.errorText?.trim() || snapshot.resultText?.trim();
-	if (preview) {
-		const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
-		const tone = snapshot.errorText ? "error" : "dim";
-		for (const pl of getPreviewLines(preview, maxLines, PREVIEW_LINE_WIDTH, Ellipsis.Unicode)) {
-			lines.push(`  ${theme.fg(tone, replaceTabs(pl))}`);
-		}
-		if (snapshot.truncated) {
-			lines.push(
-				`  ${theme.fg("dim", "Preview truncated; use the output ref or explicit ids with `verbosity=full` for more.")}`,
-			);
-		}
+	if (snapshot.truncated) {
+		lines.push(
+			`  ${theme.fg("dim", "Preview truncated; use the output ref or explicit ids with `verbosity=full` for more.")}`,
+		);
 	}
 
 	if (snapshot.guidance) lines.push(`  ${theme.fg("dim", snapshot.guidance)}`);
@@ -218,6 +321,7 @@ export const subagentToolRenderer = {
 		}
 
 		const runningCount = subagents.filter(s => s.status === "running").length;
+		const awaitingCount = subagents.filter(s => s.status === "running" || s.status === "queued").length;
 
 		// Each snapshot's rendered-state signature is constant for this component
 		// instance, so compute them at most once; the heavy per-subagent bodies are
@@ -232,12 +336,12 @@ export const subagentToolRenderer = {
 				// it is never gated by the heavy body cache.
 				const header = renderStatusLine(
 					{
-						icon: runningCount > 0 ? "info" : "success",
+						icon: awaitingCount > 0 ? (runningCount > 0 ? "info" : "pending") : "success",
 						spinnerFrame: runningCount > 0 ? options.spinnerFrame : undefined,
 						title: "Subagent",
 						description:
-							runningCount > 0
-								? `awaiting ${runningCount} of ${subagents.length}`
+							awaitingCount > 0
+								? `awaiting ${awaitingCount} of ${subagents.length}`
 								: `${subagents.length} ${subagents.length === 1 ? "subagent" : "subagents"}`,
 					},
 					theme,
@@ -245,7 +349,7 @@ export const subagentToolRenderer = {
 				const out: string[] = [truncateToWidth(header, width, Ellipsis.Omit)];
 				// Discoverability: the inline panel is a bounded preview; the session
 				// observer (ctrl+s) streams the full per-subagent message history.
-				if (runningCount > 0) {
+				if (awaitingCount > 0) {
 					out.push(truncateToWidth(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`, width, Ellipsis.Omit));
 				}
 
