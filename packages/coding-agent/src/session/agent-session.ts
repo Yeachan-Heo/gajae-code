@@ -3963,7 +3963,7 @@ export class AgentSession {
 	 * prompts or tool execution can run.
 	 */
 	#wrapToolForDeepInterviewMutationGuard<T extends AgentTool>(tool: T): T {
-		if (!["edit", "write", "ast_edit"].includes(tool.name)) return tool;
+		if (!["edit", "write", "ast_edit", "bash"].includes(tool.name)) return tool;
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return Reflect.get(target, prop, target);

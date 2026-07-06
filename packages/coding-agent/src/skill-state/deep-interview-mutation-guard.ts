@@ -38,10 +38,13 @@ const ARCHIVE_OR_SQLITE_BASE_RE = /^(.+?\.(?:tar\.gz|sqlite3|sqlite|db3|zip|tgz|
 const INTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\r|\n|$)/i;
 const BASH_MUTATION_COMMAND_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:tee|touch|rm|mkdir|cp|mv|install)\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|\n]*)/gi;
 const BASH_OPAQUE_INTERPRETER_WRITE_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
+const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE =
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:<<[-]?\s*['"]?\w+['"]?)[\s\S]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
+const BASH_DD_OUTPUT_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?dd\b([^;&|\n]*)/gi;
 
 type ToolWithEditMode = AgentTool & {
 	mode?: unknown;
@@ -350,8 +353,14 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 		targets.unknown = true;
 		return targets;
 	}
-	if (BASH_OPAQUE_INTERPRETER_WRITE_RE.test(command)) {
+	if (BASH_OPAQUE_INTERPRETER_WRITE_RE.test(command) || BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(command)) {
 		targets.unknown = true;
+	}
+	for (const match of command.matchAll(BASH_DD_OUTPUT_RE)) {
+		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
+		const output = parts.find(part => part.startsWith("of="));
+		if (output) addPath(targets, output.slice(3));
+		else targets.unknown = true;
 	}
 	for (const match of command.matchAll(BASH_IN_PLACE_MUTATION_COMMAND_RE)) {
 		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
@@ -369,10 +378,12 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 		}
 		const parts = shellWords(match[1] ?? "");
 		const commandName = match[0]
-			?.match(/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(tee|touch|rm|mkdir|cp|mv|install)\b/i)?.[1]
+			?.match(/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\b/i)?.[1]
 			?.toLowerCase();
 		const targetParts =
-			commandName === "cp" || commandName === "mv" || commandName === "install" ? parts.slice(-1) : parts;
+			commandName === "cp" || commandName === "mv" || commandName === "install" || commandName === "truncate"
+				? parts.slice(-1)
+				: parts;
 		for (const part of targetParts) {
 			const cleaned = cleanShellWord(part);
 			if (!cleaned || cleaned.startsWith("-")) continue;

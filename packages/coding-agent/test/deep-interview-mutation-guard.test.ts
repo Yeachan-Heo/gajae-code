@@ -633,6 +633,9 @@ describe("deep-interview mutation guard", () => {
 			"gjc state read\nrm .gjc/state/foo.json",
 			"sed -i s/a/b/ src/product.ts",
 			'python -c \'open("src/product.ts", "w").write("x")\'',
+			"dd if=/dev/null of=src/product.ts",
+			"truncate -s 0 src/product.ts",
+			'python <<PY\nopen("src/product.ts", "w").write("x")\nPY',
 		]) {
 			const decision = await getDeepInterviewMutationDecision({
 				cwd,
