@@ -306,10 +306,13 @@ const longAssistantTurn = (chars: number) => ({
 	message: { role: "assistant", content: "가".repeat(chars) },
 });
 
-async function finalizedTextFor(over: Partial<Record<(typeof envKeys)[number], string>>): Promise<string> {
+async function finalizedTextFor(
+	over: Partial<Record<(typeof envKeys)[number], string>>,
+	chars = 5000,
+): Promise<string> {
 	setEnv(over);
 	const { handlers, ctx, frames } = await bootSession();
-	await handlers.get("turn_end")!(longAssistantTurn(5000), ctx);
+	await handlers.get("turn_end")!(longAssistantTurn(chars), ctx);
 	await waitFor(() => frames.some(f => f.type === "turn_stream" && f.phase === "finalized"), 3000, "finalized");
 	return frames.find(f => f.type === "turn_stream" && f.phase === "finalized")!.text ?? "";
 }
@@ -324,6 +327,18 @@ test("GJC_NOTIFICATIONS_TURN_MAX raises the finalized cap for full-turn delivery
 	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TURN_MAX: "40000" });
 	expect(text.length).toBe(5000); // full turn, untruncated
 	expect(text.endsWith("…")).toBe(false);
+});
+
+test("GJC_NOTIFICATIONS_TURN_MAX is clamped to a finite ceiling (never unbounded)", async () => {
+	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TURN_MAX: "10000000" }, 45000);
+	expect(text.length).toBe(40000); // clamped to TURN_TEXT_MAX_CEILING, not the requested 10M
+	expect(text.endsWith("…")).toBe(true); // still truncated at the ceiling
+});
+
+test("non-finite GJC_NOTIFICATIONS_TURN_MAX falls back to the 3500 default", async () => {
+	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TURN_MAX: "Infinity" });
+	expect(text.length).toBeLessThanOrEqual(3500); // Infinity is rejected, default applies
+	expect(text.endsWith("…")).toBe(true);
 });
 
 test("live frames are NOT raised by the turn cap (stay one editable preview)", async () => {

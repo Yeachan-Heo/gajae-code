@@ -1853,16 +1853,41 @@ export class TelegramNotificationDaemon {
 							parse_mode: TELEGRAM_PARSE_MODE,
 						});
 					} else {
-						let firstMessageId: number | undefined;
-						for (let i = 0; i < chunks.length; i++) {
-							const res = (await this.botApi.call("sendMessage", {
-								chat_id: this.opts.chatId,
-								...threadField,
-								text: chunks[i]!,
-								parse_mode: TELEGRAM_PARSE_MODE,
-							})) as { result?: { message_id?: number } };
-							if (i === 0) firstMessageId = res?.result?.message_id;
+						// A single granted slot MUST map to a single Telegram send. When the
+						// rendered text splits into multiple chunks (e.g. a long finalized
+						// turn raised via GJC_NOTIFICATIONS_TURN_MAX), deliver the first
+						// chunk on this token and re-submit the remaining chunks as their
+						// own pool items so each consumes a token on a later drain.
+						// Otherwise one frame would fan out into many sends against a single
+						// slot, bypassing the per-chat rate-limit / fairness invariant.
+						const res = (await this.botApi.call("sendMessage", {
+							chat_id: this.opts.chatId,
+							...threadField,
+							text: chunks[0]!,
+							parse_mode: TELEGRAM_PARSE_MODE,
+						})) as { result?: { message_id?: number } };
+						for (let i = 1; i < chunks.length; i++) {
+							// Continuation chunks are fresh, non-editable text sends: no
+							// coalesce key (they neither replace nor are replaced by other
+							// frames) and no media payload.
+							this.pool.submit({
+								sessionId: item.sessionId,
+								lane: item.lane,
+								payload: {
+									send: {
+										...send,
+										method: "sendMessage",
+										text: chunks[i]!,
+										editable: false,
+										coalesceKey: undefined,
+										photoBase64: undefined,
+										documentBase64: undefined,
+									},
+									topicId,
+								},
+							});
 						}
+						const firstMessageId = res?.result?.message_id;
 						if (editKey && ckey !== undefined && firstMessageId !== undefined) {
 							this.recordLiveMessage(item.sessionId, ckey, firstMessageId);
 						}

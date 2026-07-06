@@ -401,12 +401,20 @@ function streamIntervalMs(): number {
 }
 // Max chars of a turn's assistant text carried by the FINALIZED turn_stream (and
 // the pre-ask capture). Default 3500 keeps the mirror a glanceable per-turn
-// summary; a client that splits long messages (the Telegram daemon already does
-// via splitTelegramHtml) can raise it with GJC_NOTIFICATIONS_TURN_MAX to deliver
-// full turns. Live frames are intentionally NOT raised — they stay one editable
-// preview message rather than fanning a long in-progress turn across sends.
+// summary; a client that splits long messages (the Telegram daemon does so via
+// splitTelegramHtml, scheduling each chunk through the shared rate-limit pool so
+// the fan-out never bypasses the per-chat limit) can raise it with
+// GJC_NOTIFICATIONS_TURN_MAX to deliver full turns. The value is clamped to a
+// finite [280, TURN_TEXT_MAX_CEILING] range: a non-finite or non-positive env
+// (unset, NaN, Infinity, <= 0) falls back to the default, so the cap can never
+// be unbounded. Live frames are intentionally NOT raised — they stay one
+// editable preview message rather than fanning a long in-progress turn across
+// sends.
+const TURN_TEXT_MAX_CEILING = 40_000;
 function turnTextMax(): number {
-	return Math.max(280, Number(process.env.GJC_NOTIFICATIONS_TURN_MAX) || 3500);
+	const raw = Number(process.env.GJC_NOTIFICATIONS_TURN_MAX);
+	if (!Number.isFinite(raw) || raw <= 0) return 3500;
+	return Math.min(TURN_TEXT_MAX_CEILING, Math.max(280, raw));
 }
 function resolveSettings(settingsOverride?: Settings): ResolvedSettings {
 	if (settingsOverride)

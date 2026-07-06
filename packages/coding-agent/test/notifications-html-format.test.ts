@@ -334,6 +334,15 @@ describe("daemon send sites force parse_mode HTML (AC1)", () => {
 			phase: "finalized",
 			text: raw,
 		});
+		// The split is scheduled through the rate-limit pool: the first chunk is
+		// sent on the granted slot and the continuation is re-queued, so a follow-up
+		// flush drains it (one send per token — no single-slot burst).
+		await daemon.handleSessionMessage(fakeSession() as any, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "tail",
+		});
 		const texts = bot.calls
 			.filter(c => c.method === "sendMessage" && c.body.text?.startsWith("a"))
 			.map(c => String(c.body.text));

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
+import { markdownToTelegramHtml, splitTelegramHtml } from "../src/notifications/html-format";
 import {
 	acquireDaemonOwnership,
 	DAEMON_VERSION,
@@ -2714,4 +2715,58 @@ test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {
 		(process as any).once = originalOnce;
 		(process as any).off = originalOff;
 	}
+});
+
+test("a long finalized turn is scheduled through the pool, not burst in one grant", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const now = 0;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		now: () => now,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	bot.calls = [];
+
+	// A finalized turn with NO messageRef renders keyless (legacy fresh-send).
+	// Its rendered HTML spans multiple Telegram chunks.
+	const raw = "가".repeat(9000);
+	const expectedChunks = splitTelegramHtml(markdownToTelegramHtml(raw));
+	expect(expectedChunks.length).toBeGreaterThan(1); // sanity: the turn really splits
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "finalized",
+		text: raw,
+	});
+
+	// One granted slot -> exactly one Telegram send; the remaining chunks are
+	// re-submitted to the pool rather than fanned out against the single token.
+	const firstFlush = bot.calls.filter(c => c.method === "sendMessage");
+	expect(firstFlush).toHaveLength(1);
+	expect(firstFlush[0]!.body.text).toBe(expectedChunks[0]);
+
+	// A follow-up flush drains the queued continuation chunks (each consumed a
+	// token) ahead of the newer frame, preserving order and dropping nothing.
+	bot.calls = [];
+	await daemon.handleSessionMessage(session as any, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "finalized",
+		text: "tail",
+	});
+	const rest = bot.calls.filter(c => c.method === "sendMessage").map(c => c.body.text);
+	expect(rest).toEqual([...expectedChunks.slice(1), markdownToTelegramHtml("tail")]);
 });
