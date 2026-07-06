@@ -188,6 +188,104 @@ describe("deep-interview redteam: idempotency and lossless shape normalization",
 			answer_hash: "answer-shell-hash",
 		});
 	});
+
+	it("strips leaked envelope-reserved keys from nested state and self-heals recursive nesting", () => {
+		// Reproduces the real corruption: a write wrapped a whole envelope under
+		// `state`, leaking `state.state`/`state.receipt`/`state.skill`/... into the
+		// nested state where they accreted forever. Good top-level interview data
+		// coexists with a stale nested duplicate.
+		const corrupt = {
+			skill: "deep-interview",
+			active: true,
+			current_phase: "interviewing",
+			version: 2,
+			updated_at: "2026-07-06T06:47:40.342Z",
+			receipt: { owner: "gjc-state-cli", command: "gjc state deep-interview write" },
+			state_revision: 3,
+			state: {
+				rounds: [
+					{ round_key: "iv::r:1::q:q1", round: 1, lifecycle: "scored", ambiguity: 0.62 },
+					{ round_key: "iv::r:2::q:q2", round: 2, lifecycle: "scored", ambiguity: 0.61 },
+				],
+				established_facts: [{ id: "f1", statement: "confirmed fact", round: 1, disputed: false }],
+				interview_id: "iv",
+				current_ambiguity: 0.61,
+				topology: { status: "confirmed", last_targeted_component_id: "supabase-backend" },
+				custom_extension: { keep: true },
+				// Leaked envelope-reserved keys (junk from an envelope-in-state write):
+				active: true,
+				current_phase: "interviewing",
+				skill: "deep-interview",
+				version: 2,
+				updated_at: "2026-07-06T06:38:03.375Z",
+				receipt: { owner: "stale" },
+				state_revision: 1,
+				session_id: "sess",
+				state: {
+					rounds: [],
+					established_facts: [{ id: "old", statement: "stale fact", round: 0, disputed: false }],
+					current_ambiguity: 1,
+					topology: { status: "pending" },
+				},
+			},
+		};
+
+		const normalized = normalizeDeepInterviewEnvelope(corrupt);
+		const state = inner(normalized);
+		for (const reserved of [
+			"state",
+			"receipt",
+			"skill",
+			"version",
+			"updated_at",
+			"active",
+			"current_phase",
+			"state_revision",
+			"session_id",
+		]) {
+			expect(Object.hasOwn(state, reserved)).toBe(false);
+		}
+		// Good interview data survives untouched; the stale nested duplicate is gone.
+		expect((state.rounds as Array<Record<string, unknown>>).map(round => round.round)).toEqual([1, 2]);
+		expect(state.established_facts).toEqual([{ id: "f1", statement: "confirmed fact", round: 1, disputed: false }]);
+		expect(state.current_ambiguity).toBe(0.61);
+		expect(state.topology).toEqual({ status: "confirmed", last_targeted_component_id: "supabase-backend" });
+		expect(state.interview_id).toBe("iv");
+		// Non-reserved unknown nested fields are still preserved (free-form extension).
+		expect(state.custom_extension).toEqual({ keep: true });
+		// Envelope-level reserved keys remain legitimately at the top level.
+		expect(normalized.skill).toBe("deep-interview");
+		expect(normalized.receipt).toEqual({ owner: "gjc-state-cli", command: "gjc state deep-interview write" });
+		// Idempotent: a second normalization pass is a fixed point.
+		expect(normalizeDeepInterviewEnvelope(clone(normalized))).toEqual(normalized);
+	});
+
+	it("self-heals leaked reserved keys through a partial merge without dropping rounds", () => {
+		const corruptExisting = {
+			skill: "deep-interview",
+			active: true,
+			current_phase: "interviewing",
+			state: {
+				rounds: [{ round_key: "iv::r:1::q:q1", round: 1, lifecycle: "scored", ambiguity: 0.62 }],
+				established_facts: [{ id: "f1", statement: "fact", round: 1, disputed: false }],
+				current_ambiguity: 0.62,
+				// Leaked junk a plain merge would otherwise carry forward forever:
+				state: { rounds: [], current_ambiguity: 1 },
+				receipt: { owner: "stale" },
+				skill: "deep-interview",
+			},
+		};
+		// A normal partial update (e.g. a topology write) that carries no reserved keys.
+		const merged = mergeDeepInterviewEnvelope(corruptExisting, { state: { topology: { status: "confirmed" } } });
+		const state = inner(merged);
+		expect(Object.hasOwn(state, "state")).toBe(false);
+		expect(Object.hasOwn(state, "receipt")).toBe(false);
+		expect(Object.hasOwn(state, "skill")).toBe(false);
+		expect((state.rounds as Array<Record<string, unknown>>).map(round => round.round)).toEqual([1]);
+		expect(state.established_facts).toEqual([{ id: "f1", statement: "fact", round: 1, disputed: false }]);
+		expect(state.topology).toEqual({ status: "confirmed" });
+		expect(state.current_ambiguity).toBe(0.62);
+	});
 });
 
 describe("deep-interview redteam: writer and recorder integration", () => {
