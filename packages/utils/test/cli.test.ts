@@ -58,7 +58,7 @@ async function runCapturing(
 	} finally {
 		process.stdout.write = origOut;
 		process.stderr.write = origErr;
-		process.exitCode = origExit;
+		process.exitCode = origExit ?? 0; // Bun: `= undefined` is a no-op, so coerce to 0 to avoid leaking a numeric exitCode out of the test process
 	}
 }
 
