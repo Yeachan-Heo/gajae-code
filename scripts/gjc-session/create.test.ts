@@ -288,6 +288,76 @@ exit 0
 		});
 	});
 
+	test("runner treats non-terminal runtime state as failed even without prompt marker", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-runtime-running-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_runtime_running_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+printf 'Gajae forge\\n> Type your message\\nWorking on accepted prompt\\n'
+python3 - <<'PY'
+import json
+import os
+
+with open(os.environ["GJC_COORDINATOR_SESSION_STATE_FILE"], "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "schema_version": 1,
+            "session_id": os.environ["GJC_COORDINATOR_SESSION_ID"],
+            "state": "running",
+            "ready_for_input": False,
+            "source": "agent_session_event",
+            "event": "turn_start",
+            "reason": None,
+        },
+        handle,
+        indent=2,
+    )
+    handle.write("\\n")
+PY
+exit 0
+`,
+		);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_DISABLE: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		await waitForFile(path.join(stateDir, "final.json"));
+		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as {
+			ownerExitReason: string;
+			promptAccepted: boolean;
+			runtimeStateSummary: { present: boolean; valid: boolean; state: string; terminal: boolean };
+			severity: string;
+			turnEvidencePresent: boolean;
+		};
+		expect(finalStatus).toMatchObject({
+			ownerExitReason: "owner_exited_after_runtime_acknowledgement_before_terminal_status",
+			promptAccepted: false,
+			severity: "failure",
+			turnEvidencePresent: true,
+			runtimeStateSummary: {
+				present: true,
+				valid: true,
+				state: "running",
+				terminal: false,
+			},
+		});
+	}, 20000);
+
 	test("external monitor records vanished tmux sessions and alerts the router", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-vanish-"));
 		tempRoots.push(root);
