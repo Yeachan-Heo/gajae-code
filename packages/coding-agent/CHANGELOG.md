@@ -1,6 +1,13 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added a `/clear` slash command that clears the active conversation context while preserving the current session id and durable session history (#1677).
+
+### Fixed
+
+- Restored `/changelog` as a built-in slash command, including autocomplete and `/changelog --full`/`/changelog full`, so the What's New prompt no longer points at a missing command.
 
 ### Added
 

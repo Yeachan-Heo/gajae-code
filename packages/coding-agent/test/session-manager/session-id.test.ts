@@ -73,3 +73,19 @@ describe("SessionManager session ids", () => {
 		expect(session.getHeader()?.id).toBe(existingId);
 	});
 });
+
+describe("context clear", () => {
+	it("preserves session id while clearing the active branch context", () => {
+		const session = SessionManager.inMemory();
+		const sessionId = expectUuidV7SessionId(session);
+		session.appendMessage({ role: "user", content: "before clear", timestamp: 1 });
+
+		session.appendContextClearEntry({ sessionId });
+		session.appendMessage({ role: "user", content: "after clear", timestamp: 2 });
+
+		expect(session.getSessionId()).toBe(sessionId);
+		expect(session.getHeader()?.id).toBe(sessionId);
+		expect(session.getEntries().filter(entry => entry.type === "message")).toHaveLength(2);
+		expect(session.buildSessionContext().messages).toEqual([{ role: "user", content: "after clear", timestamp: 2 }]);
+	});
+});

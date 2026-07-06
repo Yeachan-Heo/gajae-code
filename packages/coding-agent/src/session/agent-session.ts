@@ -1736,6 +1736,16 @@ export class AgentSession {
 		manager.cancelAll({ ownerId: this.#agentId });
 	}
 
+	#suppressOwnAsyncJobDeliveries(): void {
+		if (!this.#agentId) return;
+		const manager = AsyncJobManager.instance();
+		if (!manager) return;
+		const pendingJobIds = manager.getDeliveryState({ ownerId: this.#agentId }).pendingJobIds;
+		if (pendingJobIds.length > 0) {
+			manager.acknowledgeDeliveries(pendingJobIds);
+		}
+	}
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -6094,6 +6104,41 @@ export class AgentSession {
 			});
 		}
 
+		return true;
+	}
+
+	/**
+	 * Clear active conversational/model context while preserving the current
+	 * session identity and durable history trail.
+	 */
+	async clearContext(): Promise<boolean> {
+		const sessionId = this.sessionId;
+		this.#disconnectFromAgent();
+		await this.abort();
+		this.#cancelOwnAsyncJobs();
+		this.#suppressOwnAsyncJobDeliveries();
+		this.yieldQueue.clear();
+		this.#pendingBackgroundExchanges = [];
+		this.#closeAllProviderSessions("context clear");
+		this.agent.reset();
+		await this.sessionManager.flush();
+		this.sessionManager.appendContextClearEntry({ sessionId });
+		this.setTodoPhases([]);
+		this.#syncAgentSessionId(sessionId);
+		this.#steeringMessages = [];
+		this.#followUpMessages = [];
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
+
+		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+		if (this.model) {
+			this.sessionManager.appendModelChange(`${this.model.provider}/${this.model.id}`);
+		}
+		this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
+		this.#todoReminderCount = 0;
+		this.#planReferenceSent = false;
+		this.#planReferencePath = "local://PLAN.md";
+		this.#reconnectToAgent();
 		return true;
 	}
 
