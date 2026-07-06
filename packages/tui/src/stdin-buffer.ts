@@ -348,6 +348,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				for (const sequence of result.sequences) {
 					this.#emitDataSequence(sequence);
 				}
+				if (result.remainder.length > 0) {
+					this.#emitDataSequence(result.remainder);
+				}
 			}
 
 			this.#pendingKittyPrintableCodepoint = undefined;

@@ -292,6 +292,14 @@ describe("StdinBuffer", () => {
 			expect(emittedPaste).toEqual(["pasted"]);
 		});
 
+		it("emits incomplete input before a bracketed paste marker instead of dropping it", () => {
+			processInput("\x1b[<35\x1b[200~pasted\x1b[201~");
+
+			expect(emittedSequences).toEqual(["\x1b[<35"]);
+			expect(emittedPaste).toEqual(["pasted"]);
+			expect(buffer.getBuffer()).toBe("");
+		});
+
 		it("should handle paste with newlines", () => {
 			processInput("\x1b[200~line1\nline2\nline3\x1b[201~");
 
