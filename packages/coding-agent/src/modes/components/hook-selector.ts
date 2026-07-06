@@ -474,6 +474,16 @@ export class HookSelectorComponent extends Container {
 		}
 	}
 
+	/**
+	 * True while the inline "Other (type your own)" editor is open below the
+	 * option list. Escape in this sub-mode backs out to the option list (see
+	 * `#handleInputModeKey`), so the global interrupt listener must defer to
+	 * this component instead of consuming Escape and aborting the turn.
+	 */
+	isInlineInputActive(): boolean {
+		return this.#inlineEditor !== undefined;
+	}
+
 	handleInput(keyData: string): void {
 		// Reset countdown on any interaction
 		this.#countdown?.reset();

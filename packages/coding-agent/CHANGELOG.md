@@ -18,6 +18,7 @@
 - Team worker auto-checkpoints now exclude the entire `.gjc/_session-*/` session subtree instead of nine enumerated subdirectories, so extragoal gate receipts and the session activity marker are no longer committed with `--no-verify` and merged into the leader branch on repos that do not gitignore `.gjc/_session-*/`.
 - The Telegram threaded daemon now schedules each split chunk of an oversized message through the shared rate-limit pool: a granted send slot maps to exactly one Bot API send, and continuation chunks are re-queued (one token each) rather than fanned out against a single token. This keeps a long finalized turn (e.g. raised via `GJC_NOTIFICATIONS_TURN_MAX`) within the documented per-chat rate-limit / round-robin fairness invariant instead of bursting many `sendMessage` calls on one slot.
 - `gjc config list`, `gjc config get`, and `gjc config set` now redact secret-like setting paths even when malformed config files store object, array, boolean, or numeric values there; `--show-secrets` remains the explicit unsafe opt-in (#1738).
+- Pressing `Escape` inside a hook selector's inline "Other (type your own)" editor now backs out to the option list instead of aborting the whole turn. The global interrupt listener added in #1478 consumed `Escape` whenever a hook dialog was streaming, so deep-interview/ralplan custom-input entry was killed with "Operation aborted"; it now defers to the focused selector while still aborting from option-selection mode.
 
 ## [0.8.2] - 2026-07-06
 ### Added
