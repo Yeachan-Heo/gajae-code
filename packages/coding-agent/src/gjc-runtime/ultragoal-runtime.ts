@@ -688,7 +688,13 @@ function normalizePipelinePath(value: string, fieldName: string): string {
 	const raw = value.trim();
 	if (raw.split(/[\\/]+/).includes("..")) throw new Error(`${fieldName} contains unsafe path ${value}`);
 	const normalized = normalizeRepoPath(raw);
-	if (!normalized || normalized.startsWith("../") || normalized === ".." || path.isAbsolute(normalized) || normalized.includes("\0")) {
+	if (
+		!normalized ||
+		normalized.startsWith("../") ||
+		normalized === ".." ||
+		path.isAbsolute(normalized) ||
+		normalized.includes("\0")
+	) {
 		throw new Error(`${fieldName} contains unsafe path ${value}`);
 	}
 	return normalized;
@@ -701,7 +707,8 @@ function normalizePipelineTargets(value: unknown, fieldName: string): UltragoalP
 	);
 	const surfaces = normalizePipelineStringArray(record.surfaces, `${fieldName}.surfaces`).map(normalizeSurfaceToken);
 	if (new Set(files).size !== files.length) throw new Error(`${fieldName}.files contains duplicate normalized paths`);
-	if (new Set(surfaces).size !== surfaces.length) throw new Error(`${fieldName}.surfaces contains duplicate normalized surfaces`);
+	if (new Set(surfaces).size !== surfaces.length)
+		throw new Error(`${fieldName}.surfaces contains duplicate normalized surfaces`);
 	return { files, surfaces };
 }
 
@@ -720,7 +727,9 @@ function hashPipelineMetadata(metadata: Omit<UltragoalPipelineMetadata, "metadat
 	return hashStructuredValue(pipelineMetadataHashBasis(metadata));
 }
 
-function withPipelineMetadataHash(metadata: Omit<UltragoalPipelineMetadata, "metadataHash">): UltragoalPipelineMetadata {
+function withPipelineMetadataHash(
+	metadata: Omit<UltragoalPipelineMetadata, "metadataHash">,
+): UltragoalPipelineMetadata {
 	return { ...metadata, metadataHash: hashPipelineMetadata(metadata) } as UltragoalPipelineMetadata;
 }
 
@@ -740,7 +749,8 @@ function legacyPipelineMetadata(goalId: string): UltragoalPipelineMetadata {
 }
 
 function normalizePipelineMetadataRecord(value: unknown, goalIds: ReadonlySet<string>): UltragoalPipelineMetadata {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("goal metadata rows must be objects");
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		throw new Error("goal metadata rows must be objects");
 	const record = value as JsonObject;
 	if (record.schemaVersion !== 1) throw new Error("goal metadata schemaVersion must be 1");
 	const goalId = nonEmptyString(record.goalId);
@@ -751,11 +761,13 @@ function normalizePipelineMetadataRecord(value: unknown, goalIds: ReadonlySet<st
 	}
 	const dependsOn = normalizePipelineStringArray(record.dependsOn, `metadata ${goalId}.dependsOn`);
 	const independentOf = normalizePipelineStringArray(record.independentOf, `metadata ${goalId}.independentOf`);
-	if (dependsOn.includes(goalId) || independentOf.includes(goalId)) throw new Error(`goal metadata ${goalId} cannot reference itself`);
+	if (dependsOn.includes(goalId) || independentOf.includes(goalId))
+		throw new Error(`goal metadata ${goalId} cannot reference itself`);
 	for (const id of [...dependsOn, ...independentOf]) {
 		if (!goalIds.has(id)) throw new Error(`goal metadata ${goalId} references unknown goal id ${id}`);
 	}
-	if (dependsOn.some(id => independentOf.includes(id))) throw new Error(`goal metadata ${goalId} has dependency/independence conflict`);
+	if (dependsOn.some(id => independentOf.includes(id)))
+		throw new Error(`goal metadata ${goalId} has dependency/independence conflict`);
 	const targets = requireNonEmptyPipelineTargets(record.targets, `metadata ${goalId}.targets`);
 	const basis: Omit<UltragoalPipelineMetadata, "metadataHash"> = {
 		schemaVersion: 1,
@@ -771,21 +783,32 @@ function normalizePipelineMetadataRecord(value: unknown, goalIds: ReadonlySet<st
 }
 
 function targetsAreDisjoint(left: UltragoalPipelineTargets, right: UltragoalPipelineTargets): boolean {
-	return left.files.every(file => !right.files.includes(file)) && left.surfaces.every(surface => !right.surfaces.includes(surface));
+	return (
+		left.files.every(file => !right.files.includes(file)) &&
+		left.surfaces.every(surface => !right.surfaces.includes(surface))
+	);
 }
 
 function targetsOverlap(left: UltragoalPipelineTargets, right: UltragoalPipelineTargets): boolean {
-	return left.files.some(file => right.files.includes(file)) || left.surfaces.some(surface => right.surfaces.includes(surface));
+	return (
+		left.files.some(file => right.files.includes(file)) ||
+		left.surfaces.some(surface => right.surfaces.includes(surface))
+	);
 }
 
 function requireNonEmptyPipelineTargets(value: unknown, fieldName: string): UltragoalPipelineTargets {
 	const targets = normalizePipelineTargets(value, fieldName);
-	if (targets.files.length === 0 && targets.surfaces.length === 0) throw new Error(`${fieldName} requires files or surfaces`);
+	if (targets.files.length === 0 && targets.surfaces.length === 0)
+		throw new Error(`${fieldName} requires files or surfaces`);
 	return targets;
 }
 
 function collectPipelineBlockerFootprints(result: JsonObject, fieldName: string): UltragoalPipelineTargets[] {
-	const raw = Array.isArray(result.blockers) ? result.blockers : Array.isArray(result.blockerFootprints) ? result.blockerFootprints : [];
+	const raw = Array.isArray(result.blockers)
+		? result.blockers
+		: Array.isArray(result.blockerFootprints)
+			? result.blockerFootprints
+			: [];
 	return raw.map((item, index) => {
 		const record = requireJsonObjectValue(item, `${fieldName}.blockers[${index}]`);
 		const footprint = typeof record.footprint === "object" && record.footprint !== null ? record.footprint : record;
@@ -805,7 +828,13 @@ function pipelinePeer(plan: UltragoalPlan, metadata: UltragoalPipelineMetadata):
 
 function handleIdsFromValue(value: JsonObject | JsonObject[], fieldName: string): string[] {
 	const records = Array.isArray(value) ? value : [value];
-	const ids = records.map((record, index) => nonEmptyString(record.id) ?? nonEmptyString(record.handleId) ?? nonEmptyString(record.name) ?? `${fieldName}-${index}`);
+	const ids = records.map(
+		(record, index) =>
+			nonEmptyString(record.id) ??
+			nonEmptyString(record.handleId) ??
+			nonEmptyString(record.name) ??
+			`${fieldName}-${index}`,
+	);
 	if (ids.some(id => id.length === 0)) throw new Error(`${fieldName} handles require ids`);
 	return ids;
 }
@@ -826,14 +855,21 @@ function validatePipelineEligibility(metadata: UltragoalPipelineMetadata[]): Ult
 	return metadata.map(item => {
 		const invalidationReasons: string[] = [];
 		if (item.source !== "original_plan_graph") invalidationReasons.push("not_original_plan_graph");
-		if (item.targets.files.length === 0 && item.targets.surfaces.length === 0) invalidationReasons.push("empty_targets");
+		if (item.targets.files.length === 0 && item.targets.surfaces.length === 0)
+			invalidationReasons.push("empty_targets");
 		for (const otherId of item.independentOf) {
 			const other = byId.get(otherId);
-			if (!other?.independentOf.includes(item.goalId)) invalidationReasons.push(`missing_symmetric_independence:${otherId}`);
-			if (other && !targetsAreDisjoint(item.targets, other.targets)) invalidationReasons.push(`shared_targets:${otherId}`);
+			if (!other?.independentOf.includes(item.goalId))
+				invalidationReasons.push(`missing_symmetric_independence:${otherId}`);
+			if (other && !targetsAreDisjoint(item.targets, other.targets))
+				invalidationReasons.push(`shared_targets:${otherId}`);
 		}
 		const eligible = invalidationReasons.length === 0;
-		return { ...item, eligible, ...(eligible ? {} : { invalidationReason: invalidationReasons.join(",") || "ineligible" }) };
+		return {
+			...item,
+			eligible,
+			...(eligible ? {} : { invalidationReason: invalidationReasons.join(",") || "ineligible" }),
+		};
 	});
 }
 
@@ -876,12 +912,21 @@ function normalizeSavedPipelineMetadata(value: unknown, goalId: string): Ultrago
 		...(nonEmptyString(record.priorGoalId) ? { priorGoalId: nonEmptyString(record.priorGoalId)! } : {}),
 		...(nonEmptyString(record.nextGoalId) ? { nextGoalId: nonEmptyString(record.nextGoalId)! } : {}),
 		...(Array.isArray(record.blockerFootprints)
-			? { blockerFootprints: record.blockerFootprints.map((item, index) => normalizePipelineTargets(item, `metadata ${goalId}.blockerFootprints[${index}]`)) }
+			? {
+					blockerFootprints: record.blockerFootprints.map((item, index) =>
+						normalizePipelineTargets(item, `metadata ${goalId}.blockerFootprints[${index}]`),
+					),
+				}
 			: {}),
-		...(nonEmptyString(record.invalidationReason) ? { invalidationReason: nonEmptyString(record.invalidationReason)! } : {}),
+		...(nonEmptyString(record.invalidationReason)
+			? { invalidationReason: nonEmptyString(record.invalidationReason)! }
+			: {}),
 		...(nonEmptyString(record.invalidatedAt) ? { invalidatedAt: nonEmptyString(record.invalidatedAt)! } : {}),
 	};
-	return { ...basis, metadataHash: nonEmptyString(record.metadataHash) ?? hashPipelineMetadata(basis) } as UltragoalPipelineMetadata;
+	return {
+		...basis,
+		metadataHash: nonEmptyString(record.metadataHash) ?? hashPipelineMetadata(basis),
+	} as UltragoalPipelineMetadata;
 }
 
 function currentPipelineHash(metadata: UltragoalPipelineMetadata): string {
@@ -891,11 +936,14 @@ function currentPipelineHash(metadata: UltragoalPipelineMetadata): string {
 function requireFreshPipelineMetadata(goal: UltragoalGoal): UltragoalPipelineMetadata {
 	const metadata = goal.pipelineMetadata;
 	if (!metadata) throw new Error(`Goal ${goal.id} has no pipeline metadata`);
-	if (metadata.metadataHash !== currentPipelineHash(metadata)) throw new Error(`Goal ${goal.id} has stale pipeline metadata hash`);
+	if (metadata.metadataHash !== currentPipelineHash(metadata))
+		throw new Error(`Goal ${goal.id} has stale pipeline metadata hash`);
 	return metadata;
 }
 
-function openPipelineOverlap(plan: UltragoalPlan): { prior: UltragoalGoal; next: UltragoalGoal; overlapId: string } | null {
+function openPipelineOverlap(
+	plan: UltragoalPlan,
+): { prior: UltragoalGoal; next: UltragoalGoal; overlapId: string } | null {
 	const openGoals = plan.goals.filter(goal => goal.pipelineMetadata?.overlap === "open");
 	if (openGoals.length === 0) return null;
 	const overlapId = openGoals[0]?.pipelineMetadata?.overlapId;
@@ -1209,7 +1257,8 @@ export interface UltragoalRunCompletionState {
 	needsFinalAggregateReceipt: boolean;
 }
 function requireJsonObjectValue(value: unknown, fieldName: string): JsonObject {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${fieldName} must be an object`);
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		throw new Error(`${fieldName} must be an object`);
 	if (Object.keys(value).length === 0) throw new Error(`${fieldName} must be non-empty`);
 	return value as JsonObject;
 }
@@ -1226,22 +1275,32 @@ async function readRequiredJsonObject(cwd: string, value: string, fieldName: str
 	return requireJsonObjectValue(await readStructuredValue(cwd, value), fieldName);
 }
 
-async function readRequiredJsonObjectOrArray(cwd: string, value: string, fieldName: string): Promise<JsonObject | JsonObject[]> {
+async function readRequiredJsonObjectOrArray(
+	cwd: string,
+	value: string,
+	fieldName: string,
+): Promise<JsonObject | JsonObject[]> {
 	return requireJsonObjectOrArrayValue(await readStructuredValue(cwd, value), fieldName);
 }
 
 function requirePipelineStartable(plan: UltragoalPlan, prior: UltragoalGoal, next: UltragoalGoal): void {
-	if (plan.gjcGoalMode !== "aggregate") throw new Error("pipeline overlap is supported only for aggregate ultragoal mode");
-	if (openPipelineOverlap(plan)) throw new Error("Cannot start pipeline overlap because another overlap is already open");
-	if (prior.status !== "active") throw new Error(`Prior goal ${prior.id} must be active before pipeline overlap starts`);
-	if (next.status !== "pending" && next.status !== "failed") throw new Error(`Next goal ${next.id} must be pending or retryable failed`);
+	if (plan.gjcGoalMode !== "aggregate")
+		throw new Error("pipeline overlap is supported only for aggregate ultragoal mode");
+	if (openPipelineOverlap(plan))
+		throw new Error("Cannot start pipeline overlap because another overlap is already open");
+	if (prior.status !== "active")
+		throw new Error(`Prior goal ${prior.id} must be active before pipeline overlap starts`);
+	if (next.status !== "pending" && next.status !== "failed")
+		throw new Error(`Next goal ${next.id} must be pending or retryable failed`);
 	const priorMetadata = requireFreshPipelineMetadata(prior);
 	const nextMetadata = requireFreshPipelineMetadata(next);
-	if (!priorMetadata.eligible || !nextMetadata.eligible) throw new Error("pipeline overlap requires eligible original-plan metadata on both goals");
+	if (!priorMetadata.eligible || !nextMetadata.eligible)
+		throw new Error("pipeline overlap requires eligible original-plan metadata on both goals");
 	if (!priorMetadata.independentOf.includes(next.id) || !nextMetadata.independentOf.includes(prior.id)) {
 		throw new Error("pipeline overlap requires symmetric original independence");
 	}
-	if (!targetsAreDisjoint(priorMetadata.targets, nextMetadata.targets)) throw new Error("pipeline overlap requires disjoint files and surfaces");
+	if (!targetsAreDisjoint(priorMetadata.targets, nextMetadata.targets))
+		throw new Error("pipeline overlap requires disjoint files and surfaces");
 }
 
 function pipelineEventRefs(prior: UltragoalGoal, next: UltragoalGoal): JsonObject {
@@ -1253,7 +1312,13 @@ function pipelineEventRefs(prior: UltragoalGoal, next: UltragoalGoal): JsonObjec
 	};
 }
 
-function pipelineReceipt(cwd: string, event: string, overlapId: string, prior: UltragoalGoal, next: UltragoalGoal): UltragoalPipelineOverlapReceipt {
+function pipelineReceipt(
+	cwd: string,
+	event: string,
+	overlapId: string,
+	prior: UltragoalGoal,
+	next: UltragoalGoal,
+): UltragoalPipelineOverlapReceipt {
 	const paths = getUltragoalPaths(cwd, currentUltragoalSessionId(cwd));
 	return {
 		ok: true,
@@ -1345,14 +1410,24 @@ function requireCleanPipelineResult(result: JsonObject, expectedHandleIds: reado
 	const evidence = nonEmptyString(result.evidence);
 	if (!evidence || !isSubstantiveEvidence(evidence)) throw new Error(`${fieldName} requires substantive evidence`);
 	requireCoveredHandles(expectedHandleIds, resultHandleIds(result, fieldName), fieldName);
-	if (collectPipelineBlockerFootprints(result, fieldName).length > 0) throw new Error(`${fieldName} cannot clean-join with blockers`);
+	if (collectPipelineBlockerFootprints(result, fieldName).length > 0)
+		throw new Error(`${fieldName} cannot clean-join with blockers`);
 }
 
-function pipelineStartEventHandleIds(ledger: UltragoalLedgerEvent[], overlapId: string): { review: string[]; qa: string[] } {
-	const event = ledger.find(row => row.event === "pipeline_overlap_started" && row.overlapId === overlapId) as JsonObject | undefined;
+function pipelineStartEventHandleIds(
+	ledger: UltragoalLedgerEvent[],
+	overlapId: string,
+): { review: string[]; qa: string[] } {
+	const event = ledger.find(row => row.event === "pipeline_overlap_started" && row.overlapId === overlapId) as
+		| JsonObject
+		| undefined;
 	if (!event) throw new Error(`No pipeline_overlap_started event found for ${overlapId}`);
-	const review = stringArray(event.reviewHandleIds) ?? handleIdsFromValue(requireJsonObjectOrArrayValue(event.reviewHandles, "review handles"), "review");
-	const qa = stringArray(event.qaHandleIds) ?? handleIdsFromValue(requireJsonObjectOrArrayValue(event.qaHandles, "QA handles"), "QA");
+	const review =
+		stringArray(event.reviewHandleIds) ??
+		handleIdsFromValue(requireJsonObjectOrArrayValue(event.reviewHandles, "review handles"), "review");
+	const qa =
+		stringArray(event.qaHandleIds) ??
+		handleIdsFromValue(requireJsonObjectOrArrayValue(event.qaHandles, "QA handles"), "QA");
 	return { review, qa };
 }
 
@@ -1365,7 +1440,8 @@ export async function joinUltragoalPipelineOverlap(input: {
 	const plan = await readUltragoalPlan(input.cwd);
 	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
 	const overlap = openPipelineOverlap(plan);
-	if (!overlap || overlap.overlapId !== input.overlapId) throw new Error(`No open pipeline overlap found for ${input.overlapId}`);
+	if (!overlap || overlap.overlapId !== input.overlapId)
+		throw new Error(`No open pipeline overlap found for ${input.overlapId}`);
 	const { prior, next, overlapId } = overlap;
 	const nextMetadata = requireFreshPipelineMetadata(next);
 	const ledger = await readUltragoalLedger(input.cwd);
@@ -1438,7 +1514,8 @@ export async function rebaselineUltragoalPipelineOverlap(input: {
 		throw new Error(`Goal ${goal.id} is not quarantined for overlap ${input.overlapId}`);
 	}
 	for (const footprint of metadata.blockerFootprints ?? []) {
-		if (targetsOverlap(footprint, targetState)) throw new Error("rebaseline-pipeline-overlap target state overlaps unresolved blocker footprints");
+		if (targetsOverlap(footprint, targetState))
+			throw new Error("rebaseline-pipeline-overlap target state overlaps unresolved blocker footprints");
 	}
 	const now = new Date().toISOString();
 	const rebaselinedMetadata = { ...metadata, overlap: "rebaseline_complete" as const, targets: targetState };
@@ -3115,18 +3192,28 @@ async function readRequiredCompletionQualityGate(
 	return gate;
 }
 
-function validatePipelineCheckpointSafety(plan: UltragoalPlan, goal: UltragoalGoal, changeSet?: UltragoalChangeSet): void {
+function validatePipelineCheckpointSafety(
+	plan: UltragoalPlan,
+	goal: UltragoalGoal,
+	changeSet?: UltragoalChangeSet,
+): void {
 	const metadata = goal.pipelineMetadata;
 	if (!metadata) return;
 	requireFreshPipelineMetadata(goal);
 	if (metadata.overlap === "open") {
-		throw new Error(`Cannot complete ${goal.id} while pipeline overlap ${metadata.overlapId ?? ""} is open; join or quarantine first.`);
+		throw new Error(
+			`Cannot complete ${goal.id} while pipeline overlap ${metadata.overlapId ?? ""} is open; join or quarantine first.`,
+		);
 	}
 	if (metadata.overlap === "quarantine_required") {
-		throw new Error(`Cannot complete ${goal.id} while pipeline overlap ${metadata.overlapId ?? ""} requires rebaseline.`);
+		throw new Error(
+			`Cannot complete ${goal.id} while pipeline overlap ${metadata.overlapId ?? ""} requires rebaseline.`,
+		);
 	}
 	if (metadata.goalId === metadata.priorGoalId && metadata.overlap !== "none" && metadata.overlap !== "joined_clean") {
-		throw new Error(`Cannot complete ${goal.id} without a clean join for pipeline overlap ${metadata.overlapId ?? ""}.`);
+		throw new Error(
+			`Cannot complete ${goal.id} without a clean join for pipeline overlap ${metadata.overlapId ?? ""}.`,
+		);
 	}
 	const peer = pipelinePeer(plan, metadata);
 	if (changeSet && metadata.overlap !== "none") {
@@ -3134,9 +3221,12 @@ function validatePipelineCheckpointSafety(plan: UltragoalPlan, goal: UltragoalGo
 		for (const row of changeSet.paths) {
 			const ownedByGoal = pipelineTargetsCoverPath(metadata.targets, row.path);
 			const ownedByPeer = peerTargets ? pipelineTargetsCoverPath(peerTargets, row.path) : false;
-			if (ownedByGoal && ownedByPeer) throw new Error(`Cannot complete ${goal.id} with shared pipeline change-set path ${row.path}.`);
-			if (!ownedByGoal && !ownedByPeer) throw new Error(`Cannot complete ${goal.id} with unattributable pipeline change-set path ${row.path}.`);
-			if (!ownedByGoal && ownedByPeer) throw new Error(`Cannot complete ${goal.id} with next-goal pipeline change-set path ${row.path}.`);
+			if (ownedByGoal && ownedByPeer)
+				throw new Error(`Cannot complete ${goal.id} with shared pipeline change-set path ${row.path}.`);
+			if (!ownedByGoal && !ownedByPeer)
+				throw new Error(`Cannot complete ${goal.id} with unattributable pipeline change-set path ${row.path}.`);
+			if (!ownedByGoal && ownedByPeer)
+				throw new Error(`Cannot complete ${goal.id} with next-goal pipeline change-set path ${row.path}.`);
 		}
 	}
 }
@@ -4629,24 +4719,42 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 					cwd,
 					priorGoalId: flagValue(args, "--prior-goal-id") ?? "",
 					nextGoalId: flagValue(args, "--next-goal-id") ?? "",
-					reviewHandles: await readRequiredJsonObjectOrArray(cwd, flagValue(args, "--review-handles-json") ?? "", "review handles"),
-					qaHandles: await readRequiredJsonObjectOrArray(cwd, flagValue(args, "--qa-handles-json") ?? "", "QA handles"),
+					reviewHandles: await readRequiredJsonObjectOrArray(
+						cwd,
+						flagValue(args, "--review-handles-json") ?? "",
+						"review handles",
+					),
+					qaHandles: await readRequiredJsonObjectOrArray(
+						cwd,
+						flagValue(args, "--qa-handles-json") ?? "",
+						"QA handles",
+					),
 					implementationHandle: await readRequiredJsonObject(
 						cwd,
 						flagValue(args, "--implementation-handle-json") ?? "",
 						"implementation handle",
 					),
 				});
-				return { status: 0, stdout: json ? renderCliWriteReceipt(receipt) : `Started pipeline overlap ${receipt.overlap_id}.\n` };
+				return {
+					status: 0,
+					stdout: json ? renderCliWriteReceipt(receipt) : `Started pipeline overlap ${receipt.overlap_id}.\n`,
+				};
 			}
 			case "join-pipeline-overlap": {
 				const receipt = await joinUltragoalPipelineOverlap({
 					cwd,
 					overlapId: flagValue(args, "--overlap-id") ?? "",
-					reviewResult: await readRequiredJsonObject(cwd, flagValue(args, "--review-result-json") ?? "", "review result"),
+					reviewResult: await readRequiredJsonObject(
+						cwd,
+						flagValue(args, "--review-result-json") ?? "",
+						"review result",
+					),
 					qaResult: await readRequiredJsonObject(cwd, flagValue(args, "--qa-result-json") ?? "", "QA result"),
 				});
-				return { status: 0, stdout: json ? renderCliWriteReceipt(receipt) : `Joined pipeline overlap ${receipt.overlap_id}.\n` };
+				return {
+					status: 0,
+					stdout: json ? renderCliWriteReceipt(receipt) : `Joined pipeline overlap ${receipt.overlap_id}.\n`,
+				};
 			}
 			case "rebaseline-pipeline-overlap": {
 				const receipt = await rebaselineUltragoalPipelineOverlap({
@@ -4654,9 +4762,16 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 					overlapId: flagValue(args, "--overlap-id") ?? "",
 					goalId: flagValue(args, "--goal-id") ?? "",
 					evidence: flagValue(args, "--evidence") ?? "",
-					targetState: await readRequiredJsonObject(cwd, flagValue(args, "--target-state-json") ?? "", "target state"),
+					targetState: await readRequiredJsonObject(
+						cwd,
+						flagValue(args, "--target-state-json") ?? "",
+						"target state",
+					),
 				});
-				return { status: 0, stdout: json ? renderCliWriteReceipt(receipt) : `Rebaselined pipeline overlap ${receipt.overlap_id}.\n` };
+				return {
+					status: 0,
+					stdout: json ? renderCliWriteReceipt(receipt) : `Rebaselined pipeline overlap ${receipt.overlap_id}.\n`,
+				};
 			}
 			default:
 				return { status: 1, stderr: `Unknown gjc ultragoal command: ${command}\n` };

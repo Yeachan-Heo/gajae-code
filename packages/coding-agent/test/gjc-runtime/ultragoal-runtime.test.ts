@@ -844,7 +844,10 @@ describe("native GJC ultragoal runtime", () => {
 				source: "original_plan_graph",
 				dependsOn: [],
 				independentOf: ["G001"],
-				targets: { files: ["packages/coding-agent/test/gjc-runtime/ultragoal-runtime.test.ts"], surfaces: ["tests"] },
+				targets: {
+					files: ["packages/coding-agent/test/gjc-runtime/ultragoal-runtime.test.ts"],
+					surfaces: ["tests"],
+				},
 			},
 		]);
 
@@ -897,7 +900,9 @@ describe("native GJC ultragoal runtime", () => {
 			["G002", "active", "open"],
 		]);
 		expect(plan?.goals.every(goal => goal.pipelineMetadata?.eligible === true)).toBe(true);
-		expect(ledger.some(event => event.event === "pipeline_overlap_started" && event.priorGoalId === "G001")).toBe(true);
+		expect(ledger.some(event => event.event === "pipeline_overlap_started" && event.priorGoalId === "G001")).toBe(
+			true,
+		);
 	});
 
 	it("rejects unsafe pipeline metadata and per-story overlap", async () => {
@@ -908,7 +913,14 @@ describe("native GJC ultragoal runtime", () => {
 				"--brief",
 				"@goal: A\na\n@goal: B\nb",
 				"--goal-metadata-json",
-				JSON.stringify([{ schemaVersion: 1, goalId: "G003", source: "original_plan_graph", targets: { files: ["a.ts"], surfaces: ["a"] } }]),
+				JSON.stringify([
+					{
+						schemaVersion: 1,
+						goalId: "G003",
+						source: "original_plan_graph",
+						targets: { files: ["a.ts"], surfaces: ["a"] },
+					},
+				]),
 				"--json",
 			],
 			root,
@@ -922,7 +934,14 @@ describe("native GJC ultragoal runtime", () => {
 				"--brief",
 				"@goal: A\na\n@goal: B\nb",
 				"--goal-metadata-json",
-				JSON.stringify([{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", targets: { files: [], surfaces: [] } }]),
+				JSON.stringify([
+					{
+						schemaVersion: 1,
+						goalId: "G001",
+						source: "original_plan_graph",
+						targets: { files: [], surfaces: [] },
+					},
+				]),
 				"--json",
 			],
 			root,
@@ -936,7 +955,14 @@ describe("native GJC ultragoal runtime", () => {
 				"--brief",
 				"@goal: A\na\n@goal: B\nb",
 				"--goal-metadata-json",
-				JSON.stringify([{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", targets: { files: ["a.ts", "a.ts"], surfaces: ["a"] } }]),
+				JSON.stringify([
+					{
+						schemaVersion: 1,
+						goalId: "G001",
+						source: "original_plan_graph",
+						targets: { files: ["a.ts", "a.ts"], surfaces: ["a"] },
+					},
+				]),
 				"--json",
 			],
 			root,
@@ -950,7 +976,14 @@ describe("native GJC ultragoal runtime", () => {
 				"--brief",
 				"@goal: A\na\n@goal: B\nb",
 				"--goal-metadata-json",
-				JSON.stringify([{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", targets: { files: ["safe/../target.ts"], surfaces: ["a"] } }]),
+				JSON.stringify([
+					{
+						schemaVersion: 1,
+						goalId: "G001",
+						source: "original_plan_graph",
+						targets: { files: ["safe/../target.ts"], surfaces: ["a"] },
+					},
+				]),
 				"--json",
 			],
 			root,
@@ -960,8 +993,20 @@ describe("native GJC ultragoal runtime", () => {
 		expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).exists()).toBe(false);
 
 		const metadata = JSON.stringify([
-			{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", independentOf: ["G002"], targets: { files: ["a.ts"], surfaces: ["a"] } },
-			{ schemaVersion: 1, goalId: "G002", source: "original_plan_graph", independentOf: ["G001"], targets: { files: ["b.ts"], surfaces: ["b"] } },
+			{
+				schemaVersion: 1,
+				goalId: "G001",
+				source: "original_plan_graph",
+				independentOf: ["G002"],
+				targets: { files: ["a.ts"], surfaces: ["a"] },
+			},
+			{
+				schemaVersion: 1,
+				goalId: "G002",
+				source: "original_plan_graph",
+				independentOf: ["G001"],
+				targets: { files: ["b.ts"], surfaces: ["b"] },
+			},
 		]);
 		const create = await runNativeUltragoalCommand(
 			[
@@ -1001,8 +1046,20 @@ describe("native GJC ultragoal runtime", () => {
 	it("fails closed for open and quarantined pipeline checkpoints", async () => {
 		const root = await tempDir();
 		const metadata = JSON.stringify([
-			{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", independentOf: ["G002"], targets: { files: ["a.ts"], surfaces: ["a"] } },
-			{ schemaVersion: 1, goalId: "G002", source: "original_plan_graph", independentOf: ["G001"], targets: { files: ["b.ts"], surfaces: ["b"] } },
+			{
+				schemaVersion: 1,
+				goalId: "G001",
+				source: "original_plan_graph",
+				independentOf: ["G002"],
+				targets: { files: ["a.ts"], surfaces: ["a"] },
+			},
+			{
+				schemaVersion: 1,
+				goalId: "G002",
+				source: "original_plan_graph",
+				independentOf: ["G001"],
+				targets: { files: ["b.ts"], surfaces: ["b"] },
+			},
 		]);
 		await runNativeUltragoalCommand(
 			["create-goals", "--brief", "@goal: A\na\n@goal: B\nb", "--goal-metadata-json", metadata],
@@ -1037,7 +1094,11 @@ describe("native GJC ultragoal runtime", () => {
 				"--overlap-id",
 				overlapId,
 				"--review-result-json",
-				JSON.stringify({ status: "failed", evidence: "review failed without structured blocker footprints", blockers: [] }),
+				JSON.stringify({
+					status: "failed",
+					evidence: "review failed without structured blocker footprints",
+					blockers: [],
+				}),
 				"--qa-result-json",
 				JSON.stringify({ status: "passed", evidence: "qa passed", blockers: [] }),
 				"--json",
@@ -1068,7 +1129,10 @@ describe("native GJC ultragoal runtime", () => {
 		expect(openCheckpoint.status).toBe(1);
 		expect(openCheckpoint.stderr).toContain("pipeline overlap");
 		expect(join.status).toBe(0);
-		expect(JSON.parse(join.stdout ?? "{}")).toMatchObject({ event: "pipeline_overlap_quarantined", status: "quarantine_required" });
+		expect(JSON.parse(join.stdout ?? "{}")).toMatchObject({
+			event: "pipeline_overlap_quarantined",
+			status: "quarantine_required",
+		});
 		expect(quarantinedCheckpoint.status).toBe(1);
 		expect(quarantinedCheckpoint.stderr).toContain("requires rebaseline");
 		expect(rebaseline.status).toBe(0);
@@ -1078,9 +1142,27 @@ describe("native GJC ultragoal runtime", () => {
 	it("clean joins permit prior checkpoint without starting a third goal", async () => {
 		const root = await tempDir();
 		const metadata = JSON.stringify([
-			{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", independentOf: ["G002"], targets: { files: ["packages"], surfaces: ["a"] } },
-			{ schemaVersion: 1, goalId: "G002", source: "original_plan_graph", independentOf: ["G001"], targets: { files: ["b.ts"], surfaces: ["b"] } },
-			{ schemaVersion: 1, goalId: "G003", source: "original_plan_graph", independentOf: [], targets: { files: ["c.ts"], surfaces: ["c"] } },
+			{
+				schemaVersion: 1,
+				goalId: "G001",
+				source: "original_plan_graph",
+				independentOf: ["G002"],
+				targets: { files: ["packages"], surfaces: ["a"] },
+			},
+			{
+				schemaVersion: 1,
+				goalId: "G002",
+				source: "original_plan_graph",
+				independentOf: ["G001"],
+				targets: { files: ["b.ts"], surfaces: ["b"] },
+			},
+			{
+				schemaVersion: 1,
+				goalId: "G003",
+				source: "original_plan_graph",
+				independentOf: [],
+				targets: { files: ["c.ts"], surfaces: ["c"] },
+			},
 		]);
 		await runNativeUltragoalCommand(
 			["create-goals", "--brief", "@goal: A\na\n@goal: B\nb\n@goal: C\nc", "--goal-metadata-json", metadata],
@@ -1127,9 +1209,19 @@ describe("native GJC ultragoal runtime", () => {
 				"--overlap-id",
 				overlapId,
 				"--review-result-json",
-				JSON.stringify({ status: "passed", handleIds: ["review"], evidence: "Architect review passed with complete clean join evidence.", blockers: [] }),
+				JSON.stringify({
+					status: "passed",
+					handleIds: ["review"],
+					evidence: "Architect review passed with complete clean join evidence.",
+					blockers: [],
+				}),
 				"--qa-result-json",
-				JSON.stringify({ status: "passed", handleIds: ["qa"], evidence: "Executor QA passed with complete clean join evidence.", blockers: [] }),
+				JSON.stringify({
+					status: "passed",
+					handleIds: ["qa"],
+					evidence: "Executor QA passed with complete clean join evidence.",
+					blockers: [],
+				}),
 				"--json",
 			],
 			root,
@@ -1155,9 +1247,18 @@ describe("native GJC ultragoal runtime", () => {
 		expect(secondOverlap.status).toBe(1);
 		expect(secondOverlap.stderr).toContain("another overlap is already open");
 		expect(join.status).toBe(0);
-		expect(JSON.parse(join.stdout ?? "{}")).toMatchObject({ event: "pipeline_overlap_joined", status: "joined_clean" });
+		expect(JSON.parse(join.stdout ?? "{}")).toMatchObject({
+			event: "pipeline_overlap_joined",
+			status: "joined_clean",
+		});
 		expect(checkpoint.status).toBe(0);
-		expect(receipt).toMatchObject({ goal_id: "G001", all_complete: false, next_goal_id: "G002", next_goal_status: "active", started_next: false });
+		expect(receipt).toMatchObject({
+			goal_id: "G001",
+			all_complete: false,
+			next_goal_id: "G002",
+			next_goal_status: "active",
+			started_next: false,
+		});
 		expect(plan?.goals.map(goal => [goal.id, goal.status])).toEqual([
 			["G001", "complete"],
 			["G002", "active"],
