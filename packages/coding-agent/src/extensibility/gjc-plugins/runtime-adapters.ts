@@ -15,6 +15,7 @@ export interface AlwaysOnPluginTools {
 interface FileSnapshot {
 	path: string;
 	mtimeMs: number;
+	ctimeMs: number;
 	size: number;
 }
 
@@ -39,7 +40,7 @@ const registryScopes: GjcPluginScope[] = ["user", "project"];
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
 	try {
 		const stat = await fs.stat(filePath);
-		return { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size };
+		return { path: filePath, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return null;
 		throw error;
@@ -47,7 +48,7 @@ async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | nu
 }
 
 function snapshotsKey(snapshots: readonly FileSnapshot[]): string {
-	return snapshots.map(s => `${s.path}:${s.mtimeMs}:${s.size}`).join("|");
+	return snapshots.map(s => `${s.path}:${s.mtimeMs}:${s.ctimeMs}:${s.size}`).join("|");
 }
 
 async function snapshotRegistryFiles(cwd: string): Promise<FileSnapshot[]> {
@@ -65,7 +66,7 @@ async function snapshotPluginFiles(entries: readonly GjcPluginRegistryEntry[]): 
 			const abs = path.join(entry.pluginRoot, file.relativePath);
 			const snapshot = await snapshotExistingFile(abs);
 			if (!snapshot) {
-				snapshots.push({ path: abs, mtimeMs: Number.NaN, size: Number.NaN });
+				snapshots.push({ path: abs, mtimeMs: Number.NaN, ctimeMs: Number.NaN, size: Number.NaN });
 			} else {
 				snapshots.push(snapshot);
 			}
@@ -79,7 +80,7 @@ function sha256(buf: Buffer): string {
 }
 
 async function hashFile(snapshot: FileSnapshot): Promise<string> {
-	const key = `${snapshot.path}:${snapshot.mtimeMs}:${snapshot.size}`;
+	const key = `${snapshot.path}:${snapshot.mtimeMs}:${snapshot.ctimeMs}:${snapshot.size}`;
 	const cached = hashCache.get(key);
 	if (cached) return cached;
 	const digest = sha256(await fs.readFile(snapshot.path));
