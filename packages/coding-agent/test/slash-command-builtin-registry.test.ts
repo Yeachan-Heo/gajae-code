@@ -24,16 +24,32 @@ function createTuiRuntime() {
 	};
 }
 
+function createClearTuiRuntime() {
+	const handleContextClearCommand = vi.fn(async () => {});
+	const setText = vi.fn();
+	const ctx = {
+		handleContextClearCommand,
+		editor: { setText },
+	} as unknown as InteractiveModeContext;
+
+	return {
+		runtime: { ctx, handleBackgroundCommand: () => undefined },
+		handleContextClearCommand,
+		setText,
+	};
+}
+
 describe("builtin /copy slash command", () => {
-	it("is discoverable as a TUI builtin without public subcommands and does not register /clear", () => {
+	it("is discoverable as a TUI builtin without public subcommands", () => {
 		const copyCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "copy");
+		const clearCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "clear");
 
 		expect(copyCommand).toBeDefined();
 		expect(copyCommand?.description).toBe("Copy the last response for review or sharing");
 		expect(copyCommand?.subcommands).toBeUndefined();
 		expect(copyCommand?.inlineHint).toBeUndefined();
-		expect(BUILTIN_SLASH_COMMAND_DEFS.some(command => command.name === "clear")).toBe(false);
-		expect(BUILTIN_SLASH_COMMANDS_INTERNAL.some(command => command.name === "clear")).toBe(false);
+		expect(clearCommand?.description).toBe("Clear context while preserving this session ID");
+		expect(BUILTIN_SLASH_COMMANDS_INTERNAL.some(command => command.name === "clear")).toBe(true);
 	});
 
 	it("surfaces beginner session commands with clear labels", () => {
@@ -82,6 +98,79 @@ describe("builtin /copy slash command", () => {
 	});
 });
 
+function createChangelogTuiRuntime() {
+	const handleChangelogCommand = vi.fn(async (_showFull?: boolean) => {});
+	const showError = vi.fn();
+	const setText = vi.fn();
+	const ctx = {
+		handleChangelogCommand,
+		showError,
+		editor: { setText },
+	} as unknown as InteractiveModeContext;
+
+	return {
+		runtime: { ctx, handleBackgroundCommand: () => undefined },
+		handleChangelogCommand,
+		showError,
+		setText,
+	};
+}
+
+describe("builtin /changelog slash command", () => {
+	it("is discoverable with full-history completion metadata", () => {
+		const changelogCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "changelog");
+
+		expect(changelogCommand).toBeDefined();
+		expect(changelogCommand?.description).toBe("Show release notes and changelog entries");
+		expect(changelogCommand?.inlineHint).toBe("[full|--full]");
+		expect(changelogCommand?.subcommands?.map(command => command.name)).toEqual(["full"]);
+	});
+
+	it("dispatches /changelog to the existing TUI changelog controller path", async () => {
+		const { runtime, handleChangelogCommand, showError, setText } = createChangelogTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/changelog", runtime);
+
+		expect(result).toBe(true);
+		expect(handleChangelogCommand).toHaveBeenCalledWith(false);
+		expect(showError).not.toHaveBeenCalled();
+		expect(setText).toHaveBeenCalledWith("");
+	});
+
+	it("accepts full and --full changelog arguments", async () => {
+		const shortForm = createChangelogTuiRuntime();
+		const longForm = createChangelogTuiRuntime();
+
+		expect(await executeBuiltinSlashCommand("/changelog full", shortForm.runtime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/changelog --full", longForm.runtime)).toBe(true);
+
+		expect(shortForm.handleChangelogCommand).toHaveBeenCalledWith(true);
+		expect(longForm.handleChangelogCommand).toHaveBeenCalledWith(true);
+	});
+
+	it("rejects unknown changelog arguments locally instead of falling through", async () => {
+		const { runtime, handleChangelogCommand, showError, setText } = createChangelogTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/changelog nope", runtime);
+
+		expect(result).toBe(true);
+		expect(handleChangelogCommand).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledWith("Usage: /changelog [full|--full]");
+		expect(setText).toHaveBeenCalledWith("");
+	});
+});
+
+describe("builtin /clear slash command", () => {
+	it("dispatches to context clear without starting the /new flow", async () => {
+		const { runtime, handleContextClearCommand, setText } = createClearTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/clear", runtime);
+
+		expect(result).toBe(true);
+		expect(handleContextClearCommand).toHaveBeenCalled();
+		expect(setText).toHaveBeenCalledWith("");
+	});
+});
 function createGoalTuiRuntime(goalModeEnabled: boolean) {
 	const handleGoalModeCommand = vi.fn(async () => {});
 	const addToHistory = vi.fn();
