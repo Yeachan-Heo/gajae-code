@@ -24,6 +24,39 @@ const ESC = "\x1b";
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 
+function isUtf8LeadByte(byte: number): boolean {
+	return byte >= 0xc2 && byte <= 0xf4;
+}
+
+function endsWithIncompleteUtf8Sequence(data: Buffer): boolean {
+	if (data.length === 0) return false;
+
+	let index = data.length - 1;
+	let continuationCount = 0;
+	while (index >= 0) {
+		const byte = data[index]!;
+		if (byte < 0x80 || byte > 0xbf) break;
+		continuationCount++;
+		index--;
+	}
+
+	if (index < 0) {
+		return continuationCount > 0;
+	}
+
+	const lead = data[index]!;
+	let expectedLength = 0;
+	if (lead >= 0xc2 && lead <= 0xdf) expectedLength = 2;
+	else if (lead >= 0xe0 && lead <= 0xef) expectedLength = 3;
+	else if (lead >= 0xf0 && lead <= 0xf4) expectedLength = 4;
+
+	return expectedLength > 0 && continuationCount + 1 < expectedLength;
+}
+
+function legacyMetaSequence(byte: number): string {
+	return `\x1b${String.fromCharCode(byte - 128)}`;
+}
+
 /**
  * Check if a string is a complete escape sequence or needs more data
  */
@@ -268,6 +301,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	// split across two stdin events) reassemble correctly instead of emitting
 	// U+FFFD. Reset on clear()/destroy(); never finalized on normal flush.
 	#decoder = new StringDecoder("utf8");
+	#decoderHasPendingUtf8 = false;
+	#pendingSingleUtf8LeadByte: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -286,22 +321,51 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		let str: string;
 		let decodedFromBuffer = false;
 		if (Buffer.isBuffer(data)) {
-			// Legacy 8-bit meta: an isolated high byte (0x80-0xFF) is treated
-			// as ESC + (byte - 128) for Alt/meta compatibility, BEFORE UTF-8
-			// decoding. This is the one documented exception to UTF-8 boundary
-			// decoding — a lone high byte that is also a valid UTF-8 lead byte
-			// is still read as meta — so such a byte is never fed to the decoder.
-			if (data.length === 1 && data[0]! > 127) {
-				const byte = data[0]! - 128;
-				str = `\x1b${String.fromCharCode(byte)}`;
+			let bytes = data;
+			const hadPendingUtf8 = this.#decoderHasPendingUtf8 || this.#pendingSingleUtf8LeadByte !== undefined;
+
+			if (this.#pendingSingleUtf8LeadByte !== undefined) {
+				const nextByte = data[0];
+				if (nextByte !== undefined && nextByte >= 0x80 && nextByte <= 0xbf) {
+					bytes = Buffer.concat([Buffer.from([this.#pendingSingleUtf8LeadByte]), data]);
+					this.#pendingSingleUtf8LeadByte = undefined;
+				} else {
+					const pendingMeta = this.#consumePendingSingleUtf8LeadAsMeta();
+					if (pendingMeta !== undefined) {
+						this.#emitDataSequence(pendingMeta);
+					}
+				}
+			}
+
+			if (bytes.length === 1 && bytes[0]! > 127 && !this.#decoderHasPendingUtf8) {
+				const byte = bytes[0]!;
+				if (isUtf8LeadByte(byte)) {
+					this.#pendingSingleUtf8LeadByte = byte;
+					this.#decoderHasPendingUtf8 = true;
+					this.#timeout = setTimeout(() => {
+						const sequence = this.#consumePendingSingleUtf8LeadAsMeta();
+						if (sequence !== undefined) {
+							this.#emitDataSequence(sequence);
+						}
+					}, this.#timeoutMs);
+					return;
+				}
+				str = legacyMetaSequence(byte);
 			} else {
 				// Decode through the persistent StringDecoder so a multi-byte
 				// sequence split across chunks (e.g. a 3-byte Korean syllable)
 				// is reassembled instead of emitting U+FFFD.
-				str = this.#decoder.write(data);
+				str = this.#decoder.write(bytes);
 				decodedFromBuffer = true;
+				const allContinuationBytes = bytes.every(byte => byte >= 0x80 && byte <= 0xbf);
+				this.#decoderHasPendingUtf8 =
+					endsWithIncompleteUtf8Sequence(bytes) && !(hadPendingUtf8 && str.length > 0 && allContinuationBytes);
 			}
 		} else {
+			const pendingMeta = this.#consumePendingSingleUtf8LeadAsMeta();
+			if (pendingMeta !== undefined) {
+				this.#emitDataSequence(pendingMeta);
+			}
 			str = data;
 		}
 
@@ -392,6 +456,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 	}
 
+	#consumePendingSingleUtf8LeadAsMeta(): string | undefined {
+		const byte = this.#pendingSingleUtf8LeadByte;
+		if (byte === undefined) return undefined;
+		this.#pendingSingleUtf8LeadByte = undefined;
+		this.#decoderHasPendingUtf8 = false;
+		return legacyMetaSequence(byte);
+	}
 	#emitDataSequence(sequence: string): void {
 		const rawCodepoint = sequence.length === 1 ? sequence.codePointAt(0) : undefined;
 		if (rawCodepoint !== undefined && rawCodepoint === this.#pendingKittyPrintableCodepoint) {
@@ -409,11 +480,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.#timeout = undefined;
 		}
 
+		const pendingMeta = this.#consumePendingSingleUtf8LeadAsMeta();
+
 		if (this.#buffer.length === 0) {
-			return [];
+			return pendingMeta === undefined ? [] : [pendingMeta];
 		}
 
-		const sequences = [this.#buffer];
+		const sequences = pendingMeta === undefined ? [this.#buffer] : [pendingMeta, this.#buffer];
 		this.#buffer = "";
 		this.#pendingKittyPrintableCodepoint = undefined;
 		return sequences;
@@ -432,6 +505,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		// stale partial prefix cannot combine with future input. destroy()
 		// resets the decoder by calling clear().
 		this.#decoder = new StringDecoder("utf8");
+		this.#decoderHasPendingUtf8 = false;
+		this.#pendingSingleUtf8LeadByte = undefined;
 	}
 
 	getBuffer(): string {
