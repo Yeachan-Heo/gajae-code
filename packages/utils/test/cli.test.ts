@@ -58,6 +58,7 @@ const commands: CommandEntry[] = [
 	{ name: "demo", load: async () => Demo },
 	{ name: "boom", load: async () => Boom },
 	{ name: "verbed", load: async () => Verbed },
+	{ name: "tokened", load: async () => Tokened },
 ];
 
 /** Run the CLI while capturing stdout/stderr and isolating process.exitCode. */
@@ -154,6 +155,15 @@ describe("cli run — usage instead of uncaught crash", () => {
 		sideEffect.ran = false;
 		const { err, out, exitCode } = await runCapturing(["verbed"]);
 		expect(err).toContain("Missing required argument: verb");
+		expect(out.toLowerCase()).toContain("usage");
+		expect(exitCode).toBe(2);
+		expect(sideEffect.ran).toBe(false); // command body never ran
+	});
+
+	it("renders usage + exits 2 (no throw) when a required flag is missing", async () => {
+		sideEffect.ran = false;
+		const { err, out, exitCode } = await runCapturing(["tokened"]);
+		expect(err).toContain("Missing required flag: --token");
 		expect(out.toLowerCase()).toContain("usage");
 		expect(exitCode).toBe(2);
 		expect(sideEffect.ran).toBe(false); // command body never ran
