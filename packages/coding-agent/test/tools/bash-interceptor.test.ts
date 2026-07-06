@@ -175,6 +175,23 @@ describe("BashTool restricted role-agent allowlist", () => {
 			"restricted role-agent bash only allows commands starting with",
 		);
 	});
+	it("blocks restricted role-agent cwd outside the session workspace", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-restricted-cwd-root-"));
+		const outside = await fs.mkdtemp(path.join(process.cwd(), ".tmp-restricted-cwd-outside-"));
+		try {
+			const tool = createRestrictedBashTool(root, ["gjc state"]);
+
+			await expect(
+				tool.execute("tool-call", {
+					command: "gjc state read --json",
+					cwd: outside,
+				}),
+			).rejects.toThrow("Restricted role-agent bash cwd must stay within the session workspace");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
 
 	it("surfaces read-only bash restrictions in the tool description", () => {
 		const tool = createRestrictedBashTool(process.cwd(), ["grep", "rg", "tree", "ls"], "read-only");
@@ -259,7 +276,52 @@ describe("BashTool restricted role-agent allowlist", () => {
 				command: "gjc ralplan --write --stage architect --stage_n 1 --artifact ok",
 				env: { PATH: "/tmp/fake" },
 			}),
-		).rejects.toThrow("does not allow per-command env overrides");
+		).rejects.toThrow("only allows the GJC_RALPLAN_ARTIFACT env override");
+	});
+
+	it("blocks artifact env overrides when --artifact-env only matches as a substring", async () => {
+		const tool = createRestrictedBashTool();
+
+		await expect(
+			tool.execute("tool-call", {
+				command: "gjc ralplan --write --stage architect --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT_EVIL",
+				env: { GJC_RALPLAN_ARTIFACT: "payload" },
+			}),
+		).rejects.toThrow("only allows the GJC_RALPLAN_ARTIFACT env override");
+	});
+
+	it("allows the sanctioned ralplan artifact env override in restricted mode", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-restricted-env-bash-"));
+		try {
+			const cliPath = path.resolve(import.meta.dir, "..", "..", "src", "cli.ts");
+			const bunPath = process.execPath;
+			const tool = createRestrictedBashTool(root, [`${bunPath} ${cliPath} ralplan --write`]);
+			const result = await tool.execute("tool-call", {
+				command: `${bunPath} ${cliPath} ralplan --write --stage critic --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT --run-id env-marker --session-id restricted-bash-test`,
+				env: {
+					GJC_RALPLAN_ARTIFACT: '# Review\n\nContains `"studio"`, `use client`, $VALUE, and C:\\tmp.\n',
+				},
+				timeout: 30,
+			});
+
+			expect(result.content.find(part => part.type === "text")?.text).toContain("stage-01-critic.md");
+			const persisted = await fs.readFile(
+				path.join(
+					root,
+					".gjc",
+					sessionDirName("restricted-bash-test"),
+					"plans",
+					"ralplan",
+					"env-marker",
+					"stage-01-critic.md",
+				),
+				"utf-8",
+			);
+			expect(persisted).toContain('Contains `"studio"`, `use client`, $VALUE');
+			expect(persisted).toContain("C:\\tmp");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("marks restricted CLI subprocesses so ralplan does not ingest artifact file paths", async () => {

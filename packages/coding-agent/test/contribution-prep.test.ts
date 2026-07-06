@@ -144,6 +144,33 @@ describe("contribution prep", () => {
 		}
 	});
 
+	it("ignores PI_SUBPROCESS_CMD when spawning contribution workers", async () => {
+		const tempDir = TempDir.createSync("@gjc-contribution-prep-env-spawn-");
+		const previous = process.env.PI_SUBPROCESS_CMD;
+		process.env.PI_SUBPROCESS_CMD = "/tmp/evil-gjc";
+		try {
+			const spawns: Array<{ args: string[]; cwd: string }> = [];
+			await prepareContributionPrep(
+				{ sessionId: "source-session", cwd: tempDir.path(), messages: [] },
+				{
+					artifactRoot: path.join(tempDir.path(), "artifacts"),
+					spawnWorker: true,
+					spawn: async (args, cwd) => {
+						spawns.push({ args, cwd });
+					},
+				},
+			);
+
+			expect(spawns).toHaveLength(1);
+			expect(spawns[0]?.args[0]).not.toBe("/tmp/evil-gjc");
+			expect(spawns[0]?.args).toContain("--no-skills");
+		} finally {
+			if (previous === undefined) delete process.env.PI_SUBPROCESS_CMD;
+			else process.env.PI_SUBPROCESS_CMD = previous;
+			tempDir.remove();
+		}
+	});
+
 	it("resolves worker spawn argv through the GJC command and prompt file", async () => {
 		const tempDir = TempDir.createSync("@gjc-contribution-prep-real-spawn-");
 		try {

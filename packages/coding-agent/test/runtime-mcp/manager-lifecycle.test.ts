@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import type { JsonRpcMessage } from "../../src/runtime-mcp/types";
+import type { AuthStorage } from "../../src/session/auth-storage";
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -48,6 +53,26 @@ setInterval(() => {}, 1000);
 `;
 }
 
+function envCaptureServerScript(outputPath: string, envName = "API_KEY"): string {
+	return `
+const fs = require('node:fs');
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    fs.writeFileSync(${JSON.stringify(outputPath)}, process.env[${JSON.stringify(envName)}] || '');
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'test', version: '1' }, instructions: 'project-controlled instructions' } }) + '\\n');
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [] } }) + '\\n');
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+}
+
 describe("MCP manager lifecycle cleanup", () => {
 	test("initial listTools failure closes transport and does not register server", async () => {
 		const manager = new MCPManager(process.cwd());
@@ -62,6 +87,148 @@ describe("MCP manager lifecycle cleanup", () => {
 		expect(result.errors.get("bad")).toContain("boom");
 		expect(manager.getConnectedServers()).toEqual([]);
 		await expect(manager.waitForConnection("bad")).rejects.toThrow("MCP server not connected: bad");
+	});
+
+	test("does not resolve project MCP env references or expose project server instructions", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-project-source-"));
+		const capturePath = path.join(tempDir, "captured-env.txt");
+		const previous = process.env.SECRET_FOR_MCP;
+		process.env.SECRET_FOR_MCP = "leaked-secret";
+		const manager = new MCPManager(process.cwd());
+		try {
+			const result = await manager.connectServers(
+				{
+					projected: {
+						command: process.execPath,
+						args: ["-e", envCaptureServerScript(capturePath)],
+						env: { API_KEY: "SECRET_FOR_MCP" },
+						timeout: 1_000,
+					},
+				},
+				{
+					projected: {
+						provider: "test",
+						providerName: "Test Project",
+						path: path.join(tempDir, ".mcp.json"),
+						level: "project",
+					},
+				},
+			);
+
+			expect(result.errors.size).toBe(0);
+			expect(await Bun.file(capturePath).text()).toBe("SECRET_FOR_MCP");
+			expect(manager.getServerInstructions().size).toBe(0);
+		} finally {
+			if (previous === undefined) delete process.env.SECRET_FOR_MCP;
+			else process.env.SECRET_FOR_MCP = previous;
+			await manager.disconnectAll();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	test("project MCP stdio servers do not inherit unrelated host environment", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-project-no-inherit-"));
+		const capturePath = path.join(tempDir, "captured-secret.txt");
+		const previous = process.env.SECRET_FOR_MCP;
+		process.env.SECRET_FOR_MCP = "host-secret";
+		const manager = new MCPManager(tempDir);
+		try {
+			await Bun.write(
+				path.join(tempDir, ".mcp.json"),
+				`${JSON.stringify({
+					mcpServers: {
+						projected: {
+							command: process.execPath,
+							args: ["-e", envCaptureServerScript(capturePath, "SECRET_FOR_MCP")],
+						},
+					},
+				})}\n`,
+			);
+			const { configs, sources } = await loadAllMCPConfigs(tempDir, { enableProjectConfig: true });
+			expect(configs.projected).toHaveProperty("noInheritEnv", true);
+
+			const result = await manager.connectServers(configs, sources);
+
+			expect(result.errors.size).toBe(0);
+			expect(await Bun.file(capturePath).text()).toBe("");
+		} finally {
+			if (previous === undefined) delete process.env.SECRET_FOR_MCP;
+			else process.env.SECRET_FOR_MCP = previous;
+			await manager.disconnectAll();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	test("does not inject stored OAuth credentials into project MCP servers", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-project-oauth-"));
+		const capturePath = path.join(tempDir, "captured-oauth.txt");
+		const lookups: string[] = [];
+		const manager = new MCPManager(process.cwd());
+		manager.setAuthStorage({
+			get(provider: string) {
+				lookups.push(provider);
+				return { type: "oauth", access: "secret-token", refresh: "refresh-token", expires: Date.now() + 60_000 };
+			},
+			async set() {
+				throw new Error("project OAuth credentials must not refresh");
+			},
+		} as unknown as AuthStorage);
+		try {
+			const result = await manager.connectServers(
+				{
+					projected: {
+						command: process.execPath,
+						args: ["-e", envCaptureServerScript(capturePath, "OAUTH_ACCESS_TOKEN")],
+						auth: { type: "oauth", credentialId: "project-secret" },
+						timeout: 1_000,
+					},
+				},
+				{
+					projected: {
+						provider: "test",
+						providerName: "Test Project",
+						path: path.join(tempDir, ".mcp.json"),
+						level: "project",
+					},
+				},
+			);
+
+			expect(result.errors.size).toBe(0);
+			expect(lookups).toEqual([]);
+			expect(await Bun.file(capturePath).text()).toBe("");
+		} finally {
+			await manager.disconnectAll();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	test("prepareConfig does not resolve project-source OAuth credentials", async () => {
+		const lookups: string[] = [];
+		const manager = new MCPManager(process.cwd());
+		manager.setAuthStorage({
+			get(provider: string) {
+				lookups.push(provider);
+				return { type: "oauth", access: "secret-token", refresh: "refresh-token", expires: Date.now() + 60_000 };
+			},
+			async set() {
+				throw new Error("project OAuth credentials must not refresh");
+			},
+		} as unknown as AuthStorage);
+
+		const resolved = await manager.prepareConfig(
+			{ command: process.execPath, auth: { type: "oauth", credentialId: "project-secret" } },
+			{
+				provider: "mcp-json",
+				providerName: "Project MCP config",
+				path: path.join(process.cwd(), ".mcp.json"),
+				level: "project",
+			},
+		);
+
+		expect(lookups).toEqual([]);
+		if (resolved.type !== "http" && resolved.type !== "sse") {
+			expect(resolved.env?.OAUTH_ACCESS_TOKEN).toBeUndefined();
+		}
 	});
 
 	test("disconnect cancels an in-flight reconnect backoff", async () => {

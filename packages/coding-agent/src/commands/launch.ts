@@ -12,13 +12,17 @@ import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
 import { prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
-	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	resolveCoordinatorRuntimeStateFile,
 } from "../gjc-runtime/session-state-sidecar";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
 
 async function persistCoordinatorLaunchFailure(error: unknown, cwd: string): Promise<void> {
-	const stateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	const stateFile = resolveCoordinatorRuntimeStateFile({
+		sessionId: process.env.GJC_SESSION_ID?.trim() || process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || "launch",
+		cwd,
+		sessionFile: null,
+	});
 	if (!stateFile) return;
 	const message = error instanceof Error ? error.message : String(error);
 	const code = message.split(":", 1)[0] || "launch_failed";

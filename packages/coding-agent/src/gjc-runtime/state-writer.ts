@@ -18,7 +18,7 @@ import {
 	auditPath as layoutAuditPath,
 	transactionJournalPath as layoutTransactionJournalPath,
 } from "./session-layout";
-import { RequiredOnWriteEnvelopeSchema } from "./state-schema";
+import { type RequiredOnWriteEnvelope, RequiredOnWriteEnvelopeSchema } from "./state-schema";
 
 /**
  * Sole sanctioned project `.gjc/**` writer module (gate G1).
@@ -207,16 +207,105 @@ function cwdForOptions(options?: StateWriterOptions): string {
 	return path.resolve(options?.cwd ?? process.cwd());
 }
 
+function isWithinOrEqualPath(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function resolveGjcTarget(targetPath: string, cwd = process.cwd()): string {
 	if (!targetPath.trim()) throw new Error("targetPath is required");
 	const projectRoot = path.resolve(cwd);
 	const gjcRoot = path.join(projectRoot, ".gjc");
 	const resolved = path.resolve(projectRoot, targetPath);
-	const relative = path.relative(gjcRoot, resolved);
-	if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+	if (!isWithinOrEqualPath(gjcRoot, resolved)) {
 		throw new Error(`target path must be within project .gjc/**: ${targetPath}`);
 	}
 	return resolved;
+}
+
+function gjcRootFromResolvedTarget(filePath: string): string {
+	const resolved = path.resolve(filePath);
+	const parsed = path.parse(resolved);
+	const segments = path.relative(parsed.root, resolved).split(path.sep).filter(Boolean);
+	const gjcIndex = segments.lastIndexOf(".gjc");
+	if (gjcIndex < 0) {
+		throw new Error(`resolved target path must include project .gjc/**: ${filePath}`);
+	}
+	return path.join(parsed.root, ...segments.slice(0, gjcIndex + 1));
+}
+
+async function lstatIfPresent(filePath: string): Promise<Stats | undefined> {
+	try {
+		return await fs.lstat(filePath);
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return undefined;
+		throw error;
+	}
+}
+
+async function ensureExistingDirectoryWithoutSymlink(dirPath: string): Promise<void> {
+	let stat = await lstatIfPresent(dirPath);
+	if (!stat) {
+		try {
+			await fs.mkdir(dirPath, { mode: 0o700 });
+		} catch (error) {
+			if (!isErrno(error, "EEXIST")) throw error;
+		}
+		stat = await fs.lstat(dirPath);
+	}
+	assertDirectoryStatWithoutSymlink(dirPath, stat);
+}
+
+function assertDirectoryStatWithoutSymlink(dirPath: string, stat: Stats): void {
+	if (stat.isSymbolicLink()) {
+		throw new Error(`state path contains symlink: ${dirPath}`);
+	}
+	if (!stat.isDirectory()) {
+		throw new Error(`state path parent is not a directory: ${dirPath}`);
+	}
+}
+
+async function ensureResolvedGjcParent(filePath: string): Promise<void> {
+	const resolved = path.resolve(filePath);
+	const gjcRoot = gjcRootFromResolvedTarget(resolved);
+	const parent = path.dirname(resolved);
+	if (!isWithinOrEqualPath(gjcRoot, parent)) {
+		throw new Error(`resolved target path must stay within project .gjc/**: ${filePath}`);
+	}
+	await ensureExistingDirectoryWithoutSymlink(gjcRoot);
+	const relativeParent = path.relative(gjcRoot, parent);
+	let current = gjcRoot;
+	for (const segment of relativeParent.split(path.sep).filter(Boolean)) {
+		current = path.join(current, segment);
+		await ensureExistingDirectoryWithoutSymlink(current);
+	}
+}
+
+async function assertResolvedGjcParentConfined(filePath: string): Promise<void> {
+	const resolved = path.resolve(filePath);
+	const gjcRoot = gjcRootFromResolvedTarget(resolved);
+	const parent = path.dirname(resolved);
+	if (!isWithinOrEqualPath(gjcRoot, parent)) {
+		throw new Error(`resolved target path must stay within project .gjc/**: ${filePath}`);
+	}
+	const rootStat = await lstatIfPresent(gjcRoot);
+	if (!rootStat) return;
+	assertDirectoryStatWithoutSymlink(gjcRoot, rootStat);
+	const relativeParent = path.relative(gjcRoot, parent);
+	let current = gjcRoot;
+	for (const segment of relativeParent.split(path.sep).filter(Boolean)) {
+		current = path.join(current, segment);
+		const stat = await lstatIfPresent(current);
+		if (!stat) return;
+		assertDirectoryStatWithoutSymlink(current, stat);
+	}
+}
+
+async function assertResolvedGjcTargetIsNotSymlink(filePath: string): Promise<void> {
+	const stat = await lstatIfPresent(filePath);
+	if (stat?.isSymbolicLink()) {
+		throw new Error(`state path target is a symlink: ${filePath}`);
+	}
 }
 
 function tempPathFor(filePath: string): string {
@@ -277,6 +366,8 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 export async function detectWorkflowEnvelopeIntegrityMismatch(
 	filePath: string,
 ): Promise<WorkflowEnvelopeIntegrityMismatch | undefined> {
+	await assertResolvedGjcParentConfined(filePath);
+	await assertResolvedGjcTargetIsNotSymlink(filePath);
 	const current = await readJsonIfPresent(filePath);
 	if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
 	const receipt = (current as Record<string, unknown>).receipt;
@@ -365,6 +456,7 @@ function buildActiveSnapshot(entries: SkillActiveEntry[]): SkillActiveState {
 }
 
 async function atomicRemove(filePath: string): Promise<boolean> {
+	await ensureResolvedGjcParent(filePath);
 	const tmpPath = tempPathFor(filePath);
 	try {
 		await fs.rename(filePath, tmpPath);
@@ -481,7 +573,7 @@ async function maybeAudit(mutatedPath: string, options?: StateWriterOptions): Pr
 }
 
 async function atomicWrite(filePath: string, content: string): Promise<string> {
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await ensureResolvedGjcParent(filePath);
 	const tmpPath = tempPathFor(filePath);
 	try {
 		await fs.writeFile(tmpPath, content, "utf-8");
@@ -501,6 +593,7 @@ async function writeGuardedResolvedJsonAtomic(
 	return lockResolvedWorkflowTarget(
 		filePath,
 		async () => {
+			await assertResolvedGjcTargetIsNotSymlink(filePath);
 			const current = await readJsonIfPresentTolerant(filePath);
 			const currentRevision = persistedStateRevision(current);
 
@@ -572,6 +665,7 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 							.join("; ")}`,
 					);
 				}
+				await enforceWorkflowEnvelopePhaseInvariants(filePath, parsed.data, options);
 				await atomicWrite(filePath, jsonText(next));
 				await maybeAudit(filePath, options);
 				return { path: filePath, written: true, revision: currentRevision + 1 };
@@ -597,6 +691,7 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 						.join("; ")}`,
 				);
 			}
+			await enforceWorkflowEnvelopePhaseInvariants(filePath, parsed.data, options);
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
 			return { path: filePath, written: true, revision: currentRevision + 1 };
@@ -611,13 +706,21 @@ export async function writeJsonAtomic(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await atomicWrite(filePath, jsonText(withWorkflowReceipt(value, buildReceipt(options))));
-	await maybeAudit(filePath, options);
-	return filePath;
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			await atomicWrite(filePath, jsonText(withWorkflowReceipt(value, buildReceipt(options))));
+			await maybeAudit(filePath, options);
+			return filePath;
+		},
+		options?.lock,
+	);
 }
 
 async function readPersistedPhase(filePath: string): Promise<string | undefined> {
 	try {
+		await ensureResolvedGjcParent(filePath);
+		await assertResolvedGjcTargetIsNotSymlink(filePath);
 		const existing = await readJsonIfPresent(filePath);
 		if (!isPlainObject(existing)) return undefined;
 		// Only an *active* prior envelope is a transition source. A cleared / handed-off
@@ -667,6 +770,60 @@ async function recordInvalidWorkflowTransition(args: {
 	}
 }
 
+async function enforceWorkflowEnvelopePhaseInvariants(
+	filePath: string,
+	envelope: RequiredOnWriteEnvelope,
+	options?: StateWriterOptions,
+): Promise<void> {
+	// #658: internal runtime writers (ralplan/ultragoal/deep-interview/team) persist
+	// envelopes directly, bypassing the `gjc state` CLI transition gate (`isValidTransition`,
+	// historically the sole call site in state-runtime.ts). Re-assert that gate on every
+	// sanctioned envelope write so internal writes cannot persist invalid state-machine phase
+	// transitions silently. Forced writes (`gjc state ... --force`, reconcile repairs) carry
+	// `audit.forced` and bypass, mirroring the CLI's `use --force to bypass`.
+	//
+	// The gate governs ACTIVE workflow progression only. Deactivation/teardown writes
+	// (`active: false`, e.g. `gjc state clear`, which persists the universal `complete`
+	// sentinel that is not a per-skill manifest state) leave the transition graph and are
+	// intentionally exempt.
+	if (options?.audit?.forced === true || envelope.active !== true) return;
+
+	const toPhase = envelope.current_phase.trim();
+	if (!toPhase) return;
+
+	// Lazy import: workflow-manifest dereferences CANONICAL_GJC_WORKFLOW_SKILLS at
+	// module load, and active-state -> state-writer -> workflow-manifest -> active-state
+	// is a load-time cycle. Importing at call time (after init) avoids the TDZ.
+	const { isKnownWorkflowState, isValidTransition } = await import("./workflow-manifest");
+	const skill = envelope.skill;
+
+	// Structural invariant (hard): a `current_phase` absent from the skill's manifest is
+	// never a legitimate internal write, matching the CLI/reconcile unknown-phase gate.
+	if (!isKnownWorkflowState(skill, toPhase)) {
+		throw new Error(
+			`Refusing to write unknown ${skill} phase "${toPhase}" to ${filePath}: not a known ${skill} manifest state (forced writes bypass via audit.forced)`,
+		);
+	}
+
+	// Transition invariant (#658): resolve the prior phase (caller-supplied
+	// `audit.fromPhase`, else the active persisted envelope on disk) and fail closed
+	// when the manifest does not define the edge. Forced repair/reconcile writes carry
+	// `audit.forced` and bypass this block above; ordinary runtime writers must not
+	// skip approval or completion gates by jumping between known states.
+	const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
+	if (
+		fromPhase &&
+		fromPhase !== toPhase &&
+		isKnownWorkflowState(skill, fromPhase) &&
+		!isValidTransition(skill, fromPhase, toPhase)
+	) {
+		await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
+		throw new Error(
+			`Refusing to write invalid ${skill} phase transition "${fromPhase}" -> "${toPhase}" to ${filePath}: not a valid ${skill} manifest edge (forced writes bypass via audit.forced)`,
+		);
+	}
+}
+
 export async function writeWorkflowEnvelopeAtomic(
 	targetPath: string,
 	value: unknown,
@@ -683,50 +840,7 @@ export async function writeWorkflowEnvelopeAtomic(
 				.join("; ")}`,
 		);
 	}
-	// #658: internal runtime writers (ralplan/ultragoal/deep-interview/team) persist
-	// envelopes directly, bypassing the `gjc state` CLI transition gate (`isValidTransition`,
-	// historically the sole call site in state-runtime.ts). Re-assert that gate on every
-	// sanctioned envelope write so internal writes cannot persist invalid state-machine phase
-	// transitions silently. Forced writes (`gjc state ... --force`, reconcile repairs) carry
-	// `audit.forced` and bypass, mirroring the CLI's `use --force to bypass`.
-	//
-	// The gate governs ACTIVE workflow progression only. Deactivation/teardown writes
-	// (`active: false`, e.g. `gjc state clear`, which persists the universal `complete`
-	// sentinel that is not a per-skill manifest state) leave the transition graph and are
-	// intentionally exempt.
-	if (options?.audit?.forced !== true && parsed.data.active === true) {
-		const toPhase = parsed.data.current_phase.trim();
-		if (toPhase) {
-			// Lazy import: workflow-manifest dereferences CANONICAL_GJC_WORKFLOW_SKILLS at
-			// module load, and active-state -> state-writer -> workflow-manifest -> active-state
-			// is a load-time cycle. Importing at call time (after init) avoids the TDZ.
-			const { isKnownWorkflowState, isValidTransition } = await import("./workflow-manifest");
-			const skill = parsed.data.skill;
-			// Structural invariant (hard): a `current_phase` absent from the skill's manifest is
-			// never a legitimate internal write, matching the CLI/reconcile unknown-phase gate.
-			if (!isKnownWorkflowState(skill, toPhase)) {
-				throw new Error(
-					`Refusing to write unknown ${skill} phase "${toPhase}" to ${filePath}: not a known ${skill} manifest state (forced writes bypass via audit.forced)`,
-				);
-			}
-			// Transition invariant (#658, diagnostic-only safety net): resolve the prior phase
-			// (caller-supplied `audit.fromPhase`, else the active persisted envelope on disk) and
-			// flag edges the manifest does not define. Intentionally NON-blocking and audit-only
-			// — the CLI path already hard-fails invalid edges before reaching here, and legitimate
-			// internal repairs / ralplan short-mode stage skips move between valid states without a
-			// direct manifest edge. It records an `invalid_transition_detected` audit entry (no
-			// stderr) so such transitions are non-silent without breaking those flows.
-			const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
-			if (
-				fromPhase &&
-				fromPhase !== toPhase &&
-				isKnownWorkflowState(skill, fromPhase) &&
-				!isValidTransition(skill, fromPhase, toPhase)
-			) {
-				await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
-			}
-		}
-	}
+	await enforceWorkflowEnvelopePhaseInvariants(filePath, parsed.data, options);
 	await atomicWrite(filePath, jsonText(stamped));
 	await maybeAudit(filePath, options);
 	return filePath;
@@ -767,7 +881,7 @@ async function lockResolvedWorkflowTarget<T>(
 ): Promise<T> {
 	// `withFileLock` creates the lock dir next to the target with a non-recursive
 	// mkdir, so the parent directory must exist before the lock is acquired.
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await ensureResolvedGjcParent(filePath);
 	return withFileLock(filePath, fn, lockOptions);
 }
 
@@ -780,6 +894,7 @@ export async function updateJsonAtomic<T = unknown>(
 	return lockResolvedWorkflowTarget(
 		filePath,
 		async () => {
+			await assertResolvedGjcTargetIsNotSymlink(filePath);
 			const current = (await readJsonIfPresent(filePath)) as T | undefined;
 			const next = await mutator(current);
 			await atomicWrite(filePath, jsonText(withWorkflowReceipt(next, buildReceipt(options))));
@@ -792,7 +907,8 @@ export async function updateJsonAtomic<T = unknown>(
 
 export async function appendJsonl(targetPath: string, entry: unknown, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await ensureResolvedGjcParent(filePath);
+	await assertResolvedGjcTargetIsNotSymlink(filePath);
 	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
 	await maybeAudit(filePath, options);
 	return filePath;
@@ -891,6 +1007,7 @@ export async function appendJsonlIdempotent(
 	return lockResolvedWorkflowTarget(
 		filePath,
 		async () => {
+			await assertResolvedGjcTargetIsNotSymlink(filePath);
 			const existing = await readJsonlEntries(filePath);
 			const duplicate = findJsonlDuplicate(existing, entry, options);
 			if (duplicate !== undefined) {
@@ -906,7 +1023,8 @@ export async function appendJsonlIdempotent(
 
 export async function appendText(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await ensureResolvedGjcParent(filePath);
+	await assertResolvedGjcTargetIsNotSymlink(filePath);
 	await fs.appendFile(filePath, text, "utf-8");
 	await maybeAudit(filePath, options);
 	return filePath;
@@ -918,7 +1036,7 @@ export async function createJsonNoClobber(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await ensureResolvedGjcParent(filePath);
 	let handle: fs.FileHandle | undefined;
 	try {
 		handle = await fs.open(filePath, "wx");
@@ -940,12 +1058,19 @@ export async function deleteIfOwned(
 	const options = typeof predicateOrOptions === "function" ? undefined : predicateOrOptions;
 	const predicate = typeof predicateOrOptions === "function" ? predicateOrOptions : predicateOrOptions?.predicate;
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const current = await readJsonIfPresent(filePath);
-	if (current === undefined) return { path: filePath, deleted: false };
-	if (predicate && !(await predicate(current))) return { path: filePath, deleted: false };
-	const deleted = await atomicRemove(filePath);
-	if (deleted) await maybeAudit(filePath, options);
-	return { path: filePath, deleted };
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			await assertResolvedGjcTargetIsNotSymlink(filePath);
+			const current = await readJsonIfPresent(filePath);
+			if (current === undefined) return { path: filePath, deleted: false };
+			if (predicate && !(await predicate(current))) return { path: filePath, deleted: false };
+			const deleted = await atomicRemove(filePath);
+			if (deleted) await maybeAudit(filePath, options);
+			return { path: filePath, deleted };
+		},
+		options?.lock,
+	);
 }
 
 export async function removeFileAudited(targetPath: string, options?: StateWriterOptions): Promise<DeleteResult> {
@@ -969,6 +1094,8 @@ export async function writeActiveEntry(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
+	await ensureResolvedGjcParent(filePath);
+	await assertResolvedGjcTargetIsNotSymlink(filePath);
 	await writeGuardedResolvedJsonAtomic(
 		filePath,
 		{ ...entry, skill },
@@ -992,6 +1119,7 @@ export async function removeActiveEntry(
 	return lockResolvedWorkflowTarget(
 		filePath,
 		async () => {
+			await assertResolvedGjcTargetIsNotSymlink(filePath);
 			const current = await readJsonIfPresent(filePath);
 			const incomingSourceRevision = options?.sourceRevision;
 			if (
@@ -1134,6 +1262,8 @@ export async function hardPrune(
 	const removed: string[] = [];
 	for (const target of targets) {
 		const filePath = resolveGjcTarget(target.path, cwd);
+		await ensureResolvedGjcParent(filePath);
+		await assertResolvedGjcTargetIsNotSymlink(filePath);
 		let stat: Stats;
 		try {
 			stat = await fs.stat(filePath);
@@ -1208,7 +1338,8 @@ export async function appendAuditEntry(
 	const entry = typeof sessionIdOrEntry === "string" ? maybeEntry : sessionIdOrEntry;
 	if (!entry) throw new Error("audit entry is required");
 	const filePath = resolveGjcTarget(layoutAuditPath(cwd, sessionId), cwd);
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await ensureResolvedGjcParent(filePath);
+	await assertResolvedGjcTargetIsNotSymlink(filePath);
 	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
 	return filePath;
 }
@@ -1264,6 +1395,8 @@ export async function updateWorkflowTransactionJournal(
 	patch: Partial<WorkflowTransactionJournal>,
 ): Promise<string> {
 	const filePath = transactionJournalPath(cwd, sessionId, mutationId);
+	await ensureResolvedGjcParent(filePath);
+	await assertResolvedGjcTargetIsNotSymlink(filePath);
 	const current = ((await readJsonIfPresent(filePath)) ?? {}) as WorkflowTransactionJournal;
 	const next = { ...current, ...patch, updated_at: new Date().toISOString() } as WorkflowTransactionJournal;
 	await atomicWrite(filePath, jsonText(next));

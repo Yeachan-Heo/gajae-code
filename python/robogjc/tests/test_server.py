@@ -95,6 +95,42 @@ def test_index_does_not_expose_replay_token(env, monkeypatch: pytest.MonkeyPatch
         close_database()
 
 
+def test_dashboard_read_apis_reject_missing_token_when_replay_enabled(
+    env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    try:
+        with TestClient(app) as client:
+            for path in ("/api/status", "/api/logs", "/events", "/issues"):
+                resp = client.get(path)
+                assert resp.status_code == 401, path
+    finally:
+        close_database()
+
+
+def test_dashboard_read_apis_accept_configured_replay_token(
+    env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    try:
+        with TestClient(app) as client:
+            _seed_db(cfg)
+            headers = {"X-Robogjc-Replay-Token": token}
+            for path in ("/api/status", "/api/logs", "/events", "/issues"):
+                resp = client.get(path, headers=headers)
+                assert resp.status_code == 200, path
+    finally:
+        close_database()
+
+
 def test_api_status_reports_runtime_counts_and_inflight(settings: Settings) -> None:
     app = create_app(settings)
     with TestClient(app) as client:

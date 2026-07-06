@@ -3,12 +3,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	deleteIfOwned,
 	detectWorkflowEnvelopeIntegrityMismatch,
 	removeActiveEntry,
 	StateWriteConflictError,
 	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
+	writeJsonAtomic,
 } from "../src/gjc-runtime/state-writer";
 
 describe("GJC state writer revision policy", () => {
@@ -143,6 +145,72 @@ describe("GJC state writer revision policy", () => {
 		).rejects.toBeInstanceOf(StateWriteConflictError);
 
 		await expect(readJson(root, target)).resolves.toMatchObject({ current_phase: "handoff", state_revision: 2 });
+	});
+
+	it("rejects unknown active phases in guarded workflow envelopes", async () => {
+		const root = await cwd();
+		const target = ".gjc/_session-sess/state/mode-state/deep-interview.json";
+
+		await expect(
+			writeGuardedWorkflowEnvelopeAtomic(target, modeEnvelope("stale"), {
+				cwd: root,
+				policy: "source",
+				receipt: receipt(root),
+			}),
+		).rejects.toThrow('Refusing to write unknown deep-interview phase "stale"');
+
+		await expect(fs.stat(path.join(root, target))).rejects.toThrow();
+	});
+
+	it("rejects invalid known transitions in guarded workflow envelopes", async () => {
+		const root = await cwd();
+		const target = ".gjc/_session-sess/state/mode-state/ralplan.json";
+		const base = {
+			skill: "ralplan",
+			current_phase: "planner",
+			active: true,
+			version: 2,
+			updated_at: "2026-01-01T00:00:00.000Z",
+		};
+		const ralplanReceipt = {
+			cwd: root,
+			skill: "ralplan" as const,
+			owner: "gjc-runtime" as const,
+			command: "test",
+			sessionId: "sess",
+			nowIso: "2026-01-01T00:00:00.000Z",
+		};
+
+		await writeGuardedWorkflowEnvelopeAtomic(target, base, { cwd: root, policy: "source", receipt: ralplanReceipt });
+		await expect(
+			writeGuardedWorkflowEnvelopeAtomic(
+				target,
+				{ ...base, current_phase: "final" },
+				{ cwd: root, policy: "source", expectedRevision: 1, receipt: ralplanReceipt },
+			),
+		).rejects.toThrow('Refusing to write invalid ralplan phase transition "planner" -> "final"');
+
+		await expect(readJson(root, target)).resolves.toMatchObject({ current_phase: "planner", state_revision: 1 });
+	});
+
+	it("serializes owned deletes against atomic json replacement", async () => {
+		const root = await cwd();
+		const target = ".gjc/_session-sess/state/claims/task.json";
+		await writeJsonAtomic(target, { token: "old" }, { cwd: root });
+		let replacement: Promise<string> | undefined;
+
+		const deleted = await deleteIfOwned(target, {
+			cwd: root,
+			predicate: current => {
+				if ((current as { token?: string }).token !== "old") return false;
+				replacement = writeJsonAtomic(target, { token: "new" }, { cwd: root });
+				return true;
+			},
+		});
+		await replacement;
+
+		expect(deleted.deleted).toBe(true);
+		await expect(readJson(root, target)).resolves.toMatchObject({ token: "new" });
 	});
 
 	it("guarded workflow envelope checksum covers final receipt and state_revision", async () => {

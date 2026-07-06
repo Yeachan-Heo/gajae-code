@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { ImageProtocol, TERMINAL, Text } from "@gajae-code/tui";
@@ -36,6 +37,7 @@ import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 export const BASH_DEFAULT_PREVIEW_LINES = 10;
 
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const GJC_RALPLAN_ARTIFACT_ENV = "GJC_RALPLAN_ARTIFACT";
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
 	GREP_OPTIONS: "",
@@ -43,6 +45,15 @@ const READ_ONLY_BASH_ENV: Record<string, string> = {
 	GREP_COLORS: "",
 	RIPGREP_CONFIG_PATH: "",
 };
+
+function isWithinOrEqualPath(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function commandHasRalplanArtifactEnvFlag(command: string): boolean {
+	return new RegExp(`(?:^|\\s)--artifact-env\\s+${GJC_RALPLAN_ARTIFACT_ENV}(?:\\s|$)`, "u").test(command);
+}
 
 export async function saveBashOriginalArtifactForTests(
 	session: ToolSession,
@@ -530,13 +541,27 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		const rawCommand = input.command;
 		const allowedPrefixes = this.session.bashAllowedPrefixes;
-		if (
-			(this.session.bashRestrictionProfile === "read-only" || (allowedPrefixes && allowedPrefixes.length > 0)) &&
+		const isRestrictedRalplanArtifactEnv =
+			allowedPrefixes &&
+			allowedPrefixes.length > 0 &&
+			this.session.bashRestrictionProfile !== "read-only" &&
 			env &&
-			Object.keys(env).length > 0
+			Object.keys(env).length === 1 &&
+			Object.hasOwn(env, GJC_RALPLAN_ARTIFACT_ENV) &&
+			commandHasRalplanArtifactEnvFlag(rawCommand);
+		if (this.session.bashRestrictionProfile === "read-only" && env && Object.keys(env).length > 0) {
+			throw new ToolError("Read-only bash does not allow per-command env overrides.");
+		}
+		if (
+			allowedPrefixes &&
+			allowedPrefixes.length > 0 &&
+			env &&
+			Object.keys(env).length > 0 &&
+			!isRestrictedRalplanArtifactEnv
 		) {
-			const mode = this.session.bashRestrictionProfile === "read-only" ? "Read-only" : "Restricted role-agent";
-			throw new ToolError(`${mode} bash does not allow per-command env overrides.`);
+			throw new ToolError(
+				"Restricted role-agent bash only allows the GJC_RALPLAN_ARTIFACT env override when command includes --artifact-env GJC_RALPLAN_ARTIFACT.",
+			);
 		}
 		if (allowedPrefixes && allowedPrefixes.length > 0) {
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
@@ -633,6 +658,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		if (!cwdStat.isDirectory()) {
 			throw new ToolError(`Working directory is not a directory: ${commandCwd}`);
+		}
+		if (this.session.bashRestrictionProfile === "read-only" || (allowedPrefixes && allowedPrefixes.length > 0)) {
+			const [sessionRealpath, commandRealpath] = await Promise.all([
+				fs.promises.realpath(this.session.cwd),
+				fs.promises.realpath(commandCwd),
+			]);
+			if (!isWithinOrEqualPath(sessionRealpath, commandRealpath)) {
+				const mode = this.session.bashRestrictionProfile === "read-only" ? "Read-only" : "Restricted role-agent";
+				throw new ToolError(`${mode} bash cwd must stay within the session workspace.`);
+			}
 		}
 
 		const requestedTimeoutSec = input.timeout ?? 300;

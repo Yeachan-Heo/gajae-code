@@ -676,6 +676,61 @@ describe("ExtensionRunner", () => {
 
 			warnSpy.mockRestore();
 		});
+
+		it("fails closed when a tool_call handler times out", async () => {
+			const hangExtensionPath = path.join(tempDir.path(), "hang-tool-call.ts");
+			fs.writeFileSync(
+				hangExtensionPath,
+				`
+					export default function(pi) {
+						pi.on("tool_call", async () => {
+							await Promise.withResolvers().promise;
+						});
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions([hangExtensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError(err => {
+				errors.push(err);
+			});
+			testSetExtensionHandlerTimeoutMs(10);
+
+			const toolCallResult = await runner.emitToolCall({
+				type: "tool_call",
+				toolName: "bash",
+				toolCallId: "call-timeout",
+				input: {},
+			});
+
+			expect(toolCallResult).toEqual({
+				block: true,
+				reason: `Extension ${hangExtensionPath} timed out handling tool_call.`,
+			});
+			expect(warnSpy).toHaveBeenCalledWith("Extension handler timed out", {
+				extensionPath: hangExtensionPath,
+				event: "tool_call",
+				timeoutMs: 10,
+			});
+			expect(errors).toEqual([
+				{
+					extensionPath: hangExtensionPath,
+					event: "tool_call",
+					error: "handler timed out after 10ms",
+				},
+			]);
+
+			warnSpy.mockRestore();
+		});
 	});
 
 	describe("session name API", () => {

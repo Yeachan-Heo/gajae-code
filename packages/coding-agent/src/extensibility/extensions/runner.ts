@@ -627,7 +627,25 @@ export class ExtensionRunner {
 
 			for (const handler of handlers) {
 				try {
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await Promise.race([
+						Promise.resolve(handler(event, ctx)),
+						Bun.sleep(extensionHandlerTimeoutMs).then(() => EXTENSION_HANDLER_TIMEOUT),
+					]);
+
+					if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {
+						const error = `handler timed out after ${extensionHandlerTimeoutMs}ms`;
+						logger.warn("Extension handler timed out", {
+							extensionPath: ext.path,
+							event: "tool_call",
+							timeoutMs: extensionHandlerTimeoutMs,
+						});
+						this.emitError({
+							extensionPath: ext.path,
+							event: "tool_call",
+							error,
+						});
+						return { block: true, reason: `Extension ${ext.path} timed out handling tool_call.` };
+					}
 
 					if (handlerResult) {
 						result = handlerResult as ToolCallEventResult;

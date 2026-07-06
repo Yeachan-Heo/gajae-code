@@ -81,6 +81,7 @@ const VALUE_FLAGS = new Set([
 	"--stage",
 	"--stage_n",
 	"--artifact",
+	"--artifact-env",
 	"--run-id",
 	"--session-id",
 	"--architect",
@@ -92,6 +93,8 @@ const VALUE_FLAGS = new Set([
 	"--fallback-stage-n",
 	"--fallback-receipt-path",
 ]);
+
+const ARTIFACT_ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function flagValue(args: readonly string[], flag: string): string | undefined {
 	const index = args.indexOf(flag);
@@ -408,7 +411,31 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 
 	const stageN = parseStageN(flagValue(args, "--stage_n"));
 
-	const rawArtifact = flagValue(args, "--artifact");
+	const rawArtifactEnvFlagPresent = hasFlag(args, "--artifact-env");
+	const rawArtifactEnv = flagValue(args, "--artifact-env")?.trim();
+	if (rawArtifactEnvFlagPresent && !rawArtifactEnv) {
+		throw new RalplanCommandError(2, "--artifact-env is required for ralplan --write when the flag is present");
+	}
+	if (rawArtifactEnv !== undefined && !ARTIFACT_ENV_NAME_RE.test(rawArtifactEnv)) {
+		throw new RalplanCommandError(2, `invalid --artifact-env: ${rawArtifactEnv}`);
+	}
+
+	let rawArtifact = flagValue(args, "--artifact");
+	let artifactFromEnv = false;
+	if ((rawArtifact === undefined || rawArtifact === "") && rawArtifactEnv === undefined) {
+		throw new RalplanCommandError(2, "--artifact is required for ralplan --write");
+	}
+	if (rawArtifact !== undefined && rawArtifact !== "" && rawArtifactEnv !== undefined) {
+		throw new RalplanCommandError(2, "Use either --artifact or --artifact-env for ralplan --write, not both.");
+	}
+	if (rawArtifactEnv !== undefined) {
+		const value = process.env[rawArtifactEnv];
+		if (value === undefined) {
+			throw new RalplanCommandError(2, `environment variable ${rawArtifactEnv} from --artifact-env is not set`);
+		}
+		rawArtifact = value;
+		artifactFromEnv = true;
+	}
 	if (rawArtifact === undefined || rawArtifact === "") {
 		throw new RalplanCommandError(2, "--artifact is required for ralplan --write");
 	}
@@ -430,7 +457,7 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 	const runId = explicitRunId || (await readActiveRunId(cwd, sessionId)) || sessionIdRaw || defaultRunId();
 	assertSafePathComponent(runId, "run-id");
 
-	const artifact = await resolveArtifactContent(rawArtifact, cwd);
+	const artifact = artifactFromEnv ? rawArtifact : await resolveArtifactContent(rawArtifact, cwd);
 	return { stage: stage as RalplanStage, stageN, runId, artifact, sessionId, json: hasFlag(args, "--json") };
 }
 

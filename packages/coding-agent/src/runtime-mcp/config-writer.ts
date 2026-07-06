@@ -3,6 +3,7 @@
  *
  * Utilities for reading/writing .gjc/mcp.json files at user or project level.
  */
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
@@ -44,14 +45,36 @@ export async function writeMCPConfigFile(filePath: string, config: MCPConfigFile
 	// Ensure parent directory exists
 	const dir = path.dirname(filePath);
 	await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+	const dirStat = await fs.promises.lstat(dir);
+	if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) {
+		throw new Error(`Refusing to write MCP config through non-directory or symlink parent: ${dir}`);
+	}
 
-	// Write to temp file first (atomic write)
-	const tmpPath = `${filePath}.tmp`;
 	const content = JSON.stringify(withSchema(config), null, 2);
-	await fs.promises.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+	const tmpPath = path.join(
+		dir,
+		`.${path.basename(filePath)}.${process.pid}.${Date.now()}.${crypto.randomUUID()}.tmp`,
+	);
+	let fileHandle: fs.promises.FileHandle | undefined;
+	try {
+		fileHandle = await fs.promises.open(tmpPath, "wx", 0o600);
+		await fileHandle.writeFile(content, { encoding: "utf-8" });
+		await fileHandle.sync();
+		await fileHandle.close();
+		fileHandle = undefined;
+	} catch (error) {
+		await fileHandle?.close().catch(() => {});
+		await fs.promises.rm(tmpPath, { force: true }).catch(() => {});
+		throw error;
+	}
 
 	// Rename to final path (atomic on most systems)
-	await fs.promises.rename(tmpPath, filePath);
+	try {
+		await fs.promises.rename(tmpPath, filePath);
+	} catch (error) {
+		await fs.promises.rm(tmpPath, { force: true }).catch(() => {});
+		throw error;
+	}
 	// Invalidate the capability fs cache so subsequent reads see the new content
 	invalidateFsCache(filePath);
 }

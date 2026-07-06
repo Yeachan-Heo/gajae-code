@@ -31,6 +31,33 @@ describe("upsertMCPServer", () => {
 		expect(await getMCPServer(configPath, "alpha")).toEqual(stdio("alpha-bin"));
 	});
 
+	test("does not follow a preexisting predictable temp symlink", async () => {
+		const predictableTmp = `${configPath}.tmp`;
+		const victimPath = path.join(tmpDir, "victim.txt");
+		await fs.writeFile(victimPath, "keep me", "utf-8");
+		await fs.symlink(victimPath, predictableTmp);
+
+		const result = await upsertMCPServer(configPath, "alpha", stdio("alpha-bin"));
+
+		expect(result).toEqual({ status: "added" });
+		expect(await getMCPServer(configPath, "alpha")).toEqual(stdio("alpha-bin"));
+		expect(await fs.readFile(victimPath, "utf-8")).toBe("keep me");
+	});
+
+	test("rejects writes through a symlinked config parent", async () => {
+		const projectDir = path.join(tmpDir, "project");
+		const externalDir = path.join(tmpDir, "external");
+		const symlinkDir = path.join(projectDir, ".gjc");
+		await fs.mkdir(projectDir, { recursive: true });
+		await fs.mkdir(externalDir, { recursive: true });
+		await fs.symlink(externalDir, symlinkDir);
+
+		await expect(upsertMCPServer(path.join(symlinkDir, "mcp.json"), "alpha", stdio("alpha-bin"))).rejects.toThrow(
+			"Refusing to write MCP config through non-directory or symlink parent",
+		);
+		await expect(fs.stat(path.join(externalDir, "mcp.json"))).rejects.toThrow();
+	});
+
 	test("skips an existing server without force and does not overwrite", async () => {
 		await upsertMCPServer(configPath, "alpha", stdio("alpha-bin"));
 		const result = await upsertMCPServer(configPath, "alpha", stdio("changed-bin"));

@@ -50,10 +50,11 @@ function jsonHeaders(): Record<string, string> {
 
 export const api = {
   status(signal?: AbortSignal): Promise<StatusResponse> {
-    return fetch("/api/status", { signal }).then(unwrap<StatusResponse>);
+    return fetch("/api/status", { headers: authHeaders(), signal }).then(unwrap<StatusResponse>);
   },
   logs(limit = 400, signal?: AbortSignal): Promise<LogsResponse> {
-    return fetch(`/api/logs?limit=${limit}`, { signal }).then(unwrap<LogsResponse>);
+    const qs = new URLSearchParams({ limit: String(limit) });
+    return fetch(`/api/logs?${qs.toString()}`, { headers: authHeaders(), signal }).then(unwrap<LogsResponse>);
   },
   browse(state: string, refresh = false, signal?: AbortSignal): Promise<BrowseResponse> {
     const qs = new URLSearchParams({ state, limit: "50" });

@@ -1602,6 +1602,50 @@ describe("native gjc team runtime", () => {
 		expect(await readEvents(stateDir)).toContain("claim_expired");
 	});
 
+	it("ignores task records with unsafe ids during stale claim recovery", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Ignore unsafe task",
+			teamName: "unsafe-task-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+		});
+		const stateDir = teamStateDir(cleanupRoot, "unsafe-task-team");
+		const victimPath = path.join(stateDir, "victim.json");
+		const expiredClaim = {
+			owner: "worker-1",
+			token: "evil-token",
+			leased_until: new Date(Date.now() - 60_000).toISOString(),
+		};
+		await Bun.write(victimPath, `${JSON.stringify({ keep: true }, null, 2)}\n`);
+		await Bun.write(
+			path.join(stateDir, "tasks", "evil.json"),
+			`${JSON.stringify(
+				{
+					id: "../victim",
+					status: "in_progress",
+					subject: "unsafe",
+					description: "unsafe",
+					claim: expiredClaim,
+				},
+				null,
+				2,
+			)}\n`,
+		);
+
+		const claim = await claimGjcTeamTask("unsafe-task-team", "worker-1", cleanupRoot, {
+			PATH: "",
+			GJC_SESSION_ID: TEST_SESSION_ID,
+		});
+
+		expect(claim.ok).toBe(true);
+		expect(await Bun.file(victimPath).exists()).toBe(true);
+		expect(await readEvents(stateDir)).not.toContain('task_id":"../victim');
+	});
+
 	it("recovers stale heartbeat claims during monitor and blocks stale workers from reclaiming", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
 		await startGjcTeam({
@@ -1925,6 +1969,38 @@ describe("native gjc team runtime", () => {
 			cleanupRoot,
 			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
 		)) as { claim_token: string };
+		const listedWithClaim = (await executeGjcTeamApiOperation("list-tasks", { team_name: "api-team" }, cleanupRoot, {
+			PATH: "",
+			GJC_SESSION_ID: TEST_SESSION_ID,
+		})) as { tasks: unknown[] };
+		expect(JSON.stringify(listedWithClaim)).not.toContain(claimed.claim_token);
+		const readWithClaim = (await executeGjcTeamApiOperation(
+			"read-task",
+			{ team_name: "api-team", task_id: created.task_id },
+			cleanupRoot,
+			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+		)) as { task: unknown };
+		expect(JSON.stringify(readWithClaim.task)).not.toContain(claimed.claim_token);
+		await expect(
+			executeGjcTeamApiOperation(
+				"transition-task-status",
+				{
+					team_name: "api-team",
+					task_id: created.task_id,
+					worker: "worker-1",
+					to: "completed",
+					claim_token: claimed.claim_token,
+					completionEvidence: artifactCompletionEvidence("forged completion"),
+				},
+				cleanupRoot,
+				{
+					PATH: "",
+					GJC_SESSION_ID: TEST_SESSION_ID,
+					GJC_TEAM_NAME: "api-team",
+					GJC_TEAM_WORKER_ID: "worker-2",
+				},
+			),
+		).rejects.toThrow("worker_context_mismatch:worker-2:worker-1");
 		await executeGjcTeamApiOperation(
 			"transition-task-status",
 			{
@@ -2029,6 +2105,19 @@ describe("native gjc team runtime", () => {
 			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
 		)) as { status: string };
 		expect(approval.status).toBe("approved");
+		await expect(
+			executeGjcTeamApiOperation(
+				"write-task-approval",
+				{ team_name: "api-team", task_id: created.task_id, status: "approved", reviewer: "leader" },
+				cleanupRoot,
+				{
+					PATH: "",
+					GJC_SESSION_ID: TEST_SESSION_ID,
+					GJC_TEAM_NAME: "api-team",
+					GJC_TEAM_WORKER_ID: "worker-1",
+				},
+			),
+		).rejects.toThrow("leader_only_operation:write-task-approval");
 		await executeGjcTeamApiOperation(
 			"write-shutdown-request",
 			{ team_name: "api-team", worker: "worker-1", requested_by: "leader-fixed" },
