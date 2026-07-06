@@ -13,6 +13,7 @@ import type { SessionStats } from "../../session/agent-session";
 import type { TodoPhase } from "../../tools/todo-write";
 
 export type RpcGetStateInclude = "tools" | "dumpTools" | "systemPrompt";
+export type RpcCapability = "compact_message_update";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -33,6 +34,7 @@ export type RpcCommand =
 	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
 	| { id?: string; type: "set_host_uri_schemes"; schemes: RpcHostUriSchemeDefinition[] }
 	| { id?: string; type: "get_pending_workflow_gates" }
+	| { id?: string; type: "set_capabilities"; capabilities: RpcCapability[] }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -139,6 +141,13 @@ export type RpcResponse =
 			command: "get_pending_workflow_gates";
 			success: true;
 			data: { gates: RpcWorkflowGate[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_capabilities";
+			success: true;
+			data: { acceptedCapabilities: RpcCapability[]; unsupported: string[] };
 	  }
 
 	// Model

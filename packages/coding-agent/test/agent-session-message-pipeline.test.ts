@@ -3,9 +3,20 @@ import { Agent, type AgentMessage } from "@gajae-code/agent-core";
 import type { Message, Model, SimpleStreamOptions } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
+import { __sessionStateSidecarPerfCounters } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import {
+	__agentSessionPerfCounters,
+	AgentSession,
+	type AgentSessionEvent,
+} from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+
+function eventDelta(event: AgentSessionEvent): string {
+	if (event.type !== "message_update") return "";
+	const ame = event.assistantMessageEvent as { delta?: string };
+	return ame.delta ?? "";
+}
 
 function createAgent(): Agent {
 	return new Agent({
@@ -22,6 +33,8 @@ describe("AgentSession message pipeline", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		__agentSessionPerfCounters.reset();
+		__sessionStateSidecarPerfCounters.reset();
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
@@ -128,6 +141,7 @@ describe("AgentSession message pipeline", () => {
 			modelRegistry: {} as never,
 			extensionRunner: {
 				emit: extensionEmit,
+				hasHandlers: (eventType: string) => eventType === "message_update",
 			} as never,
 		});
 		sessions.push(session);
@@ -179,6 +193,417 @@ describe("AgentSession message pipeline", () => {
 
 		resolve();
 		await Bun.sleep(0);
+	});
+
+	it("caches listener snapshots and preserves mutation-during-emit safety", async () => {
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+
+		const calls: string[] = [];
+		let unsubscribeSecond: (() => void) | undefined;
+		let mutated = false;
+		const first = vi.fn(() => {
+			calls.push("first");
+			if (!mutated) {
+				mutated = true;
+				unsubscribeSecond?.();
+				session.subscribe(() => calls.push("third"));
+			}
+		});
+		const second = vi.fn(() => calls.push("second"));
+		session.subscribe(first);
+		unsubscribeSecond = session.subscribe(second);
+		__agentSessionPerfCounters.reset();
+
+		for (let i = 0; i < 20; i++) {
+			session.agent.emitExternalEvent({
+				type: "message_update",
+				message: createAssistantMessage(`chunk ${i}`) as never,
+				assistantMessageEvent: { type: "text_delta", delta: `${i}` },
+			} as never);
+		}
+
+		expect(first).toHaveBeenCalledTimes(20);
+		expect(second).toHaveBeenCalledTimes(1);
+		expect(calls.slice(0, 2)).toEqual(["first", "second"]);
+		expect(calls).toContain("third");
+		expect(__agentSessionPerfCounters.listenerSnapshotRebuilds).toBe(2);
+	});
+
+	it("skips sidecar and extension queueing for message_update when no extension handles streaming", async () => {
+		const extensionEmit = vi.fn(async () => {});
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+			extensionRunner: {
+				emit: extensionEmit,
+				hasHandlers: () => false,
+			} as never,
+		});
+		sessions.push(session);
+		__agentSessionPerfCounters.reset();
+		__sessionStateSidecarPerfCounters.reset();
+
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("chunk") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "chunk" },
+		} as never);
+		await Bun.sleep(0);
+
+		expect(extensionEmit).not.toHaveBeenCalled();
+		expect(__agentSessionPerfCounters.messageUpdateExtensionQueues).toBe(0);
+		expect(__sessionStateSidecarPerfCounters.persistFromEventCalls).toBe(0);
+	});
+
+	it("queues message_update for extensions that handle streaming", async () => {
+		const extensionEmit = vi.fn(async () => {});
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+			extensionRunner: {
+				emit: extensionEmit,
+				hasHandlers: (eventType: string) => eventType === "message_update",
+			} as never,
+		});
+		sessions.push(session);
+		__agentSessionPerfCounters.reset();
+		__sessionStateSidecarPerfCounters.reset();
+
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("chunk") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "chunk" },
+		} as never);
+		await Bun.sleep(0);
+
+		expect(extensionEmit).toHaveBeenCalledTimes(1);
+		expect(__agentSessionPerfCounters.messageUpdateExtensionQueues).toBe(1);
+		expect(__sessionStateSidecarPerfCounters.persistFromEventCalls).toBe(0);
+	});
+
+	it("red-team: listener snapshot rebuilds only on subscription mutations, not emits", async () => {
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+
+		const calls: string[] = [];
+		const unsubscribes = [
+			session.subscribe(event => calls.push(`a:${event.type}`)),
+			session.subscribe(event => calls.push(`b:${event.type}`)),
+			session.subscribe(event => calls.push(`c:${event.type}`)),
+		];
+		__agentSessionPerfCounters.reset();
+
+		for (let i = 0; i < 100; i++) {
+			session.agent.emitExternalEvent({
+				type: "message_update",
+				message: createAssistantMessage(`chunk ${i}`) as never,
+				assistantMessageEvent: { type: "text_delta", delta: `${i}` },
+			} as never);
+		}
+
+		expect(calls).toHaveLength(300);
+		expect(__agentSessionPerfCounters.listenerSnapshotRebuilds).toBe(0);
+		unsubscribes[1]?.();
+		expect(__agentSessionPerfCounters.listenerSnapshotRebuilds).toBe(1);
+		for (let i = 0; i < 10; i++) {
+			session.agent.emitExternalEvent({
+				type: "message_update",
+				message: createAssistantMessage(`after ${i}`) as never,
+				assistantMessageEvent: { type: "text_delta", delta: `${i}` },
+			} as never);
+		}
+		expect(__agentSessionPerfCounters.listenerSnapshotRebuilds).toBe(1);
+		unsubscribes[0]?.();
+		unsubscribes[2]?.();
+		expect(__agentSessionPerfCounters.listenerSnapshotRebuilds).toBe(3);
+	});
+
+	it("red-team: unsubscribe during emit uses the pre-change snapshot exactly once", async () => {
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+
+		const calls: string[] = [];
+		let unsubscribeFirst: (() => void) | undefined;
+		let unsubscribeSecond: (() => void) | undefined;
+		const first = vi.fn((event: AgentSessionEvent) => {
+			calls.push(`first:${event.type}`);
+			unsubscribeSecond?.();
+			unsubscribeFirst?.();
+		});
+		const second = vi.fn((event: AgentSessionEvent) => calls.push(`second:${event.type}`));
+		unsubscribeFirst = session.subscribe(first);
+		unsubscribeSecond = session.subscribe(second);
+
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("current") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "current" },
+		} as never);
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("later") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "later" },
+		} as never);
+
+		expect(calls).toEqual(["first:message_update", "second:message_update"]);
+		expect(first).toHaveBeenCalledTimes(1);
+		expect(second).toHaveBeenCalledTimes(1);
+	});
+
+	it("red-team: subscribe during emit only affects subsequent events", async () => {
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+
+		const calls: string[] = [];
+		let subscribed = false;
+		const late = vi.fn((event: AgentSessionEvent) => calls.push(`late:${event.type}`));
+		const first = vi.fn((event: AgentSessionEvent) => {
+			calls.push(`first:${event.type}`);
+			if (!subscribed) {
+				subscribed = true;
+				session.subscribe(late);
+			}
+		});
+		session.subscribe(first);
+
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("current") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "current" },
+		} as never);
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("later") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "later" },
+		} as never);
+
+		expect(calls).toEqual(["first:message_update", "first:message_update", "late:message_update"]);
+		expect(first).toHaveBeenCalledTimes(2);
+		expect(late).toHaveBeenCalledTimes(1);
+	});
+
+	it("red-team: re-entrant emits do not corrupt listener snapshots", async () => {
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+
+		const calls: string[] = [];
+		let nested = false;
+		const first = vi.fn((event: AgentSessionEvent) => {
+			calls.push(`first:${event.type}:${eventDelta(event)}`);
+			if (!nested && event.type === "message_update" && eventDelta(event) === "outer") {
+				nested = true;
+				session.agent.emitExternalEvent({
+					type: "message_update",
+					message: createAssistantMessage("nested") as never,
+					assistantMessageEvent: { type: "text_delta", delta: "nested" },
+				} as never);
+			}
+		});
+		const second = vi.fn((event: AgentSessionEvent) => calls.push(`second:${event.type}:${eventDelta(event)}`));
+		session.subscribe(first);
+		session.subscribe(second);
+		__agentSessionPerfCounters.reset();
+
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("outer") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "outer" },
+		} as never);
+
+		expect(calls).toEqual([
+			"first:message_update:outer",
+			"first:message_update:nested",
+			"second:message_update:nested",
+			"second:message_update:outer",
+		]);
+		expect(first).toHaveBeenCalledTimes(2);
+		expect(second).toHaveBeenCalledTimes(2);
+		expect(__agentSessionPerfCounters.listenerSnapshotRebuilds).toBe(0);
+	});
+
+	it("red-team: sidecar skips message_update but persists state-mapped events", async () => {
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+		__sessionStateSidecarPerfCounters.reset();
+
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("chunk") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "chunk" },
+		} as never);
+		await Bun.sleep(0);
+		expect(__sessionStateSidecarPerfCounters.persistFromEventCalls).toBe(0);
+
+		session.agent.emitExternalEvent({ type: "agent_start", prompt: "hello" } as never);
+		await Bun.sleep(0);
+		expect(__sessionStateSidecarPerfCounters.persistFromEventCalls).toBe(1);
+	});
+
+	it("red-team: extension gate preserves message_update and non-message_update ordering", async () => {
+		const noHandlerEmit = vi.fn(async () => {});
+		const noHandlerSession = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+			extensionRunner: {
+				emit: noHandlerEmit,
+				hasHandlers: () => false,
+			} as never,
+		});
+		sessions.push(noHandlerSession);
+
+		noHandlerSession.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("skipped") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "skipped" },
+		} as never);
+		noHandlerSession.agent.emitExternalEvent({ type: "agent_start", prompt: "hello" } as never);
+		await Bun.sleep(0);
+		expect(noHandlerEmit.mock.calls.map(call => ((call as unknown[])[0] as { type: string }).type)).toEqual([
+			"agent_start",
+		]);
+
+		const extensionCalls: string[] = [];
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+			extensionRunner: {
+				emit: vi.fn(async (event: { type: string; assistantMessageEvent?: { delta?: string } }) => {
+					extensionCalls.push(
+						event.type === "message_update" ? `message_update:${event.assistantMessageEvent?.delta}` : event.type,
+					);
+				}),
+				hasHandlers: (eventType: string) => eventType === "message_update",
+			} as never,
+		});
+		sessions.push(session);
+
+		session.agent.emitExternalEvent({ type: "agent_start", prompt: "hello" } as never);
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("one") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "one" },
+		} as never);
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("two") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "two" },
+		} as never);
+		await Bun.sleep(0);
+		await Bun.sleep(0);
+
+		expect(extensionCalls).toEqual(["agent_start", "message_update:one", "message_update:two"]);
+	});
+
+	it("red-team: subscribers see identical ordering through interleaved message and tool events", async () => {
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+
+		const seen = [[], [], []] as string[][];
+		for (const bucket of seen) {
+			session.subscribe(event => {
+				if (event.type === "message_update") {
+					bucket.push(`message_update:${eventDelta(event)}`);
+				} else if (event.type === "tool_execution_start") {
+					bucket.push(`tool_execution_start:${event.toolCallId}`);
+				} else if (event.type === "tool_execution_update") {
+					bucket.push(`tool_execution_update:${event.toolCallId}`);
+				} else if (event.type === "tool_execution_end") {
+					bucket.push(`tool_execution_end:${event.toolCallId}`);
+				}
+			});
+		}
+
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("one") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "one" },
+		} as never);
+		session.agent.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "tool-1",
+			toolName: "edit",
+			args: {},
+			intent: "edit",
+		} as never);
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("two") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "two" },
+		} as never);
+		session.agent.emitExternalEvent({
+			type: "tool_execution_update",
+			toolCallId: "tool-1",
+			toolName: "edit",
+			args: {},
+			partialResult: "half",
+		} as never);
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("three") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "three" },
+		} as never);
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "tool-1",
+			toolName: "edit",
+			args: {},
+			result: "done",
+			isError: false,
+		} as never);
+
+		const expected = [
+			"message_update:one",
+			"tool_execution_start:tool-1",
+			"message_update:two",
+			"tool_execution_update:tool-1",
+			"message_update:three",
+			"tool_execution_end:tool-1",
+		];
+		expect(seen).toEqual([expected, expected, expected]);
 	});
 
 	it("flushes queued background exchanges during prompt teardown without waiting for polling timers", async () => {

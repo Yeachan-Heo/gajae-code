@@ -130,6 +130,10 @@ export function isRpcCommand(value: unknown): value is RpcCommand {
 			return Array.isArray(value.tools) && value.tools.every(hostToolDefinition);
 		case "set_host_uri_schemes":
 			return Array.isArray(value.schemes) && value.schemes.every(hostUriScheme);
+		case "set_capabilities":
+			return (
+				Array.isArray(value.capabilities) && value.capabilities.every(capability => typeof capability === "string")
+			);
 		case "set_model":
 			return stringField(value, "provider") && stringField(value, "modelId");
 		case "set_thinking_level":

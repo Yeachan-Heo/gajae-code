@@ -1,5 +1,6 @@
 import type { AgentTool } from "@gajae-code/agent-core";
 import {
+	type AnimationRegistration,
 	Box,
 	type Component,
 	Container,
@@ -7,6 +8,7 @@ import {
 	Image,
 	ImageProtocol,
 	imageFallback,
+	registerAnimationCallback,
 	Spacer,
 	TERMINAL,
 	Text,
@@ -49,6 +51,21 @@ function cloneToolArgs<T>(args: T): T {
 	} catch {
 		return args;
 	}
+}
+
+// Built-in tool renderers that treat call args as read-only, so streaming UI can
+// avoid per-delta defensive clone churn. Kept here (not in the tool renderer
+// registry) because it is a rendering-perf capability of these renderers, not a
+// tool-registration concern.
+const READONLY_ARG_RENDERER_TOOLS = new Set(["bash", "recipe", "eval", "edit", "apply_patch"]);
+
+function argsCanBeSharedWithRenderer(toolName: string, tool: AgentTool | undefined): boolean {
+	return !tool?.renderCall && !tool?.renderResult && READONLY_ARG_RENDERER_TOOLS.has(toolName);
+}
+
+function partialJsonLength(args: unknown): number {
+	const value = args && typeof args === "object" ? (args as { __partialJson?: unknown }).__partialJson : undefined;
+	return typeof value === "string" ? value.length : -1;
 }
 
 /**
@@ -158,11 +175,14 @@ export class ToolExecutionComponent extends Container {
 	#editDiffPreview?: PerFileDiffPreview[];
 	#editDiffAbort?: AbortController;
 	#editDiffLastArgsKey?: string;
+	#argsIdentityVersion = 0;
+	#lastArgsReference: any;
+	#shareArgsWithRenderer = false;
 	// Cached converted images for Kitty protocol (which requires PNG), keyed by index
 	#convertedImages: Map<number, { data: string; mimeType: string }> = new Map();
 	// Spinner animation for partial task results
 	#spinnerFrame?: number;
-	#spinnerInterval?: NodeJS.Timeout;
+	#spinnerAnimation?: AnimationRegistration;
 	// Track if args are still being streamed (for edit/write spinner)
 	#argsComplete = false;
 	#renderState: {
@@ -194,7 +214,9 @@ export class ToolExecutionComponent extends Container {
 		this.#tool = tool;
 		this.#ui = ui;
 		this.#cwd = cwd;
-		this.#args = cloneToolArgs(args);
+		this.#shareArgsWithRenderer = argsCanBeSharedWithRenderer(toolName, tool);
+		this.#lastArgsReference = args;
+		this.#args = this.#shareArgsWithRenderer ? args : cloneToolArgs(args);
 
 		this.addChild(new Spacer(1));
 
@@ -220,7 +242,11 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	updateArgs(args: any, _toolCallId?: string): void {
-		this.#args = cloneToolArgs(args);
+		if (args !== this.#lastArgsReference) {
+			this.#lastArgsReference = args;
+			this.#argsIdentityVersion += 1;
+		}
+		this.#args = this.#shareArgsWithRenderer ? args : cloneToolArgs(args);
 		this.#updateSpinnerAnimation();
 		void this.#runPreviewDiff();
 		this.#updateDisplay();
@@ -253,13 +279,13 @@ export class ToolExecutionComponent extends Container {
 			effectiveArgs = args;
 		}
 
-		// Coalesce duplicate computes for identical args.
-		let argsKey: string;
-		try {
-			argsKey = JSON.stringify(effectiveArgs);
-		} catch {
-			argsKey = String(Date.now());
-		}
+		// Coalesce duplicate computes without serializing multi-KB streamed args every delta.
+		const argsKey = [
+			this.#toolName,
+			this.#argsIdentityVersion,
+			partialJsonLength(args),
+			this.#argsComplete ? 1 : 0,
+		].join(":");
 		if (argsKey === this.#editDiffLastArgsKey) return;
 		this.#editDiffLastArgsKey = argsKey;
 
@@ -367,18 +393,17 @@ export class ToolExecutionComponent extends Container {
 			(this.#result?.details as { async?: { state?: string } } | undefined)?.async?.state === "running";
 		const isPartialTask = this.#isPartial && this.#toolName === "task" && !isBackgroundAsyncTask;
 		const needsSpinner = isStreamingArgs || isPartialTask;
-		if (needsSpinner && !this.#spinnerInterval) {
-			this.#spinnerInterval = setInterval(() => {
+		if (needsSpinner && !this.#spinnerAnimation) {
+			this.#spinnerAnimation = registerAnimationCallback(() => {
 				const frameCount = theme.spinnerFrames.length;
 				if (frameCount === 0) return;
 				this.#spinnerFrame = ((this.#spinnerFrame ?? -1) + 1) % frameCount;
 				this.#renderState.spinnerFrame = this.#spinnerFrame;
 				this.#ui.requestRender();
 			}, 80);
-			this.#spinnerInterval?.unref?.();
-		} else if (!needsSpinner && this.#spinnerInterval) {
-			clearInterval(this.#spinnerInterval);
-			this.#spinnerInterval = undefined;
+		} else if (!needsSpinner && this.#spinnerAnimation) {
+			this.#spinnerAnimation.unregister();
+			this.#spinnerAnimation = undefined;
 		}
 	}
 
@@ -386,9 +411,9 @@ export class ToolExecutionComponent extends Container {
 	 * Stop spinner animation and cleanup resources.
 	 */
 	stopAnimation(): void {
-		if (this.#spinnerInterval) {
-			clearInterval(this.#spinnerInterval);
-			this.#spinnerInterval = undefined;
+		if (this.#spinnerAnimation) {
+			this.#spinnerAnimation.unregister();
+			this.#spinnerAnimation = undefined;
 			this.#spinnerFrame = undefined;
 		}
 		this.#editDiffAbort?.abort();

@@ -12,12 +12,35 @@ import { randomUUID } from "node:crypto";
 import type { AgentSessionEvent } from "../../../session/agent-session";
 import {
 	AGENT_WIRE_PROTOCOL_VERSION,
+	type AgentWireCompactAssistantMessageEvent,
+	type AgentWireCompactEventFrame,
+	type AgentWireCompactMessageUpdatePayload,
 	type AgentWireEventFrame,
 	type AgentWireEventPayload,
 	type AgentWireEventType,
 	type AgentWireFrameEnvelope,
 	type AgentWireFrameType,
 } from "./event-contract";
+
+export const AGENT_WIRE_COMPACT_MESSAGE_UPDATE_CHECKPOINT_INTERVAL = 32;
+
+function recordObject(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function messageIdOf(message: unknown): string | null {
+	const id = recordObject(message)?.id;
+	return typeof id === "string" ? id : null;
+}
+
+function contentIndexOf(assistantMessageEvent: unknown): number | null {
+	const contentIndex = recordObject(assistantMessageEvent)?.contentIndex;
+	return typeof contentIndex === "number" && Number.isInteger(contentIndex) ? contentIndex : null;
+}
+
+function snapshotMessage<T>(message: T): T {
+	return structuredClone(message);
+}
 
 function assertNever(value: never): never {
 	throw new Error(`Unhandled AgentSessionEvent variant: ${JSON.stringify(value)}`);
@@ -122,6 +145,65 @@ export function toAgentWireEventFrame(
 /** Build the rich event payload (renderer-facing) for an `AgentSessionEvent`. */
 export function toAgentWireEventPayload(event: AgentSessionEvent): AgentWireEventPayload {
 	return { event_type: agentSessionEventType(event), event };
+}
+export function sanitizeAssistantMessageEventForCompact(
+	assistantMessageEvent: Extract<AgentSessionEvent, { type: "message_update" }>["assistantMessageEvent"],
+): AgentWireCompactAssistantMessageEvent {
+	const {
+		partial: _partial,
+		message: _message,
+		error: _error,
+		...deltaOnly
+	} = assistantMessageEvent as Record<string, unknown>;
+	return deltaOnly as AgentWireCompactAssistantMessageEvent;
+}
+
+export interface AgentWireCompactMessageUpdateOptions {
+	checkpointInterval?: number;
+}
+
+/**
+ * Stateful compact event serializer for opt-in RPC clients.
+ *
+ * Only `message_update` changes shape: it carries the immutable provider delta
+ * plus message/content identifiers, with periodic full-message checkpoints that
+ * are cloned synchronously before the caller returns to the event loop. All other
+ * event variants remain canonical full event frames so legacy bridge/RPC behavior
+ * and terminal `message_end` reconstruction are unchanged.
+ */
+export class AgentWireCompactEventEncoder {
+	readonly #sequencer: AgentWireFrameSequencer;
+	readonly #checkpointInterval: number;
+	#messageUpdateCount = 0;
+
+	constructor(sequencer: AgentWireFrameSequencer, options: AgentWireCompactMessageUpdateOptions = {}) {
+		this.#sequencer = sequencer;
+		this.#checkpointInterval = options.checkpointInterval ?? AGENT_WIRE_COMPACT_MESSAGE_UPDATE_CHECKPOINT_INTERVAL;
+	}
+
+	frame(event: AgentSessionEvent): AgentWireCompactEventFrame {
+		if (event.type !== "message_update") return toAgentWireEventFrame(event, this.#sequencer);
+		this.#messageUpdateCount += 1;
+		const payload: AgentWireCompactMessageUpdatePayload = {
+			event_type: "message_update",
+			compact: true,
+			message_id: messageIdOf(event.message),
+			content_index: contentIndexOf(event.assistantMessageEvent),
+			assistantMessageEvent: sanitizeAssistantMessageEventForCompact(event.assistantMessageEvent),
+		};
+		if (this.#checkpointInterval > 0 && this.#messageUpdateCount % this.#checkpointInterval === 0) {
+			payload.checkpoint_message = snapshotMessage(event.message);
+			payload.checkpoint_reason = "periodic";
+		}
+		return this.#sequencer.next("event", payload);
+	}
+}
+
+export function toAgentWireCompactEventFrame(
+	event: AgentSessionEvent,
+	encoder: AgentWireCompactEventEncoder,
+): AgentWireCompactEventFrame {
+	return encoder.frame(event);
 }
 
 /** Back-compat alias for {@link toAgentWireEventFrame}. */

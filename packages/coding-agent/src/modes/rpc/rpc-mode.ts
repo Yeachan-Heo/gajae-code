@@ -22,8 +22,13 @@ import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { initializeExtensions } from "../runtime-init";
 import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
-import { AgentWireFrameSequencer, toAgentWireEventFrame } from "../shared/agent-wire/event-envelope";
-import { rpcError as error } from "../shared/agent-wire/responses";
+import {
+	AgentWireCompactEventEncoder,
+	AgentWireFrameSequencer,
+	toAgentWireCompactEventFrame,
+	toAgentWireEventFrame,
+} from "../shared/agent-wire/event-envelope";
+import { rpcError as error, rpcSuccess } from "../shared/agent-wire/responses";
 import { registerRpcSession, unregisterRpcSession } from "../shared/agent-wire/session-registry";
 import { defaultAuditPath, UnattendedAuditLog } from "../shared/agent-wire/unattended-audit";
 import { modelSupportsTokenCostMetrics, UnattendedSessionControlPlane } from "../shared/agent-wire/unattended-session";
@@ -297,6 +302,7 @@ export async function runRpcMode(
 		output({ type: "ready" });
 	}
 	const emitRpcTitles = shouldEmitRpcTitles();
+	const rpcCapabilities = { compactMessageUpdate: false };
 	const decodeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 	const pendingExtensionRequests = new Map<string, PendingExtensionRequest>();
@@ -636,8 +642,13 @@ export async function runRpcMode(
 	// Output all agent events as canonical agent-wire `event` frames (docs/rpc.md):
 	// { type:"event", protocol_version, session_id, seq, frame_id, payload:{ event_type, event } }.
 	const eventSequencer = new AgentWireFrameSequencer(session.sessionId);
+	const compactEventEncoder = new AgentWireCompactEventEncoder(eventSequencer);
 	session.subscribe(event => {
-		output(toAgentWireEventFrame(event, eventSequencer));
+		output(
+			rpcCapabilities.compactMessageUpdate
+				? toAgentWireCompactEventFrame(event, compactEventEncoder)
+				: toAgentWireEventFrame(event, eventSequencer),
+		);
 	});
 
 	// Handle a single command through the shared agent-wire dispatcher so RPC
@@ -708,6 +719,21 @@ export async function runRpcMode(
 			}
 			if (isRpcHostUriResult(parsed)) {
 				hostUriBridge.handleResult(parsed);
+				return;
+			}
+			if ((parsed as RpcCommand).type === "set_capabilities") {
+				// RPC has no startup handshake; clients negotiate optional event-shape capabilities
+				// with this explicit command. Defaults remain legacy/full-frame until accepted here.
+				const command = parsed as Extract<RpcCommand, { type: "set_capabilities" }>;
+				const requested = Array.isArray(command.capabilities) ? command.capabilities : [];
+				const acceptedCapabilities = requested.filter(capability => capability === "compact_message_update");
+				rpcCapabilities.compactMessageUpdate = acceptedCapabilities.includes("compact_message_update");
+				output(
+					rpcSuccess(command.id, "set_capabilities", {
+						acceptedCapabilities,
+						unsupported: requested.filter(capability => capability !== "compact_message_update"),
+					}),
+				);
 				return;
 			}
 			// Ordered commands run through a serial chain to preserve causal order; the

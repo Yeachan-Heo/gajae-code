@@ -24,10 +24,20 @@ import type { ResolveToolDetails } from "../../tools/resolve";
 import { interruptHint } from "../shared";
 import { buildAbortDisplayMessage } from "../utils/abort-message";
 import { ringTerminalBell } from "../utils/terminal-bell";
+import { argsWithPartialJson } from "../utils/ui-helpers";
 
 type AgentSessionEventKind = AgentSessionEvent["type"];
 
 const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
+
+/** Test-only performance counters for advisory baseline tests. */
+export const __eventControllerPerfCounters = {
+	messageUpdateContentVisits: 0,
+	reset(): void {
+		this.messageUpdateContentVisits = 0;
+	},
+};
+
 const COMPLETION_NOTIFY_COMMAND_TIMEOUT_MS = 10_000;
 
 interface CompletionNotifyPayload {
@@ -100,6 +110,8 @@ export class EventController {
 	#lastAssistantComponent: AssistantMessageComponent | undefined = undefined;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#ircExpiryTimers = new Map<string, NodeJS.Timeout>();
+	#toolIntentCache = new Map<string, { args: unknown; intent: string | undefined }>();
+	#thinkingContentIndices = new Set<number>();
 	#handlers: AgentSessionEventHandlers;
 
 	constructor(private ctx: InteractiveModeContext) {
@@ -307,12 +319,14 @@ export class EventController {
 		} else if (event.message.role === "assistant") {
 			this.#lastThinkingCount = 0;
 			this.#resetReadGroup();
+			this.#toolIntentCache.clear();
+			this.#thinkingContentIndices.clear();
 			this.ctx.streamingComponent = new AssistantMessageComponent(undefined, this.ctx.hideThinkingBlock, () =>
 				this.ctx.ui.requestRender(),
 			);
 			this.ctx.streamingMessage = event.message;
 			this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
-			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
 			this.ctx.ui.requestRender();
 		}
 	}
@@ -375,46 +389,53 @@ export class EventController {
 	async #handleMessageUpdate(event: Extract<AgentSessionEvent, { type: "message_update" }>): Promise<void> {
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
 			this.ctx.streamingMessage = event.message;
-			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
+			const contentIndex = event.assistantMessageEvent?.contentIndex;
+			const changedContent =
+				typeof contentIndex === "number" && contentIndex >= 0
+					? this.ctx.streamingMessage.content[contentIndex]
+					: undefined;
+			const contentsToProcess = changedContent ? [changedContent] : this.ctx.streamingMessage.content;
 
-			const thinkingCount = this.ctx.streamingMessage.content.filter(
-				content => content.type === "thinking" && content.thinking.trim(),
-			).length;
-			if (thinkingCount > this.#lastThinkingCount) {
-				this.#resetReadGroup();
-				this.#lastThinkingCount = thinkingCount;
+			if (changedContent?.type === "thinking" && changedContent.thinking.trim()) {
+				if (typeof contentIndex === "number") this.#thinkingContentIndices.add(contentIndex);
+				const thinkingCount = this.#thinkingContentIndices.size;
+				if (thinkingCount > this.#lastThinkingCount) {
+					this.#resetReadGroup();
+					this.#lastThinkingCount = thinkingCount;
+				}
+			} else if (!changedContent) {
+				const thinkingCount = this.ctx.streamingMessage.content.filter(
+					content => content.type === "thinking" && content.thinking.trim(),
+				).length;
+				if (thinkingCount > this.#lastThinkingCount) {
+					this.#resetReadGroup();
+					this.#lastThinkingCount = thinkingCount;
+				}
 			}
 
-			for (const content of this.ctx.streamingMessage.content) {
+			for (const content of contentsToProcess) {
+				__eventControllerPerfCounters.messageUpdateContentVisits += 1;
 				if (content.type !== "toolCall") continue;
 				if (content.name === "read") {
-					if (!readArgsHaveTarget(content.arguments)) {
-						// Args still streaming — defer until path is parseable so we can route to the
-						// read group (regular files) vs ToolExecutionComponent (internal URLs).
-						// Creating either component now would lock the read into the wrong shape.
-						continue;
-					}
+					if (!readArgsHaveTarget(content.arguments)) continue;
 					if (!readArgsTargetInternalUrl(content.arguments)) {
 						this.#trackReadToolCall(content.id, content.arguments);
 						const component = this.ctx.pendingTools.get(content.id);
-						if (component) {
-							component.updateArgs(content.arguments, content.id);
-						} else {
+						if (component) component.updateArgs(content.arguments, content.id);
+						else {
 							const group = this.#getReadGroup();
 							group.updateArgs(content.arguments, content.id);
 							this.ctx.pendingTools.set(content.id, group);
 						}
 						continue;
 					}
-					// Internal URL read falls through to ToolExecutionComponent below.
 				}
 
-				// Preserve the raw partial JSON for renderers that need to surface fields before the JSON object closes.
-				// Bash uses this to show inline env assignments during streaming instead of popping them in at completion.
-				const renderArgs =
-					"partialJson" in content
-						? { ...content.arguments, __partialJson: content.partialJson }
-						: content.arguments;
+				const renderArgs = argsWithPartialJson(
+					content.arguments,
+					"partialJson" in content ? content.partialJson : undefined,
+				);
 				if (!this.ctx.pendingTools.has(content.id)) {
 					this.#resetReadGroup();
 					this.ctx.chatContainer.addChild(new Text("", 0, 0));
@@ -437,32 +458,30 @@ export class EventController {
 					this.ctx.chatContainer.addChild(component);
 					this.ctx.pendingTools.set(content.id, component);
 				} else {
-					const component = this.ctx.pendingTools.get(content.id);
-					if (component) {
-						component.updateArgs(renderArgs, content.id);
-					}
+					this.ctx.pendingTools.get(content.id)?.updateArgs(renderArgs, content.id);
 				}
-			}
 
-			// Update working message with intent from streamed tool arguments
-			for (const content of this.ctx.streamingMessage.content) {
-				if (content.type !== "toolCall") continue;
 				const args = content.arguments;
 				if (!args || typeof args !== "object") continue;
+				let intent: string | undefined;
 				if (INTENT_FIELD in args) {
-					this.#updateWorkingMessageFromIntent(args[INTENT_FIELD]);
-					continue;
-				}
-				const tool = this.ctx.session.getToolByName(content.name);
-				if (typeof tool?.intent !== "function") continue;
-				try {
-					const derived = tool.intent(args as never)?.trim();
-					if (derived) {
-						this.#updateWorkingMessageFromIntent(derived);
+					intent = String(args[INTENT_FIELD]);
+				} else {
+					const cached = this.#toolIntentCache.get(content.id);
+					if (cached?.args === args) intent = cached.intent;
+					else {
+						const tool = this.ctx.session.getToolByName(content.name);
+						if (typeof tool?.intent === "function") {
+							try {
+								intent = tool.intent(args as never)?.trim();
+							} catch {
+								// intent function must never break the UI
+							}
+						}
+						this.#toolIntentCache.set(content.id, { args, intent });
 					}
-				} catch {
-					// intent function must never break the UI
 				}
+				if (intent) this.#updateWorkingMessageFromIntent(intent);
 			}
 
 			this.ctx.ui.requestRender();
@@ -495,9 +514,9 @@ export class EventController {
 				// display only — does NOT mutate the persisted message's stopReason
 				// (the marker on errorMessage drives replay-side suppression).
 				const msgWithoutAbort = { ...this.ctx.streamingMessage, stopReason: "stop" as const };
-				this.ctx.streamingComponent.updateContent(msgWithoutAbort);
+				this.ctx.streamingComponent.updateContent(msgWithoutAbort, { streaming: false });
 			} else {
-				this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+				this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: false });
 			}
 
 			if (this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error") {

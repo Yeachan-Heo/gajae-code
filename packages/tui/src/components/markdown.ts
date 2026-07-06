@@ -42,6 +42,13 @@ const RENDER_CACHE_MAX = 256; // sane cap: ~256 distinct message × width combos
 const renderCache = new LRUCache<string, { source: string; lines: string[] }>({ max: RENDER_CACHE_MAX });
 const PARSE_CACHE_MAX = 128;
 const parseCache = new LRUCache<string, { source: string; tokens: Token[] }>({ max: PARSE_CACHE_MAX });
+const MARKDOWN_STREAM_THROTTLE_MS = 64;
+let markdownNow = (): number => performance.now();
+
+/** Test-only clock seam for streaming throttle tests. */
+export function __setMarkdownNowForTest(now: (() => number) | undefined): void {
+	markdownNow = now ?? (() => performance.now());
+}
 
 // Per-code-block highlight cache (F3): keyed by theme + lang + code so streaming
 // appends only highlight new/changed blocks instead of re-highlighting the whole
@@ -60,6 +67,16 @@ export function getMarkdownHighlightCallCount(): number {
 export function resetMarkdownHighlightCallCount(): void {
 	highlightCallCount = 0;
 }
+
+/** Test-only performance counters for advisory baseline tests. */
+export const __markdownPerfCounters = {
+	lexerInvocations: 0,
+	lexedBytes: 0,
+	reset(): void {
+		this.lexerInvocations = 0;
+		this.lexedBytes = 0;
+	},
+};
 
 // Full-content 64-bit wyhash over every byte (no lossy sampling). Cache hits
 // additionally verify entry.source against the normalized text, so even a
@@ -178,6 +195,11 @@ export class Markdown implements Component {
 	#cachedWidth?: number;
 	#cachedLines?: string[];
 
+	#streaming = false;
+	#lastFullParseAt = 0;
+	#onStaleThrottle?: () => void;
+	#staleThrottleTimer?: ReturnType<typeof setTimeout>;
+
 	constructor(
 		text: string,
 		paddingX: number,
@@ -194,9 +216,53 @@ export class Markdown implements Component {
 		this.#codeBlockIndent = Math.max(0, Math.floor(codeBlockIndent));
 	}
 
-	setText(text: string): void {
+	setOnStaleThrottle(callback: (() => void) | undefined): void {
+		this.#onStaleThrottle = callback;
+	}
+
+	setText(text: string, options?: { streaming?: boolean }): void {
+		if (options?.streaming !== undefined) {
+			this.setStreaming(options.streaming);
+		}
 		this.#text = text;
+		if (this.#streaming) {
+			return;
+		}
 		this.invalidate();
+	}
+
+	setStreaming(streaming: boolean): void {
+		if (this.#streaming === streaming) return;
+		this.#streaming = streaming;
+		if (!streaming) {
+			this.#clearStaleThrottleTimer();
+			this.#lastFullParseAt = 0;
+			this.invalidate();
+		}
+	}
+
+	#clearStaleThrottleTimer(): void {
+		if (!this.#staleThrottleTimer) return;
+		clearTimeout(this.#staleThrottleTimer);
+		this.#staleThrottleTimer = undefined;
+	}
+
+	#armStaleThrottleTimer(remainingMs: number): void {
+		if (!this.#onStaleThrottle || this.#staleThrottleTimer || this.#cachedText === this.#text) return;
+		this.#staleThrottleTimer = setTimeout(
+			() => {
+				this.#staleThrottleTimer = undefined;
+				if (this.#streaming && this.#cachedText !== this.#text) {
+					this.#onStaleThrottle?.();
+				}
+			},
+			Math.max(0, remainingMs),
+		);
+		this.#staleThrottleTimer.unref?.();
+	}
+
+	dispose(): void {
+		this.#clearStaleThrottleTimer();
 	}
 
 	invalidate(): void {
@@ -256,6 +322,14 @@ export class Markdown implements Component {
 		// Calculate available width for content (subtract horizontal padding)
 		const contentWidth = Math.max(1, width - this.#paddingX * 2);
 
+		if (this.#streaming && this.#cachedLines && this.#cachedWidth === width && this.#lastFullParseAt > 0) {
+			const elapsedMs = markdownNow() - this.#lastFullParseAt;
+			if (elapsedMs < MARKDOWN_STREAM_THROTTLE_MS) {
+				this.#armStaleThrottleTimer(MARKDOWN_STREAM_THROTTLE_MS - elapsedMs);
+				return this.#cachedLines;
+			}
+		}
+
 		// Don't render anything if there's no actual text
 		if (!this.#text || this.#text.trim() === "") {
 			const result: string[] = [];
@@ -268,7 +342,7 @@ export class Markdown implements Component {
 
 		// Replace tabs with 3 spaces for consistent rendering
 		const normalizedText = replaceTabs(this.#text);
-
+		this.#clearStaleThrottleTimer();
 		const contentKey = markdownContentKey(normalizedText);
 
 		// L2: module-level LRU — survives component disposal/recreation across
@@ -296,6 +370,8 @@ export class Markdown implements Component {
 		if (cachedParse !== undefined && cachedParse.source === normalizedText) {
 			tokens = cachedParse.tokens;
 		} else {
+			__markdownPerfCounters.lexerInvocations += 1;
+			__markdownPerfCounters.lexedBytes += normalizedText.length;
 			tokens = markdownParser.lexer(normalizedText);
 			parseCache.set(contentKey, { source: normalizedText, tokens });
 		}
@@ -361,6 +437,7 @@ export class Markdown implements Component {
 		this.#cachedText = this.#text;
 		this.#cachedWidth = width;
 		this.#cachedLines = result;
+		this.#lastFullParseAt = markdownNow();
 
 		// Update L2 module-level LRU so future instances with the same key skip
 		// the marked.lexer + highlightCode (Rust FFI) work entirely.

@@ -64,8 +64,7 @@ describe("virtual viewport rendering (W1b / F1)", () => {
 
 	/** Run a scripted transcript scenario and capture the visible viewport after each step. */
 	async function runScenario(flagOn: boolean): Promise<string[][]> {
-		if (flagOn) Bun.env[FLAG] = "1";
-		else delete Bun.env[FLAG];
+		Bun.env[FLAG] = flagOn ? "1" : "0";
 		const term = new VirtualTerminal(40, 12);
 		const tui = new TUI(term);
 		const rows = Array.from({ length: 80 }, (_v, i) => `line-${i}`);

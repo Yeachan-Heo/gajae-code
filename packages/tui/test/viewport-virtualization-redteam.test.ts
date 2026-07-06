@@ -311,8 +311,7 @@ async function runScenario(
 	componentFactory: (lines: string[]) => ScriptedLines,
 	flagOn: boolean,
 ): Promise<string[][]> {
-	if (flagOn) Bun.env[FLAG] = "1";
-	else delete Bun.env[FLAG];
+	Bun.env[FLAG] = flagOn ? "1" : "0";
 
 	const term = new VirtualTerminal(scenario.width ?? 40, scenario.height ?? 12);
 	const tui = new TUI(term);

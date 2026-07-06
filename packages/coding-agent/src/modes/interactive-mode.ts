@@ -2207,6 +2207,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				message => renderWorkingMessage(message, this.#getWorkingMessageAccent()),
 				this.#defaultWorkingMessage,
 				getSymbolTheme().spinnerFrames,
+				{ timeDependentColor: true },
 			);
 			this.statusContainer.addChild(this.loadingAnimation);
 		}

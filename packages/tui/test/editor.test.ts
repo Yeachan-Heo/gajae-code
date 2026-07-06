@@ -2,14 +2,17 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { CURSOR_MARKER } from "@gajae-code/tui";
 import { type AutocompleteProvider, CombinedAutocompleteProvider } from "@gajae-code/tui/autocomplete";
-import { Editor } from "@gajae-code/tui/components/editor";
+import { __editorPerfCounters, Editor } from "@gajae-code/tui/components/editor";
 import { visibleWidth } from "@gajae-code/tui/utils";
-import { setDefaultTabWidth } from "@gajae-code/utils";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings";
 import { defaultEditorTheme } from "./test-themes";
 
 describe("Editor component", () => {
+	const originalTabWidth = getDefaultTabWidth();
+
 	afterEach(() => {
+		setDefaultTabWidth(originalTabWidth);
 		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
 	});
 
@@ -723,7 +726,35 @@ describe("Editor component", () => {
 				editor.setText("foo\tbar");
 				expect(editor.getText()).toBe("foo     bar");
 			} finally {
-				setDefaultTabWidth(3);
+				setDefaultTabWidth(originalTabWidth);
+			}
+		});
+
+		it("preserves raw tabs inserted through insertText", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.insertText("foo\tbar");
+
+			expect(editor.getText()).toBe("foo\tbar");
+		});
+
+		it("recomputes tab-containing input prefix width when the default tab width changes", () => {
+			try {
+				setDefaultTabWidth(2);
+				const editor = new Editor(defaultEditorTheme);
+				editor.setInputPrefix("\t");
+				editor.insertText("wrapped text after tab prefix");
+				editor.render(18);
+
+				setDefaultTabWidth(8);
+				const refreshed = editor.render(18).join("\n");
+				const fresh = new Editor(defaultEditorTheme);
+				fresh.setInputPrefix("\t");
+				fresh.insertText("wrapped text after tab prefix");
+
+				expect(refreshed).toBe(fresh.render(18).join("\n"));
+			} finally {
+				setDefaultTabWidth(originalTabWidth);
 			}
 		});
 
@@ -2390,6 +2421,77 @@ describe("Editor component", () => {
 			editor.handleInput("a"); // must skip the 'a' under the cursor
 
 			expect(editor.getCursor()).toEqual({ line: 1, col: 1 });
+		});
+	});
+	describe("layout cache", () => {
+		it("patches cursor-only moves without relaying out the whole buffer or remeasuring visible widths", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText(Array.from({ length: 1000 }, (_, i) => `line ${i} content`).join("\n"));
+			editor.render(80);
+
+			__editorPerfCounters.reset();
+			editor.handleInput("\x1b[D");
+			editor.render(80);
+
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBeLessThanOrEqual(1);
+			expect(__editorPerfCounters.visibleWidthMeasurements).toBeLessThanOrEqual(1);
+
+			__editorPerfCounters.reset();
+			editor.handleInput("\x1b[A");
+			editor.render(80);
+
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBeLessThanOrEqual(2);
+			expect(__editorPerfCounters.visibleWidthMeasurements).toBeLessThanOrEqual(2);
+			expect(editor.wrappedLineCacheSize).toBe(1000);
+		});
+
+		it("invalidates on edits and width changes while preserving rendered output", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("alpha\nbeta\ngamma");
+			const first = editor.render(40);
+			expect(stripVTControlCharacters(first.join("\n"))).toContain("gamma");
+
+			__editorPerfCounters.reset();
+			editor.insertText("!");
+			const edited = editor.render(40);
+			expect(stripVTControlCharacters(edited.join("\n"))).toContain("gamma!");
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBe(3);
+
+			__editorPerfCounters.reset();
+			const resized = editor.render(20);
+			expect(stripVTControlCharacters(resized.join("\n"))).toContain("gamma!");
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBe(3);
+		});
+
+		it("keeps cursor rendering stable at wrapped-line boundaries and empty lines", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText(`abcdef ghijkl mnopqr\n\ntrail   `);
+			const freshAtEnd = editor.render(16).join("\n");
+			editor.handleInput("\x1b[D");
+			editor.render(16);
+			editor.handleInput("\x1b[C");
+			const cachedAtEnd = editor.render(16).join("\n");
+			expect(cachedAtEnd).toBe(freshAtEnd);
+
+			editor.handleInput("\x1b[A");
+			const cachedEmpty = editor.render(16).join("\n");
+			const fresh = new Editor(defaultEditorTheme);
+			fresh.setText(editor.getText());
+			fresh.handleInput("\x1b[A");
+			expect(cachedEmpty).toBe(fresh.render(16).join("\n"));
+		});
+
+		it("invalidates placeholder and borderless layout-affecting transitions", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setPlaceholder("type here");
+			expect(stripVTControlCharacters(editor.render(30).join("\n"))).toContain("type here");
+			editor.setPlaceholder("new hint");
+			expect(stripVTControlCharacters(editor.render(30).join("\n"))).toContain("new hint");
+
+			editor.setBorderVisible(false);
+			editor.setPromptGutter("> ");
+			const borderless = stripVTControlCharacters(editor.render(10).join("\n"));
+			expect(borderless).toContain("> ");
 		});
 	});
 });

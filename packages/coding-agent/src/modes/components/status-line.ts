@@ -175,6 +175,9 @@ export class StatusLineComponent implements Component {
 	#settings: StatusLineSettings = {};
 	#cachedBranch: string | null | undefined = undefined;
 	#cachedBranchRepoId: string | null | undefined = undefined;
+	#branchProjectDir: string | undefined;
+	#branchLastFetch = 0;
+	#branchInFlight = false;
 	#gitWatcher: fs.FSWatcher | null = null;
 	#onBranchChange: (() => void) | null = null;
 	#autoCompactEnabled: boolean = true;
@@ -188,6 +191,14 @@ export class StatusLineComponent implements Component {
 	#skillHudLastFetch = 0;
 	#skillHudInFlight = false;
 	#version: string | undefined;
+	#resolvedSettingsCache:
+		| (Required<Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">> &
+				StatusLineSettings)
+		| undefined;
+	#resolvedSettingsFingerprint: string | undefined;
+	#renderedRowsCache: { key: string; rows: string[] } | undefined;
+	#renderedRowsCacheHits = 0;
+	#renderedRowsCacheMisses = 0;
 
 	// Git status caching (1s TTL)
 	#cachedGitStatus: { staged: number; unstaged: number; untracked: number } | null = null;
@@ -320,18 +331,39 @@ export class StatusLineComponent implements Component {
 	#invalidateGitCaches(): void {
 		this.#cachedBranch = undefined;
 		this.#cachedBranchRepoId = undefined;
+		this.#branchProjectDir = undefined;
 		this.#cachedPrContext = undefined;
+		this.#branchLastFetch = 0;
+		this.#branchInFlight = false;
+		this.#renderedRowsCache = undefined;
 	}
 	#getCurrentBranch(): string | null {
-		const current = resolveCurrentBranch(getProjectDir());
-		if (this.#cachedBranch !== undefined && this.#cachedBranchRepoId === current.repoId) {
-			return this.#cachedBranch;
+		const now = Date.now();
+		const projectDir = getProjectDir();
+		const withinTtl =
+			this.#cachedBranch !== undefined &&
+			this.#branchProjectDir === projectDir &&
+			Date.now() - this.#branchLastFetch < 1000;
+		if (withinTtl || this.#branchInFlight) {
+			return this.#cachedBranch ?? null;
 		}
 
-		this.#cachedBranchRepoId = current.repoId;
-		this.#cachedBranch = current.branch;
-
-		return this.#cachedBranch ?? null;
+		this.#branchInFlight = true;
+		try {
+			const current = resolveCurrentBranch(projectDir);
+			this.#cachedBranchRepoId = current.repoId;
+			this.#cachedBranch = current.branch;
+			this.#branchProjectDir = projectDir;
+			return this.#cachedBranch ?? null;
+		} catch {
+			this.#cachedBranchRepoId = null;
+			this.#cachedBranch = null;
+			this.#branchProjectDir = projectDir;
+			return null;
+		} finally {
+			this.#branchLastFetch = now;
+			this.#branchInFlight = false;
+		}
 	}
 
 	#isDefaultBranch(branch: string): boolean {
@@ -637,7 +669,13 @@ export class StatusLineComponent implements Component {
 		return `${modelId}|${sp.length}:${sp[0]?.length ?? 0}|${tools.length}|${skills.length}`;
 	}
 
-	#buildSegmentContext(width: number): SegmentContext {
+	#buildSegmentContext(
+		width: number,
+		effectiveSettings: Required<
+			Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">
+		> &
+			StatusLineSettings,
+	): SegmentContext {
 		const state = this.session.state;
 
 		// Trigger background fetch (5-min TTL); render uses cached value
@@ -666,7 +704,7 @@ export class StatusLineComponent implements Component {
 		return {
 			session: this.session,
 			width,
-			options: this.#resolveSettings().segmentOptions ?? {},
+			options: effectiveSettings.segmentOptions ?? {},
 			planMode: this.#planModeStatus,
 			goalMode: this.#goalModeStatus,
 			usageStats,
@@ -685,10 +723,19 @@ export class StatusLineComponent implements Component {
 		};
 	}
 
+	#settingsFingerprint(): string {
+		return JSON.stringify(this.#settings);
+	}
+
 	#resolveSettings(): Required<
 		Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">
 	> &
 		StatusLineSettings {
+		const fingerprint = this.#settingsFingerprint();
+		if (this.#resolvedSettingsCache && this.#resolvedSettingsFingerprint === fingerprint) {
+			return this.#resolvedSettingsCache;
+		}
+
 		const preset = this.#settings.preset ?? "default";
 		const presetDef = getPreset(preset);
 		const useCustomSegments = preset === "custom";
@@ -713,13 +760,15 @@ export class StatusLineComponent implements Component {
 			? (this.#settings.rightSegments ?? presetDef.rightSegments)
 			: presetDef.rightSegments;
 
-		return {
+		this.#resolvedSettingsFingerprint = fingerprint;
+		this.#resolvedSettingsCache = {
 			...this.#settings,
 			leftSegments,
 			rightSegments,
 			separator: this.#settings.separator ?? presetDef.separator,
 			segmentOptions: mergedSegmentOptions,
 		};
+		return this.#resolvedSettingsCache;
 	}
 
 	#groupWidth(parts: string[], capWidth: number, sepWidth: number): number {
@@ -785,9 +834,14 @@ export class StatusLineComponent implements Component {
 		return reRendered.content;
 	}
 
-	#collectStatusSegments(width: number): CollectedStatusSegments {
-		const ctx = this.#buildSegmentContext(width);
-		const effectiveSettings = this.#resolveSettings();
+	#collectStatusSegments(
+		width: number,
+		effectiveSettings: Required<
+			Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">
+		> &
+			StatusLineSettings,
+	): CollectedStatusSegments {
+		const ctx = this.#buildSegmentContext(width, effectiveSettings);
 		const separatorDef = getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
 
 		// Use the subtle surface tone (the same elevated background as user-message
@@ -856,7 +910,7 @@ export class StatusLineComponent implements Component {
 	}
 
 	#buildStatusLine(width: number, precollected?: CollectedStatusSegments): string {
-		const seg = precollected ?? this.#collectStatusSegments(width);
+		const seg = precollected ?? this.#collectStatusSegments(width, this.#resolveSettings());
 		const { ctx, separatorDef, bgAnsi, fgAnsi, sepAnsi, previewHighlightSegment } = seg;
 		const { leftSepWidth, rightSepWidth, leftCapWidth, rightCapWidth } = seg;
 		const left = [...seg.left];
@@ -915,8 +969,52 @@ export class StatusLineComponent implements Component {
 	 * everything fits on one line.
 	 */
 	#buildStatusRows(width: number, maxRows: number): string[] {
-		const seg = this.#collectStatusSegments(width);
-		if (seg.left.length === 0 && seg.right.length === 0) return [];
+		const effectiveSettings = this.#resolveSettings();
+		const seg = this.#collectStatusSegments(width, effectiveSettings);
+		const cacheKey = JSON.stringify({
+			width,
+			maxRows,
+			settings: this.#resolvedSettingsFingerprint,
+			left: seg.left,
+			leftSegIds: seg.leftSegIds,
+			right: seg.right,
+			separator: effectiveSettings.separator,
+			previewHighlightSegment: seg.previewHighlightSegment,
+			sessionAccent: seg.sessionAccent,
+			theme: [seg.bgAnsi, seg.fgAnsi, seg.sepAnsi],
+			rowLayout: {
+				separatorLeft: seg.separatorDef.left,
+				separatorRight: seg.separatorDef.right,
+				separatorEndCapLeft: seg.separatorDef.endCaps?.left,
+				separatorEndCapRight: seg.separatorDef.endCaps?.right,
+				separatorEndCapUseBgAsFg: seg.separatorDef.endCaps?.useBgAsFg,
+				borderFgAnsi: theme.getFgAnsi("border"),
+				boxRoundHorizontal: theme.boxRound.horizontal,
+			},
+			context: [seg.ctx.contextPercent, seg.ctx.contextWindow],
+			usageStats: seg.ctx.usageStats,
+			usage: seg.ctx.usage,
+			git: seg.ctx.git,
+			modes: [seg.ctx.planMode, seg.ctx.goalMode, seg.ctx.autoCompactEnabled],
+			runtime: [seg.ctx.subagentCount, seg.ctx.jobs, seg.ctx.sessionStartTime],
+			sessionName: seg.sessionAccent !== false ? this.session.sessionManager?.getSessionName() : undefined,
+			asyncJobs: this.session
+				.getAsyncJobSnapshot()
+				?.running.filter(job => job.metadata?.monitor !== true)
+				.map(job => job.id ?? job.metadata ?? job)
+				.join(","),
+			version: this.#version,
+		});
+		if (this.#renderedRowsCache?.key === cacheKey) {
+			this.#renderedRowsCacheHits++;
+			return [...this.#renderedRowsCache.rows];
+		}
+		this.#renderedRowsCacheMisses++;
+
+		if (seg.left.length === 0 && seg.right.length === 0) {
+			this.#renderedRowsCache = { key: cacheKey, rows: [] };
+			return [];
+		}
 
 		const topFillWidth = Math.max(1, width);
 		const leftWidth = this.#groupWidth(seg.left, seg.leftCapWidth, seg.leftSepWidth);
@@ -924,51 +1022,52 @@ export class StatusLineComponent implements Component {
 		const gap = seg.left.length > 0 && seg.right.length > 0 ? 1 : 0;
 		const fitsSingleRow = leftWidth + rightWidth + gap <= topFillWidth;
 
+		let rows: string[];
 		if (maxRows <= 1 || fitsSingleRow) {
 			const single = this.#buildStatusLine(width, seg);
-			return single ? [single] : [];
-		}
+			rows = single ? [single] : [];
+		} else {
+			const items: { content: string; isPath: boolean }[] = [
+				...seg.left.map((content, i) => ({ content, isPath: seg.leftSegIds[i] === "path" })),
+				...seg.right.map(content => ({ content, isPath: false })),
+			];
 
-		// Ordered sequence: left segments first (in order), then right segments.
-		const items: { content: string; isPath: boolean }[] = [
-			...seg.left.map((content, i) => ({ content, isPath: seg.leftSegIds[i] === "path" })),
-			...seg.right.map(content => ({ content, isPath: false })),
-		];
-
-		// Pre-shrink an over-wide path so it never blows out a row on its own.
-		for (const item of items) {
-			if (!item.isPath) continue;
-			const alone = this.#groupWidth([item.content], seg.leftCapWidth, seg.leftSepWidth);
-			if (alone > topFillWidth) {
-				const shrunk = this.#shrinkPathToWidth(item.content, seg.ctx, alone - topFillWidth);
-				if (shrunk !== null) item.content = shrunk;
+			for (const item of items) {
+				if (!item.isPath) continue;
+				const alone = this.#groupWidth([item.content], seg.leftCapWidth, seg.leftSepWidth);
+				if (alone > topFillWidth) {
+					const shrunk = this.#shrinkPathToWidth(item.content, seg.ctx, alone - topFillWidth);
+					if (shrunk !== null) item.content = shrunk;
+				}
 			}
+
+			const packedRows: string[][] = [];
+			let current: string[] = [];
+			for (const item of items) {
+				if (current.length === 0) {
+					current.push(item.content);
+					continue;
+				}
+				const tentative = [...current, item.content];
+				if (this.#groupWidth(tentative, seg.leftCapWidth, seg.leftSepWidth) <= topFillWidth) {
+					current = tentative;
+				} else {
+					packedRows.push(current);
+					current = [item.content];
+					if (packedRows.length >= maxRows) break;
+				}
+			}
+			if (packedRows.length < maxRows && current.length > 0) {
+				packedRows.push(current);
+			}
+
+			rows = packedRows.map(row =>
+				this.#renderStatusGroup(row, "left", seg.separatorDef, seg.bgAnsi, seg.fgAnsi, seg.sepAnsi),
+			);
 		}
 
-		// Greedy pack into up to `maxRows` left-justified rows.
-		const rows: string[][] = [];
-		let current: string[] = [];
-		for (const item of items) {
-			if (current.length === 0) {
-				current.push(item.content);
-				continue;
-			}
-			const tentative = [...current, item.content];
-			if (this.#groupWidth(tentative, seg.leftCapWidth, seg.leftSepWidth) <= topFillWidth) {
-				current = tentative;
-			} else {
-				rows.push(current);
-				current = [item.content];
-				if (rows.length >= maxRows) break;
-			}
-		}
-		if (rows.length < maxRows && current.length > 0) {
-			rows.push(current);
-		}
-
-		return rows.map(row =>
-			this.#renderStatusGroup(row, "left", seg.separatorDef, seg.bgAnsi, seg.fgAnsi, seg.sepAnsi),
-		);
+		this.#renderedRowsCache = { key: cacheKey, rows };
+		return [...rows];
 	}
 
 	getTopBorder(width: number): { content: string; width: number } {
@@ -987,6 +1086,20 @@ export class StatusLineComponent implements Component {
 	 */
 	getPreviewContent(width: number): string {
 		return this.#buildStatusRows(width, this.#resolveMaxRows()).join("\n");
+	}
+
+	getCacheStatsForTest(): { rowHits: number; rowMisses: number } {
+		return { rowHits: this.#renderedRowsCacheHits, rowMisses: this.#renderedRowsCacheMisses };
+	}
+
+	invalidateBranchForTest(): void {
+		this.#invalidateGitCaches();
+	}
+
+	setCachedPrForTest(pr: { number: number; url: string } | null): void {
+		const branch = this.#getCurrentBranch();
+		this.#cachedPr = pr;
+		this.#cachedPrContext = branch ? createPrCacheContext(branch, this.#cachedBranchRepoId ?? null) : undefined;
 	}
 
 	render(width: number): string[] {

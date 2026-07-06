@@ -55,6 +55,15 @@ function elideRunawayThinkingRepetition(text: string): string {
 	return text;
 }
 
+interface AssistantMessageUpdateOptions {
+	streaming?: boolean;
+}
+
+type AssistantChildDescriptor = {
+	key: string;
+	component: Component;
+};
+
 /**
  * Component that renders a complete assistant message
  */
@@ -67,6 +76,11 @@ export class AssistantMessageComponent extends Container {
 	#kittyConversionsInFlight = new Set<string>();
 	#responseHeader = new Text(theme.bold(theme.fg("statusLineModel", "gajae")), 1, 0);
 	#contentBlocksCache = new WeakMap<object, { source: string; component: Component }>();
+	#lastStreaming = false;
+	#childComponents = new Map<string, Component>();
+	#contentBlockKeys = new WeakMap<object, string>();
+	#nextContentBlockKey = 0;
+	#reusableChildren = new WeakSet<Component>();
 
 	constructor(
 		message?: AssistantMessage,
@@ -87,7 +101,7 @@ export class AssistantMessageComponent extends Container {
 	override invalidate(): void {
 		super.invalidate();
 		if (this.#lastMessage) {
-			this.updateContent(this.#lastMessage);
+			this.updateContent(this.#lastMessage, { streaming: this.#lastStreaming });
 		}
 	}
 
@@ -115,7 +129,7 @@ export class AssistantMessageComponent extends Container {
 			this.#convertToolImagesForKitty(toolCallId, validImages);
 		}
 		if (this.#lastMessage) {
-			this.updateContent(this.#lastMessage);
+			this.updateContent(this.#lastMessage, { streaming: this.#lastStreaming });
 		}
 	}
 
@@ -138,7 +152,7 @@ export class AssistantMessageComponent extends Container {
 						mimeType: "image/png",
 					});
 					if (this.#lastMessage) {
-						this.updateContent(this.#lastMessage);
+						this.updateContent(this.#lastMessage, { streaming: this.#lastStreaming });
 					}
 					this.onImageUpdate?.();
 				})
@@ -151,153 +165,298 @@ export class AssistantMessageComponent extends Container {
 	setUsageInfo(usage: Usage): void {
 		this.#usageInfo = usage;
 		if (this.#lastMessage) {
-			this.updateContent(this.#lastMessage);
+			this.updateContent(this.#lastMessage, { streaming: this.#lastStreaming });
 		}
 	}
 
-	#renderTextBlock(content: { text: string }): Component {
+	#contentBlockKey(content: object): string {
+		let key = this.#contentBlockKeys.get(content);
+		if (!key) {
+			key = `block:${this.#nextContentBlockKey++}`;
+			this.#contentBlockKeys.set(content, key);
+		}
+		return key;
+	}
+
+	#cachedChild<T extends Component>(key: string, create: () => T): T {
+		const cached = this.#childComponents.get(key);
+		if (cached) return cached as T;
+		const component = create();
+		this.#childComponents.set(key, component);
+		this.#reusableChildren.add(component);
+		return component;
+	}
+
+	#renderTextBlock(content: { text: string }, streaming: boolean): Component {
 		const cached = this.#contentBlocksCache.get(content);
-		if (cached?.source === content.text) return cached.component;
+		if (cached?.source === content.text) {
+			if (cached.component instanceof Markdown) {
+				cached.component.setOnStaleThrottle(this.onImageUpdate);
+				cached.component.setStreaming(streaming);
+			}
+			return cached.component;
+		}
 		const trimmed = content.text.trim();
 		const deepInterview = renderDeepInterviewAssistantText(trimmed, theme);
 		// Reuse the same Markdown instance across streaming chunks (update text in place)
 		// instead of constructing a new one each chunk; combined with the markdown
 		// per-code-block highlight cache, appends no longer re-highlight the whole prefix.
 		if (!deepInterview && cached && cached.component instanceof Markdown) {
-			cached.component.setText(trimmed);
+			cached.component.setOnStaleThrottle(this.onImageUpdate);
+			cached.component.setText(trimmed, { streaming });
 			cached.source = content.text;
 			return cached.component;
 		}
 		const component = deepInterview ?? new Markdown(trimmed, 1, 0, getMarkdownTheme());
+		if (component instanceof Markdown) {
+			component.setOnStaleThrottle(this.onImageUpdate);
+			component.setStreaming(streaming);
+		}
 		this.#contentBlocksCache.set(content, { source: content.text, component });
+		this.#reusableChildren.add(component);
 		return component;
 	}
 
-	#renderThinkingBlock(content: { thinking: string }): Markdown {
+	#renderThinkingBlock(content: { thinking: string }, streaming: boolean): Markdown {
 		const cached = this.#contentBlocksCache.get(content);
-		if (cached?.source === content.thinking) return cached.component as Markdown;
+		if (cached?.source === content.thinking) {
+			if (cached.component instanceof Markdown) {
+				cached.component.setOnStaleThrottle(this.onImageUpdate);
+				cached.component.setStreaming(streaming);
+			}
+			return cached.component as Markdown;
+		}
 		const trimmed = elideRunawayThinkingRepetition(content.thinking.trim());
+		if (cached?.component instanceof Markdown) {
+			cached.component.setOnStaleThrottle(this.onImageUpdate);
+			cached.component.setText(trimmed, { streaming });
+			cached.source = content.thinking;
+			return cached.component;
+		}
 		const component = new Markdown(trimmed, 1, 0, getMarkdownTheme(), {
 			color: (text: string) => theme.fg("thinkingText", text),
 			italic: true,
 		});
+		component.setOnStaleThrottle(this.onImageUpdate);
+		component.setStreaming(streaming);
 		this.#contentBlocksCache.set(content, { source: content.thinking, component });
+		this.#reusableChildren.add(component);
 		return component;
 	}
 
-	#renderToolImages(): void {
+	#toolImageDescriptors(): AssistantChildDescriptor[] {
 		const imageEntries = Array.from(this.#toolImagesByCallId.entries()).flatMap(([toolCallId, images]) =>
 			images.map((image, index) => ({ image, key: `${toolCallId}:${index}` })),
 		);
-		if (imageEntries.length === 0) return;
+		if (imageEntries.length === 0) return [];
 
-		this.#contentContainer.addChild(new Spacer(1));
+		const descriptors: AssistantChildDescriptor[] = [
+			{ key: "tool-images:spacer", component: this.#cachedChild("tool-images:spacer", () => new Spacer(1)) },
+		];
 		for (const { image, key } of imageEntries) {
 			const displayImage =
 				TERMINAL.imageProtocol === ImageProtocol.Kitty && image.mimeType !== "image/png"
 					? this.#convertedKittyImages.get(key)
 					: image;
 			if (TERMINAL.imageProtocol && displayImage) {
-				this.#contentContainer.addChild(
-					new Image(
-						displayImage.data,
-						displayImage.mimeType,
-						{ fallbackColor: (text: string) => theme.fg("toolOutput", text) },
-						resolveImageOptions(),
+				const imageKey = `tool-image:${key}:${displayImage.mimeType}:${displayImage.data}`;
+				descriptors.push({
+					key: imageKey,
+					component: this.#cachedChild(
+						imageKey,
+						() =>
+							new Image(
+								displayImage.data,
+								displayImage.mimeType,
+								{ fallbackColor: (text: string) => theme.fg("toolOutput", text) },
+								resolveImageOptions(),
+							),
 					),
-				);
+				});
 				continue;
 			}
-			this.#contentContainer.addChild(new Text(theme.fg("toolOutput", `[Image: ${image.mimeType}]`), 1, 0));
+			const fallbackKey = `tool-image-fallback:${key}:${image.mimeType}`;
+			descriptors.push({
+				key: fallbackKey,
+				component: this.#cachedChild(
+					fallbackKey,
+					() => new Text(theme.fg("toolOutput", `[Image: ${image.mimeType}]`), 1, 0),
+				),
+			});
 		}
+		return descriptors;
 	}
 
-	updateContent(message: AssistantMessage): void {
+	#reconcileChildren(descriptors: AssistantChildDescriptor[]): void {
+		const nextChildren = descriptors.map(descriptor => descriptor.component);
+		if (
+			nextChildren.length === this.#contentContainer.children.length &&
+			nextChildren.every((child, index) => child === this.#contentContainer.children[index])
+		) {
+			return;
+		}
+
+		const nextSet = new Set(nextChildren);
+		for (const child of this.#contentContainer.children) {
+			if (!nextSet.has(child) && !this.#reusableChildren.has(child)) {
+				child.dispose?.();
+			}
+		}
+		this.#contentContainer.children = nextChildren;
+	}
+
+	updateContent(message: AssistantMessage, options?: AssistantMessageUpdateOptions): void {
 		this.#lastMessage = message;
+		this.#lastStreaming = options?.streaming ?? false;
 
-		// Clear content container
-		this.#contentContainer.clear();
+		const visibleContentAfter = new Array<boolean>(message.content.length).fill(false);
+		let hasVisibleContentAfter = false;
+		let hasVisibleContent = false;
+		let activeContentIndex = -1;
+		for (let i = message.content.length - 1; i >= 0; i--) {
+			visibleContentAfter[i] = hasVisibleContentAfter;
+			const content = message.content[i];
+			const isVisible =
+				(content.type === "text" && Boolean(content.text.trim())) ||
+				(content.type === "thinking" && Boolean(content.thinking.trim()));
+			if (isVisible) {
+				hasVisibleContent = true;
+				hasVisibleContentAfter = true;
+				if (this.#lastStreaming && activeContentIndex === -1) {
+					activeContentIndex = i;
+				}
+			}
+		}
 
-		const hasVisibleContent = message.content.some(
-			c => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
-		);
-
+		const streaming = this.#lastStreaming;
+		const descriptors: AssistantChildDescriptor[] = [];
 		if (hasVisibleContent) {
-			this.#contentContainer.addChild(new Spacer(1));
-			this.#contentContainer.addChild(this.#responseHeader);
+			descriptors.push({
+				key: "response-header:spacer",
+				component: this.#cachedChild("response-header:spacer", () => new Spacer(1)),
+			});
+			descriptors.push({ key: "response-header", component: this.#responseHeader });
 		}
 
 		// Render content in order
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
+			const blockKey = this.#contentBlockKey(content);
 			if (content.type === "text" && content.text.trim()) {
-				this.#contentContainer.addChild(this.#renderTextBlock(content));
+				descriptors.push({
+					key: `${blockKey}:text`,
+					component: this.#renderTextBlock(content, streaming && i === activeContentIndex),
+				});
 			} else if (content.type === "thinking" && content.thinking.trim()) {
 				// Add spacing only when another visible assistant content block follows.
 				// This avoids a superfluous blank line before separately-rendered tool execution blocks.
-				const hasVisibleContentAfter = message.content
-					.slice(i + 1)
-					.some(c => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()));
-
 				if (this.hideThinkingBlock) {
 					// Show static "Thinking..." label when hidden
-					this.#contentContainer.addChild(new Text(theme.italic(theme.fg("thinkingText", "Thinking...")), 1, 0));
-					if (hasVisibleContentAfter) {
-						this.#contentContainer.addChild(new Spacer(1));
-					}
+					descriptors.push({
+						key: `${blockKey}:thinking-hidden`,
+						component: this.#cachedChild(
+							`${blockKey}:thinking-hidden`,
+							() => new Text(theme.italic(theme.fg("thinkingText", "Thinking...")), 1, 0),
+						),
+					});
 				} else {
-					this.#contentContainer.addChild(this.#renderThinkingBlock(content));
-					if (hasVisibleContentAfter) {
-						this.#contentContainer.addChild(new Spacer(1));
-					}
+					descriptors.push({
+						key: `${blockKey}:thinking`,
+						component: this.#renderThinkingBlock(content, streaming && i === activeContentIndex),
+					});
+				}
+				if (visibleContentAfter[i]) {
+					descriptors.push({
+						key: `${blockKey}:thinking-spacer`,
+						component: this.#cachedChild(`${blockKey}:thinking-spacer`, () => new Spacer(1)),
+					});
 				}
 			}
 		}
 
-		this.#renderToolImages();
-		// Check if aborted - show after partial content
-		// But only if there are no tool calls (tool execution components will show the error)
-		const hasToolCalls = message.content.some(c => c.type === "toolCall");
-		if (!hasToolCalls) {
-			if (message.stopReason === "aborted" && !isSilentAbort(message.errorMessage)) {
-				const abortMessage =
-					message.errorMessage && message.errorMessage !== "Request was aborted"
-						? message.errorMessage
-						: "Operation aborted";
-				if (hasVisibleContent) {
-					this.#contentContainer.addChild(new Spacer(1));
-				} else {
-					this.#contentContainer.addChild(new Spacer(1));
+		descriptors.push(...this.#toolImageDescriptors());
+
+		const isTerminal = !streaming || Boolean(message.stopReason);
+		if (isTerminal) {
+			// Check if aborted - show after partial content
+			// But only if there are no tool calls (tool execution components will show the error)
+			const hasToolCalls = message.content.some(c => c.type === "toolCall");
+			if (!hasToolCalls) {
+				if (message.stopReason === "aborted" && !isSilentAbort(message.errorMessage)) {
+					const abortMessage =
+						message.errorMessage && message.errorMessage !== "Request was aborted"
+							? message.errorMessage
+							: "Operation aborted";
+					descriptors.push({
+						key: "abort:spacer",
+						component: this.#cachedChild("abort:spacer", () => new Spacer(1)),
+					});
+					descriptors.push({
+						key: `abort:text:${abortMessage}`,
+						component: this.#cachedChild(
+							`abort:text:${abortMessage}`,
+							() => new Text(theme.fg("error", abortMessage), 1, 0),
+						),
+					});
+				} else if (message.stopReason === "error") {
+					const errorMsg = message.errorMessage || "Unknown error";
+					descriptors.push({
+						key: "error:spacer",
+						component: this.#cachedChild("error:spacer", () => new Spacer(1)),
+					});
+					descriptors.push({
+						key: `error:text:${errorMsg}`,
+						component: this.#cachedChild(
+							`error:text:${errorMsg}`,
+							() => new Text(theme.fg("error", `Error: ${errorMsg}`), 1, 0),
+						),
+					});
 				}
-				this.#contentContainer.addChild(new Text(theme.fg("error", abortMessage), 1, 0));
-			} else if (message.stopReason === "error") {
-				const errorMsg = message.errorMessage || "Unknown error";
-				this.#contentContainer.addChild(new Spacer(1));
-				this.#contentContainer.addChild(new Text(theme.fg("error", `Error: ${errorMsg}`), 1, 0));
 			}
-		}
-		if (
-			message.errorMessage &&
-			!isSilentAbort(message.errorMessage) &&
-			message.stopReason !== "aborted" &&
-			message.stopReason !== "error"
-		) {
-			this.#contentContainer.addChild(new Spacer(1));
-			this.#contentContainer.addChild(new Text(theme.fg("error", `Error: ${message.errorMessage}`), 1, 0));
+			if (
+				message.errorMessage &&
+				!isSilentAbort(message.errorMessage) &&
+				message.stopReason !== "aborted" &&
+				message.stopReason !== "error"
+			) {
+				descriptors.push({
+					key: "message-error:spacer",
+					component: this.#cachedChild("message-error:spacer", () => new Spacer(1)),
+				});
+				descriptors.push({
+					key: `message-error:text:${message.errorMessage}`,
+					component: this.#cachedChild(
+						`message-error:text:${message.errorMessage}`,
+						() => new Text(theme.fg("error", `Error: ${message.errorMessage}`), 1, 0),
+					),
+				});
+			}
+
+			// Token usage metadata
+			if (settings.get("display.showTokenUsage") && this.#usageInfo) {
+				const usage = this.#usageInfo;
+				const totalInput = usage.input + usage.cacheWrite;
+				const parts: string[] = [];
+				parts.push(`${theme.icon.input} ${formatNumber(totalInput)}`);
+				parts.push(`${theme.icon.output} ${formatNumber(usage.output)}`);
+				if (usage.cacheRead > 0) {
+					parts.push(`cache: ${formatNumber(usage.cacheRead)}`);
+				}
+				const usageText = parts.join("  ");
+				descriptors.push({
+					key: "usage:spacer",
+					component: this.#cachedChild("usage:spacer", () => new Spacer(1)),
+				});
+				descriptors.push({
+					key: `usage:text:${usageText}`,
+					component: this.#cachedChild(
+						`usage:text:${usageText}`,
+						() => new Text(theme.fg("dim", usageText), 1, 0),
+					),
+				});
+			}
 		}
 
-		// Token usage metadata
-		if (settings.get("display.showTokenUsage") && this.#usageInfo) {
-			const usage = this.#usageInfo;
-			const totalInput = usage.input + usage.cacheWrite;
-			const parts: string[] = [];
-			parts.push(`${theme.icon.input} ${formatNumber(totalInput)}`);
-			parts.push(`${theme.icon.output} ${formatNumber(usage.output)}`);
-			if (usage.cacheRead > 0) {
-				parts.push(`cache: ${formatNumber(usage.cacheRead)}`);
-			}
-			this.#contentContainer.addChild(new Spacer(1));
-			this.#contentContainer.addChild(new Text(theme.fg("dim", parts.join("  ")), 1, 0));
-		}
+		this.#reconcileChildren(descriptors);
 	}
 }

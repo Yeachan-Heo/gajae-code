@@ -1,5 +1,6 @@
 // Core TUI interfaces and classes
 
+export * from "./animation-scheduler";
 // Autocomplete support
 export * from "./autocomplete";
 // Components

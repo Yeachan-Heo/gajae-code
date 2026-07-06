@@ -4,7 +4,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import { $flag, getDebugLogPath, logger } from "@gajae-code/utils";
+import { $flag, getDebugLogPath, logger, onDefaultTabWidthChange } from "@gajae-code/utils";
 import { getKeybindings } from "./keybindings";
 import { isKeyRelease } from "./keys";
 import { renderMetrics } from "./metrics";
@@ -17,8 +17,10 @@ import {
 	normalizeTerminalOutput,
 	sliceByColumn,
 	sliceWithWidth,
+	truncateLinesToWidth,
 	truncateToWidth,
 	visibleWidth,
+	visibleWidths,
 } from "./utils";
 
 const SEGMENT_RESET = "\x1b[0m";
@@ -335,6 +337,13 @@ function safeRenderComponent(component: Component, width: number, where: string)
 type LineNormalizationCacheEntry = {
 	normalized: string;
 	terminated: string;
+	width: number | undefined;
+};
+
+type TuiRenderCounterSnapshot = {
+	debugRedrawEnvReads: number;
+	debugRedrawAppendWrites: number;
+	differentialGuardVisibleWidthCalls: number;
 };
 
 /**
@@ -351,6 +360,7 @@ export class TUI extends Container {
 	 */
 	#previousRaw: string[] = [];
 	#lineNormalizationCache = new Map<string, LineNormalizationCacheEntry>();
+	#lineEmitWidthCache = new Map<string, number>();
 	#lineTruncationCache = new Map<string, string>();
 	#lineNormalizationCacheLimit = 0;
 	#lineTruncationCacheLimit = 0;
@@ -381,19 +391,57 @@ export class TUI extends Container {
 	#sixelProbeTimeout?: NodeJS.Timeout;
 	#sixelProbeUnsubscribe?: () => void;
 	#showHardwareCursor = $flag("PI_HARDWARE_CURSOR");
+	#debugRedraw = TUI.#readDebugRedrawFlag();
 	// macOS: steady-block cursor anchors CJK IME overlays; disable with GJC_TUI_IME_CURSOR=0.
 	readonly #useImeBlockCursor = $flag("GJC_TUI_IME_CURSOR", process.platform === "darwin");
 	// showHardwareCursor=false but cursor is shown for IME anchoring (macOS).
 	#imeCursorActive = false;
 	#clearOnShrink = $flag("PI_CLEAR_ON_SHRINK"); // Clear empty rows when content shrinks (default: off)
-	// Opt-in: reuse the previous normalized off-screen prefix and only normalize/diff the
-	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical.
-	#virtualViewport = $flag("PI_TUI_VIRTUAL_VIEWPORT");
+	// Default-on: reuse the previous normalized off-screen prefix and only normalize/diff the
+	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical;
+	// set PI_TUI_VIRTUAL_VIEWPORT=0 to restore legacy full-transcript normalization.
+	#virtualViewport = $flag("PI_TUI_VIRTUAL_VIEWPORT", true);
 	#maxLinesRendered = 0; // Line count from last render, used for viewport calculation
 	#fullRedrawCount = 0;
 	#stopped = false;
 	#terminalUnavailable = false;
 	#bottomPinnedComponent: Component | null = null;
+
+	#unsubscribeTabWidthChange?: () => void;
+	static #renderCounters: TuiRenderCounterSnapshot = {
+		debugRedrawEnvReads: 0,
+		debugRedrawAppendWrites: 0,
+		differentialGuardVisibleWidthCalls: 0,
+	};
+
+	static resetRenderCountersForTest(): void {
+		TUI.#renderCounters = {
+			debugRedrawEnvReads: 0,
+			debugRedrawAppendWrites: 0,
+			differentialGuardVisibleWidthCalls: 0,
+		};
+	}
+
+	static getRenderCountersForTest(): TuiRenderCounterSnapshot {
+		return { ...TUI.#renderCounters };
+	}
+
+	static #readDebugRedrawFlag(): boolean {
+		TUI.#renderCounters.debugRedrawEnvReads += 1;
+		return $flag("PI_DEBUG_REDRAW");
+	}
+
+	#appendDebugRedrawLog(message: string): void {
+		TUI.#renderCounters.debugRedrawAppendWrites += 1;
+		fs.appendFileSync(getDebugLogPath(), message);
+	}
+
+	#visibleWidthForDifferentialGuard(line: string): number {
+		const cached = this.#lineEmitWidthCache.get(line);
+		if (cached !== undefined) return cached;
+		TUI.#renderCounters.differentialGuardVisibleWidthCalls += 1;
+		return visibleWidth(line);
+	}
 
 	// Overlay stack for modal components rendered on top of base content
 	overlayStack: {
@@ -410,6 +458,18 @@ export class TUI extends Container {
 			this.#showHardwareCursor = showHardwareCursor;
 		}
 		this.#imeCursorActive = !this.#showHardwareCursor && this.#useImeBlockCursor;
+		this.#unsubscribeTabWidthChange = onDefaultTabWidthChange(() => {
+			this.#lineTruncationCache.clear();
+			this.#lineNormalizationCache.clear();
+			this.#lineEmitWidthCache.clear();
+			this.requestRender(true, "tab-width-change");
+		});
+	}
+
+	override dispose(): void {
+		this.#unsubscribeTabWidthChange?.();
+		this.#unsubscribeTabWidthChange = undefined;
+		super.dispose();
 	}
 
 	get fullRedraws(): number {
@@ -841,6 +901,7 @@ export class TUI extends Container {
 		this.#previousRaw = [];
 		this.#lineNormalizationCache.clear();
 		this.#lineTruncationCache.clear();
+		this.#lineEmitWidthCache.clear();
 		this.#previousWidth = 0;
 		this.#previousHeight = 0;
 	}
@@ -875,6 +936,7 @@ export class TUI extends Container {
 			this.#previousRaw = [];
 			this.#lineNormalizationCache.clear();
 			this.#lineTruncationCache.clear();
+			this.#lineEmitWidthCache.clear();
 			this.#previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
 			this.#previousHeight = -1; // -1 triggers heightChanged, forcing a full clear
 			this.#lineNormalizationCacheLimit = 0;
@@ -1348,24 +1410,9 @@ export class TUI extends Container {
 		if (cached !== undefined) return cached;
 		const normalized = normalizeTerminalOutput(line);
 		const terminated = normalized + (normalized.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
-		this.#lineNormalizationCache.set(line, { normalized, terminated });
-		return { normalized, terminated };
-	}
-
-	#lineFitsWidth(normalizedLine: string, width: number): boolean {
-		return isPrintableAscii(normalizedLine) && normalizedLine.length <= width
-			? true
-			: visibleWidth(normalizedLine) <= width;
-	}
-
-	#truncateNormalizedLine(normalizedLine: string, width: number): string {
-		const key = `${width}\0${normalizedLine}`;
-		const cached = this.#lineTruncationCache.get(key);
-		if (cached !== undefined) return cached;
-		const truncated = truncateToWidth(normalizedLine, width, Ellipsis.Omit);
-		const terminated = truncated + (truncated.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
-		this.#lineTruncationCache.set(key, terminated);
-		return terminated;
+		const entry = { normalized, terminated, width: undefined };
+		this.#lineNormalizationCache.set(line, entry);
+		return entry;
 	}
 
 	#trimLineCachesForRender(lineCount: number): void {
@@ -1375,12 +1422,19 @@ export class TUI extends Container {
 		while (this.#lineNormalizationCache.size > limit) {
 			const key = this.#lineNormalizationCache.keys().next().value;
 			if (key === undefined) break;
+			const entry = this.#lineNormalizationCache.get(key);
+			if (entry !== undefined) this.#lineEmitWidthCache.delete(entry.terminated);
 			this.#lineNormalizationCache.delete(key);
 		}
 		while (this.#lineTruncationCache.size > limit) {
 			const key = this.#lineTruncationCache.keys().next().value;
 			if (key === undefined) break;
 			this.#lineTruncationCache.delete(key);
+		}
+		while (this.#lineEmitWidthCache.size > limit * 2) {
+			const key = this.#lineEmitWidthCache.keys().next().value;
+			if (key === undefined) break;
+			this.#lineEmitWidthCache.delete(key);
 		}
 	}
 
@@ -1398,17 +1452,66 @@ export class TUI extends Container {
 		};
 	}
 
-	/** Normalize + width-fit a single line for emission (image lines pass through). */
-	#normalizeLineForEmit(line: string, width: number): string {
-		if (TERMINAL.isImageLine(line)) return line;
-		const { normalized, terminated } = this.#normalizeLineForRender(line);
-		return this.#lineFitsWidth(normalized, width) ? terminated : this.#truncateNormalizedLine(normalized, width);
+	#normalizeLinesForEmit(lines: string[], width: number, start = 0): string[] {
+		const widthCheckIndexes: number[] = [];
+		const widthCheckLines: string[] = [];
+		for (let i = start; i < lines.length; i++) {
+			const line = lines[i];
+			if (TERMINAL.isImageLine(line)) continue;
+			const entry = this.#normalizeLineForRender(line);
+			const { normalized, terminated } = entry;
+			if (isPrintableAscii(normalized) && normalized.length <= width) {
+				entry.width = normalized.length;
+				this.#lineEmitWidthCache.set(terminated, normalized.length);
+				lines[i] = terminated;
+				continue;
+			}
+			widthCheckIndexes.push(i);
+			widthCheckLines.push(normalized);
+		}
+
+		const widths = widthCheckLines.length === 0 ? [] : visibleWidths(widthCheckLines);
+		const truncateIndexes: number[] = [];
+		const truncateLines: string[] = [];
+		for (let i = 0; i < widthCheckIndexes.length; i++) {
+			const lineIndex = widthCheckIndexes[i];
+			const normalized = widthCheckLines[i];
+			const measuredWidth = widths[i] ?? 0;
+			if (measuredWidth <= width) {
+				const entry = this.#normalizeLineForRender(lines[lineIndex]);
+				entry.width = measuredWidth;
+				this.#lineEmitWidthCache.set(entry.terminated, measuredWidth);
+				lines[lineIndex] = entry.terminated;
+				continue;
+			}
+
+			const key = `${width}\0${normalized}`;
+			const cached = this.#lineTruncationCache.get(key);
+			if (cached !== undefined) {
+				this.#lineEmitWidthCache.set(cached, width);
+				lines[lineIndex] = cached;
+				continue;
+			}
+			truncateIndexes.push(lineIndex);
+			truncateLines.push(normalized);
+		}
+
+		const truncated = truncateLines.length === 0 ? [] : truncateLinesToWidth(truncateLines, width, Ellipsis.Omit);
+		for (let i = 0; i < truncateIndexes.length; i++) {
+			const lineIndex = truncateIndexes[i];
+			const normalized = truncateLines[i];
+			const truncatedLine = truncated[i] ?? "";
+			const terminated = truncatedLine + (truncatedLine.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
+			this.#lineTruncationCache.set(`${width}\0${normalized}`, terminated);
+			this.#lineEmitWidthCache.set(terminated, width);
+			lines[lineIndex] = terminated;
+		}
+
+		return lines;
 	}
 
 	#applyLineResetsAndTruncate(lines: string[], width: number): string[] {
-		for (let i = 0; i < lines.length; i++) {
-			lines[i] = this.#normalizeLineForEmit(lines[i], width);
-		}
+		this.#normalizeLinesForEmit(lines, width);
 		this.#trimLineCachesForRender(lines.length);
 		return lines;
 	}
@@ -1462,7 +1565,7 @@ export class TUI extends Container {
 			if (lineIndex >= lines.length) continue;
 			const line = lines[lineIndex];
 			const isImage = TERMINAL.isImageLine(line);
-			if (!isImage && visibleWidth(line) > width) {
+			if (!isImage && this.#visibleWidthForDifferentialGuard(line) > width) {
 				let truncatedLine = truncateToWidth(line, width, Ellipsis.Omit);
 				truncatedLine += truncatedLine.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET;
 				buffer += truncatedLine;
@@ -1484,10 +1587,9 @@ export class TUI extends Container {
 		buffer += "\x1b[?2026l";
 		if (!this.#writeTerminal(buffer)) return false;
 
-		if ($flag("PI_DEBUG_REDRAW")) {
-			const logPath = getDebugLogPath();
+		if (this.#debugRedraw) {
 			const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (lines=${lines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
-			fs.appendFileSync(logPath, msg);
+			this.#appendDebugRedrawLog(msg);
 		}
 
 		this.#cursorRow = Math.max(0, lines.length - 1);
@@ -1564,8 +1666,9 @@ export class TUI extends Container {
 				if (stable) {
 					const windowed = this.#previousLines.slice(0, winTop);
 					for (let i = winTop; i < total; i++) {
-						windowed.push(this.#normalizeLineForEmit(rawLines[i], width));
+						windowed.push(rawLines[i]);
 					}
+					this.#normalizeLinesForEmit(windowed, width, winTop);
 					this.#trimLineCachesForRender(total);
 					newLines = windowed;
 					diffStart = winTop;
@@ -1656,7 +1759,7 @@ export class TUI extends Container {
 				if (lineIndex >= newLines.length) continue;
 				const line = newLines[lineIndex];
 				const isImage = TERMINAL.isImageLine(line);
-				if (!isImage && visibleWidth(line) > width) {
+				if (!isImage && this.#visibleWidthForDifferentialGuard(line) > width) {
 					let truncatedLine = truncateToWidth(line, width, Ellipsis.Omit);
 					truncatedLine += truncatedLine.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET;
 					buffer += truncatedLine;
@@ -1678,10 +1781,9 @@ export class TUI extends Container {
 			buffer += "\x1b[?2026l";
 			if (!this.#writeTerminal(buffer)) return;
 
-			if ($flag("PI_DEBUG_REDRAW")) {
-				const logPath = getDebugLogPath();
+			if (this.#debugRedraw) {
 				const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
-				fs.appendFileSync(logPath, msg);
+				this.#appendDebugRedrawLog(msg);
 			}
 			// Viewport repaint deliberately prioritizes the live viewport over
 			// historical scrollback repair. After offscreen changes, #previousLines
@@ -1695,12 +1797,11 @@ export class TUI extends Container {
 			this.#previousHeight = height;
 		};
 
-		const debugRedraw = $flag("PI_DEBUG_REDRAW");
+		const debugRedraw = this.#debugRedraw;
 		const logRedraw = (reason: string): void => {
 			if (!debugRedraw) return;
-			const logPath = getDebugLogPath();
 			const msg = `[${new Date().toISOString()}] fullRender: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height})\n`;
-			fs.appendFileSync(logPath, msg);
+			this.#appendDebugRedrawLog(msg);
 		};
 
 		// First render - just output everything without clearing (assumes clean screen)
@@ -1884,16 +1985,17 @@ export class TUI extends Container {
 			const line = newLines[i];
 			let truncatedLine = line;
 			const isImage = TERMINAL.isImageLine(line);
-			if (!isImage && visibleWidth(line) > width) {
+			const lineWidth = isImage ? 0 : this.#visibleWidthForDifferentialGuard(line);
+			if (!isImage && lineWidth > width) {
 				if (debugRedraw) {
 					const debugData = [
 						`[TUI Truncate] ${new Date().toISOString()}`,
-						`Line ${i} truncated: ${visibleWidth(line)} > ${width}`,
+						`Line ${i} truncated: ${lineWidth} > ${width}`,
 						`Content preview: ${line.slice(0, 100)}...`,
 						"",
 					].join("\n");
 					try {
-						fs.appendFileSync(getDebugLogPath(), debugData);
+						this.#appendDebugRedrawLog(debugData);
 					} catch {
 						// Ignore write errors - truncation should still work
 					}

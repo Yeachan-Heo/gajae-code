@@ -3,16 +3,31 @@ import {
 	type ExtractSegmentsResult,
 	extractSegments as nativeExtractSegments,
 	sliceWithWidth as nativeSliceWithWidth,
+	truncateLinesToWidth as nativeTruncateLinesToWidth,
 	truncateToWidth as nativeTruncateToWidth,
+	visibleWidths as nativeVisibleWidths,
 	wrapTextWithAnsi as nativeWrapTextWithAnsi,
 	type SliceResult,
 } from "@gajae-code/natives";
-import { getDefaultTabWidth, getIndentation } from "@gajae-code/utils";
+import { getDefaultTabWidth, getIndentation, onDefaultTabWidthChange } from "@gajae-code/utils";
 import { renderMetrics } from "./metrics";
 
 export { Ellipsis } from "@gajae-code/natives";
 
 export { getDefaultTabWidth, getIndentation } from "@gajae-code/utils";
+/** Test-only performance counters for advisory baseline tests. */
+export const __textHelperPerfCounters = {
+	truncateToWidthCalls: 0,
+	wrapTextWithAnsiCalls: 0,
+	truncateLinesToWidthCalls: 0,
+	visibleWidthsCalls: 0,
+	reset(): void {
+		this.truncateToWidthCalls = 0;
+		this.wrapTextWithAnsiCalls = 0;
+		this.truncateLinesToWidthCalls = 0;
+		this.visibleWidthsCalls = 0;
+	},
+};
 
 function recordTextHelper<T>(name: string, fn: () => T): T {
 	if (!renderMetrics.enabled) return fn();
@@ -24,6 +39,18 @@ function recordTextHelper<T>(name: string, fn: () => T): T {
 	}
 }
 
+let cachedTabWidth: number | undefined;
+
+function getCachedTabWidth(): number {
+	cachedTabWidth ??= getDefaultTabWidth();
+	return cachedTabWidth;
+}
+
+export function invalidateTabWidthCache(): void {
+	cachedTabWidth = undefined;
+}
+onDefaultTabWidthChange(invalidateTabWidthCache);
+
 export function isPrintableAscii(text: string): boolean {
 	for (let i = 0; i < text.length; i++) {
 		const code = text.charCodeAt(i);
@@ -33,7 +60,7 @@ export function isPrintableAscii(text: string): boolean {
 }
 
 export function sliceWithWidth(line: string, startCol: number, length: number, strict?: boolean | null): SliceResult {
-	return nativeSliceWithWidth(line, startCol, length, strict ?? null, getDefaultTabWidth());
+	return nativeSliceWithWidth(line, startCol, length, strict ?? null, getCachedTabWidth());
 }
 
 export function truncateToWidth(
@@ -42,6 +69,7 @@ export function truncateToWidth(
 	ellipsisKind?: Ellipsis | null,
 	pad?: boolean | null,
 ): string {
+	__textHelperPerfCounters.truncateToWidthCalls += 1;
 	// Guard nullish napi inputs: napi-rs 3 on the Windows prebuilt rejects
 	// `null` for `Option<u8>` (Ellipsis) / `Option<bool>` (pad) (issue #848),
 	// and `maxWidth` is a required `u32` that throws on `null`/`undefined`
@@ -60,12 +88,34 @@ export function truncateToWidth(
 		safeWidth,
 		resolvedEllipsis ?? Ellipsis.Unicode,
 		pad ?? false,
-		getDefaultTabWidth(),
+		getCachedTabWidth(),
+	);
+}
+
+export function truncateLinesToWidth(
+	lines: readonly string[],
+	maxWidth: number,
+	ellipsisKind?: Ellipsis | null,
+	pad?: boolean | null,
+): string[] {
+	__textHelperPerfCounters.truncateLinesToWidthCalls += 1;
+	const safeWidth = Number.isFinite(maxWidth) ? Math.max(0, Math.trunc(maxWidth)) : 0;
+	let resolvedEllipsis: Ellipsis | null | undefined | string = ellipsisKind;
+	if (typeof resolvedEllipsis === "string") {
+		resolvedEllipsis = resolvedEllipsis === "" ? Ellipsis.Omit : Ellipsis.Unicode;
+	}
+	return nativeTruncateLinesToWidth(
+		lines.map(line => (typeof line === "string" ? line : String(line ?? ""))),
+		safeWidth,
+		resolvedEllipsis ?? Ellipsis.Unicode,
+		pad ?? false,
+		getCachedTabWidth(),
 	);
 }
 
 export function wrapTextWithAnsi(text: string, width: number): string[] {
-	return nativeWrapTextWithAnsi(text, width, getDefaultTabWidth());
+	__textHelperPerfCounters.wrapTextWithAnsiCalls += 1;
+	return nativeWrapTextWithAnsi(text, width, getCachedTabWidth());
 }
 
 export function extractSegments(
@@ -75,7 +125,7 @@ export function extractSegments(
 	afterLen: number,
 	strictAfter: boolean,
 ): ExtractSegmentsResult {
-	return nativeExtractSegments(line, beforeEnd, afterStart, afterLen, strictAfter, getDefaultTabWidth());
+	return nativeExtractSegments(line, beforeEnd, afterStart, afterLen, strictAfter, getCachedTabWidth());
 }
 
 // Pre-allocated space buffer for padding
@@ -124,7 +174,7 @@ export function visibleWidthRaw(str: string): number {
 	if (str.length === 1) {
 		const code = str.charCodeAt(0);
 		if (code >= 0x20 && code <= 0x7e) return 1;
-		if (code === 9) return getDefaultTabWidth();
+		if (code === 9) return getCachedTabWidth();
 	}
 
 	let tabCount = 0;
@@ -138,12 +188,11 @@ export function visibleWidthRaw(str: string): number {
 		}
 	}
 	if (isPureAscii) {
-		return str.length + tabCount * (getDefaultTabWidth() - 1);
+		return str.length + tabCount * (getCachedTabWidth() - 1);
 	}
-
 	const normalized = normalizeForWidth(str);
 	if (tabCount === 0) return Bun.stringWidth(normalized);
-	return Bun.stringWidth(normalized.replaceAll("\t", " ".repeat(getDefaultTabWidth())));
+	return Bun.stringWidth(normalized.replaceAll("\t", " ".repeat(getCachedTabWidth())));
 }
 
 /**
@@ -152,6 +201,19 @@ export function visibleWidthRaw(str: string): number {
 export function visibleWidth(str: string): number {
 	if (!renderMetrics.enabled) return visibleWidthRaw(str);
 	return recordTextHelper("text.visibleWidth", () => visibleWidthRaw(str));
+}
+
+export function visibleWidthsNative(lines: readonly string[]): number[] {
+	__textHelperPerfCounters.visibleWidthsCalls += 1;
+	return nativeVisibleWidths(
+		lines.map(line => (typeof line === "string" ? line : String(line ?? ""))),
+		getCachedTabWidth(),
+	);
+}
+
+export function visibleWidths(lines: readonly string[]): number[] {
+	void visibleWidthsNative(lines);
+	return lines.map(line => visibleWidth(typeof line === "string" ? line : String(line ?? "")));
 }
 
 const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;

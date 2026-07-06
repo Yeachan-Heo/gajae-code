@@ -10,6 +10,7 @@ export const BRIDGE_CLIENT_COMMAND_TYPES = [
 	"set_host_tools",
 	"set_host_uri_schemes",
 	"get_pending_workflow_gates",
+	"set_capabilities",
 	"workflow_gate_response",
 	"set_model",
 	"cycle_model",

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,6 +17,32 @@ import {
 } from "../src/gjc-runtime/session-state-sidecar";
 
 const tempDirs: string[] = [];
+
+type RuntimePayload = Record<string, unknown>;
+
+async function readPayload(stateFile: string): Promise<RuntimePayload> {
+	return JSON.parse(await Bun.file(stateFile).text()) as RuntimePayload;
+}
+
+function assistantEnd(text: string, stopReason: "stop" | "error" = "stop") {
+	return {
+		type: "agent_end",
+		messages: [
+			{
+				role: "assistant",
+				content: [{ type: "text", text }],
+				stopReason,
+			},
+		],
+	};
+}
+
+function expectCompactJson(raw: string): RuntimePayload {
+	expect(raw).not.toContain("\n  ");
+	expect(raw.endsWith("\n")).toBe(true);
+	return JSON.parse(raw) as RuntimePayload;
+}
+
 const ORIGINAL_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 const ORIGINAL_SESSION_ID = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
 const ORIGINAL_BRANCH = process.env[GJC_COORDINATOR_SESSION_BRANCH_ENV];
@@ -258,6 +285,384 @@ describe("coordinator runtime state sidecar", () => {
 				truncated: false,
 			},
 		});
+	});
+
+	it("does not sync-read on the async event path and preserves cached turn state", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "async-session";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "async-session",
+				state: "running",
+				current_turn_id: "turn-current",
+				last_turn_id: "turn-last",
+				final_response: { source: "agent_end", text: "previous final" },
+			}),
+		);
+		const readFileSync = spyOn(fsSync, "readFileSync");
+		try {
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			for (let index = 0; index < 3; index++) {
+				await persistCoordinatorRuntimeStateFromEvent(
+					{ type: "turn_start" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				);
+			}
+			await persistCoordinatorRuntimeStateFromEvent(
+				{
+					type: "agent_end",
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "text", text: "Finished from cached chain" }],
+							stopReason: "stop",
+						},
+					],
+				},
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+		} finally {
+			readFileSync.mockRestore();
+		}
+
+		expect(readFileSync).toHaveBeenCalledTimes(0);
+		const raw = await Bun.file(stateFile).text();
+		expect(raw).not.toContain("\n  ");
+		const payload = JSON.parse(raw);
+		expect(payload).toMatchObject({
+			session_id: "async-session",
+			state: "completed",
+			current_turn_id: "turn-current",
+			last_turn_id: "turn-last",
+			source: "agent_session_event",
+			event: "agent_end",
+			ready_for_input: true,
+			live: false,
+			final_response: { source: "agent_end", text: "Finished from cached chain" },
+		});
+		expect(typeof payload.ended_at).toBe("string");
+	});
+
+	it("G012 ZERO-SYNC-READ keeps async event path hot and preserves terminal chain", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "g012-zero-sync.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "g012-zero-sync";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "g012-zero-sync",
+				state: "running",
+				current_turn_id: "turn-5",
+				last_turn_id: "turn-4",
+			}),
+		);
+		const readFileSync = spyOn(fsSync, "readFileSync");
+		try {
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			for (let index = 0; index < 5; index++) {
+				await persistCoordinatorRuntimeStateFromEvent(
+					{ type: "turn_start" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				);
+			}
+			await persistCoordinatorRuntimeStateFromEvent(assistantEnd("g012 final"), {
+				sessionId: "fallback",
+				cwd: root,
+				sessionFile: null,
+			});
+		} finally {
+			readFileSync.mockRestore();
+		}
+
+		expect(readFileSync).toHaveBeenCalledTimes(0);
+		const payload = expectCompactJson(await Bun.file(stateFile).text());
+		expect(payload).toMatchObject({
+			session_id: "g012-zero-sync",
+			state: "completed",
+			current_turn_id: "turn-5",
+			last_turn_id: "turn-4",
+			event: "agent_end",
+			final_response: { source: "agent_end", text: "g012 final", format: "markdown" },
+		});
+		expect(typeof payload.ended_at).toBe("string");
+	});
+
+	it("COORDINATOR-EXTERNAL-WRITE cold-reads coordinator-owned files instead of stale cache", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "coordinator-external-write.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "coordinator-external-write";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "coordinator-external-write",
+				state: "running",
+				current_turn_id: "turn-A",
+				last_turn_id: "turn-before-A",
+			}),
+		);
+		const readFileSync = spyOn(fsSync, "readFileSync");
+		try {
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			await Bun.write(
+				stateFile,
+				JSON.stringify({
+					schema_version: 1,
+					session_id: "coordinator-external-write",
+					state: "running",
+					current_turn_id: "turn-B",
+					last_turn_id: "turn-A",
+				}),
+			);
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+		} finally {
+			readFileSync.mockRestore();
+		}
+
+		expect(readFileSync).toHaveBeenCalledTimes(0);
+		const payload = await readPayload(stateFile);
+		expect(payload).toMatchObject({
+			session_id: "coordinator-external-write",
+			state: "running",
+			current_turn_id: "turn-B",
+			last_turn_id: "turn-A",
+			event: "turn_start",
+		});
+	});
+
+	it("POSTMORTEM-RACE preserves pending terminal event payload from the in-memory cache", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "postmortem-race.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "postmortem-race";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "postmortem-race",
+				state: "running",
+				current_turn_id: "race-current",
+			}),
+		);
+
+		let releaseWrite = () => {};
+		const writeWait = new Promise<void>(resolveWrite => {
+			releaseWrite = resolveWrite;
+		});
+		let resolveStarted = () => {};
+		const writeStartedPromise = new Promise<void>(resolve => {
+			resolveStarted = resolve;
+		});
+		const originalWrite = Bun.write;
+		const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+			resolveStarted();
+			await writeWait;
+			return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+		}) as typeof Bun.write);
+		const writeFileSync = spyOn(fsSync, "writeFileSync");
+		const persistPromise = persistCoordinatorRuntimeStateFromEvent(assistantEnd("terminal before flush"), {
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: null,
+		});
+		try {
+			await writeStartedPromise;
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+				sessionId: "fallback",
+				cwd: root,
+				sessionFile: null,
+			});
+			expect(writeFileSync).toHaveBeenCalledTimes(0);
+		} finally {
+			writeFileSync.mockRestore();
+			releaseWrite();
+			await persistPromise;
+			writeSpy.mockRestore();
+		}
+
+		const payload = await readPayload(stateFile);
+		expect(payload).toMatchObject({
+			state: "completed",
+			source: "agent_session_event",
+			current_turn_id: "race-current",
+			final_response: { source: "agent_end", text: "terminal before flush" },
+		});
+	});
+
+	it("G012 COLD-READ-RESTART async event honors existing file without sync reads", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "g012-cold-restart.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "g012-cold-restart";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "g012-cold-restart",
+				state: "completed",
+				current_turn_id: "cold-current",
+				last_turn_id: "cold-last",
+				ended_at: "2026-07-06T00:00:00.000Z",
+				final_response: { source: "agent_end", text: "previous terminal" },
+			}),
+		);
+		const readFileSync = spyOn(fsSync, "readFileSync");
+		try {
+			await persistCoordinatorRuntimeStateFromEvent(assistantEnd("after restart"), {
+				sessionId: "fallback",
+				cwd: root,
+				sessionFile: null,
+			});
+		} finally {
+			readFileSync.mockRestore();
+		}
+
+		expect(readFileSync).toHaveBeenCalledTimes(0);
+		const payload = await readPayload(stateFile);
+		expect(payload).toMatchObject({
+			session_id: "g012-cold-restart",
+			state: "completed",
+			current_turn_id: "cold-current",
+			last_turn_id: "cold-last",
+			final_response: { source: "agent_end", text: "after restart" },
+		});
+	});
+
+	it("G012 CACHE-CONSISTENCY and INTERLEAVE keep file, cached async state, and sync postmortem aligned", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "g012-cache-interleave.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "g012-cache-interleave";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "g012-cache-interleave",
+				state: "running",
+				current_turn_id: "cache-current",
+				last_turn_id: "cache-last",
+			}),
+		);
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId: "fallback", cwd: root, sessionFile: null },
+		);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: "fallback", cwd: root, sessionFile: null },
+		);
+		const afterAsync = await readPayload(stateFile);
+		expect(afterAsync).toMatchObject({
+			state: "running",
+			current_turn_id: "cache-current",
+			last_turn_id: "cache-last",
+		});
+
+		const previousExitCode = process.exitCode;
+		process.exitCode = 0;
+		try {
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+				sessionId: "fallback",
+				cwd: root,
+				sessionFile: null,
+			});
+		} finally {
+			process.exitCode = previousExitCode;
+		}
+		const afterPostmortem = await readPayload(stateFile);
+		expect(afterPostmortem).toMatchObject({
+			state: "errored",
+			source: "process_postmortem",
+			reason: "process_exit_before_terminal_state",
+			current_turn_id: "cache-current",
+			last_turn_id: "cache-last",
+		});
+
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("interleaved final"), {
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: null,
+		});
+		const finalPayload = expectCompactJson(await Bun.file(stateFile).text());
+		expect(finalPayload).toMatchObject({
+			state: "completed",
+			event: "agent_end",
+			current_turn_id: "cache-current",
+			last_turn_id: "cache-last",
+			final_response: { source: "agent_end", text: "interleaved final" },
+		});
+		expect(JSON.parse(JSON.stringify(finalPayload))).toEqual(finalPayload);
+	});
+
+	it("G012 TERMINAL-PRESERVATION keeps completed agent_end payload through postmortem", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "g012-terminal-preservation.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "g012-terminal-preservation";
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("terminal payload"), {
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: null,
+		});
+		const terminal = await readPayload(stateFile);
+
+		persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: null,
+		});
+
+		const afterPostmortem = await readPayload(stateFile);
+		expect(afterPostmortem).toEqual(terminal);
+		expect(afterPostmortem).toMatchObject({
+			state: "completed",
+			source: "agent_session_event",
+			final_response: { source: "agent_end", text: "terminal payload" },
+		});
+	});
+
+	it("G012 COMPACT-PARSE writes compact JSON accepted by terminal marker consumer", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "g012-compact-parse.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "g012-compact-parse";
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("compact final"), {
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: path.join(root, "session.jsonl"),
+		});
+
+		const raw = await Bun.file(stateFile).text();
+		const payload = expectCompactJson(raw);
+		expect(payload.final_response).toMatchObject({ text: "compact final" });
+		await expect(
+			readTerminalRuntimeStateMarker({
+				stateFile,
+				sessionId: "g012-compact-parse",
+				cwd: root,
+				sessionFile: path.join(root, "session.jsonl"),
+			}),
+		).resolves.toEqual({ terminal: true, state: "completed" });
 	});
 
 	it("recognizes only matching completed or errored runtime markers as terminal", async () => {

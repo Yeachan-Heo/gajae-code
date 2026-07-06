@@ -13,6 +13,8 @@
  * an `AgentSessionEvent` variant fails typecheck until it is registered, and so
  * conformance tests can assert fixture coverage equals the registry exactly.
  */
+
+import type { AssistantMessageEvent } from "@gajae-code/ai";
 import type { AgentSessionEvent } from "../../../session/agent-session";
 
 /** Wire protocol version. Bump on breaking envelope/semantic changes. */
@@ -68,6 +70,25 @@ export interface AgentWireEventPayload {
 	event_type: AgentWireEventType;
 	event: AgentSessionEvent;
 }
+export type AgentWireCompactAssistantMessageEvent = AssistantMessageEvent extends infer TEvent
+	? TEvent extends { type: string }
+		? Omit<TEvent, "partial" | "message" | "error">
+		: never
+	: never;
+
+export interface AgentWireCompactMessageUpdatePayload {
+	event_type: "message_update";
+	/** Compact RPC opt-in payload: delta-only update plus minimal routing metadata. */
+	compact: true;
+	message_id: string | null;
+	content_index: number | null;
+	assistantMessageEvent: AgentWireCompactAssistantMessageEvent;
+	/** Full message checkpoint, snapshotted synchronously when this frame is enqueued. */
+	checkpoint_message?: Extract<AgentSessionEvent, { type: "message_update" }>["message"];
+	checkpoint_reason?: "periodic";
+}
+
+export type AgentWireEventFramePayload = AgentWireEventPayload | AgentWireCompactMessageUpdatePayload;
 
 /**
  * Bounded observed-signal vocabulary surfaced to owner control planes. Mirrors
@@ -146,3 +167,4 @@ export interface AgentWireFrameEnvelope<TType extends AgentWireFrameType = Agent
 
 /** An `AgentSessionEvent` serialized into a versioned wire frame. */
 export type AgentWireEventFrame = AgentWireFrameEnvelope<"event", AgentWireEventPayload>;
+export type AgentWireCompactEventFrame = AgentWireFrameEnvelope<"event", AgentWireEventFramePayload>;

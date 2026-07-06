@@ -182,6 +182,7 @@ export class CustomEditor extends Editor {
 	dispose(): void {
 		this.#clearPendingPasteState();
 		this.#pasteHandler = new BracketedPasteHandler();
+		super.dispose();
 	}
 
 	#drainPendingPasteInput(initialInput?: string): void {

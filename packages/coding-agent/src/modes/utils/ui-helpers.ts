@@ -36,6 +36,19 @@ interface RenderInitialMessagesOptions {
 	preserveExistingChat?: boolean;
 }
 
+export function argsWithPartialJson(args: unknown, partialJson: unknown): unknown {
+	if (typeof partialJson !== "string" || !args || typeof args !== "object" || Array.isArray(args)) return args;
+	// Non-enumerable so the transient streaming buffer reaches renderers via direct
+	// property read but never serializes into persisted/wire message content.
+	Object.defineProperty(args, "__partialJson", {
+		value: partialJson,
+		enumerable: false,
+		configurable: true,
+		writable: true,
+	});
+	return args;
+}
+
 type QueuedMessages = {
 	steering: string[];
 	followUp: string[];
@@ -392,10 +405,10 @@ export class UiHelpers {
 
 					readGroup = null;
 					const tool = this.ctx.session.getToolByName(content.name);
-					const renderArgs =
-						"partialJson" in content
-							? { ...content.arguments, __partialJson: content.partialJson }
-							: content.arguments;
+					const renderArgs = argsWithPartialJson(
+						content.arguments,
+						"partialJson" in content ? content.partialJson : undefined,
+					);
 					const component = new ToolExecutionComponent(
 						content.name,
 						renderArgs,

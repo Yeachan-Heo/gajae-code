@@ -20,6 +20,16 @@ const HEARTBEAT_MS = 1000;
 type LastPayloadCacheEntry = { mtimeMs: number; size: number; payload: Record<string, unknown> };
 const lastPayloadByStateFile = new Map<string, LastPayloadCacheEntry>();
 
+/** Test-only counters for runtime sidecar hot-path assertions. */
+export const __sessionStateSidecarPerfCounters = {
+	persistFromEventCalls: 0,
+	reset(): void {
+		this.persistFromEventCalls = 0;
+	},
+};
+
+const lastWrittenPayloadByStateFile = new Map<string, Record<string, unknown>>();
+
 interface RuntimeStateEvent {
 	type: string;
 	messages?: unknown[];
@@ -58,6 +68,11 @@ export type TerminalRuntimeStateStatus =
 
 function sameResolvedPath(left: string, right: string): boolean {
 	return path.resolve(left) === path.resolve(right);
+}
+
+function isCoordinatorOwnedStateFile(stateFile: string): boolean {
+	const coordinatorStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	return !!coordinatorStateFile && sameResolvedPath(coordinatorStateFile, stateFile);
 }
 
 export async function readTerminalRuntimeStateMarker(input: {
@@ -155,6 +170,10 @@ function readPreviousPayload(stateFile: string): Record<string, unknown> {
 }
 
 async function readPreviousPayloadForEvent(stateFile: string): Promise<Record<string, unknown>> {
+	if (!isCoordinatorOwnedStateFile(stateFile)) {
+		const cachedWritten = lastWrittenPayloadByStateFile.get(stateFile);
+		if (cachedWritten) return cachedWritten;
+	}
 	let stat: Awaited<ReturnType<typeof fs.stat>>;
 	try {
 		stat = await fs.stat(stateFile);
@@ -193,15 +212,15 @@ function shouldSkipRuntimeStateWrite(
 	return nowMs - previousUpdatedAt < HEARTBEAT_MS;
 }
 
-async function refreshLastPayloadCache(stateFile: string, payload: Record<string, unknown>): Promise<void> {
+function rememberWrittenPayload(stateFile: string, payload: Record<string, unknown>): void {
+	lastWrittenPayloadByStateFile.set(stateFile, payload);
 	try {
-		const stat = await fs.stat(stateFile);
+		const stat = fsSync.statSync(stateFile);
 		lastPayloadByStateFile.set(stateFile, { mtimeMs: stat.mtimeMs, size: stat.size, payload });
 	} catch {
 		lastPayloadByStateFile.delete(stateFile);
 	}
 }
-
 function shouldPreserveTerminalPayload(
 	previous: RuntimeStateSidecarPayload,
 	input: { sessionId: string; cwd: string; sessionFile?: string | null },
@@ -220,6 +239,14 @@ function shouldPreserveTerminalPayload(
 		return false;
 	}
 	return true;
+}
+
+function cachedTerminalPayload(
+	stateFile: string,
+	input: { sessionId: string; cwd: string; sessionFile?: string | null },
+): RuntimeStateSidecarPayload | null {
+	const cached = lastWrittenPayloadByStateFile.get(stateFile) as RuntimeStateSidecarPayload | undefined;
+	return cached && shouldPreserveTerminalPayload(cached, input) ? cached : null;
 }
 
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
@@ -417,18 +444,21 @@ function postmortemExitDetails(
 
 function writeStateFileSync(stateFile: string, payload: Record<string, unknown>): void {
 	fsSync.mkdirSync(path.dirname(stateFile), { recursive: true });
-	fsSync.writeFileSync(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+	fsSync.writeFileSync(stateFile, `${JSON.stringify(payload)}\n`);
+	rememberWrittenPayload(stateFile, payload);
 }
 
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
 	await fs.mkdir(path.dirname(stateFile), { recursive: true });
-	await Bun.write(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+	await Bun.write(stateFile, `${JSON.stringify(payload)}\n`);
+	rememberWrittenPayload(stateFile, payload);
 }
 
 export async function persistCoordinatorRuntimeStateFromEvent(
 	event: RuntimeStateEvent,
 	context: RuntimeStateContext,
 ): Promise<void> {
+	__sessionStateSidecarPerfCounters.persistFromEventCalls += 1;
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
 	const state = stateForEvent(event);
@@ -463,6 +493,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 				}
 			: {}),
 	};
+	if (state === "completed" || state === "errored") rememberWrittenPayload(stateFile, payload);
 	try {
 		if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 		await writeStateFile(stateFile, payload);
@@ -478,19 +509,15 @@ export function persistCoordinatorRuntimeStateFromPostmortem(
 ): void {
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
-	const previous = readPreviousPayload(stateFile);
 	const sessionId = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim()
 		? process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId
 		: context.sessionId;
-	if (
-		shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, {
-			sessionId,
-			cwd: context.cwd,
-			sessionFile: context.sessionFile,
-		})
-	) {
-		return;
-	}
+	const preserveInput = { sessionId, cwd: context.cwd, sessionFile: context.sessionFile };
+	const cachedTerminal = cachedTerminalPayload(stateFile, preserveInput);
+	const previous: Record<string, unknown> = cachedTerminal
+		? (cachedTerminal as unknown as Record<string, unknown>)
+		: readPreviousPayload(stateFile);
+	if (cachedTerminal || shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, preserveInput)) return;
 	const previousForDetails: RuntimeStateSidecarPayload =
 		(previous as RuntimeStateSidecarPayload).state === "completed" ||
 		(previous as RuntimeStateSidecarPayload).state === "errored"

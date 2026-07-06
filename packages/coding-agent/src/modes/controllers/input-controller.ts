@@ -1308,7 +1308,7 @@ export class InputController {
 		// If streaming, re-add the streaming component with updated visibility and re-render
 		if (this.ctx.streamingComponent && this.ctx.streamingMessage) {
 			this.ctx.streamingComponent.setHideThinkingBlock(this.ctx.hideThinkingBlock);
-			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
 			this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
 		}
 

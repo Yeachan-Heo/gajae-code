@@ -1048,6 +1048,15 @@ export function getStreamingEditToolCallForEvent(
 	return parsed;
 }
 
+/** Test-only counters for AgentSession event fan-out hot-path assertions. */
+export const __agentSessionPerfCounters = {
+	listenerSnapshotRebuilds: 0,
+	messageUpdateExtensionQueues: 0,
+	reset(): void {
+		this.listenerSnapshotRebuilds = 0;
+		this.messageUpdateExtensionQueues = 0;
+	},
+};
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -1071,6 +1080,12 @@ export class AgentSession {
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
+	#eventListenerSnapshot: readonly AgentSessionEventListener[] = Object.freeze([]);
+
+	#rebuildEventListenerSnapshot(): void {
+		this.#eventListenerSnapshot = Object.freeze([...this.#eventListeners]);
+		__agentSessionPerfCounters.listenerSnapshotRebuilds += 1;
+	}
 
 	/** Tracks pending steering messages for UI display. Removed when delivered.
 	 *  Entry shape: `{ text }` for plain-text steers (user-message dequeue
@@ -1256,10 +1271,31 @@ export class AgentSession {
 
 	#streamingEditAbortTriggered = false;
 	#streamingEditCheckedLineCounts = new Map<string, number>();
+	#streamingEditToolCallStates = new Map<
+		string,
+		{
+			op?: string;
+			resolvedPath?: string;
+			lastProcessedOffset: number;
+			processedPrefix: string;
+			settledVerdict?: "aborted" | "non-edit" | "non-update";
+			debugProcessedChars: number;
+			debugCheckedRemovedLines: number;
+			debugFullChecks: number;
+			debugGuardRuns: number;
+		}
+	>();
 
 	#streamingEditPrecheckedToolCallIds = new Set<string>();
 
 	#streamingEditFileCache = new Map<string, string>();
+	readonly streamingEditDebugCounters = {
+		guardRuns: 0,
+		processedChars: 0,
+		checkedRemovedLines: 0,
+		fullChecks: 0,
+		nonEditDeterminations: 0,
+	};
 	#promptInFlightCount = 0;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
 	// Local subscribers and extension hooks both receive the deferred event from
@@ -1477,16 +1513,6 @@ export class AgentSession {
 		this.#agentRegistry = config.agentRegistry;
 		this.#providerSessionId = config.providerSessionId;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
-		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
-			const event: AgentEvent = {
-				type: "message_update",
-				message,
-				assistantMessageEvent,
-			};
-			const generation = this.#promptGeneration;
-			this.#preCacheStreamingEditFile(event);
-			this.#maybeAbortStreamingEdit(event, generation);
-		});
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => this.#ttsrAfterToolCall(ctx);
 		this.agent.providerSessionState = this.#providerSessionState;
@@ -1872,9 +1898,7 @@ export class AgentSession {
 
 	/** Emit an event to all listeners */
 	#emit(event: AgentSessionEvent): void {
-		// Copy array before iteration to avoid mutation during iteration
-		const listeners = [...this.#eventListeners];
-		for (const l of listeners) {
+		for (const l of this.#eventListenerSnapshot) {
 			l(event);
 		}
 	}
@@ -1905,20 +1929,15 @@ export class AgentSession {
 
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "message_update") {
+			// Fast path: message_update maps to no sidecar state, so we must not
+			// build the persistRuntimeState closure here (per-token hot path).
 			this.#emit(event);
-			if (eventAffectsCoordinatorRuntimeState(event)) {
-				void persistCoordinatorRuntimeStateFromEvent(event, {
-					sessionId: this.sessionId,
-					cwd: this.sessionManager.getCwd(),
-					sessionFile: this.sessionManager.getSessionFile(),
-				});
-			}
-			if (this.#extensionRunner?.hasHandlers("message_update")) {
+			if (this.#hasStreamingExtensionHandlers()) {
+				__agentSessionPerfCounters.messageUpdateExtensionQueues += 1;
 				void this.#queueExtensionEvent(event);
 			}
 			return;
 		}
-
 		const persistRuntimeState = () =>
 			persistCoordinatorRuntimeStateFromEvent(event, {
 				sessionId: this.sessionId,
@@ -2996,6 +3015,7 @@ export class AgentSession {
 	#resetStreamingEditState(): void {
 		this.#streamingEditAbortTriggered = false;
 		this.#streamingEditCheckedLineCounts.clear();
+		this.#streamingEditToolCallStates.clear();
 		this.#streamingEditPrecheckedToolCallIds.clear();
 		this.#streamingEditParsedToolCallCache.clear();
 		this.#streamingEditFileCache.clear();
@@ -3123,36 +3143,122 @@ export class AgentSession {
 		const assistantEvent = event.assistantMessageEvent;
 		if (assistantEvent.type !== "toolcall_end" && assistantEvent.type !== "toolcall_delta") return;
 
+		const contentIndex = assistantEvent.contentIndex ?? 0;
+		const messageContent = event.message.role === "assistant" ? event.message.content : undefined;
+		const candidateToolCall = Array.isArray(messageContent)
+			? (messageContent[contentIndex] as ToolCall | undefined)
+			: undefined;
+		const candidateToolCallId = candidateToolCall?.type === "toolCall" ? candidateToolCall.id : undefined;
+		if (candidateToolCallId) {
+			const cached = this.#streamingEditToolCallStates.get(candidateToolCallId);
+			if (
+				cached?.settledVerdict === "aborted" ||
+				cached?.settledVerdict === "non-edit" ||
+				cached?.settledVerdict === "non-update"
+			) {
+				return;
+			}
+		}
+
 		const streamingEdit = this.#getStreamingEditToolCall(event);
-		if (!streamingEdit?.toolCall.id) return;
+		if (!streamingEdit?.toolCall.id) {
+			if (candidateToolCallId) {
+				this.#streamingEditToolCallStates.set(candidateToolCallId, {
+					lastProcessedOffset: 0,
+					processedPrefix: "",
+					settledVerdict: "non-edit",
+					debugProcessedChars: 0,
+					debugCheckedRemovedLines: 0,
+					debugFullChecks: 0,
+					debugGuardRuns: 0,
+				});
+				this.streamingEditDebugCounters.nonEditDeterminations += 1;
+			}
+			return;
+		}
 
 		const { toolCall, path, resolvedPath, diff, op, rename } = streamingEdit;
-		if (!diff) return;
-		if (op && op !== "update") return;
+		let state = this.#streamingEditToolCallStates.get(toolCall.id);
+		if (!state) {
+			state = {
+				op,
+				resolvedPath,
+				lastProcessedOffset: 0,
+				processedPrefix: "",
+				debugProcessedChars: 0,
+				debugCheckedRemovedLines: 0,
+				debugFullChecks: 0,
+				debugGuardRuns: 0,
+			};
+			this.#streamingEditToolCallStates.set(toolCall.id, state);
+		} else {
+			state.op = op;
+			state.resolvedPath = resolvedPath;
+		}
+		state.debugGuardRuns += 1;
+		this.streamingEditDebugCounters.guardRuns += 1;
 
-		if (!diff.includes("\n")) return;
+		if (op && op !== "update") {
+			state.settledVerdict = "non-update";
+			return;
+		}
+		if (!diff) return;
+
 		const lastNewlineIndex = diff.lastIndexOf("\n");
 		if (lastNewlineIndex < 0) return;
-		const diffForCheck = diff.endsWith("\n") ? diff : diff.slice(0, lastNewlineIndex + 1);
-		if (diffForCheck.trim().length === 0) return;
+		const completeDiff = diff.slice(0, lastNewlineIndex + 1);
+		if (completeDiff.trim().length === 0) return;
+
+		let diffForCheck = completeDiff;
+		let fullCheck = false;
+		// Obfuscated diffs are intentionally checked through the full path because
+		// deobfuscation is not proven chunk-composable across streaming deltas.
+		if (this.#obfuscator) {
+			fullCheck = true;
+		} else if (completeDiff.length < state.lastProcessedOffset || !completeDiff.startsWith(state.processedPrefix)) {
+			fullCheck = true;
+		} else {
+			diffForCheck = completeDiff.slice(state.lastProcessedOffset);
+		}
+		if (!diffForCheck) return;
 
 		let normalizedDiff = normalizeDiff(diffForCheck.replace(/\r/g, ""));
 		if (!normalizedDiff) return;
-		// Deobfuscate the diff so removed lines match real file content
 		if (this.#obfuscator) normalizedDiff = this.#obfuscator.deobfuscate(normalizedDiff);
 		if (!normalizedDiff) return;
 		const lines = normalizedDiff.split("\n");
 		const hasChangeLine = lines.some(line => line.startsWith("+") || line.startsWith("-"));
-		if (!hasChangeLine) return;
+		if (!hasChangeLine) {
+			if (!fullCheck) {
+				state.lastProcessedOffset = completeDiff.length;
+				state.processedPrefix = completeDiff;
+			}
+			return;
+		}
+
+		if (fullCheck) {
+			state.debugFullChecks += 1;
+			this.streamingEditDebugCounters.fullChecks += 1;
+		}
+		state.debugProcessedChars += diffForCheck.length;
+		this.streamingEditDebugCounters.processedChars += diffForCheck.length;
 
 		const lineCount = lines.length;
-		const lastChecked = this.#streamingEditCheckedLineCounts.get(toolCall.id);
-		if (lastChecked !== undefined && lineCount <= lastChecked) return;
 		this.#streamingEditCheckedLineCounts.set(toolCall.id, lineCount);
 
 		const removedLines = lines
 			.filter(line => line.startsWith("-") && !line.startsWith("--- "))
 			.map(line => line.slice(1));
+		state.debugCheckedRemovedLines += removedLines.length;
+		this.streamingEditDebugCounters.checkedRemovedLines += removedLines.length;
+		if (!fullCheck) {
+			state.lastProcessedOffset = completeDiff.length;
+			state.processedPrefix = completeDiff;
+		} else if (!this.#obfuscator) {
+			state.lastProcessedOffset = completeDiff.length;
+			state.processedPrefix = completeDiff;
+		}
+
 		if (removedLines.length > 0) {
 			let cachedContent = this.#streamingEditFileCache.get(resolvedPath);
 			if (cachedContent === undefined) {
@@ -3163,6 +3269,7 @@ export class AgentSession {
 				const missing = removedLines.find(line => !cachedContent.includes(normalizeToLF(line)));
 				if (missing) {
 					this.#streamingEditAbortTriggered = true;
+					state.settledVerdict = "aborted";
 					logger.warn("Streaming edit aborted due to patch preview failure", {
 						toolCallId: toolCall.id,
 						path,
@@ -3388,12 +3495,14 @@ export class AgentSession {
 	 */
 	subscribe(listener: AgentSessionEventListener): () => void {
 		this.#eventListeners.push(listener);
+		this.#rebuildEventListenerSnapshot();
 
 		// Return unsubscribe function for this specific listener
 		return () => {
 			const index = this.#eventListeners.indexOf(listener);
 			if (index !== -1) {
 				this.#eventListeners.splice(index, 1);
+				this.#rebuildEventListenerSnapshot();
 			}
 		};
 	}
@@ -3531,6 +3640,7 @@ export class AgentSession {
 			this.#unsubscribeAppendOnly = undefined;
 		}
 		this.#eventListeners = [];
+		this.#rebuildEventListenerSnapshot();
 	}
 
 	/**
@@ -10959,6 +11069,10 @@ export class AgentSession {
 	 */
 	hasExtensionHandlers(eventType: string): boolean {
 		return this.#extensionRunner?.hasHandlers(eventType) ?? false;
+	}
+
+	#hasStreamingExtensionHandlers(): boolean {
+		return this.hasExtensionHandlers("message_update");
 	}
 
 	/**
