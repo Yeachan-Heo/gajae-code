@@ -47,5 +47,7 @@ describe("Extragoal skill template", () => {
 		expect(template).toContain("Maximum **2 re-sign rounds**");
 		expect(template).toContain("Any fix invalidates the previous signature.");
 		expect(template).toContain("never commit `.gjc/_session-*` gate artifacts");
+		expect(template).toContain("The one-shot session's `default` model authors the verdict");
+		expect(template).toContain("--mpreset reviewer --model openai-codex/gpt-5.5:high -p --no-session --tools read,search,find");
 	});
 });
