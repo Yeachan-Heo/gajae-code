@@ -27,6 +27,13 @@ describe("AgentOutputManager", () => {
 		expect(await mgr.allocateBatch(["Alpha", "Beta"])).toEqual(["3-Alpha", "4-Beta"]);
 	});
 
+	it("reserves ids from child session files before markdown output exists", async () => {
+		const dir = await makeArtifactsDir(["0-Foo.jsonl"]);
+		const mgr = new AgentOutputManager(() => dir);
+
+		expect(await mgr.allocate("Bar")).toBe("1-Bar");
+	});
+
 	it("does not reuse or duplicate ids when allocations race on a shared instance", async () => {
 		// Regression: #ensureInitialized previously set a boolean flag BEFORE the
 		// awaited readdir, so a second concurrent allocate short-circuited init and
@@ -54,5 +61,12 @@ describe("AgentOutputManager", () => {
 		// peek observes the scanned cursor, not the pre-scan default of 0.
 		expect(peeked).toBeGreaterThanOrEqual(3);
 		expect(Number.parseInt(allocated.split("-")[0] ?? "", 10)).toBeGreaterThanOrEqual(3);
+	});
+
+	it("reserves nested ids from child session files before markdown output exists", async () => {
+		const dir = await makeArtifactsDir(["0-Parent.0-Foo.jsonl"]);
+		const mgr = new AgentOutputManager(() => dir, { parentPrefix: "0-Parent" });
+
+		expect(await mgr.allocate("Bar")).toBe("0-Parent.1-Bar");
 	});
 });
