@@ -175,6 +175,23 @@ describe("BashTool restricted role-agent allowlist", () => {
 			"restricted role-agent bash only allows commands starting with",
 		);
 	});
+	it("blocks restricted role-agent cwd outside the session workspace", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-restricted-cwd-root-"));
+		const outside = await fs.mkdtemp(path.join(process.cwd(), ".tmp-restricted-cwd-outside-"));
+		try {
+			const tool = createRestrictedBashTool(root, ["gjc state"]);
+
+			await expect(
+				tool.execute("tool-call", {
+					command: "gjc state read --json",
+					cwd: outside,
+				}),
+			).rejects.toThrow("Restricted role-agent bash cwd must stay within the session workspace");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
 
 	it("surfaces read-only bash restrictions in the tool description", () => {
 		const tool = createRestrictedBashTool(process.cwd(), ["grep", "rg", "tree", "ls"], "read-only");
@@ -197,7 +214,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 				"read-only bash only allows commands starting with",
 			);
 			await expect(tool.execute("tool-call", { command: "ls", env: { PATH: "/tmp/fake" } })).rejects.toThrow(
-				"Read-only bash only allows the GJC_RALPLAN_ARTIFACT env override for --artifact-env.",
+				"Read-only bash does not allow per-command env overrides.",
 			);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
@@ -258,6 +275,17 @@ describe("BashTool restricted role-agent allowlist", () => {
 			tool.execute("tool-call", {
 				command: "gjc ralplan --write --stage architect --stage_n 1 --artifact ok",
 				env: { PATH: "/tmp/fake" },
+			}),
+		).rejects.toThrow("only allows the GJC_RALPLAN_ARTIFACT env override");
+	});
+
+	it("blocks artifact env overrides when --artifact-env only matches as a substring", async () => {
+		const tool = createRestrictedBashTool();
+
+		await expect(
+			tool.execute("tool-call", {
+				command: "gjc ralplan --write --stage architect --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT_EVIL",
+				env: { GJC_RALPLAN_ARTIFACT: "payload" },
 			}),
 		).rejects.toThrow("only allows the GJC_RALPLAN_ARTIFACT env override");
 	});

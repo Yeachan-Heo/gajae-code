@@ -390,7 +390,7 @@ describe("workflow state writer drift guard", () => {
 		expect(persisted.current_phase).toBe("bogus-phase");
 	});
 
-	it("flags an invalid phase transition on an internal write but still persists it (#658 transition invariant)", async () => {
+	it("rejects an invalid phase transition on an internal write (#658 transition invariant)", async () => {
 		const root = await tempDir();
 		const statePath = modeStatePath(root, TEST_SESSION_ID, "ralplan");
 		const base = {
@@ -419,24 +419,13 @@ describe("workflow state writer drift guard", () => {
 		// Seed a valid active prior phase, then jump planner -> final (no manifest edge).
 		await writeWorkflowEnvelopeAtomic(statePath, { ...base, current_phase: "planner" }, opts);
 
-		// The diagnostic-only path must NOT touch stderr (callers may treat stderr as failure
-		// or parse machine output): capture stderr across the invalid-edge write.
-		const originalWrite = process.stderr.write.bind(process.stderr);
-		let stderrCaptured = "";
-		process.stderr.write = ((chunk: unknown) => {
-			stderrCaptured += typeof chunk === "string" ? chunk : String(chunk);
-			return true;
-		}) as typeof process.stderr.write;
-		try {
-			await writeWorkflowEnvelopeAtomic(statePath, { ...base, current_phase: "final" }, opts);
-		} finally {
-			process.stderr.write = originalWrite;
-		}
-		expect(stderrCaptured).toBe("");
+		// Invalid known-state edges fail closed at the writer boundary; audit evidence
+		// is supplementary and must not be the only enforcement.
+		await expect(writeWorkflowEnvelopeAtomic(statePath, { ...base, current_phase: "final" }, opts)).rejects.toThrow(
+			'Refusing to write invalid ralplan phase transition "planner" -> "final"',
+		);
 
-		// The invalid edge is recorded as audit evidence, not blocked.
-		await expectPersistedEnvelope(statePath);
-		expect((await readJson(statePath)).current_phase).toBe("final");
+		expect((await readJson(statePath)).current_phase).toBe("planner");
 		const flagged = (await readAuditEntries(root)).filter(e => e.verb === "invalid_transition_detected");
 		expect(flagged.length).toBe(1);
 		expect(flagged[0]?.from_phase).toBe("planner");

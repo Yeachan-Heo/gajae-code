@@ -53,6 +53,26 @@ function sameResolvedPath(left: string, right: string): boolean {
 	return path.resolve(left) === path.resolve(right);
 }
 
+function isWithinOrEqualPath(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+export function resolveCoordinatorRuntimeStateFile(context: RuntimeStateContext): string | null {
+	const stateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	if (!stateFile) return null;
+	const runtimeRoot = path.resolve(sessionRuntimeDir(context.cwd, context.sessionId));
+	const resolved = path.resolve(stateFile);
+	if (!isWithinOrEqualPath(runtimeRoot, resolved)) {
+		logger.warn("Ignoring coordinator runtime state file outside session runtime root", {
+			stateFile: resolved,
+			runtimeRoot,
+		});
+		return null;
+	}
+	return resolved;
+}
+
 export async function readTerminalRuntimeStateMarker(input: {
 	stateFile?: string | null;
 	sessionId?: string | null;
@@ -73,15 +93,17 @@ export async function readTerminalRuntimeStateMarker(input: {
 		};
 	}
 	if (payload.session_id !== sessionId) return { terminal: false, reason: "session_id_mismatch" };
-	if (input.cwd && typeof payload.cwd === "string" && !sameResolvedPath(payload.cwd, input.cwd)) {
-		return { terminal: false, reason: "cwd_mismatch" };
+	if (input.cwd) {
+		if (typeof payload.cwd !== "string") return { terminal: false, reason: "cwd_mismatch" };
+		if (!sameResolvedPath(payload.cwd, input.cwd)) {
+			return { terminal: false, reason: "cwd_mismatch" };
+		}
 	}
-	if (
-		input.sessionFile &&
-		typeof payload.session_file === "string" &&
-		!sameResolvedPath(payload.session_file, input.sessionFile)
-	) {
-		return { terminal: false, reason: "session_file_mismatch" };
+	if (input.sessionFile) {
+		if (typeof payload.session_file !== "string") return { terminal: false, reason: "session_file_mismatch" };
+		if (!sameResolvedPath(payload.session_file, input.sessionFile)) {
+			return { terminal: false, reason: "session_file_mismatch" };
+		}
 	}
 	if (payload.state === "completed" || payload.state === "errored") return { terminal: true, state: payload.state };
 	return { terminal: false, reason: "non_terminal_state" };
@@ -151,7 +173,7 @@ function shouldPreserveTerminalPayload(previous: RuntimeStateSidecarPayload): bo
 
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
 	const explicit = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
-	if (explicit) return explicit;
+	if (explicit) return resolveCoordinatorRuntimeStateFile(context);
 	if (!context.sessionId.trim()) return null;
 	return path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json");
 }

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { modeStatePath, sessionDirName, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 
 const TEST_SESSION_ID = "test-session";
@@ -70,6 +70,19 @@ describe("gjc state write hardening", () => {
 		const result = await writeState(root, "ralplan", { current_phase: "final" });
 		expect(result.status).not.toBe(0);
 		expect(result.stderr).toContain("invalid ralplan phase transition from planner to final");
+	});
+
+	it("rejects writes through symlinked state parents", async () => {
+		const root = await tempDir();
+		const victim = await tempDir();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.symlink(victim, path.join(root, ".gjc", sessionDirName(TEST_SESSION_ID)));
+
+		const result = await writeState(root, "ralplan", { current_phase: "planner" });
+
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain("state path contains symlink");
+		await expect(fs.readFile(path.join(victim, "state", "ralplan-state.json"), "utf-8")).rejects.toThrow();
 	});
 
 	it("allows --force to bypass a known-bad jump", async () => {
