@@ -37,6 +37,8 @@ function normalizeSkillName(name: string | undefined): string {
 	return (name ?? "").trim();
 }
 
+const SKILL_NAME_GLOB_PATTERN = /[*?[\]{}]/;
+
 type SkillToolInput = z.infer<typeof skillSchema>;
 
 export interface SkillToolDetails {
@@ -86,6 +88,19 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 			const requestedName = normalizeSkillName(input.name);
 			if (!requestedName) {
 				throw new ToolError("skill tool: `name` is required");
+			}
+			// Fail fast on glob/wildcard names (e.g. `*`). A model that sees the
+			// `--skills '*'` launch filter may echo the glob into the skill tool.
+			// Without this guard `*` slips through to the generic unknown-skill
+			// path only because no skill is literally named `*`, so a future
+			// odd skill name could get dispatched — and the actionable signal
+			// that names are concrete (not globs) is lost. Reject before any
+			// dispatch or handoff state mutation so the call ends immediately
+			// instead of spawning skill work that burns the whole turn budget.
+			if (SKILL_NAME_GLOB_PATTERN.test(requestedName)) {
+				throw new ToolError(
+					`skill tool: "${requestedName}" is not a valid skill name. The name must be a single concrete skill (e.g. "ralplan"), not a glob or wildcard pattern. Pass one exact skill name as shown in /skill:<name>.`,
+				);
 			}
 			const activeState = this.#session.getActiveSkillState?.();
 			const activeSkill = normalizeSkillName(activeState?.skill);

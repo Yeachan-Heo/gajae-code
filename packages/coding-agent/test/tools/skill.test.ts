@@ -185,6 +185,23 @@ describe("SkillTool", () => {
 		expect(content).not.toContain("User:");
 	});
 
+	it("rejects wildcard/glob skill names immediately without dispatching", async () => {
+		const cwd = await makeTempCwd();
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nBody");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ultragoal], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+			getActiveSkillPhase: () => "interviewing",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await expect(tool.execute("call-1", { name: "*" })).rejects.toBeInstanceOf(ToolError);
+		await expect(tool.execute("call-1", { name: "*" })).rejects.toThrow(/not a valid skill name/);
+		await expect(tool.execute("call-1", { name: "git-*" })).rejects.toThrow(/glob or wildcard/);
+		// Guard runs before the phase/handoff path, so no dispatch and no state I/O.
+		expect(captured).toHaveLength(0);
+	});
+
 	it("rejects chaining into the currently active skill (recursive-self guard)", async () => {
 		const cwd = await makeTempCwd();
 		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
