@@ -54,5 +54,8 @@ describe("Extragoal skill template", () => {
 		expect(template).toContain(
 			"Adding `--mpreset reviewer` on top is an **optional enhancement**, not a prerequisite",
 		);
+		expect(template).toContain("injected **beyond** the allowlist");
+		expect(template).toContain("`goal` (auto-added whenever `goal.enabled` is on, its default)");
+		expect(template).toContain("a contract violation that fails the gate round");
 	});
 });

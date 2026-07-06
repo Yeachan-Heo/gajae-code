@@ -9,6 +9,7 @@
 ### Fixed
 
 - Restored `/changelog` as a built-in slash command, including autocomplete and `/changelog --full`/`/changelog full`, so the What's New prompt no longer points at a missing command.
+- Corrected the Extragoal template's read-only enforcement claim: the `--tools` allowlist governs the built-in tool surface, while the runtime injects the session `goal` tool (when `goal.enabled` is on) and `generate_image` (when an image credential exists) beyond it. The template now documents the verified strict-leaf recipe (`goal.enabled: false` in the review working directory's `.gjc/config.yml`) and treats reviewer calls outside the allowlist as gate-failing contract violations.
 
 ## [0.8.2] - 2026-07-06
 ### Added

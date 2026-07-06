@@ -125,7 +125,12 @@ gjc -p --no-session --model openai-codex/gpt-5.5:high --tools read,search,find "
 
 Adding `--mpreset reviewer` on top is an **optional enhancement**, not a prerequisite: the `reviewer` profile is user-installed `models.yml` config from [Cross-vendor role-based profiles](./multi-vendor-profiles.md), and `gjc --mpreset reviewer` fails with an unknown-profile error when that profile has not been copied in. The profile's role mapping matters for interactive review sessions where roles do get delegated — the one-shot gate works without it.
 
-Read-only is enforced by the `--tools` allowlist, not by the prompt — a reviewer invocation without a tool allowlist does not satisfy the leaf contract. The sub-session shares no conversation state with the authoring session and may inspect the repo read-only when the diff alone is not self-contained.
+Read-only is enforced for the built-in tool surface by the `--tools` allowlist, not by the prompt — a reviewer invocation without a tool allowlist does not satisfy the leaf contract. Two session utilities are injected **beyond** the allowlist and must be accounted for: `goal` (auto-added whenever `goal.enabled` is on, its default) and `generate_image` (registered whenever an image-capable credential exists). Neither can write to the repository, so the no-mutation contract holds, but for a strict leaf surface:
+
+- disable the goal tool for the review working directory — a `.gjc/config.yml` there containing `goal:` / `  enabled: false` removes it (verified against the tool-construction path, which augments explicit tool lists with `goal` only when the setting is on),
+- treat any reviewer call to a tool outside `read`/`search`/`find` as a contract violation that fails the gate round and is reported in the gate artifact.
+
+The sub-session shares no conversation state with the authoring session and may inspect the repo read-only when the diff alone is not self-contained.
 
 Cross-family provenance is always the operator-chosen verdict model, never an assumption: with fewer vendors, pick whatever strong selector your credentials allow from a family other than the authoring one.
 
