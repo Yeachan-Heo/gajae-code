@@ -593,7 +593,7 @@ describe("coordinator runtime state sidecar", () => {
 		expect(afterPostmortem).toMatchObject({
 			state: "errored",
 			source: "process_postmortem",
-			reason: "process_exit_before_terminal_state",
+			reason: "process_exit_before_prompt_acceptance",
 			current_turn_id: "cache-current",
 			last_turn_id: "cache-last",
 		});

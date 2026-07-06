@@ -91,6 +91,9 @@ describe("TUI overlays", () => {
 	let previousTmux: string | undefined;
 	let previousSty: string | undefined;
 	let previousZellij: string | undefined;
+	let previousTmuxPane: string | undefined;
+	let previousGjcTmuxLaunched: string | undefined;
+	let previousTerm: string | undefined;
 	let previousLegacyFullRender: string | undefined;
 
 	beforeEach(() => {
@@ -98,10 +101,16 @@ describe("TUI overlays", () => {
 		previousSty = Bun.env.STY;
 		previousZellij = Bun.env.ZELLIJ;
 		previousLegacyFullRender = Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+		previousTmuxPane = Bun.env.TMUX_PANE;
+		previousGjcTmuxLaunched = Bun.env.GJC_TMUX_LAUNCHED;
+		previousTerm = Bun.env.TERM;
 		delete Bun.env.TMUX;
 		delete Bun.env.STY;
 		delete Bun.env.ZELLIJ;
 		delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+		delete Bun.env.TMUX_PANE;
+		delete Bun.env.GJC_TMUX_LAUNCHED;
+		Bun.env.TERM = "xterm-256color";
 	});
 
 	afterEach(() => {
@@ -124,6 +133,21 @@ describe("TUI overlays", () => {
 			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 		} else {
 			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = previousLegacyFullRender;
+		}
+		if (previousTmuxPane === undefined) {
+			delete Bun.env.TMUX_PANE;
+		} else {
+			Bun.env.TMUX_PANE = previousTmuxPane;
+		}
+		if (previousGjcTmuxLaunched === undefined) {
+			delete Bun.env.GJC_TMUX_LAUNCHED;
+		} else {
+			Bun.env.GJC_TMUX_LAUNCHED = previousGjcTmuxLaunched;
+		}
+		if (previousTerm === undefined) {
+			delete Bun.env.TERM;
+		} else {
+			Bun.env.TERM = previousTerm;
 		}
 	});
 
