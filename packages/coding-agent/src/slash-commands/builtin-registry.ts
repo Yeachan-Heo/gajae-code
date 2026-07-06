@@ -32,6 +32,7 @@ import {
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
+import { getDisplayChangelogEntries } from "../utils/changelog";
 import { buildContextReportText } from "./helpers/context-report";
 import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
@@ -382,6 +383,30 @@ function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.statusLine.invalidate();
 	ctx.updateEditorTopBorder();
 	ctx.ui.requestRender();
+}
+
+type ChangelogCommandArgs = { showFull: boolean } | { error: string };
+
+function parseChangelogCommandArgs(args: string): ChangelogCommandArgs {
+	const normalized = args.trim().toLowerCase();
+	if (!normalized) return { showFull: false };
+	if (normalized === "full" || normalized === "--full") return { showFull: true };
+	return { error: "Usage: /changelog [full|--full]" };
+}
+
+function buildChangelogCommandOutput(showFull: boolean): string {
+	const allEntries = getDisplayChangelogEntries();
+	const entriesToShow = showFull ? allEntries : allEntries.slice(0, 3);
+	const changelogMarkdown =
+		entriesToShow.length > 0
+			? [...entriesToShow]
+					.reverse()
+					.map(entry => entry.content)
+					.join("\n\n")
+			: "No changelog entries found.";
+	const title = showFull ? "Full Changelog" : "Recent Changes";
+	const hint = showFull ? "" : "\n\nUse `/changelog --full` to view the complete changelog.";
+	return `${title}\n\n${changelogMarkdown}${hint}`;
 }
 
 const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashCommandRuntime): SlashCommandResult => {
@@ -819,6 +844,29 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: async (_command, runtime) => {
 			await runtime.ctx.handleUsageCommand();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "changelog",
+		description: "Show release notes and changelog entries",
+		inlineHint: "[full|--full]",
+		subcommands: [{ name: "full", description: "Show complete changelog" }],
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const parsed = parseChangelogCommandArgs(command.args);
+			if ("error" in parsed) return usage(parsed.error, runtime);
+			await runtime.output(buildChangelogCommandOutput(parsed.showFull));
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			const parsed = parseChangelogCommandArgs(command.args);
+			if ("error" in parsed) {
+				runtime.ctx.showError(parsed.error);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			await runtime.ctx.handleChangelogCommand(parsed.showFull);
 			runtime.ctx.editor.setText("");
 		},
 	},

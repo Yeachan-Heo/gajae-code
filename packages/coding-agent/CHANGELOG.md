@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored `/changelog` as a built-in slash command, including autocomplete and `/changelog --full`/`/changelog full`, so the What's New prompt no longer points at a missing command.
+
 ## [0.8.2] - 2026-07-06
 ### Added
 

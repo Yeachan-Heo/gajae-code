@@ -82,6 +82,68 @@ describe("builtin /copy slash command", () => {
 	});
 });
 
+function createChangelogTuiRuntime() {
+	const handleChangelogCommand = vi.fn(async (_showFull?: boolean) => {});
+	const showError = vi.fn();
+	const setText = vi.fn();
+	const ctx = {
+		handleChangelogCommand,
+		showError,
+		editor: { setText },
+	} as unknown as InteractiveModeContext;
+
+	return {
+		runtime: { ctx, handleBackgroundCommand: () => undefined },
+		handleChangelogCommand,
+		showError,
+		setText,
+	};
+}
+
+describe("builtin /changelog slash command", () => {
+	it("is discoverable with full-history completion metadata", () => {
+		const changelogCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "changelog");
+
+		expect(changelogCommand).toBeDefined();
+		expect(changelogCommand?.description).toBe("Show release notes and changelog entries");
+		expect(changelogCommand?.inlineHint).toBe("[full|--full]");
+		expect(changelogCommand?.subcommands?.map(command => command.name)).toEqual(["full"]);
+	});
+
+	it("dispatches /changelog to the existing TUI changelog controller path", async () => {
+		const { runtime, handleChangelogCommand, showError, setText } = createChangelogTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/changelog", runtime);
+
+		expect(result).toBe(true);
+		expect(handleChangelogCommand).toHaveBeenCalledWith(false);
+		expect(showError).not.toHaveBeenCalled();
+		expect(setText).toHaveBeenCalledWith("");
+	});
+
+	it("accepts full and --full changelog arguments", async () => {
+		const shortForm = createChangelogTuiRuntime();
+		const longForm = createChangelogTuiRuntime();
+
+		expect(await executeBuiltinSlashCommand("/changelog full", shortForm.runtime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/changelog --full", longForm.runtime)).toBe(true);
+
+		expect(shortForm.handleChangelogCommand).toHaveBeenCalledWith(true);
+		expect(longForm.handleChangelogCommand).toHaveBeenCalledWith(true);
+	});
+
+	it("rejects unknown changelog arguments locally instead of falling through", async () => {
+		const { runtime, handleChangelogCommand, showError, setText } = createChangelogTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/changelog nope", runtime);
+
+		expect(result).toBe(true);
+		expect(handleChangelogCommand).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledWith("Usage: /changelog [full|--full]");
+		expect(setText).toHaveBeenCalledWith("");
+	});
+});
+
 function createGoalTuiRuntime(goalModeEnabled: boolean) {
 	const handleGoalModeCommand = vi.fn(async () => {});
 	const addToHistory = vi.fn();
