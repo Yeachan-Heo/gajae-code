@@ -827,6 +827,344 @@ describe("native GJC ultragoal runtime", () => {
 		expect(receipt).not.toHaveProperty("goals");
 	});
 
+	it("stores explicit pipeline metadata and starts one eligible overlap", async () => {
+		const root = await tempDir();
+		const metadata = JSON.stringify([
+			{
+				schemaVersion: 1,
+				goalId: "G001",
+				source: "original_plan_graph",
+				dependsOn: [],
+				independentOf: ["G002"],
+				targets: { files: ["packages/coding-agent/src/gjc-runtime/ultragoal-runtime.ts"], surfaces: ["runtime"] },
+			},
+			{
+				schemaVersion: 1,
+				goalId: "G002",
+				source: "original_plan_graph",
+				dependsOn: [],
+				independentOf: ["G001"],
+				targets: { files: ["packages/coding-agent/test/gjc-runtime/ultragoal-runtime.test.ts"], surfaces: ["tests"] },
+			},
+		]);
+
+		const create = await runNativeUltragoalCommand(
+			[
+				"create-goals",
+				"--brief",
+				"@goal: Runtime\nImplement runtime\n@goal: Tests\nImplement tests",
+				"--goal-metadata-json",
+				metadata,
+				"--json",
+			],
+			root,
+		);
+		await runNativeUltragoalCommand(["complete-goals", "--json"], root);
+		const start = await runNativeUltragoalCommand(
+			[
+				"start-pipeline-overlap",
+				"--prior-goal-id",
+				"G001",
+				"--next-goal-id",
+				"G002",
+				"--review-handles-json",
+				JSON.stringify([{ id: "architect-G001", agent: "architect" }]),
+				"--qa-handles-json",
+				JSON.stringify([{ id: "executor-qa-G001", agent: "executor" }]),
+				"--implementation-handle-json",
+				JSON.stringify({ id: "executor-G002", agent: "executor" }),
+				"--json",
+			],
+			root,
+		);
+		const receipt = JSON.parse(start.stdout ?? "{}");
+		const plan = await readUltragoalPlan(root);
+		const ledger = await readUltragoalLedger(root);
+
+		expect(create.status).toBe(0);
+		expect(start.status).toBe(0);
+		expect(receipt).toMatchObject({
+			ok: true,
+			event: "pipeline_overlap_started",
+			prior_goal_id: "G001",
+			next_goal_id: "G002",
+			status: "open",
+			next_goal_status: "active",
+		});
+		expect(receipt).not.toHaveProperty("goals");
+		expect(plan?.goals.map(goal => [goal.id, goal.status, goal.pipelineMetadata?.overlap])).toEqual([
+			["G001", "active", "open"],
+			["G002", "active", "open"],
+		]);
+		expect(plan?.goals.every(goal => goal.pipelineMetadata?.eligible === true)).toBe(true);
+		expect(ledger.some(event => event.event === "pipeline_overlap_started" && event.priorGoalId === "G001")).toBe(true);
+	});
+
+	it("rejects unsafe pipeline metadata and per-story overlap", async () => {
+		const root = await tempDir();
+		const malformed = await runNativeUltragoalCommand(
+			[
+				"create-goals",
+				"--brief",
+				"@goal: A\na\n@goal: B\nb",
+				"--goal-metadata-json",
+				JSON.stringify([{ schemaVersion: 1, goalId: "G003", source: "original_plan_graph", targets: { files: ["a.ts"], surfaces: ["a"] } }]),
+				"--json",
+			],
+			root,
+		);
+		expect(malformed.status).toBe(1);
+		expect(malformed.stderr).toContain("unknown goal id G003");
+		expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).exists()).toBe(false);
+		const emptyTargets = await runNativeUltragoalCommand(
+			[
+				"create-goals",
+				"--brief",
+				"@goal: A\na\n@goal: B\nb",
+				"--goal-metadata-json",
+				JSON.stringify([{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", targets: { files: [], surfaces: [] } }]),
+				"--json",
+			],
+			root,
+		);
+		expect(emptyTargets.status).toBe(1);
+		expect(emptyTargets.stderr).toContain("requires files or surfaces");
+		expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).exists()).toBe(false);
+		const duplicateTargets = await runNativeUltragoalCommand(
+			[
+				"create-goals",
+				"--brief",
+				"@goal: A\na\n@goal: B\nb",
+				"--goal-metadata-json",
+				JSON.stringify([{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", targets: { files: ["a.ts", "a.ts"], surfaces: ["a"] } }]),
+				"--json",
+			],
+			root,
+		);
+		expect(duplicateTargets.status).toBe(1);
+		expect(duplicateTargets.stderr).toContain("duplicate normalized paths");
+		expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).exists()).toBe(false);
+		const unsafeTraversal = await runNativeUltragoalCommand(
+			[
+				"create-goals",
+				"--brief",
+				"@goal: A\na\n@goal: B\nb",
+				"--goal-metadata-json",
+				JSON.stringify([{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", targets: { files: ["safe/../target.ts"], surfaces: ["a"] } }]),
+				"--json",
+			],
+			root,
+		);
+		expect(unsafeTraversal.status).toBe(1);
+		expect(unsafeTraversal.stderr).toContain("unsafe path");
+		expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).exists()).toBe(false);
+
+		const metadata = JSON.stringify([
+			{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", independentOf: ["G002"], targets: { files: ["a.ts"], surfaces: ["a"] } },
+			{ schemaVersion: 1, goalId: "G002", source: "original_plan_graph", independentOf: ["G001"], targets: { files: ["b.ts"], surfaces: ["b"] } },
+		]);
+		const create = await runNativeUltragoalCommand(
+			[
+				"create-goals",
+				"--gjc-goal-mode",
+				"per-story",
+				"--brief",
+				"@goal: A\na\n@goal: B\nb",
+				"--goal-metadata-json",
+				metadata,
+			],
+			root,
+		);
+		await runNativeUltragoalCommand(["complete-goals"], root);
+		const overlap = await runNativeUltragoalCommand(
+			[
+				"start-pipeline-overlap",
+				"--prior-goal-id",
+				"G001",
+				"--next-goal-id",
+				"G002",
+				"--review-handles-json",
+				JSON.stringify([{ id: "review" }]),
+				"--qa-handles-json",
+				JSON.stringify([{ id: "qa" }]),
+				"--implementation-handle-json",
+				JSON.stringify({ id: "impl" }),
+			],
+			root,
+		);
+
+		expect(create.status).toBe(0);
+		expect(overlap.status).toBe(1);
+		expect(overlap.stderr).toContain("aggregate ultragoal mode");
+	});
+
+	it("fails closed for open and quarantined pipeline checkpoints", async () => {
+		const root = await tempDir();
+		const metadata = JSON.stringify([
+			{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", independentOf: ["G002"], targets: { files: ["a.ts"], surfaces: ["a"] } },
+			{ schemaVersion: 1, goalId: "G002", source: "original_plan_graph", independentOf: ["G001"], targets: { files: ["b.ts"], surfaces: ["b"] } },
+		]);
+		await runNativeUltragoalCommand(
+			["create-goals", "--brief", "@goal: A\na\n@goal: B\nb", "--goal-metadata-json", metadata],
+			root,
+		);
+		await runNativeUltragoalCommand(["complete-goals"], root);
+		const start = await runNativeUltragoalCommand(
+			[
+				"start-pipeline-overlap",
+				"--prior-goal-id",
+				"G001",
+				"--next-goal-id",
+				"G002",
+				"--review-handles-json",
+				JSON.stringify([{ id: "review" }]),
+				"--qa-handles-json",
+				JSON.stringify([{ id: "qa" }]),
+				"--implementation-handle-json",
+				JSON.stringify({ id: "impl" }),
+				"--json",
+			],
+			root,
+		);
+		const overlapId = JSON.parse(start.stdout ?? "{}").overlap_id as string;
+		const openCheckpoint = await runNativeUltragoalCommand(
+			["checkpoint", "--goal-id", "G001", "--status", "complete", "--evidence", "tests passed"],
+			root,
+		);
+		const join = await runNativeUltragoalCommand(
+			[
+				"join-pipeline-overlap",
+				"--overlap-id",
+				overlapId,
+				"--review-result-json",
+				JSON.stringify({ status: "failed", evidence: "review failed without structured blocker footprints", blockers: [] }),
+				"--qa-result-json",
+				JSON.stringify({ status: "passed", evidence: "qa passed", blockers: [] }),
+				"--json",
+			],
+			root,
+		);
+		const quarantinedCheckpoint = await runNativeUltragoalCommand(
+			["checkpoint", "--goal-id", "G002", "--status", "complete", "--evidence", "tests passed"],
+			root,
+		);
+		const rebaseline = await runNativeUltragoalCommand(
+			[
+				"rebaseline-pipeline-overlap",
+				"--overlap-id",
+				overlapId,
+				"--goal-id",
+				"G002",
+				"--evidence",
+				"Rebaselined quarantined G002 after rerunning focused verification successfully.",
+				"--target-state-json",
+				JSON.stringify({ files: ["b.ts"], surfaces: ["b"] }),
+				"--json",
+			],
+			root,
+		);
+		const plan = await readUltragoalPlan(root);
+
+		expect(openCheckpoint.status).toBe(1);
+		expect(openCheckpoint.stderr).toContain("pipeline overlap");
+		expect(join.status).toBe(0);
+		expect(JSON.parse(join.stdout ?? "{}")).toMatchObject({ event: "pipeline_overlap_quarantined", status: "quarantine_required" });
+		expect(quarantinedCheckpoint.status).toBe(1);
+		expect(quarantinedCheckpoint.stderr).toContain("requires rebaseline");
+		expect(rebaseline.status).toBe(0);
+		expect(plan?.goals.find(goal => goal.id === "G002")?.pipelineMetadata?.overlap).toBe("rebaseline_complete");
+	});
+
+	it("clean joins permit prior checkpoint without starting a third goal", async () => {
+		const root = await tempDir();
+		const metadata = JSON.stringify([
+			{ schemaVersion: 1, goalId: "G001", source: "original_plan_graph", independentOf: ["G002"], targets: { files: ["packages"], surfaces: ["a"] } },
+			{ schemaVersion: 1, goalId: "G002", source: "original_plan_graph", independentOf: ["G001"], targets: { files: ["b.ts"], surfaces: ["b"] } },
+			{ schemaVersion: 1, goalId: "G003", source: "original_plan_graph", independentOf: [], targets: { files: ["c.ts"], surfaces: ["c"] } },
+		]);
+		await runNativeUltragoalCommand(
+			["create-goals", "--brief", "@goal: A\na\n@goal: B\nb\n@goal: C\nc", "--goal-metadata-json", metadata],
+			root,
+		);
+		await runNativeUltragoalCommand(["complete-goals"], root);
+		const start = await runNativeUltragoalCommand(
+			[
+				"start-pipeline-overlap",
+				"--prior-goal-id",
+				"G001",
+				"--next-goal-id",
+				"G002",
+				"--review-handles-json",
+				JSON.stringify([{ id: "review" }]),
+				"--qa-handles-json",
+				JSON.stringify([{ id: "qa" }]),
+				"--implementation-handle-json",
+				JSON.stringify({ id: "impl" }),
+				"--json",
+			],
+			root,
+		);
+		const overlapId = JSON.parse(start.stdout ?? "{}").overlap_id as string;
+		const secondOverlap = await runNativeUltragoalCommand(
+			[
+				"start-pipeline-overlap",
+				"--prior-goal-id",
+				"G002",
+				"--next-goal-id",
+				"G003",
+				"--review-handles-json",
+				JSON.stringify([{ id: "review-2" }]),
+				"--qa-handles-json",
+				JSON.stringify([{ id: "qa-2" }]),
+				"--implementation-handle-json",
+				JSON.stringify({ id: "impl-2" }),
+			],
+			root,
+		);
+		const join = await runNativeUltragoalCommand(
+			[
+				"join-pipeline-overlap",
+				"--overlap-id",
+				overlapId,
+				"--review-result-json",
+				JSON.stringify({ status: "passed", handleIds: ["review"], evidence: "Architect review passed with complete clean join evidence.", blockers: [] }),
+				"--qa-result-json",
+				JSON.stringify({ status: "passed", handleIds: ["qa"], evidence: "Executor QA passed with complete clean join evidence.", blockers: [] }),
+				"--json",
+			],
+			root,
+		);
+		const checkpoint = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"pipeline prior goal verified cleanly",
+				"--quality-gate-json",
+				await passingLiveQualityGate(root),
+				"--json",
+			],
+			root,
+		);
+		const receipt = JSON.parse(checkpoint.stdout ?? "{}");
+		const plan = await readUltragoalPlan(root);
+
+		expect(secondOverlap.status).toBe(1);
+		expect(secondOverlap.stderr).toContain("another overlap is already open");
+		expect(join.status).toBe(0);
+		expect(JSON.parse(join.stdout ?? "{}")).toMatchObject({ event: "pipeline_overlap_joined", status: "joined_clean" });
+		expect(checkpoint.status).toBe(0);
+		expect(receipt).toMatchObject({ goal_id: "G001", all_complete: false, next_goal_id: "G002", next_goal_status: "active", started_next: false });
+		expect(plan?.goals.map(goal => [goal.id, goal.status])).toEqual([
+			["G001", "complete"],
+			["G002", "active"],
+			["G003", "pending"],
+		]);
+	});
+
 	it("prints receipt-only json for complete-goals", async () => {
 		const root = await tempDir();
 		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });

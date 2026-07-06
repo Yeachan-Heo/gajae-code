@@ -192,6 +192,43 @@ If an Ultragoal request has no approved plan or consensus artifact, run `ralplan
 
 The Ultragoal leader owns `.gjc/_session-{sessionid}/ultragoal/goals.json` and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`. Role agents return implementation/review evidence; they do not checkpoint Ultragoal or mutate goal state.
 
+### Native executor parallelism contract
+
+Native subagent parallelism is a contract for bounded `executor` delegation, not a runtime scheduler and not a Team-mode rule:
+
+- **MUST use native `executor` parallelism** when a story meets the big-scope delegation threshold above and decomposes into independent implementation slices that can be bounded by per-slice coordination contracts.
+- **SHOULD prefer parallel `executor` subagents** for independent files/surfaces, and sequence only real dependencies, unsafe shared-file overlap, sub-threshold trivial work, or work that lacks a safe contract.
+- Worker agents **MUST NOT mutate `.gjc/_session-{sessionid}/ultragoal`**, call goal tools, make checkpoint decisions, own integration, or own final verification. The Ultragoal leader keeps those responsibilities.
+
+Before workers start, each per-slice coordination contract MUST name the target files/surfaces, independence assumptions, allowed coordination channel, conflict-escalation rule, expected evidence, and terminal status. Conflict or assignment changes remain leader-owned and must be auditable through durable ledger evidence.
+
+For failed, timed-out, or contract-violating slices, record durable ledger evidence; preserve successful terminal slices only when safe; and reassign, retry, or collapse the invalid work to serial execution under an updated contract. Completion after parallel work still requires terminal worker evidence, leader integration, targeted verification, and the existing cleaner + architect + executor QA/red-team gate before checkpoint complete.
+
+### Runtime-backed pipelined scheduling
+
+Sequential execution remains the default. Ultragoal may use runtime-backed pipelined scheduling only when `goals.json` metadata proves original-plan independence and disjoint target files/surfaces for the prior and next goals. This is a leader-owned Ultragoal runtime contract, not hidden Team scheduling and not a substitute for the native executor parallelism contract above.
+
+Pipeline metadata is explicit-only: create eligible goals with `gjc ultragoal create-goals --goal-metadata-json '<json>'` or the equivalent runtime `createUltragoalPlan({ goalMetadata })` input. Brief-only or missing metadata remains valid but non-eligible and falls back to ordinary sequential scheduling. The initial pipeline contract is **aggregate mode only**; per-story mode remains sequential until a separate UX/state contract exists.
+
+Use the lifecycle commands exactly when runtime metadata proves safety:
+
+```sh
+gjc ultragoal start-pipeline-overlap --prior-goal-id G001 --next-goal-id G002 --review-handles-json '<json>' --qa-handles-json '<json>' --implementation-handle-json '<json>' --json
+gjc ultragoal join-pipeline-overlap --overlap-id <id> --review-result-json '<json>' --qa-result-json '<json>' --json
+gjc ultragoal rebaseline-pipeline-overlap --overlap-id <id> --goal-id G002 --evidence "<evidence>" --target-state-json '<json>' --json
+```
+
+Runtime-backed pipelining is deliberately narrow:
+
+- At most one eligible next goal may overlap the current goal's review/QA join window.
+- G(N) remains active until `join-pipeline-overlap` records a clean join; do not checkpoint G(N) complete before clean join evidence exists.
+- `start-pipeline-overlap` must fail closed for missing metadata, one-sided independence, shared target files/surfaces, stale metadata hashes, missing handles, another open overlap, or per-story mode.
+- `join-pipeline-overlap` must fail closed for missing lane evidence or unresolved blockers. Continue G(N+1) only when structured blocker footprints are disjoint from G(N+1) targets; otherwise quarantine and re-baseline with `rebaseline-pipeline-overlap` before G(N+1) can complete.
+- Complete checkpoints must fail closed for open overlaps, missing clean joins, stale metadata, quarantined next goals, shared or unattributable change-set paths, and any missing pipeline evidence.
+- After a crash or lost live handles, the leader reruns review/QA lanes and joins with replacement evidence when metadata hashes still match; otherwise quarantine and re-baseline. Ultragoal must not auto-start G(N+2) during recovery.
+
+Team remains explicit and separate: Team is not auto-launched, not a hidden pipeline scheduler, and never owns Ultragoal goals, checkpoints, or ledger state.
+
 ## Use Ultragoal and Team together
 
 Use ultragoal and team together for a durable Ultragoal story that benefits from one visible tmux worker session. Ultragoal remains leader-owned: `.gjc/_session-{sessionid}/ultragoal/goals.json` stores the story plan and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` stores checkpoints. Team is the single-worker tmux execution engine and returns task/evidence status to the leader.

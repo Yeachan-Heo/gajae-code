@@ -312,6 +312,35 @@ Project executor override body.
 		expect(ultragoal).toContain("the subagent has actually failed");
 		expect(ultragoal).toContain("gone off-track");
 		expect(ultragoal).toContain("become unrecoverably wrong");
+		expect(ultragoal).toContain("Native executor parallelism contract");
+		expect(ultragoal).toContain("MUST use native `executor` parallelism");
+		expect(ultragoal).toContain("SHOULD prefer parallel `executor` subagents");
+		expect(ultragoal).toContain("MUST NOT mutate `.gjc/_session-{sessionid}/ultragoal`");
+		expect(ultragoal).toContain("target files/surfaces");
+		expect(ultragoal).toContain("independence assumptions");
+		expect(ultragoal).toContain("allowed coordination channel");
+		expect(ultragoal).toContain("conflict-escalation rule");
+		expect(ultragoal).toContain("expected evidence");
+		expect(ultragoal).toContain("terminal status");
+		expect(ultragoal).toContain("failed, timed-out, or contract-violating slices");
+		expect(ultragoal).toContain("durable ledger evidence");
+		expect(ultragoal).toContain("reassign, retry, or collapse");
+		expect(ultragoal).toContain("targeted verification");
+		expect(ultragoal).toContain("cleaner + architect + executor QA/red-team gate");
+		expect(ultragoal).toContain("Runtime-backed pipelined scheduling");
+		expect(ultragoal).toContain("--goal-metadata-json");
+		expect(ultragoal).toContain("start-pipeline-overlap");
+		expect(ultragoal).toContain("join-pipeline-overlap");
+		expect(ultragoal).toContain("rebaseline-pipeline-overlap");
+		expect(ultragoal).toContain("At most one eligible next goal");
+		expect(ultragoal).toContain("aggregate mode only");
+		expect(ultragoal).toContain("G(N) remains active");
+		expect(ultragoal).toContain("clean join");
+		expect(ultragoal).toContain("quarantine and re-baseline");
+		expect(ultragoal).toContain("unattributable change-set paths");
+		expect(ultragoal).toContain("fail closed");
+		expect(ultragoal).toContain("Team is not auto-launched");
+		expect(ultragoal).toContain("not a hidden pipeline scheduler");
 	});
 
 	it("routes simple clear implementation requests directly without contradictory workflow escalation", async () => {
