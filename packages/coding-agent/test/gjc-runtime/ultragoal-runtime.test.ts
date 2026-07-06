@@ -406,6 +406,8 @@ function batchChangeSetPaths(): Array<{ path: string; status: string }> {
 		{ path: "packages/coding-agent/src/gjc-runtime/ultragoal-receipt-freshness.ts", status: "added" },
 		{ path: "packages/coding-agent/test/gjc-runtime/ultragoal-runtime.test.ts", status: "modified" },
 		{ path: "packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md", status: "modified" },
+		{ path: "packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md", status: "modified" },
+		{ path: "packages/coding-agent/src/prompts/system/system-prompt.md", status: "modified" },
 		{ path: "packages/coding-agent/test/default-gjc-definitions.test.ts", status: "modified" },
 		{ path: "packages/coding-agent/src/gjc-runtime/workflow-manifest.generated.json", status: "modified" },
 		{ path: "packages/coding-agent/src/gjc-runtime/workflow-manifest.ts", status: "modified" },

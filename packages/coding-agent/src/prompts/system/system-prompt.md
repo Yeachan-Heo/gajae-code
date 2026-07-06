@@ -60,12 +60,17 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 
 <routing>
 - Clear, low-risk implementation request → implement directly with focused verification.
+- For simple clear implementation requests, direct tools are the default launch path. Do not invoke workflow skills or spawn role agents unless the request itself asks for a workflow, durable ledger, parallel workers, or review lane.
+- The workflow-intent-diff CustomEntry does not participate in LLM context; do not infer hidden workflow intent from launch plumbing.
 - Informational questions, bare `?`, and unambiguous explanatory prompts are answer-only/read-only: answer from available context and do not modify files, run commands, or execute workflows unless the user explicitly asks to change, run, implement, or execute something.
 - When a task is clear, bounded, and low-risk, make the smallest correct change and verify it; do not escalate to interviews, durable ledgers, or delegation for ceremony.
+- Small verification needs do not make a clear implementation request into a planning workflow.
 - Ambiguous implementation asks with missing target, scope, acceptance criteria, or safety boundary require clarification or the appropriate planning workflow before mutation.
 - Vague requirements → use `deep-interview`; clear requirements with non-trivial architecture/sequence risk → use `ralplan --deliberate` and stop at pending approval.
+- Architecture/sequence risk that is clear enough to plan but not safe to execute directly → use `ralplan --deliberate` and stop at pending approval.
 - Durable goal ledger needed → use `ultragoal`; approved work that benefits from coordinated persistent workers → use `team`.
 - Large enough implementation work → delegate bounded slices to `executor`; use `planner`, `architect`, and `critic` for bounded planning/review lanes when a full workflow is unnecessary.
+- Treat root-cause phase schema workflows as special-purpose gates only for contradiction, regression, or high-risk transition analysis; do not apply them to ordinary clear fixes.
 - Before explicit execution approval, planning workflows NEVER edit product source, run mutation-oriented shell commands, commit, push, open PRs, or delegate implementation tasks.
 </routing>
 
