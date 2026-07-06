@@ -1,19 +1,7 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { renderCliWriteReceipt } from "../gjc-runtime/cli-write-receipt";
 import { renderTeamStatusMarkdown } from "../gjc-runtime/state-renderer";
-import {
-	buildTeamHudSummary,
-	executeGjcTeamApiOperation,
-	type GjcTeamSnapshot,
-	listGjcTeams,
-	monitorGjcTeamSnapshot,
-	parseTeamLaunchArgs,
-	persistGjcTeamModeStateSummary,
-	readGjcTeamEvents,
-	readGjcTeamSnapshot,
-	shutdownGjcTeam,
-	startGjcTeam,
-} from "../gjc-runtime/team-runtime";
+import type { GjcTeamSnapshot } from "../gjc-runtime/team-runtime";
 import { syncSkillActiveState } from "../skill-state/active-state";
 
 function writeJson(value: unknown): void {
@@ -25,6 +13,9 @@ function writeText(lines: string[]): void {
 }
 async function syncTeamHud(snapshot: GjcTeamSnapshot): Promise<void> {
 	try {
+		const { buildTeamHudSummary, persistGjcTeamModeStateSummary, readGjcTeamEvents } = await import(
+			"../gjc-runtime/team-runtime"
+		);
 		const events = await readGjcTeamEvents(snapshot.team_name);
 		await syncSkillActiveState({
 			cwd: process.cwd(),
@@ -111,6 +102,7 @@ export default class Team extends Command {
 		const dryRun = flags["dry-run"] ?? this.argv.includes("--dry-run");
 
 		if (action === "list") {
+			const { listGjcTeams } = await import("../gjc-runtime/team-runtime");
 			const teams = await listGjcTeams();
 			if (json) {
 				writeJson({ teams });
@@ -121,6 +113,7 @@ export default class Team extends Command {
 		}
 
 		if (action === "status") {
+			const { readGjcTeamSnapshot } = await import("../gjc-runtime/team-runtime");
 			const teamName = rest.find(arg => !arg.startsWith("--"));
 			if (!teamName) throw new Error("missing_team_name");
 			const snapshot = await readGjcTeamSnapshot(teamName);
@@ -137,6 +130,7 @@ export default class Team extends Command {
 		}
 
 		if (action === "monitor" || action === "resume") {
+			const { monitorGjcTeamSnapshot } = await import("../gjc-runtime/team-runtime");
 			const teamName = rest.find(arg => !arg.startsWith("--"));
 			if (!teamName) throw new Error("missing_team_name");
 			const snapshot = await monitorGjcTeamSnapshot(teamName);
@@ -154,6 +148,7 @@ export default class Team extends Command {
 		}
 
 		if (action === "shutdown") {
+			const { shutdownGjcTeam } = await import("../gjc-runtime/team-runtime");
 			const teamName = rest.find(arg => !arg.startsWith("--"));
 			if (!teamName) throw new Error("missing_team_name");
 			const snapshot = await shutdownGjcTeam(teamName);
@@ -182,6 +177,7 @@ export default class Team extends Command {
 				]);
 				return;
 			}
+			const { executeGjcTeamApiOperation, readGjcTeamSnapshot } = await import("../gjc-runtime/team-runtime");
 			const input = parseInputFlag(rest);
 			const result = await executeGjcTeamApiOperation(operation, input);
 			const teamName = String(input.team_name ?? input.teamName ?? "").trim();
@@ -196,6 +192,7 @@ export default class Team extends Command {
 			return;
 		}
 
+		const { parseTeamLaunchArgs, startGjcTeam } = await import("../gjc-runtime/team-runtime");
 		const startArgs = action === "start" ? rest : this.argv;
 		const options = parseTeamLaunchArgs(startArgs);
 		const snapshot = await startGjcTeam({ ...options, dryRun });

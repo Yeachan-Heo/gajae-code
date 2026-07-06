@@ -5,6 +5,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} [prompt]             - Start an interactive coding session (default launch command)
   ${APP_NAME} launch               - Start an explicit launch/session workflow
   ${APP_NAME} setup                - Install GJC defaults or optional dependencies
+  ${APP_NAME} acp                  - Serve the Agent Client Protocol integration
   ${APP_NAME} session              - List, inspect, create, remove, or attach sessions
   ${APP_NAME} state                - Inspect or manage persisted GJC state
   ${APP_NAME} harness              - Run harness control-plane commands
@@ -21,11 +22,14 @@ export function getExtraHelpText(): string {
   ${APP_NAME} mcp                  - Manage MCP server registrations
   ${APP_NAME} mcp-serve            - Serve the MCP integration endpoint
   ${APP_NAME} contribute-pr        - Prepare contribution/PR workflow artifacts
+  ${APP_NAME} contribution-prep    - Alias for contribute-pr
   ${APP_NAME} migrate              - Run migration helpers
   ${APP_NAME} rlm                  - Run RLM helpers
   ${APP_NAME} update               - Update GJC installation artifacts
   ${APP_NAME} plugin               - Install, remove, and list plugins
+  ${APP_NAME} completion           - Generate shell completion specs
   ${APP_NAME} web-search           - Search the web from the CLI (alias: q)
+  ${APP_NAME} local-provider       - Run local provider helpers
   ${APP_NAME} codex-native-hook    - Run Codex native hook integration
   ${APP_NAME} gc                   - Run garbage-collection/cleanup helpers
   ${APP_NAME} <command> --help     - Show command-specific help
@@ -88,21 +92,10 @@ Environment Variables:
 
   For complete environment variable reference, see:
   docs/environment-variables.md
-Available Tools (default-enabled unless noted):
-  read          - Read file contents
-  bash          - Execute bash commands
-  edit          - Edit files with find/replace
-  write         - Write files (creates/overwrites)
-  grep          - Search file contents
-  find          - Find files by glob pattern
-  lsp           - Language server protocol (code intelligence)
-  python        - Execute Python code (requires: ${APP_NAME} setup python)
-  notebook      - Edit Jupyter notebooks
-  browser       - Browser automation (Puppeteer)
-  task          - Launch sub-agents for parallel tasks
-  todo_write    - Manage todo/task lists
-  web_search    - Search the web
-  ask           - Ask user questions (interactive mode only)
+Available Tools:
+  Essential at startup: read, bash, edit, write, search, find
+  Discoverable via search_tool_bm25: ask, ast_edit, ast_grep, browser, computer,
+    cron, debug, eval, job, lsp, monitor, task, todo_write, web_search
 
 Useful Commands:
   ${APP_NAME} --list-models        - List configured provider models

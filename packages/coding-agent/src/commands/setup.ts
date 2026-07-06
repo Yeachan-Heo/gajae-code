@@ -2,8 +2,7 @@
  * Install GJC defaults or optional feature dependencies.
  */
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import { runSetupCommand, type SetupCommandArgs, type SetupComponent } from "../cli/setup-cli";
-import { initTheme } from "../modes/theme/theme";
+import type { SetupCommandArgs, SetupComponent } from "../cli/setup-cli";
 
 const COMPONENTS: SetupComponent[] = [
 	"claude",
@@ -95,6 +94,25 @@ export default class Setup extends Command {
 				dryRun: flags["dry-run"],
 			},
 		};
+		if (cmd.component === "defaults") {
+			const { installDefaultGjcDefinitions } = await import("../defaults/gjc-defaults");
+			const result = await installDefaultGjcDefinitions({ check: flags.check, force: flags.force });
+			if (flags.json) {
+				process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+			} else {
+				process.stdout.write(
+					`${[
+						`Default GJC workflow skills ${flags.check ? "checked" : "installed"}`,
+						`Target: ${result.targetRoot}`,
+						`Written: ${result.written}; skipped: ${result.skipped}; matching: ${result.matching}`,
+					].join("\n")}\n`,
+				);
+			}
+			if (flags.check && (result.missing > 0 || result.different > 0)) process.exitCode = 1;
+			return;
+		}
+		const { initTheme } = await import("../modes/theme/theme");
+		const { runSetupCommand } = await import("../cli/setup-cli");
 		await initTheme();
 		await runSetupCommand(cmd);
 	}

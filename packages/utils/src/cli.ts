@@ -407,8 +407,7 @@ export async function run(opts: RunOptions): Promise<void> {
 			const instance = new Cmd(commandArgv, config);
 			await instance.run();
 		} else {
-			const config = await loadAllCommands(opts);
-			renderCommandHelp(bin, entry.name, config.commands.get(entry.name) ?? Cmd);
+			renderCommandHelp(bin, entry.name, Cmd);
 		}
 		return;
 	}

@@ -152,6 +152,16 @@ describe("GJC inshellisense completion spec", () => {
 		expect(await Bun.file(path.join(dir, "index.js")).text()).toBe('export default ["git"];\n');
 	});
 
+	it("rejects an unrelated index that only mentions gjc outside the exported spec list", async () => {
+		const dir = await makeTempDir();
+		await Bun.write(path.join(dir, "index.js"), 'const note = "gjc";\nexport default ["git"];\n');
+
+		await expect(installGjcInshellisenseSpec(await buildGjcFigSpec(fakeEntries()), { dir })).rejects.toThrow(
+			/does not list gjc/,
+		);
+		expect(await Bun.file(path.join(dir, "index.js")).text()).toBe('const note = "gjc";\nexport default ["git"];\n');
+	});
+
 	it("overwrites an unrelated index only when force is explicit", async () => {
 		const dir = await makeTempDir();
 		await Bun.write(path.join(dir, "index.js"), 'export default ["git"];\n');

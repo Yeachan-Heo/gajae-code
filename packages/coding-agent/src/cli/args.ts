@@ -1,11 +1,47 @@
 /**
  * CLI argument parsing and help display
  */
-import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai";
-import { APP_NAME, CONFIG_DIR_NAME, logger } from "@gajae-code/utils";
+import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
+import { APP_NAME, CONFIG_DIR_NAME } from "@gajae-code/utils/dirs";
+import { warn as logWarn } from "@gajae-code/utils/logger";
 import chalk from "chalk";
 import { parseEffort } from "../thinking";
-import { BUILTIN_TOOLS } from "../tools";
+
+const VALID_TOOL_NAMES = new Set([
+	"read",
+	"bash",
+	"edit",
+	"ast_grep",
+	"ast_edit",
+	"render_mermaid",
+	"ask",
+	"debug",
+	"eval",
+	"calc",
+	"ssh",
+	"github",
+	"find",
+	"search",
+	"lsp",
+	"browser",
+	...(process.platform !== "win32" ? ["computer"] : []),
+	"checkpoint",
+	"rewind",
+	"task",
+	"subagent",
+	"job",
+	"monitor",
+	"cron",
+	"recipe",
+	"irc",
+	"todo_write",
+	"web_search",
+	"search_tool_bm25",
+	"telegram_send",
+	"write",
+	"skill",
+	"goal",
+]);
 
 export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui" | "bridge";
 
@@ -165,12 +201,12 @@ export function parseArgs(args: string[]): Args {
 				.filter(Boolean);
 			const validTools: string[] = [];
 			for (const name of toolNames) {
-				if (name in BUILTIN_TOOLS) {
+				if (VALID_TOOL_NAMES.has(name)) {
 					validTools.push(name);
 				} else {
-					logger.warn("Unknown tool passed to --tools", {
+					logWarn("Unknown tool passed to --tools", {
 						tool: name,
-						validTools: Object.keys(BUILTIN_TOOLS),
+						validTools: [...VALID_TOOL_NAMES],
 					});
 				}
 			}
@@ -181,7 +217,7 @@ export function parseArgs(args: string[]): Args {
 			if (thinking !== undefined) {
 				result.thinking = thinking;
 			} else {
-				logger.warn("Invalid thinking level passed to --thinking", {
+				logWarn("Invalid thinking level passed to --thinking", {
 					level: rawThinking,
 					validThinkingLevels: THINKING_EFFORTS,
 				});
@@ -274,21 +310,10 @@ export function getExtraHelpText(): string {
 
   For complete environment variable reference, see:
   ${chalk.dim("docs/environment-variables.md")}
-${chalk.bold("Available Tools (default-enabled unless noted):")}
-  read          - Read file contents
-  bash          - Execute bash commands
-  edit          - Edit files with find/replace
-  write         - Write files (creates/overwrites)
-  grep          - Search file contents
-  find          - Find files by glob pattern
-  lsp           - Language server protocol (code intelligence)
-  python        - Execute Python code (requires: ${APP_NAME} setup python)
-  notebook      - Edit Jupyter notebooks
-  browser       - Browser automation (Puppeteer)
-  task          - Launch sub-agents for parallel tasks
-  todo_write    - Manage todo/task lists
-  web_search    - Search the web
-  ask           - Ask user questions (interactive mode only)
+${chalk.bold("Available Tools:")}
+  Essential at startup: read, bash, edit, write, search, find
+  Discoverable via search_tool_bm25: ask, ast_edit, ast_grep, browser, computer,
+    cron, debug, eval, job, lsp, monitor, task, todo_write, web_search
 
 ${chalk.bold("Useful Commands:")}
   ${APP_NAME} --list-models        - List configured provider models

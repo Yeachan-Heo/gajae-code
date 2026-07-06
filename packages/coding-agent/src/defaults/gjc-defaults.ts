@@ -1,5 +1,7 @@
 import * as path from "node:path";
-import { getAgentDir, isEnoent, parseFrontmatter } from "@gajae-code/utils";
+import { getAgentDir } from "@gajae-code/utils/dirs";
+import { parseFrontmatter } from "@gajae-code/utils/frontmatter";
+import { isEnoent } from "@gajae-code/utils/fs-error";
 import autoAnswerUncertainFragment from "./gjc/skills/deep-interview/auto-answer-uncertain.md" with { type: "text" };
 import autoResearchGreenfieldFragment from "./gjc/skills/deep-interview/auto-research-greenfield.md" with {
 	type: "text",

@@ -2,8 +2,7 @@
  * View usage statistics dashboard.
  */
 import { Command, Flags } from "@gajae-code/utils/cli";
-import { runStatsCommand, type StatsCommandArgs } from "../cli/stats-cli";
-import { initTheme } from "../modes/theme/theme";
+import type { StatsCommandArgs } from "../cli/stats-cli";
 
 export default class Stats extends Command {
 	static description = "View usage statistics";
@@ -23,6 +22,8 @@ export default class Stats extends Command {
 			summary: flags.summary,
 		};
 
+		const { initTheme } = await import("../modes/theme/theme");
+		const { runStatsCommand } = await import("../cli/stats-cli");
 		await initTheme();
 		await runStatsCommand(cmd);
 	}

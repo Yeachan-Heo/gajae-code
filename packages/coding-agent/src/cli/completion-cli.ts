@@ -199,7 +199,9 @@ async function fileTextIfExists(filePath: string): Promise<string | undefined> {
 }
 
 function indexDeclaresGjc(content: string): boolean {
-	return /["']gjc["']/.test(content);
+	const defaultArray = content.match(/\bexport\s+default\s+\[([\s\S]*?)\]\s*;?/m);
+	if (!defaultArray) return false;
+	return /["']gjc["']/.test(defaultArray[1]);
 }
 
 async function resolveIndexStatus(indexPath: string, force: boolean | undefined): Promise<InshellisenseIndexStatus> {

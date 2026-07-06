@@ -140,24 +140,6 @@ export default class Index extends Command {
 			description: `Set thinking level: ${THINKING_EFFORTS.join(", ")}`,
 			options: [...THINKING_EFFORTS],
 		}),
-		hook: Flags.string({
-			description: "Load a hook/extension file (can be used multiple times)",
-			multiple: true,
-		}),
-		extension: Flags.string({
-			char: "e",
-			description: "Load an extension file (can be used multiple times)",
-			multiple: true,
-		}),
-		"no-extensions": Flags.boolean({
-			description: "Disable extension discovery (explicit -e paths still work)",
-		}),
-		"no-skills": Flags.boolean({
-			description: "Disable skills discovery and loading",
-		}),
-		skills: Flags.string({
-			description: "Comma-separated glob patterns to filter skills (e.g., git-*,docker)",
-		}),
 		"no-rules": Flags.boolean({
 			description: "Disable rules discovery and loading",
 		}),

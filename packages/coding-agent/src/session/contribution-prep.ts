@@ -4,8 +4,6 @@ import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, ToolResultMessage, UserMessage } from "@gajae-code/ai";
 import { $ } from "bun";
-import { resolveGjcCommand } from "../task/gjc-command";
-import { shortenPath } from "../tools/render-utils";
 
 export const CONTRIBUTION_PREP_SCHEMA_VERSION = 1;
 
@@ -72,6 +70,11 @@ function replaceRegex(text: string, regex: RegExp, replacement: string, state: R
 	return text.replace(regex, replacement);
 }
 
+function shortenContributionPath(value: string): string {
+	const home = os.homedir();
+	return home && value.startsWith(home) ? `~${value.slice(home.length)}` : value;
+}
+
 export function redactContributionPrepText(
 	text: string,
 	cwd: string,
@@ -122,7 +125,7 @@ export function redactContributionPrepText(
 	const normalizedCwd = path.resolve(cwd);
 	if (normalizedCwd && redacted.includes(normalizedCwd)) {
 		state.labels.add("cwd_paths");
-		redacted = redacted.split(normalizedCwd).join(shortenPath(normalizedCwd));
+		redacted = redacted.split(normalizedCwd).join(shortenContributionPath(normalizedCwd));
 	}
 	return redacted;
 }
@@ -307,6 +310,7 @@ export async function prepareContributionPrep(
 				}
 				Bun.spawn(args, { cwd, stdout: "inherit", stderr: "inherit", stdin: "inherit" });
 			});
+		const { resolveGjcCommand } = await import("../task/gjc-command");
 		const command = resolveGjcCommand();
 		await spawn(
 			[command.cmd, ...command.args, "--no-skills", "--", `@${workerPromptPath}`],
