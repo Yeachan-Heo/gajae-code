@@ -71,6 +71,14 @@ async function batchTempDir(): Promise<string> {
 	return dir;
 }
 
+async function pipelineTempDir(): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-pipeline-"));
+	tempRoots.push(dir);
+	savedCiDevChangedPaths ??= { value: process.env.CI_DEV_CHANGED_PATHS };
+	process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/src/gjc-runtime/ultragoal-runtime.ts";
+	return dir;
+}
+
 afterEach(async () => {
 	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = savedSessionId;
@@ -1940,7 +1948,7 @@ describe("native GJC ultragoal runtime", () => {
 	});
 
 	it("clean joins permit prior checkpoint without starting a third goal", async () => {
-		const root = await tempDir();
+		const root = await pipelineTempDir();
 		const metadata = JSON.stringify([
 			{
 				schemaVersion: 1,
