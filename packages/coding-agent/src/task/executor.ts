@@ -253,17 +253,21 @@ const PLACEHOLDER_YIELD_PATTERNS = [
 ];
 
 const PLACEHOLDER_YIELD_FIELD_NAMES = new Set([
-	"artifact_markdown",
-	"final_markdown",
-	"full_plan",
+	"artifactmarkdown",
+	"finalmarkdown",
+	"fullplan",
 	"markdown",
-	"plan_markdown",
+	"planmarkdown",
 ]);
 
 function looksLikePlaceholderYieldString(value: string): boolean {
 	const trimmed = value.trim();
 	if (trimmed.length === 0 || trimmed.length > 500) return false;
 	return PLACEHOLDER_YIELD_PATTERNS.some(pattern => pattern.test(trimmed));
+}
+
+function normalizePlaceholderYieldFieldName(key: string): string {
+	return key.replace(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
 function findPlaceholderYieldPath(value: unknown, path = "$", depth = 0, inspectStrings = true): string | undefined {
@@ -280,7 +284,7 @@ function findPlaceholderYieldPath(value: unknown, path = "$", depth = 0, inspect
 	}
 	const record = value as Record<string, unknown>;
 	for (const [key, item] of Object.entries(record)) {
-		const shouldInspectString = PLACEHOLDER_YIELD_FIELD_NAMES.has(key);
+		const shouldInspectString = PLACEHOLDER_YIELD_FIELD_NAMES.has(normalizePlaceholderYieldFieldName(key));
 		const found = findPlaceholderYieldPath(item, `${path}.${key}`, depth + 1, shouldInspectString);
 		if (found) return found;
 	}

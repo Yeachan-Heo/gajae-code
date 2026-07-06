@@ -7,6 +7,9 @@ import {
 } from "../../src/task/executor";
 
 describe("subagent warning injection", () => {
+	const placeholderPlanText =
+		"See message body — complete plan returned inline per caller instruction (leader persists).";
+
 	it("injects null-data warning when yield is success without data", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: "partial output",
@@ -128,7 +131,7 @@ describe("subagent warning injection", () => {
 				{
 					status: "success",
 					data: {
-						plan_markdown: "See message body — complete plan returned inline per caller instruction (leader persists).",
+						plan_markdown: placeholderPlanText,
 					},
 				},
 			],
@@ -169,7 +172,7 @@ describe("subagent warning injection", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: JSON.stringify({
 				data: {
-					plan_markdown: "See message body — complete plan returned inline per caller instruction (leader persists).",
+					planMarkdown: placeholderPlanText,
 				},
 			}),
 			exitCode: 0,
@@ -182,7 +185,7 @@ describe("subagent warning injection", () => {
 
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain(SUBAGENT_WARNING_PLACEHOLDER_YIELD);
-		expect(result.stderr).toContain("$.plan_markdown");
+		expect(result.stderr).toContain("$.planMarkdown");
 		expect(result.rawOutput).toContain('"error": "schema_violation"');
 	});
 
