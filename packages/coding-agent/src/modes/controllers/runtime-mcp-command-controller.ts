@@ -7,7 +7,12 @@ import * as path from "node:path";
 import { Spacer, Text } from "@gajae-code/tui";
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
-import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
+import {
+	analyzeAuthError,
+	buildTrustGatedMCPDiscoverOptions,
+	discoverOAuthEndpoints,
+	MCPManager,
+} from "../../runtime-mcp";
 import { connectToServer, disconnectServer, listTools } from "../../runtime-mcp/client";
 import {
 	addMCPServer,
@@ -1253,6 +1258,32 @@ export class MCPCommandController {
 			await updateMCPServer(found.filePath, name, updated);
 			await this.#reloadMCP();
 
+			// The gated reload only reconnects trust-eligible servers. Enabling a
+			// project server while mcp.enableProjectConfig is off must not connect
+			// it; say so instead of showing a misleading connection failure.
+			const projectGateClosed = found.scope === "project" && !this.ctx.settings.get("mcp.enableProjectConfig");
+			if (enabled && projectGateClosed) {
+				this.#showMessage(
+					[
+						"",
+						theme.fg("success", `✓ Enabled "${name}" (${found.scope} config)`),
+						"",
+						theme.fg(
+							"warning",
+							"  Project MCP config is disabled; the server stays disconnected until you enable the mcp.enableProjectConfig setting.",
+						),
+						"",
+					].join("\n"),
+				);
+				return;
+			}
+
+			// autoload:false servers are excluded from the gated reload by design.
+			// /mcp enable names this server explicitly, so connect it directly.
+			if (enabled && updated.autoload === false) {
+				await this.#syncManagerConnection(name, updated);
+			}
+
 			let status = "";
 			if (enabled) {
 				const state = await this.#waitForServerConnectionWithAnimation(name);
@@ -1444,7 +1475,13 @@ export class MCPCommandController {
 	}
 
 	/**
-	 * Reload MCP manager with new configs
+	 * Reload MCP manager with new configs.
+	 *
+	 * Reload applies the same trust gates as session startup (`sdk.ts`): it
+	 * never connects project-config servers while `mcp.enableProjectConfig`
+	 * is off and never implicitly connects `autoload: false` servers.
+	 * Explicit per-server commands (`/mcp enable`, `/mcp reconnect`) remain
+	 * the user-consent path for gated servers.
 	 */
 	async #reloadMCP(): Promise<void> {
 		if (!this.ctx.mcpManager) {
@@ -1454,8 +1491,13 @@ export class MCPCommandController {
 		// Disconnect all existing servers
 		await this.ctx.mcpManager.disconnectAll();
 
-		// Rediscover and connect
-		const result = await this.ctx.mcpManager.discoverAndConnect();
+		// Rediscover and connect with startup-parity trust gates
+		const result = await this.ctx.mcpManager.discoverAndConnect(
+			buildTrustGatedMCPDiscoverOptions({
+				enableProjectConfig: this.ctx.settings.get("mcp.enableProjectConfig"),
+				browserEnabled: this.ctx.settings.get("browser.enabled"),
+			}),
+		);
 		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
 
 		// Show any connection errors
