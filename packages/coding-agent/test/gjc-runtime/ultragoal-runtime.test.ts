@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
 import {
@@ -1056,6 +1057,54 @@ describe("native GJC ultragoal runtime", () => {
 		await expect(readUltragoalPlan(root)).rejects.toThrow("Goal G001 has stale validation batch metadata hash");
 	});
 
+	it("validation batch deferred: uses CI changed paths when git diff is unavailable", async () => {
+		const savedChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-ci-paths-"));
+		tempRoots.push(root);
+		process.env.CI_DEV_CHANGED_PATHS = batchChangeSetPaths()
+			.map(row => row.path)
+			.join("\n");
+		try {
+			await writeStructuralArtifacts(root);
+			const plan = await createUltragoalPlan({
+				cwd: root,
+				brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
+				validationBatches: [
+					{ schemaVersion: 1, batchId: "VB001", memberIds: ["G001", "G002", "G003"], finalGoalId: "G003" },
+				],
+			});
+			await startNextUltragoalGoal({ cwd: root });
+			const uncovered = JSON.parse(deferredBatchGate("G001", plan.goals[0]!.validationBatch!));
+			uncovered.deferredToBatch.changeSet.paths = [
+				{ path: "packages/coding-agent/src/gjc-runtime/ultragoal-runtime.ts", status: "modified" },
+			];
+			uncovered.deferredToBatch.changeSet.changeSetHash = hashStructuredValue(
+				uncovered.deferredToBatch.changeSet.paths.map((row: Record<string, unknown>) => ({
+					...row,
+					oldPath: undefined,
+				})),
+			);
+			await expect(
+				checkpointUltragoalGoal({
+					cwd: root,
+					goalId: "G001",
+					status: "complete",
+					evidence: "uncovered path",
+					qualityGateJson: JSON.stringify(uncovered),
+				}),
+			).rejects.toThrow("does not cover computed checkpoint change-set path");
+			await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "targeted verification passed",
+				qualityGateJson: deferredBatchGate("G001", plan.goals[0]!.validationBatch!),
+			});
+		} finally {
+			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;
+		}
+	});
 	it("validation batch deferred: accepts deferred gate and rejects strict keys/uncovered paths", async () => {
 		const root = await tempDir();
 		await writeStructuralArtifacts(root);

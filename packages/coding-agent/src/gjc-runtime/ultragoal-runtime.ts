@@ -3410,11 +3410,13 @@ function requireChangeSetCoverage(
 	fieldName: string,
 ): void {
 	if (!expected) return;
-	const declaredKeys = new Set(declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`));
+	const declaredExactKeys = new Set(declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`));
+	const declaredPathKeys = new Set(declared.map(row => `${row.oldPath ?? ""}\u0000${row.path}`));
 	for (const row of expected.paths) {
-		const key = `${row.oldPath ?? ""}\u0000${row.path}\u0000${row.status}`;
-		if (!declaredKeys.has(key))
-			throw new Error(`${fieldName} does not cover computed checkpoint change-set path ${row.path}`);
+		const pathKey = `${row.oldPath ?? ""}\u0000${row.path}`;
+		const exactKey = `${pathKey}\u0000${row.status}`;
+		const covered = row.status === "unknown" ? declaredPathKeys.has(pathKey) : declaredExactKeys.has(exactKey);
+		if (!covered) throw new Error(`${fieldName} does not cover computed checkpoint change-set path ${row.path}`);
 	}
 }
 
@@ -4487,6 +4489,20 @@ function parseGitNameStatus(output: string): UltragoalChangeSetPath[] {
 	return rows;
 }
 
+function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
+	const raw = process.env.CI_DEV_CHANGED_PATHS;
+	if (!raw) return [];
+	return raw
+		.split(/\r?\n/)
+		.map(row => row.trim())
+		.filter(Boolean)
+		.map(pathValue => ({
+			path: normalizeRepoPath(pathValue),
+			status: "unknown" as UltragoalChangeStatus,
+			category: categorizeComputerChangePath(pathValue),
+		}));
+}
+
 function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChangeSetPath[] {
 	const byKey = new Map<string, UltragoalChangeSetPath>();
 	for (const row of groups.flat()) byKey.set(`${row.oldPath ?? ""}\u0000${row.path}`, row);
@@ -4494,8 +4510,12 @@ function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChang
 }
 
 async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeSet | undefined> {
+	const ciChangedPaths = ciDevChangedPathRows();
 	const inGit = await spawnText(["git", "rev-parse", "--is-inside-work-tree"], { cwd, timeoutMs: 3000 });
-	if (!inGit.ok || inGit.stdout.trim() !== "true") return undefined;
+	if (!inGit.ok || inGit.stdout.trim() !== "true") {
+		if (ciChangedPaths.length === 0) return undefined;
+		return { source: "checkpoint-git", paths: ciChangedPaths, trusted: true };
+	}
 	const baseRef = await resolveGitBase(cwd);
 	const base = baseRef;
 	const mergeBase = await spawnText(["git", "merge-base", "HEAD", baseRef], { cwd, timeoutMs: 3000 });
@@ -4508,17 +4528,19 @@ async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeS
 		spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 	]);
-	if (!committed.ok && !unstaged.ok && !staged.ok) return undefined;
+	if (!committed.ok && !unstaged.ok && !staged.ok && ciChangedPaths.length === 0) return undefined;
+	const gitPaths = mergeChangeSetPaths([
+		parseGitNameStatus(committed.stdout),
+		parseGitNameStatus(unstaged.stdout),
+		parseGitNameStatus(staged.stdout),
+	]);
+	const paths = gitPaths.length > 0 ? gitPaths : ciChangedPaths;
 	return {
 		source: "checkpoint-git",
 		baseRef,
 		mergeBase: mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : undefined,
 		headRef: "HEAD",
-		paths: mergeChangeSetPaths([
-			parseGitNameStatus(committed.stdout),
-			parseGitNameStatus(unstaged.stdout),
-			parseGitNameStatus(staged.stdout),
-		]),
+		paths,
 		rawDiffStat: stat.stdout,
 		rawDiff: [committedDiff.stdout, unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n"),
 		trusted: true,
