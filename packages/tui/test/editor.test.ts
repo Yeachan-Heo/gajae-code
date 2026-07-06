@@ -737,6 +737,28 @@ describe("Editor component", () => {
 
 			expect(editor.getText()).toBe("foo\tbar");
 		});
+		it("splits embedded newlines inserted through insertText", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const changes: string[] = [];
+			editor.onChange = text => changes.push(text);
+
+			editor.insertText("a\nb");
+
+			expect(editor.getLines()).toEqual(["a", "b"]);
+			expect(editor.getCursor()).toEqual({ line: 1, col: 1 });
+			expect(changes).toEqual(["a\nb"]);
+		});
+
+		it("keeps suffix text after the final line when insertText inserts newlines mid-line", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("xz");
+			editor.handleInput("\x1b[D"); // Move between x and z
+
+			editor.insertText("a\r\nb\rc");
+
+			expect(editor.getLines()).toEqual(["xa", "b", "cz"]);
+			expect(editor.getCursor()).toEqual({ line: 2, col: 1 });
+		});
 
 		it("recomputes tab-containing input prefix width when the default tab width changes", () => {
 			try {

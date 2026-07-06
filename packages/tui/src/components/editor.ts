@@ -1819,18 +1819,7 @@ export class Editor implements Component, Focusable {
 	/** Insert text at the current cursor position */
 	insertText(text: string): void {
 		this.#exitHistoryForEditing();
-		this.#resetKillSequence();
-		this.#recordUndoState();
-
-		const line = this.#state.lines[this.#state.cursorLine] || "";
-		const inserted = insertTextNfcAt(line, this.#state.cursorCol, text);
-
-		this.#state.lines[this.#state.cursorLine] = inserted.line;
-		this.#setCursorCol(inserted.cursorCol);
-
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#insertTextAtCursor(text);
 	}
 
 	// All the editor methods from before...
