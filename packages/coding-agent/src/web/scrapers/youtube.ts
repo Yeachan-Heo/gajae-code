@@ -10,29 +10,38 @@ import { extractWithParallel, findParallelApiKey, getParallelExtractContent } fr
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, formatMediaDuration, formatNumber } from "./types";
 
-interface YouTubeUrl {
+export interface YouTubeUrl {
 	videoId: string;
 	playlistId?: string;
+}
+
+function isYouTubeHost(hostname: string): boolean {
+	return hostname === "youtube.com" || hostname === "m.youtube.com" || hostname === "music.youtube.com";
+}
+
+function isYouTubeEmbedHost(hostname: string): boolean {
+	return isYouTubeHost(hostname) || hostname === "youtube-nocookie.com";
 }
 
 /**
  * Parse YouTube URL into components
  */
-function parseYouTubeUrl(url: string): YouTubeUrl | null {
+export function parseYouTubeUrl(url: string): YouTubeUrl | null {
 	try {
 		const parsed = new URL(url);
 		const hostname = parsed.hostname.replace(/^www\./, "");
 
-		// youtube.com/watch?v=VIDEO_ID
-		if ((hostname === "youtube.com" || hostname === "m.youtube.com") && parsed.pathname === "/watch") {
+		// youtube.com/watch?v=VIDEO_ID and music.youtube.com/watch?v=VIDEO_ID
+		if (isYouTubeHost(hostname) && parsed.pathname === "/watch") {
 			const videoId = parsed.searchParams.get("v");
 			const playlistId = parsed.searchParams.get("list") || undefined;
-			if (videoId) return { videoId, playlistId };
+			if (videoId && /^[a-zA-Z0-9_-]{11}$/.test(videoId)) return { videoId, playlistId };
 		}
 
-		// youtube.com/v/VIDEO_ID or youtube.com/embed/VIDEO_ID
-		if (hostname === "youtube.com" || hostname === "m.youtube.com") {
-			const match = parsed.pathname.match(/^\/(v|embed)\/([a-zA-Z0-9_-]{11})/);
+		// youtube.com/v/VIDEO_ID, youtube.com/embed/VIDEO_ID, youtube.com/live/VIDEO_ID,
+		// and youtube-nocookie.com/embed/VIDEO_ID
+		if (isYouTubeEmbedHost(hostname)) {
+			const match = parsed.pathname.match(/^\/(v|embed|live)\/([a-zA-Z0-9_-]{11})/);
 			if (match) return { videoId: match[2] };
 		}
 
@@ -44,8 +53,8 @@ function parseYouTubeUrl(url: string): YouTubeUrl | null {
 			}
 		}
 
-		// youtube.com/shorts/VIDEO_ID
-		if (hostname === "youtube.com" && parsed.pathname.startsWith("/shorts/")) {
+		// youtube.com/shorts/VIDEO_ID and m.youtube.com/shorts/VIDEO_ID
+		if (isYouTubeHost(hostname) && parsed.pathname.startsWith("/shorts/")) {
 			const videoId = parsed.pathname.replace("/shorts/", "").split("/")[0];
 			if (videoId && /^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
 				return { videoId };

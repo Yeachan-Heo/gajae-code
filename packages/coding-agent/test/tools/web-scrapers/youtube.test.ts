@@ -1,7 +1,26 @@
 import { describe, expect, it } from "bun:test";
-import { handleYouTube } from "@gajae-code/coding-agent/web/scrapers/youtube";
+import { handleYouTube, parseYouTubeUrl } from "@gajae-code/coding-agent/web/scrapers/youtube";
 
 const SKIP = !Bun.env.WEB_FETCH_INTEGRATION;
+
+describe("parseYouTubeUrl", () => {
+	const cases = [
+		["youtube live URLs", "https://www.youtube.com/live/dQw4w9WgXcQ?si=share"],
+		["music.youtube.com watch URLs", "https://music.youtube.com/watch?v=dQw4w9WgXcQ"],
+		["youtube-nocookie embed URLs", "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"],
+		["mobile shorts URLs", "https://m.youtube.com/shorts/dQw4w9WgXcQ"],
+	] as const;
+
+	for (const [label, url] of cases) {
+		it(`parses ${label}`, () => {
+			expect(parseYouTubeUrl(url)?.videoId).toBe("dQw4w9WgXcQ");
+		});
+	}
+
+	it("rejects lookalike YouTube hosts", () => {
+		expect(parseYouTubeUrl("https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ")).toBeNull();
+	});
+});
 
 describe.skipIf(SKIP)("handleYouTube", () => {
 	it("returns null for non-YouTube URLs", async () => {
