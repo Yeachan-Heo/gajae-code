@@ -118,16 +118,13 @@ describe("fixture report", () => {
 	});
 });
 
-async function captureRun(
-	fixtureId: string,
-): Promise<{ stdout: string; stderr: string; exitCode: number | undefined }> {
+async function captureRun(fixtureId: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
 	const originalCwd = process.cwd();
 	const originalStdout = process.stdout.write.bind(process.stdout);
 	const originalStderr = process.stderr.write.bind(process.stderr);
-	const originalExit = process.exitCode;
+	let exitCode = 0;
 	let stdout = "";
 	let stderr = "";
-	process.exitCode = undefined;
 	process.stdout.write = ((chunk: string | Uint8Array): boolean => {
 		stdout += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8");
 		return true;
@@ -137,13 +134,12 @@ async function captureRun(
 		return true;
 	}) as typeof process.stderr.write;
 	try {
-		await runFixtureReport(fixtureId);
-		return { stdout, stderr, exitCode: process.exitCode };
+		exitCode = await runFixtureReport(fixtureId);
+		return { stdout, stderr, exitCode };
 	} finally {
 		process.stdout.write = originalStdout;
 		process.stderr.write = originalStderr;
 		process.chdir(originalCwd);
-		process.exitCode = originalExit;
 	}
 }
 

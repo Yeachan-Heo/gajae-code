@@ -76,7 +76,7 @@ export function buildFixtureReport(fixtureId: string, logs: readonly TaskTokenLo
 	};
 }
 
-export async function runFixtureReport(fixtureId: string): Promise<void> {
+export async function runFixtureReport(fixtureId: string): Promise<number> {
 	let resolved: ResolvedFixtureLogs;
 	try {
 		resolved = await resolveFixtureLogs(fixtureId);
@@ -85,18 +85,17 @@ export async function runFixtureReport(fixtureId: string): Promise<void> {
 		process.stderr.write(
 			`failed to build fixture report for ${fixtureId}: ${error instanceof Error ? error.message : String(error)}\n`,
 		);
-		process.exitCode = 1;
-		return;
+		return 1;
 	}
 	if (resolved.kind === "unknown") {
 		// Neither a known deterministic fixture nor a resolvable GJC session. Emit a
 		// bounded error on stderr with a non-zero exit rather than a schema-valid
 		// all-zero report, which a before/after benchmark would misread as "0 tokens".
 		process.stderr.write(`unknown fixture id and no matching GJC session: ${fixtureId}\n`);
-		process.exitCode = 1;
-		return;
+		return 1;
 	}
 	process.stdout.write(JSON.stringify(buildFixtureReport(fixtureId, resolved.logs)));
+	return 0;
 }
 
 type ResolvedFixtureLogs =

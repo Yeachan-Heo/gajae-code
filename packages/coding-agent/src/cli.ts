@@ -256,7 +256,7 @@ export async function runCli(argv: string[]): Promise<void> {
 			process.exitCode = 1;
 			return;
 		}
-		await runFixtureReport(id);
+		process.exitCode = await runFixtureReport(id);
 		return;
 	}
 	if (hasRootHelpFlag(argv)) {
