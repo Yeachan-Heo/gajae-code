@@ -242,9 +242,12 @@ function dedupeExactContextFiles(
 }
 
 /**
- * Load all project context files using the capability API.
+ * Load all context files using the capability API.
  * Returns {path, content, depth} entries for all discovered context files.
- * Files are sorted by depth (descending) so files closer to cwd appear last/more prominent.
+ * Native user-global files (`~/.gjc/agent/AGENTS.md`) come first, then project
+ * files sorted by depth (descending) so files closer to cwd appear last/more
+ * prominent. User-home files from foreign providers (`~/.claude/CLAUDE.md`,
+ * `~/.codex/AGENTS.md`, …) stay excluded — only gjc's own user config applies.
  */
 export async function loadProjectContextFiles(
 	options: LoadContextFilesOptions = {},
@@ -252,28 +255,32 @@ export async function loadProjectContextFiles(
 	const resolvedCwd = options.cwd ?? getProjectDir();
 
 	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd });
+	const items = result.items as ContextFile[];
+
+	// Native user-global context applies everywhere and is least specific, so it
+	// renders first — project files rendered later take precedence over it.
+	const userFiles = items
+		.filter(item => item.level === "user" && item._source.provider === "native")
+		.map(item => ({ path: item.path, content: item.content }));
 
 	// Convert project-level ContextFile items and preserve depth info
-	const files = result.items
-		.filter(item => (item as ContextFile).level === "project")
-		.map(item => {
-			const contextFile = item as ContextFile;
-			return {
-				path: contextFile.path,
-				content: contextFile.content,
-				depth: contextFile.depth,
-			};
-		});
+	const projectFiles = items
+		.filter(item => item.level === "project")
+		.map(item => ({
+			path: item.path,
+			content: item.content,
+			depth: item.depth,
+		}));
 
 	// Sort by depth (descending): higher depth (farther from cwd) comes first,
 	// so files closer to cwd appear later and are more prominent
-	files.sort((a, b) => {
+	projectFiles.sort((a, b) => {
 		const depthA = a.depth ?? -1;
 		const depthB = b.depth ?? -1;
 		return depthB - depthA;
 	});
 
-	return dedupeExactContextFiles(files);
+	return dedupeExactContextFiles([...userFiles, ...projectFiles]);
 }
 
 /**
