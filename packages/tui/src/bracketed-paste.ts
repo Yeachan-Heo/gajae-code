@@ -23,15 +23,32 @@ export class BracketedPasteHandler {
 	 *          paste has been assembled; omitted when still buffering.
 	 */
 	process(data: string): PasteResult {
-		if (data.includes(PASTE_START)) {
-			this.#active = true;
+		if (!this.#active) {
+			const hadBufferedPrefix = this.#buffer.length > 0;
+			const combined = this.#buffer + data;
 			this.#buffer = "";
-			data = data.replace(PASTE_START, "");
+
+			const startIndex = combined.indexOf(PASTE_START);
+			if (startIndex === -1) {
+				if (PASTE_START.startsWith(combined)) {
+					this.#buffer = combined;
+					return { handled: true, remaining: "" };
+				}
+				if (hadBufferedPrefix) {
+					return { handled: true, remaining: combined };
+				}
+				return { handled: false };
+			}
+
+			if (startIndex > 0) {
+				return { handled: false };
+			}
+
+			this.#active = true;
+			this.#buffer = combined.slice(PASTE_START.length);
+		} else {
+			this.#buffer += data;
 		}
-
-		if (!this.#active) return { handled: false };
-
-		this.#buffer += data;
 
 		const endIndex = this.#buffer.indexOf(PASTE_END);
 		if (endIndex === -1) return { handled: true, remaining: "" };

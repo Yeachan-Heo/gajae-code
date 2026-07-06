@@ -2301,6 +2301,17 @@ describe("Editor component", () => {
 
 			expect(submitted).toBe(pastedText);
 		});
+
+		it("handles bracketed paste start markers split across input chunks", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("\x1b[200");
+			editor.handleInput("~hello");
+			expect(editor.getText()).toBe("");
+
+			editor.handleInput("\x1b[201~");
+			expect(editor.getText()).toBe("hello");
+		});
 	});
 
 	describe("Korean NFC paste normalization", () => {

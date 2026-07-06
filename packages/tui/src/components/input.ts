@@ -68,9 +68,9 @@ export class Input implements Component, Focusable {
 		if (paste.handled) {
 			if (paste.pasteContent !== undefined) {
 				this.#handlePaste(paste.pasteContent);
-				if (paste.remaining.length > 0) {
-					this.handleInput(paste.remaining);
-				}
+			}
+			if (paste.remaining.length > 0) {
+				this.handleInput(paste.remaining);
 			}
 			return;
 		}
