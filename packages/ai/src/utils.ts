@@ -215,7 +215,11 @@ function sanitizeOpenAIResponsesHistoryItemForReplay(
 	// providerPayload stores raw output items; replay strips fields that are output-only.
 	const { id: _id, ...itemWithoutId } = item;
 	const sanitizedItem =
-		item.type === "computer_call" ? sanitizeComputerCallForResponsesInput(itemWithoutId) : itemWithoutId;
+		item.type === "computer_call"
+			? sanitizeComputerCallForResponsesInput(itemWithoutId)
+			: item.type === "image_generation_call"
+				? sanitizeImageGenerationCallForResponsesInput(itemWithoutId)
+				: itemWithoutId;
 	if (typeof item.call_id === "string") {
 		sanitizedItem.call_id = normalizeReplayedResponsesHistoryCallId(item.call_id, normalizedCallIds);
 	}
@@ -228,6 +232,22 @@ function sanitizeComputerCallForResponsesInput(item: Record<string, unknown>): R
 	// The Responses stream includes the performed computer action on output items,
 	// but the create input accepts only the call identity/status fields on replay.
 	const { action: _action, actions: _actions, ...inputSafeItem } = item;
+	return inputSafeItem;
+}
+
+function sanitizeImageGenerationCallForResponsesInput(item: Record<string, unknown>): Record<string, unknown> {
+	// Image generation output items include request-time knobs that are not part of
+	// the Responses input replay schema. Replaying them verbatim makes OpenAI-compatible
+	// endpoints reject the next turn, e.g. `Unknown parameter: input[n].action`.
+	const {
+		action: _action,
+		background: _background,
+		output_format: _outputFormat,
+		quality: _quality,
+		revised_prompt: _revisedPrompt,
+		size: _size,
+		...inputSafeItem
+	} = item;
 	return inputSafeItem;
 }
 
