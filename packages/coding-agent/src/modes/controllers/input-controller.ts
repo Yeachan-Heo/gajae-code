@@ -148,6 +148,12 @@ export class InputController {
 				return { consume: true };
 			}
 			const hookDialogActive = this.#hasHookDialog();
+			// A hook selector in its inline "Other (type your own)" input mode
+			// handles Escape itself (back out to the option list). Defer to the
+			// focused component instead of consuming Escape and aborting the turn.
+			if (this.ctx.hookSelector?.isInlineInputActive()) {
+				return undefined;
+			}
 			if (
 				this.#handleCancellableWorkEscape({
 					loading: hookDialogActive,

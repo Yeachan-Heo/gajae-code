@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Pressing `Escape` inside a hook selector's inline "Other (type your own)" editor now backs out to the option list instead of aborting the whole turn. The global interrupt listener added in #1478 consumed `Escape` whenever a hook dialog was streaming, so deep-interview/ralplan custom-input entry was killed with "Operation aborted"; it now defers to the focused selector while still aborting from option-selection mode.
+
 ## [0.8.2] - 2026-07-06
 ### Added
 
