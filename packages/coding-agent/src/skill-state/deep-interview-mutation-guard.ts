@@ -39,6 +39,9 @@ const INTERNAL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const VIM_FILE_SWITCH_RE = /^\s*:(?:e|e!|edit|edit!)(?:\s+([^<\r\n]+))?(?:<CR>|\r|\n|$)/i;
 const BASH_MUTATION_COMMAND_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:tee|touch|rm|mkdir|cp|mv|install)\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
+const BASH_IN_PLACE_MUTATION_COMMAND_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|\n]*)/gi;
+const BASH_OPAQUE_INTERPRETER_WRITE_RE =
+	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
 
 type ToolWithEditMode = AgentTool & {
 	mode?: unknown;
@@ -331,6 +334,14 @@ function extractEditTargets(args: unknown, tool: ToolWithEditMode): ExtractedTar
 	if (targets.paths.length === 0) targets.unknown = true;
 	return targets;
 }
+function shellWords(argsText: string): string[] {
+	return argsText.match(/(?:[^\s'"\\]+|'[^']*'|"[^"]*")+/g) ?? [];
+}
+
+function cleanShellWord(value: string): string {
+	return value.replace(/^[\'"]|[\'"]$/g, "");
+}
+
 function extractBashTargets(args: unknown): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
@@ -339,28 +350,37 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 		targets.unknown = true;
 		return targets;
 	}
+	if (BASH_OPAQUE_INTERPRETER_WRITE_RE.test(command)) {
+		targets.unknown = true;
+	}
+	for (const match of command.matchAll(BASH_IN_PLACE_MUTATION_COMMAND_RE)) {
+		const parts = shellWords(match[1] ?? "").map(cleanShellWord);
+		const hasInPlaceFlag = parts.some(part => /^-.*i/.test(part));
+		if (!hasInPlaceFlag) continue;
+		const target = [...parts].reverse().find(part => part && !part.startsWith("-"));
+		if (target) addPath(targets, target);
+		else targets.unknown = true;
+	}
 	for (const match of command.matchAll(BASH_MUTATION_COMMAND_RE)) {
 		const redirected = match[2]?.trim();
 		if (redirected) {
-			addPath(targets, redirected.replace(/^['"]|['"]$/g, ""));
+			addPath(targets, cleanShellWord(redirected));
 			continue;
 		}
-		const argsText = match[1] ?? "";
-		const parts = argsText.match(/(?:[^\s'"\\]+|'[^']*'|"[^"]*")+/g) ?? [];
+		const parts = shellWords(match[1] ?? "");
 		const commandName = match[0]
 			?.match(/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(tee|touch|rm|mkdir|cp|mv|install)\b/i)?.[1]
 			?.toLowerCase();
 		const targetParts =
 			commandName === "cp" || commandName === "mv" || commandName === "install" ? parts.slice(-1) : parts;
 		for (const part of targetParts) {
-			const cleaned = part.replace(/^['"]|['"]$/g, "");
+			const cleaned = cleanShellWord(part);
 			if (!cleaned || cleaned.startsWith("-")) continue;
 			addPath(targets, cleaned);
 		}
 	}
 	return targets;
 }
-
 function extractTargets(tool: ToolWithEditMode, args: unknown): ExtractedTargets {
 	if (tool.name === "write") return extractWriteTargets(args);
 	if (tool.name === "ast_edit") return extractAstEditTargets(args);

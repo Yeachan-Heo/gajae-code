@@ -631,6 +631,8 @@ describe("deep-interview mutation guard", () => {
 			"gjc state read && echo x > .gjc/state/foo.json",
 			"gjc ralplan --write --stage planner --artifact /tmp/p.md\ntouch src/product.ts",
 			"gjc state read\nrm .gjc/state/foo.json",
+			"sed -i s/a/b/ src/product.ts",
+			'python -c \'open("src/product.ts", "w").write("x")\'',
 		]) {
 			const decision = await getDeepInterviewMutationDecision({
 				cwd,
