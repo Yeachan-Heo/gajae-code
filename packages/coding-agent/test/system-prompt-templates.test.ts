@@ -243,6 +243,21 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("`job` remains the generic background-job tool");
 	});
 
+	test("system-prompt bounds long-form media ingestion before fallback drafting", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+		const rendered = prompt.render(template, baseRenderContext);
+
+		expect(rendered).toContain("<media-ingestion>");
+		expect(rendered).toContain("For YouTube, podcasts, webinars, screen recordings");
+		expect(rendered).toContain("Do not let \"recover the full transcript\" silently replace");
+		expect(rendered).toContain("transcript/caption retrieval fails after two attempts");
+		expect(rendered).toContain("produce an evidence-scoped draft");
+		expect(rendered).toContain("Evidence used");
+		expect(rendered).toContain("Limitations");
+		expect(rendered).toContain("Never spend an extended turn repeatedly trying to ingest the same blocked video");
+	});
+
 	test("system-prompt distinguishes informational questions from explicit implementation requests", async () => {
 		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
 		const template = await Bun.file(templatePath).text();
