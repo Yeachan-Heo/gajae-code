@@ -87,6 +87,17 @@ Durable completion is single-source: `goals.json` defines which goals exist and 
    - `gjc ultragoal create-goals --gjc-goal-mode per-story --brief "<brief>"` only when one GJC goal context per story is explicitly preferred
 3. Inspect `.gjc/_session-{sessionid}/ultragoal/goals.json` and refine if needed.
 
+### Create-goals granularity: merge validation-coupled stories
+
+Before splitting a brief into many thin stories, check whether the candidate stories are **validation-coupled**. Merge validation-coupled stories into one goal and fan out executor slices inside that goal instead of creating one goal per slice. Two stories are validation-coupled when they share any of:
+
+- the same feature stack (one story's code cannot be meaningfully verified without the other's),
+- the same acceptance surface,
+- the same red-team surface, or
+- the same final review boundary (they can only be signed off as a unit).
+
+Fanning out executor slices inside a single merged goal keeps one review/QA boundary while preserving parallel implementation. When validation-coupled stories must stay as separate goals for scheduling reasons, use an aggregate-mode **validation batch** (below) so the coupled review happens once at the final member.
+
 ## Complete goals
 
 Loop until `gjc ultragoal status` reports all goals complete:
@@ -229,6 +240,30 @@ Runtime-backed pipelining is deliberately narrow:
 
 Team remains explicit and separate: Team is not auto-launched, not a hidden pipeline scheduler, and never owns Ultragoal goals, checkpoints, or ledger state.
 
+## Validation batches (aggregate-only)
+
+Validation batches let several aggregate-mode goals that share one review/QA boundary defer their heavyweight architect + executor QA/red-team review to a single **final member**, while each non-final member still proves targeted verification and cleanup. Validation batches are **aggregate-only**, **explicit-only**, and **fail-closed**. They are created only through `--validation-batch-json`; there is no inference from brief prose and no per-story batching.
+
+Batches and #1701 pipeline metadata/overlap are **mutually exclusive**: `--validation-batch-json` and `--goal-metadata-json` cannot be combined, and a goal may not carry both `validationBatch` and eligible `pipelineMetadata`. There is no batch/pipeline mixing.
+
+Create a batch explicitly:
+
+```sh
+gjc ultragoal create-goals --brief-file <path> --validation-batch-json '[{"schemaVersion":1,"batchId":"VB001","memberIds":["G001","G002","G003"],"finalGoalId":"G003"}]'
+```
+
+Checkpoint contract:
+
+- **Non-final members** checkpoint `complete` with a single top-level `deferredToBatch` quality gate (kind `validation-batch-deferred`): targeted verification, ai-slop-cleaner pass, and a rerun iteration, plus a cumulative-since-base change set. A `deferredToBatch` gate must NOT contain `architectReview`, `executorQa`, or `validationBatchClose` — deferring never manufactures fake review approvals.
+- **The final member** (`finalGoalId`) checkpoints `complete` with the normal full strict gate PLUS a top-level `validationBatchClose` proof that covers all member IDs, member metadata hashes, member receipt/checkpoint-ledger-event IDs, per-member change-set hashes, and union change-set coverage. The final close only starts once every non-final member is already `complete` with a structurally fresh deferred receipt (out-of-order close is rejected).
+- Close state is append-only proof: it lives in the final member's checkpoint receipt and matching `goal_checkpointed` ledger row only. Never stamp `closedReceiptId`/`closedAt` or any close-state field onto member goals, and never append a separate close ledger event.
+- Change sets are cumulative-since-base: each member's `changeSet.paths` is the whole-worktree diff vs base (`cumulativeFromBase: true`), `memberGoalId` is a label not a per-path attribution, and `unionChangeSet.paths` carries no per-goal attribution.
+- Batch invalidation is fail-closed: steering mutations that would invalidate a batch are rejected while any member holds a fresh deferred receipt.
+
+### Intra-goal validation-lane parallelism
+
+Within a single goal (including a single-goal run or one validation-batch member), architect review and the executor QA/red-team lane MAY run in parallel, but only on the same **frozen post-cleaner change set**: run the ai-slop-cleaner to a zero-blocker pass and rerun verification first, then hand both lanes the identical frozen change-set summary. Parallel architect + executor QA/red-team lanes must **join before checkpoint** — neither lane may checkpoint independently. Fall back to **sequential** lanes when code is still changing, when the two lanes would see divergent snapshots, when the red-team lane depends on architect fixes, or when architect findings gate the QA scope.
+
 ## Use Ultragoal and Team together
 
 Use ultragoal and team together for a durable Ultragoal story that benefits from one visible tmux worker session. Ultragoal remains leader-owned: `.gjc/_session-{sessionid}/ultragoal/goals.json` stores the story plan and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` stores checkpoints. Team is the single-worker tmux execution engine and returns task/evidence status to the leader.
@@ -336,6 +371,7 @@ Receipts are freshness-scoped:
 - Per-goal receipts remain fresh for their target goal unless that goal, its blocker metadata, or its supersession metadata changes.
 - Normal later `goal_started` or clean receipt-backed `goal_checkpointed` events for other goals do not stale older per-goal receipts.
 - Appending required goals or changing final required-goal state stales final aggregate receipts. Final aggregate completion requires a fresh final aggregate receipt proving no incomplete, blocked, or `review_blocked` required goals remain.
+- Deferred per-goal receipts (validation-batch members) are incomplete until a matching fresh batch-close receipt exists on the batch's `finalGoalId`; a story-scope query for a deferred member stays blocked until that close, and mutating a member after close stales the batch-close and final aggregate receipts.
 
 ## Handoff back to planning
 

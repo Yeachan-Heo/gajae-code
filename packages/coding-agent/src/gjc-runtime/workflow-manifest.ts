@@ -259,6 +259,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				enumValues: ["aggregate", "per-story"],
 				appliesToVerbs: ["create-goals"],
 			},
+			{ name: "validation-batch-json", type: "string", appliesToVerbs: ["create-goals"] },
 			{ name: "retry-failed", type: "boolean", appliesToVerbs: ["complete-goals"] },
 			{ name: "goal-id", type: "string", required: true, appliesToVerbs: ["checkpoint", "record-review-blockers"] },
 			{

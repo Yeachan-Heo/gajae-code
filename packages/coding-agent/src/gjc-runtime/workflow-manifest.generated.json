@@ -1437,6 +1437,13 @@
       },
       {
         "appliesToVerbs": [
+          "create-goals"
+        ],
+        "name": "validation-batch-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
           "complete-goals"
         ],
         "name": "retry-failed",

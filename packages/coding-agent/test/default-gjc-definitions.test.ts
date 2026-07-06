@@ -343,6 +343,51 @@ Project executor override body.
 		expect(ultragoal).toContain("not a hidden pipeline scheduler");
 	});
 
+	it("documents validation-batch granularity, contract, and intra-goal lane parallelism in the ultragoal prompt", async () => {
+		const ultragoal = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
+		).text();
+
+		// A: create-goals granularity — merge validation-coupled stories, fan out executor slices.
+		expect(ultragoal).toContain("validation-coupled");
+		expect(ultragoal).toContain("Merge validation-coupled stories into one goal");
+		expect(ultragoal).toContain("fan out executor slices");
+		expect(ultragoal).toContain("the same feature stack");
+		expect(ultragoal).toContain("the same red-team surface");
+		expect(ultragoal).toContain("the same final review boundary");
+
+		// B: validation-batch contract.
+		expect(ultragoal).toContain("## Validation batches (aggregate-only)");
+		expect(ultragoal).toContain("--validation-batch-json");
+		expect(ultragoal).toContain("aggregate-only");
+		expect(ultragoal).toContain("fail-closed");
+		expect(ultragoal).toContain("deferredToBatch");
+		expect(ultragoal).toContain("validation-batch-deferred");
+		expect(ultragoal).toContain("validationBatchClose");
+		expect(ultragoal).toContain("mutually exclusive");
+		expect(ultragoal).toContain("no batch/pipeline mixing");
+		expect(ultragoal).toContain("out-of-order close is rejected");
+		expect(ultragoal).toContain("append-only proof");
+		expect(ultragoal).toContain("Never stamp");
+		expect(ultragoal).toContain("cumulative-since-base");
+		expect(ultragoal).toContain("`cumulativeFromBase: true`");
+		expect(ultragoal).toContain("`memberGoalId` is a label not a per-path attribution");
+		expect(ultragoal).toContain("Batch invalidation is fail-closed");
+
+		// B: receipts freshness for deferred members.
+		expect(ultragoal).toContain(
+			"Deferred per-goal receipts (validation-batch members) are incomplete until a matching fresh batch-close receipt exists",
+		);
+
+		// C: intra-goal validation-lane parallelism.
+		expect(ultragoal).toContain("### Intra-goal validation-lane parallelism");
+		expect(ultragoal).toContain("frozen post-cleaner change set");
+		expect(ultragoal).toContain("architect review and the executor QA/red-team lane MAY run in parallel");
+		expect(ultragoal).toContain("join before checkpoint");
+		expect(ultragoal).toContain("Fall back to **sequential** lanes");
+		expect(ultragoal).toContain("red-team lane depends on architect fixes");
+	});
+
 	it("routes simple clear implementation requests directly without contradictory workflow escalation", async () => {
 		const systemPrompt = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "prompts", "system", "system-prompt.md"),
