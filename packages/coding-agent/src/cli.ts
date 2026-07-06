@@ -76,6 +76,9 @@ async function installRuntimeGlobals(): Promise<void> {
 	// `HTTP2Unsupported`. See @gajae-code/ai/utils/h2-fetch for details.
 	installH2Fetch();
 
+	const { warnIfMacOSNoFileLimitTooLow } = await import("./cli/nofile-limit");
+	warnIfMacOSNoFileLimitTooLow();
+
 	// Strip macOS malloc-stack-logging env vars before any subprocess is spawned.
 	// Otherwise every child bun process (subagents, plugin installs, ptree spawns,
 	// etc.) prints a `MallocStackLogging: can't turn off …` warning to stderr.
