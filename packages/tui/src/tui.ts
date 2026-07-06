@@ -152,6 +152,14 @@ function termLooksMultiplexed(value: string | undefined): boolean {
 	return term.startsWith("tmux") || term.startsWith("screen");
 }
 
+function isWindowsTerminalSession(): boolean {
+	return envIsEnabled(Bun.env.WT_SESSION) || Bun.env.TERM_PROGRAM === "Windows_Terminal";
+}
+
+function isViewportRepaintSession(): boolean {
+	return isMultiplexerSession() || isWindowsTerminalSession();
+}
+
 /** Detect terminal multiplexers where scrollback clearing and height-change redraws are hostile. */
 function isMultiplexerSession(): boolean {
 	return Boolean(
@@ -166,6 +174,10 @@ function isMultiplexerSession(): boolean {
 
 function useLegacyMultiplexerFullRender(): boolean {
 	return $flag("PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER");
+}
+
+function useViewportRepaintPath(): boolean {
+	return isViewportRepaintSession() && !(isMultiplexerSession() && useLegacyMultiplexerFullRender());
 }
 
 /**
@@ -834,19 +846,20 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Multiplexer-aware resize render request.
+	 * Viewport-repaint-aware resize render request.
 	 *
 	 * A forced full redraw (`requestRender(true)`) resets `#previousWidth`/`#previousHeight`
 	 * to -1, which makes `#doRender` treat the frame as a width change and fall into the
 	 * `fullRender` path. In terminal multiplexers that path skips the scrollback-clearing
 	 * `3J` escape (users navigate scrollback history), so replaying every transcript line
 	 * piles it back on top of scrollback — the "top of screen scrolls down to the prompt at
-	 * high speed" resize storm. Here we keep force off in multiplexers so `#doRender`'s
-	 * height-change branch takes the viewport-only `multiplexerViewportRepaint` path instead.
-	 * Set `PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER=1` to restore the legacy forced redraw.
+	 * high speed" resize storm. Windows Terminal can also visibly jump to the
+	 * transcript top during streaming redraws, so viewport-repaint sessions keep
+	 * force off and let `#doRender` repaint only the live viewport. Set
+	 * `PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER=1` to restore the legacy tmux redraw.
 	 */
 	requestResizeRender(): void {
-		this.requestRender(!(isMultiplexerSession() && !useLegacyMultiplexerFullRender()), "resize");
+		this.requestRender(!useViewportRepaintPath(), "resize");
 	}
 
 	requestRender(force = false, source = "unknown"): void {
@@ -1626,7 +1639,7 @@ export class TUI extends Container {
 			this.#previousHeight = height;
 		};
 
-		const multiplexerViewportRepaint = (reason: string): void => {
+		const viewportRepaint = (reason: string): void => {
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			const nextViewportTop = Math.max(0, newLines.length - height);
@@ -1667,13 +1680,13 @@ export class TUI extends Container {
 
 			if ($flag("PI_DEBUG_REDRAW")) {
 				const logPath = getDebugLogPath();
-				const msg = `[${new Date().toISOString()}] multiplexerViewportRepaint: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
+				const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
 				fs.appendFileSync(logPath, msg);
 			}
-			// In multiplexers this deliberately prioritizes the live viewport over
+			// Viewport repaint deliberately prioritizes the live viewport over
 			// historical scrollback repair. After offscreen changes, #previousLines
 			// tracks the desired logical transcript, not every byte emitted into the
-			// multiplexer scrollback.
+			// terminal scrollback.
 			this.#cursorRow = Math.max(0, newLines.length - 1);
 			this.#maxLinesRendered = newLines.length;
 			this.#viewportTopRow = nextViewportTop;
@@ -1700,13 +1713,12 @@ export class TUI extends Container {
 		// Width changes always need a full re-render because wrapping changes.
 		if (widthChanged) {
 			logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
-			if (isMultiplexerSession() && !useLegacyMultiplexerFullRender()) {
-				// In multiplexers a full replay piles the whole transcript back onto
-				// scrollback (3J is intentionally skipped). Repaint the viewport only,
-				// mirroring the height-change branch. This also neutralizes the fake
-				// width change that requestRender(true) injects via #previousWidth = -1,
-				// so every force-render call site is safe in multiplexers too.
-				multiplexerViewportRepaint(`terminal width changed (${this.#previousWidth} -> ${width})`);
+			if (useViewportRepaintPath()) {
+				// In viewport-repaint sessions a full replay can either pile the transcript
+				// back onto scrollback (tmux/screen) or visibly jump to the transcript top
+				// (Windows Terminal). Repaint the viewport only, mirroring the height-change
+				// branch and neutralizing fake width changes from requestRender(true).
+				viewportRepaint(`terminal width changed (${this.#previousWidth} -> ${width})`);
 			} else {
 				fullRender(true, "terminal width changed");
 			}
@@ -1717,8 +1729,8 @@ export class TUI extends Container {
 		// but Termux changes height when the software keyboard shows or hides.
 		// In that environment, a full redraw causes the entire history to replay on every toggle.
 		if (heightChanged) {
-			if (isMultiplexerSession() && !useLegacyMultiplexerFullRender()) {
-				multiplexerViewportRepaint(`terminal height changed (${this.#previousHeight} -> ${height})`);
+			if (useViewportRepaintPath()) {
+				viewportRepaint(`terminal height changed (${this.#previousHeight} -> ${height})`);
 				return;
 			}
 			if (!isTermuxSession() && !isMultiplexerSession()) {
@@ -1785,8 +1797,8 @@ export class TUI extends Container {
 				const extraLines = this.#previousLines.length - newLines.length;
 				if (extraLines > height) {
 					logRedraw(`extraLines > height (${extraLines} > ${height})`);
-					if (isMultiplexerSession() && !useLegacyMultiplexerFullRender()) {
-						multiplexerViewportRepaint(`extraLines > height (${extraLines} > ${height})`);
+					if (useViewportRepaintPath()) {
+						viewportRepaint(`extraLines > height (${extraLines} > ${height})`);
 					} else {
 						fullRender(true, "extraLines > height");
 					}
@@ -1819,16 +1831,19 @@ export class TUI extends Container {
 			return;
 		}
 
-		// Differential rendering can only touch what was actually visible.
-		// Any change above the previous viewport requires a full redraw so terminal
-		// scrollback ends up consistent with the new transcript state.
+		// Differential rendering can only touch what was actually visible. If a
+		// streaming status/header line changes above a live-following viewport, keep
+		// the terminal pinned by diffing from the visible top instead of clearing and
+		// replaying the transcript. If the user paged away, keep the historical
+		// full-redraw behavior so scrollback is repaired rather than snapping them
+		// back to live.
 		if (firstChanged < prevViewportTop) {
 			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
-			if (isMultiplexerSession() && !useLegacyMultiplexerFullRender()) {
-				multiplexerViewportRepaint(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
-			} else {
-				fullRender(true, "firstChanged < viewportTop");
+			if (useViewportRepaintPath()) {
+				viewportRepaint(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
+				return;
 			}
+			fullRender(true, "firstChanged < viewportTop");
 			return;
 		}
 
