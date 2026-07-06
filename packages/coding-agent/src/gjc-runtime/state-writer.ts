@@ -304,6 +304,18 @@ function activeStateDir(cwd: string, sessionScope?: string | ActiveSessionScope)
 	return layoutActiveStateDir(cwd, requireSessionId(sessionScope, "activeStateDir"));
 }
 
+type ActiveStateCacheInvalidator = (cwd?: string, sessionId?: string) => void;
+var activeStateCacheInvalidator: ActiveStateCacheInvalidator | undefined;
+
+export function setActiveStateCacheInvalidator(invalidator: ActiveStateCacheInvalidator): void {
+	activeStateCacheInvalidator = invalidator;
+}
+
+function invalidateActiveStateCacheForScope(cwd: string, sessionScope?: string | ActiveSessionScope): void {
+	const sessionId = typeof sessionScope === "string" ? sessionScope : sessionScope?.sessionId;
+	activeStateCacheInvalidator?.(cwd, sessionId);
+}
+
 function activeSnapshotPath(cwd: string, sessionScope?: string | ActiveSessionScope): string {
 	return layoutActiveSnapshotPath(cwd, requireSessionId(sessionScope, "activeSnapshotPath"));
 }
@@ -979,6 +991,7 @@ export async function writeActiveEntry(
 				persistedSourceRevision(entry) || persistedSourceRevision(await readJsonIfPresent(filePath)) + 1,
 		},
 	);
+	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return filePath;
 }
 
@@ -1003,6 +1016,7 @@ export async function removeActiveEntry(
 			}
 			const deleted = await atomicRemove(filePath);
 			if (deleted) await maybeAudit(filePath, options);
+			if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
 			return { path: filePath, deleted };
 		},
 		options?.lock,
@@ -1049,6 +1063,7 @@ export async function rebuildActiveSnapshot(
 			...entries.map(entry => persistedSourceRevision(entry)),
 		),
 	});
+	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return snapshotPath;
 }
 

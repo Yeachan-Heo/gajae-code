@@ -2,11 +2,13 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { activeStateDir, modeStatePath } from "../src/gjc-runtime/session-layout";
 import { removeActiveEntry, writeActiveEntry, writeGuardedJsonAtomic } from "../src/gjc-runtime/state-writer";
 import {
 	applyHandoffToActiveState,
 	CANONICAL_GJC_WORKFLOW_SKILLS,
 	getSkillActiveStatePaths,
+	invalidateVisibleSkillActiveStateCache,
 	listActiveSkills,
 	normalizeSkillActiveState,
 	readVisibleSkillActiveState,
@@ -689,6 +691,106 @@ describe("GJC skill-active state", () => {
 			const snapshot = JSON.parse(await fs.readFile(sessionPath, "utf-8"));
 			expect(snapshot.active).toBe(false);
 			expect(snapshot.active_skills).toEqual([]);
+		});
+	});
+
+	it("security-tier visible reads observe external active-entry changes on the next read", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({
+				cwd,
+				skill: "deep-interview",
+				phase: "interviewing",
+				active: true,
+				sessionId: "sess-cache",
+			});
+			const first = await readVisibleSkillActiveState(cwd, "sess-cache", { tier: "security" });
+			expect(first?.active_skills?.map(entry => entry.skill)).toEqual(["deep-interview"]);
+
+			await fs.writeFile(
+				path.join(activeStateDir(cwd, "sess-cache"), "ultragoal.json"),
+				JSON.stringify({
+					skill: "ultragoal",
+					phase: "active",
+					active: true,
+					session_id: "sess-cache",
+					updated_at: "2026-01-01T00:10:00.000Z",
+				}),
+			);
+
+			const second = await readVisibleSkillActiveState(cwd, "sess-cache", { tier: "security" });
+			expect(second?.active_skills?.map(entry => entry.skill)).toEqual(["ultragoal"]);
+		});
+	});
+
+	it("hud-tier visible reads may serve stale within TTL while security-tier refreshes", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({
+				cwd,
+				skill: "team",
+				phase: "running",
+				active: true,
+				sessionId: "sess-hud-cache",
+			});
+			const initial = await readVisibleSkillActiveState(cwd, "sess-hud-cache", { tier: "hud" });
+			expect(initial?.active_skills?.[0]?.phase).toBe("running");
+
+			await fs.writeFile(
+				path.join(activeStateDir(cwd, "sess-hud-cache"), "team.json"),
+				JSON.stringify({
+					skill: "team",
+					phase: "changed-externally-with-longer-size",
+					active: true,
+					session_id: "sess-hud-cache",
+					updated_at: "2026-01-01T00:10:00.000Z",
+				}),
+			);
+
+			const staleHud = await readVisibleSkillActiveState(cwd, "sess-hud-cache", { tier: "hud" });
+			expect(staleHud?.active_skills?.[0]?.phase).toBe("running");
+			const freshSecurity = await readVisibleSkillActiveState(cwd, "sess-hud-cache", { tier: "security" });
+			expect(freshSecurity?.active_skills?.[0]?.phase).toBe("changed-externally-with-longer-size");
+		});
+	});
+
+	it("local active-entry writes invalidate the visible-state cache immediately", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({ cwd, skill: "team", phase: "running", active: true, sessionId: "sess-local" });
+			expect((await readVisibleSkillActiveState(cwd, "sess-local"))?.active_skills?.[0]?.phase).toBe("running");
+
+			await writeActiveEntry(
+				cwd,
+				"sess-local",
+				"team",
+				{ skill: "team", phase: "locally-written", active: true, session_id: "sess-local" },
+				{ cwd },
+			);
+			expect((await readVisibleSkillActiveState(cwd, "sess-local"))?.active_skills?.[0]?.phase).toBe(
+				"locally-written",
+			);
+		});
+	});
+
+	it("security-tier visible reads invalidate on canonical ralplan mode-state phase changes", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({
+				cwd,
+				skill: "ralplan",
+				phase: "planner",
+				active: true,
+				sessionId: "sess-ralplan",
+			});
+			expect((await readVisibleSkillActiveState(cwd, "sess-ralplan"))?.active_skills?.[0]?.phase).toBe("planner");
+
+			const modePath = modeStatePath(cwd, "sess-ralplan", "ralplan");
+			await fs.mkdir(path.dirname(modePath), { recursive: true });
+			await fs.writeFile(modePath, JSON.stringify({ active: true, current_phase: "handoff" }));
+
+			const visible = await readVisibleSkillActiveState(cwd, "sess-ralplan", { tier: "security" });
+			expect(visible?.active_skills?.[0]?.phase).toBe("handoff");
 		});
 	});
 

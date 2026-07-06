@@ -38,14 +38,25 @@ interface TtsrScope {
 interface TtsrEntry {
 	rule: Rule;
 	conditions: RegExp[];
+	conditionWindows: Array<number | undefined>;
+
 	scope: TtsrScope;
 	globalPathGlobs?: Bun.Glob[];
 }
 
 /** Tracks when a rule was last injected (for repeat gating). */
+export interface TtsrInjectionRecord {
+	name: string;
+	lastInjectedAt: number;
+	repeatMode?: "once" | "after-gap";
+	repeatGap?: number;
+}
+
 interface InjectionRecord {
 	/** Message count (turn index) when the rule was last injected. */
 	lastInjectedAt: number;
+	repeatMode?: "once" | "after-gap";
+	repeatGap?: number;
 }
 
 const DEFAULT_SETTINGS: Required<TtsrSettings> = {
@@ -55,6 +66,9 @@ const DEFAULT_SETTINGS: Required<TtsrSettings> = {
 	repeatMode: "once",
 	repeatGap: 10,
 };
+
+const SAFE_REGEX_WINDOW_CAP = 4096;
+const SAFE_REGEX_WINDOW_MULTIPLIER = 4;
 
 const DEFAULT_SCOPE: TtsrScope = {
 	allowText: true,
@@ -70,7 +84,7 @@ export class TtsrManager {
 	readonly #buffers = new Map<string, string>();
 	#messageCount = 0;
 
-	constructor(settings?: TtsrSettings) {
+	constructor(settings?: Partial<TtsrSettings>) {
 		this.#settings = { ...DEFAULT_SETTINGS, ...settings };
 	}
 
@@ -81,12 +95,15 @@ export class TtsrManager {
 			return true;
 		}
 
-		if (this.#settings.repeatMode === "once") {
+		const entry = this.#rules.get(ruleName);
+		const repeatMode = entry?.rule.repeatMode ?? record.repeatMode ?? this.#settings.repeatMode;
+		if (repeatMode === "once") {
 			return false;
 		}
 
+		const repeatGap = entry?.rule.repeatGap ?? record.repeatGap ?? this.#settings.repeatGap;
 		const gap = this.#messageCount - record.lastInjectedAt;
-		return gap >= this.#settings.repeatGap;
+		return gap >= repeatGap;
 	}
 
 	#compileConditions(rule: Rule): RegExp[] {
@@ -104,6 +121,20 @@ export class TtsrManager {
 		}
 
 		return compiled;
+	}
+
+	#conditionWindow(condition: RegExp): number | undefined {
+		const source = condition.source;
+		if (source.length === 0 || source.length > SAFE_REGEX_WINDOW_CAP) {
+			return undefined;
+		}
+		// Quantifiers (*, +, {n,}) and anchors/lookaround/backrefs can make a match's
+		// witness exceed a bounded window, so fall back to full-buffer scanning (always
+		// correct) for those patterns rather than risk silently missing a match.
+		if (/[$^*+{]|\\[bBAZz]|\\[1-9]|\(\?/.test(source)) {
+			return undefined;
+		}
+		return Math.min(SAFE_REGEX_WINDOW_CAP, Math.max(1, source.length * SAFE_REGEX_WINDOW_MULTIPLIER));
 	}
 
 	#compileGlobalPathGlobs(globs: Rule["globs"]): Bun.Glob[] | undefined {
@@ -281,17 +312,28 @@ export class TtsrManager {
 	}
 
 	#matchesCondition(entry: TtsrEntry, streamBuffer: string): boolean {
-		for (const condition of entry.conditions) {
+		for (let i = 0; i < entry.conditions.length; i++) {
+			const condition = entry.conditions[i];
+			const window = entry.conditionWindows[i];
+			const target = window === undefined ? streamBuffer : streamBuffer.slice(-window);
 			condition.lastIndex = 0;
-			if (condition.test(streamBuffer)) {
+			if (condition.test(target)) {
 				return true;
 			}
 		}
 		return false;
 	}
 
+	/** Check if TTSR is disabled for this manager. */
+	#isDisabled(): boolean {
+		return this.#settings.enabled === false;
+	}
+
 	/** Add a TTSR rule to be monitored. */
 	addRule(rule: Rule): boolean {
+		if (this.#isDisabled()) {
+			return false;
+		}
 		if (this.#rules.has(rule.name)) {
 			return false;
 		}
@@ -310,9 +352,11 @@ export class TtsrManager {
 			return false;
 		}
 		const globalPathGlobs = this.#compileGlobalPathGlobs(rule.globs);
+		const conditionWindows = conditions.map(condition => this.#conditionWindow(condition));
 		this.#rules.set(rule.name, {
 			rule,
 			conditions,
+			conditionWindows,
 			scope,
 			globalPathGlobs,
 		});
@@ -334,6 +378,9 @@ export class TtsrManager {
 	 * assistant prose, thinking text, and unrelated tool argument streams.
 	 */
 	checkDelta(delta: string, context: TtsrMatchContext): Rule[] {
+		if (this.#isDisabled()) {
+			return [];
+		}
 		const bufferKey = this.#bufferKey(context);
 		const nextBuffer = `${this.#buffers.get(bufferKey) ?? ""}${delta}`;
 		this.#buffers.set(bufferKey, nextBuffer);
@@ -378,16 +425,18 @@ export class TtsrManager {
 			if (ruleName.length === 0) {
 				continue;
 			}
-			const record = this.#injectionRecords.get(ruleName);
-			if (!record) {
-				this.#injectionRecords.set(ruleName, { lastInjectedAt: this.#messageCount });
-			} else {
-				record.lastInjectedAt = this.#messageCount;
-			}
+			const entry = this.#rules.get(ruleName);
+			const nextRecord: InjectionRecord = {
+				lastInjectedAt: this.#messageCount,
+				repeatMode: entry?.rule.repeatMode ?? this.#settings.repeatMode,
+				repeatGap: entry?.rule.repeatGap ?? this.#settings.repeatGap,
+			};
+			this.#injectionRecords.set(ruleName, nextRecord);
+
 			logger.debug("TTSR rule marked as injected", {
 				ruleName,
 				messageCount: this.#messageCount,
-				repeatMode: this.#settings.repeatMode,
+				repeatMode: nextRecord.repeatMode,
 			});
 		}
 	}
@@ -397,13 +446,31 @@ export class TtsrManager {
 		return Array.from(this.#injectionRecords.keys());
 	}
 
-	/** Restore injected state from a list of rule names. */
-	restoreInjected(ruleNames: string[]): void {
-		for (const name of ruleNames) {
-			this.#injectionRecords.set(name, { lastInjectedAt: 0 });
+	/** Get full injected rule records (for persistence). */
+	getInjectedRecords(): TtsrInjectionRecord[] {
+		return Array.from(this.#injectionRecords, ([name, record]) => ({ name, ...record }));
+	}
+
+	/** Restore injected state from legacy rule names or persisted records. */
+	restoreInjected(records: string[] | TtsrInjectionRecord[]): void {
+		if (this.#isDisabled()) {
+			return;
 		}
-		if (ruleNames.length > 0) {
-			logger.debug("TTSR injected state restored", { ruleNames });
+		for (const record of records) {
+			if (typeof record === "string") {
+				this.#injectionRecords.set(record, { lastInjectedAt: 0 });
+				continue;
+			}
+			const name = record.name.trim();
+			if (name.length === 0) continue;
+			this.#injectionRecords.set(name, {
+				lastInjectedAt: Number.isFinite(record.lastInjectedAt) ? record.lastInjectedAt : 0,
+				repeatMode: record.repeatMode,
+				repeatGap: record.repeatGap,
+			});
+		}
+		if (records.length > 0) {
+			logger.debug("TTSR injected state restored", { records });
 		}
 	}
 
@@ -414,6 +481,9 @@ export class TtsrManager {
 
 	/** Check if any TTSR rules are registered. */
 	hasRules(): boolean {
+		if (this.#isDisabled()) {
+			return false;
+		}
 		return this.#rules.size > 0;
 	}
 
@@ -425,6 +495,14 @@ export class TtsrManager {
 	/** Get current message count. */
 	getMessageCount(): number {
 		return this.#messageCount;
+	}
+
+	/** Restore message counter after session resume. */
+	restoreMessageCount(messageCount: number): void {
+		if (this.#isDisabled()) {
+			return;
+		}
+		this.#messageCount = Math.max(0, Math.floor(messageCount));
 	}
 
 	/** Get settings. */

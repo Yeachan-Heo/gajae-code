@@ -139,6 +139,10 @@ export class GoalRuntime {
 		return Boolean(state?.enabled && isAccountingStatus(state.goal));
 	}
 
+	shouldTrackTurnBaseline(): boolean {
+		return this.#hasAccountingState();
+	}
+
 	async #withAccounting<T>(fn: () => Promise<T> | T): Promise<T> {
 		const previous = this.#accountingTail;
 		const { promise, resolve } = Promise.withResolvers<void>();
@@ -179,6 +183,12 @@ export class GoalRuntime {
 		if (this.#turnSnapshot) {
 			this.#turnSnapshot.activeGoalId = goal.id;
 			this.#turnSnapshot.baselineUsage = { ...this.#host.getCurrentUsage() };
+		} else {
+			this.#turnSnapshot = {
+				turnId: `activation-${goal.id}`,
+				activeGoalId: goal.id,
+				baselineUsage: { ...this.#host.getCurrentUsage() },
+			};
 		}
 	}
 

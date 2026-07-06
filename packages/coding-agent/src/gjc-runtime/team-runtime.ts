@@ -1056,6 +1056,22 @@ async function readConfig(dir: string): Promise<GjcTeamConfig> {
 		worker_cli_plan: config.worker_cli_plan ?? Array.from({ length: config.worker_count }, () => "gjc"),
 	};
 }
+const WORKER_INTEGRATION_CONFIG_CACHE_TTL_MS = 100;
+type WorkerIntegrationConfigCacheEntry = { checkedAt: number; mtimeMs: number; config: GjcTeamConfig };
+const workerIntegrationConfigCache = new Map<string, WorkerIntegrationConfigCacheEntry>();
+
+async function readConfigForWorkerIntegration(dir: string): Promise<GjcTeamConfig> {
+	const configPath = path.join(dir, "config.json");
+	const nowMs = Date.now();
+	const stat = await fs.stat(configPath);
+	const cached = workerIntegrationConfigCache.get(configPath);
+	if (cached && cached.mtimeMs === stat.mtimeMs && nowMs - cached.checkedAt <= WORKER_INTEGRATION_CONFIG_CACHE_TTL_MS)
+		return cached.config;
+	const config = await readConfig(dir);
+	workerIntegrationConfigCache.set(configPath, { checkedAt: nowMs, mtimeMs: stat.mtimeMs, config });
+
+	return config;
+}
 async function readPhase(dir: string): Promise<GjcTeamPhase> {
 	const phase = await readJsonFile<{ current_phase?: GjcTeamPhase }>(path.join(dir, "phase.json"));
 	return phase?.current_phase ?? "running";
@@ -1704,6 +1720,23 @@ function runGitResult(cwd: string, args: string[]): GitResult {
 		stderr: result.stderr.toString().trim(),
 	};
 }
+async function runGitResultAsync(cwd: string, args: string[]): Promise<GitResult> {
+	const result = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const [exitCode, stdout, stderr] = await Promise.all([
+		result.exited,
+		new Response(result.stdout).text(),
+		new Response(result.stderr).text(),
+	]);
+	return {
+		ok: exitCode === 0,
+		stdout: stdout.trim(),
+		stderr: stderr.trim(),
+	};
+}
+async function tryRunGitAsync(cwd: string, args: string[]): Promise<string | null> {
+	const result = await runGitResultAsync(cwd, args);
+	return result.ok ? result.stdout : null;
+}
 function runGit(cwd: string, args: string[]): string {
 	const result = runGitResult(cwd, args);
 	if (result.ok) return result.stdout;
@@ -2318,6 +2351,9 @@ async function appendCommitHygieneEntries(config: GjcTeamConfig, entries: GjcTea
 function resolveHead(cwd: string): string | null {
 	return tryRunGit(cwd, ["rev-parse", "HEAD"]);
 }
+async function resolveHeadAsync(cwd: string): Promise<string | null> {
+	return tryRunGitAsync(cwd, ["rev-parse", "HEAD"]);
+}
 function isAncestor(cwd: string, ancestor: string, descendant: string): boolean {
 	return runGitResult(cwd, ["merge-base", "--is-ancestor", ancestor, descendant]).ok;
 }
@@ -2331,6 +2367,14 @@ function listCommitRange(cwd: string, baseRef: string, headRef: string): string[
 }
 function listConflictFiles(cwd: string): string[] {
 	const result = runGitResult(cwd, ["diff", "--name-only", "--diff-filter=U"]);
+	if (!result.ok || !result.stdout) return [];
+	return result.stdout
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean);
+}
+async function listConflictFilesAsync(cwd: string): Promise<string[]> {
+	const result = await runGitResultAsync(cwd, ["diff", "--name-only", "--diff-filter=U"]);
 	if (!result.ok || !result.stdout) return [];
 	return result.stdout
 		.split(/\r?\n/)
@@ -2396,6 +2440,26 @@ export function classifyWorkerCheckpointStatus(cwd: string): GjcWorkerCheckpoint
 		.filter(Boolean)
 		.some(line => UNMERGED_GIT_STATUS_CODES.has(line.slice(0, 2)));
 	const conflictFiles = listConflictFiles(cwd);
+	if (hasUnmergedStatus || conflictFiles.length > 0) {
+		return { kind: "conflicted", files: conflictFiles.length > 0 ? conflictFiles : files };
+	}
+	const classified = classifyGjcTeamCheckpointFiles(files);
+	if (classified.eligible.length === 0 && classified.protected.length > 0)
+		return { kind: "protected_only", files: classified.protected };
+	return { kind: "eligible", files: classified.eligible };
+}
+export async function classifyWorkerCheckpointStatusAsync(cwd: string): Promise<GjcWorkerCheckpointClassification> {
+	const status = await runGitResultAsync(cwd, ["status", "--porcelain", "-uall"]);
+	if (!status.ok) {
+		return { kind: "git_error", files: [], detail: status.stderr || status.stdout || "git status failed" };
+	}
+	if (!status.stdout.trim()) return { kind: "clean", files: [] };
+	const files = parsePorcelainStatusFiles(status.stdout);
+	const hasUnmergedStatus = status.stdout
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.some(line => UNMERGED_GIT_STATUS_CODES.has(line.slice(0, 2)));
+	const conflictFiles = await listConflictFilesAsync(cwd);
 	if (hasUnmergedStatus || conflictFiles.length > 0) {
 		return { kind: "conflicted", files: conflictFiles.length > 0 ? conflictFiles : files };
 	}
@@ -3062,13 +3126,15 @@ export async function requestGjcWorkerIntegrationAttempt(
 	const worker = env.GJC_TEAM_WORKER_ID?.trim() || env.GJC_TEAM_INTERNAL_WORKER?.split("/").pop()?.trim();
 	if (!teamName || !worker) return { requested: false, reason: "not_worker" };
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
+	const config = await readConfigForWorkerIntegration(dir);
 	const configuredWorker = config.workers.find(candidate => candidate.id === worker);
 	const worktreePath = env.GJC_TEAM_WORKTREE_PATH?.trim() || configuredWorker?.worktree_path;
 	if (!worktreePath || !(await pathExists(worktreePath)))
 		return { requested: false, reason: "missing_worktree", worker, team_name: teamName };
-	const classification = classifyWorkerCheckpointStatus(worktreePath);
-	const head = resolveHead(worktreePath);
+	const [classification, head] = await Promise.all([
+		classifyWorkerCheckpointStatusAsync(worktreePath),
+		resolveHeadAsync(worktreePath),
+	]);
 	if (classification.kind === "git_error") {
 		return { requested: false, reason: "git_error", worker, team_name: teamName, head, status: classification.kind };
 	}

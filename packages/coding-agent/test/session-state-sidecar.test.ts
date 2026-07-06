@@ -1,16 +1,18 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
+	eventAffectsCoordinatorRuntimeState,
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorRuntimeStateFromPostmortem,
 	readTerminalRuntimeStateMarker,
+	stateForEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
 
 const tempDirs: string[] = [];
@@ -47,7 +49,183 @@ afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
+async function readJson(file: string): Promise<Record<string, unknown>> {
+	return JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
+}
+
 describe("coordinator runtime state sidecar", () => {
+	it("reports whether events affect coordinator runtime state", () => {
+		const events = [
+			{ event: { type: "message_update", message: {}, assistantMessageEvent: {} }, affects: false },
+			{ event: { type: "notice", level: "info", message: "background notice" }, affects: false },
+			{ event: { type: "turn_start" }, affects: true },
+			{ event: { type: "agent_start" }, affects: true },
+			{ event: { type: "agent_end", messages: [] }, affects: true },
+		] as const;
+
+		for (const { event, affects } of events) {
+			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(affects);
+			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(stateForEvent(event as never) !== null);
+		}
+	});
+
+	it("skips duplicate same-state running writes within the heartbeat", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "heartbeat-session";
+		try {
+			setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			const beforeStat = await fs.stat(stateFile);
+			const beforeText = await Bun.file(stateFile).text();
+
+			setSystemTime(new Date("2026-01-01T00:00:00.500Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+			const afterStat = await fs.stat(stateFile);
+			expect(await Bun.file(stateFile).text()).toBe(beforeText);
+			expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs);
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("refreshes updated_at for duplicate same-state running writes after the heartbeat", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "heartbeat-session";
+		try {
+			setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			const before = await readJson(stateFile);
+
+			setSystemTime(new Date("2026-01-01T00:00:01.100Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+			const after = await readJson(stateFile);
+			expect(after.updated_at).toBe("2026-01-01T00:00:01.100Z");
+			expect(after.updated_at).not.toBe(before.updated_at);
+			const { updated_at: _afterTs, ...afterRest } = after;
+			const { updated_at: _beforeTs, ...beforeRest } = before;
+			expect(afterRest).toEqual(beforeRest);
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("always writes state transitions from running to completed", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "transition-session";
+		try {
+			setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+			setSystemTime(new Date("2026-01-01T00:00:00.200Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_end", messages: [] },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+			const payload = await readJson(stateFile);
+			expect(payload).toMatchObject({
+				state: "completed",
+				updated_at: "2026-01-01T00:00:00.200Z",
+				ended_at: "2026-01-01T00:00:00.200Z",
+			});
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("always writes terminal final_response events", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "terminal-session";
+		const event = {
+			type: "agent_end",
+			messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }], stopReason: "stop" }],
+		};
+		try {
+			setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			await persistCoordinatorRuntimeStateFromEvent(event, { sessionId: "fallback", cwd: root, sessionFile: null });
+
+			setSystemTime(new Date("2026-01-01T00:00:00.200Z"));
+			await persistCoordinatorRuntimeStateFromEvent(event, { sessionId: "fallback", cwd: root, sessionFile: null });
+
+			const payload = await readJson(stateFile);
+			expect(payload).toMatchObject({
+				state: "completed",
+				updated_at: "2026-01-01T00:00:00.200Z",
+				final_response: { text: "Done", source: "agent_end" },
+			});
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("invalidates the async previous-payload cache after an external state file write", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "external-session";
+		try {
+			setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			const external = {
+				schema_version: 1,
+				session_id: "external-session",
+				state: "running",
+				ready_for_input: false,
+				updated_at: "2026-01-01T00:00:00.000Z",
+				current_turn_id: "external-turn",
+				last_turn_id: null,
+				live: true,
+				reason: null,
+				source: "agent_session_event",
+				event: "turn_start",
+				cwd: root,
+				workdir: root,
+				branch: null,
+				session_file: null,
+			};
+			await Bun.write(stateFile, `${JSON.stringify(external, null, 2)}\n`);
+
+			setSystemTime(new Date("2026-01-01T00:00:01.100Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+			const payload = await readJson(stateFile);
+			expect(payload.current_turn_id).toBe("external-turn");
+			expect(payload.updated_at).toBe("2026-01-01T00:00:01.100Z");
+		} finally {
+			setSystemTime();
+		}
+	});
 	it("persists final assistant text on agent_end", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");

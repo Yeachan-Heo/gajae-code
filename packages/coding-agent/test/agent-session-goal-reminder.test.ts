@@ -83,6 +83,53 @@ describe("AgentSession active goal reminders", () => {
 		}).length;
 	}
 
+	it("skips turn-start token baseline scan when goal accounting is inactive", async () => {
+		const statsSpy = vi.spyOn(session, "getSessionStats");
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+
+		expect(statsSpy).not.toHaveBeenCalled();
+	});
+
+	it("captures turn-start token baseline when a goal is active", async () => {
+		setActiveGoal();
+		const statsSpy = vi.spyOn(session, "getSessionStats");
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+
+		expect(statsSpy).toHaveBeenCalled();
+		expect(session.goalRuntime.snapshot.turnSnapshot?.activeGoalId).toBe("goal-1");
+	});
+
+	it("does not reuse an active-goal baseline after goal mode is disabled", async () => {
+		setActiveGoal();
+		const statsSpy = vi.spyOn(session, "getSessionStats");
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(statsSpy).toHaveBeenCalledTimes(1);
+
+		session.setGoalModeState({
+			enabled: false,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "Ship the idle reminder fix",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+
+		expect(statsSpy).toHaveBeenCalledTimes(1);
+	});
+
 	it("continues after an assistant stop when an active goal remains uncleared", async () => {
 		setActiveGoal();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();

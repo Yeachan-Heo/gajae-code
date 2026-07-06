@@ -1,12 +1,148 @@
+import { createHash } from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
-import { loadEffectiveGjcPluginRegistry } from "./registry";
-import { type SessionQuarantine, validateSessionBundles, verifyEntryHashes } from "./session-validation";
+import { loadEffectiveGjcPluginRegistry, registryPathForScope } from "./registry";
+import { type SessionQuarantine, type SessionValidationResult, validateSessionBundles } from "./session-validation";
+import type { GjcPluginRegistryEntry, GjcPluginScope } from "./types";
 
 export interface AlwaysOnPluginTools {
 	tools: CustomTool[];
 	quarantine: SessionQuarantine[];
+}
+
+interface FileSnapshot {
+	path: string;
+	mtimeMs: number;
+	size: number;
+}
+
+interface ValidatedPluginRegistry {
+	effective: GjcPluginRegistryEntry[];
+	active: GjcPluginRegistryEntry[];
+	quarantine: SessionQuarantine[];
+	validation: SessionValidationResult;
+	registryFiles: FileSnapshot[];
+	pluginFiles: FileSnapshot[];
+}
+
+interface CachedValidatedPluginRegistry extends ValidatedPluginRegistry {
+	registryKey: string;
+	pluginKey: string;
+}
+
+const validatedRegistryCache = new Map<string, CachedValidatedPluginRegistry>();
+const hashCache = new Map<string, string>();
+const registryScopes: GjcPluginScope[] = ["user", "project"];
+
+async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
+	try {
+		const stat = await fs.stat(filePath);
+		return { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function snapshotsKey(snapshots: readonly FileSnapshot[]): string {
+	return snapshots.map(s => `${s.path}:${s.mtimeMs}:${s.size}`).join("|");
+}
+
+async function snapshotRegistryFiles(cwd: string): Promise<FileSnapshot[]> {
+	const snapshots = await Promise.all(
+		registryScopes.map(scope => snapshotExistingFile(registryPathForScope(scope, cwd))),
+	);
+	return snapshots.filter((s): s is FileSnapshot => s !== null);
+}
+
+async function snapshotPluginFiles(entries: readonly GjcPluginRegistryEntry[]): Promise<FileSnapshot[]> {
+	const snapshots: FileSnapshot[] = [];
+	for (const entry of entries) {
+		if (!entry.enabled) continue;
+		for (const file of entry.copiedFiles) {
+			const abs = path.join(entry.pluginRoot, file.relativePath);
+			const snapshot = await snapshotExistingFile(abs);
+			if (!snapshot) {
+				snapshots.push({ path: abs, mtimeMs: Number.NaN, size: Number.NaN });
+			} else {
+				snapshots.push(snapshot);
+			}
+		}
+	}
+	return snapshots;
+}
+
+function sha256(buf: Buffer): string {
+	return createHash("sha256").update(buf).digest("hex");
+}
+
+async function hashFile(snapshot: FileSnapshot): Promise<string> {
+	const key = `${snapshot.path}:${snapshot.mtimeMs}:${snapshot.size}`;
+	const cached = hashCache.get(key);
+	if (cached) return cached;
+	const digest = sha256(await fs.readFile(snapshot.path));
+	hashCache.set(key, digest);
+	return digest;
+}
+
+async function verifyEntryHashesCached(entry: GjcPluginRegistryEntry): Promise<SessionQuarantine | null> {
+	for (const file of entry.copiedFiles) {
+		const abs = path.join(entry.pluginRoot, file.relativePath);
+		const snapshot = await snapshotExistingFile(abs);
+		if (!snapshot) {
+			return {
+				plugin: entry.name,
+				surfaceId: `plugin:${entry.name}`,
+				code: "runtime_mismatch",
+				message: `Installed file missing: ${file.relativePath}`,
+			};
+		}
+		if ((await hashFile(snapshot)) !== file.sha256) {
+			return {
+				plugin: entry.name,
+				surfaceId: `plugin:${entry.name}`,
+				code: "runtime_mismatch",
+				message: `Installed file hash drift: ${file.relativePath}`,
+			};
+		}
+	}
+	return null;
+}
+
+async function loadValidatedPluginRegistry(cwd: string): Promise<ValidatedPluginRegistry> {
+	const registryFiles = await snapshotRegistryFiles(cwd);
+	const registryKey = snapshotsKey(registryFiles);
+	const cached = validatedRegistryCache.get(cwd);
+	if (cached && cached.registryKey === registryKey) {
+		const pluginFiles = await snapshotPluginFiles(cached.effective);
+		const pluginKey = snapshotsKey(pluginFiles);
+		if (cached.pluginKey === pluginKey) return cached;
+	}
+
+	const effective = await loadEffectiveGjcPluginRegistry(cwd);
+	const currentRegistryFiles = await snapshotRegistryFiles(cwd);
+	const preQuarantine: SessionQuarantine[] = [];
+	for (const entry of effective) {
+		if (!entry.enabled) continue;
+		const drift = await verifyEntryHashesCached(entry);
+		if (drift) preQuarantine.push(drift);
+	}
+	const validation = validateSessionBundles(effective, {}, preQuarantine);
+	const pluginFiles = await snapshotPluginFiles(effective);
+	const next: CachedValidatedPluginRegistry = {
+		effective,
+		active: validation.active,
+		quarantine: validation.quarantine,
+		validation,
+		registryFiles: currentRegistryFiles,
+		pluginFiles,
+		registryKey: snapshotsKey(currentRegistryFiles),
+		pluginKey: snapshotsKey(pluginFiles),
+	};
+	validatedRegistryCache.set(cwd, next);
+	return next;
 }
 
 /**
@@ -26,22 +162,15 @@ export async function loadAlwaysOnPluginTools(input: {
 	cwd: string;
 	reservedToolNames: string[];
 }): Promise<AlwaysOnPluginTools> {
-	const effective = await loadEffectiveGjcPluginRegistry(input.cwd);
+	const validated = await loadValidatedPluginRegistry(input.cwd);
+	const { effective } = validated;
 	if (effective.length === 0) return { tools: [], quarantine: [] };
-
-	// Hash-drift quarantine before importing any plugin code.
-	const preQuarantine: SessionQuarantine[] = [];
-	for (const entry of effective) {
-		if (!entry.enabled) continue;
-		const drift = await verifyEntryHashes(entry);
-		if (drift) preQuarantine.push(drift);
-	}
 
 	const reserved = new Set(input.reservedToolNames);
 	const { active, quarantine } = validateSessionBundles(
 		effective,
 		{ toolNames: input.reservedToolNames },
-		preQuarantine,
+		validated.quarantine,
 	);
 
 	// Map declared (path -> name) for every active always-on tool surface.
@@ -109,15 +238,8 @@ export async function loadAlwaysOnPluginTools(input: {
  * plugins are installed/enabled. Safe to call unconditionally at session start.
  */
 export async function renderAlwaysOnSystemAppendices(input: { cwd: string }): Promise<string> {
-	const effective = await loadEffectiveGjcPluginRegistry(input.cwd);
+	const { effective, active } = await loadValidatedPluginRegistry(input.cwd);
 	if (effective.length === 0) return "";
-	const preQuarantine: SessionQuarantine[] = [];
-	for (const entry of effective) {
-		if (!entry.enabled) continue;
-		const drift = await verifyEntryHashes(entry);
-		if (drift) preQuarantine.push(drift);
-	}
-	const { active } = validateSessionBundles(effective, {}, preQuarantine);
 	const { renderPluginAppendices } = await import("./prompt-appendix");
 	return (await renderPluginAppendices(active)).system;
 }
@@ -131,15 +253,8 @@ export async function renderAgentPromptAdditions(input: {
 	cwd: string;
 	agentName: string;
 }): Promise<{ appendix: string; advertisement: string }> {
-	const effective = await loadEffectiveGjcPluginRegistry(input.cwd);
+	const { effective, active } = await loadValidatedPluginRegistry(input.cwd);
 	if (effective.length === 0) return { appendix: "", advertisement: "" };
-	const preQuarantine: SessionQuarantine[] = [];
-	for (const entry of effective) {
-		if (!entry.enabled) continue;
-		const drift = await verifyEntryHashes(entry);
-		if (drift) preQuarantine.push(drift);
-	}
-	const { active } = validateSessionBundles(effective, {}, preQuarantine);
 	const { renderPluginAppendices } = await import("./prompt-appendix");
 	const { buildAgentSubskillAdvertisement } = await import("./injection");
 	const rendered = await renderPluginAppendices(active);
@@ -158,15 +273,8 @@ export async function renderSkillAdvertisement(input: {
 	skillName: string;
 	phase?: string;
 }): Promise<string> {
-	const effective = await loadEffectiveGjcPluginRegistry(input.cwd);
+	const { effective, active } = await loadValidatedPluginRegistry(input.cwd);
 	if (effective.length === 0) return "";
-	const preQuarantine: SessionQuarantine[] = [];
-	for (const entry of effective) {
-		if (!entry.enabled) continue;
-		const drift = await verifyEntryHashes(entry);
-		if (drift) preQuarantine.push(drift);
-	}
-	const { active } = validateSessionBundles(effective, {}, preQuarantine);
 	const { buildSubskillAdvertisement } = await import("./injection");
 	return buildSubskillAdvertisement(active, input.skillName, input.phase);
 }
@@ -181,15 +289,8 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 	configs: Record<string, any>;
 	quarantine: SessionQuarantine[];
 }> {
-	const effective = await loadEffectiveGjcPluginRegistry(input.cwd);
+	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd);
 	if (effective.length === 0) return { configs: {}, quarantine: [] };
-	const preQuarantine: SessionQuarantine[] = [];
-	for (const entry of effective) {
-		if (!entry.enabled) continue;
-		const drift = await verifyEntryHashes(entry);
-		if (drift) preQuarantine.push(drift);
-	}
-	const { active, quarantine } = validateSessionBundles(effective, {}, preQuarantine);
 	const { assertMcpInstallPolicy, assertDnsResolvesPublic, assertUrlAllowed } = await import("./mcp-policy");
 	const nodePath = await import("node:path");
 

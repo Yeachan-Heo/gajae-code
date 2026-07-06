@@ -342,6 +342,115 @@ export function normalizeMessagesForProvider(
 	return changed ? normalized : messages;
 }
 
+interface ConvertedContextCacheEntry {
+	messageHashes: string[];
+	modelKey: string;
+	toolKey: string;
+	intentTracing: boolean;
+	convertToLlm: AgentLoopConfig["convertToLlm"];
+	transformContext: AgentLoopConfig["transformContext"];
+	llmMessages: Context["messages"];
+	normalizedMessages: Context["messages"];
+}
+
+const convertedContextCache = new WeakMap<AgentLoopConfig, ConvertedContextCacheEntry>();
+
+function stableCacheString(value: unknown): string | undefined {
+	try {
+		return JSON.stringify(value, (_key, item) =>
+			typeof item === "function" ? `[Function:${item.name || "anonymous"}]` : item,
+		);
+	} catch {
+		return undefined;
+	}
+}
+
+function hashMessageContent(message: AgentMessage): string | undefined {
+	return stableCacheString(message);
+}
+
+function buildConvertedContextCacheKeys(
+	messages: AgentMessage[],
+	context: AgentContext,
+	config: AgentLoopConfig,
+): Pick<ConvertedContextCacheEntry, "messageHashes" | "modelKey" | "toolKey" | "intentTracing"> | undefined {
+	const intentTracing = !!config.intentTracing;
+	const messageHashes = messages.map(hashMessageContent);
+	const modelKey = stableCacheString(config.model);
+	const toolKey = stableCacheString(normalizeTools(context.tools, intentTracing) ?? []);
+	if (messageHashes.some(hash => hash === undefined) || modelKey === undefined || toolKey === undefined) {
+		return undefined;
+	}
+	return {
+		messageHashes: messageHashes as string[],
+		modelKey,
+		toolKey,
+		intentTracing,
+	};
+}
+
+function findStablePrefixLength(previous: string[], next: string[]): number {
+	const max = Math.min(previous.length, next.length);
+	let index = 0;
+	while (index < max && previous[index] === next[index]) index++;
+	return index;
+}
+
+async function convertAndNormalizeMessages(
+	messages: AgentMessage[],
+	context: AgentContext,
+	config: AgentLoopConfig,
+): Promise<Context["messages"]> {
+	const keys = buildConvertedContextCacheKeys(messages, context, config);
+	if (!keys) {
+		return normalizeMessagesForProvider(await config.convertToLlm(messages), config.model);
+	}
+	const previous = convertedContextCache.get(config);
+	const canReuse =
+		previous &&
+		previous.convertToLlm === config.convertToLlm &&
+		previous.transformContext === config.transformContext &&
+		previous.modelKey === keys.modelKey &&
+		previous.toolKey === keys.toolKey &&
+		previous.intentTracing === keys.intentTracing;
+
+	if (canReuse) {
+		const stablePrefixLength = findStablePrefixLength(previous.messageHashes, keys.messageHashes);
+		if (stablePrefixLength === keys.messageHashes.length && stablePrefixLength === previous.messageHashes.length) {
+			return previous.normalizedMessages;
+		}
+		if (
+			config.appendOnlyContext &&
+			stablePrefixLength === previous.messageHashes.length &&
+			keys.messageHashes.length > previous.messageHashes.length
+		) {
+			const suffix = messages.slice(stablePrefixLength);
+			const convertedSuffix = await config.convertToLlm(suffix);
+			const llmMessages = [...previous.llmMessages, ...convertedSuffix];
+			const normalizedMessages = normalizeMessagesForProvider(llmMessages, config.model);
+			convertedContextCache.set(config, {
+				...keys,
+				convertToLlm: config.convertToLlm,
+				transformContext: config.transformContext,
+				llmMessages,
+				normalizedMessages,
+			});
+			return normalizedMessages;
+		}
+	}
+
+	const llmMessages = await config.convertToLlm(messages);
+	const normalizedMessages = normalizeMessagesForProvider(llmMessages, config.model);
+	convertedContextCache.set(config, {
+		...keys,
+		convertToLlm: config.convertToLlm,
+		transformContext: config.transformContext,
+		llmMessages,
+		normalizedMessages,
+	});
+	return normalizedMessages;
+}
+
 export const INTENT_FIELD = "_i";
 
 function injectIntentIntoSchema(schema: unknown, mode: "require" | "optional" = "require"): unknown {
@@ -711,9 +820,9 @@ async function streamAssistantResponse(
 		messages = await config.transformContext(messages, signal);
 	}
 
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-	const normalizedMessages = normalizeMessagesForProvider(llmMessages, config.model);
+	// Convert to LLM-compatible messages (AgentMessage[] → Message[]) and normalize at the LLM boundary.
+	// Cache hits are keyed by provider-visible content hashes, never message object identity.
+	const normalizedMessages = await convertAndNormalizeMessages(messages, context, config);
 
 	// Build LLM context — append-only mode caches system prompt + tools
 	// AND keeps an append-only message log so prior-turn bytes are stable.

@@ -1125,8 +1125,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				rulebookRules.push(rule);
 			}
 		}
-		if (existingSession.injectedTtsrRules.length > 0) {
-			ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
+		if (ttsrManager.getSettings().enabled !== false) {
+			if ((existingSession.ttsrMessageCount ?? 0) > 0) {
+				ttsrManager.restoreMessageCount(existingSession.ttsrMessageCount ?? 0);
+			}
+			if (existingSession.injectedTtsrRuleRecords && existingSession.injectedTtsrRuleRecords.length > 0) {
+				ttsrManager.restoreInjected(existingSession.injectedTtsrRuleRecords);
+			} else if (existingSession.injectedTtsrRules.length > 0) {
+				ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
+			}
 		}
 		return { ttsrManager, rulebookRules, alwaysApplyRules };
 	});

@@ -45,7 +45,7 @@ Invalid regex conditions and unreachable scopes are logged as warnings and ignor
 
 ### Setting caveat
 
-`TtsrSettings.enabled` is loaded into the manager but is not currently checked in runtime gating. If TTSR rules exist, matching still runs.
+`TtsrSettings.enabled=false` makes `TtsrManager` no-op (`addRule`, `checkDelta`, `hasRules`, `restoreInjected`), so no conditional rules are registered or injected.
 
 ## 2. Streaming monitor lifecycle
 

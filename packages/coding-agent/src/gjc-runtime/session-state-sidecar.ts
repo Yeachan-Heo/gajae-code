@@ -15,6 +15,10 @@ export type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | 
 
 type FinalResponseSource = "agent_end" | "launch_error";
 const MAX_PUBLIC_ERROR_MESSAGE_LENGTH = 2000;
+const HEARTBEAT_MS = 1000;
+
+type LastPayloadCacheEntry = { mtimeMs: number; size: number; payload: Record<string, unknown> };
+const lastPayloadByStateFile = new Map<string, LastPayloadCacheEntry>();
 
 interface RuntimeStateEvent {
 	type: string;
@@ -128,7 +132,7 @@ function finalResponseForEvent(event: RuntimeStateEvent): {
 	};
 }
 
-function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
+export function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 	if (event.type === "agent_start" || event.type === "turn_start") return "running";
 	if (event.type === "agent_end") {
 		const assistant = lastAssistant(event.messages);
@@ -138,11 +142,63 @@ function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 	return null;
 }
 
+export function eventAffectsCoordinatorRuntimeState(event: RuntimeStateEvent): boolean {
+	return stateForEvent(event) !== null;
+}
+
 function readPreviousPayload(stateFile: string): Record<string, unknown> {
 	try {
 		return JSON.parse(fsSync.readFileSync(stateFile, "utf8")) as Record<string, unknown>;
 	} catch {
 		return {};
+	}
+}
+
+async function readPreviousPayloadForEvent(stateFile: string): Promise<Record<string, unknown>> {
+	let stat: Awaited<ReturnType<typeof fs.stat>>;
+	try {
+		stat = await fs.stat(stateFile);
+	} catch {
+		lastPayloadByStateFile.delete(stateFile);
+		return {};
+	}
+	const cached = lastPayloadByStateFile.get(stateFile);
+	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.payload;
+	try {
+		const payload = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+		lastPayloadByStateFile.set(stateFile, { mtimeMs: stat.mtimeMs, size: stat.size, payload });
+		return payload;
+	} catch {
+		lastPayloadByStateFile.delete(stateFile);
+		return {};
+	}
+}
+
+function withoutUpdatedAt(payload: Record<string, unknown>): Record<string, unknown> {
+	const { updated_at: _updatedAt, ...rest } = payload;
+	return rest;
+}
+
+function shouldSkipRuntimeStateWrite(
+	previous: Record<string, unknown>,
+	payload: Record<string, unknown>,
+	nowMs: number,
+): boolean {
+	if (payload.state === "completed" || payload.state === "errored") return false;
+	if (previous.state !== payload.state) return false;
+	if (previous.state !== "running" || payload.state !== "running") return false;
+	if (JSON.stringify(withoutUpdatedAt(previous)) !== JSON.stringify(withoutUpdatedAt(payload))) return false;
+	const previousUpdatedAt = typeof previous.updated_at === "string" ? Date.parse(previous.updated_at) : NaN;
+	if (!Number.isFinite(previousUpdatedAt)) return false;
+	return nowMs - previousUpdatedAt < HEARTBEAT_MS;
+}
+
+async function refreshLastPayloadCache(stateFile: string, payload: Record<string, unknown>): Promise<void> {
+	try {
+		const stat = await fs.stat(stateFile);
+		lastPayloadByStateFile.set(stateFile, { mtimeMs: stat.mtimeMs, size: stat.size, payload });
+	} catch {
+		lastPayloadByStateFile.delete(stateFile);
 	}
 }
 
@@ -377,8 +433,9 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	if (!stateFile) return;
 	const state = stateForEvent(event);
 	if (!state) return;
-	const now = new Date().toISOString();
-	const previous = readPreviousPayload(stateFile);
+	const nowMs = Date.now();
+	const now = new Date(nowMs).toISOString();
+	const previous = await readPreviousPayloadForEvent(stateFile);
 	const finalResponse = finalResponseForEvent(event);
 	const sessionId = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim()
 		? process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId
@@ -407,7 +464,9 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 			: {}),
 	};
 	try {
+		if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 		await writeStateFile(stateFile, payload);
+		await refreshLastPayloadCache(stateFile, payload);
 	} catch (error) {
 		logger.warn("Failed to persist coordinator runtime state", { error: String(error), stateFile });
 	}

@@ -193,6 +193,7 @@ import {
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
 import {
+	eventAffectsCoordinatorRuntimeState,
 	persistCoordinatorRuntimeStateFromEvent,
 	registerCoordinatorRuntimeStateFinalizer,
 } from "../gjc-runtime/session-state-sidecar";
@@ -936,6 +937,117 @@ export type BeforeAgentStartContributor = (event: {
 	sessionId: string | undefined;
 }) => Promise<BeforeAgentStartInternalMessage | undefined>;
 
+export class WorkerIntegrationRequestScheduler {
+	#inFlight: Promise<void> | undefined = undefined;
+	#pending = false;
+
+	constructor(readonly request: () => Promise<void>) {}
+
+	enqueue(): void {
+		if (this.#inFlight) {
+			this.#pending = true;
+			return;
+		}
+		this.#start();
+	}
+
+	async flush(): Promise<void> {
+		while (this.#inFlight) {
+			await this.#inFlight;
+		}
+	}
+
+	#start(): void {
+		this.#pending = false;
+		// Isolate request rejections so flush() can never reject or deadlock: the
+		// request is expected to handle/log its own errors, but a throwing generic
+		// request must still clear #inFlight and drain any trailing pending run.
+		this.#inFlight = this.request()
+			.catch(() => {})
+			.finally(() => {
+				this.#inFlight = undefined;
+				if (this.#pending) this.#start();
+			});
+	}
+}
+
+export type StreamingEditParsedToolCall = {
+	toolCall: ToolCall;
+	path: string;
+	resolvedPath: string;
+	diff?: string;
+	op?: string;
+	rename?: string;
+};
+
+export type StreamingEditParsedCacheEntry = {
+	version: string;
+	parsed: StreamingEditParsedToolCall | undefined;
+};
+
+function stableStreamingEditArgsVersion(args: unknown): string | undefined {
+	if (typeof args === "string") return args;
+	if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+	try {
+		return JSON.stringify(args);
+	} catch {
+		return undefined;
+	}
+}
+
+export function getStreamingEditToolCallForEvent(
+	event: AgentEvent,
+	cache: Map<string, StreamingEditParsedCacheEntry>,
+	resolvePath: (filePath: string) => string | undefined,
+): StreamingEditParsedToolCall | undefined {
+	if (event.type !== "message_update") return undefined;
+	if (event.message.role !== "assistant") return undefined;
+
+	const contentIndex = event.assistantMessageEvent.contentIndex ?? 0;
+	const messageContent = event.message.content;
+	if (!Array.isArray(messageContent) || contentIndex < 0 || contentIndex >= messageContent.length) {
+		return undefined;
+	}
+
+	const toolCall = messageContent[contentIndex] as ToolCall;
+	if (toolCall.name !== "edit") return undefined;
+
+	const version = stableStreamingEditArgsVersion(toolCall.arguments);
+	if (version === undefined) return undefined;
+	const cacheKey = String(contentIndex);
+	const cached = cache.get(cacheKey);
+	if (cached?.version === version) return cached.parsed;
+
+	let args: unknown = toolCall.arguments;
+	if (typeof args === "string") {
+		try {
+			args = JSON.parse(args) as unknown;
+		} catch {
+			cache.delete(cacheKey);
+			return undefined;
+		}
+	}
+	if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+	if ("old_text" in args || "new_text" in args) return undefined;
+
+	const argsRecord = args as Record<string, unknown>;
+	const path = typeof argsRecord.path === "string" ? argsRecord.path : undefined;
+	if (!path) return undefined;
+	const resolvedPath = resolvePath(path);
+	if (resolvedPath === undefined) return undefined;
+
+	const parsed = {
+		toolCall,
+		path,
+		resolvedPath,
+		diff: typeof argsRecord.diff === "string" ? argsRecord.diff : undefined,
+		op: typeof argsRecord.op === "string" ? argsRecord.op : undefined,
+		rename: typeof argsRecord.rename === "string" ? argsRecord.rename : undefined,
+	};
+	cache.set(cacheKey, { version, parsed });
+	return parsed;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -978,12 +1090,15 @@ export class AgentSession {
 	#workflowGateEmitter: WorkflowGateEmitter | undefined;
 	#goalRuntime: GoalRuntime;
 	#goalTurnCounter = 0;
+	#streamingEditParsedToolCallCache = new Map<string, StreamingEditParsedCacheEntry>();
 	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
 	#clientBridge: ClientBridge | undefined;
 	#allowAcpAgentInitiatedTurns = false;
 	/** Per-session memory of allow_always / reject_always decisions for gated tools. */
 	#acpPermissionDecisions: Map<string, "allow_always" | "reject_always"> = new Map();
+	#guardedToolWrapperCache = new WeakMap<AgentTool, Map<string, AgentTool>>();
+	#acpPermissionWrapperVersion = 0;
 
 	// Compaction state
 	#compactionAbortController: AbortController | undefined = undefined;
@@ -1045,6 +1160,11 @@ export class AgentSession {
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#turnIndex = 0;
+	#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(async () => {
+		await requestGjcWorkerIntegrationAttempt(this.sessionManager.getCwd(), process.env).catch(error => {
+			logger.warn("GJC team worker integration request failed", { error: String(error) });
+		});
+	});
 	// First-party internal before-agent-start contributors (not user hooks).
 	#beforeAgentStartContributors: BeforeAgentStartContributor[] = [];
 
@@ -1784,19 +1904,27 @@ export class AgentSession {
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
+		if (event.type === "message_update") {
+			this.#emit(event);
+			if (eventAffectsCoordinatorRuntimeState(event)) {
+				void persistCoordinatorRuntimeStateFromEvent(event, {
+					sessionId: this.sessionId,
+					cwd: this.sessionManager.getCwd(),
+					sessionFile: this.sessionManager.getSessionFile(),
+				});
+			}
+			if (this.#extensionRunner?.hasHandlers("message_update")) {
+				void this.#queueExtensionEvent(event);
+			}
+			return;
+		}
+
 		const persistRuntimeState = () =>
 			persistCoordinatorRuntimeStateFromEvent(event, {
 				sessionId: this.sessionId,
 				cwd: this.sessionManager.getCwd(),
 				sessionFile: this.sessionManager.getSessionFile(),
 			});
-
-		if (event.type === "message_update") {
-			this.#emit(event);
-			void persistRuntimeState();
-			void this.#queueExtensionEvent(event);
-			return;
-		}
 		// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
 		// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
 		// emitting while #promptInFlightCount > 0 lets a client fire its next
@@ -1903,7 +2031,7 @@ export class AgentSession {
 			}
 		}
 
-		if (event.type === "turn_start") {
+		if (event.type === "turn_start" && this.#goalRuntime.shouldTrackTurnBaseline()) {
 			const usage = this.getSessionStats().tokens;
 			this.#goalRuntime.onTurnStart(`turn-${++this.#goalTurnCounter}`, {
 				input: usage.input,
@@ -2655,8 +2783,10 @@ export class AgentSession {
 		// The TTSR manager was already claimed at bucket time; only persistence remains.
 		const ruleNames = rules.map(r => r.name.trim()).filter(n => n.length > 0);
 		if (ruleNames.length > 0) {
-			this.sessionManager.appendTtsrInjection(ruleNames);
+			const records = this.#ttsrManager?.getInjectedRecords().filter(record => ruleNames.includes(record.name));
+			this.sessionManager.appendTtsrInjection(ruleNames, records, this.#ttsrManager?.getMessageCount());
 		}
+
 		return {
 			content: [{ type: "text", text: reminder }, ...ctx.result.content],
 		};
@@ -2681,7 +2811,8 @@ export class AgentSession {
 			return;
 		}
 		this.#ttsrManager?.markInjectedByNames(uniqueRuleNames);
-		this.sessionManager.appendTtsrInjection(uniqueRuleNames);
+		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
+		this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, this.#ttsrManager?.getMessageCount());
 	}
 
 	#findTtsrAssistantIndex(targetTimestamp: number | undefined): number {
@@ -2866,54 +2997,14 @@ export class AgentSession {
 		this.#streamingEditAbortTriggered = false;
 		this.#streamingEditCheckedLineCounts.clear();
 		this.#streamingEditPrecheckedToolCallIds.clear();
+		this.#streamingEditParsedToolCallCache.clear();
 		this.#streamingEditFileCache.clear();
 	}
 
-	#getStreamingEditToolCall(event: AgentEvent):
-		| {
-				toolCall: ToolCall;
-				path: string;
-				resolvedPath: string;
-				diff?: string;
-				op?: string;
-				rename?: string;
-		  }
-		| undefined {
-		if (event.type !== "message_update") return undefined;
-		if (event.message.role !== "assistant") return undefined;
-
-		const contentIndex = event.assistantMessageEvent.contentIndex ?? 0;
-		const messageContent = event.message.content;
-		if (!Array.isArray(messageContent) || contentIndex < 0 || contentIndex >= messageContent.length) {
-			return undefined;
-		}
-
-		const toolCall = messageContent[contentIndex] as ToolCall;
-		if (toolCall.name !== "edit") return undefined;
-
-		const args = toolCall.arguments;
-		if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
-		if ("old_text" in args || "new_text" in args) return undefined;
-
-		const path = typeof args.path === "string" ? args.path : undefined;
-		if (!path) return undefined;
-
-		// `local://` URLs (e.g. local://PLAN.md for plan-mode) resolve to a real
-		// on-disk artifacts path; pre-caching works as long as we ask the
-		// local-protocol handler. Other internal-scheme URLs have no stable filesystem representation;
-		// skip pre-cache entirely for those — the edit tool itself will reject
-		// them through its normal dispatch path.
-		const resolvedPath = this.#resolveSessionFsPath(path);
-		if (resolvedPath === undefined) return undefined;
-
-		return {
-			toolCall,
-			path,
-			resolvedPath,
-			diff: typeof args.diff === "string" ? args.diff : undefined,
-			op: typeof args.op === "string" ? args.op : undefined,
-			rename: typeof args.rename === "string" ? args.rename : undefined,
-		};
+	#getStreamingEditToolCall(event: AgentEvent): StreamingEditParsedToolCall | undefined {
+		return getStreamingEditToolCallForEvent(event, this.#streamingEditParsedToolCallCache, filePath =>
+			this.#resolveSessionFsPath(filePath),
+		);
 	}
 
 	#lastStreamingEditToolCallId: string | undefined;
@@ -3151,12 +3242,21 @@ export class AgentSession {
 		}
 	}
 
+	#requestWorkerIntegrationAttempt(): void {
+		this.#workerIntegrationScheduler.enqueue();
+	}
+
+	async #flushWorkerIntegrationAttempt(): Promise<void> {
+		await this.#workerIntegrationScheduler.flush();
+	}
+
 	/** Emit extension events based on session events */
 	async #emitExtensionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "turn_end") {
-			await requestGjcWorkerIntegrationAttempt(this.sessionManager.getCwd(), process.env).catch(error => {
-				logger.warn("GJC team worker integration request failed", { error: String(error) });
-			});
+			this.#requestWorkerIntegrationAttempt();
+		}
+		if (event.type === "agent_end") {
+			await this.#flushWorkerIntegrationAttempt();
 		}
 		if (!this.#extensionRunner) return;
 		if (event.type === "agent_start") {
@@ -3370,6 +3470,7 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
+		await this.#flushWorkerIntegrationAttempt();
 		await this.#cancelPostPromptTasks();
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
 		// leak its background bash/task work into the parent's manager. Only
@@ -3986,8 +4087,25 @@ export class AgentSession {
 		}) as T;
 	}
 
+	#guardedToolWrapperCacheKey(): string {
+		const bridge = this.#clientBridge;
+		const acpEnabled = Boolean(bridge?.capabilities.requestPermission && bridge.requestPermission);
+		const activeSkill = this.#activeSkillState?.skill ?? "";
+		const activeSkillSession = this.#activeSkillState?.sessionId ?? "";
+		return [
+			"deep-interview-mutation-v1",
+			"ultragoal-ask-v1",
+			`active=${activeSkill}:${activeSkillSession}`,
+			`acp=${acpEnabled ? "on" : "off"}:${this.#acpPermissionWrapperVersion}`,
+		].join("|");
+	}
+
 	#prepareToolForExecution<T extends AgentTool>(tool: T): T {
-		return this.#wrapToolForDeepInterviewMutationGuard(
+		const cacheKey = this.#guardedToolWrapperCacheKey();
+		let wrappersByVersion = this.#guardedToolWrapperCache.get(tool);
+		const cached = wrappersByVersion?.get(cacheKey);
+		if (cached) return cached as T;
+		const wrapped = this.#wrapToolForDeepInterviewMutationGuard(
 			this.#wrapToolForAcpPermission(
 				guardToolForUltragoalAsk(
 					tool,
@@ -3999,6 +4117,12 @@ export class AgentSession {
 				),
 			),
 		);
+		if (!wrappersByVersion) {
+			wrappersByVersion = new Map();
+			this.#guardedToolWrapperCache.set(tool, wrappersByVersion);
+		}
+		wrappersByVersion.set(cacheKey, wrapped);
+		return wrapped;
 	}
 
 	#setGuardedAgentTools(tools: AgentTool[]): void {
@@ -4655,6 +4779,7 @@ export class AgentSession {
 	setClientBridge(bridge: ClientBridge | undefined): void {
 		this.#clientBridge = bridge;
 		this.#acpPermissionDecisions.clear();
+		this.#acpPermissionWrapperVersion++;
 		const activeToolNames = this.getActiveToolNames();
 		const activeTools = activeToolNames
 			.map(name => this.#toolRegistry.get(name))

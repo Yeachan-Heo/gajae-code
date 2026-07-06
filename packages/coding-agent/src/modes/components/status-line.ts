@@ -467,7 +467,7 @@ export class StatusLineComponent implements Component {
 		const cwd = typeof getCwd === "function" ? getCwd.call(this.session.sessionManager) : getProjectDir();
 		const sessionId = typeof getSessionId === "function" ? getSessionId.call(this.session.sessionManager) : undefined;
 		this.#skillHudInFlight = true;
-		void readVisibleSkillActiveState(cwd, sessionId)
+		void readVisibleSkillActiveState(cwd, sessionId, { tier: "hud" })
 			.then(state => {
 				this.#skillHudEntries = state?.active_skills ?? [];
 			})

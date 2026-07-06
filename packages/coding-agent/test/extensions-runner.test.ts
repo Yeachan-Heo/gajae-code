@@ -676,6 +676,41 @@ describe("ExtensionRunner", () => {
 
 			warnSpy.mockRestore();
 		});
+
+		it("does not emit timeout errors for fast handlers", async () => {
+			const extPath = path.join(tempDir.path(), "fast-timeout.ts");
+			fs.writeFileSync(
+				extPath,
+				`
+					export default function(pi) {
+						pi.on("session_start", async () => "ok");
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions([extPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError(err => {
+				errors.push(err);
+			});
+			testSetExtensionHandlerTimeoutMs(10);
+
+			await runner.emit({ type: "session_start" });
+			await Bun.sleep(20);
+
+			expect(warnSpy).not.toHaveBeenCalledWith("Extension handler timed out", expect.any(Object));
+			expect(errors).toEqual([]);
+
+			warnSpy.mockRestore();
+		});
 	});
 
 	describe("session name API", () => {
@@ -774,6 +809,111 @@ describe("ExtensionRunner", () => {
 
 			expect(runner.hasHandlers("tool_call")).toBe(true);
 			expect(runner.hasHandlers("agent_end")).toBe(false);
+		});
+
+		it("returns true for other indexed event types and false when no handlers exist", async () => {
+			let result = await loadTestExtensions();
+			let runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			expect(runner.hasHandlers("before_provider_request")).toBe(false);
+
+			const extCode = `
+				export default function(pi) {
+					pi.on("before_provider_request", async (event) => event.payload);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "before-provider-request-handler.ts"), extCode);
+
+			result = await loadTestExtensions();
+			runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
+
+			expect(runner.hasHandlers("before_provider_request")).toBe(true);
+		});
+
+		it("reports message_update handlers for agent-session fast path predicate", async () => {
+			let result = await loadTestExtensions();
+			let runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			expect(runner.hasHandlers("message_update")).toBe(false);
+
+			const extCode = `
+				export default function(pi) {
+					pi.on("message_update", async () => undefined);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "message-update-handler.ts"), extCode);
+
+			result = await loadTestExtensions();
+			runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
+
+			expect(runner.hasHandlers("message_update")).toBe(true);
+		});
+	});
+
+	describe("handler dispatch index", () => {
+		it("returns without creating context when an event has no handlers", async () => {
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const messages = [{ role: "user", content: "hello" }] as Parameters<ExtensionRunner["emitContext"]>[0];
+			const createContextSpy = vi.spyOn(runner, "createContext");
+
+			await expect(runner.emitContext(messages)).resolves.toBe(messages);
+
+			expect(createContextSpy).not.toHaveBeenCalled();
+		});
+
+		it("preserves extension order then handler order within each extension", async () => {
+			const orderPath = path.join(tempDir.path(), "order.json");
+			const extensionCode = (labels: string[]) => `
+				import * as fs from "node:fs";
+
+				export default function(pi) {
+					${labels
+						.map(
+							label => `pi.on("session_start", async () => {
+								const order = fs.existsSync(${JSON.stringify(orderPath)})
+									? JSON.parse(fs.readFileSync(${JSON.stringify(orderPath)}, "utf8"))
+									: [];
+								order.push(${JSON.stringify(label)});
+								fs.writeFileSync(${JSON.stringify(orderPath)}, JSON.stringify(order));
+							});`,
+						)
+						.join("\n")}
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "ordered-a.ts"), extensionCode(["a1", "a2"]));
+			fs.writeFileSync(path.join(extensionsDir, "ordered-b.ts"), extensionCode(["b1", "b2"]));
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			await runner.emit({ type: "session_start" });
+
+			expect(JSON.parse(fs.readFileSync(orderPath, "utf8"))).toEqual(["a1", "a2", "b1", "b2"]);
 		});
 	});
 

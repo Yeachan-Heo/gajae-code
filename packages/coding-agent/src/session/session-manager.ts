@@ -27,7 +27,9 @@ import {
 	Snowflake,
 	toError,
 } from "@gajae-code/utils";
+import type { TtsrInjectionRecord } from "../export/ttsr";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
+
 import * as git from "../utils/git";
 import { ArtifactManager } from "./artifacts";
 import {
@@ -221,6 +223,10 @@ export interface TtsrInjectionEntry extends SessionEntryBase {
 	type: "ttsr_injection";
 	/** Names of rules that were injected */
 	injectedRules: string[];
+	/** Rich rule injection records with repeat state. */
+	injectedRuleRecords?: TtsrInjectionRecord[];
+	/** TTSR manager message count when this injection was recorded. */
+	ttsrMessageCount?: number;
 }
 
 /** Persisted MCP discovery selection state for a session branch. */
@@ -313,6 +319,11 @@ export interface SessionContext {
 	models: Record<string, string>;
 	/** Names of TTSR rules that have been injected this session */
 	injectedTtsrRules: string[];
+	/** Rich TTSR rule injection records for repeat resume. */
+	injectedTtsrRuleRecords?: TtsrInjectionRecord[];
+	/** TTSR manager message count for repeat resume. */
+	ttsrMessageCount?: number;
+
 	/** MCP tool names selected through discovery for this session branch. */
 	selectedMCPToolNames: string[];
 	/** Whether this branch contains an explicit persisted MCP selection entry. */
@@ -612,6 +623,9 @@ export function buildSessionContext(
 			serviceTier: undefined,
 			models: {},
 			injectedTtsrRules: [],
+			injectedTtsrRuleRecords: [],
+			ttsrMessageCount: 0,
+
 			selectedMCPToolNames: [],
 			hasPersistedMCPToolSelection: false,
 			mode: "none",
@@ -632,6 +646,8 @@ export function buildSessionContext(
 			serviceTier: undefined,
 			models: {},
 			injectedTtsrRules: [],
+			injectedTtsrRuleRecords: [],
+			ttsrMessageCount: 0,
 			selectedMCPToolNames: [],
 			hasPersistedMCPToolSelection: false,
 			mode: "none",
@@ -656,6 +672,9 @@ export function buildSessionContext(
 	const models: Record<string, string> = {};
 	let compaction: CompactionEntry | null = null;
 	const injectedTtsrRulesSet = new Set<string>();
+	const injectedTtsrRuleRecords = new Map<string, TtsrInjectionRecord>();
+	let ttsrMessageCount = 0;
+
 	let selectedMCPToolNames: string[] = [];
 	let hasPersistedMCPToolSelection = false;
 	let mode = "none";
@@ -695,9 +714,19 @@ export function buildSessionContext(
 		} else if (entry.type === "compaction") {
 			compaction = entry;
 		} else if (entry.type === "ttsr_injection") {
-			// Collect injected TTSR rule names
+			// Collect injected TTSR rule names and richer records when present.
 			for (const ruleName of entry.injectedRules) {
 				injectedTtsrRulesSet.add(ruleName);
+				if (!injectedTtsrRuleRecords.has(ruleName)) {
+					injectedTtsrRuleRecords.set(ruleName, { name: ruleName, lastInjectedAt: 0 });
+				}
+			}
+			for (const record of entry.injectedRuleRecords ?? []) {
+				injectedTtsrRulesSet.add(record.name);
+				injectedTtsrRuleRecords.set(record.name, record);
+			}
+			if (typeof entry.ttsrMessageCount === "number" && Number.isFinite(entry.ttsrMessageCount)) {
+				ttsrMessageCount = entry.ttsrMessageCount;
 			}
 		} else if (entry.type === "mcp_tool_selection") {
 			selectedMCPToolNames = [...entry.selectedToolNames];
@@ -709,6 +738,7 @@ export function buildSessionContext(
 	}
 
 	const injectedTtsrRules = Array.from(injectedTtsrRulesSet);
+	const injectedTtsrRuleRecordsArray = Array.from(injectedTtsrRuleRecords.values());
 
 	// Build messages and collect corresponding entries
 	// When there's a compaction, we need to:
@@ -797,6 +827,9 @@ export function buildSessionContext(
 		serviceTier,
 		models,
 		injectedTtsrRules,
+		injectedTtsrRuleRecords: injectedTtsrRuleRecordsArray,
+		ttsrMessageCount,
+
 		selectedMCPToolNames,
 		hasPersistedMCPToolSelection,
 		mode,
@@ -810,6 +843,9 @@ function cloneSessionContext(context: SessionContext): SessionContext {
 		messages: cloneJsonSemantic(context.messages),
 		models: { ...context.models },
 		injectedTtsrRules: [...context.injectedTtsrRules],
+		injectedTtsrRuleRecords: context.injectedTtsrRuleRecords?.map(record => ({ ...record })),
+		ttsrMessageCount: context.ttsrMessageCount,
+
 		selectedMCPToolNames: [...context.selectedMCPToolNames],
 		modeData: cloneJsonSemantic(context.modeData),
 	};
@@ -4067,13 +4103,15 @@ export class SessionManager {
 	 * @param ruleNames Names of rules that were injected
 	 * @returns Entry id
 	 */
-	appendTtsrInjection(ruleNames: string[]): string {
+	appendTtsrInjection(ruleNames: string[], records?: TtsrInjectionRecord[], ttsrMessageCount?: number): string {
 		const entry: TtsrInjectionEntry = {
 			type: "ttsr_injection",
 			id: generateId(this.#byId),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			injectedRules: ruleNames,
+			injectedRuleRecords: records,
+			ttsrMessageCount,
 		};
 		this.#appendEntry(entry);
 		return entry.id;

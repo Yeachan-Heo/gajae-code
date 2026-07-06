@@ -222,7 +222,7 @@ async function getActivePlanningSkill(
 ): Promise<ActivePlanningSkill | null> {
 	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
 	if (!resolvedSessionId) return null;
-	const skillState = await readVisibleSkillActiveState(cwd, resolvedSessionId);
+	const skillState = await readVisibleSkillActiveState(cwd, resolvedSessionId, { tier: "security" });
 	if (!skillState) return null;
 	const activeEntries = listActiveSkills(skillState).filter(entry =>
 		entryMatchesContext(entry, resolvedSessionId, threadId),

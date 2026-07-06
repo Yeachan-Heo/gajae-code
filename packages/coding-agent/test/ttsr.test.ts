@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { parseRuleConditionAndScope, type Rule } from "@gajae-code/coding-agent/capability/rule";
+import { buildRuleFromMarkdown } from "@gajae-code/coding-agent/discovery/helpers";
 import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 
 function makeRule(partial: Partial<Rule>): Rule {
@@ -13,6 +14,9 @@ function makeRule(partial: Partial<Rule>): Rule {
 		description: partial.description,
 		condition: partial.condition,
 		scope: partial.scope,
+		repeatMode: partial.repeatMode,
+		repeatGap: partial.repeatGap,
+
 		_source: partial._source ?? {
 			provider: "test",
 			providerName: "test",
@@ -20,6 +24,26 @@ function makeRule(partial: Partial<Rule>): Rule {
 			level: "project",
 		},
 	};
+}
+
+function bucketRulesWithTtsrDisabled(rules: Rule[]): { rulebookRules: Rule[]; alwaysApplyRules: Rule[] } {
+	const ttsrManager = new TtsrManager({ enabled: false });
+	const rulebookRules: Rule[] = [];
+	const alwaysApplyRules: Rule[] = [];
+	for (const rule of rules) {
+		const isTtsrRule = rule.condition && rule.condition.length > 0 ? ttsrManager.addRule(rule) : false;
+		if (isTtsrRule) {
+			continue;
+		}
+		if (rule.alwaysApply === true) {
+			alwaysApplyRules.push(rule);
+			continue;
+		}
+		if (rule.description) {
+			rulebookRules.push(rule);
+		}
+	}
+	return { rulebookRules, alwaysApplyRules };
 }
 
 describe("parseRuleConditionAndScope", () => {
@@ -86,6 +110,74 @@ describe("parseRuleConditionAndScope", () => {
 
 		expect(parsed.condition).toEqual([".*"]);
 		expect(parsed.scope).toEqual(["tool:edit(*.rs)", "tool:write(*.rs)"]);
+	});
+
+	it("parses per-rule repeat policy frontmatter", () => {
+		const rule = buildRuleFromMarkdown(
+			"rule.md",
+			'---\ncondition: "forbidden"\nrepeatMode: "after-gap"\nrepeatGap: 3\n---\nContent',
+			"/tmp/rule.md",
+			{ provider: "test", providerName: "test", path: "/tmp/rule.md", level: "project" },
+		);
+
+		expect(rule.condition).toEqual(["forbidden"]);
+		expect(rule.repeatMode).toBe("after-gap");
+		expect(rule.repeatGap).toBe(3);
+	});
+});
+
+describe("TtsrManager disabled behavior", () => {
+	it("does not register rules when disabled", () => {
+		const manager = new TtsrManager({ enabled: false });
+		const rule = makeRule({
+			name: "disabled-rule",
+			condition: ["forbidden"],
+			scope: ["text"],
+		});
+
+		expect(manager.addRule(rule)).toBe(false);
+		expect(manager.hasRules()).toBe(false);
+		manager.restoreInjected([rule.name]);
+		expect(manager.getInjectedRuleNames()).toEqual([]);
+	});
+
+	it("does not match deltas when disabled", () => {
+		const manager = new TtsrManager({ enabled: false });
+		const rule = makeRule({
+			name: "disabled-match",
+			condition: ["forbidden"],
+			scope: ["text"],
+		});
+
+		expect(manager.addRule(rule)).toBe(false);
+		expect(manager.checkDelta("forbidden", { source: "text" })).toEqual([]);
+	});
+
+	it("keeps disabled conditional-only rules out of sdk rulebook bucketing", () => {
+		const conditionalOnly = makeRule({
+			name: "conditional-only",
+			condition: ["forbidden"],
+		});
+		const conditionalWithDescription = makeRule({
+			name: "conditional-with-description",
+			condition: ["forbidden"],
+			description: "Visible in rulebook when TTSR is disabled",
+		});
+		const conditionalAlwaysApply = makeRule({
+			name: "conditional-always-apply",
+			condition: ["forbidden"],
+			alwaysApply: true,
+		});
+
+		// Mirrors sdk.ts discovery bucketing: addRule(false) must not turn conditional-only rules into rulebook rules.
+		const { rulebookRules, alwaysApplyRules } = bucketRulesWithTtsrDisabled([
+			conditionalOnly,
+			conditionalWithDescription,
+			conditionalAlwaysApply,
+		]);
+
+		expect(rulebookRules).toEqual([conditionalWithDescription]);
+		expect(alwaysApplyRules).toEqual([conditionalAlwaysApply]);
 	});
 });
 
@@ -273,6 +365,35 @@ describe("TtsrManager scope matching", () => {
 	});
 });
 
+describe("TtsrManager bounded matching", () => {
+	it("matches safe conditions across chunk boundaries", () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({ name: "boundary", condition: ["forbidden"], scope: ["text"] });
+		manager.addRule(rule);
+
+		expect(manager.checkDelta("for", { source: "text" })).toEqual([]);
+		expect(manager.checkDelta("bidden", { source: "text" })).toEqual([rule]);
+	});
+
+	it("falls back to full-buffer matching for anchored unsafe regex", () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({ name: "anchored", condition: ["^hello.*forbidden$"], scope: ["text"] });
+		manager.addRule(rule);
+
+		expect(manager.checkDelta("hello ", { source: "text" })).toEqual([]);
+		expect(manager.checkDelta("forbidden", { source: "text" })).toEqual([rule]);
+	});
+
+	it("does not scan conditions when no rule is triggerable for the context", () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({ name: "once-only", condition: ["forbidden"], scope: ["text"] });
+		manager.addRule(rule);
+		manager.markInjected([rule]);
+
+		expect(manager.checkDelta("forbidden", { source: "text" })).toEqual([]);
+	});
+});
+
 describe("TtsrManager repeat behavior", () => {
 	const turnContext = { source: "text" as const };
 
@@ -344,6 +465,40 @@ describe("TtsrManager repeat behavior", () => {
 		expect(runTurn(manager, rule)).toEqual([rule]);
 	});
 
+	it("honors per-rule once override when global mode is after-gap", () => {
+		const manager = new TtsrManager({ repeatMode: "after-gap", repeatGap: 1 });
+		const rule = makeRule({ name: "rule-once", condition: ["forbidden"], scope: ["text"], repeatMode: "once" });
+		manager.addRule(rule);
+
+		expect(runTurn(manager, rule)).toEqual([rule]);
+		expect(runTurn(manager, rule)).toEqual([]);
+	});
+
+	it("honors per-rule after-gap override when global mode is once", () => {
+		const manager = new TtsrManager({ repeatMode: "once", repeatGap: 10 });
+		const rule = makeRule({
+			name: "rule-after-gap",
+			condition: ["forbidden"],
+			scope: ["text"],
+			repeatMode: "after-gap",
+			repeatGap: 1,
+		});
+		manager.addRule(rule);
+
+		expect(runTurn(manager, rule)).toEqual([rule]);
+		expect(runTurn(manager, rule)).toEqual([rule]);
+	});
+
+	it("honors per-rule repeat gap override", () => {
+		const manager = new TtsrManager({ repeatMode: "after-gap", repeatGap: 10 });
+		const rule = makeRule({ name: "rule-gap", condition: ["forbidden"], scope: ["text"], repeatGap: 2 });
+		manager.addRule(rule);
+
+		expect(runTurn(manager, rule)).toEqual([rule]);
+		expect(runTurn(manager, rule)).toEqual([]);
+		expect(runTurn(manager, rule)).toEqual([rule]);
+	});
+
 	it("blocks restored rules in once mode across resumed sessions", () => {
 		const manager = new TtsrManager({
 			enabled: true,
@@ -375,6 +530,30 @@ describe("TtsrManager repeat behavior", () => {
 		expect(runTurn(manager, rule)).toEqual([]);
 		expect(runTurn(manager, rule)).toEqual([]);
 		expect(runTurn(manager, rule)).toEqual([rule]);
+	});
+
+	it("restores new record arrays with exact lastInjectedAt", () => {
+		const manager = new TtsrManager({ repeatMode: "after-gap", repeatGap: 3 });
+		const rule = createRepeatRule("record-gap");
+		manager.addRule(rule);
+		manager.restoreMessageCount(4);
+		manager.restoreInjected([{ name: rule.name, lastInjectedAt: 2, repeatMode: "after-gap", repeatGap: 3 }]);
+
+		expect(runTurn(manager, rule)).toEqual([]);
+		expect(runTurn(manager, rule)).toEqual([rule]);
+	});
+
+	it("resumes after-gap with exact remaining gap from restored message count", () => {
+		const manager = new TtsrManager({ repeatMode: "after-gap", repeatGap: 5 });
+		const rule = createRepeatRule("resume-gap");
+		manager.addRule(rule);
+		manager.restoreMessageCount(7);
+		manager.restoreInjected([{ name: rule.name, lastInjectedAt: 3, repeatMode: "after-gap", repeatGap: 5 }]);
+
+		expect(manager.checkDelta("forbidden", turnContext)).toEqual([]);
+		manager.incrementMessageCount();
+		manager.resetBuffer();
+		expect(manager.checkDelta("forbidden", turnContext)).toEqual([rule]);
 	});
 
 	it("tracks only one injection record per rule per turn", () => {

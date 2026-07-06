@@ -1,8 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { installGjcPluginBundle, loadAlwaysOnPluginTools } from "../src/extensibility/gjc-plugins";
+import {
+	installGjcPluginBundle,
+	loadAlwaysOnPluginTools,
+	renderSkillAdvertisement,
+} from "../src/extensibility/gjc-plugins";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");
@@ -75,5 +79,85 @@ describe("always-on plugin tool runtime activation", () => {
 		expect(res.tools.map(t => t.name)).not.toContain("actual_y");
 		expect(res.tools.map(t => t.name)).not.toContain("declared_x");
 		expect(res.quarantine.some(q => q.code === "runtime_mismatch")).toBe(true);
+	});
+
+	test("reuses validated registry hashes across repeated surface calls until files change", async () => {
+		const cwd = await mkCwd();
+		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
+		const readFileSpy = spyOn(fs, "readFile");
+		const pluginReadCount = () =>
+			readFileSpy.mock.calls.filter(args => typeof args[0] === "string" && args[0].startsWith(installedRoot)).length;
+
+		try {
+			const first = await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
+			expect(first).toContain('activation_arg="design"');
+			const afterFirst = pluginReadCount();
+			expect(afterFirst).toBeGreaterThan(0);
+
+			const second = await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
+			expect(second).toContain('activation_arg="design"');
+			expect(pluginReadCount()).toBe(afterFirst);
+		} finally {
+			readFileSpy.mockRestore();
+		}
+	});
+
+	test("file metadata changes force re-hash and drift quarantine", async () => {
+		const cwd = await mkCwd();
+		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const installed = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "tools", "domain-note.ts");
+		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
+		const readFileSpy = spyOn(fs, "readFile");
+		const pluginReadCount = () =>
+			readFileSpy.mock.calls.filter(args => typeof args[0] === "string" && args[0].startsWith(installedRoot)).length;
+
+		try {
+			await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
+			const afterPriming = pluginReadCount();
+			await fs.appendFile(installed, "\n// tampered after cache priming\n");
+
+			const res = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: [] });
+			expect(pluginReadCount()).toBeGreaterThan(afterPriming);
+			expect(res.tools.map(t => t.name)).not.toContain("domain_note");
+			expect(res.quarantine.some(q => q.code === "runtime_mismatch")).toBe(true);
+		} finally {
+			readFileSpy.mockRestore();
+		}
+	});
+
+	test("same-size tamper with restored mtime still fails closed instead of reusing a forged hash", async () => {
+		const cwd = await mkCwd();
+		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const installed = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "tools", "domain-note.ts");
+		const beforeStat = await fs.stat(installed);
+		const primed = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: [] });
+		expect(primed.tools.map(t => t.name)).toContain("domain_note");
+
+		const original = await fs.readFile(installed, "utf8");
+		const tampered = original.replace('label: "Domain Note"', 'label: "Domain Nope"');
+		expect(tampered).not.toBe(original);
+		expect(Buffer.byteLength(tampered)).toBe(Buffer.byteLength(original));
+		await fs.writeFile(installed, tampered);
+		await fs.utimes(installed, beforeStat.atime, beforeStat.mtime);
+
+		const res = await loadAlwaysOnPluginTools({ cwd, reservedToolNames: [] });
+		expect(res.tools.map(t => t.name)).not.toContain("domain_note");
+		expect(res.quarantine.some(q => q.code === "runtime_mismatch")).toBe(true);
+	});
+
+	test("registry enablement changes invalidate the validated-registry cache", async () => {
+		const cwd = await mkCwd();
+		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const before = await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
+		expect(before).toContain('activation_arg="design"');
+
+		const registryPath = path.join(cwd, ".gjc", "gjc-plugins", "registry.json");
+		const registry = JSON.parse(await fs.readFile(registryPath, "utf8"));
+		registry.plugins[0].enabled = false;
+		await fs.writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
+
+		const after = await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
+		expect(after).toBe("");
 	});
 });
