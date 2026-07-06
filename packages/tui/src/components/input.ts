@@ -42,7 +42,7 @@ export class Input implements Component, Focusable {
 	focused: boolean = false;
 
 	// Bracketed paste mode buffering
-	#pasteHandler = new BracketedPasteHandler();
+	#pasteHandler = new BracketedPasteHandler(data => this.handleInput(data));
 
 	// Kill ring for Emacs-style kill/yank operations
 	#killRing = new KillRing();
@@ -63,16 +63,26 @@ export class Input implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
-		// Handle bracketed paste mode
-		const paste = this.#pasteHandler.process(data);
-		if (paste.handled) {
-			if (paste.pasteContent !== undefined) {
-				this.#handlePaste(paste.pasteContent);
-				if (paste.remaining.length > 0) {
-					this.handleInput(paste.remaining);
+		this.#handleInput(data, false);
+	}
+
+	#handleInput(data: string, skipPaste: boolean): void {
+		if (!skipPaste) {
+			// Handle bracketed paste mode
+			const paste = this.#pasteHandler.process(data);
+			if (paste.handled) {
+				if (paste.prefix) {
+					this.#handleInput(paste.prefix, true);
 				}
+				if (paste.pasteContent !== undefined) {
+					this.#handlePaste(paste.pasteContent);
+					if (paste.remaining.length > 0) {
+						this.handleInput(paste.remaining);
+					}
+				}
+				return;
 			}
-			return;
+			data = paste.data;
 		}
 
 		const kb = getKeybindings();

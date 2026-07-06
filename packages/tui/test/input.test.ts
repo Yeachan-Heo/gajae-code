@@ -4,6 +4,7 @@ import { Input } from "@gajae-code/tui/components/input";
 import { setKittyProtocolActive } from "@gajae-code/tui/keys";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { getIndentation } from "@gajae-code/utils";
+import { BracketedPasteHandler } from "../src/bracketed-paste";
 
 function renderedWidth(input: Input, width: number): number {
 	const [line] = input.render(width);
@@ -180,6 +181,88 @@ describe("Input component", () => {
 
 		input.handleInput("c\x1b[201~");
 		expect(input.getValue()).toBe(`a${" ".repeat(getIndentation())}bc`);
+	});
+
+	it("buffers a bracketed paste whose start marker is split across chunks", () => {
+		const input = setupAtEnd("");
+
+		input.handleInput("\x1b[200");
+		expect(input.getValue()).toBe("");
+
+		input.handleInput("~hello");
+		expect(input.getValue()).toBe("");
+
+		input.handleInput("\x1b[201~!");
+		expect(input.getValue()).toBe("hello!");
+	});
+	it("buffers a bracketed paste whose start marker is split after escape", () => {
+		const input = setupAtEnd("");
+
+		input.handleInput("\x1b");
+		expect(input.getValue()).toBe("");
+
+		input.handleInput("[200~hello\x1b[201~!");
+		expect(input.getValue()).toBe("hello!");
+	});
+	it("preserves ordinary input before and after a complete paste marker in one chunk", () => {
+		const input = setupAtEnd("");
+
+		input.handleInput("ab\x1b[200~cd\x1b[201~ef");
+
+		expect(input.getValue()).toBe("abcdef");
+	});
+	it("preserves ordinary input before an incomplete paste marker in one chunk", () => {
+		const input = setupAtEnd("");
+
+		input.handleInput("ab\x1b[200~cd");
+		expect(input.getValue()).toBe("ab");
+
+		input.handleInput("\x1b[201~ef");
+		expect(input.getValue()).toBe("abcdef");
+	});
+
+	it("still handles a lone escape as cancel input", async () => {
+		const input = setupAtEnd("");
+		let escaped = false;
+		input.onEscape = () => {
+			escaped = true;
+		};
+
+		input.handleInput("\x1b");
+		expect(escaped).toBe(false);
+
+		await Bun.sleep(15);
+
+		expect(escaped).toBe(true);
+		expect(input.getValue()).toBe("");
+	});
+
+	it("releases a timed-out partial paste marker prefix back to normal input", async () => {
+		const input = setupAtEnd("");
+
+		input.handleInput("\x1b[200");
+		await Bun.sleep(15);
+		input.handleInput("x");
+
+		expect(input.getValue()).toBe("x");
+	});
+
+	it("returns a partial paste marker prefix when it stops matching the start marker", () => {
+		const handler = new BracketedPasteHandler();
+
+		expect(handler.process("\x1b[200")).toEqual({ handled: true, remaining: "" });
+		expect(handler.process("x")).toEqual({ handled: false, data: "\x1b[200x" });
+	});
+
+	it("calls the pending-prefix timeout callback", async () => {
+		const timedOut: string[] = [];
+		const handler = new BracketedPasteHandler(data => timedOut.push(data));
+
+		expect(handler.process("\x1b[200")).toEqual({ handled: true, remaining: "" });
+		await Bun.sleep(15);
+
+		expect(timedOut).toEqual(["\x1b[200"]);
+		expect(handler.process("x")).toEqual({ handled: false, data: "x" });
 	});
 
 	it("never renders a line wider than the terminal width (wide chars)", () => {

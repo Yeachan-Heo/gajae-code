@@ -2078,6 +2078,37 @@ describe("Editor component", () => {
 			expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
 		});
 
+		it("buffers a bracketed paste with a split start marker and handles remaining input", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("\x1b[200");
+			expect(editor.getText()).toBe("");
+
+			editor.handleInput("~hello");
+			expect(editor.getText()).toBe("");
+
+			editor.handleInput("\x1b[201~!");
+			expect(editor.getText()).toBe("hello!");
+		});
+		it("buffers a bracketed paste whose start marker is split after escape", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("\x1b");
+			expect(editor.getText()).toBe("");
+
+			editor.handleInput("[200~hello\x1b[201~!");
+			expect(editor.getText()).toBe("hello!");
+		});
+		it("preserves ordinary input before an incomplete paste marker in one chunk", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("ab\x1b[200~cd");
+			expect(editor.getText()).toBe("ab");
+
+			editor.handleInput("\x1b[201~ef");
+			expect(editor.getText()).toBe("abcdef");
+		});
+
 		it("undoes the last paste when a transient #undo trigger is executed", () => {
 			const editor = new Editor(defaultEditorTheme);
 

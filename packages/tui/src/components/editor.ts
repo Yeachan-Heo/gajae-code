@@ -467,7 +467,7 @@ export class Editor implements Component, Focusable {
 	#pasteCounter: number = 0;
 
 	// Bracketed paste mode buffering
-	#pasteHandler = new BracketedPasteHandler();
+	#pasteHandler = new BracketedPasteHandler(data => this.handleInput(data));
 
 	// Prompt history for up/down navigation
 	#history: string[] = [];
@@ -1117,6 +1117,10 @@ export class Editor implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
+		this.#handleInput(data, false);
+	}
+
+	#handleInput(data: string, skipPaste: boolean): void {
 		const kb = getKeybindings();
 
 		// Handle character jump mode (awaiting next character to jump to)
@@ -1139,16 +1143,22 @@ export class Editor implements Component, Focusable {
 			this.#jumpMode = null;
 		}
 
-		// Handle bracketed paste mode
-		const paste = this.#pasteHandler.process(data);
-		if (paste.handled) {
-			if (paste.pasteContent !== undefined) {
-				this.#handlePaste(paste.pasteContent);
-				if (paste.remaining.length > 0) {
-					this.handleInput(paste.remaining);
+		if (!skipPaste) {
+			// Handle bracketed paste mode
+			const paste = this.#pasteHandler.process(data);
+			if (paste.handled) {
+				if (paste.prefix) {
+					this.#handleInput(paste.prefix, true);
 				}
+				if (paste.pasteContent !== undefined) {
+					this.#handlePaste(paste.pasteContent);
+					if (paste.remaining.length > 0) {
+						this.handleInput(paste.remaining);
+					}
+				}
+				return;
 			}
-			return;
+			data = paste.data;
 		}
 
 		// Handle special key combinations first
