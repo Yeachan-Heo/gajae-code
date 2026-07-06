@@ -49,14 +49,38 @@ type CliSettingDef = {
 
 const ALL_SETTING_PATHS = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
 const REDACTED_SECRET_VALUE = "<redacted>";
-const SECRET_SETTING_SEGMENT_PATTERN = /(?:api[-_]?key|token|secret|password|passwd|pwd|credential)/i;
+const SECRET_SETTING_WORDS = new Set(["token", "secret", "password", "passwd", "pwd", "credential", "credentials"]);
+const SECRET_SETTING_COMPOUND_PREFIXES = [
+	"api",
+	"auth",
+	"access",
+	"refresh",
+	"bearer",
+	"session",
+	"client",
+	"broker",
+	"bot",
+	"basic",
+];
+const SECRET_SETTING_COMPOUND_SUFFIXES = ["token", "secret", "password", "credential"];
+
+function isSecretSettingSegment(segment: string): boolean {
+	const normalized = segment.toLowerCase();
+	if (SECRET_SETTING_WORDS.has(normalized)) return true;
+	if (/api[-_]?key/i.test(segment)) return true;
+	const words = normalized.split(/[-_]/).filter(Boolean);
+	if (words.some(word => SECRET_SETTING_WORDS.has(word))) return true;
+	return SECRET_SETTING_COMPOUND_PREFIXES.some(prefix =>
+		SECRET_SETTING_COMPOUND_SUFFIXES.some(suffix => normalized === `${prefix}${suffix}`),
+	);
+}
 
 function isSecretSettingPath(path: string): boolean {
-	return path.split(".").some(segment => SECRET_SETTING_SEGMENT_PATTERN.test(segment));
+	return path.split(".").some(segment => isSecretSettingSegment(segment));
 }
 
 function redactConfigValue(path: string, value: unknown, showSecrets?: boolean): unknown {
-	if (showSecrets || typeof value !== "string" || !isSecretSettingPath(path)) {
+	if (showSecrets || value === undefined || value === null || !isSecretSettingPath(path)) {
 		return value;
 	}
 	return REDACTED_SECRET_VALUE;
