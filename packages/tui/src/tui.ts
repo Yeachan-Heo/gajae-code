@@ -859,7 +859,7 @@ export class TUI extends Container {
 	 * `PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER=1` to restore the legacy tmux redraw.
 	 */
 	requestResizeRender(): void {
-		this.requestRender(!useViewportRepaintPath(), "resize");
+		this.requestRender(!useViewportRepaintPath() && !isTermuxSession(), "resize");
 	}
 
 	requestRender(force = false, source = "unknown"): void {

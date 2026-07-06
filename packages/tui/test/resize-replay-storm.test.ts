@@ -164,6 +164,58 @@ describe("multiplexer resize replay storm regression", () => {
 		});
 	});
 
+	describe("in Termux", () => {
+		let origTermuxVersion: string | undefined;
+		let origTmux: string | undefined;
+		let origSty: string | undefined;
+		let origZellij: string | undefined;
+		let origLaunched: string | undefined;
+
+		beforeEach(() => {
+			origTermuxVersion = process.env.TERMUX_VERSION;
+			origTmux = process.env.TMUX;
+			origSty = process.env.STY;
+			origZellij = process.env.ZELLIJ;
+			origLaunched = process.env.GJC_TMUX_LAUNCHED;
+			process.env.TERMUX_VERSION = "1";
+			delete process.env.TMUX;
+			delete process.env.STY;
+			delete process.env.ZELLIJ;
+			delete process.env.GJC_TMUX_LAUNCHED;
+		});
+
+		afterEach(() => {
+			if (origTermuxVersion === undefined) delete process.env.TERMUX_VERSION;
+			else process.env.TERMUX_VERSION = origTermuxVersion;
+			if (origTmux === undefined) delete process.env.TMUX;
+			else process.env.TMUX = origTmux;
+			if (origSty === undefined) delete process.env.STY;
+			else process.env.STY = origSty;
+			if (origZellij === undefined) delete process.env.ZELLIJ;
+			else process.env.ZELLIJ = origZellij;
+			if (origLaunched === undefined) delete process.env.GJC_TMUX_LAUNCHED;
+			else process.env.GJC_TMUX_LAUNCHED = origLaunched;
+		});
+
+		it("does not full-clear or replay the transcript on a height-only resize", async () => {
+			const term = new VirtualTerminal(COLS, 30);
+			const tui = new TUI(term);
+			tui.start();
+			await term.waitForRender();
+
+			await buildTranscript(tui, term, 60);
+			term.clearWriteLog();
+
+			term.resize(COLS, 20);
+			await term.waitForRender();
+
+			const out = term.getWriteLog().join("");
+			expect(out).not.toContain("\x1b[3J");
+			expect(distinctReplayedLineMarkers(out)).toBeLessThan(60);
+
+			tui.stop();
+		});
+	});
 	describe("in a plain terminal (no multiplexer markers)", () => {
 		let origTmux: string | undefined;
 		let origTmuxPane: string | undefined;
