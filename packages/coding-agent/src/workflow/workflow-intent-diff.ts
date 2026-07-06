@@ -5,8 +5,11 @@ import {
 } from "./workflow-intent-report";
 
 export const WORKFLOW_INTENT_DIFF_CUSTOM_TYPE = "workflow-intent-diff";
+export const WORKFLOW_INTENT_ROUTES = ["direct", "deep-interview", "ralplan", "ultragoal", "team"] as const;
+export const WORKFLOW_ESCALATION_ROUTES = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
 
-export type WorkflowIntentRoute = "direct" | "deep-interview" | "ralplan" | "ultragoal" | "team";
+export type WorkflowIntentRoute = (typeof WORKFLOW_INTENT_ROUTES)[number];
+export type WorkflowEscalationRoute = (typeof WORKFLOW_ESCALATION_ROUTES)[number];
 export type DirectTrackingMode = "custom-entry-only" | "not-direct";
 export type RootCausePhaseStatus = "active" | "inactive";
 
@@ -15,7 +18,7 @@ export interface WorkflowIntentDiff {
 	readonly route: WorkflowIntentRoute;
 	readonly reason: string;
 	readonly directTracking: DirectTrackingMode;
-	readonly recommendedSkill?: Exclude<WorkflowIntentRoute, "direct">;
+	readonly recommendedSkill?: WorkflowEscalationRoute;
 	readonly recommendedInvocation?: string;
 	readonly triggers: readonly string[];
 	readonly rootCausePhase: {
