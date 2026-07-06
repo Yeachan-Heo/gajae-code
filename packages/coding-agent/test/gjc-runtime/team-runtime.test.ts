@@ -2265,9 +2265,19 @@ describe("native gjc team runtime", () => {
 	it("checkpoint classification excludes GJC runtime paths from worker auto-commits", async () => {
 		const protectedTeamPath = `.gjc/_session-${TEST_SESSION_ID}/state/team/demo/worker.json`;
 		const protectedReportPath = `.gjc/_session-${TEST_SESSION_ID}/reports/team-commit-hygiene/demo.ledger.json`;
-		expect(classifyGjcTeamCheckpointFiles(["src/feature.ts", protectedTeamPath, protectedReportPath])).toEqual({
+		const protectedGatePath = `.gjc/_session-${TEST_SESSION_ID}/extragoal/gate-1.md`;
+		const protectedActivityPath = `.gjc/_session-${TEST_SESSION_ID}/.session-activity.json`;
+		expect(
+			classifyGjcTeamCheckpointFiles([
+				"src/feature.ts",
+				protectedTeamPath,
+				protectedReportPath,
+				protectedGatePath,
+				protectedActivityPath,
+			]),
+		).toEqual({
 			eligible: ["src/feature.ts"],
-			protected: [protectedTeamPath, protectedReportPath],
+			protected: [protectedTeamPath, protectedReportPath, protectedGatePath, protectedActivityPath],
 		});
 
 		cleanupRoot = await createGitRepo();

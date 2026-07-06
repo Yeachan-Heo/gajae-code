@@ -2346,17 +2346,14 @@ export type GjcWorkerCheckpointClassification =
 	| { kind: "git_error"; files: string[]; detail: string };
 
 const UNMERGED_GIT_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
-const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [
-	".gjc/_session-*/state/",
-	".gjc/_session-*/logs/",
-	".gjc/_session-*/reports/",
-	".gjc/_session-*/runtime/",
-	".gjc/_session-*/ultragoal/",
-	".gjc/_session-*/plans/",
-	".gjc/_session-*/specs/",
-	".gjc/_session-*/rlm/",
-	".gjc/_session-*/audit/",
-];
+// Every generated/runtime artifact for a GJC session lives under
+// `.gjc/_session-{id}/...` (see session-layout.ts), so worker auto-checkpoints
+// exclude the whole session subtree instead of enumerating its subdirectories.
+// The enumerated form drifted: subtrees outside the list (for example the
+// extragoal gate receipts from docs/extragoal-skill-template.md, or the
+// session-root `.session-activity.json` marker) were auto-committed and merged
+// into the leader branch on projects that do not gitignore `.gjc/_session-*/`.
+const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [".gjc/_session-*/"];
 
 function parsePorcelainStatusFiles(stdout: string): string[] {
 	return stdout
