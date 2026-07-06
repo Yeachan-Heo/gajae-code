@@ -9,7 +9,17 @@ mkdir -p ~/.gjc/agent/skills/gjc-dogfood
 sed -n '/^---$/,$p' docs/gjc-dogfood-skill-template.md > ~/.gjc/agent/skills/gjc-dogfood/SKILL.md
 ```
 
-For a single project, install to `<project>/.gjc/skills/gjc-dogfood/SKILL.md` with the same extraction. Do not commit that project `.gjc` copy unless the project explicitly wants a local override. Verify the install in a new session: `/skill:gjc-dogfood` should autocomplete.
+For a single project, install to `<project>/.gjc/skills/gjc-dogfood/SKILL.md` with the same extraction. Do not commit that project `.gjc` copy unless the project explicitly wants a local override.
+
+Filesystem skill discovery is off by default, so enable it once (`skills.enabled` plus the native user/project scans are `false` in `DEFAULT_SKILL_DISCOVERY_SETTINGS`):
+
+```sh
+gjc config set skills.enabled true
+gjc config set skills.enablePiUser true      # for the ~/.gjc/agent/skills/ install
+gjc config set skills.enablePiProject true   # for the <project>/.gjc/skills/ install
+```
+
+Then verify in a new session: `/skill:gjc-dogfood` should autocomplete.
 
 ---
 name: gjc-dogfood
