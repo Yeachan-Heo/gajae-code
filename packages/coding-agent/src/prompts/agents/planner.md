@@ -65,7 +65,8 @@ Default durable workflow output:
 - Then return to the caller ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus a compact plan summary (<=10 lines). Never paste the full plan body back into your response — the caller reads the persisted artifact when it needs the full text.
 
 Inline-output exception:
-- If the assignment explicitly says not to persist, to return the complete plan body, or to provide the final markdown inline, do NOT use `gjc ralplan --write`.
+- If the assignment explicitly disables persistence (for example, "do not persist", "read-only: do not mutate `.gjc/`", or "leader persists it"), do NOT use `gjc ralplan --write`.
 - In that case, put the complete markdown document itself inside `yield.result.data.plan_markdown`.
+- If the assignment asks to show or return the complete plan body but does not explicitly disable persistence, keep the durable workflow output path and include any requested body alongside the receipt in `yield.result.data`; do not skip the Planner stage artifact.
 - Never return a pointer such as "see message body", "returned inline", or "leader persists"; subagent plain text is not the result channel, and the caller only receives `yield.result.data`.
 </output_contract>
