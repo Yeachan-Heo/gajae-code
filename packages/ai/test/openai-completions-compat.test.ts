@@ -511,6 +511,7 @@ describe("kimi model detection via detectCompat", () => {
 
 	async function captureOpenCodeGoPayload(
 		options: Parameters<typeof streamOpenAICompletions>[2],
+		modelId = "kimi-k2.7-code",
 	): Promise<Record<string, unknown>> {
 		const tool: Tool = {
 			name: "search",
@@ -519,7 +520,7 @@ describe("kimi model detection via detectCompat", () => {
 		};
 		const { promise, resolve } = Promise.withResolvers<unknown>();
 		streamOpenAICompletions(
-			getBundledModel("opencode-go", "kimi-k2.5") as Model<"openai-completions">,
+			getBundledModel("opencode-go", modelId) as Model<"openai-completions">,
 			{ ...baseContext(), tools: [tool] },
 			{
 				...options,
@@ -530,26 +531,27 @@ describe("kimi model detection via detectCompat", () => {
 		);
 		return (await promise) as Record<string, unknown>;
 	}
-	it("disables reasoning for forced tool_choice on official OpenCode Go models", () => {
-		const model = getBundledModel("opencode-go", "kimi-k2.5");
+	it("caps OpenCode Go Kimi reasoning effort and forced tool_choice support", () => {
+		const model = getBundledModel("opencode-go", "kimi-k2.7-code");
 		expect(model.provider).toBe("opencode-go");
 		expect(model.reasoning).toBe(true);
 
 		const compat = detectCompat(model as Model<"openai-completions">);
 
+		expect(compat.reasoningEffortMap).toMatchObject({ xhigh: "high", max: "high" });
 		expect(compat.disableReasoningOnForcedToolChoice).toBe(true);
+		expect(compat.supportsForcedToolChoice).toBe(false);
 	});
 
-	it("drops reasoning, not forced tool_choice, for OpenCode Go forced tool_choice payloads", async () => {
+	it("omits forced tool_choice for OpenCode Go Kimi payloads", async () => {
 		const payload = await captureOpenCodeGoPayload({
 			reasoning: "high",
 			toolChoice: { type: "function", function: { name: "search" } },
 		});
 
 		expect(payload.tools).toBeDefined();
-		expect(payload.tool_choice).toEqual({ type: "function", function: { name: "search" } });
-		expect(payload.reasoning_effort).toBeUndefined();
-		expect(payload.reasoning).toBeUndefined();
+		expect(payload.tool_choice).toBeUndefined();
+		expect(payload.reasoning_effort).toBe("high");
 	});
 
 	it("preserves reasoning for OpenCode Go auto tool_choice payloads", async () => {
@@ -558,6 +560,14 @@ describe("kimi model detection via detectCompat", () => {
 		expect(payload.tools).toBeDefined();
 		expect(payload.tool_choice).toBe("auto");
 		expect(payload.reasoning_effort).toBe("high");
+	});
+
+	it("maps OpenCode Go Kimi xhigh and max reasoning down to high", async () => {
+		const xhighPayload = await captureOpenCodeGoPayload({ reasoning: "xhigh", toolChoice: "auto" });
+		const maxPayload = await captureOpenCodeGoPayload({ reasoning: "max", toolChoice: "auto" });
+
+		expect(xhighPayload.reasoning_effort).toBe("high");
+		expect(maxPayload.reasoning_effort).toBe("high");
 	});
 
 	it("does not inject reasoning_content placeholder for kimi on opencode-go", () => {

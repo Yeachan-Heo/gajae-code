@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Capped OpenCode Go Kimi reasoning efforts that the Go chat-completions endpoint rejects (`xhigh`/`max` → `high`) and degraded forced `tool_choice` for those models so `opencode-go/kimi-k2.7-code:xhigh` sessions and title-generation turns no longer fail with generic upstream 400s.
+
 ## [0.8.2] - 2026-07-06
 
 ### Fixed

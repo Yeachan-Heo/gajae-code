@@ -1,11 +1,9 @@
 /**
- * Repro for #827 — `opencode-go/kimi-k2.6` returns 400 with
- * `tool_choice 'specified' is incompatible with thinking enabled`
- * whenever the agent forces a tool call while reasoning is on.
- *
- * The fix follows the Anthropic pattern (`disableThinkingIfToolChoiceForced`)
- * — when a forced tool_choice is sent to a Kimi reasoning model, we strip
- * reasoning for that single turn rather than dropping `tool_choice` outright.
+ * Repro lineage for #827 — OpenCode Go Kimi models reject forced `tool_choice`
+ * while thinking is enabled. Later Go captures also showed generic upstream
+ * 400s for forced `tool_choice` even when reasoning was omitted, so the
+ * OpenCode Go Kimi path now degrades forced choices to auto/no explicit
+ * `tool_choice` instead of forwarding the forced directive.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
@@ -82,17 +80,15 @@ interface CompletionsBody {
 	thinking?: unknown;
 }
 
-describe("issue #827 — kimi reasoning models drop reasoning under forced tool_choice", () => {
-	it("strips reasoning_effort when toolChoice is forced on direct Kimi (Moonshot-style id)", async () => {
+describe("issue #827 lineage — kimi reasoning models avoid incompatible forced tool_choice", () => {
+	it("omits forced tool_choice on OpenCode Go Kimi and keeps supported reasoning", async () => {
 		const body = (await captureBody(kimiOpencodeGoModel(), {
 			reasoning: "high",
 			toolChoice: "any",
 		})) as CompletionsBody;
 
-		// Forced choice still forwarded so the model must pick a tool…
-		expect(body.tool_choice).toBe("required");
-		// …but reasoning is suppressed to satisfy Kimi's "thinking incompatible with forced tool_choice" rule.
-		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.tool_choice).toBeUndefined();
+		expect(body.reasoning_effort).toBe("high");
 	});
 
 	it("preserves reasoning_effort when toolChoice is auto", async () => {
