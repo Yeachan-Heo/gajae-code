@@ -231,8 +231,10 @@ describe("agent loop converted context cache", () => {
 		const convertPerMessage = (messages: AgentMessage[]): Message[] =>
 			messages.filter((m): m is Message => m.role === "user" || m.role === "assistant" || m.role === "toolResult");
 
+		const userMessage = createUserMessage("do it");
+
 		// Incremental run: prefix cached, then suffix converted in isolation.
-		const incrementalContext = makeContext([createUserMessage("do it"), toolCalls, resultOne]);
+		const incrementalContext = makeContext([userMessage, toolCalls, resultOne]);
 		const incrementalCaptured: Context[] = [];
 		const incrementalConfig: AgentLoopConfig = {
 			model: mock.model,
@@ -244,7 +246,7 @@ describe("agent loop converted context cache", () => {
 		await runOnce(incrementalContext, incrementalConfig, incrementalCaptured);
 
 		// Cold run: identical messages converted in a single full pass.
-		const coldContext = makeContext([createUserMessage("do it"), toolCalls, resultOne, resultTwo]);
+		const coldContext = makeContext([userMessage, toolCalls, resultOne, resultTwo]);
 		const coldCaptured: Context[] = [];
 		const coldConfig: AgentLoopConfig = {
 			model: mock.model,
