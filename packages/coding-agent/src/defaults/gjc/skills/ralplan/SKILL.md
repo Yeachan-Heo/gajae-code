@@ -19,11 +19,10 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 
 ## Flags
 
-- `--interactive`: Enables extra mid-loop user prompts (draft review in step 2 and one-at-a-time reconciliation in step 6c). Regardless of this flag, the workflow always finishes the post-interview gate with an `ask`-tool prompt offering Refine further / Approve ultragoal / Approve team / Stop here, and never auto-executes — execution always requires explicit approval through that prompt.
-- `--deliberate`: Forces deliberate mode for high-risk work. Adds pre-mortem (3 scenarios) and expanded test planning (unit/integration/e2e/observability). Without this flag, deliberate mode can still auto-enable when the request explicitly signals high risk (auth/security, migrations, destructive changes, production incidents, compliance/PII, public API breakage).
-- `--architect openai-code`: Use OpenAI code for the Architect pass when OpenAI code CLI is available. Otherwise, briefly note the fallback and keep the default GJC Architect review.
-- `--critic openai-code`: Use OpenAI code for the Critic pass when OpenAI code CLI is available. Otherwise, briefly note the fallback and keep the default GJC Critic review.
-- `--write --stage <type> --stage_n <N> --artifact <markdown file path or markdown string>`: Native artifact write path persisting Planner, Architect, Critic, revision, ADR, and final pending-approval plan markdown under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`. Use this instead of editing `.gjc/` files directly.
+- `--interactive`: Adds draft-review prompts and one-at-a-time reconciliation; final approval always uses an `ask` workflow gate and never auto-executes.
+- `--deliberate`: Forces high-risk deliberation: pre-mortem plus expanded test planning. It may also auto-enable for explicit auth/security, migration, destructive, incident, compliance/PII, or public-API-breakage risk.
+- `--architect openai-code` / `--critic openai-code`: Use OpenAI code for that review pass when available; otherwise note the fallback and use default GJC review.
+- `--write --stage <type> --stage_n <N> --artifact <markdown file path or markdown string>`: Native writer for Planner/Architect/Critic/revision/ADR/final pending-approval markdown under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`; do not edit `.gjc/` directly.
 
 ## Usage with interactive mode
 
@@ -33,15 +32,15 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 
 ## Corrupt current-session state recovery
 
-When ralplan detects its own current-session state is corrupt, tampered, unreadable, or stale on resume, run `gjc state clear --force --mode ralplan` before reseeding or restarting. Scope the clear to the current session via `--session-id`, the command payload, or `GJC_SESSION_ID`; it clears only ralplan state for that session and never clears other skills or sessions.
+For corrupt, tampered, unreadable, or stale current-session ralplan state, run `gjc state clear --force --mode ralplan` scoped by `--session-id`, command payload, or `GJC_SESSION_ID`; it clears only ralplan state for that session.
 
 ## Behavior
 
 ## Planning/Execution Boundary
 
-Ralplan is a planning module. It may inspect context and draft or update plan/spec/proposal artifacts, but it MUST mark those artifacts as `pending approval` unless the user has explicitly opted into execution in the current turn or via the structured approval UI. Before explicit execution approval, it MUST NOT run mutation-oriented shell commands, edit source files, commit, push, open PRs, invoke execution skills, or delegate implementation tasks.
+Ralplan is planning only. It may inspect context and draft plan/spec/proposal artifacts, but those remain `pending approval` until explicit current-turn or structured-UI execution approval. Before that approval, do not mutate product source, run mutation-oriented shell, commit, push, open PRs, invoke execution skills, or delegate implementation.
 
-Planning artifacts and stage handoffs MUST be persisted through the ralplan CLI artifact writer, not by direct `.gjc/` edits. Every role agent or subagent that produces a durable stage artifact MUST write it with:
+Persist planning artifacts and handoffs through the ralplan CLI writer, never direct `.gjc/` edits:
 
 ```bash
 gjc ralplan --write --stage <type> --stage_n <N> --artifact "markdown file path or markdown string"
@@ -49,13 +48,9 @@ gjc ralplan --write --stage <type> --stage_n <N> --artifact "markdown file path 
 gjc ralplan --write --stage <type> --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT
 ```
 
-Use stage values that match the producer or artifact kind, such as `planner`, `architect`, `critic`, `revision`, `post-interview`, `adr`, or `final`. Increment `--stage_n` for each consensus-loop pass. The `--artifact` value may be either a markdown file path prepared outside `.gjc/` for ingestion or the markdown content string itself. The native `--write` handler also accepts `--artifact-env GJC_RALPLAN_ARTIFACT` to read markdown from that per-command env override. It persists markdown under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/stage-<NN>-<stage>.md`, maintains an `index.jsonl` audit log, and for `final` stages additionally writes a `pending-approval.md` copy. Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden unless an explicit force override is active.
+Use stages `planner`, `architect`, `critic`, `revision`, `post-interview`, `adr`, or `final`; increment `--stage_n` each consensus pass. The writer accepts inline markdown, an artifact path prepared outside `.gjc/`, or `--artifact-env GJC_RALPLAN_ARTIFACT`, persists `stage-<NN>-<stage>.md` plus `index.jsonl` under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`, and copies `final` to `pending-approval.md`. Ralplan mutation blocking is enforced in code; use temp directories (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) only for oversized scratch artifacts, never the repo or `.gjc/`.
 
-While ralplan is active it is a pre-approval planning phase: product-code mutation tools (`write`/`edit`/`ast_edit`) and product-mutating `bash` (e.g. `tee src/...`, redirects into the project tree) are blocked, exactly like deep-interview. Leaders may pass `--artifact` markdown inline or, when an artifact is too large to pass inline, stage it as a file in a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree and pass that path — never write scratch files into the repo or `.gjc/`. Product code is mutated only after the plan is approved and execution begins.
-
-Restricted read-only role agents (`planner`, `architect`, and `critic`) must pass markdown content through the `GJC_RALPLAN_ARTIFACT` env override with `--artifact-env GJC_RALPLAN_ARTIFACT`; their restricted bash environment intentionally disables artifact file-path ingestion so a verdict command cannot persist arbitrary file contents.
-
-After a role agent persists a stage artifact, its model-facing response to the caller SHOULD be receipt-only: return the `gjc ralplan --write --json` receipt (`run_id`, `path`, `stage`, `stage_n`, `sha256`, `created_at`) plus the minimal verdict/status fields the caller needs for routing, and do **not** paste the full persisted markdown back into the parent conversation. Downstream reviewers should receive the artifact path/receipt and read the persisted file themselves when they actually need the body. This preserves the audit trail while preventing Planner/Architect/Critic verdict bodies from being duplicated into the main-agent context.
+Restricted read-only role agents (`planner`, `architect`, `critic`) must pass markdown through `GJC_RALPLAN_ARTIFACT` with `--artifact-env GJC_RALPLAN_ARTIFACT`; their restricted bash environment disables artifact file-path ingestion.
 
 RECEIPT-ONLY guideline: role agents (`planner`, `architect`, and `critic`) persist durable outputs via `gjc ralplan --write` and return ONLY the receipt fields (`run_id`, `path`, `sha256`) plus verdict/status routing fields; include `stage` and `stage_n` when available, and never return the full persisted body.
 
@@ -70,12 +65,10 @@ The consensus workflow:
    - If only one viable option remains, explicit invalidation rationale for alternatives
    - Deliberate mode only: pre-mortem (3 scenarios) + expanded test plan (unit/integration/e2e/observability)
 2. **User feedback** *(--interactive only)*: If `--interactive` is set, use the `ask` tool to present the draft plan **plus the Principles / Drivers / Options summary** before review (Proceed to review / Request changes / Skip review). Otherwise, automatically proceed to review.
-3. **Review fan-out after Planner persistence**: after the Planner stage is persisted, launch fresh Architect and Critic review lanes against the same immutable Planner receipt/path/sha/stage_n when the Critic lane is **plan-only** and does not consume Architect output.
-   - **Architect lane**: Architect reviews for architectural soundness and must provide the strongest steelman antithesis, at least one real tradeoff tension, and (when possible) synthesis. In deliberate mode, Architect should explicitly flag principle violations.
-   - The Architect agent/subagent must persist its review with `gjc ralplan --write --stage architect --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return the receipt/path plus compact verdict/status (`CLEAR`/`WATCH`/`BLOCK`, `APPROVE`/`COMMENT`/`REQUEST CHANGES`) instead of pasting the full review body.
-   - **Plan-only Critic lane**: Critic evaluates the Planner artifact against quality criteria independently of Architect output. It must enforce principle-option consistency, fair alternatives, risk mitigation clarity, testable acceptance criteria, and concrete verification steps. In deliberate mode, Critic must reject missing/weak pre-mortem or expanded test plan.
-   - The Critic agent/subagent must persist its evaluation with `gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return the receipt/path plus compact verdict/status (`OKAY`/`ITERATE`/`REJECT`) instead of pasting the full evaluation body.
-   - **Sequential fallback**: when Critic must evaluate Architect findings, verdict, antithesis, tradeoffs, synthesis, architectural status, or any other Architect-produced artifact, await the Architect result before issuing that Architect-dependent Critic pass.
+3. **Review fan-out after Planner persistence**: launch fresh Architect and Critic review lanes against the same immutable Planner receipt/path/sha/stage_n when Critic is **plan-only** and does not consume Architect output.
+   - **Architect lane**: challenge architecture, surface tradeoff tensions, and enrich thin plans with synthesis or missed sub-scope. Persist with `gjc ralplan --write --stage architect --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return receipt/path plus `CLEAR`/`WATCH`/`BLOCK` and `APPROVE`/`COMMENT`/`REQUEST CHANGES`.
+   - **Plan-only Critic lane**: independently check quality, principle-option consistency, alternatives, risks, acceptance criteria, and verification; when the plan is thin, request concrete expansion rather than only defects. Persist with `gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return receipt/path plus `OKAY`/`ITERATE`/`REJECT`.
+   - **Sequential fallback**: if Critic must evaluate Architect findings, verdict, antithesis, tradeoffs, synthesis, status, or any Architect-produced artifact, await the Architect result before issuing that Architect-dependent Critic pass.
 4. **Review join gate**: before consensus, revision, reconciliation, finalization, or approval, verify both Architect and Critic receipts/verdicts exist for the same Planner artifact/pass (`path`, `sha256`, `stage_n`). A non-`CLEAR` Architect verdict, non-`APPROVE` Architect decision, or any non-`OKAY` Critic verdict routes back to Planner revision; do not finalize from only one review lane.
 5. **Re-review loop** (max 5 iterations): Any non-`OKAY` Critic verdict (`ITERATE` or `REJECT`) or Architect result that is not `CLEAR`/`APPROVE` MUST run the same full closed loop:
    a. Collect Architect + Critic feedback
@@ -118,9 +111,9 @@ Follow the Plan skill's full documentation for consensus mode details.
 
 ### Persisted Planner (consensus loop)
 
-The Planner is a **same-session persisted subagent**: launched detached once, awaited before review fan-out, then **resumed** with consolidated Architect + Critic feedback on every re-review pass instead of being re-spawned. The Architect and Critic stay **fresh, independent spawns each pass** so their verdicts remain reproducible from their pass artifacts alone; the Critic may run in parallel only when it is plan-only and tied to the same Planner receipt/path/sha/stage_n as Architect. Do NOT modify the subagent control surface; this orchestration uses the existing `subagent` resume/steer controls only.
+The Planner is a **same-session persisted subagent**: launched detached once, awaited before review fan-out, then **resumed** with consolidated Architect + Critic challenge and enrichment on each re-review pass. Architect and Critic are fresh independent spawns each pass; Critic may run in parallel only when plan-only and tied to the same Planner receipt/path/sha/stage_n. Do NOT modify the subagent control surface; use existing `subagent` resume/steer controls only.
 
-**Persistence boundary:** this is same-parent, active-session continuity only. Resumability depends on the manager's retained subagent resume metadata and a persistent parent session (an in-memory parent yields `resumable:false`), not just the `.gjc` run-state record. A terminal subagent whose live job record was evicted can still be resumed when its retained resume descriptor points at a saved subagent session file. After a process restart, missing resume metadata, or any unavailable/failed resume, use the fresh Planner fallback.
+**Persistence boundary:** same-parent, active-session continuity only. Resumability requires retained subagent resume metadata and a persistent parent session (in-memory parent yields `resumable:false`), not just `.gjc` run-state. A terminal subagent can still resume when its retained descriptor points at a saved subagent session; after process restart, missing metadata, or failed/unavailable resume, use fresh Planner fallback.
 
 **Resume routing table** (per re-review pass, when resuming the persisted Planner id):
 
@@ -145,73 +138,16 @@ Set `--planner-resumable true` only when the parent session is provably persiste
 
 ## Pre-Execution Gate
 
-### Why the Gate Exists
+Execution skills (`ultragoal`, `team`) implement bounded work; they are not scope-discovery lanes. Vague execution requests such as `team improve the app` are routed through ralplan so scope, acceptance criteria, consensus, and verification exist before code changes.
 
-Execution skills (`ultragoal` and `team`) drive implementation rather than scope discovery. When launched on a vague request like "team improve the app", agents have no clear target — they waste cycles on scope discovery that should happen during planning, often delivering partial or misaligned work that requires rework.
+**Passes the gate** (specific enough for direct execution): file paths, issue/PR numbers, named symbols, explicit tests, numbered steps, acceptance criteria, error references, code blocks, or escape prefixes (`force:` / `!`). Examples: `team fix src/hooks/bridge.ts`, `team implement #42`, `team add validation to processKeywordDetector`, `team do:\n1. Add input validation\n2. Write tests`.
 
-The ralplan-first gate intercepts underspecified execution requests and redirects them through the ralplan consensus planning workflow. This ensures:
-- **Explicit scope**: A PRD defines exactly what will be built
-- **Test specification**: Acceptance criteria are testable before code is written
-- **Consensus**: Planner, Architect, and Critic agree on the approach
-- **No wasted execution**: Agents start with a clear, bounded task
+**Gated — redirected to ralplan**: `team fix this`, `team build the app`, `team improve performance`, `team add authentication`, `team make it better`.
 
-### Good vs Bad Prompts
+Gate auto-pass signals: file path, issue/PR number, camelCase/PascalCase/snake_case symbol, test runner, numbered steps, acceptance criteria, error reference, code block, or escape prefix. If it fires on a well-specified prompt, add one concrete anchor; if you intentionally bypass, prefix `force:` or `!`.
 
-**Passes the gate** (specific enough for direct execution):
-- `team fix the null check in src/hooks/bridge.ts:326`
-- `team implement issue #42`
-- `team add validation to function processKeywordDetector`
-- `team do:\n1. Add input validation\n2. Write tests\n3. Update README`
-- `team add the user model in src/models/user.ts`
+On consensus approval, choose:
+- **ultragoal**: goal-tracked autonomous execution with verification (recommended default)
+- **team**: tmux-based coordinated workers only when interactive worker parallelization is required
 
-**Gated — redirected to ralplan** (needs scoping first):
-- `team fix this`
-- `team build the app`
-- `team improve performance`
-- `team add authentication`
-- `team make it better`
-
-**Bypass the gate** (when you know what you want):
-- `force: team refactor the auth module`
-- `! team optimize everything`
-
-### When the Gate Does NOT Trigger
-
-The gate auto-passes when it detects **any** concrete signal. You do not need all of them — one is enough:
-
-| Signal Type | Example prompt | Why it passes |
-|---|---|---|
-| File path | `team fix src/hooks/bridge.ts` | References a specific file |
-| Issue/PR number | `team implement #42` | Has a concrete work item |
-| camelCase symbol | `team fix processKeywordDetector` | Names a specific function |
-| PascalCase symbol | `team update UserModel` | Names a specific class |
-| snake_case symbol | `team fix user_model` | Names a specific identifier |
-| Test runner | `team npm test && fix failures` | Has an explicit test target |
-| Numbered steps | `team do:\n1. Add X\n2. Test Y` | Structured deliverables |
-| Acceptance criteria | `team add login - acceptance criteria: ...` | Explicit success definition |
-| Error reference | `team fix TypeError in auth` | Specific error to address |
-| Code block | `team add: \`\`\`ts ... \`\`\`` | Concrete code provided |
-| Escape prefix | `force: team do it` or `! team do it` | Explicit user override |
-
-### End-to-End Flow Example
-
-1. User types: `team add user authentication`
-2. Gate detects: execution keyword (`team`) + underspecified prompt (no files, functions, or test spec)
-3. Gate redirects to **ralplan** with message explaining the redirect
-4. Ralplan consensus runs:
-   - **Planner** creates initial plan (which files, what auth method, what tests)
-   - **Architect** reviews for soundness
-   - **Critic** validates quality and testability
-5. On consensus approval, user chooses execution path:
-   - **ultragoal**: goal-tracked autonomous execution with verification (recommended default)
-   - **team**: N coordinated parallel agents in tmux — only when tmux-based interactive worker parallelization is required
-6. Execution begins with a clear, bounded plan
-
-### Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| Gate fires on a well-specified prompt | Add a file reference, function name, or issue number to anchor the request |
-| Want to bypass the gate | Prefix with `force:` or `!` (e.g., `force: team fix it`) |
-| Gate does not fire on a vague prompt | The gate only catches prompts with <=15 effective words and no concrete anchors; add more detail or use `/skill:ralplan` explicitly |
-| Redirected to ralplan but want execution | Use the structured approval option or explicitly say which execution skill should proceed; `just do it` / `skip planning` alone only ends planning with a `pending approval` artifact |
+A redirected request proceeds only through the structured approval option or an explicit execution-skill choice; `just do it` / `skip planning` alone leaves the plan `pending approval`.
