@@ -869,6 +869,8 @@ interface PendingThreadedFrame {
 export class TelegramNotificationDaemon {
 	readonly aliasTable: AliasTable;
 	readonly messageRoutes = new Map<string | number, CallbackRoute | Omit<CallbackRoute, "answer">>();
+	/** Telegram message id backing each streamed `${sessionId}:${coalesceKey}`, for in-place edits. */
+	private readonly liveMessages = new Map<string, number>();
 	readonly sessions = new Map<string, SessionSocket>();
 	private readonly runtime: NotificationOperatorRuntime;
 	private readonly sessionRouter: OperatorEventRouter<SessionSocket>;
@@ -1666,6 +1668,9 @@ export class TelegramNotificationDaemon {
 			})) as { ok?: boolean };
 			if (res?.ok === false) return;
 			this.topics.delete(sessionId);
+			for (const k of [...this.liveMessages.keys()]) {
+				if (k.startsWith(`${sessionId}:`)) this.liveMessages.delete(k);
+			}
 			this.topicOwnerByIdentity.forEach((ownerSessionId, identityKey) => {
 				if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
 			});
@@ -1795,11 +1800,25 @@ export class TelegramNotificationDaemon {
 
 	/** Drain the shared rate-limit pool and deliver each granted send to its topic. */
 	private async flushPool(): Promise<void> {
-		for (const item of this.pool.drain()) {
+		const batch = this.pool.drain();
+		// Within a batch a finalized frame supersedes any still-queued live frame for
+		// the same streamed message (finalized outranks live), so drop the stale live
+		// edit — otherwise the authoritative final text could be overwritten by an
+		// older partial delivered right after it.
+		const finalizedKeys = new Set<string>();
+		for (const item of batch) {
+			if (item.lane === "finalized" && item.coalesceKey !== undefined) {
+				finalizedKeys.add(`${item.sessionId}:${item.coalesceKey}`);
+			}
+		}
+		for (const item of batch) {
 			const { send, topicId } = item.payload;
 			if (topicId && !(await this.pairedChatIsPrivate())) continue;
 			// Threaded topic when available; otherwise deliver flat to the paired chat.
 			const threadField = topicId ? { message_thread_id: Number(topicId) } : {};
+			const ckey = send.editable ? item.coalesceKey : undefined;
+			const editKey = ckey !== undefined ? `${item.sessionId}:${ckey}` : undefined;
+			if (item.lane === "live" && editKey && finalizedKeys.has(editKey)) continue;
 			try {
 				if (send.method === "sendPhoto" && send.photoBase64) {
 					// Real photo upload (the default botApi multiparts base64 -> file).
@@ -1822,19 +1841,52 @@ export class TelegramNotificationDaemon {
 						parse_mode: TELEGRAM_PARSE_MODE,
 					});
 				} else if (send.text) {
-					for (const text of splitTelegramHtml(send.text)) {
-						await this.botApi.call("sendMessage", {
+					const chunks = splitTelegramHtml(send.text);
+					const existingId = editKey ? this.liveMessages.get(editKey) : undefined;
+					if (editKey && existingId !== undefined && chunks.length === 1) {
+						// In-place edit of the streamed message. An unchanged edit is
+						// rejected by Telegram ("message is not modified") and swallowed.
+						await this.botApi.call("editMessageText", {
 							chat_id: this.opts.chatId,
-							...threadField,
-							text,
+							message_id: existingId,
+							text: chunks[0],
 							parse_mode: TELEGRAM_PARSE_MODE,
 						});
+					} else {
+						let firstMessageId: number | undefined;
+						for (let i = 0; i < chunks.length; i++) {
+							const res = (await this.botApi.call("sendMessage", {
+								chat_id: this.opts.chatId,
+								...threadField,
+								text: chunks[i]!,
+								parse_mode: TELEGRAM_PARSE_MODE,
+							})) as { result?: { message_id?: number } };
+							if (i === 0) firstMessageId = res?.result?.message_id;
+						}
+						if (editKey && ckey !== undefined && firstMessageId !== undefined) {
+							this.recordLiveMessage(item.sessionId, ckey, firstMessageId);
+						}
 					}
 				}
 			} catch {
-				// Best-effort: a failed send must never stop the daemon.
+				// Best-effort: a failed send/edit must never stop the daemon.
 			}
 		}
+	}
+
+	/**
+	 * Track the Telegram message id backing a streamed `(sessionId, coalesceKey)`
+	 * so later live/finalized frames edit it in place. Evicts this session's stale
+	 * same-category entries (e.g. prior turns) so the map stays bounded.
+	 */
+	private recordLiveMessage(sessionId: string, coalesceKey: string, messageId: number): void {
+		const mapKey = `${sessionId}:${coalesceKey}`;
+		const category = coalesceKey.split(":")[0] ?? "";
+		const prefix = `${sessionId}:${category}:`;
+		for (const k of [...this.liveMessages.keys()]) {
+			if (k !== mapKey && k.startsWith(prefix)) this.liveMessages.delete(k);
+		}
+		this.liveMessages.set(mapKey, messageId);
 	}
 
 	/**

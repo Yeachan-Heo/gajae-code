@@ -350,6 +350,12 @@ interface SessionRuntime {
 	/** Assistant text already flushed before an ask this turn (turn-scoped dedupe
 	 * so turn_end does not re-emit the pre-ask lead-in). Reset each turn. */
 	preAskFlushedText?: string;
+	/** Live streaming: opt-in flag, monotonic per-turn ref, and emit throttle state. */
+	stream: boolean;
+	turnSeq?: number;
+	liveRef?: string;
+	lastLiveAt?: number;
+	lastLiveText?: string;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
 }
@@ -383,6 +389,16 @@ export function notificationsEnabled(): boolean {
 	return process.env.GJC_NOTIFICATIONS === "1" || Boolean(process.env.GJC_NOTIFICATIONS_TOKEN);
 }
 
+// Live streaming (opt-in): emit throttled non-finalized `turn_stream` frames as
+// the assistant message streams so remote clients can edit ONE message live. The
+// finalized frame (turn_end) carries the same messageRef and stays authoritative,
+// so a dropped live frame self-heals. Off unless GJC_NOTIFICATIONS_STREAM=1.
+function streamingEnabled(): boolean {
+	return process.env.GJC_NOTIFICATIONS_STREAM === "1";
+}
+function streamIntervalMs(): number {
+	return Math.max(200, Number(process.env.GJC_NOTIFICATIONS_STREAM_INTERVAL_MS) || 500);
+}
 function resolveSettings(settingsOverride?: Settings): ResolvedSettings {
 	if (settingsOverride)
 		return { settings: settingsOverride, cfg: getNotificationConfig(settingsOverride), settingsAvailable: true };
@@ -708,6 +724,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 				cancelPostmortemCleanup: () => {},
 				redact,
 				verbosity,
+				stream: streamingEnabled(),
 				sessionTag: tag,
 				busy: false,
 				pendingInbound: new Set<number>(),
@@ -1063,7 +1080,15 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		if (!text || text === rt.preAskFlushedText) return;
 		rt.preAskFlushedText = text;
 		try {
-			rt.server.pushFrame(JSON.stringify({ type: "turn_stream", sessionId: id, phase: "finalized", text }));
+			rt.server.pushFrame(
+				JSON.stringify({
+					type: "turn_stream",
+					sessionId: id,
+					phase: "finalized",
+					text,
+					...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
+				}),
+			);
 		} catch (e) {
 			logger.warn(`notifications: pushFrame (turn) failed: ${String(e)}`);
 		}
@@ -1093,6 +1118,37 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		// turn with identical text is not falsely deduped.
 		rt.currentTurnText = undefined;
 		rt.preAskFlushedText = undefined;
+		rt.liveRef = undefined;
+		rt.lastLiveAt = undefined;
+		rt.lastLiveText = undefined;
+	});
+
+	// Live streaming (opt-in): push throttled in-progress assistant text as
+	// non-finalized turn_stream frames so remote clients edit one message as the
+	// turn streams. The finalized frame (turn_end) carries the same messageRef and
+	// lands the authoritative text. Suppressed under redaction.
+	api.on("message_update", (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt || !rt.stream || rt.redact) return;
+		if ((event.message as { role?: unknown }).role !== "assistant") return;
+		if (rt.liveRef === undefined) {
+			rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+			rt.liveRef = String(rt.turnSeq);
+		}
+		const now = Date.now();
+		if (now - (rt.lastLiveAt ?? 0) < streamIntervalMs()) return;
+		const text = summaryFromMessage(event.message, 3500);
+		if (!text || text === rt.lastLiveText) return;
+		rt.lastLiveAt = now;
+		rt.lastLiveText = text;
+		try {
+			rt.server.pushFrame(
+				JSON.stringify({ type: "turn_stream", sessionId: id, phase: "live", text, messageRef: rt.liveRef }),
+			);
+		} catch (e) {
+			logger.warn(`notifications: pushFrame (live) failed: ${String(e)}`);
+		}
 	});
 
 	// Stream agent-produced images (computer/browser/tool screenshots) as

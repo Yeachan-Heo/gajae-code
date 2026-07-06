@@ -32,6 +32,12 @@ export interface ThreadedSend {
 	coalesceKey?: string;
 	/** True for the one-time identity header (the daemon pins it once). */
 	identity?: boolean;
+	/**
+	 * When true the daemon may deliver this as an in-place edit of the message
+	 * previously sent under the same `(sessionId, coalesceKey)` instead of a new
+	 * message. Set for streamed turn frames so live + finalized share one message.
+	 */
+	editable?: boolean;
 }
 
 interface ThreadedFrame {
@@ -135,11 +141,21 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 			if (!raw) return undefined;
 			const text = markdownToTelegramHtml(raw);
 			const finalized = frame.phase === "finalized";
+			// A per-turn ref ties the streamed live edits and the finalized text to
+			// ONE message. Without a ref (streaming off), finalized keeps its legacy
+			// keyless behaviour: a fresh message per turn.
+			const ref = str(frame.messageRef);
+			const coalesceKey = finalized
+				? ref
+					? `turn:${ref}`
+					: undefined
+				: `turn:${ref ?? str(frame.sessionId) ?? ""}`;
 			return {
 				method: "sendMessage",
 				lane: finalized ? "finalized" : "live",
 				text,
-				coalesceKey: finalized ? undefined : `turn:${str(frame.messageRef) ?? str(frame.sessionId) ?? ""}`,
+				coalesceKey,
+				editable: coalesceKey !== undefined,
 			};
 		}
 		case "image_attachment": {
