@@ -94,6 +94,7 @@ describe("multiplexer resize replay storm regression", () => {
 			// now routes to viewport repaint: at most `rows` distinct lines, never the
 			// full 60-line transcript.
 			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+			expect(out).toContain("\x1b[29A\r");
 
 			tui.stop();
 		});

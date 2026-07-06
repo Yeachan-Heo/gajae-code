@@ -869,6 +869,7 @@ export class TUI extends Container {
 		}
 		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {
+			const preserveViewportCursor = useViewportRepaintPath();
 			// A forced full redraw supersedes any queued input-priority render.
 			this.#inputRenderPending = false;
 			this.#previousLines = [];
@@ -879,10 +880,12 @@ export class TUI extends Container {
 			this.#previousHeight = -1; // -1 triggers heightChanged, forcing a full clear
 			this.#lineNormalizationCacheLimit = 0;
 			this.#lineTruncationCacheLimit = 0;
-			this.#cursorRow = 0;
-			this.#hardwareCursorRow = 0;
-			this.#viewportTopRow = 0;
-			this.#maxLinesRendered = 0;
+			if (!preserveViewportCursor) {
+				this.#cursorRow = 0;
+				this.#hardwareCursorRow = 0;
+				this.#viewportTopRow = 0;
+				this.#maxLinesRendered = 0;
+			}
 			if (this.#renderTimer) {
 				clearTimeout(this.#renderTimer);
 				this.#renderTimer = undefined;
