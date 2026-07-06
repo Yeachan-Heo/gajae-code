@@ -58,6 +58,8 @@ describe("Extragoal skill template", () => {
 		expect(template).toContain("`goal` (auto-added whenever `goal.enabled` is on, its default)");
 		expect(template).toContain("a contract violation that fails the gate round");
 		expect(template).toContain("**Disabling it is mandatory, not optional**");
-		expect(template).toContain("an invocation with the goal tool still injected does not satisfy the leaf contract");
+		expect(template).toContain("with the goal tool still injected does not satisfy the leaf contract");
+		expect(template).toContain("dedicated gate directory outside the repository");
+		expect(template).toContain("without dirtying the reviewed checkout");
 	});
 });

@@ -11,12 +11,16 @@ sed -n '/^---$/,$p' docs/gjc-dogfood-skill-template.md > ~/.gjc/agent/skills/gjc
 
 For a single project, install to `<project>/.gjc/skills/gjc-dogfood/SKILL.md` with the same extraction. Do not commit that project `.gjc` copy unless the project explicitly wants a local override.
 
-Filesystem skill discovery is off by default, so enable it once (`skills.enabled` plus the native user/project scans are `false` in `DEFAULT_SKILL_DISCOVERY_SETTINGS`):
+Filesystem skill discovery is off by default, so enable it once. Set `skills.enabled`, then enable **only the scan that matches where you installed** — `enablePiUser` and `enablePiProject` default to `false` in `DEFAULT_SKILL_DISCOVERY_SETTINGS`, and enabling the project scan opts every future session into repo-local `.gjc/skills` discovery, so do not enable it for a user-only install:
 
 ```sh
 gjc config set skills.enabled true
-gjc config set skills.enablePiUser true      # for the ~/.gjc/agent/skills/ install
-gjc config set skills.enablePiProject true   # for the <project>/.gjc/skills/ install
+
+# for the user-level install (~/.gjc/agent/skills/):
+gjc config set skills.enablePiUser true
+
+# OR, for the project-level install (<project>/.gjc/skills/):
+gjc config set skills.enablePiProject true
 ```
 
 Then verify in a new session: `/skill:gjc-dogfood` should autocomplete.

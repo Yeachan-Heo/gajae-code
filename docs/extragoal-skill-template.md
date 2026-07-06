@@ -11,7 +11,21 @@ mkdir -p ~/.gjc/agent/skills/extragoal
 sed -n '/^---$/,$p' docs/extragoal-skill-template.md > ~/.gjc/agent/skills/extragoal/SKILL.md
 ```
 
-For a single project, install to `<project>/.gjc/skills/extragoal/SKILL.md` with the same extraction. Do not commit that project `.gjc` copy unless the project explicitly wants a local override. Verify the install in a new session: `/skill:extragoal` should autocomplete.
+For a single project, install to `<project>/.gjc/skills/extragoal/SKILL.md` with the same extraction. Do not commit that project `.gjc` copy unless the project explicitly wants a local override.
+
+Filesystem skill discovery is off by default, so enable it once. Set `skills.enabled`, then enable **only the scan that matches where you installed** — `enablePiUser` and `enablePiProject` default to `false`, and enabling the project scan opts every future session into repo-local `.gjc/skills` discovery, so do not enable it for a user-only install:
+
+```sh
+gjc config set skills.enabled true
+
+# for the user-level install (~/.gjc/agent/skills/):
+gjc config set skills.enablePiUser true
+
+# OR, for the project-level install (<project>/.gjc/skills/):
+gjc config set skills.enablePiProject true
+```
+
+Then verify in a new session: `/skill:extragoal` should autocomplete.
 
 ---
 name: extragoal
@@ -127,7 +141,7 @@ Adding `--mpreset reviewer` on top is an **optional enhancement**, not a prerequ
 
 Read-only is enforced for the built-in tool surface by the `--tools` allowlist, not by the prompt — a reviewer invocation without a tool allowlist does not satisfy the leaf contract. Two session utilities are injected **beyond** the allowlist and must be handled:
 
-- `goal` (auto-added whenever `goal.enabled` is on, its default): its mutating ops (`create`, `complete`, `pause`, `drop`) persist session mode state through the session host, so a reviewer — or prompt-injected bundle text — could write `.gjc` session state before the violation is even recorded. **Disabling it is mandatory, not optional**: the review working directory must contain a `.gjc/config.yml` with `goal:` / `  enabled: false` (verified to remove the injected tool), and an invocation with the goal tool still injected does not satisfy the leaf contract.
+- `goal` (auto-added whenever `goal.enabled` is on, its default): its mutating ops (`create`, `complete`, `pause`, `drop`) persist session mode state through the session host, so a reviewer — or prompt-injected bundle text — could write `.gjc` session state before the violation is even recorded. **Disabling it is mandatory, not optional**, and it must be disabled without dirtying the reviewed checkout (an untracked `<repo>/.gjc/config.yml` would violate the Stage 0 clean-work precondition, and committing it would disable goal mode project-wide): run the reviewer from a **dedicated gate directory outside the repository** whose `.gjc/config.yml` contains `goal:` / `  enabled: false` — project-level settings load from the session cwd, and bundle/repo paths are passed absolute (verified: the injected tool disappears while absolute-path repo reads keep working). A temporary user-level toggle (`gjc config set goal.enabled false` around the invocation) is an acceptable alternative on single-operator machines. An invocation with the goal tool still injected does not satisfy the leaf contract.
 - `generate_image` (registered whenever an image-capable credential exists): it has no disable setting but cannot write to the repository or `.gjc` state; any reviewer call to it — or to any tool outside `read`/`search`/`find` — is a contract violation that fails the gate round and is reported in the gate artifact.
 
 The sub-session shares no conversation state with the authoring session and may inspect the repo read-only when the diff alone is not self-contained.
