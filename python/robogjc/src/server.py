@@ -486,6 +486,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if token != cfg.replay_token.get_secret_value():
             raise HTTPException(401, "invalid replay token")
 
+    def _require_dashboard_token(cfg: Settings, token: str | None) -> None:
+        if cfg.replay_token is None:
+            return
+        if token != cfg.replay_token.get_secret_value():
+            raise HTTPException(401, "invalid replay token")
+
     @app.get("/api/github/issues")
     async def api_github_issues(
         request: Request,
@@ -663,7 +669,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.get("/events")
-    async def events(request: Request, limit: int = 50) -> dict[str, Any]:
+    async def events(
+        request: Request,
+        limit: int = 50,
+        x_robogjc_token: str | None = Header(None, alias="X-Robogjc-Replay-Token"),
+    ) -> dict[str, Any]:
+        cfg: Settings = request.app.state.bag["settings"]
+        _require_dashboard_token(cfg, x_robogjc_token)
         rows = request.app.state.bag["db"].list_events(limit=limit)
         return {
             "events": [
@@ -682,7 +694,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/issues")
-    async def issues(request: Request, limit: int = 100) -> dict[str, Any]:
+    async def issues(
+        request: Request,
+        limit: int = 100,
+        x_robogjc_token: str | None = Header(None, alias="X-Robogjc-Replay-Token"),
+    ) -> dict[str, Any]:
+        cfg: Settings = request.app.state.bag["settings"]
+        _require_dashboard_token(cfg, x_robogjc_token)
         rows = request.app.state.bag["db"].list_issues(limit=limit)
         return {
             "issues": [
@@ -706,9 +724,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return HTMLResponse(render_index(cfg.replay_token is not None))
 
     @app.get("/api/status")
-    async def api_status(request: Request) -> dict[str, Any]:
+    async def api_status(
+        request: Request,
+        x_robogjc_token: str | None = Header(None, alias="X-Robogjc-Replay-Token"),
+    ) -> dict[str, Any]:
         bag = request.app.state.bag
         cfg: Settings = bag["settings"]
+        _require_dashboard_token(cfg, x_robogjc_token)
         db: Database = bag["db"]
         pool: WorkerPool = bag["pool"]
         started = float(bag.get("started_at") or time.time())
@@ -772,8 +794,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/api/logs")
-    async def api_logs(request: Request, limit: int = 400) -> dict[str, Any]:
+    async def api_logs(
+        request: Request,
+        limit: int = 400,
+        x_robogjc_token: str | None = Header(None, alias="X-Robogjc-Replay-Token"),
+    ) -> dict[str, Any]:
         cfg: Settings = request.app.state.bag["settings"]
+        _require_dashboard_token(cfg, x_robogjc_token)
         capped = max(1, min(int(limit), 2000))
         entries = tail_jsonl(cfg.log_dir / "robogjc.log.jsonl", limit=capped)
         return {"entries": entries, "count": len(entries), "limit": capped}
