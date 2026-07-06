@@ -497,7 +497,6 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	try {
 		if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 		await writeStateFile(stateFile, payload);
-		await refreshLastPayloadCache(stateFile, payload);
 	} catch (error) {
 		logger.warn("Failed to persist coordinator runtime state", { error: String(error), stateFile });
 	}

@@ -193,7 +193,6 @@ import {
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
 import {
-	eventAffectsCoordinatorRuntimeState,
 	persistCoordinatorRuntimeStateFromEvent,
 	registerCoordinatorRuntimeStateFinalizer,
 } from "../gjc-runtime/session-state-sidecar";
