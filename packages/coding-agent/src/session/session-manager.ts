@@ -3958,6 +3958,25 @@ export class SessionManager {
 	}
 
 	/**
+	 * Append a root marker that starts a fresh active branch without changing the
+	 * session id or deleting earlier durable entries. Subsequent messages descend
+	 * from this marker, so provider context is clear while history remains
+	 * available for diagnostics/export.
+	 */
+	appendContextClearEntry(data?: Record<string, unknown>): string {
+		const entry: CustomEntry = {
+			type: "custom",
+			customType: "context_clear",
+			data,
+			id: generateId(this.#byId),
+			parentId: null,
+			timestamp: new Date().toISOString(),
+		};
+		this.#appendEntry(entry);
+		return entry.id;
+	}
+
+	/**
 	 * Write mutated message entries back into the canonical entry store by id.
 	 *
 	 * `getBranch()` materializes resident-blob entries into copies, so in-place

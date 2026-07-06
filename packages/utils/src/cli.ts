@@ -68,6 +68,18 @@ export const Args = {
 	},
 };
 
+/**
+ * Thrown when CLI argument/flag parsing or validation fails (unknown flag,
+ * bad option value, missing required arg, etc.). `run()` catches this to print
+ * the message and render usage instead of crashing as an uncaught exception.
+ */
+export class CliParseError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "CliParseError";
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Parse result types — mirrors oclif's typed output from this.parse()
 // ---------------------------------------------------------------------------
@@ -174,12 +186,22 @@ export abstract class Command {
 
 		// strict=false when command declares args (positionals must pass through)
 		// or when the command itself opts out
-		const { values: rawValues, positionals } = nodeParseArgs({
-			args: this.argv,
-			options,
-			allowPositionals: true,
-			strict,
-		});
+		let rawValues: Record<string, string | boolean | Array<string | boolean> | undefined>;
+		let positionals: string[];
+		try {
+			const parsed = nodeParseArgs({
+				args: this.argv,
+				options,
+				allowPositionals: true,
+				strict,
+			});
+			rawValues = parsed.values;
+			positionals = parsed.positionals;
+		} catch (err) {
+			// node:util parseArgs throws on unknown flags / malformed input — surface
+			// it as a CliParseError so run() renders usage instead of crashing.
+			throw new CliParseError(err instanceof Error ? err.message : String(err));
+		}
 
 		// Convert raw values to proper types and validate
 		const flags: Record<string, unknown> = {};
@@ -191,7 +213,7 @@ export abstract class Command {
 				} else {
 					const n = Number.parseInt(raw as string, 10);
 					if (Number.isNaN(n)) {
-						throw new Error(`Expected integer for --${name}, got "${raw}"`);
+						throw new CliParseError(`Expected integer for --${name}, got "${raw}"`);
 					}
 					flags[name] = n;
 				}
@@ -204,14 +226,16 @@ export abstract class Command {
 				// Validate options constraint
 				if (val !== undefined && desc.options && !Array.isArray(val)) {
 					if (!desc.options.includes(val as string)) {
-						throw new Error(`Expected --${name} to be one of: ${[...desc.options].join(", ")}; got "${val}"`);
+						throw new CliParseError(
+							`Expected --${name} to be one of: ${[...desc.options].join(", ")}; got "${val}"`,
+						);
 					}
 				}
 				flags[name] = val;
 			}
 			// Validate required
 			if (desc.required && flags[name] === undefined) {
-				throw new Error(`Missing required flag: --${name}`);
+				throw new CliParseError(`Missing required flag: --${name}`);
 			}
 		}
 
@@ -230,13 +254,15 @@ export abstract class Command {
 			}
 			// Validate required
 			if (desc.required && args[argName] === undefined) {
-				throw new Error(`Missing required argument: ${argName}`);
+				throw new CliParseError(`Missing required argument: ${argName}`);
 			}
 			// Validate options constraint
 			const argVal = args[argName];
 			if (argVal !== undefined && desc.options && typeof argVal === "string") {
 				if (!desc.options.includes(argVal)) {
-					throw new Error(`Expected ${argName} to be one of: ${[...desc.options].join(", ")}; got "${argVal}"`);
+					throw new CliParseError(
+						`Expected ${argName} to be one of: ${[...desc.options].join(", ")}; got "${argVal}"`,
+					);
 				}
 			}
 		}
@@ -425,7 +451,19 @@ export async function run(opts: RunOptions): Promise<void> {
 	const Cmd = await entry.load();
 	const config: CliConfig = { bin, version, commands: new Map([[entry.name, Cmd]]) };
 	const instance = new Cmd(commandArgv, config);
-	await instance.run();
+	try {
+		await instance.run();
+	} catch (err) {
+		if (err instanceof CliParseError) {
+			// Invalid args/flags for a real command: print the problem + usage and
+			// exit with a usage error, instead of crashing as an uncaught exception.
+			process.stderr.write(`${err.message}\n\n`);
+			renderCommandHelp(bin, entry.name, Cmd);
+			process.exitCode = 2;
+			return;
+		}
+		throw err;
+	}
 }
 
 /** Resolve all command loaders for help/alias display. */

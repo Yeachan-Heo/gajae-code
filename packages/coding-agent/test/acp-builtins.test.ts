@@ -313,6 +313,24 @@ describe("ACP builtin slash commands", () => {
 		expect(result).toBe(false);
 	});
 
+	it("changelog: advertises and renders recent or full changelog output", async () => {
+		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(command => command.name === "changelog");
+		expect(advertised?.description).toBe("Show release notes and changelog entries");
+		expect(advertised?.input?.hint).toBe("[full|--full]");
+
+		const recent = createRuntime();
+		await expect(executeAcpBuiltinSlashCommand("/changelog", recent.runtime)).resolves.toEqual({ consumed: true });
+		expect(recent.output[0]).toContain("Recent Changes");
+		expect(recent.output[0]).toContain("Use `/changelog --full`");
+
+		const full = createRuntime();
+		await expect(executeAcpBuiltinSlashCommand("/changelog --full", full.runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(full.output[0]).toContain("Full Changelog");
+		expect(full.output[0]).not.toContain("Use `/changelog --full`");
+	});
+
 	// /jobs
 	it("jobs: shows informative message when snapshot is null", async () => {
 		const { output, runtime } = createRuntime();
@@ -641,7 +659,6 @@ describe("ACP builtin slash commands", () => {
 			"/tree",
 			"/branch",
 			"/browser",
-			"/changelog",
 			"/plan",
 			"/share",
 			"/hotkeys",

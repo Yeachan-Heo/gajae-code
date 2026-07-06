@@ -1,6 +1,15 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added a `/clear` slash command that clears the active conversation context while preserving the current session id and durable session history (#1677).
+- Added an Extragoal local skill template (`docs/extragoal-skill-template.md`) documenting an external final review gate on top of `ultragoal` — a fresh-context, cross-family, tool-restricted read-only reviewer with a machine-parsable verdict contract, mandatory bundle secret scan, prompt-injection stance, explicit findings triage, and a bounded re-sign loop — plus a `reviewer` stance profile and cross-session review-gate recipe in `docs/multi-vendor-profiles.md`, pinned by `test/extragoal-template.test.ts`.
+
+### Fixed
+
+- Restored `/changelog` as a built-in slash command, including autocomplete and `/changelog --full`/`/changelog full`, so the What's New prompt no longer points at a missing command.
+- Corrected the Extragoal template's read-only enforcement claim: the `--tools` allowlist governs the built-in tool surface, while the runtime injects the session `goal` tool (when `goal.enabled` is on) and `generate_image` (when an image credential exists) beyond it. Because goal's mutating ops persist session mode state, disabling it is now a mandatory gate precondition (`goal.enabled: false` in the review working directory's `.gjc/config.yml`), and reviewer calls outside the allowlist are gate-failing contract violations.
 
 ## [0.8.2] - 2026-07-06
 ### Added
