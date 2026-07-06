@@ -36,8 +36,14 @@ function makeFetch(results: Record<string, unknown[]>): { fetchImpl: typeof fetc
 	}) as typeof fetch;
 	return { fetchImpl, calls };
 }
-
+let captureOutputQueue: Promise<void> = Promise.resolve();
 async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string; stderr: string }> {
+	const previous = captureOutputQueue;
+	let release!: () => void;
+	captureOutputQueue = new Promise<void>(resolve => {
+		release = resolve;
+	});
+	await previous;
 	const originalStdout = process.stdout.write.bind(process.stdout);
 	const originalStderr = process.stderr.write.bind(process.stderr);
 	let stdout = "";
@@ -55,6 +61,7 @@ async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string
 	} finally {
 		process.stdout.write = originalStdout;
 		process.stderr.write = originalStderr;
+		release();
 	}
 	return { stdout, stderr };
 }
@@ -265,7 +272,7 @@ test("non-interactive setup with --token and --chat-id verifies private chat wit
 	}) as any;
 	const cmd = parseNotifyArgs(["notify", "setup", "--token", "123:abc", "--chat-id", "999", "--redact"]);
 	expect(cmd).toBeTruthy();
-	await runNotifyCommand(cmd!, { settings, fetchImpl, apiBase: "https://api.telegram.org" });
+	await captureOutput(() => runNotifyCommand(cmd!, { settings, fetchImpl, apiBase: "https://api.telegram.org" }));
 	const cfg = getNotificationConfig(settings);
 	expect(cfg.enabled).toBe(true);
 	expect(cfg.chatId).toBe("999");
@@ -284,9 +291,9 @@ test("non-interactive setup rejects non-private chat ids without writing config"
 		});
 		const cmd = parseNotifyArgs(["notify", "setup", "--token", "123:abc", "--chat-id", "-100"]);
 
-		await expect(runNotifyCommand(cmd!, { settings, fetchImpl, setupInteractive: false })).rejects.toThrow(
-			`Provided chat id -100 is a ${type} chat`,
-		);
+		await expect(
+			captureOutput(() => runNotifyCommand(cmd!, { settings, fetchImpl, setupInteractive: false })),
+		).rejects.toThrow(`Provided chat id -100 is a ${type} chat`);
 
 		expect(getNotificationConfig(settings).enabled).toBe(false);
 		expect(getNotificationConfig(settings).botToken).toBeUndefined();
