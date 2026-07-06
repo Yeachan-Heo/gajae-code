@@ -166,6 +166,28 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("repaints live viewport when overflowed content shrinks only at the tail", async () => {
+			const term = new VirtualTerminal(20, 5);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("row-", 10));
+			tui.setClearOnShrink(false);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(visible(term)).toEqual(["row-5", "row-6", "row-7", "row-8", "row-9"]);
+
+				component.setLines(rows("row-", 8));
+				tui.requestRender(false, "test.tail-shrink");
+				await settle(term);
+
+				expect(visible(term)).toEqual(["row-3", "row-4", "row-5", "row-6", "row-7"]);
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("clears row 0 when content shrinks to empty without clearOnShrink", async () => {
 			const term = new VirtualTerminal(40, 10);
 			const tui = new TUI(term);

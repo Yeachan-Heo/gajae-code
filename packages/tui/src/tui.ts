@@ -1783,6 +1783,11 @@ export class TUI extends Container {
 			return;
 		}
 
+		const nextLiveViewportTop = Math.max(0, newLines.length - height);
+		if (firstChanged >= newLines.length && nextLiveViewportTop !== prevViewportTop) {
+			viewportRepaint(`tail shrink changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
+			return;
+		}
 		// All changes are in deleted lines (nothing to render, just clear)
 		if (firstChanged >= newLines.length) {
 			if (this.#previousLines.length > newLines.length) {
