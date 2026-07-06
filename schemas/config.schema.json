@@ -341,7 +341,7 @@
 				"readArtifactSpillThreshold": {
 					"type": "number",
 					"description": "Combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Higher than the general spill threshold so ordinary inspection reads stay inline; 0 disables read spill (falls back to the absolute inline backstop only).",
-					"default": 256
+					"default": 0
 				},
 				"fileMentionInlineBytes": {
 					"type": "number",
