@@ -17,6 +17,7 @@ interface FileSnapshot {
 	mtimeMs: number;
 	ctimeMs: number;
 	size: number;
+	ino: number;
 }
 
 interface ValidatedPluginRegistry {
@@ -35,12 +36,15 @@ interface CachedValidatedPluginRegistry extends ValidatedPluginRegistry {
 
 const validatedRegistryCache = new Map<string, CachedValidatedPluginRegistry>();
 const hashCache = new Map<string, string>();
+// Bound the digest memo so long sessions with plugin churn cannot grow it
+// unboundedly; entries are re-derivable from disk at the cost of one read.
+const HASH_CACHE_MAX_ENTRIES = 512;
 const registryScopes: GjcPluginScope[] = ["user", "project"];
 
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
 	try {
 		const stat = await fs.stat(filePath);
-		return { path: filePath, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size };
+		return { path: filePath, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size, ino: stat.ino };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return null;
 		throw error;
@@ -48,7 +52,7 @@ async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | nu
 }
 
 function snapshotsKey(snapshots: readonly FileSnapshot[]): string {
-	return snapshots.map(s => `${s.path}:${s.mtimeMs}:${s.ctimeMs}:${s.size}`).join("|");
+	return snapshots.map(s => `${s.path}:${s.mtimeMs}:${s.ctimeMs}:${s.size}:${s.ino}`).join("|");
 }
 
 async function snapshotRegistryFiles(cwd: string): Promise<FileSnapshot[]> {
@@ -66,7 +70,7 @@ async function snapshotPluginFiles(entries: readonly GjcPluginRegistryEntry[]): 
 			const abs = path.join(entry.pluginRoot, file.relativePath);
 			const snapshot = await snapshotExistingFile(abs);
 			if (!snapshot) {
-				snapshots.push({ path: abs, mtimeMs: Number.NaN, ctimeMs: Number.NaN, size: Number.NaN });
+				snapshots.push({ path: abs, mtimeMs: Number.NaN, ctimeMs: Number.NaN, size: Number.NaN, ino: Number.NaN });
 			} else {
 				snapshots.push(snapshot);
 			}
@@ -80,10 +84,16 @@ function sha256(buf: Buffer): string {
 }
 
 async function hashFile(snapshot: FileSnapshot): Promise<string> {
-	const key = `${snapshot.path}:${snapshot.mtimeMs}:${snapshot.ctimeMs}:${snapshot.size}`;
+	const key = `${snapshot.path}:${snapshot.mtimeMs}:${snapshot.ctimeMs}:${snapshot.size}:${snapshot.ino}`;
 	const cached = hashCache.get(key);
 	if (cached) return cached;
 	const digest = sha256(await fs.readFile(snapshot.path));
+	if (hashCache.size >= HASH_CACHE_MAX_ENTRIES) {
+		// FIFO eviction is sufficient: the memo only avoids re-reads within a
+		// session; correctness never depends on a hit.
+		const oldest = hashCache.keys().next().value;
+		if (oldest !== undefined) hashCache.delete(oldest);
+	}
 	hashCache.set(key, digest);
 	return digest;
 }

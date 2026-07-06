@@ -365,6 +365,16 @@ function stableCacheString(value: unknown): string | undefined {
 	}
 }
 
+/**
+ * Hash a message by full content serialization.
+ *
+ * Deliberately NOT memoized by object identity: callers mutate messages in
+ * place (compaction rewrites, obfuscation, abort markers) and the cache's
+ * correctness contract requires detecting those mutations. The per-turn
+ * serialization cost is the price of that contract; the win is skipping
+ * convertToLlm + normalize on stable contexts, which dominates for
+ * image-heavy histories.
+ */
 function hashMessageContent(message: AgentMessage): string | undefined {
 	return stableCacheString(message);
 }
@@ -419,6 +429,14 @@ async function convertAndNormalizeMessages(
 		if (stablePrefixLength === keys.messageHashes.length && stablePrefixLength === previous.messageHashes.length) {
 			return previous.normalizedMessages;
 		}
+		// Append-only fast path: convert only the new suffix and concatenate.
+		// CONTRACT: `convertToLlm` must be per-message (each output message
+		// derived solely from its input message). The bundled converters
+		// satisfy this — they map/filter message-by-message. A converter that
+		// merges adjacent messages or pairs across the suffix boundary would
+		// diverge from a full rebuild; such converters must not be combined
+		// with appendOnlyContext. Covered by the suffix-equivalence test in
+		// agent-loop-context-cache.test.ts.
 		if (
 			config.appendOnlyContext &&
 			stablePrefixLength === previous.messageHashes.length &&

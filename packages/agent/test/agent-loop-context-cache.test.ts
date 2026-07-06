@@ -189,4 +189,69 @@ describe("agent loop converted context cache", () => {
 		expect(convertSizes).toEqual([1, 1]);
 		expect(captured[1]!.messages[0]!.content).toBe("second transform");
 	});
+
+	it("append-only suffix conversion is equivalent to a full rebuild across tool-result boundaries", async () => {
+		const mock = createMockModel();
+		const toolCalls = {
+			role: "assistant" as const,
+			content: [
+				{ type: "toolCall" as const, id: "call-1", name: "read", arguments: { path: "a.ts" } },
+				{ type: "toolCall" as const, id: "call-2", name: "read", arguments: { path: "b.ts" } },
+			],
+			api: "mock",
+			provider: "mock",
+			model: "mock-model",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse" as const,
+			timestamp: Date.now(),
+		} as AgentMessage;
+		const makeToolResult = (id: string, text: string): AgentMessage =>
+			({
+				role: "toolResult" as const,
+				toolCallId: id,
+				toolName: "read",
+				content: [{ type: "text" as const, text }],
+				isError: false,
+				timestamp: Date.now(),
+			}) as AgentMessage;
+		const resultOne = makeToolResult("call-1", "contents of a.ts");
+		const resultTwo = makeToolResult("call-2", "contents of b.ts");
+
+		// The assistant tool-call message and the first result land in the
+		// cached prefix; the second result for the SAME assistant message
+		// arrives as the appended suffix. A per-message converter must produce
+		// identical output whether it saw the group together or split there.
+		const convertPerMessage = (messages: AgentMessage[]): Message[] =>
+			messages.filter((m): m is Message => m.role === "user" || m.role === "assistant" || m.role === "toolResult");
+
+		// Incremental run: prefix cached, then suffix converted in isolation.
+		const incrementalContext = makeContext([createUserMessage("do it"), toolCalls, resultOne]);
+		const incrementalCaptured: Context[] = [];
+		const incrementalConfig: AgentLoopConfig = {
+			model: mock.model,
+			appendOnlyContext: new AppendOnlyContextManager(),
+			convertToLlm: convertPerMessage,
+		};
+		await runOnce(incrementalContext, incrementalConfig, incrementalCaptured);
+		incrementalContext.messages.push(resultTwo);
+		await runOnce(incrementalContext, incrementalConfig, incrementalCaptured);
+
+		// Cold run: identical messages converted in a single full pass.
+		const coldContext = makeContext([createUserMessage("do it"), toolCalls, resultOne, resultTwo]);
+		const coldCaptured: Context[] = [];
+		const coldConfig: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: convertPerMessage,
+		};
+		await runOnce(coldContext, coldConfig, coldCaptured);
+
+		expect(incrementalCaptured[1]!.messages).toEqual(coldCaptured[0]!.messages);
+	});
 });
