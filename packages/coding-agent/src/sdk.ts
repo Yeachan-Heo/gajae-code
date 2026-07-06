@@ -97,7 +97,7 @@ import {
 } from "./notifications/config";
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
-import { discoverAndLoadMCPTools, MCPManager } from "./runtime-mcp";
+import { buildTrustGatedMCPDiscoverOptions, discoverAndLoadMCPTools, MCPManager } from "./runtime-mcp";
 import {
 	collectEnvSecrets,
 	deobfuscateSessionContext,
@@ -1479,12 +1479,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							process.stderr.write(`Connecting to MCP servers: ${serverNames.join(", ")}…\n`);
 						}
 					},
-					enableProjectConfig: settings.get("mcp.enableProjectConfig"),
-					// Always filter Exa - we have native integration
-					filterExa: true,
-					// Filter browser MCP servers when builtin browser tool is active
-					filterBrowser: settings.get("browser.enabled") ?? false,
-					autoloadOnly: true,
+					// Shared trust gates: identical shape to the runtime /mcp reload
+					// path (buildTrustGatedMCPDiscoverOptions) so reload can never
+					// widen the connected surface beyond startup.
+					...buildTrustGatedMCPDiscoverOptions({
+						enableProjectConfig: settings.get("mcp.enableProjectConfig"),
+						browserEnabled: settings.get("browser.enabled"),
+					}),
 					cacheStorage: settings.getStorage(),
 					authStorage,
 				});
