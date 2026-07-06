@@ -34,6 +34,34 @@ export interface LoadMCPConfigsResult {
 	sources: Record<string, SourceMeta>;
 }
 
+/** Setting-derived inputs for {@link buildTrustGatedMCPDiscoverOptions}. */
+export interface MCPTrustGateInputs {
+	/** Value of the `mcp.enableProjectConfig` setting; project config stays opt-in. */
+	enableProjectConfig: boolean | undefined;
+	/** Value of the `browser.enabled` setting; browser MCP servers are filtered when the builtin browser tool is active. */
+	browserEnabled: boolean | undefined;
+}
+
+/**
+ * Build the discover/connect options that enforce GJC's MCP trust gates.
+ *
+ * Session startup (`sdk.ts`) and the runtime `/mcp reload` path must share
+ * this exact shape so a reload can never widen the connected surface beyond
+ * what startup would have connected: project config stays opt-in via
+ * `mcp.enableProjectConfig`, Exa servers stay filtered (native integration),
+ * and only autoload-eligible servers (`autoload !== false`) connect
+ * implicitly. Explicit per-server commands remain the consent path for
+ * gated servers.
+ */
+export function buildTrustGatedMCPDiscoverOptions(inputs: MCPTrustGateInputs): LoadMCPConfigsOptions {
+	return {
+		enableProjectConfig: inputs.enableProjectConfig,
+		filterExa: true,
+		filterBrowser: inputs.browserEnabled ?? false,
+		autoloadOnly: true,
+	};
+}
+
 /**
  * Convert canonical MCPServer to legacy MCPServerConfig.
  */
