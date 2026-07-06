@@ -548,17 +548,17 @@ export const SETTINGS_SCHEMA = {
 
 	"tools.readArtifactSpillThreshold": {
 		type: "number",
-		default: 256,
+		default: 0,
 		ui: {
 			tab: "tools",
 			label: "Read-tool artifact spill threshold (KB)",
 			description:
 				"Combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Higher than the general spill threshold so ordinary inspection reads stay inline; 0 disables read spill (falls back to the absolute inline backstop only).",
 			options: [
-				{ value: "0", label: "Off", description: "No read-specific spill (backstop only)" },
+				{ value: "0", label: "Off", description: "Default; no read-specific spill (backstop only)" },
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
 				{ value: "100", label: "100 KB", description: "~25K tokens" },
-				{ value: "256", label: "256 KB", description: "Default; ~64K tokens" },
+				{ value: "256", label: "256 KB", description: "~64K tokens" },
 				{ value: "512", label: "512 KB", description: "~128K tokens" },
 				{ value: "1000", label: "1 MB", description: "~250K tokens" },
 			],

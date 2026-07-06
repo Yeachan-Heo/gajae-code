@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { getDefault, Settings } from "@gajae-code/coding-agent/config/settings";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
@@ -48,6 +48,10 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 }
 
 describe("read-tool artifact spill (Finding 4)", () => {
+	it("keeps the read spill rollout default off", () => {
+		expect(getDefault("tools.readArtifactSpillThreshold")).toBe(0);
+	});
+
 	let testDir: string;
 	let bigFile: string;
 	const fullBytes = 80 * 1024;
@@ -115,7 +119,7 @@ describe("read-tool artifact spill (Finding 4)", () => {
 
 	it("leaves reads within the read threshold inline (no spill)", async () => {
 		const tool = wrapToolWithMetaNotice(new ReadTool(createSession(testDir)));
-		// Default read threshold (256KB) leaves the 80KB read fully inline.
+		// Default read threshold is off, leaving the 80KB read fully inline.
 		const ctx = createContext(Settings.isolated({ "tools.maxInlineResultBytes": 0 }));
 
 		const result = await tool.execute("r3", { path: bigFile }, undefined, undefined, ctx);
