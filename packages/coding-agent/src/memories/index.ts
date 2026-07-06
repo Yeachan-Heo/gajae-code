@@ -1083,7 +1083,18 @@ async function resolveMemoryModel(options: {
 		});
 		if (resolved.model) return resolved.model;
 	}
-	return session.model ?? modelRegistry.getAll()[0];
+	if (session.model) return session.model;
+	// No configured role and no active session model (e.g. background startup
+	// before lazy model resolution): prefer the most recently used model over
+	// raw registry order. `getAll()[0]` can be a retired model the provider
+	// now rejects with 404, which permanently fails consolidation jobs.
+	const allModels = modelRegistry.getAll();
+	const usageOrder = session.settings.getStorage()?.getModelUsageOrder() ?? [];
+	for (const usedKey of usageOrder) {
+		const match = allModels.find(model => `${model.provider}/${model.id}` === usedKey);
+		if (match) return match;
+	}
+	return allModels[0];
 }
 
 function loadMemoryConfig(settings: Settings): MemoryRuntimeConfig {

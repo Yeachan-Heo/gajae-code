@@ -17,7 +17,12 @@ import {
 export { computeUltragoalPlanGeneration, receiptRelevantGoals } from "./ultragoal-receipt-freshness";
 
 import { gjcRoot, sessionUltragoalDir } from "./session-layout";
-import { resolveGjcSessionForRead, resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
+import {
+	resolveGjcSessionForRead,
+	resolveGjcSessionForWrite,
+	SessionResolutionError,
+	writeSessionActivityMarker,
+} from "./session-resolution";
 import { renderUltragoalStatusMarkdown } from "./state-renderer";
 import { reconcileWorkflowSkillState } from "./state-runtime";
 import {
@@ -5164,9 +5169,18 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 }
 
 async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<UltragoalCommandResult> {
-	const sessionId = currentUltragoalSessionId(cwd);
+	// Help must not require a resolvable session; render it before session resolution.
 	const help = renderUltragoalHelp(args);
 	if (help) return { status: 0, stdout: help };
+	let sessionId: string;
+	try {
+		sessionId = currentUltragoalSessionId(cwd);
+	} catch (error) {
+		// A missing/ambiguous session is an operator input error, not a crash:
+		// surface the guidance on stderr instead of an uncaught-exception dump.
+		if (error instanceof SessionResolutionError) return { status: 1, stderr: `${error.message}\n` };
+		throw error;
+	}
 	try {
 		const command = commandName(args);
 		const json = hasFlag(args, "--json");

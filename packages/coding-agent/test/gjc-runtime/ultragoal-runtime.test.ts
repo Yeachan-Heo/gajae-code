@@ -50,11 +50,37 @@ async function tempDir(): Promise<string> {
 	return dir;
 }
 
+let savedCiDevChangedPaths: { value: string | undefined } | undefined;
+
+/**
+ * Root for validation-batch tests, hermetically OUTSIDE the enclosing git
+ * repository. `computeCheckpointChangeSet` walks git from the checkpoint cwd,
+ * so a root inside this repo sweeps the contributor's actual branch diff /
+ * dirty working tree into the computed change set and breaks the hardcoded
+ * `batchChangeSetPaths()` coverage on any branch other than the one that
+ * introduced these tests. Outside a git work tree the runtime falls back to
+ * `CI_DEV_CHANGED_PATHS`, which we pin to the declared batch change-set paths.
+ */
+async function batchTempDir(): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-batch-"));
+	tempRoots.push(dir);
+	savedCiDevChangedPaths ??= { value: process.env.CI_DEV_CHANGED_PATHS };
+	process.env.CI_DEV_CHANGED_PATHS = batchChangeSetPaths()
+		.map(row => row.path)
+		.join("\n");
+	return dir;
+}
+
 afterEach(async () => {
 	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = savedSessionId;
 	if (savedSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 	else process.env.GJC_SESSION_FILE = savedSessionFile;
+	if (savedCiDevChangedPaths) {
+		if (savedCiDevChangedPaths.value === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+		else process.env.CI_DEV_CHANGED_PATHS = savedCiDevChangedPaths.value;
+		savedCiDevChangedPaths = undefined;
+	}
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -1106,7 +1132,7 @@ describe("native GJC ultragoal runtime", () => {
 		}
 	});
 	it("validation batch deferred: accepts deferred gate and rejects strict keys/uncovered paths", async () => {
-		const root = await tempDir();
+		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);
 		const plan = await createUltragoalPlan({
 			cwd: root,
@@ -1178,7 +1204,7 @@ describe("native GJC ultragoal runtime", () => {
 	});
 
 	it("validation batch close: rejects out-of-order, accepts close, keeps members deferred, and stales after member mutation", async () => {
-		const root = await tempDir();
+		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);
 		let plan = await createUltragoalPlan({
 			cwd: root,
@@ -1242,7 +1268,7 @@ describe("native GJC ultragoal runtime", () => {
 	});
 
 	it("validation batch idempotent replay rejects stale durable metadata before early return", async () => {
-		const root = await tempDir();
+		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);
 		let plan = await createUltragoalPlan({
 			cwd: root,
@@ -1275,7 +1301,7 @@ describe("native GJC ultragoal runtime", () => {
 	});
 
 	it("validation batch idempotent replay rejects deleted durable metadata before early return", async () => {
-		const root = await tempDir();
+		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);
 		let plan = await createUltragoalPlan({
 			cwd: root,
@@ -1308,7 +1334,7 @@ describe("native GJC ultragoal runtime", () => {
 	});
 
 	it("validation batch close rejects receipt-stale deferred member", async () => {
-		const root = await tempDir();
+		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);
 		let plan = await createUltragoalPlan({
 			cwd: root,
@@ -1350,7 +1376,7 @@ describe("native GJC ultragoal runtime", () => {
 	});
 
 	it("validation batch close idempotent replay rejects changed member basis", async () => {
-		const root = await tempDir();
+		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);
 		let plan = await createUltragoalPlan({
 			cwd: root,
@@ -1399,7 +1425,7 @@ describe("native GJC ultragoal runtime", () => {
 	});
 
 	it("validation batch close idempotent replay rejects stale final receipt", async () => {
-		const root = await tempDir();
+		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);
 		let plan = await createUltragoalPlan({
 			cwd: root,
@@ -1448,7 +1474,7 @@ describe("native GJC ultragoal runtime", () => {
 	});
 
 	it("validation batch close rejects member durable receipt when ledger payload differs", async () => {
-		const root = await tempDir();
+		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);
 		let plan = await createUltragoalPlan({
 			cwd: root,
@@ -1508,7 +1534,7 @@ describe("native GJC ultragoal runtime", () => {
 			"split before validation is safe",
 			"--json",
 		];
-		const allowedRoot = await tempDir();
+		const allowedRoot = await batchTempDir();
 		await createUltragoalPlan({
 			cwd: allowedRoot,
 			brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
@@ -1536,7 +1562,7 @@ describe("native GJC ultragoal runtime", () => {
 			}),
 		).rejects.toThrow("unsupported keys");
 
-		const rejectedRoot = await tempDir();
+		const rejectedRoot = await batchTempDir();
 		await writeStructuralArtifacts(rejectedRoot);
 		let plan = await createUltragoalPlan({
 			cwd: rejectedRoot,
@@ -4151,6 +4177,25 @@ describe("ultragoal mode-state + HUD reconciliation (#342)", () => {
 
 			const sessionActive = await readVisibleSkillActiveState(root, sessionId);
 			expect(sessionActive?.active_skills?.some(e => e.skill === "ultragoal")).toBe(true);
+		});
+	});
+
+	it("fails cleanly instead of crashing when no session id is resolvable", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			const result = await runNativeUltragoalCommand(["status"], root);
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("a session id is required to write state");
+			expect(result.stderr).toContain("GJC_SESSION_ID");
+		});
+	});
+
+	it("renders help without requiring a resolvable session id", async () => {
+		const root = await tempDir();
+		await withSessionId(undefined, async () => {
+			const result = await runNativeUltragoalCommand(["--help"], root);
+			expect(result.status).toBe(0);
+			expect(result.stdout).toContain("classify-blocker");
 		});
 	});
 

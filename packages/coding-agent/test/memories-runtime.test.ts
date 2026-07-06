@@ -224,6 +224,59 @@ describe("memories runtime", () => {
 		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
 	});
 
+	test("falls back to the most recently used model instead of registry order when no role or session model is set", async () => {
+		const fx = await createFixture();
+		const retiredModel = createModel("retired-model");
+		const mruModel = createModel("mru-model");
+		fx.session.model = undefined;
+		fx.modelRegistry.getAll = vi.fn(() => [retiredModel, mruModel]);
+		vi.spyOn(fx.settings, "getStorage").mockReturnValue({
+			getModelUsageOrder: () => ["openai/mru-model"],
+		} as any);
+
+		const rolloutPath = path.join(fx.sessionDir, "thread-mru.jsonl");
+		const rolloutRows = [
+			{ type: "session", id: "thread-mru", cwd: fx.agentDir },
+			{ type: "message", message: { role: "user", content: "summarize this rollout" } },
+		];
+		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
+
+		const completeSpy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({
+						rollout_summary: "Rollout summary MRU",
+						rollout_slug: "thread-mru-rollout",
+						raw_memory: "Raw memory MRU",
+					}),
+				),
+			)
+			.mockResolvedValueOnce(
+				createAssistantMessage(
+					JSON.stringify({
+						memory_md: "# Memory\n\nMRU body",
+						memory_summary: "MRU summary",
+						skills: [],
+					}),
+				),
+			);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		await waitFor(() => {
+			expect(completeSpy).toHaveBeenCalled();
+		});
+		const usedModel = completeSpy.mock.calls[0]?.[0] as Model;
+		expect(usedModel.id).toBe("mru-model");
+	});
+
 	test("local backend enqueue starts maintenance immediately for the explicit local selector", async () => {
 		const fx = await createFixture({ "memory.backend": "local", "memories.enabled": false });
 		const rolloutPath = path.join(fx.sessionDir, "thread-local.jsonl");
