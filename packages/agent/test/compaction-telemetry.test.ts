@@ -114,6 +114,7 @@ function makePreparation(overrides: Partial<CompactionPreparation> = {}): Compac
 		tokensBefore: 12345,
 		fileOps: createFileOps(),
 		settings: { ...DEFAULT_COMPACTION_SETTINGS, remoteEnabled: false },
+		tokenCorrection: { ratio: 1, keepRecentTokensCorrected: DEFAULT_COMPACTION_SETTINGS.keepRecentTokens },
 		...overrides,
 	};
 }

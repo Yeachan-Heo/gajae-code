@@ -159,24 +159,32 @@ async function resolveMentionPath(
 	return best?.candidate.path ?? null;
 }
 
-function buildTextOutput(textContent: string): { output: string; lineCount: number } {
+/**
+ * Default inline cap for auto-read file mentions, deliberately below the
+ * read-tool cap (`DEFAULT_MAX_BYTES`, 50KB) so an incidental `@path` mention
+ * injects a smaller snippet than an explicit `read`. Overridable per call.
+ */
+export const DEFAULT_FILE_MENTION_INLINE_BYTES = 20 * 1024;
+
+function buildTextOutput(textContent: string, maxInlineBytes?: number): { output: string; lineCount: number } {
+	const cap = maxInlineBytes && maxInlineBytes > 0 ? maxInlineBytes : DEFAULT_FILE_MENTION_INLINE_BYTES;
 	const allLines = textContent.split("\n");
 	const totalFileLines = allLines.length;
-	const truncation = truncateHead(textContent);
+	const truncation = truncateHead(textContent, { maxBytes: cap });
 
 	if (truncation.firstLineExceedsLimit) {
 		const firstLine = allLines[0] ?? "";
 		const firstLineBytes = Buffer.byteLength(firstLine, "utf-8");
-		const snippet = truncateHeadBytes(firstLine, DEFAULT_MAX_BYTES);
+		const snippet = truncateHeadBytes(firstLine, cap);
 		let outputText = snippet.text;
 
 		if (outputText.length > 0) {
 			outputText += `\n\n[Line 1 is ${formatBytes(firstLineBytes)}, exceeds ${formatBytes(
-				DEFAULT_MAX_BYTES,
+				cap,
 			)} limit. Showing first ${formatBytes(snippet.bytes)} of the line.]`;
 		} else {
 			outputText = `[Line 1 is ${formatBytes(firstLineBytes)}, exceeds ${formatBytes(
-				DEFAULT_MAX_BYTES,
+				cap,
 			)} limit. Unable to display a valid UTF-8 snippet.]`;
 		}
 
@@ -277,7 +285,18 @@ export function extractFileMentions(text: string): string[] {
 export async function generateFileMentionMessages(
 	filePaths: string[],
 	cwd: string,
-	options?: { autoResizeImages?: boolean; useHashLines?: boolean },
+	options?: {
+		autoResizeImages?: boolean;
+		useHashLines?: boolean;
+		/** Inline byte cap for auto-read text. Default: DEFAULT_FILE_MENTION_INLINE_BYTES. */
+		maxInlineBytes?: number;
+		/**
+		 * Resolved paths already shown (read or mentioned) recently in the
+		 * conversation. A mention of one of these emits a compact duplicate note
+		 * instead of re-injecting the full body.
+		 */
+		recentlyShownPaths?: ReadonlySet<string>;
+	},
 ): Promise<AgentMessage[]> {
 	if (filePaths.length === 0) return [];
 
@@ -290,12 +309,25 @@ export async function generateFileMentionMessages(
 		return mentionCandidatesPromise;
 	};
 
+	const shownInBatch = new Set<string>();
 	for (const filePath of filePaths) {
 		const resolvedPath = await resolveMentionPath(filePath, cwd, getMentionCandidates);
 		if (!resolvedPath) {
 			continue;
 		}
 		const absolutePath = resolveReadPath(resolvedPath, cwd);
+		// Duplicate suppression, keyed by absolute path: same path shown earlier this
+		// batch or recently in the conversation → compact note, no re-read (the path
+		// stays referenced so the model can re-fetch via the read tool).
+		if (shownInBatch.has(absolutePath) || options?.recentlyShownPaths?.has(absolutePath)) {
+			files.push({
+				path: resolvedPath,
+				content: `(already shown in this conversation; not re-read — use the read tool to fetch \`${resolvedPath}\` again)`,
+				duplicate: true,
+			});
+			continue;
+		}
+		shownInBatch.add(absolutePath);
 		try {
 			const stat = await Bun.file(absolutePath).stat();
 			if (stat.isDirectory()) {
@@ -354,7 +386,7 @@ export async function generateFileMentionMessages(
 			}
 
 			const content = await Bun.file(absolutePath).text();
-			let { output, lineCount } = buildTextOutput(content);
+			let { output, lineCount } = buildTextOutput(content, options?.maxInlineBytes);
 			if (options?.useHashLines) {
 				output = formatHashLines(output);
 			}

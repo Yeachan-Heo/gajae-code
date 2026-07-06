@@ -554,13 +554,17 @@ function getSpillConfig(s: Settings | undefined) {
 		| "tools.artifactSpillThreshold"
 		| "tools.artifactTailBytes"
 		| "tools.artifactTailLines"
-		| "tools.artifactHeadBytes";
+		| "tools.artifactHeadBytes"
+		| "tools.maxInlineResultBytes"
+		| "tools.readArtifactSpillThreshold";
 	const get = <P extends Path>(path: P) => s?.get(path) ?? getDefault(path);
 	return {
 		threshold: get("tools.artifactSpillThreshold") * 1024,
+		readThreshold: get("tools.readArtifactSpillThreshold") * 1024,
 		tailBytes: get("tools.artifactTailBytes") * 1024,
 		tailLines: get("tools.artifactTailLines"),
 		headBytes: get("tools.artifactHeadBytes") * 1024,
+		maxInlineBytes: get("tools.maxInlineResultBytes") * 1024,
 	};
 }
 
@@ -596,8 +600,12 @@ async function spillLargeResultToArtifact(
 ): Promise<AgentToolResult> {
 	const sessionManager = context?.sessionManager;
 	if (!sessionManager) return result;
-	if (toolName === "read") return result;
-	const { threshold, tailBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
+	const { threshold, readThreshold, tailBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
+	// `read` manages its own per-range truncation, but the combined multi-range
+	// output has no cap — enforce a read-specific (higher) combined threshold
+	// instead of exempting read entirely. 0 disables read spill (backstop only).
+	const effectiveThreshold = toolName === "read" ? readThreshold : threshold;
+	if (effectiveThreshold <= 0) return result;
 
 	// Skip if tool already saved an artifact
 	const existingMeta: OutputMeta | undefined = result.details?.meta;
@@ -614,7 +622,7 @@ async function spillLargeResultToArtifact(
 
 	const fullText = textParts.length === 1 ? textParts[0] : textParts.join("\n");
 	const totalBytes = Buffer.byteLength(fullText, "utf-8");
-	if (totalBytes <= threshold) return result;
+	if (totalBytes <= effectiveThreshold) return result;
 
 	// Save full output as artifact
 	const artifactId = await sessionManager.saveArtifact(fullText, toolName);
@@ -691,6 +699,106 @@ async function spillLargeResultToArtifact(
 	return { ...result, content: newContent, details: newDetails };
 }
 
+/**
+ * Absolute inline-size backstop enforced after {@link spillLargeResultToArtifact}.
+ *
+ * The threshold-based spill above has escape hatches: it early-returns for the
+ * `read` tool and for results that already carry an `artifactId` (a tool may set
+ * partial truncation meta yet still emit oversized inline text). This backstop
+ * closes those gaps: when `tools.maxInlineResultBytes` is configured (> 0), any
+ * final result whose inline text exceeds the cap is force-saved to an artifact
+ * (reusing an existing artifactId to avoid double-artifacting) and truncated to a
+ * head+tail view that fits the cap. Disabled by default (opt-in pending
+ * measurement); a 0 cap returns the result untouched.
+ */
+async function enforceInlineResultBackstop(
+	result: AgentToolResult,
+	toolName: string,
+	context: AgentToolContext | undefined,
+): Promise<AgentToolResult> {
+	const { maxInlineBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
+	if (maxInlineBytes <= 0) return result;
+
+	const textParts: string[] = [];
+	for (const block of result.content) {
+		if (block.type === "text" && block.text) {
+			textParts.push(block.text);
+		}
+	}
+	if (textParts.length === 0) return result;
+
+	const fullText = textParts.length === 1 ? textParts[0] : textParts.join("\n");
+	const totalBytes = Buffer.byteLength(fullText, "utf-8");
+	if (totalBytes <= maxInlineBytes) return result;
+
+	// Reuse an existing artifact (avoid double-artifacting); otherwise save the
+	// full output so the truncated view keeps a reference to the complete text.
+	const existingMeta: OutputMeta | undefined = result.details?.meta;
+	let artifactId = existingMeta?.truncation?.artifactId;
+	if (!artifactId) {
+		artifactId = (await context?.sessionManager?.saveArtifact(fullText, toolName)) ?? undefined;
+	}
+
+	// Budget head+tail below the cap, reserving room for the elision marker so the
+	// composed `<head>\n<marker>\n<tail>` view never exceeds the configured cap.
+	const MARKER_RESERVE = 256;
+	const budget = maxInlineBytes - MARKER_RESERVE;
+	const useMiddle = headBytes > 0 && budget > 0;
+	let truncated = useMiddle
+		? truncateMiddle(fullText, {
+				maxBytes: budget,
+				maxLines: tailLines * 2,
+				maxHeadBytes: Math.min(headBytes, Math.floor(budget / 2)),
+				maxHeadLines: tailLines,
+			})
+		: truncateTail(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
+
+	// Defensive clamp: guarantee the contract even for pathological marker sizes.
+	if (Buffer.byteLength(truncated.content, "utf-8") > maxInlineBytes) {
+		truncated = truncateTail(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
+	}
+
+	const newContent: (TextContent | ImageContent)[] = [];
+	for (const block of result.content) {
+		if (block.type !== "text") {
+			newContent.push(block);
+		}
+	}
+	newContent.push({ type: "text", text: truncated.content });
+
+	const outputLines = truncated.outputLines ?? truncated.totalLines;
+	const outputBytes = truncated.outputBytes ?? truncated.totalBytes;
+	const truncationMeta: TruncationMeta =
+		truncated.truncatedBy === "middle"
+			? {
+					direction: "middle",
+					truncatedBy: "middle",
+					totalLines: truncated.totalLines,
+					totalBytes: truncated.totalBytes,
+					outputLines,
+					outputBytes,
+					maxBytes: maxInlineBytes,
+					elidedLines: truncated.elidedLines ?? Math.max(0, truncated.totalLines - outputLines),
+					elidedBytes: truncated.elidedBytes ?? Math.max(0, truncated.totalBytes - outputBytes),
+					artifactId,
+				}
+			: {
+					direction: "tail",
+					truncatedBy: truncated.truncatedBy ?? "bytes",
+					totalLines: truncated.totalLines,
+					totalBytes: truncated.totalBytes,
+					outputLines,
+					outputBytes,
+					maxBytes: maxInlineBytes,
+					shownRange: { start: truncated.totalLines - outputLines + 1, end: truncated.totalLines },
+					artifactId,
+				};
+
+	const newMeta: OutputMeta = { ...(existingMeta ?? {}), truncation: truncationMeta };
+	const newDetails = { ...(result.details ?? {}), meta: newMeta };
+	return { ...result, content: newContent, details: newDetails };
+}
+
 // =============================================================================
 // Tool wrapper
 // =============================================================================
@@ -710,6 +818,10 @@ async function wrappedExecute(
 
 		// Spill large results to artifact, truncate to tail
 		result = await spillLargeResultToArtifact(result, this.name, context);
+
+		// Absolute inline-size backstop: catches oversized text the threshold spill
+		// skipped (read exemption, tools with pre-existing partial artifact meta).
+		result = await enforceInlineResultBackstop(result, this.name, context);
 
 		// Append notices from meta
 		const meta: OutputMeta | undefined = result.details?.meta;

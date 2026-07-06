@@ -6,6 +6,7 @@
  */
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
+import { runFixtureReport } from "./cli/fixture-report";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -97,6 +98,17 @@ async function runNotifyDaemonInternalFastPath(argv: string[]): Promise<void> {
 		throw new Error("invalid notify daemon-internal fast path");
 	}
 	await runNotifyCommand(cmd);
+}
+
+function rootFixtureArg(argv: string[]): { present: boolean; id: string | undefined } {
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		// Stop at the first subcommand token so a `--fixture` flag belonging to a
+		// subcommand never hijacks the root fast-path into fixture-report mode.
+		if (isSubcommand(arg)) return { present: false, id: undefined };
+		if (arg === "--fixture") return { present: true, id: argv[i + 1] };
+	}
+	return { present: false, id: undefined };
 }
 
 function hasRootFastFlag(argv: string[], flags: readonly string[]): boolean {
@@ -234,6 +246,17 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();
+		return;
+	}
+	const fixtureArg = rootFixtureArg(argv);
+	if (fixtureArg.present) {
+		const id = fixtureArg.id;
+		if (!id || id.startsWith("-")) {
+			process.stderr.write(`${APP_NAME} --fixture requires a fixture id\n`);
+			process.exitCode = 1;
+			return;
+		}
+		await runFixtureReport(id);
 		return;
 	}
 	if (hasRootHelpFlag(argv)) {

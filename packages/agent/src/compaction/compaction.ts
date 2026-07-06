@@ -315,7 +315,7 @@ export function resolveThresholdTokens(
  * Image content has no tokenizer representation; charge a fixed estimate
  * matching what providers typically bill for inline images.
  */
-const IMAGE_TOKEN_ESTIMATE = 1200;
+export const IMAGE_TOKEN_ESTIMATE = 1200;
 /**
  * Estimate tokens for collected message fragments using the native-free
  * heuristic. Provider usage is the authoritative anchor for context-changing
@@ -977,11 +977,35 @@ export interface CompactionPreparation {
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
 	settings: CompactionSettings;
+	/**
+	 * Diagnostics for the keep-window token correction (Finding 7). `ratio` is the
+	 * clamped heuristic→actual correction that was applied (1 when none supplied);
+	 * `keepRecentTokensCorrected` is the heuristic budget findCutPoint actually used.
+	 */
+	tokenCorrection: { ratio: number; keepRecentTokensCorrected: number };
+}
+
+/** Bounds for the keep-window token correction (Finding 7): never trust a ratio
+ * beyond 2x in either direction so a bad estimate cannot balloon or collapse the
+ * kept window. */
+export const TOKEN_CORRECTION_MIN_RATIO = 0.5;
+export const TOKEN_CORRECTION_MAX_RATIO = 2;
+
+export interface PrepareCompactionOptions {
+	/**
+	 * Observed heuristic→actual token correction for the post-boundary keep window
+	 * (actualTokens / chars-4-heuristicTokens), supplied by the caller from per-turn
+	 * Usage deltas or a stable-prefix-subtracted comparison. Clamped to
+	 * [0.5, 2] and applied bidirectionally. When omitted, no correction is applied
+	 * (the confounded raw promptTokens/estimatedTokens quotient is never used).
+	 */
+	tokenCorrectionRatio?: number;
 }
 
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	options: PrepareCompactionOptions = {},
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -999,17 +1023,22 @@ export function prepareCompaction(
 
 	const lastUsage = getLastAssistantUsage(pathEntries);
 	const tokensBefore = lastUsage ? calculateContextTokens(lastUsage) : 0;
-	let keepRecentTokens = settings.keepRecentTokens;
-	if (lastUsage) {
-		const estimatedTokens = estimateEntriesTokens(pathEntries, boundaryStart, boundaryEnd);
-		const promptTokens = calculatePromptTokens(lastUsage);
-		const ratio = estimatedTokens > 0 ? promptTokens / estimatedTokens : 0;
-		if (Number.isFinite(ratio) && ratio > 1) {
-			keepRecentTokens = Math.max(1, Math.floor(keepRecentTokens / ratio));
-		}
-	}
 
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokens);
+	// Correct the keep-window budget for the chars/4 heuristic error using the
+	// caller-supplied observed ratio (actual/heuristic). The legacy raw
+	// promptTokens/estimatedTokens quotient is intentionally NOT used: promptTokens
+	// counts system+tools+full history while estimatedTokens counted only the
+	// post-boundary slice, so it was confounded and only ever shrank the window.
+	// Here the correction is bidirectional and clamped to [0.5, 2].
+	const keepRecentTokens = settings.keepRecentTokens;
+	const rawRatio = options.tokenCorrectionRatio;
+	const appliedRatio =
+		rawRatio !== undefined && Number.isFinite(rawRatio) && rawRatio > 0
+			? Math.min(TOKEN_CORRECTION_MAX_RATIO, Math.max(TOKEN_CORRECTION_MIN_RATIO, rawRatio))
+			: 1;
+	const keepRecentTokensCorrected = Math.max(1, Math.round(keepRecentTokens / appliedRatio));
+
+	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokensCorrected);
 
 	// Get ID of first kept entry
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
@@ -1077,6 +1106,7 @@ export function prepareCompaction(
 		previousPreserveData,
 		fileOps,
 		settings,
+		tokenCorrection: { ratio: appliedRatio, keepRecentTokensCorrected },
 	};
 }
 

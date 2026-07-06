@@ -379,4 +379,40 @@ export function isToolAllowed(name: string): boolean {
 		const qa = executorQa({ computerTouching: false, surface: "native" });
 		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
 	});
+
+	it("does not trigger from a non-computer settings-schema edit", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(
+			root,
+			"packages/coding-agent/src/config/settings-schema.ts",
+			`export const SETTINGS = {\n\t"tools.maxInlineResultBytes": { type: "number", default: 0 },\n};\n`,
+		);
+		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+			row => row.id !== "blast-radius",
+		);
+		const qa = executorQa({ computerTouching: false, cases, surface: "native" });
+		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+	});
+
+	it("triggers from a computer-specific settings-schema diff", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(
+			root,
+			"packages/coding-agent/src/config/settings-schema.ts",
+			`export const SETTINGS = {\n\t"computer.enabled": { type: "boolean", default: false },\n};\n`,
+		);
+		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+			row => row.id !== "blast-radius",
+		);
+		const message = await checkpoint(root, executorQa({ computerTouching: false, cases })).catch(error =>
+			String(error),
+		);
+		expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
 });

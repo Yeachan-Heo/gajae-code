@@ -576,3 +576,43 @@ describe("TtsrManager repeat behavior", () => {
 		expect(manager.checkDelta("forbidden", turnContext)).toEqual([rule]);
 	});
 });
+
+describe("TtsrManager enabled gating (Finding 10)", () => {
+	const textContext = { source: "text" as const };
+
+	function makeSettings(enabled: boolean) {
+		return {
+			enabled,
+			contextMode: "discard" as const,
+			interruptMode: "always" as const,
+			repeatMode: "after-gap" as const,
+			repeatGap: 1,
+		};
+	}
+
+	function forbiddenRule(): Rule {
+		return makeRule({ name: "forbidden-rule", condition: ["forbidden"], scope: ["text"] });
+	}
+
+	it("does not match when disabled, even with a registered matching rule", () => {
+		const manager = new TtsrManager(makeSettings(false));
+		manager.addRule(forbiddenRule());
+		expect(manager.checkDelta("forbidden", textContext)).toEqual([]);
+		// Repeated deltas still never match while disabled.
+		expect(manager.checkDelta(" forbidden again", textContext)).toEqual([]);
+	});
+
+	it("matches once re-enabled (control)", () => {
+		const rule = forbiddenRule();
+		const enabled = new TtsrManager(makeSettings(true));
+		enabled.addRule(rule);
+		expect(enabled.checkDelta("forbidden", textContext)).toEqual([rule]);
+	});
+
+	it("disabled manager buffers nothing, so enabling later starts from a clean slate", () => {
+		const manager = new TtsrManager(makeSettings(false));
+		manager.addRule(forbiddenRule());
+		// Feed a partial match while disabled; it must not be retained.
+		expect(manager.checkDelta("forbid", textContext)).toEqual([]);
+	});
+});

@@ -344,4 +344,23 @@ describe("Settings", () => {
 			expect(settings.get("theme.light")).toBe("light");
 		});
 	});
+
+	describe("below-threshold maintenance pruning defaults (Finding 13)", () => {
+		it("keeps maintenance pruning off by default (evidence-gated) with a high min-savings floor", () => {
+			const settings = Settings.isolated();
+			const compaction = settings.getGroup("compaction");
+			expect(compaction.maintenancePruningEnabled).toBe(false);
+			expect(compaction.maintenancePruningMinSavingsTokens).toBe(8000);
+		});
+
+		it("exposes the opt-in override through getGroup", () => {
+			const settings = Settings.isolated({
+				"compaction.maintenancePruningEnabled": true,
+				"compaction.maintenancePruningMinSavingsTokens": 12000,
+			});
+			const compaction = settings.getGroup("compaction");
+			expect(compaction.maintenancePruningEnabled).toBe(true);
+			expect(compaction.maintenancePruningMinSavingsTokens).toBe(12000);
+		});
+	});
 });

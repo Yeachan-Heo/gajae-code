@@ -22,6 +22,7 @@ import { runExtensionCompact, runExtensionSetModel } from "../extensibility/exte
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import { buildAgentSubskillInjection, renderAgentPromptAdditions } from "../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
+import { sessionRoot } from "../gjc-runtime/session-layout";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
@@ -42,6 +43,7 @@ import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
+import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
@@ -1287,6 +1289,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const subagentAgentIdentity: AgentIdentity | undefined = options.parentTelemetry
 				? { id, name: agent.name, description: agent.description }
 				: undefined;
+			let subagentTokenTurn = 0;
+			const tokenLogDir = options.parentSessionId
+				? path.join(sessionRoot(cwd, options.parentSessionId), "token-logs")
+				: undefined;
 			const subagentTelemetry: AgentTelemetryConfig | undefined =
 				options.parentTelemetry && subagentAgentIdentity
 					? {
@@ -1295,6 +1301,27 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							// Clear parent's conversationId; the child loop falls back to
 							// its own AgentLoopConfig.sessionId.
 							conversationId: undefined,
+							// Intentionally REPLACES (does not chain) the parent's onChatUsage:
+							// the parent handler attributes turns to subagentId "root", so
+							// chaining it here would double-log every subagent turn under root.
+							// Subagent turns are attributed to this child's id instead.
+							onChatUsage: async event => {
+								if (!tokenLogDir) return;
+								subagentTokenTurn += 1;
+								await persistTaskTokenLog(
+									taskTokenLogFromUsage(event.usage, {
+										subagentId: id,
+										agent: agent.name,
+										// Monotonic 1-based sequence per subagent session
+										// (event.stepNumber is 0-based and -1 for oneshots).
+										turn: subagentTokenTurn,
+										at: new Date().toISOString(),
+										model: event.model,
+										cost: event.cost,
+									}),
+									{ dir: tokenLogDir },
+								);
+							},
 						}
 					: undefined;
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { agentLoop, agentLoopContinue, INTENT_FIELD } from "@gajae-code/agent-core/agent-loop";
+import { agentLoop, agentLoopContinue, INTENT_FIELD, normalizeTools } from "@gajae-code/agent-core/agent-loop";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -435,11 +435,131 @@ describe("agentLoop with AgentMessage", () => {
 			value: { type: "string" },
 			[INTENT_FIELD]: { type: "string" },
 		});
-		expect(firstRequestToolSchema?.required).toEqual(expect.arrayContaining([INTENT_FIELD]));
+		expect(firstRequestToolSchema?.required ?? []).not.toContain(INTENT_FIELD);
 		expect(executedParams).toEqual([{ value: "hello" }]);
 		expect(tracedToolCall?.type).toBe("toolCall");
 		if (tracedToolCall?.type === "toolCall") {
 			expect(tracedToolCall.intent).toBe("Read one file");
+		}
+	});
+
+	it("runs intent-traced tools when the model omits intent", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const executedParams: Record<string, unknown>[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executedParams.push(params as Record<string, unknown>);
+				return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }] },
+				{ content: ["done"] },
+			],
+		});
+
+		const stream = agentLoop(
+			[createUserMessage("run")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter, intentTracing: true },
+			undefined,
+			mock.stream,
+		);
+		for await (const _ of stream) {
+			// drain
+		}
+
+		expect(executedParams).toEqual([{ value: "hello" }]);
+	});
+
+	it("normalizes intent schemas according to per-tool mode and PI_NO_INTENT", () => {
+		const previousNoIntent = Bun.env.PI_NO_INTENT;
+		try {
+			delete Bun.env.PI_NO_INTENT;
+			const optionalParameters = {
+				type: "object",
+				properties: { value: { type: "string" } },
+			};
+			const requiredPathParameters = {
+				type: "object",
+				properties: { path: { type: "string" } },
+				required: ["path"],
+			};
+			const defaultTool: AgentTool = {
+				name: "default",
+				label: "Default",
+				description: "Default tool",
+				parameters: optionalParameters,
+				execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+			};
+			const requiredPathTool: AgentTool = {
+				...defaultTool,
+				name: "required-path",
+				parameters: requiredPathParameters,
+			};
+			const requireTool: AgentTool = { ...defaultTool, name: "require", intent: "require" };
+			const omitTool: AgentTool = { ...defaultTool, name: "omit", intent: "omit" };
+			const functionIntentTool: AgentTool = { ...defaultTool, name: "function-intent", intent: () => "Tool intent" };
+
+			const normalized =
+				normalizeTools([defaultTool, requiredPathTool, requireTool, omitTool, functionIntentTool], true) ?? [];
+			const defaultParams = normalized[0]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			const requiredPathParams = normalized[1]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			const requireParams = normalized[2]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			const omitParams = normalized[3]?.parameters as { properties?: Record<string, unknown>; required?: string[] };
+			const functionIntentParams = normalized[4]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+
+			expect(defaultParams.properties?.[INTENT_FIELD]).toEqual({ type: "string" });
+			expect(Object.keys(defaultParams.properties ?? {})[0]).toBe(INTENT_FIELD);
+			expect(defaultParams.required ?? []).not.toContain(INTENT_FIELD);
+			expect(requiredPathParams.properties?.[INTENT_FIELD]).toEqual({ type: "string" });
+			expect(requiredPathParams.required ?? []).toEqual(["path"]);
+			expect(requireParams.properties?.[INTENT_FIELD]).toEqual({ type: "string" });
+			expect(Object.keys(requireParams.properties ?? {})[0]).toBe(INTENT_FIELD);
+			expect(requireParams.required ?? []).toContain(INTENT_FIELD);
+			expect(omitParams.properties?.[INTENT_FIELD]).toBeUndefined();
+			expect(omitParams.required ?? []).not.toContain(INTENT_FIELD);
+			expect(functionIntentParams.properties?.[INTENT_FIELD]).toBeUndefined();
+			expect(functionIntentParams.required ?? []).not.toContain(INTENT_FIELD);
+
+			Bun.env.PI_NO_INTENT = "1";
+			const disabled = normalizeTools([defaultTool, requireTool], true) ?? [];
+			const disabledDefault = disabled[0]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			const disabledRequired = disabled[1]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			expect(disabledDefault.properties?.[INTENT_FIELD]).toBeUndefined();
+			expect(disabledDefault.required ?? []).not.toContain(INTENT_FIELD);
+			expect(disabledRequired.properties?.[INTENT_FIELD]).toBeUndefined();
+			expect(disabledRequired.required ?? []).not.toContain(INTENT_FIELD);
+		} finally {
+			if (previousNoIntent === undefined) {
+				delete Bun.env.PI_NO_INTENT;
+			} else {
+				Bun.env.PI_NO_INTENT = previousNoIntent;
+			}
 		}
 	});
 

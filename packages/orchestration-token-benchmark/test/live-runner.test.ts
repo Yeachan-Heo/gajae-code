@@ -58,6 +58,22 @@ console.log(${JSON.stringify(stdout)});
 	await Bun.$`chmod +x ${path}`;
 	return path;
 }
+async function writeFixtureModeShim(dir: string, report: LiveRunReport): Promise<string> {
+	const path = join(dir, "gjc-fixture-shim");
+	await Bun.write(
+		path,
+		`#!/usr/bin/env bun
+const index = Bun.argv.indexOf("--fixture");
+if (index < 0 || Bun.argv[index + 1] !== ${JSON.stringify(report.fixtureId)}) {
+	process.stderr.write("missing fixture flag");
+	process.exit(2);
+}
+process.stdout.write(${JSON.stringify(JSON.stringify(report))});
+`,
+	);
+	await Bun.$`chmod +x ${path}`;
+	return path;
+}
 
 describe("live runner", () => {
 	it("live-runner.fake-old-new.delta", async () => {
@@ -150,6 +166,21 @@ describe("live runner", () => {
 		// or live-model call and makes no assertion about live-provider behavior.
 		expect(report.binaryId).toBe("local-only");
 		expect(report.fixtureId).toBe(fixtureId);
+	});
+
+	it("live-runner.fixture-mode-schema-v1", async () => {
+		const dir = await tempDir();
+		const fixtureId = "fixed-fixture";
+		const expected = fakeReport("fixture-shim", fixtureId, 144);
+		const binary = await writeFixtureModeShim(dir, expected);
+
+		const report = await runOneBinary(binary, fixtureId);
+
+		expect(report.schemaVersion).toBe(LIVE_RUNNER_SCHEMA_VERSION);
+		expect(report.binaryPath).toBe(binary);
+		expect(report.binaryId).toBe("fixture-shim");
+		expect(report.fixtureId).toBe(fixtureId);
+		expect(report.totals.totalTokens).toBe(144);
 	});
 
 	it("keeps bounded errors as LiveRunnerError", async () => {

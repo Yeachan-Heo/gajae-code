@@ -545,6 +545,42 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+
+	"tools.readArtifactSpillThreshold": {
+		type: "number",
+		default: 256,
+		ui: {
+			tab: "tools",
+			label: "Read-tool artifact spill threshold (KB)",
+			description:
+				"Combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Higher than the general spill threshold so ordinary inspection reads stay inline; 0 disables read spill (falls back to the absolute inline backstop only).",
+			options: [
+				{ value: "0", label: "Off", description: "No read-specific spill (backstop only)" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+				{ value: "256", label: "256 KB", description: "Default; ~64K tokens" },
+				{ value: "512", label: "512 KB", description: "~128K tokens" },
+				{ value: "1000", label: "1 MB", description: "~250K tokens" },
+			],
+		},
+	},
+
+	"tools.fileMentionInlineBytes": {
+		type: "number",
+		default: 20,
+		ui: {
+			tab: "tools",
+			label: "File-mention inline cap (KB)",
+			description:
+				"Inline byte cap for auto-read `@path` file mentions, deliberately below the read-tool cap so an incidental mention injects a smaller snippet than an explicit read. The full file is still available via the read tool.",
+			options: [
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens (matches read cap)" },
+			],
+		},
+	},
 	"tools.artifactTailBytes": {
 		type: "number",
 		default: 20,
@@ -619,6 +655,25 @@ export const SETTINGS_SCHEMA = {
 				{ value: "1000", label: "1000 lines", description: "~5K tokens" },
 				{ value: "2000", label: "2000 lines", description: "~10K tokens" },
 				{ value: "5000", label: "5000 lines", description: "~25K tokens" },
+			],
+		},
+	},
+
+	"tools.maxInlineResultBytes": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tools",
+			label: "Max inline tool-result size (KB)",
+			description:
+				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+			options: [
+				{ value: "0", label: "Off", description: "Disabled; no absolute inline cap" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "30", label: "30 KB", description: "~7.5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "75", label: "75 KB", description: "~19K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
 			],
 		},
 	},
@@ -1385,6 +1440,32 @@ export const SETTINGS_SCHEMA = {
 
 	"compaction.remoteEndpoint": { type: "string", default: undefined },
 
+	// Below-threshold maintenance pruning (Finding 13). DEFAULT-OFF and BLOCKED
+	// from default-on until live TaskTokenLog (#6) evidence justifies it: pruning
+	// rewrites already-sent history and forces a provider cache-epoch reset, so it
+	// only pays off when the estimated stale savings clearly exceed that reset.
+	"compaction.maintenancePruningEnabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "context",
+			label: "Below-threshold maintenance pruning",
+			description:
+				"Opt-in: prune stale tool outputs BELOW the compaction threshold when the estimated savings are large enough to outweigh a prompt-cache-epoch reset. Off by default (evidence-gated); enabling it trades one cache reset for reclaimed context.",
+		},
+	},
+
+	"compaction.maintenancePruningMinSavingsTokens": {
+		type: "number",
+		default: 8000,
+		ui: {
+			tab: "context",
+			label: "Maintenance pruning min savings (tokens)",
+			description:
+				"Minimum estimated stale-prunable token savings required before below-threshold maintenance pruning runs. Kept high so a cache-epoch reset is only spent for a large reclaim.",
+		},
+	},
+
 	// Idle compaction
 	"compaction.idleEnabled": {
 		type: "boolean",
@@ -1658,7 +1739,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "context",
 			label: "TTSR Context Mode",
-			description: "What to do with partial output when TTSR triggers",
+			description:
+				"What to do with partial output when TTSR triggers. 'discard' (recommended) drops the aborted partial turn so it never accumulates in context. 'keep' retains every aborted partial turn, which grows the token footprint each time a rule fires — prefer 'discard' unless you specifically need the partial output.",
 		},
 	},
 
@@ -3219,6 +3301,8 @@ export interface CompactionSettings {
 	autoContinue: boolean;
 	remoteEnabled: boolean;
 	remoteEndpoint: string | undefined;
+	maintenancePruningEnabled: boolean;
+	maintenancePruningMinSavingsTokens: number;
 	idleEnabled: boolean;
 	idleThresholdTokens: number;
 	idleTimeoutSeconds: number;

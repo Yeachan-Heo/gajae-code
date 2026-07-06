@@ -338,6 +338,16 @@
 					"description": "Tool output above this size is saved as an artifact; tail is kept inline",
 					"default": 50
 				},
+				"readArtifactSpillThreshold": {
+					"type": "number",
+					"description": "Combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Higher than the general spill threshold so ordinary inspection reads stay inline; 0 disables read spill (falls back to the absolute inline backstop only).",
+					"default": 256
+				},
+				"fileMentionInlineBytes": {
+					"type": "number",
+					"description": "Inline byte cap for auto-read `@path` file mentions, deliberately below the read-tool cap so an incidental mention injects a smaller snippet than an explicit read. The full file is still available via the read tool.",
+					"default": 20
+				},
 				"artifactTailBytes": {
 					"type": "number",
 					"description": "Amount of tail content kept inline when output spills to artifact",
@@ -357,6 +367,11 @@
 					"type": "number",
 					"description": "Maximum lines of tail content kept inline when output spills to artifact",
 					"default": 500
+				},
+				"maxInlineResultBytes": {
+					"type": "number",
+					"description": "Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+					"default": 0
 				},
 				"intentTracing": {
 					"type": "boolean",
@@ -965,6 +980,16 @@
 				"remoteEndpoint": {
 					"type": "string"
 				},
+				"maintenancePruningEnabled": {
+					"type": "boolean",
+					"description": "Opt-in: prune stale tool outputs BELOW the compaction threshold when the estimated savings are large enough to outweigh a prompt-cache-epoch reset. Off by default (evidence-gated); enabling it trades one cache reset for reclaimed context.",
+					"default": false
+				},
+				"maintenancePruningMinSavingsTokens": {
+					"type": "number",
+					"description": "Minimum estimated stale-prunable token savings required before below-threshold maintenance pruning runs. Kept high so a cache-epoch reset is only spent for a large reclaim.",
+					"default": 8000
+				},
 				"idleEnabled": {
 					"type": "boolean",
 					"description": "Compact context while idle when token count exceeds threshold",
@@ -1219,7 +1244,7 @@
 						"discard",
 						"keep"
 					],
-					"description": "What to do with partial output when TTSR triggers",
+					"description": "What to do with partial output when TTSR triggers. 'discard' (recommended) drops the aborted partial turn so it never accumulates in context. 'keep' retains every aborted partial turn, which grows the token footprint each time a rule fires — prefer 'discard' unless you specifically need the partial output.",
 					"default": "discard"
 				},
 				"interruptMode": {

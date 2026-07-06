@@ -194,6 +194,15 @@ export class AppendOnlyLog {
  * ctx = mgr.build(context);        // subsequent calls use cache
  * ```
  */
+export interface AppendOnlyContextManagerOptions {
+	/**
+	 * Invoked whenever the stable prefix fingerprint changes on `build()` (a
+	 * provider prompt-cache prefix reset). Used for per-session diagnostics; must
+	 * not throw. `from` is `<unbuilt>` on the first build.
+	 */
+	readonly onPrefixChange?: (info: { from: string; to: string; version: number }) => void;
+}
+
 export class AppendOnlyContextManager {
 	readonly prefix = new StablePrefix();
 	readonly log = new AppendOnlyLog();
@@ -203,6 +212,11 @@ export class AppendOnlyContextManager {
 	#syncedHashes: (number | bigint)[] = [];
 	/** Number of provider-normalized messages that were seeded before child-local messages. */
 	#seededPrefixCount = 0;
+	readonly #onPrefixChange: AppendOnlyContextManagerOptions["onPrefixChange"];
+
+	constructor(options: AppendOnlyContextManagerOptions = {}) {
+		this.#onPrefixChange = options.onPrefixChange;
+	}
 
 	static forkFromSeed(args: {
 		prefixSnapshot?: StablePrefixSnapshot;
@@ -220,7 +234,15 @@ export class AppendOnlyContextManager {
 	}
 
 	build(context: AgentContext, options: BuildOptions): Context {
-		this.prefix.build(context, options);
+		const previousFingerprint = this.prefix.fingerprint;
+		const changed = this.prefix.build(context, options);
+		if (changed && this.#onPrefixChange) {
+			this.#onPrefixChange({
+				from: previousFingerprint,
+				to: this.prefix.fingerprint,
+				version: this.prefix.version,
+			});
+		}
 		const { systemPrompt, tools } = this.prefix.toContext();
 		return { systemPrompt, messages: this.log.toMessages(), tools };
 	}

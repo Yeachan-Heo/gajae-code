@@ -4,7 +4,7 @@ import {
 	type AgentMessage,
 	type AgentTelemetryConfig,
 	type AgentTool,
-	AppendOnlyContextManager,
+	type AppendOnlyContextManager,
 	INTENT_FIELD,
 	type ThinkingLevel,
 } from "@gajae-code/agent-core";
@@ -31,7 +31,11 @@ import {
 	prompt,
 	Snowflake,
 } from "@gajae-code/utils";
-
+import {
+	createAppendOnlyContextManager,
+	providerSupportsAppendOnlyAuto,
+	resolveAppendOnlyMode,
+} from "./append-only-mode";
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "./async";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
@@ -615,23 +619,12 @@ function registerJsVmCleanup(): void {
 	postmortem.register("js-vm-cleanup", disposeAllVmContexts);
 }
 
-/**
- * Resolve whether to enable append-only context mode based on the setting and provider.
- *
- * - `"on"` → always enable
- * - `"off"` → never enable
- * - `"auto"` → enable for DeepSeek (prefix-caching provider)
+/*
+ * Append-only context-mode resolution + manager construction live in
+ * ./append-only-mode so the initial build, the runtime model/setting-change
+ * path, and the status UI share one implementation. Re-exported for importers/tests.
  */
-function resolveAppendOnlyMode(setting: "auto" | "on" | "off" | undefined, provider: string): boolean {
-	switch (setting ?? "auto") {
-		case "on":
-			return true;
-		case "off":
-			return false;
-		default:
-			return provider === "deepseek";
-	}
-}
+export { createAppendOnlyContextManager, providerSupportsAppendOnlyAuto, resolveAppendOnlyMode };
 
 function customToolToDefinition(tool: CustomTool): ToolDefinition {
 	const definition: ToolDefinition & { [TOOL_DEFINITION_MARKER]: true } = {
@@ -864,6 +857,10 @@ function withEmbeddedDefaultGjcSkills(skills: Skill[]): Skill[] {
 		}
 	}
 	return [...byName.values()];
+}
+
+export function resolveIntentTracingEnabled(intentTracingSetting: boolean | undefined, hasUI: boolean): boolean {
+	return (!!intentTracingSetting || $flag("PI_INTENT_TRACING")) && hasUI;
 }
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
@@ -1772,7 +1769,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
 		const eagerTasks = settings.get("task.eager");
-		const intentField = settings.get("tools.intentTracing") || $flag("PI_INTENT_TRACING") ? INTENT_FIELD : undefined;
+		const intentTracingEnabled = resolveIntentTracingEnabled(
+			settings.get("tools.intentTracing"),
+			options.hasUI ?? false,
+		);
+		const intentField = intentTracingEnabled ? INTENT_FIELD : undefined;
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
@@ -1844,6 +1845,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				eagerTasks,
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
+				subagent: options.parentTaskPrefix !== undefined,
 			});
 
 			if (options.systemPrompt === undefined) {
@@ -2052,7 +2054,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const appendOnlyContext =
 			model && resolveAppendOnlyMode(settings.get("provider.appendOnlyContext"), model.provider)
-				? new AppendOnlyContextManager()
+				? createAppendOnlyContextManager(model.provider)
 				: undefined;
 		if (appendOnlyContext && options.forkContextSeed && !hasExistingSession) {
 			if (options.forkContextSeed.appendOnlyPrefixSnapshot) {
@@ -2223,6 +2225,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			onResponse,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			workspaceTree: resolvedWorkspaceTree,
 			reloadSshTool,
 			requestedToolNames: requestedToolNameSet,
 			discoverableToolAllowedNames: options.discoverableToolAllowedNames,

@@ -527,14 +527,29 @@ export function pruneAssistantToolArguments(
 	return { argumentPrunedCount: candidates.length, argumentTokensSaved, prunedEntries };
 }
 
-export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = DEFAULT_PRUNE_CONFIG): PruneResult {
+interface ToolOutputPruneCandidate {
+	entry: SessionMessageEntry;
+	tokens: number;
+	notice: string;
+	savings: number;
+}
+
+/**
+ * Read-only pass that collects the tool-result entries that {@link pruneToolOutputs}
+ * would prune, plus the total estimated token savings. Shared by the mutating
+ * prune and the non-mutating {@link estimateToolOutputPruneSavings} so the
+ * maintenance gate (Finding 13) can decide whether pruning is worth a cache-epoch
+ * reset without rewriting history.
+ */
+function collectToolOutputPruneCandidates(
+	entries: SessionEntry[],
+	config: PruneConfig,
+): { candidates: ToolOutputPruneCandidate[]; tokensSaved: number } {
 	let accumulatedTokens = 0;
-	let tokensSaved = 0;
-	let prunedCount = 0;
 
 	const { staleResultIndices } = buildStalenessIndex(entries);
 	const staleOverridable = new Set(config.staleOverridableTools ?? []);
-	const candidates: Array<{ entry: SessionMessageEntry; tokens: number; notice: string; savings: number }> = [];
+	const candidates: ToolOutputPruneCandidate[] = [];
 
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
@@ -574,13 +589,55 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 		accumulatedTokens += tokens;
 	}
 
+	let tokensSaved = 0;
 	for (const candidate of candidates) {
 		tokensSaved += candidate.savings;
 	}
+	return { candidates, tokensSaved };
+}
+
+/**
+ * Estimate the token savings {@link pruneToolOutputs} would achieve, without
+ * mutating any entry. Returns 0 savings when below the configured minimum so the
+ * caller sees the same gate the real prune enforces.
+ */
+export function estimateToolOutputPruneSavings(
+	entries: SessionEntry[],
+	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
+): { prunableCount: number; tokensSaved: number } {
+	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
+	if (tokensSaved < config.minimumSavings || candidates.length === 0) {
+		return { prunableCount: 0, tokensSaved: 0 };
+	}
+	return { prunableCount: candidates.length, tokensSaved };
+}
+
+/**
+ * Evidence gate for below-threshold maintenance pruning (Finding 13). Pruning
+ * forces a prompt-cache-epoch reset, so it only runs when opted in AND the
+ * estimated stale savings clear a high minimum AND exceed the one-time reset
+ * cost (so the reclaim pays the reset back). Default-off/blocked until live
+ * evidence justifies enabling.
+ */
+export function shouldRunMaintenancePrune(args: {
+	enabled: boolean;
+	estimatedSavings: number;
+	minSavings: number;
+	cacheEpochResetCost: number;
+}): boolean {
+	if (!args.enabled) return false;
+	if (args.estimatedSavings < args.minSavings) return false;
+	return args.estimatedSavings > args.cacheEpochResetCost;
+}
+
+export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = DEFAULT_PRUNE_CONFIG): PruneResult {
+	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
 
 	if (tokensSaved < config.minimumSavings || candidates.length === 0) {
 		return { prunedCount: 0, tokensSaved: 0, prunedEntries: [] };
 	}
+
+	let prunedCount = 0;
 
 	const prunedAt = Date.now();
 	const prunedEntries: SessionMessageEntry[] = [];

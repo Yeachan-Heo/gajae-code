@@ -216,7 +216,7 @@ During the timer window, state can change (user interruption, mode actions, addi
 - Invalid `condition` regex: skipped with warning; other conditions/rules continue.
 - Duplicate rule names at capability layer: lower-priority duplicates are shadowed before registration.
 - Duplicate names at manager layer: second registration is ignored.
-- `contextMode: "keep"`: partial violating output can remain in context before reminder retry.
+- `contextMode: "keep"`: partial violating output can remain in context before reminder retry. **Cost warning:** every aborted partial turn is retained, so context (and token spend) grows each time a rule fires. Prefer the default `discard` unless the partial output is specifically needed.
 - `interruptMode: "never"`: prose-source matches queue a deferred hidden injection after a successful assistant message; tool-source matches fold an in-band `<system-reminder>` into the matched tool call's `toolResult` content via the `afterToolCall` hook (no mid-stream abort, no separate follow-up turn).
 - Tool-source non-interrupting buckets are cleared when the parent assistant message ends with `stopReason === "aborted"` or `"error"`, so rules whose target tool never produced a result remain eligible to re-trigger.
 - Repeat-after-gap depends on turn count increments at `turn_end`; mid-turn chunks do not advance gap counters.

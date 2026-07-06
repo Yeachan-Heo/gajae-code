@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { join } from "node:path";
+
 import {
 	escapeXmlText,
 	GoalRuntime,
@@ -213,6 +215,33 @@ describe("goal runtime", () => {
 		expect(prompt).not.toContain(objective);
 		expect(prompt.toLowerCase()).not.toContain("budget");
 		expect(prompt.toLowerCase()).not.toContain("remaining");
+	});
+
+	it("renders active prompts byte-identically across adversarial live counter changes", () => {
+		const objective = "Fix <root>&keep>safe";
+		const first = renderGoalPrompt(
+			"active",
+			createGoal({ objective, tokensUsed: 0, timeUsedSeconds: 0, updatedAt: 10 }),
+		);
+		const second = renderGoalPrompt(
+			"active",
+			createGoal({ objective, tokensUsed: 999_999, timeUsedSeconds: 987_654, updatedAt: 20 }),
+		);
+
+		expect(second).toBe(first);
+		expect(first).toContain("Fix &lt;root&gt;&amp;keep&gt;safe");
+		expect(first).not.toContain(objective);
+		expect(first).toContain('goal({op:"get"})` returns the current goal and usage state');
+		expect(first).not.toContain("Tokens used");
+		expect(first).not.toContain("Time used");
+	});
+
+	it("keeps the goal continuation prompt template counter-free", async () => {
+		const templatePath = join(import.meta.dir, "../../src/prompts/goals/goal-continuation.md");
+		const content = await Bun.file(templatePath).text();
+
+		expect(content).not.toContain("Tokens used");
+		expect(content).not.toContain("Time used");
 	});
 
 	it("renders continuation prompts without budget language", () => {

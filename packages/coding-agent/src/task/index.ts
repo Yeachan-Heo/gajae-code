@@ -48,6 +48,7 @@ import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import { runSubprocess } from "./executor";
 import { adviseForkContextMode } from "./fork-context-advisory";
+import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
@@ -303,11 +304,11 @@ function resolveForkSeedParamsForMode(
 		case "none":
 			return undefined;
 		case "receipt":
-			return { maxMessages: 1, maxTokens: 64 };
+			return { maxMessages: 1, maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.receipt };
 		case "last-turn":
-			return { maxMessages: 2, maxTokens: 250 };
+			return { maxMessages: 2, maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE["last-turn"] };
 		case "bounded":
-			return { maxMessages: capMessages(50), maxTokens: 250 };
+			return { maxMessages: capMessages(50), maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.bounded };
 		case "full":
 			return { maxMessages: capMessages(500), maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, model) };
 		default:

@@ -34,6 +34,8 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { sessionRoot } from "./gjc-runtime/session-layout";
+import { resolveGjcSessionForRead, SessionResolutionError } from "./gjc-runtime/session-resolution";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
@@ -52,6 +54,7 @@ import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
+import { persistTaskTokenLog, taskTokenLogFromUsage } from "./task/token-log";
 import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
@@ -101,6 +104,26 @@ const RPC_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"memories.enabled",
 ];
 
+async function resolveTaskTokenLogDir(
+	cwd: string,
+	sessionManager: SessionManager | undefined,
+): Promise<string | undefined> {
+	// Prefer the canonical SessionManager id so root turns land in the SAME
+	// `<session>/token-logs` dir the task executor uses for subagent turns and
+	// that `gjc --fixture <id>` reads from. Fall back to the env/latest-active
+	// session only when no manager id is available (e.g. a fresh launch whose
+	// session the SDK creates lazily). Never let a best-effort telemetry side
+	// channel crash startup — swallow every SessionResolutionError.
+	const managerId = sessionManager?.getSessionId();
+	if (managerId) return path.join(sessionRoot(cwd, managerId), "token-logs");
+	try {
+		const session = await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
+		return path.join(session.sessionRoot, "token-logs");
+	} catch (error) {
+		if (error instanceof SessionResolutionError) return undefined;
+		throw error;
+	}
+}
 function applyRpcDefaultSettingOverrides(targetSettings: Settings = settings): void {
 	for (const settingPath of RPC_DEFAULTED_SETTING_PATHS) {
 		targetSettings.override(settingPath, getDefault(settingPath));
@@ -951,6 +974,46 @@ export async function runRootCommand(
 		modelRegistry,
 		settingsInstance,
 	);
+	// Resolve the token-log dir lazily on the first chat-usage event: a fresh
+	// launch's session dir does not exist yet at this point (the SDK creates it),
+	// so eager resolution would miss it. Re-resolve when the SessionManager id
+	// changes mid-run (fork/new) so root turns keep landing in the SAME
+	// `<session>/token-logs` dir the task executor uses for subagent turns.
+	let rootTokenLogDir: string | undefined;
+	let rootTokenLogSessionId: string | undefined;
+	let rootTokenLogResolved = false;
+	let rootTokenTurn = 0;
+	const baseTelemetry = sessionOptions.telemetry;
+	sessionOptions.telemetry = {
+		...(baseTelemetry ?? {}),
+		onChatUsage: async event => {
+			await baseTelemetry?.onChatUsage?.(event);
+			const currentSessionId = sessionManager?.getSessionId();
+			if (!rootTokenLogResolved || (currentSessionId && currentSessionId !== rootTokenLogSessionId)) {
+				rootTokenLogDir = await resolveTaskTokenLogDir(process.cwd(), sessionManager);
+				// Reset the per-session turn counter when the log dir moves to a new
+				// session so each session's log starts at turn 1.
+				if (rootTokenLogSessionId !== undefined && currentSessionId !== rootTokenLogSessionId) rootTokenTurn = 0;
+				rootTokenLogSessionId = currentSessionId;
+				rootTokenLogResolved = true;
+			}
+			if (!rootTokenLogDir) return;
+			rootTokenTurn += 1;
+			await persistTaskTokenLog(
+				taskTokenLogFromUsage(event.usage, {
+					subagentId: "root",
+					agent: event.agent?.name ?? "main",
+					// Monotonic 1-based sequence of persisted usage events for this
+					// session (event.stepNumber is 0-based and -1 for oneshot spans).
+					turn: rootTokenTurn,
+					at: new Date().toISOString(),
+					model: event.model,
+					cost: event.cost,
+				}),
+				{ dir: rootTokenLogDir },
+			);
+		},
+	};
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";

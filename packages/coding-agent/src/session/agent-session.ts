@@ -26,7 +26,6 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
-	AppendOnlyContextManager,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
@@ -44,16 +43,20 @@ import {
 	type EmergencyCompactionSample,
 	emergencyCompactionReason,
 	estimateMessageTokensHeuristic,
+	estimateTextTokensHeuristic,
 	generateBranchSummary,
 	generateHandoff,
+	IMAGE_TOKEN_ESTIMATE,
 	prepareCompaction,
 	type SummaryOptions,
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction";
 import {
 	DEFAULT_PRUNE_CONFIG,
+	estimateToolOutputPruneSavings,
 	pruneAssistantToolArguments,
 	pruneToolOutputs,
+	shouldRunMaintenancePrune,
 } from "@gajae-code/agent-core/compaction/pruning";
 import type {
 	AssistantMessage,
@@ -128,6 +131,7 @@ import {
 	prompt,
 	Snowflake,
 } from "@gajae-code/utils";
+import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
@@ -238,6 +242,7 @@ import {
 } from "../skill-state/active-state";
 import { assertWorkflowMutationAllowed } from "../skill-state/deep-interview-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
+import { buildVolatileProjectContext } from "../system-prompt";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
@@ -252,7 +257,7 @@ import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
-import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
+import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
@@ -264,6 +269,7 @@ import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import { buildWorkflowIntentDiff, WORKFLOW_INTENT_DIFF_CUSTOM_TYPE } from "../workflow/workflow-intent-diff";
+import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
 import type { AuthStorage } from "./auth-storage";
 import type { ClientBridge, ClientBridgePermissionOption, ClientBridgePermissionOutcome } from "./client-bridge";
 import {
@@ -271,6 +277,7 @@ import {
 	type ContributionPrepResult,
 	prepareContributionPrep,
 } from "./contribution-prep";
+import { pruneStaleFileMentions } from "./file-mention-pruning";
 import {
 	type BashExecutionMessage,
 	type CompactionSummaryMessage,
@@ -396,6 +403,8 @@ export interface AgentSessionConfig {
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
 	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
+	/** Initial workspace tree snapshot used for the first volatile per-turn context message. */
+	workspaceTree?: WorkspaceTree;
 	/** Rebuild the SSH tool from current capability discovery results. */
 	reloadSshTool?: () => Promise<AgentTool | null>;
 	requestedToolNames?: ReadonlySet<string>;
@@ -615,6 +624,13 @@ const IRC_REPLY_MAX_BYTES = 4096;
  * subprocess (wedged Chrome renderer, stuck Python cell) refuses to settle.
  */
 const SIGNAL_TEARDOWN_TIMEOUT_MS = 5_000;
+
+/**
+ * Throttle window for the per-turn volatile workspace-tree scan. Date/cwd are
+ * refreshed every turn; the mtime-sorted tree is rescanned + re-embedded at most
+ * once per this interval to bound prompt-hot-path IO and history accumulation.
+ */
+const VOLATILE_TREE_TTL_MS = 30_000;
 
 /**
  * Collapse degenerate IRC ephemeral replies before they hit the relay.
@@ -1056,6 +1072,16 @@ export const __agentSessionPerfCounters = {
 		this.messageUpdateExtensionQueues = 0;
 	},
 };
+
+export function buildContextInjectionSignature(kind: string, parts: readonly string[]): string {
+	const hash = crypto.createHash("sha256");
+	hash.update(kind);
+	for (const part of parts) {
+		hash.update("\0");
+		hash.update(part);
+	}
+	return hash.digest("base64url");
+}
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -1103,6 +1129,8 @@ export class AgentSession {
 	#goalModeState: GoalModeState | undefined;
 	#workflowGateEmitter: WorkflowGateEmitter | undefined;
 	#goalRuntime: GoalRuntime;
+	#lastInjectedGoalContextSig: string | undefined = undefined;
+	#lastInjectedPlanContextSig: string | undefined = undefined;
 	#goalTurnCounter = 0;
 	#streamingEditParsedToolCallCache = new Map<string, StreamingEditParsedCacheEntry>();
 	#planReferenceSent = false;
@@ -1211,6 +1239,10 @@ export class AgentSession {
 	#reloadSshTool: (() => Promise<AgentTool | null>) | undefined;
 	#requestedToolNames: ReadonlySet<string> | undefined;
 	#baseSystemPrompt: string[];
+	#initialWorkspaceTree: WorkspaceTree | undefined;
+	/** Throttle cache for the per-turn volatile workspace-tree scan (see #buildVolatileProjectContextMessage). */
+	#cachedWorkspaceTree: WorkspaceTree | undefined;
+	#cachedWorkspaceTreeAt = 0;
 	/**
 	 * Signature of the (toolNames, tool descriptions) tuple passed to the most
 	 * recent successful `rebuildSystemPrompt` call. Used to skip redundant rebuilds
@@ -1482,6 +1514,7 @@ export class AgentSession {
 		this.#getMcpServerInstructions = config.getMcpServerInstructions;
 		this.#reloadSshTool = config.reloadSshTool;
 		this.#baseSystemPrompt = this.agent.state.systemPrompt;
+		this.#initialWorkspaceTree = config.workspaceTree;
 		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
 		this.#discoverableToolAllowedNames = config.discoverableToolAllowedNames
 			? new Set(config.discoverableToolAllowedNames.map(name => name.toLowerCase()))
@@ -1659,13 +1692,30 @@ export class AgentSession {
 	}
 
 	async buildForkContextSeed(options: ForkContextSeedOptions): Promise<ForkContextSeed> {
+		const maxMessages = Math.min(500, Math.max(0, Math.trunc(options.maxMessages)));
+		const maxTokens = Math.max(0, Math.trunc(options.maxTokens));
+		if (maxMessages <= 0 || maxTokens <= 0) {
+			return {
+				messages: [],
+				agentMessages: [],
+				metadata: {
+					sourceSessionId: this.sessionId,
+					parentMessageCount: this.messages.length,
+					includedMessages: 0,
+					skippedMessages: 0,
+					approximateTokens: 0,
+					maxMessages,
+					maxTokens,
+					skippedReasons: {},
+				},
+				cacheIdentity: options.cacheIdentity ?? this.sessionId,
+			};
+		}
 		const transformedMessages = await this.#transformContext([...this.messages], options.signal);
 		const convertedMessages = await this.#convertToLlm(transformedMessages);
 		const providerMessages = this.model
 			? normalizeMessagesForProvider(convertedMessages, this.model)
 			: convertedMessages;
-		const maxMessages = Math.min(500, Math.max(0, Math.trunc(options.maxMessages)));
-		const maxTokens = Math.max(0, Math.trunc(options.maxTokens));
 		const selected: Message[] = [];
 		const skippedReasons: Record<string, number> = {};
 		let skippedMessages = 0;
@@ -1712,6 +1762,33 @@ export class AgentSession {
 			return cloned;
 		};
 
+		const truncateMessageToTokenBudget = (message: Message): { message: Message; tokens: number } => {
+			const notice = `\n\n[fork-context seed: newest message truncated to fit the ${maxTokens}-token budget]`;
+			const contentText = Array.isArray(message.content)
+				? message.content.map(block => (block.type === "text" ? block.text : "")).join("\n\n")
+				: String(message.content ?? "");
+			let low = 0;
+			let high = contentText.length;
+			let bestMessage: Message = { ...message, content: [{ type: "text", text: notice.trimStart() }] };
+			let bestTokens = estimateMessageTokensHeuristic(bestMessage);
+			while (low <= high) {
+				const mid = Math.floor((low + high) / 2);
+				const candidate: Message = {
+					...message,
+					content: [{ type: "text", text: `${contentText.slice(0, mid)}${notice}` }],
+				};
+				const candidateTokens = estimateMessageTokensHeuristic(candidate);
+				if (candidateTokens <= maxTokens) {
+					bestMessage = candidate;
+					bestTokens = candidateTokens;
+					low = mid + 1;
+				} else {
+					high = mid - 1;
+				}
+			}
+			return { message: bestMessage, tokens: Math.min(bestTokens, maxTokens) };
+		};
+
 		for (let i = providerMessages.length - 1; i >= 0; i--) {
 			if (selected.length >= maxMessages) {
 				recordSkip("message-limit");
@@ -1725,8 +1802,14 @@ export class AgentSession {
 			// messages. `continue` here would skip the oversized recent message and scavenge
 			// smaller OLDER ones, yielding a non-contiguous seed that misrepresents the
 			// conversation and violates the recency contract of the receipt/last-turn/bounded modes.
-			if (maxTokens > 0 && approximateTokens + messageTokens > maxTokens) {
+			if (approximateTokens + messageTokens > maxTokens) {
 				recordSkip("token-limit");
+				if (selected.length === 0) {
+					const truncated = truncateMessageToTokenBudget(sanitized);
+					selected.unshift(truncated.message);
+					approximateTokens = truncated.tokens;
+					skippedReasons["newest-message-truncated"] = (skippedReasons["newest-message-truncated"] ?? 0) + 1;
+				}
 				break;
 			}
 			selected.unshift(sanitized);
@@ -4426,11 +4509,15 @@ export class AgentSession {
 	 * For everything else, callers must explicitly call `refreshBaseSystemPrompt()`
 	 * after side-effecting changes; see e.g. the memory hooks and
 	 * `#syncEditToolModeAfterModelChange`.
-	 *
-	 * The current calendar date IS covered (appended as a segment) because
-	 * `buildSystemPrompt` injects it into the prompt body (`Today is '{{date}}'`).
-	 * Without this, a session spanning midnight with only tool-stable MCP
-	 * reconnects would keep yesterday's date indefinitely.
+	 * Volatile per-turn facts (current date, cwd, and mtime-sorted workspace tree
+	 * RENDERING) are intentionally NOT covered. They are delivered as user-role
+	 * context by `#buildVolatileProjectContextMessage()`, outside the provider
+	 * cached system prefix, so rollover/touched-file changes must not force a
+	 * stable prompt rebuild. Note the AGENTS.md file LIST (`agentsMdFiles`, sorted
+	 * by name) surfaced by the same workspace scan is still a stable-prefix input
+	 * via project-prompt's `<dir-context>`; adding/removing an AGENTS.md is an
+	 * intended instruction change, and name-sorting means touched files do not
+	 * perturb it.
 	 */
 	#computeAppliedToolSignature(toolNames: string[], tools: AgentTool[]): string {
 		// Order-preserving join: any reorder must produce a different signature so
@@ -4461,8 +4548,7 @@ export class AgentSession {
 			entries.sort();
 			instructionsSegment = entries.join("\u0006");
 		}
-		const date = new Date().toISOString().slice(0, 10);
-		return `${nameSegment}\u0003${descriptionSegment}\u0005${registrySegment}\u0007${instructionsSegment}|${date}`;
+		return `${nameSegment}\u0003${descriptionSegment}\u0005${registrySegment}\u0007${instructionsSegment}`;
 	}
 
 	/**
@@ -5083,6 +5169,94 @@ export class AgentSession {
 		};
 	}
 
+	async #buildAutomaticPlanModeMessage(): Promise<CustomMessage | null> {
+		const state = this.#planModeState;
+		if (!state?.enabled) {
+			this.#lastInjectedPlanContextSig = undefined;
+			return null;
+		}
+		const message = await this.#buildPlanModeMessage();
+		if (!message) {
+			this.#lastInjectedPlanContextSig = undefined;
+			return null;
+		}
+		const content = typeof message.content === "string" ? message.content : "";
+		const signature = buildContextInjectionSignature("plan-mode-context", [
+			"enabled",
+			state.planFilePath,
+			state.workflow ?? "",
+			content,
+		]);
+		if (signature === this.#lastInjectedPlanContextSig) return null;
+		this.#lastInjectedPlanContextSig = signature;
+		return message;
+	}
+
+	#buildAutomaticGoalModeMessage(): CustomMessage | null {
+		const state = this.#goalModeState;
+		if (!state?.enabled || state.goal.status !== "active") {
+			this.#lastInjectedGoalContextSig = undefined;
+			return null;
+		}
+		const message = this.#buildGoalModeMessage();
+		if (!message) {
+			this.#lastInjectedGoalContextSig = undefined;
+			return null;
+		}
+		const content = typeof message.content === "string" ? message.content : "";
+		const signature = buildContextInjectionSignature("goal-mode-context", ["enabled", state.goal.id, content]);
+		if (signature === this.#lastInjectedGoalContextSig) return null;
+		this.#lastInjectedGoalContextSig = signature;
+		return message;
+	}
+
+	/**
+	 * Clear the goal/plan static-once injection signatures so the next prompt
+	 * re-injects the active mode context once. MUST be called whenever the live
+	 * message set is rebuilt in a way that can evict a previously injected
+	 * goal-mode-context/plan-mode-context copy (compaction/pruning/handoff
+	 * replaceMessages) or when a signature was consumed but the message was not
+	 * delivered (prompt-generation abort). Forward-omission relies on the injected
+	 * copy surviving in context; this guards that invariant.
+	 */
+	#resetInjectedContextSignatures(): void {
+		this.#lastInjectedPlanContextSig = undefined;
+		this.#lastInjectedGoalContextSig = undefined;
+	}
+
+	async #buildVolatileProjectContextMessage(): Promise<CustomMessage> {
+		const cwd = this.sessionManager.getCwd();
+		// Date + cwd are refreshed every turn (cheap). The mtime-sorted workspace
+		// tree is expensive to scan and large to carry, so throttle it: rebuild at
+		// most once per VOLATILE_TREE_TTL_MS and only embed the tree block on turns
+		// where the scan actually refreshed. This bounds both the per-turn IO cost
+		// and the accumulation of stale tree copies in history, while keeping the
+		// content outside the cached system prefix.
+		let includeTree: WorkspaceTree | undefined;
+		if (this.#initialWorkspaceTree) {
+			this.#cachedWorkspaceTree = this.#initialWorkspaceTree;
+			this.#cachedWorkspaceTreeAt = Date.now();
+			this.#initialWorkspaceTree = undefined;
+			includeTree = this.#cachedWorkspaceTree;
+		} else if (Date.now() - this.#cachedWorkspaceTreeAt >= VOLATILE_TREE_TTL_MS) {
+			try {
+				this.#cachedWorkspaceTree = await buildWorkspaceTree(cwd, { timeoutMs: 5000 });
+			} catch {
+				this.#cachedWorkspaceTree = undefined;
+			}
+			this.#cachedWorkspaceTreeAt = Date.now();
+			includeTree = this.#cachedWorkspaceTree;
+		}
+		return {
+			role: "custom",
+			customType: "volatile-project-context",
+			content: buildVolatileProjectContext({ cwd, workspaceTree: includeTree }),
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+	}
+
 	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
@@ -5333,14 +5507,16 @@ export class AgentSession {
 			if (planReferenceMessage) {
 				messages.push(planReferenceMessage);
 			}
-			const planModeMessage = await this.#buildPlanModeMessage();
+			const planModeMessage = await this.#buildAutomaticPlanModeMessage();
 			if (planModeMessage) {
 				messages.push(planModeMessage);
 			}
-			const goalModeMessage = this.#buildGoalModeMessage();
+			const goalModeMessage = this.#buildAutomaticGoalModeMessage();
 			if (goalModeMessage) {
 				messages.push(goalModeMessage);
 			}
+			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
+			messages.push(volatileProjectContextMessage);
 			if (options?.prependMessages) {
 				messages.push(...options.prependMessages);
 			}
@@ -5350,6 +5526,7 @@ export class AgentSession {
 			// Early bail-out: if a newer abort/prompt cycle started during setup,
 			// return before mutating shared state (nextTurn messages, system prompt).
 			if (this.#promptGeneration !== generation) {
+				this.#resetInjectedContextSignatures();
 				return;
 			}
 
@@ -5362,9 +5539,28 @@ export class AgentSession {
 			// Auto-read @filepath mentions
 			const fileMentions = extractFileMentions(expandedText);
 			if (fileMentions.length > 0) {
-				const fileMentionMessages = await generateFileMentionMessages(fileMentions, this.sessionManager.getCwd(), {
+				const cwd = this.sessionManager.getCwd();
+				// Collect resolved paths already shown (read or mentioned) in the recent
+				// window so a repeat @mention emits a compact note instead of the full body.
+				const RECENT_MENTION_WINDOW = 40;
+				const recentlyShownPaths = new Set<string>();
+				for (const entry of this.sessionManager.getBranch().slice(-RECENT_MENTION_WINDOW)) {
+					if (entry.type !== "message") continue;
+					const msg = entry.message;
+					if (msg.role === "fileMention") {
+						for (const file of msg.files) {
+							if (!file.duplicate && !file.pruned) recentlyShownPaths.add(resolveReadPath(file.path, cwd));
+						}
+					} else if (msg.role === "toolResult") {
+						const resolved = (msg.details as { resolvedPath?: unknown } | undefined)?.resolvedPath;
+						if (typeof resolved === "string" && resolved) recentlyShownPaths.add(resolveReadPath(resolved, cwd));
+					}
+				}
+				const fileMentionMessages = await generateFileMentionMessages(fileMentions, cwd, {
 					autoResizeImages: this.settings.get("images.autoResize"),
 					useHashLines: resolveFileDisplayMode(this).hashLines,
+					maxInlineBytes: this.settings.get("tools.fileMentionInlineBytes") * 1024,
+					recentlyShownPaths,
 				});
 				messages.push(...fileMentionMessages);
 			}
@@ -5414,8 +5610,12 @@ export class AgentSession {
 				this.#appendBeforeAgentStartCustomMessages(messages, contributed, promptAttribution, message.role);
 			}
 
-			// Bail out if a newer abort/prompt cycle has started since we began setup
+			// Bail out if a newer abort/prompt cycle has started since we began setup.
+			// The injection signatures were consumed while building the automatic
+			// goal/plan context above, but the message is not delivered on this
+			// aborted turn, so reset them here so the next real turn re-injects once.
 			if (this.#promptGeneration !== generation) {
+				this.#resetInjectedContextSignatures();
 				return;
 			}
 
@@ -6123,6 +6323,9 @@ export class AgentSession {
 		if (eviction.evictedEntries > 0) await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
+		// Compaction can evict a previously injected goal/plan-mode-context copy from
+		// live context; clear the static-once signatures so the next prompt re-injects.
+		this.#resetInjectedContextSignatures();
 		this.#syncTodoPhasesFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
@@ -6947,22 +7150,90 @@ export class AgentSession {
 		const branchEntries = this.sessionManager.getBranch();
 		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG);
 		const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
-		const tokensSaved = result.tokensSaved + argumentResult.argumentTokensSaved;
-		const prunedCount = result.prunedCount + argumentResult.argumentPrunedCount;
+		const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
+			resolveReadPath(p, this.sessionManager.getCwd()),
+		);
+		const tokensSaved =
+			result.tokensSaved + argumentResult.argumentTokensSaved + Math.round(fileMentionResult.bytesSaved / 4);
+		const prunedCount = result.prunedCount + argumentResult.argumentPrunedCount + fileMentionResult.changed.length;
 		if (prunedCount === 0) {
 			return undefined;
 		}
 
 		// getBranch() returns materialized copies for blob-externalized entries, so
 		// the pruning mutations must be written back into the canonical store.
-		const combined = [...result.prunedEntries, ...argumentResult.prunedEntries];
+		const combined = [...result.prunedEntries, ...argumentResult.prunedEntries, ...fileMentionResult.changed];
 		this.sessionManager.applyEntryMessageUpdates(combined);
 		await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
+		// Pruning can evict a previously injected goal/plan-mode-context copy; clear
+		// the static-once signatures so the next prompt re-injects the mode context.
+		this.#resetInjectedContextSignatures();
 		this.#syncTodoPhasesFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		return { prunedCount, tokensSaved };
+	}
+
+	/**
+	 * Approximate cost of the prompt-cache-epoch reset that pruning forces:
+	 * pruning rewrites already-sent history, invalidating the provider's cached
+	 * prefix, so the next turn re-bills that prefix as fresh input. Use the cached
+	 * prefix tokens from the last provider usage as the reset-cost estimate.
+	 */
+	#lastCacheEpochResetCost(): number {
+		const messages = this.messages;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg.role === "assistant" && (msg as AssistantMessage).usage) {
+				const usage = (msg as AssistantMessage).usage;
+				return (usage?.cacheRead ?? 0) + (usage?.cacheWrite ?? 0);
+			}
+		}
+		return 0;
+	}
+
+	/**
+	 * Evidence-gated below-threshold maintenance pruning (Finding 13). Runs
+	 * #pruneToolOutputs ONCE, below the compaction threshold, only when it is
+	 * opted in AND the estimated stale-prunable savings both clear a high minimum
+	 * and exceed the one-time cache-epoch reset cost (so remaining-turn savings pay
+	 * it back). Default-off/blocked until live evidence justifies enabling. Emits
+	 * explicit maintenance/reset telemetry.
+	 */
+	async #maybeRunBelowThresholdMaintenancePrune(): Promise<void> {
+		const compactionSettings = this.settings.getGroup("compaction");
+		if (!compactionSettings.maintenancePruningEnabled) return;
+
+		const estimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
+		const cacheEpochResetCost = this.#lastCacheEpochResetCost();
+		if (
+			!shouldRunMaintenancePrune({
+				enabled: compactionSettings.maintenancePruningEnabled,
+				estimatedSavings: estimate.tokensSaved,
+				minSavings: compactionSettings.maintenancePruningMinSavingsTokens,
+				cacheEpochResetCost,
+			})
+		) {
+			return;
+		}
+
+		const pruneResult = await this.#pruneToolOutputs();
+		if (!pruneResult || pruneResult.prunedCount === 0) return;
+
+		const resetReason = `below-threshold maintenance: reclaimed ${pruneResult.tokensSaved} tokens > cache-epoch reset cost ${cacheEpochResetCost}`;
+		await this.#emitSessionEvent({
+			type: "notice",
+			level: "info",
+			source: "maintenance-prune",
+			message: `Maintenance pruning reclaimed ${pruneResult.tokensSaved} tokens from ${pruneResult.prunedCount} stale tool outputs (${resetReason}).`,
+		});
+		logger.info("Below-threshold maintenance pruning ran", {
+			tokensSaved: pruneResult.tokensSaved,
+			prunedCount: pruneResult.prunedCount,
+			cacheEpochResetCost,
+			minSavings: compactionSettings.maintenancePruningMinSavingsTokens,
+		});
 	}
 
 	/**
@@ -6987,7 +7258,9 @@ export class AgentSession {
 
 			const compactionSettings = this.settings.getGroup("compaction");
 			const pathEntries = this.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, compactionSettings);
+			const preparation = prepareCompaction(pathEntries, compactionSettings, {
+				tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
+			});
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -7299,6 +7572,9 @@ export class AgentSession {
 			// Rebuild agent messages from session
 			const sessionContext = this.buildDisplaySessionContext();
 			this.agent.replaceMessages(sessionContext.messages);
+			// Handoff rebuilds live context and can evict a previously injected
+			// goal/plan-mode-context copy; clear the static-once signatures.
+			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
 
 			return { document: handoffText, savedPath };
@@ -7481,7 +7757,12 @@ export class AgentSession {
 		// Model maxTokens is a capability ceiling, not a per-turn reservation.
 		// Auto maintenance should track actual context fullness.
 		const autoCompactionOutputReserveTokens = 0;
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) return;
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+			// Below the compaction threshold: optionally run evidence-gated maintenance
+			// pruning (opt-in, high savings + cache-epoch payback required).
+			await this.#maybeRunBelowThresholdMaintenancePrune();
+			return;
+		}
 
 		const pruneResult = await this.#pruneToolOutputs();
 		if (pruneResult) {
@@ -7531,6 +7812,7 @@ export class AgentSession {
 		}
 		const safeCount = Math.max(0, Math.min(checkpointState.checkpointMessageCount, this.agent.state.messages.length));
 		this.agent.replaceMessages(this.agent.state.messages.slice(0, safeCount));
+		this.#resetInjectedContextSignatures();
 		try {
 			this.sessionManager.branchWithSummary(checkpointState.checkpointEntryId, report, {
 				startedAt: checkpointState.startedAt,
@@ -7836,13 +8118,13 @@ export class AgentSession {
 	#syncAppendOnlyContext(model: Model | null | undefined): void {
 		const setting = this.settings.get("provider.appendOnlyContext") ?? "auto";
 		const providerId = model?.provider;
-		const enable = setting === "on" || (setting === "auto" && providerId === "deepseek");
+		const enable = resolveAppendOnlyMode(setting, providerId ?? "");
 		const prev = this.#lastAppendOnlyResolution;
 		if (prev && prev.enable === enable && prev.providerId === providerId) return;
 		this.#lastAppendOnlyResolution = { enable, providerId };
 
 		if (enable && !this.agent.appendOnlyContext) {
-			this.agent.setAppendOnlyContext(new AppendOnlyContextManager());
+			this.agent.setAppendOnlyContext(createAppendOnlyContextManager(providerId));
 		} else if (enable && this.agent.appendOnlyContext) {
 			// Already active — invalidate prefix + log so the next turn
 			// rebuilds for the current model's normalization.
@@ -8445,7 +8727,13 @@ export class AgentSession {
 
 			const pathEntries = this.sessionManager.getBranch();
 
-			const preparation = prepareCompaction(pathEntries, compactionSettings);
+			// Emergency/overflow-recovery compaction is conservative: apply the token
+			// correction only when it SHRINKS the keep window (ratio >= 1), never when
+			// it would grow it, so recovery cannot re-overflow the provider window.
+			const overflowRatio = this.#computeCompactionTokenCorrectionRatio();
+			const preparation = prepareCompaction(pathEntries, compactionSettings, {
+				tokenCorrectionRatio: overflowRatio !== undefined ? Math.max(1, overflowRatio) : undefined,
+			});
 			if (!preparation) {
 				const continuationSkipReason = willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
 				await this.#emitSessionEvent({
@@ -10245,6 +10533,7 @@ export class AgentSession {
 			}
 
 			this.agent.replaceMessages(sessionContext.messages);
+			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
 			if (switchingToDifferentSession) {
 				this.#closeAllProviderSessions("session switch");
@@ -10417,6 +10706,7 @@ export class AgentSession {
 
 		if (!skipConversationRestore) {
 			this.agent.replaceMessages(sessionContext.messages);
+			this.#resetInjectedContextSignatures();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 		}
 
@@ -10584,6 +10874,7 @@ export class AgentSession {
 		const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
 		await this.#restoreMCPSelectionsForSessionContext(displayContext);
 		this.agent.replaceMessages(displayContext.messages);
+		this.#resetInjectedContextSignatures();
 		this.#syncTodoPhasesFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
@@ -10780,6 +11071,57 @@ export class AgentSession {
 		tokens: number;
 	} {
 		return this.#estimateContextTokensWith(message => this.#estimateMessageDisplayTokens(message));
+	}
+
+	/** Count inline image blocks in a message (for bucketing the fixed image token estimate). */
+	#countImageBlocks(message: AgentMessage): number {
+		const content = (message as { content?: unknown }).content;
+		if (!Array.isArray(content)) return 0;
+		let count = 0;
+		for (const block of content) {
+			if (block && typeof block === "object" && (block as { type?: unknown }).type === "image") count++;
+		}
+		return count;
+	}
+
+	/**
+	 * Observed heuristic→actual token correction for the compaction keep window
+	 * (Finding 7). Compares the provider's real prompt tokens against the chars/4
+	 * heuristic estimate of the same content (stable system prefix + history through
+	 * the last usage-bearing assistant turn). Image-bearing content is bucketed out
+	 * of BOTH sides using the identical fixed IMAGE_TOKEN_ESTIMATE so the 1200-token
+	 * image charge cannot skew the text ratio. Returns undefined when data is
+	 * insufficient, so prepareCompaction applies no correction (never the confounded
+	 * raw promptTokens/estimatedTokens quotient). Clamped to [0.5, 2] downstream.
+	 */
+	#computeCompactionTokenCorrectionRatio(): number | undefined {
+		const messages = this.messages;
+		let lastUsageIndex = -1;
+		let lastUsage: Usage | undefined;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg.role === "assistant" && (msg as AssistantMessage).usage) {
+				lastUsage = (msg as AssistantMessage).usage;
+				lastUsageIndex = i;
+				break;
+			}
+		}
+		if (!lastUsage || lastUsageIndex < 0) return undefined;
+		const actual = calculatePromptTokens(lastUsage);
+		if (!(actual > 0)) return undefined;
+
+		let heuristic = 0;
+		for (const block of this.agent.state.systemPrompt) heuristic += estimateTextTokensHeuristic(block);
+		let imageBlocks = 0;
+		for (let i = 0; i <= lastUsageIndex; i++) {
+			heuristic += this.#estimateMessageDisplayTokens(messages[i]);
+			imageBlocks += this.#countImageBlocks(messages[i]);
+		}
+		const imgAdjust = imageBlocks * IMAGE_TOKEN_ESTIMATE;
+		const num = actual - imgAdjust;
+		const den = heuristic - imgAdjust;
+		if (!(num > 0) || !(den > 0)) return undefined;
+		return num / den;
 	}
 
 	#estimateContextTokensForCompaction(pendingMessages: readonly AgentMessage[]): {

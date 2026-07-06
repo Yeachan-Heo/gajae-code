@@ -192,6 +192,10 @@ export interface FileMentionMessage {
 		/** Why the file contents were omitted from auto-read. */
 		skippedReason?: "tooLarge";
 		image?: ImageContent;
+		/** Set when this mention duplicated a recently shown path (compact note, no full body). */
+		duplicate?: boolean;
+		/** Set when a stale entry was pruned to a digest notice (never silently deleted). */
+		pruned?: boolean;
 	}>;
 	timestamp: number;
 }

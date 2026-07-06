@@ -101,8 +101,6 @@ export function renderGoalPrompt(kind: GoalPromptKind, goal: Goal): string {
 	const template = kind === "active" ? goalModeActivePrompt : goalContinuationPrompt;
 	return prompt.render(template, {
 		objective: escapeXmlText(goal.objective),
-		tokensUsed: String(goal.tokensUsed),
-		timeUsedSeconds: String(goal.timeUsedSeconds),
 	});
 }
 

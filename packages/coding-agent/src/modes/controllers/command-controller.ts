@@ -13,6 +13,7 @@ import {
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
 import { formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
 import { $ } from "bun";
+import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
 import { reset as resetCapabilities } from "../../capability";
 import { clearClaudePluginRootsCache } from "../../discovery/helpers";
@@ -400,7 +401,7 @@ export class CommandController {
 		{
 			const setting = this.ctx.settings.get("provider.appendOnlyContext") ?? "auto";
 			const provider = this.ctx.session.model?.provider;
-			const mode = setting === "on" ? true : setting === "off" ? false : provider === "deepseek";
+			const mode = resolveAppendOnlyMode(setting, provider ?? "");
 			const activeLabel = mode ? theme.fg("success", "active") : theme.fg("dim", "inactive");
 			const settingLabel = setting === "auto" ? `${setting} (${provider ?? "?"})` : setting;
 			info += `${theme.fg("dim", "Append-Only:")} ${activeLabel} (setting: ${settingLabel})\n`;

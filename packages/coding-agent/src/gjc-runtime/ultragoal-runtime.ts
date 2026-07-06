@@ -2128,6 +2128,38 @@ function isComputerSpecificToolsIndexDiff(diff: string | undefined, targetPath: 
 	return false;
 }
 
+/** Settings registry file that holds ALL settings, most of them unrelated to computer control. */
+const SETTINGS_SCHEMA_PATH = "packages/coding-agent/src/config/settings-schema.ts";
+
+function isSettingsSchemaPath(value: string): boolean {
+	return normalizeRepoPath(value) === SETTINGS_SCHEMA_PATH;
+}
+
+/**
+ * The settings registry holds every setting (themes, tool output sizes, retry
+ * knobs, …), so a bare `settings-schema.ts` edit is NOT by itself a computer
+ * change. Mirror {@link isComputerSpecificToolsIndexDiff}: only treat it as a
+ * computer-control surface when the diff actually adds/removes a `computer.*`
+ * setting key. When no diff is available, callers fall back to the conservative
+ * (fail-closed) categorization instead of this narrowing.
+ */
+function isComputerSpecificSettingsDiff(diff: string | undefined, targetPath: string): boolean {
+	if (!diff || !isSettingsSchemaPath(targetPath)) return false;
+	let inTargetFile = false;
+	for (const line of diff.split("\n")) {
+		if (line.startsWith("diff --git ")) {
+			const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+			inTargetFile = !!match && (isSettingsSchemaPath(match[1]!) || isSettingsSchemaPath(match[2]!));
+			continue;
+		}
+		if (!inTargetFile || line.startsWith("+++") || line.startsWith("---")) continue;
+		if (!line.startsWith("+") && !line.startsWith("-")) continue;
+		const changedLine = line.slice(1);
+		if (/["']computer\./.test(changedLine)) return true;
+	}
+	return false;
+}
+
 function isComputerControlSurfaceChangePath(row: UltragoalChangeSetPath): boolean {
 	const category = row.category ?? categorizeComputerChangePath(row.path);
 	const oldCategory = row.oldPath ? categorizeComputerChangePath(row.oldPath) : category;
@@ -2137,7 +2169,20 @@ function isComputerControlSurfaceChangePath(row: UltragoalChangeSetPath): boolea
 function trustedChangeSetRequiresComputerSuite(changeSet: UltragoalChangeSet | undefined): boolean {
 	if (!changeSet?.trusted) return false;
 	return changeSet.paths.some(row => {
-		if (isComputerControlSurfaceChangePath(row)) return true;
+		if (isComputerControlSurfaceChangePath(row)) {
+			// The settings registry mixes computer and non-computer settings. Narrow it
+			// with the diff so unrelated settings edits do not force the computer suite;
+			// fall back to the conservative categorization when no diff is available.
+			const touchesSettingsSchema =
+				isSettingsSchemaPath(row.path) || (row.oldPath ? isSettingsSchemaPath(row.oldPath) : false);
+			if (touchesSettingsSchema && changeSet.rawDiff !== undefined) {
+				return (
+					isComputerSpecificSettingsDiff(changeSet.rawDiff, row.path) ||
+					(row.oldPath ? isComputerSpecificSettingsDiff(changeSet.rawDiff, row.oldPath) : false)
+				);
+			}
+			return true;
+		}
 		return (
 			isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.path) ||
 			(row.oldPath ? isComputerSpecificToolsIndexDiff(changeSet.rawDiff, row.oldPath) : false)

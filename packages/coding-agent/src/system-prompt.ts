@@ -14,6 +14,7 @@ import { loadSkills, type Skill } from "./extensibility/skills";
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
+import volatileProjectContextTemplate from "./prompts/system/volatile-project-context.md" with { type: "text" };
 import { shortenPath } from "./tools/render-utils";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -368,12 +369,42 @@ export interface BuildSystemPromptOptions {
 	secretsEnabled?: boolean;
 	/** Pre-loaded workspace tree (skips discovery if provided). May be a Promise to allow early kick-off. */
 	workspaceTree?: WorkspaceTree | Promise<WorkspaceTree>;
+	/**
+	 * Render a trimmed role-agent base prompt for subagent sessions: omits the
+	 * workflow-surface/routing/self-awareness (`<gjc-runtime>`) and `<soul>` blocks
+	 * that only apply to the top-level interactive/print agent. Tool safety, repo
+	 * safety, and the completion contract are retained. Default: false.
+	 */
+	subagent?: boolean;
 }
 
 /** Result of building provider-facing system prompt messages. */
 export interface BuildSystemPromptResult {
 	/** Ordered system prompt blocks. Providers should preserve entries as distinct messages/blocks. */
 	systemPrompt: string[];
+}
+export interface BuildVolatileProjectContextOptions {
+	cwd?: string;
+	date?: string;
+	workspaceTree?: WorkspaceTree;
+}
+
+export function buildVolatileProjectContext(options: BuildVolatileProjectContextOptions = {}): string {
+	const resolvedCwd = options.cwd ?? getProjectDir();
+	const date = options.date ?? new Date().toISOString().slice(0, 10);
+	return prompt
+		.render(volatileProjectContextTemplate, {
+			date,
+			cwd: shortenPath(resolvedCwd.replace(/\\/g, "/")),
+			workspaceTree: options.workspaceTree ?? {
+				rootPath: resolvedCwd,
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		})
+		.trim();
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -403,6 +434,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		eagerTasks = false,
 		secretsEnabled = false,
 		workspaceTree: providedWorkspaceTree,
+		subagent = false,
 	} = options;
 	const resolvedCwd = cwd ?? getProjectDir();
 
@@ -582,6 +614,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		discoverableTools,
 		eagerTasks,
 		secretsEnabled,
+		subagent,
 	};
 	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
 	const systemPrompt = [rendered];

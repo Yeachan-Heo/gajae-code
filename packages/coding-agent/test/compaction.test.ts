@@ -345,7 +345,7 @@ describe("remote compaction setting", () => {
 		];
 		const preparation = prepareCompaction(entries, {
 			...DEFAULT_COMPACTION_SETTINGS,
-			keepRecentTokens: 1000,
+			keepRecentTokens: 1,
 			remoteEnabled: false,
 		});
 		if (!preparation) throw new Error("Expected compaction preparation");
@@ -383,7 +383,7 @@ describe("remote compaction setting", () => {
 		];
 		const preparation = prepareCompaction(entries, {
 			...DEFAULT_COMPACTION_SETTINGS,
-			keepRecentTokens: 1000,
+			keepRecentTokens: 1,
 			remoteEnabled: false,
 			remoteEndpoint: "https://compaction.example.test/summarize",
 		});
@@ -460,7 +460,7 @@ describe("remote compaction setting", () => {
 
 		const preparation = prepareCompaction(entries, {
 			...DEFAULT_COMPACTION_SETTINGS,
-			keepRecentTokens: 1000,
+			keepRecentTokens: 1,
 			remoteEnabled: true,
 		});
 		expect(preparation).toBeDefined();
@@ -744,7 +744,7 @@ describe("remote compaction setting", () => {
 
 		const preparation = prepareCompaction(entries, {
 			...DEFAULT_COMPACTION_SETTINGS,
-			keepRecentTokens: 1000,
+			keepRecentTokens: 1,
 			remoteEnabled: true,
 		});
 		if (!preparation) throw new Error("Expected compaction preparation");
