@@ -245,6 +245,38 @@ function previewOffendingData(value: unknown, maxLength = 500): string {
 	}
 	return serialized.length > maxLength ? `${serialized.slice(0, maxLength)}…` : serialized;
 }
+const PLACEHOLDER_YIELD_PATTERNS = [
+	/\bsee (?:the )?message body\b/i,
+	/\breturned inline\b/i,
+	/\bleader persists\b/i,
+	/\bcaller persists\b/i,
+];
+
+function looksLikePlaceholderYieldString(value: string): boolean {
+	const trimmed = value.trim();
+	if (trimmed.length === 0 || trimmed.length > 500) return false;
+	return PLACEHOLDER_YIELD_PATTERNS.some(pattern => pattern.test(trimmed));
+}
+
+function findPlaceholderYieldPath(value: unknown, path = "$", depth = 0): string | undefined {
+	if (typeof value === "string") {
+		return looksLikePlaceholderYieldString(value) ? path : undefined;
+	}
+	if (!value || typeof value !== "object" || depth > 4) return undefined;
+	if (Array.isArray(value)) {
+		for (let i = 0; i < value.length; i++) {
+			const found = findPlaceholderYieldPath(value[i], `${path}[${i}]`, depth + 1);
+			if (found) return found;
+		}
+		return undefined;
+	}
+	const record = value as Record<string, unknown>;
+	for (const [key, item] of Object.entries(record)) {
+		const found = findPlaceholderYieldPath(item, `${path}.${key}`, depth + 1);
+		if (found) return found;
+	}
+	return undefined;
+}
 
 function tryParseJsonOutput(text: string): unknown | undefined {
 	const trimmed = text.trim();
@@ -321,6 +353,8 @@ interface FinalizeSubprocessOutputResult {
 export const SUBAGENT_WARNING_NULL_YIELD = "SYSTEM WARNING: Subagent called yield with null data.";
 export const SUBAGENT_WARNING_MISSING_YIELD =
 	"SYSTEM WARNING: Subagent exited without calling yield tool after 3 reminders.";
+export const SUBAGENT_WARNING_PLACEHOLDER_YIELD =
+	"SYSTEM WARNING: Subagent yield data contains a placeholder instead of the actual result.";
 
 /** Build a schema_violation outcome — surfaced as a non-zero exit so callers treat it as a failure. */
 function buildSchemaViolationOutcome(
@@ -376,21 +410,37 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 					stderr = `schema_violation: invalid output schema: ${schemaError}`;
 					exitCode = 1;
 				} else {
-					const verdict = validator ? validator.validate(completeData) : { ok: true as const };
-					if (!verdict.ok) {
-						const outcome = buildSchemaViolationOutcome(verdict, completeData);
+					const placeholderPath = findPlaceholderYieldPath(completeData);
+					if (placeholderPath) {
+						const outcome = buildSchemaViolationOutcome(
+							{
+								message:
+									`${SUBAGENT_WARNING_PLACEHOLDER_YIELD} Offending path: ${placeholderPath}. ` +
+									"Return the real payload in yield.result.data or persist a durable artifact receipt.",
+								missingRequired: [],
+							},
+							completeData,
+						);
 						rawOutput = outcome.rawOutput;
 						stderr = outcome.stderr;
 						exitCode = outcome.exitCode;
 					} else {
-						try {
-							rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
-						} catch (err) {
-							const errorMessage = err instanceof Error ? err.message : String(err);
-							rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
+						const verdict = validator ? validator.validate(completeData) : { ok: true as const };
+						if (!verdict.ok) {
+							const outcome = buildSchemaViolationOutcome(verdict, completeData);
+							rawOutput = outcome.rawOutput;
+							stderr = outcome.stderr;
+							exitCode = outcome.exitCode;
+						} else {
+							try {
+								rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
+							} catch (err) {
+								const errorMessage = err instanceof Error ? err.message : String(err);
+								rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
+							}
+							exitCode = 0;
+							stderr = "";
 						}
-						exitCode = 0;
-						stderr = "";
 					}
 				}
 			}

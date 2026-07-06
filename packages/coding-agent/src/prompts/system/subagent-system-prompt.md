@@ -45,6 +45,7 @@ While work remains, always continue with another tool call — investigate, edit
 When finished, you MUST call `yield` exactly once. This is like writing to a ticket: provide what is required and close it.
 
 This is your only way to return a result. You NEVER put JSON in plain text, and you NEVER substitute a text summary for the structured `result.data` parameter.
+Do not return pointers like "see message body", "returned inline", or "leader persists" inside `result.data`. The parent receives the structured `yield` payload, not prior plain-text prose; include the actual requested payload or a durable artifact receipt in `result.data`.
 
 {{#if outputSchema}}
 Your result MUST match this TypeScript interface:

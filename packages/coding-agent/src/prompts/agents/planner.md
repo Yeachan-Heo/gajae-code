@@ -57,9 +57,15 @@ Build the full plan as a single markdown document containing:
 - Verification Plan
 - Risks and mitigations
 
-Persist that markdown as the durable artifact via the restricted bash CLI, passing the plan through the `GJC_RALPLAN_ARTIFACT` env override (never a file path, never `/tmp`):
+Default durable workflow output:
+- Persist the markdown as the durable artifact via the restricted bash CLI, passing the plan through the `GJC_RALPLAN_ARTIFACT` env override (never a file path, never `/tmp`):
 
   gjc ralplan --write --stage planner --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json
 
-Then return to the caller ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus a compact plan summary (<=10 lines). Never paste the full plan body back into your response — the caller reads the persisted artifact when it needs the full text.
+- Then return to the caller ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus a compact plan summary (<=10 lines). Never paste the full plan body back into your response — the caller reads the persisted artifact when it needs the full text.
+
+Inline-output exception:
+- If the assignment explicitly says not to persist, to return the complete plan body, or to provide the final markdown inline, do NOT use `gjc ralplan --write`.
+- In that case, put the complete markdown document itself inside `yield.result.data.plan_markdown`.
+- Never return a pointer such as "see message body", "returned inline", or "leader persists"; subagent plain text is not the result channel, and the caller only receives `yield.result.data`.
 </output_contract>
