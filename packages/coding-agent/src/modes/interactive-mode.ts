@@ -163,6 +163,7 @@ function configureDefaultComposerChrome(editor: CustomEditor): void {
 	editor.setInputPrefix(getDefaultInputPrefix());
 	editor.setPlaceholder(DEFAULT_COMPOSER_PLACEHOLDER);
 	editor.setPaddingX(1);
+	editor.setRightGutterWidth(1);
 	editor.setTopBorder(undefined);
 }
 

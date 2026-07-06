@@ -23,6 +23,9 @@
 ### Fixed
 
 - Kept the terminal stdout error handler armed briefly after TUI shutdown so late `EIO`/closed-PTY errors from SSH or Windows Terminal detach do not crash tmux-backed GJC panes.
+### Fixed
+
+- Added an editor right-gutter render option so bordered input chrome can stay one cell inside the terminal edge without changing component width.
 
 ## [0.7.9] - 2026-07-01
 

@@ -4,7 +4,7 @@ import { stripVTControlCharacters } from "node:util";
 import { Agent } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { initTheme, theme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { CURSOR_MARKER, Text } from "@gajae-code/tui";
+import { CURSOR_MARKER, Text, visibleWidth } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { CustomEditor } from "../src/modes/components/custom-editor";
@@ -72,11 +72,13 @@ describe("InteractiveMode.setEditorComponent", () => {
 	it("renders the default composer as a closed rounded input box", () => {
 		const lines = mode.editor.render(48).map(stripRenderControls);
 
-		expect(lines[0]).toStartWith("╭");
-		expect(lines[0]).toEndWith("╮");
-		expect(lines.at(-1)).toStartWith("╰");
-		expect(lines.at(-1)).toEndWith("╯");
-		expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.endsWith("│"))).toBe(true);
+		expect(lines.every(line => visibleWidth(line) === 48)).toBe(true);
+		expect(lines.every(line => line.endsWith(" "))).toBe(true);
+		expect(lines[0].trimEnd()).toStartWith("╭");
+		expect(lines[0].trimEnd()).toEndWith("╮");
+		expect(lines.at(-1)!.trimEnd()).toStartWith("╰");
+		expect(lines.at(-1)!.trimEnd()).toEndWith("╯");
+		expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.trimEnd().endsWith("│"))).toBe(true);
 		expect(lines.join("\n")).toContain("Type your message...");
 		expect(lines.join("\n")).not.toContain("›");
 	});
@@ -85,6 +87,20 @@ describe("InteractiveMode.setEditorComponent", () => {
 		const shortcut = process.platform === "win32" ? "Alt+Enter/Ctrl+J" : "Shift+Enter/Ctrl+J";
 		return `${shortcut}: New line`;
 	}
+
+	it("keeps the composer right border inside a trailing gutter for CJK input", () => {
+		mode.editor.focused = true;
+		mode.editor.setText("이전 커밋들");
+
+		const lines = mode.editor.render(48).map(stripRenderControls);
+		const promptLine = lines.find(line => line.includes("이전 커밋들"));
+
+		expect(promptLine).toBeDefined();
+		expect(lines.every(line => visibleWidth(line) === 48)).toBe(true);
+		expect(lines.every(line => line.endsWith(" "))).toBe(true);
+		expect(promptLine!.trimEnd()).toEndWith("│");
+		expect(promptLine!).toContain("이전 커밋들");
+	});
 
 	function expectedQueueShortcutHint(): string {
 		const shortcut = process.platform === "win32" ? "Alt+Q" : "Alt+Enter";
@@ -172,11 +188,15 @@ describe("InteractiveMode.setEditorComponent", () => {
 			mode.editor.setText(text);
 			const lines = mode.editor.render(width).map(stripRenderControls);
 
-			expect(lines[0]).toStartWith("╭");
-			expect(lines[0]).toEndWith("╮");
-			expect(lines.at(-1)).toStartWith("╰");
-			expect(lines.at(-1)).toEndWith("╯");
-			expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.endsWith("│"))).toBe(true);
+			expect(lines.every(line => visibleWidth(line) === width)).toBe(true);
+			expect(lines.every(line => line.endsWith(" "))).toBe(true);
+			expect(lines[0].trimEnd()).toStartWith("╭");
+			expect(lines[0].trimEnd()).toEndWith("╮");
+			expect(lines.at(-1)!.trimEnd()).toStartWith("╰");
+			expect(lines.at(-1)!.trimEnd()).toEndWith("╯");
+			expect(lines.some(line => line.startsWith("│") && line.includes(">") && line.trimEnd().endsWith("│"))).toBe(
+				true,
+			);
 			expect(lines.join("\n")).not.toContain("Type your message...");
 		}
 	});

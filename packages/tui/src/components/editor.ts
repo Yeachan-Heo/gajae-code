@@ -404,6 +404,7 @@ export class Editor implements Component, Focusable {
 	// Store last layout width for cursor navigation
 	#lastLayoutWidth: number = 80;
 	#paddingXOverride: number | undefined;
+	#rightGutterWidth = 0;
 	#maxHeight?: number;
 	#scrollOffset: number = 0;
 	#wrappedLineCache: CachedWrappedLine[] = [];
@@ -524,12 +525,14 @@ export class Editor implements Component, Focusable {
 
 	/**
 	 * Get the available width for top border content given a total terminal width.
-	 * Accounts for the border characters and horizontal padding when visible.
+	 * Accounts for right gutter, border characters, and horizontal padding when visible.
 	 */
 	getTopBorderAvailableWidth(terminalWidth: number): number {
+		const rightGutterWidth = Math.min(this.#rightGutterWidth, Math.max(0, terminalWidth - 1));
+		const renderWidth = Math.max(1, terminalWidth - rightGutterWidth);
 		const paddingX = this.#getEditorPaddingX();
 		const borderWidth = this.#getHorizontalChromeWidth(paddingX);
-		return Math.max(0, terminalWidth - borderWidth * 2);
+		return Math.max(0, renderWidth - borderWidth * 2);
 	}
 
 	/**
@@ -551,6 +554,10 @@ export class Editor implements Component, Focusable {
 
 	setPaddingX(paddingX: number): void {
 		this.#paddingXOverride = Math.max(0, paddingX);
+	}
+
+	setRightGutterWidth(width: number): void {
+		this.#rightGutterWidth = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
 	}
 
 	getAutocompleteMaxVisible(): number {
@@ -789,12 +796,14 @@ export class Editor implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
+		const rightGutterWidth = Math.min(this.#rightGutterWidth, Math.max(0, width - 1));
+		const renderWidth = Math.max(1, width - rightGutterWidth);
 		const paddingX = this.#getEditorPaddingX();
 		const borderVisible = this.#borderVisible;
-		const promptGutter = this.#getPromptGutter(width, paddingX);
-		const contentAreaWidth = this.#getContentWidth(width, paddingX);
+		const promptGutter = this.#getPromptGutter(renderWidth, paddingX);
+		const contentAreaWidth = this.#getContentWidth(renderWidth, paddingX);
 		const inputPrefixWidth = this.#inputPrefixWidth;
-		const layoutWidth = Math.max(1, this.#getLayoutWidth(width, paddingX) - inputPrefixWidth);
+		const layoutWidth = Math.max(1, this.#getLayoutWidth(renderWidth, paddingX) - inputPrefixWidth);
 		this.#lastLayoutWidth = layoutWidth;
 
 		// Box-drawing characters for the configured input box shape.
@@ -815,7 +824,7 @@ export class Editor implements Component, Focusable {
 
 		if (borderVisible) {
 			// Render top border: ╭─ [status content] ────────────────╮
-			const topFillWidth = Math.max(0, width - borderWidth * 2);
+			const topFillWidth = Math.max(0, renderWidth - borderWidth * 2);
 			if (this.#topBorderContent) {
 				const { content, width: statusWidth } = this.#topBorderContent;
 				if (statusWidth <= topFillWidth) {
@@ -1020,7 +1029,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		if (borderVisible && this.#closedBorderBox) {
-			const bottomFillWidth = Math.max(0, width - borderWidth * 2);
+			const bottomFillWidth = Math.max(0, renderWidth - borderWidth * 2);
 			const bottomLeftClosed = this.borderColor(`${box.bottomLeft}${box.horizontal.repeat(paddingX)}`);
 			const bottomRightClosed = this.borderColor(`${box.horizontal.repeat(paddingX)}${box.bottomRight}`);
 			result.push(bottomLeftClosed + horizontal.repeat(bottomFillWidth) + bottomRightClosed);
@@ -1028,8 +1037,13 @@ export class Editor implements Component, Focusable {
 
 		// Add autocomplete list if active
 		if (this.#autocompleteState && this.#autocompleteList) {
-			const autocompleteResult = this.#autocompleteList.render(width);
+			const autocompleteResult = this.#autocompleteList.render(renderWidth);
 			result.push(...autocompleteResult);
+		}
+
+		if (rightGutterWidth > 0) {
+			const rightGutter = padding(rightGutterWidth);
+			return result.map(line => line + rightGutter);
 		}
 
 		return result;

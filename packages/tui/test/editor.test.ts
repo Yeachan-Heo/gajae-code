@@ -970,6 +970,22 @@ describe("Editor component", () => {
 			expect(visibleWidth(contentLine)).toBeLessThanOrEqual(width);
 		});
 
+		it("keeps bordered editor chrome inside a configured right gutter", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setRightGutterWidth(1);
+			editor.setInputPrefix("> ");
+			editor.setClosedBorderBox(true);
+			editor.setText("이전 커밋들");
+
+			const lines = editor.render(24).map(line => stripVTControlCharacters(line));
+
+			expect(lines.every(line => visibleWidth(line) === 24)).toBeTrue();
+			expect(lines.every(line => line.endsWith(" "))).toBeTrue();
+			expect(lines[0]!.trimEnd()).toEndWith(defaultEditorTheme.symbols.boxRound.topRight);
+			expect(lines.at(-1)!.trimEnd()).toEndWith(defaultEditorTheme.symbols.boxRound.bottomRight);
+			expect(lines.some(line => line.includes("이전 커밋들") && line.trimEnd().endsWith("|"))).toBeTrue();
+		});
+
 		it("shows cursor at end before wrap and wraps on next char", () => {
 			for (const paddingX of [0, 1]) {
 				const editor = new Editor({ ...defaultEditorTheme, editorPaddingX: paddingX });

@@ -106,6 +106,9 @@
 ### Changed
 
 - `web_search` latency overhaul: provider hard timeouts are now class-based (pure search APIs 15s, LLM-mediated providers 120s, Kimi 35s aligned to its upstream 30s budget, replacing the uniform 300s ceiling; an explicitly configured `web_search.timeout` still overrides — the schema default no longer reinstalls 300s), DuckDuckGo is fired as a background hedge 3s into a slower primary so a failing primary falls back to an already-settled result, the Gemini 429/5xx retry-delay budget dropped from 5 minutes to 30 seconds, resolved provider chains are cached per AuthStorage for 60s keyed on the credential generation (availability probes skipped on repeat searches; login/logout invalidates immediately), and `WebSearchTool` prewarms the chain at construction. Measured: hung-primary fallback 301s → 15s, slow-failing-primary fallback ~7s → 6s, repeat chain resolution ~26ms → ~0.01ms.
+### Fixed
+
+- Kept the default composer border one cell inside the terminal edge to avoid the right rounded input corner protruding in narrow/macOS terminal renderers.
 
 ## [0.7.10] - 2026-07-02
 ### Added
