@@ -27,10 +27,37 @@ class Boom extends Command {
 	}
 }
 
+// Mirrors `gjc harness`: a single required positional "verb" and no required
+// flags — the exact shape that crashed with an uncaught "Missing required
+// argument" stack trace before run() learned to catch CliParseError.
+class Verbed extends Command {
+	static description = "requires a verb";
+	static args = {
+		verb: Args.string({ description: "verb", required: true }),
+	};
+	async run(): Promise<void> {
+		await this.parse(Verbed);
+		sideEffect.ran = true;
+	}
+}
+
+// Covers the sibling required-flag validation path.
+class Tokened extends Command {
+	static description = "requires a token";
+	static flags = {
+		token: Flags.string({ description: "token", required: true }),
+	};
+	async run(): Promise<void> {
+		await this.parse(Tokened);
+		sideEffect.ran = true;
+	}
+}
+
 const sideEffect: { ran: boolean; action?: string } = { ran: false };
 const commands: CommandEntry[] = [
 	{ name: "demo", load: async () => Demo },
 	{ name: "boom", load: async () => Boom },
+	{ name: "verbed", load: async () => Verbed },
 ];
 
 /** Run the CLI while capturing stdout/stderr and isolating process.exitCode. */
@@ -86,6 +113,18 @@ describe("cli parse — CliParseError for invalid input", () => {
 		await expect(cmd.parse(Strict)).rejects.toBeInstanceOf(CliParseError);
 	});
 
+	it("throws CliParseError when a required positional argument is missing (the `gjc harness` no-verb case)", async () => {
+		const cmd = new Verbed([], CFG);
+		await expect(cmd.parse(Verbed)).rejects.toBeInstanceOf(CliParseError);
+		await expect(cmd.parse(Verbed)).rejects.toThrow(/Missing required argument: verb/);
+	});
+
+	it("throws CliParseError when a required flag is missing", async () => {
+		const cmd = new Tokened([], CFG);
+		await expect(cmd.parse(Tokened)).rejects.toBeInstanceOf(CliParseError);
+		await expect(cmd.parse(Tokened)).rejects.toThrow(/Missing required flag: --token/);
+	});
+
 	it("accepts a valid action", async () => {
 		const cmd = new Demo(["build"], CFG);
 		const { args } = await cmd.parse(Demo);
@@ -109,6 +148,15 @@ describe("cli run — usage instead of uncaught crash", () => {
 		expect(sideEffect.ran).toBe(true);
 		expect(sideEffect.action).toBe("build");
 		expect(exitCode).toBe(0);
+	});
+
+	it("renders usage + exits 2 (no throw) when a required argument is missing (mirrors `gjc harness`)", async () => {
+		sideEffect.ran = false;
+		const { err, out, exitCode } = await runCapturing(["verbed"]);
+		expect(err).toContain("Missing required argument: verb");
+		expect(out.toLowerCase()).toContain("usage");
+		expect(exitCode).toBe(2);
+		expect(sideEffect.ran).toBe(false); // command body never ran
 	});
 
 	it("still propagates genuine (non-parse) runtime errors", async () => {
