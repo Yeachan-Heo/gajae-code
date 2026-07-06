@@ -1,7 +1,35 @@
 import { describe, expect, it } from "bun:test";
-import { handleYouTube } from "@gajae-code/coding-agent/web/scrapers/youtube";
+import { handleYouTube, parseYouTubeUrl } from "@gajae-code/coding-agent/web/scrapers/youtube";
 
 const SKIP = !Bun.env.WEB_FETCH_INTEGRATION;
+
+describe("parseYouTubeUrl", () => {
+	const validCases = [
+		["youtube live URLs", "https://www.youtube.com/live/dQw4w9WgXcQ?si=share"],
+		["music.youtube.com watch URLs", "https://music.youtube.com/watch?v=dQw4w9WgXcQ"],
+		["youtube-nocookie embed URLs", "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"],
+		["mobile shorts URLs", "https://m.youtube.com/shorts/dQw4w9WgXcQ"],
+	] as const;
+
+	for (const [label, url] of validCases) {
+		it(`parses ${label}`, () => {
+			expect(parseYouTubeUrl(url)?.videoId).toBe("dQw4w9WgXcQ");
+		});
+	}
+
+	const invalidCases = [
+		["lookalike host", "https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ"],
+		["overlong live id", "https://www.youtube.com/live/dQw4w9WgXcQextra"],
+		["overlong embed id", "https://www.youtube.com/embed/dQw4w9WgXcQextra"],
+		["overlong nocookie embed id", "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQextra"],
+	] as const;
+
+	for (const [label, url] of invalidCases) {
+		it(`rejects ${label}`, () => {
+			expect(parseYouTubeUrl(url)).toBeNull();
+		});
+	}
+});
 
 describe.skipIf(SKIP)("handleYouTube", () => {
 	it("returns null for non-YouTube URLs", async () => {
