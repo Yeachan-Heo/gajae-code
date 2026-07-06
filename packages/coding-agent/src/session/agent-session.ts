@@ -1142,13 +1142,13 @@ export class AgentSession {
 	#streamingEditFileCache = new Map<string, string>();
 	#promptInFlightCount = 0;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
-	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
-	// checks in #handleAgentEvent) still fire on the original schedule — only the
-	// `#emit(event)` that reaches external subscribers (rpc-mode stdout, ACP bridge,
-	// Cursor exec, TUI listeners) is held back. Without this, a client that resumes
-	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
-	// has decremented #promptInFlightCount, hitting AgentBusyError. Flushed from
-	// both #endInFlight (normal) and #resetInFlight (abort).
+	// Local subscribers and extension hooks both receive the deferred event from
+	// #flushPendingAgentEnd(), preserving the local-before-extension ordering used
+	// by #emitSessionEvent while still preventing external clients from resuming
+	// before #promptWithMessage's finally decrements #promptInFlightCount. Without
+	// this, a client that resumes on `agent_end` can fire its next `prompt` while
+	// the session still reports busy and hit AgentBusyError. Flushed from both
+	// #endInFlight (normal) and #resetInFlight (abort).
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#obfuscator: SecretObfuscator | undefined;
 	#checkpointState: CheckpointState | undefined = undefined;
@@ -1233,6 +1233,7 @@ export class AgentSession {
 		if (!pending) return;
 		this.#pendingAgentEndEmit = undefined;
 		this.#emit(pending);
+		void this.#queueExtensionEvent(pending);
 	}
 
 	constructor(config: AgentSessionConfig) {
@@ -1773,17 +1774,19 @@ export class AgentSession {
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
-		await persistCoordinatorRuntimeStateFromEvent(event, {
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
-		});
+		const persistRuntimeState = () =>
+			persistCoordinatorRuntimeStateFromEvent(event, {
+				sessionId: this.sessionId,
+				cwd: this.sessionManager.getCwd(),
+				sessionFile: this.sessionManager.getSessionFile(),
+			});
+
 		if (event.type === "message_update") {
 			this.#emit(event);
+			void persistRuntimeState();
 			void this.#queueExtensionEvent(event);
 			return;
 		}
-		await this.#emitExtensionEvent(event);
 		// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
 		// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
 		// emitting while #promptInFlightCount > 0 lets a client fire its next
@@ -1793,10 +1796,18 @@ export class AgentSession {
 		// supersedes the pending one, which is what subscribers want — they only
 		// care about the final settle.
 		if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
+			void persistRuntimeState();
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
+
+		// Local subscribers are part of the AgentSession control path: retryNow(),
+		// auto-continuation gates, goal reminders, and tests all observe these events
+		// synchronously. Coordinator sidecar writes and extension hooks are secondary
+		// sinks, so they must not delay or suppress local delivery.
 		this.#emit(event);
+		void persistRuntimeState();
+		await this.#emitExtensionEvent(event);
 	}
 
 	// Track last assistant message for auto-compaction check
