@@ -50,11 +50,30 @@ record_prompt_accepted() {
   mkdir -p "$(dirname "$accepted_path")"
   local accepted_dir
   accepted_dir="$(dirname "$accepted_path")"
-  python3 - "$accepted_path" "$SESSION" "$accepted_at" "$accepted_dir/pane.log" <<'PY'
+  local worktree_baseline_dirty="${GJC_SESSION_PROMPT_WORKTREE_BASELINE_DIRTY:-null}"
+  if [[ "$worktree_baseline_dirty" != "true" && "$worktree_baseline_dirty" != "false" ]]; then
+    local workdir=""
+    if [[ -f "$accepted_dir/metadata.json" ]]; then
+      workdir="$(python3 - "$accepted_dir/metadata.json" <<'PYMETA'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get("workdir") or "")
+except Exception:
+    print("")
+PYMETA
+)"
+    fi
+    if [[ -n "$workdir" ]]; then
+      worktree_baseline_dirty="$(gjc_session_git_dirty_boolean "$workdir")"
+    fi
+  fi
+  python3 - "$accepted_path" "$SESSION" "$accepted_at" "$accepted_dir/pane.log" "$worktree_baseline_dirty" <<'PY'
 import json
 import sys
 
-path, session, accepted_at, pane_log = sys.argv[1:]
+path, session, accepted_at, pane_log, worktree_baseline_dirty = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -62,6 +81,7 @@ with open(path, "w", encoding="utf-8") as handle:
             "acceptedAt": accepted_at,
             "evidence": "durable_turn_evidence",
             "paneLog": pane_log,
+            "worktreeBaselineDirty": None if worktree_baseline_dirty == "null" else worktree_baseline_dirty == "true",
         },
         handle,
         indent=2,
@@ -131,19 +151,6 @@ PY
   return 1
 }
 
-print_redacted_tail() {
-  local prompt_text="${TEXT:-}"
-  python3 - "$prompt_text" <<'PY'
-import sys
-
-prompt = sys.argv[1]
-text = sys.stdin.read()
-if prompt:
-    text = text.replace(prompt, "[prompt redacted]")
-for line in text.splitlines()[-40:]:
-    print(line)
-PY
-}
 
 show_missing_session_diagnostics() {
   local log_path="$1"
@@ -159,8 +166,7 @@ show_missing_session_diagnostics() {
   if [[ -f "$state_dir/events.log" ]]; then
     echo "durable events: $state_dir/events.log" >&2
   fi
-  echo "--- durable pane log tail ---" >&2
-  tail -40 "$log_path" | print_redacted_tail >&2
+  echo "durable pane log tail omitted from diagnostics to preserve public-safe boundaries" >&2
 }
 
 
@@ -244,8 +250,7 @@ if ! printf '%s\n' "$PANE_TEXT" | grep -qE 'Gajae forge|Type your message|> Type
     write_pre_prompt_vanished "tmux_session_unready_before_prompt_injection" "before_prompt_injection" false ""
   fi
   echo "refusing to paste prompt: GJC TUI is not ready in session $SESSION" >&2
-  echo "--- pane tail ---" >&2
-  printf '%s\n' "$PANE_TEXT" | print_redacted_tail >&2
+  echo "pane tail omitted from diagnostics to preserve public-safe boundaries" >&2
   exit 1
 fi
 
@@ -277,6 +282,23 @@ cleanup_evidence_log() {
 trap cleanup_evidence_log EXIT
 if [[ "$EVIDENCE_LOG_IS_TEMP" == "1" ]]; then
   "${TMUX_CMD[@]}" pipe-pane -t "$SESSION":0.0 "cat >> '$EVIDENCE_LOG'"
+fi
+GJC_SESSION_PROMPT_WORKTREE_BASELINE_DIRTY="null"
+prompt_baseline_path="$(prompt_accepted_path)"
+if [[ -n "$prompt_baseline_path" && -f "$(dirname "$prompt_baseline_path")/metadata.json" ]]; then
+  prompt_baseline_workdir="$(python3 - "$(dirname "$prompt_baseline_path")/metadata.json" <<'PYMETA'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get("workdir") or "")
+except Exception:
+    print("")
+PYMETA
+)"
+  if [[ -n "$prompt_baseline_workdir" ]]; then
+    GJC_SESSION_PROMPT_WORKTREE_BASELINE_DIRTY="$(gjc_session_git_dirty_boolean "$prompt_baseline_workdir")"
+  fi
 fi
 
 "${TMUX_CMD[@]}" send-keys -t "$SESSION" -l "$TEXT"
@@ -322,6 +344,5 @@ for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
 done
 
 echo "prompt acceptance failed: no durable turn evidence appeared in session $SESSION" >&2
-echo "--- pane tail ---" >&2
-printf '%s\n' "$PANE_TEXT" | print_redacted_tail >&2
+echo "pane tail omitted from diagnostics to preserve public-safe boundaries" >&2
 exit 1

@@ -127,6 +127,167 @@ exit 0
 		});
 	});
 
+	test("runner treats completed runtime state as normal terminal cleanup", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-runtime-completed-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_runtime_completed_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+python3 - <<'PY'
+import json
+import os
+with open(os.environ["GJC_COORDINATOR_SESSION_STATE_FILE"], "w", encoding="utf-8") as handle:
+    json.dump({"session_id": os.environ["GJC_COORDINATOR_SESSION_ID"], "state": "completed", "final_response": {"source": "agent_end"}}, handle)
+PY
+exit 0
+`,
+		);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_DISABLE: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as Record<string, unknown>;
+		expect(finalStatus).toMatchObject({
+			ownerExitReason: "terminal_runtime_cleanup",
+			severity: "normal",
+			runtimeTerminal: true,
+			runtimeTerminalState: "completed",
+			runtimeTerminalSource: "agent_end",
+		});
+	});
+
+	test("runner treats launch_error runtime state as normal terminal cleanup", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-runtime-errored-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_runtime_errored_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+python3 - <<'PY'
+import json
+import os
+with open(os.environ["GJC_COORDINATOR_SESSION_STATE_FILE"], "w", encoding="utf-8") as handle:
+    json.dump({"session_id": os.environ["GJC_COORDINATOR_SESSION_ID"], "state": "errored", "final_response": {"source": "launch_error"}}, handle)
+PY
+exit 1
+`,
+		);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_DISABLE: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as Record<string, unknown>;
+		expect(finalStatus).toMatchObject({
+			ownerExitReason: "terminal_runtime_cleanup",
+			severity: "normal",
+			runtimeTerminal: true,
+			runtimeTerminalState: "errored",
+			runtimeTerminalSource: "launch_error",
+		});
+	});
+
+	test("runner rejects terminal runtime state for a mismatched session id", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-runtime-mismatch-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_runtime_mismatch_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+python3 - <<'PY'
+import json
+import os
+with open(os.environ["GJC_COORDINATOR_SESSION_STATE_FILE"], "w", encoding="utf-8") as handle:
+    json.dump({"session_id": "unrelated-session", "state": "completed", "final_response": {"source": "agent_end"}}, handle)
+PY
+printf 'Gajae forge\nWorking before prompt but no accepted marker\n'
+exit 0
+`,
+		);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_DISABLE: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		await waitForFile(path.join(stateDir, "final.json"));
+		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as Record<string, unknown>;
+		expect(finalStatus).toMatchObject({
+			ownerExitReason: "owner_exited_before_prompt_acceptance",
+			severity: "failure",
+			runtimeTerminal: false,
+		});
+	});
+
+	test("runner treats pre-acceptance pane evidence exit as failure, not normal", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-preaccept-evidence-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_preaccept_evidence_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(fakeGjc, "#!/usr/bin/env bash\nprintf 'Gajae forge\\nWorking before prompt acceptance\\n'\nexit 0\n");
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_DISABLE: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		await waitForFile(path.join(stateDir, "final.json"));
+		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as Record<string, unknown>;
+		expect(finalStatus).toMatchObject({
+			turnEvidencePresent: true,
+			promptAccepted: false,
+			ownerExitReason: "owner_exited_before_prompt_acceptance",
+			severity: "failure",
+		});
+	});
+
 	test("external monitor records vanished tmux sessions and alerts the router", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-vanish-"));
 		tempRoots.push(root);
@@ -164,14 +325,17 @@ exit 0
 		};
 		expect(vanished).toMatchObject({
 			finalPresent: false,
-			reason: "tmux_session_missing_before_prompt_acceptance",
-			phase: "before_prompt_acceptance",
+			reason: vanished.tuiReadyObserved
+				? "tmux_session_missing_before_prompt_acceptance"
+				: "tmux_session_missing_before_tui_readiness",
+			phase: vanished.tuiReadyObserved ? "before_prompt_acceptance" : "before_tui_readiness",
 			severity: "failure",
-			tuiReadyObserved: true,
+			tuiReadyObserved: vanished.tuiReadyObserved,
 		});
 		expect(vanished.runtimeState).toBe(path.relative(worktree, path.join(stateDir, "runtime-state.json")));
+		await waitForFile(routerLog);
 		expect(await Bun.file(routerLog).text()).toContain("tmux stale --session");
-	});
+	}, 20000);
 	test("external monitor records vanished sessions after prompt acceptance", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-post-accept-vanish-"));
 		tempRoots.push(root);
@@ -491,9 +655,119 @@ exit 0
 		expect(finalStatus).toMatchObject({
 			promptAccepted: true,
 			turnEvidencePresent: true,
-			ownerExitReason: "owner_exited_after_prompt_acceptance_before_terminal_status",
+			ownerExitReason: "accepted_prompt_no_useful_output",
 			severity: "failure",
+			observedRecoverableWorktreeChanges: false,
+			worktreeChangedSinceBaseline: false,
 		});
+	}, 20000);
+	test("runner reports new recoverable worktree changes after prompt acceptance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-owner-exit-dirty-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_owner_exit_dirty_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+printf 'Gajae forge\n> Type your message\n'
+IFS= read -r line
+printf '\nWorking then writing recoverable work\n'
+printf 'fixture\nrecoverable private diff text\n' > README.md
+exit 0
+`,
+		);
+
+		const created = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_DISABLE: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(created.exitCode).toBe(0);
+
+		const prompted = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "accepted then dirty"], {
+			env: isolatedEnv({
+				GJC_SESSION_STATE_DIR: stateDir,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "2",
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(prompted.exitCode).toBe(0);
+		await waitForFile(path.join(stateDir, "final.json"));
+
+		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as Record<string, unknown>;
+		expect(finalStatus).toMatchObject({
+			promptAccepted: true,
+			ownerExitReason: "accepted_prompt_observed_recoverable_worktree_changes",
+			severity: "failure",
+			worktreeBaselineDirty: false,
+			observedRecoverableWorktreeChanges: true,
+			worktreeChangedSinceBaseline: true,
+		});
+		expect(JSON.stringify(finalStatus)).not.toContain("recoverable private diff text");
+	}, 20000);
+
+	test("runner does not overclaim pre-existing dirty worktree as new work", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-owner-exit-preexisting-dirty-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_owner_exit_preexisting_dirty_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		await Bun.write(path.join(worktree, "README.md"), "fixture\npreexisting dirty text\n");
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+printf 'Gajae forge\n> Type your message\n'
+IFS= read -r line
+printf '\nWorking without new worktree changes\n'
+exit 0
+`,
+		);
+
+		const created = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_DISABLE: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(created.exitCode).toBe(0);
+
+		const prompted = Bun.spawnSync(["bash", "scripts/gjc-session/prompt.sh", session, "accepted preexisting dirty"], {
+			env: isolatedEnv({
+				GJC_SESSION_STATE_DIR: stateDir,
+				GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS: "2",
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(prompted.exitCode).toBe(0);
+		await waitForFile(path.join(stateDir, "final.json"));
+
+		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as Record<string, unknown>;
+		expect(finalStatus).toMatchObject({
+			promptAccepted: true,
+			ownerExitReason: "accepted_prompt_dirty_worktree_observed_without_new_change_proof",
+			severity: "failure",
+			worktreeBaselineDirty: true,
+			observedRecoverableWorktreeChanges: true,
+			worktreeChangedSinceBaseline: false,
+		});
+		expect(String(finalStatus.ownerExitReason)).not.toContain("partial");
+		expect(JSON.stringify(finalStatus)).not.toContain("preexisting dirty text");
 	}, 20000);
 
 	test("monitor preserves vanished marker when failure-final hold disappears after prompt acceptance", async () => {

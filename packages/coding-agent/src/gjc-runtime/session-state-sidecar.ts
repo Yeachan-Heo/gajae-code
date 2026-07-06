@@ -8,6 +8,8 @@ import { sessionRuntimeDir } from "./session-layout";
 export const GJC_COORDINATOR_SESSION_STATE_FILE_ENV = "GJC_COORDINATOR_SESSION_STATE_FILE";
 export const GJC_COORDINATOR_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 export const GJC_COORDINATOR_SESSION_BRANCH_ENV = "GJC_COORDINATOR_SESSION_BRANCH";
+const GJC_SESSION_PROMPT_ACCEPTED_JSON_ENV = "GJC_SESSION_PROMPT_ACCEPTED_JSON";
+const GJC_SESSION_WORKTREE_BASELINE_DIRTY_ENV = "GJC_SESSION_WORKTREE_BASELINE_DIRTY";
 
 export type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | "completed" | "errored";
 
@@ -32,6 +34,7 @@ interface RuntimeStateSidecarPayload {
 	state?: unknown;
 	ready_for_input?: unknown;
 	cwd?: unknown;
+	workdir?: unknown;
 	session_file?: unknown;
 	final_response?: { source?: unknown };
 }
@@ -143,10 +146,24 @@ function readPreviousPayload(stateFile: string): Record<string, unknown> {
 	}
 }
 
-function shouldPreserveTerminalPayload(previous: RuntimeStateSidecarPayload): boolean {
+function shouldPreserveTerminalPayload(
+	previous: RuntimeStateSidecarPayload,
+	input: { sessionId: string; cwd: string; sessionFile?: string | null },
+): boolean {
 	if (previous.state !== "completed" && previous.state !== "errored") return false;
 	const source = previous.final_response?.source;
-	return source === "agent_end" || source === "launch_error";
+	if (source !== "agent_end" && source !== "launch_error") return false;
+	if (typeof previous.session_id === "string" && previous.session_id !== input.sessionId) return false;
+	if (typeof previous.cwd === "string" && !sameResolvedPath(previous.cwd, input.cwd)) return false;
+	if (typeof previous.workdir === "string" && !sameResolvedPath(previous.workdir, input.cwd)) return false;
+	if (
+		input.sessionFile &&
+		typeof previous.session_file === "string" &&
+		!sameResolvedPath(previous.session_file, input.sessionFile)
+	) {
+		return false;
+	}
+	return true;
 }
 
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
@@ -187,6 +204,56 @@ function basePayload(input: {
 		session_file: input.context.sessionFile ?? null,
 	};
 }
+function booleanFromUnknown(value: unknown): boolean | null {
+	if (typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		const normalized = value.trim().toLowerCase();
+		if (normalized === "true") return true;
+		if (normalized === "false") return false;
+	}
+	return null;
+}
+
+function promptAcceptedFromEnv(): boolean {
+	const promptAcceptedJson = process.env[GJC_SESSION_PROMPT_ACCEPTED_JSON_ENV]?.trim();
+	if (!promptAcceptedJson) return false;
+	try {
+		return fsSync.statSync(promptAcceptedJson).size > 0;
+	} catch {
+		return false;
+	}
+}
+
+function readJsonFileSync(file: string): Record<string, unknown> | null {
+	try {
+		return JSON.parse(fsSync.readFileSync(file, "utf8")) as Record<string, unknown>;
+	} catch {
+		return null;
+	}
+}
+
+function worktreeBaselineDirtyFromEnvOrMarker(): boolean | null {
+	const promptAcceptedJson = process.env[GJC_SESSION_PROMPT_ACCEPTED_JSON_ENV]?.trim();
+	if (promptAcceptedJson) {
+		const promptAccepted = readJsonFileSync(promptAcceptedJson);
+		const promptBaseline = booleanFromUnknown(promptAccepted?.worktreeBaselineDirty);
+		if (promptBaseline !== null) return promptBaseline;
+	}
+	const envValue = booleanFromUnknown(process.env[GJC_SESSION_WORKTREE_BASELINE_DIRTY_ENV]);
+	if (envValue !== null) return envValue;
+	return null;
+}
+
+function observedRecoverableWorktreeChanges(cwd: string): boolean {
+	if (!cwd.trim()) return false;
+	try {
+		const proc = Bun.spawnSync(["git", "status", "--porcelain"], { cwd, stdout: "pipe", stderr: "pipe" });
+		return proc.exitCode === 0 && proc.stdout.byteLength > 0;
+	} catch {
+		return false;
+	}
+}
+
 function publicSafeErrorMessage(message: string): string {
 	const normalized = message.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ").trim();
 	if (normalized.length <= MAX_PUBLIC_ERROR_MESSAGE_LENGTH) return normalized;
@@ -204,6 +271,7 @@ function numericProcessExitCode(defaultCode: number | null): number | null {
 function postmortemExitDetails(
 	reason: postmortem.Reason,
 	previous: RuntimeStateSidecarPayload,
+	cwd: string,
 ): {
 	state: RuntimeState;
 	reason: string;
@@ -212,7 +280,15 @@ function postmortemExitDetails(
 	signal: string | null;
 	error?: { code: string; message: string; recoverable: true };
 	recovery?: { action: string; reason: string };
+	promptAccepted: boolean;
+	observedRecoverableWorktreeChanges: boolean;
+	worktreeBaselineDirty: boolean | null;
+	worktreeChangedSinceBaseline: boolean;
 } {
+	const promptAccepted = promptAcceptedFromEnv();
+	const observedChanges = observedRecoverableWorktreeChanges(typeof previous.cwd === "string" ? previous.cwd : cwd);
+	const worktreeBaselineDirty = worktreeBaselineDirtyFromEnvOrMarker();
+	const worktreeChangedSinceBaseline = worktreeBaselineDirty === false && observedChanges;
 	if (reason === postmortem.Reason.EXIT || reason === postmortem.Reason.MANUAL) {
 		const exitCode = numericProcessExitCode(0) ?? 0;
 		const exitedBeforeTerminalState =
@@ -223,16 +299,25 @@ function postmortemExitDetails(
 			: reason === postmortem.Reason.EXIT
 				? "process_exit"
 				: "manual_cleanup";
+		let classifiedReason = exitReason;
+		if (exitedBeforeTerminalState) {
+			if (!promptAccepted) classifiedReason = "process_exit_before_prompt_acceptance";
+			else if (worktreeChangedSinceBaseline)
+				classifiedReason = "accepted_prompt_observed_recoverable_worktree_changes";
+			else if (observedChanges)
+				classifiedReason = "accepted_prompt_dirty_worktree_observed_without_new_change_proof";
+			else classifiedReason = "accepted_prompt_no_useful_output";
+		}
 		return {
 			state,
-			reason: exitReason,
+			reason: classifiedReason,
 			exitKind: reason,
 			exitCode,
 			signal: null,
 			...(state === "errored"
 				? {
 						error: {
-							code: exitReason,
+							code: classifiedReason,
 							message: publicSafeErrorMessage(
 								exitedBeforeTerminalState
 									? "GJC process exited before emitting terminal agent state"
@@ -248,6 +333,10 @@ function postmortemExitDetails(
 						},
 					}
 				: {}),
+			promptAccepted,
+			observedRecoverableWorktreeChanges: observedChanges,
+			worktreeBaselineDirty,
+			worktreeChangedSinceBaseline,
 		};
 	}
 	const signalByReason: Partial<Record<postmortem.Reason, string>> = {
@@ -263,6 +352,10 @@ function postmortemExitDetails(
 		signal: signalByReason[reason] ?? null,
 		error: { code: reason, message: errorMessageForPostmortem(reason), recoverable: true },
 		recovery: { action: "recover_or_resume_session", reason: "process cleanup ran before terminal agent state" },
+		promptAccepted,
+		observedRecoverableWorktreeChanges: observedChanges,
+		worktreeBaselineDirty,
+		worktreeChangedSinceBaseline,
 	};
 }
 
@@ -327,12 +420,25 @@ export function persistCoordinatorRuntimeStateFromPostmortem(
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
 	const previous = readPreviousPayload(stateFile);
-	if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload)) return;
-	const now = new Date().toISOString();
-	const details = postmortemExitDetails(reason, previous as RuntimeStateSidecarPayload);
 	const sessionId = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim()
 		? process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId
 		: context.sessionId;
+	if (
+		shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, {
+			sessionId,
+			cwd: context.cwd,
+			sessionFile: context.sessionFile,
+		})
+	) {
+		return;
+	}
+	const previousForDetails: RuntimeStateSidecarPayload =
+		(previous as RuntimeStateSidecarPayload).state === "completed" ||
+		(previous as RuntimeStateSidecarPayload).state === "errored"
+			? { ...(previous as RuntimeStateSidecarPayload), state: "running" }
+			: (previous as RuntimeStateSidecarPayload);
+	const now = new Date().toISOString();
+	const details = postmortemExitDetails(reason, previousForDetails, context.cwd);
 	const payload = {
 		...basePayload({
 			context,
@@ -352,6 +458,10 @@ export function persistCoordinatorRuntimeStateFromPostmortem(
 		...(details.error ? { error: details.error } : {}),
 		...(details.recovery ? { recovery: details.recovery } : {}),
 		previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
+		prompt_accepted: details.promptAccepted,
+		observed_recoverable_worktree_changes: details.observedRecoverableWorktreeChanges,
+		worktree_baseline_dirty: details.worktreeBaselineDirty,
+		worktree_changed_since_baseline: details.worktreeChangedSinceBaseline,
 	};
 	try {
 		writeStateFileSync(stateFile, payload);

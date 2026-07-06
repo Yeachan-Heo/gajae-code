@@ -53,8 +53,7 @@ show_recovery_hint() {
   echo "durable vanished status: $STATE_DIR/vanished.json" >&2
   echo "durable runtime state: $RUNTIME_STATE_JSON" >&2
   if [[ -s "$STATE_DIR/pane.log" ]]; then
-    echo "--- durable pane log tail ---" >&2
-    tail -40 "$STATE_DIR/pane.log" >&2
+    echo "durable pane log tail omitted from diagnostics to preserve public-safe boundaries" >&2
   fi
 }
 
@@ -81,6 +80,7 @@ STATE_DIR="${GJC_SESSION_STATE_DIR:-$WORKDIR/.gjc-session-state/$SESSION}"
 RUNTIME_STATE_JSON="$STATE_DIR/runtime-state.json"
 mkdir -p "$STATE_DIR"
 CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+WORKTREE_BASELINE_DIRTY="$(gjc_session_git_dirty_boolean "$WORKDIR")"
 {
   printf '{\n'
   printf '  "session": "%s",\n' "$(printf '%s' "$SESSION" | json_escape)"
@@ -94,7 +94,8 @@ CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '  "finalStatus": "%s",\n' "$(printf '%s' "$STATE_DIR/final.json" | json_escape)"
   printf '  "runtimeState": "%s",\n' "$(printf '%s' "$RUNTIME_STATE_JSON" | json_escape)"
   printf '  "vanishedStatus": "%s",\n' "$(printf '%s' "$STATE_DIR/vanished.json" | json_escape)"
-  printf '  "promptAcceptedStatus": "%s"\n' "$(printf '%s' "$STATE_DIR/prompt-accepted.json" | json_escape)"
+  printf '  "promptAcceptedStatus": "%s",\n' "$(printf '%s' "$STATE_DIR/prompt-accepted.json" | json_escape)"
+  printf '  "worktreeBaselineDirty": %s\n' "$WORKTREE_BASELINE_DIRTY"
   printf '}\n'
 } >"$STATE_DIR/metadata.json"
 : >"$STATE_DIR/pane.log"
@@ -103,6 +104,22 @@ printf '[%s] create requested session=%s workdir=%s branch=%s\n' "$CREATED_AT" "
 cat >"$STATE_DIR/runner.sh" <<'RUNNER'
 #!/usr/bin/env bash
 set +e
+gjc_session_git_dirty_boolean() {
+  local workdir="${1:-}"
+  if [[ -z "$workdir" ]]; then
+    printf 'null\n'
+    return 0
+  fi
+  if ! git -C "$workdir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'null\n'
+    return 0
+  fi
+  if [[ -n "$(git -C "$workdir" status --porcelain 2>/dev/null)" ]]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
 cd "$GJC_SESSION_WORKDIR" || exit 127
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf '[%s] runner started session=%s branch=%s cwd=%s\n' "$started_at" "$GJC_SESSION_NAME" "$GJC_SESSION_BRANCH" "$GJC_SESSION_WORKDIR" >>"$GJC_SESSION_EVENTS_LOG"
@@ -129,18 +146,86 @@ for _ in $(seq 1 20); do
 done
 owner_exit_reason="normal_exit"
 owner_exit_severity="normal"
-if [[ "$turn_evidence" != "true" ]]; then
+runtime_terminal=false
+runtime_terminal_state=""
+runtime_terminal_source=""
+if [[ -s "${GJC_COORDINATOR_SESSION_STATE_FILE:-}" ]]; then
+  runtime_summary="$(python3 - "$GJC_COORDINATOR_SESSION_STATE_FILE" "$GJC_SESSION_NAME" "$GJC_SESSION_WORKDIR" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+state_file, expected_session, expected_cwd = sys.argv[1:]
+try:
+    with open(state_file, encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    data = {}
+state = data.get("state")
+session_id = data.get("session_id")
+cwd = data.get("cwd") or data.get("workdir")
+source = (data.get("final_response") or {}).get("source")
+session_matches = not session_id or session_id == expected_session
+cwd_matches = not cwd or os.path.abspath(str(cwd)) == os.path.abspath(expected_cwd)
+if state in {"completed", "errored"} and session_matches and cwd_matches:
+    print("true")
+    print(state)
+    print(source or "runtime_state")
+else:
+    print("false")
+    print("")
+    print("")
+PY
+)"
+  runtime_terminal="$(printf '%s\n' "$runtime_summary" | sed -n '1p')"
+  runtime_terminal_state="$(printf '%s\n' "$runtime_summary" | sed -n '2p')"
+  runtime_terminal_source="$(printf '%s\n' "$runtime_summary" | sed -n '3p')"
+fi
+worktree_baseline_dirty="${GJC_SESSION_WORKTREE_BASELINE_DIRTY:-null}"
+if [[ "$prompt_accepted" == "true" && -s "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}" ]]; then
+  prompt_baseline="$(python3 - "$GJC_SESSION_PROMPT_ACCEPTED_JSON" <<'PY' 2>/dev/null || true
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        value = json.load(handle).get("worktreeBaselineDirty")
+    print("true" if value is True else "false" if value is False else "null")
+except Exception:
+    print("null")
+PY
+)"
+  if [[ "$prompt_baseline" == "true" || "$prompt_baseline" == "false" ]]; then
+    worktree_baseline_dirty="$prompt_baseline"
+  fi
+fi
+worktree_current_dirty="$(gjc_session_git_dirty_boolean "${GJC_SESSION_WORKDIR:-}")"
+worktree_changed_since_baseline=false
+if [[ "$worktree_baseline_dirty" == "false" && "$worktree_current_dirty" == "true" ]]; then
+  worktree_changed_since_baseline=true
+fi
+if [[ "$runtime_terminal" == "true" ]]; then
+  owner_exit_reason="terminal_runtime_cleanup"
+  owner_exit_severity="normal"
+elif [[ "$turn_evidence" != "true" ]]; then
   owner_exit_reason="owner_exited_before_turn_evidence"
   owner_exit_severity="failure"
+elif [[ "$prompt_accepted" == "true" && "$worktree_changed_since_baseline" == "true" ]]; then
+  owner_exit_reason="accepted_prompt_observed_recoverable_worktree_changes"
+  owner_exit_severity="failure"
+elif [[ "$prompt_accepted" == "true" && "$worktree_current_dirty" == "true" ]]; then
+  owner_exit_reason="accepted_prompt_dirty_worktree_observed_without_new_change_proof"
+  owner_exit_severity="failure"
 elif [[ "$prompt_accepted" == "true" ]]; then
-  owner_exit_reason="owner_exited_after_prompt_acceptance_before_terminal_status"
+  owner_exit_reason="accepted_prompt_no_useful_output"
+  owner_exit_severity="failure"
+elif [[ "$prompt_accepted" != "true" ]]; then
+  owner_exit_reason="owner_exited_before_prompt_acceptance"
   owner_exit_severity="failure"
 fi
-python3 - "$GJC_SESSION_FINAL_JSON" "$GJC_SESSION_NAME" "$rc" "$started_at" "$finished_at" "$GJC_SESSION_PANE_LOG" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$turn_evidence" "$prompt_accepted" "$owner_exit_reason" "$owner_exit_severity" <<'PY'
+python3 - "$GJC_SESSION_FINAL_JSON" "$GJC_SESSION_NAME" "$rc" "$started_at" "$finished_at" "$GJC_SESSION_PANE_LOG" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$turn_evidence" "$prompt_accepted" "$owner_exit_reason" "$owner_exit_severity" "$runtime_terminal" "$runtime_terminal_state" "$runtime_terminal_source" "$worktree_baseline_dirty" "$worktree_current_dirty" "$worktree_changed_since_baseline" <<'PY'
 import json
 import sys
 
-path, session, status, started_at, finished_at, pane_log, runtime_state, turn_evidence, prompt_accepted, owner_exit_reason, owner_exit_severity = sys.argv[1:]
+path, session, status, started_at, finished_at, pane_log, runtime_state, turn_evidence, prompt_accepted, owner_exit_reason, owner_exit_severity, runtime_terminal, runtime_terminal_state, runtime_terminal_source, baseline_dirty, current_dirty, changed_since_baseline = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -154,6 +239,12 @@ with open(path, "w", encoding="utf-8") as handle:
             "promptAccepted": prompt_accepted == "true",
             "ownerExitReason": owner_exit_reason,
             "severity": owner_exit_severity,
+            "runtimeTerminal": runtime_terminal == "true",
+            "runtimeTerminalState": runtime_terminal_state or None,
+            "runtimeTerminalSource": runtime_terminal_source or None,
+            "worktreeBaselineDirty": None if baseline_dirty == "null" else baseline_dirty == "true",
+            "observedRecoverableWorktreeChanges": current_dirty == "true",
+            "worktreeChangedSinceBaseline": changed_since_baseline == "true",
         },
         handle,
         indent=2,
@@ -209,6 +300,40 @@ PY
 )"
     final_severity="$(printf '%s\n' "$final_summary" | sed -n '1p')"
     final_prompt_accepted="$(printf '%s\n' "$final_summary" | sed -n '2p')"
+  fi
+  runtime_terminal_state=""
+  runtime_terminal_source=""
+  if [[ -s "${GJC_COORDINATOR_SESSION_STATE_FILE:-}" ]]; then
+    runtime_summary="$(python3 - "$GJC_COORDINATOR_SESSION_STATE_FILE" "$GJC_SESSION_NAME" "$GJC_SESSION_WORKDIR" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+state_file, expected_session, expected_cwd = sys.argv[1:]
+try:
+    with open(state_file, encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    data = {}
+state = data.get("state")
+session_id = data.get("session_id")
+cwd = data.get("cwd") or data.get("workdir")
+source = (data.get("final_response") or {}).get("source")
+session_matches = not session_id or session_id == expected_session
+cwd_matches = not cwd or os.path.abspath(str(cwd)) == os.path.abspath(expected_cwd)
+if state in {"completed", "errored"} and session_matches and cwd_matches:
+    print(state)
+    print(source or "runtime_state")
+else:
+    print("")
+    print("")
+PY
+)"
+    runtime_terminal_state="$(printf '%s\n' "$runtime_summary" | sed -n '1p')"
+    runtime_terminal_source="$(printf '%s\n' "$runtime_summary" | sed -n '2p')"
+  fi
+  if [[ "$final_present" != "true" && -n "$runtime_terminal_state" ]]; then
+    printf '[%s] tmux session closed after terminal runtime state=%s source=%s; no vanished failure marker written\n' "$detected_at" "$runtime_terminal_state" "${runtime_terminal_source:-unknown}" >>"$GJC_SESSION_EVENTS_LOG"
+    exit 0
   fi
   if [[ "$final_present" == "true" ]]; then
     if [[ "$final_severity" != "failure" ]]; then
@@ -287,6 +412,7 @@ LAUNCH_CMD=(
   "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON"
   "GJC_COORDINATOR_SESSION_BRANCH=$BRANCH"
   "GJC_SESSION_TURN_EVIDENCE_PATTERN=$TURN_EVIDENCE_PATTERN"
+  "GJC_SESSION_WORKTREE_BASELINE_DIRTY=$WORKTREE_BASELINE_DIRTY"
   "GJC_SESSION_GJC_BIN=$GJC_BIN"
   "GJC_SESSION_FLAGS=$GJC_FLAGS"
   bash "$STATE_DIR/runner.sh"
@@ -322,6 +448,7 @@ if [[ "${GJC_SESSION_MONITOR_DISABLE:-0}" != "1" ]]; then
     "GJC_SESSION_ROUTER_BIN=$ROUTER_BIN"
     "GJC_SESSION_CHANNEL=$CHANNEL"
     "GJC_SESSION_TURN_EVIDENCE_PATTERN=$TURN_EVIDENCE_PATTERN"
+    "GJC_SESSION_WORKTREE_BASELINE_DIRTY=$WORKTREE_BASELINE_DIRTY"
     bash "$STATE_DIR/monitor.sh"
   )
   nohup "${MONITOR_CMD[@]}" >>"$STATE_DIR/monitor.log" 2>&1 &
@@ -353,7 +480,26 @@ if ! "${TMUX_CMD[@]}" has-session -t "$SESSION" 2>/dev/null; then
   show_recovery_hint
   exit 1
 fi
-if [[ -s "$STATE_DIR/final.json" ]] && ! has_turn_evidence; then
+if ! has_turn_evidence; then
+  for _ in $(seq 1 20); do
+    [[ -s "$STATE_DIR/final.json" ]] && break
+    sleep 0.1
+  done
+fi
+final_severity=""
+if [[ -s "$STATE_DIR/final.json" ]]; then
+  final_severity="$(python3 - "$STATE_DIR/final.json" <<'PY' 2>/dev/null || true
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get("severity") or "")
+except Exception:
+    print("")
+PY
+)"
+fi
+if [[ -s "$STATE_DIR/final.json" && "$final_severity" == "failure" ]] && ! has_turn_evidence; then
   echo "GJC owner exited before durable turn evidence: $SESSION" >&2
   show_recovery_hint
   exit 1
