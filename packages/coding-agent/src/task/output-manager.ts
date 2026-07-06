@@ -14,6 +14,8 @@ function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const RESERVED_OUTPUT_EXTENSIONS_PATTERN = "(?:md|jsonl|patch)";
+
 /**
  * Manages agent output ID allocation to ensure uniqueness.
  *
@@ -62,8 +64,8 @@ export class AgentOutputManager {
 		}
 
 		const pattern = this.#parentPrefix
-			? new RegExp(`^${escapeRegExp(this.#parentPrefix)}\\.(\\d+)-.*\\.md$`)
-			: /^(\d+)-.*\.md$/;
+			? new RegExp(`^${escapeRegExp(this.#parentPrefix)}\\.(\\d+)-.*\\.${RESERVED_OUTPUT_EXTENSIONS_PATTERN}$`)
+			: new RegExp(`^(\\d+)-.*\\.${RESERVED_OUTPUT_EXTENSIONS_PATTERN}$`);
 
 		let maxId = -1;
 		for (const file of files) {

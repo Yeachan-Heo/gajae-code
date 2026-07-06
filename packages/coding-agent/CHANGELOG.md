@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Task subagent output-ID allocation now reserves numeric prefixes from `.jsonl` session artifacts and `.patch` sidecars as well as final `.md` outputs, preventing resumed or partial subagent runs from reusing an existing artifact stem (#1733).
 - Restored `/changelog` as a built-in slash command, including autocomplete and `/changelog --full`/`/changelog full`, so the What's New prompt no longer points at a missing command.
 - Corrected the Extragoal template's read-only enforcement claim: the `--tools` allowlist governs the built-in tool surface, while the runtime injects the session `goal` tool (when `goal.enabled` is on) and `generate_image` (when an image credential exists) beyond it. Because goal's mutating ops persist session mode state, disabling it is now a mandatory gate precondition (`goal.enabled: false` in the review working directory's `.gjc/config.yml`), and reviewer calls outside the allowlist are gate-failing contract violations.
 - Corrected the GJC dogfood template's user-level install instructions (`docs/gjc-dogfood-skill-template.md`): the documented verbatim `cp` wrote to `~/.gjc/skills/`, which is not the user-level scan location (`~/.gjc/agent/skills/`), and left the YAML frontmatter mid-file, so the scan's required `description` never parsed and the installed skill was silently skipped. The template now documents the same frontmatter-first `sed` extraction into the scanned location that the Extragoal template ships with, pinned by `test/gjc-dogfood-template.test.ts`.
