@@ -66,6 +66,15 @@ interface OAuthFlowResult {
 }
 
 type MCPAddScope = "user" | "project";
+
+function mcpConfigSource(scope: MCPAddScope, filePath: string): SourceMeta {
+	return {
+		provider: "mcp-json",
+		providerName: scope === "project" ? "Project MCP config" : "User MCP config",
+		path: filePath,
+		level: scope,
+	};
+}
 type MCPAddTransport = "http" | "sse";
 
 type MCPAddParsed = {
@@ -205,6 +214,7 @@ export class MCPCommandController {
 
 		let name: string | undefined;
 		let scope: MCPAddScope = "project";
+		let scopeExplicit = false;
 		let url: string | undefined;
 		let transport: MCPAddTransport = "http";
 		let authToken: string | undefined;
@@ -228,6 +238,7 @@ export class MCPCommandController {
 					return { scope, error: r.error };
 				}
 				scope = r.scope;
+				scopeExplicit = true;
 				i += 2;
 				continue;
 			}
@@ -273,6 +284,9 @@ export class MCPCommandController {
 		}
 		if (authToken && !url) {
 			return { scope, error: "--token requires --url (HTTP/SSE transport)." };
+		}
+		if (authToken && !scopeExplicit) {
+			scope = "user";
 		}
 
 		if (commandTokens && commandTokens.length > 0) {
@@ -650,16 +664,16 @@ export class MCPCommandController {
 	 * Test connection to an MCP server.
 	 * Throws an error if connection fails (used for auto-detection).
 	 */
-	async #handleTestConnection(config: MCPServerConfig): Promise<void> {
+	async #handleTestConnection(config: MCPServerConfig, source?: SourceMeta): Promise<void> {
 		// Create temporary connection using a test name
 		const testName = `test_${Date.now()}`;
 		let resolvedConfig: MCPServerConfig;
 		if (this.ctx.mcpManager) {
-			resolvedConfig = await this.ctx.mcpManager.prepareConfig(config);
+			resolvedConfig = await this.ctx.mcpManager.prepareConfig(config, source);
 		} else {
 			const tempManager = new MCPManager(getProjectDir());
 			tempManager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
-			resolvedConfig = await tempManager.prepareConfig(config);
+			resolvedConfig = await tempManager.prepareConfig(config, source);
 		}
 
 		const connection = await connectToServer(testName, resolvedConfig);
@@ -805,10 +819,10 @@ export class MCPCommandController {
 		}
 	}
 
-	async #syncManagerConnection(name: string, config: MCPServerConfig): Promise<void> {
+	async #syncManagerConnection(name: string, config: MCPServerConfig, source: SourceMeta): Promise<void> {
 		if (!this.ctx.mcpManager) return;
 		if (this.ctx.mcpManager.getConnectionStatus(name) !== "disconnected") return;
-		await this.ctx.mcpManager.connectServers({ [name]: config }, {});
+		await this.ctx.mcpManager.connectServers({ [name]: config }, { [name]: source });
 		if (this.ctx.mcpManager.getConnectionStatus(name) === "connected") {
 			await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
 		}
@@ -836,9 +850,9 @@ export class MCPCommandController {
 			// report as connected to avoid false-negative messaging.
 			if (!isConnected && !isConnecting && config.enabled !== false) {
 				try {
-					await this.#handleTestConnection(config);
+					await this.#handleTestConnection(config, mcpConfigSource(scope, filePath));
 					isConnected = true;
-					await this.#syncManagerConnection(name, config);
+					await this.#syncManagerConnection(name, config, mcpConfigSource(scope, filePath));
 				} catch {
 					// Keep disconnected status
 				}
@@ -1115,7 +1129,7 @@ export class MCPCommandController {
 				return;
 			}
 
-			const { config } = found;
+			const { config, filePath, scope } = found;
 			if (config.enabled === false) {
 				this.ctx.showError(`Server "${name}" is disabled. Run /mcp enable ${name} first.`);
 				return;
@@ -1128,11 +1142,11 @@ export class MCPCommandController {
 			// Resolve auth config if needed
 			let resolvedConfig: MCPServerConfig;
 			if (this.ctx.mcpManager) {
-				resolvedConfig = await this.ctx.mcpManager.prepareConfig(config);
+				resolvedConfig = await this.ctx.mcpManager.prepareConfig(config, mcpConfigSource(scope, filePath));
 			} else {
 				const tempManager = new MCPManager(getProjectDir());
 				tempManager.setAuthStorage(this.ctx.session.modelRegistry.authStorage);
-				resolvedConfig = await tempManager.prepareConfig(config);
+				resolvedConfig = await tempManager.prepareConfig(config, mcpConfigSource(scope, filePath));
 			}
 
 			// Create temporary connection
@@ -1159,7 +1173,7 @@ export class MCPCommandController {
 			}
 
 			lines.push("");
-			await this.#syncManagerConnection(name, config);
+			await this.#syncManagerConnection(name, config, mcpConfigSource(scope, filePath));
 			this.#showMessage(lines.join("\n"));
 		} catch (error) {
 			if (abortController.signal.aborted || (error instanceof Error && error.name === "AbortError")) {

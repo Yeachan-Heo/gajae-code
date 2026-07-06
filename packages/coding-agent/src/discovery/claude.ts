@@ -23,7 +23,6 @@ import {
 	calculateDepth,
 	createSourceMeta,
 	discoverExtensionModulePaths,
-	expandEnvVarsDeep,
 	getExtensionNameFromPath,
 	loadFilesFromDir,
 	scanSkillsFromDir,
@@ -53,7 +52,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		const json = tryParseJson<{ mcpServers?: Record<string, unknown> }>(content);
 		if (!json?.mcpServers) return [];
 
-		const mcpServers = expandEnvVarsDeep(json.mcpServers);
+		const mcpServers = json.mcpServers;
 		return Object.entries(mcpServers).map(([name, config]) => {
 			const serverConfig = config as Record<string, unknown>;
 			return {

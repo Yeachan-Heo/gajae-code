@@ -1,4 +1,5 @@
 import { getMCPConfigPath, logger } from "@gajae-code/utils";
+import type { SourceMeta } from "../../capability/types";
 import { connectToServer, disconnectServer, listPrompts, listResources, listTools } from "../../runtime-mcp/client";
 import {
 	addMCPServer,
@@ -18,9 +19,26 @@ import { commandConsumed, errorMessage, parseNamedScopeArgs, parseSubcommand, us
 
 type AcpMcpScope = "user" | "project";
 
+function mcpConfigSource(scope: AcpMcpScope, filePath: string): SourceMeta {
+	return {
+		provider: "mcp-json",
+		providerName: scope === "project" ? "Project MCP config" : "User MCP config",
+		path: filePath,
+		level: scope,
+	};
+}
+
+type ConfiguredMcpServer = {
+	name: string;
+	config: MCPServerConfig;
+	scope: AcpMcpScope;
+	source: SourceMeta;
+};
+
 interface ParsedMcpAddArgs {
 	name?: string;
 	scope: AcpMcpScope;
+	scopeExplicit?: boolean;
 	url?: string;
 	transport: "http" | "sse";
 	authToken?: string;
@@ -47,6 +65,7 @@ const MCP_ADD_OPTION_PARSERS = new Map<string, McpAddOptionParser>([
 		(parsed, value) => {
 			if (!value || (value !== "project" && value !== "user")) return "Invalid --scope value. Use project or user.";
 			parsed.scope = value;
+			parsed.scopeExplicit = true;
 			return undefined;
 		},
 	],
@@ -76,22 +95,34 @@ const MCP_ADD_OPTION_PARSERS = new Map<string, McpAddOptionParser>([
 	],
 ]);
 
-async function getMcpConfiguredServers(
-	cwd: string,
-): Promise<Array<{ name: string; config: MCPServerConfig; scope: AcpMcpScope }>> {
+async function getMcpConfiguredServers(cwd: string, includeProjectConfig: boolean): Promise<ConfiguredMcpServer[]> {
 	const userPath = getMCPConfigPath("user", cwd);
 	const projectPath = getMCPConfigPath("project", cwd);
 	const [userConfig, projectConfig] = await Promise.all([readMCPConfigFile(userPath), readMCPConfigFile(projectPath)]);
-	const servers: Array<{ name: string; config: MCPServerConfig; scope: AcpMcpScope }> = [];
+	const servers: ConfiguredMcpServer[] = [];
 	const seen = new Set<string>();
-	for (const [name, config] of Object.entries(projectConfig.mcpServers ?? {})) {
-		if (config.enabled !== false) {
-			servers.push({ name, config, scope: "project" });
-			seen.add(name);
+	if (includeProjectConfig) {
+		for (const [name, config] of Object.entries(projectConfig.mcpServers ?? {})) {
+			if (config.enabled !== false) {
+				servers.push({
+					name,
+					config,
+					scope: "project",
+					source: mcpConfigSource("project", projectPath),
+				});
+				seen.add(name);
+			}
 		}
 	}
 	for (const [name, config] of Object.entries(userConfig.mcpServers ?? {})) {
-		if (!seen.has(name) && config.enabled !== false) servers.push({ name, config, scope: "user" });
+		if (!seen.has(name) && config.enabled !== false) {
+			servers.push({
+				name,
+				config,
+				scope: "user",
+				source: mcpConfigSource("user", userPath),
+			});
+		}
 	}
 	return servers;
 }
@@ -108,6 +139,7 @@ function validateParsedMcpAddArgs(parsed: ParsedMcpAddArgs): ParsedMcpAddArgs {
 	if (!parsed.name) return { ...parsed, error: "Server name required. Usage: /mcp add <name> ..." };
 	if (hasCommand && hasUrl) return { ...parsed, error: "Use either --url or -- <command...>, not both." };
 	if (parsed.authToken && !hasUrl) return { ...parsed, error: "--token requires --url (HTTP/SSE transport)." };
+	if (parsed.authToken && !parsed.scopeExplicit) return { ...parsed, scope: "user" };
 	return parsed;
 }
 
@@ -199,6 +231,7 @@ async function withPreparedMcpConnection<T>(
 	runtime: SlashCommandRuntime,
 	name: string,
 	config: MCPServerConfig,
+	source: SourceMeta,
 	fn: (connection: MCPServerConnection) => Promise<T>,
 ): Promise<T> {
 	let connection: MCPServerConnection | undefined;
@@ -209,7 +242,7 @@ async function withPreparedMcpConnection<T>(
 		// Without this, `/mcp test|resources|prompts` silently fails for any
 		// server saved by the TUI/reauth path.
 		manager.setAuthStorage(runtime.session.modelRegistry.authStorage);
-		const resolvedConfig = await manager.prepareConfig(config);
+		const resolvedConfig = await manager.prepareConfig(config, source);
 		connection = await connectToServer(name, resolvedConfig);
 		return await fn(connection);
 	} finally {
@@ -231,13 +264,13 @@ async function collectConnectedMcpLines(
 	runtime: SlashCommandRuntime,
 	collect: (serverName: string, connection: MCPServerConnection) => Promise<string[]>,
 ): Promise<string[] | undefined> {
-	const servers = await getMcpConfiguredServers(runtime.cwd);
+	const servers = await getMcpConfiguredServers(runtime.cwd, runtime.settings.get("mcp.enableProjectConfig"));
 	if (servers.length === 0) return undefined;
 
 	const lines: string[] = [];
-	for (const { name, config } of servers) {
+	for (const { name, config, source } of servers) {
 		try {
-			const collected = await withPreparedMcpConnection(runtime, name, config, connection =>
+			const collected = await withPreparedMcpConnection(runtime, name, config, source, connection =>
 				collect(name, connection),
 			);
 			lines.push(...collected);
@@ -277,12 +310,12 @@ async function handlePromptsCommand(runtime: SlashCommandRuntime): Promise<Slash
 async function handleTestCommand(rest: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	const name = rest.split(/\s+/)[0]?.trim() ?? "";
 	if (!name) return usage("Usage: /mcp test <name>", runtime);
-	const servers = await getMcpConfiguredServers(runtime.cwd);
+	const servers = await getMcpConfiguredServers(runtime.cwd, runtime.settings.get("mcp.enableProjectConfig"));
 	const server = servers.find(item => item.name === name);
 	if (!server) return usage(`Server "${name}" not found. Run /mcp list to see configured servers.`, runtime);
 
 	try {
-		return await withPreparedMcpConnection(runtime, name, server.config, async connection => {
+		return await withPreparedMcpConnection(runtime, name, server.config, server.source, async connection => {
 			const tools = await listTools(connection);
 			const lines = [`Server "${name}" connected (${tools.length} tools).`];
 			for (const tool of tools) lines.push(`  - ${tool.name}`);

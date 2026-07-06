@@ -118,6 +118,10 @@ export function sortMCPToolsByName<T extends { name: string }>(tools: T[]): T[] 
 	return tools;
 }
 
+function canResolveConfigValuesFromSource(source: SourceMeta | undefined): boolean {
+	return source?.level !== "project";
+}
+
 export function resolveSubscriptionPostAction(
 	notificationsEnabled: boolean,
 	currentEpoch: number,
@@ -141,13 +145,13 @@ export interface MCPLoadResult {
 
 /** Options for discovering and connecting to MCP servers */
 export interface MCPDiscoverOptions {
-	/** Whether to load project-level config (default: true) */
+	/** Whether to load project-level config (default: false) */
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
-	/** Only connect servers with autoload !== false (default: false) */
+	/** Only connect servers with autoload !== false (default: true) */
 	autoloadOnly?: boolean;
 	/** Called when starting to connect to servers */
 	onConnecting?: (serverNames: string[]) => void;
@@ -404,7 +408,7 @@ export class MCPManager {
 			this.#pendingConnectionControllers.set(name, connectionAbort);
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			const connectionPromise = (async () => {
-				const resolvedConfig = await this.#resolveAuthConfig(config);
+				const resolvedConfig = await this.#resolveAuthConfig(config, false, sources[name]);
 				return connectToServer(name, resolvedConfig, {
 					signal: connectionAbort.signal,
 					onNotification: (method, params) => {
@@ -442,7 +446,7 @@ export class MCPManager {
 					// Wire auth refresh for HTTP transports so 401s trigger token refresh.
 					if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
 						connection.transport.onAuthError = async () => {
-							const refreshed = await this.#resolveAuthConfig(config, true);
+							const refreshed = await this.#resolveAuthConfig(config, true, sources[name]);
 							if (refreshed.type === "http" || refreshed.type === "sse") {
 								return refreshed.headers ?? null;
 							}
@@ -747,8 +751,8 @@ export class MCPManager {
 	/**
 	 * Resolve auth and shell-command substitutions in config before connecting.
 	 */
-	async prepareConfig(config: MCPServerConfig): Promise<MCPServerConfig> {
-		return this.#resolveAuthConfig(config);
+	async prepareConfig(config: MCPServerConfig, source?: SourceMeta): Promise<MCPServerConfig> {
+		return this.#resolveAuthConfig(config, false, source);
 	}
 
 	/**
@@ -947,7 +951,7 @@ export class MCPManager {
 		globalEpoch: number,
 		disconnectEpoch: number,
 	): Promise<MCPServerConnection> {
-		const resolvedConfig = await this.#resolveAuthConfig(config);
+		const resolvedConfig = await this.#resolveAuthConfig(config, false, source);
 		const connectionAbort = new AbortController();
 		this.#pendingConnectionControllers.set(name, connectionAbort);
 		let connection: MCPServerConnection;
@@ -986,7 +990,7 @@ export class MCPManager {
 		// Wire auth refresh for HTTP transports, and reconnect for any transport.
 		if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
 			connection.transport.onAuthError = async () => {
-				const refreshed = await this.#resolveAuthConfig(config, true);
+				const refreshed = await this.#resolveAuthConfig(config, true, source);
 				if (refreshed.type === "http" || refreshed.type === "sse") {
 					return refreshed.headers ?? null;
 				}
@@ -1217,6 +1221,7 @@ export class MCPManager {
 	getServerInstructions(): Map<string, string> {
 		const instructions = new Map<string, string>();
 		for (const [name, connection] of this.#connections) {
+			if (connection._source?.level === "project") continue;
 			if (connection.instructions) {
 				instructions.set(name, connection.instructions);
 			}
@@ -1235,13 +1240,18 @@ export class MCPManager {
 	}
 
 	/**
-	 * Resolve OAuth credentials and shell commands in config.
+	 * Resolve OAuth credentials and shell/env references for trusted non-project configs.
 	 */
-	async #resolveAuthConfig(config: MCPServerConfig, forceRefresh = false): Promise<MCPServerConfig> {
+	async #resolveAuthConfig(
+		config: MCPServerConfig,
+		forceRefresh = false,
+		source?: SourceMeta,
+	): Promise<MCPServerConfig> {
 		let resolved: MCPServerConfig = { ...config };
+		const allowTrustedSecretResolution = canResolveConfigValuesFromSource(source);
 
 		const auth = config.auth;
-		if (auth?.type === "oauth" && auth.credentialId && this.#authStorage) {
+		if (allowTrustedSecretResolution && auth?.type === "oauth" && auth.credentialId && this.#authStorage) {
 			const credentialId = auth.credentialId;
 			try {
 				let credential = this.#authStorage.get(credentialId);
@@ -1293,6 +1303,9 @@ export class MCPManager {
 			}
 		}
 
+		if (!allowTrustedSecretResolution) {
+			return resolved;
+		}
 		if (resolved.type !== "http" && resolved.type !== "sse") {
 			if (resolved.env) {
 				const nextEnv: Record<string, string> = {};

@@ -109,15 +109,18 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				_source: source,
 			};
 
-			// Expand environment variables
-			if (server.command) server.command = expandEnvVarsDeep(server.command);
-			if (server.args) server.args = expandEnvVarsDeep(server.args);
-			if (server.env) server.env = expandEnvVarsDeep(server.env);
-			if (server.cwd) server.cwd = expandEnvVarsDeep(server.cwd);
-			if (server.url) server.url = expandEnvVarsDeep(server.url);
-			if (server.headers) server.headers = expandEnvVarsDeep(server.headers);
-			if (server.auth) server.auth = expandEnvVarsDeep(server.auth);
-			if (server.oauth) server.oauth = expandEnvVarsDeep(server.oauth);
+			if (source.level !== "project") {
+				// Project MCP configs are untrusted input. Preserve ${VAR} literally so
+				// manager/transport source-trust gates can prevent host-secret flow.
+				if (server.command) server.command = expandEnvVarsDeep(server.command);
+				if (server.args) server.args = expandEnvVarsDeep(server.args);
+				if (server.env) server.env = expandEnvVarsDeep(server.env);
+				if (server.cwd) server.cwd = expandEnvVarsDeep(server.cwd);
+				if (server.url) server.url = expandEnvVarsDeep(server.url);
+				if (server.headers) server.headers = expandEnvVarsDeep(server.headers);
+				if (server.auth) server.auth = expandEnvVarsDeep(server.auth);
+				if (server.oauth) server.oauth = expandEnvVarsDeep(server.oauth);
+			}
 			servers.push(server);
 		}
 	}

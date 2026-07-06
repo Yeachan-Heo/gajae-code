@@ -28,13 +28,13 @@ export interface MCPToolsLoadResult {
 export interface MCPToolsLoadOptions {
 	/** Called when starting to connect to servers */
 	onConnecting?: (serverNames: string[]) => void;
-	/** Whether to load project-level config (default: true) */
+	/** Whether to load project-level config (default: false) */
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
-	/** Only connect servers with autoload !== false (default: false) */
+	/** Only connect servers with autoload !== false (default: true) */
 	autoloadOnly?: boolean;
 	/** SQLite storage for MCP tool cache (null disables cache) */
 	cacheStorage?: AgentStorage | null;

@@ -14,13 +14,13 @@ import type { MCPServerConfig } from "./types";
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
-	/** Whether to load project-level config (default: true) */
+	/** Whether to load project-level config (default: false) */
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
-	/** Only include servers eligible for startup connection, i.e. autoload !== false (default: false) */
+	/** Only include servers eligible for startup connection, i.e. autoload !== false (default: true) */
 	autoloadOnly?: boolean;
 }
 
@@ -54,6 +54,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 			type: "stdio" as const,
 			command: server.command ?? "",
 		};
+		if (server._source.level === "project") config.noInheritEnv = true;
 		if (server.args) config.args = server.args;
 		if (server.env) config.env = server.env;
 		if (server.cwd) config.cwd = server.cwd;
@@ -96,10 +97,10 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
  * @param options Load options
  */
 export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOptions): Promise<LoadMCPConfigsResult> {
-	const enableProjectConfig = options?.enableProjectConfig ?? true;
+	const enableProjectConfig = options?.enableProjectConfig ?? false;
 	const filterExa = options?.filterExa ?? true;
 	const filterBrowser = options?.filterBrowser ?? false;
-	const autoloadOnly = options?.autoloadOnly ?? false;
+	const autoloadOnly = options?.autoloadOnly ?? true;
 
 	// Load MCP servers via capability system
 	const result = await loadCapability<MCPServer>(mcpCapability.id, { cwd });
