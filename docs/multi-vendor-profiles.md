@@ -86,12 +86,12 @@ The profiles above assume an **authoring** stance: `executor` is the lead and `a
 A verified use is the cross-session final review gate: the authoring session launches a fresh, stateless reviewer sub-session so the finished diff is judged without the authoring context:
 
 ```sh
-# verdict author must be cross-family vs the authoring default/executor;
-# for Claude-authored work override the profile default explicitly (explicit --model wins over the profile):
-gjc --mpreset reviewer --model openai-codex/gpt-5.5:high -p --no-session --tools read,search,find "<review prompt: diff + spec paths, severity findings, final line VERDICT: APPROVE|REQUEST_CHANGES>"
+# the one-shot gate needs only a cross-family --model; add --mpreset reviewer as an
+# optional enhancement AFTER installing this profile in ~/.gjc/agent/models.yml:
+gjc -p --no-session --model openai-codex/gpt-5.5:high --tools read,search,find "<review prompt: diff + spec paths, severity findings, final line VERDICT: APPROVE|REQUEST_CHANGES>"
 ```
 
-The `--tools` allowlist is part of the contract: it enforces the reviewer's read-only boundary at the tool surface instead of trusting the prompt. Note that in this one-shot form the session's `default` model authors the verdict — the tool-restricted print session cannot delegate to the profile's `critic`/`architect` roles — so the profile serves the interactive review-session case, and the explicit `--model` override carries cross-family provenance in the one-shot gate. Profile names in this document live in the user namespace — a user profile overrides a builtin preset only on an exact name match, and a future builtin with the same name would be silently shadowed by your copy.
+The `--tools` allowlist is part of the contract: it enforces the reviewer's read-only boundary at the tool surface instead of trusting the prompt. In this one-shot form the session's `default` model authors the verdict — a tool-restricted print session cannot delegate to the profile's `critic`/`architect` roles — so the explicit cross-family `--model` carries provenance, and the `reviewer` profile itself serves the interactive review-session case (activate it with `--mpreset reviewer` only after copying it into `models.yml`; otherwise activation fails with an unknown-profile error). Profile names in this document live in the user namespace — a user profile overrides a builtin preset only on an exact name match, and a future builtin with the same name would be silently shadowed by your copy.
 
 See [Extragoal local skill template](./extragoal-skill-template.md) for the full gate workflow (verdict contract, findings triage, bounded re-sign loop, secret-scan and injection guards) built on this recipe.
 

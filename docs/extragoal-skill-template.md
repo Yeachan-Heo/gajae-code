@@ -116,18 +116,18 @@ Merge only when the latest verdict is `APPROVE` **and** every finding is either 
 
 ### Default — headless cross-session GJC
 
-Run a fresh, stateless GJC session with the tool surface restricted to read-only inspection. **The one-shot session's `default` model authors the verdict**: the tool-restricted print session never delegates to the profile's `critic`/`architect` roles (`task` is deliberately absent from the allowlist), so the profile's role mapping does not provide cross-family provenance by itself. Pick the verdict author cross-family versus the authoring `default`/`executor` with an explicit `--model` override — the CLI guarantees explicit `--model` wins over any activated profile:
+Run a fresh, stateless GJC session with the tool surface restricted to read-only inspection. **The one-shot session's `default` model authors the verdict**: a tool-restricted print session never delegates to profile `critic`/`architect` roles (`task` is deliberately absent from the allowlist), so the only model selection the gate needs is an explicit cross-family `--model` — pick the verdict author from a family **different from the authoring `default`/`executor`**:
 
 ```sh
 # Claude-authored work (the common case for the recommended authoring profiles):
-gjc --mpreset reviewer --model openai-codex/gpt-5.5:high -p --no-session --tools read,search,find "<review prompt with bundle paths + verdict contract>"
+gjc -p --no-session --model openai-codex/gpt-5.5:high --tools read,search,find "<review prompt with bundle paths + verdict contract>"
 ```
 
-When the authoring session ran on a non-Anthropic family, the `reviewer` profile default (`anthropic/claude-opus-4-8`) is already cross-family and the `--model` override may be dropped. The `--mpreset reviewer` activation remains useful for interactive review sessions where roles do get delegated (see [Cross-vendor role-based profiles](./multi-vendor-profiles.md)).
+Adding `--mpreset reviewer` on top is an **optional enhancement**, not a prerequisite: the `reviewer` profile is user-installed `models.yml` config from [Cross-vendor role-based profiles](./multi-vendor-profiles.md), and `gjc --mpreset reviewer` fails with an unknown-profile error when that profile has not been copied in. The profile's role mapping matters for interactive review sessions where roles do get delegated — the one-shot gate works without it.
 
 Read-only is enforced by the `--tools` allowlist, not by the prompt — a reviewer invocation without a tool allowlist does not satisfy the leaf contract. The sub-session shares no conversation state with the authoring session and may inspect the repo read-only when the diff alone is not self-contained.
 
-The `reviewer` profile requires `anthropic` + `openai-codex` + `google-antigravity` credentials and hard-blocks activation with fewer. With fewer vendors, drop `--mpreset` entirely and run the sub-session on any model from a family **different from the authoring `default`/`executor`** via `--model <selector>` — fresh context is preserved either way; cross-family provenance is always the operator-chosen verdict model, never an assumption.
+Cross-family provenance is always the operator-chosen verdict model, never an assumption: with fewer vendors, pick whatever strong selector your credentials allow from a family other than the authoring one.
 
 ### Custom — user-provided external reviewer command
 
