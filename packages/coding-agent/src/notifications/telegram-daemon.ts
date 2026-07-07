@@ -1408,20 +1408,21 @@ export class TelegramNotificationDaemon {
 					// dead, token-bearing record forever. But a hard-killed session
 					// (SIGKILL, crash, terminal pane close) never sends its graceful
 					// `session_closed` frame either, so without cleanup here its forum
-					// topic is orphaned forever. Reap it: delete the topic for stale
-					// records and for dead local (loopback) endpoints, then unlink the
-					// dead endpoint file once its topic record is cleared - a failed
-					// delete keeps the record and is retried on the next scan. Remote
-					// (non-loopback) endpoints are left untouched because a local pid
-					// check is meaningless for them.
+					// topic is orphaned forever. Reap it: for LOCAL (loopback)
+					// endpoints only, delete the topic of a stale or dead-pid record,
+					// then unlink the dead endpoint file once its topic record is
+					// cleared - a failed delete keeps the record and is retried on the
+					// next scan. Remote (non-loopback) endpoints are never reaped,
+					// whether stale or dead-pid: a local pid check is meaningless for
+					// them and their lifecycle belongs to the remote host.
 					const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
 					const gone = endpoint.pid !== undefined && !pidAlive(endpoint.pid);
 					if (endpoint.stale || gone) {
-						const loopback = isLoopbackEndpointUrl(endpoint.url);
-						if ((endpoint.stale || (gone && loopback)) && this.topics.get(sessionId)) {
+						const local = isLoopbackEndpointUrl(endpoint.url);
+						if (local && this.topics.get(sessionId)) {
 							await this.deleteTopic(sessionId).catch(() => undefined);
 						}
-						if (gone && loopback && !this.topics.get(sessionId)) {
+						if (local && gone && !this.topics.get(sessionId)) {
 							await this.fsImpl.unlink(path.join(dir, file)).catch(() => undefined);
 						}
 						continue;

@@ -2735,15 +2735,16 @@ test("scanRoots connects only live endpoints (skips stale + dead-PID records)", 
 	expect(FakeWs.instances.every(ws => ws.url.startsWith("ws://live"))).toBe(true);
 });
 
-test("scanRoots reaps the orphaned topic of a dead local endpoint and leaves remote endpoints alone", async () => {
+test("scanRoots reaps the orphaned topic of a dead local endpoint and never touches remote endpoints", async () => {
 	FakeWs.instances = [];
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
 	await registerNotificationRoot({ settings: s, cwd, sessionId: "gone" });
 	await registerNotificationRoot({ settings: s, cwd, sessionId: "remote" });
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "stale-remote" });
 	const bot = new FakeBotApi();
-	// Seed persisted topic records for both sessions through a first daemon.
+	// Seed persisted topic records for all sessions through a first daemon.
 	const firstDaemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
@@ -2751,7 +2752,7 @@ test("scanRoots reaps the orphaned topic of a dead local endpoint and leaves rem
 		chatId: "42",
 		botApi: bot,
 	});
-	for (const sessionId of ["gone", "remote"]) {
+	for (const sessionId of ["gone", "remote", "stale-remote"]) {
 		const live = { sessionId, token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
 		await firstDaemon.handleSessionMessage(live as any, {
 			type: "identity_header",
@@ -2763,8 +2764,9 @@ test("scanRoots reaps the orphaned topic of a dead local endpoint and leaves rem
 	const createIdx = bot.calls.findIndex(c => c.method === "createForumTopic" && c.body.name === "r/gone");
 	expect(createIdx).toBeGreaterThanOrEqual(0);
 	const goneThreadId = createIdx + 1;
-	// Both sessions died WITHOUT a graceful session_closed (SIGKILL / pane close):
-	// their endpoint files remain with dead pids. Only the loopback one is ours.
+	// All sessions died WITHOUT a graceful session_closed (SIGKILL / pane close):
+	// their endpoint files remain. Only the loopback one is owned by this host;
+	// the remote records (dead-pid AND explicitly stale) must never be reaped.
 	const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
 	fs.mkdirSync(endpointDir, { recursive: true });
 	fs.writeFileSync(
@@ -2774,6 +2776,10 @@ test("scanRoots reaps the orphaned topic of a dead local endpoint and leaves rem
 	fs.writeFileSync(
 		path.join(endpointDir, "remote.json"),
 		JSON.stringify({ url: "ws://build-box:1", token: "t", pid: 999999 }),
+	);
+	fs.writeFileSync(
+		path.join(endpointDir, "stale-remote.json"),
+		JSON.stringify({ url: "ws://build-box:2", token: "t", pid: 4242, stale: true }),
 	);
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
@@ -2787,12 +2793,14 @@ test("scanRoots reaps the orphaned topic of a dead local endpoint and leaves rem
 	await daemon.loadTopics();
 	await daemon.scanRoots();
 	// The dead loopback endpoint's topic is deleted and its endpoint file is
-	// unlinked once the record is cleared; the remote endpoint keeps both.
+	// unlinked once the record is cleared; both remote endpoints (dead-pid and
+	// stale) keep their topic record and endpoint file.
 	const deletes = bot.calls.filter(c => c.method === "deleteForumTopic");
 	expect(deletes).toHaveLength(1);
 	expect(Number(deletes[0].body.message_thread_id)).toBe(goneThreadId);
 	expect(fs.existsSync(path.join(endpointDir, "gone.json"))).toBe(false);
 	expect(fs.existsSync(path.join(endpointDir, "remote.json"))).toBe(true);
+	expect(fs.existsSync(path.join(endpointDir, "stale-remote.json"))).toBe(true);
 	// Neither dead endpoint is connected.
 	expect(daemon.sessions.size).toBe(0);
 	expect(FakeWs.instances).toHaveLength(0);
