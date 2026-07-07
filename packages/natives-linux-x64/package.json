@@ -20,6 +20,9 @@
 	"cpu": [
 		"x64"
 	],
+	"libc": [
+		"glibc"
+	],
 	"files": [
 		"native",
 		"README.md"

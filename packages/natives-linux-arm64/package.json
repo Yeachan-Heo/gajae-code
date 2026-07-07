@@ -20,6 +20,9 @@
 	"cpu": [
 		"arm64"
 	],
+	"libc": [
+		"glibc"
+	],
 	"files": [
 		"native",
 		"README.md"
