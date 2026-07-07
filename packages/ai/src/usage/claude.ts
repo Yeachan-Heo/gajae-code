@@ -333,6 +333,9 @@ function buildUsageLimit(args: {
  * weekly limits (e.g. a "Claude Fable 5" weekly cap) that the legacy
  * seven_day_opus/seven_day_sonnet buckets no longer report. Each entry becomes
  * an `anthropic:7d:<model>` limit with the model display name as its tier.
+ * Fail-closed: an entry without a numeric percent AND a derivable model
+ * identity is ignored, so malformed scoped entries are never trusted as usage
+ * data (and never satisfy the hasUsageData gate).
  */
 function parseScopedWeeklyLimits(payload: ClaudeUsageResponse): UsageLimit[] {
 	const entries = Array.isArray(payload.limits) ? payload.limits : [];
@@ -347,10 +350,11 @@ function parseScopedWeeklyLimits(payload: ClaudeUsageResponse): UsageLimit[] {
 			model && typeof model.display_name === "string" && model.display_name.trim()
 				? model.display_name.trim()
 				: undefined;
-		const tier = displayName ? displayName.toLowerCase() : "scoped";
+		if (!displayName) continue;
+		const tier = displayName.toLowerCase();
 		const limit = buildUsageLimit({
 			id: `anthropic:7d:${tier}`,
-			label: displayName ? `Claude 7 Day (${displayName})` : "Claude 7 Day (scoped)",
+			label: `Claude 7 Day (${displayName})`,
 			windowId: "7d",
 			windowLabel: "7 Day",
 			durationMs: SEVEN_DAYS_MS,

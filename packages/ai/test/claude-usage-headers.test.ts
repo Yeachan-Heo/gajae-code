@@ -126,9 +126,13 @@ describe("claude usage request headers", () => {
 							resets_at: resetsAt,
 							scope: { model: { display_name: "Fable" } },
 						},
-						// Unknown kinds and malformed entries are ignored.
+						// Unknown kinds and malformed entries are ignored, including
+						// scoped entries whose model identity cannot be derived.
 						{ kind: "monthly_total", percent: 10 },
 						{ kind: "weekly_scoped" },
+						{ kind: "weekly_scoped", percent: 10 },
+						{ kind: "weekly_scoped", percent: 10, scope: { model: {} } },
+						{ kind: "weekly_scoped", percent: 10, scope: { model: { display_name: "   " } } },
 						"garbage",
 					],
 				}),
@@ -180,5 +184,30 @@ describe("claude usage request headers", () => {
 		);
 
 		expect(report?.limits.map(limit => limit.id)).toEqual(["anthropic:7d:fable"]);
+	});
+
+	it("rejects a modern payload whose weekly_scoped entries carry no model identity", async () => {
+		const fetchMock = (async () => {
+			return new Response(
+				JSON.stringify({
+					limits: [{ kind: "weekly_scoped", percent: 5 }],
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const report = await claudeUsageProvider.fetchUsage(
+			{
+				provider: "anthropic",
+				credential: {
+					type: "oauth",
+					accessToken: "oat-test-access-token",
+					expiresAt: Date.now() + 60_000,
+				},
+			},
+			{ fetch: fetchMock, retryWait: async () => {} },
+		);
+
+		expect(report).toBeNull();
 	});
 });
