@@ -98,6 +98,7 @@
     "generate-schemas": "bun scripts/generate-json-schemas.ts",
     "check:schemas": "bun scripts/generate-json-schemas.ts --check",
     "check:public-sync": "bun scripts/check-public-version-sync.ts",
+    "check:public-live-sync": "bun scripts/check-public-version-sync.ts --live",
     "generate-plugins": "bun scripts/generate-gjc-plugins.ts",
     "check:plugins": "bun scripts/generate-gjc-plugins.ts --check && bun scripts/verify-gjc-plugins.ts",
     "test:rs": "bun scripts/run-rs-task.ts test:rs",
