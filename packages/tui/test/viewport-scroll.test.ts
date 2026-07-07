@@ -126,6 +126,51 @@ describe("TUI manual viewport paging", () => {
 		}
 	});
 
+	it("keeps Windows Terminal pinned when a normal assistant answer starts before status/editor", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const chat = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		const working = new Lines(["thinking"]);
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(chat);
+		tui.addChild(working);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		const previousWtSession = Bun.env.WT_SESSION;
+		Bun.env.WT_SESSION = "test-windows-terminal-session";
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-9", "line-10", "line-11", "thinking", "status", "editor"]);
+			term.clearWriteLog();
+
+			chat.append("assistant-0");
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-10", "line-11", "assistant-0", "thinking", "status", "editor"]);
+			expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
+
+			term.clearWriteLog();
+			chat.setLine(12, "assistant-0 token");
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-10", "line-11", "assistant-0 token", "thinking", "status", "editor"]);
+			expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
+		} finally {
+			tui.stop();
+			if (previousWtSession === undefined) {
+				delete Bun.env.WT_SESSION;
+			} else {
+				Bun.env.WT_SESSION = previousWtSession;
+			}
+		}
+	});
+
 	it("keeps Windows Terminal live output pinned when offscreen lines change during streaming", async () => {
 		const term = new VirtualTerminal(30, 5);
 		const tui = new TUI(term);
