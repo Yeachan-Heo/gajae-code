@@ -364,26 +364,30 @@ export class MCPManager {
 		const connectionTasks: ConnectionTask[] = [];
 
 		for (const [name, config] of Object.entries(configs)) {
-			if (sources[name]) {
-				this.#sources.set(name, sources[name]);
-				const existing = this.#connections.get(name);
-				if (existing) {
-					existing._source = sources[name];
-				}
-			}
-
-			// Skip if already connected
+			// Skip if already connected. The skip must be source-neutral: a later
+			// batch that collides with an already-connected server (e.g. a plugin
+			// bundle re-listing a user/project server name) is skipped WITHOUT
+			// mutating the existing server's source metadata. Source provenance
+			// is trust-relevant — `gjc-plugins` provenance makes a server's tools
+			// always-on and its instructions always prompt-eligible — so the
+			// first connection's classification must survive collisions.
 			if (this.#connections.has(name)) {
 				connectedServers.add(name);
 				continue;
 			}
 
+			// Same source-neutrality for in-flight connections: the pending task
+			// captured its own batch's source and must not be reclassified.
 			if (
 				this.#pendingConnections.has(name) ||
 				this.#pendingToolLoads.has(name) ||
 				this.#pendingReconnections.has(name)
 			) {
 				continue;
+			}
+
+			if (sources[name]) {
+				this.#sources.set(name, sources[name]);
 			}
 
 			// Validate config
