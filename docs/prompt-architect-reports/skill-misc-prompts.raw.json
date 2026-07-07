@@ -1,7 +1,7 @@
 {
   "status": "errored_context_recovered",
   "agent_id": "3-SkillMiscPrompts",
-  "session_file": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-prompt-opt-80f48d38/2026-07-07T00-55-37-253Z_019f3a12-c825-7000-a216-6742b406b69a/3-SkillMiscPrompts.jsonl",
+  "session_file": "<local-gjc-session-jsonl-redacted>",
   "tool_calls": 82,
   "report_finding_count": 0,
   "yield_count": 0,

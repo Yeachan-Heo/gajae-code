@@ -1,6 +1,6 @@
 # Recovered context: 3-SkillMiscPrompts
 
-- Session file: `/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-prompt-opt-80f48d38/2026-07-07T00-55-37-253Z_019f3a12-c825-7000-a216-6742b406b69a/3-SkillMiscPrompts.jsonl`
+- Session file: `<local-gjc-session-jsonl-redacted>`
 - JSONL records inspected: yes
 - Tool calls: 82
 - Recorded findings recovered from `report_finding`: 0
