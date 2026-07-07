@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { evaluateDefaultReduction } from "../src/default-reduction-gate";
 import { APPLIED_DEFAULT_REDUCTIONS, HELD_DEFAULT_REDUCTIONS } from "../src/default-reductions.ledger";
+import { LIVE_DEFAULT_CANDIDATE_FIXTURE_PAIRS } from "../src/live-runner";
 
 const EXPECTED_APPLIED_REDUCTIONS = [
 	{
@@ -127,6 +128,13 @@ describe("default reduction evidence ledger", () => {
 			expect(entry.requiresLiveEvidenceVia).toBe("pr9-live-runner");
 			expect(entry.reason).toContain("HELD/BLOCKED");
 			expect(entry.reason).toContain("PR9 live before/after runner evidence is required");
+		}
+	});
+
+	test("keeps held reductions backed by PR9 live fixture pairs", () => {
+		const candidatePairs = new Set(LIVE_DEFAULT_CANDIDATE_FIXTURE_PAIRS.map(pair => pair.candidate));
+		for (const entry of HELD_DEFAULT_REDUCTIONS) {
+			expect(candidatePairs.has(entry.candidate.name), entry.candidate.name).toBe(true);
 		}
 	});
 });

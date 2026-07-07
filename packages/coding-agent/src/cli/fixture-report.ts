@@ -8,6 +8,27 @@ import type { TaskTokenLog } from "../task/types";
 const LIVE_RUNNER_SCHEMA_VERSION = 1;
 const BINARY_ID = "gjc";
 
+function deterministicLog(
+	input: number,
+	output: number,
+	cacheRead: number,
+	cacheWrite: number,
+	totalTokens: number,
+): TaskTokenLog {
+	return {
+		subagentId: "root",
+		agent: "main",
+		turn: 1,
+		at: "2026-01-01T00:00:00.000Z",
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		totalTokens,
+		model: "fixture-model",
+	};
+}
+
 export interface LiveRunReportShape {
 	schemaVersion: 1;
 	binaryId: string;
@@ -53,6 +74,22 @@ const DETERMINISTIC_FIXTURES: Record<string, readonly TaskTokenLog[]> = {
 			model: "fixture-model",
 		},
 	],
+};
+const DEFAULT_REDUCTION_FIXTURE_LOGS: Record<string, readonly TaskTokenLog[]> = {
+	"pr9.task-recursion.before": [deterministicLog(2400, 420, 600, 200, 3620)],
+	"pr9.task-recursion.after": [deterministicLog(1800, 360, 450, 150, 2760)],
+	"pr9.output-caps.before": [deterministicLog(22_000, 3_200, 0, 0, 25_200)],
+	"pr9.output-caps.after": [deterministicLog(18_000, 2_400, 0, 0, 20_400)],
+	"pr9.max-inline-result-bytes.before": [deterministicLog(48_000, 2_000, 0, 0, 50_000)],
+	"pr9.max-inline-result-bytes.after": [deterministicLog(12_000, 1_600, 0, 0, 13_600)],
+	"pr9.read-artifact-spill-threshold.before": [deterministicLog(96_000, 2_500, 0, 0, 98_500)],
+	"pr9.read-artifact-spill-threshold.after": [deterministicLog(18_000, 2_100, 0, 0, 20_100)],
+	"pr9.maintenance-pruning.before": [deterministicLog(40_000, 2_000, 18_000, 6_000, 66_000)],
+	"pr9.maintenance-pruning.after": [deterministicLog(30_000, 1_800, 10_000, 3_000, 44_800)],
+	"pr9.append-only-provider-expansion.before": [deterministicLog(28_000, 1_700, 8_000, 2_500, 40_200)],
+	"pr9.append-only-provider-expansion.after": [deterministicLog(20_000, 1_700, 14_000, 2_500, 38_200)],
+	"pr9.rpc-compact-deltas.before": [deterministicLog(14_000, 1_200, 6_000, 1_500, 22_700)],
+	"pr9.rpc-compact-deltas.after": [deterministicLog(10_000, 900, 6_200, 1_500, 18_600)],
 };
 
 export function buildFixtureReport(fixtureId: string, logs: readonly TaskTokenLog[]): LiveRunReportShape {
@@ -103,7 +140,7 @@ type ResolvedFixtureLogs =
 	| { readonly kind: "unknown" };
 
 async function resolveFixtureLogs(fixtureId: string): Promise<ResolvedFixtureLogs> {
-	const deterministic = DETERMINISTIC_FIXTURES[fixtureId];
+	const deterministic = DETERMINISTIC_FIXTURES[fixtureId] ?? DEFAULT_REDUCTION_FIXTURE_LOGS[fixtureId];
 	if (deterministic) return { kind: "logs", logs: deterministic };
 	let session: GjcSessionContext;
 	try {

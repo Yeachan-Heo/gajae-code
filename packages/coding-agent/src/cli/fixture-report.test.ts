@@ -153,6 +153,33 @@ describe("runFixtureReport CLI degradation", () => {
 		});
 	});
 
+	it("reads only the requested session token-log directory", async () => {
+		await withTempCwd(async () => {
+			const firstSession = "fixture-session-a";
+			const secondSession = "fixture-session-b";
+			await writeTokenLog(firstSession, { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110 });
+			await writeTokenLog(secondSession, { input: 900, output: 90, cacheRead: 0, cacheWrite: 0, totalTokens: 990 });
+
+			const { stdout, exitCode } = await captureRun(firstSession);
+			const report = JSON.parse(stdout) as LiveRunReportShape;
+
+			expect(exitCode).toBe(0);
+			expect(report.fixtureId).toBe(firstSession);
+			expect(report.totals.totalTokens).toBe(110);
+		});
+	});
+
+	it("emits deterministic PR9 default-candidate fixture reports", async () => {
+		await withTempCwd(async () => {
+			const { stdout, exitCode } = await captureRun("pr9.read-artifact-spill-threshold.after");
+			const report = JSON.parse(stdout) as LiveRunReportShape;
+
+			expect(exitCode).toBe(0);
+			expectParseReportCompatible(report, "pr9.read-artifact-spill-threshold.after");
+			expect(report.totals.totalTokens).toBe(20_100);
+		});
+	});
+
 	it("exits non-zero without emitting JSON for a corrupt token-log", async () => {
 		await withTempCwd(async () => {
 			const id = "corrupt-session";
@@ -180,4 +207,24 @@ async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 		process.chdir(originalCwd);
 		await rm(dir, { recursive: true, force: true });
 	}
+}
+
+async function writeTokenLog(
+	sessionId: string,
+	metrics: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number },
+): Promise<void> {
+	const dir = join(sessionRoot(process.cwd(), sessionId), "token-logs");
+	await mkdir(dir, { recursive: true });
+	await writeFile(
+		join(dir, "token-log.jsonl"),
+		`${JSON.stringify({
+			subagentId: "root",
+			agent: "main",
+			turn: 1,
+			at: "2026-01-01T00:00:00.000Z",
+			model: "fixture-model",
+			...metrics,
+		})}\n`,
+		"utf-8",
+	);
 }
