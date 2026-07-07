@@ -2025,6 +2025,7 @@ export class Editor implements Component, Focusable {
 		this.#resetKillSequence();
 
 		const result = this.#expandPasteMarkers(this.#state.lines.join("\n")).trim();
+		this.#cancelAutocomplete();
 
 		this.#state = { lines: [""], cursorLine: 0, cursorCol: 0 };
 		this.#bumpDocumentVersion();

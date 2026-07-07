@@ -319,6 +319,50 @@ describe("Editor component", () => {
 			await expect(promise).resolves.toBe("@");
 		});
 
+		it("ignores late non-slash autocomplete suggestions after submit resets the editor", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const { promise, resolve } = Promise.withResolvers<{
+				items: Array<{ label: string; value: string }>;
+				prefix: string;
+			} | null>();
+			const submissions: string[] = [];
+			const applied: string[] = [];
+
+			editor.onSubmit = text => {
+				submissions.push(text);
+			};
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					return promise;
+				},
+				applyCompletion(_lines, cursorLine, cursorCol, item, prefix) {
+					applied.push(`applied:${prefix}:${item.value}`);
+					return {
+						lines: [item.value],
+						cursorLine,
+						cursorCol,
+					};
+				},
+			});
+
+			editor.handleInput("#");
+			editor.handleInput("\r");
+
+			expect(submissions).toEqual(["#"]);
+			expect(editor.getText()).toBe("");
+
+			resolve({ prefix: "#", items: [{ label: "old", value: "old" }] });
+			await Bun.sleep(0);
+
+			expect(editor.isAutocompleteOpen()).toBe(false);
+			editor.disableSubmit = true;
+			editor.handleInput("\r");
+
+			expect(applied).toEqual([]);
+			expect(submissions).toEqual(["#"]);
+			expect(editor.getText()).toBe("");
+		});
+
 		it("chains into argument completions after tab-completing slash command names", async () => {
 			const editor = new Editor(defaultEditorTheme);
 			editor.setAutocompleteProvider(
