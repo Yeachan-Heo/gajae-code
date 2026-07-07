@@ -21,3 +21,8 @@ Returns JSON with:
 - `activated_tools` — tools activated by this search call
 - `match_count` — number of ranked matches returned by the search
 - `total_tools`
+
+Match details include:
+- `server_name` — MCP server name when the activated result is an MCP tool
+- `mcp_tool_name` — original MCP tool name when applicable
+- `schema_keys` — searchable input property names

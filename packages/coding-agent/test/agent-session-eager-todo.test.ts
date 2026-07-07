@@ -81,6 +81,11 @@ function getMessageText(message: AgentMessage): string {
 		.join("\n");
 }
 
+function isVolatileProjectContextMessage(message: AgentMessage): boolean {
+	const text = getMessageText(message);
+	return text.startsWith("<system-reminder>\n<workspace-tree>") && text.includes("current working directory");
+}
+
 describe("AgentSession eager todo enforcement", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
@@ -137,15 +142,16 @@ describe("AgentSession eager todo enforcement", () => {
 			getToolChoice: () => session?.nextToolChoice(),
 			streamFn: (_model, context, options) => {
 				streamCallCount++;
-				const lastMessage = context.messages.at(-1);
+				const visiblePromptMessages = context.messages.filter(message => !isVolatileProjectContextMessage(message));
+				const lastMessage = visiblePromptMessages.at(-1);
 				if (!lastMessage) {
 					throw new Error("Expected prompt context to include a message");
 				}
 				observedCalls.push({
 					toolChoice: getToolChoiceName(options?.toolChoice),
 					toolNames: (context.tools ?? []).map(tool => tool.name),
-					messageRoles: context.messages.map(message => message.role),
-					messageTexts: context.messages.map(message => getMessageText(message)),
+					messageRoles: visiblePromptMessages.map(message => message.role),
+					messageTexts: visiblePromptMessages.map(message => getMessageText(message)),
 					lastMessageRole: lastMessage.role,
 					lastMessageText: getMessageText(lastMessage),
 				});
