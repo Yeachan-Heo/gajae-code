@@ -3960,6 +3960,7 @@ async function attemptConfiguredMailboxTransport(
 			env,
 		});
 		if (!result) return null;
+		if (result.transport === "notifications_sdk" && result.state === "failed") return null;
 		return writeNotificationRecord(dir, {
 			...notification,
 			delivery_state: result.state,
@@ -4061,7 +4062,7 @@ export async function sendGjcTeamMessage(
 		notificationPath(dir, messageNotificationId(config.team_name, toWorker, written.message_id)),
 	);
 	const notification = await createMessageNotification(dir, config.team_name, written);
-	if (!existingNotification || isReplayEligibleNotification(existingNotification.delivery_state)) {
+	if (!existingNotification) {
 		await attemptPaneNotification(dir, config, notification, env, cwd);
 	}
 	await appendEvent(dir, {
