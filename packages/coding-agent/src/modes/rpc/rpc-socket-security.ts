@@ -9,6 +9,18 @@ export class RpcSocketSecurityError extends Error {
 	}
 }
 
+// The launch boundary in main.ts catches exactly this class to turn a
+// duplicate --listen into a clean stderr diagnostic + non-zero exit (issue 19).
+export class RpcListenRefusedError extends Error {
+	constructor(socketPath: string) {
+		super(
+			`RPC --listen refused: a live server is already listening on ${socketPath}. ` +
+				"Stop it first or choose a different --listen path.",
+		);
+		this.name = "RpcListenRefusedError";
+	}
+}
+
 const unsafeBits = 0o077;
 
 function currentUid(): number | undefined {
@@ -53,7 +65,7 @@ export async function prepareRpcSocketPath(socketPath: string): Promise<void> {
 	if (!existing.isSocket()) throw new RpcSocketSecurityError(`RPC socket path is not a socket: ${socketPath}`);
 	assertPrivateMode(existing.mode, socketPath);
 	if (await probeUnixSocketAlive(socketPath)) {
-		throw new RpcSocketSecurityError(`RPC socket path is live: ${socketPath}`);
+		throw new RpcListenRefusedError(socketPath);
 	}
 	await fs.unlink(socketPath);
 }

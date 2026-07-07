@@ -6,6 +6,7 @@ import * as path from "node:path";
 import {
 	assertSafeClientSocket,
 	prepareRpcSocketPath,
+	RpcListenRefusedError,
 	RpcSocketSecurityError,
 	verifyRpcSocketAfterListen,
 } from "@gajae-code/coding-agent/modes/rpc/rpc-socket-security";
@@ -63,6 +64,22 @@ describe("rpc socket security", () => {
 		});
 		try {
 			await expect(prepareRpcSocketPath(socketPath)).rejects.toThrow(/live/);
+			expect((await lstat(socketPath)).isSocket()).toBe(true);
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	test("live-socket refusal is an RpcListenRefusedError (the class the launch boundary catches, issue 19)", async () => {
+		const socketPath = path.join(dir, "duplicate-owner.sock");
+		const server = net.createServer();
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, resolve);
+		});
+		try {
+			await chmod(socketPath, 0o600);
+			await expect(prepareRpcSocketPath(socketPath)).rejects.toThrow(RpcListenRefusedError);
 			expect((await lstat(socketPath)).isSocket()).toBe(true);
 		} finally {
 			await new Promise<void>(resolve => server.close(() => resolve()));
