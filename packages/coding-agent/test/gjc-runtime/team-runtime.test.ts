@@ -21,6 +21,7 @@ import {
 	resolveGjcTeamWorkerCliPlan,
 	resolveGjcWorkerCommand,
 	sendGjcTeamMessage,
+	setGjcTeamMailboxDeliveryTransport,
 	setGjcTeamMailboxDeliveryTransportForTest,
 	shutdownGjcTeam,
 	startGjcTeam,
@@ -224,6 +225,7 @@ let resetMailboxTransport: (() => void) | undefined;
 afterEach(async () => {
 	resetMailboxTransport?.();
 	resetMailboxTransport = undefined;
+	setGjcTeamMailboxDeliveryTransport(undefined);
 	if (cleanupRoot) {
 		for (const session of [
 			"gjc-worktree-team",
@@ -2179,6 +2181,7 @@ describe("native gjc team runtime", () => {
 
 	it("routes team mailbox notifications through the configured transport seam", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const delivered: Array<{ teamName: string; messageId: string; body: string }> = [];
 		await startGjcTeam({
 			workerCount: 2,
 			agentType: "executor",
@@ -2187,16 +2190,15 @@ describe("native gjc team runtime", () => {
 			cwd: cleanupRoot,
 			dryRun: true,
 			env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
-		});
-		const delivered: Array<{ teamName: string; messageId: string; body: string }> = [];
-		resetMailboxTransport = setGjcTeamMailboxDeliveryTransportForTest({
-			async deliverMailboxMessage(input) {
-				delivered.push({
-					teamName: input.team_name,
-					messageId: input.message.message_id,
-					body: input.message.body,
-				});
-				return { transport: "notifications_sdk", state: "sent", reason: "test-sdk" };
+			mailboxDeliveryTransport: {
+				async deliverMailboxMessage(input) {
+					delivered.push({
+						teamName: input.team_name,
+						messageId: input.message.message_id,
+						body: input.message.body,
+					});
+					return { transport: "notifications_sdk", state: "sent", reason: "test-sdk" };
+				},
 			},
 		});
 

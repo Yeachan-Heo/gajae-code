@@ -239,14 +239,17 @@ export interface GjcTeamMailboxDeliveryTransport {
 
 let gjcTeamMailboxDeliveryTransport: GjcTeamMailboxDeliveryTransport | undefined;
 
-export function setGjcTeamMailboxDeliveryTransportForTest(
-	transport: GjcTeamMailboxDeliveryTransport | undefined,
-): () => void {
+export function setGjcTeamMailboxDeliveryTransport(transport: GjcTeamMailboxDeliveryTransport | undefined): () => void {
 	const previous = gjcTeamMailboxDeliveryTransport;
 	gjcTeamMailboxDeliveryTransport = transport;
 	return () => {
 		gjcTeamMailboxDeliveryTransport = previous;
 	};
+}
+export function setGjcTeamMailboxDeliveryTransportForTest(
+	transport: GjcTeamMailboxDeliveryTransport | undefined,
+): () => void {
+	return setGjcTeamMailboxDeliveryTransport(transport);
 }
 
 export interface GjcTeamNotificationSummary {
@@ -284,6 +287,7 @@ export interface GjcTeamStartOptions {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
 	dryRun?: boolean;
+	mailboxDeliveryTransport?: GjcTeamMailboxDeliveryTransport;
 }
 
 export interface GjcTeamApiClaimResult {
@@ -2973,6 +2977,7 @@ async function initializeStateDirs(dir: string, workers: GjcTeamWorker[]): Promi
 export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTeamSnapshot> {
 	const cwd = options.cwd ?? process.cwd();
 	const env = options.env ?? process.env;
+	if (options.mailboxDeliveryTransport) setGjcTeamMailboxDeliveryTransport(options.mailboxDeliveryTransport);
 	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
 	const workerCliPlan = resolveGjcTeamWorkerCliPlan(options.workerCount, env);
