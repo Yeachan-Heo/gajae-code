@@ -324,7 +324,10 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		try {
 			const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
 			expect(searchTool?.description).toContain("total_tools");
-			expect(searchTool?.description).toContain("- `server_name`");
+			// The description is augmented from the live discoverable-MCP catalog:
+			// the single github server set up above is summarized with its tool count.
+			expect(searchTool?.description).toContain("Discoverable MCP servers in this session: github");
+			expect(searchTool?.description).toContain("Total discoverable tools available: 1.");
 		} finally {
 			await session.dispose();
 		}
