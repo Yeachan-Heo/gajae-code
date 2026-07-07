@@ -35,16 +35,20 @@ describe("GJC utility extensibility quarantine", () => {
 			"plan",
 			"share",
 			"todo",
-			"changelog",
 			"branch",
 			"fork",
 			"handoff",
 			"force",
+			// `quit` stays a non-standalone command: `/quit` is a TUI alias of
+			// `/exit`, verified in slash-command-builtin-registry.test.ts.
 			"quit",
 			"loop",
 		]) {
 			expect(registry).not.toContain(`name: "${removedCommand}"`);
 		}
+		// `/changelog` was restored as a first-class built-in (see CHANGELOG
+		// Unreleased), so it is intentionally no longer in the removed set above.
+		expect(registry).toContain(`name: "changelog"`);
 		expect(registry).toContain(`name: "ssh"`);
 		expect(registry).toContain(`name: "provider"`);
 		expect(await Bun.file(srcPath("slash-commands", "helpers", "marketplace-manager.ts")).exists()).toBe(false);
