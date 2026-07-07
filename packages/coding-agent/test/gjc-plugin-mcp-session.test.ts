@@ -184,4 +184,81 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		await parent.session.dispose();
 		expect(parentManager?.getConnectedServers()).toEqual([]);
 	}, 30_000);
+
+	test("shared manager keeps user-config and plugin-bundle tools across refresh", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-combined-"));
+		tempDirs.push(cwd);
+		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+
+		// Autoload user/project-config server exposing a "usersearch" tool. It
+		// connects into the same owned manager as the always-on plugin server.
+		const userServerScript = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'userdocs', version: '1' } } }) + '\\n');
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'usersearch', description: 'user tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+		fs.writeFileSync(
+			path.join(cwd, ".mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					userdocs: { command: "node", args: ["-e", userServerScript], timeout: 3_000 },
+				},
+			}),
+		);
+
+		const { session, mcpManager } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			sessionManager: SessionManager.inMemory(cwd),
+			settings: Settings.isolated({ "mcp.enableProjectConfig": true }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: true,
+			enableLsp: false,
+		});
+
+		try {
+			expect(mcpManager?.getConnectedServers().sort()).toEqual(["domain_docs", "userdocs"]);
+
+			// The manager's canonical snapshot must contain BOTH batches: the
+			// user/project server connected first and the plugin bundle connected
+			// second into the same manager. (Regression: the plugin batch used to
+			// replace the snapshot wholesale and drop the user tools.)
+			const managerServers = new Set(mcpManager?.getTools().map(t => t.mcpServerName));
+			expect(managerServers).toEqual(new Set(["domain_docs", "userdocs"]));
+
+			const userTool = session.getAllToolNames().find(n => n.includes("usersearch"));
+			const pluginTool = session.getAllToolNames().find(n => n.includes("lookup"));
+			expect(userTool).toBeDefined();
+			expect(pluginTool).toBeDefined();
+
+			// Every refresh path (tools/list_changed, reconnect, /mcp reload,
+			// /mcp enable|disable) rebuilds the session registry from
+			// manager.getTools(); both tool sets must survive it.
+			await session.refreshMCPTools(mcpManager?.getTools() ?? []);
+			expect(session.getAllToolNames()).toContain(userTool as string);
+			expect(session.getAllToolNames()).toContain(pluginTool as string);
+			// The plugin tool stays always-on after the refresh.
+			expect(session.getActiveToolNames()).toContain(pluginTool as string);
+		} finally {
+			await session.dispose();
+		}
+
+		expect(mcpManager?.getConnectedServers()).toEqual([]);
+	}, 30_000);
 });
