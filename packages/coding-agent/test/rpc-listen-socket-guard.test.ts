@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
+import * as net from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { isUnixSocketAlive } from "@gajae-code/coding-agent/modes/rpc/rpc-mode";
+import { isUnixSocketAlive, RpcListenRefusedError } from "@gajae-code/coding-agent/modes/rpc/rpc-mode";
+import { prepareRpcSocketPath } from "@gajae-code/coding-agent/modes/rpc/rpc-socket-security";
 
 let dir: string;
 
@@ -64,5 +66,24 @@ describe("isUnixSocketAlive (--listen live-owner probe, #606)", () => {
 		}) as typeof Bun.connect;
 
 		expect(await isUnixSocketAlive(path.join(dir, "permission.sock"))).toBe(true);
+	});
+});
+
+describe("--listen duplicate refusal boundary (issue 19)", () => {
+	it("prepareRpcSocketPath throws the RpcListenRefusedError class main.ts catches at launch", async () => {
+		// main.ts imports RpcListenRefusedError from rpc-mode and only exits cleanly
+		// for that class; the refusal thrown on a live socket must be that instance.
+		const socketPath = path.join(dir, "duplicate.sock");
+		const server = net.createServer();
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, resolve);
+		});
+		try {
+			await chmod(socketPath, 0o600);
+			await expect(prepareRpcSocketPath(socketPath)).rejects.toBeInstanceOf(RpcListenRefusedError);
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
 	});
 });

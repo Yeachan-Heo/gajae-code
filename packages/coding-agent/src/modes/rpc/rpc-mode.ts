@@ -173,15 +173,9 @@ function auditOutcomeFor(event: string): "accepted" | "rejected" | "denied" | "e
 	return "info";
 }
 
-export class RpcListenRefusedError extends Error {
-	constructor(socketPath: string) {
-		super(
-			`RPC --listen refused: a live server is already listening on ${socketPath}. ` +
-				"Stop it first or choose a different --listen path.",
-		);
-		this.name = "RpcListenRefusedError";
-	}
-}
+// Thrown by prepareRpcSocketPath when the --listen path has a live owner;
+// re-exported here because main.ts catches it at the RPC launch boundary.
+export { RpcListenRefusedError } from "./rpc-socket-security";
 
 /**
  * Probe whether a unix-domain socket path has a live server accepting
