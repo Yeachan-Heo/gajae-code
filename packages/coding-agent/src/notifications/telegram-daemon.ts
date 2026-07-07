@@ -147,6 +147,11 @@ function endpointGenerationKey(url: string, token: string): string {
 	return `${url}\0${token}`;
 }
 
+/** True when a session endpoint URL points at this machine (loopback). */
+function isLoopbackEndpointUrl(url: string): boolean {
+	return /^wss?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(url);
+}
+
 /**
  * Whether `err` is a transient network failure worth retrying. Telegram API
  * calls over HTTP/2 occasionally surface mid-stream `ECONNRESET` (and similar)
@@ -1398,11 +1403,29 @@ export class TelegramNotificationDaemon {
 				if (this.sessions.has(sessionId)) continue;
 				try {
 					const endpoint = readEndpoint(path.join(dir, file));
-					// Skip endpoint files whose owning process is gone or that are
-					// explicitly stale (e.g. a hard-closed session): reconnecting
-					// would chase a dead, token-bearing record forever.
+					// Endpoint files whose owning process is gone, or that are
+					// explicitly stale, must not be reconnected: that would chase a
+					// dead, token-bearing record forever. But a hard-killed session
+					// (SIGKILL, crash, terminal pane close) never sends its graceful
+					// `session_closed` frame either, so without cleanup here its forum
+					// topic is orphaned forever. Reap it: delete the topic for stale
+					// records and for dead local (loopback) endpoints, then unlink the
+					// dead endpoint file once its topic record is cleared - a failed
+					// delete keeps the record and is retried on the next scan. Remote
+					// (non-loopback) endpoints are left untouched because a local pid
+					// check is meaningless for them.
 					const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
-					if (endpoint.stale || (endpoint.pid !== undefined && !pidAlive(endpoint.pid))) continue;
+					const gone = endpoint.pid !== undefined && !pidAlive(endpoint.pid);
+					if (endpoint.stale || gone) {
+						const loopback = isLoopbackEndpointUrl(endpoint.url);
+						if ((endpoint.stale || (gone && loopback)) && this.topics.get(sessionId)) {
+							await this.deleteTopic(sessionId).catch(() => undefined);
+						}
+						if (gone && loopback && !this.topics.get(sessionId)) {
+							await this.fsImpl.unlink(path.join(dir, file)).catch(() => undefined);
+						}
+						continue;
+					}
 					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
 					if (this.closedEndpointKeys.get(sessionId) === endpointKey) continue;
 					this.closedEndpointKeys.delete(sessionId);
