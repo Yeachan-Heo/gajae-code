@@ -1,0 +1,116 @@
+{
+  "grade": "B-",
+  "findings_count": 16,
+  "severity_breakdown": {
+    "P1": 2,
+    "P2": 5,
+    "P3": 9
+  },
+  "p1_findings": [
+    {
+      "title": "Architect/Critic output contracts unconditionally mandate gjc ralplan --write, polluting ralplan state and arming the Stop hook in non-ralplan invocations",
+      "refs": [
+        "packages/coding-agent/src/prompts/agents/architect.md:94-98",
+        "packages/coding-agent/src/prompts/agents/critic.md:65-69",
+        "packages/coding-agent/src/gjc-runtime/ralplan-runtime.ts:225-262",
+        "packages/coding-agent/src/hooks/skill-state.ts:543-545"
+      ]
+    },
+    {
+      "title": "Architect prompt never instructs use of report_finding despite granting it; structured findings pipeline (receipt ROI, TUI rendering, auto findings[] injection) is bypassed; severity vocab mismatches tool enum",
+      "refs": [
+        "packages/coding-agent/src/prompts/agents/architect.md:4",
+        "packages/coding-agent/src/task/executor.ts:313-327",
+        "packages/coding-agent/src/task/receipt.ts:139-182",
+        "packages/coding-agent/src/tools/review.ts:19"
+      ]
+    }
+  ],
+  "cross_file_issues": [
+    "Persistence-context leak: role prompts assume active ralplan run; ralplan-runtime + Stop hook make wrong assumption expensive",
+    "executorQa contract triplicated across executor.md, ultragoal SKILL.md:266-273, and ultragoal-runtime.ts validators",
+    "Severity vocabulary split: CRITICAL/HIGH/MEDIUM/LOW (architect.md) vs P0-P3 (report_finding schema) vs dual-accepting receipt.ts",
+    "Dead frontmatter keys: blocking (parsed, never consumed), command-path hide/thinking-level (init.md), frontmatter.md template omits tools/output (privilege-escalating failure direction if structured path used)",
+    "Scaffold/role duplication asymmetry: yield pointer rule duplicated verbatim in planner only; architect/critic never connect receipt return to yield.result.data; scaffold's tail/grep hint rejected by restricted-bash allowlist"
+  ],
+  "plugins_dirs": {
+    "plugins/gajae-code": "commands (delegate_execute/plan/team), skills (gjc-delegation, gjc-session), plugin manifests - no agent definitions",
+    "plugins/.agents": "marketplace.json only - no agent definitions"
+  },
+  "top_3_leverage": [
+    "Add persistence-context gate (mirroring planner's inline-output exception) to architect.md and critic.md - fixes P1 state pollution and stage_n ambiguity in one edit",
+    "Wire report_finding into architect output contract with explicit CRITICAL->P0..LOW->P3 mapping - one paragraph unlocks existing structured-findings pipeline",
+    "Extract ultragoal red-team block from executor.md into leader-injected fragment/autoload skill, leaving 3-line activation stub - kills highest-drift duplication, reclaims ~40% of executor prompt"
+  ],
+  "positives": [
+    "Frontmatter parsing well-tested; roster and required plan sections pinned by tests (task-bundled-agent-surface.test.ts, ralplan-decision-artifacts.test.ts)",
+    "Restricted-bash design coherent end-to-end: prompt constraint <-> bashAllowedPrefixes <-> checkBashAllowedPrefixes enforcement with GJC_RALPLAN_ARTIFACT env carve-out",
+    "Verdict vocabularies consistent across prompts, ralplan SKILL gates, and HUD severity mapping",
+    "forkContext declared exactly where task.md advertises it and enforced at task/index.ts:335"
+  ],
+  "findings": [
+    {
+      "title": "P1: Architect/Critic output contracts unconditionally mandate `gjc ralplan --write`, polluting state in non-ralplan invocations",
+      "body": "architect.md:94-98 and critic.md:65-69 mandate ralplan-stage persistence with no exception clause. planner.md:64-68 has an explicit inline-output exception; the other two read-only roles do not. These agents are general-purpose bundled agents, spawnable from any context. In non-ralplan contexts, following the prompt can write bogus stage artifacts and trigger persistActiveRunId, making ralplan active and arming the Stop hook. Fix: gate persistence on active ralplan context; otherwise return the full review in yield.result.data, mirroring planner.",
+      "priority": 1,
+      "confidence": 0.85,
+      "file_path": "packages/coding-agent/src/prompts/agents/architect.md",
+      "line_start": 94,
+      "line_end": 98
+    },
+    {
+      "title": "P1: Architect prompt never mentions `report_finding` despite listing it in tools",
+      "body": "architect.md grants report_finding, and the orchestrator has machinery for dedupe, auto-injection into yield.result.data.findings, receipt surfacing, and TUI rendering. The prompt only asks for markdown findings persisted via gjc ralplan --write and says to return only the receipt. The structured findings pipeline is bypassed unless the caller mentions it. Also severity vocabulary mismatches the tool schema (CRITICAL/HIGH/MEDIUM/LOW vs P0-P3). Fix: require report_finding for each issue and define mapping CRITICAL->P0, HIGH->P1, MEDIUM->P2, LOW->P3.",
+      "priority": 1,
+      "confidence": 0.88,
+      "file_path": "packages/coding-agent/src/prompts/agents/architect.md",
+      "line_start": 4,
+      "line_end": 99
+    },
+    {
+      "title": "P2: Planner/Architect/Critic use `--stage_n <N>` without derivation rule",
+      "body": "All three read-only role prompts show gjc ralplan --write with --stage_n <N> but never explain how to determine N. Runtime parse and duplicate-write guards are strict. Fix: state to use assignment-provided stage_n; if absent, default/block/retry on duplicate with incremented N.",
+      "priority": 2,
+      "confidence": 0.75,
+      "file_path": "packages/coding-agent/src/prompts/agents/planner.md",
+      "line_start": 57,
+      "line_end": 62
+    },
+    {
+      "title": "P2: Planner/Critic/Executor ask-question guidance is unactionable in headless subagents",
+      "body": "Planner and executor prompts tell agents to ask if blocked, but planner lacks ask in its tools and subagent sessions are headless, where AskTool is unavailable/throws. Fix: require recording assumptions/open questions in yielded blocker/plan data instead of trying to ask the user.",
+      "priority": 2,
+      "confidence": 0.8,
+      "file_path": "packages/coding-agent/src/prompts/agents/planner.md",
+      "line_start": 23,
+      "line_end": 30
+    },
+    {
+      "title": "P2: Critic names nonexistent analyst agent",
+      "body": "critic.md says to escalate to analyst for requirements. Bundled agents are exactly executor/architect/planner/critic. Requirements gathering is deep-interview skill. Fix wording to deep-interview or remove.",
+      "priority": 2,
+      "confidence": 0.95,
+      "file_path": "packages/coding-agent/src/prompts/agents/critic.md",
+      "line_start": 24,
+      "line_end": 24
+    },
+    {
+      "title": "P2: Executor prompt lacks default yield.result.data output contract",
+      "body": "Executor only says final output lists changed files, decisions, and verification. Other role prompts name result fields. Fix: add changed_files, decisions, verification, blockers fields or similar.",
+      "priority": 2,
+      "confidence": 0.8,
+      "file_path": "packages/coding-agent/src/prompts/agents/executor.md",
+      "line_start": 53,
+      "line_end": 58
+    },
+    {
+      "title": "P2: Executor prompt embeds ultragoal red-team schema duplicated from SKILL/runtime",
+      "body": "executor.md hard-codes executorQa taxonomy and enums duplicated from ultragoal SKILL and validators. This bloats every executor spawn and drifts easily. Fix: inject the exact contract only in ultragoal assignments or reduce to activation stub plus pointer to runtime-validated contract.",
+      "priority": 2,
+      "confidence": 0.75,
+      "file_path": "packages/coding-agent/src/prompts/agents/executor.md",
+      "line_start": 34,
+      "line_end": 47
+    }
+  ]
+}

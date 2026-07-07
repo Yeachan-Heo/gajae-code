@@ -55,7 +55,7 @@ Cells render like a Jupyter notebook. `display(value)` renders non-presentable d
 {{#if js}}- **js**: the VM exposes a selective `process` subset, Web APIs, `Buffer`, `fs/promises`, and the `Bun` global.
 {{/if}}</caution>
 
-<example>
+<examples>
 {{#if py}}```json
 {
   "cells": [
@@ -72,4 +72,4 @@ Cells render like a Jupyter notebook. `display(value)` renders non-presentable d
   ]
 }
 ```{{/if}}
-</example>
+</examples>
