@@ -2008,12 +2008,12 @@
       // INITIALIZATION
       // ============================================================
 
-      // Escape HTML tags in text (but not code blocks)
+      // Escape raw HTML tags in markdown text while keeping markdown/code rendering.
       function escapeHtmlTags(text) {
         return text.replace(/<(?=[a-zA-Z\/])/g, '&lt;');
       }
 
-      // Configure marked with syntax highlighting and HTML escaping for text
+      // Configure marked with syntax highlighting and raw HTML escaping
       marked.use({
         breaks: true,
         gfm: true,
@@ -2042,6 +2042,10 @@
           // Text content: escape HTML tags
           text(token) {
             return escapeHtmlTags(escapeHtml(token.text));
+          },
+          // Raw HTML: render as text, never as executable DOM
+          html(token) {
+            return escapeHtml(token.raw || token.text || '');
           },
           // Inline code: escape HTML
           codespan(token) {
