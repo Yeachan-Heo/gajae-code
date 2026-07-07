@@ -9,6 +9,7 @@ import {
 	getNotificationConfig,
 	isGloballyConfigured,
 	isSessionNotificationsEnabled,
+	isTelegramConfigured,
 	maskToken,
 	type NotificationConfig,
 	type RedactableAction,
@@ -17,6 +18,7 @@ import {
 	tokenFingerprint,
 } from "../src/notifications/config";
 import { createNotificationsExtension } from "../src/notifications/index";
+import { daemonPaths } from "../src/notifications/telegram-daemon";
 import { createAgentSession } from "../src/sdk";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -125,6 +127,19 @@ describe("notifications config", () => {
 		).toBe(false);
 	});
 
+	test("isTelegramConfigured rejects blank Telegram credentials even when another adapter is configured", () => {
+		const mixedAdapterCfg: NotificationConfig = {
+			...BASE_CFG,
+			enabled: true,
+			botToken: " ",
+			chatId: "\t",
+			discord: { botToken: "discord-token", channelId: "discord-channel" },
+		};
+
+		expect(isGloballyConfigured(mixedAdapterCfg)).toBe(true);
+		expect(isTelegramConfigured(mixedAdapterCfg)).toBe(false);
+	});
+
 	test("isSessionNotificationsEnabled applies precedence", () => {
 		expect(
 			isSessionNotificationsEnabled({
@@ -200,6 +215,8 @@ describe("notifications config", () => {
 		delete process.env.GJC_NOTIFICATIONS;
 		const settings = Settings.isolated({
 			"notifications.enabled": true,
+			"notifications.telegram.botToken": " ",
+			"notifications.telegram.chatId": "\t",
 			"notifications.discord.botToken": "discord-token",
 			"notifications.discord.channelId": "discord-channel",
 		});
@@ -339,6 +356,7 @@ describe("notifications config", () => {
 			expect(fs.existsSync(parentPrefixSubagentEndpoint)).toBe(false);
 			expect(fs.existsSync(agentTypeOnlySubagentEndpoint)).toBe(false);
 			expect(fs.existsSync(explicitExtensionSubagentEndpoint)).toBe(false);
+			expect(fs.existsSync(daemonPaths(cwd).roots)).toBe(false);
 		} finally {
 			await Promise.all(disposers.reverse().map(dispose => dispose()));
 			if (previous === undefined) {

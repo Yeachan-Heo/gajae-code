@@ -171,6 +171,24 @@ describe("TelegramDaemonController.status", () => {
 		expect(status.health).toBe("not_configured");
 	});
 
+	test("reports not_configured for blank Telegram credentials even when another adapter is configured", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.telegram.botToken": " ",
+				"notifications.telegram.chatId": "\t",
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.channelId": "discord-channel",
+			}) as Settings,
+			agentDir,
+		);
+		const status = await new TelegramDaemonController(s).status();
+
+		expect(status.configured).toBe(false);
+		expect(status.health).toBe("not_configured");
+	});
+
 	test("reports running for a fresh live owner and stale for a dead one", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);

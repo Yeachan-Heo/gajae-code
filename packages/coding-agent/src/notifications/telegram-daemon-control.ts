@@ -20,7 +20,7 @@ import type {
 	DaemonStatus,
 } from "../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
-import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
+import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import {
 	daemonPaths,
 	isFreshLiveOwner,
@@ -159,7 +159,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	async status(): Promise<DaemonStatus> {
 		const runtime = this.runtimeInfo();
 		const cfg = getNotificationConfig(this.settings);
-		const configured = isGloballyConfigured(cfg) && Boolean(cfg.botToken) && Boolean(cfg.chatId);
+		const configured = isTelegramConfigured(cfg);
 		if (!configured) {
 			return { kind: this.kind, configured: false, health: "not_configured", runtime };
 		}

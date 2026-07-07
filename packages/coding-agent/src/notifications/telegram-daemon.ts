@@ -8,7 +8,7 @@ import { withFileLock } from "../config/file-lock";
 import type { Settings } from "../config/settings";
 import type { DaemonRuntimeInfo } from "../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
-import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
+import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
 import { daemonPaths } from "./daemon-paths";
 import {
@@ -636,7 +636,7 @@ export async function ensureTelegramDaemonRunning(
 	deps: TelegramDaemonDeps = {},
 ): Promise<EnsureDaemonResult> {
 	const cfg = getNotificationConfig(input.settings);
-	if (!isGloballyConfigured(cfg) || !cfg.botToken || !cfg.chatId) return "disabled";
+	if (!isTelegramConfigured(cfg)) return "disabled";
 	const root = notificationRootForCwd(input.cwd);
 	const fp = tokenFingerprint(cfg.botToken);
 	const spawned = await spawnTelegramDaemonOwner(

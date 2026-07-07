@@ -131,6 +131,36 @@ describe("telegram daemon", () => {
 		expect(spawns).toBe(1);
 	});
 
+	test("ensureTelegramDaemonRunning ignores blank Telegram credentials when another adapter enables notifications", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.telegram.botToken": " ",
+				"notifications.telegram.chatId": "\t",
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.channelId": "discord-channel",
+			}) as Settings,
+			agentDir,
+		);
+		let spawns = 0;
+		const result = await ensureTelegramDaemonRunning(
+			{ settings: s, cwd: path.join(agentDir, "cwd"), sessionId: "s1" },
+			{
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+				pidAlive: () => true,
+				pid: 111,
+			},
+		);
+
+		expect(result).toBe("disabled");
+		expect(spawns).toBe(0);
+		expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
+	});
+
 	test("concurrent root registrations persist every root", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -389,6 +419,36 @@ describe("telegram daemon", () => {
 		};
 		expect(state.pid).toBe(222);
 		expect(state.ownerId).toBe("owner");
+	});
+
+	test("runDaemonInternal exits before constructing daemon for blank Telegram credentials with another adapter configured", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.telegram.botToken": " ",
+				"notifications.telegram.chatId": "\t",
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.channelId": "discord-channel",
+			}) as Settings,
+			agentDir,
+		);
+		let daemonConstructed = false;
+		class StubDaemon {
+			constructor() {
+				daemonConstructed = true;
+			}
+			async run(): Promise<void> {}
+			requestStop(): void {}
+		}
+
+		await runDaemonInternal(["--agent-dir", agentDir, "--owner-id", "owner"], {
+			SettingsImpl: { init: async () => s },
+			DaemonImpl: StubDaemon,
+			pidAlive: () => true,
+		});
+
+		expect(daemonConstructed).toBe(false);
 	});
 
 	test("callback alias from session B routes only to session B", async () => {

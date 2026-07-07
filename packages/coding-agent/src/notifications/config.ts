@@ -38,15 +38,22 @@ export function getNotificationConfig(settings: Settings): NotificationConfig {
 	};
 }
 
-function hasNonBlankValue(value: string | undefined): boolean {
+export function hasNonBlankValue(value: string | undefined): boolean {
 	return typeof value === "string" && value.trim().length > 0;
+}
+
+/** Is Telegram configured with usable non-blank boundary credentials? */
+export function isTelegramConfigured(
+	cfg: NotificationConfig,
+): cfg is NotificationConfig & { botToken: string; chatId: string } {
+	return cfg.enabled && hasNonBlankValue(cfg.botToken) && hasNonBlankValue(cfg.chatId);
 }
 
 /** Is global config sufficient for auto-on (enabled + at least one configured adapter)? */
 export function isGloballyConfigured(cfg: NotificationConfig): boolean {
 	return (
 		cfg.enabled &&
-		((hasNonBlankValue(cfg.botToken) && hasNonBlankValue(cfg.chatId)) ||
+		(isTelegramConfigured(cfg) ||
 			(hasNonBlankValue(cfg.discord.botToken) && hasNonBlankValue(cfg.discord.channelId)) ||
 			(hasNonBlankValue(cfg.slack.botToken) && hasNonBlankValue(cfg.slack.channelId)))
 	);

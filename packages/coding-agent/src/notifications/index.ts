@@ -33,8 +33,8 @@ import { registerAskAnswerSource } from "../tools/ask-answer-registry";
 import { registerTelegramFileSink } from "./attachment-registry";
 import {
 	getNotificationConfig,
-	isGloballyConfigured,
 	isSessionNotificationsEnabled,
+	isTelegramConfigured,
 	type NotificationConfig,
 	sessionTag,
 } from "./config";
@@ -758,7 +758,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 			});
 			logger.info(`notifications: serving session ${id} at ${endpoint.url} (unattended=${unattended})`);
 
-			if (settingsAvailable && settings && isGloballyConfigured(cfg)) {
+			if (settingsAvailable && settings && isTelegramConfigured(cfg)) {
 				try {
 					await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
 				} catch (e) {
@@ -1147,7 +1147,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 	api.on("message_update", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (!rt || !rt.stream || rt.redact) return;
+		if (!rt?.stream || rt.redact) return;
 		if ((event.message as { role?: unknown }).role !== "assistant") return;
 		if (rt.liveRef === undefined) {
 			rt.turnSeq = (rt.turnSeq ?? 0) + 1;
