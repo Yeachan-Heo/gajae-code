@@ -122,6 +122,49 @@ describe("CLI help load order", () => {
 		expect(combined).not.toContain("http-400-requests");
 	}, 15_000);
 
+	it("renders contribute-pr --help without loading native-dependent commands", async () => {
+		if (Bun.semver.order(Bun.version, "1.3.14") < 0) {
+			return;
+		}
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-contribute-pr-help-native-"));
+		cleanupRoot = root;
+		const home = path.join(root, "home");
+		const xdg = path.join(root, "xdg");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(home, { recursive: true });
+		await fs.mkdir(xdg, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+
+		const proc = Bun.spawn([process.execPath, cliEntry, "contribute-pr", "--help"], {
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				HOME: home,
+				XDG_CONFIG_HOME: xdg,
+				XDG_DATA_HOME: xdg,
+				GJC_CODING_AGENT_DIR: agentDir,
+				PI_CODING_AGENT_DIR: agentDir,
+				PI_NO_TITLE: "1",
+				NO_COLOR: "1",
+			},
+		});
+
+		const [stdout, stderr, exitCode] = await Promise.all([
+			readStream(proc.stdout as ReadableStream<Uint8Array>),
+			readStream(proc.stderr as ReadableStream<Uint8Array>),
+			proc.exited,
+		]);
+		const combined = `${stdout}\n${stderr}`;
+
+		expect(exitCode, combined).toBe(0);
+		expect(stdout).toContain("USAGE");
+		expect(stdout).toContain("$ gjc contribute-pr");
+		expect(stdout).toContain("--no-spawn");
+		expect(combined).not.toContain("Failed to load pi_natives native addon");
+	}, 15_000);
+
 	it("lists representative commands in root --help", async () => {
 		if (Bun.semver.order(Bun.version, "1.3.14") < 0) {
 			return;

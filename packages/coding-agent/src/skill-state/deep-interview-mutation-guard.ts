@@ -342,7 +342,7 @@ function shellWords(argsText: string): string[] {
 }
 
 function cleanShellWord(value: string): string {
-	return value.replace(/^[\'"]|[\'"]$/g, "");
+	return value.replace(/^['"]|['"]$/g, "");
 }
 
 function extractBashTargets(args: unknown): ExtractedTargets {

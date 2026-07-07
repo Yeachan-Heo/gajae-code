@@ -433,7 +433,7 @@ export async function run(opts: RunOptions): Promise<void> {
 			const instance = new Cmd(commandArgv, config);
 			await instance.run();
 		} else {
-			const config = await loadAllCommands(opts);
+			const config: CliConfig = { bin, version, commands: new Map([[entry.name, Cmd]]) };
 			renderCommandHelp(bin, entry.name, config.commands.get(entry.name) ?? Cmd);
 		}
 		return;
