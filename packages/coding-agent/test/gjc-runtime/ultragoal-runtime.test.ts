@@ -2741,6 +2741,151 @@ describe("native GJC ultragoal runtime", () => {
 		expect(diagnostic.state).toBe("active_verified_complete");
 	});
 
+	it("keeps final aggregate on the temporal last required goal", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc" });
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const saved = JSON.parse(await Bun.file(goalsPath).text());
+		saved.goals[2].status = "active";
+		saved.goals[2].startedAt = new Date().toISOString();
+		saved.goals[2].updatedAt = saved.goals[2].startedAt;
+		await fs.writeFile(goalsPath, `${JSON.stringify(saved, null, 2)}\n`);
+		const middleComplete = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G003",
+			status: "complete",
+			evidence: "third goal verified before second",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		expect(middleComplete.goals[2]?.completionVerification?.receiptKind).toBe("per-goal");
+
+		await startNextUltragoalGoal({ cwd: root });
+		const finalComplete = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G002",
+			status: "complete",
+			evidence: "second goal verified last",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		expect(finalComplete.goals[1]?.completionVerification?.receiptKind).toBe("final-aggregate");
+	});
+
+	it("keeps non-final complete re-checkpoints idempotent after aggregate completion (#1777)", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await addUltragoalSubgoal({
+			cwd: root,
+			title: "Second stage",
+			objective: "Complete the second stage.",
+			evidence: "The regression requires a second required goal.",
+			rationale: "Cover complete re-checkpoint receipt kind after aggregate completion.",
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const afterFirst = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		expect(afterFirst.goals[0]?.completionVerification?.receiptKind).toBe("per-goal");
+		await startNextUltragoalGoal({ cwd: root });
+		const afterFinal = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G002",
+			status: "complete",
+			evidence: "final goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		expect(afterFinal.goals[1]?.completionVerification?.receiptKind).toBe("final-aggregate");
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const goalsAfterFinal = await Bun.file(goalsPath).text();
+		const checkpointCount = (await readUltragoalLedger(root)).filter(
+			event => event.event === "goal_checkpointed",
+		).length;
+
+		const afterIdempotent = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		expect(afterIdempotent.goals[0]?.completionVerification?.receiptKind).toBe("per-goal");
+		expect((await readUltragoalLedger(root)).filter(event => event.event === "goal_checkpointed")).toHaveLength(
+			checkpointCount,
+		);
+		expect(await Bun.file(goalsPath).text()).toBe(goalsAfterFinal);
+	});
+
+	it("uses per-goal receipts when repairing a non-final goal after aggregate completion (#1777)", async () => {
+		for (const repairStatus of ["active", "failed"] as const) {
+			const root = await tempDir();
+			await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+			await addUltragoalSubgoal({
+				cwd: root,
+				title: "Second stage",
+				objective: "Complete the second stage.",
+				evidence: "The regression requires a second required goal.",
+				rationale: `Cover ${repairStatus} repair receipt kind after aggregate completion.`,
+			});
+			await startNextUltragoalGoal({ cwd: root });
+			await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "first goal initially verified",
+				qualityGateJson: await passingLiveQualityGate(root),
+			});
+			await startNextUltragoalGoal({ cwd: root });
+			const completed = await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G002",
+				status: "complete",
+				evidence: "final goal verified",
+				qualityGateJson: await passingLiveQualityGate(root),
+			});
+			expect(completed.goals[1]?.completionVerification?.receiptKind).toBe("final-aggregate");
+
+			const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+			const saved = JSON.parse(await Bun.file(goalsPath).text());
+			saved.goals[0].status = repairStatus;
+			saved.goals[0].evidence = `${repairStatus} repair required`;
+			saved.goals[0].updatedAt = new Date(Date.now() + 1000).toISOString();
+			delete saved.goals[0].completedAt;
+			delete saved.goals[0].completionVerification;
+			await fs.writeFile(goalsPath, `${JSON.stringify(saved, null, 2)}\n`);
+
+			const repaired = await checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: `${repairStatus} repair verified`,
+				qualityGateJson: await passingLiveQualityGate(root),
+			});
+
+			expect(repaired.goals[0]?.completionVerification?.receiptKind).toBe("per-goal");
+			expect(
+				validateCompletionReceipt({
+					plan: repaired,
+					ledger: await readUltragoalLedger(root),
+					goal: repaired.goals[0]!,
+					receiptKind: "per-goal",
+				}).state,
+			).toBe("active_verified_complete");
+		}
+	});
+
 	it("keeps receipts fresh after no-goalId annotate_ledger steering", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
