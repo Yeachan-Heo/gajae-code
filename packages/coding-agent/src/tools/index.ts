@@ -34,6 +34,7 @@ import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import type { BashRestrictionProfile } from "./bash-allowed-prefixes";
+import { BisectTool } from "./bisect";
 import { BrowserTool } from "./browser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
@@ -72,6 +73,7 @@ export * from "./ask";
 export * from "./ast-edit";
 export * from "./ast-grep";
 export * from "./bash";
+export * from "./bisect";
 export * from "./browser";
 export * from "./calculator";
 export * from "./checkpoint";
@@ -387,6 +389,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	render_mermaid: s => new RenderMermaidTool(s),
 	ask: AskTool.createIf,
 	debug: DebugTool.createIf,
+	bisect: s => new BisectTool(s),
 	eval: s => new EvalTool(s),
 	calc: s => new CalculatorTool(s),
 	ssh: loadSshTool,
