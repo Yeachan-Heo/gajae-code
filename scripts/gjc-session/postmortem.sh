@@ -81,11 +81,12 @@ if runtime_state:
         state = runtime_data.get("state")
         session_id = runtime_data.get("session_id")
         cwd = runtime_data.get("cwd") or runtime_data.get("workdir")
+        final_response = runtime_data.get("final_response") if isinstance(runtime_data.get("final_response"), dict) else {}
         session_matches = not session_id or session_id == session
         cwd_matches = not cwd or os.path.abspath(str(cwd)) == os.path.abspath(workdir)
         if state in {"completed", "errored"} and session_matches and cwd_matches:
             runtime_terminal_state = state
-            runtime_terminal_source = (runtime_data.get("final_response") or {}).get("source") or "runtime_state"
+            runtime_terminal_source = final_response.get("source") or runtime_data.get("source") or "runtime_state"
     except Exception:
         pass
 current_dirty_raw = "null"

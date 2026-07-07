@@ -360,6 +360,7 @@ PY
   fi
   runtime_terminal_state=""
   runtime_terminal_source=""
+  runtime_terminal_reason=""
   if [[ -s "${GJC_COORDINATOR_SESSION_STATE_FILE:-}" ]]; then
     runtime_summary="$(python3 - "$GJC_COORDINATOR_SESSION_STATE_FILE" "$GJC_SESSION_NAME" "$GJC_SESSION_WORKDIR" <<'PY' 2>/dev/null || true
 import json
@@ -374,12 +375,15 @@ except Exception:
 state = data.get("state")
 session_id = data.get("session_id")
 cwd = data.get("cwd") or data.get("workdir")
-source = (data.get("final_response") or {}).get("source")
+final_response = data.get("final_response") if isinstance(data.get("final_response"), dict) else {}
+source = final_response.get("source") or data.get("source")
+reason = data.get("reason") if isinstance(data.get("reason"), str) else ""
 session_matches = not session_id or session_id == expected_session
 cwd_matches = not cwd or os.path.abspath(str(cwd)) == os.path.abspath(expected_cwd)
 if state in {"completed", "errored"} and session_matches and cwd_matches:
     print(state)
     print(source or "runtime_state")
+    print(reason)
 else:
     print("")
     print("")
@@ -387,8 +391,9 @@ PY
 )"
     runtime_terminal_state="$(printf '%s\n' "$runtime_summary" | sed -n '1p')"
     runtime_terminal_source="$(printf '%s\n' "$runtime_summary" | sed -n '2p')"
+    runtime_terminal_reason="$(printf '%s\n' "$runtime_summary" | sed -n '3p')"
   fi
-  if [[ "$final_present" != "true" && -n "$runtime_terminal_state" ]]; then
+  if [[ "$final_present" != "true" && -n "$runtime_terminal_state" && "$runtime_terminal_source" != "process_postmortem" ]]; then
     printf '[%s] tmux session closed after terminal runtime state=%s source=%s; no vanished failure marker written\n' "$detected_at" "$runtime_terminal_state" "${runtime_terminal_source:-unknown}" >>"$GJC_SESSION_EVENTS_LOG"
     exit 0
   fi
@@ -418,6 +423,10 @@ PY
   elif [[ "$tui_ready" == "true" ]]; then
     vanish_phase="before_prompt_acceptance"
     vanish_reason="tmux_session_missing_before_prompt_acceptance"
+  fi
+  if [[ "$final_present" != "true" && -n "$runtime_terminal_state" && "$runtime_terminal_source" == "process_postmortem" ]]; then
+    vanish_phase="process_postmortem"
+    vanish_reason="${runtime_terminal_reason:-process_postmortem}"
   fi
   severity="failure"
   printf '[%s] tmux session vanished final_present=%s final_severity=%s prompt_accepted=%s tui_ready=%s phase=%s severity=%s reason=%s\n' "$detected_at" "$final_present" "${final_severity:-none}" "$prompt_accepted" "$tui_ready" "$vanish_phase" "$severity" "$vanish_reason" >>"$GJC_SESSION_EVENTS_LOG"
