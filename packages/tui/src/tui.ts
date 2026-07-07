@@ -1849,7 +1849,11 @@ export class TUI extends Container {
 		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
 		if (this.#clearOnShrink && newLines.length < this.#previousLines.length && this.overlayStack.length === 0) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			fullRender(true, "clearOnShrink");
+			if (useViewportRepaintPath()) {
+				viewportRepaint(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
+			} else {
+				fullRender(true, "clearOnShrink");
+			}
 			return;
 		}
 

@@ -17,6 +17,10 @@ class Lines implements Component {
 		this.#lines = this.#lines.map((value, currentIndex) => (currentIndex === index ? line : value));
 	}
 
+	replace(lines: string[]): void {
+		this.#lines = [...lines];
+	}
+
 	render(_width: number): string[] {
 		return this.#lines;
 	}
@@ -103,6 +107,36 @@ describe("TUI manual viewport paging", () => {
 			await settle(term);
 
 			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "line-11"]);
+			expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
+		} finally {
+			tui.stop();
+			if (previousWtSession === undefined) {
+				delete Bun.env.WT_SESSION;
+			} else {
+				Bun.env.WT_SESSION = previousWtSession;
+			}
+		}
+	});
+
+	it("keeps Windows Terminal pinned when offscreen status lines disappear", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		const content = new Lines(["status-0", ...Array.from({ length: 11 }, (_value, index) => `line-${index}`)]);
+		tui.addChild(content);
+		const previousWtSession = Bun.env.WT_SESSION;
+		Bun.env.WT_SESSION = "test-windows-terminal-session";
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-6", "line-7", "line-8", "line-9", "line-10"]);
+			term.clearWriteLog();
+
+			content.replace(Array.from({ length: 11 }, (_value, index) => `line-${index}`));
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-6", "line-7", "line-8", "line-9", "line-10"]);
 			expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
 		} finally {
 			tui.stop();
