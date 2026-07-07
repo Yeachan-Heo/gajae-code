@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as logger from "@gajae-code/utils/logger";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
 import type { ActiveSubskillEntry, SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
 import {
@@ -1024,7 +1025,22 @@ export async function readActiveEntries(
 	const entries: SkillActiveEntry[] = [];
 	for (const name of names.sort()) {
 		if (!name.endsWith(".json")) continue;
-		const raw = await readJsonIfPresent(path.join(dir, name));
+		const filePath = path.join(dir, name);
+		let raw: unknown;
+		try {
+			raw = await readJsonIfPresent(filePath);
+		} catch (error) {
+			// Fail open: a single corrupt per-skill entry file (e.g. a zero-filled or
+			// truncated file left by an interrupted / rename-crashed write, common on
+			// exFAT and network volumes) must not break active-state reads or block
+			// skill loading. Skip it; the next authoritative write overwrites it.
+			logger.warn(
+				`gjc skill-state: skipping corrupt active-state entry at ${filePath}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+			continue;
+		}
 		if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
 		const skill = safeString((raw as SkillActiveEntry).skill).trim();
 		if (!skill) continue;
