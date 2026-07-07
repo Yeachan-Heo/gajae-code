@@ -2020,6 +2020,10 @@
         // Collapse whitespace/control characters before scheme checks so
         // variants like "java\nscript:" cannot bypass the allowlist.
         const compact = value.replace(/[\u0000-\u001F\u007F\s]+/g, '');
+        // Browser URL parsing treats backslashes in leading path separators as
+        // network-path separators; Marked may pass them through or encode them.
+        if (compact.includes('\\') || /%5c/i.test(compact)) return null;
+
         const colonIndex = compact.indexOf(':');
         const firstPathIndex = compact.search(/[/?#]/);
         if (colonIndex !== -1 && (firstPathIndex === -1 || colonIndex < firstPathIndex)) {
@@ -2030,7 +2034,7 @@
           return null;
         }
 
-        if (compact.startsWith('//') || compact.startsWith('\\')) return null;
+        if (compact.startsWith('//')) return null;
         return value;
       }
 

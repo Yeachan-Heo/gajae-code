@@ -26,11 +26,15 @@ describe("HTML export template script inlining", () => {
 		return script.slice(start, end);
 	}
 
+	interface MarkdownRendererThis {
+		parser: { parseInline(tokens: unknown[]): string };
+	}
+
 	interface MarkdownRenderer {
 		html(token: { raw?: string; text?: string }): string;
 		code(token: { text: string; lang?: string }): string;
 		codespan(token: { text: string }): string;
-		link(token: { href?: string; title?: string | null; tokens?: unknown[] }): string;
+		link(this: MarkdownRendererThis, token: { href?: string; title?: string | null; tokens?: unknown[] }): string;
 		image(token: { href?: string; title?: string | null; text?: string; tokens?: unknown[] }): string;
 	}
 
@@ -110,6 +114,20 @@ describe("HTML export template script inlining", () => {
 		return (text: string) => String(factory(marked, hljs, documentStub)(text));
 	}
 
+	function renderWithConfiguredRenderer(render: (renderer: MarkdownRenderer) => string): string {
+		let renderer: MarkdownRenderer | undefined;
+		const marked: MarkedStub = {
+			use(config) {
+				renderer = config.renderer;
+			},
+			parse() {
+				if (!renderer) throw new Error("marked renderer was not configured");
+				return render(renderer);
+			},
+		};
+		return buildMarkdownRenderer(marked)("");
+	}
+
 	function createEscapingElementFromText(text: string): { readonly innerHTML: string } {
 		const element = createEscapingElement();
 		element.textContent = text;
@@ -165,6 +183,47 @@ describe("HTML export template script inlining", () => {
 		expect(html).not.toContain("src=");
 		expect(html).not.toContain('src="javascript:alert(1)"');
 		expect(html).toContain("![x](javascript:alert(1))");
+	});
+
+	it("neutralizes markdown links with slash-backslash network-path variants", () => {
+		const unsafeHrefs = [
+			String.raw`/\evil.com/a`,
+			String.raw`\/evil.com/a`,
+			String.raw`/\/evil.com/a`,
+			"//evil.com/a",
+		];
+
+		for (const href of unsafeHrefs) {
+			const html = renderWithConfiguredRenderer(renderer =>
+				renderer.link.call({ parser: { parseInline: () => "x" } }, { href, tokens: [] }),
+			);
+			expect(html).not.toContain("href=");
+			expect(html).toContain("evil.com/a");
+		}
+	});
+
+	it("neutralizes markdown images with slash-backslash network-path variants", () => {
+		const unsafeHrefs = [
+			String.raw`/\evil.com/pixel`,
+			String.raw`\/evil.com/pixel`,
+			String.raw`/\/evil.com/pixel`,
+			"//evil.com/pixel",
+		];
+
+		for (const href of unsafeHrefs) {
+			const html = renderWithConfiguredRenderer(renderer => renderer.image({ href, text: "x" }));
+			expect(html).not.toContain("<img");
+			expect(html).not.toContain("src=");
+			expect(html).toContain("evil.com/pixel");
+		}
+	});
+
+	it("preserves local relative markdown links and images", () => {
+		const renderMarkdown = buildMarkdownRenderer(createRealMarkedStub());
+		const html = renderMarkdown("[doc](./docs/readme.md) ![alt](/assets/pixel.png)");
+
+		expect(html).toContain('<a href="./docs/readme.md">doc</a>');
+		expect(html).toContain('<img src="/assets/pixel.png" alt="alt">');
 	});
 
 	it("preserves safe markdown links", () => {
