@@ -33,8 +33,9 @@ in a detached bisect state. The tool:
 
 ### Predicate exit-code contract
 
-`run` is executed as `sh -c <run>` from the repository working directory at each
-candidate commit. Its exit code is mapped to a verdict:
+`run` is executed as `sh -c <run>` from the repository root (the top level of the
+working tree) at each candidate commit — even when the tool is invoked from a
+subdirectory. Its exit code is mapped to a verdict:
 
 | Exit code | Verdict |
 | --- | --- |

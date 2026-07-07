@@ -16,7 +16,7 @@ Search direction:
 Rules:
 - Requires a git repository and a clean working tree. Commit or stash uncommitted changes first — bisect checks out historical commits and would clobber them.
 - `good` must resolve, `bad` must resolve, they must differ, and `good` must be an ancestor of `bad`.
-- Make `run` self-contained and deterministic (build + test in one command). It runs from the repository working directory at each candidate commit.
+- Make `run` self-contained and deterministic (build + test in one command). It always runs from the repository root (the top level of the working tree), even when the tool is invoked from a subdirectory — reference files by repo-relative paths, and do not assume the current subdirectory exists at every candidate commit.
 - Prefer a narrow predicate that targets only the behavior you are hunting, so unrelated breakage does not mislead the search.
 
 The result reports the first bad (or first fixing) commit with its author, date, subject, and changed files, plus every revision tested. Every tracked file is restored to its pre-bisect state; if the predicate created untracked files they are reported and left in place.

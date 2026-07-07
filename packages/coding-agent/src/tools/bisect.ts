@@ -237,9 +237,13 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 		_onUpdate?: AgentToolUpdateCallback<BisectToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<BisectToolDetails>> {
-		const cwd = this.session.cwd;
-
-		if (!(await git.repo.root(cwd, signal))) {
+		// Resolve the worktree top level once and run every git, predicate, and
+		// teardown operation from it — never from the raw session cwd. The session
+		// cwd may be a subdirectory that a candidate commit deletes mid-bisect
+		// (leaving later commands with a missing working directory), and `git
+		// bisect` itself must be run from the top level of the working tree.
+		const cwd = await git.repo.root(this.session.cwd, signal);
+		if (!cwd) {
 			throw new ToolError("bisect requires a git repository; the current directory is not inside a git worktree.");
 		}
 		const dirty = (await git.status(cwd, { porcelainV1: true, untrackedFiles: "no" })).trim();

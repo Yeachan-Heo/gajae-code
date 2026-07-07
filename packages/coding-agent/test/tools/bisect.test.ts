@@ -243,6 +243,76 @@ describe("BisectTool.execute", () => {
 		expect(await Bun.file(path.join(repo, "sentinel.txt")).text()).toBe("base\n");
 	});
 
+	it("restores the repo when invoked from a subdirectory a candidate deletes", async () => {
+		const repo = await makeRepo();
+		// good + HEAD contain sub/, but the intermediate first-bad commit deletes
+		// it — so a naive tool running from repo/sub would lose its cwd mid-bisect.
+		await fs.mkdir(path.join(repo, "sub"), { recursive: true });
+		await fs.writeFile(path.join(repo, "sub", "keep.txt"), "keep\n");
+		const good = await commitFlag(repo, "PASS\n", "c0 baseline (sub present)");
+		await commitFlag(repo, "PASS\n", "c1 still ok (sub present)");
+		await fs.rm(path.join(repo, "sub"), { recursive: true, force: true });
+		const bug = await commitFlag(repo, "FAIL\n", "c2 bug (sub deleted)");
+		await commitFlag(repo, "FAIL\n", "c3 (sub absent)");
+		await fs.mkdir(path.join(repo, "sub"), { recursive: true });
+		await fs.writeFile(path.join(repo, "sub", "keep.txt"), "keep\n");
+		await commitFlag(repo, "FAIL\n", "c4 head (sub present)");
+
+		const originalHead = await gitRun(repo, ["rev-parse", "HEAD"]);
+		const originalBranch = await gitRun(repo, ["rev-parse", "--abbrev-ref", "HEAD"]);
+
+		const result = await new BisectTool(session(path.join(repo, "sub"))).execute("call", {
+			good,
+			bad: "HEAD",
+			run: "grep -q PASS flag.txt",
+			invert: false,
+			maxSteps: 40,
+			stepTimeoutMs: 60_000,
+		});
+
+		expect(result.details?.concluded).toBe(true);
+		expect(result.details?.culprit).toBe(bug);
+		// Everything is restored despite the working cwd vanishing at a candidate.
+		expect(await gitRun(repo, ["rev-parse", "HEAD"])).toBe(originalHead);
+		expect(await gitRun(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe(originalBranch);
+		expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
+		expect(await Bun.file(path.join(repo, "sub", "keep.txt")).exists()).toBe(true);
+	});
+
+	it("restores from a subdirectory even when the run does not converge (failure path)", async () => {
+		const repo = await makeRepo();
+		await fs.mkdir(path.join(repo, "sub"), { recursive: true });
+		await fs.writeFile(path.join(repo, "sub", "keep.txt"), "keep\n");
+		const good = await commitFlag(repo, "PASS\n", "c0 baseline (sub present)");
+		await commitFlag(repo, "PASS\n", "c1 (sub present)");
+		await fs.rm(path.join(repo, "sub"), { recursive: true, force: true });
+		await commitFlag(repo, "FAIL\n", "c2 (sub deleted)");
+		await commitFlag(repo, "FAIL\n", "c3 (sub absent)");
+		await fs.mkdir(path.join(repo, "sub"), { recursive: true });
+		await fs.writeFile(path.join(repo, "sub", "keep.txt"), "keep\n");
+		await commitFlag(repo, "FAIL\n", "c4 head (sub present)");
+
+		const originalHead = await gitRun(repo, ["rev-parse", "HEAD"]);
+		const originalBranch = await gitRun(repo, ["rev-parse", "--abbrev-ref", "HEAD"]);
+
+		// A predicate that always skips can never converge; the candidate checkouts
+		// still delete sub/, so teardown must restore the repo on the failure path.
+		const result = await new BisectTool(session(path.join(repo, "sub"))).execute("call", {
+			good,
+			bad: "HEAD",
+			run: "exit 125",
+			invert: false,
+			maxSteps: 40,
+			stepTimeoutMs: 60_000,
+		});
+
+		expect(result.details?.concluded).toBe(false);
+		expect(await gitRun(repo, ["rev-parse", "HEAD"])).toBe(originalHead);
+		expect(await gitRun(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe(originalBranch);
+		expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
+		expect(await Bun.file(path.join(repo, "sub", "keep.txt")).exists()).toBe(true);
+	});
+
 	it("rejects a dirty working tree", async () => {
 		const repo = await makeRepo();
 		const good = await commitFlag(repo, "ok\n", "c0");
