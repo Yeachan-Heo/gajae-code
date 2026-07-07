@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { MCPManager } from "../../runtime-mcp/manager";
 import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
 import { loadEffectiveGjcPluginRegistry, registryPathForScope } from "./registry";
@@ -343,4 +344,44 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 		}
 	}
 	return { configs, quarantine };
+}
+
+/**
+ * Connect this session's always-on plugin-bundle MCP servers into an existing
+ * manager, tagging every server with `gjc-plugins` provenance so its tools stay
+ * always-on. Shared by session startup (`createAgentSession`) and the runtime
+ * `/mcp reload` path so the destructive reload sequence (disconnectAll →
+ * gated user/project rediscover) re-establishes plugin surfaces instead of
+ * silently dropping them. Returns `{}`-shaped empties when no bundle MCP exists.
+ *
+ * User/project servers must already be (re)connected before this runs: a plugin
+ * server whose name collides with an existing connection is skipped rather than
+ * double-spawned, and the skip is source-neutral (see `connectServers`).
+ */
+export async function connectPluginBundleMcpServers(
+	manager: MCPManager,
+	cwd: string,
+): Promise<{
+	connectedServers: string[];
+	tools: CustomTool[];
+	quarantine: SessionQuarantine[];
+	errors: Map<string, string>;
+}> {
+	const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
+	if (Object.keys(configs).length === 0) {
+		return { connectedServers: [], tools: [], quarantine, errors: new Map() };
+	}
+	const sources = Object.fromEntries(
+		Object.keys(configs).map(name => [
+			name,
+			{ provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
+		]),
+	);
+	const result = await manager.connectServers(configs, sources as never);
+	return {
+		connectedServers: result.connectedServers,
+		tools: result.tools as CustomTool[],
+		quarantine,
+		errors: result.errors,
+	};
 }

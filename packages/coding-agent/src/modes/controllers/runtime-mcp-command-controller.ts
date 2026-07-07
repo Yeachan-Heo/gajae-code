@@ -5,8 +5,9 @@
  */
 import * as path from "node:path";
 import { Spacer, Text } from "@gajae-code/tui";
-import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
+import { getMCPConfigPath, getProjectDir, logger } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
+import { connectPluginBundleMcpServers } from "../../extensibility/gjc-plugins/runtime-adapters";
 import {
 	analyzeAuthError,
 	buildTrustGatedMCPDiscoverOptions,
@@ -1482,6 +1483,13 @@ export class MCPCommandController {
 	 * is off and never implicitly connects `autoload: false` servers.
 	 * Explicit per-server commands (`/mcp enable`, `/mcp reconnect`) remain
 	 * the user-consent path for gated servers.
+	 *
+	 * `disconnectAll()` tears down every server in the shared manager —
+	 * including always-on plugin-bundle MCP servers, which are wired outside
+	 * `discoverAndConnect()`. Reload therefore re-establishes them via the same
+	 * `connectPluginBundleMcpServers` helper startup uses, after the gated
+	 * user/project rediscover, so `/mcp reload` cannot silently drop plugin
+	 * MCP tools.
 	 */
 	async #reloadMCP(): Promise<void> {
 		if (!this.ctx.mcpManager) {
@@ -1498,12 +1506,30 @@ export class MCPCommandController {
 				browserEnabled: this.ctx.settings.get("browser.enabled"),
 			}),
 		);
+
+		// Re-establish always-on plugin-bundle MCP servers dropped by
+		// disconnectAll. User/project servers reconnected first, so a colliding
+		// plugin name is skipped source-neutrally.
+		const pluginErrors = new Map<string, string>();
+		try {
+			const pluginResult = await connectPluginBundleMcpServers(
+				this.ctx.mcpManager,
+				this.ctx.sessionManager.getCwd(),
+			);
+			for (const [server, error] of pluginResult.errors) {
+				pluginErrors.set(server, error);
+			}
+		} catch (error) {
+			logger.warn("Failed to reconnect GJC plugin MCP servers on reload", { error });
+		}
+
 		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
 
 		// Show any connection errors
-		if (result.errors.size > 0) {
+		const allErrors = [...result.errors.entries(), ...pluginErrors.entries()];
+		if (allErrors.length > 0) {
 			const errorLines = ["", theme.fg("warning", "Some servers failed to connect:"), ""];
-			for (const [serverName, error] of result.errors.entries()) {
+			for (const [serverName, error] of allErrors) {
 				errorLines.push(`  ${serverName}: ${error}`);
 			}
 			errorLines.push("");

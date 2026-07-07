@@ -126,6 +126,23 @@ function isSelectableMCPBridgeTool(tool: {
 }
 
 /**
+ * Always-on MCP bridge tools: `gjc-plugins` bundle tools and any tool tagged
+ * `mcpDiscoveryScope === "always-on"`. These are the inverse of
+ * `isSelectableMCPBridgeTool` within the bridge-tool set — they are never gated
+ * behind MCP selection and must stay active across tool refreshes (reconnect,
+ * `tools/list_changed`, `/mcp reload`), matching their session-startup contract.
+ */
+export function isAlwaysOnMCPBridgeTool(tool: {
+	name: string;
+	mcpServerName?: unknown;
+	mcpToolName?: unknown;
+	mcpSourceProvider?: unknown;
+	mcpDiscoveryScope?: unknown;
+}): boolean {
+	return isMCPBridgeTool(tool) && (tool.mcpSourceProvider === "gjc-plugins" || tool.mcpDiscoveryScope === "always-on");
+}
+
+/**
  * Server names whose MCP `instructions` may be surfaced in the system prompt.
  *
  * A server is eligible only when it owns at least one bridge tool that is

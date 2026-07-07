@@ -8,6 +8,8 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { installGjcPluginBundle } from "../src/extensibility/gjc-plugins";
+import { connectPluginBundleMcpServers } from "../src/extensibility/gjc-plugins/runtime-adapters";
+import { buildTrustGatedMCPDiscoverOptions } from "../src/runtime-mcp/config";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const mcpBundle = path.join(fixturesRoot, "valid-mcp-bundle");
@@ -354,6 +356,80 @@ setInterval(() => {}, 1000);
 			// (A gjc-plugins source overwrite would have made it always-on/active.)
 			expect(session.getActiveToolNames()).not.toContain("mcp__domain_docs_usersearch");
 			expect(session.getDiscoverableMCPTools().map(tool => tool.name)).toContain("mcp__domain_docs_usersearch");
+		} finally {
+			await session.dispose();
+		}
+
+		expect(mcpManager?.getConnectedServers()).toEqual([]);
+	}, 30_000);
+
+	test("the destructive /mcp reload sequence preserves always-on plugin MCP tools", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-reload-"));
+		tempDirs.push(cwd);
+		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+
+		// A user/project .mcp.json server alongside the always-on plugin bundle.
+		const userServerScript = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'userdocs', version: '1' } } }) + '\\n');
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'usersearch', description: 'user tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+		fs.writeFileSync(
+			path.join(cwd, ".mcp.json"),
+			JSON.stringify({
+				mcpServers: { userdocs: { command: "node", args: ["-e", userServerScript], timeout: 3_000 } },
+			}),
+		);
+
+		const { session, mcpManager } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			sessionManager: SessionManager.inMemory(cwd),
+			settings: Settings.isolated({ "mcp.enableProjectConfig": true }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: true,
+			enableLsp: false,
+		});
+
+		try {
+			const pluginTool = session.getAllToolNames().find(n => n.includes("lookup")) as string;
+			expect(pluginTool).toBeDefined();
+			expect(session.getActiveToolNames()).toContain(pluginTool);
+
+			// Reproduce MCPCommandController#reloadMCP exactly: disconnectAll wipes
+			// the shared manager (user AND plugin servers), the gated rediscover
+			// only reconnects user/project .mcp.json, then plugin bundles are
+			// re-established via the shared helper before the registry refresh.
+			await mcpManager?.disconnectAll();
+			await mcpManager?.discoverAndConnect(
+				buildTrustGatedMCPDiscoverOptions({ enableProjectConfig: true, browserEnabled: false }),
+			);
+			await connectPluginBundleMcpServers(mcpManager!, cwd);
+			await session.refreshMCPTools(mcpManager?.getTools() ?? []);
+
+			// Both survive the reload: the plugin tool stays connected AND always-on,
+			// the user tool is back in the manager snapshot. (Regression: without the
+			// plugin reconnect, the plugin server/tool vanished after reload.)
+			expect(mcpManager?.getConnectedServers().sort()).toEqual(["domain_docs", "userdocs"]);
+			expect(session.getAllToolNames()).toContain(pluginTool);
+			expect(session.getActiveToolNames()).toContain(pluginTool);
+			expect(session.getAllToolNames().some(n => n.includes("usersearch"))).toBe(true);
 		} finally {
 			await session.dispose();
 		}

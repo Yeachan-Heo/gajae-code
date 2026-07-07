@@ -249,6 +249,7 @@ import {
 	collectDiscoverableTools,
 	type DiscoverableTool,
 	type DiscoverableToolSearchIndex,
+	isAlwaysOnMCPBridgeTool,
 } from "../tool-discovery/tool-index";
 import type { AskAnswerSource, ToolSession } from "../tools";
 import { AskTool } from "../tools/ask";
@@ -4597,7 +4598,17 @@ export class AgentSession {
 			this.#getConfiguredDefaultSelectedMCPToolNames(),
 		);
 
-		const nextActive = [...this.#getActiveNonMCPToolNames(), ...this.getSelectedMCPToolNames()];
+		// Always-on MCP tools (gjc-plugins bundle / scope "always-on") are never
+		// gated behind selection, so they must stay active across every refresh —
+		// including the reactive churn of `/mcp reload` (disconnectAll then
+		// reconnect), which would otherwise deactivate them permanently since they
+		// are neither "non-MCP" nor "selectable".
+		const alwaysOnMCPToolNames = mcpTools.filter(tool => isAlwaysOnMCPBridgeTool(tool)).map(tool => tool.name);
+		const nextActive = [
+			...this.#getActiveNonMCPToolNames(),
+			...alwaysOnMCPToolNames,
+			...this.getSelectedMCPToolNames(),
+		];
 		await this.#applyActiveToolsByName(nextActive, { previousSelectedMCPToolNames });
 	}
 

@@ -78,7 +78,7 @@ import { ExtensionRuntime } from "./extensibility/extensions/loader";
 import { type ConstrainedPluginHook, loadConstrainedPluginHooks } from "./extensibility/gjc-plugins/constrained-hooks";
 import { resolveCurrentPhaseForParent } from "./extensibility/gjc-plugins/injection";
 import {
-	buildPluginMcpConfigs,
+	connectPluginBundleMcpServers,
 	loadAlwaysOnPluginTools,
 	renderAlwaysOnSystemAppendices,
 } from "./extensibility/gjc-plugins/runtime-adapters";
@@ -1513,37 +1513,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// server whose name collides with an already-connected user server is
 			// skipped rather than double-spawned.
 			try {
-				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
-				for (const q of quarantine) {
+				const target = owned ?? new MCPManager(cwd);
+				const pluginResult = await connectPluginBundleMcpServers(target, cwd);
+				for (const q of pluginResult.quarantine) {
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 				}
-				if (Object.keys(configs).length > 0) {
-					const target = owned ?? new MCPManager(cwd);
-					try {
-						const sources = Object.fromEntries(
-							Object.keys(configs).map(name => [
-								name,
-								{ provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
-							]),
-						);
-						const result = await target.connectServers(configs, sources as never);
-						for (const [server, err] of result.errors) {
-							logger.warn("GJC plugin MCP connect failed", { path: `mcp:${server}`, error: err });
-						}
-						if (result.tools.length > 0) {
-							customTools.push(...(result.tools as CustomTool[]));
-						}
-						if (result.connectedServers.length > 0 || owned) {
-							owned = target;
-						} else {
-							await target.disconnectAll().catch(() => {});
-						}
-					} catch (error) {
-						// Avoid leaking partially-started plugin server processes, but never
-						// tear down a manager that already holds user-config connections.
-						if (!owned) await target.disconnectAll().catch(() => {});
-						throw error;
-					}
+				for (const [server, err] of pluginResult.errors) {
+					logger.warn("GJC plugin MCP connect failed", { path: `mcp:${server}`, error: err });
+				}
+				if (pluginResult.tools.length > 0) {
+					customTools.push(...pluginResult.tools);
+				}
+				// Keep the target as the owned manager when it now holds plugin
+				// connections or already held user-config connections; otherwise a
+				// freshly created plugin-only manager that connected nothing is torn
+				// down to avoid leaking processes.
+				if (pluginResult.connectedServers.length > 0 || owned) {
+					owned = target;
+				} else if (target !== owned) {
+					await target.disconnectAll().catch(() => {});
 				}
 			} catch (error) {
 				logger.warn("Failed to wire GJC plugin MCP servers", { error });
