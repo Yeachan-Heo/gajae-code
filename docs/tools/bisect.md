@@ -12,8 +12,11 @@ Running `git bisect` by hand is error-prone for an agent: it is easy to forget
 in a detached bisect state. The tool:
 
 - validates preconditions before touching repo state,
-- always runs `git bisect reset` in a `finally` block, so the working tree is
-  restored even on error or abort,
+- always runs `git bisect reset` in a `finally` block and then discards any
+  tracked-file edits the predicate made with `git reset --hard`, so the working
+  tree's tracked files are restored to their pre-bisect state even on error or
+  abort (untracked files the predicate created are left in place — the tool
+  never deletes files it did not create),
 - returns a structured, durable result (culprit + per-step verdicts) instead of
   scrollback that must be re-parsed.
 
@@ -66,7 +69,9 @@ On success the tool reports the first bad (or first fixing) commit with its
 author, date, subject, and changed files, plus every revision it tested and
 their verdicts. When the search cannot converge (only skipped commits remain, a
 `git bisect` step fails, or `maxSteps` is reached) it reports the reason and the
-revisions tested. In all cases the working tree is restored.
+revisions tested. In all cases every tracked file is restored to its pre-bisect
+state; if the predicate created untracked files, the result says so and leaves
+them in place.
 
 ## Examples
 

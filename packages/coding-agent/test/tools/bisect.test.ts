@@ -213,6 +213,36 @@ describe("BisectTool.execute", () => {
 		expect(result.details?.culprit).toBe(fix);
 	});
 
+	it("restores tracked files that the predicate modified", async () => {
+		const repo = await makeRepo();
+		// sentinel.txt is committed once and never changes across commits, so a
+		// local edit to it is carried across every candidate checkout instead of
+		// blocking bisect — leaving it dirty at teardown unless the tool cleans up.
+		await fs.writeFile(path.join(repo, "sentinel.txt"), "base\n");
+		const good = await commitFlag(repo, "PASS\n", "c0 baseline");
+		await commitFlag(repo, "PASS\n", "c1 still ok");
+		const bug = await commitFlag(repo, "FAIL\n", "c2 introduce bug");
+		await commitFlag(repo, "FAIL\n", "c3");
+		await commitFlag(repo, "FAIL\n", "c4 head");
+
+		const result = await new BisectTool(session(repo)).execute("call", {
+			good,
+			bad: "HEAD",
+			// Dirties a tracked file, then decides the verdict from flag.txt.
+			run: "printf mutated > sentinel.txt; grep -q PASS flag.txt",
+			invert: false,
+			maxSteps: 40,
+			stepTimeoutMs: 60_000,
+		});
+
+		expect(result.details?.concluded).toBe(true);
+		expect(result.details?.culprit).toBe(bug);
+		// `git bisect reset` alone would leave `M sentinel.txt`; teardown must
+		// discard the predicate's tracked-file edit and fully restore the worktree.
+		expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
+		expect(await Bun.file(path.join(repo, "sentinel.txt")).text()).toBe("base\n");
+	});
+
 	it("rejects a dirty working tree", async () => {
 		const repo = await makeRepo();
 		const good = await commitFlag(repo, "ok\n", "c0");

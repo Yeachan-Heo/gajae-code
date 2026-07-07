@@ -194,6 +194,27 @@ function formatSteps(steps: BisectStep[]): string {
 	return steps.map((step, index) => `  ${index + 1}. ${step.rev.slice(0, 12)} → ${step.verdict}`).join("\n");
 }
 
+/**
+ * Report the post-teardown worktree state honestly. `git bisect reset` plus a
+ * `git reset --hard` restores every *tracked* file to its pre-bisect state, so
+ * the common "predicate wrote to a tracked file" case is fully cleaned. A
+ * predicate that created *untracked* files is intentionally left untouched (the
+ * tool never deletes files it did not create), so those are surfaced as a note
+ * rather than hidden behind a false "restored" claim. Any residual tracked
+ * change is reported as a warning so the tool never overstates the cleanup.
+ */
+async function describeRestore(cwd: string): Promise<string> {
+	const tracked = (await git.status(cwd, { porcelainV1: true, untrackedFiles: "no" }).catch(() => "")).trim();
+	if (tracked) {
+		return `WARNING: working tree not fully restored — tracked changes remain after teardown:\n${tracked}`;
+	}
+	const all = (await git.status(cwd, { porcelainV1: true, untrackedFiles: "all" }).catch(() => "")).trim();
+	if (all) {
+		return "Working tree restored: tracked files reset to their pre-bisect state (untracked files the predicate created are left in place).";
+	}
+	return "Working tree restored to its pre-bisect state.";
+}
+
 export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDetails> {
 	readonly name = "bisect";
 	readonly label = "Bisect";
@@ -283,9 +304,19 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 				);
 			}
 		} finally {
-			// Always restore the working tree, even on error/abort.
+			// Always restore the working tree, even on error/abort. `git bisect
+			// reset` returns HEAD to the original branch/commit but leaves behind
+			// any tracked-file edits the `sh -c` predicate made mid-run. The tracked
+			// tree was verified clean before we started (precondition above), so
+			// discarding tracked modifications (reset --hard) only reverts the
+			// predicate's side effects, never user work; then bisect reset restores
+			// the original HEAD. Both are best-effort and must not throw here.
+			await git.reset(cwd, { hard: true }).catch(() => {});
 			await git.bisect.reset(cwd);
 		}
+
+		// Never claim a clean restore we did not actually achieve.
+		const restoreLine = await describeRestore(cwd);
 
 		if (outcome.concluded && outcome.culprit) {
 			const info = await git.bisect.describe(cwd, outcome.culprit).catch(() => null);
@@ -297,7 +328,7 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 				if (info.stat) lines.push("", "Files changed:", info.stat);
 			}
 			lines.push("", `Tested ${outcome.steps.length} revision(s):`, formatSteps(outcome.steps));
-			lines.push("", "Working tree restored (git bisect reset).");
+			lines.push("", restoreLine);
 			return toolResult<BisectToolDetails>({
 				culprit: outcome.culprit,
 				invert: params.invert,
@@ -317,7 +348,7 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 			`Tested ${outcome.steps.length} revision(s):`,
 			formatSteps(outcome.steps),
 			"",
-			"Working tree restored (git bisect reset).",
+			restoreLine,
 		];
 		return toolResult<BisectToolDetails>({
 			culprit: null,

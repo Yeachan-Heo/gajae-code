@@ -1,6 +1,6 @@
 Find the exact commit that introduced (or fixed) a behavior by driving `git bisect` with a shell predicate, then restore the working tree and report the culprit.
 
-Use this instead of running `git bisect` by hand when you have a reproducible pass/fail check and a known-good and known-bad revision. The tool guarantees clean setup and teardown (it always runs `git bisect reset`), so it never leaves the repository stranded in a detached bisect state.
+Use this instead of running `git bisect` by hand when you have a reproducible pass/fail check and a known-good and known-bad revision. The tool guarantees clean setup and teardown: it always runs `git bisect reset` and then discards any tracked-file edits the predicate made (`git reset --hard`), so it never leaves the repository stranded in a detached bisect state or with the predicate's tracked-file modifications behind. Untracked files the predicate creates are left in place (the tool never deletes files it did not create).
 
 Parameters:
 - `good`: the OLDER endpoint — a commit that must be an ancestor of `bad`.
@@ -19,4 +19,4 @@ Rules:
 - Make `run` self-contained and deterministic (build + test in one command). It runs from the repository working directory at each candidate commit.
 - Prefer a narrow predicate that targets only the behavior you are hunting, so unrelated breakage does not mislead the search.
 
-The result reports the first bad (or first fixing) commit with its author, date, subject, and changed files, plus every revision tested. The working tree is restored to where it started.
+The result reports the first bad (or first fixing) commit with its author, date, subject, and changed files, plus every revision tested. Every tracked file is restored to its pre-bisect state; if the predicate created untracked files they are reported and left in place.
