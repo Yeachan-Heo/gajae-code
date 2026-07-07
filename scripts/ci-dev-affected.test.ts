@@ -430,11 +430,27 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
 	};
 
-	test("push mode plans the package-wide test for a coding-agent change", () => {
+	test("push mode splits the package-wide coding-agent test across bounded shards", () => {
 		const tasks = planTasks(["packages/coding-agent/src/edit/foo.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
-		// Broad planner keeps the package-wide test (the post-merge fuller suite).
-		expect(keys).toContain("test:@gajae-code/coding-agent");
+		const testShards = tasks.filter(task => task.key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		// Broad planner keeps the post-merge fuller suite, but not as one 30m shard.
+		expect(testShards.map(task => task.key)).toEqual([
+			"test:@gajae-code/coding-agent:shard-1-of-8",
+			"test:@gajae-code/coding-agent:shard-2-of-8",
+			"test:@gajae-code/coding-agent:shard-3-of-8",
+			"test:@gajae-code/coding-agent:shard-4-of-8",
+			"test:@gajae-code/coding-agent:shard-5-of-8",
+			"test:@gajae-code/coding-agent:shard-6-of-8",
+			"test:@gajae-code/coding-agent:shard-7-of-8",
+			"test:@gajae-code/coding-agent:shard-8-of-8",
+		]);
+		expect(testShards[0]?.command).toEqual(["bun", "test", "--shard=1/8"]);
+		expect(testShards[0]?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
 		expect(keys).toContain("check:@gajae-code/coding-agent");
+
+		const entries = describeTasks(tasks);
+		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.native).toBe(true);
 	});
 });
