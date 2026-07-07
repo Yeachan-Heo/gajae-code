@@ -98,7 +98,7 @@ Complete this phase before Phase 1, before brownfield exploration, before GJC st
    - First inspect active deep-interview state with `gjc state deep-interview read --json`.
    - If state contains a finite numeric `threshold` and a non-empty `threshold_source`, use those values, set `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`, and skip optional settings-file reads. This is the normal `/skill:deep-interview` path because the native hook already resolved settings quietly before loading the skill.
 2. **Only if native state lacks a resolved threshold, read threshold settings in runtime precedence order**:
-   - YAML config first: `GJC_CODING_AGENT_DIR/config.yml`, then `$GJC_CONFIG_DIR/agent/config.yml`, then `~/.gjc/agent/config.yml`.
+   - YAML config first: read the **single** modern config path the environment selects — `$GJC_CODING_AGENT_DIR/config.yml` when `GJC_CODING_AGENT_DIR` is set, else `$GJC_CONFIG_DIR/agent/config.yml` when `GJC_CONFIG_DIR` is set, else `~/.gjc/agent/config.yml`. Do not cascade through the other YAML locations when the selected one is absent or invalid.
    - Then JSON settings: project settings `./.gjc/settings.json`, then user settings `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`.
    - Read `gjc.deepInterview.ambiguityThreshold` only from files that are known to exist; optional config/settings-file absence is expected and must not be surfaced as failed `Read` calls.
    - Do not probe arbitrary ancestor candidates such as `../../.gjc/settings.json`; use the current project `.gjc/settings.json` and user settings only.
