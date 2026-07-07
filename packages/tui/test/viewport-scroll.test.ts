@@ -87,6 +87,45 @@ describe("TUI manual viewport paging", () => {
 		}
 	});
 
+	it("keeps manual viewport control after paging to live while transient panel streams", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const content = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		const transientPanel = new Lines([]);
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(content);
+		tui.addChild(transientPanel);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "status", "editor"]);
+
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-3", "line-4", "line-5", "line-6", "line-7", "line-8"]);
+
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "status", "editor"]);
+
+			transientPanel.replace(["btw-0", "btw-1"]);
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "btw-0", "btw-1"]);
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-10", "line-11", "btw-0", "btw-1", "status", "editor"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("keeps Windows Terminal live output pinned when offscreen lines change during streaming", async () => {
 		const term = new VirtualTerminal(30, 5);
 		const tui = new TUI(term);

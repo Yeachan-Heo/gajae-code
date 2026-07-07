@@ -530,19 +530,13 @@ export class TUI extends Container {
 		const pageStep = Math.max(1, height - 1);
 		const targetViewportTop = Math.max(0, Math.min(maxViewportTop, currentViewportTop + direction * pageStep));
 
-		if (targetViewportTop >= maxViewportTop) {
-			this.#manualViewportTop = undefined;
-		} else {
-			this.#manualViewportTop = targetViewportTop;
-		}
-
-		const cursorPos = this.#manualViewportTop === undefined ? this.#lastCursorPosition : null;
+		this.#manualViewportTop = targetViewportTop;
 		return this.#repaintViewportFromLines(
 			this.#previousLines,
 			width,
 			height,
 			targetViewportTop,
-			cursorPos,
+			null,
 			"manual viewport scroll",
 		);
 	}
@@ -1695,9 +1689,8 @@ export class TUI extends Container {
 		if (this.#manualViewportTop !== undefined) {
 			const maxViewportTop = Math.max(0, newLines.length - height);
 			const nextViewportTop = Math.max(0, Math.min(maxViewportTop, this.#manualViewportTop));
-			const followingLive = nextViewportTop >= maxViewportTop;
-			this.#manualViewportTop = followingLive ? undefined : nextViewportTop;
-			const repaintCursorPos = followingLive ? cursorPos : null;
+			this.#manualViewportTop = nextViewportTop;
+			const repaintCursorPos = null;
 			if (
 				this.#repaintViewportFromLines(
 					newLines,
