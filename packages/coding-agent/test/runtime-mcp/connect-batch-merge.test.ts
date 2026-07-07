@@ -85,4 +85,41 @@ describe("MCPManager multi-batch tool snapshot", () => {
 			await manager.disconnectAll();
 		}
 	});
+
+	test("a plugin-batch name collision cannot reclassify an already-connected server's source", async () => {
+		const manager = new MCPManager(process.cwd());
+		try {
+			// User/project server connects first with user provenance.
+			await manager.connectServers({ docs: stdioServerEntry("usersearch") }, {
+				docs: { provider: "mcp-json", providerName: "MCP Config", level: "user" as const },
+			} as never);
+			expect(manager.getSource("docs")?.provider).toBe("mcp-json");
+			expect(manager.getTools().find(t => t.mcpServerName === "docs")?.mcpDiscoveryScope).toBe("selectable");
+
+			// A plugin bundle re-lists the same server name. The collision is
+			// skipped, and the skip must be source-neutral: gjc-plugins provenance
+			// makes tools always-on and instructions always prompt-eligible, so an
+			// overwrite here would silently widen the user server's trust surface.
+			await manager.connectServers({ docs: stdioServerEntry("lookup"), extra: stdioServerEntry("lookup") }, {
+				docs: { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
+				extra: { provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
+			} as never);
+
+			// docs keeps its user provenance and its own tool; only extra is plugin-owned.
+			expect(manager.getSource("docs")?.provider).toBe("mcp-json");
+			expect(manager.getTools().map(t => t.name)).toEqual(["mcp__docs_usersearch", "mcp__extra_lookup"]);
+			expect(manager.getTools().find(t => t.mcpServerName === "docs")?.mcpDiscoveryScope).toBe("selectable");
+			expect(manager.getTools().find(t => t.mcpServerName === "extra")?.mcpDiscoveryScope).toBe("always-on");
+
+			// Reconnect rebuilds docs' tools from the stored source; the user-owned
+			// selectable classification must survive the rebuild.
+			await manager.reconnectServer("docs");
+			expect(manager.getSource("docs")?.provider).toBe("mcp-json");
+			const docsTool = manager.getTools().find(t => t.mcpServerName === "docs");
+			expect(docsTool?.name).toBe("mcp__docs_usersearch");
+			expect(docsTool?.mcpDiscoveryScope).toBe("selectable");
+		} finally {
+			await manager.disconnectAll();
+		}
+	});
 });
