@@ -292,7 +292,7 @@ describe("system Handlebars prompt templates", () => {
 
 		expect(rendered).toContain("<media-ingestion>");
 		expect(rendered).toContain("For YouTube, podcasts, webinars, screen recordings");
-		expect(rendered).toContain("Do not let \"recover the full transcript\" silently replace");
+		expect(rendered).toContain('Do not let "recover the full transcript" silently replace');
 		expect(rendered).toContain("transcript/caption retrieval fails after two attempts");
 		expect(rendered).toContain("produce an evidence-scoped draft");
 		expect(rendered).toContain("Evidence used");
