@@ -1789,6 +1789,36 @@ describe("Editor component", () => {
 		});
 	});
 
+	describe("Vertical display column movement", () => {
+		it("uses display columns when moving down from CJK text to ASCII text", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("好好\nabcd");
+
+			editor.handleInput("\x01"); // Ctrl+A on second line
+			editor.handleInput("\x1b[A"); // Up to first line
+			editor.handleInput("\x1b[C"); // After first CJK grapheme, display column 2
+			editor.handleInput("\x1b[B"); // Down to matching display column in ASCII
+			editor.handleInput("X");
+
+			expect(editor.getText()).toBe("好好\nabXcd");
+			expect(editor.getCursor()).toEqual({ line: 1, col: 3 });
+		});
+
+		it("uses display columns when moving down from ASCII text to CJK text", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abcd\n好好");
+
+			editor.handleInput("\x01"); // Ctrl+A on second line
+			editor.handleInput("\x1b[A"); // Up to first line
+			editor.handleInput("\x1b[C");
+			editor.handleInput("\x1b[C"); // ASCII display column 2
+			editor.handleInput("\x1b[B"); // Down to after first CJK grapheme
+			editor.handleInput("X");
+
+			expect(editor.getText()).toBe("abcd\n好X好");
+			expect(editor.getCursor()).toEqual({ line: 1, col: 2 });
+		});
+	});
 	describe("Sticky column", () => {
 		it("preserves target column when moving up through a shorter line", () => {
 			const editor = new Editor(defaultEditorTheme);

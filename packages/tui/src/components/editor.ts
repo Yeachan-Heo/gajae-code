@@ -67,6 +67,7 @@ interface CachedWrappedLine extends WrappedLine {
 	lineRef: string;
 	contentWidth: number;
 }
+type VisualLineSegment = { logicalLine: number; startCol: number; length: number };
 
 function wordWrapAsciiLine(line: string, maxWidth: number): TextChunk[] {
 	if (line.length <= maxWidth) {
@@ -2110,27 +2111,25 @@ export class Editor implements Component, Focusable {
 	 * Move cursor to a target visual line, applying sticky column logic.
 	 * Shared by moveCursor() and pageScroll().
 	 */
-	#moveToVisualLine(
-		visualLines: Array<{ logicalLine: number; startCol: number; length: number }>,
-		currentVisualLine: number,
-		targetVisualLine: number,
-	): void {
+	#moveToVisualLine(visualLines: VisualLineSegment[], currentVisualLine: number, targetVisualLine: number): void {
 		const currentVL = visualLines[currentVisualLine];
 		const targetVL = visualLines[targetVisualLine];
 
 		if (currentVL && targetVL) {
-			const currentVisualCol = this.#state.cursorCol - currentVL.startCol;
+			const currentVisualCol = this.#getDisplayColInVisualLine(currentVL, this.#state.cursorCol);
 
-			// For non-last segments, clamp to length-1 to stay within the segment
+			// For non-last segments, clamp to the last valid in-segment display cell to stay within the segment.
 			const isLastSourceSegment =
 				currentVisualLine === visualLines.length - 1 ||
 				visualLines[currentVisualLine + 1]?.logicalLine !== currentVL.logicalLine;
-			const sourceMaxVisualCol = isLastSourceSegment ? currentVL.length : Math.max(0, currentVL.length - 1);
+			const sourceDisplayWidth = this.#getVisualLineDisplayWidth(currentVL);
+			const sourceMaxVisualCol = isLastSourceSegment ? sourceDisplayWidth : Math.max(0, sourceDisplayWidth - 1);
 
 			const isLastTargetSegment =
 				targetVisualLine === visualLines.length - 1 ||
 				visualLines[targetVisualLine + 1]?.logicalLine !== targetVL.logicalLine;
-			const targetMaxVisualCol = isLastTargetSegment ? targetVL.length : Math.max(0, targetVL.length - 1);
+			const targetDisplayWidth = this.#getVisualLineDisplayWidth(targetVL);
+			const targetMaxVisualCol = isLastTargetSegment ? targetDisplayWidth : Math.max(0, targetDisplayWidth - 1);
 
 			const moveToVisualCol = this.#computeVerticalMoveColumn(
 				currentVisualCol,
@@ -2140,10 +2139,39 @@ export class Editor implements Component, Focusable {
 
 			// Set cursor position
 			this.#state.cursorLine = targetVL.logicalLine;
-			const targetCol = targetVL.startCol + moveToVisualCol;
 			const logicalLine = this.#state.lines[targetVL.logicalLine] || "";
-			this.#state.cursorCol = Math.min(targetCol, logicalLine.length);
+			this.#state.cursorCol = this.#getStringIndexForDisplayCol(logicalLine, targetVL, moveToVisualCol);
 		}
+	}
+	#getVisualLineDisplayWidth(visualLine: VisualLineSegment): number {
+		const line = this.#state.lines[visualLine.logicalLine] || "";
+		return visibleWidth(line.slice(visualLine.startCol, visualLine.startCol + visualLine.length));
+	}
+
+	#getDisplayColInVisualLine(visualLine: VisualLineSegment, cursorCol: number): number {
+		const line = this.#state.lines[visualLine.logicalLine] || "";
+		const segmentStart = visualLine.startCol;
+		const segmentEnd = segmentStart + visualLine.length;
+		const clampedCursorCol = Math.max(segmentStart, Math.min(cursorCol, segmentEnd));
+		return visibleWidth(line.slice(segmentStart, clampedCursorCol));
+	}
+
+	#getStringIndexForDisplayCol(line: string, visualLine: VisualLineSegment, displayCol: number): number {
+		const segmentStart = visualLine.startCol;
+		const segmentEnd = segmentStart + visualLine.length;
+		if (displayCol <= 0) return segmentStart;
+
+		let width = 0;
+		for (const seg of segmenter.segment(line.slice(segmentStart, segmentEnd))) {
+			const graphemeWidth = visibleWidth(seg.segment);
+			const nextWidth = width + graphemeWidth;
+			const nextIndex = segmentStart + seg.index + seg.segment.length;
+			if (nextWidth === displayCol) return nextIndex;
+			if (nextWidth > displayCol) return segmentStart + seg.index;
+			width = nextWidth;
+		}
+
+		return segmentEnd;
 	}
 
 	/**
@@ -2577,8 +2605,8 @@ export class Editor implements Component, Focusable {
 	 * - startCol: starting column in the logical line
 	 * - length: length of this visual line segment
 	 */
-	#buildVisualLineMap(width: number): Array<{ logicalLine: number; startCol: number; length: number }> {
-		const visualLines: Array<{ logicalLine: number; startCol: number; length: number }> = [];
+	#buildVisualLineMap(width: number): VisualLineSegment[] {
+		const visualLines: VisualLineSegment[] = [];
 
 		for (let i = 0; i < this.#state.lines.length; i++) {
 			const line = this.#state.lines[i] || "";
@@ -2607,7 +2635,7 @@ export class Editor implements Component, Focusable {
 	/**
 	 * Find the visual line index for the current cursor position.
 	 */
-	#findCurrentVisualLine(visualLines: Array<{ logicalLine: number; startCol: number; length: number }>): number {
+	#findCurrentVisualLine(visualLines: VisualLineSegment[]): number {
 		for (let i = 0; i < visualLines.length; i++) {
 			const vl = visualLines[i];
 			if (!vl) continue;
@@ -2662,7 +2690,7 @@ export class Editor implements Component, Focusable {
 					// At end of last line - can't move, but set preferredVisualCol for up/down navigation
 					const currentVL = visualLines[currentVisualLine];
 					if (currentVL) {
-						this.#preferredVisualCol = this.#state.cursorCol - currentVL.startCol;
+						this.#preferredVisualCol = this.#getDisplayColInVisualLine(currentVL, this.#state.cursorCol);
 					}
 				}
 			} else {
