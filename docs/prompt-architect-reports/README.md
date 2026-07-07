@@ -13,6 +13,8 @@ Generated from the four architect subagents spawned to review prompt optimizatio
 - `recovered-context/3-SkillMiscPrompts.recovered.md` — recovered skill/misc context: reads/searches/errors; no findings/yield emitted.
 - `recovered-context/3-SkillMiscPrompts.findings.json` — empty; no `report_finding` calls emitted.
 - `tool-prompts.raw.md`, `system-prompts.raw.md`, `skill-misc-prompts.raw.json` — initial raw-stub artifacts kept for audit history; superseded by `recovery-summary.md` and `recovered-context/`.
+- `system-prompts.rerun.json` — successful re-run of the SystemPrompts lane (grade C, 12 findings: 1 P1, 6 P2, 5 P3).
+- `skill-misc-prompts.rerun.json` — successful re-run of the SkillMiscPrompts lane (grade C, 9 findings: 1 P1, 4 P2, 4 P3).
 
 ## Usable verdicts
 
@@ -37,10 +39,14 @@ Highest-impact recovered findings:
 3. `apply-patch.md` has a truncated “Within a hunk each line starts with:” sentence.
 4. `ast-edit.md` omits the preview-to-`resolve({action:"apply"})` persistence flow.
 
-### SystemPrompts / SkillMiscPrompts
+### SystemPrompts (re-run)
 
-Both failed before emitting structured findings or `yield`. Their contexts were recovered as read/search/error logs only, so they have coverage evidence but no valid verdict.
+Grade **C**, **12 findings** (1 P1, 6 P2, 5 P3). Top fixes: remove the `<soul>` block contradicting the base prompt's authority/safety contracts; guard `{{toolRefs.search_tool_bm25}}` discovery text on the actual activator tool; make plan-mode subagent output instructions yield-aware. See `system-prompts.rerun.json`.
 
-## Caveat
+### SkillMiscPrompts (re-run)
 
-The batch did not produce four independent final reports. The prompt-corpus audit is partial: agent prompts are fully reviewed, tool prompts have strong recovered findings without a final grade, and system/skill prompts have only context coverage from failed sessions.
+Grade **C**, **9 findings** (1 P1, 4 P2, 4 P3). Top fixes: fix unrendered `{{ARGUMENTS}}` in deep-interview SKILL; remove dead `plan` skill / `--research-setup` / `gjc sparkshell` / `team_cleanup` references; complete the ultragoal `executorQa` replay contract. See `skill-misc-prompts.rerun.json`.
+
+## Status
+
+All four lanes now have usable reports: AgentPrompts and ToolPrompts findings were applied in this branch's prompt fixes; SystemPrompts and SkillMiscPrompts re-run findings are recorded above and pending application.
