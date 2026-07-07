@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Anthropic usage now parses the modern `limits[]` array's `weekly_scoped` entries (model-scoped weekly limits such as a "Claude Fable 5" weekly cap) that the legacy `seven_day_opus`/`seven_day_sonnet` buckets no longer report. Each entry is emitted as an `anthropic:7d:<model>` limit with the model display name as its tier, and a payload carrying only modern scoped limits now counts as usage data instead of being retried and dropped.
+
 - Capped OpenCode Go Kimi reasoning efforts that the Go chat-completions endpoint rejects (`kimi-k2.5:minimal` → `low`, `kimi-k2.7-code:xhigh|max` → `high`) and degraded forced `tool_choice` for those models so Kimi Go sessions and title-generation turns no longer fail with generic upstream 400s.
 
 ## [0.8.2] - 2026-07-06

@@ -63,6 +63,8 @@ interface ClaudeUsageResponse {
 	seven_day?: ClaudeUsageBucket | null;
 	seven_day_opus?: ClaudeUsageBucket | null;
 	seven_day_sonnet?: ClaudeUsageBucket | null;
+	/** Modern limits[] array carrying e.g. model-scoped weekly limits. */
+	limits?: unknown[] | null;
 }
 
 type ClaudeUsagePayload = {
@@ -126,7 +128,8 @@ function hasUsageData(payload: ClaudeUsageResponse): boolean {
 		parseBucket(payload.five_hour)?.utilization !== undefined ||
 		parseBucket(payload.seven_day)?.utilization !== undefined ||
 		parseBucket(payload.seven_day_opus)?.utilization !== undefined ||
-		parseBucket(payload.seven_day_sonnet)?.utilization !== undefined
+		parseBucket(payload.seven_day_sonnet)?.utilization !== undefined ||
+		parseScopedWeeklyLimits(payload).length > 0
 	);
 }
 
@@ -325,6 +328,44 @@ function buildUsageLimit(args: {
 	};
 }
 
+/**
+ * Parse the modern `limits[]` array's `weekly_scoped` entries: model-scoped
+ * weekly limits (e.g. a "Claude Fable 5" weekly cap) that the legacy
+ * seven_day_opus/seven_day_sonnet buckets no longer report. Each entry becomes
+ * an `anthropic:7d:<model>` limit with the model display name as its tier.
+ */
+function parseScopedWeeklyLimits(payload: ClaudeUsageResponse): UsageLimit[] {
+	const entries = Array.isArray(payload.limits) ? payload.limits : [];
+	const scoped: UsageLimit[] = [];
+	for (const entry of entries) {
+		if (!isRecord(entry) || entry.kind !== "weekly_scoped") continue;
+		const percent = toNumber(entry.percent);
+		if (percent === undefined) continue;
+		const scope = isRecord(entry.scope) ? entry.scope : undefined;
+		const model = scope && isRecord(scope.model) ? scope.model : undefined;
+		const displayName =
+			model && typeof model.display_name === "string" && model.display_name.trim()
+				? model.display_name.trim()
+				: undefined;
+		const tier = displayName ? displayName.toLowerCase() : "scoped";
+		const limit = buildUsageLimit({
+			id: `anthropic:7d:${tier}`,
+			label: displayName ? `Claude 7 Day (${displayName})` : "Claude 7 Day (scoped)",
+			windowId: "7d",
+			windowLabel: "7 Day",
+			durationMs: SEVEN_DAYS_MS,
+			bucket: {
+				utilization: percent,
+				resetsAt: parseIsoTime(typeof entry.resets_at === "string" ? entry.resets_at : undefined),
+			},
+			provider: "anthropic",
+			tier,
+		});
+		if (limit) scoped.push(limit);
+	}
+	return scoped;
+}
+
 async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
 	if (params.provider !== "anthropic") return null;
 	const credential = params.credential;
@@ -388,6 +429,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 			tier: "sonnet",
 		}),
 	].filter((limit): limit is UsageLimit => limit !== null);
+	limits.push(...parseScopedWeeklyLimits(payload));
 
 	if (limits.length === 0) return null;
 	const identity = extractUsageIdentity(payload, orgId);

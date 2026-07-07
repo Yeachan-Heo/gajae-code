@@ -111,4 +111,74 @@ describe("claude usage request headers", () => {
 
 		expect(report?.limits[0]?.window?.resetsAt).toBeUndefined();
 	});
+
+	it("parses modern limits[] weekly_scoped entries as model-scoped 7d limits", async () => {
+		const now = Date.now();
+		const resetsAt = new Date(now + 3 * 24 * 60 * 60 * 1000).toISOString();
+		const fetchMock = (async () => {
+			return new Response(
+				JSON.stringify({
+					five_hour: { utilization: 42 },
+					limits: [
+						{
+							kind: "weekly_scoped",
+							percent: 63,
+							resets_at: resetsAt,
+							scope: { model: { display_name: "Fable" } },
+						},
+						// Unknown kinds and malformed entries are ignored.
+						{ kind: "monthly_total", percent: 10 },
+						{ kind: "weekly_scoped" },
+						"garbage",
+					],
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const report = await claudeUsageProvider.fetchUsage(
+			{
+				provider: "anthropic",
+				credential: {
+					type: "oauth",
+					accessToken: "oat-test-access-token",
+					expiresAt: Date.now() + 60_000,
+				},
+			},
+			{ fetch: fetchMock },
+		);
+
+		const scoped = report?.limits.find(limit => limit.id === "anthropic:7d:fable");
+		expect(scoped).toBeDefined();
+		expect(scoped?.label).toBe("Claude 7 Day (Fable)");
+		expect(scoped?.scope.tier).toBe("fable");
+		expect(scoped?.amount.used).toBe(63);
+		expect(scoped?.window?.resetsAt).toBe(Date.parse(resetsAt));
+		expect(report?.limits.map(limit => limit.id)).toEqual(["anthropic:5h", "anthropic:7d:fable"]);
+	});
+
+	it("accepts a payload that only carries modern weekly_scoped limits", async () => {
+		const fetchMock = (async () => {
+			return new Response(
+				JSON.stringify({
+					limits: [{ kind: "weekly_scoped", percent: 5, scope: { model: { display_name: "Fable" } } }],
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const report = await claudeUsageProvider.fetchUsage(
+			{
+				provider: "anthropic",
+				credential: {
+					type: "oauth",
+					accessToken: "oat-test-access-token",
+					expiresAt: Date.now() + 60_000,
+				},
+			},
+			{ fetch: fetchMock },
+		);
+
+		expect(report?.limits.map(limit => limit.id)).toEqual(["anthropic:7d:fable"]);
+	});
 });
