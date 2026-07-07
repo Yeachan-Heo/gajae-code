@@ -25,6 +25,7 @@ const PUBLIC_HOMEPAGE = "https://gajae-code.com";
 const GENERATED_DOCS_INDEX = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
 const VERSIONED_MARKETING_RE = /\b(?:New in|Also new in|Gajae Code|Gajae-Code|Feature card for the)\s+(\d+\.\d+\.\d+)\b/gi;
 const MARKETING_VERSION_FILES = ["README.md", "docs/**/*.md", "packages/*/README.md"];
+const LIVE_FETCH_TIMEOUT_MS = 5_000;
 
 async function pathExists(candidate: string): Promise<boolean> {
 	try {
@@ -183,7 +184,7 @@ export async function checkPublicVersionSync(repoRoot = path.join(import.meta.di
 	return violations;
 }
 
-export async function checkLivePublicVersionSync(repoRoot = path.join(import.meta.dir, ".."), fetchImpl: PublicFetch = fetch): Promise<SyncViolation[]> {
+export async function checkLivePublicVersionSync(repoRoot = path.join(import.meta.dir, ".."), fetchImpl: PublicFetch = fetch, timeoutMs = LIVE_FETCH_TIMEOUT_MS): Promise<SyncViolation[]> {
 	const violations: SyncViolation[] = [];
 	const canonicalVersion = await canonicalVersionForRepo(repoRoot);
 
@@ -196,6 +197,7 @@ export async function checkLivePublicVersionSync(repoRoot = path.join(import.met
 	try {
 		response = await fetchImpl(PUBLIC_HOMEPAGE, {
 			headers: { "User-Agent": "gajae-code-public-version-sync/1.0" },
+			signal: AbortSignal.timeout(timeoutMs),
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

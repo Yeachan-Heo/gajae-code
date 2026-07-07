@@ -88,6 +88,21 @@ describe("public docs/site/version sync guard", () => {
 		await expect(checkLivePublicVersionSync(root, fetchImpl)).resolves.toEqual([]);
 	});
 
+	test("live check sends a bounded timeout signal to the homepage fetch", async () => {
+		const root = await createRepo({
+			"package.json": rootPackage("1.2.3"),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent", "1.2.3"),
+		});
+		let observedSignal: AbortSignal | undefined;
+		const fetchImpl = async (_input: string | URL, init?: RequestInit) => {
+			observedSignal = init?.signal ?? undefined;
+			return new Response("<main>🦀 v1.2.3 · beta</main>");
+		};
+
+		await expect(checkLivePublicVersionSync(root, fetchImpl, 50)).resolves.toEqual([]);
+		expect(observedSignal).toBeInstanceOf(AbortSignal);
+	});
+
 	test("live check fails when deployed homepage exposes a stale version", async () => {
 		const root = await createRepo({
 			"package.json": rootPackage("1.2.3"),
