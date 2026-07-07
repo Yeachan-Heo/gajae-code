@@ -255,7 +255,10 @@ owner_exit_severity = "normal"
 runtime_state_value = runtime_summary["state"]
 runtime_matches = runtime_summary["valid"] and runtime_summary["sessionMatches"] and runtime_summary["cwdMatches"]
 
-if runtime_summary["terminal"]:
+if runtime_matches and runtime_summary["source"] == "process_postmortem":
+    owner_exit_reason = runtime_summary["reason"] or "process_postmortem"
+    owner_exit_severity = "failure"
+elif runtime_summary["terminal"]:
     owner_exit_reason = "terminal_runtime_cleanup"
     owner_exit_severity = "normal"
 elif not turn_evidence_present:
