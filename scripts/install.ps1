@@ -256,11 +256,19 @@ function Install-Binary {
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-    # Download binary
+    # Download binary to a temp file first so a failed or partial download
+    # never clobbers an existing working install at $InstallDir\gjc.exe.
     $BinaryUrl = "https://github.com/$Repo/releases/download/$Latest/$BinaryName"
     Write-Host "Downloading $BinaryName..."
     $OutPath = Join-Path $InstallDir "gjc.exe"
-    Invoke-WebRequest -Uri $BinaryUrl -OutFile $OutPath
+    $DownloadTmp = Join-Path $InstallDir (".gjc.download." + [System.Guid]::NewGuid().ToString("N"))
+    try {
+        Invoke-WebRequest -Uri $BinaryUrl -OutFile $DownloadTmp
+    } catch {
+        Remove-Item -Force $DownloadTmp -ErrorAction SilentlyContinue
+        throw
+    }
+    Move-Item -Force $DownloadTmp $OutPath
 
     Write-Host ""
     Write-Host "✓ Installed gjc to $OutPath" -ForegroundColor Green
