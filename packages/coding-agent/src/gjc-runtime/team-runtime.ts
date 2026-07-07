@@ -204,6 +204,7 @@ export type GjcTeamNotificationDeliveryState =
 	| "acknowledged";
 
 export type GjcTeamPaneAttemptResult = "sent" | "queued" | "deferred" | "failed";
+export type GjcTeamMailboxDeliveryTransportKind = "notifications_sdk" | "pane";
 
 export interface GjcTeamNotification {
 	id: string;
@@ -219,6 +220,33 @@ export interface GjcTeamNotification {
 	created_at: string;
 	updated_at: string;
 	replay_count: number;
+}
+export interface GjcTeamMailboxDeliveryInput {
+	team_name: string;
+	state_dir: string;
+	config: GjcTeamConfig;
+	notification: GjcTeamNotification;
+	message: GjcTeamMailboxMessage;
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+}
+export type GjcTeamMailboxDeliveryResult =
+	| { transport: "notifications_sdk"; state: GjcTeamNotificationDeliveryState; reason?: string }
+	| { transport: "pane"; state: GjcTeamPaneAttemptResult; reason?: string };
+export interface GjcTeamMailboxDeliveryTransport {
+	deliverMailboxMessage(input: GjcTeamMailboxDeliveryInput): Promise<GjcTeamMailboxDeliveryResult | null>;
+}
+
+let gjcTeamMailboxDeliveryTransport: GjcTeamMailboxDeliveryTransport | undefined;
+
+export function setGjcTeamMailboxDeliveryTransportForTest(
+	transport: GjcTeamMailboxDeliveryTransport | undefined,
+): () => void {
+	const previous = gjcTeamMailboxDeliveryTransport;
+	gjcTeamMailboxDeliveryTransport = transport;
+	return () => {
+		gjcTeamMailboxDeliveryTransport = previous;
+	};
 }
 
 export interface GjcTeamNotificationSummary {
@@ -3902,12 +3930,58 @@ async function reconcileTeamNotifications(dir: string, config: GjcTeamConfig): P
 	}
 	return summarizeNotifications(await listNotificationRecords(dir));
 }
+async function messageForNotification(
+	dir: string,
+	notification: GjcTeamNotification,
+): Promise<GjcTeamMailboxMessage | null> {
+	if (notification.kind !== "mailbox_message" || notification.source.type !== "message") return null;
+	const mailbox = await readMailbox(dir, notification.recipient);
+	return mailbox.messages.find(message => message.message_id === notification.source.id) ?? null;
+}
+
+async function attemptConfiguredMailboxTransport(
+	dir: string,
+	config: GjcTeamConfig,
+	notification: GjcTeamNotification,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+): Promise<GjcTeamNotification | null> {
+	if (!gjcTeamMailboxDeliveryTransport) return null;
+	const message = await messageForNotification(dir, notification);
+	if (!message) return null;
+	try {
+		const result = await gjcTeamMailboxDeliveryTransport.deliverMailboxMessage({
+			team_name: config.team_name,
+			state_dir: dir,
+			config,
+			notification,
+			message,
+			cwd,
+			env,
+		});
+		if (!result) return null;
+		return writeNotificationRecord(dir, {
+			...notification,
+			delivery_state: result.state,
+			pane_attempt_result: result.transport === "pane" ? result.state : undefined,
+			pane_attempt_reason: result.reason ?? result.transport,
+			pane_attempt_at: now(),
+			updated_at: now(),
+		});
+	} catch {
+		return null;
+	}
+}
+
 async function attemptPaneNotification(
 	dir: string,
 	config: GjcTeamConfig,
 	notification: GjcTeamNotification,
 	env: NodeJS.ProcessEnv,
+	cwd = process.cwd(),
 ): Promise<GjcTeamNotification> {
+	const transported = await attemptConfiguredMailboxTransport(dir, config, notification, cwd, env);
+	if (transported) return transported;
 	const paneId =
 		notification.recipient === "leader-fixed"
 			? config.leader.pane_id
@@ -3954,6 +4028,7 @@ export async function replayGjcTeamNotifications(
 				replay_count: (notification.replay_count ?? 0) + 1,
 			},
 			env,
+			cwd,
 		);
 		next.push(attempted);
 	}
@@ -3982,8 +4057,13 @@ export async function sendGjcTeamMessage(
 		...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
 	};
 	const written = await writeMailboxMessage(dir, toWorker, message);
+	const existingNotification = await readJsonFile<GjcTeamNotification>(
+		notificationPath(dir, messageNotificationId(config.team_name, toWorker, written.message_id)),
+	);
 	const notification = await createMessageNotification(dir, config.team_name, written);
-	await attemptPaneNotification(dir, config, notification, env);
+	if (!existingNotification || isReplayEligibleNotification(existingNotification.delivery_state)) {
+		await attemptPaneNotification(dir, config, notification, env, cwd);
+	}
 	await appendEvent(dir, {
 		type: "message_sent",
 		worker: fromWorker,
