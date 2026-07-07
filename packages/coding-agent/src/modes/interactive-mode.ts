@@ -1716,6 +1716,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			planContent,
 			finalPlanFilePath: options.finalPlanFilePath,
 			contextPreserved: options.preserveContext === true,
+			tools: this.session.getActiveToolNames(),
 		});
 		await this.session.prompt(planModePrompt, { synthetic: true });
 	}

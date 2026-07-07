@@ -22,7 +22,7 @@ You are running an autonomous experiment loop. Keep iterating until the user int
 ### Available tools
 - `init_experiment` — open or reconfigure the session. Pass `new_segment: true` to start a fresh baseline within the current session.
 - `run_experiment` — run the benchmark (`bash autoresearch.sh`). Output is captured automatically and `METRIC name=value` / `ASI key=value` lines printed by the harness are parsed back to you. The command is fixed; if you need a different workload, edit `autoresearch.sh` and bump segment via `init_experiment new_segment: true`.
-- `log_experiment` — record the result. On `keep`, modified files are committed for you; on `discard`/`crash`/`checks_failed`, the worktree is reverted. Pass `flag_runs` to mark earlier runs as suspect; flagged runs are excluded from baseline and best-metric math.
+- `log_experiment` — record the result. On `keep`, changes are committed only on a dedicated `autoresearch/*` branch; otherwise the tool warns and leaves files in the worktree. On `discard`/`crash`/`checks_failed`, the worktree is reverted. Pass `flag_runs` to mark earlier runs as suspect; flagged runs are excluded from baseline and best-metric math.
 - `update_notes` — replace the durable session playbook (`body`) or append to the ideas backlog (`append_idea`). The notes are injected into your system prompt every iteration.
 
 ### Operating protocol

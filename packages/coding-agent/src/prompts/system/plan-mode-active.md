@@ -98,7 +98,7 @@ You MUST update `{{planFilePath}}` (`{{editToolName}}` for changes, `{{writeTool
 </procedure>
 
 <caution>
-You MUST ask questions throughout. You NEVER make large assumptions about user intent.
+Ask only when exploration cannot resolve a material requirement or tradeoff; otherwise proceed to `resolve` with the self-contained plan. You NEVER make large assumptions about user intent.
 </caution>
 {{/if}}
 

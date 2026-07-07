@@ -14,12 +14,12 @@ You MUST explore the codebase and report findings. Main agent updates plan file.
 
 <procedure>
 1. You MUST use read-only tools to investigate
-2. You MUST describe plan changes in response text
-3. You MUST end with a Critical Files section
+2. You MUST return the markdown report inside `yield.result.data`, not as plain response text
+3. The markdown report MUST end with a Critical Files section
 </procedure>
 
 <output>
-End response with:
+Return a markdown report inside `yield.result.data` ending with:
 
 ### Critical Files for Implementation
 

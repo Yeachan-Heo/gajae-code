@@ -343,14 +343,15 @@ Use only after checking `gjc team status <team>` and state evidence:
    - `.gjc/_session-{sessionid}/state/team/<team>/config.json`
    - `.gjc/_session-{sessionid}/state/team/<team>/tasks/task-1.json`
    - `.gjc/_session-{sessionid}/state/team/<team>/mailbox/worker-1.json`
-2. Capture pane tail to confirm current worker state:
-   - `tmux capture-pane -t %<worker-pane> -p -S -120`
-   - If a larger-tail read or bounded summary would help, prefer explicit opt-in inspection via `gjc sparkshell --tmux-pane %<worker-pane> --tail-lines 400` before improvising extra tmux commands.
-3. If the pane is stuck in an interactive state, safely return to idle prompt first:
-   - optional interrupt `C-c` or escape flow (CLI-specific) once, then re-check pane capture
+2. Use supported team surfaces before manual pane intervention:
+   - `gjc team status <team>` for current recorded state
+   - `gjc team monitor <team>` when a live monitor/update loop is needed
+   - `gjc team api <team>` only for documented programmatic operations
+3. If the recorded worker pane is stuck in an interactive state, safely return to idle prompt first:
+   - optional interrupt `C-c` or escape flow (CLI-specific) once, then re-check `gjc team status <team>` and relevant state files
 4. Send one concise trigger only when runtime/state checks show manual prompt input is needed:
    - `tmux send-keys -t %<worker-pane> "continue current task; report status" C-m`
-5. Re-check pane output, task state, worker mailbox, and `gjc team status <team>`.
+5. Re-check task state, worker mailbox, and `gjc team status <team>`.
 
 ### Shutdown reports success but stale worker panes remain
 
@@ -372,8 +373,9 @@ tmux list-panes -F '#{pane_id}	#{pane_current_command}	#{pane_start_command}'
 tmux kill-pane -t %450
 tmux kill-pane -t %451
 
-# 3) Remove stale team state only after preserving needed evidence, using the state runtime
-# cleanup verb documented by the current manifest
+# 3) Shut down recorded team state/workers through the supported team runtime
+# Replace <team-name> with the team from `gjc team list` / `gjc team status`.
+gjc team shutdown <team-name>
 
 # 4) Retry
 gjc team executor "fresh retry"
@@ -396,7 +398,7 @@ When operating this skill, provide concrete progress evidence:
 
 Do not claim success without file/pane evidence.
 Do not claim clean completion if shutdown occurred with `in_progress>0`.
-Use `gjc sparkshell --tmux-pane ...` as an explicit opt-in operator aid for pane inspection and summaries; keep raw `tmux capture-pane` evidence available for manual intervention and proof.
+Use `gjc team status <team>` and `gjc team monitor <team>` as the supported operator aids for status inspection; keep raw state-file or pane evidence available for manual intervention and proof.
 
 ## Programmatic Team Orchestration
 
@@ -405,14 +407,15 @@ Use the `gjc team ...` CLI as the supported team-launch surface. For automation,
 ### Supported current surfaces
 
 - **`gjc team ...` CLI** — Primary method for interactive or automated team orchestration. Use this when you want direct tmux-pane visibility or a scriptable launch path.
+- **`gjc team status <team>`** — Read current team/task/worker state.
+- **`gjc team monitor <team>`** — Follow live progress through the supported runtime surface.
+- **`gjc team shutdown <team>`** — Stop recorded active workers and move the team toward terminal state.
+- **`gjc team api <team>`** — Use only for documented programmatic operations exposed by the team runtime.
 - **Team state files** — Inspect `.gjc/_session-{sessionid}/state/team/<team>/` when you need status, task, or mailbox evidence after launch.
 
 ### Cleanup distinction
 
-Two cleanup paths exist and must not be confused:
-
-- `team_cleanup` (**state-server**): Deletes team state **files** on disk (`.gjc/_session-{sessionid}/state/team/<team>/`). Use after a team run is fully complete.
-- tmux/session cleanup: Use the documented `gjc team` shutdown / cleanup flow when you need to stop the worker pane or clean up an interrupted run.
+Use `gjc team shutdown <team>` for recorded active workers. After shutdown reports a terminal state and required evidence is preserved, use supported `gjc state ...` session/mode cleanup commands only when you are intentionally clearing state; do not delete team state by hand during an active run. Use manual tmux/session cleanup only for verified stale panes that are not handled by the documented shutdown flow.
 
 ### Automation example
 

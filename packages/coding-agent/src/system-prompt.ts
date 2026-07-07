@@ -573,6 +573,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	// Build tool descriptions for system prompt rendering.
 	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
+	const hasHiddenToolDiscoveryTool = Object.hasOwn(toolRefs, "search_tool_bm25");
 	const toolInfo = toolNames.map(name => ({
 		name: toolPromptNames.get(name) ?? name,
 		internalName: name,
@@ -614,10 +615,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd: promptCwd,
 		intentTracing: !!intentField,
 		intentField: intentField ?? "",
-		mcpDiscoveryMode,
+		mcpDiscoveryMode: mcpDiscoveryMode && hasHiddenToolDiscoveryTool,
 		hasMCPDiscoveryServers: mcpDiscoveryServerSummaries.length > 0,
 		mcpDiscoveryServerSummaries,
-		toolDiscoveryActive,
+		toolDiscoveryActive: toolDiscoveryActive && hasHiddenToolDiscoveryTool,
 		discoverableTools,
 		eagerTasks,
 		secretsEnabled,

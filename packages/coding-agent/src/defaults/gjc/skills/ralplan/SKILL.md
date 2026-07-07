@@ -108,7 +108,7 @@ The consensus workflow:
 > **Important:** Architect and Critic MAY run in the same parallel batch only for the plan-only Critic lane after Planner persistence. Any Architect-dependent Critic pass MUST remain sequential: await Architect before issuing Critic, then apply the same review join gate before consensus.
 
 
-Follow the Plan skill's full documentation for consensus mode details.
+Follow this ralplan-internal consensus workflow for consensus mode details.
 
 ### Persisted Planner (consensus loop)
 
