@@ -38,13 +38,17 @@ export function getNotificationConfig(settings: Settings): NotificationConfig {
 	};
 }
 
+function hasNonBlankValue(value: string | undefined): boolean {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
 /** Is global config sufficient for auto-on (enabled + at least one configured adapter)? */
 export function isGloballyConfigured(cfg: NotificationConfig): boolean {
 	return (
 		cfg.enabled &&
-		((Boolean(cfg.botToken) && Boolean(cfg.chatId)) ||
-			(Boolean(cfg.discord.botToken) && Boolean(cfg.discord.channelId)) ||
-			(Boolean(cfg.slack.botToken) && Boolean(cfg.slack.channelId)))
+		((hasNonBlankValue(cfg.botToken) && hasNonBlankValue(cfg.chatId)) ||
+			(hasNonBlankValue(cfg.discord.botToken) && hasNonBlankValue(cfg.discord.channelId)) ||
+			(hasNonBlankValue(cfg.slack.botToken) && hasNonBlankValue(cfg.slack.channelId)))
 	);
 }
 
@@ -88,6 +92,7 @@ export function isSessionNotificationsEnabled(input: {
 /** Mask a bot token for display: first 4 chars + "…" + "(len N)"; "(unset)" when undefined/empty. Never reveal full token. */
 export function maskToken(token: string | undefined): string {
 	if (!token) return "(unset)";
+	if (token.length <= 4) return `…(len ${token.length})`;
 	return `${token.slice(0, 4)}…(len ${token.length})`;
 }
 
@@ -131,6 +136,6 @@ export function buildRedactedAction(
 	// Asks stay fully readable/answerable even under redaction.
 	if (action.kind === "ask") return action;
 
-	const { summary: _summary, question: _question, ...base } = action;
+	const { summary: _summary, question: _question, options: _options, ...base } = action;
 	return base;
 }

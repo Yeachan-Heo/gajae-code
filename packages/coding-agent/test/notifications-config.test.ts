@@ -92,6 +92,16 @@ describe("notifications config", () => {
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, botToken: "" })).toBe(false);
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: undefined })).toBe(false);
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: "" })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, botToken: " " })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: "\t" })).toBe(false);
+		expect(
+			isGloballyConfigured({
+				...BASE_CFG,
+				enabled: true,
+				botToken: " ",
+				chatId: "\t",
+			}),
+		).toBe(false);
 		expect(
 			isGloballyConfigured({
 				...BASE_CFG,
@@ -343,6 +353,8 @@ describe("notifications config", () => {
 	test("maskToken handles unset tokens and never reveals the raw token", () => {
 		expect(maskToken(undefined)).toBe("(unset)");
 		expect(maskToken("")).toBe("(unset)");
+		expect(maskToken("abc")).toBe("…(len 3)");
+		expect(maskToken("abc")).not.toContain("abc");
 
 		const token = "1234567890:super-secret-token";
 		const masked = maskToken(token);
@@ -388,6 +400,23 @@ describe("notifications config", () => {
 		};
 
 		expect(buildRedactedAction(action, { redact: false, sessionTag: "abcdef" })).toBe(action);
+	});
+
+	test("buildRedactedAction strips question and options for non-ask actions", () => {
+		const action: RedactableAction = {
+			id: "custom-1",
+			kind: "custom",
+			sessionId: "session-abcdef",
+			question: "Sensitive question?",
+			options: ["Sensitive option"],
+			summary: "Sensitive summary",
+		};
+
+		expect(buildRedactedAction(action, { redact: true, sessionTag: "abcdef" })).toEqual({
+			id: "custom-1",
+			kind: "custom",
+			sessionId: "session-abcdef",
+		});
 	});
 
 	test("buildRedactedAction strips only summary for idle actions", () => {
