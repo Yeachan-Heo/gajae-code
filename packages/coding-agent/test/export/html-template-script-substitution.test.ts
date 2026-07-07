@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import type { MarkedExtension } from "marked";
+import { Marked } from "marked";
 import { TEMPLATE } from "../../src/export/html/template.generated";
 
 // Regression: `String.prototype.replace(string, string)` treats `$'`, `$&`,
@@ -28,16 +30,30 @@ describe("HTML export template script inlining", () => {
 		html(token: { raw?: string; text?: string }): string;
 		code(token: { text: string; lang?: string }): string;
 		codespan(token: { text: string }): string;
+		link(token: { href?: string; title?: string | null; tokens?: unknown[] }): string;
+		image(token: { href?: string; title?: string | null; text?: string; tokens?: unknown[] }): string;
 	}
 
 	interface MarkedStub {
-		use(config: { renderer: MarkdownRenderer }): void;
-		parse(text: string): string;
+		use(config: { renderer: MarkdownRenderer; breaks?: boolean; gfm?: boolean }): void;
+		parse(text: string): string | Promise<string>;
 	}
 
 	interface HighlightStub {
 		getLanguage(): boolean;
 		highlightAuto(tokenText: string): { value: string };
+	}
+
+	function createRealMarkedStub(): MarkedStub {
+		const marked = new Marked<string, string>();
+		return {
+			use(config) {
+				marked.use(config as MarkedExtension<string, string>);
+			},
+			parse(text) {
+				return marked.parse(text, { async: false });
+			},
+		};
 	}
 
 	function createEscapingElement(): { textContent: string; readonly innerHTML: string } {
@@ -55,11 +71,11 @@ describe("HTML export template script inlining", () => {
 		};
 	}
 
-	function buildMarkdownRenderer(): (text: string) => string {
+	function buildMarkdownRenderer(markedOverride?: MarkedStub): (text: string) => string {
 		const script = extractScript();
 		const block = extractMarkdownInitializationScript(script);
 		let renderer: MarkdownRenderer | undefined;
-		const marked: MarkedStub = {
+		const marked: MarkedStub = markedOverride ?? {
 			use(config) {
 				renderer = config.renderer;
 			},
@@ -91,7 +107,7 @@ describe("HTML export template script inlining", () => {
 			"document",
 			`function escapeHtml(text) { const div = document.createElement('div'); div.textContent = text; return div.innerHTML; }\n${block}; return safeMarkedParse;`,
 		) as (marked: MarkedStub, hljs: HighlightStub, document: typeof documentStub) => (text: string) => string;
-		return factory(marked, hljs, documentStub);
+		return (text: string) => String(factory(marked, hljs, documentStub)(text));
 	}
 
 	function createEscapingElementFromText(text: string): { readonly innerHTML: string } {
@@ -130,5 +146,31 @@ describe("HTML export template script inlining", () => {
 		expect(html).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
 		expect(html).toContain("<code>x &lt; y</code>");
 		expect(html).toContain('<pre><code class="hljs">&lt;img src=x onerror=alert(1)&gt;</code></pre>');
+	});
+
+	it("neutralizes markdown links with unsafe URL schemes", () => {
+		const renderMarkdown = buildMarkdownRenderer(createRealMarkedStub());
+		const html = renderMarkdown("[x](javascript:alert(1))");
+
+		expect(html).not.toContain("href=");
+		expect(html).not.toContain('href="javascript:alert(1)"');
+		expect(html).toContain("javascript:alert(1)");
+	});
+
+	it("neutralizes markdown images with unsafe URL schemes", () => {
+		const renderMarkdown = buildMarkdownRenderer(createRealMarkedStub());
+		const html = renderMarkdown("![x](javascript:alert(1))");
+
+		expect(html).not.toContain("<img");
+		expect(html).not.toContain("src=");
+		expect(html).not.toContain('src="javascript:alert(1)"');
+		expect(html).toContain("![x](javascript:alert(1))");
+	});
+
+	it("preserves safe markdown links", () => {
+		const renderMarkdown = buildMarkdownRenderer(createRealMarkedStub());
+		const html = renderMarkdown("[x](https://example.com/path?q=1#ok)");
+
+		expect(html).toContain('<a href="https://example.com/path?q=1#ok">x</a>');
 	});
 });
