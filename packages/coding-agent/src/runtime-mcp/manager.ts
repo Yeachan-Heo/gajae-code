@@ -606,8 +606,22 @@ export class MCPManager {
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(allTools);
 
-		// Update cached tools
-		if (shouldPublishToolSnapshot) this.#tools = allTools;
+		// Update cached tools. connectServers can run more than once against a
+		// shared manager (user/project config servers first, then always-on
+		// plugin-bundle servers), so only the servers actually (re)computed in
+		// this batch may have their snapshot entries replaced. Tools from
+		// servers connected by an earlier batch — including servers skipped
+		// above because they are already connected — must be retained, or
+		// getTools() and every refresh path (`tools/list_changed`, reconnect,
+		// /mcp reload) would drop them.
+		if (shouldPublishToolSnapshot) {
+			const recomputed = new Set(connectionTasks.map(task => task.name));
+			const retained = this.#tools.filter(
+				tool => tool.mcpServerName === undefined || !recomputed.has(tool.mcpServerName),
+			);
+			this.#tools = [...retained, ...allTools];
+			sortMCPToolsByName(this.#tools);
+		}
 		allowBackgroundLogging = true;
 
 		return {
