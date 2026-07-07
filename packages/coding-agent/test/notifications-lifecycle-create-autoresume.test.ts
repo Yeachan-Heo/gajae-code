@@ -16,6 +16,23 @@ afterEach(() => {
 	for (const k of LIFECYCLE_ENV) delete process.env[k];
 });
 
+test("normal root launch creates a current SessionManager for root token logs", async () => {
+	const agentDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-root-token-session-"));
+	setAgentDir(agentDir);
+	const cwd = path.join(agentDir, "repo");
+	fs.mkdirSync(cwd, { recursive: true });
+
+	const settings = Settings.isolated();
+	settings.set("autoResume", false);
+
+	const created = await createSessionManager({} as Args, cwd, settings);
+	expect(created).toBeDefined();
+	expect(created?.getSessionId()).toBeTruthy();
+	expect(created?.getCwd()).toBe(cwd);
+
+	await fsp.rm(agentDir, { recursive: true, force: true });
+});
+
 // Regression for the PR #1148 stage-17 blocker: a `/session_create` child is a
 // bare `gjc` launch with GJC_SESSION_ID/GJC_LIFECYCLE_REQUEST_ID. With autoResume
 // enabled and existing history in the cwd, the child must NOT auto-resume the old
