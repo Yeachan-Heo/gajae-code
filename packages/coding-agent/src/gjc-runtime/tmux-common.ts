@@ -4,6 +4,7 @@ import { resolveGjcTmuxBinary } from "./psmux-detect";
 export const GJC_DEFAULT_TMUX_SESSION = "gajae_code";
 export const GJC_TMUX_SESSION_PREFIX = `${GJC_DEFAULT_TMUX_SESSION}_`;
 export const GJC_TMUX_COMMAND_ENV = "GJC_TMUX_COMMAND";
+export const GJC_TMUX_ACTIVE_SESSION_ENV = "GJC_TMUX_ACTIVE_SESSION";
 export const GJC_TMUX_PROFILE_ENV = "GJC_TMUX_PROFILE";
 export const GJC_TMUX_MOUSE_ENV = "GJC_MOUSE";
 export const GJC_TMUX_PROFILE_OPTION = "@gjc-profile";

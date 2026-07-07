@@ -88,6 +88,8 @@ case "$1" in
       %2) echo "test-session:0 %2" ;;
       %9) echo "other-session:0 %9" ;;
       %1) echo "test-session:0 %1" ;;
+      =test-session:*|=test-session|test-session:*|test-session) echo "test-session:0 %1" ;;
+      =other-session:*|=other-session|other-session:*|other-session) echo "other-session:0 %9" ;;
       *) echo "test-session:0 %1" ;;
     esac
     `
@@ -607,6 +609,38 @@ describe("native gjc team runtime", () => {
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
 		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
 		expect(tmuxLog).not.toContain("send-keys -l");
+	});
+
+	it("targets the GJC-managed leader session from GJC_TMUX_ACTIVE_SESSION over a stale TMUX_PANE", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Resolve leader from active session, not stale pane",
+			teamName: "active-session-team",
+			cwd: cleanupRoot,
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				PATH: process.env.PATH ?? "",
+				GJC_TEAM_WORKER_COMMAND: "true",
+				GJC_TEAM_TMUX_COMMAND: fakeTmux,
+				// A stale/ambiguous inherited pane points at the wrong session; the
+				// explicit GJC-managed session name must win so workers land in the
+				// intended leader session (issue #531).
+				TMUX_PANE: "%9",
+				GJC_TMUX_ACTIVE_SESSION: "test-session",
+			},
+		});
+
+		const config = await Bun.file(path.join(snapshot.state_dir, "config.json")).json();
+		expect(config.tmux_session).toBe("test-session");
+		expect(config.tmux_target).toBe("test-session:0");
+		expect(config.leader.pane_id).toBe("%1");
+		expect(snapshot.tmux_target).toBe("test-session:0");
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p -t =test-session: #S:#I #{pane_id}");
+		expect(tmuxLog).not.toContain("display-message -p -t %9 #S:#I #{pane_id}");
 	});
 
 	it("starts multiple runtime workers before tmux state mutation", async () => {

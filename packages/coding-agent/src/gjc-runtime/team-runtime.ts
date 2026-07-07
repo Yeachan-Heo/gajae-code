@@ -22,6 +22,7 @@ import {
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxUntaggedSessionHint,
+	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_PROFILE_OPTION,
 	GJC_TMUX_PROFILE_VALUE,
 	resolveGjcTmuxCommand,
@@ -1922,16 +1923,22 @@ function tagTmuxSessionAsGjcLeader(tmuxCommand: string, sessionName: string): bo
 function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
 	if (Bun.which(tmuxCommand) === null)
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`tmux_not_installed:${tmuxCommand}`));
-	const paneTarget = env.TMUX_PANE?.trim();
-	const args = paneTarget
-		? ["display-message", "-p", "-t", paneTarget, "#S:#I #{pane_id}"]
+	// Prefer the explicit GJC-managed session name propagated by `gjc --tmux`
+	// (GJC_TMUX_ACTIVE_SESSION). Under psmux on Windows the inherited TMUX_PANE
+	// can resolve to the wrong/default session, so querying the tagged session
+	// by name is authoritative for GJC-launched leaders. Fall back to TMUX_PANE,
+	// then to the ambient session, to keep native tmux/WSL flows unchanged.
+	const activeSession = env[GJC_TMUX_ACTIVE_SESSION_ENV]?.trim();
+	const displayTarget = activeSession ? buildGjcTmuxExactOptionTarget(activeSession, { env }) : env.TMUX_PANE?.trim();
+	const args = displayTarget
+		? ["display-message", "-p", "-t", displayTarget, "#S:#I #{pane_id}"]
 		: ["display-message", "-p", "#S:#I #{pane_id}"];
 	const result = Bun.spawnSync([tmuxCommand, ...args], { stdout: "pipe", stderr: "pipe" });
 	if (result.exitCode !== 0) {
 		// Distinguish "you are not inside any tmux session" from a genuine tmux
 		// query failure so the caller gets actionable guidance instead of raw
 		// tmux stderr. `gjc team` needs a tmux leader; outside tmux there is none.
-		const insideTmux = Boolean(env.TMUX?.trim() || env.TMUX_PANE?.trim());
+		const insideTmux = Boolean(env.TMUX?.trim() || env.TMUX_PANE?.trim() || activeSession);
 		const stderr = result.stderr.toString().trim();
 		throw new Error(
 			buildTeamTmuxLeaderRequirementMessage(

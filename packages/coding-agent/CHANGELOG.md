@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `gjc team` on Windows/psmux now targets the GJC-managed leader session by name instead of trusting the inherited `TMUX_PANE`. `gjc --tmux` propagates the managed session name to the child via `GJC_TMUX_ACTIVE_SESSION`, and `readCurrentTmuxLeaderContext` prefers it when resolving the leader pane. Under psmux the inherited `TMUX_PANE` can resolve to the wrong/default session, so a `ralplan -> ultragoal -> team` handoff could split/send workers into the wrong leader session; native tmux/WSL flows (no `GJC_TMUX_ACTIVE_SESSION`) keep the existing `TMUX_PANE`/ambient-session behavior (#531).
+
 ## [0.9.0] - 2026-07-07
 ### Added
 
