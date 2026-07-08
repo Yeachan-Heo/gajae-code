@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
@@ -37,18 +38,22 @@ function normalizeLimit(limit: number | undefined): number {
 	return Math.max(1, Math.min(MAX_LIMIT, Math.trunc(limit)));
 }
 
-function getProjectSkillDirs(cwd: string, stopAt: string): string[] {
+async function getProjectSkillDirs(cwd: string, home: string): Promise<{ dirs: string[]; repoRoot: string | null }> {
 	const dirs: string[] = [];
 	let current = path.resolve(cwd);
-	const stop = path.resolve(stopAt);
+	const resolvedHome = path.resolve(home);
+	const repoRoot = await findRepoRoot(current);
+	const stop = path.resolve(repoRoot ?? current);
 	while (true) {
-		dirs.push(path.join(current, ".gjc", "skills"));
+		if (current !== resolvedHome) {
+			dirs.push(path.join(current, ".gjc", "skills"));
+		}
 		if (current === stop) break;
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;
 	}
-	return dirs;
+	return { dirs, repoRoot };
 }
 
 function getUseWhen(skill: CapabilitySkill): string[] | undefined {
@@ -138,13 +143,17 @@ export async function discoverRuntimeSkills(
 	const source = options.source ?? "all";
 	const policy = options.policy;
 	const scanJobs: Array<Promise<{ skill: CapabilitySkill; source: RuntimeSkillDiscoverySource }[]>> = [];
+	const projectSkills = await getProjectSkillDirs(options.cwd, home);
+	const projectContext = { cwd: options.cwd, home, repoRoot: projectSkills.repoRoot };
 	if ((source === "all" || source === "project") && sourceEnabled("project", policy)) {
-		for (const dir of getProjectSkillDirs(options.cwd, home)) {
+		for (const dir of projectSkills.dirs) {
 			scanJobs.push(
-				scanSkillsFromDir(
-					{ cwd: options.cwd, home, repoRoot: home },
-					{ dir, providerId: "runtime", level: "project", requireDescription: true },
-				).then(result => result.items.map(skill => ({ skill, source: "project" as const }))),
+				scanSkillsFromDir(projectContext, {
+					dir,
+					providerId: "runtime",
+					level: "project",
+					requireDescription: true,
+				}).then(result => result.items.map(skill => ({ skill, source: "project" as const }))),
 			);
 		}
 	}
@@ -189,13 +198,17 @@ export async function findRuntimeSkillByName(
 	const normalized = name.trim();
 	if (!normalized) return undefined;
 	const scanJobs: Array<Promise<{ skill: CapabilitySkill; source: RuntimeSkillDiscoverySource }[]>> = [];
+	const projectSkills = await getProjectSkillDirs(cwd, home);
+	const projectContext = { cwd, home, repoRoot: projectSkills.repoRoot };
 	if (sourceEnabled("project", policy)) {
 		scanJobs.push(
-			...getProjectSkillDirs(cwd, home).map(dir =>
-				scanSkillsFromDir(
-					{ cwd, home, repoRoot: home },
-					{ dir, providerId: "runtime", level: "project", requireDescription: true },
-				).then(result => result.items.map(skill => ({ skill, source: "project" as const }))),
+			...projectSkills.dirs.map(dir =>
+				scanSkillsFromDir(projectContext, {
+					dir,
+					providerId: "runtime",
+					level: "project",
+					requireDescription: true,
+				}).then(result => result.items.map(skill => ({ skill, source: "project" as const }))),
 			),
 		);
 	}

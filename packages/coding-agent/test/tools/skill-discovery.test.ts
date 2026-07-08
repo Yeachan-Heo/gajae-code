@@ -91,6 +91,47 @@ describe("SkillDiscoveryTool", () => {
 		}
 	});
 
+	it("does not classify home .gjc skills as project skills while walking up", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-home-skill-boundary-"));
+		const cwd = path.join(home, "work", "project", "nested");
+		await fs.mkdir(cwd, { recursive: true });
+		await makeSkill(path.join(home, ".gjc", "skills"), "home-helper", "Home helper skill", "Home body.");
+		const originalHome = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			const projectOnly = runtimeSkillSettings({ "skills.enablePiUser": false });
+			const discovery = await new SkillDiscoveryTool(createSession(cwd, { settings: projectOnly })).execute("call", {
+				source: "project",
+			});
+			expect(discovery.details?.candidates).toEqual([]);
+
+			const sent: Array<{ content: string; details?: unknown }> = [];
+			const tool = new SkillTool(
+				createSession(cwd, {
+					skills: [],
+					settings: projectOnly,
+					sendCustomMessage: async message => {
+						sent.push({ content: String(message.content), details: message.details });
+					},
+				}),
+			);
+			await expect(tool.execute("call", { name: "home-helper" })).rejects.toThrow(/unknown skill/);
+			expect(sent).toHaveLength(0);
+
+			const userEnabled = runtimeSkillSettings({ "skills.enablePiProject": false });
+			const userDiscovery = await new SkillDiscoveryTool(createSession(cwd, { settings: userEnabled })).execute(
+				"call",
+				{ source: "user" },
+			);
+			expect(userDiscovery.details?.candidates).toEqual([
+				expect.objectContaining({ name: "home-helper", source: "user" }),
+			]);
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+		}
+	});
+
 	it("does not return bundled built-in skills or grow the core prompt catalog", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-builtins-suppressed-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
