@@ -222,6 +222,34 @@ export interface ImageRenderOptions {
 	maxWidthCells?: number;
 	maxHeightCells?: number;
 	preserveAspectRatio?: boolean;
+	/**
+	 * Kitty-only: stable placement id (`p=`). Re-emitting the same image id +
+	 * placement id *replaces* the existing placement instead of stacking a new
+	 * copy, which makes diff-renderer repaints idempotent. Callers that render
+	 * a persistent component should allocate one id per component instance.
+	 */
+	placementId?: number;
+	/**
+	 * Kitty-only: stable image id (`i=`). Defaults to a content hash of the
+	 * base64 payload ({@link kittyImageId}). Pass a precomputed id to avoid
+	 * re-hashing large payloads on every render.
+	 */
+	imageId?: number;
+}
+
+/**
+ * Derive a stable 32-bit non-zero kitty image id (`i=`) from image content
+ * (FNV-1a over the base64 payload). Identical content maps to the same id, so
+ * retransmission replaces the stored image instead of accumulating copies.
+ */
+export function kittyImageId(base64Data: string): number {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < base64Data.length; i++) {
+		hash ^= base64Data.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	hash >>>= 0;
+	return hash === 0 ? 1 : hash;
 }
 
 // Default cell dimensions - updated by TUI when terminal responds to query
@@ -241,6 +269,7 @@ export function encodeKitty(
 		columns?: number;
 		rows?: number;
 		imageId?: number;
+		placementId?: number;
 	} = {},
 ): string {
 	const CHUNK_SIZE = 4096;
@@ -249,7 +278,13 @@ export function encodeKitty(
 
 	if (options.columns) params.push(`c=${options.columns}`);
 	if (options.rows) params.push(`r=${options.rows}`);
-	if (options.imageId) params.push(`i=${options.imageId}`);
+	if (options.imageId) {
+		params.push(`i=${options.imageId}`);
+		// A placement id is only meaningful together with an image id. Same
+		// i= + p= replaces the previous placement (kitty graphics spec), so
+		// re-emitting this sequence never duplicates the image on screen.
+		if (options.placementId) params.push(`p=${options.placementId}`);
+	}
 
 	if (base64Data.length <= CHUNK_SIZE) {
 		return `\x1b_G${params.join(",")};${base64Data}\x1b\\`;
@@ -501,6 +536,8 @@ export function renderImage(
 		const sequence = encodeKitty(base64Data, {
 			columns: fit.columns,
 			rows: fit.rows,
+			imageId: options.imageId ?? kittyImageId(base64Data),
+			placementId: options.placementId ?? 1,
 		});
 		return { sequence, rows: fit.rows };
 	}

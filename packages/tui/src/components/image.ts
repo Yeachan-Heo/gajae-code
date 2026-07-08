@@ -1,11 +1,24 @@
 import {
 	getImageDimensions,
 	type ImageDimensions,
+	ImageProtocol,
 	imageFallback,
+	kittyImageId,
 	renderImage,
 	TERMINAL,
 } from "../terminal-capabilities";
 import type { Component } from "../tui";
+
+// Monotonic placement id allocator (kitty `p=`). Each Image instance keeps a
+// stable placement id so diff-renderer repaints replace its own placement
+// instead of stacking new copies, while two components showing identical
+// content (same image id) still coexist as distinct placements.
+let nextPlacementId = 1;
+function allocatePlacementId(): number {
+	const id = nextPlacementId;
+	nextPlacementId = nextPlacementId >= 0x7fffffff ? 1 : nextPlacementId + 1;
+	return id;
+}
 
 export interface ImageTheme {
 	fallbackColor: (str: string) => string;
@@ -26,6 +39,10 @@ export class Image implements Component {
 
 	#cachedLines?: string[];
 	#cachedWidth?: number;
+	// Kitty graphics: content-derived image id + per-instance placement id.
+	// Computed lazily so non-kitty terminals never pay the hash cost.
+	#kittyImageId?: number;
+	readonly #kittyPlacementId = allocatePlacementId();
 
 	constructor(
 		base64Data: string,
@@ -57,9 +74,14 @@ export class Image implements Component {
 		let lines: string[];
 
 		if (TERMINAL.imageProtocol) {
+			if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
+				this.#kittyImageId ??= kittyImageId(this.#base64Data);
+			}
 			const result = renderImage(this.#base64Data, this.#dimensions, {
 				maxWidthCells: maxWidth,
 				maxHeightCells: this.#options.maxHeightCells,
+				imageId: this.#kittyImageId,
+				placementId: this.#kittyPlacementId,
 			});
 
 			if (result) {
