@@ -300,7 +300,14 @@ async function cmdRelease(version: string): Promise<void> {
 	console.log("Regenerating lockfiles...");
 	await $`rm -f bun.lock`;
 	await $`bun install`;
-	await $`cargo generate-lockfile`;
+	// `cargo update --workspace` bumps only the workspace-member versions in
+	// Cargo.lock to match the freshly bumped Cargo.toml, keeping every resolved
+	// registry dependency exactly as tested. This intentionally does NOT do a
+	// full re-resolution (`cargo generate-lockfile`): a full re-resolve fails
+	// closed whenever a still-referenced transitive crate has been yanked
+	// upstream (e.g. tree-sitter-perl-next 0.1.0/0.1.1), even though the
+	// committed lock — and release CI, which builds from it — resolve fine.
+	await $`cargo update --workspace`;
 	console.log();
 
 	// 4b. Regenerate the GJC plugin bundle so its embedded version tracks the

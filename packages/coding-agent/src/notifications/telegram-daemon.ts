@@ -8,7 +8,7 @@ import { withFileLock } from "../config/file-lock";
 import type { Settings } from "../config/settings";
 import type { DaemonRuntimeInfo } from "../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
-import { getNotificationConfig, isGloballyConfigured, tokenFingerprint } from "./config";
+import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand } from "./config-commands";
 import { daemonPaths } from "./daemon-paths";
 import {
@@ -636,7 +636,7 @@ export async function ensureTelegramDaemonRunning(
 	deps: TelegramDaemonDeps = {},
 ): Promise<EnsureDaemonResult> {
 	const cfg = getNotificationConfig(input.settings);
-	if (!isGloballyConfigured(cfg) || !cfg.botToken || !cfg.chatId) return "disabled";
+	if (!isTelegramConfigured(cfg)) return "disabled";
 	const root = notificationRootForCwd(input.cwd);
 	const fp = tokenFingerprint(cfg.botToken);
 	const spawned = await spawnTelegramDaemonOwner(
@@ -1120,7 +1120,7 @@ export class TelegramNotificationDaemon {
 	/** Build an authenticated lifecycle frame from a parsed command + identity. */
 	private buildLifecycleFrame(
 		parsed:
-			| { kind: "create"; target: SessionCreateTarget }
+			| { kind: "create"; target: SessionCreateTarget; modelPreset?: string }
 			| { kind: "close"; target: SessionCloseTarget }
 			| { kind: "resume"; target: SessionResumeTarget },
 		updateId: number,
@@ -1138,6 +1138,7 @@ export class TelegramNotificationDaemon {
 				chatId,
 				token,
 				target: parsed.target,
+				modelPreset: parsed.modelPreset,
 			};
 		}
 		if (parsed.kind === "close") {
@@ -1959,7 +1960,7 @@ export class TelegramNotificationDaemon {
 		try {
 			await this.botApi.call("sendMessage", {
 				chat_id: this.opts.chatId,
-				text: "turn on threaded mode from botfather miniapp to receive gjc notification!",
+				text: "Flat Telegram private chat supports outbound notifications and inline ask buttons only. Enable Threaded Mode in @BotFather > Bot Settings > Threads Settings for free-text replies and session commands.",
 				parse_mode: TELEGRAM_PARSE_MODE,
 			});
 		} catch {
@@ -2291,7 +2292,7 @@ export class TelegramNotificationDaemon {
 					{ command: "verbose", description: "Mirror full tool output + reasoning in this thread" },
 					{ command: "lean", description: "Mirror assistant text + tool names only (default)" },
 					{ command: "redact", description: "Toggle redaction of streamed content: /redact <on|off>" },
-					{ command: "session_create", description: "Create a GJC session: path, worktree, or dir" },
+					{ command: "session_create", description: "Create a GJC session: path, worktree, or dir [--mpreset]" },
 					{ command: "session_recent", description: "List recent GJC sessions" },
 					{ command: "session_close", description: "Close a GJC-managed session" },
 					{ command: "session_resume", description: "Resume or reattach a session" },

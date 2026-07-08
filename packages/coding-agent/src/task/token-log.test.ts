@@ -1,11 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { appendFile, mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GJC_SESSION_ACTIVITY_FILE, sessionRoot } from "../gjc-runtime/session-layout";
 import {
 	computeCacheHitRate,
 	persistTaskTokenLog,
 	readTaskTokenLogs,
+	resolveTaskTokenLogDir,
 	taskTokenLogFromChat,
 	taskTokenLogFromUsage,
 } from "./token-log";
@@ -89,6 +91,32 @@ describe("task token log", () => {
 			await persistTaskTokenLog(second, { dir });
 
 			expect(await readTaskTokenLogs(dir)).toEqual([first, second]);
+		});
+	});
+
+	it("prefers the current session manager over a stale latest-active session", async () => {
+		await withTempDir(async cwd => {
+			const currentSessionId = "current-session";
+			const staleSessionId = "stale-session";
+			for (const [sessionId, updatedAt] of [
+				[currentSessionId, "2026-01-01T00:00:00.000Z"],
+				[staleSessionId, "2026-01-01T00:00:10.000Z"],
+			] as const) {
+				const markerPath = join(sessionRoot(cwd, sessionId), GJC_SESSION_ACTIVITY_FILE);
+				await mkdir(join(markerPath, ".."), { recursive: true });
+				await writeFile(
+					markerPath,
+					`${JSON.stringify({ session_id: sessionId, updated_at: updatedAt })}\n`,
+					"utf-8",
+				);
+			}
+
+			await expect(resolveTaskTokenLogDir(cwd, undefined, "")).resolves.toBe(
+				join(sessionRoot(cwd, staleSessionId), "token-logs"),
+			);
+			await expect(resolveTaskTokenLogDir(cwd, { getSessionId: () => currentSessionId }, "")).resolves.toBe(
+				join(sessionRoot(cwd, currentSessionId), "token-logs"),
+			);
 		});
 	});
 

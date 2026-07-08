@@ -2008,12 +2008,50 @@
       // INITIALIZATION
       // ============================================================
 
-      // Escape HTML tags in text (but not code blocks)
+      // Escape raw HTML tags in markdown text while keeping markdown/code rendering.
       function escapeHtmlTags(text) {
         return text.replace(/<(?=[a-zA-Z\/])/g, '&lt;');
       }
 
-      // Configure marked with syntax highlighting and HTML escaping for text
+      function sanitizeMarkdownUrl(href) {
+        const value = String(href || '').trim();
+        if (!value) return '';
+
+        // Collapse whitespace/control characters before scheme checks so
+        // variants like "java\nscript:" cannot bypass the allowlist.
+        const compact = value.replace(/[\u0000-\u001F\u007F\s]+/g, '');
+        // Browser URL parsing treats backslashes in leading path separators as
+        // network-path separators; Marked may pass them through or encode them.
+        if (compact.includes('\\') || /%5c/i.test(compact)) return null;
+
+        const colonIndex = compact.indexOf(':');
+        const firstPathIndex = compact.search(/[/?#]/);
+        if (colonIndex !== -1 && (firstPathIndex === -1 || colonIndex < firstPathIndex)) {
+          const scheme = compact.slice(0, colonIndex).toLowerCase();
+          if (scheme === 'http' || scheme === 'https' || scheme === 'mailto' || scheme === 'tel') {
+            return value;
+          }
+          return null;
+        }
+
+        if (compact.startsWith('//')) return null;
+        return value;
+      }
+
+      function renderAttribute(name, value) {
+        return value ? ` ${name}="${escapeHtml(value)}"` : '';
+      }
+
+      function renderUnsafeLinkText(tokens, href) {
+        const text = this.parser.parseInline(tokens);
+        return href ? `${text} (${escapeHtml(href)})` : text;
+      }
+
+      function renderUnsafeImageText(text, href) {
+        return href ? `![${escapeHtml(text)}](${escapeHtml(href)})` : `![${escapeHtml(text)}]`;
+      }
+
+      // Configure marked with syntax highlighting and raw HTML escaping
       marked.use({
         breaks: true,
         gfm: true,
@@ -2043,9 +2081,29 @@
           text(token) {
             return escapeHtmlTags(escapeHtml(token.text));
           },
+          // Raw HTML: render as text, never as executable DOM
+          html(token) {
+            return escapeHtml(token.raw || token.text || '');
+          },
           // Inline code: escape HTML
           codespan(token) {
             return `<code>${escapeHtml(token.text)}</code>`;
+          },
+          link(token) {
+            const href = token.href || '';
+            const sanitizedHref = sanitizeMarkdownUrl(href);
+            if (sanitizedHref === null) {
+              return renderUnsafeLinkText.call(this, token.tokens || [], href);
+            }
+            return `<a href="${escapeHtml(sanitizedHref)}"${renderAttribute('title', token.title)}>${this.parser.parseInline(token.tokens || [])}</a>`;
+          },
+          image(token) {
+            const href = token.href || '';
+            const sanitizedHref = sanitizeMarkdownUrl(href);
+            if (sanitizedHref === null) {
+              return renderUnsafeImageText(token.text || '', href);
+            }
+            return `<img src="${escapeHtml(sanitizedHref)}" alt="${escapeHtml(token.text || '')}"${renderAttribute('title', token.title)}>`;
           }
         }
       });

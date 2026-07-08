@@ -23,8 +23,8 @@ Pick by how many notifications you need:
 
 ## Output
 
-Returns `Monitor started · task <task_id>` plus a task entry visible via `job({op:"list"})`. Each stdout line of the monitored command becomes a `<task-notification>` event delivered between turns.
+Returns `Monitor started · task <task_id>` plus a task entry visible via `job({list: true})`. Each stdout line of the monitored command becomes a `<task-notification>` event delivered between turns.
 
 ## Cancellation
 
-There is no separate `monitor` kill tool. Cancel a running monitor with `job` using the returned `task_id`. Disposing the session also cancels every monitor the calling agent started.
+There is no separate `monitor` kill tool. Cancel a running monitor via `job({cancel: ["<task_id>"]})` using the returned `task_id`. Disposing the session also cancels every monitor the calling agent started.

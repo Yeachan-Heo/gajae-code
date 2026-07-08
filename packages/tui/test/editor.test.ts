@@ -319,6 +319,140 @@ describe("Editor component", () => {
 			await expect(promise).resolves.toBe("@");
 		});
 
+		it("triggers prompt-action autocomplete when typing hash", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const { promise, resolve } = Promise.withResolvers<string>();
+
+			editor.setAutocompleteProvider({
+				async getSuggestions(lines, cursorLine, cursorCol) {
+					const currentLine = lines[cursorLine] ?? "";
+					resolve(currentLine.slice(0, cursorCol));
+					return { items: [{ label: "#undo", value: "#undo" }], prefix: "#" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("#");
+
+			await expect(promise).resolves.toBe("#");
+		});
+
+		it("inserts trigger-leading bracketed paste literally without autocomplete", async () => {
+			const cases = [
+				"# Heading",
+				"/not-a-command prompt",
+				"@literal file mention",
+				":literal shortcode",
+				"./relative/path prompt",
+				"~/literal/path prompt",
+				"# Heading\nbody with /slash and @mention",
+			];
+
+			for (const pasted of cases) {
+				const editor = new Editor(defaultEditorTheme);
+				const suggestionCalls: string[] = [];
+				editor.setAutocompleteProvider({
+					async getSuggestions(lines, cursorLine, cursorCol) {
+						const currentLine = lines[cursorLine] ?? "";
+						suggestionCalls.push(currentLine.slice(0, cursorCol));
+						return { items: [{ label: "suggestion", value: "suggestion" }], prefix: pasted[0] ?? "" };
+					},
+					applyCompletion(lines, cursorLine, cursorCol) {
+						return { lines, cursorLine, cursorCol };
+					},
+				});
+
+				editor.handleInput(`\x1b[200~${pasted}\x1b[201~`);
+				await Bun.sleep(120);
+
+				expect(editor.getText()).toBe(pasted);
+				expect(editor.isShowingAutocomplete()).toBe(false);
+				expect(suggestionCalls).toEqual([]);
+			}
+		});
+
+		it("cancels stale autocomplete before applying bracketed paste", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const pending = Promise.withResolvers<{
+				items: Array<{ label: string; value: string }>;
+				prefix: string;
+			} | null>();
+			let suggestionCalls = 0;
+
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					suggestionCalls += 1;
+					return pending.promise;
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("/");
+			await Bun.sleep(0);
+			expect(suggestionCalls).toBe(1);
+
+			editor.handleInput("\x1b[200~# pasted prompt\x1b[201~");
+			pending.resolve({ items: [{ label: "/help", value: "help" }], prefix: "/" });
+			await Bun.sleep(0);
+
+			expect(editor.getText()).toBe("/# pasted prompt");
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(suggestionCalls).toBe(1);
+		});
+
+		it("closes open autocomplete before applying bracketed paste", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			let suggestionCalls = 0;
+
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					suggestionCalls += 1;
+					return { items: [{ label: "/help", value: "help" }], prefix: "/" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("/");
+			await Bun.sleep(0);
+			expect(editor.isShowingAutocomplete()).toBe(true);
+
+			editor.handleInput("\x1b[200~# pasted prompt\x1b[201~");
+			await Bun.sleep(120);
+
+			expect(editor.getText()).toBe("/# pasted prompt");
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(suggestionCalls).toBe(1);
+		});
+
+		it("preserves exact pasted text after existing content", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const suggestionCalls: string[] = [];
+			editor.setText("prefix");
+			editor.setAutocompleteProvider({
+				async getSuggestions(lines, cursorLine, cursorCol) {
+					const currentLine = lines[cursorLine] ?? "";
+					suggestionCalls.push(currentLine.slice(0, cursorCol));
+					return { items: [{ label: "path", value: "path" }], prefix: "/" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("\x1b[200~/tmp/copied\x1b[201~");
+			await Bun.sleep(120);
+
+			expect(editor.getText()).toBe("prefix/tmp/copied");
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(suggestionCalls).toEqual([]);
+		});
+
 		it("chains into argument completions after tab-completing slash command names", async () => {
 			const editor = new Editor(defaultEditorTheme);
 			editor.setAutocompleteProvider(
@@ -2307,6 +2441,21 @@ describe("Editor component", () => {
 			editor.handleInput("\x1b[B"); // Down to line 1
 			expect(editor.getCursor()).toEqual({ line: 1, col: 15 });
 		});
+		it("does not record a ghost undo snapshot for a paste that filters to nothing", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("\x1b[200~hello\x1b[201~");
+			expect(editor.getText()).toBe("hello");
+
+			// A paste of only non-printable characters inserts nothing…
+			editor.handleInput("\x1b[200~\x07\x07\x1b[201~");
+			expect(editor.getText()).toBe("hello");
+
+			// …so a single undo must revert the previous edit, not a no-op snapshot.
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			expect(editor.getText()).toBe("");
+		});
+
 		it("expands large pasted content literally in getExpandedText", () => {
 			const editor = new Editor(defaultEditorTheme);
 			const pastedText = [

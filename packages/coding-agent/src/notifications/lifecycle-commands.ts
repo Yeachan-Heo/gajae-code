@@ -31,7 +31,7 @@ function normalizeLifecycleCommandToken(
 
 /** A parsed, validated lifecycle command (transport identity added by caller). */
 export type ParsedLifecycleCommand =
-	| { kind: "create"; target: SessionCreateTarget }
+	| { kind: "create"; target: SessionCreateTarget; modelPreset?: string }
 	| { kind: "close"; target: SessionCloseTarget }
 	| { kind: "resume"; target: SessionResumeTarget }
 	| { kind: "recent"; which: "create" | "resume" | "all" }
@@ -41,9 +41,9 @@ export type ParsedLifecycleCommand =
 
 const USAGE = [
 	"Session commands:",
-	"/session_create path <dir>",
-	"/session_create worktree <repo> <branch>",
-	"/session_create dir <newdir>",
+	"/session_create path <dir> [--mpreset <profile>]",
+	"/session_create worktree <repo> <branch> [--mpreset <profile>]",
+	"/session_create dir <newdir> [--mpreset <profile>]",
 	"/session_close <sessionId>",
 	"/session_resume <sessionId|prefix>",
 	"/session_recent [create|resume]",
@@ -67,6 +67,23 @@ export function isLifecycleCommandText(
 	if (!text) return false;
 	const [rawCommand] = text.trim().split(/\s+/, 1);
 	return normalizeLifecycleCommandToken(rawCommand ?? "", ctx) !== undefined;
+}
+
+/** Extract `--mpreset <name>` (or `--mpreset=<name>`) from args, returning remaining positional args. */
+function extractModelPreset(args: string[]): { positional: string[]; modelPreset?: string } {
+	const positional: string[] = [];
+	let modelPreset: string | undefined;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		if (arg === "--mpreset" && i + 1 < args.length) {
+			modelPreset = args[++i]!;
+		} else if (arg.startsWith("--mpreset=")) {
+			modelPreset = arg.slice("--mpreset=".length);
+		} else {
+			positional.push(arg);
+		}
+	}
+	return { positional, modelPreset };
 }
 
 /**
@@ -121,29 +138,33 @@ export function parseLifecycleCommand(
 		return { kind: "resume", target: { sessionIdOrPrefix: idOrPrefix } };
 	}
 
-	// /session_create <kind> ...
-	const kind = args[0];
+	// /session_create <kind> ... [--mpreset <profile>]
+	const { positional, modelPreset } = extractModelPreset(args);
+	if (modelPreset !== undefined && !isSafeIdentifier(modelPreset)) {
+		return { kind: "reject", reason: "invalid_target", message: `Invalid model preset name.\n\n${USAGE}` };
+	}
+	const kind = positional[0];
 	if (kind === "path") {
-		if (args.length !== 2) return { kind: "usage", message: USAGE };
-		const p = normalizeLifecyclePath(args[1]!);
+		if (positional.length !== 2) return { kind: "usage", message: USAGE };
+		const p = normalizeLifecyclePath(positional[1]!);
 		if (!p) return { kind: "reject", reason: "invalid_target", message: `Invalid path.\n\n${USAGE}` };
-		return { kind: "create", target: { kind: "existing_path", path: p } };
+		return { kind: "create", target: { kind: "existing_path", path: p }, modelPreset };
 	}
 	if (kind === "dir") {
-		if (args.length !== 2) return { kind: "usage", message: USAGE };
-		const p = normalizeLifecyclePath(args[1]!);
+		if (positional.length !== 2) return { kind: "usage", message: USAGE };
+		const p = normalizeLifecyclePath(positional[1]!);
 		if (!p) return { kind: "reject", reason: "invalid_target", message: `Invalid dir.\n\n${USAGE}` };
-		return { kind: "create", target: { kind: "plain_dir", path: p } };
+		return { kind: "create", target: { kind: "plain_dir", path: p }, modelPreset };
 	}
 	if (kind === "worktree") {
-		if (args.length !== 3) return { kind: "usage", message: USAGE };
-		const repo = normalizeLifecyclePath(args[1]!);
-		const branch = args[2]!;
+		if (positional.length !== 3) return { kind: "usage", message: USAGE };
+		const repo = normalizeLifecyclePath(positional[1]!);
+		const branch = positional[2]!;
 		if (!repo) return { kind: "reject", reason: "invalid_target", message: `Invalid repo path.\n\n${USAGE}` };
 		if (!isSafeBranch(branch)) {
 			return { kind: "reject", reason: "invalid_target", message: `Invalid branch name.\n\n${USAGE}` };
 		}
-		return { kind: "create", target: { kind: "worktree", repo, branch } };
+		return { kind: "create", target: { kind: "worktree", repo, branch }, modelPreset };
 	}
 	return { kind: "usage", message: USAGE };
 }

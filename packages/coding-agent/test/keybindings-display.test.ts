@@ -36,7 +36,7 @@ describe("message keybinding defaults", () => {
 		expect(keybindings.getKeys("app.message.followUp")).toEqual([]);
 		expect(keybindings.getDisplayString("app.message.followUp")).toBe("");
 		expect(keybindings.getDisplayString("app.message.queue")).toBe(
-			process.platform === "win32" ? "Alt+Q" : "Alt+Enter",
+			process.platform === "win32" || process.platform === "darwin" ? "Alt+Q" : "Alt+Enter",
 		);
 	});
 
@@ -47,10 +47,10 @@ describe("message keybinding defaults", () => {
 		expect(keybindings.getDisplayString("app.message.dequeue")).toBe("Alt+Up/Alt+Down");
 	});
 
-	it("uses Alt+Q for the native Windows queue shortcut", () => {
+	it("uses Alt+Q for native Windows and macOS queue shortcuts", () => {
 		expect(defaultMessageQueueKeysForPlatform("win32")).toBe("alt+q");
 		expect(defaultMessageQueueKeysForPlatform("linux")).toBe("alt+enter");
-		expect(defaultMessageQueueKeysForPlatform("darwin")).toBe("alt+enter");
+		expect(defaultMessageQueueKeysForPlatform("darwin")).toBe("alt+q");
 	});
 });
 

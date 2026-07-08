@@ -12,7 +12,7 @@ Allowed `op` values are only `init`, `start`, `done`, `drop`, `rm`, `append`, an
 |`start`|`task`|Mark in progress|
 |`done`|`task` or `phase`|Mark completed|
 |`drop`|`task` or `phase`|Mark abandoned|
-|`rm`|`task` or `phase`|Remove|
+|`rm`|`task` or `phase` or *(none = clear all tasks)*|Remove a task; with `phase`, empties the phase (the phase entry remains); bare `rm` clears every task in every phase|
 |`append`|`phase`, `items: string[]`|Append tasks to `phase`; lazily creates phase|
 |`note`|`task`, `text`|Append a note to a task. Reminders for future-you only.|
 

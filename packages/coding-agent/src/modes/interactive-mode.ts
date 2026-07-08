@@ -119,7 +119,7 @@ import { addChatChild, UiHelpers } from "./utils/ui-helpers";
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
 const COMPOSER_NEWLINE_HINT = process.platform === "win32" ? "Alt+Enter/Ctrl+J" : "Shift+Enter/Ctrl+J";
-const DEFAULT_COMPOSER_PLACEHOLDER = `Type your message... ${COMPOSER_NEWLINE_HINT}: New line · Ctrl+C: Clear · Shift+Tab: Reasoning`;
+export const DEFAULT_COMPOSER_PLACEHOLDER = `Type your message... ${COMPOSER_NEWLINE_HINT}: New line · Ctrl+C: Clear · Ctrl+R: Search history · Shift+Tab: Reasoning`;
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
 const FRIENDLY_KEY_PARTS: Record<string, string> = {
 	alt: "Alt",
@@ -331,6 +331,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined = undefined;
 	locallySubmittedUserSignatures: Set<string> = new Set();
+	optimisticInjectedSignatures: Map<string, number> = new Map();
 	#pendingSubmittedInput: SubmittedUserInput | undefined;
 	#pendingSubmissionDispose: (() => void) | undefined;
 	lastSigintTime = 0;
@@ -1724,6 +1725,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			planContent,
 			finalPlanFilePath: options.finalPlanFilePath,
 			contextPreserved: options.preserveContext === true,
+			tools: this.session.getActiveToolNames(),
 		});
 		await this.session.prompt(planModePrompt, { synthetic: true });
 	}
@@ -2565,6 +2567,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
 		this.#selectorController.showModelSelector(options);
+	}
+
+	showEffortSelector(): void {
+		this.#selectorController.showEffortSelector();
 	}
 
 	showProviderOnboarding(): void {

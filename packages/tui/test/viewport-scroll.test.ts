@@ -17,6 +17,10 @@ class Lines implements Component {
 		this.#lines = this.#lines.map((value, currentIndex) => (currentIndex === index ? line : value));
 	}
 
+	replace(lines: string[]): void {
+		this.#lines = [...lines];
+	}
+
 	render(_width: number): string[] {
 		return this.#lines;
 	}
@@ -83,6 +87,90 @@ describe("TUI manual viewport paging", () => {
 		}
 	});
 
+	it("keeps manual viewport control after paging to live while transient panel streams", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const content = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		const transientPanel = new Lines([]);
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(content);
+		tui.addChild(transientPanel);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "status", "editor"]);
+
+			expect(tui.scrollViewportPages(-1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-3", "line-4", "line-5", "line-6", "line-7", "line-8"]);
+
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "status", "editor"]);
+
+			transientPanel.replace(["btw-0", "btw-1"]);
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "btw-0", "btw-1"]);
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["line-10", "line-11", "btw-0", "btw-1", "status", "editor"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps Windows Terminal pinned when a normal assistant answer starts before status/editor", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const chat = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		const working = new Lines(["thinking"]);
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(chat);
+		tui.addChild(working);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		const previousWtSession = Bun.env.WT_SESSION;
+		Bun.env.WT_SESSION = "test-windows-terminal-session";
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-9", "line-10", "line-11", "thinking", "status", "editor"]);
+			term.clearWriteLog();
+
+			chat.append("assistant-0");
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-10", "line-11", "assistant-0", "thinking", "status", "editor"]);
+			expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
+
+			term.clearWriteLog();
+			chat.setLine(12, "assistant-0 token");
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-10", "line-11", "assistant-0 token", "thinking", "status", "editor"]);
+			expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
+		} finally {
+			tui.stop();
+			if (previousWtSession === undefined) {
+				delete Bun.env.WT_SESSION;
+			} else {
+				Bun.env.WT_SESSION = previousWtSession;
+			}
+		}
+	});
+
 	it("keeps Windows Terminal live output pinned when offscreen lines change during streaming", async () => {
 		const term = new VirtualTerminal(30, 5);
 		const tui = new TUI(term);
@@ -103,6 +191,36 @@ describe("TUI manual viewport paging", () => {
 			await settle(term);
 
 			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "line-11"]);
+			expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
+		} finally {
+			tui.stop();
+			if (previousWtSession === undefined) {
+				delete Bun.env.WT_SESSION;
+			} else {
+				Bun.env.WT_SESSION = previousWtSession;
+			}
+		}
+	});
+
+	it("keeps Windows Terminal pinned when offscreen status lines disappear", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		const content = new Lines(["status-0", ...Array.from({ length: 11 }, (_value, index) => `line-${index}`)]);
+		tui.addChild(content);
+		const previousWtSession = Bun.env.WT_SESSION;
+		Bun.env.WT_SESSION = "test-windows-terminal-session";
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-6", "line-7", "line-8", "line-9", "line-10"]);
+			term.clearWriteLog();
+
+			content.replace(Array.from({ length: 11 }, (_value, index) => `line-${index}`));
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-6", "line-7", "line-8", "line-9", "line-10"]);
 			expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
 		} finally {
 			tui.stop();

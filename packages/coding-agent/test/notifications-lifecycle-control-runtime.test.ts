@@ -113,6 +113,25 @@ describe("lifecycle control runtime", () => {
 		expect(remainingArgs).toEqual([]);
 	});
 
+	it("buildCreateArgv emits root-parser-compatible --mpreset argv when modelPreset is set", () => {
+		const pathLaunch = buildCreateArgv(createFrame({ modelPreset: "codex-eco" }), { intendedSessionId: "x" });
+		expect(pathLaunch).toEqual({ cwd: "/repo", args: ["--mpreset", "codex-eco"] });
+		expect(pathLaunch.args).not.toContain("--mpreset=codex-eco");
+
+		const worktreeLaunch = buildCreateArgv(
+			createFrame({ target: { kind: "worktree", repo: "/r", branch: "feat/y" }, modelPreset: "claude-opus" }),
+			{ intendedSessionId: "x" },
+		);
+		expect(worktreeLaunch).toEqual({ cwd: "/r", args: ["--worktree=feat/y", "--mpreset", "claude-opus"] });
+		const { mode, remainingArgs } = parseLaunchWorktreeMode(worktreeLaunch.args);
+		expect(mode).toEqual({ enabled: true, detached: false, name: "feat/y" });
+		expect(remainingArgs).toEqual(["--mpreset", "claude-opus"]);
+	});
+
+	it("buildCreateArgv omits --mpreset when modelPreset is undefined", () => {
+		expect(buildCreateArgv(createFrame(), { intendedSessionId: "x" }).args).toEqual([]);
+	});
+
 	it("outcomeToResponse maps ok create to a create_response frame", () => {
 		const entry: LedgerEntry = {
 			requestHash: "h",

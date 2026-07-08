@@ -23,5 +23,3 @@ Use a single `op` field to select the operation:
 - All times are interpreted in the local timezone.
 - Recurring tasks fire with up to 30 minutes of deterministic jitter (or up to half their interval for sub-hourly tasks). One-shot tasks scheduled for `:00` or `:30` may fire up to 90 s early. Pick an off-minute if exact timing matters.
 - Closing or replacing the session clears every scheduled task.
-
-Disable the scheduler entirely via `CLAUDE_CODE_DISABLE_CRON=1`.

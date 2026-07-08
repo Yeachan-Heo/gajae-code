@@ -88,6 +88,9 @@ export interface Terminal {
 	// Whether terminal output is still writable
 	get available(): boolean;
 
+	// True for the real process stdin/stdout terminal (not virtual test terminals).
+	readonly isProcessTerminal?: boolean;
+
 	// Get terminal dimensions
 	get columns(): number;
 	get rows(): number;
@@ -197,6 +200,10 @@ export class ProcessTerminal implements Terminal {
 	#osc11PollTimer?: Timer;
 	#mode2031DebounceTimer?: Timer;
 	#progressTimer?: ReturnType<typeof setInterval>;
+
+	get isProcessTerminal(): boolean {
+		return true;
+	}
 
 	get kittyProtocolActive(): boolean {
 		return this.#kittyProtocolActive;

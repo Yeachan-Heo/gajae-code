@@ -12,6 +12,7 @@ interface PackageManifest {
 	files?: string[];
 	os?: string[];
 	cpu?: string[];
+	libc?: string[];
 }
 
 const repoRoot = path.join(import.meta.dir, "..");
@@ -180,6 +181,23 @@ describe("native release binary coverage", () => {
 		expect(workflow).toContain("{ os: macos-14, platform: darwin, arch: arm64 }");
 		expect(workflow).toContain("target_id: darwin-arm64");
 		expect(workflow).toContain("pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*-h${{ needs.rust-hash.outputs.hash }}");
+	});
+
+	test("linux native platform packages declare their glibc requirement", async () => {
+		// The linux native addons are built against *-unknown-linux-gnu targets
+		// only (see the ci.yml build matrix), so the platform packages must set
+		// "libc" to keep npm/bun from installing a glibc-linked .node on musl
+		// systems (e.g. Alpine), where dlopen fails with raw relocation errors.
+		for (const dir of ["packages/natives-linux-x64", "packages/natives-linux-arm64"]) {
+			const manifest = await readManifest(dir);
+			expect(manifest.libc).toEqual(["glibc"]);
+		}
+
+		// libc is a linux-only selector; other platform packages must not set it.
+		for (const dir of ["packages/natives-darwin-arm64", "packages/natives-darwin-x64", "packages/natives-win32-x64"]) {
+			const manifest = await readManifest(dir);
+			expect(manifest.libc).toBeUndefined();
+		}
 	});
 
 	test("installer explains missing release assets with fallback guidance", async () => {

@@ -7,6 +7,58 @@ export interface LiveRunnerOptions {
 	outputDir: string;
 }
 
+export interface LiveRunnerFixturePair {
+	candidate: string;
+	beforeFixtureId: string;
+	afterFixtureId: string;
+	successCriterion: string;
+}
+
+export const LIVE_DEFAULT_CANDIDATE_FIXTURE_PAIRS: readonly LiveRunnerFixturePair[] = [
+	{
+		candidate: "task.maxRecursionDepth.default.2-to-1",
+		beforeFixtureId: "pr9.task-recursion.before",
+		afterFixtureId: "pr9.task-recursion.after",
+		successCriterion: "externally checked nested delegation outcome remains successful",
+	},
+	{
+		candidate: "outputCaps.default.500000-to-lower",
+		beforeFixtureId: "pr9.output-caps.before",
+		afterFixtureId: "pr9.output-caps.after",
+		successCriterion: "large output fact recovery succeeds through retained preview plus artifact reference",
+	},
+	{
+		candidate: "tools.maxInlineResultBytes.default.0-to-candidate",
+		beforeFixtureId: "pr9.max-inline-result-bytes.before",
+		afterFixtureId: "pr9.max-inline-result-bytes.after",
+		successCriterion: "inline tool text remains actionable and artifact recovery succeeds",
+	},
+	{
+		candidate: "tools.readArtifactSpillThreshold.default.0-to-candidate",
+		beforeFixtureId: "pr9.read-artifact-spill-threshold.before",
+		afterFixtureId: "pr9.read-artifact-spill-threshold.after",
+		successCriterion: "read workflow locates required facts through bounded output plus artifact reference",
+	},
+	{
+		candidate: "compaction.maintenancePruningEnabled.default.false-to-true",
+		beforeFixtureId: "pr9.maintenance-pruning.before",
+		afterFixtureId: "pr9.maintenance-pruning.after",
+		successCriterion: "stale-output pruning improves token/cache economics without task failure",
+	},
+	{
+		candidate: "appendOnlyContext.providerExpansion.default-held",
+		beforeFixtureId: "pr9.append-only-provider-expansion.before",
+		afterFixtureId: "pr9.append-only-provider-expansion.after",
+		successCriterion: "provider-specific prefix stability holds across candidate provider turns",
+	},
+	{
+		candidate: "rpc.compactMessageUpdateDeltas.default.false-to-true",
+		beforeFixtureId: "pr9.rpc-compact-deltas.before",
+		afterFixtureId: "pr9.rpc-compact-deltas.after",
+		successCriterion: "compact delta clients and legacy clients both receive equivalent message state",
+	},
+] as const;
+
 export interface LiveRunTotals {
 	turns: number;
 	inputTokens: number;
@@ -164,6 +216,12 @@ function parseReport(stdout: string, binaryPath: string, fixtureId: string): Liv
 	};
 }
 
+function resolveFixturePair(fixtureId: string): { beforeFixtureId: string; afterFixtureId: string } {
+	const pair = LIVE_DEFAULT_CANDIDATE_FIXTURE_PAIRS.find(candidate => candidate.candidate === fixtureId);
+	if (!pair) return { beforeFixtureId: fixtureId, afterFixtureId: fixtureId };
+	return { beforeFixtureId: pair.beforeFixtureId, afterFixtureId: pair.afterFixtureId };
+}
+
 export async function runOneBinary(
 	binaryPath: string,
 	fixtureId: string,
@@ -239,8 +297,9 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 }
 
 export async function runLiveComparison(options: LiveRunnerOptions): Promise<DeltaReport> {
-	const before = await runOneBinary(options.beforeBinary, options.fixtureId);
-	const after = await runOneBinary(options.afterBinary, options.fixtureId);
+	const fixturePair = resolveFixturePair(options.fixtureId);
+	const before = await runOneBinary(options.beforeBinary, fixturePair.beforeFixtureId);
+	const after = await runOneBinary(options.afterBinary, fixturePair.afterFixtureId);
 	const delta = computeDelta(before, after);
 	const report: DeltaReport = {
 		schemaVersion: LIVE_RUNNER_SCHEMA_VERSION,

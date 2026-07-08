@@ -340,7 +340,7 @@
 				},
 				"readArtifactSpillThreshold": {
 					"type": "number",
-					"description": "Combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Higher than the general spill threshold so ordinary inspection reads stay inline; 0 disables read spill (falls back to the absolute inline backstop only).",
+					"description": "Advanced opt-in only: combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 found no token savings and a lower cache-hit rate at 50 KB, so normal coding sessions should leave this Off unless intentionally measuring large-read behavior.",
 					"default": 0
 				},
 				"fileMentionInlineBytes": {
@@ -982,12 +982,10 @@
 				},
 				"maintenancePruningEnabled": {
 					"type": "boolean",
-					"description": "Opt-in: prune stale tool outputs BELOW the compaction threshold when the estimated savings are large enough to outweigh a prompt-cache-epoch reset. Off by default (evidence-gated); enabling it trades one cache reset for reclaimed context.",
 					"default": false
 				},
 				"maintenancePruningMinSavingsTokens": {
 					"type": "number",
-					"description": "Minimum estimated stale-prunable token savings required before below-threshold maintenance pruning runs. Kept high so a cache-epoch reset is only spent for a large reclaim.",
 					"default": 8000
 				},
 				"idleEnabled": {

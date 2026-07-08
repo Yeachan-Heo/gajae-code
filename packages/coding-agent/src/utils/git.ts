@@ -1318,6 +1318,79 @@ export async function clean(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// API: bisect
+// ════════════════════════════════════════════════════════════════════════════
+
+export interface BisectCommitInfo {
+	sha: string;
+	author: string;
+	date: string;
+	subject: string;
+	stat: string;
+}
+
+/**
+ * Thin wrappers over `git bisect`. The marking commands (`good`/`bad`/`skip`)
+ * return the raw {@link GitCommandResult} without throwing so callers can both
+ * detect a genuine failure (non-zero exit) and scan the output for the
+ * "<sha> is the first bad commit" conclusion. `reset` is best-effort and never
+ * throws so it is safe to call from a `finally` block to restore the worktree.
+ */
+export const bisect = {
+	/** Begin a bisect session (does not seed good/bad endpoints). */
+	async start(cwd: string, signal?: AbortSignal): Promise<void> {
+		await runEffect(cwd, ["bisect", "start"], { signal });
+	},
+
+	/** Mark a revision (or current HEAD when omitted) good. Returns raw output. */
+	async good(cwd: string, ref?: string, signal?: AbortSignal): Promise<GitCommandResult> {
+		return runCommand(cwd, ref ? ["bisect", "good", ref] : ["bisect", "good"], { signal });
+	},
+
+	/** Mark a revision (or current HEAD when omitted) bad. Returns raw output. */
+	async bad(cwd: string, ref?: string, signal?: AbortSignal): Promise<GitCommandResult> {
+		return runCommand(cwd, ref ? ["bisect", "bad", ref] : ["bisect", "bad"], { signal });
+	},
+
+	/** Skip the current (untestable) revision. Returns raw output. */
+	async skip(cwd: string, signal?: AbortSignal): Promise<GitCommandResult> {
+		return runCommand(cwd, ["bisect", "skip"], { signal });
+	},
+
+	/** Read the replayable bisect log for the current session. */
+	async log(cwd: string, signal?: AbortSignal): Promise<string> {
+		return runText(cwd, ["bisect", "log"], { signal });
+	},
+
+	/** End the bisect session, restoring the original HEAD. Never throws. */
+	async reset(cwd: string, signal?: AbortSignal): Promise<void> {
+		await runCommand(cwd, ["bisect", "reset"], { signal });
+	},
+
+	/** True when `ancestor` is a first-parent-or-merge ancestor of `descendant`. */
+	async isAncestor(cwd: string, ancestor: string, descendant: string, signal?: AbortSignal): Promise<boolean> {
+		const result = await runCommand(cwd, ["merge-base", "--is-ancestor", ancestor, descendant], {
+			readOnly: true,
+			signal,
+		});
+		return result.exitCode === 0;
+	},
+
+	/** Resolve author/date/subject and a diffstat for a commit (for the receipt). */
+	async describe(cwd: string, sha: string, signal?: AbortSignal): Promise<BisectCommitInfo> {
+		// Newline-delimited so the format string carries no NUL byte (argv cannot
+		// contain NUL); %s is already a single line, so the four fields never wrap.
+		const meta = await runText(cwd, ["show", "-s", "--format=%H%n%an <%ae>%n%aI%n%s", sha], {
+			readOnly: true,
+			signal,
+		});
+		const [resolvedSha = sha, author = "", date = "", subject = ""] = meta.split("\n");
+		const stat = await runText(cwd, ["show", "--stat", "--format=", sha], { readOnly: true, signal });
+		return { sha: resolvedSha, author, date, subject, stat: stat.trim() };
+	},
+};
+
+// ════════════════════════════════════════════════════════════════════════════
 // API: ls
 // ════════════════════════════════════════════════════════════════════════════
 

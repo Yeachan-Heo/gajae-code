@@ -76,16 +76,18 @@ menu to appear through the Bot API. The safe fallback is to continue setup with 
 private DM pairing: choose `skip` in the interactive prompt (or use
 `--token <botToken> --chat-id <chatId>` for non-interactive setup). GJC will save
 `threaded=unverified`/`threaded=unknown`, try topics at runtime when possible,
-and otherwise deliver notifications flat to the paired private chat with the
-one-time nudge shown below.
+and otherwise deliver flat to the paired private chat with outbound notifications
+and inline ask buttons only plus the one-time nudge shown below.
 
 Setup verification is capability verification, not a delivery guarantee: even when
 setup reports `threaded=verified`, the first runtime `createForumTopic` for the
 paired chat can still fail if Telegram refuses it. When per-session topics are
 unavailable, the daemon does **not** drop notifications — it routes them to the
-normal (flat) paired chat and posts a one-time nudge: `turn on threaded mode from
-botfather miniapp to receive gjc notification!`. Because pairing is private-only,
-flat delivery lands in your own private DM with the bot.
+normal (flat) paired chat and posts a one-time nudge: `Flat Telegram private chat
+supports outbound notifications and inline ask buttons only. Enable Threaded Mode
+in @BotFather > Bot Settings > Threads Settings for free-text replies and session
+commands.` Because pairing is private-only, flat delivery lands in your own
+private DM with the bot.
 
 The final setup line reports a `threaded=` status:
 
@@ -93,8 +95,8 @@ The final setup line reports a `threaded=` status:
   was true during setup);
 - `threaded=unverified`: Threaded Mode was off and you skipped, or setup ran
   non-interactively; setup is saved, topics are attempted when available, and
-  runtime delivery falls back to the paired flat private chat when Telegram
-  refuses topic creation;
+  runtime delivery falls back to the paired flat private chat with outbound
+  notifications and inline ask buttons only when Telegram refuses topic creation;
 - `threaded=unknown`: the Telegram response did not include `has_topics_enabled`,
   so capability could not be verified.
 
@@ -196,11 +198,16 @@ against the paired `notifications.telegram.chatId`. If BotFather does not show
 after setup reported `threaded=verified`, the daemon routes notifications to the
 normal (flat) paired private chat and posts a one-time nudge to enable Threaded
 Mode rather than dropping them.
+Flat private chat is notification-only plus inline ask buttons. It is not a
+free-text chat surface: replies typed as normal messages and session commands such
+as `/verbose`, `/lean`, `/verbosity`, and `/redact` require Threaded Mode/topic
+routing.
 
 Flat private-chat fallback preserves outbound notifications and inline-button
 answers, but it cannot provide a separate Telegram topic per GJC session. Free-
-text replies and in-topic config commands depend on topic routing, so use
-Threaded Mode when you need multi-session reply separation from Telegram. Do not
+text replies and in-topic config commands depend on topic routing, so enable
+Threaded Mode in @BotFather > Bot Settings > Threads Settings when you need
+multi-session reply separation or session commands from Telegram. Do not
 pair a group, supergroup, or channel as a substitute: setup intentionally accepts
 only a private DM, and hand-edited non-private chat ids remain fail-closed to
 avoid leaking session data. If you specifically want group topics, create a
@@ -284,8 +291,10 @@ client's @BotFather flow for this bot. If BotFather's **Bot Settings** menu lack
 pairing; this is supported. GJC cannot enable Threaded Mode through the Bot API,
 and no paid/Stars option is required just to receive flat private-chat
 notifications. When `createForumTopic` is refused for the paired chat, the daemon
-falls back to flat delivery in the paired private chat and posts a one-time
-`turn on threaded mode from botfather miniapp to receive gjc notification!` nudge.
+falls back to flat delivery in the paired private chat and posts a one-time nudge
+that points to @BotFather > Bot Settings > Threads Settings. Flat fallback is
+limited to outbound notifications and inline ask buttons; free-text replies and
+session commands require Threaded Mode/topic routing.
 
 ### Telegram 409 conflict
 

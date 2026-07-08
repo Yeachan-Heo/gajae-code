@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildDocsIndexOutput, checkPublicVersionSync } from "./check-public-version-sync";
+import { buildDocsIndexOutput, checkLivePublicVersionSync, checkPublicVersionSync } from "./check-public-version-sync";
 
 const tempRoots: string[] = [];
 
@@ -76,5 +76,46 @@ describe("public docs/site/version sync guard", () => {
 		expect(violations.some(violation => violation.path === "package.json" && violation.message.includes("catalog gajae-code"))).toBe(true);
 		expect(violations.some(violation => violation.path === "README.md" && violation.message.includes("Visible marketing version 1.2.2"))).toBe(true);
 		expect(violations.some(violation => violation.path.includes("docs-index.generated.ts") && violation.message.includes("stale"))).toBe(true);
+	});
+
+	test("live check passes when public homepage version matches canonical package version", async () => {
+		const root = await createRepo({
+			"package.json": rootPackage("1.2.3"),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent", "1.2.3"),
+		});
+		const fetchImpl = async () => new Response("<main>🦀 v1.2.3 · beta</main>");
+
+		await expect(checkLivePublicVersionSync(root, fetchImpl)).resolves.toEqual([]);
+	});
+
+	test("live check sends a bounded timeout signal to the homepage fetch", async () => {
+		const root = await createRepo({
+			"package.json": rootPackage("1.2.3"),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent", "1.2.3"),
+		});
+		let observedSignal: AbortSignal | undefined;
+		const fetchImpl = async (_input: string | URL, init?: RequestInit) => {
+			observedSignal = init?.signal ?? undefined;
+			return new Response("<main>🦀 v1.2.3 · beta</main>");
+		};
+
+		await expect(checkLivePublicVersionSync(root, fetchImpl, 50)).resolves.toEqual([]);
+		expect(observedSignal).toBeInstanceOf(AbortSignal);
+	});
+
+	test("live check fails when deployed homepage exposes a stale version", async () => {
+		const root = await createRepo({
+			"package.json": rootPackage("1.2.3"),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent", "1.2.3"),
+		});
+		const fetchImpl = async () => new Response("<main>🦀 v1.2.2 · beta</main>");
+
+		const violations = await checkLivePublicVersionSync(root, fetchImpl);
+		expect(violations).toEqual([
+			{
+				path: "https://gajae-code.com",
+				message: "Public homepage version 1.2.2 does not match canonical 1.2.3. Redeploy or update the public site metadata.",
+			},
+		]);
 	});
 });

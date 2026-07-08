@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { YAML } from "bun";
 import type { Settings } from "../config/settings";
-import { getNotificationConfig, isGloballyConfigured } from "./config";
+import { getNotificationConfig, isTelegramConfigured } from "./config";
 import { daemonPaths } from "./daemon-paths";
 import type { TelegramDaemonOptions } from "./telegram-daemon";
 
@@ -146,7 +146,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const resolvedAgentDir = agentDir ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
 	const cfg = getNotificationConfig(settings as Settings);
-	if (!isGloballyConfigured(cfg) || !cfg.botToken || !cfg.chatId) return;
+	if (!isTelegramConfigured(cfg)) return;
 	const { clearTelegramControlRequest, readTelegramControlRequest } = await import("./telegram-daemon-control");
 	const Daemon: TelegramDaemonConstructor =
 		deps.DaemonImpl ?? (await import("./telegram-daemon")).TelegramNotificationDaemon;

@@ -116,6 +116,7 @@ export interface InteractiveModeContext {
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined;
 	locallySubmittedUserSignatures: Set<string>;
+	optimisticInjectedSignatures: Map<string, number>;
 	lastSigintTime: number;
 	lastEscapeTime: number;
 	lastComposerClearEscapeTime: number;
@@ -244,6 +245,7 @@ export interface InteractiveModeContext {
 	showExtensionsDashboard(): void;
 	showAgentsDashboard(): void;
 	showModelSelector(options?: { temporaryOnly?: boolean }): void;
+	showEffortSelector(): void;
 	showProviderOnboarding(): void;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
 	showUserMessageSelector(): void;

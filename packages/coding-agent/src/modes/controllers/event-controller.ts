@@ -16,6 +16,7 @@ import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
+import { completionNotifyDisabledByEnv } from "../../notifications/config";
 import { summaryFromMessage } from "../../notifications/helpers";
 import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import type { AgentSessionEvent } from "../../session/agent-session";
@@ -23,6 +24,7 @@ import { isSilentAbort, readPendingDisplayTag } from "../../session/messages";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { interruptHint } from "../shared";
 import { buildAbortDisplayMessage } from "../utils/abort-message";
+import { consumeInjectedOptimisticSignature } from "../utils/injected-user-submission";
 import { ringTerminalBell } from "../utils/terminal-bell";
 import { addChatChild, argsWithPartialJson } from "../utils/ui-helpers";
 
@@ -291,12 +293,17 @@ export class EventController {
 			const signature = `${textContent}\u0000${imageCount}`;
 
 			this.#resetReadGroup();
-			const wasOptimistic = this.ctx.optimisticUserMessageSignature === signature;
+			const wasSingleOptimistic = this.ctx.optimisticUserMessageSignature === signature;
+			const wasInjectedOptimistic = !wasSingleOptimistic && consumeInjectedOptimisticSignature(this.ctx, signature);
+			const wasOptimistic = wasSingleOptimistic || wasInjectedOptimistic;
 			const wasLocallySubmitted = this.ctx.locallySubmittedUserSignatures.delete(signature) || wasOptimistic;
 			if (!wasOptimistic) {
 				this.ctx.addMessageToChat(event.message);
 			}
-			if (wasOptimistic) {
+			// Only clear the single local slot when IT matched; an injected match is
+			// consumed from the counting Map above and must not clobber a coexisting
+			// pending local optimistic signature.
+			if (wasSingleOptimistic) {
 				this.ctx.optimisticUserMessageSignature = undefined;
 			}
 
@@ -960,6 +967,8 @@ export class EventController {
 	}
 
 	sendCompletionNotification(): void {
+		// Per-run hard opt-out (env, config-untouched, child-inheritable): GJC_NOTIFY=off.
+		if (completionNotifyDisabledByEnv(process.env)) return;
 		const isBackgrounded = this.ctx.isBackgrounded !== false;
 		const notify = settings.get("completion.notify");
 		if (notify === "off") return;

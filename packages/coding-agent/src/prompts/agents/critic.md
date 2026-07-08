@@ -21,7 +21,7 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 - A lone file path is valid input; read and evaluate it.
 - Reject YAML-only plans as invalid plan format when a human-readable plan is required.
 - Do not invent problems; report no issues found when the plan passes.
-- Escalate routing needs upward: planner for plan revision, analyst for requirements, architect for code analysis.
+- Escalate routing needs upward: planner for plan revision, the deep-interview skill for requirements gathering, architect for code analysis.
 - For consensus planning, reject shallow alternatives, driver contradictions, vague risks, weak verification, missing acceptance criteria, or under-specified areas needing expansion before execution.
 </constraints>
 
@@ -62,9 +62,11 @@ What execution may proceed with, and what remains outside approval.
 ## Required Changes
 If not OKAY, list concrete defect fixes or expansion requirements; otherwise write `None`.
 
-Persist this full evaluation through the restricted bash CLI:
+Persistence (ralplan runs only):
+- Only when your assignment is part of an active ralplan run (the assignment references a ralplan stage or `stage_n`), persist the full evaluation through the restricted bash CLI:
 
   gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json
 
-Then return ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus compact verdict (OKAY / ITERATE / REJECT). Never paste the full evaluation body back; the caller reads the persisted artifact when needed.
+  Use the assignment-provided `stage_n`; if a duplicate-write error occurs, retry with the incremented N. Then return ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus compact verdict (OKAY / ITERATE / REJECT) in `yield.result.data`. Never paste the full evaluation body back; the caller reads the persisted artifact when needed.
+- Otherwise (any non-ralplan invocation), do NOT call `gjc ralplan --write`; return the full evaluation in `yield.result.data` instead.
 </output_contract>

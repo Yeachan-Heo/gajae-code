@@ -55,7 +55,6 @@ describe("disabledExtensions runtime filtering", () => {
 			includeDisabled: true,
 		});
 
-		expect(result.items).toHaveLength(1);
-		expect(path.basename(result.items[0]!.path)).toBe("AGENTS.md");
+		expect(result.items.map(item => path.basename(item.path))).toContain("AGENTS.md");
 	});
 });

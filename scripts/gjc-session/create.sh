@@ -144,42 +144,6 @@ for _ in $(seq 1 20); do
   [[ "$turn_evidence" == "true" ]] || break
   sleep 0.1
 done
-owner_exit_reason="normal_exit"
-owner_exit_severity="normal"
-runtime_terminal=false
-runtime_terminal_state=""
-runtime_terminal_source=""
-if [[ -s "${GJC_COORDINATOR_SESSION_STATE_FILE:-}" ]]; then
-  runtime_summary="$(python3 - "$GJC_COORDINATOR_SESSION_STATE_FILE" "$GJC_SESSION_NAME" "$GJC_SESSION_WORKDIR" <<'PY' 2>/dev/null || true
-import json
-import os
-import sys
-state_file, expected_session, expected_cwd = sys.argv[1:]
-try:
-    with open(state_file, encoding="utf-8") as handle:
-        data = json.load(handle)
-except Exception:
-    data = {}
-state = data.get("state")
-session_id = data.get("session_id")
-cwd = data.get("cwd") or data.get("workdir")
-source = (data.get("final_response") or {}).get("source")
-session_matches = not session_id or session_id == expected_session
-cwd_matches = not cwd or os.path.abspath(str(cwd)) == os.path.abspath(expected_cwd)
-if state in {"completed", "errored"} and session_matches and cwd_matches:
-    print("true")
-    print(state)
-    print(source or "runtime_state")
-else:
-    print("false")
-    print("")
-    print("")
-PY
-)"
-  runtime_terminal="$(printf '%s\n' "$runtime_summary" | sed -n '1p')"
-  runtime_terminal_state="$(printf '%s\n' "$runtime_summary" | sed -n '2p')"
-  runtime_terminal_source="$(printf '%s\n' "$runtime_summary" | sed -n '3p')"
-fi
 worktree_baseline_dirty="${GJC_SESSION_WORKTREE_BASELINE_DIRTY:-null}"
 if [[ "$prompt_accepted" == "true" && -s "${GJC_SESSION_PROMPT_ACCEPTED_JSON:-}" ]]; then
   prompt_baseline="$(python3 - "$GJC_SESSION_PROMPT_ACCEPTED_JSON" <<'PY' 2>/dev/null || true
@@ -202,30 +166,122 @@ worktree_changed_since_baseline=false
 if [[ "$worktree_baseline_dirty" == "false" && "$worktree_current_dirty" == "true" ]]; then
   worktree_changed_since_baseline=true
 fi
-if [[ "$runtime_terminal" == "true" ]]; then
-  owner_exit_reason="terminal_runtime_cleanup"
-  owner_exit_severity="normal"
-elif [[ "$turn_evidence" != "true" ]]; then
-  owner_exit_reason="owner_exited_before_turn_evidence"
-  owner_exit_severity="failure"
-elif [[ "$prompt_accepted" == "true" && "$worktree_changed_since_baseline" == "true" ]]; then
-  owner_exit_reason="accepted_prompt_observed_recoverable_worktree_changes"
-  owner_exit_severity="failure"
-elif [[ "$prompt_accepted" == "true" && "$worktree_current_dirty" == "true" ]]; then
-  owner_exit_reason="accepted_prompt_dirty_worktree_observed_without_new_change_proof"
-  owner_exit_severity="failure"
-elif [[ "$prompt_accepted" == "true" ]]; then
-  owner_exit_reason="accepted_prompt_no_useful_output"
-  owner_exit_severity="failure"
-elif [[ "$prompt_accepted" != "true" ]]; then
-  owner_exit_reason="owner_exited_before_prompt_acceptance"
-  owner_exit_severity="failure"
-fi
-python3 - "$GJC_SESSION_FINAL_JSON" "$GJC_SESSION_NAME" "$rc" "$started_at" "$finished_at" "$GJC_SESSION_PANE_LOG" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$turn_evidence" "$prompt_accepted" "$owner_exit_reason" "$owner_exit_severity" "$runtime_terminal" "$runtime_terminal_state" "$runtime_terminal_source" "$worktree_baseline_dirty" "$worktree_current_dirty" "$worktree_changed_since_baseline" <<'PY'
+python3 - "$GJC_SESSION_FINAL_JSON" "$GJC_SESSION_NAME" "$rc" "$started_at" "$finished_at" "$GJC_SESSION_PANE_LOG" "$GJC_COORDINATOR_SESSION_STATE_FILE" "$turn_evidence" "$prompt_accepted" "$GJC_SESSION_WORKDIR" "$worktree_baseline_dirty" "$worktree_current_dirty" "$worktree_changed_since_baseline" <<'PY'
 import json
+import os
 import sys
 
-path, session, status, started_at, finished_at, pane_log, runtime_state, turn_evidence, prompt_accepted, owner_exit_reason, owner_exit_severity, runtime_terminal, runtime_terminal_state, runtime_terminal_source, baseline_dirty, current_dirty, changed_since_baseline = sys.argv[1:]
+(
+    path,
+    session,
+    status,
+    started_at,
+    finished_at,
+    pane_log,
+    runtime_state,
+    turn_evidence,
+    prompt_accepted,
+    expected_cwd,
+    baseline_dirty,
+    current_dirty,
+    changed_since_baseline,
+) = sys.argv[1:]
+
+turn_evidence_present = turn_evidence == "true"
+prompt_accepted_present = prompt_accepted == "true"
+
+runtime_summary = {
+    "present": False,
+    "valid": False,
+    "state": None,
+    "source": None,
+    "event": None,
+    "reason": None,
+    "terminal": False,
+    "terminalState": None,
+    "terminalSource": None,
+    "finalResponsePresent": False,
+    "previousRuntimeState": None,
+    "sessionMatches": True,
+    "cwdMatches": True,
+}
+if runtime_state and os.path.exists(runtime_state) and os.path.getsize(runtime_state) > 0:
+    runtime_summary["present"] = True
+    try:
+        with open(runtime_state, encoding="utf-8") as handle:
+            runtime_payload = json.load(handle)
+        final_response = runtime_payload.get("final_response")
+        final_response_present = False
+        final_response_source = None
+        if isinstance(final_response, dict):
+            text = final_response.get("text")
+            artifact_path = final_response.get("artifact_path")
+            final_response_present = (
+                (isinstance(text, str) and text.strip() != "")
+                or (isinstance(artifact_path, str) and artifact_path.strip() != "")
+            )
+            if isinstance(final_response.get("source"), str):
+                final_response_source = final_response["source"]
+        runtime_state_value = runtime_payload.get("state")
+        session_id = runtime_payload.get("session_id")
+        cwd = runtime_payload.get("cwd") or runtime_payload.get("workdir")
+        session_matches = not session_id or session_id == session
+        cwd_matches = not cwd or os.path.abspath(str(cwd)) == os.path.abspath(expected_cwd)
+        terminal = runtime_state_value in ("completed", "errored") and session_matches and cwd_matches
+        runtime_source = runtime_payload.get("source") if isinstance(runtime_payload.get("source"), str) else None
+        runtime_summary.update(
+            {
+                "valid": True,
+                "state": runtime_state_value if isinstance(runtime_state_value, str) else None,
+                "source": runtime_source,
+                "event": runtime_payload.get("event") if isinstance(runtime_payload.get("event"), str) else None,
+                "reason": runtime_payload.get("reason") if isinstance(runtime_payload.get("reason"), str) else None,
+                "terminal": terminal,
+                "terminalState": runtime_state_value if terminal and isinstance(runtime_state_value, str) else None,
+                "terminalSource": final_response_source or runtime_source or ("runtime_state" if terminal else None),
+                "finalResponsePresent": final_response_present,
+                "previousRuntimeState": runtime_payload.get("previous_runtime_state")
+                if isinstance(runtime_payload.get("previous_runtime_state"), str)
+                else None,
+                "sessionMatches": session_matches,
+                "cwdMatches": cwd_matches,
+            }
+        )
+    except Exception:
+        runtime_summary["valid"] = False
+
+owner_exit_reason = "normal_exit"
+owner_exit_severity = "normal"
+runtime_state_value = runtime_summary["state"]
+runtime_matches = runtime_summary["valid"] and runtime_summary["sessionMatches"] and runtime_summary["cwdMatches"]
+
+if runtime_matches and runtime_summary["source"] == "process_postmortem":
+    owner_exit_reason = runtime_summary["reason"] or "process_postmortem"
+    owner_exit_severity = "failure"
+elif runtime_summary["terminal"]:
+    owner_exit_reason = "terminal_runtime_cleanup"
+    owner_exit_severity = "normal"
+elif not turn_evidence_present:
+    owner_exit_reason = "owner_exited_before_turn_evidence"
+    owner_exit_severity = "failure"
+elif runtime_matches and runtime_state_value in ("running", "needs_user_input"):
+    owner_exit_reason = "owner_exited_after_runtime_acknowledgement_before_terminal_status"
+    owner_exit_severity = "failure"
+elif prompt_accepted_present and changed_since_baseline == "true":
+    owner_exit_reason = "accepted_prompt_observed_recoverable_worktree_changes"
+    owner_exit_severity = "failure"
+elif prompt_accepted_present and current_dirty == "true":
+    owner_exit_reason = "accepted_prompt_dirty_worktree_observed_without_new_change_proof"
+    owner_exit_severity = "failure"
+elif prompt_accepted_present:
+    owner_exit_reason = "accepted_prompt_no_useful_output"
+    owner_exit_severity = "failure"
+else:
+    owner_exit_reason = "owner_exited_before_prompt_acceptance"
+    owner_exit_severity = "failure"
+
+runtime_summary["ownerExitReason"] = owner_exit_reason
+runtime_summary["severity"] = owner_exit_severity
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -235,16 +291,17 @@ with open(path, "w", encoding="utf-8") as handle:
             "finishedAt": finished_at,
             "paneLog": pane_log,
             "runtimeState": runtime_state,
-            "turnEvidencePresent": turn_evidence == "true",
-            "promptAccepted": prompt_accepted == "true",
+            "turnEvidencePresent": turn_evidence_present,
+            "promptAccepted": prompt_accepted_present,
             "ownerExitReason": owner_exit_reason,
             "severity": owner_exit_severity,
-            "runtimeTerminal": runtime_terminal == "true",
-            "runtimeTerminalState": runtime_terminal_state or None,
-            "runtimeTerminalSource": runtime_terminal_source or None,
+            "runtimeTerminal": runtime_summary["terminal"],
+            "runtimeTerminalState": runtime_summary["terminalState"],
+            "runtimeTerminalSource": runtime_summary["terminalSource"],
             "worktreeBaselineDirty": None if baseline_dirty == "null" else baseline_dirty == "true",
             "observedRecoverableWorktreeChanges": current_dirty == "true",
             "worktreeChangedSinceBaseline": changed_since_baseline == "true",
+            "runtimeStateSummary": runtime_summary,
         },
         handle,
         indent=2,
@@ -303,6 +360,7 @@ PY
   fi
   runtime_terminal_state=""
   runtime_terminal_source=""
+  runtime_terminal_reason=""
   if [[ -s "${GJC_COORDINATOR_SESSION_STATE_FILE:-}" ]]; then
     runtime_summary="$(python3 - "$GJC_COORDINATOR_SESSION_STATE_FILE" "$GJC_SESSION_NAME" "$GJC_SESSION_WORKDIR" <<'PY' 2>/dev/null || true
 import json
@@ -317,12 +375,15 @@ except Exception:
 state = data.get("state")
 session_id = data.get("session_id")
 cwd = data.get("cwd") or data.get("workdir")
-source = (data.get("final_response") or {}).get("source")
+final_response = data.get("final_response") if isinstance(data.get("final_response"), dict) else {}
+source = final_response.get("source") or data.get("source")
+reason = data.get("reason") if isinstance(data.get("reason"), str) else ""
 session_matches = not session_id or session_id == expected_session
 cwd_matches = not cwd or os.path.abspath(str(cwd)) == os.path.abspath(expected_cwd)
 if state in {"completed", "errored"} and session_matches and cwd_matches:
     print(state)
     print(source or "runtime_state")
+    print(reason)
 else:
     print("")
     print("")
@@ -330,8 +391,9 @@ PY
 )"
     runtime_terminal_state="$(printf '%s\n' "$runtime_summary" | sed -n '1p')"
     runtime_terminal_source="$(printf '%s\n' "$runtime_summary" | sed -n '2p')"
+    runtime_terminal_reason="$(printf '%s\n' "$runtime_summary" | sed -n '3p')"
   fi
-  if [[ "$final_present" != "true" && -n "$runtime_terminal_state" ]]; then
+  if [[ "$final_present" != "true" && -n "$runtime_terminal_state" && "$runtime_terminal_source" != "process_postmortem" ]]; then
     printf '[%s] tmux session closed after terminal runtime state=%s source=%s; no vanished failure marker written\n' "$detected_at" "$runtime_terminal_state" "${runtime_terminal_source:-unknown}" >>"$GJC_SESSION_EVENTS_LOG"
     exit 0
   fi
@@ -361,6 +423,10 @@ PY
   elif [[ "$tui_ready" == "true" ]]; then
     vanish_phase="before_prompt_acceptance"
     vanish_reason="tmux_session_missing_before_prompt_acceptance"
+  fi
+  if [[ "$final_present" != "true" && -n "$runtime_terminal_state" && "$runtime_terminal_source" == "process_postmortem" ]]; then
+    vanish_phase="process_postmortem"
+    vanish_reason="${runtime_terminal_reason:-process_postmortem}"
   fi
   severity="failure"
   printf '[%s] tmux session vanished final_present=%s final_severity=%s prompt_accepted=%s tui_ready=%s phase=%s severity=%s reason=%s\n' "$detected_at" "$final_present" "${final_severity:-none}" "$prompt_accepted" "$tui_ready" "$vanish_phase" "$severity" "$vanish_reason" >>"$GJC_SESSION_EVENTS_LOG"

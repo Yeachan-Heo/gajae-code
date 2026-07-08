@@ -835,6 +835,7 @@ async function shutdownClientInstance(client: LspClient): Promise<void> {
 	await Promise.race([shutdown, Bun.sleep(5_000)]);
 	await client.owner?.dispose();
 	await client.owner?.awaitExit({ timeoutMs: 1_000 });
+	await Promise.race([client.proc.exited.catch(() => undefined), Bun.sleep(1_000)]);
 }
 
 export async function shutdownClient(key: string): Promise<void> {

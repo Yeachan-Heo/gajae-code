@@ -3,10 +3,10 @@ import { createApiKeyLogin } from "./api-key-login";
 
 export const loginFugu = createApiKeyLogin({
 	providerLabel: "Sakana Fugu",
-	authUrl: "https://fugu.sakana.ai/",
+	authUrl: "https://console.sakana.ai/api-keys",
 	instructions: "Create or copy your Sakana Fugu API key",
 	promptMessage: "Paste your Sakana Fugu API key",
-	placeholder: "fugu_...",
+	placeholder: "fish_...",
 	validation: {
 		kind: "models-endpoint",
 		provider: "Sakana Fugu",

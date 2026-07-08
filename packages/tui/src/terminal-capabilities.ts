@@ -222,6 +222,40 @@ export interface ImageRenderOptions {
 	maxWidthCells?: number;
 	maxHeightCells?: number;
 	preserveAspectRatio?: boolean;
+	/**
+	 * Kitty-only: stable placement id (`p=`). Re-emitting the same image id +
+	 * placement id *replaces* the existing placement instead of stacking a new
+	 * copy, which makes diff-renderer repaints idempotent. Callers that render
+	 * a persistent component should allocate one id per component instance.
+	 */
+	placementId?: number;
+	/**
+	 * Kitty-only: stable image id (`i=`). Defaults to a content hash of the
+	 * base64 payload ({@link kittyImageId}). Pass a precomputed id to avoid
+	 * re-hashing large payloads on every render.
+	 */
+	imageId?: number;
+	/**
+	 * Kitty-only: sink for the out-of-band data transmission (`a=t`) emitted
+	 * the first time an image id is rendered. Defaults to the process-wide
+	 * writer configured via {@link setKittyTransmitWriter} (stdout).
+	 */
+	onTransmit?: (sequence: string) => void;
+}
+
+/**
+ * Derive a stable 32-bit non-zero kitty image id (`i=`) from image content
+ * (FNV-1a over the base64 payload). Identical content maps to the same id, so
+ * retransmission replaces the stored image instead of accumulating copies.
+ */
+export function kittyImageId(base64Data: string): number {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < base64Data.length; i++) {
+		hash ^= base64Data.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	hash >>>= 0;
+	return hash === 0 ? 1 : hash;
 }
 
 // Default cell dimensions - updated by TUI when terminal responds to query
@@ -241,6 +275,7 @@ export function encodeKitty(
 		columns?: number;
 		rows?: number;
 		imageId?: number;
+		placementId?: number;
 	} = {},
 ): string {
 	const CHUNK_SIZE = 4096;
@@ -249,7 +284,13 @@ export function encodeKitty(
 
 	if (options.columns) params.push(`c=${options.columns}`);
 	if (options.rows) params.push(`r=${options.rows}`);
-	if (options.imageId) params.push(`i=${options.imageId}`);
+	if (options.imageId) {
+		params.push(`i=${options.imageId}`);
+		// A placement id is only meaningful together with an image id. Same
+		// i= + p= replaces the previous placement (kitty graphics spec), so
+		// re-emitting this sequence never duplicates the image on screen.
+		if (options.placementId) params.push(`p=${options.placementId}`);
+	}
 
 	if (base64Data.length <= CHUNK_SIZE) {
 		return `\x1b_G${params.join(",")};${base64Data}\x1b\\`;
@@ -276,6 +317,86 @@ export function encodeKitty(
 	}
 
 	return chunks.join("");
+}
+
+/** Kitty image ids already uploaded to the terminal in this process. */
+const transmittedKittyImageIds = new Set<number>();
+
+/** Test hook: forget which kitty image ids were transmitted. */
+export function resetKittyTransmissions(): void {
+	transmittedKittyImageIds.clear();
+}
+
+let kittyTransmitWriter: (sequence: string) => void = sequence => {
+	process.stdout.write(sequence);
+};
+
+/**
+ * Override where out-of-band kitty data transmissions (`a=t`) are written.
+ * The default writes directly to stdout: a transmit-only escape is
+ * cursor-neutral (it uploads pixel data without drawing anything), so the
+ * only ordering requirement is that it reaches the terminal before the
+ * placement escape that references it — which the synchronous write during
+ * render guarantees. Tests use this to capture transmissions.
+ */
+export function setKittyTransmitWriter(writer: (sequence: string) => void): void {
+	kittyTransmitWriter = writer;
+}
+
+/**
+ * Encode a kitty transmit-only (`a=t`) escape: uploads image data under a
+ * stable id without creating a placement. Chunked at 4096 bytes per spec.
+ *
+ * This is deliberately separate from placement: re-sending data (`a=t`/`a=T`)
+ * for an existing image id deletes the image and ALL of its placements, so
+ * data must be uploaded exactly once per id and repaints must go through
+ * {@link encodeKittyPlacement} only.
+ */
+export function encodeKittyTransmit(base64Data: string, imageId: number): string {
+	const CHUNK_SIZE = 4096;
+	const params = ["a=t", "f=100", "q=2", `i=${imageId}`];
+
+	if (base64Data.length <= CHUNK_SIZE) {
+		return `\x1b_G${params.join(",")};${base64Data}\x1b\\`;
+	}
+
+	const chunks: string[] = [];
+	let offset = 0;
+	let isFirst = true;
+
+	while (offset < base64Data.length) {
+		const chunk = base64Data.slice(offset, offset + CHUNK_SIZE);
+		const isLast = offset + CHUNK_SIZE >= base64Data.length;
+
+		if (isFirst) {
+			chunks.push(`\x1b_G${params.join(",")},m=1;${chunk}\x1b\\`);
+			isFirst = false;
+		} else if (isLast) {
+			chunks.push(`\x1b_Gm=0;${chunk}\x1b\\`);
+		} else {
+			chunks.push(`\x1b_Gm=1;${chunk}\x1b\\`);
+		}
+
+		offset += CHUNK_SIZE;
+	}
+
+	return chunks.join("");
+}
+
+/**
+ * Encode a kitty placement-only (`a=p`) escape referencing previously
+ * transmitted data. Re-emitting the same i=/p= pair replaces that one
+ * placement (never stacks, never touches sibling placements), and C=1
+ * keeps the cursor where it is so the escape can be emitted from the
+ * component's first row without cursor-up tricks.
+ */
+export function encodeKittyPlacement(options: {
+	imageId: number;
+	placementId: number;
+	columns: number;
+	rows: number;
+}): string {
+	return `\x1b_Ga=p,i=${options.imageId},p=${options.placementId},c=${options.columns},r=${options.rows},C=1,q=2\x1b\\`;
 }
 
 export function encodeITerm2(
@@ -485,11 +606,23 @@ export function getImageDimensions(base64Data: string, mimeType: string): ImageD
 	return null;
 }
 
+export interface RenderedImage {
+	sequence: string;
+	rows: number;
+	/**
+	 * True when the escape neither moves the cursor nor carries pixel data
+	 * (kitty `a=p,C=1` placements). Cursor-neutral sequences can be emitted
+	 * from the component's first row; cursor-advancing protocols
+	 * (iTerm2/SIXEL) must draw from the last reserved row instead.
+	 */
+	cursorNeutral?: boolean;
+}
+
 export function renderImage(
 	base64Data: string,
 	imageDimensions: ImageDimensions,
 	options: ImageRenderOptions = {},
-): { sequence: string; rows: number } | null {
+): RenderedImage | null {
 	if (!TERMINAL.imageProtocol) {
 		return null;
 	}
@@ -498,11 +631,20 @@ export function renderImage(
 	const fit = calculateImageFit(imageDimensions, options, cellDims);
 
 	if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
-		const sequence = encodeKitty(base64Data, {
-			columns: fit.columns,
-			rows: fit.rows,
-		});
-		return { sequence, rows: fit.rows };
+		const imageId = options.imageId ?? kittyImageId(base64Data);
+		const placementId = options.placementId ?? 1;
+		// Upload data once per image id (out-of-band; the transmit escape is
+		// cursor-neutral), then return only a tiny placement escape. Repaints
+		// re-emit just the placement, which replaces/moves that placement —
+		// re-sending data (a=T/a=t) for an existing id would delete the image
+		// and ALL of its placements (breaking sibling components showing the
+		// same content) and would re-send multi-MB payloads on every repaint.
+		if (!transmittedKittyImageIds.has(imageId)) {
+			transmittedKittyImageIds.add(imageId);
+			(options.onTransmit ?? kittyTransmitWriter)(encodeKittyTransmit(base64Data, imageId));
+		}
+		const sequence = encodeKittyPlacement({ imageId, placementId, columns: fit.columns, rows: fit.rows });
+		return { sequence, rows: fit.rows, cursorNeutral: true };
 	}
 
 	if (TERMINAL.imageProtocol === ImageProtocol.Sixel) {

@@ -6,7 +6,7 @@ Requirements:
 - `report` is REQUIRED and must be concise, factual, and actionable.
 - Include key findings, decisions, and any unresolved risks.
 - Do not include raw scratch logs unless essential.
-- You MUST call this before yielding if a checkpoint is active.
+- `checkpoint`'s must-rewind-before-yield rule applies: never yield with a checkpoint still active.
 
 Behavior:
 - If no checkpoint is active, this tool errors.

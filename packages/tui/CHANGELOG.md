@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Native Windows console hosts now use the live-viewport repaint path even when `WT_SESSION` is missing, and full clears avoid `3J` there, preventing Windows Terminal/PowerShell from jumping to the transcript top during forced redraws such as prompt bells and context compaction.
 
 ## [0.8.2] - 2026-07-06
 ### Fixed

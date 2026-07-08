@@ -19,11 +19,13 @@ export interface SyncViolation {
 	message: string;
 	line?: number;
 }
+type PublicFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
 const PUBLIC_HOMEPAGE = "https://gajae-code.com";
 const GENERATED_DOCS_INDEX = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
 const VERSIONED_MARKETING_RE = /\b(?:New in|Also new in|Gajae Code|Gajae-Code|Feature card for the)\s+(\d+\.\d+\.\d+)\b/gi;
 const MARKETING_VERSION_FILES = ["README.md", "docs/**/*.md", "packages/*/README.md"];
+const LIVE_FETCH_TIMEOUT_MS = 5_000;
 
 async function pathExists(candidate: string): Promise<boolean> {
 	try {
@@ -86,6 +88,11 @@ export async function buildDocsIndexOutput(repoRoot: string): Promise<string> {
 		`};`,
 		"",
 	].join("\n");
+}
+
+async function canonicalVersionForRepo(repoRoot: string): Promise<string | undefined> {
+	const rootPackage = await readJson<PackageJson>(path.join(repoRoot, "package.json"));
+	return rootPackage.workspaces?.catalog?.["@gajae-code/coding-agent"];
 }
 
 export async function checkPublicVersionSync(repoRoot = path.join(import.meta.dir, "..")): Promise<SyncViolation[]> {
@@ -177,8 +184,51 @@ export async function checkPublicVersionSync(repoRoot = path.join(import.meta.di
 	return violations;
 }
 
+export async function checkLivePublicVersionSync(repoRoot = path.join(import.meta.dir, ".."), fetchImpl: PublicFetch = fetch, timeoutMs = LIVE_FETCH_TIMEOUT_MS): Promise<SyncViolation[]> {
+	const violations: SyncViolation[] = [];
+	const canonicalVersion = await canonicalVersionForRepo(repoRoot);
+
+	if (!canonicalVersion) {
+		violations.push({ path: "package.json", message: "Missing canonical @gajae-code/coding-agent catalog version." });
+		return violations;
+	}
+
+	let response: Response;
+	try {
+		response = await fetchImpl(PUBLIC_HOMEPAGE, {
+			headers: { "User-Agent": "gajae-code-public-version-sync/1.0" },
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		violations.push({ path: PUBLIC_HOMEPAGE, message: `Failed to fetch public homepage: ${message}` });
+		return violations;
+	}
+
+	if (!response.ok) {
+		violations.push({ path: PUBLIC_HOMEPAGE, message: `Public homepage returned HTTP ${response.status}.` });
+		return violations;
+	}
+
+	const homepage = await response.text();
+	const visibleVersion = homepage.match(/\bv(\d+\.\d+\.\d+)\b/i)?.[1];
+	if (!visibleVersion) {
+		violations.push({ path: PUBLIC_HOMEPAGE, message: "Public homepage does not expose a visible vX.Y.Z version marker." });
+	} else if (visibleVersion !== canonicalVersion) {
+		violations.push({
+			path: PUBLIC_HOMEPAGE,
+			message: `Public homepage version ${visibleVersion} does not match canonical ${canonicalVersion}. Redeploy or update the public site metadata.`,
+		});
+	}
+
+	return violations;
+}
 if (import.meta.main) {
-	const violations = await checkPublicVersionSync();
+	const live = process.argv.includes("--live");
+	const violations = [
+		...(await checkPublicVersionSync()),
+		...(live ? await checkLivePublicVersionSync() : []),
+	];
 	if (violations.length === 0) {
 		console.log("Public docs/site/version surfaces are in sync.");
 		process.exit(0);

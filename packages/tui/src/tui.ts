@@ -137,16 +137,22 @@ function parseSizeValue(value: SizeValue | undefined, referenceSize: number): nu
 	return undefined;
 }
 
-function isTermuxSession(): boolean {
-	return Boolean(process.env.TERMUX_VERSION);
+function isTermuxSession(env: Record<string, string | undefined> = Bun.env): boolean {
+	return Boolean(env.TERMUX_VERSION);
 }
 
 const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 const DISABLED_ENV_VALUES = new Set(["0", "false", "off", "no"]);
+const TRUTHY_ENV_VALUES = new Set(["1", "true", "yes", "on", "y"]);
 
 function envIsEnabled(value: string | undefined): boolean {
 	const normalized = value?.trim().toLowerCase();
 	return normalized !== undefined && normalized.length > 0 && !DISABLED_ENV_VALUES.has(normalized);
+}
+
+function envFlagEnabled(value: string | undefined): boolean {
+	const normalized = value?.trim().toLowerCase();
+	return normalized !== undefined && TRUTHY_ENV_VALUES.has(normalized);
 }
 
 function termLooksMultiplexed(value: string | undefined): boolean {
@@ -154,32 +160,60 @@ function termLooksMultiplexed(value: string | undefined): boolean {
 	return term.startsWith("tmux") || term.startsWith("screen");
 }
 
-function isWindowsTerminalSession(): boolean {
-	return envIsEnabled(Bun.env.WT_SESSION) || Bun.env.TERM_PROGRAM === "Windows_Terminal";
-}
-
-function isViewportRepaintSession(): boolean {
-	return isMultiplexerSession() || isWindowsTerminalSession();
+function isWindowsTerminalSession(env: Record<string, string | undefined> = Bun.env): boolean {
+	return envIsEnabled(env.WT_SESSION) || env.TERM_PROGRAM === "Windows_Terminal";
 }
 
 /** Detect terminal multiplexers where scrollback clearing and height-change redraws are hostile. */
-function isMultiplexerSession(): boolean {
+function isMultiplexerSession(env: Record<string, string | undefined> = Bun.env): boolean {
 	return Boolean(
-		envIsEnabled(Bun.env.TMUX) ||
-			envIsEnabled(Bun.env.TMUX_PANE) ||
-			envIsEnabled(Bun.env.STY) ||
-			envIsEnabled(Bun.env.ZELLIJ) ||
-			envIsEnabled(Bun.env[GJC_TMUX_LAUNCHED_ENV]) ||
-			termLooksMultiplexed(Bun.env.TERM),
+		envIsEnabled(env.TMUX) ||
+			envIsEnabled(env.TMUX_PANE) ||
+			envIsEnabled(env.STY) ||
+			envIsEnabled(env.ZELLIJ) ||
+			envIsEnabled(env[GJC_TMUX_LAUNCHED_ENV]) ||
+			termLooksMultiplexed(env.TERM),
 	);
 }
 
-function useLegacyMultiplexerFullRender(): boolean {
-	return $flag("PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER");
+function useLegacyMultiplexerFullRender(env: Record<string, string | undefined> = Bun.env): boolean {
+	return envFlagEnabled(env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER);
 }
 
-function useViewportRepaintPath(): boolean {
-	return isViewportRepaintSession() && !(isMultiplexerSession() && useLegacyMultiplexerFullRender());
+function isViewportSensitiveHost(
+	env: Record<string, string | undefined>,
+	platform: NodeJS.Platform,
+	includeNativeWindows: boolean,
+): boolean {
+	return isMultiplexerSession(env) || isWindowsTerminalSession(env) || (includeNativeWindows && platform === "win32");
+}
+/**
+ * True when repainting only the live viewport is safer than clearing/replaying
+ * the full transcript. Native Windows console hosts are included even when
+ * WT_SESSION is absent because PowerShell/ConPTY launch chains can drop terminal
+ * identity variables while keeping the same scroll-jump behavior.
+ */
+export function shouldUseViewportRepaintForHost(
+	env: Record<string, string | undefined> = Bun.env,
+	platform: NodeJS.Platform = process.platform,
+	options: { includeNativeWindows?: boolean } = {},
+): boolean {
+	const multiplexed = isMultiplexerSession(env);
+	const includeNativeWindows = options.includeNativeWindows ?? true;
+	return (
+		isViewportSensitiveHost(env, platform, includeNativeWindows) &&
+		!(multiplexed && useLegacyMultiplexerFullRender(env))
+	);
+}
+
+function useViewportRepaintPath(terminal: Terminal): boolean {
+	return shouldUseViewportRepaintForHost(Bun.env, process.platform, {
+		includeNativeWindows: terminal.isProcessTerminal === true,
+	});
+}
+
+function shouldPreserveScrollbackOnFullClear(terminal: Terminal): boolean {
+	return isViewportSensitiveHost(Bun.env, process.platform, terminal.isProcessTerminal === true);
 }
 
 /**
@@ -530,19 +564,13 @@ export class TUI extends Container {
 		const pageStep = Math.max(1, height - 1);
 		const targetViewportTop = Math.max(0, Math.min(maxViewportTop, currentViewportTop + direction * pageStep));
 
-		if (targetViewportTop >= maxViewportTop) {
-			this.#manualViewportTop = undefined;
-		} else {
-			this.#manualViewportTop = targetViewportTop;
-		}
-
-		const cursorPos = this.#manualViewportTop === undefined ? this.#lastCursorPosition : null;
+		this.#manualViewportTop = targetViewportTop;
 		return this.#repaintViewportFromLines(
 			this.#previousLines,
 			width,
 			height,
 			targetViewportTop,
-			cursorPos,
+			null,
 			"manual viewport scroll",
 		);
 	}
@@ -914,13 +942,13 @@ export class TUI extends Container {
 	 * `fullRender` path. In terminal multiplexers that path skips the scrollback-clearing
 	 * `3J` escape (users navigate scrollback history), so replaying every transcript line
 	 * piles it back on top of scrollback — the "top of screen scrolls down to the prompt at
-	 * high speed" resize storm. Windows Terminal can also visibly jump to the
-	 * transcript top during streaming redraws, so viewport-repaint sessions keep
-	 * force off and let `#doRender` repaint only the live viewport. Set
+	 * high speed" resize storm. Windows Terminal/ConPTY can also visibly jump to
+	 * the transcript top during streaming redraws, so viewport-repaint sessions
+	 * keep force off and let `#doRender` repaint only the live viewport. Set
 	 * `PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER=1` to restore the legacy tmux redraw.
 	 */
 	requestResizeRender(): void {
-		this.requestRender(!useViewportRepaintPath() && !isTermuxSession(), "resize");
+		this.requestRender(!useViewportRepaintPath(this.terminal) && !isTermuxSession(), "resize");
 	}
 
 	requestRender(force = false, source = "unknown"): void {
@@ -930,7 +958,7 @@ export class TUI extends Container {
 		}
 		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {
-			const preserveViewportCursor = useViewportRepaintPath();
+			const preserveViewportCursor = useViewportRepaintPath(this.terminal);
 			// A forced full redraw supersedes any queued input-priority render.
 			this.#inputRenderPending = false;
 			this.#previousLines = [];
@@ -1695,9 +1723,8 @@ export class TUI extends Container {
 		if (this.#manualViewportTop !== undefined) {
 			const maxViewportTop = Math.max(0, newLines.length - height);
 			const nextViewportTop = Math.max(0, Math.min(maxViewportTop, this.#manualViewportTop));
-			const followingLive = nextViewportTop >= maxViewportTop;
-			this.#manualViewportTop = followingLive ? undefined : nextViewportTop;
-			const repaintCursorPos = followingLive ? cursorPos : null;
+			this.#manualViewportTop = nextViewportTop;
+			const repaintCursorPos = null;
 			if (
 				this.#repaintViewportFromLines(
 					newLines,
@@ -1719,8 +1746,10 @@ export class TUI extends Container {
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
-			// Skip clearing scrollback (3J) in multiplexers — users actively navigate scrollback history
-			if (clear) buffer += isMultiplexerSession() ? "\x1b[2J\x1b[H" : "\x1b[2J\x1b[H\x1b[3J";
+			// Skip clearing scrollback (3J) in hosts where clear/replay can snap the
+			// native viewport away from the live prompt (tmux/screen, Windows ConPTY).
+			if (clear)
+				buffer += shouldPreserveScrollbackOnFullClear(this.terminal) ? "\x1b[2J\x1b[H" : "\x1b[2J\x1b[H\x1b[3J";
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
 				// Lines were pre-terminated/normalized by #applyLineResets; image
@@ -1817,7 +1846,7 @@ export class TUI extends Container {
 		// Width changes always need a full re-render because wrapping changes.
 		if (widthChanged) {
 			logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
-			if (useViewportRepaintPath()) {
+			if (useViewportRepaintPath(this.terminal)) {
 				// In viewport-repaint sessions a full replay can either pile the transcript
 				// back onto scrollback (tmux/screen) or visibly jump to the transcript top
 				// (Windows Terminal). Repaint the viewport only, mirroring the height-change
@@ -1833,7 +1862,7 @@ export class TUI extends Container {
 		// but Termux changes height when the software keyboard shows or hides.
 		// In that environment, a full redraw causes the entire history to replay on every toggle.
 		if (heightChanged) {
-			if (useViewportRepaintPath()) {
+			if (useViewportRepaintPath(this.terminal)) {
 				viewportRepaint(`terminal height changed (${this.#previousHeight} -> ${height})`);
 				return;
 			}
@@ -1849,7 +1878,11 @@ export class TUI extends Container {
 		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
 		if (this.#clearOnShrink && newLines.length < this.#previousLines.length && this.overlayStack.length === 0) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			fullRender(true, "clearOnShrink");
+			if (useViewportRepaintPath(this.terminal)) {
+				viewportRepaint(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
+			} else {
+				fullRender(true, "clearOnShrink");
+			}
 			return;
 		}
 
@@ -1906,7 +1939,7 @@ export class TUI extends Container {
 				const extraLines = this.#previousLines.length - newLines.length;
 				if (extraLines > height) {
 					logRedraw(`extraLines > height (${extraLines} > ${height})`);
-					if (useViewportRepaintPath()) {
+					if (useViewportRepaintPath(this.terminal)) {
 						viewportRepaint(`extraLines > height (${extraLines} > ${height})`);
 					} else {
 						fullRender(true, "extraLines > height");
@@ -1948,7 +1981,7 @@ export class TUI extends Container {
 		// back to live.
 		if (firstChanged < prevViewportTop) {
 			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
-			if (useViewportRepaintPath()) {
+			if (useViewportRepaintPath(this.terminal)) {
 				viewportRepaint(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
 				return;
 			}

@@ -127,22 +127,27 @@ function tmuxSessionNameFor(sessionId: string): string {
  *  The launched session id is carried via `GJC_SESSION_ID` in the child env (see
  *  {@link daemonSpawnCreate}); the root `gjc` launcher has no `--session-id`
  *  flag, so it must never appear in argv. Only flags the launch parser actually
- *  supports are emitted (`--worktree <branch>` for worktree targets). */
+ *  supports are emitted (`--worktree <branch>` for worktree targets,
+ *  `--mpreset <profile>` for model presets). */
 export function buildCreateArgv(
 	frame: SessionCreateFrame,
 	_ids: { intendedSessionId: string; startupPromptRef?: string },
 ): { cwd: string; args: string[] } {
+	const extraArgs: string[] = [];
+	if (frame.modelPreset) {
+		extraArgs.push("--mpreset", frame.modelPreset);
+	}
 	if (frame.target.kind === "worktree") {
 		const cwd = normalizeLifecyclePath(frame.target.repo);
 		if (!cwd) throw new Error("invalid_lifecycle_repo_path");
 		// Use the `--worktree=<branch>` form so the branch is a single argv token:
 		// a flag-shaped branch (e.g. `-x`) can never be mis-parsed as a separate
 		// launcher flag / detached-mode trigger.
-		return { cwd, args: [`--worktree=${frame.target.branch}`] };
+		return { cwd, args: [`--worktree=${frame.target.branch}`, ...extraArgs] };
 	}
 	const cwd = normalizeLifecyclePath(frame.target.path);
 	if (!cwd) throw new Error("invalid_lifecycle_path");
-	return { cwd, args: [] };
+	return { cwd, args: extraArgs };
 }
 
 /** Real daemon-safe tmux launcher: detached `tmux new-session -d` + GJC tags. */

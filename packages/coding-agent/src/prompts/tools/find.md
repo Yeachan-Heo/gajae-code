@@ -25,7 +25,7 @@ Matching file paths sorted by modification time (most recent first). Truncated a
 </examples>
 
 <avoid>
-For open-ended searches requiring multiple rounds of globbing and searching, you MUST use Task tool instead.
+For open-ended searches requiring multiple rounds of globbing and searching, delegate a bounded fact-finding task to an appropriate canonical role agent (`planner` for sequencing/context maps or `architect` for read-only architecture assessment) instead.
 </avoid>
 
 <critical>

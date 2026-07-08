@@ -1,7 +1,8 @@
 Runs commands on remote hosts.
 
 <instruction>
-You MUST build commands from the reference below
+You MUST build commands from the reference below.
+The local coreutils restrictions (`cat`/`grep`/`find`/`head`/`tail` bans) do NOT apply on remote hosts — `read`/`search`/`find` cannot reach them, so these shell commands are the only tools available there.
 </instruction>
 
 <commands>

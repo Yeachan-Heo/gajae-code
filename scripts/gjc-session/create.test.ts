@@ -40,6 +40,19 @@ async function waitForFile(file: string, timeoutMs = 7000): Promise<void> {
 	}
 	throw new Error(`timed out waiting for ${file}`);
 }
+async function waitForFileContaining(file: string, text: string, timeoutMs = 7000): Promise<string> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			const content = await Bun.file(file).text();
+			if (content.includes(text)) return content;
+		} catch {
+			// keep polling
+		}
+		await Bun.sleep(100);
+	}
+	throw new Error(`timed out waiting for ${file} to contain ${text}`);
+}
 
 function startPaneLog(session: string, stateDir: string): void {
 	const paneLog = path.join(stateDir, "pane.log");
@@ -213,6 +226,73 @@ exit 1
 		});
 	});
 
+	test("runner treats process_postmortem errored runtime state as recoverable failure", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-runtime-postmortem-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_runtime_postmortem_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+printf 'Gajae forge\\nWorking before postmortem exit\\n'
+python3 - <<'PY'
+import json
+import os
+
+with open(os.environ["GJC_COORDINATOR_SESSION_STATE_FILE"], "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "schema_version": 1,
+            "session_id": os.environ["GJC_COORDINATOR_SESSION_ID"],
+            "state": "errored",
+            "ready_for_input": False,
+            "source": "process_postmortem",
+            "event": "process_exit",
+            "reason": "process_exit_before_prompt_acceptance",
+            "previous_runtime_state": "running",
+            "error": {"code": "process_exit_before_prompt_acceptance", "recoverable": True},
+        },
+        handle,
+        indent=2,
+    )
+    handle.write("\\n")
+PY
+exit 0
+`,
+		);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_DISABLE: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		await waitForFile(path.join(stateDir, "final.json"));
+		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as Record<string, unknown>;
+		expect(finalStatus).toMatchObject({
+			ownerExitReason: "process_exit_before_prompt_acceptance",
+			severity: "failure",
+			runtimeTerminal: true,
+			runtimeTerminalState: "errored",
+			runtimeTerminalSource: "process_postmortem",
+			runtimeStateSummary: {
+				source: "process_postmortem",
+				event: "process_exit",
+				reason: "process_exit_before_prompt_acceptance",
+				previousRuntimeState: "running",
+			},
+		});
+	}, 20000);
+
 	test("runner rejects terminal runtime state for a mismatched session id", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-runtime-mismatch-"));
 		tempRoots.push(root);
@@ -288,6 +368,76 @@ exit 0
 		});
 	});
 
+	test("runner treats non-terminal runtime state as failed even without prompt marker", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-runtime-running-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_runtime_running_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(
+			fakeGjc,
+			`#!/usr/bin/env bash
+printf 'Gajae forge\\n> Type your message\\nWorking on accepted prompt\\n'
+python3 - <<'PY'
+import json
+import os
+
+with open(os.environ["GJC_COORDINATOR_SESSION_STATE_FILE"], "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "schema_version": 1,
+            "session_id": os.environ["GJC_COORDINATOR_SESSION_ID"],
+            "state": "running",
+            "ready_for_input": False,
+            "source": "agent_session_event",
+            "event": "turn_start",
+            "reason": None,
+        },
+        handle,
+        indent=2,
+    )
+    handle.write("\\n")
+PY
+exit 0
+`,
+		);
+
+		const result = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_DISABLE: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).toBe(0);
+		await waitForFile(path.join(stateDir, "final.json"));
+		const finalStatus = (await Bun.file(path.join(stateDir, "final.json")).json()) as {
+			ownerExitReason: string;
+			promptAccepted: boolean;
+			runtimeStateSummary: { present: boolean; valid: boolean; state: string; terminal: boolean };
+			severity: string;
+			turnEvidencePresent: boolean;
+		};
+		expect(finalStatus).toMatchObject({
+			ownerExitReason: "owner_exited_after_runtime_acknowledgement_before_terminal_status",
+			promptAccepted: false,
+			severity: "failure",
+			turnEvidencePresent: true,
+			runtimeStateSummary: {
+				present: true,
+				valid: true,
+				state: "running",
+				terminal: false,
+			},
+		});
+	}, 20000);
+
 	test("external monitor records vanished tmux sessions and alerts the router", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-vanish-"));
 		tempRoots.push(root);
@@ -336,6 +486,102 @@ exit 0
 		await waitForFile(routerLog);
 		expect(await Bun.file(routerLog).text()).toContain("tmux stale --session");
 	}, 20000);
+	test("external monitor treats process_postmortem runtime state as recoverable failure", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-monitor-postmortem-"));
+		tempRoots.push(root);
+		const session = `gjc_issue_1496_monitor_postmortem_${process.pid}_${Date.now()}`;
+		tmuxSessions.push(session);
+		const worktree = await makeGitWorktree(root);
+		const stateDir = path.join(root, "state");
+		const fakeGjc = path.join(root, "bin", "gjc");
+		await makeExecutable(fakeGjc, "#!/usr/bin/env bash\nprintf 'Gajae forge\\nWorking before postmortem exit\\n'\nsleep 60\n");
+
+		const created = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+			env: isolatedEnv({
+				GJC_BIN: fakeGjc,
+				GJC_SESSION_MONITOR_INTERVAL: "1",
+				GJC_SESSION_SKIP_ROUTER: "1",
+				GJC_SESSION_STATE_DIR: stateDir,
+			}),
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(created.exitCode).toBe(0);
+
+		await Bun.write(
+			path.join(stateDir, "runtime-state.json"),
+			JSON.stringify(
+				{
+					schema_version: 1,
+					session_id: session,
+					state: "errored",
+					ready_for_input: false,
+					source: "process_postmortem",
+					event: "process_exit",
+					reason: "process_exit_before_prompt_acceptance",
+					previous_runtime_state: "running",
+					error: { code: "process_exit_before_prompt_acceptance", recoverable: true },
+				},
+				null,
+				2,
+			),
+		);
+		Bun.spawnSync(["tmux", "kill-session", "-t", session], { stderr: "pipe", stdout: "pipe" });
+		await waitForFile(path.join(stateDir, "vanished.json"));
+
+		const vanished = (await Bun.file(path.join(stateDir, "vanished.json")).json()) as Record<string, unknown>;
+		expect(vanished).toMatchObject({
+			finalPresent: false,
+			phase: "process_postmortem",
+			reason: "process_exit_before_prompt_acceptance",
+			runtimeTerminal: true,
+			runtimeTerminalState: "errored",
+			runtimeTerminalSource: "process_postmortem",
+			severity: "failure",
+		});
+		expect(await Bun.file(path.join(stateDir, "final.json")).exists()).toBe(false);
+		const events = await Bun.file(path.join(stateDir, "events.log")).text();
+		expect(events).toContain("tmux session vanished");
+		expect(events).not.toContain("no vanished failure marker written");
+	}, 20000);
+
+	test("external monitor preserves terminal cleanup for agent_end and launch_error runtime states", async () => {
+		for (const [source, state] of [
+			["agent_end", "completed"],
+			["launch_error", "errored"],
+		] as const) {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), `gjc-session-monitor-${source}-`));
+			tempRoots.push(root);
+			const session = `gjc_issue_1496_monitor_${source}_${process.pid}_${Date.now()}`;
+			tmuxSessions.push(session);
+			const worktree = await makeGitWorktree(root);
+			const stateDir = path.join(root, "state");
+			const fakeGjc = path.join(root, "bin", "gjc");
+			await makeExecutable(fakeGjc, "#!/usr/bin/env bash\nprintf 'Gajae forge\\n'\nsleep 60\n");
+
+			const created = Bun.spawnSync(["bash", "scripts/gjc-session/create.sh", session, worktree], {
+				env: isolatedEnv({
+					GJC_BIN: fakeGjc,
+					GJC_SESSION_MONITOR_INTERVAL: "1",
+					GJC_SESSION_SKIP_ROUTER: "1",
+					GJC_SESSION_STATE_DIR: stateDir,
+				}),
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			expect(created.exitCode).toBe(0);
+
+			await Bun.write(
+				path.join(stateDir, "runtime-state.json"),
+				JSON.stringify({ session_id: session, state, final_response: { source } }, null, 2),
+			);
+			Bun.spawnSync(["tmux", "kill-session", "-t", session], { stderr: "pipe", stdout: "pipe" });
+			const events = await waitForFileContaining(path.join(stateDir, "events.log"), "no vanished failure marker written");
+			expect(events).toContain(`state=${state} source=${source}`);
+			expect(await Bun.file(path.join(stateDir, "vanished.json")).exists()).toBe(false);
+			expect(await Bun.file(path.join(stateDir, "final.json")).exists()).toBe(false);
+		}
+	}, 30000);
 	test("external monitor records vanished sessions after prompt acceptance", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-post-accept-vanish-"));
 		tempRoots.push(root);

@@ -653,12 +653,19 @@ describe("AgentSession message pipeline", () => {
 		expect(session.isStreaming).toBe(true);
 
 		await session.respondAsBackground({ from: "0-Main", message: "ping", awaitReply: false });
-		expect(agent.state.messages.some(message => message.role === "custom")).toBe(false);
+		// Only the background IRC exchange is deferred here; other injected custom
+		// messages (e.g. volatile-project-context) are unrelated to this assertion.
+		const ircBefore = agent.state.messages
+			.filter(message => message.role === "custom")
+			.filter(message => String(message.customType).startsWith("irc:"));
+		expect(ircBefore).toHaveLength(0);
 
 		finish.resolve();
 		await promptPromise;
 
-		const customMessages = agent.state.messages.filter(message => message.role === "custom");
+		const customMessages = agent.state.messages
+			.filter(message => message.role === "custom")
+			.filter(message => String(message.customType).startsWith("irc:"));
 		expect(customMessages).toHaveLength(1);
 		expect(customMessages[0]?.customType).toBe("irc:incoming");
 		expect(customMessages[0]?.content).toContain("ping");

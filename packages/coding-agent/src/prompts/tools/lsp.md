@@ -37,6 +37,6 @@ Interacts with Language Server Protocol servers for code intelligence.
 
 <critical>
 - You MUST use `lsp` for symbol-aware operations (rename, find references, go to definition/implementation, code actions) whenever a language server is available — it is safer and more accurate than text-based alternatives.
-- You NEVER perform cross-file renames with `ast_edit`, `sed`, `rsed`, or manual edits when `lsp` `rename` can do it. Text-based renames miss shadowing, re-exports, and usages in other files.
+- You NEVER perform cross-file renames with `ast_edit`, `sed`, or manual edits when `lsp` `rename` can do it. Text-based renames miss shadowing, re-exports, and usages in other files.
 - Prefer `lsp` `code_actions` for imports, quick-fixes, and refactors the language server already knows how to apply.
 </critical>

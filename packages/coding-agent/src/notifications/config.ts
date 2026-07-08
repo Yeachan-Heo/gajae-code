@@ -38,14 +38,39 @@ export function getNotificationConfig(settings: Settings): NotificationConfig {
 	};
 }
 
+export function hasNonBlankValue(value: string | undefined): boolean {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+/** Is Telegram configured with usable non-blank boundary credentials? */
+export function isTelegramConfigured(
+	cfg: NotificationConfig,
+): cfg is NotificationConfig & { botToken: string; chatId: string } {
+	return cfg.enabled && hasNonBlankValue(cfg.botToken) && hasNonBlankValue(cfg.chatId);
+}
+
 /** Is global config sufficient for auto-on (enabled + at least one configured adapter)? */
 export function isGloballyConfigured(cfg: NotificationConfig): boolean {
 	return (
 		cfg.enabled &&
-		((Boolean(cfg.botToken) && Boolean(cfg.chatId)) ||
-			(Boolean(cfg.discord.botToken) && Boolean(cfg.discord.channelId)) ||
-			(Boolean(cfg.slack.botToken) && Boolean(cfg.slack.channelId)))
+		(isTelegramConfigured(cfg) ||
+			(hasNonBlankValue(cfg.discord.botToken) && hasNonBlankValue(cfg.discord.channelId)) ||
+			(hasNonBlankValue(cfg.slack.botToken) && hasNonBlankValue(cfg.slack.channelId)))
 	);
+}
+
+/**
+ * Per-run opt-out for completion notifications, honored before settings lookups.
+ *
+ * `GJC_NOTIFY=off` (also `0` / `false`, case-insensitive) suppresses the
+ * completion notification surface for this process only. `config.yml` is
+ * untouched and child processes inherit the env var, which lets non-interactive
+ * fleet runs (`gjc -p --no-session`) stay silent even when a user-level/global
+ * completion notification configuration is enabled.
+ */
+export function completionNotifyDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
+	const v = env.GJC_NOTIFY?.trim().toLowerCase();
+	return v === "off" || v === "0" || v === "false";
 }
 
 /** Resolve whether the notifications extension should be registered at SDK startup. */
@@ -60,6 +85,7 @@ export function shouldRegisterNotificationsExtension(input: {
 	currentAgentType?: string;
 }): boolean {
 	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix || input.currentAgentType) return false;
+	if (completionNotifyDisabledByEnv(input.env)) return false;
 	if (input.env.GJC_NOTIFICATIONS === "0") return false;
 	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
 	return input.cfg ? isGloballyConfigured(input.cfg) : false;
@@ -88,6 +114,7 @@ export function isSessionNotificationsEnabled(input: {
 /** Mask a bot token for display: first 4 chars + "…" + "(len N)"; "(unset)" when undefined/empty. Never reveal full token. */
 export function maskToken(token: string | undefined): string {
 	if (!token) return "(unset)";
+	if (token.length <= 4) return `…(len ${token.length})`;
 	return `${token.slice(0, 4)}…(len ${token.length})`;
 }
 
@@ -131,6 +158,6 @@ export function buildRedactedAction(
 	// Asks stay fully readable/answerable even under redaction.
 	if (action.kind === "ask") return action;
 
-	const { summary: _summary, question: _question, ...base } = action;
+	const { summary: _summary, question: _question, options: _options, ...base } = action;
 	return base;
 }

@@ -1,0 +1,132 @@
+# Recovered context: 1-SystemPrompts
+
+- Session file: `<local-gjc-session-jsonl-redacted>`
+- JSONL records inspected: yes
+- Tool calls: 106
+- Recorded findings recovered from `report_finding`: 0
+- Yield calls: 0
+- Errors/stalls: 25
+
+## Errors / terminal blockers
+
+- line 187: Anthropic stream stalled while waiting for the next event
+- line 188: Anthropic stream stalled while waiting for the next event
+- line 192: Anthropic stream stalled while waiting for the next event
+- line 195: Anthropic stream stalled while waiting for the next event
+- line 196: Anthropic stream stalled while waiting for the next event
+- line 197: Anthropic stream stalled while waiting for the next event
+- line 198: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()
+- line 201: Anthropic stream stalled while waiting for the next event
+- line 202: Anthropic stream stalled while waiting for the next event
+- line 203: 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}
+
+## Read paths sampled
+
+- `packages/coding-agent/src/prompts/system/`
+- `packages/coding-agent/src/prompts/goals/`
+- `packages/coding-agent/src/prompts/memories/`
+- `packages/coding-agent/src/prompts/system/system-prompt.md:raw`
+- `packages/coding-agent/src/prompts/system/subagent-system-prompt.md:raw`
+- `packages/coding-agent/src/prompts/system/subagent-user-prompt.md:raw`
+- `packages/coding-agent/src/prompts/system/subagent-yield-reminder.md:raw`
+- `packages/coding-agent/src/prompts/system/custom-system-prompt.md:raw`
+- `packages/coding-agent/src/prompts/system/plan-mode-active.md:raw`
+- `packages/coding-agent/src/prompts/system/plan-mode-approved.md:raw`
+- `packages/coding-agent/src/prompts/system/plan-mode-compact-instructions.md:raw`
+- `packages/coding-agent/src/prompts/system/plan-mode-reference.md:raw`
+- `packages/coding-agent/src/prompts/system/plan-mode-subagent.md:raw`
+- `packages/coding-agent/src/prompts/system/plan-mode-tool-decision-reminder.md:raw`
+- `packages/coding-agent/src/prompts/system/ttsr-interrupt.md:raw`
+- `packages/coding-agent/src/prompts/system/ttsr-tool-reminder.md:raw`
+- `packages/coding-agent/src/prompts/system/auto-continue.md:raw`
+- `packages/coding-agent/src/prompts/system/eager-todo.md:raw`
+- `packages/coding-agent/src/prompts/system/btw-user.md:raw`
+- `packages/coding-agent/src/prompts/system/irc-incoming.md:raw`
+- `packages/coding-agent/src/prompts/system/project-prompt.md:raw`
+- `packages/coding-agent/src/prompts/system/rlm-report-command.md:raw`
+- `packages/coding-agent/src/prompts/system/rlm-research.md:raw`
+- `packages/coding-agent/src/prompts/system/title-system.md:raw`
+- `packages/coding-agent/src/prompts/system/commit-message-system.md:raw`
+- `packages/coding-agent/src/prompts/system/web-search.md:raw`
+- `packages/coding-agent/src/prompts/system/agent-creation-architect.md:raw`
+- `packages/coding-agent/src/prompts/system/agent-creation-user.md:raw`
+- `packages/coding-agent/src/prompts/goals/goal-continuation.md:raw`
+- `packages/coding-agent/src/prompts/goals/goal-mode-active.md:raw`
+- `packages/coding-agent/src/prompts/memories/consolidation.md:raw`
+- `packages/coding-agent/src/prompts/memories/read-path.md:raw`
+- `packages/coding-agent/src/prompts/memories/stage_one_input.md:raw`
+- `packages/coding-agent/src/prompts/memories/stage_one_system.md:raw`
+- `packages/coding-agent/src/prompts/memories/unavailable.md:raw`
+- `packages/coding-agent/src/prompts/ci-green-request.md:raw`
+- `packages/coding-agent/src/autoresearch/prompt.md:raw`
+- `packages/coding-agent/src/autoresearch/prompt-setup.md:raw`
+- `packages/ai/src/prompts/turn-aborted-guidance.md:raw`
+- `packages/coding-agent/src/system-prompt.ts`
+- `packages/coding-agent/src/system-prompt.ts:raw`
+- `packages/coding-agent/src/system-prompt.ts:300-601:raw`
+- `packages/coding-agent/src/sdk.ts:1790-1900:raw`
+- `packages/coding-agent/src/task/executor.ts`
+- `packages/coding-agent/src/task/executor.ts:1351-1400:raw`
+- `packages/coding-agent/src/goals/runtime.ts:raw`
+- `packages/utils/src/prompt.ts:380-430:raw`
+- `packages/coding-agent/src/rlm/preset.ts:raw`
+- `packages/coding-agent/src/session/agent-session.ts:2470-2515:raw`
+- `packages/coding-agent/src/prompts/tools/skill.md:raw`
+- `packages/utils/src/prompt.ts:1-120:raw`
+- `packages/coding-agent/src/autoresearch/index.ts:340-470:raw`
+- `packages/coding-agent/src/prompts/system/system-prompt.md:84-115`
+- `packages/utils/src/prompt.ts:124-236:raw`
+- `packages/coding-agent/src/session/agent-session.ts:9600-9640:raw`
+- `packages/coding-agent/src/goals/runtime.ts:300-420:raw`
+- `packages/coding-agent/src/session/agent-session.ts:7360-7420:raw`
+- `packages/coding-agent/src/modes/interactive-mode.ts:1700-1725:raw`
+- `packages/coding-agent/src/extensibility/custom-commands/bundled/ci-green/index.ts:raw`
+- `packages/coding-agent/src/tools/skill.ts:raw`
+- `packages/coding-agent/src/prompts/system/system-prompt.md:58-98`
+- `packages/coding-agent/src/prompts/system/system-prompt.md:239-293`
+- `packages/coding-agent/src/modes/interactive-mode.ts:750-800:raw`
+- `packages/coding-agent/src/session/agent-session.ts:7424-7470:raw`
+
+## Search patterns sampled
+
+- `system-prompt\.md|subagent-system-prompt|subagent-user-prompt|subagent-yield-reminder|custom-system-prompt|plan-mode-|ttsr-|project-prompt|rlm-research|rlm-report-command|title-system|commit-message-system|agent-creation|auto-continue\.md|btw-user|eager-todo|irc-incoming|web-search\.md|goal-continuation|goal-mode-active|ci-green-request|turn-aborted-guidance` in `['packages/coding-agent/src', 'packages/ai/src']`
+- `system-prompt\.md|subagent-system-prompt|subagent-user-prompt|subagent-yield-reminder|custom-system-prompt|plan-mode-|ttsr-|project-prompt|rlm-research|rlm-report-command|title-system|commit-message-system|agent-creation|auto-continue\.md|btw-user|eager-todo|irc-incoming|web-search\.md|goal-continuation|goal-mode-active|ci-green-request|turn-aborted-guidance` in `['packages/coding-agent/src', 'packages/ai/src']`
+- `skills|rules|dateTime|git\.` in `['packages/coding-agent/src/prompts/system/system-prompt.md', 'packages/coding-agent/src/prompts/system/project-prompt.md', 'packages/coding-agent/src/prompts/system/custom-system-prompt.md']`
+- `git\.isRepo|git:\s|\bgit\b.*currentBranch|mainBranch` in `['packages/coding-agent/src/system-prompt.ts', 'packages/coding-agent/src/session']`
+- `alwaysApplyRules|skills\.length|rules\.length` in `['packages/coding-agent/src/prompts']`
+- `customSystemPromptTemplate|git:` in `['packages/coding-agent/src/system-prompt.ts', 'packages/coding-agent/src']`
+- `alwaysApplyRules|dateTime|{{skills|skills\.length` in `['packages/coding-agent/src']`
+- `<skills>|<rules>|rule://` in `['packages/coding-agent/src/prompts', 'packages/coding-agent/src/system-prompt.ts', 'packages/coding-agent/src/sdk.ts']`
+- `Skills are specialized|alwaysApply|<skill name=` in `['packages/coding-agent/src/session', 'packages/coding-agent/src/sdk.ts', 'packages/coding-agent/src/extensibility/skills']`
+- `\{\{(?!#|/|else)` in `['packages/coding-agent/src/prompts/system/project-prompt.md']`
+- `Skills are specialized|<skills>|skill name=|Rules are local constraints` in `['packages/coding-agent/src']`
+- `subagentSystemPromptTemplate|submitReminderTemplate|retryCount|maxRetries|forkContext|ircPeers|contextFile|outputSchema|worktree` in `['packages/coding-agent/src/task/executor.ts']`
+- `jtdToTypeScript|#list|#has\b|ifAny|#when|#includes` in `['packages/utils/src']`
+- `jtdToTypeScript|includes.*registerHelper|registerHelper\("includes"` in `['packages/utils/src/prompt.ts']`
+- `jtdToTypeScript` in `['packages']`
+- `planModeActivePrompt|planModeReferencePrompt|planModeToolDecisionReminderPrompt|planExists|planFilePath|editToolName|writeToolName|askToolName|iterative|reentry` in `['packages/coding-agent/src/session/agent-session.ts']`
+- `planModeApprovedPrompt|planModeCompactInstructionsPrompt|finalPlanFilePath|contextPreserved|planContent` in `['packages/coding-agent/src/modes/interactive-mode.ts']`
+- `prompt\.md|prompt-setup\.md|base_system_prompt|has_goal|working_dir` in `['packages/coding-agent/src/autoresearch']`
+- `consolidation\.md|read-path\.md|stage_one_input|stage_one_system|unavailable\.md|memory_summary|raw_memories|rollout_summaries|response_items_json|thread_id` in `['packages/coding-agent/src']`
+- `unavailableTemplate|autoContinuePrompt|eagerTodoPrompt|btwUserPrompt|ircIncomingTemplate` in `['packages/coding-agent/src']`
+- `ttsrInterruptTemplate|ttsrToolReminderTemplate` in `['packages/coding-agent/src/session/agent-session.ts']`
+- `agentCreationArchitectPrompt|agentCreationUserPrompt|TASK_TOOL_NAME` in `['packages/coding-agent/src/modes/components/agent-dashboard.ts']`
+- `planModeSubagentPrompt|subagentUserPromptTemplate` in `['packages/coding-agent/src/task/index.ts']`
+- `ANTHROPIC_MODEL|AGENTS\.md|CLAUDE\.md` in `['packages/coding-agent/src/capability/context-file.ts', 'packages/coding-agent/src/workspace-tree.ts', 'packages/coding-agent/src/discovery.ts']`
+- `ANTHROPIC_MODEL` in `['packages/coding-agent/src']`
+- `independentMode` in `['packages/coding-agent/src/prompts', 'packages/coding-agent/src/task']`
+- `filteredSkills|skills:|rules:` in `['packages/coding-agent/src/system-prompt.ts']`
+- `skill.*description|<available-skills>|availableSkills|renderSkill|skillList` in `['packages/coding-agent/src/sdk.ts', 'packages/coding-agent/src/session/agent-session.ts']`
+- `skills|rules|alwaysApply` in `['packages/coding-agent/src/prompts/system/project-prompt.md', 'packages/coding-agent/src/prompts/system/system-prompt.md']`
+- `export function render|noEscape|compile` in `['packages/utils/src/prompt.ts']`
+- `dateTime|default_metric_name` in `['packages/coding-agent/src/prompts', 'packages/coding-agent/src/autoresearch/prompt.md', 'packages/coding-agent/src/autoresearch/prompt-setup.md']`
+- `baseline_run_number|metric_unit|asi_summary|has_asi_summary|has_deviations|run_number|status|metric_display|description` in `['packages/coding-agent/src/autoresearch/prompt.md']`
+- `^<soul>|^</soul>|^## Scope of Freedom|^<communication>|^<completion-contract>|^<workflow>|^<tools>|^</tools>|^<repo-safety>|^<identity>|^<authority>|^<gjc-runtime>|^</gjc-runtime>` in `['packages/coding-agent/src/prompts/system/system-prompt.md']`
+- `todo|eager` in `['packages/coding-agent/src/task/executor.ts']`
+- `alwaysApply|always-apply|Rules are local|rule://` in `['packages/coding-agent/src/session/agent-session.ts', 'packages/coding-agent/src/sdk.ts']`
+- `prompt-templates` in `['packages/coding-agent/src/sdk.ts', 'packages/coding-agent/src/task/executor.ts', 'packages/coding-agent/src/task/index.ts']`
+- `AGENTS\.md|GEMINI\.md|QWEN\.md|\.cursorrules|CONTEXT_FILE|fileNames|candidates` in `['packages/coding-agent/src/capability/context-file.ts']`
+- `buildActivePrompt|goal_context|goalRuntime\.build` in `['packages/coding-agent/src']`
+- `alwaysApply|always_apply|always-apply` in `['packages/coding-agent/src/session', 'packages/coding-agent/src/rulebook', 'packages/coding-agent/src/ttsr']`
+- `\{\{#if skills|\{\{#list skills|\{\{#each skills|\{\{#if rules|\{\{#if alwaysApplyRules` in `['packages/coding-agent/src/prompts']`
+- `Scan descriptions|specialized knowledge|skill://` in `['packages/coding-agent/src/session/agent-session.ts', 'packages/coding-agent/src/sdk.ts', 'packages/coding-agent/src/extensibility/skills.ts']`

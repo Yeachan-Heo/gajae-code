@@ -71,6 +71,7 @@ import {
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
 import { compactGrammarDefinition } from "./grammar";
+import { wrapOpenAIFetchForBoundedRateLimits } from "./openai-bounded-rate-limits";
 import {
 	applyOpenAIRequestTransformBody,
 	applyOpenAIRequestTransformHeaders,
@@ -274,6 +275,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.fetch,
 				options?.authCredentialType,
 				options?.requestMaxRetries,
+				options?.maxRetryDelayMs,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
@@ -400,6 +402,7 @@ function createClient(
 	fetchOverride?: FetchImpl,
 	authCredentialType?: OpenAIResponsesOptions["authCredentialType"],
 	requestMaxRetries?: number,
+	maxRetryDelayMs?: number,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -446,8 +449,9 @@ function createClient(
 		headers["x-client-request-id"] ??= sessionId;
 	}
 	const baseFetch = fetchOverride ?? fetch;
+	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(baseFetch, maxRetryDelayMs);
 	const transformedFetch = wrapFetchForOpenAIRequestTransform(
-		baseFetch,
+		boundedFetch,
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);

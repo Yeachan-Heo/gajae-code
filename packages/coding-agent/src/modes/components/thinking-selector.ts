@@ -1,7 +1,7 @@
-import type { Effort } from "@gajae-code/ai";
+import { ThinkingLevel, type ThinkingLevel as ThinkingLevelValue } from "@gajae-code/agent-core";
 import { Container, type SelectItem, SelectList } from "@gajae-code/tui";
 import { getSelectListTheme } from "../../modes/theme/theme";
-import { getThinkingLevelMetadata } from "../../thinking";
+import { getThinkingLevelMetadata, type ThinkingLevelValue as ThinkingMetadataValue } from "../../thinking-metadata";
 import { DynamicBorder } from "./dynamic-border";
 
 /**
@@ -11,14 +11,16 @@ export class ThinkingSelectorComponent extends Container {
 	#selectList: SelectList;
 
 	constructor(
-		currentLevel: Effort,
-		availableLevels: Effort[],
-		onSelect: (level: Effort) => void,
+		currentLevel: ThinkingLevelValue | undefined,
+		availableLevels: ThinkingLevelValue[],
+		onSelect: (level: ThinkingLevelValue) => void,
 		onCancel: () => void,
 	) {
 		super();
 
-		const thinkingLevels: SelectItem[] = availableLevels.map(getThinkingLevelMetadata);
+		const thinkingLevels: SelectItem[] = availableLevels.map(level =>
+			getThinkingLevelMetadata(level as ThinkingMetadataValue),
+		);
 
 		// Add top border
 		this.addChild(new DynamicBorder());
@@ -27,13 +29,13 @@ export class ThinkingSelectorComponent extends Container {
 		this.#selectList = new SelectList(thinkingLevels, thinkingLevels.length, getSelectListTheme());
 
 		// Preselect current level
-		const currentIndex = thinkingLevels.findIndex(item => item.value === currentLevel);
+		const currentIndex = thinkingLevels.findIndex(item => item.value === (currentLevel ?? ThinkingLevel.Off));
 		if (currentIndex !== -1) {
 			this.#selectList.setSelectedIndex(currentIndex);
 		}
 
 		this.#selectList.onSelect = item => {
-			onSelect(item.value as Effort);
+			onSelect(item.value as ThinkingLevelValue);
 		};
 
 		this.#selectList.onCancel = () => {

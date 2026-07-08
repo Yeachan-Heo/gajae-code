@@ -33,8 +33,8 @@ import { registerAskAnswerSource } from "../tools/ask-answer-registry";
 import { registerTelegramFileSink } from "./attachment-registry";
 import {
 	getNotificationConfig,
-	isGloballyConfigured,
 	isSessionNotificationsEnabled,
+	isTelegramConfigured,
 	type NotificationConfig,
 	sessionTag,
 } from "./config";
@@ -90,6 +90,8 @@ export interface SessionCreateFrame {
 	target: SessionCreateTarget;
 	/** Reference to the daemon-written, once-consumed startup-prompt file. */
 	startupPromptRef?: string;
+	/** Model profile preset to activate for the spawned session (--mpreset). */
+	modelPreset?: string;
 }
 
 /** Close (hard-kill, history preserved) a session. */
@@ -758,7 +760,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 			});
 			logger.info(`notifications: serving session ${id} at ${endpoint.url} (unattended=${unattended})`);
 
-			if (settingsAvailable && settings && isGloballyConfigured(cfg)) {
+			if (settingsAvailable && settings && isTelegramConfigured(cfg)) {
 				try {
 					await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
 				} catch (e) {

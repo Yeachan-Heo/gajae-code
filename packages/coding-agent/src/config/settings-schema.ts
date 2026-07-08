@@ -551,9 +551,9 @@ export const SETTINGS_SCHEMA = {
 		default: 0,
 		ui: {
 			tab: "tools",
-			label: "Read-tool artifact spill threshold (KB)",
+			label: "Experimental read-tool artifact spill threshold (KB)",
 			description:
-				"Combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Higher than the general spill threshold so ordinary inspection reads stay inline; 0 disables read spill (falls back to the absolute inline backstop only).",
+				"Advanced opt-in only: combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 found no token savings and a lower cache-hit rate at 50 KB, so normal coding sessions should leave this Off unless intentionally measuring large-read behavior.",
 			options: [
 				{ value: "0", label: "Off", description: "Default; no read-specific spill (backstop only)" },
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
@@ -1440,31 +1440,14 @@ export const SETTINGS_SCHEMA = {
 
 	"compaction.remoteEndpoint": { type: "string", default: undefined },
 
-	// Below-threshold maintenance pruning (Finding 13). DEFAULT-OFF and BLOCKED
-	// from default-on until live TaskTokenLog (#6) evidence justifies it: pruning
-	// rewrites already-sent history and forces a provider cache-epoch reset, so it
-	// only pays off when the estimated stale savings clearly exceed that reset.
-	"compaction.maintenancePruningEnabled": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "context",
-			label: "Below-threshold maintenance pruning",
-			description:
-				"Opt-in: prune stale tool outputs BELOW the compaction threshold when the estimated savings are large enough to outweigh a prompt-cache-epoch reset. Off by default (evidence-gated); enabling it trades one cache reset for reclaimed context.",
-		},
-	},
+	// Below-threshold maintenance pruning (Finding 13). Internal/measurement-only:
+	// keep the runtime setting for targeted experiments, but do not expose it in
+	// settings UI. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 showed no
+	// savings and a cache-hit regression; pruning rewrites already-sent history and
+	// can force a provider cache-epoch reset.
+	"compaction.maintenancePruningEnabled": { type: "boolean", default: false },
 
-	"compaction.maintenancePruningMinSavingsTokens": {
-		type: "number",
-		default: 8000,
-		ui: {
-			tab: "context",
-			label: "Maintenance pruning min savings (tokens)",
-			description:
-				"Minimum estimated stale-prunable token savings required before below-threshold maintenance pruning runs. Kept high so a cache-epoch reset is only spent for a large reclaim.",
-		},
-	},
+	"compaction.maintenancePruningMinSavingsTokens": { type: "number", default: 8000 },
 
 	// Idle compaction
 	"compaction.idleEnabled": {

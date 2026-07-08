@@ -3,12 +3,11 @@ Launches subagents to parallelize workflows.
 - Results are delivered automatically when complete.
 - The tool result lists the assigned task ids (e.g. `0-AuthLoader`) — those are the live agent ids.
 {{#if ircEnabled}}
-- Coordinate with running tasks via `irc` using those ids. `subagent` cancel terminates a task and **cannot carry a message** — never cancel because an await timed out; cancel only when the task has actually failed, gone off-track, or become unrecoverably wrong.
-- If genuinely blocked on completion, wait with `subagent` action `await` and a timeout; timeout only bounds your wait and does not stop or fail the subagent.
+- Coordinate with running tasks via `irc` using those ids. `subagent` cancel terminates a task and **cannot carry a message**.
 {{else}}
-- If genuinely blocked on completion, wait with `subagent` action `await` and a timeout; timeout only bounds your wait and does not stop or fail the subagent.
-- Use `subagent` action `inspect` or `list` to snapshot manager state; `cancel` only when a task has actually failed, gone off-track, or become unrecoverably wrong.
+- Use `subagent` action `inspect` or `list` to snapshot manager state.
 {{/if}}
+- To wait or cancel, use the `subagent` tool; its await/cancel doctrine applies (never cancel just because an await timed out).
 
 {{#if ircEnabled}}
 Subagents have no conversation history, but they can reach you and their siblings live via the `irc` tool. Front-load every fact, file path, and direction they need in {{#if contextEnabled}}`context` or `assignment`{{else}}each `assignment`{{/if}}.
@@ -19,7 +18,7 @@ Subagents have no conversation history. Every fact, file path, and direction the
 <parameters>
 - `agent`: agent type for all tasks
 - `tasks`: tasks to execute in parallel
- - `.id`: CamelCase, ≤32 chars
+ - `.id`: filesystem-safe, ≤48 chars, matching `[A-Za-z0-9][A-Za-z0-9_-]*`; prefer CamelCase
  - `.description`: UI label only — subagent never sees it
  - `.assignment`: complete self-contained instructions; one-liners and missing acceptance criteria are PROHIBITED
 {{#if contextEnabled}}- `context`: shared background prepended to every assignment; session-specific only{{/if}}

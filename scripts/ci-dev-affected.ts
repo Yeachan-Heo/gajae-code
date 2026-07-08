@@ -9,6 +9,10 @@ const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
 const PYTHON_DEV_SETUP =
 	"python3 -m pip install --user --upgrade 'pip>=24' 'setuptools>=69' wheel && python3 -m pip install --user -e python/gjc-rpc -e 'python/robogjc[dev]'";
+// The coding-agent package has hundreds of test files; keep dev affected push
+// validation below the 30m shard timeout by splitting its package-wide suite.
+const CODING_AGENT_TEST_SHARDS = 8;
+
 // Keys for tasks that compile the @gajae-code/natives addon. They run once in
 // the dedicated dev-ci native-build job (not as matrix shards) and publish the
 // built `.node` files as an artifact the runtime-dependent shards download.
@@ -451,7 +455,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 				add(tasks, `check:${workspacePackage.name}`, `Check ${workspacePackage.name}`, packageScriptCommand("check"), resolvePackageCwd(workspacePackage.dir));
 			}
 			if (workspacePackage.manifest.scripts?.test) {
-				add(tasks, `test:${workspacePackage.name}`, `Test ${workspacePackage.name}`, packageScriptCommand("test"), resolvePackageCwd(workspacePackage.dir));
+				addPackageTestTasks(tasks, workspacePackage);
 			}
 		}
 	}
@@ -612,6 +616,23 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 // so the matrix shard name stays small and directly traceable to the file.
 function addTestFileTask(tasks: Map<string, Task>, testFile: string): void {
 	add(tasks, `test:${testFile}`, `Test ${testFile}`, ["bun", "test", testFile]);
+}
+
+function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: WorkspacePackage): void {
+	if (workspacePackage.name !== "@gajae-code/coding-agent") {
+		add(tasks, `test:${workspacePackage.name}`, `Test ${workspacePackage.name}`, packageScriptCommand("test"), resolvePackageCwd(workspacePackage.dir));
+		return;
+	}
+
+	for (let shard = 1; shard <= CODING_AGENT_TEST_SHARDS; shard++) {
+		add(
+			tasks,
+			`test:${workspacePackage.name}:shard-${shard}-of-${CODING_AGENT_TEST_SHARDS}`,
+			`Test ${workspacePackage.name} shard ${shard}/${CODING_AGENT_TEST_SHARDS}`,
+			["bun", "test", `--shard=${shard}/${CODING_AGENT_TEST_SHARDS}`],
+			resolvePackageCwd(workspacePackage.dir),
+		);
+	}
 }
 
 // Resolve the directly-named test(s) for a changed path: the changed file itself

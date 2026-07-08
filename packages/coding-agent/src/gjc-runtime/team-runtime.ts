@@ -22,6 +22,7 @@ import {
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxUntaggedSessionHint,
+	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_PROFILE_OPTION,
 	GJC_TMUX_PROFILE_VALUE,
 	resolveGjcTmuxCommand,
@@ -204,6 +205,7 @@ export type GjcTeamNotificationDeliveryState =
 	| "acknowledged";
 
 export type GjcTeamPaneAttemptResult = "sent" | "queued" | "deferred" | "failed";
+export type GjcTeamMailboxDeliveryTransportKind = "notifications_sdk" | "pane";
 
 export interface GjcTeamNotification {
 	id: string;
@@ -219,6 +221,36 @@ export interface GjcTeamNotification {
 	created_at: string;
 	updated_at: string;
 	replay_count: number;
+}
+export interface GjcTeamMailboxDeliveryInput {
+	team_name: string;
+	state_dir: string;
+	config: GjcTeamConfig;
+	notification: GjcTeamNotification;
+	message: GjcTeamMailboxMessage;
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+}
+export type GjcTeamMailboxDeliveryResult =
+	| { transport: "notifications_sdk"; state: GjcTeamNotificationDeliveryState; reason?: string }
+	| { transport: "pane"; state: GjcTeamPaneAttemptResult; reason?: string };
+export interface GjcTeamMailboxDeliveryTransport {
+	deliverMailboxMessage(input: GjcTeamMailboxDeliveryInput): Promise<GjcTeamMailboxDeliveryResult | null>;
+}
+
+let gjcTeamMailboxDeliveryTransport: GjcTeamMailboxDeliveryTransport | undefined;
+
+export function setGjcTeamMailboxDeliveryTransport(transport: GjcTeamMailboxDeliveryTransport | undefined): () => void {
+	const previous = gjcTeamMailboxDeliveryTransport;
+	gjcTeamMailboxDeliveryTransport = transport;
+	return () => {
+		gjcTeamMailboxDeliveryTransport = previous;
+	};
+}
+export function setGjcTeamMailboxDeliveryTransportForTest(
+	transport: GjcTeamMailboxDeliveryTransport | undefined,
+): () => void {
+	return setGjcTeamMailboxDeliveryTransport(transport);
 }
 
 export interface GjcTeamNotificationSummary {
@@ -256,6 +288,7 @@ export interface GjcTeamStartOptions {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
 	dryRun?: boolean;
+	mailboxDeliveryTransport?: GjcTeamMailboxDeliveryTransport;
 }
 
 export interface GjcTeamApiClaimResult {
@@ -1890,16 +1923,22 @@ function tagTmuxSessionAsGjcLeader(tmuxCommand: string, sessionName: string): bo
 function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
 	if (Bun.which(tmuxCommand) === null)
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`tmux_not_installed:${tmuxCommand}`));
-	const paneTarget = env.TMUX_PANE?.trim();
-	const args = paneTarget
-		? ["display-message", "-p", "-t", paneTarget, "#S:#I #{pane_id}"]
+	// Prefer the explicit GJC-managed session name propagated by `gjc --tmux`
+	// (GJC_TMUX_ACTIVE_SESSION). Under psmux on Windows the inherited TMUX_PANE
+	// can resolve to the wrong/default session, so querying the tagged session
+	// by name is authoritative for GJC-launched leaders. Fall back to TMUX_PANE,
+	// then to the ambient session, to keep native tmux/WSL flows unchanged.
+	const activeSession = env[GJC_TMUX_ACTIVE_SESSION_ENV]?.trim();
+	const displayTarget = activeSession ? buildGjcTmuxExactOptionTarget(activeSession, { env }) : env.TMUX_PANE?.trim();
+	const args = displayTarget
+		? ["display-message", "-p", "-t", displayTarget, "#S:#I #{pane_id}"]
 		: ["display-message", "-p", "#S:#I #{pane_id}"];
 	const result = Bun.spawnSync([tmuxCommand, ...args], { stdout: "pipe", stderr: "pipe" });
 	if (result.exitCode !== 0) {
 		// Distinguish "you are not inside any tmux session" from a genuine tmux
 		// query failure so the caller gets actionable guidance instead of raw
 		// tmux stderr. `gjc team` needs a tmux leader; outside tmux there is none.
-		const insideTmux = Boolean(env.TMUX?.trim() || env.TMUX_PANE?.trim());
+		const insideTmux = Boolean(env.TMUX?.trim() || env.TMUX_PANE?.trim() || activeSession);
 		const stderr = result.stderr.toString().trim();
 		throw new Error(
 			buildTeamTmuxLeaderRequirementMessage(
@@ -2945,6 +2984,7 @@ async function initializeStateDirs(dir: string, workers: GjcTeamWorker[]): Promi
 export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTeamSnapshot> {
 	const cwd = options.cwd ?? process.cwd();
 	const env = options.env ?? process.env;
+	if (options.mailboxDeliveryTransport) setGjcTeamMailboxDeliveryTransport(options.mailboxDeliveryTransport);
 	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
 	const workerCliPlan = resolveGjcTeamWorkerCliPlan(options.workerCount, env);
@@ -3902,12 +3942,59 @@ async function reconcileTeamNotifications(dir: string, config: GjcTeamConfig): P
 	}
 	return summarizeNotifications(await listNotificationRecords(dir));
 }
+async function messageForNotification(
+	dir: string,
+	notification: GjcTeamNotification,
+): Promise<GjcTeamMailboxMessage | null> {
+	if (notification.kind !== "mailbox_message" || notification.source.type !== "message") return null;
+	const mailbox = await readMailbox(dir, notification.recipient);
+	return mailbox.messages.find(message => message.message_id === notification.source.id) ?? null;
+}
+
+async function attemptConfiguredMailboxTransport(
+	dir: string,
+	config: GjcTeamConfig,
+	notification: GjcTeamNotification,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+): Promise<GjcTeamNotification | null> {
+	if (!gjcTeamMailboxDeliveryTransport) return null;
+	const message = await messageForNotification(dir, notification);
+	if (!message) return null;
+	try {
+		const result = await gjcTeamMailboxDeliveryTransport.deliverMailboxMessage({
+			team_name: config.team_name,
+			state_dir: dir,
+			config,
+			notification,
+			message,
+			cwd,
+			env,
+		});
+		if (!result) return null;
+		if (result.transport === "notifications_sdk" && result.state === "failed") return null;
+		return writeNotificationRecord(dir, {
+			...notification,
+			delivery_state: result.state,
+			pane_attempt_result: result.transport === "pane" ? result.state : undefined,
+			pane_attempt_reason: result.reason ?? result.transport,
+			pane_attempt_at: now(),
+			updated_at: now(),
+		});
+	} catch {
+		return null;
+	}
+}
+
 async function attemptPaneNotification(
 	dir: string,
 	config: GjcTeamConfig,
 	notification: GjcTeamNotification,
 	env: NodeJS.ProcessEnv,
+	cwd = process.cwd(),
 ): Promise<GjcTeamNotification> {
+	const transported = await attemptConfiguredMailboxTransport(dir, config, notification, cwd, env);
+	if (transported) return transported;
 	const paneId =
 		notification.recipient === "leader-fixed"
 			? config.leader.pane_id
@@ -3954,6 +4041,7 @@ export async function replayGjcTeamNotifications(
 				replay_count: (notification.replay_count ?? 0) + 1,
 			},
 			env,
+			cwd,
 		);
 		next.push(attempted);
 	}
@@ -3982,8 +4070,13 @@ export async function sendGjcTeamMessage(
 		...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
 	};
 	const written = await writeMailboxMessage(dir, toWorker, message);
+	const existingNotification = await readJsonFile<GjcTeamNotification>(
+		notificationPath(dir, messageNotificationId(config.team_name, toWorker, written.message_id)),
+	);
 	const notification = await createMessageNotification(dir, config.team_name, written);
-	await attemptPaneNotification(dir, config, notification, env);
+	if (!existingNotification) {
+		await attemptPaneNotification(dir, config, notification, env, cwd);
+	}
 	await appendEvent(dir, {
 		type: "message_sent",
 		worker: fromWorker,

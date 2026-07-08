@@ -1,0 +1,191 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { decodePastedPathCandidate, resolvePastedImagePath } from "../src/utils/pasted-image-path";
+
+const NNBSP = "\u202f"; // narrow no-break space used by macOS screenshot names
+
+describe("resolvePastedImagePath", () => {
+	let testDir: string;
+
+	beforeEach(() => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pasted-image-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(testDir, { recursive: true, force: true });
+	});
+
+	const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+	function writeImage(name: string): string {
+		const filePath = path.join(testDir, name);
+		fs.writeFileSync(filePath, PNG_SIGNATURE);
+		return filePath;
+	}
+
+	it("resolves a plain absolute path to an existing image", () => {
+		const filePath = writeImage("plain.png");
+		expect(resolvePastedImagePath(filePath)).toBe(filePath);
+	});
+
+	it("resolves a shell-escaped drag-drop path with U+202F before PM", () => {
+		// macOS screenshot drag-drop: ASCII spaces are `\ `-escaped, the U+202F
+		// before "PM" is left as-is.
+		const filePath = writeImage(`Screenshot 2026-07-07 at 11.06.38${NNBSP}PM.png`);
+		const pasted = filePath.replaceAll(" ", "\\ ");
+		expect(pasted).not.toBe(filePath);
+		expect(resolvePastedImagePath(pasted)).toBe(filePath);
+	});
+
+	it("resolves shell-escaped parentheses", () => {
+		const filePath = writeImage("shot (1).png");
+		const pasted = filePath.replaceAll(" ", "\\ ").replaceAll("(", "\\(").replaceAll(")", "\\)");
+		expect(resolvePastedImagePath(pasted)).toBe(filePath);
+	});
+
+	it("resolves single- and double-quoted paths", () => {
+		const filePath = writeImage("quoted image.jpg");
+		expect(resolvePastedImagePath(`'${filePath}'`)).toBe(filePath);
+		expect(resolvePastedImagePath(`"${filePath}"`)).toBe(filePath);
+	});
+
+	it("resolves file:// URIs with percent-encoding", () => {
+		const filePath = writeImage("uri image.webp");
+		const uri = `file://${filePath.split("/").map(encodeURIComponent).join("/")}`;
+		expect(resolvePastedImagePath(uri)).toBe(filePath);
+	});
+
+	it("resolves file://localhost URIs", () => {
+		const filePath = writeImage("localhost.png");
+		expect(resolvePastedImagePath(`file://localhost${filePath}`)).toBe(filePath);
+	});
+
+	it("expands ~/ against the provided homedir", () => {
+		const filePath = writeImage("home.png");
+		expect(resolvePastedImagePath("~/home.png", { homedir: testDir })).toBe(filePath);
+	});
+
+	it("resolves relative paths against the provided cwd", () => {
+		const filePath = writeImage("relative.png");
+		expect(resolvePastedImagePath("./relative.png", { cwd: testDir })).toBe(filePath);
+	});
+
+	it("still accepts legacy clipboard temp paths", () => {
+		const filePath = writeImage("clipboard-2026-07-07-123456-Ab3.png");
+		expect(resolvePastedImagePath(filePath)).toBe(filePath);
+	});
+
+	it("rejects nonexistent files", () => {
+		expect(resolvePastedImagePath(path.join(testDir, "missing.png"))).toBeUndefined();
+	});
+
+	it("rejects directories with image-like names", () => {
+		const dirPath = path.join(testDir, "dir.png");
+		fs.mkdirSync(dirPath);
+		expect(resolvePastedImagePath(dirPath)).toBeUndefined();
+	});
+
+	it("rejects non-image extensions", () => {
+		const filePath = path.join(testDir, "notes.txt");
+		fs.writeFileSync(filePath, "hello");
+		expect(resolvePastedImagePath(filePath)).toBeUndefined();
+	});
+
+	it("rejects existing non-image files with image extensions (content sniffing)", () => {
+		// Regression (#1841 review): consuming this paste would lose the raw
+		// path once the image loader rejects the content.
+		const filePath = path.join(testDir, "not-image.png");
+		fs.writeFileSync(filePath, "hello, I am a text file");
+		expect(resolvePastedImagePath(filePath)).toBeUndefined();
+	});
+
+	it("rejects empty files with image extensions", () => {
+		const filePath = path.join(testDir, "empty.png");
+		fs.writeFileSync(filePath, "");
+		expect(resolvePastedImagePath(filePath)).toBeUndefined();
+	});
+
+	it("accepts each supported image signature", () => {
+		const signatures: Array<[string, Buffer]> = [
+			["sig.png", Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+			["sig.jpg", Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46])],
+			["sig.gif", Buffer.from("GIF89a", "latin1")],
+			["sig.webp", Buffer.concat([Buffer.from("RIFF", "latin1"), Buffer.alloc(4), Buffer.from("WEBP", "latin1")])],
+		];
+		for (const [name, magic] of signatures) {
+			const filePath = path.join(testDir, name);
+			fs.writeFileSync(filePath, magic);
+			expect(resolvePastedImagePath(filePath)).toBe(filePath);
+		}
+	});
+
+	it("accepts mismatched extension when content is a supported image (loader sniffs real mime)", () => {
+		const filePath = path.join(testDir, "actually-png.jpg");
+		fs.writeFileSync(filePath, PNG_SIGNATURE);
+		expect(resolvePastedImagePath(filePath)).toBe(filePath);
+	});
+
+	it("rejects multiline pastes", () => {
+		const filePath = writeImage("multi.png");
+		expect(resolvePastedImagePath(`${filePath}\nmore text`)).toBeUndefined();
+	});
+
+	it("rejects prose around a path (whole paste must be the path)", () => {
+		const filePath = writeImage("prose.png");
+		expect(resolvePastedImagePath(`look at ${filePath} please`)).toBeUndefined();
+	});
+
+	it("rejects empty and whitespace-only pastes", () => {
+		expect(resolvePastedImagePath("")).toBeUndefined();
+		expect(resolvePastedImagePath("   ")).toBeUndefined();
+	});
+});
+
+describe("decodePastedPathCandidate (win32 contract)", () => {
+	it("decodes drive-letter file:// URIs to win32 paths", () => {
+		expect(decodePastedPathCandidate("file:///C:/Users/me/Pictures/shot.png", { platform: "win32" })).toBe(
+			"C:\\Users\\me\\Pictures\\shot.png",
+		);
+	});
+
+	it("decodes file://localhost drive-letter URIs", () => {
+		expect(decodePastedPathCandidate("file://localhost/C:/x.png", { platform: "win32" })).toBe("C:\\x.png");
+	});
+
+	it("decodes UNC-host file:// URIs", () => {
+		expect(decodePastedPathCandidate("file://server/share/img.png", { platform: "win32" })).toBe(
+			"\\\\server\\share\\img.png",
+		);
+	});
+
+	it("decodes percent-encoded spaces in win32 file:// URIs", () => {
+		expect(decodePastedPathCandidate("file:///C:/My%20Pictures/shot.png", { platform: "win32" })).toBe(
+			"C:\\My Pictures\\shot.png",
+		);
+	});
+
+	it("rejects drive-letter-less file:// URIs on win32", () => {
+		expect(decodePastedPathCandidate("file:///Users/me/shot.png", { platform: "win32" })).toBeUndefined();
+	});
+
+	it("rejects encoded path separators", () => {
+		expect(decodePastedPathCandidate("file:///C:/a%2Fb.png", { platform: "win32" })).toBeUndefined();
+		expect(decodePastedPathCandidate("file:///C:/a%5Cb.png", { platform: "win32" })).toBeUndefined();
+	});
+
+	it("does not shell-unescape win32 paths (backslash is the separator)", () => {
+		expect(decodePastedPathCandidate("C:\\Users\\me\\img.png", { platform: "win32" })).toBe("C:\\Users\\me\\img.png");
+	});
+});
+
+describe("decodePastedPathCandidate (posix contract)", () => {
+	it("rejects file:// URIs with non-localhost hosts", () => {
+		expect(decodePastedPathCandidate("file://server/share/img.png", { platform: "linux" })).toBeUndefined();
+	});
+
+	it("rejects encoded path separators", () => {
+		expect(decodePastedPathCandidate("file:///tmp/a%2Fb.png", { platform: "linux" })).toBeUndefined();
+	});
+});

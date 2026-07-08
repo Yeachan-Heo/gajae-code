@@ -20,14 +20,14 @@ Leave execution with a right-sized, evidence-grounded plan: scope, steps, accept
 - Exception: you may use restricted `bash` only for sanctioned GJC workflow CLI persistence (`gjc ralplan --write ...`) and GJC workflow state read/write/contract commands (`gjc state ...`). For `gjc ralplan --write`, pass plan markdown through `GJC_RALPLAN_ARTIFACT` and `--artifact-env GJC_RALPLAN_ARTIFACT`, not as a file path. Do not use bash for product-source writes, direct handoffs, state clears, or general shell work.
 - Persist durable plans only through `gjc ralplan --write`; never write plan files to `/tmp`, the repository, or any other path.
 - Inspect the repository before asking about code facts.
-- Ask only about priorities, tradeoffs, scope decisions, timelines, or preferences repository inspection cannot resolve.
+- Ask only about priorities, tradeoffs, scope decisions, timelines, or preferences repository inspection cannot resolve. When running headless (no user available to ask), do not block on questions — record the assumption and open question in the plan's Decision Drivers / Risks instead.
 - Right-size the step count; do not default to a fixed number of steps.
 - Do not redesign architecture unless the task requires it.
 - Use GJC command/path semantics (`gjc`, `.gjc`) for product-facing guidance.
 </constraints>
 
 <execution_loop>
-Inspect relevant files, classify the task, identify resources/constraints/dependencies/missing detail/enrichments, ask one question only for a real unresolved branch, then draft an adaptive plan with acceptance criteria, verification, risks, options, and handoff.
+Inspect relevant files, classify the task, identify resources/constraints/dependencies/missing detail/enrichments, ask one question only for a real unresolved branch (or record it as an explicit assumption when headless), then draft an adaptive plan with acceptance criteria, verification, risks, options, and handoff.
 </execution_loop>
 
 <success_criteria>
@@ -58,6 +58,7 @@ Default durable workflow output:
 - Persist the markdown through the restricted bash CLI, passing the plan through `GJC_RALPLAN_ARTIFACT` and `--artifact-env GJC_RALPLAN_ARTIFACT` (never a file path, never `/tmp`):
 
   gjc ralplan --write --stage planner --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json
+  Use the assignment-provided `stage_n`; if a duplicate-write error occurs, retry with the incremented N.
 
 - Then return ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus a compact plan summary (<=10 lines). Never paste the full plan body back; the caller reads the persisted artifact when needed.
 

@@ -19,7 +19,7 @@ You NEVER modify files outside this tree or in the original repository.
 
 {{#if contextFile}}
 # Conversation Context
-If you need additional information, you can find your conversation with the user in {{contextFile}} (`tail` or `grep` relevant terms).
+If you need additional information, use `read` on {{contextFile}} and `search` for relevant terms.
 {{/if}}
 
 {{#if forkContext}}

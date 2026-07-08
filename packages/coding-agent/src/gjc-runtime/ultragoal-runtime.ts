@@ -577,7 +577,12 @@ function chooseReceiptKind(
 ): UltragoalReceiptKind {
 	if (plan.gjcGoalMode === "per-story") return "per-goal";
 	if (status !== "complete") return "per-goal";
-	const unfinishedRequiredGoals = requiredUltragoalGoals(plan).filter(
+	const requiredGoals = requiredUltragoalGoals(plan);
+	const existingFinalAggregateGoal = requiredGoals.find(
+		item => item.id !== goal.id && item.completionVerification?.receiptKind === "final-aggregate",
+	);
+	if (existingFinalAggregateGoal) return "per-goal";
+	const unfinishedRequiredGoals = requiredGoals.filter(
 		item => item.id !== goal.id && !TERMINAL_OR_SKIPPED_STATUSES.has(item.status),
 	);
 	return unfinishedRequiredGoals.length === 0 ? "final-aggregate" : "per-goal";

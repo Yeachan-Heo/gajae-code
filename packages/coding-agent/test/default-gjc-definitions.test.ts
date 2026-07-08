@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -31,7 +31,10 @@ function extractPromptSection(content: string, sectionName: string): string {
 }
 
 async function makeTempRoot(): Promise<string> {
-	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-definitions-"));
+	// Keep project-discovery fixtures outside the real user HOME even when
+	// TMPDIR points at ~/tmp; otherwise walk-up discovery can pick up
+	// ~/.gjc/agents as a project config directory.
+	const tempRoot = await fs.mkdtemp(path.join(path.sep, "tmp", "gjc-default-definitions-"));
 	tempRoots.push(tempRoot);
 	return tempRoot;
 }
@@ -41,9 +44,11 @@ async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-home-"));
 	tempRoots.push(home);
 	process.env.HOME = home;
+	const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
 	try {
 		return await fn(home);
 	} finally {
+		homedirSpy.mockRestore();
 		if (originalHome === undefined) {
 			delete process.env.HOME;
 		} else {
@@ -67,14 +72,15 @@ describe("default GJC definitions", () => {
 
 		expect(skills).toEqual(expected);
 		expect(workflowDefinitions).toHaveLength(4);
-		expect(definitions).toHaveLength(8);
+		expect(definitions).toHaveLength(9);
 		expect(workflowDefinitions.every(definition => definition.relativePath.startsWith("skills/"))).toBe(true);
 		expect(workflowDefinitions.every(definition => definition.content.includes(definition.name))).toBe(true);
-		expect(fragmentDefinitions).toHaveLength(4);
+		expect(fragmentDefinitions).toHaveLength(5);
 		expect(fragmentDefinitions.map(definition => definition.parentSkillName).sort()).toEqual([
 			"deep-interview",
 			"deep-interview",
 			"deep-interview",
+			"ultragoal",
 			"ultragoal",
 		]);
 		expect(fragmentDefinitions.map(definition => definition.relativePath).sort()).toEqual([
@@ -82,6 +88,7 @@ describe("default GJC definitions", () => {
 			"skill-fragments/deep-interview/auto-research-greenfield.md",
 			"skill-fragments/deep-interview/lateral-review-panel.md",
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
+			"skill-fragments/ultragoal/pipeline-validation-contracts.md",
 		]);
 		const team = workflowDefinitions.find(definition => definition.name === "team");
 		expect(team?.content).toContain("supported surfaces only");
@@ -108,7 +115,7 @@ describe("default GJC definitions", () => {
 		expect(fragments.every(fragment => fragment.content.includes("read-only architect"))).toBe(true);
 	});
 
-	it("exposes the ultragoal ai-slop-cleaner fragment only through the parent-scoped fragment accessor", () => {
+	it("exposes the ultragoal fragments only through the parent-scoped fragment accessor", () => {
 		const fragments = getEmbeddedDefaultGjcSkillFragments("ultragoal");
 
 		expect(
@@ -116,17 +123,24 @@ describe("default GJC definitions", () => {
 				.map(skill => skill.name)
 				.sort(),
 		).toEqual([...DEFAULT_GJC_DEFINITION_NAMES].sort());
-		expect(fragments).toHaveLength(1);
-		expect(fragments.map(fragment => fragment.kind)).toEqual(["skill-fragment"]);
-		expect(fragments.map(fragment => fragment.relativePath)).toEqual([
+		expect(fragments).toHaveLength(2);
+		expect(fragments.map(fragment => fragment.kind)).toEqual(["skill-fragment", "skill-fragment"]);
+		expect(fragments.map(fragment => fragment.relativePath).sort()).toEqual([
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
+			"skill-fragments/ultragoal/pipeline-validation-contracts.md",
 		]);
-		expect(fragments[0]!.content).toContain("AI SLOP CLEANUP REPORT");
-		expect(fragments[0]!.content).toContain("read-only detector");
+		const cleaner = fragments.find(fragment => fragment.relativePath.endsWith("ai-slop-cleaner.md"))!;
+		expect(cleaner.content).toContain("AI SLOP CLEANUP REPORT");
+		expect(cleaner.content).toContain("read-only detector");
+		const contracts = fragments.find(fragment => fragment.relativePath.endsWith("pipeline-validation-contracts.md"))!;
+		expect(contracts.content).toContain("never user-facing");
+		expect(contracts.content).toContain("fails closed");
 	});
 
 	it("authors the ai-slop-cleaner fragment with the mandated report labels and full taxonomy", () => {
-		const fragment = getEmbeddedDefaultGjcSkillFragments("ultragoal")[0]!;
+		const fragment = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(candidate =>
+			candidate.relativePath.endsWith("ai-slop-cleaner.md"),
+		)!;
 		const content = fragment.content;
 
 		for (const label of [
@@ -329,18 +343,24 @@ Project executor override body.
 		expect(ultragoal).toContain("cleaner + architect + executor QA/red-team gate");
 		expect(ultragoal).toContain("Runtime-backed pipelined scheduling");
 		expect(ultragoal).toContain("--goal-metadata-json");
-		expect(ultragoal).toContain("start-pipeline-overlap");
-		expect(ultragoal).toContain("join-pipeline-overlap");
-		expect(ultragoal).toContain("rebaseline-pipeline-overlap");
-		expect(ultragoal).toContain("At most one eligible next goal");
 		expect(ultragoal).toContain("aggregate mode only");
-		expect(ultragoal).toContain("G(N) remains active");
-		expect(ultragoal).toContain("clean join");
-		expect(ultragoal).toContain("quarantine and re-baseline");
-		expect(ultragoal).toContain("unattributable change-set paths");
-		expect(ultragoal).toContain("fail closed");
+		expect(ultragoal).toContain("pipeline-validation-contracts");
+		expect(ultragoal).toContain("skill-fragments/ultragoal/pipeline-validation-contracts.md");
 		expect(ultragoal).toContain("Team is not auto-launched");
 		expect(ultragoal).toContain("not a hidden pipeline scheduler");
+
+		const contracts = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(fragment =>
+			fragment.relativePath.endsWith("pipeline-validation-contracts.md"),
+		)!;
+		expect(contracts.content).toContain("start-pipeline-overlap");
+		expect(contracts.content).toContain("join-pipeline-overlap");
+		expect(contracts.content).toContain("rebaseline-pipeline-overlap");
+		expect(contracts.content).toContain("At most one eligible next goal");
+		expect(contracts.content).toContain("G(N) remains active");
+		expect(contracts.content).toContain("clean join");
+		expect(contracts.content).toContain("quarantine and re-baseline");
+		expect(contracts.content).toContain("unattributable change-set paths");
+		expect(contracts.content).toContain("fail closed");
 	});
 
 	it("documents validation-batch granularity, contract, and intra-goal lane parallelism in the ultragoal prompt", async () => {
@@ -356,7 +376,7 @@ Project executor override body.
 		expect(ultragoal).toContain("the same red-team surface");
 		expect(ultragoal).toContain("the same final review boundary");
 
-		// B: validation-batch contract.
+		// B: validation-batch contract summary in the SKILL; full contract in the fragment.
 		expect(ultragoal).toContain("## Validation batches (aggregate-only)");
 		expect(ultragoal).toContain("--validation-batch-json");
 		expect(ultragoal).toContain("aggregate-only");
@@ -368,11 +388,22 @@ Project executor override body.
 		expect(ultragoal).toContain("no batch/pipeline mixing");
 		expect(ultragoal).toContain("out-of-order close is rejected");
 		expect(ultragoal).toContain("append-only proof");
-		expect(ultragoal).toContain("Never stamp");
 		expect(ultragoal).toContain("cumulative-since-base");
-		expect(ultragoal).toContain("`cumulativeFromBase: true`");
-		expect(ultragoal).toContain("`memberGoalId` is a label not a per-path attribution");
-		expect(ultragoal).toContain("Batch invalidation is fail-closed");
+		expect(ultragoal).toContain("skill-fragments/ultragoal/pipeline-validation-contracts.md");
+
+		const contracts = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(fragment =>
+			fragment.relativePath.endsWith("pipeline-validation-contracts.md"),
+		)!;
+		expect(contracts.content).toContain("deferredToBatch");
+		expect(contracts.content).toContain("validation-batch-deferred");
+		expect(contracts.content).toContain("validationBatchClose");
+		expect(contracts.content).toContain("out-of-order close is rejected");
+		expect(contracts.content).toContain("append-only proof");
+		expect(contracts.content).toContain("Never stamp");
+		expect(contracts.content).toContain("cumulative-since-base");
+		expect(contracts.content).toContain("`cumulativeFromBase: true`");
+		expect(contracts.content).toContain("`memberGoalId` is a label not a per-path attribution");
+		expect(contracts.content).toContain("Batch invalidation is fail-closed");
 
 		// B: receipts freshness for deferred members.
 		expect(ultragoal).toContain(
@@ -515,10 +546,10 @@ Project executor override body.
 		const deepInterviewSkillPath = path.join(targetRoot, "skills", "deep-interview", "SKILL.md");
 		const installedDeepInterview = await Bun.file(deepInterviewSkillPath).text();
 
-		expect(initial.written).toBe(8);
-		expect(initial.total).toBe(8);
+		expect(initial.written).toBe(9);
+		expect(initial.total).toBe(9);
 		expect(initial.skipped).toBe(0);
-		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(4);
+		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(5);
 
 		const installedResearchFragment = await Bun.file(
 			path.join(targetRoot, "skill-fragments", "deep-interview", "auto-research-greenfield.md"),
@@ -527,15 +558,15 @@ Project executor override body.
 		await Bun.write(deepInterviewSkillPath, "local edit");
 		const skipped = await installDefaultGjcDefinitions({ targetRoot });
 		expect(skipped.written).toBe(0);
-		expect(skipped.skipped).toBe(8);
+		expect(skipped.skipped).toBe(9);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe("local edit");
 
 		const check = await installDefaultGjcDefinitions({ targetRoot, check: true });
 		expect(check.different).toBe(1);
-		expect(check.matching).toBe(7);
+		expect(check.matching).toBe(8);
 
 		const forced = await installDefaultGjcDefinitions({ targetRoot, force: true });
-		expect(forced.written).toBe(8);
+		expect(forced.written).toBe(9);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(installedDeepInterview);
 		expect(
 			forced.files.some(file => file.kind === "skill-fragment" && file.parentSkillName === "deep-interview"),
@@ -549,25 +580,25 @@ Project executor override body.
 		// No files on disk yet: refreshOnly must not create any (opt-in preserved).
 		const untouched = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
 		expect(untouched.written).toBe(0);
-		expect(untouched.missing).toBe(8);
+		expect(untouched.missing).toBe(9);
 		expect(await Bun.file(deepInterviewSkillPath).exists()).toBe(false);
 
 		// User opted in, then a local file went stale relative to the embedded default.
 		const installed = await installDefaultGjcDefinitions({ targetRoot });
 		const canonicalDeepInterview = await Bun.file(deepInterviewSkillPath).text();
-		expect(installed.written).toBe(8);
+		expect(installed.written).toBe(9);
 		await Bun.write(deepInterviewSkillPath, "stale content");
 
 		const refreshed = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
 		expect(refreshed.written).toBe(1);
-		expect(refreshed.matching).toBe(7);
+		expect(refreshed.matching).toBe(8);
 		expect(refreshed.missing).toBe(0);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(canonicalDeepInterview);
 
 		// Second refresh is a no-op once everything matches.
 		const stable = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
 		expect(stable.written).toBe(0);
-		expect(stable.matching).toBe(8);
+		expect(stable.matching).toBe(9);
 	});
 
 	it("does not make installed fragments reachable as skill-relative internal URL assets", async () => {
@@ -679,7 +710,7 @@ Project executor override body.
 		expect(await jsonProc.exited).toBe(0);
 		expect(jsonStderr).toBe("");
 		expect(jsonStdout).not.toContain("gjc skills list");
-		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 8 });
+		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 9 });
 	});
 });
 

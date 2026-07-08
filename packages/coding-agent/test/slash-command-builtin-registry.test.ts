@@ -4,6 +4,7 @@ import {
 	BUILTIN_SLASH_COMMAND_DEFS,
 	BUILTIN_SLASH_COMMANDS_INTERNAL,
 	executeBuiltinSlashCommand,
+	lookupBuiltinSlashCommand,
 } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
 
 function createTuiRuntime() {
@@ -216,5 +217,20 @@ describe("builtin /goal slash command", () => {
 
 		expect(result).toBe(true);
 		expect(addToHistory).not.toHaveBeenCalled();
+	});
+});
+
+describe("builtin /exit shutdown command", () => {
+	it("resolves /quit as an alias of /exit (TUI-only shutdown)", () => {
+		const exitCommand = lookupBuiltinSlashCommand("exit");
+		const quitCommand = lookupBuiltinSlashCommand("quit");
+
+		expect(exitCommand?.name).toBe("exit");
+		expect(quitCommand).toBe(exitCommand);
+		// Shutdown is a TUI-only action: no ACP text-mode handle.
+		expect(exitCommand?.handleTui).toBeDefined();
+		expect(exitCommand?.handle).toBeUndefined();
+		// The alias is not advertised as its own autocomplete/help entry.
+		expect(BUILTIN_SLASH_COMMAND_DEFS.some(command => command.name === "quit")).toBe(false);
 	});
 });

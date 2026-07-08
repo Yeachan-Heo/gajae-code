@@ -6,9 +6,11 @@ import { getBundledModel } from "@gajae-code/ai";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import {
 	buildRedactedAction,
+	completionNotifyDisabledByEnv,
 	getNotificationConfig,
 	isGloballyConfigured,
 	isSessionNotificationsEnabled,
+	isTelegramConfigured,
 	maskToken,
 	type NotificationConfig,
 	type RedactableAction,
@@ -17,6 +19,7 @@ import {
 	tokenFingerprint,
 } from "../src/notifications/config";
 import { createNotificationsExtension } from "../src/notifications/index";
+import { daemonPaths } from "../src/notifications/telegram-daemon";
 import { createAgentSession } from "../src/sdk";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -92,6 +95,16 @@ describe("notifications config", () => {
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, botToken: "" })).toBe(false);
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: undefined })).toBe(false);
 		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: "" })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, botToken: " " })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: "\t" })).toBe(false);
+		expect(
+			isGloballyConfigured({
+				...BASE_CFG,
+				enabled: true,
+				botToken: " ",
+				chatId: "\t",
+			}),
+		).toBe(false);
 		expect(
 			isGloballyConfigured({
 				...BASE_CFG,
@@ -113,6 +126,19 @@ describe("notifications config", () => {
 				discord: { botToken: "discord-token", channelId: undefined },
 			}),
 		).toBe(false);
+	});
+
+	test("isTelegramConfigured rejects blank Telegram credentials even when another adapter is configured", () => {
+		const mixedAdapterCfg: NotificationConfig = {
+			...BASE_CFG,
+			enabled: true,
+			botToken: " ",
+			chatId: "\t",
+			discord: { botToken: "discord-token", channelId: "discord-channel" },
+		};
+
+		expect(isGloballyConfigured(mixedAdapterCfg)).toBe(true);
+		expect(isTelegramConfigured(mixedAdapterCfg)).toBe(false);
 	});
 
 	test("isSessionNotificationsEnabled applies precedence", () => {
@@ -164,6 +190,19 @@ describe("notifications config", () => {
 		expect(
 			shouldRegisterNotificationsExtension({
 				cfg: GLOBAL_CFG,
+				env: { GJC_NOTIFY: "off" },
+			}),
+		).toBe(false);
+		expect(
+			shouldRegisterNotificationsExtension({
+				cfg: BASE_CFG,
+				env: { GJC_NOTIFY: "FALSE", GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TOKEN: "legacy-token" },
+			}),
+		).toBe(false);
+		expect(completionNotifyDisabledByEnv({ GJC_NOTIFY: " 0 " })).toBe(true);
+		expect(
+			shouldRegisterNotificationsExtension({
+				cfg: GLOBAL_CFG,
 				env: { GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TOKEN: "legacy-token" },
 				taskDepth: 1,
 			}),
@@ -190,6 +229,8 @@ describe("notifications config", () => {
 		delete process.env.GJC_NOTIFICATIONS;
 		const settings = Settings.isolated({
 			"notifications.enabled": true,
+			"notifications.telegram.botToken": " ",
+			"notifications.telegram.chatId": "\t",
 			"notifications.discord.botToken": "discord-token",
 			"notifications.discord.channelId": "discord-channel",
 		});
@@ -329,6 +370,7 @@ describe("notifications config", () => {
 			expect(fs.existsSync(parentPrefixSubagentEndpoint)).toBe(false);
 			expect(fs.existsSync(agentTypeOnlySubagentEndpoint)).toBe(false);
 			expect(fs.existsSync(explicitExtensionSubagentEndpoint)).toBe(false);
+			expect(fs.existsSync(daemonPaths(cwd).roots)).toBe(false);
 		} finally {
 			await Promise.all(disposers.reverse().map(dispose => dispose()));
 			if (previous === undefined) {
@@ -343,6 +385,8 @@ describe("notifications config", () => {
 	test("maskToken handles unset tokens and never reveals the raw token", () => {
 		expect(maskToken(undefined)).toBe("(unset)");
 		expect(maskToken("")).toBe("(unset)");
+		expect(maskToken("abc")).toBe("…(len 3)");
+		expect(maskToken("abc")).not.toContain("abc");
 
 		const token = "1234567890:super-secret-token";
 		const masked = maskToken(token);
@@ -388,6 +432,23 @@ describe("notifications config", () => {
 		};
 
 		expect(buildRedactedAction(action, { redact: false, sessionTag: "abcdef" })).toBe(action);
+	});
+
+	test("buildRedactedAction strips question and options for non-ask actions", () => {
+		const action: RedactableAction = {
+			id: "custom-1",
+			kind: "custom",
+			sessionId: "session-abcdef",
+			question: "Sensitive question?",
+			options: ["Sensitive option"],
+			summary: "Sensitive summary",
+		};
+
+		expect(buildRedactedAction(action, { redact: true, sessionTag: "abcdef" })).toEqual({
+			id: "custom-1",
+			kind: "custom",
+			sessionId: "session-abcdef",
+		});
 	});
 
 	test("buildRedactedAction strips only summary for idle actions", () => {

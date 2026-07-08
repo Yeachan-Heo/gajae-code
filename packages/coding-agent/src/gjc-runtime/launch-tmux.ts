@@ -13,6 +13,7 @@ import {
 	buildGjcTmuxSessionName,
 	buildGjcTmuxSessionSlug,
 	GJC_DEFAULT_TMUX_SESSION,
+	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_COMMAND_ENV,
 	GJC_TMUX_MOUSE_ENV,
 	GJC_TMUX_PROFILE_ENV,
@@ -688,6 +689,11 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 			extraEnv: {
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
+				// Carry the GJC-managed session name into the child so `gjc team`
+				// can target the correct leader session by name. Under psmux on
+				// Windows the inherited TMUX_PANE can resolve to the wrong/default
+				// session, which would split/send workers into the wrong session.
+				[GJC_TMUX_ACTIVE_SESSION_ENV]: sessionName,
 			},
 			platform,
 		},

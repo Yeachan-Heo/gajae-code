@@ -1858,7 +1858,7 @@ export class AgentSession {
 					high = mid - 1;
 				}
 			}
-			return { message: bestMessage, tokens: Math.min(bestTokens, maxTokens) };
+			return { message: bestMessage, tokens: bestTokens };
 		};
 
 		for (let i = providerMessages.length - 1; i >= 0; i--) {
@@ -1878,9 +1878,11 @@ export class AgentSession {
 				recordSkip("token-limit");
 				if (selected.length === 0) {
 					const truncated = truncateMessageToTokenBudget(sanitized);
-					selected.unshift(truncated.message);
-					approximateTokens = truncated.tokens;
-					skippedReasons["newest-message-truncated"] = (skippedReasons["newest-message-truncated"] ?? 0) + 1;
+					if (truncated.tokens <= maxTokens) {
+						selected.unshift(truncated.message);
+						approximateTokens = truncated.tokens;
+						skippedReasons["newest-message-truncated"] = (skippedReasons["newest-message-truncated"] ?? 0) + 1;
+					}
 				}
 				break;
 			}
@@ -8009,7 +8011,7 @@ export class AgentSession {
 			return undefined;
 		}
 
-		if (!this.#toolRegistry.has("todo_write")) {
+		if (!this.#toolRegistry.has("todo_write") || !this.getActiveToolNames().includes("todo_write")) {
 			logger.warn("Eager todo enforcement skipped because todo_write is unavailable", {
 				activeToolNames: this.agent.state.tools.map(tool => tool.name),
 			});
