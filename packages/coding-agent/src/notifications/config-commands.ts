@@ -38,8 +38,9 @@ const TELEGRAM_REASONING_LEVELS = new Set(["inherit", "off", "minimal", "low", "
 
 function stripTelegramBotSuffix(rawCommand: string, botUsername?: string): string | undefined {
 	const [name, suffix] = rawCommand.toLowerCase().split("@", 2);
-	if (suffix && botUsername && suffix !== botUsername.toLowerCase()) return undefined;
-	return name;
+	if (!suffix) return name;
+	if (!botUsername) return undefined;
+	return suffix === botUsername.toLowerCase() ? name : undefined;
 }
 
 export function telegramControlCommandUsage(commandName: TelegramControlCommandName): string {
