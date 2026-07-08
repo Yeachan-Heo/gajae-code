@@ -358,6 +358,9 @@ interface SessionRuntime {
 	liveRef?: string;
 	lastLiveAt?: number;
 	lastLiveText?: string;
+	/** True between turn_end and the next turn_start: drops late async message_update
+	 * frames so a stale live edit can never be emitted after the finalized turn. */
+	turnClosed?: boolean;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
 }
@@ -385,6 +388,8 @@ const defaultConfig: NotificationConfig = {
 	redact: false,
 	verbosity: "lean",
 	idleTimeoutMs: 60_000,
+	rich: { enabled: true },
+	richDraft: { enabled: false },
 };
 
 export function notificationsEnabled(): boolean {
@@ -999,7 +1004,10 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 	api.on("turn_start", (_event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (!rt || rt.pendingInbound.size === 0) return;
+		if (!rt) return;
+		// A new turn is live: re-open the live-stream window (see turnClosed).
+		rt.turnClosed = false;
+		if (rt.pendingInbound.size === 0) return;
 		for (const updateId of rt.pendingInbound) {
 			try {
 				rt.server.pushFrame(JSON.stringify({ type: "inbound_ack", sessionId: id, updateId, state: "consumed" }));
@@ -1095,15 +1103,25 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 	// rate-limit pool before sending to Telegram.
 	// Push the in-flight turn's assistant text as a finalized turn_stream, deduped
 	// against what was already flushed for this turn (the pre-ask lead-in).
-	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined): void => {
+	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): void => {
 		if (!text || text === rt.preAskFlushedText) return;
 		rt.preAskFlushedText = text;
+		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
+		// live message, never a fresh (rich-promotable) send. If live frames were
+		// async-queued and none landed before this flush, allocate the per-turn ref
+		// now so the finalized frame always carries a messageRef → the daemon keeps it
+		// editable (HTML edit) and never rich-promotes a streamed final.
+		if (finalAnswer && rt.stream && rt.liveRef === undefined) {
+			rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+			rt.liveRef = String(rt.turnSeq);
+		}
 		try {
 			rt.server.pushFrame(
 				JSON.stringify({
 					type: "turn_stream",
 					sessionId: id,
 					phase: "finalized",
+					finalAnswer,
 					text,
 					...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
 				}),
@@ -1124,7 +1142,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt || rt.redact) return;
-		flushTurnText(rt, id, rt.currentTurnText);
+		flushTurnText(rt, id, rt.currentTurnText, false);
 	});
 
 	api.on("turn_end", (event, ctx) => {
@@ -1132,12 +1150,15 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		const text = rt.redact ? undefined : summaryFromMessage(event.message, turnTextMax());
-		if (text) flushTurnText(rt, id, text);
+		if (text) flushTurnText(rt, id, text, true);
 		// Reset per-turn streaming state so the next turn starts fresh and a later
 		// turn with identical text is not falsely deduped.
 		rt.currentTurnText = undefined;
 		rt.preAskFlushedText = undefined;
 		rt.liveRef = undefined;
+		// Close the live-stream window: any message_update queued after turn_end is
+		// dropped so it can never emit a stale live edit past the finalized turn.
+		rt.turnClosed = true;
 		rt.lastLiveAt = undefined;
 		rt.lastLiveText = undefined;
 	});
@@ -1149,7 +1170,7 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 	api.on("message_update", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (!rt?.stream || rt.redact) return;
+		if (!rt?.stream || rt.redact || rt.turnClosed) return;
 		if ((event.message as { role?: unknown }).role !== "assistant") return;
 		if (rt.liveRef === undefined) {
 			rt.turnSeq = (rt.turnSeq ?? 0) + 1;

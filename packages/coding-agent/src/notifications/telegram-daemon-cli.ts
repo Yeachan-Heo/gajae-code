@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { YAML } from "bun";
+import { withFileLock } from "../config/file-lock";
 import type { Settings } from "../config/settings";
 import { getNotificationConfig, isTelegramConfigured } from "./config";
 import { daemonPaths } from "./daemon-paths";
@@ -14,7 +15,7 @@ type TelegramDaemonRunner = {
 type TelegramDaemonConstructor = new (opts: TelegramDaemonOptions) => TelegramDaemonRunner;
 
 export interface RunDaemonInternalDeps {
-	SettingsImpl?: { init: (options?: { agentDir?: string }) => Promise<Pick<Settings, "get" | "getAgentDir">> };
+	SettingsImpl?: { init: (options?: { agentDir?: string }) => Promise<Pick<Settings, "get" | "getAgentDir" | "set">> };
 	DaemonImpl?: TelegramDaemonConstructor;
 	processPid?: number;
 	pidAlive?: (pid: number) => boolean;
@@ -34,6 +35,17 @@ function getByPath(obj: unknown, pathSegments: string[]): unknown {
 	return current;
 }
 
+function setByPath(obj: Record<string, unknown>, pathSegments: string[], value: unknown): void {
+	let current = obj;
+	for (let i = 0; i < pathSegments.length - 1; i++) {
+		const segment = pathSegments[i]!;
+		const next = current[segment];
+		if (!next || typeof next !== "object" || Array.isArray(next)) current[segment] = {};
+		current = current[segment] as Record<string, unknown>;
+	}
+	current[pathSegments[pathSegments.length - 1]!] = value;
+}
+
 function asString(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -49,7 +61,7 @@ function asIdleTimeoutMs(value: unknown): number {
 export function createLightweightDaemonSettings(input: {
 	agentDir: string;
 	rawConfig?: unknown;
-}): Pick<Settings, "get" | "getAgentDir"> {
+}): Pick<Settings, "get" | "getAgentDir" | "set"> {
 	const rawConfig = input.rawConfig && typeof input.rawConfig === "object" ? input.rawConfig : {};
 	return {
 		get(pathName: string): unknown {
@@ -64,6 +76,10 @@ export function createLightweightDaemonSettings(input: {
 				case "notifications.slack.botToken":
 				case "notifications.slack.channelId":
 					return asString(value);
+				case "notifications.telegram.rich.enabled":
+					return asBoolean(value, true);
+				case "notifications.telegram.richDraft.enabled":
+					return asBoolean(value, false);
 				case "notifications.redact":
 					return asBoolean(value, false);
 				case "notifications.verbosity":
@@ -77,10 +93,39 @@ export function createLightweightDaemonSettings(input: {
 		getAgentDir(): string {
 			return input.agentDir;
 		},
-	} as Pick<Settings, "get" | "getAgentDir">;
+		async set(pathName: string, value: unknown): Promise<void> {
+			// Back onto config.yml directly (the full Settings class is not loaded in
+			// the spawned daemon process). Contend on the SAME per-file lock as
+			// Settings.#saveNow and re-read UNDER the lock, patching only this key, so
+			// a concurrent main-process save can never drop unrelated settings (no
+			// whole-file last-writer-wins). The write is atomic (tmp + rename) so a
+			// crash mid-write can never truncate config.yml, and any failure propagates
+			// so the `/rich` handler leaves runtime state unchanged. The in-memory view
+			// is updated only after the durable write succeeds.
+			const segments = pathName.split(".");
+			const configPath = path.join(input.agentDir, "config.yml");
+			await withFileLock(configPath, async () => {
+				let onDisk: Record<string, unknown> = {};
+				try {
+					const parsed = YAML.parse(await fs.promises.readFile(configPath, "utf8"));
+					if (parsed && typeof parsed === "object") onDisk = parsed as Record<string, unknown>;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
+				setByPath(onDisk, segments, value);
+				await fs.promises.mkdir(path.dirname(configPath), { recursive: true });
+				const tmpPath = `${configPath}.tmp.${process.pid}.${Date.now()}`;
+				await fs.promises.writeFile(tmpPath, YAML.stringify(onDisk), { mode: 0o600 });
+				await fs.promises.rename(tmpPath, configPath);
+			});
+			setByPath(rawConfig as Record<string, unknown>, segments, value);
+		},
+	} as Pick<Settings, "get" | "getAgentDir" | "set">;
 }
 
-export async function loadLightweightDaemonSettings(agentDir: string): Promise<Pick<Settings, "get" | "getAgentDir">> {
+export async function loadLightweightDaemonSettings(
+	agentDir: string,
+): Promise<Pick<Settings, "get" | "getAgentDir" | "set">> {
 	const configPath = path.join(agentDir, "config.yml");
 	let rawConfig: unknown = {};
 	try {
@@ -94,7 +139,7 @@ export async function loadLightweightDaemonSettings(agentDir: string): Promise<P
 async function resolveDaemonSettings(
 	agentDir: string,
 	deps: RunDaemonInternalDeps,
-): Promise<Pick<Settings, "get" | "getAgentDir">> {
+): Promise<Pick<Settings, "get" | "getAgentDir" | "set">> {
 	if (deps.SettingsImpl) return await deps.SettingsImpl.init({ agentDir });
 	return await loadLightweightDaemonSettings(agentDir);
 }
@@ -156,6 +201,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		botToken: cfg.botToken,
 		chatId: cfg.chatId,
 		idleTimeoutMs: cfg.idleTimeoutMs,
+		rich: cfg.rich,
+		richDraft: cfg.richDraft,
 		pid: deps.processPid ?? process.pid,
 		control: {
 			shouldStop: async owner => {

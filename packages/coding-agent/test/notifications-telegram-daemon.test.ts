@@ -3,7 +3,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
-import { markdownToTelegramHtml, splitTelegramHtml } from "../src/notifications/html-format";
+import {
+	markdownToTelegramHtml,
+	splitTelegramHtml,
+	TELEGRAM_MESSAGE_LIMIT,
+	TELEGRAM_PARSE_MODE,
+} from "../src/notifications/html-format";
+import { deliverRichWithFallback } from "../src/notifications/rich-render";
 import {
 	acquireDaemonOwnership,
 	DAEMON_VERSION,
@@ -465,6 +471,7 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("A", "ws://a", "ta");
@@ -498,6 +505,7 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("S", "ws://s", "ts");
@@ -585,6 +593,7 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("S", "ws://s", "ts");
@@ -621,6 +630,7 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("S", "ws://s", "ts");
@@ -650,6 +660,7 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("S", "ws://s", "ts");
@@ -685,6 +696,7 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("S", "ws://old", "old-token");
@@ -757,6 +769,7 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("S", "ws://s", "ts");
@@ -794,6 +807,7 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("S", "ws://s", "ts");
@@ -826,6 +840,7 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("S", "ws://s", "ts");
@@ -1537,6 +1552,7 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot,
+		rich: { enabled: false },
 	});
 	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
 
@@ -2328,6 +2344,7 @@ describe("telegram daemon reconnect reconciliation", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 			now: () => now,
 			setIntervalImpl: ((cb: () => void) => {
@@ -2392,6 +2409,7 @@ describe("telegram daemon reconnect answer routing", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
+			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 			now: () => now,
 			setIntervalImpl: ((cb: () => void) => {
@@ -2824,4 +2842,903 @@ test("a long finalized turn is scheduled through the pool, not burst in one gran
 	});
 	const rest = bot.calls.filter(c => c.method === "sendMessage").map(c => c.body.text);
 	expect(rest).toEqual([...expectedChunks.slice(1), markdownToTelegramHtml("tail")]);
+});
+// ---------------------------------------------------------------------------
+// Rev 3 rich final-answer promotion verification (Slice 1). Proves that the
+// off state is byte-identical (transport golden + daemon HTML body), documents
+// the multipart FormData contract, and pins the exact rich-promotion counts,
+// topic-match matrix, transport-level ok:false fallback, version-skew
+// tolerance, and the long-string split seam. Config reachability lives in
+// notifications-daemon-config-reachability.test.ts.
+// ---------------------------------------------------------------------------
+
+/** FakeBotApi with a deterministic topic id and a switchable sendRichMessage outcome. */
+class RichFakeBotApi extends FakeBotApi {
+	richBehavior: "ok" | "ok_false" | "throw" = "ok";
+	richThreadId = 555;
+	/** When true, createForumTopic yields no thread id, forcing flat delivery. */
+	threadedOff = false;
+	override async call(method: string, body: unknown): Promise<unknown> {
+		if (method === "createForumTopic") {
+			this.calls.push({ method, body });
+			return this.threadedOff
+				? { ok: true, result: {} }
+				: { ok: true, result: { message_thread_id: this.richThreadId } };
+		}
+		if (method === "sendRichMessage") {
+			this.calls.push({ method, body });
+			if (this.richBehavior === "throw") throw new Error("rich transport down");
+			if (this.richBehavior === "ok_false") return { ok: false, description: "rich unavailable" };
+			return { ok: true, result: { message_id: 4242 } };
+		}
+		return super.call(method, body);
+	}
+}
+
+function richSession(id = "S"): any {
+	return { sessionId: id, token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+}
+
+function makeRichDaemon(bot: FakeBotApi, rich?: { enabled: boolean }): TelegramNotificationDaemon {
+	return new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot as any,
+		...(rich ? { rich } : {}),
+	});
+}
+
+/**
+ * Drive an identity_header (creates the topic) then a finalized turn_stream,
+ * resetting call history in between so only the finalized turn's calls remain.
+ */
+async function driveFinalizedTurn(
+	daemon: TelegramNotificationDaemon,
+	bot: FakeBotApi,
+	session: any,
+	raw: string,
+	finalAnswer = true,
+): Promise<void> {
+	await daemon.handleSessionMessage(session, {
+		type: "identity_header",
+		sessionId: session.sessionId,
+		repo: "r",
+		branch: "b",
+	});
+	bot.calls.length = 0;
+	await daemon.handleSessionMessage(session, {
+		type: "turn_stream",
+		sessionId: session.sessionId,
+		phase: "finalized",
+		finalAnswer,
+		text: raw,
+	});
+}
+
+const countMethod = (bot: FakeBotApi, method: string): number => bot.calls.filter(c => c.method === method).length;
+const findMethod = (bot: FakeBotApi, method: string) => bot.calls.find(c => c.method === method);
+
+describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () => {
+	// (a) TRANSPORT GOLDEN --------------------------------------------------
+	test("(a) transport serializes off-state sendMessage variants byte-identically", async () => {
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		const transport = new TelegramBotTransport({
+			botToken: "tok",
+			apiBase: "https://telegram.test",
+			fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+				requests.push({ url: String(url), init: init ?? {} });
+				return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), { status: 200 });
+			}) as typeof fetch,
+		});
+
+		// The exact bodies flushPool / the ask path hand to botApi.call in the off state.
+		const single = { chat_id: "42", message_thread_id: 100, text: "Hello <b>world</b>", parse_mode: "HTML" };
+		const longText = "x".repeat(4200);
+		const longChunk = { chat_id: "42", message_thread_id: 100, text: longText, parse_mode: "HTML" };
+		const ask = {
+			chat_id: "42",
+			message_thread_id: 100,
+			text: "Pick one option",
+			parse_mode: "HTML",
+			reply_markup: {
+				inline_keyboard: [
+					[
+						{ text: "1", callback_data: "a:1" },
+						{ text: "2", callback_data: "a:2" },
+					],
+				],
+			},
+		};
+
+		await transport.call("sendMessage", single);
+		await transport.call("sendMessage", longChunk);
+		await transport.call("sendMessage", ask);
+
+		// Byte-identical JSON with the exact pre-rich field order.
+		expect(requests[0].init.body).toBe(
+			'{"chat_id":"42","message_thread_id":100,"text":"Hello <b>world</b>","parse_mode":"HTML"}',
+		);
+		expect(requests[1].init.body).toBe(
+			`{"chat_id":"42","message_thread_id":100,"text":"${longText}","parse_mode":"HTML"}`,
+		);
+		expect(requests[2].init.body).toBe(
+			'{"chat_id":"42","message_thread_id":100,"text":"Pick one option","parse_mode":"HTML",' +
+				'"reply_markup":{"inline_keyboard":[[{"text":"1","callback_data":"a:1"},{"text":"2","callback_data":"a:2"}]]}}',
+		);
+		for (const r of requests) {
+			expect(r.url).toBe("https://telegram.test/bottok/sendMessage");
+			expect(r.init.headers).toEqual({ "content-type": "application/json" });
+		}
+	});
+
+	// (b) FormData semantics ------------------------------------------------
+	test("(b) sendPhoto/sendDocument multipart carries fields, file names, and blob types", async () => {
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		const transport = new TelegramBotTransport({
+			botToken: "tok",
+			apiBase: "https://telegram.test",
+			fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+				requests.push({ url: String(url), init: init ?? {} });
+				return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), { status: 200 });
+			}) as typeof fetch,
+		});
+
+		await transport.call("sendPhoto", {
+			chat_id: "42",
+			message_thread_id: 7,
+			photo: Buffer.from("PNGDATA").toString("base64"),
+			mime: "image/png",
+			caption: "shot",
+			parse_mode: "HTML",
+		});
+		await transport.call("sendDocument", {
+			chat_id: "42",
+			message_thread_id: 9,
+			document: Buffer.from("DOCDATA").toString("base64"),
+			mime: "application/pdf",
+			fileName: "notes.pdf",
+			caption: "doc",
+			parse_mode: "HTML",
+		});
+		// Defaults: no mime -> image/png; no mime/fileName -> octet-stream/"file"; no thread -> field omitted.
+		await transport.call("sendPhoto", { chat_id: "42", photo: Buffer.from("Z").toString("base64") });
+		await transport.call("sendDocument", { chat_id: "42", document: Buffer.from("Z").toString("base64") });
+
+		expect(requests[0].url).toBe("https://telegram.test/bottok/sendPhoto");
+		const photo = requests[0].init.body as FormData;
+		expect(photo).toBeInstanceOf(FormData);
+		expect(photo.get("chat_id")).toBe("42");
+		expect(photo.get("message_thread_id")).toBe("7");
+		expect(photo.get("caption")).toBe("shot");
+		expect(photo.get("parse_mode")).toBe("HTML");
+		const photoFile = photo.get("photo") as File;
+		expect(photoFile).toBeInstanceOf(Blob);
+		expect(photoFile.name).toBe("image");
+		expect(photoFile.type).toBe("image/png");
+		expect(await photoFile.text()).toBe("PNGDATA");
+
+		expect(requests[1].url).toBe("https://telegram.test/bottok/sendDocument");
+		const doc = requests[1].init.body as FormData;
+		expect(doc.get("chat_id")).toBe("42");
+		expect(doc.get("message_thread_id")).toBe("9");
+		expect(doc.get("caption")).toBe("doc");
+		expect(doc.get("parse_mode")).toBe("HTML");
+		const docFile = doc.get("document") as File;
+		expect(docFile).toBeInstanceOf(Blob);
+		expect(docFile.name).toBe("notes.pdf");
+		expect(docFile.type).toBe("application/pdf");
+		expect(await docFile.text()).toBe("DOCDATA");
+
+		const photoDefaults = requests[2].init.body as FormData;
+		expect((photoDefaults.get("photo") as File).type).toBe("image/png");
+		const docDefaults = requests[3].init.body as FormData;
+		expect(docDefaults.has("message_thread_id")).toBe(false);
+		expect(docDefaults.has("caption")).toBe(false);
+		expect(docDefaults.has("parse_mode")).toBe(false);
+		const docDefaultFile = docDefaults.get("document") as File;
+		expect(docDefaultFile.name).toBe("file");
+		expect(docDefaultFile.type).toBe("application/octet-stream");
+	});
+
+	// (c) off-state fake BotApi: no rich, byte-identical HTML body -----------
+	test("(c) off states never call sendRichMessage and emit a byte-identical HTML body", async () => {
+		const raw = "Just plain final answer text";
+		const goldenBody =
+			'{"chat_id":"42","message_thread_id":555,"text":"Just plain final answer text","parse_mode":"HTML"}';
+		const offStates: Array<{ label: string; rich?: { enabled: boolean } }> = [
+			{ label: "enabled false", rich: { enabled: false } },
+		];
+		for (const state of offStates) {
+			const bot = new RichFakeBotApi();
+			const daemon = makeRichDaemon(bot, state.rich);
+			await driveFinalizedTurn(daemon, bot, richSession(), raw);
+			expect(countMethod(bot, "sendRichMessage")).toBe(0);
+			expect(countMethod(bot, "sendMessage")).toBe(1);
+			const body = findMethod(bot, "sendMessage")!.body;
+			// Byte-identical to the pre-rich HTML path (field order included).
+			expect(JSON.stringify(body)).toBe(goldenBody);
+			expect(body.text).toBe(markdownToTelegramHtml(raw));
+			expect(body.parse_mode).toBe(TELEGRAM_PARSE_MODE);
+		}
+	});
+
+	// (d) exact counts ------------------------------------------------------
+	test("(d) on+matching topic promotes exactly one sendRichMessage and no sendMessage", async () => {
+		const raw = "# Final\n\nThe answer.";
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot, { enabled: true });
+		await driveFinalizedTurn(daemon, bot, richSession(), raw);
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+		expect(countMethod(bot, "sendMessage")).toBe(0);
+		expect(findMethod(bot, "sendRichMessage")!.body).toEqual({
+			chat_id: "42",
+			message_thread_id: 555,
+			rich_message: { markdown: raw },
+		});
+	});
+
+	test("(d) editable finalized messageRef stays on HTML edit path and never promotes rich", async () => {
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot, { enabled: true });
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+		expect(bot.calls.length).toBeGreaterThan(0);
+		bot.calls.length = 0;
+
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "live",
+			text: "Hello",
+			messageRef: "1",
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			finalAnswer: true,
+			text: "Hello world!",
+			messageRef: "1",
+		});
+
+		expect(countMethod(bot, "sendRichMessage")).toBe(0);
+		expect(countMethod(bot, "editMessageText")).toBeGreaterThanOrEqual(1);
+		expect(countMethod(bot, "sendMessage")).toBe(1);
+		expect(findMethod(bot, "sendMessage")!.body.text).toBe(markdownToTelegramHtml("Hello"));
+	});
+
+	test("(d) editable multi-chunk finalized continuations strip rich markers and never re-promote", async () => {
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot, { enabled: true });
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+		expect(bot.calls.length).toBeGreaterThan(0);
+		bot.calls.length = 0;
+
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "live",
+			text: "seed",
+			messageRef: "1",
+		});
+		const raw = "가".repeat(9000);
+		const chunks = splitTelegramHtml(markdownToTelegramHtml(raw));
+		expect(chunks.length).toBeGreaterThan(1);
+
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			finalAnswer: true,
+			text: raw,
+			messageRef: "1",
+		});
+
+		expect(countMethod(bot, "sendRichMessage")).toBe(0);
+
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			finalAnswer: true,
+			text: "tail",
+			messageRef: "1",
+		});
+
+		expect(countMethod(bot, "sendRichMessage")).toBe(0);
+		const sends = bot.calls.filter(c => c.method === "sendMessage");
+		expect(sends.length).toBeGreaterThan(0);
+		expect(sends.every(c => c.body.parse_mode === TELEGRAM_PARSE_MODE)).toBe(true);
+	});
+
+	test("(d) sendRichMessage throw falls back to chunk 0 now and requeues the rest (fairness)", async () => {
+		const raw = "B".repeat(9000);
+		const chunks = splitTelegramHtml(markdownToTelegramHtml(raw));
+		expect(chunks.length).toBeGreaterThan(1);
+		const bot = new RichFakeBotApi();
+		bot.richBehavior = "throw";
+		const daemon = makeRichDaemon(bot, { enabled: true });
+		const session = richSession();
+		await driveFinalizedTurn(daemon, bot, session, raw);
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+		// Fairness: only the first HTML chunk is delivered on this token; the rest are requeued.
+		const first = bot.calls.filter(c => c.method === "sendMessage");
+		expect(first).toHaveLength(1);
+		expect(first[0]!.body.text).toBe(chunks[0]);
+		// A follow-up flush drains the requeued continuations (ahead of the newer frame).
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: session.sessionId,
+			phase: "finalized",
+			text: "tail",
+		});
+		const rest = bot.calls.filter(c => c.method === "sendMessage");
+		expect(rest.map(c => c.body.text)).toEqual([...chunks.slice(1), markdownToTelegramHtml("tail")]);
+		expect(rest.every(c => c.body.message_thread_id === 555 && c.body.parse_mode === TELEGRAM_PARSE_MODE)).toBe(true);
+	});
+
+	test("(d) sendRichMessage ok:false falls back to a single HTML chunk", async () => {
+		const raw = "One short final answer";
+		const bot = new RichFakeBotApi();
+		bot.richBehavior = "ok_false";
+		const daemon = makeRichDaemon(bot, { enabled: true });
+		await driveFinalizedTurn(daemon, bot, richSession(), raw);
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+		expect(countMethod(bot, "sendMessage")).toBe(1);
+		expect(findMethod(bot, "sendMessage")!.body.text).toBe(markdownToTelegramHtml(raw));
+	});
+
+	test("(d) deliverRichWithFallback warns exactly once per failure and never on success", async () => {
+		const send = { method: "sendMessage", lane: "finalized", text: "<b>x</b>", richMarkdown: "raw md" } as any;
+		const base = { chat_id: "42", message_thread_id: 555 };
+
+		const okBot = new RichFakeBotApi();
+		const okWarns: string[] = [];
+		let okFallbacks = 0;
+		await deliverRichWithFallback(
+			okBot as any,
+			base,
+			send,
+			async () => {
+				okFallbacks++;
+			},
+			{ warn: m => okWarns.push(m) },
+		);
+		expect(countMethod(okBot, "sendRichMessage")).toBe(1);
+		expect(okFallbacks).toBe(0);
+		expect(okWarns).toHaveLength(0);
+
+		const throwBot = new RichFakeBotApi();
+		throwBot.richBehavior = "throw";
+		const throwWarns: string[] = [];
+		let throwFallbacks = 0;
+		await deliverRichWithFallback(
+			throwBot as any,
+			base,
+			send,
+			async () => {
+				throwFallbacks++;
+			},
+			{ warn: m => throwWarns.push(m) },
+		);
+		expect(throwFallbacks).toBe(1);
+		expect(throwWarns).toHaveLength(1);
+		expect(throwWarns[0]).toContain("sendRichMessage failed");
+
+		const okFalseBot = new RichFakeBotApi();
+		okFalseBot.richBehavior = "ok_false";
+		const okFalseWarns: string[] = [];
+		let okFalseFallbacks = 0;
+		await deliverRichWithFallback(
+			okFalseBot as any,
+			base,
+			send,
+			async () => {
+				okFalseFallbacks++;
+			},
+			{ warn: m => okFalseWarns.push(m) },
+		);
+		expect(okFalseFallbacks).toBe(1);
+		expect(okFalseWarns).toHaveLength(1);
+		expect(okFalseWarns[0]).toContain("rich unavailable");
+	});
+
+	// (e) global rich matrix ---------------------------------------------------
+	test("(e) global rich promotes in threaded and flat delivery", async () => {
+		const raw = "Matrix final answer";
+
+		const threadedBot = new RichFakeBotApi();
+		await driveFinalizedTurn(makeRichDaemon(threadedBot, { enabled: true }), threadedBot, richSession(), raw);
+		expect(countMethod(threadedBot, "sendRichMessage")).toBe(1);
+		expect(findMethod(threadedBot, "sendRichMessage")!.body.message_thread_id).toBe(555);
+
+		const flatBot = new RichFakeBotApi();
+		flatBot.threadedOff = true;
+		await driveFinalizedTurn(makeRichDaemon(flatBot, { enabled: true }), flatBot, richSession(), raw);
+		expect(countMethod(flatBot, "sendRichMessage")).toBe(1);
+		expect(findMethod(flatBot, "sendRichMessage")!.body.message_thread_id).toBeUndefined();
+	});
+
+	// (f) transport-level ok:false -> HTML fallback -------------------------
+	test("(f) transport-level {ok:false} sendRichMessage response falls back to HTML", async () => {
+		const fetchCalls: Array<{ method: string; body: any }> = [];
+		const jsonResponse = (obj: unknown) =>
+			new Response(JSON.stringify(obj), { status: 200, headers: { "content-type": "application/json" } });
+		const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+			const method = String(url).split("/").pop() ?? "";
+			const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+			fetchCalls.push({ method, body });
+			if (method === "getChat") return jsonResponse({ ok: true, result: { id: 42, type: "private" } });
+			if (method === "getMe") return jsonResponse({ ok: true, result: { id: 1 } });
+			if (method === "createForumTopic") return jsonResponse({ ok: true, result: { message_thread_id: 555 } });
+			if (method === "sendRichMessage") return jsonResponse({ ok: false, description: "rich off at transport" });
+			return jsonResponse({ ok: true, result: { message_id: fetchCalls.length } });
+		}) as typeof fetch;
+		const transport = new TelegramBotTransport({ botToken: "tok", apiBase: "https://telegram.test", fetchImpl });
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: transport,
+			rich: { enabled: true },
+		});
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+		fetchCalls.length = 0;
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			finalAnswer: true,
+			text: "Transport ok false answer",
+		});
+		expect(fetchCalls.filter(c => c.method === "sendRichMessage")).toHaveLength(1);
+		const htmlSends = fetchCalls.filter(c => c.method === "sendMessage");
+		expect(htmlSends.length).toBeGreaterThan(0);
+		expect(htmlSends[0].body.text).toBe(markdownToTelegramHtml("Transport ok false answer"));
+	});
+
+	// default-on: a finalAnswer-bearing frame reaching a rich-unset daemon promotes rich
+	test("default-on: finalAnswer frame on a rich-unset daemon promotes rich", async () => {
+		const raw = "# Heading here";
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot); // no rich option defaults on
+		await driveFinalizedTurn(daemon, bot, richSession(), raw, true);
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+		expect(countMethod(bot, "sendMessage")).toBe(0);
+		expect(findMethod(bot, "sendRichMessage")!.body.rich_message.markdown).toBe(raw);
+	});
+
+	// long-string seam: a 4096+ finalized message splits identically in the off state
+	test("long-string seam: 4096+ off-state finalized message keeps the existing HTML split", async () => {
+		const raw = "C".repeat(9000);
+		const chunks = splitTelegramHtml(markdownToTelegramHtml(raw));
+		expect(chunks.length).toBeGreaterThan(1);
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot, { enabled: false }); // off
+		await driveFinalizedTurn(daemon, bot, richSession(), raw);
+		expect(countMethod(bot, "sendRichMessage")).toBe(0);
+		const sends = bot.calls.filter(c => c.method === "sendMessage");
+		// Off state uses the unchanged HTML path. Upstream fans the split across
+		// pool drains (first chunk now, the rest re-queued), so this flush leads
+		// with chunk[0]; the full multi-chunk drain is covered by the pool test
+		// above. The point here: no rich promotion, and chunks stay limit-bounded.
+		expect(sends.length).toBeGreaterThanOrEqual(1);
+		expect(sends[0]!.body.text).toBe(chunks[0]);
+		expect(sends.every(c => c.body.text.length <= TELEGRAM_MESSAGE_LIMIT)).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// G006: rich overflow boundary. Production caps the final answer at 3500 chars
+// (summaryFromMessage(..., 3500)), so a promoted sendRichMessage never overflows
+// under normal traffic and RICH_MESSAGE_LIMIT (rich-render.ts) stays a purely
+// non-behavioral marker. These tests pin the defended-but-prod-unreachable case:
+// an oversized (4096+) rich payload the Bot API rejects with {ok:false} MUST
+// degrade to the chunked HTML splitTelegramHtml fallback — N chunks, each
+// <= TELEGRAM_MESSAGE_LIMIT, with exactly one diagnostic warn — while normal
+// (<= limit) traffic stays a single send. Purely additive: no existing test case
+// is modified.
+// ---------------------------------------------------------------------------
+describe("telegram daemon rich overflow boundary (G006)", () => {
+	test("(g) rich {ok:false} on a 4096+ payload falls back to N HTML chunks, each <= TELEGRAM_MESSAGE_LIMIT", async () => {
+		const raw = "D".repeat(9000);
+		const html = markdownToTelegramHtml(raw);
+		const chunks = splitTelegramHtml(html);
+		expect(html.length).toBeGreaterThan(TELEGRAM_MESSAGE_LIMIT); // genuine 4096+ overflow
+		expect(chunks.length).toBeGreaterThan(1); // must actually split into multiple messages
+
+		const bot = new RichFakeBotApi();
+		bot.richBehavior = "ok_false";
+		const daemon = makeRichDaemon(bot, { enabled: true });
+		const session = richSession();
+		await driveFinalizedTurn(daemon, bot, session, raw);
+
+		// Rich attempted once, then the REAL daemon sendHtmlFallback closure runs:
+		// chunk 0 on this token, the rest requeued (fairness) and drained next flush.
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+		const first = bot.calls.filter(c => c.method === "sendMessage");
+		expect(first).toHaveLength(1);
+		expect(first[0]!.body.text).toBe(chunks[0]);
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: session.sessionId,
+			phase: "finalized",
+			text: "tail",
+		});
+		const rest = bot.calls.filter(c => c.method === "sendMessage");
+		const allChunkTexts = [chunks[0], ...rest.map(c => c.body.text)];
+		expect(allChunkTexts).toEqual([...chunks, markdownToTelegramHtml("tail")]); // no content dropped
+		expect(rest.every(c => c.body.text.length <= TELEGRAM_MESSAGE_LIMIT)).toBe(true);
+		expect(rest.every(c => c.body.message_thread_id === 555 && c.body.parse_mode === TELEGRAM_PARSE_MODE)).toBe(true);
+	});
+
+	test("(g) rich {ok:false} at 4096+ overflow warns exactly once and runs the chunked HTML fallback once", async () => {
+		const raw = "E".repeat(9000);
+		const html = markdownToTelegramHtml(raw);
+		const chunks = splitTelegramHtml(html);
+		expect(html.length).toBeGreaterThan(TELEGRAM_MESSAGE_LIMIT);
+		expect(chunks.length).toBeGreaterThan(1);
+
+		const bot = new RichFakeBotApi();
+		bot.richBehavior = "ok_false";
+		const send = { method: "sendMessage", lane: "finalized", text: html, richMarkdown: raw } as any;
+		const base = { chat_id: "42", message_thread_id: 555 };
+		const warns: string[] = [];
+		let fallbacks = 0;
+		// Mirror the daemon's sendHtmlFallback closure (telegram-daemon.ts) verbatim.
+		const sendHtmlFallback = async () => {
+			fallbacks++;
+			for (const text of splitTelegramHtml(send.text)) {
+				await bot.call("sendMessage", {
+					chat_id: base.chat_id,
+					message_thread_id: base.message_thread_id,
+					text,
+					parse_mode: TELEGRAM_PARSE_MODE,
+				});
+			}
+		};
+		await deliverRichWithFallback(bot as any, base, send, sendHtmlFallback, { warn: m => warns.push(m) });
+
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+		expect(fallbacks).toBe(1); // fallback invoked exactly once for the whole overflow
+		expect(warns).toHaveLength(1); // one diagnostic, NOT one per chunk
+		expect(warns[0]).toContain("sendRichMessage failed");
+		const sends = bot.calls.filter(c => c.method === "sendMessage");
+		expect(sends).toHaveLength(chunks.length);
+		expect(sends.map(c => c.body.text)).toEqual(chunks);
+		expect(sends.every(c => c.body.text.length <= TELEGRAM_MESSAGE_LIMIT)).toBe(true);
+	});
+
+	test("(g) normal-length (<= limit) traffic is unchanged: promoted -> one rich send; off -> one HTML send", async () => {
+		const raw = "A concise final answer well under the Telegram limit.";
+		expect(markdownToTelegramHtml(raw).length).toBeLessThanOrEqual(TELEGRAM_MESSAGE_LIMIT); // no overflow
+
+		// Promoted + ok:true -> exactly one sendRichMessage, and NO HTML fallback/split.
+		const onBot = new RichFakeBotApi();
+		await driveFinalizedTurn(makeRichDaemon(onBot, { enabled: true }), onBot, richSession(), raw);
+		expect(countMethod(onBot, "sendRichMessage")).toBe(1);
+		expect(countMethod(onBot, "sendMessage")).toBe(0);
+
+		// Off -> the unchanged single HTML sendMessage (no rich, no split).
+		const offBot = new RichFakeBotApi();
+		await driveFinalizedTurn(makeRichDaemon(offBot, { enabled: false }), offBot, richSession(), raw);
+		expect(countMethod(offBot, "sendRichMessage")).toBe(0);
+		expect(countMethod(offBot, "sendMessage")).toBe(1);
+		expect(findMethod(offBot, "sendMessage")!.body.text).toBe(markdownToTelegramHtml(raw));
+	});
+});
+
+describe("telegram daemon action-needed rich delivery (G004)", () => {
+	function makeAskDaemon(bot: FakeBotApi, rich: { enabled: boolean }) {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot as any,
+			WebSocketImpl: FakeWs as any,
+			rich,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		return daemon;
+	}
+
+	test("ask rich success: one sendRichMessage with reply_markup, route registered, callback + free-text reply route", async () => {
+		FakeWs.instances = [];
+		const bot = new RichFakeBotApi();
+		const daemon = makeAskDaemon(bot, { enabled: true });
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Q",
+			options: ["Y", "N"],
+		});
+		const rich = bot.calls.filter(c => c.method === "sendRichMessage");
+		expect(rich).toHaveLength(1);
+		expect(countMethod(bot, "sendMessage")).toBe(0);
+		expect(rich[0]!.body.rich_message.markdown).toContain("Q");
+		expect(rich[0]!.body.reply_markup.inline_keyboard).toBeTruthy();
+		expect(rich[0]!.body.message_thread_id).toBe(555);
+		expect(daemon.messageRoutes.get("4242")).toEqual({ sessionId: "S", actionId: "ask" });
+
+		const alias = rich[0]!.body.reply_markup.inline_keyboard[0][0].callback_data;
+		await daemon.handleTelegramUpdate({
+			update_id: 1,
+			callback_query: { id: "cb", data: alias, message: { chat: { id: 42 } } },
+		});
+		expect(JSON.parse(FakeWs.instances[0]!.sent.at(-1)!)).toEqual({
+			type: "reply",
+			id: "ask",
+			answer: 0,
+			token: "ts",
+		});
+
+		await daemon.handleTelegramUpdate({
+			update_id: 2,
+			message: { chat: { id: 42 }, text: "typed answer", reply_to_message: { message_id: 4242 } },
+		});
+		expect(JSON.parse(FakeWs.instances[0]!.sent.at(-1)!)).toEqual({
+			type: "reply",
+			id: "ask",
+			answer: "typed answer",
+			token: "ts",
+		});
+	});
+
+	for (const behavior of ["ok_false", "throw"] as const) {
+		test(`ask rich ${behavior}: HTML fallback registers last-chunk id and routes replies`, async () => {
+			FakeWs.instances = [];
+			const bot = new RichFakeBotApi();
+			bot.richBehavior = behavior;
+			const daemon = makeAskDaemon(bot, { enabled: true });
+			await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+				type: "action_needed",
+				kind: "ask",
+				id: "ask",
+				question: "Q",
+				options: ["Y", "N"],
+			});
+			expect(countMethod(bot, "sendRichMessage")).toBe(1);
+			const htmlSends = bot.calls.filter(c => c.method === "sendMessage");
+			expect(htmlSends.length).toBeGreaterThanOrEqual(1);
+			expect(htmlSends.at(-1)!.body.reply_markup.inline_keyboard).toBeTruthy();
+			const askEntry = [...daemon.messageRoutes.entries()].find(
+				([, route]) => route.sessionId === "S" && route.actionId === "ask",
+			);
+			expect(askEntry).toBeDefined();
+			await daemon.handleTelegramUpdate({
+				update_id: 1,
+				message: { chat: { id: 42 }, text: "typed", reply_to_message: { message_id: Number(askEntry![0]) } },
+			});
+			expect(JSON.parse(FakeWs.instances[0]!.sent.at(-1)!)).toEqual({
+				type: "reply",
+				id: "ask",
+				answer: "typed",
+				token: "ts",
+			});
+		});
+	}
+
+	test("idle rich: one sendRichMessage without reply_markup and no message route", async () => {
+		FakeWs.instances = [];
+		const bot = new RichFakeBotApi();
+		const daemon = makeAskDaemon(bot, { enabled: true });
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "idle",
+			id: "idle1",
+			summary: "all done",
+		});
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+		expect(countMethod(bot, "sendMessage")).toBe(0);
+		const rich = findMethod(bot, "sendRichMessage")!;
+		expect(rich.body.rich_message.markdown).toContain("Agent idle");
+		expect(rich.body.reply_markup).toBeUndefined();
+		expect(daemon.messageRoutes.size).toBe(0);
+	});
+
+	test("off (rich.enabled=false) ask: byte-identical HTML, zero sendRichMessage", async () => {
+		FakeWs.instances = [];
+		const bot = new RichFakeBotApi();
+		const daemon = makeAskDaemon(bot, { enabled: false });
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Q",
+			options: ["Y", "N"],
+		});
+		expect(countMethod(bot, "sendRichMessage")).toBe(0);
+		const sends = bot.calls.filter(c => c.method === "sendMessage");
+		expect(sends).toHaveLength(1);
+		expect(sends[0]!.body.parse_mode).toBe(TELEGRAM_PARSE_MODE);
+		expect(sends[0]!.body.reply_markup.inline_keyboard).toBeTruthy();
+		const askEntry = [...daemon.messageRoutes.entries()].find(
+			([, route]) => route.sessionId === "S" && route.actionId === "ask",
+		);
+		expect(askEntry).toBeDefined();
+	});
+});
+
+describe("telegram daemon /rich toggle (G005)", () => {
+	function richDaemonWithSettings(bot: FakeBotApi, s: Settings, enabled: boolean) {
+		return new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot as any,
+			rich: { enabled },
+		});
+	}
+
+	test("/rich off persists the setting, updates runtime, and confirms in-topic", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new RichFakeBotApi();
+		const daemon = richDaemonWithSettings(bot, s, true);
+
+		await daemon.handleTelegramUpdate({
+			update_id: 501,
+			message: { chat: { id: 42 }, message_thread_id: 555, text: "/rich off", message_id: 1 },
+		});
+		const confirm = bot.calls.find(c => c.method === "sendMessage" && c.body.text === "Rich messages: off");
+		expect(confirm).toBeDefined();
+		expect(confirm!.body.message_thread_id).toBe(555);
+		expect(s.get("notifications.telegram.rich.enabled")).toBe(false);
+
+		// Runtime is toggled immediately: the next finalized final is HTML, not rich.
+		bot.calls.length = 0;
+		await driveFinalizedTurn(daemon, bot, richSession(), "answer after off");
+		expect(countMethod(bot, "sendRichMessage")).toBe(0);
+		expect(countMethod(bot, "sendMessage")).toBe(1);
+	});
+
+	test("/rich on re-enables rich at runtime and persists true", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new RichFakeBotApi();
+		const daemon = richDaemonWithSettings(bot, s, false);
+
+		await daemon.handleTelegramUpdate({
+			update_id: 502,
+			message: { chat: { id: 42 }, text: "/rich on", message_id: 1 },
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.text === "Rich messages: on")).toBe(true);
+		expect(s.get("notifications.telegram.rich.enabled")).toBe(true);
+
+		bot.calls.length = 0;
+		await driveFinalizedTurn(daemon, bot, richSession(), "answer after on");
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+	});
+
+	test("/rich works with no connected session (handled before WS-dependent injection)", async () => {
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot, { enabled: true }); // no connectSession
+		await daemon.handleTelegramUpdate({
+			update_id: 601,
+			message: { chat: { id: 42 }, text: "/rich off", message_id: 1 },
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.text === "Rich messages: off")).toBe(true);
+	});
+
+	test("invalid /rich arg returns usage guidance and is not injected", async () => {
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot, { enabled: true });
+		await daemon.handleTelegramUpdate({
+			update_id: 602,
+			message: { chat: { id: 42 }, text: "/rich maybe", message_id: 1 },
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.text === "Usage: /rich on|off")).toBe(true);
+	});
+
+	test("/rich off while an ask is pending is a config command, not an ask answer", async () => {
+		FakeWs.instances = [];
+		const bot = new RichFakeBotApi();
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot as any,
+			WebSocketImpl: FakeWs as any,
+			rich: { enabled: true },
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Q",
+			options: ["Y", "N"],
+		});
+		const threadId = bot.calls.find(c => c.method === "sendRichMessage")?.body.message_thread_id;
+		const before = FakeWs.instances[0]!.sent.length;
+		bot.calls.length = 0;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 701,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/rich off", message_id: 9 },
+		});
+
+		const afterFrames = FakeWs.instances[0]!.sent.slice(before).map(f => JSON.parse(f));
+		expect(afterFrames.some(f => f.type === "reply")).toBe(false); // ask NOT answered
+		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.text === "Rich messages: off")).toBe(true);
+	});
+
+	test("settings write failure leaves runtime unchanged and warns the user", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		(s as any).set = () => {
+			throw new Error("disk full");
+		};
+		const bot = new RichFakeBotApi();
+		const daemon = richDaemonWithSettings(bot, s, true);
+
+		await daemon.handleTelegramUpdate({
+			update_id: 801,
+			message: { chat: { id: 42 }, text: "/rich off", message_id: 1 },
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("unchanged"))).toBe(true);
+
+		// Runtime stays rich because the persistence failed.
+		bot.calls.length = 0;
+		await driveFinalizedTurn(daemon, bot, richSession(), "still rich");
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+	});
+
+	test("a non-paired chat cannot toggle rich", async () => {
+		const bot = new RichFakeBotApi();
+		const daemon = makeRichDaemon(bot, { enabled: true });
+		await daemon.handleTelegramUpdate({
+			update_id: 901,
+			message: { chat: { id: -99999 }, text: "/rich off", message_id: 1 },
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).startsWith("Rich messages"))).toBe(
+			false,
+		);
+	});
+
+	test("/rich in a non-private paired chat is rejected (fail-closed, no toggle)", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new RichFakeBotApi();
+		// Paired chat resolves to a group/supergroup, not a private DM.
+		bot.call = (async (method: string, body: any) => {
+			bot.calls.push({ method, body });
+			if (method === "getChat") return { ok: true, result: { id: body.chat_id, type: "supergroup" } };
+			if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+			return { ok: true, result: true };
+		}) as any;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot as any,
+			rich: { enabled: true },
+		});
+		await daemon.handleTelegramUpdate({
+			update_id: 951,
+			message: { chat: { id: 42, type: "supergroup" }, text: "/rich off", message_id: 1 },
+		});
+		// No toggle confirmation is sent and the persisted setting is untouched.
+		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).startsWith("Rich messages"))).toBe(
+			false,
+		);
+		expect(s.get("notifications.telegram.rich.enabled")).toBe(true);
+	});
 });

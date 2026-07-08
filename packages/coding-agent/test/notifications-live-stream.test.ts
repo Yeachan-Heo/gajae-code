@@ -354,3 +354,40 @@ test("live frames are NOT raised by the turn cap (stay one editable preview)", a
 	const live = frames.find(f => f.type === "turn_stream" && f.phase === "live")!;
 	expect(live.text!.length).toBeLessThanOrEqual(3500); // live preview stays capped regardless of TURN_MAX
 });
+
+// Pro round-6 regression: a live (editable) frame whose HTML splits must NOT fan
+// out into stale non-coalesced continuation messages. The daemon edits the one
+// streamed message with a single edit-safe preview chunk; the full authoritative
+// text arrives with the finalized frame.
+test("a split live preview edits one message and never fans out continuation sends", async () => {
+	const { daemon, bot, session } = await bootDaemon();
+	// First live frame creates the streamed message.
+	await daemon.handleSessionMessage(session as never, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "live",
+		text: "seed",
+		messageRef: "1",
+	});
+	bot.calls.length = 0;
+	// A long live frame whose rendered HTML spans multiple Telegram chunks.
+	await daemon.handleSessionMessage(session as never, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "live",
+		text: "가".repeat(9000),
+		messageRef: "1",
+	});
+	// The preview edits the ONE message; a live frame never requeues continuations.
+	expect(bot.calls.filter(c => c.method === "editMessageText").length).toBeGreaterThanOrEqual(1);
+	expect(bot.calls.filter(c => c.method === "sendMessage").length).toBe(0);
+	// A follow-up flush drains any queued items: still no continuation sendMessage.
+	await daemon.handleSessionMessage(session as never, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "live",
+		text: "가".repeat(9000) + " more",
+		messageRef: "1",
+	});
+	expect(bot.calls.filter(c => c.method === "sendMessage").length).toBe(0);
+});

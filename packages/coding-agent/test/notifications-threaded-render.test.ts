@@ -144,3 +144,54 @@ describe("renderThreadedFrame", () => {
 		expect(formatIdentityHeader({ sessionId: "s" })).toContain("• repo: <code>?</code>");
 	});
 });
+
+describe("renderThreadedFrame rich final-answer marker", () => {
+	// The rich delivery marker (`richMarkdown`) is derived ONLY from a frame's
+	// `finalAnswer` bit - never inferred from `phase` - and carries the RAW
+	// markdown (pre-HTML), so the daemon can promote a rich final answer while
+	// `text` stays the HTML-rendered fallback.
+	test("a finalAnswer turn_stream carries the raw markdown as richMarkdown", () => {
+		const raw = "**bold** answer with `code` and a [link](https://example.com)";
+		const send = renderThreadedFrame({
+			type: "turn_stream",
+			sessionId: "s",
+			phase: "finalized",
+			finalAnswer: true,
+			text: raw,
+		});
+		expect(send?.richMarkdown).toBe(raw);
+		// richMarkdown is the RAW markdown, not the HTML-rendered `text`.
+		expect(send?.text).not.toBe(raw);
+		expect(send?.text).toContain("<b>bold</b>");
+	});
+
+	test("a finalized turn_stream with finalAnswer:false has no richMarkdown", () => {
+		const send = renderThreadedFrame({
+			type: "turn_stream",
+			sessionId: "s",
+			phase: "finalized",
+			finalAnswer: false,
+			text: "done",
+		});
+		expect(send?.lane).toBe("finalized");
+		expect(send?.richMarkdown).toBeUndefined();
+	});
+
+	test("a finalized turn_stream without finalAnswer has no richMarkdown (marker not inferred from phase)", () => {
+		const send = renderThreadedFrame({ type: "turn_stream", sessionId: "s", phase: "finalized", text: "done" });
+		expect(send?.lane).toBe("finalized");
+		expect(send?.richMarkdown).toBeUndefined();
+	});
+
+	test("a live turn_stream has no richMarkdown", () => {
+		const send = renderThreadedFrame({
+			type: "turn_stream",
+			sessionId: "s",
+			phase: "live",
+			text: "partial",
+			messageRef: "m-7",
+		});
+		expect(send?.lane).toBe("live");
+		expect(send?.richMarkdown).toBeUndefined();
+	});
+});

@@ -9,7 +9,7 @@ import type { Settings } from "../config/settings";
 import type { DaemonRuntimeInfo } from "../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
-import { parseInThreadConfigCommand } from "./config-commands";
+import { parseInThreadConfigCommand, parseRichToggleCommand } from "./config-commands";
 import { daemonPaths } from "./daemon-paths";
 import {
 	buildCompactChoiceGrid,
@@ -44,8 +44,12 @@ import {
 import { NotificationOperatorRuntime, OperatorBackoffPolicy, OperatorEventRouter } from "./operator-runtime";
 import { RateLimitPool } from "./rate-limit-pool";
 import { listRecentSessions } from "./recent-activity";
+import { ReplySentStore } from "./reply-sent-store";
+import { DraftStreamState, deliverDraft, shouldStreamDraft } from "./rich-draft";
+import { deliverRichActionWithFallback, deliverRichWithFallback, shouldPromoteRich } from "./rich-render";
 import {
 	type AliasTable,
+	buildActionMarkdown,
 	buildActionMessage,
 	type CallbackRoute,
 	createAliasTable,
@@ -843,6 +847,10 @@ export interface TelegramDaemonOptions {
 	 * default applies (e.g. lifecycle control disabled), no control server starts.
 	 */
 	createLifecycleControlServer?: LifecycleControlServerFactory | null;
+	/** Rich text promotion (enabled by default; see rich-render.ts). */
+	rich?: { enabled: boolean };
+	/** Opt-in rich-draft streaming of live turn previews (off by default; see rich-draft.ts). */
+	richDraft?: { enabled: boolean };
 }
 
 interface SessionSocket {
@@ -883,6 +891,10 @@ export class TelegramNotificationDaemon {
 	private readonly pool: RateLimitPool<{ send: ThreadedSend; topicId?: string }>;
 	private readonly poller: TelegramUpdatePoller;
 	private readonly dispatchState = new TelegramEventDispatchState();
+	/** Original markdown of rich messages we sent (chat+message_id), for restoring reply context on inbound replies. */
+	private readonly replyStore: ReplySentStore;
+	/** Per-session debounce + monotonic draft-id state for opt-in draft streaming. */
+	private readonly draftStream = new DraftStreamState();
 	/** Identity-bearing sessions by repo/branch surface, used to avoid transient duplicate topics. */
 	private readonly topicOwnerByIdentity = new Map<string, string>();
 	/** Non-identity frames held until identity creates the correct thread. */
@@ -1243,6 +1255,7 @@ export class TelegramNotificationDaemon {
 
 	constructor(private readonly opts: TelegramDaemonOptions) {
 		this.fsImpl = opts.fs ?? nodeFs;
+		this.replyStore = new ReplySentStore({ agentDir: opts.settings.getAgentDir(), fs: opts.fs });
 		this.aliasTable = createAliasTable();
 		this.botApi =
 			opts.botApi ??
@@ -1799,8 +1812,23 @@ export class TelegramNotificationDaemon {
 		return { images, fileNotes };
 	}
 
+	/**
+	 * Serialize all pool flushes. Every caller (`submitThreadedFrame`, the flat
+	 * fallback, the drain timer's `void this.flushPool()`, topic teardown) goes
+	 * through one promise chain, so two flushes never interleave — a live send can
+	 * never be in-flight while a finalized flush reads `liveMessages` and decides
+	 * to post a fresh (duplicate) final. Errors are swallowed so one failed flush
+	 * never poisons the queue (each flush is already best-effort internally).
+	 */
+	private flushChain: Promise<void> = Promise.resolve();
+	private flushPool(): Promise<void> {
+		const next = this.flushChain.then(() => this.flushPoolInner());
+		this.flushChain = next.catch(() => {});
+		return next;
+	}
+
 	/** Drain the shared rate-limit pool and deliver each granted send to its topic. */
-	private async flushPool(): Promise<void> {
+	private async flushPoolInner(): Promise<void> {
 		const batch = this.pool.drain();
 		// Within a batch a finalized frame supersedes any still-queued live frame for
 		// the same streamed message (finalized outranks live), so drop the stale live
@@ -1812,6 +1840,17 @@ export class TelegramNotificationDaemon {
 				finalizedKeys.add(`${item.sessionId}:${item.coalesceKey}`);
 			}
 		}
+		// Cross-batch protection: also purge any live frame still QUEUED for a
+		// message whose finalized frame is in this batch, so a stale live edit can
+		// never be delivered on a later drain after the authoritative final.
+		if (finalizedKeys.size > 0) {
+			this.pool.removeWhere(
+				it =>
+					it.lane === "live" &&
+					it.coalesceKey !== undefined &&
+					finalizedKeys.has(`${it.sessionId}:${it.coalesceKey}`),
+			);
+		}
 		for (const item of batch) {
 			const { send, topicId } = item.payload;
 			if (topicId && !(await this.pairedChatIsPrivate())) continue;
@@ -1821,6 +1860,33 @@ export class TelegramNotificationDaemon {
 			const editKey = ckey !== undefined ? `${item.sessionId}:${ckey}` : undefined;
 			if (item.lane === "live" && editKey && finalizedKeys.has(editKey)) continue;
 			try {
+				// Draft streaming (opt-in, off by default): stream a live turn frame as a
+				// best-effort rich-draft preview, debounced to >=1.5s per session through
+				// this same rate-limited drain; a finalized frame ends the turn's draft
+				// window. Entirely inert when richDraft is off (the enabled gate /
+				// shouldStreamDraft fail closed), so off-state HTML request bodies stay
+				// byte-identical.
+				if (this.opts.richDraft?.enabled === true && this.opts.rich?.enabled !== false) {
+					if (send.lane === "finalized" && send.method === "sendMessage") {
+						this.draftStream.reset(item.sessionId);
+					} else if (
+						shouldStreamDraft({
+							enabled: this.opts.richDraft.enabled,
+							send,
+						})
+					) {
+						const draftId = this.draftStream.tryClaim(item.sessionId, this.opts.now?.() ?? Date.now());
+						if (draftId !== undefined) {
+							await deliverDraft(
+								this.botApi,
+								{ chat_id: this.opts.chatId, ...threadField },
+								draftId,
+								send.richDraftMarkdown!,
+								logger,
+							);
+						}
+					}
+				}
 				if (send.method === "sendPhoto" && send.photoBase64) {
 					// Real photo upload (the default botApi multiparts base64 -> file).
 					await this.botApi.call("sendPhoto", {
@@ -1842,53 +1908,139 @@ export class TelegramNotificationDaemon {
 						parse_mode: TELEGRAM_PARSE_MODE,
 					});
 				} else if (send.text) {
-					const chunks = splitTelegramHtml(send.text);
-					const existingId = editKey ? this.liveMessages.get(editKey) : undefined;
-					if (editKey && existingId !== undefined && chunks.length === 1) {
-						// In-place edit of the streamed message. An unchanged edit is
-						// rejected by Telegram ("message is not modified") and swallowed.
-						await this.botApi.call("editMessageText", {
-							chat_id: this.opts.chatId,
-							message_id: existingId,
-							text: chunks[0],
-							parse_mode: TELEGRAM_PARSE_MODE,
-						});
-					} else {
-						// A single granted slot MUST map to a single Telegram send. When the
-						// rendered text splits into multiple chunks (e.g. a long finalized
-						// turn raised via GJC_NOTIFICATIONS_TURN_MAX), deliver the first
-						// chunk on this token and re-submit the remaining chunks as their
-						// own pool items so each consumes a token on a later drain.
-						// Otherwise one frame would fan out into many sends against a single
-						// slot, bypassing the per-chat rate-limit / fairness invariant.
-						const res = (await this.botApi.call("sendMessage", {
-							chat_id: this.opts.chatId,
-							...threadField,
-							text: chunks[0]!,
-							parse_mode: TELEGRAM_PARSE_MODE,
-						})) as { result?: { message_id?: number } };
-						for (let i = 1; i < chunks.length; i++) {
-							// Continuation chunks are fresh, non-editable text sends: no
-							// coalesce key (they neither replace nor are replaced by other
-							// frames) and no media payload.
-							this.pool.submit({
-								sessionId: item.sessionId,
-								lane: item.lane,
-								payload: {
-									send: {
-										...send,
-										method: "sendMessage",
-										text: chunks[i]!,
-										editable: false,
-										coalesceKey: undefined,
-										photoBase64: undefined,
-										documentBase64: undefined,
+					// Rich pre-branch: promote stable non-editable finalized text to a fresh
+					// sendRichMessage when enabled. Off/miss falls through to the unchanged
+					// upstream edit/send path, so off behavior is byte-identical.
+					if (
+						shouldPromoteRich({
+							enabled: this.opts.rich?.enabled === false ? false : true,
+							send,
+						})
+					) {
+						const sendHtmlFallback = async () => {
+							// Fairness: this frame consumed exactly one token, so send only the
+							// first HTML chunk now and requeue any continuations as their own
+							// non-editable, HTML-only pool items (rich markers stripped) — same
+							// per-token discipline as the non-rich split path.
+							const chunks = splitTelegramHtml(send.text!);
+							await this.botApi.call("sendMessage", {
+								chat_id: this.opts.chatId,
+								...threadField,
+								text: chunks[0]!,
+								parse_mode: TELEGRAM_PARSE_MODE,
+							});
+							for (let i = 1; i < chunks.length; i++) {
+								this.pool.submit({
+									sessionId: item.sessionId,
+									lane: item.lane,
+									payload: {
+										send: {
+											...send,
+											method: "sendMessage",
+											text: chunks[i]!,
+											editable: false,
+											coalesceKey: undefined,
+											photoBase64: undefined,
+											documentBase64: undefined,
+											richMarkdown: undefined,
+											richDraftMarkdown: undefined,
+											richClass: undefined,
+										},
+										topicId,
 									},
-									topicId,
-								},
+								});
+							}
+						};
+						const richMessageId = await deliverRichWithFallback(
+							this.botApi,
+							{ chat_id: this.opts.chatId, ...threadField },
+							send,
+							sendHtmlFallback,
+							logger,
+						);
+						// Index the sent rich message so an inbound reply to it can restore
+						// the original markdown as context (Telegram does not echo it back).
+						if (richMessageId !== undefined) {
+							await this.replyStore.record({
+								chatId: this.opts.chatId,
+								messageId: richMessageId,
+								text: send.richMarkdown!,
 							});
 						}
-						const firstMessageId = res?.result?.message_id;
+					} else {
+						const chunks = splitTelegramHtml(send.text);
+						const existingId = editKey ? this.liveMessages.get(editKey) : undefined;
+						let firstMessageId: number | undefined;
+						if (editKey && existingId !== undefined) {
+							// Edit the existing streamed message in place with the first chunk
+							// so a finalized turn never leaves a stale live preview. A LOCAL
+							// try/catch keeps a failed edit from aborting the continuation
+							// requeue below; "message is not modified" is a success (the message
+							// already shows this text); a missing/deleted backing message (or a
+							// transport error) resends so the first chunk is never lost.
+							let edited = false;
+							try {
+								const res = (await this.botApi.call("editMessageText", {
+									chat_id: this.opts.chatId,
+									message_id: existingId,
+									text: chunks[0],
+									parse_mode: TELEGRAM_PARSE_MODE,
+								})) as { ok?: boolean; description?: string } | null;
+								edited = res?.ok !== false || /not modified/i.test(String(res?.description ?? ""));
+							} catch {
+								edited = false;
+							}
+							if (edited) {
+								firstMessageId = existingId;
+							} else {
+								const res = (await this.botApi.call("sendMessage", {
+									chat_id: this.opts.chatId,
+									...threadField,
+									text: chunks[0]!,
+									parse_mode: TELEGRAM_PARSE_MODE,
+								})) as { result?: { message_id?: number } };
+								firstMessageId = res?.result?.message_id;
+							}
+						} else {
+							// No streamed message to edit: a single granted slot maps to a
+							// single Telegram send.
+							const res = (await this.botApi.call("sendMessage", {
+								chat_id: this.opts.chatId,
+								...threadField,
+								text: chunks[0]!,
+								parse_mode: TELEGRAM_PARSE_MODE,
+							})) as { result?: { message_id?: number } };
+							firstMessageId = res?.result?.message_id;
+						}
+						// Continuation chunks are FINALIZED-lane only. A live preview is a
+						// single edit-safe chunk (its authoritative full text arrives with the
+						// finalized frame), so a split live frame never fans out into stale,
+						// non-coalesced continuation messages. Finalized continuations are
+						// fresh, non-editable, HTML-only sends (rich markers stripped) so they
+						// can never be re-promoted to a duplicate sendRichMessage.
+						if (item.lane !== "live") {
+							for (let i = 1; i < chunks.length; i++) {
+								this.pool.submit({
+									sessionId: item.sessionId,
+									lane: item.lane,
+									payload: {
+										send: {
+											...send,
+											method: "sendMessage",
+											text: chunks[i]!,
+											editable: false,
+											coalesceKey: undefined,
+											photoBase64: undefined,
+											documentBase64: undefined,
+											richMarkdown: undefined,
+											richDraftMarkdown: undefined,
+											richClass: undefined,
+										},
+										topicId,
+									},
+								});
+							}
+						}
 						if (editKey && ckey !== undefined && firstMessageId !== undefined) {
 							this.recordLiveMessage(item.sessionId, ckey, firstMessageId);
 						}
@@ -2109,24 +2261,58 @@ export class TelegramNotificationDaemon {
 			});
 			const options = Array.isArray(msg.options) ? msg.options : [];
 			// Daemon keyboards use alias callback data with compact one-based tap targets;
-			// full option text is rendered in the message body by buildActionMessage.
+			// full option text is rendered in the message body by buildActionMessage/buildActionMarkdown.
 			const inline_keyboard = buildCompactChoiceGrid(options, (i: number) =>
 				this.aliasTable.put({ sessionId: session.sessionId, actionId: msg.id, answer: i }),
 			);
-			const chunks = splitTelegramHtml(rendered.text);
-			let result: { result?: { message_id?: number } } = {};
-			for (let i = 0; i < chunks.length; i++) {
-				result = (await this.botApi.call("sendMessage", {
-					chat_id: this.opts.chatId,
-					...threadField,
-					text: chunks[i]!,
-					parse_mode: TELEGRAM_PARSE_MODE,
-					...(i === chunks.length - 1 && inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),
-				})) as { result?: { message_id?: number } };
+			// HTML delivery: one sendMessage per chunk, keyboard on the last chunk;
+			// returns the last chunk's message_id (the reply-routable message).
+			const sendHtmlChunks = async (): Promise<number | undefined> => {
+				const chunks = splitTelegramHtml(rendered.text);
+				let result: { result?: { message_id?: number } } = {};
+				for (let i = 0; i < chunks.length; i++) {
+					result = (await this.botApi.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						...threadField,
+						text: chunks[i]!,
+						parse_mode: TELEGRAM_PARSE_MODE,
+						...(i === chunks.length - 1 && inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),
+					})) as { result?: { message_id?: number } };
+				}
+				return result.result?.message_id;
+			};
+			const kind = msg.kind === "idle" ? "idle" : "ask";
+			if (this.opts.rich?.enabled !== false) {
+				// Rich (default on): promote to sendRichMessage with a top-level
+				// reply_markup (probe-confirmed). Any miss falls back to the HTML loop.
+
+				const outcome = await deliverRichActionWithFallback(
+					this.botApi,
+					{ chat_id: this.opts.chatId, ...threadField },
+					{
+						markdown: buildActionMarkdown({
+							kind,
+							question: msg.question,
+							options: msg.options,
+							summary: msg.summary,
+						}),
+						replyMarkup: kind === "ask" && inline_keyboard.length ? { inline_keyboard } : undefined,
+						requireMessageId: kind === "ask",
+					},
+					sendHtmlChunks,
+					logger,
+				);
+				// Only asks are reply-routable; idle pings register no route.
+				if (kind === "ask" && outcome.messageId !== undefined)
+					this.messageRoutes.set(String(outcome.messageId), { sessionId: session.sessionId, actionId: msg.id });
+			} else {
+				// Off: byte-identical to the pre-rich HTML path.
+				const messageId = await sendHtmlChunks();
+				// Only asks are reply-routable; idle pings register no route (parity
+				// with the rich branch and correct even in the byte-identical off path).
+				if (kind === "ask" && messageId !== undefined)
+					this.messageRoutes.set(String(messageId), { sessionId: session.sessionId, actionId: msg.id });
 			}
-			const messageId = result.result?.message_id;
-			if (messageId !== undefined)
-				this.messageRoutes.set(String(messageId), { sessionId: session.sessionId, actionId: msg.id });
 			await this.persistAliases();
 		} else if (msg.type === "action_resolved" && msg.id) {
 			session.pending.delete(msg.id);
@@ -2182,6 +2368,65 @@ export class TelegramNotificationDaemon {
 				}
 			}
 		}
+		// Rich-message toggle (/rich on|off): daemon-local delivery policy, NOT a
+		// session config forward. Handled at paired-chat pre-routing, before threaded
+		// injection and independent of any session WebSocket, so it works even when
+		// no session is connected and never becomes an ask answer.
+		{
+			const m = (update as { update_id?: number; message?: Record<string, unknown> }).message;
+			const chat = m?.chat as { id?: unknown } | undefined;
+			const cmdText = typeof m?.text === "string" ? m.text : undefined;
+			const rawFirst = cmdText?.trim().split(/\s+/)[0]?.toLowerCase();
+			// Fail-closed: intercept ANY "/rich" or "/rich@<anything>" form (Telegram
+			// appends @botname in groups; the bot username may be unknown if getMe
+			// failed) so a rich command is never leaked into threaded injection / an
+			// ask answer. Argument validity is decided by parseRichToggleCommand below.
+			const isRichCommand = rawFirst?.split("@")[0] === "/rich";
+			if (m !== undefined && String(chat?.id) === String(this.opts.chatId) && isRichCommand) {
+				// Fail-closed: /rich mutates global config, so honor it ONLY in a PRIVATE
+				// paired chat — the same contract as session delivery and lifecycle
+				// commands. A group/supergroup chatId (legacy or hand-edited) must never
+				// let an arbitrary chat member toggle the owner's notification config.
+				if (!(await this.pairedChatIsPrivate())) return;
+				const updateId = (update as { update_id?: number }).update_id;
+				// Dedupe redelivered updates so a toggle+confirmation runs at most once.
+				if (typeof updateId === "number") {
+					if (this.dispatchState.seenUpdateIds.has(updateId)) return;
+					await this.rememberSeenUpdateId(updateId);
+				}
+				const threadField =
+					typeof m.message_thread_id === "number" ? { message_thread_id: m.message_thread_id as number } : {};
+				const reply = async (body: string): Promise<void> => {
+					try {
+						await this.botApi.call("sendMessage", {
+							chat_id: this.opts.chatId,
+							...threadField,
+							text: body,
+							parse_mode: TELEGRAM_PARSE_MODE,
+						});
+					} catch {
+						// Best-effort confirmation; never block on the notice.
+					}
+				};
+				const desired = parseRichToggleCommand(cmdText ?? "");
+				if (desired === undefined) {
+					await reply("Usage: /rich on|off");
+					return;
+				}
+				try {
+					await this.opts.settings.set("notifications.telegram.rich.enabled", desired);
+				} catch (err) {
+					logger.warn(
+						`notifications: /rich settings write failed (${err instanceof Error ? err.message : String(err)}); runtime unchanged`,
+					);
+					await reply("Rich messages: unchanged (settings write failed)");
+					return;
+				}
+				this.opts.rich = { enabled: desired };
+				await reply(desired ? "Rich messages: on" : "Rich messages: off");
+				return;
+			}
+		}
 		// Threaded injection: a free-text message in a known topic (not a button
 		// tap and not a reply to a specific ask message) injects a user turn or an
 		// in-thread config command. Fail-closed: paired chat + known topic +
@@ -2212,7 +2457,17 @@ export class TelegramNotificationDaemon {
 					const images = attachmentResult?.images ?? [];
 					const fileNotes = attachmentResult?.fileNotes ?? [];
 					const hasMedia = images.length > 0 || fileNotes.length > 0;
-					const injectedText = [inbound.text, ...fileNotes].filter(Boolean).join("\n");
+					const baseInjectedText = [inbound.text, ...fileNotes].filter(Boolean).join("\n");
+					// A reply to a rich message we sent (not an ask route) loses its original
+					// text: Telegram does not echo it in reply_to_message. Restore it from the
+					// reply index as a labeled context prefix; a miss leaves the turn unchanged.
+					const repliedOriginal =
+						typeof replyTo === "number"
+							? this.replyStore.lookup({ chatId: this.opts.chatId, messageId: replyTo })
+							: undefined;
+					const injectedText = repliedOriginal
+						? `> replied-to message:\n${repliedOriginal}\n\n${baseInjectedText}`
+						: baseInjectedText;
 					const cfg = hasMedia ? undefined : parseInThreadConfigCommand(inbound.text);
 					// A plain (non-config) message while an ask is pending for this session
 					// answers that ask as free-input — instead of starting a new user turn.
@@ -2292,6 +2547,7 @@ export class TelegramNotificationDaemon {
 					{ command: "verbose", description: "Mirror full tool output + reasoning in this thread" },
 					{ command: "lean", description: "Mirror assistant text + tool names only (default)" },
 					{ command: "redact", description: "Toggle redaction of streamed content: /redact <on|off>" },
+					{ command: "rich", description: "Toggle rich Telegram delivery: /rich <on|off>" },
 					{ command: "session_create", description: "Create a GJC session: path, worktree, or dir [--mpreset]" },
 					{ command: "session_recent", description: "List recent GJC sessions" },
 					{ command: "session_close", description: "Close a GJC-managed session" },
@@ -2322,6 +2578,7 @@ export class TelegramNotificationDaemon {
 			await this.loadAliases();
 			await this.loadTopics();
 			await this.loadSeenUpdateIds();
+			await this.replyStore.load();
 			await this.runScan();
 			// Owner-only: start the session-lifecycle control server now that
 			// ownership is confirmed (singleton-safe). Best-effort; degrades.
@@ -2342,31 +2599,30 @@ export class TelegramNotificationDaemon {
 				await this.runScan();
 				if (await this.controlStopRequested()) break;
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
-				if (this.sessions.size === 0 && !this.lifecycleControlActive) {
-					// No sessions and no lifecycle control: idle-exit on timeout.
-					if (idleElapsed) break;
-				} else {
-					// Poll getUpdates when sessions exist OR lifecycle control is active
-					// (so phone /session_* commands are received even with zero sessions).
-					// With zero sessions, still idle-exit after the timeout so the owner
-					// does not run forever; an active session resets the idle window.
-					if (this.sessions.size > 0) idleSince = this.runtime.now();
-					else if (idleElapsed) break;
-					const activePoll = this.runtime.createAbortController();
-					try {
-						await this.pollOnce(activePoll.signal);
-						this.loopBackoff.reset();
-					} catch (e) {
-						// A transient getUpdates/network failure must not kill the
-						// daemon. Back off (bounded, below the heartbeat TTL) and keep
-						// renewing ownership at the loop top.
-						const backoffMs = this.loopBackoff.next();
-						logger.warn(`notifications: getUpdates failed, backing off ${backoffMs}ms: ${String(e)}`);
-						await this.runtime.sleep(backoffMs);
-						continue;
-					} finally {
-						this.runtime.clearAbortController(activePoll);
-					}
+				if (this.sessions.size > 0) {
+					idleSince = this.runtime.now();
+				} else if (idleElapsed) {
+					// Zero sessions past the idle window: exit so the owner does not run
+					// forever. An active session resets the idle window above.
+					break;
+				}
+				// Poll getUpdates whenever the daemon owns the token — even with zero
+				// sessions and no lifecycle control — so daemon-local commands (/rich,
+				// /session_*) are always received until idle-exit.
+				const activePoll = this.runtime.createAbortController();
+				try {
+					await this.pollOnce(activePoll.signal);
+					this.loopBackoff.reset();
+				} catch (e) {
+					// A transient getUpdates/network failure must not kill the daemon.
+					// Back off (bounded, below the heartbeat TTL) and keep renewing
+					// ownership at the loop top.
+					const backoffMs = this.loopBackoff.next();
+					logger.warn(`notifications: getUpdates failed, backing off ${backoffMs}ms: ${String(e)}`);
+					await this.runtime.sleep(backoffMs);
+					continue;
+				} finally {
+					this.runtime.clearAbortController(activePoll);
 				}
 				if (await this.controlStopRequested()) break;
 				await this.runtime.sleep(10);

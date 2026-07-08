@@ -280,14 +280,18 @@ pub struct ContextUpdate {
 #[serde(rename_all = "camelCase")]
 pub struct TurnStream {
 	/// The session this chunk belongs to.
-	pub session_id:  String,
+	pub session_id:   String,
 	/// Whether this is a live (throttled) edit or the finalized output.
-	pub phase:       TurnPhase,
+	pub phase:        TurnPhase,
 	/// The rendered text for this chunk.
-	pub text:        String,
+	pub text:         String,
+	/// True only for the distinct final-answer chunk of a turn (never for
+	/// pre-ask lead-ins); consumers treat absence as false.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub final_answer: Option<bool>,
 	/// Opaque ref to coalesce live edits onto one rendered message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub message_ref: Option<String>,
+	pub message_ref:  Option<String>,
 }
 
 /// An agent-produced image artifact for a session thread.
@@ -689,14 +693,16 @@ mod tests {
 	#[test]
 	fn turn_stream_phase_serializes_snake_case() {
 		let msg = ServerMessage::TurnStream(TurnStream {
-			session_id:  "sess-1".into(),
-			phase:       TurnPhase::Finalized,
-			text:        "final output".into(),
-			message_ref: Some("m-7".into()),
+			session_id:   "sess-1".into(),
+			phase:        TurnPhase::Finalized,
+			text:         "final output".into(),
+			final_answer: Some(true),
+			message_ref:  Some("m-7".into()),
 		});
 		let v = serde_json::to_value(&msg).unwrap();
 		assert_eq!(v["type"], "turn_stream");
 		assert_eq!(v["phase"], "finalized");
+		assert_eq!(v["finalAnswer"], true);
 		assert_eq!(v["messageRef"], "m-7");
 	}
 

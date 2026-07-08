@@ -38,6 +38,13 @@ export interface ThreadedSend {
 	 * message. Set for streamed turn frames so live + finalized share one message.
 	 */
 	editable?: boolean;
+	/** Rich message class metadata. Only finalized final-answer sends are ever
+	 * rich-promoted; the daemon gate (`shouldPromoteRich`) requires exactly this. */
+	richClass?: "final";
+	/** Rich final-answer markdown (raw). Delivery marker derived ONLY from a frame's `finalAnswer` bit; never inferred from `phase`. */
+	richMarkdown?: string;
+	/** Live-turn raw markdown for opt-in draft streaming (set ONLY on non-finalized turn frames; never triggers rich-final promotion, which requires `lane === "finalized"`). */
+	richDraftMarkdown?: string;
 }
 
 interface ThreadedFrame {
@@ -58,6 +65,7 @@ interface ThreadedFrame {
 	cwd?: unknown;
 	// turn_stream
 	phase?: unknown;
+	finalAnswer?: boolean;
 	text?: unknown;
 	messageRef?: unknown;
 	// image_attachment / file_attachment
@@ -161,6 +169,16 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 				text,
 				coalesceKey,
 				editable: coalesceKey !== undefined,
+				// Rich-final markers are set ONLY on a non-editable finalized final
+				// (no messageRef / coalesceKey). A streamed (editable) final owns a live
+				// message edited in place, so it is never rich-promoted and carries no
+				// rich marker to leak into split continuations.
+				richClass: frame.finalAnswer === true && coalesceKey === undefined ? "final" : undefined,
+				richMarkdown: frame.finalAnswer === true && coalesceKey === undefined ? raw : undefined,
+				// Live-only draft marker: carries the RAW markdown on non-finalized turn
+				// frames so the opt-in draft gate has the source. It never arms rich-final
+				// promotion (shouldPromoteRich requires lane === "finalized").
+				richDraftMarkdown: finalized ? undefined : raw,
 			};
 		}
 		case "image_attachment": {
@@ -193,7 +211,11 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 			const redact = typeof frame.redact === "boolean" ? `redact ${frame.redact ? "on" : "off"}` : undefined;
 			const parts = [verbosity ? `verbosity ${verbosity}` : undefined, redact].filter(Boolean);
 			return parts.length
-				? { method: "sendMessage", lane: "idle", text: finalizeTelegramHtml(`⚙ ${escapeHtml(parts.join(", "))}`) }
+				? {
+						method: "sendMessage",
+						lane: "idle",
+						text: finalizeTelegramHtml(`⚙ ${escapeHtml(parts.join(", "))}`),
+					}
 				: undefined;
 		}
 		default:
