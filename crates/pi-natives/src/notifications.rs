@@ -49,27 +49,31 @@ pub struct ReplyEvent {
 	pub idempotency_key: Option<String>,
 }
 
-/// An inbound message forwarded to the TypeScript host: a free-text injection
-/// (`user_message`) or an in-thread config command (`config_command`).
+/// An inbound message forwarded to the TypeScript host: a free-text injection,
+/// in-thread config command, or deterministic control command.
 #[napi(object)]
 pub struct InboundEvent {
-	/// Either `"user_message"` or `"config_command"`.
-	pub kind:       String,
+	/// Inbound kind (`user_message`, `config_command`, or `control_command`).
+	pub kind:         String,
 	/// The session this inbound belongs to.
-	pub session_id: String,
+	pub session_id:   String,
 	/// Free-text body (`user_message` only).
-	pub text:       Option<String>,
+	pub text:         Option<String>,
 	/// Telegram update id for dedupe (`user_message` only).
-	pub update_id:  Option<i64>,
+	pub update_id:    Option<i64>,
 	/// Originating thread/topic id (`user_message` only).
-	pub thread_id:  Option<String>,
+	pub thread_id:    Option<String>,
 	/// Requested verbosity `"lean"|"verbose"` (`config_command` only).
-	pub verbosity:  Option<String>,
+	pub verbosity:    Option<String>,
 	/// Requested redaction state (`config_command` only).
-	pub redact:     Option<bool>,
+	pub redact:       Option<bool>,
+	/// Client-generated request id (`control_command` only).
+	pub request_id:   Option<String>,
+	/// JSON-encoded command payload (`control_command` only).
+	pub command_json: Option<String>,
 	/// Inline image attachments forwarded with the message (`user_message`
 	/// only).
-	pub images:     Option<Vec<InboundImageEvent>>,
+	pub images:       Option<Vec<InboundImageEvent>>,
 }
 
 /// One inline image attachment forwarded with an inbound user message.
@@ -179,12 +183,12 @@ impl NotificationServer {
 				while let Some(msg) = rx.recv().await {
 					let event = match msg {
 						ClientMessage::UserMessage(u) => InboundEvent {
-							kind:       "user_message".to_owned(),
-							session_id: u.session_id,
-							text:       Some(u.text),
-							update_id:  u.update_id,
-							thread_id:  u.thread_id,
-							images:     if u.images.is_empty() {
+							kind:         "user_message".to_owned(),
+							session_id:   u.session_id,
+							text:         Some(u.text),
+							update_id:    u.update_id,
+							thread_id:    u.thread_id,
+							images:       if u.images.is_empty() {
 								None
 							} else {
 								Some(
@@ -194,21 +198,39 @@ impl NotificationServer {
 										.collect(),
 								)
 							},
-							verbosity:  None,
-							redact:     None,
+							verbosity:    None,
+							redact:       None,
+							request_id:   None,
+							command_json: None,
 						},
 						ClientMessage::ConfigCommand(c) => InboundEvent {
-							kind:       "config_command".to_owned(),
-							session_id: c.session_id,
-							text:       None,
-							update_id:  None,
-							thread_id:  None,
-							verbosity:  c.verbosity.map(|v| match v {
+							kind:         "config_command".to_owned(),
+							session_id:   c.session_id,
+							text:         None,
+							update_id:    None,
+							thread_id:    None,
+							verbosity:    c.verbosity.map(|v| match v {
 								Verbosity::Lean => "lean".to_owned(),
 								Verbosity::Verbose => "verbose".to_owned(),
 							}),
-							redact:     c.redact,
-							images:     None,
+							redact:       c.redact,
+							request_id:   None,
+							command_json: None,
+							images:       None,
+						},
+						ClientMessage::ControlCommand(c) => InboundEvent {
+							kind:         "control_command".to_owned(),
+							session_id:   c.session_id,
+							text:         None,
+							update_id:    c.update_id,
+							thread_id:    c.thread_id,
+							verbosity:    None,
+							redact:       None,
+							request_id:   Some(c.request_id),
+							command_json: Some(
+								serde_json::to_string(&c.command).unwrap_or_else(|_| "null".to_owned()),
+							),
+							images:       None,
 						},
 						_ => continue,
 					};

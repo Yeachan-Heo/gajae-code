@@ -77,6 +77,9 @@ interface ThreadedFrame {
 	// config_update
 	verbosity?: unknown;
 	redact?: unknown;
+	// control_command_result
+	status?: unknown;
+	message?: unknown;
 }
 
 function str(v: unknown): string | undefined {
@@ -217,6 +220,17 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 						text: finalizeTelegramHtml(`⚙ ${escapeHtml(parts.join(", "))}`),
 					}
 				: undefined;
+		}
+		case "control_command_result": {
+			const message = str(frame.message);
+			if (!message) return undefined;
+			const status = str(frame.status);
+			const prefix = status === "ok" ? "✅" : status === "unavailable" ? "⚠️" : "❌";
+			return {
+				method: "sendMessage",
+				lane: "idle",
+				text: finalizeTelegramHtml(`${prefix} ${escapeHtml(truncate(message, 1200))}`),
+			};
 		}
 		default:
 			return undefined;

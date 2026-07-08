@@ -135,6 +135,17 @@ describe("renderThreadedFrame", () => {
 		expect(send?.text).toContain("redact off");
 	});
 
+	test("control_command_result renders escaped status output", () => {
+		const send = renderThreadedFrame({
+			type: "control_command_result",
+			sessionId: "s",
+			status: "ok",
+			message: "Context: <25>/100 (25.0%)",
+		});
+		expect(send?.lane).toBe("idle");
+		expect(send?.text).toContain("✅ Context: &lt;25&gt;/100 (25.0%)");
+	});
+
 	test("unknown frame types render nothing", () => {
 		expect(renderThreadedFrame({ type: "some_future_frame", sessionId: "s" })).toBeUndefined();
 		expect(renderThreadedFrame({ sessionId: "s" })).toBeUndefined();

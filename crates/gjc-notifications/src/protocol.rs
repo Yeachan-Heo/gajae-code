@@ -182,6 +182,8 @@ pub enum ServerMessage {
 	/// Session endpoint teardown signal for clients that maintain per-session
 	/// surfaces.
 	SessionClosed(SessionClosed),
+	/// Result of a deterministic transport control command.
+	ControlCommandResult(ControlCommandResult),
 	/// Application-level liveness response to a client ping.
 	Pong(Pong),
 	/// Forward-compat: an unrecognized frame type. Tolerated, never emitted.
@@ -201,6 +203,8 @@ pub enum ClientMessage {
 	UserMessage(UserMessage),
 	/// An in-thread configuration command (verbosity/redact toggles).
 	ConfigCommand(ConfigCommand),
+	/// A deterministic transport control command from a client.
+	ControlCommand(ControlCommand),
 	/// Application-level liveness ping from a client.
 	Ping(Ping),
 	/// Forward-compat: an unrecognized frame type. Tolerated, ignored.
@@ -433,6 +437,55 @@ pub struct ConfigCommand {
 	/// Requested redaction state, if changing.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub redact:     Option<bool>,
+}
+
+/// A deterministic transport control command forwarded to the host session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlCommand {
+	/// The session to control.
+	pub session_id: String,
+	/// The per-session token authorizing this client.
+	pub token:      String,
+	/// Client-generated request id, echoed in the result.
+	pub request_id: String,
+	/// Telegram update id for inbound dedupe/idempotency.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub update_id:  Option<i64>,
+	/// Originating thread/topic id, for fail-closed routing.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub thread_id:  Option<String>,
+	/// Command payload as a small JSON object owned by the TypeScript executor.
+	pub command:    serde_json::Value,
+}
+
+/// Result status for a transport control command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlCommandStatus {
+	/// Command completed successfully.
+	Ok,
+	/// Command was syntactically invalid or unsupported.
+	Error,
+	/// The target session/control surface is unavailable.
+	Unavailable,
+}
+
+/// Result of a deterministic transport control command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlCommandResult {
+	/// The session this result belongs to.
+	pub session_id: String,
+	/// Client request id being answered.
+	pub request_id: String,
+	/// Telegram update id this result corresponds to, when known.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub update_id:  Option<i64>,
+	/// Terminal command status.
+	pub status:     ControlCommandStatus,
+	/// Short deterministic Telegram-visible text.
+	pub message:    String,
 }
 
 /// Agent loop activity state, driving the client's live typing indicator.
@@ -820,6 +873,39 @@ mod tests {
 			},
 			other => panic!("expected config_command, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn control_command_parses() {
+		let raw = r#"{"type":"control_command","sessionId":"s1","token":"t","requestId":"r1","updateId":42,"threadId":"topic-9","command":{"name":"context"}}"#;
+		let msg: ClientMessage = serde_json::from_str(raw).unwrap();
+		match msg {
+			ClientMessage::ControlCommand(c) => {
+				assert_eq!(c.session_id, "s1");
+				assert_eq!(c.request_id, "r1");
+				assert_eq!(c.update_id, Some(42));
+				assert_eq!(c.thread_id.as_deref(), Some("topic-9"));
+				assert_eq!(c.command["name"], "context");
+			},
+			other => panic!("expected control_command, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn control_command_result_serializes() {
+		let msg = ServerMessage::ControlCommandResult(ControlCommandResult {
+			session_id: "s1".into(),
+			request_id: "r1".into(),
+			update_id:  Some(42),
+			status:     ControlCommandStatus::Ok,
+			message:    "Context: 1/2 (50.0%)".into(),
+		});
+		let v = serde_json::to_value(&msg).unwrap();
+		assert_eq!(v["type"], "control_command_result");
+		assert_eq!(v["sessionId"], "s1");
+		assert_eq!(v["requestId"], "r1");
+		assert_eq!(v["updateId"], 42);
+		assert_eq!(v["status"], "ok");
 	}
 
 	#[test]

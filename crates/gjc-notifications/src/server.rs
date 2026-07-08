@@ -444,6 +444,12 @@ where
 			}
 			return true;
 		},
+		ClientMessage::ControlCommand(c) => {
+			if tokens_match(&c.token, &state.token) {
+				let _ = state.inbound_tx.send(ClientMessage::ControlCommand(c));
+			}
+			return true;
+		},
 		ClientMessage::Ping(p) => {
 			return send_msg(write, &ServerMessage::Pong(Pong { nonce: p.nonce }))
 				.await
@@ -938,6 +944,42 @@ mod tests {
 				assert_eq!(u.thread_id.as_deref(), Some("topic-1"));
 			},
 			other => panic!("expected user_message, got {other:?}"),
+		}
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn inbound_control_command_forwards_to_host() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut inbound = handle.take_inbound_receiver().expect("inbound rx");
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		wait_for_clients(&handle, 1).await;
+		ws.send(Message::Text(
+			serde_json::to_string(&ClientMessage::ControlCommand(crate::protocol::ControlCommand {
+				session_id: "s".into(),
+				token:      "secret".into(),
+				request_id: "r1".into(),
+				update_id:  Some(8),
+				thread_id:  Some("topic-1".into()),
+				command:    serde_json::json!({ "name": "context" }),
+			}))
+			.unwrap()
+			.into(),
+		))
+		.await
+		.unwrap();
+		let got = tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv())
+			.await
+			.expect("inbound timed out")
+			.expect("inbound channel closed");
+		match got {
+			ClientMessage::ControlCommand(c) => {
+				assert_eq!(c.request_id, "r1");
+				assert_eq!(c.update_id, Some(8));
+				assert_eq!(c.command["name"], "context");
+			},
+			other => panic!("expected control_command, got {other:?}"),
 		}
 		handle.stop();
 	}
