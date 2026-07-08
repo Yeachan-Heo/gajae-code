@@ -67,7 +67,9 @@ describe("Extragoal skill template", () => {
 		const template = await Bun.file(path.join(repoRoot, "docs", "extragoal-skill-template.md")).text();
 
 		expect(template).toContain("### Maximalist — N-of-N external reviewers");
-		expect(template).toContain("The Extragoal leader is an LLM interpreting this checklist as prompt policy; there is no compiled parser.");
+		expect(template).toContain(
+			"The Extragoal leader is an LLM interpreting this checklist as prompt policy; there is no compiled parser.",
+		);
 		expect(template).toContain("anthropic/claude-fable-5:xhigh");
 		expect(template).toContain("- [ ] anthropic/claude-fable-5:xhigh — default OFF");
 		expect(template).toContain("- [x] codex-xhigh — enabled by default");
@@ -75,6 +77,8 @@ describe("Extragoal skill template", () => {
 		expect(template).toContain("same immutable bundle");
 		expect(template).toContain("mechanically AND-gate");
 		expect(template).toContain("round fails closed");
+		expect(template).toContain("zero checked reviewers is malformed and fails closed before launch");
+		expect(template).toContain("a finding-bearing `APPROVE` with any unresolved `CRITICAL`/`HIGH` is malformed");
 		expect(template).toContain("dedupe");
 		expect(template).toContain("reference adapter only");
 		expect(template).toContain("No browser automation, Playwright, or Repomix dependency is added to GJC core");

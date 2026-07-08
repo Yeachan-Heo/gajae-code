@@ -173,12 +173,12 @@ This lane is **optional and operator-local**: the default gate remains the singl
 
 The Extragoal leader is an LLM interpreting this checklist as prompt policy; there is no compiled parser. Editing a checkbox changes which reviewers the leader launches, and nothing else.
 
-**N-of-N orchestration (prescriptive).** In a single round the leader must:
+**N-of-N orchestration (prescriptive).** A round with **zero checked reviewers is malformed and fails closed before launch** — the maximalist lane requires at least one configured reviewer and never vacuously passes. Otherwise, in a single round the leader must:
 
 1. launch all checked reviewers concurrently against the **same immutable bundle** — identical bundle paths and head SHA for every reviewer, never re-bundled mid-round,
 2. wait for **ALL** configured reviewers to return (no early exit on the first verdict),
 3. parse each reviewer's final non-empty line, then
-4. **mechanically AND-gate** the parsed verdicts: all `APPROVE` → the round passes; any `REQUEST_CHANGES` → merge every reviewer's findings into one deduped triage; any unparsable, missing, or timed-out output → the round fails closed.
+4. **mechanically AND-gate** the parsed verdicts: the round passes only when **every** configured reviewer returns a valid `APPROVE` **and** every finding it emitted is absent or explicitly triaged under the base gate's disposition rules (fixed, or rebutted-and-not-reasserted; silent drops forbidden) — a finding-bearing `APPROVE` with any unresolved `CRITICAL`/`HIGH` is malformed and fails closed. Any `REQUEST_CHANGES` → merge every reviewer's findings into one deduped triage; any unparsable, missing, or timed-out output → the round fails closed.
 
 **Dedupe rule.** When merging findings across reviewers, normalize each finding on file path, line/range, severity, and message/category; collapse matches into a single triage entry that **preserves the raw findings verbatim and records merged provenance** — every reviewer that reported the issue — so no reviewer's signal is silently dropped.
 
