@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { parseInThreadConfigCommand, parseRichToggleCommand } from "../src/notifications/config-commands";
+import {
+	parseInThreadConfigCommand,
+	parseRichToggleCommand,
+	parseTelegramControlCommand,
+} from "../src/notifications/config-commands";
 
 describe("parseInThreadConfigCommand", () => {
 	test("/verbose and /lean toggle verbosity", () => {
@@ -65,5 +69,56 @@ describe("parseRichToggleCommand", () => {
 		expect(parseRichToggleCommand("/verbose")).toBeUndefined();
 		expect(parseRichToggleCommand("rich on")).toBeUndefined();
 		expect(parseRichToggleCommand("")).toBeUndefined();
+	});
+});
+
+describe("parseTelegramControlCommand", () => {
+	test("parses command roots and bot suffixes", () => {
+		expect(parseTelegramControlCommand("/context@GajaeCodeBot", "GajaeCodeBot")).toEqual({
+			kind: "command",
+			command: { name: "context" },
+		});
+		expect(parseTelegramControlCommand("/usage", "GajaeCodeBot")).toEqual({
+			kind: "command",
+			command: { name: "usage" },
+		});
+		expect(parseTelegramControlCommand("/compact keep architecture notes", "GajaeCodeBot")).toEqual({
+			kind: "command",
+			command: { name: "compact", instructions: "keep architecture notes" },
+		});
+	});
+
+	test("parses reasoning status, cycle, and levels", () => {
+		expect(parseTelegramControlCommand("/reasoning")).toEqual({
+			kind: "command",
+			command: { name: "reasoning", action: "status" },
+		});
+		expect(parseTelegramControlCommand("/reasoning cycle")).toEqual({
+			kind: "command",
+			command: { name: "reasoning", action: "cycle" },
+		});
+		expect(parseTelegramControlCommand("/reasoning HIGH")).toEqual({
+			kind: "command",
+			command: { name: "reasoning", action: "set", level: "high" },
+		});
+	});
+
+	test("recognized invalid forms fail closed", () => {
+		expect(parseTelegramControlCommand("/usage now")).toMatchObject({ kind: "invalid", commandName: "usage" });
+		expect(parseTelegramControlCommand("/context extra")).toMatchObject({ kind: "invalid", commandName: "context" });
+		expect(parseTelegramControlCommand("/reasoning enormous")).toMatchObject({
+			kind: "invalid",
+			commandName: "reasoning",
+		});
+	});
+
+	test("unknown commands and wrong bot suffix fall through", () => {
+		expect(parseTelegramControlCommand("/unknown")).toEqual({ kind: "none" });
+		expect(parseTelegramControlCommand("/context@OtherBot", "GajaeCodeBot")).toEqual({
+			kind: "ignored",
+			commandName: "context",
+		});
+		expect(parseTelegramControlCommand("/context@OtherBot")).toEqual({ kind: "ignored", commandName: "context" });
+		expect(parseTelegramControlCommand("plain text")).toEqual({ kind: "none" });
 	});
 });

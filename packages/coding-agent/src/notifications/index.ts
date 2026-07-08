@@ -24,11 +24,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger, postmortem } from "@gajae-code/utils";
 import { Settings } from "../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../extensibility/extensions";
+import { parseThinkingLevel } from "../thinking";
 import { registerAskAnswerSource } from "../tools/ask-answer-registry";
 import { registerTelegramFileSink } from "./attachment-registry";
 import {
@@ -485,6 +487,121 @@ function mapAnswerToGate(
 	return { selected: [] };
 }
 
+interface NotificationControlCommandPayload {
+	name?: unknown;
+	action?: unknown;
+	level?: unknown;
+	instructions?: unknown;
+}
+
+function parseControlCommandPayload(json: string | undefined): NotificationControlCommandPayload | undefined {
+	if (!json) return undefined;
+	try {
+		const parsed = JSON.parse(json) as unknown;
+		return parsed && typeof parsed === "object" ? (parsed as NotificationControlCommandPayload) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function formatCompactTokenCount(value: number | null | undefined): string {
+	if (value == null) return "unknown";
+	if (value >= 1_000_000) return `${Number((value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1))}m`;
+	if (value >= 1_000) return `${Number((value / 1_000).toFixed(value % 1_000 === 0 ? 0 : 1))}k`;
+	return value.toLocaleString();
+}
+
+function formatContextUsageLine(ctx: ExtensionContext): string {
+	const usage = ctx.getContextUsage();
+	if (!usage) return "Context usage unavailable.";
+	const tokens = formatCompactTokenCount(usage.tokens);
+	const window = formatCompactTokenCount(usage.contextWindow);
+	const pct = usage.percent == null ? "unknown" : `${usage.percent.toFixed(1)}%`;
+	return `Context: ${tokens}/${window} ${pct}`;
+}
+
+function formatLocalUsage(ctx: ExtensionContext): string {
+	const stats = ctx.sessionManager.getUsageStatistics();
+	return [
+		"Usage",
+		`Input tokens: ${stats.input}`,
+		`Output tokens: ${stats.output}`,
+		`Cache read tokens: ${stats.cacheRead}`,
+		`Cache write tokens: ${stats.cacheWrite}`,
+		`Premium requests: ${stats.premiumRequests}`,
+		`Cost: $${stats.cost.toFixed(6)}`,
+	].join("\n");
+}
+
+function cycleTelegramThinking(api: ExtensionAPI): ThinkingLevel | undefined {
+	const levels = [
+		ThinkingLevel.Off,
+		ThinkingLevel.Minimal,
+		ThinkingLevel.Low,
+		ThinkingLevel.Medium,
+		ThinkingLevel.High,
+		ThinkingLevel.XHigh,
+		ThinkingLevel.Max,
+	];
+	const current = api.getThinkingLevel() ?? ThinkingLevel.Off;
+	const currentIndex = levels.indexOf(current as (typeof levels)[number]);
+	const next = levels[(currentIndex + 1) % levels.length];
+	if (!next) return undefined;
+	api.setThinkingLevel(next);
+	return api.getThinkingLevel() ?? next;
+}
+
+export async function executeNotificationControlCommand(
+	command: NotificationControlCommandPayload | undefined,
+	ctx: ExtensionContext,
+	api: ExtensionAPI,
+): Promise<{ status: "ok" | "error" | "unavailable"; message: string }> {
+	if (!command || typeof command.name !== "string") return { status: "error", message: "Invalid control command." };
+	switch (command.name) {
+		case "reasoning": {
+			const current = api.getThinkingLevel() ?? ThinkingLevel.Off;
+			if (command.action === "status") return { status: "ok", message: `Reasoning effort: ${current}` };
+			if (command.action === "cycle") {
+				const next = cycleTelegramThinking(api);
+				return next
+					? { status: "ok", message: `Reasoning effort set to ${next}.` }
+					: { status: "unavailable", message: "Reasoning effort unavailable for this session." };
+			}
+			if (command.action === "set" && typeof command.level === "string") {
+				const parsed = parseThinkingLevel(command.level);
+				if (!parsed) return { status: "error", message: "Invalid reasoning effort." };
+				api.setThinkingLevel(parsed);
+				return { status: "ok", message: `Reasoning effort set to ${api.getThinkingLevel() ?? ThinkingLevel.Off}.` };
+			}
+			return { status: "error", message: "Invalid reasoning command." };
+		}
+		case "usage":
+			return { status: "ok", message: formatLocalUsage(ctx) };
+		case "context":
+			return { status: "ok", message: formatContextUsageLine(ctx) };
+		case "compact": {
+			const before = ctx.getContextUsage()?.tokens;
+			try {
+				await ctx.compact(typeof command.instructions === "string" ? command.instructions : undefined);
+			} catch (err) {
+				return {
+					status: "error",
+					message: `Compaction failed: ${err instanceof Error ? err.message : String(err)}`,
+				};
+			}
+			const after = ctx.getContextUsage()?.tokens;
+			if (before != null && after != null)
+				return {
+					status: "ok",
+					message: `Compaction complete. Tokens: ${before} -> ${after} (saved ${before - after}).`,
+				};
+			return { status: "ok", message: "Compaction complete." };
+		}
+		default:
+			return { status: "error", message: "Unknown control command." };
+	}
+}
+
 /** Register the interactive `ask` answer source for a session (the ask tool
  * races the local UI against a remote reply). Returns the deregister disposer. */
 function registerInteractiveAnswerSource(
@@ -700,6 +817,38 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 						logger.warn(`notifications: config_update failed: ${String(e)}`);
 					}
 				}
+			}
+			if (inbound.kind === "control_command") {
+				if (!runtime || !inbound.requestId) return;
+				void executeNotificationControlCommand(parseControlCommandPayload(inbound.commandJson), ctx, api)
+					.then(result => {
+						runtime?.server.pushFrame(
+							JSON.stringify({
+								type: "control_command_result",
+								sessionId: id,
+								requestId: inbound.requestId,
+								updateId: inbound.updateId,
+								status: result.status,
+								message: result.message,
+							}),
+						);
+					})
+					.catch(err => {
+						try {
+							runtime?.server.pushFrame(
+								JSON.stringify({
+									type: "control_command_result",
+									sessionId: id,
+									requestId: inbound.requestId,
+									updateId: inbound.updateId,
+									status: "error",
+									message: `Control command failed: ${err instanceof Error ? err.message : String(err)}`,
+								}),
+							);
+						} catch (pushErr) {
+							logger.warn(`notifications: control_command_result failed: ${String(pushErr)}`);
+						}
+					});
 			}
 		});
 

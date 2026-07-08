@@ -9,7 +9,7 @@ import type { Settings } from "../config/settings";
 import type { DaemonRuntimeInfo } from "../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
-import { parseInThreadConfigCommand, parseRichToggleCommand } from "./config-commands";
+import { parseInThreadConfigCommand, parseRichToggleCommand, parseTelegramControlCommand } from "./config-commands";
 import { daemonPaths } from "./daemon-paths";
 import {
 	buildCompactChoiceGrid,
@@ -1565,6 +1565,7 @@ export class TelegramNotificationDaemon {
 		"image_attachment",
 		"file_attachment",
 		"config_update",
+		"control_command_result",
 	]);
 
 	private topicNameFor(sessionId: string, msg: { title?: unknown; repo?: unknown; branch?: unknown }): string {
@@ -2492,6 +2493,45 @@ export class TelegramNotificationDaemon {
 					const injectedText = repliedOriginal
 						? `> replied-to message:\n${repliedOriginal}\n\n${baseInjectedText}`
 						: baseInjectedText;
+					const control = hasMedia
+						? { kind: "none" as const }
+						: parseTelegramControlCommand(inbound.text, this.botUsername);
+					if (control.kind !== "none") {
+						await this.rememberSeenUpdateId(inbound.updateId);
+						const sendControlNotice = async (body: string): Promise<void> => {
+							try {
+								await this.botApi.call("sendMessage", {
+									chat_id: this.opts.chatId,
+									message_thread_id: Number(inbound.threadId),
+									text: body,
+									parse_mode: TELEGRAM_PARSE_MODE,
+								});
+							} catch {
+								// Best-effort control feedback; never convert to user input.
+							}
+						};
+						if (control.kind === "ignored") return;
+						if (control.kind === "invalid") {
+							await sendControlNotice(control.usage);
+							return;
+						}
+						if (session?.ws.readyState !== WebSocket.OPEN) {
+							await sendControlNotice("Session control unavailable: session is disconnected.");
+							return;
+						}
+						session.ws.send(
+							JSON.stringify({
+								type: "control_command",
+								sessionId: inbound.sessionId,
+								token: session.token,
+								requestId: `tg:${inbound.updateId}`,
+								updateId: inbound.updateId,
+								threadId: inbound.threadId,
+								command: control.command,
+							}),
+						);
+						return;
+					}
 					const cfg = hasMedia ? undefined : parseInThreadConfigCommand(inbound.text);
 					// A plain (non-config) message while an ask is pending for this session
 					// answers that ask as free-input — instead of starting a new user turn.
@@ -2581,6 +2621,10 @@ export class TelegramNotificationDaemon {
 					{ command: "lean", description: "Mirror assistant text + tool names only (default)" },
 					{ command: "redact", description: "Toggle redaction of streamed content: /redact <on|off>" },
 					{ command: "rich", description: "Toggle rich Telegram delivery: /rich <on|off>" },
+					{ command: "reasoning", description: "Show or change reasoning effort in this session" },
+					{ command: "usage", description: "Show provider/local usage for this session" },
+					{ command: "context", description: "Show current context usage for this session" },
+					{ command: "compact", description: "Compact this session: /compact [instructions]" },
 					{ command: "session_create", description: "Create a GJC session: path, worktree, or dir [--mpreset]" },
 					{ command: "session_recent", description: "List recent GJC sessions" },
 					{ command: "session_close", description: "Close a GJC-managed session" },

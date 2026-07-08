@@ -933,6 +933,122 @@ describe("telegram daemon", () => {
 		expect(sent.some(frame => frame.type === "reply")).toBe(false);
 	});
 
+	test("telegram control command forwards control_command instead of user_message", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 8,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/context", message_id: 101 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent).toContainEqual({
+			type: "control_command",
+			sessionId: "S",
+			token: "ts",
+			requestId: "tg:8",
+			updateId: 8,
+			threadId: String(threadId),
+			command: { name: "context" },
+		});
+		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
+	});
+
+	test("invalid telegram control command does not answer pending ask", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+		await daemon.handleTelegramUpdate({
+			update_id: 9,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/reasoning impossible", message_id: 102 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent.some(frame => frame.type === "reply")).toBe(false);
+		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
+		expect(
+			bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).startsWith("Usage: /reasoning")),
+		).toBe(true);
+	});
+
+	test("wrong-suffix telegram control command is consumed, not injected or ask-answered", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		Object.assign(daemon, { botUsername: "GajaeCodeBot" });
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+		bot.calls = [];
+
+		await daemon.handleTelegramUpdate({
+			update_id: 10,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/context@OtherBot", message_id: 103 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent.some(frame => frame.type === "reply")).toBe(false);
+		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
+		expect(sent.some(frame => frame.type === "control_command")).toBe(false);
+		expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
+	});
+
 	test("persisted seen update ids suppress duplicate threaded injection after restart", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
