@@ -470,6 +470,8 @@ describe("notify setup threaded mode verification", () => {
 		);
 		expect(stdout).toContain("Threaded Mode is OFF");
 		expect(stdout).toContain("@BotFather");
+		expect(stdout).toContain("Bot Settings > Threads Settings");
+		expect(stdout).toContain("inline ask buttons only");
 		expect(stdout).toContain("threaded=verified");
 		expect(calls.filter(c => c.method === "getMe")).toHaveLength(2);
 	});
@@ -497,6 +499,8 @@ describe("notify setup threaded mode verification", () => {
 		);
 		expect(stdout).toContain("continuing without verified");
 		expect(stdout).toContain("threaded=unverified");
+		expect(stdout).toContain("inline ask buttons only");
+		expect(stdout).toContain("free-text replies and session commands");
 		expect(getNotificationConfig(settings).enabled).toBe(true);
 		expect(getNotificationConfig(settings).chatId).toBe("555111");
 		expect(calls.filter(c => c.method === "getMe")).toHaveLength(1);
@@ -514,6 +518,8 @@ describe("notify setup threaded mode verification", () => {
 		);
 		expect(stdout).toContain("non-interactive");
 		expect(stdout).toContain("threaded=unverified");
+		expect(stdout).toContain("Bot Settings > Threads Settings");
+		expect(stdout).toContain("inline ask buttons only");
 		expect(calls.filter(c => c.method === "getUpdates")).toHaveLength(0);
 		expect(getNotificationConfig(settings).chatId).toBe("777");
 		expect(stdout).not.toContain(token);

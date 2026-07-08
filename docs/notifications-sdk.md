@@ -278,9 +278,11 @@ or **Threaded Mode**, the supported fallback is the normal private-chat pairing.
 Setup can be saved as `threaded=unverified`/`threaded=unknown`, and the daemon
 still tries topics when Telegram allows them. When `createForumTopic` is refused,
 the daemon does not drop the send: it routes the notification to the normal
-(flat) paired private chat and posts a one-time `turn on threaded mode from
-botfather miniapp to receive gjc notification!` nudge. Pairing is private-only,
-so flat delivery stays within the user's own private DM.
+(flat) paired private chat and posts a one-time nudge: `Flat Telegram private chat
+supports outbound notifications and inline ask buttons only. Enable Threaded Mode
+in @BotFather > Bot Settings > Threads Settings for free-text replies and session
+commands.` Pairing is private-only, so flat delivery stays within the user's own
+private DM.
 
 Supported reply paths:
 
@@ -293,11 +295,13 @@ config commands: `/verbose`, `/lean`, `/verbosity <lean|verbose>`, and
 `/redact <on|off>`. The legacy `/answer <session-tag> <answer>` command is
 removed — replies are routed by the topic they arrive in.
 
-Flat fallback keeps outbound notifications and inline-button answers working,
-but plain free-text never guesses from the global pending-ask set. Free-text
-replies and `/verbose`/`/lean`/`/verbosity`/`/redact` commands are
-thread-native and require topic routing. Do not pair a group, supergroup, or
-channel to work around a missing BotFather menu; the bundled setup flow is
+Flat fallback keeps outbound notifications and inline-button answers working, but
+plain free-text never guesses from the global pending-ask set. Free-text replies
+and `/verbose`/`/lean`/`/verbosity`/`/redact` commands are thread-native and
+require Threaded Mode/topic routing. Enable Threaded Mode in @BotFather > Bot
+Settings > Threads Settings when you need free-text replies or session commands.
+Do not pair a group, supergroup, or channel to work around a missing BotFather
+menu; the bundled setup flow is
 private-chat only, and non-private chat ids remain fail-closed to avoid session
 data leaks.
 

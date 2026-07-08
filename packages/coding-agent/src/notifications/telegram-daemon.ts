@@ -1959,7 +1959,7 @@ export class TelegramNotificationDaemon {
 		try {
 			await this.botApi.call("sendMessage", {
 				chat_id: this.opts.chatId,
-				text: "turn on threaded mode from botfather miniapp to receive gjc notification!",
+				text: "Flat Telegram private chat supports outbound notifications and inline ask buttons only. Enable Threaded Mode in @BotFather > Bot Settings > Threads Settings for free-text replies and session commands.",
 				parse_mode: TELEGRAM_PARSE_MODE,
 			});
 		} catch {

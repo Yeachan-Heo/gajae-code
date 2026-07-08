@@ -19,6 +19,9 @@ import {
 } from "../src/notifications/telegram-daemon";
 import { runDaemonInternal, runDaemonSmoke } from "../src/notifications/telegram-daemon-cli";
 
+const THREADED_FALLBACK_NOTICE =
+	"Flat Telegram private chat supports outbound notifications and inline ask buttons only. Enable Threaded Mode in @BotFather > Bot Settings > Threads Settings for free-text replies and session commands.";
+
 function tempAgentDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-daemon-test-"));
 }
@@ -1562,9 +1565,7 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 	expect(sends.length).toBeGreaterThan(0);
 	expect(sends.every(c => c.body.message_thread_id === undefined)).toBe(true);
 	// The nudge is sent exactly once with the requested copy.
-	const notices = sends.filter(c =>
-		String(c.body.text).includes("turn on threaded mode from botfather miniapp to receive gjc notification!"),
-	);
+	const notices = sends.filter(c => String(c.body.text).includes(THREADED_FALLBACK_NOTICE));
 	expect(notices).toHaveLength(1);
 	// The ask still carries its inline keyboard in flat mode.
 	const ask = sends.find(c => String(c.body.text).includes("Proceed?"));
@@ -1597,11 +1598,7 @@ test("threaded mode off: multiple sessions share a single fallback notice", asyn
 	}
 	const sends = bot.calls.filter(c => c.method === "sendMessage");
 	expect(sends.every(c => c.body.message_thread_id === undefined)).toBe(true);
-	expect(
-		sends.filter(c =>
-			String(c.body.text).includes("turn on threaded mode from botfather miniapp to receive gjc notification!"),
-		),
-	).toHaveLength(1);
+	expect(sends.filter(c => String(c.body.text).includes(THREADED_FALLBACK_NOTICE))).toHaveLength(1);
 });
 
 test("threaded mode off: image_attachment uploads flat without message_thread_id", async () => {
@@ -1635,9 +1632,7 @@ test("threaded mode off: image_attachment uploads flat without message_thread_id
 	expect(photo!.body.photo).toBe("AAAA");
 	expect(photo!.body.message_thread_id).toBeUndefined();
 	const notice = bot.calls.filter(
-		c =>
-			c.method === "sendMessage" &&
-			String(c.body.text).includes("turn on threaded mode from botfather miniapp to receive gjc notification!"),
+		c => c.method === "sendMessage" && String(c.body.text).includes(THREADED_FALLBACK_NOTICE),
 	);
 	expect(notice).toHaveLength(1);
 });

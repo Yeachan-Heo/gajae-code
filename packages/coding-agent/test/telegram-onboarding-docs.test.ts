@@ -17,11 +17,18 @@ describe("Telegram onboarding docs", () => {
 		expect(onboarding).toContain("choose `skip` in the interactive prompt");
 		expect(onboarding).toContain("continue with the saved private-chat\npairing; this is supported");
 		expect(onboarding).toContain("no paid/Stars option is required just to receive flat private-chat\nnotifications");
+		expect(onboarding).toContain("outbound notifications\nand inline ask buttons only");
+		expect(onboarding).toContain("@BotFather > Bot Settings > Threads Settings");
+		expect(onboarding).toContain("free-text replies and\nsession commands require Threaded Mode/topic routing");
 		expect(onboarding).toContain("Do not\npair a group, supergroup, or channel as a substitute");
+		expect(onboarding.toLowerCase()).not.toContain("mini" + "app");
 
 		expect(sdk).toContain("If BotFather's per-bot **Bot Settings** menu does not show **Threads Settings**");
 		expect(sdk).toContain("the supported fallback is the normal private-chat pairing");
 		expect(sdk).toContain("Flat fallback keeps outbound notifications and inline-button answers working");
-		expect(sdk).toContain("Do not pair a group, supergroup, or\nchannel to work around a missing BotFather menu");
+		expect(sdk).toContain("require Threaded Mode/topic routing");
+		expect(sdk).toContain("@BotFather > Bot\nSettings > Threads Settings");
+		expect(sdk).toContain("Do not pair a group, supergroup, or channel to work around a missing BotFather\nmenu");
+		expect(sdk.toLowerCase()).not.toContain("mini" + "app");
 	});
 });
