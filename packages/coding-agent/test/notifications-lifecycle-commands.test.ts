@@ -236,4 +236,47 @@ describe("lifecycle command parser (G009)", () => {
 		expect(amb).toContain("a");
 		expect(amb).toContain("b");
 	});
+
+	it("parses --mpreset for all create target kinds (space-separated)", () => {
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset codex-eco")).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+			modelPreset: "codex-eco",
+		});
+		expect(parseLifecycleCommand("/session_create dir /new/dir --mpreset claude-opus")).toEqual({
+			kind: "create",
+			target: { kind: "plain_dir", path: "/new/dir" },
+			modelPreset: "claude-opus",
+		});
+		expect(parseLifecycleCommand("/session_create worktree /repo feat/x --mpreset opencodego")).toEqual({
+			kind: "create",
+			target: { kind: "worktree", repo: "/repo", branch: "feat/x" },
+			modelPreset: "opencodego",
+		});
+	});
+
+	it("parses --mpreset=<name> (equals-separated) form", () => {
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset=codex-medium")).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+			modelPreset: "codex-medium",
+		});
+	});
+
+	it("omits modelPreset when --mpreset is not given", () => {
+		const out = parseLifecycleCommand("/session_create path /repo");
+		expect(out.kind).toBe("create");
+		if (out.kind === "create") {
+			expect(out.modelPreset).toBeUndefined();
+		}
+	});
+
+	it("rejects injection-shaped --mpreset values", () => {
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset 'bad;rm'").kind).toBe("reject");
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset a$(whoami)").kind).toBe("reject");
+	});
+
+	it("usage text includes --mpreset", () => {
+		expect(lifecycleUsage()).toContain("--mpreset");
+	});
 });

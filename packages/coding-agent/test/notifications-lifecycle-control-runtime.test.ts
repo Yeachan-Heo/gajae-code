@@ -113,6 +113,23 @@ describe("lifecycle control runtime", () => {
 		expect(remainingArgs).toEqual([]);
 	});
 
+	it("buildCreateArgv emits --mpreset when modelPreset is set", () => {
+		expect(
+			buildCreateArgv(createFrame({ modelPreset: "codex-eco" }), { intendedSessionId: "x" }),
+		).toEqual({ cwd: "/repo", args: ["--mpreset=codex-eco"] });
+
+		expect(
+			buildCreateArgv(
+				createFrame({ target: { kind: "worktree", repo: "/r", branch: "feat/y" }, modelPreset: "claude-opus" }),
+				{ intendedSessionId: "x" },
+			),
+		).toEqual({ cwd: "/r", args: ["--worktree=feat/y", "--mpreset=claude-opus"] });
+	});
+
+	it("buildCreateArgv omits --mpreset when modelPreset is undefined", () => {
+		expect(buildCreateArgv(createFrame(), { intendedSessionId: "x" }).args).toEqual([]);
+	});
+
 	it("outcomeToResponse maps ok create to a create_response frame", () => {
 		const entry: LedgerEntry = {
 			requestHash: "h",

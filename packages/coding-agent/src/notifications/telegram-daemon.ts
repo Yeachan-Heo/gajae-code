@@ -1120,7 +1120,7 @@ export class TelegramNotificationDaemon {
 	/** Build an authenticated lifecycle frame from a parsed command + identity. */
 	private buildLifecycleFrame(
 		parsed:
-			| { kind: "create"; target: SessionCreateTarget }
+			| { kind: "create"; target: SessionCreateTarget; modelPreset?: string }
 			| { kind: "close"; target: SessionCloseTarget }
 			| { kind: "resume"; target: SessionResumeTarget },
 		updateId: number,
@@ -1138,6 +1138,7 @@ export class TelegramNotificationDaemon {
 				chatId,
 				token,
 				target: parsed.target,
+				modelPreset: parsed.modelPreset,
 			};
 		}
 		if (parsed.kind === "close") {
@@ -2291,7 +2292,7 @@ export class TelegramNotificationDaemon {
 					{ command: "verbose", description: "Mirror full tool output + reasoning in this thread" },
 					{ command: "lean", description: "Mirror assistant text + tool names only (default)" },
 					{ command: "redact", description: "Toggle redaction of streamed content: /redact <on|off>" },
-					{ command: "session_create", description: "Create a GJC session: path, worktree, or dir" },
+					{ command: "session_create", description: "Create a GJC session: path, worktree, or dir [--mpreset]" },
 					{ command: "session_recent", description: "List recent GJC sessions" },
 					{ command: "session_close", description: "Close a GJC-managed session" },
 					{ command: "session_resume", description: "Resume or reattach a session" },

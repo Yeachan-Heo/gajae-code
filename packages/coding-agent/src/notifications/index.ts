@@ -90,6 +90,8 @@ export interface SessionCreateFrame {
 	target: SessionCreateTarget;
 	/** Reference to the daemon-written, once-consumed startup-prompt file. */
 	startupPromptRef?: string;
+	/** Model profile preset to activate for the spawned session (--mpreset). */
+	modelPreset?: string;
 }
 
 /** Close (hard-kill, history preserved) a session. */
