@@ -250,12 +250,21 @@ describe("BisectTool.execute", () => {
 		await commitFlag(repo, "PASS\n", "c1 still ok");
 		const bug = await commitFlag(repo, "FAIL\n", "c2 introduce bug");
 		await commitFlag(repo, "FAIL\n", "c3 head");
+		const originalHead = await gitRun(repo, ["rev-parse", "HEAD"]);
+		const originalBranch = await gitRun(repo, ["rev-parse", "--abbrev-ref", "HEAD"]);
 
 		// Hold the repo write lock while bisect launches: bisect checks out
 		// candidate commits and resets the tree, so it must queue behind the
-		// holder instead of mutating the repo alongside it.
+		// holder instead of mutating the repo alongside it. The `entered`
+		// handshake guarantees the holder owns the lock before execute() starts,
+		// so the test proves queuing rather than racing on timing.
+		const entered = Promise.withResolvers<void>();
 		const gate = Promise.withResolvers<void>();
-		const holder = git.withRepoLock(repo, () => gate.promise);
+		const holder = git.withRepoLock(repo, () => {
+			entered.resolve();
+			return gate.promise;
+		});
+		await entered.promise;
 
 		const execution = new BisectTool(session(repo)).execute("call", {
 			good,
@@ -265,13 +274,24 @@ describe("BisectTool.execute", () => {
 			maxSteps: 40,
 			stepTimeoutMs: 60_000,
 		});
+		let settled = false;
+		void execution.finally(() => {
+			settled = true;
+		});
 
 		try {
-			const first = await Promise.race([
-				execution.then(() => "bisect-finished"),
-				new Promise<string>(resolve => setTimeout(() => resolve("still-queued"), 750)),
-			]);
-			expect(first).toBe("still-queued");
+			// Give a mis-ordered implementation (mutate first, acquire the lock
+			// later) time to touch the repo, then assert the contract: while the
+			// holder is active, bisect has neither started (no bisect state, HEAD
+			// and worktree untouched) nor finished (a completed run would also
+			// leave a clean tree, so cleanliness alone proves nothing).
+			await new Promise(resolve => setTimeout(resolve, 750));
+			expect(settled).toBe(false);
+			expect(await gitRun(repo, ["rev-parse", "HEAD"])).toBe(originalHead);
+			expect(await gitRun(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe(originalBranch);
+			expect(await Bun.file(path.join(repo, ".git", "BISECT_START")).exists()).toBe(false);
+			expect(await Bun.file(path.join(repo, ".git", "BISECT_LOG")).exists()).toBe(false);
+			expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
 		} finally {
 			gate.resolve();
 			await holder;
@@ -280,6 +300,10 @@ describe("BisectTool.execute", () => {
 		const result = await execution;
 		expect(result.details?.concluded).toBe(true);
 		expect(result.details?.culprit).toBe(bug);
+		// The queued run still converges and restores cleanly after the holder releases.
+		expect(await gitRun(repo, ["rev-parse", "HEAD"])).toBe(originalHead);
+		expect(await Bun.file(path.join(repo, ".git", "BISECT_LOG")).exists()).toBe(false);
+		expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
 	});
 
 	it("restores the repo when invoked from a subdirectory a candidate deletes", async () => {
