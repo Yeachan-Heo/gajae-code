@@ -2213,7 +2213,11 @@ export class TelegramNotificationDaemon {
 					const fileNotes = attachmentResult?.fileNotes ?? [];
 					const hasMedia = images.length > 0 || fileNotes.length > 0;
 					const injectedText = [inbound.text, ...fileNotes].filter(Boolean).join("\n");
-					const cfg = hasMedia ? undefined : parseInThreadConfigCommand(inbound.text);
+					// Forum/supergroup chats append "@<botname>" to slash commands (e.g. "/lean@MyBot");
+					// strip it from the leading command token so /lean, /verbose, /redact work in topics.
+					const cfg = hasMedia
+						? undefined
+						: parseInThreadConfigCommand(inbound.text.replace(/^(\s*\/[A-Za-z0-9_]+)@[A-Za-z0-9_]+/, "$1"));
 					// A plain (non-config) message while an ask is pending for this session
 					// answers that ask as free-input — instead of starting a new user turn.
 					// Telegram asks always accept custom text (the SDK maps a string answer
