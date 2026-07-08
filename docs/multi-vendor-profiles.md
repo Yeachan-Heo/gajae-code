@@ -88,7 +88,7 @@ A verified use is the cross-session final review gate: the authoring session lau
 ```sh
 # the one-shot gate needs only a cross-family --model; add --mpreset reviewer as an
 # optional enhancement AFTER installing this profile in ~/.gjc/agent/models.yml:
-gjc -p --no-session --model openai-codex/gpt-5.5:high --tools read,search,find "<review prompt: diff + spec paths, severity findings, final line VERDICT: APPROVE|REQUEST_CHANGES>"
+gjc -p --no-session --model openai-codex/gpt-5.5:xhigh --tools read,search,find "<review prompt: diff + spec paths, severity findings, final line VERDICT: APPROVE|REQUEST_CHANGES>"
 ```
 
 The `--tools` allowlist is part of the contract: it enforces the reviewer's read-only boundary for the built-in tool surface instead of trusting the prompt (the runtime still injects the session `goal` tool unless `goal.enabled` is off — disabling it for the reviewer invocation is **mandatory**, via a dedicated gate directory outside the repo so the reviewed checkout stays clean, see the template — plus `generate_image` when an image credential exists). In this one-shot form the session's `default` model authors the verdict — a tool-restricted print session cannot delegate to the profile's `critic`/`architect` roles — so the explicit cross-family `--model` carries provenance, and the `reviewer` profile itself serves the interactive review-session case (activate it with `--mpreset reviewer` only after copying it into `models.yml`; otherwise activation fails with an unknown-profile error). Profile names in this document live in the user namespace — a user profile overrides a builtin preset only on an exact name match, and a future builtin with the same name would be silently shadowed by your copy.
