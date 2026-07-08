@@ -18,6 +18,7 @@ import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
+import { resolvePastedImagePath } from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
 
@@ -26,8 +27,6 @@ interface Expandable {
 }
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
-const CLIPBOARD_TEMP_IMAGE_FILE_PATTERN = /^clipboard-\d{4}-\d{2}-\d{2}-\d{6}-[A-Za-z0-9]+\.(?:png|jpe?g|gif|webp)$/i;
-const MACOS_CLIPBOARD_TEMP_DIR_PATTERN = /^\/var\/folders\/[^/]+\/[^/]+\/T$/;
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
@@ -1061,7 +1060,7 @@ export class InputController {
 	}
 
 	handleTextPaste(text: string): boolean | Promise<boolean> {
-		const imagePath = this.#getPastedImagePathCandidate(text);
+		const imagePath = resolvePastedImagePath(text, { cwd: this.ctx.sessionManager.getCwd() });
 		return imagePath ? this.#attachPastedImagePath(imagePath) : false;
 	}
 
@@ -1073,7 +1072,7 @@ export class InputController {
 				autoResize: this.ctx.settings.get("images.autoResize"),
 			});
 			if (!image) {
-				this.ctx.showStatus("Unsupported pasted clipboard image file");
+				this.ctx.showStatus("Unsupported pasted image file");
 				return true;
 			}
 
@@ -1091,18 +1090,9 @@ export class InputController {
 				this.ctx.showStatus(error.message);
 				return true;
 			}
-			this.ctx.showStatus("Failed to attach pasted clipboard image");
+			this.ctx.showStatus("Failed to attach pasted image");
 			return true;
 		}
-	}
-
-	#getPastedImagePathCandidate(text: string): string | undefined {
-		const resolvedPath = path.resolve(text.trim());
-		const parentDir = path.dirname(resolvedPath);
-		const isClipboardTempPath =
-			(parentDir === "/tmp" || MACOS_CLIPBOARD_TEMP_DIR_PATTERN.test(parentDir)) &&
-			CLIPBOARD_TEMP_IMAGE_FILE_PATTERN.test(path.basename(resolvedPath));
-		return isClipboardTempPath ? resolvedPath : undefined;
 	}
 
 	#nextImagePlaceholder(): string {
