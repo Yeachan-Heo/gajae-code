@@ -229,6 +229,68 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
 	});
 
+	it("preserves streamed tool-call arguments through Anthropic partial JSON deltas", async () => {
+		const args = {
+			command: "printf hi",
+			cwd: "/tmp/worktree",
+			timeout: 5,
+		};
+		vi.spyOn(Messages.prototype, "create").mockImplementation(
+			() =>
+				createMockRequest([
+					{
+						type: "message_start",
+						message: {
+							id: "msg_tool_args",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					},
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "tool_use", id: "tool_args", name: "bash", input: {} },
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "input_json_delta", partial_json: '{"command":"printf' },
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "input_json_delta", partial_json: ' hi","cwd":"/tmp/worktree","timeout":5}' },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "message_delta",
+						delta: { stop_reason: "tool_use" },
+						usage: { output_tokens: 7 },
+					},
+					{ type: "message_stop" },
+				]) as never,
+		);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+		const deltaEvents = events.filter(event => event.type === "toolcall_delta");
+		const endEvent = events.find(event => event.type === "toolcall_end");
+
+		expect(deltaEvents).toHaveLength(2);
+		expect(endEvent?.type).toBe("toolcall_end");
+		if (endEvent?.type !== "toolcall_end") throw new Error("Expected toolcall_end");
+		expect(endEvent.toolCall.arguments).toEqual(args);
+		expect(result.content).toEqual([{ type: "toolCall", id: "tool_args", name: "bash", arguments: args }]);
+	});
+
 	it("ignores ping before message_start and streams the response once", async () => {
 		let attempt = 0;
 		vi.spyOn(Messages.prototype, "create").mockImplementation(() => {

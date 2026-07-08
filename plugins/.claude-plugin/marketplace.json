@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "GJC delegation plugin",
-    "version": "0.9.0"
+    "version": "0.9.1"
   },
   "plugins": [
     {
       "name": "gajae-code",
       "source": "./gajae-code",
       "description": "Delegate GJC planning/execution/team workflows via coordinator MCP.",
-      "version": "0.9.0",
+      "version": "0.9.1",
       "author": {
         "name": "Gajae Code"
       },

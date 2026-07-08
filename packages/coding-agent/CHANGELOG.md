@@ -1,16 +1,37 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Finalized notification turn mirrors now default to the bounded full-turn cap so Telegram's existing chunked delivery can send long assistant answers instead of receiving an already-truncated 3500-character summary; `GJC_NOTIFICATIONS_TURN_MAX` remains available to lower the cap for summary-style mirrors, and live previews stay capped as one editable message.
+
+## [0.9.1] - 2026-07-08
 
 ### Added
 
+- Added `/effort` to show or set the current model reasoning effort, including a selector UI when run without arguments and validation for invalid effort names.
+- Added `--mpreset <profile>` option to the Telegram `/session_create` command, allowing users to specify a model profile preset when creating a session remotely (e.g. `/session_create path /repo --mpreset codex-eco`). Both `--mpreset <name>` and `--mpreset=<name>` forms are supported.
+- Pasting or drag-dropping a path to any existing image file into the interactive editor now attaches the image and inserts an `[image N]` placeholder instead of leaving the raw path in the prompt. Quoted paths, `file://` URIs, `~/` expansion, spaces, and macOS screenshot narrow no-break spaces are handled when the whole paste is a single supported image file.
+- Added `GJC_NOTIFY=off` as a per-run completion-notification opt-out.
+- Telegram mirror messages now render as native Bot API 10.1 rich messages on by default with a global `/rich on|off` toggle, while failing closed to the previous HTML path.
+
+### Changed
+
+- Upgraded the Extragoal review template with a stronger reviewer lane and optional maximalist N-of-N review recipe.
 - Added `--mpreset <profile>` option to the Telegram `/session_create` command, allowing users to specify a model profile preset when creating a session remotely (e.g. `/session_create path /repo --mpreset codex-eco`). Both `--mpreset <name>` and `--mpreset=<name>` forms are supported. The preset is passed as a regular `--mpreset` CLI flag to the spawned `gjc` child, where the existing `applyStartupModelProfiles` flow activates it.
+- Added the built-in `skill_discovery` tool for runtime discovery of custom project `.gjc/skills` and user `~/.gjc/skills` without injecting the full skill catalog into the core prompt; selected discovered skills are loaded narrowly through the existing `skill` invocation path (#1815).
 - Pasting or drag-dropping a path to any existing image file into the interactive editor now attaches the image and inserts an `[image N]` placeholder instead of leaving the raw path in the prompt. Previously this only worked for clipboard temp files (`/tmp/clipboard-*` or `/var/folders/xx/yy/T/clipboard-*`); terminal drag-drop paths — including shell-escaped spaces and the U+202F narrow no-break space in macOS screenshot names — pasted as long raw path text. Quoted paths, `file://` URIs (decoded via Node's `fileURLToPath` semantics, including Windows drive-letter, `file://localhost`, and UNC forms), and `~/` expansion are handled; the whole paste must be a single path to an existing image file whose content carries a supported image signature (PNG/JPEG/GIF/WEBP), so prose containing paths and non-image files with image-looking extensions are inserted unchanged. When attachment still fails (unsupported content, oversized image, load error), the original pasted text is replayed into the editor instead of being consumed.
 
 ### Fixed
+- Composer queue submissions (`Alt+Q` / `app.message.queue`) now force one-at-a-time follow-up delivery for those queued prompts, including replay after compaction, so they do not collapse into one batched model call even when the broader follow-up mode is set to `all`.
 
-- `gjc team` on Windows/psmux now targets the GJC-managed leader session by name instead of trusting the inherited `TMUX_PANE`. `gjc --tmux` propagates the managed session name to the child via `GJC_TMUX_ACTIVE_SESSION`, and `readCurrentTmuxLeaderContext` prefers it when resolving the leader pane. Under psmux the inherited `TMUX_PANE` can resolve to the wrong/default session, so a `ralplan -> ultragoal -> team` handoff could split/send workers into the wrong leader session; native tmux/WSL flows (no `GJC_TMUX_ACTIVE_SESSION`) keep the existing `TMUX_PANE`/ambient-session behavior (#531).
-- Kitty inline images no longer duplicate/stack or paint over transcript text when the diff renderer repaints the image line (e.g. while streaming scrolls the transcript). Image data is now uploaded once per content-derived image id (`a=t`, cursor-neutral out-of-band transmit), and the rendered line carries only a tiny placement escape (`a=p,i=,p=,C=1`) anchored to the component's first row: repaints replace/move exactly that placement without deleting sibling placements or re-sending multi-MB payloads, and the removal of the cursor-up placement trick eliminates the viewport-top clamp that painted images over transcript text (#1832).
+- `gjc team` on Windows/psmux now targets the GJC-managed leader session by name instead of trusting the inherited `TMUX_PANE`.
+- Kitty inline images no longer duplicate/stack or paint over transcript text when the diff renderer repaints the image line.
+- Session creation now forwards `--mpreset` as split argv instead of one combined argument.
+- The RPC server restores the duplicate-listen boundary error instead of masking it.
+- Mac Option+Enter no longer collides with the queue-message binding.
+- Telegram completion notifications suppress dot-only messages, and Telegram-originated input is shown immediately and recorded in prompt history.
+- The computer red-team CI gate avoids false positives from non-computer-control changes.
 
 ## [0.9.0] - 2026-07-07
 ### Added
@@ -22,6 +43,7 @@
 - Added `GJC_NOTIFICATIONS_TURN_MAX` to raise the finalized `turn_stream` text cap (default 3500 chars, unchanged) so full long turns reach split-capable clients — the Telegram daemon already fans a long finalized turn across multiple messages via `splitTelegramHtml` — instead of being truncated with an ellipsis at the notification layer. The value is clamped to a finite `[280, 40000]` range: a non-finite or non-positive value (unset, `NaN`, `Infinity`, `<= 0`) falls back to the default, so the cap can never be unbounded. Opt-in and off by default (mirror stays a glanceable per-turn summary); live in-progress frames are intentionally NOT raised so a streaming turn stays one editable preview message rather than fanning across sends.
 
 ### Fixed
+- Composer-pasted images now follow the visible `[image N]` placeholders at submit time, so deleting a pasted image placeholder with Backspace removes that attachment instead of still sending it to the model or Telegram session mirrors.
 
 - Stopped the Hindsight memory backend from injecting stale public-memory-tool guidance into the system prompt. `hindsight/backend.ts`'s `STATIC_INSTRUCTIONS` still instructed the model to "Use `recall`/`retain`/`reflect`", but those tools were removed from the public surface in #341 — they are unregistered in `BUILTIN_TOOLS`/`HIDDEN_TOOLS` and not discoverable — so every Hindsight-backed session advertised three uncallable tools in its injected `# Memory` block. #341 cleaned the local-memory prompts, public docs, and tool registry but never touched the Hindsight backend's own injected block, and its `public-memory-tool-surface.test.ts` guard list omitted `backend.ts`, so the drift went unnoticed. The block now describes the automatic recall/retain lifecycle instead of naming tools, and the regression test now guards `hindsight/backend.ts`.
 - Task subagent output-ID allocation now reserves numeric prefixes from `.jsonl` session artifacts and `.patch` sidecars as well as final `.md` outputs, preventing resumed or partial subagent runs from reusing an existing artifact stem (#1733).

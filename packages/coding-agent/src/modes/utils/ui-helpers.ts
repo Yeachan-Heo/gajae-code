@@ -36,17 +36,27 @@ interface RenderInitialMessagesOptions {
 	preserveExistingChat?: boolean;
 }
 
+function cloneRenderArgs(args: Record<string, unknown>): Record<string, unknown> {
+	try {
+		return structuredClone(args);
+	} catch {
+		return { ...args };
+	}
+}
+
 export function argsWithPartialJson(args: unknown, partialJson: unknown): unknown {
 	if (typeof partialJson !== "string" || !args || typeof args !== "object" || Array.isArray(args)) return args;
-	// Non-enumerable so the transient streaming buffer reaches renderers via direct
-	// property read but never serializes into persisted/wire message content.
-	Object.defineProperty(args, "__partialJson", {
+	// Keep the transient streaming buffer on a renderer-only snapshot. The live
+	// assistant message args are later validated/executed, so UI-only metadata or
+	// renderer mutations must never share that object reference.
+	const renderArgs = cloneRenderArgs(args as Record<string, unknown>);
+	Object.defineProperty(renderArgs, "__partialJson", {
 		value: partialJson,
 		enumerable: false,
 		configurable: true,
 		writable: true,
 	});
-	return args;
+	return renderArgs;
 }
 
 type QueuedMessages = {
@@ -741,7 +751,11 @@ export class UiHelpers {
 	}
 
 	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.ctx.compactionQueuedMessages.push({ text, mode } as CompactionQueuedMessage);
+		const entry: CompactionQueuedMessage = { text, mode };
+		if (mode === "followUp") {
+			entry.followUpQueuePolicy = "sequential";
+		}
+		this.ctx.compactionQueuedMessages.push(entry);
 		this.ctx.editor.addToHistory(text);
 		this.ctx.editor.setText("");
 		this.ctx.updatePendingMessagesDisplay();
@@ -753,6 +767,11 @@ export class UiHelpers {
 
 	#isCompactionCommandMessage(text: string): boolean {
 		return this.#hasSkillInvocations(text) || this.isKnownSlashCommand(text);
+	}
+
+	#compactionFollowUpQueuePolicy(message: CompactionQueuedMessage): "sequential" | undefined {
+		if (message.mode !== "followUp") return undefined;
+		return message.followUpQueuePolicy ?? "sequential";
 	}
 
 	async #deliverQueuedSkillMessage(message: CompactionQueuedMessage): Promise<boolean> {
@@ -797,6 +816,13 @@ export class UiHelpers {
 				continue;
 			}
 
+			const promptOptions =
+				message.mode === "followUp"
+					? {
+							streamingBehavior: message.mode,
+							followUpQueuePolicy: this.#compactionFollowUpQueuePolicy(message),
+						}
+					: { streamingBehavior: message.mode };
 			await this.ctx.session.promptCustomMessage(
 				{
 					customType: SKILL_PROMPT_MESSAGE_TYPE,
@@ -805,7 +831,7 @@ export class UiHelpers {
 					details,
 					attribution: "user",
 				},
-				{ streamingBehavior: message.mode },
+				promptOptions,
 			);
 		}
 
@@ -825,7 +851,11 @@ export class UiHelpers {
 			return;
 		}
 		await this.ctx.withLocalSubmission(message.text, () =>
-			message.mode === "followUp" ? this.ctx.session.followUp(message.text) : this.ctx.session.steer(message.text),
+			message.mode === "followUp"
+				? this.ctx.session.followUp(message.text, undefined, {
+						followUpQueuePolicy: this.#compactionFollowUpQueuePolicy(message),
+					})
+				: this.ctx.session.steer(message.text),
 		);
 	}
 
@@ -916,14 +946,17 @@ export class UiHelpers {
 			// `restoreQueue` rather than rethrown, so we use the primitive
 			// recordLocalSubmission and dispose manually in the catch.
 			const disposeFirstPrompt = this.ctx.recordLocalSubmission(firstPrompt.text);
-			const promptPromise = this.ctx.session
-				.prompt(firstPrompt.text, {
-					streamingBehavior: firstPrompt.mode === "followUp" ? "followUp" : "steer",
-				})
-				.catch((error: unknown) => {
-					disposeFirstPrompt();
-					restoreQueue(error);
-				});
+			const firstPromptOptions =
+				firstPrompt.mode === "followUp"
+					? {
+							streamingBehavior: "followUp" as const,
+							followUpQueuePolicy: this.#compactionFollowUpQueuePolicy(firstPrompt),
+						}
+					: { streamingBehavior: "steer" as const };
+			const promptPromise = this.ctx.session.prompt(firstPrompt.text, firstPromptOptions).catch((error: unknown) => {
+				disposeFirstPrompt();
+				restoreQueue(error);
+			});
 
 			for (const message of rest) {
 				await this.#deliverQueuedMessage(message);

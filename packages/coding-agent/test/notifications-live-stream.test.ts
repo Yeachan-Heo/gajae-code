@@ -295,9 +295,9 @@ test("a finalized turn frame without a messageRef posts a fresh message (no in-p
 	expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("All done"))).toBe(true);
 });
 // ---------------------------------------------------------------------------
-// 4) Finalized turn-text cap: default keeps the mirror a glanceable summary;
-//    GJC_NOTIFICATIONS_TURN_MAX raises it so full turns reach split-capable
-//    clients (Telegram daemon / Slack bridge) instead of being truncated.
+// 4) Finalized turn-text cap: default lets full turns reach split-capable
+//    clients (Telegram daemon / Slack bridge) instead of being truncated;
+//    GJC_NOTIFICATIONS_TURN_MAX can lower the cap for summary-style mirrors.
 // ---------------------------------------------------------------------------
 
 const longAssistantTurn = (chars: number) => ({
@@ -317,16 +317,16 @@ async function finalizedTextFor(
 	return frames.find(f => f.type === "turn_stream" && f.phase === "finalized")!.text ?? "";
 }
 
-test("finalized turn text is capped at 3500 chars by default (mirror stays a summary)", async () => {
+test("finalized turn text defaults to full-turn delivery for split-capable clients", async () => {
 	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1" });
-	expect(text.length).toBeLessThanOrEqual(3500);
-	expect(text.endsWith("…")).toBe(true); // truncated with an ellipsis
-});
-
-test("GJC_NOTIFICATIONS_TURN_MAX raises the finalized cap for full-turn delivery", async () => {
-	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TURN_MAX: "40000" });
 	expect(text.length).toBe(5000); // full turn, untruncated
 	expect(text.endsWith("…")).toBe(false);
+});
+
+test("GJC_NOTIFICATIONS_TURN_MAX can lower the finalized cap for summary mirrors", async () => {
+	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TURN_MAX: "3500" });
+	expect(text.length).toBeLessThanOrEqual(3500);
+	expect(text.endsWith("…")).toBe(true); // truncated with an ellipsis
 });
 
 test("GJC_NOTIFICATIONS_TURN_MAX is clamped to a finite ceiling (never unbounded)", async () => {
@@ -335,10 +335,10 @@ test("GJC_NOTIFICATIONS_TURN_MAX is clamped to a finite ceiling (never unbounded
 	expect(text.endsWith("…")).toBe(true); // still truncated at the ceiling
 });
 
-test("non-finite GJC_NOTIFICATIONS_TURN_MAX falls back to the 3500 default", async () => {
+test("non-finite GJC_NOTIFICATIONS_TURN_MAX falls back to the full-turn ceiling", async () => {
 	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TURN_MAX: "Infinity" });
-	expect(text.length).toBeLessThanOrEqual(3500); // Infinity is rejected, default applies
-	expect(text.endsWith("…")).toBe(true);
+	expect(text.length).toBe(5000); // invalid env does not force summary truncation
+	expect(text.endsWith("…")).toBe(false);
 });
 
 test("live frames are NOT raised by the turn cap (stay one editable preview)", async () => {
@@ -353,4 +353,41 @@ test("live frames are NOT raised by the turn cap (stay one editable preview)", a
 	await waitFor(() => frames.some(f => f.type === "turn_stream" && f.phase === "live"), 3000, "live frame");
 	const live = frames.find(f => f.type === "turn_stream" && f.phase === "live")!;
 	expect(live.text!.length).toBeLessThanOrEqual(3500); // live preview stays capped regardless of TURN_MAX
+});
+
+// Pro round-6 regression: a live (editable) frame whose HTML splits must NOT fan
+// out into stale non-coalesced continuation messages. The daemon edits the one
+// streamed message with a single edit-safe preview chunk; the full authoritative
+// text arrives with the finalized frame.
+test("a split live preview edits one message and never fans out continuation sends", async () => {
+	const { daemon, bot, session } = await bootDaemon();
+	// First live frame creates the streamed message.
+	await daemon.handleSessionMessage(session as never, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "live",
+		text: "seed",
+		messageRef: "1",
+	});
+	bot.calls.length = 0;
+	// A long live frame whose rendered HTML spans multiple Telegram chunks.
+	await daemon.handleSessionMessage(session as never, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "live",
+		text: "가".repeat(9000),
+		messageRef: "1",
+	});
+	// The preview edits the ONE message; a live frame never requeues continuations.
+	expect(bot.calls.filter(c => c.method === "editMessageText").length).toBeGreaterThanOrEqual(1);
+	expect(bot.calls.filter(c => c.method === "sendMessage").length).toBe(0);
+	// A follow-up flush drains any queued items: still no continuation sendMessage.
+	await daemon.handleSessionMessage(session as never, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "live",
+		text: `${"가".repeat(9000)} more`,
+		messageRef: "1",
+	});
+	expect(bot.calls.filter(c => c.method === "sendMessage").length).toBe(0);
 });

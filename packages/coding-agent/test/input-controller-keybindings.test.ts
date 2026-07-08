@@ -56,6 +56,19 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 	const updatePendingMessagesDisplay = vi.fn();
 	const handleBashCommand = vi.fn(async () => {});
 	const showStatus = vi.fn();
+	const onInputCallback = vi.fn();
+	const startPendingSubmission = vi.fn(
+		(input: {
+			text: string;
+			images?: InteractiveModeContext["pendingImages"];
+			customType?: string;
+			display?: boolean;
+		}) => ({
+			...input,
+			cancelled: false,
+			started: true,
+		}),
+	);
 	const compactionQueuedMessages: CompactionQueuedMessage[] = [];
 	const sessionQueuedMessages: string[] = [];
 	const queueCompactionMessage = vi.fn((text: string, mode: "steer" | "followUp") => {
@@ -141,6 +154,7 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			isGeneratingHandoff: false,
 			isBashRunning: false,
 			isEvalRunning: false,
+			messages: [],
 			abortBash: vi.fn(),
 			extensionRunner: undefined,
 			prompt,
@@ -159,6 +173,9 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		pendingImages: [],
 		compactionQueuedMessages,
 		queueCompactionMessage,
+		onInputCallback,
+		startPendingSubmission,
+		flushPendingBashComponents: vi.fn(),
 		settings: {
 			get(path: string) {
 				if (path === "images.autoResize") return false;
@@ -169,6 +186,9 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		sessionManager: {
 			getCwd() {
 				return "/";
+			},
+			getSessionName() {
+				return "test-session";
 			},
 		} as unknown as InteractiveModeContext["sessionManager"],
 		locallySubmittedUserSignatures: new Set<string>(),
@@ -228,6 +248,8 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			setActionKeys,
 			showModelSelector,
 			prompt,
+			onInputCallback,
+			startPendingSubmission,
 			updatePendingMessagesDisplay,
 			handleBashCommand,
 			showStatus,
@@ -286,6 +308,7 @@ describe("InputController keybinding setup", () => {
 		expect(ctx.locallySubmittedUserSignatures.has("queue after current response\u00000")).toBe(true);
 		expect(spies.prompt).toHaveBeenCalledWith("queue after current response", {
 			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
@@ -331,6 +354,7 @@ describe("InputController keybinding setup", () => {
 		await Bun.sleep(0);
 		expect(spies.prompt).toHaveBeenCalledWith("follow up from shortcut", {
 			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
 		});
 	});
 
@@ -570,6 +594,62 @@ describe("InputController keybinding setup", () => {
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
+	it("omits pasted image attachments when their placeholders were deleted", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const deletedImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "deleted-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [deletedImage];
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("send text after deleting the pasted image");
+
+		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+			text: "send text after deleting the pasted image",
+			images: undefined,
+		});
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "send text after deleting the pasted image",
+			images: undefined,
+			cancelled: false,
+			started: true,
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("submits only pasted images whose placeholders remain", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const firstImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "first-image",
+			mimeType: "image/png",
+		};
+		const secondImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "second-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [firstImage, secondImage];
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("describe only [image 2]");
+
+		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+			text: "describe only [image 2]",
+			images: [secondImage],
+		});
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "describe only [image 2]",
+			images: [secondImage],
+			cancelled: false,
+			started: true,
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
 
 	it("marks streaming follow-up submissions as local", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
@@ -583,6 +663,7 @@ describe("InputController keybinding setup", () => {
 		expect(ctx.locallySubmittedUserSignatures.has("follow up after current response\u00000")).toBe(true);
 		expect(spies.prompt).toHaveBeenCalledWith("follow up after current response", {
 			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});

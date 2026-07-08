@@ -31,6 +31,9 @@ export interface NotifyCommandDeps {
 	setupRedact?: boolean;
 	setupInteractive?: boolean;
 	threadedModePrompt?: (message: string) => Promise<string>;
+	tokenPrompt?: () => Promise<string>;
+	setExitCode?: (code: number) => void;
+	exitProcess?: (code: number) => void;
 }
 
 interface TelegramApiResponse<T> {
@@ -126,6 +129,27 @@ export async function runNotifyCommand(cmd: NotifyCommandArgs, deps: NotifyComma
 	}
 }
 
+export async function runNotifyCliCommand(cmd: NotifyCommandArgs, deps: NotifyCommandDeps = {}): Promise<void> {
+	try {
+		await runNotifyCommand(cmd, deps);
+	} catch (error) {
+		if (cmd.action !== "setup" || !(error instanceof Error)) {
+			throw error;
+		}
+
+		const cancelled = error.message === "Telegram bot token prompt cancelled.";
+		process.stderr.write(cancelled ? "Telegram notify setup cancelled.\n" : `Error: ${error.message}\n`);
+		const code = cancelled ? 130 : 1;
+		if (deps.setExitCode) {
+			deps.setExitCode(code);
+		} else {
+			process.exitCode = code;
+		}
+		const exitProcess = deps.exitProcess ?? (deps.setExitCode ? undefined : process.exit);
+		exitProcess?.(code);
+	}
+}
+
 async function getSettings(deps: NotifyCommandDeps): Promise<Settings> {
 	if (deps.settings) return deps.settings;
 	const { Settings } = await import("../config/settings");
@@ -136,7 +160,7 @@ async function runSetup(deps: NotifyCommandDeps): Promise<void> {
 	const settings = await getSettings(deps);
 	const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
 	const apiBase = deps.apiBase ?? DEFAULT_API_BASE;
-	const token = deps.setupToken ?? (await promptForToken());
+	const token = deps.setupToken ?? (await (deps.tokenPrompt ?? promptForToken)());
 	if (!token.trim()) {
 		throw new Error("Telegram bot token is required.");
 	}
@@ -179,6 +203,7 @@ async function runSetup(deps: NotifyCommandDeps): Promise<void> {
 type TokenPromptInput = NodeJS.ReadStream & {
 	isRaw?: boolean;
 	setRawMode?: (mode: boolean) => unknown;
+	pause?: () => unknown;
 };
 
 type TokenPromptOutput = Pick<NodeJS.WriteStream, "write">;
@@ -206,6 +231,7 @@ export async function promptForToken(
 			input.off("data", onData);
 			input.off("error", onError);
 			input.setRawMode?.(wasRaw);
+			input.pause?.();
 			output.write("\n");
 		};
 

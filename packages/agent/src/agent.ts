@@ -275,6 +275,7 @@ export class Agent {
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
+	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
 	#interruptMode: "immediate" | "wait";
@@ -865,8 +866,15 @@ export class Agent {
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 * Delivered only when agent has no more tool calls or steering messages.
+	 *
+	 * `forceOneAtATime` lets UI composer queues preserve prompt-by-prompt
+	 * delivery even when the session-wide follow-up mode is set to `all` for
+	 * other integration paths.
 	 */
-	followUp(m: AgentMessage) {
+	followUp(m: AgentMessage, options?: { forceOneAtATime?: boolean }) {
+		if (options?.forceOneAtATime) {
+			this.#followUpForceOneAtATime.add(m);
+		}
 		this.#followUpQueue.push(m);
 	}
 
@@ -942,8 +950,18 @@ export class Agent {
 			}
 			return [];
 		}
-		const followUp = this.#followUpQueue.slice();
-		this.#followUpQueue = [];
+
+		const first = this.#followUpQueue[0];
+		if (!first) return [];
+		if (this.#followUpForceOneAtATime.has(first)) {
+			this.#followUpQueue = this.#followUpQueue.slice(1);
+			return [first];
+		}
+
+		const forcedIndex = this.#followUpQueue.findIndex(message => this.#followUpForceOneAtATime.has(message));
+		const takeCount = forcedIndex === -1 ? this.#followUpQueue.length : forcedIndex;
+		const followUp = this.#followUpQueue.slice(0, takeCount);
+		this.#followUpQueue = this.#followUpQueue.slice(takeCount);
 		return followUp;
 	}
 

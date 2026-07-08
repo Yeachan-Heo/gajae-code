@@ -34,6 +34,7 @@ import type { Theme } from "./theme/theme";
 export type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
+	followUpQueuePolicy?: "sequential";
 };
 
 export type SubmittedUserInput = {

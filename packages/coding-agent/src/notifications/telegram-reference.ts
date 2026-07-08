@@ -143,6 +143,23 @@ export function buildActionMessage(action: {
 	return { text: body, inline_keyboard };
 }
 
+/** Render an `action_needed` body as raw markdown (rich-message source; the HTML fallback stays on buildActionMessage). */
+export function buildActionMarkdown(action: {
+	kind: "ask" | "idle";
+	question?: string;
+	options?: string[];
+	summary?: string;
+}): string {
+	if (action.kind === "idle") {
+		return action.summary ? `🟢 Agent idle\n${action.summary}` : "🟢 Agent idle";
+	}
+	const heading = `❓ **${action.question ?? "Question"}**`;
+	const options = action.options ?? [];
+	if (options.length === 0) return `${heading}\n\n(reply with text)`;
+	const list = options.map((label, i) => `${i + 1}. ${label.replace(/^\s*\d+[.)]\s+/, "")}`).join("\n");
+	return `${heading}\n\n${list}`;
+}
+
 /** Send Telegram HTML text chunks sequentially so long messages preserve order. */
 export async function sendTelegramHtmlChunks(
 	send: TelegramSend,

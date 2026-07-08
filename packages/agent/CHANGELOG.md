@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Follow-up queues can now mark individual messages as one-at-a-time, so interactive composer queues can remain sequential without disabling the existing batch mode for other callers.
+
 ## [0.8.2] - 2026-07-06
 ### Added
 

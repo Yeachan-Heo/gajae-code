@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	buildActionMarkdown,
 	buildActionMessage,
 	createAliasTable,
 	decodeCallbackData,
@@ -159,5 +160,25 @@ describe("telegram reference client helpers", () => {
 	test("telegramUpdateToReply ignores irrelevant updates", () => {
 		expect(telegramUpdateToReply({}, "tok", "a1")).toBeNull();
 		expect(telegramUpdateToReply({ callback_query: { data: "bad" } }, "tok", "a1")).toBeNull();
+	});
+});
+
+describe("buildActionMarkdown", () => {
+	test("ask: heading, blank line, and numbered options as raw markdown", () => {
+		const md = buildActionMarkdown({ kind: "ask", question: "Proceed?", options: ["Yes", "No"] });
+		expect(md).toContain("Proceed?");
+		expect(md).toContain("1. Yes\n2. No");
+		expect(md).not.toContain("<b>");
+	});
+
+	test("ask without options falls back to the free-text hint", () => {
+		const md = buildActionMarkdown({ kind: "ask", question: "Name?" });
+		expect(md).toContain("Name?");
+		expect(md).toContain("(reply with text)");
+	});
+
+	test("idle with and without summary", () => {
+		expect(buildActionMarkdown({ kind: "idle", summary: "done" })).toBe("🟢 Agent idle\ndone");
+		expect(buildActionMarkdown({ kind: "idle" })).toBe("🟢 Agent idle");
 	});
 });

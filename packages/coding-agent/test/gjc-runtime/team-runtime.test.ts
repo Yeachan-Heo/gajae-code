@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getWorktreesDir } from "@gajae-code/utils/dirs";
 import { sessionReportsDir, teamStateRoot } from "../../src/gjc-runtime/session-layout";
 import {
 	buildWorkerCommand,
@@ -20,6 +21,7 @@ import {
 	resolveGjcTeamWorkerCli,
 	resolveGjcTeamWorkerCliPlan,
 	resolveGjcWorkerCommand,
+	resolveWorkerWorktreePath,
 	sendGjcTeamMessage,
 	setGjcTeamMailboxDeliveryTransport,
 	setGjcTeamMailboxDeliveryTransportForTest,
@@ -63,6 +65,7 @@ async function createFakeTmuxBin(
 		gjcProfile?: boolean;
 		untaggableProfile?: boolean;
 		commandName?: string;
+		versionOutput?: string;
 	} = {},
 ): Promise<string> {
 	const binDir = path.join(root, ".test-bin");
@@ -72,6 +75,9 @@ async function createFakeTmuxBin(
 	const script = `#!/usr/bin/env bash
 echo "$@" >> ${JSON.stringify(logPath)}
 case "$1" in
+  -V|--version)
+    echo ${JSON.stringify(options.versionOutput ?? "tmux 3.3.5")}
+    ;;
   display-message)
     ${
 			options.failDisplay
@@ -276,6 +282,49 @@ describe("native gjc team runtime", () => {
 		const telemetry = await Bun.file(path.join(snapshot.state_dir, "telemetry.jsonl")).text();
 		expect(telemetry).toContain("Native gjc team dry-run state initialized");
 		expect(telemetry).toContain('"dry_run":true');
+	});
+
+	it("uses a short default worker worktree root on Windows psmux", () => {
+		const repoRoot = path.resolve("C:/Users/alice/source/really/deep/repository");
+		const stateDir = path.join(
+			repoRoot,
+			".gjc",
+			"_session-019f40f8-b6df-7000-8529-9227933daf5a",
+			"state",
+			"team",
+			"windows-psmux-team",
+		);
+
+		const workerPath = resolveWorkerWorktreePath({
+			repoRoot,
+			stateDir,
+			teamName: "windows-psmux-team",
+			workerId: "worker-1",
+			platform: "win32",
+			isPsmux: true,
+		});
+
+		expect(workerPath.startsWith(getWorktreesDir())).toBe(true);
+		expect(workerPath).toContain("team-");
+		expect(workerPath.endsWith("worker-1")).toBe(true);
+		expect(workerPath).not.toContain("_session-019f40f8-b6df-7000-8529-9227933daf5a");
+		expect(workerPath).not.toContain(`${path.sep}state${path.sep}team${path.sep}`);
+	});
+
+	it("keeps the session-scoped worker worktree root outside Windows psmux", () => {
+		const repoRoot = path.resolve("/tmp/gjc-team-runtime");
+		const stateDir = path.join(repoRoot, ".gjc", "_session-test-session", "state", "team", "posix-team");
+
+		const workerPath = resolveWorkerWorktreePath({
+			repoRoot,
+			stateDir,
+			teamName: "posix-team",
+			workerId: "worker-1",
+			platform: "linux",
+			isPsmux: false,
+		});
+
+		expect(workerPath).toBe(path.join(stateDir, "worktrees", "worker-1"));
 	});
 
 	it("separates managed worker lifecycle from worker-reported status", async () => {
@@ -699,6 +748,37 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("send-keys -l -t %2");
 		expect(tmuxLog).toContain("worker-startup-ack");
 		expect(tmuxLog).toContain("send-keys -t %2 Enter");
+	});
+
+	it("uses the short worker worktree root for Windows psmux even when -V prints a generic tmux banner", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakePsmux = await createFakeTmuxBin(cleanupRoot, { commandName: "psmux", versionOutput: "tmux 3.3.5" });
+
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Start Windows psmux worker",
+			teamName: "windows-generic-psmux-team",
+			cwd: cleanupRoot,
+			platform: "win32",
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				PATH: process.env.PATH ?? "",
+				GJC_TEAM_WORKER_COMMAND: "true",
+				GJC_TEAM_TMUX_COMMAND: fakePsmux,
+			},
+		});
+
+		const workerPath = snapshot.workers[0]?.worktree_path ?? "";
+		expect(workerPath.startsWith(getWorktreesDir())).toBe(true);
+		expect(workerPath).toContain("team-");
+		expect(workerPath).toContain("worker-1");
+		expect(workerPath).not.toContain("_session-test-session");
+		expect(workerPath).not.toContain(`${path.sep}state${path.sep}team${path.sep}`);
+
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("split-window -h -t %1 -d -P -F #{pane_id} -c ");
+		expect(tmuxLog).toContain("send-keys -l -t %2");
 	});
 	it("distributes explicit markdown lane sections into worker-owned initial tasks", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));

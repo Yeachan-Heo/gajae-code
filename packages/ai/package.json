@@ -1,13 +1,10 @@
 {
 	"type": "module",
 	"name": "@gajae-code/ai",
-	"version": "0.9.0",
+	"version": "0.9.1",
 	"description": "Unified LLM API with automatic model discovery and provider configuration",
 	"homepage": "https://gajae-code.com",
-	"author": "Yeachan-Heo",
-	"contributors": [
-		"Mario Zechner"
-	],
+	"author": "Yeachan-Heo and Gajae Code Contributors",
 	"license": "MIT",
 	"repository": {
 		"type": "git",

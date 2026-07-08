@@ -1,6 +1,6 @@
 {
   "name": "gajae-code",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Delegate Codex tasks to GJC workflows through coordinator MCP.",
   "skills": "./skills/",
   "mcpServers": "./.codex.mcp.json"

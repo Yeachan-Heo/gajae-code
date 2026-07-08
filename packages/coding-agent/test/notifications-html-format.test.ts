@@ -285,13 +285,18 @@ class CapturingBotApi {
 	}
 }
 
-function makeDaemon(bot: CapturingBotApi, agentDir: string): TelegramNotificationDaemon {
+function makeDaemon(
+	bot: CapturingBotApi,
+	agentDir: string,
+	rich: { enabled: boolean } = { enabled: false },
+): TelegramNotificationDaemon {
 	return new TelegramNotificationDaemon({
 		settings: isolatedSettings(agentDir),
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot as any,
+		rich,
 	});
 }
 

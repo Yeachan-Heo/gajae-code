@@ -47,6 +47,45 @@ describe("Agent", () => {
 		expect(agent.state.messages[agent.state.messages.length - 1].role).toBe("assistant");
 	});
 
+	it("continue() honors forced one-at-a-time follow-ups even when batching is enabled", async () => {
+		const mock = createMockModel({
+			responses: [{ content: ["Processed 1"] }, { content: ["Processed 2"] }],
+		});
+		const agent = new Agent({ streamFn: mock.stream, followUpMode: "all" });
+
+		agent.replaceMessages([
+			{
+				role: "user",
+				content: [{ type: "text", text: "Initial" }],
+				timestamp: Date.now() - 10,
+			},
+			createAssistantMessage([{ type: "text", text: "Initial response" }]),
+		]);
+
+		agent.followUp(
+			{
+				role: "user",
+				content: [{ type: "text", text: "Queued follow-up 1" }],
+				timestamp: Date.now(),
+			},
+			{ forceOneAtATime: true },
+		);
+		agent.followUp(
+			{
+				role: "user",
+				content: [{ type: "text", text: "Queued follow-up 2" }],
+				timestamp: Date.now() + 1,
+			},
+			{ forceOneAtATime: true },
+		);
+
+		await expect(agent.continue()).resolves.toBeUndefined();
+
+		const recentMessages = agent.state.messages.slice(-4);
+		expect(recentMessages.map(m => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
+		expect(mock.calls.length).toBe(2);
+	});
+
 	it("continue() should keep one-at-a-time steering semantics from assistant tail", async () => {
 		const mock = createMockModel({
 			responses: [{ content: ["Processed 1"] }, { content: ["Processed 2"] }],

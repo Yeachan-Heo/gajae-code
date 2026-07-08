@@ -507,7 +507,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				? loadSkills({ ...skillsSettings, cwd: resolvedCwd }).then(result => result.skills)
 				: Promise.resolve([]);
 
-	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFiles, skills, workspaceTree] =
+	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFiles, , workspaceTree] =
 		await Promise.all([
 			withDeadline(
 				"customPrompt",
@@ -581,11 +581,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		description: tools?.get(name)?.description ?? "",
 	}));
 
-	// Filter skills for the rendered system prompt:
-	// - require the `read` tool so the model can actually fetch skill content;
-	// - drop skills with frontmatter `hide: true` (still loadable via skill:// and /skill:<name>).
-	const hasRead = tools?.has("read");
-	const filteredSkills = hasRead ? skills.filter(skill => skill.hide !== true) : [];
+	// Runtime skills are discovered by `skill_discovery` and loaded narrowly through
+	// `skill`; do not dump the full custom skill catalog into the core prompt.
+	const filteredSkills: Skill[] = [];
 
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,

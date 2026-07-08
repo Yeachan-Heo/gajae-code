@@ -115,6 +115,20 @@ function outputMentionsPsmux(output: string): boolean {
 	return PSMUX_VERSION_MARKERS.some(marker => output.includes(marker));
 }
 
+function normalizedCommandBaseName(command: string): string {
+	const normalized = command
+		.trim()
+		.replace(/^['"]|['"]$/g, "")
+		.replace(/\\/g, "/");
+	const basename = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
+	return basename.endsWith(".exe") ? basename.slice(0, -4) : basename;
+}
+
+function isNamedPsmuxCommand(command: string): boolean {
+	const basename = normalizedCommandBaseName(command);
+	return basename === "psmux" || basename === "pmux";
+}
+
 function resolveBinaryPath(candidate: string): string | null {
 	return activeBinaryResolver(candidate);
 }
@@ -194,13 +208,14 @@ export function resolveGjcTmuxBinary(options: ResolveGjcTmuxBinaryOptions = {}):
 	const runner = options.runner ?? readSpawnRunner();
 	const explicit = env.GJC_TMUX_COMMAND?.trim() || env.GJC_TEAM_TMUX_COMMAND?.trim();
 	if (explicit) {
-		const isPsmux = detectPsmux(explicit, { env, runner });
+		const isPsmux =
+			platform === "win32" && isNamedPsmuxCommand(explicit) ? true : detectPsmux(explicit, { env, runner });
 		return { command: explicit, isPsmux, viaExplicitOverride: true };
 	}
 	if (platform === "win32") {
 		for (const candidate of PSMUX_BINARY_NAMES) {
 			if (resolveBinaryPath(candidate)) {
-				const isPsmux = detectPsmux(candidate, { env, runner });
+				const isPsmux = isNamedPsmuxCommand(candidate) ? true : detectPsmux(candidate, { env, runner });
 				return { command: candidate, isPsmux, viaExplicitOverride: false };
 			}
 		}

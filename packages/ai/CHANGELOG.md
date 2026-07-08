@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-08
+
+### Fixed
+
+- Unified the Cursor client version used across provider requests and discovery.
+- Detected ZAI weekly limit exhaustion as a structured rate-limit condition.
+- Pointed Sakana Fugu OAuth/login guidance at the Sakana platform console and documented the `fish_` key prefix expectation.
+
 ## [0.9.0] - 2026-07-07
 
 ### Fixed

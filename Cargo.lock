@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "gjc-notifications"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "futures-util",
  "libc",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "libc",
@@ -2432,7 +2432,7 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2478,7 +2478,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "brush-builtins",

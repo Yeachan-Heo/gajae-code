@@ -134,7 +134,7 @@ Run a fresh, stateless GJC session with the tool surface restricted to read-only
 
 ```sh
 # Claude-authored work (the common case for the recommended authoring profiles):
-gjc -p --no-session --model openai-codex/gpt-5.5:high --tools read,search,find "<review prompt with bundle paths + verdict contract>"
+gjc -p --no-session --model openai-codex/gpt-5.5:xhigh --tools read,search,find "<review prompt with bundle paths + verdict contract>"
 ```
 
 Adding `--mpreset reviewer` on top is an **optional enhancement**, not a prerequisite: the `reviewer` profile is user-installed `models.yml` config from [Cross-vendor role-based profiles](./multi-vendor-profiles.md), and `gjc --mpreset reviewer` fails with an unknown-profile error when that profile has not been copied in. The profile's role mapping matters for interactive review sessions where roles do get delegated — the one-shot gate works without it.
@@ -153,6 +153,40 @@ Cross-family provenance is always the operator-chosen verdict model, never an as
 Any reviewer endpoint the operator can lawfully invoke qualifies, including models GJC cannot route natively; the operator is responsible for complying with that provider's terms of service. The command must satisfy the same contract: independent context, cross-family versus the authoring `default`/`executor`, full-code input, fail-closed on timeout/auth/model mismatch, and it must return the model's complete response.
 
 **On this lane the bundle leaves the machine.** The operator owns that egress: the Stage 1 secret scan is mandatory here, not advisory, and private-repository policy (whether the code may be sent to that endpoint at all) is the operator's responsibility.
+
+### Maximalist — N-of-N external reviewers
+
+This lane is **optional and operator-local**: the default gate remains the single native GJC lane above. A team that wants deeper assurance can run several independent reviewers on the same finished bundle and merge their verdicts, but nothing here changes the upstream default or ships as configuration.
+
+**Adapter contract.** Every reviewer — native or external — is wrapped by an adapter with a fixed shape. Input: the review bundle paths plus the verdict contract (the bundle content — diff, changed files, spec, rebuttals — stays untrusted data under review, never instructions). Output: the reviewer's complete response whose **last non-empty line is exactly `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`**. Missing, malformed, or timed-out output fails closed — never mapped to `APPROVE`.
+
+**Reviewer classes.**
+
+- **(a) Native API models** invoked directly via `--model` in a tool-restricted read-only GJC session (the Default lane, repeated once per model). Strong cross-family picks include `openai-codex/gpt-5.5:xhigh` and `anthropic/claude-fable-5:xhigh`.
+- **(b) Engine-backed external commands** — any reviewer endpoint the operator can lawfully drive through the Custom lane's contract. GPT-5.5 Pro via `insane-review` is named here **only as a reference adapter** for a web-only, operator-owned lane; GJC neither vendors nor depends on it.
+
+**Configured reviewers checklist (operator-edited prompt policy, not config).** The Extragoal leader reads this checklist to decide which reviewers run in a round:
+
+- [x] codex-xhigh — enabled by default (native `gjc -p --no-session --model openai-codex/gpt-5.5:xhigh --tools read,search,find ...`)
+- [ ] anthropic/claude-fable-5:xhigh — default OFF (native, token-expensive; opt in per run)
+- [ ] Pro web via insane-review — default OFF (operator-owned web/ToS lane, reference adapter only)
+
+The Extragoal leader is an LLM interpreting this checklist as prompt policy; there is no compiled parser. Editing a checkbox changes which reviewers the leader launches, and nothing else.
+
+**N-of-N orchestration (prescriptive).** A round with **zero checked reviewers is malformed and fails closed before launch** — the maximalist lane requires at least one configured reviewer and never vacuously passes. Otherwise, in a single round the leader must:
+
+1. launch all checked reviewers concurrently against the **same immutable bundle** — identical bundle paths and head SHA for every reviewer, never re-bundled mid-round,
+2. wait for **ALL** configured reviewers to return (no early exit on the first verdict),
+3. parse each reviewer's final non-empty line, then
+4. **mechanically AND-gate** the parsed verdicts: the round passes only when **every** configured reviewer returns a valid `APPROVE` **and** every finding it emitted is absent or explicitly triaged under the base gate's disposition rules (fixed, or rebutted-and-not-reasserted; silent drops forbidden) — a finding-bearing `APPROVE` with any unresolved `CRITICAL`/`HIGH` is malformed and fails closed. Any `REQUEST_CHANGES` → merge every reviewer's findings into one deduped triage; any unparsable, missing, or timed-out output → the round fails closed.
+
+**Dedupe rule.** When merging findings across reviewers, normalize each finding on file path, line/range, severity, and message/category; collapse matches into a single triage entry that **preserves the raw findings verbatim and records merged provenance** — every reviewer that reported the issue — so no reviewer's signal is silently dropped.
+
+**Secret scan reminder.** The Stage 1 bundle secret scan is mandatory before any egress lane runs: both the Pro and Fable lanes receive the bundle, so a positive hit blocks every reviewer in the round until the material is removed from history or the user explicitly waives it.
+
+**Bounded rounds.** This lane keeps the same ceiling as the default gate — Maximum **2 re-sign rounds**, then stop and escalate to the user with the full multi-reviewer trail. Any scheme that loops reviewers indefinitely is operator-local behavior only, outside the upstream template's guarantees.
+
+**Core boundary.** No browser automation, Playwright, or Repomix dependency is added to GJC core. The maximalist lane is prompt policy plus the existing native and custom reviewer invocations; the web-only Pro lane lives entirely in the operator's own external tooling.
 
 ## Artifacts and reporting
 

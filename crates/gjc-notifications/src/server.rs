@@ -660,10 +660,11 @@ mod tests {
 		}
 
 		handle.push_frame(ServerMessage::TurnStream(TurnStream {
-			session_id:  "s".into(),
-			phase:       TurnPhase::Finalized,
-			text:        "done".into(),
-			message_ref: None,
+			session_id:   "s".into(),
+			phase:        TurnPhase::Finalized,
+			text:         "done".into(),
+			final_answer: None,
+			message_ref:  None,
 		}));
 		match next_server_msg(&mut ws).await {
 			ServerMessage::TurnStream(t) => {

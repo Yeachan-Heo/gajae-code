@@ -37,6 +37,12 @@ const BASE_CFG: NotificationConfig = {
 	},
 	redact: false,
 	verbosity: "lean",
+	rich: {
+		enabled: true,
+	},
+	richDraft: {
+		enabled: false,
+	},
 	idleTimeoutMs: 60000,
 };
 
@@ -84,6 +90,12 @@ describe("notifications config", () => {
 			},
 			redact: true,
 			verbosity: "lean",
+			rich: {
+				enabled: true,
+			},
+			richDraft: {
+				enabled: false,
+			},
 			idleTimeoutMs: 1234,
 		});
 	});

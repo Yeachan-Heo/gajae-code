@@ -50,7 +50,7 @@ describe("Extragoal skill template", () => {
 		expect(template).toContain("Any fix invalidates the previous signature.");
 		expect(template).toContain("never commit `.gjc/_session-*` gate artifacts");
 		expect(template).toContain("The one-shot session's `default` model authors the verdict");
-		expect(template).toContain("gjc -p --no-session --model openai-codex/gpt-5.5:high --tools read,search,find");
+		expect(template).toContain("gjc -p --no-session --model openai-codex/gpt-5.5:xhigh --tools read,search,find");
 		expect(template).toContain(
 			"Adding `--mpreset reviewer` on top is an **optional enhancement**, not a prerequisite",
 		);
@@ -61,5 +61,29 @@ describe("Extragoal skill template", () => {
 		expect(template).toContain("with the goal tool still injected does not satisfy the leaf contract");
 		expect(template).toContain("dedicated gate directory outside the repository");
 		expect(template).toContain("without dirtying the reviewed checkout");
+	});
+
+	it("pins the optional maximalist N-of-N reviewer recipe without adding core dependencies", async () => {
+		const template = await Bun.file(path.join(repoRoot, "docs", "extragoal-skill-template.md")).text();
+
+		expect(template).toContain("### Maximalist — N-of-N external reviewers");
+		expect(template).toContain(
+			"The Extragoal leader is an LLM interpreting this checklist as prompt policy; there is no compiled parser.",
+		);
+		expect(template).toContain("anthropic/claude-fable-5:xhigh");
+		expect(template).toContain("- [ ] anthropic/claude-fable-5:xhigh — default OFF");
+		expect(template).toContain("- [x] codex-xhigh — enabled by default");
+		expect(template).toContain("launch all checked reviewers concurrently");
+		expect(template).toContain("same immutable bundle");
+		expect(template).toContain("mechanically AND-gate");
+		expect(template).toContain("round fails closed");
+		expect(template).toContain("zero checked reviewers is malformed and fails closed before launch");
+		expect(template).toContain("a finding-bearing `APPROVE` with any unresolved `CRITICAL`/`HIGH` is malformed");
+		expect(template).toContain("dedupe");
+		expect(template).toContain("reference adapter only");
+		expect(template).toContain("No browser automation, Playwright, or Repomix dependency is added to GJC core");
+		expect(template).toContain("Maximum **2 re-sign rounds**");
+		expect(template).toContain("Pro and Fable lanes receive the bundle");
+		expect(template).toContain("gjc -p --no-session --model openai-codex/gpt-5.5:xhigh --tools read,search,find");
 	});
 });

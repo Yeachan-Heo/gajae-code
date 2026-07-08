@@ -1,9 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.9.1] - 2026-07-08
 ### Fixed
 
 - Native Windows console hosts now use the live-viewport repaint path even when `WT_SESSION` is missing, and full clears avoid `3J` there, preventing Windows Terminal/PowerShell from jumping to the transcript top during forced redraws such as prompt bells and context compaction.
+- Manual viewport paging and resize repaint paths remain stable after terminal resizes, including the Windows/psmux live-viewport path.
+- Kitty inline image repaints now reuse uploaded image data and avoid duplicate placements or transcript overpaint.
+- Empty filtered paste operations no longer leave ghost undo snapshots, and footer git watcher disposal no longer races late watcher creation.
 
 ## [0.8.2] - 2026-07-06
 ### Fixed

@@ -28,12 +28,19 @@ beforeAll(() => {
 	initTheme();
 });
 
-type PromptOpts = { streamingBehavior?: "steer" | "followUp" } | undefined;
+type PromptOpts =
+	| {
+			streamingBehavior?: "steer" | "followUp";
+			followUpQueuePolicy?: "respect-mode" | "sequential";
+	  }
+	| undefined;
+type FollowUpOpts = { followUpQueuePolicy?: "respect-mode" | "sequential" } | undefined;
 
 function makeFakeSession() {
 	const steering: string[] = [];
 	const followUp: string[] = [];
 	const promptCalls: Array<{ text: string; opts: PromptOpts }> = [];
+	const followUpCalls: Array<{ text: string; opts: FollowUpOpts }> = [];
 
 	const prompt = mock(async (text: string, opts?: PromptOpts): Promise<void> => {
 		promptCalls.push({ text, opts });
@@ -53,7 +60,8 @@ function makeFakeSession() {
 		steering.push(text);
 	});
 
-	const followUpFn = mock(async (text: string): Promise<void> => {
+	const followUpFn = mock(async (text: string, _images?: unknown, opts?: FollowUpOpts): Promise<void> => {
+		followUpCalls.push({ text, opts });
 		followUp.push(text);
 	});
 
@@ -75,7 +83,7 @@ function makeFakeSession() {
 		followUp: followUpFn,
 	};
 
-	return { session, steering, followUp, promptCalls };
+	return { session, steering, followUp, promptCalls, followUpCalls };
 }
 
 function makeCtx(initialQueue: CompactionQueuedMessage[]) {
@@ -180,6 +188,30 @@ describe("issue #825: steer preview stuck after compaction", () => {
 
 		expect(promptCalls.length).toBe(1);
 		expect(promptCalls[0].text).toBe("ship it");
+	});
+
+	test("preserves sequential policy when replaying compaction follow-up messages", async () => {
+		const queued: CompactionQueuedMessage[] = [
+			{ text: "first explicit queue", mode: "followUp" },
+			{ text: "second explicit queue", mode: "followUp" },
+		];
+		const { ctx, fake } = makeCtx(queued);
+
+		const helpers = new UiHelpers(ctx);
+		await helpers.flushCompactionQueue({ willRetry: false });
+
+		expect(fake.promptCalls).toEqual([
+			{
+				text: "first explicit queue",
+				opts: { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" },
+			},
+		]);
+		expect(fake.followUpCalls).toEqual([
+			{
+				text: "second explicit queue",
+				opts: { followUpQueuePolicy: "sequential" },
+			},
+		]);
 	});
 	test("removes the local-submission signature when willRetry delivery rejects", async () => {
 		const queued: CompactionQueuedMessage[] = [{ text: "willRetry boom", mode: "followUp" }];
