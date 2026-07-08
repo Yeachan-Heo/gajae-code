@@ -186,12 +186,13 @@ describe("G004 streamed tool args QA", () => {
 		component.dispose();
 	});
 
-	it("PARTIALJSON-LEAK keeps streaming partial JSON out of serialized message content", async () => {
+	it("PARTIALJSON-LEAK keeps streaming partial JSON out of serialized and executable message content", async () => {
+		const originalArgs = { command: "echo done" };
 		const content = {
 			type: "toolCall",
 			id: "leak",
 			name: "bash",
-			arguments: { command: "echo done" },
+			arguments: originalArgs,
 			partialJson: '{"command":"echo part',
 		};
 		const message = assistantMessage([content]);
@@ -203,14 +204,52 @@ describe("G004 streamed tool args QA", () => {
 			message,
 			assistantMessageEvent: { contentIndex: 0 },
 		} as any);
-		expect((message.content[0].arguments as any).__partialJson).toBe(content.partialJson);
+		expect(message.content[0].arguments).toBe(originalArgs);
+		expect(message.content[0].arguments).toEqual({ command: "echo done" });
+		expect((message.content[0].arguments as any).__partialJson).toBeUndefined();
 		expect(JSON.stringify(message.content)).not.toContain("__partialJson");
 		await controller.handleEvent({ type: "message_end", message } as any);
-		expect((message.content[0].arguments as any).__partialJson).toBe(content.partialJson);
+		expect(message.content[0].arguments).toBe(originalArgs);
+		expect(message.content[0].arguments).toEqual({ command: "echo done" });
+		expect((message.content[0].arguments as any).__partialJson).toBeUndefined();
 		expect(JSON.stringify(message.content)).not.toContain("__partialJson");
 		ctx.pendingTools.forEach((component: any) => {
 			component.dispose?.();
 		});
+	});
+
+	it("EXECUTION-ARGS-SNAPSHOT preserves streamed final args for validation after UI rendering", async () => {
+		for (const [toolName, args, partialJson] of [
+			["bash", { command: "printf hi", timeout: 5 }, '{"command":"printf hi"'],
+			["edit", { input: "§tmp/issue-1870.txt\n»EOF\nhello" }, '{"input":"§tmp/issue-1870.txt'],
+			["find", { paths: ["packages/coding-agent/src/**/*.ts"], limit: 3 }, '{"paths":["packages/coding-agent'],
+		] as const) {
+			const content = {
+				type: "toolCall",
+				id: `preserve-${toolName}`,
+				name: toolName,
+				arguments: args,
+				partialJson,
+			};
+			const message = assistantMessage([content]);
+			const ctx = makeCtx();
+			ctx.streamingMessage = message;
+			await new EventController(ctx).handleEvent({
+				type: "message_update",
+				message,
+				assistantMessageEvent: { contentIndex: 0 },
+			} as any);
+			const beforeEnd = structuredClone(message.content[0].arguments);
+			await new EventController(ctx).handleEvent({ type: "message_end", message } as any);
+			expect(message.content[0].arguments).toBe(args);
+			expect(message.content[0].arguments).toEqual(beforeEnd);
+			expect(message.content[0].arguments).not.toEqual({});
+			expect((message.content[0].arguments as any).__partialJson).toBeUndefined();
+			expect(JSON.stringify(message.content[0].arguments)).not.toContain("__partialJson");
+			ctx.pendingTools.forEach((component: any) => {
+				component.dispose?.();
+			});
+		}
 	});
 
 	it("COALESCE-SKIP recomputes edit preview for same-length changed content via args identity version", async () => {
@@ -252,10 +291,11 @@ describe("G004 streamed tool args QA", () => {
 			partialJson: '{"command":"echo restored',
 		} as any;
 		// Restore path must use the shared non-enumerable helper so persisted content stays clean.
-		argsWithPartialJson(restoredContent.arguments, restoredContent.partialJson);
+		const renderArgs = argsWithPartialJson(restoredContent.arguments, restoredContent.partialJson);
 		expect(JSON.stringify(restoredContent)).not.toContain("__partialJson");
-		expect((restoredContent.arguments as any).__partialJson).toBe(restoredContent.partialJson);
-		const restore = new ToolExecutionComponent("bash", restoredContent.arguments, {}, undefined, ui);
+		expect((restoredContent.arguments as any).__partialJson).toBeUndefined();
+		expect((renderArgs as any).__partialJson).toBe(restoredContent.partialJson);
+		const restore = new ToolExecutionComponent("bash", renderArgs, {}, undefined, ui);
 		expect(rendered(restore)).toBe(rendered(live));
 		live.dispose();
 		restore.dispose();

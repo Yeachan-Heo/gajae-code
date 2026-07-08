@@ -36,17 +36,27 @@ interface RenderInitialMessagesOptions {
 	preserveExistingChat?: boolean;
 }
 
+function cloneRenderArgs(args: Record<string, unknown>): Record<string, unknown> {
+	try {
+		return structuredClone(args);
+	} catch {
+		return { ...args };
+	}
+}
+
 export function argsWithPartialJson(args: unknown, partialJson: unknown): unknown {
 	if (typeof partialJson !== "string" || !args || typeof args !== "object" || Array.isArray(args)) return args;
-	// Non-enumerable so the transient streaming buffer reaches renderers via direct
-	// property read but never serializes into persisted/wire message content.
-	Object.defineProperty(args, "__partialJson", {
+	// Keep the transient streaming buffer on a renderer-only snapshot. The live
+	// assistant message args are later validated/executed, so UI-only metadata or
+	// renderer mutations must never share that object reference.
+	const renderArgs = cloneRenderArgs(args as Record<string, unknown>);
+	Object.defineProperty(renderArgs, "__partialJson", {
 		value: partialJson,
 		enumerable: false,
 		configurable: true,
 		writable: true,
 	});
-	return args;
+	return renderArgs;
 }
 
 type QueuedMessages = {
