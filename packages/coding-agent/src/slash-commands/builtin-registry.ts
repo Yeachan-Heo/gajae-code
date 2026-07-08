@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { ThinkingLevel } from "@gajae-code/agent-core";
+import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, modelsAreEqual } from "@gajae-code/ai";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { Spacer, Text } from "@gajae-code/tui";
@@ -378,6 +378,60 @@ function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: st
 		.join("\n\n");
 }
 
+const EFFORT_COMMAND_INPUT_HINT = "[inherit|off|minimal|low|medium|high|xhigh|max]";
+const EFFORT_COMMAND_ACCEPTED_VALUES = ["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+function effortCommandUsage(prefix?: string): string {
+	return [prefix, `Usage: /effort ${EFFORT_COMMAND_INPUT_HINT}`]
+		.filter((line): line is string => Boolean(line))
+		.join("\n");
+}
+
+function formatEffortStatus(runtime: SlashCommandRuntime): string {
+	const current = runtime.session.thinkingLevel ?? ThinkingLevel.Off;
+	const configuredDefault = runtime.settings.get("defaultThinkingLevel");
+	const supported = runtime.session.getAvailableThinkingLevels();
+	return [
+		`Current effective effort: ${current}`,
+		`Configured default effort: ${configuredDefault}`,
+		`Accepted values: ${EFFORT_COMMAND_ACCEPTED_VALUES.join(", ")}`,
+		`Current-model supported levels: ${supported.length > 0 ? supported.join(", ") : "(none reported)"}`,
+	].join("\n");
+}
+
+async function handleEffortCommand(
+	command: ParsedSlashCommand,
+	runtime: SlashCommandRuntime,
+): Promise<SlashCommandResult> {
+	const tokens = command.args.trim().split(/\s+/).filter(Boolean);
+	if (tokens.length === 0) {
+		await runtime.output(formatEffortStatus(runtime));
+		return commandConsumed();
+	}
+	if (tokens.length !== 1) {
+		return usage(effortCommandUsage("Invalid effort input."), runtime);
+	}
+
+	const requestedToken = tokens[0];
+	const requestedLevel = parseThinkingLevel(requestedToken);
+	if (!requestedToken || !requestedLevel) {
+		return usage(effortCommandUsage(`Invalid effort: ${tokens[0] ?? ""}.`), runtime);
+	}
+
+	const levelToApply =
+		requestedLevel === ThinkingLevel.Inherit ? runtime.settings.get("defaultThinkingLevel") : requestedLevel;
+	runtime.session.setThinkingLevel(levelToApply, false);
+	const effectiveLevel = runtime.session.thinkingLevel ?? ThinkingLevel.Off;
+	const requestedLabel =
+		requestedLevel === ThinkingLevel.Inherit ? `${requestedLevel} (${levelToApply})` : requestedLevel;
+	const clampedSuffix =
+		effectiveLevel === levelToApply ? "" : ` Requested ${levelToApply}; effective ${effectiveLevel}.`;
+	await runtime.output(
+		`Reasoning effort set to ${requestedLabel}. Effective effort: ${effectiveLevel}.${clampedSuffix}`,
+	);
+	return commandConsumed();
+}
+
 function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.statusLine.invalidate();
 	ctx.updateEditorTopBorder();
@@ -559,6 +613,29 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return result;
 			}
 			runtime.ctx.showModelSelector();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "effort",
+		description: "Show or set model reasoning effort",
+		acpDescription: "Show or set model reasoning effort",
+		inlineHint: EFFORT_COMMAND_INPUT_HINT,
+		acpInputHint: EFFORT_COMMAND_INPUT_HINT,
+		allowArgs: true,
+		handle: handleEffortCommand,
+		handleTui: async (command, runtime) => {
+			if (command.args.trim()) {
+				const result = await handleEffortCommand(command, toSlashCommandRuntime(runtime));
+				runtime.ctx.statusLine.invalidate();
+				runtime.ctx.updateEditorBorderColor();
+				runtime.ctx.updateEditorTopBorder();
+				runtime.ctx.editor.setText("");
+				runtime.ctx.ui.requestRender();
+				return result;
+			}
+
+			runtime.ctx.showEffortSelector();
 			runtime.ctx.editor.setText("");
 		},
 	},

@@ -88,6 +88,7 @@ import { SessionSelectorComponent } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
 import type { StatusLineSettings } from "../components/status-line";
 import { ThemeSelectorComponent } from "../components/theme-selector";
+import { ThinkingSelectorComponent } from "../components/thinking-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
 import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
@@ -428,6 +429,46 @@ export class SelectorController {
 				() => this.ctx.ui.requestRender(),
 			);
 			return { component: wizard, focus: wizard };
+		});
+	}
+
+	showEffortSelector(): void {
+		const availableLevels = [
+			ThinkingLevel.Inherit,
+			ThinkingLevel.Off,
+			...this.ctx.session.getAvailableThinkingLevels(),
+		];
+
+		this.showSelector(done => {
+			const selector = new ThinkingSelectorComponent(
+				this.ctx.session.thinkingLevel,
+				availableLevels,
+				level => {
+					done();
+
+					const configuredDefault = this.ctx.settings.get("defaultThinkingLevel");
+					const levelToApply = level === ThinkingLevel.Inherit ? configuredDefault : level;
+					this.ctx.session.setThinkingLevel(levelToApply, false);
+					const effectiveLevel = this.ctx.session.thinkingLevel ?? ThinkingLevel.Off;
+					const requestedLabel =
+						level === ThinkingLevel.Inherit ? `${level} (configured default: ${configuredDefault})` : level;
+					const clampedSuffix =
+						effectiveLevel === levelToApply ? "" : ` Requested ${levelToApply}; effective ${effectiveLevel}.`;
+
+					this.ctx.statusLine.invalidate();
+					this.ctx.updateEditorBorderColor();
+					this.ctx.updateEditorTopBorder();
+					this.ctx.ui.requestRender();
+					this.ctx.showStatus(
+						`Reasoning effort set to ${requestedLabel}. Effective effort: ${effectiveLevel}.${clampedSuffix}`,
+					);
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector.getSelectList() };
 		});
 	}
 
