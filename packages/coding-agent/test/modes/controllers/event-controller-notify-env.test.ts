@@ -13,12 +13,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
-import {
-	completionNotifyDisabledByEnv,
-	EventController,
-} from "@gajae-code/coding-agent/modes/controllers/event-controller";
+import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import { completionNotifyDisabledByEnv } from "@gajae-code/coding-agent/notifications/config";
 import { TERMINAL } from "@gajae-code/tui";
 
 type NotifyProc = Bun.Subprocess<"ignore", "ignore", "ignore">;

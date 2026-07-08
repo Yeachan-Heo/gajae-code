@@ -59,6 +59,20 @@ export function isGloballyConfigured(cfg: NotificationConfig): boolean {
 	);
 }
 
+/**
+ * Per-run opt-out for completion notifications, honored before settings lookups.
+ *
+ * `GJC_NOTIFY=off` (also `0` / `false`, case-insensitive) suppresses the
+ * completion notification surface for this process only. `config.yml` is
+ * untouched and child processes inherit the env var, which lets non-interactive
+ * fleet runs (`gjc -p --no-session`) stay silent even when a user-level/global
+ * completion notification configuration is enabled.
+ */
+export function completionNotifyDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
+	const v = env.GJC_NOTIFY?.trim().toLowerCase();
+	return v === "off" || v === "0" || v === "false";
+}
+
 /** Resolve whether the notifications extension should be registered at SDK startup. */
 export function shouldRegisterNotificationsExtension(input: {
 	env: NodeJS.ProcessEnv;
@@ -71,6 +85,7 @@ export function shouldRegisterNotificationsExtension(input: {
 	currentAgentType?: string;
 }): boolean {
 	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix || input.currentAgentType) return false;
+	if (completionNotifyDisabledByEnv(input.env)) return false;
 	if (input.env.GJC_NOTIFICATIONS === "0") return false;
 	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
 	return input.cfg ? isGloballyConfigured(input.cfg) : false;

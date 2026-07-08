@@ -16,6 +16,7 @@ import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
+import { completionNotifyDisabledByEnv } from "../../notifications/config";
 import { summaryFromMessage } from "../../notifications/helpers";
 import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import type { AgentSessionEvent } from "../../session/agent-session";
@@ -39,21 +40,6 @@ export const __eventControllerPerfCounters = {
 };
 
 const COMPLETION_NOTIFY_COMMAND_TIMEOUT_MS = 10_000;
-
-/**
- * Per-run opt-out for completion notifications, honored before any settings lookup.
- *
- * `GJC_NOTIFY=off` (also `0` / `false`, case-insensitive) suppresses the whole
- * completion notification surface (terminal bell, backgrounded desktop toast, and the
- * user `completion.notifyCommand`) for this process only. `config.yml` is untouched and
- * child processes inherit the env var, which is exactly what non-interactive fleet runs
- * (`gjc -p --no-session`) need so an inherited global `completion.notify=on` /
- * `completion.notifyCommand` stops firing a notification per run.
- */
-export function completionNotifyDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
-	const v = env.GJC_NOTIFY?.trim().toLowerCase();
-	return v === "off" || v === "0" || v === "false";
-}
 
 interface CompletionNotifyPayload {
 	type: "agent-turn-complete";
