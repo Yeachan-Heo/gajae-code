@@ -594,6 +594,14 @@ export class InputController {
 	}
 
 	handleCtrlZ(): void {
+		// POSIX job control (SIGTSTP suspend / SIGCONT resume) does not exist on
+		// Windows: process.kill(0, "SIGTSTP") throws "Unknown signal: SIGTSTP" and
+		// crashes the TUI as an uncaught exception. Treat Ctrl+Z as a no-op there,
+		// mirroring the win32 guard already used by the background-fold path below.
+		if (process.platform === "win32") {
+			this.ctx.showStatus("Suspend (Ctrl+Z) is not supported on Windows");
+			return;
+		}
 		// Set up handler to restore TUI when resumed
 		process.once("SIGCONT", () => {
 			this.ctx.ui.start();
