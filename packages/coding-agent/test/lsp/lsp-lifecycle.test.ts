@@ -70,8 +70,8 @@ describe("LSP lifecycle behavior", () => {
 			expect(second.proc.killed).toBe(false);
 			expect(cachedAfterFirstExit).toBe(second);
 			await shutdownAll();
-			await second.proc.exited;
-			expect(second.proc.exitCode).not.toBeNull();
+			const secondExitCode = await second.proc.exited;
+			expect(secondExitCode).not.toBeNull();
 			expect(first.pendingRequests.size).toBe(0);
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
