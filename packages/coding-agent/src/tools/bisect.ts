@@ -266,58 +266,68 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 			);
 		}
 
-		let outcome: BisectOutcome;
-		// Defensive reset in case a previous aborted bisect left state behind; a
-		// no-op when not bisecting (reset never throws).
-		await git.bisect.reset(cwd, signal);
-		try {
-			await git.bisect.start(cwd, signal);
-			const badMark = await git.bisect.bad(cwd, badSha, signal);
-			if (badMark.exitCode !== 0) {
-				throw new ToolError(`git bisect bad failed: ${badMark.stderr.trim() || badMark.stdout.trim()}`);
-			}
-			const goodMark = await git.bisect.good(cwd, goodSha, signal);
-			if (goodMark.exitCode !== 0) {
-				throw new ToolError(`git bisect good failed: ${goodMark.stderr.trim() || goodMark.stdout.trim()}`);
-			}
-			// A tiny good..bad range can converge on the seeding marks themselves.
-			const seededCulprit = parseFirstBadCommit(`${goodMark.stdout}\n${goodMark.stderr}`);
-			if (seededCulprit) {
-				outcome = { culprit: seededCulprit, steps: [], concluded: true };
-			} else {
-				outcome = await runBisectController(
-					{
-						maxSteps: params.maxSteps,
-						currentRev: async () => (await git.head.sha(cwd, signal)) ?? "HEAD",
-						evaluate: async () =>
-							classifyExit(
-								await evaluatePredicate(params.run, cwd, params.stepTimeoutMs, signal),
-								params.invert,
-							),
-						mark: async verdict => {
-							const result =
-								verdict === "good"
-									? await git.bisect.good(cwd, undefined, signal)
-									: verdict === "bad"
-										? await git.bisect.bad(cwd, undefined, signal)
-										: await git.bisect.skip(cwd, signal);
-							return { exitCode: result.exitCode, output: `${result.stdout}\n${result.stderr}` };
+		// Everything from here to teardown mutates repo state — bisect metadata,
+		// checkouts between candidate commits, the closing resets — so it runs
+		// under the per-repo write lock. That keeps concurrent in-process callers
+		// (worktree checkouts, commits) from colliding on git's O_EXCL lock files
+		// or mutating a tree bisect is moving. The read-only prechecks above stay
+		// outside the lock so they never queue behind another writer.
+		const outcome = await git.withRepoLock(
+			cwd,
+			async (): Promise<BisectOutcome> => {
+				// Defensive reset in case a previous aborted bisect left state behind; a
+				// no-op when not bisecting (reset never throws).
+				await git.bisect.reset(cwd, signal);
+				try {
+					await git.bisect.start(cwd, signal);
+					const badMark = await git.bisect.bad(cwd, badSha, signal);
+					if (badMark.exitCode !== 0) {
+						throw new ToolError(`git bisect bad failed: ${badMark.stderr.trim() || badMark.stdout.trim()}`);
+					}
+					const goodMark = await git.bisect.good(cwd, goodSha, signal);
+					if (goodMark.exitCode !== 0) {
+						throw new ToolError(`git bisect good failed: ${goodMark.stderr.trim() || goodMark.stdout.trim()}`);
+					}
+					// A tiny good..bad range can converge on the seeding marks themselves.
+					const seededCulprit = parseFirstBadCommit(`${goodMark.stdout}\n${goodMark.stderr}`);
+					if (seededCulprit) {
+						return { culprit: seededCulprit, steps: [], concluded: true };
+					}
+					return await runBisectController(
+						{
+							maxSteps: params.maxSteps,
+							currentRev: async () => (await git.head.sha(cwd, signal)) ?? "HEAD",
+							evaluate: async () =>
+								classifyExit(
+									await evaluatePredicate(params.run, cwd, params.stepTimeoutMs, signal),
+									params.invert,
+								),
+							mark: async verdict => {
+								const result =
+									verdict === "good"
+										? await git.bisect.good(cwd, undefined, signal)
+										: verdict === "bad"
+											? await git.bisect.bad(cwd, undefined, signal)
+											: await git.bisect.skip(cwd, signal);
+								return { exitCode: result.exitCode, output: `${result.stdout}\n${result.stderr}` };
+							},
 						},
-					},
-					signal,
-				);
-			}
-		} finally {
-			// Always restore the working tree, even on error/abort. `git bisect
-			// reset` returns HEAD to the original branch/commit but leaves behind
-			// any tracked-file edits the `sh -c` predicate made mid-run. The tracked
-			// tree was verified clean before we started (precondition above), so
-			// discarding tracked modifications (reset --hard) only reverts the
-			// predicate's side effects, never user work; then bisect reset restores
-			// the original HEAD. Both are best-effort and must not throw here.
-			await git.reset(cwd, { hard: true }).catch(() => {});
-			await git.bisect.reset(cwd);
-		}
+						signal,
+					);
+				} finally {
+					// Always restore the working tree, even on error/abort. `git bisect
+					// reset` returns HEAD to the original branch/commit but leaves behind
+					// any tracked-file edits the `sh -c` predicate made mid-run. The tracked
+					// tree was verified clean before we started (precondition above), so
+					// discarding tracked modifications (reset --hard) only reverts the
+					// predicate's side effects, never user work; then bisect reset restores
+					// the original HEAD. Both are best-effort and must not throw here.
+					await git.reset(cwd, { hard: true }).catch(() => {});
+					await git.bisect.reset(cwd);
+				}
+			},
+			signal,
+		);
 
 		// Never claim a clean restore we did not actually achieve.
 		const restoreLine = await describeRestore(cwd);

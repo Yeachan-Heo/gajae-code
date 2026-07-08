@@ -12,6 +12,7 @@ import {
 	runBisectController,
 	type ToolSession,
 } from "@gajae-code/coding-agent/tools";
+import * as git from "@gajae-code/coding-agent/utils/git";
 
 const FORTY_HEX = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 
@@ -241,6 +242,44 @@ describe("BisectTool.execute", () => {
 		// discard the predicate's tracked-file edit and fully restore the worktree.
 		expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
 		expect(await Bun.file(path.join(repo, "sentinel.txt")).text()).toBe("base\n");
+	});
+
+	it("queues its git mutations behind the per-repo write lock", async () => {
+		const repo = await makeRepo();
+		const good = await commitFlag(repo, "PASS\n", "c0 baseline");
+		await commitFlag(repo, "PASS\n", "c1 still ok");
+		const bug = await commitFlag(repo, "FAIL\n", "c2 introduce bug");
+		await commitFlag(repo, "FAIL\n", "c3 head");
+
+		// Hold the repo write lock while bisect launches: bisect checks out
+		// candidate commits and resets the tree, so it must queue behind the
+		// holder instead of mutating the repo alongside it.
+		const gate = Promise.withResolvers<void>();
+		const holder = git.withRepoLock(repo, () => gate.promise);
+
+		const execution = new BisectTool(session(repo)).execute("call", {
+			good,
+			bad: "HEAD",
+			run: "grep -q PASS flag.txt",
+			invert: false,
+			maxSteps: 40,
+			stepTimeoutMs: 60_000,
+		});
+
+		try {
+			const first = await Promise.race([
+				execution.then(() => "bisect-finished"),
+				new Promise<string>(resolve => setTimeout(() => resolve("still-queued"), 750)),
+			]);
+			expect(first).toBe("still-queued");
+		} finally {
+			gate.resolve();
+			await holder;
+		}
+
+		const result = await execution;
+		expect(result.details?.concluded).toBe(true);
+		expect(result.details?.culprit).toBe(bug);
 	});
 
 	it("restores the repo when invoked from a subdirectory a candidate deletes", async () => {
