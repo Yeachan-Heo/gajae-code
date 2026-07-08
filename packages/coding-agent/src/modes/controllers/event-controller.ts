@@ -24,6 +24,7 @@ import { isSilentAbort, readPendingDisplayTag } from "../../session/messages";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { interruptHint } from "../shared";
 import { buildAbortDisplayMessage } from "../utils/abort-message";
+import { consumeInjectedOptimisticSignature } from "../utils/injected-user-submission";
 import { ringTerminalBell } from "../utils/terminal-bell";
 import { argsWithPartialJson } from "../utils/ui-helpers";
 
@@ -292,12 +293,17 @@ export class EventController {
 			const signature = `${textContent}\u0000${imageCount}`;
 
 			this.#resetReadGroup();
-			const wasOptimistic = this.ctx.optimisticUserMessageSignature === signature;
+			const wasSingleOptimistic = this.ctx.optimisticUserMessageSignature === signature;
+			const wasInjectedOptimistic = !wasSingleOptimistic && consumeInjectedOptimisticSignature(this.ctx, signature);
+			const wasOptimistic = wasSingleOptimistic || wasInjectedOptimistic;
 			const wasLocallySubmitted = this.ctx.locallySubmittedUserSignatures.delete(signature) || wasOptimistic;
 			if (!wasOptimistic) {
 				this.ctx.addMessageToChat(event.message);
 			}
-			if (wasOptimistic) {
+			// Only clear the single local slot when IT matched; an injected match is
+			// consumed from the counting Map above and must not clobber a coexisting
+			// pending local optimistic signature.
+			if (wasSingleOptimistic) {
 				this.ctx.optimisticUserMessageSignature = undefined;
 			}
 

@@ -3,6 +3,8 @@ import type { ImageContent, TextContent } from "@gajae-code/ai";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import {
 	applyInjectedUserSubmission,
+	consumeInjectedOptimisticSignature,
+	incrementInjectedOptimisticSignature,
 	normalizeInjectedUserContent,
 } from "@gajae-code/coding-agent/modes/utils/injected-user-submission";
 
@@ -12,14 +14,24 @@ function createContext() {
 	const addMessageToChat = vi.fn();
 	const updatePendingMessagesDisplay = vi.fn();
 	const requestRender = vi.fn();
+	const optimisticInjectedSignatures = new Map<string, number>();
 	const ctx = {
 		editor: { addToHistory, setText },
 		addMessageToChat,
 		updatePendingMessagesDisplay,
 		ui: { requestRender },
 		optimisticUserMessageSignature: undefined,
+		optimisticInjectedSignatures,
 	} as unknown as InteractiveModeContext;
-	return { ctx, addToHistory, setText, addMessageToChat, updatePendingMessagesDisplay, requestRender };
+	return {
+		ctx,
+		addToHistory,
+		setText,
+		addMessageToChat,
+		updatePendingMessagesDisplay,
+		requestRender,
+		optimisticInjectedSignatures,
+	};
 }
 
 const image: ImageContent = { type: "image", data: "AAAA", mimeType: "image/png" };
@@ -70,16 +82,47 @@ describe("normalizeInjectedUserContent", () => {
 	});
 });
 
+describe("injected optimistic signature counting", () => {
+	it("increments and consumes with multiplicity, deleting the key at zero", () => {
+		const { ctx, optimisticInjectedSignatures } = createContext();
+		const sig = "dup\u00000";
+
+		expect(consumeInjectedOptimisticSignature(ctx, sig)).toBe(false);
+
+		incrementInjectedOptimisticSignature(ctx, sig);
+		incrementInjectedOptimisticSignature(ctx, sig);
+		incrementInjectedOptimisticSignature(ctx, sig);
+		expect(optimisticInjectedSignatures.get(sig)).toBe(3);
+
+		expect(consumeInjectedOptimisticSignature(ctx, sig)).toBe(true);
+		expect(optimisticInjectedSignatures.get(sig)).toBe(2);
+		expect(consumeInjectedOptimisticSignature(ctx, sig)).toBe(true);
+		expect(optimisticInjectedSignatures.get(sig)).toBe(1);
+		expect(consumeInjectedOptimisticSignature(ctx, sig)).toBe(true);
+		expect(optimisticInjectedSignatures.has(sig)).toBe(false);
+	});
+});
+
 describe("applyInjectedUserSubmission", () => {
 	it("records history and renders optimistically for an idle injection", () => {
-		const { ctx, addToHistory, setText, addMessageToChat, updatePendingMessagesDisplay, requestRender } =
-			createContext();
+		const {
+			ctx,
+			addToHistory,
+			setText,
+			addMessageToChat,
+			updatePendingMessagesDisplay,
+			requestRender,
+			optimisticInjectedSignatures,
+		} = createContext();
 
 		applyInjectedUserSubmission(ctx, { content: "idle telegram prompt", queued: false });
 
 		expect(addToHistory).toHaveBeenCalledTimes(1);
 		expect(addToHistory).toHaveBeenCalledWith("idle telegram prompt");
-		expect(ctx.optimisticUserMessageSignature).toBe("idle telegram prompt\u00000");
+		// Idle injections record a pending injected optimistic signature in the counting
+		// Map, leaving the single local slot untouched.
+		expect(optimisticInjectedSignatures.get("idle telegram prompt\u00000")).toBe(1);
+		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(addMessageToChat.mock.calls[0][0]).toMatchObject({
 			role: "user",
@@ -92,14 +135,22 @@ describe("applyInjectedUserSubmission", () => {
 		expect(updatePendingMessagesDisplay).not.toHaveBeenCalled();
 	});
 	it("records image-only idle injection without clearing the editor", () => {
-		const { ctx, addToHistory, setText, addMessageToChat, updatePendingMessagesDisplay } = createContext();
+		const {
+			ctx,
+			addToHistory,
+			setText,
+			addMessageToChat,
+			updatePendingMessagesDisplay,
+			optimisticInjectedSignatures,
+		} = createContext();
 
 		applyInjectedUserSubmission(ctx, { content: [image], queued: false });
 
 		expect(addToHistory).toHaveBeenCalledTimes(1);
 		expect(addToHistory).toHaveBeenCalledWith("");
 		// imageCount is 1, matching EventController's signature (event-controller.ts:288-292).
-		expect(ctx.optimisticUserMessageSignature).toBe("\u00001");
+		expect(optimisticInjectedSignatures.get("\u00001")).toBe(1);
+		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(addMessageToChat.mock.calls[0][0]).toMatchObject({
 			role: "user",
@@ -111,8 +162,15 @@ describe("applyInjectedUserSubmission", () => {
 	});
 
 	it("records history and refreshes pending display only for a busy/queued injection", () => {
-		const { ctx, addToHistory, setText, addMessageToChat, updatePendingMessagesDisplay, requestRender } =
-			createContext();
+		const {
+			ctx,
+			addToHistory,
+			setText,
+			addMessageToChat,
+			updatePendingMessagesDisplay,
+			requestRender,
+			optimisticInjectedSignatures,
+		} = createContext();
 
 		applyInjectedUserSubmission(ctx, { content: "busy telegram prompt", queued: true });
 
@@ -120,8 +178,9 @@ describe("applyInjectedUserSubmission", () => {
 		expect(addToHistory).toHaveBeenCalledWith("busy telegram prompt");
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 		expect(requestRender).toHaveBeenCalled();
-		// Queued injection must not optimistically render, set a signature, or clear the editor.
+		// Queued injection must not optimistically render, record a signature, or clear the editor.
 		expect(addMessageToChat).not.toHaveBeenCalled();
+		expect(optimisticInjectedSignatures.size).toBe(0);
 		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
 		expect(setText).not.toHaveBeenCalled();
 	});

@@ -36,10 +36,11 @@ export function normalizeInjectedUserContent(content: string | (TextContent | Im
  * local prompt history.
  *
  * - Always adds the injected text to editor prompt history.
- * - Idle injections optimistically render the user message and set
- *   `optimisticUserMessageSignature`; the later user `message_start` recognizes
- *   the signature and skips both the duplicate chat add and the defensive
- *   editor clear (so a locally typed draft is preserved).
+ * - Idle injections optimistically render the user message and record a pending
+ *   injected optimistic signature (a counting Map, so multiple idle injections
+ *   before the first `message_start` do not clobber each other); the later user
+ *   `message_start` consumes one count and skips both the duplicate chat add and
+ *   the defensive editor clear (so a locally typed draft is preserved).
  * - Busy/queued injections refresh the pending-message display, which the
  *   caller has already populated by invoking `session.sendUserMessage(...)`
  *   before this helper.
@@ -59,7 +60,7 @@ export function applyInjectedUserSubmission(
 		return;
 	}
 
-	ctx.optimisticUserMessageSignature = `${text}\u0000${imageCount}`;
+	incrementInjectedOptimisticSignature(ctx, `${text}\u0000${imageCount}`);
 	ctx.addMessageToChat({
 		role: "user",
 		content: [{ type: "text", text }, ...images],
@@ -67,4 +68,27 @@ export function applyInjectedUserSubmission(
 		timestamp: Date.now(),
 	});
 	ctx.ui.requestRender();
+}
+
+/**
+ * Record one pending optimistic render for an injected user message.
+ *
+ * Injected sends are fire-and-forget and multiple idle injections can be
+ * rendered before the first `message_start` arrives, so a counting Map (not a
+ * single slot) tracks how many optimistic renders are outstanding per signature.
+ */
+export function incrementInjectedOptimisticSignature(ctx: InteractiveModeContext, signature: string): void {
+	ctx.optimisticInjectedSignatures.set(signature, (ctx.optimisticInjectedSignatures.get(signature) ?? 0) + 1);
+}
+
+/**
+ * Consume one pending injected optimistic render for `signature`. Decrements the
+ * count (deleting the key at zero) and returns whether one was outstanding.
+ */
+export function consumeInjectedOptimisticSignature(ctx: InteractiveModeContext, signature: string): boolean {
+	const count = ctx.optimisticInjectedSignatures.get(signature) ?? 0;
+	if (count <= 0) return false;
+	if (count === 1) ctx.optimisticInjectedSignatures.delete(signature);
+	else ctx.optimisticInjectedSignatures.set(signature, count - 1);
+	return true;
 }
