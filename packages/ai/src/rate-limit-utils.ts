@@ -13,7 +13,7 @@ export type RateLimitReason =
 const QUOTA_EXHAUSTED_BACKOFF_MS = 30 * 60 * 1000; // 30 min
 const RATE_LIMIT_EXCEEDED_BACKOFF_MS = 30 * 1000; // 30s
 const MODEL_CAPACITY_BASE_MS = 45 * 1000; // 45s base
-const MODEL_CAPACITY_JITTER_MS = 30 * 1000; // ±15s
+const MODEL_CAPACITY_JITTER_MS = 30 * 1000; // uniform +0–30s above base → 45–75s total
 const SERVER_ERROR_BACKOFF_MS = 20 * 1000; // 20s
 
 /**
