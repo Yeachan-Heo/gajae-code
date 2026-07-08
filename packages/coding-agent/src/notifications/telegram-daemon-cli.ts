@@ -15,7 +15,9 @@ type TelegramDaemonRunner = {
 type TelegramDaemonConstructor = new (opts: TelegramDaemonOptions) => TelegramDaemonRunner;
 
 export interface RunDaemonInternalDeps {
-	SettingsImpl?: { init: (options?: { agentDir?: string }) => Promise<Pick<Settings, "get" | "getAgentDir" | "set">> };
+	SettingsImpl?: {
+		init: (options?: { agentDir?: string }) => Promise<Pick<Settings, "get" | "getAgentDir" | "set" | "flush">>;
+	};
 	DaemonImpl?: TelegramDaemonConstructor;
 	processPid?: number;
 	pidAlive?: (pid: number) => boolean;
@@ -61,7 +63,7 @@ function asIdleTimeoutMs(value: unknown): number {
 export function createLightweightDaemonSettings(input: {
 	agentDir: string;
 	rawConfig?: unknown;
-}): Pick<Settings, "get" | "getAgentDir" | "set"> {
+}): Pick<Settings, "get" | "getAgentDir" | "set" | "flush"> {
 	const rawConfig = input.rawConfig && typeof input.rawConfig === "object" ? input.rawConfig : {};
 	return {
 		get(pathName: string): unknown {
@@ -120,12 +122,18 @@ export function createLightweightDaemonSettings(input: {
 			});
 			setByPath(rawConfig as Record<string, unknown>, segments, value);
 		},
-	} as Pick<Settings, "get" | "getAgentDir" | "set">;
+		async flush(): Promise<void> {
+			// The set() above is synchronously durable (it awaits the atomic tmp+rename
+			// write under the shared file lock), so there is never a pending save to
+			// flush. Present so the daemon can await flush() uniformly regardless of
+			// which Settings implementation is injected.
+		},
+	} as Pick<Settings, "get" | "getAgentDir" | "set" | "flush">;
 }
 
 export async function loadLightweightDaemonSettings(
 	agentDir: string,
-): Promise<Pick<Settings, "get" | "getAgentDir" | "set">> {
+): Promise<Pick<Settings, "get" | "getAgentDir" | "set" | "flush">> {
 	const configPath = path.join(agentDir, "config.yml");
 	let rawConfig: unknown = {};
 	try {
@@ -139,7 +147,7 @@ export async function loadLightweightDaemonSettings(
 async function resolveDaemonSettings(
 	agentDir: string,
 	deps: RunDaemonInternalDeps,
-): Promise<Pick<Settings, "get" | "getAgentDir" | "set">> {
+): Promise<Pick<Settings, "get" | "getAgentDir" | "set" | "flush">> {
 	if (deps.SettingsImpl) return await deps.SettingsImpl.init({ agentDir });
 	return await loadLightweightDaemonSettings(agentDir);
 }

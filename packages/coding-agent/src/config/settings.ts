@@ -374,6 +374,25 @@ export class Settings {
 		}
 	}
 
+	/**
+	 * Like {@link flush}, but rejects if the durable save fails instead of
+	 * swallowing the error. Use where the caller must confirm persistence before
+	 * reporting success (e.g. the Telegram `/rich` toggle). In-memory instances
+	 * ({@link isolated}) short-circuit in {@link #saveNow} and never throw.
+	 */
+	async flushOrThrow(): Promise<void> {
+		if (this.#saveTimer) {
+			clearTimeout(this.#saveTimer);
+			this.#saveTimer = undefined;
+		}
+		if (this.#savePromise) {
+			await this.#savePromise;
+		}
+		if (this.#modified.size > 0) {
+			await this.#saveNow({ throwOnError: true });
+		}
+	}
+
 	async cloneForCwd(cwd: string): Promise<Settings> {
 		const cloned = new Settings({
 			cwd,
@@ -817,7 +836,7 @@ export class Settings {
 		}, 100);
 	}
 
-	async #saveNow(): Promise<void> {
+	async #saveNow(options: { throwOnError?: boolean } = {}): Promise<void> {
 		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
 
 		const configPath = this.#configPath;
@@ -845,6 +864,10 @@ export class Settings {
 			// Re-add failed paths for retry
 			for (const p of modifiedPaths) {
 				this.#modified.add(p);
+			}
+			if (options.throwOnError) {
+				this.#rebuildMerged();
+				throw error;
 			}
 		}
 

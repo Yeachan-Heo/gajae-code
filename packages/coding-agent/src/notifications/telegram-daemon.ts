@@ -111,6 +111,21 @@ export const CLIENT_PING_PONG_CAPABILITY = "client_ping_pong";
 export const NOTIFICATION_PROTOCOL_VERSION = 2;
 
 const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
+
+/**
+ * Durably persist a `/rich` toggle. A real {@link Settings} exposes
+ * `flushOrThrow()`, which rejects on a failed config.yml write (its `set()` is a
+ * fire-and-forget whose background save swallows errors). The lightweight daemon
+ * settings has no `flushOrThrow` — its `set()` already wrote durably and throws
+ * on failure — so its plain `flush()` no-op drain is sufficient.
+ */
+async function flushRichToggleSettings(settings: Settings): Promise<void> {
+	if (typeof settings.flushOrThrow === "function") {
+		await settings.flushOrThrow();
+		return;
+	}
+	await settings.flush();
+}
 const RATE_LIMIT_FLUSH_INTERVAL_MS = 1_000;
 // How often the daemon rescans for newly-started sessions. This MUST run
 // independently of the Telegram getUpdates long-poll (up to 25s): otherwise a
@@ -2415,6 +2430,15 @@ export class TelegramNotificationDaemon {
 				}
 				try {
 					await this.opts.settings.set("notifications.telegram.rich.enabled", desired);
+					// Confirm success only after a DURABLE write. The real Settings.set is
+					// a synchronous fire-and-forget whose queued save (Settings.#saveNow)
+					// swallows write errors, and Settings.flush() inherits that — neither
+					// rejects on a failed config.yml write. flushOrThrow() rethrows the
+					// durable-write failure so it lands in the catch below (in-memory
+					// isolated Settings short-circuit and never throw). The lightweight
+					// daemon settings has no flushOrThrow: its set() already wrote durably
+					// (and throws on failure), so its flush() is only a no-op drain.
+					await flushRichToggleSettings(this.opts.settings);
 				} catch (err) {
 					logger.warn(
 						`notifications: /rich settings write failed (${err instanceof Error ? err.message : String(err)}); runtime unchanged`,

@@ -3741,4 +3741,50 @@ describe("telegram daemon /rich toggle (G005)", () => {
 		);
 		expect(s.get("notifications.telegram.rich.enabled")).toBe(true);
 	});
+
+	test("/rich confirms success only after a durable flushOrThrow (swallowed background save)", async () => {
+		const agentDir = tempAgentDir();
+		// The real Settings.set is a synchronous fire-and-forget whose background
+		// #saveNow swallows write errors, so flushOrThrow() is the only signal of a
+		// failed config.yml write. Simulate set() succeeding while flushOrThrow()
+		// rejects, and assert /rich does NOT confirm success.
+		const base = setPrivateAgentDir(settings(agentDir), agentDir);
+		const s = new Proxy(base, {
+			get(target, prop) {
+				if (prop === "set") return async () => undefined;
+				if (prop === "flushOrThrow")
+					return async () => {
+						throw new Error("config.yml write failed");
+					};
+				const value = Reflect.get(target, prop, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		}) as Settings;
+		const bot = new RichFakeBotApi();
+		bot.call = (async (method: string, body: any) => {
+			bot.calls.push({ method, body });
+			if (method === "getChat") return { ok: true, result: { id: body.chat_id, type: "private" } };
+			if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+			return { ok: true, result: true };
+		}) as any;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot as any,
+			rich: { enabled: true },
+		});
+		await daemon.handleTelegramUpdate({
+			update_id: 952,
+			message: { chat: { id: 42, type: "private" }, text: "/rich off", message_id: 1 },
+		});
+		// A durable-write failure is reported as "unchanged"; success is never confirmed.
+		expect(
+			bot.calls.some(
+				c => c.method === "sendMessage" && c.body.text === "Rich messages: unchanged (settings write failed)",
+			),
+		).toBe(true);
+		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.text === "Rich messages: off")).toBe(false);
+	});
 });
