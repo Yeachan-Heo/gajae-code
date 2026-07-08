@@ -180,6 +180,27 @@ describe("resolveGjcTmuxBinary", () => {
 		});
 		expect(resolved.isPsmux).toBe(true);
 	});
+
+	it("treats a selected Windows psmux executable as psmux even with a generic tmux banner", () => {
+		const resolved = resolveGjcTmuxBinary({
+			platform: "win32",
+			env: {},
+			runner: buildRunner(tmuxVersionOutput()),
+		});
+		expect(resolved.command).toBe("psmux");
+		expect(resolved.isPsmux).toBe(true);
+	});
+
+	it("treats an explicit Windows psmux path as psmux without relying on the version banner", () => {
+		const resolved = resolveGjcTmuxBinary({
+			platform: "win32",
+			env: { GJC_TEAM_TMUX_COMMAND: "C:\\tools\\psmux.exe" },
+			runner: buildRunner(tmuxVersionOutput()),
+		});
+		expect(resolved.command).toBe("C:\\tools\\psmux.exe");
+		expect(resolved.viaExplicitOverride).toBe(true);
+		expect(resolved.isPsmux).toBe(true);
+	});
 });
 
 describe("probePsmux", () => {
