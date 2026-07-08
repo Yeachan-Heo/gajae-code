@@ -397,6 +397,25 @@ export function isToolAllowed(name: string): boolean {
 		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
 	});
 
+	it("does not trigger from CI path-only non-computer settings-schema edit", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "@goal computer gate fixture" });
+		await startNextUltragoalGoal({ cwd: root });
+		await writeQaArtifacts(root);
+		const savedChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/src/config/settings-schema.ts";
+		try {
+			const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+				row => row.id !== "blast-radius",
+			);
+			const qa = executorQa({ computerTouching: false, cases, surface: "native" });
+			expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+		} finally {
+			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;
+		}
+	});
+
 	it("triggers from a computer-specific settings-schema diff", async () => {
 		const root = await tempDir();
 		await initRepo(root);

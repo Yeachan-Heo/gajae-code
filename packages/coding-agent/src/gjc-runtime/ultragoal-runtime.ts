@@ -4544,6 +4544,15 @@ function parseGitNameStatus(output: string): UltragoalChangeSetPath[] {
 	return rows;
 }
 
+function categorizeCiChangedPath(value: string): UltragoalChangeCategory {
+	// CI_DEV_CHANGED_PATHS intentionally carries path names only. Mixed registries
+	// such as settings-schema.ts require diff-level narrowing; without the diff,
+	// treating the whole registry as computer-control source forces the mandatory
+	// computer red-team suite on unrelated settings changes.
+	if (isSettingsSchemaPath(value)) return "other";
+	return categorizeComputerChangePath(value);
+}
+
 function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 	const raw = process.env.CI_DEV_CHANGED_PATHS;
 	if (!raw) return [];
@@ -4554,7 +4563,7 @@ function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 		.map(pathValue => ({
 			path: normalizeRepoPath(pathValue),
 			status: "unknown" as UltragoalChangeStatus,
-			category: categorizeComputerChangePath(pathValue),
+			category: categorizeCiChangedPath(pathValue),
 		}));
 }
 
