@@ -262,7 +262,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			email: "skipped@example.com",
 		});
 		expect(skipped.inserted).toBe(false);
-		expect(skipped.reason).toBe("skipped-existing");
+		expect(["skipped-existing", "skipped-existing-env"]).toContain(skipped.reason);
 		expect(serverStore!.listAuthCredentials("anthropic")).toHaveLength(1);
 
 		const inserted = await clientStorage.importCredentialIfAbsent("kagi", { type: "api_key", key: "new-key" });

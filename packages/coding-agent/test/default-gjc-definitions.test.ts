@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -31,7 +31,10 @@ function extractPromptSection(content: string, sectionName: string): string {
 }
 
 async function makeTempRoot(): Promise<string> {
-	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-definitions-"));
+	// Keep project-discovery fixtures outside the real user HOME even when
+	// TMPDIR points at ~/tmp; otherwise walk-up discovery can pick up
+	// ~/.gjc/agents as a project config directory.
+	const tempRoot = await fs.mkdtemp(path.join(path.sep, "tmp", "gjc-default-definitions-"));
 	tempRoots.push(tempRoot);
 	return tempRoot;
 }
@@ -41,9 +44,11 @@ async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-home-"));
 	tempRoots.push(home);
 	process.env.HOME = home;
+	const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
 	try {
 		return await fn(home);
 	} finally {
+		homedirSpy.mockRestore();
 		if (originalHome === undefined) {
 			delete process.env.HOME;
 		} else {

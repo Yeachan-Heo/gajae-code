@@ -33,6 +33,8 @@ function scrub(text: string): string {
 	return text
 		.replaceAll(/\/var\/folders\/[^\n"]+/g, "/tmp/SCRUBBED")
 		.replaceAll(/\/private\/var\/[^\n"]+/g, "/tmp/SCRUBBED")
+		.replaceAll(/\/home\/bellman\/tmp\/skill-tool-[^\n"]+/g, "/tmp/SCRUBBED")
+		.replaceAll(/\/home\/bellman\/tmp\/gjc-[^\n"]+/g, "/tmp/SCRUBBED")
 		.replaceAll(/\/tmp\/skill-tool-[^\n"]+/g, "/tmp/SCRUBBED")
 		.replaceAll(/\/tmp\/gjc-[^\n"]+/g, "/tmp/SCRUBBED")
 		.replaceAll(/[0-9a-f]{64}/g, "<sha256>")
