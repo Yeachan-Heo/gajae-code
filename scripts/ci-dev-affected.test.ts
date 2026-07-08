@@ -453,4 +453,23 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		const entries = describeTasks(tasks);
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.native).toBe(true);
 	});
+
+	test("full-workspace changes partition root tests into matrix shards", () => {
+		const tasks = planTasks(["tsconfig.json"], [codingAgent]);
+		const keys = tasks.map(task => task.key);
+
+		expect(keys).toContain("root-check");
+		expect(keys).toContain("root-test:release");
+		expect(keys).not.toContain("root-test");
+		expect(tasks.filter(task => task.key.startsWith("test:@gajae-code/coding-agent:shard-")).map(task => task.key)).toEqual([
+			"test:@gajae-code/coding-agent:shard-1-of-8",
+			"test:@gajae-code/coding-agent:shard-2-of-8",
+			"test:@gajae-code/coding-agent:shard-3-of-8",
+			"test:@gajae-code/coding-agent:shard-4-of-8",
+			"test:@gajae-code/coding-agent:shard-5-of-8",
+			"test:@gajae-code/coding-agent:shard-6-of-8",
+			"test:@gajae-code/coding-agent:shard-7-of-8",
+			"test:@gajae-code/coding-agent:shard-8-of-8",
+		]);
+	});
 });
