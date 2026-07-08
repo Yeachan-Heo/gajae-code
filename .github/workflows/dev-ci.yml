@@ -120,7 +120,11 @@ jobs:
     needs: [affected-plan, affected-native]
     if: ${{ always() && needs.affected-plan.outputs.relevant == 'true' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-native.result != 'failure' && needs.affected-native.result != 'cancelled' }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # Broad PR-mode root-test shards run the same root TypeScript test command as
+    # the full CI job, whose timeout is 60m. Keep this shard budget aligned so
+    # valid broad PRs do not get cancelled at 30m before the test command can
+    # finish.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.affected-plan.outputs.matrix) }}
