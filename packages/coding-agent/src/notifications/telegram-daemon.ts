@@ -245,7 +245,30 @@ async function writeJsonAtomic(fsImpl: TelegramDaemonFs, file: string, data: unk
 	const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
 	await fsImpl.writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
 	await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
-	await fsImpl.rename(tmp, file);
+	// Windows: renaming the tmp file onto an existing target throws EPERM/EACCES/
+	// EBUSY when the destination is concurrently opened (another owner/reader, the
+	// reload controller, or antivirus). POSIX replaces atomically; Windows does not.
+	// A single failure here previously crashed the daemon heartbeat with an uncaught
+	// exception. Retry with bounded backoff so a transient lock is tolerated, and drop
+	// a stubborn target so the next rename has a clear path.
+	const RETRYABLE = new Set(["EPERM", "EACCES", "EBUSY", "EEXIST"]);
+	const maxAttempts = 12;
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await fsImpl.rename(tmp, file);
+			return;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code ?? "";
+			if (!RETRYABLE.has(code) || attempt >= maxAttempts) {
+				await fsImpl.unlink(tmp).catch(() => undefined);
+				throw error;
+			}
+			if ((code === "EEXIST" || code === "EPERM") && attempt >= 3) {
+				await fsImpl.unlink(file).catch(() => undefined);
+			}
+			await new Promise(resolve => setTimeout(resolve, 25 * attempt));
+		}
+	}
 }
 
 async function tryOpenWx(fsImpl: TelegramDaemonFs, file: string): Promise<boolean> {
