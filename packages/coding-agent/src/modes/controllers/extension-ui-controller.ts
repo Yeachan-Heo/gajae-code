@@ -23,6 +23,7 @@ import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
+import { applyInjectedUserSubmission } from "../utils/injected-user-submission";
 import { classifyHookSelectorBellEvent, ringTerminalBell } from "../utils/terminal-bell";
 
 const MAX_WIDGET_LINES = 10;
@@ -954,7 +955,13 @@ export class ExtensionUiController {
 	}
 
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {
-		this.ctx.session.sendUserMessage(content, options).catch((err: unknown) => {
+		// Compute queued BEFORE send: prompt() may flip session.isStreaming synchronously.
+		const queued = Boolean(options?.deliverAs) || this.ctx.session.isStreaming;
+		// Call send first so the busy/queued path finds the session queue populated
+		// (queueSteer/queueFollowUp push synchronously) before refreshing pending display.
+		const send = this.ctx.session.sendUserMessage(content, options);
+		applyInjectedUserSubmission(this.ctx, { content, queued });
+		send.catch((err: unknown) => {
 			this.ctx.showError(`Extension sendUserMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 		});
 	};

@@ -118,6 +118,27 @@ describe("EventController message_start (user role)", () => {
 		expect(setText).not.toHaveBeenCalled();
 		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
 	});
+
+	it("skips the duplicate add and preserves the draft for an optimistic-only injected message", async () => {
+		// Injected (e.g. Telegram) messages set ONLY optimisticUserMessageSignature via
+		// applyInjectedUserSubmission. Since wasLocallySubmitted derives from `|| wasOptimistic`,
+		// message_start must skip the duplicate chat add, must NOT clear the local draft, and
+		// must consume the optimistic signature.
+		const message = createUserMessage("remote injected");
+		const signature = "remote injected\u00000";
+		const { ctx, editor, setText, addMessageToChat } = createContext({
+			editorText: "local draft in progress",
+			optimisticSignature: signature,
+		});
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({ type: "message_start", message });
+
+		expect(addMessageToChat).not.toHaveBeenCalled();
+		expect(setText).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("local draft in progress");
+		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
+	});
 });
 
 function createIrcMessage(timestamp: number): CustomMessage<{ from: string; message: string }> {
