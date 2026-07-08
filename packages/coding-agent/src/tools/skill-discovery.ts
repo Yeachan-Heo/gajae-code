@@ -39,6 +39,13 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 		this.description = prompt.render(skillDiscoveryDescription);
 	}
 
+	#getRuntimeSkillPolicy() {
+		return {
+			...this.#session.settings.getGroup("skills"),
+			disabledExtensions: this.#session.settings.get("disabledExtensions"),
+		};
+	}
+
 	static createIf(session: ToolSession): SkillDiscoveryTool | null {
 		if (session.settings.get("skill.enabled") === false) return null;
 		return new SkillDiscoveryTool(session);
@@ -55,6 +62,7 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 				query: input.query,
 				source: input.source ?? "all",
 				limit: input.limit,
+				policy: this.#getRuntimeSkillPolicy(),
 			});
 			return {
 				content: [{ type: "text", text: JSON.stringify({ candidates, count: candidates.length }, null, 2) }],

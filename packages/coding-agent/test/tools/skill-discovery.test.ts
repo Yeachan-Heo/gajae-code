@@ -42,13 +42,23 @@ function createSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolS
 		...overrides,
 	};
 }
+function runtimeSkillSettings(overrides: Record<string, unknown> = {}): Settings {
+	return Settings.isolated({
+		"skill.enabled": true,
+		"skills.enabled": true,
+		"skills.enablePiProject": true,
+		"skills.enablePiUser": true,
+		...overrides,
+	});
+}
 
 describe("SkillDiscoveryTool", () => {
 	it("discovers project runtime skills from .gjc/skills", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skills-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
+		const settings = runtimeSkillSettings();
 
-		const tool = new SkillDiscoveryTool(createSession(cwd));
+		const tool = new SkillDiscoveryTool(createSession(cwd, { settings }));
 		const result = await tool.execute("call", { query: "project helper" });
 		const details = result.details;
 		expect(details).toBeDefined();
@@ -66,8 +76,9 @@ describe("SkillDiscoveryTool", () => {
 		process.env.HOME = home;
 		try {
 			await makeSkill(path.join(home, ".gjc", "skills"), "user-helper", "User helper skill");
+			const settings = runtimeSkillSettings();
 
-			const tool = new SkillDiscoveryTool(createSession(cwd));
+			const tool = new SkillDiscoveryTool(createSession(cwd, { settings }));
 			const result = await tool.execute("call", { source: "user" });
 			const details = result.details;
 			expect(details).toBeDefined();
@@ -83,6 +94,7 @@ describe("SkillDiscoveryTool", () => {
 	it("does not return bundled built-in skills or grow the core prompt catalog", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-builtins-suppressed-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
+		const settings = runtimeSkillSettings();
 		const builtInSkill: Skill = {
 			name: "ralplan",
 			description: "Built-in planning workflow",
@@ -91,7 +103,7 @@ describe("SkillDiscoveryTool", () => {
 			source: "embedded",
 		};
 
-		const tool = new SkillDiscoveryTool(createSession(cwd, { skills: [builtInSkill] }));
+		const tool = new SkillDiscoveryTool(createSession(cwd, { skills: [builtInSkill], settings }));
 		const result = await tool.execute("call", {});
 		const details = result.details;
 		expect(details).toBeDefined();
@@ -123,10 +135,12 @@ describe("SkillDiscoveryTool", () => {
 	it("loads selected discovered skill content through the skill invocation path", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-selected-skill-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill", "Loaded narrowly.");
+		const settings = runtimeSkillSettings();
 		const sent: Array<{ content: string; details?: unknown }> = [];
 		const tool = new SkillTool(
 			createSession(cwd, {
 				skills: [],
+				settings,
 				sendCustomMessage: async message => {
 					sent.push({ content: String(message.content), details: message.details });
 				},
@@ -138,5 +152,78 @@ describe("SkillDiscoveryTool", () => {
 		expect(sent).toHaveLength(1);
 		expect(sent[0]?.content).toContain("Loaded narrowly.");
 		expect(sent[0]?.details).toEqual(expect.objectContaining({ name: "project-helper" }));
+	});
+
+	it("does not discover or invoke runtime skills when skills.enabled is false", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-disabled-"));
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill", "Blocked body.");
+		const settings = runtimeSkillSettings({ "skills.enabled": false });
+
+		const discovery = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {});
+		expect(discovery.details?.candidates).toEqual([]);
+
+		const sent: Array<{ content: string; details?: unknown }> = [];
+		const tool = new SkillTool(
+			createSession(cwd, {
+				skills: [],
+				settings,
+				sendCustomMessage: async message => {
+					sent.push({ content: String(message.content), details: message.details });
+				},
+			}),
+		);
+		await expect(tool.execute("call", { name: "project-helper" })).rejects.toThrow(/unknown skill/);
+		expect(sent).toHaveLength(0);
+	});
+
+	it("applies source enable flags and skill filters to discovery and invocation", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-policy-"));
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-policy-home-"));
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill", "Project body.");
+		await makeSkill(path.join(home, ".gjc", "skills"), "user-helper", "User helper skill", "User body.");
+		const originalHome = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			const projectDisabled = runtimeSkillSettings({ "skills.enablePiProject": false });
+			let result = await new SkillDiscoveryTool(createSession(cwd, { settings: projectDisabled })).execute(
+				"call",
+				{},
+			);
+			expect(result.details?.candidates.map(candidate => candidate.name)).toEqual(["user-helper"]);
+			await expect(
+				new SkillTool(
+					createSession(cwd, { skills: [], settings: projectDisabled, sendCustomMessage: async () => {} }),
+				).execute("call", { name: "project-helper" }),
+			).rejects.toThrow(/unknown skill/);
+
+			const userDisabled = runtimeSkillSettings({ "skills.enablePiUser": false });
+			result = await new SkillDiscoveryTool(createSession(cwd, { settings: userDisabled })).execute("call", {});
+			expect(result.details?.candidates.map(candidate => candidate.name)).toEqual(["project-helper"]);
+			await expect(
+				new SkillTool(
+					createSession(cwd, { skills: [], settings: userDisabled, sendCustomMessage: async () => {} }),
+				).execute("call", { name: "user-helper" }),
+			).rejects.toThrow(/unknown skill/);
+
+			for (const settings of [
+				runtimeSkillSettings({ "skills.ignoredSkills": ["project-*"] }),
+				runtimeSkillSettings({ "skills.includeSkills": ["user-*"] }),
+				runtimeSkillSettings({ disabledExtensions: ["skill:project-helper"] }),
+			]) {
+				result = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {
+					source: "project",
+				});
+				expect(result.details?.candidates).toEqual([]);
+				await expect(
+					new SkillTool(createSession(cwd, { skills: [], settings, sendCustomMessage: async () => {} })).execute(
+						"call",
+						{ name: "project-helper" },
+					),
+				).rejects.toThrow(/unknown skill/);
+			}
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+		}
 	});
 });

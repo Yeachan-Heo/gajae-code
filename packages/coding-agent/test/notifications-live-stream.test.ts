@@ -386,7 +386,7 @@ test("a split live preview edits one message and never fans out continuation sen
 		type: "turn_stream",
 		sessionId: "S",
 		phase: "live",
-		text: "가".repeat(9000) + " more",
+		text: `${"가".repeat(9000)} more`,
 		messageRef: "1",
 	});
 	expect(bot.calls.filter(c => c.method === "sendMessage").length).toBe(0);

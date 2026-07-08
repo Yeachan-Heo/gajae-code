@@ -1928,7 +1928,7 @@ export class TelegramNotificationDaemon {
 					// upstream edit/send path, so off behavior is byte-identical.
 					if (
 						shouldPromoteRich({
-							enabled: this.opts.rich?.enabled === false ? false : true,
+							enabled: this.opts.rich?.enabled !== false,
 							send,
 						})
 					) {

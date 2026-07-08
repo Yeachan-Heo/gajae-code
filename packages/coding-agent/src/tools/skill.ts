@@ -65,6 +65,13 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 		this.description = prompt.render(skillDescription);
 	}
 
+	#getRuntimeSkillPolicy() {
+		return {
+			...this.#session.settings.getGroup("skills"),
+			disabledExtensions: this.#session.settings.get("disabledExtensions"),
+		};
+	}
+
 	static createIf(session: ToolSession): SkillTool | null {
 		// The tool can only chain when the session can deliver the same-turn
 		// custom message. Without `sendCustomMessage` (e.g. minimal tool
@@ -113,7 +120,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 
 			const skill =
 				skills.find(s => s.name === requestedName) ??
-				(await findRuntimeSkillByName(this.#session.cwd, requestedName));
+				(await findRuntimeSkillByName(this.#session.cwd, requestedName, this.#getRuntimeSkillPolicy()));
 			if (!skill) {
 				const available = skills.map(s => s.name).sort();
 				const hint =

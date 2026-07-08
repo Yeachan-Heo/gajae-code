@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Skill as CapabilitySkill } from "../capability/skill";
+import type { SkillsSettings } from "../config/settings-schema";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
 import type { Skill } from "./skills";
 
@@ -21,6 +22,7 @@ export interface DiscoverRuntimeSkillsOptions {
 	query?: string;
 	limit?: number;
 	source?: RuntimeSkillDiscoverySource | "all";
+	policy?: SkillsSettings;
 }
 
 function getRuntimeHome(): string {
@@ -77,7 +79,38 @@ function toRuntimeSkill(skill: CapabilitySkill, source: RuntimeSkillDiscoverySou
 		_source: { ...skill._source, providerName: "Runtime skill discovery" },
 	};
 }
+function sourceEnabled(source: RuntimeSkillDiscoverySource, policy: SkillsSettings | undefined): boolean {
+	if (policy?.enabled !== true) return false;
+	if (source === "project") return policy.enablePiProject === true;
+	if (source === "user") return policy.enablePiUser === true;
+	return false;
+}
 
+function matchesIncludePatterns(name: string, includeSkills: string[] | undefined): boolean {
+	if (!includeSkills || includeSkills.length === 0) return true;
+	return includeSkills.some(pattern => new Bun.Glob(pattern).match(name));
+}
+
+function matchesIgnorePatterns(name: string, ignoredSkills: string[] | undefined): boolean {
+	if (!ignoredSkills || ignoredSkills.length === 0) return false;
+	return ignoredSkills.some(pattern => new Bun.Glob(pattern).match(name));
+}
+
+function isDisabledSkill(name: string, disabledExtensions: string[] | undefined): boolean {
+	return (disabledExtensions ?? []).some(id => id === `skill:${name}`);
+}
+
+function isAllowedByPolicy(
+	skill: CapabilitySkill,
+	source: RuntimeSkillDiscoverySource,
+	policy: SkillsSettings | undefined,
+): boolean {
+	if (!sourceEnabled(source, policy)) return false;
+	if (isDisabledSkill(skill.name, policy?.disabledExtensions)) return false;
+	if (matchesIgnorePatterns(skill.name, policy?.ignoredSkills)) return false;
+	if (!matchesIncludePatterns(skill.name, policy?.includeSkills)) return false;
+	return true;
+}
 function matchesQuery(candidate: RuntimeSkillDiscoveryCandidate, query: string): boolean {
 	const normalized = query.trim().toLowerCase();
 	if (!normalized) return true;
@@ -103,8 +136,9 @@ export async function discoverRuntimeSkills(
 ): Promise<RuntimeSkillDiscoveryCandidate[]> {
 	const home = options.home ?? getRuntimeHome();
 	const source = options.source ?? "all";
+	const policy = options.policy;
 	const scanJobs: Array<Promise<{ skill: CapabilitySkill; source: RuntimeSkillDiscoverySource }[]>> = [];
-	if (source === "all" || source === "project") {
+	if ((source === "all" || source === "project") && sourceEnabled("project", policy)) {
 		for (const dir of getProjectSkillDirs(options.cwd, home)) {
 			scanJobs.push(
 				scanSkillsFromDir(
@@ -114,7 +148,7 @@ export async function discoverRuntimeSkills(
 			);
 		}
 	}
-	if (source === "all" || source === "user") {
+	if ((source === "all" || source === "user") && sourceEnabled("user", policy)) {
 		scanJobs.push(
 			scanSkillsFromDir(
 				{ cwd: options.cwd, home, repoRoot: home },
@@ -127,6 +161,7 @@ export async function discoverRuntimeSkills(
 	const seenPaths = new Set<string>();
 	const candidates: RuntimeSkillDiscoveryCandidate[] = [];
 	for (const entry of (await Promise.all(scanJobs)).flat()) {
+		if (!isAllowedByPolicy(entry.skill, entry.source, policy)) continue;
 		const realPath = await realPathOrSelf(entry.skill.path);
 		if (seenPaths.has(realPath) || seenNames.has(entry.skill.name)) continue;
 		seenPaths.add(realPath);
@@ -148,24 +183,34 @@ export async function discoverRuntimeSkills(
 export async function findRuntimeSkillByName(
 	cwd: string,
 	name: string,
+	policy?: SkillsSettings,
 	home = getRuntimeHome(),
 ): Promise<Skill | undefined> {
 	const normalized = name.trim();
 	if (!normalized) return undefined;
-	const scanJobs = [
-		...getProjectSkillDirs(cwd, home).map(dir =>
+	const scanJobs: Array<Promise<{ skill: CapabilitySkill; source: RuntimeSkillDiscoverySource }[]>> = [];
+	if (sourceEnabled("project", policy)) {
+		scanJobs.push(
+			...getProjectSkillDirs(cwd, home).map(dir =>
+				scanSkillsFromDir(
+					{ cwd, home, repoRoot: home },
+					{ dir, providerId: "runtime", level: "project", requireDescription: true },
+				).then(result => result.items.map(skill => ({ skill, source: "project" as const }))),
+			),
+		);
+	}
+	if (sourceEnabled("user", policy)) {
+		scanJobs.push(
 			scanSkillsFromDir(
 				{ cwd, home, repoRoot: home },
-				{ dir, providerId: "runtime", level: "project", requireDescription: true },
-			).then(result => result.items.map(skill => ({ skill, source: "project" as const }))),
-		),
-		scanSkillsFromDir(
-			{ cwd, home, repoRoot: home },
-			{ dir: path.join(home, ".gjc", "skills"), providerId: "runtime", level: "user", requireDescription: true },
-		).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
-	];
+				{ dir: path.join(home, ".gjc", "skills"), providerId: "runtime", level: "user", requireDescription: true },
+			).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
+		);
+	}
 	for (const entry of (await Promise.all(scanJobs)).flat()) {
-		if (entry.skill.name === normalized) return toRuntimeSkill(entry.skill, entry.source);
+		if (entry.skill.name === normalized && isAllowedByPolicy(entry.skill, entry.source, policy)) {
+			return toRuntimeSkill(entry.skill, entry.source);
+		}
 	}
 	return undefined;
 }
