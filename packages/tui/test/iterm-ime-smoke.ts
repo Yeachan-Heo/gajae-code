@@ -1,13 +1,13 @@
 #!/usr/bin/env bun
 
-Bun.env.GJC_TUI_IME_CURSOR ??= "1";
+import { Editor } from "@gajae-code/tui/components/editor";
+import { Text } from "@gajae-code/tui/components/text";
+import { matchesKey } from "@gajae-code/tui/keys";
+import { ProcessTerminal } from "@gajae-code/tui/terminal";
+import { TUI } from "@gajae-code/tui/tui";
+import { defaultEditorTheme } from "./test-themes";
 
-const { matchesKey } = await import("@gajae-code/tui/keys");
-const { Editor } = await import("@gajae-code/tui/components/editor");
-const { Text } = await import("@gajae-code/tui/components/text");
-const { ProcessTerminal } = await import("@gajae-code/tui/terminal");
-const { TUI } = await import("@gajae-code/tui/tui");
-const { defaultEditorTheme } = await import("./test-themes");
+Bun.env.GJC_TUI_IME_CURSOR ??= "1";
 
 function readNumberFlag(name: string, fallback: number): number {
 	const args = process.argv.slice(2);
@@ -89,8 +89,8 @@ tui.addChild(instructions);
 tui.addChild(editor);
 tui.setFocus(editor);
 
-let streamTimer: ReturnType<typeof setInterval> | undefined;
-let autoExitTimer: ReturnType<typeof setTimeout> | undefined;
+let streamTimer: NodeJS.Timeout | undefined;
+let autoExitTimer: NodeJS.Timeout | undefined;
 let streaming = true;
 let stopped = false;
 
