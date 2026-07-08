@@ -139,6 +139,22 @@ describe("CustomEditor queue keybinding", () => {
 		expect(editor.getText()).toBe("a\n");
 	});
 
+	it("keeps macOS Option+Enter legacy CR sequence as newline when queue uses Alt+Q", () => {
+		const editor = createEditor();
+		const onQueue = vi.fn();
+		const onSubmit = vi.fn();
+		editor.onQueue = onQueue;
+		editor.onSubmit = onSubmit;
+		editor.setActionKeys("app.message.queue", [defaultMessageQueueKeysForPlatform("darwin")]);
+
+		editor.handleInput("a");
+		editor.handleInput("\x1b\r");
+
+		expect(onQueue).not.toHaveBeenCalled();
+		expect(onSubmit).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("a\n");
+	});
+
 	it("submits plain Enter", () => {
 		const editor = createEditor();
 		const onSubmit = vi.fn();
