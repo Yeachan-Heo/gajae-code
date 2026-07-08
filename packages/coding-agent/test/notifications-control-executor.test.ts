@@ -3,7 +3,7 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import { executeNotificationControlCommand } from "../src/notifications";
 
 function fakeCtx(overrides: Record<string, unknown> = {}) {
-	let compactCalls: Array<string | undefined> = [];
+	const compactCalls: Array<string | undefined> = [];
 	return {
 		ctx: {
 			getContextUsage: () => ({ tokens: 25_000, contextWindow: 272_000, percent: 9.191 }),

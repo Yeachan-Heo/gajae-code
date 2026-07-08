@@ -69,7 +69,9 @@ export function parseTelegramControlCommand(text: string, botUsername?: string):
 	switch (commandName) {
 		case "usage":
 		case "context":
-			return rest.length === 0 ? { kind: "command", command: { name: commandName } } : { kind: "invalid", commandName, usage };
+			return rest.length === 0
+				? { kind: "command", command: { name: commandName } }
+				: { kind: "invalid", commandName, usage };
 		case "compact": {
 			const instructions = trimmed.slice(rawRoot.length + 1).trim();
 			return { kind: "command", command: instructions ? { name: "compact", instructions } : { name: "compact" } };

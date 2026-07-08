@@ -1006,7 +1006,9 @@ describe("telegram daemon", () => {
 		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
 		expect(sent.some(frame => frame.type === "reply")).toBe(false);
 		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
-		expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).startsWith("Usage: /reasoning"))).toBe(true);
+		expect(
+			bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).startsWith("Usage: /reasoning")),
+		).toBe(true);
 	});
 
 	test("persisted seen update ids suppress duplicate threaded injection after restart", async () => {
