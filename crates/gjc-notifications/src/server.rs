@@ -18,6 +18,7 @@ use std::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	},
+	time::Duration,
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -41,6 +42,38 @@ use crate::{
 		ReplyRejected, ServerHello, ServerMessage, SessionReady, capabilities,
 	},
 };
+
+/// Default cadence for refreshing a running endpoint's `updated_at`.
+///
+/// Keeps freshness/TTL checks passing for a long-lived session; 60s sits
+/// comfortably under half of common external discovery TTLs (e.g. 300s), per
+/// the discovery contract.
+pub const DEFAULT_ENDPOINT_REFRESH_MS: u64 = 60_000;
+/// Floor for the refresh cadence: a positive override below this is clamped up
+/// so a misconfiguration cannot spin the endpoint writer into a tight rewrite
+/// loop.
+const MIN_ENDPOINT_REFRESH_MS: u64 = 1_000;
+/// Env override for the endpoint refresh cadence (milliseconds). `0` disables
+/// the heartbeat; unset/empty/unparseable falls back to
+/// [`DEFAULT_ENDPOINT_REFRESH_MS`].
+pub const ENDPOINT_REFRESH_ENV: &str = "GJC_NOTIFICATIONS_ENDPOINT_REFRESH_MS";
+
+/// Resolve the endpoint-refresh cadence from an optional env override.
+///
+/// - unset / empty / unparseable -> [`DEFAULT_ENDPOINT_REFRESH_MS`]
+/// - `0` -> `None` (heartbeat disabled)
+/// - otherwise -> the value, clamped up to [`MIN_ENDPOINT_REFRESH_MS`]
+#[must_use]
+pub fn resolve_endpoint_refresh_interval(raw: Option<&str>) -> Option<Duration> {
+	match raw.map(str::trim) {
+		None | Some("") => Some(Duration::from_millis(DEFAULT_ENDPOINT_REFRESH_MS)),
+		Some(value) => match value.parse::<u64>() {
+			Ok(0) => None,
+			Ok(ms) => Some(Duration::from_millis(ms.max(MIN_ENDPOINT_REFRESH_MS))),
+			Err(_) => Some(Duration::from_millis(DEFAULT_ENDPOINT_REFRESH_MS)),
+		},
+	}
+}
 
 /// Configuration for a per-session notification server.
 #[derive(Debug, Clone)]
@@ -103,14 +136,18 @@ struct ServerState {
 /// [`ServerHandle::stop`] (idempotent) for deterministic shutdown.
 #[derive(Debug)]
 pub struct ServerHandle {
-	addr:        SocketAddr,
-	state:       Arc<ServerState>,
-	cancel:      CancellationToken,
-	accept_task: tokio::task::JoinHandle<()>,
-	session_id:  String,
-	state_root:  Option<PathBuf>,
-	reply_rx:    Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Reply>>>,
-	inbound_rx:  Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>>>,
+	addr:         SocketAddr,
+	state:        Arc<ServerState>,
+	cancel:       CancellationToken,
+	accept_task:  tokio::task::JoinHandle<()>,
+	session_id:   String,
+	state_root:   Option<PathBuf>,
+	reply_rx:     Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Reply>>>,
+	inbound_rx:   Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>>>,
+	/// Background heartbeat that refreshes the endpoint file's `updated_at`;
+	/// aborted on [`ServerHandle::stop`] / drop. `None` when no state root or
+	/// when disabled.
+	refresh_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ServerHandle {
@@ -245,6 +282,10 @@ impl ServerHandle {
 	pub fn stop(&self) {
 		self.cancel.cancel();
 		self.accept_task.abort();
+		// Abort the heartbeat before removing the file so it cannot re-create it.
+		if let Some(task) = self.refresh_task.as_ref() {
+			task.abort();
+		}
 		if let Some(root) = self.state_root.as_deref() {
 			let _ = crate::discovery::remove_endpoint(root, &self.session_id);
 		}
@@ -271,6 +312,8 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 	let addr = listener.local_addr()?;
 	let (tx, _rx) = broadcast::channel(256);
 
+	let cancel = CancellationToken::new();
+	let mut refresh_task: Option<tokio::task::JoinHandle<()>> = None;
 	if let Some(state_root) = config.state_root.as_deref() {
 		let record = EndpointRecord::new(
 			config.session_id.as_str(),
@@ -279,6 +322,18 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 			config.token.as_str(),
 		);
 		crate::discovery::write_endpoint(state_root, &record)?;
+		// Keep `updated_at` fresh while alive so TTL/freshness checks (clean_stale and
+		// external discovery clients) never judge a long-lived session stale.
+		if let Some(interval) =
+			resolve_endpoint_refresh_interval(std::env::var(ENDPOINT_REFRESH_ENV).ok().as_deref())
+		{
+			refresh_task = Some(tokio::spawn(endpoint_refresh_loop(
+				state_root.to_path_buf(),
+				record,
+				interval,
+				cancel.clone(),
+			)));
+		}
 	}
 
 	let (reply_tx, reply_rx) = if config.forward_replies {
@@ -298,7 +353,6 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 		inbound_tx,
 		session_ready: Mutex::new(None),
 	});
-	let cancel = CancellationToken::new();
 	let accept_task = tokio::spawn(accept_loop(listener, Arc::clone(&state), cancel.clone()));
 	Ok(ServerHandle {
 		addr,
@@ -309,6 +363,7 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 		state_root: config.state_root,
 		reply_rx: Mutex::new(reply_rx),
 		inbound_rx: Mutex::new(Some(inbound_rx)),
+		refresh_task,
 	})
 }
 
@@ -320,6 +375,31 @@ async fn accept_loop(listener: TcpListener, state: Arc<ServerState>, cancel: Can
 				  let Ok((stream, _peer)) = accepted else { continue };
 				  tokio::spawn(handle_conn(stream, Arc::clone(&state), cancel.clone()));
 			 }
+		}
+	}
+}
+
+/// Periodically refresh the running session's endpoint `updated_at` so
+/// freshness/TTL checks keep passing while the process is alive. Runs until the
+/// server's [`CancellationToken`] fires; a transient filesystem error is
+/// ignored and retried on the next tick.
+async fn endpoint_refresh_loop(
+	state_root: PathBuf,
+	record: EndpointRecord,
+	interval: Duration,
+	cancel: CancellationToken,
+) {
+	loop {
+		tokio::select! {
+			() = cancel.cancelled() => break,
+			() = tokio::time::sleep(interval) => {
+				// Re-check cancellation so a tick that fires concurrently with stop()
+				// cannot re-create a file stop() is about to remove.
+				if cancel.is_cancelled() {
+					break;
+				}
+				let _ = crate::discovery::refresh_endpoint(&state_root, &record);
+			}
 		}
 	}
 }
@@ -533,6 +613,28 @@ mod tests {
 
 	use super::*;
 	use crate::protocol::{ActionKind, Ping, Reply};
+
+	#[test]
+	fn resolve_endpoint_refresh_interval_precedence() {
+		let def = Duration::from_millis(DEFAULT_ENDPOINT_REFRESH_MS);
+		// unset / empty / unparseable -> default
+		assert_eq!(resolve_endpoint_refresh_interval(None), Some(def));
+		assert_eq!(resolve_endpoint_refresh_interval(Some("")), Some(def));
+		assert_eq!(resolve_endpoint_refresh_interval(Some("  ")), Some(def));
+		assert_eq!(resolve_endpoint_refresh_interval(Some("nope")), Some(def));
+		// 0 -> disabled
+		assert_eq!(resolve_endpoint_refresh_interval(Some("0")), None);
+		// positive below the floor -> clamped up
+		assert_eq!(
+			resolve_endpoint_refresh_interval(Some("500")),
+			Some(Duration::from_millis(MIN_ENDPOINT_REFRESH_MS)),
+		);
+		// positive above the floor -> taken as-is (whitespace tolerated)
+		assert_eq!(
+			resolve_endpoint_refresh_interval(Some(" 120000 ")).map(|d| d.as_millis()),
+			Some(120_000),
+		);
+	}
 
 	fn ask(id: &str) -> ActionNeeded {
 		ActionNeeded {

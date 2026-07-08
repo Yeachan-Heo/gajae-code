@@ -523,6 +523,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | ------------------------- | ------------------------------------------------------------------------------------- |
 | `GJC_NOTIFICATIONS`        | `off` / `0` / `false` suppress desktop notifications                                  |
 | `GJC_NOTIFY`               | `off` / `0` / `false` suppress the per-turn completion notification (terminal bell, backgrounded desktop toast, and `completion.notifyCommand`) for this process only; `config.yml` is untouched and child processes inherit it. Use for non-interactive runs (`gjc -p --no-session`) so an inherited global `completion.notify=on` does not fire per run. |
+| `GJC_NOTIFICATIONS_ENDPOINT_REFRESH_MS` | Cadence (ms) at which a live session rewrites its notification endpoint discovery file's `updatedAt` so long-lived sessions stay fresh for TTL/discovery checks. Default `60000`; `0` disables the heartbeat; positive values are floored at `1000`. |
 | `GJC_TUI_WRITE_LOG`        | If set, logs TUI writes to file                                                       |
 | `GJC_HARDWARE_CURSOR`      | If `1`, enables hardware cursor mode                                                  |
 | `GJC_CLEAR_ON_SHRINK`      | If `1`, clears empty rows when content shrinks                                        |

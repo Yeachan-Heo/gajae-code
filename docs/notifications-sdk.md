@@ -72,6 +72,15 @@ A running session writes a discovery file at:
 - The **token is in the file** because clients need it; never log it raw.
   Stale files (dead PID, past TTL, or explicitly marked) are cleaned up on the
   next start.
+- **`updatedAt` is kept fresh by a heartbeat.** While the session is alive the
+  server periodically rewrites `updatedAt` (default every 60s; other fields,
+  including lifecycle markers, are preserved), so a long-lived session is not
+  judged stale by a TTL/freshness check. Tune the cadence with
+  `GJC_NOTIFICATIONS_ENDPOINT_REFRESH_MS` (milliseconds; `0` disables the
+  heartbeat, values are floored at 1000ms). A client applying its own TTL should
+  keep it comfortably above this cadence (the default sits under half of a 300s
+  TTL). If the file is deleted while the session is alive, the next heartbeat
+  recreates it.
 
 Connect with the token as a query parameter:
 

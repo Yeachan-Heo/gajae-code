@@ -23,8 +23,8 @@ pub use actions::{ActionRegistry, ReplyClassification, ReplyOutcome};
 pub use control_server::{ControlServerConfig, ControlServerHandle, start_control};
 pub use discovery::{
 	ControlEndpointRecord, EndpointRecord, clean_stale, control_endpoint_path, endpoint_path,
-	read_control_endpoint, read_endpoint, remove_control_endpoint, write_control_endpoint,
-	write_endpoint,
+	read_control_endpoint, read_endpoint, refresh_endpoint, remove_control_endpoint,
+	write_control_endpoint, write_endpoint,
 };
 pub use lifecycle::{
 	LifecycleClientMessage, LifecycleEndpoint, LifecycleErrorReason, LifecycleServerMessage,

@@ -283,6 +283,34 @@ pub fn read_endpoint(path: &Path) -> Option<EndpointRecord> {
 	serde_json::from_slice(&bytes).ok()
 }
 
+/// Refresh a live session's endpoint file so TTL/freshness checks keep passing.
+///
+/// [`write_endpoint`] stamps `updated_at` once at server start. Without a
+/// periodic refresh, a long-lived session's endpoint is judged stale by any TTL
+/// check ([`clean_stale`] and external discovery clients) even though its
+/// process is alive. This bumps `updated_at` to now while preserving every
+/// other on-disk field (e.g. lifecycle markers). If the file is missing — e.g.
+/// a client cleaned it up during the pre-refresh gap — it is recreated from
+/// `base` so a live session self-heals. A record another actor already retired
+/// (`stopped_at` set) is left untouched and `Ok(None)` is returned.
+///
+/// # Errors
+/// Propagates filesystem errors from the underlying write.
+pub fn refresh_endpoint(
+	state_root: &Path,
+	base: &EndpointRecord,
+) -> std::io::Result<Option<PathBuf>> {
+	let path = endpoint_path(state_root, &base.session_id);
+	let mut record = match read_endpoint(&path) {
+		Some(existing) if existing.stopped_at.is_some() => return Ok(None),
+		Some(existing) => existing,
+		None => base.clone(),
+	};
+	record.updated_at = now_millis();
+	record.stale = false;
+	Ok(Some(write_endpoint(state_root, &record)?))
+}
+
 /// Remove a session's endpoint file. If removal fails, mark it `stale` instead.
 ///
 /// # Errors
@@ -598,6 +626,58 @@ mod tests {
 		let root = temp_root();
 		let missing = root.join("does-not-exist");
 		assert_eq!(clean_stale(&missing, 1000).unwrap(), 0);
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn refresh_endpoint_bumps_updated_at_and_preserves_fields() {
+		let root = temp_root();
+		let mut rec = EndpointRecord::new("sess-r", "127.0.0.1", 5555, "tok").with_lifecycle(
+			"lc_1",
+			"sess-r",
+			Some("prompt_1".into()),
+		);
+		rec.updated_at = 1; // simulate a long-lived, never-refreshed endpoint
+		write_endpoint(&root, &rec).unwrap();
+
+		let path = refresh_endpoint(&root, &rec).unwrap().expect("refreshed");
+		let read = read_endpoint(&path).unwrap();
+		assert!(read.updated_at > 1, "updated_at bumped, got {}", read.updated_at);
+		// Every other field is preserved.
+		assert_eq!(read.started_at, rec.started_at);
+		assert_eq!(read.token, rec.token);
+		assert_eq!(read.lifecycle_request_id.as_deref(), Some("lc_1"));
+		assert_eq!(read.startup_prompt_ref.as_deref(), Some("prompt_1"));
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn refresh_endpoint_self_heals_when_file_missing() {
+		let root = temp_root();
+		let base = EndpointRecord::new("sess-heal", "127.0.0.1", 5556, "tok");
+		// No file on disk (e.g. a client cleaned it up during the gap).
+		assert!(read_endpoint(&endpoint_path(&root, "sess-heal")).is_none());
+
+		let path = refresh_endpoint(&root, &base).unwrap().expect("recreated");
+		let read = read_endpoint(&path).unwrap();
+		assert_eq!(read.session_id, "sess-heal");
+		assert!(!read.stale);
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn refresh_endpoint_skips_a_retired_record() {
+		let root = temp_root();
+		let mut rec = EndpointRecord::new("sess-stop", "127.0.0.1", 5557, "tok");
+		rec.stopped_at = Some(now_millis());
+		rec.updated_at = 1;
+		write_endpoint(&root, &rec).unwrap();
+
+		assert!(refresh_endpoint(&root, &rec).unwrap().is_none(), "retired record not refreshed");
+		// The on-disk record is untouched (still stopped, updated_at not bumped).
+		let read = read_endpoint(&endpoint_path(&root, "sess-stop")).unwrap();
+		assert_eq!(read.updated_at, 1);
+		assert!(read.stopped_at.is_some());
 		fs::remove_dir_all(&root).ok();
 	}
 }
