@@ -121,10 +121,11 @@ jobs:
     if: ${{ always() && needs.affected-plan.outputs.relevant == 'true' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-native.result != 'failure' && needs.affected-native.result != 'cancelled' }}
     runs-on: ubuntu-22.04
     # Broad push-mode coding-agent/root test shards have repeatedly reached the
-    # previous 30m cap without assertion failures. Give the affected shard runner
-    # enough room to finish those known-heavy shards while preserving a bounded
-    # timeout for genuine hangs.
-    timeout-minutes: 60
+    # previous 30m cap, and root-test can exceed 60m on large affected sets
+    # without assertion failures. Give the affected shard runner enough room to
+    # finish those known-heavy shards while preserving a bounded timeout for
+    # genuine hangs.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.affected-plan.outputs.matrix) }}
