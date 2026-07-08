@@ -1,12 +1,32 @@
 // MUST be first: pins terminal-capability env before @gajae-code/tui evaluates.
 import "./render-goldens-env";
 import { describe, expect, it } from "bun:test";
-import { Editor, Text, TUI } from "@gajae-code/tui";
+import { type Component, Editor, Text, TUI } from "@gajae-code/tui";
 import { defaultEditorTheme } from "./test-themes";
 import { VirtualTerminal } from "./virtual-terminal";
 
 const nextTick = (): Promise<void> => new Promise<void>(r => process.nextTick(r));
 const macro0 = (): Promise<void> => new Promise<void>(r => setTimeout(r, 0));
+
+class MutableTranscript implements Component {
+	#lines: string[];
+
+	constructor(lines: string[]) {
+		this.#lines = [...lines];
+	}
+
+	setLines(lines: string[]): void {
+		this.#lines = [...lines];
+	}
+
+	invalidate(): void {
+		// No cached state
+	}
+
+	render(): string[] {
+		return [...this.#lines];
+	}
+}
 
 interface Harness {
 	term: VirtualTerminal;
@@ -179,6 +199,40 @@ describe("keyboard input priority scheduler red-team", () => {
 			expect(bytes).toBeLessThan(typed.length * 600);
 		} finally {
 			h.tui.stop();
+		}
+	}, 30000);
+
+	it("re-anchors the macOS IME cursor after transcript repaint when the prompt draft is unchanged", async () => {
+		const previousIme = Bun.env.GJC_TUI_IME_CURSOR;
+		Bun.env.GJC_TUI_IME_CURSOR = "1";
+		const term = new VirtualTerminal(40, 6);
+		const tui = new TUI(term, false);
+		const transcript = new MutableTranscript(Array.from({ length: 10 }, (_v, i) => `row-${i}`));
+		const editor = new Editor(defaultEditorTheme);
+		tui.addChild(transcript);
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		try {
+			tui.start();
+			await term.waitForRender();
+			editor.setText("하");
+			tui.requestRender(false, "test.seed-draft");
+			await term.waitForRender();
+			term.clearWriteLog();
+
+			transcript.setLines(Array.from({ length: 11 }, (_v, i) => `row-${i}`));
+			tui.requestRender(false, "stream.chunk");
+			await term.waitForRender();
+
+			const writes = term.getWriteLog();
+			expect(writes.length).toBeGreaterThanOrEqual(2);
+			expect(writes.at(-2)).toContain("\x1b[?2026h");
+			expect(writes.at(-2)).toContain("\x1b[?2026l");
+			expect(writes.at(-1)).toBe("\x1b[6G\x1b[2 q\x1b[?25h");
+		} finally {
+			tui.stop();
+			if (previousIme === undefined) delete Bun.env.GJC_TUI_IME_CURSOR;
+			else Bun.env.GJC_TUI_IME_CURSOR = previousIme;
 		}
 	}, 30000);
 });
