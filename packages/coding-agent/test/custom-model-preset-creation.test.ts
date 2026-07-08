@@ -4,15 +4,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
+import * as modelProfileActivation from "@gajae-code/coding-agent/config/model-profile-activation";
 import {
 	materializeModelProfileForDeletion,
 	restoreMaterializedModelProfileForDeletion,
 } from "@gajae-code/coding-agent/config/model-profile-activation";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
-import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { type CustomModelProfileEditSnapshot, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import type { ModelProfileConfig } from "@gajae-code/coding-agent/config/models-config-schema";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { CustomModelPresetWizardComponent } from "@gajae-code/coding-agent/modes/components/custom-model-preset-wizard";
+import {
+	CustomModelPresetWizardComponent,
+	type CustomModelPresetWizardSubmit,
+} from "@gajae-code/coding-agent/modes/components/custom-model-preset-wizard";
 import {
 	ModelSelectorComponent,
 	type ModelSelectorSelection,
@@ -85,6 +89,138 @@ function createRegistry(profiles: Iterable<[string, ModelProfileDefinition]> = [
 		getModelProfile: (name: string) => profileMap.get(name),
 		getApiKeyForProvider: async (providerId: string) => options.apiKeyForProvider?.(providerId) ?? "key",
 	} as unknown as ModelRegistry;
+}
+
+const editableUserProfile: ModelProfileDefinition = {
+	name: "my-fast",
+	displayName: "My Fast",
+	requiredProviders: ["my-oai"],
+	modelMapping: { default: "my-oai/gpt-custom:low" },
+	source: "user",
+};
+
+function createEditControllerHarness(config: {
+	profileName: string;
+	profile: ModelProfileDefinition;
+	activeModelProfile?: string;
+	defaultModelProfile?: string;
+	notifyConfigChanged?: () => Promise<void>;
+}) {
+	const profiles = new Map<string, ModelProfileDefinition>([[config.profileName, config.profile]]);
+	const editCalls: Array<{ name: string; definition: ModelProfileConfig }> = [];
+	const restoreCalls: CustomModelProfileEditSnapshot[] = [];
+	const registry = {
+		...createRegistry(profiles),
+		getModelProfiles: () => new Map(profiles),
+		getModelProfile: (name: string) => profiles.get(name),
+		getAvailableModelProfileNames: () => [...profiles.keys()],
+		editCustomModelProfile: async (name: string, definition: ModelProfileConfig) => {
+			editCalls.push({ name, definition });
+			const previous = profiles.get(name);
+			const snapshot: CustomModelProfileEditSnapshot = {
+				profileName: name,
+				previousProfile: {
+					...(previous?.displayName !== undefined ? { display_name: previous.displayName } : {}),
+					required_providers: previous ? [...previous.requiredProviders] : [],
+					model_mapping: previous ? { ...previous.modelMapping } : {},
+				},
+				previousModelsConfigText: "PREVIOUS_MODELS_YAML",
+			};
+			profiles.set(name, {
+				name,
+				displayName: definition.display_name,
+				requiredProviders: [...definition.required_providers],
+				modelMapping: { ...definition.model_mapping },
+				source: "user",
+			});
+			return { profile: profiles.get(name) as ModelProfileDefinition, snapshot };
+		},
+		restoreCustomModelProfileEdit: async (snapshot: CustomModelProfileEditSnapshot) => {
+			restoreCalls.push(snapshot);
+			const prev = snapshot.previousProfile;
+			profiles.set(snapshot.profileName, {
+				name: snapshot.profileName,
+				displayName: prev.display_name,
+				requiredProviders: [...prev.required_providers],
+				modelMapping: { ...prev.model_mapping },
+				source: "user",
+			});
+		},
+		refresh: async () => {},
+	};
+	const settings = Settings.isolated(
+		config.defaultModelProfile ? { "modelProfile.default": config.defaultModelProfile } : {},
+	);
+	const activeProfiles: (string | undefined)[] = [config.activeModelProfile];
+	const statuses: string[] = [];
+	const errors: string[] = [];
+	let selector: ModelSelectorComponent | undefined;
+	let wizard: CustomModelPresetWizardComponent | undefined;
+	const ctx = {
+		ui: { setFocus: () => {}, requestRender: () => {} },
+		editorContainer: {
+			clear: () => {},
+			addChild: (child: unknown) => {
+				if (child instanceof ModelSelectorComponent) selector = child;
+				if (child instanceof CustomModelPresetWizardComponent) wizard = child;
+			},
+		},
+		editor: {},
+		settings,
+		session: {
+			model: currentModel("my-oai", "gpt-custom"),
+			thinkingLevel: ThinkingLevel.Low,
+			sessionId: "session",
+			scopedModels: [],
+			modelRegistry: registry,
+			getActiveModelProfile: () => activeProfiles.at(-1),
+			setActiveModelProfile: (name?: string) => activeProfiles.push(name),
+			isFastForProvider: () => false,
+			isFastForSubagentProvider: () => false,
+			isFastModeActive: () => false,
+		},
+		statusLine: { invalidate: () => {} },
+		updateEditorBorderColor: () => {},
+		showStatus: (message: string) => statuses.push(message),
+		showError: (message: string) => errors.push(message),
+		notifyConfigChanged: config.notifyConfigChanged ?? (async () => {}),
+	};
+	return {
+		ctx,
+		settings,
+		registry,
+		editCalls,
+		restoreCalls,
+		statuses,
+		errors,
+		getSelector: () => selector,
+		getWizard: () => wizard,
+	};
+}
+
+async function runCustomPresetEditSave(
+	harness: ReturnType<typeof createEditControllerHarness>,
+	profileName: string,
+): Promise<void> {
+	new SelectorController(harness.ctx as never).showModelSelector();
+	await Bun.sleep(0);
+	const selector = harness.getSelector();
+	if (!selector) throw new Error("selector not mounted");
+	await selector.__testSelectPresetAction(profileName, "edit");
+	await Bun.sleep(0);
+	const wizard = harness.getWizard();
+	if (!wizard) throw new Error("edit wizard not mounted");
+	wizard.handleInput("s");
+	await Bun.sleep(10);
+}
+
+function spyValidateCandidateOk() {
+	return spyOn(modelProfileActivation, "validateModelProfileCandidate").mockImplementation(async options => ({
+		ok: true,
+		profile: options.profile,
+		requiredProviders: options.profile.required_providers,
+		normalizedMapping: options.profile.model_mapping,
+	}));
 }
 
 describe("custom model preset creation", () => {
@@ -793,5 +929,224 @@ describe("custom model preset creation", () => {
 		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("custom-default");
+	});
+
+	it("edit wizard prepopulates roles in preset preview order", () => {
+		const editSnapshot: ModelProfileConfig = {
+			display_name: "My Fast",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom:low" },
+		};
+		const wizard = new CustomModelPresetWizardComponent(
+			editSnapshot,
+			() => {},
+			() => {},
+			() => {},
+			{
+				mode: "edit",
+				profileName: "my-fast",
+				modelRegistry: createRegistry(),
+			},
+		);
+		const text = normalizeRenderedText(wizard.render(120).join("\n"));
+		let last = -1;
+		for (const label of ["DEFAULT:", "EXECUTOR:", "PLANNER:", "CRITIC:", "ARCHITECT:"]) {
+			const idx = text.indexOf(label);
+			expect(idx).toBeGreaterThan(last);
+			last = idx;
+		}
+	});
+
+	it("edit wizard Save emits onSubmit with unchanged name and derived providers", () => {
+		const editSnapshot: ModelProfileConfig = {
+			display_name: "My Fast",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom:low" },
+		};
+		const registry = createRegistry([], { models: [currentModel("anthropic", "claude")] });
+		let submitted: CustomModelPresetWizardSubmit | undefined;
+		const wizard = new CustomModelPresetWizardComponent(
+			editSnapshot,
+			input => {
+				submitted = input;
+			},
+			() => {},
+			() => {},
+			{ mode: "edit", profileName: "my-fast", modelRegistry: registry },
+		);
+		wizard.handleInput("\n"); // DEFAULT role -> model pick
+		wizard.handleInput("\n"); // choose anthropic/claude -> effort pick
+		wizard.handleInput("\n"); // choose no-explicit-effort
+		wizard.handleInput("s"); // save
+		expect(submitted).toBeDefined();
+		expect(submitted?.name).toBe("my-fast");
+		expect(submitted?.profile.display_name).toBe("My Fast");
+		expect(submitted?.profile.model_mapping).toEqual({ default: "anthropic/claude" });
+		expect(submitted?.profile.required_providers).toEqual(["anthropic"]);
+	});
+
+	it("create-mode wizard still renders the single-input snapshot form", () => {
+		const wizard = new CustomModelPresetWizardComponent(
+			snapshot,
+			() => {},
+			() => {},
+			() => {},
+		);
+		const text = normalizeRenderedText(wizard.render(120).join("\n"));
+		expect(text).toContain("Enter a unique preset id:");
+		expect(text).toContain("Snapshot:");
+		expect(text).not.toContain("Roles");
+	});
+
+	it("edit controller blocks the config write when candidate validation fails", async () => {
+		const validateSpy = spyOn(modelProfileActivation, "validateModelProfileCandidate").mockResolvedValue({
+			ok: false,
+			reason: "Selector cannot resolve",
+		});
+		try {
+			const harness = createEditControllerHarness({
+				profileName: "my-fast",
+				profile: editableUserProfile,
+				activeModelProfile: "my-fast",
+				defaultModelProfile: "my-fast",
+			});
+			await runCustomPresetEditSave(harness, "my-fast");
+			expect(harness.editCalls).toEqual([]);
+			expect(harness.statuses).toEqual([]);
+			const rendered = normalizeRenderedText(harness.getWizard()!.render(120).join("\n"));
+			expect(rendered).toContain("Selector cannot resolve");
+		} finally {
+			validateSpy.mockRestore();
+		}
+	});
+
+	it("edit controller re-applies once with persistDefault true when active and default", async () => {
+		const validateSpy = spyValidateCandidateOk();
+		const activateSpy = spyOn(modelProfileActivation, "activateModelProfile").mockResolvedValue(undefined);
+		try {
+			const harness = createEditControllerHarness({
+				profileName: "my-fast",
+				profile: editableUserProfile,
+				activeModelProfile: "my-fast",
+				defaultModelProfile: "my-fast",
+			});
+			await runCustomPresetEditSave(harness, "my-fast");
+			expect(harness.editCalls).toHaveLength(1);
+			expect(activateSpy).toHaveBeenCalledTimes(1);
+			expect(activateSpy.mock.calls[0]?.[1]).toEqual({ persistDefault: true });
+			expect(harness.errors).toEqual([]);
+			expect(harness.statuses.length).toBeGreaterThan(0);
+		} finally {
+			validateSpy.mockRestore();
+			activateSpy.mockRestore();
+		}
+	});
+
+	it("edit controller does not re-apply when default but not active", async () => {
+		const validateSpy = spyValidateCandidateOk();
+		const activateSpy = spyOn(modelProfileActivation, "activateModelProfile").mockResolvedValue(undefined);
+		try {
+			const harness = createEditControllerHarness({
+				profileName: "my-fast",
+				profile: editableUserProfile,
+				activeModelProfile: "other-active",
+				defaultModelProfile: "my-fast",
+			});
+			await runCustomPresetEditSave(harness, "my-fast");
+			expect(harness.editCalls).toHaveLength(1);
+			expect(activateSpy).not.toHaveBeenCalled();
+			expect(harness.settings.get("modelProfile.default")).toBe("my-fast");
+			expect(harness.statuses.length).toBeGreaterThan(0);
+		} finally {
+			validateSpy.mockRestore();
+			activateSpy.mockRestore();
+		}
+	});
+
+	it("edit controller re-applies once with persistDefault false when active only", async () => {
+		const validateSpy = spyValidateCandidateOk();
+		const activateSpy = spyOn(modelProfileActivation, "activateModelProfile").mockResolvedValue(undefined);
+		try {
+			const harness = createEditControllerHarness({
+				profileName: "my-fast",
+				profile: editableUserProfile,
+				activeModelProfile: "my-fast",
+				defaultModelProfile: "other-default",
+			});
+			await runCustomPresetEditSave(harness, "my-fast");
+			expect(activateSpy).toHaveBeenCalledTimes(1);
+			expect(activateSpy.mock.calls[0]?.[1]).toEqual({ persistDefault: false });
+			expect(harness.statuses.length).toBeGreaterThan(0);
+		} finally {
+			validateSpy.mockRestore();
+			activateSpy.mockRestore();
+		}
+	});
+
+	it("edit controller does not re-apply when inactive and not default", async () => {
+		const validateSpy = spyValidateCandidateOk();
+		const activateSpy = spyOn(modelProfileActivation, "activateModelProfile").mockResolvedValue(undefined);
+		try {
+			const harness = createEditControllerHarness({
+				profileName: "my-fast",
+				profile: editableUserProfile,
+				activeModelProfile: "other-active",
+				defaultModelProfile: "other-default",
+			});
+			await runCustomPresetEditSave(harness, "my-fast");
+			expect(harness.editCalls).toHaveLength(1);
+			expect(activateSpy).not.toHaveBeenCalled();
+			expect(harness.statuses.length).toBeGreaterThan(0);
+		} finally {
+			validateSpy.mockRestore();
+			activateSpy.mockRestore();
+		}
+	});
+
+	it("edit controller restores config and suppresses success when activation prepare fails", async () => {
+		const validateSpy = spyValidateCandidateOk();
+		const activateSpy = spyOn(modelProfileActivation, "activateModelProfile").mockRejectedValue(
+			new Error("prepare exploded"),
+		);
+		try {
+			const harness = createEditControllerHarness({
+				profileName: "my-fast",
+				profile: editableUserProfile,
+				activeModelProfile: "my-fast",
+				defaultModelProfile: "my-fast",
+			});
+			await runCustomPresetEditSave(harness, "my-fast");
+			expect(harness.editCalls).toHaveLength(1);
+			expect(harness.restoreCalls).toHaveLength(1);
+			expect(harness.restoreCalls[0]?.previousModelsConfigText).toBe("PREVIOUS_MODELS_YAML");
+			expect(harness.statuses).toEqual([]);
+			expect(harness.errors.some(message => message.includes("prepare exploded"))).toBe(true);
+		} finally {
+			validateSpy.mockRestore();
+			activateSpy.mockRestore();
+		}
+	});
+
+	it("edit controller restores config and suppresses success when activation apply fails", async () => {
+		const validateSpy = spyValidateCandidateOk();
+		const activateSpy = spyOn(modelProfileActivation, "activateModelProfile").mockRejectedValue(
+			new Error("apply exploded"),
+		);
+		try {
+			const harness = createEditControllerHarness({
+				profileName: "my-fast",
+				profile: editableUserProfile,
+				activeModelProfile: "my-fast",
+				defaultModelProfile: "my-fast",
+			});
+			await runCustomPresetEditSave(harness, "my-fast");
+			expect(harness.editCalls).toHaveLength(1);
+			expect(harness.restoreCalls).toHaveLength(1);
+			expect(harness.statuses).toEqual([]);
+			expect(harness.errors.some(message => message.includes("apply exploded"))).toBe(true);
+		} finally {
+			validateSpy.mockRestore();
+			activateSpy.mockRestore();
+		}
 	});
 });

@@ -6,6 +6,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	ModelSelectorComponent,
 	type ModelSelectorSelection,
+	PROFILE_ROLE_PREVIEW_ORDER,
 } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -380,5 +381,83 @@ describe("model selector profiles", () => {
 		expect(session.setModelTemporaryCalls).toEqual([]);
 		expect(session.model).toBe(alternateModel);
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
+	});
+
+	test("PROFILE_ROLE_PREVIEW_ORDER matches the preset preview role order", () => {
+		expect(PROFILE_ROLE_PREVIEW_ORDER).toEqual(["default", "executor", "planner", "critic", "architect"]);
+	});
+
+	test("custom preset action tuple routes apply, set default, edit, rename, and delete by action id", async () => {
+		installTestTheme();
+		const emitted: ModelSelectorSelection[] = [];
+		const selector = createSelector(selection => {
+			emitted.push(selection);
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		await selector.__testSelectPresetAction("profile-a", "apply");
+		await selector.__testSelectPresetAction("profile-a", "setDefault");
+		await selector.__testSelectPresetAction("profile-a", "edit");
+		await selector.__testSelectPresetAction("profile-a", "rename");
+		await selector.__testSelectPresetAction("profile-a", "delete");
+
+		expect(emitted).toEqual([
+			{ kind: "profile", profileName: "profile-a", setDefault: false },
+			{ kind: "profile", profileName: "profile-a", setDefault: true },
+			{ kind: "editProfile", profileName: "profile-a" },
+			{ kind: "renameProfile", profileName: "profile-a" },
+			{ kind: "deleteProfile", profileName: "profile-a" },
+		]);
+	});
+
+	test("built-in preset action tuple omits edit, rename, and delete", async () => {
+		installTestTheme();
+		const builtin: ModelProfileDefinition = {
+			name: "codex-medium",
+			displayName: "Codex Medium",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "builtin",
+		};
+		const profiles = new Map<string, ModelProfileDefinition>([[builtin.name, builtin]]);
+		const registry = {
+			...createRegistry(),
+			getModelProfiles: () => new Map(profiles),
+			getModelProfile: (name: string) => profiles.get(name),
+			getAvailableModelProfileNames: () => [...profiles.keys()],
+		};
+		const ui = { requestRender: vi.fn() } as unknown as TUI;
+		const emitted: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			ui,
+			undefined,
+			Settings.isolated(),
+			registry as never,
+			[],
+			selection => {
+				emitted.push(selection);
+			},
+			() => {},
+			{},
+		);
+		await Bun.sleep(10);
+		installTestTheme();
+
+		await expect(selector.__testSelectPresetAction("codex-medium", "edit")).rejects.toThrow(
+			"Preset scope action not available: edit",
+		);
+		await expect(selector.__testSelectPresetAction("codex-medium", "rename")).rejects.toThrow(
+			"Preset scope action not available: rename",
+		);
+		await expect(selector.__testSelectPresetAction("codex-medium", "delete")).rejects.toThrow(
+			"Preset scope action not available: delete",
+		);
+		await selector.__testSelectPresetAction("codex-medium", "apply");
+		await selector.__testSelectPresetAction("codex-medium", "setDefault");
+		expect(emitted).toEqual([
+			{ kind: "profile", profileName: "codex-medium", setDefault: false },
+			{ kind: "profile", profileName: "codex-medium", setDefault: true },
+		]);
 	});
 });

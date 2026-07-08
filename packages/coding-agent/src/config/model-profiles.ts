@@ -1,6 +1,6 @@
 import { sanitizeText } from "@gajae-code/utils";
 import type { GjcModelAssignmentTargetId } from "./model-registry";
-import type { ModelsConfig } from "./models-config-schema";
+import type { ModelProfileConfig, ModelsConfig } from "./models-config-schema";
 
 export type ModelProfileRole = GjcModelAssignmentTargetId;
 
@@ -32,6 +32,16 @@ function parseModelSelectorProvider(selector: string): string | undefined {
 	const slashIdx = selector.indexOf("/");
 	if (slashIdx <= 0) return undefined;
 	return selector.slice(0, slashIdx);
+}
+
+export function deriveRequiredProviders(modelMapping: ModelProfileConfig["model_mapping"]): string[] {
+	const providers = new Set<string>();
+	for (const selector of Object.values(modelMapping)) {
+		if (!selector) continue;
+		const provider = parseModelSelectorProvider(selector);
+		if (provider) providers.add(provider);
+	}
+	return [...providers].sort((a, b) => a.localeCompare(b));
 }
 
 export function deriveModelProfileMappedProviders(definition: Pick<ModelProfileDefinition, "modelMapping">): string[] {

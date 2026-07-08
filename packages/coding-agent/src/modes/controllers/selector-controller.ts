@@ -11,9 +11,14 @@ import {
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	restoreMaterializedModelProfileForDeletion,
+	validateModelProfileCandidate,
 } from "../../config/model-profile-activation";
 import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
-import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
+import {
+	type CustomModelProfileEditSnapshot,
+	GJC_MODEL_ASSIGNMENT_TARGETS,
+	type GjcModelAssignmentTargetId,
+} from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { type Settings, settings } from "../../config/settings";
@@ -400,6 +405,117 @@ export class SelectorController {
 			}
 			this.ctx.showError(`Preset delete failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
+
+	async #editCustomModelPreset(profileName: string, modelSelector: ModelSelectorComponent): Promise<void> {
+		const existing = this.ctx.session.modelRegistry.getModelProfile(profileName);
+		if (!existing) {
+			this.ctx.showError(`Custom model preset does not exist: ${profileName}`);
+			this.ctx.ui.requestRender();
+			return;
+		}
+		const editSnapshot: ModelProfileConfig = {
+			...(existing.displayName !== undefined ? { display_name: existing.displayName } : {}),
+			model_mapping: { ...existing.modelMapping },
+			required_providers: [...existing.requiredProviders],
+		};
+		this.showSelector(done => {
+			let wizard: CustomModelPresetWizardComponent;
+			const submit = async (input: CustomModelPresetWizardSubmit): Promise<void> => {
+				const validation = await validateModelProfileCandidate({
+					profileName,
+					profile: input.profile,
+					modelRegistry: this.ctx.session.modelRegistry,
+					settings: this.ctx.settings,
+					sessionId: this.ctx.session.sessionId,
+				});
+				if (!validation.ok) {
+					wizard.setSubmitError(validation.reason);
+					return;
+				}
+				const activeProfileName = this.ctx.session.getActiveModelProfile?.();
+				const persistedDefault = this.ctx.settings.get("modelProfile.default");
+				const isActive = activeProfileName === profileName;
+				const isPersistedDefault = persistedDefault === profileName;
+				let snapshot: CustomModelProfileEditSnapshot;
+				try {
+					const result = await this.ctx.session.modelRegistry.editCustomModelProfile(
+						profileName,
+						validation.profile,
+					);
+					snapshot = result.snapshot;
+				} catch (err) {
+					wizard.setSubmitError(`Preset edit failed: ${err instanceof Error ? err.message : String(err)}`);
+					return;
+				}
+				try {
+					if (isActive) {
+						await activateModelProfile(
+							{
+								session: this.ctx.session,
+								modelRegistry: this.ctx.session.modelRegistry,
+								settings: this.ctx.settings,
+								profileName,
+							},
+							{ persistDefault: isPersistedDefault },
+						);
+					}
+					await this.ctx.session.modelRegistry.refresh("offline");
+					await this.ctx.notifyConfigChanged?.();
+				} catch (postWriteErr) {
+					await this.#restoreEditedModelPreset(snapshot, modelSelector);
+					this.ctx.showError(
+						`Preset edit failed: ${postWriteErr instanceof Error ? postWriteErr.message : String(postWriteErr)}`,
+					);
+					this.ctx.ui.requestRender();
+					return;
+				}
+				this.#refreshEditedSelectorState(modelSelector, profileName);
+				this.ctx.showStatus(
+					`Custom model preset updated: ${formatModelProfileDisplayLabel(
+						this.ctx.session.modelRegistry.getModelProfile(profileName) ?? { name: profileName },
+					)}`,
+				);
+				done();
+				this.ctx.ui.requestRender();
+			};
+			wizard = new CustomModelPresetWizardComponent(
+				editSnapshot,
+				input => {
+					void submit(input);
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+				() => this.ctx.ui.requestRender(),
+				{ mode: "edit", profileName, modelRegistry: this.ctx.session.modelRegistry },
+			);
+			return { component: wizard, focus: wizard };
+		});
+	}
+
+	#refreshEditedSelectorState(modelSelector: ModelSelectorComponent, profileName?: string): void {
+		modelSelector.refreshRoleAssignments({
+			currentModel: this.ctx.session.model,
+			currentThinkingLevel: this.ctx.session.thinkingLevel,
+			activeModelProfile:
+				this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
+		});
+		modelSelector.refreshPresetProfiles(profileName);
+	}
+
+	async #restoreEditedModelPreset(
+		snapshot: CustomModelProfileEditSnapshot,
+		modelSelector: ModelSelectorComponent,
+	): Promise<void> {
+		try {
+			await this.ctx.session.modelRegistry.restoreCustomModelProfileEdit(snapshot);
+			await this.ctx.session.modelRegistry.refresh("offline");
+		} catch {
+			// Best-effort config restore; the triggering error is surfaced by the caller.
+		}
+		this.#refreshEditedSelectorState(modelSelector, snapshot.profileName);
 	}
 
 	showCustomProviderWizard(): void {
@@ -876,6 +992,10 @@ export class SelectorController {
 						if (selection.kind === "createProfile") {
 							done();
 							this.showCustomModelPresetWizard(selection.profile);
+							return;
+						}
+						if (selection.kind === "editProfile") {
+							await this.#editCustomModelPreset(selection.profileName, modelSelector);
 							return;
 						}
 						if (selection.kind === "renameProfile") {

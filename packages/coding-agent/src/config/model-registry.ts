@@ -48,6 +48,7 @@ import {
 } from "./model-equivalence";
 import {
 	aggregateModelProfileRequiredProviders,
+	deriveRequiredProviders,
 	type ModelProfileDefinition,
 	mergeModelProfiles,
 } from "./model-profiles";
@@ -999,6 +1000,12 @@ function getConfiguredProviderOrderFromSettings(): string[] {
 	}
 }
 
+export interface CustomModelProfileEditSnapshot {
+	profileName: string;
+	previousProfile: ModelProfileConfig;
+	previousModelsConfigText: string;
+}
+
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
@@ -1664,9 +1671,73 @@ export class ModelRegistry {
 		return profile;
 	}
 
+	async editCustomModelProfile(
+		name: string,
+		definition: ModelProfileConfig,
+	): Promise<{ profile: ModelProfileDefinition; snapshot: CustomModelProfileEditSnapshot }> {
+		const normalizedName = name.trim();
+		if (!normalizedName) throw new Error("Profile name is required.");
+		const checkedDefinition = ProfileDefinitionSchema.safeParse(definition);
+		if (!checkedDefinition.success) {
+			const first = checkedDefinition.error.issues[0];
+			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+			throw new Error(`Custom model profile is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
+		}
+		const { current, profile: previousProfile } = this.#loadCustomProfileForMutation(normalizedName, "edit");
+		const previousModelsConfigText = await this.#readModelsConfigText();
+		const modelMapping = { ...definition.model_mapping };
+		const requiredProviders = deriveRequiredProviders(modelMapping);
+		const nextDefinition: ModelProfileConfig = {
+			...previousProfile,
+			required_providers: requiredProviders,
+			model_mapping: modelMapping,
+		};
+		const nextProfiles = {
+			...(current.profiles ?? {}),
+			[normalizedName]: nextDefinition,
+		};
+		const checkedConfig = ModelsConfigSchema.safeParse({ ...current, profiles: nextProfiles });
+		if (!checkedConfig.success) {
+			const first = checkedConfig.error.issues[0];
+			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
+		}
+		await this.#writeCheckedModelsConfig(checkedConfig.data);
+		// Force a fresh reload so getModelProfiles() reflects the edit before activation,
+		// defeating the mtime cache guard when the write lands in the same millisecond.
+		this.#lastStaticLoadMtime = null;
+		this.#reloadStaticModels();
+		const profile: ModelProfileDefinition = {
+			name: normalizedName,
+			displayName: previousProfile.display_name,
+			requiredProviders,
+			modelMapping,
+			source: "user",
+		};
+		return { profile, snapshot: { profileName: normalizedName, previousProfile, previousModelsConfigText } };
+	}
+
+	async restoreCustomModelProfileEdit(snapshot: CustomModelProfileEditSnapshot): Promise<void> {
+		const modelsPath = this.#modelsConfigFile.path();
+		await fs.mkdir(path.dirname(modelsPath), { recursive: true });
+		await Bun.write(modelsPath, snapshot.previousModelsConfigText);
+		this.#modelsConfigFile.invalidate();
+		// Force a full reload regardless of mtime so getModelProfiles() reflects the restore.
+		this.#lastStaticLoadMtime = null;
+		this.#reloadStaticModels();
+	}
+
+	async #readModelsConfigText(): Promise<string> {
+		try {
+			return await fs.readFile(this.#modelsConfigFile.path(), "utf8");
+		} catch {
+			return "";
+		}
+	}
+
 	#loadCustomProfileForMutation(
 		normalizedName: string,
-		action: "rename" | "delete",
+		action: "edit" | "rename" | "delete",
 	): { current: ModelsConfig; profile: ModelProfileConfig } {
 		const loaded = this.#modelsConfigFile.tryLoad();
 		if (loaded.status === "error") {

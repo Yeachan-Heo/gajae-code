@@ -4,6 +4,7 @@ import type { AgentSession } from "../session/agent-session";
 import { formatClampedModelSelector } from "../thinking";
 import {
 	aggregateModelProfileRequiredProviders,
+	deriveRequiredProviders,
 	formatAvailableProfileNames,
 	formatModelProfileDisplayLabel,
 	resolveProfileBindings,
@@ -15,6 +16,7 @@ import {
 	type ModelRegistry,
 } from "./model-registry";
 import { formatModelSelectorValue, resolveModelRoleValue } from "./model-resolver";
+import { type ModelProfileConfig, ProfileDefinitionSchema } from "./models-config-schema";
 import type { Settings } from "./settings";
 
 const LEGACY_MODEL_PROFILE_ALIASES: ReadonlyMap<string, string> = new Map([["codex-standard", "codex-medium"]]);
@@ -509,4 +511,77 @@ export async function activateModelProfile(
 ): Promise<void> {
 	const prepared = await prepareModelProfileActivation(options);
 	await applyPreparedModelProfileActivation(prepared, applyOptions);
+}
+
+export interface ValidateModelProfileCandidateOptions {
+	profileName: string;
+	profile: ModelProfileConfig;
+	modelRegistry: Pick<
+		ModelRegistry,
+		"getAll" | "getApiKeyForProvider" | "resolveCanonicalModel" | "getCanonicalVariants" | "getCanonicalId"
+	>;
+	settings: Pick<Settings, "get">;
+	sessionId?: string;
+}
+
+export type ValidateModelProfileCandidateResult =
+	| {
+			ok: true;
+			profile: ModelProfileConfig;
+			requiredProviders: string[];
+			normalizedMapping: ModelProfileConfig["model_mapping"];
+	  }
+	| { ok: false; reason: string };
+
+/**
+ * Validate an unsaved custom model profile candidate before any config write.
+ * Checks schema, non-empty role mapping, selector resolution, effort clamping
+ * (clamp is accepted, not rejected), and per-provider credentials.
+ */
+export async function validateModelProfileCandidate(
+	options: ValidateModelProfileCandidateOptions,
+): Promise<ValidateModelProfileCandidateResult> {
+	const parsed = ProfileDefinitionSchema.safeParse(options.profile);
+	if (!parsed.success) {
+		const first = parsed.error.issues[0];
+		const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+		return { ok: false, reason: `Invalid model profile at ${where}: ${first?.message ?? "unknown schema error"}` };
+	}
+	const candidate = parsed.data;
+
+	const mappingEntries = Object.entries(candidate.model_mapping).filter(
+		(entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0,
+	);
+	if (mappingEntries.length === 0) {
+		return { ok: false, reason: "Model profile must map at least one role." };
+	}
+
+	const availableModels = options.modelRegistry.getAll();
+	const normalizedMapping: Record<string, string> = {};
+	for (const [role, selector] of mappingEntries) {
+		const resolved = resolveModelRoleValue(selector, availableModels, {
+			settings: options.settings as Settings,
+			modelRegistry: options.modelRegistry,
+		});
+		if (!resolved.model) {
+			return { ok: false, reason: `Model profile ${role} selector did not resolve: ${selector}` };
+		}
+		normalizedMapping[role] = formatClampedModelSelector(selector, resolved.model);
+	}
+
+	const requiredProviders = deriveRequiredProviders(candidate.model_mapping);
+	for (const provider of requiredProviders) {
+		const apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.sessionId);
+		if (!isAuthenticated(apiKey)) {
+			return { ok: false, reason: formatModelProfileCredentialError(options.profileName, [provider]) };
+		}
+	}
+
+	const normalized = normalizedMapping as ModelProfileConfig["model_mapping"];
+	return {
+		ok: true,
+		profile: { ...candidate, required_providers: requiredProviders, model_mapping: normalized },
+		requiredProviders,
+		normalizedMapping: normalized,
+	};
 }
