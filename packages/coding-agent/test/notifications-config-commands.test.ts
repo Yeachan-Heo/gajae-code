@@ -114,7 +114,11 @@ describe("parseTelegramControlCommand", () => {
 
 	test("unknown commands and wrong bot suffix fall through", () => {
 		expect(parseTelegramControlCommand("/unknown")).toEqual({ kind: "none" });
-		expect(parseTelegramControlCommand("/context@OtherBot", "GajaeCodeBot")).toEqual({ kind: "none" });
+		expect(parseTelegramControlCommand("/context@OtherBot", "GajaeCodeBot")).toEqual({
+			kind: "ignored",
+			commandName: "context",
+		});
+		expect(parseTelegramControlCommand("/context@OtherBot")).toEqual({ kind: "ignored", commandName: "context" });
 		expect(parseTelegramControlCommand("plain text")).toEqual({ kind: "none" });
 	});
 });
