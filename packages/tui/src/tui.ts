@@ -2179,6 +2179,9 @@ export class TUI extends Container {
 	 * to embed the sequences into.
 	 */
 	#writeCursorPosition(cursorPos: { row: number; col: number } | null, totalLines: number): boolean {
+		if (!cursorPos || totalLines <= 0) {
+			return this.#hideCursor();
+		}
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, totalLines, this.#hardwareCursorRow);
 		this.#hardwareCursorRow = toRow;
 		// No \x1b[?2026h/l wrapper: synchronized output flushes terminal state and discards macOS IME composition.
