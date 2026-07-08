@@ -40,6 +40,21 @@ export const __eventControllerPerfCounters = {
 
 const COMPLETION_NOTIFY_COMMAND_TIMEOUT_MS = 10_000;
 
+/**
+ * Per-run opt-out for completion notifications, honored before any settings lookup.
+ *
+ * `GJC_NOTIFY=off` (also `0` / `false`, case-insensitive) suppresses the whole
+ * completion notification surface (terminal bell, backgrounded desktop toast, and the
+ * user `completion.notifyCommand`) for this process only. `config.yml` is untouched and
+ * child processes inherit the env var, which is exactly what non-interactive fleet runs
+ * (`gjc -p --no-session`) need so an inherited global `completion.notify=on` /
+ * `completion.notifyCommand` stops firing a notification per run.
+ */
+export function completionNotifyDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
+	const v = env.GJC_NOTIFY?.trim().toLowerCase();
+	return v === "off" || v === "0" || v === "false";
+}
+
 interface CompletionNotifyPayload {
 	type: "agent-turn-complete";
 	title: string;
@@ -960,6 +975,8 @@ export class EventController {
 	}
 
 	sendCompletionNotification(): void {
+		// Per-run hard opt-out (env, config-untouched, child-inheritable): GJC_NOTIFY=off.
+		if (completionNotifyDisabledByEnv(process.env)) return;
 		const isBackgrounded = this.ctx.isBackgrounded !== false;
 		const notify = settings.get("completion.notify");
 		if (notify === "off") return;

@@ -522,6 +522,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | Variable                  | Behavior                                                                              |
 | ------------------------- | ------------------------------------------------------------------------------------- |
 | `GJC_NOTIFICATIONS`        | `off` / `0` / `false` suppress desktop notifications                                  |
+| `GJC_NOTIFY`               | `off` / `0` / `false` suppress the per-turn completion notification (terminal bell, backgrounded desktop toast, and `completion.notifyCommand`) for this process only; `config.yml` is untouched and child processes inherit it. Use for non-interactive runs (`gjc -p --no-session`) so an inherited global `completion.notify=on` does not fire per run. |
 | `GJC_TUI_WRITE_LOG`        | If set, logs TUI writes to file                                                       |
 | `GJC_HARDWARE_CURSOR`      | If `1`, enables hardware cursor mode                                                  |
 | `GJC_CLEAR_ON_SHRINK`      | If `1`, clears empty rows when content shrinks                                        |
