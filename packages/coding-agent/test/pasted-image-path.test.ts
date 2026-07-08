@@ -17,9 +17,11 @@ describe("resolvePastedImagePath", () => {
 		fs.rmSync(testDir, { recursive: true, force: true });
 	});
 
+	const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
 	function writeImage(name: string): string {
 		const filePath = path.join(testDir, name);
-		fs.writeFileSync(filePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+		fs.writeFileSync(filePath, PNG_SIGNATURE);
 		return filePath;
 	}
 
@@ -89,6 +91,40 @@ describe("resolvePastedImagePath", () => {
 		const filePath = path.join(testDir, "notes.txt");
 		fs.writeFileSync(filePath, "hello");
 		expect(resolvePastedImagePath(filePath)).toBeUndefined();
+	});
+
+	it("rejects existing non-image files with image extensions (content sniffing)", () => {
+		// Regression (#1841 review): consuming this paste would lose the raw
+		// path once the image loader rejects the content.
+		const filePath = path.join(testDir, "not-image.png");
+		fs.writeFileSync(filePath, "hello, I am a text file");
+		expect(resolvePastedImagePath(filePath)).toBeUndefined();
+	});
+
+	it("rejects empty files with image extensions", () => {
+		const filePath = path.join(testDir, "empty.png");
+		fs.writeFileSync(filePath, "");
+		expect(resolvePastedImagePath(filePath)).toBeUndefined();
+	});
+
+	it("accepts each supported image signature", () => {
+		const signatures: Array<[string, Buffer]> = [
+			["sig.png", Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+			["sig.jpg", Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46])],
+			["sig.gif", Buffer.from("GIF89a", "latin1")],
+			["sig.webp", Buffer.concat([Buffer.from("RIFF", "latin1"), Buffer.alloc(4), Buffer.from("WEBP", "latin1")])],
+		];
+		for (const [name, magic] of signatures) {
+			const filePath = path.join(testDir, name);
+			fs.writeFileSync(filePath, magic);
+			expect(resolvePastedImagePath(filePath)).toBe(filePath);
+		}
+	});
+
+	it("accepts mismatched extension when content is a supported image (loader sniffs real mime)", () => {
+		const filePath = path.join(testDir, "actually-png.jpg");
+		fs.writeFileSync(filePath, PNG_SIGNATURE);
+		expect(resolvePastedImagePath(filePath)).toBe(filePath);
 	});
 
 	it("rejects multiline pastes", () => {

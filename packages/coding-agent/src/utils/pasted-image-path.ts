@@ -120,8 +120,40 @@ export function decodePastedPathCandidate(text: string, options?: DecodePastedPa
 }
 
 /**
+ * Sniff the file header for a supported image signature (PNG, JPEG, GIF,
+ * WEBP). Prevents existing non-image files with image-looking extensions
+ * (e.g. a text file named `not-image.png`) from being treated as image
+ * candidates — consuming such a paste would lose the raw path when the
+ * image loader later rejects the content.
+ */
+function hasSupportedImageMagic(filePath: string): boolean {
+	let fd: number;
+	try {
+		fd = fs.openSync(filePath, "r");
+	} catch {
+		return false;
+	}
+	try {
+		// Zero-filled; short reads leave trailing zeros so comparisons fail safely.
+		const header = Buffer.alloc(12);
+		fs.readSync(fd, header, 0, 12, 0);
+		if (header[0] === 0x89 && header[1] === 0x50 && header[2] === 0x4e && header[3] === 0x47) return true; // PNG
+		if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return true; // JPEG
+		const ascii6 = header.toString("latin1", 0, 6);
+		if (ascii6 === "GIF87a" || ascii6 === "GIF89a") return true; // GIF
+		if (header.toString("latin1", 0, 4) === "RIFF" && header.toString("latin1", 8, 12) === "WEBP") return true; // WEBP
+		return false;
+	} catch {
+		return false;
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+/**
  * Returns the resolved path when the whole pasted text is a single path to an
- * existing image file, otherwise `undefined` (the paste is inserted as text).
+ * existing image file (verified by extension AND content signature),
+ * otherwise `undefined` (the paste is inserted as text).
  */
 export function resolvePastedImagePath(text: string, options?: ResolvePastedImagePathOptions): string | undefined {
 	const candidate = decodePastedPathCandidate(text, options);
@@ -133,5 +165,6 @@ export function resolvePastedImagePath(text: string, options?: ResolvePastedImag
 	} catch {
 		return undefined;
 	}
+	if (!hasSupportedImageMagic(resolved)) return undefined;
 	return resolved;
 }

@@ -1064,6 +1064,11 @@ export class InputController {
 		return imagePath ? this.#attachPastedImagePath(imagePath) : false;
 	}
 
+	/**
+	 * Returns `false` on every failure path so the editor replays the original
+	 * bracketed paste — the raw path text must never be lost when attachment
+	 * is impossible (unsupported content, oversized image, load error).
+	 */
 	async #attachPastedImagePath(imagePath: string): Promise<boolean> {
 		try {
 			const image = await loadImageInput({
@@ -1073,7 +1078,7 @@ export class InputController {
 			});
 			if (!image) {
 				this.ctx.showStatus("Unsupported pasted image file");
-				return true;
+				return false;
 			}
 
 			this.ctx.pendingImages.push({
@@ -1088,10 +1093,10 @@ export class InputController {
 		} catch (error) {
 			if (error instanceof ImageInputTooLargeError) {
 				this.ctx.showStatus(error.message);
-				return true;
+				return false;
 			}
 			this.ctx.showStatus("Failed to attach pasted image");
-			return true;
+			return false;
 		}
 	}
 
