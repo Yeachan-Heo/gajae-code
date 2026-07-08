@@ -1910,45 +1910,48 @@ export class Editor implements Component, Focusable {
 	#handlePaste(pastedText: string): void {
 		this.#historyIndex = -1; // Exit history browsing mode
 		this.#resetKillSequence();
-		this.#recordUndoState();
 		const hadAutocomplete = this.#autocompleteState !== null;
 		this.#cancelAutocomplete();
 		if (hadAutocomplete) {
 			this.onAutocompleteUpdate?.();
 		}
 
+		// Some terminals (e.g. tmux popups with extended-keys-format=csi-u) re-encode
+		// control bytes inside bracketed paste as CSI-u Ctrl+<letter> sequences
+		// (ESC [ <codepoint> ; 5 u). Decode those back to their literal byte so the
+		// per-char filter below preserves newlines instead of stripping ESC and
+		// leaking the printable tail (e.g. "[106;5u") into the editor.
+		const decodedText = pastedText.replace(/\x1b\[(\d+);5u/g, (match, code) => {
+			const cp = Number(code);
+			if (cp >= 97 && cp <= 122) return String.fromCharCode(cp - 96);
+			if (cp >= 65 && cp <= 90) return String.fromCharCode(cp - 64);
+			return match;
+		});
+
+		// Clean the pasted text. NFC-normalize so macOS Finder drag-drops of
+		// Korean filenames (which arrive as NFD: e.g. `ᄒ`+`ᅪ` instead of `화`)
+		// land in the buffer as the same precomposed syllables a terminal
+		// renders — without this, cursor column accounting drifts by
+		// `(NFD cells − NFC cells)` and the visible glyph desyncs from the
+		// hardware cursor. Matches the `Input` component's prior fix; this
+		// is the same fix on the real GJC prompt component (`Editor`).
+		const cleanText = decodedText.replace(/\r\n?/g, "\n").normalize("NFC");
+
+		// Convert tabs to spaces (4 spaces per tab)
+		const tabExpandedText = cleanText.replace(/\t/g, "    ");
+
+		// Filter out non-printable characters except newlines
+		const filteredText = tabExpandedText
+			.split("")
+			.filter(char => char === "\n" || char.charCodeAt(0) >= 32)
+			.join("");
+
+		// Nothing survived filtering: the buffer is untouched, so don't record
+		// an undo snapshot — a no-op entry would make the next undo appear dead.
+		if (filteredText.length === 0) return;
+
+		this.#recordUndoState();
 		this.#withUndoSuspended(() => {
-			// Some terminals (e.g. tmux popups with extended-keys-format=csi-u) re-encode
-			// control bytes inside bracketed paste as CSI-u Ctrl+<letter> sequences
-			// (ESC [ <codepoint> ; 5 u). Decode those back to their literal byte so the
-			// per-char filter below preserves newlines instead of stripping ESC and
-			// leaking the printable tail (e.g. "[106;5u") into the editor.
-			const decodedText = pastedText.replace(/\x1b\[(\d+);5u/g, (match, code) => {
-				const cp = Number(code);
-				if (cp >= 97 && cp <= 122) return String.fromCharCode(cp - 96);
-				if (cp >= 65 && cp <= 90) return String.fromCharCode(cp - 64);
-				return match;
-			});
-
-			// Clean the pasted text. NFC-normalize so macOS Finder drag-drops of
-			// Korean filenames (which arrive as NFD: e.g. `ᄒ`+`ᅪ` instead of `화`)
-			// land in the buffer as the same precomposed syllables a terminal
-			// renders — without this, cursor column accounting drifts by
-			// `(NFD cells − NFC cells)` and the visible glyph desyncs from the
-			// hardware cursor. Matches the `Input` component's prior fix; this
-			// is the same fix on the real GJC prompt component (`Editor`).
-			const cleanText = decodedText.replace(/\r\n?/g, "\n").normalize("NFC");
-
-			// Convert tabs to spaces (4 spaces per tab)
-			const tabExpandedText = cleanText.replace(/\t/g, "    ");
-
-			// Filter out non-printable characters except newlines
-			const filteredText = tabExpandedText
-				.split("")
-				.filter(char => char === "\n" || char.charCodeAt(0) >= 32)
-				.join("");
-
-			if (filteredText.length === 0) return;
 			// Split into lines
 			const pastedLines = filteredText.split("\n");
 

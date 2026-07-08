@@ -2441,6 +2441,21 @@ describe("Editor component", () => {
 			editor.handleInput("\x1b[B"); // Down to line 1
 			expect(editor.getCursor()).toEqual({ line: 1, col: 15 });
 		});
+		it("does not record a ghost undo snapshot for a paste that filters to nothing", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("\x1b[200~hello\x1b[201~");
+			expect(editor.getText()).toBe("hello");
+
+			// A paste of only non-printable characters inserts nothing…
+			editor.handleInput("\x1b[200~\x07\x07\x1b[201~");
+			expect(editor.getText()).toBe("hello");
+
+			// …so a single undo must revert the previous edit, not a no-op snapshot.
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			expect(editor.getText()).toBe("");
+		});
+
 		it("expands large pasted content literally in getExpandedText", () => {
 			const editor = new Editor(defaultEditorTheme);
 			const pastedText = [
