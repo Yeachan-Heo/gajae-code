@@ -581,6 +581,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	): Promise<void> {
 		const meta = q.deepInterview;
 		if (!meta) return;
+		const activeSkill = this.session.getActiveSkillState?.()?.skill?.trim();
+		if (activeSkill !== "deep-interview") return;
 		const cwd = this.session.cwd;
 		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const statePath = deepInterviewStatePath(cwd, sessionId);
@@ -745,8 +747,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				};
 			}
 			try {
-				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
-				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
+			const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
+			const activeSkill = this.session.getActiveSkillState?.()?.skill?.trim();
+			const isDeepInterviewActive = activeSkill === "deep-interview";
+			const isDeepInterviewQuestion = isDeepInterviewActive && (deepInterviewPrompt !== null || q.deepInterview !== undefined);
 				const displayQuestion = deepInterviewPrompt ?? q.question;
 				const shouldNumberOptions = isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question);
 				const optionLabels = shouldNumberOptions ? numberOptionLabels(rawOptionLabels) : rawOptionLabels;
