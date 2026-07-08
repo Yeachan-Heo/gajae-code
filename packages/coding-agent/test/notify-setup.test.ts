@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { parseNotifyArgs, promptForToken, runNotifyCommand } from "../src/cli/notify-cli";
+import { parseNotifyArgs, promptForToken, runNotifyCliCommand, runNotifyCommand } from "../src/cli/notify-cli";
 import { Settings } from "../src/config/settings";
 import { getNotificationConfig, maskToken } from "../src/notifications/config";
 import {
@@ -72,6 +72,7 @@ class FakeTokenInput extends EventEmitter {
 	isTTY = true;
 	isRaw = false;
 	resumeCalls = 0;
+	pauseCalls = 0;
 
 	setRawMode(mode: boolean): this {
 		this.isRaw = mode;
@@ -80,6 +81,10 @@ class FakeTokenInput extends EventEmitter {
 
 	resume(): this {
 		this.resumeCalls++;
+		return this;
+	}
+	pause(): this {
+		this.pauseCalls++;
 		return this;
 	}
 }
@@ -122,8 +127,23 @@ describe("notify setup cli", () => {
 		await expect(prompt).resolves.toBe(token);
 		expect(input.isRaw).toBe(false);
 		expect(input.resumeCalls).toBe(1);
+		expect(input.pauseCalls).toBe(1);
 		expect(output.text).toContain("Telegram BotFather token: ");
 		expect(output.text).not.toContain(token);
+	});
+
+	test("interactive token prompt pauses input when cancelled", async () => {
+		const input = new FakeTokenInput();
+		const output = new FakeTokenOutput();
+
+		const prompt = promptForToken(input as unknown as NodeJS.ReadStream, output);
+		input.emit("data", Buffer.from("\u0003"));
+
+		await expect(prompt).rejects.toThrow("Telegram bot token prompt cancelled.");
+		expect(input.isRaw).toBe(false);
+		expect(input.resumeCalls).toBe(1);
+		expect(input.pauseCalls).toBe(1);
+		expect(output.text).toContain("Telegram BotFather token: ");
 	});
 
 	test("getMe ok plus private message writes settings and reads via config helper", async () => {
@@ -223,6 +243,65 @@ describe("notify setup cli", () => {
 				),
 			),
 		).rejects.toThrow("Timed out waiting for a private Telegram message");
+		expect(getNotificationConfig(settings).enabled).toBe(false);
+	});
+	test("cli setup reports pairing timeout without uncaught stack", async () => {
+		const settings = Settings.isolated();
+		const { fetchImpl } = makeFetch({
+			getMe: [{ ok: true, result: { id: 1 } }],
+			getUpdates: [
+				{ ok: true, result: [] },
+				{ ok: true, result: [] },
+			],
+		});
+		let exitCode: number | undefined;
+
+		const { stderr } = await captureOutput(() =>
+			runNotifyCliCommand(
+				{ action: "setup", rawArgs: [] },
+				{
+					fetchImpl,
+					settings,
+					setupToken: token,
+					pollTimeoutMs: 1,
+					pollIntervalMs: 0,
+					setExitCode: code => {
+						exitCode = code;
+					},
+				},
+			),
+		);
+
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("Error: Timed out waiting for a private Telegram message");
+		expect(stderr).not.toContain("[Uncaught Exception]");
+		expect(stderr).not.toContain("at waitForPrivateChat");
+		expect(getNotificationConfig(settings).enabled).toBe(false);
+	});
+
+	test("cli setup reports token prompt cancellation cleanly", async () => {
+		const settings = Settings.isolated();
+		let exitCode: number | undefined;
+
+		const { stderr } = await captureOutput(() =>
+			runNotifyCliCommand(
+				{ action: "setup", rawArgs: [] },
+				{
+					settings,
+					tokenPrompt: async () => {
+						throw new Error("Telegram bot token prompt cancelled.");
+					},
+					setExitCode: code => {
+						exitCode = code;
+					},
+				},
+			),
+		);
+
+		expect(exitCode).toBe(130);
+		expect(stderr).toBe("Telegram notify setup cancelled.\n");
+		expect(stderr).not.toContain("[Uncaught Exception]");
+		expect(stderr).not.toContain("Telegram bot token prompt cancelled.");
 		expect(getNotificationConfig(settings).enabled).toBe(false);
 	});
 

@@ -2,7 +2,7 @@
  * Configure Telegram notifications.
  */
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import { type NotifyAction, type NotifyCommandArgs, runNotifyCommand } from "../cli/notify-cli";
+import { type NotifyAction, type NotifyCommandArgs, runNotifyCliCommand } from "../cli/notify-cli";
 import { initTheme } from "../modes/theme/theme";
 
 const ACTIONS: NotifyAction[] = ["setup", "status", "daemon-internal"];
@@ -56,6 +56,6 @@ export default class Notify extends Command {
 		};
 
 		if (action !== "daemon-internal") await initTheme();
-		await runNotifyCommand(cmd);
+		await runNotifyCliCommand(cmd);
 	}
 }
