@@ -135,9 +135,7 @@ export function buildCreateArgv(
 ): { cwd: string; args: string[] } {
 	const extraArgs: string[] = [];
 	if (frame.modelPreset) {
-		// Use `--mpreset=<name>` form so the preset name is a single argv token
-		// and a leading-hyphen preset name can never be mis-parsed.
-		extraArgs.push(`--mpreset=${frame.modelPreset}`);
+		extraArgs.push("--mpreset", frame.modelPreset);
 	}
 	if (frame.target.kind === "worktree") {
 		const cwd = normalizeLifecyclePath(frame.target.repo);
