@@ -1616,7 +1616,7 @@ export class TUI extends Container {
 		this.#hardwareCursorRow = cursorToRow;
 		buffer += cursorSeq;
 		buffer += "\x1b[?2026l";
-		if (!this.#writeTerminal(buffer)) return false;
+		if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, lines.length)) return false;
 
 		if (this.#debugRedraw) {
 			const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (lines=${lines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
@@ -1761,7 +1761,7 @@ export class TUI extends Container {
 			this.#hardwareCursorRow = toRow;
 			buffer += seq;
 			buffer += "\x1b[?2026l"; // End synchronized output
-			if (!this.#writeTerminal(buffer)) return;
+			if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
 			// Reset max lines when clearing, otherwise track growth
 			if (clear) {
 				this.#maxLinesRendered = newLines.length;
@@ -1811,7 +1811,7 @@ export class TUI extends Container {
 			this.#hardwareCursorRow = cursorToRow;
 			buffer += cursorSeq;
 			buffer += "\x1b[?2026l";
-			if (!this.#writeTerminal(buffer)) return;
+			if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
 
 			if (this.#debugRedraw) {
 				const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
@@ -1963,7 +1963,7 @@ export class TUI extends Container {
 				this.#hardwareCursorRow = toRow;
 				buffer += seq;
 				buffer += "\x1b[?2026l";
-				if (!this.#writeTerminal(buffer)) return;
+				if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
 			}
 			this.#previousLines = newLines;
 			this.#previousWidth = width;
@@ -2108,7 +2108,7 @@ export class TUI extends Container {
 		}
 
 		// Write entire buffer at once
-		if (!this.#writeTerminal(buffer)) return;
+		if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
 
 		// Track cursor position for next render.
 		// cursorRow tracks end of content (for viewport calculation).
@@ -2163,19 +2163,25 @@ export class TUI extends Container {
 		return { seq, toRow: targetRow };
 	}
 
+	#writeRenderBufferAndReanchorImeCursor(
+		buffer: string,
+		cursorPos: { row: number; col: number } | null,
+		totalLines: number,
+	): boolean {
+		if (!this.#writeTerminal(buffer)) return false;
+		if (!this.#imeCursorActive) return true;
+		return this.#writeCursorPosition(cursorPos, totalLines);
+	}
+
 	/**
 	 * Write the hardware cursor position to the terminal as a standalone
 	 * synchronized output block. Use when there is no surrounding render buffer
 	 * to embed the sequences into.
 	 */
-	#writeCursorPosition(cursorPos: { row: number; col: number } | null, totalLines: number): void {
-		if (!cursorPos || totalLines <= 0) {
-			this.#hideCursor();
-			return;
-		}
+	#writeCursorPosition(cursorPos: { row: number; col: number } | null, totalLines: number): boolean {
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, totalLines, this.#hardwareCursorRow);
 		this.#hardwareCursorRow = toRow;
 		// No \x1b[?2026h/l wrapper: synchronized output flushes terminal state and discards macOS IME composition.
-		this.#writeTerminal(seq);
+		return this.#writeTerminal(seq);
 	}
 }
