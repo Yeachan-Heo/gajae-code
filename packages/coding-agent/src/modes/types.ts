@@ -116,6 +116,7 @@ export interface InteractiveModeContext {
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined;
 	locallySubmittedUserSignatures: Set<string>;
+	optimisticInjectedSignatures: Map<string, number>;
 	lastSigintTime: number;
 	lastEscapeTime: number;
 	lastComposerClearEscapeTime: number;

@@ -75,6 +75,10 @@ function str(v: unknown): string | undefined {
 	return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
+function isDotOnlyText(value: string): boolean {
+	return /^[.\s]+$/.test(value);
+}
+
 /** Format the one-time identity header as pinned bullets. */
 export function formatIdentityHeader(frame: {
 	repo?: unknown;
@@ -139,6 +143,7 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 		case "turn_stream": {
 			const raw = str(frame.text);
 			if (!raw) return undefined;
+			if (frame.phase === "finalized" && isDotOnlyText(raw)) return undefined;
 			const text = markdownToTelegramHtml(raw);
 			const finalized = frame.phase === "finalized";
 			// A per-turn ref ties the streamed live edits and the finalized text to
