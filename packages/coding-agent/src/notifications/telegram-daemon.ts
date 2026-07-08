@@ -2510,6 +2510,7 @@ export class TelegramNotificationDaemon {
 								// Best-effort control feedback; never convert to user input.
 							}
 						};
+						if (control.kind === "ignored") return;
 						if (control.kind === "invalid") {
 							await sendControlNotice(control.usage);
 							return;

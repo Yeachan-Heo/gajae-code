@@ -30,17 +30,16 @@ export type TelegramControlCommand =
 
 export type TelegramControlCommandParseResult =
 	| { kind: "none" }
+	| { kind: "ignored"; commandName: TelegramControlCommandName }
 	| { kind: "command"; command: TelegramControlCommand }
 	| { kind: "invalid"; commandName: TelegramControlCommandName; usage: string };
 
 const TELEGRAM_CONTROL_COMMANDS = new Set<TelegramControlCommandName>(["reasoning", "usage", "context", "compact"]);
 const TELEGRAM_REASONING_LEVELS = new Set(["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
-function stripTelegramBotSuffix(rawCommand: string, botUsername?: string): string | undefined {
+function splitTelegramBotSuffix(rawCommand: string): { name: string; suffix?: string } {
 	const [name, suffix] = rawCommand.toLowerCase().split("@", 2);
-	if (!suffix) return name;
-	if (!botUsername) return undefined;
-	return suffix === botUsername.toLowerCase() ? name : undefined;
+	return suffix ? { name, suffix } : { name };
 }
 
 export function telegramControlCommandUsage(commandName: TelegramControlCommandName): string {
@@ -62,9 +61,10 @@ export function parseTelegramControlCommand(text: string, botUsername?: string):
 	if (!trimmed.startsWith("/")) return { kind: "none" };
 	const [rawRoot, ...rest] = trimmed.slice(1).split(/\s+/);
 	if (!rawRoot) return { kind: "none" };
-	const root = stripTelegramBotSuffix(rawRoot, botUsername);
-	if (!root || !TELEGRAM_CONTROL_COMMANDS.has(root as TelegramControlCommandName)) return { kind: "none" };
+	const { name: root, suffix } = splitTelegramBotSuffix(rawRoot);
+	if (!TELEGRAM_CONTROL_COMMANDS.has(root as TelegramControlCommandName)) return { kind: "none" };
 	const commandName = root as TelegramControlCommandName;
+	if (suffix && (!botUsername || suffix !== botUsername.toLowerCase())) return { kind: "ignored", commandName };
 	const usage = telegramControlCommandUsage(commandName);
 
 	switch (commandName) {
