@@ -56,6 +56,7 @@ import { reportFindingTool } from "./review";
 import { SearchTool } from "./search";
 import { SearchToolBm25Tool } from "./search-tool-bm25";
 import { SkillTool } from "./skill";
+import { SkillDiscoveryTool } from "./skill-discovery";
 import { loadSshTool } from "./ssh";
 import { SubagentTool } from "./subagent";
 import { TelegramSendTool } from "./telegram-send";
@@ -95,6 +96,7 @@ export * from "./review";
 export * from "./search";
 export * from "./search-tool-bm25";
 export * from "./skill";
+export * from "./skill-discovery";
 export * from "./ssh";
 export * from "./subagent";
 export * from "./telegram-send";
@@ -411,6 +413,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	todo_write: s => new TodoWriteTool(s),
 	web_search: s => new WebSearchTool(s),
 	search_tool_bm25: SearchToolBm25Tool.createIf,
+	skill_discovery: SkillDiscoveryTool.createIf,
 	telegram_send: TelegramSendTool.createIf,
 	write: s => new WriteTool(s),
 	skill: SkillTool.createIf,
@@ -570,6 +573,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "search_tool_bm25") return discoveryActive;
 		if (name === "calc") return session.settings.get("calc.enabled");
 		if (name === "skill") return session.settings.get("skill.enabled");
+		if (name === "skill_discovery") return session.settings.get("skill.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "computer") return isComputerCallable(session);
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");

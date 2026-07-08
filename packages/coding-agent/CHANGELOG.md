@@ -18,6 +18,9 @@
 ### Changed
 
 - Upgraded the Extragoal review template with a stronger reviewer lane and optional maximalist N-of-N review recipe.
+- Added `--mpreset <profile>` option to the Telegram `/session_create` command, allowing users to specify a model profile preset when creating a session remotely (e.g. `/session_create path /repo --mpreset codex-eco`). Both `--mpreset <name>` and `--mpreset=<name>` forms are supported. The preset is passed as a regular `--mpreset` CLI flag to the spawned `gjc` child, where the existing `applyStartupModelProfiles` flow activates it.
+- Added the built-in `skill_discovery` tool for runtime discovery of custom project `.gjc/skills` and user `~/.gjc/skills` without injecting the full skill catalog into the core prompt; selected discovered skills are loaded narrowly through the existing `skill` invocation path (#1815).
+- Pasting or drag-dropping a path to any existing image file into the interactive editor now attaches the image and inserts an `[image N]` placeholder instead of leaving the raw path in the prompt. Previously this only worked for clipboard temp files (`/tmp/clipboard-*` or `/var/folders/xx/yy/T/clipboard-*`); terminal drag-drop paths — including shell-escaped spaces and the U+202F narrow no-break space in macOS screenshot names — pasted as long raw path text. Quoted paths, `file://` URIs (decoded via Node's `fileURLToPath` semantics, including Windows drive-letter, `file://localhost`, and UNC forms), and `~/` expansion are handled; the whole paste must be a single path to an existing image file whose content carries a supported image signature (PNG/JPEG/GIF/WEBP), so prose containing paths and non-image files with image-looking extensions are inserted unchanged. When attachment still fails (unsupported content, oversized image, load error), the original pasted text is replayed into the editor instead of being consumed.
 
 ### Fixed
 
