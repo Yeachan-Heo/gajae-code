@@ -9,8 +9,9 @@ const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
 const PYTHON_DEV_SETUP =
 	"python3 -m pip install --user --upgrade 'pip>=24' 'setuptools>=69' wheel && python3 -m pip install --user -e python/gjc-rpc -e 'python/robogjc[dev]'";
-// The coding-agent package has hundreds of test files; keep dev affected push
-// validation below the 30m shard timeout by splitting its package-wide suite.
+// The coding-agent package has hundreds of test files; keep dev affected
+// validation below the shard timeout by splitting package-wide/full-workspace
+// TypeScript suites across the matrix instead of one root-test runner.
 const CODING_AGENT_TEST_SHARDS = 8;
 
 // Keys for tasks that compile the @gajae-code/natives addon. They run once in
@@ -444,7 +445,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	if (fullWorkspace) {
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
 		addNativeBuild(tasks);
-		add(tasks, "root-test", "Root workspace TypeScript tests", ["bun", "run", "test:ts"]);
+		addWorkspaceTestTasks(tasks, packages);
 	} else if (!ciOnly && !workflowHarnessOnly) {
 		const affectedPackages = expandWithDependents(touchedPackages, packages);
 		if (affectedPackages.some(workspacePackage => workspacePackage.manifest.scripts?.test)) {
@@ -527,7 +528,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 	if (fullWorkspace) {
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
 		addNativeBuild(tasks);
-		add(tasks, "root-test", "Root workspace TypeScript tests", ["bun", "run", "test:ts"]);
+		addWorkspaceTestTasks(tasks, packages);
 	}
 
 	for (const changedPath of relevant) {
@@ -616,6 +617,15 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 // so the matrix shard name stays small and directly traceable to the file.
 function addTestFileTask(tasks: Map<string, Task>, testFile: string): void {
 	add(tasks, `test:${testFile}`, `Test ${testFile}`, ["bun", "test", testFile]);
+}
+
+function addWorkspaceTestTasks(tasks: Map<string, Task>, packages: readonly WorkspacePackage[]): void {
+	add(tasks, "root-test:release", "Root release contract tests", ["bun", "run", "test:release"]);
+	for (const workspacePackage of packages) {
+		if (workspacePackage.manifest.scripts?.test) {
+			addPackageTestTasks(tasks, workspacePackage);
+		}
+	}
 }
 
 function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: WorkspacePackage): void {
