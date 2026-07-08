@@ -620,6 +620,28 @@ export function findCutPoint(
 	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
 	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
 
+	// Never fold the most-recent turn into a summary. When the cut lands inside a
+	// split turn that has no later user/bash message before endIndex, that turn is
+	// the one the user most recently spoke in; summarizing its leading user message
+	// would drop the user's last message from the restored transcript and the LLM
+	// context. Snap the cut back to the turn start and keep the whole turn verbatim.
+	if (!isUserMessage && turnStartIndex !== -1) {
+		let hasLaterUserMessage = false;
+		for (let i = turnStartIndex + 1; i < endIndex; i++) {
+			const laterEntry = entries[i];
+			if (laterEntry.type === "message") {
+				const laterRole = laterEntry.message.role as string;
+				if (laterRole === "user" || laterRole === "bashExecution") {
+					hasLaterUserMessage = true;
+					break;
+				}
+			}
+		}
+		if (!hasLaterUserMessage) {
+			return { firstKeptEntryIndex: turnStartIndex, turnStartIndex: -1, isSplitTurn: false };
+		}
+	}
+
 	return {
 		firstKeptEntryIndex: cutIndex,
 		turnStartIndex,
