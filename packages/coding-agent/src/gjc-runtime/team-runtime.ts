@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getWorktreesDir } from "@gajae-code/utils/dirs";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -25,6 +26,7 @@ import {
 	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_PROFILE_OPTION,
 	GJC_TMUX_PROFILE_VALUE,
+	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
 
@@ -288,6 +290,7 @@ export interface GjcTeamStartOptions {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
 	dryRun?: boolean;
+	platform?: NodeJS.Platform;
 	mailboxDeliveryTransport?: GjcTeamMailboxDeliveryTransport;
 }
 
@@ -1844,18 +1847,41 @@ function findWorktreePath(repoRoot: string, worktreePath: string): string | null
 		if (line.startsWith("worktree ") && path.resolve(line.slice("worktree ".length)) === resolved) return resolved;
 	return null;
 }
+export function resolveWorkerWorktreePath(input: {
+	repoRoot: string;
+	stateDir: string;
+	teamName: string;
+	workerId: string;
+	platform: NodeJS.Platform;
+	isPsmux: boolean;
+}): string {
+	if (input.platform === "win32" && input.isPsmux) {
+		const slug = stableHash([input.repoRoot, input.stateDir, input.teamName].join("\0")).slice(0, 12);
+		return path.join(getWorktreesDir(), `team-${slug}-${input.workerId}`);
+	}
+	return path.join(input.stateDir, "worktrees", input.workerId);
+}
 async function ensureWorkerWorktree(
 	cwd: string,
 	dir: string,
 	teamName: string,
 	worker: GjcTeamWorker,
 	mode: GjcTeamWorktreeMode,
+	platform: NodeJS.Platform,
+	isPsmux: boolean,
 ): Promise<GjcTeamWorker> {
 	if (!mode.enabled) return worker;
 	if (!isGitRepository(cwd)) throw new Error(`team_worktree_requires_git_repo:${cwd}`);
 	const repoRoot = runGit(cwd, ["rev-parse", "--show-toplevel"]);
 	const baseRef = runGit(repoRoot, ["rev-parse", "HEAD"]);
-	const worktreePath = path.join(dir, "worktrees", worker.id);
+	const worktreePath = resolveWorkerWorktreePath({
+		repoRoot,
+		stateDir: dir,
+		teamName,
+		workerId: worker.id,
+		platform,
+		isPsmux,
+	});
 	const existing = findWorktreePath(repoRoot, worktreePath);
 	let created = false;
 	const branchName = mode.detached
@@ -2994,7 +3020,9 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const dir = teamDir(stateRoot, teamName);
 	const createdAt = now();
 	const worktreeMode = resolveDefaultWorktreeMode(options.worktreeMode);
-	const tmuxCommand = resolveGjcTmuxCommand(env);
+	const platform = options.platform ?? process.platform;
+	const tmuxBinary = resolveGjcTmuxBinary({ env, platform });
+	const tmuxCommand = tmuxBinary.command;
 	const tmuxContext = options.dryRun
 		? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
 		: readCurrentTmuxLeaderContext(tmuxCommand, env);
@@ -3003,7 +3031,11 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const workers: GjcTeamWorker[] = [];
 	try {
 		for (const worker of initialWorkers)
-			workers.push(options.dryRun ? worker : await ensureWorkerWorktree(cwd, dir, teamName, worker, worktreeMode));
+			workers.push(
+				options.dryRun
+					? worker
+					: await ensureWorkerWorktree(cwd, dir, teamName, worker, worktreeMode, platform, tmuxBinary.isPsmux),
+			);
 	} catch (error) {
 		await rollbackCreatedWorktrees(workers);
 		throw error;
