@@ -126,6 +126,7 @@
     "ci:build:native": "bun scripts/ci-build-native.ts",
     "ci:test:full": "bun run test",
     "ci:test:smoke": "bun packages/coding-agent/src/cli.ts --version && bun packages/coding-agent/src/cli.ts --help && bun packages/coding-agent/src/cli.ts stats --help && bun packages/coding-agent/src/cli.ts --smoke-test",
+    "smoke:tui:iterm-ime": "bun packages/tui/test/iterm-ime-smoke.ts",
     "ci:test:install-methods": "bash scripts/install-tests/run-ci.sh",
     "ci:release:build-binaries": "bun scripts/ci-release-build-binaries.ts",
     "ci:release:publish": "bun scripts/ci-release-publish.ts",
