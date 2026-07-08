@@ -27,6 +27,32 @@ describe("renderThreadedFrame", () => {
 		expect(send?.coalesceKey).toBeUndefined();
 	});
 
+	test("finalized turn_stream suppresses dot-only placeholders", () => {
+		expect(
+			renderThreadedFrame({ type: "turn_stream", sessionId: "s", phase: "finalized", text: "." }),
+		).toBeUndefined();
+		expect(
+			renderThreadedFrame({ type: "turn_stream", sessionId: "s", phase: "finalized", text: " . \n" }),
+		).toBeUndefined();
+		expect(
+			renderThreadedFrame({ type: "turn_stream", sessionId: "s", phase: "finalized", text: "   " }),
+		).toBeUndefined();
+	});
+
+	test("finalized turn_stream preserves meaningful completion summaries", () => {
+		const send = renderThreadedFrame({
+			type: "turn_stream",
+			sessionId: "s",
+			phase: "finalized",
+			text: "Background job completed: tests passed",
+		});
+		expect(send).toMatchObject({
+			method: "sendMessage",
+			lane: "finalized",
+			text: "Background job completed: tests passed",
+		});
+	});
+
 	test("live turn_stream uses live lane and a coalesce key from messageRef", () => {
 		const send = renderThreadedFrame({
 			type: "turn_stream",
