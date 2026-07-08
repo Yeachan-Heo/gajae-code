@@ -85,16 +85,28 @@ export class Image implements Component {
 			});
 
 			if (result) {
-				// Return `rows` lines so TUI accounts for image height
-				// First (rows-1) lines are empty (TUI clears them)
-				// Last line: move cursor back up, then output image sequence
-				lines = [];
-				for (let i = 0; i < result.rows - 1; i++) {
-					lines.push("");
+				// Return `rows` lines so the TUI accounts for the image height.
+				if (result.cursorNeutral) {
+					// Kitty a=p,C=1 placements neither move the cursor nor carry
+					// pixel data, so the escape lives on the FIRST row — the image
+					// anchors to that cell and no cursor-up trick is needed (the
+					// old CUU approach clamped at the viewport top edge and placed
+					// the image over transcript text when partially scrolled out).
+					lines = [result.sequence];
+					for (let i = 0; i < result.rows - 1; i++) {
+						lines.push("");
+					}
+				} else {
+					// iTerm2/SIXEL draw at the cursor and advance it: reserve
+					// rows-1 blank lines (TUI clears them), then move the cursor
+					// up and draw from the last line.
+					lines = [];
+					for (let i = 0; i < result.rows - 1; i++) {
+						lines.push("");
+					}
+					const moveUp = result.rows > 1 ? `\x1b[${result.rows - 1}A` : "";
+					lines.push(moveUp + result.sequence);
 				}
-				// Move cursor up to first row, then output image
-				const moveUp = result.rows > 1 ? `\x1b[${result.rows - 1}A` : "";
-				lines.push(moveUp + result.sequence);
 			} else {
 				const fallback = imageFallback(this.#mimeType, this.#dimensions, this.#options.filename);
 				lines = [this.#theme.fallbackColor(fallback)];
