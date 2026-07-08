@@ -11,24 +11,85 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const IMAGE_FILE_EXTENSION_PATTERN = /\.(?:png|jpe?g|gif|webp)$/i;
 
-export interface ResolvePastedImagePathOptions {
-	/** Base directory for relative paths. Defaults to `process.cwd()`. */
-	cwd?: string;
+export interface DecodePastedPathOptions {
+	/**
+	 * Platform whose path semantics apply when decoding (shell unescaping,
+	 * `file://` drive letters / UNC hosts). Defaults to `process.platform`;
+	 * injectable so tests can pin the win32 contract from any host.
+	 */
+	platform?: NodeJS.Platform;
 	/** Home directory for `~/` expansion. Defaults to `os.homedir()`. */
 	homedir?: string;
 }
 
+export interface ResolvePastedImagePathOptions extends DecodePastedPathOptions {
+	/** Base directory for relative paths. Defaults to `process.cwd()`. */
+	cwd?: string;
+}
+
 /**
- * Returns the resolved path when the whole pasted text is a single path to an
- * existing image file, otherwise `undefined` (the paste is inserted as text).
+ * Convert a `file://` URI to a filesystem path for the given platform, or
+ * `undefined` when the URI is invalid.
  *
- * Handles terminal drag-drop shell escaping (`\ `, `\(`, ...), quoted paths,
- * `file://` URIs, and `~/` expansion.
+ * The production path (injected platform === host platform, always true
+ * outside tests) delegates to Node's `fileURLToPath`. When tests inject a
+ * foreign platform, a mirror of `fileURLToPath`'s rules is applied instead —
+ * Bun (1.3) accepts but ignores `fileURLToPath`'s `windows` option, so the
+ * native call cannot emulate a foreign platform.
  */
-export function resolvePastedImagePath(text: string, options?: ResolvePastedImagePathOptions): string | undefined {
+function decodeFileUrl(candidate: string, platform: NodeJS.Platform): string | undefined {
+	let url: URL;
+	try {
+		url = new URL(candidate);
+	} catch {
+		return undefined;
+	}
+	if (url.protocol !== "file:") return undefined;
+
+	if (platform === process.platform) {
+		try {
+			return fileURLToPath(url);
+		} catch {
+			return undefined;
+		}
+	}
+
+	// Foreign-platform mirror of fileURLToPath (tests only).
+	if (/%2f/i.test(url.pathname) || (platform === "win32" && /%5c/i.test(url.pathname))) return undefined;
+	let pathname: string;
+	try {
+		pathname = decodeURIComponent(url.pathname);
+	} catch {
+		return undefined;
+	}
+	if (platform === "win32") {
+		if (url.hostname && url.hostname !== "localhost") {
+			// UNC: file://server/share/img.png -> \\server\share\img.png
+			return `\\\\${url.hostname}${pathname.replaceAll("/", "\\")}`;
+		}
+		// Drive letter required: file:///C:/x -> C:\x
+		if (!/^\/[A-Za-z]:/.test(pathname)) return undefined;
+		return pathname.slice(1).replaceAll("/", "\\");
+	}
+	if (url.hostname && url.hostname !== "localhost") return undefined;
+	return pathname;
+}
+
+/**
+ * Decode pasted text into a filesystem path candidate. No filesystem access.
+ *
+ * Handles terminal drag-drop shell escaping (`\ `, `\(`, ...; skipped on
+ * win32 where `\` is the path separator), quoted paths, `file://` URIs
+ * (drive-letter, `file://localhost`, and UNC forms on win32), and `~/`
+ * expansion. Returns `undefined` when the text is empty, spans multiple
+ * lines, or is an invalid `file://` URI.
+ */
+export function decodePastedPathCandidate(text: string, options?: DecodePastedPathOptions): string | undefined {
+	const platform = options?.platform ?? process.platform;
 	let candidate = text.trim();
 	if (!candidate || /[\r\n]/.test(candidate)) return undefined;
 
@@ -41,14 +102,11 @@ export function resolvePastedImagePath(text: string, options?: ResolvePastedImag
 		candidate = candidate.slice(1, -1);
 	}
 
-	// file:// URIs (e.g. dropped from a file manager).
 	if (candidate.startsWith("file://")) {
-		try {
-			candidate = decodeURIComponent(candidate.slice("file://".length));
-		} catch {
-			return undefined;
-		}
-	} else if (process.platform !== "win32") {
+		const decoded = decodeFileUrl(candidate, platform);
+		if (decoded === undefined) return undefined;
+		candidate = decoded;
+	} else if (platform !== "win32") {
 		// Terminal drag-drop escapes shell-special characters (`\ `, `\(`, ...).
 		// Skipped on Windows where `\` is the path separator.
 		candidate = candidate.replace(/\\(.)/g, "$1");
@@ -58,7 +116,16 @@ export function resolvePastedImagePath(text: string, options?: ResolvePastedImag
 		candidate = path.join(options?.homedir ?? os.homedir(), candidate.slice(2));
 	}
 
-	if (!IMAGE_FILE_EXTENSION_PATTERN.test(candidate)) return undefined;
+	return candidate;
+}
+
+/**
+ * Returns the resolved path when the whole pasted text is a single path to an
+ * existing image file, otherwise `undefined` (the paste is inserted as text).
+ */
+export function resolvePastedImagePath(text: string, options?: ResolvePastedImagePathOptions): string | undefined {
+	const candidate = decodePastedPathCandidate(text, options);
+	if (!candidate || !IMAGE_FILE_EXTENSION_PATTERN.test(candidate)) return undefined;
 
 	const resolved = path.resolve(options?.cwd ?? process.cwd(), candidate);
 	try {

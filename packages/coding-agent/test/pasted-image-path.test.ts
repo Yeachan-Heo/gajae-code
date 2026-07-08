@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { resolvePastedImagePath } from "../src/utils/pasted-image-path";
+import { decodePastedPathCandidate, resolvePastedImagePath } from "../src/utils/pasted-image-path";
 
 const NNBSP = "\u202f"; // narrow no-break space used by macOS screenshot names
 
@@ -55,6 +55,11 @@ describe("resolvePastedImagePath", () => {
 		expect(resolvePastedImagePath(uri)).toBe(filePath);
 	});
 
+	it("resolves file://localhost URIs", () => {
+		const filePath = writeImage("localhost.png");
+		expect(resolvePastedImagePath(`file://localhost${filePath}`)).toBe(filePath);
+	});
+
 	it("expands ~/ against the provided homedir", () => {
 		const filePath = writeImage("home.png");
 		expect(resolvePastedImagePath("~/home.png", { homedir: testDir })).toBe(filePath);
@@ -99,5 +104,52 @@ describe("resolvePastedImagePath", () => {
 	it("rejects empty and whitespace-only pastes", () => {
 		expect(resolvePastedImagePath("")).toBeUndefined();
 		expect(resolvePastedImagePath("   ")).toBeUndefined();
+	});
+});
+
+describe("decodePastedPathCandidate (win32 contract)", () => {
+	it("decodes drive-letter file:// URIs to win32 paths", () => {
+		expect(decodePastedPathCandidate("file:///C:/Users/me/Pictures/shot.png", { platform: "win32" })).toBe(
+			"C:\\Users\\me\\Pictures\\shot.png",
+		);
+	});
+
+	it("decodes file://localhost drive-letter URIs", () => {
+		expect(decodePastedPathCandidate("file://localhost/C:/x.png", { platform: "win32" })).toBe("C:\\x.png");
+	});
+
+	it("decodes UNC-host file:// URIs", () => {
+		expect(decodePastedPathCandidate("file://server/share/img.png", { platform: "win32" })).toBe(
+			"\\\\server\\share\\img.png",
+		);
+	});
+
+	it("decodes percent-encoded spaces in win32 file:// URIs", () => {
+		expect(decodePastedPathCandidate("file:///C:/My%20Pictures/shot.png", { platform: "win32" })).toBe(
+			"C:\\My Pictures\\shot.png",
+		);
+	});
+
+	it("rejects drive-letter-less file:// URIs on win32", () => {
+		expect(decodePastedPathCandidate("file:///Users/me/shot.png", { platform: "win32" })).toBeUndefined();
+	});
+
+	it("rejects encoded path separators", () => {
+		expect(decodePastedPathCandidate("file:///C:/a%2Fb.png", { platform: "win32" })).toBeUndefined();
+		expect(decodePastedPathCandidate("file:///C:/a%5Cb.png", { platform: "win32" })).toBeUndefined();
+	});
+
+	it("does not shell-unescape win32 paths (backslash is the separator)", () => {
+		expect(decodePastedPathCandidate("C:\\Users\\me\\img.png", { platform: "win32" })).toBe("C:\\Users\\me\\img.png");
+	});
+});
+
+describe("decodePastedPathCandidate (posix contract)", () => {
+	it("rejects file:// URIs with non-localhost hosts", () => {
+		expect(decodePastedPathCandidate("file://server/share/img.png", { platform: "linux" })).toBeUndefined();
+	});
+
+	it("rejects encoded path separators", () => {
+		expect(decodePastedPathCandidate("file:///tmp/a%2Fb.png", { platform: "linux" })).toBeUndefined();
 	});
 });
