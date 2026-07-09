@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import type { Api, KnownProvider, Model, Usage } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
@@ -33,6 +34,9 @@ function getProviderModels(provider: GeneratedProvider): Map<string, Model<Api>>
 	if (!models) return undefined;
 	const providerModels = new Map<string, Model<Api>>();
 	for (const [id, model] of Object.entries(models)) {
+		if (isRetiredModelKey(provider, id)) {
+			continue;
+		}
 		providerModels.set(id, applyBundledCompatDefaults(enrichModelThinking(model as Model<Api>)));
 	}
 	providerModelRegistry.set(provider, providerModels);

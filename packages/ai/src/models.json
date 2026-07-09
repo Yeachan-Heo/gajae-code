@@ -10978,35 +10978,6 @@
 				]
 			}
 		},
-		"gemini-3.1-pro-high": {
-			"id": "gemini-3.1-pro-high",
-			"name": "Gemini 3.1 Pro (High) (Antigravity)",
-			"api": "google-gemini-cli",
-			"provider": "google-antigravity",
-			"baseUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com",
-			"reasoning": true,
-			"input": [
-				"text",
-				"image"
-			],
-			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 1048576,
-			"maxTokens": 65535,
-			"thinking": {
-				"mode": "google-level",
-				"minLevel": "low",
-				"maxLevel": "high",
-				"levels": [
-					"low",
-					"high"
-				]
-			}
-		},
 		"gemini-3.1-pro-low": {
 			"id": "gemini-3.1-pro-low",
 			"name": "Gemini 3.1 Pro (Low) (Antigravity)",

@@ -5,6 +5,10 @@
 
 - Added runtime credential selectors so callers can pin stored multi-account credentials by id, email, account id, or project id instead of using automatic rotation/ranking.
 
+### Fixed
+
+- Hid the non-callable `google-antigravity/gemini-3.1-pro-high` selector from bundled, dynamic, and cached Antigravity catalogs after live Cloud Code Assist calls returned HTTP 400; `google-antigravity/gemini-3.1-pro-low:high` remains the working high-thinking path.
+
 ## [0.9.1] - 2026-07-08
 
 ### Fixed

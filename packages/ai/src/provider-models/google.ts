@@ -75,6 +75,7 @@ export function googleGeminiCliModelManagerOptions(
 						const models = await fetchAntigravityDiscoveryModels({
 							token,
 							endpoint,
+							targetProvider: "google-gemini-cli",
 						});
 						if (models === null) {
 							return null;

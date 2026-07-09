@@ -1,8 +1,8 @@
 import { readModelCache, writeModelCache } from "./model-cache";
+import { isRetiredModel, isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import type { Api, Model, Provider } from "./types";
-import { isRecord } from "./utils";
 
 const DEFAULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
@@ -85,7 +85,14 @@ function passModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 	}
 	const out: Model<TApi>[] = [];
 	for (const item of value) {
-		if (item === null || typeof item !== "object" || typeof (item as { id: unknown }).id !== "string") {
+		if (item === null || typeof item !== "object") {
+			continue;
+		}
+		const candidate = item as { id?: unknown; provider?: unknown };
+		if (typeof candidate.id !== "string") {
+			continue;
+		}
+		if (typeof candidate.provider === "string" && isRetiredModelKey(candidate.provider, candidate.id)) {
 			continue;
 		}
 		out.push(enrichModelThinking(item as Model<TApi>));
@@ -382,7 +389,7 @@ function normalizeModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 	}
 	const models: Model<TApi>[] = [];
 	for (const item of value) {
-		if (isModelLike(item)) {
+		if (isModelLike(item) && !isRetiredModel(item)) {
 			models.push(enrichModelThinking(item as Model<TApi>));
 		}
 	}
@@ -439,6 +446,10 @@ function isModelLike(value: unknown): value is Model<Api> {
 		return false;
 	}
 	return true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
 }
 
 function isModelInputArray(value: unknown): value is ("text" | "image")[] {

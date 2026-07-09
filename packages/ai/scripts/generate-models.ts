@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { $env } from "@gajae-code/utils";
 import { AuthStorage, type OAuthAccess, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { createModelManager } from "../src/model-manager";
+import { RETIRED_MODEL_KEYS } from "../src/model-retirements";
 import {
 	applyGeneratedModelPolicies,
 	CLOUDFLARE_FALLBACK_MODEL,
@@ -63,9 +64,8 @@ function createAzureOpenAICatalogModels(): Model<"azure-openai-responses">[] {
 }
 
 const packageRoot = path.join(import.meta.dir, "..");
-// Claude Fable 5 was temporarily retired during its June 2026 suspension; it
-// was redeployed on 2026-07-01, so no models are currently retired.
-const RETIRED_BUNDLED_MODEL_KEYS = new Set<string>();
+// Keep retired selectors out of regenerated bundled catalogs.
+const RETIRED_BUNDLED_MODEL_KEYS = new Set<string>(RETIRED_MODEL_KEYS);
 
 function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
 	return RETIRED_BUNDLED_MODEL_KEYS.has(`${model.provider}/${model.id}`);

@@ -3,7 +3,7 @@
  * Replaces per-provider JSON files with a single cache.db.
  */
 import { Database } from "bun:sqlite";
-import { getModelDbPath } from "@gajae-code/utils";
+import { getModelDbPath } from "@gajae-code/utils/dirs";
 import type { Api, Model } from "./types";
 
 const CACHE_SCHEMA_VERSION = 3;
