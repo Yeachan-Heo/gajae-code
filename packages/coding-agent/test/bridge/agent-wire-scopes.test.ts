@@ -20,6 +20,7 @@ const EXPECTED_RPC_COMMAND_TYPES: readonly RpcCommand["type"][] = [
 	"set_host_tools",
 	"set_host_uri_schemes",
 	"get_pending_workflow_gates",
+	"set_capabilities",
 	"set_model",
 	"cycle_model",
 	"get_available_models",
@@ -96,6 +97,7 @@ describe("agent-wire RPC command scopes", () => {
 		expect(scopeForRpcCommand("get_messages")).toBe("message:read");
 		expect(scopeForRpcCommand("set_todos")).toBe("control");
 		expect(scopeForRpcCommand("workflow_gate_response")).toBe("control");
+		expect(scopeForRpcCommand("set_capabilities")).toBe("control");
 		expect(scopeForRpcCommand("set_host_tools")).toBe("host_tools");
 		expect(scopeForRpcCommand("set_host_uri_schemes")).toBe("host_uri");
 		expect(scopeForRpcCommand("handoff")).toBe("admin");

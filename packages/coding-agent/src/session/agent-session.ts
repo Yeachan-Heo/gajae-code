@@ -8178,7 +8178,7 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+		this.#scheduleAgentContinue({ skipCompactionCheck: true });
 	}
 
 	/**
