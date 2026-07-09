@@ -28,8 +28,6 @@ const ACP_EMPTY_WHITELIST = new Set([
 	"turn_start",
 	"turn_end",
 	"message_start",
-	"auto_compaction_start",
-	"auto_compaction_end",
 	"auto_retry_start",
 	"auto_retry_end",
 	"retry_fallback_applied",
