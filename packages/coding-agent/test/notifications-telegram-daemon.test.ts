@@ -2985,6 +2985,102 @@ test("scanRoots connects only live endpoints (skips stale + dead-PID records)", 
 	expect(FakeWs.instances.every(ws => ws.url.startsWith("ws://live"))).toBe(true);
 });
 
+test("scanRoots reaps stale and dead-PID session topics after the orphan grace window", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "stale" });
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "dead" });
+	const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
+	fs.mkdirSync(endpointDir, { recursive: true });
+	fs.writeFileSync(
+		path.join(endpointDir, "stale.json"),
+		JSON.stringify({ url: "ws://stale", token: "t", stale: true }),
+	);
+	fs.writeFileSync(path.join(endpointDir, "dead.json"), JSON.stringify({ url: "ws://dead", token: "t", pid: 999999 }));
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({
+			topics: {
+				stale: { topicId: "101", identitySent: true, createdAt: 0, name: "stale" },
+				dead: { topicId: "102", identitySent: true, createdAt: 0, name: "dead" },
+			},
+		}),
+	);
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		pidAlive: () => false,
+		now: () => 120_000,
+	});
+	await daemon.loadTopics();
+	await daemon.scanRoots();
+	expect(
+		bot.calls
+			.filter(c => c.method === "deleteForumTopic")
+			.map(c => c.body.message_thread_id)
+			.sort(),
+	).toEqual([101, 102]);
+	expect(daemon.sessions.size).toBe(0);
+});
+
+test("scanRoots reaps missing endpoint topics only when all roots are readable and grace has elapsed", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "missing" });
+	fs.mkdirSync(path.join(cwd, ".gjc", "state", "notifications"), { recursive: true });
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({ topics: { missing: { topicId: "201", identitySent: true, createdAt: 0, name: "missing" } } }),
+	);
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		now: () => 120_000,
+	});
+	await daemon.loadTopics();
+	await daemon.scanRoots();
+	expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([201]);
+
+	const blockedAgentDir = tempAgentDir();
+	const blockedSettings = setPrivateAgentDir(settings(blockedAgentDir), blockedAgentDir);
+	await registerNotificationRoot({
+		settings: blockedSettings,
+		cwd: path.join(blockedAgentDir, "unreadable"),
+		sessionId: "kept",
+	});
+	fs.mkdirSync(daemonPaths(blockedAgentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(blockedAgentDir).dir, "telegram-topics.json"),
+		JSON.stringify({ topics: { kept: { topicId: "202", identitySent: true, createdAt: 0, name: "kept" } } }),
+	);
+	const blockedBot = new FakeBotApi();
+	const blockedDaemon = new TelegramNotificationDaemon({
+		settings: blockedSettings,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: blockedBot,
+		now: () => 120_000,
+	});
+	await blockedDaemon.loadTopics();
+	await blockedDaemon.scanRoots();
+	expect(blockedBot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+});
+
 test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);

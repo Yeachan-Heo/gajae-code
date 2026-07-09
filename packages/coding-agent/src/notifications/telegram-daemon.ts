@@ -146,6 +146,7 @@ const TYPING_REFRESH_INTERVAL_MS = 4_000;
 const QUEUED_REACTION = "👀";
 const PENDING_TOPIC_FRAME_LIMIT = 20;
 const SEEN_UPDATE_ID_LIMIT = 1_000;
+const ORPHAN_TOPIC_GRACE_MS = 60_000;
 const CONSUMED_REACTION = "✅";
 
 function splitTelegramPlainText(text: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
@@ -1414,29 +1415,44 @@ export class TelegramNotificationDaemon {
 	async scanRoots(): Promise<void> {
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
 		const rootState = await readJson<{ roots?: string[] }>(this.fsImpl, paths.roots);
+		const endpointSessionIds = new Set<string>();
+		let allRootsReadable = true;
 		for (const root of rootState?.roots ?? []) {
 			const dir = path.join(root, "notifications");
 			let files: string[];
 			try {
 				files = await this.fsImpl.readdir(dir);
 			} catch {
+				allRootsReadable = false;
 				continue;
 			}
 			for (const file of files.filter(item => item.endsWith(".json"))) {
 				const sessionId = path.basename(file, ".json");
+				endpointSessionIds.add(sessionId);
 				if (this.sessions.has(sessionId)) continue;
 				try {
 					const endpoint = readEndpoint(path.join(dir, file));
 					// Skip endpoint files whose owning process is gone or that are
 					// explicitly stale (e.g. a hard-closed session): reconnecting
-					// would chase a dead, token-bearing record forever.
+					// would chase a dead, token-bearing record forever. Once the
+					// associated topic is past the grace window, reap it through the
+					// same best-effort delete path as graceful session shutdown.
 					const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
-					if (endpoint.stale || (endpoint.pid !== undefined && !pidAlive(endpoint.pid))) continue;
+					if (endpoint.stale || (endpoint.pid !== undefined && !pidAlive(endpoint.pid))) {
+						await this.deleteOrphanedTopic(sessionId);
+						continue;
+					}
 					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
 					if (this.closedEndpointKeys.get(sessionId) === endpointKey) continue;
 					this.closedEndpointKeys.delete(sessionId);
 					this.connectSession(sessionId, endpoint.url, endpoint.token);
 				} catch {}
+			}
+		}
+		if (allRootsReadable) {
+			for (const sessionId of this.topics.sessionIds()) {
+				if (!this.sessions.has(sessionId) && !endpointSessionIds.has(sessionId))
+					await this.deleteOrphanedTopic(sessionId);
 			}
 		}
 	}
@@ -1681,6 +1697,16 @@ export class TelegramNotificationDaemon {
 		} catch {
 			return undefined;
 		}
+	}
+
+	private topicPastOrphanGrace(sessionId: string): boolean {
+		const record = this.topics.get(sessionId);
+		return record !== undefined && this.runtime.now() - record.createdAt >= ORPHAN_TOPIC_GRACE_MS;
+	}
+
+	private async deleteOrphanedTopic(sessionId: string): Promise<void> {
+		if (!this.topicPastOrphanGrace(sessionId)) return;
+		await this.deleteTopic(sessionId);
 	}
 
 	/** Best-effort delete of a session topic once its local notification endpoint shuts down. */
