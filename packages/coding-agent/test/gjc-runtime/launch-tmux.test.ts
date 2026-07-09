@@ -169,13 +169,50 @@ describe("default GJC tmux launch", () => {
 			"-t",
 			expect.stringMatching(/^=gajae_code_.*:$/),
 			"set-titles-string",
-			"GJC: repo-feature/demo",
+			"#{?#{==:#{@gjc-root-terminal-title-session},#{session_name}},#{@gjc-root-terminal-title},GJC: #{session_name}}",
 		]);
+		expect(
+			calls.some(call => call.args[3] === "@gjc-root-terminal-title" && call.args[4] === "GJC: repo-feature/demo"),
+		).toBe(true);
+		expect(
+			calls.some(
+				call => call.args[3] === "@gjc-root-terminal-title-session" && /^gajae_code_/.test(call.args[4] ?? ""),
+			),
+		).toBe(true);
 		expect(calls.some(call => call.args[3] === "set-titles" && call.args[4] === "on")).toBe(true);
 		expect(writeSpy).not.toHaveBeenCalled();
 	});
+	it("uses the live tmux session name for already renamed managed sessions", () => {
+		const calls: Array<{ command: string; args: string[] }> = [];
 
-	it("escapes tmux format markers in client terminal titles", () => {
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
+			rawArgs: ["--tmux", "--continue", "hello world"],
+			cwd: "/repo",
+			env: {},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: "office-renamed",
+			currentBranch: "feature/demo",
+			spawnSync: (command, spawnArgs) => {
+				calls.push({ command, args: spawnArgs });
+				return { exitCode: 0 };
+			},
+		});
+
+		expect(handled).toBe(true);
+		expect(calls.find(call => call.args[3] === "set-titles-string")?.args.at(-1)).toBe("GJC: #{session_name}");
+		expect(calls.find(call => call.args[0] === "attach-session")?.args).toEqual([
+			"attach-session",
+			"-t",
+			"=office-renamed",
+		]);
+	});
+
+	it("stores literal fallback titles outside the tmux title format", () => {
 		const calls: Array<{ command: string; args: string[] }> = [];
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
@@ -196,7 +233,14 @@ describe("default GJC tmux launch", () => {
 		});
 
 		expect(handled).toBe(true);
-		expect(calls.find(call => call.args[3] === "set-titles-string")?.args.at(-1)).toBe("GJC: repo-feature/##S/demo");
+		expect(
+			calls.some(
+				call => call.args[3] === "@gjc-root-terminal-title" && call.args[4] === "GJC: repo-feature/#S/demo",
+			),
+		).toBe(true);
+		expect(calls.find(call => call.args[3] === "set-titles-string")?.args.at(-1)).toBe(
+			"#{?#{==:#{@gjc-root-terminal-title-session},#{session_name}},#{@gjc-root-terminal-title},GJC: #{session_name}}",
+		);
 	});
 
 	it("honors title opt-out while launching managed tmux", () => {

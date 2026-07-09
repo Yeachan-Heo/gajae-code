@@ -448,6 +448,9 @@ function truncateVisibleTail(value: string, maxWidth: number): string {
 const GJC_TMUX_WINDOW_BRANCH_SEPARATOR = "-";
 const GJC_TMUX_WINDOW_TITLE_PREFIX = "GJC-";
 const GJC_TMUX_TERMINAL_TITLE_PREFIX = "GJC: ";
+const GJC_TMUX_ROOT_TERMINAL_TITLE_OPTION = "@gjc-root-terminal-title";
+const GJC_TMUX_ROOT_TERMINAL_TITLE_SESSION_OPTION = "@gjc-root-terminal-title-session";
+const GJC_TMUX_DYNAMIC_SESSION_TITLE = "GJC: #{session_name}";
 
 function sanitizeTmuxWindowTitleSegment(value: string): string {
 	return value.replace(/:+/g, "-");
@@ -489,17 +492,31 @@ function sanitizeGjcTmuxRootTerminalTitle(title: string): string {
 	return title.replace(TERMINAL_TITLE_CONTROL_CHARS, "").trim() || "GJC";
 }
 
-function escapeTmuxFormatLiteral(value: string): string {
-	return value.replace(/#/g, "##");
+function buildGjcTmuxRootTerminalTitleFormat(sessionName: string): string {
+	if (!sessionName.startsWith(GJC_TMUX_SESSION_PREFIX)) return GJC_TMUX_DYNAMIC_SESSION_TITLE;
+	return `#{?#{==:#{${GJC_TMUX_ROOT_TERMINAL_TITLE_SESSION_OPTION}},#{session_name}},#{${GJC_TMUX_ROOT_TERMINAL_TITLE_OPTION}},${GJC_TMUX_DYNAMIC_SESSION_TITLE}}`;
 }
 
-function buildGjcTmuxRootTerminalTitleCommands(target: string, title: string): GjcTmuxProfileCommand[] {
-	const sanitized = escapeTmuxFormatLiteral(sanitizeGjcTmuxRootTerminalTitle(title));
+function buildGjcTmuxRootTerminalTitleCommands(
+	target: string,
+	sessionName: string,
+	title: string,
+): GjcTmuxProfileCommand[] {
+	const sanitized = sanitizeGjcTmuxRootTerminalTitle(title);
+	const format = buildGjcTmuxRootTerminalTitleFormat(sessionName);
 	return [
+		{
+			description: "remember tmux client terminal title fallback",
+			args: ["set-option", "-t", target, GJC_TMUX_ROOT_TERMINAL_TITLE_OPTION, sanitized],
+		},
+		{
+			description: "remember tmux client terminal title session",
+			args: ["set-option", "-t", target, GJC_TMUX_ROOT_TERMINAL_TITLE_SESSION_OPTION, sessionName],
+		},
 		{ description: "enable tmux client terminal title", args: ["set-option", "-t", target, "set-titles", "on"] },
 		{
-			description: "set tmux client terminal title",
-			args: ["set-option", "-t", target, "set-titles-string", sanitized],
+			description: "set dynamic tmux client terminal title",
+			args: ["set-option", "-t", target, "set-titles-string", format],
 		},
 	];
 }
@@ -512,10 +529,8 @@ function applyGjcTmuxRootTerminalTitleProfile(context: {
 	options: TmuxSpawnOptions;
 }): void {
 	if (!context.title) return;
-	for (const command of buildGjcTmuxRootTerminalTitleCommands(
-		buildGjcTmuxExactOptionTarget(context.target, { env: context.options.env }),
-		context.title,
-	)) {
+	const optionTarget = buildGjcTmuxExactOptionTarget(context.target, { env: context.options.env });
+	for (const command of buildGjcTmuxRootTerminalTitleCommands(optionTarget, context.target, context.title)) {
 		context.spawnSync(context.tmuxCommand, command.args, context.options);
 	}
 }
