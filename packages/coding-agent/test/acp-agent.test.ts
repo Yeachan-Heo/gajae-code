@@ -976,6 +976,190 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("forwards prompt compaction once and returns the session phase to idle", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await waitForBootstrapGuard();
+
+		session.prompt = async (text: string): Promise<void> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			for (const listener of session.listeners()) {
+				listener({
+					type: "auto_compaction_start",
+					reason: "overflow",
+					action: "context-full",
+				} as AgentSessionEvent);
+			}
+			for (const listener of session.listeners()) {
+				listener({
+					type: "auto_compaction_end",
+					action: "context-full",
+					result: undefined,
+					aborted: false,
+					willRetry: true,
+				} as AgentSessionEvent);
+			}
+			const assistantMessage = makeAssistantMessage("continued after compaction");
+			session.sessionManager.appendMessage(assistantMessage);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [assistantMessage] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+		};
+
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-0000000000cc",
+			prompt: [{ type: "text", text: "trigger compaction" }],
+		} as PromptRequest);
+
+		const sessionInfoUpdates = harness.updates
+			.filter(
+				update => update.sessionId === created.sessionId && update.update.sessionUpdate === "session_info_update",
+			)
+			.map(notification => notification.update);
+		const compactionUpdates = sessionInfoUpdates.filter(update => update._meta?.gjcCompactionState !== undefined);
+		expect(compactionUpdates).toHaveLength(2);
+		expect(compactionUpdates[0]?._meta).toMatchObject({
+			gjcPhase: "compacting",
+			gjcCompactionState: "start",
+			gjcCompactionTrigger: "overflow",
+			running: true,
+		});
+		expect(compactionUpdates[1]?._meta).toMatchObject({
+			gjcPhase: "responding",
+			gjcCompactionState: "end",
+			gjcCompactionWillRetry: true,
+			running: true,
+		});
+		expect(sessionInfoUpdates.at(-1)?._meta).toMatchObject({
+			gjcPhase: "idle",
+			running: false,
+			gjcRunning: false,
+		});
+		expectAcpNotifications(harness.updates);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("forwards idle compaction through the session lifetime subscription", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await waitForBootstrapGuard();
+		const before = harness.updates.length;
+
+		for (const listener of session.listeners()) {
+			listener({ type: "auto_compaction_start", reason: "idle", action: "handoff" } as AgentSessionEvent);
+		}
+		for (const listener of session.listeners()) {
+			listener({
+				type: "auto_compaction_end",
+				action: "handoff",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+			} as AgentSessionEvent);
+		}
+		await Bun.sleep(0);
+
+		const compactionUpdates = harness.updates
+			.slice(before)
+			.filter(update => update.update.sessionUpdate === "session_info_update")
+			.filter(update => update.update._meta?.gjcCompactionState !== undefined)
+			.map(notification => notification.update);
+		expect(compactionUpdates).toHaveLength(2);
+		expect(compactionUpdates[0]?._meta).toMatchObject({
+			gjcPhase: "compacting",
+			gjcCompactionTrigger: "idle",
+			gjcCompactionAction: "handoff",
+			running: true,
+		});
+		expect(compactionUpdates[1]?._meta).toMatchObject({
+			gjcPhase: "idle",
+			gjcCompactionState: "end",
+			gjcCompactionAction: "handoff",
+			running: false,
+		});
+		expectAcpNotifications(harness.updates);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("reports aborted compaction and clears phase when a prompt is cancelled", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const { promise: compactionStarted, resolve: markCompactionStarted } = Promise.withResolvers<void>();
+		const { promise: releasePrompt, resolve: finishPrompt } = Promise.withResolvers<void>();
+
+		session.prompt = async (text: string): Promise<void> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			for (const listener of session.listeners()) {
+				listener({
+					type: "auto_compaction_start",
+					reason: "threshold",
+					action: "context-full",
+				} as AgentSessionEvent);
+			}
+			markCompactionStarted();
+			await releasePrompt;
+			session.isStreaming = false;
+		};
+		session.abort = async (): Promise<void> => {
+			for (const listener of session.listeners()) {
+				listener({
+					type: "auto_compaction_end",
+					action: "context-full",
+					result: undefined,
+					aborted: true,
+					willRetry: false,
+				} as AgentSessionEvent);
+			}
+			finishPrompt();
+			session.isStreaming = false;
+		};
+
+		const prompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-0000000000ca",
+			prompt: [{ type: "text", text: "cancel compaction" }],
+		} as PromptRequest);
+		await compactionStarted;
+		await harness.agent.cancel({ sessionId: created.sessionId });
+		expect((await prompt).stopReason).toBe("cancelled");
+		await Bun.sleep(0);
+
+		const sessionInfoUpdates = harness.updates
+			.filter(
+				update => update.sessionId === created.sessionId && update.update.sessionUpdate === "session_info_update",
+			)
+			.map(notification => notification.update);
+		const compactionUpdates = sessionInfoUpdates.filter(update => update._meta?.gjcCompactionState !== undefined);
+		expect(compactionUpdates).toHaveLength(2);
+		expect(compactionUpdates[1]?._meta).toMatchObject({
+			gjcPhase: "idle",
+			gjcCompactionState: "end",
+			gjcCompactionAborted: true,
+			gjcCompactionWillRetry: false,
+			running: false,
+			gjcRunning: false,
+		});
+		expect(sessionInfoUpdates.at(-1)?._meta).toMatchObject({
+			gjcPhase: "idle",
+			running: false,
+			gjcRunning: false,
+		});
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("emits ACP plan updates from live todo_write results", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -1500,6 +1684,13 @@ describe("ACP agent", () => {
 		expect(returnedBeforeCleanup).toBe(true);
 		const cancelledResponse = await firstPrompt;
 		expect(cancelledResponse.stopReason).toBe("cancelled");
+		const afterCancelUpdates = harness.updates.length;
+		expect(afterCancelUpdates).toBeGreaterThan(beforeCancelUpdates);
+		expect(harness.updates.at(-1)?.update._meta).toMatchObject({
+			gjcPhase: "idle",
+			running: false,
+			gjcRunning: false,
+		});
 
 		for (const listener of session.listeners()) {
 			listener({
@@ -1508,7 +1699,7 @@ describe("ACP agent", () => {
 				assistantMessageEvent: { type: "text_delta", delta: "late" },
 			} as AgentSessionEvent);
 		}
-		expect(harness.updates).toHaveLength(beforeCancelUpdates);
+		expect(harness.updates).toHaveLength(afterCancelUpdates);
 
 		const secondPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,

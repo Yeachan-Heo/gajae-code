@@ -152,8 +152,8 @@ type ManagedSessionRecord = {
 	liveMessageProgress: { textEmitted: boolean; thoughtEmitted: boolean } | undefined;
 	toolArgsById: Map<string, unknown>;
 	extensionsConfigured: boolean;
-	// Installed inside `#scheduleBootstrapUpdates` (post-race-guard); released
-	// in `#disposeSessionRecord`. Lives independent of any prompt turn.
+	// Installed after the bootstrap race guard or eagerly when the client starts a prompt;
+	// released in `#disposeSessionRecord`. Lives independent of any prompt turn.
 	lifetimeUnsubscribe: (() => void) | undefined;
 };
 
@@ -619,6 +619,7 @@ export class AcpAgent implements Agent {
 				promise: pendingPrompt.promise,
 			};
 
+			this.#ensureLifetimeSubscription(record);
 			record.promptTurn.unsubscribe = record.session.subscribe(event => {
 				void this.#handlePromptEvent(record, event);
 			});
@@ -831,6 +832,7 @@ export class AcpAgent implements Agent {
 		}
 		promptTurn.cancelRequested = true;
 		promptTurn.unsubscribe?.();
+		void this.#emitCancelledPromptIdleUpdate(record);
 		const cleanup = this.#runCancelCleanup(record, promptTurn);
 		promptTurn.cleanup = cleanup;
 		this.#finishPrompt(record, {
@@ -1043,8 +1045,8 @@ export class AcpAgent implements Agent {
 	async #registerPreparedSession(session: AgentSession, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
 		const record = this.#createManagedSessionRecord(session);
 		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
-		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
-		// so it shares the bootstrap race guard — see that comment for why.
+		// The lifetime subscription normally follows the bootstrap race guard, but
+		// prompt() installs it eagerly once the client has demonstrated session ownership.
 		try {
 			await this.#configureExtensions(record);
 			await this.#configureMcpServers(record, mcpServers);
@@ -1070,7 +1072,38 @@ export class AcpAgent implements Agent {
 		};
 	}
 
+	#ensureLifetimeSubscription(record: ManagedSessionRecord): void {
+		if (record.lifetimeUnsubscribe) {
+			return;
+		}
+		record.lifetimeUnsubscribe = record.session.subscribe(event => {
+			void this.#handleLifetimeEvent(record, event);
+		});
+	}
+
 	async #handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
+		if (event.type === "auto_compaction_start" || event.type === "auto_compaction_end") {
+			// Prompt-bound compaction is normally forwarded by #handlePromptEvent. The lifetime
+			// subscription covers idle maintenance and the end event after prompt cancellation.
+			const promptTurn = record.promptTurn;
+			if (
+				isPromptTurnInFlight(promptTurn) &&
+				(!promptTurn.cancelRequested || event.type === "auto_compaction_start")
+			) {
+				return;
+			}
+			for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(
+				toAgentWireEventPayload(event),
+				record.session.sessionId,
+				{
+					cwd: record.session.sessionManager.getCwd(),
+					compactionEndPhase: "idle",
+				},
+			)) {
+				await this.#connection.sessionUpdate(notification);
+			}
+			return;
+		}
 		if (event.type !== "thinking_level_changed") {
 			return;
 		}
@@ -1140,6 +1173,7 @@ export class AcpAgent implements Agent {
 				getMessageProgress: message => this.#getLiveMessageProgress(record, message),
 				getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
 				cwd: record.session.sessionManager.getCwd(),
+				compactionEndPhase: "responding",
 			},
 		)) {
 			await this.#connection.sessionUpdate(notification);
@@ -1551,13 +1585,10 @@ export class AcpAgent implements Agent {
 		// enough that the response future has scheduled before our timer fires
 		// on stdio-only transports.
 		//
-		// The session-lifetime subscription is installed inside the same timer
-		// so it shares this guard — without it, an extension's `session_start`
-		// handler (or any async work it schedules) calling `setThinkingLevel`
-		// would push a `config_option_update` for a session id the client
-		// hasn't been told about yet. The pre-bootstrap thinking level is
-		// reported in the response's `configOptions`, so deferring the
-		// notification loses no state.
+		// The session-lifetime subscription normally shares this guard so extension
+		// work cannot notify an unknown session id. prompt() may install it earlier:
+		// receipt of a prompt proves the client already owns the returned session id,
+		// and closes the cancellation window before this timer fires.
 		setTimeout(() => {
 			if (this.#connection.signal.aborted) {
 				return;
@@ -1566,11 +1597,7 @@ export class AcpAgent implements Agent {
 			if (!record) {
 				return;
 			}
-			if (!record.lifetimeUnsubscribe) {
-				record.lifetimeUnsubscribe = record.session.subscribe(event => {
-					void this.#handleLifetimeEvent(record, event);
-				});
-			}
+			this.#ensureLifetimeSubscription(record);
 			void this.#emitBootstrapUpdates(sessionId, record);
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
 	}
@@ -1604,6 +1631,30 @@ export class AcpAgent implements Agent {
 				availableCommands: await this.#buildAvailableCommands(record.session),
 			},
 		});
+	}
+
+	/** Ensure cancellation clears a previously emitted busy/compacting phase even if abort never produces an end event. */
+	async #emitCancelledPromptIdleUpdate(record: ManagedSessionRecord): Promise<void> {
+		if (this.#connection.signal.aborted) {
+			return;
+		}
+		try {
+			await this.#connection.sessionUpdate({
+				sessionId: record.session.sessionId,
+				update: {
+					sessionUpdate: "session_info_update",
+					title: record.session.sessionName,
+					updatedAt: new Date().toISOString(),
+					_meta: {
+						gjcPhase: "idle",
+						running: false,
+						gjcRunning: false,
+					},
+				},
+			});
+		} catch (error) {
+			logger.warn("Failed to emit cancelled ACP prompt idle update", { error });
+		}
 	}
 
 	/**
@@ -1647,6 +1698,11 @@ export class AcpAgent implements Agent {
 				sessionUpdate: "session_info_update",
 				title: record.session.sessionName,
 				updatedAt: new Date().toISOString(),
+				_meta: {
+					gjcPhase: "idle",
+					running: false,
+					gjcRunning: false,
+				},
 			},
 		});
 	}
