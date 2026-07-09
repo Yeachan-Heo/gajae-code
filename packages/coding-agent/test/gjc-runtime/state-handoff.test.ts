@@ -250,7 +250,7 @@ describe("gjc state handoff", () => {
 		});
 	});
 
-	it("rejects unknown callee skill", async () => {
+	it("demotes canonical caller without creating runtime mode-state when callee is a runtime skill", async () => {
 		await withTempCwd(async cwd => {
 			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
 				skill: "deep-interview",
@@ -262,8 +262,40 @@ describe("gjc state handoff", () => {
 				["handoff", "--mode", "deep-interview", "--to", "made-up-skill", "--json"],
 				cwd,
 			);
+			expect(result.status).toBe(0);
+			const payload = JSON.parse(result.stdout ?? "{}") as Record<string, unknown>;
+			expect(payload.from).toBe("deep-interview");
+			expect(payload.to).toBe("made-up-skill");
+
+			const caller = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"));
+			expect(caller?.active).toBe(false);
+			expect(caller?.current_phase).toBe("handoff");
+			expect(caller?.handoff_to).toBe("made-up-skill");
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "made-up-skill"))).rejects.toThrow();
+
+			const activeState = await readJson(activeSnapshotPath(cwd, TEST_SESSION_ID));
+			const activeSkills = (activeState?.active_skills as Array<Record<string, unknown>>) ?? [];
+			expect(activeSkills.find(e => e.skill === "made-up-skill")).toBeUndefined();
+			const callerEntry = activeSkills.find(e => e.skill === "deep-interview");
+			expect(callerEntry?.active).not.toBe(true);
+			if (callerEntry) expect(callerEntry.handoff_to).toBe("made-up-skill");
+		});
+	});
+
+	it("rejects unsafe runtime callee path components", async () => {
+		await withTempCwd(async cwd => {
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
+				skill: "deep-interview",
+				version: 1,
+				active: true,
+				current_phase: "interviewing",
+			});
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "../made-up-skill", "--json"],
+				cwd,
+			);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("unknown --mode");
+			expect(result.stderr).toContain("invalid path component for --to");
 		});
 	});
 

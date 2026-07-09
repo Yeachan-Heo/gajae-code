@@ -127,15 +127,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -529,15 +523,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -913,15 +901,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -1357,15 +1339,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
