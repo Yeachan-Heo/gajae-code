@@ -717,7 +717,7 @@ describe("InputController pasted clipboard image paths", () => {
 	const RED_1X1_PNG_BASE64 =
 		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
-	it("attaches terminal-pasted clipboard temp images and inserts a compact placeholder", async () => {
+	it("attaches terminal-pasted clipboard temp images and preserves the source path in the placeholder", async () => {
 		const imagePath = `/tmp/clipboard-2026-06-04-120441-${process.pid.toString(36)}CAC144E7.png`;
 		await Bun.write(imagePath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
 		try {
@@ -728,7 +728,7 @@ describe("InputController pasted clipboard image paths", () => {
 			const handled = await editor.onPasteText?.(`${imagePath}\n`);
 
 			expect(handled).toBe(true);
-			expect(editor.getText()).toBe("[image 1] ");
+			expect(editor.getText()).toBe(`[image 1] source="${imagePath}" `);
 			expect(ctx.pendingImages).toHaveLength(1);
 			expect(ctx.pendingImages[0]?.mimeType).toBe("image/png");
 			expect(spies.showStatus).toHaveBeenCalledWith(`Attached image: ${imagePath.split("/").at(-1)}`, { dim: true });
