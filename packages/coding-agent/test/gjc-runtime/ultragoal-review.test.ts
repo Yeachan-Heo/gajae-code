@@ -208,6 +208,21 @@ async function writeQa(root: string, qa: Record<string, unknown>): Promise<strin
 	return file;
 }
 
+async function withUnavailableGh<T>(root: string, callback: () => Promise<T>): Promise<T> {
+	const fakeBin = path.join(root, "fake-bin");
+	await fs.mkdir(fakeBin, { recursive: true });
+	const fakeGh = path.join(fakeBin, "gh");
+	await Bun.write(fakeGh, "#!/bin/sh\necho 'gh unavailable in test' >&2\nexit 127\n");
+	await fs.chmod(fakeGh, 0o755);
+	const originalPath = process.env.PATH;
+	process.env.PATH = `${fakeBin}${path.delimiter}${originalPath ?? ""}`;
+	try {
+		return await callback();
+	} finally {
+		if (originalPath === undefined) delete process.env.PATH;
+		else process.env.PATH = originalPath;
+	}
+}
 async function review(root: string, args: string[]): Promise<Record<string, unknown>> {
 	const result = await runNativeUltragoalCommand(["review", ...args, "--json"], root);
 	expect(result.status).toBe(0);
@@ -274,9 +289,11 @@ describe("ultragoal review command", () => {
 		expect((await review(root, ["--branch", "HEAD", "--executor-qa-json", qaPath])).source).toMatchObject({
 			kind: "branch",
 		});
-		expect((await review(root, ["--pr", "123", "--executor-qa-json", qaPath])).source).toMatchObject({
-			kind: "pr",
-			prSource: "gh-unavailable",
+		await withUnavailableGh(root, async () => {
+			expect((await review(root, ["--pr", "123", "--executor-qa-json", qaPath])).source).toMatchObject({
+				kind: "pr",
+				prSource: "gh-unavailable",
+			});
 		});
 	});
 
