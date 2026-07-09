@@ -22,18 +22,38 @@ import type {
 	ClientBridgeTerminalHandle,
 } from "../../session/client-bridge";
 
+type AcpPermissionMode = "auto" | "prompt" | "always-allow";
+
+const ACP_PERMISSION_MODE_ENV = "GJC_ACP_PERMISSION_MODE";
+
+function parseAcpPermissionMode(value: unknown): AcpPermissionMode {
+	if (value === "auto" || value === "prompt" || value === "always-allow") return value;
+	return "prompt";
+}
+
+/** Client metadata is authoritative; the process environment is only a fallback when that field is absent. */
+function resolveAcpPermissionMode(clientCapabilities: ClientCapabilities | undefined): AcpPermissionMode {
+	const meta = clientCapabilities?._meta;
+	if (typeof meta === "object" && meta !== null) {
+		const gjc = (meta as { gjc?: unknown }).gjc;
+		if (typeof gjc === "object" && gjc !== null && "permissionHandling" in gjc) {
+			return parseAcpPermissionMode((gjc as { permissionHandling?: unknown }).permissionHandling);
+		}
+	}
+	return parseAcpPermissionMode(process.env[ACP_PERMISSION_MODE_ENV]);
+}
+
 export function createAcpClientBridge(
 	connection: AgentSideConnection,
 	sessionId: string,
 	clientCapabilities: ClientCapabilities | undefined,
 ): ClientBridge {
+	const promptPermission = resolveAcpPermissionMode(clientCapabilities) === "prompt";
 	const capabilities: ClientBridgeCapabilities = {
 		readTextFile: clientCapabilities?.fs?.readTextFile === true,
 		writeTextFile: clientCapabilities?.fs?.writeTextFile === true,
 		terminal: clientCapabilities?.terminal === true,
-		// Permission requests are always usable on the connection; gating is
-		// the agent's policy choice rather than a client capability.
-		requestPermission: true,
+		requestPermission: promptPermission,
 	};
 
 	const bridge: ClientBridge = { capabilities, deferAgentInitiatedTurns: true };
@@ -65,8 +85,10 @@ export function createAcpClientBridge(
 			createTerminalHandle(connection, sessionId, params);
 	}
 
-	bridge.requestPermission = (toolCall, options, signal) =>
-		requestPermission(connection, sessionId, toolCall, options, signal);
+	if (promptPermission) {
+		bridge.requestPermission = (toolCall, options, signal) =>
+			requestPermission(connection, sessionId, toolCall, options, signal);
+	}
 
 	return bridge;
 }
