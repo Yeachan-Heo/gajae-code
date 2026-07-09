@@ -149,6 +149,12 @@ export class InputController {
 				return { consume: true };
 			}
 			const hookDialogActive = this.#hasHookDialog();
+			if (this.ctx.hookSelector?.hasActiveInlineInput?.() === true) {
+				// Inline ask/custom-input editors use Esc to return to the option list.
+				// Let the focused selector see the key instead of converting a typo
+				// into a full workflow/session abort while the agent is streaming.
+				return undefined;
+			}
 			if (
 				this.#handleCancellableWorkEscape({
 					loading: hookDialogActive,
