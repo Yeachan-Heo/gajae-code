@@ -51,8 +51,11 @@ describe("SessionSelectorComponent delete confirmation", () => {
 		const selector = createSelector(onDelete);
 
 		selector.handleInput("\x1b[3~");
-		expect(renderText(selector)).toContain("Delete session?");
+		expect(renderText(selector)).toContain("Delete selected session transcript and artifacts?");
 		expect(renderText(selector)).toContain("Alpha");
+		expect(renderText(selector)).toContain(
+			"This cannot be undone. Other sessions and topic/history metadata are not deleted.",
+		);
 
 		selector.handleInput("\n");
 		await Bun.sleep(0);
@@ -62,7 +65,7 @@ describe("SessionSelectorComponent delete confirmation", () => {
 		expect(rendered).toContain("Error: disk failed");
 		expect(rendered).toContain("Alpha");
 		expect(rendered).toContain("Beta");
-		expect(rendered).not.toContain("Delete session?");
+		expect(rendered).not.toContain("Delete selected session transcript and artifacts?");
 	});
 
 	it("keeps the session visible when delete is canceled upstream", async () => {

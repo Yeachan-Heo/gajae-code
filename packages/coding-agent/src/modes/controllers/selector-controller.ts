@@ -1431,8 +1431,12 @@ export class SelectorController {
 		}
 
 		const confirmed = await this.ctx.showHookConfirm(
-			"Delete Session",
-			"This will permanently delete the current session.\nYou will be returned to the session selector.",
+			"Delete current session transcript and artifacts?",
+			[
+				"This permanently deletes only the current session transcript file and its artifacts directory.",
+				"Other sessions and topic/history metadata are not deleted.",
+				"You will be moved to a fresh session and returned to the session selector.",
+			].join("\n"),
 		);
 
 		if (!confirmed) {
@@ -1449,7 +1453,7 @@ export class SelectorController {
 		await storage.deleteSessionWithArtifacts(sessionFile);
 
 		// Show session selector
-		this.ctx.showStatus("Session deleted");
+		this.ctx.showStatus("Current session transcript and artifacts deleted");
 		await this.showSessionSelector();
 	}
 

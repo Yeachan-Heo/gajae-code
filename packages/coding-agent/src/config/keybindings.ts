@@ -188,11 +188,11 @@ export const KEYBINDINGS = {
 	},
 	"app.session.delete": {
 		defaultKeys: "ctrl+d",
-		description: "Delete session",
+		description: "Delete current session transcript/artifacts",
 	},
 	"app.session.deleteNoninvasive": {
 		defaultKeys: "ctrl+backspace",
-		description: "Delete session (non-invasive)",
+		description: "Delete selected session transcript/artifacts (non-invasive)",
 	},
 	"app.tree.foldOrUp": {
 		defaultKeys: ["ctrl+left", "alt+left"],

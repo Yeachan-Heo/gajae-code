@@ -567,7 +567,7 @@ export class CommandController {
 			`| Start a fresh session | \`${sessionNewKey}\` or \`/new\` |`,
 			"| Resume another session | `/resume` |",
 			"| Show session details | `/session info` |",
-			"| Delete current session | `/session delete` |",
+			"| Delete current session transcript/artifacts | `/session delete` |",
 			"| Select a model | `/model` or `Ctrl+L` |",
 			"| Show all shortcuts | `?` on an empty prompt or `/hotkeys` |",
 			"",

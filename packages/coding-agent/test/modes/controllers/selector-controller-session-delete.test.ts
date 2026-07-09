@@ -246,8 +246,12 @@ describe("SelectorController session deletion", () => {
 
 		expect(exists).toHaveBeenCalledWith(activeSessionPath);
 		expect(showHookConfirm).toHaveBeenCalledWith(
-			"Delete Session",
-			"This will permanently delete the current session.\nYou will be returned to the session selector.",
+			"Delete current session transcript and artifacts?",
+			[
+				"This permanently deletes only the current session transcript file and its artifacts directory.",
+				"Other sessions and topic/history metadata are not deleted.",
+				"You will be moved to a fresh session and returned to the session selector.",
+			].join("\n"),
 		);
 		expect(newSession).toHaveBeenCalledTimes(1);
 		expect(deleteSessionWithArtifacts).toHaveBeenCalledWith(activeSessionPath);
@@ -265,7 +269,7 @@ describe("SelectorController session deletion", () => {
 			"reloadTodos",
 			"ui.requestRender",
 			`delete:${activeSessionPath}`,
-			"showStatus:Session deleted",
+			"showStatus:Current session transcript and artifacts deleted",
 			"editorContainer.clear",
 			"editorContainer.addChild",
 			"ui.requestRender",

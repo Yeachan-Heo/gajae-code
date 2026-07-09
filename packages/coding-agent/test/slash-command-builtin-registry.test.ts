@@ -61,7 +61,7 @@ describe("builtin /copy slash command", () => {
 		expect(helpCommand?.description).toContain("beginner workflows");
 		expect(helpCommand?.priority).toBeGreaterThan(newCommand?.priority ?? 0);
 		expect(newCommand?.description).toBe("Start a new session");
-		expect(sessionCommand?.description).toBe("Show current session info or delete current session");
+		expect(sessionCommand?.description).toBe("Show session info or delete the current session transcript/artifacts");
 		expect(sessionCommand?.subcommands?.map(command => command.name)).toEqual(["info", "delete"]);
 	});
 

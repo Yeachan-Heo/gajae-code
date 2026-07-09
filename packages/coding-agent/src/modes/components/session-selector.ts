@@ -180,7 +180,7 @@ class SessionList implements Component {
 
 		// Add keybinding hint
 		lines.push("");
-		lines.push(theme.fg("muted", "  [Del to delete, Enter to select, Esc to cancel]"));
+		lines.push(theme.fg("muted", "  [Del to delete selected transcript/artifacts, Enter to select, Esc to cancel]"));
 
 		return lines;
 	}
@@ -307,7 +307,7 @@ export class SessionSelectorComponent extends Container {
 	#showDeleteConfirmation(session: SessionInfo): void {
 		const displayName = session.title || session.firstMessage.slice(0, 40) || session.id;
 		this.#confirmationDialog = new HookSelectorComponent(
-			`Delete session?\n${displayName}`,
+			`Delete selected session transcript and artifacts?\n${displayName}\nThis cannot be undone. Other sessions and topic/history metadata are not deleted.`,
 			["Yes", "No"],
 			async (option: string) => {
 				if (option === "Yes" && this.#onDelete) {
