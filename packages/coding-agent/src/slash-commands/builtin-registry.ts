@@ -24,6 +24,7 @@ import { resolveMemoryBackend } from "../memory-backend";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
+import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
@@ -820,13 +821,37 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			if (!command.args || command.args === "info") {
-				await runtime.output(
-					[
-						`Session: ${runtime.session.sessionId}`,
-						`Title: ${runtime.session.sessionName}`,
-						`CWD: ${runtime.cwd}`,
-					].join("\n"),
-				);
+				const stats = runtime.session.getSessionStats();
+				const lines = [
+					`Session: ${runtime.session.sessionId}`,
+					`Title: ${runtime.session.sessionName}`,
+					`CWD: ${runtime.cwd}`,
+					"",
+					"Tokens",
+					`Input: ${stats.tokens.input.toLocaleString()}`,
+					`Output: ${stats.tokens.output.toLocaleString()}`,
+				];
+				if (stats.tokens.cacheRead > 0) {
+					lines.push(`Cache Read: ${stats.tokens.cacheRead.toLocaleString()}`);
+				}
+				if (stats.tokens.cacheWrite > 0) {
+					lines.push(`Cache Write: ${stats.tokens.cacheWrite.toLocaleString()}`);
+				}
+				lines.push(`Total: ${stats.tokens.total.toLocaleString()}`);
+				if (stats.cost > 0 || stats.premiumRequests > 0) {
+					lines.push("", "Cost");
+					if (stats.cost > 0) {
+						lines.push(`Total: ${stats.cost.toFixed(4)}`);
+					}
+					if (stats.premiumRequests > 0) {
+						lines.push(`Premium Requests: ${stats.premiumRequests.toLocaleString()}`);
+					}
+				}
+				const cacheMissSummary = computeCacheMissCostSummary(stats.tokens, runtime.session.model?.cost);
+				if (cacheMissSummary) {
+					lines.push("", "Cache Miss Cost", ...formatCacheMissSummaryLines(cacheMissSummary));
+				}
+				await runtime.output(lines.join("\n"));
 				return commandConsumed();
 			}
 			if (command.args === "delete") {

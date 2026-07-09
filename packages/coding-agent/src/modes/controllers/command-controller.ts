@@ -40,6 +40,7 @@ import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
+import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../../session/cache-economics";
 import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
@@ -425,6 +426,19 @@ export class CommandController {
 			if (normalizedPremiumRequests > 0) {
 				info += `${theme.fg("dim", "Premium Requests:")} ${normalizedPremiumRequests.toLocaleString()}\n`;
 			}
+		}
+		const cacheMissSummary = computeCacheMissCostSummary(stats.tokens, this.ctx.session.model?.cost);
+		if (cacheMissSummary) {
+			info += `\n${theme.bold("Cache Miss Cost")}`;
+			for (const line of formatCacheMissSummaryLines(cacheMissSummary)) {
+				const separator = line.indexOf(":");
+				if (separator === -1) {
+					info += `\n${line}`;
+				} else {
+					info += `\n${theme.fg("dim", `${line.slice(0, separator)}:`)}${line.slice(separator + 1)}`;
+				}
+			}
+			info += `\n`;
 		}
 
 		if (this.ctx.lspServers && this.ctx.lspServers.length > 0) {

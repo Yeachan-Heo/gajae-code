@@ -26,6 +26,18 @@ interface FakeAcpBuiltinSession {
 	resolveRoleModelWithThinking(role: string): { model?: { provider: string; id: string } };
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
+	getSessionStats: () => {
+		sessionFile: string | undefined;
+		sessionId: string;
+		userMessages: number;
+		assistantMessages: number;
+		toolCalls: number;
+		toolResults: number;
+		totalMessages: number;
+		tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+		premiumRequests: number;
+		cost: number;
+	};
 	getAsyncJobSnapshot: (opts?: { recentLimit?: number }) => { running: unknown[]; recent: unknown[] } | null;
 	formatSessionAsText: () => string;
 	getLastAssistantText: () => string | undefined;
@@ -37,7 +49,14 @@ interface FakeAcpBuiltinSession {
 			options?: { candidates?: Array<{ provider: string; id: string; contextWindow?: number }> },
 		) => { provider: string; id: string; contextWindow?: number } | undefined;
 	};
-	model: { provider: string; id: string; contextWindow?: number } | undefined;
+	model:
+		| {
+				provider: string;
+				id: string;
+				contextWindow?: number;
+				cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+		  }
+		| undefined;
 	agent: {
 		state: {
 			tools: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
@@ -118,6 +137,18 @@ function createRuntime() {
 		},
 		async refreshBaseSystemPrompt() {},
 		getAsyncJobSnapshot: () => null,
+		getSessionStats: () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 0,
+			assistantMessages: 0,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 0,
+			tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			premiumRequests: 0,
+			cost: 0,
+		}),
 		formatSessionAsText: () => "",
 		getLastAssistantText: () => undefined,
 		messages: [],
@@ -840,6 +871,71 @@ describe("ACP builtin slash commands", () => {
 });
 
 describe("session lifecycle commands", () => {
+	it("/session info: includes cache miss summary for priced material cache usage", async () => {
+		const { output, session, runtime } = createRuntime();
+		session.model = {
+			provider: "test",
+			id: "priced-model",
+			cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+		};
+		session.getSessionStats = () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 1,
+			assistantMessages: 1,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 2,
+			tokens: { input: 2_000, output: 500, cacheRead: 1_000_000, cacheWrite: 0, total: 1_002_500 },
+			premiumRequests: 0,
+			cost: 0.45,
+		});
+
+		const result = await executeAcpBuiltinSlashCommand("/session info", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Tokens\nInput: 2,000\nOutput: 500\nCache Read: 1,000,000");
+		expect(output[0]).toContain("Cost\nTotal: 0.4500");
+		expect(output[0]).toContain("Cache Miss Cost");
+		expect(output[0]).toContain("Uncached Input Cost: $0.0060");
+		expect(output[0]).toContain("Estimated Miss Premium: $0.0054 vs cache-read pricing");
+	});
+
+	it("/session info: omits cache miss summary without material priced usage", async () => {
+		const zeroUsage = createRuntime();
+		zeroUsage.session.model = {
+			provider: "test",
+			id: "priced-model",
+			cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+		};
+
+		await expect(executeAcpBuiltinSlashCommand("/session info", zeroUsage.runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(zeroUsage.output[0]).toContain("Tokens");
+		expect(zeroUsage.output[0]).not.toContain("Cache Miss Cost");
+
+		const unpriced = createRuntime();
+		unpriced.session.getSessionStats = () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 1,
+			assistantMessages: 1,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 2,
+			tokens: { input: 2_000, output: 500, cacheRead: 1_000_000, cacheWrite: 0, total: 1_002_500 },
+			premiumRequests: 0,
+			cost: 0,
+		});
+
+		await expect(executeAcpBuiltinSlashCommand("/session info", unpriced.runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(unpriced.output[0]).toContain("Cache Read: 1,000,000");
+		expect(unpriced.output[0]).not.toContain("Cache Miss Cost");
+	});
+
 	it("/session delete: returns in-memory usage when no sessionFile", async () => {
 		const { output, runtime } = createRuntime();
 		const result = await executeAcpBuiltinSlashCommand("/session delete", runtime);
