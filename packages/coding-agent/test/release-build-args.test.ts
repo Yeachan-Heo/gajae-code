@@ -31,17 +31,24 @@ describe("release build compile args", () => {
 		expect(releaseEntrypoints).toContain("./packages/stats/src/sync-worker.ts");
 		expect(releaseEntrypoints).toContain("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts");
 		expect(releaseEntrypoints).toContain("./packages/coding-agent/src/eval/js/worker-entry.ts");
-		expect(releaseEntrypoints).toContain("./packages/ai/src/models.json");
 		expect(releaseEntrypoints).toContain("./node_modules/handlebars/lib/index.js");
 		expect(releaseArgs).toContain("./packages/stats/src/sync-worker.ts");
 		expect(releaseArgs).toContain("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts");
 		expect(releaseArgs).toContain("./packages/coding-agent/src/eval/js/worker-entry.ts");
-		expect(releaseArgs).toContain("./packages/ai/src/models.json");
 		expect(releaseArgs).toContain("./node_modules/handlebars/lib/index.js");
 	});
 
+	it("does not list models.json as an extra compile entrypoint", () => {
+		// Bun does not emit `.json` extra entrypoints into the compiled bunfs.
+		// The bundled model catalog is embedded via the `with { type: "file" }`
+		// import in @gajae-code/ai instead, so re-adding these args would regress
+		// release binary startup.
+		expect(releaseEntrypoints).not.toContain("./packages/ai/src/models.json");
+		expect(releaseArgs).not.toContain("./packages/ai/src/models.json");
+		expect(buildDevCompileArgs()).not.toContain("../ai/src/models.json");
+	});
+
 	it("includes lazy CommonJS entrypoints in dev args", () => {
-		expect(buildDevCompileArgs()).toContain("../ai/src/models.json");
 		expect(buildDevCompileArgs()).toContain("../../node_modules/handlebars/lib/index.js");
 	});
 
