@@ -27,6 +27,13 @@ export interface InstallGjcPluginOptions {
 	scope: GjcPluginScope;
 	cwd: string;
 	force?: boolean;
+	/**
+	 * Explicit operator approval for command hooks (subprocess-spawning hook
+	 * entries). Installing a bundle that declares command hooks without this
+	 * approval fails with security_policy; the hooks are never silently
+	 * activated or silently dropped.
+	 */
+	allowCommandHooks?: boolean;
 }
 
 export interface InstallGjcPluginResult {
@@ -277,6 +284,7 @@ function bundleToRegistryEntry(
 	scope: GjcPluginScope,
 	source: GjcPluginRegistrySource,
 	now: string,
+	commandHooksApproved: boolean,
 ): GjcPluginRegistryEntry {
 	return {
 		name: bundle.name,
@@ -292,6 +300,7 @@ function bundleToRegistryEntry(
 		copiedFiles: bundle.files,
 		surfaces: bundle.surfaces,
 		disabledSurfaceIds: [],
+		...(commandHooksApproved ? { commandHooksApproved: true } : {}),
 	};
 }
 
@@ -342,6 +351,16 @@ export async function installGjcPluginBundle(
 	try {
 		// 1. Compile + validate (never imports plugin code).
 		const bundle = await compileGjcPluginBundle(resolved.dir);
+		// Command hooks spawn a bundle-confined subprocess on hook events; that
+		// capability requires explicit operator approval at install time.
+		const commandHookNames = bundle.surfaces.hooks.filter(h => h.command !== undefined).map(h => h.name);
+		if (commandHookNames.length > 0 && !options.allowCommandHooks) {
+			throw new GjcPluginLoadError(
+				"security_policy",
+				`GJC plugin "${bundle.name}" declares command hook(s) [${commandHookNames.join(", ")}] that run a bundled subprocess on hook events; re-run install with --allow-command-hooks to approve`,
+			);
+		}
+		const commandHooksApproved = commandHookNames.length > 0 && options.allowCommandHooks === true;
 		const dirName = safeDirSegment(bundle.name);
 		const root = scopeRoot(options.scope, options.cwd);
 		const finalDir = path.join(root, dirName);
@@ -363,6 +382,7 @@ export async function installGjcPluginBundle(
 				options.scope,
 				resolved.source,
 				new Date().toISOString(),
+				commandHooksApproved,
 			);
 			if (existing) {
 				const sameContent = registryEntryFingerprint(existing) === registryEntryFingerprint(candidate);

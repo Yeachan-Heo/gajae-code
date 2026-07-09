@@ -37,7 +37,19 @@ export interface GjcPluginHookManifestEntry {
 	event: string;
 	target?: string;
 	phase?: "before" | "after";
-	path: string;
+	/** Module hook: bundled factory file (exactly one of `path` / `command`). */
+	path?: string;
+	/**
+	 * Command hook (tool_call only): root-confined executable or allowlisted
+	 * launcher (node/bun) spawned by GJC itself with the event JSON on stdin;
+	 * an optional `{block,reason}` verdict on stdout blocks the call.
+	 * Requires explicit install approval (`--allow-command-hooks`).
+	 */
+	command?: string;
+	/** Extra argv entries for `command` (never shell-interpreted). */
+	args?: string[];
+	/** Self-deadline for `command` in ms (default 10000, max 60000). */
+	timeoutMs?: number;
 	sha256?: string;
 }
 
@@ -199,7 +211,13 @@ export interface NormalizedHookSurface {
 	event: string;
 	target?: string;
 	phase?: "before" | "after";
-	relativePath: string;
+	/** Present for module hooks only. */
+	relativePath?: string;
+	/** Present for command hooks only (see GjcPluginHookManifestEntry). */
+	command?: string;
+	args?: string[];
+	timeoutMs?: number;
+	/** Module hooks: file hash. Command hooks: canonical config hash. */
 	sha256: string;
 }
 
@@ -277,6 +295,12 @@ export interface GjcPluginRegistryEntry {
 	copiedFiles: GjcPluginCopiedFile[];
 	surfaces: NormalizedGjcPluginSurfaces;
 	disabledSurfaceIds: string[];
+	/**
+	 * True only when the operator approved this bundle's command hooks at
+	 * install time (`--allow-command-hooks`). Command hooks never activate
+	 * without it.
+	 */
+	commandHooksApproved?: boolean;
 	quarantine?: GjcPluginQuarantineEntry[];
 }
 

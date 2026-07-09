@@ -19,7 +19,8 @@ A GJC plugin bundle may only **extend** existing skills/agents — it can never 
     { "name": "domain_note", "path": "tools/domain-note.ts", "description": "..." }
   ],
   "hooks": [
-    { "name": "audit-read", "event": "tool_call", "target": "read", "phase": "before", "path": "hooks/audit-read.ts" }
+    { "name": "audit-read", "event": "tool_call", "target": "read", "phase": "before", "path": "hooks/audit-read.ts" },
+    { "name": "policy-gate", "event": "tool_call", "command": "bun", "args": ["hooks/gate.js"], "timeoutMs": 10000 }
   ],
   "mcps": [
     { "name": "domain_docs", "transport": "stdio", "command": "bun", "args": ["mcp/domain-docs.ts"], "cwd": "." }
@@ -35,7 +36,7 @@ A GJC plugin bundle may only **extend** existing skills/agents — it can never 
 |---------|---------|---------------|
 | `subskills` | Inline sub-skills bound to an existing skill/agent (`binds_to`/`phase`/`activation_arg`) | Two-tier (see below) |
 | `tools` | Always-on custom tools (object entries) or legacy subskill-scoped string paths | Additive; manifest-declared name is authoritative, never overwrites an existing tool |
-| `hooks` | Constrained event hooks bound to a declared `event`/`target`/`phase` | Additive; run alongside built-ins, never replace |
+| `hooks` | Constrained event hooks: a module hook (`path`) or an operator-approved command hook (`command`) bound to a declared `event`/`target`/`phase` | Additive; run alongside built-ins, never replace |
 | `mcps` | MCP servers (`stdio`/`http`/`sse`) | Additive; server-name collisions are hard errors |
 | `system_appendix` | Lower-authority text appended to the default agent system prompt | Append-only, never overrides base |
 | `agent-appendix` | Lower-authority text appended to an existing role agent's prompt | Append-only per named agent |
@@ -54,6 +55,8 @@ gjc plugin install <path|git-url|tarball> --project   # install into the project
 
 Exactly one of `--user` / `--project` is required for GJC plugin bundles (there is no default root). A source containing `gajae-plugin.json` is classified as a GJC bundle and routed to the bundle installer **before** the marketplace/npm path; non-bundle sources fall through to the legacy flow.
 
+Bundles that declare **command hooks** additionally require `--allow-command-hooks` (explicit operator approval of the subprocess-spawn capability); install fails with `security_policy` otherwise.
+
 Install is **compile-validate-then-copy**:
 
 1. The bundle is compiled and validated **without importing any plugin code** (manifest, frontmatter, and declared files are read as bytes only).
@@ -67,6 +70,7 @@ Idempotency: re-installing identical content is a no-op; different content requi
 - **Install validation never executes plugin code.** Tool/hook names are manifest-declared; at runtime the loaded factory must return/register exactly the declared name/event or the surface is quarantined (`runtime_mismatch`).
 - **MCP policy** (install + runtime connect): HTTPS-only for `http`/`sse`; private/loopback/link-local/unique-local/multicast and the `169.254.169.254` metadata endpoint are denied across IPv4, IPv6, IPv4-mapped/compatible, zone-id and trailing-dot forms; URL credentials and CRLF headers are rejected; DNS is re-resolved before connect (rebinding defence). `stdio` servers are confined to the plugin root (allowed launchers `node`/`bun` or a root-confined executable; required bundled script argument; no eval/loader flags; no env expansion).
 - **Hooks** run through a *constrained* API: only a handler for the declared event may be registered. `registerCommand`, `sendMessage`, `appendEntry`, renderer registration, and shell `exec` are denied (`security_policy`). The broad first-party hook API is never exposed to bundle hooks.
+- **Command hooks** (`command` instead of `path`, `tool_call` only): GJC itself spawns the declared command (argv array, never a shell) with the event JSON on stdin and honors an optional `{"block":true,"reason":"..."}` verdict on stdout, fail-closed (spawn error, timeout, non-zero exit, or unparseable output block the call). The spawn spec passes the same confinement policy as `stdio` MCP servers, runs with a minimal no-inherit environment, inside the plugin root, under a self-deadline (`timeoutMs`, default 10 s, max 60 s), and requires explicit operator approval at install time (`--allow-command-hooks`); un-approved surfaces quarantine at session load. A command hook may be target-less so a governance gate sees every tool call; module hooks keep their required `target`/`phase` contract.
 - **Appendices** render as lower-authority, delimited `<gjc-plugin-system-appendix>` / `<gjc-plugin-agent-appendix>` blocks appended after the base/project prompt; size-capped (8 KiB/appendix, 32 KiB total) fail-closed; content is escaped and control-char sanitized. They can never override base/developer instructions.
 - **Hash drift**: installed files are re-verified against the registry at session start; any drift quarantines the plugin (`runtime_mismatch`).
 

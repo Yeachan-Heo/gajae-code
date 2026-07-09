@@ -1,6 +1,12 @@
 # Changelog
 
 ## [Unreleased]
+
+### Added
+
+- GJC plugin bundles can declare `tool_call` **command hooks** (`command`/`args`/`timeoutMs` instead of `path`): GJC spawns the plugin-root-confined command with the event JSON on stdin and honors a fail-closed `{block,reason}` verdict on stdout; requires the new `gjc plugin install --allow-command-hooks` operator approval and reuses the stdio-MCP subprocess confinement policy. Module hooks and existing bundles are unaffected.
+
+## [0.9.2] - 2026-07-09
 ### Added
 
 - Added `gjc --credential <selector>` for pinning a stored provider credential by `email:`, `id:`, `account:`, `project:`, or `provider/email:` during a session.

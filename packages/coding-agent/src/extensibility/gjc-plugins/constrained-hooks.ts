@@ -1,5 +1,7 @@
 import { logger } from "@gajae-code/utils";
 
+import { createCommandHookHandler } from "./command-hooks";
+import { assertCommandHookAllowed } from "./mcp-policy";
 import { loadEffectiveGjcPluginRegistry } from "./registry";
 import { type SessionQuarantine, validateSessionBundles, verifyEntryHashes } from "./session-validation";
 import { GjcPluginLoadError, type GjcPluginRegistryEntry } from "./types";
@@ -43,14 +45,63 @@ interface DeclaredHook {
 	relativePath: string;
 }
 
-function collectDeclaredHooks(entries: readonly GjcPluginRegistryEntry[]): DeclaredHook[] {
-	const out: DeclaredHook[] = [];
+function collectDeclaredHooks(entries: readonly GjcPluginRegistryEntry[]): {
+	declared: DeclaredHook[];
+	commandHooks: ConstrainedPluginHook[];
+	quarantine: SessionQuarantine[];
+} {
+	const declared: DeclaredHook[] = [];
+	const commandHooks: ConstrainedPluginHook[] = [];
+	const quarantine: SessionQuarantine[] = [];
 	for (const entry of entries) {
 		if (!entry.enabled) continue;
 		const disabled = new Set(entry.disabledSurfaceIds);
 		for (const h of entry.surfaces.hooks) {
 			if (disabled.has(h.extensionId)) continue;
-			out.push({
+			if (h.command !== undefined) {
+				// Command hooks spawn a subprocess; they activate ONLY when the
+				// operator approved them at install time (--allow-command-hooks).
+				if (entry.commandHooksApproved !== true) {
+					quarantine.push({
+						plugin: entry.name,
+						surfaceId: h.extensionId,
+						code: "security_policy",
+						message: `Command hook "${h.name}" is not approved; reinstall the plugin with --allow-command-hooks`,
+					});
+					continue;
+				}
+				// Re-apply the install-time confinement policy before any spawn
+				// (mirrors buildPluginMcpConfigs re-running assertMcpInstallPolicy).
+				try {
+					assertCommandHookAllowed(h, { pluginRoot: entry.pluginRoot });
+				} catch (error) {
+					quarantine.push({
+						plugin: entry.name,
+						surfaceId: h.extensionId,
+						code: "security_policy",
+						message: error instanceof Error ? error.message : String(error),
+					});
+					continue;
+				}
+				commandHooks.push({
+					plugin: entry.name,
+					event: h.event,
+					target: h.target,
+					phase: h.phase,
+					handler: createCommandHookHandler({
+						plugin: entry.name,
+						name: h.name,
+						event: h.event,
+						command: h.command,
+						args: h.args,
+						timeoutMs: h.timeoutMs,
+						pluginRoot: entry.pluginRoot,
+					}),
+				});
+				continue;
+			}
+			if (h.relativePath === undefined) continue; // malformed surface; nothing to import
+			declared.push({
 				plugin: entry.name,
 				event: h.event,
 				target: h.target,
@@ -59,7 +110,7 @@ function collectDeclaredHooks(entries: readonly GjcPluginRegistryEntry[]): Decla
 			});
 		}
 	}
-	return out;
+	return { declared, commandHooks, quarantine };
 }
 
 async function loadOneHook(
@@ -159,9 +210,10 @@ export async function loadConstrainedPluginHooks(input: { cwd: string }): Promis
 		if (drift) preQuarantine.push(drift);
 	}
 	const { active, quarantine } = validateSessionBundles(effective, {}, preQuarantine);
-	const declared = collectDeclaredHooks(active);
-	const hooks: ConstrainedPluginHook[] = [];
-	for (const d of declared) {
+	const collected = collectDeclaredHooks(active);
+	quarantine.push(...collected.quarantine);
+	const hooks: ConstrainedPluginHook[] = [...collected.commandHooks];
+	for (const d of collected.declared) {
 		const { hook, quarantine: q } = await loadOneHook(d);
 		if (hook) hooks.push(hook);
 		if (q) quarantine.push(q);

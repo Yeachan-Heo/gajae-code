@@ -2,11 +2,13 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseFrontmatter, pathIsWithin } from "@gajae-code/utils";
+import { assertCommandHookAllowed } from "./mcp-policy";
 import { resolveWithinRoot } from "./paths";
 import { parseManifest, parseSubskillFrontmatter } from "./schema";
 import {
 	GJC_PLUGIN_MANIFEST_FILENAME,
 	type GjcPluginAppendixManifestEntry,
+	type GjcPluginHookManifestEntry,
 	GjcPluginLoadError,
 	type GjcPluginMcpManifestEntry,
 	type NormalizedAgentAppendixSurface,
@@ -96,6 +98,19 @@ async function hashFile(
 		throw new GjcPluginLoadError("hash_mismatch", `GJC plugin file hash mismatch for ${rel}`);
 	}
 	return { sha256: digest, bytes: buf.byteLength };
+}
+
+function commandHookConfigHash(hook: GjcPluginHookManifestEntry): string {
+	const canonical = JSON.stringify({
+		name: hook.name,
+		event: hook.event,
+		target: hook.target ?? null,
+		phase: hook.phase ?? null,
+		command: hook.command ?? null,
+		args: hook.args ?? null,
+		timeoutMs: hook.timeoutMs ?? null,
+	});
+	return sha256(canonical);
 }
 
 function mcpConfigHash(entry: GjcPluginMcpManifestEntry): string {
@@ -228,6 +243,42 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 
 	const hooks: NormalizedHookSurface[] = [];
 	for (const hook of manifest.hooks) {
+		if (hook.command !== undefined) {
+			// Command hook: no factory module. Apply the same subprocess confinement
+			// policy stdio MCP servers get (pure check, no spawn), then hash any
+			// bundled script args so the copied-file boundary owns them.
+			assertCommandHookAllowed(hook, { pluginRoot });
+			for (const arg of hook.args ?? []) {
+				if (arg.startsWith("-")) continue;
+				if (!arg.startsWith(".") && !arg.includes("/")) continue;
+				const argAbs = await resolveDeclaredFile(pluginRoot, arg);
+				const { sha256: argDigest, bytes: argBytes } = await hashFile(argAbs, arg, undefined);
+				files.set(arg, { sha256: argDigest, bytes: argBytes });
+			}
+			const configHash = commandHookConfigHash(hook);
+			if (hook.sha256 !== undefined && hook.sha256.toLowerCase() !== configHash) {
+				throw new GjcPluginLoadError("hash_mismatch", `GJC plugin hook config hash mismatch for "${hook.name}"`);
+			}
+			// A governance command hook may be target-less: it then observes every
+			// tool_call (mirrors matcher-less hooks in other agent runtimes). The
+			// module-hook target/phase contract below stays unchanged.
+			hooks.push({
+				extensionId: surfaceIds.hook(hook.event, hook.phase, hook.target, hook.name),
+				name: hook.name,
+				event: hook.event,
+				target: hook.target,
+				phase: hook.phase,
+				command: hook.command,
+				args: hook.args,
+				timeoutMs: hook.timeoutMs,
+				sha256: configHash,
+			});
+			continue;
+		}
+		if (hook.path === undefined) {
+			// Unreachable after schema validation; kept as an honest guard.
+			throw new GjcPluginLoadError("invalid_hook", `GJC plugin hook "${hook.name}": missing path`);
+		}
 		// Path safety first: resolve/hash before semantic checks so traversal and
 		// missing-file failures take precedence over contract validation.
 		const abs = await resolveDeclaredFile(pluginRoot, hook.path);
