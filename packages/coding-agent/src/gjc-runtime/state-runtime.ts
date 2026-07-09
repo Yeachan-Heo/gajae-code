@@ -242,9 +242,12 @@ function assertSafePathComponent(value: string, label: string): void {
 		throw new StateCommandError(2, `invalid path component for --${label}: ${value}`);
 	}
 }
+function isKnownMode(mode: string): mode is CanonicalGjcWorkflowSkill {
+	return KNOWN_MODES.includes(mode);
+}
 
 function assertKnownMode(mode: string): asserts mode is CanonicalGjcWorkflowSkill {
-	if (!KNOWN_MODES.includes(mode)) {
+	if (!isKnownMode(mode)) {
 		throw new StateCommandError(2, `unknown --mode: ${mode}. Expected one of: ${KNOWN_MODES.join(", ")}.`);
 	}
 }
@@ -1580,14 +1583,15 @@ async function handleHandoff(
 	if (!calleeRaw) {
 		throw new StateCommandError(2, "gjc state handoff requires --to <callee>");
 	}
-	assertKnownMode(calleeRaw);
-	const callee = calleeRaw as CanonicalGjcWorkflowSkill;
+	assertSafePathComponent(calleeRaw, "to");
+	const callee = calleeRaw;
+	const calleeIsWorkflow = isKnownMode(callee);
 	if (callee === caller) {
 		throw new StateCommandError(2, `gjc state handoff: --to must differ from caller (both are "${caller}")`);
 	}
 
 	const callerPath = modeStateFile(cwd, caller, sessionId);
-	const calleePath = modeStateFile(cwd, callee, sessionId);
+	const calleePath = calleeIsWorkflow ? modeStateFile(cwd, callee, sessionId) : undefined;
 	const forced = hasFlag(args, "--force");
 	const callerRead = await readExistingStateForMutation(callerPath);
 	if (callerRead.kind === "corrupt" && !forced) {
@@ -1602,15 +1606,7 @@ async function handleHandoff(
 			`gjc state ${caller} handoff: caller is not active (no mode-state file at ${callerPath})`,
 		);
 	}
-	const calleeRead = await readExistingStateForMutation(calleePath);
-	if (calleeRead.kind === "corrupt" && !forced) {
-		throw new StateCommandError(
-			2,
-			`existing state for ${callee} is corrupt or tampered (${calleeRead.error}); use --force to overwrite`,
-		);
-	}
 	const existingCaller = callerRead.kind === "valid" ? callerRead.value : {};
-	const existingCallee = calleeRead.kind === "valid" ? calleeRead.value : {};
 
 	const handoffAt = nowIso();
 	const mutationId = `${caller}:handoff:${callee}:${handoffAt}`;
@@ -1623,6 +1619,103 @@ async function handleHandoff(
 		nowIso: handoffAt,
 		mutationId,
 	});
+
+	// Runtime callees have no native mode-state to clear later, so do not
+	// persist them as active-state entries; the prompt observer tracks them
+	// in memory the same way direct `/skill:<runtime>` invocation does.
+	if (!calleeIsWorkflow) {
+		const normalizedCaller =
+			caller === "deep-interview"
+				? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
+						string,
+						unknown
+					>)
+				: migrateWorkflowState(existingCaller, caller).state;
+		const mergedCallerState: Record<string, unknown> = {
+			...normalizedCaller,
+			skill: caller,
+			version: WORKFLOW_STATE_VERSION,
+			active: false,
+			current_phase: "handoff",
+			handoff_to: callee,
+			handoff_at: handoffAt,
+			updated_at: handoffAt,
+			receipt: callerReceipt,
+		};
+		const force = hasFlag(args, "--force");
+		await beginWorkflowTransactionJournal({
+			cwd,
+			sessionId,
+			mutationId,
+			caller,
+			paths: [callerPath, activeStateFile(cwd, sessionId)],
+		});
+		const callerWrite = await writeJsonAtomic(cwd, callerPath, mergedCallerState, "handoff", {
+			sessionId,
+			skill: caller,
+			mutationId,
+			force,
+			fromPhase: typeof existingCaller.current_phase === "string" ? existingCaller.current_phase : undefined,
+			toPhase: "handoff",
+		});
+		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { steps: ["caller-mode-state"] });
+		if (callerWrite.warning) process.stderr.write(`${callerWrite.warning}\n`);
+		const stampedCallerReceipt = isPlainObject(callerWrite.stamped.receipt) ? callerWrite.stamped.receipt : {};
+		await syncSkillActiveState({
+			cwd,
+			skill: caller,
+			active: false,
+			phase: "handoff",
+			sessionId,
+			threadId,
+			turnId,
+			source: "gjc-state-cli",
+			hud: buildHudForMode(caller, mergedCallerState),
+			handoff_to: callee,
+			handoff_at: handoffAt,
+			receipt: callerReceipt,
+		});
+		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
+			steps: ["caller-mode-state", "active-state"],
+		});
+		await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
+		await touchStateActivityMarker(cwd, sessionId, callerPath);
+		return {
+			status: 0,
+			stdout: renderCliWriteReceipt({
+				ok: true,
+				from: caller,
+				to: callee,
+				handoff_at: handoffAt,
+				phases: {
+					from: mergedCallerState.current_phase,
+				},
+				receipts: {
+					from: {
+						mutation_id: stampedCallerReceipt.mutation_id,
+						status: stampedCallerReceipt.status,
+						content_sha256: stampedCallerReceipt.content_sha256,
+					},
+				},
+				paths: {
+					from: callerPath,
+					active_state: activeStateFile(cwd, sessionId),
+				},
+			}),
+		};
+	}
+
+	if (!calleePath) {
+		throw new StateCommandError(2, `gjc state handoff failed to resolve workflow callee path for ${callee}`);
+	}
+	const calleeRead = await readExistingStateForMutation(calleePath);
+	if (calleeRead.kind === "corrupt" && !forced) {
+		throw new StateCommandError(
+			2,
+			`existing state for ${callee} is corrupt or tampered (${calleeRead.error}); use --force to overwrite`,
+		);
+	}
+	const existingCallee = calleeRead.kind === "valid" ? calleeRead.value : {};
 	const calleeReceipt = buildWorkflowStateReceipt({
 		cwd,
 		skill: callee,

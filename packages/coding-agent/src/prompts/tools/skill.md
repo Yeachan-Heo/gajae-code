@@ -8,8 +8,8 @@ Invoke another available skill in the current turn.
 <instruction>
 - `name` is the skill name as it appears in `/skill:<name>` (e.g. `ralplan`, `ultragoal`, `team`, `deep-interview`)
 - `args` is the free-form argument string the skill would receive after `/skill:<name>` on the command line
-- The tool loads the callee's SKILL.md into the current turn and handles the caller→callee state handoff itself.
-- The chain is refused while the caller skill is still active. If your current skill has not yet reached a terminal phase, prepare it first with `gjc state <skill> write --input '{"current_phase":"handoff"}' --json`; no other handoff command is needed.
+- The tool loads the callee's SKILL.md into the current turn and handles native workflow caller→callee state handoff when the caller is one of the built-in GJC workflows.
+- The chain is refused while a native workflow caller is still active. If your current skill is one of `deep-interview`, `ralplan`, `ultragoal`, or `team` and has not yet reached a terminal phase, prepare it first with `gjc state <skill> write --input '{"current_phase":"handoff"}' --json`; no other handoff command is needed. Runtime project/user skills do not use `gjc state <skill>`.
 - Call once per chain step. To chain `A → B → C`, A calls `skill(B)`; B's next agent turn calls `skill(C)`.
 </instruction>
 

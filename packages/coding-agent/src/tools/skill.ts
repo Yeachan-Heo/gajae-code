@@ -4,15 +4,16 @@
  * Lets the agent hand off to another available skill in the current turn. The
  * callee's SKILL.md is dispatched through the same custom-message path used by
  * `/skill:<name>` typing, as a user-attribution message delivered same-turn
- * (without `deliverAs: "nextTurn"`). Before dispatch, the tool calls
- * `gjc state <caller> handoff --to <callee>` in-process via the state-runtime
- * function so caller and callee mode-states plus `skill-active-state.json`
- * transition atomically.
+ * (without `deliverAs: "nextTurn"`). When the caller is one of the canonical
+ * workflow skills, the tool first runs the native state handoff so workflow
+ * mode-state and `skill-active-state.json` transition atomically. Runtime
+ * project/user skills have no native workflow mode-state, so they are dispatched
+ * directly and tracked by the prompt observer instead.
  *
- * Chaining is refused unless the caller's `current_phase` is in
- * `{complete, completed, handoff, failed, cancelled, canceled, inactive}`. The
- * agent declares readiness either by writing `current_phase: "handoff"` to its
- * mode-state or by running the handoff verb directly.
+ * Canonical workflow chaining is refused unless the caller's `current_phase` is
+ * in `{complete, completed, handoff, failed, cancelled, canceled, inactive}`.
+ * The agent declares readiness either by writing `current_phase: "handoff"` to
+ * its mode-state or by running the handoff verb directly.
  */
 
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
@@ -24,6 +25,7 @@ import { buildSkillPromptMessage } from "../extensibility/skills";
 import { runNativeStateCommand } from "../gjc-runtime/state-runtime";
 import skillDescription from "../prompts/tools/skill.md" with { type: "text" };
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
+import { isCanonicalGjcWorkflowSkill } from "../skill-state/active-state";
 import type { ToolSession } from ".";
 import { ToolError } from "./tool-errors";
 
@@ -130,9 +132,10 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				throw new ToolError(`skill tool: unknown skill "${requestedName}".${hint}`);
 			}
 
-			// Phase guard + atomic handoff. Only runs when transitioning between
-			// distinct skills (same-skill recursion was already refused above).
-			if (activeSkill) {
+			// Phase guard + atomic native handoff only apply to canonical workflow
+			// skills. Runtime project/user skills do not have a native mode-state,
+			// so there is no `gjc state <skill>` command to run for them.
+			if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill)) {
 				const phase = (this.#session.getActiveSkillPhase?.() ?? "running").trim().toLowerCase();
 				if (!TERMINAL_PHASES.has(phase)) {
 					throw new ToolError(
