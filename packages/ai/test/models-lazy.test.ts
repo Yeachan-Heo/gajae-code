@@ -22,23 +22,35 @@ function runIsolationScript(script: string): unknown {
 }
 
 describe("bundled models catalog lazy loading", () => {
-	it("does not require models.json until the first synchronous accessor call", () => {
+	it("does not read models.json until the first synchronous accessor call", () => {
 		const modelsUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/models.ts")).href;
 		const modelsJsonPath = path.resolve(import.meta.dir, "../src/models.json");
+		// The catalog is embedded via `import ... with { type: "file" }` and read
+		// lazily with fs.readFileSync. The lazy contract is therefore observable as
+		// "no filesystem read of models.json at import time; exactly one read on
+		// first accessor use" (module-cache presence no longer discriminates,
+		// because the file-type import registers the path eagerly without parsing).
 		const result = runIsolationScript(`
 import { createRequire } from "node:module";
-import * as fs from "node:fs";
 const require = createRequire(${JSON.stringify(modelsUrl)});
-const modelsJsonPath = require.resolve(${JSON.stringify(modelsJsonPath)});
+const fs = require("node:fs");
+const realReadFileSync = fs.readFileSync;
+let catalogReads = 0;
+fs.readFileSync = function (file, ...args) {
+	if (String(file).endsWith("models.json")) catalogReads += 1;
+	return realReadFileSync.call(this, file, ...args);
+};
 const modelsModule = await import(${JSON.stringify(modelsUrl)});
-const before = Boolean(require.cache[modelsJsonPath]);
-const directCatalog = JSON.parse(fs.readFileSync(modelsJsonPath, "utf8"));
+const before = catalogReads > 0;
+const directCatalog = JSON.parse(realReadFileSync(${JSON.stringify(modelsJsonPath)}, "utf8"));
 const providers = modelsModule.getBundledProviders();
 const model = modelsModule.getBundledModel("openai", "gpt-4o-mini");
-const after = Boolean(require.cache[modelsJsonPath]);
+const after = catalogReads > 0;
+modelsModule.getBundledProviders();
 console.log(JSON.stringify({
 	before,
 	after,
+	catalogReads,
 	providers,
 	directProviders: Object.keys(directCatalog),
 	model,
@@ -46,7 +58,7 @@ console.log(JSON.stringify({
 }));
 `);
 
-		expect(result).toMatchObject({ before: false, after: true });
+		expect(result).toMatchObject({ before: false, after: true, catalogReads: 1 });
 		expect((result as { providers: string[]; directProviders: string[] }).providers).toEqual(
 			(result as { providers: string[]; directProviders: string[] }).directProviders,
 		);

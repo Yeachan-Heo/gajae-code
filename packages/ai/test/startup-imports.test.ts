@@ -24,13 +24,23 @@ function runIsolationScript(script: string): unknown {
 describe("AI package startup imports", () => {
 	it("does not parse the bundled model catalog when importing the barrel", () => {
 		const indexUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/index.ts")).href;
-		const modelsJsonPath = path.resolve(import.meta.dir, "../src/models.json");
+		// The catalog is embedded via `import ... with { type: "file" }` and parsed
+		// lazily with fs.readFileSync, so the startup contract is observable as
+		// "importing the barrel performs no filesystem read of models.json"
+		// (module-cache presence no longer discriminates, because the file-type
+		// import registers the path eagerly without parsing).
 		const result = runIsolationScript(`
 import { createRequire } from "node:module";
 const require = createRequire(${JSON.stringify(indexUrl)});
-const modelsJsonPath = require.resolve(${JSON.stringify(modelsJsonPath)});
+const fs = require("node:fs");
+const realReadFileSync = fs.readFileSync;
+let catalogReads = 0;
+fs.readFileSync = function (file, ...args) {
+	if (String(file).endsWith("models.json")) catalogReads += 1;
+	return realReadFileSync.call(this, file, ...args);
+};
 await import(${JSON.stringify(indexUrl)});
-console.log(JSON.stringify({ catalogLoaded: Boolean(require.cache[modelsJsonPath]) }));
+console.log(JSON.stringify({ catalogLoaded: catalogReads > 0 }));
 `);
 
 		expect(result).toEqual({ catalogLoaded: false });
