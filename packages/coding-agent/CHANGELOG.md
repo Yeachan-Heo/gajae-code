@@ -10,7 +10,8 @@
 - ACP clients now receive GJC automatic-compaction start/end state through additive `session_info_update` metadata, including the compaction action, trigger, retry/abort/error outcome, and busy-to-idle phase transitions.
 ### Changed
 
-- Updated the Codex Eco, Medium, and Pro presets to GPT-5.6 Luna, Terra, and Sol with tier-appropriate reasoning efforts; Codex Pro now uses `ultra` for its main session, enables proactive task delegation, and assigns `max` to critic and architect roles.
+- Updated the Codex Eco, Medium, and Pro presets to GPT-5.6 Luna, Terra, and Sol with tier-appropriate reasoning efforts; Codex Pro tops out at `xhigh` for its main session with `max` critic and architect roles.
+- Added a `codex-ultra` preset that reserves the `ultra` main-session effort on GPT-5.6 Sol and enables proactive task delegation for Ultra sessions.
 - Exposed the `ultra` effort across `/effort`, settings, model selectors, agent-wire commands, status rendering, and Telegram reasoning controls.
 
 ## [0.9.4] - 2026-07-09

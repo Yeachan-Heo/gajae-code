@@ -45,9 +45,20 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "codex-pro",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-sol:ultra",
+			default: "openai-codex/gpt-5.6-sol:xhigh",
 			executor: "openai-codex/gpt-5.6-sol:medium",
 			planner: "openai-codex/gpt-5.6-sol:high",
+			critic: "openai-codex/gpt-5.6-sol:max",
+			architect: "openai-codex/gpt-5.6-sol:max",
+		},
+	},
+	{
+		name: "codex-ultra",
+		requiredProviders: ["openai-codex"],
+		mapping: {
+			default: "openai-codex/gpt-5.6-sol:ultra",
+			executor: "openai-codex/gpt-5.6-sol:high",
+			planner: "openai-codex/gpt-5.6-sol:xhigh",
 			critic: "openai-codex/gpt-5.6-sol:max",
 			architect: "openai-codex/gpt-5.6-sol:max",
 		},
@@ -352,7 +363,7 @@ function selectorExists(selector: string): boolean {
 }
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 28-profile matrix cell-for-cell", () => {
+	test("contains exact 29-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
