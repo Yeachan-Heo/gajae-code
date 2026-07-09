@@ -34,6 +34,23 @@ describe("TopicRegistry", () => {
 		expect(reg.needsIdentity("s1")).toBe(false);
 	});
 
+	test("separates rename detection from successful name commit", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic(
+			"s1",
+			async () => "t1",
+			() => 1000,
+			"GJC abc123",
+		);
+
+		expect(reg.needsRename("s1", "repo/main")).toBe(true);
+		expect(reg.needsRename("missing", "repo/main")).toBe(false);
+
+		reg.markNameApplied("s1", "repo/main");
+		expect(reg.needsRename("s1", "repo/main")).toBe(false);
+		expect(reg.get("s1")?.name).toBe("repo/main");
+	});
+
 	test("resolves session for a topic id (inbound routing)", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "t-99");

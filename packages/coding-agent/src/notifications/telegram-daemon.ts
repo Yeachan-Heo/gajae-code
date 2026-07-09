@@ -2235,16 +2235,22 @@ export class TelegramNotificationDaemon {
 				// Rename the topic if the title changed (e.g. the session title was
 				// auto-generated after the topic was first created). This runs on
 				// every identity frame, but does NOT re-send the bulleted message.
+				// Only commit the new registry name after Telegram accepts the edit:
+				// a transient editForumTopic failure must remain retryable on the
+				// next identity re-assert instead of leaving the remote topic stuck
+				// at the provisional "GJC <id>" name forever.
 				const name = this.topicNameFor(session.sessionId, msg);
-				if (this.topics.applyName(session.sessionId, name)) {
+				if (this.topics.needsRename(session.sessionId, name)) {
 					try {
 						await this.botApi.call("editForumTopic", {
 							chat_id: this.opts.chatId,
 							message_thread_id: Number(topicId),
 							name,
 						});
+						this.topics.markNameApplied(session.sessionId, name);
 					} catch {
-						// Best-effort rename; never block delivery.
+						// Best-effort rename; never block delivery. Leave the old
+						// registry name intact so a later identity frame retries.
 					}
 				}
 				// Send the full bulleted identity header EXACTLY ONCE per topic.

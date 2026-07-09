@@ -120,15 +120,16 @@ export class TopicRegistry {
 		return record ? !record.identitySent : true;
 	}
 
-	/**
-	 * Record the topic's applied title. Returns `true` when it changed (so the
-	 * caller should `editForumTopic`), `false` when already current or unknown.
-	 */
-	applyName(sessionId: string, name: string): boolean {
+	/** Whether a known session topic's applied title differs from `name`. */
+	needsRename(sessionId: string, name: string): boolean {
 		const record = this.topics.get(sessionId);
-		if (!record || record.name === name) return false;
-		record.name = name;
-		return true;
+		return record !== undefined && record.name !== name;
+	}
+
+	/** Commit a successfully-applied Telegram topic title. */
+	markNameApplied(sessionId: string, name: string): void {
+		const record = this.topics.get(sessionId);
+		if (record) record.name = name;
 	}
 
 	/** Remove a session topic record after Telegram deletes the topic. */

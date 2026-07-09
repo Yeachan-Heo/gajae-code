@@ -1604,6 +1604,59 @@ test("identity-less threaded frames wait for identity instead of creating fallba
 	expect(photo).toBeTruthy();
 	expect(photo!.body.message_thread_id).toBeGreaterThan(0);
 });
+test("transient topic rename failure is retried on the next identity header", async () => {
+	class RetryRenameBotApi extends FakeBotApi {
+		editAttempts = 0;
+		override async call(method: string, body: unknown): Promise<unknown> {
+			if (method === "editForumTopic") {
+				this.editAttempts++;
+				this.calls.push({ method, body });
+				if (this.editAttempts === 1) throw new Error("temporary rename failure");
+				return { ok: true, result: true };
+			}
+			return super.call(method, body);
+		}
+	}
+
+	const agentDir = tempAgentDir();
+	const bot = new RetryRenameBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "action_needed",
+		kind: "ask",
+		id: "ask1",
+		question: "Name it?",
+		options: ["a", "b"],
+	});
+	expect(bot.calls.find(c => c.method === "createForumTopic")!.body.name).toBe("GJC S");
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Readable title",
+	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Readable title",
+	});
+
+	const edits = bot.calls.filter(c => c.method === "editForumTopic");
+	expect(edits).toHaveLength(2);
+	expect(edits.map(c => c.body.name)).toEqual(["gajae-code/dev - Readable title", "gajae-code/dev - Readable title"]);
+});
 
 test("live sessions with the same repo branch create distinct topics", async () => {
 	const agentDir = tempAgentDir();
