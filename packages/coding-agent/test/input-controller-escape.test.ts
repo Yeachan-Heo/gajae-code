@@ -437,6 +437,20 @@ describe("InputController escape behavior", () => {
 		expect(spies.abort).toHaveBeenCalledTimes(1);
 		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt" }));
 	});
+	it("lets hook selector inline input handle Esc locally during a workflow stream", () => {
+		const { ctx, inputListeners, spies } = createContext();
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
+		ctx.hookSelector = {
+			hasActiveInlineInput: () => true,
+		} as InteractiveModeContext["hookSelector"];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const result = inputListeners[0]?.("\x1b");
+
+		expect(result).toBeUndefined();
+		expect(spies.abort).not.toHaveBeenCalled();
+	});
 
 	it("does not globally steal draft-clearing Esc from a normal stream", () => {
 		const { ctx, editor, inputListeners, spies } = createContext();
