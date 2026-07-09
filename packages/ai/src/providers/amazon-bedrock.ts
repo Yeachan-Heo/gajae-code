@@ -877,6 +877,7 @@ function buildAdditionalModelRequestFields(
 		high: 16384,
 		xhigh: 32768,
 		max: 32768,
+		ultra: 32768,
 	};
 	const budget = options.thinkingBudgets?.[level] ?? defaultBudgets[level];
 

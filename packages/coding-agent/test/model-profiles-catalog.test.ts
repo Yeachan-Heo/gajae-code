@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { type Api, Effort, getSupportedEfforts, type Model } from "@gajae-code/ai";
 import {
 	BUILTIN_MODEL_PROFILES,
 	formatAvailableProfileNames,
@@ -22,33 +23,33 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "codex-eco",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:low",
-			executor: "openai-codex/gpt-5.5:minimal",
-			planner: "openai-codex/gpt-5.5:low",
-			critic: "openai-codex/gpt-5.5:medium",
-			architect: "openai-codex/gpt-5.5:high",
+			default: "openai-codex/gpt-5.6-luna:low",
+			executor: "openai-codex/gpt-5.6-luna:low",
+			planner: "openai-codex/gpt-5.6-luna:low",
+			critic: "openai-codex/gpt-5.6-luna:medium",
+			architect: "openai-codex/gpt-5.6-luna:high",
 		},
 	},
 	{
 		name: "codex-medium",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:medium",
-			executor: "openai-codex/gpt-5.5:low",
-			planner: "openai-codex/gpt-5.5:medium",
-			critic: "openai-codex/gpt-5.5:high",
-			architect: "openai-codex/gpt-5.5:xhigh",
+			default: "openai-codex/gpt-5.6-terra:medium",
+			executor: "openai-codex/gpt-5.6-terra:low",
+			planner: "openai-codex/gpt-5.6-terra:medium",
+			critic: "openai-codex/gpt-5.6-terra:high",
+			architect: "openai-codex/gpt-5.6-terra:xhigh",
 		},
 	},
 	{
 		name: "codex-pro",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:xhigh",
-			executor: "openai-codex/gpt-5.5:medium",
-			planner: "openai-codex/gpt-5.5:high",
-			critic: "openai-codex/gpt-5.5:xhigh",
-			architect: "openai-codex/gpt-5.5:xhigh",
+			default: "openai-codex/gpt-5.6-sol:ultra",
+			executor: "openai-codex/gpt-5.6-sol:medium",
+			planner: "openai-codex/gpt-5.6-sol:high",
+			critic: "openai-codex/gpt-5.6-sol:max",
+			architect: "openai-codex/gpt-5.6-sol:max",
 		},
 	},
 	{
@@ -383,6 +384,46 @@ describe("built-in model profile catalog", () => {
 		expect(missing).toEqual([]);
 		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.["kimi-k2.7-code"]).toBeDefined();
 		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["minimax-m3"]).toBeDefined();
+	});
+
+	test("bundles GPT-5.6 Codex tier thinking metadata", () => {
+		const codexModels = (modelsJson as Record<string, Record<string, Model<Api>>>)["openai-codex"];
+
+		expect(codexModels?.["gpt-5.6-luna"]?.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Medium,
+		});
+		expect(codexModels?.["gpt-5.6-sol"]?.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Ultra,
+			defaultLevel: Effort.Low,
+		});
+		expect(codexModels?.["gpt-5.6-terra"]?.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Ultra,
+			defaultLevel: Effort.Medium,
+		});
+	});
+
+	test("every Codex preset effort is supported by its bundled model", () => {
+		const bundledModels = modelsJson as Record<string, Record<string, Model<Api>>>;
+		for (const profile of BUILTIN_MODEL_PROFILES.filter(candidate => candidate.name.startsWith("codex-"))) {
+			for (const role of roles) {
+				const selector = profile.modelMapping[role];
+				const parsed = selector ? parseModelString(selector) : undefined;
+				expect(parsed).toBeDefined();
+				if (!parsed?.thinkingLevel) continue;
+				const model = bundledModels[parsed.provider]?.[parsed.id];
+				expect(model).toBeDefined();
+				const effort = parsed.thinkingLevel;
+				if (effort === "inherit" || effort === "off") throw new Error(`Unexpected preset effort: ${effort}`);
+				if (model) expect(getSupportedEfforts(model)).toContain(effort);
+			}
+		}
 	});
 
 	test("plain minimax provider does not appear in catalog or recommendations", () => {

@@ -1,4 +1,4 @@
-export type ThinkingLevelValue = "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ThinkingLevelValue = "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 /**
  * Metadata used to render thinking selector values in the coding-agent UI.
@@ -34,12 +34,17 @@ const THINKING_LEVEL_METADATA: Record<ThinkingLevelValue, ThinkingLevelMetadata>
 	xhigh: {
 		value: "xhigh",
 		label: "xhigh",
-		description: "Maximum reasoning (~32k tokens)",
+		description: "Extra-high reasoning for complex work",
 	},
 	max: {
 		value: "max",
 		label: "max",
-		description: "Opus maximum reasoning",
+		description: "Maximum single-agent reasoning and revision",
+	},
+	ultra: {
+		value: "ultra",
+		label: "ultra",
+		description: "Coordinates four agents in parallel by default",
 	},
 };
 

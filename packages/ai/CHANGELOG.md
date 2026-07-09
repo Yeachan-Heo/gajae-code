@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added provider-scoped GPT-5.6 Sol, Terra, and Luna reasoning metadata plus the `ultra` effort, with Codex requests translating `ultra` to the backend-compatible `max` wire value.
 
 ## [0.9.4] - 2026-07-09
 ### Fixed

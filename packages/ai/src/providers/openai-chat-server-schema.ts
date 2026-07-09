@@ -210,7 +210,7 @@ export const openaiChatRequestSchema = z.object({
 	frequency_penalty: z.number().optional(),
 	logit_bias: z.record(z.string(), z.number()).optional(),
 	user: z.string().optional(),
-	reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]).optional(),
+	reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).optional(),
 	parallel_tool_calls: z.boolean().optional(),
 	service_tier: z.enum(["auto", "default", "flex", "scale", "priority"]).optional(),
 	metadata: z.record(z.string(), z.unknown()).optional(),

@@ -49,4 +49,11 @@ describe("status line thinking indicator", () => {
 		expect(rendered.content).toContain("Opus 4.5");
 		expect(rendered.content).toContain(theme.thinking.max);
 	});
+
+	it("renders ultra reasoning with a dedicated theme label", () => {
+		const rendered = renderSegment("model", createCtx(ThinkingLevel.Ultra));
+
+		expect(rendered.visible).toBe(true);
+		expect(rendered.content).toContain(theme.thinking.ultra);
+	});
 });

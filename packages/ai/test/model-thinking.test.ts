@@ -63,6 +63,64 @@ describe("model thinking metadata", () => {
 		expect(requireSupportedEffort(model, Effort.XHigh)).toBe(Effort.XHigh);
 	});
 
+	it("stores Codex GPT-5.6 Sol/Terra/Luna supported efforts and defaults", () => {
+		const sol = createModel({
+			id: "gpt-5.6-sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+		});
+		const terra = createModel({
+			id: "gpt-5.6-terra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+		});
+		const luna = createModel({
+			id: "gpt-5.6-luna",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+		});
+
+		expect(sol.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Ultra,
+			defaultLevel: Effort.Low,
+		});
+		expect(terra.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Ultra,
+			defaultLevel: Effort.Medium,
+		});
+		expect(luna.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Medium,
+		});
+		expect(requireSupportedEffort(sol, Effort.Ultra)).toBe(Effort.Ultra);
+		expect(requireSupportedEffort(terra, Effort.Ultra)).toBe(Effort.Ultra);
+		expect(requireSupportedEffort(luna, Effort.Max)).toBe(Effort.Max);
+		expect(() => requireSupportedEffort(luna, Effort.Ultra)).toThrow(
+			/Supported efforts: low, medium, high, xhigh, max/,
+		);
+	});
+
+	it("does not expose Ultra for non-Codex GPT-5.6 Sol", () => {
+		const model = createModel({
+			id: "gpt-5.6-sol",
+			api: "openai-responses",
+			provider: "openai",
+		});
+
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.XHigh,
+		});
+		expect(() => requireSupportedEffort(model, Effort.Ultra)).toThrow(/Supported efforts: low, medium, high, xhigh/);
+	});
+
 	it("maps Gemini 3 Pro only for supported levels", () => {
 		const model = createModel({
 			id: "gemini-3-pro-preview",

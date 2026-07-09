@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Effort } from "../src/model-thinking";
 import { encodeResponse, encodeStream, parseRequest } from "../src/providers/openai-chat-server";
 import type { AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream } from "../src/types";
 
@@ -149,6 +150,12 @@ describe("auth-gateway openai-chat: parseRequest", () => {
 		const parsed = parseRequest({ model: "m", messages: [], max_tokens: 256 });
 		expect(parsed.options.maxOutputTokens).toBe(256);
 		expect(parsed.stream).toBe(false);
+	});
+
+	it("accepts ultra reasoning effort", () => {
+		const parsed = parseRequest({ model: "gpt-5.6-sol", messages: [], reasoning_effort: "ultra" });
+
+		expect(parsed.options.reasoning).toBe(Effort.Ultra);
 	});
 });
 

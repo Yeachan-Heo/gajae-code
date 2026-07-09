@@ -17,6 +17,7 @@ const ReasoningEffortMapSchema = z.object({
 	high: z.string().optional(),
 	xhigh: z.string().optional(),
 	max: z.string().optional(),
+	ultra: z.string().optional(),
 });
 
 export const OpenAICompatSchema = z.object({
@@ -49,7 +50,7 @@ export const OpenAICompatSchema = z.object({
 	toolStrictMode: z.enum(["all_strict", "none"]).optional(),
 });
 
-const EffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
+const EffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const CacheRetentionSchema = z.enum(["none", "short", "long"]);
 
 const ThinkingControlModeSchema = z.enum([
@@ -94,7 +95,7 @@ function isValidProfileModelSelector(value: string): boolean {
 	if (parts.length > 2) return false;
 	const [base, suffix] = parts;
 	if (!base) return false;
-	return suffix === undefined || ["minimal", "low", "medium", "high", "xhigh", "max"].includes(suffix);
+	return suffix === undefined || ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(suffix);
 }
 
 export const ProfileModelSelectorSchema = z

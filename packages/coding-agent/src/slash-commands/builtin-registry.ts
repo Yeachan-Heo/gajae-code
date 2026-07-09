@@ -379,8 +379,18 @@ function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: st
 		.join("\n\n");
 }
 
-const EFFORT_COMMAND_INPUT_HINT = "[inherit|off|minimal|low|medium|high|xhigh|max]";
-const EFFORT_COMMAND_ACCEPTED_VALUES = ["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const EFFORT_COMMAND_INPUT_HINT = "[inherit|off|minimal|low|medium|high|xhigh|max|ultra]";
+const EFFORT_COMMAND_ACCEPTED_VALUES = [
+	"inherit",
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+	"ultra",
+] as const;
 
 function effortCommandUsage(prefix?: string): string {
 	return [prefix, `Usage: /effort ${EFFORT_COMMAND_INPUT_HINT}`]

@@ -86,7 +86,7 @@ import {
 import { transformMessages } from "./transform-messages";
 
 export interface OpenAICodexResponsesOptions extends StreamOptions {
-	reasoning?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	reasoning?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 	reasoningSummary?: "auto" | "concise" | "detailed" | null;
 	textVerbosity?: "low" | "medium" | "high";
 	include?: string[];

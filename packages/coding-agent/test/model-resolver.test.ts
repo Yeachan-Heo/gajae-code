@@ -275,6 +275,7 @@ describe("parseModelPattern", () => {
 				Effort.High,
 				Effort.XHigh,
 				Effort.Max,
+				Effort.Ultra,
 			] as const;
 			for (const level of levels) {
 				const result = parseModelPattern(`sonnet:${level}`, allModels);

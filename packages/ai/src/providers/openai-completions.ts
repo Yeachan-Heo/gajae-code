@@ -256,7 +256,7 @@ export function isOpenAICompletionsProgressChunk(chunk: unknown): boolean {
 
 export interface OpenAICompletionsOptions extends StreamOptions {
 	toolChoice?: ToolChoice;
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 	/** Force-disable reasoning where supported, or request the lowest effort on generic effort endpoints. */
 	disableReasoning?: boolean;
 	serviceTier?: ServiceTier;
@@ -1399,7 +1399,7 @@ function mapReasoningEffort(
 	effort: NonNullable<OpenAICompletionsOptions["reasoning"]>,
 	reasoningEffortMap: Partial<Record<NonNullable<OpenAICompletionsOptions["reasoning"]>, string>>,
 ): string {
-	return reasoningEffortMap[effort] ?? effort;
+	return reasoningEffortMap[effort] ?? (effort === "ultra" ? "max" : effort);
 }
 
 function maybeAddOpenRouterAnthropicCacheControl(

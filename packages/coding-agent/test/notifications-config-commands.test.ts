@@ -101,6 +101,10 @@ describe("parseTelegramControlCommand", () => {
 			kind: "command",
 			command: { name: "reasoning", action: "set", level: "high" },
 		});
+		expect(parseTelegramControlCommand("/reasoning ULTRA")).toEqual({
+			kind: "command",
+			command: { name: "reasoning", action: "set", level: "ultra" },
+		});
 	});
 
 	test("recognized invalid forms fail closed", () => {

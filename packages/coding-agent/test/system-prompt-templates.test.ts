@@ -478,6 +478,26 @@ describe("system Handlebars prompt templates", () => {
 		expect(countOccurrences(prompt, distinctRule)).toBe(1);
 	}, 30_000);
 
+	test("eager task mode adds proactive delegation guidance", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: os.tmpdir(),
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			toolNames: ["task"],
+			eagerTasks: true,
+			workspaceTree: {
+				rootPath: os.tmpdir(),
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		});
+
+		expect(systemPrompt.join("\n\n")).toContain("Delegate by default for multi-file changes");
+	});
+
 	test("buildSystemPromptToolMetadata captures custom wire names", () => {
 		const editTool = {
 			name: "edit",

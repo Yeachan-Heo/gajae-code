@@ -28,7 +28,7 @@ import {
 import { transformMessages } from "./transform-messages";
 
 export interface OllamaChatOptions extends StreamOptions {
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 	toolChoice?: ToolChoice;
 }
 
@@ -101,6 +101,7 @@ function mapReasoning(reasoning: OllamaChatOptions["reasoning"]): boolean | "low
 		case "high":
 		case "xhigh":
 		case "max":
+		case "ultra":
 			return "high";
 		default:
 			return undefined;

@@ -35,7 +35,17 @@ export type TelegramControlCommandParseResult =
 	| { kind: "invalid"; commandName: TelegramControlCommandName; usage: string };
 
 const TELEGRAM_CONTROL_COMMANDS = new Set<TelegramControlCommandName>(["reasoning", "usage", "context", "compact"]);
-const TELEGRAM_REASONING_LEVELS = new Set(["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const TELEGRAM_REASONING_LEVELS = new Set([
+	"inherit",
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+	"ultra",
+]);
 
 function splitTelegramBotSuffix(rawCommand: string): { name: string; suffix?: string } {
 	const [name, suffix] = rawCommand.toLowerCase().split("@", 2);
@@ -45,7 +55,7 @@ function splitTelegramBotSuffix(rawCommand: string): { name: string; suffix?: st
 export function telegramControlCommandUsage(commandName: TelegramControlCommandName): string {
 	switch (commandName) {
 		case "reasoning":
-			return "Usage: /reasoning [cycle|inherit|off|minimal|low|medium|high|xhigh|max]";
+			return "Usage: /reasoning [cycle|inherit|off|minimal|low|medium|high|xhigh|max|ultra]";
 		case "usage":
 			return "Usage: /usage";
 		case "context":

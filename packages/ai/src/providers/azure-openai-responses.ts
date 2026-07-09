@@ -76,7 +76,7 @@ function resolveDeploymentName(model: Model<"azure-openai-responses">, options?:
 
 // Azure OpenAI Responses-specific options
 export interface AzureOpenAIResponsesOptions extends StreamOptions {
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	azureApiVersion?: string;
 	azureResourceName?: string;
@@ -320,7 +320,7 @@ function buildParams(
 		}
 	}
 
-	applyResponsesReasoningParams(params, model, options, messages);
+	applyResponsesReasoningParams(params, model, options, messages, effort => (effort === "ultra" ? "max" : effort));
 
 	return params;
 }

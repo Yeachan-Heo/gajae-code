@@ -660,7 +660,7 @@ describe("ACP builtin slash commands", () => {
 	it("effort: advertises ACP command with the exact accepted-value hint and no thinking alias", () => {
 		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(command => command.name === "effort");
 		expect(advertised?.description).toBe("Show or set model reasoning effort");
-		expect(advertised?.input?.hint).toBe("[inherit|off|minimal|low|medium|high|xhigh|max]");
+		expect(advertised?.input?.hint).toBe("[inherit|off|minimal|low|medium|high|xhigh|max|ultra]");
 		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "thinking")).toBe(false);
 	});
 
@@ -675,7 +675,7 @@ describe("ACP builtin slash commands", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("Current effective effort: medium");
 		expect(output[0]).toContain("Configured default effort: high");
-		expect(output[0]).toContain("Accepted values: inherit, off, minimal, low, medium, high, xhigh, max");
+		expect(output[0]).toContain("Accepted values: inherit, off, minimal, low, medium, high, xhigh, max, ultra");
 		expect(output[0]).toContain("Current-model supported levels: low, high");
 	});
 
@@ -696,12 +696,15 @@ describe("ACP builtin slash commands", () => {
 
 		const offResult = await executeAcpBuiltinSlashCommand("/effort off", runtime);
 		const xhighResult = await executeAcpBuiltinSlashCommand("/effort xhigh", runtime);
+		const ultraResult = await executeAcpBuiltinSlashCommand("/effort ultra", runtime);
 
 		expect(offResult).toEqual({ consumed: true });
 		expect(xhighResult).toEqual({ consumed: true });
+		expect(ultraResult).toEqual({ consumed: true });
 		expect(session.thinkingLevelCalls).toEqual([
 			{ thinkingLevel: ThinkingLevel.Off, persist: false },
 			{ thinkingLevel: ThinkingLevel.XHigh, persist: false },
+			{ thinkingLevel: ThinkingLevel.Ultra, persist: false },
 		]);
 	});
 
@@ -728,7 +731,7 @@ describe("ACP builtin slash commands", () => {
 
 			expect(result).toEqual({ consumed: true });
 			expect(session.thinkingLevelCalls).toEqual([]);
-			expect(output[0]).toContain("Usage: /effort [inherit|off|minimal|low|medium|high|xhigh|max]");
+			expect(output[0]).toContain("Usage: /effort [inherit|off|minimal|low|medium|high|xhigh|max|ultra]");
 		}
 	});
 

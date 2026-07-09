@@ -17,7 +17,7 @@ function stringField(value: Record<string, unknown>, key: string): boolean {
 	return typeof value[key] === "string";
 }
 
-const THINKING_LEVELS = new Set(["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const THINKING_LEVELS = new Set(["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const TODO_STATUSES = new Set(["pending", "in_progress", "completed", "abandoned"]);
 
 function optionalBoolean(value: unknown): boolean {

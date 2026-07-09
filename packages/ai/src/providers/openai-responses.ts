@@ -115,7 +115,7 @@ export function normalizeOpenAIResponsesPromptCacheKey(sessionId: string | undef
 
 // OpenAI Responses-specific options
 export interface OpenAIResponsesOptions extends StreamOptions {
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	serviceTier?: ServiceTier;
 	toolChoice?: ToolChoice;
@@ -574,7 +574,7 @@ function mapReasoningEffort(
 	effort: NonNullable<OpenAIResponsesOptions["reasoning"]>,
 	reasoningEffortMap: OpenAICompat["reasoningEffortMap"] | undefined,
 ): string {
-	return reasoningEffortMap?.[effort] ?? effort;
+	return reasoningEffortMap?.[effort] ?? (effort === "ultra" ? "max" : effort);
 }
 
 function isAzureOpenAIBaseUrl(baseUrl: string): boolean {

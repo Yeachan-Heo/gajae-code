@@ -1836,7 +1836,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
-		const eagerTasks = settings.get("task.eager");
+		const eagerTasks = settings.get("task.eager") || thinkingLevel === "ultra";
 		const intentTracingEnabled = resolveIntentTracingEnabled(
 			settings.get("tools.intentTracing"),
 			options.hasUI ?? false,

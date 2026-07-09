@@ -518,7 +518,8 @@
 				"medium",
 				"high",
 				"xhigh",
-				"max"
+				"max",
+				"ultra"
 			],
 			"description": "Reasoning depth for thinking-capable models",
 			"default": "high"

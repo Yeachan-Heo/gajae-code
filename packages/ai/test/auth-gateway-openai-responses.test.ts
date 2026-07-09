@@ -160,6 +160,12 @@ describe("openai-responses parseRequest", () => {
 		expect(parsed.options.extra).toBeUndefined();
 	});
 
+	it("accepts ultra reasoning effort", () => {
+		const parsed = parseRequest({ model: "gpt-5.6-sol", input: "hi", reasoning: { effort: "ultra" } });
+
+		expect(parsed.options.reasoning).toBe(Effort.Ultra);
+	});
+
 	it("accepts a bare string input and rejects a missing model", () => {
 		const parsed = parseRequest({ model: "m", input: "hi" });
 		expect(parsed.context.messages).toHaveLength(1);

@@ -155,6 +155,15 @@ describe("openai-codex reasoning effort validation", () => {
 		).rejects.toThrow(/Supported efforts: minimal, low, medium, high/);
 	});
 
+	it("maps GPT-5.6 Sol ultra to max on the Codex wire", async () => {
+		const body: RequestBody = { model: "gpt-5.6-sol", input: [] };
+		const transformed = await transformRequestBody(body, createCodexModel(body.model), {
+			reasoningEffort: "ultra",
+		});
+
+		expect(transformed.reasoning?.effort).toBe("max");
+	});
+
 	it("rejects unsupported Codex mini efforts instead of clamping", async () => {
 		const body: RequestBody = { model: "gpt-5.1-codex-mini", input: [] };
 

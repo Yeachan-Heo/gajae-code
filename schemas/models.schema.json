@@ -88,6 +88,9 @@
 									},
 									"max": {
 										"type": "string"
+									},
+									"ultra": {
+										"type": "string"
 									}
 								},
 								"additionalProperties": false
@@ -344,7 +347,8 @@
 												"medium",
 												"high",
 												"xhigh",
-												"max"
+												"max",
+												"ultra"
 											]
 										},
 										"maxLevel": {
@@ -355,7 +359,8 @@
 												"medium",
 												"high",
 												"xhigh",
-												"max"
+												"max",
+												"ultra"
 											]
 										},
 										"mode": {
@@ -376,7 +381,8 @@
 												"medium",
 												"high",
 												"xhigh",
-												"max"
+												"max",
+												"ultra"
 											]
 										},
 										"levels": {
@@ -389,7 +395,8 @@
 													"medium",
 													"high",
 													"xhigh",
-													"max"
+													"max",
+													"ultra"
 												]
 											}
 										}
@@ -500,6 +507,9 @@
 													"type": "string"
 												},
 												"max": {
+													"type": "string"
+												},
+												"ultra": {
 													"type": "string"
 												}
 											},
@@ -722,7 +732,8 @@
 												"medium",
 												"high",
 												"xhigh",
-												"max"
+												"max",
+												"ultra"
 											]
 										},
 										"maxLevel": {
@@ -733,7 +744,8 @@
 												"medium",
 												"high",
 												"xhigh",
-												"max"
+												"max",
+												"ultra"
 											]
 										},
 										"mode": {
@@ -754,7 +766,8 @@
 												"medium",
 												"high",
 												"xhigh",
-												"max"
+												"max",
+												"ultra"
 											]
 										},
 										"levels": {
@@ -767,7 +780,8 @@
 													"medium",
 													"high",
 													"xhigh",
-													"max"
+													"max",
+													"ultra"
 												]
 											}
 										}
@@ -872,6 +886,9 @@
 													"type": "string"
 												},
 												"max": {
+													"type": "string"
+												},
+												"ultra": {
 													"type": "string"
 												}
 											},

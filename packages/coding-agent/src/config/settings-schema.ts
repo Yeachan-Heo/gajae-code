@@ -4,7 +4,7 @@ import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 
-const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
+const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as readonly Effort[];
 const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
 
 import {
