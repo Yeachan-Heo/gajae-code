@@ -1,6 +1,12 @@
-import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 import { isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
+// `with { type: "file" }` is embedded by `bun build --compile` and resolves to
+// the bunfs path inside standalone binaries (and to the on-disk path in dev).
+// A plain `createRequire` of a `.json` listed as an extra compile entrypoint is
+// NOT emitted into the bunfs, and its cwd-fallback masks the failure whenever
+// the process runs inside a repo checkout — see PR body for the minimal repro.
+import modelsJsonPath from "./models.json" with { type: "file" };
 import type { Api, KnownProvider, Model, Usage } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
@@ -14,16 +20,14 @@ import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-ca
  */
 type BundledCatalog = typeof import("./models.json");
 
-const require = createRequire(import.meta.url);
-const COMPILED_MODELS_PATH = "./packages/ai/src/models.json";
 let bundledCatalog: BundledCatalog | undefined;
 let providerNames: KnownProvider[] | undefined;
 const providerModelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
 
 function getBundledCatalog(): BundledCatalog {
-	bundledCatalog ??= require(
-		process.env.PI_COMPILED === "true" ? COMPILED_MODELS_PATH : "./models.json",
-	) as BundledCatalog;
+	// TS types a .json import as its contents; at runtime `with { type: "file" }`
+	// yields the file path (bunfs path in compiled binaries, disk path in dev).
+	bundledCatalog ??= JSON.parse(readFileSync(modelsJsonPath as unknown as string, "utf8")) as BundledCatalog;
 	return bundledCatalog;
 }
 

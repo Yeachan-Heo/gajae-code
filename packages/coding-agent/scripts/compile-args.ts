@@ -24,7 +24,9 @@ export const releaseEntrypoints = [
 	"./packages/coding-agent/src/eval/js/worker-entry.ts",
 	"./packages/natives/native/index.js",
 	"./packages/coding-agent/src/notifications/telegram-daemon-cli.ts",
-	"./packages/ai/src/models.json",
+	// NOTE: models.json must NOT be listed here — `bun build --compile` does not
+	// emit `.json` extra entrypoints into the bunfs. It is embedded via the
+	// `with { type: "file" }` import in packages/ai/src/models.ts instead.
 	"./node_modules/handlebars/lib/index.js",
 ];
 
@@ -34,7 +36,6 @@ export const devEntrypoints = [
 	"./src/tools/browser/tab-worker-entry.ts",
 	"./src/eval/js/worker-entry.ts",
 	"./src/notifications/telegram-daemon-cli.ts",
-	"../ai/src/models.json",
 	"../../node_modules/handlebars/lib/index.js",
 ];
 
