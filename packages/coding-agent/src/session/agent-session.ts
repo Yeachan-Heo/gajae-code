@@ -6953,7 +6953,7 @@ export class AgentSession {
 
 	/**
 	 * Set thinking level.
-	 * Saves the effective metadata-clamped level to session and settings only if it changes.
+	 * Saves the effective metadata-clamped level to the session, and to settings when requested.
 	 */
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
 		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
@@ -6962,11 +6962,12 @@ export class AgentSession {
 		this.#thinkingLevel = effectiveLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(effectiveLevel));
 
+		if (persist && effectiveLevel !== undefined) {
+			this.settings.set("defaultThinkingLevel", effectiveLevel);
+		}
+
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (persist && effectiveLevel !== undefined && effectiveLevel !== ThinkingLevel.Off) {
-				this.settings.set("defaultThinkingLevel", effectiveLevel);
-			}
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}
 	}

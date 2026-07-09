@@ -7,6 +7,7 @@
 - `gjc --tmux` now wraps the inner GJC command with a durable `tmux-exit.json` marker next to `runtime-state.json`, so a tmux-resident session that exits before normal runtime-state finalization leaves a public-safe exit timestamp/code for silent-vanish diagnosis (#1746).
 - `gjc --tmux` terminal titles now track live tmux session renames while preserving the friendly project/branch title for untouched generated session ids.
 - Telegram session forum-topic renames now remain retryable after a transient `editForumTopic` failure, so topics do not get stuck at the provisional `GJC <session>` name while the daemon incorrectly records the final title locally.
+- `/effort` selector choices now show the current reasoning effort and mirror `/model` by asking whether to apply the selected effort for the current session or save it as the default, including support for persisting `off`. Default model presets also sync their encoded effort into the persisted effort default so later `/effort` defaults are not overwritten on restart.
 
 ## [0.9.1] - 2026-07-08
 

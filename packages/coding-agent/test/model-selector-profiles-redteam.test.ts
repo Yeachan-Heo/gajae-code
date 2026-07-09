@@ -211,6 +211,7 @@ describe("model selector profile red-team", () => {
 		await selectProfileThroughController(new SelectorController(persistent.ctx as never), true);
 
 		expect(persistent.setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(persistent.setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
 		expect(persistent.flush).toHaveBeenCalledTimes(1);
 		expect(persistent.ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});

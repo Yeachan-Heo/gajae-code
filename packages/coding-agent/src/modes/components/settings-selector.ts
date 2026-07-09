@@ -1,4 +1,4 @@
-import type { ThinkingLevel } from "@gajae-code/agent-core";
+import { ThinkingLevel, type ThinkingLevel as ThinkingLevelValue } from "@gajae-code/agent-core";
 import type { Effort } from "@gajae-code/ai";
 import {
 	Container,
@@ -654,7 +654,7 @@ export interface SettingsRuntimeContext {
 	/** Available thinking levels (from session) */
 	availableThinkingLevels: Effort[];
 	/** Current thinking level (from session) */
-	thinkingLevel: ThinkingLevel | undefined;
+	thinkingLevel: ThinkingLevelValue | undefined;
 	/** Available themes */
 	availableThemes: string[];
 	/** Available model profile names (from the model registry) */
@@ -843,7 +843,7 @@ export class SettingsSelectorComponent extends Container {
 
 		// Special case: inject runtime options for thinking level
 		if (def.path === "defaultThinkingLevel") {
-			options = this.context.availableThinkingLevels.map(level => {
+			options = [ThinkingLevel.Off, ...this.context.availableThinkingLevels].map(level => {
 				const baseOpt = options.find(o => o.value === level);
 				return baseOpt || { value: level, label: level };
 			});

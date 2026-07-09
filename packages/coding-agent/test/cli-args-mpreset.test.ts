@@ -170,6 +170,34 @@ test("ACP session factory applies default profile and --mpreset before returning
 		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:medium", "cli-provider/explicit:high"]);
 });
+test("persisted default thinking overrides startup default profile effort", async () => {
+	const settings = Settings.isolated({
+		"modelProfile.default": "default-profile",
+		defaultThinkingLevel: ThinkingLevel.XHigh,
+	});
+	const session = fakeSession();
+	const registry = fakeRegistry([
+		{
+			name: "default-profile",
+			requiredProviders: ["profile-provider"],
+			modelMapping: { default: "profile-provider/default:medium" },
+			source: "user",
+		},
+	]) as never;
+
+	await applyStartupModelProfiles({
+		session,
+		settings,
+		modelRegistry: registry,
+		parsedArgs: {},
+		startupModel: undefined,
+		startupThinkingLevel: undefined,
+	});
+
+	expect(
+		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+	).toEqual(["profile-provider/default:xhigh"]);
+});
 
 test("ACP session factory refreshes registry before applying project default profile", async () => {
 	const settings = Settings.isolated();

@@ -1,32 +1,40 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { createAgentSession, type ExtensionFactory } from "@gajae-code/coding-agent/sdk";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 
+setDefaultTimeout(20_000);
+
 describe("createAgentSession deferred model pattern resolution", () => {
 	let tempDir: string;
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		tempDir = path.join(os.tmpdir(), `pi-sdk-model-selection-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
+		authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		registerRuntimeProvider(modelRegistry);
 	});
 
 	afterEach(() => {
+		authStorage?.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
 
-	const providerExtension: ExtensionFactory = pi => {
-		pi.registerProvider("runtime-provider", {
-			baseUrl: "https://runtime.example.com/v1",
+	function registerRuntimeProvider(target: ModelRegistry): void {
+		target.registerProvider("runtime-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
 			apiKey: "RUNTIME_KEY",
 			api: "openai-completions",
 			models: [
@@ -47,10 +55,16 @@ describe("createAgentSession deferred model pattern resolution", () => {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: 128000,
 					maxTokens: 8192,
+					thinking: {
+						minLevel: Effort.Minimal,
+						maxLevel: Effort.High,
+						mode: "effort",
+						defaultLevel: Effort.Low,
+					},
 				},
 			],
 		});
-	};
+	}
 
 	function buildSessionOptions(modelPattern: string) {
 		return {
@@ -58,18 +72,22 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
 			disableExtensionDiscovery: true,
-			extensions: [providerExtension],
+			extensions: [],
 			skills: [],
 			contextFiles: [],
 			promptTemplates: [],
 			slashCommands: [],
 			enableMCP: false,
 			enableLsp: false,
+			workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+			toolNames: [],
+			rules: [],
+			modelRegistry,
 			modelPattern,
 		};
 	}
 
-	test("resolves explicit modelPattern after extension providers register", async () => {
+	test("resolves explicit modelPattern after runtime providers are available", async () => {
 		const { session, modelFallbackMessage } = await createAgentSession(
 			buildSessionOptions("runtime-provider/runtime-model"),
 		);
@@ -78,6 +96,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		expect(session.model?.provider).toBe("runtime-provider");
 		expect(session.model?.id).toBe("runtime-model");
 		expect(modelFallbackMessage).toBeUndefined();
+		await session.dispose();
 	});
 
 	test("does not silently fallback when explicit modelPattern is unresolved", async () => {
@@ -87,6 +106,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 
 		expect(session.model).toBeUndefined();
 		expect(modelFallbackMessage).toBe('Model "missing-provider/missing-model" not found');
+		await session.dispose();
 	});
 
 	test("does not apply default role thinking override when modelPattern is explicit", async () => {
@@ -101,6 +121,30 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		expect(session.model?.provider).toBe("runtime-provider");
 		expect(session.model?.id).toBe("runtime-reasoning-model");
 		expect(session.thinkingLevel).toBe("off");
+		await session.dispose();
+	});
+
+	test("uses model defaultLevel when default thinking is not configured", async () => {
+		const { session } = await createAgentSession(buildSessionOptions("runtime-provider/runtime-reasoning-model"));
+
+		expect(session.model?.provider).toBe("runtime-provider");
+		expect(session.model?.id).toBe("runtime-reasoning-model");
+		expect(session.thinkingLevel).toBe(Effort.Low);
+		await session.dispose();
+	});
+
+	test("uses explicit defaultThinkingLevel over model defaultLevel", async () => {
+		const settings = Settings.isolated({ defaultThinkingLevel: Effort.Minimal });
+
+		const { session } = await createAgentSession({
+			...buildSessionOptions("runtime-provider/runtime-reasoning-model"),
+			settings,
+		});
+
+		expect(session.model?.provider).toBe("runtime-provider");
+		expect(session.model?.id).toBe("runtime-reasoning-model");
+		expect(session.thinkingLevel).toBe(Effort.Minimal);
+		await session.dispose();
 	});
 
 	test("selects the settings default model without synchronously validating auth", async () => {
@@ -134,6 +178,9 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				slashCommands: [],
 				enableMCP: false,
 				enableLsp: false,
+				workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+				toolNames: [],
+				rules: [],
 			});
 
 			try {

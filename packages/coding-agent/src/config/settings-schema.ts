@@ -5,6 +5,7 @@ import { EDIT_MODES } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 
 const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
+const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
 
 import {
 	DEFAULT_DISABLED_EXTENSIONS,
@@ -804,13 +805,13 @@ export const SETTINGS_SCHEMA = {
 	// Reasoning and prompts
 	defaultThinkingLevel: {
 		type: "enum",
-		values: THINKING_EFFORTS,
+		values: DEFAULT_THINKING_LEVELS,
 		default: THINKING_EFFORTS[3],
 		ui: {
 			tab: "model",
 			label: "Thinking Level",
 			description: "Reasoning depth for thinking-capable models",
-			options: [...THINKING_EFFORTS.map(getThinkingLevelMetadata)],
+			options: [...DEFAULT_THINKING_LEVELS.map(getThinkingLevelMetadata)],
 		},
 	},
 

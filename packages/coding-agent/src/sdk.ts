@@ -1047,6 +1047,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const taskDepth = options.taskDepth ?? 0;
 
 	let thinkingLevel = options.thinkingLevel;
+	const hasExplicitDefaultThinkingLevel = settings.has("defaultThinkingLevel");
+	let thinkingLevelFromSchemaDefault = false;
 
 	// If session has data and includes a thinking entry, restore it
 	if (thinkingLevel === undefined && hasExistingSession && hasThinkingEntry) {
@@ -1057,13 +1059,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = defaultRoleSpec.thinkingLevel;
 	}
 
-	// Prefer the selected model's configured defaultLevel, otherwise fall back
-	// to the global settings default.
+	// An explicit user/project default should win over the model's bundled
+	// defaultLevel. The schema default is only a final fallback so model metadata
+	// can keep driving first-run behavior until the user chooses "Set as default".
+	if (thinkingLevel === undefined && hasExplicitDefaultThinkingLevel) {
+		thinkingLevel = settings.get("defaultThinkingLevel");
+	}
+
 	if (thinkingLevel === undefined && model?.thinking?.defaultLevel !== undefined) {
 		thinkingLevel = model.thinking.defaultLevel;
 	}
+
 	if (thinkingLevel === undefined) {
 		thinkingLevel = settings.get("defaultThinkingLevel");
+		thinkingLevelFromSchemaDefault = true;
 	}
 	if (model) {
 		const resolvedModel = model;
@@ -1608,6 +1617,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (resolved) {
 				model = resolved;
 				modelFallbackMessage = undefined;
+				if (thinkingLevelFromSchemaDefault && resolved.thinking?.defaultLevel !== undefined) {
+					thinkingLevel = resolved.thinking.defaultLevel;
+					thinkingLevelFromSchemaDefault = false;
+				}
+				thinkingLevel = resolveThinkingLevelForModel(resolved, thinkingLevel);
 			} else {
 				modelFallbackMessage = `Model "${options.modelPattern}" not found`;
 			}

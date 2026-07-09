@@ -217,10 +217,14 @@ export async function applyStartupModelProfiles(args: {
 	startupModel?: CreateAgentSessionOptions["model"];
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 }): Promise<void> {
-	const applyProfile = async (profileName: string, persistDefault: boolean): Promise<void> => {
+	const applyProfile = async (
+		profileName: string,
+		persistDefault: boolean,
+		options: { thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"] } = {},
+	): Promise<void> => {
 		await activateModelProfile(
 			{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-			{ persistDefault },
+			{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
 		);
 	};
 
@@ -234,7 +238,11 @@ export async function applyStartupModelProfiles(args: {
 	}
 
 	if (defaultProfile) {
-		await applyProfile(defaultProfile, false);
+		await applyProfile(defaultProfile, false, {
+			thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
+				? args.settings.get("defaultThinkingLevel")
+				: undefined,
+		});
 	}
 	if (args.parsedArgs.mpreset) {
 		await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);

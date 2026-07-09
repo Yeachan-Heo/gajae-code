@@ -304,7 +304,13 @@ describe("model profile activation", () => {
 			{ persistDefault: true },
 		);
 
-		expect(setCalls).toEqual(["modelRoles", "task.agentModelOverrides", "modelProfile.default"]);
+		expect(setCalls).toEqual([
+			"modelRoles",
+			"task.agentModelOverrides",
+			"defaultThinkingLevel",
+			"modelProfile.default",
+		]);
+		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
 		expect(settings.get("modelProfile.default")).toBe("profile-a");
 		expect(flushCount).toBe(1);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
@@ -352,7 +358,10 @@ describe("model profile activation", () => {
 
 	test("apply rolls back runtime changes when persistence throws", async () => {
 		const session = fakeSession();
-		const settings = Settings.isolated({ "task.agentModelOverrides": { executor: "provider-a/original" } });
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": { executor: "provider-a/original" },
+			defaultThinkingLevel: ThinkingLevel.Low,
+		});
 		const prepared = await prepareModelProfileActivation({
 			session,
 			modelRegistry: fakeRegistry(),
@@ -371,6 +380,7 @@ describe("model profile activation", () => {
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
 		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 

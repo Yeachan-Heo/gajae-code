@@ -1,4 +1,4 @@
-import type { ThinkingLevel } from "@gajae-code/agent-core";
+import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai";
 import type { AgentSession } from "../session/agent-session";
 import { formatClampedModelSelector } from "../thinking";
@@ -43,7 +43,10 @@ export interface PrepareModelProfileActivationOptions {
 	settings: Pick<Settings, "get">;
 	profileName: string;
 }
-
+export interface ApplyModelProfileActivationOptions {
+	persistDefault?: boolean;
+	thinkingLevelOverride?: ThinkingLevel;
+}
 export interface PreparedModelProfileActivation {
 	profileName: string;
 	session: ModelProfileActivationSession & { setModelTemporary: AgentSession["setModelTemporary"] };
@@ -345,25 +348,31 @@ export async function prepareModelProfileActivation(
 
 export async function applyPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
-	options: { persistDefault?: boolean } = {},
+	options: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
 	const previousModel = prepared.previousModel;
 	const previousThinkingLevel = prepared.previousThinkingLevel;
 	const previousAgentModelOverrides = prepared.previousAgentModelOverrides;
 	const previousModelRoles = prepared.previousModelRoles;
 	const previousPersistedDefault = prepared.settings.get("modelProfile.default");
+	const previousDefaultThinkingLevel = prepared.settings.get("defaultThinkingLevel");
 	const previousActiveModelProfile = prepared.previousActiveModelProfile;
 	const previousSessionDefaultModel = prepared.previousSessionDefaultModel;
 	let modelChanged = false;
 	let overridesChanged = false;
 	let defaultChanged = false;
 	let modelRolesChanged = false;
+	let defaultThinkingChanged = false;
 
 	try {
 		if (prepared.defaultModel) {
-			await prepared.session.setModelTemporary(prepared.defaultModel, prepared.defaultThinkingLevel, {
-				persistAsSessionDefault: true,
-			});
+			await prepared.session.setModelTemporary(
+				prepared.defaultModel,
+				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
+				{
+					persistAsSessionDefault: true,
+				},
+			);
 			modelChanged = true;
 		}
 		if (Object.keys(prepared.modelRoles).length > 0) {
@@ -380,6 +389,10 @@ export async function applyPreparedModelProfileActivation(
 		if (options.persistDefault) {
 			prepared.settings.set("modelRoles", {});
 			prepared.settings.set("task.agentModelOverrides", {});
+			if (prepared.defaultThinkingLevel !== undefined && prepared.defaultThinkingLevel !== ThinkingLevel.Inherit) {
+				prepared.settings.set("defaultThinkingLevel", prepared.defaultThinkingLevel);
+				defaultThinkingChanged = true;
+			}
 			prepared.settings.set("modelProfile.default", prepared.profileName);
 			defaultChanged = true;
 			await prepared.settings.flush();
@@ -390,6 +403,9 @@ export async function applyPreparedModelProfileActivation(
 			prepared.settings.set("modelProfile.default", previousPersistedDefault);
 			prepared.settings.set("modelRoles", previousModelRoles);
 			prepared.settings.set("task.agentModelOverrides", previousAgentModelOverrides);
+			if (defaultThinkingChanged) {
+				prepared.settings.set("defaultThinkingLevel", previousDefaultThinkingLevel);
+			}
 		}
 		if (modelRolesChanged) {
 			prepared.settings.override("modelRoles", previousModelRoles);
@@ -505,7 +521,7 @@ export async function restoreMaterializedModelProfileForDeletion(options: {
 
 export async function activateModelProfile(
 	options: PrepareModelProfileActivationOptions,
-	applyOptions: { persistDefault?: boolean } = {},
+	applyOptions: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
 	const prepared = await prepareModelProfileActivation(options);
 	await applyPreparedModelProfileActivation(prepared, applyOptions);

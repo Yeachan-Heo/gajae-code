@@ -3,15 +3,7 @@
  */
 
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import {
-	type Api,
-	clampThinkingLevelForModel,
-	DEFAULT_MODEL_PER_PROVIDER,
-	type Effort,
-	type KnownProvider,
-	type Model,
-	modelsAreEqual,
-} from "@gajae-code/ai";
+import { type Api, DEFAULT_MODEL_PER_PROVIDER, type KnownProvider, type Model, modelsAreEqual } from "@gajae-code/ai";
 import { fuzzyMatch } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import chalk from "chalk";
@@ -1197,7 +1189,7 @@ export async function findInitialModel(options: {
 	isContinuing: boolean;
 	defaultProvider?: string;
 	defaultModelId?: string;
-	defaultThinkingSelector?: Effort;
+	defaultThinkingSelector?: ThinkingLevel;
 	modelRegistry: InitialModelRegistry;
 }): Promise<InitialModelResult> {
 	const {
@@ -1212,7 +1204,7 @@ export async function findInitialModel(options: {
 	} = options;
 
 	let model: Model<Api> | undefined;
-	let thinkingLevel: Effort | undefined;
+	let thinkingLevel: ThinkingLevel | undefined;
 
 	// 1. CLI args take priority
 	if (cliProvider && cliModel) {
@@ -1233,10 +1225,7 @@ export async function findInitialModel(options: {
 				: (scoped.thinkingLevel ?? defaultThinkingSelector);
 		return {
 			model: scoped.model,
-			thinkingLevel:
-				scopedThinkingSelector === ThinkingLevel.Off
-					? ThinkingLevel.Off
-					: clampThinkingLevelForModel(scoped.model, scopedThinkingSelector),
+			thinkingLevel: resolveThinkingLevelForModel(scoped.model, scopedThinkingSelector),
 			fallbackMessage: undefined,
 		};
 	}
@@ -1246,7 +1235,7 @@ export async function findInitialModel(options: {
 		const found = modelRegistry.find(defaultProvider, defaultModelId);
 		if (found) {
 			model = found;
-			thinkingLevel = clampThinkingLevelForModel(found, defaultThinkingSelector);
+			thinkingLevel = resolveThinkingLevelForModel(found, defaultThinkingSelector);
 			return { model, thinkingLevel, fallbackMessage: undefined };
 		}
 	}

@@ -334,6 +334,7 @@ describe("model selector profiles", () => {
 
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
 		expect(flush).toHaveBeenCalledTimes(1);
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
@@ -363,6 +364,7 @@ describe("model selector profiles", () => {
 		expect(session.setModelTemporaryCalls).toHaveLength(1);
 		expect(session.model?.id).toBe("default");
 		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
 		expect(flush).toHaveBeenCalledTimes(1);
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});

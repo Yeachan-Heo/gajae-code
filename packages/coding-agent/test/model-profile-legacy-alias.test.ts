@@ -100,6 +100,7 @@ describe("legacy model profile aliases", () => {
 
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
 		expect(settings.get("modelProfile.default")).toBe("codex-medium");
+		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Medium);
 	});
 
 	test("preparation exposes the canonical replacement profile name", async () => {

@@ -443,12 +443,13 @@ export class SelectorController {
 			const selector = new ThinkingSelectorComponent(
 				this.ctx.session.thinkingLevel,
 				availableLevels,
-				level => {
+				selection => {
 					done();
 
+					const { level, persistDefault } = selection;
 					const configuredDefault = this.ctx.settings.get("defaultThinkingLevel");
 					const levelToApply = level === ThinkingLevel.Inherit ? configuredDefault : level;
-					this.ctx.session.setThinkingLevel(levelToApply, false);
+					this.ctx.session.setThinkingLevel(levelToApply, persistDefault);
 					const effectiveLevel = this.ctx.session.thinkingLevel ?? ThinkingLevel.Off;
 					const requestedLabel =
 						level === ThinkingLevel.Inherit ? `${level} (configured default: ${configuredDefault})` : level;
@@ -458,9 +459,11 @@ export class SelectorController {
 					this.ctx.statusLine.invalidate();
 					this.ctx.updateEditorBorderColor();
 					this.ctx.updateEditorTopBorder();
+					if (persistDefault) void this.ctx.notifyConfigChanged?.();
 					this.ctx.ui.requestRender();
+					const scopeLabel = persistDefault ? "Default reasoning effort" : "Reasoning effort";
 					this.ctx.showStatus(
-						`Reasoning effort set to ${requestedLabel}. Effective effort: ${effectiveLevel}.${clampedSuffix}`,
+						`${scopeLabel} set to ${requestedLabel}. Effective effort: ${effectiveLevel}.${clampedSuffix}`,
 					);
 				},
 				() => {
@@ -468,10 +471,9 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 			);
-			return { component: selector, focus: selector.getSelectList() };
+			return { component: selector, focus: selector };
 		});
 	}
-
 	showSettingsSelector(): void {
 		getAvailableThemes().then(availableThemes => {
 			this.showSelector(done => {
