@@ -15,6 +15,7 @@
 ### Fixed
 
 - Finalized notification turn mirrors now default to the bounded full-turn cap so Telegram's existing chunked delivery can send long assistant answers instead of receiving an already-truncated 3500-character summary; `GJC_NOTIFICATIONS_TURN_MAX` remains available to lower the cap for summary-style mirrors, and live previews stay capped as one editable message.
+- The Telegram notification daemon now reaps forum topics whose owning session endpoint has been dead (missing endpoint record, stale record, or dead PID) for over a minute, so killed panes, crashes, and power loss no longer leave permanent orphaned topics — including provisional `GJC <session>` topics — that the user cannot delete from the Telegram client. Clean shutdowns keep deleting the topic immediately, live endpoints are never touched, and reaping fail-closes for a scan when any notifications root is unreadable.
 - `gjc --tmux` now wraps the inner GJC command with a durable `tmux-exit.json` marker next to `runtime-state.json`, so a tmux-resident session that exits before normal runtime-state finalization leaves a public-safe exit timestamp/code for silent-vanish diagnosis (#1746).
 - `gjc --tmux` terminal titles now track live tmux session renames while preserving the friendly project/branch title for untouched generated session ids.
 - Telegram session forum-topic renames now remain retryable after a transient `editForumTopic` failure, so topics do not get stuck at the provisional `GJC <session>` name while the daemon incorrectly records the final title locally.

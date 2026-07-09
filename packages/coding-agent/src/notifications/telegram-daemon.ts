@@ -146,6 +146,13 @@ const TYPING_REFRESH_INTERVAL_MS = 4_000;
 const QUEUED_REACTION = "👀";
 const PENDING_TOPIC_FRAME_LIMIT = 20;
 const SEEN_UPDATE_ID_LIMIT = 1_000;
+/**
+ * How long a session's notification endpoint must stay dead (missing endpoint
+ * record, stale record, or dead PID) before its forum topic is reaped. Clean
+ * shutdowns delete the topic immediately via `session_closed`; this grace
+ * window keeps transient restarts/reconnects from losing a live topic.
+ */
+const ORPHAN_TOPIC_GRACE_MS = 60_000;
 const CONSUMED_REACTION = "✅";
 
 function splitTelegramPlainText(text: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
@@ -916,6 +923,8 @@ export class TelegramNotificationDaemon {
 	private readonly pendingThreadedFrames = new Map<string, PendingThreadedFrame[]>();
 	/** Endpoint generation tombstones for sessions that already sent session_closed. */
 	private readonly closedEndpointKeys = new Map<string, string>();
+	/** First scan time (ms) each topic-owning session was seen with a dead endpoint. */
+	private readonly orphanTopicSince = new Map<string, number>();
 	/** True once the daemon has nudged the user to enable Threaded Mode. */
 	private threadedFallbackNoticeSent = false;
 	/** Sessions whose identity header was already sent flat (Threaded Mode off). */
@@ -1414,12 +1423,21 @@ export class TelegramNotificationDaemon {
 	async scanRoots(): Promise<void> {
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
 		const rootState = await readJson<{ roots?: string[] }>(this.fsImpl, paths.roots);
+		// Sessions whose endpoint record is owned by a live process. Feeds the
+		// orphan-topic reap below; currently-connected sessions are tracked
+		// separately via `this.sessions`.
+		const liveEndpointSessions = new Set<string>();
+		let sawUnreadableRoot = false;
 		for (const root of rootState?.roots ?? []) {
 			const dir = path.join(root, "notifications");
 			let files: string[];
 			try {
 				files = await this.fsImpl.readdir(dir);
-			} catch {
+			} catch (err) {
+				// A missing notifications dir simply means no endpoints under this
+				// root; any other readdir failure hides potentially-live sessions,
+				// so orphan-topic reaping must skip this scan (fail closed).
+				if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") sawUnreadableRoot = true;
 				continue;
 			}
 			for (const file of files.filter(item => item.endsWith(".json"))) {
@@ -1432,11 +1450,49 @@ export class TelegramNotificationDaemon {
 					// would chase a dead, token-bearing record forever.
 					const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
 					if (endpoint.stale || (endpoint.pid !== undefined && !pidAlive(endpoint.pid))) continue;
+					liveEndpointSessions.add(sessionId);
 					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
 					if (this.closedEndpointKeys.get(sessionId) === endpointKey) continue;
 					this.closedEndpointKeys.delete(sessionId);
 					this.connectSession(sessionId, endpoint.url, endpoint.token);
-				} catch {}
+				} catch (err) {
+					// An endpoint file that vanished between readdir and read is a
+					// genuine dead sighting (the grace window will confirm it). Any
+					// other failure — malformed JSON, schema violation, permission
+					// error — is UNKNOWN liveness, not death: protect the session
+					// from reaping this scan by counting it as live (fail closed).
+					if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") liveEndpointSessions.add(sessionId);
+				}
+			}
+		}
+		if (!sawUnreadableRoot) await this.reapOrphanTopics(liveEndpointSessions);
+	}
+
+	/**
+	 * Delete topics whose owning session endpoint has been dead (missing, stale,
+	 * or dead-PID) for longer than {@link ORPHAN_TOPIC_GRACE_MS}. Clean shutdowns
+	 * delete their topic immediately via `session_closed`; this reaper covers
+	 * killed panes, crashes, and power loss, which otherwise leave topics behind
+	 * forever (the user cannot delete bot-owned private-chat topics themselves).
+	 */
+	private async reapOrphanTopics(liveEndpointSessions: ReadonlySet<string>): Promise<void> {
+		const now = this.runtime.now();
+		for (const sessionId of this.topics.sessionIds()) {
+			if (liveEndpointSessions.has(sessionId) || this.sessions.has(sessionId)) {
+				this.orphanTopicSince.delete(sessionId);
+				continue;
+			}
+			const since = this.orphanTopicSince.get(sessionId);
+			if (since === undefined) {
+				this.orphanTopicSince.set(sessionId, now);
+				continue;
+			}
+			if (now - since < ORPHAN_TOPIC_GRACE_MS) continue;
+			await this.deleteTopic(sessionId);
+			if (this.topics.get(sessionId)) {
+				// Telegram refused the delete (e.g. missing topic permissions);
+				// retry after a fresh grace window instead of every scan tick.
+				this.orphanTopicSince.set(sessionId, now);
 			}
 		}
 	}
@@ -1705,6 +1761,7 @@ export class TelegramNotificationDaemon {
 				if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
 			});
 			this.pendingThreadedFrames.delete(sessionId);
+			this.orphanTopicSince.delete(sessionId);
 			await this.persistTopics();
 		} catch {
 			// Best-effort: missing Telegram topic permissions must not stop teardown.

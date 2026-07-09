@@ -4022,3 +4022,172 @@ describe("telegram daemon /rich toggle (G005)", () => {
 		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.text === "Rich messages: off")).toBe(false);
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Orphan topic reaping: sessions that die without a clean `session_closed`
+// (killed panes, crashes, power loss) must not leave their forum topic behind
+// forever — the user cannot delete bot-owned private-chat topics themselves.
+// ---------------------------------------------------------------------------
+describe("telegram daemon orphan topic reaping", () => {
+	const GRACE = 60_000;
+
+	function seedTopics(agentDir: string, sessionId: string, topicId: string) {
+		const dir = daemonPaths(agentDir).dir;
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(dir, "telegram-topics.json"),
+			JSON.stringify({ topics: { [sessionId]: { topicId, identitySent: true, createdAt: 0, name: "GJC S" } } }),
+		);
+	}
+
+	function reapDaemon(
+		s: Settings,
+		bot: FakeBotApi,
+		now: () => number,
+		pidAlive: (pid: number) => boolean = () => false,
+	) {
+		return new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive,
+			now,
+		});
+	}
+
+	test("a topic whose endpoint record is gone is deleted only after the grace window", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		await registerNotificationRoot({ settings: s, cwd: path.join(agentDir, "repo"), sessionId: "S" });
+		seedTopics(agentDir, "S", "777");
+		let now = 0;
+		const bot = new FakeBotApi();
+		const daemon = reapDaemon(s, bot, () => now);
+		await daemon.loadTopics();
+
+		await daemon.scanRoots(); // first dead sighting only marks the orphan
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+
+		now += GRACE - 1;
+		await daemon.scanRoots(); // still inside the grace window
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+
+		now += 1;
+		await daemon.scanRoots();
+		const del = bot.calls.find(c => c.method === "deleteForumTopic");
+		expect(del?.body.message_thread_id).toBe(777);
+		const topicsFile = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		expect(fs.readFileSync(topicsFile, "utf8").includes('"S"')).toBe(false);
+	});
+
+	test("a live endpoint keeps its topic across the grace window", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const cwd = path.join(agentDir, "repo");
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
+		const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://live", token: "t", pid: 4242 }));
+		seedTopics(agentDir, "S", "778");
+		let now = 0;
+		const bot = new FakeBotApi();
+		const daemon = reapDaemon(s, bot, () => now, pid => pid === 4242);
+		await daemon.loadTopics();
+
+		await daemon.scanRoots();
+		now += GRACE + 1;
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	});
+
+	test("an endpoint that comes back within the grace window resets the reap clock", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const cwd = path.join(agentDir, "repo");
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
+		const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		seedTopics(agentDir, "S", "779");
+		let now = 0;
+		const bot = new FakeBotApi();
+		const daemon = reapDaemon(s, bot, () => now, pid => pid === 4242);
+		await daemon.loadTopics();
+
+		await daemon.scanRoots(); // dead: mark at t=0
+
+		now = 30_000; // session resumes inside the grace window
+		fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://live", token: "t", pid: 4242 }));
+		await daemon.scanRoots(); // live again: mark cleared, session connects
+		expect(daemon.sessions.has("S")).toBe(true);
+
+		// The session dies again (dead PID + closed socket).
+		fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://live", token: "t", pid: 9999 }));
+		FakeWs.instances[0]!.close();
+		expect(daemon.sessions.has("S")).toBe(false);
+
+		now = 61_000;
+		await daemon.scanRoots(); // fresh mark at t=61s — old t=0 mark must not fire
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+
+		now = 61_000 + GRACE + 1;
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(true);
+	});
+
+	test("an unreadable notifications root fail-closes reaping for that scan", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const cwd = path.join(agentDir, "repo");
+		const root = await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
+		// Make `<root>/notifications` fail readdir with something other than
+		// ENOENT (here: ENOTDIR), which must suppress reaping entirely.
+		fs.mkdirSync(root, { recursive: true });
+		fs.writeFileSync(path.join(root, "notifications"), "not a directory");
+		seedTopics(agentDir, "S", "780");
+		let now = 0;
+		const bot = new FakeBotApi();
+		const daemon = reapDaemon(s, bot, () => now);
+		await daemon.loadTopics();
+
+		await daemon.scanRoots();
+		now += GRACE + 1;
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	});
+
+	test("a malformed endpoint file protects its session from reaping (unknown, not dead)", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const cwd = path.join(agentDir, "repo");
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
+		const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		// Present but unparseable: liveness is UNKNOWN, so reaping must not fire.
+		fs.writeFileSync(path.join(endpointDir, "S.json"), "{not json");
+		seedTopics(agentDir, "S", "781");
+		let now = 0;
+		const bot = new FakeBotApi();
+		const daemon = reapDaemon(s, bot, () => now);
+		await daemon.loadTopics();
+
+		await daemon.scanRoots();
+		now += GRACE + 1;
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+
+		// Once the malformed record is actually removed, the normal reap applies.
+		fs.rmSync(path.join(endpointDir, "S.json"));
+		await daemon.scanRoots(); // dead sighting: mark
+		now += GRACE + 1;
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(true);
+	});
+});
