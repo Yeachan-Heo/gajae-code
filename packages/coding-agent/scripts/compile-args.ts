@@ -14,7 +14,10 @@ export const compileAutoloadDisableFlags = [
 	"--no-compile-autoload-package-json",
 ];
 
-export const compiledDefineFlags = ['process.env.PI_COMPILED="true"'];
+const compiledDefineFlags = ['process.env.PI_COMPILED="true"'];
+const releaseDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="release"'];
+const devDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="dev"'];
+
 export const compiledExternalPackages = ["mupdf"];
 
 export const releaseEntrypoints = [
@@ -45,7 +48,8 @@ export function buildReleaseCompileArgs(target: string, outfile: string): string
 		entrypoints: releaseEntrypoints,
 		outfile,
 		target,
-		defines: compiledDefineFlags,
+		defines: releaseDefineFlags,
+
 		externals: compiledExternalPackages,
 	});
 }
@@ -55,7 +59,7 @@ export function buildDevCompileArgs(outfile = "dist/gjc"): string[] {
 		root: "../..",
 		entrypoints: devEntrypoints,
 		outfile,
-		defines: compiledDefineFlags,
+		defines: devDefineFlags,
 		externals: compiledExternalPackages,
 	});
 }

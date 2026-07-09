@@ -1,5 +1,6 @@
 import { type Component, padding, TERMINAL, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { APP_NAME } from "@gajae-code/utils";
+import { formatBuildLabel } from "../../build-metadata";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 
 export interface RecentSession {
@@ -19,6 +20,7 @@ export interface WelcomeComponentOptions {
 	getReservedBottomRows?: (termWidth: number) => number;
 	changelogMarkdown?: string;
 	collapseChangelog?: boolean;
+	buildLabel?: string;
 }
 
 const WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 9;
@@ -227,7 +229,8 @@ export class WelcomeComponent implements Component {
 		const br = theme.fg("dim", theme.boxRound.bottomRight);
 
 		const lines: string[] = [];
-		const title = ` ${APP_NAME} v${this.version} · GJC Forge `;
+		const buildLabel = this.options.buildLabel ?? formatBuildLabel();
+		const title = ` ${APP_NAME} v${this.version} · ${buildLabel} · GJC Forge `;
 		const titlePrefixRaw = hChar.repeat(3);
 		const titleStyled = theme.fg("dim", titlePrefixRaw) + theme.fg("muted", title);
 		const titleVisLen = visibleWidth(titlePrefixRaw) + visibleWidth(title);
