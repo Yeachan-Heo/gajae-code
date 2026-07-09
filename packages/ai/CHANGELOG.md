@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added GPT-5.6 Sol, Terra, and Luna catalog/parser support for OpenAI and OpenAI code transports, including `low` through canonical `max` reasoning efforts, verified pricing/limits, and GPT-5.6 cache-write pricing (#1925; OmX #3103).
 
 ## [0.9.4] - 2026-07-09
 ### Fixed

@@ -47,6 +47,7 @@ const DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX: readonly Effort[] = [
 const GEMINI_3_PRO_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High];
 const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
 const GPT_5_2_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
+const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
 
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
@@ -60,7 +61,18 @@ type SemVer = {
 
 type GeminiKind = "pro" | "flash";
 type AnthropicKind = "opus" | "sonnet";
-type OpenAIVariant = "base" | "codex" | "codex-max" | "codex-mini" | "codex-spark" | "mini" | "max" | "nano";
+type OpenAIVariant =
+	| "base"
+	| "codex"
+	| "codex-max"
+	| "codex-mini"
+	| "codex-spark"
+	| "luna"
+	| "mini"
+	| "max"
+	| "nano"
+	| "sol"
+	| "terra";
 
 const CODEX_GPT_5_4_PRIORITY_BY_VARIANT: Partial<Record<OpenAIVariant, number>> = {
 	base: 0,
@@ -465,9 +477,22 @@ function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel)
 	}
 	return false;
 }
+const GPT_5_6_TIER_VARIANTS: ReadonlySet<OpenAIVariant> = new Set(["base", "sol", "terra", "luna"]);
+
+function applyGpt56ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel): boolean {
+	if (!semverGte(parsedModel.version, "5.6") || !GPT_5_6_TIER_VARIANTS.has(parsedModel.variant)) {
+		return false;
+	}
+	model.contextWindow =
+		model.provider === "openai-codex" || model.api === "openai-codex-responses" ? 272_000 : 1_050_000;
+	return true;
+}
 
 function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel): void {
 	if (applyGpt55ContextWindow(model, parsedModel)) {
+		return;
+	}
+	if (applyGpt56ContextWindow(model, parsedModel)) {
 		return;
 	}
 	// OpenAI code backend models: 400K figure includes output budget; input window is 272K.
@@ -581,6 +606,9 @@ function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model
 function inferOpenAISupportedEfforts(model: OpenAIModel): readonly Effort[] {
 	if (model.variant === "codex-mini" && semverEqual(model.version, "5.1")) {
 		return GPT_5_1_CODEX_MINI_EFFORTS;
+	}
+	if (semverGte(model.version, "5.6")) {
+		return GPT_5_6_PLUS_EFFORTS;
 	}
 	if (semverGte(model.version, "5.2")) {
 		return GPT_5_2_PLUS_EFFORTS;
@@ -714,7 +742,10 @@ function parseAnthropicModel(modelId: string): AnthropicModel | null {
 }
 
 function parseOpenAIModel(modelId: string): OpenAIModel | null {
-	const match = /gpt-(\d+(?:\.\d+){0,2})(?:-(codex-spark|codex-mini|codex-max|codex|mini|max|nano))?$/.exec(modelId);
+	const match =
+		/gpt-(\d+(?:\.\d+){0,2})(?:-(codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(
+			modelId,
+		);
 	if (!match) {
 		return null;
 	}

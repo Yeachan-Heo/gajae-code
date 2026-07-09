@@ -372,6 +372,73 @@ describe("generated model policies", () => {
 		expect(models[2]?.applyPatchToolType).toBeUndefined();
 		expect(models[3]?.applyPatchToolType).toBeUndefined();
 	});
+
+	it("stores GPT-5.6 Sol/Terra/Luna effort metadata through max", () => {
+		const models = [
+			createModel({
+				id: "gpt-5.6-sol",
+				api: "openai-responses",
+				provider: "openai",
+			}),
+			createModel({
+				id: "gpt-5.6-terra",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+			}),
+			createModel({
+				id: "gpt-5.6-luna",
+				api: "openai-responses",
+				provider: "openai",
+			}),
+			createModel({
+				id: "gpt-5.6",
+				api: "openai-responses",
+				provider: "openai",
+			}),
+		];
+
+		for (const model of models) {
+			expect(model.thinking).toEqual({
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.Max,
+			});
+			expect(requireSupportedEffort(model, Effort.Max)).toBe(Effort.Max);
+			expect(() => requireSupportedEffort(model, Effort.Minimal)).toThrow(
+				/Supported efforts: low, medium, high, xhigh, max/,
+			);
+		}
+	});
+
+	it("normalizes GPT-5.6 tier context windows by OpenAI transport", () => {
+		const models: Model<Api>[] = [
+			{
+				...createModel({
+					id: "gpt-5.6-sol",
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+				}),
+				contextWindow: 1_050_000,
+				maxTokens: 128000,
+			},
+			{
+				...createModel({
+					id: "gpt-5.6-terra",
+					api: "openai-responses",
+					provider: "openai",
+				}),
+				contextWindow: 272000,
+				maxTokens: 128000,
+			},
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.contextWindow).toBe(272_000);
+		expect(models[1]?.contextWindow).toBe(1_050_000);
+		expect(models[0]?.applyPatchToolType).toBe("freeform");
+		expect(models[1]?.applyPatchToolType).toBe("freeform");
+	});
 });
 
 describe("model thinking runtime helpers", () => {
