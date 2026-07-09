@@ -29,7 +29,7 @@ import { calculateTokensPerSecond } from "./status-line/token-rate";
 import type { SeparatorDef } from "./status-line/types";
 
 export interface StatusLineSegmentOptions {
-	model?: { showThinkingLevel?: boolean };
+	model?: { showThinkingLevel?: boolean; showContextPercent?: boolean };
 	path?: { abbreviate?: boolean; maxLength?: number; stripWorkPrefix?: boolean };
 	git?: { showBranch?: boolean; showStaged?: boolean; showUnstaged?: boolean; showUntracked?: boolean };
 	time?: { format?: "12h" | "24h"; showSeconds?: boolean };

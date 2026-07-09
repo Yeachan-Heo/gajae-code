@@ -105,6 +105,18 @@ const modelSegment: StatusLineSegment = {
 				}
 			}
 		}
+		// Show the context-window token percentage right next to the model /
+		// reasoning effort (rather than as a trailing segment) so it stays
+		// grouped with the model it describes. Disable per-preset with
+		// `segmentOptions.model.showContextPercent: false`.
+		if (opts.showContextPercent !== false) {
+			const pct = ctx.contextPercent;
+			const window = ctx.contextWindow;
+			if (window > 0 && Number.isFinite(pct)) {
+				const color = getContextUsageThemeColor(getContextUsageLevel(pct, window));
+				content += `${theme.sep.dot}${theme.fg(color, `${pct.toFixed(1)}%`)}`;
+			}
+		}
 
 		return { content: theme.fg("statusLineModel", content), visible: true };
 	},
