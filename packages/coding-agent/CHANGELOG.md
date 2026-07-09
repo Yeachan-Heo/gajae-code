@@ -7,6 +7,7 @@
 ### Added
 
 - ACP clients now receive GJC automatic-compaction start/end state through additive `session_info_update` metadata, including the compaction action, trigger, retry/abort/error outcome, and busy-to-idle phase transitions.
+- Added GPT-5.6 family support (Sol, Terra, Luna — GA 2026-07-09): bundled `openai` and `openai-codex` catalog entries with verified pricing/limits (1,050K context, 128K max output, cache writes billed at 1.25x input), `sol`/`terra`/`luna` variant parsing so catalog policies (freeform apply_patch, context-window normalization) apply, and a `low`–`max` reasoning-effort range including the new `max` level above `xhigh`. The bare `gpt-5.6` API alias resolves like Sol. The multi-agent `ultra` setting is a Responses API beta, not a reasoning effort, and is out of scope.
 
 ## [0.9.4] - 2026-07-09
 ### Fixed

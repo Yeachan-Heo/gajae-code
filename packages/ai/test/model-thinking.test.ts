@@ -372,6 +372,73 @@ describe("generated model policies", () => {
 		expect(models[2]?.applyPatchToolType).toBeUndefined();
 		expect(models[3]?.applyPatchToolType).toBeUndefined();
 	});
+
+	it("stores the GPT-5.6 effort range including max in model metadata", () => {
+		const sol = createModel({
+			id: "gpt-5.6-sol",
+			api: "openai-responses",
+			provider: "openai",
+		});
+		const terra = createModel({
+			id: "gpt-5.6-terra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+		});
+		const luna = createModel({
+			id: "gpt-5.6-luna",
+			api: "openai-responses",
+			provider: "openai",
+		});
+		const alias = createModel({
+			id: "gpt-5.6",
+			api: "openai-responses",
+			provider: "openai",
+		});
+
+		for (const model of [sol, terra, luna, alias]) {
+			expect(model.thinking).toEqual({
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.Max,
+			});
+		}
+		expect(requireSupportedEffort(sol, Effort.Max)).toBe(Effort.Max);
+		expect(() => requireSupportedEffort(sol, Effort.Minimal)).toThrow(
+			/Supported efforts: low, medium, high, xhigh, max/,
+		);
+	});
+
+	it("keeps Codex GPT-5.6 tiers at the effective 272K request cap and first-party tiers at 1,050K", () => {
+		const models: Model<Api>[] = [
+			{
+				...createModel({
+					id: "gpt-5.6-sol",
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+				}),
+				// Discovery/cache can advertise the total 1,050K window, but the
+				// usable request prompt cap remains lower on this transport.
+				contextWindow: 1_050_000,
+				maxTokens: 128000,
+			},
+			{
+				...createModel({
+					id: "gpt-5.6-terra",
+					api: "openai-responses",
+					provider: "openai",
+				}),
+				contextWindow: 272000,
+				maxTokens: 128000,
+			},
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.contextWindow).toBe(272_000);
+		expect(models[1]?.contextWindow).toBe(1_050_000);
+		expect(models[0]?.applyPatchToolType).toBe("freeform");
+		expect(models[1]?.applyPatchToolType).toBe("freeform");
+	});
 });
 
 describe("model thinking runtime helpers", () => {
