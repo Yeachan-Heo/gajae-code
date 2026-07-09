@@ -35,7 +35,7 @@ import * as path from "node:path";
 describe("issue #1011 — tab worker entry must survive `bun build --compile`", () => {
 	const packageDir = path.resolve(import.meta.dir, "..");
 	const supervisorPath = path.join(packageDir, "src/tools/browser/tab-supervisor.ts");
-	const buildBinaryPath = path.join(packageDir, "scripts/build-binary.ts");
+	const compileArgsPath = path.join(packageDir, "scripts/compile-args.ts");
 	// `--root` is `../..` from packages/coding-agent, so the literal that
 	// matches at runtime inside the compiled bunfs is repo-relative.
 	const compiledLiteral = "./packages/coding-agent/src/tools/browser/tab-worker-entry.ts";
@@ -68,11 +68,11 @@ describe("issue #1011 — tab worker entry must survive `bun build --compile`", 
 		).toBe(true);
 	});
 
-	it("build-binary.ts lists tab-worker-entry as an explicit --compile entrypoint", async () => {
-		const source = await Bun.file(buildBinaryPath).text();
+	it("compile args list tab-worker-entry as an explicit --compile entrypoint", async () => {
+		const source = await Bun.file(compileArgsPath).text();
 		expect(
 			source.includes(`"${buildEntrypoint}"`),
-			`scripts/build-binary.ts must include "${buildEntrypoint}" as an explicit --compile entrypoint so Bun emits the worker into bunfs`,
+			`scripts/compile-args.ts must include "${buildEntrypoint}" as an explicit --compile entrypoint so Bun emits the worker into bunfs`,
 		).toBe(true);
 	});
 });

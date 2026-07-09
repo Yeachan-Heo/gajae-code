@@ -1,23 +1,35 @@
+import { createRequire } from "node:module";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
-import MODELS from "./models.json" with { type: "json" };
 import type { Api, KnownProvider, Model, Usage } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
 /**
- * Static bundled model registry loaded from `models.json`.
+ * Static bundled model registry loaded lazily from `models.json`.
  *
  * This module intentionally exposes compile-time defaults only.
  * It does not include runtime discovery, models.dev overlays, or on-disk cache state.
  *
  * For runtime-aware resolution, use `createModelManager()` / `resolveProviderModels()`.
  */
-const providerNames = Object.keys(MODELS) as KnownProvider[];
+type BundledCatalog = typeof import("./models.json");
+
+const require = createRequire(import.meta.url);
+const COMPILED_MODELS_PATH = "./packages/ai/src/models.json";
+let bundledCatalog: BundledCatalog | undefined;
+let providerNames: KnownProvider[] | undefined;
 const providerModelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
+
+function getBundledCatalog(): BundledCatalog {
+	bundledCatalog ??= require(
+		process.env.PI_COMPILED === "true" ? COMPILED_MODELS_PATH : "./models.json",
+	) as BundledCatalog;
+	return bundledCatalog;
+}
 
 function getProviderModels(provider: GeneratedProvider): Map<string, Model<Api>> | undefined {
 	const cached = providerModelRegistry.get(provider);
 	if (cached) return cached;
-	const models = MODELS[provider];
+	const models = getBundledCatalog()[provider];
 	if (!models) return undefined;
 	const providerModels = new Map<string, Model<Api>>();
 	for (const [id, model] of Object.entries(models)) {
@@ -52,7 +64,7 @@ function applyBundledCompatDefaults(model: Model<Api>): Model<Api> {
 	return policyModels[0] ?? normalized;
 }
 
-export type GeneratedProvider = keyof typeof MODELS;
+export type GeneratedProvider = keyof BundledCatalog;
 
 export function getBundledModel<TApi extends Api = Api>(provider: GeneratedProvider, modelId: string): Model<TApi> {
 	const providerModels = getProviderModels(provider);
@@ -62,6 +74,7 @@ export function getBundledModel<TApi extends Api = Api>(provider: GeneratedProvi
 export function getBundledProviders(): KnownProvider[] {
 	// Defensive copy: the old eager path returned a fresh Array.from(...), so
 	// callers may freely mutate their result without corrupting enumeration.
+	providerNames ??= Object.keys(getBundledCatalog()) as KnownProvider[];
 	return providerNames.slice();
 }
 

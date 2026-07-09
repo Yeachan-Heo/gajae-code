@@ -38,6 +38,7 @@ import type { InteractiveMode } from "./modes/interactive-mode";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import { applyCliRuntimeApiKeyOverride } from "./runtime-api-key";
+import { parseCliCredentialSelector } from "./runtime-credential-selector";
 import type { MCPManager } from "./runtime-mcp";
 import {
 	type CreateAgentSessionOptions,
@@ -1010,6 +1011,20 @@ export async function runRootCommand(
 	deps.rlmPreset?.applyOptions(sessionOptions, settingsInstance);
 
 	// Handle CLI --api-key as runtime override (not persisted)
+	if (parsedArgs.apiKey && parsedArgs.credential) {
+		process.stderr.write(`${chalk.red("--api-key and --credential cannot be used together")}\n`);
+		process.exit(1);
+	}
+
+	if (parsedArgs.credential) {
+		try {
+			sessionOptions.credentialSelector = parseCliCredentialSelector(parsedArgs.credential);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			process.stderr.write(`${chalk.red(message)}\n`);
+			process.exit(1);
+		}
+	}
 	if (parsedArgs.apiKey) {
 		if (!sessionOptions.model && !sessionOptions.modelPattern) {
 			process.stderr.write(

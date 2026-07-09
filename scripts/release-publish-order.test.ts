@@ -175,7 +175,7 @@ describe("native release binary coverage", () => {
 		// The deprecated macos-13 runner pool stays retired; Intel coverage now
 		// rides the supported macos-15-intel runner.
 		expect(workflow).not.toContain("{ os: macos-13, platform: darwin, arch: x64 }");
-		expect(workflow).toContain("{ os: macos-15-intel, platform: darwin, arch: x64 }");
+		expect(workflow).toContain("{ os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }");
 		expect(workflow).toContain("target_id: darwin-x64");
 		expect(workflow).toContain("binary_path: packages/coding-agent/binaries/gjc-darwin-x64");
 		expect(workflow).toContain("{ os: macos-14, platform: darwin, arch: arm64 }");

@@ -5,6 +5,7 @@
  * and after compaction the session is reloaded.
  */
 
+import * as os from "node:os";
 import {
 	type AssistantMessage,
 	Effort,
@@ -237,7 +238,13 @@ export function shouldCompact(
 }
 
 /** Reason a compaction was triggered. `token` is the normal user-configurable path; the rest are emergency floors. */
-export type CompactionTriggerReason = "token" | "heap" | "providerBytes" | "messageCount" | "imageBytes";
+export type CompactionTriggerReason =
+	| "token"
+	| "heap"
+	| "retainedMemory"
+	| "providerBytes"
+	| "messageCount"
+	| "imageBytes";
 
 /** A point-in-time resource sample. Supplied by an injectable sampler so tests never read real RSS. */
 export interface EmergencyCompactionSample {
@@ -249,6 +256,14 @@ export interface EmergencyCompactionSample {
 	messageCount: number;
 	/** Approximate inline image bytes in the provider context. */
 	imageBytes: number;
+	/** Bytes retained by session resident image sentinels; separate from provider-visible bytes. */
+	sessionResidentImageBytes?: number;
+	/** Bytes retained by non-provider materialized/session-local caches. */
+	materializedResidentBytes?: number;
+	/** Number of live TUI chat-container children. */
+	tuiChatChildren?: number;
+	/** Bytes retained by TUI render caches. */
+	tuiCachedRenderBytes?: number;
 }
 
 export interface EmergencyCompactionLimits {
@@ -256,6 +271,40 @@ export interface EmergencyCompactionLimits {
 	providerBytes: number;
 	messageCount: number;
 	imageBytes: number;
+	retainedMemoryBytes?: number;
+	retainedMemoryDiagnosticBytes?: number;
+	tuiChatChildren?: number;
+	tuiChatChildrenDiagnostic?: number;
+}
+
+const MAX_EMERGENCY_HEAP_FLOOR_BYTES = 1_536 * 1024 * 1024; // 1.5 GiB resident heap
+const EMERGENCY_RETAINED_MEMORY_BYTES = 128 * 1024 * 1024;
+const DIAGNOSTIC_RETAINED_MEMORY_BYTES = 64 * 1024 * 1024;
+const EMERGENCY_TUI_CHAT_CHILDREN = 1000;
+const DIAGNOSTIC_TUI_CHAT_CHILDREN = 700;
+let retainedMemoryDiagnosticActive = false;
+let tuiChatChildrenDiagnosticActive = false;
+
+export function resetEmergencyRetainedMemoryDiagnosticsForTests(): void {
+	retainedMemoryDiagnosticActive = false;
+	tuiChatChildrenDiagnosticActive = false;
+}
+
+export function resolveEmergencyCompactionLimits(totalMemoryBytes: number = os.totalmem()): EmergencyCompactionLimits {
+	// Invalid or non-positive total memory (bad injection, exotic platform)
+	// must never disable the heap floor — fall back to the fixed 1.5 GiB cap.
+	const safeTotal =
+		Number.isFinite(totalMemoryBytes) && totalMemoryBytes > 0 ? totalMemoryBytes : Number.POSITIVE_INFINITY;
+	return {
+		heapUsedBytes: Math.min(MAX_EMERGENCY_HEAP_FLOOR_BYTES, Math.floor(0.5 * safeTotal)),
+		providerBytes: 24 * 1024 * 1024, // 24 MiB serialized provider context
+		messageCount: 4000,
+		imageBytes: 64 * 1024 * 1024, // 64 MiB inline image bytes
+		retainedMemoryBytes: EMERGENCY_RETAINED_MEMORY_BYTES,
+		retainedMemoryDiagnosticBytes: DIAGNOSTIC_RETAINED_MEMORY_BYTES,
+		tuiChatChildren: EMERGENCY_TUI_CHAT_CHILDREN,
+		tuiChatChildrenDiagnostic: DIAGNOSTIC_TUI_CHAT_CHILDREN,
+	};
 }
 
 /**
@@ -263,23 +312,43 @@ export interface EmergencyCompactionLimits {
  * long session on weak hardware compacts before OOM even when token-based compaction is
  * disabled or its threshold is set too high. They are NOT user-tunable down to zero.
  */
-export const DEFAULT_EMERGENCY_COMPACTION_LIMITS: EmergencyCompactionLimits = {
-	heapUsedBytes: 1_536 * 1024 * 1024, // 1.5 GiB resident heap
-	providerBytes: 24 * 1024 * 1024, // 24 MiB serialized provider context
-	messageCount: 4000,
-	imageBytes: 64 * 1024 * 1024, // 64 MiB inline image bytes
-};
+export const DEFAULT_EMERGENCY_COMPACTION_LIMITS: EmergencyCompactionLimits = resolveEmergencyCompactionLimits();
 
 /**
- * Returns the first emergency limit exceeded (heap > providerBytes > imageBytes > messageCount),
- * or null when none is. Pure and sampler-injected; the caller routes the result through the
+ * Returns the first emergency limit exceeded (heap > retainedMemory > providerBytes > imageBytes > messageCount),
+ * or null when none is. Pure apart from retained-memory diagnostics; the caller routes the result through the
  * normal pair-safe `compact()` cut logic so a tool_use/tool_result pair is never split.
  */
 export function emergencyCompactionReason(
 	sample: EmergencyCompactionSample,
-	limits: EmergencyCompactionLimits = DEFAULT_EMERGENCY_COMPACTION_LIMITS,
+	limits: EmergencyCompactionLimits = resolveEmergencyCompactionLimits(),
 ): CompactionTriggerReason | null {
+	const retainedMemoryBytes = (sample.materializedResidentBytes ?? 0) + (sample.tuiCachedRenderBytes ?? 0);
+	const tuiChatChildren = sample.tuiChatChildren ?? 0;
+	const retainedDiagnostic =
+		retainedMemoryBytes >= (limits.retainedMemoryDiagnosticBytes ?? DIAGNOSTIC_RETAINED_MEMORY_BYTES);
+	const childDiagnostic = tuiChatChildren >= (limits.tuiChatChildrenDiagnostic ?? DIAGNOSTIC_TUI_CHAT_CHILDREN);
+	if (retainedDiagnostic && !retainedMemoryDiagnosticActive) {
+		logger.warn("Emergency compaction retained-memory diagnostic threshold crossed", {
+			retainedMemoryBytes,
+			limitBytes: limits.retainedMemoryDiagnosticBytes ?? DIAGNOSTIC_RETAINED_MEMORY_BYTES,
+		});
+	}
+	if (childDiagnostic && !tuiChatChildrenDiagnosticActive) {
+		logger.warn("Emergency compaction TUI chat-child diagnostic threshold crossed", {
+			tuiChatChildren,
+			limit: limits.tuiChatChildrenDiagnostic ?? DIAGNOSTIC_TUI_CHAT_CHILDREN,
+		});
+	}
+	retainedMemoryDiagnosticActive = retainedDiagnostic;
+	tuiChatChildrenDiagnosticActive = childDiagnostic;
+
 	if (sample.heapUsedBytes > limits.heapUsedBytes) return "heap";
+	if (
+		retainedMemoryBytes >= (limits.retainedMemoryBytes ?? EMERGENCY_RETAINED_MEMORY_BYTES) ||
+		tuiChatChildren >= (limits.tuiChatChildren ?? EMERGENCY_TUI_CHAT_CHILDREN)
+	)
+		return "retainedMemory";
 	if (sample.providerBytes > limits.providerBytes) return "providerBytes";
 	if (sample.imageBytes > limits.imageBytes) return "imageBytes";
 	if (sample.messageCount > limits.messageCount) return "messageCount";

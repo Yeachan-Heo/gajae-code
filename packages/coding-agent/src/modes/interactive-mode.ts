@@ -18,6 +18,7 @@ import type { Component, EditorTheme, SlashCommand } from "@gajae-code/tui";
 import {
 	Container,
 	clearRenderCache,
+	getRenderCacheRetainedBytes,
 	Loader,
 	Markdown,
 	ProcessTerminal,
@@ -114,7 +115,7 @@ import {
 	theme,
 } from "./theme/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext, SubmittedUserInput, TodoItem, TodoPhase } from "./types";
-import { UiHelpers } from "./utils/ui-helpers";
+import { addChatChild, UiHelpers } from "./utils/ui-helpers";
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
 const COMPOSER_NEWLINE_HINT = process.platform === "win32" ? "Alt+Enter/Ctrl+J" : "Shift+Enter/Ctrl+J";
@@ -398,6 +399,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
+		this.session.setRetainedMemorySampler(() => ({
+			tuiChatChildren: this.chatContainer.children.length,
+			tuiCachedRenderBytes: getRenderCacheRetainedBytes(),
+		}));
 		this.settings = session.settings;
 		this.keybindings = KeybindingsManager.inMemory();
 		this.agent = session.agent;
@@ -1514,8 +1519,11 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#renderPlanPreview(planContent: string, options?: { append?: boolean }): void {
 		const existingContainer = this.#planReviewContainer;
-		const replaceExisting = options?.append !== true && existingContainer !== undefined;
-		const planReviewContainer = replaceExisting ? existingContainer : new Container();
+		// Only reuse the existing preview when it is still attached to the chat container;
+		// a collapsed/disposed container must be re-added, not mutated in place.
+		const stillAttached = existingContainer !== undefined && this.chatContainer.children.includes(existingContainer);
+		const replaceExisting = options?.append !== true && stillAttached;
+		const planReviewContainer = replaceExisting && existingContainer ? existingContainer : new Container();
 		planReviewContainer.clear();
 		planReviewContainer.addChild(new Spacer(1));
 		planReviewContainer.addChild(new DynamicBorder());
@@ -1524,7 +1532,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		planReviewContainer.addChild(new Markdown(planContent, 1, 1, getMarkdownTheme()));
 		planReviewContainer.addChild(new DynamicBorder());
 		if (!replaceExisting) {
-			this.chatContainer.addChild(planReviewContainer);
+			addChatChild(this, planReviewContainer);
 		}
 		this.#planReviewContainer = planReviewContainer;
 		this.ui.requestRender();

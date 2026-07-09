@@ -82,6 +82,9 @@ runs:
            TARGET_PLATFORM: ${{ inputs.platform }}
            TARGET_ARCH: ${{ inputs.arch }}
            TARGET_VARIANTS: ${{ inputs.variant }}
+           # Tag builds ship the size-tuned dist profile (strip=debuginfo,
+           # fat LTO, panic=unwind preserved); PR/branch builds keep ci.
+           PI_NATIVE_PROFILE: ${{ startsWith(github.ref, 'refs/tags/v') && 'dist' || '' }}
            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: bun run ci:build:native
       - name: Upload native addon(s)

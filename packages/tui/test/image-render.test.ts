@@ -323,7 +323,7 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 			BASE64_DUMMY,
 			"image/png",
 			{ fallbackColor: text => text },
-			{ maxWidthCells: 10, maxHeightCells: 2 },
+			{ maxWidthCells: 10, maxHeightCells: 2, refetch: () => BASE64_DUMMY },
 			SQUARE_DIMENSIONS,
 		);
 		const model = new KittyTerminalModel();
@@ -339,6 +339,67 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 		expect(second).toBe(first);
 		expect(model.placements.size).toBe(1);
 		expect(transmitted).toHaveLength(1);
+	});
+
+	it("Image component releases source base64 after successful protocol render", () => {
+		terminal.imageProtocol = ImageProtocol.Kitty;
+		const image = new Image(
+			BASE64_DUMMY,
+			"image/png",
+			{ fallbackColor: text => text },
+			{ maxWidthCells: 10 },
+			SQUARE_DIMENSIONS,
+		);
+
+		const lines = image.render(20);
+
+		expect(lines[0]).toContain("\x1b_G");
+		expect(image.retainedBase64DataForTest).toBeUndefined();
+	});
+
+	it("Image component refetches released base64 when an invalidated render needs re-encoding", () => {
+		terminal.imageProtocol = ImageProtocol.Kitty;
+		let refetchCount = 0;
+		const image = new Image(
+			BASE64_DUMMY,
+			"image/png",
+			{ fallbackColor: text => text },
+			{
+				maxWidthCells: 10,
+				refetch: () => {
+					refetchCount++;
+					return BASE64_DUMMY;
+				},
+			},
+			SQUARE_DIMENSIONS,
+		);
+
+		image.render(20);
+		image.invalidate();
+		const lines = image.render(12);
+
+		expect(refetchCount).toBe(1);
+		expect(lines[0]).toContain("\x1b_G");
+		expect(image.retainedBase64DataForTest).toBeUndefined();
+	});
+
+	it("Image component falls back gracefully after invalidation when released base64 cannot be refetched", () => {
+		terminal.imageProtocol = ImageProtocol.Kitty;
+		const image = new Image(
+			BASE64_DUMMY,
+			"image/png",
+			{ fallbackColor: text => `fallback:${text}` },
+			{ maxWidthCells: 10, filename: "sample.png" },
+			SQUARE_DIMENSIONS,
+		);
+
+		image.render(20);
+		image.invalidate();
+		const lines = image.render(12);
+
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("fallback:");
+		expect(lines[0]).toContain("sample.png");
 	});
 });
 

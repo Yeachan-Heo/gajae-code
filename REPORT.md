@@ -236,3 +236,124 @@ The staleness-aware pruner is well designed (digest notices, 40k protect-window,
 - Staleness-aware pruning design with digest notices and protect-window hysteresis (pruning.ts)
 - Emergency compaction floors (heap/providerBytes/imageBytes/messageCount) prevent OOM-by-context
 - Default-reduction gate requiring benchmark + human evidence before shrinking defaults
+
+---
+
+# Binary Size & Memory Footprint Audit
+
+Read-only architect audit of distributable/binary size and runtime memory footprint. 12 evidence-backed findings; no files modified, no builds run.
+
+Pipeline overview: `bun build --compile` via `scripts/ci-release-build-binaries.ts` (release) and `packages/coding-agent/scripts/build-binary.ts` (dev); embeds native .node via embed-native.ts file-type imports, stats dashboard tar.gz, worker entrypoints, telegram daemon CLI; only mupdf is `--external`.
+
+## Top 5 Prioritized
+
+1. **HIGH / small effort** — Add `--minify` to release binary builds. Dev build documents 302MB→114MB startup RSS win from `--minify`; release pipeline omits it entirely. `scripts/ci-release-build-binaries.ts:152-181`
+2. **HIGH / medium effort** — Stop embedding both modern+baseline native addons in x64 binaries; only one is ever loaded. `packages/natives/scripts/embed-native.ts:61-96`
+3. **HIGH / small effort** — Introduce a stripped `dist` Rust profile for shipped addons. Shipped .node files use `[profile.ci]` with strip=none + line tables + thin LTO; the tuned `[profile.release]` is never used for distribution. 20–40% addon shrink plausible. `Cargo.toml:25-36`
+4. **MED-HIGH / medium effort** — Lazy-resolve session image blobs instead of materializing all history base64 on resume; images can be pinned 3x. `packages/coding-agent/src/session/session-manager.ts:1002-1028`
+5. **MEDIUM / medium effort** — Defer eager heavy imports (1.6MB models.json, 1.1MB docs index, winston/handlebars/xterm/linkedom); fixed ~10-20MB parse-time heap paid by every process including subagent fan-out. `packages/ai/src/models.ts:2`, `packages/coding-agent/src/internal-urls/gjc-protocol.ts:11`, `packages/utils/src/logger.ts:13-16`
+
+## Findings
+
+### 1. [Size/Memory] Release binaries built without `--minify` — HIGH, small effort
+`scripts/ci-release-build-binaries.ts:152-181`
+
+The release pipeline invokes `bun build --compile` with `--keep-names`, `--no-compile-autoload-*`, `--define` — but **no `--minify`**. The dev build (`packages/coding-agent/scripts/build-binary.ts:40-50`) passes `--minify` with an explicit comment: "Minify shrinks the bundled JS the compiled binary must parse at startup (302MB → ~114MB --help RSS measured on darwin-arm64)". Shipped release binaries carry unminified JS: larger distributable AND ~2.5x higher startup RSS.
+
+**Fix:** mirror the dev script's flag set (`--minify --keep-names`), or extract a shared arg list consumed by both scripts so they cannot drift. Re-run `--smoke-test` gates and the issue-1150-repro worker-entry contract test.
+
+### 2. [Size] x64 release binaries embed BOTH modern and baseline native addons (~2x native payload) — HIGH, medium effort
+`packages/natives/scripts/embed-native.ts:61-96`
+
+For x64 targets the candidate list is `[modern, baseline]` (:61-67) and **every** available candidate is embedded via `import ... with { type: "file" }` (:92-96). CI downloads both variants (`.github/workflows/ci.yml:425-427`, `merge-multiple: true`; `native_linux` builds both at ci.yml:163-166), so linux-x64/darwin-x64/win32-x64 binaries ship two full copies of the pi-natives cdylib (~28 tree-sitter grammars, syntect, brush, grep, image codecs statically linked; plausibly 20–50MB each under the ci profile). At runtime only one variant is extracted (`loader-state.js` `selectEmbeddedAddonFile()`).
+
+**Fix:** (a) ship baseline-only embedded and stage modern lazily, (b) per-variant binaries, or (c) baseline-only as sole compiled-binary variant. Minimal: filter candidates by `EMBED_VARIANTS=baseline` in the release path.
+
+### 3. [Size] Shipped native addons use `ci` profile (strip=none, line tables, thin LTO) — never the size-tuned `release` profile — HIGH, small effort
+`Cargo.toml:25-36`
+
+Root Cargo.toml defines a well-tuned `[profile.release]` (:17-23: opt-level 3, lto="fat", codegen-units=1, strip=true, panic="abort") but it is dead for distribution: `build-native.ts:149-151` selects `local` for dev and `ci` for every CI/cross build, and `[profile.ci]` sets `lto="thin"`, `codegen-units=16`, `debug="line-tables-only"`, **`strip="none"`**. The `panic="unwind"` override is genuinely required (pi-natives catch_unwind guard), but strip/debug/lto/codegen-units are not coupled to it.
+
+**Fix:** add a `dist` profile: `inherits = "release"`, `panic = "unwind"`, `strip = true` (or `"debuginfo"`), optionally `lto = "fat"`; have build-native.ts select it for release tags; keep `ci` for test builds.
+
+### 4. [Size/Memory] 1.1 MB docs corpus embedded as a TS module in the eagerly-imported internal-urls barrel — MEDIUM, small/medium effort
+`packages/coding-agent/src/internal-urls/gjc-protocol.ts:11`
+
+`generate-docs-index.ts:46-67` inlines the full text of every `docs/**/*.md` (76+ files) into `docs-index.generated.ts` — 1.1 MB of string literals. Statically imported by gjc-protocol.ts:11, re-exported from the barrel (index.ts:13), imported by sdk.ts:85. Cost: +1.1 MB in every compiled binary and npm package, and the whole corpus is parsed into JS heap at startup of every session — including subagent runs that never resolve a `gjc://docs` URL.
+
+**Fix:** (1) lazy `await import("./docs-index.generated")` inside the resolve handler; (2) better: emit docs as embedded assets or a gzipped archive (like packages/stats' `embedded-client.generated.txt` pattern), decompressed on demand — markdown compresses ~4x.
+
+### 5. [Size] Docker runtime base ships full build toolchain; `COPY . /pi/` includes 11.5 MB of brand PNGs — MEDIUM, small effort
+`Dockerfile:117-138`
+
+(1) pi-base stage installs `build-essential pkg-config libssl-dev` (~250MB) + rustup launcher into the *runtime* image, even though pi-natives is compiled in a separate `natives-builder` stage and copied prebuilt (:138). (2) `Dockerfile.dockerignore` does NOT exclude `assets/` (7 PNGs, ~11.5MB — README-only brand assets; nothing under packages/ references them), nor `docs/`, `issues/`, `geobench/`, `.plans/`.
+
+**Fix:** add `assets/`, `issues/`, `.plans/`, `geobench/` to Dockerfile.dockerignore; move toolchain out of pi-base into a `pi-dev` target or behind a build ARG.
+
+### 6. [Size] pi-natives statically links 28 always-on tree-sitter grammars + unused syntect default-themes — MEDIUM
+`Cargo.toml:286-290`
+
+(1) `crates/pi-ast/Cargo.toml:20-77` marks ~37 grammars optional behind `full-langs`, but 28 are unconditional (cpp and typescript are each multi-MB of static tables). The embed guard already enforces `languageSet: "default"` — the default tier is just wide. (2) syntect `default-themes` feature is dead weight: highlight.rs never loads a `ThemeSet` — theme colors are passed in from TS as ANSI strings (highlight.rs:132-135); zero uses of ThemeSet workspace-wide. ~0.5MB serialized theme dump is baggage; only `default-syntaxes` + `regex-fancy` are needed. (3) `inferno` (flamegraph SVGs, prof.rs:200) ships in the production addon for a dev-profiling feature.
+
+**Fix:** drop `default-themes` (small); audit the default grammar tier and feature-flag inferno (medium).
+
+### 7. [Memory] Session resume materializes every historical image blob into inline base64 heap strings for session lifetime — MED-HIGH, medium effort
+`packages/coding-agent/src/session/session-manager.ts:1002-1028`
+
+`resolveBlobRefsInEntries` rehydrates **all** blob refs in **all** loaded entries back into inline base64 on load (:1019; plus `resolvePersistedBlobRefs` at :959-980). Concurrency is bounded (BLOB_RESOLVE_CONCURRENCY=8) but *retained* footprint is not: after resume, every image in history lives in heap as base64 (≈1.37x binary size) even if behind a compaction summary. The blob store's externalization is undone at load. The emergency `imageBytes` floor (64MiB, compaction.ts:270) only counts provider-visible messages; the MemoryBlobStore LRU governs a different store — a resumed image-heavy session can pin hundreds of MB indefinitely.
+
+**Fix:** resolve blob refs lazily — keep `blob:sha256:` refs in loaded entries and materialize only in provider-visible context building and display rendering (the resident-blob sentinel system already demonstrates the lazy pattern for text). Or restrict eager resolution to active-branch entries ahead of the latest compaction.
+
+### 8. [Memory] TUI chatContainer grows unboundedly; Image components retain base64 + rendered escape sequences — MEDIUM, medium effort
+`packages/coding-agent/src/modes/interactive-mode.ts:418`
+
+One flat `chatContainer` only ever grows within a conversation (addChild sites: event-controller.ts:437,552,846; ui-helpers.ts:81-243); nothing evicts scrolled-off components until whole-session `clear()`. (1) `packages/tui/src/components/image.ts:21,37` stores `#base64Data` for component lifetime plus `#cachedLines` with the kitty/sixel escape sequence — combined with finding 7, each screenshot exists ≥3x in heap. (2) Each Text/Markdown/Box caches `#cachedLines`, so TUI heap is O(total conversation render output), not O(viewport). The 1.5GiB emergency heap floor is very high for weak hardware.
+
+**Fix:** virtualize or cap chatContainer children beyond N components (collapsed placeholder); null out `Image#base64Data` after first successful protocol render (re-fetchable from blob store).
+
+### 9. [Size] npm package ships generated 1.1MB docs index, duplicated HTML template, vendored minified JS, vendored Python engine tests — LOW/MEDIUM, small effort
+`packages/coding-agent/package.json:83-91`
+
+`files` publishes `src`, `scripts`, `examples`, `vendor` wholesale: `docs-index.generated.ts` (1.1MB), `template.generated.ts` (112KB inlined duplicate of template.html/js/css which are *also* shipped), `vendor/highlight.min.js` (118.9KB) + `marked.min.js` (38.1KB), and `vendor/insane-search/**` including Python test files.
+
+**Fix:** negation patterns in `files` or .npmignore for `vendor/insane-search/engine/tests`; reconsider publishing `scripts`/`examples`.
+
+### 10. [Memory] Eagerly-imported heavy TS deps (winston, handlebars, xterm-headless, linkedom) inflate baseline RSS of every process — MEDIUM, medium effort
+`packages/utils/src/logger.ts:13-16`
+
+- logger.ts:14-15 — winston + winston-daily-rotate-file imported statically; rotating-file logger constructed at module load. `@gajae-code/utils` is imported by every package — universal cost before a single log line.
+- prompt.ts:1-2 — handlebars (full compiler, ~1MB parsed) statically imported in the same universal package.
+- bash-interactive.ts:15 — `@xterm/headless` (full terminal emulator) at module scope even when interactive bash never runs.
+- fetch.ts:8 + 6 scrapers — linkedom statically imported even when fetch/browser tools are never invoked.
+
+Together O(10MB) baseline RSS per gjc process, multiplied by subagent/team fan-out. In compiled binaries all get bundled (only mupdf is `--external`). The lazy pattern is already proven in-repo (puppeteer-core, markit-ai, turndown).
+
+**Fix:** lazy `await import()` behind first use; logger transport created on first write; consider replacing winston with a tiny append-only JSONL writer (format is already hand-rolled JSON, logger.ts:27-43).
+
+### 11. [Memory] #streamingEditFileCache holds full file contents per touched path with no size cap — LOW/MEDIUM, small effort
+`packages/coding-agent/src/session/agent-session.ts:2970-2979`
+
+`#ensureFileCache` does `readFileSync` and stores the **entire normalized file text** keyed by path — no per-entry cap, no LRU. Cleared at streaming-cycle boundaries (:2859) and per-path on edit completion (:2986), so not a permanent leak, but during a multi-file streaming turn it holds sum(all touched file sizes) unbounded. Contrast the neighboring FileReadCache which is LRU-bounded at 30 paths and stores only line hashes.
+
+**Fix:** skip caching files above a threshold (reuse the existing 8MiB edit/read guard constant), or cap the map at N entries / M bytes with oldest-eviction.
+
+### 12. [Size/Memory] 1.6MB models.json bundled and parsed eagerly at import; ~40 provider modules load statically — MEDIUM, medium effort
+`packages/ai/src/models.ts:2`
+
+`import MODELS from "./models.json" with { type: "json" }` — a 1.6MB catalog at module scope. Per-provider Map conversion is lazy (good), but the full parsed JSON object graph materializes at import in every process (JSON graphs inflate 3–6x over source → ~5–10MB retained), plus 1.6MB in every binary/tarball. model-registry layers 20+ Maps on top, often duplicating catalog data. Secondary: auth-storage.ts is 166.5KB, anthropic.ts 103KB; all ~40 providers load via static `register-builtins.ts` even when one provider is used.
+
+**Fix:** lazy loader behind the public API; embed as asset and parse on demand for compiled binaries; defer provider module bodies behind factory thunks.
+
+## Memory Guard Coverage Assessment
+
+**Present and sound:**
+- Emergency compaction floors, non-disableable: heap 1.5GiB / providerBytes 24MiB / messageCount 4000 / imageBytes 64MiB (compaction.ts:266-271), red-team tested.
+- MemoryBlobStore LRU 64MiB/4096 entries; bounded blob-resume concurrency.
+- Output truncation everywhere: 50KB default, 10MB artifact cap, TailBuffer ring.
+- TUI render caches bounded to 2x screen lines; markdown LRUs 256/128/512 with 200KB highlight ceiling; token-estimate WeakMap.
+- Rust: FS scan cache 16 entries/1s TTL; native highlight 16MiB input cap; prof circular buffer.
+
+**Gaps:**
+1. Heap floor (1.5GiB) not scaled to `os.totalmem()` — on a 2GB box it fires at OOM-kill territory. Fix: `min(1.5GiB, 0.5 * os.totalmem())` — small effort.
+2. Emergency floors sample only provider-visible messages (agent-session.ts:7155-7177) — TUI component retention, resident blob caches, session-entry copies invisible; only the blunt heapUsed check catches them.
+3. pi-natives PTY timeout path leaks one thread per timed-out openpty by design (`std::mem::forget`, pty.rs:497) — documented/bounded, but worth a counter.

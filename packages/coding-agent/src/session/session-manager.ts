@@ -45,8 +45,6 @@ import {
 	MemoryBlobStore,
 	parseBlobRef,
 	ResidentBlobMissingError,
-	resolveImageData,
-	resolveImageDataUrl,
 	resolveResidentImageDataSync,
 	resolveResidentImageDataUrlSync,
 	resolveTextBlobSync,
@@ -973,47 +971,46 @@ export async function loadEntriesFromFile(
 }
 
 /**
- * Resolve blob references in loaded entries, restoring both session image blocks and persisted
- * provider image URLs back to the inline data expected by downstream transports. Mutates entries in place.
+ * Convert legacy persisted blob references in loaded entries into resident sentinels.
+ * Images then materialize lazily at provider/display/export chokepoints instead of
+ * pinning every historical base64 string for the lifetime of a resumed session.
  */
 function hasImageUrl(value: unknown): value is { image_url: string | { url?: string } } {
 	return typeof value === "object" && value !== null && "image_url" in value;
 }
 
-async function resolvePersistedBlobRefs(value: unknown, blobStore: BlobStore, key?: string): Promise<void> {
+function residentizePersistedBlobRefs(value: unknown, key?: string): void {
 	if (Array.isArray(value)) {
-		await Promise.all(value.map(item => resolvePersistedBlobRefs(item, blobStore, key)));
+		for (const item of value) residentizePersistedBlobRefs(item, key);
 		return;
 	}
 
 	if (typeof value !== "object" || value === null) return;
 
 	if (isImageBlock(value) && isBlobRef(value.data)) {
-		value.data = await resolveImageData(blobStore, value.data);
+		value.data = residentBlobSentinel("imageData", value.data) as unknown as string;
 	}
 
 	if (hasImageUrl(value)) {
 		if (typeof value.image_url === "string" && isBlobRef(value.image_url)) {
-			value.image_url = await resolveImageDataUrl(blobStore, value.image_url);
+			value.image_url = residentBlobSentinel("imageUrl", value.image_url) as unknown as string;
 		} else if (
 			typeof value.image_url === "object" &&
 			value.image_url !== null &&
 			typeof value.image_url.url === "string" &&
 			isBlobRef(value.image_url.url)
 		) {
-			value.image_url.url = await resolveImageDataUrl(blobStore, value.image_url.url);
+			value.image_url.url = residentBlobSentinel("imageUrl", value.image_url.url) as unknown as string;
 		}
 	}
 
-	await Promise.all(
-		Object.entries(value).map(async ([childKey, item]) => {
-			if (childKey === "data" && typeof item === "string" && isBlobRef(item) && key !== TEXT_CONTENT_KEY) {
-				(value as Record<string, unknown>)[childKey] = await resolveImageDataUrl(blobStore, item);
-				return;
-			}
-			await resolvePersistedBlobRefs(item, blobStore, childKey);
-		}),
-	);
+	for (const [childKey, item] of Object.entries(value)) {
+		if (childKey === "data" && typeof item === "string" && isBlobRef(item) && key !== TEXT_CONTENT_KEY) {
+			(value as Record<string, unknown>)[childKey] = residentBlobSentinel("imageUrl", item);
+			continue;
+		}
+		residentizePersistedBlobRefs(item, childKey);
+	}
 }
 
 /**
@@ -1035,28 +1032,13 @@ async function runWithConcurrency(tasks: Array<() => Promise<void>>, limit: numb
 	await Promise.all(Array.from({ length: workerCount }, () => worker()));
 }
 
-async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): Promise<void> {
+async function resolveBlobRefsInEntries(entries: FileEntry[], _blobStore: BlobStore): Promise<void> {
 	const tasks: Array<() => Promise<void>> = [];
 
 	for (const entry of entries) {
 		if (entry.type === "session") continue;
-
-		let contentArray: unknown[] | undefined;
-		if (entry.type === "message" && "content" in entry.message && Array.isArray(entry.message.content)) {
-			contentArray = entry.message.content;
-		} else if (entry.type === "custom_message" && Array.isArray(entry.content)) {
-			contentArray = entry.content;
-		}
-
 		tasks.push(async () => {
-			if (contentArray) {
-				for (const block of contentArray) {
-					if (isImageBlock(block) && isBlobRef(block.data)) {
-						block.data = await resolveImageData(blobStore, block.data);
-					}
-				}
-			}
-			await resolvePersistedBlobRefs(entry, blobStore);
+			residentizePersistedBlobRefs(entry);
 		});
 	}
 
@@ -1312,6 +1294,33 @@ function containsResidentSentinel(value: unknown, seen = new WeakSet<object>()):
 		if (containsResidentSentinel(child, seen)) return true;
 	}
 	return false;
+}
+
+function containsResidentImageSentinel(value: unknown, seen = new WeakSet<object>()): boolean {
+	if (value === null || value === undefined || typeof value !== "object") return false;
+	if (isResidentBlobSentinel(value)) return value.kind === "imageUrl" || value.kind === "imageData";
+	if (seen.has(value)) return false;
+	seen.add(value);
+	if (Array.isArray(value)) return value.some(item => containsResidentImageSentinel(item, seen));
+	for (const child of Object.values(value)) {
+		if (containsResidentImageSentinel(child, seen)) return true;
+	}
+	return false;
+}
+
+function collectResidentImageRefs(value: unknown, refs: Set<string>, seen = new WeakSet<object>()): void {
+	if (value === null || value === undefined || typeof value !== "object") return;
+	if (isResidentBlobSentinel(value)) {
+		if (value.kind === "imageUrl" || value.kind === "imageData") refs.add(value.ref);
+		return;
+	}
+	if (seen.has(value)) return;
+	seen.add(value);
+	if (Array.isArray(value)) {
+		for (const item of value) collectResidentImageRefs(item, refs, seen);
+		return;
+	}
+	for (const child of Object.values(value)) collectResidentImageRefs(child, refs, seen);
 }
 
 /**
@@ -4148,6 +4157,22 @@ export class SessionManager {
 		return entry ? materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()) : undefined;
 	}
 
+	getResidentImageBytes(): number {
+		const refs = new Set<string>();
+		for (const entry of this.#fileEntries) collectResidentImageRefs(entry, refs);
+		let bytes = 0;
+		for (const ref of refs) {
+			const hash = parseBlobRef(ref);
+			if (!hash) continue;
+			try {
+				bytes += fs.statSync(path.join(this.#residentImageBlobStore.dir, hash)).size;
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+			}
+		}
+		return bytes;
+	}
+
 	/**
 	 * Get the most recent model role from the current session path.
 	 * Returns undefined if no model change has been recorded.
@@ -4571,11 +4596,14 @@ export class SessionManager {
 		}
 		this.#materializedEntriesCachePopulateCount++;
 		const resolvedTextBlobCache = new Map<string, string>();
-		const materializedEntries = this.#fileEntries
-			.filter((e): e is SessionEntry => e.type !== "session")
-			.map(entry => materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), resolvedTextBlobCache));
-		this.#materializedEntriesCache = materializedEntries;
-		this.#materializedEntriesRevision = this.#entryRevision;
+		const sourceEntries = this.#fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		const materializedEntries = sourceEntries.map(entry =>
+			materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), resolvedTextBlobCache),
+		);
+		if (!sourceEntries.some(entry => containsResidentImageSentinel(entry))) {
+			this.#materializedEntriesCache = materializedEntries;
+			this.#materializedEntriesRevision = this.#entryRevision;
+		}
 		return materializedEntries;
 	}
 

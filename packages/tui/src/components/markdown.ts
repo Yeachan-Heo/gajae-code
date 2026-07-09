@@ -55,6 +55,13 @@ export function __setMarkdownNowForTest(now: (() => number) | undefined): void {
 // prefix on every chunk. Bounded LRU; cleared on theme change via clearRenderCache().
 const HIGHLIGHT_CACHE_MAX = 512;
 const highlightCache = new LRUCache<string, string[]>({ max: HIGHLIGHT_CACHE_MAX });
+
+function renderedLinesBytes(lines: readonly string[]): number {
+	let bytes = 0;
+	for (const line of lines) bytes += Buffer.byteLength(line, "utf8");
+	return bytes;
+}
+
 // F18: cap synchronous (Rust FFI) syntax highlighting so a single huge fenced block
 // cannot stall the UI thread; oversized blocks render plain with a sanitized marker.
 const MAX_HIGHLIGHT_BYTES = 200_000;
@@ -94,6 +101,17 @@ export function clearRenderCache(): void {
 	renderCache.clear();
 	parseCache.clear();
 	highlightCache.clear();
+}
+
+export function getRenderCacheRetainedBytes(): number {
+	let bytes = 0;
+	for (const entry of renderCache.values()) {
+		bytes += Buffer.byteLength(entry.source, "utf8");
+		bytes += renderedLinesBytes(entry.lines);
+	}
+	for (const entry of parseCache.values()) bytes += Buffer.byteLength(entry.source, "utf8");
+	for (const lines of highlightCache.values()) bytes += renderedLinesBytes(lines);
+	return bytes;
 }
 
 // Stable numeric IDs for structural theme/style objects (no ID field on type).

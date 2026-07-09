@@ -291,7 +291,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 
 		const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
 		expect(searchTool?.description).toContain("total_tools");
-		expect(searchTool?.description).toContain("- `server_name`");
+		expect(searchTool?.description).toContain("server name");
 	});
 
 	it(

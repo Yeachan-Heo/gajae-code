@@ -12,22 +12,15 @@ import {
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
-import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
-import { isKimiModel, streamKimi } from "./providers/kimi";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
-import { streamPiNative } from "./providers/pi-native-client";
 // Heavy provider stream functions are imported lazily via register-builtins,
-// which wraps each provider module in a dynamic import. This keeps the
-// AWS SDK, google-auth-library, @google/genai, @bufbuild/protobuf, and
-// other provider SDKs out of the CLI startup parse graph. The
-// gitlab-duo / kimi / synthetic providers stay eager because their modules
-// export routing predicates (isGitLabDuoModel, isKimiModel, isSyntheticModel)
-// that must be callable synchronously before streaming begins, and their
-// modules are thin wrappers with no heavy SDK dependencies.
+// which wraps each provider module in a dynamic import. Thin provider routing
+// modules are also loaded lazily below by returning an outer stream and piping
+// the dynamically imported inner stream into it.
 import {
 	streamAnthropic,
 	streamAzureOpenAIResponses,
@@ -41,7 +34,6 @@ import {
 	streamOpenAICompletions,
 	streamOpenAIResponses,
 } from "./providers/register-builtins";
-import { isSyntheticModel, streamSynthetic } from "./providers/synthetic";
 import type {
 	Api,
 	AssistantMessage,
@@ -240,6 +232,45 @@ export function formatProviderCredentialHint(provider: string): string {
 	}
 	return parts.join(" ");
 }
+function pipeAssistantStream(
+	outer: AssistantMessageEventStream,
+	inner: AssistantMessageEventStream,
+	signal?: AbortSignal,
+): void {
+	void (async () => {
+		try {
+			for await (const event of inner) {
+				outer.push(event);
+				// The inner provider stream owns abort semantics (it receives the
+				// same signal), but stop forwarding as soon as the consumer
+				// aborted so a misbehaving inner stream cannot keep the pipe
+				// buffering events indefinitely.
+				if (signal?.aborted && !outer.done) {
+					outer.end(await inner.result());
+					return;
+				}
+			}
+			if (!outer.done) outer.end(await inner.result());
+		} catch (error) {
+			outer.fail(error);
+		}
+	})();
+}
+
+function streamFromLazyImport(
+	createInner: () => Promise<AssistantMessageEventStream>,
+	signal?: AbortSignal,
+): AssistantMessageEventStream {
+	const outer = new AssistantMessageEventStream();
+	void (async () => {
+		try {
+			pipeAssistantStream(outer, await createInner(), signal);
+		} catch (error) {
+			outer.fail(error);
+		}
+	})();
+	return outer;
+}
 
 /**
  * Build an actionable "missing API key" error for a provider, used by the
@@ -262,15 +293,21 @@ export function stream<TApi extends Api>(
 		return customApiProvider.stream(model, context, options as StreamOptions);
 	}
 
-	if (isGitLabDuoModel(model)) {
+	if (model.provider === "gitlab-duo") {
 		const apiKey = (options as StreamOptions | undefined)?.apiKey || getEnvApiKey(model.provider);
 		if (!apiKey) {
 			throw new Error(formatMissingApiKeyError(model.provider));
 		}
-		return streamGitLabDuo(model, context, {
-			...(options as SimpleStreamOptions | undefined),
-			apiKey,
-		});
+		return streamFromLazyImport(
+			async () => {
+				const { streamGitLabDuo } = await import("./providers/gitlab-duo");
+				return streamGitLabDuo(model, context, {
+					...(options as SimpleStreamOptions | undefined),
+					apiKey,
+				});
+			},
+			(options as StreamOptions | undefined)?.signal,
+		);
 	}
 
 	// Vertex AI uses Application Default Credentials, not API keys
@@ -446,7 +483,10 @@ export function streamSimple<TApi extends Api>(
 	// extension-registered APIs can't accidentally override a configured
 	// pi-native transport.
 	if (model.transport === "pi-native") {
-		return streamPiNative(model, context, options);
+		return streamFromLazyImport(async () => {
+			const { streamPiNative } = await import("./providers/pi-native-client");
+			return streamPiNative(model, context, options);
+		}, options?.signal);
 	}
 
 	// Check custom API registry (extension-provided APIs)
@@ -471,31 +511,40 @@ export function streamSimple<TApi extends Api>(
 	}
 
 	// GitLab Duo - wraps Anthropic/OpenAI behind GitLab AI Gateway direct access tokens
-	if (isGitLabDuoModel(model)) {
-		return streamGitLabDuo(model, context, {
-			...options,
-			apiKey,
-		});
+	if (model.provider === "gitlab-duo") {
+		return streamFromLazyImport(async () => {
+			const { streamGitLabDuo } = await import("./providers/gitlab-duo");
+			return streamGitLabDuo(model, context, {
+				...options,
+				apiKey,
+			});
+		}, options?.signal);
 	}
 
 	// Kimi Code - route to dedicated handler that wraps OpenAI or Anthropic API
-	if (isKimiModel(model)) {
-		// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
-		return streamKimi(model as Model<"openai-completions">, context, {
-			...options,
-			apiKey,
-			format: options?.kimiApiFormat ?? "anthropic",
-		});
+	if (model.provider === "kimi-code") {
+		return streamFromLazyImport(async () => {
+			const { streamKimi } = await import("./providers/kimi");
+			// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
+			return streamKimi(model as Model<"openai-completions">, context, {
+				...options,
+				apiKey,
+				format: options?.kimiApiFormat ?? "anthropic",
+			});
+		}, options?.signal);
 	}
 
 	// Synthetic - route to dedicated handler that wraps OpenAI or Anthropic API
-	if (isSyntheticModel(model)) {
-		// Pass raw SimpleStreamOptions - streamSynthetic handles mapping internally
-		return streamSynthetic(model as Model<"openai-completions">, context, {
-			...options,
-			apiKey,
-			format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
-		});
+	if (model.provider === "synthetic") {
+		return streamFromLazyImport(async () => {
+			const { streamSynthetic } = await import("./providers/synthetic");
+			// Pass raw SimpleStreamOptions - streamSynthetic handles mapping internally
+			return streamSynthetic(model as Model<"openai-completions">, context, {
+				...options,
+				apiKey,
+				format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
+			});
+		}, options?.signal);
 	}
 
 	const providerOptions = mapOptionsForApi(model, options, apiKey);

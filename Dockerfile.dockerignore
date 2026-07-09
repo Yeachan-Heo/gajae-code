@@ -8,6 +8,10 @@ target/
 **/node_modules
 dist/
 runs/
+assets/
+issues/
+.plans/
+geobench/
 
 # Per-host scratch the pi codebase uses for parallel agents / worktrees.
 .fallow/

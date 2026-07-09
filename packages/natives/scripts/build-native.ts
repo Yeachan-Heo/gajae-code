@@ -146,9 +146,33 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 	}
 }
 
+type NativeBuildProfile = "local" | "ci" | "dist";
+
+export function resolveNativeBuildProfile(options: {
+	isCI: boolean;
+	isCrossCompile: boolean;
+	explicitProfile?: string;
+}): NativeBuildProfile {
+	if (options.explicitProfile !== undefined && options.explicitProfile !== "") {
+		if (
+			options.explicitProfile === "local" ||
+			options.explicitProfile === "ci" ||
+			options.explicitProfile === "dist"
+		) {
+			return options.explicitProfile;
+		}
+		throw new Error(`Unsupported PI_NATIVE_PROFILE: ${options.explicitProfile}. Expected "local", "ci", or "dist".`);
+	}
+
+	return !options.isCI && !options.isCrossCompile ? "local" : "ci";
+}
+
 const isCI = Boolean(Bun.env.CI);
-const useLocalProfile = !isCI && !isCrossCompile;
-const profileLabel = useLocalProfile ? "local" : "ci";
+const profileLabel = resolveNativeBuildProfile({
+	isCI,
+	isCrossCompile,
+	explicitProfile: Bun.env.PI_NATIVE_PROFILE,
+});
 const profileSuffix = ` (${profileLabel})`;
 
 const buildOutputDirPrefix = resolveBuildOutputDirPrefix(profileLabel);
@@ -210,7 +234,7 @@ try {
 
 	await Bun.write(
 		`${canonicalAddonPath}.build.json`,
-		`${JSON.stringify({ languageSet, builtAt: new Date().toISOString() }, null, 2)}\n`,
+		`${JSON.stringify({ languageSet, profile: profileLabel, builtAt: new Date().toISOString() }, null, 2)}\n`,
 	);
 
 	await generateEnumExports();

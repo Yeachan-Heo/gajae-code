@@ -85,7 +85,6 @@ function isVolatileProjectContextMessage(message: AgentMessage): boolean {
 	const text = getMessageText(message);
 	return text.startsWith("<system-reminder>\n<workspace-tree>") && text.includes("current working directory");
 }
-
 describe("AgentSession eager todo enforcement", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;

@@ -65,6 +65,7 @@ export const matchesLegacySequence = nativeBindings.matchesLegacySequence;
 export const nativeBuildInfo = nativeBindings.nativeBuildInfo;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
+export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard;
 export const search = nativeBindings.search;
 export const sliceWithWidth = nativeBindings.sliceWithWidth;

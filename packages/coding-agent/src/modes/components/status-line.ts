@@ -29,7 +29,7 @@ import { calculateTokensPerSecond } from "./status-line/token-rate";
 import type { SeparatorDef } from "./status-line/types";
 
 export interface StatusLineSegmentOptions {
-	model?: { showThinkingLevel?: boolean };
+	model?: { showThinkingLevel?: boolean; showContextPercent?: boolean };
 	path?: { abbreviate?: boolean; maxLength?: number; stripWorkPrefix?: boolean };
 	git?: { showBranch?: boolean; showStaged?: boolean; showUnstaged?: boolean; showUntracked?: boolean };
 	time?: { format?: "12h" | "24h"; showSeconds?: boolean };
@@ -700,6 +700,11 @@ export class StatusLineComponent implements Component {
 		const contextTokens = breakdown.usedTokens;
 		const contextWindow = breakdown.contextWindow || state.model?.contextWindow || 0;
 		const contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+		// Suppress the inline model percentage when a standalone context_pct
+		// segment is also rendered, so the value is not shown twice.
+		const contextPctSegmentActive =
+			effectiveSettings.leftSegments.includes("context_pct") ||
+			effectiveSettings.rightSegments.includes("context_pct");
 
 		return {
 			session: this.session,
@@ -710,6 +715,7 @@ export class StatusLineComponent implements Component {
 			usageStats,
 			contextPercent,
 			contextWindow,
+			contextPctSegmentActive,
 			autoCompactEnabled: this.#autoCompactEnabled,
 			subagentCount: this.#subagentCount,
 			jobs: this.#jobs,

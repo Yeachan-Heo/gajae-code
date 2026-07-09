@@ -84,7 +84,11 @@
 		"examples",
 		"README.md",
 		"CHANGELOG.md",
-		"vendor"
+		"vendor",
+		"!vendor/insane-search/engine/tests/**",
+		"!src/export/html/template.html",
+		"!src/export/html/template.css",
+		"!src/export/html/template.js"
 	],
 	"exports": {
 		"./cli": {

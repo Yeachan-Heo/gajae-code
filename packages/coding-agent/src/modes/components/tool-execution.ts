@@ -678,7 +678,7 @@ export class ToolExecutionComponent extends Container {
 						imageData,
 						imageMimeType,
 						{ fallbackColor: (s: string) => theme.fg("toolOutput", s) },
-						resolveImageOptions(),
+						{ ...resolveImageOptions(), refetch: () => imageData },
 					);
 					this.#imageComponents.push(imageComponent);
 					this.addChild(imageComponent);

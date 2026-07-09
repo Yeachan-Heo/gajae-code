@@ -5,7 +5,6 @@ import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { htmlToMarkdown } from "@gajae-code/natives";
 import { type Component, Text } from "@gajae-code/tui";
 import { $which, ptree, truncate } from "@gajae-code/utils";
-import { parseHTML } from "linkedom";
 import type { Settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
@@ -15,6 +14,7 @@ import { DEFAULT_MAX_BYTES, truncateHead } from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
+import { parseHtmlLazy } from "../utils/linkedom";
 import { ensureTool } from "../utils/tools-manager";
 import { INSANE_NOTES, tryInsaneFetch } from "../web/insane/bridge";
 import { validatePublicHttpUrl, validatePublicHttpUrlForInsane } from "../web/insane/url-guard";
@@ -483,9 +483,9 @@ function cleanFeedText(text: string): string {
 /**
  * Parse RSS/Atom feed to markdown
  */
-function parseFeedToMarkdown(content: string, maxItems = 10): string {
+async function parseFeedToMarkdown(content: string, maxItems = 10): Promise<string> {
 	try {
-		const doc = parseHTML(content).document;
+		const doc = (await parseHtmlLazy(content)).document;
 
 		// Try RSS
 		const channel = doc.querySelector("channel");
@@ -1026,7 +1026,7 @@ async function renderUrl(
 	}
 
 	if (isFeed || (isXml && (rawContent.includes("<rss") || rawContent.includes("<feed")))) {
-		const parsed = parseFeedToMarkdown(rawContent);
+		const parsed = await parseFeedToMarkdown(rawContent);
 		const output = finalizeOutput(parsed);
 		return {
 			url,
@@ -1119,7 +1119,7 @@ async function renderUrl(
 			const altResult = await loadPage(resolved, { timeout, signal });
 			if (altResult.ok && altResult.content.trim().length > 200) {
 				notes.push(`Used feed alternate: ${resolved}`);
-				const parsed = parseFeedToMarkdown(altResult.content);
+				const parsed = await parseFeedToMarkdown(altResult.content);
 				const output = finalizeOutput(parsed);
 				return {
 					url,

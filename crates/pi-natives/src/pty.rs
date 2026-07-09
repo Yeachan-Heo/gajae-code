@@ -5,12 +5,16 @@
 //! passthrough while a command is running.
 
 #[cfg(windows)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::{
 	collections::HashMap,
 	io::{Read, Write},
 	str,
-	sync::{Arc, Mutex, mpsc},
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicU64, Ordering},
+		mpsc,
+	},
 	time::{Duration, Instant},
 };
 
@@ -87,6 +91,17 @@ const FINAL_READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 const READER_EVENT_QUEUE_CAPACITY: usize = 1024;
 const READER_LOSS_MARKER_PREFIX: &str = "\n[PTY output truncated: ";
 const TERMINATED_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+static OPENPTY_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[napi]
+pub fn pty_timeout_count() -> u64 {
+	OPENPTY_TIMEOUT_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(any(windows, test))]
+fn record_openpty_timeout() {
+	OPENPTY_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 #[cfg(windows)]
 static WINDOWS_OPENPTY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -491,6 +506,7 @@ fn run_pty_sync(
 					return Err(Error::from_reason(format!("Failed to open PTY: {e}")));
 				},
 				Err(_) => {
+					record_openpty_timeout();
 					// The worker may be permanently stuck inside ConPTY. Keep the
 					// single-flight gate held after timeout so residual leakage is capped
 					// to one outstanding openpty thread for the process lifetime.
@@ -941,6 +957,17 @@ mod tests {
 				.map_err(|err| Error::from_reason(format!("Failed to write child pid: {err}")))?;
 		}
 		Err(Error::from_reason("simulated post-spawn setup failure"))
+	}
+
+	#[test]
+	fn pty_timeout_counter_increments() {
+		let _guard = PTY_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+		// Delta assertion: the counter is process-global, so other tests (or
+		// real Windows openpty timeouts under plain `cargo test`) may have
+		// already incremented it.
+		let before = pty_timeout_count();
+		record_openpty_timeout();
+		assert_eq!(pty_timeout_count(), before + 1);
 	}
 
 	#[test]

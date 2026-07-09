@@ -8,8 +8,16 @@
  * - gjc://<file>.md - Reads a specific documentation file
  */
 import * as path from "node:path";
-import { EMBEDDED_DOC_FILENAMES, EMBEDDED_DOCS } from "./docs-index.generated";
 import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+
+type DocsIndex = typeof import("./docs-index.generated");
+
+let docsIndexPromise: Promise<DocsIndex> | undefined;
+
+function loadDocsIndex(): Promise<DocsIndex> {
+	docsIndexPromise ??= import("./docs-index.generated");
+	return docsIndexPromise;
+}
 
 /**
  * Handler for gjc:// URLs.
@@ -34,6 +42,7 @@ export class GjcProtocolHandler implements ProtocolHandler {
 	}
 
 	async #listDocs(url: InternalUrl): Promise<InternalResource> {
+		const { EMBEDDED_DOC_FILENAMES } = await loadDocsIndex();
 		if (EMBEDDED_DOC_FILENAMES.length === 0) {
 			throw new Error("No documentation files found");
 		}
@@ -60,6 +69,7 @@ export class GjcProtocolHandler implements ProtocolHandler {
 			throw new Error("Path traversal (..) is not allowed in gjc:// URLs");
 		}
 
+		const { EMBEDDED_DOC_FILENAMES, EMBEDDED_DOCS } = await loadDocsIndex();
 		const content = EMBEDDED_DOCS[normalized];
 		if (content === undefined) {
 			const lookup = normalized.replace(/\.md$/, "");

@@ -388,8 +388,8 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(rebuildCount).toBe(baseline + 1);
 	});
 	it("does not rebuild when only the calendar date rolls over between tool-stable MCP refreshes", async () => {
-		// Current date is volatile per-turn context, outside the provider
-		// stable-prefix tool signature, so this still skips.
+		// Date/cwd/workspace-tree are volatile per-turn context, not stable system
+		// prompt inputs. A midnight rollover must not perturb the MCP tool signature.
 		setSystemTime(new Date("2025-01-01T23:59:58Z"));
 		try {
 			let rebuildCount = 0;
@@ -412,6 +412,10 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 			// Same tools, new calendar day: skip because volatile date/cwd/tree
 			// context is intentionally excluded from the stable tool signature.
+			await session.refreshMCPTools([tool]);
+			expect(rebuildCount).toBe(1);
+
+			// Same tools, same new day: skip again.
 			await session.refreshMCPTools([tool]);
 			expect(rebuildCount).toBe(1);
 		} finally {

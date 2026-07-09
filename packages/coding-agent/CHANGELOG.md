@@ -1,6 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added `gjc --credential <selector>` for pinning a stored provider credential by `email:`, `id:`, `account:`, `project:`, or `provider/email:` during a session.
+
+### Changed
+
+- The status line (information bar) token-percentage now renders inline within the model segment, right after the reasoning-effort indicator, instead of as a trailing segment at the far end of the line, so the context usage percentage stays grouped with the model it describes. The standalone `context_pct` segment was removed from the `default`, `default-usage`, `compact`, `full`, `nerd`, `ascii`, and `custom` presets (it remains available for `minimal` and custom configs); the inline percentage is color-coded by context-usage level, can be disabled per-preset with `segmentOptions.model.showContextPercent: false`, and is auto-suppressed when a standalone `context_pct` segment is also active so the value is never shown twice.
+
 ### Fixed
 
 - Finalized notification turn mirrors now default to the bounded full-turn cap so Telegram's existing chunked delivery can send long assistant answers instead of receiving an already-truncated 3500-character summary; `GJC_NOTIFICATIONS_TURN_MAX` remains available to lower the cap for summary-style mirrors, and live previews stay capped as one editable message.

@@ -26,7 +26,7 @@ html-to-markdown-rs.workspace = true
 icy_sixel.workspace = true
 ignore.workspace = true
 image.workspace = true
-inferno.workspace = true
+inferno = { workspace = true, optional = true }
 gjc-notifications = { path = "../gjc-notifications" }
 memmap2.workspace = true
 napi.workspace = true
@@ -65,3 +65,4 @@ serde_json.workspace = true
 [features]
 default = []
 full-langs = ["pi-ast/full-langs"]
+prof-flamegraph = ["dep:inferno"]

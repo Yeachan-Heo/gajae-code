@@ -1,4 +1,4 @@
-import { parseHTML } from "linkedom";
+import { parseHtmlLazy } from "../../utils/linkedom";
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, loadPage } from "./types";
 import { convertWithMarkit, fetchBinary } from "./utils";
@@ -30,7 +30,7 @@ export const handleIacr: SpecialHandler = async (
 
 		if (!result.ok) return null;
 
-		const doc = parseHTML(result.content).document;
+		const doc = (await parseHtmlLazy(result.content)).document;
 
 		// Extract metadata from the page
 		const title =

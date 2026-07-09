@@ -155,6 +155,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			modelRegistry,
 			extensionRunner,
 		});
+		session.setResourceSampler(() => ({ heapUsedBytes: 0, providerBytes: 0, messageCount: 0, imageBytes: 0 }));
 	});
 
 	afterEach(async () => {
@@ -168,6 +169,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 	it("resumes after threshold compaction when only agent-level queued messages exist", async () => {
 		vi.useRealTimers();
+
 		session.agent.followUp({
 			role: "custom",
 			customType: "test",

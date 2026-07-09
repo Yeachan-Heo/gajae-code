@@ -196,7 +196,8 @@ fn generate_summary(samples: &[ProfileSample], window_ms: f64) -> String {
 	lines.join("\n")
 }
 
-fn generate_svg(folded: &str) -> Option<String> {
+#[cfg(feature = "prof-flamegraph")]
+fn generate_svg(folded: &str) -> Result<Option<String>, &'static str> {
 	use inferno::flamegraph::{self, Options};
 
 	let mut options = Options::default();
@@ -208,9 +209,14 @@ fn generate_svg(folded: &str) -> Option<String> {
 	let reader = std::io::Cursor::new(folded.as_bytes());
 
 	match flamegraph::from_reader(&mut options, reader, &mut svg_output) {
-		Ok(()) => String::from_utf8(svg_output).ok(),
-		Err(_) => None,
+		Ok(()) => Ok(String::from_utf8(svg_output).ok()),
+		Err(_) => Ok(None),
 	}
+}
+
+#[cfg(not(feature = "prof-flamegraph"))]
+const fn generate_svg(_folded: &str) -> Result<Option<String>, &'static str> {
+	Err("flamegraph SVG generation unavailable; rebuild with prof-flamegraph")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,11 +236,18 @@ pub fn get_work_profile(last_seconds: f64) -> WorkProfile {
 	let samples = PROFILE_BUFFER.lock().get_since(cutoff_us);
 
 	let folded = generate_folded(&samples);
-	let summary = generate_summary(&samples, last_seconds * 1000.0);
+	let mut summary = generate_summary(&samples, last_seconds * 1000.0);
 	let svg = if folded.is_empty() {
 		None
 	} else {
-		generate_svg(&folded)
+		match generate_svg(&folded) {
+			Ok(svg) => svg,
+			Err(message) => {
+				summary.push_str("\n\n");
+				summary.push_str(message);
+				None
+			},
+		}
 	};
 
 	let total_ms = samples.iter().map(|s| (s.duration_us as f64) * 0.001).sum();

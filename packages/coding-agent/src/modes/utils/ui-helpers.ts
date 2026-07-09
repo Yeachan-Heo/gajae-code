@@ -64,6 +64,127 @@ type QueuedMessages = {
 	followUp: string[];
 };
 
+const CHAT_CHILD_CAP = 400;
+const CHAT_COLLAPSE_BATCH_SIZE = 300;
+
+const chatChildAddedAt = new WeakMap<Component, number>();
+
+export class CollapsedChatHistoryComponent implements Component {
+	readonly isCollapsedChatHistory = true;
+	count: number;
+	startTime: number;
+	endTime: number;
+
+	constructor(count: number, startTime: number, endTime: number) {
+		this.count = count;
+		this.startTime = startTime;
+		this.endTime = endTime;
+	}
+
+	merge(count: number, startTime: number, endTime: number): void {
+		this.count += count;
+		this.startTime = Math.min(this.startTime, startTime);
+		this.endTime = Math.max(this.endTime, endTime);
+	}
+
+	render(_width: number): string[] {
+		const label = `[${this.count} earlier messages collapsed — ${formatChatCollapseTime(this.startTime)} to ${formatChatCollapseTime(this.endTime)}]`;
+		return [theme.fg("dim", label)];
+	}
+
+	invalidate(): void {}
+}
+
+function formatChatCollapseTime(timestamp: number): string {
+	return new Date(timestamp).toLocaleTimeString(undefined, {
+		hour: "2-digit",
+		minute: "2-digit",
+		hour12: false,
+	});
+}
+
+function isCollapsedChatHistory(component: Component): component is CollapsedChatHistoryComponent {
+	return component instanceof CollapsedChatHistoryComponent;
+}
+
+function isActiveChatChild(ctx: InteractiveModeContext, component: Component): boolean {
+	if ([...ctx.pendingTools.values()].includes(component as never)) return true;
+	if (ctx.pendingBashComponents.includes(component as never)) return true;
+	if (ctx.pendingPythonComponents.includes(component as never)) return true;
+	return component === ctx.bashComponent || component === ctx.pythonComponent || component === ctx.streamingComponent;
+}
+
+function getChatChildTime(component: Component): number {
+	return chatChildAddedAt.get(component) ?? Date.now();
+}
+
+export function addChatChild(ctx: InteractiveModeContext, component: Component): void {
+	ctx.chatContainer.addChild(component);
+	chatChildAddedAt.set(component, Date.now());
+	trimChatChildren(ctx);
+}
+
+export function trimChatChildren(ctx: InteractiveModeContext): void {
+	const children = ctx.chatContainer.children;
+
+	// Collapse the oldest completed children into history placeholders until the cap is
+	// satisfied or no further reduction is structurally possible. Active (pending/running)
+	// children and existing placeholders are never collapsed, so a conversation whose
+	// top-level children are dominated by active components may legitimately exceed the cap.
+	let scanFrom = 0;
+	while (children.length > CHAT_CHILD_CAP) {
+		// Advance to the oldest collapsible completed child, skipping active children and
+		// existing placeholders so the cap is enforced even when the oldest child is active.
+		while (
+			scanFrom < children.length &&
+			(isActiveChatChild(ctx, children[scanFrom]) || isCollapsedChatHistory(children[scanFrom]))
+		) {
+			scanFrom++;
+		}
+		if (scanFrom >= children.length) return; // only active/placeholder children remain
+
+		// Extend over the oldest contiguous run of completed children (up to the batch size).
+		let collapseEndExclusive = scanFrom;
+		const maxEnd = Math.min(children.length, scanFrom + CHAT_COLLAPSE_BATCH_SIZE);
+		while (
+			collapseEndExclusive < maxEnd &&
+			!isActiveChatChild(ctx, children[collapseEndExclusive]) &&
+			!isCollapsedChatHistory(children[collapseEndExclusive])
+		) {
+			collapseEndExclusive++;
+		}
+		const collapseCount = collapseEndExclusive - scanFrom;
+
+		const prev = scanFrom > 0 ? children[scanFrom - 1] : undefined;
+		const mergeTarget = prev && isCollapsedChatHistory(prev) ? prev : undefined;
+		// A lone completed child with no adjacent placeholder to merge into cannot reduce
+		// the child count (collapsing it yields a 1-count placeholder). Skip past it.
+		if (!mergeTarget && collapseCount <= 1) {
+			scanFrom += Math.max(collapseCount, 1);
+			continue;
+		}
+
+		const collapsed = children.slice(scanFrom, collapseEndExclusive);
+		const startTime = getChatChildTime(collapsed[0]);
+		const endTime = getChatChildTime(collapsed[collapsed.length - 1]);
+		for (const child of collapsed) {
+			child.dispose?.();
+		}
+
+		if (mergeTarget) {
+			mergeTarget.merge(collapseCount, startTime, endTime);
+			children.splice(scanFrom, collapseCount);
+			chatChildAddedAt.set(mergeTarget, mergeTarget.startTime);
+			// scanFrom stays; whatever follows the merged run is next.
+		} else {
+			const placeholder = new CollapsedChatHistoryComponent(collapseCount, startTime, endTime);
+			children.splice(scanFrom, collapseCount, placeholder);
+			chatChildAddedAt.set(placeholder, startTime);
+			scanFrom++; // step past the freshly created placeholder
+		}
+	}
+}
+
 export class UiHelpers {
 	constructor(private ctx: InteractiveModeContext) {}
 
@@ -101,8 +222,8 @@ export class UiHelpers {
 
 		const spacer = new Spacer(1);
 		const text = new Text(rendered, 1, 0);
-		this.ctx.chatContainer.addChild(spacer);
-		this.ctx.chatContainer.addChild(text);
+		addChatChild(this.ctx, spacer);
+		addChatChild(this.ctx, text);
 		this.ctx.lastStatusSpacer = spacer;
 		this.ctx.lastStatusText = text;
 		this.ctx.ui.requestRender();
@@ -118,7 +239,7 @@ export class UiHelpers {
 				component.setComplete(message.exitCode, message.cancelled, {
 					truncation: message.meta?.truncation,
 				});
-				this.ctx.chatContainer.addChild(component);
+				addChatChild(this.ctx, component);
 				break;
 			}
 			case "pythonExecution": {
@@ -129,7 +250,7 @@ export class UiHelpers {
 				component.setComplete(message.exitCode, message.cancelled, {
 					truncation: message.meta?.truncation,
 				});
-				this.ctx.chatContainer.addChild(component);
+				addChatChild(this.ctx, component);
 				break;
 			}
 			case "hookMessage":
@@ -173,14 +294,14 @@ export class UiHelpers {
 							]
 								.filter(Boolean)
 								.join(" ");
-							this.ctx.chatContainer.addChild(new Text(line, 1, 0));
+							addChatChild(this.ctx, new Text(line, 1, 0));
 						}
 						break;
 					}
 					if (message.customType === SKILL_PROMPT_MESSAGE_TYPE) {
 						const component = new SkillMessageComponent(message as CustomMessage<SkillPromptDetails>);
 						component.setExpanded(this.ctx.toolOutputExpanded);
-						this.ctx.chatContainer.addChild(component);
+						addChatChild(this.ctx, component);
 						break;
 					}
 					if (
@@ -217,12 +338,12 @@ export class UiHelpers {
 						const components: Component[] = [];
 						const header = `${theme.fg("accent", `[IRC] ${arrow}`)}`;
 						const headerComponent = new Text(header, 1, 0);
-						this.ctx.chatContainer.addChild(headerComponent);
+						addChatChild(this.ctx, headerComponent);
 						components.push(headerComponent);
 						if (body) {
 							for (const line of body.split("\n")) {
 								const lineComponent = new Text(theme.fg("muted", `  ${line}`), 0, 0);
-								this.ctx.chatContainer.addChild(lineComponent);
+								addChatChild(this.ctx, lineComponent);
 								components.push(lineComponent);
 							}
 						}
@@ -240,12 +361,12 @@ export class UiHelpers {
 						const components: Component[] = [];
 						const header = `${theme.fg("accent", `[Steer ${details?.state ?? "queued"}] ${details?.from ?? "?"} ⇨ ${details?.to ?? "?"}`)}`;
 						const headerComponent = new Text(header, 1, 0);
-						this.ctx.chatContainer.addChild(headerComponent);
+						addChatChild(this.ctx, headerComponent);
 						components.push(headerComponent);
 						if (details?.body) {
 							for (const line of details.body.split("\n")) {
 								const lineComponent = new Text(theme.fg("muted", `  ${line}`), 0, 0);
-								this.ctx.chatContainer.addChild(lineComponent);
+								addChatChild(this.ctx, lineComponent);
 								components.push(lineComponent);
 							}
 						}
@@ -255,22 +376,22 @@ export class UiHelpers {
 					// Both HookMessage and CustomMessage have the same structure, cast for compatibility
 					const component = new CustomMessageComponent(message as CustomMessage<unknown>, renderer);
 					component.setExpanded(this.ctx.toolOutputExpanded);
-					this.ctx.chatContainer.addChild(component);
+					addChatChild(this.ctx, component);
 				}
 				break;
 			}
 			case "compactionSummary": {
-				this.ctx.chatContainer.addChild(new Spacer(1));
+				addChatChild(this.ctx, new Spacer(1));
 				const component = new CompactionSummaryMessageComponent(message);
 				component.setExpanded(this.ctx.toolOutputExpanded);
-				this.ctx.chatContainer.addChild(component);
+				addChatChild(this.ctx, component);
 				break;
 			}
 			case "branchSummary": {
-				this.ctx.chatContainer.addChild(new Spacer(1));
+				addChatChild(this.ctx, new Spacer(1));
 				const component = new BranchSummaryMessageComponent(message);
 				component.setExpanded(this.ctx.toolOutputExpanded);
-				this.ctx.chatContainer.addChild(component);
+				addChatChild(this.ctx, component);
 				break;
 			}
 			case "fileMention": {
@@ -291,7 +412,7 @@ export class UiHelpers {
 						"accent",
 						file.path,
 					)} ${theme.fg("dim", suffix)}`;
-					this.ctx.chatContainer.addChild(new Text(text, 0, 0));
+					addChatChild(this.ctx, new Text(text, 0, 0));
 				}
 				break;
 			}
@@ -301,7 +422,7 @@ export class UiHelpers {
 				if (textContent) {
 					const isSynthetic = message.role === "developer" ? true : (message.synthetic ?? false);
 					const userComponent = new UserMessageComponent(textContent, isSynthetic);
-					this.ctx.chatContainer.addChild(userComponent);
+					addChatChild(this.ctx, userComponent);
 					if (options?.populateHistory && message.role === "user" && !isSynthetic) {
 						this.ctx.editor.addToHistory(textContent);
 					}
@@ -312,7 +433,7 @@ export class UiHelpers {
 				const assistantComponent = new AssistantMessageComponent(message, this.ctx.hideThinkingBlock, () =>
 					this.ctx.ui.requestRender(),
 				);
-				this.ctx.chatContainer.addChild(assistantComponent);
+				addChatChild(this.ctx, assistantComponent);
 				break;
 			}
 			case "toolResult": {
@@ -392,7 +513,7 @@ export class UiHelpers {
 									showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
-								this.ctx.chatContainer.addChild(readGroup);
+								addChatChild(this.ctx, readGroup);
 							}
 							readGroup.updateArgs(content.arguments, content.id);
 							readGroup.updateResult(
@@ -434,7 +555,7 @@ export class UiHelpers {
 						content.id,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
-					this.ctx.chatContainer.addChild(component);
+					addChatChild(this.ctx, component);
 
 					if (hasErrorStop && errorMessage) {
 						component.updateResult(
@@ -472,7 +593,7 @@ export class UiHelpers {
 								showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
 							});
 							readGroup.setExpanded(this.ctx.toolOutputExpanded);
-							this.ctx.chatContainer.addChild(readGroup);
+							addChatChild(this.ctx, readGroup);
 						}
 						const args = readToolCallArgs.get(message.toolCallId);
 						if (args) {
@@ -539,7 +660,7 @@ export class UiHelpers {
 		}
 		if (preservedChatChildren && preservedChatChildren.length > 0) {
 			for (const child of preservedChatChildren) {
-				this.ctx.chatContainer.addChild(child);
+				addChatChild(this.ctx, child);
 			}
 			this.ctx.ui.requestRender();
 		}
@@ -559,8 +680,8 @@ export class UiHelpers {
 			process.stderr.write(`Error: ${errorMessage}\n`);
 			return;
 		}
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
+		addChatChild(this.ctx, new Spacer(1));
+		addChatChild(this.ctx, new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
 		this.ctx.ui.requestRender();
 	}
 
@@ -569,15 +690,16 @@ export class UiHelpers {
 			process.stderr.write(`Warning: ${warningMessage}\n`);
 			return;
 		}
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
+		addChatChild(this.ctx, new Spacer(1));
+		addChatChild(this.ctx, new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
 		this.ctx.ui.requestRender();
 	}
 
 	showNewVersionNotification(newVersion: string): void {
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(new DynamicBorder(text => theme.fg("warning", text)));
-		this.ctx.chatContainer.addChild(
+		addChatChild(this.ctx, new Spacer(1));
+		addChatChild(this.ctx, new DynamicBorder(text => theme.fg("warning", text)));
+		addChatChild(
+			this.ctx,
 			new Text(
 				theme.bold(theme.fg("warning", "Update Available")) +
 					"\n" +
@@ -587,7 +709,7 @@ export class UiHelpers {
 				0,
 			),
 		);
-		this.ctx.chatContainer.addChild(new DynamicBorder(text => theme.fg("warning", text)));
+		addChatChild(this.ctx, new DynamicBorder(text => theme.fg("warning", text)));
 		this.ctx.ui.requestRender();
 	}
 
@@ -853,12 +975,12 @@ export class UiHelpers {
 		// removeChild() would tear them down before re-adding.
 		for (const component of this.ctx.pendingBashComponents) {
 			this.ctx.pendingMessagesContainer.detachChild(component);
-			this.ctx.chatContainer.addChild(component);
+			addChatChild(this.ctx, component);
 		}
 		this.ctx.pendingBashComponents = [];
 		for (const component of this.ctx.pendingPythonComponents) {
 			this.ctx.pendingMessagesContainer.detachChild(component);
-			this.ctx.chatContainer.addChild(component);
+			addChatChild(this.ctx, component);
 		}
 		this.ctx.pendingPythonComponents = [];
 	}

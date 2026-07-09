@@ -41,6 +41,12 @@ export interface SegmentContext {
 	};
 	contextPercent: number;
 	contextWindow: number;
+	/**
+	 * True when a standalone `context_pct` segment is also part of the active
+	 * layout. The model segment suppresses its inline percentage in that case to
+	 * avoid showing the same value twice.
+	 */
+	contextPctSegmentActive?: boolean;
 	autoCompactEnabled: boolean;
 	subagentCount: number;
 	jobs: JobsSnapshot;

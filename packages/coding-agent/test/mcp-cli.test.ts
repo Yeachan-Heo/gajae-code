@@ -60,18 +60,33 @@ describe("gjc mcp CLI helpers", () => {
 		});
 		expect(stdoutText(stdout)).toContain('"API_TOKEN": "<redacted>"');
 		expect(stdoutText(stdout)).not.toContain("super-secret");
+		expect(stdoutText(stdout)).toContain('"runtimeStatus": "storage-only"');
+		expect(stdoutText(stdout)).toContain('"runtimeLoadedByStandalone": false');
+		expect(stdoutText(stdout)).toContain(
+			'"runtimeNote": "Stored MCP registrations are not loaded by normal standalone gjc sessions today."',
+		);
 
 		stdout.mockClear();
 		await runMCPCommand({ action: "list", flags: { json: true }, cwd: projectDir });
 		expect(stdoutText(stdout)).toContain('"name": "context7"');
 		expect(stdoutText(stdout)).toContain('"API_TOKEN": "<redacted>"');
 		expect(stdoutText(stdout)).not.toContain("super-secret");
+		expect(stdoutText(stdout)).toContain('"runtimeStatus": "storage-only"');
+		expect(stdoutText(stdout)).toContain('"runtimeLoadedByStandalone": false');
+		expect(stdoutText(stdout)).toContain(
+			'"runtimeNote": "Stored MCP registrations are not loaded by normal standalone gjc sessions today."',
+		);
 
 		stdout.mockClear();
 		await runMCPCommand({ action: "remove", name: "context7", flags: { json: true }, cwd: projectDir });
 		expect(stdoutText(stdout)).toContain('"status": "removed"');
 		expect(stdoutText(stdout)).toContain('"API_TOKEN": "<redacted>"');
 		expect(stdoutText(stdout)).not.toContain("super-secret");
+		expect(stdoutText(stdout)).toContain('"runtimeStatus": "storage-only"');
+		expect(stdoutText(stdout)).toContain('"runtimeLoadedByStandalone": false');
+		expect(stdoutText(stdout)).toContain(
+			'"runtimeNote": "Stored MCP registrations are not loaded by normal standalone gjc sessions today."',
+		);
 		expect((await readMCPConfigFile(configPath)).mcpServers).toEqual({});
 	});
 
@@ -103,10 +118,56 @@ describe("gjc mcp CLI helpers", () => {
 		});
 		const output = stdoutText(stdout);
 		expect(output).toContain("docs\thttp\thttps://example.test/mcp");
+		expect(output).toContain("Status: storage-only");
+		expect(output).toContain("normal standalone gjc sessions do not load stored MCP registrations today");
 		expect(output).toContain('"Authorization": "<redacted>"');
 		expect(output).toContain('"X-Public": "<redacted>"');
 		expect(output).not.toContain("Bearer real-token");
 		expect(output).not.toContain('"X-Public": "value"');
+
+		stdout.mockClear();
+		await runMCPCommand({ action: "remove", name: "docs", flags: { project: true }, cwd: projectDir });
+		expect(stdoutText(stdout)).toContain('Removed MCP server "docs"');
+		expect(stdoutText(stdout)).toContain("Status: storage-only");
+	});
+
+	it("redacts URL and stdio argument secrets from public output", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+		await runMCPCommand({
+			action: "add",
+			name: "urlsecret",
+			flags: {
+				type: "http",
+				url: "https://user:pass@example.test/mcp?apiKey=url-secret&plain=value#frag",
+			},
+			cwd: projectDir,
+		});
+		await runMCPCommand({ action: "list", flags: {}, cwd: projectDir });
+
+		let output = stdoutText(stdout);
+		expect(output).toContain("apiKey=%3Credacted%3E");
+		expect(output).not.toContain("user:pass");
+		expect(output).not.toContain("url-secret");
+		expect(output).not.toContain("plain=value");
+		expect(output).not.toContain("#frag");
+
+		stdout.mockClear();
+		await runMCPCommand({
+			action: "add",
+			name: "argsecret",
+			commandArgs: ["tool", "--api-key", "arg-secret", "--token=arg-token", "normal"],
+			flags: {},
+			cwd: projectDir,
+		});
+		await runMCPCommand({ action: "list", flags: {}, cwd: projectDir });
+
+		output = stdoutText(stdout);
+		expect(output).toContain("--api-key <redacted>");
+		expect(output).toContain("--token=<redacted>");
+		expect(output).toContain("normal");
+		expect(output).not.toContain("arg-secret");
+		expect(output).not.toContain("arg-token");
 	});
 
 	it("does not overwrite an existing server unless force is set", async () => {

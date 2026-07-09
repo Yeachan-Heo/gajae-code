@@ -28,10 +28,11 @@ export interface ImageOptions {
 	maxWidthCells?: number;
 	maxHeightCells?: number;
 	filename?: string;
+	refetch?: () => string;
 }
 
 export class Image implements Component {
-	#base64Data: string;
+	#base64Data?: string;
 	#mimeType: string;
 	#dimensions: ImageDimensions;
 	#theme: ImageTheme;
@@ -63,6 +64,22 @@ export class Image implements Component {
 		this.#cachedWidth = undefined;
 	}
 
+	get retainedBase64DataForTest(): string | undefined {
+		return this.#base64Data;
+	}
+
+	#fallbackLines(): string[] {
+		const fallback = imageFallback(this.#mimeType, this.#dimensions, this.#options.filename);
+		return [this.#theme.fallbackColor(fallback)];
+	}
+
+	#getBase64Data(): string | undefined {
+		if (this.#base64Data) return this.#base64Data;
+		const refetched = this.#options.refetch?.();
+		if (refetched) this.#base64Data = refetched;
+		return this.#base64Data;
+	}
+
 	render(width: number): string[] {
 		if (this.#cachedLines && this.#cachedWidth === width) {
 			return this.#cachedLines;
@@ -74,46 +91,50 @@ export class Image implements Component {
 		let lines: string[];
 
 		if (TERMINAL.imageProtocol) {
-			if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
-				this.#kittyImageId ??= kittyImageId(this.#base64Data);
-			}
-			const result = renderImage(this.#base64Data, this.#dimensions, {
-				maxWidthCells: maxWidth,
-				maxHeightCells: this.#options.maxHeightCells,
-				imageId: this.#kittyImageId,
-				placementId: this.#kittyPlacementId,
-			});
-
-			if (result) {
-				// Return `rows` lines so the TUI accounts for the image height.
-				if (result.cursorNeutral) {
-					// Kitty a=p,C=1 placements neither move the cursor nor carry
-					// pixel data, so the escape lives on the FIRST row — the image
-					// anchors to that cell and no cursor-up trick is needed (the
-					// old CUU approach clamped at the viewport top edge and placed
-					// the image over transcript text when partially scrolled out).
-					lines = [result.sequence];
-					for (let i = 0; i < result.rows - 1; i++) {
-						lines.push("");
-					}
-				} else {
-					// iTerm2/SIXEL draw at the cursor and advance it: reserve
-					// rows-1 blank lines (TUI clears them), then move the cursor
-					// up and draw from the last line.
-					lines = [];
-					for (let i = 0; i < result.rows - 1; i++) {
-						lines.push("");
-					}
-					const moveUp = result.rows > 1 ? `\x1b[${result.rows - 1}A` : "";
-					lines.push(moveUp + result.sequence);
-				}
+			const base64Data = this.#getBase64Data();
+			if (!base64Data) {
+				lines = this.#fallbackLines();
 			} else {
-				const fallback = imageFallback(this.#mimeType, this.#dimensions, this.#options.filename);
-				lines = [this.#theme.fallbackColor(fallback)];
+				if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
+					this.#kittyImageId ??= kittyImageId(base64Data);
+				}
+				const result = renderImage(base64Data, this.#dimensions, {
+					maxWidthCells: maxWidth,
+					maxHeightCells: this.#options.maxHeightCells,
+					imageId: this.#kittyImageId,
+					placementId: this.#kittyPlacementId,
+				});
+
+				if (result) {
+					// Return `rows` lines so the TUI accounts for the image height.
+					if (result.cursorNeutral) {
+						// Kitty a=p,C=1 placements neither move the cursor nor carry
+						// pixel data, so the escape lives on the FIRST row — the image
+						// anchors to that cell and no cursor-up trick is needed (the
+						// old CUU approach clamped at the viewport top edge and placed
+						// the image over transcript text when partially scrolled out).
+						lines = [result.sequence];
+						for (let i = 0; i < result.rows - 1; i++) {
+							lines.push("");
+						}
+					} else {
+						// iTerm2/SIXEL draw at the cursor and advance it: reserve
+						// rows-1 blank lines (TUI clears them), then move the cursor
+						// up and draw from the last line.
+						lines = [];
+						for (let i = 0; i < result.rows - 1; i++) {
+							lines.push("");
+						}
+						const moveUp = result.rows > 1 ? `\x1b[${result.rows - 1}A` : "";
+						lines.push(moveUp + result.sequence);
+					}
+					this.#base64Data = undefined;
+				} else {
+					lines = this.#fallbackLines();
+				}
 			}
 		} else {
-			const fallback = imageFallback(this.#mimeType, this.#dimensions, this.#options.filename);
-			lines = [this.#theme.fallbackColor(fallback)];
+			lines = this.#fallbackLines();
 		}
 
 		this.#cachedLines = lines;

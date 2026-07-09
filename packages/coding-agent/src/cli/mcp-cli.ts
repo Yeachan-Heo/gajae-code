@@ -37,14 +37,27 @@ interface ScopedPath {
 	path: string;
 }
 
+interface RuntimeDisclosure {
+	runtimeStatus: "storage-only";
+	runtimeLoadedByStandalone: false;
+	runtimeNote: string;
+}
+
 interface RedactedServerEntry {
 	name: string;
 	config: MCPServerConfig;
 }
 
+interface RuntimeRedactedServerEntry extends RedactedServerEntry, RuntimeDisclosure {}
+
 const REDACTED = "<redacted>";
 const SENSITIVE_KEY_PATTERN =
 	/(?:token|secret|key|credential|password|passwd|pwd|authorization|auth|bearer|cookie|session)/i;
+const STORAGE_ONLY_RUNTIME_DISCLOSURE: RuntimeDisclosure = {
+	runtimeStatus: "storage-only",
+	runtimeLoadedByStandalone: false,
+	runtimeNote: "Stored MCP registrations are not loaded by normal standalone gjc sessions today.",
+};
 
 function resolvePath(args: MCPCommandArgs): ScopedPath {
 	const scope = args.flags.project ? "project" : "user";
@@ -128,6 +141,50 @@ function redactRecord(
 	);
 }
 
+function redactUrl(value: string | undefined): string | undefined {
+	if (!value) return value;
+	try {
+		const url = new URL(value);
+		if (url.username) url.username = REDACTED;
+		if (url.password) url.password = REDACTED;
+		if (url.search) {
+			for (const key of Array.from(url.searchParams.keys())) {
+				url.searchParams.set(key, REDACTED);
+			}
+		}
+		url.hash = "";
+		return url.toString();
+	} catch {
+		return SENSITIVE_KEY_PATTERN.test(value) ? REDACTED : value;
+	}
+}
+
+function redactArgs(args: string[] | undefined): string[] | undefined {
+	if (!args) return undefined;
+	const redacted: string[] = [];
+	let redactNext = false;
+	for (const arg of args) {
+		if (redactNext) {
+			redacted.push(REDACTED);
+			redactNext = false;
+			continue;
+		}
+		const equalsIndex = arg.indexOf("=");
+		if (equalsIndex > 0) {
+			const key = arg.slice(0, equalsIndex);
+			redacted.push(SENSITIVE_KEY_PATTERN.test(key) ? `${key}=${REDACTED}` : arg);
+			continue;
+		}
+		if (arg.startsWith("-") && SENSITIVE_KEY_PATTERN.test(arg)) {
+			redacted.push(arg);
+			redactNext = true;
+			continue;
+		}
+		redacted.push(SENSITIVE_KEY_PATTERN.test(arg) ? REDACTED : arg);
+	}
+	return redacted;
+}
+
 export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig {
 	const redacted = { ...config } as MCPServerConfig;
 	if ("env" in redacted) {
@@ -138,11 +195,19 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 		const headers = redactRecord(redacted.headers, true);
 		if (headers) redacted.headers = headers;
 	}
+	if ("url" in redacted) {
+		const url = redactUrl(redacted.url);
+		if (url) redacted.url = url;
+	}
+	if ("args" in redacted) {
+		const args = redactArgs(redacted.args);
+		if (args) redacted.args = args;
+	}
 	if (redacted.auth) {
 		redacted.auth = {
 			type: redacted.auth.type,
 			credentialId: redacted.auth.credentialId ? REDACTED : undefined,
-			tokenUrl: redacted.auth.tokenUrl,
+			tokenUrl: redactUrl(redacted.auth.tokenUrl),
 			clientId: redacted.auth.clientId ? REDACTED : undefined,
 			clientSecret: redacted.auth.clientSecret ? REDACTED : undefined,
 		};
@@ -151,7 +216,7 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 		redacted.oauth = {
 			clientId: redacted.oauth.clientId ? REDACTED : undefined,
 			clientSecret: redacted.oauth.clientSecret ? REDACTED : undefined,
-			redirectUri: redacted.oauth.redirectUri,
+			redirectUri: redactUrl(redacted.oauth.redirectUri),
 			callbackPort: redacted.oauth.callbackPort,
 			callbackPath: redacted.oauth.callbackPath,
 		};
@@ -159,10 +224,14 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 	return redacted;
 }
 
-function collectEntries(config: MCPConfigFile): RedactedServerEntry[] {
+function withRuntimeDisclosure<T extends object>(value: T): T & RuntimeDisclosure {
+	return { ...value, ...STORAGE_ONLY_RUNTIME_DISCLOSURE };
+}
+
+function collectEntries(config: MCPConfigFile): RuntimeRedactedServerEntry[] {
 	return Object.entries(config.mcpServers ?? {})
 		.sort(([a], [b]) => a.localeCompare(b))
-		.map(([name, serverConfig]) => ({ name, config: redactMCPServerConfig(serverConfig) }));
+		.map(([name, serverConfig]) => withRuntimeDisclosure({ name, config: redactMCPServerConfig(serverConfig) }));
 }
 
 function writeJson(value: unknown): void {
@@ -188,37 +257,46 @@ async function runAdd(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
 	const result = await upsertMCPServer(scoped.path, args.name, config, { force: args.flags.force });
 	const redacted = redactMCPServerConfig(config);
 	if (args.flags.json) {
-		writeJson({
-			action: "add",
-			status: result.status,
-			name: args.name,
-			scope: scoped.scope,
-			path: scoped.path,
-			config: redacted,
-		});
+		writeJson(
+			withRuntimeDisclosure({
+				action: "add",
+				status: result.status,
+				name: args.name,
+				scope: scoped.scope,
+				path: scoped.path,
+				config: redacted,
+			}),
+		);
 		return;
 	}
 	if (result.status === "skipped") {
 		process.stdout.write(
-			`MCP server "${args.name}" already exists in ${scoped.scope} config. Pass --force to overwrite.\n`,
+			`MCP server "${args.name}" already exists in ${scoped.scope} config. Pass --force to overwrite. ` +
+				"Status: storage-only; normal standalone gjc sessions do not load stored MCP registrations today.\n",
 		);
 		return;
 	}
-	process.stdout.write(`MCP server "${args.name}" ${result.status} in ${scoped.scope} config: ${scoped.path}\n`);
+	process.stdout.write(
+		`MCP server "${args.name}" ${result.status} in ${scoped.scope} config: ${scoped.path}\nStatus: storage-only; normal standalone gjc sessions do not load stored MCP registrations today.\n`,
+	);
 }
 
 async function runList(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
 	const config = await readMCPConfigFile(scoped.path);
 	const entries = collectEntries(config);
 	if (args.flags.json) {
-		writeJson({ action: "list", scope: scoped.scope, path: scoped.path, servers: entries });
+		writeJson(withRuntimeDisclosure({ action: "list", scope: scoped.scope, path: scoped.path, servers: entries }));
 		return;
 	}
 	if (entries.length === 0) {
-		process.stdout.write(`No MCP servers registered in ${scoped.scope} config: ${scoped.path}\n`);
+		process.stdout.write(
+			`No MCP servers registered in ${scoped.scope} config: ${scoped.path}\nStatus: storage-only; normal standalone gjc sessions do not load stored MCP registrations today.\n`,
+		);
 		return;
 	}
-	process.stdout.write(`MCP servers in ${scoped.scope} config: ${scoped.path}\n`);
+	process.stdout.write(
+		`MCP servers in ${scoped.scope} config: ${scoped.path}\nStatus: storage-only; normal standalone gjc sessions do not load stored MCP registrations today.\n`,
+	);
 	for (const entry of entries) {
 		process.stdout.write(`${renderDetails(entry)}\n`);
 	}
@@ -233,17 +311,21 @@ async function runRemove(args: MCPCommandArgs, scoped: ScopedPath): Promise<void
 	await removeMCPServer(scoped.path, args.name);
 	const entry = { name: args.name, config: redactMCPServerConfig(existing) };
 	if (args.flags.json) {
-		writeJson({
-			action: "remove",
-			status: "removed",
-			name: args.name,
-			scope: scoped.scope,
-			path: scoped.path,
-			removed: entry,
-		});
+		writeJson(
+			withRuntimeDisclosure({
+				action: "remove",
+				status: "removed",
+				name: args.name,
+				scope: scoped.scope,
+				path: scoped.path,
+				removed: entry,
+			}),
+		);
 		return;
 	}
-	process.stdout.write(`Removed MCP server "${args.name}" from ${scoped.scope} config: ${scoped.path}\n`);
+	process.stdout.write(
+		`Removed MCP server "${args.name}" from ${scoped.scope} config: ${scoped.path}\nStatus: storage-only; normal standalone gjc sessions do not load stored MCP registrations today.\n`,
+	);
 	process.stdout.write(`${renderDetails(entry)}\n`);
 }
 

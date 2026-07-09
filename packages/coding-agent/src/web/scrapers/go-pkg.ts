@@ -1,5 +1,5 @@
 import { tryParseJson } from "@gajae-code/utils";
-import { parseHTML } from "linkedom";
+import { parseHtmlLazy } from "../../utils/linkedom";
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, htmlToBasicMarkdown, loadPage } from "./types";
 
@@ -97,7 +97,7 @@ export const handleGoPkg: SpecialHandler = async (
 			});
 		}
 
-		const doc = parseHTML(pageResult.content).document;
+		const doc = (await parseHtmlLazy(pageResult.content)).document;
 
 		// Extract actual module path from breadcrumb or header
 		const breadcrumb = doc.querySelector(".go-Breadcrumb");

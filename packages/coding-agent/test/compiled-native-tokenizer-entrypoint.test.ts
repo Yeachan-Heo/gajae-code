@@ -3,15 +3,23 @@ import * as path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 const devBuildScriptPath = path.join(repoRoot, "packages/coding-agent/scripts/build-binary.ts");
+const compileArgsPath = path.join(repoRoot, "packages/coding-agent/scripts/compile-args.ts");
 
 describe("compiled binary entrypoints", () => {
 	it("dev binary build omits native tokenizer entrypoint while preserving minify and worker entrypoints", async () => {
-		const source = await Bun.file(devBuildScriptPath).text();
+		const devSource = await Bun.file(devBuildScriptPath).text();
+		const argsSource = await Bun.file(compileArgsPath).text();
 
-		expect(source).not.toContain("nativeTokenizerEntrypoint");
-		expect(source).toContain('"--minify"');
-		expect(source).toContain('"../stats/src/sync-worker.ts"');
-		expect(source).toContain('"./src/tools/browser/tab-worker-entry.ts"');
-		expect(source).toContain('"./src/eval/js/worker-entry.ts"');
+		// Dev entrypoints (shared builder) must not include the native
+		// tokenizer entry — that one is release-only.
+		expect(devSource).not.toContain("nativeTokenizerEntrypoint");
+		expect(argsSource).not.toContain('"../natives/native/index.js"');
+		// Shared builder carries --minify and the dev worker entrypoints
+		// consumed by build-binary.ts via buildDevCompileArgs.
+		expect(argsSource).toContain('"--minify"');
+		expect(argsSource).toContain('"../stats/src/sync-worker.ts"');
+		expect(argsSource).toContain('"./src/tools/browser/tab-worker-entry.ts"');
+		expect(argsSource).toContain('"./src/eval/js/worker-entry.ts"');
+		expect(devSource).toContain("buildDevCompileArgs");
 	});
 });
