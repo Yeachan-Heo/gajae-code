@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Hid the non-callable `google-antigravity/gemini-3.1-pro-high` selector from bundled and dynamic Antigravity catalogs after live Cloud Code Assist calls returned HTTP 400; `google-antigravity/gemini-3.1-pro-low:high` remains the working high-thinking path.
+
 ## [0.9.2] - 2026-07-09
 ### Added
 

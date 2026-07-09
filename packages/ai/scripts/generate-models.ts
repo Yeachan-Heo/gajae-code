@@ -63,9 +63,10 @@ function createAzureOpenAICatalogModels(): Model<"azure-openai-responses">[] {
 }
 
 const packageRoot = path.join(import.meta.dir, "..");
-// Claude Fable 5 was temporarily retired during its June 2026 suspension; it
-// was redeployed on 2026-07-01, so no models are currently retired.
-const RETIRED_BUNDLED_MODEL_KEYS = new Set<string>();
+// Antigravity advertises gemini-3.1-pro-high, but Cloud Code Assist rejects it
+// at request time. Retire the bundled entry so the TUI/catalog does not present
+// a selector that cannot complete; gemini-3.1-pro-low:high remains callable.
+const RETIRED_BUNDLED_MODEL_KEYS = new Set<string>(["google-antigravity/gemini-3.1-pro-high"]);
 
 function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
 	return RETIRED_BUNDLED_MODEL_KEYS.has(`${model.provider}/${model.id}`);

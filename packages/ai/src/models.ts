@@ -13,6 +13,7 @@ import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-ca
  */
 const providerNames = Object.keys(MODELS) as KnownProvider[];
 const providerModelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
+const RETIRED_BUNDLED_MODEL_KEYS = new Set(["google-antigravity/gemini-3.1-pro-high"]);
 
 function getProviderModels(provider: GeneratedProvider): Map<string, Model<Api>> | undefined {
 	const cached = providerModelRegistry.get(provider);
@@ -21,6 +22,9 @@ function getProviderModels(provider: GeneratedProvider): Map<string, Model<Api>>
 	if (!models) return undefined;
 	const providerModels = new Map<string, Model<Api>>();
 	for (const [id, model] of Object.entries(models)) {
+		if (RETIRED_BUNDLED_MODEL_KEYS.has(`${provider}/${id}`)) {
+			continue;
+		}
 		providerModels.set(id, applyBundledCompatDefaults(enrichModelThinking(model as Model<Api>)));
 	}
 	providerModelRegistry.set(provider, providerModels);

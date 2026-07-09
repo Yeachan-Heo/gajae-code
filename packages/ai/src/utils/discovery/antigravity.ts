@@ -1,7 +1,6 @@
 import * as z from "zod/v4";
 import { getAntigravityUserAgent } from "../../providers/google-gemini-headers";
 import type { Model } from "../../types";
-import { toPositiveNumber } from "../../utils";
 
 const DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS = [
 	"https://daily-cloudcode-pa.googleapis.com",
@@ -11,10 +10,13 @@ const FETCH_AVAILABLE_MODELS_PATH = "/v1internal:fetchAvailableModels";
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
+// Antigravity advertises this selector, but Cloud Code Assist rejects live calls
+// with HTTP 400. Keep the callable high-thinking path as gemini-3.1-pro-low:high.
 const ANTIGRAVITY_DISCOVERY_DENYLIST = new Set([
 	"chat_20706",
 	"chat_23310",
 	"gemini-2.5-flash-thinking",
+	"gemini-3.1-pro-high",
 	"gemini-3-pro-low",
 	"gemini-2.5-pro",
 ]);
@@ -254,6 +256,13 @@ function parseAntigravityDiscoveryResponse(value: unknown): AntigravityDiscovery
 		return null;
 	}
 	return parsed.data;
+}
+
+function toPositiveNumber(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+		return fallback;
+	}
+	return value;
 }
 
 function trimTrailingSlashes(value: string): string {
