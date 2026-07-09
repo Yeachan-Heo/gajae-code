@@ -26,6 +26,32 @@ describe("provider slash command", () => {
 		expect(command?.allowArgs).toBe(true);
 	});
 
+	it("points generic provider login users to /login provider selection", async () => {
+		const outputs: string[] = [];
+		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "provider");
+
+		await command?.handle?.({ name: "provider", args: "login", text: "/provider login" }, {
+			output: (text: string) => outputs.push(text),
+		} as unknown as SlashCommandRuntime);
+
+		const output = outputs.join("\n");
+		expect(output).toContain("/login [provider-id]");
+		expect(output).toMatch(/OAuth|account/);
+	});
+
+	it("points provider-specific login users to the matching /login command", async () => {
+		const outputs: string[] = [];
+		const command = BUILTIN_SLASH_COMMANDS_INTERNAL.find(entry => entry.name === "provider");
+
+		await command?.handle?.({ name: "provider", args: "login kagi", text: "/provider login kagi" }, {
+			output: (text: string) => outputs.push(text),
+		} as unknown as SlashCommandRuntime);
+
+		const output = outputs.join("\n");
+		expect(output).toContain("/login kagi");
+		expect(output).toMatch(/OAuth|account/);
+	});
+
 	it("reports the /provicer typo without falling through to model bootstrap", async () => {
 		const errors: string[] = [];
 		const result = await executeBuiltinSlashCommand("/provicer add --compat anthropic", {

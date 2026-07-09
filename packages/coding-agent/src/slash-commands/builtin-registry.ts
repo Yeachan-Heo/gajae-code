@@ -1020,8 +1020,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			if (args === "login" || args.startsWith("login ")) {
+				const providerId = args.slice("login".length).trim();
+				const loginCommand = providerId ? `/login ${providerId}` : "/login [provider-id]";
 				await runtime.output(
-					"Use the terminal UI /login selector for browser, device-code, or manual callback provider login.",
+					`Open the terminal UI and run ${loginCommand} for OAuth/subscription account login. Paste callbacks with /login <redirect URL or code>.`,
 				);
 				return commandConsumed();
 			}
