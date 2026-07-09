@@ -1,12 +1,11 @@
 /**
  * Resolve pasted editor text to an image file path.
  *
- * Terminals insert a shell-escaped filesystem path when a file is drag-dropped
- * onto them (e.g. macOS `Screenshot\ 2026-07-07\ at\ 11.06.38 PM.png`, where
- * the visible "space" before AM/PM is U+202F and stays unescaped). When the
- * entire paste is a single path to an existing image file, the interactive
- * editor attaches the image and inserts an `[image N]` placeholder instead of
- * leaving the raw path in the prompt.
+ * Some terminal/clipboard integrations paste a temporary filesystem path after a
+ * copied image is pasted into the editor (for example `/tmp/clipboard-...png`).
+ * Only those recognized clipboard temp files are auto-attached and replaced with
+ * an `[image N]` placeholder. Ordinary image paths remain literal prompt text;
+ * users attach saved files explicitly with `@path/to/image.png`.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,6 +13,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const IMAGE_FILE_EXTENSION_PATTERN = /\.(?:png|jpe?g|gif|webp)$/i;
+const CLIPBOARD_TEMP_BASENAME_PATTERN = /^clipboard-\d{4}-\d{2}-\d{2}-\d{6}-[A-Za-z0-9-]+\.(?:png|jpe?g|gif|webp)$/i;
 
 export interface DecodePastedPathOptions {
 	/**
@@ -150,16 +150,25 @@ function hasSupportedImageMagic(filePath: string): boolean {
 	}
 }
 
+function isRecognizedClipboardTempPath(filePath: string): boolean {
+	const resolved = path.resolve(filePath);
+	const tempRoot = path.resolve(os.tmpdir());
+	if (resolved !== tempRoot && !resolved.startsWith(`${tempRoot}${path.sep}`)) return false;
+	return CLIPBOARD_TEMP_BASENAME_PATTERN.test(path.basename(resolved));
+}
+
 /**
- * Returns the resolved path when the whole pasted text is a single path to an
- * existing image file (verified by extension AND content signature),
- * otherwise `undefined` (the paste is inserted as text).
+ * Returns the resolved path when the whole pasted text is a recognized clipboard
+ * temp path to an existing image file, otherwise `undefined` (the paste is
+ * inserted as text). Arbitrary saved image paths are not auto-attached here;
+ * users attach them explicitly with `@path/to/image.png`.
  */
 export function resolvePastedImagePath(text: string, options?: ResolvePastedImagePathOptions): string | undefined {
 	const candidate = decodePastedPathCandidate(text, options);
 	if (!candidate || !IMAGE_FILE_EXTENSION_PATTERN.test(candidate)) return undefined;
 
 	const resolved = path.resolve(options?.cwd ?? process.cwd(), candidate);
+	if (!isRecognizedClipboardTempPath(resolved)) return undefined;
 	try {
 		if (!fs.statSync(resolved).isFile()) return undefined;
 	} catch {

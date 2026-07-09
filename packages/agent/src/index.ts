@@ -7,6 +7,7 @@ export * from "./append-only-context";
 // Compaction
 export * from "./compaction";
 export * from "./harmony-leak";
+export * from "./image-placeholder-guard";
 // Proxy utilities
 export * from "./proxy";
 // Run-level telemetry collector + aggregators

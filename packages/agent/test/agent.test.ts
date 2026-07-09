@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Agent, type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
-import type { SimpleStreamOptions } from "@gajae-code/ai";
+import type { ImageContent, SimpleStreamOptions } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createAssistantMessage } from "./helpers";
@@ -119,6 +119,34 @@ describe("Agent", () => {
 		expect(mock.calls.length).toBe(2);
 	});
 
+	it("prompt() rejects image-placeholder-only text without image payload", async () => {
+		const mock = createMockModel({ responses: [{ content: ["unreachable"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+
+		await expect(agent.prompt("[image 1]")).rejects.toThrow("#paste-image");
+		await expect(agent.prompt("[image 1]\n[image 2]", [])).rejects.toThrow("@path/to/image.png");
+		expect(mock.calls).toHaveLength(0);
+	});
+
+	it("prompt() allows image-placeholder-only text when image payload is attached", async () => {
+		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		const image: ImageContent = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
+
+		await expect(agent.prompt("[image 1]", [image])).resolves.toBeUndefined();
+
+		expect(mock.calls).toHaveLength(1);
+		expect(mock.calls[0].context.messages[0].content).toEqual([{ type: "text", text: "[image 1]" }, image]);
+	});
+
+	it("prompt() allows normal text that mentions an image placeholder", async () => {
+		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+
+		await expect(agent.prompt("Please explain why [image 1] is missing.")).resolves.toBeUndefined();
+
+		expect(mock.calls).toHaveLength(1);
+	});
 	it("prompt() refreshes tools and system prompt between same-turn model calls", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		type Details = { value: string };

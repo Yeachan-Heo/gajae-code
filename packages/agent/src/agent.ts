@@ -23,6 +23,7 @@ import {
 import { agentLoop, agentLoopContinue } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { HarmonyAuditEvent } from "./harmony-leak";
+import { assertImagePlaceholdersHavePayload } from "./image-placeholder-guard";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -34,6 +35,23 @@ import type {
 	StreamFn,
 	ToolCallContext,
 } from "./types";
+
+function assertUserImagePlaceholdersHavePayload(messages: readonly AgentMessage[]): void {
+	for (const message of messages) {
+		if (!("role" in message) || message.role !== "user") continue;
+		const content = message.content;
+		if (typeof content === "string") {
+			assertImagePlaceholdersHavePayload(content, undefined);
+			continue;
+		}
+		if (!Array.isArray(content)) continue;
+		const text = content
+			.filter(part => part.type === "text")
+			.map(part => part.text)
+			.join("\n");
+		assertImagePlaceholdersHavePayload(text, content);
+	}
+}
 
 /**
  * Default convertToLlm: Keep only LLM-compatible messages, convert attachments.
@@ -860,6 +878,7 @@ export class Agent {
 	 * Delivered after current tool execution, skips remaining tools.
 	 */
 	steer(m: AgentMessage) {
+		assertUserImagePlaceholdersHavePayload([m]);
 		this.#steeringQueue.push(m);
 	}
 
@@ -872,6 +891,7 @@ export class Agent {
 	 * other integration paths.
 	 */
 	followUp(m: AgentMessage, options?: { forceOneAtATime?: boolean }) {
+		assertUserImagePlaceholdersHavePayload([m]);
 		if (options?.forceOneAtATime) {
 			this.#followUpForceOneAtATime.add(m);
 		}
@@ -1117,6 +1137,8 @@ export class Agent {
 			msgs = [input];
 			promptOptions = imagesOrOptions as AgentPromptOptions | undefined;
 		}
+
+		assertUserImagePlaceholdersHavePayload(msgs);
 
 		await this.#runLoop(msgs, promptOptions);
 	}

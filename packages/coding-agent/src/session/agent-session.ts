@@ -26,6 +26,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	assertImagePlaceholdersHavePayload,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
@@ -5397,6 +5398,7 @@ export class AgentSession {
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		assertImagePlaceholdersHavePayload(expandedText, options?.images);
 		const workflowIntentDiff = options?.synthetic ? null : buildWorkflowIntentDiff(expandedText);
 
 		// If streaming, queue via steer() or followUp() based on option
@@ -5883,6 +5885,7 @@ export class AgentSession {
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		assertImagePlaceholdersHavePayload(expandedText, images);
 		await this.#queueSteer(expandedText, images);
 	}
 
@@ -5899,6 +5902,7 @@ export class AgentSession {
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		assertImagePlaceholdersHavePayload(expandedText, images);
 		await this.#queueFollowUp(expandedText, images, {
 			forceOneAtATime: options?.followUpQueuePolicy === "sequential",
 		});
@@ -5908,6 +5912,7 @@ export class AgentSession {
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	async #queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText));
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -5939,6 +5944,7 @@ export class AgentSession {
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	async #queueFollowUp(text: string, images?: ImageContent[], options?: { forceOneAtATime?: boolean }): Promise<void> {
+		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#followUpMessages.push(this.#createQueuedDisplayEntry(displayText));
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
