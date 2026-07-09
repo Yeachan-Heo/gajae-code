@@ -201,6 +201,124 @@ describe("GJC plugin command hooks: install-time approval", () => {
 	});
 });
 
+describe("GJC plugin command hooks: ownership boundary (copy/hash) matches the confinement policy", () => {
+	const SH_GATE = '#!/bin/sh\ncat > /dev/null\nprintf \'{"block":true,"reason":"sh gate"}\'\n';
+	const BARE_GATE =
+		'process.stdin.resume(); process.stdin.on("end", () => { process.stdout.write(JSON.stringify({ block: true, reason: "bare gate" })); process.exit(0); }); process.stdin.on("data", () => {});\n';
+
+	async function shExecutableBundle(): Promise<string> {
+		const src = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cmdhooksrc-"));
+		tempDirs.push(src);
+		await fs.mkdir(path.join(src, "hooks"), { recursive: true });
+		await fs.writeFile(path.join(src, "hooks", "gate.sh"), SH_GATE, { mode: 0o755 });
+		await fs.writeFile(
+			path.join(src, "gajae-plugin.json"),
+			JSON.stringify({
+				kind: "gajae-code-plugin",
+				name: "sh-gate-bundle",
+				version: "1.0.0",
+				hooks: [{ name: "gate", event: "tool_call", command: "hooks/gate.sh" }],
+			}),
+		);
+		return src;
+	}
+
+	async function bareScriptBundle(): Promise<string> {
+		const src = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cmdhooksrc-"));
+		tempDirs.push(src);
+		await fs.writeFile(path.join(src, "gate.js"), BARE_GATE);
+		await fs.writeFile(
+			path.join(src, "gajae-plugin.json"),
+			JSON.stringify({
+				kind: "gajae-code-plugin",
+				name: "bare-gate-bundle",
+				version: "1.0.0",
+				hooks: [{ name: "gate", event: "tool_call", command: "bun", args: ["gate.js"] }],
+			}),
+		);
+		return src;
+	}
+
+	const ctx = {
+		cwd: "/workspace",
+		sessionManager: { getSessionId: () => "sess-1", getSessionFile: () => "/tmp/sess-1.jsonl" },
+	};
+
+	test("a root-confined executable command is copied, hashed, owned, and runs", async () => {
+		const cwd = await mkCwd();
+		const res = await installGjcPluginBundle(await shExecutableBundle(), {
+			scope: "project",
+			cwd,
+			allowCommandHooks: true,
+		});
+		expect(res.entry.copiedFiles.some(f => f.relativePath === "hooks/gate.sh")).toBe(true);
+		const loaded = await loadConstrainedPluginHooks({ cwd });
+		expect(loaded.quarantine).toHaveLength(0);
+		const verdict = (await loaded.hooks[0]?.handler(
+			{ type: "tool_call", toolName: "bash", toolCallId: "t1", input: { command: "ls" } },
+			ctx,
+		)) as { block?: boolean; reason?: string };
+		expect(verdict?.block).toBe(true);
+		expect(verdict?.reason).toBe("sh gate");
+	});
+
+	test("a bare-launcher plain-filename script is copied, hashed, owned, and runs", async () => {
+		const cwd = await mkCwd();
+		const res = await installGjcPluginBundle(await bareScriptBundle(), {
+			scope: "project",
+			cwd,
+			allowCommandHooks: true,
+		});
+		expect(res.entry.copiedFiles.some(f => f.relativePath === "gate.js")).toBe(true);
+		const loaded = await loadConstrainedPluginHooks({ cwd });
+		expect(loaded.quarantine).toHaveLength(0);
+		const verdict = (await loaded.hooks[0]?.handler(
+			{ type: "tool_call", toolName: "bash", toolCallId: "t1", input: { command: "ls" } },
+			ctx,
+		)) as { block?: boolean; reason?: string };
+		expect(verdict?.block).toBe(true);
+		expect(verdict?.reason).toBe("bare gate");
+	});
+
+	test("tampering with either executed file after install quarantines the plugin (hash drift)", async () => {
+		const cases: { bundle: () => Promise<string>; name: string; installedRel: string }[] = [
+			{ bundle: shExecutableBundle, name: "sh-gate-bundle", installedRel: "hooks/gate.sh" },
+			{ bundle: bareScriptBundle, name: "bare-gate-bundle", installedRel: "gate.js" },
+		];
+		for (const c of cases) {
+			const cwd = await mkCwd();
+			await installGjcPluginBundle(await c.bundle(), { scope: "project", cwd, allowCommandHooks: true });
+			const installed = path.join(cwd, ".gjc", "gjc-plugins", c.name, c.installedRel);
+			await fs.appendFile(installed, "\n// tampered\n");
+			const loaded = await loadConstrainedPluginHooks({ cwd });
+			expect(loaded.hooks).toHaveLength(0);
+			expect(loaded.quarantine.some(q => q.code === "runtime_mismatch")).toBe(true);
+		}
+	});
+
+	test("a command pointing at a missing bundled file fails compile (missing_file)", async () => {
+		const cwd = await mkCwd();
+		// realpath the source root: on macOS the symlinked tmpdir (/var -> /private/var)
+		// otherwise makes pathIsWithin reject the missing candidate first
+		// (security_policy) before the missing_file resolution is reached.
+		const src = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cmdhooksrc-")));
+		tempDirs.push(src);
+		await fs.writeFile(
+			path.join(src, "gajae-plugin.json"),
+			JSON.stringify({
+				kind: "gajae-code-plugin",
+				name: "missing-gate-bundle",
+				version: "1.0.0",
+				hooks: [{ name: "gate", event: "tool_call", command: "hooks/gate.sh" }],
+			}),
+		);
+		await expectAsyncLoadError(
+			() => installGjcPluginBundle(src, { scope: "project", cwd, allowCommandHooks: true }),
+			"missing_file",
+		);
+	});
+});
+
 describe("GJC plugin command hooks: session load", () => {
 	test("approved command hooks load with a spawn-backed handler", async () => {
 		const cwd = await mkCwd();

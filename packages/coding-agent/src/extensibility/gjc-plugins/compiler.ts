@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseFrontmatter, pathIsWithin } from "@gajae-code/utils";
-import { assertCommandHookAllowed } from "./mcp-policy";
+import { assertCommandHookAllowed, confinedSpawnBundledFiles } from "./mcp-policy";
 import { resolveWithinRoot } from "./paths";
 import { parseManifest, parseSubskillFrontmatter } from "./schema";
 import {
@@ -245,15 +245,16 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 	for (const hook of manifest.hooks) {
 		if (hook.command !== undefined) {
 			// Command hook: no factory module. Apply the same subprocess confinement
-			// policy stdio MCP servers get (pure check, no spawn), then hash any
-			// bundled script args so the copied-file boundary owns them.
+			// policy stdio MCP servers get (pure check, no spawn), then hash/copy
+			// EVERYTHING that policy lets the spawn execute (the root-confined
+			// command file, the launcher's bundled script even as a plain filename,
+			// and any path-like args) so the copied-file ownership boundary and
+			// hash-drift quarantine cover exactly the executable surface.
 			assertCommandHookAllowed(hook, { pluginRoot });
-			for (const arg of hook.args ?? []) {
-				if (arg.startsWith("-")) continue;
-				if (!arg.startsWith(".") && !arg.includes("/")) continue;
-				const argAbs = await resolveDeclaredFile(pluginRoot, arg);
-				const { sha256: argDigest, bytes: argBytes } = await hashFile(argAbs, arg, undefined);
-				files.set(arg, { sha256: argDigest, bytes: argBytes });
+			for (const rel of confinedSpawnBundledFiles({ command: hook.command, args: hook.args })) {
+				const relAbs = await resolveDeclaredFile(pluginRoot, rel);
+				const { sha256: relDigest, bytes: relBytes } = await hashFile(relAbs, rel, undefined);
+				files.set(rel, { sha256: relDigest, bytes: relBytes });
 			}
 			const configHash = commandHookConfigHash(hook);
 			if (hook.sha256 !== undefined && hook.sha256.toLowerCase() !== configHash) {

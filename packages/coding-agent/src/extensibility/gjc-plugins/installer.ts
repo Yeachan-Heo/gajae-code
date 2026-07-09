@@ -327,6 +327,9 @@ async function copyValidatedFiles(bundle: NormalizedGjcPluginBundle, stagingDir:
 		const dest = path.join(stagingDir, file.relativePath);
 		await fs.mkdir(path.dirname(dest), { recursive: true });
 		await fs.writeFile(dest, buf);
+		// Preserve the source permission bits so root-confined executables
+		// (e.g. a command hook's "hooks/gate.sh") stay executable after install.
+		await fs.chmod(dest, lst.mode & 0o777);
 	}
 }
 

@@ -235,6 +235,37 @@ export function assertConfinedSpawnAllowed(spec: ConfinedSpawnSpec, ctx: StdioPo
 	}
 }
 
+/**
+ * The bundle-relative files a confined spawn spec will execute, derived from
+ * the SAME shape rules as assertConfinedSpawnAllowed so the confinement policy
+ * and the copy/hash ownership boundary can never drift apart:
+ * - a non-bare-launcher `command` is a root-confined executable file;
+ * - a node/bun launcher's first non-flag argument is the bundled script,
+ *   even when it is a plain filename (e.g. "gate.js");
+ * - any additional path-like args are bundled files.
+ * Callers must run assertConfinedSpawnAllowed first; every returned path is
+ * then resolved/hashed/copied so session-start re-verification and hash-drift
+ * quarantine own exactly what the spawn can execute.
+ */
+export function confinedSpawnBundledFiles(spec: ConfinedSpawnSpec): string[] {
+	const files: string[] = [];
+	const command = spec.command ?? "";
+	const base = path.basename(command);
+	const isBareLauncher = !command.includes("/") && ALLOWED_STDIO_LAUNCHERS.has(base);
+	if (command && !isBareLauncher) files.push(command);
+	const args = spec.args ?? [];
+	if (isBareLauncher || ALLOWED_STDIO_LAUNCHERS.has(base)) {
+		const firstScript = args.find(a => !a.startsWith("-"));
+		if (firstScript) files.push(firstScript);
+	}
+	for (const arg of args) {
+		if (arg.startsWith("-")) continue;
+		if (!arg.startsWith(".") && !arg.includes("/")) continue;
+		files.push(arg);
+	}
+	return [...new Set(files)];
+}
+
 /** stdio launcher/path confinement policy. */
 export function assertStdioAllowed(entry: GjcPluginMcpManifestEntry, ctx: StdioPolicyContext): void {
 	assertConfinedSpawnAllowed(
