@@ -15,7 +15,7 @@ gjc mcp list
 gjc mcp remove context7
 ```
 
-`gjc mcp add` writes only the definition supplied on that invocation to GJC's own MCP config (`~/.gjc/agent/mcp.json` by default, or `./.gjc/mcp.json` with `--project`). It does not read Claude Code, Codex, OpenCode, Cursor, Gemini, Windsurf, or other live configs. `gjc mcp list` and `gjc mcp remove` print redacted definitions so env/header/auth/OAuth credential values are not exposed in public output.
+`gjc mcp add` writes only the definition supplied on that invocation to GJC's own MCP config (`~/.gjc/agent/mcp.json` by default, or `./.gjc/mcp.json` with `--project`). It does not read Claude Code, Codex, OpenCode, Cursor, Gemini, Windsurf, or other live configs. `gjc mcp list` and `gjc mcp remove` print redacted definitions so env/header/auth/OAuth credential values are not exposed in public output. These registrations are storage-only today: normal standalone `gjc`, `gjc --tmux`, and print-mode sessions do not load them as runtime tools.
 
 ## What is supported today
 

@@ -62,9 +62,10 @@ interface MCPServerConfigBase {
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
 	/**
-	 * Whether to connect this server automatically at session startup (default: true).
-	 * When false the server stays configured-but-disconnected until connected
-	 * explicitly (e.g. `/mcp connect <name>`).
+	 * Whether an explicit runtime MCP consumer should connect this server
+	 * automatically when that consumer starts (default: true). Normal standalone
+	 * `gjc`, `gjc --tmux`, and print-mode sessions do not consume `gjc mcp`
+	 * registrations today.
 	 */
 	autoload?: boolean;
 	/** Connection timeout in milliseconds (default: 30000) */
@@ -114,7 +115,7 @@ export interface MCPSseServerConfig extends MCPServerConfigBase {
 export type MCPServerConfig = MCPStdioServerConfig | MCPHttpServerConfig | MCPSseServerConfig;
 
 export const MCP_CONFIG_SCHEMA_URL =
-	"https://raw.githubusercontent.com/can1357/gajae-code/main/packages/coding-agent/src/config/mcp-schema.json";
+	"https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/packages/coding-agent/src/config/mcp-schema.json";
 
 /** Root mcp.json/.mcp.json file structure */
 export interface MCPConfigFile {

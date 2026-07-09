@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { loadCapability } from "@gajae-code/coding-agent/discovery";
 import { type MCPServer, mcpCapability } from "../../src/capability/mcp";
+import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 
 async function loadStandaloneMcpConfig(cwd: string): Promise<MCPServer[]> {
 	const result = await loadCapability<MCPServer>(mcpCapability.id, {
@@ -123,5 +124,26 @@ describe("standalone mcp.json oauth env expansion", () => {
 			callbackPath: "/oauth/callback",
 		});
 		expect(server?.auth).toBeUndefined();
+	});
+
+	test("preserves noInheritEnv for explicit stdio runtime consumers", async () => {
+		await fs.writeFile(
+			path.join(tempDir, "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					isolated: {
+						type: "stdio",
+						command: "isolated-mcp",
+						noInheritEnv: true,
+					},
+				},
+			}),
+		);
+
+		const [server] = await loadStandaloneMcpConfig(tempDir);
+		expect(server).toBeDefined();
+		expect(server?.noInheritEnv).toBe(true);
+		const loaded = await loadAllMCPConfigs(tempDir, { filterExa: false });
+		expect(loaded.configs.isolated).toMatchObject({ noInheritEnv: true });
 	});
 });

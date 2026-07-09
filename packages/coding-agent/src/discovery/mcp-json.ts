@@ -30,6 +30,7 @@ interface MCPConfigFile {
 			command?: string;
 			args?: string[];
 			env?: Record<string, string>;
+			noInheritEnv?: boolean;
 			cwd?: string;
 			url?: string;
 			headers?: Record<string, string>;
@@ -92,6 +93,18 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				}
 			}
 
+			let noInheritEnv: boolean | undefined;
+			if (serverConfig.noInheritEnv !== undefined) {
+				if (typeof serverConfig.noInheritEnv === "boolean") {
+					noInheritEnv = serverConfig.noInheritEnv;
+				} else {
+					logger.warn("MCP server has invalid 'noInheritEnv' value, ignoring", {
+						name,
+						value: serverConfig.noInheritEnv,
+					});
+				}
+			}
+
 			const server: MCPServer = {
 				name,
 				enabled,
@@ -100,6 +113,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				command: serverConfig.command,
 				args: serverConfig.args,
 				env: serverConfig.env,
+				noInheritEnv,
 				cwd: serverConfig.cwd,
 				url: serverConfig.url,
 				headers: serverConfig.headers,

@@ -176,6 +176,19 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				autoload = undefined;
 			}
 
+			// Validate noInheritEnv: boolean only, warn on other types
+			let noInheritEnv: boolean | undefined;
+			if (serverConfig.noInheritEnv === undefined || serverConfig.noInheritEnv === null) {
+				noInheritEnv = undefined;
+			} else if (typeof serverConfig.noInheritEnv === "boolean") {
+				noInheritEnv = serverConfig.noInheritEnv;
+			} else {
+				logger.warn(
+					`MCP server "${serverName}": invalid noInheritEnv type ${typeof serverConfig.noInheritEnv}, ignoring`,
+				);
+				noInheritEnv = undefined;
+			}
+
 			result.push({
 				name: serverName,
 				enabled,
@@ -184,6 +197,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				command: serverConfig.command as string | undefined,
 				args: serverConfig.args as string[] | undefined,
 				env: serverConfig.env as Record<string, string> | undefined,
+				noInheritEnv,
 				cwd: serverConfig.cwd as string | undefined,
 				url: serverConfig.url as string | undefined,
 				headers: serverConfig.headers as Record<string, string> | undefined,
