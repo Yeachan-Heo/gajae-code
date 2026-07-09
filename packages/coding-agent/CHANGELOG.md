@@ -7,7 +7,7 @@
 
 ### Changed
 
-- The status line (information bar) token-percentage now renders inline within the model segment, right after the reasoning-effort indicator, instead of as a trailing segment at the far end of the line, so the context usage percentage stays grouped with the model it describes. The standalone `context_pct` segment was removed from the `default`, `default-usage`, `compact`, `full`, `nerd`, `ascii`, and `custom` presets (it remains available for `minimal` and custom configs); the inline percentage is color-coded by context-usage level and can be disabled per-preset with `segmentOptions.model.showContextPercent: false`.
+- The status line (information bar) token-percentage now renders inline within the model segment, right after the reasoning-effort indicator, instead of as a trailing segment at the far end of the line, so the context usage percentage stays grouped with the model it describes. The standalone `context_pct` segment was removed from the `default`, `default-usage`, `compact`, `full`, `nerd`, `ascii`, and `custom` presets (it remains available for `minimal` and custom configs); the inline percentage is color-coded by context-usage level, can be disabled per-preset with `segmentOptions.model.showContextPercent: false`, and is auto-suppressed when a standalone `context_pct` segment is also active so the value is never shown twice.
 
 ### Fixed
 

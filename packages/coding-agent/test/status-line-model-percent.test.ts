@@ -76,6 +76,19 @@ describe("model segment inline context percentage", () => {
 		expect(rendered).not.toContain("42.5%");
 		expect(rendered).toContain("Sonnet");
 	});
+	it("suppresses the inline percentage when a standalone context_pct segment is active", () => {
+		const ctx = makeCtx({
+			contextPercent: 42.5,
+			contextWindow: 200_000,
+			contextPctSegmentActive: true,
+		});
+		const rendered = Bun.stripANSI(renderSegment("model", ctx).content);
+
+		// Avoids showing the same percentage twice in custom layouts that keep
+		// both the model segment and a standalone context_pct segment.
+		expect(rendered).not.toContain("42.5%");
+		expect(rendered).toContain("Sonnet");
+	});
 
 	it("still shows the percentage when the reasoning effort is off", () => {
 		const ctx = makeCtx({

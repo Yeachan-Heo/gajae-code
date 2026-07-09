@@ -108,8 +108,10 @@ const modelSegment: StatusLineSegment = {
 		// Show the context-window token percentage right next to the model /
 		// reasoning effort (rather than as a trailing segment) so it stays
 		// grouped with the model it describes. Disable per-preset with
-		// `segmentOptions.model.showContextPercent: false`.
-		if (opts.showContextPercent !== false) {
+		// `segmentOptions.model.showContextPercent: false`. Suppressed
+		// automatically when a standalone context_pct segment is also in the
+		// active layout, so the value is never shown twice.
+		if (opts.showContextPercent !== false && ctx.contextPctSegmentActive !== true) {
 			const pct = ctx.contextPercent;
 			const window = ctx.contextWindow;
 			if (window > 0 && Number.isFinite(pct)) {
