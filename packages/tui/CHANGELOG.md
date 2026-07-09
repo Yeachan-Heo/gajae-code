@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Markdown terminal rendering now treats HTML comments as invisible markup, preventing React-style `<!-- -->` text separators from leaking into chat output while preserving visible HTML-like model text.
+
 ## [0.9.1] - 2026-07-08
 ### Fixed
 
