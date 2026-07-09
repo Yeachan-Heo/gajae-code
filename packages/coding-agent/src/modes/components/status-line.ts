@@ -929,11 +929,8 @@ export class StatusLineComponent implements Component {
 		const totalWidth = () => leftWidth + rightWidth + (left.length > 0 && right.length > 0 ? 1 : 0);
 
 		if (topFillWidth > 0) {
-			while (totalWidth() > topFillWidth && right.length > 0) {
-				right.pop();
-				rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
-			}
-			// Shrink path before dropping left segments — path is the only elastic segment
+			// Shrink path before dropping right-side telemetry — path is the only elastic segment,
+			// and presets such as default-usage should not hide usage just because cwd is long.
 			const pathIdx = leftIds.indexOf("path");
 			if (pathIdx >= 0 && totalWidth() > topFillWidth) {
 				const overflow = totalWidth() - topFillWidth;
@@ -942,6 +939,10 @@ export class StatusLineComponent implements Component {
 					left[pathIdx] = previewHighlightSegment === "path" ? `\x1b[7m${shrunk}\x1b[27m` : shrunk;
 					leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
 				}
+			}
+			while (totalWidth() > topFillWidth && right.length > 0) {
+				right.pop();
+				rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
 			}
 			while (totalWidth() > topFillWidth && left.length > 0) {
 				left.pop();
