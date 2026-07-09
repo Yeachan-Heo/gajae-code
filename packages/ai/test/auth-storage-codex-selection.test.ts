@@ -506,6 +506,29 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(maxConcurrent).toBe(3);
 		expect(elapsedMs).toBeLessThan(refreshDelayMs * 2);
 	});
+	test("runtime credential selector pins Codex oauth by email instead of ranking", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-near", "near@example.com") },
+			{ type: "oauth", ...createCredential("acct-far", "far@example.com") },
+		]);
+
+		usageByAccount.set(
+			"acct-near",
+			createCodexUsageReport({
+				accountId: "acct-near",
+				primary: { usedFraction: 0.1, resetInMs: 10 * 60 * 1000 },
+				secondary: { usedFraction: 0.1, resetInMs: 20 * 60 * 1000 },
+			}),
+		);
+
+		authStorage.setRuntimeCredentialSelector("openai-codex", { kind: "email", value: "far@example.com" });
+
+		const apiKey = await authStorage.getApiKey("openai-codex", "session-pinned-codex-email");
+		expect(apiKey).toBe("api-acct-far");
+		expect(authStorage.getOAuthAccountId("openai-codex", "session-pinned-codex-email")).toBe("acct-far");
+	});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -757,5 +780,39 @@ describe("AuthStorage claude oauth ranking", () => {
 
 		const apiKey = await authStorage.getApiKey("anthropic", "session-claude-single");
 		expect(apiKey).toBe("api-acct-solo");
+	});
+	test("runtime credential selector pins oauth by email instead of ranking", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("anthropic", [
+			{ type: "oauth", ...createCredential("acct-near", "near@example.com") },
+			{ type: "oauth", ...createCredential("acct-far", "far@example.com") },
+		]);
+
+		usageByAccount.set(
+			"acct-near",
+			createClaudeUsageReport({
+				accountId: "acct-near",
+				primary: { usedFraction: 0.1, resetInMs: 10 * 60 * 1000 },
+				secondary: { usedFraction: 0.1, resetInMs: 20 * 60 * 1000 },
+			}),
+		);
+
+		authStorage.setRuntimeCredentialSelector("anthropic", { kind: "email", value: "far@example.com" });
+
+		const apiKey = await authStorage.getApiKey("anthropic", "session-pinned-email");
+		expect(apiKey).toBe("api-acct-far");
+		expect(authStorage.getOAuthAccountId("anthropic", "session-pinned-email")).toBe("acct-far");
+	});
+
+	test("runtime credential selector fails when the credential is missing", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const storage = authStorage;
+
+		await storage.set("anthropic", [{ type: "oauth", ...createCredential("acct-a", "a@example.com") }]);
+
+		expect(() =>
+			storage.setRuntimeCredentialSelector("anthropic", { kind: "email", value: "missing@example.com" }),
+		).toThrow("No credential found for anthropic matching email:missing@example.com");
 	});
 });

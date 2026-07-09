@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added `gjc --credential <selector>` for pinning a stored provider credential by `email:`, `id:`, `account:`, `project:`, or `provider/email:` during a session.
+
 ### Fixed
 
 - Finalized notification turn mirrors now default to the bounded full-turn cap so Telegram's existing chunked delivery can send long assistant answers instead of receiving an already-truncated 3500-character summary; `GJC_NOTIFICATIONS_TURN_MAX` remains available to lower the cap for summary-style mirrors, and live previews stay capped as one editable message.

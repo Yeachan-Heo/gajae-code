@@ -3,6 +3,7 @@ import * as path from "node:path";
 import {
 	type Api,
 	type AssistantMessageEventStream,
+	type AuthCredentialSelector,
 	type CacheRetention,
 	type Context,
 	createModelManager,
@@ -2667,21 +2668,37 @@ export class ModelRegistry {
 	/**
 	 * Get API key for a model.
 	 */
-	async getApiKey(model: Model<Api>, sessionId?: string): Promise<string | undefined> {
+	async getApiKey(
+		model: Model<Api>,
+		sessionId?: string,
+		options: { credentialSelector?: AuthCredentialSelector } = {},
+	): Promise<string | undefined> {
 		if (this.#keylessProviders.has(model.provider) && !this.authStorage.hasAuth(model.provider)) {
 			return kNoAuth;
 		}
-		return this.authStorage.getApiKey(model.provider, sessionId, { baseUrl: model.baseUrl, modelId: model.id });
+		return this.authStorage.getApiKey(model.provider, sessionId, {
+			baseUrl: model.baseUrl,
+			modelId: model.id,
+			credentialSelector: options.credentialSelector,
+		});
 	}
 
 	/**
 	 * Get API key for a provider (e.g., "openai").
 	 */
-	async getApiKeyForProvider(provider: string, sessionId?: string, baseUrl?: string): Promise<string | undefined> {
+	async getApiKeyForProvider(
+		provider: string,
+		sessionId?: string,
+		baseUrl?: string,
+		options: { credentialSelector?: AuthCredentialSelector } = {},
+	): Promise<string | undefined> {
 		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
 			return kNoAuth;
 		}
-		return this.authStorage.getApiKey(provider, sessionId, { baseUrl });
+		return this.authStorage.getApiKey(provider, sessionId, {
+			baseUrl,
+			credentialSelector: options.credentialSelector,
+		});
 	}
 
 	async #peekApiKeyForProvider(provider: string): Promise<string | undefined> {

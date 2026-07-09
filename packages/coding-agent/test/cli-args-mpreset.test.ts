@@ -5,6 +5,7 @@ import { parseArgs } from "../src/cli/args";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
 import { applyStartupModelProfiles, createAcpSessionFactory } from "../src/main";
+import { parseCliCredentialSelector } from "../src/runtime-credential-selector";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
 
@@ -71,6 +72,26 @@ describe("CLI model profile args", () => {
 
 	test("rejects --default without --mpreset", () => {
 		expect(() => parseArgs(["--default"])).toThrow("--default requires --mpreset <name>");
+	});
+});
+
+describe("CLI credential selector args", () => {
+	test("parses --credential with provider-qualified email selector", () => {
+		const parsed = parseArgs(["--credential", "openai-codex/email:me@example.com"]);
+		expect(parsed.credential).toBe("openai-codex/email:me@example.com");
+
+		const selector = parseCliCredentialSelector(parsed.credential ?? "");
+		expect(selector.provider).toBe("openai-codex");
+		expect(selector.selector).toEqual({ kind: "email", value: "me@example.com" });
+	});
+
+	test("parses bare email credential selector as email shorthand", () => {
+		const selector = parseCliCredentialSelector("me@example.com");
+		expect(selector.selector).toEqual({ kind: "email", value: "me@example.com" });
+	});
+
+	test("rejects malformed credential selector", () => {
+		expect(() => parseCliCredentialSelector("openai-codex/nope")).toThrow("Invalid --credential selector");
 	});
 });
 

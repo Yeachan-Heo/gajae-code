@@ -87,6 +87,10 @@ export default class Index extends Command {
 		"api-key": Flags.string({
 			description: "API key (defaults to env vars)",
 		}),
+		credential: Flags.string({
+			description:
+				"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/email:<addr>",
+		}),
 		"system-prompt": Flags.string({
 			description: "System prompt (default: coding assistant prompt)",
 		}),
@@ -181,6 +185,7 @@ export default class Index extends Command {
 		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
+		`# Pin a stored credential for this session\n  ${APP_NAME} --credential email:me@example.com`,
 		`# Activate a model profile for this session\n  ${APP_NAME} --mpreset codex-medium`,
 		`# Persist a model profile as the default\n  ${APP_NAME} --mpreset opencodego --default`,
 		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/--path--/session.jsonl`,
