@@ -121,6 +121,7 @@ export type ModelSelectorSelection =
 interface PendingThinkingChoice {
 	item: ModelItem | CanonicalModelItem;
 	role: GjcModelAssignmentTargetId | null;
+	roles?: readonly GjcModelAssignmentTargetId[];
 	levels: ThinkingLevel[];
 }
 
@@ -1373,7 +1374,13 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#renderThinkingMenu(choice: PendingThinkingChoice): void {
-		const targetLabel = choice.role === null ? "temporary model" : GJC_MODEL_ASSIGNMENT_TARGETS[choice.role].name;
+		const targetLabel = choice.roles
+			? choice.roles.includes("default")
+				? "all targets"
+				: "all role agents"
+			: choice.role === null
+				? "temporary model"
+				: GJC_MODEL_ASSIGNMENT_TARGETS[choice.role].name;
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(
 			new Text(theme.fg("muted", `  Reasoning for ${targetLabel}: ${choice.item.model.id}`), 0, 0),
@@ -1700,14 +1707,16 @@ export class ModelSelectorComponent extends Container {
 			const level = choice.levels[this.#selectedThinkingIndex];
 			if (!level) return;
 			this.#pendingThinkingChoice = undefined;
-			this.#handleSelect(choice.item, choice.role, level);
+			this.#handleSelect(choice.item, choice.role, level, choice.roles);
 			return;
 		}
 		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
 			this.#pendingThinkingChoice = undefined;
 			if (choice.role !== null) {
 				this.#pendingActionItem = choice.item;
-				this.#selectedActionIndex = Math.max(0, GJC_MODEL_ASSIGNMENT_TARGET_IDS.indexOf(choice.role));
+				this.#selectedActionIndex = choice.roles
+					? GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + (choice.roles.includes("default") ? 1 : 0)
+					: Math.max(0, GJC_MODEL_ASSIGNMENT_TARGET_IDS.indexOf(choice.role));
 			}
 			this.#updateList();
 		}
@@ -1736,9 +1745,12 @@ export class ModelSelectorComponent extends Container {
 	): void {
 		const itemThinkingLevel = thinkingLevel ?? item.thinkingLevel;
 		const hasExplicitThinkingChoice = thinkingLevel !== undefined || item.explicitThinkingLevel === true;
-		if (!hasExplicitThinkingChoice && requiresExplicitThinkingChoice(item.model, role)) {
+		const needsExplicitThinkingChoice = roles
+			? roles.some(targetRole => requiresExplicitThinkingChoice(item.model, targetRole))
+			: requiresExplicitThinkingChoice(item.model, role);
+		if (!hasExplicitThinkingChoice && needsExplicitThinkingChoice) {
 			const levels = getSelectableThinkingLevels(item.model);
-			this.#pendingThinkingChoice = { item, role, levels };
+			this.#pendingThinkingChoice = { item, role, roles, levels };
 			this.#selectedThinkingIndex = this.#getInitialThinkingChoiceIndex(item, levels);
 			this.#updateList();
 			return;

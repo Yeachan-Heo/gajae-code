@@ -295,10 +295,16 @@ describe("ModelSelector canonical model selection", () => {
 		for (let i = 0; i < 5; i++) selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 
+		// Batch assignment of a reasoning model requires an explicit effort choice.
+		expect(selected).toBeUndefined();
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Reasoning for all role agents");
+		selector.handleInput("\n");
+
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected batch role-agent selection");
 		expect(selectedAfterEnter.role).toBe("default");
 		expect(selectedAfterEnter.roles).toEqual(["executor", "architect", "planner", "critic"]);
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
 	});
 
@@ -318,10 +324,16 @@ describe("ModelSelector canonical model selection", () => {
 		for (let i = 0; i < 6; i++) selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 
+		// Batch assignment of a reasoning model requires an explicit effort choice.
+		expect(selected).toBeUndefined();
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Reasoning for all targets");
+		selector.handleInput("\n");
+
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected all-targets selection");
 		expect(selectedAfterEnter.role).toBe("default");
 		expect(selectedAfterEnter.roles).toEqual(["default", "executor", "architect", "planner", "critic"]);
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
 	});
 

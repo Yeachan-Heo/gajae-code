@@ -4,6 +4,7 @@
 ### Fixed
 
 - ACP permission prompts now honor `clientCapabilities._meta.gjc.permissionHandling` and the `GJC_ACP_PERMISSION_MODE` fallback, so `auto` and `always-allow` no longer emit `session/request_permission` calls while invalid values fail safely to `prompt`.
+- Model selector batch assignments ("Set for all role agents" / "Set for all targets") now open the reasoning-effort menu whenever any batch target requires an explicit choice (e.g. Anthropic reasoning models like `claude-fable-5`), and the chosen effort plus the full batch survive the menu. Previously the menu never appeared for Anthropic models (silently persisting `:off` selectors for every role agent), and for OpenAI/Codex models picking an effort collapsed the batch to a DEFAULT-only assignment.
 ### Added
 
 - ACP clients now receive GJC automatic-compaction start/end state through additive `session_info_update` metadata, including the compaction action, trigger, retry/abort/error outcome, and busy-to-idle phase transitions.
