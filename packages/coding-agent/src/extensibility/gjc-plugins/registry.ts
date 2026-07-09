@@ -175,6 +175,10 @@ export function registryEntryFingerprint(entry: GjcPluginRegistryEntry): string 
 		name: entry.name,
 		manifestHash: entry.manifestHash,
 		files: entry.copiedFiles.map(f => [f.relativePath, f.sha256]).sort(),
+		// Approval participates so re-installing with --allow-command-hooks is
+		// never short-circuited as "unchanged"; undefined is dropped by
+		// JSON.stringify, keeping fingerprints stable for existing entries.
+		commandHooksApproved: entry.commandHooksApproved,
 	});
 	return createHash("sha256").update(canonical).digest("hex");
 }

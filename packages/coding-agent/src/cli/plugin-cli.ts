@@ -45,6 +45,7 @@ export interface PluginCommandArgs {
 		force?: boolean;
 		dryRun?: boolean;
 		local?: boolean;
+		allowCommandHooks?: boolean;
 		enable?: string;
 		disable?: string;
 		set?: string;
@@ -110,6 +111,8 @@ export function parsePluginArgs(args: string[]): PluginCommandArgs | undefined {
 			result.flags.force = true;
 		} else if (arg === "--dry-run") {
 			result.flags.dryRun = true;
+		} else if (arg === "--allow-command-hooks") {
+			result.flags.allowCommandHooks = true;
 		} else if (arg === "-l" || arg === "--local") {
 			result.flags.local = true;
 		} else if (arg === "--user") {
@@ -359,6 +362,7 @@ async function handleInstall(
 		scope?: "user" | "project";
 		user?: boolean;
 		project?: boolean;
+		allowCommandHooks?: boolean;
 	},
 ): Promise<void> {
 	if (packages.length === 0) {
@@ -385,7 +389,12 @@ async function handleInstall(
 			}
 			const scope: "user" | "project" = flags.user ? "user" : "project";
 			try {
-				const res = await installGjcPluginBundle(spec, { scope, cwd: process.cwd(), force: flags.force });
+				const res = await installGjcPluginBundle(spec, {
+					scope,
+					cwd: process.cwd(),
+					force: flags.force,
+					allowCommandHooks: flags.allowCommandHooks,
+				});
 				if (flags.json) {
 					console.log(JSON.stringify({ name: res.entry.name, status: res.status, scope }, null, 2));
 				} else {
@@ -992,6 +1001,7 @@ ${chalk.bold("Options:")}
   --force          Overwrite without prompting (install)
   --scope <scope>  Install scope: user (default) or project (install name@marketplace)
   --dry-run        Preview changes without applying (install)
+  --allow-command-hooks  Approve a GJC plugin bundle's command hooks (subprocess spawn on hook events)
   -l, --local      Use project-local overrides
 
 ${chalk.bold("Examples:")}

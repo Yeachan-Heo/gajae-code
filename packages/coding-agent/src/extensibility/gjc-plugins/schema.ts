@@ -121,6 +121,9 @@ function parseTools(value: unknown, manifestPath: string): GjcPluginToolManifest
 	});
 }
 
+const COMMAND_HOOK_MAX_TIMEOUT_MS = 60_000;
+const COMMAND_HOOK_MIN_TIMEOUT_MS = 100;
+
 function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifestEntry[] {
 	const raw = optionalArray(value, "hooks", manifestPath);
 	return raw.map((entry, index) => {
@@ -132,7 +135,54 @@ function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifest
 		}
 		const name = manifestString(entry.name, `hooks[${index}].name`, manifestPath);
 		const event = manifestString(entry.event, `hooks[${index}].event`, manifestPath);
-		const path = manifestString(entry.path, `hooks[${index}].path`, manifestPath);
+		// Exactly one of `path` (module hook) or `command` (command hook).
+		const hasPath = entry.path !== undefined;
+		const hasCommand = entry.command !== undefined;
+		if (hasPath === hasCommand) {
+			throw new GjcPluginLoadError(
+				"invalid_manifest",
+				`Invalid GJC plugin manifest at ${manifestPath}: hooks[${index}] requires exactly one of "path" or "command"`,
+			);
+		}
+		const path = hasPath ? manifestString(entry.path, `hooks[${index}].path`, manifestPath) : undefined;
+		const command = hasCommand ? manifestString(entry.command, `hooks[${index}].command`, manifestPath) : undefined;
+		let args: string[] | undefined;
+		if (entry.args !== undefined) {
+			if (!hasCommand) {
+				throw new GjcPluginLoadError(
+					"invalid_manifest",
+					`Invalid GJC plugin manifest at ${manifestPath}: hooks[${index}].args requires "command"`,
+				);
+			}
+			if (!Array.isArray(entry.args) || !entry.args.every(item => typeof item === "string")) {
+				throw new GjcPluginLoadError(
+					"invalid_manifest",
+					`Invalid GJC plugin manifest at ${manifestPath}: hooks[${index}].args must be a string array`,
+				);
+			}
+			args = [...(entry.args as string[])];
+		}
+		let timeoutMs: number | undefined;
+		if (entry.timeoutMs !== undefined) {
+			if (!hasCommand) {
+				throw new GjcPluginLoadError(
+					"invalid_manifest",
+					`Invalid GJC plugin manifest at ${manifestPath}: hooks[${index}].timeoutMs requires "command"`,
+				);
+			}
+			if (
+				typeof entry.timeoutMs !== "number" ||
+				!Number.isInteger(entry.timeoutMs) ||
+				entry.timeoutMs < COMMAND_HOOK_MIN_TIMEOUT_MS ||
+				entry.timeoutMs > COMMAND_HOOK_MAX_TIMEOUT_MS
+			) {
+				throw new GjcPluginLoadError(
+					"invalid_manifest",
+					`Invalid GJC plugin manifest at ${manifestPath}: hooks[${index}].timeoutMs must be an integer between ${COMMAND_HOOK_MIN_TIMEOUT_MS} and ${COMMAND_HOOK_MAX_TIMEOUT_MS}`,
+				);
+			}
+			timeoutMs = entry.timeoutMs;
+		}
 		const target =
 			entry.target === undefined ? undefined : manifestString(entry.target, `hooks[${index}].target`, manifestPath);
 		let phase: "before" | "after" | undefined;
@@ -147,7 +197,7 @@ function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifest
 		}
 		const sha256 =
 			entry.sha256 === undefined ? undefined : manifestString(entry.sha256, `hooks[${index}].sha256`, manifestPath);
-		return { name, event, target, phase, path, sha256 };
+		return { name, event, target, phase, path, command, args, timeoutMs, sha256 };
 	});
 }
 

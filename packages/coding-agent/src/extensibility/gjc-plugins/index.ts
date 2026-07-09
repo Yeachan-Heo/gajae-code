@@ -1,4 +1,5 @@
 export * from "./activation";
+export * from "./command-hooks";
 export * from "./compiler";
 export * from "./constrained-hooks";
 export * from "./injection";

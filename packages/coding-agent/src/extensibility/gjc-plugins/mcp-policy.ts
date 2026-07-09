@@ -1,7 +1,7 @@
 import { lookup } from "node:dns/promises";
 import * as path from "node:path";
 import { pathIsWithin } from "@gajae-code/utils";
-import { GjcPluginLoadError, type GjcPluginMcpManifestEntry } from "./types";
+import { type GjcPluginHookManifestEntry, GjcPluginLoadError, type GjcPluginMcpManifestEntry } from "./types";
 
 /**
  * Shared MCP security policy applied at BOTH install validation and runtime
@@ -172,10 +172,22 @@ const DANGEROUS_LAUNCHER_FLAGS = [
 	"--input-type",
 ];
 
-/** stdio launcher/path confinement policy. */
-export function assertStdioAllowed(entry: GjcPluginMcpManifestEntry, ctx: StdioPolicyContext): void {
-	const command = entry.command ?? "";
-	if (!command) fail(`MCP "${entry.name}": stdio requires a command`);
+export interface ConfinedSpawnSpec {
+	command: string;
+	args?: string[];
+	cwd?: string;
+}
+
+/**
+ * Shared launcher/path confinement policy for every subprocess a third-party
+ * bundle may declare (stdio MCP servers and command hooks). Deny-first: the
+ * command must be a bare allowlisted launcher (node/bun) with a root-confined
+ * script argument, or an executable inside the plugin root; no eval/loader
+ * flags, no env expansion, cwd confined to the plugin root.
+ */
+export function assertConfinedSpawnAllowed(spec: ConfinedSpawnSpec, ctx: StdioPolicyContext, label: string): void {
+	const command = spec.command ?? "";
+	if (!command) fail(`${label} requires a command`);
 	const root = path.resolve(ctx.pluginRoot);
 	const base = path.basename(command);
 	const isBareLauncher = !command.includes("/") && ALLOWED_STDIO_LAUNCHERS.has(base);
@@ -183,44 +195,69 @@ export function assertStdioAllowed(entry: GjcPluginMcpManifestEntry, ctx: StdioP
 	// Absolute or relative paths must stay inside the plugin root; bare launchers
 	// must be in the allowlist. An absolute /bin/node is rejected (outside root).
 	if (!isBareLauncher && !isRootConfinedExecutable) {
-		fail(`MCP "${entry.name}": stdio command not allowed: ${command}`);
+		fail(`${label} command not allowed: ${command}`);
 	}
 	const usesNodeLauncher = isBareLauncher || ALLOWED_STDIO_LAUNCHERS.has(base);
-	const args = entry.args ?? [];
+	const args = spec.args ?? [];
 	// Reject code-eval/loader flags for node/bun launchers.
 	if (usesNodeLauncher) {
 		for (const arg of args) {
 			const flag = arg.split("=")[0];
 			if (DANGEROUS_LAUNCHER_FLAGS.includes(flag)) {
-				fail(`MCP "${entry.name}": stdio launcher flag not allowed: ${arg}`);
+				fail(`${label} launcher flag not allowed: ${arg}`);
 			}
 		}
 		// Require a root-confined script as the first non-flag argument.
 		const firstScript = args.find(a => !a.startsWith("-"));
 		if (!firstScript) {
-			fail(`MCP "${entry.name}": node/bun stdio launcher requires a bundled script argument`);
+			fail(`${label} node/bun launcher requires a bundled script argument`);
 		}
 		if (!pathIsWithin(root, path.resolve(root, firstScript))) {
-			fail(`MCP "${entry.name}": stdio script escapes plugin root: ${firstScript}`);
+			fail(`${label} script escapes plugin root: ${firstScript}`);
 		}
 	}
 	// cwd must resolve within the plugin root.
-	const cwd = entry.cwd ? path.resolve(root, entry.cwd) : root;
+	const cwd = spec.cwd ? path.resolve(root, spec.cwd) : root;
 	if (!pathIsWithin(root, cwd) && cwd !== root) {
-		fail(`MCP "${entry.name}": stdio cwd escapes plugin root: ${entry.cwd}`);
+		fail(`${label} cwd escapes plugin root: ${spec.cwd}`);
 	}
 	// File-like args must resolve within the plugin root; reject env-expansion.
 	for (const arg of args) {
 		if (/\$\{?[A-Za-z_]/.test(arg) || arg.includes("`") || arg.includes("$(")) {
-			fail(`MCP "${entry.name}": stdio arg expansion not allowed: ${arg}`);
+			fail(`${label} arg expansion not allowed: ${arg}`);
 		}
 		if (arg.startsWith("-")) continue;
 		if (!arg.startsWith(".") && !arg.includes("/")) continue;
 		const resolvedArg = path.resolve(root, arg);
 		if (!pathIsWithin(root, resolvedArg)) {
-			fail(`MCP "${entry.name}": stdio arg escapes plugin root: ${arg}`);
+			fail(`${label} arg escapes plugin root: ${arg}`);
 		}
 	}
+}
+
+/** stdio launcher/path confinement policy. */
+export function assertStdioAllowed(entry: GjcPluginMcpManifestEntry, ctx: StdioPolicyContext): void {
+	assertConfinedSpawnAllowed(
+		{ command: entry.command ?? "", args: entry.args, cwd: entry.cwd },
+		ctx,
+		`MCP "${entry.name}": stdio`,
+	);
+}
+
+/**
+ * Command-hook confinement policy: identical subprocess discipline to stdio MCP
+ * servers. Applied at compile/install time (pure) and re-applied at session
+ * load before any spawn.
+ */
+export function assertCommandHookAllowed(
+	hook: Pick<GjcPluginHookManifestEntry, "name" | "command" | "args">,
+	ctx: StdioPolicyContext,
+): void {
+	assertConfinedSpawnAllowed(
+		{ command: hook.command ?? "", args: hook.args },
+		ctx,
+		`plugin hook "${hook.name}": command`,
+	);
 }
 
 /**

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- GJC plugin bundles can now declare **command hooks** (`{ "event": "tool_call", "command": "bun", "args": ["hooks/gate.js"] }`): GJC spawns the declared, plugin-root-confined command with the event JSON on stdin and honors a `{block,reason}` verdict on stdout for `tool_call` (fail-closed on spawn error/timeout/non-zero exit/unparseable output; observe-only for all other events). Command hooks reuse the stdio-MCP subprocess confinement policy, run with a minimal no-inherit environment, and require explicit operator approval at install time via the new `gjc plugin install --allow-command-hooks` flag; module hooks and existing bundles are unaffected. This gives external governance/policy tools a sanctioned command seam instead of relying on module-scope `child_process` imports inside constrained hook modules.
+
 ## [0.9.2] - 2026-07-09
 ### Added
 
