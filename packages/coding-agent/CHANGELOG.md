@@ -4,6 +4,9 @@
 ### Added
 
 - Added `gjc --credential <selector>` for pinning a stored provider credential by `email:`, `id:`, `account:`, `project:`, or `provider/email:` during a session.
+- Added `--mpreset <profile>` support to Telegram `/session_create`, forwarding both `--mpreset <name>` and `--mpreset=<name>` as split argv to the spawned GJC child.
+- Added the built-in `skill_discovery` tool for runtime discovery of custom project/user skills without injecting the full skill catalog into the core prompt.
+- Pasting or drag-dropping a path to an existing image file now attaches the image and inserts an `[image N]` placeholder, including quoted paths, `file://` URIs, `~/` expansion, spaces, and macOS screenshot narrow no-break spaces.
 
 ### Changed
 
@@ -16,6 +19,9 @@
 - `gjc --tmux` terminal titles now track live tmux session renames while preserving the friendly project/branch title for untouched generated session ids.
 - Telegram session forum-topic renames now remain retryable after a transient `editForumTopic` failure, so topics do not get stuck at the provisional `GJC <session>` name while the daemon incorrectly records the final title locally.
 - `/effort` selector choices now show the current reasoning effort and mirror `/model` by asking whether to apply the selected effort for the current session or save it as the default, including support for persisting `off`. Default model presets also sync their encoded effort into the persisted effort default so later `/effort` defaults are not overwritten on restart.
+- Composer queue submissions (`Alt+Q` / `app.message.queue`) force one-at-a-time follow-up delivery, including replay after compaction, without disabling broader batch mode for other follow-up callers.
+- `--credential` now rejects a missing selector immediately instead of falling through into session launch with no output.
+- `gjc-session` prompt/monitor postmortem helpers now work on macOS's system Bash/Python, so missing tmux sessions write the public-safe `vanished.json` marker and prompt injection exits through the guarded refusal path.
 
 ## [0.9.1] - 2026-07-08
 

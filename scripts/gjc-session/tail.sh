@@ -35,9 +35,13 @@ if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]
   show_durable_state "$GJC_SESSION_STATE_DIR/pane.log"
   exit 0
 fi
-mapfile -t candidates < <(find "${GJC_SESSION_LOG_SEARCH_ROOT:-$HOME/Workspace}" \( -path "*/.gjc-session-state/$SESSION/pane.log" -o -path "*/$SESSION/pane.log" \) -type f 2>/dev/null | sort)
-if [[ "${#candidates[@]}" -gt 0 ]]; then
-  show_durable_state "${candidates[0]}"
+candidate=""
+while IFS= read -r found; do
+  candidate="$found"
+  break
+done < <(find "${GJC_SESSION_LOG_SEARCH_ROOT:-$HOME/Workspace}" \( -path "*/.gjc-session-state/$SESSION/pane.log" -o -path "*/$SESSION/pane.log" \) -type f 2>/dev/null | sort)
+if [[ -n "$candidate" ]]; then
+  show_durable_state "$candidate"
   exit 0
 fi
 

@@ -9,6 +9,7 @@
 
 - Hid the non-callable `google-antigravity/gemini-3.1-pro-high` selector from bundled, dynamic, and cached Antigravity catalogs after live Cloud Code Assist calls returned HTTP 400; `google-antigravity/gemini-3.1-pro-low:high` remains the working high-thinking path.
 - Preserved Anthropic tool-use arguments supplied on `content_block_start` when no `input_json_delta` chunks follow, preventing finished tool calls from collapsing back to `{}`.
+- Refreshed the default Gemini CLI impersonation version to 0.50.0 so the spoofed User-Agent freshness gate passes for the 0.9.2 release.
 
 ## [0.9.1] - 2026-07-08
 

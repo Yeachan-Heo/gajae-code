@@ -26,16 +26,25 @@ find_durable_pane_logs() {
     find "${GJC_SESSION_LOG_SEARCH_ROOT:-$HOME/Workspace}" \( -path "*/.gjc-session-state/$SESSION/pane.log" -o -path "*/$SESSION/pane.log" \) -type f 2>/dev/null | sort
   fi
 }
+first_durable_pane_log() {
+  local candidate
+  while IFS= read -r candidate; do
+    printf '%s\n' "$candidate"
+    return 0
+  done < <(find_durable_pane_logs)
+  return 1
+}
+
 
 prompt_accepted_path() {
   if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -z "${GJC_SESSION_LOG_SEARCH_ROOT:-}" ]]; then
     printf '%s\n' "$GJC_SESSION_STATE_DIR/prompt-accepted.json"
     return 0
   fi
-  local candidates=()
-  mapfile -t candidates < <(find_durable_pane_logs)
-  if [[ "${#candidates[@]}" -gt 0 ]]; then
-    printf '%s\n' "$(dirname "${candidates[0]}")/prompt-accepted.json"
+  local candidate
+  candidate="$(first_durable_pane_log || true)"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$(dirname "$candidate")/prompt-accepted.json"
   fi
 }
 
@@ -232,10 +241,10 @@ fi
 
 PANE_TEXT="$(${TMUX_CMD[@]} capture-pane -t "$SESSION":0.0 -p -S -80 2>/dev/null || true)"
 if [[ -z "$PANE_TEXT" ]]; then
-  mapfile -t candidates < <(find_durable_pane_logs)
-  if [[ "${#candidates[@]}" -gt 0 ]]; then
-    write_pre_prompt_vanished "tmux_session_missing_before_prompt_injection" "before_prompt_injection" false "${candidates[0]}"
-    show_missing_session_diagnostics "${candidates[0]}"
+  candidate="$(first_durable_pane_log || true)"
+  if [[ -n "$candidate" ]]; then
+    write_pre_prompt_vanished "tmux_session_missing_before_prompt_injection" "before_prompt_injection" false "$candidate"
+    show_missing_session_diagnostics "$candidate"
   else
     write_pre_prompt_vanished "tmux_session_missing_before_prompt_injection" "before_prompt_injection" false ""
     echo "refusing to paste prompt: tmux session $SESSION is not readable and no durable pane log was found" >&2
@@ -243,9 +252,9 @@ if [[ -z "$PANE_TEXT" ]]; then
   exit 1
 fi
 if ! printf '%s\n' "$PANE_TEXT" | grep -qE 'Gajae forge|Type your message|> Type your message|Working'; then
-  mapfile -t candidates < <(find_durable_pane_logs)
-  if [[ "${#candidates[@]}" -gt 0 ]]; then
-    write_pre_prompt_vanished "tmux_session_unready_before_prompt_injection" "before_prompt_injection" false "${candidates[0]}"
+  candidate="$(first_durable_pane_log || true)"
+  if [[ -n "$candidate" ]]; then
+    write_pre_prompt_vanished "tmux_session_unready_before_prompt_injection" "before_prompt_injection" false "$candidate"
   else
     write_pre_prompt_vanished "tmux_session_unready_before_prompt_injection" "before_prompt_injection" false ""
   fi
@@ -263,10 +272,9 @@ EVIDENCE_LOG_IS_TEMP=0
 if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -z "${GJC_SESSION_LOG_SEARCH_ROOT:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
   EVIDENCE_LOG="$GJC_SESSION_STATE_DIR/pane.log"
 else
-  durable_log_candidates=()
-  mapfile -t durable_log_candidates < <(find_durable_pane_logs)
-  if [[ "${#durable_log_candidates[@]}" -gt 0 ]]; then
-    EVIDENCE_LOG="${durable_log_candidates[0]}"
+  durable_log_candidate="$(first_durable_pane_log || true)"
+  if [[ -n "$durable_log_candidate" ]]; then
+    EVIDENCE_LOG="$durable_log_candidate"
   else
     EVIDENCE_LOG="$(mktemp "${TMPDIR:-/tmp}/gjc-session-prompt-evidence.XXXXXX")"
     EVIDENCE_LOG_IS_TEMP=1
@@ -326,10 +334,10 @@ for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
   fi
   PANE_TEXT="$(${TMUX_CMD[@]} capture-pane -t "$SESSION":0.0 -p -S -120 2>/dev/null || true)"
   if [[ -z "$PANE_TEXT" ]]; then
-    mapfile -t candidates < <(find_durable_pane_logs)
-    if [[ "${#candidates[@]}" -gt 0 ]]; then
-      write_pre_prompt_vanished "tmux_session_missing_before_prompt_acceptance" "before_prompt_acceptance" true "${candidates[0]}"
-      show_missing_session_diagnostics "${candidates[0]}"
+    candidate="$(first_durable_pane_log || true)"
+    if [[ -n "$candidate" ]]; then
+      write_pre_prompt_vanished "tmux_session_missing_before_prompt_acceptance" "before_prompt_acceptance" true "$candidate"
+      show_missing_session_diagnostics "$candidate"
     else
       write_pre_prompt_vanished "tmux_session_missing_before_prompt_acceptance" "before_prompt_acceptance" true ""
       echo "prompt acceptance failed: tmux session $SESSION vanished before durable turn evidence" >&2

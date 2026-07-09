@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
+import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
@@ -83,6 +84,13 @@ describe("CLI credential selector args", () => {
 		const selector = parseCliCredentialSelector(parsed.credential ?? "");
 		expect(selector.provider).toBe("openai-codex");
 		expect(selector.selector).toEqual({ kind: "email", value: "me@example.com" });
+	});
+
+	test("rejects --credential without selector", () => {
+		expect(() => parseArgs(["--credential"])).toThrow(CliParseError);
+		expect(() => parseArgs(["--credential"])).toThrow("--credential requires <selector>");
+		expect(() => parseArgs(["--credential", "--model", "opus"])).toThrow(CliParseError);
+		expect(() => parseArgs(["--credential", "--model", "opus"])).toThrow("--credential requires <selector>");
 	});
 
 	test("parses bare email credential selector as email shorthand", () => {

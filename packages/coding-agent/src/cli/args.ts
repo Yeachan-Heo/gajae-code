@@ -3,6 +3,7 @@
  */
 import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai";
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@gajae-code/utils";
+import { CliParseError } from "@gajae-code/utils/cli";
 import chalk from "chalk";
 import { parseEffort } from "../thinking";
 import { BUILTIN_TOOLS } from "../tools";
@@ -137,7 +138,11 @@ export function parseArgs(args: string[]): Args {
 			result.default = true;
 		} else if (arg === "--api-key" && i + 1 < args.length) {
 			result.apiKey = args[++i];
-		} else if (arg === "--credential" && i + 1 < args.length) {
+		} else if (arg === "--credential") {
+			const next = args[i + 1];
+			if (!next || next.startsWith("-")) {
+				throw new CliParseError("--credential requires <selector>");
+			}
 			result.credential = args[++i];
 		} else if (arg === "--system-prompt" && i + 1 < args.length) {
 			result.systemPrompt = args[++i];

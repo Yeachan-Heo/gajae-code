@@ -64,7 +64,8 @@ import sys
     prompt_accepted_json,
 ) = sys.argv[1:]
 
-def rel_to_workdir(value: str) -> str | None:
+
+def rel_to_workdir(value):
     if not value:
         return None
     try:
