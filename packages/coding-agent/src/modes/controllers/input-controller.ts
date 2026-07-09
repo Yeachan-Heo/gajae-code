@@ -18,7 +18,7 @@ import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
-import { resolvePastedImagePath } from "../../utils/pasted-image-path";
+import { formatPastedImageReference, resolvePastedImagePath } from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
 
@@ -1096,7 +1096,7 @@ export class InputController {
 				data: image.data,
 				mimeType: image.mimeType,
 			});
-			this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
+			this.ctx.editor.insertText(`${formatPastedImageReference(this.#nextImagePlaceholder(), image.resolvedPath)} `);
 			this.ctx.showStatus(`Attached image: ${path.basename(image.resolvedPath)}`, { dim: true });
 			this.ctx.ui.requestRender();
 			return true;

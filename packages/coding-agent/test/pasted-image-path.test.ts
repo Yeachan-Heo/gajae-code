@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { decodePastedPathCandidate, resolvePastedImagePath } from "../src/utils/pasted-image-path";
+import {
+	decodePastedPathCandidate,
+	formatPastedImageReference,
+	resolvePastedImagePath,
+} from "../src/utils/pasted-image-path";
 
 const NNBSP = "\u202f"; // narrow no-break space used by macOS screenshot names
 
@@ -130,6 +134,21 @@ describe("resolvePastedImagePath", () => {
 	it("rejects empty and whitespace-only pastes", () => {
 		expect(resolvePastedImagePath("")).toBeUndefined();
 		expect(resolvePastedImagePath("   ")).toBeUndefined();
+	});
+});
+
+describe("formatPastedImageReference", () => {
+	it("keeps the image placeholder while preserving the exact source path", () => {
+		const imagePath = `/tmp/Screenshot 2026-07-09 at 10.00.00${NNBSP}PM.png`;
+		expect(formatPastedImageReference("[image 1]", imagePath)).toBe(
+			`[image 1] source="/tmp/Screenshot 2026-07-09 at 10.00.00${NNBSP}PM.png"`,
+		);
+	});
+
+	it("JSON-escapes paths so spaces, quotes, and backslashes stay model-readable", () => {
+		expect(formatPastedImageReference("[image 2]", String.raw`C:\Users\me\shot "final".png`)).toBe(
+			String.raw`[image 2] source="C:\\Users\\me\\shot \"final\".png"`,
+		);
 	});
 });
 

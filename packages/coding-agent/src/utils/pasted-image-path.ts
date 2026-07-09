@@ -4,8 +4,9 @@
  * Some terminal/clipboard integrations paste a temporary filesystem path after a
  * copied image is pasted into the editor (for example `/tmp/clipboard-...png`).
  * Only those recognized clipboard temp files are auto-attached and replaced with
- * an `[image N]` placeholder. Ordinary image paths remain literal prompt text;
- * users attach saved files explicitly with `@path/to/image.png`.
+ * an `[image N] source="/path"` reference so the model receives both the image
+ * payload and the raw temp file path. Ordinary image paths remain literal prompt
+ * text; users attach saved files explicitly with `@path/to/image.png`.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -176,4 +177,8 @@ export function resolvePastedImagePath(text: string, options?: ResolvePastedImag
 	}
 	if (!hasSupportedImageMagic(resolved)) return undefined;
 	return resolved;
+}
+
+export function formatPastedImageReference(placeholder: string, imagePath: string): string {
+	return `${placeholder} source=${JSON.stringify(imagePath)}`;
 }

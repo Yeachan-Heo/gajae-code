@@ -6,7 +6,7 @@
 - Added `gjc --credential <selector>` for pinning a stored provider credential by `email:`, `id:`, `account:`, `project:`, or `provider/email:` during a session.
 - Added `--mpreset <profile>` support to Telegram `/session_create`, forwarding both `--mpreset <name>` and `--mpreset=<name>` as split argv to the spawned GJC child.
 - Added the built-in `skill_discovery` tool for runtime discovery of custom project/user skills without injecting the full skill catalog into the core prompt.
-- Pasting or drag-dropping a path to an existing image file now attaches the image and inserts an `[image N]` placeholder, including quoted paths, `file://` URIs, `~/` expansion, spaces, and macOS screenshot narrow no-break spaces.
+- Pasted clipboard-temp image paths now attach as `[image N] source="/path"`, so the model receives both the image payload and the retrievable raw temp file path; ordinary saved image paths remain literal prompt text instead of being consumed into opaque placeholders.
 
 ### Changed
 
