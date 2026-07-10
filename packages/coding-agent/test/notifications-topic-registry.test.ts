@@ -163,6 +163,15 @@ describe("TopicRegistry", () => {
 		expect(reloaded.needsIdentity("s1")).toBe(false);
 		expect(reloaded.sessionForTopic("t1")).toBe("s1");
 	});
+
+	test("serializes an optional Telegram chat scope", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "t1");
+		expect(reg.serialize("-10042")).toMatchObject({
+			chatId: "-10042",
+			topics: { s1: { topicId: "t1" } },
+		});
+	});
 	test("concurrent getOrCreateTopic for one session creates exactly one topic (no race)", async () => {
 		const reg = new TopicRegistry();
 		let creates = 0;

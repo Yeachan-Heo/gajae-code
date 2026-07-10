@@ -225,6 +225,40 @@ class ReplayRenameBotApi extends FakeBotApi {
 	}
 }
 
+class ReplayInboundBotApi extends FakeBotApi {
+	getChatFailure: (() => unknown) | undefined;
+
+	override async call(method: string, body: unknown): Promise<unknown> {
+		if (method === "getUpdates") {
+			this.calls.push({ method, body });
+			const offset = (body as { offset?: number }).offset ?? 0;
+			if (offset <= 7) {
+				return {
+					ok: true,
+					result: [
+						{
+							update_id: 7,
+							message: {
+								chat: { id: 42, type: "private" },
+								text: "ok",
+								reply_to_message: { message_id: 55 },
+							},
+						},
+					],
+				};
+			}
+			return { ok: true, result: [] };
+		}
+		if (method === "getChat" && this.getChatFailure) {
+			const failure = this.getChatFailure;
+			this.getChatFailure = undefined;
+			this.calls.push({ method, body });
+			return failure();
+		}
+		return super.call(method, body);
+	}
+}
+
 class FailingCallbackAckBotApi extends FakeBotApi {
 	override async call(method: string, body: unknown): Promise<unknown> {
 		if (method === "answerCallbackQuery") {
@@ -1810,6 +1844,72 @@ test("a delayed user topic rename is immediately restored after a completed daem
 	expect(bot.calls.filter(c => c.method === "editForumTopic")).toHaveLength(0);
 });
 
+test("configured forum preserves admin topic renames but ignores ordinary members", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "supergroup", is_forum: true } };
+		if (method === "getChatMember") {
+			return { ok: true, result: { status: body.user_id === 100 ? "administrator" : "member" } };
+		}
+		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 777 } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+		rich: { enabled: false },
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+		title: "Generated",
+	});
+	bot.calls = [];
+
+	await daemon.handleTelegramUpdate(
+		forumTopicEditedUpdate(41, 777, "Member choice", {
+			chat: { id: -10042 },
+			from: { id: 99, is_bot: false },
+		}),
+	);
+	expect((await readTopicAuthorityState(agentDir)).topics.S).not.toMatchObject({
+		name: "Member choice",
+		nameOwner: "user",
+	});
+
+	await daemon.handleTelegramUpdate(
+		forumTopicEditedUpdate(42, 777, "Admin choice", {
+			chat: { id: -10042 },
+			from: { id: 100, is_bot: false },
+		}),
+	);
+	expect((await readTopicAuthorityState(agentDir)).topics.S).toMatchObject({
+		name: "Admin choice",
+		nameOwner: "user",
+		nameReconcilePending: false,
+	});
+	expect(bot.calls.filter(call => call.method === "getChatMember").map(call => call.body.user_id)).toEqual([99, 100]);
+
+	bot.calls = [];
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+		title: "Later generated title",
+	});
+	expect(bot.calls.filter(call => call.method === "editForumTopic")).toHaveLength(0);
+});
+
 test("bot-originated topic edit service messages do not claim user ownership", async () => {
 	const { bot, daemon, session, threadId } = await identityTopicHarness({ title: "First title" });
 	bot.calls = [];
@@ -1995,6 +2095,165 @@ test.each([
 		userNameUpdateId: 51,
 	});
 	expect(bot.calls.filter(call => call.method === "getUpdates").map(call => call.body.offset)).toEqual([0, 0, 52]);
+});
+
+test.each([
+	[
+		"thrown getChat",
+		() => {
+			throw new Error("getChat unavailable");
+		},
+	],
+	["getChat ok:false", () => ({ ok: false, description: "temporary failure" })],
+	["malformed getChat", () => ({ ok: true, result: {} })],
+])("indeterminate %s retries an inbound private ask reply", async (_name, getChatFailure) => {
+	FakeWs.instances = [];
+	const bot = new ReplayInboundBotApi();
+	bot.getChatFailure = getChatFailure;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		setTimeoutImpl: ((cb: () => void) => {
+			cb();
+			return 0;
+		}) as any,
+	});
+	daemon.connectSession("S", "ws://s", "ts");
+	daemon.messageRoutes.set("55", { sessionId: "S", actionId: "A" });
+	daemon.sessions.get("S")!.pending.set("A", { sessionId: "S", actionId: "A" });
+
+	await daemon.pollOnce();
+	expect(FakeWs.instances[0]!.sent).toHaveLength(0);
+
+	await daemon.pollOnce();
+	expect(JSON.parse(FakeWs.instances[0]!.sent[0]!)).toEqual({ type: "reply", id: "A", answer: "ok", token: "ts" });
+
+	await daemon.pollOnce();
+	expect(bot.calls.filter(call => call.method === "getUpdates").map(call => call.body.offset)).toEqual([0, 0, 8]);
+});
+
+test("unroutable private-chat messages advance the poller without probing getChat", async () => {
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getUpdates") {
+			const offset = body.offset ?? 0;
+			return {
+				ok: true,
+				result:
+					offset <= 7 ? [{ update_id: 7, message: { chat: { id: 42, type: "private" }, text: "unrelated" } }] : [],
+			};
+		}
+		if (method === "getChat") throw new Error("getChat unavailable");
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+
+	await daemon.pollOnce();
+	await daemon.pollOnce();
+
+	expect(bot.calls.filter(call => call.method === "getUpdates").map(call => call.body.offset)).toEqual([0, 8]);
+	expect(bot.calls.filter(call => call.method === "getChat")).toHaveLength(0);
+});
+
+test.each([
+	"/session_recent",
+	"/rich on",
+])("indeterminate private authority retries routeable command %s", async command => {
+	const bot = new FakeBotApi();
+	const originalCall = bot.call.bind(bot);
+	let getChatCalls = 0;
+	bot.call = (async (method: string, body: any) => {
+		if (method === "getUpdates") {
+			bot.calls.push({ method, body });
+			const offset = body.offset ?? 0;
+			return {
+				ok: true,
+				result:
+					offset <= 7
+						? [{ update_id: 7, message: { chat: { id: 42, type: "private" }, text: command, message_id: 1 } }]
+						: [],
+			};
+		}
+		if (method === "getChat") {
+			bot.calls.push({ method, body });
+			getChatCalls++;
+			if (getChatCalls === 1) throw new Error("getChat unavailable");
+			return { ok: true, result: { type: "private" } };
+		}
+		return originalCall(method, body);
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		setTimeoutImpl: ((callback: () => void) => {
+			callback();
+			return 0;
+		}) as any,
+	});
+
+	await daemon.pollOnce();
+	await daemon.pollOnce();
+	await daemon.pollOnce();
+
+	expect(bot.calls.filter(call => call.method === "getUpdates").map(call => call.body.offset)).toEqual([0, 0, 8]);
+	expect(getChatCalls).toBe(2);
+});
+
+test("stale callback advances the poller when private authority is indeterminate", async () => {
+	const bot = new FakeBotApi();
+	const originalCall = bot.call.bind(bot);
+	bot.call = (async (method: string, body: any) => {
+		if (method === "getUpdates") {
+			bot.calls.push({ method, body });
+			const offset = body.offset ?? 0;
+			return {
+				ok: true,
+				result:
+					offset <= 7
+						? [
+								{
+									update_id: 7,
+									callback_query: { id: "stale", data: "missing", message: { chat: { id: 42 } } },
+								},
+							]
+						: [],
+			};
+		}
+		if (method === "getChat") {
+			bot.calls.push({ method, body });
+			throw new Error("getChat unavailable");
+		}
+		return originalCall(method, body);
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+
+	await daemon.pollOnce();
+	await daemon.pollOnce();
+
+	expect(bot.calls.filter(call => call.method === "getUpdates").map(call => call.body.offset)).toEqual([0, 8]);
+	expect(bot.calls.filter(call => call.method === "getChat")).toHaveLength(1);
+	expect(bot.calls.some(call => call.method === "answerCallbackQuery")).toBe(true);
+	expect(bot.calls.some(call => call.method === "sendMessage")).toBe(false);
 });
 
 test("remote-success user-name reconciliation retries after its pending-clear write fails", async () => {
@@ -2324,17 +2583,307 @@ test("threaded mode off: image_attachment uploads flat without message_thread_id
 	expect(notice).toHaveLength(1);
 });
 
-test("non-private chat: fails closed before topic creation or flat delivery", async () => {
-	for (const chatType of ["supergroup", "group", "channel"]) {
+test("forum supergroup uses a session topic for outbound transport only", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "supergroup", is_forum: true } };
+		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 777 } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+		rich: { enabled: false },
+	});
+	const sent: string[] = [];
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		ws: {
+			readyState: 1,
+			send(value: string) {
+				sent.push(value);
+			},
+		},
+		pending: new Map(),
+	};
+	daemon.sessions.set("S", session as any);
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "context_update",
+		sessionId: "S",
+		lastMessage: "session output",
+	});
+
+	expect(bot.calls.filter(c => c.method === "getChat")).toHaveLength(1);
+	expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(1);
+	expect(bot.calls.some(c => c.method === "sendMessage" && c.body.message_thread_id === 777)).toBe(true);
+
+	session.pending.set("ask1", { sessionId: "S", actionId: "ask1" });
+	bot.calls = [];
+	for (const [updateId, text] of [
+		[7, "/context"],
+		[8, "/verbose"],
+		[9, "answer the pending ask"],
+	] as const) {
+		await daemon.handleTelegramUpdate({
+			update_id: updateId,
+			message: {
+				chat: { id: -10042, type: "supergroup" },
+				message_thread_id: 777,
+				message_id: 500 + updateId,
+				text,
+			},
+		});
+	}
+	expect(sent).toHaveLength(0);
+	expect(bot.calls).toHaveLength(0);
+});
+
+test("forum supergroup does not fall back to flat delivery when topic creation fails", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "supergroup", is_forum: true } };
+		if (method === "createForumTopic") return { ok: true, result: {} };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+		rich: { enabled: false },
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+
+	expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(1);
+	expect(
+		bot.calls.filter(c => ["sendMessage", "sendPhoto", "sendDocument", "sendRichMessage"].includes(c.method)),
+	).toHaveLength(0);
+});
+
+test.each([
+	["missing", undefined],
+	["null", null],
+	["non-boolean", "yes"],
+])("indeterminate forum metadata (%s) is retried instead of cached", async (_name, malformedValue) => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	let getChatCalls = 0;
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") {
+			getChatCalls++;
+			if (getChatCalls === 1) {
+				return { ok: true, result: { type: "supergroup", is_forum: malformedValue } };
+			}
+			return { ok: true, result: { type: "supergroup", is_forum: true } };
+		}
+		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 888 } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+		rich: { enabled: false },
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	const identity = { type: "identity_header", sessionId: "S", repo: "r", branch: "b" };
+
+	await daemon.handleSessionMessage(session as any, identity);
+	expect(getChatCalls).toBe(2);
+	expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(1);
+	expect(bot.calls.some(c => c.method === "sendMessage" && c.body.message_thread_id === 888)).toBe(true);
+});
+
+test.each([
+	[
+		"transient getChat failure",
+		() => {
+			throw new Error("getChat unavailable");
+		},
+	],
+	["malformed forum metadata", () => ({ ok: true, result: { type: "supergroup" } })],
+])("forum action retries after %s instead of dropping the one-shot frame", async (_name, firstResponse) => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	let getChatCalls = 0;
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") {
+			getChatCalls++;
+			if (getChatCalls === 1) return firstResponse();
+			return { ok: true, result: { type: "supergroup", is_forum: true } };
+		}
+		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 889 } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: 91 } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+		rich: { enabled: false },
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "action_needed",
+		sessionId: "S",
+		id: "ask1",
+		kind: "ask",
+		question: "Proceed?",
+		options: ["Yes"],
+	});
+
+	expect(getChatCalls).toBe(2);
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+	expect(bot.calls.some(call => call.method === "sendMessage" && call.body.message_thread_id === 889)).toBe(true);
+	expect(daemon.messageRoutes.get("91")).toEqual({ sessionId: "S", actionId: "ask1" });
+});
+
+test("persisted topics are scoped to their configured Telegram chat", async () => {
+	const agentDir = tempAgentDir();
+	const firstBot = new FakeBotApi();
+	firstBot.call = (async (method: string, body: any) => {
+		firstBot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "supergroup", is_forum: true } };
+		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 777 } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: firstBot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const firstDaemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner-a",
+		botToken: "tok",
+		chatId: "-10001",
+		botApi: firstBot,
+		rich: { enabled: false },
+	});
+	const firstSession = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	await firstDaemon.handleSessionMessage(firstSession as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	const persisted = JSON.parse(
+		await fs.promises.readFile(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"),
+	) as { chatId?: string };
+	expect(persisted.chatId).toBe("-10001");
+
+	const secondBot = new FakeBotApi();
+	secondBot.call = (async (method: string, body: any) => {
+		secondBot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "supergroup", is_forum: true } };
+		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 888 } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: secondBot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const secondDaemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner-b",
+		botToken: "tok",
+		chatId: "-10002",
+		botApi: secondBot,
+		rich: { enabled: false },
+	});
+	await secondDaemon.loadTopics();
+	const secondSession = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	await secondDaemon.handleSessionMessage(secondSession as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+
+	expect(secondBot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(1);
+	expect(secondBot.calls.some(c => c.method === "sendMessage" && c.body.message_thread_id === 888)).toBe(true);
+	expect(secondBot.calls.some(c => c.body.message_thread_id === 777)).toBe(false);
+});
+
+test("legacy unscoped topic state is rejected because its destination cannot be proven", async () => {
+	const agentDir = tempAgentDir();
+	const stateDir = daemonPaths(agentDir).dir;
+	await fs.promises.mkdir(stateDir, { recursive: true });
+	await fs.promises.writeFile(
+		path.join(stateDir, "telegram-topics.json"),
+		JSON.stringify({
+			topics: {
+				S: { topicId: "777", identitySent: true, createdAt: 0, name: "Legacy topic" },
+			},
+		}),
+	);
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "supergroup", is_forum: true } };
+		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 888 } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+		rich: { enabled: false },
+	});
+	await daemon.loadTopics();
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+	expect(bot.calls.some(call => call.body.message_thread_id === 777)).toBe(false);
+	expect(bot.calls.some(call => call.body.message_thread_id === 888)).toBe(true);
+});
+
+test("non-forum groups and channels fail closed before topic creation or flat delivery", async () => {
+	for (const chat of [{ type: "supergroup", is_forum: false }, { type: "group" }, { type: "channel" }]) {
 		const agentDir = tempAgentDir();
 		const bot = new FakeBotApi();
-		// Even if the target chat would accept forum topic creation, the paired chat
-		// contract is private-only, so the daemon must fail closed before creating
-		// topics or sending session content into a shared chat.
+		// Only a supergroup explicitly reported as a forum is topic-capable; other
+		// shared destinations must never receive session content.
 		bot.call = (async (method: string, body: any) => {
 			bot.calls.push({ method, body });
 			if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 777 } };
-			if (method === "getChat") return { ok: true, result: { type: chatType } };
+			if (method === "getChat") return { ok: true, result: chat };
 			if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
 			return { ok: true, result: true };
 		}) as any;
@@ -2367,8 +2916,11 @@ test("non-private chat: fails closed before topic creation or flat delivery", as
 			options: ["Yes"],
 		});
 
-		expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(0);
-		expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
+		expect(
+			bot.calls.filter(c =>
+				["createForumTopic", "sendMessage", "sendPhoto", "sendDocument", "sendRichMessage"].includes(c.method),
+			),
+		).toHaveLength(0);
 	}
 });
 
@@ -2558,6 +3110,52 @@ test("session_closed deletes the topic and resume creates a fresh visible topic"
 	expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("queued-before-delete"))).toBe(
 		false,
 	);
+});
+
+test("session_closed clears local topic state and queued frames when getChat is unavailable", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		now: () => 0,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	for (let i = 0; i < 25; i++) {
+		await daemon.handleSessionMessage(session as any, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: `queued-before-close-${i}`,
+		});
+	}
+	expect((daemon as any).pool.pending).toBeGreaterThan(0);
+
+	const originalCall = bot.call.bind(bot);
+	bot.call = (async (method: string, body: unknown) => {
+		if (method === "getChat") throw new Error("getChat unavailable");
+		return originalCall(method, body);
+	}) as any;
+	(daemon as any).pairedChatTopicCapable = undefined;
+	(daemon as any).pairedChatPrivacy = undefined;
+	bot.calls = [];
+
+	await daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
+
+	expect(bot.calls.some(call => call.method === "deleteForumTopic")).toBe(false);
+	expect((daemon as any).pool.pending).toBe(0);
+	expect((daemon as any).topics.get("S")).toBeUndefined();
+	expect((await readTopicAuthorityState(agentDir)).topics.S).toBeUndefined();
 });
 
 test("session_closed clears reply message routes for the closed session", async () => {
@@ -3437,6 +4035,7 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 	fs.writeFileSync(
 		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
 		JSON.stringify({
+			chatId: "42",
 			topics: {
 				stale: { topicId: "101", identitySent: true, createdAt: 0, name: "stale" },
 				dead: { topicId: "102", identitySent: true, createdAt: 0, name: "dead" },
@@ -3474,7 +4073,10 @@ test("scanRoots reaps missing endpoint topics only when all roots are readable a
 	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
 	fs.writeFileSync(
 		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
-		JSON.stringify({ topics: { missing: { topicId: "201", identitySent: true, createdAt: 0, name: "missing" } } }),
+		JSON.stringify({
+			chatId: "42",
+			topics: { missing: { topicId: "201", identitySent: true, createdAt: 0, name: "missing" } },
+		}),
 	);
 	const bot = new FakeBotApi();
 	const daemon = new TelegramNotificationDaemon({
@@ -3499,7 +4101,10 @@ test("scanRoots reaps missing endpoint topics only when all roots are readable a
 	fs.mkdirSync(daemonPaths(blockedAgentDir).dir, { recursive: true });
 	fs.writeFileSync(
 		path.join(daemonPaths(blockedAgentDir).dir, "telegram-topics.json"),
-		JSON.stringify({ topics: { kept: { topicId: "202", identitySent: true, createdAt: 0, name: "kept" } } }),
+		JSON.stringify({
+			chatId: "42",
+			topics: { kept: { topicId: "202", identitySent: true, createdAt: 0, name: "kept" } },
+		}),
 	);
 	const blockedBot = new FakeBotApi();
 	const blockedDaemon = new TelegramNotificationDaemon({
