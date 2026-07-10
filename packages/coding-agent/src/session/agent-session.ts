@@ -146,8 +146,8 @@ import {
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
-import { resolveModelServiceTierPolicy } from "../config/model-service-tier-policy";
 import type { ModelServiceTierOverrides, ModelServiceTierPolicyStatus } from "../config/model-service-tier-policy";
+import { resolveModelServiceTierPolicy } from "../config/model-service-tier-policy";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
@@ -7140,7 +7140,9 @@ export class AgentSession {
 	 */
 	isFastModeEnabled(): boolean {
 		return (
-			this.#rawServiceTier === "priority" || this.#rawServiceTier === "claude-only" || this.#rawServiceTier === "openai-only"
+			this.#rawServiceTier === "priority" ||
+			this.#rawServiceTier === "claude-only" ||
+			this.#rawServiceTier === "openai-only"
 		);
 	}
 
@@ -7174,7 +7176,6 @@ export class AgentSession {
 		return status.effectiveTier === "priority";
 	}
 
-
 	/**
 	 * Effective service tier applied to task-tool subagent sessions
 	 * (executor/architect/planner/critic). They run under `task.serviceTier`
@@ -7193,7 +7194,6 @@ export class AgentSession {
 		if (configured === "none") return undefined;
 		return configured;
 	}
-
 
 	/**
 	 * Provider-aware fast-mode predicate for task-tool subagent roles, evaluated
@@ -8311,7 +8311,6 @@ export class AgentSession {
 	}
 
 	#setModelWithProviderSessionReset(model: Model): void {
-
 		const currentModel = this.model;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);

@@ -1382,7 +1382,7 @@ export class ModelSelectorComponent extends Container {
 					? "Set for all role agents"
 					: i === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + 1
 						? "Set for all targets"
-						: ["Fast: Inherit", "Fast: On", "Fast: Off"][i - GJC_MODEL_ASSIGNMENT_TARGET_IDS.length - 2] ?? "";
+						: (["Fast: Inherit", "Fast: On", "Fast: Off"][i - GJC_MODEL_ASSIGNMENT_TARGET_IDS.length - 2] ?? "");
 			this.#listContainer.addChild(
 				new Text(`${prefix}${i === this.#selectedActionIndex ? theme.fg("accent", label) : label}`, 0, 0),
 			);

@@ -64,8 +64,8 @@ function fastStatusRoleTargets(): Array<{ id: GjcModelAssignmentTargetId; label:
 	return GJC_MODEL_ASSIGNMENT_TARGET_IDS.map(id => ({
 		id,
 		label: GJC_MODEL_ASSIGNMENT_TARGETS[id].tag ?? id.toUpperCase(),
-	// The current row is effective; DEFAULT is a main-tier configured projection,
-	// while task-agent rows are projections evaluated against task.serviceTier.
+		// The current row is effective; DEFAULT is a main-tier configured projection,
+		// while task-agent rows are projections evaluated against task.serviceTier.
 		isSubagentRole: GJC_MODEL_ASSIGNMENT_TARGETS[id].settingsPath === "task.agentModelOverrides",
 	}));
 }

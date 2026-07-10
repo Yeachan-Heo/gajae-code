@@ -907,7 +907,9 @@ export class SelectorController {
 								this.ctx.session.refreshServiceTierForModel();
 								this.ctx.showStatus(`Fast mode ${selection.override} for ${modelKey}.`);
 							} catch (err) {
-								this.ctx.showError(`Fast mode update failed: ${err instanceof Error ? err.message : String(err)}`);
+								this.ctx.showError(
+									`Fast mode update failed: ${err instanceof Error ? err.message : String(err)}`,
+								);
 							}
 							return;
 						}

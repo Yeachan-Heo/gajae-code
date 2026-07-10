@@ -1,4 +1,4 @@
-import { resolveServiceTier, type Provider, type ResolvedServiceTier, type ServiceTier } from "@gajae-code/ai";
+import { type Provider, type ResolvedServiceTier, resolveServiceTier, type ServiceTier } from "@gajae-code/ai";
 
 /** Persisted per-model policy values. `inherit` is runtime-only. */
 export type ModelServiceTierOverride = "on" | "off";
@@ -39,7 +39,8 @@ export function resolveModelServiceTierPolicy(args: {
 	overrides?: unknown;
 	decision?: ModelServiceTierDecision;
 }): ModelServiceTierPolicyStatus {
-	const overrideKey = args.provider === undefined ? args.model : formatModelServiceTierOverrideKey(args.provider, args.model);
+	const overrideKey =
+		args.provider === undefined ? args.model : formatModelServiceTierOverrideKey(args.provider, args.model);
 	const override = sanitizeModelServiceTierOverrides(args.overrides)[overrideKey];
 	const decision = args.decision ?? override ?? "inherit";
 	const providerResolvedTier = resolveServiceTier(args.rawBaseline, args.provider);
@@ -50,7 +51,15 @@ export function resolveModelServiceTierPolicy(args: {
 			: decision === "off" && providerResolvedTier === "priority"
 				? undefined
 				: providerResolvedTier;
-	return { rawBaseline: args.rawBaseline, rawRequestTier, providerResolvedTier, decision, effectiveTier, overrideKey, override };
+	return {
+		rawBaseline: args.rawBaseline,
+		rawRequestTier,
+		providerResolvedTier,
+		decision,
+		effectiveTier,
+		overrideKey,
+		override,
+	};
 }
 
 export const getModelServiceTierOverrideKey = formatModelServiceTierOverrideKey;

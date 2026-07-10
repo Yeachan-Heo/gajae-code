@@ -117,9 +117,9 @@ export function buildFastStatusReport(args: BuildFastStatusReportArgs): string {
 		const resolved = session.resolveRoleModelWithThinking(target.id);
 		if (resolved.model) {
 			const fast = target.isSubagentRole
-				? (session.isFastForModel
+				? session.isFastForModel
 					? session.isFastForModel(resolved.model, { subagent: true })
-					: session.isFastForSubagentProvider?.(resolved.model.provider) ??
+					: (session.isFastForSubagentProvider?.(resolved.model.provider) ??
 						session.isFastForProvider(resolved.model.provider))
 				: session.isFastForModel
 					? session.isFastForModel(resolved.model)

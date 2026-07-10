@@ -15,12 +15,9 @@ import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
 import { ModelRegistry } from "../config/model-registry";
 import { formatModelString, resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
+import { type ModelServiceTierOverrides, sanitizeModelServiceTierOverrides } from "../config/model-service-tier-policy";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { Settings } from "../config/settings";
-import {
-	sanitizeModelServiceTierOverrides,
-	type ModelServiceTierOverrides,
-} from "../config/model-service-tier-policy";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
@@ -682,11 +679,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const settings = options.settings ?? Settings.isolated();
 	const modelServiceTierOverrides = options.modelServiceTierOverrides ?? settings.getGlobalModelServiceTierOverrides();
-	const subagentSettings = createSubagentSettings(
-		settings,
-		options.inheritedServiceTier,
-		modelServiceTierOverrides,
-	);
+	const subagentSettings = createSubagentSettings(settings, options.inheritedServiceTier, modelServiceTierOverrides);
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	const maxRuntimeMs = Math.max(0, Math.trunc(Number(settings.get("task.maxRuntimeMs") ?? 0) || 0));
 	const parentDepth = options.taskDepth ?? 0;

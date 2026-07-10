@@ -14,9 +14,9 @@ import {
 	type Message,
 	type Model,
 	type ProviderSessionState,
+	type ServiceTier,
 	type SimpleStreamOptions,
 	streamSimple,
-	type ServiceTier,
 } from "@gajae-code/ai";
 import {
 	getOpenAICodexTransportDetails,
@@ -50,8 +50,8 @@ import {
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "./config/model-resolver";
+import { type ModelServiceTierOverrides, resolveModelServiceTierPolicy } from "./config/model-service-tier-policy";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
-import { resolveModelServiceTierPolicy, type ModelServiceTierOverrides } from "./config/model-service-tier-policy";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
 import type { BashRestrictionProfile } from "./tools/bash-allowed-prefixes";

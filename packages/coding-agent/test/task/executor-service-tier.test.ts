@@ -61,11 +61,7 @@ describe("createSubagentSettings service-tier inheritance", () => {
 		base.set("serviceTier", "priority");
 		base.set("modelServiceTierOverrides", overrides);
 		const subagent = createSubagentSettings(base, "openai-only", base.getGlobalModelServiceTierOverrides());
-		const nested = createSubagentSettings(
-			subagent,
-			"openai-only",
-			subagent.get("modelServiceTierOverrides"),
-		);
+		const nested = createSubagentSettings(subagent, "openai-only", subagent.get("modelServiceTierOverrides"));
 		expect(subagent.get("serviceTier")).toBe("openai-only");
 		expect(nested.get("serviceTier")).toBe("openai-only");
 		expect(subagent.get("modelServiceTierOverrides")).toEqual(overrides);

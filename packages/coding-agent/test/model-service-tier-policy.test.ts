@@ -35,17 +35,28 @@ describe("resolveModelServiceTierPolicy", () => {
 	});
 	it("honors exact-model inherit, on, and off decisions over the global baseline", () => {
 		const overrides = { "openai/gpt-5": "off" as const, "openai/gpt-4.1": "on" as const };
-		expect(resolveModelServiceTierPolicy({ rawBaseline: "priority", provider: "openai", model: "gpt-5", overrides })).toMatchObject({
+		expect(
+			resolveModelServiceTierPolicy({ rawBaseline: "priority", provider: "openai", model: "gpt-5", overrides }),
+		).toMatchObject({
 			decision: "off",
 			providerResolvedTier: "priority",
 			effectiveTier: undefined,
 		});
-		expect(resolveModelServiceTierPolicy({ rawBaseline: "flex", provider: "openai", model: "gpt-4.1", overrides })).toMatchObject({
+		expect(
+			resolveModelServiceTierPolicy({ rawBaseline: "flex", provider: "openai", model: "gpt-4.1", overrides }),
+		).toMatchObject({
 			decision: "on",
 			rawRequestTier: "priority",
 			effectiveTier: "priority",
 		});
-		expect(resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "anthropic", model: "claude-sonnet", decision: "inherit" })).toMatchObject({
+		expect(
+			resolveModelServiceTierPolicy({
+				rawBaseline: "openai-only",
+				provider: "anthropic",
+				model: "claude-sonnet",
+				decision: "inherit",
+			}),
+		).toMatchObject({
 			decision: "inherit",
 			providerResolvedTier: undefined,
 			effectiveTier: undefined,
@@ -57,15 +68,26 @@ describe("resolveModelServiceTierPolicy", () => {
 			[formatModelServiceTierOverrideKey("openai", "shared")]: "on" as const,
 			[formatModelServiceTierOverrideKey("anthropic", "shared")]: "off" as const,
 		};
-		expect(resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "openai", model: "shared", overrides })).toMatchObject({
+		expect(
+			resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "openai", model: "shared", overrides }),
+		).toMatchObject({
 			decision: "on",
 			effectiveTier: "priority",
 		});
-		expect(resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "anthropic", model: "shared", overrides })).toMatchObject({
+		expect(
+			resolveModelServiceTierPolicy({
+				rawBaseline: "openai-only",
+				provider: "anthropic",
+				model: "shared",
+				overrides,
+			}),
+		).toMatchObject({
 			decision: "off",
 			effectiveTier: undefined,
 		});
-		expect(resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "google", model: "shared", overrides })).toMatchObject({
+		expect(
+			resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "google", model: "shared", overrides }),
+		).toMatchObject({
 			decision: "inherit",
 			providerResolvedTier: undefined,
 			effectiveTier: undefined,
@@ -74,13 +96,23 @@ describe("resolveModelServiceTierPolicy", () => {
 
 	it("requests priority when the per-model decision is on", () => {
 		expect(
-			resolveModelServiceTierPolicy({ rawBaseline: "flex", provider: "anthropic", model: "claude-sonnet", decision: "on" }),
+			resolveModelServiceTierPolicy({
+				rawBaseline: "flex",
+				provider: "anthropic",
+				model: "claude-sonnet",
+				decision: "on",
+			}),
 		).toMatchObject({ rawRequestTier: "priority", effectiveTier: "priority" });
 	});
 
 	it("suppresses only a priority-resolved baseline when the decision is off", () => {
 		expect(
-			resolveModelServiceTierPolicy({ rawBaseline: "priority", provider: "openai", model: "gpt-5", decision: "off" }),
+			resolveModelServiceTierPolicy({
+				rawBaseline: "priority",
+				provider: "openai",
+				model: "gpt-5",
+				decision: "off",
+			}),
 		).toMatchObject({ providerResolvedTier: "priority", effectiveTier: undefined });
 		expect(
 			resolveModelServiceTierPolicy({ rawBaseline: "flex", provider: "openai", model: "gpt-5", decision: "off" }),
@@ -88,15 +120,21 @@ describe("resolveModelServiceTierPolicy", () => {
 	});
 
 	it("applies provider-scoped OpenAI and Anthropic baselines", () => {
-		expect(resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "openai", model: "gpt-5" })).toMatchObject({
+		expect(
+			resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "openai", model: "gpt-5" }),
+		).toMatchObject({
 			providerResolvedTier: "priority",
 			effectiveTier: "priority",
 		});
-		expect(resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "anthropic", model: "claude-sonnet" })).toMatchObject({
+		expect(
+			resolveModelServiceTierPolicy({ rawBaseline: "openai-only", provider: "anthropic", model: "claude-sonnet" }),
+		).toMatchObject({
 			providerResolvedTier: undefined,
 			effectiveTier: undefined,
 		});
-		expect(resolveModelServiceTierPolicy({ rawBaseline: "claude-only", provider: "anthropic", model: "claude-sonnet" })).toMatchObject({
+		expect(
+			resolveModelServiceTierPolicy({ rawBaseline: "claude-only", provider: "anthropic", model: "claude-sonnet" }),
+		).toMatchObject({
 			providerResolvedTier: "priority",
 			effectiveTier: "priority",
 		});

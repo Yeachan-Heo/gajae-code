@@ -977,7 +977,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "model",
 			label: "Model Service Tier Overrides",
-			description: "Per-model Fast overrides keyed by the exact resolved provider/model identity. Values are on or off; omitted models use the raw baseline service tier.",
+			description:
+				"Per-model Fast overrides keyed by the exact resolved provider/model identity. Values are on or off; omitted models use the raw baseline service tier.",
 		},
 	},
 
