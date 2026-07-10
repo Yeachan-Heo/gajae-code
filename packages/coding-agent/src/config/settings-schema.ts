@@ -1224,7 +1224,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "interaction",
 			label: "Check for Updates",
-			description: "If false, skip update check",
+			description:
+				"Check for newer versions at interactive startup and show a notification. Startup never installs updates; run `gjc update` explicitly. If false, skip the check.",
 		},
 	},
 
