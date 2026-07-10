@@ -381,31 +381,23 @@ function formatModelAssignmentSuccess(
 	if (targetId === "default") return `Default model set to ${selector}.`;
 	return `${targetId} agent model set to ${selector}.`;
 }
-async function notifyModelAssignmentCommitted(
-	runtime: SlashCommandRuntime,
-	options: { titleChanged: boolean },
-): Promise<void> {
-	const failures: string[] = [];
-	if (options.titleChanged) {
-		try {
-			await runtime.notifyTitleChanged?.();
-		} catch (error) {
-			failures.push(`title: ${errorMessage(error)}`);
-		}
-	}
-	try {
-		await runtime.notifyConfigChanged?.();
-	} catch (error) {
-		failures.push(`config: ${errorMessage(error)}`);
-	}
-	if (failures.length > 0) {
-		try {
-			await runtime.output(`Model settings were updated, but notification failed (${failures.join("; ")}).`);
-		} catch {
-			// The model mutation is already committed; output transport failure
-			// must not turn it into a false mutation failure.
-		}
-	}
+function notifyModelAssignmentCommitted(runtime: SlashCommandRuntime, options: { titleChanged: boolean }): void {
+	const notify = (label: "title" | "config", callback: (() => Promise<void> | void) | undefined): void => {
+		if (!callback) return;
+		void Promise.resolve()
+			.then(() => callback())
+			.catch(error =>
+				Promise.resolve()
+					.then(() =>
+						runtime.output(
+							`Model settings were updated, but notification failed (${label}: ${errorMessage(error)}).`,
+						),
+					)
+					.catch(() => {}),
+			);
+	};
+	if (options.titleChanged) notify("title", runtime.notifyTitleChanged);
+	notify("config", runtime.notifyConfigChanged);
 }
 
 function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: string): string {
@@ -642,7 +634,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					}
 					runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
 					await runtime.output(formatModelAssignmentSuccess(parsedArgs.targetId, assignments));
-					await notifyModelAssignmentCommitted(runtime, { titleChanged: includesDefault });
+					notifyModelAssignmentCommitted(runtime, { titleChanged: includesDefault });
 					return commandConsumed();
 				} catch (err) {
 					return usage(`Failed to set model: ${errorMessage(err)}`, runtime);

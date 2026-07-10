@@ -54,6 +54,11 @@ export * from "./settings-schema";
 export interface RawSettings {
 	[key: string]: unknown;
 }
+export interface ConditionalDurableSettingUpdate {
+	path: string;
+	expectedValue: string | undefined;
+	value: string | undefined;
+}
 
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
@@ -390,6 +395,56 @@ export class Settings {
 		}
 		delete current[segments[segments.length - 1]];
 		this.#rebuildMerged();
+	}
+	/**
+	 * Conditionally update persisted leaves while holding the config file lock.
+	 *
+	 * Each update is applied only when the durable value still equals
+	 * `expectedValue`. The returned paths are the updates that won the compare
+	 * and swap. Pending writes for these paths are superseded so a failed
+	 * transaction cannot re-apply its stale materialized values later.
+	 */
+	async compareAndSwapGlobal(updates: readonly ConditionalDurableSettingUpdate[]): Promise<ReadonlySet<string>> {
+		const applied = new Set<string>();
+		for (const update of updates) {
+			this.#modified.delete(update.path);
+		}
+
+		if (!this.#persist || !this.#configPath) {
+			for (const update of updates) {
+				const segments = update.path.split(".");
+				if (Object.is(getByPath(this.#global, segments), update.expectedValue)) {
+					setByPath(this.#global, segments, update.value);
+					applied.add(update.path);
+				}
+			}
+			this.#rebuildMerged();
+			return applied;
+		}
+
+		const configPath = this.#configPath;
+		await withFileLock(configPath, async () => {
+			const current = await this.#loadYaml(configPath);
+			for (const update of updates) {
+				const segments = update.path.split(".");
+				if (Object.is(getByPath(current, segments), update.expectedValue)) {
+					setByPath(current, segments, update.value);
+					applied.add(update.path);
+				}
+			}
+
+			for (const pendingPath of this.#modified) {
+				const segments = pendingPath.split(".");
+				setByPath(current, segments, getByPath(this.#global, segments));
+			}
+
+			if (applied.size > 0 || this.#modified.size > 0) {
+				await Bun.write(configPath, YAML.stringify(current, null, 2));
+			}
+			this.#global = current;
+		});
+		this.#rebuildMerged();
+		return applied;
 	}
 
 	/**

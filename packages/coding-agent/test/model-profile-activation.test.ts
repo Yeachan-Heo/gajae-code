@@ -497,6 +497,67 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
+	test("persisted effort follows the restored baseline when switching to a role-only profile", async () => {
+		const baselineModel = model("openai-codex", "gpt-5.6-sol", {
+			mode: "effort",
+			minLevel: ThinkingLevel.Low,
+			maxLevel: ThinkingLevel.Max,
+		});
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "profile-a",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { default: "openai-codex/gpt-5.6-sol:xhigh" },
+				source: "user",
+			},
+			{
+				name: "role-only-b",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { executor: "openai-codex/gpt-5.6-terra:low" },
+				source: "user",
+			},
+		];
+		const registry = fakeRegistry({ profiles });
+		const session = fakeSession(baselineModel);
+		const settings = Settings.isolated();
+
+		await activateModelProfile(
+			{ session, modelRegistry: registry, settings, profileName: "profile-a" },
+			{ persistDefault: true },
+		);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(settings.getGlobal("defaultThinkingLevel")).toBe(ThinkingLevel.XHigh);
+
+		await activateModelProfile(
+			{ session, modelRegistry: registry, settings, profileName: "role-only-b" },
+			{ persistDefault: true },
+		);
+
+		const persistedEffort = settings.getGlobal("defaultThinkingLevel");
+		expect(session.model).toBe(baselineModel);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(persistedEffort).toBe(ThinkingLevel.Low);
+		expect(settings.getGlobal("modelProfile.default")).toBe("role-only-b");
+
+		const restartedSession = fakeSession(baselineModel);
+		restartedSession.thinkingLevel = persistedEffort;
+		const restartedSettings = Settings.isolated({
+			"modelProfile.default": "role-only-b",
+			defaultThinkingLevel: persistedEffort,
+		});
+		await activateModelProfile(
+			{
+				session: restartedSession,
+				modelRegistry: registry,
+				settings: restartedSettings,
+				profileName: "role-only-b",
+			},
+			{ thinkingLevelOverride: restartedSettings.get("defaultThinkingLevel") },
+		);
+
+		expect(restartedSession.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
+
 	test("missing credentials hard-block before mutation", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({
@@ -541,7 +602,6 @@ describe("model profile activation", () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({
 			"task.agentModelOverrides": { executor: "provider-a/original" },
-			defaultThinkingLevel: ThinkingLevel.Low,
 		});
 		const prepared = await prepareModelProfileActivation({
 			session,
@@ -561,7 +621,7 @@ describe("model profile activation", () => {
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
 		expect(settings.get("modelProfile.default")).toBeUndefined();
-		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
+		expect(settings.getGlobal("defaultThinkingLevel")).toBeUndefined();
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 

@@ -183,6 +183,22 @@ describe("/model batch assignments", () => {
 		expect(output).toEqual(["Default model set to anthropic/claude-3-5-sonnet:high."]);
 	});
 
+	test("nonsettling notifications do not delay a committed assignment result", async () => {
+		const { promise: notification } = Promise.withResolvers<void>();
+		const { output, runtime, settings } = createRuntime();
+		runtime.notifyTitleChanged = () => notification;
+		runtime.notifyConfigChanged = () => notification;
+
+		const result = await Promise.race([
+			executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet:low", runtime),
+			Bun.sleep(50).then(() => "timeout" as const),
+		]);
+
+		expect(result).toEqual({ consumed: true });
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:low");
+		expect(output).toEqual(["Default model set to anthropic/claude-3-5-sonnet:low."]);
+	});
+
 	test("notification failures do not report a committed assignment as failed", async () => {
 		const { output, runtime, settings } = createRuntime();
 		runtime.notifyTitleChanged = async () => {
@@ -195,11 +211,13 @@ describe("/model batch assignments", () => {
 		await expect(executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet:low", runtime)).resolves.toEqual({
 			consumed: true,
 		});
+		await Bun.sleep(0);
 
 		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:low");
 		expect(output).toEqual([
 			"Default model set to anthropic/claude-3-5-sonnet:low.",
-			"Model settings were updated, but notification failed (title: title transport unavailable; config: config transport unavailable).",
+			"Model settings were updated, but notification failed (title: title transport unavailable).",
+			"Model settings were updated, but notification failed (config: config transport unavailable).",
 		]);
 	});
 });

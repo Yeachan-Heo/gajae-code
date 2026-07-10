@@ -279,7 +279,7 @@ export class SelectorController {
 					const profile = await this.ctx.session.modelRegistry.saveCustomModelProfile(input.name, input.profile);
 					await this.ctx.session.modelRegistry.refresh("offline");
 					this.ctx.showStatus(`Custom model preset created: ${formatModelProfileDisplayLabel(profile)}`);
-					await this.#notifyConfigChangedSafely();
+					this.#notifyConfigChangedSafely();
 					done();
 					this.ctx.ui.requestRender();
 				} catch (err) {
@@ -318,7 +318,7 @@ export class SelectorController {
 			await this.ctx.session.modelRegistry.refresh("offline");
 			modelSelector.refreshPresetProfiles(renamed.name);
 			this.ctx.showStatus(`Custom model preset renamed: ${formatModelProfileDisplayLabel(renamed)}`);
-			await this.#notifyConfigChangedSafely();
+			this.#notifyConfigChangedSafely();
 			this.ctx.ui.requestRender();
 		} catch (err) {
 			this.ctx.showError(`Preset rename failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -384,7 +384,7 @@ export class SelectorController {
 			await this.ctx.session.modelRegistry.refresh("offline");
 			refreshSelectorState();
 			this.ctx.showStatus(`Custom model preset deleted: ${profileLabel}`);
-			await this.#notifyConfigChangedSafely();
+			this.#notifyConfigChangedSafely();
 			this.ctx.ui.requestRender();
 		} catch (err) {
 			let presetRestoreError: unknown;
@@ -442,7 +442,7 @@ export class SelectorController {
 					const result = await addApiCompatibleProvider(input);
 					await this.ctx.session.modelRegistry.refresh("offline");
 					this.ctx.showStatus(formatProviderSetupResult(result));
-					await this.#notifyConfigChangedSafely();
+					this.#notifyConfigChangedSafely();
 					done();
 					this.ctx.ui.requestRender();
 				} catch (err) {
@@ -873,14 +873,14 @@ export class SelectorController {
 		}
 	}
 
-	async #notifyConfigChangedSafely(): Promise<void> {
-		try {
-			await this.ctx.notifyConfigChanged?.();
-		} catch (error) {
-			this.ctx.showError(
-				`Configuration was updated, but change notification failed: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
+	#notifyConfigChangedSafely(): void {
+		void Promise.resolve()
+			.then(() => this.ctx.notifyConfigChanged?.())
+			.catch(error => {
+				this.ctx.showError(
+					`Configuration was updated, but change notification failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			});
 	}
 
 	#getSessionActiveModelProfile(): string | undefined {
@@ -911,7 +911,7 @@ export class SelectorController {
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorBorderColor();
 		this.ctx.showStatus(persistDefault ? `Default model profile: ${profileLabel}` : `Model profile: ${profileLabel}`);
-		await this.#notifyConfigChangedSafely();
+		this.#notifyConfigChangedSafely();
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
@@ -1014,7 +1014,7 @@ export class SelectorController {
 									? `All model targets set to ${value} for ${labels.join(", ")}.`
 									: `Role-agent models set to ${value} for ${labels.join(", ")}.`,
 							);
-							await this.#notifyConfigChangedSafely();
+							this.#notifyConfigChangedSafely();
 							done();
 							this.ctx.ui.requestRender();
 						} else if (role === "default") {
@@ -1044,7 +1044,7 @@ export class SelectorController {
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
-							await this.#notifyConfigChangedSafely();
+							this.#notifyConfigChangedSafely();
 							done();
 							this.ctx.ui.requestRender();
 						} else {
@@ -1077,7 +1077,7 @@ export class SelectorController {
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`${role} agent model: ${value}`);
-							await this.#notifyConfigChangedSafely();
+							this.#notifyConfigChangedSafely();
 							done();
 							this.ctx.ui.requestRender();
 						}
