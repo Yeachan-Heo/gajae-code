@@ -82,6 +82,12 @@ interface FakeAcpBuiltinSession {
 	getAvailableThinkingLevels(): ThinkingLevel[];
 	setModel(model: unknown): Promise<void>;
 	setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean): void;
+	getSessionDefaultModelSelector(): string | undefined;
+	restoreModelRuntime(
+		model: FakeAcpBuiltinSession["model"],
+		thinkingLevel: ThinkingLevel | undefined,
+		resumeDefaultSelector: string | undefined,
+	): Promise<void>;
 }
 
 function createRuntime() {
@@ -173,6 +179,11 @@ function createRuntime() {
 		setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean) {
 			this.thinkingLevel = thinkingLevel;
 			this.thinkingLevelCalls.push({ thinkingLevel, persist });
+		},
+		getSessionDefaultModelSelector: () => undefined,
+		async restoreModelRuntime(model, thinkingLevel) {
+			this.model = model;
+			this.thinkingLevel = thinkingLevel;
 		},
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};

@@ -157,6 +157,24 @@ describe("buildSessionContext", () => {
 			// downgrades both produce such mismatched messages.
 			expect(ctx.models.default).toBe("openai/gpt-4");
 		});
+
+		it("clears a failed explicit default without assistant-message inference reviving it", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "hello"),
+				modelChange("2", "1", "openai", "failed-model"),
+				{
+					type: "model_change",
+					id: "3",
+					parentId: "2",
+					timestamp: "2025-01-01T00:00:00Z",
+					model: null,
+					role: "default",
+				},
+				msg("4", "3", "assistant", "different provider response"),
+			];
+
+			expect(buildSessionContext(entries).models.default).toBeUndefined();
+		});
 	});
 
 	describe("with compaction", () => {

@@ -152,8 +152,8 @@ export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 
 export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
-	/** Model in "provider/modelId" format */
-	model: string;
+	/** Model in "provider/modelId" format, or null to clear the role. */
+	model: string | null;
 	/** Role: "default" or an agent role. Undefined treated as "default" */
 	role?: string;
 	/** Requested model before a runtime substitution/fallback, in "provider/modelId" format. */
@@ -690,13 +690,14 @@ export function buildSessionContext(
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel ?? "off";
 		} else if (entry.type === "model_change") {
-			// New format: { model: "provider/id", role?: string }
+			const role = entry.role ?? "default";
 			if (entry.model) {
-				const role = entry.role ?? "default";
 				models[role] = entry.model;
-				if (role === "default") {
-					hasExplicitDefaultModel = true;
-				}
+			} else {
+				delete models[role];
+			}
+			if (role === "default") {
+				hasExplicitDefaultModel = true;
 			}
 		} else if (entry.type === "service_tier_change") {
 			serviceTier = entry.serviceTier ?? undefined;
@@ -3919,11 +3920,11 @@ export class SessionManager {
 
 	/**
 	 * Append a model change as child of current leaf, then advance leaf. Returns entry id.
-	 * @param model Model in "provider/modelId" format
+	 * @param model Model in "provider/modelId" format, or null to clear the role
 	 * @param role Optional role (default: "default")
 	 */
 	appendModelChange(
-		model: string,
+		model: string | null,
 		role?: string,
 		metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
 	): string {

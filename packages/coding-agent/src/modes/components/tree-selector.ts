@@ -392,7 +392,7 @@ class TreeList implements Component {
 				parts.push("branch summary", entry.summary);
 				break;
 			case "model_change":
-				parts.push("model", entry.model);
+				parts.push("model", entry.model ?? "(cleared)");
 				break;
 			case "thinking_level_change":
 				parts.push("thinking", entry.thinkingLevel ?? ThinkingLevel.Off);

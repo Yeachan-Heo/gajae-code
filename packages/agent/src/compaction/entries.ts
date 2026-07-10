@@ -20,8 +20,8 @@ export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 
 export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
-	/** Model in "provider/modelId" format */
-	model: string;
+	/** Model in "provider/modelId" format, or null to clear the role. */
+	model: string | null;
 	/** Role: "default", "smol", "slow", etc. Undefined treated as "default" */
 	role?: string;
 	/** Requested model before a runtime substitution/fallback, in "provider/modelId" format. */

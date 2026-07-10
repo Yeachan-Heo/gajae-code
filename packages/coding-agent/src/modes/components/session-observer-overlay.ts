@@ -606,7 +606,7 @@ export class SessionObserverOverlayComponent extends Container {
 							this.#transcriptCache.model = msg.model;
 						}
 					} else if (entry.type === "model_change") {
-						this.#transcriptCache.model = entry.model;
+						this.#transcriptCache.model = entry.model ?? undefined;
 					}
 				}
 				this.#transcriptCache.bytesRead = fromByte + Buffer.byteLength(completeChunk, "utf-8");

@@ -1199,6 +1199,52 @@
 				],
 				"additionalProperties": false
 			}
+		},
+		"archivedProfiles": {
+			"type": "object",
+			"propertyNames": {
+				"type": "string",
+				"minLength": 1
+			},
+			"additionalProperties": {
+				"type": "object",
+				"properties": {
+					"required_providers": {
+						"minItems": 1,
+						"type": "array",
+						"items": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"display_name": {
+						"type": "string",
+						"minLength": 1
+					},
+					"model_mapping": {
+						"type": "object",
+						"propertyNames": {
+							"type": "string",
+							"enum": [
+								"default",
+								"executor",
+								"architect",
+								"planner",
+								"critic"
+							]
+						},
+						"additionalProperties": {
+							"type": "string",
+							"minLength": 1
+						}
+					}
+				},
+				"required": [
+					"required_providers",
+					"model_mapping"
+				],
+				"additionalProperties": false
+			}
 		}
 	},
 	"additionalProperties": false

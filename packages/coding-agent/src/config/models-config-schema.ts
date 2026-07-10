@@ -260,6 +260,7 @@ export const ModelsConfigSchema = z
 		modelBindings: ModelBindingsSchema.optional(),
 		equivalence: EquivalenceConfigSchema.optional(),
 		profiles: ProfilesSchema.optional(),
+		archivedProfiles: ProfilesSchema.optional(),
 	})
 	.strict();
 

@@ -1,3 +1,5 @@
+import * as crypto from "node:crypto";
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -39,6 +41,7 @@ import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
+import { withFileLock } from "./file-lock";
 import {
 	buildCanonicalModelIndex,
 	type CanonicalModelIndex,
@@ -50,6 +53,7 @@ import {
 import {
 	aggregateModelProfileRequiredProviders,
 	type ModelProfileDefinition,
+	mapUserModelProfiles,
 	mergeModelProfiles,
 } from "./model-profiles";
 import {
@@ -541,6 +545,7 @@ interface CustomModelsResult {
 	equivalence?: ModelEquivalenceConfig;
 	modelBindings?: NonNullable<ModelsConfig["modelBindings"]>;
 	profiles?: ModelsConfig["profiles"];
+	archivedProfiles?: ModelsConfig["archivedProfiles"];
 	error?: ConfigError;
 	found: boolean;
 }
@@ -1016,6 +1021,7 @@ export class ModelRegistry {
 	#equivalenceConfig: ModelEquivalenceConfig | undefined;
 	#configuredModelBindings: NonNullable<ModelsConfig["modelBindings"]> | undefined;
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
+	#archivedModelProfiles = new Map<string, ModelProfileDefinition>();
 	#modelBindingsTargetSettings: Settings | undefined;
 	#appliedModelBindingRoles = new Set<string>();
 	#appliedAgentModelBindingOverrides = new Set<string>();
@@ -1049,8 +1055,20 @@ export class ModelRegistry {
 		readonly authStorage: AuthStorage,
 		modelsPath?: string,
 	) {
-		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
-		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
+		const configuredModelsPath = modelsPath ?? ModelsConfigFile.path();
+		let persistenceModelsPath = configuredModelsPath;
+		try {
+			persistenceModelsPath = syncFs.realpathSync.native(configuredModelsPath);
+		} catch {
+			try {
+				persistenceModelsPath = path.join(
+					syncFs.realpathSync.native(path.dirname(configuredModelsPath)),
+					path.basename(configuredModelsPath),
+				);
+			} catch {}
+		}
+		this.#modelsConfigFile = ModelsConfigFile.relocate(persistenceModelsPath);
+		this.#cacheDbPath = modelsPath ? path.join(path.dirname(persistenceModelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
 		this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
@@ -1157,6 +1175,7 @@ export class ModelRegistry {
 			equivalence,
 			modelBindings,
 			profiles,
+			archivedProfiles,
 			error: configError,
 		} = this.#loadCustomModels();
 		this.#configError = configError;
@@ -1168,6 +1187,7 @@ export class ModelRegistry {
 		this.#equivalenceConfig = equivalence;
 		this.#configuredModelBindings = modelBindings;
 		this.#modelProfiles = mergeModelProfiles(profiles);
+		this.#archivedModelProfiles = mapUserModelProfiles(archivedProfiles);
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
 		const builtInModels = this.#applyHardcodedModelPolicies(this.#loadBuiltInModels(overrides));
@@ -1556,6 +1576,7 @@ export class ModelRegistry {
 			equivalence: value.equivalence,
 			modelBindings: value.modelBindings,
 			profiles: value.profiles,
+			archivedProfiles: value.archivedProfiles,
 			found: true,
 		};
 	}
@@ -1566,6 +1587,10 @@ export class ModelRegistry {
 
 	getModelProfile(name: string): ModelProfileDefinition | undefined {
 		return this.#modelProfiles.get(name);
+	}
+
+	getModelProfileForReference(name: string): ModelProfileDefinition | undefined {
+		return this.#modelProfiles.get(name) ?? this.#archivedModelProfiles.get(name);
 	}
 
 	getAvailableModelProfileNames(): string[] {
@@ -1581,39 +1606,39 @@ export class ModelRegistry {
 			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
 			throw new Error(`Custom model profile is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
 		}
-		const loaded = this.#modelsConfigFile.tryLoad();
-		if (loaded.status === "error") {
-			throw new Error(
-				`Cannot create custom model profile because ${this.#modelsConfigFile.path()} is invalid. Fix the existing config before saving a new preset.`,
-			);
-		}
-		const current = loaded.value ?? this.#modelsConfigFile.createDefault();
-		if (mergeModelProfiles(current.profiles).has(normalizedName)) {
-			throw new Error(`Custom model profile already exists: ${normalizedName}. Choose a unique preset id.`);
-		}
-		const next: ModelsConfig = {
-			...current,
-			profiles: {
-				...(current.profiles ?? {}),
-				[normalizedName]: definition,
-			},
-		};
-		const checkedConfig = ModelsConfigSchema.safeParse(next);
-		if (!checkedConfig.success) {
-			const first = checkedConfig.error.issues[0];
-			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
-			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
-		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		const modelMapping = { ...definition.model_mapping };
-		const profile: ModelProfileDefinition = {
-			name: normalizedName,
-			displayName: definition.display_name,
-			requiredProviders: aggregateModelProfileRequiredProviders(definition.required_providers, { modelMapping }),
-			modelMapping,
-			source: "user",
-		};
-		return profile;
+		return this.#withModelsConfigMutation(async () => {
+			const loaded = this.#modelsConfigFile.tryLoad();
+			if (loaded.status === "error") {
+				throw new Error(
+					`Cannot create custom model profile because ${this.#modelsConfigFile.path()} is invalid. Fix the existing config before saving a new preset.`,
+				);
+			}
+			const current = loaded.value ?? this.#modelsConfigFile.createDefault();
+			if (mergeModelProfiles(current.profiles).has(normalizedName)) {
+				throw new Error(`Custom model profile already exists: ${normalizedName}. Choose a unique preset id.`);
+			}
+			const nextArchivedProfiles = { ...(current.archivedProfiles ?? {}) };
+			delete nextArchivedProfiles[normalizedName];
+			const checkedConfig = this.#validateGeneratedModelsConfig({
+				...current,
+				profiles: {
+					...(current.profiles ?? {}),
+					[normalizedName]: checkedDefinition.data,
+				},
+				archivedProfiles: Object.keys(nextArchivedProfiles).length > 0 ? nextArchivedProfiles : undefined,
+			});
+			await this.#writeCheckedModelsConfig(checkedConfig);
+			const modelMapping = { ...checkedDefinition.data.model_mapping };
+			return {
+				name: normalizedName,
+				displayName: checkedDefinition.data.display_name,
+				requiredProviders: aggregateModelProfileRequiredProviders(checkedDefinition.data.required_providers, {
+					modelMapping,
+				}),
+				modelMapping,
+				source: "user",
+			};
+		});
 	}
 
 	async renameCustomModelProfile(name: string, displayName: string): Promise<ModelProfileDefinition> {
@@ -1621,48 +1646,67 @@ export class ModelRegistry {
 		const nextDisplayName = displayName.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
 		if (!nextDisplayName) throw new Error("Profile display name is required.");
-		const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "rename");
-		const nextProfiles = {
-			...(current.profiles ?? {}),
-			[normalizedName]: {
-				...profile,
-				display_name: nextDisplayName,
-			},
-		};
-		const checkedConfig = ModelsConfigSchema.safeParse({ ...current, profiles: nextProfiles });
-		if (!checkedConfig.success) {
-			const first = checkedConfig.error.issues[0];
-			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
-			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
-		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		const modelMapping = { ...profile.model_mapping };
-		return {
-			name: normalizedName,
-			displayName: nextDisplayName,
-			requiredProviders: aggregateModelProfileRequiredProviders(profile.required_providers, { modelMapping }),
-			modelMapping,
-			source: "user",
-		};
+		return this.#withModelsConfigMutation(async () => {
+			const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "rename");
+			const checkedConfig = this.#validateGeneratedModelsConfig({
+				...current,
+				profiles: {
+					...(current.profiles ?? {}),
+					[normalizedName]: {
+						...profile,
+						display_name: nextDisplayName,
+					},
+				},
+			});
+			await this.#writeCheckedModelsConfig(checkedConfig);
+			const modelMapping = { ...profile.model_mapping };
+			return {
+				name: normalizedName,
+				displayName: nextDisplayName,
+				requiredProviders: aggregateModelProfileRequiredProviders(profile.required_providers, { modelMapping }),
+				modelMapping,
+				source: "user",
+			};
+		});
 	}
 
 	async deleteCustomModelProfile(name: string): Promise<ModelProfileConfig> {
 		const normalizedName = name.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
-		const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "delete");
-		const nextProfiles = { ...(current.profiles ?? {}) };
-		delete nextProfiles[normalizedName];
-		const checkedConfig = ModelsConfigSchema.safeParse({
-			...current,
-			profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
+		return this.#withModelsConfigMutation(async () => {
+			const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "delete");
+			const nextProfiles = { ...(current.profiles ?? {}) };
+			delete nextProfiles[normalizedName];
+			const checkedConfig = this.#validateGeneratedModelsConfig({
+				...current,
+				profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
+				archivedProfiles: {
+					...(current.archivedProfiles ?? {}),
+					[normalizedName]: profile,
+				},
+			});
+			await this.#writeCheckedModelsConfig(checkedConfig);
+			return profile;
 		});
+	}
+
+	async #withModelsConfigMutation<T>(mutation: () => Promise<T>): Promise<T> {
+		const configPath = this.#modelsConfigFile.path();
+		await fs.mkdir(path.dirname(configPath), { recursive: true });
+		return withFileLock(configPath, async () => {
+			this.#modelsConfigFile.invalidate();
+			return mutation();
+		});
+	}
+
+	#validateGeneratedModelsConfig(candidate: ModelsConfig): ModelsConfig {
+		const checkedConfig = ModelsConfigSchema.safeParse(candidate);
 		if (!checkedConfig.success) {
 			const first = checkedConfig.error.issues[0];
 			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
 			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
 		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		return profile;
+		return checkedConfig.data;
 	}
 
 	#loadCustomProfileForMutation(
@@ -1678,6 +1722,9 @@ export class ModelRegistry {
 		const current = loaded.value ?? this.#modelsConfigFile.createDefault();
 		const profile = current.profiles?.[normalizedName];
 		if (!profile) {
+			if (current.archivedProfiles?.[normalizedName]) {
+				throw new Error(`Custom model profile is already deleted: ${normalizedName}.`);
+			}
 			const existing = this.#modelProfiles.get(normalizedName);
 			if (existing && existing.source !== "user") {
 				throw new Error(`Cannot ${action} bundled model profile: ${normalizedName}.`);
@@ -1688,9 +1735,47 @@ export class ModelRegistry {
 	}
 
 	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
-		await fs.mkdir(path.dirname(this.#modelsConfigFile.path()), { recursive: true });
-		await Bun.write(this.#modelsConfigFile.path(), Bun.YAML.stringify(config, null, 2));
+		const configPath = this.#modelsConfigFile.path();
+		await fs.mkdir(path.dirname(configPath), { recursive: true });
+		const tempPath = `${configPath}.${crypto.randomUUID()}.tmp`;
+		try {
+			await Bun.write(tempPath, Bun.YAML.stringify(config, null, 2));
+			const fileHandle = syncFs.openSync(tempPath, "r");
+			try {
+				syncFs.fsyncSync(fileHandle);
+			} finally {
+				syncFs.closeSync(fileHandle);
+			}
+			syncFs.renameSync(tempPath, configPath);
+			if (process.platform !== "win32") {
+				try {
+					const directoryHandle = syncFs.openSync(path.dirname(configPath), "r");
+					try {
+						syncFs.fsyncSync(directoryHandle);
+					} finally {
+						syncFs.closeSync(directoryHandle);
+					}
+				} catch (error) {
+					// The rename already committed the checked config. A parent
+					// fsync warning must not turn that commit into a reported failure.
+					logger.warn("models config parent directory fsync failed after commit", {
+						path: configPath,
+						error: String(error),
+					});
+				}
+			}
+		} finally {
+			try {
+				syncFs.rmSync(tempPath, { force: true });
+			} catch (error) {
+				logger.warn("models config temp cleanup failed", {
+					path: tempPath,
+					error: String(error),
+				});
+			}
+		}
 		this.#modelsConfigFile.invalidate();
+		this.#lastStaticLoadMtime = null;
 		this.#reloadStaticModels();
 	}
 	applyConfiguredModelBindings(targetSettings: Settings): void {
@@ -1702,7 +1787,7 @@ export class ModelRegistry {
 		const targetSettings = this.#modelBindingsTargetSettings;
 		if (!targetSettings) return;
 		const bindings = this.#configuredModelBindings;
-		const nextModelRoles = { ...targetSettings.get("modelRoles") };
+		const nextModelRoles = { ...(targetSettings.getRuntimeOverride("modelRoles") ?? {}) };
 		const configuredModelRoles = bindings?.modelRoles ?? {};
 		const configuredModelRoleKeys = new Set(Object.keys(configuredModelRoles));
 		for (const role of this.#appliedModelBindingRoles) {
@@ -1733,7 +1818,9 @@ export class ModelRegistry {
 		targetSettings.override("modelRoles", nextModelRoles);
 		this.#appliedModelBindingRoles = new Set(Object.keys(configuredModelRoles));
 
-		const nextAgentModelOverrides = { ...targetSettings.get("task.agentModelOverrides") };
+		const nextAgentModelOverrides = {
+			...(targetSettings.getRuntimeOverride("task.agentModelOverrides") ?? {}),
+		};
 		const configuredAgentModelOverrides = bindings?.agentModelOverrides ?? {};
 		const configuredAgentModelOverrideKeys = new Set(Object.keys(configuredAgentModelOverrides));
 		for (const agentName of this.#appliedAgentModelBindingOverrides) {

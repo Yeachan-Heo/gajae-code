@@ -6879,8 +6879,8 @@ export class AgentSession {
 	 * semantics). Used by model-profile activation rollback to neutralize the
 	 * profile main model the failed activation already recorded as the default.
 	 */
-	recordResumeDefaultModel(selector: string): void {
-		this.sessionManager.appendModelChange(selector, "default");
+	recordResumeDefaultModel(selector: string | undefined): void {
+		this.sessionManager.appendModelChange(selector ?? null, "default");
 	}
 
 	/**
@@ -6918,6 +6918,32 @@ export class AgentSession {
 		// Apply explicit thinking level if given; otherwise prefer the model's
 		// configured defaultLevel; otherwise re-clamp the current level.
 		this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	/**
+	 * Restore the live and resumable model/thinking snapshot after a command
+	 * fails before its settings commit. This does not revalidate credentials:
+	 * the exact previously active runtime state must remain restorable.
+	 */
+	async restoreModelRuntime(
+		model: Model | undefined,
+		thinkingLevel: ThinkingLevel | undefined,
+		resumeDefaultSelector: string | undefined,
+	): Promise<void> {
+		const previousEditMode = this.#resolveActiveEditMode();
+		this.#clearActiveRetryFallback();
+		if (model) {
+			this.#setModelWithProviderSessionReset(model);
+		} else {
+			this.#closeAllProviderSessions("model selection rollback");
+			(this.agent as unknown as { setModel(model: Model | undefined): void }).setModel(undefined);
+			this.#syncAppendOnlyContext(undefined);
+		}
+		this.sessionManager.appendModelChange(resumeDefaultSelector ?? null, "default", {
+			reason: "settings-rollback",
+		});
+		this.setThinkingLevel(thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 

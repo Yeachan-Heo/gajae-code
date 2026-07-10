@@ -57,6 +57,14 @@ export function clampExplicitThinkingLevelForModel(
 	return clampThinkingLevelForModel(model, level);
 }
 
+export function clampModelAssignmentThinkingLevel(
+	model: Model | undefined,
+	level: ThinkingLevel | undefined,
+): ThinkingLevel | undefined {
+	const clamped = clampExplicitThinkingLevelForModel(model, level);
+	return clamped ?? (model && model.reasoning !== false ? level : undefined);
+}
+
 export function formatClampedModelSelector(selector: string, model: Model | undefined): string {
 	const slashIdx = selector.indexOf("/");
 	if (slashIdx <= 0) return selector;

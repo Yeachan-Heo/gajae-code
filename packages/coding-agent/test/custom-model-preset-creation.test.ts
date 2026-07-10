@@ -1,17 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import {
+	activateModelProfile,
 	materializeModelProfileForDeletion,
 	restoreMaterializedModelProfileForDeletion,
 } from "@gajae-code/coding-agent/config/model-profile-activation";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import type { ModelProfileConfig } from "@gajae-code/coding-agent/config/models-config-schema";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { CustomModelPresetWizardComponent } from "@gajae-code/coding-agent/modes/components/custom-model-preset-wizard";
 import {
 	ModelSelectorComponent,
@@ -21,6 +23,7 @@ import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/s
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { TUI } from "@gajae-code/tui";
+import { getProjectAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 
 let tempDir: string;
@@ -85,6 +88,112 @@ function createRegistry(profiles: Iterable<[string, ModelProfileDefinition]> = [
 		getModelProfile: (name: string) => profileMap.get(name),
 		getApiKeyForProvider: async (providerId: string) => options.apiKeyForProvider?.(providerId) ?? "key",
 	} as unknown as ModelRegistry;
+}
+
+function createDeletionSession() {
+	let activeProfile: string | undefined;
+	let sessionDefault = "my-oai/baseline";
+	return {
+		model: currentModel("my-oai", "baseline") as Model | undefined,
+		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
+		sessionId: "deletion-session",
+		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
+			this.model = next;
+			this.thinkingLevel = thinkingLevel;
+		},
+		setActiveModelProfile(profileName: string | undefined) {
+			activeProfile = profileName;
+		},
+		getActiveModelProfile() {
+			return activeProfile;
+		},
+		getSessionDefaultModelSelector() {
+			return sessionDefault;
+		},
+		recordResumeDefaultModel(selector: string) {
+			sessionDefault = selector;
+		},
+	};
+}
+
+async function createDeletionControllerHarness(
+	settings: Settings,
+	profiles: Map<string, ModelProfileDefinition>,
+	initialActiveProfile?: string,
+) {
+	let selector: ModelSelectorComponent | undefined;
+	let deleteCalls = 0;
+	const errors: string[] = [];
+	const statuses: string[] = [];
+	const archivedProfiles = new Map<string, ModelProfileDefinition>();
+	const registry = {
+		...createRegistry(profiles),
+		getModelProfiles: () => new Map(profiles),
+		getModelProfile: (name: string) => profiles.get(name),
+		getModelProfileForReference: (name: string) => profiles.get(name) ?? archivedProfiles.get(name),
+		getAvailableModelProfileNames: () => [...profiles.keys()],
+		deleteCustomModelProfile: async (name: string) => {
+			deleteCalls++;
+			const profile = profiles.get(name);
+			if (!profile) throw new Error("missing profile");
+			profiles.delete(name);
+			archivedProfiles.set(name, profile);
+			return {
+				display_name: profile.displayName,
+				required_providers: [...profile.requiredProviders],
+				model_mapping: { ...profile.modelMapping },
+			};
+		},
+		saveCustomModelProfile: async (name: string, config: ModelProfileConfig) => {
+			archivedProfiles.delete(name);
+			profiles.set(name, {
+				name,
+				displayName: config.display_name,
+				requiredProviders: [...config.required_providers],
+				modelMapping: { ...config.model_mapping },
+				source: "user",
+			});
+			return profiles.get(name);
+		},
+		refresh: async () => {},
+	};
+	const session = {
+		...createDeletionSession(),
+		scopedModels: [],
+		modelRegistry: registry,
+		isFastForProvider: () => false,
+		isFastForSubagentProvider: () => false,
+		isFastModeActive: () => false,
+	};
+	session.setActiveModelProfile(initialActiveProfile);
+	const ctx = {
+		ui: { setFocus: () => {}, requestRender: () => {} },
+		editorContainer: {
+			clear: () => {},
+			addChild: (child: unknown) => {
+				if (child instanceof ModelSelectorComponent) selector = child;
+			},
+		},
+		editor: {},
+		settings,
+		session,
+		statusLine: { invalidate: () => {} },
+		updateEditorBorderColor: () => {},
+		showStatus: (message: string) => statuses.push(message),
+		showError: (message: string) => errors.push(message),
+		showHookConfirm: async () => true,
+		notifyConfigChanged: async () => {},
+	};
+	new SelectorController(ctx as never).showModelSelector();
+	await Bun.sleep(0);
+	if (!selector) throw new Error("Model selector did not open");
+	return {
+		selector,
+		errors,
+		statuses,
+		getDeleteCalls: () => deleteCalls,
+		getArchivedProfile: (name: string) => archivedProfiles.get(name),
+	};
 }
 
 describe("custom model preset creation", () => {
@@ -191,13 +300,183 @@ describe("custom model preset creation", () => {
 			model_mapping: { default: "my-oai/gpt-custom" },
 		});
 
+		expect(registry.getModelProfiles().has("first")).toBe(false);
+		expect(registry.getAvailableModelProfileNames()).not.toContain("first");
 		expect(registry.getModelProfile("first")).toBeUndefined();
+		expect(registry.getModelProfileForReference("first")?.displayName).toBe("first");
 		expect(registry.getModelProfile("second")?.displayName).toBe("second");
 		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
 			profiles: Record<string, { display_name?: string }>;
+			archivedProfiles: Record<string, { display_name?: string }>;
 		};
 		expect(parsed.profiles.first).toBeUndefined();
 		expect(parsed.profiles.second?.display_name).toBe("second");
+		expect(parsed.archivedProfiles.first?.display_name).toBe("first");
+	});
+
+	it("serializes concurrent profile saves without losing either update", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const registryA = new ModelRegistry(authStorage, modelsPath);
+		const registryB = new ModelRegistry(authStorage, modelsPath);
+
+		await Promise.all([
+			registryA.saveCustomModelProfile("profile-a", {
+				display_name: "Profile A",
+				required_providers: ["my-oai"],
+				model_mapping: { default: "my-oai/model-a" },
+			}),
+			registryB.saveCustomModelProfile("profile-b", {
+				display_name: "Profile B",
+				required_providers: ["anthropic"],
+				model_mapping: { default: "anthropic/model-b" },
+			}),
+		]);
+
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			profiles: Record<string, { display_name?: string }>;
+		};
+		expect(parsed.profiles["profile-a"]?.display_name).toBe("Profile A");
+		expect(parsed.profiles["profile-b"]?.display_name).toBe("Profile B");
+	});
+
+	it("keeps the prior models config intact when an atomic profile write fails", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const canonicalModelsPath = path.join(await fs.realpath(tempDir), "models.yml");
+		const registry = new ModelRegistry(authStorage, modelsPath);
+		await registry.saveCustomModelProfile("profile-a", {
+			display_name: "Profile A",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/model-a" },
+		});
+		const before = await Bun.file(modelsPath).text();
+		const originalWrite = Bun.write;
+		const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+			if (typeof args[0] === "string" && args[0].startsWith(`${canonicalModelsPath}.`) && args[0].endsWith(".tmp")) {
+				throw new Error("forced models write failure");
+			}
+			return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+		}) as typeof Bun.write);
+		try {
+			await expect(
+				registry.saveCustomModelProfile("profile-b", {
+					display_name: "Profile B",
+					required_providers: ["anthropic"],
+					model_mapping: { default: "anthropic/model-b" },
+				}),
+			).rejects.toThrow("forced models write failure");
+		} finally {
+			writeSpy.mockRestore();
+		}
+
+		expect(await Bun.file(modelsPath).text()).toBe(before);
+		const reopened = new ModelRegistry(authStorage, modelsPath);
+		expect(reopened.getModelProfile("profile-a")?.displayName).toBe("Profile A");
+		expect(reopened.getModelProfile("profile-b")).toBeUndefined();
+	});
+
+	it("keeps a renamed models config committed when parent directory fsync fails", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const registry = new ModelRegistry(authStorage, modelsPath);
+		const originalFsync = syncFs.fsyncSync;
+		const fsyncSpy = spyOn(syncFs, "fsyncSync").mockImplementation(fd => {
+			if (syncFs.fstatSync(fd).isDirectory()) {
+				throw new Error("simulated models parent fsync failure");
+			}
+			return originalFsync(fd);
+		});
+		try {
+			await expect(
+				registry.saveCustomModelProfile("profile-a", {
+					display_name: "Profile A",
+					required_providers: ["my-oai"],
+					model_mapping: { default: "my-oai/model-a" },
+				}),
+			).resolves.toMatchObject({ displayName: "Profile A" });
+		} finally {
+			fsyncSpy.mockRestore();
+		}
+
+		const reopened = new ModelRegistry(authStorage, modelsPath);
+		expect(reopened.getModelProfile("profile-a")?.displayName).toBe("Profile A");
+	});
+
+	it("keeps an archived fallback across repeated deletion and clears it on recreation", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const registryA = new ModelRegistry(authStorage, modelsPath);
+		const registryB = new ModelRegistry(authStorage, modelsPath);
+		await registryA.saveCustomModelProfile("profile-a", {
+			display_name: "Original A",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/model-a" },
+		});
+		await registryA.deleteCustomModelProfile("profile-a");
+
+		await expect(registryB.deleteCustomModelProfile("profile-a")).rejects.toThrow(
+			"Custom model profile is already deleted: profile-a.",
+		);
+		const archivedRegistry = new ModelRegistry(authStorage, modelsPath);
+		expect(archivedRegistry.getModelProfile("profile-a")).toBeUndefined();
+		expect(archivedRegistry.getModelProfileForReference("profile-a")?.displayName).toBe("Original A");
+		expect(archivedRegistry.getAvailableModelProfileNames()).not.toContain("profile-a");
+
+		await registryB.saveCustomModelProfile("profile-a", {
+			display_name: "Recreated A",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/model-a-v2" },
+		});
+		const recreatedConfig = YAML.parse(await Bun.file(modelsPath).text()) as {
+			profiles: Record<string, { display_name?: string }>;
+			archivedProfiles?: Record<string, unknown>;
+		};
+		expect(recreatedConfig.profiles["profile-a"]?.display_name).toBe("Recreated A");
+		expect(recreatedConfig.archivedProfiles?.["profile-a"]).toBeUndefined();
+	});
+
+	it("keeps stale global and cross-project references resolvable after archival", async () => {
+		const agentDir = path.join(tempDir, "archived-reference-agent");
+		const modelsPath = path.join(agentDir, "models.yml");
+		const registry = new ModelRegistry(authStorage, modelsPath);
+		await registry.saveCustomModelProfile("profile-a", {
+			display_name: "Profile A",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/model-a" },
+		});
+		const projectX = path.join(tempDir, "project-x");
+		await fs.mkdir(getProjectAgentDir(projectX), { recursive: true });
+		await Bun.write(
+			path.join(getProjectAgentDir(projectX), "config.yml"),
+			YAML.stringify({ modelProfile: { default: "profile-a" } }),
+		);
+
+		resetSettingsForTest();
+		try {
+			const settingsA = await Settings.init({ agentDir, cwd: tempDir });
+			const settingsB = await settingsA.cloneForCwd(tempDir);
+			settingsB.set("modelProfile.default", "profile-a");
+
+			await settingsA.deleteModelProfileIfUnreferenced("profile-a", () =>
+				registry.deleteCustomModelProfile("profile-a"),
+			);
+			const projectY = path.join(tempDir, "project-y");
+			await fs.mkdir(getProjectAgentDir(projectY), { recursive: true });
+			await Bun.write(
+				path.join(getProjectAgentDir(projectY), "config.yml"),
+				YAML.stringify({ modelProfile: { default: "profile-a" } }),
+			);
+			await settingsB.flushOrThrow();
+
+			resetSettingsForTest();
+			const projectSettings = await Settings.init({ agentDir, cwd: projectX });
+			const reopenedRegistry = new ModelRegistry(authStorage, modelsPath);
+			expect(projectSettings.getGlobal("modelProfile.default")).toBe("profile-a");
+			expect(projectSettings.getProject("modelProfile.default")).toBe("profile-a");
+			const lateProjectSettings = await projectSettings.cloneForCwd(projectY);
+			expect(lateProjectSettings.getProject("modelProfile.default")).toBe("profile-a");
+			expect(reopenedRegistry.getModelProfileForReference("profile-a")?.displayName).toBe("Profile A");
+			expect(reopenedRegistry.getAvailableModelProfileNames()).not.toContain("profile-a");
+		} finally {
+			resetSettingsForTest();
+		}
 	});
 
 	it("rejects empty rename input and built-in delete without mutating config", async () => {
@@ -664,7 +943,7 @@ describe("custom model preset creation", () => {
 			},
 			getActiveModelProfile: () => activeProfiles.at(-1),
 		};
-		const flushSpy = spyOn(settings, "flush").mockRejectedValueOnce(new Error("flush failed"));
+		const flushSpy = spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
 
 		try {
 			await expect(
@@ -684,7 +963,278 @@ describe("custom model preset creation", () => {
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("custom-default");
 	});
-	it("restores a deleted custom preset when post-delete notification fails", async () => {
+	it("rejects profile deletion materialization when config persistence fails", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-default",
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: "my-oai/gpt-custom",
+			},
+			source: "user",
+		};
+		const agentDir = path.join(tempDir, "failed-materialization-settings");
+		resetSettingsForTest();
+		try {
+			const settings = await Settings.init({ agentDir, cwd: tempDir });
+			const configPath = path.join(await fs.realpath(settings.getAgentDir()), "config.yml");
+			settings.set("modelProfile.default", customProfile.name);
+			settings.setModelRole("default", "old/default");
+			await settings.flushOrThrow();
+			const session = createDeletionSession();
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (
+					typeof args[0] === "string" &&
+					args[0].startsWith(`${configPath}.`) &&
+					args[0].endsWith(".tmp") &&
+					!args[0].startsWith(`${configPath}.revisions.json.`)
+				) {
+					throw new Error("forced config write failure");
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				await expect(
+					materializeModelProfileForDeletion({
+						session,
+						settings,
+						modelRegistry: createRegistry([[customProfile.name, customProfile]]),
+						profileName: customProfile.name,
+					}),
+				).rejects.toThrow("forced config write failure");
+			} finally {
+				writeSpy.mockRestore();
+			}
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir, cwd: tempDir });
+			expect(reopened.getGlobal("modelProfile.default")).toBe(customProfile.name);
+		} finally {
+			resetSettingsForTest();
+		}
+	});
+	it("preserves later durable choices while materializing a profile for deletion", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-default",
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: "my-oai/gpt-custom",
+				architect: "my-oai/gpt-custom",
+			},
+			source: "user",
+		};
+		const agentDir = path.join(tempDir, "forward-settings");
+		resetSettingsForTest();
+		const { promise: releaseLookup, resolve: resolveLookup } = Promise.withResolvers<void>();
+		const { promise: lookupStarted, resolve: resolveLookupStarted } = Promise.withResolvers<void>();
+		try {
+			const settingsA = await Settings.init({ agentDir, cwd: tempDir });
+			settingsA.setModelRole("default", "old/default");
+			settingsA.setAgentModelOverride("critic", "old/critic");
+			settingsA.setAgentModelOverride("architect", "my-oai/gpt-custom");
+			settingsA.set("modelProfile.default", customProfile.name);
+			await settingsA.flushOrThrow();
+			const settingsB = await settingsA.cloneForCwd(tempDir);
+			const session = createDeletionSession();
+			const baseRegistry = createRegistry([[customProfile.name, customProfile]]);
+			await activateModelProfile({
+				session,
+				settings: settingsA,
+				modelRegistry: baseRegistry,
+				profileName: customProfile.name,
+			});
+			const originalGetApiKey = baseRegistry.getApiKeyForProvider.bind(baseRegistry);
+			const gatedRegistry = {
+				...baseRegistry,
+				getApiKeyForProvider: async (...args: Parameters<ModelRegistry["getApiKeyForProvider"]>) => {
+					resolveLookupStarted();
+					await releaseLookup;
+					return originalGetApiKey(...args);
+				},
+			} as ModelRegistry;
+
+			const materializing = materializeModelProfileForDeletion({
+				session,
+				settings: settingsA,
+				modelRegistry: gatedRegistry,
+				profileName: customProfile.name,
+			});
+			await lookupStarted;
+			settingsB.setModelRole("default", "external/default");
+			settingsB.setAgentModelOverride("architect", "external/architect");
+			settingsB.set("modelProfile.default", "profile-b");
+			await settingsB.flushOrThrow();
+			resolveLookup();
+			await materializing;
+
+			expect(settingsA.get("modelRoles")).toEqual({ default: "external/default" });
+			expect(settingsA.get("task.agentModelOverrides")).toEqual({
+				architect: "external/architect",
+				critic: "old/critic",
+				executor: "my-oai/gpt-custom",
+			});
+			expect(settingsA.get("modelProfile.default")).toBe("profile-b");
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir, cwd: tempDir });
+			expect(reopened.getGlobal("modelRoles")).toEqual({ default: "external/default" });
+			expect(reopened.getGlobal("task.agentModelOverrides")).toEqual({
+				architect: "external/architect",
+				critic: "old/critic",
+				executor: "my-oai/gpt-custom",
+			});
+			expect(reopened.getGlobal("modelProfile.default")).toBe("profile-b");
+		} finally {
+			resolveLookup();
+			resetSettingsForTest();
+		}
+	});
+	it("rolls back only deletion leaves that no later writer changed", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-default",
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: "my-oai/gpt-custom",
+				architect: "my-oai/gpt-custom",
+			},
+			source: "user",
+		};
+		const agentDir = path.join(tempDir, "rollback-settings");
+		resetSettingsForTest();
+		try {
+			const settingsA = await Settings.init({ agentDir, cwd: tempDir });
+			settingsA.setModelRole("default", "old/default");
+			settingsA.setAgentModelOverride("critic", "old/critic");
+			settingsA.set("modelProfile.default", customProfile.name);
+			await settingsA.flushOrThrow();
+			const session = createDeletionSession();
+			const registry = createRegistry([[customProfile.name, customProfile]]);
+			await activateModelProfile({
+				session,
+				settings: settingsA,
+				modelRegistry: registry,
+				profileName: customProfile.name,
+			});
+			const snapshot = await materializeModelProfileForDeletion({
+				session,
+				settings: settingsA,
+				modelRegistry: registry,
+				profileName: customProfile.name,
+			});
+			expect(snapshot.previousPersistedModelRoles).toEqual({ default: "old/default" });
+			expect(snapshot.previousPersistedAgentModelOverrides).toEqual({ critic: "old/critic" });
+			const settingsB = await settingsA.cloneForCwd(tempDir);
+			settingsB.setModelRole("default", "external/default");
+			settingsB.setAgentModelOverride("architect", "external/architect");
+			settingsB.setAgentModelOverride("executor", "my-oai/gpt-custom");
+			settingsB.set("modelProfile.default", "profile-b");
+			await settingsB.flushOrThrow();
+
+			await restoreMaterializedModelProfileForDeletion({ settings: settingsA, session, snapshot });
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir, cwd: tempDir });
+			expect(reopened.getGlobal("modelRoles")).toEqual({ default: "external/default" });
+			expect(reopened.getGlobal("task.agentModelOverrides")).toEqual({
+				architect: "external/architect",
+				critic: "old/critic",
+				executor: "my-oai/gpt-custom",
+			});
+			expect(reopened.getGlobal("modelProfile.default")).toBe("profile-b");
+		} finally {
+			resetSettingsForTest();
+		}
+	});
+	it("refuses controller deletion when the same profile is selected after materialization", async () => {
+		const profileName = "custom-default";
+		const profile: ModelProfileDefinition = {
+			name: profileName,
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom:low" },
+			source: "user",
+		};
+		const agentDir = path.join(tempDir, "concurrent-delete-agent");
+		resetSettingsForTest();
+		try {
+			const settingsA = await Settings.init({ agentDir, cwd: tempDir });
+			settingsA.set("modelProfile.default", profileName);
+			await settingsA.flushOrThrow();
+			const settingsB = await settingsA.cloneForCwd(tempDir);
+			const profiles = new Map([[profileName, profile]]);
+			const harness = await createDeletionControllerHarness(settingsA, profiles, profileName);
+			const deleteModelProfileIfUnreferenced = settingsA.deleteModelProfileIfUnreferenced.bind(settingsA);
+			const deletionSpy = spyOn(settingsA, "deleteModelProfileIfUnreferenced").mockImplementation(
+				async (name, deleteProfile) => {
+					settingsB.set("modelProfile.default", profileName);
+					await settingsB.flushOrThrow();
+					return deleteModelProfileIfUnreferenced(name, deleteProfile);
+				},
+			);
+			try {
+				await harness.selector.__testSelectPresetAction(profileName, "delete");
+				await Bun.sleep(0);
+			} finally {
+				deletionSpy.mockRestore();
+			}
+
+			expect(harness.getDeleteCalls()).toBe(0);
+			expect(profiles.has(profileName)).toBe(true);
+			expect(harness.statuses.some(message => message.includes("Custom model preset deleted"))).toBe(false);
+			expect(harness.errors).toContain(
+				`Preset delete failed: Model profile became the default while deletion was in progress: ${profileName}`,
+			);
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir, cwd: tempDir });
+			expect(reopened.getGlobal("modelProfile.default")).toBe(profileName);
+		} finally {
+			resetSettingsForTest();
+		}
+	});
+
+	it("archives a deleted preset so current-project references remain resolvable", async () => {
+		const profileName = "custom-project";
+		const profile: ModelProfileDefinition = {
+			name: profileName,
+			displayName: "Custom Project",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom:low" },
+			source: "user",
+		};
+		const agentDir = path.join(tempDir, "project-reference-agent");
+		const projectDir = path.join(tempDir, "referencing-project");
+		await fs.mkdir(getProjectAgentDir(projectDir), { recursive: true });
+		await Bun.write(
+			path.join(getProjectAgentDir(projectDir), "config.yml"),
+			YAML.stringify({ modelProfile: { default: profileName } }),
+		);
+		resetSettingsForTest();
+		try {
+			const settings = await Settings.init({ agentDir, cwd: projectDir });
+			const profiles = new Map([[profileName, profile]]);
+			const harness = await createDeletionControllerHarness(settings, profiles);
+			await harness.selector.__testSelectPresetAction(profileName, "delete");
+			await Bun.sleep(0);
+
+			expect(harness.getDeleteCalls()).toBe(1);
+			expect(profiles.has(profileName)).toBe(false);
+			expect(harness.getArchivedProfile(profileName)?.displayName).toBe("Custom Project");
+			expect(harness.statuses).toContain("Custom model preset deleted: Custom Project");
+			expect(harness.errors).toEqual([]);
+			expect(settings.getProject("modelProfile.default")).toBe(profileName);
+		} finally {
+			resetSettingsForTest();
+		}
+	});
+	it("keeps a deleted custom preset committed when post-delete notification fails", async () => {
 		const unsafeDisplayName = "Custom\x1b[31m Default\x1b[0m\nRestored";
 		const profiles = new Map<string, ModelProfileDefinition>([
 			[
@@ -771,7 +1321,7 @@ describe("custom model preset creation", () => {
 			updateEditorBorderColor: () => {},
 			showStatus: () => {},
 			showError: (message: string) => {
-				expect(message).toBe("Preset delete failed: notify failed");
+				expect(message).toBe("Configuration was updated, but change notification failed: notify failed");
 			},
 			showHookConfirm: async (title: string) => {
 				confirmTitle = title;
@@ -785,13 +1335,14 @@ describe("custom model preset creation", () => {
 		new SelectorController(ctx as never).showModelSelector();
 		await Bun.sleep(0);
 		await selector?.__testSelectPresetAction("custom-default", "delete");
+		await Bun.sleep(0);
 
 		expect(confirmTitle).toBe("Delete custom model preset: Custom Default Restored");
-		expect(restoredProfile?.display_name).toBe(unsafeDisplayName);
-		expect(profiles.get("custom-default")?.displayName).toBe(unsafeDisplayName);
-		expect(settings.get("modelProfile.default")).toBe("custom-default");
-		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
+		expect(restoredProfile).toBeUndefined();
+		expect(profiles.has("custom-default")).toBe(false);
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.get("modelRoles")).toEqual({ default: "my-oai/gpt-custom:low" });
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
-		expect(activeProfiles.at(-1)).toBe("custom-default");
+		expect(activeProfiles.at(-1)).toBeUndefined();
 	});
 });
