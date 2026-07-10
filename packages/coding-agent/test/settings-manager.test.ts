@@ -350,6 +350,106 @@ describe("Settings", () => {
 			});
 		});
 
+		it("applies inherited leaves only when their durable snapshot is unchanged", async () => {
+			await writeSettings({
+				modelProfile: { default: "profile-a" },
+				modelRoles: { default: "baseline/default" },
+				task: { agentModelOverrides: { architect: "baseline/architect" } },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			await writeSettings({
+				modelProfile: { default: "profile-b" },
+				modelRoles: { default: "external/default" },
+				task: { agentModelOverrides: { architect: "external/architect" } },
+			});
+
+			settings.setModelRoleIfUnchanged("default", "baseline/default", "profile/default");
+			settings.setAgentModelOverrideIfUnchanged("architect", "baseline/architect", "profile/architect");
+			settings.setAgentModelOverrideIfUnchanged("critic", undefined, "profile/critic");
+			settings.setModelProfileDefaultIfUnchanged("profile-a", undefined);
+			await settings.flushOrThrow();
+
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelProfile).toEqual({ default: "profile-b" });
+			expect(savedSettings.modelRoles).toEqual({ default: "external/default" });
+			expect(savedSettings.task).toEqual({
+				agentModelOverrides: {
+					architect: "external/architect",
+					critic: "profile/critic",
+				},
+			});
+		});
+
+		it("canonicalizes whole-record and leaf model assignment writes with last-write ownership", async () => {
+			await writeSettings({
+				task: {
+					agentModelOverrides: {
+						architect: "baseline/architect",
+						planner: "baseline/planner",
+					},
+				},
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			await writeSettings({
+				task: {
+					agentModelOverrides: {
+						architect: "baseline/architect",
+						planner: "external/planner",
+					},
+				},
+			});
+
+			settings.set("task.agentModelOverrides", {
+				architect: "whole/architect-1",
+				planner: "baseline/planner",
+			});
+			settings.setAgentModelOverrideIfUnchanged("planner", "baseline/planner", "profile/planner");
+			settings.setAgentModelOverride("architect", "leaf/architect-2");
+			settings.set("task.agentModelOverrides", {
+				architect: "whole/architect-3",
+				planner: "baseline/planner",
+			});
+			await settings.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: {
+					architect: "whole/architect-3",
+					planner: "baseline/planner",
+				},
+			});
+		});
+
+		it("retains conditional ownership checks across a failed save retry", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "baseline/architect" } },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (args[0] === getConfigPath()) {
+					throw new Error("simulated write failure");
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settings.setAgentModelOverrideIfUnchanged("architect", "baseline/architect", "profile/architect");
+				await expect(settings.flushOrThrow()).rejects.toThrow("simulated write failure");
+			} finally {
+				writeSpy.mockRestore();
+			}
+
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "external/architect" } },
+			});
+			await settings.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "external/architect" },
+			});
+		});
+
 		it("preserves external siblings for dotted role and agent names", async () => {
 			await writeSettings({
 				modelRoles: {
@@ -447,6 +547,50 @@ describe("Settings", () => {
 			expect(savedSettings.modelRoles).toEqual({ default: "user/default" });
 			expect(savedSettings.task).toEqual({
 				agentModelOverrides: { executor: "user/executor" },
+			});
+		});
+
+		it("keeps newer explicit leaves across an in-flight conditional save", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const { promise: writeWait, resolve: releaseWrite } = Promise.withResolvers<void>();
+			const { promise: writeStarted, resolve: resolveWriteStarted } = Promise.withResolvers<void>();
+			const originalWrite = Bun.write;
+			let blockedConfigWrite = false;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (!blockedConfigWrite && args[0] === getConfigPath()) {
+					blockedConfigWrite = true;
+					resolveWriteStarted();
+					await writeWait;
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settings.setAgentModelOverrideIfUnchanged("architect", undefined, "profile/architect");
+				const firstFlush = settings.flushOrThrow();
+				await writeStarted;
+
+				settings.setAgentModelOverride("architect", "user/architect");
+				settings.setAgentModelOverride("planner", "user/planner");
+				settings.setAgentModelOverrideIfUnchanged("planner", "user/planner", "profile/planner");
+				expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+					architect: "user/architect",
+					planner: "user/planner",
+				});
+
+				releaseWrite();
+				await firstFlush;
+				await settings.flushOrThrow();
+			} finally {
+				releaseWrite();
+				writeSpy.mockRestore();
+			}
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: {
+					architect: "user/architect",
+					planner: "user/planner",
+				},
 			});
 		});
 	});

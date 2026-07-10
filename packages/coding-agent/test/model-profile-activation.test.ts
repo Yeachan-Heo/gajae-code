@@ -328,6 +328,15 @@ describe("model profile activation", () => {
 			persistedAgents.push(agentName);
 			originalSetAgentModelOverride(agentName, selector);
 		};
+		const originalSetAgentModelOverrideIfUnchanged = settings.setAgentModelOverrideIfUnchanged.bind(settings);
+		settings.setAgentModelOverrideIfUnchanged = (
+			agentName: string,
+			expectedSelector: string | undefined,
+			selector: string | undefined,
+		) => {
+			persistedAgents.push(agentName);
+			originalSetAgentModelOverrideIfUnchanged(agentName, expectedSelector, selector);
+		};
 
 		materializeActiveModelProfileAssignment({
 			session,
@@ -338,6 +347,111 @@ describe("model profile activation", () => {
 
 		expect(persistedAgents).toEqual(["executor", "architect"]);
 		expect(persistedAgents).not.toContain("critic");
+	});
+	test("materialization preserves pending explicit sibling and profile choices in the same Settings instance", async () => {
+		const settings = Settings.isolated();
+		const session = fakeSession();
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		settings.setAgentModelOverride("architect", "provider-a/user-architect:medium");
+		settings.set("modelProfile.default", "profile-b");
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "executor",
+				selector: "provider-a/manual-executor:low",
+			}),
+		).toBe(true);
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			architect: "provider-a/user-architect:medium",
+			executor: "provider-a/manual-executor:low",
+		});
+		expect(settings.get("modelProfile.default")).toBe("profile-b");
+	});
+	test("materialization preserves an already-flushed profile choice from the same Settings instance", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-profile-materialization-owner-"));
+		resetSettingsForTest();
+		try {
+			const settings = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			const session = fakeSession();
+			await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+			settings.set("modelProfile.default", "profile-b");
+			await settings.flushOrThrow();
+			expect(
+				materializeActiveModelProfileAssignment({
+					session,
+					settings,
+					role: "executor",
+					selector: "provider-a/manual-executor:low",
+				}),
+			).toBe(true);
+			await settings.flushOrThrow();
+
+			expect(settings.get("modelProfile.default")).toBe("profile-b");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				architect: "provider-a/architect",
+				executor: "provider-a/manual-executor:low",
+			});
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	test("materializing one profile role preserves a later durable sibling assignment", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-profile-materialization-sibling-"));
+		resetSettingsForTest();
+		try {
+			const settingsA = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			const settingsB = await settingsA.cloneForCwd(tempDir);
+			const session = fakeSession();
+
+			await activateModelProfile({
+				session,
+				modelRegistry: fakeRegistry(),
+				settings: settingsA,
+				profileName: "profile-a",
+			});
+			settingsB.setAgentModelOverride("architect", "provider-a/user-architect:medium");
+			settingsB.setAgentModelOverride("executor", "provider-a/external-executor:medium");
+			settingsB.set("modelProfile.default", "profile-b");
+			settingsB.setModelRole("default", "provider-a/external-default:medium");
+			await settingsB.flushOrThrow();
+
+			expect(
+				materializeActiveModelProfileAssignment({
+					session,
+					settings: settingsA,
+					role: "executor",
+					selector: "provider-a/manual-executor:low",
+				}),
+			).toBe(true);
+			await settingsA.flushOrThrow();
+			expect(settingsA.get("task.agentModelOverrides")).toEqual({
+				architect: "provider-a/user-architect:medium",
+				executor: "provider-a/manual-executor:low",
+			});
+			expect(settingsA.get("modelRoles")).toEqual({
+				default: "provider-a/external-default:medium",
+			});
+			expect(settingsA.get("modelProfile.default")).toBe("profile-b");
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			expect(reopened.getGlobal("task.agentModelOverrides")).toEqual({
+				architect: "provider-a/user-architect:medium",
+				executor: "provider-a/manual-executor:low",
+			});
+			expect(reopened.getGlobal("modelProfile.default")).toBe("profile-b");
+			expect(reopened.getGlobal("modelRoles")).toEqual({
+				default: "provider-a/external-default:medium",
+			});
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	test("failed profile detachment retains transition state for the next activation", async () => {
@@ -386,9 +500,10 @@ describe("model profile activation", () => {
 
 	test("role-only materialization persists the active profile default, not a transient live model", async () => {
 		const session = fakeSession(model("provider-c", "default"));
-		const settings = Settings.isolated();
-		settings.set("modelRoles", { default: "configured/default:medium" });
-		settings.set("task.agentModelOverrides", { critic: "configured/critic:high" });
+		const settings = Settings.isolated({
+			modelRoles: { default: "configured/default:medium" },
+			"task.agentModelOverrides": { critic: "configured/critic:high" },
+		});
 		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
 
 		session.model = model("provider-c", "architect");

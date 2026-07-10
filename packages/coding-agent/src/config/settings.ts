@@ -54,6 +54,21 @@ export * from "./settings-schema";
 export interface RawSettings {
 	[key: string]: unknown;
 }
+type SettingMutationGuard = { kind: "unconditional" } | { kind: "if-unchanged"; expectedValue: unknown };
+
+interface PendingSettingMutation {
+	id: number;
+	desiredValue: unknown;
+	guard: SettingMutationGuard;
+}
+
+function canApplySettingMutation(mutation: PendingSettingMutation, currentValue: unknown): boolean {
+	return (
+		mutation.guard.kind === "unconditional" ||
+		Object.is(currentValue, mutation.guard.expectedValue) ||
+		Object.is(currentValue, mutation.desiredValue)
+	);
+}
 
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
@@ -223,7 +238,8 @@ export class Settings {
 	#merged: RawSettings = {};
 
 	/** Paths modified during this session (for partial save) */
-	#modified = new Set<string>();
+	#modified = new Map<string, PendingSettingMutation>();
+	#nextMutationId = 1;
 
 	/** Pending save (debounced) */
 	#saveTimer?: NodeJS.Timeout;
@@ -363,8 +379,8 @@ export class Settings {
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		const prev = this.get(path);
 		const segments = path.split(".");
+		this.#enqueueSettingValue(path, value);
 		setByPath(this.#global, segments, value);
-		this.#modified.add(path);
 		this.#rebuildMerged();
 		this.#queueSave();
 
@@ -377,8 +393,20 @@ export class Settings {
 
 	/** Remove a user/global setting while preserving project and runtime layers. */
 	clearGlobal(path: SettingPath): void {
+		this.#enqueueSettingValue(path, undefined);
 		setByPath(this.#global, path.split("."), undefined);
-		this.#modified.add(path);
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	/**
+	 * Persist or clear the default model profile only if another writer has not
+	 * changed it since this Settings instance loaded it.
+	 */
+	setModelProfileDefaultIfUnchanged(expectedProfileName: string | undefined, profileName: string | undefined): void {
+		const path = "modelProfile.default";
+		if (!this.#enqueueModifiedIfUnchanged(path, expectedProfileName, profileName, true)) return;
+		setByPath(this.#global, path.split("."), profileName);
 		this.#rebuildMerged();
 		this.#queueSave();
 	}
@@ -526,11 +554,65 @@ export class Settings {
 		return this.get("bashInterceptor.patterns");
 	}
 
+	#enqueueModified(path: string, desiredValue: unknown): void {
+		this.#modified.delete(path);
+		this.#modified.set(path, {
+			id: this.#nextMutationId++,
+			desiredValue: structuredClone(desiredValue),
+			guard: { kind: "unconditional" },
+		});
+	}
+
+	#enqueueSettingValue(path: SettingPath, desiredValue: unknown): void {
+		if (path !== "modelRoles" && path !== "task.agentModelOverrides") {
+			this.#enqueueModified(path, desiredValue);
+			return;
+		}
+		const previous = shallowStringRecord(getByPath(this.#global, path.split(".")));
+		const next = shallowStringRecord(desiredValue);
+		for (const key of new Set([...Object.keys(previous), ...Object.keys(next)])) {
+			this.#enqueueModified(encodeRecordEntryMutation(path, key), next[key]);
+		}
+	}
+
+	#enqueueModifiedIfUnchanged(
+		path: string,
+		expectedValue: unknown,
+		desiredValue: unknown,
+		replaceMatchingUnconditional = false,
+	): boolean {
+		const pending = this.#modified.get(path);
+		if (pending) {
+			const replacesMatchingUnconditional =
+				replaceMatchingUnconditional &&
+				pending.guard.kind === "unconditional" &&
+				Object.is(pending.desiredValue, expectedValue);
+			const reversesPendingConditional =
+				pending.guard.kind === "if-unchanged" &&
+				Object.is(pending.guard.expectedValue, desiredValue) &&
+				Object.is(pending.desiredValue, expectedValue);
+			if (!replacesMatchingUnconditional && !reversesPendingConditional) return false;
+		}
+		const currentValue = getByPath(this.#global, decodeModifiedPath(path));
+		if (!Object.is(currentValue, expectedValue) && !Object.is(currentValue, desiredValue)) return false;
+		this.#modified.delete(path);
+		this.#modified.set(path, {
+			id: this.#nextMutationId++,
+			desiredValue: structuredClone(desiredValue),
+			guard: {
+				kind: "if-unchanged",
+				expectedValue: structuredClone(expectedValue),
+			},
+		});
+		return true;
+	}
+
 	#setStringRecordEntry(
 		path: "modelRoles" | "task.agentModelOverrides",
 		key: string,
 		value: string | undefined,
-	): void {
+		expectedValue?: { value: string | undefined },
+	): boolean {
 		const segments = path.split(".");
 		const next = shallowStringRecord(getByPath(this.#global, segments));
 		if (value === undefined) {
@@ -538,10 +620,40 @@ export class Settings {
 		} else {
 			next[key] = value;
 		}
+		const modifiedPath = encodeRecordEntryMutation(path, key);
+		if (expectedValue) {
+			if (!this.#enqueueModifiedIfUnchanged(modifiedPath, expectedValue.value, value)) return false;
+		} else {
+			this.#enqueueModified(modifiedPath, value);
+		}
 		setByPath(this.#global, segments, next);
-		this.#modified.add(encodeRecordEntryMutation(path, key));
 		this.#rebuildMerged();
 		this.#queueSave();
+		return true;
+	}
+
+	#setModelRoleEntry(
+		role: ModelRole | string,
+		modelId: string | undefined,
+		expectedValue?: { value: string | undefined },
+	): void {
+		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
+		const hasRuntimeOverrides =
+			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
+		const runtimeRoleIsSet = hasRuntimeOverrides && Object.hasOwn(runtimeOverrides, role);
+
+		if (!this.#setStringRecordEntry("modelRoles", role, modelId, expectedValue)) return;
+
+		if (modelId === undefined) {
+			if (hasRuntimeOverrides) {
+				const nextRuntimeOverrides = shallowStringRecord(runtimeOverrides);
+				delete nextRuntimeOverrides[role];
+				this.override("modelRoles", nextRuntimeOverrides);
+			}
+		} else if (runtimeRoleIsSet || this.get("modelRoles")[role] !== modelId) {
+			const base = shallowStringRecord(runtimeOverrides);
+			this.override("modelRoles", { ...base, [role]: modelId });
+		}
 	}
 
 	/**
@@ -549,18 +661,44 @@ export class Settings {
 	 * process, and keep a shadowing runtime/project value aligned for this session.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string): void {
-		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
-		const runtimeRoleIsSet =
-			!!runtimeOverrides &&
-			typeof runtimeOverrides === "object" &&
-			!Array.isArray(runtimeOverrides) &&
-			Object.hasOwn(runtimeOverrides, role);
+		this.#setModelRoleEntry(role, modelId);
+	}
 
-		this.#setStringRecordEntry("modelRoles", role, modelId);
+	/**
+	 * Persist or clear one model role only if another writer has not changed that
+	 * leaf since this Settings instance loaded it.
+	 */
+	setModelRoleIfUnchanged(
+		role: ModelRole | string,
+		expectedModelId: string | undefined,
+		modelId: string | undefined,
+	): void {
+		this.#setModelRoleEntry(role, modelId, { value: expectedModelId });
+	}
 
-		if (runtimeRoleIsSet || this.get("modelRoles")[role] !== modelId) {
+	#setAgentModelOverrideEntry(
+		agentName: string,
+		modelId: string | undefined,
+		expectedValue?: { value: string | undefined },
+	): void {
+		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
+		const hasRuntimeOverrides =
+			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
+
+		if (!this.#setStringRecordEntry("task.agentModelOverrides", agentName, modelId, expectedValue)) return;
+
+		if (modelId === undefined) {
+			if (hasRuntimeOverrides) {
+				const nextRuntimeOverrides = shallowStringRecord(runtimeOverrides);
+				delete nextRuntimeOverrides[agentName];
+				this.override("task.agentModelOverrides", nextRuntimeOverrides);
+			}
+		} else if (hasRuntimeOverrides || this.get("task.agentModelOverrides")[agentName] !== modelId) {
 			const base = shallowStringRecord(runtimeOverrides);
-			this.override("modelRoles", { ...base, [role]: modelId });
+			this.override("task.agentModelOverrides", {
+				...base,
+				[agentName]: modelId,
+			});
 		}
 	}
 
@@ -573,49 +711,29 @@ export class Settings {
 	 * persisted.
 	 */
 	setAgentModelOverride(agentName: string, modelId: string): void {
-		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
-		const hasRuntimeOverrides =
-			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
+		this.#setAgentModelOverrideEntry(agentName, modelId);
+	}
 
-		this.#setStringRecordEntry("task.agentModelOverrides", agentName, modelId);
-
-		if (hasRuntimeOverrides || this.get("task.agentModelOverrides")[agentName] !== modelId) {
-			const base = shallowStringRecord(runtimeOverrides);
-			this.override("task.agentModelOverrides", {
-				...base,
-				[agentName]: modelId,
-			});
-		}
+	/**
+	 * Persist or clear one agent override only if another writer has not changed
+	 * that leaf since this Settings instance loaded it.
+	 */
+	setAgentModelOverrideIfUnchanged(
+		agentName: string,
+		expectedModelId: string | undefined,
+		modelId: string | undefined,
+	): void {
+		this.#setAgentModelOverrideEntry(agentName, modelId, { value: expectedModelId });
 	}
 
 	/** Clear one persisted and live model role without replacing siblings. */
 	clearModelRole(role: ModelRole | string): void {
-		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
-		const hasRuntimeOverrides =
-			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
-
-		this.#setStringRecordEntry("modelRoles", role, undefined);
-
-		if (hasRuntimeOverrides) {
-			const nextRuntimeOverrides = shallowStringRecord(runtimeOverrides);
-			delete nextRuntimeOverrides[role];
-			this.override("modelRoles", nextRuntimeOverrides);
-		}
+		this.#setModelRoleEntry(role, undefined);
 	}
 
 	/** Clear one persisted and live agent model override without replacing siblings. */
 	clearAgentModelOverride(agentName: string): void {
-		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
-		const hasRuntimeOverrides =
-			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
-
-		this.#setStringRecordEntry("task.agentModelOverrides", agentName, undefined);
-
-		if (hasRuntimeOverrides) {
-			const nextRuntimeOverrides = shallowStringRecord(runtimeOverrides);
-			delete nextRuntimeOverrides[agentName];
-			this.override("task.agentModelOverrides", nextRuntimeOverrides);
-		}
+		this.#setAgentModelOverrideEntry(agentName, undefined);
 	}
 
 	/**
@@ -967,45 +1085,43 @@ export class Settings {
 		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
 
 		const configPath = this.#configPath;
-		const modifiedPaths = [...this.#modified];
-		const modifiedValues = new Map(
-			modifiedPaths.map(modPath => {
-				const segments = decodeModifiedPath(modPath);
-				return [modPath, structuredClone(getByPath(this.#global, segments))] as const;
-			}),
-		);
-		this.#modified.clear();
+		const initialEntries = [...this.#modified].sort((left, right) => left[1].id - right[1].id);
 
 		try {
 			await withFileLock(configPath, async () => {
-				// Re-read to preserve external changes
 				const current = await this.#loadYaml(configPath);
+				const processedIds = new Set<number>();
+				const processedEntries: Array<[path: string, id: number]> = [];
+				const processMutation = (modifiedPath: string, mutation: PendingSettingMutation): void => {
+					if (processedIds.has(mutation.id)) return;
+					processedIds.add(mutation.id);
+					processedEntries.push([modifiedPath, mutation.id]);
+					const segments = decodeModifiedPath(modifiedPath);
+					if (!canApplySettingMutation(mutation, getByPath(current, segments))) return;
+					setByPath(current, segments, structuredClone(mutation.desiredValue));
+				};
 
-				// Apply only our modified paths
-				for (const modPath of modifiedPaths) {
-					const segments = decodeModifiedPath(modPath);
-					const value = modifiedValues.get(modPath);
-					setByPath(current, segments, value);
+				const pendingEntries = [...initialEntries, ...this.#modified].sort(
+					(left, right) => left[1].id - right[1].id,
+				);
+				for (const [modifiedPath, mutation] of pendingEntries) {
+					processMutation(modifiedPath, mutation);
 				}
 
-				// A mutation can arrive while the file is being loaded. Overlay those
-				// still-pending leaves before replacing #global so the in-memory value
-				// survives this save and the serialized snapshot is never stale.
-				for (const pendingPath of this.#modified) {
-					const segments = decodeModifiedPath(pendingPath);
-					setByPath(current, segments, getByPath(this.#global, segments));
-				}
+				await Bun.write(configPath, YAML.stringify(current, null, 2));
 
-				// Update our global with any external changes we preserved
+				for (const [modifiedPath, id] of processedEntries) {
+					if (this.#modified.get(modifiedPath)?.id === id) {
+						this.#modified.delete(modifiedPath);
+					}
+				}
 				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
+				for (const [modifiedPath, mutation] of this.#modified) {
+					setByPath(this.#global, decodeModifiedPath(modifiedPath), structuredClone(mutation.desiredValue));
+				}
 			});
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
-			// Re-add failed paths for retry
-			for (const p of modifiedPaths) {
-				this.#modified.add(p);
-			}
 			if (options.throwOnError) {
 				this.#rebuildMerged();
 				throw error;
