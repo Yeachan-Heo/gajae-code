@@ -62,8 +62,11 @@ export interface FastStatusSessionLike {
 	 * Optional so lightweight fakes can omit it; falls back to `isFastForProvider`.
 	 */
 	isFastModeActive?(): boolean;
+	/** Complete provider/model query including per-model overrides. */
+	isFastForModel?(model?: Model, options?: { subagent?: boolean }): boolean;
 	/** Fast predicate against the effective subagent tier (`task.agentModelOverrides` roles). */
-	isFastForSubagentProvider(provider?: string): boolean;
+	/** Optional; falls back to the main-session predicate when unavailable. */
+	isFastForSubagentProvider?(provider?: string): boolean;
 	resolveRoleModelWithThinking(role: string): { model?: Model };
 }
 
@@ -106,14 +109,21 @@ export function buildFastStatusReport(args: BuildFastStatusReportArgs): string {
 	// on pure intent. Fall back to intent when a fake omits `isFastModeActive`.
 	const currentFast = session.isFastModeActive
 		? session.isFastModeActive()
-		: session.isFastForProvider(session.model?.provider);
+		: session.isFastForModel
+			? session.isFastForModel(session.model)
+			: session.isFastForProvider(session.model?.provider);
 	const rows: FastStatusRow[] = [{ label: "현재 모델", model: session.model, fast: currentFast }];
 	for (const target of roleTargets) {
 		const resolved = session.resolveRoleModelWithThinking(target.id);
 		if (resolved.model) {
 			const fast = target.isSubagentRole
-				? session.isFastForSubagentProvider(resolved.model.provider)
-				: session.isFastForProvider(resolved.model.provider);
+				? (session.isFastForModel
+					? session.isFastForModel(resolved.model, { subagent: true })
+					: session.isFastForSubagentProvider?.(resolved.model.provider) ??
+						session.isFastForProvider(resolved.model.provider))
+				: session.isFastForModel
+					? session.isFastForModel(resolved.model)
+					: session.isFastForProvider(resolved.model.provider);
 			rows.push({ label: target.label, model: resolved.model, fast });
 		}
 	}
