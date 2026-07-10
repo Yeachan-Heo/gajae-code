@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- Updated the built-in `codex-{eco,medium,pro}` model profiles from GPT-5.5 effort spreads to role-specific GPT-5.6 Sol, Terra, and Luna assignments. Eco now uses Luna for frequent routing and execution with Sol reviewers, medium uses Sol orchestration with a Terra `max` executor, and pro uses Sol throughout.
 
 ## [0.9.5] - 2026-07-09
 ### Fixed

@@ -22,33 +22,33 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "codex-eco",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:low",
-			executor: "openai-codex/gpt-5.5:minimal",
-			planner: "openai-codex/gpt-5.5:low",
-			critic: "openai-codex/gpt-5.5:medium",
-			architect: "openai-codex/gpt-5.5:high",
+			default: "openai-codex/gpt-5.6-luna:xhigh",
+			executor: "openai-codex/gpt-5.6-luna:max",
+			planner: "openai-codex/gpt-5.6-luna:xhigh",
+			critic: "openai-codex/gpt-5.6-sol:medium",
+			architect: "openai-codex/gpt-5.6-sol:medium",
 		},
 	},
 	{
 		name: "codex-medium",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:medium",
-			executor: "openai-codex/gpt-5.5:low",
-			planner: "openai-codex/gpt-5.5:medium",
-			critic: "openai-codex/gpt-5.5:high",
-			architect: "openai-codex/gpt-5.5:xhigh",
+			default: "openai-codex/gpt-5.6-sol:medium",
+			executor: "openai-codex/gpt-5.6-terra:max",
+			planner: "openai-codex/gpt-5.6-sol:medium",
+			critic: "openai-codex/gpt-5.6-sol:high",
+			architect: "openai-codex/gpt-5.6-sol:high",
 		},
 	},
 	{
 		name: "codex-pro",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:xhigh",
-			executor: "openai-codex/gpt-5.5:medium",
-			planner: "openai-codex/gpt-5.5:high",
-			critic: "openai-codex/gpt-5.5:xhigh",
-			architect: "openai-codex/gpt-5.5:xhigh",
+			default: "openai-codex/gpt-5.6-sol:high",
+			executor: "openai-codex/gpt-5.6-sol:max",
+			planner: "openai-codex/gpt-5.6-sol:xhigh",
+			critic: "openai-codex/gpt-5.6-sol:xhigh",
+			architect: "openai-codex/gpt-5.6-sol:max",
 		},
 	},
 	{
@@ -351,7 +351,7 @@ function selectorExists(selector: string): boolean {
 }
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 28-profile matrix cell-for-cell", () => {
+	test("contains the exact built-in profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);

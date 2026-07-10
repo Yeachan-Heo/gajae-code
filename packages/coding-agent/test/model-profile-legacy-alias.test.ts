@@ -24,6 +24,23 @@ const codexModel = {
 	},
 } satisfies Model<"openai-codex-responses">;
 
+const codexSolModel = {
+	...codexModel,
+	id: "gpt-5.6-sol",
+	name: "gpt-5.6-sol",
+	thinking: {
+		mode: "effort",
+		minLevel: ThinkingLevel.Low,
+		maxLevel: ThinkingLevel.Max,
+	},
+} satisfies Model<"openai-codex-responses">;
+
+const codexTerraModel = {
+	...codexSolModel,
+	id: "gpt-5.6-terra",
+	name: "gpt-5.6-terra",
+} satisfies Model<"openai-codex-responses">;
+
 interface TestSession {
 	model: Model | undefined;
 	thinkingLevel: ThinkingLevel | undefined;
@@ -43,7 +60,7 @@ function fakeRegistry(extraProfiles: ModelProfileDefinition[] = []) {
 		getModelProfiles: () => new Map(profiles),
 		getAvailableModelProfileNames: () => [...profiles.keys()].sort(),
 		getApiKeyForProvider: async () => "key-openai-codex",
-		getAll: () => [codexModel],
+		getAll: () => [codexModel, codexSolModel, codexTerraModel],
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
 		getCanonicalId: () => undefined,
@@ -85,7 +102,7 @@ describe("legacy model profile aliases", () => {
 		});
 
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
-		expect(session.setModelTemporaryCalls).toEqual([{ model: codexModel, thinkingLevel: ThinkingLevel.Medium }]);
+		expect(session.setModelTemporaryCalls).toEqual([{ model: codexSolModel, thinkingLevel: ThinkingLevel.Medium }]);
 		expect(settings.get("modelProfile.default")).toBe("codex-standard");
 	});
 
