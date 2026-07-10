@@ -173,6 +173,7 @@ interface ArrayDef<T> {
 interface RecordDef<T> {
 	type: "record";
 	default: Record<string, T>;
+	items?: { enum: readonly string[] };
 	ui?: UiBase;
 }
 
@@ -967,6 +968,16 @@ export const SETTINGS_SCHEMA = {
 					description: "Anthropic fast mode on direct Claude requests; ignored elsewhere (incl. Bedrock/Vertex)",
 				},
 			],
+		},
+	},
+	modelServiceTierOverrides: {
+		type: "record",
+		items: { enum: ["on", "off"] },
+		default: {} as Record<string, "on" | "off">,
+		ui: {
+			tab: "model",
+			label: "Model Service Tier Overrides",
+			description: "Per-model Fast overrides keyed by the exact resolved provider/model identity. Values are on or off; omitted models use the raw baseline service tier.",
 		},
 	},
 

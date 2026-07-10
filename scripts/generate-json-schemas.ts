@@ -117,7 +117,10 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 		case "array":
 			return { type: "array", items: arrayItemsSchema(definition.default, definition.items) };
 		case "record":
-			return { type: "object", additionalProperties: true };
+			return {
+				type: "object",
+				additionalProperties: definition.items?.enum ? { type: "string", enum: definition.items.enum } : true,
+			};
 	}
 }
 

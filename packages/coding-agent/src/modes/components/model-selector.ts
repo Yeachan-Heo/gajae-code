@@ -101,6 +101,11 @@ export type ModelSelectorSelection =
 			selector?: string;
 	  }
 	| {
+			kind: "serviceTier";
+			model: Model;
+			override: "inherit" | "on" | "off";
+	  }
+	| {
 			kind: "profile";
 			profileName: string;
 			setDefault: boolean;
@@ -319,6 +324,7 @@ export class ModelSelectorComponent extends Container {
 	#currentThinkingLevel?: ThinkingLevel;
 	#activeModelProfile?: string;
 	#isFastForProvider: (provider?: string) => boolean = () => false;
+	#isFastForModel: (model?: Model, options?: { subagent?: boolean }) => boolean = () => false;
 	#isFastForSubagentProvider: (provider?: string) => boolean = () => false;
 	#isCurrentModelFastModeActive: () => boolean = () => false;
 	#pendingActionItem?: ModelItem | CanonicalModelItem;
@@ -355,6 +361,7 @@ export class ModelSelectorComponent extends Container {
 			initialSearchInput?: string;
 			sessionId?: string;
 			isFastForProvider?: (provider?: string) => boolean;
+			isFastForModel?: (model?: Model, options?: { subagent?: boolean }) => boolean;
 			isFastForSubagentProvider?: (provider?: string) => boolean;
 			isCurrentModelFastModeActive?: () => boolean;
 			currentThinkingLevel?: ThinkingLevel;
@@ -376,12 +383,20 @@ export class ModelSelectorComponent extends Container {
 		this.#activeModelProfile = options?.activeModelProfile;
 		this.#isFastForProvider = options?.isFastForProvider ?? (() => false);
 		this.#isFastForSubagentProvider = options?.isFastForSubagentProvider ?? (() => false);
+		this.#isFastForModel =
+			options?.isFastForModel ??
+			((model, roleOptions) =>
+				model
+					? roleOptions?.subagent
+						? this.#isFastForSubagentProvider(model.provider)
+						: this.#isFastForProvider(model.provider)
+					: false);
 		// Current-model EFFECTIVE fast state. Defaults to intent for the current
 		// model so existing callers/tests keep prior behavior; production wires the
 		// session's effective predicate so an auto-disabled provider shows no glyph.
 		this.#isCurrentModelFastModeActive =
 			options?.isCurrentModelFastModeActive ??
-			(() => (this.#currentModel ? this.#isFastForProvider(this.#currentModel.provider) : false));
+			(() => (this.#currentModel ? this.#isFastForModel(this.#currentModel) : false));
 		const initialSearchInput = options?.initialSearchInput;
 		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
 
@@ -1257,11 +1272,10 @@ export class ModelSelectorComponent extends Container {
 					// other modelRoles rows show pure intent.
 					const isSubagentRole = roleInfo.settingsPath === "task.agentModelOverrides";
 					const isCurrentRow = this.#currentModel !== undefined && modelsAreEqual(this.#currentModel, item.model);
-					const roleFast = isSubagentRole
-						? this.#isFastForSubagentProvider(assigned.model.provider)
-						: isCurrentRow
+					const roleFast =
+						isCurrentRow && !isSubagentRole
 							? this.#isCurrentModelFastModeActive()
-							: this.#isFastForProvider(assigned.model.provider);
+							: this.#isFastForModel(assigned.model, { subagent: isSubagentRole });
 					if (roleFast && isCurrentRow && !isSubagentRole) {
 						currentModelEffectiveGlyphRendered = true;
 					}
@@ -1366,7 +1380,9 @@ export class ModelSelectorComponent extends Container {
 				? `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name})`
 				: i === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length
 					? "Set for all role agents"
-					: "Set for all targets";
+					: i === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + 1
+						? "Set for all targets"
+						: ["Fast: Inherit", "Fast: On", "Fast: Off"][i - GJC_MODEL_ASSIGNMENT_TARGET_IDS.length - 2] ?? "";
 			this.#listContainer.addChild(
 				new Text(`${prefix}${i === this.#selectedActionIndex ? theme.fg("accent", label) : label}`, 0, 0),
 			);
@@ -1396,12 +1412,12 @@ export class ModelSelectorComponent extends Container {
 			);
 		}
 	}
+	#getActionCount(_model: Model): number {
+		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + 5;
+	}
 
 	#getCurrentRoleThinkingLevel(role: string): ThinkingLevel {
 		return this.#roles[role]?.thinkingLevel ?? ThinkingLevel.Inherit;
-	}
-	#getActionCount(_model: Model): number {
-		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + 2;
 	}
 
 	#getSelectedItem(): ModelItem | CanonicalModelItem | undefined {
@@ -1670,14 +1686,21 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+			const index = this.#selectedActionIndex;
 			this.#pendingActionItem = undefined;
-			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[this.#selectedActionIndex];
+			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[index];
 			if (role) {
 				this.#handleSelect(item, role);
 				return;
 			}
+			const allTargetsIndex = GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + 1;
+			if (index >= allTargetsIndex + 1) {
+				const override = (["inherit", "on", "off"] as const)[index - allTargetsIndex - 1];
+				this.#onSelectCallback({ kind: "serviceTier", model: item.model, override });
+				return;
+			}
 			const roles =
-				this.#selectedActionIndex === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length
+				index === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length
 					? (["executor", "architect", "planner", "critic"] as const)
 					: GJC_MODEL_ASSIGNMENT_TARGET_IDS;
 			this.#handleSelect(item, "default", undefined, roles);

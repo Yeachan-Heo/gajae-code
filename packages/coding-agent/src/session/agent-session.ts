@@ -146,6 +146,8 @@ import {
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
+import { resolveModelServiceTierPolicy } from "../config/model-service-tier-policy";
+import type { ModelServiceTierOverrides, ModelServiceTierPolicyStatus } from "../config/model-service-tier-policy";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
@@ -369,6 +371,8 @@ export interface RetainedMemorySample {
 
 export interface AgentSessionConfig {
 	agent: Agent;
+	/** Raw user-configured tier, before per-model policy resolution. */
+	rawServiceTier?: ServiceTier;
 	sessionManager: SessionManager;
 	settings: Settings;
 	/** Models to cycle through with Alt+N (from --models flag) */
@@ -459,6 +463,8 @@ export interface AgentSessionConfig {
 	forkContextSeed?: ForkContextSeed;
 	/** Optional provider state override. Fork-context children should omit this by default. */
 	providerSessionState?: Map<string, ProviderSessionState>;
+	/** Explicit sanitized per-model policy snapshot carried across child sessions. */
+	modelServiceTierOverrides?: ModelServiceTierOverrides;
 	/** Agent identity (registry id like "0-Main" or "3-Alice") used for IRC routing. */
 	agentId?: string;
 	/** Shared agent registry (for forwarding IRC observations to the main session UI). */
@@ -1297,6 +1303,7 @@ export class AgentSession {
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
+	#rawServiceTier: ServiceTier | undefined;
 
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
@@ -1420,6 +1427,7 @@ export class AgentSession {
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
 	#promptGeneration = 0;
 	#providerSessionState = new Map<string, ProviderSessionState>();
+	#modelServiceTierOverrides: ModelServiceTierOverrides | undefined;
 	/**
 	 * Provider keys for which the Anthropic fast-mode auto-fallback fired this
 	 * session (the provider rejected `speed:"fast"` and we retried without it).
@@ -1499,6 +1507,7 @@ export class AgentSession {
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
+		this.#modelServiceTierOverrides = config.modelServiceTierOverrides;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.taskDepth = config.taskDepth ?? 0;
@@ -1531,6 +1540,8 @@ export class AgentSession {
 		this.#customCommands = config.customCommands ?? [];
 		this.#skillsSettings = config.skillsSettings;
 		this.#modelRegistry = config.modelRegistry;
+		this.#rawServiceTier = config.rawServiceTier ?? this.agent.serviceTier;
+		this.#syncServiceTierForModel();
 		if (config.providerSessionState) {
 			this.#providerSessionState = config.providerSessionState;
 		}
@@ -3874,6 +3885,7 @@ export class AgentSession {
 			}
 		}
 
+		this.#rearmFastMode();
 		this.#providerSessionState.clear();
 	}
 
@@ -3898,6 +3910,28 @@ export class AgentSession {
 
 	get serviceTier(): ServiceTier | undefined {
 		return this.agent.serviceTier;
+	}
+	/**
+	 * Raw user-configured tier before per-model policy resolution.
+	 */
+	get rawServiceTier(): ServiceTier | undefined {
+		return this.#rawServiceTier;
+	}
+
+	/** Sanitized per-model service-tier policy snapshot inherited by child sessions. */
+	get modelServiceTierOverrides(): ModelServiceTierOverrides | undefined {
+		return this.#modelServiceTierOverrides;
+	}
+	/**
+	 * Refresh the active model's effective service tier after the durable global
+	 * per-model policy changes. This updates only the effective runtime tier:
+	 * the raw baseline and service-tier history remain unchanged.
+	 */
+	refreshServiceTierForModel(
+		overrides: ModelServiceTierOverrides = this.settings.getGlobalModelServiceTierOverrides(),
+	): ModelServiceTierPolicyStatus | undefined {
+		this.#modelServiceTierOverrides = overrides;
+		return this.#syncServiceTierForModel(overrides);
 	}
 
 	/** Whether agent is currently streaming a response */
@@ -6645,7 +6679,7 @@ export class AgentSession {
 		if (this.model) {
 			this.sessionManager.appendModelChange(`${this.model.provider}/${this.model.id}`);
 		}
-		this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
+		this.sessionManager.appendServiceTierChange(this.#rawServiceTier ?? null);
 		if (nextDiscoverySessionToolNames) {
 			await this.#applyActiveToolsByName(nextDiscoverySessionToolNames, { persistMCPSelection: false });
 			if (this.getSelectedMCPToolNames().length > 0) {
@@ -6701,7 +6735,7 @@ export class AgentSession {
 		if (this.model) {
 			this.sessionManager.appendModelChange(`${this.model.provider}/${this.model.id}`);
 		}
-		this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
+		this.sessionManager.appendServiceTierChange(this.#rawServiceTier ?? null);
 		this.#todoReminderCount = 0;
 		this.#planReferenceSent = false;
 		this.#planReferencePath = "local://PLAN.md";
@@ -7106,7 +7140,7 @@ export class AgentSession {
 	 */
 	isFastModeEnabled(): boolean {
 		return (
-			this.serviceTier === "priority" || this.serviceTier === "claude-only" || this.serviceTier === "openai-only"
+			this.#rawServiceTier === "priority" || this.#rawServiceTier === "claude-only" || this.#rawServiceTier === "openai-only"
 		);
 	}
 
@@ -7121,8 +7155,25 @@ export class AgentSession {
 		// (no model selected) it cannot apply, even under an unscoped `priority`
 		// tier that `resolveServiceTier` would otherwise pass through.
 		if (provider === undefined) return false;
-		return resolveServiceTier(this.serviceTier, provider) === "priority";
+		return resolveServiceTier(this.#rawServiceTier, provider) === "priority";
 	}
+	/**
+	 * Resolve fast mode for a complete provider/model identity, including the
+	 * persisted per-model override. The optional subagent form uses the tier
+	 * under which task-tool roles execute.
+	 */
+	isFastForModel(model: Model | undefined, options?: { subagent?: boolean }): boolean {
+		if (!model) return false;
+		const rawBaseline = options?.subagent ? this.#subagentRawServiceTier() : this.#rawServiceTier;
+		const status = resolveModelServiceTierPolicy({
+			rawBaseline,
+			provider: model.provider,
+			model: model.id,
+			overrides: this.#modelServiceTierOverrides ?? this.settings.getGlobalModelServiceTierOverrides(),
+		});
+		return status.effectiveTier === "priority";
+	}
+
 
 	/**
 	 * Effective service tier applied to task-tool subagent sessions
@@ -7136,6 +7187,13 @@ export class AgentSession {
 		if (configured === "none") return undefined;
 		return configured;
 	}
+	#subagentRawServiceTier(): ServiceTier | undefined {
+		const configured = this.settings.get("task.serviceTier");
+		if (configured === "inherit") return this.#rawServiceTier;
+		if (configured === "none") return undefined;
+		return configured;
+	}
+
 
 	/**
 	 * Provider-aware fast-mode predicate for task-tool subagent roles, evaluated
@@ -7199,10 +7257,12 @@ export class AgentSession {
 	 */
 	isFastModeActive(): boolean {
 		const provider = this.model?.provider;
-		return this.isFastForProvider(provider) && !this.#isFastModeAutoDisabledForProvider(provider);
+		return this.isFastForModel(this.model) && !this.#isFastModeAutoDisabledForProvider(provider);
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {
+		const previousRawServiceTier = this.#rawServiceTier;
+		this.#rawServiceTier = serviceTier;
 		// Re-arming a priority-granting tier always clears the per-session
 		// auto-fallback sticky disable AND the auto-disable markers so the next
 		// request carries `speed: "fast"` again — even when the tier is unchanged
@@ -7211,8 +7271,8 @@ export class AgentSession {
 		if (serviceTier === "priority" || serviceTier === "claude-only") {
 			this.#rearmFastMode();
 		}
-		if (this.serviceTier === serviceTier) return;
-		this.agent.serviceTier = serviceTier;
+		this.#syncServiceTierForModel();
+		if (previousRawServiceTier === serviceTier) return;
 		this.sessionManager.appendServiceTierChange(serviceTier ?? null);
 	}
 
@@ -7668,7 +7728,7 @@ export class AgentSession {
 				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`);
 			}
 			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
-			this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
+			this.sessionManager.appendServiceTierChange(this.#rawServiceTier ?? null);
 
 			// Inject the handoff document as a custom message
 			const handoffContent = createHandoffContext(handoffText);
@@ -8234,12 +8294,30 @@ export class AgentSession {
 		return candidate;
 	}
 
+	#syncServiceTierForModel(overrides?: ModelServiceTierOverrides): ModelServiceTierPolicyStatus | undefined {
+		const model = this.model;
+		if (!model) {
+			this.agent.serviceTier = this.#rawServiceTier;
+			return undefined;
+		}
+		const status = resolveModelServiceTierPolicy({
+			rawBaseline: this.#rawServiceTier,
+			provider: model.provider,
+			model: model.id,
+			overrides: overrides ?? this.#modelServiceTierOverrides ?? this.settings.getGlobalModelServiceTierOverrides(),
+		});
+		this.agent.serviceTier = status.effectiveTier;
+		return status;
+	}
+
 	#setModelWithProviderSessionReset(model: Model): void {
+
 		const currentModel = this.model;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
 		}
 		this.agent.setModel(model);
+		this.#syncServiceTierForModel();
 
 		// Re-evaluate append-only context mode — provider or setting may have changed
 		this.#syncAppendOnlyContext(model);
@@ -10629,7 +10707,7 @@ export class AgentSession {
 		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 		const previousModel = this.model;
 		const previousThinkingLevel = this.#thinkingLevel;
-		const previousServiceTier = this.agent.serviceTier;
+		const previousRawServiceTier = this.#rawServiceTier;
 		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 		const previousTools = [...this.agent.state.tools];
 		const previousBaseSystemPrompt = this.#baseSystemPrompt;
@@ -10702,6 +10780,7 @@ export class AgentSession {
 							this.#setModelWithProviderSessionReset(match);
 						} else {
 							this.agent.setModel(match);
+							this.#syncServiceTierForModel();
 						}
 					}
 				}
@@ -10719,11 +10798,12 @@ export class AgentSession {
 			);
 			this.#thinkingLevel = nextThinkingLevel;
 			this.agent.setThinkingLevel(toReasoningEffort(nextThinkingLevel));
-			this.agent.serviceTier = hasServiceTierEntry
+			this.#rawServiceTier = hasServiceTierEntry
 				? sessionContext.serviceTier
 				: configuredServiceTier === "none"
 					? undefined
 					: configuredServiceTier;
+			this.#syncServiceTierForModel();
 
 			if (switchingToDifferentSession) {
 				this.#resetHindsightConversationTrackingIfHindsight();
@@ -10766,7 +10846,8 @@ export class AgentSession {
 			}
 			this.#thinkingLevel = previousThinkingLevel;
 			this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
-			this.agent.serviceTier = previousServiceTier;
+			this.#rawServiceTier = previousRawServiceTier;
+			this.#syncServiceTierForModel();
 			this.#syncTodoPhasesFromBranch();
 			this.#reconnectToAgent();
 			if (restoreMcpError) {

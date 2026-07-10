@@ -578,6 +578,18 @@
 			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
 			"default": "none"
 		},
+		"modelServiceTierOverrides": {
+			"type": "object",
+			"additionalProperties": {
+				"type": "string",
+				"enum": [
+					"on",
+					"off"
+				]
+			},
+			"description": "Per-model Fast overrides keyed by the exact resolved provider/model identity. Values are on or off; omitted models use the raw baseline service tier.",
+			"default": {}
+		},
 		"task": {
 			"type": "object",
 			"properties": {

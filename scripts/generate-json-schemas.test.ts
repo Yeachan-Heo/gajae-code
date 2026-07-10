@@ -21,4 +21,9 @@ describe("generated JSON Schemas", () => {
 		const providerSchema = modelsSchema.properties.providers.additionalProperties;
 		expect(providerSchema.properties.webSearch.enum).toEqual(["on", "off", "auto"]);
 	});
+	it("emits model service tier override value enum", () => {
+		const configSchema = JSON_SCHEMA_OUTPUTS.find(output => output.path === "schemas/config.schema.json")?.schema as any;
+		const overrides = configSchema.properties.modelServiceTierOverrides;
+		expect(overrides.additionalProperties).toEqual({ type: "string", enum: ["on", "off"] });
+	});
 });
