@@ -5,6 +5,7 @@
 
 - Fixed `/model` and Agent Control Center role assignments so DEFAULT, EXECUTOR, ARCHITECT, PLANNER, and CRITIC update their effective runtime/project-shadowed values, TUI badges, and persisted per-role settings without replacing sibling assignments.
 - Fixed active-profile role edits and preset-deletion rollback so inherited materialization preserves later independent role/profile choices, including equal-value writes, and preset deletion now aborts when durable settings persistence fails; also fixed omitted-role profile switches, role-only profile effort across restart, truthful mixed-effort output, and model-setting commands blocking on nonsettling notification transports.
+- Fixed durable model-setting boundaries so deleted ownership metadata self-heals without wedging conditional writes, `/model` and the model selector report success only after persistence commits, and custom preset deletion refuses project references while blocking concurrent same-name reselection from leaving a dangling default.
 
 ### Changed
 

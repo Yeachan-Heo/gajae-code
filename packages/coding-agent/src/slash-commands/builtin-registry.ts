@@ -701,6 +701,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							}
 						}
 					}
+					await runtime.settings.flushOrThrow();
 					runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
 					const success = formatModelAssignmentSuccess(parsedArgs.targetId, assignments);
 					const projectRestartNotice = formatProjectModelRestartNotice(runtime, targetIds);

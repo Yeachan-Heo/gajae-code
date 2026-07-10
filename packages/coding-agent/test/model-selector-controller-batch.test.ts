@@ -1,7 +1,10 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -37,8 +40,7 @@ const selectedModel = model("provider-a", "selected", {
 });
 const nonReasoningModel = model("provider-a", "plain");
 
-function createControllerContext() {
-	const settings = Settings.isolated();
+function createControllerContext(settings = Settings.isolated()) {
 	settings.set("modelRoles", { default: "provider-a/original-default:medium" });
 	settings.set("task.agentModelOverrides", { executor: "provider-a/original-executor:low" });
 	settings.set("modelProfile.default", undefined);
@@ -310,5 +312,50 @@ describe("SelectorController model batch assignments", () => {
 				options: { selector: "provider-a/selected:high", thinkingLevel: ThinkingLevel.High },
 			},
 		]);
+	});
+
+	test("does not report a persisted role assignment when the config write fails", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-selector-durable-model-"));
+		resetSettingsForTest();
+		try {
+			const settings = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			const { ctx } = createControllerContext(settings);
+			await settings.flushOrThrow();
+			const selector = await openSelector(ctx);
+			const configPath = path.join(fs.realpathSync.native(tempDir), "config.yml");
+			const originalWrite = Bun.write;
+			const writeSpy = vi.spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (
+					typeof args[0] === "string" &&
+					args[0].startsWith(`${configPath}.`) &&
+					args[0].endsWith(".tmp") &&
+					!args[0].startsWith(`${configPath}.revisions.json.`)
+				) {
+					throw new Error("forced config write failure");
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+			try {
+				await selector.__testSelectAssignment({
+					model: selectedModel,
+					role: "executor",
+					thinkingLevel: ThinkingLevel.Low,
+					selector: "provider-a/selected:low",
+				});
+			} finally {
+				writeSpy.mockRestore();
+			}
+
+			expect(ctx.showStatus).not.toHaveBeenCalled();
+			expect(ctx.notifyConfigChanged).not.toHaveBeenCalled();
+			expect(ctx.showError).toHaveBeenCalledWith("forced config write failure");
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			expect(reopened.get("task.agentModelOverrides").executor).toBe("provider-a/original-executor:low");
+		} finally {
+			resetSettingsForTest();
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 });

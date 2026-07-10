@@ -1,13 +1,15 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { Settings } from "../../src/config/settings";
+import { resetSettingsForTest, Settings } from "../../src/config/settings";
 import type { AgentSession } from "../../src/session/agent-session";
 import type { SessionManager } from "../../src/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../../src/slash-commands/acp-builtins";
 
-function createRuntime() {
+function createRuntime(settings = Settings.isolated()) {
 	const output: string[] = [];
-	const settings = Settings.isolated();
 	let activeModelProfile: string | undefined;
 	const availableModel = {
 		provider: "anthropic",
@@ -312,6 +314,46 @@ describe("/model batch assignments", () => {
 		]);
 	});
 
+	test("does not report a persisted assignment when the config write fails", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-slash-durable-model-"));
+		resetSettingsForTest();
+		try {
+			const settings = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			settings.setAgentModelOverride("executor", "anthropic/original");
+			await settings.flushOrThrow();
+			const { output, runtime } = createRuntime(settings);
+			const configPath = path.join(fs.realpathSync.native(tempDir), "config.yml");
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (
+					typeof args[0] === "string" &&
+					args[0].startsWith(`${configPath}.`) &&
+					args[0].endsWith(".tmp") &&
+					!args[0].startsWith(`${configPath}.revisions.json.`)
+				) {
+					throw new Error("forced config write failure");
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+			try {
+				await expect(
+					executeAcpBuiltinSlashCommand("/model assign executor claude-3-5-sonnet:low", runtime),
+				).resolves.toEqual({ consumed: true });
+			} finally {
+				writeSpy.mockRestore();
+			}
+
+			expect(output.some(line => line.includes("Failed to set model: forced config write failure"))).toBe(true);
+			expect(output.some(line => line.includes("Executor model set to"))).toBe(false);
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			expect(reopened.get("task.agentModelOverrides").executor).toBe("anthropic/original");
+		} finally {
+			resetSettingsForTest();
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 	test("nonsettling notifications do not block a committed assignment", async () => {
 		const { runtime, settings } = createRuntime();
 		const never = Promise.withResolvers<void>();

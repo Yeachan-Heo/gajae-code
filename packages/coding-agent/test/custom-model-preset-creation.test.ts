@@ -22,6 +22,7 @@ import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/s
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { TUI } from "@gajae-code/tui";
+import { getProjectAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 
 let tempDir: string;
@@ -111,6 +112,81 @@ function createDeletionSession() {
 		recordResumeDefaultModel(selector: string) {
 			sessionDefault = selector;
 		},
+	};
+}
+
+async function createDeletionControllerHarness(
+	settings: Settings,
+	profiles: Map<string, ModelProfileDefinition>,
+	initialActiveProfile?: string,
+) {
+	let selector: ModelSelectorComponent | undefined;
+	let deleteCalls = 0;
+	const errors: string[] = [];
+	const statuses: string[] = [];
+	const registry = {
+		...createRegistry(profiles),
+		getModelProfiles: () => new Map(profiles),
+		getModelProfile: (name: string) => profiles.get(name),
+		getAvailableModelProfileNames: () => [...profiles.keys()],
+		deleteCustomModelProfile: async (name: string) => {
+			deleteCalls++;
+			const profile = profiles.get(name);
+			if (!profile) throw new Error("missing profile");
+			profiles.delete(name);
+			return {
+				display_name: profile.displayName,
+				required_providers: [...profile.requiredProviders],
+				model_mapping: { ...profile.modelMapping },
+			};
+		},
+		saveCustomModelProfile: async (name: string, config: ModelProfileConfig) => {
+			profiles.set(name, {
+				name,
+				displayName: config.display_name,
+				requiredProviders: [...config.required_providers],
+				modelMapping: { ...config.model_mapping },
+				source: "user",
+			});
+			return profiles.get(name);
+		},
+		refresh: async () => {},
+	};
+	const session = {
+		...createDeletionSession(),
+		scopedModels: [],
+		modelRegistry: registry,
+		isFastForProvider: () => false,
+		isFastForSubagentProvider: () => false,
+		isFastModeActive: () => false,
+	};
+	session.setActiveModelProfile(initialActiveProfile);
+	const ctx = {
+		ui: { setFocus: () => {}, requestRender: () => {} },
+		editorContainer: {
+			clear: () => {},
+			addChild: (child: unknown) => {
+				if (child instanceof ModelSelectorComponent) selector = child;
+			},
+		},
+		editor: {},
+		settings,
+		session,
+		statusLine: { invalidate: () => {} },
+		updateEditorBorderColor: () => {},
+		showStatus: (message: string) => statuses.push(message),
+		showError: (message: string) => errors.push(message),
+		showHookConfirm: async () => true,
+		notifyConfigChanged: async () => {},
+	};
+	new SelectorController(ctx as never).showModelSelector();
+	await Bun.sleep(0);
+	if (!selector) throw new Error("Model selector did not open");
+	return {
+		selector,
+		errors,
+		statuses,
+		getDeleteCalls: () => deleteCalls,
 	};
 }
 
@@ -896,6 +972,89 @@ describe("custom model preset creation", () => {
 				executor: "my-oai/gpt-custom",
 			});
 			expect(reopened.getGlobal("modelProfile.default")).toBe("profile-b");
+		} finally {
+			resetSettingsForTest();
+		}
+	});
+	it("refuses controller deletion when the same profile is selected after materialization", async () => {
+		const profileName = "custom-default";
+		const profile: ModelProfileDefinition = {
+			name: profileName,
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom:low" },
+			source: "user",
+		};
+		const agentDir = path.join(tempDir, "concurrent-delete-agent");
+		resetSettingsForTest();
+		try {
+			const settingsA = await Settings.init({ agentDir, cwd: tempDir });
+			settingsA.set("modelProfile.default", profileName);
+			await settingsA.flushOrThrow();
+			const settingsB = await settingsA.cloneForCwd(tempDir);
+			const profiles = new Map([[profileName, profile]]);
+			const harness = await createDeletionControllerHarness(settingsA, profiles, profileName);
+			const deleteModelProfileIfUnreferenced = settingsA.deleteModelProfileIfUnreferenced.bind(settingsA);
+			const deletionSpy = spyOn(settingsA, "deleteModelProfileIfUnreferenced").mockImplementation(
+				async (name, deleteProfile) => {
+					settingsB.set("modelProfile.default", profileName);
+					await settingsB.flushOrThrow();
+					return deleteModelProfileIfUnreferenced(name, deleteProfile);
+				},
+			);
+			try {
+				await harness.selector.__testSelectPresetAction(profileName, "delete");
+				await Bun.sleep(0);
+			} finally {
+				deletionSpy.mockRestore();
+			}
+
+			expect(harness.getDeleteCalls()).toBe(0);
+			expect(profiles.has(profileName)).toBe(true);
+			expect(harness.statuses.some(message => message.includes("Custom model preset deleted"))).toBe(false);
+			expect(harness.errors).toContain(
+				`Preset delete failed: Model profile became the default while deletion was in progress: ${profileName}`,
+			);
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir, cwd: tempDir });
+			expect(reopened.getGlobal("modelProfile.default")).toBe(profileName);
+		} finally {
+			resetSettingsForTest();
+		}
+	});
+
+	it("refuses controller deletion while the current project references the profile", async () => {
+		const profileName = "custom-project";
+		const profile: ModelProfileDefinition = {
+			name: profileName,
+			displayName: "Custom Project",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom:low" },
+			source: "user",
+		};
+		const agentDir = path.join(tempDir, "project-reference-agent");
+		const projectDir = path.join(tempDir, "referencing-project");
+		await fs.mkdir(getProjectAgentDir(projectDir), { recursive: true });
+		await Bun.write(
+			path.join(getProjectAgentDir(projectDir), "config.yml"),
+			YAML.stringify({ modelProfile: { default: profileName } }),
+		);
+		resetSettingsForTest();
+		try {
+			const settings = await Settings.init({ agentDir, cwd: projectDir });
+			const profiles = new Map([[profileName, profile]]);
+			const harness = await createDeletionControllerHarness(settings, profiles);
+			await harness.selector.__testSelectPresetAction(profileName, "delete");
+			await Bun.sleep(0);
+
+			expect(harness.getDeleteCalls()).toBe(0);
+			expect(profiles.has(profileName)).toBe(true);
+			expect(harness.statuses.some(message => message.includes("Custom model preset deleted"))).toBe(false);
+			expect(harness.errors).toContain(
+				`Preset delete failed: Cannot delete model profile referenced by the current project: ${profileName}`,
+			);
+			expect(settings.getProject("modelProfile.default")).toBe(profileName);
 		} finally {
 			resetSettingsForTest();
 		}

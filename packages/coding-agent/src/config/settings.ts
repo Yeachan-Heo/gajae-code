@@ -78,6 +78,11 @@ interface DurableSettingsRevisionState {
 	entries: Record<string, DurableSettingRevisionEntry>;
 }
 
+interface LoadedSettingsRevisionState {
+	state: DurableSettingsRevisionState;
+	exists: boolean;
+}
+
 interface ConditionalMutationOutcome {
 	expectedValue: unknown;
 	desiredValue: unknown;
@@ -595,6 +600,38 @@ export class Settings {
 	}
 
 	/**
+	 * Delete a custom model profile while holding the global settings lock.
+	 *
+	 * The durable deletion marker prevents a profile selection staged by a
+	 * concurrent Settings instance from committing after object deletion.
+	 */
+	async deleteModelProfileIfUnreferenced<T>(profileName: string, deleteProfile: () => Promise<T>): Promise<T> {
+		await this.flushOrThrow();
+		if (!this.#persist || !this.#configPath) {
+			if (this.getGlobal("modelProfile.default") === profileName) {
+				throw new Error(`Model profile became the default while deletion was in progress: ${profileName}`);
+			}
+			return deleteProfile();
+		}
+		return withFileLock(this.#configPath, async () => {
+			const current = await this.#loadYaml(this.#configPath!);
+			if (getByPath(current, ["modelProfile", "default"]) === profileName) {
+				throw new Error(`Model profile became the default while deletion was in progress: ${profileName}`);
+			}
+			const deletedModelProfiles = await this.#loadDeletedModelProfiles();
+			deletedModelProfiles.add(profileName);
+			await this.#writeDeletedModelProfiles(deletedModelProfiles);
+			try {
+				return await deleteProfile();
+			} catch (error) {
+				deletedModelProfiles.delete(profileName);
+				await this.#writeDeletedModelProfiles(deletedModelProfiles);
+				throw error;
+			}
+		});
+	}
+
+	/**
 	 * Apply runtime overrides (not persisted).
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
@@ -1005,10 +1042,10 @@ export class Settings {
 			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
 			await this.#migrateFromLegacy();
 			await withFileLock(this.#configPath!, async () => {
-				const revisionStateExists = this.#revisionPath ? await Bun.file(this.#revisionPath).exists() : false;
+				const loadedRevisionState = await this.#loadRevisionState();
 				this.#global = await this.#loadYaml(this.#configPath!);
-				this.#revisionState = await this.#loadRevisionState();
-				if (!revisionStateExists) {
+				this.#revisionState = loadedRevisionState.state;
+				if (!loadedRevisionState.exists) {
 					await this.#writeRevisionState(this.#revisionState);
 				}
 			});
@@ -1022,19 +1059,70 @@ export class Settings {
 		return this;
 	}
 
-	async #loadRevisionState(): Promise<DurableSettingsRevisionState> {
-		if (!this.#revisionPath) return emptySettingsRevisionState();
+	async #loadRevisionState(): Promise<LoadedSettingsRevisionState> {
+		if (!this.#revisionPath) {
+			return { state: emptySettingsRevisionState(), exists: false };
+		}
 		try {
 			const content = await Bun.file(this.#revisionPath).text();
-			return parseSettingsRevisionState(JSON.parse(content));
+			return {
+				state: parseSettingsRevisionState(JSON.parse(content)),
+				exists: true,
+			};
 		} catch (error) {
-			if (isEnoent(error)) return emptySettingsRevisionState();
+			if (isEnoent(error)) {
+				return { state: emptySettingsRevisionState(), exists: false };
+			}
 			logger.warn("Settings: failed to load revision state", {
 				path: this.#revisionPath,
 				error: String(error),
 			});
 			throw error;
 		}
+	}
+
+	#getModelProfileDeletionPath(): string | undefined {
+		return this.#configPath ? `${this.#configPath}.profile-deletions.json` : undefined;
+	}
+
+	async #loadDeletedModelProfiles(): Promise<Set<string>> {
+		const deletionPath = this.#getModelProfileDeletionPath();
+		if (!deletionPath) return new Set();
+		try {
+			const parsed: unknown = JSON.parse(await Bun.file(deletionPath).text());
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				throw new Error("Invalid model profile deletion state");
+			}
+			const raw = parsed as Record<string, unknown>;
+			if (
+				raw.version !== 1 ||
+				!Array.isArray(raw.profiles) ||
+				!raw.profiles.every(profileName => typeof profileName === "string" && profileName.length > 0) ||
+				new Set(raw.profiles).size !== raw.profiles.length
+			) {
+				throw new Error("Invalid model profile deletion state");
+			}
+			return new Set(raw.profiles as string[]);
+		} catch (error) {
+			if (isEnoent(error)) return new Set();
+			logger.warn("Settings: failed to load model profile deletion state", {
+				path: deletionPath,
+				error: String(error),
+			});
+			throw error;
+		}
+	}
+
+	async #writeDeletedModelProfiles(profileNames: ReadonlySet<string>): Promise<void> {
+		const deletionPath = this.#getModelProfileDeletionPath();
+		if (!deletionPath) return;
+		await this.#atomicWrite(
+			deletionPath,
+			JSON.stringify({
+				version: 1,
+				profiles: [...profileNames].sort((left, right) => left.localeCompare(right)),
+			}),
+		);
 	}
 
 	async #atomicWrite(filePath: string, content: string): Promise<void> {
@@ -1351,6 +1439,29 @@ export class Settings {
 		}, 100);
 	}
 
+	async #customModelProfileExists(profileName: string): Promise<boolean> {
+		const modelsPath = path.join(this.#agentDir, "models.yml");
+		try {
+			const parsed = YAML.parse(await Bun.file(modelsPath).text());
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+			const profiles = (parsed as Record<string, unknown>).profiles;
+			return (
+				!!profiles &&
+				typeof profiles === "object" &&
+				!Array.isArray(profiles) &&
+				Object.hasOwn(profiles, profileName)
+			);
+		} catch (error) {
+			if (!isEnoent(error)) {
+				logger.warn("Settings: failed to inspect custom model profiles", {
+					path: modelsPath,
+					error: String(error),
+				});
+			}
+			return false;
+		}
+	}
+
 	async #saveNow(options: { throwOnError?: boolean } = {}): Promise<void> {
 		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
 
@@ -1360,9 +1471,14 @@ export class Settings {
 		try {
 			await withFileLock(configPath, async () => {
 				const current = await this.#loadYaml(configPath);
-				const revisionState = await this.#loadRevisionState();
+				const loadedRevisionState = await this.#loadRevisionState();
+				const revisionState = loadedRevisionState.state;
+				if (!loadedRevisionState.exists) {
+					await this.#writeRevisionState(revisionState);
+				}
 				this.#revisionState = structuredClone(revisionState);
 				const loadedGeneration = revisionState.generation;
+				const deletedModelProfiles = await this.#loadDeletedModelProfiles();
 				const accepted: Array<{
 					modifiedPath: string;
 					mutation: PendingSettingMutation;
@@ -1371,6 +1487,18 @@ export class Settings {
 				}> = [];
 
 				for (const [modifiedPath, mutation] of initialEntries) {
+					if (
+						modifiedPath === "modelProfile.default" &&
+						typeof mutation.desiredValue === "string" &&
+						deletedModelProfiles.has(mutation.desiredValue)
+					) {
+						if (await this.#customModelProfileExists(mutation.desiredValue)) {
+							deletedModelProfiles.delete(mutation.desiredValue);
+							await this.#writeDeletedModelProfiles(deletedModelProfiles);
+						} else {
+							throw new Error(`Model profile no longer exists: ${mutation.desiredValue}`);
+						}
+					}
 					const segments = decodeModifiedPath(modifiedPath);
 					const currentValue = getByPath(current, segments);
 					const currentRevision = revisionState.entries[modifiedPath]?.revision ?? 0;

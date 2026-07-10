@@ -357,6 +357,10 @@ export class SelectorController {
 			modelSelector.refreshPresetProfiles(refreshedProfileName);
 		};
 		try {
+			const projectProfile = resolveProjectModelProfileShadow(this.ctx.settings, this.ctx.session.modelRegistry);
+			if (projectProfile?.profileName === profileName) {
+				throw new Error(`Cannot delete model profile referenced by the current project: ${profileName}`);
+			}
 			if (activeProfile === profileName || defaultProfile === profileName) {
 				snapshot = await materializeModelProfileForDeletion({
 					session: this.ctx.session,
@@ -365,7 +369,9 @@ export class SelectorController {
 					profileName,
 				});
 			}
-			deletedProfile = await this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName);
+			deletedProfile = await this.ctx.settings.deleteModelProfileIfUnreferenced(profileName, () =>
+				this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName),
+			);
 			await this.ctx.session.modelRegistry.refresh("offline");
 			refreshSelectorState();
 			this.ctx.showStatus(`Custom model preset deleted: ${profileLabel}`);
@@ -1052,6 +1058,7 @@ export class SelectorController {
 									}
 								}
 							}
+							await this.ctx.settings.flushOrThrow();
 							modelSelector.refreshRoleAssignments({
 								currentModel: this.ctx.session.model,
 								currentThinkingLevel: this.ctx.session.thinkingLevel,
@@ -1093,6 +1100,7 @@ export class SelectorController {
 							) {
 								this.ctx.session.setThinkingLevel(defaultThinking.effective);
 							}
+							await this.ctx.settings.flushOrThrow();
 							modelSelector.refreshRoleAssignments({
 								currentModel: this.ctx.session.model,
 								currentThinkingLevel: this.ctx.session.thinkingLevel,
@@ -1141,6 +1149,7 @@ export class SelectorController {
 									this.ctx.settings.setAgentModelOverride(role, value);
 								}
 							}
+							await this.ctx.settings.flushOrThrow();
 							modelSelector.refreshRoleAssignments({
 								currentModel: this.ctx.session.model,
 								currentThinkingLevel: this.ctx.session.thinkingLevel,

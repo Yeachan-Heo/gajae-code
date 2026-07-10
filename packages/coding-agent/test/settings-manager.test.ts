@@ -793,6 +793,97 @@ describe("Settings", () => {
 				agentModelOverrides: { architect: "equal/architect" },
 			});
 		});
+		it("regenerates a deleted sidecar without wedging later live conditional writes", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const sidecarPath = `${getConfigPath()}.revisions.json`;
+			fs.rmSync(sidecarPath);
+
+			settings.setAgentModelOverrideIfUnchanged("architect", "original/architect", "first/architect");
+			await settings.flushOrThrow();
+			expect(await Bun.file(sidecarPath).exists()).toBe(true);
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "original/architect" },
+			});
+
+			settings.setAgentModelOverrideIfUnchanged("architect", "original/architect", "second/architect");
+			await settings.flushOrThrow();
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ cwd: projectDir, agentDir });
+			expect(reopened.getGlobal("task.agentModelOverrides")).toEqual({
+				architect: "second/architect",
+			});
+		});
+		it("refuses profile deletion when a concurrent writer restored the same default", async () => {
+			const settingsA = await Settings.init({ cwd: projectDir, agentDir });
+			const settingsB = await settingsA.cloneForCwd(projectDir);
+			settingsB.set("modelProfile.default", "profile-a");
+			await settingsB.flushOrThrow();
+			let deleted = false;
+
+			await expect(
+				settingsA.deleteModelProfileIfUnreferenced("profile-a", async () => {
+					deleted = true;
+				}),
+			).rejects.toThrow("Model profile became the default while deletion was in progress: profile-a");
+
+			expect(deleted).toBe(false);
+			resetSettingsForTest();
+			const reopened = await Settings.init({ cwd: projectDir, agentDir });
+			expect(reopened.getGlobal("modelProfile.default")).toBe("profile-a");
+		});
+
+		it("rejects a staged default that commits after its custom profile was deleted", async () => {
+			const modelsPath = path.join(agentDir, "models.yml");
+			await Bun.write(
+				modelsPath,
+				YAML.stringify({
+					profiles: {
+						"profile-a": {
+							required_providers: ["provider-a"],
+							model_mapping: { default: "provider-a/model-a" },
+						},
+					},
+				}),
+			);
+			const settingsA = await Settings.init({ cwd: projectDir, agentDir });
+			const settingsB = await settingsA.cloneForCwd(projectDir);
+			settingsB.set("modelProfile.default", "profile-a");
+
+			await settingsA.deleteModelProfileIfUnreferenced("profile-a", async () => {
+				await Bun.write(modelsPath, YAML.stringify({}));
+			});
+			await expect(settingsB.flushOrThrow()).rejects.toThrow("Model profile no longer exists: profile-a");
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ cwd: projectDir, agentDir });
+			expect(reopened.getGlobal("modelProfile.default")).toBeUndefined();
+
+			fs.rmSync(`${getConfigPath()}.revisions.json`);
+			resetSettingsForTest();
+			const recovered = await Settings.init({ cwd: projectDir, agentDir });
+			recovered.set("modelProfile.default", "profile-a");
+			await expect(recovered.flushOrThrow()).rejects.toThrow("Model profile no longer exists: profile-a");
+
+			await Bun.write(
+				modelsPath,
+				YAML.stringify({
+					profiles: {
+						"profile-a": {
+							required_providers: ["provider-a"],
+							model_mapping: { default: "provider-a/model-a" },
+						},
+					},
+				}),
+			);
+			await recovered.flushOrThrow();
+			resetSettingsForTest();
+			const recreated = await Settings.init({ cwd: projectDir, agentDir });
+			expect(recreated.getGlobal("modelProfile.default")).toBe("profile-a");
+		});
 		it("preserves external siblings for dotted role and agent names", async () => {
 			await writeSettings({
 				modelRoles: {
