@@ -4,6 +4,7 @@
 ### Changed
 
 - Moved the `codex-eco`/`codex-medium`/`codex-pro` presets and the `opus-codex`/`codex-opencodego`/`fable-opus-codex` combo presets from `gpt-5.5` onto the GPT-5.6 tier family: Sol drives `default` and `architect` on every codex preset (eco `sol:medium`, medium `sol:high`, pro `sol:xhigh`/`sol:max`), with Luna/Terra covering the lighter executor/planner/critic roles by tier.
+- Raised the `codex-pro` executor from `gpt-5.6-terra:medium` to `gpt-5.6-sol:max`, aligning the performance-first preset's coding role with the highest measured GPT-5.6 coding tier.
 
 ### Fixed
 

@@ -85,7 +85,7 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	}),
 	profile("codex-pro", ["openai-codex"], {
 		default: "openai-codex/gpt-5.6-sol:xhigh",
-		executor: "openai-codex/gpt-5.6-terra:medium",
+		executor: "openai-codex/gpt-5.6-sol:max",
 		planner: "openai-codex/gpt-5.6-sol:high",
 		critic: "openai-codex/gpt-5.6-sol:xhigh",
 		architect: "openai-codex/gpt-5.6-sol:max",
