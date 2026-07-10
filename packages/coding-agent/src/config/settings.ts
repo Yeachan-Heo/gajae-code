@@ -150,6 +150,21 @@ function shallowStringRecord(value: unknown): Record<string, string> {
 	return result;
 }
 
+const RECORD_ENTRY_MUTATION_PREFIX = "\0record-entry:";
+
+function encodeRecordEntryMutation(path: string, key: string): string {
+	return RECORD_ENTRY_MUTATION_PREFIX + JSON.stringify([...path.split("."), key]);
+}
+
+function decodeModifiedPath(modifiedPath: string): string[] {
+	if (!modifiedPath.startsWith(RECORD_ENTRY_MUTATION_PREFIX)) return modifiedPath.split(".");
+	const parsed: unknown = JSON.parse(modifiedPath.slice(RECORD_ENTRY_MUTATION_PREFIX.length));
+	if (!Array.isArray(parsed) || !parsed.every((segment): segment is string => typeof segment === "string")) {
+		throw new Error("Invalid encoded settings record-entry mutation");
+	}
+	return parsed;
+}
+
 function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, cwd: string): string[] | undefined {
 	if (!PATH_SCOPED_ARRAY_SETTINGS.has(settingPath) || !Array.isArray(value)) return undefined;
 
@@ -308,6 +323,33 @@ export class Settings {
 		return value === undefined ? undefined : (value as SettingValue<P>);
 	}
 
+	/** Get a setting from project config only, excluding global and runtime layers. */
+	getProject<P extends SettingPath>(path: P): SettingValue<P> | undefined {
+		const value = getByPath(this.#project, path.split("."));
+		return value === undefined ? undefined : (value as SettingValue<P>);
+	}
+
+	/**
+	 * Get the user/global plus runtime value while excluding project settings.
+	 * Profile materialization uses this to preserve explicit runtime choices
+	 * without leaking project-scoped configuration into the user config.
+	 */
+	getWithoutProject<P extends SettingPath>(path: P): SettingValue<P> {
+		const merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#overrides);
+		const value = getByPath(merged, path.split("."));
+		if (value !== undefined) {
+			const pathScopedValue = resolvePathScopedStringArray(path, value, this.#cwd);
+			return (pathScopedValue ?? value) as SettingValue<P>;
+		}
+		return getDefault(path);
+	}
+
+	/** Get the raw runtime override layer for a setting, without lower-precedence values. */
+	getRuntimeOverride<P extends SettingPath>(path: P): SettingValue<P> | undefined {
+		const value = getByPath(this.#overrides, path.split("."));
+		return value === undefined ? undefined : (value as SettingValue<P>);
+	}
+
 	/** Check whether a setting is present in loaded settings/overrides rather than coming from schema defaults. */
 	has(path: SettingPath): boolean {
 		return getByPath(this.#merged, path.split(".")) !== undefined;
@@ -331,6 +373,14 @@ export class Settings {
 		if (hook) {
 			hook(value, prev);
 		}
+	}
+
+	/** Remove a user/global setting while preserving project and runtime layers. */
+	clearGlobal(path: SettingPath): void {
+		setByPath(this.#global, path.split("."), undefined);
+		this.#modified.add(path);
+		this.#rebuildMerged();
+		this.#queueSave();
 	}
 
 	/**
@@ -370,7 +420,7 @@ export class Settings {
 			await this.#savePromise;
 		}
 		if (this.#modified.size > 0) {
-			await this.#saveNow();
+			await this.#startSave();
 		}
 	}
 
@@ -389,7 +439,7 @@ export class Settings {
 			await this.#savePromise;
 		}
 		if (this.#modified.size > 0) {
-			await this.#saveNow({ throwOnError: true });
+			await this.#startSave({ throwOnError: true });
 		}
 	}
 
@@ -476,44 +526,95 @@ export class Settings {
 		return this.get("bashInterceptor.patterns");
 	}
 
+	#setStringRecordEntry(
+		path: "modelRoles" | "task.agentModelOverrides",
+		key: string,
+		value: string | undefined,
+	): void {
+		const segments = path.split(".");
+		const next = shallowStringRecord(getByPath(this.#global, segments));
+		if (value === undefined) {
+			delete next[key];
+		} else {
+			next[key] = value;
+		}
+		setByPath(this.#global, segments, next);
+		this.#modified.add(encodeRecordEntryMutation(path, key));
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
 	/**
-	 * Set a model role (helper for modelRoles record).
+	 * Persist one model role without replacing sibling roles written by another
+	 * process, and keep a shadowing runtime/project value aligned for this session.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string): void {
-		const current = shallowStringRecord(getByPath(this.#global, ["modelRoles"]));
 		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
-		const updateRuntimeOverride =
+		const runtimeRoleIsSet =
 			!!runtimeOverrides &&
 			typeof runtimeOverrides === "object" &&
 			!Array.isArray(runtimeOverrides) &&
 			Object.hasOwn(runtimeOverrides, role);
 
-		this.set("modelRoles", { ...current, [role]: modelId });
+		this.#setStringRecordEntry("modelRoles", role, modelId);
 
-		if (updateRuntimeOverride) {
-			this.override("modelRoles", { ...shallowStringRecord(runtimeOverrides), [role]: modelId });
+		if (runtimeRoleIsSet || this.get("modelRoles")[role] !== modelId) {
+			const base = shallowStringRecord(runtimeOverrides);
+			this.override("modelRoles", { ...base, [role]: modelId });
 		}
 	}
+
 	/**
-	 * Set an agent model override while keeping any live runtime override aligned.
+	 * Set an agent model override while keeping any live runtime/project override aligned.
 	 *
-	 * Runtime model profiles override `task.agentModelOverrides` for the current
-	 * session. A user-selected role assignment must win immediately in that same
-	 * session, but only the explicit agent change should be persisted.
+	 * Runtime model profiles and project settings can override
+	 * `task.agentModelOverrides` for the current session. A user-selected role
+	 * assignment must win immediately, but only that explicit agent change is
+	 * persisted.
 	 */
 	setAgentModelOverride(agentName: string, modelId: string): void {
-		const current = shallowStringRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
 		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
-		const updateRuntimeOverride =
+		const hasRuntimeOverrides =
 			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
 
-		this.set("task.agentModelOverrides", { ...current, [agentName]: modelId });
+		this.#setStringRecordEntry("task.agentModelOverrides", agentName, modelId);
 
-		if (updateRuntimeOverride) {
+		if (hasRuntimeOverrides || this.get("task.agentModelOverrides")[agentName] !== modelId) {
+			const base = shallowStringRecord(runtimeOverrides);
 			this.override("task.agentModelOverrides", {
-				...shallowStringRecord(runtimeOverrides),
+				...base,
 				[agentName]: modelId,
 			});
+		}
+	}
+
+	/** Clear one persisted and live model role without replacing siblings. */
+	clearModelRole(role: ModelRole | string): void {
+		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
+		const hasRuntimeOverrides =
+			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
+
+		this.#setStringRecordEntry("modelRoles", role, undefined);
+
+		if (hasRuntimeOverrides) {
+			const nextRuntimeOverrides = shallowStringRecord(runtimeOverrides);
+			delete nextRuntimeOverrides[role];
+			this.override("modelRoles", nextRuntimeOverrides);
+		}
+	}
+
+	/** Clear one persisted and live agent model override without replacing siblings. */
+	clearAgentModelOverride(agentName: string): void {
+		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
+		const hasRuntimeOverrides =
+			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
+
+		this.#setStringRecordEntry("task.agentModelOverrides", agentName, undefined);
+
+		if (hasRuntimeOverrides) {
+			const nextRuntimeOverrides = shallowStringRecord(runtimeOverrides);
+			delete nextRuntimeOverrides[agentName];
+			this.override("task.agentModelOverrides", nextRuntimeOverrides);
 		}
 	}
 
@@ -821,6 +922,31 @@ export class Settings {
 	// Saving
 	// ─────────────────────────────────────────────────────────────────────────
 
+	#startSave(options: { throwOnError?: boolean } = {}): Promise<void> {
+		const previousSave = this.#savePromise;
+		const savePromise = (async () => {
+			if (previousSave) {
+				try {
+					await previousSave;
+				} catch {
+					// A failed durable flush must not prevent a later retry from
+					// persisting the paths that #saveNow re-queued.
+				}
+			}
+			await this.#saveNow(options);
+		})();
+		this.#savePromise = savePromise;
+		void savePromise.then(
+			() => {
+				if (this.#savePromise === savePromise) this.#savePromise = undefined;
+			},
+			() => {
+				if (this.#savePromise === savePromise) this.#savePromise = undefined;
+			},
+		);
+		return savePromise;
+	}
+
 	#queueSave(): void {
 		if (!this.#persist || !this.#configPath) return;
 
@@ -830,7 +956,8 @@ export class Settings {
 		}
 		this.#saveTimer = setTimeout(() => {
 			this.#saveTimer = undefined;
-			this.#saveNow().catch(err => {
+			const savePromise = this.#startSave();
+			void savePromise.catch(err => {
 				logger.warn("Settings: background save failed", { error: String(err) });
 			});
 		}, 100);
@@ -841,6 +968,12 @@ export class Settings {
 
 		const configPath = this.#configPath;
 		const modifiedPaths = [...this.#modified];
+		const modifiedValues = new Map(
+			modifiedPaths.map(modPath => {
+				const segments = decodeModifiedPath(modPath);
+				return [modPath, structuredClone(getByPath(this.#global, segments))] as const;
+			}),
+		);
 		this.#modified.clear();
 
 		try {
@@ -850,9 +983,17 @@ export class Settings {
 
 				// Apply only our modified paths
 				for (const modPath of modifiedPaths) {
-					const segments = modPath.split(".");
-					const value = getByPath(this.#global, segments);
+					const segments = decodeModifiedPath(modPath);
+					const value = modifiedValues.get(modPath);
 					setByPath(current, segments, value);
+				}
+
+				// A mutation can arrive while the file is being loaded. Overlay those
+				// still-pending leaves before replacing #global so the in-memory value
+				// survives this save and the serialized snapshot is never stale.
+				for (const pendingPath of this.#modified) {
+					const segments = decodeModifiedPath(pendingPath);
+					setByPath(current, segments, getByPath(this.#global, segments));
 				}
 
 				// Update our global with any external changes we preserved

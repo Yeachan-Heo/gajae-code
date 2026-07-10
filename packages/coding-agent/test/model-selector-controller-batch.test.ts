@@ -7,16 +7,35 @@ import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/s
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 
 let testTheme = await getThemeByName("red-claw");
+function normalizeRenderedText(text: string): string {
+	return text
+		.replace(/\x1b\[[0-9;]*m/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
 
 function installTestTheme(): void {
 	if (!testTheme) throw new Error("Failed to load test theme");
 	setThemeInstance(testTheme);
 }
 
-const model = (provider: string, id: string): Model =>
-	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
-
-const selectedModel = model("provider-a", "selected");
+const model = (provider: string, id: string, thinking?: Model["thinking"]): Model =>
+	({
+		provider,
+		id,
+		name: id,
+		api: "openai-responses",
+		contextWindow: 1000,
+		maxTokens: 1000,
+		thinking,
+		reasoning: thinking !== undefined,
+	}) as Model;
+const selectedModel = model("provider-a", "selected", {
+	mode: "effort",
+	minLevel: ThinkingLevel.Low,
+	maxLevel: ThinkingLevel.High,
+});
+const nonReasoningModel = model("provider-a", "plain");
 
 function createControllerContext() {
 	const settings = Settings.isolated();
@@ -34,9 +53,9 @@ function createControllerContext() {
 		sessionId: "session-1",
 		scopedModels: [],
 		modelRegistry: {
-			getAvailable: () => [selectedModel],
+			getAvailable: () => [selectedModel, nonReasoningModel],
 			refresh: vi.fn(async () => {}),
-			getAll: () => [selectedModel],
+			getAll: () => [selectedModel, nonReasoningModel],
 			getError: () => undefined,
 			getCanonicalModels: () => [],
 			getDiscoverableProviders: () => [],
@@ -49,6 +68,13 @@ function createControllerContext() {
 			setModelCalls.push({ model: nextModel, role, options });
 			this.model = nextModel;
 			if (options?.thinkingLevel) this.thinkingLevel = options.thinkingLevel;
+			const selector = options?.selector ?? `${nextModel.provider}/${nextModel.id}`;
+			settings.setModelRole(
+				role,
+				options?.thinkingLevel && options.thinkingLevel !== ThinkingLevel.Inherit
+					? `${selector}:${options.thinkingLevel}`
+					: selector,
+			);
 		},
 		async setModelTemporary() {},
 		setThinkingLevel(thinkingLevel: ThinkingLevel) {
@@ -107,6 +133,7 @@ describe("SelectorController model batch assignments", () => {
 		expect(ctx.showStatus).toHaveBeenCalledWith(
 			"Role-agent models set to provider-a/selected:low for EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		);
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
 	});
 
 	test("all targets selection writes DEFAULT plus every role-agent override", async () => {
@@ -138,5 +165,150 @@ describe("SelectorController model batch assignments", () => {
 		expect(ctx.showStatus).toHaveBeenCalledWith(
 			"All model targets set to provider-a/selected:high for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		);
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("DEFAULT (high)");
+		expect(rendered).toContain("EXECUTOR (high)");
+		expect(rendered).toContain("ARCHITECT (high)");
+		expect(rendered).toContain("PLANNER (high)");
+		expect(rendered).toContain("CRITIC (high)");
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
+	});
+
+	test("all targets replace live role overrides with the selected model's clamped effort", async () => {
+		const { ctx, settings } = createControllerContext();
+		settings.override("task.agentModelOverrides", {
+			executor: "provider-a/profile-executor:medium",
+			architect: "provider-a/profile-architect:high",
+			planner: "provider-a/profile-planner:medium",
+			critic: "provider-a/profile-critic:high",
+		});
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			roles: ["default", "executor", "architect", "planner", "critic"],
+			thinkingLevel: ThinkingLevel.XHigh,
+			selector: "provider-a/selected:xhigh",
+		});
+
+		const expectedRoleOverrides = {
+			executor: "provider-a/selected:high",
+			architect: "provider-a/selected:high",
+			planner: "provider-a/selected:high",
+			critic: "provider-a/selected:high",
+		};
+		expect(settings.get("task.agentModelOverrides")).toEqual(expectedRoleOverrides);
+
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("task.agentModelOverrides")).toEqual(expectedRoleOverrides);
+	});
+
+	test("single role assignments clamp stale effort for a non-reasoning model", async () => {
+		const { ctx, settings } = createControllerContext();
+		settings.setAgentModelOverride("executor", "provider-a/selected:high");
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: nonReasoningModel,
+			role: "executor",
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/plain:high",
+		});
+
+		expect(settings.get("task.agentModelOverrides").executor).toBe("provider-a/plain");
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.getGlobal("task.agentModelOverrides")).toMatchObject({
+			executor: "provider-a/plain",
+		});
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("EXECUTOR (inherit)");
+		expect(rendered).not.toContain("EXECUTOR (high)");
+	});
+	test("single role status reports project settings that resume on restart", async () => {
+		const { ctx, settings } = createControllerContext();
+		settings.getProject = ((path: string) =>
+			path === "task.agentModelOverrides"
+				? { executor: "project/executor" }
+				: undefined) as typeof settings.getProject;
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "executor",
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/selected:high",
+		});
+
+		expect(ctx.showStatus).toHaveBeenCalledWith(
+			"executor agent model: provider-a/selected:high Project settings for EXECUTOR resume on restart.",
+		);
+	});
+	test("single DEFAULT selection notifies configuration observers", async () => {
+		const { ctx } = createControllerContext();
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/selected",
+		});
+
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
+	});
+	test("DEFAULT inherit persists without a suffix while applying the clamped configured effort live", async () => {
+		const { ctx, settings, session, setModelCalls } = createControllerContext();
+		settings.set("defaultThinkingLevel", ThinkingLevel.High);
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			thinkingLevel: ThinkingLevel.Inherit,
+			selector: "provider-a/selected",
+		});
+
+		expect(setModelCalls).toEqual([
+			{
+				model: selectedModel,
+				role: "default",
+				options: { selector: "provider-a/selected", thinkingLevel: ThinkingLevel.Inherit },
+			},
+		]);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(settings.getModelRole("default")).toBe("provider-a/selected");
+		expect(ctx.showStatus).toHaveBeenCalledWith(
+			"Default model: provider-a/selected (effective: provider-a/selected:high)",
+		);
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("DEFAULT (high)");
+		expect(rendered).not.toContain("DEFAULT (inherit)");
+	});
+
+	test("nonsettling configuration notifications do not block selector completion", async () => {
+		const { ctx, setModelCalls } = createControllerContext();
+		const never = Promise.withResolvers<void>();
+		ctx.notifyConfigChanged = vi.fn(() => never.promise);
+		const selector = await openSelector(ctx);
+
+		const completed = await Promise.race([
+			selector.__testSelectAssignment({
+				model: selectedModel,
+				role: "default",
+				thinkingLevel: ThinkingLevel.High,
+				selector: "provider-a/selected:high",
+			}),
+			Bun.sleep(100).then(() => "timeout" as const),
+		]);
+
+		expect(completed).not.toBe("timeout");
+		expect(setModelCalls).toEqual([
+			{
+				model: selectedModel,
+				role: "default",
+				options: { selector: "provider-a/selected:high", thinkingLevel: ThinkingLevel.High },
+			},
+		]);
 	});
 });

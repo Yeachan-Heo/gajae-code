@@ -684,7 +684,7 @@ describe("custom model preset creation", () => {
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("custom-default");
 	});
-	it("restores a deleted custom preset when post-delete notification fails", async () => {
+	it("keeps a deleted custom preset committed when post-delete notification fails", async () => {
 		const unsafeDisplayName = "Custom\x1b[31m Default\x1b[0m\nRestored";
 		const profiles = new Map<string, ModelProfileDefinition>([
 			[
@@ -771,7 +771,7 @@ describe("custom model preset creation", () => {
 			updateEditorBorderColor: () => {},
 			showStatus: () => {},
 			showError: (message: string) => {
-				expect(message).toBe("Preset delete failed: notify failed");
+				expect(message).toBe("Configuration was updated, but change notification failed: notify failed");
 			},
 			showHookConfirm: async (title: string) => {
 				confirmTitle = title;
@@ -785,13 +785,14 @@ describe("custom model preset creation", () => {
 		new SelectorController(ctx as never).showModelSelector();
 		await Bun.sleep(0);
 		await selector?.__testSelectPresetAction("custom-default", "delete");
+		await Bun.sleep(0);
 
 		expect(confirmTitle).toBe("Delete custom model preset: Custom Default Restored");
-		expect(restoredProfile?.display_name).toBe(unsafeDisplayName);
-		expect(profiles.get("custom-default")?.displayName).toBe(unsafeDisplayName);
-		expect(settings.get("modelProfile.default")).toBe("custom-default");
-		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
+		expect(restoredProfile).toBeUndefined();
+		expect(profiles.has("custom-default")).toBe(false);
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.get("modelRoles")).toEqual({ default: "my-oai/gpt-custom:low" });
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
-		expect(activeProfiles.at(-1)).toBe("custom-default");
+		expect(activeProfiles.at(-1)).toBeUndefined();
 	});
 });
