@@ -423,10 +423,11 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 			baseDir: tempDir.path(),
 			source: "test",
 		});
-		const { ctx, editor, sendCustomMessage, promptCustomMessage, addMessageToChat } = createStubInputControllerContext({
-			skillCommands,
-			isStreaming: false,
-		});
+		const { ctx, editor, sendCustomMessage, promptCustomMessage, addMessageToChat } =
+			createStubInputControllerContext({
+				skillCommands,
+				isStreaming: false,
+			});
 
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
