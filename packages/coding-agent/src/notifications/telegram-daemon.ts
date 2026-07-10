@@ -761,6 +761,10 @@ export class TelegramBotTransport implements BotApi {
 }
 
 type PairedChatPrivacy = "private" | "non-private" | "indeterminate";
+interface PairedChatCapabilities {
+	privacy: "private" | "non-private";
+	isTopicCapable?: boolean;
+}
 
 export type TelegramUpdateOutcome = "consumed" | "retry";
 
@@ -938,8 +942,9 @@ export class TelegramNotificationDaemon {
 	private threadedFallbackNoticeSent = false;
 	/** Sessions whose identity header was already sent flat (Threaded Mode off). */
 	private readonly flatIdentitySent = new Set<string>();
-	/** Cached result of whether the paired chat is a private chat (flat-fallback gate). */
-	private pairedChatPrivate: boolean | undefined;
+	/** Independently cached definitive privacy and topic capabilities. */
+	private pairedChatPrivacy: Exclude<PairedChatPrivacy, "indeterminate"> | undefined;
+	private pairedChatTopicCapable: boolean | undefined;
 	/** Bot username from getMe, cached once at owner startup for group/forum command targeting. */
 	private botUsername: string | undefined;
 	/** Sessions whose agent loop is currently busy (drives the typing indicator). */
@@ -1663,8 +1668,8 @@ export class TelegramNotificationDaemon {
 		await this.flushPool();
 	}
 
-	private async existingTopicForPrivateChat(sessionId: string): Promise<string | undefined> {
-		if (!(await this.pairedChatIsPrivate())) return undefined;
+	private async existingTopicForTopicCapableChat(sessionId: string): Promise<string | undefined> {
+		if (!(await this.pairedChatIsTopicCapable())) return undefined;
 		return this.topics.get(sessionId)?.topicId;
 	}
 
@@ -1720,7 +1725,7 @@ export class TelegramNotificationDaemon {
 	 * one-time nudge) or drop fail-closed for a non-private chat.
 	 */
 	private async ensureTopic(sessionId: string, name: string): Promise<string | undefined> {
-		if (!(await this.pairedChatIsPrivate())) return undefined;
+		if (!(await this.pairedChatIsTopicCapable())) return undefined;
 		const existing = this.topics.get(sessionId);
 		if (existing) return existing.topicId;
 		try {
@@ -1762,7 +1767,7 @@ export class TelegramNotificationDaemon {
 	/** Best-effort delete of a session topic once its local notification endpoint shuts down. */
 	private async deleteTopic(sessionId: string): Promise<void> {
 		const record = this.topics.get(sessionId);
-		if (!record) return;
+		if (!record || !(await this.pairedChatIsTopicCapable())) return;
 		try {
 			// Drop queued sends for this session before deleting the topic; otherwise
 			// rate-limited frames can flush later into a deleted topic or across resume.
@@ -1791,7 +1796,11 @@ export class TelegramNotificationDaemon {
 		const pending = this.topicsPersistQueue.then(async () => {
 			const paths = daemonPaths(this.opts.settings.getAgentDir());
 			await ensureDir(this.fsImpl, paths.dir);
-			await writeJsonAtomic(this.fsImpl, path.join(paths.dir, "telegram-topics.json"), this.topics.serialize());
+			await writeJsonAtomic(
+				this.fsImpl,
+				path.join(paths.dir, "telegram-topics.json"),
+				this.topics.serialize(String(this.opts.chatId)),
+			);
 		});
 		this.topicsPersistQueue = pending.catch(() => undefined);
 		return pending;
@@ -1800,9 +1809,9 @@ export class TelegramNotificationDaemon {
 	async loadTopics(): Promise<void> {
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
 		const raw = await readJson<TopicRegistryState>(this.fsImpl, path.join(paths.dir, "telegram-topics.json"));
-		// Restore the full serialized registry (topicId + identitySent + name) so a
-		// fresh daemon after reload does not resend identity headers or lose renames.
-		if (raw && typeof raw === "object") this.topics.load(raw);
+		// Topic ids are local to one Telegram chat. Legacy unscoped state and state
+		// from a previous configured destination must never be reused.
+		if (raw && typeof raw === "object" && raw.chatId === String(this.opts.chatId)) this.topics.load(raw);
 	}
 
 	/** Download a Telegram file by its file_path (from getFile) into memory. */
@@ -1949,7 +1958,7 @@ export class TelegramNotificationDaemon {
 		}
 		for (const item of batch) {
 			const { send, topicId } = item.payload;
-			if (topicId && !(await this.pairedChatIsPrivate())) continue;
+			if (topicId && !(await this.pairedChatIsTopicCapable())) continue;
 			// Threaded topic when available; otherwise deliver flat to the paired chat.
 			const threadField = topicId ? { message_thread_id: Number(topicId) } : {};
 			const ckey = send.editable ? item.coalesceKey : undefined;
@@ -2182,41 +2191,61 @@ export class TelegramNotificationDaemon {
 	}
 
 	/**
-	 * Resolve (and cache definitive resolution of) whether the paired `chatId` is
-	 * a private chat. Topic and flat delivery are only safe in a private DM; an
-	 * indeterminate `getChat` result fails closed for this attempt and is retried
-	 * later.
+	 * Refresh definitive capabilities for the paired `chatId`. Privacy can be
+	 * known for a supergroup while malformed `is_forum` metadata remains
+	 * indeterminate and retryable.
 	 */
-	private async resolvePairedChatPrivacy(): Promise<PairedChatPrivacy> {
-		if (this.pairedChatPrivate !== undefined) return this.pairedChatPrivate ? "private" : "non-private";
+	private async refreshPairedChatCapabilities(): Promise<PairedChatCapabilities | undefined> {
 		try {
 			const res = (await this.botApi.call("getChat", { chat_id: this.opts.chatId })) as {
 				ok?: unknown;
-				result?: { type?: unknown };
+				result?: { type?: unknown; is_forum?: unknown };
 			};
 			if (res?.ok !== true) {
-				logger.warn("notifications: getChat privacy check indeterminate (non-success response)");
-				return "indeterminate";
+				logger.warn("notifications: getChat capability check indeterminate (non-success response)");
+				return undefined;
 			}
 			if (res.result?.type === "private") {
-				this.pairedChatPrivate = true;
-				return "private";
+				this.pairedChatPrivacy = "private";
+				this.pairedChatTopicCapable = true;
+				return { privacy: "private", isTopicCapable: true };
 			}
-			if (res.result?.type === "group" || res.result?.type === "supergroup" || res.result?.type === "channel") {
-				this.pairedChatPrivate = false;
-				return "non-private";
+			if (res.result?.type === "supergroup") {
+				this.pairedChatPrivacy = "non-private";
+				if (typeof res.result.is_forum !== "boolean") {
+					logger.warn("notifications: getChat capability check indeterminate (missing or invalid is_forum)");
+					return { privacy: "non-private" };
+				}
+				this.pairedChatTopicCapable = res.result.is_forum;
+				return { privacy: "non-private", isTopicCapable: res.result.is_forum };
 			}
-			logger.warn("notifications: getChat privacy check indeterminate (missing or invalid chat type)");
-			return "indeterminate";
+			if (res.result?.type === "group" || res.result?.type === "channel") {
+				this.pairedChatPrivacy = "non-private";
+				this.pairedChatTopicCapable = false;
+				return { privacy: "non-private", isTopicCapable: false };
+			}
+			logger.warn("notifications: getChat capability check indeterminate (missing or invalid chat type)");
+			return undefined;
 		} catch {
-			logger.warn("notifications: getChat privacy check indeterminate (request failed)");
-			return "indeterminate";
+			logger.warn("notifications: getChat capability check indeterminate (request failed)");
+			return undefined;
 		}
 	}
 
-	/** Keep existing outbound callers fail-closed for indeterminate privacy. */
+	private async resolvePairedChatPrivacy(): Promise<PairedChatPrivacy> {
+		if (this.pairedChatPrivacy !== undefined) return this.pairedChatPrivacy;
+		return (await this.refreshPairedChatCapabilities())?.privacy ?? "indeterminate";
+	}
+
+	/** Private-chat-only gate for flat delivery and global configuration commands. */
 	private async pairedChatIsPrivate(): Promise<boolean> {
 		return (await this.resolvePairedChatPrivacy()) === "private";
+	}
+
+	/** Topic-only gate for private chats and explicitly configured forum supergroups. */
+	private async pairedChatIsTopicCapable(): Promise<boolean> {
+		if (this.pairedChatTopicCapable !== undefined) return this.pairedChatTopicCapable;
+		return (await this.refreshPairedChatCapabilities())?.isTopicCapable === true;
 	}
 
 	/** Tell the user once (per daemon run) how to enable Threaded Mode. */
@@ -2266,7 +2295,7 @@ export class TelegramNotificationDaemon {
 	/** Send a single `typing` chat action into a busy session's topic (best-effort). */
 	private async sendTyping(sessionId: string): Promise<void> {
 		const topicId = this.topics.get(sessionId)?.topicId;
-		if (!topicId || !(await this.pairedChatIsPrivate())) return;
+		if (!topicId || !(await this.pairedChatIsTopicCapable())) return;
 		try {
 			await this.botApi.call("sendChatAction", {
 				chat_id: this.opts.chatId,
@@ -2280,7 +2309,7 @@ export class TelegramNotificationDaemon {
 
 	/** Set a native reaction on an inbound thread message (best-effort). */
 	private async setReaction(messageId: number, emoji: string): Promise<void> {
-		if (!(await this.pairedChatIsPrivate())) return;
+		if (!(await this.pairedChatIsTopicCapable())) return;
 		try {
 			await this.botApi.call("setMessageReaction", {
 				chat_id: this.opts.chatId,
@@ -2308,7 +2337,7 @@ export class TelegramNotificationDaemon {
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
 			const send = renderThreadedFrame(msg);
 			if (!send) return;
-			const existingTopic = await this.existingTopicForPrivateChat(session.sessionId);
+			const existingTopic = await this.existingTopicForTopicCapableChat(session.sessionId);
 			if (!send.identity && !existingTopic && !this.flatIdentitySent.has(session.sessionId)) {
 				this.rememberPendingThreadedFrame(session.sessionId, send, msg as Record<string, unknown>);
 				return;
@@ -2541,15 +2570,16 @@ export class TelegramNotificationDaemon {
 		const topicOutcome = await this.handleForumTopicEdited(update);
 		if (topicOutcome !== "not-topic") return topicOutcome;
 		try {
-			await this.handleTelegramUpdate(update);
+			return (await this.handleTelegramUpdate(update)) ?? "consumed";
 		} catch (err) {
 			logger.error("notifications daemon: handleTelegramUpdate failed", { error: String(err) });
+			return "consumed";
 		}
-		return "consumed";
 	}
 
-	async handleTelegramUpdate(update: unknown): Promise<void> {
-		if ((await this.handleForumTopicEdited(update)) !== "not-topic") return;
+	async handleTelegramUpdate(update: unknown): Promise<TelegramUpdateOutcome | undefined> {
+		const topicOutcome = await this.handleForumTopicEdited(update);
+		if (topicOutcome !== "not-topic") return topicOutcome;
 		// Session-lifecycle command (/session_*): handled ONLY from the paired chat,
 		// gated before any arg parsing or side effect, and routed through the control
 		// endpoint. Must run before threaded-injection so commands are not treated as
@@ -2637,6 +2667,25 @@ export class TelegramNotificationDaemon {
 				await reply(desired ? "Rich messages: on" : "Rich messages: off");
 				return;
 			}
+		}
+		// A configured forum supergroup is outbound topic transport only. Check
+		// the update's chat before the capability lookup so unpaired traffic stays
+		// side-effect free.
+		const authorityUpdate = update as {
+			message?: { chat?: { id?: unknown } };
+			callback_query?: { id?: unknown; message?: { chat?: { id?: unknown } } };
+		};
+		const authorityChatId = authorityUpdate.message?.chat?.id ?? authorityUpdate.callback_query?.message?.chat?.id;
+		if (String(authorityChatId) !== String(this.opts.chatId)) return;
+		const privacy = await this.resolvePairedChatPrivacy();
+		if (privacy === "indeterminate") return "retry";
+		if (privacy === "non-private") {
+			// Dismiss callback spinners without routing an answer or leaking stale
+			// guidance into the shared chat.
+			if (authorityUpdate.callback_query?.id !== undefined) {
+				await this.answerCallbackQueryBestEffort(authorityUpdate.callback_query.id, "Button is stale");
+			}
+			return "consumed";
 		}
 		// Threaded injection: a free-text message in a known topic (not a button
 		// tap and not a reply to a specific ask message) injects a user turn or an

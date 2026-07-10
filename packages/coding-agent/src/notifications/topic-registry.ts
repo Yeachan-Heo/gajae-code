@@ -1,10 +1,11 @@
 /**
  * Per-session forum-topic registry for the threaded session surface.
  *
- * Each GJC session owns one active Telegram forum topic in the paired private
- * DM. The topic is created via `createForumTopic`, reused while the session
- * remains active, and removed from the registry when the daemon deletes it on
- * shutdown. The registry also tracks whether the one-time identity header has
+ * Each GJC session owns one active Telegram forum topic in the configured
+ * topic-capable chat. The topic is created via `createForumTopic`, reused while
+ * the session remains active, and removed from the registry when the daemon
+ * deletes it on shutdown.
+ * The registry also tracks whether the one-time identity header has
  * already been pinned, so it is sent exactly once per active topic, even across
  * reconnects.
  *
@@ -37,6 +38,8 @@ export interface TopicRecord {
 export interface TopicRegistryState {
 	/** sessionId -> record. */
 	topics: Record<string, TopicRecord>;
+	/** Telegram destination that owns every topic id in this state. */
+	chatId?: string;
 }
 
 export function emptyTopicRegistryState(): TopicRegistryState {
@@ -219,7 +222,7 @@ export class TopicRegistry {
 	}
 
 	/** Serialise for atomic persistence beside the daemon state. */
-	serialize(): TopicRegistryState {
-		return { topics: Object.fromEntries(this.topics) };
+	serialize(chatId?: string): TopicRegistryState {
+		return { ...(chatId === undefined ? {} : { chatId }), topics: Object.fromEntries(this.topics) };
 	}
 }
