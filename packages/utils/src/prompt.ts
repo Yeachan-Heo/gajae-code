@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import type { HelperDelegate, HelperOptions, Template, TemplateDelegate } from "handlebars";
 
 export type { HelperDelegate, HelperOptions, Template, TemplateDelegate };
@@ -226,15 +225,16 @@ export interface TemplateContext extends Record<string, unknown> {
 type HandlebarsRuntime = typeof import("handlebars");
 type HandlebarsInstance = ReturnType<HandlebarsRuntime["create"]>;
 
-const require = createRequire(import.meta.url);
-const COMPILED_HANDLEBARS_PATH = "/$bunfs/root/node_modules/handlebars/lib/index.js";
 let handlebars: HandlebarsInstance | undefined;
 
 function getHandlebars(): HandlebarsInstance {
 	if (handlebars) return handlebars;
-	const Handlebars = asHandlebarsRuntime(
-		require(process.env.PI_COMPILED === "true" ? COMPILED_HANDLEBARS_PATH : "handlebars"),
-	);
+	// Lazy bare-literal require: statically traceable, so the bundler always
+	// embeds handlebars in the main bundle (compiled binaries included), while
+	// the module still loads only on first template render. The previous
+	// bunfs extra-entrypoint require crashed v0.9.3–v0.9.6 compiled releases
+	// at startup when --minify dropped the entrypoint (#1939).
+	const Handlebars = asHandlebarsRuntime(require("handlebars"));
 	handlebars = Handlebars.create();
 	registerBuiltinHelpers(handlebars);
 	return handlebars;

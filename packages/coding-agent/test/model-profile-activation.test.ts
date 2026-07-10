@@ -63,6 +63,21 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.XHigh,
 			}),
+			model("openai-codex", "gpt-5.6-sol", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.Max,
+			}),
+			model("openai-codex", "gpt-5.6-terra", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.Max,
+			}),
+			model("openai-codex", "gpt-5.6-luna", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Medium,
+				maxLevel: ThinkingLevel.Max,
+			}),
 			model("openai-codex", "gpt-5.3-codex-spark"),
 			model("minimax-code", "minimax-m3"),
 			model("minimax-code-cn", "minimax-m3"),
@@ -144,10 +159,10 @@ describe("model profile activation", () => {
 			architect: "provider-b/executor",
 		});
 	});
-	test("builtin codex-eco executor selector clamps from catalog minimal to prepared low", async () => {
+	test("builtin codex-eco executor selector clamps below-catalog effort up to the model minimum", async () => {
 		const registry = fakeRegistry({ profiles: [...BUILTIN_MODEL_PROFILES] });
 		const catalog = BUILTIN_MODEL_PROFILES.find(profile => profile.name === "codex-eco");
-		expect(catalog?.modelMapping.executor).toBe("openai-codex/gpt-5.5:minimal");
+		expect(catalog?.modelMapping.executor).toBe("openai-codex/gpt-5.6-luna:low");
 
 		const prepared = await prepareModelProfileActivation({
 			session: fakeSession(),
@@ -155,10 +170,11 @@ describe("model profile activation", () => {
 			settings: Settings.isolated(),
 			profileName: "codex-eco",
 		});
-		expect(prepared.agentModelOverrides.executor).toBe("openai-codex/gpt-5.5:low");
-		expect(prepared.agentModelOverrides.architect).toBe("openai-codex/gpt-5.5:high");
-		expect(prepared.agentModelOverrides.planner).toBe("openai-codex/gpt-5.5:low");
-		expect(prepared.agentModelOverrides.critic).toBe("openai-codex/gpt-5.5:medium");
+		// The fake luna catalog entry has minLevel medium, so :low clamps up.
+		expect(prepared.agentModelOverrides.executor).toBe("openai-codex/gpt-5.6-luna:medium");
+		expect(prepared.agentModelOverrides.architect).toBe("openai-codex/gpt-5.6-sol:medium");
+		expect(prepared.agentModelOverrides.planner).toBe("openai-codex/gpt-5.6-luna:medium");
+		expect(prepared.agentModelOverrides.critic).toBe("openai-codex/gpt-5.6-luna:medium");
 	});
 
 	test("session-only changes active model and replaces runtime overrides without persisted sets", async () => {

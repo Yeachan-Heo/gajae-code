@@ -1,10 +1,20 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- Moved the `codex-eco`/`codex-medium`/`codex-pro` presets and the `opus-codex`/`codex-opencodego`/`fable-opus-codex` combo presets from `gpt-5.5` onto the GPT-5.6 tier family: Sol drives `default` and `architect` on every codex preset (eco `sol:medium`, medium `sol:high`, pro `sol:xhigh`/`sol:max`), with Luna/Terra covering the lighter executor/planner/critic roles by tier.
+
+### Fixed
+
+- Fixed v0.9.3–v0.9.6 compiled release binaries crashing at first real launch with `Cannot find module '/$bunfs/root/node_modules/handlebars/lib/index.js'` while `--version`/`--help` still worked (#1939). `--minify` silently dropped the handlebars bunfs extra entrypoint; handlebars is now bundled through a statically-traceable `require("handlebars")` in `@gajae-code/utils` prompt rendering (still lazy at runtime), and the fragile extra entrypoint is gone from both release and dev compile args. `--minify` and its startup-RSS win are retained.
+
+## [0.9.5] - 2026-07-09
 ### Fixed
 
 - ACP permission prompts now honor `clientCapabilities._meta.gjc.permissionHandling` and the `GJC_ACP_PERMISSION_MODE` fallback, so `auto` and `always-allow` no longer emit `session/request_permission` calls while invalid values fail safely to `prompt`.
 - Complete bracketed-paste input now returns a manually paged transcript to live output before inserting or consuming the paste, preventing the viewport from remaining stuck above ongoing output.
+- Model selector batch assignments ("Set for all role agents" / "Set for all targets") now open the reasoning-effort menu whenever any batch target requires an explicit choice (e.g. Anthropic reasoning models like `claude-fable-5`), and the chosen effort plus the full batch survive the menu. Previously the menu never appeared for Anthropic models (silently persisting `:off` selectors for every role agent), and for OpenAI/Codex models picking an effort collapsed the batch to a DEFAULT-only assignment.
 ### Added
 
 - ACP clients now receive GJC automatic-compaction start/end state through additive `session_info_update` metadata, including the compaction action, trigger, retry/abort/error outcome, and busy-to-idle phase transitions.

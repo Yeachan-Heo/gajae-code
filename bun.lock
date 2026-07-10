@@ -15,7 +15,7 @@
     },
     "packages/agent": {
       "name": "@gajae-code/agent-core",
-      "version": "0.9.4",
+      "version": "0.9.5",
       "dependencies": {
         "@gajae-code/ai": "catalog:",
         "@gajae-code/natives": "catalog:",
@@ -30,7 +30,7 @@
     },
     "packages/ai": {
       "name": "@gajae-code/ai",
-      "version": "0.9.4",
+      "version": "0.9.5",
       "bin": {
         "pi-ai": "./src/cli.ts",
       },
@@ -48,14 +48,14 @@
     },
     "packages/bridge-client": {
       "name": "@gajae-code/bridge-client",
-      "version": "0.9.4",
+      "version": "0.9.5",
       "devDependencies": {
         "@types/bun": "catalog:",
       },
     },
     "packages/coding-agent": {
       "name": "@gajae-code/coding-agent",
-      "version": "0.9.4",
+      "version": "0.9.5",
       "bin": {
         "gjc": "bin/gjc.js",
       },
@@ -91,7 +91,7 @@
     },
     "packages/gajae-code": {
       "name": "gajae-code",
-      "version": "0.9.4",
+      "version": "0.9.5",
       "bin": {
         "gjc": "bin/gjc.js",
       },
@@ -101,7 +101,7 @@
     },
     "packages/natives": {
       "name": "@gajae-code/natives",
-      "version": "0.9.4",
+      "version": "0.9.5",
       "devDependencies": {
         "@napi-rs/cli": "catalog:",
         "@types/bun": "catalog:",
@@ -117,23 +117,23 @@
     },
     "packages/natives-darwin-arm64": {
       "name": "@gajae-code/natives-darwin-arm64",
-      "version": "0.9.4",
+      "version": "0.9.5",
     },
     "packages/natives-darwin-x64": {
       "name": "@gajae-code/natives-darwin-x64",
-      "version": "0.9.4",
+      "version": "0.9.5",
     },
     "packages/natives-linux-arm64": {
       "name": "@gajae-code/natives-linux-arm64",
-      "version": "0.9.4",
+      "version": "0.9.5",
     },
     "packages/natives-linux-x64": {
       "name": "@gajae-code/natives-linux-x64",
-      "version": "0.9.4",
+      "version": "0.9.5",
     },
     "packages/natives-win32-x64": {
       "name": "@gajae-code/natives-win32-x64",
-      "version": "0.9.4",
+      "version": "0.9.5",
     },
     "packages/orchestration-token-benchmark": {
       "name": "@gajae-code/orchestration-token-benchmark",
@@ -144,7 +144,7 @@
     },
     "packages/stats": {
       "name": "@gajae-code/stats",
-      "version": "0.9.4",
+      "version": "0.9.5",
       "bin": {
         "gjc-stats": "./src/index.ts",
       },
@@ -169,7 +169,7 @@
     },
     "packages/tui": {
       "name": "@gajae-code/tui",
-      "version": "0.9.4",
+      "version": "0.9.5",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "@gajae-code/utils": "catalog:",
@@ -209,7 +209,7 @@
     },
     "packages/utils": {
       "name": "@gajae-code/utils",
-      "version": "0.9.4",
+      "version": "0.9.5",
       "dependencies": {
         "@gajae-code/natives": "catalog:",
         "beautiful-mermaid": "catalog:",
@@ -247,19 +247,19 @@
     "@biomejs/biome": "^2.4.14",
     "@bufbuild/protobuf": "^2.12.0",
     "@bufbuild/protoc-gen-es": "^2.12.0",
-    "@gajae-code/agent-core": "0.9.4",
-    "@gajae-code/ai": "0.9.4",
-    "@gajae-code/bridge-client": "0.9.4",
-    "@gajae-code/coding-agent": "0.9.4",
-    "@gajae-code/natives": "0.9.4",
-    "@gajae-code/natives-darwin-arm64": "0.9.4",
-    "@gajae-code/natives-darwin-x64": "0.9.4",
-    "@gajae-code/natives-linux-arm64": "0.9.4",
-    "@gajae-code/natives-linux-x64": "0.9.4",
-    "@gajae-code/natives-win32-x64": "0.9.4",
-    "@gajae-code/stats": "0.9.4",
-    "@gajae-code/tui": "0.9.4",
-    "@gajae-code/utils": "0.9.4",
+    "@gajae-code/agent-core": "0.9.5",
+    "@gajae-code/ai": "0.9.5",
+    "@gajae-code/bridge-client": "0.9.5",
+    "@gajae-code/coding-agent": "0.9.5",
+    "@gajae-code/natives": "0.9.5",
+    "@gajae-code/natives-darwin-arm64": "0.9.5",
+    "@gajae-code/natives-darwin-x64": "0.9.5",
+    "@gajae-code/natives-linux-arm64": "0.9.5",
+    "@gajae-code/natives-linux-x64": "0.9.5",
+    "@gajae-code/natives-win32-x64": "0.9.5",
+    "@gajae-code/stats": "0.9.5",
+    "@gajae-code/tui": "0.9.5",
+    "@gajae-code/utils": "0.9.5",
     "@mozilla/readability": "^0.6.0",
     "@napi-rs/cli": "3.6.2",
     "@opentelemetry/api": "^1.9.0",
@@ -651,7 +651,7 @@
 
     "@opentelemetry/sdk-trace-base": ["@opentelemetry/sdk-trace-base@2.9.0", "", { "dependencies": { "@opentelemetry/core": "2.9.0", "@opentelemetry/resources": "2.9.0", "@opentelemetry/sdk-trace": "2.9.0", "@opentelemetry/semantic-conventions": "^1.29.0" }, "peerDependencies": { "@opentelemetry/api": ">=1.3.0 <1.10.0" } }, "sha512-cp9zmTl62R8PJrpvFcmc8N2JQU/xfa0S+61q511Nji+QxCfZ8Ifvg7H27G8cANe4crg4RTrWsVvanHiXjSp6ag=="],
 
-    "@opentelemetry/semantic-conventions": ["@opentelemetry/semantic-conventions@1.41.1", "", {}, "sha512-/UhIkaZgPutTFmQ7RnIJGgDXZmtEJ7Dvi86xNTFWcnRxVRNk/aotsqDJYeEvDP+FSMB2SdW+pQzNMcWP0rwuNA=="],
+    "@opentelemetry/semantic-conventions": ["@opentelemetry/semantic-conventions@1.42.0", "", {}, "sha512-icc5xCzndZfhuJMy5oqk5AvloWquR7jtae74qzpkKkhGp8BivK+oCcEXgGnjCdTfp8hA44l+w8gE8yYJbocJJw=="],
 
     "@puppeteer/browsers": ["@puppeteer/browsers@2.13.2", "", { "dependencies": { "debug": "^4.4.3", "extract-zip": "^2.0.1", "progress": "^2.0.3", "proxy-agent": "^6.5.0", "semver": "^7.7.4", "tar-fs": "^3.1.1", "yargs": "^17.7.2" }, "bin": { "browsers": "lib/cjs/main-cli.js" } }, "sha512-5EUZSUIc37H6aIXyWO0Z4y8NlF8NnjgmqeQgOGiswAU7pY0HOo16ho4+alIWmSfdZnjqBRawMsP3I5YqLSn6kw=="],
 

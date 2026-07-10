@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/utils",
-	"version": "0.9.4",
+	"version": "0.9.5",
 	"description": "Shared utilities for pi packages",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo",

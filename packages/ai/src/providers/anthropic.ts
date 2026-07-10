@@ -2263,7 +2263,11 @@ function buildParams(
 		params.tools = convertTools(
 			context.tools,
 			isOAuthToken,
-			disableStrictTools || model.provider === "github-copilot",
+			// The Claude Code OAuth surface mishandles `strict: true` tools:
+			// streamed tool_use blocks arrive with empty/undefined arguments and
+			// occasionally corrupted names (works with PI_NO_STRICT=1). Never
+			// request strict tool use on OAuth requests.
+			disableStrictTools || isOAuthToken || model.provider === "github-copilot",
 			getAnthropicCompat(model).supportsEagerToolInputStreaming,
 		);
 	}

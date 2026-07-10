@@ -639,6 +639,36 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.tools?.find(tool => tool.name === "bash")?.input_schema?.required).toEqual(["requiredValue"]);
 	});
 
+	it("never sends strict tools on OAuth requests", async () => {
+		const tools: Tool[] = (["bash", "python", "edit", "find"] as const).map(name => ({
+			name,
+			description: `${name} tool`,
+			strict: true,
+			parameters: {
+				type: "object",
+				properties: { requiredValue: { type: "string" } },
+				required: ["requiredValue"],
+			} as TJsonSchema,
+		}));
+
+		const payload = (await captureAnthropicPayload(
+			ANTHROPIC_MODEL,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+				tools,
+			},
+			{ isOAuth: true },
+		)) as {
+			tools?: Array<{ name?: string; strict?: boolean }>;
+		};
+
+		expect(payload.tools?.length).toBe(4);
+		expect((payload.tools ?? []).some(tool => tool.strict === true)).toBe(false);
+		// OAuth still prefixes custom tool names.
+		expect(payload.tools?.map(tool => tool.name)).toEqual(["proxy_bash", "proxy_python", "proxy_edit", "proxy_find"]);
+	});
+
 	it("marks regular two-field Zod object tools strict", async () => {
 		const tools: Tool[] = [
 			{

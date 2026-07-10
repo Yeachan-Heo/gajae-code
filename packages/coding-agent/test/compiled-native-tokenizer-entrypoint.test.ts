@@ -15,8 +15,10 @@ describe("compiled binary entrypoints", () => {
 		expect(devSource).not.toContain("nativeTokenizerEntrypoint");
 		expect(argsSource).not.toContain('"../natives/native/index.js"');
 		// Shared builder carries --minify and the dev worker entrypoints
-		// consumed by build-binary.ts via buildDevCompileArgs.
+		// consumed by build-binary.ts via buildDevCompileArgs. handlebars must
+		// NOT be an extra entrypoint (#1939: --minify silently dropped it).
 		expect(argsSource).toContain('"--minify"');
+		expect(argsSource).not.toContain('"../../node_modules/handlebars/lib/index.js"');
 		expect(argsSource).toContain('"../stats/src/sync-worker.ts"');
 		expect(argsSource).toContain('"./src/tools/browser/tab-worker-entry.ts"');
 		expect(argsSource).toContain('"./src/eval/js/worker-entry.ts"');

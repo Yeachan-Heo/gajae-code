@@ -27,6 +27,15 @@ describe("release build compile args", () => {
 		expect(releaseArgs).toContain("--minify");
 	});
 
+	it("does not ship handlebars as a bunfs extra entrypoint (#1939)", () => {
+		// --minify silently dropped the handlebars extra entrypoint from the
+		// bunfs bundle, crashing v0.9.3–v0.9.6 compiled releases at startup.
+		// handlebars is bundled via a statically-traceable require instead.
+		expect(releaseEntrypoints).not.toContain("./node_modules/handlebars/lib/index.js");
+		expect(releaseArgs).not.toContain("./node_modules/handlebars/lib/index.js");
+		expect(buildDevCompileArgs()).not.toContain("../../node_modules/handlebars/lib/index.js");
+	});
+
 	it("marks release binaries with release build metadata", () => {
 		expect(valuesAfter(releaseArgs, "--define")).toContain('process.env.PI_COMPILED="true"');
 		expect(valuesAfter(releaseArgs, "--define")).toContain('process.env.GJC_BUILD_CHANNEL="release"');
@@ -39,15 +48,13 @@ describe("release build compile args", () => {
 		expect(devDefines).toContain('process.env.GJC_BUILD_CHANNEL="dev"');
 	});
 
-	it("includes worker and lazy CommonJS entrypoints in release args", () => {
+	it("includes worker entrypoints in release args", () => {
 		expect(releaseEntrypoints).toContain("./packages/stats/src/sync-worker.ts");
 		expect(releaseEntrypoints).toContain("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts");
 		expect(releaseEntrypoints).toContain("./packages/coding-agent/src/eval/js/worker-entry.ts");
-		expect(releaseEntrypoints).toContain("./node_modules/handlebars/lib/index.js");
 		expect(releaseArgs).toContain("./packages/stats/src/sync-worker.ts");
 		expect(releaseArgs).toContain("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts");
 		expect(releaseArgs).toContain("./packages/coding-agent/src/eval/js/worker-entry.ts");
-		expect(releaseArgs).toContain("./node_modules/handlebars/lib/index.js");
 	});
 
 	it("does not list models.json as an extra compile entrypoint", () => {
@@ -58,10 +65,6 @@ describe("release build compile args", () => {
 		expect(releaseEntrypoints).not.toContain("./packages/ai/src/models.json");
 		expect(releaseArgs).not.toContain("./packages/ai/src/models.json");
 		expect(buildDevCompileArgs()).not.toContain("../ai/src/models.json");
-	});
-
-	it("includes lazy CommonJS entrypoints in dev args", () => {
-		expect(buildDevCompileArgs()).toContain("../../node_modules/handlebars/lib/index.js");
 	});
 
 	it("has exactly one target and outfile", () => {

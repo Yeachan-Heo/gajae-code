@@ -30,7 +30,10 @@ export const releaseEntrypoints = [
 	// NOTE: models.json must NOT be listed here — `bun build --compile` does not
 	// emit `.json` extra entrypoints into the bunfs. It is embedded via the
 	// `with { type: "file" }` import in packages/ai/src/models.ts instead.
-	"./node_modules/handlebars/lib/index.js",
+	// NOTE: handlebars must NOT be listed here either — the extra entrypoint
+	// silently vanished from minified bundles and crashed v0.9.3–v0.9.6
+	// releases at startup (#1939). It is bundled via the statically-traceable
+	// `require("handlebars")` in packages/utils/src/prompt.ts instead.
 ];
 
 export const devEntrypoints = [
@@ -39,7 +42,6 @@ export const devEntrypoints = [
 	"./src/tools/browser/tab-worker-entry.ts",
 	"./src/eval/js/worker-entry.ts",
 	"./src/notifications/telegram-daemon-cli.ts",
-	"../../node_modules/handlebars/lib/index.js",
 ];
 
 export function buildReleaseCompileArgs(target: string, outfile: string): string[] {
@@ -72,6 +74,10 @@ export function buildCompileArgs(options: CompileArgOptions): string[] {
 		// Minify shrinks the bundled JS the compiled binary must parse at
 		// startup (302MB → ~114MB --help RSS measured on darwin-arm64).
 		// --keep-names below preserves identifiers for error reports.
+		// SAFE with handlebars since #1939: the module is bundled via a
+		// statically-traceable require in packages/utils/src/prompt.ts, not a
+		// bunfs extra entrypoint (which --minify silently dropped, crashing
+		// v0.9.3–v0.9.6 releases at startup).
 		"--minify",
 		...compileAutoloadDisableFlags,
 		"--keep-names",
