@@ -21,8 +21,16 @@ export interface TopicRecord {
 	identitySent: boolean;
 	/** Creation timestamp (ms epoch). */
 	createdAt: number;
-	/** Last applied topic title (for rename detection). */
+	/** Last applied or observed Telegram topic title. */
 	name?: string;
+	/** Naming authority. Missing values are legacy daemon-owned records. */
+	nameOwner?: "user";
+	/** Whether a user-owned name still needs a best-effort Telegram re-assert. */
+	nameReconcilePending?: boolean;
+	/** Last accepted Telegram update id for a user-owned name. */
+	userNameUpdateId?: number;
+	/** Stable repo/branch identity used when topic names are user-owned or customized. */
+	identityKey?: string;
 }
 
 /** Serialisable shape persisted to disk. */
@@ -48,13 +56,31 @@ export class TopicRegistry {
 	private readonly inflight = new Map<string, Promise<TopicRecord>>();
 
 	constructor(state: TopicRegistryState = emptyTopicRegistryState()) {
-		this.topics = new Map(Object.entries(state.topics ?? {}));
-		for (const [sessionId, record] of this.topics) this.byTopic.set(record.topicId, sessionId);
+		this.topics = new Map();
+		this.load(state);
 	}
 
-	/** Merge a serialized state into this registry, preserving all persisted fields. */
+	/** Merge serialized state and normalize authority fields from older releases. */
 	load(state: TopicRegistryState): void {
-		for (const [sessionId, record] of Object.entries(state.topics ?? {})) {
+		for (const [sessionId, raw] of Object.entries(state.topics ?? {})) {
+			if (!raw || typeof raw.topicId !== "string") continue;
+			const hasValidUserAuthority =
+				raw.nameOwner === "user" &&
+				typeof raw.name === "string" &&
+				raw.name.trim().length > 0 &&
+				typeof raw.userNameUpdateId === "number" &&
+				Number.isSafeInteger(raw.userNameUpdateId) &&
+				raw.userNameUpdateId >= 0;
+			const record: TopicRecord = {
+				topicId: raw.topicId,
+				identitySent: raw.identitySent === true,
+				createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
+				...(typeof raw.name === "string" ? { name: raw.name } : {}),
+				...(hasValidUserAuthority ? { nameOwner: "user" as const } : {}),
+				...(hasValidUserAuthority && raw.nameReconcilePending === true ? { nameReconcilePending: true } : {}),
+				...(hasValidUserAuthority ? { userNameUpdateId: raw.userNameUpdateId } : {}),
+				...(typeof raw.identityKey === "string" ? { identityKey: raw.identityKey } : {}),
+			};
 			this.topics.set(sessionId, record);
 			this.byTopic.set(record.topicId, sessionId);
 		}
@@ -120,16 +146,67 @@ export class TopicRegistry {
 		return record ? !record.identitySent : true;
 	}
 
-	/** Whether a known session topic's applied title differs from `name`. */
-	needsRename(sessionId: string, name: string): boolean {
+	/** Remember stable repo/branch identity independently of the displayed name. */
+	markIdentityKey(sessionId: string, identityKey: string): boolean {
 		const record = this.topics.get(sessionId);
-		return record !== undefined && record.name !== name;
+		if (!record || record.identityKey === identityKey) return false;
+		record.identityKey = identityKey;
+		return true;
 	}
 
-	/** Commit a successfully-applied Telegram topic title. */
+	/** Whether daemon identity reconciliation should apply `name`. */
+	needsRename(sessionId: string, name: string): boolean {
+		const record = this.topics.get(sessionId);
+		return record !== undefined && record.nameOwner !== "user" && record.name !== name;
+	}
+
+	/** The user-owned name that must be preserved, when one exists. */
+	userOwnedName(sessionId: string): string | undefined {
+		const record = this.topics.get(sessionId);
+		return record?.nameOwner === "user" ? record.name : undefined;
+	}
+
+	/** A user-owned name whose Telegram reconciliation is still pending. */
+	userNameToReconcile(sessionId: string): string | undefined {
+		const record = this.topics.get(sessionId);
+		return record?.nameOwner === "user" && record.nameReconcilePending ? record.name : undefined;
+	}
+
+	/** Record an explicit Telegram-side user rename, rejecting stale update ids. */
+	markUserName(sessionId: string, name: string, updateId: number): "updated" | "duplicate" | "stale" {
+		const record = this.topics.get(sessionId);
+		if (!record) return "stale";
+		if (record.userNameUpdateId !== undefined && updateId < record.userNameUpdateId) return "stale";
+		if (record.userNameUpdateId === updateId) return "duplicate";
+		record.name = name;
+		record.nameOwner = "user";
+		record.nameReconcilePending = true;
+		record.userNameUpdateId = updateId;
+		return "updated";
+	}
+
+	/** Mark the matching preserved user name as reconciled with Telegram. */
+	markUserNameReconciled(sessionId: string, name: string): boolean {
+		const record = this.topics.get(sessionId);
+		if (record?.nameOwner !== "user" || record.name !== name || !record.nameReconcilePending) return false;
+		record.nameReconcilePending = false;
+		return true;
+	}
+
+	/** Restore retryable reconciliation after a failed pending-clear persistence. */
+	markUserNamePending(sessionId: string, name: string): boolean {
+		const record = this.topics.get(sessionId);
+		if (record?.nameOwner !== "user" || record.name !== name || record.nameReconcilePending) return false;
+		record.nameReconcilePending = true;
+		return true;
+	}
+
+	/** Commit a successfully-applied daemon topic title. */
 	markNameApplied(sessionId: string, name: string): void {
 		const record = this.topics.get(sessionId);
-		if (record) record.name = name;
+		if (!record || record.nameOwner === "user") return;
+		record.name = name;
+		record.nameReconcilePending = false;
 	}
 
 	/** Remove a session topic record after Telegram deletes the topic. */

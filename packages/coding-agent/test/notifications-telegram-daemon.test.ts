@@ -19,6 +19,7 @@ import {
 	releaseDaemonOwnership,
 	renewDaemonHeartbeat,
 	TelegramBotTransport,
+	type TelegramDaemonFs,
 	TelegramEventDispatchState,
 	TelegramNotificationDaemon,
 	TelegramUpdatePoller,
@@ -54,6 +55,22 @@ function setPrivateAgentDir(s: Settings, agentDir: string) {
 			return typeof value === "function" ? value.bind(target) : value;
 		},
 	}) as Settings;
+}
+
+function topicStateFs(onTopicStateWrite: () => Promise<void>): TelegramDaemonFs {
+	return {
+		mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+		readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+		writeFile: async (file, data, opts) => {
+			if (file.includes("telegram-topics.json")) await onTopicStateWrite();
+			await fs.promises.writeFile(file, data, opts);
+		},
+		rename: (oldPath, newPath) => fs.promises.rename(oldPath, newPath).then(() => undefined),
+		unlink: file => fs.promises.unlink(file),
+		open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
+		readdir: file => fs.promises.readdir(file),
+		chmod: (file, mode) => fs.promises.chmod(file, mode),
+	};
 }
 
 class FakeWs extends EventTarget {
@@ -102,6 +119,109 @@ class FakeBotApi {
 		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: this.calls.length } };
 		if (method === "sendMessage") return { ok: true, result: { message_id: this.calls.length } };
 		return { ok: true, result: true };
+	}
+}
+
+type TopicAuthorityState = {
+	topics: Record<
+		string,
+		{ name?: string; nameOwner?: string; nameReconcilePending?: boolean; userNameUpdateId?: number }
+	>;
+};
+
+async function readTopicAuthorityState(agentDir: string): Promise<TopicAuthorityState> {
+	return JSON.parse(
+		await fs.promises.readFile(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"),
+	) as TopicAuthorityState;
+}
+
+function forumTopicEditedUpdate(
+	updateId: number,
+	threadId: number,
+	name: string,
+	{
+		chat = { id: 42 },
+		from = { id: 42, is_bot: false },
+	}: {
+		chat?: { id: number | string };
+		from?: { id: number; is_bot?: boolean } | null;
+	} = {},
+) {
+	return {
+		update_id: updateId,
+		message: {
+			chat,
+			...(from === null ? {} : { from }),
+			message_thread_id: threadId,
+			forum_topic_edited: { name },
+		},
+	};
+}
+
+async function identityTopicHarness({
+	agentDir = tempAgentDir(),
+	bot = new FakeBotApi(),
+	fs: fsImpl,
+	ownerId = "owner",
+	title = "Generated title",
+}: {
+	agentDir?: string;
+	bot?: FakeBotApi;
+	fs?: TelegramDaemonFs;
+	ownerId?: string;
+	title?: string;
+} = {}) {
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId,
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fs: fsImpl,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	await daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title,
+	});
+	return {
+		agentDir,
+		bot,
+		daemon,
+		session,
+		threadId: bot.calls.find(call => call.method === "sendMessage")!.body.message_thread_id as number,
+	};
+}
+
+class ReplayRenameBotApi extends FakeBotApi {
+	threadId: number | undefined;
+	getChatFailure: (() => unknown) | undefined;
+
+	override async call(method: string, body: unknown): Promise<unknown> {
+		if (method === "getUpdates") {
+			this.calls.push({ method, body });
+			const offset = (body as { offset?: number }).offset ?? 0;
+			if (this.threadId !== undefined && offset <= 50) {
+				return {
+					ok: true,
+					result: [
+						forumTopicEditedUpdate(50, this.threadId, "First focus"),
+						forumTopicEditedUpdate(51, this.threadId, "Later focus"),
+					],
+				};
+			}
+			return { ok: true, result: [] };
+		}
+		if (method === "getChat" && this.getChatFailure) {
+			const failure = this.getChatFailure;
+			this.getChatFailure = undefined;
+			this.calls.push({ method, body });
+			return failure();
+		}
+		return super.call(method, body);
 	}
 }
 
@@ -205,9 +325,10 @@ describe("telegram daemon", () => {
 		expect(bot.maxConcurrentGetUpdates).toBe(1);
 	});
 
-	test("TelegramUpdatePoller owns offset and isolates update failures", async () => {
+	test("TelegramUpdatePoller isolates handler failures and backs off before retrying an update", async () => {
 		const calls: Array<{ method: string; body: any }> = [];
-		const processed: unknown[] = [];
+		const processed: string[] = [];
+		const sleeps: number[] = [];
 		const bot = {
 			async call(method: string, body: unknown): Promise<unknown> {
 				calls.push({ method, body });
@@ -216,7 +337,8 @@ describe("telegram daemon", () => {
 						ok: true,
 						result: [
 							{ update_id: 10, value: "bad" },
-							{ update_id: 11, value: "good" },
+							{ update_id: 11, value: "retry" },
+							{ update_id: 12, value: "later" },
 						],
 					};
 				}
@@ -225,18 +347,21 @@ describe("telegram daemon", () => {
 		};
 		const poller = new TelegramUpdatePoller({
 			botApi: bot,
-			runtime: { sleep: async () => undefined } as any,
+			runtime: { sleep: async (ms: number) => void sleeps.push(ms) } as any,
 			backoff: { next: () => 500, reset() {} } as any,
 			processUpdate: async update => {
-				processed.push(update);
-				if ((update as { value?: string }).value === "bad") throw new Error("boom");
+				const value = (update as { value: string }).value;
+				processed.push(value);
+				if (value === "bad") throw new Error("boom");
+				return value === "retry" ? "retry" : "consumed";
 			},
 		});
 
-		expect(await poller.pollOnce()).toBe(2);
+		expect(await poller.pollOnce()).toBe(3);
 		expect(await poller.pollOnce()).toBe(0);
-		expect(calls.map(call => call.body.offset)).toEqual([0, 12]);
-		expect(processed).toHaveLength(2);
+		expect(calls.map(call => call.body.offset)).toEqual([0, 11]);
+		expect(processed).toEqual(["bad", "retry"]);
+		expect(sleeps).toEqual([500]);
 	});
 
 	test("TelegramBotTransport keeps JSON and multipart Bot API details outside daemon", async () => {
@@ -1658,6 +1783,315 @@ test("transient topic rename failure is retried on the next identity header", as
 	expect(edits.map(c => c.body.name)).toEqual(["gajae-code/dev - Readable title", "gajae-code/dev - Readable title"]);
 });
 
+test("a delayed user topic rename is immediately restored after a completed daemon edit", async () => {
+	const { agentDir, bot, daemon, session, threadId } = await identityTopicHarness({ title: "First title" });
+	await daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Generated title",
+	});
+	bot.calls = [];
+
+	await daemon.handleTelegramUpdate(forumTopicEditedUpdate(41, threadId, "My focus"));
+	const persisted = await readTopicAuthorityState(agentDir);
+	expect(bot.calls.filter(c => c.method === "editForumTopic").map(c => c.body.name)).toEqual(["My focus"]);
+	expect(persisted.topics.S).toMatchObject({ name: "My focus", nameOwner: "user", nameReconcilePending: false });
+
+	bot.calls = [];
+	await daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Later generated title",
+	});
+	expect(bot.calls.filter(c => c.method === "editForumTopic")).toHaveLength(0);
+});
+
+test("bot-originated topic edit service messages do not claim user ownership", async () => {
+	const { bot, daemon, session, threadId } = await identityTopicHarness({ title: "First title" });
+	bot.calls = [];
+
+	for (const [updateId, name, overrides] of [
+		[42, "Bot echo", { from: { id: 42, is_bot: true } }],
+		[43, "Wrong user", { from: { id: 7, is_bot: false } }],
+		[44, "String chat", { chat: { id: "42" } }],
+		[45, "Unknown bot status", { from: { id: 42 } }],
+		[46, "Missing sender", { from: null }],
+	] as const) {
+		await daemon.handleTelegramUpdate(forumTopicEditedUpdate(updateId, threadId, name, overrides));
+	}
+	expect(bot.calls.filter(c => c.method === "editForumTopic")).toHaveLength(0);
+	await daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Second title",
+	});
+	expect(bot.calls.filter(c => c.method === "editForumTopic").map(c => c.body.name)).toEqual([
+		"gajae-code/dev - Second title",
+	]);
+});
+
+test("a user rename racing an in-flight daemon edit is restored after the daemon edit", async () => {
+	class RacingRenameBotApi extends FakeBotApi {
+		readonly daemonEditStarted = Promise.withResolvers<void>();
+		readonly releaseDaemonEdit = Promise.withResolvers<void>();
+
+		override async call(method: string, body: unknown): Promise<unknown> {
+			const name = (body as { name?: unknown } | null)?.name;
+			if (method === "editForumTopic" && name === "gajae-code/dev - Generated title") {
+				this.calls.push({ method, body });
+				this.daemonEditStarted.resolve();
+				await this.releaseDaemonEdit.promise;
+				return { ok: true, result: true };
+			}
+			return super.call(method, body);
+		}
+	}
+
+	const bot = new RacingRenameBotApi();
+	const { daemon, session, threadId } = await identityTopicHarness({ bot, title: "First title" });
+	bot.calls = [];
+
+	const identityUpdate = daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Generated title",
+	});
+	await bot.daemonEditStarted.promise;
+	await daemon.handleTelegramUpdate(forumTopicEditedUpdate(43, threadId, "My focus"));
+	const laterIdentity = daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Later generated title",
+	});
+	await laterIdentity;
+	expect(bot.calls.filter(c => c.method === "editForumTopic").map(c => c.body.name)).toEqual([
+		"gajae-code/dev - Generated title",
+	]);
+	bot.releaseDaemonEdit.resolve();
+	await identityUpdate;
+
+	expect(bot.calls.filter(c => c.method === "editForumTopic").map(c => c.body.name)).toEqual([
+		"gajae-code/dev - Generated title",
+		"My focus",
+	]);
+	bot.calls = [];
+	await daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Another generated title",
+	});
+	expect(bot.calls.some(c => c.method === "editForumTopic")).toBe(false);
+});
+
+test("concurrent user renames persist the newest pending ownership state", async () => {
+	const firstWriteStarted = Promise.withResolvers<void>();
+	const releaseFirstWrite = Promise.withResolvers<void>();
+	let blockNextTopicWrite = false;
+	const fsImpl = topicStateFs(async () => {
+		if (blockNextTopicWrite) {
+			blockNextTopicWrite = false;
+			firstWriteStarted.resolve();
+			await releaseFirstWrite.promise;
+		}
+	});
+	const { agentDir, daemon, threadId } = await identityTopicHarness({ fs: fsImpl });
+
+	blockNextTopicWrite = true;
+	const firstRename = daemon.handleTelegramUpdate(forumTopicEditedUpdate(45, threadId, "First focus"));
+	await firstWriteStarted.promise;
+	const secondRename = daemon.handleTelegramUpdate(forumTopicEditedUpdate(46, threadId, "Latest focus"));
+	releaseFirstWrite.resolve();
+	await Promise.all([firstRename, secondRename]);
+
+	const state = await readTopicAuthorityState(agentDir);
+	expect(state.topics.S).toMatchObject({
+		name: "Latest focus",
+		nameOwner: "user",
+		nameReconcilePending: false,
+	});
+});
+
+test("topic-state write failure retries the rename before later Telegram updates", async () => {
+	let failNextTopicWrite = false;
+	const fsImpl = topicStateFs(async () => {
+		if (failNextTopicWrite) {
+			failNextTopicWrite = false;
+			throw new Error("injected topic-state write failure");
+		}
+	});
+	const bot = new ReplayRenameBotApi();
+	const { agentDir, daemon, threadId } = await identityTopicHarness({ bot, fs: fsImpl });
+	bot.threadId = threadId;
+	failNextTopicWrite = true;
+
+	await daemon.pollOnce();
+	const failedState = await readTopicAuthorityState(agentDir);
+	expect(failedState.topics.S).not.toMatchObject({ name: "First focus", nameOwner: "user" });
+
+	await daemon.pollOnce();
+	await daemon.pollOnce();
+	const persistedState = await readTopicAuthorityState(agentDir);
+	expect(persistedState.topics.S).toMatchObject({
+		name: "Later focus",
+		nameOwner: "user",
+		nameReconcilePending: false,
+		userNameUpdateId: 51,
+	});
+	expect(bot.calls.filter(call => call.method === "getUpdates").map(call => call.body.offset)).toEqual([0, 0, 52]);
+	expect(bot.calls.filter(call => call.method === "editForumTopic").map(call => call.body.name)).toEqual([
+		"First focus",
+		"Later focus",
+	]);
+});
+
+test.each([
+	[
+		"thrown getChat",
+		() => {
+			throw new Error("getChat unavailable");
+		},
+	],
+	["getChat ok:false", () => ({ ok: false, description: "temporary failure" })],
+	["malformed getChat", () => ({ ok: true, result: {} })],
+])("indeterminate %s retries a forum rename before dispatching later updates", async (_name, getChatFailure) => {
+	const bot = new ReplayRenameBotApi();
+	const { agentDir } = await identityTopicHarness({ bot, ownerId: "creator" });
+	bot.threadId = bot.calls.find(call => call.method === "sendMessage")!.body.message_thread_id;
+	bot.calls = [];
+	bot.getChatFailure = getChatFailure;
+
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "retry",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	await daemon.loadTopics();
+
+	await daemon.pollOnce();
+	const beforePrivacySucceeds = await readTopicAuthorityState(agentDir);
+	expect(beforePrivacySucceeds.topics.S).not.toMatchObject({ nameOwner: "user" });
+	expect(bot.calls.filter(call => call.method === "getUpdates").map(call => call.body.offset)).toEqual([0]);
+
+	await daemon.pollOnce();
+	await daemon.pollOnce();
+	const durableState = await readTopicAuthorityState(agentDir);
+	expect(durableState.topics.S).toMatchObject({
+		name: "Later focus",
+		nameOwner: "user",
+		userNameUpdateId: 51,
+	});
+	expect(bot.calls.filter(call => call.method === "getUpdates").map(call => call.body.offset)).toEqual([0, 0, 52]);
+});
+
+test("remote-success user-name reconciliation retries after its pending-clear write fails", async () => {
+	let successfulTopicWritesBeforeFailure: number | undefined;
+	const fsImpl = topicStateFs(async () => {
+		if (successfulTopicWritesBeforeFailure === undefined) return;
+		if (successfulTopicWritesBeforeFailure > 0) {
+			successfulTopicWritesBeforeFailure--;
+			return;
+		}
+		successfulTopicWritesBeforeFailure = undefined;
+		throw new Error("injected pending-clear write failure");
+	});
+	const firstBot = new FakeBotApi();
+	const {
+		agentDir,
+		daemon: firstDaemon,
+		session,
+		threadId,
+	} = await identityTopicHarness({ bot: firstBot, fs: fsImpl });
+	successfulTopicWritesBeforeFailure = 1;
+	await firstDaemon.handleTelegramUpdate(forumTopicEditedUpdate(44, threadId, "My focus"));
+	expect(firstBot.calls.filter(c => c.method === "editForumTopic").map(c => c.body.name)).toEqual(["My focus"]);
+	const persistedState = await readTopicAuthorityState(agentDir);
+	expect(persistedState.topics.S).toMatchObject({
+		name: "My focus",
+		nameOwner: "user",
+		nameReconcilePending: true,
+	});
+
+	const retryBot = new FakeBotApi();
+	const restarted = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner-2",
+		botToken: "tok",
+		chatId: "42",
+		botApi: retryBot,
+	});
+	await restarted.loadTopics();
+	await restarted.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Later generated title",
+	});
+	expect(retryBot.calls.filter(c => c.method === "editForumTopic").map(c => c.body.name)).toEqual(["My focus"]);
+});
+
+test.each([
+	[
+		"throw",
+		() => {
+			throw new Error("temporary reconciliation failure");
+		},
+	],
+	["ok:false", () => ({ ok: false, description: "temporary reconciliation failure" })],
+])("user-name reconciliation %s remains retryable after restart", async (_name, failure) => {
+	class FailingUserRenameBotApi extends FakeBotApi {
+		override async call(method: string, body: unknown): Promise<unknown> {
+			if (method === "editForumTopic" && (body as { name?: unknown }).name === "My focus") {
+				this.calls.push({ method, body });
+				return failure();
+			}
+			return super.call(method, body);
+		}
+	}
+
+	const failingBot = new FailingUserRenameBotApi();
+	const { agentDir, daemon: firstDaemon, session, threadId } = await identityTopicHarness({ bot: failingBot });
+	await firstDaemon.handleTelegramUpdate(forumTopicEditedUpdate(47, threadId, "My focus"));
+	await firstDaemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Later generated title",
+	});
+
+	const retryBot = new FakeBotApi();
+	const restarted = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner-2",
+		botToken: "tok",
+		chatId: "42",
+		botApi: retryBot,
+	});
+	await restarted.loadTopics();
+	await restarted.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "gajae-code",
+		branch: "dev",
+		title: "Later generated title",
+	});
+	expect(retryBot.calls.filter(c => c.method === "editForumTopic").map(c => c.body.name)).toEqual(["My focus"]);
+});
 test("live sessions with the same repo branch create distinct topics", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
