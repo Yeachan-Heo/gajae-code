@@ -7,7 +7,7 @@ import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
-import { $credentialEnv, hookFetch, Snowflake } from "@gajae-code/utils";
+import { $credentialEnv, getProjectAgentDir, hookFetch, Snowflake } from "@gajae-code/utils";
 
 describe("model roles", () => {
 	test("default is the only built-in model role", () => {
@@ -2710,6 +2710,51 @@ describe("ModelRegistry", () => {
 		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("proxy/executor-selector");
 	});
 
+	test("configured bindings do not copy project-only siblings into runtime or global settings", async () => {
+		const projectDir = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(getProjectAgentDir(projectDir), { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(getProjectAgentDir(projectDir), "config.yml"),
+			"modelRoles:\n  smol: project/smol\ntask:\n  agentModelOverrides:\n    planner: project/planner\n",
+		);
+		writeRawModelsConfig({
+			modelBindings: {
+				modelRoles: { default: "proxy/default-selector" },
+				agentModelOverrides: { executor: "proxy/executor-selector" },
+			},
+		});
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		registry.applyConfiguredModelBindings(settings);
+		expect(settings.get("modelRoles")).toEqual({
+			default: "proxy/default-selector",
+			smol: "project/smol",
+		});
+		expect(settings.getRuntimeOverride("modelRoles")).toEqual({
+			default: "proxy/default-selector",
+		});
+		expect(settings.getWithoutProject("modelRoles")).toEqual({
+			default: "proxy/default-selector",
+		});
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "proxy/executor-selector",
+			planner: "project/planner",
+		});
+		expect(settings.getRuntimeOverride("task.agentModelOverrides")).toEqual({
+			executor: "proxy/executor-selector",
+		});
+		expect(settings.getWithoutProject("task.agentModelOverrides")).toEqual({
+			executor: "proxy/executor-selector",
+		});
+
+		settings.setAgentModelOverride("architect", "user/architect");
+		await settings.flushOrThrow();
+		expect(await Bun.file(path.join(agentDir, "config.yml")).text()).not.toContain("project/planner");
+	});
 	test("defers model bindings until settings are initialized", () => {
 		writeRawModelsConfig({
 			modelBindings: {

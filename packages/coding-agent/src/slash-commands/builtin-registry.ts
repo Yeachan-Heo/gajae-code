@@ -6,7 +6,10 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { Spacer, Text } from "@gajae-code/tui";
 import { setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
-import { materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
+import {
+	materializeActiveModelProfileAssignments,
+	resolveProjectModelProfileShadow,
+} from "../config/model-profile-activation";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
@@ -18,6 +21,7 @@ import {
 	formatModelSelectorValue,
 	parseModelPattern,
 	parseModelString,
+	resolveModelRoleValue,
 } from "../config/model-resolver";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { resolveMemoryBackend } from "../memory-backend";
@@ -32,7 +36,7 @@ import {
 	formatProviderSetupResult,
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
-import { parseThinkingLevel } from "../thinking";
+import { clampModelAssignmentThinkingLevel, parseThinkingLevel } from "../thinking";
 import { getDisplayChangelogEntries } from "../utils/changelog";
 import { buildContextReportText } from "./helpers/context-report";
 import { buildFastStatusReport } from "./helpers/fast-status-report";
@@ -172,11 +176,32 @@ function providerSetupUsage(): string {
 
 function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
 	const agentModelOverrides = runtime.settings.get("task.agentModelOverrides");
+	const activeProfile = runtime.session.getActiveModelProfile?.();
+	const persistedDefault = runtime.settings.getModelRole("default");
+	const liveDefault = runtime.session.model
+		? formatModelSelectorValue(
+				`${runtime.session.model.provider}/${runtime.session.model.id}`,
+				runtime.session.thinkingLevel,
+			)
+		: undefined;
+	let displayedDefault = activeProfile ? liveDefault : persistedDefault;
+	if (!activeProfile && persistedDefault && liveDefault && runtime.session.model) {
+		const resolvedDefault = resolveModelRoleValue(persistedDefault, runtime.session.modelRegistry.getAll(), {
+			settings: runtime.settings,
+			modelRegistry: runtime.session.modelRegistry,
+		});
+		const inheritedEffort =
+			resolvedDefault.model &&
+			modelsAreEqual(resolvedDefault.model, runtime.session.model) &&
+			extractExplicitThinkingSelector(persistedDefault, runtime.settings) === undefined;
+		if (inheritedEffort && liveDefault !== persistedDefault) {
+			displayedDefault = `${persistedDefault} (effective: ${liveDefault})`;
+		}
+	}
 	const lines = ["Model assignments:"];
 	for (const targetId of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 		const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
-		const modelSelector =
-			target.settingsPath === "modelRoles" ? runtime.settings.getModelRole(targetId) : agentModelOverrides[targetId];
+		const modelSelector = targetId === "default" ? displayedDefault : agentModelOverrides[targetId];
 		lines.push(`  ${target.tag ?? target.id.toUpperCase()} (${target.name}): ${modelSelector ?? "(unset)"}`);
 	}
 	return lines.join("\n");
@@ -355,10 +380,64 @@ function getModelAssignmentTargetIds(
 	return [targetId];
 }
 
+function formatProjectModelRestartNotice(
+	runtime: SlashCommandRuntime,
+	targetIds: readonly GjcModelAssignmentTargetId[],
+): string {
+	const projectModelRoles = runtime.settings.getProject("modelRoles") ?? {};
+	const projectAgentOverrides = runtime.settings.getProject("task.agentModelOverrides") ?? {};
+	const projectProfile = resolveProjectModelProfileShadow(runtime.settings, runtime.session.modelRegistry);
+	const shadowed = targetIds.filter(targetId => {
+		const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
+		const direct =
+			target.settingsPath === "modelRoles" ? projectModelRoles[targetId] : projectAgentOverrides[targetId];
+		return direct !== undefined || projectProfile?.targetIds.includes(targetId) === true;
+	});
+	if (shadowed.length === 0) return "";
+	const labels = shadowed.map(targetId => GJC_MODEL_ASSIGNMENT_TARGETS[targetId].tag ?? targetId.toUpperCase());
+	return `\nProject settings for ${labels.join(", ")} resume on restart.`;
+}
+
+function resolveDefaultModelThinking(
+	runtime: SlashCommandRuntime,
+	model: Model,
+	selectedThinkingLevel: ThinkingLevel | undefined,
+): { effective: ThinkingLevel | undefined; persisted: ThinkingLevel | undefined } {
+	const configuredDefault = runtime.settings.get("defaultThinkingLevel");
+	const existingExplicit = extractExplicitThinkingSelector(runtime.settings.getModelRole("default"), runtime.settings);
+	const activeProfile = runtime.session.getActiveModelProfile?.() !== undefined;
+	const inherited = activeProfile
+		? (runtime.session.thinkingLevel ?? configuredDefault)
+		: (existingExplicit ?? configuredDefault);
+	const persisted = clampModelAssignmentThinkingLevel(
+		model,
+		selectedThinkingLevel === undefined ? (activeProfile ? inherited : existingExplicit) : selectedThinkingLevel,
+	);
+	const effective = clampModelAssignmentThinkingLevel(
+		model,
+		selectedThinkingLevel === ThinkingLevel.Inherit ? configuredDefault : (selectedThinkingLevel ?? inherited),
+	);
+	return { effective, persisted };
+}
+
 function formatModelAssignmentSuccess(
 	targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId,
-	selector: string,
+	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string>,
 ): string {
+	const targetIds = getModelAssignmentTargetIds(targetId);
+	const assigned = targetIds
+		.map(id => [id, assignments.get(id)] as const)
+		.filter((entry): entry is readonly [GjcModelAssignmentTargetId, string] => entry[1] !== undefined);
+	const selector = assigned[0]?.[1] ?? "(unset)";
+	const hasMixedSelectors = new Set(assigned.map(([, value]) => value)).size > 1;
+
+	if ((targetId === "all-role-agents" || targetId === "all-targets") && hasMixedSelectors) {
+		const heading = targetId === "all-role-agents" ? "Role-agent models updated:" : "All model targets updated:";
+		return [
+			heading,
+			...assigned.map(([id, value]) => `  ${GJC_MODEL_ASSIGNMENT_TARGETS[id].tag ?? id.toUpperCase()}: ${value}`),
+		].join("\n");
+	}
 	if (targetId === "all-role-agents") {
 		return `Role-agent models set to ${selector} for EXECUTOR, ARCHITECT, PLANNER, CRITIC.`;
 	}
@@ -367,6 +446,24 @@ function formatModelAssignmentSuccess(
 	}
 	if (targetId === "default") return `Default model set to ${selector}.`;
 	return `${targetId} agent model set to ${selector}.`;
+}
+function notifyModelAssignmentCommitted(runtime: SlashCommandRuntime, options: { titleChanged: boolean }): void {
+	const notify = (label: "title" | "config", callback: (() => Promise<void> | void) | undefined): void => {
+		if (!callback) return;
+		void Promise.resolve()
+			.then(() => callback())
+			.catch(error =>
+				Promise.resolve()
+					.then(() =>
+						runtime.output(
+							`Model settings were updated, but notification failed (${label}: ${errorMessage(error)}).`,
+						),
+					)
+					.catch(() => {}),
+			);
+	};
+	if (options.titleChanged) notify("title", runtime.notifyTitleChanged);
+	notify("config", runtime.notifyConfigChanged);
 }
 
 function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: string): string {
@@ -560,13 +657,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 
 					const overrides = runtime.settings.get("task.agentModelOverrides");
 					const assignments = new Map<GjcModelAssignmentTargetId, string>();
-					const existingDefaultThinkingLevel =
-						selection.thinkingLevel !== undefined
-							? selection.thinkingLevel
-							: runtime.session.getActiveModelProfile?.()
-								? undefined
-								: extractExplicitThinkingSelector(runtime.settings.getModelRole("default"), runtime.settings);
-					const persistedSelector = formatModelSelectorValue(selection.selector, existingDefaultThinkingLevel);
+					const defaultThinking = includesDefault
+						? resolveDefaultModelThinking(runtime, selection.model, selection.thinkingLevel)
+						: undefined;
+					const persistedSelector = formatModelSelectorValue(selection.selector, defaultThinking?.persisted);
 					for (const targetId of targetIds) {
 						if (targetId === "default") {
 							assignments.set(targetId, persistedSelector);
@@ -574,16 +668,22 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						}
 						const thinkingLevel =
 							selection.thinkingLevel ?? extractExplicitThinkingSelector(overrides[targetId], runtime.settings);
-						assignments.set(targetId, formatModelSelectorValue(selection.selector, thinkingLevel));
+						assignments.set(
+							targetId,
+							formatModelSelectorValue(
+								selection.selector,
+								clampModelAssignmentThinkingLevel(selection.model, thinkingLevel),
+							),
+						);
 					}
 
 					if (includesDefault) {
 						await runtime.session.setModel(selection.model, "default", {
 							selector: selection.selector,
-							thinkingLevel: existingDefaultThinkingLevel,
+							thinkingLevel: defaultThinking?.persisted,
 						});
-						if (existingDefaultThinkingLevel) {
-							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
+						if (defaultThinking?.effective !== undefined && defaultThinking.effective !== ThinkingLevel.Inherit) {
+							runtime.session.setThinkingLevel(defaultThinking.effective);
 						}
 					}
 
@@ -594,8 +694,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					});
 					if (!materializedProfile) {
 						for (const [targetId, selector] of assignments) {
-							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
-							if (target.settingsPath === "modelRoles") {
+							if (targetId === "default") {
 								runtime.settings.setModelRole(targetId, selector);
 							} else {
 								runtime.settings.setAgentModelOverride(targetId, selector);
@@ -603,14 +702,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						}
 					}
 					runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
-					await runtime.output(
-						formatModelAssignmentSuccess(
-							parsedArgs.targetId,
-							assignments.get(targetIds[0] ?? "default") ?? persistedSelector,
-						),
-					);
-					if (includesDefault) await runtime.notifyTitleChanged?.();
-					await runtime.notifyConfigChanged?.();
+					const success = formatModelAssignmentSuccess(parsedArgs.targetId, assignments);
+					const projectRestartNotice = formatProjectModelRestartNotice(runtime, targetIds);
+					await runtime.output(success + projectRestartNotice);
+					notifyModelAssignmentCommitted(runtime, { titleChanged: includesDefault });
 					return commandConsumed();
 				} catch (err) {
 					return usage(`Failed to set model: ${errorMessage(err)}`, runtime);

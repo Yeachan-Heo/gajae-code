@@ -1702,7 +1702,7 @@ export class ModelRegistry {
 		const targetSettings = this.#modelBindingsTargetSettings;
 		if (!targetSettings) return;
 		const bindings = this.#configuredModelBindings;
-		const nextModelRoles = { ...targetSettings.get("modelRoles") };
+		const nextModelRoles = { ...(targetSettings.getRuntimeOverride("modelRoles") ?? {}) };
 		const configuredModelRoles = bindings?.modelRoles ?? {};
 		const configuredModelRoleKeys = new Set(Object.keys(configuredModelRoles));
 		for (const role of this.#appliedModelBindingRoles) {
@@ -1733,7 +1733,9 @@ export class ModelRegistry {
 		targetSettings.override("modelRoles", nextModelRoles);
 		this.#appliedModelBindingRoles = new Set(Object.keys(configuredModelRoles));
 
-		const nextAgentModelOverrides = { ...targetSettings.get("task.agentModelOverrides") };
+		const nextAgentModelOverrides = {
+			...(targetSettings.getRuntimeOverride("task.agentModelOverrides") ?? {}),
+		};
 		const configuredAgentModelOverrides = bindings?.agentModelOverrides ?? {};
 		const configuredAgentModelOverrideKeys = new Set(Object.keys(configuredAgentModelOverrides));
 		for (const agentName of this.#appliedAgentModelBindingOverrides) {

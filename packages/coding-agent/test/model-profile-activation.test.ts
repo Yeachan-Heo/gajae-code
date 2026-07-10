@@ -1,4 +1,7 @@
 import { describe, expect, it, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import {
@@ -8,11 +11,12 @@ import {
 	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
 	prepareModelProfileActivation,
+	resolveProjectModelProfileShadow,
 } from "../src/config/model-profile-activation";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import type { ModelRegistry } from "../src/config/model-registry";
-import { Settings } from "../src/config/settings";
+import { resetSettingsForTest, Settings } from "../src/config/settings";
 
 const model = (provider: string, id: string, thinking?: Model["thinking"]): Model =>
 	({
@@ -90,23 +94,40 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 	};
 }
 
-function fakeSession(initial = model("provider-a", "initial")) {
+function fakeSession(initial = model("provider-a", "initial"), initialResumeDefault?: string) {
 	let activeModelProfile: string | undefined;
+	let resumeDefault = initialResumeDefault;
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
-		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
+		resumeDefaultChanges: [] as string[],
+		async setModelTemporary(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			options?: { persistAsSessionDefault?: boolean },
+		) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
 			this.thinkingLevel = thinkingLevel;
+			if (options?.persistAsSessionDefault) {
+				resumeDefault = `${next.provider}/${next.id}`;
+				this.resumeDefaultChanges.push(resumeDefault);
+			}
 		},
 		setActiveModelProfile(name: string | undefined) {
 			activeModelProfile = name;
 		},
 		getActiveModelProfile() {
 			return activeModelProfile;
+		},
+		getSessionDefaultModelSelector() {
+			return resumeDefault;
+		},
+		recordResumeDefaultModel(selector: string) {
+			resumeDefault = selector;
+			this.resumeDefaultChanges.push(selector);
 		},
 	};
 }
@@ -127,6 +148,24 @@ describe("model profile activation", () => {
 		expect(prepared.agentModelOverrides).toEqual({
 			executor: "provider-b/executor",
 			architect: "provider-a/architect",
+		});
+	});
+	test("project profile shadow resolution honors fallback aliases and partial bindings", () => {
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "codex-medium",
+				requiredProviders: ["provider-a"],
+				modelMapping: { architect: "provider-a/architect" },
+				source: "user",
+			},
+		];
+		const settings = Settings.isolated();
+		settings.getProject = ((path: string) =>
+			path === "modelProfile.default" ? "codex-standard" : undefined) as typeof settings.getProject;
+
+		expect(resolveProjectModelProfileShadow(settings, fakeRegistry({ profiles }))).toEqual({
+			profileName: "codex-medium",
+			targetIds: ["architect"],
 		});
 	});
 
@@ -202,6 +241,53 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
+	test("switching profiles drops omitted assignments back to the pre-profile baseline", async () => {
+		const session = fakeSession(model("provider-c", "default"));
+		const settings = Settings.isolated();
+		settings.set("modelRoles", { default: "provider-c/default:medium" });
+		settings.set("task.agentModelOverrides", {
+			architect: "configured/architect:low",
+			critic: "configured/critic:high",
+		});
+		const registry = fakeRegistry({
+			profiles: [
+				{
+					name: "profile-a",
+					requiredProviders: ["provider-a", "provider-b"],
+					modelMapping: {
+						default: "provider-a/default:high",
+						executor: "provider-b/executor",
+						architect: "provider-a/architect",
+					},
+					source: "user",
+				},
+				{
+					name: "profile-b",
+					requiredProviders: ["provider-c"],
+					modelMapping: {
+						default: "provider-c/default:low",
+						executor: "provider-c/executor",
+					},
+					source: "user",
+				},
+			],
+		});
+
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" });
+		expect(settings.get("task.agentModelOverrides").architect).toBe("provider-a/architect");
+
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-b" });
+
+		expect(session.model?.provider).toBe("provider-c");
+		expect(session.model?.id).toBe("default");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			architect: "configured/architect:low",
+			critic: "configured/critic:high",
+			executor: "provider-c/executor",
+		});
+		expect(session.getActiveModelProfile()).toBe("profile-b");
+	});
+
 	test("materializing a profile role override persists the full effective assignment set and clears the profile", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({
@@ -229,6 +315,213 @@ describe("model profile activation", () => {
 		});
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("materialization persists only leaves changed from the loaded global baseline", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		settings.set("task.agentModelOverrides", { critic: "configured/critic:high" });
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+		const persistedAgents: string[] = [];
+		const originalSetAgentModelOverride = settings.setAgentModelOverride.bind(settings);
+		settings.setAgentModelOverride = (agentName: string, selector: string) => {
+			persistedAgents.push(agentName);
+			originalSetAgentModelOverride(agentName, selector);
+		};
+
+		materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor:medium",
+		});
+
+		expect(persistedAgents).toEqual(["executor", "architect"]);
+		expect(persistedAgents).not.toContain("critic");
+	});
+
+	test("failed profile detachment retains transition state for the next activation", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		const profileA = fakeRegistry().getModelProfile("profile-a");
+		if (!profileA) throw new Error("missing profile-a fixture");
+		const registry = fakeRegistry({
+			profiles: [
+				profileA,
+				{
+					name: "profile-b",
+					requiredProviders: ["provider-c"],
+					modelMapping: {
+						default: "provider-c/default:low",
+						executor: "provider-c/executor",
+					},
+					source: "user",
+				},
+			],
+		});
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" });
+		const setActiveModelProfile = session.setActiveModelProfile.bind(session);
+		session.setActiveModelProfile = (name: string | undefined) => {
+			if (name === undefined) throw new Error("detach failed");
+			setActiveModelProfile(name);
+		};
+
+		expect(() =>
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "critic",
+				selector: "provider-c/critic:low",
+			}),
+		).toThrow("detach failed");
+		expect(session.getActiveModelProfile()).toBe("profile-a");
+
+		session.setActiveModelProfile = setActiveModelProfile;
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-b" });
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-c/executor",
+		});
+	});
+
+	test("role-only materialization persists the active profile default, not a transient live model", async () => {
+		const session = fakeSession(model("provider-c", "default"));
+		const settings = Settings.isolated();
+		settings.set("modelRoles", { default: "configured/default:medium" });
+		settings.set("task.agentModelOverrides", { critic: "configured/critic:high" });
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		session.model = model("provider-c", "architect");
+		session.thinkingLevel = ThinkingLevel.Low;
+		const materialized = materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor:medium",
+		});
+
+		expect(materialized).toBe(true);
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "provider-a/default:high",
+		});
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+			architect: "provider-a/architect",
+			critic: "configured/critic:high",
+			executor: "provider-c/executor:medium",
+		});
+	});
+	test("materialization uses an activation effort override for the active profile DEFAULT", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		await activateModelProfile(
+			{ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" },
+			{ thinkingLevelOverride: ThinkingLevel.Low },
+		);
+
+		expect(
+			materializeActiveModelProfileAssignments({
+				session,
+				settings,
+				assignments: { executor: "provider-c/executor:medium" },
+			}),
+		).toBe(true);
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "provider-a/default:low",
+		});
+	});
+	test("role-only profile detach preserves the exact persisted DEFAULT selector", async () => {
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "role-only",
+				requiredProviders: ["provider-b"],
+				modelMapping: { executor: "provider-b/executor:low" },
+				source: "user",
+			},
+		];
+		const settings = Settings.isolated();
+		settings.set("modelRoles", { default: "configured/resume:high" });
+		const session = fakeSession(model("provider-c", "default"), "provider-c/resume");
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ profiles }),
+			settings,
+			profileName: "role-only",
+		});
+
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "executor",
+				selector: "provider-c/executor:medium",
+			}),
+		).toBe(true);
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "configured/resume:high",
+		});
+	});
+
+	test("suffixless profile DEFAULT remains inherited when detached", async () => {
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "inherits-effort",
+				requiredProviders: ["provider-a"],
+				modelMapping: {
+					default: "provider-a/default",
+					executor: "provider-b/executor:low",
+				},
+				source: "user",
+			},
+		];
+		const settings = Settings.isolated({ defaultThinkingLevel: ThinkingLevel.High });
+		const session = fakeSession();
+		await activateModelProfile(
+			{
+				session,
+				modelRegistry: fakeRegistry({ profiles }),
+				settings,
+				profileName: "inherits-effort",
+			},
+			{ thinkingLevelOverride: ThinkingLevel.High },
+		);
+
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "executor",
+				selector: "provider-c/executor:medium",
+			}),
+		).toBe(true);
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "provider-a/default",
+		});
+		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
+	});
+
+	test("detached sessions do not re-materialize a still-configured project default", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		settings.set("modelProfile.default", "profile-a");
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "executor",
+				selector: "provider-c/executor:medium",
+			}),
+		).toBe(true);
+
+		settings.override("modelProfile.default", "profile-a");
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "critic",
+				selector: "provider-c/architect:low",
+			}),
+		).toBe(false);
 	});
 
 	test("materializing a default override stores the selected default and clears the profile", async () => {
@@ -301,9 +594,168 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
-	test("--default persists profile default, clears persisted assignments, and flushes", async () => {
+	test("switching profiles preserves an explicit role clear instead of resurrecting the saved baseline", async () => {
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "profile-a",
+				requiredProviders: ["provider-a"],
+				modelMapping: { critic: "provider-a/architect" },
+				source: "user",
+			},
+			{
+				name: "profile-b",
+				requiredProviders: ["provider-b"],
+				modelMapping: { executor: "provider-b/executor" },
+				source: "user",
+			},
+		];
+		const settings = Settings.isolated();
+		settings.setAgentModelOverride("critic", "user/critic");
+		settings.override("task.agentModelOverrides", { critic: "user/critic" });
+		const session = fakeSession();
+
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ profiles }),
+			settings,
+			profileName: "profile-a",
+		});
+		settings.clearAgentModelOverride("critic");
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ profiles }),
+			settings,
+			profileName: "profile-b",
+		});
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-b/executor" });
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({});
+	});
+
+	test("materializing one role does not restore another profile role that the user cleared", async () => {
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "profile-a",
+				requiredProviders: ["provider-a", "provider-b"],
+				modelMapping: {
+					architect: "provider-a/architect",
+					executor: "provider-b/executor",
+				},
+				source: "user",
+			},
+		];
+		const settings = Settings.isolated();
+		const session = fakeSession();
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ profiles }),
+			settings,
+			profileName: "profile-a",
+		});
+
+		settings.clearAgentModelOverride("architect");
+		materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor:low",
+		});
+		settings.clearOverride("task.agentModelOverrides");
+
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+			executor: "provider-c/executor:low",
+		});
+	});
+
+	test("failed persisted profile switch detaches to baseline and retries without omitted roles", async () => {
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "profile-a",
+				requiredProviders: ["provider-a"],
+				modelMapping: { architect: "provider-a/architect" },
+				source: "user",
+			},
+			{
+				name: "profile-b",
+				requiredProviders: ["provider-b"],
+				modelMapping: { executor: "provider-b/executor" },
+				source: "user",
+			},
+		];
+		const registry = fakeRegistry({ profiles });
+		const settings = Settings.isolated();
+		const session = fakeSession();
+		await activateModelProfile(
+			{ session, modelRegistry: registry, settings, profileName: "profile-a" },
+			{ persistDefault: true },
+		);
+		const durableFlush = settings.flushOrThrow.bind(settings);
+		let failOnce = true;
+		settings.flushOrThrow = async () => {
+			if (failOnce) {
+				failOnce = false;
+				throw new Error("flush failed");
+			}
+			await durableFlush();
+		};
+
+		await expect(
+			activateModelProfile(
+				{ session, modelRegistry: registry, settings, profileName: "profile-b" },
+				{ persistDefault: true },
+			),
+		).rejects.toThrow("flush failed");
+		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(settings.get("task.agentModelOverrides")).toEqual({});
+
+		await activateModelProfile(
+			{ session, modelRegistry: registry, settings, profileName: "profile-b" },
+			{ persistDefault: true },
+		);
+		expect(session.getActiveModelProfile()).toBe("profile-b");
+		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-b/executor" });
+		expect(settings.get("task.agentModelOverrides").architect).toBeUndefined();
+	});
+
+	test("role-only switching preserves the pre-profile resume default and configured effort", async () => {
+		const transientModel = model("provider-c", "default");
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "profile-a",
+				requiredProviders: ["provider-a"],
+				modelMapping: { default: "provider-a/default:high" },
+				source: "user",
+			},
+			{
+				name: "role-only-b",
+				requiredProviders: ["provider-b"],
+				modelMapping: { executor: "provider-b/executor:low" },
+				source: "user",
+			},
+		];
+		const settings = Settings.isolated();
+		settings.set("defaultThinkingLevel", ThinkingLevel.Medium);
+		const session = fakeSession(transientModel, "provider-a/resume");
+		session.thinkingLevel = ThinkingLevel.XHigh;
+		const registry = fakeRegistry({ profiles });
+
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" });
+		await activateModelProfile(
+			{ session, modelRegistry: registry, settings, profileName: "role-only-b" },
+			{ persistDefault: true },
+		);
+
+		expect(session.model).toBe(transientModel);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(session.getSessionDefaultModelSelector()).toBe("provider-a/resume");
+		expect(settings.getGlobal("defaultThinkingLevel")).toBe(ThinkingLevel.Medium);
+	});
+
+	test("--default persists the profile while retaining inherited role defaults", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated();
+		settings.set("modelRoles", { default: "configured/default" });
+		settings.set("task.agentModelOverrides", { critic: "configured/critic" });
 		const setCalls: string[] = [];
 		const originalSet = settings.set.bind(settings);
 		settings.set = ((path: never, value: never) => {
@@ -311,7 +763,7 @@ describe("model profile activation", () => {
 			return originalSet(path, value);
 		}) as typeof settings.set;
 		let flushCount = 0;
-		settings.flush = async () => {
+		settings.flushOrThrow = async () => {
 			flushCount += 1;
 		};
 
@@ -320,16 +772,136 @@ describe("model profile activation", () => {
 			{ persistDefault: true },
 		);
 
-		expect(setCalls).toEqual([
-			"modelRoles",
-			"task.agentModelOverrides",
-			"defaultThinkingLevel",
-			"modelProfile.default",
-		]);
+		expect(setCalls).toEqual(["defaultThinkingLevel", "modelProfile.default"]);
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "configured/default" });
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({ critic: "configured/critic" });
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
 		expect(settings.get("modelProfile.default")).toBe("profile-a");
 		expect(flushCount).toBe(1);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
+	});
+
+	test("role-only profile effort remains consistent after durable restart", async () => {
+		const baselineModel = model("openai-codex", "gpt-5.6-sol", {
+			mode: "effort",
+			minLevel: ThinkingLevel.Low,
+			maxLevel: ThinkingLevel.Max,
+		});
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "profile-a",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { default: "openai-codex/gpt-5.6-sol:xhigh" },
+				source: "user",
+			},
+			{
+				name: "role-only-b",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { executor: "openai-codex/gpt-5.6-terra:low" },
+				source: "user",
+			},
+		];
+		const registry = fakeRegistry({ profiles });
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-role-only-profile-"));
+		try {
+			const session = fakeSession(baselineModel);
+			const settings = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			settings.set("defaultThinkingLevel", ThinkingLevel.Low);
+			await settings.flushOrThrow();
+
+			await activateModelProfile(
+				{ session, modelRegistry: registry, settings, profileName: "profile-a" },
+				{ persistDefault: true },
+			);
+			expect(session.thinkingLevel).toBe(ThinkingLevel.XHigh);
+
+			await activateModelProfile(
+				{ session, modelRegistry: registry, settings, profileName: "role-only-b" },
+				{ persistDefault: true },
+			);
+			expect(session.model).toBe(baselineModel);
+			expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+			expect(settings.getGlobal("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
+			expect(settings.getGlobal("modelProfile.default")).toBe("role-only-b");
+
+			resetSettingsForTest();
+			const restartedSettings = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			const restartedProfile = restartedSettings.getGlobal("modelProfile.default");
+			if (!restartedProfile) throw new Error("Expected persisted model profile");
+			const restartedSession = fakeSession(baselineModel);
+			restartedSession.thinkingLevel = restartedSettings.get("defaultThinkingLevel");
+			await activateModelProfile(
+				{
+					session: restartedSession,
+					modelRegistry: registry,
+					settings: restartedSettings,
+					profileName: restartedProfile,
+				},
+				{ thinkingLevelOverride: restartedSettings.get("defaultThinkingLevel") },
+			);
+
+			expect(restartedProfile).toBe("role-only-b");
+			expect(restartedSettings.getGlobal("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
+			expect(restartedSession.model).toBe(baselineModel);
+			expect(restartedSession.thinkingLevel).toBe(ThinkingLevel.Low);
+			expect(restartedSession.getActiveModelProfile()).toBe("role-only-b");
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	test("an effort-less profile switch applies the configured default after a non-reasoning session and survives restart", async () => {
+		const profiles: ModelProfileDefinition[] = [
+			{
+				name: "implicit-effort",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { default: "openai-codex/gpt-5.6-sol" },
+				source: "user",
+			},
+		];
+		const registry = fakeRegistry({ profiles });
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-implicit-profile-effort-"));
+		try {
+			const session = fakeSession(model("provider-c", "non-reasoning"));
+			session.thinkingLevel = undefined;
+			const settings = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			settings.set("defaultThinkingLevel", ThinkingLevel.High);
+			await settings.flushOrThrow();
+
+			await activateModelProfile(
+				{ session, modelRegistry: registry, settings, profileName: "implicit-effort" },
+				{ persistDefault: true },
+			);
+
+			expect(session.model?.id).toBe("gpt-5.6-sol");
+			expect(session.thinkingLevel as ThinkingLevel | undefined).toBe(ThinkingLevel.High);
+			expect(settings.getGlobal("defaultThinkingLevel")).toBe(ThinkingLevel.High);
+			expect(settings.getGlobal("modelProfile.default")).toBe("implicit-effort");
+
+			resetSettingsForTest();
+			const restartedSettings = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			const restartedProfile = restartedSettings.getGlobal("modelProfile.default");
+			if (!restartedProfile) throw new Error("Expected persisted model profile");
+			const restartedSession = fakeSession(model("provider-c", "non-reasoning"));
+			restartedSession.thinkingLevel = undefined;
+
+			await activateModelProfile(
+				{
+					session: restartedSession,
+					modelRegistry: registry,
+					settings: restartedSettings,
+					profileName: restartedProfile,
+				},
+				{ thinkingLevelOverride: restartedSettings.get("defaultThinkingLevel") },
+			);
+
+			expect(restartedSettings.getGlobal("defaultThinkingLevel")).toBe(ThinkingLevel.High);
+			expect(restartedSession.model?.id).toBe("gpt-5.6-sol");
+			expect(restartedSession.thinkingLevel as ThinkingLevel | undefined).toBe(ThinkingLevel.High);
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	test("missing credentials hard-block before mutation", async () => {
@@ -372,7 +944,35 @@ describe("model profile activation", () => {
 		).rejects.toThrow('Unknown model profile "missing". Available profiles: alpha, beta');
 	});
 
-	test("apply rolls back runtime changes when persistence throws", async () => {
+	test("rolls back when setModelTemporary mutates before rejecting", async () => {
+		const initialModel = model("provider-c", "default");
+		const session = fakeSession(initialModel, "provider-c/resume");
+		session.thinkingLevel = ThinkingLevel.Low;
+		const originalSetModelTemporary = session.setModelTemporary.bind(session);
+		let rejectAfterMutation = true;
+		session.setModelTemporary = async (next, thinkingLevel, options) => {
+			await originalSetModelTemporary(next, thinkingLevel, options);
+			if (rejectAfterMutation) {
+				rejectAfterMutation = false;
+				throw new Error("prompt refresh failed");
+			}
+		};
+
+		await expect(
+			activateModelProfile({
+				session,
+				modelRegistry: fakeRegistry(),
+				settings: Settings.isolated(),
+				profileName: "profile-a",
+			}),
+		).rejects.toThrow("prompt refresh failed");
+
+		expect(session.model).toBe(initialModel);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+		expect(session.getSessionDefaultModelSelector()).toBe("provider-c/resume");
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+	test("detaches an ambiguous persisted activation without stale compensation", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({
 			"task.agentModelOverrides": { executor: "provider-a/original" },
@@ -384,7 +984,7 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		settings.flush = async () => {
+		settings.flushOrThrow = async () => {
 			throw new Error("flush failed");
 		};
 
@@ -395,8 +995,8 @@ describe("model profile activation", () => {
 		expect(session.model?.id).toBe("initial");
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
-		expect(settings.get("modelProfile.default")).toBeUndefined();
-		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
+		expect(settings.get("modelProfile.default")).toBe("profile-a");
+		expect(settings.getGlobal("defaultThinkingLevel")).toBe(ThinkingLevel.High);
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 

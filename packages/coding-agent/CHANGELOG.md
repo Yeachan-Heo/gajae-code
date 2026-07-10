@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Fixed `/model` and Agent Control Center role assignments so DEFAULT, EXECUTOR, ARCHITECT, PLANNER, and CRITIC update their effective runtime/project-shadowed values, TUI badges, and persisted per-role settings without replacing sibling assignments.
+- Fixed active-profile role edits, omitted-role profile switches, role-only profile effort across restart, truthful mixed-effort output, and model-setting commands blocking on nonsettling notification transports.
 
 ### Changed
 

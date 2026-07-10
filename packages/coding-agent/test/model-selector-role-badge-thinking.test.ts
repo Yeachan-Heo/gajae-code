@@ -504,6 +504,7 @@ describe("ModelSelector canonical model selection", () => {
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 
 		const selectedAfterThinking = selected;
@@ -514,6 +515,33 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
 	});
 
+	test("can explicitly choose inherit for OpenAI reasoning default models", async () => {
+		installTestTheme();
+		const model = createOpenAIModel("openai", "gpt-reasoning-inherit-test");
+		const settings = Settings.isolated({});
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+
+		const selectedAfterThinking = selected;
+		if (!selectedAfterThinking) throw new Error("Expected OpenAI selection after inherit choice");
+		expect(selectedAfterThinking.role).toBe("default");
+		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.Inherit);
+		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
+	});
 	test("can explicitly choose off for OpenAI reasoning default models", async () => {
 		installTestTheme();
 		const model = createOpenAIModel("openai", "gpt-reasoning-off-test");
@@ -533,6 +561,7 @@ describe("ModelSelector canonical model selection", () => {
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 
 		const selectedAfterThinking = selected;
@@ -567,6 +596,7 @@ describe("ModelSelector canonical model selection", () => {
 		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(thinkingRendered).toContain("Reasoning for Executor");
 
+		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
