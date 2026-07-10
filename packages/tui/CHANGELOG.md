@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Real interactive terminals now repaint only the live viewport when streaming changes touch off-screen transcript lines, preventing full clear/replay cycles from jumping native scrollback upward or snapping it back to the prompt without relying on terminal-name allowlists.
+- Live-following viewports now repaint newly exposed transcript rows when a transient middle panel contracts, preventing blank rows and delayed snap-back after temporary output disappears.
+
 ## [0.9.4] - 2026-07-09
 
 ### Fixed

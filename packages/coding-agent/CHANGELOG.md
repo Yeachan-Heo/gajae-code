@@ -4,6 +4,7 @@
 ### Fixed
 
 - ACP permission prompts now honor `clientCapabilities._meta.gjc.permissionHandling` and the `GJC_ACP_PERMISSION_MODE` fallback, so `auto` and `always-allow` no longer emit `session/request_permission` calls while invalid values fail safely to `prompt`.
+- Complete bracketed-paste input now returns a manually paged transcript to live output before inserting or consuming the paste, preventing the viewport from remaining stuck above ongoing output.
 ### Added
 
 - ACP clients now receive GJC automatic-compaction start/end state through additive `session_info_update` metadata, including the compaction action, trigger, retry/abort/error outcome, and busy-to-idle phase transitions.

@@ -28,6 +28,10 @@ class Lines implements Component {
 	invalidate(): void {}
 }
 
+class ProcessVirtualTerminal extends VirtualTerminal {
+	readonly isProcessTerminal = true;
+}
+
 async function settle(term: VirtualTerminal): Promise<void> {
 	await term.waitForRender();
 }
@@ -126,6 +130,34 @@ describe("TUI manual viewport paging", () => {
 		}
 	});
 
+	it("repaints newly exposed rows when a transient middle panel contracts", async () => {
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const content = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
+		const transientPanel = new Lines(["panel-0", "panel-1"]);
+		const status = new Lines(["status"]);
+		const editor = new Lines(["editor"]);
+		tui.addChild(content);
+		tui.addChild(transientPanel);
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-10", "line-11", "panel-0", "panel-1", "status", "editor"]);
+
+			transientPanel.replace([]);
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-8", "line-9", "line-10", "line-11", "status", "editor"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("keeps Windows Terminal pinned when a normal assistant answer starts before status/editor", async () => {
 		const term = new VirtualTerminal(30, 6);
 		const tui = new TUI(term);
@@ -199,6 +231,30 @@ describe("TUI manual viewport paging", () => {
 			} else {
 				Bun.env.WT_SESSION = previousWtSession;
 			}
+		}
+	});
+
+	it("keeps real process terminal output pinned when offscreen lines change during streaming", async () => {
+		const term = new ProcessVirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		const content = new Lines(["status-0", ...Array.from({ length: 11 }, (_value, index) => `line-${index}`)]);
+		tui.addChild(content);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-6", "line-7", "line-8", "line-9", "line-10"]);
+			term.clearWriteLog();
+
+			content.setLine(0, "status-1");
+			content.append("line-11");
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-7", "line-8", "line-9", "line-10", "line-11"]);
+			expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
+		} finally {
+			tui.stop();
 		}
 	});
 

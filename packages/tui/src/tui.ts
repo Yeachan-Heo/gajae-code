@@ -184,36 +184,48 @@ function isViewportSensitiveHost(
 	env: Record<string, string | undefined>,
 	platform: NodeJS.Platform,
 	includeNativeWindows: boolean,
+	includeProcessTerminal: boolean,
 ): boolean {
-	return isMultiplexerSession(env) || isWindowsTerminalSession(env) || (includeNativeWindows && platform === "win32");
+	return (
+		isMultiplexerSession(env) ||
+		isWindowsTerminalSession(env) ||
+		includeProcessTerminal ||
+		(includeNativeWindows && platform === "win32")
+	);
 }
 /**
  * True when repainting only the live viewport is safer than clearing/replaying
- * the full transcript. Native Windows console hosts are included even when
- * WT_SESSION is absent because PowerShell/ConPTY launch chains can drop terminal
- * identity variables while keeping the same scroll-jump behavior.
+ * the full transcript. Real process terminals are viewport-sensitive because
+ * their native scrollback position is not observable by the renderer; clearing
+ * and replaying while output streams can move the user's viewport. Native
+ * Windows console hosts are also recognized from platform identity when the
+ * process-terminal capability is unavailable.
  */
 export function shouldUseViewportRepaintForHost(
 	env: Record<string, string | undefined> = Bun.env,
 	platform: NodeJS.Platform = process.platform,
-	options: { includeNativeWindows?: boolean } = {},
+	options: { includeNativeWindows?: boolean; includeProcessTerminal?: boolean } = {},
 ): boolean {
 	const multiplexed = isMultiplexerSession(env);
 	const includeNativeWindows = options.includeNativeWindows ?? true;
+	const includeProcessTerminal = options.includeProcessTerminal ?? false;
 	return (
-		isViewportSensitiveHost(env, platform, includeNativeWindows) &&
+		isViewportSensitiveHost(env, platform, includeNativeWindows, includeProcessTerminal) &&
 		!(multiplexed && useLegacyMultiplexerFullRender(env))
 	);
 }
 
 function useViewportRepaintPath(terminal: Terminal): boolean {
+	const isProcessTerminal = terminal.isProcessTerminal === true;
 	return shouldUseViewportRepaintForHost(Bun.env, process.platform, {
-		includeNativeWindows: terminal.isProcessTerminal === true,
+		includeNativeWindows: isProcessTerminal,
+		includeProcessTerminal: isProcessTerminal,
 	});
 }
 
 function shouldPreserveScrollbackOnFullClear(terminal: Terminal): boolean {
-	return isViewportSensitiveHost(Bun.env, process.platform, terminal.isProcessTerminal === true);
+	const isProcessTerminal = terminal.isProcessTerminal === true;
+	return isViewportSensitiveHost(Bun.env, process.platform, isProcessTerminal, isProcessTerminal);
 }
 
 /**
@@ -1921,8 +1933,12 @@ export class TUI extends Container {
 		}
 
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
-		if (firstChanged >= newLines.length && nextLiveViewportTop !== prevViewportTop) {
-			viewportRepaint(`tail shrink changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
+		if (
+			newLines.length >= height &&
+			newLines.length < this.#previousLines.length &&
+			nextLiveViewportTop !== prevViewportTop
+		) {
+			viewportRepaint(`content contraction changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
 			return;
 		}
 		// All changes are in deleted lines (nothing to render, just clear)

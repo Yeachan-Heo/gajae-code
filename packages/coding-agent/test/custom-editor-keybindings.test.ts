@@ -270,6 +270,18 @@ describe("CustomEditor viewport paging", () => {
 		expect(onViewportFollowLive).toHaveBeenCalledTimes(1);
 		expect(editor.getText()).toBe("a");
 	});
+
+	it("returns the transcript viewport to live output before bracketed paste", () => {
+		const editor = createEditor();
+		const onViewportFollowLive = vi.fn();
+		editor.onViewportFollowLive = onViewportFollowLive;
+		editor.onPasteText = vi.fn(() => false);
+
+		editor.handleInput("\x1b[200~pasted text\x1b[201~");
+
+		expect(onViewportFollowLive).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("pasted text");
+	});
 });
 
 describe("CustomEditor pasteImage default sourced from KEYBINDINGS", () => {

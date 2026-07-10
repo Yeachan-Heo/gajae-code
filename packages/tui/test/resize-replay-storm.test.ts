@@ -27,6 +27,10 @@ import { VirtualTerminal } from "./virtual-terminal";
 
 const COLS = 100;
 
+class ProcessVirtualTerminal extends VirtualTerminal {
+	readonly isProcessTerminal = true;
+}
+
 async function buildTranscript(tui: TUI, term: VirtualTerminal, count: number): Promise<void> {
 	for (let i = 0; i < count; i++) {
 		tui.addChild(new Text(`L${i}:${"x".repeat(20)}`, 1, 0));
@@ -43,6 +47,15 @@ describe("multiplexer resize replay storm regression", () => {
 	describe("viewport-sensitive host detection", () => {
 		it("uses viewport repaint for native Windows even when WT_SESSION is missing", () => {
 			expect(shouldUseViewportRepaintForHost({ TERM: "xterm-256color" }, "win32")).toBe(true);
+		});
+
+		it("uses viewport repaint for real process terminals", () => {
+			expect(
+				shouldUseViewportRepaintForHost({ TERM: "xterm-256color" }, "darwin", {
+					includeNativeWindows: false,
+					includeProcessTerminal: true,
+				}),
+			).toBe(true);
 		});
 
 		it("keeps the legacy full-render opt-in scoped to multiplexers", () => {
@@ -117,6 +130,32 @@ describe("multiplexer resize replay storm regression", () => {
 			expect(out).toContain("\x1b[29A\r");
 
 			tui.stop();
+		});
+
+		it("keeps the explicit multiplexer legacy replay for process terminals", async () => {
+			const previousLegacy = Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = "1";
+			const term = new ProcessVirtualTerminal(COLS, 30);
+			const tui = new TUI(term);
+
+			try {
+				tui.start();
+				await term.waitForRender();
+				await buildTranscript(tui, term, 60);
+				term.clearWriteLog();
+
+				tui.requestRender(true, "test.process.legacy-force");
+				await term.waitForRender();
+
+				const out = term.getWriteLog().join("");
+				expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+				expect(out).toContain("\x1b[2J\x1b[H");
+				expect(out).not.toContain("\x1b[3J");
+			} finally {
+				tui.stop();
+				if (previousLegacy === undefined) delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+				else Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = previousLegacy;
+			}
 		});
 		it("viewport-only repaint on a width+height resize (the case from the blocking review)", async () => {
 			const term = new VirtualTerminal(COLS, 30);
@@ -375,6 +414,25 @@ describe("multiplexer resize replay storm regression", () => {
 				expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
 				expect(out).toContain("\x1b[3J");
 			}
+
+			tui.stop();
+		});
+
+		it("bounds forced redraws to the viewport for real process terminals", async () => {
+			const term = new ProcessVirtualTerminal(COLS, 30);
+			const tui = new TUI(term);
+			tui.start();
+			await term.waitForRender();
+
+			await buildTranscript(tui, term, 60);
+			term.clearWriteLog();
+
+			tui.requestRender(true, "test.process.force");
+			await term.waitForRender();
+
+			const out = term.getWriteLog().join("");
+			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+			expect(out).not.toContain("\x1b[2J\x1b[H");
 
 			tui.stop();
 		});
