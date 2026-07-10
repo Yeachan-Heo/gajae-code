@@ -28,7 +28,14 @@ describe("Settings", () => {
 		fs.mkdirSync(getProjectAgentDir(projectDir), { recursive: true });
 	});
 
-	const getConfigPath = () => path.join(agentDir, "config.yml");
+	const getConfigPath = () => path.join(fs.realpathSync.native(agentDir), "config.yml");
+	const isConfigWritePath = (value: unknown): boolean =>
+		typeof value === "string" &&
+		value.startsWith(`${getConfigPath()}.`) &&
+		value.endsWith(".tmp") &&
+		!value.startsWith(`${getConfigPath()}.revisions.json.`);
+	const isRevisionWritePath = (value: unknown): boolean =>
+		typeof value === "string" && value.startsWith(`${getConfigPath()}.revisions.json.`) && value.endsWith(".tmp");
 
 	const writeSettings = async (settings: Record<string, unknown>) => {
 		await Bun.write(getConfigPath(), YAML.stringify(settings, null, 2));
@@ -420,6 +427,77 @@ describe("Settings", () => {
 			});
 		});
 
+		it("does not roll back over a later equal-value write from another Settings instance", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			const settingsA = await Settings.init({ cwd: projectDir, agentDir });
+			const settingsB = await settingsA.cloneForCwd(projectDir);
+
+			settingsB.setAgentModelOverride("architect", "equal/architect");
+			await settingsB.flushOrThrow();
+			settingsA.setAgentModelOverrideIfUnchanged("architect", "original/architect", "equal/architect");
+			await settingsA.flushOrThrow();
+			settingsA.setAgentModelOverrideIfUnchanged("architect", "equal/architect", "original/architect");
+			await settingsA.flushOrThrow();
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ cwd: projectDir, agentDir });
+			expect(reopened.getGlobal("task.agentModelOverrides")).toEqual({
+				architect: "equal/architect",
+			});
+		});
+
+		it("rotates ownership for explicit equal-value writes and absent clears", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "equal/architect" } },
+			});
+			const settingsA = await Settings.init({ cwd: projectDir, agentDir });
+			const settingsB = await settingsA.cloneForCwd(projectDir);
+
+			settingsB.setAgentModelOverride("architect", "equal/architect");
+			settingsB.clearAgentModelOverride("planner");
+			await settingsB.flushOrThrow();
+			settingsA.setAgentModelOverrideIfUnchanged("architect", "equal/architect", "profile/architect");
+			settingsA.setAgentModelOverrideIfUnchanged("planner", undefined, "profile/planner");
+			await settingsA.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "equal/architect" },
+			});
+		});
+
+		it("does not invert over a later equal explicit write from the same Settings instance", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			settings.setAgentModelOverrideIfUnchanged("architect", "original/architect", "equal/architect");
+			await settings.flushOrThrow();
+			settings.setAgentModelOverride("architect", "equal/architect");
+			await settings.flushOrThrow();
+			settings.setAgentModelOverrideIfUnchanged("architect", "equal/architect", "original/architect");
+			await settings.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "equal/architect" },
+			});
+		});
+
+		it("does not replace a pending equal explicit profile with an inverse conditional", async () => {
+			await writeSettings({ modelProfile: { default: "original-profile" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			settings.setModelProfileDefaultIfUnchanged("original-profile", "equal-profile");
+			await settings.flushOrThrow();
+			settings.set("modelProfile.default", "equal-profile");
+			settings.setModelProfileDefaultIfUnchanged("equal-profile", "original-profile");
+			await settings.flushOrThrow();
+
+			expect((await readSettings()).modelProfile).toEqual({ default: "equal-profile" });
+		});
+
 		it("retains conditional ownership checks across a failed save retry", async () => {
 			await writeSettings({
 				task: { agentModelOverrides: { architect: "baseline/architect" } },
@@ -427,7 +505,7 @@ describe("Settings", () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			const originalWrite = Bun.write;
 			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
-				if (args[0] === getConfigPath()) {
+				if (isConfigWritePath(args[0])) {
 					throw new Error("simulated write failure");
 				}
 				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
@@ -450,6 +528,271 @@ describe("Settings", () => {
 			});
 		});
 
+		it("retries the same owned conditional mutation after a config write failure", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "baseline/architect" } },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (isConfigWritePath(args[0])) throw new Error("simulated config failure");
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settings.setAgentModelOverrideIfUnchanged("architect", "baseline/architect", "profile/architect");
+				await expect(settings.flushOrThrow()).rejects.toThrow("simulated config failure");
+			} finally {
+				writeSpy.mockRestore();
+			}
+			await settings.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "profile/architect" },
+			});
+		});
+
+		it("does not let an unconditional retry reclaim a later writer", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			const settingsA = await Settings.init({ cwd: projectDir, agentDir });
+			const settingsB = await settingsA.cloneForCwd(projectDir);
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (isConfigWritePath(args[0])) throw new Error("simulated config failure");
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settingsA.setAgentModelOverride("architect", "first/architect");
+				await expect(settingsA.flushOrThrow()).rejects.toThrow("simulated config failure");
+			} finally {
+				writeSpy.mockRestore();
+			}
+			settingsB.setAgentModelOverride("architect", "later/architect");
+			await settingsB.flushOrThrow();
+			await settingsA.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "later/architect" },
+			});
+		});
+		it("does not overwrite an external edit when retrying an unconditional mutation", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (isConfigWritePath(args[0])) throw new Error("simulated config failure");
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settings.setAgentModelOverride("architect", "first/architect");
+				await expect(settings.flushOrThrow()).rejects.toThrow("simulated config failure");
+			} finally {
+				writeSpy.mockRestore();
+			}
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "external/architect" } },
+			});
+			await settings.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "external/architect" },
+			});
+		});
+		it("does not retry past a later writer after sidecar persistence fails", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			const settingsA = await Settings.init({ cwd: projectDir, agentDir });
+			const settingsB = await settingsA.cloneForCwd(projectDir);
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (isRevisionWritePath(args[0])) throw new Error("simulated revision failure");
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settingsA.setAgentModelOverride("architect", "first/architect");
+				await expect(settingsA.flushOrThrow()).rejects.toThrow("simulated revision failure");
+			} finally {
+				writeSpy.mockRestore();
+			}
+			settingsB.setAgentModelOverride("architect", "later/architect");
+			await settingsB.flushOrThrow();
+			await settingsA.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "later/architect" },
+			});
+		});
+		it("retries after a sidecar failure when the predecessor is unchanged", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (isRevisionWritePath(args[0])) throw new Error("simulated revision failure");
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settings.setAgentModelOverride("architect", "first/architect");
+				await expect(settings.flushOrThrow()).rejects.toThrow("simulated revision failure");
+			} finally {
+				writeSpy.mockRestore();
+			}
+			await settings.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "first/architect" },
+			});
+		});
+		it("does not overwrite siblings when the config root becomes invalid", async () => {
+			await writeSettings({
+				modelRoles: { default: "original/default" },
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const invalidConfig = "- broken-root\n";
+			await Bun.write(getConfigPath(), invalidConfig);
+
+			settings.setAgentModelOverride("planner", "user/planner");
+			await expect(settings.flushOrThrow()).rejects.toThrow("Settings root must be an object");
+			expect(await Bun.file(getConfigPath()).text()).toBe(invalidConfig);
+		});
+		it("rejects invalid model assignment keys without poisoning durable ownership", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(() => settings.setModelRole("", "invalid/default")).toThrow("Model assignment key cannot be empty");
+			expect(() => settings.setAgentModelOverride("", "invalid/agent")).toThrow(
+				"Model assignment key cannot be empty",
+			);
+			expect(() => settings.set("modelRoles", { "": "invalid/default" })).toThrow(
+				"Model assignment key cannot be empty",
+			);
+			expect(() => settings.set("task.agentModelOverrides", { "": "invalid/agent" })).toThrow(
+				"Model assignment key cannot be empty",
+			);
+
+			for (const key of ["__proto__", "prototype", "constructor", "toString", "hasOwnProperty"]) {
+				const roleRecord = Object.fromEntries([[key, "invalid/default"]]);
+				const agentRecord = Object.fromEntries([[key, "invalid/agent"]]);
+				expect(() => settings.setModelRole(key, "invalid/default")).toThrow(
+					`Model assignment key is not allowed: ${key}`,
+				);
+				expect(() => settings.setAgentModelOverride(key, "invalid/agent")).toThrow(
+					`Model assignment key is not allowed: ${key}`,
+				);
+				expect(() => settings.set("modelRoles", roleRecord)).toThrow(`Model assignment key is not allowed: ${key}`);
+				expect(() => settings.set("task.agentModelOverrides", agentRecord)).toThrow(
+					`Model assignment key is not allowed: ${key}`,
+				);
+			}
+
+			settings.setModelRole("default", "valid/default");
+			await settings.flushOrThrow();
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ cwd: projectDir, agentDir });
+			expect(reopened.getModelRole("default")).toBe("valid/default");
+		});
+
+		it("fails closed when the durable ownership sidecar is malformed", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			await Bun.write(`${getConfigPath()}.revisions.json`, "{not-json");
+
+			await expect(Settings.init({ cwd: projectDir, agentDir })).rejects.toThrow();
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "original/architect" },
+			});
+		});
+
+		it("rejects semantically invalid ownership sidecars", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "original/architect" } },
+			});
+			await Bun.write(
+				`${getConfigPath()}.revisions.json`,
+				JSON.stringify({
+					version: 1,
+					generation: "uninitialized",
+					nextRevision: 1,
+					entries: {},
+				}),
+			);
+
+			await expect(Settings.init({ cwd: projectDir, agentDir })).rejects.toThrow(
+				"Invalid settings revision state header",
+			);
+		});
+
+		it("rejects non-canonical ownership paths", async () => {
+			await writeSettings({
+				modelRoles: { default: "original/default" },
+			});
+			await Settings.init({ cwd: projectDir, agentDir });
+			const sidecarPath = `${getConfigPath()}.revisions.json`;
+			const state = JSON.parse(await Bun.file(sidecarPath).text()) as Record<string, unknown>;
+			const invalidPaths = [
+				"modelRoles",
+				"task.agentModelOverrides",
+				'\0record-entry:[ "modelRoles", "default" ]',
+				`\0record-entry:${JSON.stringify(["modelRoles", "__proto__"])}`,
+				`\0record-entry:${JSON.stringify(["task", "agentModelOverrides", "constructor"])}`,
+				`\0record-entry:${JSON.stringify(["modelRoles", "toString"])}`,
+			];
+
+			for (const modifiedPath of invalidPaths) {
+				resetSettingsForTest();
+				await Bun.write(
+					sidecarPath,
+					JSON.stringify({
+						...state,
+						nextRevision: 2,
+						entries: {
+							[modifiedPath]: {
+								revision: 1,
+								ownerId: "external-writer",
+								mutationId: 1,
+							},
+						},
+					}),
+				);
+				await expect(Settings.init({ cwd: projectDir, agentDir })).rejects.toThrow(
+					`Invalid settings revision path: ${modifiedPath}`,
+				);
+			}
+		});
+
+		it("rejects stale baselines after ownership sidecar regeneration", async () => {
+			await writeSettings({
+				task: { agentModelOverrides: { architect: "equal/architect" } },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.setAgentModelOverride("architect", "equal/architect");
+			await settings.flushOrThrow();
+			const staleSettings = await settings.cloneForCwd(projectDir);
+			fs.rmSync(`${getConfigPath()}.revisions.json`);
+
+			resetSettingsForTest();
+			const regenerated = await Settings.init({ cwd: projectDir, agentDir });
+			regenerated.setAgentModelOverride("architect", "equal/architect");
+			await regenerated.flushOrThrow();
+			staleSettings.setAgentModelOverrideIfUnchanged("architect", "equal/architect", "profile/architect");
+			await staleSettings.flushOrThrow();
+
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { architect: "equal/architect" },
+			});
+		});
 		it("preserves external siblings for dotted role and agent names", async () => {
 			await writeSettings({
 				modelRoles: {
@@ -557,7 +900,7 @@ describe("Settings", () => {
 			const originalWrite = Bun.write;
 			let blockedConfigWrite = false;
 			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
-				if (!blockedConfigWrite && args[0] === getConfigPath()) {
+				if (!blockedConfigWrite && isConfigWritePath(args[0])) {
 					blockedConfigWrite = true;
 					resolveWriteStarted();
 					await writeWait;

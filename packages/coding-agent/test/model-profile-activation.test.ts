@@ -453,6 +453,82 @@ describe("model profile activation", () => {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});
+	test("session-only materialization preserves a later durable selection of the same profile", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-profile-materialization-same-default-"));
+		resetSettingsForTest();
+		try {
+			const settingsA = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			const settingsB = await settingsA.cloneForCwd(tempDir);
+			const session = fakeSession();
+			await activateModelProfile({
+				session,
+				modelRegistry: fakeRegistry(),
+				settings: settingsA,
+				profileName: "profile-a",
+			});
+
+			settingsB.set("modelProfile.default", "profile-a");
+			await settingsB.flushOrThrow();
+			expect(
+				materializeActiveModelProfileAssignment({
+					session,
+					settings: settingsA,
+					role: "executor",
+					selector: "provider-a/manual-executor:low",
+				}),
+			).toBe(true);
+			await settingsA.flushOrThrow();
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			expect(reopened.getGlobal("modelProfile.default")).toBe("profile-a");
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	test("equal explicit materialization rotates ownership against stale conditional writers", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-profile-equal-explicit-owner-"));
+		resetSettingsForTest();
+		try {
+			const settingsA = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			settingsA.setAgentModelOverride("executor", "provider-a/manual-executor:low");
+			await settingsA.flushOrThrow();
+			const staleSettings = await settingsA.cloneForCwd(tempDir);
+			const session = fakeSession();
+			await activateModelProfile({
+				session,
+				modelRegistry: fakeRegistry(),
+				settings: settingsA,
+				profileName: "profile-a",
+			});
+
+			expect(
+				materializeActiveModelProfileAssignment({
+					session,
+					settings: settingsA,
+					role: "executor",
+					selector: "provider-a/manual-executor:low",
+				}),
+			).toBe(true);
+			await settingsA.flushOrThrow();
+			staleSettings.setAgentModelOverrideIfUnchanged(
+				"executor",
+				"provider-a/manual-executor:low",
+				"provider-a/stale-executor:low",
+			);
+			await staleSettings.flushOrThrow();
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir: tempDir, cwd: tempDir });
+			expect(reopened.getGlobal("task.agentModelOverrides")).toMatchObject({
+				executor: "provider-a/manual-executor:low",
+			});
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
 
 	test("failed profile detachment retains transition state for the next activation", async () => {
 		const session = fakeSession();

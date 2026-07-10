@@ -32,6 +32,7 @@ interface ActiveModelProfileRuntimeState {
 	appliedAgentModelOverrides: Record<string, string>;
 	defaultSelector?: string;
 	persistedModelProfile: string | undefined;
+	persistedModelProfilePendingMutationId: number | undefined;
 }
 
 const activeModelProfileRuntimeStates = new WeakMap<object, ActiveModelProfileRuntimeState>();
@@ -94,10 +95,15 @@ function persistModelAssignmentEntries(
 		modelRoles: [],
 		agentModelOverrides: [],
 	};
-	for (const role of new Set([...Object.keys(previousModelRoles), ...Object.keys(modelRoles)])) {
+	for (const role of new Set([
+		...Object.keys(previousModelRoles),
+		...Object.keys(modelRoles),
+		...explicitModelRoles,
+	])) {
 		const selector = modelRoles[role];
-		if (previousModelRoles[role] === selector) continue;
-		if (explicitModelRoles.has(role)) {
+		const explicit = explicitModelRoles.has(role);
+		if (previousModelRoles[role] === selector && !explicit) continue;
+		if (explicit) {
 			if (selector === undefined) {
 				settings.clearModelRole(role);
 			} else {
@@ -111,10 +117,12 @@ function persistModelAssignmentEntries(
 	for (const agentName of new Set([
 		...Object.keys(previousAgentModelOverrides),
 		...Object.keys(agentModelOverrides),
+		...explicitAgentModelOverrides,
 	])) {
 		const selector = agentModelOverrides[agentName];
-		if (previousAgentModelOverrides[agentName] === selector) continue;
-		if (explicitAgentModelOverrides.has(agentName)) {
+		const explicit = explicitAgentModelOverrides.has(agentName);
+		if (previousAgentModelOverrides[agentName] === selector && !explicit) continue;
+		if (explicit) {
 			if (selector === undefined) {
 				settings.clearAgentModelOverride(agentName);
 			} else {
@@ -165,6 +173,7 @@ export interface PrepareModelProfileActivationOptions {
 		| "getWithoutProject"
 		| "override"
 		| "set"
+		| "getPendingModelProfileDefaultMutationId"
 		| "setModelProfileDefaultIfUnchanged"
 	> &
 		ModelAssignmentPersistenceSettings;
@@ -188,6 +197,7 @@ export interface PreparedModelProfileActivation {
 		| "getRuntimeOverride"
 		| "override"
 		| "set"
+		| "getPendingModelProfileDefaultMutationId"
 		| "setModelProfileDefaultIfUnchanged"
 	> &
 		ModelAssignmentPersistenceSettings;
@@ -213,6 +223,7 @@ export interface PreparedModelProfileActivation {
 	modelRoles: Record<string, string>;
 	agentModelOverrides: Record<string, string>;
 	previousPersistedModelProfile: string | undefined;
+	previousPersistedModelProfilePendingMutationId: number | undefined;
 	previousActiveModelProfile: string | undefined;
 	/**
 	 * The session resume default ("provider/id") captured BEFORE activation —
@@ -231,6 +242,7 @@ export interface MaterializeModelProfileAssignmentOptions {
 	settings: Pick<
 		Settings,
 		| "setModelProfileDefaultIfUnchanged"
+		| "getPendingModelProfileDefaultMutationId"
 		| "clearOverride"
 		| "get"
 		| "getGlobal"
@@ -251,6 +263,7 @@ export interface MaterializeModelProfileAssignmentsOptions {
 	settings: Pick<
 		Settings,
 		| "setModelProfileDefaultIfUnchanged"
+		| "getPendingModelProfileDefaultMutationId"
 		| "clearOverride"
 		| "get"
 		| "getGlobal"
@@ -305,7 +318,10 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 		...(options.settings.getGlobal("task.agentModelOverrides") ?? {}),
 	};
 	const runtimeState = activeModelProfileRuntimeStates.get(options.session);
-	const previousPersistedModelProfile = runtimeState?.persistedModelProfile ?? activeProfile;
+	const previousPersistedModelProfile = runtimeState ? runtimeState.persistedModelProfile : activeProfile;
+	const previousPersistedModelProfilePendingMutationId = runtimeState
+		? runtimeState.persistedModelProfilePendingMutationId
+		: options.settings.getPendingModelProfileDefaultMutationId();
 	const currentPersistableModelRoles = {
 		...options.settings.getWithoutProject("modelRoles"),
 	};
@@ -395,7 +411,11 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 	for (const agentName of touched.agentModelOverrides) {
 		if (!explicitAgentModelOverrides.has(agentName)) delete runtimeAgentModelOverrides[agentName];
 	}
-	options.settings.setModelProfileDefaultIfUnchanged(previousPersistedModelProfile, undefined);
+	options.settings.setModelProfileDefaultIfUnchanged(
+		previousPersistedModelProfile,
+		undefined,
+		previousPersistedModelProfilePendingMutationId,
+	);
 	options.settings.clearOverride("modelProfile.default");
 	options.settings.override("modelRoles", runtimeModelRoles);
 	options.settings.override("task.agentModelOverrides", runtimeAgentModelOverrides);
@@ -578,6 +598,7 @@ export async function prepareModelProfileActivation(
 
 	const previousActiveModelProfile = options.session.getActiveModelProfile?.();
 	const previousPersistedModelProfile = options.settings.getGlobal("modelProfile.default");
+	const previousPersistedModelProfilePendingMutationId = options.settings.getPendingModelProfileDefaultMutationId();
 	const previousRuntimeState = previousActiveModelProfile
 		? activeModelProfileRuntimeStates.get(options.session)
 		: undefined;
@@ -680,6 +701,7 @@ export async function prepareModelProfileActivation(
 		modelRoles,
 		agentModelOverrides,
 		previousPersistedModelProfile,
+		previousPersistedModelProfilePendingMutationId,
 		previousActiveModelProfile,
 		previousSessionDefaultModel: options.session.getSessionDefaultModelSelector?.(),
 	};
@@ -752,6 +774,9 @@ export async function applyPreparedModelProfileActivation(
 			baselineThinkingLevel: prepared.baselineThinkingLevel,
 			baselineSessionDefaultModel: prepared.baselineSessionDefaultModel,
 			persistedModelProfile: options.persistDefault ? prepared.profileName : prepared.previousPersistedModelProfile,
+			persistedModelProfilePendingMutationId: options.persistDefault
+				? undefined
+				: prepared.previousPersistedModelProfilePendingMutationId,
 			persistableBaselineThinkingLevel: prepared.persistableBaselineThinkingLevel,
 			baselineModelRoles: { ...prepared.baselineModelRoles },
 			baselineAgentModelOverrides: { ...prepared.baselineAgentModelOverrides },
@@ -839,7 +864,12 @@ export interface MaterializeModelProfileForDeletionResult {
 
 type ModelProfileDeletionSettings = Pick<
 	Settings,
-	"clearOverride" | "flush" | "getGlobal" | "getRuntimeOverride" | "override" | "setModelProfileDefaultIfUnchanged"
+	| "clearOverride"
+	| "flushOrThrow"
+	| "getGlobal"
+	| "getRuntimeOverride"
+	| "override"
+	| "setModelProfileDefaultIfUnchanged"
 > &
 	ModelAssignmentPersistenceSettings;
 
@@ -949,7 +979,7 @@ export async function materializeModelProfileForDeletion(
 		prepared.settings.override("modelRoles", nextRuntimeModelRoles);
 		prepared.settings.override("task.agentModelOverrides", nextRuntimeAgentModelOverrides);
 		prepared.session.setActiveModelProfile?.(undefined);
-		await prepared.settings.flush();
+		await prepared.settings.flushOrThrow();
 	} catch (error) {
 		stageModelProfileDeletionRollback(prepared.settings, snapshot);
 		restoreModelProfileDeletionRuntime(prepared.settings, snapshot);
@@ -968,7 +998,7 @@ export async function restoreMaterializedModelProfileForDeletion(options: {
 	stageModelProfileDeletionRollback(options.settings, options.snapshot);
 	restoreModelProfileDeletionRuntime(options.settings, options.snapshot);
 	options.session.setActiveModelProfile?.(options.snapshot.previousActiveModelProfile);
-	await options.settings.flush();
+	await options.settings.flushOrThrow();
 }
 
 export async function activateModelProfile(

@@ -691,7 +691,7 @@ describe("custom model preset creation", () => {
 			},
 			getActiveModelProfile: () => activeProfiles.at(-1),
 		};
-		const flushSpy = spyOn(settings, "flush").mockRejectedValueOnce(new Error("flush failed"));
+		const flushSpy = spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
 
 		try {
 			await expect(
@@ -710,6 +710,59 @@ describe("custom model preset creation", () => {
 		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("custom-default");
+	});
+	it("rejects profile deletion materialization when config persistence fails", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-default",
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: "my-oai/gpt-custom",
+			},
+			source: "user",
+		};
+		const agentDir = path.join(tempDir, "failed-materialization-settings");
+		resetSettingsForTest();
+		try {
+			const settings = await Settings.init({ agentDir, cwd: tempDir });
+			const configPath = path.join(await fs.realpath(settings.getAgentDir()), "config.yml");
+			settings.set("modelProfile.default", customProfile.name);
+			settings.setModelRole("default", "old/default");
+			await settings.flushOrThrow();
+			const session = createDeletionSession();
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (
+					typeof args[0] === "string" &&
+					args[0].startsWith(`${configPath}.`) &&
+					args[0].endsWith(".tmp") &&
+					!args[0].startsWith(`${configPath}.revisions.json.`)
+				) {
+					throw new Error("forced config write failure");
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				await expect(
+					materializeModelProfileForDeletion({
+						session,
+						settings,
+						modelRegistry: createRegistry([[customProfile.name, customProfile]]),
+						profileName: customProfile.name,
+					}),
+				).rejects.toThrow("forced config write failure");
+			} finally {
+				writeSpy.mockRestore();
+			}
+
+			resetSettingsForTest();
+			const reopened = await Settings.init({ agentDir, cwd: tempDir });
+			expect(reopened.getGlobal("modelProfile.default")).toBe(customProfile.name);
+		} finally {
+			resetSettingsForTest();
+		}
 	});
 	it("preserves later durable choices while materializing a profile for deletion", async () => {
 		const customProfile: ModelProfileDefinition = {
@@ -828,6 +881,7 @@ describe("custom model preset creation", () => {
 			const settingsB = await settingsA.cloneForCwd(tempDir);
 			settingsB.setModelRole("default", "external/default");
 			settingsB.setAgentModelOverride("architect", "external/architect");
+			settingsB.setAgentModelOverride("executor", "my-oai/gpt-custom");
 			settingsB.set("modelProfile.default", "profile-b");
 			await settingsB.flushOrThrow();
 
@@ -839,6 +893,7 @@ describe("custom model preset creation", () => {
 			expect(reopened.getGlobal("task.agentModelOverrides")).toEqual({
 				architect: "external/architect",
 				critic: "old/critic",
+				executor: "my-oai/gpt-custom",
 			});
 			expect(reopened.getGlobal("modelProfile.default")).toBe("profile-b");
 		} finally {

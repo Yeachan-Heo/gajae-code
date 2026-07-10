@@ -11,9 +11,11 @@
  *   const isolated = Settings.isolated({ "compaction.enabled": false });
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -54,19 +56,152 @@ export * from "./settings-schema";
 export interface RawSettings {
 	[key: string]: unknown;
 }
-type SettingMutationGuard = { kind: "unconditional" } | { kind: "if-unchanged"; expectedValue: unknown };
+type SettingMutationGuard =
+	| { kind: "unconditional" }
+	| {
+			kind: "if-unchanged";
+			expectedValue: unknown;
+			expectedGeneration: string;
+			expectedRevision: number;
+	  };
+
+interface DurableSettingRevisionEntry {
+	revision: number;
+	ownerId: string;
+	mutationId: number;
+}
+
+interface DurableSettingsRevisionState {
+	version: 1;
+	nextRevision: number;
+	generation: string;
+	entries: Record<string, DurableSettingRevisionEntry>;
+}
+
+interface ConditionalMutationOutcome {
+	expectedValue: unknown;
+	desiredValue: unknown;
+	applied: boolean;
+	revision: number;
+	generation: string;
+}
 
 interface PendingSettingMutation {
 	id: number;
 	desiredValue: unknown;
 	guard: SettingMutationGuard;
+	attempted: boolean;
+	predecessorGeneration?: string;
+	predecessorRevision?: number;
+	predecessorValue?: unknown;
 }
 
-function canApplySettingMutation(mutation: PendingSettingMutation, currentValue: unknown): boolean {
+const SETTINGS_REVISION_STATE_VERSION = 1 as const;
+const SETTINGS_REVISION_GENERATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function emptySettingsRevisionState(): DurableSettingsRevisionState {
+	return {
+		version: SETTINGS_REVISION_STATE_VERSION,
+		generation: crypto.randomUUID(),
+		nextRevision: 1,
+		entries: {},
+	};
+}
+
+function isValidRevisionPath(modifiedPath: string): boolean {
+	if (!modifiedPath.startsWith(RECORD_ENTRY_MUTATION_PREFIX)) {
+		return (
+			modifiedPath !== "modelRoles" &&
+			modifiedPath !== "task.agentModelOverrides" &&
+			Object.hasOwn(SETTINGS_SCHEMA, modifiedPath)
+		);
+	}
+	try {
+		const segments = decodeModifiedPath(modifiedPath);
+		if (segments.length === 2 && segments[0] === "modelRoles" && isValidRecordEntryMutationKey(segments[1])) {
+			return modifiedPath === encodeRecordEntryMutation("modelRoles", segments[1]);
+		}
+		if (
+			segments.length === 3 &&
+			segments[0] === "task" &&
+			segments[1] === "agentModelOverrides" &&
+			isValidRecordEntryMutationKey(segments[2])
+		) {
+			return modifiedPath === encodeRecordEntryMutation("task.agentModelOverrides", segments[2]);
+		}
+		return false;
+	} catch {
+		return false;
+	}
+}
+
+function parseSettingsRevisionState(value: unknown): DurableSettingsRevisionState {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("Invalid settings revision state");
+	}
+	const raw = value as Record<string, unknown>;
+	if (
+		raw.version !== SETTINGS_REVISION_STATE_VERSION ||
+		typeof raw.generation !== "string" ||
+		!SETTINGS_REVISION_GENERATION_PATTERN.test(raw.generation) ||
+		!Number.isSafeInteger(raw.nextRevision) ||
+		(raw.nextRevision as number) < 1
+	) {
+		throw new Error("Invalid settings revision state header");
+	}
+	if (!raw.entries || typeof raw.entries !== "object" || Array.isArray(raw.entries)) {
+		throw new Error("Invalid settings revision state entries");
+	}
+
+	const entries: Record<string, DurableSettingRevisionEntry> = {};
+	let maxRevision = 0;
+	for (const [modifiedPath, candidate] of Object.entries(raw.entries)) {
+		if (!isValidRevisionPath(modifiedPath)) {
+			throw new Error(`Invalid settings revision path: ${modifiedPath}`);
+		}
+		if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+			throw new Error(`Invalid settings revision entry: ${modifiedPath}`);
+		}
+		const entry = candidate as Record<string, unknown>;
+		if (
+			!Number.isSafeInteger(entry.revision) ||
+			(entry.revision as number) < 1 ||
+			typeof entry.ownerId !== "string" ||
+			entry.ownerId.length === 0 ||
+			!Number.isSafeInteger(entry.mutationId) ||
+			(entry.mutationId as number) < 1
+		) {
+			throw new Error(`Invalid settings revision entry: ${modifiedPath}`);
+		}
+		const revision = entry.revision as number;
+		entries[modifiedPath] = {
+			revision,
+			ownerId: entry.ownerId,
+			mutationId: entry.mutationId as number,
+		};
+		maxRevision = Math.max(maxRevision, revision);
+	}
+	if ((raw.nextRevision as number) <= maxRevision) {
+		throw new Error("Invalid settings revision ordering");
+	}
+
+	return {
+		generation: raw.generation,
+		version: SETTINGS_REVISION_STATE_VERSION,
+		nextRevision: raw.nextRevision as number,
+		entries,
+	};
+}
+
+function mutationValuesMatch(mutation: PendingSettingMutation, currentValue: unknown): boolean {
+	if (mutation.guard.kind === "unconditional") return true;
+	return Object.is(currentValue, mutation.guard.expectedValue) || Object.is(currentValue, mutation.desiredValue);
+}
+
+function mutationRetryValuesMatch(mutation: PendingSettingMutation, currentValue: unknown): boolean {
 	return (
-		mutation.guard.kind === "unconditional" ||
-		Object.is(currentValue, mutation.guard.expectedValue) ||
-		Object.is(currentValue, mutation.desiredValue)
+		isDeepStrictEqual(currentValue, mutation.predecessorValue) ||
+		isDeepStrictEqual(currentValue, mutation.desiredValue)
 	);
 }
 
@@ -94,6 +229,9 @@ function getByPath(obj: RawSettings, segments: string[]): unknown {
 		if (current === null || current === undefined || typeof current !== "object") {
 			return undefined;
 		}
+		if (!Object.hasOwn(current, segment)) {
+			return undefined;
+		}
 		current = (current as Record<string, unknown>)[segment];
 	}
 	return current;
@@ -107,7 +245,7 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 	let current = obj;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const segment = segments[i];
-		if (!(segment in current) || typeof current[segment] !== "object" || current[segment] === null) {
+		if (!Object.hasOwn(current, segment) || typeof current[segment] !== "object" || current[segment] === null) {
 			current[segment] = {};
 		}
 		current = current[segment] as RawSettings;
@@ -156,13 +294,28 @@ function stringArrayFromUnknown(value: unknown): string[] {
 function shallowStringRecord(value: unknown): Record<string, string> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
 
-	const result: Record<string, string> = {};
+	const result: Record<string, string> = Object.create(null);
 	for (const [key, item] of Object.entries(value)) {
 		if (typeof item === "string") {
 			result[key] = item;
 		}
 	}
 	return result;
+}
+
+const FORBIDDEN_RECORD_ENTRY_MUTATION_KEYS = new Set(["prototype"]);
+
+function isValidRecordEntryMutationKey(key: string): boolean {
+	return key.length > 0 && !FORBIDDEN_RECORD_ENTRY_MUTATION_KEYS.has(key) && !Object.hasOwn(Object.prototype, key);
+}
+
+function assertValidRecordEntryMutationKey(key: string): void {
+	if (key.length === 0) {
+		throw new Error("Model assignment key cannot be empty");
+	}
+	if (!isValidRecordEntryMutationKey(key)) {
+		throw new Error(`Model assignment key is not allowed: ${key}`);
+	}
 }
 
 const RECORD_ENTRY_MUTATION_PREFIX = "\0record-entry:";
@@ -227,6 +380,10 @@ export class Settings {
 	#cwd: string;
 	#agentDir: string;
 	#storage: AgentStorage | null = null;
+	#revisionPath: string | null;
+	#ownerId = crypto.randomUUID();
+	#revisionState = emptySettingsRevisionState();
+	#conditionalOutcomes = new Map<string, ConditionalMutationOutcome>();
 
 	/** Global settings from config.yml */
 	#global: RawSettings = {};
@@ -251,7 +408,24 @@ export class Settings {
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
-		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, "config.yml");
+		let persistenceAgentDir = this.#agentDir;
+		try {
+			persistenceAgentDir = fs.realpathSync.native(this.#agentDir);
+		} catch {
+			try {
+				persistenceAgentDir = path.join(
+					fs.realpathSync.native(path.dirname(this.#agentDir)),
+					path.basename(this.#agentDir),
+				);
+			} catch {}
+		}
+		this.#configPath = options.inMemory ? null : path.join(persistenceAgentDir, "config.yml");
+		if (this.#configPath) {
+			try {
+				this.#configPath = fs.realpathSync.native(this.#configPath);
+			} catch {}
+		}
+		this.#revisionPath = this.#configPath ? `${this.#configPath}.revisions.json` : null;
 		this.#persist = !options.inMemory;
 
 		if (options.overrides) {
@@ -284,6 +458,7 @@ export class Settings {
 			},
 			error => {
 				globalInstance = null;
+				globalInstancePromise = null;
 				throw error;
 			},
 		);
@@ -403,9 +578,17 @@ export class Settings {
 	 * Persist or clear the default model profile only if another writer has not
 	 * changed it since this Settings instance loaded it.
 	 */
-	setModelProfileDefaultIfUnchanged(expectedProfileName: string | undefined, profileName: string | undefined): void {
+	getPendingModelProfileDefaultMutationId(): number | undefined {
+		return this.#modified.get("modelProfile.default")?.id;
+	}
+
+	setModelProfileDefaultIfUnchanged(
+		expectedProfileName: string | undefined,
+		profileName: string | undefined,
+		expectedPendingMutationId?: number,
+	): void {
 		const path = "modelProfile.default";
-		if (!this.#enqueueModifiedIfUnchanged(path, expectedProfileName, profileName, true)) return;
+		if (!this.#enqueueModifiedIfUnchanged(path, expectedProfileName, profileName, expectedPendingMutationId)) return;
 		setByPath(this.#global, path.split("."), profileName);
 		this.#rebuildMerged();
 		this.#queueSave();
@@ -479,6 +662,7 @@ export class Settings {
 		});
 		cloned.#storage = this.#storage;
 		cloned.#global = structuredClone(this.#global);
+		cloned.#revisionState = structuredClone(this.#revisionState);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#overrides = structuredClone(this.#overrides);
 		cloned.#rebuildMerged();
@@ -554,12 +738,20 @@ export class Settings {
 		return this.get("bashInterceptor.patterns");
 	}
 
+	#revisionFor(path: string): number {
+		return this.#revisionState.entries[path]?.revision ?? 0;
+	}
+
 	#enqueueModified(path: string, desiredValue: unknown): void {
 		this.#modified.delete(path);
 		this.#modified.set(path, {
 			id: this.#nextMutationId++,
 			desiredValue: structuredClone(desiredValue),
 			guard: { kind: "unconditional" },
+			attempted: false,
+			predecessorGeneration: undefined,
+			predecessorRevision: undefined,
+			predecessorValue: undefined,
 		});
 	}
 
@@ -570,7 +762,11 @@ export class Settings {
 		}
 		const previous = shallowStringRecord(getByPath(this.#global, path.split(".")));
 		const next = shallowStringRecord(desiredValue);
-		for (const key of new Set([...Object.keys(previous), ...Object.keys(next)])) {
+		const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
+		for (const key of keys) {
+			assertValidRecordEntryMutationKey(key);
+		}
+		for (const key of keys) {
 			this.#enqueueModified(encodeRecordEntryMutation(path, key), next[key]);
 		}
 	}
@@ -579,19 +775,34 @@ export class Settings {
 		path: string,
 		expectedValue: unknown,
 		desiredValue: unknown,
-		replaceMatchingUnconditional = false,
+		expectedPendingMutationId?: number,
 	): boolean {
 		const pending = this.#modified.get(path);
+		let expectedRevision = this.#revisionFor(path);
+		let expectedGeneration = this.#revisionState.generation;
 		if (pending) {
-			const replacesMatchingUnconditional =
-				replaceMatchingUnconditional &&
+			const replacesOwnedUnconditional =
+				expectedPendingMutationId !== undefined &&
+				pending.id === expectedPendingMutationId &&
 				pending.guard.kind === "unconditional" &&
 				Object.is(pending.desiredValue, expectedValue);
 			const reversesPendingConditional =
 				pending.guard.kind === "if-unchanged" &&
 				Object.is(pending.guard.expectedValue, desiredValue) &&
 				Object.is(pending.desiredValue, expectedValue);
-			if (!replacesMatchingUnconditional && !reversesPendingConditional) return false;
+			if (!replacesOwnedUnconditional && !reversesPendingConditional) return false;
+		} else {
+			const outcome = this.#conditionalOutcomes.get(path);
+			const reversesCompletedConditional =
+				outcome && Object.is(outcome.expectedValue, desiredValue) && Object.is(outcome.desiredValue, expectedValue);
+			if (reversesCompletedConditional) {
+				this.#conditionalOutcomes.delete(path);
+				if (!outcome.applied) return false;
+				expectedRevision = outcome.revision;
+				expectedGeneration = outcome.generation;
+			} else {
+				this.#conditionalOutcomes.delete(path);
+			}
 		}
 		const currentValue = getByPath(this.#global, decodeModifiedPath(path));
 		if (!Object.is(currentValue, expectedValue) && !Object.is(currentValue, desiredValue)) return false;
@@ -602,7 +813,13 @@ export class Settings {
 			guard: {
 				kind: "if-unchanged",
 				expectedValue: structuredClone(expectedValue),
+				expectedGeneration,
+				expectedRevision,
 			},
+			attempted: false,
+			predecessorGeneration: undefined,
+			predecessorRevision: undefined,
+			predecessorValue: undefined,
 		});
 		return true;
 	}
@@ -613,6 +830,7 @@ export class Settings {
 		value: string | undefined,
 		expectedValue?: { value: string | undefined },
 	): boolean {
+		assertValidRecordEntryMutationKey(key);
 		const segments = path.split(".");
 		const next = shallowStringRecord(getByPath(this.#global, segments));
 		if (value === undefined) {
@@ -786,7 +1004,14 @@ export class Settings {
 		if (this.#persist) {
 			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
 			await this.#migrateFromLegacy();
-			this.#global = await this.#loadYaml(this.#configPath!);
+			await withFileLock(this.#configPath!, async () => {
+				const revisionStateExists = this.#revisionPath ? await Bun.file(this.#revisionPath).exists() : false;
+				this.#global = await this.#loadYaml(this.#configPath!);
+				this.#revisionState = await this.#loadRevisionState();
+				if (!revisionStateExists) {
+					await this.#writeRevisionState(this.#revisionState);
+				}
+			});
 		}
 
 		this.#project = await projectPromise;
@@ -797,18 +1022,63 @@ export class Settings {
 		return this;
 	}
 
+	async #loadRevisionState(): Promise<DurableSettingsRevisionState> {
+		if (!this.#revisionPath) return emptySettingsRevisionState();
+		try {
+			const content = await Bun.file(this.#revisionPath).text();
+			return parseSettingsRevisionState(JSON.parse(content));
+		} catch (error) {
+			if (isEnoent(error)) return emptySettingsRevisionState();
+			logger.warn("Settings: failed to load revision state", {
+				path: this.#revisionPath,
+				error: String(error),
+			});
+			throw error;
+		}
+	}
+
+	async #atomicWrite(filePath: string, content: string): Promise<void> {
+		const tempPath = `${filePath}.${this.#ownerId}.tmp`;
+		try {
+			await Bun.write(tempPath, content);
+			const fd = fs.openSync(tempPath, "r");
+			try {
+				fs.fsyncSync(fd);
+			} finally {
+				fs.closeSync(fd);
+			}
+			fs.renameSync(tempPath, filePath);
+			if (process.platform !== "win32") {
+				const directoryFd = fs.openSync(path.dirname(filePath), "r");
+				try {
+					fs.fsyncSync(directoryFd);
+				} finally {
+					fs.closeSync(directoryFd);
+				}
+			}
+		} finally {
+			try {
+				fs.rmSync(tempPath, { force: true });
+			} catch {}
+		}
+	}
+
+	async #writeRevisionState(state: DurableSettingsRevisionState): Promise<void> {
+		if (!this.#revisionPath) return;
+		await this.#atomicWrite(this.#revisionPath, JSON.stringify(state));
+	}
 	async #loadYaml(filePath: string): Promise<RawSettings> {
 		try {
 			const content = await Bun.file(filePath).text();
 			const parsed = YAML.parse(content);
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-				return {};
+				throw new Error(`Settings root must be an object: ${filePath}`);
 			}
 			return this.#migrateRawSettings(parsed as RawSettings);
 		} catch (error) {
 			if (isEnoent(error)) return {};
 			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
-			return {};
+			throw error;
 		}
 	}
 
@@ -1090,29 +1360,105 @@ export class Settings {
 		try {
 			await withFileLock(configPath, async () => {
 				const current = await this.#loadYaml(configPath);
-				const processedIds = new Set<number>();
-				const processedEntries: Array<[path: string, id: number]> = [];
-				const processMutation = (modifiedPath: string, mutation: PendingSettingMutation): void => {
-					if (processedIds.has(mutation.id)) return;
-					processedIds.add(mutation.id);
-					processedEntries.push([modifiedPath, mutation.id]);
-					const segments = decodeModifiedPath(modifiedPath);
-					if (!canApplySettingMutation(mutation, getByPath(current, segments))) return;
-					setByPath(current, segments, structuredClone(mutation.desiredValue));
-				};
+				const revisionState = await this.#loadRevisionState();
+				this.#revisionState = structuredClone(revisionState);
+				const loadedGeneration = revisionState.generation;
+				const accepted: Array<{
+					modifiedPath: string;
+					mutation: PendingSettingMutation;
+					revision: number;
+					revisionChanged: boolean;
+				}> = [];
 
-				const pendingEntries = [...initialEntries, ...this.#modified].sort(
-					(left, right) => left[1].id - right[1].id,
-				);
-				for (const [modifiedPath, mutation] of pendingEntries) {
-					processMutation(modifiedPath, mutation);
+				for (const [modifiedPath, mutation] of initialEntries) {
+					const segments = decodeModifiedPath(modifiedPath);
+					const currentValue = getByPath(current, segments);
+					const currentRevision = revisionState.entries[modifiedPath]?.revision ?? 0;
+					const currentOwner = revisionState.entries[modifiedPath];
+					const sameMutation = currentOwner?.ownerId === this.#ownerId && currentOwner.mutationId === mutation.id;
+					const capturesPredecessor = !mutation.attempted && mutation.predecessorGeneration === undefined;
+					if (capturesPredecessor) {
+						mutation.predecessorGeneration = loadedGeneration;
+						mutation.predecessorRevision = currentRevision;
+						mutation.predecessorValue = structuredClone(currentValue);
+					}
+					const predecessorMatches =
+						mutation.predecessorGeneration === loadedGeneration &&
+						mutation.predecessorRevision === currentRevision;
+					const retryValueMatches = mutationRetryValuesMatch(mutation, currentValue);
+					const sameMutationRetry = sameMutation && retryValueMatches;
+					const generationMatches =
+						mutation.guard.kind === "if-unchanged" && mutation.guard.expectedGeneration === loadedGeneration;
+					const firstAttemptApplies =
+						!mutation.attempted &&
+						predecessorMatches &&
+						(capturesPredecessor || retryValueMatches) &&
+						(mutation.guard.kind === "unconditional" ||
+							(mutationValuesMatch(mutation, currentValue) &&
+								generationMatches &&
+								currentRevision === mutation.guard.expectedRevision));
+					const applies = sameMutationRetry || firstAttemptApplies;
+
+					if (!applies) {
+						if (this.#modified.get(modifiedPath)?.id === mutation.id) {
+							this.#modified.delete(modifiedPath);
+							if (mutation.guard.kind === "if-unchanged") {
+								this.#conditionalOutcomes.set(modifiedPath, {
+									expectedValue: mutation.guard.expectedValue,
+									desiredValue: mutation.desiredValue,
+									applied: false,
+									revision: currentRevision,
+									generation: loadedGeneration,
+								});
+							}
+						}
+						continue;
+					}
+
+					let revision = currentRevision;
+					if (!sameMutation) {
+						if (revisionState.nextRevision >= Number.MAX_SAFE_INTEGER) {
+							throw new Error("Settings revision state exhausted");
+						}
+						revision = revisionState.nextRevision++;
+						revisionState.entries[modifiedPath] = {
+							revision,
+							ownerId: this.#ownerId,
+							mutationId: mutation.id,
+						};
+					}
+					setByPath(current, segments, structuredClone(mutation.desiredValue));
+					accepted.push({
+						modifiedPath,
+						mutation,
+						revision,
+						revisionChanged: !sameMutation,
+					});
 				}
 
-				await Bun.write(configPath, YAML.stringify(current, null, 2));
+				if (accepted.some(entry => entry.revisionChanged)) {
+					await this.#writeRevisionState(revisionState);
+					for (const entry of accepted) {
+						if (entry.revisionChanged) entry.mutation.attempted = true;
+					}
+				}
+				this.#revisionState = structuredClone(revisionState);
 
-				for (const [modifiedPath, id] of processedEntries) {
-					if (this.#modified.get(modifiedPath)?.id === id) {
-						this.#modified.delete(modifiedPath);
+				if (accepted.length > 0) {
+					await this.#atomicWrite(configPath, YAML.stringify(current, null, 2));
+				}
+
+				for (const { modifiedPath, mutation, revision } of accepted) {
+					if (this.#modified.get(modifiedPath)?.id !== mutation.id) continue;
+					this.#modified.delete(modifiedPath);
+					if (mutation.guard.kind === "if-unchanged") {
+						this.#conditionalOutcomes.set(modifiedPath, {
+							expectedValue: mutation.guard.expectedValue,
+							desiredValue: mutation.desiredValue,
+							applied: true,
+							revision,
+							generation: revisionState.generation,
+						});
 					}
 				}
 				this.#global = current;
