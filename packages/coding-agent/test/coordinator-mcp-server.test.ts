@@ -13,6 +13,7 @@ import {
 	COORDINATOR_MCP_TOOL_NAMES,
 	COORDINATOR_POLL_INTERVAL_MAX_MS,
 	createCoordinatorMcpServer,
+	pumpCoordinatorMcpStream,
 } from "../src/coordinator-mcp/server";
 
 const tempDirs: string[] = [];
@@ -63,6 +64,43 @@ describe("Coordinator MCP server protocol", () => {
 
 		const resources = await server.handleJsonRpc({ jsonrpc: "2.0", id: 21, method: "resources/list", params: {} });
 		expect(resources.result.resources).toEqual([]);
+	});
+
+	it("answers the MCP ping utility with an empty result", async () => {
+		const server = createCoordinatorMcpServer({ env: {} });
+		const res = await server.handleJsonRpc({ jsonrpc: "2.0", id: 7, method: "ping", params: {} });
+		expect(res).toEqual({ jsonrpc: "2.0", id: 7, result: {} });
+	});
+
+	it("dispatches concurrently: a slow in-flight request never blocks a later ping", async () => {
+		let releaseSlow: () => void = () => {};
+		const slowGate = new Promise<void>(resolve => {
+			releaseSlow = resolve;
+		});
+		const handle = async (request: {
+			id?: number | string | null;
+			method?: string;
+		}): Promise<{ jsonrpc: "2.0"; id: number | string | null; result: unknown }> => {
+			if (request.method === "slow") await slowGate; // stays pending until released
+			return { jsonrpc: "2.0", id: request.id ?? null, result: {} };
+		};
+
+		const writtenIds: Array<number | string | null> = [];
+		async function* input(): AsyncGenerator<string> {
+			yield `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "slow" })}\n`;
+			yield `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" })}\n`;
+			await new Promise(resolve => setTimeout(resolve, 25)); // let ping resolve while slow is pending
+			releaseSlow(); // now let the slow request finish
+			await new Promise(resolve => setTimeout(resolve, 25));
+		}
+
+		await pumpCoordinatorMcpStream(handle as never, input(), line => {
+			writtenIds.push((JSON.parse(line) as { id: number | string | null }).id);
+		});
+
+		// The ping (id 2) must be answered before the still-pending slow request
+		// (id 1) — proving the read loop did not serialize behind the long call.
+		expect(writtenIds).toEqual([2, 1]);
 	});
 
 	it("does not read ambient coordinator MCP env when explicit env is provided", async () => {

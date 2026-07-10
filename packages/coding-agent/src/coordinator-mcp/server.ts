@@ -2508,6 +2508,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (request.method === "resources/list") {
 			return { jsonrpc: "2.0", id, result: { resources: [] } };
 		}
+		if (request.method === "ping") {
+			// MCP ping utility: a lightweight liveness probe. Answering it keeps
+			// the client's keepalive cheap and — crucially, once the stdio read
+			// loop dispatches concurrently — answerable even while a long-running
+			// tool call (e.g. gjc_coordinator_await_turn) is still in flight.
+			return { jsonrpc: "2.0", id, result: {} };
+		}
 		if (request.method === "tools/call") {
 			const params = (request.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
 			const payload = await callTool(params.name ?? "", params.arguments ?? {});
@@ -2567,23 +2574,72 @@ export async function handleCoordinatorMcpRequest(
 	};
 }
 
-export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
-	const server = createCoordinatorMcpServer(options);
+/**
+ * Pump a newline-delimited JSON-RPC stream, dispatching each request
+ * CONCURRENTLY. A long-running tool call (e.g. gjc_coordinator_await_turn,
+ * which polls a delegated turn for minutes) must never block the read loop
+ * from processing keepalive pings on the same stdio channel — otherwise the
+ * client's heartbeat times out mid-delegation and tears the connection down.
+ *
+ * Responses correlate by JSON-RPC id, so they may complete out of order; only
+ * the writes are serialized so concurrent frames can't interleave on the wire.
+ * Extracted from runCoordinatorMcpStdio so the concurrency can be unit-tested.
+ */
+export async function pumpCoordinatorMcpStream(
+	handleJsonRpc: (request: JsonRpcRequest) => Promise<JsonRpcResponse>,
+	input: AsyncIterable<string | Uint8Array>,
+	writeLine: (line: string) => void | Promise<void>,
+): Promise<void> {
 	let buffer = "";
-	for await (const chunk of process.stdin) {
-		buffer += chunk.toString();
+	let writeChain: Promise<void> = Promise.resolve();
+	const emit = (response: JsonRpcResponse): void => {
+		writeChain = writeChain.then(() => writeLine(`${JSON.stringify(response)}\n`));
+	};
+	const dispatch = (request: JsonRpcRequest): void => {
+		handleJsonRpc(request)
+			.then(emit)
+			.catch((err: unknown) => {
+				emit({
+					jsonrpc: "2.0",
+					id: request.id ?? null,
+					error: { code: -32603, message: err instanceof Error ? err.message : String(err) },
+				});
+			});
+	};
+
+	for await (const chunk of input) {
+		buffer += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
 		let newline = buffer.indexOf("\n");
 		while (newline >= 0) {
 			const line = buffer.slice(0, newline).trim();
 			buffer = buffer.slice(newline + 1);
 			if (line.length > 0) {
-				const request = JSON.parse(line) as JsonRpcRequest;
-				if (request.id !== undefined && request.id !== null) {
-					const response = await server.handleJsonRpc(request);
-					process.stdout.write(`${JSON.stringify(response)}\n`);
+				let request: JsonRpcRequest | null = null;
+				try {
+					request = JSON.parse(line) as JsonRpcRequest;
+				} catch {
+					request = null; // ignore malformed frames rather than crashing the loop
+				}
+				// Requests without an id are notifications — no response expected.
+				if (request && request.id !== undefined && request.id !== null) {
+					dispatch(request);
 				}
 			}
 			newline = buffer.indexOf("\n");
 		}
 	}
+	// Flush any responses still queued when the input stream ends.
+	await writeChain;
+}
+
+export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
+	const server = createCoordinatorMcpServer(options);
+	await pumpCoordinatorMcpStream(
+		request => server.handleJsonRpc(request),
+		process.stdin,
+		line =>
+			new Promise<void>(resolve => {
+				process.stdout.write(line, () => resolve());
+			}),
+	);
 }

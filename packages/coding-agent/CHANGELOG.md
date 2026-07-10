@@ -6,6 +6,10 @@
 
 - Migrated the repository type-check and release declaration pipeline to stable TypeScript 7.0.2, including the robogjc web workspace and a non-mutating publish-type gate.
 
+### Fixed
+
+- Coordinator MCP stdio server now dispatches JSON-RPC requests concurrently and answers the standard `ping` utility, so a long-running tool call (e.g. `gjc_coordinator_await_turn`, which polls a delegated turn for minutes) no longer blocks keepalive on the same channel. Previously the read loop awaited each request serially, starving keepalive during long delegations until the client's heartbeat timed out and tore the connection down — stretching ~110s delegated reviews to 300–625s. Measured live: coordinator keepalive failures 33→0 and a delegated deep review 625s→136s.
+
 ## [0.9.6] - 2026-07-10
 ### Changed
 
