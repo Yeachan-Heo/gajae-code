@@ -1,3 +1,5 @@
+import * as crypto from "node:crypto";
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -39,6 +41,7 @@ import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
+import { withFileLock } from "./file-lock";
 import {
 	buildCanonicalModelIndex,
 	type CanonicalModelIndex,
@@ -50,6 +53,7 @@ import {
 import {
 	aggregateModelProfileRequiredProviders,
 	type ModelProfileDefinition,
+	mapUserModelProfiles,
 	mergeModelProfiles,
 } from "./model-profiles";
 import {
@@ -66,6 +70,11 @@ import { type Settings, settings } from "./settings";
 export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, ModelEquivalenceConfig };
 
 export const kNoAuth = "N/A";
+interface ModelsConfigMutationSource {
+	bytes?: Buffer;
+	digest?: Buffer;
+	stat?: syncFs.Stats;
+}
 
 export function isAuthenticated(apiKey: string | undefined | null): apiKey is string {
 	return Boolean(apiKey) && apiKey !== kNoAuth;
@@ -86,6 +95,148 @@ export const MODEL_ROLES: Record<ModelRole, ModelRoleInfo> = {
 export const MODEL_ROLE_IDS: ModelRole[] = ["default"];
 export const MODEL_PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 export const MODEL_PROFILE_NAME_PATTERN_DESCRIPTION = "lowercase letters, numbers, dots, underscores, or hyphens";
+
+const ARCHIVED_MODEL_PROFILE_NAMESPACE = "__gjc_archived_profile__";
+const ARCHIVED_MODEL_PROFILE_PREFIX = `${ARCHIVED_MODEL_PROFILE_NAMESPACE}:`;
+const ARCHIVED_MODEL_PROFILE_V1_PREFIX = `${ARCHIVED_MODEL_PROFILE_PREFIX}v1:`;
+const MAX_ARCHIVED_MODEL_PROFILE_BYTES = 64 * 1024;
+const MAX_ARCHIVED_MODEL_PROFILE_BASE64URL_LENGTH = Math.ceil((MAX_ARCHIVED_MODEL_PROFILE_BYTES * 4) / 3);
+
+type ArchivedModelProfileEnvelopeInspection =
+	| { kind: "ordinary" }
+	| { kind: "quarantined"; name?: string; reason: string }
+	| { kind: "valid"; name: string; profile: ModelProfileConfig };
+
+function decodeCanonicalBase64Url(value: string): Buffer | undefined {
+	if (!value || !/^[A-Za-z0-9_-]+$/.test(value)) return undefined;
+	const decoded = Buffer.from(value, "base64url");
+	return decoded.toString("base64url") === value ? decoded : undefined;
+}
+
+function decodeUtf8(value: Buffer): string | undefined {
+	try {
+		return new TextDecoder("utf-8", { fatal: true }).decode(value);
+	} catch {
+		return undefined;
+	}
+}
+
+function encodeArchivedModelProfile(name: string, profile: ModelProfileConfig): string {
+	if (!MODEL_PROFILE_NAME_PATTERN.test(name)) {
+		throw new Error(
+			`Cannot archive custom model profile "${name}": profile ids must use ${MODEL_PROFILE_NAME_PATTERN_DESCRIPTION}.`,
+		);
+	}
+	const checkedProfile = ProfileDefinitionSchema.parse(profile);
+	const profileJson = JSON.stringify(checkedProfile);
+	if (Buffer.byteLength(profileJson, "utf8") > MAX_ARCHIVED_MODEL_PROFILE_BYTES) {
+		throw new Error(
+			`Cannot archive custom model profile "${name}": serialized profile exceeds ${MAX_ARCHIVED_MODEL_PROFILE_BYTES} bytes.`,
+		);
+	}
+	const encodedName = Buffer.from(name, "utf8").toString("base64url");
+	const encodedProfile = Buffer.from(profileJson, "utf8").toString("base64url");
+	return `${ARCHIVED_MODEL_PROFILE_V1_PREFIX}${encodedName}:${encodedProfile}`;
+}
+
+function inspectArchivedModelProfile(value: string): ArchivedModelProfileEnvelopeInspection {
+	if (!value.startsWith(ARCHIVED_MODEL_PROFILE_PREFIX)) return { kind: "ordinary" };
+
+	const parts = value.split(":");
+	if (parts.length !== 4 || parts[0] !== ARCHIVED_MODEL_PROFILE_NAMESPACE || parts[1] !== "v1") {
+		return { kind: "quarantined", reason: "unsupported version or malformed envelope syntax" };
+	}
+
+	const nameBytes = decodeCanonicalBase64Url(parts[2]);
+	if (!nameBytes) return { kind: "quarantined", reason: "profile name is not canonical base64url" };
+	const name = decodeUtf8(nameBytes);
+	if (!name) return { kind: "quarantined", reason: "profile name is not valid UTF-8" };
+	if (!MODEL_PROFILE_NAME_PATTERN.test(name)) {
+		return { kind: "quarantined", name, reason: "profile name is invalid" };
+	}
+
+	if (parts[3].length > MAX_ARCHIVED_MODEL_PROFILE_BASE64URL_LENGTH) {
+		return { kind: "quarantined", name, reason: "profile payload exceeds the size limit" };
+	}
+	const profileBytes = decodeCanonicalBase64Url(parts[3]);
+	if (!profileBytes) {
+		return { kind: "quarantined", name, reason: "profile payload is not canonical base64url" };
+	}
+	if (profileBytes.byteLength > MAX_ARCHIVED_MODEL_PROFILE_BYTES) {
+		return { kind: "quarantined", name, reason: "profile payload exceeds the size limit" };
+	}
+	const profileJson = decodeUtf8(profileBytes);
+	if (profileJson === undefined) {
+		return { kind: "quarantined", name, reason: "profile payload is not valid UTF-8" };
+	}
+
+	let decoded: unknown;
+	try {
+		decoded = JSON.parse(profileJson);
+	} catch {
+		return { kind: "quarantined", name, reason: "profile payload is not valid JSON" };
+	}
+	const profile = ProfileDefinitionSchema.safeParse(decoded);
+	if (!profile.success) {
+		return { kind: "quarantined", name, reason: "profile payload does not match the profile schema" };
+	}
+	return { kind: "valid", name, profile: profile.data };
+}
+
+function archivedModelProfilesFromExclusions(exclusions: readonly string[] | undefined): {
+	profiles: Record<string, ModelProfileConfig>;
+	equivalenceExclusions: string[];
+} {
+	const profiles: Record<string, ModelProfileConfig> = {};
+	const equivalenceExclusions: string[] = [];
+	for (const [index, exclusion] of (exclusions ?? []).entries()) {
+		const inspected = inspectArchivedModelProfile(exclusion);
+		if (inspected.kind === "ordinary") {
+			equivalenceExclusions.push(exclusion);
+			continue;
+		}
+		if (inspected.kind === "quarantined") {
+			logger.warn("Quarantining malformed archived model profile envelope", {
+				index,
+				reason: inspected.reason,
+			});
+			continue;
+		}
+		if (profiles[inspected.name]) {
+			logger.warn("Duplicate archived model profile envelope; using the last entry", {
+				index,
+				name: inspected.name,
+			});
+		}
+		profiles[inspected.name] = inspected.profile;
+	}
+	return { profiles, equivalenceExclusions };
+}
+
+function exclusionsWithArchivedModelProfile(
+	exclusions: readonly string[] | undefined,
+	name: string,
+	profile?: ModelProfileConfig,
+): string[] | undefined {
+	const retained = (exclusions ?? []).filter(exclusion => {
+		const inspected = inspectArchivedModelProfile(exclusion);
+		return inspected.kind !== "valid" || inspected.name !== name;
+	});
+	if (profile) retained.push(encodeArchivedModelProfile(name, profile));
+	return retained.length > 0 ? retained : undefined;
+}
+
+function withArchivedModelProfile(config: ModelsConfig, name: string, profile?: ModelProfileConfig): ModelsConfig {
+	const exclude = exclusionsWithArchivedModelProfile(config.equivalence?.exclude, name, profile);
+	const equivalence =
+		exclude || config.equivalence?.overrides
+			? {
+					...(config.equivalence ?? {}),
+					exclude,
+				}
+			: undefined;
+	return { ...config, equivalence };
+}
 export type GjcModelAssignmentTargetId = "default" | "executor" | "architect" | "planner" | "critic";
 
 export interface GjcModelAssignmentTargetInfo extends ModelRoleInfo {
@@ -541,6 +692,7 @@ interface CustomModelsResult {
 	equivalence?: ModelEquivalenceConfig;
 	modelBindings?: NonNullable<ModelsConfig["modelBindings"]>;
 	profiles?: ModelsConfig["profiles"];
+	archivedProfiles?: Record<string, ModelProfileConfig>;
 	error?: ConfigError;
 	found: boolean;
 }
@@ -1016,6 +1168,7 @@ export class ModelRegistry {
 	#equivalenceConfig: ModelEquivalenceConfig | undefined;
 	#configuredModelBindings: NonNullable<ModelsConfig["modelBindings"]> | undefined;
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
+	#archivedModelProfiles = new Map<string, ModelProfileDefinition>();
 	#modelBindingsTargetSettings: Settings | undefined;
 	#appliedModelBindingRoles = new Set<string>();
 	#appliedAgentModelBindingOverrides = new Set<string>();
@@ -1025,7 +1178,6 @@ export class ModelRegistry {
 	#lastAppliedAgentModelBindingOverrides = new Map<string, string>();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
-	#lastStaticLoadMtime: number | null = null;
 	#registeredProviderSources: Set<string> = new Set();
 	#providerDiscoveryStates: Map<string, ProviderDiscoveryState> = new Map();
 	#cacheDbPath?: string;
@@ -1049,8 +1201,20 @@ export class ModelRegistry {
 		readonly authStorage: AuthStorage,
 		modelsPath?: string,
 	) {
-		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
-		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
+		const configuredModelsPath = modelsPath ?? ModelsConfigFile.path();
+		let persistenceModelsPath = configuredModelsPath;
+		try {
+			persistenceModelsPath = syncFs.realpathSync.native(configuredModelsPath);
+		} catch {
+			try {
+				persistenceModelsPath = path.join(
+					syncFs.realpathSync.native(path.dirname(configuredModelsPath)),
+					path.basename(configuredModelsPath),
+				);
+			} catch {}
+		}
+		this.#modelsConfigFile = ModelsConfigFile.relocate(persistenceModelsPath);
+		this.#cacheDbPath = modelsPath ? path.join(path.dirname(persistenceModelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
 		this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
@@ -1110,11 +1274,6 @@ export class ModelRegistry {
 	}
 
 	#reloadStaticModels(): void {
-		const currentMtime = this.#modelsConfigFile.getMtimeMs();
-		if (currentMtime !== null && currentMtime === this.#lastStaticLoadMtime) {
-			// models.json unchanged since last load; reload + canonical rebuild would be redundant.
-			return;
-		}
 		this.#modelsConfigFile.invalidate();
 		this.#customProviderApiKeys.clear();
 		this.#providerWebSearchModes.clear();
@@ -1157,6 +1316,7 @@ export class ModelRegistry {
 			equivalence,
 			modelBindings,
 			profiles,
+			archivedProfiles,
 			error: configError,
 		} = this.#loadCustomModels();
 		this.#configError = configError;
@@ -1168,6 +1328,7 @@ export class ModelRegistry {
 		this.#equivalenceConfig = equivalence;
 		this.#configuredModelBindings = modelBindings;
 		this.#modelProfiles = mergeModelProfiles(profiles);
+		this.#archivedModelProfiles = mapUserModelProfiles(archivedProfiles);
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
 		const builtInModels = this.#applyHardcodedModelPolicies(this.#loadBuiltInModels(overrides));
@@ -1183,7 +1344,6 @@ export class ModelRegistry {
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
 		this.#models = this.#applyRuntimeProviderOverrides(withModelOverrides);
 		this.#rebuildCanonicalIndex();
-		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
 	}
 
 	/** Load built-in models, applying provider-level overrides only.
@@ -1546,6 +1706,17 @@ export class ModelRegistry {
 			}
 		}
 
+		const archivedProfiles = archivedModelProfilesFromExclusions(value.equivalence?.exclude);
+		const equivalence = value.equivalence
+			? {
+					...value.equivalence,
+					exclude:
+						archivedProfiles.equivalenceExclusions.length > 0
+							? archivedProfiles.equivalenceExclusions
+							: undefined,
+				}
+			: undefined;
+
 		return {
 			models: this.#parseModels(value),
 			overrides,
@@ -1553,9 +1724,10 @@ export class ModelRegistry {
 			keylessProviders,
 			discoverableProviders,
 			configuredProviders,
-			equivalence: value.equivalence,
+			equivalence,
 			modelBindings: value.modelBindings,
 			profiles: value.profiles,
+			archivedProfiles: archivedProfiles.profiles,
 			found: true,
 		};
 	}
@@ -1568,6 +1740,10 @@ export class ModelRegistry {
 		return this.#modelProfiles.get(name);
 	}
 
+	getModelProfileForReference(name: string): ModelProfileDefinition | undefined {
+		return this.#modelProfiles.get(name) ?? this.#archivedModelProfiles.get(name);
+	}
+
 	getAvailableModelProfileNames(): string[] {
 		return [...this.#modelProfiles.keys()].sort((a, b) => a.localeCompare(b));
 	}
@@ -1575,45 +1751,42 @@ export class ModelRegistry {
 	async saveCustomModelProfile(name: string, definition: ModelProfileConfig): Promise<ModelProfileDefinition> {
 		const normalizedName = name.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
+		if (!MODEL_PROFILE_NAME_PATTERN.test(normalizedName)) {
+			throw new Error(
+				`Invalid custom model profile id "${normalizedName}": use ${MODEL_PROFILE_NAME_PATTERN_DESCRIPTION}.`,
+			);
+		}
 		const checkedDefinition = ProfileDefinitionSchema.safeParse(definition);
 		if (!checkedDefinition.success) {
 			const first = checkedDefinition.error.issues[0];
 			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
 			throw new Error(`Custom model profile is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
 		}
-		const loaded = this.#modelsConfigFile.tryLoad();
-		if (loaded.status === "error") {
-			throw new Error(
-				`Cannot create custom model profile because ${this.#modelsConfigFile.path()} is invalid. Fix the existing config before saving a new preset.`,
-			);
-		}
-		const current = loaded.value ?? this.#modelsConfigFile.createDefault();
-		if (mergeModelProfiles(current.profiles).has(normalizedName)) {
-			throw new Error(`Custom model profile already exists: ${normalizedName}. Choose a unique preset id.`);
-		}
-		const next: ModelsConfig = {
-			...current,
-			profiles: {
-				...(current.profiles ?? {}),
-				[normalizedName]: definition,
-			},
-		};
-		const checkedConfig = ModelsConfigSchema.safeParse(next);
-		if (!checkedConfig.success) {
-			const first = checkedConfig.error.issues[0];
-			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
-			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
-		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		const modelMapping = { ...definition.model_mapping };
-		const profile: ModelProfileDefinition = {
-			name: normalizedName,
-			displayName: definition.display_name,
-			requiredProviders: aggregateModelProfileRequiredProviders(definition.required_providers, { modelMapping }),
-			modelMapping,
-			source: "user",
-		};
-		return profile;
+		return this.#withModelsConfigMutation(async source => {
+			const current = this.#loadBoundModelsConfig(source, "create") ?? this.#modelsConfigFile.createDefault();
+			if (mergeModelProfiles(current.profiles).has(normalizedName)) {
+				throw new Error(`Custom model profile already exists: ${normalizedName}. Choose a unique preset id.`);
+			}
+			const currentWithoutArchive = withArchivedModelProfile(current, normalizedName);
+			const checkedConfig = this.#validateGeneratedModelsConfig({
+				...currentWithoutArchive,
+				profiles: {
+					...(current.profiles ?? {}),
+					[normalizedName]: checkedDefinition.data,
+				},
+			});
+			await this.#writeCheckedModelsConfig(checkedConfig, source);
+			const modelMapping = { ...checkedDefinition.data.model_mapping };
+			return {
+				name: normalizedName,
+				displayName: checkedDefinition.data.display_name,
+				requiredProviders: aggregateModelProfileRequiredProviders(checkedDefinition.data.required_providers, {
+					modelMapping,
+				}),
+				modelMapping,
+				source: "user",
+			};
+		});
 	}
 
 	async renameCustomModelProfile(name: string, displayName: string): Promise<ModelProfileDefinition> {
@@ -1621,63 +1794,192 @@ export class ModelRegistry {
 		const nextDisplayName = displayName.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
 		if (!nextDisplayName) throw new Error("Profile display name is required.");
-		const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "rename");
-		const nextProfiles = {
-			...(current.profiles ?? {}),
-			[normalizedName]: {
-				...profile,
-				display_name: nextDisplayName,
-			},
-		};
-		const checkedConfig = ModelsConfigSchema.safeParse({ ...current, profiles: nextProfiles });
-		if (!checkedConfig.success) {
-			const first = checkedConfig.error.issues[0];
-			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
-			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
-		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		const modelMapping = { ...profile.model_mapping };
-		return {
-			name: normalizedName,
-			displayName: nextDisplayName,
-			requiredProviders: aggregateModelProfileRequiredProviders(profile.required_providers, { modelMapping }),
-			modelMapping,
-			source: "user",
-		};
+		return this.#withModelsConfigMutation(async source => {
+			const { current, profile } = this.#loadCustomProfileForMutation(
+				normalizedName,
+				"rename",
+				this.#loadBoundModelsConfig(source, "rename") ?? this.#modelsConfigFile.createDefault(),
+			);
+			const checkedConfig = this.#validateGeneratedModelsConfig({
+				...current,
+				profiles: {
+					...(current.profiles ?? {}),
+					[normalizedName]: {
+						...profile,
+						display_name: nextDisplayName,
+					},
+				},
+			});
+			await this.#writeCheckedModelsConfig(checkedConfig, source);
+			const modelMapping = { ...profile.model_mapping };
+			return {
+				name: normalizedName,
+				displayName: nextDisplayName,
+				requiredProviders: aggregateModelProfileRequiredProviders(profile.required_providers, { modelMapping }),
+				modelMapping,
+				source: "user",
+			};
+		});
 	}
 
 	async deleteCustomModelProfile(name: string): Promise<ModelProfileConfig> {
 		const normalizedName = name.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
-		const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "delete");
-		const nextProfiles = { ...(current.profiles ?? {}) };
-		delete nextProfiles[normalizedName];
-		const checkedConfig = ModelsConfigSchema.safeParse({
-			...current,
-			profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
+		return this.#withModelsConfigMutation(async source => {
+			const { current, profile } = this.#loadCustomProfileForMutation(
+				normalizedName,
+				"delete",
+				this.#loadBoundModelsConfig(source, "delete") ?? this.#modelsConfigFile.createDefault(),
+			);
+			const nextProfiles = { ...(current.profiles ?? {}) };
+			delete nextProfiles[normalizedName];
+			const checkedConfig = this.#validateGeneratedModelsConfig(
+				withArchivedModelProfile(
+					{
+						...current,
+						profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
+					},
+					normalizedName,
+					profile,
+				),
+			);
+			await this.#writeCheckedModelsConfig(checkedConfig, source);
+			return profile;
 		});
+	}
+
+	async #withModelsConfigMutation<T>(mutation: (source: ModelsConfigMutationSource) => Promise<T>): Promise<T> {
+		const configPath = this.#modelsConfigFile.path();
+		await fs.mkdir(path.dirname(configPath), { recursive: true });
+		this.#statModelsConfigForReplacement();
+		return withFileLock(configPath, async () => {
+			this.#statModelsConfigForReplacement();
+			const source = this.#captureModelsConfigMutationSource();
+			this.#modelsConfigFile.invalidate();
+			return mutation(source);
+		});
+	}
+
+	#statModelsConfigForReplacement(): syncFs.Stats | undefined {
+		const configPath = this.#modelsConfigFile.path();
+		try {
+			const stat = syncFs.statSync(configPath);
+			if (stat.nlink > 1) {
+				throw new Error(`Refusing to replace hard-linked models config: ${configPath}`);
+			}
+			return stat;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+	}
+	#modelsConfigDigest(content: Uint8Array): Buffer {
+		return crypto.createHash("sha256").update(content).digest();
+	}
+
+	#captureModelsConfigMutationSource(): ModelsConfigMutationSource {
+		let handle: number | undefined;
+		try {
+			handle = syncFs.openSync(this.#modelsConfigFile.path(), "r");
+			const stat = syncFs.fstatSync(handle);
+			if (stat.nlink > 1)
+				throw new Error(`Refusing to replace hard-linked models config: ${this.#modelsConfigFile.path()}`);
+			const bytes = syncFs.readFileSync(handle);
+			const finalStat = syncFs.fstatSync(handle);
+			if (
+				finalStat.dev !== stat.dev ||
+				finalStat.ino !== stat.ino ||
+				finalStat.size !== stat.size ||
+				finalStat.mtimeMs !== stat.mtimeMs
+			) {
+				throw new Error(
+					`Refusing to replace models config changed while reading: ${this.#modelsConfigFile.path()}`,
+				);
+			}
+			return { bytes, digest: this.#modelsConfigDigest(bytes), stat };
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+			throw error;
+		} finally {
+			if (handle !== undefined) syncFs.closeSync(handle);
+		}
+	}
+
+	#modelsConfigDigestMatches(expectedDigest: Buffer | undefined, content?: Uint8Array): boolean {
+		const actualDigest = content ? this.#modelsConfigDigest(content) : this.#readLiveModelsConfigDigest();
+		return (
+			expectedDigest !== undefined &&
+			actualDigest !== undefined &&
+			actualDigest.byteLength === expectedDigest.byteLength &&
+			crypto.timingSafeEqual(actualDigest, expectedDigest)
+		);
+	}
+	#readLiveModelsConfigDigest(): Buffer | undefined {
+		try {
+			return this.#modelsConfigDigest(syncFs.readFileSync(this.#modelsConfigFile.path()));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+	}
+
+	#validateGeneratedModelsConfig(candidate: ModelsConfig): ModelsConfig {
+		const checkedConfig = ModelsConfigSchema.safeParse(candidate);
 		if (!checkedConfig.success) {
 			const first = checkedConfig.error.issues[0];
 			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
 			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
 		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		return profile;
+		return checkedConfig.data;
 	}
 
+	#loadBoundModelsConfig(
+		source: ModelsConfigMutationSource,
+		action: "create" | "rename" | "delete",
+	): ModelsConfig | undefined {
+		if (!source.bytes) return undefined;
+		try {
+			const checked = ModelsConfigSchema.safeParse(Bun.YAML.parse(source.bytes.toString("utf8").trim()));
+			if (!checked.success) throw checked.error;
+			for (const [providerName, providerConfig] of Object.entries(checked.data.providers ?? {})) {
+				validateProviderConfiguration(
+					providerName,
+					{
+						baseUrl: providerConfig.baseUrl,
+						headers: providerConfig.headers,
+						apiKey: providerConfig.apiKey,
+						apiKeyEnv: providerConfig.apiKeyEnv,
+						api: providerConfig.api as Api | undefined,
+						auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
+						discovery: providerConfig.discovery as ProviderDiscovery | undefined,
+						compat: providerConfig.compat,
+						requestTransform: providerConfig.requestTransform,
+						disableStrictTools: providerConfig.disableStrictTools,
+						cacheRetention: providerConfig.cacheRetention,
+						openaiCompat: providerConfig.openaiCompat,
+						modelOverrides: providerConfig.modelOverrides,
+						models: (providerConfig.models ?? []) as ProviderValidationModel[],
+					},
+					"models-config",
+				);
+			}
+			return checked.data;
+		} catch {
+			throw new Error(
+				`Cannot ${action} custom model profile because ${this.#modelsConfigFile.path()} is invalid. Fix the existing config before ${action === "create" ? "saving a new preset" : "modifying presets"}.`,
+			);
+		}
+	}
 	#loadCustomProfileForMutation(
 		normalizedName: string,
 		action: "rename" | "delete",
+		current: ModelsConfig,
 	): { current: ModelsConfig; profile: ModelProfileConfig } {
-		const loaded = this.#modelsConfigFile.tryLoad();
-		if (loaded.status === "error") {
-			throw new Error(
-				`Cannot ${action} custom model profile because ${this.#modelsConfigFile.path()} is invalid. Fix the existing config before modifying presets.`,
-			);
-		}
-		const current = loaded.value ?? this.#modelsConfigFile.createDefault();
 		const profile = current.profiles?.[normalizedName];
 		if (!profile) {
+			if (archivedModelProfilesFromExclusions(current.equivalence?.exclude).profiles[normalizedName]) {
+				throw new Error(`Custom model profile is already deleted: ${normalizedName}.`);
+			}
 			const existing = this.#modelProfiles.get(normalizedName);
 			if (existing && existing.source !== "user") {
 				throw new Error(`Cannot ${action} bundled model profile: ${normalizedName}.`);
@@ -1687,11 +1989,277 @@ export class ModelRegistry {
 		return { current, profile };
 	}
 
-	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
-		await fs.mkdir(path.dirname(this.#modelsConfigFile.path()), { recursive: true });
-		await Bun.write(this.#modelsConfigFile.path(), Bun.YAML.stringify(config, null, 2));
+	async #writeCheckedModelsConfig(config: ModelsConfig, source: ModelsConfigMutationSource): Promise<void> {
+		const configPath = this.#modelsConfigFile.path();
+		await fs.mkdir(path.dirname(configPath), { recursive: true });
+		const existingStat = this.#statModelsConfigForReplacement();
+		const sourceStat = source.stat ?? existingStat;
+		const tempPath = `${configPath}.${crypto.randomUUID()}.tmp`;
+		const rollbackPath = `${configPath}.${crypto.randomUUID()}.rollback`;
+		const verificationRecoveryPath = `${configPath}.recovery`;
+		let fileHandle: number | undefined;
+		let originalHandle: number | undefined;
+		let rollbackCreated = false;
+		let verificationRecoveryCreated = false;
+		let preserveRecovery = false;
+		let committed = false;
+		try {
+			fileHandle = syncFs.openSync(tempPath, "wx", sourceStat ? sourceStat.mode & 0o7777 : 0o600);
+			syncFs.writeFileSync(fileHandle, Bun.YAML.stringify(config, null, 2), "utf8");
+			if (sourceStat && process.platform !== "win32") {
+				syncFs.fchownSync(fileHandle, sourceStat.uid, sourceStat.gid);
+			}
+			syncFs.fchmodSync(fileHandle, sourceStat ? sourceStat.mode & 0o7777 : 0o600);
+			syncFs.fsyncSync(fileHandle);
+			syncFs.closeSync(fileHandle);
+			fileHandle = undefined;
+			const replacementStat = syncFs.statSync(tempPath);
+
+			if (existingStat) {
+				if (!source.digest || !source.stat) {
+					throw new Error(`Refusing to replace models config without checked source bytes: ${configPath}`);
+				}
+				syncFs.linkSync(configPath, rollbackPath);
+				rollbackCreated = true;
+				this.#fsyncModelsConfigParentOrThrow(configPath);
+				originalHandle = syncFs.openSync(rollbackPath, "r");
+				const rollbackStat = syncFs.fstatSync(originalHandle);
+				const liveStat = syncFs.statSync(configPath);
+				const identityChanged =
+					rollbackStat.dev !== source.stat.dev ||
+					rollbackStat.ino !== source.stat.ino ||
+					liveStat.dev !== source.stat.dev ||
+					liveStat.ino !== source.stat.ino;
+				const metadataChanged =
+					(liveStat.mode & 0o7777) !== (source.stat.mode & 0o7777) ||
+					liveStat.uid !== source.stat.uid ||
+					liveStat.gid !== source.stat.gid;
+				if (
+					identityChanged ||
+					metadataChanged ||
+					rollbackStat.nlink !== 2 ||
+					liveStat.nlink !== 2 ||
+					!this.#modelsConfigDigestMatches(source.digest)
+				) {
+					throw new Error(`Refusing to replace models config changed during mutation: ${configPath}`);
+				}
+
+				// POSIX rename replaces the canonical entry atomically: readers see either
+				// the checked source or the complete replacement, never a missing pathname.
+				syncFs.renameSync(tempPath, configPath);
+				committed = true;
+			} else {
+				if (source.stat) {
+					throw new Error(`Refusing to create models config whose checked source disappeared: ${configPath}`);
+				}
+				try {
+					syncFs.linkSync(tempPath, configPath);
+					committed = true;
+					syncFs.unlinkSync(tempPath);
+				} catch (commitError) {
+					throw new Error(`Models config changed at the exclusive commit boundary: ${String(commitError)}`);
+				}
+			}
+
+			const committedStat = syncFs.statSync(configPath);
+			if (committedStat.dev !== replacementStat.dev || committedStat.ino !== replacementStat.ino) {
+				preserveRecovery = rollbackCreated;
+				throw new Error(`Models config changed immediately after commit: ${configPath}`);
+			}
+			if (rollbackCreated && originalHandle !== undefined && source.stat) {
+				const originalStat = syncFs.fstatSync(originalHandle);
+				if (
+					(originalStat.mode & 0o7777) !== (source.stat.mode & 0o7777) ||
+					originalStat.uid !== source.stat.uid ||
+					originalStat.gid !== source.stat.gid
+				) {
+					this.#replaceModelsConfigRecovery(originalHandle, verificationRecoveryPath, source.stat);
+					verificationRecoveryCreated = true;
+					preserveRecovery = true;
+					throw new Error(
+						`Models config metadata changed at the atomic commit boundary; recovery evidence preserved`,
+					);
+				}
+			}
+
+			if (rollbackCreated && originalHandle !== undefined && source.stat) {
+				if (syncFs.fstatSync(originalHandle).nlink !== 1) {
+					preserveRecovery = true;
+					throw new Error(`Models config hard-link state became ambiguous during commit; recovery file preserved`);
+				}
+				const originalBytes = this.#readModelsConfigHandle(originalHandle);
+				if (!this.#modelsConfigDigestMatches(source.digest, originalBytes)) {
+					this.#replaceModelsConfigRecovery(originalHandle, verificationRecoveryPath, source.stat);
+					verificationRecoveryCreated = true;
+					preserveRecovery = true;
+					throw new Error(`Models config changed at the atomic commit boundary; recovery file preserved`);
+				}
+				const preRotationStat = syncFs.fstatSync(originalHandle);
+				if (
+					preRotationStat.nlink !== 1 ||
+					(preRotationStat.mode & 0o7777) !== (source.stat.mode & 0o7777) ||
+					preRotationStat.uid !== source.stat.uid ||
+					preRotationStat.gid !== source.stat.gid ||
+					!this.#modelsConfigDigestMatches(source.digest, this.#readModelsConfigHandle(originalHandle))
+				) {
+					preserveRecovery = true;
+					throw new Error(`Models config changed during recovery cleanup; recovery evidence preserved`);
+				}
+				syncFs.renameSync(rollbackPath, verificationRecoveryPath);
+				rollbackCreated = false;
+				verificationRecoveryCreated = true;
+				this.#fsyncModelsConfigParentOrThrow(verificationRecoveryPath);
+				const rotatedStat = syncFs.fstatSync(originalHandle);
+				const recoveryStat = syncFs.statSync(verificationRecoveryPath);
+				if (
+					recoveryStat.dev !== rotatedStat.dev ||
+					recoveryStat.ino !== rotatedStat.ino ||
+					rotatedStat.nlink !== 1 ||
+					(rotatedStat.mode & 0o7777) !== (source.stat.mode & 0o7777) ||
+					rotatedStat.uid !== source.stat.uid ||
+					rotatedStat.gid !== source.stat.gid ||
+					!this.#modelsConfigDigestMatches(source.digest, this.#readModelsConfigHandle(originalHandle))
+				) {
+					preserveRecovery = true;
+					throw new Error(
+						`Models config hard-link state became ambiguous during recovery rotation; recovery file preserved`,
+					);
+				}
+			}
+
+			const finalStat = syncFs.statSync(configPath);
+			if (finalStat.dev !== replacementStat.dev || finalStat.ino !== replacementStat.ino) {
+				throw new Error(`Models config changed before commit verification completed: ${configPath}`);
+			}
+			// Keep one durable previous-generation recovery for every existing-file
+			// replacement; it bounds retained-descriptor recovery races without accumulating files.
+			this.#fsyncModelsConfigParent(configPath);
+		} catch (error) {
+			const reportedError = committed
+				? new Error(
+						`Models config was committed, but verification failed; recovery evidence preserved: ${String(error)}`,
+					)
+				: error;
+			if (committed && (rollbackCreated || verificationRecoveryCreated)) {
+				preserveRecovery = true;
+			}
+			throw reportedError;
+		} finally {
+			if (fileHandle !== undefined) {
+				try {
+					syncFs.closeSync(fileHandle);
+				} catch {}
+			}
+			if (originalHandle !== undefined) {
+				try {
+					syncFs.closeSync(originalHandle);
+				} catch {}
+			}
+			try {
+				syncFs.rmSync(tempPath, { force: true });
+			} catch (error) {
+				logger.warn("models config temp cleanup failed", {
+					path: tempPath,
+					error: String(error),
+				});
+			}
+			if (!preserveRecovery && rollbackCreated) {
+				try {
+					syncFs.rmSync(rollbackPath, { force: true });
+				} catch (error) {
+					logger.warn("models config recovery cleanup failed", {
+						path: rollbackPath,
+						error: String(error),
+					});
+				}
+			}
+		}
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();
+	}
+
+	#readModelsConfigHandle(handle: number): Buffer {
+		const size = syncFs.fstatSync(handle).size;
+		const content = Buffer.alloc(size);
+		let offset = 0;
+		while (offset < content.length) {
+			const read = syncFs.readSync(handle, content, offset, content.length - offset, offset);
+			if (read === 0) throw new Error("Unable to read complete models config recovery bytes");
+			offset += read;
+		}
+		return content;
+	}
+	#replaceModelsConfigRecovery(handle: number, recoveryPath: string, sourceStat: syncFs.Stats): void {
+		const lateRecoveryPath = `${recoveryPath}.${crypto.randomUUID()}.late`;
+		try {
+			this.#materializeModelsConfigRecovery(handle, lateRecoveryPath, sourceStat);
+			syncFs.renameSync(lateRecoveryPath, recoveryPath);
+			this.#fsyncModelsConfigParentOrThrow(recoveryPath);
+		} catch (error) {
+			try {
+				syncFs.rmSync(lateRecoveryPath, { force: true });
+			} catch {}
+			throw error;
+		}
+	}
+	#materializeModelsConfigRecovery(handle: number, recoveryPath: string, existingStat: syncFs.Stats): void {
+		const content = this.#readModelsConfigHandle(handle);
+		let recoveryHandle: number | undefined;
+		let recoveryCreated = false;
+		let recoveryComplete = false;
+		try {
+			recoveryHandle = syncFs.openSync(recoveryPath, "wx", existingStat.mode & 0o7777);
+			recoveryCreated = true;
+			syncFs.writeFileSync(recoveryHandle, content);
+			if (process.platform !== "win32") {
+				syncFs.fchownSync(recoveryHandle, existingStat.uid, existingStat.gid);
+			}
+			syncFs.fchmodSync(recoveryHandle, existingStat.mode & 0o7777);
+			syncFs.fsyncSync(recoveryHandle);
+			syncFs.closeSync(recoveryHandle);
+			recoveryHandle = undefined;
+			recoveryComplete = true;
+			this.#fsyncModelsConfigParentOrThrow(recoveryPath);
+		} catch (error) {
+			if (recoveryHandle !== undefined) {
+				try {
+					syncFs.closeSync(recoveryHandle);
+				} catch {}
+			}
+			if (recoveryCreated && !recoveryComplete) {
+				try {
+					syncFs.rmSync(recoveryPath, { force: true });
+				} catch {}
+			}
+			throw error;
+		}
+	}
+	#fsyncModelsConfigParentOrThrow(configPath: string): void {
+		if (process.platform === "win32") return;
+		const directoryHandle = syncFs.openSync(path.dirname(configPath), "r");
+		try {
+			syncFs.fsyncSync(directoryHandle);
+		} finally {
+			syncFs.closeSync(directoryHandle);
+		}
+	}
+	#fsyncModelsConfigParent(configPath: string): void {
+		if (process.platform === "win32") return;
+		try {
+			const directoryHandle = syncFs.openSync(path.dirname(configPath), "r");
+			try {
+				syncFs.fsyncSync(directoryHandle);
+			} finally {
+				syncFs.closeSync(directoryHandle);
+			}
+		} catch (error) {
+			// The rename already committed or restored a checked config. A parent
+			// fsync warning must not turn that result into a reported failure.
+			logger.warn("models config parent directory fsync failed", {
+				path: configPath,
+				error: String(error),
+			});
+		}
 	}
 	applyConfiguredModelBindings(targetSettings: Settings): void {
 		this.#modelBindingsTargetSettings = targetSettings;
@@ -1702,7 +2270,7 @@ export class ModelRegistry {
 		const targetSettings = this.#modelBindingsTargetSettings;
 		if (!targetSettings) return;
 		const bindings = this.#configuredModelBindings;
-		const nextModelRoles = { ...targetSettings.get("modelRoles") };
+		const nextModelRoles = { ...(targetSettings.getRuntimeOverride("modelRoles") ?? {}) };
 		const configuredModelRoles = bindings?.modelRoles ?? {};
 		const configuredModelRoleKeys = new Set(Object.keys(configuredModelRoles));
 		for (const role of this.#appliedModelBindingRoles) {
@@ -1733,7 +2301,9 @@ export class ModelRegistry {
 		targetSettings.override("modelRoles", nextModelRoles);
 		this.#appliedModelBindingRoles = new Set(Object.keys(configuredModelRoles));
 
-		const nextAgentModelOverrides = { ...targetSettings.get("task.agentModelOverrides") };
+		const nextAgentModelOverrides = {
+			...(targetSettings.getRuntimeOverride("task.agentModelOverrides") ?? {}),
+		};
 		const configuredAgentModelOverrides = bindings?.agentModelOverrides ?? {};
 		const configuredAgentModelOverrideKeys = new Set(Object.keys(configuredAgentModelOverrides));
 		for (const agentName of this.#appliedAgentModelBindingOverrides) {
@@ -2744,7 +3314,6 @@ export class ModelRegistry {
 			this.#runtimeProviderSourceByName.delete(providerName);
 			this.#clearRuntimeProviderState(providerName);
 		}
-		this.#lastStaticLoadMtime = null;
 		this.#reloadStaticModels();
 		this.#rebuildCanonicalIndex();
 	}
@@ -2824,7 +3393,6 @@ export class ModelRegistry {
 			this.#runtimeProviderSourceByName.set(providerName, sourceId);
 		}
 		if (sourceHandoff) {
-			this.#lastStaticLoadMtime = null;
 			this.#reloadStaticModels();
 		}
 

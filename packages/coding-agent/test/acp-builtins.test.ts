@@ -82,11 +82,17 @@ interface FakeAcpBuiltinSession {
 	getAvailableThinkingLevels(): ThinkingLevel[];
 	setModel(model: unknown): Promise<void>;
 	setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean): void;
+	setModelForSettingsCommit(model: FakeAcpBuiltinSession["model"], thinkingLevel?: ThinkingLevel): Promise<void>;
+	commitSettingsModelChange(model: NonNullable<FakeAcpBuiltinSession["model"]>): Promise<void>;
+	cancelSettingsModelChange(): void;
+	getSessionDefaultModelSelector(): string | undefined;
 }
 
 function createRuntime() {
 	const output: string[] = [];
 	const settings = Settings.isolated();
+	let pendingSettingsModel: FakeAcpBuiltinSession["model"];
+	let pendingSettingsThinkingLevel: ThinkingLevel | undefined;
 	const session: FakeAcpBuiltinSession = {
 		fastMode: false,
 		forcedToolChoice: undefined as string | undefined,
@@ -170,10 +176,27 @@ function createRuntime() {
 		getAvailableModels: () => [] as Array<{ provider: string; id: string; contextWindow?: number }>,
 		getAvailableThinkingLevels: () => [ThinkingLevel.Low, ThinkingLevel.Medium, ThinkingLevel.High],
 		async setModel(_model: unknown) {},
+		async setModelForSettingsCommit(model, thinkingLevel) {
+			pendingSettingsModel = model;
+			pendingSettingsThinkingLevel = thinkingLevel;
+		},
+		async commitSettingsModelChange(model) {
+			if (pendingSettingsModel === model) {
+				this.model = model;
+				this.thinkingLevel = pendingSettingsThinkingLevel;
+				pendingSettingsModel = undefined;
+				pendingSettingsThinkingLevel = undefined;
+			}
+		},
+		cancelSettingsModelChange() {
+			pendingSettingsModel = undefined;
+			pendingSettingsThinkingLevel = undefined;
+		},
 		setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean) {
 			this.thinkingLevel = thinkingLevel;
 			this.thinkingLevelCalls.push({ thinkingLevel, persist });
 		},
+		getSessionDefaultModelSelector: () => undefined,
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};
 	const typedSession = session as unknown as AgentSession & FakeAcpBuiltinSession;
@@ -492,15 +515,12 @@ describe("ACP builtin slash commands", () => {
 		runtime.notifyConfigChanged = () => {
 			configNotified++;
 		};
-		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+		const setModelSpy = spyOn(session, "setModelForSettingsCommit").mockResolvedValue(undefined);
 
 		const result = await executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
-			selector: "anthropic/claude-3-5-sonnet",
-			thinkingLevel: undefined,
-		});
+		expect(setModelSpy).toHaveBeenCalledWith(available[0], "high");
 		expect(output[0]).toContain("Default model set to anthropic/claude-3-5-sonnet");
 		expect(titleNotified).toBe(1);
 		expect(configNotified).toBe(1);
@@ -510,34 +530,24 @@ describe("ACP builtin slash commands", () => {
 		const { runtime, session } = createRuntime();
 		const available = [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
 		session.getAvailableModels = () => available;
-		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
-		const setThinkingLevelSpy = spyOn(session, "setThinkingLevel");
+		const setModelSpy = spyOn(session, "setModelForSettingsCommit").mockResolvedValue(undefined);
 
 		const result = await executeAcpBuiltinSlashCommand("/model anthropic/claude-3-5-sonnet:low", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
-			selector: "anthropic/claude-3-5-sonnet",
-			thinkingLevel: "low",
-		});
-		expect(setThinkingLevelSpy).toHaveBeenCalledWith("low");
+		expect(setModelSpy).toHaveBeenCalledWith(available[0], "low");
 	});
 
 	it("model: applies explicit thinking level from a bare model id", async () => {
 		const { output, runtime, session } = createRuntime();
 		const available = [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
 		session.getAvailableModels = () => available;
-		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
-		const setThinkingLevelSpy = spyOn(session, "setThinkingLevel");
+		const setModelSpy = spyOn(session, "setModelForSettingsCommit").mockResolvedValue(undefined);
 
 		const result = await executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet:low", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
-			selector: "anthropic/claude-3-5-sonnet",
-			thinkingLevel: "low",
-		});
-		expect(setThinkingLevelSpy).toHaveBeenCalledWith("low");
+		expect(setModelSpy).toHaveBeenCalledWith(available[0], "low");
 		expect(output[0]).toContain("Default model set to anthropic/claude-3-5-sonnet:low");
 	});
 

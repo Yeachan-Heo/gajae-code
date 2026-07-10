@@ -110,7 +110,7 @@ import { AgentSession, type ForkContextSeed } from "./session/agent-session";
 import { resolveAuthBrokerConfig } from "./session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "./session/auth-storage";
 import { type CustomMessage, convertToLlm } from "./session/messages";
-import { SessionManager } from "./session/session-manager";
+import { hasPersistedThinkingLevel, SessionManager } from "./session/session-manager";
 import { formatNoModelsAvailableFallback } from "./setup/model-onboarding-guidance";
 import { closeAllConnections } from "./ssh/connection-manager";
 import { unmountAll } from "./ssh/sshfs-mount";
@@ -1057,7 +1057,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	);
 	const existingBranch = logger.time("getSessionBranch", () => sessionManager.getBranch());
 	const hasExistingSession = existingBranch.length > 0;
-	const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
+	const hasThinkingEntry = hasPersistedThinkingLevel(existingBranch);
 	const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
 
 	const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;

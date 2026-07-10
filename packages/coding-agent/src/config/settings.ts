@@ -11,9 +11,12 @@
  *   const isolated = Settings.isolated({ "compaction.enabled": false });
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -54,6 +57,164 @@ export * from "./settings-schema";
 export interface RawSettings {
 	[key: string]: unknown;
 }
+type SettingMutationGuard =
+	| { kind: "unconditional" }
+	| {
+			kind: "if-unchanged";
+			expectedValue: unknown;
+			expectedGeneration: string;
+			expectedRevision: number;
+	  };
+
+interface DurableSettingRevisionEntry {
+	revision: number;
+	ownerId: string;
+	mutationId: number;
+}
+
+interface DurableSettingsRevisionState {
+	version: 1;
+	nextRevision: number;
+	generation: string;
+	entries: Record<string, DurableSettingRevisionEntry>;
+}
+
+interface LoadedSettingsRevisionState {
+	state: DurableSettingsRevisionState;
+	exists: boolean;
+}
+
+interface ConditionalMutationOutcome {
+	expectedValue: unknown;
+	desiredValue: unknown;
+	applied: boolean;
+	revision: number;
+	generation: string;
+}
+
+interface SettingsMutationContext {
+	id: number;
+	active: boolean;
+}
+interface PendingSettingMutation {
+	id: number;
+	desiredValue: unknown;
+	guard: SettingMutationGuard;
+	attempted: boolean;
+	predecessorGeneration?: string;
+	predecessorRevision?: number;
+	predecessorValue?: unknown;
+	checkpointId?: number;
+}
+
+const SETTINGS_REVISION_STATE_VERSION = 1 as const;
+const SETTINGS_REVISION_GENERATION_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function emptySettingsRevisionState(): DurableSettingsRevisionState {
+	return {
+		version: SETTINGS_REVISION_STATE_VERSION,
+		generation: crypto.randomUUID(),
+		nextRevision: 1,
+		entries: {},
+	};
+}
+
+function isValidRevisionPath(modifiedPath: string): boolean {
+	if (!modifiedPath.startsWith(RECORD_ENTRY_MUTATION_PREFIX)) {
+		return (
+			modifiedPath !== "modelRoles" &&
+			modifiedPath !== "task.agentModelOverrides" &&
+			Object.hasOwn(SETTINGS_SCHEMA, modifiedPath)
+		);
+	}
+	try {
+		const segments = decodeModifiedPath(modifiedPath);
+		if (segments.length === 2 && segments[0] === "modelRoles" && isValidRecordEntryMutationKey(segments[1])) {
+			return modifiedPath === encodeRecordEntryMutation("modelRoles", segments[1]);
+		}
+		if (
+			segments.length === 3 &&
+			segments[0] === "task" &&
+			segments[1] === "agentModelOverrides" &&
+			isValidRecordEntryMutationKey(segments[2])
+		) {
+			return modifiedPath === encodeRecordEntryMutation("task.agentModelOverrides", segments[2]);
+		}
+		return false;
+	} catch {
+		return false;
+	}
+}
+
+function parseSettingsRevisionState(value: unknown): DurableSettingsRevisionState {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("Invalid settings revision state");
+	}
+	const raw = value as Record<string, unknown>;
+	if (
+		raw.version !== SETTINGS_REVISION_STATE_VERSION ||
+		typeof raw.generation !== "string" ||
+		!SETTINGS_REVISION_GENERATION_PATTERN.test(raw.generation) ||
+		!Number.isSafeInteger(raw.nextRevision) ||
+		(raw.nextRevision as number) < 1
+	) {
+		throw new Error("Invalid settings revision state header");
+	}
+	if (!raw.entries || typeof raw.entries !== "object" || Array.isArray(raw.entries)) {
+		throw new Error("Invalid settings revision state entries");
+	}
+
+	const entries: Record<string, DurableSettingRevisionEntry> = {};
+	let maxRevision = 0;
+	for (const [modifiedPath, candidate] of Object.entries(raw.entries)) {
+		if (!isValidRevisionPath(modifiedPath)) {
+			throw new Error(`Invalid settings revision path: ${modifiedPath}`);
+		}
+		if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+			throw new Error(`Invalid settings revision entry: ${modifiedPath}`);
+		}
+		const entry = candidate as Record<string, unknown>;
+		if (
+			!Number.isSafeInteger(entry.revision) ||
+			(entry.revision as number) < 1 ||
+			typeof entry.ownerId !== "string" ||
+			entry.ownerId.length === 0 ||
+			!Number.isSafeInteger(entry.mutationId) ||
+			(entry.mutationId as number) < 1
+		) {
+			throw new Error(`Invalid settings revision entry: ${modifiedPath}`);
+		}
+		const revision = entry.revision as number;
+		entries[modifiedPath] = {
+			revision,
+			ownerId: entry.ownerId,
+			mutationId: entry.mutationId as number,
+		};
+		maxRevision = Math.max(maxRevision, revision);
+	}
+	if ((raw.nextRevision as number) <= maxRevision) {
+		throw new Error("Invalid settings revision ordering");
+	}
+
+	return {
+		generation: raw.generation,
+		version: SETTINGS_REVISION_STATE_VERSION,
+		nextRevision: raw.nextRevision as number,
+		entries,
+	};
+}
+
+function mutationValuesMatch(mutation: PendingSettingMutation, currentValue: unknown): boolean {
+	if (mutation.guard.kind === "unconditional") return true;
+	return Object.is(currentValue, mutation.guard.expectedValue) || Object.is(currentValue, mutation.desiredValue);
+}
+
+function mutationRetryValuesMatch(mutation: PendingSettingMutation, currentValue: unknown): boolean {
+	return (
+		isDeepStrictEqual(currentValue, mutation.predecessorValue) ||
+		isDeepStrictEqual(currentValue, mutation.desiredValue)
+	);
+}
 
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
@@ -64,6 +225,22 @@ export interface SettingsOptions {
 	inMemory?: boolean;
 	/** Initial overrides */
 	overrides?: Partial<Record<SettingPath, unknown>>;
+}
+
+export interface SettingsMutationCheckpoint {
+	readonly ownerId: string;
+	readonly id: number;
+}
+
+interface SettingsMutationSnapshot {
+	global: RawSettings;
+	overrides: RawSettings;
+	modified: Map<string, PendingSettingMutation>;
+	conditionalOutcomes: Map<string, ConditionalMutationOutcome>;
+	context: SettingsMutationContext;
+	state: "active" | "flushing" | "flushed" | "failed";
+	flushedMutationVersion?: number;
+	release: () => void;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -79,6 +256,9 @@ function getByPath(obj: RawSettings, segments: string[]): unknown {
 		if (current === null || current === undefined || typeof current !== "object") {
 			return undefined;
 		}
+		if (!Object.hasOwn(current, segment)) {
+			return undefined;
+		}
 		current = (current as Record<string, unknown>)[segment];
 	}
 	return current;
@@ -92,7 +272,7 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 	let current = obj;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const segment = segments[i];
-		if (!(segment in current) || typeof current[segment] !== "object" || current[segment] === null) {
+		if (!Object.hasOwn(current, segment) || typeof current[segment] !== "object" || current[segment] === null) {
 			current[segment] = {};
 		}
 		current = current[segment] as RawSettings;
@@ -141,13 +321,43 @@ function stringArrayFromUnknown(value: unknown): string[] {
 function shallowStringRecord(value: unknown): Record<string, string> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
 
-	const result: Record<string, string> = {};
+	const result: Record<string, string> = Object.create(null);
 	for (const [key, item] of Object.entries(value)) {
 		if (typeof item === "string") {
 			result[key] = item;
 		}
 	}
 	return result;
+}
+
+const FORBIDDEN_RECORD_ENTRY_MUTATION_KEYS = new Set(["prototype"]);
+
+function isValidRecordEntryMutationKey(key: string): boolean {
+	return key.length > 0 && !FORBIDDEN_RECORD_ENTRY_MUTATION_KEYS.has(key) && !Object.hasOwn(Object.prototype, key);
+}
+
+function assertValidRecordEntryMutationKey(key: string): void {
+	if (key.length === 0) {
+		throw new Error("Model assignment key cannot be empty");
+	}
+	if (!isValidRecordEntryMutationKey(key)) {
+		throw new Error(`Model assignment key is not allowed: ${key}`);
+	}
+}
+
+const RECORD_ENTRY_MUTATION_PREFIX = "\0record-entry:";
+
+function encodeRecordEntryMutation(path: string, key: string): string {
+	return RECORD_ENTRY_MUTATION_PREFIX + JSON.stringify([...path.split("."), key]);
+}
+
+function decodeModifiedPath(modifiedPath: string): string[] {
+	if (!modifiedPath.startsWith(RECORD_ENTRY_MUTATION_PREFIX)) return modifiedPath.split(".");
+	const parsed: unknown = JSON.parse(modifiedPath.slice(RECORD_ENTRY_MUTATION_PREFIX.length));
+	if (!Array.isArray(parsed) || !parsed.every((segment): segment is string => typeof segment === "string")) {
+		throw new Error("Invalid encoded settings record-entry mutation");
+	}
+	return parsed;
 }
 
 function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, cwd: string): string[] | undefined {
@@ -197,6 +407,11 @@ export class Settings {
 	#cwd: string;
 	#agentDir: string;
 	#storage: AgentStorage | null = null;
+	#revisionPath: string | null;
+	#ownerId = crypto.randomUUID();
+	#revisionState = emptySettingsRevisionState();
+	#configCommitError: Error | null = null;
+	#conditionalOutcomes = new Map<string, ConditionalMutationOutcome>();
 
 	/** Global settings from config.yml */
 	#global: RawSettings = {};
@@ -208,7 +423,14 @@ export class Settings {
 	#merged: RawSettings = {};
 
 	/** Paths modified during this session (for partial save) */
-	#modified = new Set<string>();
+	#modified = new Map<string, PendingSettingMutation>();
+	#nextMutationId = 1;
+	#nextMutationCheckpointId = 1;
+	#mutationCheckpoints = new Map<number, SettingsMutationSnapshot>();
+	#mutationCheckpointTail: Promise<void> = Promise.resolve();
+	#mutationCheckpointContext = new AsyncLocalStorage<SettingsMutationContext>();
+	#mutationCheckpointAcquisitions = 0;
+	#mutationVersion = 0;
 
 	/** Pending save (debounced) */
 	#saveTimer?: NodeJS.Timeout;
@@ -220,7 +442,24 @@ export class Settings {
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
-		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, "config.yml");
+		let persistenceAgentDir = this.#agentDir;
+		try {
+			persistenceAgentDir = fs.realpathSync.native(this.#agentDir);
+		} catch {
+			try {
+				persistenceAgentDir = path.join(
+					fs.realpathSync.native(path.dirname(this.#agentDir)),
+					path.basename(this.#agentDir),
+				);
+			} catch {}
+		}
+		this.#configPath = options.inMemory ? null : path.join(persistenceAgentDir, "config.yml");
+		if (this.#configPath) {
+			try {
+				this.#configPath = fs.realpathSync.native(this.#configPath);
+			} catch {}
+		}
+		this.#revisionPath = this.#configPath ? `${this.#configPath}.revisions.json` : null;
 		this.#persist = !options.inMemory;
 
 		if (options.overrides) {
@@ -253,6 +492,7 @@ export class Settings {
 			},
 			error => {
 				globalInstance = null;
+				globalInstancePromise = null;
 				throw error;
 			},
 		);
@@ -308,11 +548,169 @@ export class Settings {
 		return value === undefined ? undefined : (value as SettingValue<P>);
 	}
 
+	/** Get a setting from project config only, excluding global and runtime layers. */
+	getProject<P extends SettingPath>(path: P): SettingValue<P> | undefined {
+		const value = getByPath(this.#project, path.split("."));
+		return value === undefined ? undefined : (value as SettingValue<P>);
+	}
+
+	/**
+	 * Get the user/global plus runtime value while excluding project settings.
+	 * Profile materialization uses this to preserve explicit runtime choices
+	 * without leaking project-scoped configuration into the user config.
+	 */
+	getWithoutProject<P extends SettingPath>(path: P): SettingValue<P> {
+		const merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#overrides);
+		const value = getByPath(merged, path.split("."));
+		if (value !== undefined) {
+			const pathScopedValue = resolvePathScopedStringArray(path, value, this.#cwd);
+			return (pathScopedValue ?? value) as SettingValue<P>;
+		}
+		return getDefault(path);
+	}
+
+	/** Get the raw runtime override layer for a setting, without lower-precedence values. */
+	getRuntimeOverride<P extends SettingPath>(path: P): SettingValue<P> | undefined {
+		const value = getByPath(this.#overrides, path.split("."));
+		return value === undefined ? undefined : (value as SettingValue<P>);
+	}
+
 	/** Check whether a setting is present in loaded settings/overrides rather than coming from schema defaults. */
 	has(path: SettingPath): boolean {
 		return getByPath(this.#merged, path.split(".")) !== undefined;
 	}
 
+	async createMutationCheckpoint(): Promise<SettingsMutationCheckpoint> {
+		this.#assertMutationCheckpointWaitAllowed("create a nested transaction");
+		const predecessor = this.#mutationCheckpointTail;
+		const { promise: completion, resolve: release } = Promise.withResolvers<void>();
+		this.#mutationCheckpointTail = predecessor.then(
+			() => completion,
+			() => completion,
+		);
+		this.#mutationCheckpointAcquisitions++;
+		let checkpointCreated = false;
+		try {
+			await predecessor.catch(() => {});
+			await this.#flushPending({ throwOnError: true });
+
+			const id = this.#nextMutationCheckpointId++;
+			const context: SettingsMutationContext = { id, active: true };
+			this.#mutationCheckpoints.set(id, {
+				global: structuredClone(this.#global),
+				overrides: structuredClone(this.#overrides),
+				modified: structuredClone(this.#modified),
+				conditionalOutcomes: structuredClone(this.#conditionalOutcomes),
+				context,
+				state: "active",
+				release,
+			});
+			checkpointCreated = true;
+			return { ownerId: this.#ownerId, id };
+		} catch (error) {
+			release();
+			throw error;
+		} finally {
+			this.#mutationCheckpointAcquisitions--;
+			if (!checkpointCreated && this.#modified.size > 0) this.#queueSave();
+		}
+	}
+
+	restoreMutationCheckpoint(checkpoint: SettingsMutationCheckpoint): void {
+		if (checkpoint.ownerId !== this.#ownerId) {
+			throw new Error("Settings mutation checkpoint belongs to another instance");
+		}
+		const snapshot = this.#mutationCheckpoints.get(checkpoint.id);
+		if (!snapshot) throw new Error("Settings mutation checkpoint is no longer active");
+		if (snapshot.state === "flushing") {
+			throw new Error("Settings mutation checkpoint flush is still in progress");
+		}
+		if (snapshot.state === "flushed") {
+			throw new Error("Settings mutation checkpoint was already durably flushed");
+		}
+		snapshot.context.active = false;
+		this.#mutationCheckpoints.delete(checkpoint.id);
+		try {
+			if (this.#saveTimer) {
+				clearTimeout(this.#saveTimer);
+				this.#saveTimer = undefined;
+			}
+			this.#global = structuredClone(snapshot.global);
+			this.#overrides = structuredClone(snapshot.overrides);
+			this.#modified = structuredClone(snapshot.modified);
+			this.#conditionalOutcomes = structuredClone(snapshot.conditionalOutcomes);
+			this.#rebuildMerged();
+		} finally {
+			snapshot.release();
+		}
+		if (this.#modified.size > 0) this.#queueSave();
+	}
+
+	releaseMutationCheckpoint(checkpoint: SettingsMutationCheckpoint): void {
+		const snapshot = checkpoint.ownerId === this.#ownerId ? this.#mutationCheckpoints.get(checkpoint.id) : undefined;
+		if (!snapshot) {
+			throw new Error("Settings mutation checkpoint is no longer active");
+		}
+		if (
+			snapshot.state !== "flushed" ||
+			snapshot.flushedMutationVersion === undefined ||
+			snapshot.flushedMutationVersion !== this.#mutationVersion
+		) {
+			throw new Error("Settings mutation checkpoint has unflushed transaction work");
+		}
+		snapshot.context.active = false;
+		this.#mutationCheckpoints.delete(checkpoint.id);
+		snapshot.release();
+		if (this.#modified.size > 0) this.#queueSave();
+	}
+
+	async flushMutationCheckpoint(checkpoint: SettingsMutationCheckpoint): Promise<void> {
+		const snapshot = checkpoint.ownerId === this.#ownerId ? this.#mutationCheckpoints.get(checkpoint.id) : undefined;
+		if (!snapshot) {
+			throw new Error("Settings mutation checkpoint is no longer active");
+		}
+		if (snapshot.state !== "active") {
+			throw new Error("Settings mutation checkpoint cannot be flushed more than once");
+		}
+		snapshot.state = "flushing";
+		snapshot.context.active = false;
+		const mutationVersion = this.#mutationVersion;
+		try {
+			await this.#flushPending({ throwOnError: true });
+			if (this.#mutationCheckpoints.get(checkpoint.id) !== snapshot || snapshot.state !== "flushing") {
+				throw new Error("Settings mutation checkpoint changed while its durable save was in progress");
+			}
+			if (this.#mutationVersion !== mutationVersion) {
+				throw new Error("Settings transaction changed while its durable save was in progress");
+			}
+			if (this.#persist) {
+				const hasUnflushedOwnedMutation = [...this.#modified.values()].some(
+					mutation => mutation.checkpointId === checkpoint.id,
+				);
+				if (hasUnflushedOwnedMutation) {
+					throw new Error("Settings transaction still has unflushed durable mutations");
+				}
+			}
+			snapshot.flushedMutationVersion = mutationVersion;
+			snapshot.state = "flushed";
+		} catch (error) {
+			if (this.#mutationCheckpoints.get(checkpoint.id) === snapshot && snapshot.state === "flushing") {
+				snapshot.state = "failed";
+			}
+			throw error;
+		}
+	}
+
+	runMutationCheckpoint<T>(checkpoint: SettingsMutationCheckpoint, operation: () => Promise<T>): Promise<T> {
+		const snapshot = checkpoint.ownerId === this.#ownerId ? this.#mutationCheckpoints.get(checkpoint.id) : undefined;
+		if (!snapshot) {
+			throw new Error("Settings mutation checkpoint is no longer active");
+		}
+		if (snapshot.state !== "active") {
+			throw new Error("Settings mutation checkpoint is sealed");
+		}
+		return this.#mutationCheckpointContext.run(snapshot.context, operation);
+	}
 	/**
 	 * Set a setting value (sync).
 	 * Updates global settings and queues a background save.
@@ -321,8 +719,8 @@ export class Settings {
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		const prev = this.get(path);
 		const segments = path.split(".");
+		this.#enqueueSettingValue(path, value);
 		setByPath(this.#global, segments, value);
-		this.#modified.add(path);
 		this.#rebuildMerged();
 		this.#queueSave();
 
@@ -333,10 +731,64 @@ export class Settings {
 		}
 	}
 
+	/** Remove a user/global setting while preserving project and runtime layers. */
+	clearGlobal(path: SettingPath): void {
+		this.#enqueueSettingValue(path, undefined);
+		setByPath(this.#global, path.split("."), undefined);
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	/**
+	 * Persist or clear the default model profile only if another writer has not
+	 * changed it since this Settings instance loaded it.
+	 */
+	getPendingModelProfileDefaultMutationId(): number | undefined {
+		return this.#modified.get("modelProfile.default")?.id;
+	}
+
+	setModelProfileDefaultIfUnchanged(
+		expectedProfileName: string | undefined,
+		profileName: string | undefined,
+		expectedPendingMutationId?: number,
+	): void {
+		const path = "modelProfile.default";
+		if (!this.#enqueueModifiedIfUnchanged(path, expectedProfileName, profileName, expectedPendingMutationId)) return;
+		setByPath(this.#global, path.split("."), profileName);
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	/**
+	 * Delete a custom model profile while holding the global settings lock.
+	 *
+	 * A fresh durable default check rejects a concurrent selection that commits
+	 * before archival; selections that commit later remain resolvable through
+	 * the registry's archived-profile fallback.
+	 */
+	async deleteModelProfileIfUnreferenced<T>(profileName: string, deleteProfile: () => Promise<T>): Promise<T> {
+		await this.flushOrThrow();
+		if (!this.#persist || !this.#configPath) {
+			if (this.getGlobal("modelProfile.default") === profileName) {
+				throw new Error(`Model profile became the default while deletion was in progress: ${profileName}`);
+			}
+			return deleteProfile();
+		}
+		return withFileLock(this.#configPath, async () => {
+			const current = await this.#loadYaml(this.#configPath!);
+			if (getByPath(current, ["modelProfile", "default"]) === profileName) {
+				throw new Error(`Model profile became the default while deletion was in progress: ${profileName}`);
+			}
+			return deleteProfile();
+		});
+	}
+
 	/**
 	 * Apply runtime overrides (not persisted).
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+		this.#assertMutationCheckpointAccess();
+		this.#mutationVersion++;
 		const segments = path.split(".");
 		setByPath(this.#overrides, segments, value);
 		this.#rebuildMerged();
@@ -346,6 +798,7 @@ export class Settings {
 	 * Clear a runtime override.
 	 */
 	clearOverride(path: SettingPath): void {
+		this.#assertMutationCheckpointAccess();
 		const segments = path.split(".");
 		let current = this.#overrides;
 		for (let i = 0; i < segments.length - 1; i++) {
@@ -353,6 +806,7 @@ export class Settings {
 			if (!(segment in current)) return;
 			current = current[segment] as RawSettings;
 		}
+		this.#mutationVersion++;
 		delete current[segments[segments.length - 1]];
 		this.#rebuildMerged();
 	}
@@ -362,16 +816,12 @@ export class Settings {
 	 * Call before exit to ensure all changes are persisted.
 	 */
 	async flush(): Promise<void> {
-		if (this.#saveTimer) {
-			clearTimeout(this.#saveTimer);
-			this.#saveTimer = undefined;
+		this.#assertMutationCheckpointWaitAllowed("flush settings");
+		this.#assertConfigPathIsNotHardlinked();
+		if (this.#mutationCheckpointAcquisitions > 0 || this.#mutationCheckpoints.size > 0) {
+			throw new Error("Settings flush blocked by an active transaction");
 		}
-		if (this.#savePromise) {
-			await this.#savePromise;
-		}
-		if (this.#modified.size > 0) {
-			await this.#saveNow();
-		}
+		await this.#flushPending();
 	}
 
 	/**
@@ -381,15 +831,29 @@ export class Settings {
 	 * ({@link isolated}) short-circuit in {@link #saveNow} and never throw.
 	 */
 	async flushOrThrow(): Promise<void> {
+		this.#assertMutationCheckpointWaitAllowed("flush settings");
+		this.#assertConfigPathIsNotHardlinked();
+		if (this.#mutationCheckpointAcquisitions > 0 || this.#mutationCheckpoints.size > 0) {
+			throw new Error("Settings flush blocked by an active transaction");
+		}
+		await this.#flushPending({ throwOnError: true });
+	}
+
+	async #flushPending(options: { throwOnError?: boolean } = {}): Promise<void> {
 		if (this.#saveTimer) {
 			clearTimeout(this.#saveTimer);
 			this.#saveTimer = undefined;
 		}
 		if (this.#savePromise) {
-			await this.#savePromise;
+			try {
+				await this.#savePromise;
+			} catch {
+				// A previous caller owns the prior failure. Retry whatever remains
+				// dirty and report only the attempt started below.
+			}
 		}
 		if (this.#modified.size > 0) {
-			await this.#saveNow({ throwOnError: true });
+			await this.#startSave(options);
 		}
 	}
 
@@ -400,8 +864,22 @@ export class Settings {
 			inMemory: !this.#persist,
 		});
 		cloned.#storage = this.#storage;
-		cloned.#global = structuredClone(this.#global);
-		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
+		if (this.#persist) {
+			cloned.#assertConfigPathIsNotHardlinked();
+			await withFileLock(cloned.#configPath!, async () => {
+				const loadedRevisionState = await cloned.#loadRevisionState();
+				cloned.#global = await cloned.#loadYaml(cloned.#configPath!);
+				cloned.#revisionState = loadedRevisionState.state;
+				if (!loadedRevisionState.exists) {
+					await cloned.#writeRevisionState(cloned.#revisionState);
+				}
+			});
+			cloned.#project = await cloned.#loadProjectSettings();
+		} else {
+			cloned.#global = structuredClone(this.#global);
+			cloned.#revisionState = structuredClone(this.#revisionState);
+			cloned.#project = structuredClone(this.#project);
+		}
 		cloned.#overrides = structuredClone(this.#overrides);
 		cloned.#rebuildMerged();
 		cloned.#fireAllHooks();
@@ -476,45 +954,264 @@ export class Settings {
 		return this.get("bashInterceptor.patterns");
 	}
 
-	/**
-	 * Set a model role (helper for modelRoles record).
-	 */
-	setModelRole(role: ModelRole | string, modelId: string): void {
-		const current = shallowStringRecord(getByPath(this.#global, ["modelRoles"]));
-		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
-		const updateRuntimeOverride =
-			!!runtimeOverrides &&
-			typeof runtimeOverrides === "object" &&
-			!Array.isArray(runtimeOverrides) &&
-			Object.hasOwn(runtimeOverrides, role);
-
-		this.set("modelRoles", { ...current, [role]: modelId });
-
-		if (updateRuntimeOverride) {
-			this.override("modelRoles", { ...shallowStringRecord(runtimeOverrides), [role]: modelId });
+	#revisionFor(path: string): number {
+		return this.#revisionState.entries[path]?.revision ?? 0;
+	}
+	#assertConfigPathIsNotHardlinked(): void {
+		if (this.#configCommitError) throw this.#configCommitError;
+		if (!this.#configPath) return;
+		try {
+			if (fs.statSync(this.#configPath).nlink > 1) {
+				throw new Error("Settings config file has multiple hardlinks");
+			}
+		} catch (error) {
+			if (isEnoent(error)) return;
+			throw error;
 		}
 	}
+
+	#assertMutationCheckpointWaitAllowed(action: string): void {
+		const context = this.#mutationCheckpointContext.getStore();
+		if (!context) return;
+		if (!context.active) {
+			throw new Error("Settings operation belongs to a completed transaction");
+		}
+		if (this.#mutationCheckpoints.has(context.id)) {
+			throw new Error(`Cannot ${action} from inside an active Settings transaction`);
+		}
+	}
+	#assertMutationCheckpointAccess(): SettingsMutationContext | undefined {
+		this.#assertConfigPathIsNotHardlinked();
+		const context = this.#mutationCheckpointContext.getStore();
+		if (context && !context.active) {
+			throw new Error("Settings mutation belongs to a completed transaction");
+		}
+		if (context && this.#mutationCheckpoints.has(context.id)) return context;
+		if (this.#mutationCheckpoints.size > 0) {
+			throw new Error("Settings mutation blocked by an active transaction");
+		}
+		if (this.#mutationCheckpointAcquisitions > 0) {
+			throw new Error("Settings mutation blocked while a transaction is being acquired");
+		}
+		return context;
+	}
+
+	#enqueueModified(path: string, desiredValue: unknown): void {
+		const context = this.#assertMutationCheckpointAccess();
+		this.#mutationVersion++;
+		this.#modified.delete(path);
+		this.#modified.set(path, {
+			id: this.#nextMutationId++,
+			desiredValue: structuredClone(desiredValue),
+			guard: { kind: "unconditional" },
+			attempted: false,
+			predecessorGeneration: undefined,
+			predecessorRevision: undefined,
+			predecessorValue: undefined,
+			checkpointId: context?.id,
+		});
+	}
+
+	#enqueueSettingValue(path: SettingPath, desiredValue: unknown): void {
+		if (path !== "modelRoles" && path !== "task.agentModelOverrides") {
+			this.#enqueueModified(path, desiredValue);
+			return;
+		}
+		const previous = shallowStringRecord(getByPath(this.#global, path.split(".")));
+		const next = shallowStringRecord(desiredValue);
+		const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
+		for (const key of keys) {
+			assertValidRecordEntryMutationKey(key);
+		}
+		for (const key of keys) {
+			this.#enqueueModified(encodeRecordEntryMutation(path, key), next[key]);
+		}
+	}
+
+	#enqueueModifiedIfUnchanged(
+		path: string,
+		expectedValue: unknown,
+		desiredValue: unknown,
+		expectedPendingMutationId?: number,
+	): boolean {
+		const context = this.#assertMutationCheckpointAccess();
+		const pending = this.#modified.get(path);
+		let expectedRevision = this.#revisionFor(path);
+		let expectedGeneration = this.#revisionState.generation;
+		if (pending) {
+			const replacesOwnedUnconditional =
+				expectedPendingMutationId !== undefined &&
+				pending.id === expectedPendingMutationId &&
+				pending.guard.kind === "unconditional" &&
+				Object.is(pending.desiredValue, expectedValue);
+			const reversesPendingConditional =
+				pending.guard.kind === "if-unchanged" &&
+				Object.is(pending.guard.expectedValue, desiredValue) &&
+				Object.is(pending.desiredValue, expectedValue);
+			if (!replacesOwnedUnconditional && !reversesPendingConditional) return false;
+		} else {
+			const outcome = this.#conditionalOutcomes.get(path);
+			const reversesCompletedConditional =
+				outcome && Object.is(outcome.expectedValue, desiredValue) && Object.is(outcome.desiredValue, expectedValue);
+			if (reversesCompletedConditional) {
+				this.#conditionalOutcomes.delete(path);
+				if (!outcome.applied) return false;
+				expectedRevision = outcome.revision;
+				expectedGeneration = outcome.generation;
+			} else {
+				this.#conditionalOutcomes.delete(path);
+			}
+		}
+		const currentValue = getByPath(this.#global, decodeModifiedPath(path));
+		if (!Object.is(currentValue, expectedValue) && !Object.is(currentValue, desiredValue)) return false;
+		this.#mutationVersion++;
+		this.#modified.delete(path);
+		this.#modified.set(path, {
+			id: this.#nextMutationId++,
+			desiredValue: structuredClone(desiredValue),
+			guard: {
+				kind: "if-unchanged",
+				expectedValue: structuredClone(expectedValue),
+				expectedGeneration,
+				expectedRevision,
+			},
+			attempted: false,
+			predecessorGeneration: undefined,
+			predecessorRevision: undefined,
+			predecessorValue: undefined,
+			checkpointId: context?.id,
+		});
+		return true;
+	}
+
+	#setStringRecordEntry(
+		path: "modelRoles" | "task.agentModelOverrides",
+		key: string,
+		value: string | undefined,
+		expectedValue?: { value: string | undefined },
+	): boolean {
+		assertValidRecordEntryMutationKey(key);
+		const segments = path.split(".");
+		const next = shallowStringRecord(getByPath(this.#global, segments));
+		if (value === undefined) {
+			delete next[key];
+		} else {
+			next[key] = value;
+		}
+		const modifiedPath = encodeRecordEntryMutation(path, key);
+		if (expectedValue) {
+			if (!this.#enqueueModifiedIfUnchanged(modifiedPath, expectedValue.value, value)) return false;
+		} else {
+			this.#enqueueModified(modifiedPath, value);
+		}
+		setByPath(this.#global, segments, next);
+		this.#rebuildMerged();
+		this.#queueSave();
+		return true;
+	}
+
+	#setModelRoleEntry(
+		role: ModelRole | string,
+		modelId: string | undefined,
+		expectedValue?: { value: string | undefined },
+	): void {
+		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
+		const hasRuntimeOverrides =
+			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
+		const runtimeRoleIsSet = hasRuntimeOverrides && Object.hasOwn(runtimeOverrides, role);
+
+		if (!this.#setStringRecordEntry("modelRoles", role, modelId, expectedValue)) return;
+
+		if (modelId === undefined) {
+			if (hasRuntimeOverrides) {
+				const nextRuntimeOverrides = shallowStringRecord(runtimeOverrides);
+				delete nextRuntimeOverrides[role];
+				this.override("modelRoles", nextRuntimeOverrides);
+			}
+		} else if (runtimeRoleIsSet || this.get("modelRoles")[role] !== modelId) {
+			const base = shallowStringRecord(runtimeOverrides);
+			this.override("modelRoles", { ...base, [role]: modelId });
+		}
+	}
+
 	/**
-	 * Set an agent model override while keeping any live runtime override aligned.
-	 *
-	 * Runtime model profiles override `task.agentModelOverrides` for the current
-	 * session. A user-selected role assignment must win immediately in that same
-	 * session, but only the explicit agent change should be persisted.
+	 * Persist one model role without replacing sibling roles written by another
+	 * process, and keep a shadowing runtime/project value aligned for this session.
 	 */
-	setAgentModelOverride(agentName: string, modelId: string): void {
-		const current = shallowStringRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
+	setModelRole(role: ModelRole | string, modelId: string): void {
+		this.#setModelRoleEntry(role, modelId);
+	}
+
+	/**
+	 * Persist or clear one model role only if another writer has not changed that
+	 * leaf since this Settings instance loaded it.
+	 */
+	setModelRoleIfUnchanged(
+		role: ModelRole | string,
+		expectedModelId: string | undefined,
+		modelId: string | undefined,
+	): void {
+		this.#setModelRoleEntry(role, modelId, { value: expectedModelId });
+	}
+
+	#setAgentModelOverrideEntry(
+		agentName: string,
+		modelId: string | undefined,
+		expectedValue?: { value: string | undefined },
+	): void {
 		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
-		const updateRuntimeOverride =
+		const hasRuntimeOverrides =
 			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
 
-		this.set("task.agentModelOverrides", { ...current, [agentName]: modelId });
+		if (!this.#setStringRecordEntry("task.agentModelOverrides", agentName, modelId, expectedValue)) return;
 
-		if (updateRuntimeOverride) {
+		if (modelId === undefined) {
+			if (hasRuntimeOverrides) {
+				const nextRuntimeOverrides = shallowStringRecord(runtimeOverrides);
+				delete nextRuntimeOverrides[agentName];
+				this.override("task.agentModelOverrides", nextRuntimeOverrides);
+			}
+		} else if (hasRuntimeOverrides || this.get("task.agentModelOverrides")[agentName] !== modelId) {
+			const base = shallowStringRecord(runtimeOverrides);
 			this.override("task.agentModelOverrides", {
-				...shallowStringRecord(runtimeOverrides),
+				...base,
 				[agentName]: modelId,
 			});
 		}
+	}
+
+	/**
+	 * Set an agent model override while keeping any live runtime/project override aligned.
+	 *
+	 * Runtime model profiles and project settings can override
+	 * `task.agentModelOverrides` for the current session. A user-selected role
+	 * assignment must win immediately, but only that explicit agent change is
+	 * persisted.
+	 */
+	setAgentModelOverride(agentName: string, modelId: string): void {
+		this.#setAgentModelOverrideEntry(agentName, modelId);
+	}
+
+	/**
+	 * Persist or clear one agent override only if another writer has not changed
+	 * that leaf since this Settings instance loaded it.
+	 */
+	setAgentModelOverrideIfUnchanged(
+		agentName: string,
+		expectedModelId: string | undefined,
+		modelId: string | undefined,
+	): void {
+		this.#setAgentModelOverrideEntry(agentName, modelId, { value: expectedModelId });
+	}
+
+	/** Clear one persisted and live model role without replacing siblings. */
+	clearModelRole(role: ModelRole | string): void {
+		this.#setModelRoleEntry(role, undefined);
+	}
+
+	/** Clear one persisted and live agent model override without replacing siblings. */
+	clearAgentModelOverride(agentName: string): void {
+		this.#setAgentModelOverrideEntry(agentName, undefined);
 	}
 
 	/**
@@ -565,9 +1262,17 @@ export class Settings {
 		const projectPromise = this.#loadProjectSettings();
 
 		if (this.#persist) {
+			this.#assertConfigPathIsNotHardlinked();
 			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
 			await this.#migrateFromLegacy();
-			this.#global = await this.#loadYaml(this.#configPath!);
+			await withFileLock(this.#configPath!, async () => {
+				const loadedRevisionState = await this.#loadRevisionState();
+				this.#global = await this.#loadYaml(this.#configPath!);
+				this.#revisionState = loadedRevisionState.state;
+				if (!loadedRevisionState.exists) {
+					await this.#writeRevisionState(this.#revisionState);
+				}
+			});
 		}
 
 		this.#project = await projectPromise;
@@ -578,18 +1283,106 @@ export class Settings {
 		return this;
 	}
 
+	async #loadRevisionState(): Promise<LoadedSettingsRevisionState> {
+		if (!this.#revisionPath) {
+			return { state: emptySettingsRevisionState(), exists: false };
+		}
+		try {
+			const content = await Bun.file(this.#revisionPath).text();
+			return {
+				state: parseSettingsRevisionState(JSON.parse(content)),
+				exists: true,
+			};
+		} catch (error) {
+			if (isEnoent(error)) {
+				return { state: emptySettingsRevisionState(), exists: false };
+			}
+			logger.warn("Settings: failed to load revision state", {
+				path: this.#revisionPath,
+				error: String(error),
+			});
+			throw error;
+		}
+	}
+
+	async #atomicWrite(filePath: string, content: string): Promise<void> {
+		const tempPath = `${filePath}.${this.#ownerId}.tmp`;
+		const protectsConfigCommit = filePath === this.#configPath;
+		let previousConfigFd: number | undefined;
+		try {
+			await Bun.write(tempPath, content);
+			const fd = fs.openSync(tempPath, "r");
+			try {
+				fs.fsyncSync(fd);
+			} finally {
+				fs.closeSync(fd);
+			}
+			if (protectsConfigCommit) {
+				try {
+					previousConfigFd = fs.openSync(filePath, "r");
+				} catch (error) {
+					if (!isEnoent(error)) throw error;
+				}
+				if (previousConfigFd !== undefined) {
+					const previousConfig = fs.fstatSync(previousConfigFd);
+					const currentConfig = fs.statSync(filePath);
+					if (
+						previousConfig.nlink > 1 ||
+						currentConfig.nlink > 1 ||
+						previousConfig.dev !== currentConfig.dev ||
+						previousConfig.ino !== currentConfig.ino
+					) {
+						throw new Error("Settings config file has multiple hardlinks");
+					}
+				}
+			}
+			fs.renameSync(tempPath, filePath);
+			if (previousConfigFd !== undefined && fs.fstatSync(previousConfigFd).nlink !== 0) {
+				const error = new Error("Settings config file hardlink changed during atomic commit");
+				this.#configCommitError = error;
+				throw error;
+			}
+			if (process.platform !== "win32") {
+				try {
+					const directoryFd = fs.openSync(path.dirname(filePath), "r");
+					try {
+						fs.fsyncSync(directoryFd);
+					} finally {
+						fs.closeSync(directoryFd);
+					}
+				} catch (error) {
+					// rename() is the commit point. Do not report an uncommitted
+					// write after the target already contains the new bytes.
+					logger.warn("Settings: parent directory fsync failed after commit", {
+						path: filePath,
+						error: String(error),
+					});
+				}
+			}
+		} finally {
+			if (previousConfigFd !== undefined) fs.closeSync(previousConfigFd);
+			try {
+				fs.rmSync(tempPath, { force: true });
+			} catch {}
+		}
+	}
+
+	async #writeRevisionState(state: DurableSettingsRevisionState): Promise<void> {
+		if (!this.#revisionPath) return;
+		await this.#atomicWrite(this.#revisionPath, JSON.stringify(state));
+	}
 	async #loadYaml(filePath: string): Promise<RawSettings> {
 		try {
 			const content = await Bun.file(filePath).text();
 			const parsed = YAML.parse(content);
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-				return {};
+				throw new Error(`Settings root must be an object: ${filePath}`);
 			}
 			return this.#migrateRawSettings(parsed as RawSettings);
 		} catch (error) {
 			if (isEnoent(error)) return {};
 			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
-			return {};
+			throw error;
 		}
 	}
 
@@ -821,8 +1614,34 @@ export class Settings {
 	// Saving
 	// ─────────────────────────────────────────────────────────────────────────
 
+	#startSave(options: { throwOnError?: boolean } = {}): Promise<void> {
+		const previousSave = this.#savePromise;
+		const savePromise = (async () => {
+			if (previousSave) {
+				try {
+					await previousSave;
+				} catch {
+					// A failed durable flush must not prevent a later retry from
+					// persisting the paths that #saveNow re-queued.
+				}
+			}
+			await this.#saveNow(options);
+		})();
+		this.#savePromise = savePromise;
+		void savePromise.then(
+			() => {
+				if (this.#savePromise === savePromise) this.#savePromise = undefined;
+			},
+			() => {
+				if (this.#savePromise === savePromise) this.#savePromise = undefined;
+			},
+		);
+		return savePromise;
+	}
+
 	#queueSave(): void {
 		if (!this.#persist || !this.#configPath) return;
+		if (this.#mutationCheckpointAcquisitions > 0 || this.#mutationCheckpoints.size > 0) return;
 
 		// Debounce: wait 100ms for more changes
 		if (this.#saveTimer) {
@@ -830,7 +1649,9 @@ export class Settings {
 		}
 		this.#saveTimer = setTimeout(() => {
 			this.#saveTimer = undefined;
-			this.#saveNow().catch(err => {
+			if (this.#mutationCheckpointAcquisitions > 0 || this.#mutationCheckpoints.size > 0) return;
+			const savePromise = this.#startSave();
+			void savePromise.catch(err => {
 				logger.warn("Settings: background save failed", { error: String(err) });
 			});
 		}, 100);
@@ -838,33 +1659,126 @@ export class Settings {
 
 	async #saveNow(options: { throwOnError?: boolean } = {}): Promise<void> {
 		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
+		this.#assertConfigPathIsNotHardlinked();
 
 		const configPath = this.#configPath;
-		const modifiedPaths = [...this.#modified];
-		this.#modified.clear();
+		const initialEntries = [...this.#modified].sort((left, right) => left[1].id - right[1].id);
 
 		try {
 			await withFileLock(configPath, async () => {
-				// Re-read to preserve external changes
 				const current = await this.#loadYaml(configPath);
+				const loadedRevisionState = await this.#loadRevisionState();
+				const revisionState = loadedRevisionState.state;
+				if (!loadedRevisionState.exists) {
+					await this.#writeRevisionState(revisionState);
+				}
+				this.#revisionState = structuredClone(revisionState);
+				const loadedGeneration = revisionState.generation;
+				const accepted: Array<{
+					modifiedPath: string;
+					mutation: PendingSettingMutation;
+					revision: number;
+					revisionChanged: boolean;
+				}> = [];
 
-				// Apply only our modified paths
-				for (const modPath of modifiedPaths) {
-					const segments = modPath.split(".");
-					const value = getByPath(this.#global, segments);
-					setByPath(current, segments, value);
+				for (const [modifiedPath, mutation] of initialEntries) {
+					const segments = decodeModifiedPath(modifiedPath);
+					const currentValue = getByPath(current, segments);
+					const currentRevision = revisionState.entries[modifiedPath]?.revision ?? 0;
+					const currentOwner = revisionState.entries[modifiedPath];
+					const sameMutation = currentOwner?.ownerId === this.#ownerId && currentOwner.mutationId === mutation.id;
+					const capturesPredecessor = !mutation.attempted && mutation.predecessorGeneration === undefined;
+					if (capturesPredecessor) {
+						mutation.predecessorGeneration = loadedGeneration;
+						mutation.predecessorRevision = currentRevision;
+						mutation.predecessorValue = structuredClone(currentValue);
+					}
+					const predecessorMatches =
+						mutation.predecessorGeneration === loadedGeneration &&
+						mutation.predecessorRevision === currentRevision;
+					const retryValueMatches = mutationRetryValuesMatch(mutation, currentValue);
+					const sameMutationRetry = sameMutation && retryValueMatches;
+					const generationMatches =
+						mutation.guard.kind === "if-unchanged" && mutation.guard.expectedGeneration === loadedGeneration;
+					const firstAttemptApplies =
+						!mutation.attempted &&
+						predecessorMatches &&
+						(capturesPredecessor || retryValueMatches) &&
+						(mutation.guard.kind === "unconditional" ||
+							(mutationValuesMatch(mutation, currentValue) &&
+								generationMatches &&
+								currentRevision === mutation.guard.expectedRevision));
+					const applies = sameMutationRetry || firstAttemptApplies;
+
+					if (!applies) {
+						if (this.#modified.get(modifiedPath)?.id === mutation.id) {
+							this.#modified.delete(modifiedPath);
+							if (mutation.guard.kind === "if-unchanged") {
+								this.#conditionalOutcomes.set(modifiedPath, {
+									expectedValue: mutation.guard.expectedValue,
+									desiredValue: mutation.desiredValue,
+									applied: false,
+									revision: currentRevision,
+									generation: loadedGeneration,
+								});
+							}
+						}
+						continue;
+					}
+
+					let revision = currentRevision;
+					if (!sameMutation) {
+						if (revisionState.nextRevision >= Number.MAX_SAFE_INTEGER) {
+							throw new Error("Settings revision state exhausted");
+						}
+						revision = revisionState.nextRevision++;
+						revisionState.entries[modifiedPath] = {
+							revision,
+							ownerId: this.#ownerId,
+							mutationId: mutation.id,
+						};
+					}
+					setByPath(current, segments, structuredClone(mutation.desiredValue));
+					accepted.push({
+						modifiedPath,
+						mutation,
+						revision,
+						revisionChanged: !sameMutation,
+					});
 				}
 
-				// Update our global with any external changes we preserved
+				if (accepted.some(entry => entry.revisionChanged)) {
+					await this.#writeRevisionState(revisionState);
+					for (const entry of accepted) {
+						if (entry.revisionChanged) entry.mutation.attempted = true;
+					}
+				}
+				this.#revisionState = structuredClone(revisionState);
+
+				if (accepted.length > 0) {
+					await this.#atomicWrite(configPath, YAML.stringify(current, null, 2));
+				}
+
+				for (const { modifiedPath, mutation, revision } of accepted) {
+					if (this.#modified.get(modifiedPath)?.id !== mutation.id) continue;
+					this.#modified.delete(modifiedPath);
+					if (mutation.guard.kind === "if-unchanged") {
+						this.#conditionalOutcomes.set(modifiedPath, {
+							expectedValue: mutation.guard.expectedValue,
+							desiredValue: mutation.desiredValue,
+							applied: true,
+							revision,
+							generation: revisionState.generation,
+						});
+					}
+				}
 				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
+				for (const [modifiedPath, mutation] of this.#modified) {
+					setByPath(this.#global, decodeModifiedPath(modifiedPath), structuredClone(mutation.desiredValue));
+				}
 			});
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
-			// Re-add failed paths for retry
-			for (const p of modifiedPaths) {
-				this.#modified.add(p);
-			}
 			if (options.throwOnError) {
 				this.#rebuildMerged();
 				throw error;

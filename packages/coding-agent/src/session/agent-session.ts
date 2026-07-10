@@ -301,7 +301,7 @@ import type {
 	SessionContext,
 	SessionManager,
 } from "./session-manager";
-import { getLatestCompactionEntry } from "./session-manager";
+import { getLatestCompactionEntry, hasPersistedThinkingLevel } from "./session-manager";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { YieldQueue } from "./yield-queue";
 
@@ -1172,6 +1172,12 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
+	#pendingSettingsModelChange:
+		| {
+				model: Model;
+				thinkingLevel: ThinkingLevel | undefined;
+		  }
+		| undefined;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -6861,6 +6867,49 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
+	/**
+	 * Stage a DEFAULT model until its Settings transaction commits.
+	 * The caller must validate credentials first. Runtime provider sessions,
+	 * retry state, history, Settings, and model-usage MRU remain untouched.
+	 */
+	async setModelForSettingsCommit(model: Model, thinkingLevel?: ThinkingLevel): Promise<void> {
+		this.#pendingSettingsModelChange = { model, thinkingLevel };
+	}
+
+	cancelSettingsModelChange(): void {
+		this.#pendingSettingsModelChange = undefined;
+	}
+
+	/**
+	 * Apply runtime and session-history side effects after Settings are durable.
+	 * Errors are post-commit failures and must never trigger Settings rollback.
+	 */
+	async commitSettingsModelChange(model: Model, role: string = "default"): Promise<void> {
+		const pending = this.#pendingSettingsModelChange;
+		this.#pendingSettingsModelChange = undefined;
+		if (!pending || !modelsAreEqual(pending.model, model)) {
+			throw new Error(`Pending model settings commit does not match ${model.provider}/${model.id}`);
+		}
+
+		const previousEditMode = this.#resolveActiveEditMode();
+		const previousThinkingLevel = this.#thinkingLevel;
+		const nextThinkingLevel = resolveThinkingLevelForModel(
+			model,
+			pending.thinkingLevel ?? model.thinking?.defaultLevel ?? this.#thinkingLevel,
+		);
+		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role, {
+			thinkingLevel: nextThinkingLevel,
+		});
+
+		this.#clearActiveRetryFallback();
+		this.#setModelWithProviderSessionReset(model);
+		this.#setThinkingLevelRuntime(nextThinkingLevel);
+		if (previousThinkingLevel !== this.#thinkingLevel) {
+			this.#emit({ type: "thinking_level_changed", thinkingLevel: this.#thinkingLevel });
+		}
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
 	setActiveModelProfile(name: string | undefined): void {
 		this.#activeModelProfile = name;
 	}
@@ -7106,11 +7155,7 @@ export class AgentSession {
 	 * Saves the effective metadata-clamped level to the session, and to settings when requested.
 	 */
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
-		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
-		const isChanging = effectiveLevel !== this.#thinkingLevel;
-
-		this.#thinkingLevel = effectiveLevel;
-		this.agent.setThinkingLevel(toReasoningEffort(effectiveLevel));
+		const { effectiveLevel, isChanging } = this.#setThinkingLevelRuntime(level);
 
 		if (persist && effectiveLevel !== undefined) {
 			this.settings.set("defaultThinkingLevel", effectiveLevel);
@@ -7120,6 +7165,14 @@ export class AgentSession {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}
+	}
+
+	#setThinkingLevelRuntime(level: ThinkingLevel | undefined) {
+		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
+		const isChanging = effectiveLevel !== this.#thinkingLevel;
+		this.#thinkingLevel = effectiveLevel;
+		this.agent.setThinkingLevel(toReasoningEffort(effectiveLevel));
+		return { effectiveLevel, isChanging };
 	}
 
 	/**
@@ -10844,7 +10897,7 @@ export class AgentSession {
 				}
 			}
 
-			const hasThinkingEntry = this.sessionManager.getBranch().some(entry => entry.type === "thinking_level_change");
+			const hasThinkingEntry = hasPersistedThinkingLevel(this.sessionManager.getBranch());
 			const hasServiceTierEntry = this.sessionManager
 				.getBranch()
 				.some(entry => entry.type === "service_tier_change");

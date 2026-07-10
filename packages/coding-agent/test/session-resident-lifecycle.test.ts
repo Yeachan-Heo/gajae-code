@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
@@ -222,6 +223,79 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		await sm.rewriteEntries();
 		expect(await readPersistedJsonl(sessionFile)).toContain(sentinel.slice(0, 100));
 		await sm.close();
+	});
+	it("keeps an active manager reusable after artifact cleanup fails following transcript deletion", async () => {
+		const { sm, sessionFile, artifactsDir } = await makeLargeSession(`partial drop ${"p".repeat(2048)}`);
+		const originalRm = fsp.rm;
+		vi.spyOn(fsp, "rm").mockImplementation(async (target, options) => {
+			const normalizeDarwinPath = (value: string) => value.replace(/^\/private(?=\/(?:tmp|var)\b)/, "");
+			if (normalizeDarwinPath(String(target)) === normalizeDarwinPath(artifactsDir)) {
+				throw new Error("simulated artifact cleanup failure");
+			}
+			return originalRm(target, options);
+		});
+
+		await expect(sm.dropSession(sessionFile)).rejects.toThrow("simulated artifact cleanup failure");
+		expect(fs.existsSync(sessionFile)).toBe(false);
+		const replacement = sm.getSessionFile();
+		expect(replacement).toBeDefined();
+		expect(replacement).not.toBe(sessionFile);
+		sm.appendMessage({ role: "user", content: "after-partial-drop", timestamp: Date.now() });
+		await sm.flush();
+		expect(await readPersistedJsonl(replacement!)).toContain("after-partial-drop");
+	});
+
+	it("cleans artifacts when the session transcript is already missing", async () => {
+		const { sm, sessionFile, artifactsDir } = await makeLargeSession(`missing transcript ${"q".repeat(2048)}`);
+		await fs.promises.unlink(sessionFile);
+		await sm.dropSession(sessionFile);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+	});
+
+	it("rolls back physical and logical state when the final move rewrite fails", async () => {
+		const sentinel = `final rewrite rollback ${"z".repeat(2048)}`;
+		const { sm, root, sessionFile } = await makeLargeSession(sentinel);
+		const newRoot = tempRoot("gjc-resident-final-rewrite-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		let jsonlRenames = 0;
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(target).endsWith(".jsonl") && ++jsonlRenames === 2) {
+				throw new Error("simulated final rewrite rename failure");
+			}
+			return realRename(source, target);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("simulated final rewrite rename failure");
+		expect(sm.getCwd()).toBe(root);
+		expect(sm.getSessionFile()).toBe(sessionFile);
+		expect(fs.existsSync(sessionFile)).toBe(true);
+		sm.appendMessage({ role: "user", content: "after-final-rewrite-failure", timestamp: Date.now() });
+		await sm.flush();
+		expect(await readPersistedJsonl(sessionFile)).toContain("after-final-rewrite-failure");
+	});
+	it("uses EXDEV-safe reverse movement after a later move failure", async () => {
+		const { sm, root, sessionFile } = await makeLargeSession(`exdev rollback ${"x".repeat(2048)}`);
+		const newRoot = tempRoot("gjc-resident-exdev-rollback-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		let exdevCount = 0;
+		let jsonlRenames = 0;
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(source).endsWith(".jsonl") && exdevCount++ < 2) {
+				const error = new Error("cross-device") as Error & { code: string };
+				error.code = "EXDEV";
+				throw error;
+			}
+			if (String(target).endsWith(".jsonl") && ++jsonlRenames === 1) {
+				throw new Error("later rewrite failure");
+			}
+			return realRename(source, target);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("later rewrite failure");
+		expect(sm.getCwd()).toBe(root);
+		expect(sm.getSessionFile()).toBe(sessionFile);
+		expect(fs.existsSync(sessionFile)).toBe(true);
+		expect(exdevCount).toBeGreaterThanOrEqual(2);
 	});
 
 	it("persists large text with legacy truncation notice and without resident sentinels or text blob refs", async () => {

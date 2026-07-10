@@ -269,25 +269,26 @@ export class FileSessionStorage implements SessionStorage {
 	 * Artifacts are stored in a sibling directory with the same name minus .jsonl extension.
 	 */
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
-		// Delete the session file itself
-		await this.unlink(sessionPath);
-
-		// Compute artifacts directory: /path/to/session.jsonl -> /path/to/session
 		const artifactsDir = sessionPath.slice(0, -6);
+		let failure: Error | undefined;
 
-		// Delete artifacts directory if it exists. Missing directories are fine, but
-		// surface real cleanup failures because the session file is already gone.
+		try {
+			await this.unlink(sessionPath);
+		} catch (err) {
+			if (!isEnoent(err)) failure = toError(err);
+		}
+
 		try {
 			await fsp.rm(artifactsDir, { recursive: true, force: true });
 		} catch (err) {
-			const error = toError(err);
-			throw new Error(
-				`Session file deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`,
-				{
-					cause: error,
-				},
+			const cleanupError = toError(err);
+			failure ??= new Error(
+				`Session file deleted but failed to remove artifacts directory ${artifactsDir}: ${cleanupError.message}`,
+				{ cause: cleanupError },
 			);
 		}
+
+		if (failure) throw failure;
 	}
 }
 

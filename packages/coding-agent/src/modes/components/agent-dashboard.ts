@@ -64,6 +64,7 @@ interface SourceTab {
 interface DashboardAgent extends AgentDefinition {
 	disabled: boolean;
 	overrideModel?: string;
+	persistenceWarning?: string;
 }
 
 interface ModelResolution {
@@ -82,6 +83,8 @@ interface AgentDashboardModelContext {
 	modelRegistry?: ModelRegistry;
 	activeModelPattern?: string;
 	defaultModelPattern?: string;
+	projectModelProfileShadow?: { profileName: string; targetIds: readonly string[] };
+	onModelOverrideChange?: (agentName: string, value: string | undefined) => void | Promise<void>;
 }
 
 const SOURCE_ORDER: Record<AgentSource, number> = {
@@ -97,6 +100,28 @@ const SOURCE_LABEL: Record<AgentSource, string> = {
 };
 
 const IDENTIFIER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+){1,5}$/;
+const MODEL_OVERRIDE_PERSISTENCE_WARNINGS = new WeakMap<Settings, Map<string, string>>();
+
+function getModelOverridePersistenceWarning(settings: Settings | null, agentName: string): string | undefined {
+	return settings ? MODEL_OVERRIDE_PERSISTENCE_WARNINGS.get(settings)?.get(agentName) : undefined;
+}
+
+function setModelOverridePersistenceWarning(
+	settings: Settings | null,
+	agentName: string,
+	warning: string | undefined,
+): void {
+	if (!settings) return;
+	const warnings = MODEL_OVERRIDE_PERSISTENCE_WARNINGS.get(settings);
+	if (warning === undefined) {
+		warnings?.delete(agentName);
+		if (warnings?.size === 0) MODEL_OVERRIDE_PERSISTENCE_WARNINGS.delete(settings);
+		return;
+	}
+	const nextWarnings = warnings ?? new Map<string, string>();
+	nextWarnings.set(agentName, warning);
+	MODEL_OVERRIDE_PERSISTENCE_WARNINGS.set(settings, nextWarnings);
+}
 
 function joinPatterns(patterns: string[]): string {
 	if (patterns.length === 0) return "(session model)";
@@ -270,6 +295,10 @@ class AgentInspectorPane implements Component {
 		lines.push(
 			`${theme.fg("muted", "Effective:")} ${this.effectiveResolution ? this.#formatResolution(this.effectiveResolution) : theme.fg("dim", "(unresolved)")}`,
 		);
+		if (this.agent.persistenceWarning) {
+			lines.push(theme.fg("warning", "Persistence: unconfirmed"));
+			lines.push(theme.fg("warning", "  Local override may not survive restart"));
+		}
 
 		if (this.agent.filePath) {
 			lines.push("");
@@ -310,6 +339,8 @@ export class AgentDashboard extends Container {
 
 	#editInput: Input | null = null;
 	#editingAgentName: string | null = null;
+	#modelOverrideSaving = false;
+	#modelOverrideGeneration = 0;
 
 	#createInput: Input | null = null;
 	#createDescription = "";
@@ -344,8 +375,22 @@ export class AgentDashboard extends Container {
 
 	async #init(): Promise<void> {
 		this.#settingsManager = this.settings ?? (await Settings.init());
+		const settingsManager = this.#settingsManager;
 		await this.#reloadData();
 		this.#buildLayout();
+
+		if (MODEL_OVERRIDE_PERSISTENCE_WARNINGS.get(settingsManager)?.size) {
+			void settingsManager
+				.flushOrThrow()
+				.then(async () => {
+					MODEL_OVERRIDE_PERSISTENCE_WARNINGS.delete(settingsManager);
+					await this.#reloadData();
+				})
+				.catch(() => {
+					// Keep the warning attached to this Settings instance until a
+					// later durable flush confirms the live value.
+				});
+		}
 	}
 
 	async #reloadData(): Promise<void> {
@@ -371,6 +416,7 @@ export class AgentDashboard extends Container {
 					...agent,
 					disabled: disabled.has(agent.name),
 					overrideModel: overrides[agent.name]?.trim() || undefined,
+					persistenceWarning: getModelOverridePersistenceWarning(this.#settingsManager, agent.name),
 				}));
 
 			this.#tabs = this.#buildTabs(this.#allAgents);
@@ -465,18 +511,6 @@ export class AgentDashboard extends Container {
 		this.#settingsManager.set("task.disabledAgents", disabled);
 	}
 
-	#persistModelOverrides(): void {
-		if (!this.#settingsManager) return;
-		const overrides: Record<string, string> = {};
-		for (const agent of this.#allAgents) {
-			const value = agent.overrideModel?.trim();
-			if (value) {
-				overrides[agent.name] = value;
-			}
-		}
-		this.#settingsManager.set("task.agentModelOverrides", overrides);
-	}
-
 	#toggleSelectedAgent(): void {
 		const selected = this.#selectedAgent();
 		if (!selected) return;
@@ -486,6 +520,7 @@ export class AgentDashboard extends Container {
 	}
 
 	#beginModelEdit(): void {
+		if (this.#modelOverrideSaving) return;
 		const selected = this.#selectedAgent();
 		if (!selected) return;
 		this.#createError = null;
@@ -495,26 +530,85 @@ export class AgentDashboard extends Container {
 			this.#editInput.setValue(selected.overrideModel);
 		}
 		this.#editInput.onSubmit = value => {
-			this.#saveModelOverride(value);
+			void this.#saveModelOverride(value);
 		};
 		this.#buildLayout();
 	}
 
-	#saveModelOverride(rawValue: string): void {
+	async #saveModelOverride(rawValue: string): Promise<void> {
 		if (!this.#editingAgentName) return;
 		const selected = this.#allAgents.find(agent => agent.name === this.#editingAgentName);
-		if (!selected) return;
+		if (!selected || this.#modelOverrideSaving) return;
+		this.#modelOverrideSaving = true;
+		const operationGeneration = ++this.#modelOverrideGeneration;
 		const value = rawValue.trim();
-		selected.overrideModel = value || undefined;
-		this.#persistModelOverrides();
+		try {
+			if (this.modelContext.onModelOverrideChange) {
+				await this.modelContext.onModelOverrideChange(selected.name, value || undefined);
+			} else if (value) {
+				this.#settingsManager?.setAgentModelOverride(selected.name, value);
+				await this.#settingsManager?.flushOrThrow();
+			} else {
+				this.#settingsManager?.clearAgentModelOverride(selected.name);
+				await this.#settingsManager?.flushOrThrow();
+			}
+		} catch (error) {
+			this.#modelOverrideSaving = false;
+			const effectiveValue = this.#settingsManager?.get("task.agentModelOverrides")[selected.name]?.trim();
+			const persistenceWarning = `Model override for ${selected.name} is ${effectiveValue || "(unset)"} locally, but persistence was not confirmed: ${error instanceof Error ? error.message : String(error)}`;
+			selected.overrideModel = effectiveValue || undefined;
+			selected.persistenceWarning = persistenceWarning;
+			setModelOverridePersistenceWarning(this.#settingsManager, selected.name, persistenceWarning);
+			if (operationGeneration !== this.#modelOverrideGeneration) {
+				this.#notice = `Background model override save for ${selected.name} was not confirmed: ${error instanceof Error ? error.message : String(error)}`;
+				this.#rebuildAndRender();
+				return;
+			}
+			this.#editingAgentName = null;
+			this.#editInput = null;
+			this.#applyFilters();
+			this.#notice = `Model override for ${selected.name} is ${effectiveValue || "(unset)"} locally, but persistence was not confirmed: ${error instanceof Error ? error.message : String(error)}`;
+			this.#rebuildAndRender();
+			return;
+		}
+
+		this.#modelOverrideSaving = false;
+		const effectiveValue = this.#settingsManager?.get("task.agentModelOverrides")[selected.name]?.trim();
+		const projectValue = this.#settingsManager?.getProject("task.agentModelOverrides")?.[selected.name]?.trim();
+		selected.overrideModel = effectiveValue || undefined;
+		selected.persistenceWarning = undefined;
+		setModelOverridePersistenceWarning(this.#settingsManager, selected.name, undefined);
+		if (operationGeneration !== this.#modelOverrideGeneration) {
+			this.#notice = `Background model override save completed for ${selected.name}`;
+			this.#rebuildAndRender();
+			return;
+		}
 		this.#editingAgentName = null;
 		this.#editInput = null;
 		this.#applyFilters();
-		this.#notice = `Updated model override for ${selected.name}`;
-		this.#buildLayout();
+		const projectProfile = this.modelContext.projectModelProfileShadow;
+		if (projectProfile?.targetIds.includes(selected.name)) {
+			const operation = value
+				? `Updated model override for ${selected.name}`
+				: `Cleared model override for ${selected.name}`;
+			this.#notice = `${operation} for this session; project model profile ${projectProfile.profileName} resumes on restart`;
+		} else if (value && projectValue && projectValue !== value) {
+			this.#notice = `Updated user override for ${selected.name} to ${value} for this session; project override ${projectValue} resumes on restart`;
+		} else if (!value && effectiveValue) {
+			this.#notice = `Cleared user override for ${selected.name}; effective override remains ${effectiveValue}`;
+		} else if (!value) {
+			this.#notice = `Cleared model override for ${selected.name}`;
+		} else {
+			this.#notice = `Updated model override for ${selected.name}`;
+		}
+		this.#rebuildAndRender();
 	}
 
 	#cancelModelEdit(): void {
+		if (this.#modelOverrideSaving) {
+			this.#modelOverrideGeneration++;
+			this.#notice = "Model override save continues in the background";
+		}
 		this.#editingAgentName = null;
 		this.#editInput = null;
 		this.#buildLayout();
@@ -719,8 +813,12 @@ export class AgentDashboard extends Container {
 	}
 
 	#effectivePatternsFor(agent: DashboardAgent, draftOverride: string | undefined): string[] {
+		const projectedOverride =
+			draftOverride !== undefined && draftOverride.trim() === ""
+				? this.#settingsManager?.getProject("task.agentModelOverrides")?.[agent.name]
+				: draftOverride;
 		return resolveAgentModelPatterns({
-			settingsOverride: draftOverride,
+			settingsOverride: projectedOverride,
 			agentModel: agent.model,
 			settings: this.#settingsManager ?? undefined,
 			activeModelPattern: this.modelContext.activeModelPattern,
@@ -1005,10 +1103,11 @@ export class AgentDashboard extends Container {
 		}
 
 		if (this.#editInput) {
-			if (matchesAppInterrupt(data)) {
+			if (matchesKey(data, "escape") || matchesKey(data, "esc") || matchesAppInterrupt(data)) {
 				this.#cancelModelEdit();
 				return;
 			}
+			if (this.#modelOverrideSaving) return;
 			this.#editInput.handleInput(data);
 			if (this.#editInput) {
 				this.#buildLayout();
