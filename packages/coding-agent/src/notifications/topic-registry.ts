@@ -1,10 +1,11 @@
 /**
  * Per-session forum-topic registry for the threaded session surface.
  *
- * Each GJC session owns one active Telegram forum topic in the paired private
- * DM. The topic is created via `createForumTopic`, reused while the session
- * remains active, and removed from the registry when the daemon deletes it on
- * shutdown. The registry also tracks whether the one-time identity header has
+ * Each GJC session owns one active Telegram forum topic in the configured
+ * topic-capable chat. The topic is created via `createForumTopic`, reused while
+ * the session remains active, and removed from the registry when the daemon
+ * deletes it on shutdown.
+ * The registry also tracks whether the one-time identity header has
  * already been pinned, so it is sent exactly once per active topic, even across
  * reconnects.
  *
@@ -37,6 +38,8 @@ export interface TopicRecord {
 export interface TopicRegistryState {
 	/** sessionId -> record. */
 	topics: Record<string, TopicRecord>;
+	/** Telegram destination that owns every topic id in this state. */
+	chatId?: string;
 }
 
 export function emptyTopicRegistryState(): TopicRegistryState {
@@ -52,8 +55,11 @@ export class TopicRegistry {
 	private readonly topics: Map<string, TopicRecord>;
 	/** Maps topicId -> sessionId for fast inbound routing. */
 	private readonly byTopic = new Map<string, string>();
-	/** In-flight create promises, keyed by session, to dedupe concurrent creates. */
-	private readonly inflight = new Map<string, Promise<TopicRecord>>();
+	/** In-flight create promises, keyed by session, to dedupe or cancel concurrent creates. */
+	private readonly inflight = new Map<
+		string,
+		{ cancellation: { cancelled: boolean }; promise: Promise<TopicRecord> }
+	>();
 
 	constructor(state: TopicRegistryState = emptyTopicRegistryState()) {
 		this.topics = new Map();
@@ -110,6 +116,7 @@ export class TopicRegistry {
 		create: () => Promise<string>,
 		now: () => number = Date.now,
 		name?: string,
+		discard?: (topicId: string) => Promise<void>,
 	): Promise<TopicRecord> {
 		const existing = this.topics.get(sessionId);
 		if (existing) return existing;
@@ -118,20 +125,39 @@ export class TopicRegistry {
 		// `existing` check before `create()` resolves and creates a DUPLICATE
 		// forum topic. Share a single in-flight create per session id.
 		const pending = this.inflight.get(sessionId);
-		if (pending) return pending;
+		if (pending) return pending.promise;
+		const cancellation = { cancelled: false };
 		const promise = (async () => {
 			const topicId = await create();
+			if (cancellation.cancelled) {
+				try {
+					await discard?.(topicId);
+				} catch {}
+				throw new Error("topic creation cancelled");
+			}
 			const record: TopicRecord = { topicId, name, identitySent: false, createdAt: now() };
 			this.topics.set(sessionId, record);
 			this.byTopic.set(topicId, sessionId);
 			return record;
 		})();
-		this.inflight.set(sessionId, promise);
+		this.inflight.set(sessionId, { cancellation, promise });
 		try {
 			return await promise;
 		} finally {
-			this.inflight.delete(sessionId);
+			if (this.inflight.get(sessionId)?.promise === promise) this.inflight.delete(sessionId);
 		}
+	}
+
+	/**
+	 * Cancel an unresolved creation so session teardown wins the race. A later
+	 * creation starts independently, while the stale winner is discarded.
+	 */
+	cancelPendingCreate(sessionId: string): boolean {
+		const pending = this.inflight.get(sessionId);
+		if (!pending) return false;
+		pending.cancellation.cancelled = true;
+		this.inflight.delete(sessionId);
+		return true;
 	}
 
 	/** Mark the identity header as sent for a session. Idempotent. */
@@ -217,9 +243,16 @@ export class TopicRegistry {
 		this.byTopic.delete(record.topicId);
 		return true;
 	}
+	/** Restore failed-delete retry state unless a replacement generation already published. */
+	restoreIfAbsent(sessionId: string, record: TopicRecord): boolean {
+		if (this.topics.has(sessionId)) return false;
+		this.topics.set(sessionId, record);
+		this.byTopic.set(record.topicId, sessionId);
+		return true;
+	}
 
 	/** Serialise for atomic persistence beside the daemon state. */
-	serialize(): TopicRegistryState {
-		return { topics: Object.fromEntries(this.topics) };
+	serialize(chatId?: string): TopicRegistryState {
+		return { ...(chatId === undefined ? {} : { chatId }), topics: Object.fromEntries(this.topics) };
 	}
 }
