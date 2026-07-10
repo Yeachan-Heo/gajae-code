@@ -98,30 +98,6 @@ function persistModelAssignmentEntries(
 	return touched;
 }
 
-function restoreModelAssignmentEntries(
-	settings: ModelAssignmentPersistenceSettings,
-	touched: ModelAssignmentTouchedEntries,
-	previousModelRoles: Record<string, string>,
-	previousAgentModelOverrides: Record<string, string>,
-): void {
-	for (const role of touched.modelRoles) {
-		const selector = previousModelRoles[role];
-		if (selector === undefined) {
-			settings.clearModelRole(role);
-		} else {
-			settings.setModelRole(role, selector);
-		}
-	}
-	for (const agentName of touched.agentModelOverrides) {
-		const selector = previousAgentModelOverrides[agentName];
-		if (selector === undefined) {
-			settings.clearAgentModelOverride(agentName);
-		} else {
-			settings.setAgentModelOverride(agentName, selector);
-		}
-	}
-}
-
 function clearActiveModelProfileRuntimeState(session: object): void {
 	activeModelProfileRuntimeStates.delete(session);
 }
@@ -151,6 +127,7 @@ export interface PrepareModelProfileActivationOptions {
 		Settings,
 		| "clearGlobal"
 		| "clearOverride"
+		| "compareAndSwapGlobal"
 		| "flushOrThrow"
 		| "get"
 		| "getGlobal"
@@ -171,7 +148,15 @@ export interface PreparedModelProfileActivation {
 	session: ModelProfileActivationSession & { setModelTemporary: AgentSession["setModelTemporary"] };
 	settings: Pick<
 		Settings,
-		"clearGlobal" | "clearOverride" | "flushOrThrow" | "get" | "getGlobal" | "getRuntimeOverride" | "override" | "set"
+		| "clearGlobal"
+		| "clearOverride"
+		| "compareAndSwapGlobal"
+		| "flushOrThrow"
+		| "get"
+		| "getGlobal"
+		| "getRuntimeOverride"
+		| "override"
+		| "set"
 	> &
 		ModelAssignmentPersistenceSettings;
 	previousModel: Model<Api> | undefined;
@@ -578,21 +563,20 @@ export async function applyPreparedModelProfileActivation(
 	const previousModelRoles = prepared.previousModelRoles;
 	const previousPersistedDefault = prepared.settings.getGlobal("modelProfile.default");
 	const previousDefaultThinkingLevel = prepared.settings.getGlobal("defaultThinkingLevel");
+	const previousPersistedDefaultPresent = previousPersistedDefault !== undefined;
+	const previousDefaultThinkingLevelPresent = previousDefaultThinkingLevel !== undefined;
 	const previousActiveModelProfile = prepared.previousActiveModelProfile;
 	const previousSessionDefaultModel = prepared.previousSessionDefaultModel;
 	let modelChanged = false;
 	let defaultChanged = false;
 	let defaultThinkingChanged = false;
+	const effectiveDefaultThinkingLevel = options.thinkingLevelOverride ?? prepared.defaultThinkingLevel;
 
 	try {
 		if (prepared.defaultModel) {
-			await prepared.session.setModelTemporary(
-				prepared.defaultModel,
-				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
-				{
-					persistAsSessionDefault: true,
-				},
-			);
+			await prepared.session.setModelTemporary(prepared.defaultModel, effectiveDefaultThinkingLevel, {
+				persistAsSessionDefault: true,
+			});
 			modelChanged = true;
 		}
 		if (prepared.previousActiveModelProfile || Object.keys(prepared.modelRoles).length > 0) {
@@ -608,16 +592,18 @@ export async function applyPreparedModelProfileActivation(
 			});
 		}
 		if (options.persistDefault) {
+			defaultChanged = true;
+			defaultThinkingChanged = prepared.defaultModel !== undefined;
 			if (
-				prepared.profileDefaultSelector &&
-				prepared.defaultThinkingLevel !== undefined &&
-				prepared.defaultThinkingLevel !== ThinkingLevel.Inherit
+				prepared.defaultModel &&
+				effectiveDefaultThinkingLevel !== undefined &&
+				effectiveDefaultThinkingLevel !== ThinkingLevel.Inherit
 			) {
-				prepared.settings.set("defaultThinkingLevel", prepared.defaultThinkingLevel);
-				defaultThinkingChanged = true;
+				prepared.settings.set("defaultThinkingLevel", effectiveDefaultThinkingLevel);
+			} else if (prepared.defaultModel) {
+				prepared.settings.clearGlobal("defaultThinkingLevel");
 			}
 			prepared.settings.set("modelProfile.default", prepared.profileName);
-			defaultChanged = true;
 			await prepared.settings.flushOrThrow();
 		}
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
@@ -638,12 +624,16 @@ export async function applyPreparedModelProfileActivation(
 		const rollbackErrors: unknown[] = [];
 		if (defaultChanged) {
 			try {
-				prepared.settings.set("modelProfile.default", previousPersistedDefault);
+				if (previousPersistedDefaultPresent) {
+					prepared.settings.set("modelProfile.default", previousPersistedDefault);
+				} else {
+					prepared.settings.clearGlobal("modelProfile.default");
+				}
 				if (defaultThinkingChanged) {
-					if (previousDefaultThinkingLevel === undefined) {
-						prepared.settings.clearGlobal("defaultThinkingLevel");
-					} else {
+					if (previousDefaultThinkingLevelPresent) {
 						prepared.settings.set("defaultThinkingLevel", previousDefaultThinkingLevel);
+					} else {
+						prepared.settings.clearGlobal("defaultThinkingLevel");
 					}
 				}
 				await prepared.settings.flushOrThrow();
@@ -714,12 +704,65 @@ export interface MaterializeModelProfileForDeletionResult {
 	previousPersistedDefaultProfile: string | undefined;
 	previousActiveModelProfile: string | undefined;
 }
+type DeletionRollbackSettings = Pick<Settings, "clearOverride" | "compareAndSwapGlobal" | "override">;
+
+async function restoreDeletionSettings(
+	settings: DeletionRollbackSettings,
+	snapshot: MaterializeModelProfileForDeletionResult,
+): Promise<void> {
+	const updates = [
+		...snapshot.touchedModelRoles.map(role => ({
+			path: `modelRoles.${role}`,
+			expectedValue: snapshot.modelRoles[role],
+			value: snapshot.previousPersistedModelRoles[role],
+		})),
+		...snapshot.touchedAgentModelOverrides.map(agentName => ({
+			path: `task.agentModelOverrides.${agentName}`,
+			expectedValue: snapshot.agentModelOverrides[agentName],
+			value: snapshot.previousPersistedAgentModelOverrides[agentName],
+		})),
+		{
+			path: "modelProfile.default",
+			expectedValue: undefined,
+			value: snapshot.previousPersistedDefaultProfile,
+		},
+	];
+	const restoredPaths = await settings.compareAndSwapGlobal(updates);
+
+	const restoredModelRoles = { ...snapshot.previousModelRoles };
+	for (const role of snapshot.touchedModelRoles) {
+		if (!restoredPaths.has(`modelRoles.${role}`)) {
+			delete restoredModelRoles[role];
+		}
+	}
+	const restoredAgentModelOverrides = { ...snapshot.previousAgentModelOverrides };
+	for (const agentName of snapshot.touchedAgentModelOverrides) {
+		if (!restoredPaths.has(`task.agentModelOverrides.${agentName}`)) {
+			delete restoredAgentModelOverrides[agentName];
+		}
+	}
+
+	settings.override("modelRoles", restoredModelRoles);
+	settings.override("task.agentModelOverrides", restoredAgentModelOverrides);
+	if (restoredPaths.has("modelProfile.default")) {
+		settings.override("modelProfile.default", snapshot.previousDefaultProfile);
+	} else {
+		settings.clearOverride("modelProfile.default");
+	}
+}
 
 export async function materializeModelProfileForDeletion(
 	options: PrepareModelProfileActivationOptions & {
 		settings: Pick<
 			Settings,
-			"clearOverride" | "flushOrThrow" | "get" | "getGlobal" | "getRuntimeOverride" | "override" | "set"
+			| "clearOverride"
+			| "compareAndSwapGlobal"
+			| "flushOrThrow"
+			| "get"
+			| "getGlobal"
+			| "getRuntimeOverride"
+			| "override"
+			| "set"
 		> &
 			ModelAssignmentPersistenceSettings;
 	},
@@ -772,17 +815,19 @@ export async function materializeModelProfileForDeletion(
 		clearActiveModelProfileRuntimeState(prepared.session);
 	} catch (error) {
 		try {
-			restoreModelAssignmentEntries(
-				prepared.settings,
-				touchedEntries,
+			await restoreDeletionSettings(prepared.settings, {
+				modelRoles: nextModelRoles,
+				agentModelOverrides: nextAgentModelOverrides,
+				previousModelRoles: prepared.previousModelRoles,
+				previousAgentModelOverrides: prepared.previousAgentModelOverrides,
 				previousPersistedModelRoles,
 				previousPersistedAgentModelOverrides,
-			);
-			prepared.settings.set("modelProfile.default", previousPersistedDefaultProfile);
-			prepared.settings.override("modelRoles", prepared.previousModelRoles);
-			prepared.settings.override("task.agentModelOverrides", prepared.previousAgentModelOverrides);
-			prepared.settings.override("modelProfile.default", previousDefaultProfile);
-			await prepared.settings.flushOrThrow();
+				touchedModelRoles: touchedEntries.modelRoles,
+				touchedAgentModelOverrides: touchedEntries.agentModelOverrides,
+				previousDefaultProfile,
+				previousPersistedDefaultProfile,
+				previousActiveModelProfile: prepared.previousActiveModelProfile,
+			});
 		} catch (rollbackError) {
 			throw new AggregateError(
 				[error, rollbackError],
@@ -812,24 +857,11 @@ export async function materializeModelProfileForDeletion(
 }
 
 export async function restoreMaterializedModelProfileForDeletion(options: {
-	settings: Pick<Settings, "flushOrThrow" | "override" | "set"> & ModelAssignmentPersistenceSettings;
+	settings: DeletionRollbackSettings;
 	session: Pick<ModelProfileActivationSession, "setActiveModelProfile">;
 	snapshot: MaterializeModelProfileForDeletionResult;
 }): Promise<void> {
-	restoreModelAssignmentEntries(
-		options.settings,
-		{
-			modelRoles: options.snapshot.touchedModelRoles,
-			agentModelOverrides: options.snapshot.touchedAgentModelOverrides,
-		},
-		options.snapshot.previousPersistedModelRoles,
-		options.snapshot.previousPersistedAgentModelOverrides,
-	);
-	options.settings.set("modelProfile.default", options.snapshot.previousPersistedDefaultProfile);
-	options.settings.override("modelRoles", options.snapshot.previousModelRoles);
-	options.settings.override("task.agentModelOverrides", options.snapshot.previousAgentModelOverrides);
-	options.settings.override("modelProfile.default", options.snapshot.previousDefaultProfile);
-	await options.settings.flushOrThrow();
+	await restoreDeletionSettings(options.settings, options.snapshot);
 	options.session.setActiveModelProfile?.(options.snapshot.previousActiveModelProfile);
 	const previousRuntimeState = deletedModelProfileRuntimeStates.get(options.snapshot);
 	if (previousRuntimeState) {

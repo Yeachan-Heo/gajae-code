@@ -2,11 +2,12 @@ import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	ModelSelectorComponent,
 	type ModelSelectorSelection,
 } from "@gajae-code/coding-agent/modes/components/model-selector";
+import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";
@@ -342,6 +343,42 @@ describe("model selector profiles", () => {
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
 
+	test("profile activation closes without waiting for config notification", async () => {
+		const { promise: notification, reject: rejectNotification } = Promise.withResolvers<void>();
+		const { ctx, settings, session } = createControllerContext();
+		ctx.notifyConfigChanged = vi.fn(() => notification);
+		const controller = new SelectorController(ctx as never);
+		controller.showModelSelector();
+		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const result = await Promise.race([
+			selector.__testSelectProfile("profile-a", false).then(() => "selected" as const),
+			Bun.sleep(50).then(() => "timeout" as const),
+		]);
+
+		expect(result).toBe("selected");
+		expect(session.model).toBe(defaultModel);
+		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/alternate" });
+		expect(ctx.editorContainer.addChild).toHaveBeenLastCalledWith(ctx.editor);
+
+		rejectNotification(new Error("notification transport unavailable"));
+		await Bun.sleep(0);
+		expect(ctx.showError).toHaveBeenCalledWith(
+			"Configuration was updated, but change notification failed: notification transport unavailable",
+		);
+
+		controller.showModelSelector();
+		const nextSelector = ctx.editorContainer.addChild.mock.calls.at(-1)?.[0] as ModelSelectorComponent;
+		await Bun.sleep(10);
+		installTestTheme();
+		nextSelector.handleInput("c");
+		expect(nextSelector.getSearchInput().getValue()).toBe("c");
+		nextSelector.handleInput("\x1b");
+		expect(ctx.editorContainer.addChild).toHaveBeenLastCalledWith(ctx.editor);
+	});
+
 	test("credential failure shows error and leaves model and overrides unchanged", async () => {
 		const { ctx, settings, session } = createControllerContext({ missingCredentials: true });
 		const controller = new SelectorController(ctx as never);
@@ -369,6 +406,62 @@ describe("model selector profiles", () => {
 		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
 		expect(flush).toHaveBeenCalledTimes(1);
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
+	});
+
+	test("settings profile activation returns without waiting for config notification", async () => {
+		const { promise: notification } = Promise.withResolvers<void>();
+		const { ctx, session, settings } = createControllerContext();
+		ctx.notifyConfigChanged = vi.fn(() => notification);
+		const controller = new SelectorController(ctx as never);
+
+		const result = await Promise.race([
+			(controller.handleSettingChange("modelProfile.default", "profile-a") as Promise<void>).then(
+				() => "activated" as const,
+			),
+			Bun.sleep(50).then(() => "timeout" as const),
+		]);
+
+		expect(result).toBe("activated");
+		expect(session.model).toBe(defaultModel);
+		expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
+		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
+	});
+
+	test("settings profile submenu releases input while notification remains pending", async () => {
+		const { promise: notification } = Promise.withResolvers<void>();
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		const { ctx, session, settings } = createControllerContext();
+		ctx.notifyConfigChanged = vi.fn(() => notification);
+		const controller = new SelectorController(ctx as never);
+		const onCancel = vi.fn();
+		try {
+			const selector = new SettingsSelectorComponent(
+				{
+					availableThinkingLevels: [],
+					thinkingLevel: session.thinkingLevel,
+					availableThemes: ["red-claw"],
+					availableModelProfiles: ["profile-a"],
+					cwd: process.cwd(),
+				},
+				{
+					onChange: (path, value) => controller.handleSettingChange(path, value),
+					onCancel,
+				},
+			);
+
+			selector.handleInput("\x1b[C");
+			selector.handleInput("\n");
+			selector.handleInput("\n");
+			await Bun.sleep(0);
+			selector.handleInput("\x1b");
+
+			expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
+			expect(session.model).toBe(defaultModel);
+			expect(onCancel).toHaveBeenCalledTimes(1);
+		} finally {
+			resetSettingsForTest();
+		}
 	});
 
 	test("settings Default Model Profile surfaces credential errors without switching", async () => {
