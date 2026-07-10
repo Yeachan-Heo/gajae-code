@@ -279,6 +279,7 @@ export interface UltragoalStatusSummary {
 	nudgeGoalId?: string;
 	nudgeTargetKind?: UltragoalNudgeTargetKind;
 	pipelineOverlap?: JsonObject;
+	eta?: UltragoalEtaEstimate;
 }
 
 export interface UltragoalCommandResult {
@@ -1332,6 +1333,196 @@ function emptyCounts(): Record<UltragoalGoalStatus, number> {
 		superseded: 0,
 	};
 }
+export type UltragoalEtaState = "estimating" | "blocked" | "complete";
+export type UltragoalEtaConfidence = "low" | "medium" | "high";
+export type UltragoalEtaBasis = "observed_median" | "fallback_default";
+
+export interface UltragoalEtaEstimate {
+	state: UltragoalEtaState;
+	confidence: UltragoalEtaConfidence;
+	sampleSize: number;
+	elapsedSeconds: number;
+	remainingSecondsLow: number;
+	remainingSecondsHigh: number;
+	finishAtLow?: string;
+	finishAtHigh?: string;
+	basis: UltragoalEtaBasis;
+	blockedReason?: string;
+}
+
+const ULTRAGOAL_ETA_FALLBACK_LOW_SECONDS = 15 * 60;
+const ULTRAGOAL_ETA_FALLBACK_HIGH_SECONDS = 45 * 60;
+const ULTRAGOAL_ETA_OBSERVED_LOW_FACTOR = 0.75;
+const ULTRAGOAL_ETA_OBSERVED_HIGH_FACTOR = 1.25;
+const ULTRAGOAL_ETA_MIN_REMAINING_FLOOR_SECONDS = 5 * 60;
+// When both the low and high floors would otherwise collapse onto the same value (a short
+// observed median can push `perGoalHighSeconds / 2` below the low floor), the high floor
+// must still read as a distinct, wider estimate instead of a fake-precision point value.
+const ULTRAGOAL_ETA_MIN_HIGH_SPREAD_SECONDS = 5 * 60;
+
+function parseUltragoalTimestampMs(value: string | undefined): number | undefined {
+	if (typeof value !== "string" || value.trim().length === 0) return undefined;
+	const ms = Date.parse(value);
+	return Number.isFinite(ms) ? ms : undefined;
+}
+
+interface UltragoalCompletionRecord {
+	durationMs: number;
+	completedAtMs: number;
+	completedAtIso: string;
+}
+
+/**
+ * Valid `complete`-status goals with a sane (non-reversed, parseable) start/end pair.
+ * `superseded` goals, missing timestamps, and reversed pairs never count as real samples,
+ * so both the duration statistics and the "latest finish" candidate below share one source
+ * of truth instead of drifting apart.
+ */
+function validUltragoalCompletionRecords(goals: readonly UltragoalGoal[]): UltragoalCompletionRecord[] {
+	const records: UltragoalCompletionRecord[] = [];
+	for (const goal of goals) {
+		if (goal.status !== "complete") continue;
+		const started = parseUltragoalTimestampMs(goal.startedAt);
+		const completed = parseUltragoalTimestampMs(goal.completedAt);
+		if (started === undefined || completed === undefined || typeof goal.completedAt !== "string") continue;
+		const durationMs = completed - started;
+		if (durationMs <= 0) continue;
+		records.push({ durationMs, completedAtMs: completed, completedAtIso: goal.completedAt });
+	}
+	return records;
+}
+
+/** Ascending ms durations of `complete` goals with a sane (non-reversed, parseable) start/end. */
+function validUltragoalCompletedDurationsMs(goals: readonly UltragoalGoal[]): number[] {
+	return validUltragoalCompletionRecords(goals)
+		.map(record => record.durationMs)
+		.sort((a, b) => a - b);
+}
+
+function medianOfSorted(sortedValues: readonly number[]): number {
+	const mid = Math.floor(sortedValues.length / 2);
+	return sortedValues.length % 2 === 0 ? (sortedValues[mid - 1] + sortedValues[mid]) / 2 : sortedValues[mid];
+}
+
+function ultragoalEtaConfidence(sampleSize: number): UltragoalEtaConfidence {
+	if (sampleSize <= 1) return "low";
+	if (sampleSize <= 4) return "medium";
+	return "high";
+}
+
+/** Latest observed finish time among valid completion records, or `undefined` with none. */
+function latestUltragoalCompletionIso(records: readonly UltragoalCompletionRecord[]): string | undefined {
+	let latestMs: number | undefined;
+	let latestIso: string | undefined;
+	for (const record of records) {
+		if (latestMs === undefined || record.completedAtMs > latestMs) {
+			latestMs = record.completedAtMs;
+			latestIso = record.completedAtIso;
+		}
+	}
+	return latestIso;
+}
+
+function blockedUltragoalEtaReason(goal: UltragoalGoal): string {
+	return `${goal.id} ${goal.status}: ${goal.title}`;
+}
+
+/**
+ * Pure, deterministic ETA estimator for an ultragoal run. Never asserts a single exact
+ * completion time: always a low/high range with an explicit confidence and basis.
+ * `nowMs` is caller-injected so tests can drive it without mutating global clocks.
+ * `complete`/`superseded` goals are excluded from remaining-work accounting; a required
+ * (non-superseded) `blocked`/`review_blocked` goal short-circuits to `state: "blocked"`
+ * without asserting a finish time.
+ */
+export function computeUltragoalEta(goals: readonly UltragoalGoal[], nowMs: number): UltragoalEtaEstimate | undefined {
+	if (goals.length === 0) return undefined;
+	if (goals.every(goal => TERMINAL_OR_SKIPPED_STATUSES.has(goal.status))) {
+		const completionRecords = validUltragoalCompletionRecords(goals);
+		const sampleSize = completionRecords.length;
+		const confidence = ultragoalEtaConfidence(sampleSize);
+		const basis: UltragoalEtaBasis = sampleSize > 0 ? "observed_median" : "fallback_default";
+		const finishAt = latestUltragoalCompletionIso(completionRecords);
+		return {
+			state: "complete",
+			confidence,
+			sampleSize,
+			elapsedSeconds: 0,
+			remainingSecondsLow: 0,
+			remainingSecondsHigh: 0,
+			...(finishAt ? { finishAtLow: finishAt, finishAtHigh: finishAt } : {}),
+			basis,
+		};
+	}
+
+	const required = goals.filter(goal => goal.status !== "superseded");
+	const blockedGoal = required.find(goal => goal.status === "blocked" || goal.status === "review_blocked");
+	const durations = validUltragoalCompletedDurationsMs(goals);
+	const sampleSize = durations.length;
+	const confidence = ultragoalEtaConfidence(sampleSize);
+	const basis: UltragoalEtaBasis = sampleSize > 0 ? "observed_median" : "fallback_default";
+	const medianMs = sampleSize > 0 ? medianOfSorted(durations) : undefined;
+	const perGoalLowSeconds =
+		medianMs !== undefined
+			? (medianMs * ULTRAGOAL_ETA_OBSERVED_LOW_FACTOR) / 1000
+			: ULTRAGOAL_ETA_FALLBACK_LOW_SECONDS;
+	const perGoalHighSeconds =
+		medianMs !== undefined
+			? (medianMs * ULTRAGOAL_ETA_OBSERVED_HIGH_FACTOR) / 1000
+			: ULTRAGOAL_ETA_FALLBACK_HIGH_SECONDS;
+
+	const remainingCountable = required.filter(
+		goal => goal.status === "pending" || goal.status === "active" || goal.status === "failed",
+	);
+	const activeGoal = required.find(goal => goal.status === "active");
+	const elapsedSeconds = activeGoal
+		? Math.max(0, (nowMs - (parseUltragoalTimestampMs(activeGoal.startedAt) ?? nowMs)) / 1000)
+		: 0;
+
+	// Only the current active goal's own remaining window absorbs `elapsedSeconds`; any
+	// other countable goal (pending, failed, or an additional active) keeps its full
+	// per-goal budget so an overrunning active goal can never erase a later goal's ETA.
+	const otherCountableGoals = remainingCountable.filter(goal => goal !== activeGoal);
+	let remainingSecondsLow = otherCountableGoals.length * perGoalLowSeconds;
+	let remainingSecondsHigh = otherCountableGoals.length * perGoalHighSeconds;
+	if (activeGoal) {
+		const activeLowSeconds = Math.max(perGoalLowSeconds - elapsedSeconds, ULTRAGOAL_ETA_MIN_REMAINING_FLOOR_SECONDS);
+		const activeHighFloorSeconds =
+			perGoalHighSeconds / 2 > activeLowSeconds
+				? perGoalHighSeconds / 2
+				: activeLowSeconds + ULTRAGOAL_ETA_MIN_HIGH_SPREAD_SECONDS;
+		const activeHighSeconds = Math.max(perGoalHighSeconds - elapsedSeconds, activeHighFloorSeconds);
+		remainingSecondsLow += activeLowSeconds;
+		remainingSecondsHigh += activeHighSeconds;
+	}
+	remainingSecondsLow = Math.max(0, Math.round(remainingSecondsLow));
+	remainingSecondsHigh = Math.max(remainingSecondsLow, Math.round(remainingSecondsHigh));
+
+	if (blockedGoal) {
+		return {
+			state: "blocked",
+			confidence,
+			sampleSize,
+			elapsedSeconds: Math.round(elapsedSeconds),
+			remainingSecondsLow,
+			remainingSecondsHigh,
+			basis,
+			blockedReason: blockedUltragoalEtaReason(blockedGoal),
+		};
+	}
+
+	return {
+		state: "estimating",
+		confidence,
+		sampleSize,
+		elapsedSeconds: Math.round(elapsedSeconds),
+		remainingSecondsLow,
+		remainingSecondsHigh,
+		finishAtLow: new Date(nowMs + remainingSecondsLow * 1000).toISOString(),
+		finishAtHigh: new Date(nowMs + remainingSecondsHigh * 1000).toISOString(),
+		basis,
+	};
+}
 
 export async function getUltragoalStatus(cwd: string, sessionId?: string | null): Promise<UltragoalStatusSummary> {
 	const resolvedSessionId =
@@ -1344,6 +1535,7 @@ export async function getUltragoalStatus(cwd: string, sessionId?: string | null)
 	for (const goal of plan.goals) counts[goal.status] += 1;
 	const currentGoal = plan.goals.find(goal => SCHEDULABLE_STATUSES.has(goal.status));
 	const overlap = openPipelineOverlap(plan);
+	const eta = computeUltragoalEta(plan.goals, Date.now());
 	let status: UltragoalStatusSummary["status"] = "pending";
 	if (plan.goals.length > 0 && plan.goals.every(goal => TERMINAL_OR_SKIPPED_STATUSES.has(goal.status)))
 		status = "complete";
@@ -1373,6 +1565,7 @@ export async function getUltragoalStatus(cwd: string, sessionId?: string | null)
 		counts,
 		goals: plan.goals,
 		...nudgeFields,
+		...(eta ? { eta } : {}),
 		...(overlap
 			? {
 					pipelineOverlap: {
@@ -1396,6 +1589,7 @@ export function buildUltragoalHudSummary(
 		goals: summary.goals,
 		latestLedgerEvent: latestLedger,
 		updatedAt: new Date().toISOString(),
+		eta: summary.eta,
 	});
 }
 function clampTitle(title: string): string {
@@ -5472,6 +5666,7 @@ async function reconcileUltragoalState(cwd: string): Promise<void> {
 		if (summary.nudgeGoalId !== undefined) payload.nudge_goal_id = summary.nudgeGoalId;
 		if (summary.nudgeTargetKind !== undefined) payload.nudge_target_kind = summary.nudgeTargetKind;
 		if (summary.pipelineOverlap) payload.pipeline_overlap = summary.pipelineOverlap;
+		if (summary.eta) payload.eta = summary.eta;
 		const ledgerText = await Bun.file(summary.paths.ledgerPath)
 			.text()
 			.catch(() => "");

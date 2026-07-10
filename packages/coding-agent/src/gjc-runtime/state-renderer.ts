@@ -1,4 +1,5 @@
 import type { CanonicalGjcWorkflowSkill } from "../skill-state/active-state";
+import { formatUltragoalLocalRange } from "../skill-state/workflow-hud";
 import type { SkillManifest } from "./workflow-manifest";
 
 function scalar(value: unknown): string | undefined {
@@ -248,6 +249,13 @@ export function renderHistoryMarkdown(history: {
 	return `${lines.join("\n")}\n`;
 }
 
+function formatUltragoalEtaDuration(totalSeconds: number): string {
+	const seconds = Math.max(0, Math.round(totalSeconds));
+	const hours = Math.floor(seconds / 3600);
+	const minutes = Math.floor((seconds % 3600) / 60);
+	return hours > 0 ? `${hours}h${String(minutes).padStart(2, "0")}m` : `${minutes}m`;
+}
+
 export function renderUltragoalStatusMarkdown(summary: {
 	exists: boolean;
 	status: string;
@@ -261,6 +269,18 @@ export function renderUltragoalStatusMarkdown(summary: {
 	nudgeRemaining?: number;
 	nudgeGoalId?: string;
 	nudgeTargetKind?: string;
+	eta?: {
+		state: string;
+		confidence: string;
+		sampleSize: number;
+		elapsedSeconds: number;
+		remainingSecondsLow: number;
+		remainingSecondsHigh: number;
+		finishAtLow?: string;
+		finishAtHigh?: string;
+		basis: string;
+		blockedReason?: string;
+	};
 }): string {
 	if (!summary.exists)
 		return `# ultragoal status\n\n- status: missing\n- No ultragoal plan found at ${summary.paths.goalsPath}. Run \`gjc ultragoal create-goals --brief "..."\` first.\n`;
@@ -282,6 +302,23 @@ export function renderUltragoalStatusMarkdown(summary: {
 		lines.push(
 			`- nudge: ${summary.nudgeGoalId} ${used}/${summary.nudgeBudget} used (${remaining} remaining)${target}`,
 		);
+	}
+	if (summary.eta && summary.eta.state !== "complete") {
+		const elapsed = formatUltragoalEtaDuration(summary.eta.elapsedSeconds);
+		if (summary.eta.state === "blocked") {
+			lines.push(
+				`- eta: blocked${summary.eta.blockedReason ? ` (${summary.eta.blockedReason})` : ""} — elapsed=${elapsed} confidence=${summary.eta.confidence} basis=${summary.eta.basis}`,
+			);
+		} else {
+			const remaining = `${formatUltragoalEtaDuration(summary.eta.remainingSecondsLow)}\u2013${formatUltragoalEtaDuration(summary.eta.remainingSecondsHigh)}`;
+			lines.push(
+				`- eta: elapsed=${elapsed} remaining=${remaining} confidence=${summary.eta.confidence} basis=${summary.eta.basis}`,
+			);
+			if (summary.eta.finishAtLow && summary.eta.finishAtHigh) {
+				const range = formatUltragoalLocalRange(summary.eta.finishAtLow, summary.eta.finishAtHigh);
+				if (range) lines.push(`- eta_finish: ~${range} (local, estimate)`);
+			}
+		}
 	}
 	lines.push(`- goals_path: ${summary.paths.goalsPath}`);
 	if (summary.paths.ledgerPath) lines.push(`- ledger_path: ${summary.paths.ledgerPath}`);
