@@ -308,6 +308,38 @@ export class Settings {
 		return value === undefined ? undefined : (value as SettingValue<P>);
 	}
 
+	/**
+	 * Return the persisted global model service-tier policy without consulting
+	 * project settings or runtime overrides.
+	 */
+	getGlobalModelServiceTierOverrides(): Record<string, "on" | "off"> {
+		const value = getByPath(this.#global, ["modelServiceTierOverrides"]);
+		if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+		const result: Record<string, "on" | "off"> = {};
+		for (const [key, override] of Object.entries(value)) {
+			if (override === "on" || override === "off") result[key] = override;
+		}
+		return result;
+	}
+
+	/**
+	 * Update one persisted global model policy entry, preserving all other entries.
+	 */
+	setGlobalModelServiceTierOverride(modelKey: string, override: "on" | "off"): void {
+		const current = this.getGlobalModelServiceTierOverrides();
+		this.set("modelServiceTierOverrides", { ...current, [modelKey]: override });
+	}
+
+	/**
+	 * Delete one persisted global model policy entry, preserving all other entries.
+	 */
+	deleteGlobalModelServiceTierOverride(modelKey: string): void {
+		const current = this.getGlobalModelServiceTierOverrides();
+		if (!(modelKey in current)) return;
+		delete current[modelKey];
+		this.set("modelServiceTierOverrides", current);
+	}
+
 	/** Check whether a setting is present in loaded settings/overrides rather than coming from schema defaults. */
 	has(path: SettingPath): boolean {
 		return getByPath(this.#merged, path.split(".")) !== undefined;

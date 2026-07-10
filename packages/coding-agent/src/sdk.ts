@@ -16,6 +16,7 @@ import {
 	type ProviderSessionState,
 	type SimpleStreamOptions,
 	streamSimple,
+	type ServiceTier,
 } from "@gajae-code/ai";
 import {
 	getOpenAICodexTransportDetails,
@@ -50,6 +51,7 @@ import {
 	type ScopedModelSelection,
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
+import { resolveModelServiceTierPolicy, type ModelServiceTierOverrides } from "./config/model-service-tier-policy";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
 import type { BashRestrictionProfile } from "./tools/bash-allowed-prefixes";
@@ -373,6 +375,8 @@ export interface CreateAgentSessionOptions {
 	forkContextSeed?: ForkContextSeed;
 	/** Optional provider state override. Fork-context children should omit this by default. */
 	providerSessionState?: Map<string, ProviderSessionState>;
+	/** Explicit sanitized per-model policy snapshot for child-session resolution. */
+	modelServiceTierOverrides?: ModelServiceTierOverrides;
 	/** Cooperative pause checkpoint passed through to Agent. */
 	shouldPause?: () => boolean;
 }
@@ -1320,6 +1324,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// (serviceTier === undefined) would be resurrected to the startup value.
 				return agent ? agent.serviceTier : initialServiceTier;
 			},
+			get rawServiceTier(): ServiceTier | undefined {
+				// Preserve the configured raw baseline before a live AgentSession exists.
+				return session ? session.rawServiceTier : initialServiceTier;
+			},
+			get modelServiceTierOverrides() {
+				return session?.modelServiceTierOverrides ?? initialModelServiceTierOverrides;
+			},
 			getAgentId: () => resolvedAgentId,
 			bashAllowedPrefixes: options.bashAllowedPrefixes,
 			bashRestrictionProfile: options.bashRestrictionProfile,
@@ -2142,6 +2153,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: serviceTierSetting === "none"
 				? undefined
 				: serviceTierSetting;
+		const initialModelServiceTierOverrides =
+			options.modelServiceTierOverrides ?? settings.getGlobalModelServiceTierOverrides();
+		const initialRequestTier =
+			model === undefined
+				? initialServiceTier
+				: resolveModelServiceTierPolicy({
+						rawBaseline: initialServiceTier,
+						provider: model.provider,
+						model: model.id,
+						overrides: initialModelServiceTierOverrides,
+					}).effectiveTier;
 
 		const appendOnlyContext =
 			model && resolveAppendOnlyMode(settings.get("provider.appendOnlyContext"), model.provider)
@@ -2191,7 +2213,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			minP: settings.get("minP") >= 0 ? settings.get("minP") : undefined,
 			presencePenalty: settings.get("presencePenalty") >= 0 ? settings.get("presencePenalty") : undefined,
 			repetitionPenalty: settings.get("repetitionPenalty") >= 0 ? settings.get("repetitionPenalty") : undefined,
-			serviceTier: initialServiceTier,
+			serviceTier: initialRequestTier,
 			hideThinkingSummary: settings.get("hideThinkingBlock"),
 			maxRetryDelayMs: retrySettings.maxDelayMs,
 			requestMaxRetries: retrySettings.requestMaxRetries,
@@ -2286,6 +2308,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		session = new AgentSession({
 			agent,
+			rawServiceTier: initialServiceTier,
+			modelServiceTierOverrides: initialModelServiceTierOverrides,
 			thinkingLevel,
 			sessionManager,
 			settings,

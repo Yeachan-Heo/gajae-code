@@ -15,6 +15,7 @@ import {
 import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
+import { formatModelServiceTierOverrideKey } from "../../config/model-service-tier-policy";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { type Settings, settings } from "../../config/settings";
 import { DebugSelectorComponent } from "../../debug";
@@ -894,6 +895,23 @@ export class SelectorController {
 							this.ctx.ui.requestRender();
 							return;
 						}
+						if (selection.kind === "serviceTier") {
+							const modelKey = formatModelServiceTierOverrideKey(selection.model.provider, selection.model.id);
+							try {
+								if (selection.override === "inherit") {
+									this.ctx.settings.deleteGlobalModelServiceTierOverride(modelKey);
+								} else {
+									this.ctx.settings.setGlobalModelServiceTierOverride(modelKey, selection.override);
+								}
+								await this.ctx.settings.flushOrThrow();
+								this.ctx.session.refreshServiceTierForModel();
+								this.ctx.showStatus(`Fast mode ${selection.override} for ${modelKey}.`);
+							} catch (err) {
+								this.ctx.showError(`Fast mode update failed: ${err instanceof Error ? err.message : String(err)}`);
+							}
+							return;
+						}
+						if (selection.kind && selection.kind !== "assignment") return;
 						const { model, role, thinkingLevel, selector: selectedSelector } = selection;
 						if (role === null) {
 							// Temporary: update agent state but don't persist to settings

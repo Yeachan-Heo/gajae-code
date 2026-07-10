@@ -226,6 +226,10 @@ export interface ToolSession {
 	settings: Settings;
 	/** Live service-tier intent of the parent session, inherited by `inherit` subagents. */
 	serviceTier?: ServiceTier;
+	/** Raw user-configured service-tier baseline, before per-model policy resolution. */
+	readonly rawServiceTier?: ServiceTier;
+	/** Per-model service-tier policy snapshot inherited by child sessions. */
+	readonly modelServiceTierOverrides?: import("../config/model-service-tier-policy").ModelServiceTierOverrides;
 	/** Plan mode state (if active) */
 	getPlanModeState?: () => PlanModeState | undefined;
 	/** Goal mode state (if active or paused) */

@@ -17,6 +17,7 @@ import { ModelRegistry } from "../config/model-registry";
 import { formatModelString, resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { Settings } from "../config/settings";
+import type { ModelServiceTierOverrides } from "../config/model-service-tier-policy";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
@@ -152,12 +153,14 @@ export interface ExecutorOptions {
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
 	/**
-	 * Live service-tier intent of the parent session (`AgentSession.serviceTier`),
+	 * Live raw service-tier intent of the parent session (`AgentSession.rawServiceTier`),
 	 * used as the inherited tier when `task.serviceTier === "inherit"`. Passing the
-	 * live value (not the stale settings snapshot) lets a runtime `/fast on` reach
-	 * subagents, and a main-model fast-mode auto-disable does not clobber it.
+	 * raw baseline (not the effective model tier) lets child sessions derive their
+	 * own model-specific effective tier.
 	 */
 	inheritedServiceTier?: ServiceTier;
+	/** Explicit per-model policy snapshot inherited from the parent. */
+	modelServiceTierOverrides?: ModelServiceTierOverrides;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -577,9 +580,13 @@ export function createSubagentSettings(baseSettings: Settings, inheritedServiceT
 	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 		snapshot[key] = baseSettings.get(key);
 	}
+	// Preserve the parent's raw global tier intent. Project/runtime settings must
+	// not shadow the machine-wide policy used by child sessions.
+	snapshot.serviceTier = baseSettings.getGlobal("serviceTier") ?? "none";
+	snapshot.modelServiceTierOverrides = baseSettings.getGlobalModelServiceTierOverrides();
 	// Subagent-scoped service-tier override: "inherit" uses the parent session's
-	// LIVE intent (so a runtime `/fast on` reaches subagents and a main-model
-	// fast-mode auto-disable never clobbers it); any explicit value applies only
+	// LIVE intent (so a runtime `/fast on` reaches subagents and a main-model fast-mode
+	// auto-disable never clobbers it); any explicit value applies only
 	// to subagent sessions and wins over inherited intent.
 	const taskServiceTier = baseSettings.get("task.serviceTier");
 	if (taskServiceTier === "inherit") {
@@ -666,6 +673,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const settings = options.settings ?? Settings.isolated();
 	const subagentSettings = createSubagentSettings(settings, options.inheritedServiceTier);
+	const modelServiceTierOverrides = options.modelServiceTierOverrides ?? settings.getGlobalModelServiceTierOverrides();
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	const maxRuntimeMs = Math.max(0, Math.trunc(Number(settings.get("task.maxRuntimeMs") ?? 0) || 0));
 	const parentDepth = options.taskDepth ?? 0;
@@ -1358,6 +1366,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			const { session } = await awaitAbortable(
 				createAgentSession({
+					modelServiceTierOverrides,
 					cwd: worktree ?? cwd,
 					authStorage,
 					modelRegistry,
