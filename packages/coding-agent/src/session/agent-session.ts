@@ -6232,6 +6232,30 @@ export class AgentSession {
 		};
 	}
 
+	/** Remove a queued custom-message display/agent entry by its private pending-display tag. */
+	removeQueuedCustomMessageDisplay(tag: string): boolean {
+		const normalizedTag = tag.trim();
+		if (!normalizedTag) return false;
+		const matchesTag = (message: CustomMessage): boolean => readPendingDisplayTag(message.details) === normalizedTag;
+		const agentRemoved = this.agent.removeQueuedMessages(
+			(message: AgentMessage): boolean => message.role === "custom" && matchesTag(message as CustomMessage),
+		);
+
+		const beforeNext = this.#pendingNextTurnMessages.length;
+		this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(message => !matchesTag(message));
+		const pendingNextTurn = beforeNext - this.#pendingNextTurnMessages.length;
+
+		const beforeSteering = this.#steeringMessages.length;
+		this.#steeringMessages = this.#steeringMessages.filter(entry => entry.tag !== normalizedTag);
+		const displaySteering = beforeSteering - this.#steeringMessages.length;
+
+		const beforeFollowUp = this.#followUpMessages.length;
+		this.#followUpMessages = this.#followUpMessages.filter(entry => entry.tag !== normalizedTag);
+		const displayFollowUp = beforeFollowUp - this.#followUpMessages.length;
+
+		return agentRemoved.total + pendingNextTurn + displaySteering + displayFollowUp > 0;
+	}
+
 	/**
 	 * Send a user message to the agent.
 	 * When deliverAs is set, queue the message instead of starting a new turn.

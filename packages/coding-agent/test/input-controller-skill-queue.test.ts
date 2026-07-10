@@ -19,7 +19,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentMessage } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -96,16 +96,24 @@ function createStubInputControllerContext(opts: {
 		},
 		addToHistory: vi.fn(),
 	};
-	const enqueueCustomMessageDisplay = vi.fn((_text: string, _mode: "steer" | "followUp") => "sk-test-0");
+	let nextTagIndex = 0;
+	const enqueueCustomMessageDisplay = vi.fn((_text: string, _mode: "steer" | "followUp") => {
+		const tag = `sk-test-${nextTagIndex}`;
+		nextTagIndex += 1;
+		return tag;
+	});
 	// Annotate parameters so `mock.calls[N]` is typed as a tuple (not `[]`) and
 	// `message` carries required skill prompt details for assertion below.
 	const promptCustomMessage = vi.fn(
 		async (_message: { content: string; details: SkillPromptDetails }, _options?: unknown) => {},
 	);
 	const sendCustomMessage = vi.fn(async (_message: { content: string; details: SkillPromptDetails }) => {});
+	const clearQueue = vi.fn();
+	const removeQueuedCustomMessageDisplay = vi.fn((_tag: string) => true);
 	const prompt = vi.fn(async (_text: string, _options?: { streamingBehavior?: "steer" | "followUp" }) => {});
 	const updatePendingMessagesDisplay = vi.fn();
 	const requestRender = vi.fn();
+	const addMessageToChat = vi.fn((_message: AgentMessage) => []);
 	const showError = vi.fn();
 
 	const ctx = {
@@ -122,6 +130,8 @@ function createStubInputControllerContext(opts: {
 			enqueueCustomMessageDisplay,
 			sendCustomMessage,
 			promptCustomMessage,
+			clearQueue,
+			removeQueuedCustomMessageDisplay,
 			prompt,
 		},
 		settings: {
@@ -140,9 +150,19 @@ function createStubInputControllerContext(opts: {
 		compactionQueuedMessages: [],
 		locallySubmittedUserSignatures: new Set<string>(),
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+		addMessageToChat,
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage, sendCustomMessage, prompt };
+	return {
+		ctx,
+		editor,
+		enqueueCustomMessageDisplay,
+		promptCustomMessage,
+		sendCustomMessage,
+		prompt,
+		addMessageToChat,
+		removeQueuedCustomMessageDisplay,
+	};
 }
 
 describe("InputController #invokeSkillCommand (E1-E3)", () => {
@@ -269,6 +289,94 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		expect(ctx.compactionQueuedMessages).toEqual([]);
 	});
 
+	it("compaction queued chained skills direct-render non-final and prompt final sequentially", async () => {
+		const secondSkillPath = writeSkillFile(tempDir.path(), "second-skill", "Do the second thing.");
+		skillCommands.set("skill:second-skill", {
+			name: "second-skill",
+			description: "Second skill",
+			filePath: secondSkillPath,
+			baseDir: tempDir.path(),
+			source: "test",
+		});
+		const { ctx, sendCustomMessage, promptCustomMessage, addMessageToChat } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+		ctx.compactionQueuedMessages.push({
+			text: "/skill:test-skill from compaction /skill:second-skill final args",
+			mode: "followUp",
+		});
+
+		const uiHelpers = new UiHelpers(ctx);
+		await uiHelpers.flushCompactionQueue();
+
+		expect(sendCustomMessage).toHaveBeenCalledTimes(1);
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		expect(addMessageToChat).toHaveBeenCalledTimes(1);
+		const renderedMessage = addMessageToChat.mock.calls[0]?.[0];
+		if (!renderedMessage || !("content" in renderedMessage) || typeof renderedMessage.content !== "string") {
+			throw new Error("expected a rendered custom message with string content");
+		}
+		expect(renderedMessage.content).toContain("Do the thing.");
+		expect(renderedMessage.content).toContain("User: from compaction");
+		expect(renderedMessage.content).not.toContain("Do the second thing.");
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("Do the second thing.");
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("User: final args");
+		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
+			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
+		});
+		expect(ctx.ui.requestRender).toHaveBeenCalledTimes(1);
+		expect(ctx.compactionQueuedMessages).toEqual([]);
+	});
+
+	it("compaction queued chained skills direct-render each successful non-final send", async () => {
+		const secondSkillPath = writeSkillFile(tempDir.path(), "second-skill", "Do the second thing.");
+		const thirdSkillPath = writeSkillFile(tempDir.path(), "third-skill", "Do the third thing.");
+		skillCommands.set("skill:second-skill", {
+			name: "second-skill",
+			description: "Second skill",
+			filePath: secondSkillPath,
+			baseDir: tempDir.path(),
+			source: "test",
+		});
+		skillCommands.set("skill:third-skill", {
+			name: "third-skill",
+			description: "Third skill",
+			filePath: thirdSkillPath,
+			baseDir: tempDir.path(),
+			source: "test",
+		});
+		const { ctx, sendCustomMessage, promptCustomMessage, addMessageToChat } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+		sendCustomMessage
+			.mockImplementationOnce(async (_message: { content: string; details: SkillPromptDetails }) => {})
+			.mockImplementationOnce(async (_message: { content: string; details: SkillPromptDetails }) => {
+				throw new Error("send failed");
+			});
+		ctx.compactionQueuedMessages.push({
+			text: "/skill:test-skill first /skill:second-skill second /skill:third-skill third",
+			mode: "followUp",
+		});
+
+		const uiHelpers = new UiHelpers(ctx);
+		await uiHelpers.flushCompactionQueue();
+
+		expect(sendCustomMessage).toHaveBeenCalledTimes(2);
+		expect(promptCustomMessage).not.toHaveBeenCalled();
+		expect(addMessageToChat).toHaveBeenCalledTimes(1);
+		const renderedMessage = addMessageToChat.mock.calls[0]?.[0];
+		if (!renderedMessage || !("content" in renderedMessage) || typeof renderedMessage.content !== "string") {
+			throw new Error("expected a rendered custom message with string content");
+		}
+		expect(renderedMessage.content).toContain("Do the thing.");
+		expect(renderedMessage.content).toContain("User: first");
+		expect(ctx.ui.requestRender).toHaveBeenCalledTimes(1);
+		expect(ctx.showError).toHaveBeenCalledWith("Failed to send queued message: send failed");
+	});
+
 	it("E3: not streaming -> enqueueCustomMessageDisplay NOT called and tag absent", async () => {
 		const { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage } = createStubInputControllerContext({
 			skillCommands,
@@ -315,7 +423,7 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 			baseDir: tempDir.path(),
 			source: "test",
 		});
-		const { ctx, editor, sendCustomMessage, promptCustomMessage } = createStubInputControllerContext({
+		const { ctx, editor, sendCustomMessage, promptCustomMessage, addMessageToChat } = createStubInputControllerContext({
 			skillCommands,
 			isStreaming: false,
 		});
@@ -331,6 +439,124 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		expect(sendCustomMessage.mock.calls[0]?.[0].content).toContain("User: alpha");
 		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("Do the second thing.");
 		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("User: beta gamma");
+		expect(addMessageToChat).toHaveBeenCalledTimes(1);
+		const renderedMessage = addMessageToChat.mock.calls[0]?.[0];
+		expect(renderedMessage).toMatchObject({
+			role: "custom",
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			display: true,
+			attribution: "user",
+		});
+		if (!renderedMessage || !("content" in renderedMessage) || typeof renderedMessage.content !== "string") {
+			throw new Error("expected a rendered custom message with string content");
+		}
+		expect(renderedMessage.content).toContain("Do the thing.");
+		expect(renderedMessage.content).not.toContain("Do the second thing.");
+		expect(ctx.ui.requestRender).toHaveBeenCalledTimes(1);
+	});
+
+	it("dispatches chained canonical skill commands with distinct streaming tags and no direct render", async () => {
+		const secondSkillPath = writeSkillFile(tempDir.path(), "second-skill", "Do the second thing.");
+		skillCommands.set("skill:second-skill", {
+			name: "second-skill",
+			description: "Second skill",
+			filePath: secondSkillPath,
+			baseDir: tempDir.path(),
+			source: "test",
+		});
+		const { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage, addMessageToChat } =
+			createStubInputControllerContext({
+				skillCommands,
+				isStreaming: true,
+				busyPromptMode: "steer",
+			});
+
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("/skill:test-skill alpha /skill:second-skill beta gamma");
+		await editor.onSubmit?.("/skill:test-skill alpha /skill:second-skill beta gamma");
+
+		expect(enqueueCustomMessageDisplay).toHaveBeenCalledTimes(2);
+		expect(enqueueCustomMessageDisplay).toHaveBeenNthCalledWith(1, "/skill:test-skill alpha", "steer");
+		expect(enqueueCustomMessageDisplay).toHaveBeenNthCalledWith(2, "/skill:second-skill beta gamma", "steer");
+		expect(promptCustomMessage).toHaveBeenCalledTimes(2);
+		expect(promptCustomMessage.mock.calls[0]?.[0].details.__pendingDisplayTag).toBe("sk-test-0");
+		expect(promptCustomMessage.mock.calls[1]?.[0].details.__pendingDisplayTag).toBe("sk-test-1");
+		expect(addMessageToChat).not.toHaveBeenCalled();
+	});
+
+	it("cleans up streaming skill pending display when dispatch rejects", async () => {
+		const {
+			ctx,
+			editor,
+			enqueueCustomMessageDisplay,
+			promptCustomMessage,
+			addMessageToChat,
+			removeQueuedCustomMessageDisplay,
+		} = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: true,
+			busyPromptMode: "steer",
+		});
+		promptCustomMessage.mockRejectedValueOnce(new Error("dispatch failed"));
+
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("/skill:test-skill arg1 arg2");
+		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+
+		expect(enqueueCustomMessageDisplay).toHaveBeenCalledWith("/skill:test-skill arg1 arg2", "steer");
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		expect(removeQueuedCustomMessageDisplay).toHaveBeenCalledWith("sk-test-0");
+		expect(ctx.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+		expect(ctx.ui.requestRender).toHaveBeenCalledTimes(1);
+		expect(addMessageToChat).not.toHaveBeenCalled();
+		expect(ctx.showError).toHaveBeenCalledWith("Failed to load skill: dispatch failed");
+	});
+
+	it("keeps already-rendered idle skill cards when a later non-final send fails", async () => {
+		const secondSkillPath = writeSkillFile(tempDir.path(), "second-skill", "Do the second thing.");
+		const thirdSkillPath = writeSkillFile(tempDir.path(), "third-skill", "Do the third thing.");
+		skillCommands.set("skill:second-skill", {
+			name: "second-skill",
+			description: "Second skill",
+			filePath: secondSkillPath,
+			baseDir: tempDir.path(),
+			source: "test",
+		});
+		skillCommands.set("skill:third-skill", {
+			name: "third-skill",
+			description: "Third skill",
+			filePath: thirdSkillPath,
+			baseDir: tempDir.path(),
+			source: "test",
+		});
+		const { ctx, editor, sendCustomMessage, promptCustomMessage, addMessageToChat } =
+			createStubInputControllerContext({
+				skillCommands,
+				isStreaming: false,
+			});
+		sendCustomMessage
+			.mockImplementationOnce(async (_message: { content: string; details: SkillPromptDetails }) => {})
+			.mockImplementationOnce(async (_message: { content: string; details: SkillPromptDetails }) => {
+				throw new Error("send failed");
+			});
+
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("/skill:test-skill first /skill:second-skill second /skill:third-skill third");
+		await editor.onSubmit?.("/skill:test-skill first /skill:second-skill second /skill:third-skill third");
+
+		expect(sendCustomMessage).toHaveBeenCalledTimes(2);
+		expect(promptCustomMessage).not.toHaveBeenCalled();
+		expect(addMessageToChat).toHaveBeenCalledTimes(1);
+		const renderedMessage = addMessageToChat.mock.calls[0]?.[0];
+		if (!renderedMessage || !("content" in renderedMessage) || typeof renderedMessage.content !== "string") {
+			throw new Error("expected a rendered custom message with string content");
+		}
+		expect(renderedMessage.content).toContain("Do the thing.");
+		expect(renderedMessage.content).toContain("User: first");
+		expect(ctx.showError).toHaveBeenCalledWith("Failed to load skill: send failed");
 	});
 });
 

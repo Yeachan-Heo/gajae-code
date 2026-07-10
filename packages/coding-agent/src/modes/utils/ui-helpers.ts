@@ -806,13 +806,18 @@ export class UiHelpers {
 
 			const isLast = index === invocations.length - 1;
 			if (!this.ctx.session.isStreaming && !isLast) {
-				await this.ctx.session.sendCustomMessage({
+				const liveMessage: CustomMessage<SkillPromptDetails> = {
+					role: "custom",
 					customType: SKILL_PROMPT_MESSAGE_TYPE,
 					content: built.message,
 					display: true,
 					details,
 					attribution: "user",
-				});
+					timestamp: Date.now(),
+				};
+				await this.ctx.session.sendCustomMessage(liveMessage);
+				this.ctx.addMessageToChat(liveMessage);
+				this.ctx.ui.requestRender();
 				continue;
 			}
 

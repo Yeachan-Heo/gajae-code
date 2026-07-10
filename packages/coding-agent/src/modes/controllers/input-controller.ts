@@ -12,7 +12,7 @@ import { theme } from "../../modes/theme/theme";
 import { scrollTmuxToPreviousUserInput as scrollTmuxPaneToPreviousUserInput } from "../../modes/tmux-scroll";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
-import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
+import { type CustomMessage, SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
@@ -852,6 +852,7 @@ export class InputController {
 				});
 				const details: SkillPromptDetails = built.details;
 				const displayText = `/${invocation.commandName}${activationResult.cleanedArgs ? ` ${activationResult.cleanedArgs}` : ""}`;
+				let pendingDisplayTag: string | undefined;
 				// When the agent is streaming, register a compact slash-form text as
 				// the pending-display twin BEFORE dispatching the CustomMessage. The
 				// returned tag is embedded in details so AgentSession.#handleAgentEvent
@@ -859,31 +860,46 @@ export class InputController {
 				// message (mirrors the user-message dequeue path).
 				if (this.ctx.session.isStreaming) {
 					const tag = this.ctx.session.enqueueCustomMessageDisplay(displayText, streamingBehavior);
+					pendingDisplayTag = tag;
 					details.__pendingDisplayTag = tag;
 				}
 				const isLast = index === invocations.length - 1;
-				if (!this.ctx.session.isStreaming && !isLast) {
-					await this.ctx.session.sendCustomMessage({
-						customType: SKILL_PROMPT_MESSAGE_TYPE,
-						content: built.message,
-						display: true,
-						details,
-						attribution: "user",
-					});
-					continue;
+				try {
+					if (!this.ctx.session.isStreaming && !isLast) {
+						const liveMessage: CustomMessage<SkillPromptDetails> = {
+							role: "custom",
+							customType: SKILL_PROMPT_MESSAGE_TYPE,
+							content: built.message,
+							display: true,
+							details,
+							attribution: "user",
+							timestamp: Date.now(),
+						};
+						await this.ctx.session.sendCustomMessage(liveMessage);
+						this.ctx.addMessageToChat(liveMessage);
+						this.ctx.ui.requestRender();
+						continue;
+					}
+					await this.ctx.session.promptCustomMessage(
+						{
+							customType: SKILL_PROMPT_MESSAGE_TYPE,
+							content: built.message,
+							display: true,
+							details,
+							attribution: "user",
+						},
+						streamingBehavior === "followUp"
+							? { streamingBehavior, followUpQueuePolicy: "sequential" }
+							: { streamingBehavior },
+					);
+				} catch (err) {
+					if (pendingDisplayTag) {
+						this.ctx.session.removeQueuedCustomMessageDisplay(pendingDisplayTag);
+						this.ctx.updatePendingMessagesDisplay();
+						this.ctx.ui.requestRender();
+					}
+					throw err;
 				}
-				await this.ctx.session.promptCustomMessage(
-					{
-						customType: SKILL_PROMPT_MESSAGE_TYPE,
-						content: built.message,
-						display: true,
-						details,
-						attribution: "user",
-					},
-					streamingBehavior === "followUp"
-						? { streamingBehavior, followUpQueuePolicy: "sequential" }
-						: { streamingBehavior },
-				);
 			}
 			if (this.ctx.session.isStreaming) {
 				this.ctx.updatePendingMessagesDisplay();
