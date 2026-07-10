@@ -78,13 +78,14 @@ class SelectSubmenu extends Container {
 	#selectList: SelectList;
 	#previewText: Text | null = null;
 	#previewUpdateRequestId: number = 0;
+	#selectPending = false;
 
 	constructor(
 		title: string,
 		description: string,
 		options: ReadonlyArray<SelectItem>,
 		currentValue: string,
-		onSelect: (value: string) => void,
+		onSelect: (value: string) => void | Promise<void>,
 		onCancel: () => void,
 		onSelectionChange?: (value: string) => void | Promise<void>,
 		private readonly getPreview?: () => string,
@@ -121,7 +122,25 @@ class SelectSubmenu extends Container {
 		}
 
 		this.#selectList.onSelect = item => {
-			onSelect(item.value);
+			if (this.#selectPending) return;
+			this.#selectPending = true;
+			try {
+				const result = onSelect(item.value);
+				if (result && typeof (result as Promise<void>).then === "function") {
+					void (result as Promise<void>)
+						.catch(() => {
+							// The callback owns user-facing error reporting. Keep the
+							// submenu open so the prior selection remains visible.
+						})
+						.finally(() => {
+							this.#selectPending = false;
+						});
+					return;
+				}
+			} catch {
+				// The callback owns user-facing error reporting.
+			}
+			this.#selectPending = false;
 		};
 
 		this.#selectList.onCancel = onCancel;
@@ -158,6 +177,7 @@ class SelectSubmenu extends Container {
 	}
 
 	handleInput(data: string): void {
+		if (this.#selectPending) return;
 		this.#selectList.handleInput(data);
 	}
 }
@@ -677,7 +697,7 @@ export interface StatusLinePreviewSettings {
 
 export interface SettingsCallbacks {
 	/** Called when any setting value changes */
-	onChange: (path: SettingPath, newValue: unknown) => void;
+	onChange: (path: SettingPath, newValue: unknown) => void | Promise<void>;
 	/** Called for theme preview while browsing theme settings */
 	onThemePreview?: (theme: string) => void | Promise<void>;
 	/** Called to restore the rendered theme when theme settings preview is cancelled */
@@ -937,8 +957,15 @@ export class SettingsSelectorComponent extends Container {
 			options,
 			currentValue,
 			value => {
-				this.#setSettingValue(def.path, value);
-				this.callbacks.onChange(def.path, value);
+				// Profile activation owns persistence so credential/model failures
+				// cannot leave a default profile selected only on disk.
+				if (def.path !== "modelProfile.default") {
+					this.#setSettingValue(def.path, value);
+				}
+				const result = this.callbacks.onChange(def.path, value);
+				if (result && typeof result.then === "function") {
+					return result.then(() => done(value));
+				}
 				done(value);
 			},
 			() => {

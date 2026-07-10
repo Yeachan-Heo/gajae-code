@@ -465,18 +465,6 @@ export class AgentDashboard extends Container {
 		this.#settingsManager.set("task.disabledAgents", disabled);
 	}
 
-	#persistModelOverrides(): void {
-		if (!this.#settingsManager) return;
-		const overrides: Record<string, string> = {};
-		for (const agent of this.#allAgents) {
-			const value = agent.overrideModel?.trim();
-			if (value) {
-				overrides[agent.name] = value;
-			}
-		}
-		this.#settingsManager.set("task.agentModelOverrides", overrides);
-	}
-
 	#toggleSelectedAgent(): void {
 		const selected = this.#selectedAgent();
 		if (!selected) return;
@@ -505,8 +493,12 @@ export class AgentDashboard extends Container {
 		const selected = this.#allAgents.find(agent => agent.name === this.#editingAgentName);
 		if (!selected) return;
 		const value = rawValue.trim();
+		if (value) {
+			this.#settingsManager?.setAgentModelOverride(selected.name, value);
+		} else {
+			this.#settingsManager?.clearAgentModelOverride(selected.name);
+		}
 		selected.overrideModel = value || undefined;
-		this.#persistModelOverrides();
 		this.#editingAgentName = null;
 		this.#editInput = null;
 		this.#applyFilters();

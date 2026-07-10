@@ -65,7 +65,7 @@ function instrumentSettings(settings: Settings) {
 		overrideCalls.push(path);
 		return originalOverride(path, value);
 	}) as typeof settings.override;
-	settings.flush = async () => {
+	settings.flushOrThrow = async () => {
 		flushCount += 1;
 	};
 	return {

@@ -107,6 +107,7 @@ describe("SelectorController model batch assignments", () => {
 		expect(ctx.showStatus).toHaveBeenCalledWith(
 			"Role-agent models set to provider-a/selected:low for EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		);
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
 	});
 
 	test("all targets selection writes DEFAULT plus every role-agent override", async () => {
@@ -138,5 +139,50 @@ describe("SelectorController model batch assignments", () => {
 		expect(ctx.showStatus).toHaveBeenCalledWith(
 			"All model targets set to provider-a/selected:high for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		);
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
+	});
+
+	test("all targets replace live role overrides used by the TUI", async () => {
+		const { ctx, settings } = createControllerContext();
+		settings.override("task.agentModelOverrides", {
+			executor: "provider-a/profile-executor:medium",
+			architect: "provider-a/profile-architect:high",
+			planner: "provider-a/profile-planner:medium",
+			critic: "provider-a/profile-critic:high",
+		});
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			roles: ["default", "executor", "architect", "planner", "critic"],
+			thinkingLevel: ThinkingLevel.XHigh,
+			selector: "provider-a/selected:xhigh",
+		});
+
+		const expectedRoleOverrides = {
+			executor: "provider-a/selected:xhigh",
+			architect: "provider-a/selected:xhigh",
+			planner: "provider-a/selected:xhigh",
+			critic: "provider-a/selected:xhigh",
+		};
+		expect(settings.get("task.agentModelOverrides")).toEqual(expectedRoleOverrides);
+
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("task.agentModelOverrides")).toEqual(expectedRoleOverrides);
+	});
+
+	test("single DEFAULT selection notifies configuration observers", async () => {
+		const { ctx } = createControllerContext();
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/selected",
+		});
+
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
 	});
 });

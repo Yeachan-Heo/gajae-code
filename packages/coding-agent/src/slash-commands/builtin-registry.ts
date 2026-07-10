@@ -356,8 +356,22 @@ function getModelAssignmentTargetIds(
 
 function formatModelAssignmentSuccess(
 	targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId,
-	selector: string,
+	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string>,
 ): string {
+	const targetIds = getModelAssignmentTargetIds(targetId);
+	const assigned = targetIds
+		.map(id => [id, assignments.get(id)] as const)
+		.filter((entry): entry is readonly [GjcModelAssignmentTargetId, string] => entry[1] !== undefined);
+	const selector = assigned[0]?.[1] ?? "(unset)";
+	const hasMixedSelectors = new Set(assigned.map(([, value]) => value)).size > 1;
+
+	if ((targetId === "all-role-agents" || targetId === "all-targets") && hasMixedSelectors) {
+		const heading = targetId === "all-role-agents" ? "Role-agent models updated:" : "All model targets updated:";
+		return [
+			heading,
+			...assigned.map(([id, value]) => `  ${GJC_MODEL_ASSIGNMENT_TARGETS[id].tag ?? id.toUpperCase()}: ${value}`),
+		].join("\n");
+	}
 	if (targetId === "all-role-agents") {
 		return `Role-agent models set to ${selector} for EXECUTOR, ARCHITECT, PLANNER, CRITIC.`;
 	}
@@ -366,6 +380,32 @@ function formatModelAssignmentSuccess(
 	}
 	if (targetId === "default") return `Default model set to ${selector}.`;
 	return `${targetId} agent model set to ${selector}.`;
+}
+async function notifyModelAssignmentCommitted(
+	runtime: SlashCommandRuntime,
+	options: { titleChanged: boolean },
+): Promise<void> {
+	const failures: string[] = [];
+	if (options.titleChanged) {
+		try {
+			await runtime.notifyTitleChanged?.();
+		} catch (error) {
+			failures.push(`title: ${errorMessage(error)}`);
+		}
+	}
+	try {
+		await runtime.notifyConfigChanged?.();
+	} catch (error) {
+		failures.push(`config: ${errorMessage(error)}`);
+	}
+	if (failures.length > 0) {
+		try {
+			await runtime.output(`Model settings were updated, but notification failed (${failures.join("; ")}).`);
+		} catch {
+			// The model mutation is already committed; output transport failure
+			// must not turn it into a false mutation failure.
+		}
+	}
 }
 
 function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: string): string {
@@ -593,8 +633,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					});
 					if (!materializedProfile) {
 						for (const [targetId, selector] of assignments) {
-							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
-							if (target.settingsPath === "modelRoles") {
+							if (targetId === "default") {
 								runtime.settings.setModelRole(targetId, selector);
 							} else {
 								runtime.settings.setAgentModelOverride(targetId, selector);
@@ -602,14 +641,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						}
 					}
 					runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
-					await runtime.output(
-						formatModelAssignmentSuccess(
-							parsedArgs.targetId,
-							assignments.get(targetIds[0] ?? "default") ?? persistedSelector,
-						),
-					);
-					if (includesDefault) await runtime.notifyTitleChanged?.();
-					await runtime.notifyConfigChanged?.();
+					await runtime.output(formatModelAssignmentSuccess(parsedArgs.targetId, assignments));
+					await notifyModelAssignmentCommitted(runtime, { titleChanged: includesDefault });
 					return commandConsumed();
 				} catch (err) {
 					return usage(`Failed to set model: ${errorMessage(err)}`, runtime);
