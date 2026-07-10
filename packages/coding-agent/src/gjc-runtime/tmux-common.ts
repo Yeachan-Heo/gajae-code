@@ -14,6 +14,9 @@ export const GJC_TMUX_BRANCH_SLUG_OPTION = "@gjc-branch-slug";
 export const GJC_TMUX_PROJECT_OPTION = "@gjc-project";
 export const GJC_TMUX_SESSION_ID_OPTION = "@gjc-session-id";
 export const GJC_TMUX_SESSION_STATE_FILE_OPTION = "@gjc-session-state-file";
+export const GJC_TMUX_OWNER_GENERATION_OPTION = "@gjc-owner-generation";
+export const GJC_TMUX_OWNER_SERVER_KEY_OPTION = "@gjc-owner-server-key";
+
 export const GJC_TMUX_VERSION_OPTION = "@gjc-version";
 export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
 
@@ -158,15 +161,13 @@ export function buildGjcTmuxRequiredProfileCommands(
 		project?: string | null;
 		sessionId?: string | null;
 		sessionStateFile?: string | null;
+		ownerGeneration?: string | null;
+		ownerServerKey?: string | null;
 		version?: string | null;
 	} = {},
 ): GjcTmuxProfileCommand[] {
-	const commands: GjcTmuxProfileCommand[] = [
-		{
-			description: "mark GJC tmux ownership",
-			args: ["set-option", "-t", target, GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE],
-		},
-	];
+	const commands: GjcTmuxProfileCommand[] = [];
+
 	if (metadata.branch)
 		commands.push({
 			description: "record GJC branch identity",
@@ -192,11 +193,26 @@ export function buildGjcTmuxRequiredProfileCommands(
 			description: "record GJC session state marker",
 			args: ["set-option", "-t", target, GJC_TMUX_SESSION_STATE_FILE_OPTION, metadata.sessionStateFile],
 		});
+	if (metadata.ownerGeneration)
+		commands.push({
+			description: "record GJC owner generation",
+			args: ["set-option", "-t", target, GJC_TMUX_OWNER_GENERATION_OPTION, metadata.ownerGeneration],
+		});
+	if (metadata.ownerServerKey)
+		commands.push({
+			description: "record GJC owner server key",
+			args: ["set-option", "-t", target, GJC_TMUX_OWNER_SERVER_KEY_OPTION, metadata.ownerServerKey],
+		});
+
 	if (metadata.version)
 		commands.push({
 			description: "record GJC version identity",
 			args: ["set-option", "-t", target, GJC_TMUX_VERSION_OPTION, metadata.version],
 		});
+	commands.push({
+		description: "mark GJC tmux ownership",
+		args: ["set-option", "-t", target, GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE],
+	});
 	return commands;
 }
 
@@ -219,6 +235,8 @@ export function buildGjcTmuxProfileCommands(
 		project?: string | null;
 		sessionId?: string | null;
 		sessionStateFile?: string | null;
+		ownerGeneration?: string | null;
+		ownerServerKey?: string | null;
 		version?: string | null;
 	} = {},
 	opts: { platform?: NodeJS.Platform; tmuxCommand?: string } = {},
@@ -260,7 +278,8 @@ export function buildGjcTmuxProfileCommands(
 		tmuxName.endsWith("/pmux") ||
 		tmuxName.endsWith("\\psmux") ||
 		tmuxName.endsWith("\\pmux");
-	const dropUx = isPsmuxClass && !envDisabled(env[GJC_PSMUX_PROFILE_FORCE_ENV]);
+	const forcePsmuxProfile = env[GJC_PSMUX_PROFILE_FORCE_ENV] === "true" || env[GJC_PSMUX_PROFILE_FORCE_ENV] === "1";
+	const dropUx = isPsmuxClass && !forcePsmuxProfile;
 	if (dropUx) {
 		return commands.filter(command => {
 			const flag = command.args[0];

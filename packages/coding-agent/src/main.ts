@@ -34,6 +34,7 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 import type { SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
@@ -1402,6 +1403,10 @@ export async function runRootCommand(
 }
 
 export async function main(args: string[]): Promise<void> {
+	if (isTmuxOwnerIsolationCliArgv(args)) {
+		await runTmuxOwnerIsolationCliFromStdin();
+		return;
+	}
 	const { runCli } = await import("./cli");
 	await runCli(args.length === 0 ? ["launch"] : args);
 }

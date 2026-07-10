@@ -7,6 +7,7 @@
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
+import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -278,6 +279,10 @@ export function routeRootArgv(argv: readonly string[]): string[] {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	if (isTmuxOwnerIsolationCliArgv(argv)) {
+		await runTmuxOwnerIsolationCliFromStdin();
+		return;
+	}
 	if (isNotifyDaemonInternalFastPath(argv)) {
 		await runNotifyDaemonInternalFastPath(argv);
 		return;

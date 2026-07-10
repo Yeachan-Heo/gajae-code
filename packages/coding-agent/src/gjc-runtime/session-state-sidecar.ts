@@ -1,10 +1,24 @@
+import { randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
-import { logger, postmortem } from "@gajae-code/utils";
+import { postmortem } from "@gajae-code/utils";
 import { sessionRuntimeDir } from "./session-layout";
+import {
+	isValidOwnerIntent,
+	lifecyclePaths,
+	type ObserveTerminalRequest,
+	type OwnerIntent,
+	type OwnerVerdict,
+	observeOwnerTerminal,
+	type TerminalSignal,
+} from "./tmux-owner-isolation";
 
+/** Managed tmux owner provenance propagated only to the launched child process. */
+export const GJC_TMUX_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
+export const GJC_TMUX_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
+export const GJC_TMUX_OWNER_SERVER_KEY_ENV = "GJC_TMUX_OWNER_SERVER_KEY";
 export const GJC_COORDINATOR_SESSION_STATE_FILE_ENV = "GJC_COORDINATOR_SESSION_STATE_FILE";
 export const GJC_COORDINATOR_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 export const GJC_COORDINATOR_SESSION_BRANCH_ENV = "GJC_COORDINATOR_SESSION_BRANCH";
@@ -19,6 +33,7 @@ const HEARTBEAT_MS = 1000;
 
 type LastPayloadCacheEntry = { mtimeMs: number; size: number; payload: Record<string, unknown> };
 const lastPayloadByStateFile = new Map<string, LastPayloadCacheEntry>();
+const stateFileWriteChains = new Map<string, Promise<void>>();
 
 /** Test-only counters for runtime sidecar hot-path assertions. */
 export const __sessionStateSidecarPerfCounters = {
@@ -28,18 +43,30 @@ export const __sessionStateSidecarPerfCounters = {
 	},
 };
 
-const lastWrittenPayloadByStateFile = new Map<string, Record<string, unknown>>();
-
 interface RuntimeStateEvent {
 	type: string;
 	messages?: unknown[];
 }
 
-interface RuntimeStateContext {
+export interface OwnerTerminalContext {
+	generation: string;
+	stateDir: string;
+	socketKey: string;
+	scope?: string | null;
+	ownerPid?: number | null;
+	ownerName?: string | null;
+	operatorDispatchId?: string | null;
+}
+
+export interface RuntimeStateContext {
 	sessionId: string;
 	cwd: string;
 	sessionFile?: string | null;
 	branch?: string | null;
+	/** Public-safe owner metadata used to persist the canonical terminal verdict. */
+	ownerTerminal?: OwnerTerminalContext | null;
+	/** Internal fail-closed marker set only when managed owner metadata is malformed or missing. */
+	ownerTerminalMetadataInvalid?: boolean;
 }
 
 interface RuntimeStateSidecarPayload {
@@ -60,6 +87,7 @@ export type TerminalRuntimeStateStatus =
 			reason:
 				| "missing_state_file"
 				| "invalid_json"
+				| "invalid_state_marker"
 				| "session_id_mismatch"
 				| "cwd_mismatch"
 				| "session_file_mismatch"
@@ -70,9 +98,62 @@ function sameResolvedPath(left: string, right: string): boolean {
 	return path.resolve(left) === path.resolve(right);
 }
 
-function isCoordinatorOwnedStateFile(stateFile: string): boolean {
-	const coordinatorStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
-	return !!coordinatorStateFile && sameResolvedPath(coordinatorStateFile, stateFile);
+function normalizedIdentity(context: Pick<RuntimeStateContext, "sessionId" | "cwd" | "sessionFile">): {
+	sessionId: string;
+	cwd: string;
+	workdir: string;
+	sessionFile: string | null;
+} {
+	const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+	const sessionId = explicitStateFile
+		? process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId.trim()
+		: context.sessionId.trim();
+	const cwd = context.cwd.trim();
+	if (!sessionId || !cwd) throw new PreviousRuntimeStateReadError();
+	return {
+		sessionId,
+		cwd: path.resolve(cwd),
+		workdir: path.resolve(cwd),
+		sessionFile: context.sessionFile == null ? null : path.resolve(context.sessionFile),
+	};
+}
+
+async function serializeStateFileWrite<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
+	const prior = stateFileWriteChains.get(stateFile) ?? Promise.resolve();
+	const current = prior.catch(() => {}).then(operation);
+	const settled = current.then(
+		() => undefined,
+		() => undefined,
+	);
+	stateFileWriteChains.set(stateFile, settled);
+	try {
+		return await current;
+	} finally {
+		if (stateFileWriteChains.get(stateFile) === settled) stateFileWriteChains.delete(stateFile);
+	}
+}
+
+function validRuntimeStateMarker(value: unknown): value is RuntimeStateSidecarPayload {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const payload = value as RuntimeStateSidecarPayload;
+	return (
+		payload.schema_version === 1 &&
+		typeof payload.session_id === "string" &&
+		payload.session_id.trim().length > 0 &&
+		payload.session_id === payload.session_id.trim() &&
+		(payload.state === "ready_for_input" ||
+			payload.state === "running" ||
+			payload.state === "needs_user_input" ||
+			payload.state === "completed" ||
+			payload.state === "errored") &&
+		typeof payload.cwd === "string" &&
+		payload.cwd.trim().length > 0 &&
+		typeof payload.workdir === "string" &&
+		payload.workdir.trim().length > 0 &&
+		Object.hasOwn(payload, "session_file") &&
+		(payload.session_file === null ||
+			(typeof payload.session_file === "string" && payload.session_file.trim().length > 0))
+	);
 }
 
 export async function readTerminalRuntimeStateMarker(input: {
@@ -83,28 +164,34 @@ export async function readTerminalRuntimeStateMarker(input: {
 }): Promise<TerminalRuntimeStateStatus> {
 	const stateFile = input.stateFile?.trim();
 	const sessionId = input.sessionId?.trim();
-	if (!stateFile || !sessionId) return { terminal: false, reason: "missing_state_file" };
-	let payload: RuntimeStateSidecarPayload;
+	const cwd = input.cwd?.trim();
+	if (!stateFile || !sessionId || !cwd || input.sessionId !== sessionId)
+		return { terminal: false, reason: "missing_state_file" };
+	let value: unknown;
 	try {
-		payload = JSON.parse(await Bun.file(stateFile).text()) as RuntimeStateSidecarPayload;
+		value = JSON.parse(await Bun.file(stateFile).text());
 	} catch (error) {
 		const code = (error as { code?: unknown }).code;
 		return {
 			terminal: false,
-			reason: code === "ENOENT" || code === "ENOTDIR" ? "missing_state_file" : "invalid_json",
+			reason: code === "ENOENT" ? "missing_state_file" : "invalid_json",
 		};
 	}
+	if (!validRuntimeStateMarker(value)) return { terminal: false, reason: "invalid_state_marker" };
+	const payload = value;
 	if (payload.session_id !== sessionId) return { terminal: false, reason: "session_id_mismatch" };
-	if (input.cwd && typeof payload.cwd === "string" && !sameResolvedPath(payload.cwd, input.cwd)) {
+	if (!sameResolvedPath(payload.cwd as string, cwd) || !sameResolvedPath(payload.workdir as string, cwd))
 		return { terminal: false, reason: "cwd_mismatch" };
-	}
+	const sessionFile = input.sessionFile == null ? null : path.resolve(input.sessionFile);
 	if (
-		input.sessionFile &&
-		typeof payload.session_file === "string" &&
-		!sameResolvedPath(payload.session_file, input.sessionFile)
-	) {
+		payload.session_file !== sessionFile &&
+		!(
+			typeof payload.session_file === "string" &&
+			typeof sessionFile === "string" &&
+			sameResolvedPath(payload.session_file, sessionFile)
+		)
+	)
 		return { terminal: false, reason: "session_file_mismatch" };
-	}
 	if (payload.state === "completed" || payload.state === "errored") return { terminal: true, state: payload.state };
 	return { terminal: false, reason: "non_terminal_state" };
 }
@@ -161,35 +248,105 @@ export function eventAffectsCoordinatorRuntimeState(event: RuntimeStateEvent): b
 	return stateForEvent(event) !== null;
 }
 
+class PreviousRuntimeStateReadError extends Error {
+	constructor() {
+		super("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		this.name = "PreviousRuntimeStateReadError";
+	}
+}
+
+function isAbsentStateFileError(error: unknown): boolean {
+	return (error as { code?: unknown }).code === "ENOENT";
+}
+
+function parsePreviousPayload(raw: string): Record<string, unknown> {
+	const payload: unknown = JSON.parse(raw);
+	if (!validPreviousRuntimeStatePayload(payload)) throw new PreviousRuntimeStateReadError();
+	return payload;
+}
+
+function validPreviousRuntimeStatePayload(value: unknown): value is Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const payload = value as Record<string, unknown>;
+	if (
+		payload.schema_version !== 1 ||
+		typeof payload.session_id !== "string" ||
+		payload.session_id.trim().length === 0 ||
+		(payload.state !== "booting" &&
+			payload.state !== "ready_for_input" &&
+			payload.state !== "running" &&
+			payload.state !== "needs_user_input" &&
+			payload.state !== "completed" &&
+			payload.state !== "errored" &&
+			payload.state !== "stale" &&
+			payload.state !== "unknown")
+	)
+		return false;
+	if (typeof payload.cwd !== "string" || payload.cwd.trim().length === 0) return false;
+	if (typeof payload.workdir !== "string" || payload.workdir.trim().length === 0) return false;
+	if (
+		!Object.hasOwn(payload, "session_file") ||
+		(payload.session_file !== null && typeof payload.session_file !== "string")
+	)
+		return false;
+	if (payload.ready_for_input !== undefined && typeof payload.ready_for_input !== "boolean") return false;
+	if (payload.live !== undefined && payload.live !== null && typeof payload.live !== "boolean") return false;
+	if (payload.reason !== undefined && payload.reason !== null && typeof payload.reason !== "string") return false;
+	if (
+		payload.updated_at !== undefined &&
+		(typeof payload.updated_at !== "string" || !Number.isFinite(Date.parse(payload.updated_at)))
+	)
+		return false;
+	if (payload.ready_for_input !== undefined) {
+		const expectedReady = payload.state === "ready_for_input" || payload.state === "completed";
+		if (payload.ready_for_input !== expectedReady) return false;
+	}
+	if (payload.live !== undefined && payload.live !== null && payload.live !== (payload.state === "running"))
+		return false;
+	return true;
+}
+
 function readPreviousPayload(stateFile: string): Record<string, unknown> {
+	let raw: string;
 	try {
-		return JSON.parse(fsSync.readFileSync(stateFile, "utf8")) as Record<string, unknown>;
-	} catch {
-		return {};
+		raw = fsSync.readFileSync(stateFile, "utf8");
+	} catch (error) {
+		lastPayloadByStateFile.delete(stateFile);
+		if (isAbsentStateFileError(error)) return {};
+		throw new PreviousRuntimeStateReadError();
+	}
+	try {
+		return parsePreviousPayload(raw);
+	} catch (error) {
+		lastPayloadByStateFile.delete(stateFile);
+		if (error instanceof PreviousRuntimeStateReadError) throw error;
+		throw new PreviousRuntimeStateReadError();
 	}
 }
 
 async function readPreviousPayloadForEvent(stateFile: string): Promise<Record<string, unknown>> {
-	if (!isCoordinatorOwnedStateFile(stateFile)) {
-		const cachedWritten = lastWrittenPayloadByStateFile.get(stateFile);
-		if (cachedWritten) return cachedWritten;
-	}
-	let stat: Awaited<ReturnType<typeof fs.stat>>;
+	let stat: fsSync.Stats;
 	try {
 		stat = await fs.stat(stateFile);
-	} catch {
+	} catch (error) {
 		lastPayloadByStateFile.delete(stateFile);
-		return {};
+		if (isAbsentStateFileError(error)) return {};
+		throw new PreviousRuntimeStateReadError();
+	}
+	if (!stat.isFile()) {
+		lastPayloadByStateFile.delete(stateFile);
+		throw new PreviousRuntimeStateReadError();
 	}
 	const cached = lastPayloadByStateFile.get(stateFile);
 	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.payload;
 	try {
-		const payload = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+		const payload = parsePreviousPayload(await Bun.file(stateFile).text());
 		lastPayloadByStateFile.set(stateFile, { mtimeMs: stat.mtimeMs, size: stat.size, payload });
 		return payload;
-	} catch {
+	} catch (error) {
 		lastPayloadByStateFile.delete(stateFile);
-		return {};
+		if (error instanceof PreviousRuntimeStateReadError) throw error;
+		throw new PreviousRuntimeStateReadError();
 	}
 }
 
@@ -213,7 +370,6 @@ function shouldSkipRuntimeStateWrite(
 }
 
 function rememberWrittenPayload(stateFile: string, payload: Record<string, unknown>): void {
-	lastWrittenPayloadByStateFile.set(stateFile, payload);
 	try {
 		const stat = fsSync.statSync(stateFile);
 		lastPayloadByStateFile.set(stateFile, { mtimeMs: stat.mtimeMs, size: stat.size, payload });
@@ -223,30 +379,42 @@ function rememberWrittenPayload(stateFile: string, payload: Record<string, unkno
 }
 function shouldPreserveTerminalPayload(
 	previous: RuntimeStateSidecarPayload,
-	input: { sessionId: string; cwd: string; sessionFile?: string | null },
+	input: { sessionId: string; cwd: string; sessionFile: string | null },
 ): boolean {
+	if (!validRuntimeStateMarker(previous)) return false;
 	if (previous.state !== "completed" && previous.state !== "errored") return false;
 	const source = previous.final_response?.source;
 	if (source !== "agent_end" && source !== "launch_error") return false;
-	if (typeof previous.session_id === "string" && previous.session_id !== input.sessionId) return false;
-	if (typeof previous.cwd === "string" && !sameResolvedPath(previous.cwd, input.cwd)) return false;
-	if (typeof previous.workdir === "string" && !sameResolvedPath(previous.workdir, input.cwd)) return false;
-	if (
-		input.sessionFile &&
-		typeof previous.session_file === "string" &&
-		!sameResolvedPath(previous.session_file, input.sessionFile)
-	) {
-		return false;
-	}
-	return true;
+	return (
+		previous.session_id === input.sessionId &&
+		sameResolvedPath(previous.cwd as string, input.cwd) &&
+		sameResolvedPath(previous.workdir as string, input.cwd) &&
+		(previous.session_file === input.sessionFile ||
+			(typeof previous.session_file === "string" &&
+				typeof input.sessionFile === "string" &&
+				sameResolvedPath(previous.session_file, input.sessionFile)))
+	);
 }
 
-function cachedTerminalPayload(
-	stateFile: string,
-	input: { sessionId: string; cwd: string; sessionFile?: string | null },
-): RuntimeStateSidecarPayload | null {
-	const cached = lastWrittenPayloadByStateFile.get(stateFile) as RuntimeStateSidecarPayload | undefined;
-	return cached && shouldPreserveTerminalPayload(cached, input) ? cached : null;
+function assertPreviousRuntimeStateIdentity(
+	previous: Record<string, unknown>,
+	input: { sessionId: string; cwd: string; sessionFile: string | null },
+): void {
+	if (Object.keys(previous).length === 0) return;
+	if (
+		previous.session_id !== input.sessionId ||
+		typeof previous.cwd !== "string" ||
+		typeof previous.workdir !== "string" ||
+		!sameResolvedPath(previous.cwd, input.cwd) ||
+		!sameResolvedPath(previous.workdir, input.cwd) ||
+		(previous.session_file !== input.sessionFile &&
+			!(
+				typeof previous.session_file === "string" &&
+				typeof input.sessionFile === "string" &&
+				sameResolvedPath(previous.session_file, input.sessionFile)
+			))
+	)
+		throw new PreviousRuntimeStateReadError();
 }
 
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
@@ -269,9 +437,11 @@ function basePayload(input: {
 	reason: string | null;
 	sessionId: string;
 }): Record<string, unknown> {
+	const identity = normalizedIdentity(input.context);
+	if (identity.sessionId !== input.sessionId) throw new PreviousRuntimeStateReadError();
 	return {
 		schema_version: 1,
-		session_id: input.sessionId,
+		session_id: identity.sessionId,
 		state: input.state,
 		ready_for_input: input.state === "completed" || input.state === "ready_for_input",
 		updated_at: input.now,
@@ -281,10 +451,11 @@ function basePayload(input: {
 		reason: input.reason,
 		source: input.source,
 		event: input.event,
-		cwd: input.context.cwd,
-		workdir: input.context.cwd,
+		cwd: identity.cwd,
+		workdir: identity.workdir,
 		branch: branchForContext(input.context),
-		session_file: input.context.sessionFile ?? null,
+		session_file: identity.sessionFile,
+		...(input.context.ownerTerminal ? { owner_generation: input.context.ownerTerminal.generation } : {}),
 	};
 }
 function booleanFromUnknown(value: unknown): boolean | null {
@@ -372,10 +543,10 @@ function postmortemExitDetails(
 	const observedChanges = observedRecoverableWorktreeChanges(typeof previous.cwd === "string" ? previous.cwd : cwd);
 	const worktreeBaselineDirty = worktreeBaselineDirtyFromEnvOrMarker();
 	const worktreeChangedSinceBaseline = worktreeBaselineDirty === false && observedChanges;
+	const previousStateIsTerminal = previous.state === "completed" || previous.state === "errored";
 	if (reason === postmortem.Reason.EXIT || reason === postmortem.Reason.MANUAL) {
 		const exitCode = numericProcessExitCode(0) ?? 0;
-		const exitedBeforeTerminalState =
-			exitCode === 0 && reason === postmortem.Reason.EXIT && previous.state === "running";
+		const exitedBeforeTerminalState = exitCode === 0 && reason === postmortem.Reason.EXIT && !previousStateIsTerminal;
 		const state: RuntimeState = exitCode === 0 && !exitedBeforeTerminalState ? "completed" : "errored";
 		const exitReason = exitedBeforeTerminalState
 			? "process_exit_before_terminal_state"
@@ -442,10 +613,129 @@ function postmortemExitDetails(
 	};
 }
 
-function writeStateFileSync(stateFile: string, payload: Record<string, unknown>): void {
-	fsSync.mkdirSync(path.dirname(stateFile), { recursive: true });
-	fsSync.writeFileSync(stateFile, `${JSON.stringify(payload)}\n`);
-	rememberWrittenPayload(stateFile, payload);
+async function writeStateFileSync(stateFile: string, payload: Record<string, unknown>): Promise<void> {
+	await writeStateFile(stateFile, payload);
+}
+
+interface StateFileLockOwner {
+	pid: number;
+	start_time: string;
+	token: string;
+}
+
+function processStartTime(pid: number): string | null {
+	try {
+		const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		const fields = stat
+			.slice(close + 1)
+			.trim()
+			.split(/\s+/);
+		return fields[19] ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function validLockOwner(value: unknown): value is StateFileLockOwner {
+	if (!value || typeof value !== "object") return false;
+	const owner = value as Partial<StateFileLockOwner>;
+	return (
+		typeof owner.pid === "number" &&
+		Number.isSafeInteger(owner.pid) &&
+		owner.pid > 0 &&
+		typeof owner.start_time === "string" &&
+		typeof owner.token === "string" &&
+		owner.token.length > 0
+	);
+}
+
+function lockOwnerIsAlive(value: unknown): boolean {
+	if (!validLockOwner(value)) return false;
+	const owner = value;
+	try {
+		process.kill(owner.pid, 0);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		return true;
+	}
+	const currentStartTime = processStartTime(owner.pid);
+	return currentStartTime === null || currentStartTime === owner.start_time;
+}
+
+async function reclaimStaleStateFileLock(lockFile: string): Promise<void> {
+	let raw: string;
+	try {
+		raw = await fs.readFile(lockFile, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	let owner: unknown;
+	try {
+		owner = JSON.parse(raw);
+	} catch {
+		owner = null;
+	}
+	if (!validLockOwner(owner)) {
+		const stat = await fs.stat(lockFile);
+		if (Date.now() - stat.mtimeMs < 30_000) return;
+	} else if (lockOwnerIsAlive(owner)) return;
+	try {
+		if ((await fs.readFile(lockFile, "utf8")) === raw) await fs.rm(lockFile);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
+async function withStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
+	const lockFile = `${stateFile}.lock`;
+	const owner: StateFileLockOwner = {
+		pid: process.pid,
+		start_time: processStartTime(process.pid) ?? "unknown",
+		token: randomUUID(),
+	};
+	await fs.mkdir(path.dirname(stateFile), { recursive: true });
+	for (let attempt = 0; attempt < 12_000; attempt++) {
+		let handle: fs.FileHandle | undefined;
+		try {
+			handle = await fs.open(lockFile, "wx");
+			try {
+				await handle.writeFile(JSON.stringify(owner));
+			} catch (error) {
+				await handle.close().catch(() => undefined);
+				handle = undefined;
+				await fs.rm(lockFile, { force: true }).catch(() => undefined);
+				throw error;
+			}
+			const outcome = await operation().then(
+				value => ({ ok: true as const, value }),
+				error => ({ ok: false as const, error }),
+			);
+			await handle.close();
+			try {
+				if ((await fs.readFile(lockFile, "utf8")) === JSON.stringify(owner)) await fs.rm(lockFile);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			if (!outcome.ok) throw outcome.error;
+			return outcome.value;
+		} catch (error) {
+			if (handle) throw error;
+			if ((error as { code?: unknown }).code !== "EEXIST") throw error;
+			await reclaimStaleStateFileLock(lockFile);
+			await Bun.sleep(5);
+		}
+	}
+	throw new PreviousRuntimeStateReadError();
+}
+
+function coordinatorTransactionLockFile(stateFile: string): string {
+	return path.resolve(path.dirname(stateFile), "..", "locks", "mutation.lock");
+}
+
+async function withCoordinatorTransactionLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
+	return await withStateFileLock(coordinatorTransactionLockFile(stateFile), operation);
 }
 
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
@@ -454,110 +744,334 @@ async function writeStateFile(stateFile: string, payload: Record<string, unknown
 	rememberWrittenPayload(stateFile, payload);
 }
 
+function contextWithManagedOwnerGeneration(context: RuntimeStateContext): RuntimeStateContext {
+	if (context.ownerTerminal) return context;
+	const ownerTerminal = ownerTerminalContextFromEnvironment();
+	if (ownerTerminal === "invalid") throw new PreviousRuntimeStateReadError();
+	return ownerTerminal ? { ...context, ownerTerminal } : context;
+}
+
 export async function persistCoordinatorRuntimeStateFromEvent(
 	event: RuntimeStateEvent,
 	context: RuntimeStateContext,
 ): Promise<void> {
 	__sessionStateSidecarPerfCounters.persistFromEventCalls += 1;
 	const stateFile = runtimeStateFileForContext(context);
-	if (!stateFile) return;
 	const state = stateForEvent(event);
-	if (!state) return;
-	const nowMs = Date.now();
-	const now = new Date(nowMs).toISOString();
-	const previous = await readPreviousPayloadForEvent(stateFile);
-	const finalResponse = finalResponseForEvent(event);
-	const sessionId = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim()
-		? process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId
-		: context.sessionId;
-	const payload = {
-		...basePayload({
-			context,
-			previous,
-			state,
-			now,
-			source: "agent_session_event",
-			event: event.type,
-			reason: null,
-			sessionId,
-		}),
-		...(state === "completed" || state === "errored" ? { ended_at: now } : {}),
-		...(finalResponse ? { final_response: finalResponse } : {}),
-		...(state === "errored"
-			? {
-					error: {
-						code: "agent_error",
-						message: publicSafeErrorMessage(lastAssistant(event.messages)?.errorMessage ?? "agent_error"),
-						recoverable: true,
-					},
-				}
-			: {}),
-	};
-	if (state === "completed" || state === "errored") rememberWrittenPayload(stateFile, payload);
-	try {
-		if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
-		await writeStateFile(stateFile, payload);
-	} catch (error) {
-		logger.warn("Failed to persist coordinator runtime state", { error: String(error), stateFile });
-	}
+	if (!stateFile || !state) return;
+	context = contextWithManagedOwnerGeneration(context);
+	const identity = normalizedIdentity(context);
+	await serializeStateFileWrite(
+		stateFile,
+		async () =>
+			await withCoordinatorTransactionLock(
+				stateFile,
+				async () =>
+					await withStateFileLock(stateFile, async () => {
+						const nowMs = Date.now();
+						const now = new Date(nowMs).toISOString();
+						const previous = await readPreviousPayloadForEvent(stateFile);
+						assertPreviousRuntimeStateIdentity(previous, identity);
+						const payload = {
+							...basePayload({
+								context,
+								previous,
+								state,
+								now,
+								source: "agent_session_event",
+								event: event.type,
+								reason: null,
+								sessionId: identity.sessionId,
+							}),
+							...(state === "completed" || state === "errored" ? { ended_at: now } : {}),
+							...(finalResponseForEvent(event) ? { final_response: finalResponseForEvent(event) } : {}),
+							...(state === "errored"
+								? { error: { code: "agent_error", message: "GJC agent reported an error", recoverable: true } }
+								: {}),
+						};
+						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
+						await writeStateFile(stateFile, payload);
+					}),
+			),
+	);
 }
 
-export function persistCoordinatorRuntimeStateFromPostmortem(
+function ownerTerminalSignal(reason: postmortem.Reason): TerminalSignal {
+	if (reason === postmortem.Reason.SIGTERM) return "SIGTERM";
+	if (reason === postmortem.Reason.SIGINT) return "SIGINT";
+	if (reason === postmortem.Reason.SIGHUP) return "SIGHUP";
+	if (reason === postmortem.Reason.EXIT) return "EXIT";
+	if (reason === postmortem.Reason.MANUAL) return "MANUAL";
+	return "UNKNOWN";
+}
+
+function ownerTerminalPayload(verdict: OwnerVerdict, _owner: OwnerTerminalContext): Record<string, unknown> {
+	return {
+		generation: verdict.generation,
+		socket_key: verdict.server_key,
+		signal: verdict.signal,
+		result: verdict.result,
+		classification: verdict.classification,
+		observer: verdict.observer,
+		observed_at: verdict.observed_at,
+		...(verdict.intent_id ? { intent_id: verdict.intent_id } : {}),
+		dedupe_key: verdict.dedupe_key,
+	};
+}
+
+export function ownerTerminalContextFromEnvironment(): OwnerTerminalContext | "invalid" | null {
+	const generation = process.env[GJC_TMUX_OWNER_GENERATION_ENV];
+	const stateDir = process.env[GJC_TMUX_OWNER_STATE_DIR_ENV];
+	const socketKey = process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV];
+	const supplied = [generation, stateDir, socketKey].some(value => value !== undefined);
+	const managedLaunch = process.platform === "linux" && process.env.GJC_TMUX_LAUNCHED === "1";
+	if (!supplied) return managedLaunch ? "invalid" : null;
+	const normalizedGeneration = generation?.trim();
+	const normalizedStateDir = stateDir?.trim();
+	const normalizedSocketKey = socketKey?.trim();
+	if (
+		!normalizedGeneration ||
+		!normalizedStateDir ||
+		!normalizedSocketKey ||
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(normalizedGeneration) ||
+		!path.isAbsolute(normalizedStateDir) ||
+		/[\u0000-\u001f\u007f]/.test(normalizedSocketKey)
+	) {
+		return "invalid";
+	}
+	return { generation: normalizedGeneration, stateDir: normalizedStateDir, socketKey: normalizedSocketKey };
+}
+
+async function persistInvalidOwnerTerminalMetadata(
 	reason: postmortem.Reason,
 	context: RuntimeStateContext,
-): void {
-	const stateFile = runtimeStateFileForContext(context);
-	if (!stateFile) return;
-	const sessionId = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim()
-		? process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId
-		: context.sessionId;
-	const preserveInput = { sessionId, cwd: context.cwd, sessionFile: context.sessionFile };
-	const cachedTerminal = cachedTerminalPayload(stateFile, preserveInput);
-	const previous: Record<string, unknown> = cachedTerminal
-		? (cachedTerminal as unknown as Record<string, unknown>)
-		: readPreviousPayload(stateFile);
-	if (cachedTerminal || shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, preserveInput)) return;
-	const previousForDetails: RuntimeStateSidecarPayload =
-		(previous as RuntimeStateSidecarPayload).state === "completed" ||
-		(previous as RuntimeStateSidecarPayload).state === "errored"
-			? { ...(previous as RuntimeStateSidecarPayload), state: "running" }
-			: (previous as RuntimeStateSidecarPayload);
+	stateFile: string,
+	sessionId: string,
+	previous: Record<string, unknown>,
+): Promise<void> {
 	const now = new Date().toISOString();
-	const details = postmortemExitDetails(reason, previousForDetails, context.cwd);
-	const payload = {
+	await writeStateFileSync(stateFile, {
 		...basePayload({
 			context,
 			previous,
-			state: details.state,
+			state: "errored",
 			now,
 			source: "process_postmortem",
-			event: "process_exit",
-			reason: details.reason,
+			event: "owner_terminal",
+			reason: "owner_metadata_invalid",
 			sessionId,
 		}),
 		ended_at: now,
 		detected_at: now,
-		exit_kind: details.exitKind,
-		exit_code: details.exitCode,
-		signal: details.signal,
-		...(details.error ? { error: details.error } : {}),
-		...(details.recovery ? { recovery: details.recovery } : {}),
+		signal: ownerTerminalSignal(reason),
+		error: {
+			code: "owner_metadata_invalid",
+			message: "GJC managed tmux owner metadata was unavailable or invalid",
+			recoverable: true,
+		},
+		recovery: {
+			action: "recover_or_resume_session",
+			reason: "managed tmux owner provenance could not be validated",
+		},
 		previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
-		prompt_accepted: details.promptAccepted,
-		observed_recoverable_worktree_changes: details.observedRecoverableWorktreeChanges,
-		worktree_baseline_dirty: details.worktreeBaselineDirty,
-		worktree_changed_since_baseline: details.worktreeChangedSinceBaseline,
-	};
+	});
+}
+
+async function operatorDispatchIdForOwner(
+	owner: OwnerTerminalContext,
+	request: Omit<ObserveTerminalRequest, "operator_dispatch_id">,
+): Promise<string | undefined> {
 	try {
-		writeStateFileSync(stateFile, payload);
-	} catch (error) {
-		logger.warn("Failed to persist coordinator runtime state during postmortem", { error: String(error), stateFile });
+		const intent = JSON.parse(
+			await Bun.file(lifecyclePaths(owner.stateDir, request.session_id, owner.generation).intentFile).text(),
+		) as unknown;
+		if (!isValidOwnerIntent(intent)) return undefined;
+		const dispatchId = owner.operatorDispatchId ?? intent.dispatch_id;
+		return isValidOwnerIntent(intent as OwnerIntent, { ...request, operator_dispatch_id: dispatchId })
+			? dispatchId
+			: undefined;
+	} catch {
+		return undefined;
 	}
+}
+
+async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
+	reason: postmortem.Reason,
+	context: RuntimeStateContext,
+	stateFile: string,
+	sessionId: string,
+	previous: Record<string, unknown>,
+): Promise<void> {
+	const owner = context.ownerTerminal;
+	if (!owner) return;
+	try {
+		const now = new Date().toISOString();
+		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id"> = {
+			schema_version: 1,
+			op: "observe_terminal",
+			session_id: sessionId,
+			owner_generation: owner.generation,
+			state_dir: owner.stateDir,
+			socket_key: owner.socketKey,
+			observer: "sidecar",
+			observed_at: now,
+			signal: ownerTerminalSignal(reason),
+			exit_code: numericProcessExitCode(null),
+			exit_kind: String(reason),
+			reason: "process_postmortem",
+		};
+		const operatorDispatchId = await operatorDispatchIdForOwner(owner, observation);
+		const verdict = await observeOwnerTerminal({
+			...observation,
+			...(operatorDispatchId ? { operator_dispatch_id: operatorDispatchId } : {}),
+		});
+		const expected = verdict.classification === "expected_operator_shutdown";
+		const state: RuntimeState = expected ? "completed" : "errored";
+		const payload = {
+			...basePayload({
+				context,
+				previous,
+				state,
+				now,
+				source: "process_postmortem",
+				event: "owner_terminal",
+				reason: verdict.classification,
+				sessionId,
+			}),
+			ended_at: now,
+			detected_at: now,
+			owner_terminal: ownerTerminalPayload(verdict, owner),
+			...(expected
+				? {}
+				: {
+						error: {
+							code: verdict.classification,
+							message: "GJC owner terminal verdict requires session recovery",
+							recoverable: true,
+						},
+						recovery: {
+							action: "recover_or_resume_session",
+							reason: "owner terminal verdict was not an expected operator shutdown",
+						},
+					}),
+			previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
+		};
+		await writeStateFileSync(stateFile, payload);
+	} catch {
+		const now = new Date().toISOString();
+		await writeStateFileSync(stateFile, {
+			...basePayload({
+				context,
+				previous,
+				state: "errored",
+				now,
+				source: "process_postmortem",
+				event: "owner_terminal",
+				reason: "owner_verdict_unavailable",
+				sessionId,
+			}),
+			ended_at: now,
+			detected_at: now,
+			error: {
+				code: "owner_verdict_unavailable",
+				message: "GJC owner terminal verdict was unavailable",
+				recoverable: true,
+			},
+			recovery: {
+				action: "recover_or_resume_session",
+				reason: "owner terminal could not be authoritatively classified",
+			},
+			previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
+		});
+	}
+}
+
+export async function persistCoordinatorRuntimeStateFromPostmortem(
+	reason: postmortem.Reason,
+	context: RuntimeStateContext,
+): Promise<void> {
+	const stateFile = runtimeStateFileForContext(context);
+	if (!stateFile) return;
+	const identity = normalizedIdentity(context);
+	await serializeStateFileWrite(
+		stateFile,
+		async () =>
+			await withCoordinatorTransactionLock(
+				stateFile,
+				async () =>
+					await withStateFileLock(stateFile, async () => {
+						const previous = readPreviousPayload(stateFile);
+						assertPreviousRuntimeStateIdentity(previous, identity);
+						if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, identity)) return;
+						// The immutable owner verdict remains in its lifecycle artifact; never replace a
+						// complete agent terminal payload merely to mirror that verdict here.
+						if (process.platform === "linux" && context.ownerTerminalMetadataInvalid) {
+							await persistInvalidOwnerTerminalMetadata(
+								reason,
+								context,
+								stateFile,
+								identity.sessionId,
+								previous,
+							);
+							return;
+						}
+						if (process.platform === "linux" && context.ownerTerminal) {
+							await persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
+								reason,
+								context,
+								stateFile,
+								identity.sessionId,
+								previous,
+							);
+							return;
+						}
+						const previousForDetails: RuntimeStateSidecarPayload =
+							(previous as RuntimeStateSidecarPayload).state === "completed" ||
+							(previous as RuntimeStateSidecarPayload).state === "errored"
+								? { ...(previous as RuntimeStateSidecarPayload), state: "running" }
+								: (previous as RuntimeStateSidecarPayload);
+						const now = new Date().toISOString();
+						const details = postmortemExitDetails(reason, previousForDetails, identity.cwd);
+						const payload = {
+							...basePayload({
+								context,
+								previous,
+								state: details.state,
+								now,
+								source: "process_postmortem",
+								event: "process_exit",
+								reason: details.reason,
+								sessionId: identity.sessionId,
+							}),
+							ended_at: now,
+							detected_at: now,
+							exit_kind: details.exitKind,
+							exit_code: details.exitCode,
+							signal: details.signal,
+							...(details.error ? { error: details.error } : {}),
+							...(details.recovery ? { recovery: details.recovery } : {}),
+							previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
+							prompt_accepted: details.promptAccepted,
+							observed_recoverable_worktree_changes: details.observedRecoverableWorktreeChanges,
+							worktree_baseline_dirty: details.worktreeBaselineDirty,
+							worktree_changed_since_baseline: details.worktreeChangedSinceBaseline,
+						};
+						await writeStateFileSync(stateFile, payload);
+					}),
+			),
+	);
 }
 
 export function registerCoordinatorRuntimeStateFinalizer(context: RuntimeStateContext): () => void {
 	if (!runtimeStateFileForContext(context)) return () => {};
-	return postmortem.register("coordinator-runtime-state", reason => {
-		persistCoordinatorRuntimeStateFromPostmortem(reason, context);
+	const ownerTerminal = ownerTerminalContextFromEnvironment();
+	const finalizerContext: RuntimeStateContext =
+		ownerTerminal === "invalid"
+			? { ...context, ownerTerminalMetadataInvalid: true }
+			: ownerTerminal
+				? { ...context, ownerTerminal }
+				: context;
+	return postmortem.register("coordinator-runtime-state", async reason => {
+		await persistCoordinatorRuntimeStateFromPostmortem(reason, finalizerContext);
 	});
 }

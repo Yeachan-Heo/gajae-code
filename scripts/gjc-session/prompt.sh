@@ -1,356 +1,153 @@
 #!/usr/bin/env bash
-# Send a prompt to an existing interactive GJC tmux session.
+# Submit a prompt to an existing isolated GJC tmux owner without reading pane data.
 # Usage: prompt.sh <session-name> "<prompt-text>" OR prompt.sh <session-name> @/path/to/prompt.md
-
 set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=postmortem.sh
 source "$SCRIPT_DIR/postmortem.sh"
+
 SESSION="${1:?Usage: $0 <session-name> <text|@file>}"
 TEXT_ARG="${2:?Usage: $0 <session-name> <text|@file>}"
 TMUX_BIN="${GJC_SESSION_TMUX_BIN:-tmux}"
-TMUX_CMD=("$TMUX_BIN")
-TURN_EVIDENCE_PATTERN="${GJC_SESSION_TURN_EVIDENCE_PATTERN:-Working|Tool|Running|Executing|function call|tool call}"
-PROMPT_EVIDENCE_ATTEMPTS="${GJC_SESSION_PROMPT_EVIDENCE_ATTEMPTS:-10}"
-case "$PROMPT_EVIDENCE_ATTEMPTS" in
-  ''|*[!0-9]*) PROMPT_EVIDENCE_ATTEMPTS=10 ;;
-esac
-if [[ "$PROMPT_EVIDENCE_ATTEMPTS" -lt 1 ]]; then
-  PROMPT_EVIDENCE_ATTEMPTS=1
+STATE_DIR="${GJC_SESSION_STATE_DIR:-}"
+if [[ -z "$STATE_DIR" && -n "${GJC_SESSION_WORKDIR:-}" ]]; then
+  STATE_DIR="$GJC_SESSION_WORKDIR/.gjc-session-state/$SESSION"
 fi
-
-find_durable_pane_logs() {
-  if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -z "${GJC_SESSION_LOG_SEARCH_ROOT:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
-    printf '%s\n' "$GJC_SESSION_STATE_DIR/pane.log"
-  else
-    find "${GJC_SESSION_LOG_SEARCH_ROOT:-$HOME/Workspace}" \( -path "*/.gjc-session-state/$SESSION/pane.log" -o -path "*/$SESSION/pane.log" \) -type f 2>/dev/null | sort
-  fi
-}
-first_durable_pane_log() {
-  local candidate
-  while IFS= read -r candidate; do
-    printf '%s\n' "$candidate"
-    return 0
-  done < <(find_durable_pane_logs)
-  return 1
-}
-
-
-prompt_accepted_path() {
-  if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -z "${GJC_SESSION_LOG_SEARCH_ROOT:-}" ]]; then
-    printf '%s\n' "$GJC_SESSION_STATE_DIR/prompt-accepted.json"
-    return 0
-  fi
-  local candidate
-  candidate="$(first_durable_pane_log || true)"
-  if [[ -n "$candidate" ]]; then
-    printf '%s\n' "$(dirname "$candidate")/prompt-accepted.json"
-  fi
-}
-
-record_prompt_accepted() {
-  local accepted_path
-  accepted_path="$(prompt_accepted_path)"
-  if [[ -z "$accepted_path" ]]; then
-    return 0
-  fi
-  local accepted_at
-  accepted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  mkdir -p "$(dirname "$accepted_path")"
-  local accepted_dir
-  accepted_dir="$(dirname "$accepted_path")"
-  local worktree_baseline_dirty="${GJC_SESSION_PROMPT_WORKTREE_BASELINE_DIRTY:-null}"
-  if [[ "$worktree_baseline_dirty" != "true" && "$worktree_baseline_dirty" != "false" ]]; then
-    local workdir=""
-    if [[ -f "$accepted_dir/metadata.json" ]]; then
-      workdir="$(python3 - "$accepted_dir/metadata.json" <<'PYMETA'
-import json
-import sys
+if [[ -z "$STATE_DIR" || ! -s "$STATE_DIR/started.json" ]]; then
+  echo "refusing to submit prompt: session $SESSION has no public started marker" >&2
+  exit 1
+fi
+TMUX_SOCKET_OVERRIDE="${GJC_SESSION_TMUX_SOCKET:-}"
+TMUX_SOCKET="$(python3 - "$STATE_DIR/metadata.json" <<'PY'
+import json, sys
 try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        print(json.load(handle).get("workdir") or "")
-except Exception:
-    print("")
-PYMETA
-)"
-    fi
-    if [[ -n "$workdir" ]]; then
-      worktree_baseline_dirty="$(gjc_session_git_dirty_boolean "$workdir")"
-    fi
-  fi
-  python3 - "$accepted_path" "$SESSION" "$accepted_at" "$accepted_dir/pane.log" "$worktree_baseline_dirty" <<'PY'
-import json
-import sys
-
-path, session, accepted_at, pane_log, worktree_baseline_dirty = sys.argv[1:]
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(
-        {
-            "session": session,
-            "acceptedAt": accepted_at,
-            "evidence": "durable_turn_evidence",
-            "paneLog": pane_log,
-            "worktreeBaselineDirty": None if worktree_baseline_dirty == "null" else worktree_baseline_dirty == "true",
-        },
-        handle,
-        indent=2,
-    )
-    handle.write("\n")
+    with open(sys.argv[1], encoding="utf-8") as handle: value = json.load(handle).get("socket_key")
+    if not isinstance(value, str) or not value: raise ValueError()
+    print(value)
+except Exception: raise SystemExit(1)
 PY
-}
+)" || { echo "refusing to submit prompt: metadata has no private tmux socket" >&2; exit 1; }
+if [[ -n "$TMUX_SOCKET_OVERRIDE" && "$TMUX_SOCKET_OVERRIDE" != "$TMUX_SOCKET" ]]; then
+  echo "refusing to submit prompt: socket override does not match metadata" >&2
+  exit 1
+fi
+TMUX_CMD=("$TMUX_BIN" -L "$TMUX_SOCKET")
 
-file_size_bytes() {
-  local file_path="${1:-}"
-  python3 - "$file_path" <<'PY'
-import os
-import sys
-
-try:
-    print(os.path.getsize(sys.argv[1]))
-except OSError:
-    print(0)
-PY
-}
-
-wait_for_evidence_log_quiet() {
-  local previous_size="-1"
-  local current_size="0"
-  for _ in $(seq 1 20); do
-    current_size="$(file_size_bytes "$EVIDENCE_LOG")"
-    if [[ "$current_size" == "$previous_size" ]]; then
-      printf '%s\n' "$current_size"
-      return 0
-    fi
-    previous_size="$current_size"
-    sleep 0.1
-  done
-  printf '%s\n' "$(file_size_bytes "$EVIDENCE_LOG")"
-}
-
-has_turn_evidence() {
-  local log_path="${1:-}"
-  local log_offset="${2:-0}"
-  local prompt_text="${3:-}"
-  if [[ -n "$log_path" && -f "$log_path" ]]; then
-    python3 - "$log_path" "$log_offset" "$TURN_EVIDENCE_PATTERN" "$prompt_text" <<'PY'
-import re
-import sys
-
-log_path, offset_raw, pattern, prompt_text = sys.argv[1:]
-try:
-    offset = int(offset_raw)
-except ValueError:
-    offset = 0
-try:
-    with open(log_path, "rb") as handle:
-        handle.seek(max(offset, 0))
-        data = handle.read()
-except OSError:
-    sys.exit(1)
-
-text = data.decode("utf-8", errors="replace")
-if prompt_text:
-    text = text.replace(prompt_text, "")
-if re.search(pattern, text, re.IGNORECASE):
-    sys.exit(0)
-sys.exit(1)
-PY
-    return $?
-  fi
-  return 1
-}
-
-
-show_missing_session_diagnostics() {
-  local log_path="$1"
-  local state_dir
-  state_dir="$(dirname "$log_path")"
-  if [[ -f "$state_dir/metadata.json" ]]; then
-    echo "durable metadata: $state_dir/metadata.json" >&2
-  fi
-  echo "refusing to paste prompt: tmux session $SESSION is not readable; durable pane log exists at $log_path" >&2
-  if [[ -f "$state_dir/final.json" ]]; then
-    echo "durable final status: $state_dir/final.json" >&2
-  fi
-  if [[ -f "$state_dir/events.log" ]]; then
-    echo "durable events: $state_dir/events.log" >&2
-  fi
-  echo "durable pane log tail omitted from diagnostics to preserve public-safe boundaries" >&2
-}
-
-
-state_dir_from_log() {
-  local log_path="${1:-}"
-  [[ -n "$log_path" ]] && dirname "$log_path"
-}
-
-write_pre_prompt_vanished() {
-  local reason="${1:?reason required}"
-  local phase="${2:?phase required}"
-  local tui_ready="${3:-false}"
-  local log_path="${4:-}"
-  local state_dir=""
-  state_dir="$(state_dir_from_log "$log_path")"
-  if [[ -z "$state_dir" && -n "${GJC_SESSION_STATE_DIR:-}" ]]; then
-    state_dir="$GJC_SESSION_STATE_DIR"
-    log_path="$state_dir/pane.log"
-  fi
-  [[ -n "$state_dir" ]] || return 0
-  mkdir -p "$state_dir"
-  local workdir=""
-  if [[ -f "$state_dir/metadata.json" ]]; then
-    workdir="$(python3 - "$state_dir/metadata.json" <<'PYMETA'
-import json
-import sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        print(json.load(handle).get("workdir") or "")
-except Exception:
-    print("")
-PYMETA
-)"
-  fi
-  if [[ -z "$workdir" ]]; then
-    workdir="$state_dir"
-  fi
-  printf '[%s] prompt preflight vanished phase=%s reason=%s tui_ready=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$phase" "$reason" "$tui_ready" >>"$state_dir/events.log"
-  gjc_session_write_vanished_json \
-    "$state_dir/vanished.json" \
-    "$SESSION" \
-    "$workdir" \
-    "$reason" \
-    "$phase" \
-    failure \
-    false \
-    false \
-    "$tui_ready" \
-    "$log_path" \
-    "$state_dir/events.log" \
-    "$state_dir/final.json" \
-    "$state_dir/runtime-state.json" \
-    "$state_dir/prompt-accepted.json"
-}
 
 if [[ "$TEXT_ARG" == @* ]]; then
   FILE="${TEXT_ARG#@}"
   [[ -f "$FILE" ]] || { echo "prompt file not found: $FILE" >&2; exit 1; }
-  TEXT="$(cat "$FILE")"
+  TEXT="$(<"$FILE")"
 else
   TEXT="$TEXT_ARG"
 fi
 
-PANE_TEXT="$(${TMUX_CMD[@]} capture-pane -t "$SESSION":0.0 -p -S -80 2>/dev/null || true)"
-if [[ -z "$PANE_TEXT" ]]; then
-  candidate="$(first_durable_pane_log || true)"
-  if [[ -n "$candidate" ]]; then
-    write_pre_prompt_vanished "tmux_session_missing_before_prompt_injection" "before_prompt_injection" false "$candidate"
-    show_missing_session_diagnostics "$candidate"
-  else
-    write_pre_prompt_vanished "tmux_session_missing_before_prompt_injection" "before_prompt_injection" false ""
-    echo "refusing to paste prompt: tmux session $SESSION is not readable and no durable pane log was found" >&2
-  fi
-  exit 1
-fi
-if ! printf '%s\n' "$PANE_TEXT" | grep -qE 'Gajae forge|Type your message|> Type your message|Working'; then
-  candidate="$(first_durable_pane_log || true)"
-  if [[ -n "$candidate" ]]; then
-    write_pre_prompt_vanished "tmux_session_unready_before_prompt_injection" "before_prompt_injection" false "$candidate"
-  else
-    write_pre_prompt_vanished "tmux_session_unready_before_prompt_injection" "before_prompt_injection" false ""
-  fi
-  echo "refusing to paste prompt: GJC TUI is not ready in session $SESSION" >&2
-  echo "pane tail omitted from diagnostics to preserve public-safe boundaries" >&2
+
+STARTED_JSON="$STATE_DIR/started.json"
+ACCEPTED_JSON="$STATE_DIR/prompt-accepted.json"
+METADATA_JSON="$STATE_DIR/metadata.json"
+GENERATION_JSON="$STATE_DIR/$SESSION/owner-lifecycle/generation.json"
+exec 9>"${GENERATION_JSON%.json}.transition.lock"
+flock -x 9
+GJC_SESSION_TRANSITION_LOCK_HELD=1
+if [[ ! -s "$STARTED_JSON" ]]; then
+  echo "refusing to submit prompt: session $SESSION has no public started marker" >&2
   exit 1
 fi
 
-# Establish freshness before submission. Prompt acceptance must come from bytes
-# captured after the local paste echo has drained, but before Enter submits the
-# turn. Prefer the durable pane log when session state provides one so this
-# script does not replace an existing tmux pipe-pane logger.
-EVIDENCE_LOG=""
-EVIDENCE_LOG_IS_TEMP=0
-if [[ -n "${GJC_SESSION_STATE_DIR:-}" && -z "${GJC_SESSION_LOG_SEARCH_ROOT:-}" && -f "$GJC_SESSION_STATE_DIR/pane.log" ]]; then
-  EVIDENCE_LOG="$GJC_SESSION_STATE_DIR/pane.log"
-else
-  durable_log_candidate="$(first_durable_pane_log || true)"
-  if [[ -n "$durable_log_candidate" ]]; then
-    EVIDENCE_LOG="$durable_log_candidate"
-  else
-    EVIDENCE_LOG="$(mktemp "${TMPDIR:-/tmp}/gjc-session-prompt-evidence.XXXXXX")"
-    EVIDENCE_LOG_IS_TEMP=1
-  fi
+if ! OWNER_GENERATION="$(python3 - "$STARTED_JSON" "$METADATA_JSON" "$GENERATION_JSON" "$SESSION" "$TMUX_SOCKET" <<'PY'
+import json
+import sys
+started_path, metadata_path, generation_path, session, socket = sys.argv[1:]
+try:
+    with open(started_path, encoding="utf-8") as handle: started = json.load(handle)
+    with open(metadata_path, encoding="utf-8") as handle: metadata = json.load(handle)
+    with open(generation_path, encoding="utf-8") as handle: current = json.load(handle)
+    generation = started.get("owner_generation")
+    valid = (isinstance(generation, str) and generation and started.get("schema_version") == 1 and started.get("kind") == "started" and started.get("session_id") == session and metadata.get("schema_version") == 1 and metadata.get("session_id") == session and metadata.get("owner_generation") == generation and metadata.get("socket_key") == socket and current.get("schema_version") == 1 and current.get("session_id") == session and current.get("generation") == generation)
+    if not valid: raise ValueError()
+    print(generation)
+except Exception: raise SystemExit(1)
+PY
+)"; then
+  echo "refusing to submit prompt: session $SESSION has invalid current generation metadata" >&2
+  exit 1
 fi
-EVIDENCE_LOG_OFFSET=0
-cleanup_evidence_log() {
-  if [[ "$EVIDENCE_LOG_IS_TEMP" == "1" ]]; then
-    "${TMUX_CMD[@]}" pipe-pane -t "$SESSION":0.0 2>/dev/null || true
-    rm -f "$EVIDENCE_LOG"
-  fi
-}
-trap cleanup_evidence_log EXIT
-if [[ "$EVIDENCE_LOG_IS_TEMP" == "1" ]]; then
-  "${TMUX_CMD[@]}" pipe-pane -t "$SESSION":0.0 "cat >> '$EVIDENCE_LOG'"
+
+
+if ! "${TMUX_CMD[@]}" has-session -t "=$SESSION" >/dev/null 2>&1; then
+  echo "refusing to submit prompt: tmux session $SESSION is not available" >&2
+  exit 1
 fi
-GJC_SESSION_PROMPT_WORKTREE_BASELINE_DIRTY="null"
-prompt_baseline_path="$(prompt_accepted_path)"
-if [[ -n "$prompt_baseline_path" && -f "$(dirname "$prompt_baseline_path")/metadata.json" ]]; then
-  prompt_baseline_workdir="$(python3 - "$(dirname "$prompt_baseline_path")/metadata.json" <<'PYMETA'
+for option_value in "@gjc-owner-generation=$OWNER_GENERATION" "@gjc-owner-server-key=$TMUX_SOCKET"; do
+  option="${option_value%%=*}"; expected="${option_value#*=}"
+  actual="$("${TMUX_CMD[@]}" show-options -t "=$SESSION:" -v "$option" 2>/dev/null || true)"
+  [[ "$actual" == "$expected" ]] || { echo "refusing to submit prompt: isolated owner proof failed" >&2; exit 1; }
+done
+
+
+worktree_baseline_dirty="${GJC_SESSION_PROMPT_WORKTREE_BASELINE_DIRTY:-null}"
+if [[ "$worktree_baseline_dirty" != true && "$worktree_baseline_dirty" != false && -f "$STATE_DIR/metadata.json" ]]; then
+  workdir="$(python3 - "$STATE_DIR/metadata.json" <<'PY'
 import json
 import sys
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
-        print(json.load(handle).get("workdir") or "")
+        value = json.load(handle).get("workdir")
+    print(value if isinstance(value, str) else "")
 except Exception:
     print("")
-PYMETA
+PY
 )"
-  if [[ -n "$prompt_baseline_workdir" ]]; then
-    GJC_SESSION_PROMPT_WORKTREE_BASELINE_DIRTY="$(gjc_session_git_dirty_boolean "$prompt_baseline_workdir")"
-  fi
+  [[ -z "$workdir" ]] || worktree_baseline_dirty="$(gjc_session_git_dirty_boolean "$workdir")"
 fi
 
-"${TMUX_CMD[@]}" send-keys -t "$SESSION" -l "$TEXT"
-sleep 0.5
-EVIDENCE_LOG_OFFSET="$(wait_for_evidence_log_quiet)"
-# Multiple Enters work around terminal focus/submission edge cases. Prompt visibility is not acceptance;
-# verify Working/tool activity afterwards.
-"${TMUX_CMD[@]}" send-keys -t "$SESSION" Enter
-sleep 1
-if has_turn_evidence "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET" "$TEXT"; then
-  record_prompt_accepted
-  echo "sent to $SESSION with durable turn evidence"
-  exit 0
-fi
-"${TMUX_CMD[@]}" send-keys -t "$SESSION" Enter 2>/dev/null || true
-sleep 1
-"${TMUX_CMD[@]}" send-keys -t "$SESSION" Enter 2>/dev/null || true
+# Keep prompt bytes out of tmux argv and lifecycle records. The private buffer is
+# deleted immediately after a single paste; this script never reads it back.
+BUFFER_NAME="gjc-prompt-${OWNER_GENERATION//[^A-Za-z0-9]/}-${BASHPID}"
+BUFFER_CLEANUP_REQUIRED=1
+cleanup_prompt_buffer() {
+  local status=$?
+  [[ "${BUFFER_CLEANUP_REQUIRED:-0}" == 1 ]] || return "$status"
+  if "${TMUX_CMD[@]}" delete-buffer -b "$BUFFER_NAME" >/dev/null 2>&1; then
+    return "$status"
+  fi
+  if "${TMUX_CMD[@]}" has-session -t "=$SESSION" >/dev/null 2>&1; then
+    echo "failed to delete private prompt buffer" >&2
+    return 1
+  fi
+  return "$status"
+}
+trap cleanup_prompt_buffer EXIT
+printf '%s' "$TEXT" | "${TMUX_CMD[@]}" load-buffer -b "$BUFFER_NAME" -
+"${TMUX_CMD[@]}" paste-buffer -d -b "$BUFFER_NAME" -t "=$SESSION":0.0
+BUFFER_CLEANUP_REQUIRED=0
+"${TMUX_CMD[@]}" send-keys -t "=$SESSION":0.0 Enter
 
-for _ in $(seq 1 "$PROMPT_EVIDENCE_ATTEMPTS"); do
-  sleep 1
-  if has_turn_evidence "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET" "$TEXT"; then
-    record_prompt_accepted
-    echo "sent to $SESSION with durable turn evidence"
-    exit 0
-  fi
-  PANE_TEXT="$(${TMUX_CMD[@]} capture-pane -t "$SESSION":0.0 -p -S -120 2>/dev/null || true)"
-  if [[ -z "$PANE_TEXT" ]]; then
-    candidate="$(first_durable_pane_log || true)"
-    if [[ -n "$candidate" ]]; then
-      write_pre_prompt_vanished "tmux_session_missing_before_prompt_acceptance" "before_prompt_acceptance" true "$candidate"
-      show_missing_session_diagnostics "$candidate"
-    else
-      write_pre_prompt_vanished "tmux_session_missing_before_prompt_acceptance" "before_prompt_acceptance" true ""
-      echo "prompt acceptance failed: tmux session $SESSION vanished before durable turn evidence" >&2
-    fi
-    exit 1
-  fi
-  if has_turn_evidence "$EVIDENCE_LOG" "$EVIDENCE_LOG_OFFSET" "$TEXT"; then
-    record_prompt_accepted
-    echo "sent to $SESSION with durable turn evidence"
-    exit 0
-  fi
-done
 
-echo "prompt acceptance failed: no durable turn evidence appeared in session $SESSION" >&2
-echo "pane tail omitted from diagnostics to preserve public-safe boundaries" >&2
-exit 1
+accepted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+mkdir -p "$STATE_DIR"
+ACCEPTED_CANONICAL="$STATE_DIR/$SESSION/owner-lifecycle/prompt-accepted-$OWNER_GENERATION.json"
+python3 - "$ACCEPTED_CANONICAL" "$GENERATION_JSON" "$SESSION" "$OWNER_GENERATION" "$accepted_at" "$worktree_baseline_dirty" <<'PY'
+import json, os, sys
+path, generation_path, session, generation, accepted_at, baseline = sys.argv[1:]
+with open(generation_path, encoding="utf-8") as handle:
+    current = json.load(handle)
+if current.get("schema_version") != 1 or current.get("session_id") != session or current.get("generation") != generation: raise SystemExit(1)
+marker = {"schema_version": 1, "kind": "prompt_accepted", "session_id": session, "owner_generation": generation, "accepted_at": accepted_at, "worktree_baseline_dirty": None if baseline == "null" else baseline == "true"}
+temporary = f"{path}.{os.getpid()}.tmp"
+try:
+    with open(temporary, "x", encoding="utf-8") as handle:
+        json.dump(marker, handle, separators=(",", ":")); handle.write("\n")
+    os.link(temporary, path)
+except FileExistsError:
+    with open(path, encoding="utf-8") as handle:
+        if json.load(handle) != marker: raise
+finally:
+    try: os.unlink(temporary)
+    except FileNotFoundError: pass
+PY
+gjc_session_publish_current_alias "$ACCEPTED_CANONICAL" "$ACCEPTED_JSON" "$GENERATION_JSON" "$SESSION" "$OWNER_GENERATION" prompt_accepted
+
+echo "prompt submitted to $SESSION; public acceptance marker recorded"

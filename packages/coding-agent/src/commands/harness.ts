@@ -9,11 +9,30 @@
  * until the RuntimeOwner (M3+) lands.
  */
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import { resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
+import {
+	GJC_TMUX_OWNER_GENERATION_ENV,
+	GJC_TMUX_OWNER_SERVER_KEY_ENV,
+	GJC_TMUX_OWNER_STATE_DIR_ENV,
+} from "../gjc-runtime/session-state-sidecar";
+import { resolveGjcTmuxBinary, resolveGjcTmuxCommand, sanitizeTmuxToken } from "../gjc-runtime/tmux-common";
+import {
+	captureOwnerGenerationBaselineSync,
+	classifyCgroup,
+	isExactScopedBootstrapSuccessReceipt,
+	isOwnerGenerationBaselineCurrentSync,
+	type OwnerGenerationBaseline,
+	type OwnerIsolationProbe,
+	observeOwnerTerminal,
+	ownerProcessStartTime,
+	planTmuxOwnerIsolation,
+	replaceOwnerGenerationSync,
+	type TmuxServerProof,
+} from "../gjc-runtime/tmux-owner-isolation";
 import { classifyRecovery } from "../harness-control-plane/classifier";
 import { callEndpoint, EndpointUnreachableError } from "../harness-control-plane/control-endpoint";
 import { type ResolvedOwner, RuntimeOwner, resolveOwner, resolveOwnerLive } from "../harness-control-plane/owner";
@@ -48,8 +67,58 @@ import {
 	type SessionState,
 } from "../harness-control-plane/types";
 
+const PRIVATE_OWNER_CONTROL_FIELDS = new Set([
+	"socket_key",
+	"socketKey",
+	"tmux_socket_key",
+	"tmuxSocketKey",
+	"tmux_owner_socket_key",
+	"tmuxOwnerSocketKey",
+	"owner_generation",
+	"ownerGeneration",
+	"state_dir",
+	"stateDir",
+	"owner_state_dir",
+	"ownerStateDir",
+	"owner_server_key",
+	"ownerServerKey",
+	"owner_server_pid",
+	"ownerServerPid",
+	"owner_server_start_time",
+	"ownerServerStartTime",
+	"tmux_owner_generation",
+	"tmuxOwnerGeneration",
+	"tmux_owner_state_dir",
+	"tmuxOwnerStateDir",
+	"tmux_owner_server_key",
+	"tmuxOwnerServerKey",
+	"tmux_owner_server_pid",
+	"tmuxOwnerServerPid",
+	"tmux_owner_server_start_time",
+	"tmuxOwnerServerStartTime",
+	"socket_path",
+	"socketPath",
+	"endpoint",
+	"owner_terminal",
+	"ownerTerminal",
+	"generation",
+	"server_key",
+	"intent_id",
+	"dedupe_key",
+]);
+
+function publicHarnessResponse(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(publicHarnessResponse);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(
+		Object.entries(value as Record<string, unknown>)
+			.filter(([key]) => !PRIVATE_OWNER_CONTROL_FIELDS.has(key))
+			.map(([key, item]) => [key, publicHarnessResponse(item)]),
+	);
+}
+
 function writeJson(value: unknown): void {
-	process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+	process.stdout.write(`${JSON.stringify(publicHarnessResponse(value), null, 2)}\n`);
 }
 
 function nowIso(): string {
@@ -473,12 +542,120 @@ interface OwnerSpawnResult {
 	live: boolean;
 	runtime: "tmux" | "detached" | "manual";
 	tmuxSessionName: string | null;
+	socketKey: string | null;
 	fallbackReason: string | null;
 	blockerReason: string | null;
 }
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function isBoundedNoServerDiagnostic(stderr: Uint8Array): boolean {
+	const diagnostic = new TextDecoder().decode(stderr);
+	return (
+		diagnostic.length > 0 &&
+		diagnostic.length <= 512 &&
+		/^(?:no server running on |failed to connect to server)/i.test(diagnostic.trim())
+	);
+}
+
+function sameServerIdentity(left: TmuxServerProof, right: TmuxServerProof): boolean {
+	return (
+		left.pid === right.pid &&
+		left.startTime === right.startTime &&
+		left.cgroup?.classification === right.cgroup?.classification &&
+		left.cgroup?.scope === right.cgroup?.scope &&
+		left.cgroup?.diagnostic === right.cgroup?.diagnostic
+	);
+}
+
+function isSafeServerProof(proof: TmuxServerProof): boolean {
+	return (
+		proof.state === "safe" &&
+		typeof proof.pid === "number" &&
+		Number.isSafeInteger(proof.pid) &&
+		proof.pid > 0 &&
+		typeof proof.startTime === "string" &&
+		proof.startTime.length > 0 &&
+		(proof.cgroup?.classification === "safe" ||
+			(process.platform !== "linux" && proof.cgroup?.classification === "not_applicable"))
+	);
+}
+
+function exactNativeTmuxSessionId(stdout: Uint8Array): string | null {
+	const value = new TextDecoder().decode(stdout);
+	const line = value.endsWith("\n") ? value.slice(0, -1) : value;
+	return /^\$\d+$/.test(line) ? line : null;
+}
+
+interface ScopedBootstrapReceipt {
+	nativeSessionId: string;
+	serverPid: number;
+	serverStartTime: string;
+	sessionName: string;
+}
+
+function scopedBootstrapReceipt(stdout: Uint8Array): ScopedBootstrapReceipt | null {
+	const value = new TextDecoder().decode(stdout);
+	if (!isExactScopedBootstrapSuccessReceipt(value)) return null;
+	try {
+		const receipt = JSON.parse(value) as {
+			native_session_id: unknown;
+			server_pid: unknown;
+			server_start_time: unknown;
+			session_name: unknown;
+		};
+		if (
+			typeof receipt.native_session_id !== "string" ||
+			!/^\$\d+$/.test(receipt.native_session_id) ||
+			typeof receipt.server_pid !== "number" ||
+			!Number.isSafeInteger(receipt.server_pid) ||
+			receipt.server_pid <= 0 ||
+			typeof receipt.server_start_time !== "string" ||
+			!receipt.server_start_time ||
+			typeof receipt.session_name !== "string" ||
+			!receipt.session_name
+		)
+			return null;
+		return {
+			nativeSessionId: receipt.native_session_id,
+			serverPid: receipt.server_pid,
+			serverStartTime: receipt.server_start_time,
+			sessionName: receipt.session_name,
+		};
+	} catch {
+		return null;
+	}
+}
+
+function portableProcessStartTime(pid: number): string | null {
+	if (process.platform === "linux") return null;
+	const configured = process.env.GJC_HARNESS_PROCESS_START_COMMAND;
+	let command: string[] = ["ps", "-o", "lstart=", "-p"];
+	if (configured) {
+		try {
+			const parsed = JSON.parse(configured) as unknown;
+			if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some(value => typeof value !== "string" || !value))
+				return null;
+			command = parsed;
+		} catch {
+			return null;
+		}
+	}
+	const result = Bun.spawnSync([...command, String(pid)], { stdout: "pipe", stderr: "ignore" });
+	if (result.exitCode !== 0) return null;
+	const value = result.stdout.toString();
+	const line = value.endsWith("\n") ? value.slice(0, -1) : value;
+	if (
+		!line ||
+		line.includes("\n") ||
+		line.includes("\r") ||
+		Buffer.byteLength(line) > 128 ||
+		!/^[\x20-\x7e]+$/.test(line)
+	)
+		return null;
+	return `portable:${line}`;
 }
 
 function deterministicHarnessTmuxSessionName(sessionId: string): string {
@@ -671,57 +848,354 @@ export default class Harness extends Command {
 		return false;
 	}
 
-	#startTmuxResidentOwner(
+	async #harnessOwnerIsolationProbe(tmuxCommand: string): Promise<OwnerIsolationProbe> {
+		return {
+			readCallerCgroup: async () =>
+				process.env.GJC_HARNESS_TEST_CALLER_CGROUP ??
+				(await fs.readFile("/proc/self/cgroup", "utf8").catch(() => null)),
+			probeServer: async (socketKey, tmuxControlArgv): Promise<TmuxServerProof> => {
+				if (!socketKey || socketKey.length > 128) return { state: "unverifiable" };
+				const controlArgv = tmuxControlArgv ?? [tmuxCommand, "-L", socketKey];
+				if (controlArgv.length < 3 || controlArgv[0] !== tmuxCommand || !controlArgv.includes("-L")) {
+					return { state: "unverifiable" };
+				}
+				const result = Bun.spawnSync([...controlArgv, "display-message", "-p", "#{pid}"], {
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				if (result.exitCode !== 0) {
+					return isBoundedNoServerDiagnostic(result.stderr) ? { state: "absent" } : { state: "unverifiable" };
+				}
+				const pid = Number(result.stdout.toString().trim());
+				if (!Number.isSafeInteger(pid) || pid <= 0) return { state: "unverifiable" };
+				const cgroupText =
+					process.env.GJC_HARNESS_TEST_SERVER_CGROUP ??
+					(process.platform === "linux"
+						? await fs.readFile(`/proc/${pid}/cgroup`, "utf8").catch(() => null)
+						: null);
+				const testStartTime = process.env.GJC_HARNESS_TEST_SERVER_START_TIME;
+				const stat =
+					testStartTime || process.platform !== "linux"
+						? null
+						: await fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => null);
+				const cgroup = classifyCgroup({ platform: process.platform, cgroupText });
+				const startTime =
+					testStartTime ??
+					(process.platform === "linux"
+						? ownerProcessStartTime(process.platform, stat)
+						: portableProcessStartTime(pid));
+				if (!startTime) return { state: "unverifiable", pid, cgroup };
+				return {
+					state:
+						cgroup.classification === "safe" || cgroup.classification === "not_applicable"
+							? "safe"
+							: cgroup.classification === "unsafe_service"
+								? "unsafe"
+								: "unverifiable",
+					pid,
+					startTime,
+					cgroup,
+				};
+			},
+		};
+	}
+
+	async #nativeSessionBoundToName(
+		tmuxCommand: string,
+		socketKey: string,
+		nativeSessionId: string,
+		sessionName: string,
+	): Promise<boolean> {
+		const result = Bun.spawnSync(
+			[
+				tmuxCommand,
+				"-L",
+				socketKey,
+				"display-message",
+				"-p",
+				"-t",
+				nativeSessionId,
+				"#{session_id}\t#{session_name}",
+			],
+			{ stdout: "pipe", stderr: "ignore" },
+		);
+		if (result.exitCode !== 0) return false;
+		const value = result.stdout.toString();
+		const line = value.endsWith("\n") ? value.slice(0, -1) : value;
+		return line === `${nativeSessionId}\t${sessionName}`;
+	}
+
+	async #cleanupTmuxAttempt(
+		tmuxCommand: string,
+		socketKey: string,
+		nativeSessionId: string | null,
+		sessionName: string,
+		proof: TmuxServerProof | null,
+		probeServer: OwnerIsolationProbe["probeServer"],
+	): Promise<void> {
+		if (!nativeSessionId || !proof || !isSafeServerProof(proof)) throw new Error("tmux-owner-cleanup_uncertain");
+		if (!(await this.#nativeSessionBoundToName(tmuxCommand, socketKey, nativeSessionId, sessionName)))
+			throw new Error("tmux-owner-cleanup_uncertain");
+		const current = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
+		if (!sameServerIdentity(proof, current)) throw new Error("tmux-owner-cleanup_uncertain");
+		const predicate = `#{&&:#{==:#{pid},${proof.pid}},#{&&:#{==:#{session_id},${nativeSessionId}},#{==:#{session_name},${sessionName}}}}`;
+		const killed = Bun.spawnSync(
+			[
+				tmuxCommand,
+				"-L",
+				socketKey,
+				"if-shell",
+				"-t",
+				nativeSessionId,
+				"-F",
+				predicate,
+				`kill-session -t '${nativeSessionId}' ; display-message -p __gjc_harness_cleanup_ok__`,
+				"display-message -p __gjc_harness_cleanup_refused__",
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		if (killed.exitCode !== 0 || killed.stdout.toString().trim() !== "__gjc_harness_cleanup_ok__")
+			throw new Error("tmux-owner-cleanup_uncertain");
+	}
+
+	async #startTmuxResidentOwner(
 		root: string,
 		sessionId: string,
 		cwd: string,
-	): { started: boolean; sessionName: string; reason: string | null } {
+	): Promise<{
+		started: boolean;
+		sessionName: string;
+		socketKey: string | null;
+		reason: string | null;
+		cleanup?: () => Promise<void>;
+	}> {
 		const tmuxCommand = resolveGjcTmuxCommand();
-		if (Bun.which(tmuxCommand) === null) {
+		const sessionName = deterministicHarnessTmuxSessionName(sessionId);
+		if (Bun.which(tmuxCommand) === null)
+			return { started: false, sessionName, socketKey: null, reason: "tmux-unavailable" };
+		if (resolveGjcTmuxBinary({ env: process.env }).isPsmux)
 			return {
 				started: false,
-				sessionName: deterministicHarnessTmuxSessionName(sessionId),
-				reason: "tmux-unavailable",
+				sessionName,
+				socketKey: null,
+				reason: "tmux-owner-native_session_identity_unavailable",
 			};
+		const socketKey = `gjc-owner-${randomBytes(24).toString("hex")}`;
+		const ownerStateDir = root;
+		let baseline: OwnerGenerationBaseline;
+		try {
+			baseline = captureOwnerGenerationBaselineSync(ownerStateDir, sessionId);
+		} catch {
+			return { started: false, sessionName, socketKey, reason: "tmux-owner-generation_unverifiable" };
 		}
-		const sessionName = deterministicHarnessTmuxSessionName(sessionId);
-		const envAssignments = [`GJC_HARNESS_STATE_ROOT=${shellQuote(root)}`];
-		if (process.env[RECEIPT_SPOOL_DIR_ENV]) {
+		if (process.platform !== "linux" && !portableProcessStartTime(process.pid))
+			return { started: false, sessionName, socketKey, reason: "tmux-owner-generation_unverifiable" };
+		await fs.mkdir(path.join(ownerStateDir, sessionId, "owner-lifecycle"), { recursive: true, mode: 0o700 });
+		const ownerGeneration = randomUUID();
+		const envAssignments = [
+			`GJC_HARNESS_STATE_ROOT=${shellQuote(root)}`,
+			`${GJC_TMUX_OWNER_GENERATION_ENV}=${shellQuote(ownerGeneration)}`,
+			`${GJC_TMUX_OWNER_STATE_DIR_ENV}=${shellQuote(ownerStateDir)}`,
+			`${GJC_TMUX_OWNER_SERVER_KEY_ENV}=${shellQuote(socketKey)}`,
+		];
+		if (process.env[RECEIPT_SPOOL_DIR_ENV])
 			envAssignments.push(`${RECEIPT_SPOOL_DIR_ENV}=${shellQuote(process.env[RECEIPT_SPOOL_DIR_ENV])}`);
-		}
-		if (process.env.GJC_HARNESS_RPC_COMMAND) {
+		if (process.env.GJC_HARNESS_RPC_COMMAND)
 			envAssignments.push(`GJC_HARNESS_RPC_COMMAND=${shellQuote(process.env.GJC_HARNESS_RPC_COMMAND)}`);
-		}
-		if (process.env.GJC_HARNESS_TEST_NODE_MODULES) {
+		if (process.env.GJC_HARNESS_TEST_NODE_MODULES)
 			envAssignments.push(`GJC_HARNESS_TEST_NODE_MODULES=${shellQuote(process.env.GJC_HARNESS_TEST_NODE_MODULES)}`);
-		}
-		const ownerCommand = this.#buildOwnerCommand(sessionId).map(shellQuote).join(" ");
-		const shellCommand = `exec env ${envAssignments.join(" ")} ${ownerCommand}`;
-		const created = Bun.spawnSync([tmuxCommand, "new-session", "-d", "-s", sessionName, "-c", cwd, shellCommand], {
+		const shellCommand = `exec env ${envAssignments.join(" ")} ${this.#buildOwnerCommand(sessionId).map(shellQuote).join(" ")}`;
+		const probe = await this.#harnessOwnerIsolationProbe(tmuxCommand);
+		const probeServer = probe.probeServer;
+		probe.probeServer = async (requestedSocketKey, controlArgv) =>
+			requestedSocketKey === socketKey ? probeServer(requestedSocketKey, controlArgv) : { state: "unverifiable" };
+		const tmuxArgv = [
+			tmuxCommand,
+			"-L",
+			socketKey,
+			"new-session",
+			"-d",
+			"-s",
+			sessionName,
+			"-P",
+			"-F",
+			"#{session_id}",
+			"-c",
+			cwd,
+			shellCommand,
+		];
+		const plan = await planTmuxOwnerIsolation(
+			{
+				schema_version: 1,
+				op: "plan",
+				platform: process.platform,
+				session_id: sessionId,
+				owner_generation: ownerGeneration,
+				baseline,
+				cwd,
+				state_dir: ownerStateDir,
+				socket_key: socketKey,
+				tmux_argv: tmuxArgv,
+			},
+			probe,
+		);
+		if (!plan.ok) return { started: false, sessionName, socketKey, reason: `tmux-owner-${plan.code}` };
+		if (!isOwnerGenerationBaselineCurrentSync(ownerStateDir, sessionId, baseline))
+			return { started: false, sessionName, socketKey, reason: "tmux-owner-generation_stale" };
+		let nativeSessionId: string | null = null;
+		let cleanupProof: TmuxServerProof | null = null;
+		const fail = async (
+			reason: string,
+		): Promise<{ started: false; sessionName: string; socketKey: string; reason: string }> => {
+			try {
+				await this.#cleanupTmuxAttempt(
+					tmuxCommand,
+					socketKey,
+					nativeSessionId,
+					sessionName,
+					cleanupProof,
+					probeServer,
+				);
+				return { started: false, sessionName, socketKey, reason };
+			} catch {
+				return { started: false, sessionName, socketKey, reason: `${reason}:tmux-owner-cleanup_uncertain` };
+			}
+		};
+		const created = Bun.spawnSync(plan.execution.argv, {
 			stdout: "pipe",
 			stderr: "pipe",
 			env: process.env,
+			...(plan.execution.mode === "scoped"
+				? { stdin: new TextEncoder().encode(`${plan.execution.stdin_line}\n`) }
+				: {}),
 		});
-		if (created.exitCode === 0) return { started: true, sessionName, reason: null };
-		const stderr = created.stderr.toString().trim();
-		return { started: false, sessionName, reason: stderr || "tmux-start-failed" };
+		const scopedReceipt = plan.execution.mode === "scoped" ? scopedBootstrapReceipt(created.stdout) : null;
+		nativeSessionId =
+			scopedReceipt?.nativeSessionId ??
+			(plan.execution.mode === "direct" ? exactNativeTmuxSessionId(created.stdout) : null);
+		if (created.exitCode !== 0)
+			return fail(
+				plan.execution.mode === "scoped"
+					? "tmux-owner-scope_bootstrap_failed"
+					: "tmux-owner-direct_creation_failed",
+			);
+		if (!nativeSessionId)
+			return fail(
+				plan.execution.mode === "scoped"
+					? "tmux-owner-scope_bootstrap_failed"
+					: "tmux-owner-native_session_identity_unavailable",
+			);
+		const postSpawnServer = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
+		cleanupProof = postSpawnServer;
+		if (postSpawnServer.state === "unsafe") return fail("tmux-owner-server_unsafe");
+		if (!isSafeServerProof(postSpawnServer)) return fail("tmux-owner-server_unverifiable");
+		if (
+			scopedReceipt &&
+			(scopedReceipt.sessionName !== sessionName ||
+				scopedReceipt.serverPid !== postSpawnServer.pid ||
+				scopedReceipt.serverStartTime !== postSpawnServer.startTime)
+		)
+			return fail("tmux-owner-receipt_server_mismatch");
+		if (!(await this.#nativeSessionBoundToName(tmuxCommand, socketKey, nativeSessionId, sessionName)))
+			return fail("tmux-owner-native_session_identity_unproven");
+		const boundServer = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
+		if (!sameServerIdentity(postSpawnServer, boundServer)) return fail("tmux-owner-server_race");
+		cleanupProof = boundServer;
+		if (
+			plan.execution.mode === "direct" &&
+			!plan.execution.server_absent_before &&
+			(boundServer.pid !== plan.execution.server_pid || boundServer.startTime !== plan.execution.server_start_time)
+		) {
+			cleanupProof = null;
+			return fail("tmux-owner-server_race");
+		}
+		if (!isOwnerGenerationBaselineCurrentSync(ownerStateDir, sessionId, baseline))
+			return fail("tmux-owner-generation_stale");
+		try {
+			replaceOwnerGenerationSync(ownerStateDir, sessionId, ownerGeneration, baseline);
+		} catch {
+			return fail("tmux-owner-generation_stale");
+		}
+		return {
+			started: true,
+			sessionName,
+			socketKey,
+			reason: null,
+			cleanup: async () => {
+				await this.#cleanupTmuxAttempt(
+					tmuxCommand,
+					socketKey,
+					nativeSessionId,
+					sessionName,
+					cleanupProof,
+					probeServer,
+				);
+				await observeOwnerTerminal({
+					schema_version: 1,
+					op: "observe_terminal",
+					session_id: sessionId,
+					owner_generation: ownerGeneration,
+					state_dir: ownerStateDir,
+					socket_key: socketKey,
+					observer: "sidecar",
+					observed_at: new Date().toISOString(),
+					signal: "UNKNOWN",
+					exit_code: null,
+					exit_kind: "owner_lost",
+					reason: "endpoint_unroutable",
+				});
+			},
+		};
 	}
 
-	/** Spawn the owner daemon. Prefer a tmux-resident owner, then explicitly fall back to detached. */
+	/** Spawn the owner daemon. Tmux isolation failures and unroutable starts block; unavailable tmux may fall back. */
 	async #spawnDetachedOwner(root: string, sessionId: string, cwd: string): Promise<OwnerSpawnResult> {
-		const tmux = this.#startTmuxResidentOwner(root, sessionId, cwd);
+		const tmux = await this.#startTmuxResidentOwner(root, sessionId, cwd);
+		if (!tmux.started && tmux.reason?.startsWith("tmux-owner-")) {
+			return {
+				live: false,
+				runtime: "manual",
+				tmuxSessionName: null,
+				socketKey: tmux.socketKey,
+				fallbackReason: tmux.reason,
+				blockerReason: "tmux-owner-isolation-failed",
+			};
+		}
 		if (tmux.started && (await this.#waitForOwner(root, sessionId))) {
 			return {
 				live: true,
 				runtime: "tmux",
 				tmuxSessionName: tmux.sessionName,
+				socketKey: tmux.socketKey,
 				fallbackReason: null,
 				blockerReason: null,
 			};
 		}
-		const fallbackReason = tmux.started
-			? "tmux new-session exited 0 but owner endpoint did not become routable"
-			: tmux.reason;
+		if (tmux.started) {
+			try {
+				if (!tmux.cleanup) throw new Error("tmux-owner-cleanup_uncertain");
+				await tmux.cleanup();
+			} catch {
+				return {
+					live: false,
+					runtime: "manual",
+					tmuxSessionName: tmux.sessionName,
+					socketKey: tmux.socketKey,
+					fallbackReason:
+						"tmux new-session owner endpoint not routable; exact cleanup or reconciliation uncertain",
+					blockerReason: "tmux-owner-endpoint-cleanup-uncertain",
+				};
+			}
+			return {
+				live: false,
+				runtime: "manual",
+				tmuxSessionName: null,
+				socketKey: tmux.socketKey,
+				fallbackReason: "tmux new-session exited 0 but owner endpoint did not become routable; owner cleaned",
+				blockerReason: "tmux-owner-endpoint-not-routable",
+			};
+		}
+		const fallbackReason = tmux.reason;
 		const cmd = this.#buildOwnerCommand(sessionId);
 		const child = Bun.spawn(cmd, {
 			cwd,
@@ -745,6 +1219,7 @@ export default class Harness extends Command {
 			live,
 			runtime: "detached",
 			tmuxSessionName: null,
+			socketKey: null,
 			fallbackReason,
 			blockerReason: live ? null : "detached-owner-not-live",
 		};
@@ -815,12 +1290,14 @@ export default class Harness extends Command {
 		let ownerRuntime: OwnerSpawnResult["runtime"] = "manual";
 		let ownerFallbackReason: string | null = null;
 		let ownerBlockerReason: string | null = null;
+		let ownerSocketKey: string | null = null;
 		if (input.detach === true) {
 			const ownerSpawn = await this.#spawnDetachedOwner(root, sessionId, workspace);
 			ownerLive = ownerSpawn.live;
 			ownerRuntime = ownerSpawn.runtime;
 			ownerFallbackReason = ownerSpawn.fallbackReason;
 			ownerBlockerReason = ownerSpawn.blockerReason;
+			ownerSocketKey = ownerSpawn.socketKey;
 			handle.viewportHandle = {
 				kind: "event-monitor",
 				tmuxSessionName: ownerSpawn.tmuxSessionName,
@@ -842,25 +1319,7 @@ export default class Harness extends Command {
 				await writeSessionState(root, state);
 			}
 		}
-		if (ownerBlockerReason) {
-			const resolved = await resolveOwner(root, sessionId);
-			if (resolved.live && resolved.socketPath) {
-				ownerLive = true;
-				ownerBlockerReason = null;
-				handle.processHandle = {
-					kind: "runtime-owner",
-					ownerId: resolved.lease?.ownerId ?? null,
-					pid: resolved.lease?.pid ?? null,
-				};
-				handle.ownerHandle = {
-					leasePath,
-					endpoint: resolved.socketPath,
-					heartbeatAt: resolved.lease?.heartbeatAt ?? null,
-				};
-				state.handle = handle;
-				await writeSessionState(root, state);
-			}
-		}
+		// A live endpoint never proves a failed tmux launch safe: preserve the isolation/provenance blocker.
 		if (ownerBlockerReason) {
 			state.lifecycle = "blocked";
 			state.blockers = [...state.blockers, ownerBlockerReason];
@@ -876,6 +1335,7 @@ export default class Harness extends Command {
 					handle,
 					ownerRuntime,
 					preflight,
+					...(ownerSocketKey ? { tmuxOwnerSocketKey: ownerSocketKey } : {}),
 					...(ownerFallbackReason ? { ownerFallbackReason } : {}),
 					...(ownerBlockerReason ? { reason: ownerBlockerReason } : {}),
 				},

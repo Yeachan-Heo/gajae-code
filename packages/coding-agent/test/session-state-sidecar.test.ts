@@ -10,11 +10,21 @@ import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_TMUX_OWNER_GENERATION_ENV,
+	GJC_TMUX_OWNER_SERVER_KEY_ENV,
+	GJC_TMUX_OWNER_STATE_DIR_ENV,
+	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorRuntimeStateFromPostmortem,
 	readTerminalRuntimeStateMarker,
 	stateForEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
+import {
+	createOwnerIntent,
+	lifecyclePaths,
+	observeOwnerTerminal,
+	replaceOwnerGeneration,
+} from "../src/gjc-runtime/tmux-owner-isolation";
 
 const tempDirs: string[] = [];
 
@@ -209,6 +219,40 @@ describe("coordinator runtime state sidecar", () => {
 			setSystemTime();
 		}
 	});
+	it("adds managed owner generation to normal terminal event markers", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const generation = "2b3847de-1cbb-480d-8cad-1f8aa51b891a";
+		const keys = [
+			GJC_TMUX_OWNER_GENERATION_ENV,
+			GJC_TMUX_OWNER_STATE_DIR_ENV,
+			GJC_TMUX_OWNER_SERVER_KEY_ENV,
+		] as const;
+		const previous = new Map(keys.map(key => [key, process.env[key]]));
+		try {
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "managed-terminal-session";
+			process.env[GJC_TMUX_OWNER_GENERATION_ENV] = generation;
+			process.env[GJC_TMUX_OWNER_STATE_DIR_ENV] = root;
+			process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] = "managed-socket";
+			await persistCoordinatorRuntimeStateFromEvent(assistantEnd("launch failed", "error"), {
+				sessionId: "fallback",
+				cwd: root,
+				sessionFile: null,
+			});
+			expect(await readJson(stateFile)).toMatchObject({
+				state: "errored",
+				owner_generation: generation,
+				final_response: { source: "agent_end" },
+			});
+		} finally {
+			for (const key of keys) {
+				const value = previous.get(key);
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
 
 	it("invalidates the async previous-payload cache after an external state file write", async () => {
 		const root = await tempRoot();
@@ -253,6 +297,109 @@ describe("coordinator runtime state sidecar", () => {
 			setSystemTime();
 		}
 	});
+	it("treats an absent runtime-state marker as empty state", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "missing-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "missing-state";
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: "fallback", cwd: root, sessionFile: null },
+		);
+
+		expect(await readPayload(stateFile)).toMatchObject({ session_id: "missing-state", state: "running" });
+	});
+
+	it("preserves malformed runtime-state evidence and refuses event and postmortem writes", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "malformed-state.json");
+		const evidence = "{ malformed terminal evidence\n";
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "malformed-state";
+		await Bun.write(stateFile, evidence);
+
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_end", messages: [] },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			),
+		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+
+		await expect(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+				sessionId: "fallback",
+				cwd: root,
+				sessionFile: null,
+			}),
+		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+	});
+
+	it("preserves directory runtime-state evidence and refuses event and postmortem writes", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "unreadable-state");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "directory-state";
+		await fs.mkdir(stateFile);
+
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			),
+		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		expect((await fs.stat(stateFile)).isDirectory()).toBe(true);
+
+		await expect(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+				sessionId: "fallback",
+				cwd: root,
+				sessionFile: null,
+			}),
+		).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		expect((await fs.stat(stateFile)).isDirectory()).toBe(true);
+	});
+
+	it("preserves unreadable runtime-state evidence and refuses event and postmortem writes", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "permission-denied-state.json");
+		const evidence = JSON.stringify({ state: "completed", terminal: "durable" });
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "permission-denied-state";
+		await Bun.write(stateFile, evidence);
+		const denied = Object.assign(new Error("permission denied"), { code: "EACCES" });
+		const stat = spyOn(fs, "stat").mockRejectedValue(denied);
+		try {
+			await expect(
+				persistCoordinatorRuntimeStateFromEvent(
+					{ type: "turn_start" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				),
+			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		} finally {
+			stat.mockRestore();
+		}
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+
+		const readFileSync = spyOn(fsSync, "readFileSync").mockImplementation(() => {
+			throw denied;
+		});
+		try {
+			await expect(
+				persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+					sessionId: "fallback",
+					cwd: root,
+					sessionFile: null,
+				}),
+			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+		} finally {
+			readFileSync.mockRestore();
+		}
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+	});
+
 	it("persists final assistant text on agent_end", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");
@@ -298,6 +445,9 @@ describe("coordinator runtime state sidecar", () => {
 				schema_version: 1,
 				session_id: "async-session",
 				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
 				current_turn_id: "turn-current",
 				last_turn_id: "turn-last",
 				final_response: { source: "agent_end", text: "previous final" },
@@ -361,6 +511,9 @@ describe("coordinator runtime state sidecar", () => {
 				schema_version: 1,
 				session_id: "g012-zero-sync",
 				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
 				current_turn_id: "turn-5",
 				last_turn_id: "turn-4",
 			}),
@@ -410,6 +563,9 @@ describe("coordinator runtime state sidecar", () => {
 				schema_version: 1,
 				session_id: "coordinator-external-write",
 				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
 				current_turn_id: "turn-A",
 				last_turn_id: "turn-before-A",
 			}),
@@ -426,6 +582,9 @@ describe("coordinator runtime state sidecar", () => {
 					schema_version: 1,
 					session_id: "coordinator-external-write",
 					state: "running",
+					cwd: root,
+					workdir: root,
+					session_file: null,
 					current_turn_id: "turn-B",
 					last_turn_id: "turn-A",
 				}),
@@ -460,6 +619,9 @@ describe("coordinator runtime state sidecar", () => {
 				schema_version: 1,
 				session_id: "postmortem-race",
 				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
 				current_turn_id: "race-current",
 			}),
 		);
@@ -484,18 +646,22 @@ describe("coordinator runtime state sidecar", () => {
 			cwd: root,
 			sessionFile: null,
 		});
-		try {
+		const postmortemPromise = (async () => {
 			await writeStartedPromise;
-			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+			return persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
 				sessionId: "fallback",
 				cwd: root,
 				sessionFile: null,
 			});
+		})();
+		try {
+			await writeStartedPromise;
 			expect(writeFileSync).toHaveBeenCalledTimes(0);
 		} finally {
 			writeFileSync.mockRestore();
 			releaseWrite();
 			await persistPromise;
+			await postmortemPromise;
 			writeSpy.mockRestore();
 		}
 
@@ -519,6 +685,9 @@ describe("coordinator runtime state sidecar", () => {
 				schema_version: 1,
 				session_id: "g012-cold-restart",
 				state: "completed",
+				cwd: root,
+				workdir: root,
+				session_file: null,
 				current_turn_id: "cold-current",
 				last_turn_id: "cold-last",
 				ended_at: "2026-07-06T00:00:00.000Z",
@@ -558,6 +727,9 @@ describe("coordinator runtime state sidecar", () => {
 				schema_version: 1,
 				session_id: "g012-cache-interleave",
 				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
 				current_turn_id: "cache-current",
 				last_turn_id: "cache-last",
 			}),
@@ -581,7 +753,7 @@ describe("coordinator runtime state sidecar", () => {
 		const previousExitCode = process.exitCode;
 		process.exitCode = 0;
 		try {
-			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
 				sessionId: "fallback",
 				cwd: root,
 				sessionFile: null,
@@ -626,7 +798,7 @@ describe("coordinator runtime state sidecar", () => {
 		});
 		const terminal = await readPayload(stateFile);
 
-		persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
 			sessionId: "fallback",
 			cwd: root,
 			sessionFile: null,
@@ -675,6 +847,7 @@ describe("coordinator runtime state sidecar", () => {
 				session_id: "session-a",
 				state: "completed",
 				cwd: root,
+				workdir: root,
 				session_file: path.join(root, "session.jsonl"),
 			}),
 		);
@@ -703,17 +876,49 @@ describe("coordinator runtime state sidecar", () => {
 				session_id: "session-a",
 				state: "running",
 				cwd: root,
+				workdir: root,
 				session_file: path.join(root, "session.jsonl"),
 			}),
 		);
 
-		await expect(readTerminalRuntimeStateMarker({ stateFile, sessionId: "session-a", cwd: root })).resolves.toEqual({
+		await expect(
+			readTerminalRuntimeStateMarker({
+				stateFile,
+				sessionId: "session-a",
+				cwd: root,
+				sessionFile: path.join(root, "session.jsonl"),
+			}),
+		).resolves.toEqual({
 			terminal: false,
 			reason: "non_terminal_state",
 		});
 		await expect(
-			readTerminalRuntimeStateMarker({ stateFile, sessionId: "session-a", cwd: path.join(root, "other") }),
+			readTerminalRuntimeStateMarker({
+				stateFile,
+				sessionId: "session-a",
+				cwd: path.join(root, "other"),
+				sessionFile: path.join(root, "session.jsonl"),
+			}),
 		).resolves.toEqual({ terminal: false, reason: "cwd_mismatch" });
+	});
+	it("treats every parseable non-marker shape as semantic corruption before terminal dereference", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "invalid-terminal-marker.json");
+		for (const value of [
+			null,
+			[],
+			"terminal",
+			{ schema_version: 1 },
+			{ schema_version: 2, session_id: "session-a", state: "completed", cwd: root },
+		]) {
+			await Bun.write(stateFile, JSON.stringify(value));
+			await expect(
+				readTerminalRuntimeStateMarker({ stateFile, sessionId: "session-a", cwd: root }),
+			).resolves.toEqual({
+				terminal: false,
+				reason: "invalid_state_marker",
+			});
+		}
 	});
 
 	it("writes public-safe postmortem exit evidence without transcript payloads", async () => {
@@ -723,7 +928,7 @@ describe("coordinator runtime state sidecar", () => {
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "postmortem-session";
 		process.env[GJC_COORDINATOR_SESSION_BRANCH_ENV] = "issue-1496";
 
-		persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
 			sessionId: "fallback",
 			cwd: root,
 			sessionFile: path.join(root, "session.jsonl"),
@@ -780,6 +985,7 @@ describe("coordinator runtime state sidecar", () => {
 				state: "running",
 				ready_for_input: false,
 				cwd: workspace,
+				workdir: workspace,
 				session_file: path.join(root, "session.jsonl"),
 				current_turn_id: "turn-after-prompt-acceptance",
 			}),
@@ -787,7 +993,7 @@ describe("coordinator runtime state sidecar", () => {
 		const previousExitCode = process.exitCode;
 		process.exitCode = 0;
 		try {
-			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
 				sessionId: "fallback",
 				cwd: workspace,
 				sessionFile: path.join(root, "session.jsonl"),
@@ -841,12 +1047,19 @@ describe("coordinator runtime state sidecar", () => {
 		process.env[BASELINE_DIRTY_ENV] = "false";
 		await Bun.write(
 			stateFile,
-			JSON.stringify({ schema_version: 1, session_id: "no-output-session", state: "running", cwd: workspace }),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "no-output-session",
+				state: "running",
+				cwd: workspace,
+				workdir: workspace,
+				session_file: null,
+			}),
 		);
 		const previousExitCode = process.exitCode;
 		process.exitCode = 0;
 		try {
-			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
 				sessionId: "fallback",
 				cwd: workspace,
 				sessionFile: null,
@@ -899,12 +1112,14 @@ describe("coordinator runtime state sidecar", () => {
 				session_id: "preexisting-dirty-session",
 				state: "running",
 				cwd: workspace,
+				workdir: workspace,
+				session_file: null,
 			}),
 		);
 		const previousExitCode = process.exitCode;
 		process.exitCode = 0;
 		try {
-			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
 				sessionId: "fallback",
 				cwd: workspace,
 				sessionFile: null,
@@ -952,7 +1167,7 @@ describe("coordinator runtime state sidecar", () => {
 		const previousExitCode = process.exitCode;
 		process.exitCode = 0;
 		try {
-			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
 				sessionId,
 				cwd: root,
 				sessionFile: null,
@@ -976,7 +1191,7 @@ describe("coordinator runtime state sidecar", () => {
 		expect(payload).not.toHaveProperty("paneLog");
 	});
 
-	it("overwrites mismatched terminal payloads instead of preserving stale evidence", async () => {
+	it("refuses mismatched terminal session identity without replacing evidence", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");
 		const promptAccepted = path.join(root, "prompt-accepted.json");
@@ -994,33 +1209,29 @@ describe("coordinator runtime state sidecar", () => {
 				session_id: "stale-session",
 				state: "completed",
 				cwd: root,
+				workdir: root,
+				session_file: null,
 				final_response: { source: "agent_end", text: "Stale done" },
 			}),
 		);
+		const before = await Bun.file(stateFile).text();
 		const previousExitCode = process.exitCode;
 		process.exitCode = 0;
 		try {
-			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
-				sessionId: "fallback",
-				cwd: root,
-				sessionFile: null,
-			});
+			await expect(
+				persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+					sessionId: "fallback",
+					cwd: root,
+					sessionFile: null,
+				}),
+			).rejects.toThrow("invalid or unreadable");
 		} finally {
 			process.exitCode = previousExitCode;
 		}
-
-		const payload = JSON.parse(await Bun.file(stateFile).text());
-		expect(payload).toMatchObject({
-			session_id: "current-session",
-			state: "errored",
-			source: "process_postmortem",
-			reason: "accepted_prompt_no_useful_output",
-			error: { code: "accepted_prompt_no_useful_output", recoverable: true },
-		});
-		expect(payload.final_response?.text).not.toBe("Stale done");
+		expect(await Bun.file(stateFile).text()).toBe(before);
 	});
 
-	it("overwrites terminal payloads with mismatched cwd or session file", async () => {
+	it("refuses terminal payloads with mismatched cwd or session file", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
@@ -1036,22 +1247,19 @@ describe("coordinator runtime state sidecar", () => {
 					session_id: "current-session",
 					state: "errored",
 					...stale,
+					workdir: stale.cwd,
 					final_response: { source: "launch_error", text: "Stale launch" },
 				}),
 			);
-			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
-				sessionId: "fallback",
-				cwd: root,
-				sessionFile: path.join(root, "session.jsonl"),
-			});
-			const payload = JSON.parse(await Bun.file(stateFile).text());
-			expect(payload).toMatchObject({
-				session_id: "current-session",
-				state: "errored",
-				source: "process_postmortem",
-				reason: "sigterm",
-			});
-			expect(payload.final_response?.text).not.toBe("Stale launch");
+			const before = await Bun.file(stateFile).text();
+			await expect(
+				persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+					sessionId: "fallback",
+					cwd: root,
+					sessionFile: path.join(root, "session.jsonl"),
+				}),
+			).rejects.toThrow("invalid or unreadable");
+			expect(await Bun.file(stateFile).text()).toBe(before);
 		}
 	});
 
@@ -1066,11 +1274,14 @@ describe("coordinator runtime state sidecar", () => {
 				schema_version: 1,
 				session_id: "preserved-session",
 				state: "completed",
+				cwd: root,
+				workdir: root,
+				session_file: null,
 				final_response: { source: "agent_end", text: "Already done" },
 			}),
 		);
 
-		persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
 			sessionId: "fallback",
 			cwd: root,
 			sessionFile: null,
@@ -1095,11 +1306,14 @@ describe("coordinator runtime state sidecar", () => {
 				schema_version: 1,
 				session_id: "launch-error-session",
 				state: "errored",
+				cwd: root,
+				workdir: root,
+				session_file: null,
 				final_response: { source: "launch_error", text: "Launch failed" },
 			}),
 		);
 
-		persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
 			sessionId: "fallback",
 			cwd: root,
 			sessionFile: null,
@@ -1111,5 +1325,400 @@ describe("coordinator runtime state sidecar", () => {
 			final_response: { source: "launch_error", text: "Launch failed" },
 		});
 		expect(payload.source).not.toBe("process_postmortem");
+	});
+	it("derives only complete valid managed owner provenance and fails closed otherwise", () => {
+		const keys = [
+			GJC_TMUX_OWNER_GENERATION_ENV,
+			GJC_TMUX_OWNER_STATE_DIR_ENV,
+			GJC_TMUX_OWNER_SERVER_KEY_ENV,
+			"GJC_TMUX_LAUNCHED",
+		] as const;
+		const previous = new Map(keys.map(key => [key, process.env[key]]));
+		try {
+			process.env.GJC_TMUX_LAUNCHED = "1";
+			process.env[GJC_TMUX_OWNER_GENERATION_ENV] = "2b3847de-1cbb-480d-8cad-1f8aa51b891a";
+			process.env[GJC_TMUX_OWNER_STATE_DIR_ENV] = "/tmp/gjc-owner-lifecycle";
+			process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] = "tmux";
+			expect(ownerTerminalContextFromEnvironment()).toEqual({
+				generation: "2b3847de-1cbb-480d-8cad-1f8aa51b891a",
+				stateDir: "/tmp/gjc-owner-lifecycle",
+				socketKey: "tmux",
+			});
+			for (const invalid of [
+				{ generation: "not-a-uuid", stateDir: "/tmp/gjc-owner-lifecycle", socketKey: "tmux" },
+				{ generation: "2b3847de-1cbb-480d-8cad-1f8aa51b891a", stateDir: "relative", socketKey: "tmux" },
+				{ generation: "   ", stateDir: "/tmp/gjc-owner-lifecycle", socketKey: "tmux" },
+				{
+					generation: "2b3847de-1cbb-480d-8cad-1f8aa51b891a",
+					stateDir: "/tmp/gjc-owner-lifecycle",
+					socketKey: "tmux\ncontrol",
+				},
+			]) {
+				process.env[GJC_TMUX_OWNER_GENERATION_ENV] = invalid.generation;
+				process.env[GJC_TMUX_OWNER_STATE_DIR_ENV] = invalid.stateDir;
+				process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] = invalid.socketKey;
+				expect(ownerTerminalContextFromEnvironment()).toBe("invalid");
+			}
+			process.env[GJC_TMUX_OWNER_GENERATION_ENV] = "2b3847de-1cbb-480d-8cad-1f8aa51b891a";
+			process.env[GJC_TMUX_OWNER_STATE_DIR_ENV] = "/tmp/gjc-owner-lifecycle";
+			delete process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV];
+			expect(ownerTerminalContextFromEnvironment()).toBe("invalid");
+			delete process.env[GJC_TMUX_OWNER_GENERATION_ENV];
+			delete process.env[GJC_TMUX_OWNER_STATE_DIR_ENV];
+			expect(ownerTerminalContextFromEnvironment()).toBe(process.platform === "linux" ? "invalid" : null);
+			delete process.env.GJC_TMUX_LAUNCHED;
+			process.env[GJC_TMUX_OWNER_GENERATION_ENV] = "2b3847de-1cbb-480d-8cad-1f8aa51b891a";
+			expect(ownerTerminalContextFromEnvironment()).toBe("invalid");
+			delete process.env[GJC_TMUX_OWNER_GENERATION_ENV];
+			expect(ownerTerminalContextFromEnvironment()).toBeNull();
+		} finally {
+			for (const key of keys) {
+				const value = previous.get(key);
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
+	it("persists the immutable owner-terminal verdict with public-safe metadata", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const sessionId = "owner-sidecar-session";
+		const generation = await replaceOwnerGeneration(root, sessionId, "generation-one");
+		await createOwnerIntent(root, {
+			generation,
+			session_id: sessionId,
+			server_key: "opaque-server-key",
+			expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+			dispatch_id: "operator-dispatch",
+			created_at: "2026-01-01T00:00:00.000Z",
+			expires_at: "2099-01-01T00:00:00.000Z",
+		});
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			}),
+		);
+
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+			sessionId,
+			cwd: root,
+			ownerTerminal: {
+				generation,
+				stateDir: root,
+				socketKey: "opaque-server-key",
+				scope: "gjc-owner.scope",
+				ownerPid: 123,
+				ownerName: "tmux",
+			},
+		});
+		const rawVerdict = await observeOwnerTerminal({
+			schema_version: 1,
+			op: "observe_terminal",
+			session_id: sessionId,
+			owner_generation: generation,
+			state_dir: root,
+			socket_key: "opaque-server-key",
+			observer: "raw_monitor",
+			observed_at: new Date().toISOString(),
+			signal: "SIGTERM",
+			exit_code: null,
+			exit_kind: "sigterm",
+			reason: "raw_terminal",
+		});
+		expect(rawVerdict.classification).toBe("expected_operator_shutdown");
+		expect(rawVerdict.observer).toBe("sidecar");
+		let payload: RuntimePayload | null = null;
+		for (let attempt = 0; attempt < 20; attempt++) {
+			try {
+				await fs.access(stateFile);
+			} catch {
+				await Bun.sleep(5);
+				continue;
+			}
+			const candidate = await readPayload(stateFile);
+			if (candidate.owner_terminal) {
+				payload = candidate;
+				break;
+			}
+			await Bun.sleep(5);
+		}
+		expect(payload).not.toBeNull();
+		expect(payload?.owner_terminal).toMatchObject({
+			generation,
+			socket_key: "opaque-server-key",
+			observer: "sidecar",
+			classification: rawVerdict.classification,
+			dedupe_key: rawVerdict.dedupe_key,
+		});
+		expect(payload?.state).toBe(rawVerdict.classification === "expected_operator_shutdown" ? "completed" : "errored");
+		const serialized = JSON.stringify(payload);
+		expect(serialized).not.toContain("raw_terminal");
+		expect(serialized).not.toContain("operator-dispatch");
+		await expect(fs.access(lifecyclePaths(root, sessionId, generation).verdictFile)).resolves.toBeNull();
+	});
+	it("fails closed with public-safe recovery state for invalid metadata or unavailable owner verdicts", async () => {
+		const root = await tempRoot();
+		const sessionId = "owner-fail-closed";
+		const invalidStateFile = path.join(root, "invalid.json");
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+			sessionId,
+			cwd: root,
+			ownerTerminalMetadataInvalid: true,
+			branch: null,
+		});
+		const invalid = await readPayload(path.join(sessionRuntimeDir(root, sessionId), "runtime-state.json"));
+		expect(invalid).toMatchObject({
+			state: "errored",
+			reason: "owner_metadata_invalid",
+			error: { code: "owner_metadata_invalid", recoverable: true },
+			recovery: { action: "recover_or_resume_session" },
+		});
+
+		await Bun.write(invalidStateFile, "not-a-directory");
+		const unavailableSessionId = "owner-verdict-unavailable";
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+			sessionId: unavailableSessionId,
+			cwd: root,
+			ownerTerminal: { generation: "owner-failure", stateDir: invalidStateFile, socketKey: "opaque-owner" },
+		});
+		const unavailable = await readPayload(
+			path.join(sessionRuntimeDir(root, unavailableSessionId), "runtime-state.json"),
+		);
+		expect(unavailable).toMatchObject({
+			state: "errored",
+			reason: "owner_verdict_unavailable",
+			error: { code: "owner_verdict_unavailable", recoverable: true },
+			recovery: { action: "recover_or_resume_session" },
+		});
+		expect(JSON.stringify(unavailable)).not.toContain("not-a-directory");
+	});
+
+	it("fails closed for absent, malformed, mismatched, and expired owner intents", async () => {
+		const root = await tempRoot();
+		for (const kind of ["absent", "malformed", "mismatched", "expired"] as const) {
+			const sessionId = `owner-intent-${kind}`;
+			const generation = await replaceOwnerGeneration(root, sessionId, `generation-${kind}`);
+			const paths = lifecyclePaths(root, sessionId, generation);
+			if (kind === "malformed") await Bun.write(paths.intentFile, "{");
+			if (kind === "mismatched") {
+				await createOwnerIntent(root, {
+					generation,
+					session_id: sessionId,
+					server_key: "other-owner",
+					expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+					dispatch_id: "dispatch",
+					created_at: "2026-01-01T00:00:00.000Z",
+					expires_at: "2099-01-01T00:00:00.000Z",
+				});
+			}
+			if (kind === "expired")
+				await Bun.write(
+					paths.intentFile,
+					JSON.stringify({
+						schema_version: 1,
+						intent_id: "expired-intent",
+						generation,
+						session_id: sessionId,
+						server_key: "opaque-owner",
+						expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+						dispatch_id: "dispatch",
+						created_at: "2019-01-01T00:00:00.000Z",
+						expires_at: "2020-01-01T00:00:00.000Z",
+						state: "pending",
+					}),
+				);
+			const stateFile = path.join(root, `${kind}.json`);
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+				sessionId,
+				cwd: root,
+				ownerTerminal: { generation, stateDir: root, socketKey: "opaque-owner" },
+			});
+			const payload = await readPayload(stateFile);
+			expect(payload).toMatchObject({
+				owner_generation: generation,
+				state: "errored",
+				reason: "unexpected_owner_loss",
+				error: { code: "unexpected_owner_loss", recoverable: true },
+				recovery: { action: "recover_or_resume_session" },
+			});
+		}
+	});
+
+	it("reuses one immutable owner verdict when raw observation wins the race", async () => {
+		const root = await tempRoot();
+		const sessionId = "raw-first-owner";
+		const generation = await replaceOwnerGeneration(root, sessionId, "raw-first-generation");
+		await createOwnerIntent(root, {
+			generation,
+			session_id: sessionId,
+			server_key: "opaque-owner",
+			expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+			dispatch_id: "dispatch",
+			created_at: "2026-01-01T00:00:00.000Z",
+			expires_at: "2099-01-01T00:00:00.000Z",
+		});
+		const raw = await observeOwnerTerminal({
+			schema_version: 1,
+			op: "observe_terminal",
+			session_id: sessionId,
+			owner_generation: generation,
+			state_dir: root,
+			socket_key: "opaque-owner",
+			observer: "raw_monitor",
+			observed_at: new Date().toISOString(),
+			signal: "SIGTERM",
+			exit_code: null,
+			exit_kind: "sigterm",
+			reason: "raw_terminal",
+			operator_dispatch_id: "dispatch",
+		});
+		const stateFile = path.join(root, "raw-first.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+			sessionId,
+			cwd: root,
+			ownerTerminal: { generation, stateDir: root, socketKey: "opaque-owner" },
+		});
+		const payload = await readPayload(stateFile);
+		expect(payload.owner_terminal).toMatchObject({ observer: "raw_monitor", dedupe_key: raw.dedupe_key });
+		expect(JSON.stringify(payload)).not.toContain("raw_terminal");
+	});
+	it("rejects otherwise valid owner intents for non-SIGTERM exits and dispatch mismatches", async () => {
+		const root = await tempRoot();
+		for (const [signal, dispatch] of [
+			["SIGHUP", "dispatch"],
+			["SIGINT", "dispatch"],
+			["EXIT", "dispatch"],
+			["SIGTERM", "other-dispatch"],
+		] as const) {
+			const sessionId = `negative-${signal}-${dispatch}`;
+			const generation = await replaceOwnerGeneration(root, sessionId, `generation-${signal}-${dispatch}`);
+			await createOwnerIntent(root, {
+				generation,
+				session_id: sessionId,
+				server_key: "private-owner",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch",
+				created_at: "2026-01-01T00:00:00.000Z",
+				expires_at: "2099-01-01T00:00:00.000Z",
+			});
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: root,
+				socket_key: "private-owner",
+				observer: "raw_monitor",
+				observed_at: "2026-01-01T00:00:01.000Z",
+				signal,
+				exit_code: null,
+				exit_kind: signal.toLowerCase(),
+				reason: "terminal",
+				operator_dispatch_id: dispatch,
+			});
+			expect(verdict.classification).toBe("unexpected_owner_loss");
+			expect(verdict.intent_id).toBeUndefined();
+		}
+	});
+
+	it("reclaims orphaned runtime-state locks without inspecting protected payloads", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "runtime-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "orphaned-runtime-lock";
+		await Bun.write(
+			`${stateFile}.lock`,
+			JSON.stringify({ pid: 999_999_999, start_time: "0", token: "orphaned-writer" }),
+		);
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("completed"), {
+			sessionId: "orphaned-runtime-lock",
+			cwd: root,
+			sessionFile: null,
+		});
+		expect((await readPayload(stateFile)).state).toBe("completed");
+		expect(await Bun.file(`${stateFile}.lock`).exists()).toBe(false);
+	});
+
+	it("publishes one byte-stable immutable verdict when raw and sidecar observers race", async () => {
+		const root = await tempRoot();
+		const sessionId = "barrier-race";
+		const generation = await replaceOwnerGeneration(root, sessionId, "barrier-generation");
+		await createOwnerIntent(root, {
+			generation,
+			session_id: sessionId,
+			server_key: "private-owner",
+			expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+			dispatch_id: "barrier-dispatch",
+			created_at: "2026-01-01T00:00:00.000Z",
+			expires_at: "2099-01-01T00:00:10.000Z",
+		});
+		const generationBytes = await Bun.file(lifecyclePaths(root, sessionId, generation).generationFile).text();
+		const barrier = Promise.withResolvers<void>();
+		const observe = (observer: "raw_monitor" | "sidecar") =>
+			barrier.promise.then(() =>
+				observeOwnerTerminal({
+					schema_version: 1,
+					op: "observe_terminal",
+					session_id: sessionId,
+					owner_generation: generation,
+					state_dir: root,
+					socket_key: "private-owner",
+					observer,
+					observed_at: "2026-01-01T00:00:01.000Z",
+					signal: "SIGTERM",
+					exit_code: null,
+					exit_kind: "sigterm",
+					reason: "terminal",
+					operator_dispatch_id: "barrier-dispatch",
+				}),
+			);
+		const raw = observe("raw_monitor");
+		const sidecar = observe("sidecar");
+		barrier.resolve();
+		const [rawVerdict, sidecarVerdict] = await Promise.all([raw, sidecar]);
+		expect(rawVerdict).toEqual(sidecarVerdict);
+		const paths = lifecyclePaths(root, sessionId, generation);
+		const verdictBytes = await Bun.file(paths.verdictFile).text();
+		expect(verdictBytes).toBe(`${JSON.stringify(rawVerdict)}\n`);
+		expect(await Bun.file(paths.generationFile).text()).toBe(generationBytes);
+		expect(["raw_monitor", "sidecar"]).toContain(rawVerdict.observer);
+		expect(await Bun.file(paths.intentFile).exists()).toBe(false);
+		expect(await Bun.file(`${paths.intentFile}.consumed`).exists()).toBe(true);
+		expect(await Bun.file(paths.incidentFile).exists()).toBe(false);
+	});
+	it("serializes reverse-release running and terminal postmortem races", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "serialized-race.json");
+		const sessionId = "serialized-race";
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		const context = { sessionId, cwd: root, sessionFile: null };
+
+		await Promise.all([
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context),
+			persistCoordinatorRuntimeStateFromEvent({ type: "agent_start" }, context),
+			persistCoordinatorRuntimeStateFromEvent(assistantEnd("committed terminal"), context),
+		]);
+
+		const terminal = await readPayload(stateFile);
+		expect(terminal).toMatchObject({
+			session_id: sessionId,
+			state: "completed",
+			final_response: { source: "agent_end", text: "committed terminal" },
+		});
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context);
+		expect(await readPayload(stateFile)).toEqual(terminal);
 	});
 });

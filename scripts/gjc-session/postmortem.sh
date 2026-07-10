@@ -1,29 +1,144 @@
 #!/usr/bin/env bash
-# Public-safe GJC session postmortem helpers. Do not include raw prompt text,
-# pane text, tokens, config, or logs in JSON markers written by this file.
+# Public-safe GJC session postmortem helpers. Markers contain only lifecycle
+# state and paths; they never read or persist pane, prompt, or runtime payloads.
 
-json_escape() {
-  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])'
-}
 
 gjc_session_git_dirty_boolean() {
   local workdir="${1:-}"
-  if [[ -z "$workdir" ]]; then
+  local status
+  if [[ -z "$workdir" ]] || ! git -C "$workdir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     printf 'null\n'
-    return 0
+    return
   fi
-  if ! git -C "$workdir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    printf 'null\n'
-    return 0
-  fi
-  if [[ -n "$(git -C "$workdir" status --porcelain 2>/dev/null)" ]]; then
-    printf 'true\n'
-  else
-    printf 'false\n'
-  fi
+  status="$(git -C "$workdir" status --porcelain 2>/dev/null)" || { printf 'null\n'; return; }
+  [[ -n "$status" ]] && printf 'true\n' || printf 'false\n'
 }
 
-gjc_session_write_vanished_json() {
+
+gjc_session_write_public_marker() {
+  local path="${1:?marker path required}"
+  local kind="${2:?marker kind required}"
+  local session="${3:?session required}"
+  local generation="${4:?generation required}"
+  mkdir -p "$(dirname "$path")"
+  python3 - "$path" "$kind" "$session" "$generation" <<'PY'
+import json
+import os
+import sys
+path, kind, session, generation = sys.argv[1:]
+temporary = f"{path}.{os.getpid()}.tmp"
+with open(temporary, "x", encoding="utf-8") as handle:
+    json.dump({"schema_version": 1, "kind": kind, "session_id": session, "owner_generation": generation}, handle, separators=(",", ":"))
+    handle.write("\n")
+os.replace(temporary, path)
+PY
+}
+
+
+gjc_session_validate_raw_verdict() {
+  local verdict_path="${1:?verdict path required}"
+  local generation_path="${2:?generation path required}"
+  local session="${3:?session required}"
+  local generation="${4:?generation required}"
+  local server_key="${5:?server key required}"
+  local intent_path="${6:-$(dirname "$generation_path")/intent-$generation.json}"
+  python3 - "$verdict_path" "$generation_path" "$session" "$generation" "$server_key" "$intent_path" <<'PY'
+import datetime, json, re, sys
+verdict_path, generation_path, session, generation, server_key, intent_path = sys.argv[1:]
+canonical_utc = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$")
+def strict_utc(value):
+    if not isinstance(value, str) or not canonical_utc.fullmatch(value): raise ValueError("invalid UTC timestamp")
+    return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ" if "." in value else "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+try:
+    with open(verdict_path, encoding="utf-8") as handle: verdict = json.load(handle)
+    with open(generation_path, encoding="utf-8") as handle: current = json.load(handle)
+    required = {"schema_version", "generation", "session_id", "server_key", "observed_at", "signal", "exit_code", "result", "observer", "classification", "reason", "dedupe_key"}
+    if verdict.get("classification") == "expected_operator_shutdown": required.add("intent_id")
+    observed = strict_utc(verdict.get("observed_at"))
+    identity = (set(verdict) == required and verdict["schema_version"] == 1 and verdict["generation"] == generation
+        and verdict["session_id"] == session and verdict["server_key"] == server_key
+        and current.get("schema_version") == 1 and current.get("session_id") == session and current.get("generation") == generation
+        and isinstance(verdict["signal"], str) and verdict["exit_code"] is None
+        and isinstance(verdict["observer"], str) and isinstance(verdict["reason"], str) and bool(verdict["reason"])
+        and verdict["dedupe_key"] == f"owner-loss:{session}:{generation}")
+    unexpected = (verdict["classification"] == "unexpected_owner_loss"
+        and ((verdict["result"] == "owner_lost" and verdict["signal"] == "UNKNOWN")
+            or (verdict["result"] == "signal" and verdict["signal"] in {"SIGTERM", "SIGINT", "SIGHUP"})
+            or (verdict["result"] == "unknown_terminal" and verdict["signal"] in {"SIGTERM", "SIGINT", "SIGHUP", "UNKNOWN"}))
+        and verdict["observer"] in {"raw_monitor", "replacement_reconciler"})
+    expected = False
+    if verdict["classification"] == "expected_operator_shutdown":
+        consumed_intent_path = f"{intent_path}.consumed"
+        with open(consumed_intent_path, encoding="utf-8") as handle: intent = json.load(handle)
+        created = strict_utc(intent["created_at"])
+        expires = strict_utc(intent["expires_at"])
+        expected = (set(intent) == {"schema_version", "intent_id", "generation", "session_id", "server_key", "expected_terminal", "dispatch_id", "created_at", "expires_at", "state"}
+            and intent["schema_version"] == 1 and isinstance(intent["intent_id"], str) and bool(intent["intent_id"])
+            and intent["generation"] == generation and intent["session_id"] == session and intent["server_key"] == server_key
+            and intent["expected_terminal"] == {"signal": "SIGTERM", "result": "owner_term_then_session_cleanup"}
+            and isinstance(intent["dispatch_id"], str) and bool(intent["dispatch_id"]) and intent["state"] == "pending"
+            and created <= observed < expires and verdict["signal"] == "SIGTERM" and verdict["result"] == "owner_term_then_session_cleanup"
+            and verdict["observer"] == "raw_monitor" and verdict["intent_id"] == intent["intent_id"])
+    raise SystemExit(0 if identity and (unexpected or expected) else 1)
+except (KeyError, OSError, TypeError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+ gjc_session_publish_current_alias() {
+  local canonical_path="${1:?canonical path required}"
+  local alias_path="${2:?alias path required}"
+  local generation_path="${3:?generation path required}"
+  local session="${4:?session required}"
+  local generation="${5:?generation required}"
+  local kind="${6:-}"
+  local transition_lock="${generation_path%.json}.transition.lock"
+  if [[ "${GJC_SESSION_TRANSITION_LOCK_HELD:-0}" != 1 ]]; then
+    exec {gjc_alias_lock_fd}>"$transition_lock"
+    flock -x "$gjc_alias_lock_fd"
+  fi
+  python3 - "$canonical_path" "$alias_path" "$generation_path" "$session" "$generation" "$kind" <<'PY'
+import json
+import os
+import sqlite3
+import sys
+canonical_path, alias_path, generation_path, session, generation, kind = sys.argv[1:]
+lock_path = os.path.join(os.path.dirname(generation_path), "owner-locks.sqlite")
+database = sqlite3.connect(lock_path, timeout=7)
+temporary = f"{alias_path}.{os.getpid()}.tmp"
+try:
+    os.chmod(lock_path, 0o600)
+    database.execute("BEGIN IMMEDIATE")
+    with open(canonical_path, encoding="utf-8") as handle: record = json.load(handle)
+    with open(generation_path, encoding="utf-8") as handle: current = json.load(handle)
+    record_generation = record.get("owner_generation", record.get("generation"))
+    valid = (record.get("schema_version") == 1 and record.get("session_id") == session and record_generation == generation and (not kind or record.get("kind") in (None, kind)) and current.get("schema_version") == 1 and current.get("session_id") == session and current.get("generation") == generation)
+    if not valid: raise ValueError("invalid canonical identity")
+    if kind == "owner_incident" and (record.get("classification") != "unexpected_owner_loss" or record.get("dedupe_key") != f"owner-loss:{session}:{generation}"): raise ValueError("invalid incident canonical")
+    alias = dict(record); alias["owner_generation"] = generation
+    if kind: alias["kind"] = kind
+    if kind == "owner_incident": alias["incident_dedupe"] = f"{session}:{generation}"
+    with open(temporary, "x", encoding="utf-8") as handle:
+        json.dump(alias, handle, separators=(",", ":")); handle.write("\n")
+    os.replace(temporary, alias_path)
+    database.commit()
+except Exception:
+    database.rollback()
+    try: os.unlink(temporary)
+    except FileNotFoundError: pass
+    raise
+finally:
+    database.close()
+PY
+  local rc=$?
+  if [[ "${GJC_SESSION_TRANSITION_LOCK_HELD:-0}" != 1 ]]; then
+    flock -u "$gjc_alias_lock_fd"
+    eval "exec ${gjc_alias_lock_fd}>&-"
+  fi
+  return "$rc"
+}
+
+ gjc_session_write_vanished_json() {
   local vanished_json="${1:?vanished json path required}"
   local session="${2:?session required}"
   local workdir="${3:?workdir required}"
@@ -32,119 +147,39 @@ gjc_session_write_vanished_json() {
   local severity="${6:-failure}"
   local prompt_accepted="${7:-false}"
   local final_present="${8:-false}"
-  local tui_ready="${9:-false}"
-  local pane_log="${10:-}"
-  local events_log="${11:-}"
-  local final_json="${12:-}"
-  local runtime_state="${13:-}"
-  local prompt_accepted_json="${14:-}"
-  local detected_at
-  detected_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local generation="${9:?generation required}"
   mkdir -p "$(dirname "$vanished_json")"
-  python3 - "$vanished_json" "$session" "$detected_at" "$workdir" "$reason" "$phase" "$severity" "$prompt_accepted" "$final_present" "$tui_ready" "$pane_log" "$events_log" "$final_json" "$runtime_state" "$prompt_accepted_json" <<'PY'
+  python3 - "$vanished_json" "$session" "$workdir" "$reason" "$phase" "$severity" "$prompt_accepted" "$final_present" "$generation" <<'PY'
 import json
 import os
 import sys
-
-(
-    path,
-    session,
-    detected_at,
-    workdir,
-    reason,
-    phase,
-    severity,
-    prompt_accepted,
-    final_present,
-    tui_ready,
-    pane_log,
-    events_log,
-    final_json,
-    runtime_state,
-    prompt_accepted_json,
-) = sys.argv[1:]
-
-
-def rel_to_workdir(value):
-    if not value:
-        return None
-    try:
-        return os.path.relpath(value, workdir)
-    except ValueError:
-        return None
-
-runtime_terminal_state = None
-runtime_terminal_source = None
-if runtime_state:
-    try:
-        with open(runtime_state, encoding="utf-8") as runtime_handle:
-            runtime_data = json.load(runtime_handle)
-        state = runtime_data.get("state")
-        session_id = runtime_data.get("session_id")
-        cwd = runtime_data.get("cwd") or runtime_data.get("workdir")
-        final_response = runtime_data.get("final_response") if isinstance(runtime_data.get("final_response"), dict) else {}
-        session_matches = not session_id or session_id == session
-        cwd_matches = not cwd or os.path.abspath(str(cwd)) == os.path.abspath(workdir)
-        if state in {"completed", "errored"} and session_matches and cwd_matches:
-            runtime_terminal_state = state
-            runtime_terminal_source = final_response.get("source") or runtime_data.get("source") or "runtime_state"
-    except Exception:
-        pass
-current_dirty_raw = "null"
-try:
-    import subprocess
-    probe = subprocess.run(["git", "-C", workdir, "status", "--porcelain"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
-    if probe.returncode == 0:
-        current_dirty_raw = "true" if probe.stdout else "false"
-except Exception:
-    pass
-baseline_dirty = None
-try:
-    if prompt_accepted_json:
-        with open(prompt_accepted_json, encoding="utf-8") as prompt_handle:
-            value = json.load(prompt_handle).get("worktreeBaselineDirty")
-        if isinstance(value, bool):
-            baseline_dirty = value
-except Exception:
-    pass
-if baseline_dirty is None:
-    try:
-        metadata_path = os.path.join(os.path.dirname(path), "metadata.json")
-        with open(metadata_path, encoding="utf-8") as metadata_handle:
-            value = json.load(metadata_handle).get("worktreeBaselineDirty")
-        if isinstance(value, bool):
-            baseline_dirty = value
-    except Exception:
-        pass
-current_dirty = None if current_dirty_raw == "null" else current_dirty_raw == "true"
-changed_since_baseline = baseline_dirty is False and current_dirty is True
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(
-        {
-            "session": session,
-            "detectedAt": detected_at,
-            "phase": phase,
-            "reason": reason,
-            "severity": severity,
-            "promptAccepted": prompt_accepted == "true",
-            "finalPresent": final_present == "true",
-            "tuiReadyObserved": tui_ready == "true",
-            "statePath": rel_to_workdir(os.path.dirname(path)),
-            "paneLog": rel_to_workdir(pane_log),
-            "eventsLog": rel_to_workdir(events_log),
-            "finalStatus": rel_to_workdir(final_json),
-            "runtimeState": rel_to_workdir(runtime_state),
-            "promptAcceptedStatus": rel_to_workdir(prompt_accepted_json),
-            "runtimeTerminal": runtime_terminal_state in {"completed", "errored"},
-            "runtimeTerminalState": runtime_terminal_state,
-            "runtimeTerminalSource": runtime_terminal_source,
-            "worktreeBaselineDirty": baseline_dirty,
-            "observedRecoverableWorktreeChanges": current_dirty is True,
-            "worktreeChangedSinceBaseline": changed_since_baseline,
-        },
-        handle,
-        indent=2,
-    )
+path, session, workdir, reason, phase, severity, prompt_accepted, final_present, generation = sys.argv[1:]
+temporary = f"{path}.{os.getpid()}.tmp"
+with open(temporary, "x", encoding="utf-8") as handle:
+    json.dump({
+        "schema_version": 1,
+        "session_id": session,
+        "owner_generation": generation,
+        "generation": generation,
+        "dedupe_key": f"owner-loss:{session}:{generation}",
+        "state_path": os.path.relpath(os.path.dirname(path), workdir),
+        "phase": phase,
+        "reason": reason,
+        "severity": severity,
+        "prompt_accepted": prompt_accepted == "true",
+        "final_present": final_present == "true",
+    }, handle, separators=(",", ":"))
     handle.write("\n")
+try:
+    os.link(temporary, path)
+except FileExistsError:
+    with open(path, encoding="utf-8") as handle:
+        existing = json.load(handle)
+    with open(temporary, encoding="utf-8") as handle:
+        candidate = json.load(handle)
+    if existing != candidate:
+        raise
+finally:
+    os.unlink(temporary)
 PY
 }

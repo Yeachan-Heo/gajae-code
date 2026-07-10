@@ -11,6 +11,7 @@
 - Preserved explicit Telegram forum-topic renames as durable user-owned names, immediately re-asserting delayed edits while retaining restart and rename-race recovery (#1910).
 - `gjc resume` now aliases value-less `--resume`, requests confirmation before opening and continues a resumable tail once only; terminal tails open idle, and headless bare resume exits with explicit `--resume <id>` guidance (#1973).
 - Telegram answers to interactive and unattended `ask` prompts now receive a semantic, origin-bound `Selected!` acknowledgement before workflow continuation, with typed multi-select controls, no acknowledgement for toggles/clarifications/skips, at-most-once delivery attempts, and truthful failure/unknown outcomes (#1974).
+- Isolated unsafe Linux/systemd tmux owners into independently proven user scopes before server creation, added generation-bound exact-SIGTERM shutdown verdicts and deduplicated incident/recovery provenance, and removed pane payloads from raw session lifecycle evidence (#1938).
 
 ## [0.9.6] - 2026-07-10
 ### Changed
