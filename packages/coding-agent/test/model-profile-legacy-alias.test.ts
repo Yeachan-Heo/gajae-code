@@ -153,4 +153,29 @@ describe("legacy model profile aliases", () => {
 		expect(prepared.profileName).toBe("codex-standard");
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
 	});
+
+	test("resolves an archived exact codex-standard before the retired-name alias", async () => {
+		const archivedCodexStandard: ModelProfileDefinition = {
+			name: "codex-standard",
+			requiredProviders: ["openai-codex"],
+			modelMapping: { default: "openai-codex/gpt-5.5:xhigh" },
+			source: "user",
+		};
+		const activeRegistry = fakeRegistry();
+		const archivedRegistry = {
+			...activeRegistry,
+			getModelProfileForReference: (name: string) =>
+				name === "codex-standard" ? archivedCodexStandard : activeRegistry.getModelProfile(name),
+		};
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: archivedRegistry,
+			settings: Settings.isolated(),
+			profileName: "codex-standard",
+		});
+
+		expect(prepared.profileName).toBe("codex-standard");
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+	});
 });

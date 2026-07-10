@@ -101,6 +101,9 @@ function createControllerContext(
 		showHookConfirm: vi.fn(async () => options.confirm ?? false),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
+		statusLine: { invalidate: vi.fn() },
+		updateEditorBorderColor: vi.fn(),
+		notifyConfigChanged: vi.fn(async () => {}),
 	};
 	return { ctx, settings, session, setCalls };
 }
@@ -128,6 +131,7 @@ describe("login preset recommendation", () => {
 		expect(session.setActiveModelProfile).toHaveBeenCalledWith("codex-medium");
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(setCalls).not.toContainEqual({ path: "modelProfile.default", value: "codex-medium" });
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
 	});
 
 	test("declining the post-login recommendation performs no mutation", async () => {
@@ -151,13 +155,13 @@ describe("login preset recommendation", () => {
 		expect(session.setModelTemporaryCalls).toEqual([]);
 	});
 
-	test("login with default profile setting shows hint instead of prompting", async () => {
+	test("configured startup profile does not mask an explicitly detached session", async () => {
 		const { ctx, session } = createControllerContext({ defaultProfile: "codex-eco" });
 
 		await login(ctx, "openai-codex");
 
-		expect(ctx.showHookConfirm).not.toHaveBeenCalled();
-		expect(ctx.showStatus).toHaveBeenCalledWith("Preset codex-medium is available in /model.");
+		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply codex-medium now?", "");
+		expect(ctx.showStatus).not.toHaveBeenCalledWith("Preset codex-medium is available in /model.");
 		expect(session.setModelTemporaryCalls).toEqual([]);
 	});
 

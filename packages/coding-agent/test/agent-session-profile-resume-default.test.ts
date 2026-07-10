@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import {
 	applyPreparedModelProfileActivation,
@@ -98,6 +98,50 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		expect(session.model?.provider).toBe("anthropic");
 		expect(session.model?.id).toBe("claude-opus-4-8");
 		// Resume still restores the explicit base default, not the transient model.
+		expect(session.sessionManager.buildSessionContext().models.default).toBe("openai-codex/gpt-5.5");
+	});
+
+	it("stages settings model changes without durable history until commit", async () => {
+		const { base, profileMain } = resolveModels();
+		session = makeSession(base);
+		await session.setModel(base);
+		const entriesBefore = session.sessionManager.getEntries().length;
+		const thinkingBefore = session.thinkingLevel;
+
+		await session.setModelForSettingsCommit(profileMain);
+		expect(session.model?.id).toBe("gpt-5.5");
+		expect(session.sessionManager.getEntries()).toHaveLength(entriesBefore);
+
+		session.cancelSettingsModelChange();
+		expect(session.model?.id).toBe("gpt-5.5");
+		expect(session.thinkingLevel).toBe(thinkingBefore);
+		expect(session.sessionManager.getEntries()).toHaveLength(entriesBefore);
+		expect(session.sessionManager.buildSessionContext().models.default).toBe("openai-codex/gpt-5.5");
+
+		await session.setModelForSettingsCommit(profileMain, ThinkingLevel.High);
+		await session.commitSettingsModelChange(profileMain);
+		expect(session.model?.id).toBe("claude-opus-4-8");
+		expect(session.sessionManager.getEntries()).toHaveLength(entriesBefore + 1);
+		expect(session.sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-opus-4-8");
+		expect(session.sessionManager.buildSessionContext().thinkingLevel).toBe(ThinkingLevel.High);
+	});
+	it("leaves runtime and history unchanged when session-history commit fails", async () => {
+		const { base, profileMain } = resolveModels();
+		session = makeSession(base);
+		await session.setModel(base);
+		const entriesBefore = session.sessionManager.getEntries().length;
+		const appendSpy = spyOn(session.sessionManager, "appendModelChange").mockImplementation(() => {
+			throw new Error("forced session history failure");
+		});
+		try {
+			await session.setModelForSettingsCommit(profileMain);
+			await expect(session.commitSettingsModelChange(profileMain)).rejects.toThrow("forced session history failure");
+		} finally {
+			appendSpy.mockRestore();
+		}
+
+		expect(session.model?.id).toBe("gpt-5.5");
+		expect(session.sessionManager.getEntries()).toHaveLength(entriesBefore);
 		expect(session.sessionManager.buildSessionContext().models.default).toBe("openai-codex/gpt-5.5");
 	});
 

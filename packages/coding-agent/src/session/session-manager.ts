@@ -154,7 +154,7 @@ export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 
 export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
-	/** Model in "provider/modelId" format */
+	/** Model in "provider/modelId" format. */
 	model: string;
 	/** Role: "default" or an agent role. Undefined treated as "default" */
 	role?: string;
@@ -653,6 +653,16 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
  * If leafId is provided, walks from that entry to root.
  * Handles compaction and branch summaries along the path.
  */
+export function hasPersistedThinkingLevel(entries: readonly SessionEntry[]): boolean {
+	return entries.some(
+		entry =>
+			entry.type === "thinking_level_change" ||
+			(entry.type === "model_change" &&
+				(entry.role ?? "default") === "default" &&
+				entry.thinkingLevel !== undefined),
+	);
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -745,12 +755,14 @@ export function buildSessionContext(
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel ?? "off";
 		} else if (entry.type === "model_change") {
-			// New format: { model: "provider/id", role?: string }
 			if (entry.model) {
 				const role = entry.role ?? "default";
 				models[role] = entry.model;
 				if (role === "default") {
 					hasExplicitDefaultModel = true;
+					if (entry.thinkingLevel !== undefined) {
+						thinkingLevel = entry.thinkingLevel ?? "off";
+					}
 				}
 			}
 		} else if (entry.type === "service_tier_change") {
@@ -2977,6 +2989,7 @@ export class SessionManager {
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
+	#activeCloseOperations = 0;
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
 	// When set, take precedence over the lazily-derived per-session manager.
@@ -3811,14 +3824,25 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
-		await this.#queuePersistTask(async () => {
-			if (this.#persistWriter) {
-				await this.#closePersistWriterInternal();
-				this.#flushed = true;
-			}
-		});
-		this.#disposeResidentTextBlobStore();
-		if (this.#persistError) throw this.#persistError;
+		this.#activeCloseOperations++;
+		try {
+			await this.#queuePersistTask(async () => {
+				if (this.#persistWriter) {
+					await this.#closePersistWriterInternal();
+					this.#flushed = true;
+				}
+			});
+			const materializedEntries = materializeResidentEntriesForReadSync(
+				this.#fileEntries,
+				this.#residentBlobStores(),
+			);
+			this.#disposeResidentTextBlobStore();
+			this.#fileEntries = materializedEntries;
+			this.#buildIndex();
+			if (this.#persistError) throw this.#persistError;
+		} finally {
+			this.#activeCloseOperations--;
+		}
 	}
 
 	getCwd(): string {
@@ -4096,15 +4120,31 @@ export class SessionManager {
 	}
 
 	#appendEntry(entry: SessionEntry): void {
+		if (this.#activeCloseOperations > 0) throw new Error("Session manager close is in progress");
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
 		const residentEntry = prepareEntryForResidentSync(normalizedEntry, this.#residentBlobStores()) as SessionEntry;
+		const previousLeafId = this.#leafId;
+		const previousEntryRevision = this.#entryRevision;
+		const previousLeafRevision = this.#leafRevision;
+		const previousLabelRevision = this.#labelRevision;
 		this.#fileEntries.push(residentEntry);
 		this.#byId.set(residentEntry.id, residentEntry);
 		this.#leafId = residentEntry.id;
 		this.#bumpEntryRevision();
 		this.#leafRevision++;
 		if (entry.type === "label") this.#labelRevision++;
-		this._persist(residentEntry);
+		try {
+			this._persist(residentEntry);
+		} catch (error) {
+			this.#fileEntries.pop();
+			this.#byId.delete(residentEntry.id);
+			this.#leafId = previousLeafId;
+			this.#entryRevision = previousEntryRevision;
+			this.#leafRevision = previousLeafRevision;
+			this.#labelRevision = previousLabelRevision;
+			this.#resetMaterializedCaches();
+			throw error;
+		}
 		if (entry.type === "message" && entry.message.role === "assistant") {
 			const usage = entry.message.usage;
 			this.#usageStatistics.input += usage.input;

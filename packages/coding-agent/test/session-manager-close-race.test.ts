@@ -203,15 +203,15 @@ describe("SessionManager close/appendMessage race", () => {
 		}
 		expect(storage.hasPendingClose()).toBe(true);
 
-		// Synchronous append in the yield window — must not record a
-		// persistError. Pre-fix this stashes Error("Writer closed").
+		// Synchronous append in the yield window is rejected before resident
+		// state or the closing writer can be touched.
 		expect(() => {
 			sm.appendMessage({
 				role: "user",
 				content: "during-close",
 				timestamp: Date.now(),
 			});
-		}).not.toThrow();
+		}).toThrow("Session manager close is in progress");
 
 		// Drain everything.
 		await settle(closePromise, storage);

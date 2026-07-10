@@ -325,6 +325,7 @@ export class ModelSelectorComponent extends Container {
 	#selectedActionIndex: number = 0;
 	#pendingThinkingChoice?: PendingThinkingChoice;
 	#selectedThinkingIndex: number = 0;
+	#selectionPending = false;
 
 	// Preset landing state
 	#viewMode: ModelSelectorViewMode = "presets";
@@ -467,10 +468,16 @@ export class ModelSelectorComponent extends Container {
 				modelRegistry: this.#modelRegistry,
 			});
 			if (resolved.model) {
+				const usesLiveDefaultEffort =
+					role === "default" &&
+					!resolved.explicitThinkingLevel &&
+					this.#currentModel?.provider === resolved.model.provider &&
+					this.#currentModel.id === resolved.model.id;
 				this.#roles[role] = {
 					model: resolved.model,
-					thinkingLevel:
-						resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined
+					thinkingLevel: usesLiveDefaultEffort
+						? (this.#currentThinkingLevel ?? ThinkingLevel.Inherit)
+						: resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined
 							? resolved.thinkingLevel
 							: ThinkingLevel.Inherit,
 				};
@@ -492,7 +499,11 @@ export class ModelSelectorComponent extends Container {
 		if ("activeModelProfile" in options) this.#activeModelProfile = options.activeModelProfile;
 		this.#roles = {};
 		this.#loadRoleModels();
-		this.#applyTabFilter();
+		if (this.#viewMode === "presets") {
+			this.#renderPresetLanding();
+		} else {
+			this.#applyTabFilter();
+		}
 	}
 
 	#sortModels(models: ModelItem[]): void {
@@ -855,14 +866,15 @@ export class ModelSelectorComponent extends Container {
 
 	#buildCustomModelProfileSnapshot(): ModelProfileConfig {
 		const modelMapping: ModelProfileConfig["model_mapping"] = {};
+		const configuredDefaultSelector = this.#resolveProfileModelSelector(this.#settings.getModelRole("default"));
+		const activeProfileDefaultSelector = this.#activeModelProfile
+			? this.#resolveProfileModelSelector(this.#getProfileByName(this.#activeModelProfile)?.modelMapping.default)
+			: undefined;
 		const currentModelSelector = this.#formatCurrentModelSelector();
-		if (currentModelSelector) {
-			modelMapping.default = currentModelSelector;
-		} else {
-			const defaultRole = this.#settings.getModelRole("default");
-			const defaultSelector = this.#resolveProfileModelSelector(defaultRole);
-			if (defaultSelector) modelMapping.default = defaultSelector;
-		}
+		const defaultSelector = this.#activeModelProfile
+			? (activeProfileDefaultSelector ?? configuredDefaultSelector ?? currentModelSelector)
+			: (configuredDefaultSelector ?? currentModelSelector);
+		if (defaultSelector) modelMapping.default = defaultSelector;
 
 		const agentOverrides = this.#settings.get("task.agentModelOverrides");
 		for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
@@ -1410,7 +1422,42 @@ export class ModelSelectorComponent extends Container {
 			: this.#filteredModels[this.#selectedIndex];
 	}
 
+	#handleSelectionFailure(error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		this.#roles = {};
+		this.#loadRoleModels();
+		if (this.#viewMode === "presets") {
+			this.#presetLoginHint = message;
+			this.#renderPresetLanding();
+		} else {
+			this.#errorMessage = message;
+			this.#applyTabFilter();
+		}
+		this.#tui.requestRender();
+	}
+
+	#dispatchSelection(selection: ModelSelectorSelection): void | Promise<void> {
+		if (this.#selectionPending) return;
+		this.#selectionPending = true;
+		try {
+			const result = this.#onSelectCallback(selection);
+			if (result && typeof result.then === "function") {
+				return result
+					.catch(error => {
+						this.#handleSelectionFailure(error);
+					})
+					.finally(() => {
+						this.#selectionPending = false;
+					});
+			}
+		} catch (error) {
+			this.#handleSelectionFailure(error);
+		}
+		this.#selectionPending = false;
+	}
+
 	handleInput(keyData: string): void {
+		if (this.#selectionPending) return;
 		if (this.#pendingThinkingChoice) {
 			this.#handleThinkingMenuInput(keyData);
 			return;
@@ -1549,11 +1596,11 @@ export class ModelSelectorComponent extends Container {
 			const profile = this.#getProfileByName(this.#previewProfileName);
 			if (!profile) return;
 			if (this.#presetScopeIndex === 2 && isCustomUserProfile(profile)) {
-				this.#onSelectCallback({ kind: "renameProfile", profileName: this.#previewProfileName });
+				void this.#dispatchSelection({ kind: "renameProfile", profileName: this.#previewProfileName });
 				return;
 			}
 			if (this.#presetScopeIndex === 3 && isCustomUserProfile(profile)) {
-				this.#onSelectCallback({ kind: "deleteProfile", profileName: this.#previewProfileName });
+				void this.#dispatchSelection({ kind: "deleteProfile", profileName: this.#previewProfileName });
 				return;
 			}
 			const missing = this.#getMissingProviders(profile);
@@ -1562,7 +1609,7 @@ export class ModelSelectorComponent extends Container {
 				this.#renderPresetLanding();
 				return;
 			}
-			this.#onSelectCallback({
+			void this.#dispatchSelection({
 				kind: "profile",
 				profileName: this.#previewProfileName,
 				setDefault: this.#presetScopeIndex === 1,
@@ -1578,7 +1625,7 @@ export class ModelSelectorComponent extends Container {
 		const row = this.#getSelectedPresetRow();
 		if (!row) return;
 		if (row.kind === "create") {
-			this.#onSelectCallback({ kind: "createProfile", profile: this.#buildCustomModelProfileSnapshot() });
+			void this.#dispatchSelection({ kind: "createProfile", profile: this.#buildCustomModelProfileSnapshot() });
 			return;
 		}
 		if (row.kind === "alreadySaved" || row.kind === "createUnavailable") {
@@ -1758,7 +1805,7 @@ export class ModelSelectorComponent extends Container {
 
 		// For temporary role, don't save to settings - just notify caller
 		if (role === null) {
-			this.#onSelectCallback({
+			void this.#dispatchSelection({
 				kind: "assignment",
 				model: item.model,
 				role: null,
@@ -1781,7 +1828,7 @@ export class ModelSelectorComponent extends Container {
 		}
 
 		// Notify caller (for updating agent state if needed)
-		this.#onSelectCallback({
+		void this.#dispatchSelection({
 			kind: "assignment",
 			model: item.model,
 			role,
@@ -1798,15 +1845,15 @@ export class ModelSelectorComponent extends Container {
 		return this.#searchInput;
 	}
 	async __testSelectProfile(profileName: string, setDefault: boolean): Promise<void> {
-		await this.#onSelectCallback({ kind: "profile", profileName, setDefault });
+		await this.#dispatchSelection({ kind: "profile", profileName, setDefault });
 	}
 	async __testSelectAssignment(
 		selection: Omit<Extract<ModelSelectorSelection, { kind: "assignment" }>, "kind">,
 	): Promise<void> {
-		await this.#onSelectCallback({ kind: "assignment", ...selection });
+		await this.#dispatchSelection({ kind: "assignment", ...selection });
 	}
 	async __testSelectPresetAction(profileName: string, action: "rename" | "delete"): Promise<void> {
-		await this.#onSelectCallback({
+		await this.#dispatchSelection({
 			kind: action === "rename" ? "renameProfile" : "deleteProfile",
 			profileName,
 		});
@@ -1824,7 +1871,7 @@ function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTa
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {
-	const levels: ThinkingLevel[] = [ThinkingLevel.Off];
+	const levels: ThinkingLevel[] = [ThinkingLevel.Inherit, ThinkingLevel.Off];
 	let efforts: readonly string[];
 	try {
 		efforts = getSupportedEfforts(model);

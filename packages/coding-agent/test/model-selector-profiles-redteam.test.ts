@@ -87,7 +87,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		"modelProfile.default": "old-profile",
 	});
 	const flush = vi.fn(async () => {});
-	settings.flush = flush as typeof settings.flush;
+	settings.flushOrThrow = flush as typeof settings.flushOrThrow;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
@@ -199,6 +199,24 @@ describe("model selector profile red-team", () => {
 		]);
 	});
 
+	test("async model selections ignore overlapping dispatches until the first settles", async () => {
+		const selections: ModelSelectorSelection[] = [];
+		const { promise: pendingSelection, resolve: releaseSelection } = Promise.withResolvers<void>();
+		const selector = createSelector(async selection => {
+			selections.push(selection);
+			await pendingSelection;
+		});
+		await renderSelector(selector);
+
+		const first = selector.__testSelectProfile("profile-a", false);
+		const overlapping = selector.__testSelectPresetAction("profile-a", "delete");
+
+		expect(selections).toEqual([{ kind: "profile", profileName: "profile-a", setDefault: false }]);
+		releaseSelection();
+		await Promise.all([first, overlapping]);
+		expect(selections).toHaveLength(1);
+	});
+
 	test("controller persists only Set as default and leaves Apply for this session non-default", async () => {
 		const sessionOnly = createControllerContext();
 		await selectProfileThroughController(new SelectorController(sessionOnly.ctx as never), false);
@@ -278,7 +296,7 @@ describe("model selector profile red-team", () => {
 	});
 });
 
-test("delete action restores the profile when post-delete notification fails", async () => {
+test("delete action remains committed when post-delete notification fails", async () => {
 	const profiles = new Map<string, ModelProfileDefinition>([[userProfile.name, { ...userProfile }]]);
 	const deletedConfigs: Record<string, { required_providers: string[]; model_mapping: Record<string, string> }> = {};
 	const registry = {
@@ -310,7 +328,7 @@ test("delete action restores the profile when post-delete notification fails", a
 		),
 		refresh: vi.fn(async () => {}),
 	};
-	const settings = Settings.isolated({ "modelProfile.default": "unrelated" });
+	const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
 	const ctx = {
 		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
 		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
@@ -322,7 +340,6 @@ test("delete action restores the profile when post-delete notification fails", a
 			sessionId: "session-1",
 			scopedModels: [],
 			modelRegistry: registry,
-			getActiveModelProfile: () => undefined,
 			isFastForProvider: () => false,
 			isFastForSubagentProvider: () => false,
 			isFastModeActive: () => false,
@@ -343,7 +360,14 @@ test("delete action restores the profile when post-delete notification fails", a
 	await selector.__testSelectPresetAction("profile-a", "delete");
 
 	expect(registry.deleteCustomModelProfile).toHaveBeenCalledWith("profile-a");
-	expect(registry.saveCustomModelProfile).toHaveBeenCalledWith("profile-a", deletedConfigs["profile-a"]);
-	expect(profiles.has("profile-a")).toBe(true);
-	expect(ctx.showError).toHaveBeenCalledWith("Preset delete failed: notify failed");
+	expect(registry.saveCustomModelProfile).not.toHaveBeenCalled();
+	expect(profiles.has("profile-a")).toBe(false);
+	expect(ctx.showStatus).toHaveBeenCalledWith("Custom model preset deleted: Profile Alpha");
+	expect(ctx.showError).toHaveBeenCalledWith(
+		"Configuration was updated, but change notification failed: notify failed",
+	);
+	expect(settings.get("modelProfile.default")).toBeUndefined();
+	expect(settings.getRuntimeOverride("modelProfile.default")).toBeUndefined();
+	expect(settings.get("modelRoles")).toEqual({ default: "provider-a/default:high" });
+	expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/alternate" });
 });
