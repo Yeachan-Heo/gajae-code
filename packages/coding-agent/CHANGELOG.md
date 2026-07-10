@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Fixed Coordinator MCP prompt delivery failing with `runtime_prompt_ack_timeout` on driven tmux sessions (`start_session`, `send_prompt`, and every `delegate_*`). The autocomplete-dismiss `Escape` added in #1480 and the submit `Enter` were sent as back-to-back `send-keys`, so the driven session's terminal (`escape-time 0`) coalesced them into a single `ESC`+`CR` = `Alt+Enter` (a newline); the prompt piled up unsubmitted in the composer and the runtime never emitted `turn_start`. A brief settle delay between the two keystrokes lets the standalone `Escape` land first, restoring submission. Reproduces independently of the host tmux config (`tmux -f /dev/null`).
 
 ## [0.9.6] - 2026-07-10
 ### Changed

@@ -1310,6 +1310,12 @@ async function runCommand(command: string[]): Promise<{ exitCode: number; stdout
 
 type CommandRunner = (command: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
 
+// Gap between the autocomplete-dismiss Escape and the submit Enter. Sent back-to-back
+// they are coalesced by the driven session's terminal (escape-time 0) into a single
+// ESC+CR = Alt+Enter (a newline), so the prompt never submits — a regression of the
+// #1480 autocomplete-dismiss fix. A brief pause lets the standalone Escape settle first.
+const SUBMIT_KEY_ESCAPE_SETTLE_MS = 120;
+
 async function sendTmuxPromptKeys(
 	target: string,
 	prompt: string,
@@ -1329,6 +1335,9 @@ async function sendTmuxPromptKeys(
 	// prompt instead of selecting the highlighted completion.
 	const dismissedAutocomplete = await runner(["tmux", "send-keys", "-t", target, "Escape"]);
 	if (dismissedAutocomplete.exitCode !== 0) return false;
+	// Let the standalone Escape land before Enter so the terminal does not read the pair
+	// as ESC+CR (Alt+Enter). See SUBMIT_KEY_ESCAPE_SETTLE_MS.
+	await new Promise(resolve => setTimeout(resolve, SUBMIT_KEY_ESCAPE_SETTLE_MS));
 	const submitted = await runner(["tmux", "send-keys", "-t", target, "Enter"]);
 	return submitted.exitCode === 0;
 }
