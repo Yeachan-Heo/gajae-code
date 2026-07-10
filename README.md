@@ -253,7 +253,7 @@ retry:
 
 ### Launch-time updates
 
-Interactive startup checks the npm registry for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch. Use `gjc update` explicitly when you want to install an update.
+Interactive startup checks the npm registry for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch. For a recognized Bun global install, use `gjc update` or `bun install -g @gajae-code/coding-agent@latest`. For a recognized Windows npm install, use `gjc update` or the original npm package workflow. For a supported standalone binary installed by the bundled installer, use `gjc update` or rerun the documented platform installer. For a source checkout or `dev:link` executable, update, pull, build, and link through that checkout's original workflow. For unrecognized npm, pnpm, other package-manager installs, or unknown PATH targets, use the original package manager or install method.
 
 Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Registry or network failures are ignored so they do not block startup.
 

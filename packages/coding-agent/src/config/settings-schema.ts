@@ -1225,7 +1225,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Check for Updates",
 			description:
-				"Check for newer versions at interactive startup and show a notification. Startup never installs updates; run `gjc update` explicitly. If false, skip the check.",
+				"At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
 		},
 	},
 

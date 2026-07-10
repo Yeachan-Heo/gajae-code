@@ -20,6 +20,14 @@ const CODING_AGENT_TEST_SHARDS = 8;
 // Declared here (before the top-level `await main()`) so it is initialized for
 // every CLI mode despite top-level await halting later module statements.
 const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-linux-x64"]);
+
+// Behavioral-owner tests cover entrypoint contracts whose names intentionally do
+// not follow the source-file basename convention. They supplement, rather than
+// replace, direct-basename test selection and owner fallback tasks.
+const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
+	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+};
+
 export interface PackageManifest {
 	name?: string;
 	scripts?: Record<string, string>;
@@ -572,10 +580,13 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 
 
 		const mappedTests = mappedTestsFor(changedPath, packages, testFiles);
+		for (const testFile of mappedTests) {
+			addTestFileTask(tasks, testFile);
+		}
+		for (const testFile of behavioralTestsFor(changedPath)) {
+			addTestFileTask(tasks, testFile);
+		}
 		if (mappedTests.length > 0) {
-			for (const testFile of mappedTests) {
-				addTestFileTask(tasks, testFile);
-			}
 			continue;
 		}
 
@@ -661,6 +672,13 @@ function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage
 	const owner = owningPackage(changedPath, packages);
 	const scopePrefix = owner ? `${owner.dir}/` : `${path.posix.dirname(changedPath)}/`;
 	return testFiles.filter(testFile => wanted.has(path.posix.basename(testFile)) && testFile.startsWith(scopePrefix));
+}
+
+// Resolve explicit behavioral-owner tests. Unlike mappedTestsFor(), these tests
+// are additive because an entrypoint's package-level check and smoke coverage
+// remain necessary even when it owns a dedicated contract test.
+function behavioralTestsFor(changedPath: string): readonly string[] {
+	return BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
 }
 
 function owningPackage(changedPath: string, packages: readonly WorkspacePackage[]): WorkspacePackage | undefined {

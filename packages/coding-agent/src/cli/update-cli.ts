@@ -45,7 +45,6 @@ export interface PackageManagerUpdateOptions {
 	expectedVersion: string;
 	runInstall: PackageManagerUpdateRunner;
 	verifyInstalledRuntime: (expectedVersion: string) => Promise<InstalledVersionVerification>;
-	printVerificationResult?: (expectedVersion: string) => Promise<void>;
 	printRecoveredVerification?: (expectedVersion: string) => void;
 }
 
@@ -122,8 +121,11 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
-type PackageManagerTarget = { manager: "npm"; packageName: string };
-type UpdateTarget = { method: "bun" } | { method: "npm"; packageName: string } | { method: "binary"; path: string };
+export type PackageManagerTarget = { manager: "npm"; packageName: string };
+export type UpdateTarget =
+	| { method: "bun" }
+	| { method: "npm"; packageName: string }
+	| { method: "binary"; path: string };
 
 type PathPlatform = NodeJS.Platform;
 type PackageExists = (packageName: string, packageRoot: string) => boolean;
@@ -423,19 +425,6 @@ export function formatVerificationFailureForTest(
 	return formatVerificationFailure(result, expectedVersion);
 }
 
-/**
- * Print post-update verification result.
- */
-async function printVerification(expectedVersion: string): Promise<void> {
-	const result = await verifyInstalledRuntime(expectedVersion);
-	if (result.ok) {
-		printSuccessfulVerification(expectedVersion);
-		return;
-	}
-	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
-	console.log(chalk.yellow(formatManualUpdateInstructions()));
-}
-
 async function unlinkIfExists(filePath: string): Promise<void> {
 	try {
 		await fs.promises.unlink(filePath);
@@ -499,6 +488,14 @@ function formatPackageManagerInstallFailure(
 	return `${managerName} install failed with exit code ${result.exitCode ?? "unknown"}${outputSuffix}. ${formatVerificationFailure(verification, expectedVersion)}`;
 }
 
+function formatPackageManagerVerificationFailure(
+	managerName: string,
+	verification: InstalledVersionVerification,
+	expectedVersion: string,
+): string {
+	return `${managerName} install exited successfully, but the selected ${APP_NAME} runtime failed verification: ${formatVerificationFailure(verification, expectedVersion)}`;
+}
+
 export async function runPackageManagerUpdateForTest(
 	options: PackageManagerUpdateOptions,
 ): Promise<InstalledVersionVerification> {
@@ -508,8 +505,14 @@ export async function runPackageManagerUpdateForTest(
 async function updateViaPackageManager(options: PackageManagerUpdateOptions): Promise<InstalledVersionVerification> {
 	const result = await options.runInstall(options.expectedVersion);
 	if (result.exitCode === 0) {
-		await (options.printVerificationResult ?? printVerification)(options.expectedVersion);
-		return await options.verifyInstalledRuntime(options.expectedVersion);
+		const verification = await options.verifyInstalledRuntime(options.expectedVersion);
+		if (!verification.ok) {
+			throw new Error(
+				formatPackageManagerVerificationFailure(options.managerName, verification, options.expectedVersion),
+			);
+		}
+		printSuccessfulVerification(options.expectedVersion);
+		return verification;
 	}
 
 	const verification = await options.verifyInstalledRuntime(options.expectedVersion);
@@ -661,16 +664,42 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 /**
  * Run the update command.
  */
-export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {
+export interface UpdateCommandDependencies {
+	getLatestRelease?: () => Promise<ReleaseInfo>;
+	resolveUpdateTarget?: () => Promise<UpdateTarget>;
+	performUpdate?: (target: UpdateTarget, expectedVersion: string) => Promise<void>;
+	refreshInstalledDefaultSkills?: () => Promise<void>;
+	exit?: (code: number) => never;
+}
+
+async function performUpdate(target: UpdateTarget, expectedVersion: string): Promise<void> {
+	if (target.method === "bun") {
+		await updateViaBun(expectedVersion);
+	} else if (target.method === "npm") {
+		await updateViaNpm(target.packageName, expectedVersion);
+	} else {
+		await updateViaBinaryAt(target.path, expectedVersion);
+	}
+}
+
+export async function runUpdateCommand(
+	opts: { force: boolean; check: boolean },
+	deps: UpdateCommandDependencies = {},
+): Promise<void> {
+	const lookupRelease = deps.getLatestRelease ?? getLatestRelease;
+	const resolveTarget = deps.resolveUpdateTarget ?? resolveUpdateTarget;
+	const update = deps.performUpdate ?? performUpdate;
+	const refreshDefaults = deps.refreshInstalledDefaultSkills ?? refreshInstalledDefaultSkills;
+	const exit = deps.exit ?? process.exit;
+
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 
-	// Check for updates
 	let release: ReleaseInfo;
 	try {
-		release = await getLatestRelease();
+		release = await lookupRelease();
 	} catch (err) {
 		console.error(chalk.red(`Failed to check for updates: ${err}`));
-		process.exit(1);
+		return exit(1);
 	}
 
 	const comparison = compareVersions(release.version, VERSION);
@@ -686,27 +715,17 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
 	}
 
-	if (opts.check) {
-		// Just check, don't install
-		return;
-	}
+	if (opts.check) return;
 
-	// Choose update method based on the prioritized gjc binary in PATH
 	try {
-		const target = await resolveUpdateTarget();
-		if (target.method === "bun") {
-			await updateViaBun(release.version);
-		} else if (target.method === "npm") {
-			await updateViaNpm(target.packageName, release.version);
-		} else {
-			await updateViaBinaryAt(target.path, release.version);
-		}
+		const target = await resolveTarget();
+		await update(target, release.version);
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
-		process.exit(1);
+		return exit(1);
 	}
 
-	await refreshInstalledDefaultSkills();
+	await refreshDefaults();
 }
 
 /**

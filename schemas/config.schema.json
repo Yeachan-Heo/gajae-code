@@ -844,7 +844,7 @@
 				},
 				"checkUpdate": {
 					"type": "boolean",
-					"description": "Check for newer versions at interactive startup and show a notification. Startup never installs updates; run `gjc update` explicitly. If false, skip the check.",
+					"description": "At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
 					"default": true
 				}
 			},

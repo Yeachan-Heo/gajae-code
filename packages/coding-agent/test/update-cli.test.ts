@@ -15,7 +15,9 @@ import {
 	resolveUpdateMethodForTest,
 	runBinaryUpdateFlow,
 	runPackageManagerUpdateForTest,
+	runUpdateCommand,
 } from "../src/cli/update-cli";
+import { initTheme } from "../src/modes/theme/theme";
 
 const tempDirs: string[] = [];
 const repoRoot = path.resolve(import.meta.dir, "../../..");
@@ -207,6 +209,60 @@ describe("update-cli package-manager verification", () => {
 		}
 	});
 
+	it("verifies a zero-exit install once and prints success and restart guidance once", async () => {
+		await initTheme();
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		let verificationCalls = 0;
+		try {
+			const result = await runPackageManagerUpdateForTest({
+				managerName: "bun",
+				expectedVersion: "0.7.8",
+				runInstall: async () => ({ exitCode: 0, text: () => "installed" }),
+				verifyInstalledRuntime: async expectedVersion => {
+					verificationCalls += 1;
+					return { ok: true, actual: expectedVersion, path: "/Users/test/.bun/bin/gjc" };
+				},
+			});
+
+			expect(result.ok).toBe(true);
+			expect(verificationCalls).toBe(1);
+			expect(output.filter(line => line.includes("Updated to 0.7.8"))).toHaveLength(1);
+			expect(output.filter(line => line.includes("Restart gjc to use the new version"))).toHaveLength(1);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("rejects a zero-exit stale install with verification-specific diagnostics and no success output", async () => {
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		let verificationCalls = 0;
+		try {
+			await expect(
+				runPackageManagerUpdateForTest({
+					managerName: "bun",
+					expectedVersion: "0.7.8",
+					runInstall: async () => ({ exitCode: 0, text: () => "installed" }),
+					verifyInstalledRuntime: async () => {
+						verificationCalls += 1;
+						return { ok: false, actual: "0.7.7", path: "/Users/test/.bun/bin/gjc" };
+					},
+				}),
+			).rejects.toThrow("bun install exited successfully, but the selected gjc runtime failed verification");
+			expect(verificationCalls).toBe(1);
+			expect(output.join("\n")).not.toContain("install failed with exit code 0");
+			expect(output.filter(line => line.includes("Updated to"))).toHaveLength(0);
+			expect(output.filter(line => line.includes("Restart gjc"))).toHaveLength(0);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
 	it("keeps package-manager nonzero failures hard when runtime verification does not prove the update landed", async () => {
 		await expect(
 			runPackageManagerUpdateForTest({
@@ -223,6 +279,127 @@ describe("update-cli package-manager verification", () => {
 				}),
 			}),
 		).rejects.toThrow("Fail extracting tarball");
+	});
+});
+
+describe("update-cli command verification failures", () => {
+	it("exits without refreshing defaults when a zero-exit install leaves a stale runtime", async () => {
+		const output: string[] = [];
+		const errors: string[] = [];
+		const exitCodes: number[] = [];
+		const sentinel = new Error("exit");
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => {
+			errors.push(String(message));
+		});
+		let verificationCalls = 0;
+		let refreshCalls = 0;
+		try {
+			await expect(
+				runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => ({ tag: "v999.0.0", version: "999.0.0" }),
+						resolveUpdateTarget: async () => ({ method: "bun" }),
+						performUpdate: async (_target, expectedVersion) => {
+							await runPackageManagerUpdateForTest({
+								managerName: "bun",
+								expectedVersion,
+								runInstall: async () => ({ exitCode: 0, text: () => "installed" }),
+								verifyInstalledRuntime: async () => {
+									verificationCalls += 1;
+									return { ok: false, actual: "0.0.1", path: "/test/gjc" };
+								},
+							});
+						},
+						refreshInstalledDefaultSkills: async () => {
+							refreshCalls += 1;
+						},
+						exit: code => {
+							exitCodes.push(code);
+							throw sentinel;
+						},
+					},
+				),
+			).rejects.toBe(sentinel);
+			expect(verificationCalls).toBe(1);
+			expect(exitCodes).toEqual([1]);
+			expect(refreshCalls).toBe(0);
+			expect(errors.join("\n")).toContain(
+				"install exited successfully, but the selected gjc runtime failed verification",
+			);
+			expect(errors.join("\n")).toContain("still reports 0.0.1 (expected 999.0.0)");
+			expect(errors.join("\n")).not.toContain("install failed with exit code 0");
+			expect(output.filter(line => line.includes("Updated to") || line.includes("Restart gjc"))).toHaveLength(0);
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("exits without refreshing defaults when a zero-exit install fails its smoke test", async () => {
+		const output: string[] = [];
+		const errors: string[] = [];
+		const exitCodes: number[] = [];
+		const sentinel = new Error("exit");
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => {
+			errors.push(String(message));
+		});
+		let verificationCalls = 0;
+		let refreshCalls = 0;
+		try {
+			await expect(
+				runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => ({ tag: "v999.0.0", version: "999.0.0" }),
+						resolveUpdateTarget: async () => ({ method: "bun" }),
+						performUpdate: async (_target, expectedVersion) => {
+							await runPackageManagerUpdateForTest({
+								managerName: "bun",
+								expectedVersion,
+								runInstall: async () => ({ exitCode: 0, text: () => "installed" }),
+								verifyInstalledRuntime: async () => {
+									verificationCalls += 1;
+									return {
+										ok: false,
+										actual: "999.0.0",
+										path: "/test/gjc",
+										smokeTestFailed: true,
+										smokeTestOutput: "native addon mismatch",
+									};
+								},
+							});
+						},
+						refreshInstalledDefaultSkills: async () => {
+							refreshCalls += 1;
+						},
+						exit: code => {
+							exitCodes.push(code);
+							throw sentinel;
+						},
+					},
+				),
+			).rejects.toBe(sentinel);
+			expect(verificationCalls).toBe(1);
+			expect(exitCodes).toEqual([1]);
+			expect(refreshCalls).toBe(0);
+			expect(errors.join("\n")).toContain("--smoke-test failed");
+			expect(errors.join("\n")).toContain("native addon mismatch");
+			expect(errors.join("\n")).toContain(
+				"install exited successfully, but the selected gjc runtime failed verification",
+			);
+			expect(errors.join("\n")).not.toContain("install failed with exit code 0");
+			expect(output.filter(line => line.includes("Updated to") || line.includes("Restart gjc"))).toHaveLength(0);
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
 	});
 });
 

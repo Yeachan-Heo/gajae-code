@@ -302,6 +302,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/edit/bar.test.ts",
 		"packages/coding-agent/test/cli.test.ts",
 		"packages/coding-agent/test/rlm-live-model-e2e.test.ts",
+		"packages/coding-agent/test/startup-update-contract.test.ts",
 	];
 
 	function targeted(paths: readonly string[]) {
@@ -350,12 +351,12 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
 	});
 
-	test("a source file with a directly-named test maps to exactly that test", () => {
+	test("a source file with a directly-named test maps exclusively to that test", () => {
 		const tasks = targeted(["packages/coding-agent/src/edit/foo.ts"]);
-		const keys = tasks.map(task => task.key);
-		expect(keys).toContain("test:packages/coding-agent/test/edit/foo.test.ts");
-		expect(keys).not.toContain("test:@gajae-code/coding-agent");
-		expect(keys).not.toContain("check:@gajae-code/coding-agent");
+		expect(tasks.map(task => task.key)).toEqual([
+			"test:packages/coding-agent/test/edit/foo.test.ts",
+			"native-linux-x64",
+		]);
 	});
 
 	test("a source file with no mapped test runs the owning package check, not its test suite", () => {
@@ -364,6 +365,24 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("check:@gajae-code/coding-agent");
 		expect(keys).toContain("cli-smoke"); // coding-agent runtime smoke
 		expect(keys.some(key => key.startsWith("test:"))).toBe(false);
+	});
+
+	test("main entrypoint adds its behavioral contract test without replacing owner fallback coverage", () => {
+		const tasks = targeted(["packages/coding-agent/src/main.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toEqual([
+			"test:packages/coding-agent/test/startup-update-contract.test.ts",
+			"check:@gajae-code/coding-agent",
+			"cli-smoke",
+			"native-linux-x64",
+		]);
+		expect(tasks[0]?.command).toEqual(["bun", "test", "packages/coding-agent/test/startup-update-contract.test.ts"]);
+		expect(tasks[1]).toMatchObject({
+			command: ["bun", "run", "check"],
+			cwd: resolvePackageCwd("packages/coding-agent"),
+		});
+		expect(tasks[2]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
+		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
 
 	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run only", () => {

@@ -1,14 +1,409 @@
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
+import { getBundledModel } from "@gajae-code/ai";
+import { TempDir } from "@gajae-code/utils";
+import type { Args } from "../src/cli/args";
+import { Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
+import {
+	classifyStartupUpdateRoute,
+	initializeInteractiveModeWithStartupUpdate,
+	runRootCommand,
+	StartupUpdateOrchestrator,
+	type StartupUpdateRoute,
+} from "../src/main";
+import type { InteractiveMode } from "../src/modes/interactive-mode";
+import type { CreateAgentSessionResult } from "../src/sdk";
+import type { AgentSession } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
+import { EventBus } from "../src/utils/event-bus";
+
+const alternateRoutes: Array<{
+	name: StartupUpdateRoute;
+	parsed: { print?: boolean; mode?: "text" | "json" | "rpc" | "rpc-ui" | "acp" | "bridge" };
+	autoPrint: boolean;
+}> = [
+	{ name: "print", parsed: { print: true }, autoPrint: false },
+	{ name: "text", parsed: { mode: "text" }, autoPrint: false },
+	{ name: "json", parsed: { mode: "json" }, autoPrint: false },
+	{ name: "rpc", parsed: { mode: "rpc" }, autoPrint: false },
+	{ name: "rpc-ui", parsed: { mode: "rpc-ui" }, autoPrint: false },
+	{ name: "acp", parsed: { mode: "acp" }, autoPrint: false },
+	{ name: "bridge", parsed: { mode: "bridge" }, autoPrint: false },
+	{ name: "text", parsed: {}, autoPrint: true },
+];
+
+const testModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+if (!testModel) throw new Error("Expected bundled test model");
+
+function rootArgs(overrides: Partial<Args> = {}): Args {
+	return {
+		messages: [],
+		fileArgs: [],
+		unknownFlags: new Map(),
+		noSession: true,
+		noSkills: true,
+		noRules: true,
+		noTools: true,
+		noLsp: true,
+		...overrides,
+	};
+}
+
+function fakeSessionResult(): CreateAgentSessionResult {
+	const session = {
+		model: testModel,
+		extensionRunner: undefined,
+		dispose: async () => {},
+	} as unknown as AgentSession;
+	return {
+		session,
+		extensionsResult: {},
+		setToolUIContext: () => {},
+		eventBus: new EventBus(),
+	} as unknown as CreateAgentSessionResult;
+}
 
 describe("startup update contract", () => {
-	it("keeps launch-time checks notify-only and explicit updates opt-in", () => {
+	it("keeps the concise startup-check metadata accurate", () => {
 		const setting = SETTINGS_SCHEMA["startup.checkUpdate"];
 
 		expect(setting.default).toBe(true);
-		expect(setting.ui.description).toContain("show a notification");
-		expect(setting.ui.description).toContain("Startup never installs updates");
-		expect(setting.ui.description).toContain("run `gjc update` explicitly");
-		expect(setting.ui.description).toContain("If false, skip the check");
+		expect(setting.ui.description).toContain("At interactive startup, notify");
+		expect(setting.ui.description).toContain("never install");
+		expect(setting.ui.description).toContain("Use `gjc update` only");
+		expect(setting.ui.description).toContain("source, linked, and unrecognized installs use their original method");
+	});
+
+	it("classifies every noninteractive launch route and starts no checker for them", () => {
+		for (const { name, parsed, autoPrint } of alternateRoutes) {
+			let checks = 0;
+			let notifications = 0;
+			expect(classifyStartupUpdateRoute(parsed, autoPrint)).toBe(name);
+
+			const startupUpdate = new StartupUpdateOrchestrator(
+				classifyStartupUpdateRoute(parsed, autoPrint),
+				() => true,
+				async () => {
+					checks++;
+					return "999.0.0";
+				},
+			);
+			startupUpdate.startBeforeInteractiveInitialization();
+			startupUpdate.attachAfterInteractiveInitialization(() => notifications++);
+
+			expect(checks).toBe(0);
+			expect(notifications).toBe(0);
+		}
+	});
+
+	it("does not check or notify when interactive startup checking is disabled", () => {
+		let checks = 0;
+		let notifications = 0;
+		const startupUpdate = new StartupUpdateOrchestrator(
+			"interactive",
+			() => false,
+			async () => {
+				checks++;
+				return "999.0.0";
+			},
+		);
+
+		startupUpdate.startBeforeInteractiveInitialization();
+		startupUpdate.attachAfterInteractiveInitialization(() => notifications++);
+
+		expect(checks).toBe(0);
+		expect(notifications).toBe(0);
+	});
+
+	it("reaches real mode initialization while the interactive check remains pending", async () => {
+		expect(classifyStartupUpdateRoute({}, false)).toBe("interactive");
+		const versionCheck = Promise.withResolvers<string | undefined>();
+		const initReached = Promise.withResolvers<void>();
+		const releaseInit = Promise.withResolvers<void>();
+		const events: string[] = [];
+		const startupUpdate = new StartupUpdateOrchestrator(
+			"interactive",
+			() => true,
+			async () => {
+				events.push("check-start");
+				return await versionCheck.promise;
+			},
+		);
+		const mode = {
+			init: async () => {
+				events.push("mode-init");
+				initReached.resolve();
+				await releaseInit.promise;
+			},
+			showNewVersionNotification: (version: string) => {
+				events.push(`notify:${version}`);
+			},
+		};
+
+		startupUpdate.startBeforeInteractiveInitialization();
+		const initialized = initializeInteractiveModeWithStartupUpdate(mode, startupUpdate);
+		await initReached.promise;
+		expect(events).toEqual(["check-start", "mode-init"]);
+
+		releaseInit.resolve();
+		await initialized;
+		expect(events).toEqual(["check-start", "mode-init"]);
+
+		const notified = Promise.withResolvers<void>();
+		mode.showNewVersionNotification = version => {
+			events.push(`notify:${version}`);
+			notified.resolve();
+		};
+		versionCheck.resolve("999.0.0");
+		await notified.promise;
+		expect(events).toEqual(["check-start", "mode-init", "notify:999.0.0"]);
+	});
+
+	it("does not attach notification delivery until real mode initialization completes", async () => {
+		const versionCheck = Promise.withResolvers<string | undefined>();
+		const releaseInit = Promise.withResolvers<void>();
+		const notified = Promise.withResolvers<void>();
+		const events: string[] = [];
+		const startupUpdate = new StartupUpdateOrchestrator(
+			"interactive",
+			() => true,
+			() => versionCheck.promise,
+		);
+		const mode = {
+			init: async () => {
+				events.push("mode-init");
+				await releaseInit.promise;
+			},
+			showNewVersionNotification: (version: string) => {
+				events.push(`notify:${version}`);
+				notified.resolve();
+			},
+		};
+
+		startupUpdate.startBeforeInteractiveInitialization();
+		const initialized = initializeInteractiveModeWithStartupUpdate(mode, startupUpdate);
+		versionCheck.resolve("999.0.0");
+		await Promise.resolve();
+		expect(events).toEqual(["mode-init"]);
+
+		releaseInit.resolve();
+		await initialized;
+		await notified.promise;
+		expect(events).toEqual(["mode-init", "notify:999.0.0"]);
+	});
+
+	it("consumes rejected checks without blocking real initialization or notifying", async () => {
+		const deferred = Promise.withResolvers<string | undefined>();
+		let initialized = false;
+		let notifications = 0;
+		const startupUpdate = new StartupUpdateOrchestrator(
+			"interactive",
+			() => true,
+			async () => await deferred.promise,
+		);
+		const mode = {
+			init: async () => {
+				initialized = true;
+			},
+			showNewVersionNotification: () => {
+				notifications += 1;
+			},
+		};
+
+		startupUpdate.startBeforeInteractiveInitialization();
+		await initializeInteractiveModeWithStartupUpdate(mode, startupUpdate);
+		expect(initialized).toBe(true);
+
+		deferred.reject(new Error("registry unavailable"));
+		await Bun.sleep(0);
+		expect(notifications).toBe(0);
+	});
+
+	it("routes every noninteractive launch through runRootCommand without starting the checker", async () => {
+		const cases: Array<{
+			name: string;
+			args: Partial<Args>;
+			pipedInput?: string;
+			expectedRunner: "acp" | "bridge" | "print" | "rpc";
+		}> = [
+			{ name: "print", args: { print: true }, expectedRunner: "print" },
+			{ name: "text", args: { mode: "text" }, expectedRunner: "print" },
+			{ name: "json", args: { mode: "json" }, expectedRunner: "print" },
+			{ name: "rpc", args: { mode: "rpc" }, expectedRunner: "rpc" },
+			{ name: "rpc-ui", args: { mode: "rpc-ui" }, expectedRunner: "rpc" },
+			{ name: "acp", args: { mode: "acp" }, expectedRunner: "acp" },
+			{ name: "bridge", args: { mode: "bridge" }, expectedRunner: "bridge" },
+			{ name: "auto-print", args: {}, pipedInput: "piped prompt", expectedRunner: "print" },
+		];
+
+		for (const testCase of cases) {
+			using tempDir = TempDir.createSync("@gjc-startup-route-");
+			const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+			const originalNoTitle = Bun.env.PI_NO_TITLE;
+			let checks = 0;
+			const runners: string[] = [];
+			try {
+				await runRootCommand(rootArgs(testCase.args), [], {
+					createAgentSession: async () => fakeSessionResult(),
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": true }),
+					suppressProcessExit: true,
+					startupUpdate: {
+						check: async () => {
+							checks += 1;
+							return "999.0.0";
+						},
+					},
+					initTheme: async () => {},
+					readPipedInput: async () => testCase.pipedInput,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					runAcpMode: async () => {
+						runners.push("acp");
+					},
+					runRpcMode: async () => {
+						runners.push("rpc");
+					},
+					runBridgeMode: async () => {
+						runners.push("bridge");
+					},
+					runPrintMode: async () => {
+						runners.push("print");
+					},
+				});
+				expect(checks, testCase.name).toBe(0);
+				expect(runners, testCase.name).toEqual([testCase.expectedRunner]);
+			} finally {
+				authStorage.close();
+				if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
+				else Bun.env.PI_NO_TITLE = originalNoTitle;
+			}
+		}
+	}, 30_000);
+
+	it("runs the real root and interactive-mode path without awaiting the version check", async () => {
+		using tempDir = TempDir.createSync("@gjc-startup-interactive-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const versionCheck = Promise.withResolvers<string | undefined>();
+		const changelogReached = Promise.withResolvers<void>();
+		const releaseChangelog = Promise.withResolvers<void>();
+		const initReached = Promise.withResolvers<void>();
+		const releaseInit = Promise.withResolvers<void>();
+		const notified = Promise.withResolvers<void>();
+		const stop = new Error("stop interactive harness");
+		const events: string[] = [];
+		try {
+			const root = runRootCommand(rootArgs(), [], {
+				createAgentSession: async () => fakeSessionResult(),
+				discoverAuthStorage: async () => authStorage,
+				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": true }),
+				startupUpdate: {
+					check: async () => {
+						events.push("check-start");
+						return await versionCheck.promise;
+					},
+				},
+				initTheme: async () => {},
+				readPipedInput: async () => undefined,
+				runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				getChangelogForDisplay: async () => {
+					events.push("changelog-start");
+					changelogReached.resolve();
+					await releaseChangelog.promise;
+					return undefined;
+				},
+				createInteractiveMode: () =>
+					({
+						init: async () => {
+							events.push("mode-init");
+							initReached.resolve();
+							await releaseInit.promise;
+						},
+						showNewVersionNotification: (version: string) => {
+							events.push(`notify:${version}`);
+							notified.resolve();
+						},
+						renderInitialMessages: () => {},
+						getUserInput: async () => {
+							events.push("user-input");
+							throw stop;
+						},
+					}) as unknown as InteractiveMode,
+			});
+
+			await changelogReached.promise;
+			expect(events).toEqual(["check-start", "changelog-start"]);
+			releaseChangelog.resolve();
+			await initReached.promise;
+			versionCheck.resolve("999.0.0");
+			await Bun.sleep(0);
+			expect(events).toEqual(["check-start", "changelog-start", "mode-init"]);
+
+			releaseInit.resolve();
+			await expect(root).rejects.toBe(stop);
+			await notified.promise;
+			expect(events).toEqual(["check-start", "changelog-start", "mode-init", "notify:999.0.0", "user-input"]);
+		} finally {
+			authStorage.close();
+		}
+	}, 15_000);
+
+	it("keeps real interactive startup disabled and rejected checks non-blocking", async () => {
+		for (const testCase of [
+			{ enabled: false, check: async () => "999.0.0" },
+			{ enabled: true, check: async () => await Promise.reject(new Error("registry unavailable")) },
+		]) {
+			using tempDir = TempDir.createSync("@gjc-startup-disabled-");
+			const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+			const stop = new Error("stop interactive harness");
+			let checks = 0;
+			let notifications = 0;
+			try {
+				await expect(
+					runRootCommand(rootArgs(), [], {
+						createAgentSession: async () => fakeSessionResult(),
+						discoverAuthStorage: async () => authStorage,
+						settings: Settings.isolated({
+							"marketplace.autoUpdate": "off",
+							"startup.checkUpdate": testCase.enabled,
+						}),
+						startupUpdate: {
+							check: async () => {
+								checks += 1;
+								return await testCase.check();
+							},
+						},
+						initTheme: async () => {},
+						readPipedInput: async () => undefined,
+						runStartupCredentialAutoImportIfNeeded: async () => undefined,
+						getChangelogForDisplay: async () => undefined,
+						createInteractiveMode: () =>
+							({
+								init: async () => {},
+								showNewVersionNotification: () => {
+									notifications += 1;
+								},
+								renderInitialMessages: () => {},
+								getUserInput: async () => {
+									throw stop;
+								},
+							}) as unknown as InteractiveMode,
+					}),
+				).rejects.toBe(stop);
+				await Bun.sleep(0);
+				expect(checks).toBe(testCase.enabled ? 1 : 0);
+				expect(notifications).toBe(0);
+			} finally {
+				authStorage.close();
+			}
+		}
+	}, 15_000);
+	it("keeps updater and default-installer APIs outside startup wiring", async () => {
+		const source = await Bun.file(new URL("../src/main.ts", import.meta.url)).text();
+
+		expect(source).not.toMatch(/["']\.\/cli\/update-cli["']/);
+		expect(source).not.toMatch(/["']\.\/defaults\/gjc-defaults["']/);
+		expect(source).toContain("startupUpdate.startBeforeInteractiveInitialization()");
+		expect(source).toContain("startupUpdate.attachAfterInteractiveInitialization");
 	});
 });
