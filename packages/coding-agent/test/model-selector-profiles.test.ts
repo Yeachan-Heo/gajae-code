@@ -95,7 +95,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		"modelProfile.default": "old-profile",
 	});
 	const flush = vi.fn(async () => {});
-	settings.flush = flush as typeof settings.flush;
+	settings.flushOrThrow = flush as typeof settings.flushOrThrow;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
@@ -125,6 +125,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		updateEditorBorderColor: vi.fn(),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
+		notifyConfigChanged: vi.fn(async () => {}),
 	};
 	return { ctx, settings, session, flush, setCalls };
 }
@@ -325,6 +326,7 @@ describe("model selector profiles", () => {
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/alternate" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
 	});
 
 	test("Set as default persists and flushes modelProfile.default", async () => {
@@ -336,6 +338,7 @@ describe("model selector profiles", () => {
 		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
 		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
 		expect(flush).toHaveBeenCalledTimes(1);
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
 
@@ -358,8 +361,7 @@ describe("model selector profiles", () => {
 		const { ctx, session, flush, setCalls } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
 
-		controller.handleSettingChange("modelProfile.default", "profile-a");
-		await Bun.sleep(10);
+		await controller.handleSettingChange("modelProfile.default", "profile-a");
 
 		expect(session.setModelTemporaryCalls).toHaveLength(1);
 		expect(session.model?.id).toBe("default");
@@ -373,8 +375,9 @@ describe("model selector profiles", () => {
 		const { ctx, settings, session } = createControllerContext({ missingCredentials: true });
 		const controller = new SelectorController(ctx as never);
 
-		controller.handleSettingChange("modelProfile.default", "profile-a");
-		await Bun.sleep(10);
+		await expect(
+			controller.handleSettingChange("modelProfile.default", "profile-a") as Promise<void>,
+		).rejects.toThrow("requires credentials for: provider-a");
 
 		expect(ctx.showError).toHaveBeenCalledWith(
 			'Model profile "Profile Alpha" requires credentials for: provider-a. Run /login and configure the missing provider(s), then retry.',
