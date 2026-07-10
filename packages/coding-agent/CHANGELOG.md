@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added adaptive Ultragoal completion estimates to `gjc ultragoal status` and the active workflow HUD, including local finish ranges, elapsed/remaining time, confidence, calculation basis, blocked-state handling, and date-safe long-run formatting.
 
 ## [0.9.6] - 2026-07-10
 ### Changed

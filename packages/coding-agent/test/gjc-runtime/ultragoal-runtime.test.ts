@@ -10,13 +10,14 @@ import {
 	sessionStateDir,
 	sessionUltragoalDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { renderUltragoalStatusMarkdown } from "@gajae-code/coding-agent/gjc-runtime/state-renderer";
 import { reconcileWorkflowSkillState } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { validateCompletionReceipt } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
-
 import {
 	addUltragoalSubgoal,
 	buildUltragoalHudSummary,
 	checkpointUltragoalGoal,
+	computeUltragoalEta,
 	createUltragoalPlan,
 	getUltragoalStatus,
 	hashStructuredValue,
@@ -26,6 +27,9 @@ import {
 	runNativeUltragoalCommand,
 	startNextUltragoalGoal,
 	type UltragoalCommandResult,
+	type UltragoalEtaEstimate,
+	type UltragoalGoal,
+	type UltragoalStatusSummary,
 	validateExecutorQaRedTeamEvidenceForReview,
 	waitForReplayProcessWithTimeout,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
@@ -4654,5 +4658,572 @@ describe("resolveGitBase nearest integration base", () => {
 		await commit(dir, "feature.txt", "feature work");
 
 		expect(await resolveGitBase(dir, "main")).toBe("main");
+	});
+});
+
+function etaGoal(overrides: Partial<UltragoalGoal> & Pick<UltragoalGoal, "id" | "status">): UltragoalGoal {
+	return {
+		title: overrides.id,
+		objective: overrides.id,
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T00:00:00.000Z",
+		...overrides,
+	};
+}
+/** Builds an ISO timestamp from local calendar components so date-boundary tests never depend on the runner's TZ. */
+function localIso(year: number, month: number, day: number, hour: number, minute: number): string {
+	return new Date(year, month - 1, day, hour, minute, 0, 0).toISOString();
+}
+
+function fullUltragoalCounts(
+	overrides: Partial<Record<UltragoalGoal["status"], number>> = {},
+): Record<UltragoalGoal["status"], number> {
+	return {
+		pending: 0,
+		active: 0,
+		complete: 0,
+		failed: 0,
+		blocked: 0,
+		review_blocked: 0,
+		superseded: 0,
+		...overrides,
+	};
+}
+
+/** Minimal `UltragoalStatusSummary` fixture for exercising HUD/markdown rendering in isolation from the CLI. */
+function statusSummaryWithEta(eta: UltragoalEtaEstimate | undefined): UltragoalStatusSummary {
+	return {
+		exists: true,
+		status: "active",
+		paths: {
+			dir: "/tmp/ultragoal-eta-fixture",
+			briefPath: "/tmp/ultragoal-eta-fixture/BRIEF.md",
+			goalsPath: "/tmp/ultragoal-eta-fixture/goals.json",
+			ledgerPath: "/tmp/ultragoal-eta-fixture/ledger.jsonl",
+		},
+		counts: fullUltragoalCounts({ pending: 1 }),
+		goals: [etaGoal({ id: "G001", status: "pending" })],
+		eta,
+	};
+}
+
+describe("computeUltragoalEta (pure)", () => {
+	const NOW_MS = Date.parse("2026-01-01T12:00:00.000Z");
+
+	it("returns undefined for an empty goal list", () => {
+		expect(computeUltragoalEta([], NOW_MS)).toBeUndefined();
+	});
+
+	it("falls back to a wide 15-45min/goal low-confidence range with no completed samples", () => {
+		const goals = [
+			etaGoal({ id: "G001", status: "pending" }),
+			etaGoal({ id: "G002", status: "pending" }),
+			etaGoal({ id: "G003", status: "pending" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("estimating");
+		expect(eta?.confidence).toBe("low");
+		expect(eta?.basis).toBe("fallback_default");
+		expect(eta?.sampleSize).toBe(0);
+		expect(eta?.elapsedSeconds).toBe(0);
+		expect(eta?.remainingSecondsLow).toBe(3 * 15 * 60);
+		expect(eta?.remainingSecondsHigh).toBe(3 * 45 * 60);
+		expect(eta!.remainingSecondsLow).toBeLessThanOrEqual(eta!.remainingSecondsHigh);
+		expect(eta?.finishAtLow).toBe(new Date(NOW_MS + 3 * 15 * 60 * 1000).toISOString());
+		expect(eta?.finishAtHigh).toBe(new Date(NOW_MS + 3 * 45 * 60 * 1000).toISOString());
+	});
+
+	it("uses the median of valid completed-goal durations once observed samples exist", () => {
+		const goals = [
+			etaGoal({
+				id: "G001",
+				status: "complete",
+				startedAt: "2026-01-01T00:00:00.000Z",
+				completedAt: "2026-01-01T00:10:00.000Z",
+			}),
+			etaGoal({
+				id: "G002",
+				status: "complete",
+				startedAt: "2026-01-01T00:00:00.000Z",
+				completedAt: "2026-01-01T00:20:00.000Z",
+			}),
+			etaGoal({
+				id: "G003",
+				status: "complete",
+				startedAt: "2026-01-01T00:00:00.000Z",
+				completedAt: "2026-01-01T00:30:00.000Z",
+			}),
+			etaGoal({ id: "G004", status: "pending" }),
+			etaGoal({ id: "G005", status: "pending" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("estimating");
+		expect(eta?.basis).toBe("observed_median");
+		expect(eta?.sampleSize).toBe(3);
+		expect(eta?.confidence).toBe("medium");
+		// median duration = 1200s across the 3 samples; 2 remaining goals * [0.75, 1.25] * 1200s.
+		expect(eta?.remainingSecondsLow).toBe(Math.round(2 * 1200 * 0.75));
+		expect(eta?.remainingSecondsHigh).toBe(Math.round(2 * 1200 * 1.25));
+	});
+
+	it("ignores reversed/abnormal completed timestamps when building the sample", () => {
+		const goals = [
+			etaGoal({
+				id: "G001",
+				status: "complete",
+				startedAt: "2026-01-01T00:10:00.000Z",
+				completedAt: "2026-01-01T00:00:00.000Z",
+			}),
+			etaGoal({
+				id: "G002",
+				status: "complete",
+				startedAt: "2026-01-01T00:00:00.000Z",
+				completedAt: "2026-01-01T00:10:00.000Z",
+			}),
+			etaGoal({ id: "G003", status: "pending" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.sampleSize).toBe(1);
+		expect(eta?.confidence).toBe("low");
+		expect(eta?.basis).toBe("observed_median");
+	});
+
+	it("returns state=blocked without asserting a finish time when a required goal is blocked", () => {
+		const goals = [
+			etaGoal({ id: "G001", status: "blocked", title: "Fix the outage" }),
+			etaGoal({ id: "G002", status: "pending" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("blocked");
+		expect(eta?.blockedReason).toContain("G001");
+		expect(eta?.blockedReason).toContain("blocked");
+		expect(eta?.confidence).toBe("low");
+		expect(eta?.basis).toBe("fallback_default");
+		expect(eta?.finishAtLow).toBeUndefined();
+		expect(eta?.finishAtHigh).toBeUndefined();
+		expect(eta!.remainingSecondsLow).toBeGreaterThanOrEqual(0);
+		expect(eta!.remainingSecondsLow).toBeLessThanOrEqual(eta!.remainingSecondsHigh);
+
+		// Blocked runs never regress relative to estimating ones: the HUD chip carries the
+		// same compact confidence/basis label so the reader can judge how much to trust it.
+		const hud = buildUltragoalHudSummary(statusSummaryWithEta(eta));
+		const chip = hud.chips?.find(item => item.label === "eta");
+		expect(chip?.severity).toBe("blocked");
+		expect(chip?.value).toBe("blocked: G001 blocked: Fix the outage low/fallback");
+	});
+
+	it("returns state=complete with the actual last completion time once every required goal is terminal", () => {
+		const goals = [
+			etaGoal({
+				id: "G001",
+				status: "complete",
+				startedAt: "2026-01-01T00:00:00.000Z",
+				completedAt: "2026-01-01T00:10:00.000Z",
+			}),
+			etaGoal({
+				id: "G002",
+				status: "complete",
+				startedAt: "2026-01-01T00:10:00.000Z",
+				completedAt: "2026-01-01T00:25:00.000Z",
+			}),
+			etaGoal({ id: "G003", status: "superseded" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("complete");
+		// Two valid completion samples (G001, G002); the excluded superseded G003 must not
+		// count toward the sample, and confidence/basis must reflect the real sample size
+		// instead of a hardcoded "high"/"observed_median".
+		expect(eta?.sampleSize).toBe(2);
+		expect(eta?.confidence).toBe("medium");
+		expect(eta?.basis).toBe("observed_median");
+		expect(eta?.remainingSecondsLow).toBe(0);
+		expect(eta?.remainingSecondsHigh).toBe(0);
+		expect(eta?.finishAtLow).toBe("2026-01-01T00:25:00.000Z");
+		expect(eta?.finishAtHigh).toBe("2026-01-01T00:25:00.000Z");
+	});
+
+	it("omits a fabricated finish time when no goal has a valid completion sample", () => {
+		const goals = [etaGoal({ id: "G001", status: "superseded" }), etaGoal({ id: "G002", status: "superseded" })];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("complete");
+		expect(eta?.sampleSize).toBe(0);
+		expect(eta?.confidence).toBe("low");
+		expect(eta?.basis).toBe("fallback_default");
+		expect(eta?.finishAtLow).toBeUndefined();
+		expect(eta?.finishAtHigh).toBeUndefined();
+	});
+	it("omits a fabricated finish time when every terminal goal is `complete` but only has a reversed or missing timestamp pair", () => {
+		const goals = [
+			// Reversed pair: completedAt before startedAt.
+			etaGoal({
+				id: "G001",
+				status: "complete",
+				startedAt: "2026-01-01T00:10:00.000Z",
+				completedAt: "2026-01-01T00:00:00.000Z",
+			}),
+			// Missing completedAt entirely.
+			etaGoal({ id: "G002", status: "complete", startedAt: "2026-01-01T00:00:00.000Z" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("complete");
+		// Neither goal contributes a valid sample: a `complete` status alone must never be
+		// trusted as a real duration/finish observation without a sane, parseable pair.
+		expect(eta?.sampleSize).toBe(0);
+		expect(eta?.confidence).toBe("low");
+		expect(eta?.basis).toBe("fallback_default");
+		expect(eta?.remainingSecondsLow).toBe(0);
+		expect(eta?.remainingSecondsHigh).toBe(0);
+		expect(eta?.finishAtLow).toBeUndefined();
+		expect(eta?.finishAtHigh).toBeUndefined();
+	});
+
+	it("floors an overrunning active goal's remaining estimate instead of collapsing toward zero", () => {
+		const goals = [
+			etaGoal({
+				id: "G001",
+				status: "complete",
+				startedAt: "2026-01-01T00:00:00.000Z",
+				completedAt: "2026-01-01T00:10:00.000Z",
+			}),
+			etaGoal({ id: "G002", status: "active", startedAt: "2026-01-01T11:40:00.000Z" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("estimating");
+		expect(eta?.elapsedSeconds).toBe(20 * 60);
+		// perGoalLow=450s: 450-1200 overruns, floored at the 5min minimum.
+		expect(eta?.remainingSecondsLow).toBe(5 * 60);
+		// perGoalHigh=750s: 750-1200 overruns too, but high must stay wider than low —
+		// floored at half the observed per-goal high (375s), never collapsing to equal low.
+		expect(eta?.remainingSecondsHigh).toBe(375);
+		expect(eta!.remainingSecondsLow).toBeLessThan(eta!.remainingSecondsHigh);
+	});
+	it("keeps low strictly below high for an overrunning active goal even with a short (4min) observed median", () => {
+		const goals = [
+			etaGoal({
+				id: "G001",
+				status: "complete",
+				startedAt: "2026-01-01T00:00:00.000Z",
+				completedAt: "2026-01-01T00:04:00.000Z",
+			}),
+			etaGoal({ id: "G002", status: "active", startedAt: "2026-01-01T11:40:00.000Z" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("estimating");
+		expect(eta?.basis).toBe("observed_median");
+		// median duration = 240s; perGoalLow=180s, perGoalHigh=300s. Both overrun the 20min
+		// elapsed active goal, so both floor — but `perGoalHigh / 2` (150s) is itself below
+		// the 5min low floor (300s), so a naive `max(perGoalHigh / 2, activeLow)` would
+		// collapse both floors onto the identical 300s value. The high floor must instead
+		// widen to `activeLow + 5min` so the estimate never asserts fake single-point
+		// precision.
+		expect(eta?.remainingSecondsLow).toBe(5 * 60);
+		expect(eta?.remainingSecondsHigh).toBe(10 * 60);
+		expect(eta!.remainingSecondsLow).toBeLessThan(eta!.remainingSecondsHigh);
+	});
+
+	it("keeps a subsequent pending goal's full eta budget after the active goal overruns", () => {
+		const goals = [
+			etaGoal({
+				id: "G001",
+				status: "complete",
+				startedAt: "2026-01-01T00:00:00.000Z",
+				completedAt: "2026-01-01T00:10:00.000Z",
+			}),
+			etaGoal({ id: "G002", status: "active", startedAt: "2026-01-01T11:40:00.000Z" }),
+			etaGoal({ id: "G003", status: "pending" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("estimating");
+		expect(eta?.elapsedSeconds).toBe(20 * 60);
+		// G002 (active, overrunning) contributes its floored 300s/375s; G003 (pending) must
+		// keep its FULL 450s/750s per-goal budget — the active goal's overrun elapsed time
+		// must never be subtracted from a later goal's own estimate.
+		expect(eta?.remainingSecondsLow).toBe(300 + 450);
+		expect(eta?.remainingSecondsHigh).toBe(375 + 750);
+		// Regression guard: the pre-fix formula subtracted elapsed from the whole 2-goal sum,
+		// which floored the total at 300s and erased G003's ETA entirely.
+		expect(eta!.remainingSecondsLow).toBeGreaterThan(300);
+	});
+
+	it("excludes superseded goals but counts pending/failed goals toward the remaining estimate", () => {
+		const goals = [
+			etaGoal({ id: "G001", status: "superseded" }),
+			etaGoal({ id: "G002", status: "pending" }),
+			etaGoal({ id: "G003", status: "failed" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("estimating");
+		expect(eta?.remainingSecondsLow).toBe(2 * 15 * 60);
+		expect(eta?.remainingSecondsHigh).toBe(2 * 45 * 60);
+	});
+	function completedGoalWithTenMinuteDuration(id: string): UltragoalGoal {
+		return etaGoal({
+			id,
+			status: "complete",
+			startedAt: "2026-01-01T00:00:00.000Z",
+			completedAt: "2026-01-01T00:10:00.000Z",
+		});
+	}
+
+	it.each([
+		[2, "medium", "med"],
+		[4, "medium", "med"],
+		[5, "high", "high"],
+	] as const)("confidence boundary: sampleSize=%d -> confidence=%s (HUD label %s/observed)", (sampleSize, confidence, hudConfidenceLabel) => {
+		const goals: UltragoalGoal[] = [];
+		for (let index = 0; index < sampleSize; index += 1) {
+			goals.push(completedGoalWithTenMinuteDuration(`G-done-${index}`));
+		}
+		goals.push(etaGoal({ id: "G-pending", status: "pending" }));
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.sampleSize).toBe(sampleSize);
+		expect(eta?.confidence).toBe(confidence);
+		expect(eta?.basis).toBe("observed_median");
+
+		const hud = buildUltragoalHudSummary(statusSummaryWithEta(eta));
+		const chip = hud.chips?.find(item => item.label === "eta");
+		expect(chip?.value).toContain(`${hudConfidenceLabel}/observed`);
+	});
+
+	it("review_blocked short-circuits to state=blocked without asserting a finish time", () => {
+		const goals = [
+			etaGoal({ id: "G001", status: "review_blocked", title: "Needs architect sign-off" }),
+			etaGoal({ id: "G002", status: "pending" }),
+		];
+		const eta = computeUltragoalEta(goals, NOW_MS);
+		expect(eta?.state).toBe("blocked");
+		expect(eta?.blockedReason).toContain("G001");
+		expect(eta?.blockedReason).toContain("review_blocked");
+		expect(eta?.finishAtLow).toBeUndefined();
+		expect(eta?.finishAtHigh).toBeUndefined();
+
+		const hud = buildUltragoalHudSummary(statusSummaryWithEta(eta));
+		const chip = hud.chips?.find(item => item.label === "eta");
+		expect(chip?.severity).toBe("blocked");
+		expect(chip?.value).toBe("blocked: G001 review_blocked: Needs architect sign-off low/fallback");
+	});
+});
+
+describe("ultragoal eta status/HUD/reconcile wiring", () => {
+	it("exposes a structured, low-confidence fallback eta in `status --json` and markdown", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: First\nDo first thing.\n\n@goal: Second\nDo second thing.",
+		});
+
+		const jsonResult = await runNativeUltragoalCommand(["status", "--json"], root);
+		expect(jsonResult.status).toBe(0);
+		const parsed = JSON.parse(jsonResult.stdout ?? "{}");
+		expect(parsed.eta).toMatchObject({
+			state: "estimating",
+			confidence: "low",
+			basis: "fallback_default",
+			sampleSize: 0,
+		});
+		expect(parsed.eta.remainingSecondsLow).toBeLessThanOrEqual(parsed.eta.remainingSecondsHigh);
+		expect(typeof parsed.eta.finishAtLow).toBe("string");
+		expect(typeof parsed.eta.finishAtHigh).toBe("string");
+
+		const markdownResult = await runNativeUltragoalCommand(["status"], root);
+		expect(markdownResult.status).toBe(0);
+		expect(markdownResult.stdout).toContain("- eta: elapsed=");
+		expect(markdownResult.stdout).toContain("confidence=low basis=fallback_default");
+		expect(markdownResult.stdout).toContain("- eta_finish: ~");
+
+		const summary = await getUltragoalStatus(root);
+		const hud = buildUltragoalHudSummary(summary);
+		const chip = hud.chips?.find(item => item.label === "eta");
+		expect(chip?.value).toContain("low/fallback");
+	});
+
+	it("reports state=blocked with a visible reason and a blocked HUD eta chip", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: First\nDo first thing.\n\n@goal: Second\nDo second thing.",
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "blocked",
+			evidence: "blocked by an upstream outage",
+		});
+
+		const jsonResult = await runNativeUltragoalCommand(["status", "--json"], root);
+		const parsed = JSON.parse(jsonResult.stdout ?? "{}");
+		expect(parsed.status).toBe("blocked");
+		expect(parsed.eta.state).toBe("blocked");
+		expect(parsed.eta.blockedReason).toContain("G001");
+		expect(parsed.eta.finishAtLow).toBeUndefined();
+		expect(parsed.eta.finishAtHigh).toBeUndefined();
+
+		const summary = await getUltragoalStatus(root);
+		const hud = buildUltragoalHudSummary(summary);
+		const chip = hud.chips?.find(item => item.label === "eta");
+		expect(chip).toBeDefined();
+		expect(chip?.severity).toBe("blocked");
+		// The blocked chip must carry the same compact confidence/basis suffix as an
+		// estimating one instead of silently dropping it.
+		expect(chip?.value).toContain("low/fallback");
+
+		const markdownResult = await runNativeUltragoalCommand(["status"], root);
+		expect(markdownResult.stdout).toContain("- eta: blocked");
+	});
+
+	it("returns state=complete and omits the HUD eta chip once every goal is complete", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"tests passed",
+				"--quality-gate-json",
+				await passingLiveQualityGate(root),
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+
+		const summary = await getUltragoalStatus(root);
+		expect(summary.status).toBe("complete");
+		expect(summary.eta?.state).toBe("complete");
+		expect(summary.eta?.remainingSecondsLow).toBe(0);
+		expect(summary.eta?.remainingSecondsHigh).toBe(0);
+
+		const hud = buildUltragoalHudSummary(summary);
+		expect(hud.chips?.some(item => item.label === "eta")).toBe(false);
+
+		const markdownResult = await runNativeUltragoalCommand(["status"], root);
+		expect(markdownResult.stdout).not.toContain("- eta:");
+	});
+
+	it("threads eta through reconcile into mode-state and the active-state HUD chip", async () => {
+		const root = await tempDir();
+		const result = await runNativeUltragoalCommand(["create-goals", "--brief", "Ship the fix"], root);
+		expect(result.status).toBe(0);
+
+		const mode = (await Bun.file(sessionModeStatePath(root, TEST_SESSION_ID, "ultragoal")).json()) as Record<
+			string,
+			unknown
+		>;
+		const eta = mode.eta as Record<string, unknown>;
+		expect(eta.state).toBe("estimating");
+		expect(eta.basis).toBe("fallback_default");
+
+		const active = await readVisibleSkillActiveState(root);
+		const entry = active?.active_skills?.find(item => item.skill === "ultragoal");
+		const chip = entry?.hud?.chips?.find(item => item.label === "eta");
+		expect(chip).toBeDefined();
+		// Confidence/basis must survive the reconcile round-trip through mode-state into the
+		// durable active-state HUD chip, not just the freshly computed in-process eta.
+		expect(chip?.value).toContain("low/fallback");
+	});
+});
+describe("ultragoal eta HUD/markdown local finish formatting (cross-date)", () => {
+	function estimatingEta(finishAtLow: string, finishAtHigh: string, overrides: Partial<UltragoalEtaEstimate> = {}) {
+		return {
+			state: "estimating",
+			confidence: "low",
+			sampleSize: 0,
+			elapsedSeconds: 0,
+			remainingSecondsLow: 60,
+			remainingSecondsHigh: 120,
+			finishAtLow,
+			finishAtHigh,
+			basis: "fallback_default",
+			...overrides,
+		} satisfies UltragoalEtaEstimate;
+	}
+
+	it("keeps a bare HH:mm-HH:mm range and the exact confidence/basis label on the same local calendar day", () => {
+		const eta = estimatingEta(localIso(2026, 6, 15, 18, 20), localIso(2026, 6, 15, 19, 50));
+		const hud = buildUltragoalHudSummary(statusSummaryWithEta(eta));
+		const chip = hud.chips?.find(item => item.label === "eta");
+		expect(chip?.value).toBe("~18:20\u201319:50 low/fallback");
+
+		const markdown = renderUltragoalStatusMarkdown(statusSummaryWithEta(eta));
+		expect(markdown).toContain("- eta_finish: ~18:20\u201319:50 (local, estimate)");
+	});
+
+	it("switches to MM-DD HH:mm when the low/high finish times fall on different local calendar days", () => {
+		const eta = estimatingEta(localIso(2026, 6, 15, 23, 50), localIso(2026, 6, 16, 1, 20), {
+			confidence: "medium",
+			sampleSize: 3,
+			basis: "observed_median",
+		});
+		const hud = buildUltragoalHudSummary(statusSummaryWithEta(eta));
+		const chip = hud.chips?.find(item => item.label === "eta");
+		expect(chip?.value).toBe("~06-15 23:50\u201306-16 01:20 med/observed");
+
+		const markdown = renderUltragoalStatusMarkdown(statusSummaryWithEta(eta));
+		expect(markdown).toContain("- eta_finish: ~06-15 23:50\u201306-16 01:20 (local, estimate)");
+	});
+
+	it("switches to full YYYY-MM-DD HH:mm when the low/high finish times fall in different years", () => {
+		const eta = estimatingEta(localIso(2025, 12, 31, 23, 50), localIso(2026, 1, 1, 1, 20), {
+			confidence: "high",
+			sampleSize: 6,
+			basis: "observed_median",
+		});
+		const hud = buildUltragoalHudSummary(statusSummaryWithEta(eta));
+		const chip = hud.chips?.find(item => item.label === "eta");
+		expect(chip?.value).toBe("~2025-12-31 23:50\u20132026-01-01 01:20 high/observed");
+
+		const markdown = renderUltragoalStatusMarkdown(statusSummaryWithEta(eta));
+		expect(markdown).toContain("- eta_finish: ~2025-12-31 23:50\u20132026-01-01 01:20 (local, estimate)");
+	});
+
+	it("widens to seconds when distinct low/high instants fall in the same displayed minute", () => {
+		const finishAtLow = new Date(2026, 5, 15, 18, 20, 5, 0).toISOString();
+		const finishAtHigh = new Date(2026, 5, 15, 18, 20, 45, 0).toISOString();
+		const eta = estimatingEta(finishAtLow, finishAtHigh);
+		const hud = buildUltragoalHudSummary(statusSummaryWithEta(eta));
+		const chip = hud.chips?.find(item => item.label === "eta");
+		// Both endpoints share the same displayed HH:mm minute but are genuinely 40s
+		// apart: collapsing to a single "~18:20" would assert fake single-point precision.
+		expect(chip?.value).toBe("~18:20:05\u201318:20:45 low/fallback");
+
+		const markdown = renderUltragoalStatusMarkdown(statusSummaryWithEta(eta));
+		expect(markdown).toContain("- eta_finish: ~18:20:05\u201318:20:45 (local, estimate)");
+	});
+
+	it("distinguishes identical local wall-clock endpoints across a UTC-offset change (DST-fold style) using the offset itself", () => {
+		const lowIso = "2026-11-01T05:30:00.000Z";
+		const highIso = "2026-11-01T06:30:00.000Z";
+		const lowMs = Date.parse(lowIso);
+		const yearSpy = spyOn(Date.prototype, "getFullYear").mockReturnValue(2026);
+		const monthSpy = spyOn(Date.prototype, "getMonth").mockReturnValue(10);
+		const daySpy = spyOn(Date.prototype, "getDate").mockReturnValue(1);
+		const hourSpy = spyOn(Date.prototype, "getHours").mockReturnValue(1);
+		const minuteSpy = spyOn(Date.prototype, "getMinutes").mockReturnValue(30);
+		const secondSpy = spyOn(Date.prototype, "getSeconds").mockReturnValue(0);
+		const offsetSpy = spyOn(Date.prototype, "getTimezoneOffset").mockImplementation(function (this: Date) {
+			return this.getTime() === lowMs ? 240 : 300;
+		});
+		try {
+			const eta = estimatingEta(lowIso, highIso);
+			const hud = buildUltragoalHudSummary(statusSummaryWithEta(eta));
+			const chip = hud.chips?.find(item => item.label === "eta");
+			// Same local date/time down to the second on both sides, but genuinely different
+			// instants (a DST-fold-style pair straddling a UTC-offset change): the offset
+			// itself must disambiguate them instead of silently collapsing to one timestamp.
+			expect(chip?.value).toBe("~01:30:00 UTC-04:00\u201301:30:00 UTC-05:00 low/fallback");
+		} finally {
+			yearSpy.mockRestore();
+			monthSpy.mockRestore();
+			daySpy.mockRestore();
+			hourSpy.mockRestore();
+			minuteSpy.mockRestore();
+			secondSpy.mockRestore();
+			offsetSpy.mockRestore();
+		}
 	});
 });

@@ -35,12 +35,22 @@ interface UltragoalLikeGoal {
 	status: string;
 }
 
+interface UltragoalLikeEta {
+	state: string;
+	confidence?: string;
+	basis?: string;
+	finishAtLow?: string;
+	finishAtHigh?: string;
+	blockedReason?: string;
+}
+
 interface UltragoalHudState extends WorkflowGateHudState {
 	status: string;
 	currentGoal?: UltragoalLikeGoal;
 	counts: Record<string, number>;
 	goals: UltragoalLikeGoal[];
 	latestLedgerEvent?: { event?: string; goalId?: string; timestamp?: string; kind?: string; evidence?: string };
+	eta?: UltragoalLikeEta;
 	updatedAt?: string;
 }
 
@@ -84,6 +94,129 @@ function gateChips(state: WorkflowGateHudState, gatePriority: number): Array<Wor
 
 function compactChips(chips: Array<WorkflowHudChip | null>): WorkflowHudChip[] {
 	return chips.filter((item): item is WorkflowHudChip => item !== null);
+}
+
+function pad2(value: number): string {
+	return String(value).padStart(2, "0");
+}
+
+interface LocalDateParts {
+	year: number;
+	month: number;
+	day: number;
+	hour: number;
+	minute: number;
+	second: number;
+	/** Conventional signed UTC offset in minutes (east of UTC is positive), i.e. `-date.getTimezoneOffset()`. */
+	offsetMinutes: number;
+}
+
+function localDateParts(date: Date): LocalDateParts {
+	return {
+		year: date.getFullYear(),
+		month: date.getMonth() + 1,
+		day: date.getDate(),
+		hour: date.getHours(),
+		minute: date.getMinutes(),
+		second: date.getSeconds(),
+		offsetMinutes: -date.getTimezoneOffset(),
+	};
+}
+
+function formatHm(parts: LocalDateParts): string {
+	return `${pad2(parts.hour)}:${pad2(parts.minute)}`;
+}
+
+function formatMonthDayHm(parts: LocalDateParts): string {
+	return `${pad2(parts.month)}-${pad2(parts.day)} ${formatHm(parts)}`;
+}
+
+function formatFullDateHm(parts: LocalDateParts): string {
+	return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)} ${formatHm(parts)}`;
+}
+
+function withSeconds(text: string, parts: LocalDateParts): string {
+	return `${text}:${pad2(parts.second)}`;
+}
+
+function formatUtcOffset(offsetMinutes: number): string {
+	const sign = offsetMinutes < 0 ? "-" : "+";
+	const abs = Math.abs(offsetMinutes);
+	return `UTC${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
+}
+
+/**
+ * Deterministic (locale-independent, `Date` local-getter based) low\u2013high finish range.
+ * Same local calendar day: `HH:mm\u2013HH:mm`. Different day, same year: `MM-DD HH:mm\u2013MM-DD HH:mm`.
+ * Different year: `YYYY-MM-DD HH:mm\u2013YYYY-MM-DD HH:mm`. A range never silently drops the date
+ * when its endpoints fall on different local calendar days.
+ *
+ * Two distinct instants NEVER collapse to a single displayed value: a single value is only
+ * ever returned when the two ISO endpoints are the exact same instant. If minute-precision
+ * text happens to coincide (e.g. a 40s-wide range inside one displayed minute) the range
+ * widens to include seconds; if even that coincides (a DST-fold-style pair that shares the
+ * same local date/time down to the second but lands on opposite sides of a UTC-offset
+ * change) the range further annotates each endpoint with its UTC offset so the two instants
+ * stay individually identifiable.
+ */
+export function formatUltragoalLocalRange(lowIso: string, highIso: string): string | undefined {
+	const lowDate = new Date(lowIso);
+	const highDate = new Date(highIso);
+	if (Number.isNaN(lowDate.getTime()) || Number.isNaN(highDate.getTime())) return undefined;
+	if (lowDate.getTime() === highDate.getTime()) {
+		return formatHm(localDateParts(lowDate));
+	}
+	const low = localDateParts(lowDate);
+	const high = localDateParts(highDate);
+	const sameCalendarDay = low.year === high.year && low.month === high.month && low.day === high.day;
+	const sameYear = low.year === high.year;
+	const formatter = sameCalendarDay ? formatHm : sameYear ? formatMonthDayHm : formatFullDateHm;
+	let lowText = formatter(low);
+	let highText = formatter(high);
+	if (lowText === highText) {
+		lowText = withSeconds(lowText, low);
+		highText = withSeconds(highText, high);
+	}
+	if (lowText === highText) {
+		lowText = `${lowText} ${formatUtcOffset(low.offsetMinutes)}`;
+		highText = `${highText} ${formatUtcOffset(high.offsetMinutes)}`;
+	}
+	return `${lowText}\u2013${highText}`;
+}
+
+function abbreviateUltragoalConfidence(confidence: string | undefined): string | undefined {
+	if (confidence === "low" || confidence === "high") return confidence;
+	if (confidence === "medium") return "med";
+	return undefined;
+}
+
+function abbreviateUltragoalBasis(basis: string | undefined): string | undefined {
+	if (basis === "observed_median") return "observed";
+	if (basis === "fallback_default") return "fallback";
+	return undefined;
+}
+
+/**
+ * Never surfaces a single asserted timestamp: `estimating` shows a local finish-time
+ * range (marked `~`, annotated with a compact confidence/basis label), `blocked` shows
+ * the blocking reason instead of a fabricated finish time (also annotated with the same
+ * compact confidence/basis label, so a blocked run's honesty about its own uncertainty
+ * never regresses relative to an estimating one), and `complete` is omitted entirely (no
+ * ETA chip needed).
+ */
+function etaChip(eta: UltragoalLikeEta | undefined, priority: number): WorkflowHudChip | null {
+	if (!eta || eta.state === "complete") return null;
+	const confidenceLabel = abbreviateUltragoalConfidence(eta.confidence);
+	const basisLabel = abbreviateUltragoalBasis(eta.basis);
+	const suffix = confidenceLabel && basisLabel ? ` ${confidenceLabel}/${basisLabel}` : "";
+	if (eta.state === "blocked") {
+		const base = eta.blockedReason ? `blocked: ${eta.blockedReason}` : "blocked";
+		return chip("eta", `${base}${suffix}`, priority, "blocked");
+	}
+	if (!eta.finishAtLow || !eta.finishAtHigh) return null;
+	const range = formatUltragoalLocalRange(eta.finishAtLow, eta.finishAtHigh);
+	if (!range) return null;
+	return chip("eta", `~${range}${suffix}`, priority);
 }
 
 export function buildDeepInterviewHudSummary(state: DeepInterviewHudState): WorkflowHudSummary {
@@ -233,6 +366,7 @@ export function buildUltragoalHudSummary(state: UltragoalHudState): WorkflowHudS
 			blockers > 0 ? { label: "blocked", value: String(blockers), priority: 5, severity: "blocked" } : null,
 			chip("goals", `${complete}/${total}`, 10),
 			chip("current", state.currentGoal ? `${state.currentGoal.id}:${state.currentGoal.title}` : state.status, 20),
+			etaChip(state.eta, 25),
 			chip("status", state.status, 30, state.status === "complete" ? "success" : undefined),
 			chip(
 				"ledger",

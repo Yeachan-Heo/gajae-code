@@ -1032,6 +1032,22 @@ function buildHudForMode(
 									: undefined,
 						}
 					: undefined;
+			const rawEta = payload.eta;
+			const eta =
+				rawEta && typeof rawEta === "object" && !Array.isArray(rawEta)
+					? (() => {
+							const record = rawEta as Record<string, unknown>;
+							if (typeof record.state !== "string") return undefined;
+							return {
+								state: record.state,
+								confidence: typeof record.confidence === "string" ? record.confidence : undefined,
+								basis: typeof record.basis === "string" ? record.basis : undefined,
+								finishAtLow: typeof record.finishAtLow === "string" ? record.finishAtLow : undefined,
+								finishAtHigh: typeof record.finishAtHigh === "string" ? record.finishAtHigh : undefined,
+								blockedReason: typeof record.blockedReason === "string" ? record.blockedReason : undefined,
+							};
+						})()
+					: undefined;
 			const status = typeof payload.status === "string" ? (payload.status as string) : (phase ?? "pending");
 			return buildUltragoalHudSummary({
 				status,
@@ -1045,6 +1061,7 @@ function buildHudForMode(
 				counts,
 				goals: goals.map(g => ({ id: g.id as string, title: g.title as string, status: g.status as string })),
 				latestLedgerEvent,
+				eta,
 				updatedAt,
 			});
 		}
