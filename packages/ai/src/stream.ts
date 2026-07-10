@@ -11,6 +11,11 @@ import {
 } from "./model-thinking";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
+import {
+	hasResolvableAwsProfileSource,
+	isValidBedrockBearerToken,
+	readAwsStaticEnvironmentCredentials,
+} from "./providers/aws-credential-config";
 import type { CursorOptions } from "./providers/cursor";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
@@ -121,28 +126,12 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 			return "<authenticated>";
 		}
 	},
-	// Amazon Bedrock supports multiple credential sources:
-	// 1. AWS_PROFILE - named profile from ~/.aws/credentials
-	// 2. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY - standard IAM keys
-	// 3. AWS_BEARER_TOKEN_BEDROCK - Bedrock API keys (bearer token)
-	// 4. AWS_CONTAINER_CREDENTIALS_* - ECS/Task IAM role credentials
-	// 5. AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN - IRSA (EKS) web identity
+	// Advertise only credential sources implemented by the Bedrock request path.
+	// ECS and IRSA remain unavailable until matching resolvers are implemented.
 	"amazon-bedrock": () => {
-		const awsProfile = $credentialEnv("AWS_PROFILE");
-		const awsAccessKeyId = $credentialEnv("AWS_ACCESS_KEY_ID");
-		const awsSecretAccessKey = $credentialEnv("AWS_SECRET_ACCESS_KEY");
-		const awsBearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
-		const hasEcsCredentials =
-			!!$credentialEnv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") ||
-			!!$credentialEnv("AWS_CONTAINER_CREDENTIALS_FULL_URI");
-		const hasWebIdentity = !!$credentialEnv("AWS_WEB_IDENTITY_TOKEN_FILE") && !!$credentialEnv("AWS_ROLE_ARN");
-		if (
-			awsProfile ||
-			(awsAccessKeyId && awsSecretAccessKey) ||
-			awsBearerToken ||
-			hasEcsCredentials ||
-			hasWebIdentity
-		) {
+		const bearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
+		if (bearerToken) return isValidBedrockBearerToken(bearerToken) ? "<authenticated>" : undefined;
+		if (readAwsStaticEnvironmentCredentials() || hasResolvableAwsProfileSource()) {
 			return "<authenticated>";
 		}
 	},

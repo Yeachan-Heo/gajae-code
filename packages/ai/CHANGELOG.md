@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Made Bedrock model visibility reflect credential-only static/shared AWS sources with supported profile shapes, authenticated real bearer-token requests, and stopped advertising unsupported ECS/IRSA sources (#1934).
 
 ## [0.9.6] - 2026-07-10
 ### Fixed
