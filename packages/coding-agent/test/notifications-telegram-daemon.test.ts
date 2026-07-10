@@ -2324,17 +2324,115 @@ test("threaded mode off: image_attachment uploads flat without message_thread_id
 	expect(notice).toHaveLength(1);
 });
 
-test("non-private chat: fails closed before topic creation or flat delivery", async () => {
-	for (const chatType of ["supergroup", "group", "channel"]) {
+test("forum supergroup creates and uses a session topic", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "supergroup", is_forum: true } };
+		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 777 } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+		rich: { enabled: false },
+	});
+	const sent: string[] = [];
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		ws: {
+			readyState: 1,
+			send(value: string) {
+				sent.push(value);
+			},
+		},
+		pending: new Map(),
+	};
+	daemon.sessions.set("S", session as any);
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "context_update",
+		sessionId: "S",
+		lastMessage: "session output",
+	});
+
+	expect(bot.calls.filter(c => c.method === "getChat")).toHaveLength(1);
+	expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(1);
+	expect(bot.calls.some(c => c.method === "sendMessage" && c.body.message_thread_id === 777)).toBe(true);
+
+	bot.calls = [];
+	await daemon.handleTelegramUpdate({
+		update_id: 7,
+		message: {
+			chat: { id: -10042, type: "supergroup" },
+			message_thread_id: 777,
+			message_id: 555,
+			text: "forum reply",
+		},
+	});
+	expect(JSON.parse(sent[0]!)).toMatchObject({
+		type: "user_message",
+		text: "forum reply",
+		updateId: 7,
+	});
+	expect(bot.calls.some(c => c.method === "setMessageReaction" && c.body.message_id === 555)).toBe(true);
+});
+
+test("forum supergroup does not fall back to flat delivery when topic creation fails", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "supergroup", is_forum: true } };
+		if (method === "createForumTopic") return { ok: true, result: {} };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+		rich: { enabled: false },
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+
+	expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(1);
+	expect(
+		bot.calls.filter(c => ["sendMessage", "sendPhoto", "sendDocument", "sendRichMessage"].includes(c.method)),
+	).toHaveLength(0);
+});
+
+test("non-forum groups and channels fail closed before topic creation or flat delivery", async () => {
+	for (const chat of [{ type: "supergroup", is_forum: false }, { type: "group" }, { type: "channel" }]) {
 		const agentDir = tempAgentDir();
 		const bot = new FakeBotApi();
-		// Even if the target chat would accept forum topic creation, the paired chat
-		// contract is private-only, so the daemon must fail closed before creating
-		// topics or sending session content into a shared chat.
+		// Only a supergroup explicitly reported as a forum is topic-capable; other
+		// shared destinations must never receive session content.
 		bot.call = (async (method: string, body: any) => {
 			bot.calls.push({ method, body });
 			if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 777 } };
-			if (method === "getChat") return { ok: true, result: { type: chatType } };
+			if (method === "getChat") return { ok: true, result: chat };
 			if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
 			return { ok: true, result: true };
 		}) as any;
@@ -2367,8 +2465,11 @@ test("non-private chat: fails closed before topic creation or flat delivery", as
 			options: ["Yes"],
 		});
 
-		expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(0);
-		expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
+		expect(
+			bot.calls.filter(c =>
+				["createForumTopic", "sendMessage", "sendPhoto", "sendDocument", "sendRichMessage"].includes(c.method),
+			),
+		).toHaveLength(0);
 	}
 });
 

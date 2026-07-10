@@ -9,6 +9,7 @@
 ### Fixed
 
 - Preserved explicit Telegram forum-topic renames as durable user-owned names, immediately re-asserting delayed edits while retaining restart and rename-race recovery (#1910).
+- Allowed explicitly configured Telegram forum supergroups to use per-session topics while preserving private-only flat fallback and fail-closed behavior for non-forum shared chats.
 
 ## [0.9.6] - 2026-07-10
 ### Changed
