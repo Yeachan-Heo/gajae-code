@@ -8,6 +8,8 @@ import {
 	resolveLocalRoot,
 	resolveLocalUrlToPath,
 } from "@gajae-code/coding-agent/internal-urls";
+import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
+import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-"));
@@ -21,12 +23,95 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 describe("LocalProtocolHandler", () => {
 	beforeEach(() => {
 		LocalProtocolHandler.resetOverrideForTests();
+		AgentRegistry.resetGlobalForTests();
 		InternalUrlRouter.resetForTests();
 	});
 
 	afterEach(() => {
 		LocalProtocolHandler.resetOverrideForTests();
+		AgentRegistry.resetGlobalForTests();
 		InternalUrlRouter.resetForTests();
+	});
+
+	it("prefers explicit owned mappings over a live main registry session", () => {
+		AgentRegistry.global().register({
+			id: "main",
+			displayName: "main",
+			kind: "main",
+			status: "running",
+			session: {
+				sessionManager: {
+					getArtifactsDir: () => "/registry-artifacts",
+					getSessionId: () => "registry-session",
+				},
+			} as unknown as AgentSession,
+		});
+		const owned = { getArtifactsDir: () => "/owned-artifacts", getSessionId: () => "owned-session" };
+		const dispose = LocalProtocolHandler.installOverride(owned);
+
+		expect(LocalProtocolHandler.resolveOptions()).toBe(owned);
+
+		dispose();
+		const fallback = LocalProtocolHandler.resolveOptions();
+		expect(fallback?.getArtifactsDir?.()).toBe("/registry-artifacts");
+		expect(fallback?.getSessionId?.()).toBe("registry-session");
+	});
+
+	it("uses only live main registry sessions as the fallback", () => {
+		const session = {
+			sessionManager: {
+				getArtifactsDir: () => "/registry-artifacts",
+				getSessionId: () => "registry-session",
+			},
+		} as unknown as AgentSession;
+		const resolveForStatus = (status: "idle" | "completed" | "aborted") => {
+			AgentRegistry.resetGlobalForTests();
+			AgentRegistry.global().register({
+				id: "main",
+				displayName: "main",
+				kind: "main",
+				status,
+				session,
+			});
+			return LocalProtocolHandler.resolveOptions();
+		};
+
+		const idle = resolveForStatus("idle");
+		expect(idle?.getArtifactsDir?.()).toBe("/registry-artifacts");
+		expect(idle?.getSessionId?.()).toBe("registry-session");
+		expect(resolveForStatus("completed")).toBeUndefined();
+		expect(resolveForStatus("aborted")).toBeUndefined();
+	});
+
+	it("keeps the newest owned mapping live until its exact disposer runs", () => {
+		const first = { getArtifactsDir: () => "/first", getSessionId: () => "first" };
+		const second = { getArtifactsDir: () => "/second", getSessionId: () => "second" };
+		const third = { getArtifactsDir: () => "/third", getSessionId: () => "third" };
+		const disposeFirst = LocalProtocolHandler.installOverride(first);
+		const disposeSecond = LocalProtocolHandler.installOverride(second);
+		const disposeThird = LocalProtocolHandler.installOverride(third);
+
+		expect(LocalProtocolHandler.resolveOptions()).toBe(third);
+		disposeSecond();
+		expect(LocalProtocolHandler.resolveOptions()).toBe(third);
+		disposeSecond();
+		expect(LocalProtocolHandler.resolveOptions()).toBe(third);
+		disposeThird();
+		expect(LocalProtocolHandler.resolveOptions()).toBe(first);
+		disposeFirst();
+		expect(LocalProtocolHandler.resolveOptions()).toBeUndefined();
+		disposeFirst();
+		expect(LocalProtocolHandler.resolveOptions()).toBeUndefined();
+	});
+
+	it("reset clears direct and owned overrides", () => {
+		const owned = { getArtifactsDir: () => "/owned", getSessionId: () => "owned" };
+		LocalProtocolHandler.installOverride(owned);
+		LocalProtocolHandler.setOverride({ getArtifactsDir: () => "/direct", getSessionId: () => "direct" });
+
+		LocalProtocolHandler.resetOverrideForTests();
+
+		expect(LocalProtocolHandler.resolveOptions()).toBeUndefined();
 	});
 
 	it("lists files at local://", async () => {

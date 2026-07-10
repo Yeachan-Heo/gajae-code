@@ -1272,6 +1272,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const isSubSession = taskDepth > 0 || Boolean(options.parentTaskPrefix) || Boolean(options.currentAgentType);
 	const resolvedAgentDisplayName = options.agentDisplayName ?? (isSubSession ? "sub" : "main");
 	const evalKernelOwnerId = `agent-session:${Snowflake.next()}`;
+	let disposeLocalProtocolOverride: (() => void) | undefined;
+	let localProtocolOverrideReleased = false;
+	const releaseLocalProtocolOverride = (): void => {
+		if (localProtocolOverrideReleased) return;
+		localProtocolOverrideReleased = true;
+		disposeLocalProtocolOverride?.();
+	};
 
 	try {
 		const getActiveModelString = (): string | undefined => {
@@ -1401,7 +1408,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
 		}
 		if (options.localProtocolOptions) {
-			LocalProtocolHandler.setOverride(options.localProtocolOptions);
+			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
 		toolSession.agentOutputManager = new AgentOutputManager(
@@ -2371,6 +2378,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				} finally {
 					agentRegistry.unregister(resolvedAgentId);
 					unsubscribeCredentialDisabled?.();
+					releaseLocalProtocolOverride();
 				}
 			};
 		}
@@ -2535,6 +2543,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			logger.warn("Failed to clean up createAgentSession resources after startup error", {
 				error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
 			});
+		} finally {
+			releaseLocalProtocolOverride();
 		}
 		throw error;
 	}
