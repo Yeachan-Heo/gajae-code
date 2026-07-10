@@ -114,7 +114,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git curl ca-certificates unzip openssh-client tini sqlite3 \
+        git curl ca-certificates unzip openssh-client tini sqlite3 tmux gh \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
