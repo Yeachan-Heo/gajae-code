@@ -60,7 +60,7 @@ profiles:
       architect: google-antigravity/gemini-3.1-pro-low
       critic:    google-antigravity/gemini-3.5-flash
 
-  monorepo:              # huge codebases (openai-codex excluded: 272k context cap)
+  monorepo:              # huge codebases (Codex omitted in favor of longer-context roles)
     required_providers: [anthropic, google-antigravity, opencode-go]
     model_mapping:
       default:   anthropic/claude-opus-4-8:medium
@@ -115,7 +115,7 @@ On standard tasks, all current frontier models in the catalog are accurate; **pi
 Observed via live `gjc -p` calls; useful when wiring the profiles above:
 
 - **Antigravity Gemini, high reasoning** → use `google-antigravity/gemini-3.1-pro-low:high`. The id `gemini-3.1-pro-high` returns HTTP 400 (no matching backend model); `thinkingLevel` is a per-request parameter, so raising it on `gemini-3.1-pro-low` invokes the model's native high-reasoning mode rather than a degraded one.
-- **openai-codex on a ChatGPT account** serves base GPT only (`gpt-5.5`, `gpt-5.4`). Standalone `-codex` variants (`gpt-5.3-codex`, `gpt-5.2-codex`, `gpt-5.1-codex-max` / `-mini`) return `not supported when using Codex with a ChatGPT account`.
+- **openai-codex on an eligible ChatGPT account** serves base GPT models, including the tiered `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-5.6-sol` selectors as well as `gpt-5.5` and `gpt-5.4`. Account rollout can affect live availability. Standalone `-codex` variants (`gpt-5.3-codex`, `gpt-5.2-codex`, `gpt-5.1-codex-max` / `-mini`) return `not supported when using Codex with a ChatGPT account`.
 - **Single-message input limit is separate from the context window.** `claude-opus-4-8` runs with a 1M window via multi-turn accumulation, but a single `@file` message above ~400k tokens returns 400 on `anthropic` / `google-antigravity`; `xai` / `opencode-go` accept larger single messages. Chunk very large inputs across turns instead of pasting one block.
 - **Some selectors come from a provider's live catalog, not the bundled snapshot.** `opencode-go/glm-5.2` and `google-antigravity/gemini-3.5-flash` resolved in `gjc -p` tests but are **not** in `packages/ai/src/models.json`; they appear only after the provider's online model discovery has populated the registry. `required_providers` verifies credentials at activation — it does **not** guarantee fresh, non-stale discovery — so activation can still fail with `selector did not resolve` until discovery runs (re-login or retry to refresh). If you hit that, substitute a bundled id: `opencode-go/deepseek-v4-pro` for the critic, or `zai/glm-5.2` (add `zai` to `required_providers`) for GLM 5.2.
 

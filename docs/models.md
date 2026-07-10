@@ -206,13 +206,13 @@ profiles:
 
 Built-in profiles are grouped by provider mix and tier:
 
-- `codex-{eco,medium,pro}` — all roles on `openai-codex/gpt-5.5`, differing only by per-role reasoning effort
+- `codex-{eco,medium,pro}` — GPT-5.6 tier-family mixes, with Sol leading orchestration and architecture while Luna, Terra, and Sol cover delegated roles by tier
 - `opencodego` — single OpenCode Go preset (Kimi default, DeepSeek executor/architect, Qwen planner, MiMo critic)
 - `claude-opus` — Anthropic OAuth preset centered on `claude-opus-4-8`
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
 - Combos: `opus-codex` (Claude main agent with Codex support roles), `codex-opencodego` (Codex orchestrator/architect with OpenCode Go workers)
 
-The `eco` tier favors cheaper/faster defaults, `medium` matches normal production defaults, and `pro` raises reasoning for architect, critic, and planner roles. Effort suffixes are clamped to each model's supported thinking range at preview and activation time (for example `codex-eco`'s executor `:minimal` resolves to effective `low` on `gpt-5.5`). Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-1.5`, `minimax-code/minimax-m3`). User-defined profiles override built-ins by exact profile name.
+The Codex tiers use GPT-5.6 Luna, Terra, and Sol instead of one GPT-5.5 model differentiated only by effort. `eco` keeps delegated roles on Luna, `medium` introduces Terra, and `pro` concentrates Sol on the highest-impact roles. GPT-5.6 supports reasoning levels from `low` through `max`; preview and activation preserve an explicit effort when the selected model supports it and otherwise clamp it to the model's advertised range. Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-1.5`, `minimax-code/minimax-m3`). User-defined profiles override built-ins by exact profile name.
 
 
 Use `gjc --mpreset <name>` to activate a profile for the current session only. Activation hard-blocks when any provider listed in `required_providers` lacks credentials. Add `--default` to persist the selected profile as `modelProfile.default` in `config.yml`, so it applies at startup:
@@ -572,7 +572,7 @@ So a model can exist in registry but not be selectable until auth is available.
 - exact model id (provider inferred)
 - fuzzy/substring matching
 - glob scope patterns in `--models` (e.g. `openai/*`, `*sonnet*`)
-- optional `:thinkingLevel` suffix (`off|minimal|low|medium|high|xhigh`)
+- optional `:thinkingLevel` suffix (`off|minimal|low|medium|high|xhigh|max`)
 
 `--provider` is legacy; `--model` is preferred.
 
@@ -599,7 +599,7 @@ Supported model roles:
 
 - `default` plus the agent assignment targets `executor`, `architect`, `planner`, `critic`
 
-Role aliases like `pi/default` expand through `settings.modelRoles`. Each role value can also append a thinking selector such as `:minimal`, `:low`, `:medium`, or `:high`.
+Role aliases like `pi/default` expand through `settings.modelRoles`. Each role value can also append a thinking selector from `:minimal` through `:max` when the selected model supports it.
 
 If a role points at another role, the target model still inherits normally and any explicit suffix on the referring role wins for that role-specific use.
 
@@ -723,7 +723,7 @@ Request shaping:
 Reasoning / thinking:
 
 - `supportsReasoningEffort` — accept `reasoning_effort`. Default: auto (off for Grok and zAI).
-- `reasoningEffortMap` — partial map from internal effort levels (`minimal|low|medium|high|xhigh`) to provider-specific strings (e.g. DeepSeek maps `xhigh -> "max"`).
+- `reasoningEffortMap` — partial map from internal effort levels (`minimal|low|medium|high|xhigh|max`) to provider-specific strings (e.g. DeepSeek maps `xhigh -> "max"`).
 - `thinkingFormat` — request shape for thinking: `"openai"` (`reasoning_effort`), `"openrouter"` (`reasoning: { effort }`), `"zai"` (`thinking: { type: "enabled" }`), `"qwen"` (top-level `enable_thinking`), or `"qwen-chat-template"` (`chat_template_kwargs.enable_thinking`). Default: `"openai"`.
 - `reasoningContentField` — assistant field carrying chain-of-thought: `"reasoning_content"`, `"reasoning"`, or `"reasoning_text"`. Default: auto.
 - `requiresReasoningContentForToolCalls` — assistant tool-call turns must round-trip the reasoning field (DeepSeek-R1, Kimi, OpenRouter when reasoning is on). Default: `false`.
