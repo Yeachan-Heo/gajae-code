@@ -24,6 +24,8 @@ async function run(scenario: string, env: Record<string, string> = {}): Promise<
 			path.join(project, ".env"),
 			"AWS_PROFILE=dotenv-profile\nAWS_SHARED_CREDENTIALS_FILE=dotenv-credentials\nAWS_CONFIG_FILE=dotenv-config\nAWS_ACCESS_KEY_ID=dotenv-key\nAWS_SECRET_ACCESS_KEY=dotenv-secret\nAWS_BEARER_TOKEN_BEDROCK=dotenv-token\nOPENAI_API_KEY=dotenv-openai\n",
 		);
+	} else if (scenario === "dotenv-imds-disabled") {
+		await fs.writeFile(path.join(project, ".env"), "AWS_EC2_METADATA_DISABLED=true\n");
 	}
 	const launcher = path.join(project, "issue-1934-bedrock-auth-launcher.ts");
 	await fs.writeFile(launcher, `import ${JSON.stringify(pathToFileURL(fixture).href)};\n`);
@@ -57,7 +59,7 @@ async function run(scenario: string, env: Record<string, string> = {}): Promise<
 			GJC_CONFIG_DIR: path.join(root, "gjc-config"),
 			GJC_CODING_AGENT_DIR: path.join(root, "agent"),
 			PI_CODING_AGENT_DIR: path.join(root, "agent"),
-			AWS_EC2_METADATA_DISABLED: "true",
+			...(scenario === "dotenv-imds-disabled" ? {} : { AWS_EC2_METADATA_DISABLED: "true" }),
 			...awsFileEnv,
 			...env,
 		},
@@ -159,6 +161,10 @@ describe("issue #1934 Bedrock credential-source isolation", () => {
 
 	test("does not use project dotenv credentials, bearer tokens, or unrelated provider keys", async () => {
 		expect(await run("dotenv")).toEqual({ available: false, openai: false, resolved: false, transportRequests: 0 });
+	});
+
+	test("honors project dotenv IMDS disable without probing metadata", async () => {
+		expect(await run("dotenv-imds-disabled")).toEqual({ imdsFetches: 0, resolved: false });
 	});
 
 	test("reuses profile availability within the cache age and rescans after expiry", async () => {

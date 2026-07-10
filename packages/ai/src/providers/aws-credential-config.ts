@@ -19,6 +19,7 @@ export interface AwsCredentialSource {
 export type AwsProfileCapability = "static" | "process" | "sso" | undefined;
 
 const AVAILABILITY_CACHE_MAX_AGE_MS = 1_000;
+const MAX_AWS_INI_FILE_BYTES = 1024 * 1024;
 
 interface FileFingerprint {
 	exists: boolean;
@@ -128,10 +129,30 @@ export function isValidBedrockBearerToken(token: string | undefined): token is s
 }
 
 function readAwsIniSync(filePath: string): AwsIniFile | undefined {
+	let fd: number | undefined;
 	try {
-		return parseAwsIni(fs.readFileSync(filePath, "utf8"));
+		fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile() || stat.size > MAX_AWS_INI_FILE_BYTES) return undefined;
+		const contents = Buffer.allocUnsafe(MAX_AWS_INI_FILE_BYTES + 1);
+		let bytesRead = 0;
+		while (bytesRead < contents.length) {
+			const count = fs.readSync(fd, contents, bytesRead, contents.length - bytesRead, bytesRead);
+			if (count === 0) break;
+			bytesRead += count;
+		}
+		if (bytesRead > MAX_AWS_INI_FILE_BYTES) return undefined;
+		return parseAwsIni(contents.toString("utf8", 0, bytesRead));
 	} catch {
 		return undefined;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Ignore close errors because file availability has already been determined.
+			}
+		}
 	}
 }
 

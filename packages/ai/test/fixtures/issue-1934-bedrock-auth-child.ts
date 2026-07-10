@@ -291,6 +291,29 @@ async function main(): Promise<void> {
 			});
 			return;
 		}
+		case "dotenv-imds-disabled": {
+			const originalFetch = globalThis.fetch;
+			let imdsFetches = 0;
+			globalThis.fetch = Object.assign(
+				async () => {
+					imdsFetches++;
+					throw new Error("Unexpected IMDS fetch.");
+				},
+				{ preconnect: originalFetch.preconnect },
+			);
+			let resolved = false;
+			try {
+				await resolveAwsCredentials({ region: "us-east-1" });
+				resolved = true;
+			} catch (error) {
+				if (!(error instanceof Error) || !error.message.startsWith("Unable to resolve AWS credentials."))
+					throw error;
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+			output({ imdsFetches, resolved });
+			return;
+		}
 		case "cache": {
 			const availableProfile = "[default]\naws_access_key_id = dummy\naws_secret_access_key = dummy\n";
 			const unavailableProfile = "[default]\naws_access_key_id = dumme\naws_secret_access_kez = dummy\n";

@@ -135,23 +135,21 @@ When `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to
 
 ### Amazon Bedrock
 
-| Variable                                                                        | Default / behavior                                                                            |
-| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `AWS_REGION`                                                                    | Primary region source                                                                         |
-| `AWS_DEFAULT_REGION`                                                            | Fallback if `AWS_REGION` unset                                                                |
-| `AWS_PROFILE`                                                                   | Enables named profile auth path                                                               |
-| `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`                                   | Enables IAM key auth path                                                                     |
-| `AWS_BEARER_TOKEN_BEDROCK`                                                      | Enables bearer token auth path                                                                |
-| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` / `AWS_CONTAINER_CREDENTIALS_FULL_URI` | Enables ECS task credential path                                                              |
-| `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`                                  | Enables web identity auth path                                                                |
-| `AWS_BEDROCK_SKIP_AUTH`                                                         | If `1`, injects dummy credentials (proxy/non-auth scenarios)                                  |
-| `AWS_BEDROCK_FORCE_HTTP1`                                                       | If `1`, forces Node HTTP/1 request handler                                                    |
-| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`                                      | Routes Bedrock runtime and AWS SSO credential calls through the configured proxy using HTTP/1 |
-| `NO_PROXY`                                                                      | Excludes matching hosts from proxy routing when a proxy variable is configured                |
+| Variable | Default / behavior |
+| --- | --- |
+| `AWS_REGION` | Primary region source |
+| `AWS_DEFAULT_REGION` | Fallback if `AWS_REGION` is unset |
+| `AWS_BEARER_TOKEN_BEDROCK` | Uses bearer-token authentication (`Authorization: Bearer <token>`) instead of SigV4 |
+| `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` + optional `AWS_SESSION_TOKEN` | Static environment credentials for SigV4 authentication |
+| `AWS_PROFILE` | Selects a named `~/.aws/credentials` / `~/.aws/config` profile; static, SSO, and `credential_process` profiles are supported |
+| `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE` | Override the named profile credentials and config file paths |
+| `AWS_EC2_METADATA_DISABLED` | Set to `true` to disable the final EC2 IMDSv2 credential fallback |
+| `AWS_BEDROCK_SKIP_AUTH` | Truthy values (`1`, `y`, `true`, `yes`, or `on`, case-insensitive) use dummy SigV4 credentials for non-auth proxy scenarios |
+| `HTTPS_PROXY` | Honored by Bun's native HTTPS proxy support |
 
 Region fallback in provider code: `options.region` → `AWS_REGION` → `AWS_DEFAULT_REGION` → `us-east-1`.
 
-Credential fallback order is static env (`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` plus optional `AWS_SESSION_TOKEN`), named profile / SSO / `credential_process`, then EC2 IMDSv2. `models.yml` Bedrock entries use `api: bedrock-converse-stream` and do not require `apiKey` or `apiKeyEnv` because the provider signs requests from this AWS chain.
+Authentication uses `AWS_BEARER_TOKEN_BEDROCK` when set; otherwise credential fallback order is complete static environment credentials, the selected named profile (static, SSO, or `credential_process`), then EC2 IMDSv2 unless `AWS_EC2_METADATA_DISABLED=true`. Region and IMDS controls use the normal merged environment, including project `cwd/.env`; bearer tokens, static credentials, profiles, and credential file selectors use the credential environment, so project `cwd/.env` credential values are excluded. ECS task credentials and IRSA/web-identity credentials are not implemented. `models.yml` Bedrock entries use `api: bedrock-converse-stream` and do not require `apiKey` or `apiKeyEnv` because the provider authenticates through this AWS chain.
 
 ### Azure OpenAI Responses
 
