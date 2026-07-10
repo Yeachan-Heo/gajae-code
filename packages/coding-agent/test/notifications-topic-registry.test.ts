@@ -163,6 +163,15 @@ describe("TopicRegistry", () => {
 		expect(reloaded.needsIdentity("s1")).toBe(false);
 		expect(reloaded.sessionForTopic("t1")).toBe("s1");
 	});
+
+	test("serializes an optional Telegram chat scope", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "t1");
+		expect(reg.serialize("-10042")).toMatchObject({
+			chatId: "-10042",
+			topics: { s1: { topicId: "t1" } },
+		});
+	});
 	test("concurrent getOrCreateTopic for one session creates exactly one topic (no race)", async () => {
 		const reg = new TopicRegistry();
 		let creates = 0;
@@ -180,6 +189,43 @@ describe("TopicRegistry", () => {
 		expect(creates).toBe(1);
 		expect(results.map(r => r.topicId)).toEqual(["topic-1", "topic-1", "topic-1"]);
 		expect(reg.sessionForTopic("topic-1")).toBe("s1");
+	});
+	test("cancelling an in-flight create discards its remote winner without replacing a fresh topic", async () => {
+		const reg = new TopicRegistry();
+		const createStarted = Promise.withResolvers<void>();
+		const releaseCreate = Promise.withResolvers<void>();
+		const discarded: string[] = [];
+		const stale = reg.getOrCreateTopic(
+			"s1",
+			async () => {
+				createStarted.resolve();
+				await releaseCreate.promise;
+				return "stale";
+			},
+			() => 1,
+			"stale name",
+			async topicId => {
+				discarded.push(topicId);
+			},
+		);
+		await createStarted.promise;
+
+		expect(reg.cancelPendingCreate("s1")).toBe(true);
+		expect(reg.cancelPendingCreate("s1")).toBe(false);
+		const fresh = await reg.getOrCreateTopic(
+			"s1",
+			async () => "fresh",
+			() => 2,
+			"fresh name",
+		);
+		releaseCreate.resolve();
+
+		await expect(stale).rejects.toThrow("topic creation cancelled");
+		expect(discarded).toEqual(["stale"]);
+		expect(fresh.topicId).toBe("fresh");
+		expect(reg.get("s1")?.topicId).toBe("fresh");
+		expect(reg.sessionForTopic("stale")).toBeUndefined();
+		expect(reg.sessionForTopic("fresh")).toBe("s1");
 	});
 
 	test("deletes topic records so later use creates a fresh topic", async () => {
@@ -199,5 +245,75 @@ describe("TopicRegistry", () => {
 		expect(created).toBe(true);
 		expect(rec.topicId).toBe("t2");
 		expect(reg.sessionForTopic("t2")).toBe("s1");
+	});
+	test("pending deletion remains durable while an in-flight replacement publishes", async () => {
+		const reg = new TopicRegistry();
+		const stale = await reg.getOrCreateTopic("s1", async () => "stale");
+		expect(reg.delete("s1")).toBe(true);
+
+		const createStarted = Promise.withResolvers<void>();
+		const releaseCreate = Promise.withResolvers<void>();
+		const freshPromise = reg.getOrCreateTopic("s1", async () => {
+			createStarted.resolve();
+			await releaseCreate.promise;
+			return "fresh";
+		});
+		await createStarted.promise;
+
+		expect(reg.queuePendingDelete("s1", stale.topicId, stale.createdAt)).toBe(true);
+		expect(reg.queuePendingDelete("s1", stale.topicId, stale.createdAt)).toBe(false);
+		releaseCreate.resolve();
+		const fresh = await freshPromise;
+
+		expect(reg.get("s1")).toBe(fresh);
+		expect(reg.sessionForTopic("stale")).toBeUndefined();
+		expect(reg.sessionForTopic("fresh")).toBe("s1");
+		expect(reg.pendingDeletesForSession("s1").map(record => record.topicId)).toEqual(["stale"]);
+
+		const reloaded = new TopicRegistry(reg.serialize("-10042"));
+		expect(reloaded.get("s1")?.topicId).toBe("fresh");
+		expect(reloaded.pendingDeletesForSession("s1").map(record => record.topicId)).toEqual(["stale"]);
+		expect(reloaded.deletePendingDelete("stale")).toBe(true);
+		expect(reloaded.pendingDeletesForSession("s1")).toEqual([]);
+	});
+	test("duplicate active topic ids fail closed instead of assigning inbound authority", () => {
+		const reg = new TopicRegistry({
+			topics: {
+				first: { topicId: "777", identitySent: true, createdAt: 1 },
+				second: { topicId: "777", identitySent: true, createdAt: 2 },
+			},
+		});
+
+		expect(reg.get("first")).toBeUndefined();
+		expect(reg.get("second")).toBeUndefined();
+		expect(reg.sessionForTopic("777")).toBeUndefined();
+		expect(reg.serialize().topics).toEqual({});
+	});
+
+	test("persisted pending deletion cannot target any active topic claim", () => {
+		const reg = new TopicRegistry({
+			topics: {
+				active: { topicId: "777", identitySent: true, createdAt: 1 },
+			},
+			pendingDeletes: [{ sessionId: "old", topicId: "777", createdAt: 0 }],
+		});
+
+		expect(reg.get("active")?.topicId).toBe("777");
+		expect(reg.sessionForTopic("777")).toBe("active");
+		expect(reg.pendingDeletesForSession("old")).toEqual([]);
+		expect(reg.serialize().pendingDeletes).toBeUndefined();
+	});
+
+	test("runtime topic-id collisions preserve the existing active or pending owner", async () => {
+		const active = new TopicRegistry();
+		await active.getOrCreateTopic("active", async () => "777");
+		expect(active.queuePendingDelete("old", "777", 0)).toBe(false);
+		expect(active.get("active")?.topicId).toBe("777");
+
+		const deleting = new TopicRegistry();
+		expect(deleting.queuePendingDelete("old", "777", 0)).toBe(true);
+		await expect(deleting.getOrCreateTopic("replacement", async () => "777")).rejects.toThrow("conflicting topic id");
+		expect(deleting.get("replacement")).toBeUndefined();
+		expect(deleting.pendingDeletesForSession("old").map(record => record.topicId)).toEqual(["777"]);
 	});
 });

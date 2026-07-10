@@ -1,10 +1,11 @@
 /**
  * Per-session forum-topic registry for the threaded session surface.
  *
- * Each GJC session owns one active Telegram forum topic in the paired private
- * DM. The topic is created via `createForumTopic`, reused while the session
- * remains active, and removed from the registry when the daemon deletes it on
- * shutdown. The registry also tracks whether the one-time identity header has
+ * Each GJC session owns one active Telegram forum topic in the configured
+ * topic-capable chat. The topic is created via `createForumTopic`, reused while
+ * the session remains active, and removed from the registry when the daemon
+ * deletes it on shutdown.
+ * The registry also tracks whether the one-time identity header has
  * already been pinned, so it is sent exactly once per active topic, even across
  * reconnects.
  *
@@ -33,10 +34,25 @@ export interface TopicRecord {
 	identityKey?: string;
 }
 
+/** Durable retry record for a remote topic that still needs deletion. */
+export interface PendingTopicDelete {
+	sessionId: string;
+	topicId: string;
+	createdAt: number;
+	/** Number of consecutive failed remote deletion attempts. */
+	attempts?: number;
+	/** Earliest timestamp at which another remote deletion may be attempted. */
+	nextAttemptAt?: number;
+}
+
 /** Serialisable shape persisted to disk. */
 export interface TopicRegistryState {
 	/** sessionId -> record. */
 	topics: Record<string, TopicRecord>;
+	/** Remote topic deletions retained independently of replacement generations. */
+	pendingDeletes?: PendingTopicDelete[];
+	/** Telegram destination that owns every topic id in this state. */
+	chatId?: string;
 }
 
 export function emptyTopicRegistryState(): TopicRegistryState {
@@ -52,18 +68,29 @@ export class TopicRegistry {
 	private readonly topics: Map<string, TopicRecord>;
 	/** Maps topicId -> sessionId for fast inbound routing. */
 	private readonly byTopic = new Map<string, string>();
-	/** In-flight create promises, keyed by session, to dedupe concurrent creates. */
-	private readonly inflight = new Map<string, Promise<TopicRecord>>();
+	/** Remote deletions awaiting a confirmed Telegram success response. */
+	private readonly pendingDeletes = new Map<string, PendingTopicDelete>();
+	/** In-flight create promises, keyed by session, to dedupe or cancel concurrent creates. */
+	private readonly inflight = new Map<
+		string,
+		{ cancellation: { cancelled: boolean }; promise: Promise<TopicRecord> }
+	>();
 
 	constructor(state: TopicRegistryState = emptyTopicRegistryState()) {
 		this.topics = new Map();
 		this.load(state);
 	}
 
-	/** Merge serialized state and normalize authority fields from older releases. */
+	/** Replace serialized state and fail closed on conflicting topic ownership. */
 	load(state: TopicRegistryState): void {
+		this.topics.clear();
+		this.byTopic.clear();
+		this.pendingDeletes.clear();
+
+		const candidates: Array<[string, TopicRecord]> = [];
+		const topicClaimCounts = new Map<string, number>();
 		for (const [sessionId, raw] of Object.entries(state.topics ?? {})) {
-			if (!raw || typeof raw.topicId !== "string") continue;
+			if (!raw || typeof raw.topicId !== "string" || !raw.topicId) continue;
 			const hasValidUserAuthority =
 				raw.nameOwner === "user" &&
 				typeof raw.name === "string" &&
@@ -74,15 +101,44 @@ export class TopicRegistry {
 			const record: TopicRecord = {
 				topicId: raw.topicId,
 				identitySent: raw.identitySent === true,
-				createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
+				createdAt: typeof raw.createdAt === "number" && Number.isFinite(raw.createdAt) ? raw.createdAt : 0,
 				...(typeof raw.name === "string" ? { name: raw.name } : {}),
 				...(hasValidUserAuthority ? { nameOwner: "user" as const } : {}),
 				...(hasValidUserAuthority && raw.nameReconcilePending === true ? { nameReconcilePending: true } : {}),
 				...(hasValidUserAuthority ? { userNameUpdateId: raw.userNameUpdateId } : {}),
 				...(typeof raw.identityKey === "string" ? { identityKey: raw.identityKey } : {}),
 			};
+			candidates.push([sessionId, record]);
+			topicClaimCounts.set(record.topicId, (topicClaimCounts.get(record.topicId) ?? 0) + 1);
+		}
+		const claimedTopicIds = new Set(candidates.map(([, record]) => record.topicId));
+		for (const [sessionId, record] of candidates) {
+			if (topicClaimCounts.get(record.topicId) !== 1) continue;
 			this.topics.set(sessionId, record);
 			this.byTopic.set(record.topicId, sessionId);
+		}
+		for (const raw of state.pendingDeletes ?? []) {
+			if (
+				!raw ||
+				typeof raw.sessionId !== "string" ||
+				!raw.sessionId ||
+				typeof raw.topicId !== "string" ||
+				!raw.topicId ||
+				claimedTopicIds.has(raw.topicId) ||
+				this.pendingDeletes.has(raw.topicId)
+			)
+				continue;
+			this.pendingDeletes.set(raw.topicId, {
+				sessionId: raw.sessionId,
+				topicId: raw.topicId,
+				createdAt: typeof raw.createdAt === "number" && Number.isFinite(raw.createdAt) ? raw.createdAt : 0,
+				...(typeof raw.attempts === "number" && Number.isSafeInteger(raw.attempts) && raw.attempts > 0
+					? { attempts: raw.attempts }
+					: {}),
+				...(typeof raw.nextAttemptAt === "number" && Number.isFinite(raw.nextAttemptAt)
+					? { nextAttemptAt: raw.nextAttemptAt }
+					: {}),
+			});
 		}
 	}
 
@@ -110,6 +166,7 @@ export class TopicRegistry {
 		create: () => Promise<string>,
 		now: () => number = Date.now,
 		name?: string,
+		discard?: (topicId: string) => Promise<void>,
 	): Promise<TopicRecord> {
 		const existing = this.topics.get(sessionId);
 		if (existing) return existing;
@@ -118,20 +175,41 @@ export class TopicRegistry {
 		// `existing` check before `create()` resolves and creates a DUPLICATE
 		// forum topic. Share a single in-flight create per session id.
 		const pending = this.inflight.get(sessionId);
-		if (pending) return pending;
+		if (pending) return pending.promise;
+		const cancellation = { cancelled: false };
 		const promise = (async () => {
 			const topicId = await create();
+			if (cancellation.cancelled) {
+				try {
+					await discard?.(topicId);
+				} catch {}
+				throw new Error("topic creation cancelled");
+			}
+			if (this.byTopic.has(topicId) || this.pendingDeletes.has(topicId))
+				throw new Error("topic creation returned a conflicting topic id");
 			const record: TopicRecord = { topicId, name, identitySent: false, createdAt: now() };
 			this.topics.set(sessionId, record);
 			this.byTopic.set(topicId, sessionId);
 			return record;
 		})();
-		this.inflight.set(sessionId, promise);
+		this.inflight.set(sessionId, { cancellation, promise });
 		try {
 			return await promise;
 		} finally {
-			this.inflight.delete(sessionId);
+			if (this.inflight.get(sessionId)?.promise === promise) this.inflight.delete(sessionId);
 		}
+	}
+
+	/**
+	 * Cancel an unresolved creation so session teardown wins the race. A later
+	 * creation starts independently, while the stale winner is discarded.
+	 */
+	cancelPendingCreate(sessionId: string): boolean {
+		const pending = this.inflight.get(sessionId);
+		if (!pending) return false;
+		pending.cancellation.cancelled = true;
+		this.inflight.delete(sessionId);
+		return true;
 	}
 
 	/** Mark the identity header as sent for a session. Idempotent. */
@@ -209,17 +287,53 @@ export class TopicRegistry {
 		record.nameReconcilePending = false;
 	}
 
-	/** Remove a session topic record after Telegram deletes the topic. */
+	/** Remove one session's active topic without disturbing another owner. */
 	delete(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
 		if (!record) return false;
 		this.topics.delete(sessionId);
-		this.byTopic.delete(record.topicId);
+		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
+		return true;
+	}
+
+	/** Retain a remote deletion only while no active session owns that topic id. */
+	queuePendingDelete(sessionId: string, topicId: string, createdAt: number): boolean {
+		if (this.byTopic.has(topicId) || this.pendingDeletes.has(topicId)) return false;
+		this.pendingDeletes.set(topicId, { sessionId, topicId, createdAt });
+		return true;
+	}
+
+	/** Pending remote deletions for one logical session. */
+	pendingDeletesForSession(sessionId: string): PendingTopicDelete[] {
+		return [...this.pendingDeletes.values()].filter(record => record.sessionId === sessionId);
+	}
+
+	/** Session ids with remote deletion retries. */
+	pendingDeleteSessionIds(): string[] {
+		return [...new Set([...this.pendingDeletes.values()].map(record => record.sessionId))];
+	}
+
+	/** Remove retry state only after Telegram confirms deletion. */
+	deletePendingDelete(topicId: string): boolean {
+		return this.pendingDeletes.delete(topicId);
+	}
+
+	/** Delay a failed deletion without removing its durable retry state. */
+	deferPendingDelete(topicId: string, nextAttemptAt: number): boolean {
+		const record = this.pendingDeletes.get(topicId);
+		if (!record) return false;
+		record.attempts = (record.attempts ?? 0) + 1;
+		record.nextAttemptAt = nextAttemptAt;
 		return true;
 	}
 
 	/** Serialise for atomic persistence beside the daemon state. */
-	serialize(): TopicRegistryState {
-		return { topics: Object.fromEntries(this.topics) };
+	serialize(chatId?: string): TopicRegistryState {
+		const pendingDeletes = [...this.pendingDeletes.values()];
+		return {
+			...(chatId === undefined ? {} : { chatId }),
+			topics: Object.fromEntries(this.topics),
+			...(pendingDeletes.length === 0 ? {} : { pendingDeletes }),
+		};
 	}
 }
