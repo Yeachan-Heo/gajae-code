@@ -202,6 +202,53 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
+	test("switching profiles drops omitted assignments back to the pre-profile baseline", async () => {
+		const session = fakeSession(model("provider-c", "default"));
+		const settings = Settings.isolated();
+		settings.set("modelRoles", { default: "provider-c/default:medium" });
+		settings.set("task.agentModelOverrides", {
+			architect: "configured/architect:low",
+			critic: "configured/critic:high",
+		});
+		const registry = fakeRegistry({
+			profiles: [
+				{
+					name: "profile-a",
+					requiredProviders: ["provider-a", "provider-b"],
+					modelMapping: {
+						default: "provider-a/default:high",
+						executor: "provider-b/executor",
+						architect: "provider-a/architect",
+					},
+					source: "user",
+				},
+				{
+					name: "profile-b",
+					requiredProviders: ["provider-c"],
+					modelMapping: {
+						default: "provider-c/default:low",
+						executor: "provider-c/executor",
+					},
+					source: "user",
+				},
+			],
+		});
+
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" });
+		expect(settings.get("task.agentModelOverrides").architect).toBe("provider-a/architect");
+
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-b" });
+
+		expect(session.model?.provider).toBe("provider-c");
+		expect(session.model?.id).toBe("default");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			architect: "configured/architect:low",
+			critic: "configured/critic:high",
+			executor: "provider-c/executor",
+		});
+		expect(session.getActiveModelProfile()).toBe("profile-b");
+	});
+
 	test("materializing a profile role override persists the full effective assignment set and clears the profile", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({
@@ -229,6 +276,125 @@ describe("model profile activation", () => {
 		});
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("materialization persists only leaves changed from the loaded global baseline", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		settings.set("task.agentModelOverrides", { critic: "configured/critic:high" });
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+		const persistedAgents: string[] = [];
+		const originalSetAgentModelOverride = settings.setAgentModelOverride.bind(settings);
+		settings.setAgentModelOverride = (agentName: string, selector: string) => {
+			persistedAgents.push(agentName);
+			originalSetAgentModelOverride(agentName, selector);
+		};
+
+		materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor:medium",
+		});
+
+		expect(persistedAgents).toEqual(["executor", "architect"]);
+		expect(persistedAgents).not.toContain("critic");
+	});
+
+	test("failed profile detachment retains transition state for the next activation", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		const profileA = fakeRegistry().getModelProfile("profile-a");
+		if (!profileA) throw new Error("missing profile-a fixture");
+		const registry = fakeRegistry({
+			profiles: [
+				profileA,
+				{
+					name: "profile-b",
+					requiredProviders: ["provider-c"],
+					modelMapping: {
+						default: "provider-c/default:low",
+						executor: "provider-c/executor",
+					},
+					source: "user",
+				},
+			],
+		});
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" });
+		const setActiveModelProfile = session.setActiveModelProfile.bind(session);
+		session.setActiveModelProfile = (name: string | undefined) => {
+			if (name === undefined) throw new Error("detach failed");
+			setActiveModelProfile(name);
+		};
+
+		expect(() =>
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "critic",
+				selector: "provider-c/critic:low",
+			}),
+		).toThrow("detach failed");
+		expect(session.getActiveModelProfile()).toBe("profile-a");
+
+		session.setActiveModelProfile = setActiveModelProfile;
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-b" });
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-c/executor",
+		});
+	});
+
+	test("role-only materialization persists the active profile default, not a transient live model", async () => {
+		const session = fakeSession(model("provider-c", "default"));
+		const settings = Settings.isolated();
+		settings.set("modelRoles", { default: "configured/default:medium" });
+		settings.set("task.agentModelOverrides", { critic: "configured/critic:high" });
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		session.model = model("provider-c", "architect");
+		session.thinkingLevel = ThinkingLevel.Low;
+		const materialized = materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor:medium",
+		});
+
+		expect(materialized).toBe(true);
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "provider-a/default:high",
+		});
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+			architect: "provider-a/architect",
+			critic: "configured/critic:high",
+			executor: "provider-c/executor:medium",
+		});
+	});
+
+	test("detached sessions do not re-materialize a still-configured project default", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		settings.set("modelProfile.default", "profile-a");
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "executor",
+				selector: "provider-c/executor:medium",
+			}),
+		).toBe(true);
+
+		settings.override("modelProfile.default", "profile-a");
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "critic",
+				selector: "provider-c/architect:low",
+			}),
+		).toBe(false);
 	});
 
 	test("materializing a default override stores the selected default and clears the profile", async () => {
@@ -301,9 +467,11 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
-	test("--default persists profile default, clears persisted assignments, and flushes", async () => {
+	test("--default persists the profile while retaining inherited role defaults", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated();
+		settings.set("modelRoles", { default: "configured/default" });
+		settings.set("task.agentModelOverrides", { critic: "configured/critic" });
 		const setCalls: string[] = [];
 		const originalSet = settings.set.bind(settings);
 		settings.set = ((path: never, value: never) => {
@@ -311,7 +479,7 @@ describe("model profile activation", () => {
 			return originalSet(path, value);
 		}) as typeof settings.set;
 		let flushCount = 0;
-		settings.flush = async () => {
+		settings.flushOrThrow = async () => {
 			flushCount += 1;
 		};
 
@@ -320,12 +488,9 @@ describe("model profile activation", () => {
 			{ persistDefault: true },
 		);
 
-		expect(setCalls).toEqual([
-			"modelRoles",
-			"task.agentModelOverrides",
-			"defaultThinkingLevel",
-			"modelProfile.default",
-		]);
+		expect(setCalls).toEqual(["defaultThinkingLevel", "modelProfile.default"]);
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "configured/default" });
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({ critic: "configured/critic" });
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
 		expect(settings.get("modelProfile.default")).toBe("profile-a");
 		expect(flushCount).toBe(1);
@@ -384,7 +549,7 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		settings.flush = async () => {
+		settings.flushOrThrow = async () => {
 			throw new Error("flush failed");
 		};
 

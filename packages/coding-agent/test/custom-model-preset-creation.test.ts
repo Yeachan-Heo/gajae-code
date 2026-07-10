@@ -369,6 +369,76 @@ describe("custom model preset creation", () => {
 		]);
 	});
 
+	it("uses configured DEFAULT instead of a transient live model in custom snapshots", async () => {
+		const settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude:high" },
+		});
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			settings,
+			createRegistry([[placeholderProfile.name, placeholderProfile]]),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+			{ currentThinkingLevel: ThinkingLevel.Low },
+		);
+		await Bun.sleep(0);
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		expect(selections[0]).toEqual({
+			kind: "createProfile",
+			profile: {
+				required_providers: ["anthropic"],
+				model_mapping: {
+					default: "anthropic/claude:high",
+				},
+			},
+		});
+	});
+
+	it("uses the active profile DEFAULT instead of a transient live model in custom snapshots", async () => {
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("anthropic", "claude"),
+			Settings.isolated({
+				modelRoles: { default: "anthropic/claude:high" },
+				"task.agentModelOverrides": { critic: "anthropic/claude:high" },
+			}),
+			createRegistry([[placeholderProfile.name, placeholderProfile]]),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+			{
+				activeModelProfile: placeholderProfile.name,
+				currentThinkingLevel: ThinkingLevel.Low,
+			},
+		);
+		await Bun.sleep(0);
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		expect(selections[0]).toEqual({
+			kind: "createProfile",
+			profile: {
+				required_providers: ["anthropic", "my-oai"],
+				model_mapping: {
+					default: "my-oai/gpt-custom",
+					critic: "anthropic/claude:high",
+				},
+			},
+		});
+	});
+
 	it("keeps create custom preset visible when raw required provider order differs", async () => {
 		const orderMismatchProfile: ModelProfileDefinition = {
 			name: "order-mismatch",
@@ -536,6 +606,34 @@ describe("custom model preset creation", () => {
 		]);
 	});
 
+	it("keeps preset landing rendered when role badges refresh", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-row",
+			displayName: "Custom Row",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom" },
+			source: "user",
+		};
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			Settings.isolated({}),
+			createRegistry([[customProfile.name, customProfile]]),
+			[],
+			() => {},
+			() => {},
+		);
+		await Bun.sleep(0);
+
+		selector.refreshRoleAssignments({
+			currentModel: currentModel("my-oai", "gpt-custom"),
+			currentThinkingLevel: ThinkingLevel.Low,
+		});
+
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(text).toContain("Browse all models");
+	});
+
 	it("keeps rename and delete reachable for unauthenticated custom preset rows", async () => {
 		const customProfile: ModelProfileDefinition = {
 			name: "needs-login",
@@ -664,7 +762,7 @@ describe("custom model preset creation", () => {
 			},
 			getActiveModelProfile: () => activeProfiles.at(-1),
 		};
-		const flushSpy = spyOn(settings, "flush").mockRejectedValueOnce(new Error("flush failed"));
+		const flushSpy = spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
 
 		try {
 			await expect(
@@ -684,7 +782,7 @@ describe("custom model preset creation", () => {
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("custom-default");
 	});
-	it("restores a deleted custom preset when post-delete notification fails", async () => {
+	it("keeps a deleted custom preset committed when post-delete notification fails", async () => {
 		const unsafeDisplayName = "Custom\x1b[31m Default\x1b[0m\nRestored";
 		const profiles = new Map<string, ModelProfileDefinition>([
 			[
@@ -771,7 +869,7 @@ describe("custom model preset creation", () => {
 			updateEditorBorderColor: () => {},
 			showStatus: () => {},
 			showError: (message: string) => {
-				expect(message).toBe("Preset delete failed: notify failed");
+				expect(message).toBe("Configuration was updated, but change notification failed: notify failed");
 			},
 			showHookConfirm: async (title: string) => {
 				confirmTitle = title;
@@ -787,11 +885,102 @@ describe("custom model preset creation", () => {
 		await selector?.__testSelectPresetAction("custom-default", "delete");
 
 		expect(confirmTitle).toBe("Delete custom model preset: Custom Default Restored");
-		expect(restoredProfile?.display_name).toBe(unsafeDisplayName);
-		expect(profiles.get("custom-default")?.displayName).toBe(unsafeDisplayName);
-		expect(settings.get("modelProfile.default")).toBe("custom-default");
-		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
+		expect(restoredProfile).toBeUndefined();
+		expect(profiles.has("custom-default")).toBe(false);
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.get("modelRoles")).toEqual({ default: "my-oai/gpt-custom:low" });
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
-		expect(activeProfiles.at(-1)).toBe("custom-default");
+		expect(activeProfiles.at(-1)).toBeUndefined();
+	});
+
+	it("deleting a persisted default leaves a different session-active profile untouched", async () => {
+		const profileA: ModelProfileDefinition = {
+			name: "profile-a",
+			displayName: "Profile A",
+			requiredProviders: ["my-oai"],
+			modelMapping: { default: "my-oai/gpt-custom:low" },
+			source: "user",
+		};
+		const profileB: ModelProfileDefinition = {
+			name: "profile-b",
+			displayName: "Profile B",
+			requiredProviders: ["anthropic"],
+			modelMapping: {
+				default: "anthropic/claude:high",
+				executor: "anthropic/claude:high",
+			},
+			source: "user",
+		};
+		const profiles = new Map<string, ModelProfileDefinition>([
+			[profileA.name, profileA],
+			[profileB.name, profileB],
+		]);
+		const baseRegistry = createRegistry(profiles);
+		const registry = {
+			...baseRegistry,
+			deleteCustomModelProfile: async (name: string) => {
+				const profile = profiles.get(name);
+				if (!profile) throw new Error("missing profile");
+				profiles.delete(name);
+				return {
+					display_name: profile.displayName,
+					required_providers: [...profile.requiredProviders],
+					model_mapping: { ...profile.modelMapping },
+				};
+			},
+		};
+		const settings = Settings.isolated();
+		settings.set("modelProfile.default", profileA.name);
+		settings.override("modelProfile.default", profileB.name);
+		settings.set("task.agentModelOverrides", { critic: "persisted/critic:low" });
+		settings.override("task.agentModelOverrides", {
+			critic: "persisted/critic:low",
+			executor: "anthropic/claude:high",
+		});
+		const activeProfiles: (string | undefined)[] = [profileB.name];
+		let selector: ModelSelectorComponent | undefined;
+		const ctx = {
+			ui: { setFocus: () => {}, requestRender: () => {} },
+			editorContainer: {
+				clear: () => {},
+				addChild: (child: unknown) => {
+					if (child instanceof ModelSelectorComponent) selector = child;
+				},
+			},
+			editor: {},
+			settings,
+			session: {
+				model: currentModel("anthropic", "claude"),
+				thinkingLevel: ThinkingLevel.High,
+				sessionId: "session",
+				scopedModels: [],
+				modelRegistry: registry,
+				setActiveModelProfile: (profileName: string | undefined) => activeProfiles.push(profileName),
+				getActiveModelProfile: () => activeProfiles.at(-1),
+				isFastForProvider: () => false,
+				isFastForSubagentProvider: () => false,
+				isFastModeActive: () => false,
+			},
+			statusLine: { invalidate: () => {} },
+			updateEditorBorderColor: () => {},
+			showStatus: () => {},
+			showError: (message: string) => {
+				throw new Error(message);
+			},
+			showHookConfirm: async () => true,
+			notifyConfigChanged: async () => {},
+		};
+
+		new SelectorController(ctx as never).showModelSelector();
+		await Bun.sleep(0);
+		await selector?.__testSelectPresetAction(profileA.name, "delete");
+
+		expect(profiles.has(profileA.name)).toBe(false);
+		expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "persisted/critic:low",
+			executor: "anthropic/claude:high",
+		});
+		expect(activeProfiles.at(-1)).toBe(profileB.name);
 	});
 });

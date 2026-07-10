@@ -137,6 +137,39 @@ describe("/model batch assignments", () => {
 		]);
 	});
 
+	test("batch success reports preserved per-role efforts instead of claiming one value", async () => {
+		const { output, runtime, settings } = createRuntime();
+		settings.setModelRole("default", "anthropic/original-default:high");
+		settings.set("task.agentModelOverrides", {
+			executor: "anthropic/original-executor:low",
+			architect: "anthropic/original-architect:medium",
+			planner: "anthropic/original-planner:high",
+			critic: "anthropic/original-critic:low",
+		});
+
+		await expect(
+			executeAcpBuiltinSlashCommand("/model assign all-targets claude-3-5-sonnet", runtime),
+		).resolves.toEqual({ consumed: true });
+
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:high");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/claude-3-5-sonnet:low",
+			architect: "anthropic/claude-3-5-sonnet:medium",
+			planner: "anthropic/claude-3-5-sonnet:high",
+			critic: "anthropic/claude-3-5-sonnet:low",
+		});
+		expect(output).toEqual([
+			[
+				"All model targets updated:",
+				"  DEFAULT: anthropic/claude-3-5-sonnet:high",
+				"  EXECUTOR: anthropic/claude-3-5-sonnet:low",
+				"  ARCHITECT: anthropic/claude-3-5-sonnet:medium",
+				"  PLANNER: anthropic/claude-3-5-sonnet:high",
+				"  CRITIC: anthropic/claude-3-5-sonnet:low",
+			].join("\n"),
+		]);
+	});
+
 	test("/model preserves existing DEFAULT effort when selector has no explicit effort", async () => {
 		const { output, runtime, settings, session } = createRuntime();
 		settings.setModelRole("default", "anthropic/original-model:high");
@@ -148,5 +181,25 @@ describe("/model batch assignments", () => {
 		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:high");
 		expect(session.thinkingLevel).toBe("high");
 		expect(output).toEqual(["Default model set to anthropic/claude-3-5-sonnet:high."]);
+	});
+
+	test("notification failures do not report a committed assignment as failed", async () => {
+		const { output, runtime, settings } = createRuntime();
+		runtime.notifyTitleChanged = async () => {
+			throw new Error("title transport unavailable");
+		};
+		runtime.notifyConfigChanged = async () => {
+			throw new Error("config transport unavailable");
+		};
+
+		await expect(executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet:low", runtime)).resolves.toEqual({
+			consumed: true,
+		});
+
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:low");
+		expect(output).toEqual([
+			"Default model set to anthropic/claude-3-5-sonnet:low.",
+			"Model settings were updated, but notification failed (title: title transport unavailable; config: config transport unavailable).",
+		]);
 	});
 });

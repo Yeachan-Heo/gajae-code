@@ -44,7 +44,9 @@ function createSelector(options: SelectorOptions = {}) {
 			cwd: process.cwd(),
 		},
 		{
-			onChange: (path, value) => changedSettings.push({ path, value }),
+			onChange: (path, value) => {
+				changedSettings.push({ path, value });
+			},
 			onStatusLinePreview: preview => {
 				previews.push(preview);
 				options.onStatusLinePreview?.(preview);
