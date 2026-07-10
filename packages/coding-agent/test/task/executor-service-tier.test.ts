@@ -55,4 +55,24 @@ describe("createSubagentSettings service-tier inheritance", () => {
 		const subagent = createSubagentSettings(base, undefined);
 		expect(subagent.get("serviceTier")).toBe("none");
 	});
+	it("snapshots global raw baseline and overrides across nested agents without mutation", () => {
+		const overrides = { "openai/gpt-5": "on" as const };
+		const base = Settings.isolated({ "task.serviceTier": "inherit" });
+		base.set("serviceTier", "priority");
+		base.set("modelServiceTierOverrides", overrides);
+		const subagent = createSubagentSettings(base, "openai-only", base.getGlobalModelServiceTierOverrides());
+		const nested = createSubagentSettings(
+			subagent,
+			"openai-only",
+			subagent.get("modelServiceTierOverrides"),
+		);
+		expect(subagent.get("serviceTier")).toBe("openai-only");
+		expect(nested.get("serviceTier")).toBe("openai-only");
+		expect(subagent.get("modelServiceTierOverrides")).toEqual(overrides);
+		expect(nested.get("modelServiceTierOverrides")).toEqual(overrides);
+		expect(base.get("serviceTier")).toBe("priority");
+		expect(base.get("modelServiceTierOverrides")).toEqual(overrides);
+		expect(subagent.get("modelServiceTierOverrides")).not.toBe(overrides);
+		expect(nested.get("modelServiceTierOverrides")).not.toBe(subagent.get("modelServiceTierOverrides"));
+	});
 });

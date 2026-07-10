@@ -17,7 +17,10 @@ import { ModelRegistry } from "../config/model-registry";
 import { formatModelString, resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { Settings } from "../config/settings";
-import type { ModelServiceTierOverrides } from "../config/model-service-tier-policy";
+import {
+	sanitizeModelServiceTierOverrides,
+	type ModelServiceTierOverrides,
+} from "../config/model-service-tier-policy";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
@@ -575,7 +578,11 @@ function getUsageTokens(usage: unknown): number {
 	return firstNumberField(record, ["totalTokens", "total_tokens"]) ?? 0;
 }
 
-export function createSubagentSettings(baseSettings: Settings, inheritedServiceTier?: ServiceTier): Settings {
+export function createSubagentSettings(
+	baseSettings: Settings,
+	inheritedServiceTier?: ServiceTier,
+	inheritedModelServiceTierOverrides?: ModelServiceTierOverrides,
+): Settings {
 	const snapshot: Partial<Record<SettingPath, unknown>> = {};
 	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 		snapshot[key] = baseSettings.get(key);
@@ -583,7 +590,9 @@ export function createSubagentSettings(baseSettings: Settings, inheritedServiceT
 	// Preserve the parent's raw global tier intent. Project/runtime settings must
 	// not shadow the machine-wide policy used by child sessions.
 	snapshot.serviceTier = baseSettings.getGlobal("serviceTier") ?? "none";
-	snapshot.modelServiceTierOverrides = baseSettings.getGlobalModelServiceTierOverrides();
+	snapshot.modelServiceTierOverrides = sanitizeModelServiceTierOverrides(
+		inheritedModelServiceTierOverrides ?? baseSettings.getGlobalModelServiceTierOverrides(),
+	);
 	// Subagent-scoped service-tier override: "inherit" uses the parent session's
 	// LIVE intent (so a runtime `/fast on` reaches subagents and a main-model fast-mode
 	// auto-disable never clobbers it); any explicit value applies only
@@ -672,8 +681,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}
 
 	const settings = options.settings ?? Settings.isolated();
-	const subagentSettings = createSubagentSettings(settings, options.inheritedServiceTier);
 	const modelServiceTierOverrides = options.modelServiceTierOverrides ?? settings.getGlobalModelServiceTierOverrides();
+	const subagentSettings = createSubagentSettings(
+		settings,
+		options.inheritedServiceTier,
+		modelServiceTierOverrides,
+	);
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	const maxRuntimeMs = Math.max(0, Math.trunc(Number(settings.get("task.maxRuntimeMs") ?? 0) || 0));
 	const parentDepth = options.taskDepth ?? 0;

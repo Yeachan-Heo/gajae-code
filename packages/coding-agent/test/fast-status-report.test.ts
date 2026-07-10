@@ -129,6 +129,22 @@ describe("buildFastStatusReport", () => {
 			resolveRoleModelWithThinking: role => ({ model: args.roles[role] }),
 		};
 	}
+	test("uses exact model state when rows share a provider", () => {
+		const report = buildFastStatusReport({
+			session: {
+				...fakeSession({
+					model: model("openai", "gpt-5"),
+					roles: { executor: model("openai", "gpt-4.1") },
+					fastProviders: ["openai"],
+				}),
+				isFastForModel: candidate => candidate?.id === "gpt-5",
+			},
+			roleTargets: [{ id: "executor", label: "EXECUTOR", isSubagentRole: false }],
+			iconFast: ICON,
+		});
+		expect(report).toContain(`현재 모델: openai/gpt-5 ${ICON}`);
+		expect(report).toContain(`EXECUTOR: openai/gpt-4.1 ${FAST_STATUS_OFF}`);
+	});
 
 	test("lists the active model and assigned roles, skipping unassigned roles", () => {
 		const report = buildFastStatusReport({
