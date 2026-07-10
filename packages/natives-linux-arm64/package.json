@@ -1,6 +1,6 @@
 {
 	"name": "@gajae-code/natives-linux-arm64",
-	"version": "0.9.5",
+	"version": "0.9.6",
 	"description": "Linux arm64 native addon for @gajae-code/natives",
 	"type": "module",
 	"homepage": "https://gajae-code.com",

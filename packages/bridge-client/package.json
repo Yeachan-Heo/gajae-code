@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/bridge-client",
-	"version": "0.9.5",
+	"version": "0.9.6",
 	"description": "TypeScript client SDK for the GJC backend bridge protocol",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo",

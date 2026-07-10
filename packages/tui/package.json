@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/tui",
-	"version": "0.9.5",
+	"version": "0.9.6",
 	"description": "Terminal User Interface library with differential rendering for efficient text-based applications",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo and Gajae Code Contributors",

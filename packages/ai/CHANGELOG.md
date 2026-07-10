@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.9.6] - 2026-07-10
 ### Fixed
 
 - Normalized the GPT-5.6 Sol/Terra/Luna context window to the 373K usable prompt budget on both OpenAI and OpenAI code transports (was 1,050K / 272K), matching the live openai-codex catalog.
