@@ -13,7 +13,11 @@ import {
 	restoreMaterializedModelProfileForDeletion,
 } from "../../config/model-profile-activation";
 import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
-import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
+import {
+	AmbiguousCustomModelProfileDeletionError,
+	GJC_MODEL_ASSIGNMENT_TARGETS,
+	type GjcModelAssignmentTargetId,
+} from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { type Settings, settings } from "../../config/settings";
@@ -381,12 +385,39 @@ export class SelectorController {
 				}
 			}
 			deletedProfile = await this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName);
-			await this.ctx.session.modelRegistry.refresh("offline");
-			refreshSelectorState();
-			this.ctx.showStatus(`Custom model preset deleted: ${profileLabel}`);
-			this.#notifyConfigChangedSafely();
-			this.ctx.ui.requestRender();
+			try {
+				await this.ctx.session.modelRegistry.refresh("offline");
+				refreshSelectorState();
+				this.ctx.showStatus(`Custom model preset deleted: ${profileLabel}`);
+				this.#notifyConfigChangedSafely();
+				this.ctx.ui.requestRender();
+			} catch (postCommitError) {
+				let reportedError = postCommitError;
+				try {
+					refreshSelectorState();
+				} catch (refreshError) {
+					reportedError = refreshError;
+				}
+				this.ctx.showError(
+					`Preset was deleted, but post-delete refresh failed: ${
+						reportedError instanceof Error ? reportedError.message : String(reportedError)
+					}`,
+				);
+			}
+			return;
 		} catch (err) {
+			if (err instanceof AmbiguousCustomModelProfileDeletionError) {
+				try {
+					await this.ctx.session.modelRegistry.refresh("offline");
+					refreshSelectorState();
+				} catch {
+					// The durable profile is absent but the surrounding models config
+					// is unverified. Keep settings materialized and detached.
+				}
+				this.ctx.showError(`Preset deletion is ambiguous; settings were left detached: ${err.message}`);
+				this.ctx.ui.requestRender();
+				return;
+			}
 			let presetRestoreError: unknown;
 			if (deletedProfile) {
 				try {

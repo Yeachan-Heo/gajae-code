@@ -1,5 +1,6 @@
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 
 export interface FileLockOptions {
@@ -19,8 +20,37 @@ interface LockInfo {
 	timestamp: number;
 }
 
-function getLockPath(filePath: string): string {
-	return `${filePath}.lock`;
+export async function getCanonicalFileTarget(filePath: string): Promise<string> {
+	const visited = new Set<string>();
+	const resolveTarget = async (candidate: string): Promise<string> => {
+		const absolute = path.resolve(candidate);
+		try {
+			return await fs.realpath(absolute);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+
+		if (visited.has(absolute)) {
+			throw new Error(`Symlink cycle while resolving file lock target: ${filePath}`);
+		}
+		visited.add(absolute);
+
+		try {
+			const stats = await fs.lstat(absolute);
+			if (stats.isSymbolicLink()) {
+				const linkTarget = await fs.readlink(absolute);
+				return resolveTarget(path.resolve(path.dirname(absolute), linkTarget));
+			}
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+
+		const parent = path.dirname(absolute);
+		if (parent === absolute) return absolute;
+		return path.join(await resolveTarget(parent), path.basename(absolute));
+	};
+
+	return resolveTarget(filePath);
 }
 
 async function writeLockInfo(lockPath: string): Promise<LockInfo> {
@@ -189,14 +219,22 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise
 		// Ignore errors on release
 	}
 }
-async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
-	const opts = { ...DEFAULT_OPTIONS, ...options };
-	const lockPath = getLockPath(filePath);
+interface AcquiredFileLock {
+	targetPath: string;
+	release: () => Promise<void>;
+}
 
+async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<AcquiredFileLock> {
+	const opts = { ...DEFAULT_OPTIONS, ...options };
+	const targetPath = await getCanonicalFileTarget(filePath);
+	const lockPath = `${targetPath}.lock`;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		const owner = await tryAcquireLock(lockPath);
 		if (owner) {
-			return () => releaseLock(lockPath, owner);
+			return {
+				targetPath,
+				release: () => releaseLock(lockPath, owner),
+			};
 		}
 
 		const stale = await staleLockSnapshot(lockPath, opts.staleMs);
@@ -212,13 +250,13 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 
 export async function withFileLock<T>(
 	filePath: string,
-	fn: () => Promise<T>,
+	fn: (targetPath: string) => Promise<T>,
 	options: FileLockOptions = {},
 ): Promise<T> {
-	const release = await acquireLock(filePath, options);
+	const lock = await acquireLock(filePath, options);
 	try {
-		return await fn();
+		return await fn(lock.targetPath);
 	} finally {
-		await release();
+		await lock.release();
 	}
 }

@@ -31,7 +31,7 @@ import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import { AgentStorage } from "../session/agent-storage";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
-import { withFileLock } from "./file-lock";
+import { getCanonicalFileTarget, withFileLock } from "./file-lock";
 import {
 	type BashInterceptorRule,
 	type GroupPrefix,
@@ -56,8 +56,14 @@ export interface RawSettings {
 }
 export interface ConditionalDurableSettingUpdate {
 	path: string;
+	expectedRevision: string | undefined;
 	expectedValue: string | undefined;
 	value: string | undefined;
+	requireCompleteMatch?: boolean;
+}
+
+interface DurableSettingRevisions {
+	leaves: Record<string, string>;
 }
 
 export interface SettingsOptions {
@@ -212,8 +218,10 @@ export class Settings {
 	/** Merged view (global + project + overrides) */
 	#merged: RawSettings = {};
 
-	/** Paths modified during this session (for partial save) */
-	#modified = new Set<string>();
+	/** Paths modified during this session, keyed by their per-mutation token. */
+	#modified = new Map<string, string>();
+	/** Durable revisions for individually persisted leaves. */
+	#globalRevisions: DurableSettingRevisions = { leaves: {} };
 
 	/** Pending save (debounced) */
 	#saveTimer?: NodeJS.Timeout;
@@ -225,6 +233,11 @@ export class Settings {
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
+		try {
+			this.#agentDir = fs.realpathSync.native(this.#agentDir);
+		} catch {
+			// A new agent directory has no canonical filesystem identity yet.
+		}
 		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, "config.yml");
 		this.#persist = !options.inMemory;
 
@@ -312,6 +325,10 @@ export class Settings {
 		const value = getByPath(this.#global, path.split("."));
 		return value === undefined ? undefined : (value as SettingValue<P>);
 	}
+	/** Get the transaction-owned or durable token for a global leaf. */
+	getGlobalRevision(path: string): string | undefined {
+		return this.#modified.get(path) ?? this.#globalRevisions.leaves[path];
+	}
 
 	/** Get a setting from project config only, excluding global and runtime layers. */
 	getProject<P extends SettingPath>(path: P): SettingValue<P> | undefined {
@@ -354,7 +371,7 @@ export class Settings {
 		const prev = this.get(path);
 		const segments = path.split(".");
 		setByPath(this.#global, segments, value);
-		this.#modified.add(path);
+		this.#markModified(path);
 		this.#rebuildMerged();
 		this.#queueSave();
 
@@ -368,7 +385,7 @@ export class Settings {
 	/** Remove a user/global setting while preserving project and runtime layers. */
 	clearGlobal(path: SettingPath): void {
 		setByPath(this.#global, path.split("."), undefined);
-		this.#modified.add(path);
+		this.#markModified(path);
 		this.#rebuildMerged();
 		this.#queueSave();
 	}
@@ -399,50 +416,168 @@ export class Settings {
 	/**
 	 * Conditionally update persisted leaves while holding the config file lock.
 	 *
-	 * Each update is applied only when the durable value still equals
-	 * `expectedValue`. The returned paths are the updates that won the compare
-	 * and swap. Pending writes for these paths are superseded so a failed
-	 * transaction cannot re-apply its stale materialized values later.
+	 * A transaction owns the durable revision it materialized, rather than a
+	 * value. This prevents profile → user → profile ABA writes from being
+	 * mistaken for an untouched profile value.
 	 */
 	async compareAndSwapGlobal(updates: readonly ConditionalDurableSettingUpdate[]): Promise<ReadonlySet<string>> {
 		const applied = new Set<string>();
-		for (const update of updates) {
-			this.#modified.delete(update.path);
-		}
+		const appliedRevisions = new Map<string, string>();
+		const pending = new Map(this.#modified);
 
 		if (!this.#persist || !this.#configPath) {
+			const eligible = new Set(
+				updates
+					.filter(update => {
+						if (update.expectedRevision === undefined) return false;
+						const pendingToken = pending.get(update.path);
+						if (pendingToken && pendingToken !== update.expectedRevision) return false;
+						return (
+							this.getGlobalRevision(update.path) === update.expectedRevision &&
+							getByPath(this.#global, update.path.split(".")) === update.expectedValue
+						);
+					})
+					.map(update => update.path),
+			);
+			const completeMatch = eligible.size === updates.length;
 			for (const update of updates) {
-				const segments = update.path.split(".");
-				if (Object.is(getByPath(this.#global, segments), update.expectedValue)) {
-					setByPath(this.#global, segments, update.value);
-					applied.add(update.path);
-				}
+				if (!eligible.has(update.path) || (update.requireCompleteMatch && !completeMatch)) continue;
+				const pendingToken = pending.get(update.path);
+				setByPath(this.#global, update.path.split("."), update.value);
+				this.#globalRevisions.leaves[update.path] = crypto.randomUUID();
+				if (this.#modified.get(update.path) === pendingToken) this.#modified.delete(update.path);
+				applied.add(update.path);
 			}
 			this.#rebuildMerged();
 			return applied;
 		}
 
 		const configPath = this.#configPath;
-		await withFileLock(configPath, async () => {
-			const current = await this.#loadYaml(configPath);
+		await withFileLock(configPath, async targetPath => {
+			const current = await this.#loadYaml(targetPath);
+			const revisions = await this.#loadRevisions(targetPath);
+			const eligible = new Set(
+				updates
+					.filter(update => {
+						if (update.expectedRevision === undefined) return false;
+						const pendingToken = pending.get(update.path);
+						if (pendingToken && pendingToken !== update.expectedRevision) return false;
+						return (
+							revisions.leaves[update.path] === update.expectedRevision &&
+							getByPath(current, update.path.split(".")) === update.expectedValue
+						);
+					})
+					.map(update => update.path),
+			);
+			const completeMatch = eligible.size === updates.length;
 			for (const update of updates) {
-				const segments = update.path.split(".");
-				if (Object.is(getByPath(current, segments), update.expectedValue)) {
-					setByPath(current, segments, update.value);
-					applied.add(update.path);
+				if (!eligible.has(update.path) || (update.requireCompleteMatch && !completeMatch)) continue;
+				setByPath(current, update.path.split("."), update.value);
+				const appliedRevision = crypto.randomUUID();
+				revisions.leaves[update.path] = appliedRevision;
+				appliedRevisions.set(update.path, appliedRevision);
+				applied.add(update.path);
+			}
+
+			for (const [pendingPath, token] of pending) {
+				if (updates.some(update => update.path === pendingPath && update.expectedRevision === token)) continue;
+				setByPath(current, pendingPath.split("."), getByPath(this.#global, pendingPath.split(".")));
+				revisions.leaves[pendingPath] = token;
+			}
+
+			if (applied.size > 0 || pending.size > 0) {
+				await this.#writeRevisions(revisions, targetPath);
+				this.#globalRevisions = revisions;
+				await Bun.write(targetPath, YAML.stringify(current, null, 2));
+			}
+			for (const [pendingPath, token] of pending) {
+				if (this.#modified.get(pendingPath) === token) this.#modified.delete(pendingPath);
+			}
+
+			for (;;) {
+				const late = new Map(this.#modified);
+				const superseded = new Set(
+					[...applied].filter(appliedPath => {
+						const token = late.get(appliedPath);
+						const update = updates.find(candidate => candidate.path === appliedPath);
+						return token !== undefined && token !== update?.expectedRevision;
+					}),
+				);
+				let needsWrite = false;
+				for (const appliedPath of superseded) {
+					applied.delete(appliedPath);
+					appliedRevisions.delete(appliedPath);
+				}
+
+				if (superseded.size > 0) {
+					for (const update of updates) {
+						if (!update.requireCompleteMatch || !applied.has(update.path)) continue;
+						applied.delete(update.path);
+						appliedRevisions.delete(update.path);
+						if (late.has(update.path)) continue;
+						setByPath(current, update.path.split("."), update.expectedValue);
+						revisions.leaves[update.path] = crypto.randomUUID();
+						needsWrite = true;
+					}
+				}
+
+				for (const [pendingPath, token] of late) {
+					setByPath(current, pendingPath.split("."), getByPath(this.#global, pendingPath.split(".")));
+					revisions.leaves[pendingPath] = token;
+					needsWrite = true;
+				}
+				if (!needsWrite) break;
+
+				await this.#writeRevisions(revisions, targetPath);
+				this.#globalRevisions = revisions;
+				await Bun.write(targetPath, YAML.stringify(current, null, 2));
+				for (const [pendingPath, token] of late) {
+					if (this.#modified.get(pendingPath) === token) this.#modified.delete(pendingPath);
 				}
 			}
 
-			for (const pendingPath of this.#modified) {
-				const segments = pendingPath.split(".");
-				setByPath(current, segments, getByPath(this.#global, segments));
-			}
-
-			if (applied.size > 0 || this.#modified.size > 0) {
-				await Bun.write(configPath, YAML.stringify(current, null, 2));
+			for (const pendingPath of this.#modified.keys()) {
+				setByPath(current, pendingPath.split("."), getByPath(this.#global, pendingPath.split(".")));
 			}
 			this.#global = current;
 		});
+		for (;;) {
+			const superseded = [...applied].filter(appliedPath => {
+				const update = updates.find(candidate => candidate.path === appliedPath);
+				const pendingToken = this.#modified.get(appliedPath);
+				const durableToken = this.#globalRevisions.leaves[appliedPath];
+				return (
+					(pendingToken !== undefined && pendingToken !== update?.expectedRevision) ||
+					durableToken !== appliedRevisions.get(appliedPath)
+				);
+			});
+			if (superseded.length === 0) break;
+			for (const appliedPath of superseded) {
+				applied.delete(appliedPath);
+				appliedRevisions.delete(appliedPath);
+			}
+
+			const compensations = updates
+				.filter(update => update.requireCompleteMatch && applied.has(update.path))
+				.flatMap(update => {
+					const expectedRevision = appliedRevisions.get(update.path);
+					applied.delete(update.path);
+					appliedRevisions.delete(update.path);
+					return expectedRevision
+						? [
+								{
+									path: update.path,
+									expectedRevision,
+									expectedValue: update.value,
+									value: update.expectedValue,
+								},
+							]
+						: [];
+				});
+			if (compensations.length > 0) {
+				await this.compareAndSwapGlobal(compensations);
+			}
+		}
 		this.#rebuildMerged();
 		return applied;
 	}
@@ -491,6 +626,7 @@ export class Settings {
 		});
 		cloned.#storage = this.#storage;
 		cloned.#global = structuredClone(this.#global);
+		cloned.#globalRevisions = structuredClone(this.#globalRevisions);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#overrides = structuredClone(this.#overrides);
 		cloned.#rebuildMerged();
@@ -579,7 +715,7 @@ export class Settings {
 			next[key] = value;
 		}
 		setByPath(this.#global, segments, next);
-		this.#modified.add(key.includes(".") ? path : `${path}.${key}`);
+		this.#markModified(key.includes(".") ? path : `${path}.${key}`);
 		this.#rebuildMerged();
 		this.#queueSave();
 	}
@@ -709,6 +845,7 @@ export class Settings {
 			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
 			await this.#migrateFromLegacy();
 			this.#global = await this.#loadYaml(this.#configPath!);
+			this.#globalRevisions = await this.#loadRevisions();
 		}
 
 		this.#project = await projectPromise;
@@ -719,6 +856,33 @@ export class Settings {
 		return this;
 	}
 
+	async #loadRevisions(configPath?: string): Promise<DurableSettingRevisions> {
+		const targetPath = configPath ?? (this.#configPath ? await getCanonicalFileTarget(this.#configPath) : undefined);
+		if (!targetPath) return { leaves: {} };
+		const revisionPath = `${targetPath}.revisions.yml`;
+		try {
+			const parsed = YAML.parse(await Bun.file(revisionPath).text());
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { leaves: {} };
+			const raw = parsed as { leaves?: unknown };
+			const leaves: Record<string, string> = {};
+			if (raw.leaves && typeof raw.leaves === "object" && !Array.isArray(raw.leaves)) {
+				for (const [leaf, token] of Object.entries(raw.leaves)) {
+					if (typeof token === "string") leaves[leaf] = token;
+				}
+			}
+			return { leaves };
+		} catch (error) {
+			if (isEnoent(error)) return { leaves: {} };
+			logger.warn("Settings: failed to load revisions", { path: revisionPath, error: String(error) });
+			return { leaves: {} };
+		}
+	}
+
+	async #writeRevisions(revisions: DurableSettingRevisions, configPath?: string): Promise<void> {
+		const targetPath = configPath ?? (this.#configPath ? await getCanonicalFileTarget(this.#configPath) : undefined);
+		if (!targetPath) return;
+		await Bun.write(`${targetPath}.revisions.yml`, YAML.stringify(revisions, null, 2));
+	}
 	async #loadYaml(filePath: string): Promise<RawSettings> {
 		try {
 			const content = await Bun.file(filePath).text();
@@ -987,6 +1151,9 @@ export class Settings {
 		return savePromise;
 	}
 
+	#markModified(path: string): void {
+		this.#modified.set(path, crypto.randomUUID());
+	}
 	#queueSave(): void {
 		if (!this.#persist || !this.#configPath) return;
 
@@ -1007,45 +1174,39 @@ export class Settings {
 		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
 
 		const configPath = this.#configPath;
-		const modifiedPaths = [...this.#modified];
+		const modified = new Map(this.#modified);
 		const modifiedValues = new Map(
-			modifiedPaths.map(modPath => {
+			[...modified.keys()].map(modPath => {
 				const segments = modPath.split(".");
 				return [modPath, structuredClone(getByPath(this.#global, segments))] as const;
 			}),
 		);
-		this.#modified.clear();
 
 		try {
-			await withFileLock(configPath, async () => {
-				// Re-read to preserve external changes
-				const current = await this.#loadYaml(configPath);
+			await withFileLock(configPath, async targetPath => {
+				const current = await this.#loadYaml(targetPath);
+				const revisions = await this.#loadRevisions(targetPath);
 
-				// Apply only our modified paths
-				for (const modPath of modifiedPaths) {
-					const segments = modPath.split(".");
-					const value = modifiedValues.get(modPath);
-					setByPath(current, segments, value);
+				for (const [modPath, token] of modified) {
+					setByPath(current, modPath.split("."), modifiedValues.get(modPath));
+					revisions.leaves[modPath] = token;
 				}
 
-				// A mutation can arrive while the file is being loaded. Overlay those
-				// still-pending leaves before replacing #global so the in-memory value
-				// survives this save and the serialized snapshot is never stale.
-				for (const pendingPath of this.#modified) {
-					const segments = pendingPath.split(".");
-					setByPath(current, segments, getByPath(this.#global, segments));
+				// Persist tokens before config values. A post-write failure can then
+				// be safely rolled back using the transaction's exact token.
+				await this.#writeRevisions(revisions, targetPath);
+				this.#globalRevisions = revisions;
+				await Bun.write(targetPath, YAML.stringify(current, null, 2));
+				for (const [modPath, token] of modified) {
+					if (this.#modified.get(modPath) === token) this.#modified.delete(modPath);
 				}
-
-				// Update our global with any external changes we preserved
+				for (const modPath of this.#modified.keys()) {
+					setByPath(current, modPath.split("."), getByPath(this.#global, modPath.split(".")));
+				}
 				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
 			});
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
-			// Re-add failed paths for retry
-			for (const p of modifiedPaths) {
-				this.#modified.add(p);
-			}
 			if (options.throwOnError) {
 				this.#rebuildMerged();
 				throw error;

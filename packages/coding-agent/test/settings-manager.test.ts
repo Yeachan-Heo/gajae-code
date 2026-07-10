@@ -376,6 +376,125 @@ describe("Settings", () => {
 				agentModelOverrides: { executor: "user/executor" },
 			});
 		});
+		it("serializes alias-backed concurrent role saves", async () => {
+			const sharedConfigPath = path.join(testDir, "shared-config.yml");
+			const firstAlias = path.join(testDir, "agent-first");
+			const secondAlias = path.join(testDir, "agent-second");
+			fs.mkdirSync(firstAlias);
+			fs.mkdirSync(secondAlias);
+			await Bun.write(sharedConfigPath, "{}\n");
+			fs.symlinkSync(sharedConfigPath, path.join(firstAlias, "config.yml"), "file");
+			fs.symlinkSync(sharedConfigPath, path.join(secondAlias, "config.yml"), "file");
+
+			const first = await Settings.init({ cwd: projectDir, agentDir: firstAlias });
+			resetSettingsForTest();
+			const second = await Settings.init({ cwd: projectDir, agentDir: secondAlias });
+			const configPaths = new Set([fs.realpathSync(sharedConfigPath)]);
+			const originalWrite = Bun.write;
+			let blockConfigWrite = true;
+			let writeStarted = Promise.withResolvers<void>();
+			let releaseWrite = Promise.withResolvers<void>();
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (blockConfigWrite && typeof args[0] === "string" && configPaths.has(args[0])) {
+					blockConfigWrite = false;
+					writeStarted.resolve();
+					await releaseWrite.promise;
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				for (let iteration = 0; iteration < 8; iteration++) {
+					blockConfigWrite = true;
+					writeStarted = Promise.withResolvers<void>();
+					releaseWrite = Promise.withResolvers<void>();
+					const start = Promise.withResolvers<void>();
+					let completedFlushes = 0;
+
+					first.setModelRole("executor", `first/executor-${iteration}`);
+					second.setModelRole("planner", `second/planner-${iteration}`);
+					const flush = async (settings: Settings) => {
+						await start.promise;
+						await settings.flush();
+						completedFlushes++;
+					};
+
+					const firstFlush = flush(first);
+					const secondFlush = flush(second);
+					start.resolve();
+					await writeStarted.promise;
+					await Bun.sleep(20);
+					expect(completedFlushes).toBe(0);
+					releaseWrite.resolve();
+					await Promise.all([firstFlush, secondFlush]);
+				}
+			} finally {
+				releaseWrite.resolve();
+				writeSpy.mockRestore();
+			}
+
+			const content = await Bun.file(sharedConfigPath).text();
+			const savedSettings = YAML.parse(content) as { modelRoles?: Record<string, string> };
+			expect(savedSettings.modelRoles).toEqual({
+				executor: "first/executor-7",
+				planner: "second/planner-7",
+			});
+			expect(await Bun.file(`${sharedConfigPath}.revisions.yml`).exists()).toBe(true);
+			expect(await Bun.file(path.join(firstAlias, "config.yml.revisions.yml")).exists()).toBe(false);
+			expect(await Bun.file(path.join(secondAlias, "config.yml.revisions.yml")).exists()).toBe(false);
+		});
+		it("serializes dangling final-file aliases before the shared target exists", async () => {
+			const sharedDir = path.join(testDir, "shared");
+			const sharedConfigPath = path.join(sharedDir, "config.yml");
+			const firstAlias = path.join(testDir, "dangling-first");
+			const secondAlias = path.join(testDir, "dangling-second");
+			fs.mkdirSync(sharedDir);
+			fs.mkdirSync(firstAlias);
+			fs.mkdirSync(secondAlias);
+			fs.symlinkSync(sharedConfigPath, path.join(firstAlias, "config.yml"), "file");
+			fs.symlinkSync(sharedConfigPath, path.join(secondAlias, "config.yml"), "file");
+
+			const first = await Settings.init({ cwd: projectDir, agentDir: firstAlias });
+			resetSettingsForTest();
+			const second = await Settings.init({ cwd: projectDir, agentDir: secondAlias });
+			const canonicalConfigPath = path.join(fs.realpathSync(sharedDir), "config.yml");
+			const originalWrite = Bun.write;
+			const writeStarted = Promise.withResolvers<void>();
+			const releaseWrite = Promise.withResolvers<void>();
+			let blockedFirstWrite = false;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (!blockedFirstWrite && args[0] === canonicalConfigPath) {
+					blockedFirstWrite = true;
+					writeStarted.resolve();
+					await releaseWrite.promise;
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				first.setModelRole("executor", "first/executor");
+				second.setModelRole("planner", "second/planner");
+				const firstFlush = first.flush();
+				const secondFlush = second.flush();
+				await writeStarted.promise;
+				releaseWrite.resolve();
+				await Promise.all([firstFlush, secondFlush]);
+			} finally {
+				releaseWrite.resolve();
+				writeSpy.mockRestore();
+			}
+
+			const savedSettings = YAML.parse(await Bun.file(sharedConfigPath).text()) as {
+				modelRoles?: Record<string, string>;
+			};
+			expect(savedSettings.modelRoles).toEqual({
+				executor: "first/executor",
+				planner: "second/planner",
+			});
+			expect(await Bun.file(`${sharedConfigPath}.revisions.yml`).exists()).toBe(true);
+			expect(await Bun.file(path.join(firstAlias, "config.yml.revisions.yml")).exists()).toBe(false);
+			expect(await Bun.file(path.join(secondAlias, "config.yml.revisions.yml")).exists()).toBe(false);
+		});
 	});
 
 	describe("migrations", () => {

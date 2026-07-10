@@ -39,6 +39,7 @@ import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
+import { withFileLock } from "./file-lock";
 import {
 	buildCanonicalModelIndex,
 	type CanonicalModelIndex,
@@ -64,6 +65,19 @@ import {
 import { type Settings, settings } from "./settings";
 
 export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, ModelEquivalenceConfig };
+
+export class AmbiguousCustomModelProfileDeletionError extends Error {
+	readonly profileName: string;
+
+	constructor(profileName: string, cause: unknown) {
+		super(
+			`Custom model profile "${profileName}" is absent after a failed models config write, but the complete intended config could not be verified.`,
+			{ cause },
+		);
+		this.name = "AmbiguousCustomModelProfileDeletionError";
+		this.profileName = profileName;
+	}
+}
 
 export const kNoAuth = "N/A";
 
@@ -1581,39 +1595,38 @@ export class ModelRegistry {
 			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
 			throw new Error(`Custom model profile is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
 		}
-		const loaded = this.#modelsConfigFile.tryLoad();
-		if (loaded.status === "error") {
-			throw new Error(
-				`Cannot create custom model profile because ${this.#modelsConfigFile.path()} is invalid. Fix the existing config before saving a new preset.`,
-			);
-		}
-		const current = loaded.value ?? this.#modelsConfigFile.createDefault();
-		if (mergeModelProfiles(current.profiles).has(normalizedName)) {
-			throw new Error(`Custom model profile already exists: ${normalizedName}. Choose a unique preset id.`);
-		}
-		const next: ModelsConfig = {
-			...current,
-			profiles: {
-				...(current.profiles ?? {}),
-				[normalizedName]: definition,
-			},
-		};
-		const checkedConfig = ModelsConfigSchema.safeParse(next);
-		if (!checkedConfig.success) {
-			const first = checkedConfig.error.issues[0];
-			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
-			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
-		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		const modelMapping = { ...definition.model_mapping };
-		const profile: ModelProfileDefinition = {
-			name: normalizedName,
-			displayName: definition.display_name,
-			requiredProviders: aggregateModelProfileRequiredProviders(definition.required_providers, { modelMapping }),
-			modelMapping,
-			source: "user",
-		};
-		return profile;
+		return withFileLock(this.#modelsConfigFile.path(), async targetPath => {
+			const configFile = this.#modelsConfigFile.relocate(targetPath);
+			const loaded = this.#loadModelsConfigForMutation(configFile, "create");
+			const current = loaded ?? configFile.createDefault();
+			if (mergeModelProfiles(current.profiles).has(normalizedName)) {
+				throw new Error(`Custom model profile already exists: ${normalizedName}. Choose a unique preset id.`);
+			}
+			const next: ModelsConfig = {
+				...current,
+				profiles: {
+					...(current.profiles ?? {}),
+					[normalizedName]: definition,
+				},
+			};
+			const checkedConfig = ModelsConfigSchema.safeParse(next);
+			if (!checkedConfig.success) {
+				const first = checkedConfig.error.issues[0];
+				const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+				throw new Error(
+					`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`,
+				);
+			}
+			await this.#writeCheckedModelsConfig(checkedConfig.data, targetPath);
+			const modelMapping = { ...definition.model_mapping };
+			return {
+				name: normalizedName,
+				displayName: definition.display_name,
+				requiredProviders: aggregateModelProfileRequiredProviders(definition.required_providers, { modelMapping }),
+				modelMapping,
+				source: "user",
+			};
+		});
 	}
 
 	async renameCustomModelProfile(name: string, displayName: string): Promise<ModelProfileDefinition> {
@@ -1621,61 +1634,101 @@ export class ModelRegistry {
 		const nextDisplayName = displayName.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
 		if (!nextDisplayName) throw new Error("Profile display name is required.");
-		const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "rename");
-		const nextProfiles = {
-			...(current.profiles ?? {}),
-			[normalizedName]: {
-				...profile,
-				display_name: nextDisplayName,
-			},
-		};
-		const checkedConfig = ModelsConfigSchema.safeParse({ ...current, profiles: nextProfiles });
-		if (!checkedConfig.success) {
-			const first = checkedConfig.error.issues[0];
-			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
-			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
-		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		const modelMapping = { ...profile.model_mapping };
-		return {
-			name: normalizedName,
-			displayName: nextDisplayName,
-			requiredProviders: aggregateModelProfileRequiredProviders(profile.required_providers, { modelMapping }),
-			modelMapping,
-			source: "user",
-		};
+		return withFileLock(this.#modelsConfigFile.path(), async targetPath => {
+			const configFile = this.#modelsConfigFile.relocate(targetPath);
+			const { current, profile } = this.#loadCustomProfileForMutation(configFile, normalizedName, "rename");
+			const nextProfiles = {
+				...(current.profiles ?? {}),
+				[normalizedName]: {
+					...profile,
+					display_name: nextDisplayName,
+				},
+			};
+			const checkedConfig = ModelsConfigSchema.safeParse({ ...current, profiles: nextProfiles });
+			if (!checkedConfig.success) {
+				const first = checkedConfig.error.issues[0];
+				const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+				throw new Error(
+					`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`,
+				);
+			}
+			await this.#writeCheckedModelsConfig(checkedConfig.data, targetPath);
+			const modelMapping = { ...profile.model_mapping };
+			return {
+				name: normalizedName,
+				displayName: nextDisplayName,
+				requiredProviders: aggregateModelProfileRequiredProviders(profile.required_providers, { modelMapping }),
+				modelMapping,
+				source: "user",
+			};
+		});
 	}
 
 	async deleteCustomModelProfile(name: string): Promise<ModelProfileConfig> {
 		const normalizedName = name.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
-		const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "delete");
-		const nextProfiles = { ...(current.profiles ?? {}) };
-		delete nextProfiles[normalizedName];
-		const checkedConfig = ModelsConfigSchema.safeParse({
-			...current,
-			profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
+		return withFileLock(this.#modelsConfigFile.path(), async targetPath => {
+			const configFile = this.#modelsConfigFile.relocate(targetPath);
+			const { current, profile } = this.#loadCustomProfileForMutation(configFile, normalizedName, "delete");
+			const nextProfiles = { ...(current.profiles ?? {}) };
+			delete nextProfiles[normalizedName];
+			const checkedConfig = ModelsConfigSchema.safeParse({
+				...current,
+				profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
+			});
+			if (!checkedConfig.success) {
+				const first = checkedConfig.error.issues[0];
+				const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+				throw new Error(
+					`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`,
+				);
+			}
+			try {
+				await this.#writeCheckedModelsConfig(checkedConfig.data, targetPath);
+			} catch (error) {
+				configFile.invalidate();
+				const reloadResult = configFile.tryLoad();
+				if (reloadResult.status === "error") {
+					throw new AmbiguousCustomModelProfileDeletionError(normalizedName, error);
+				}
+				const reloaded = reloadResult.value;
+				const expectedYaml = Bun.YAML.stringify(checkedConfig.data, null, 2);
+				const reloadedYaml = reloaded ? Bun.YAML.stringify(reloaded, null, 2) : undefined;
+				if (reloadedYaml === expectedYaml) {
+					this.#modelsConfigFile = configFile;
+					this.#modelsConfigFile.invalidate();
+					this.#reloadStaticModels();
+					return profile;
+				}
+				if (!reloaded?.profiles?.[normalizedName]) {
+					throw new AmbiguousCustomModelProfileDeletionError(normalizedName, error);
+				}
+				throw error;
+			}
+			return profile;
 		});
-		if (!checkedConfig.success) {
-			const first = checkedConfig.error.issues[0];
-			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
-			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
+	}
+
+	#loadModelsConfigForMutation(
+		configFile: ConfigFile<ModelsConfig>,
+		action: "create" | "rename" | "delete",
+	): ModelsConfig | null {
+		configFile.invalidate();
+		const loaded = configFile.tryLoad();
+		if (loaded.status === "error") {
+			throw new Error(
+				`Cannot ${action} custom model profile because ${configFile.path()} is invalid. Fix the existing config before modifying presets.`,
+			);
 		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		return profile;
+		return loaded.value ?? null;
 	}
 
 	#loadCustomProfileForMutation(
+		configFile: ConfigFile<ModelsConfig>,
 		normalizedName: string,
 		action: "rename" | "delete",
 	): { current: ModelsConfig; profile: ModelProfileConfig } {
-		const loaded = this.#modelsConfigFile.tryLoad();
-		if (loaded.status === "error") {
-			throw new Error(
-				`Cannot ${action} custom model profile because ${this.#modelsConfigFile.path()} is invalid. Fix the existing config before modifying presets.`,
-			);
-		}
-		const current = loaded.value ?? this.#modelsConfigFile.createDefault();
+		const current = this.#loadModelsConfigForMutation(configFile, action) ?? configFile.createDefault();
 		const profile = current.profiles?.[normalizedName];
 		if (!profile) {
 			const existing = this.#modelProfiles.get(normalizedName);
@@ -1687,9 +1740,10 @@ export class ModelRegistry {
 		return { current, profile };
 	}
 
-	async #writeCheckedModelsConfig(config: ModelsConfig): Promise<void> {
-		await fs.mkdir(path.dirname(this.#modelsConfigFile.path()), { recursive: true });
-		await Bun.write(this.#modelsConfigFile.path(), Bun.YAML.stringify(config, null, 2));
+	async #writeCheckedModelsConfig(config: ModelsConfig, targetPath: string): Promise<void> {
+		await fs.mkdir(path.dirname(targetPath), { recursive: true });
+		await Bun.write(targetPath, Bun.YAML.stringify(config, null, 2));
+		this.#modelsConfigFile = this.#modelsConfigFile.relocate(targetPath);
 		this.#modelsConfigFile.invalidate();
 		this.#reloadStaticModels();
 	}
