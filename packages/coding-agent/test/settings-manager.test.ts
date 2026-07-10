@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -32,6 +32,10 @@ describe("Settings", () => {
 
 	const writeSettings = async (settings: Record<string, unknown>) => {
 		await Bun.write(getConfigPath(), YAML.stringify(settings, null, 2));
+	};
+
+	const writeProjectSettings = async (settings: Record<string, unknown>) => {
+		await Bun.write(path.join(getProjectAgentDir(projectDir), "config.yml"), YAML.stringify(settings, null, 2));
 	};
 
 	const readSettings = async (): Promise<Record<string, unknown>> => {
@@ -234,6 +238,215 @@ describe("Settings", () => {
 			expect(settings.get("task.agentModelOverrides")).toEqual({
 				executor: "persisted/executor",
 				planner: "user/planner:high",
+			});
+		});
+
+		it("lets explicit model assignments win over project settings for the live session", async () => {
+			await writeSettings({
+				modelRoles: { default: "global/default" },
+				task: { agentModelOverrides: { executor: "global/executor" } },
+			});
+			await writeProjectSettings({
+				modelRoles: { default: "project/default" },
+				task: {
+					agentModelOverrides: {
+						executor: "project/executor",
+						planner: "project/planner",
+					},
+				},
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.getProject("modelRoles")).toEqual({ default: "project/default" });
+			expect(settings.getProject("task.agentModelOverrides")).toEqual({
+				executor: "project/executor",
+				planner: "project/planner",
+			});
+
+			expect(settings.getWithoutProject("modelRoles")).toEqual({ default: "global/default" });
+			expect(settings.getWithoutProject("task.agentModelOverrides")).toEqual({
+				executor: "global/executor",
+			});
+
+			settings.setModelRole("default", "user/default");
+			settings.setAgentModelOverride("executor", "user/executor");
+
+			expect(settings.getWithoutProject("modelRoles")).toEqual({ default: "user/default" });
+			expect(settings.getWithoutProject("task.agentModelOverrides")).toEqual({
+				executor: "user/executor",
+			});
+
+			expect(settings.getModelRole("default")).toBe("user/default");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "user/executor",
+				planner: "project/planner",
+			});
+
+			await settings.flush();
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelRoles).toEqual({ default: "user/default" });
+			expect(savedSettings.task).toEqual({
+				agentModelOverrides: { executor: "user/executor" },
+			});
+
+			settings.clearOverride("modelRoles");
+			settings.clearOverride("task.agentModelOverrides");
+			expect(settings.getModelRole("default")).toBe("project/default");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "project/executor",
+				planner: "project/planner",
+			});
+
+			settings.clearAgentModelOverride("executor");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "project/executor",
+				planner: "project/planner",
+			});
+			expect(settings.getGlobal("task.agentModelOverrides")).toEqual({});
+			await settings.flushOrThrow();
+			expect((await readSettings()).task).toEqual({ agentModelOverrides: {} });
+		});
+
+		it("preserves externally written sibling roles when saving or clearing one assignment", async () => {
+			await writeSettings({
+				modelRoles: { default: "global/default" },
+				task: {
+					agentModelOverrides: {
+						executor: "global/executor",
+						planner: "global/planner",
+					},
+				},
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			await writeSettings({
+				modelRoles: {
+					default: "global/default",
+					smol: "external/smol",
+				},
+				task: {
+					agentModelOverrides: {
+						executor: "global/executor",
+						architect: "external/architect",
+						planner: "global/planner",
+					},
+				},
+			});
+
+			settings.setModelRole("default", "user/default");
+			settings.setAgentModelOverride("executor", "user/executor");
+			settings.clearAgentModelOverride("planner");
+			await settings.flush();
+
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelRoles).toEqual({
+				default: "user/default",
+				smol: "external/smol",
+			});
+			expect(savedSettings.task).toEqual({
+				agentModelOverrides: {
+					executor: "user/executor",
+					architect: "external/architect",
+				},
+			});
+		});
+
+		it("preserves external siblings for dotted role and agent names", async () => {
+			await writeSettings({
+				modelRoles: {
+					"review.security": "global/reviewer",
+					default: "global/default",
+				},
+				task: {
+					agentModelOverrides: {
+						"review.security": "global/reviewer",
+						planner: "global/planner",
+					},
+				},
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			await writeSettings({
+				modelRoles: {
+					"review.security": "global/reviewer",
+					default: "external/default",
+				},
+				task: {
+					agentModelOverrides: {
+						"review.security": "global/reviewer",
+						planner: "external/planner",
+					},
+				},
+			});
+			settings.setModelRole("review.security", "user/reviewer");
+			settings.setAgentModelOverride("review.security", "user/reviewer");
+			await settings.flushOrThrow();
+
+			expect((await readSettings()).modelRoles).toEqual({
+				"review.security": "user/reviewer",
+				default: "external/default",
+			});
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: {
+					"review.security": "user/reviewer",
+					planner: "external/planner",
+				},
+			});
+
+			await writeSettings({
+				modelRoles: {
+					"review.security": "user/reviewer",
+					default: "external/default-v2",
+				},
+				task: {
+					agentModelOverrides: {
+						"review.security": "user/reviewer",
+						planner: "external/planner-v2",
+					},
+				},
+			});
+			settings.clearModelRole("review.security");
+			settings.clearAgentModelOverride("review.security");
+			await settings.flushOrThrow();
+
+			expect((await readSettings()).modelRoles).toEqual({ default: "external/default-v2" });
+			expect((await readSettings()).task).toEqual({
+				agentModelOverrides: { planner: "external/planner-v2" },
+			});
+		});
+
+		it("serializes a flush behind an in-flight debounced save", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const { promise: writeWait, resolve: releaseWrite } = Promise.withResolvers<void>();
+			const { promise: writeStarted, resolve: resolveWriteStarted } = Promise.withResolvers<void>();
+			const originalWrite = Bun.write;
+			let blockedFirstWrite = false;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (!blockedFirstWrite) {
+					blockedFirstWrite = true;
+					resolveWriteStarted();
+					await writeWait;
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settings.setModelRole("default", "user/default");
+				await writeStarted;
+				settings.setAgentModelOverride("executor", "user/executor");
+				expect(settings.getGlobal("task.agentModelOverrides")).toEqual({ executor: "user/executor" });
+				const flushPromise = settings.flush();
+				releaseWrite();
+				await flushPromise;
+				expect(settings.getGlobal("task.agentModelOverrides")).toEqual({ executor: "user/executor" });
+			} finally {
+				releaseWrite();
+				writeSpy.mockRestore();
+			}
+
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelRoles).toEqual({ default: "user/default" });
+			expect(savedSettings.task).toEqual({
+				agentModelOverrides: { executor: "user/executor" },
 			});
 		});
 	});
