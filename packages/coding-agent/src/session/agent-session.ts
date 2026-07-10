@@ -538,6 +538,7 @@ export interface SessionStats {
 	};
 	premiumRequests: number;
 	cost: number;
+	costBreakdown?: Usage["cost"];
 }
 
 /** Internal marker for hook messages queued through the agent loop */
@@ -11085,6 +11086,52 @@ export class AgentSession {
 		let totalCacheWrite = 0;
 		let totalCost = 0;
 		let totalPremiumRequests = 0;
+		const totalCostBreakdown: Usage["cost"] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+		let hasCompleteCostBreakdown = true;
+		const addCostBreakdown = (cost: unknown): void => {
+			if (!cost || typeof cost !== "object") {
+				hasCompleteCostBreakdown = false;
+				return;
+			}
+			const completeCost = cost as Usage["cost"];
+			if (
+				!Number.isFinite(completeCost.input) ||
+				completeCost.input < 0 ||
+				!Number.isFinite(completeCost.output) ||
+				completeCost.output < 0 ||
+				!Number.isFinite(completeCost.cacheRead) ||
+				completeCost.cacheRead < 0 ||
+				!Number.isFinite(completeCost.cacheWrite) ||
+				completeCost.cacheWrite < 0 ||
+				!Number.isFinite(completeCost.total) ||
+				completeCost.total < 0
+			) {
+				hasCompleteCostBreakdown = false;
+				return;
+			}
+			if (!hasCompleteCostBreakdown) return;
+			totalCostBreakdown.input += completeCost.input;
+			totalCostBreakdown.output += completeCost.output;
+			totalCostBreakdown.cacheRead += completeCost.cacheRead;
+			totalCostBreakdown.cacheWrite += completeCost.cacheWrite;
+			totalCostBreakdown.total += completeCost.total;
+			if (
+				!Number.isFinite(totalCostBreakdown.input) ||
+				!Number.isFinite(totalCostBreakdown.output) ||
+				!Number.isFinite(totalCostBreakdown.cacheRead) ||
+				!Number.isFinite(totalCostBreakdown.cacheWrite) ||
+				!Number.isFinite(totalCostBreakdown.total)
+			) {
+				hasCompleteCostBreakdown = false;
+			}
+		};
+		const hasCompleteTaskToolUsage = (details: unknown): boolean =>
+			Boolean(
+				details &&
+					typeof details === "object" &&
+					(details as Record<string, unknown>).usageCostBreakdownComplete === true,
+			);
+
 		const getTaskToolUsage = (details: unknown): Usage | undefined => {
 			if (!details || typeof details !== "object") return undefined;
 			const record = details as Record<string, unknown>;
@@ -11108,6 +11155,7 @@ export class AgentSession {
 				totalCacheWrite += assistantMsg.usage.cacheWrite;
 				totalPremiumRequests += assistantMsg.usage.premiumRequests ?? 0;
 				totalCost += assistantMsg.usage.cost.total;
+				addCostBreakdown(assistantMsg.usage.cost);
 			} else if (message.role === "toolResult") {
 				toolResults += 1;
 				if (message.toolName === "task") {
@@ -11119,6 +11167,11 @@ export class AgentSession {
 						totalCacheWrite += usage.cacheWrite;
 						totalPremiumRequests += usage.premiumRequests ?? 0;
 						totalCost += usage.cost.total;
+						if (hasCompleteTaskToolUsage(message.details)) {
+							addCostBreakdown(usage.cost);
+						} else {
+							hasCompleteCostBreakdown = false;
+						}
 					}
 				}
 			}
@@ -11140,6 +11193,7 @@ export class AgentSession {
 				total: totalInput + totalOutput + totalCacheRead + totalCacheWrite,
 			},
 			cost: totalCost,
+			...(hasCompleteCostBreakdown ? { costBreakdown: totalCostBreakdown } : {}),
 			premiumRequests: totalPremiumRequests,
 		};
 	}

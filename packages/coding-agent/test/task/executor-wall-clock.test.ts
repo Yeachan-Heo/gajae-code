@@ -67,6 +67,77 @@ function mockCreateAgentSession(session: AgentSession) {
 	} satisfies CreateAgentSessionResult);
 }
 
+function createUsageSession(usages: unknown | readonly unknown[]): AgentSession {
+	const session: Partial<AgentSession> = {
+		state: { messages: [] } as never,
+		agent: { state: { systemPrompt: ["test"] } } as never,
+		extensionRunner: undefined as never,
+		sessionManager: { appendSessionInit: () => {} } as never,
+		getActiveToolNames: () => ["read", "yield"],
+		setActiveToolsByName: async () => {},
+		subscribe: (listener: (event: AgentSessionEvent) => void) => {
+			queueMicrotask(() => {
+				for (const usage of Array.isArray(usages) ? usages : [usages]) {
+					listener({
+						type: "message_end",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "ok" }],
+							usage,
+						},
+					} as unknown as AgentSessionEvent);
+				}
+				listener({
+					type: "tool_execution_end",
+					toolCallId: "tool-ok",
+					toolName: "yield",
+					result: { content: [{ type: "text", text: "Result submitted." }], details: { status: "success" } },
+					isError: false,
+				} as AgentSessionEvent);
+			});
+			return () => {};
+		},
+		prompt: async () => {},
+		waitForIdle: async () => {},
+		getLastAssistantMessage: () => undefined,
+		abort: async () => {},
+		dispose: async () => {},
+	};
+	return session as AgentSession;
+}
+
+const completeRawCost = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 };
+
+type RawCostBucket = keyof typeof completeRawCost;
+
+function usageWithRawCost(cost: Record<string, unknown>, usage: Partial<Record<string, number>> = {}) {
+	return {
+		input: 10,
+		output: 2,
+		cacheRead: 3,
+		cacheWrite: 4,
+		totalTokens: 19,
+		...usage,
+		cost,
+	};
+}
+
+const invalidRawCostCases: ReadonlyArray<{
+	label: string;
+	bucket: RawCostBucket;
+	value?: number;
+}> = [
+	...(["input", "output", "cacheRead", "cacheWrite", "total"] as const).map(bucket => ({
+		label: `missing ${bucket}`,
+		bucket,
+	})),
+	...(["input", "output", "cacheRead", "cacheWrite", "total"] as const).flatMap(bucket => [
+		{ label: `negative ${bucket}`, bucket, value: -1 },
+		{ label: `NaN ${bucket}`, bucket, value: Number.NaN },
+		{ label: `infinite ${bucket}`, bucket, value: Number.POSITIVE_INFINITY },
+	]),
+];
+
 describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -314,5 +385,118 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		// here we mock createAgentSession so it stays undefined. The async-task
 		// consumer's assignment is a straight copy, so undefined is acceptable.
 		expect(result.contextWindow).toBeUndefined();
+	});
+
+	it("marks complete raw assistant cost provenance before canonical coercion", async () => {
+		const settings = Settings.isolated({ "task.maxRuntimeMs": 0 });
+		mockCreateAgentSession(createUsageSession(usageWithRawCost({ ...completeRawCost, input: 0 })));
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-complete-cost", settings });
+
+		expect(result.usageCostBreakdownComplete).toBe(true);
+		expect(result.usage?.cost.input).toBe(0);
+	});
+
+	for (const { label, bucket, value } of invalidRawCostCases) {
+		it(`fails closed for ${label} raw assistant cost`, async () => {
+			const settings = Settings.isolated({ "task.maxRuntimeMs": 0 });
+			const cost: Record<string, unknown> = { ...completeRawCost };
+			if (value === undefined) {
+				delete cost[bucket];
+			} else {
+				cost[bucket] = value;
+			}
+			mockCreateAgentSession(createUsageSession(usageWithRawCost(cost)));
+
+			const result = await runSubprocess({ ...baseOptions, id: `subagent-${label}`, settings });
+
+			expect(result.usageCostBreakdownComplete).toBeUndefined();
+		});
+	}
+
+	for (const { label, cost } of [
+		{
+			label: "missing",
+			cost: { output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
+		},
+		{
+			label: "invalid",
+			cost: { ...completeRawCost, cacheWrite: Number.NaN },
+		},
+	]) {
+		it(`fails closed when a ${label} contributor precedes a valid contributor`, async () => {
+			const settings = Settings.isolated({ "task.maxRuntimeMs": 0 });
+			mockCreateAgentSession(createUsageSession([usageWithRawCost(cost), usageWithRawCost({ ...completeRawCost })]));
+
+			const result = await runSubprocess({ ...baseOptions, id: `subagent-${label}-then-valid-cost`, settings });
+
+			expect(result.usageCostBreakdownComplete).toBeUndefined();
+		});
+	}
+
+	it("fails closed for a legacy contributing assistant without raw cost", async () => {
+		const settings = Settings.isolated({ "task.maxRuntimeMs": 0 });
+		mockCreateAgentSession(
+			createUsageSession({ input: 10, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 19 }),
+		);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-legacy-cost", settings });
+
+		expect(result.usageCostBreakdownComplete).toBeUndefined();
+		expect(result.usage?.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+	});
+
+	for (const [label, usages] of [
+		[
+			"legacy then valid",
+			[
+				{ input: 10, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 19 },
+				usageWithRawCost({ ...completeRawCost }),
+			],
+		],
+		[
+			"valid then legacy",
+			[
+				usageWithRawCost({ ...completeRawCost }),
+				{ input: 10, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 19 },
+			],
+		],
+	] as const) {
+		it(`fails closed when a ${label} contributor has no raw cost`, async () => {
+			const settings = Settings.isolated({ "task.maxRuntimeMs": 0 });
+			mockCreateAgentSession(createUsageSession(usages));
+
+			const result = await runSubprocess({ ...baseOptions, id: `subagent-${label}-cost`, settings });
+
+			expect(result.usageCostBreakdownComplete).toBeUndefined();
+		});
+	}
+
+	it("preserves canonical aggregated usage and costs for valid contributors", async () => {
+		const settings = Settings.isolated({ "task.maxRuntimeMs": 0 });
+		mockCreateAgentSession(
+			createUsageSession([
+				usageWithRawCost(
+					{ input: 0, output: 2, cacheRead: 3, cacheWrite: 4, total: 9 },
+					{ input: 10, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 19 },
+				),
+				usageWithRawCost(
+					{ input: 10, output: 20, cacheRead: 30, cacheWrite: 40, total: 100 },
+					{ input: 11, output: 5, cacheRead: 7, cacheWrite: 13, totalTokens: 36 },
+				),
+			]),
+		);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-aggregate-valid-cost", settings });
+
+		expect(result.usageCostBreakdownComplete).toBe(true);
+		expect(result.usage).toEqual({
+			input: 21,
+			output: 7,
+			cacheRead: 10,
+			cacheWrite: 17,
+			totalTokens: 55,
+			cost: { input: 10, output: 22, cacheRead: 33, cacheWrite: 44, total: 109 },
+		});
 	});
 });

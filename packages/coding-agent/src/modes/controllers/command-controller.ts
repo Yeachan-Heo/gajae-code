@@ -427,7 +427,12 @@ export class CommandController {
 				info += `${theme.fg("dim", "Premium Requests:")} ${normalizedPremiumRequests.toLocaleString()}\n`;
 			}
 		}
-		const cacheMissSummary = computeCacheMissCostSummary(stats.tokens, this.ctx.session.model?.cost);
+		const cacheMissSummary = stats.costBreakdown
+			? computeCacheMissCostSummary(stats.tokens, {
+					kind: "persisted-aggregate",
+					costBreakdown: stats.costBreakdown,
+				})
+			: undefined;
 		if (cacheMissSummary) {
 			info += `\n${theme.bold("Cache Miss Cost")}`;
 			for (const line of formatCacheMissSummaryLines(cacheMissSummary)) {

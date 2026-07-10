@@ -59,6 +59,13 @@ function cacheWarningUsage(): Usage {
 	};
 }
 
+function cacheWarningUsageWithoutInputCost(): Usage {
+	return {
+		...cacheWarningUsage(),
+		cost: { output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } as Usage["cost"],
+	};
+}
+
 function assistantWithProxyAsk(): AssistantMessage {
 	return {
 		role: "assistant",
@@ -170,7 +177,7 @@ describe("formatSessionDumpText tool calls", () => {
 describe("formatSessionDumpText cache warnings", () => {
 	it("renders a cache warning after assistant content when pricing supports it", () => {
 		const dumped = formatSessionDumpText({
-			messages: [assistantWithUsage(cacheWarningUsage(), 1)],
+			messages: [assistantWithUsage(cacheWarningUsageWithoutInputCost(), 1)],
 			model: pricedModel(),
 			thinkingLevel: null,
 		});
@@ -180,23 +187,41 @@ describe("formatSessionDumpText cache warnings", () => {
 		);
 	});
 
-	it("omits cache warnings when model pricing is unavailable", () => {
+	it("does not reprice an explicit persisted input cost of zero", () => {
 		const dumped = formatSessionDumpText({
 			messages: [assistantWithUsage(cacheWarningUsage(), 1)],
-			model: null,
+			model: pricedModel(),
 			thinkingLevel: null,
 		});
 
+		expect(dumped).not.toContain("$0.06");
 		expect(dumped).not.toContain("Cache warning:");
+	});
+
+	it("omits cache warnings when model pricing is unavailable", () => {
+		const usage = cacheWarningUsageWithoutInputCost();
+		const withPricing = formatSessionDumpText({
+			messages: [assistantWithUsage(usage, 1)],
+			model: pricedModel(),
+			thinkingLevel: null,
+		});
+		expect(withPricing).toContain("Cache warning:");
+
+		const withoutPricing = formatSessionDumpText({
+			messages: [assistantWithUsage(usage, 1)],
+			model: null,
+			thinkingLevel: null,
+		});
+		expect(withoutPricing).not.toContain("Cache warning:");
 	});
 
 	it("caps cache warnings at three assistant turns", () => {
 		const dumped = formatSessionDumpText({
 			messages: [
-				assistantWithUsage(cacheWarningUsage(), 1),
-				assistantWithUsage(cacheWarningUsage(), 2),
-				assistantWithUsage(cacheWarningUsage(), 3),
-				assistantWithUsage(cacheWarningUsage(), 4),
+				assistantWithUsage(cacheWarningUsageWithoutInputCost(), 1),
+				assistantWithUsage(cacheWarningUsageWithoutInputCost(), 2),
+				assistantWithUsage(cacheWarningUsageWithoutInputCost(), 3),
+				assistantWithUsage(cacheWarningUsageWithoutInputCost(), 4),
 			],
 			model: pricedModel(),
 			thinkingLevel: null,

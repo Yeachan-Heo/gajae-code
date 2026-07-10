@@ -47,6 +47,7 @@ import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	hasCompleteUsageCostBreakdown,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	type ModelSubstitutionWarning,
@@ -743,6 +744,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 	let hasUsage = false;
+	let usageCostBreakdownComplete = true;
 
 	const requestAbort = (reason: AbortReason) => {
 		if (reason === "timeout") {
@@ -1109,6 +1111,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						const usageRecord = messageUsage as Record<string, unknown>;
 						const costRecord = (messageUsage as { cost?: Record<string, unknown> }).cost;
 						hasUsage = true;
+						usageCostBreakdownComplete &&= hasCompleteUsageCostBreakdown(usageRecord);
 						accumulatedUsage.input += getNumberField(usageRecord, "input") ?? 0;
 						accumulatedUsage.output += getNumberField(usageRecord, "output") ?? 0;
 						accumulatedUsage.cacheRead += getNumberField(usageRecord, "cacheRead") ?? 0;
@@ -1866,6 +1869,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		abortReason: finalAbortReason,
 		paused,
 		usage: hasUsage ? accumulatedUsage : undefined,
+		usageCostBreakdownComplete: hasUsage && usageCostBreakdownComplete ? true : undefined,
 		outputPath,
 		extractedToolData: progress.extractedToolData,
 		retryFailure: progress.retryFailure,

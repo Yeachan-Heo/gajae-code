@@ -18,6 +18,10 @@ export interface CacheEconomicsModelCost extends CacheEconomicsPricing {
 	output: number;
 }
 
+export type CacheEconomicsBasis =
+	| { kind: "persisted-aggregate"; costBreakdown: Usage["cost"] }
+	| { kind: "current-model-estimate"; pricing: CacheEconomicsPricing };
+
 export interface CacheEconomicsUsage {
 	input: number;
 	output?: number;
@@ -55,18 +59,31 @@ export interface CacheWarningBuildState {
 	warningsEmitted: number;
 }
 
+function finiteNonNegative(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
 function positiveFinite(value: number | undefined): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
-function bucketCost(
+function currentModelBucketCost(
 	tokens: number,
-	bucketCostUsd: number | undefined,
+	persistedCostUsd: number | undefined,
 	pricePerMillionTokens: number | undefined,
-): number {
-	if (positiveFinite(bucketCostUsd)) return bucketCostUsd;
+): number | undefined {
+	if (persistedCostUsd !== undefined) {
+		return finiteNonNegative(persistedCostUsd) ? persistedCostUsd : undefined;
+	}
 	if (!positiveFinite(tokens) || !positiveFinite(pricePerMillionTokens)) return 0;
 	return (tokens / TOKENS_PER_MILLION) * pricePerMillionTokens;
+}
+
+function persistedAggregateCosts(costBreakdown: Usage["cost"] | undefined): [number, number, number] | undefined {
+	if (!costBreakdown) return undefined;
+	const { input, cacheRead, cacheWrite, output, total } = costBreakdown;
+	if (![input, cacheRead, cacheWrite, output, total].every(finiteNonNegative)) return undefined;
+	return [input, cacheRead, cacheWrite];
 }
 
 function hasMaterialEvidence(usage: CacheEconomicsUsage, costs: readonly number[]): boolean {
@@ -77,12 +94,22 @@ function hasMaterialEvidence(usage: CacheEconomicsUsage, costs: readonly number[
 
 export function computeCacheMissCostSummary(
 	usage: CacheEconomicsUsage | undefined,
-	pricing: CacheEconomicsPricing | undefined,
+	basis: CacheEconomicsBasis,
 ): CacheMissCostSummary | undefined {
-	if (!usage || !pricing) return undefined;
-	const inputCostUsd = bucketCost(usage.input, usage.cost?.input, pricing.input);
-	const cacheReadCostUsd = bucketCost(usage.cacheRead, usage.cost?.cacheRead, pricing.cacheRead);
-	const cacheWriteCostUsd = bucketCost(usage.cacheWrite, usage.cost?.cacheWrite, pricing.cacheWrite);
+	if (!usage) return undefined;
+
+	const costs =
+		basis.kind === "persisted-aggregate"
+			? persistedAggregateCosts(basis.costBreakdown)
+			: [
+					currentModelBucketCost(usage.input, usage.cost?.input, basis.pricing.input),
+					currentModelBucketCost(usage.cacheRead, usage.cost?.cacheRead, basis.pricing.cacheRead),
+					currentModelBucketCost(usage.cacheWrite, usage.cost?.cacheWrite, basis.pricing.cacheWrite),
+				];
+	if (!costs) return undefined;
+	const [inputCostUsd, cacheReadCostUsd, cacheWriteCostUsd] = costs;
+	if (inputCostUsd === undefined || cacheReadCostUsd === undefined || cacheWriteCostUsd === undefined)
+		return undefined;
 	if (usage.input <= 0 && cacheWriteCostUsd <= 0) return undefined;
 	if (!hasMaterialEvidence(usage, [inputCostUsd, cacheReadCostUsd, cacheWriteCostUsd])) return undefined;
 	if (inputCostUsd <= 0 && cacheWriteCostUsd <= 0) return undefined;
@@ -90,11 +117,12 @@ export function computeCacheMissCostSummary(
 	const totalReusableInput = usage.input + usage.cacheRead;
 	const cacheHitRate = totalReusableInput > 0 ? usage.cacheRead / totalReusableInput : undefined;
 	const missPremiumUsd =
-		positiveFinite(pricing.input) &&
-		positiveFinite(pricing.cacheRead) &&
-		pricing.input > pricing.cacheRead &&
+		basis.kind === "current-model-estimate" &&
+		positiveFinite(basis.pricing.input) &&
+		positiveFinite(basis.pricing.cacheRead) &&
+		basis.pricing.input > basis.pricing.cacheRead &&
 		usage.input > 0
-			? ((pricing.input - pricing.cacheRead) * usage.input) / TOKENS_PER_MILLION
+			? ((basis.pricing.input - basis.pricing.cacheRead) * usage.input) / TOKENS_PER_MILLION
 			: undefined;
 
 	return {
@@ -135,7 +163,9 @@ export function buildCacheBehaviorWarning(
 	usage: Usage | undefined,
 	model: { cost: CacheEconomicsModelCost } | undefined | null,
 ): CacheBehaviorWarning | undefined {
-	const summary = computeCacheMissCostSummary(usage, model?.cost);
+	const summary = model
+		? computeCacheMissCostSummary(usage, { kind: "current-model-estimate", pricing: model.cost })
+		: undefined;
 	if (!summary) return undefined;
 	if (
 		summary.inputTokens >= LARGE_INPUT_TOKENS &&

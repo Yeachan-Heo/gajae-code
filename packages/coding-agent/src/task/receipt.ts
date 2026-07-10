@@ -1,5 +1,4 @@
-import type { SingleResult, TaskToolDetails } from "./types";
-
+import { hasCompleteUsageCostBreakdown, type SingleResult, type TaskToolDetails } from "./types";
 export interface TaskRoi {
 	tokens: number;
 	contextTokens?: number;
@@ -32,6 +31,7 @@ export interface TaskResultReceipt {
 	modelSubstitutionWarning?: SingleResult["modelSubstitutionWarning"];
 	usage?: SingleResult["usage"];
 	cost?: number;
+	usageCostBreakdownComplete?: true;
 	branchName?: string;
 	retryFailure?: { attempt: number; errorSummary: string };
 	errorSummary?: string;
@@ -246,6 +246,8 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		modelSubstitutionWarning: raw.modelSubstitutionWarning,
 		usage: raw.usage,
 		cost: raw.usage?.cost.total,
+		usageCostBreakdownComplete:
+			raw.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(raw.usage) ? true : undefined,
 		branchName: raw.branchName,
 		retryFailure: raw.retryFailure
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
@@ -274,6 +276,7 @@ export interface RawTaskToolDetails {
 	results: SingleResult[];
 	totalDurationMs: number;
 	usage?: TaskToolDetails["usage"];
+	usageCostBreakdownComplete?: TaskToolDetails["usageCostBreakdownComplete"];
 	async?: TaskToolDetails["async"];
 	forkContextClonedTokens?: number;
 	roiSummary?: TaskToolDetails["roiSummary"];
@@ -286,6 +289,8 @@ export function sanitizeTaskToolDetails(raw: RawTaskToolDetails): TaskToolDetail
 		results: raw.results.map(buildTaskReceipt),
 		totalDurationMs: raw.totalDurationMs,
 		usage: raw.usage,
+		usageCostBreakdownComplete:
+			raw.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(raw.usage) ? true : undefined,
 		forkContextClonedTokens: raw.forkContextClonedTokens,
 		roiSummary: raw.roiSummary ?? buildTaskRoiSummary(raw.results.map(buildTaskReceipt)),
 		async: raw.async,

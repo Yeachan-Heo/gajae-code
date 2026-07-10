@@ -13,7 +13,12 @@ import {
 	type RawTaskToolDetails,
 	sanitizeTaskToolDetails,
 } from "../../src/task/receipt";
-import type { SingleResult, TaskToolDetails } from "../../src/task/types";
+import {
+	hasCompleteAggregateUsageCostBreakdown,
+	hasCompleteUsageCostBreakdown,
+	type SingleResult,
+	type TaskToolDetails,
+} from "../../src/task/types";
 
 const CANONICAL_USAGE = {
 	input: 1,
@@ -217,6 +222,78 @@ describe("task result receipts", () => {
 		expect(receipt.usage?.output).toBe(2);
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 		expect(() => assertNoRawTaskFields(receipt, "receipt")).not.toThrow();
+	});
+
+	it("preserves explicit complete cost provenance through receipts and sanitized task details", () => {
+		const raw = makeRaw({ usage: CANONICAL_USAGE, usageCostBreakdownComplete: true });
+		const receipt = buildTaskReceipt(raw);
+		expect(receipt.usageCostBreakdownComplete).toBe(true);
+
+		const sanitized = sanitizeTaskToolDetails({
+			projectAgentsDir: null,
+			results: [raw],
+			totalDurationMs: 10,
+			usage: CANONICAL_USAGE,
+			usageCostBreakdownComplete: true,
+		});
+		expect(sanitized.results[0]?.usageCostBreakdownComplete).toBe(true);
+		expect(sanitized.usageCostBreakdownComplete).toBe(true);
+	});
+
+	it("authorizes aggregate provenance for all-complete zero-cost children", () => {
+		const children = [
+			makeRaw({ usage: CANONICAL_USAGE, usageCostBreakdownComplete: true }),
+			makeRaw({ index: 1, id: "1-Test", usage: CANONICAL_USAGE, usageCostBreakdownComplete: true }),
+		];
+
+		expect(hasCompleteAggregateUsageCostBreakdown(children)).toBe(true);
+	});
+
+	it("fails aggregate provenance for legacy or invalid usage contributors", () => {
+		const complete = makeRaw({ usage: CANONICAL_USAGE, usageCostBreakdownComplete: true });
+		const legacy = makeRaw({ index: 1, id: "1-Test", usage: CANONICAL_USAGE });
+		const invalid = makeRaw({
+			index: 2,
+			id: "2-Test",
+			usage: { ...CANONICAL_USAGE, cost: { ...CANONICAL_USAGE.cost, total: Number.NaN } },
+			usageCostBreakdownComplete: true,
+		});
+
+		expect(hasCompleteAggregateUsageCostBreakdown([complete, legacy])).toBe(false);
+		expect(hasCompleteAggregateUsageCostBreakdown([complete, invalid])).toBe(false);
+	});
+
+	it("rejects marked usage with an invalid cost contributor", () => {
+		const invalidUsage = {
+			...CANONICAL_USAGE,
+			cost: { ...CANONICAL_USAGE.cost, cacheWrite: -1 },
+		};
+		const raw = makeRaw({ usage: invalidUsage, usageCostBreakdownComplete: true });
+
+		expect(hasCompleteUsageCostBreakdown(raw.usage)).toBe(false);
+		expect(buildTaskReceipt(raw).usageCostBreakdownComplete).toBeUndefined();
+		expect(
+			sanitizeTaskToolDetails({
+				projectAgentsDir: null,
+				results: [raw],
+				totalDurationMs: 10,
+				usage: invalidUsage,
+				usageCostBreakdownComplete: true,
+			}).usageCostBreakdownComplete,
+		).toBeUndefined();
+	});
+
+	it("fails closed for absent or legacy cost provenance despite zero-filled canonical usage", () => {
+		const legacyRaw = makeRaw({ usage: CANONICAL_USAGE });
+		expect(buildTaskReceipt(legacyRaw).usageCostBreakdownComplete).toBeUndefined();
+
+		const sanitized = sanitizeTaskToolDetails({
+			projectAgentsDir: null,
+			results: [legacyRaw],
+			totalDurationMs: 10,
+			usage: CANONICAL_USAGE,
+		});
+		expect(sanitized.usageCostBreakdownComplete).toBeUndefined();
 	});
 
 	it("preserves numeric fork-context accounting on receipts and sanitized details", () => {

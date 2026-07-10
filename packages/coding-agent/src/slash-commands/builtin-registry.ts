@@ -847,7 +847,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						lines.push(`Premium Requests: ${stats.premiumRequests.toLocaleString()}`);
 					}
 				}
-				const cacheMissSummary = computeCacheMissCostSummary(stats.tokens, runtime.session.model?.cost);
+				const cacheMissSummary = stats.costBreakdown
+					? computeCacheMissCostSummary(stats.tokens, {
+							kind: "persisted-aggregate",
+							costBreakdown: stats.costBreakdown,
+						})
+					: undefined;
 				if (cacheMissSummary) {
 					lines.push("", "Cache Miss Cost", ...formatCacheMissSummaryLines(cacheMissSummary));
 				}
