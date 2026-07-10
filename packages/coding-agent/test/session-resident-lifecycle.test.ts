@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
@@ -223,7 +224,215 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		expect(await readPersistedJsonl(sessionFile)).toContain(sentinel.slice(0, 100));
 		await sm.close();
 	});
+	it("keeps an active manager reusable after artifact cleanup fails following transcript deletion", async () => {
+		const { sm, sessionFile, artifactsDir } = await makeLargeSession(`partial drop ${"p".repeat(2048)}`);
+		const originalRm = fsp.rm;
+		vi.spyOn(fsp, "rm").mockImplementation(async (target, options) => {
+			const normalizeDarwinPath = (value: string) => value.replace(/^\/private(?=\/(?:tmp|var)\b)/, "");
+			if (normalizeDarwinPath(String(target)) === normalizeDarwinPath(artifactsDir)) {
+				throw new Error("simulated artifact cleanup failure");
+			}
+			return originalRm(target, options);
+		});
 
+		await expect(sm.dropSession(sessionFile)).rejects.toThrow("simulated artifact cleanup failure");
+		expect(fs.existsSync(sessionFile)).toBe(false);
+		const replacement = sm.getSessionFile();
+		expect(replacement).toBeDefined();
+		expect(replacement).not.toBe(sessionFile);
+		sm.appendMessage({ role: "user", content: "after-partial-drop", timestamp: Date.now() });
+		await sm.flush();
+		expect(await readPersistedJsonl(replacement!)).toContain("after-partial-drop");
+	});
+
+	it("cleans artifacts when the session transcript is already missing", async () => {
+		const { sm, sessionFile, artifactsDir } = await makeLargeSession(`missing transcript ${"q".repeat(2048)}`);
+		await fs.promises.unlink(sessionFile);
+		await sm.dropSession(sessionFile);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+	});
+
+	it("rolls back physical and logical state when the final move rewrite fails", async () => {
+		const sentinel = `final rewrite rollback ${"z".repeat(2048)}`;
+		const { sm, root, sessionFile } = await makeLargeSession(sentinel);
+		const newRoot = tempRoot("gjc-resident-final-rewrite-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		let jsonlRenames = 0;
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(target).endsWith(".jsonl") && ++jsonlRenames === 2) {
+				throw new Error("simulated final rewrite rename failure");
+			}
+			return realRename(source, target);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("simulated final rewrite rename failure");
+		expect(sm.getCwd()).toBe(root);
+		expect(sm.getSessionFile()).toBe(sessionFile);
+		expect(fs.existsSync(sessionFile)).toBe(true);
+		sm.appendMessage({ role: "user", content: "after-final-rewrite-failure", timestamp: Date.now() });
+		await sm.flush();
+		expect(await readPersistedJsonl(sessionFile)).toContain("after-final-rewrite-failure");
+	});
+	it("uses EXDEV-safe reverse movement after a later move failure", async () => {
+		const { sm, root, sessionFile } = await makeLargeSession(`exdev rollback ${"x".repeat(2048)}`);
+		const newRoot = tempRoot("gjc-resident-exdev-rollback-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		let exdevCount = 0;
+		let jsonlRenames = 0;
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(source).endsWith(".jsonl") && exdevCount++ < 2) {
+				const error = new Error("cross-device") as Error & { code: string };
+				error.code = "EXDEV";
+				throw error;
+			}
+			if (String(target).endsWith(".jsonl") && ++jsonlRenames === 1) {
+				throw new Error("later rewrite failure");
+			}
+			return realRename(source, target);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("later rewrite failure");
+		expect(sm.getCwd()).toBe(root);
+		expect(sm.getSessionFile()).toBe(sessionFile);
+		expect(fs.existsSync(sessionFile)).toBe(true);
+		expect(exdevCount).toBeGreaterThanOrEqual(2);
+	});
+
+	it("removes an EXDEV-copied transcript when source unlink fails", async () => {
+		const { sm, root, sessionFile } = await makeLargeSession(`exdev cleanup ${"x".repeat(2048)}`);
+		const newRoot = tempRoot("gjc-resident-exdev-cleanup-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		const realUnlink = fs.promises.unlink.bind(fs.promises);
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(source) === sessionFile) {
+				const error = new Error("cross-device") as Error & { code: string };
+				error.code = "EXDEV";
+				throw error;
+			}
+			return realRename(source, target);
+		});
+		vi.spyOn(fs.promises, "unlink").mockImplementation(async target => {
+			if (String(target) === sessionFile) throw new Error("source unlink failure");
+			return realUnlink(target);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("source unlink failure");
+		expect(sm.getCwd()).toBe(root);
+		expect(sm.getSessionFile()).toBe(sessionFile);
+		expect(fs.existsSync(sessionFile)).toBe(true);
+		sm.appendMessage({ role: "user", content: "after-reconciled-exdev-failure", timestamp: Date.now() });
+		await sm.flush();
+	});
+	it("poisons after an EXDEV copied transcript cannot be cleaned up", async () => {
+		const { sm, root, sessionFile } = await makeLargeSession(`exdev cleanup poison ${"x".repeat(2048)}`);
+		const newRoot = tempRoot("gjc-resident-exdev-cleanup-poison-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		const realUnlink = fs.promises.unlink.bind(fs.promises);
+		let copiedTranscript: string | undefined;
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(source) === sessionFile) {
+				copiedTranscript = String(target);
+				const error = new Error("cross-device") as Error & { code: string };
+				error.code = "EXDEV";
+				throw error;
+			}
+			return realRename(source, target);
+		});
+		vi.spyOn(fs.promises, "unlink").mockImplementation(async target => {
+			if (String(target) === sessionFile || String(target) === copiedTranscript) {
+				throw new Error("unlink cleanup failure");
+			}
+			return realUnlink(target);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("Cross-device move left source and destination unreconciled");
+		expect(sm.getCwd()).toBe(root);
+		expect(() => sm.appendMessage({ role: "user", content: "must-reject", timestamp: Date.now() })).toThrow(
+			"Cross-device move left source and destination unreconciled",
+		);
+	});
+	it("restores a writable old state after EXDEV artifact cleanup succeeds", async () => {
+		const { sm, root, sessionFile } = await makeLargeSession(`exdev artifact cleanup ${"x".repeat(2048)}`);
+		const oldArtifactDir = sessionFile.slice(0, -6);
+		const newRoot = tempRoot("gjc-resident-exdev-artifact-cleanup-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		const realRm = fs.promises.rm.bind(fs.promises);
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(source) === oldArtifactDir) {
+				const error = new Error("cross-device") as Error & { code: string };
+				error.code = "EXDEV";
+				throw error;
+			}
+			return realRename(source, target);
+		});
+		vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
+			if (String(target) === oldArtifactDir) throw new Error("artifact source rm failure");
+			return realRm(target, options);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("artifact source rm failure");
+		expect(sm.getCwd()).toBe(root);
+		sm.appendMessage({ role: "user", content: "after-artifact-cleanup", timestamp: Date.now() });
+		await sm.flush();
+	});
+	it("poisons after EXDEV artifact cleanup fails", async () => {
+		const { sm, sessionFile } = await makeLargeSession(`exdev artifact poison ${"x".repeat(2048)}`);
+		const oldArtifactDir = sessionFile.slice(0, -6);
+		const newRoot = tempRoot("gjc-resident-exdev-artifact-poison-");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		const realRm = fs.promises.rm.bind(fs.promises);
+		let copiedArtifactDir: string | undefined;
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(source) === oldArtifactDir) {
+				copiedArtifactDir = String(target);
+				const error = new Error("cross-device") as Error & { code: string };
+				error.code = "EXDEV";
+				throw error;
+			}
+			return realRename(source, target);
+		});
+		vi.spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
+			if (String(target) === oldArtifactDir || String(target) === copiedArtifactDir) {
+				throw new Error("artifact cleanup failure");
+			}
+			return realRm(target, options);
+		});
+
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("Cross-device move left source and destination unreconciled");
+		expect(() => sm.appendMessage({ role: "user", content: "must-reject", timestamp: Date.now() })).toThrow(
+			"Cross-device move left source and destination unreconciled",
+		);
+	});
+	it("preserves poison after relative active-target rewrite rollback failure", async () => {
+		const root = tempRoot("gjc-relative-active-target-");
+		const relativeSessionDir = path.relative(process.cwd(), tempRoot("gjc-relative-session-dir-"));
+		const sm = SessionManager.create(root, relativeSessionDir);
+		sm.appendMessage(assistant("relative active target"));
+		await sm.ensureOnDisk();
+		const sessionFile = sm.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+		const activePath = path.resolve(sessionFile);
+		await Bun.write(sessionFile, "");
+		const realRename = fs.promises.rename.bind(fs.promises);
+		let replacementAttempts = 0;
+		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			if (String(target) === activePath && String(source).includes(".bak")) {
+				throw new Error("backup rollback failure");
+			}
+			if (String(target) === activePath && ++replacementAttempts === 1) {
+				const error = new Error("replace EPERM") as Error & { code: string };
+				error.code = "EPERM";
+				throw error;
+			}
+			if (String(target) === activePath) throw new Error("replacement failure");
+			return realRename(source, target);
+		});
+
+		await expect(sm.setSessionFile(sessionFile)).rejects.toThrow("backup rollback failure");
+		expect(() => sm.appendMessage({ role: "user", content: "must-reject", timestamp: Date.now() })).toThrow(
+			"backup rollback failure",
+		);
+	});
 	it("persists large text with legacy truncation notice and without resident sentinels or text blob refs", async () => {
 		const sentinel = `canonical parity ${"p".repeat(600_000)}`;
 		const { sm, sessionFile } = await makeLargeSession(sentinel);

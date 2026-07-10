@@ -3,11 +3,14 @@ import {
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,
+	hasPersistedThinkingLevel,
 	type ModelChangeEntry,
 	type SessionEntry,
+	SessionManager,
 	type SessionMessageEntry,
 	type ThinkingLevelChangeEntry,
 } from "@gajae-code/coding-agent/session/session-manager";
+import { MemorySessionStorage, type SessionStorageWriter } from "@gajae-code/coding-agent/session/session-storage";
 
 function msg(id: string, parentId: string | null, role: "user" | "assistant", text: string): SessionMessageEntry {
 	const base = { type: "message" as const, id, parentId, timestamp: "2025-01-01T00:00:00Z" };
@@ -58,6 +61,31 @@ function thinkingLevel(id: string, parentId: string | null, level: string): Thin
 
 function modelChange(id: string, parentId: string | null, provider: string, modelId: string): ModelChangeEntry {
 	return { type: "model_change", id, parentId, timestamp: "2025-01-01T00:00:00Z", model: `${provider}/${modelId}` };
+}
+
+class FailingAppendStorage extends MemorySessionStorage {
+	failWrites = false;
+
+	override openWriter(
+		path: string,
+		options?: { flags?: "a" | "w"; onError?: (err: Error) => void },
+	): SessionStorageWriter {
+		const writer = super.openWriter(path, options);
+		return {
+			writeLine: async line => {
+				if (this.failWrites) throw new Error("forced session write failure");
+				await writer.writeLine(line);
+			},
+			writeLineSync: line => {
+				if (this.failWrites) throw new Error("forced session write failure");
+				writer.writeLineSync(line);
+			},
+			flush: () => writer.flush(),
+			fsync: () => writer.fsync(),
+			close: () => writer.close(),
+			getError: () => writer.getError(),
+		};
+	}
 }
 
 describe("buildSessionContext", () => {
@@ -156,6 +184,53 @@ describe("buildSessionContext", () => {
 			// different model id. Temporary fallbacks and provider-side
 			// downgrades both produce such mismatched messages.
 			expect(ctx.models.default).toBe("openai/gpt-4");
+		});
+	});
+
+	describe("atomic model history", () => {
+		it("applies model and thinking level from one model change entry", () => {
+			const entry = modelChange("1", null, "anthropic", "claude") as ModelChangeEntry;
+			entry.thinkingLevel = "high";
+
+			const context = buildSessionContext([entry]);
+
+			expect(context.models.default).toBe("anthropic/claude");
+			expect(context.thinkingLevel).toBe("high");
+			expect(hasPersistedThinkingLevel([entry])).toBe(true);
+			expect(hasPersistedThinkingLevel([{ ...entry, role: "temporary" }])).toBe(false);
+		});
+
+		it("preserves persistence poison through a failed fork restore", async () => {
+			const storage = new FailingAppendStorage();
+			const manager = SessionManager.create("/project", "/sessions", storage);
+			await manager.ensureOnDisk();
+			const entriesBefore = manager.getEntries();
+			storage.failWrites = true;
+
+			expect(() => manager.appendModelChange("anthropic/claude", "default", { thinkingLevel: "high" })).toThrow(
+				"forced session write failure",
+			);
+			expect(manager.getEntries()).toEqual(entriesBefore);
+			expect(manager.buildSessionContext().models.default).toBeUndefined();
+
+			await expect(manager.fork()).rejects.toThrow("forced session write failure");
+			expect(() => manager.appendModelChange("anthropic/other", "default")).toThrow("forced session write failure");
+		});
+
+		it("rejects appends synchronously once close starts", async () => {
+			const manager = SessionManager.inMemory();
+			const largeContent = "x".repeat(4096);
+			manager.appendMessage({ role: "user", content: largeContent, timestamp: Date.now() });
+			const closePromise = manager.close();
+
+			expect(() => manager.appendModelChange("anthropic/claude", "default", { thinkingLevel: "high" })).toThrow(
+				"Session manager close is in progress",
+			);
+			await closePromise;
+			const restoredMessage = manager.buildSessionContext().messages[0];
+			expect(restoredMessage?.role).toBe("user");
+			if (restoredMessage?.role === "user") expect(restoredMessage.content).toBe(largeContent);
+			expect(() => manager.appendModelChange("anthropic/after-close", "default")).not.toThrow();
 		});
 	});
 

@@ -95,7 +95,11 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		"modelProfile.default": "old-profile",
 	});
 	const flush = vi.fn(async () => {});
-	settings.flush = flush as typeof settings.flush;
+	const durableFlush = settings.flushMutationCheckpoint.bind(settings);
+	settings.flushMutationCheckpoint = (async checkpoint => {
+		await durableFlush(checkpoint);
+		await flush();
+	}) as typeof settings.flushMutationCheckpoint;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
@@ -109,10 +113,23 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		scopedModels: [],
 		modelRegistry: createRegistry(options),
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
+		pendingSettingsModelChange: undefined as { model: Model; thinkingLevel?: ThinkingLevel } | undefined,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
 			this.thinkingLevel = thinkingLevel;
+		},
+		async setModelForSettingsCommit(next: Model, thinkingLevel?: ThinkingLevel) {
+			this.pendingSettingsModelChange = { model: next, thinkingLevel };
+		},
+		cancelSettingsModelChange() {
+			this.pendingSettingsModelChange = undefined;
+		},
+		async commitSettingsModelChange(next: Model) {
+			const pending = this.pendingSettingsModelChange;
+			this.pendingSettingsModelChange = undefined;
+			if (!pending || pending.model !== next) throw new Error("Pending model settings commit does not match");
+			await this.setModelTemporary(next, pending.thinkingLevel);
 		},
 	};
 	const ctx = {
@@ -125,6 +142,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		updateEditorBorderColor: vi.fn(),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
+		notifyConfigChanged: vi.fn(async () => {}),
 	};
 	return { ctx, settings, session, flush, setCalls };
 }
@@ -325,6 +343,7 @@ describe("model selector profiles", () => {
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/alternate" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
 	});
 
 	test("Set as default persists and flushes modelProfile.default", async () => {
@@ -336,6 +355,7 @@ describe("model selector profiles", () => {
 		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
 		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
 		expect(flush).toHaveBeenCalledTimes(1);
+		expect(ctx.notifyConfigChanged).toHaveBeenCalledTimes(1);
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
 
@@ -358,8 +378,7 @@ describe("model selector profiles", () => {
 		const { ctx, session, flush, setCalls } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
 
-		controller.handleSettingChange("modelProfile.default", "profile-a");
-		await Bun.sleep(10);
+		await controller.handleSettingChange("modelProfile.default", "profile-a");
 
 		expect(session.setModelTemporaryCalls).toHaveLength(1);
 		expect(session.model?.id).toBe("default");
@@ -373,8 +392,9 @@ describe("model selector profiles", () => {
 		const { ctx, settings, session } = createControllerContext({ missingCredentials: true });
 		const controller = new SelectorController(ctx as never);
 
-		controller.handleSettingChange("modelProfile.default", "profile-a");
-		await Bun.sleep(10);
+		await expect(
+			controller.handleSettingChange("modelProfile.default", "profile-a") as Promise<void>,
+		).rejects.toThrow("requires credentials for: provider-a");
 
 		expect(ctx.showError).toHaveBeenCalledWith(
 			'Model profile "Profile Alpha" requires credentials for: provider-a. Run /login and configure the missing provider(s), then retry.',

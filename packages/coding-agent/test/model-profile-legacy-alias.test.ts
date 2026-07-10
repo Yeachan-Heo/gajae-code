@@ -48,7 +48,11 @@ interface TestSession {
 	thinkingLevel: ThinkingLevel | undefined;
 	readonly sessionId: string;
 	readonly setModelTemporaryCalls: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	pendingSettingsModelChange: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel): Promise<void>;
+	setModelForSettingsCommit(next: Model, thinkingLevel?: ThinkingLevel): Promise<void>;
+	commitSettingsModelChange(next: Model): Promise<void>;
+	cancelSettingsModelChange(): void;
 	setActiveModelProfile(name: string | undefined): void;
 	getActiveModelProfile(): string | undefined;
 }
@@ -76,10 +80,23 @@ function fakeSession() {
 		thinkingLevel: ThinkingLevel.Low,
 		sessionId: "session-1",
 		setModelTemporaryCalls: [],
+		pendingSettingsModelChange: undefined as { model: Model; thinkingLevel?: ThinkingLevel } | undefined,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			session.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			session.model = next;
 			session.thinkingLevel = thinkingLevel;
+		},
+		async setModelForSettingsCommit(next: Model, thinkingLevel?: ThinkingLevel) {
+			session.pendingSettingsModelChange = { model: next, thinkingLevel };
+		},
+		cancelSettingsModelChange() {
+			session.pendingSettingsModelChange = undefined;
+		},
+		async commitSettingsModelChange(next: Model) {
+			const pending = session.pendingSettingsModelChange;
+			session.pendingSettingsModelChange = undefined;
+			if (!pending || pending.model !== next) throw new Error("Pending model settings commit does not match");
+			await session.setModelTemporary(next, pending.thinkingLevel);
 		},
 		setActiveModelProfile(name: string | undefined) {
 			activeModelProfile = name;
@@ -150,6 +167,31 @@ describe("legacy model profile aliases", () => {
 		});
 
 		// The retired-name alias must NOT shadow an explicitly defined profile.
+		expect(prepared.profileName).toBe("codex-standard");
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+	});
+
+	test("resolves an archived exact codex-standard before the retired-name alias", async () => {
+		const archivedCodexStandard: ModelProfileDefinition = {
+			name: "codex-standard",
+			requiredProviders: ["openai-codex"],
+			modelMapping: { default: "openai-codex/gpt-5.5:xhigh" },
+			source: "user",
+		};
+		const activeRegistry = fakeRegistry();
+		const archivedRegistry = {
+			...activeRegistry,
+			getModelProfileForReference: (name: string) =>
+				name === "codex-standard" ? archivedCodexStandard : activeRegistry.getModelProfile(name),
+		};
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: archivedRegistry,
+			settings: Settings.isolated(),
+			profileName: "codex-standard",
+		});
+
 		expect(prepared.profileName).toBe("codex-standard");
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
 	});

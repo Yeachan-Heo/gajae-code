@@ -389,15 +389,8 @@ export function recommendModelProfileForProvider(
 	return recommended ? profiles.get(recommended) : undefined;
 }
 
-export function mergeModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map<string, ModelProfileDefinition> {
+export function mapUserModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map<string, ModelProfileDefinition> {
 	const profiles = new Map<string, ModelProfileDefinition>();
-	for (const definition of BUILTIN_MODEL_PROFILES) {
-		profiles.set(definition.name, {
-			...definition,
-			requiredProviders: [...definition.requiredProviders],
-			modelMapping: { ...definition.modelMapping },
-		});
-	}
 	for (const [name, definition] of Object.entries(userProfiles ?? {})) {
 		const modelMapping = { ...definition.model_mapping };
 		profiles.set(name, {
@@ -407,6 +400,21 @@ export function mergeModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map
 			modelMapping,
 			source: "user",
 		});
+	}
+	return profiles;
+}
+
+export function mergeModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map<string, ModelProfileDefinition> {
+	const profiles = new Map<string, ModelProfileDefinition>();
+	for (const definition of BUILTIN_MODEL_PROFILES) {
+		profiles.set(definition.name, {
+			...definition,
+			requiredProviders: [...definition.requiredProviders],
+			modelMapping: { ...definition.modelMapping },
+		});
+	}
+	for (const [name, definition] of mapUserModelProfiles(userProfiles)) {
+		profiles.set(name, definition);
 	}
 	return profiles;
 }

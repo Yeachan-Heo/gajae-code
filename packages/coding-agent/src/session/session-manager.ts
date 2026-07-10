@@ -187,7 +187,7 @@ export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 
 export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
-	/** Model in "provider/modelId" format */
+	/** Model in "provider/modelId" format. */
 	model: string;
 	/** Role: "default" or an agent role. Undefined treated as "default" */
 	role?: string;
@@ -686,6 +686,16 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
  * If leafId is provided, walks from that entry to root.
  * Handles compaction and branch summaries along the path.
  */
+export function hasPersistedThinkingLevel(entries: readonly SessionEntry[]): boolean {
+	return entries.some(
+		entry =>
+			entry.type === "thinking_level_change" ||
+			(entry.type === "model_change" &&
+				(entry.role ?? "default") === "default" &&
+				entry.thinkingLevel !== undefined),
+	);
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -778,12 +788,14 @@ export function buildSessionContext(
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel ?? "off";
 		} else if (entry.type === "model_change") {
-			// New format: { model: "provider/id", role?: string }
 			if (entry.model) {
 				const role = entry.role ?? "default";
 				models[role] = entry.model;
 				if (role === "default") {
 					hasExplicitDefaultModel = true;
+					if (entry.thinkingLevel !== undefined) {
+						thinkingLevel = entry.thinkingLevel ?? "off";
+					}
 				}
 			}
 		} else if (entry.type === "service_tier_change") {
@@ -1530,7 +1542,22 @@ function formatTimeAgo(date: Date): string {
 	return date.toLocaleDateString();
 }
 
+class UnreconciledCrossDeviceMoveError extends Error {
+	constructor(source: string, destination: string, cause: unknown) {
+		super(`Cross-device move left source and destination unreconciled: ${source} -> ${destination}`, { cause });
+		this.name = "UnreconciledCrossDeviceMoveError";
+	}
+}
+
 async function movePathAcrossDevicesSafe(source: string, destination: string): Promise<void> {
+	if (
+		await fs.promises
+			.access(destination)
+			.then(() => true)
+			.catch(() => false)
+	) {
+		throw new Error(`Refusing to overwrite existing move destination: ${destination}`);
+	}
 	try {
 		await fs.promises.rename(source, destination);
 		return;
@@ -1538,13 +1565,27 @@ async function movePathAcrossDevicesSafe(source: string, destination: string): P
 		if (!hasFsCode(error, "EXDEV")) throw error;
 	}
 	const stat = await fs.promises.stat(source);
+	const removeSource = stat.isDirectory()
+		? () => fs.promises.rm(source, { recursive: true, force: false })
+		: () => fs.promises.unlink(source);
+	const removeDestination = stat.isDirectory()
+		? () => fs.promises.rm(destination, { recursive: true, force: false })
+		: () => fs.promises.unlink(destination);
 	if (stat.isDirectory()) {
 		await fs.promises.cp(source, destination, { recursive: true, force: false, errorOnExist: true });
-		await fs.promises.rm(source, { recursive: true, force: false });
-		return;
+	} else {
+		await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
 	}
-	await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
-	await fs.promises.unlink(source);
+	try {
+		await removeSource();
+	} catch (error) {
+		try {
+			await removeDestination();
+		} catch {
+			throw new UnreconciledCrossDeviceMoveError(source, destination, error);
+		}
+		throw error;
+	}
 }
 
 const MAX_PERSIST_CHARS = 500_000;
@@ -2983,9 +3024,14 @@ interface SessionManagerStateSnapshot {
 	titleSource: "auto" | "user" | undefined;
 	sessionFile: string | undefined;
 	flushed: boolean;
+	ensuredOnDisk: boolean;
 	needsFullRewriteOnNextPersist: boolean;
 	fileEntries: FileEntry[];
 	materializedFileEntries: FileEntry[];
+	leafId: string | null;
+	persistError: Error | undefined;
+	persistErrorReported: boolean;
+	adoptedArtifactManager: ArtifactManager | null;
 }
 
 export class SessionManager {
@@ -3015,6 +3061,9 @@ export class SessionManager {
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
+	/** Rejects appends immediately and serializes full lifecycle transitions. */
+	#activeCloseOperations = 0;
+	#lifecycleChain: Promise<void> = Promise.resolve();
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
 	// When set, take precedence over the lazily-derived per-session manager.
@@ -3098,10 +3147,11 @@ export class SessionManager {
 	}
 
 	#reexternalizeFileEntriesForResidentStore(): void {
+		const leafId = this.#leafId;
 		this.#fileEntries = this.#fileEntries.map(entry =>
 			prepareEntryForResidentSync(entry, this.#residentBlobStores()),
 		);
-		this.#buildIndex();
+		this.#buildIndex(leafId);
 	}
 
 	#resetMaterializedCaches(): void {
@@ -3175,6 +3225,7 @@ export class SessionManager {
 			titleSource: this.#titleSource,
 			sessionFile: this.#sessionFile,
 			flushed: this.#flushed,
+			ensuredOnDisk: this.#ensuredOnDisk,
 			needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
 			// Snapshot entry objects by reference: switch/reload replaces the active entry array,
 			// so rollback does not need structured cloning of extension/custom details.
@@ -3182,6 +3233,10 @@ export class SessionManager {
 			// Rollback snapshots must own resident data before another session reset disposes
 			// the ephemeral store backing the resident sentinels above.
 			materializedFileEntries,
+			leafId: this.#leafId,
+			persistError: this.#persistError,
+			persistErrorReported: this.#persistErrorReported,
+			adoptedArtifactManager: this.#adoptedArtifactManager,
 		};
 	}
 
@@ -3192,16 +3247,20 @@ export class SessionManager {
 		this.#titleSource = snapshot.titleSource;
 		this.#sessionFile = snapshot.sessionFile;
 		this.#flushed = snapshot.flushed;
+		this.#ensuredOnDisk = snapshot.ensuredOnDisk;
 		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
 		this.#fileEntries = restoredFileEntries;
+		this.#leafId = snapshot.leafId;
 		this.#persistWriter = undefined;
 		this.#persistWriterPath = undefined;
 		this.#persistChain = Promise.resolve();
-		this.#persistError = undefined;
-		this.#persistErrorReported = false;
+		// Callers invoke restoreState only after physically reconciling their
+		// transition; restore the old manager's poison state exactly.
+		this.#persistError = snapshot.persistError;
+		this.#persistErrorReported = snapshot.persistErrorReported;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
-		this.#adoptedArtifactManager = null;
+		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
 		this.#resetResidentTextBlobStore();
 		this.#reexternalizeFileEntriesForResidentStore();
 		this.#bumpAllRevisions();
@@ -3224,6 +3283,7 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
 		await resolveBlobRefsInEntries(entries, this.#blobStore);
 		this.#fileEntries = entries;
+		this.#leafId = null;
 		this.#resetResidentTextBlobStore();
 		this.#fileEntries = this.#fileEntries.map(entry =>
 			prepareEntryForResidentSync(entry, this.#residentBlobStores()),
@@ -3240,64 +3300,90 @@ export class SessionManager {
 		this.#newSessionSync();
 		this.#bumpAllRevisions();
 	}
+	#withLifecycleClose<T>(operation: () => Promise<T>): Promise<T> {
+		this.#activeCloseOperations++;
+		const result = this.#lifecycleChain.then(operation);
+		this.#lifecycleChain = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result.finally(() => {
+			this.#activeCloseOperations--;
+		});
+	}
 
 	/** Switch to a different session file (used for resume and branching) */
 	async setSessionFile(sessionFile: string): Promise<void> {
-		await this.#closePersistWriter();
-		this.#persistError = undefined;
-		this.#persistErrorReported = false;
-		this.#sessionFile = path.resolve(sessionFile);
-		writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
-		this.#fileEntries = await loadEntriesFromFile(this.#sessionFile, this.storage);
-		if (this.#fileEntries.length > 0) {
-			const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
-			this.#sessionId = header?.id ?? createSessionId();
-			this.#sessionName = header?.title;
-			this.#titleSource = header?.titleSource;
-
-			this.#needsFullRewriteOnNextPersist = migrateToCurrentVersion(this.#fileEntries);
-			await resolveBlobRefsInEntries(this.#fileEntries, this.#blobStore);
-			this.#resetResidentTextBlobStore();
-
-			this.#fileEntries = this.#fileEntries.map(entry =>
-				prepareEntryForResidentSync(entry, this.#residentBlobStores()),
-			);
-			this.sanitizeLoadedOpenAIResponsesReplayMetadata();
-
-			this.#buildIndex();
-			this.#bumpAllRevisions();
-			this.#flushed = true;
-			this.#ensuredOnDisk = true;
-		} else {
-			const explicitPath = this.#sessionFile;
-			this.#newSessionSync();
-			this.#sessionFile = explicitPath; // preserve explicit path from --session flag
-			this.#resetResidentTextBlobStore();
-			await this.#rewriteFile();
-			this.#flushed = true;
-			this.#ensuredOnDisk = true;
-			this.#bumpAllRevisions();
-			return;
-		}
+		await this.#withLifecycleClose(async () => {
+			const snapshot = this.captureState();
+			const targetPath = path.resolve(sessionFile);
+			try {
+				await this.#closePersistWriter();
+				this.#persistError = undefined;
+				this.#persistErrorReported = false;
+				const entries = await loadEntriesFromFile(targetPath, this.storage);
+				const migrationApplied = migrateToCurrentVersion(entries);
+				if (entries.length > 0) {
+					await this.#hydrateExistingSession(targetPath, entries, migrationApplied);
+				} else {
+					this.#sessionFile = targetPath;
+					this.#newSessionSync();
+					this.#sessionFile = targetPath;
+					this.#resetResidentTextBlobStore();
+					await this.#rewriteFile();
+					this.#flushed = true;
+					this.#ensuredOnDisk = true;
+					this.#bumpAllRevisions();
+				}
+				writeTerminalBreadcrumb(this.cwd, targetPath);
+			} catch (err) {
+				const unreconciledPersistError =
+					path.resolve(targetPath) === path.resolve(snapshot.sessionFile ?? "") ? this.#persistError : undefined;
+				this.restoreState(snapshot);
+				if (unreconciledPersistError) this.#recordPersistError(unreconciledPersistError);
+				throw err;
+			}
+		});
 	}
 
 	/** Start a new session. Closes any existing writer first. */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
-		await this.#closePersistWriter();
-		const sessionFile = this.#newSessionSync(options);
-		this.#bumpAllRevisions();
-		return sessionFile;
+		return this.#withLifecycleClose(async () => {
+			await this.#closePersistWriter();
+			const sessionFile = this.#newSessionSync(options);
+			this.#bumpAllRevisions();
+			return sessionFile;
+		});
 	}
 
 	/** Delete a session file and its artifacts. Drains the persist writer first to avoid EPERM on Windows. ENOENT is treated as success. */
 	async dropSession(sessionPath: string): Promise<void> {
-		await this.#closePersistWriter();
-		try {
-			await this.storage.deleteSessionWithArtifacts(sessionPath);
-		} catch (err) {
-			if (isEnoent(err)) return;
-			throw err;
-		}
+		await this.#withLifecycleClose(async () => {
+			const isActiveSession = !!this.#sessionFile && path.resolve(sessionPath) === path.resolve(this.#sessionFile);
+			const snapshot = isActiveSession ? this.captureState() : undefined;
+			let replaced = false;
+			try {
+				await this.#closePersistWriter();
+				await this.storage.deleteSessionWithArtifacts(sessionPath);
+			} catch (err) {
+				if (isActiveSession) {
+					// A partial delete may have removed the transcript; never restore
+					// that stale identity. Replace it before surfacing cleanup failure.
+					this.#newSessionSync();
+					await this.#rewriteFile();
+					this.#bumpAllRevisions();
+					replaced = true;
+				} else if (snapshot) {
+					this.restoreState(snapshot);
+				}
+				if (!isEnoent(err)) throw err;
+			}
+			if (isActiveSession && !replaced) {
+				this.#newSessionSync();
+				await this.#rewriteFile();
+				this.#bumpAllRevisions();
+			}
+		});
 	}
 
 	/**
@@ -3306,53 +3392,53 @@ export class SessionManager {
 	 * @returns { oldSessionFile, newSessionFile } or undefined if not persisting
 	 */
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
-		if (!this.persist || !this.#sessionFile) {
-			return undefined;
-		}
+		return this.#withLifecycleClose(async () => {
+			if (!this.persist || !this.#sessionFile) return undefined;
 
-		const oldSessionFile = this.#sessionFile;
-		const oldSessionId = this.#sessionId;
-		const materializedEntries = materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores());
+			const snapshot = this.captureState();
+			const oldSessionFile = this.#sessionFile;
+			const oldSessionId = this.#sessionId;
+			try {
+				await this.#closePersistWriter();
+				this.#persistChain = Promise.resolve();
+				this.#persistError = undefined;
+				this.#persistErrorReported = false;
 
-		// Close the current writer
-		await this.#closePersistWriter();
-		this.#persistChain = Promise.resolve();
-		this.#persistError = undefined;
-		this.#persistErrorReported = false;
+				this.#sessionId = createSessionId();
+				const timestamp = new Date().toISOString();
+				const fileTimestamp = timestamp.replace(/[:.]/g, "-");
+				this.#sessionFile = path.join(this.getSessionDir(), `${fileTimestamp}_${this.#sessionId}.jsonl`);
 
-		// Create new session ID and header
-		this.#sessionId = createSessionId();
-		const timestamp = new Date().toISOString();
-		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-		this.#sessionFile = path.join(this.getSessionDir(), `${fileTimestamp}_${this.#sessionId}.jsonl`);
+				const oldHeader = snapshot.materializedFileEntries.find(e => e.type === "session") as
+					| SessionHeader
+					| undefined;
+				const newHeader: SessionHeader = {
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: this.#sessionId,
+					title: oldHeader?.title ?? this.#sessionName,
+					titleSource: oldHeader?.titleSource ?? this.#titleSource,
+					timestamp,
+					cwd: this.cwd,
+					parentSession: oldSessionId,
+				};
+				this.#sessionName = newHeader.title;
+				this.#titleSource = newHeader.titleSource;
+				const entries = snapshot.materializedFileEntries.filter((e): e is SessionEntry => e.type !== "session");
+				this.#fileEntries = [newHeader, ...entries];
+				this.#resetResidentTextBlobStore();
+				this.#reexternalizeFileEntriesForResidentStore();
+				this.#bumpAllRevisions();
 
-		// Update the header with new ID but keep all entries
-		const oldHeader = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
-		const newHeader: SessionHeader = {
-			type: "session",
-			version: CURRENT_SESSION_VERSION,
-			id: this.#sessionId,
-			title: oldHeader?.title ?? this.#sessionName,
-			titleSource: oldHeader?.titleSource ?? this.#titleSource,
-			timestamp,
-			cwd: this.cwd,
-			parentSession: oldSessionId,
-		};
-		this.#sessionName = newHeader.title;
-		this.#titleSource = newHeader.titleSource;
-
-		// Replace the header in fileEntries
-		const entries = materializedEntries.filter((e): e is SessionEntry => e.type !== "session");
-		this.#fileEntries = [newHeader, ...entries];
-		this.#resetResidentTextBlobStore();
-		this.#reexternalizeFileEntriesForResidentStore();
-		this.#bumpAllRevisions();
-
-		// Write the new session file
-		this.#flushed = false;
-		await this.#rewriteFile();
-
-		return { oldSessionFile, newSessionFile: this.#sessionFile };
+				this.#flushed = false;
+				await this.#rewriteFile();
+				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				return { oldSessionFile, newSessionFile: this.#sessionFile };
+			} catch (err) {
+				this.restoreState(snapshot);
+				throw err;
+			}
+		});
 	}
 
 	/**
@@ -3361,6 +3447,10 @@ export class SessionManager {
 	 * and rewrites the session header with the new cwd.
 	 */
 	async moveTo(newCwd: string): Promise<void> {
+		return this.#withLifecycleClose(async () => this.#moveTo(newCwd));
+	}
+
+	async #moveTo(newCwd: string): Promise<void> {
 		const resolvedCwd = path.resolve(newCwd);
 		if (resolvedCwd === this.cwd) return;
 
@@ -3369,6 +3459,15 @@ export class SessionManager {
 			? computeDefaultSessionDir(resolvedCwd, this.storage, managedSessionsRoot)
 			: computeDefaultSessionDir(resolvedCwd, this.storage);
 		let hadSessionFile = false;
+		const stateSnapshot = this.captureState();
+		const previousCwd = this.cwd;
+		const previousSessionDir = this.sessionDir;
+		let oldSessionFileForRollback: string | undefined;
+		let newSessionFileForRollback: string | undefined;
+		let oldArtifactDirForRollback: string | undefined;
+		let newArtifactDirForRollback: string | undefined;
+		let movedSessionFileForRollback = false;
+		let movedArtifactDirForRollback = false;
 
 		if (this.persist && this.#sessionFile) {
 			// Close the persist writer before moving files
@@ -3378,9 +3477,13 @@ export class SessionManager {
 			this.#persistErrorReported = false;
 
 			const oldSessionFile = this.#sessionFile;
+			oldSessionFileForRollback = oldSessionFile;
 			const newSessionFile = path.join(newSessionDir, path.basename(oldSessionFile));
+			newSessionFileForRollback = newSessionFile;
 			const oldArtifactDir = oldSessionFile.slice(0, -6); // strip .jsonl
+			oldArtifactDirForRollback = oldArtifactDir;
 			const newArtifactDir = newSessionFile.slice(0, -6);
+			newArtifactDirForRollback = newArtifactDir;
 			hadSessionFile = this.storage.existsSync(oldSessionFile);
 			let movedSessionFile = false;
 			let movedArtifactDir = false;
@@ -3388,20 +3491,20 @@ export class SessionManager {
 				this.#fileEntries,
 				this.#residentBlobStores(),
 			);
-			const restoreResidentStateAfterFailure = (): void => {
-				this.#fileEntries = materializedEntries;
-				this.#resetResidentTextBlobStore();
-				this.#reexternalizeFileEntriesForResidentStore();
-				this.#bumpAllRevisions();
-			};
 			const restoreResidentStateAndThrow = (error: unknown): never => {
 				try {
-					restoreResidentStateAfterFailure();
+					this.restoreState(stateSnapshot);
 				} catch (restoreErr) {
+					this.#recordPersistError(restoreErr);
 					throw new Error(
 						`Failed to restore live session resident state after move failure: ${toError(restoreErr).message}; original error: ${toError(error).message}`,
 					);
 				}
+				throw error;
+			};
+			const restoreUnreconciledStateAndThrow = (error: unknown): never => {
+				this.restoreState(stateSnapshot);
+				this.#recordPersistError(error);
 				throw error;
 			};
 			this.#disposeResidentTextBlobStore();
@@ -3411,6 +3514,7 @@ export class SessionManager {
 				if (hadSessionFile) {
 					await movePathAcrossDevicesSafe(oldSessionFile, newSessionFile);
 					movedSessionFile = true;
+					movedSessionFileForRollback = true;
 				}
 
 				try {
@@ -3418,16 +3522,20 @@ export class SessionManager {
 					if (stat.isDirectory()) {
 						await movePathAcrossDevicesSafe(oldArtifactDir, newArtifactDir);
 						movedArtifactDir = true;
+						movedArtifactDirForRollback = true;
 					}
 				} catch (err) {
 					if (!isEnoent(err)) throw err;
 				}
 			} catch (err) {
+				if (err instanceof UnreconciledCrossDeviceMoveError) {
+					restoreUnreconciledStateAndThrow(err);
+				}
 				if (movedArtifactDir) {
 					try {
-						await fs.promises.rename(newArtifactDir, oldArtifactDir);
+						await movePathAcrossDevicesSafe(newArtifactDir, oldArtifactDir);
 					} catch (rollbackErr) {
-						restoreResidentStateAndThrow(
+						restoreUnreconciledStateAndThrow(
 							new Error(
 								`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
 							),
@@ -3436,9 +3544,9 @@ export class SessionManager {
 				}
 				if (movedSessionFile) {
 					try {
-						await fs.promises.rename(newSessionFile, oldSessionFile);
+						await movePathAcrossDevicesSafe(newSessionFile, oldSessionFile);
 					} catch (rollbackErr) {
-						restoreResidentStateAndThrow(
+						restoreUnreconciledStateAndThrow(
 							new Error(
 								`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
 							),
@@ -3471,7 +3579,30 @@ export class SessionManager {
 		// Neither true → fresh session, never written → preserve lazy-persist
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
 		if (this.persist && this.#sessionFile && (hadSessionFile || hasAssistant)) {
-			await this.#rewriteFile();
+			try {
+				await this.#rewriteFile();
+			} catch (err) {
+				try {
+					if (movedArtifactDirForRollback && newArtifactDirForRollback && oldArtifactDirForRollback) {
+						await movePathAcrossDevicesSafe(newArtifactDirForRollback, oldArtifactDirForRollback);
+					}
+					if (movedSessionFileForRollback && newSessionFileForRollback && oldSessionFileForRollback) {
+						await movePathAcrossDevicesSafe(newSessionFileForRollback, oldSessionFileForRollback);
+					}
+					this.cwd = previousCwd;
+					this.sessionDir = previousSessionDir;
+					this.restoreState(stateSnapshot);
+				} catch (rollbackErr) {
+					this.cwd = previousCwd;
+					this.sessionDir = previousSessionDir;
+					this.restoreState(stateSnapshot);
+					this.#recordPersistError(rollbackErr);
+					throw new Error(
+						`Failed to rewrite moved session and rollback: ${toError(rollbackErr).message}; original error: ${toError(err).message}`,
+					);
+				}
+				throw err;
+			}
 		}
 
 		// Update terminal breadcrumb
@@ -3522,7 +3653,8 @@ export class SessionManager {
 		return this.#sessionFile;
 	}
 
-	#buildIndex(): void {
+	#buildIndex(leafId?: string | null): void {
+		let lastEntryId: string | null = null;
 		this.#byId.clear();
 		this.#labelsById.clear();
 		this.#leafId = null;
@@ -3530,7 +3662,7 @@ export class SessionManager {
 		for (const entry of this.#fileEntries) {
 			if (entry.type === "session") continue;
 			this.#byId.set(entry.id, entry);
-			this.#leafId = entry.id;
+			lastEntryId = entry.id;
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.#labelsById.set(entry.targetId, entry.label);
@@ -3560,6 +3692,7 @@ export class SessionManager {
 				}
 			}
 		}
+		this.#leafId = leafId === undefined ? lastEntryId : leafId && this.#byId.has(leafId) ? leafId : null;
 	}
 
 	#recordPersistError(err: unknown): Error {
@@ -3849,14 +3982,22 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
-		await this.#queuePersistTask(async () => {
-			if (this.#persistWriter) {
-				await this.#closePersistWriterInternal();
-				this.#flushed = true;
-			}
+		await this.#withLifecycleClose(async () => {
+			await this.#queuePersistTask(async () => {
+				if (this.#persistWriter) {
+					await this.#closePersistWriterInternal();
+					this.#flushed = true;
+				}
+			});
+			const materializedEntries = materializeResidentEntriesForReadSync(
+				this.#fileEntries,
+				this.#residentBlobStores(),
+			);
+			this.#disposeResidentTextBlobStore();
+			this.#fileEntries = materializedEntries;
+			this.#buildIndex(this.#leafId);
+			if (this.#persistError) throw this.#persistError;
 		});
-		this.#disposeResidentTextBlobStore();
-		if (this.#persistError) throw this.#persistError;
 	}
 
 	getCwd(): string {
@@ -4134,15 +4275,31 @@ export class SessionManager {
 	}
 
 	#appendEntry(entry: SessionEntry): void {
+		if (this.#activeCloseOperations > 0) throw new Error("Session manager close is in progress");
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
 		const residentEntry = prepareEntryForResidentSync(normalizedEntry, this.#residentBlobStores()) as SessionEntry;
+		const previousLeafId = this.#leafId;
+		const previousEntryRevision = this.#entryRevision;
+		const previousLeafRevision = this.#leafRevision;
+		const previousLabelRevision = this.#labelRevision;
 		this.#fileEntries.push(residentEntry);
 		this.#byId.set(residentEntry.id, residentEntry);
 		this.#leafId = residentEntry.id;
 		this.#bumpEntryRevision();
 		this.#leafRevision++;
 		if (entry.type === "label") this.#labelRevision++;
-		this._persist(residentEntry);
+		try {
+			this._persist(residentEntry);
+		} catch (error) {
+			this.#fileEntries.pop();
+			this.#byId.delete(residentEntry.id);
+			this.#leafId = previousLeafId;
+			this.#entryRevision = previousEntryRevision;
+			this.#leafRevision = previousLeafRevision;
+			this.#labelRevision = previousLabelRevision;
+			this.#resetMaterializedCaches();
+			throw error;
+		}
 		if (entry.type === "message" && entry.message.role === "assistant") {
 			const usage = entry.message.usage;
 			this.#usageStatistics.input += usage.input;

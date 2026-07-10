@@ -141,7 +141,7 @@ describe("SelectorController effort selector", () => {
 		expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(ctx.editor);
 	});
 
-	it("can persist the selected effort as the default", () => {
+	it("can persist the selected effort as the default", async () => {
 		const editorContainer = {
 			children: [] as unknown[],
 			clear() {
@@ -190,6 +190,7 @@ describe("SelectorController effort selector", () => {
 		selector.handleInput("\n");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
+		await Bun.sleep(0);
 
 		expect(thinkingLevelCalls).toEqual([{ level: ThinkingLevel.Low, persist: true }]);
 		expect(notifyConfigChanged).toHaveBeenCalled();

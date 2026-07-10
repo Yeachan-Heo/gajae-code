@@ -1,4 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import type { Model } from "@gajae-code/ai";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle } from "@gajae-code/tui";
@@ -6,17 +7,19 @@ import { Input, Loader, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir } from "@gajae-code/utils";
 import {
 	activateModelProfile,
+	createActiveModelProfileRuntimeRollback,
 	type MaterializeModelProfileForDeletionResult,
 	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
+	resolveProjectModelProfileShadow,
 	restoreMaterializedModelProfileForDeletion,
 } from "../../config/model-profile-activation";
 import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
-import { formatModelSelectorValue } from "../../config/model-resolver";
+import { extractExplicitThinkingSelector, formatModelSelectorValue } from "../../config/model-resolver";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
-import { type Settings, settings } from "../../config/settings";
+import { type Settings, type SettingsMutationCheckpoint, settings } from "../../config/settings";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -57,6 +60,7 @@ import {
 	MODEL_ONBOARDING_SETUP_COMMAND,
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
+import { clampModelAssignmentThinkingLevel } from "../../thinking";
 import {
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
@@ -278,8 +282,8 @@ export class SelectorController {
 				try {
 					const profile = await this.ctx.session.modelRegistry.saveCustomModelProfile(input.name, input.profile);
 					await this.ctx.session.modelRegistry.refresh("offline");
-					await this.ctx.notifyConfigChanged?.();
 					this.ctx.showStatus(`Custom model preset created: ${formatModelProfileDisplayLabel(profile)}`);
+					this.#notifyConfigChangedSafely();
 					done();
 					this.ctx.ui.requestRender();
 				} catch (err) {
@@ -316,9 +320,9 @@ export class SelectorController {
 		try {
 			const renamed = await this.ctx.session.modelRegistry.renameCustomModelProfile(profileName, input);
 			await this.ctx.session.modelRegistry.refresh("offline");
-			await this.ctx.notifyConfigChanged?.();
 			modelSelector.refreshPresetProfiles(renamed.name);
 			this.ctx.showStatus(`Custom model preset renamed: ${formatModelProfileDisplayLabel(renamed)}`);
+			this.#notifyConfigChangedSafely();
 			this.ctx.ui.requestRender();
 		} catch (err) {
 			this.ctx.showError(`Preset rename failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -360,11 +364,13 @@ export class SelectorController {
 					profileName,
 				});
 			}
-			deletedProfile = await this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName);
+			deletedProfile = await this.ctx.settings.deleteModelProfileIfUnreferenced(profileName, () =>
+				this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName),
+			);
 			await this.ctx.session.modelRegistry.refresh("offline");
-			await this.ctx.notifyConfigChanged?.();
 			refreshSelectorState();
 			this.ctx.showStatus(`Custom model preset deleted: ${profileLabel}`);
+			this.#notifyConfigChangedSafely();
 			this.ctx.ui.requestRender();
 		} catch (err) {
 			let presetRestoreError: unknown;
@@ -409,8 +415,8 @@ export class SelectorController {
 				try {
 					const result = await addApiCompatibleProvider(input);
 					await this.ctx.session.modelRegistry.refresh("offline");
-					await this.ctx.notifyConfigChanged?.();
 					this.ctx.showStatus(formatProviderSetupResult(result));
+					this.#notifyConfigChangedSafely();
 					done();
 					this.ctx.ui.requestRender();
 				} catch (err) {
@@ -459,7 +465,7 @@ export class SelectorController {
 					this.ctx.statusLine.invalidate();
 					this.ctx.updateEditorBorderColor();
 					this.ctx.updateEditorTopBorder();
-					if (persistDefault) void this.ctx.notifyConfigChanged?.();
+					if (persistDefault) void this.#notifyConfigChangedSafely();
 					this.ctx.ui.requestRender();
 					const scopeLabel = persistDefault ? "Default reasoning effort" : "Reasoning effort";
 					this.ctx.showStatus(
@@ -627,6 +633,28 @@ export class SelectorController {
 			modelRegistry: this.ctx.session.modelRegistry,
 			activeModelPattern,
 			defaultModelPattern,
+			projectModelProfileShadow: resolveProjectModelProfileShadow(this.ctx.settings, this.ctx.session.modelRegistry),
+			onModelOverrideChange: async (agentName, value) => {
+				if (agentName !== "default" && Object.hasOwn(GJC_MODEL_ASSIGNMENT_TARGETS, agentName)) {
+					const role = agentName as GjcModelAssignmentTargetId;
+					const materializedProfile = materializeActiveModelProfileAssignment({
+						session: this.ctx.session,
+						settings: this.ctx.settings,
+						role,
+						selector: value,
+					});
+					if (materializedProfile) {
+						await this.ctx.settings.flushOrThrow();
+						return;
+					}
+				}
+				if (value) {
+					this.ctx.settings.setAgentModelOverride(agentName, value);
+				} else {
+					this.ctx.settings.clearAgentModelOverride(agentName);
+				}
+				await this.ctx.settings.flushOrThrow();
+			},
 		});
 		this.showSelector(done => {
 			dashboard.onClose = () => {
@@ -645,7 +673,7 @@ export class SelectorController {
 	 * Most settings are saved directly via SettingsManager in the definitions.
 	 * This handles side effects and session-specific settings.
 	 */
-	handleSettingChange(id: string, value: unknown): void {
+	handleSettingChange(id: string, value: unknown): void | Promise<void> {
 		// Discovery provider toggles
 		if (id.startsWith("discovery.")) {
 			const providerId = id.replace("discovery.", "");
@@ -684,12 +712,12 @@ export class SelectorController {
 				// running session switches immediately, not only on next startup.
 				const profileName = typeof value === "string" ? value : "";
 				if (!profileName) break;
-				this.#applyModelProfile(profileName, true)
+				return this.#applyModelProfile(profileName, true)
 					.then(() => this.ctx.ui.requestRender())
 					.catch(error => {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						throw error;
 					});
-				break;
 			}
 			case "clearOnShrink":
 				this.ctx.ui.setClearOnShrink(value as boolean);
@@ -846,6 +874,66 @@ export class SelectorController {
 		}
 	}
 
+	#notifyConfigChangedSafely(): void {
+		void Promise.resolve()
+			.then(() => this.ctx.notifyConfigChanged?.())
+			.catch(error => {
+				this.ctx.showError(
+					`Configuration was updated, but change notification failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			})
+			.catch(() => {});
+	}
+
+	#getSessionActiveModelProfile(): string | undefined {
+		const getActiveModelProfile = this.ctx.session.getActiveModelProfile;
+		return getActiveModelProfile
+			? getActiveModelProfile.call(this.ctx.session)
+			: this.ctx.settings.get("modelProfile.default");
+	}
+
+	#resolveDefaultModelThinking(
+		model: Model,
+		selectedThinkingLevel: ThinkingLevel | undefined,
+	): { effective: ThinkingLevel | undefined; persisted: ThinkingLevel | undefined } {
+		const configuredDefault = this.ctx.settings.get("defaultThinkingLevel");
+		const existingExplicit = extractExplicitThinkingSelector(
+			this.ctx.settings.getModelRole("default"),
+			this.ctx.settings,
+		);
+		const inherited =
+			this.#getSessionActiveModelProfile() !== undefined
+				? (this.ctx.session.thinkingLevel ?? configuredDefault)
+				: (existingExplicit ?? configuredDefault);
+		const persisted = clampModelAssignmentThinkingLevel(
+			model,
+			selectedThinkingLevel === undefined
+				? this.#getSessionActiveModelProfile() !== undefined
+					? inherited
+					: existingExplicit
+				: selectedThinkingLevel,
+		);
+		const effective = clampModelAssignmentThinkingLevel(
+			model,
+			selectedThinkingLevel === ThinkingLevel.Inherit ? configuredDefault : (selectedThinkingLevel ?? inherited),
+		);
+		return { effective, persisted };
+	}
+
+	#formatProjectModelRestartNotice(targetRoles: readonly GjcModelAssignmentTargetId[]): string {
+		const projectModelRoles = this.ctx.settings.getProject("modelRoles") ?? {};
+		const projectAgentOverrides = this.ctx.settings.getProject("task.agentModelOverrides") ?? {};
+		const projectProfile = resolveProjectModelProfileShadow(this.ctx.settings, this.ctx.session.modelRegistry);
+		const shadowed = targetRoles.filter(role => {
+			const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+			const direct = target.settingsPath === "modelRoles" ? projectModelRoles[role] : projectAgentOverrides[role];
+			return direct !== undefined || projectProfile?.targetIds.includes(role) === true;
+		});
+		if (shadowed.length === 0) return "";
+		const labels = shadowed.map(role => GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase());
+		return ` Project settings for ${labels.join(", ")} resume on restart.`;
+	}
+
 	/**
 	 * Activate a model profile through the shared /model + /settings path: swap the
 	 * live session model (and, when persistDefault, persist it as the startup
@@ -867,6 +955,7 @@ export class SelectorController {
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorBorderColor();
 		this.ctx.showStatus(persistDefault ? `Default model profile: ${profileLabel}` : `Model profile: ${profileLabel}`);
+		this.#notifyConfigChangedSafely();
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
@@ -879,6 +968,10 @@ export class SelectorController {
 				this.ctx.session.modelRegistry,
 				this.ctx.session.scopedModels,
 				async selection => {
+					let mutationCheckpoint: SettingsMutationCheckpoint | undefined;
+					let profileRuntimeRollback: (() => void) | undefined;
+					let sessionModelStaged = false;
+					let settingsCommitted = false;
 					try {
 						if (selection.kind === "createProfile") {
 							done();
@@ -908,11 +1001,97 @@ export class SelectorController {
 							this.ctx.showStatus(`Temporary model: ${selectedSelector ?? model.id}`);
 							done();
 							this.ctx.ui.requestRender();
-						} else if (selection.roles) {
-							const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles;
-							const includesDefault = targetRoles.includes("default");
-							const includesRoleAgent = targetRoles.some(targetRole => targetRole !== "default");
-							if (includesRoleAgent) {
+							return;
+						}
+						mutationCheckpoint = await this.ctx.settings.createMutationCheckpoint();
+						const activeMutationCheckpoint = mutationCheckpoint;
+						profileRuntimeRollback = createActiveModelProfileRuntimeRollback(this.ctx.session);
+						await this.ctx.settings.runMutationCheckpoint(activeMutationCheckpoint, async () => {
+							if (selection.roles) {
+								const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles;
+								const includesDefault = targetRoles.includes("default");
+								const includesRoleAgent = targetRoles.some(targetRole => targetRole !== "default");
+								if (includesDefault || includesRoleAgent) {
+									const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+										model,
+										this.ctx.session.sessionId,
+									);
+									if (!apiKey) {
+										throw new Error(`No API key for ${model.provider}/${model.id}`);
+									}
+								}
+								const defaultThinking = includesDefault
+									? this.#resolveDefaultModelThinking(model, thinkingLevel)
+									: undefined;
+								const persistedThinkingLevel =
+									defaultThinking?.persisted ?? clampModelAssignmentThinkingLevel(model, thinkingLevel);
+								const selectorBase =
+									selectedSelector &&
+									thinkingLevel !== ThinkingLevel.Inherit &&
+									thinkingLevel !== undefined &&
+									selectedSelector.endsWith(`:${thinkingLevel}`)
+										? selectedSelector.slice(0, -thinkingLevel.length - 1)
+										: (selectedSelector ?? `${model.provider}/${model.id}`);
+								const value = formatModelSelectorValue(selectorBase, persistedThinkingLevel);
+								const assignments = new Map<GjcModelAssignmentTargetId, string>();
+								for (const targetRole of targetRoles) assignments.set(targetRole, value);
+
+								if (includesDefault) {
+									sessionModelStaged = true;
+									const liveThinkingLevel =
+										defaultThinking?.effective !== undefined &&
+										defaultThinking.effective !== ThinkingLevel.Inherit
+											? defaultThinking.effective
+											: persistedThinkingLevel;
+									await this.ctx.session.setModelForSettingsCommit(model, liveThinkingLevel);
+								}
+								const materializedProfile = materializeActiveModelProfileAssignments({
+									session: this.ctx.session,
+									settings: this.ctx.settings,
+									assignments,
+								});
+								if (!materializedProfile) {
+									for (const targetRole of targetRoles) {
+										if (targetRole === "default") {
+											this.ctx.settings.setModelRole(targetRole, value);
+										} else {
+											this.ctx.settings.setAgentModelOverride(targetRole, value);
+										}
+									}
+								}
+								await this.ctx.settings.flushMutationCheckpoint(activeMutationCheckpoint);
+								settingsCommitted = true;
+								profileRuntimeRollback = undefined;
+								this.ctx.settings.releaseMutationCheckpoint(activeMutationCheckpoint);
+								mutationCheckpoint = undefined;
+								if (includesDefault) {
+									sessionModelStaged = false;
+									await this.ctx.session.commitSettingsModelChange(model);
+								}
+								modelSelector.refreshRoleAssignments({
+									currentModel: this.ctx.session.model,
+									currentThinkingLevel: this.ctx.session.thinkingLevel,
+									activeModelProfile: this.#getSessionActiveModelProfile(),
+								});
+								this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+								this.ctx.statusLine.invalidate();
+								this.ctx.updateEditorBorderColor();
+								const labels = targetRoles.map(
+									targetRole => GJC_MODEL_ASSIGNMENT_TARGETS[targetRole].tag ?? targetRole.toUpperCase(),
+								);
+								const projectRestartNotice = this.#formatProjectModelRestartNotice(targetRoles);
+								this.ctx.showStatus(
+									(includesDefault
+										? `All model targets set to ${value} for ${labels.join(", ")}.`
+										: `Role-agent models set to ${value} for ${labels.join(", ")}.`) + projectRestartNotice,
+								);
+								this.#notifyConfigChangedSafely();
+								done();
+								this.ctx.ui.requestRender();
+							} else if (role === "default") {
+								// Default: update agent state and persist as the active default model.
+								const defaultThinking = this.#resolveDefaultModelThinking(model, thinkingLevel);
+								const selectorBase = selectedSelector ?? `${model.provider}/${model.id}`;
 								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
 									model,
 									this.ctx.session.sessionId,
@@ -920,137 +1099,149 @@ export class SelectorController {
 								if (!apiKey) {
 									throw new Error(`No API key for ${model.provider}/${model.id}`);
 								}
-							}
-							const value =
-								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
-							const assignments = new Map<GjcModelAssignmentTargetId, string>();
-							for (const targetRole of targetRoles) assignments.set(targetRole, value);
-							const defaultSelector =
-								selectedSelector && thinkingLevel && selectedSelector.endsWith(`:${thinkingLevel}`)
-									? selectedSelector.slice(0, -thinkingLevel.length - 1)
-									: selectedSelector;
-
-							if (includesDefault) {
-								await this.ctx.session.setModel(model, "default", {
-									selector: defaultSelector,
-									thinkingLevel,
+								sessionModelStaged = true;
+								const liveThinkingLevel =
+									defaultThinking.effective !== undefined &&
+									defaultThinking.effective !== ThinkingLevel.Inherit
+										? defaultThinking.effective
+										: defaultThinking.persisted;
+								await this.ctx.session.setModelForSettingsCommit(model, liveThinkingLevel);
+								const value = formatModelSelectorValue(selectorBase, defaultThinking.persisted);
+								const materializedProfile = materializeActiveModelProfileAssignment({
+									session: this.ctx.session,
+									settings: this.ctx.settings,
+									role,
+									selector: value,
 								});
-								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(thinkingLevel);
+								if (!materializedProfile) this.ctx.settings.setModelRole(role, value);
+								await this.ctx.settings.flushMutationCheckpoint(activeMutationCheckpoint);
+								settingsCommitted = true;
+								profileRuntimeRollback = undefined;
+								this.ctx.settings.releaseMutationCheckpoint(activeMutationCheckpoint);
+								mutationCheckpoint = undefined;
+								sessionModelStaged = false;
+								await this.ctx.session.commitSettingsModelChange(model);
+								this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+								modelSelector.refreshRoleAssignments({
+									currentModel: this.ctx.session.model,
+									currentThinkingLevel: this.ctx.session.thinkingLevel,
+									activeModelProfile: this.#getSessionActiveModelProfile(),
+								});
+								this.ctx.statusLine.invalidate();
+								this.ctx.updateEditorBorderColor();
+								const effectiveValue = formatModelSelectorValue(
+									`${model.provider}/${model.id}`,
+									defaultThinking.effective,
+								);
+								const projectRestartNotice = this.#formatProjectModelRestartNotice([role]);
+								this.ctx.showStatus(
+									(effectiveValue === value
+										? `Default model: ${value}`
+										: `Default model: ${value} (effective: ${effectiveValue})`) + projectRestartNotice,
+								);
+								this.#notifyConfigChangedSafely();
+								done();
+								this.ctx.ui.requestRender();
+							} else {
+								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+									model,
+									this.ctx.session.sessionId,
+								);
+								if (!apiKey) {
+									throw new Error(`No API key for ${model.provider}/${model.id}`);
 								}
-							}
-							const materializedProfile = materializeActiveModelProfileAssignments({
-								session: this.ctx.session,
-								settings: this.ctx.settings,
-								assignments,
-							});
-							if (!materializedProfile) {
-								const overrides = this.ctx.settings.get("task.agentModelOverrides");
-								const nextOverrides = { ...overrides };
-								let writesOverrides = false;
-								for (const targetRole of targetRoles) {
-									const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+								const clampedThinkingLevel = clampModelAssignmentThinkingLevel(model, thinkingLevel);
+								const selectorBase =
+									selectedSelector &&
+									thinkingLevel !== undefined &&
+									thinkingLevel !== ThinkingLevel.Inherit &&
+									selectedSelector.endsWith(`:${thinkingLevel}`)
+										? selectedSelector.slice(0, -thinkingLevel.length - 1)
+										: (selectedSelector ?? `${model.provider}/${model.id}`);
+								const value = formatModelSelectorValue(selectorBase, clampedThinkingLevel);
+								const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
+								const materializedProfile = materializeActiveModelProfileAssignments({
+									session: this.ctx.session,
+									settings: this.ctx.settings,
+									assignments,
+								});
+								if (!materializedProfile) {
+									const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
 									if (target.settingsPath === "modelRoles") {
-										this.ctx.settings.setModelRole(targetRole, value);
+										this.ctx.settings.setModelRole(role, value);
 									} else {
-										nextOverrides[targetRole] = value;
-										writesOverrides = true;
+										this.ctx.settings.setAgentModelOverride(role, value);
 									}
 								}
-								if (writesOverrides) {
-									this.ctx.settings.set("task.agentModelOverrides", nextOverrides);
-								}
+								await this.ctx.settings.flushMutationCheckpoint(activeMutationCheckpoint);
+								settingsCommitted = true;
+								profileRuntimeRollback = undefined;
+								this.ctx.settings.releaseMutationCheckpoint(activeMutationCheckpoint);
+								mutationCheckpoint = undefined;
+								modelSelector.refreshRoleAssignments({
+									currentModel: this.ctx.session.model,
+									currentThinkingLevel: this.ctx.session.thinkingLevel,
+									activeModelProfile: this.#getSessionActiveModelProfile(),
+								});
+								this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+								this.ctx.statusLine.invalidate();
+								this.ctx.updateEditorBorderColor();
+								this.ctx.showStatus(
+									`${role} agent model: ${value}${this.#formatProjectModelRestartNotice([role])}`,
+								);
+								this.#notifyConfigChangedSafely();
+								done();
+								this.ctx.ui.requestRender();
 							}
-							modelSelector.refreshRoleAssignments({
-								currentModel: this.ctx.session.model,
-								currentThinkingLevel: this.ctx.session.thinkingLevel,
-								activeModelProfile:
-									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-							});
-							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
-							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorBorderColor();
-							await this.ctx.notifyConfigChanged?.();
-							const labels = targetRoles.map(
-								targetRole => GJC_MODEL_ASSIGNMENT_TARGETS[targetRole].tag ?? targetRole.toUpperCase(),
-							);
-							this.ctx.showStatus(
-								includesDefault
-									? `All model targets set to ${value} for ${labels.join(", ")}.`
-									: `Role-agent models set to ${value} for ${labels.join(", ")}.`,
-							);
-							done();
-							this.ctx.ui.requestRender();
-						} else if (role === "default") {
-							// Default: update agent state and persist as the active default model.
-							await this.ctx.session.setModel(model, role, {
-								selector: selectedSelector,
-								thinkingLevel,
-							});
-							const value = formatModelSelectorValue(
-								selectedSelector ?? `${model.provider}/${model.id}`,
-								thinkingLevel,
-							);
-							materializeActiveModelProfileAssignment({
-								session: this.ctx.session,
-								settings: this.ctx.settings,
-								role,
-								selector: value,
-							});
-							if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-								this.ctx.session.setThinkingLevel(thinkingLevel);
-							}
-							modelSelector.refreshRoleAssignments({
-								currentModel: this.ctx.session.model,
-								currentThinkingLevel: this.ctx.session.thinkingLevel,
-								activeModelProfile:
-									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-							});
-							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorBorderColor();
-							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
-							done();
-							this.ctx.ui.requestRender();
-						} else {
-							const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
-							if (!apiKey) {
-								throw new Error(`No API key for ${model.provider}/${model.id}`);
-							}
-							const value =
-								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
-							const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
-							const materializedProfile = materializeActiveModelProfileAssignments({
-								session: this.ctx.session,
-								settings: this.ctx.settings,
-								assignments,
-							});
-							if (!materializedProfile) {
-								const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
-								if (target.settingsPath === "modelRoles") {
-									this.ctx.settings.setModelRole(role, value);
-								} else {
-									this.ctx.settings.set("task.agentModelOverrides", {
-										...this.ctx.settings.get("task.agentModelOverrides"),
-										[role]: value,
-									});
-								}
-							}
-							modelSelector.refreshRoleAssignments({
-								currentModel: this.ctx.session.model,
-								currentThinkingLevel: this.ctx.session.thinkingLevel,
-								activeModelProfile:
-									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-							});
-							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
-							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorBorderColor();
-							await this.ctx.notifyConfigChanged?.();
-							this.ctx.showStatus(`${role} agent model: ${value}`);
-							done();
-							this.ctx.ui.requestRender();
-						}
+						});
 					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						if (settingsCommitted) {
+							if (mutationCheckpoint) {
+								try {
+									this.ctx.settings.releaseMutationCheckpoint(mutationCheckpoint);
+								} catch {}
+								mutationCheckpoint = undefined;
+							}
+							if (sessionModelStaged) {
+								this.ctx.session.cancelSettingsModelChange();
+								sessionModelStaged = false;
+							}
+						} else {
+							if (mutationCheckpoint) {
+								this.ctx.settings.restoreMutationCheckpoint(mutationCheckpoint);
+								mutationCheckpoint = undefined;
+							}
+							profileRuntimeRollback?.();
+							profileRuntimeRollback = undefined;
+							if (sessionModelStaged) {
+								this.ctx.session.cancelSettingsModelChange();
+								sessionModelStaged = false;
+							}
+						}
+						const message = error instanceof Error ? error.message : String(error);
+						try {
+							this.ctx.showError(
+								settingsCommitted
+									? `Model settings were committed, but a session follow-up failed: ${message}`
+									: message,
+							);
+						} catch {}
+						try {
+							modelSelector.refreshRoleAssignments({
+								currentModel: this.ctx.session.model,
+								currentThinkingLevel: this.ctx.session.thinkingLevel,
+								activeModelProfile: this.#getSessionActiveModelProfile(),
+							});
+						} catch {}
+						try {
+							this.ctx.statusLine.invalidate();
+						} catch {}
+						try {
+							this.ctx.updateEditorBorderColor();
+						} catch {}
+						try {
+							this.ctx.ui.requestRender();
+						} catch {}
 					}
 				},
 				() => {
@@ -1061,11 +1252,10 @@ export class SelectorController {
 					...options,
 					sessionId: this.ctx.session.sessionId,
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
-					activeModelProfile:
-						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
+					activeModelProfile: this.#getSessionActiveModelProfile(),
 					isFastForProvider: provider => this.ctx.session.isFastForProvider(provider),
 					isFastForSubagentProvider: provider => this.ctx.session.isFastForSubagentProvider(provider),
-					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
+					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive?.() ?? false,
 				},
 			);
 			return { component: modelSelector, focus: modelSelector };
@@ -1473,7 +1663,7 @@ export class SelectorController {
 			return;
 		}
 
-		const activeProfile = this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default");
+		const activeProfile = this.#getSessionActiveModelProfile();
 		if (activeProfile) {
 			this.ctx.showStatus(`Preset ${recommendedProfile.name} is available in /model.`);
 			return;
@@ -1484,12 +1674,8 @@ export class SelectorController {
 			return;
 		}
 
-		await activateModelProfile({
-			session: this.ctx.session,
-			modelRegistry: this.ctx.session.modelRegistry,
-			settings: this.ctx.settings,
-			profileName: recommendedProfile.name,
-		});
+		await this.#applyModelProfile(recommendedProfile.name, false);
+		this.ctx.ui.requestRender();
 	}
 
 	async #handleOAuthLogin(providerId: string): Promise<void> {
