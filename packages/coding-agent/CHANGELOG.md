@@ -10,6 +10,7 @@
 
 - Migrated the repository type-check and release declaration pipeline to stable TypeScript 7.0.2, including the robogjc web workspace and a non-mutating publish-type gate.
 - Rebalanced GPT-5.6 Codex and combo presets around published family tiers and reasoning-effort curves. The executor assignments are informed by descriptive repeated local exact-edit evidence from selected TypeScript tasks; default, planner, architect, and critic assignments remain product judgments rather than benchmark claims.
+- Cache-miss diagnostics now separate actionable, diagnostic-only, and provider-side-suspected causes instead of asserting a user-side fix for every miss (#2020). A large, costly miss with no cache reads or writes is reported as a neutral `Cache notice` marked "provider-side suspected / not user-actionable" (with what GJC cannot determine) rather than telling the user to keep a stable prefix; a miss with reads but no writes is reported as diagnostic-only without asserting a single cause; and the "cache write without enough matching reads" warning now only fires when reads actually fail to cover the writes. The existing miss cost summary and the #1929/#1936 pricing/provenance safeguards are unchanged.
 
 ### Fixed
 

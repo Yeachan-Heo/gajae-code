@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import type { Model, Usage } from "@gajae-code/ai";
 import {
+	buildCacheBehaviorWarning,
 	buildCacheEconomicsWarning,
 	type CacheEconomicsBasis,
 	type CacheEconomicsUsage,
 	computeCacheMissCostSummary,
+	formatCacheWarningLine,
 } from "@gajae-code/coding-agent/session/cache-economics";
 
 function usage(overrides: Partial<Usage>): Usage {
@@ -188,5 +190,70 @@ describe("cache economics", () => {
 		).toBe(true);
 		expect(warnings[3]).toBeUndefined();
 		expect(state.warningsEmitted).toBe(3);
+	});
+});
+
+const noPersistedCost = (overrides: Partial<Usage>): Usage => ({
+	...usage(overrides),
+	cost: {} as Usage["cost"],
+});
+
+describe("cache-miss attribution (#2020)", () => {
+	const model = modelWithCost(priced);
+
+	it("marks a large costly miss with zero cache activity as provider-side suspected, not user-actionable", () => {
+		const warning = buildCacheBehaviorWarning(noPersistedCost({ input: 20_000 }), model);
+
+		expect(warning?.code).toBe("provider_side_cache_miss");
+		expect(warning?.attribution).toBe("provider-side-suspected");
+		expect(warning?.nextStep).toBeUndefined();
+		expect(warning?.unknown).toBeDefined();
+
+		const line = formatCacheWarningLine(warning as NonNullable<typeof warning>);
+		expect(line).toContain("provider-side suspected / not user-actionable");
+		expect(line).not.toContain("keep the stable prefix");
+		expect(line).not.toContain("next step:");
+	});
+
+	it("reports partial reuse without writes as diagnostic-only and asserts no single cause", () => {
+		const warning = buildCacheBehaviorWarning(noPersistedCost({ input: 20_000, cacheRead: 1_000 }), model);
+
+		expect(warning?.code).toBe("expensive_cache_miss");
+		expect(warning?.attribution).toBe("diagnostic-only");
+		expect(warning?.nextStep).toBeUndefined();
+
+		const line = formatCacheWarningLine(warning as NonNullable<typeof warning>);
+		expect(line).toContain("Cache notice:");
+		expect(line).toContain("partial cache reuse");
+		expect(line).not.toContain("next step:");
+		expect(line).not.toContain("provider-side suspected");
+	});
+
+	it("keeps the actionable prefix remediation when writes land but reuse is low", () => {
+		const warning = buildCacheBehaviorWarning(
+			noPersistedCost({ input: 20_000, cacheRead: 1_000, cacheWrite: 5_000 }),
+			model,
+		);
+
+		expect(warning?.code).toBe("expensive_cache_miss");
+		expect(warning?.attribution).toBe("actionable");
+		expect(warning?.nextStep).toContain("keep the stable prefix");
+
+		const line = formatCacheWarningLine(warning as NonNullable<typeof warning>);
+		expect(line).toContain("Cache warning:");
+		expect(line).toContain("next step: keep the stable prefix");
+	});
+
+	it("does not claim a cache-write spike when reads cover the writes", () => {
+		const healthy = buildCacheBehaviorWarning(noPersistedCost({ cacheWrite: 30_000, cacheRead: 100_000 }), model);
+		expect(healthy).toBeUndefined();
+	});
+
+	it("flags a cache-write spike only when reads fail to cover the writes", () => {
+		const spike = buildCacheBehaviorWarning(noPersistedCost({ cacheWrite: 30_000, cacheRead: 0 }), model);
+
+		expect(spike?.code).toBe("cache_write_spike");
+		expect(spike?.attribution).toBe("actionable");
+		expect(spike?.nextStep).toContain("reuse the same context");
 	});
 });

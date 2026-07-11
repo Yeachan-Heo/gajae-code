@@ -55,7 +55,8 @@ function cacheWarningUsage(): Usage {
 		...zeroUsage,
 		input: 20_000,
 		cacheRead: 1_000,
-		totalTokens: 21_000,
+		cacheWrite: 2_000,
+		totalTokens: 23_000,
 	};
 }
 
@@ -183,7 +184,7 @@ describe("formatSessionDumpText cache warnings", () => {
 		});
 
 		expect(dumped).toContain(
-			"assistant 1\nCache warning: large uncached input with low cache hits ($0.06); next step:",
+			"assistant 1\nCache warning: large uncached input with low cache reuse ($0.06); next step:",
 		);
 	});
 
