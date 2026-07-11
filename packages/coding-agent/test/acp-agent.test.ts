@@ -11,6 +11,7 @@ import type {
 	SessionNotification,
 } from "@agentclientprotocol/sdk";
 import {
+	zDeleteSessionResponse,
 	zForkSessionResponse,
 	zLoadSessionResponse,
 	zNewSessionResponse,
@@ -533,6 +534,41 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("deletes an active session and its artifacts", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const sessionPath = session.sessionManager.getSessionFile()!;
+		const artifactsDir = sessionPath.slice(0, -6);
+		await fs.promises.mkdir(artifactsDir, { recursive: true });
+		await fs.promises.writeFile(path.join(artifactsDir, "artifact.txt"), "artifact");
+
+		const response = await harness.agent.unstable_deleteSession({ sessionId: created.sessionId });
+
+		expectAcpStructure(zDeleteSessionResponse, response);
+		expect(session.disposed).toBe(true);
+		expect(fs.existsSync(sessionPath)).toBe(false);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect((await harness.agent.listSessions({ cwd: harness.cwdA })).sessions).toHaveLength(0);
+	});
+
+	it("deletes a closed stored session and rejects an unknown session id", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const sessionPath = session.sessionManager.getSessionFile()!;
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		expect(fs.existsSync(sessionPath)).toBe(true);
+
+		await harness.agent.unstable_deleteSession({ sessionId: created.sessionId });
+
+		expect(fs.existsSync(sessionPath)).toBe(false);
+		expect((await harness.agent.listSessions({ cwd: harness.cwdB })).sessions).toHaveLength(0);
+		await expect(harness.agent.unstable_deleteSession({ sessionId: created.sessionId })).rejects.toThrow(
+			`ACP session not found: ${created.sessionId}`,
+		);
 	});
 
 	it("advertises plan mode and emits schema-valid mode updates", async () => {

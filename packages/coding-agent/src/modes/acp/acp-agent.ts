@@ -10,6 +10,8 @@ import {
 	type CloseSessionRequest,
 	type CloseSessionResponse,
 	type CreateElicitationResponse,
+	type DeleteSessionRequest,
+	type DeleteSessionResponse,
 	type ElicitationContentValue,
 	type ElicitationPropertySchema,
 	type ForkSessionRequest,
@@ -71,6 +73,7 @@ import {
 	type SessionInfo as StoredSessionInfo,
 	type UsageStatistics,
 } from "../../session/session-manager";
+import { FileSessionStorage } from "../../session/session-storage";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { parseThinkingLevel } from "../../thinking";
 import { toAgentWireEventPayload } from "../shared/agent-wire/event-envelope";
@@ -431,6 +434,7 @@ export class AcpAgent implements Agent {
 				},
 				sessionCapabilities: {
 					list: {},
+					delete: {},
 					fork: {},
 					resume: {},
 					close: {},
@@ -517,6 +521,29 @@ export class AcpAgent implements Agent {
 		};
 		this.#scheduleBootstrapUpdates(record.session.sessionId);
 		return response;
+	}
+
+	async unstable_deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+		const record = this.#sessions.get(params.sessionId);
+		let sessionPath: string;
+
+		if (record) {
+			const activeSessionPath = record.session.sessionManager.getSessionFile();
+			if (!activeSessionPath) {
+				throw new Error(`ACP session has no persisted file: ${params.sessionId}`);
+			}
+			sessionPath = activeSessionPath;
+			await this.#closeManagedSession(params.sessionId, record);
+		} else {
+			const storedSession = await this.#findStoredSessionById(params.sessionId);
+			if (!storedSession) {
+				throw new Error(`ACP session not found: ${params.sessionId}`);
+			}
+			sessionPath = storedSession.path;
+		}
+
+		await new FileSessionStorage().deleteSessionWithArtifacts(sessionPath);
+		return {};
 	}
 
 	async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
@@ -2113,11 +2140,14 @@ export class AcpAgent implements Agent {
 				headers: this.#toNameValueMap(server.headers),
 			};
 		}
-		return {
-			type: "sse",
-			url: server.url,
-			headers: this.#toNameValueMap(server.headers),
-		};
+		if (server.type === "sse") {
+			return {
+				type: "sse",
+				url: server.url,
+				headers: this.#toNameValueMap(server.headers),
+			};
+		}
+		throw new Error(`Unsupported ACP MCP transport: ${server.type}`);
 	}
 
 	#toNameValueMap(values: Array<{ name: string; value: string }>): { [name: string]: string } {

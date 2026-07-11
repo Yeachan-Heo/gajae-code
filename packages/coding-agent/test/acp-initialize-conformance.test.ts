@@ -238,6 +238,7 @@ describe("ACP initialize conformance", () => {
 				promptCapabilities: expect.objectContaining({ embeddedContext: true, image: true }),
 				sessionCapabilities: expect.objectContaining({
 					list: expect.any(Object),
+					delete: expect.any(Object),
 					fork: expect.any(Object),
 					resume: expect.any(Object),
 					close: expect.any(Object),
