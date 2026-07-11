@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+
+### Added
+
+- Added the xAI `grok-4.5` model to the bundled `xai` catalog: 500K context, $2 / $6 input/output, $0.50 cached input, reasoning with text + image input. Fields per authoritative xAI docs (https://docs.x.ai/developers/models/grok-4.5, https://docs.x.ai/developers/pricing).
+
 ### Fixed
 
 - Made Bedrock model visibility reflect credential-only static/shared AWS sources with supported profile shapes, authenticated real bearer-token requests, and stopped advertising unsupported ECS/IRSA sources (#1934).
