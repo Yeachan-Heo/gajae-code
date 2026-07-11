@@ -109,6 +109,131 @@ describe("SelectorController model batch assignments", () => {
 		);
 	});
 
+	test("batch selection wins over live project/profile shadows without persisting their extra keys", async () => {
+		const { ctx, settings } = createControllerContext();
+		settings.override("task.agentModelOverrides", {
+			executor: "shadow/executor",
+			architect: "shadow/architect",
+			planner: "shadow/planner",
+			critic: "shadow/critic",
+			reviewer: "shadow/reviewer",
+		});
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			roles: ["executor", "architect", "planner", "critic"],
+			thinkingLevel: ThinkingLevel.Low,
+			selector: "provider-a/selected:low",
+		});
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/selected:low",
+			architect: "provider-a/selected:low",
+			planner: "provider-a/selected:low",
+			critic: "provider-a/selected:low",
+			reviewer: "shadow/reviewer",
+		});
+
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/selected:low",
+			architect: "provider-a/selected:low",
+			planner: "provider-a/selected:low",
+			critic: "provider-a/selected:low",
+		});
+	});
+
+	test("single role selection wins over a live project/profile shadow without copying siblings", async () => {
+		const { ctx, settings } = createControllerContext();
+		settings.override("task.agentModelOverrides", {
+			executor: "shadow/executor",
+			architect: "shadow/architect",
+			planner: "shadow/planner",
+			critic: "shadow/critic",
+			reviewer: "shadow/reviewer",
+		});
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "planner",
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/selected:high",
+		});
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "shadow/executor",
+			architect: "shadow/architect",
+			planner: "provider-a/selected:high",
+			critic: "shadow/critic",
+			reviewer: "shadow/reviewer",
+		});
+
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/original-executor:low",
+			planner: "provider-a/selected:high",
+		});
+	});
+
+	test("all-targets selection applies coherently over null reset shadows", async () => {
+		const { ctx, settings } = createControllerContext();
+		settings.setAgentModelOverride("reviewer", "provider-a/original-reviewer");
+		settings.override("modelRoles", null as never);
+		settings.override("task.agentModelOverrides", null as never);
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			roles: ["default", "executor", "architect", "planner", "critic"],
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/selected:high",
+		});
+
+		expect(ctx.showError).not.toHaveBeenCalled();
+		expect(settings.getModelRole("default")).toBe("provider-a/selected:high");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/selected:high",
+			architect: "provider-a/selected:high",
+			planner: "provider-a/selected:high",
+			critic: "provider-a/selected:high",
+		});
+		expect(ctx.showStatus).toHaveBeenCalledWith(
+			"All model targets set to provider-a/selected:high for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
+		);
+
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/selected:high",
+			architect: "provider-a/selected:high",
+			planner: "provider-a/selected:high",
+			critic: "provider-a/selected:high",
+			reviewer: "provider-a/original-reviewer",
+		});
+	});
+
+	test("single role selection applies without partial failure over a null reset shadow", async () => {
+		const { ctx, settings } = createControllerContext();
+		settings.override("task.agentModelOverrides", null as never);
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "planner",
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/selected:high",
+		});
+
+		expect(ctx.showError).not.toHaveBeenCalled();
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			planner: "provider-a/selected:high",
+		});
+		expect(ctx.showStatus).toHaveBeenCalledWith("planner agent model: provider-a/selected:high");
+	});
+
 	test("all targets selection writes DEFAULT plus every role-agent override", async () => {
 		const { ctx, settings, setModelCalls } = createControllerContext();
 		const selector = await openSelector(ctx);

@@ -597,6 +597,8 @@ export class ModelSelectorComponent extends Container {
 		} else {
 			// Reload config and cached discovery state without blocking on live provider refresh
 			await this.#modelRegistry.refresh("offline");
+			this.#roles = {};
+			this.#loadRoleModels();
 
 			// Check for models.json errors
 			const loadError = this.#modelRegistry.getError();

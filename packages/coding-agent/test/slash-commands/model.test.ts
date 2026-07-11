@@ -111,6 +111,27 @@ describe("/model batch assignments", () => {
 		]);
 	});
 
+	test("assign all-targets replaces null reset shadows without a partial failure", async () => {
+		const { output, runtime, settings } = createRuntime();
+		settings.override("modelRoles", null as never);
+		settings.override("task.agentModelOverrides", null as never);
+
+		await expect(
+			executeAcpBuiltinSlashCommand("/model assign all-targets claude-3-5-sonnet:high", runtime),
+		).resolves.toEqual({ consumed: true });
+
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:high");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/claude-3-5-sonnet:high",
+			architect: "anthropic/claude-3-5-sonnet:high",
+			planner: "anthropic/claude-3-5-sonnet:high",
+			critic: "anthropic/claude-3-5-sonnet:high",
+		});
+		expect(output).toEqual([
+			"All model targets set to anthropic/claude-3-5-sonnet:high for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
+		]);
+	});
+
 	test("assign all-targets materializes an active profile exactly once", async () => {
 		const { output, runtime, session, settings, setActiveModelProfile } = createRuntime();
 		session.model = { provider: "anthropic", id: "current-model" };

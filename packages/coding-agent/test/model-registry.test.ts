@@ -2710,6 +2710,95 @@ describe("ModelRegistry", () => {
 		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("proxy/executor-selector");
 	});
 
+	test("preserves runtime record resets across binding refresh and role helper writes", async () => {
+		const settings = await Settings.init({ inMemory: true });
+		settings.set("modelRoles", {
+			default: "durable/default",
+			smol: "durable/smol",
+			slow: "durable/slow",
+		});
+		settings.set("task.agentModelOverrides", {
+			executor: "durable/executor",
+			reviewer: "durable/reviewer",
+		});
+		settings.override("modelRoles", null as never);
+		settings.override("task.agentModelOverrides", null as never);
+		settings.setModelRole("default", "selected/default");
+		settings.setAgentModelOverride("executor", "selected/executor");
+
+		writeRawModelsConfig({ providers: {} });
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.applyConfiguredModelBindings(settings);
+		await registry.refresh("offline");
+
+		expect(settings.get("modelRoles")).toEqual({ default: "selected/default" });
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "selected/executor",
+		});
+
+		settings.overrideModelRoles({ plan: "selected/plan" });
+		expect(settings.get("modelRoles")).toEqual({
+			default: "selected/default",
+			plan: "selected/plan",
+		});
+
+		settings.clearOverride("modelRoles");
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("modelRoles")).toEqual({
+			default: "selected/default",
+			smol: "durable/smol",
+			slow: "durable/slow",
+		});
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "selected/executor",
+			reviewer: "durable/reviewer",
+		});
+	});
+	test("restores opaque resets instead of durable bindings after configured bindings are removed", async () => {
+		const settings = await Settings.init({ inMemory: true });
+		settings.set("modelRoles", { default: "durable/default" });
+		settings.set("task.agentModelOverrides", { executor: "durable/executor" });
+		settings.override("modelRoles", null as never);
+		settings.override("task.agentModelOverrides", { executor: false } as never);
+
+		writeRawModelsConfig({
+			modelBindings: {
+				modelRoles: { default: "proxy/local-selector:high" },
+				agentModelOverrides: { executor: "proxy/executor-selector" },
+			},
+			providers: {
+				proxy: providerConfig(
+					"https://proxy.example/v1",
+					[{ id: "local-selector", reasoning: true }],
+					"openai-completions",
+				),
+			},
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.applyConfiguredModelBindings(settings);
+		expect(settings.getModelRole("default")).toBe("proxy/local-selector:high");
+		expect(settings.get("task.agentModelOverrides").executor).toBe("proxy/executor-selector");
+
+		writeRawModelsConfig({
+			providers: {
+				proxy: providerConfig(
+					"https://proxy.example/v1",
+					[{ id: "local-selector", reasoning: true }],
+					"openai-completions",
+				),
+			},
+		});
+		await Bun.sleep(5);
+		await registry.refresh("offline");
+		expect(settings.get("modelRoles")).toEqual({});
+		expect(settings.get("task.agentModelOverrides")).toEqual({});
+
+		settings.clearOverride("modelRoles");
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.getModelRole("default")).toBe("durable/default");
+		expect(settings.get("task.agentModelOverrides").executor).toBe("durable/executor");
+	});
+
 	test("defers model bindings until settings are initialized", () => {
 		writeRawModelsConfig({
 			modelBindings: {

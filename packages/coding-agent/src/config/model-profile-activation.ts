@@ -74,7 +74,7 @@ export interface MaterializeModelProfileAssignmentOptions {
 		ModelProfileActivationSession,
 		"model" | "thinkingLevel" | "setActiveModelProfile" | "getActiveModelProfile"
 	>;
-	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set">;
+	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set" | "setModelRole" | "setAgentModelOverride">;
 	role: GjcModelAssignmentTargetId;
 	selector: string;
 }
@@ -84,7 +84,7 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		ModelProfileActivationSession,
 		"model" | "thinkingLevel" | "setActiveModelProfile" | "getActiveModelProfile"
 	>;
-	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set">;
+	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set" | "setModelRole" | "setAgentModelOverride">;
 	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string> | Partial<Record<GjcModelAssignmentTargetId, string>>;
 }
 
@@ -136,6 +136,11 @@ export function materializeActiveModelProfileAssignment(options: MaterializeMode
 	options.settings.clearOverride("modelProfile.default");
 	options.settings.override("modelRoles", nextModelRoles);
 	options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
+	if (target.settingsPath === "modelRoles") {
+		options.settings.setModelRole(options.role, options.selector);
+	} else {
+		options.settings.setAgentModelOverride(options.role, options.selector);
+	}
 	options.session.setActiveModelProfile?.(undefined);
 	return true;
 }
@@ -173,6 +178,14 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 	options.settings.clearOverride("modelProfile.default");
 	options.settings.override("modelRoles", nextModelRoles);
 	options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
+	for (const [role, selector] of materializedAssignments) {
+		const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+		if (target.settingsPath === "modelRoles") {
+			options.settings.setModelRole(role, selector);
+		} else {
+			options.settings.setAgentModelOverride(role, selector);
+		}
+	}
 	options.session.setActiveModelProfile?.(undefined);
 	return true;
 }

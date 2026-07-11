@@ -199,6 +199,71 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}`);
 	});
 
+	test("keeps reset role badges coherent after offline binding refresh", async () => {
+		installTestTheme();
+		const selectedModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const hiddenModel = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!selectedModel || !hiddenModel) throw new Error("Expected bundled Anthropic models");
+
+		const selectedSelector = `${selectedModel.provider}/${selectedModel.id}`;
+		const hiddenSelector = `${hiddenModel.provider}/${hiddenModel.id}`;
+		const settings = Settings.isolated();
+		settings.set("modelRoles", { default: selectedSelector });
+		settings.set("task.agentModelOverrides", {
+			executor: selectedSelector,
+			architect: hiddenSelector,
+		});
+		settings.override("modelRoles", null as never);
+		settings.override("task.agentModelOverrides", null as never);
+		settings.setModelRole("default", selectedSelector);
+		settings.setAgentModelOverride("executor", selectedSelector);
+
+		const refreshRelease = Promise.withResolvers<void>();
+		const refreshFinished = Promise.withResolvers<void>();
+		const refresh = vi.fn(async (strategy: string) => {
+			expect(strategy).toBe("offline");
+			await refreshRelease.promise;
+			settings.override("modelRoles", { default: `${selectedSelector}:high` });
+			settings.override("task.agentModelOverrides", { executor: `${selectedSelector}:high` });
+			refreshFinished.resolve();
+		});
+		const modelRegistry = {
+			refresh,
+			getAll: () => [selectedModel, hiddenModel],
+			getAvailable: () => [selectedModel, hiddenModel],
+			getError: () => undefined,
+			getDiscoverableProviders: () => [],
+			getCanonicalModels: () => [],
+			resolveCanonicalModel: () => undefined,
+		} as unknown as ModelRegistry;
+		const ui = { requestRender: vi.fn() } as unknown as TUI;
+		const selector = new ModelSelectorComponent(
+			ui,
+			selectedModel,
+			settings,
+			modelRegistry,
+			[],
+			() => {},
+			() => {},
+			{ temporaryOnly: true },
+		);
+
+		await Bun.sleep(0);
+		expect(refresh).toHaveBeenCalledTimes(1);
+		refreshRelease.resolve();
+		await refreshFinished.promise;
+		await Bun.sleep(0);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("DEFAULT (high)");
+		expect(rendered).toContain("EXECUTOR (high)");
+		expect(rendered).not.toMatch(/ARCHITECT \((?:inherit|off|minimal|low|medium|high|xhigh|max)\)/);
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: `${selectedSelector}:high`,
+		});
+	});
+
 	test("selects role-agent assignment without using stale task role", async () => {
 		installTestTheme();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");

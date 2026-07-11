@@ -230,6 +230,30 @@ describe("model profile activation", () => {
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
+	test("materialized explicit assignments release only their whole-reset leaves", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		settings.override("task.agentModelOverrides", null as never);
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		const materialized = materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor:medium",
+		});
+		expect(materialized).toBe(true);
+		settings.clearAgentModelOverride("executor");
+		settings.set("task.agentModelOverrides", {
+			executor: "durable/executor-added-after-materialization",
+			planner: "durable/planner-added-after-materialization",
+		});
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "durable/executor-added-after-materialization",
+			architect: "provider-a/architect",
+		});
+	});
 
 	test("materializing a default override stores the selected default and clears the profile", async () => {
 		const session = fakeSession();

@@ -684,6 +684,57 @@ describe("custom model preset creation", () => {
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("custom-default");
 	});
+	it("preserves malformed runtime resets through deletion materialization rollback", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-default",
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: "my-oai/gpt-custom",
+			},
+			source: "user",
+		};
+		const settings = Settings.isolated({
+			"modelProfile.default": "custom-default",
+		});
+		settings.set("task.agentModelOverrides", { critic: "durable/critic" });
+		settings.override("task.agentModelOverrides", { executor: false } as never);
+		const session = {
+			model: currentModel("other", "active"),
+			thinkingLevel: undefined,
+			sessionId: "session",
+			setActiveModelProfile: () => {},
+			getActiveModelProfile: () => "custom-default",
+		};
+		const flushSpy = spyOn(settings, "flush").mockRejectedValueOnce(new Error("flush failed"));
+
+		try {
+			await expect(
+				materializeModelProfileForDeletion({
+					session,
+					settings,
+					modelRegistry: createRegistry([[customProfile.name, customProfile]]),
+					profileName: "custom-default",
+				}),
+			).rejects.toThrow("flush failed");
+		} finally {
+			flushSpy.mockRestore();
+		}
+
+		settings.set("task.agentModelOverrides", {
+			critic: "durable/critic",
+			executor: "durable/executor-added-after-rollback",
+		});
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "durable/critic",
+		});
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "durable/critic",
+			executor: "durable/executor-added-after-rollback",
+		});
+	});
 	it("restores a deleted custom preset when post-delete notification fails", async () => {
 		const unsafeDisplayName = "Custom\x1b[31m Default\x1b[0m\nRestored";
 		const profiles = new Map<string, ModelProfileDefinition>([
