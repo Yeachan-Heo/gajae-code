@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getWorktreesDir } from "@gajae-code/utils/dirs";
+import { SPAWN_PROVENANCE_ENV } from "../notifications/config";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -2083,6 +2084,11 @@ export function buildWorkerCommand(
 		envAssignment("GJC_TEAM_STATE_ROOT", config.state_root),
 		envAssignment("GJC_TEAM_LEADER_CWD", config.leader.cwd),
 		envAssignment("GJC_TEAM_DISPLAY_NAME", config.display_name),
+		// Canonical GJC spawn-provenance marker so `notifications.sessionScope =
+		// "primary"` suppresses the worker's own notification endpoint/topic. The
+		// value is informational (leader session id, falling back to the team name
+		// so it is always non-blank); presence is what marks the worker.
+		envAssignment(SPAWN_PROVENANCE_ENV, config.leader.session_id.trim() || config.team_name),
 		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
 	];
 	const joined = platform === "win32" ? envLines.join(" ") : envLines.join(" ");

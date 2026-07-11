@@ -66,6 +66,7 @@ import {
 	type SessionHandle,
 	type SessionState,
 } from "../harness-control-plane/types";
+import { SPAWN_PROVENANCE_ENV } from "../notifications/config";
 
 const PRIVATE_OWNER_CONTROL_FIELDS = new Set([
 	"socket_key",
@@ -804,7 +805,14 @@ export default class Harness extends Command {
 		// Optional rpc command override (tests / non-default hosts); defaults to `gjc --mode rpc`.
 		const override = process.env.GJC_HARNESS_RPC_COMMAND;
 		const command = override ? (JSON.parse(override) as string[]) : undefined;
-		const rpc = new GajaeCodeRpc({ sessionDir, command });
+		// Mark the RPC owner as a GJC-spawned child (canonical provenance marker)
+		// so `notifications.sessionScope = "primary"` suppresses its notification
+		// endpoint/topic; default `all` preserves historical auto-on behavior.
+		const rpc = new GajaeCodeRpc({
+			sessionDir,
+			command,
+			env: { ...process.env, [SPAWN_PROVENANCE_ENV]: sessionId },
+		});
 		const owner = new RuntimeOwner({ root, sessionId, rpc });
 		const info = await owner.start();
 		writeJson({ ok: true, owner: info });

@@ -485,6 +485,55 @@ describe("native gjc team runtime", () => {
 		expect(command).toContain("'You are worker-1 in gjc team win-team.");
 	});
 
+	it("marks worker commands with the canonical GJC spawn-provenance env var", () => {
+		const base = {
+			team_name: "prov-team",
+			display_name: "prov-team",
+			requested_name: "prov-team",
+			task: "Do work",
+			agent_type: "executor",
+			worker_count: 1,
+			max_workers: 1,
+			state_root: "/state",
+			worker_command: "gjc",
+			worker_cli_plan: ["gjc"],
+			tmux_command: "tmux",
+			tmux_session: "sess",
+			tmux_session_name: "sess",
+			tmux_target: "sess:0",
+			workspace_mode: "direct",
+			dry_run: false,
+			leader: { session_id: "leader-xyz", pane_id: "%1", cwd: "/repo" },
+			leader_cwd: "/repo",
+			team_state_root: "/state",
+			workers: [],
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+		} satisfies GjcTeamConfig;
+		const worker = {
+			id: "worker-1",
+			name: "worker-1",
+			index: 1,
+			agent_type: "executor",
+			role: "executor",
+			status: "starting",
+			last_heartbeat: "2026-01-01T00:00:00.000Z",
+			assigned_tasks: [],
+		} satisfies GjcTeamWorker;
+
+		// POSIX: the marker carries the leader session id.
+		const posix = buildWorkerCommand(base, worker, "linux");
+		expect(posix).toContain("GJC_SPAWNED_BY_SESSION='leader-xyz'");
+
+		// Falls back to the (always non-blank) team name when the leader has no id,
+		// so presence-based suppression still marks the worker.
+		const noLeaderId = { ...base, leader: { ...base.leader, session_id: "  " } } satisfies GjcTeamConfig;
+		expect(buildWorkerCommand(noLeaderId, worker, "linux")).toContain("GJC_SPAWNED_BY_SESSION='prov-team'");
+
+		// Windows env assignment form is emitted too.
+		expect(buildWorkerCommand(base, worker, "win32")).toContain("$env:GJC_SPAWNED_BY_SESSION = 'leader-xyz';");
+	});
+
 	it("resolves Windows JavaScript entrypoints through an executable runtime", async () => {
 		const command = resolveGjcWorkerCommand(
 			"C:\\repo",

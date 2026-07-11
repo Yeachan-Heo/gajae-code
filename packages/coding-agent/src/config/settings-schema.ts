@@ -272,6 +272,11 @@ export const SETTINGS_SCHEMA = {
 		default: "lean",
 		validate: (value: string) => value === "lean" || value === "verbose",
 	},
+	"notifications.sessionScope": {
+		type: "string",
+		default: "all",
+		validate: (value: string) => value === "all" || value === "primary",
+	},
 	"notifications.daemon.idleTimeoutMs": {
 		type: "number",
 		default: 60000,

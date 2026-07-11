@@ -236,6 +236,20 @@ describe.skipIf(process.platform !== "linux")("gjc harness start --detach (detac
 		expect(after.live).toBe(false);
 	}, 60_000);
 
+	it("injects the GJC spawn-provenance marker into the detached RPC owner", async () => {
+		// fake-rpc records the GJC_SPAWNED_BY_SESSION value it was spawned with; a
+		// non-empty marker proves #runOwner tags the detached owner's RPC child so
+		// notifications.sessionScope=primary can suppress it.
+		const recordPath = path.join(root, "owner-spawn-marker");
+		const started = await runHarness(
+			["start", "--input", JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID, detach: true })],
+			{ GJC_FAKE_RPC_ENV_RECORD: recordPath },
+		);
+		expect(started.code).toBe(0);
+		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect(await readFile(recordPath, "utf8")).toBe(SID);
+	}, 60_000);
+
 	it("blocks without a detached fallback when tmux starts but never routes the owner", async () => {
 		tmuxCommand = await createFakeTmuxBin(root, { skipOwnerLaunch: true });
 		const started = await runHarness([

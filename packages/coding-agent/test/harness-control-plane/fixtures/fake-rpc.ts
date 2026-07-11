@@ -7,6 +7,12 @@
  * a real subprocess, without a live model. It does NOT fake acceptance/completion inside
  * shipped code — the control plane drives this exactly as it would drive real gjc.
  */
+import { writeFileSync } from "node:fs";
+
+// When asked, record the GJC spawn-provenance marker this RPC child was spawned
+// with so the harness detached-owner e2e can prove `#runOwner` injects it.
+const envRecordPath = process.env.GJC_FAKE_RPC_ENV_RECORD;
+if (envRecordPath) writeFileSync(envRecordPath, process.env.GJC_SPAWNED_BY_SESSION ?? "");
 process.stdout.write(`${JSON.stringify({ type: "ready" })}\n`);
 
 let buffer = "";

@@ -6,6 +6,9 @@
 
 - Added an opt-in `/pet on|off` composer companion with idle gaze, working claw motion, and occasional automatic flex animation on Sixel- and Kitty-graphics terminals.
 
+- Added `notifications.sessionScope` (`all` default | `primary`). Under `primary`, the separate-process child sessions GJC spawns (team workers, harness RPC owners) no longer register their own Telegram forum topic / notification endpoint unless they explicitly opt in (`GJC_NOTIFICATIONS=1`, the `/session_create` path). The default `all` fully preserves current behavior, and user-opened CLI/tmux/headless sessions are never affected. The provenance marker is per-spawn and non-dynastic (consumed once at session startup, never inherited by grandchildren) (#1908).
+- Added `notifications.sessionScope` (`all` default | `primary`). Under `primary`, the separate-process child sessions GJC spawns (team workers, harness RPC owners) no longer register their own Telegram forum topic / notification endpoint unless they explicitly opt in (`GJC_NOTIFICATIONS=1`, the `/session_create` path). The default `all` fully preserves current behavior, and user-opened CLI/tmux/headless sessions are never affected. The provenance marker is per-spawn and non-dynastic (consumed once at session startup, never inherited by grandchildren) (#1908).
+
 ### Changed
 
 - Migrated the repository type-check and release declaration pipeline to stable TypeScript 7.0.2, including the robogjc web workspace and a non-mutating publish-type gate.

@@ -97,6 +97,10 @@
 					"type": "string",
 					"default": "lean"
 				},
+				"sessionScope": {
+					"type": "string",
+					"default": "all"
+				},
 				"daemon": {
 					"type": "object",
 					"properties": {

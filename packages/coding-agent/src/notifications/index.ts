@@ -529,6 +529,7 @@ const defaultConfig: NotificationConfig = {
 	},
 	redact: false,
 	verbosity: "lean",
+	sessionScope: "all",
 	idleTimeoutMs: 60_000,
 	rich: { enabled: true },
 	richDraft: { enabled: false },

@@ -37,6 +37,7 @@ const BASE_CFG: NotificationConfig = {
 	},
 	redact: false,
 	verbosity: "lean",
+	sessionScope: "all",
 	rich: {
 		enabled: true,
 	},
@@ -51,6 +52,10 @@ const GLOBAL_CFG: NotificationConfig = {
 	enabled: true,
 	botToken: "1234567890:abc",
 	chatId: "chat-1",
+};
+const PRIMARY_GLOBAL_CFG: NotificationConfig = {
+	...GLOBAL_CFG,
+	sessionScope: "primary",
 };
 const tempDirs: string[] = [];
 
@@ -90,6 +95,7 @@ describe("notifications config", () => {
 			},
 			redact: true,
 			verbosity: "lean",
+			sessionScope: "all",
 			rich: {
 				enabled: true,
 			},
@@ -233,6 +239,77 @@ describe("notifications config", () => {
 				currentAgentType: "executor",
 			}),
 		).toBe(false);
+	});
+
+	test("getNotificationConfig reads sessionScope", () => {
+		expect(getNotificationConfig(Settings.isolated()).sessionScope).toBe("all");
+		expect(getNotificationConfig(Settings.isolated({ "notifications.sessionScope": "primary" })).sessionScope).toBe(
+			"primary",
+		);
+		// Unknown / malformed values fall back to the behavior-preserving default.
+		expect(getNotificationConfig(Settings.isolated({ "notifications.sessionScope": "all" })).sessionScope).toBe(
+			"all",
+		);
+	});
+
+	test("sessionScope=primary suppresses GJC-spawned children but preserves everything else", () => {
+		// Default scope "all": a spawned child still registers (fully behavior-preserving).
+		expect(shouldRegisterNotificationsExtension({ cfg: GLOBAL_CFG, env: {}, spawnedByGjc: true })).toBe(true);
+		// scope "primary": a spawned child is suppressed.
+		expect(shouldRegisterNotificationsExtension({ cfg: PRIMARY_GLOBAL_CFG, env: {}, spawnedByGjc: true })).toBe(
+			false,
+		);
+		// scope "primary": a user-opened session (no marker) is unaffected.
+		expect(shouldRegisterNotificationsExtension({ cfg: PRIMARY_GLOBAL_CFG, env: {}, spawnedByGjc: false })).toBe(
+			true,
+		);
+		expect(shouldRegisterNotificationsExtension({ cfg: PRIMARY_GLOBAL_CFG, env: {} })).toBe(true);
+	});
+
+	test("explicit /session_create opt-in outranks sessionScope=primary suppression", () => {
+		// GJC_NOTIFICATIONS=1 is exactly what Telegram /session_create and cold
+		// /session_resume launch with, so their bidirectional topic survives.
+		expect(
+			shouldRegisterNotificationsExtension({
+				cfg: PRIMARY_GLOBAL_CFG,
+				env: { GJC_NOTIFICATIONS: "1" },
+				spawnedByGjc: true,
+			}),
+		).toBe(true);
+		expect(
+			shouldRegisterNotificationsExtension({
+				cfg: PRIMARY_GLOBAL_CFG,
+				env: { GJC_NOTIFICATIONS_TOKEN: "legacy-token" },
+				spawnedByGjc: true,
+			}),
+		).toBe(true);
+		// Hard opt-out and /notify off equivalents still outrank the marker.
+		expect(
+			shouldRegisterNotificationsExtension({
+				cfg: PRIMARY_GLOBAL_CFG,
+				env: { GJC_NOTIFICATIONS: "0" },
+				spawnedByGjc: true,
+			}),
+		).toBe(false);
+		expect(
+			shouldRegisterNotificationsExtension({
+				cfg: PRIMARY_GLOBAL_CFG,
+				env: { GJC_NOTIFY: "off" },
+				spawnedByGjc: true,
+			}),
+		).toBe(false);
+		// A spawned child that is also a subagent stays suppressed regardless.
+		expect(
+			shouldRegisterNotificationsExtension({
+				cfg: PRIMARY_GLOBAL_CFG,
+				env: {},
+				spawnedByGjc: true,
+				taskDepth: 1,
+			}),
+		).toBe(false);
+		// Without any configured adapter, a marker under primary is still off (no
+		// spurious enable, and global auto-on is never reached).
+		expect(shouldRegisterNotificationsExtension({ cfg: BASE_CFG, env: {}, spawnedByGjc: true })).toBe(false);
 	});
 	test("settings-enabled subagent sessions do not register the notifications extension", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-subagent-"));
@@ -390,6 +467,80 @@ describe("notifications config", () => {
 			} else {
 				process.env.GJC_NOTIFICATIONS = previous;
 			}
+			resetSettingsForTest();
+		}
+	}, 30000);
+
+	test("sessionScope=primary suppresses a GJC-spawned child endpoint end to end and consumes the marker", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-spawned-"));
+		tempDirs.push(cwd);
+		const previousNotif = process.env.GJC_NOTIFICATIONS;
+		const previousSpawn = process.env.GJC_SPAWNED_BY_SESSION;
+		delete process.env.GJC_NOTIFICATIONS;
+		delete process.env.GJC_SPAWNED_BY_SESSION;
+		const adapterSettings = (scope: "all" | "primary"): Settings =>
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.channelId": "discord-channel",
+				"notifications.sessionScope": scope,
+			});
+		const primarySettings = adapterSettings("primary");
+		const allSettings = adapterSettings("all");
+		const disposers: Array<() => Promise<void>> = [];
+		const spawn = async (settings: Settings) =>
+			createAgentSession({
+				cwd,
+				agentDir: cwd,
+				sessionManager: SessionManager.inMemory(cwd),
+				settings,
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+		const endpointFor = (sessionId: string): string =>
+			path.join(cwd, ".gjc", "state", "notifications", `${sessionId}.json`);
+		try {
+			resetSettingsForTest();
+			await Settings.init({ inMemory: true, cwd, agentDir: cwd });
+
+			// 1. Spawned child under primary: suppressed, and the marker is consumed.
+			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
+			const suppressed = await spawn(primarySettings);
+			disposers.push(() => suppressed.session.dispose());
+			expect(process.env.GJC_SPAWNED_BY_SESSION).toBeUndefined();
+
+			// 2. Spawned child under the default "all" scope still registers.
+			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
+			const preserved = await spawn(allSettings);
+			disposers.push(() => preserved.session.dispose());
+
+			// 3. Spawned child under primary WITH explicit opt-in keeps its endpoint.
+			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
+			process.env.GJC_NOTIFICATIONS = "1";
+			const optedIn = await spawn(primarySettings);
+			disposers.push(() => optedIn.session.dispose());
+			delete process.env.GJC_NOTIFICATIONS;
+
+			await suppressed.session.extensionRunner?.emit({ type: "session_start" });
+			await preserved.session.extensionRunner?.emit({ type: "session_start" });
+			await optedIn.session.extensionRunner?.emit({ type: "session_start" });
+
+			expect(fs.existsSync(endpointFor(suppressed.session.sessionId))).toBe(false);
+			expect(fs.existsSync(endpointFor(preserved.session.sessionId))).toBe(true);
+			expect(fs.existsSync(endpointFor(optedIn.session.sessionId))).toBe(true);
+		} finally {
+			await Promise.all(disposers.reverse().map(dispose => dispose()));
+			if (previousNotif === undefined) delete process.env.GJC_NOTIFICATIONS;
+			else process.env.GJC_NOTIFICATIONS = previousNotif;
+			if (previousSpawn === undefined) delete process.env.GJC_SPAWNED_BY_SESSION;
+			else process.env.GJC_SPAWNED_BY_SESSION = previousSpawn;
 			resetSettingsForTest();
 		}
 	}, 30000);

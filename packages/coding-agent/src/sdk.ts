@@ -94,6 +94,7 @@ import { createNotificationsExtension } from "./notifications";
 import {
 	getNotificationConfig,
 	type NotificationConfig,
+	SPAWN_PROVENANCE_ENV,
 	shouldRegisterNotificationsExtension,
 } from "./notifications/config";
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
@@ -1615,6 +1616,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} catch {
 			notificationCfg = undefined;
 		}
+		// Consume the GJC spawn-provenance marker: read it once, then remove it
+		// from this process's env so it is never re-inherited by children this
+		// session later spawns (marker is per-spawn, not dynastic — each GJC child
+		// spawn site sets it explicitly). Suppression under `sessionScope=primary`
+		// keeps auto-spawned children (team workers, harness RPC owners) silent
+		// while explicit `/session_create` opt-in (GJC_NOTIFICATIONS=1) still wins.
+		const spawnProvenance = process.env[SPAWN_PROVENANCE_ENV];
+		const spawnedByGjc = typeof spawnProvenance === "string" && spawnProvenance.trim().length > 0;
+		delete process.env[SPAWN_PROVENANCE_ENV];
 		if (
 			shouldRegisterNotificationsExtension({
 				env: process.env,
@@ -1622,6 +1632,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				taskDepth,
 				parentTaskPrefix: options.parentTaskPrefix,
 				currentAgentType: options.currentAgentType,
+				spawnedByGjc,
 			})
 		) {
 			inlineExtensions.push(api => createNotificationsExtension(api, { settings }));
