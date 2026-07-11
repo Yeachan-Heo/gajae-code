@@ -5,11 +5,15 @@ import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import type { GoalModeState } from "@gajae-code/coding-agent/goals/state";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 describe("AgentSession active goal reminders", () => {
@@ -233,5 +237,40 @@ describe("AgentSession active goal reminders", () => {
 
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(developerReminderCount()).toBe(0);
+	});
+	it("contains background coordinator state persistence failures without leaking sidecar data", async () => {
+		const stateFile = path.join(tempDir.path(), "corrupt-runtime-state.json");
+		await Bun.write(stateFile, '{"private_payload":"must-not-reach-logs"}');
+		const previousStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const previousSessionId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = session.sessionId;
+		const deliveredEvents: string[] = [];
+		session.subscribe(event => deliveredEvents.push(event.type));
+		let resolveWarning: (() => void) | undefined;
+		const warningLogged = new Promise<void>(resolve => {
+			resolveWarning = resolve;
+		});
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation((message, metadata) => {
+			if (message === "Failed to persist coordinator runtime state" && metadata?.event === "turn_start")
+				resolveWarning?.();
+		});
+
+		try {
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			expect(deliveredEvents).toEqual(["turn_start"]);
+			await Promise.race([
+				warningLogged,
+				Bun.sleep(1_000).then(() => {
+					throw new Error("Timed out waiting for coordinator runtime-state failure containment");
+				}),
+			]);
+			expect(warnSpy).toHaveBeenCalledWith("Failed to persist coordinator runtime state", { event: "turn_start" });
+		} finally {
+			if (previousStateFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = previousStateFile;
+			if (previousSessionId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = previousSessionId;
+		}
 	});
 });

@@ -194,6 +194,28 @@ describe("pumpCoordinatorMcpStream — writer robustness", () => {
 	});
 });
 
+describe("pumpCoordinatorMcpStream — public error boundary", () => {
+	it("redacts handler exception text before writing JSON-RPC errors", async () => {
+		const privateSentinel = "must-not-reach-public-json-rpc";
+		const handler = async (): Promise<Rpc> => {
+			throw new Error(`private path /tmp/${privateSentinel}`);
+		};
+		const writes: Rpc[] = [];
+		const ch = channel();
+		ch.push(line(1));
+		ch.close();
+		await pumpCoordinatorMcpStream(handler as never, ch, value => void writes.push(JSON.parse(value)));
+		expect(writes).toEqual([
+			{
+				jsonrpc: "2.0",
+				id: 1,
+				error: { code: -32603, message: "coordinator_request_failed" },
+			},
+		]);
+		expect(JSON.stringify(writes)).not.toContain(privateSentinel);
+	});
+});
+
 describe("pumpCoordinatorMcpStream — frame handling", () => {
 	it("ignores notifications (no id) and malformed frames without crashing", async () => {
 		const handler = async (req: Rpc): Promise<Rpc> => ({ jsonrpc: "2.0", id: req.id ?? null, result: { ok: true } });

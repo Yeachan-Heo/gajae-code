@@ -2095,6 +2095,16 @@ export class AgentSession {
 		return queued;
 	}
 
+	#persistRuntimeStateInBackground(event: AgentSessionEvent): void {
+		void persistCoordinatorRuntimeStateFromEvent(event, {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		}).catch(() => {
+			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
+		});
+	}
+
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "message_update") {
 			// Fast path: message_update maps to no sidecar state, so we must not
@@ -2106,12 +2116,7 @@ export class AgentSession {
 			}
 			return;
 		}
-		const persistRuntimeState = () =>
-			persistCoordinatorRuntimeStateFromEvent(event, {
-				sessionId: this.sessionId,
-				cwd: this.sessionManager.getCwd(),
-				sessionFile: this.sessionManager.getSessionFile(),
-			});
+		const persistRuntimeState = () => this.#persistRuntimeStateInBackground(event);
 		// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
 		// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
 		// emitting while #promptInFlightCount > 0 lets a client fire its next

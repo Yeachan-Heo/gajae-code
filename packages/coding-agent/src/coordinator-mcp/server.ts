@@ -4187,7 +4187,7 @@ export async function pumpCoordinatorMcpStream(
 				emit({
 					jsonrpc: "2.0",
 					id: request.id ?? null,
-					error: { code: -32603, message: err instanceof Error ? err.message : String(err) },
+					error: { code: -32603, message: publicCoordinatorError(err) },
 				});
 			} finally {
 				if (!control) {

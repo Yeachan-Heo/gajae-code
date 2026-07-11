@@ -393,9 +393,19 @@ describe("issue #1938 evidence", () => {
 		for (const environment of environments) {
 			const value = await runUnsupportedSerializer(environment);
 			expect(value.status).toBe("unsupported");
+			expect(value.generated_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/);
+			if (environment.GJC_ISSUE1938_TEST_DISABLE_BUN === "1") {
+				expect(value.generated_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+			} else {
+				expect(value.generated_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+			}
 			expect(value.cases).toEqual([]);
 			expect(value.cleanup).toEqual({ status: "not_started", unit: null, scope: null, completed_at: null });
 		}
+	});
+	test("preserves subsecond ordering for passed artifact receipts", () => {
+		expect(script).toContain('isoformat(timespec="milliseconds")');
+		expect(script).toContain("new Date().toISOString()");
 	});
 	test("leaves no partial receipt when same-directory atomic publication is interrupted", async () => {
 		for (const environment of [{}, { GJC_ISSUE1938_TEST_DISABLE_PYTHON: "1" }, { GJC_ISSUE1938_TEST_DISABLE_PYTHON: "1", GJC_ISSUE1938_TEST_DISABLE_BUN: "1" }]) {

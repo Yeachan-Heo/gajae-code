@@ -22,6 +22,37 @@ const STORE = "tmux_sessions" as const;
 const TOCTOU_SKIP = "tmux_revalidation_failed_or_became_live";
 const ORPHAN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+type CollectedTmuxIdentity = {
+	nativeSessionId: string;
+	ownerGeneration: string;
+	sessionId: string;
+	sessionStateFile: string;
+	project: string;
+	createdAt: string;
+};
+
+const collectedIdentities = new WeakMap<GcRecord, CollectedTmuxIdentity>();
+
+function collectedIdentity(session: GjcTmuxSessionStatus): CollectedTmuxIdentity | undefined {
+	if (
+		!session.nativeSessionId ||
+		!session.ownerGeneration ||
+		!session.sessionId ||
+		!session.sessionStateFile ||
+		!session.project ||
+		!session.createdAt
+	)
+		return undefined;
+	return {
+		nativeSessionId: session.nativeSessionId,
+		ownerGeneration: session.ownerGeneration,
+		sessionId: session.sessionId,
+		sessionStateFile: session.sessionStateFile,
+		project: session.project,
+		createdAt: session.createdAt,
+	};
+}
+
 function pathExists(path: string): boolean {
 	try {
 		return fs.existsSync(path);
@@ -168,15 +199,21 @@ function classifyUntaggedSession(session: GjcTmuxSessionStatus): GcRecord {
 	return unclassifiedRecord(session.name, "untagged_tmux_session");
 }
 
-async function revalidateRemovable(record: GcRecord, env: NodeJS.ProcessEnv): Promise<boolean> {
+async function revalidateRemovable(
+	record: GcRecord,
+	identity: CollectedTmuxIdentity,
+	env: NodeJS.ProcessEnv,
+): Promise<boolean> {
 	const tags = readTmuxSessionTagsForGc(record.id, env);
 	if (
-		tags.createdAt &&
-		record.detail?.includes("createdAt=") &&
-		!record.detail.includes(`createdAt=${tags.createdAt}`)
-	) {
+		tags.nativeSessionId !== identity.nativeSessionId ||
+		tags.ownerGeneration !== identity.ownerGeneration ||
+		tags.sessionId !== identity.sessionId ||
+		tags.sessionStateFile !== identity.sessionStateFile ||
+		tags.project !== identity.project ||
+		tags.createdAt !== identity.createdAt
+	)
 		return false;
-	}
 	if (tags.attached || (tags.panePids?.length ?? 0) > 0) return false;
 	if (tags.profile !== GJC_TMUX_PROFILE_VALUE) return false;
 	return await hasTerminalRuntimeMarker(tags);
@@ -205,7 +242,12 @@ export const tmuxSessionsGcAdapter: GcStoreAdapter = {
 
 		for (const session of sessions.tagged) {
 			try {
-				records.push(await classifyTaggedSession(session));
+				const record = await classifyTaggedSession(session);
+				records.push(record);
+				if (record.removable) {
+					const identity = collectedIdentity(session);
+					if (identity) collectedIdentities.set(record, identity);
+				}
 			} catch (error) {
 				errors.push({
 					store: STORE,
@@ -227,10 +269,11 @@ export const tmuxSessionsGcAdapter: GcStoreAdapter = {
 			return { removed: false, skipped: "not_removable_tmux_session" };
 		}
 		try {
-			if (!(await revalidateRemovable(record, ctx.env))) {
+			const identity = collectedIdentities.get(record);
+			if (!identity || !(await revalidateRemovable(record, identity, ctx.env))) {
 				return { removed: false, skipped: TOCTOU_SKIP };
 			}
-			removeGjcTmuxSession(record.id, ctx.env);
+			removeGjcTmuxSession(record.id, ctx.env, identity);
 			return { removed: true };
 		} catch (error) {
 			return { removed: false, error: error instanceof Error ? error.message : String(error) };
