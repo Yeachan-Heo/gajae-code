@@ -106,6 +106,9 @@ Mutating tools:
 - `gjc_coordinator_send_prompt`
 - `gjc_coordinator_submit_question_answer`
 - `gjc_coordinator_report_status`
+- `gjc_coordinator_stop_session`
+
+`gjc_coordinator_stop_session` terminates a coordinator-managed session through the owner-proof tmux shutdown path — it verifies the pane pid, native session id, owner generation, server key, and process start time before signaling, so it can never kill a PID-reused or foreign session — and then purges the session's coordinator state. It refuses a session that still has an active turn unless an explicit force is supplied, and it is the same reclamation path the idle reaper uses to reap abandoned ephemeral (delegate-created) sessions.
 
 High-level delegation tools:
 

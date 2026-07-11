@@ -26,7 +26,7 @@ import {
 	replaceOwnerGenerationSync,
 	type TmuxServerProof,
 } from "../gjc-runtime/tmux-owner-isolation";
-
+import { forceCloseGjcTmuxSession } from "../gjc-runtime/tmux-sessions";
 import {
 	assertCoordinatorArtifactPath,
 	assertCoordinatorWorkdir,
@@ -35,6 +35,7 @@ import {
 	coordinatorNamespacePath,
 	requireCoordinatorMutation,
 } from "./policy";
+import { createSessionReaper, type ReapableSession, type SessionReaper } from "./session-reaper";
 
 export type { CoordinatorToolName };
 export { COORDINATOR_MCP_PROTOCOL_VERSION, COORDINATOR_MCP_SERVER_NAME, COORDINATOR_MCP_TOOL_NAMES };
@@ -105,6 +106,12 @@ interface CoordinatorServices {
 	listSessions?: () => unknown[] | Promise<unknown[]>;
 	startSession?: (input: SessionStartInput) => unknown | Promise<unknown>;
 	commandRunner?: CommandRunner;
+	forceCloseSession?: (
+		sessionName: string,
+		env: NodeJS.ProcessEnv,
+		expectedSessionId?: string,
+		expectedStateFile?: string,
+	) => Promise<unknown>;
 	ownerIsolationProbe?: OwnerIsolationProbe;
 }
 
@@ -215,6 +222,7 @@ interface CoordinatorSessionState {
 type CoordinatorEventKind =
 	| "session.registered"
 	| "session.started"
+	| "session.reaped"
 	| "session.state_changed"
 	| "turn.queued"
 	| "turn.delivering"
@@ -342,6 +350,26 @@ function toolSchema(name: CoordinatorToolName): {
 					allow_mutation: allowMutation,
 				},
 				required: ["cwd", "allow_mutation"],
+			},
+		};
+	}
+	if (name === "gjc_coordinator_stop_session") {
+		return {
+			name,
+			description:
+				"Reap a coordinator delegate-created (ephemeral) session: terminate its owner via the owner-proof forceCloseGjcTmuxSession, then purge its state files only on verified termination. Never touches non-ephemeral (user-registered) sessions unless force is set AND the force-stop capability is enabled.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					session_id: sessionId,
+					force: {
+						type: "boolean",
+						description: "Reap a non-ephemeral session; requires the GJC_COORDINATOR_MCP_FORCE_STOP capability.",
+					},
+					reason: { type: "string", description: "Optional audit reason recorded on the session.reaped event." },
+					allow_mutation: allowMutation,
+				},
+				required: ["session_id", "allow_mutation"],
 			},
 		};
 	}
@@ -744,6 +772,7 @@ const COORDINATOR_SESSION_STATES = new Set<CoordinatorSessionStateValue>([
 const COORDINATOR_EVENT_KINDS = new Set<CoordinatorEventKind>([
 	"session.registered",
 	"session.started",
+	"session.reaped",
 	"session.state_changed",
 	"turn.queued",
 	"turn.delivering",
@@ -2995,6 +3024,98 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	function sessionFile(sessionId: unknown): string {
 		return path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`);
 	}
+	const forceCloseSession =
+		services.forceCloseSession ??
+		((name: string, targetEnv: NodeJS.ProcessEnv, expectedSessionId?: string, expectedStateFile?: string) =>
+			forceCloseGjcTmuxSession(name, targetEnv, expectedSessionId, expectedStateFile));
+
+	// Reap a coordinator delegate-created (ephemeral) session. Addresses the #2034 review:
+	//  - terminates via the owner-proof forceCloseGjcTmuxSession (pid + native session_id +
+	//    generation + server_key + start_time verified atomically) — never a raw process.kill,
+	//    so a recycled PID can never signal a foreign process.
+	//  - re-validates ephemeral + no-active-turn AT kill time under a per-session lock, closing
+	//    the select→kill TOCTOU and races with concurrent send_prompt / delegate / stop.
+	//  - purges state files ONLY on verified termination; on failure the record is kept for retry
+	//    and no session.reaped event is emitted (honest audit, no worse leak).
+	async function reapSession(
+		rawId: unknown,
+		opts: { force?: boolean; reason?: string } = {},
+	): Promise<{ ok: boolean; reason?: string; killed: boolean; active_turn_id?: string; detail?: string }> {
+		const id = safeExternalId("session", rawId);
+		return await withSessionMutation(`${namespaceDir}::${id}`, async () => {
+			const record = asRecord(await readJsonFile(sessionFile(id)));
+			if (!record) return { ok: false, reason: "unknown_session", killed: false };
+			if (record.ephemeral !== true && opts.force !== true) {
+				return { ok: false, reason: "not_ephemeral", killed: false };
+			}
+			const activeTurn = await readActiveTurn(namespaceDir, id);
+			if (activeTurn) {
+				return { ok: false, reason: "active_turn", killed: false, active_turn_id: activeTurn.turn_id };
+			}
+			const tmuxSession = optionalString(record.tmux_session) ?? optionalString(record.tmuxSession);
+			let killed = false;
+			if (tmuxSession) {
+				const expectedStateFile = optionalString(record.sessionStateFile) ?? undefined;
+				try {
+					await forceCloseSession(tmuxSession, env, undefined, expectedStateFile);
+					killed = true;
+				} catch (err) {
+					return {
+						ok: false,
+						reason: "terminate_failed",
+						detail: err instanceof Error ? err.message : String(err),
+						killed: false,
+					};
+				}
+			}
+			// Purge the session record FIRST so a partial rm failure can never re-list → re-reap →
+			// emit a duplicate session.reaped. `killed` is honest: false when nothing was signalled.
+			await fs.rm(sessionFile(id), { force: true });
+			await appendCoordinatorEvent(namespaceDir, {
+				kind: "session.reaped",
+				sessionId: id,
+				summary: `Session ${id} reaped${opts.reason ? ` (${opts.reason})` : ""}`,
+				metadata: { reason: opts.reason ?? null, force: opts.force === true, killed },
+			});
+			await fs.rm(sessionStateFile(namespaceDir, id), { force: true });
+			await fs.rm(activeTurnFile(namespaceDir, id), { force: true });
+			return { ok: true, killed };
+		});
+	}
+
+	const sessionReaper: SessionReaper = createSessionReaper(
+		{
+			listSessions: async (): Promise<ReapableSession[]> => {
+				const out: ReapableSession[] = [];
+				for (const raw of await listSessions()) {
+					try {
+						const rec = asRecord(raw);
+						if (rec?.ephemeral !== true) continue;
+						const sid = optionalString(rec.session_id);
+						if (!sid) continue;
+						const activeTurn = await readActiveTurn(namespaceDir, sid);
+						const state = await readSessionState(namespaceDir, sid);
+						const stamp = optionalString(state?.updated_at) ?? optionalString(rec.created_at);
+						const lastActivityMs = stamp ? Date.parse(stamp) : 0;
+						out.push({
+							sessionId: sid,
+							ephemeral: true,
+							hasActiveTurn: activeTurn !== null,
+							lastActivityMs: Number.isFinite(lastActivityMs) ? lastActivityMs : 0,
+						});
+					} catch {
+						// A single corrupt session/state file must not abort the whole sweep — skip it.
+					}
+				}
+				return out;
+			},
+			reapSession: async (sid: string): Promise<void> => {
+				await reapSession(sid, { reason: "idle_reaper" });
+			},
+			now: () => Date.now(),
+		},
+		{ idleTtlMs: config.sessionIdleTtlMs, sweepIntervalMs: config.sessionSweepIntervalMs },
+	);
 	async function compensateFailedOwnerStart(
 		session: Record<string, unknown>,
 		ownerTransaction: {
@@ -3508,6 +3629,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						rollback?: () => Promise<"cleaned" | "failed" | "unverifiable">;
 					} | null;
 					session = normalizeSession(startedRecord);
+					// Delegate-created sessions are ephemeral: the idle reaper may reclaim them once
+					// idle past the TTL with no active turn. User-registered sessions are never flagged.
+					session.ephemeral = true;
 					try {
 						await writeJsonFile(sessionFile(session.session_id), session);
 						await appendCoordinatorEvent(namespaceDir, {
@@ -3534,31 +3658,43 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				}
 
 				const sessionId = String(session.session_id);
-				const activeTurn = reusedSession ? await readActiveTurn(namespaceDir, sessionId) : null;
-				if (activeTurn && args.force !== true && args.queue !== true) {
-					return {
-						ok: false,
-						reason: "active_turn_exists",
-						session_id: sessionId,
-						active_turn_id: activeTurn.turn_id,
-					};
-				}
-				if (activeTurn && args.force === true) {
-					const timestamp = new Date().toISOString();
-					const superseded = {
-						...activeTurn,
-						status: "superseded" as const,
-						updated_at: timestamp,
-						completed_at: timestamp,
-					};
-					await writeTurnRecord(namespaceDir, superseded);
-					await clearActiveTurn(namespaceDir, superseded);
-				}
-				const shouldQueue = args.queue === true && args.force !== true && !!activeTurn;
-				const turn = shouldQueue
-					? makeTurnRecord(config, sessionId, taggedPrompt, "queued")
-					: await activateTurn(session, makeTurnRecord(config, sessionId, taggedPrompt, "active"));
-				if (shouldQueue) await writeTurnRecord(namespaceDir, turn);
+				// Serialize the reused-session read-active-turn → activate critical section on the
+				// same per-session lock the reaper/stop_session/send_prompt use, so the idle reaper
+				// can never reap a session between this read and activateTurn (lost work + orphaned
+				// turn/state files). The long await_completion poll below stays OUTSIDE the lock.
+				const turnMutation = await withSessionMutation(`${namespaceDir}::${sessionId}`, async () => {
+					const activeTurn = reusedSession ? await readActiveTurn(namespaceDir, sessionId) : null;
+					if (activeTurn && args.force !== true && args.queue !== true) {
+						return {
+							kind: "conflict" as const,
+							response: {
+								ok: false as const,
+								reason: "active_turn_exists" as const,
+								session_id: sessionId,
+								active_turn_id: activeTurn.turn_id,
+							},
+						};
+					}
+					if (activeTurn && args.force === true) {
+						const timestamp = new Date().toISOString();
+						const superseded = {
+							...activeTurn,
+							status: "superseded" as const,
+							updated_at: timestamp,
+							completed_at: timestamp,
+						};
+						await writeTurnRecord(namespaceDir, superseded);
+						await clearActiveTurn(namespaceDir, superseded);
+					}
+					const shouldQueue = args.queue === true && args.force !== true && !!activeTurn;
+					const turn = shouldQueue
+						? makeTurnRecord(config, sessionId, taggedPrompt, "queued")
+						: await activateTurn(session, makeTurnRecord(config, sessionId, taggedPrompt, "active"));
+					if (shouldQueue) await writeTurnRecord(namespaceDir, turn);
+					return { kind: "ok" as const, activeTurn, shouldQueue, turn };
+				});
+				if (turnMutation.kind === "conflict") return turnMutation.response;
+				const { activeTurn, shouldQueue, turn } = turnMutation;
 				await appendCoordinatorEvent(namespaceDir, {
 					kind: "delegation.started",
 					sessionId,
@@ -3628,6 +3764,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					}
 				}
 				return base;
+			}
+			if (name === "gjc_coordinator_stop_session") {
+				requireCoordinatorMutation(config, "sessions", args);
+				const sessionId = safeExternalId("session", args.session_id);
+				const forceRequested = args.force === true;
+				// force is a capability distinct from allow_mutation: reaping a non-ephemeral
+				// (user-registered) session requires GJC_COORDINATOR_MCP_FORCE_STOP to be enabled.
+				if (forceRequested && !config.forceStopEnabled) {
+					return { ok: false, reason: "force_not_authorized", session_id: sessionId, killed: false };
+				}
+				const result = await reapSession(sessionId, {
+					force: forceRequested,
+					reason: optionalString(args.reason) ?? "stop_session",
+				});
+				return {
+					ok: result.ok,
+					session_id: sessionId,
+					killed: result.killed,
+					...(result.reason ? { reason: result.reason } : {}),
+					...(result.active_turn_id ? { active_turn_id: result.active_turn_id } : {}),
+					...(result.detail ? { detail: result.detail } : {}),
+				};
 			}
 			if (name === "gjc_coordinator_start_session") {
 				requireCoordinatorMutation(config, "sessions", args);
@@ -4067,7 +4225,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
-	return { config, callTool, handleJsonRpc, handle: handleJsonRpc };
+	return { config, callTool, handleJsonRpc, handle: handleJsonRpc, reapSession, sessionReaper };
 }
 
 function legacyToolResult(payload: unknown): {
@@ -4281,12 +4439,17 @@ export async function pumpCoordinatorMcpStream(
 
 export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
 	const server = createCoordinatorMcpServer(options);
-	await pumpCoordinatorMcpStream(
-		request => server.handleJsonRpc(request),
-		process.stdin,
-		line =>
-			new Promise<void>((resolve, reject) => {
-				process.stdout.write(line, err => (err ? reject(err) : resolve()));
-			}),
-	);
+	server.sessionReaper.start(); // background idle-reap of ephemeral delegate sessions
+	try {
+		await pumpCoordinatorMcpStream(
+			request => server.handleJsonRpc(request),
+			process.stdin,
+			line =>
+				new Promise<void>((resolve, reject) => {
+					process.stdout.write(line, err => (err ? reject(err) : resolve()));
+				}),
+		);
+	} finally {
+		server.sessionReaper.stop();
+	}
 }
