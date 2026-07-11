@@ -23,4 +23,15 @@ describe("Grok CLI payload sanitize", () => {
 		expect(payload.reasoning).toBeUndefined();
 		expect(payload.prompt_cache_key).toBe("session-1");
 	});
+
+	it("caps Grok 4.5 and its official aliases at the documented high effort", () => {
+		for (const modelId of ["grok-4.5", "grok-4.5-latest", "grok-build-latest"]) {
+			const efforts = ["minimal", "low", "medium", "high", "xhigh", "max"].map(requested => {
+				const payload = sanitizePayload({ reasoning: { effort: requested } }, modelId, undefined, process.cwd());
+				return (payload.reasoning as { effort: string }).effort;
+			});
+
+			expect(efforts).toEqual(["low", "low", "medium", "high", "high", "high"]);
+		}
+	});
 });

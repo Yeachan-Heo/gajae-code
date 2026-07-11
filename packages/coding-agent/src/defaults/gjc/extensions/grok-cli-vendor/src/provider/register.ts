@@ -36,7 +36,11 @@ export default function registerGrokCli(api: ExtensionAPI) {
       name: m.name,
       reasoning: m.reasoning,
       thinking: m.reasoning
-        ? { minLevel: Effort.Low, maxLevel: Effort.XHigh, mode: 'effort' }
+        ? {
+            minLevel: Effort.Low,
+            maxLevel: m.maxReasoningEffort ?? Effort.XHigh,
+            mode: 'effort',
+          }
         : undefined,
       input: m.input,
       cost: m.cost,
