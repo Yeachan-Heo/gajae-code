@@ -120,6 +120,46 @@ async function readPipedInput(): Promise<string | undefined> {
 	}
 }
 
+export interface LaunchDisposition {
+	autoPrint: boolean;
+	isInteractive: boolean;
+	/** Set when an interactive launch is impossible (non-TTY stdin, nothing to run). */
+	nonInteractiveError?: string;
+}
+
+/**
+ * Decides between interactive, auto-print, and fail-fast launches.
+ *
+ * A non-TTY stdin means the TUI can never receive input, so an interactive
+ * launch would execute the initial prompt (real token spend) and then block in
+ * the event loop forever — observed as orphaned `gjc <words> </dev/null`
+ * processes holding session transcripts and sqlite handles for hours. With
+ * command-line messages we degrade to print mode (same as piped input);
+ * without any work to run we fail fast instead of hanging. Explicit `--print`
+ * and `--mode` launches (rpc/acp/bridge run over non-TTY stdio) are untouched.
+ */
+export function resolveLaunchDisposition(args: {
+	stdinIsTTY: boolean;
+	pipedInput: string | undefined;
+	hasMessages: boolean;
+	print: boolean;
+	mode: string | undefined;
+}): LaunchDisposition {
+	const modeSet = args.mode !== undefined;
+	const nonTtyWithPrompt = !args.stdinIsTTY && args.hasMessages;
+	const autoPrint = (args.pipedInput !== undefined || nonTtyWithPrompt) && !args.print && !modeSet;
+	const isInteractive = !args.print && !autoPrint && !modeSet;
+	if (isInteractive && !args.stdinIsTTY) {
+		return {
+			autoPrint: false,
+			isInteractive: false,
+			nonInteractiveError:
+				"stdin is not a TTY and no prompt was provided; use -p/--print (or pass a prompt) for non-interactive runs.",
+		};
+	}
+	return { autoPrint, isInteractive };
+}
+
 export interface InteractiveModeNotify {
 	kind: "warn" | "error" | "info";
 	message: string;
@@ -858,8 +898,18 @@ export async function runRootCommand(
 		fileImages,
 		stdinContent: pipedInput,
 	});
-	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
-	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
+	const disposition = resolveLaunchDisposition({
+		stdinIsTTY: process.stdin.isTTY === true,
+		pipedInput,
+		hasMessages: parsedArgs.messages.length > 0,
+		print: Boolean(parsedArgs.print),
+		mode: parsedArgs.mode,
+	});
+	if (disposition.nonInteractiveError) {
+		process.stderr.write(`${chalk.red(disposition.nonInteractiveError)}\n`);
+		process.exit(1);
+	}
+	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
 
 	// Initialize discovery system with settings for provider persistence
