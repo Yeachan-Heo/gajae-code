@@ -477,7 +477,7 @@ export class Settings {
 	}
 
 	/**
-	 * Set a model role (helper for modelRoles record).
+	 * Set a model role while keeping a project/profile-shadowed live value aligned.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string): void {
 		const current = shallowStringRecord(getByPath(this.#global, ["modelRoles"]));
@@ -490,16 +490,17 @@ export class Settings {
 
 		this.set("modelRoles", { ...current, [role]: modelId });
 
-		if (updateRuntimeOverride) {
+		if (updateRuntimeOverride || this.get("modelRoles")[role] !== modelId) {
 			this.override("modelRoles", { ...shallowStringRecord(runtimeOverrides), [role]: modelId });
 		}
 	}
 	/**
-	 * Set an agent model override while keeping any live runtime override aligned.
+	 * Set an agent model override while keeping any live project/profile override aligned.
 	 *
-	 * Runtime model profiles override `task.agentModelOverrides` for the current
-	 * session. A user-selected role assignment must win immediately in that same
-	 * session, but only the explicit agent change should be persisted.
+	 * Runtime model profiles and project settings can override
+	 * `task.agentModelOverrides` for the current session. A user-selected role
+	 * assignment must win immediately in that same session, but only the explicit
+	 * agent change should be persisted.
 	 */
 	setAgentModelOverride(agentName: string, modelId: string): void {
 		const current = shallowStringRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
@@ -509,7 +510,7 @@ export class Settings {
 
 		this.set("task.agentModelOverrides", { ...current, [agentName]: modelId });
 
-		if (updateRuntimeOverride) {
+		if (updateRuntimeOverride || this.get("task.agentModelOverrides")[agentName] !== modelId) {
 			this.override("task.agentModelOverrides", {
 				...shallowStringRecord(runtimeOverrides),
 				[agentName]: modelId,

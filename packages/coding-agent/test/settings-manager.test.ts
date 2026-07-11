@@ -236,6 +236,79 @@ describe("Settings", () => {
 				planner: "user/planner:high",
 			});
 		});
+
+		it("keeps model assignments live when project settings shadow global persistence", async () => {
+			await writeSettings({
+				modelRoles: { default: "global/default" },
+				task: {
+					agentModelOverrides: {
+						executor: "global/executor",
+					},
+				},
+			});
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "config.yml"),
+				YAML.stringify(
+					{
+						modelRoles: { default: "project/default" },
+						task: {
+							agentModelOverrides: {
+								executor: "project/executor",
+								architect: "project/architect",
+								planner: "project/planner",
+								critic: "project/critic",
+							},
+						},
+					},
+					null,
+					2,
+				),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.getModelRole("default")).toBe("project/default");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "project/executor",
+				architect: "project/architect",
+				planner: "project/planner",
+				critic: "project/critic",
+			});
+
+			settings.setModelRole("default", "openai-codex/gpt-5.6-sol:xhigh");
+			for (const role of ["executor", "architect", "planner", "critic"]) {
+				settings.setAgentModelOverride(role, "openai-codex/gpt-5.6-sol:xhigh");
+			}
+
+			expect(settings.getModelRole("default")).toBe("openai-codex/gpt-5.6-sol:xhigh");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "openai-codex/gpt-5.6-sol:xhigh",
+				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				planner: "openai-codex/gpt-5.6-sol:xhigh",
+				critic: "openai-codex/gpt-5.6-sol:xhigh",
+			});
+
+			await settings.flushOrThrow();
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelRoles).toEqual({ default: "openai-codex/gpt-5.6-sol:xhigh" });
+			expect(savedSettings.task).toEqual({
+				agentModelOverrides: {
+					executor: "openai-codex/gpt-5.6-sol:xhigh",
+					architect: "openai-codex/gpt-5.6-sol:xhigh",
+					planner: "openai-codex/gpt-5.6-sol:xhigh",
+					critic: "openai-codex/gpt-5.6-sol:xhigh",
+				},
+			});
+
+			settings.clearOverride("modelRoles");
+			settings.clearOverride("task.agentModelOverrides");
+			expect(settings.getModelRole("default")).toBe("project/default");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "project/executor",
+				architect: "project/architect",
+				planner: "project/planner",
+				critic: "project/critic",
+			});
+		});
 	});
 
 	describe("migrations", () => {
