@@ -11569,55 +11569,33 @@ export class AgentSession {
 	}
 
 	/**
-	 * Conservative inflation applied to the native-free chars/4 estimate of the
-	 * UNSENT context delta. chars/4 undercounts dense code/CJK, so we bias high
-	 * to compact slightly early rather than overflow the model window before the
-	 * next provider response re-anchors the exact count.
+	 * Conservative inflation applied to the native-free estimate of the UNSENT
+	 * context delta. The heuristic is script-aware (CJK counted ~1 token/char),
+	 * but dense non-CJK content (compact JSON, diffs, hashes) can still exceed
+	 * chars/4, so we bias high to compact slightly early rather than overflow
+	 * the model window before the next provider response re-anchors the count.
 	 */
 	#compactionDeltaInflation = 1.2;
-	#compactionDeltaTokenCache = new WeakMap<AgentMessage, { len: number; tokens: number }>();
-
-	/**
-	 * Cheap content-size signal to invalidate the compaction-delta token cache on mutation. Recursively
-	 * sums string lengths across the whole message (depth-bounded), so it covers every
-	 * provider-visible shape (text/thinking/tool args, toolResult output, tool names, etc.)
-	 * without allocating a serialized copy. A size-preserving in-place edit yields only a
-	 * benign estimate drift.
-	 */
-	#messageTokenSize(value: unknown, depth = 0): number {
-		if (depth > 6) return 0;
-		if (typeof value === "string") return value.length;
-		if (typeof value === "number" || typeof value === "boolean") return 8;
-		if (Array.isArray(value)) {
-			let size = 0;
-			for (const item of value) size += this.#messageTokenSize(item, depth + 1);
-			return size;
-		}
-		if (value && typeof value === "object") {
-			let size = 0;
-			for (const item of Object.values(value)) size += this.#messageTokenSize(item, depth + 1);
-			return size;
-		}
-		return 0;
-	}
 
 	#estimateMessageCompactionDeltaTokens(message: AgentMessage): number {
 		// Provider usage anchors the already-sent context (see calculateContextTokens); this
-		// estimates only the UNSENT delta with the native-free chars/4 heuristic, inflated by
+		// estimates only the UNSENT delta with the script-aware heuristic, inflated by
 		// #compactionDeltaInflation so dense input cannot undercount us past the compaction
-		// threshold before the next provider response re-anchors the exact count. Cached per
-		// message object, invalidated by a cheap content-size signal; a rare size-preserving
-		// in-place edit yields only a benign estimate drift, never wrong output.
-		const len = this.#messageTokenSize(message);
-		const cached = this.#compactionDeltaTokenCache.get(message);
-		if (cached && cached.len === len) return cached.tokens;
+		// threshold before the next provider response re-anchors the exact count.
+		//
+		// Deliberately uncached: this feeds the compaction-threshold decision, and a
+		// stale estimate after an in-place mutation (e.g. a same-length ASCII→CJK
+		// edit, which changes the script-aware estimate up to 4x) could hold the
+		// session under the threshold while the real prompt overflows. Any cheap
+		// invalidation signal short of recomputing the estimator's own converted
+		// fragments provably admits stale reuse, and the call sites run once per
+		// prompt over the few messages trailing the usage anchor, so correctness
+		// wins over a microcache here.
 		let heuristic = 0;
 		for (const llmMessage of convertToLlm([message])) {
 			heuristic += estimateMessageTokensHeuristic(llmMessage);
 		}
-		const tokens = Math.ceil(heuristic * this.#compactionDeltaInflation);
-		this.#compactionDeltaTokenCache.set(message, { len, tokens });
-		return tokens;
+		return Math.ceil(heuristic * this.#compactionDeltaInflation);
 	}
 
 	/**
