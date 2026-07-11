@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The native-free token heuristic is now script-aware: common-BMP CJK characters (Hangul, unified/compat Han, Kana, CJK punctuation, full-width forms) are charged at 1 token each (measured o200k_base upper bound 0.96 tokens/char) and supplementary code points (surrogate pairs: rare Han extensions, emoji) at 1 token per code point, instead of chars/4 for everything. The old estimate undercounted Korean/CJK-heavy unsent context by 2–4x and could delay threshold compaction past the provider window; ASCII estimates are unchanged. `boundConversationTextForSummary` now derives its truncation cut from the text's own estimated token density, validates the complete assembled excerpt (elision marker included) against the estimator, and fails closed — bare marker only when the marker itself fits the budget, otherwise an empty excerpt, including when the computed input budget is non-positive — instead of assuming 4 chars/token and returning over-budget or unbounded text.
+
 ## [0.9.2] - 2026-07-09
 
 ### Fixed

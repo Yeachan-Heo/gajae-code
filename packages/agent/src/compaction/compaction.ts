@@ -405,7 +405,61 @@ function countCollectedMessageFragments(collected: { fragments: string[]; extra:
 const HEURISTIC_BYTES_PER_TOKEN = 4;
 
 /**
- * Native-free chars/4 token estimate for a message. This is the only message
+ * Token-dense character weight for the script-aware heuristic.
+ *
+ * Common-BMP CJK blocks (Hangul, unified/compat Han, Kana, CJK punctuation,
+ * full-width forms) tokenize at ~0.6–1.0 tokens per character under
+ * o200k-class BPE vocabularies (measured o200k_base: Hangul prose 0.604,
+ * spaceless Hangul 0.964, Han 0.793, Kana 0.740 tokens/char — versus the
+ * 0.25 the chars/4 heuristic assumes). Each such character is charged 1
+ * token: an upper bound for these measured blocks whose only failure mode is
+ * compacting slightly early, while undercounting risks overflowing the
+ * provider window.
+ *
+ * Surrogate code units are charged 0.5 each, i.e. 1 token per supplementary
+ * code point (supplementary Han extensions, emoji, and other astral chars).
+ * That is a floor rather than an upper bound — rare ideographs and emoji can
+ * cost several tokens — but it is strictly safer than the 0.5-per-pair the
+ * plain chars/4 rule produced.
+ */
+function tokenDenseCharWeight(text: string): { weight: number; units: number } {
+	let weight = 0;
+	let units = 0;
+	for (let i = 0; i < text.length; i++) {
+		const c = text.charCodeAt(i);
+		if (
+			(c >= 0x1100 && c <= 0x11ff) || // Hangul Jamo
+			(c >= 0x3000 && c <= 0x303f) || // CJK symbols & punctuation
+			(c >= 0x3040 && c <= 0x30ff) || // Hiragana & Katakana
+			(c >= 0x3130 && c <= 0x318f) || // Hangul compatibility Jamo
+			(c >= 0x3400 && c <= 0x4dbf) || // CJK ideographs extension A
+			(c >= 0x4e00 && c <= 0x9fff) || // CJK unified ideographs
+			(c >= 0xac00 && c <= 0xd7af) || // Hangul syllables
+			(c >= 0xf900 && c <= 0xfaff) || // CJK compatibility ideographs
+			(c >= 0xff00 && c <= 0xffef) // Half/full-width forms
+		) {
+			weight += 1;
+			units += 1;
+		} else if (c >= 0xd800 && c <= 0xdfff) {
+			// Surrogate half: a supplementary code point contributes two units.
+			weight += 0.5;
+			units += 1;
+		}
+	}
+	return { weight, units };
+}
+
+/**
+ * Script-aware native-free token estimate for a plain string fragment:
+ * token-dense characters cost ~1 token each, everything else chars/4.
+ */
+function estimateFragmentTokensHeuristic(fragment: string): { dense: number; otherChars: number } {
+	const { weight, units } = tokenDenseCharWeight(fragment);
+	return { dense: weight, otherChars: fragment.length - units };
+}
+
+/**
+ * Native-free token estimate for a message. This is the only message
  * token estimator: provider usage (see {@link calculatePromptTokens}) anchors
  * the already-sent context, and this covers unsent/trailing deltas, per-entry
  * budgeting, and display surfaces. Callers add a conservative inflation factor
@@ -413,24 +467,23 @@ const HEURISTIC_BYTES_PER_TOKEN = 4;
  */
 export function estimateMessageTokensHeuristic(message: AgentMessage): number {
 	const { fragments, extra } = collectMessageFragments(message);
-	let bytes = 0;
-	for (const fragment of fragments) {
-		bytes += fragment.length;
-	}
-	return extra + Math.ceil(bytes / HEURISTIC_BYTES_PER_TOKEN);
+	return extra + estimateTextTokensHeuristic(fragments);
 }
 
 /**
- * Native-free chars/4 token estimate for plain string fragments. Fragment-level
- * counterpart of {@link estimateMessageTokensHeuristic}.
+ * Script-aware native-free token estimate for plain string fragments.
+ * Fragment-level counterpart of {@link estimateMessageTokensHeuristic}.
  */
 export function estimateTextTokensHeuristic(fragments: string | readonly string[]): number {
-	if (typeof fragments === "string") return Math.ceil(fragments.length / HEURISTIC_BYTES_PER_TOKEN);
-	let bytes = 0;
-	for (const fragment of fragments) {
-		bytes += fragment.length;
+	const list = typeof fragments === "string" ? [fragments] : fragments;
+	let dense = 0;
+	let otherChars = 0;
+	for (const fragment of list) {
+		const counts = estimateFragmentTokensHeuristic(fragment);
+		dense += counts.dense;
+		otherChars += counts.otherChars;
 	}
-	return Math.ceil(bytes / HEURISTIC_BYTES_PER_TOKEN);
+	return Math.ceil(dense + Math.max(0, otherChars) / HEURISTIC_BYTES_PER_TOKEN);
 }
 
 /** Shared content walk for both the native and heuristic estimators. */
@@ -760,8 +813,8 @@ export interface SummaryOptions {
  * on the very overflow the recovery was meant to absorb.
  *
  * The budget reserves the summary's own output tokens plus prompt/system/template
- * overhead, and applies a conservative safety factor because the chars/4 heuristic
- * undercounts dense or CJK text (the reason the original overflow was missed).
+ * overhead, and applies a conservative safety factor for estimator error on
+ * dense text (the reason the original overflow was missed).
  * Truncation keeps the head (origin/goals) and the tail (most recent state) and
  * elides the middle; it is a last resort that only triggers when the input would
  * otherwise not fit.
@@ -779,16 +832,43 @@ export function boundConversationTextForSummary(
 	const inputBudgetTokens = Math.floor(
 		(contextWindow - Math.max(0, outputMaxTokens) - OVERHEAD_TOKENS) * SAFETY_FACTOR,
 	);
-	if (inputBudgetTokens <= 0) return conversationText;
-	if (estimateTextTokensHeuristic(conversationText) <= inputBudgetTokens) return conversationText;
+	const totalEstimatedTokens = estimateTextTokensHeuristic(conversationText);
+	const assemble = (head: string, tail: string): string => {
+		const elided = conversationText.length - head.length - tail.length;
+		return `${head}\n\n[... ${elided} characters of older conversation elided so this summarization request fits within the model context window ...]\n\n${tail}`;
+	};
+	const bareMarker = assemble("", "");
+	const fitsBudget = (candidate: string) => estimateTextTokensHeuristic(candidate) <= inputBudgetTokens;
+	if (inputBudgetTokens <= 0) {
+		// A window this small cannot fit any excerpt (not even the marker).
+		// Fail closed with an empty excerpt rather than submitting text into a
+		// request that is guaranteed to overflow.
+		return "";
+	}
+	if (totalEstimatedTokens <= inputBudgetTokens) return conversationText;
 
-	const budgetChars = inputBudgetTokens * HEURISTIC_BYTES_PER_TOKEN;
-	const headChars = Math.floor(budgetChars * 0.35);
-	const tailChars = Math.max(0, budgetChars - headChars);
-	const head = conversationText.slice(0, headChars);
-	const tail = tailChars > 0 ? conversationText.slice(conversationText.length - tailChars) : "";
-	const elided = conversationText.length - head.length - tail.length;
-	return `${head}\n\n[... ${elided} characters of older conversation elided so this summarization request fits within the model context window ...]\n\n${tail}`;
+	// Derive the character budget from the text's own measured token density
+	// instead of assuming 4 chars/token: a CJK-heavy conversation runs near
+	// 1 token/char, and a fixed 4-chars/token cut would overshoot the budget
+	// by up to ~4x — re-overflowing the very request this bound protects.
+	// Verify the complete assembled candidate (elision marker included)
+	// against the estimator and shrink until it fits.
+	const charsPerToken = conversationText.length / totalEstimatedTokens;
+	let budgetChars = Math.floor(inputBudgetTokens * charsPerToken);
+	for (let attempt = 0; attempt < 12 && budgetChars > 0; attempt++) {
+		const headChars = Math.floor(budgetChars * 0.35);
+		const tailChars = Math.max(0, budgetChars - headChars);
+		const head = conversationText.slice(0, headChars);
+		const tail = tailChars > 0 ? conversationText.slice(conversationText.length - tailChars) : "";
+		const assembled = assemble(head, tail);
+		if (fitsBudget(assembled)) return assembled;
+		budgetChars = Math.floor(budgetChars * 0.8);
+	}
+	// All attempts overshot (adversarially non-uniform density, or a budget
+	// smaller than the marker itself). Fail closed: return the bare marker
+	// only when it fits the budget, else an empty excerpt — never an
+	// over-budget result.
+	return fitsBudget(bareMarker) ? bareMarker : "";
 }
 
 export async function generateSummary(
