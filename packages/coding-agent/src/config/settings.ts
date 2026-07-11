@@ -149,6 +149,17 @@ function shallowStringRecord(value: unknown): Record<string, string> {
 	}
 	return result;
 }
+function shallowStringOrNullRecord(value: unknown): Record<string, string | null> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+
+	const result: Record<string, string | null> = {};
+	for (const [key, item] of Object.entries(value)) {
+		if (typeof item === "string" || item === null) {
+			result[key] = item;
+		}
+	}
+	return result;
+}
 
 function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, cwd: string): string[] | undefined {
 	if (!PATH_SCOPED_ARRAY_SETTINGS.has(settingPath) || !Array.isArray(value)) return undefined;
@@ -291,6 +302,9 @@ export class Settings {
 		const segments = path.split(".");
 		const value = getByPath(this.#merged, segments);
 		if (value !== undefined) {
+			if (path === "modelRoles" || path === "task.agentModelOverrides") {
+				return shallowStringRecord(value) as SettingValue<P>;
+			}
 			const pathScopedValue = resolvePathScopedStringArray(path, value, this.#cwd);
 			return (pathScopedValue ?? value) as SettingValue<P>;
 		}
@@ -477,7 +491,33 @@ export class Settings {
 	}
 
 	/**
-	 * Set a model role (helper for modelRoles record).
+	 * Replace a null/scalar runtime record reset with leaf tombstones plus the
+	 * selected value, so lower-precedence sibling roles remain reset.
+	 */
+	#overrideRuntimeModelRecord(
+		path: "modelRoles" | "task.agentModelOverrides",
+		currentOverride: unknown,
+		key: string,
+		modelId: string,
+	): void {
+		const next: RawSettings = shallowStringOrNullRecord(currentOverride);
+		const currentOverrideIsRecord =
+			!!currentOverride && typeof currentOverride === "object" && !Array.isArray(currentOverride);
+		if (currentOverride !== undefined && !currentOverrideIsRecord) {
+			const segments = path.split(".");
+			for (const source of [this.#global, this.#project]) {
+				for (const lowerKey of Object.keys(shallowStringRecord(getByPath(source, segments)))) {
+					if (!Object.hasOwn(next, lowerKey)) next[lowerKey] = null;
+				}
+			}
+		}
+		next[key] = modelId;
+		setByPath(this.#overrides, path.split("."), next);
+		this.#rebuildMerged();
+	}
+
+	/**
+	 * Set a model role while keeping a project/profile-shadowed live value aligned.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string): void {
 		const current = shallowStringRecord(getByPath(this.#global, ["modelRoles"]));
@@ -490,16 +530,17 @@ export class Settings {
 
 		this.set("modelRoles", { ...current, [role]: modelId });
 
-		if (updateRuntimeOverride) {
-			this.override("modelRoles", { ...shallowStringRecord(runtimeOverrides), [role]: modelId });
+		if (updateRuntimeOverride || this.get("modelRoles")[role] !== modelId) {
+			this.#overrideRuntimeModelRecord("modelRoles", runtimeOverrides, role, modelId);
 		}
 	}
 	/**
-	 * Set an agent model override while keeping any live runtime override aligned.
+	 * Set an agent model override while keeping any live project/profile override aligned.
 	 *
-	 * Runtime model profiles override `task.agentModelOverrides` for the current
-	 * session. A user-selected role assignment must win immediately in that same
-	 * session, but only the explicit agent change should be persisted.
+	 * Runtime model profiles and project settings can override
+	 * `task.agentModelOverrides` for the current session. A user-selected role
+	 * assignment must win immediately in that same session, but only the explicit
+	 * agent change should be persisted.
 	 */
 	setAgentModelOverride(agentName: string, modelId: string): void {
 		const current = shallowStringRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
@@ -509,11 +550,8 @@ export class Settings {
 
 		this.set("task.agentModelOverrides", { ...current, [agentName]: modelId });
 
-		if (updateRuntimeOverride) {
-			this.override("task.agentModelOverrides", {
-				...shallowStringRecord(runtimeOverrides),
-				[agentName]: modelId,
-			});
+		if (updateRuntimeOverride || this.get("task.agentModelOverrides")[agentName] !== modelId) {
+			this.#overrideRuntimeModelRecord("task.agentModelOverrides", runtimeOverrides, agentName, modelId);
 		}
 	}
 

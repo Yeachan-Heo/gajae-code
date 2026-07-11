@@ -236,6 +236,152 @@ describe("Settings", () => {
 				planner: "user/planner:high",
 			});
 		});
+
+		it("keeps model assignments live when project settings shadow global persistence", async () => {
+			await writeSettings({
+				modelRoles: { default: "global/default" },
+				task: {
+					agentModelOverrides: {
+						executor: "global/executor",
+					},
+				},
+			});
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "config.yml"),
+				YAML.stringify(
+					{
+						modelRoles: { default: "project/default" },
+						task: {
+							agentModelOverrides: {
+								executor: "project/executor",
+								architect: "project/architect",
+								planner: "project/planner",
+								critic: "project/critic",
+							},
+						},
+					},
+					null,
+					2,
+				),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.getModelRole("default")).toBe("project/default");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "project/executor",
+				architect: "project/architect",
+				planner: "project/planner",
+				critic: "project/critic",
+			});
+
+			settings.setModelRole("default", "openai-codex/gpt-5.6-sol:xhigh");
+			for (const role of ["executor", "architect", "planner", "critic"]) {
+				settings.setAgentModelOverride(role, "openai-codex/gpt-5.6-sol:xhigh");
+			}
+
+			expect(settings.getModelRole("default")).toBe("openai-codex/gpt-5.6-sol:xhigh");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "openai-codex/gpt-5.6-sol:xhigh",
+				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				planner: "openai-codex/gpt-5.6-sol:xhigh",
+				critic: "openai-codex/gpt-5.6-sol:xhigh",
+			});
+
+			await settings.flushOrThrow();
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelRoles).toEqual({ default: "openai-codex/gpt-5.6-sol:xhigh" });
+			expect(savedSettings.task).toEqual({
+				agentModelOverrides: {
+					executor: "openai-codex/gpt-5.6-sol:xhigh",
+					architect: "openai-codex/gpt-5.6-sol:xhigh",
+					planner: "openai-codex/gpt-5.6-sol:xhigh",
+					critic: "openai-codex/gpt-5.6-sol:xhigh",
+				},
+			});
+
+			settings.clearOverride("modelRoles");
+			settings.clearOverride("task.agentModelOverrides");
+			expect(settings.getModelRole("default")).toBe("project/default");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "project/executor",
+				architect: "project/architect",
+				planner: "project/planner",
+				critic: "project/critic",
+			});
+		});
+
+		it("treats runtime null model records as resets before applying assignments", () => {
+			const settings = Settings.isolated();
+			settings.override("modelRoles", null as never);
+			settings.override("task.agentModelOverrides", null as never);
+
+			expect(settings.get("modelRoles")).toEqual({});
+			expect(settings.get("task.agentModelOverrides")).toEqual({});
+
+			settings.setModelRole("default", "provider/selected:high");
+			settings.setAgentModelOverride("executor", "provider/selected:high");
+
+			expect(settings.getModelRole("default")).toBe("provider/selected:high");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "provider/selected:high",
+			});
+			expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider/selected:high" });
+			expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+				executor: "provider/selected:high",
+			});
+		});
+
+		it("treats project null model records as resets without partial assignment failures", async () => {
+			await writeSettings({
+				modelRoles: { default: "global/default" },
+				task: { agentModelOverrides: { executor: "global/executor" } },
+			});
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "config.yml"),
+				YAML.stringify(
+					{
+						modelRoles: null,
+						task: { agentModelOverrides: null },
+					},
+					null,
+					2,
+				),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("modelRoles")).toEqual({});
+			expect(settings.get("task.agentModelOverrides")).toEqual({});
+
+			settings.setModelRole("default", "provider/selected:high");
+			for (const role of ["executor", "architect", "planner", "critic"]) {
+				settings.setAgentModelOverride(role, "provider/selected:high");
+			}
+
+			expect(settings.getModelRole("default")).toBe("provider/selected:high");
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "provider/selected:high",
+				architect: "provider/selected:high",
+				planner: "provider/selected:high",
+				critic: "provider/selected:high",
+			});
+
+			await settings.flushOrThrow();
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelRoles).toEqual({ default: "provider/selected:high" });
+			expect(savedSettings.task).toEqual({
+				agentModelOverrides: {
+					executor: "provider/selected:high",
+					architect: "provider/selected:high",
+					planner: "provider/selected:high",
+					critic: "provider/selected:high",
+				},
+			});
+
+			settings.clearOverride("modelRoles");
+			settings.clearOverride("task.agentModelOverrides");
+			expect(settings.get("modelRoles")).toEqual({});
+			expect(settings.get("task.agentModelOverrides")).toEqual({});
+		});
 	});
 
 	describe("migrations", () => {
