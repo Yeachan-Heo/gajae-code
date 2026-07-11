@@ -465,10 +465,14 @@ class RpcClient:
                 raise RpcProcessExitError(f"RPC process stopped before ready: {error}. Stderr: {stderr}") from error
             raise RpcTimeoutError(f"Timed out waiting for RPC ready signal. Stderr: {stderr}")
 
-        if self._custom_tools:
-            self.set_custom_tools(self._custom_tools)
-        if self._host_uris:
-            self.set_host_uris(self._host_uris)
+        try:
+            if self._custom_tools:
+                self.set_custom_tools(self._custom_tools)
+            if self._host_uris:
+                self.set_host_uris(self._host_uris)
+        except BaseException:
+            self.stop()
+            raise
         return self
 
     def stop(self) -> None:
