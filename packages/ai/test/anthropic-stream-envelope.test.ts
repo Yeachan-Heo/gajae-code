@@ -819,11 +819,191 @@ describe("anthropic stream envelope handling", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("Refusal (no details provided)");
+		expect(result.errorKind).toBe("provider_safety_stop");
 		expect(result.errorMessage).not.toContain("An unknown error occurred");
 		expect(countEvents(events, "error")).toBe(1);
 		expect(countEvents(events, "done")).toBe(0);
 	});
 
+	it("surfaces a typed safety stop for a refusal with details", async () => {
+		const refusalEvents: MockAnthropicEvent[] = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_refusal_details",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{
+				type: "message_delta",
+				delta: {
+					stop_reason: "end_turn",
+					stop_details: {
+						type: "refusal",
+						category: "safety",
+						explanation: "Policy violation",
+					},
+				},
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+			{ type: "message_stop" },
+		];
+		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(refusalEvents) as never);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Refusal (safety): Policy violation");
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(countEvents(events, "error")).toBe(1);
+		expect(countEvents(events, "done")).toBe(0);
+	});
+
+	it("surfaces a typed safety stop for a sensitive termination", async () => {
+		const sensitiveEvents: MockAnthropicEvent[] = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_sensitive",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{
+				type: "message_delta",
+				delta: { stop_reason: "sensitive", stop_details: null },
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+			{ type: "message_stop" },
+		];
+		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(sensitiveEvents) as never);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Content flagged by safety filters");
+		expect(result.errorKind).toBe("provider_safety_stop");
+	});
+	it("keeps a safety stop terminal when later stop reasons and tool events arrive", async () => {
+		const eventsAfterSafety: MockAnthropicEvent[] = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_safety_then_tool",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{
+				type: "message_delta",
+				delta: { stop_reason: "refusal", stop_details: null },
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+			{
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "tool_use", id: "tool_after_safety", name: "bash", input: {} },
+			},
+			{
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "input_json_delta", partial_json: '{"command":"pwd"}' },
+			},
+			{ type: "content_block_stop", index: 0 },
+			{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+			{ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } },
+			{ type: "message_stop" },
+		];
+		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(eventsAfterSafety) as never);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const observedEvents: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			observedEvents.push(event);
+		}
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(result.content).toEqual([]);
+		expect(countEvents(observedEvents, "error")).toBe(1);
+		expect(countEvents(observedEvents, "done")).toBe(0);
+		expect(countEvents(observedEvents, "toolcall_start")).toBe(0);
+		expect(countEvents(observedEvents, "toolcall_delta")).toBe(0);
+		expect(countEvents(observedEvents, "toolcall_end")).toBe(0);
+	});
+
+	it("does not retry a stream that closes after a stop_details refusal", async () => {
+		let attempt = 0;
+		vi.spyOn(Messages.prototype, "create").mockImplementation(() => {
+			attempt += 1;
+			if (attempt === 1) {
+				return createRawSseRequest([
+					sseFrame("message_start", {
+						type: "message_start",
+						message: {
+							id: "msg_safety_stream_close",
+							usage: {
+								input_tokens: 5,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					}),
+					sseFrame("message_delta", {
+						type: "message_delta",
+						delta: {
+							stop_details: {
+								type: "refusal",
+								category: "safety",
+								explanation: "Policy violation",
+							},
+						},
+						usage: { input_tokens: 5, output_tokens: 0 },
+					}),
+				]) as never;
+			}
+			return createMockRequest(createTextSuccessEvents("must not be used")) as never;
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const observedEvents: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			observedEvents.push(event);
+		}
+		const result = await stream.result();
+
+		expect(attempt).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(result.errorMessage).toBe("Refusal (safety): Policy violation");
+		expect(countEvents(observedEvents, "error")).toBe(1);
+		expect(countEvents(observedEvents, "done")).toBe(0);
+	});
 	it("emits per-tool eager_input_streaming only when Anthropic compat allows it", async () => {
 		const toolContext: Context = {
 			...context,

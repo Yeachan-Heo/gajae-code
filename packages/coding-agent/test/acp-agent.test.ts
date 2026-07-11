@@ -17,7 +17,7 @@ import {
 	zPromptResponse,
 	zSessionNotification,
 } from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
-import type { Model } from "@gajae-code/ai";
+import type { AssistantMessage, Model } from "@gajae-code/ai";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { ACP_BOOTSTRAP_RACE_GUARD_MS, AcpAgent, createAcpExtensionUiContext } from "../src/modes/acp/acp-agent";
@@ -80,6 +80,13 @@ function makeAssistantMessage(text: string, thinking?: string) {
 		timestamp: Date.now(),
 	};
 }
+function makeProviderSafetyStopMessage(): AssistantMessage {
+	return {
+		...makeAssistantMessage(""),
+		stopReason: "error",
+		errorKind: "provider_safety_stop",
+	};
+}
 
 class FakeAgentSession {
 	sessionManager: SessionManager;
@@ -99,6 +106,7 @@ class FakeAgentSession {
 		return Settings.instance;
 	}
 	promptCalls: string[] = [];
+	promptResponse: AssistantMessage | undefined;
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
 	skillsSettings = { enableSkillCommands: true };
 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
@@ -182,7 +190,7 @@ class FakeAgentSession {
 		this.promptCalls.push(text);
 		this.isStreaming = true;
 		this.sessionManager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
-		const assistantMessage = makeAssistantMessage("pong");
+		const assistantMessage = this.promptResponse ?? makeAssistantMessage("pong");
 		for (const listener of this.#listeners) {
 			listener({
 				type: "message_update",
@@ -788,6 +796,83 @@ describe("ACP agent", () => {
 				update => typeof getChunkMessageId(update) === "string" && getChunkMessageId(update)!.length > 0,
 			),
 		).toBe(true);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+	it("maps typed provider safety stops to ACP refusals", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.promptResponse = makeProviderSafetyStopMessage();
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "05b17a6f-b310-4be7-b767-6b4f3a84eb64",
+			prompt: [{ type: "text", text: "trigger provider safety stop" }],
+		} as PromptRequest);
+
+		expect(response.stopReason).toBe("refusal");
+		expectAcpStructure(zPromptResponse, response);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+	it("maps persisted legacy provider safety-stop labels to ACP refusals", async () => {
+		const harness = await createHarness();
+		const persistedLabels = [
+			"Refusal (no details provided)",
+			"Content flagged by safety filters",
+			"Blocked under Anthropic's Usage Policy.",
+		];
+		for (const errorMessage of persistedLabels) {
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			session.promptResponse = {
+				...makeAssistantMessage(""),
+				stopReason: "error",
+				errorMessage,
+			};
+
+			const response = await harness.agent.prompt({
+				sessionId: created.sessionId,
+				messageId: "05b17a6f-b310-4be7-b767-6b4f3a84eb65",
+				prompt: [{ type: "text", text: "trigger persisted legacy provider safety stop" }],
+			} as PromptRequest);
+
+			expect(response.stopReason).toBe("refusal");
+			expectAcpStructure(zPromptResponse, response);
+		}
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("maps incidental legacy safety-stop prose in provider errors to ACP end_turn", async () => {
+		const harness = await createHarness();
+		const incidentalMessages = [
+			"connection error after upstream refusal handshake",
+			"connection error: content flagged by safety filters in a prior response",
+			"connection error: request was blocked under Anthropic's Usage Policy while retrying",
+		];
+		for (const errorMessage of incidentalMessages) {
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			session.promptResponse = {
+				...makeAssistantMessage(""),
+				stopReason: "error",
+				errorMessage,
+			};
+
+			const response = await harness.agent.prompt({
+				sessionId: created.sessionId,
+				messageId: "05b17a6f-b310-4be7-b767-6b4f3a84eb66",
+				prompt: [{ type: "text", text: "trigger incidental legacy safety-stop prose" }],
+			} as PromptRequest);
+
+			expect(response.stopReason).toBe("end_turn");
+			expectAcpStructure(zPromptResponse, response);
+		}
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

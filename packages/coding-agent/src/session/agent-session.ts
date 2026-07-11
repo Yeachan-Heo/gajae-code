@@ -296,6 +296,7 @@ import {
 	SILENT_ABORT_MARKER,
 	SKILL_PROMPT_MESSAGE_TYPE,
 } from "./messages";
+import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 import { formatSessionDumpText } from "./session-dump-format";
 import type {
 	BranchSummaryEntry,
@@ -9342,16 +9343,6 @@ export class AgentSession {
 		);
 	}
 
-	#isRefusalErrorMessage(errorMessage: string): boolean {
-		// Provider safety-refusal stops. Matches the engine-generated Anthropic
-		// labels from packages/ai ("Refusal (<category>): …", "Refusal (no
-		// details provided)", "Content flagged by safety filters") plus generic
-		// usage-policy refusal copy.
-		return /^refusal(\s*\(|:|$)|content flagged by safety filters|blocked under .{0,40}usage policy/i.test(
-			errorMessage,
-		);
-	}
-
 	#extractExplicitHttpStatusFromErrorMessage(errorMessage: string): number | undefined {
 		// Parse only explicit HTTP/status wording. Do not treat generic
 		// `error: 400` as an HTTP status because rate-limit copy can say
@@ -9363,12 +9354,14 @@ export class AgentSession {
 	}
 
 	/**
-	 * Ordered retry classification: overflow (compaction) -> terminal (surface)
-	 * -> usage_limit (rotation) -> first_event_timeout (bounded retry) ->
-	 * transient (retry) -> unknown (retry).
+	 * Ordered retry classification: typed safety stop (surface) -> overflow
+	 * (compaction) -> terminal (surface) -> usage_limit (rotation) ->
+	 * first_event_timeout (bounded retry) -> transient (retry) -> unknown (retry).
 	 */
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
-		if (message.stopReason !== "error" || !message.errorMessage) return "none";
+		if (message.stopReason !== "error") return "none";
+		if (message.errorKind === "provider_safety_stop") return "terminal";
+		if (!message.errorMessage) return "none";
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return "overflow";
 		const err = message.errorMessage;
@@ -9378,7 +9371,7 @@ export class AgentSession {
 		// auto-retry loop can never succeed and only re-bills the full context
 		// on every attempt (#1655). Surface immediately instead of joining the
 		// unbounded "unknown" retry class.
-		if (this.#isRefusalErrorMessage(err)) return "terminal";
+		if (isLegacyProviderSafetyStopMessage(err)) return "terminal";
 		if (isLocalModelEndpoint(this.model) && this.#isLocalProviderAvailabilityErrorMessage(err)) {
 			return "local_unavailable";
 		}
