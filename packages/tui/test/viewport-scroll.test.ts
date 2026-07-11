@@ -2,13 +2,20 @@ import { describe, expect, it } from "bun:test";
 import {
 	type Component,
 	Container,
+	ImageProtocol,
+	Markdown,
 	renderComponentWithViewportAnchors,
+	setTerminalImageProtocol,
 	shouldUseViewportRepaintForHost,
+	TERMINAL,
 	Text,
 	TUI,
+	VIEWPORT_ANCHOR_PREFIX,
 	type ViewportAnchorRender,
 	type ViewportAnchorSource,
+	visibleWidth,
 } from "@gajae-code/tui";
+import { defaultMarkdownTheme } from "./test-themes";
 import { VirtualTerminal } from "./virtual-terminal";
 
 class Lines implements Component {
@@ -469,6 +476,56 @@ describe("registered viewport anchor", () => {
 		const rendered = container.renderWithViewportAnchors(80);
 		expect(rendered.lines.join("")).toContain(literalMarker);
 		expect(rendered.anchors.some(anchor => anchor?.id === "literal-apc")).toBe(true);
+	});
+
+	it("wraps Kitty-protocol anchored prose into bounded rows without marker leakage while a genuine Kitty line bypasses", () => {
+		const previousProtocol = TERMINAL.imageProtocol;
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		try {
+			// The anchor marker must never begin with (or contain) the Kitty graphics
+			// prefix. Otherwise TERMINAL.isImageLine() misclassifies every annotated
+			// prose row as an image line and skips wrapping (the #2012 regression).
+			expect(VIEWPORT_ANCHOR_PREFIX.startsWith(ImageProtocol.Kitty)).toBe(false);
+			expect(VIEWPORT_ANCHOR_PREFIX.includes(ImageProtocol.Kitty)).toBe(false);
+
+			const width = 24;
+			const prose = "the quick brown fox jumps over the lazy dog ".repeat(6).trim();
+			// renderWithViewportAnchorSource runs the real annotate -> isImageLine-gated
+			// wrap -> extract pipeline, which is exactly where the old marker collided.
+			const rendered = new Markdown(prose, 0, 0, defaultMarkdownTheme).renderWithViewportAnchorSource(width, {
+				id: "kitty-prose",
+			});
+
+			// Wrapping still happens under an active Kitty classification: many bounded rows.
+			expect(rendered.lines.length).toBeGreaterThan(1);
+			for (const line of rendered.lines) {
+				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+				expect(TERMINAL.isImageLine(line)).toBe(false);
+			}
+
+			// Anchors stay row-aligned and carry the shared source id.
+			expect(rendered.anchors.length).toBe(rendered.lines.length);
+			expect(rendered.anchors.some(anchor => anchor?.id === "kitty-prose")).toBe(true);
+
+			// No anchor marker (or stray Kitty prefix) leaks into the visible output.
+			const joined = rendered.lines.join("");
+			expect(joined).not.toContain(VIEWPORT_ANCHOR_PREFIX);
+			expect(joined).not.toContain("GJC_ANCHOR");
+			expect(joined).not.toContain(ImageProtocol.Kitty);
+
+			// A genuine Kitty graphics line is still classified as an image and bypasses
+			// wrapping: it survives the same pipeline verbatim as a single unwrapped row.
+			const kittyImageLine = `${ImageProtocol.Kitty}f=100,a=T,t=d;${"QUJD".repeat(64)}\x1b\\`;
+			expect(TERMINAL.isImageLine(kittyImageLine)).toBe(true);
+			expect(kittyImageLine.length).toBeGreaterThan(width);
+			const bypassed = new Markdown(kittyImageLine, 0, 0, defaultMarkdownTheme).renderWithViewportAnchorSource(
+				width,
+				{ id: "kitty-image" },
+			);
+			expect(bypassed.lines).toEqual([kittyImageLine]);
+		} finally {
+			setTerminalImageProtocol(previousProtocol);
+		}
 	});
 
 	it("preserves a CJK emoji ANSI anchor across arbitrary repeated reflow", async () => {
