@@ -11441,10 +11441,29 @@ export class AgentSession {
 	}
 
 	/**
+	 * Usage-anchor eligibility for context estimation. Mirrors the compaction
+	 * rule (see getAssistantUsage in compaction.ts): error/aborted turns carry
+	 * absent or partial usage, so they must not anchor an estimate. Anchor on
+	 * the last successful positive-usage assistant instead and let callers
+	 * estimate every later message (including error/aborted ones) as trailing
+	 * context.
+	 */
+	#anchorableAssistantUsage(message: AgentMessage): Usage | undefined {
+		if (message.role !== "assistant") return undefined;
+		const assistant = message as AssistantMessage;
+		if (assistant.stopReason === "aborted" || assistant.stopReason === "error") return undefined;
+		const usage = assistant.usage;
+		if (!usage || calculateContextTokens(usage) <= 0) return undefined;
+		return usage;
+	}
+
+	/**
 	 * Observed heuristic→actual token correction for the compaction keep window
 	 * (Finding 7). Compares the provider's real prompt tokens against the chars/4
-	 * heuristic estimate of the same content (stable system prefix + history through
-	 * the last usage-bearing assistant turn). Image-bearing content is bucketed out
+	 * heuristic estimate of the same content (stable system prefix + history
+	 * before the last usage-bearing assistant turn — that turn's own output is
+	 * the response, not part of the request's prompt, so it belongs on neither
+	 * side of the ratio). Image-bearing content is bucketed out
 	 * of BOTH sides using the identical fixed IMAGE_TOKEN_ESTIMATE so the 1200-token
 	 * image charge cannot skew the text ratio. Returns undefined when data is
 	 * insufficient, so prepareCompaction applies no correction (never the confounded
@@ -11455,9 +11474,9 @@ export class AgentSession {
 		let lastUsageIndex = -1;
 		let lastUsage: Usage | undefined;
 		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i];
-			if (msg.role === "assistant" && (msg as AssistantMessage).usage) {
-				lastUsage = (msg as AssistantMessage).usage;
+			const usage = this.#anchorableAssistantUsage(messages[i]);
+			if (usage) {
+				lastUsage = usage;
 				lastUsageIndex = i;
 				break;
 			}
@@ -11469,7 +11488,7 @@ export class AgentSession {
 		let heuristic = 0;
 		for (const block of this.agent.state.systemPrompt) heuristic += estimateTextTokensHeuristic(block);
 		let imageBlocks = 0;
-		for (let i = 0; i <= lastUsageIndex; i++) {
+		for (let i = 0; i < lastUsageIndex; i++) {
 			heuristic += this.#estimateMessageDisplayTokens(messages[i]);
 			imageBlocks += this.#countImageBlocks(messages[i]);
 		}
@@ -11494,18 +11513,16 @@ export class AgentSession {
 	} {
 		const messages = this.messages;
 
-		// Find last assistant message with usage
+		// Find the last successful assistant message with positive usage.
+		// Error/aborted turns are estimated as trailing context instead.
 		let lastUsageIndex: number | null = null;
 		let lastUsage: Usage | undefined;
 		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i];
-			if (msg.role === "assistant") {
-				const assistantMsg = msg as AssistantMessage;
-				if (assistantMsg.usage) {
-					lastUsage = assistantMsg.usage;
-					lastUsageIndex = i;
-					break;
-				}
+			const usage = this.#anchorableAssistantUsage(messages[i]);
+			if (usage) {
+				lastUsage = usage;
+				lastUsageIndex = i;
+				break;
 			}
 		}
 
@@ -11520,7 +11537,11 @@ export class AgentSession {
 			};
 		}
 
-		const usageTokens = calculatePromptTokens(lastUsage);
+		// Anchor on total context tokens (input + cache + output), not prompt-only
+		// tokens: the next request replays the anchor assistant's own output
+		// (text/reasoning/tool calls), so dropping it undercounts the very tokens
+		// a large-reasoning turn just added (Sol xhigh emits tens of thousands).
+		const usageTokens = calculateContextTokens(lastUsage);
 		let trailingTokens = 0;
 		for (let i = lastUsageIndex + 1; i < messages.length; i++) {
 			trailingTokens += estimateMessage(messages[i]);
@@ -11581,7 +11602,7 @@ export class AgentSession {
 	}
 
 	#estimateMessageCompactionDeltaTokens(message: AgentMessage): number {
-		// Provider usage anchors the already-sent context (see calculatePromptTokens); this
+		// Provider usage anchors the already-sent context (see calculateContextTokens); this
 		// estimates only the UNSENT delta with the native-free chars/4 heuristic, inflated by
 		// #compactionDeltaInflation so dense input cannot undercount us past the compaction
 		// threshold before the next provider response re-anchors the exact count. Cached per
