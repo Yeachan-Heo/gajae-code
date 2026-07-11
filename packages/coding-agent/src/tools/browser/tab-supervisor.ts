@@ -89,10 +89,56 @@ export interface RunInTabOptions {
 
 export interface ReleaseTabOptions {
 	kill?: boolean;
+	/**
+	 * Absolute end-to-end deadline (`Date.now()`-based, ms) for the whole teardown chain.
+	 * Shared across a `releaseAllTabs` loop so close/close-all honors ONE aggregate budget.
+	 * Omitted (the GC/session-teardown callers) keeps the original unbounded behavior.
+	 */
+	deadlineAt?: number;
 }
 
 const tabs = new Map<string, TabSession>();
 const GRACE_MS = 750;
+
+/**
+ * Remaining time (ms) until an absolute teardown deadline, or +Infinity when no deadline
+ * is set (the GC / session-teardown callers). A non-positive result means the shared
+ * close budget is already spent.
+ */
+function remainingBudget(deadlineAt: number | undefined): number {
+	if (deadlineAt === undefined) return Number.POSITIVE_INFINITY;
+	return deadlineAt - Date.now();
+}
+
+/**
+ * Await `op` but never longer than `remainingMs` (#2027). On timeout — or when the budget
+ * is already exhausted — the operation is detached and kept alive best-effort with its
+ * rejection swallowed, so a dying CDP target cannot wedge the close teardown or leak an
+ * unhandled rejection. Returns true when `op` settled within budget, false when detached.
+ */
+async function awaitWithinBudget(op: Promise<unknown>, remainingMs: number, label: string): Promise<boolean> {
+	const settled = Promise.resolve(op).then(
+		() => true,
+		() => true,
+	);
+	if (remainingMs === Number.POSITIVE_INFINITY) return await settled;
+	if (remainingMs <= 0) {
+		void settled;
+		logger.debug("close teardown budget already spent; detaching step", { label });
+		return false;
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timedOut = new Promise<boolean>(resolve => {
+		timer = setTimeout(() => resolve(false), remainingMs);
+	});
+	try {
+		const ok = await Promise.race([settled, timedOut]);
+		if (!ok) logger.debug("close teardown step exceeded deadline; detached", { label });
+		return ok;
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
 
 export function getTab(name: string): TabSession | undefined {
 	return tabs.get(name);
@@ -316,17 +362,24 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 	}
 	tab.pending.clear();
 	let forced = false;
+	const deadlineAt = opts.deadlineAt;
 	if (wasAlive) {
 		try {
 			tab.worker.send({ type: "close" });
-			await waitForClosed(tab);
+			await waitForClosed(tab, remainingBudget(deadlineAt));
 		} catch {
 			forced = true;
 		}
 	}
-	await tab.worker.terminate().catch(() => undefined);
-	if (forced && tab.kindTag === "headless") await closeOrphanTarget(tab);
-	await releaseBrowser(tab.browser, { kill: opts.kill ?? false });
+	await awaitWithinBudget(tab.worker.terminate(), remainingBudget(deadlineAt), "worker.terminate");
+	if (forced && tab.kindTag === "headless") {
+		await awaitWithinBudget(closeOrphanTarget(tab), remainingBudget(deadlineAt), "closeOrphanTarget");
+	}
+	await awaitWithinBudget(
+		releaseBrowser(tab.browser, { kill: opts.kill ?? false }),
+		remainingBudget(deadlineAt),
+		"releaseBrowser",
+	);
 	// Only delete if the map still holds THIS tab: a same-name reacquire during our async
 	// teardown may have installed a fresh tab that we must not evict.
 	if (tabs.get(name) === tab) tabs.delete(name);
@@ -495,13 +548,17 @@ async function closeOrphanTarget(tab: TabSession): Promise<void> {
 	}
 }
 
-async function waitForClosed(tab: TabSession): Promise<void> {
+async function waitForClosed(tab: TabSession, remainingMs: number = Number.POSITIVE_INFINITY): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	const unsubscribe = tab.worker.onMessage(msg => {
 		if (msg.type === "closed") resolve();
 	});
 	try {
-		await raceWithTimeout(promise, GRACE_MS, "Timed out closing browser tab worker");
+		await raceWithTimeout(
+			promise,
+			Math.max(0, Math.min(GRACE_MS, remainingMs)),
+			"Timed out closing browser tab worker",
+		);
 	} finally {
 		unsubscribe();
 	}

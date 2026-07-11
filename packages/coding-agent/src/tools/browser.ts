@@ -187,7 +187,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 				case "open":
 					return await this.#open(name, params, details, timeoutMs, signal);
 				case "close":
-					return await this.#close(name, params, details, signal);
+					return await this.#close(name, params, details, timeoutMs, signal);
 				case "run":
 					return await this.#run(name, params, details, timeoutMs, signal);
 				case "act":
@@ -274,15 +274,20 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		name: string,
 		params: BrowserParams,
 		details: BrowserToolDetails,
+		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
 		const kill = !!params.kill;
+		// One end-to-end budget across the whole close/close-all teardown chain (#2027):
+		// releaseAllTabs → waitForClosed → worker.terminate → releaseBrowser stay bounded so
+		// a CDP target dying mid-teardown cannot hang the tool call or the agent turn.
+		const deadlineAt = Date.now() + timeoutMs;
 		if (params.all) {
-			const count = await untilAborted(signal, () => releaseAllTabs({ kill }));
+			const count = await untilAborted(signal, () => releaseAllTabs({ kill, deadlineAt }));
 			details.result = `Closed ${count} tab(s)`;
 			return toolResult(details).text(details.result).done();
 		}
-		const closed = await untilAborted(signal, () => releaseTab(name, { kill }));
+		const closed = await untilAborted(signal, () => releaseTab(name, { kill, deadlineAt }));
 		details.result = closed ? `Closed tab ${JSON.stringify(name)}` : `No tab named ${JSON.stringify(name)}`;
 		return toolResult(details).text(details.result).done();
 	}
