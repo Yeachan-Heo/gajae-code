@@ -1,4 +1,5 @@
 import type { Effort } from "@gajae-code/ai/model-thinking";
+import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
@@ -508,6 +509,25 @@ export const SETTINGS_SCHEMA = {
 			tab: "appearance",
 			label: "Session Accent",
 			description: "Use the session name color for the editor border and status line gap",
+		},
+	},
+
+	"pet.mode": {
+		type: "enum",
+		values: PET_MODE_IDS,
+		default: "off",
+		ui: {
+			tab: "appearance",
+			label: "Gajae Pet",
+			description: "16x16 real-pixel gajae living beside the composer (sixel/kitty terminals)",
+			options: [
+				{ value: "off", label: "Off", description: "No pet" },
+				...PET_SKIN_IDS.map(id => ({
+					value: id,
+					label: PET_SKINS[id].label,
+					description: PET_SKINS[id].description,
+				})),
+			],
 		},
 	},
 	"statusLine.maxRows": {

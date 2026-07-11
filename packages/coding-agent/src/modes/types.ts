@@ -23,6 +23,7 @@ import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import type { CustomEditor } from "./components/custom-editor";
 import type { EvalExecutionComponent } from "./components/eval-execution";
+import type { PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
@@ -166,6 +167,11 @@ export interface InteractiveModeContext {
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;
+	setPetMode(mode: PetMode): void;
+	/** Live-preview a pet skin during a selector without persisting. */
+	previewPetMode(mode: PetMode): void;
+	/** Re-mount the composer (pet-aware) after an overlay/selector closes. */
+	restoreComposer(): void;
 	startPendingSubmission(input: {
 		text: string;
 		images?: ImageContent[];
@@ -254,6 +260,7 @@ export interface InteractiveModeContext {
 	// Selector handling
 	showSettingsSelector(): void;
 	showThemeSelector(): void;
+	showPetSelector(): void;
 	showHistorySearch(): void;
 	showExtensionsDashboard(): void;
 	showAgentsDashboard(): void;

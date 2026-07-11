@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, modelsAreEqual } from "@gajae-code/ai";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
-import { Spacer, Text } from "@gajae-code/tui";
+import { isPetMode, PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS, Spacer, Text } from "@gajae-code/tui";
 import { setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
 import { materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
@@ -22,6 +22,7 @@ import {
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { resolveMemoryBackend } from "../memory-backend";
 import { DynamicBorder } from "../modes/components/dynamic-border";
+import { GajaePetWidget } from "../modes/components/gajae-pet-widget";
 import { theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
@@ -486,6 +487,39 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showThemeSelector();
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "pet",
+		description: "Gajae pet living beside the composer",
+		subcommands: [
+			{ name: "off", description: "Hide the pet" },
+			...PET_SKIN_IDS.map(id => ({ name: id, description: PET_SKINS[id].description })),
+		],
+		inlineHint: `[${PET_MODE_IDS.join("|")}]`,
+		allowArgs: true,
+		handleTui: (command, runtime) => {
+			const ctx = runtime.ctx;
+			const raw = command.args?.trim().toLowerCase() ?? "";
+			const arg = raw === "on" ? "red" : raw;
+			if (!arg) {
+				ctx.showPetSelector();
+				ctx.editor.setText("");
+				return;
+			}
+			if (arg !== "off" && !GajaePetWidget.pixelProtocol()) {
+				ctx.showStatus(
+					"Gajae pet needs a sixel/kitty-graphics terminal (Windows Terminal 1.22+, kitty, Ghostty, WezTerm)",
+					{ dim: true },
+				);
+			} else if (isPetMode(arg)) {
+				ctx.setPetMode(arg);
+				const name = arg === "off" ? "Gajae pet hidden" : `${PET_SKINS[arg].label} is here`;
+				ctx.showStatus(name);
+			} else {
+				ctx.showStatus(`Usage: /pet [${PET_MODE_IDS.join("|")}]`, { dim: true });
+			}
+			ctx.editor.setText("");
 		},
 	},
 	{

@@ -7,6 +7,10 @@
 
 - Preserved durable transcript semantic anchors at their screen rows when completion removes transient content, including CJK/emoji/ANSI reflow, prefix eviction, provider replacement, explicit exclusion of synthetic/IRC/pinned rows, and supported SSH, tmux, Termux, and Windows terminal paths (#1969).
 
+### Added
+
+- Added transparent Sixel and Kitty real-pixel encoders plus animated 16x16 frame art for the Gajae composer pet.
+
 ## [0.9.4] - 2026-07-09
 
 ### Fixed

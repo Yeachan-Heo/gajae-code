@@ -2,7 +2,7 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle } from "@gajae-code/tui";
-import { Input, Loader, Spacer, Text } from "@gajae-code/tui";
+import { Input, isPetMode, Loader, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir } from "@gajae-code/utils";
 import {
 	activateModelProfile,
@@ -74,10 +74,12 @@ import {
 } from "../components/custom-model-preset-wizard";
 import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "../components/custom-provider-wizard";
 import { ExtensionDashboard } from "../components/extensions";
+import type { PetMode } from "../components/gajae-pet-widget";
 import { HistorySearchComponent } from "../components/history-search";
 import { JobsOverlayComponent } from "../components/jobs-overlay";
 import { ModelSelectorComponent } from "../components/model-selector";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
+import { PetSelectorComponent } from "../components/pet-selector";
 import { PluginSelectorComponent } from "../components/plugin-selector";
 import {
 	type ProviderOnboardingAction,
@@ -158,9 +160,7 @@ export class SelectorController {
 	 */
 	showSelector(create: (done: () => void) => { component: Component; focus: Component }): void {
 		const done = () => {
-			this.ctx.editorContainer.clear();
-			this.ctx.editorContainer.addChild(this.ctx.editor);
-			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.restoreComposer();
 		};
 		const { component, focus } = create(done);
 		this.ctx.editorContainer.clear();
@@ -503,6 +503,9 @@ export class SelectorController {
 								this.#refreshThemeUi();
 							});
 						},
+						onPetPreview: mode => {
+							this.ctx.previewPetMode(mode as PetMode);
+						},
 						onStatusLinePreview: previewSettings => {
 							// Update status line with preview settings
 							this.ctx.statusLine.updateSettings({
@@ -577,6 +580,29 @@ export class SelectorController {
 		});
 	}
 
+	showPetSelector(): void {
+		const stored = settings.get("pet.mode");
+		const initial: PetMode = isPetMode(stored) ? stored : "off";
+		this.showSelector(done => {
+			// Live-preview via previewMode (no editor re-mount, so the overlay stays);
+			// Enter commits + persists, Esc restores the initial skin.
+			const selector = new PetSelectorComponent(
+				initial,
+				mode => {
+					this.ctx.setPetMode(mode);
+					done();
+				},
+				() => {
+					this.ctx.previewPetMode(initial);
+					done();
+				},
+				mode => {
+					this.ctx.previewPetMode(mode);
+				},
+			);
+			return { component: selector, focus: selector.getSelectList() };
+		});
+	}
 	showHistorySearch(): void {
 		const historyStorage = this.ctx.historyStorage;
 		if (!historyStorage) return;
@@ -728,6 +754,12 @@ export class SelectorController {
 				});
 				break;
 			}
+			case "pet.mode":
+				// The settings submenu already persisted the value; apply it to the live
+				// widget via previewMode (the settings overlay is still open, so a full
+				// re-mount would tear it down — restoreComposer re-mounts on close).
+				this.ctx.previewPetMode(value as PetMode);
+				break;
 			case "symbolPreset": {
 				setSymbolPreset(value as "unicode" | "nerd" | "ascii").then(() => {
 					this.ctx.statusLine.invalidate();

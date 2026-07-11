@@ -2551,11 +2551,30 @@ export class TUI extends Container {
 		return { seq, toRow: targetRow };
 	}
 
+	/**
+	 * Register an emitter whose escape payload is appended to every render
+	 * write (inside its own synchronized-output block, cursor saved/restored).
+	 * Used for absolute-positioned overlays such as pixel-image pets that live
+	 * outside the line-based component model. Return null to emit nothing.
+	 */
+	setPostRenderEmitter(emitter: (() => string | null) | undefined): void {
+		this.#postRenderEmitter = emitter;
+	}
+
+	#postRenderEmitter: (() => string | null) | undefined;
+
 	#writeRenderBufferAndReanchorImeCursor(
 		buffer: string,
 		cursorPos: { row: number; col: number } | null,
 		totalLines: number,
 	): boolean {
+		const overlay = this.#postRenderEmitter?.();
+		if (overlay) {
+			// DECSC/DECRC keep the hardware cursor stable; the dedicated
+			// synchronized block prevents visible tearing while the overlay
+			// area is cleared and redrawn.
+			buffer += `\x1b[?2026h\x1b7${overlay}\x1b8\x1b[?2026l`;
+		}
 		if (!this.#writeTerminal(buffer)) return false;
 		if (!this.#imeCursorActive) return true;
 		return this.#writeCursorPosition(cursorPos, totalLines);

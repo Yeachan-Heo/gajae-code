@@ -350,6 +350,22 @@
 			},
 			"additionalProperties": false
 		},
+		"pet": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"type": "string",
+					"enum": [
+						"off",
+						"red",
+						"blue"
+					],
+					"description": "16x16 real-pixel gajae living beside the composer (sixel/kitty terminals)",
+					"default": "off"
+				}
+			},
+			"additionalProperties": false
+		},
 		"tools": {
 			"type": "object",
 			"properties": {

@@ -40,6 +40,14 @@ function createClearTuiRuntime() {
 	};
 }
 
+describe("builtin /pet slash command", () => {
+	it("exposes off plus the registry-driven skin choices", () => {
+		const petCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "pet");
+
+		expect(petCommand?.subcommands?.map(command => command.name)).toEqual(["off", "red", "blue"]);
+		expect(petCommand?.inlineHint).toBe("[off|red|blue]");
+	});
+});
 describe("builtin /copy slash command", () => {
 	it("is discoverable as a TUI builtin without public subcommands", () => {
 		const copyCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "copy");

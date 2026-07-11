@@ -81,6 +81,7 @@ import type { BashExecutionComponent } from "./components/bash-execution";
 import { CustomEditor } from "./components/custom-editor";
 import { DynamicBorder } from "./components/dynamic-border";
 import type { EvalExecutionComponent } from "./components/eval-execution";
+import { GajaePetWidget, type PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
@@ -301,6 +302,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	editorContainer: Container;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
+	petFloorContainer: Container = new Container();
+	petWidget: GajaePetWidget | undefined;
 	statusLine: StatusLineComponent;
 
 	isInitialized = false;
@@ -586,9 +589,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.statusLine); // Main status rail + hook statuses; composer chrome is rendered by the editor.
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
+		this.ui.addChild(this.petFloorContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
 		this.ui.setBottomPinnedComponent(this.statusLine);
 		this.ui.setFocus(this.editor);
+		this.petWidget = this.#createPetWidget(this.editor);
+		this.petWidget.setMode(settings.get("pet.mode"));
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
@@ -1038,6 +1044,40 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Keep the composer as a plain closed input rectangle; status-line
 		// rendering stays outside the input area.
 		this.editor.setTopBorder(undefined);
+	}
+
+	setPetMode(mode: PetMode): void {
+		this.petWidget?.setMode(mode);
+		settings.set("pet.mode", mode);
+		this.ui.requestRender();
+	}
+
+	previewPetMode(mode: PetMode): void {
+		this.petWidget?.previewMode(mode);
+		this.ui.requestRender();
+	}
+
+	restoreComposer(): void {
+		if (this.petWidget) {
+			this.petWidget.remountComposer();
+		} else {
+			this.editorContainer.clear();
+			this.editorContainer.addChild(this.editor);
+		}
+		this.ui.setFocus(this.editor);
+	}
+
+	#createPetWidget(editor: CustomEditor): GajaePetWidget {
+		return new GajaePetWidget({
+			ui: this.ui,
+			editor,
+			editorContainer: this.editorContainer,
+			floorContainer: this.petFloorContainer,
+			isWorking: () => this.loadingAnimation !== undefined,
+			getComposerBottomOffset: () =>
+				this.petFloorContainer.render(this.ui.terminal.columns).length +
+				this.hookWidgetContainerBelow.render(this.ui.terminal.columns).length,
+		});
 	}
 
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void {
@@ -2016,6 +2056,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	stop(): void {
+		this.petWidget?.dispose();
+		this.petWidget = undefined;
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;
@@ -2147,10 +2189,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		nextEditor.setText(previousText);
 		previousEditor.dispose();
 
+		const petMode = this.petWidget?.mode ?? settings.get("pet.mode");
+		this.petWidget?.dispose();
+
 		this.editorContainer.clear();
 		this.editor = nextEditor;
 		this.editorContainer.addChild(nextEditor);
 		this.ui.setFocus(nextEditor);
+
+		this.petWidget = this.#createPetWidget(nextEditor);
+		this.petWidget.setMode(petMode);
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
@@ -2588,6 +2636,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showThemeSelector(): void {
 		this.#selectorController.showThemeSelector();
+	}
+
+	showPetSelector(): void {
+		this.#selectorController.showPetSelector();
 	}
 
 	showHistorySearch(): void {

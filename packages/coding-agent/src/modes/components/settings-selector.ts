@@ -682,6 +682,8 @@ export interface SettingsCallbacks {
 	onThemePreview?: (theme: string) => void | Promise<void>;
 	/** Called to restore the rendered theme when theme settings preview is cancelled */
 	onThemePreviewCancel?: (theme: string) => void | Promise<void>;
+	/** Called to live-preview the gajae pet skin while browsing the pet setting. */
+	onPetPreview?: (mode: string) => void;
 	/** Called for status line preview while configuring */
 	onStatusLinePreview?: (settings: StatusLinePreviewSettings) => void;
 	/** Get current rendered status line for inline preview */
@@ -924,6 +926,14 @@ export class SettingsSelectorComponent extends Container {
 					previewHighlightSegment: undefined,
 				});
 				this.#updateStatusPreview();
+			};
+		} else if (def.path === "pet.mode") {
+			const savedPetMode = currentValue;
+			onPreview = value => {
+				this.callbacks.onPetPreview?.(value);
+			};
+			onPreviewCancel = () => {
+				this.callbacks.onPetPreview?.(savedPetMode);
 			};
 		}
 
