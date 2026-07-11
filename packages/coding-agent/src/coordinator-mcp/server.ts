@@ -2388,50 +2388,58 @@ export async function coordinatorOwnerIsolationProbe(runner: CommandRunner): Pro
 	return {
 		readCallerCgroup: async () => await fs.readFile("/proc/self/cgroup", "utf8").catch(() => null),
 		probeServer: async (socketKey): Promise<TmuxServerProof> => {
-			const result = await runner(["tmux", "-L", socketKey, "list-sessions", "-F", "#{pid} #{session_name}"]);
-			if (result.exitCode !== 0) {
-				const diagnostic = `${result.stdout}\n${result.stderr}`.slice(0, 512);
-				return /(?:no server running|failed to connect to server|no sessions)/i.test(diagnostic)
-					? { state: "absent" }
-					: { state: "unverifiable" };
-			}
-			const rows = result.stdout
-				.split("\n")
-				.map(line => line.trim().split(/\s+/, 2))
-				.filter(([pid, name]) => Boolean(pid && name));
-			const pid = Number(rows[0]?.[0]);
-			const sessionNames = rows.map(([, name]) => name as string);
-			if (!Number.isSafeInteger(pid) || pid <= 0 || rows.some(([rowPid]) => Number(rowPid) !== pid))
-				return { state: "unverifiable" };
-			const stat =
-				process.platform === "linux" ? await fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => null) : null;
-			const startTime =
-				process.platform === "linux"
-					? ownerProcessStartTime(process.platform, stat)
-					: await portableProcessStartTime(pid, runner);
-			if (!startTime) return { state: "unverifiable", pid, sessionNames };
-			if (process.platform !== "linux")
+			try {
+				const result = await runner(["tmux", "-L", socketKey, "list-sessions", "-F", "#{pid} #{session_name}"]);
+				if (result.exitCode !== 0) {
+					const diagnostic = `${result.stdout}\n${result.stderr}`.slice(0, 512);
+					return /(?:no server running|failed to connect to server|no sessions)/i.test(diagnostic)
+						? { state: "absent" }
+						: { state: "unverifiable" };
+				}
+				const rows = result.stdout
+					.split("\n")
+					.map(line => line.trim().split(/\s+/, 2))
+					.filter(([pid, name]) => Boolean(pid && name));
+				const pid = Number(rows[0]?.[0]);
+				const sessionNames = rows.map(([, name]) => name as string);
+				if (!Number.isSafeInteger(pid) || pid <= 0 || rows.some(([rowPid]) => Number(rowPid) !== pid))
+					return { state: "unverifiable" };
+				const stat =
+					process.platform === "linux" ? await fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => null) : null;
+				const startTime =
+					process.platform === "linux"
+						? ownerProcessStartTime(process.platform, stat)
+						: await portableProcessStartTime(pid, runner);
+				if (!startTime) return { state: "unverifiable", pid, sessionNames };
+				if (process.platform !== "linux")
+					return {
+						state: "safe",
+						pid,
+						startTime,
+						sessionNames,
+						cgroup: { classification: "not_applicable" },
+					};
+				const cgroupText = await fs.readFile(`/proc/${pid}/cgroup`, "utf8").catch(() => null);
+				const cgroup = classifyCgroup({ platform: process.platform, cgroupText });
 				return {
-					state: "safe",
+					state:
+						cgroup.classification === "safe"
+							? "safe"
+							: cgroup.classification === "unsafe_service"
+								? "unsafe"
+								: "unverifiable",
 					pid,
 					startTime,
 					sessionNames,
-					cgroup: { classification: "not_applicable" },
+					cgroup,
 				};
-			const cgroupText = await fs.readFile(`/proc/${pid}/cgroup`, "utf8").catch(() => null);
-			const cgroup = classifyCgroup({ platform: process.platform, cgroupText });
-			return {
-				state:
-					cgroup.classification === "safe"
-						? "safe"
-						: cgroup.classification === "unsafe_service"
-							? "unsafe"
-							: "unverifiable",
-				pid,
-				startTime,
-				sessionNames,
-				cgroup,
-			};
+			} catch {
+				// A transient spawn failure (e.g. EAGAIN under load, or a momentary tmux/ps hiccup)
+				// must not fatally abort the owner-server proof. Surfacing it as an unverifiable state
+				// lets proveCoordinatorOwnerServer's bounded retry loop re-probe once the transient
+				// clears, instead of propagating the throw and failing the entire delegate outright.
+				return { state: "unverifiable" };
+			}
 		},
 	};
 }

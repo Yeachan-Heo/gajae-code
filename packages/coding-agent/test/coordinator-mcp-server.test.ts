@@ -1298,6 +1298,28 @@ describe("Coordinator MCP server protocol", () => {
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
+	it("surfaces a transient probe spawn failure as unverifiable instead of propagating the throw", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		try {
+			Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+
+			// A transient spawn failure (e.g. EAGAIN under load) on the tmux list-sessions probe must
+			// not propagate: it becomes an unverifiable state so the caller's retry loop can re-probe.
+			const listSessionsThrows = await coordinatorOwnerIsolationProbe(async () => {
+				throw Object.assign(new Error("spawn tmux EAGAIN"), { code: "EAGAIN" });
+			});
+			expect(await listSessionsThrows.probeServer("portable")).toEqual({ state: "unverifiable" });
+
+			// The same must hold when list-sessions succeeds but the portable ps incarnation probe throws.
+			const psThrows = await coordinatorOwnerIsolationProbe(async command => {
+				if (command[0] === "ps") throw Object.assign(new Error("spawn ps EAGAIN"), { code: "EAGAIN" });
+				return { exitCode: 0, stdout: "4242 gjc-coordinator-test\n", stderr: "" };
+			});
+			expect(await psThrows.probeServer("portable")).toEqual({ state: "unverifiable" });
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+	});
 	it("refuses atomic cleanup after a post-spawn coordinator server replacement", async () => {
 		const root = await tempRoot();
 		const commands: string[][] = [];
