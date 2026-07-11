@@ -1320,6 +1320,18 @@ describe("Coordinator MCP server protocol", () => {
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
+	it("classifies a tmux >=3.7 'error connecting to' no-server diagnostic as absent, not unverifiable", async () => {
+		// tmux 3.7 reports a missing server socket as `error connecting to <path> (No such file or
+		// directory)` instead of the older `no server running on <path>`. The coordinator probe must
+		// read that as an absent server (a fresh coordinator socket has none yet); otherwise every
+		// session create fails closed with coordinator_tmux_owner_server_unverifiable on tmux >=3.7.
+		const noServer = await coordinatorOwnerIsolationProbe(async () => ({
+			exitCode: 1,
+			stdout: "",
+			stderr: "error connecting to /private/tmp/tmux-501/gjc-coordinator-abcd1234 (No such file or directory)",
+		}));
+		expect(await noServer.probeServer("gjc-coordinator-abcd1234")).toEqual({ state: "absent" });
+	});
 	it("refuses atomic cleanup after a post-spawn coordinator server replacement", async () => {
 		const root = await tempRoot();
 		const commands: string[][] = [];

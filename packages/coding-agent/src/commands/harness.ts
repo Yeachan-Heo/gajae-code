@@ -556,7 +556,7 @@ function isBoundedNoServerDiagnostic(stderr: Uint8Array): boolean {
 	return (
 		diagnostic.length > 0 &&
 		diagnostic.length <= 512 &&
-		/^(?:no server running on |failed to connect to server)/i.test(diagnostic.trim())
+		/^(?:no server running on |failed to connect to server|error connecting to )/i.test(diagnostic.trim())
 	);
 }
 

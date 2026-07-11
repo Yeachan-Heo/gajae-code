@@ -2392,7 +2392,9 @@ export async function coordinatorOwnerIsolationProbe(runner: CommandRunner): Pro
 				const result = await runner(["tmux", "-L", socketKey, "list-sessions", "-F", "#{pid} #{session_name}"]);
 				if (result.exitCode !== 0) {
 					const diagnostic = `${result.stdout}\n${result.stderr}`.slice(0, 512);
-					return /(?:no server running|failed to connect to server|no sessions)/i.test(diagnostic)
+					return /(?:no server running|failed to connect to server|no sessions|error connecting to)/i.test(
+						diagnostic,
+					)
 						? { state: "absent" }
 						: { state: "unverifiable" };
 				}
