@@ -26,7 +26,7 @@ import {
 	replaceOwnerGenerationSync,
 	type TmuxServerProof,
 } from "../gjc-runtime/tmux-owner-isolation";
-
+import { removeGjcTmuxSession, statusGjcTmuxSession } from "../gjc-runtime/tmux-sessions";
 import {
 	assertCoordinatorArtifactPath,
 	assertCoordinatorWorkdir,
@@ -35,6 +35,7 @@ import {
 	coordinatorNamespacePath,
 	requireCoordinatorMutation,
 } from "./policy";
+import { createSessionReaper, type ReapableSession, type SessionReaper } from "./session-reaper";
 
 export type { CoordinatorToolName };
 export { COORDINATOR_MCP_PROTOCOL_VERSION, COORDINATOR_MCP_SERVER_NAME, COORDINATOR_MCP_TOOL_NAMES };
@@ -215,6 +216,7 @@ interface CoordinatorSessionState {
 type CoordinatorEventKind =
 	| "session.registered"
 	| "session.started"
+	| "session.reaped"
 	| "session.state_changed"
 	| "turn.queued"
 	| "turn.delivering"
@@ -342,6 +344,23 @@ function toolSchema(name: CoordinatorToolName): {
 					allow_mutation: allowMutation,
 				},
 				required: ["cwd", "allow_mutation"],
+			},
+		};
+	}
+	if (name === "gjc_coordinator_stop_session") {
+		return {
+			name,
+			description:
+				"Reap a coordinator delegate-created (ephemeral) session: gracefully terminate its idle worker pane(s) and remove the tmux session, then purge its state files. Refuses non-ephemeral (user-registered) sessions unless force is set.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					session_id: sessionId,
+					force: { type: "boolean", description: "Allow stopping a non-ephemeral (user-registered) session." },
+					reason: { type: "string", description: "Optional audit reason recorded on the session.reaped event." },
+					allow_mutation: allowMutation,
+				},
+				required: ["session_id", "allow_mutation"],
 			},
 		};
 	}
@@ -744,6 +763,7 @@ const COORDINATOR_SESSION_STATES = new Set<CoordinatorSessionStateValue>([
 const COORDINATOR_EVENT_KINDS = new Set<CoordinatorEventKind>([
 	"session.registered",
 	"session.started",
+	"session.reaped",
 	"session.state_changed",
 	"turn.queued",
 	"turn.delivering",
@@ -2985,6 +3005,80 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	function sessionFile(sessionId: unknown): string {
 		return path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`);
 	}
+	// Reap a coordinator delegate-created session: gracefully terminate the idle worker pane(s),
+	// remove the tmux session, and purge state files. dev's removeGjcTmuxSession refuses live
+	// panes by design, so idle workers are SIGTERM'd first. Never touches non-ephemeral sessions
+	// unless force is set.
+	async function reapSession(
+		rawId: unknown,
+		opts: { force?: boolean; reason?: string } = {},
+	): Promise<{ ok: boolean; reason?: string; killed: boolean }> {
+		const id = safeExternalId("session", rawId);
+		const record = asRecord(await readJsonFile(sessionFile(id)));
+		if (!record) return { ok: false, reason: "unknown_session", killed: false };
+		if (record.ephemeral !== true && opts.force !== true) {
+			return { ok: false, reason: "not_ephemeral", killed: false };
+		}
+		const tmuxSession = optionalString(record.tmux_session) ?? optionalString(record.tmuxSession);
+		let killed = false;
+		if (tmuxSession) {
+			try {
+				const status = statusGjcTmuxSession(tmuxSession, env);
+				for (const pid of status.panePids) {
+					try {
+						process.kill(pid, "SIGTERM");
+					} catch {
+						// pane process already gone
+					}
+				}
+				if (status.panePids.length > 0) await new Promise(resolve => setTimeout(resolve, 250));
+				removeGjcTmuxSession(tmuxSession, env);
+				killed = true;
+			} catch {
+				// already gone / still live / not GJC-managed — best effort; still purge our records
+			}
+		}
+		await appendCoordinatorEvent(namespaceDir, {
+			kind: "session.reaped",
+			sessionId: id,
+			summary: `Session ${id} reaped${opts.reason ? ` (${opts.reason})` : ""}`,
+			metadata: { reason: opts.reason ?? null, killed, force: opts.force === true },
+		});
+		await fs.rm(sessionFile(id), { force: true });
+		await fs.rm(sessionStateFile(namespaceDir, id), { force: true });
+		await fs.rm(activeTurnFile(namespaceDir, id), { force: true });
+		return { ok: true, killed };
+	}
+
+	const sessionReaper: SessionReaper = createSessionReaper(
+		{
+			listSessions: async (): Promise<ReapableSession[]> => {
+				const out: ReapableSession[] = [];
+				for (const raw of await listSessions()) {
+					const rec = asRecord(raw);
+					if (rec?.ephemeral !== true) continue;
+					const sid = optionalString(rec.session_id);
+					if (!sid) continue;
+					const activeTurn = await readActiveTurn(namespaceDir, sid);
+					const state = await readSessionState(namespaceDir, sid);
+					const stamp = optionalString(state?.updated_at) ?? optionalString(rec.created_at);
+					const lastActivityMs = stamp ? Date.parse(stamp) : 0;
+					out.push({
+						sessionId: sid,
+						ephemeral: true,
+						hasActiveTurn: activeTurn !== null,
+						lastActivityMs: Number.isFinite(lastActivityMs) ? lastActivityMs : 0,
+					});
+				}
+				return out;
+			},
+			reapSession: async (sid: string): Promise<void> => {
+				await reapSession(sid, { reason: "idle_reaper" });
+			},
+			now: () => Date.now(),
+		},
+		{ idleTtlMs: config.sessionIdleTtlMs, sweepIntervalMs: config.sessionSweepIntervalMs },
+	);
 	async function compensateFailedOwnerStart(
 		session: Record<string, unknown>,
 		ownerTransaction: {
@@ -3498,6 +3592,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						rollback?: () => Promise<"cleaned" | "failed" | "unverifiable">;
 					} | null;
 					session = normalizeSession(startedRecord);
+					// Delegate-created sessions are ephemeral: the idle reaper may reclaim them once
+					// they are idle past the TTL with no active turn. User-registered sessions are not.
+					session.ephemeral = true;
 					try {
 						await writeJsonFile(sessionFile(session.session_id), session);
 						await appendCoordinatorEvent(namespaceDir, {
@@ -3618,6 +3715,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					}
 				}
 				return base;
+			}
+			if (name === "gjc_coordinator_stop_session") {
+				requireCoordinatorMutation(config, "sessions", args);
+				const result = await reapSession(args.session_id, {
+					force: args.force === true,
+					reason: optionalString(args.reason) ?? "stop_session",
+				});
+				return {
+					ok: result.ok,
+					session_id: safeExternalId("session", args.session_id),
+					killed: result.killed,
+					...(result.reason ? { reason: result.reason } : {}),
+				};
 			}
 			if (name === "gjc_coordinator_start_session") {
 				requireCoordinatorMutation(config, "sessions", args);
@@ -4057,7 +4167,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
-	return { config, callTool, handleJsonRpc, handle: handleJsonRpc };
+	return { config, callTool, handleJsonRpc, handle: handleJsonRpc, reapSession, sessionReaper };
 }
 
 function legacyToolResult(payload: unknown): {
@@ -4271,12 +4381,17 @@ export async function pumpCoordinatorMcpStream(
 
 export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
 	const server = createCoordinatorMcpServer(options);
-	await pumpCoordinatorMcpStream(
-		request => server.handleJsonRpc(request),
-		process.stdin,
-		line =>
-			new Promise<void>((resolve, reject) => {
-				process.stdout.write(line, err => (err ? reject(err) : resolve()));
-			}),
-	);
+	server.sessionReaper.start(); // idle-reap ephemeral delegate sessions in the background
+	try {
+		await pumpCoordinatorMcpStream(
+			request => server.handleJsonRpc(request),
+			process.stdin,
+			line =>
+				new Promise<void>((resolve, reject) => {
+					process.stdout.write(line, err => (err ? reject(err) : resolve()));
+				}),
+		);
+	} finally {
+		server.sessionReaper.stop();
+	}
 }
