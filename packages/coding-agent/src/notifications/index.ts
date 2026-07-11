@@ -603,18 +603,41 @@ function mapAnswerToLabel(answerJson: string, options: string[]): string | undef
 	return undefined;
 }
 
-/** Map a client answer to the workflow-gate answer shape (unattended mode). */
-function mapAnswerToGate(
-	answerJson: string,
-	options: string[],
-): { selected: string[]; other?: boolean; custom?: string } {
+/** Workflow-gate answer shape (unattended mode). */
+interface GateAnswer {
+	selected: string[];
+	other?: boolean;
+	custom?: string;
+}
+
+/**
+ * Discriminated result of mapping a client answer to a workflow-gate answer.
+ * `ok: false` means the reply is invalid and the caller must close the exact
+ * claim/receipt and reissue the interaction rather than durably accepting it.
+ */
+type GateAnswerResult = { ok: true; answer: GateAnswer } | { ok: false; reason: string };
+
+/**
+ * Map a client answer to the workflow-gate answer shape (unattended mode).
+ *
+ * The protocol defines a numeric reply as an option index, so a number outside
+ * `options` is invalid (issue #2030): it must NOT be converted into a free-text
+ * `Other` that passes the ask schema and triggers a misleading success ack.
+ * Only JSON strings enter the free-text/Other path.
+ */
+export function mapAnswerToGate(answerJson: string, options: string[]): GateAnswerResult {
 	const answer = parseAnswer(answerJson);
 	if (typeof answer === "number") {
 		const label = options[answer];
-		return label === undefined ? { selected: [], other: true, custom: String(answer) } : { selected: [label] };
+		return label === undefined
+			? { ok: false, reason: "numeric_selector_out_of_range" }
+			: { ok: true, answer: { selected: [label] } };
 	}
 	if (typeof answer === "string") {
-		return options.includes(answer) ? { selected: [answer] } : { selected: [], other: true, custom: answer };
+		return {
+			ok: true,
+			answer: options.includes(answer) ? { selected: [answer] } : { selected: [], other: true, custom: answer },
+		};
 	}
 	if (answer && typeof answer === "object") {
 		const obj = answer as { selected?: unknown; custom?: unknown };
@@ -622,9 +645,9 @@ function mapAnswerToGate(
 			? obj.selected.map(s => (typeof s === "number" ? (options[s] ?? String(s)) : String(s)))
 			: [];
 		const custom = typeof obj.custom === "string" ? obj.custom : undefined;
-		return { selected, other: custom !== undefined, custom };
+		return { ok: true, answer: { selected, other: custom !== undefined, custom } };
 	}
-	return { selected: [] };
+	return { ok: true, answer: { selected: [] } };
 }
 
 interface NotificationControlCommandPayload {
@@ -1097,7 +1120,16 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 				} else if (presentation?.multi && typeof rawAnswer === "string") {
 					answer = { selected: presentation.selectedOptions, other: true, custom: rawAnswer };
 				} else {
-					answer = mapAnswerToGate(reply.answerJson, gateOptions.get(gateId) ?? []);
+					const mapped = mapAnswerToGate(reply.answerJson, gateOptions.get(gateId) ?? []);
+					if (!mapped.ok) {
+						// A numeric selector outside options is invalid (issue #2030): close the
+						// exact claim/receipt and reissue the interaction — never a success ack.
+						native.closeClaimInvalid(reply.replyReceiptId, mapped.reason);
+						gatePresentations.closeInteraction(reply.id, mapped.reason);
+						gatePresentations.reissue(gateId);
+						return;
+					}
+					answer = mapped.answer;
 				}
 				void gate
 					.resolveGateFromNotification(

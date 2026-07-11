@@ -209,6 +209,33 @@ describe("SQLite tool support", () => {
 		});
 		expect(parseSqliteSelector("", "q=SELECT+1")).toEqual({ kind: "raw", sql: "SELECT 1" });
 	});
+	it("requires complete decimal integers for SQLite pagination", () => {
+		for (const value of ["2.5", "2rows", "2e1", "0x10"]) {
+			expect(() => parseSqliteSelector("users", `limit=${value}`)).toThrow(
+				`SQLite limit must be a positive integer; got '${value}'`,
+			);
+			expect(() => parseSqliteSelector("users", `offset=${value}`)).toThrow(
+				`SQLite offset must be a non-negative integer; got '${value}'`,
+			);
+		}
+
+		expect(parseSqliteSelector("users", "limit=1&offset=0")).toEqual({
+			kind: "query",
+			table: "users",
+			limit: 1,
+			offset: 0,
+			order: undefined,
+			where: undefined,
+		});
+		expect(parseSqliteSelector("users", "limit=500&offset=0")).toEqual({
+			kind: "query",
+			table: "users",
+			limit: 500,
+			offset: 0,
+			order: undefined,
+			where: undefined,
+		});
+	});
 
 	it("lists tables for a .sqlite database and excludes sqlite internal tables", async () => {
 		const result = await readTool.execute("sqlite-list", { path: sqlitePath });

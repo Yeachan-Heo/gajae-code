@@ -22,7 +22,15 @@ EVIDENCE_DIR="$REPO_ROOT/.gjc/_session-$SESSION_ID/runtime/evidence/issue-1938"
 EVIDENCE_PATH="$EVIDENCE_DIR/$PHASE.json"
 
 
-now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now() {
+  if [[ "${GJC_ISSUE1938_TEST_DISABLE_PYTHON:-}" != 1 ]] && command -v python3 >/dev/null 2>&1; then
+    python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'
+  elif [[ "${GJC_ISSUE1938_TEST_DISABLE_BUN:-}" != 1 ]] && command -v bun >/dev/null 2>&1; then
+    bun -e 'console.log(new Date().toISOString())'
+  else
+    date -u +%Y-%m-%dT%H:%M:%SZ
+  fi
+}
 LINUX=false; [[ "$(uname -s)" == Linux ]] && LINUX=true
 PROC=false; [[ -r /proc/self/cgroup && -r /proc/self/stat ]] && PROC=true
 SYSTEMCTL_USER=false; command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1 && SYSTEMCTL_USER=true
@@ -63,7 +71,7 @@ write_evidence() {
 import json, os, sys
 completed = None if os.environ["COMPLETED_AT"] == "null" else os.environ["COMPLETED_AT"]
 def nullable(name): return os.environ[name] or None
-payload = {"schema_version":1,"issue":"1938","phase":os.environ["PHASE"],"status":os.environ["STATUS"],"generated_at":__import__("datetime").datetime.now(__import__("datetime").timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z"),"source_revision":nullable("SOURCE_REVISION"),"run_nonce":nullable("RUN_NONCE"),"capabilities":{key:os.environ[key.upper()] == "true" for key in ("linux","proc","systemctl_user","systemd_run_user","python3","script","tmux","git","bun","disposable_unit")},"cases":json.loads(os.environ["CASES"]),"cleanup":{"status":os.environ["CLEANUP_STATUS"],"unit":nullable("SERVICE_UNIT"),"scope":nullable("SCOPE_UNIT"),"completed_at":completed}}
+payload = {"schema_version":1,"issue":"1938","phase":os.environ["PHASE"],"status":os.environ["STATUS"],"generated_at":__import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="milliseconds").replace("+00:00","Z"),"source_revision":nullable("SOURCE_REVISION"),"run_nonce":nullable("RUN_NONCE"),"capabilities":{key:os.environ[key.upper()] == "true" for key in ("linux","proc","systemctl_user","systemd_run_user","python3","script","tmux","git","bun","disposable_unit")},"cases":json.loads(os.environ["CASES"]),"cleanup":{"status":os.environ["CLEANUP_STATUS"],"unit":nullable("SERVICE_UNIT"),"scope":nullable("SCOPE_UNIT"),"completed_at":completed}}
 with open(sys.argv[1], "w", encoding="utf-8") as handle: json.dump(payload, handle, separators=(",",":")); handle.write("\n")
 if os.environ.get("GJC_ISSUE1938_TEST_FAIL_PYTHON_SERIALIZER") == "1": raise SystemExit(1)
 PY

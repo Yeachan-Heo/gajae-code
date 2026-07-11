@@ -7,7 +7,7 @@ import threading
 import time
 import unittest
 
-from gjc_rpc import RpcClient, RpcCommandError, RpcConcurrencyError, RpcError, host_tool
+from gjc_rpc import RpcClient, RpcCommandError, RpcConcurrencyError, RpcError, host_tool, host_uri
 
 
 FAKE_SERVER = textwrap.dedent(
@@ -496,6 +496,35 @@ HEADLESS_UI_ECHO_SERVER = textwrap.dedent(
     """
 )
 
+POST_READY_SETUP_FAILURE_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    print(json.dumps({"type": "ready"}), flush=True)
+
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+
+        command = json.loads(raw_line)
+        if command["type"] in {"set_host_tools", "set_host_uri_schemes"}:
+            print(
+                json.dumps(
+                    {
+                        "id": command["id"],
+                        "type": "response",
+                        "command": command["type"],
+                        "success": False,
+                        "error": "post-ready setup failed",
+                    }
+                ),
+                flush=True,
+            )
+    """
+)
+
 IDLESS_ERROR_SERVER = textwrap.dedent(
     """
     import json
@@ -749,6 +778,60 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(len(end_events), 1)
             self.assertEqual(end_events[0].result["content"][0]["text"], "host:hello")
 
+    def test_post_ready_setup_failure_stops_process_and_clears_client_state(self) -> None:
+        setups = (
+            (
+                "custom_tools",
+                "set_host_tools",
+                {
+                    "custom_tools": (
+                        host_tool(
+                            name="startup_tool",
+                            description="Fails during startup registration",
+                            parameters={"type": "object"},
+                            execute=lambda _args, _context: "unused",
+                        ),
+                    )
+                },
+            ),
+            (
+                "host_uris",
+                "set_host_uri_schemes",
+                {
+                    "host_uris": (
+                        host_uri(
+                            scheme="startup",
+                            read=lambda _url, _context: "unused",
+                        ),
+                    )
+                },
+            ),
+        )
+
+        for setup, command, kwargs in setups:
+            with self.subTest(setup=setup):
+                client = self.make_client(server=POST_READY_SETUP_FAILURE_SERVER, **kwargs)
+                stopped_processes = []
+                stop = client.stop
+
+                def capture_stop() -> None:
+                    if client._process is not None:
+                        stopped_processes.append(client._process)
+                    stop()
+
+                client.stop = capture_stop  # type: ignore[method-assign]
+
+                with self.assertRaises(RpcCommandError) as ctx:
+                    client.start()
+
+                self.assertEqual(ctx.exception.command, command)
+                self.assertEqual(ctx.exception.error, "post-ready setup failed")
+                self.assertEqual(len(stopped_processes), 1)
+                self.assertIsNotNone(stopped_processes[0].poll())
+                self.assertIsNone(client._process)
+                self.assertIsNone(client._stdout_thread)
+                self.assertIsNone(client._stderr_thread)
+                self.assertEqual(client._pending, {})
     def test_extension_ui_round_trip(self) -> None:
         with self.make_client() as client:
             client.prompt("needs ui")

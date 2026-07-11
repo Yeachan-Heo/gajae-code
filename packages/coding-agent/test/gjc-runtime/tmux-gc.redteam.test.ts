@@ -37,6 +37,8 @@ function sessionLine(overrides: {
 	project?: string;
 	sessionId?: string;
 	sessionStateFile?: string;
+	ownerGeneration?: string;
+	nativeSessionId?: string;
 }): string {
 	return [
 		overrides.name,
@@ -52,6 +54,9 @@ function sessionLine(overrides: {
 		overrides.project ?? "",
 		overrides.sessionId ?? "",
 		overrides.sessionStateFile ?? "",
+		overrides.ownerGeneration ?? "generation-1",
+		"",
+		overrides.nativeSessionId ?? "$1",
 	].join("\t");
 }
 
@@ -109,6 +114,8 @@ describe("tmux GC red-team adversarial safety", () => {
 				session_id: "toctou-session",
 				state: "completed",
 				cwd: "/tmp/gjc-redteam-deleted-project",
+				workdir: "/tmp/gjc-redteam-deleted-project",
+				session_file: null,
 			}),
 		);
 		const calls: string[][] = [];
@@ -132,10 +139,12 @@ describe("tmux GC red-team adversarial safety", () => {
 					}),
 				);
 			}
+			if (cmd.includes("display-message") && cmd.at(-1) === "#{session_id}") return spawnResult(0, "$1\n");
 			if (optionValue(cmd, "@gjc-profile")) return spawnResult(0, "1\n");
 			if (optionValue(cmd, "@gjc-project")) return spawnResult(0, "/tmp/gjc-redteam-deleted-project\n");
 			if (optionValue(cmd, "@gjc-branch")) return spawnResult(0, "deleted-branch\n");
 			if (optionValue(cmd, "@gjc-session-id")) return spawnResult(0, "toctou-session\n");
+			if (optionValue(cmd, "@gjc-owner-generation")) return spawnResult(0, "generation-1\n");
 			if (optionValue(cmd, "@gjc-session-state-file")) return spawnResult(0, `${stateFile}\n`);
 			return spawnResult(0, "");
 		});
@@ -222,5 +231,67 @@ describe("tmux GC red-team adversarial safety", () => {
 			skipped: "not_removable_tmux_session",
 		});
 		expect(calls).not.toContainEqual(["tmux-redteam", "kill-session", "-t", "=gajae_code_idle_orphan"]);
+	});
+
+	it("refuses a same-name replacement with a different native session identity", async () => {
+		const stateFile = "/tmp/gjc-redteam-native-identity-marker.json";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "collected-session",
+				state: "completed",
+				cwd: "/tmp/gjc-redteam-deleted-project",
+				workdir: "/tmp/gjc-redteam-deleted-project",
+				session_file: null,
+			}),
+		);
+		const calls: string[][] = [];
+		let richListCount = 0;
+		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+		spawnSyncSpy.mockImplementation((cmd: string[]) => {
+			calls.push(cmd);
+			if (cmd.includes("list-sessions")) {
+				const format = cmd[cmd.indexOf("-F") + 1] ?? "";
+				if (format === "#{session_name}") return spawnResult(0, "gajae_code_reused_name\n");
+				richListCount += 1;
+				return spawnResult(
+					0,
+					sessionLine({
+						name: "gajae_code_reused_name",
+						branch: "deleted-branch",
+						project: "/tmp/gjc-redteam-deleted-project",
+						sessionId: richListCount === 1 ? "collected-session" : "replacement-session",
+						nativeSessionId: richListCount === 1 ? "$1" : "$2",
+						sessionStateFile: stateFile,
+						ownerGeneration: richListCount === 1 ? "generation-one" : "generation-two",
+					}),
+				);
+			}
+			if (cmd.includes("display-message") && cmd.at(-1) === "#{session_id}")
+				return spawnResult(0, richListCount === 1 ? "$1\n" : "$2\n");
+			if (optionValue(cmd, "@gjc-profile")) return spawnResult(0, "1\n");
+			if (optionValue(cmd, "@gjc-project")) return spawnResult(0, "/tmp/gjc-redteam-deleted-project\n");
+			if (optionValue(cmd, "@gjc-branch")) return spawnResult(0, "deleted-branch\n");
+			if (optionValue(cmd, "@gjc-session-id"))
+				return spawnResult(0, richListCount === 1 ? "collected-session\n" : "replacement-session\n");
+			if (optionValue(cmd, "@gjc-session-state-file")) return spawnResult(0, `${stateFile}\n`);
+			if (optionValue(cmd, "@gjc-owner-generation"))
+				return spawnResult(0, richListCount === 1 ? "generation-one\n" : "generation-two\n");
+			return spawnResult(0, "");
+		});
+		try {
+			const result = await tmuxSessionsGcAdapter.collect(ctx());
+			const record = result.records.find(entry => entry.id === "gajae_code_reused_name");
+
+			expect(record).toMatchObject({ status: "stale", removable: true });
+			expect(await tmuxSessionsGcAdapter.prune(record!, ctx())).toEqual({
+				removed: false,
+				skipped: "tmux_revalidation_failed_or_became_live",
+			});
+			expect(calls.some(call => call.includes("kill-session"))).toBe(false);
+		} finally {
+			await fs.rm(stateFile, { force: true });
+		}
 	});
 });

@@ -1180,6 +1180,33 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 	}
 }
 
+// Per-session mutation lock. Concurrent stdio dispatch (see pumpCoordinatorMcpStream) makes
+// same-session read-modify-write tool calls (notably send_prompt: read active turn → decide →
+// write new turn) interleave, which could persist two "active" turns while only one active-turn
+// pointer survives. Serializing per session — same promise-chain shape as eventAppendQueues —
+// restores the atomicity the former serial read loop provided, without serializing across
+// sessions or blocking long read-only polls (await_turn/watch_events). This is an in-process
+// lock distinct from the file-based withSessionStateLock/withCoordinatorTransaction, so it can
+// never deadlock by nesting inside them.
+const sessionMutationQueues = new Map<string, Promise<unknown>>();
+
+async function withSessionMutation<T>(key: string, fn: () => Promise<T>): Promise<T> {
+	const previous = sessionMutationQueues.get(key) ?? Promise.resolve();
+	const { promise: current, resolve: release } = Promise.withResolvers<void>();
+	const queued = previous.then(
+		() => current,
+		() => current,
+	);
+	sessionMutationQueues.set(key, queued);
+	await previous.catch(() => undefined);
+	try {
+		return await fn();
+	} finally {
+		release();
+		if (sessionMutationQueues.get(key) === queued) sessionMutationQueues.delete(key);
+	}
+}
+
 function parseCoordinatorEvent(line: string): CoordinatorEvent {
 	let event: unknown;
 	try {
@@ -3673,70 +3700,66 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (name === "gjc_coordinator_send_prompt") {
 				requireCoordinatorMutation(config, "sessions", args);
 				const sessionId = safeExternalId("session", args.session_id);
-				await preflightCoordinatorMutation(namespaceDir, sessionId);
-
-				const session = asRecord(await readJsonFile(sessionFile(sessionId)));
-				if (!session)
-					return {
-						ok: false,
-						reason: "unknown_session",
+				return await withSessionMutation(`${namespaceDir}::${sessionId}`, async () => {
+					await preflightCoordinatorMutation(namespaceDir, sessionId);
+					const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+					if (!session) return { ok: false, reason: "unknown_session", session_id: sessionId };
+					if (typeof args.prompt !== "string" || args.prompt.length === 0)
+						return { ok: false, reason: "prompt_required" };
+					await readSessionState(namespaceDir, sessionId);
+					await readLatestEventSeq(namespaceDir);
+					const activeTurn = await readActiveTurn(namespaceDir, sessionId);
+					if (activeTurn && args.force !== true && args.queue !== true) {
+						return {
+							ok: false,
+							reason: "active_turn_exists",
+							session_id: sessionId,
+							active_turn_id: activeTurn.turn_id,
+						};
+					}
+					if (activeTurn && args.force === true) {
+						const timestamp = new Date().toISOString();
+						const superseded = {
+							...activeTurn,
+							status: "superseded" as const,
+							updated_at: timestamp,
+							completed_at: timestamp,
+						};
+						await writeTurnRecord(namespaceDir, superseded);
+						await clearActiveTurn(namespaceDir, superseded);
+					}
+					const shouldQueue = args.queue === true && args.force !== true;
+					const turn = shouldQueue
+						? makeTurnRecord(config, sessionId, args.prompt, "queued")
+						: await activateTurn(session, makeTurnRecord(config, sessionId, args.prompt, "active"));
+					if (shouldQueue) await writeTurnRecord(namespaceDir, turn);
+					const recordedTurn = turn;
+					const prompt = {
 						session_id: sessionId,
+						turn_id: recordedTurn.turn_id,
+						prompt: args.prompt,
+						queued: recordedTurn.delivery.queued,
+						delivered: recordedTurn.delivery.delivered,
+						tmux_keys_sent: recordedTurn.delivery.tmux_keys_sent ?? false,
+						prompt_acknowledged: recordedTurn.delivery.prompt_acknowledged ?? false,
+						created_at: recordedTurn.created_at,
 					};
-				if (typeof args.prompt !== "string" || args.prompt.length === 0)
-					return { ok: false, reason: "prompt_required" };
-				await readSessionState(namespaceDir, sessionId);
-				await readLatestEventSeq(namespaceDir);
-				const activeTurn = await readActiveTurn(namespaceDir, sessionId);
-				if (activeTurn && args.force !== true && args.queue !== true) {
+					await writeJsonFile(path.join(namespaceDir, "prompts", `${Date.now()}.json`), prompt);
 					return {
-						ok: false,
-						reason: "active_turn_exists",
+						ok: true,
 						session_id: sessionId,
-						active_turn_id: activeTurn.turn_id,
+						turn_id: recordedTurn.turn_id,
+						active_turn_id: shouldQueue ? activeTurn?.turn_id : recordedTurn.turn_id,
+						status: recordedTurn.status,
+						queued: recordedTurn.delivery.queued,
+						delivered: recordedTurn.delivery.delivered,
+						delivery: recordedTurn.delivery,
+						prompt,
+						tmux_keys_sent: recordedTurn.delivery.tmux_keys_sent ?? false,
+						prompt_acknowledged: recordedTurn.delivery.prompt_acknowledged ?? false,
+						session_state: await readSessionState(namespaceDir, sessionId),
 					};
-				}
-				if (activeTurn && args.force === true) {
-					const timestamp = new Date().toISOString();
-					const superseded = {
-						...activeTurn,
-						status: "superseded" as const,
-						updated_at: timestamp,
-						completed_at: timestamp,
-					};
-					await writeTurnRecord(namespaceDir, superseded);
-					await clearActiveTurn(namespaceDir, superseded);
-				}
-				const shouldQueue = args.queue === true && args.force !== true;
-				const turn = shouldQueue
-					? makeTurnRecord(config, sessionId, args.prompt, "queued")
-					: await activateTurn(session, makeTurnRecord(config, sessionId, args.prompt, "active"));
-				if (shouldQueue) await writeTurnRecord(namespaceDir, turn);
-				const recordedTurn = turn;
-				const prompt = {
-					session_id: sessionId,
-					turn_id: recordedTurn.turn_id,
-					prompt: args.prompt,
-					queued: recordedTurn.delivery.queued,
-					delivered: recordedTurn.delivery.delivered,
-					tmux_keys_sent: recordedTurn.delivery.tmux_keys_sent ?? false,
-					prompt_acknowledged: recordedTurn.delivery.prompt_acknowledged ?? false,
-					created_at: recordedTurn.created_at,
-				};
-				await writeJsonFile(path.join(namespaceDir, "prompts", `${Date.now()}.json`), prompt);
-				return {
-					ok: true,
-					session_id: sessionId,
-					turn_id: recordedTurn.turn_id,
-					active_turn_id: shouldQueue ? activeTurn?.turn_id : recordedTurn.turn_id,
-					status: recordedTurn.status,
-					queued: recordedTurn.delivery.queued,
-					delivered: recordedTurn.delivery.delivered,
-					delivery: recordedTurn.delivery,
-					prompt,
-					tmux_keys_sent: recordedTurn.delivery.tmux_keys_sent ?? false,
-					prompt_acknowledged: recordedTurn.delivery.prompt_acknowledged ?? false,
-					session_state: await readSessionState(namespaceDir, sessionId),
-				};
+				});
 			}
 			if (name === "gjc_coordinator_read_turn") {
 				return await readTurnPayload(args.turn_id, args.session_id, args.lines);
@@ -3999,6 +4022,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				},
 			};
 		}
+		if (request.method === "ping") {
+			return { jsonrpc: "2.0", id, result: {} };
+		}
 		if (request.method === "tools/list") {
 			return {
 				jsonrpc: "2.0",
@@ -4096,23 +4122,161 @@ export async function handleCoordinatorMcpRequest(
 	};
 }
 
-export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
-	const server = createCoordinatorMcpServer(options);
+export interface PumpCoordinatorOptions {
+	/** Max concurrent in-flight *data* (non-control) handlers. Control frames (ping) bypass this. */
+	maxDataConcurrency?: number;
+	/** Max data requests queued waiting for a slot before overflow is rejected as server_busy. */
+	maxQueueDepth?: number;
+	/** Bounded wait for in-flight handlers/writes to settle after input ends. */
+	drainTimeoutMs?: number;
+}
+
+/**
+ * Pump a newline-delimited JSON-RPC stream with BOUNDED concurrent dispatch.
+ *
+ * A long-running tool call (e.g. gjc_coordinator_await_turn, which polls for
+ * minutes) must not block the read loop from answering keepalive pings on the
+ * same stdio channel. But naive unbounded concurrency reintroduces its own
+ * hazards, so this pump enforces the safety envelope the coordinator needs:
+ *
+ *  - Control frames (ping) bypass the data-concurrency cap → keepalive is always
+ *    answerable even while data handlers saturate.
+ *  - Data handlers are capped at `maxDataConcurrency`; excess is queued up to
+ *    `maxQueueDepth`, then rejected as `server_busy` (bounded memory / fanout).
+ *  - `writeLine` failures move the writer to a terminal closed state instead of
+ *    poisoning the serialized write chain or escaping as an unhandled rejection;
+ *    no writes happen after close.
+ *  - On EOF the pump drains in-flight handlers (bounded by `drainTimeoutMs`) and
+ *    flushes queued writes before returning, so shutdown never races live work.
+ *  - Byte chunks are decoded with a streaming decoder so multibyte characters
+ *    split across chunks are not corrupted.
+ */
+export async function pumpCoordinatorMcpStream(
+	handleJsonRpc: (request: JsonRpcRequest) => Promise<JsonRpcResponse>,
+	input: AsyncIterable<string | Uint8Array>,
+	writeLine: (line: string) => void | Promise<void>,
+	options: PumpCoordinatorOptions = {},
+): Promise<void> {
+	const maxDataConcurrency = Math.max(1, options.maxDataConcurrency ?? 32);
+	const maxQueueDepth = Math.max(0, options.maxQueueDepth ?? 256);
+	const drainTimeoutMs = Math.max(0, options.drainTimeoutMs ?? 30_000);
+
+	let writeClosed = false;
+	let draining = false;
+	let writeChain: Promise<void> = Promise.resolve();
+	const inFlight = new Set<Promise<void>>();
+	let activeData = 0;
+	const dataQueue: JsonRpcRequest[] = [];
+
+	const emit = (response: JsonRpcResponse): void => {
+		writeChain = writeChain.then(async () => {
+			if (writeClosed) return;
+			try {
+				await writeLine(`${JSON.stringify(response)}\n`);
+			} catch {
+				writeClosed = true; // terminal writer error: stop, but never poison the chain
+			}
+		});
+	};
+
+	const launch = (request: JsonRpcRequest, control: boolean): void => {
+		const task = (async () => {
+			try {
+				emit(await handleJsonRpc(request));
+			} catch (err) {
+				emit({
+					jsonrpc: "2.0",
+					id: request.id ?? null,
+					error: { code: -32603, message: publicCoordinatorError(err) },
+				});
+			} finally {
+				if (!control) {
+					activeData -= 1;
+					if (!draining) {
+						const next = dataQueue.shift();
+						if (next) {
+							activeData += 1;
+							launch(next, false);
+						}
+					}
+				}
+			}
+		})();
+		inFlight.add(task);
+		void task.finally(() => inFlight.delete(task));
+	};
+
+	const dispatch = (request: JsonRpcRequest): void => {
+		// Notifications (no id) get no response; the coordinator has no side-effecting ones.
+		if (request.id === undefined || request.id === null) return;
+		if (request.method === "ping") {
+			launch(request, true); // control frame: bypass the data cap
+			return;
+		}
+		if (activeData < maxDataConcurrency) {
+			activeData += 1;
+			launch(request, false);
+			return;
+		}
+		if (dataQueue.length < maxQueueDepth) {
+			dataQueue.push(request);
+			return;
+		}
+		emit({
+			jsonrpc: "2.0",
+			id: request.id,
+			error: { code: -32000, message: "server_busy: coordinator request queue is full" },
+		});
+	};
+
+	const decoder = new TextDecoder();
 	let buffer = "";
-	for await (const chunk of process.stdin) {
-		buffer += chunk.toString();
+	for await (const chunk of input) {
+		buffer += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
 		let newline = buffer.indexOf("\n");
 		while (newline >= 0) {
 			const line = buffer.slice(0, newline).trim();
 			buffer = buffer.slice(newline + 1);
 			if (line.length > 0) {
-				const request = JSON.parse(line) as JsonRpcRequest;
-				if (request.id !== undefined && request.id !== null) {
-					const response = await server.handleJsonRpc(request);
-					process.stdout.write(`${JSON.stringify(response)}\n`);
+				let request: JsonRpcRequest | null = null;
+				try {
+					request = JSON.parse(line) as JsonRpcRequest;
+				} catch {
+					request = null; // ignore malformed frames rather than crashing the loop
 				}
+				if (request) dispatch(request);
 			}
 			newline = buffer.indexOf("\n");
 		}
 	}
+
+	// EOF: stop promoting queued work, then drain in-flight handlers under a bound.
+	draining = true;
+	if (inFlight.size > 0) {
+		const drain = Promise.allSettled(Array.from(inFlight)).then(() => undefined);
+		if (drainTimeoutMs > 0) {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const timeout = new Promise<void>(resolve => {
+				timer = setTimeout(resolve, drainTimeoutMs);
+				(timer as { unref?: () => void }).unref?.();
+			});
+			await Promise.race([drain, timeout]);
+			if (timer) clearTimeout(timer);
+		} else {
+			await drain;
+		}
+	}
+	await writeChain;
+}
+
+export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOptions = {}): Promise<void> {
+	const server = createCoordinatorMcpServer(options);
+	await pumpCoordinatorMcpStream(
+		request => server.handleJsonRpc(request),
+		process.stdin,
+		line =>
+			new Promise<void>((resolve, reject) => {
+				process.stdout.write(line, err => (err ? reject(err) : resolve()));
+			}),
+	);
 }

@@ -160,3 +160,42 @@ describe("native text helpers — Hangul Compatibility Jamo width parity", () =>
 		expect(sliceWithWidth(input, 0, 8, true).width).toBe(8);
 	});
 });
+
+describe("native text helpers — CRLF control-boundary width parity", () => {
+	// `unicode-segmentation` emits CRLF as a single grapheme and
+	// `UnicodeWidthStr::width("\r\n") == 1`, disagreeing with the module's
+	// zero-width control-character policy. A non-ASCII scalar in the same
+	// string routes the whole run through the grapheme path, so CRLF must be
+	// corrected to zero width to keep the width primitive context-independent.
+	const cases: Array<[string, number]> = [
+		["한\r\n", 2],
+		["\r\n한", 2],
+		["한\r\n글", 4],
+		["字\r\n漢", 4],
+		["한字\r\n漢글", 8],
+		["안녕\r\n하세요", 10],
+	];
+
+	it("scalar visibleWidth keeps CRLF zero-width next to Korean/CJK", () => {
+		for (const [input, expected] of cases) {
+			expect(visibleWidth(input)).toBe(expected);
+		}
+	});
+
+	it("batch visibleWidths matches scalar for CRLF cases", () => {
+		const inputs = cases.map(([input]) => input);
+		const expected = cases.map(([, width]) => width);
+		expect(visibleWidths(inputs)).toEqual(expected);
+		for (const [input, width] of cases) {
+			expect(visibleWidths([input])).toEqual([width]);
+		}
+	});
+
+	it("CRLF contributes no columns beyond the surrounding text", () => {
+		for (const [input, expected] of cases) {
+			const withoutCrlf = input.replaceAll(/[\r\n]/g, "");
+			expect(visibleWidth(input)).toBe(visibleWidth(withoutCrlf));
+			expect(visibleWidth(withoutCrlf)).toBe(expected);
+		}
+	});
+});

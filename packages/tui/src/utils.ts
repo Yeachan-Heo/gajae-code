@@ -183,7 +183,7 @@ export interface ViewportAnchorAnnotation {
 // Kitty graphics prefix and TERMINAL.isImageLine() would misclassify every
 // annotated line as an image line, which skips wrapping (issue: assistant
 // prose overflowing the terminal on Kitty-protocol terminals).
-const VIEWPORT_ANCHOR_PREFIX = "\x1b_AGJC_ANCHOR:";
+export const VIEWPORT_ANCHOR_PREFIX = "\x1b_AGJC_ANCHOR:";
 const VIEWPORT_ANCHOR_SUFFIX = "\x1b\\";
 
 function ansiSequenceEnd(text: string, start: number): number {

@@ -121,7 +121,7 @@ describe("gjc mcp-serve coordinator", () => {
 			{ env },
 		);
 		const payload = JSON.parse(called.result.content[0].text);
-		expect(payload).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled:sessions" });
+		expect(payload).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled" });
 	});
 
 	it("requires startup mutation class and per-call allow_mutation for mutating tools", async () => {
@@ -130,6 +130,7 @@ describe("gjc mcp-serve coordinator", () => {
 			const env = {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES: "session",
+				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".state"),
 			};
 			const missingPerCall = await handleCoordinatorMcpRequest(
 				{
@@ -142,13 +143,21 @@ describe("gjc mcp-serve coordinator", () => {
 					env,
 					createSession: () => {
 						created = true;
-						return { name: "x", attached: false, windows: 1, panes: 1, bindings: "root", createdAt: "now" };
+						return {
+							name: "x",
+							cwd: root,
+							attached: false,
+							windows: 1,
+							panes: 1,
+							bindings: "root",
+							createdAt: "now",
+						};
 					},
 				},
 			);
 			expect(JSON.parse(missingPerCall.result.content[0].text)).toEqual({
 				ok: false,
-				reason: "coordinator_mutation_call_not_allowed:sessions",
+				reason: "coordinator_mutation_call_not_allowed",
 			});
 
 			const allowed = await handleCoordinatorMcpRequest(
@@ -162,7 +171,15 @@ describe("gjc mcp-serve coordinator", () => {
 					env,
 					createSession: () => {
 						created = true;
-						return { name: "x", attached: false, windows: 1, panes: 1, bindings: "root", createdAt: "now" };
+						return {
+							name: "x",
+							cwd: root,
+							attached: false,
+							windows: 1,
+							panes: 1,
+							bindings: "root",
+							createdAt: "now",
+						};
 					},
 				},
 			);
@@ -229,7 +246,7 @@ describe("gjc mcp-serve coordinator", () => {
 				server.callTool("gjc_coordinator_read_artifact", { path: path.join(os.tmpdir(), "missing.txt") }),
 			).resolves.toEqual({
 				ok: false,
-				reason: "artifact_outside_allowed_roots",
+				reason: "coordinator_artifact_outside_allowed_roots",
 			});
 		});
 	});
@@ -266,7 +283,7 @@ describe("gjc mcp-serve coordinator", () => {
 			}
 
 			const deniedStart = await server.callTool("gjc_coordinator_start_session", { cwd: root });
-			expect(deniedStart).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed:sessions" });
+			expect(deniedStart).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed" });
 
 			const started = await server.callTool("gjc_coordinator_start_session", {
 				cwd: root,
@@ -405,7 +422,7 @@ describe("coordinator delegate tools", () => {
 				task: "Plan it",
 				allow_mutation: true,
 			});
-			expect(denied).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled:sessions" });
+			expect(denied).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled" });
 		});
 	});
 
@@ -417,7 +434,7 @@ describe("coordinator delegate tools", () => {
 				services: delegateServices(),
 			});
 			const denied = await server.callTool("gjc_delegate_execute", { cwd: root, task: "Run it" });
-			expect(denied).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed:sessions" });
+			expect(denied).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed" });
 		});
 	});
 

@@ -2,7 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { RpcWorkflowGate } from "../src/modes/rpc/rpc-types";
+import type { RpcWorkflowGate, RpcWorkflowGateResolution, RpcWorkflowGateResponse } from "../src/modes/rpc/rpc-types";
+import type { NotificationGateResolutionOptions } from "../src/modes/shared/agent-wire/unattended-session";
 import { createNotificationsExtension } from "../src/notifications/index";
 import { getAskAnswerSource, notifyWorkflowGateEmitterChanged } from "../src/tools/ask-answer-registry";
 
@@ -268,5 +269,174 @@ test("attaches unattended workflow gates installed after session_start", async (
 	} finally {
 		notifyWorkflowGateEmitterChanged(harness.sessionId, undefined);
 		await harness.restore();
+	}
+}, 20_000);
+
+interface ResolveCall {
+	answer: unknown;
+}
+
+/**
+ * Stand up an unattended workflow gate over a live notification socket. The mock
+ * gate records every `resolveGateFromNotification` call so a test can assert that
+ * an invalid numeric selector never reaches the durable-accept / ack path.
+ */
+async function startUnattendedGate(opts: {
+	options: string[];
+	multi?: boolean;
+	onResolve?: (options: NotificationGateResolutionOptions) => Promise<void> | void;
+}) {
+	const harness = await startInteractiveNotifications();
+	const ws = new WebSocket(`${harness.endpoint.url}/?token=${encodeURIComponent(harness.endpoint.token)}`);
+	const messages = socketMessages(ws);
+	await new Promise<void>((resolve, reject) => {
+		ws.addEventListener("open", () => resolve(), { once: true });
+		ws.addEventListener("error", () => reject(new Error("websocket failed")), { once: true });
+	});
+	await messages.next("hello");
+	ws.send(
+		JSON.stringify({
+			type: "hello",
+			protocolVersion: 3,
+			capabilities: ["ask_controls_v1", "ask_selected_ack_v1"],
+		}),
+	);
+
+	const calls: ResolveCall[] = [];
+	let emitGate: ((gate: RpcWorkflowGate) => void) | undefined;
+	const gate = {
+		isUnattended: () => true,
+		emitGate: async () => undefined,
+		onGateEmitted: (listener: (value: RpcWorkflowGate) => void) => {
+			emitGate = listener;
+			return () => {
+				emitGate = undefined;
+			};
+		},
+		resolveGate: async () => ({ gate_id: "gate-1", status: "accepted", answer_hash: "", resolved_at: "now" }),
+		resolveGateFromNotification: async (
+			response: RpcWorkflowGateResponse,
+			resolveOptions: NotificationGateResolutionOptions,
+		): Promise<RpcWorkflowGateResolution> => {
+			calls.push({ answer: response.answer });
+			if (opts.onResolve) await opts.onResolve(resolveOptions);
+			else resolveOptions.resolveClaim();
+			return { gate_id: response.gate_id, status: "accepted", answer_hash: "", resolved_at: "now" };
+		},
+		registerGateTerminalController: () => () => {},
+		setAckRecoveryParticipant: () => {},
+	};
+	notifyWorkflowGateEmitterChanged(harness.sessionId, gate as never);
+	emitGate?.({
+		type: "workflow_gate",
+		gate_id: "gate-1",
+		stage: "deep-interview",
+		kind: "question",
+		schema: { type: "object" },
+		schema_hash: "hash",
+		options: opts.options.map(value => ({ value, label: value })),
+		context: {
+			prompt: "Proceed?",
+			stage_state: { multi: opts.multi === true, navigation_label: "Done" },
+		},
+		created_at: new Date().toISOString(),
+		required: true,
+	});
+	const first = await messages.next("action_needed");
+	return {
+		harness,
+		ws,
+		messages,
+		calls,
+		firstActionId: String(first.id),
+		token: harness.endpoint.token,
+		restore: async () => {
+			ws.close();
+			notifyWorkflowGateEmitterChanged(harness.sessionId, undefined);
+			await harness.restore();
+		},
+	};
+}
+
+test("unattended out-of-range numeric reply closes the claim and reissues without a success ack", async () => {
+	const gate = await startUnattendedGate({ options: ["yes", "no"] });
+	try {
+		gate.ws.send(JSON.stringify({ type: "reply", id: gate.firstActionId, answer: 99, token: gate.token }));
+		const resolved = await gate.messages.next("action_resolved");
+		expect(resolved).toMatchObject({ id: gate.firstActionId, resolvedBy: "client" });
+		// Invalid-claim closure carries no accepted answer; only genuine resolution does. This
+		// pins closeClaimInvalid vs a regression that resolves the claim with answer:99 and reissues.
+		expect(resolved.answer).toBeUndefined();
+		const reissued = await gate.messages.next("action_needed");
+		expect(reissued.id).not.toBe(gate.firstActionId);
+		// The invalid numeric selector must never reach durable accept / Selected! ack.
+		expect(gate.calls).toHaveLength(0);
+		expect(gate.messages.all.some(message => message.type === "ask_selected_ack_request")).toBe(false);
+	} finally {
+		await gate.restore();
+	}
+}, 20_000);
+
+test("unattended in-range numeric reply resolves the gate and requests the Selected ack", async () => {
+	const gate = await startUnattendedGate({
+		options: ["yes", "no"],
+		onResolve: async options => {
+			await options.requestSelectedAck({
+				replyReceiptId: options.replyReceiptId,
+				actionId: options.interactionActionId,
+				commitKey: "commit-1",
+				daemonDeadlineAt: Date.now() + 8_000,
+				hostTimeoutMs: 10_000,
+			});
+			options.resolveClaim();
+		},
+	});
+	try {
+		gate.ws.send(JSON.stringify({ type: "reply", id: gate.firstActionId, answer: 0, token: gate.token }));
+		const ackRequest = await gate.messages.next("ask_selected_ack_request");
+		gate.ws.send(
+			JSON.stringify({
+				type: "ask_selected_ack_result",
+				requestId: ackRequest.requestId,
+				commitKey: ackRequest.commitKey,
+				outcome: { status: "delivered", messageId: 42 },
+			}),
+		);
+		expect(await gate.messages.next("action_resolved")).toMatchObject({ id: gate.firstActionId });
+		expect(gate.calls).toEqual([{ answer: { selected: ["yes"] } }]);
+	} finally {
+		await gate.restore();
+	}
+}, 20_000);
+
+test("unattended multi-select out-of-range numeric reply closes the claim and reissues", async () => {
+	const gate = await startUnattendedGate({ options: ["a", "b"], multi: true });
+	try {
+		gate.ws.send(JSON.stringify({ type: "reply", id: gate.firstActionId, answer: 99, token: gate.token }));
+		expect(await gate.messages.next("action_resolved")).toMatchObject({ id: gate.firstActionId });
+		const reissued = await gate.messages.next("action_needed");
+		expect(reissued.id).not.toBe(gate.firstActionId);
+		expect(gate.calls).toHaveLength(0);
+	} finally {
+		await gate.restore();
+	}
+}, 20_000);
+
+test("unattended stale/replayed out-of-range reply never resolves the gate", async () => {
+	const gate = await startUnattendedGate({ options: ["yes", "no"] });
+	try {
+		// First invalid reply closes claim #1 and reissues action #2.
+		gate.ws.send(JSON.stringify({ type: "reply", id: gate.firstActionId, answer: 99, token: gate.token }));
+		expect(await gate.messages.next("action_resolved")).toMatchObject({ id: gate.firstActionId });
+		const reissued = await gate.messages.next("action_needed");
+		expect(reissued.id).not.toBe(gate.firstActionId);
+		// Replaying the stale action id (again out of range) must not durably accept anything.
+		gate.ws.send(JSON.stringify({ type: "reply", id: gate.firstActionId, answer: 99, token: gate.token }));
+		// A fresh valid reply against the reissued action still resolves cleanly.
+		gate.ws.send(JSON.stringify({ type: "reply", id: reissued.id, answer: 1, token: gate.token }));
+		expect(await gate.messages.next("action_resolved")).toMatchObject({ id: reissued.id });
+		expect(gate.calls).toEqual([{ answer: { selected: ["no"] } }]);
+	} finally {
+		await gate.restore();
 	}
 }, 20_000);

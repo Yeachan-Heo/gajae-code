@@ -77,7 +77,7 @@ describe("GJC tmux session management", () => {
 			spawnResult(
 				0,
 				[
-					"gajae_code_abc	1	0	1770000000	1	root	2	12345	feature/demo	feature-demo	/repo-a",
+					"gajae_code_abc\t1\t0\t1770000000\t1\troot\t2\t12345\tfeature/demo\tfeature-demo\t/repo-a\t\t\t\t\t$1",
 					"unrelated	2	1	1770000060		root	3	23456		",
 					"gajae_code	1	1	1770000120		root	1	34567		",
 				].join("\n"),
@@ -95,12 +95,13 @@ describe("GJC tmux session management", () => {
 		expect(sessions[0].createdAt).toBe("2026-02-02T02:40:00.000Z");
 		expect(sessions[0].branch).toBe("feature/demo");
 		expect(sessions[0].project).toBe("/repo-a");
+		expect(sessions[0].nativeSessionId).toBe("$1");
 		expect(Bun.spawnSync).toHaveBeenCalledWith(
 			[
 				"tmux-test",
 				"list-sessions",
 				"-F",
-				"#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{@gjc-profile}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{@gjc-branch}\t#{@gjc-branch-slug}\t#{@gjc-project}\t#{@gjc-session-id}\t#{@gjc-session-state-file}\t#{@gjc-owner-generation}\t#{@gjc-version}",
+				"#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{@gjc-profile}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{@gjc-branch}\t#{@gjc-branch-slug}\t#{@gjc-project}\t#{@gjc-session-id}\t#{@gjc-session-state-file}\t#{@gjc-owner-generation}\t#{@gjc-version}\t#{session_id}",
 			],
 			expect.any(Object),
 		);
@@ -136,6 +137,37 @@ describe("GJC tmux session management", () => {
 		injectSafeMutationProof();
 		expect(removeGjcTmuxSession("gajae_code_work", env).name).toBe("gajae_code_work");
 		expect(calls.at(-1)?.[1]).toBe("if-shell");
+	});
+
+	it("refuses a same-name replacement before the final guarded remove", () => {
+		const env = { GJC_TMUX_COMMAND: "tmux" };
+		const calls: string[][] = [];
+		(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation(command => {
+			calls.push(command);
+			if (command.includes("list-sessions")) {
+				return spawnResult(
+					0,
+					"gajae_code_work\t1\t0\t1770000000\t1\troot\t0\t\tmain\tmain\t/repo\tsession-1\t/tmp/runtime-state.json\tgeneration-one\t\t$1\n",
+				);
+			}
+			if (command.includes("display-message")) return spawnResult(0, "$2\n");
+			if (command.includes("show-options")) {
+				return spawnResult(0, command.at(-1) === "@gjc-owner-generation" ? "generation-one\n" : "1\n");
+			}
+			return spawnResult(0, "");
+		});
+
+		expect(() =>
+			removeGjcTmuxSession("gajae_code_work", env, {
+				nativeSessionId: "$1",
+				ownerGeneration: "generation-one",
+				sessionId: "session-1",
+				sessionStateFile: "/tmp/runtime-state.json",
+				project: "/repo",
+				createdAt: "2026-02-02T02:40:00.000Z",
+			}),
+		).toThrow("gjc_tmux_owner_changed:gajae_code_work");
+		expect(calls.some(command => command.includes("if-shell") || command.includes("kill-session"))).toBe(false);
 	});
 
 	it("refuses unsafe or unverifiable server proof before any remove, attach, or force-close mutation", async () => {

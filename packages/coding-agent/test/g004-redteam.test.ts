@@ -155,7 +155,7 @@ describe("G004 sidecar cache and heartbeat red-team", () => {
 			{ sessionId: "fallback", cwd: root, sessionFile: null },
 		);
 		setSystemTime(new Date("2026-02-01T00:00:00.100Z"));
-		persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
 			sessionId: "fallback",
 			cwd: root,
 			sessionFile: null,
