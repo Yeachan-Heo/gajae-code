@@ -10,6 +10,8 @@ import {
 	type CloseSessionRequest,
 	type CloseSessionResponse,
 	type CreateElicitationResponse,
+	type DeleteSessionRequest,
+	type DeleteSessionResponse,
 	type ElicitationContentValue,
 	type ElicitationPropertySchema,
 	type ForkSessionRequest,
@@ -30,14 +32,11 @@ import {
 	type ResumeSessionResponse,
 	type SessionConfigOption,
 	type SessionInfo,
-	type SessionModelState,
 	type SessionModeState,
 	type SessionNotification,
 	type SessionUpdate,
 	type SetSessionConfigOptionRequest,
 	type SetSessionConfigOptionResponse,
-	type SetSessionModelRequest,
-	type SetSessionModelResponse,
 	type SetSessionModeRequest,
 	type SetSessionModeResponse,
 	type Usage,
@@ -71,6 +70,7 @@ import {
 	type SessionInfo as StoredSessionInfo,
 	type UsageStatistics,
 } from "../../session/session-manager";
+import { FileSessionStorage } from "../../session/session-storage";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { parseThinkingLevel } from "../../thinking";
 import { toAgentWireEventPayload } from "../shared/agent-wire/event-envelope";
@@ -116,7 +116,6 @@ type PromptQueueState = {
 };
 
 type PromptTurnState = {
-	userMessageId: string;
 	cancelRequested: boolean;
 	settled: boolean;
 	/**
@@ -276,10 +275,24 @@ async function elicitFromAcpClient(
 			finish(undefined);
 		});
 	const response = await promise;
-	if (response?.action !== "accept" || !response.content) {
+	if (
+		response?.action !== "accept" ||
+		typeof response.content !== "object" ||
+		response.content === null ||
+		!("value" in response.content)
+	) {
 		return undefined;
 	}
-	return response.content.value;
+	const value = response.content.value;
+	if (
+		typeof value === "string" ||
+		typeof value === "number" ||
+		typeof value === "boolean" ||
+		(Array.isArray(value) && value.every(item => typeof item === "string"))
+	) {
+		return value;
+	}
+	return undefined;
 }
 
 /**
@@ -431,6 +444,7 @@ export class AcpAgent implements Agent {
 				},
 				sessionCapabilities: {
 					list: {},
+					delete: {},
 					fork: {},
 					resume: {},
 					close: {},
@@ -457,7 +471,6 @@ export class AcpAgent implements Agent {
 		const response: NewSessionResponse = {
 			sessionId: record.session.sessionId,
 			configOptions: this.#buildConfigOptions(record.session),
-			models: this.#buildModelState(record.session),
 			modes: this.#buildModeState(record.session),
 		};
 		this.#scheduleBootstrapUpdates(record.session.sessionId);
@@ -470,7 +483,6 @@ export class AcpAgent implements Agent {
 		await this.#replaySessionHistory(record);
 		const response: LoadSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
-			models: this.#buildModelState(record.session),
 			modes: this.#buildModeState(record.session),
 		};
 		this.#scheduleBootstrapUpdates(record.session.sessionId);
@@ -499,7 +511,6 @@ export class AcpAgent implements Agent {
 		const record = await this.#resumeManagedSession(params.sessionId, params.cwd, params.mcpServers ?? []);
 		const response: ResumeSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
-			models: this.#buildModelState(record.session),
 			modes: this.#buildModeState(record.session),
 		};
 		this.#scheduleBootstrapUpdates(record.session.sessionId);
@@ -512,11 +523,33 @@ export class AcpAgent implements Agent {
 		const response: ForkSessionResponse = {
 			sessionId: record.session.sessionId,
 			configOptions: this.#buildConfigOptions(record.session),
-			models: this.#buildModelState(record.session),
 			modes: this.#buildModeState(record.session),
 		};
 		this.#scheduleBootstrapUpdates(record.session.sessionId);
 		return response;
+	}
+
+	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+		const record = this.#sessions.get(params.sessionId);
+		let sessionPath: string;
+
+		if (record) {
+			const activeSessionPath = record.session.sessionManager.getSessionFile();
+			if (!activeSessionPath) {
+				throw new Error(`ACP session has no persisted file: ${params.sessionId}`);
+			}
+			sessionPath = activeSessionPath;
+			await this.#closeManagedSession(params.sessionId, record);
+		} else {
+			const storedSession = await this.#findStoredSessionById(params.sessionId);
+			if (!storedSession) {
+				throw new Error(`ACP session not found: ${params.sessionId}`);
+			}
+			sessionPath = storedSession.path;
+		}
+
+		await new FileSessionStorage().deleteSessionWithArtifacts(sessionPath);
+		return {};
 	}
 
 	async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
@@ -580,13 +613,6 @@ export class AcpAgent implements Agent {
 		return { configOptions: this.#buildConfigOptions(record.session) };
 	}
 
-	async unstable_setSessionModel(params: SetSessionModelRequest): Promise<SetSessionModelResponse> {
-		const record = this.#getSessionRecord(params.sessionId);
-		await this.#setModelById(record.session, params.modelId);
-		await this.#pushConfigOptionUpdate(record);
-		return {};
-	}
-
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
 		const activeTurn = record.promptTurn;
@@ -608,7 +634,6 @@ export class AcpAgent implements Agent {
 			const converted = this.#convertPromptBlocks(params.prompt);
 			const pendingPrompt = Promise.withResolvers<PromptResponse>();
 			record.promptTurn = {
-				userMessageId: params.messageId ?? crypto.randomUUID(),
 				cancelRequested: false,
 				settled: false,
 				cleanup: undefined,
@@ -693,7 +718,6 @@ export class AcpAgent implements Agent {
 						this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 					record.session.sessionManager.getUsageStatistics(),
 				),
-				userMessageId: promptTurn?.userMessageId,
 			});
 			return;
 		}
@@ -836,7 +860,6 @@ export class AcpAgent implements Agent {
 		this.#finishPrompt(record, {
 			stopReason: "cancelled",
 			usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
-			userMessageId: promptTurn.userMessageId,
 		});
 		return cleanup;
 	}
@@ -1155,7 +1178,6 @@ export class AcpAgent implements Agent {
 			this.#finishPrompt(record, {
 				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
 				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
-				userMessageId: promptTurn.userMessageId,
 			});
 		}
 	}
@@ -1370,28 +1392,6 @@ export class AcpAgent implements Agent {
 			options: this.#buildThinkingOptions(session),
 		});
 		return configOptions;
-	}
-
-	#buildModelState(session: AgentSession): SessionModelState | undefined {
-		const models = session.getAvailableModels();
-		if (models.length === 0) {
-			return undefined;
-		}
-
-		const availableModels = models.map(model => ({
-			modelId: this.#toModelId(model),
-			name: model.name,
-			description: `${model.provider}/${model.id}`,
-		}));
-		const currentModelId = session.model ? this.#toModelId(session.model) : availableModels[0]?.modelId;
-		if (!currentModelId) {
-			return undefined;
-		}
-
-		return {
-			availableModels,
-			currentModelId,
-		};
 	}
 
 	#buildThinkingOptions(session: AgentSession): Array<{ value: string; name: string; description?: string }> {
@@ -2113,11 +2113,14 @@ export class AcpAgent implements Agent {
 				headers: this.#toNameValueMap(server.headers),
 			};
 		}
-		return {
-			type: "sse",
-			url: server.url,
-			headers: this.#toNameValueMap(server.headers),
-		};
+		if (server.type === "sse") {
+			return {
+				type: "sse",
+				url: server.url,
+				headers: this.#toNameValueMap(server.headers),
+			};
+		}
+		throw new Error(`Unsupported ACP MCP transport: ${server.type}`);
 	}
 
 	#toNameValueMap(values: Array<{ name: string; value: string }>): { [name: string]: string } {

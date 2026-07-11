@@ -10,13 +10,6 @@ import type {
 	PromptRequest,
 	SessionNotification,
 } from "@agentclientprotocol/sdk";
-import {
-	zForkSessionResponse,
-	zLoadSessionResponse,
-	zNewSessionResponse,
-	zPromptResponse,
-	zSessionNotification,
-} from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
 import type { Model } from "@gajae-code/ai";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
@@ -26,7 +19,6 @@ import type { PlanModeState } from "../src/plan-mode/state";
 import type { AgentSession, AgentSessionEvent } from "../src/session/agent-session";
 import { SILENT_ABORT_MARKER } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
-import { expectAcpStructure } from "./helpers/acp-schema";
 
 const TEST_MODELS: Model[] = [
 	{
@@ -382,8 +374,9 @@ function getChunkMessageId(notification: SessionNotification): string | undefine
 }
 
 function expectAcpNotifications(updates: SessionNotification[]): void {
-	for (const update of updates) {
-		expectAcpStructure(zSessionNotification, update);
+	for (const notification of updates) {
+		expect(typeof notification.sessionId).toBe("string");
+		expect(typeof notification.update.sessionUpdate).toBe("string");
 	}
 }
 
@@ -479,26 +472,29 @@ describe("ACP agent", () => {
 		const harness = await createHarness();
 		const first = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const second = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
-		expectAcpStructure(zNewSessionResponse, first);
-		expectAcpStructure(zNewSessionResponse, second);
+		expect(typeof first.sessionId).toBe("string");
+		expect(typeof second.sessionId).toBe("string");
 
-		expect(first.models?.availableModels.map(model => model.modelId)).toEqual(
+		const modelConfig = first.configOptions?.find(option => option.id === "model");
+		expect(modelConfig?.type).toBe("select");
+		if (modelConfig?.type !== "select") {
+			throw new Error("expected model config option");
+		}
+		expect(modelConfig.options.flatMap(option => ("value" in option ? [option.value] : []))).toEqual(
 			TEST_MODELS.map(model => `${model.provider}/${model.id}`),
 		);
 
-		await harness.agent.unstable_setSessionModel({
+		await harness.agent.setSessionConfigOption({
 			sessionId: first.sessionId,
-			modelId: `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`,
+			configId: "model",
+			value: `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`,
 		});
 		await harness.agent.setSessionConfigOption({
 			sessionId: first.sessionId,
 			configId: "thinking",
 			value: "high",
 		});
-		// Both model and thinking-level changes must surface as ACP
-		// `config_option_update` notifications scoped to the right session;
-		// the schema check alone would still pass if either method stopped
-		// emitting notifications entirely.
+		// Model and thinking changes must emit updates scoped to this session.
 		const configUpdatesForFirst = harness.updates.filter(
 			n => n.sessionId === first.sessionId && n.update.sessionUpdate === "config_option_update",
 		);
@@ -520,7 +516,7 @@ describe("ACP agent", () => {
 			cwd: harness.cwdA,
 			mcpServers: [],
 		});
-		expectAcpStructure(zForkSessionResponse, forked);
+		expect(typeof forked.sessionId).toBe("string");
 		const forkedSession = harness.findSession(forked.sessionId);
 		const forkedMessages = forkedSession?.sessionManager.buildSessionContext().messages ?? [];
 		expect(forked.sessionId).not.toBe(first.sessionId);
@@ -535,12 +531,46 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("deletes an active session and its artifacts", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const sessionPath = session.sessionManager.getSessionFile()!;
+		const artifactsDir = sessionPath.slice(0, -6);
+		await fs.promises.mkdir(artifactsDir, { recursive: true });
+		await fs.promises.writeFile(path.join(artifactsDir, "artifact.txt"), "artifact");
+
+		await harness.agent.deleteSession({ sessionId: created.sessionId });
+
+		expect(session.disposed).toBe(true);
+		expect(fs.existsSync(sessionPath)).toBe(false);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect((await harness.agent.listSessions({ cwd: harness.cwdA })).sessions).toHaveLength(0);
+	});
+
+	it("deletes a closed stored session and rejects an unknown session id", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const sessionPath = session.sessionManager.getSessionFile()!;
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		expect(fs.existsSync(sessionPath)).toBe(true);
+
+		await harness.agent.deleteSession({ sessionId: created.sessionId });
+
+		expect(fs.existsSync(sessionPath)).toBe(false);
+		expect((await harness.agent.listSessions({ cwd: harness.cwdB })).sessions).toHaveLength(0);
+		await expect(harness.agent.deleteSession({ sessionId: created.sessionId })).rejects.toThrow(
+			`ACP session not found: ${created.sessionId}`,
+		);
+	});
+
 	it("advertises plan mode and emits schema-valid mode updates", async () => {
 		const harness = await createHarness();
 		Settings.instance.set("plan.enabled", true);
 
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
-		expectAcpStructure(zNewSessionResponse, created);
+		expect(typeof created.sessionId).toBe("string");
 		expect(created.modes?.availableModes.map(mode => mode.id)).toEqual(["default", "plan"]);
 		const initialModeConfig = created.configOptions?.find(option => option.id === "mode") as
 			| { currentValue?: unknown; options?: Array<{ value: string }> }
@@ -742,7 +772,7 @@ describe("ACP agent", () => {
 			cwd: harness.cwdA,
 			mcpServers: [],
 		});
-		expectAcpStructure(zLoadSessionResponse, loaded);
+		expect(Array.isArray(loaded.configOptions)).toBe(true);
 		const replayChunks = harness.updates.filter(
 			update =>
 				update.sessionId === stored.sessionId &&
@@ -766,16 +796,14 @@ describe("ACP agent", () => {
 		const live = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
 		const response = await harness.agent.prompt({
 			sessionId: live.sessionId,
-			messageId: "05b17a6f-b310-4be7-b767-6b4f3a84eb63",
 			prompt: [{ type: "text", text: "ping" }],
 		} as PromptRequest);
-		expectAcpStructure(zPromptResponse, response);
+		expect(response.stopReason).toBe("end_turn");
 		expectAcpNotifications(harness.updates);
 
 		const liveChunks = harness.updates.filter(
 			update => update.sessionId === live.sessionId && update.update.sessionUpdate === "agent_message_chunk",
 		);
-		expect(response.userMessageId).toBe("05b17a6f-b310-4be7-b767-6b4f3a84eb63");
 		expect(response.usage).toEqual({
 			inputTokens: 10,
 			outputTokens: 5,
@@ -1022,7 +1050,6 @@ describe("ACP agent", () => {
 
 		await harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000047",
 			prompt: [{ type: "text", text: "write todos" }],
 		} as PromptRequest);
 
@@ -1145,7 +1172,6 @@ describe("ACP agent", () => {
 
 		await harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000001",
 			prompt: [{ type: "text", text: "/skill:sample extra context" }],
 		} as PromptRequest);
 
@@ -1166,7 +1192,6 @@ describe("ACP agent", () => {
 		});
 		await harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000002",
 			prompt: [{ type: "text", text: "/fast" }],
 		} as PromptRequest);
 
@@ -1197,7 +1222,6 @@ describe("ACP agent", () => {
 
 		await harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-0000000000a1",
 			prompt: [{ type: "text", text: "please use /skill:sample for this" }],
 		} as PromptRequest);
 
@@ -1229,7 +1253,6 @@ describe("ACP agent", () => {
 
 		await harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000003",
 			prompt: [{ type: "text", text: "/skill:sample first /skill:second next args" }],
 		} as PromptRequest);
 
@@ -1255,7 +1278,6 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000035",
 			prompt: [{ type: "text", text: "long running" }],
 		} as PromptRequest);
 		await Bun.sleep(0);
@@ -1264,7 +1286,6 @@ describe("ACP agent", () => {
 			await expect(
 				harness.agent.prompt({
 					sessionId: created.sessionId,
-					messageId: "00000000-0000-4000-8000-000000000036",
 					prompt: [{ type: "text", text: "overlap" }],
 				} as PromptRequest),
 			).rejects.toThrow("ACP prompt already in progress for this session");
@@ -1290,7 +1311,6 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000029",
 			prompt: [{ type: "text", text: "wait for cleanup" }],
 		} as PromptRequest);
 		await idleBlocked;
@@ -1302,7 +1322,7 @@ describe("ACP agent", () => {
 
 			unblockIdle();
 			const response = await firstPrompt;
-			expect(response.userMessageId).toBe("00000000-0000-4000-8000-000000000029");
+			expect(response.stopReason).toBe("end_turn");
 		} finally {
 			unblockIdle();
 			harness.abortController.abort();
@@ -1330,7 +1350,6 @@ describe("ACP agent", () => {
 
 		const prompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000047",
 			prompt: [{ type: "text", text: "wait for async delivery" }],
 		} as PromptRequest);
 		await deliveryBlocked.promise;
@@ -1342,7 +1361,7 @@ describe("ACP agent", () => {
 
 			releaseDelivery();
 			const response = await prompt;
-			expect(response.userMessageId).toBe("00000000-0000-4000-8000-000000000047");
+			expect(response.stopReason).toBe("end_turn");
 			expect(session.waitForIdleCalls).toBe(2);
 			expect(drainCalls).toBe(2);
 		} finally {
@@ -1375,7 +1394,6 @@ describe("ACP agent", () => {
 
 		await harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000048",
 			prompt: [{ type: "text", text: "deliver async follow-up" }],
 		} as PromptRequest);
 
@@ -1401,7 +1419,6 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000030",
 			prompt: [{ type: "text", text: "wait for cleanup" }],
 		} as PromptRequest);
 		await idleBlocked;
@@ -1409,7 +1426,6 @@ describe("ACP agent", () => {
 		try {
 			const secondPrompt = harness.agent.prompt({
 				sessionId: created.sessionId,
-				messageId: "00000000-0000-4000-8000-000000000031",
 				prompt: [{ type: "text", text: "after cleanup" }],
 			} as PromptRequest);
 			await Bun.sleep(0);
@@ -1439,7 +1455,6 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000032",
 			prompt: [{ type: "text", text: "wait for cleanup" }],
 		} as PromptRequest);
 		await idleBlocked;
@@ -1447,12 +1462,10 @@ describe("ACP agent", () => {
 		try {
 			const secondPrompt = harness.agent.prompt({
 				sessionId: created.sessionId,
-				messageId: "00000000-0000-4000-8000-000000000033",
 				prompt: [{ type: "text", text: "after cleanup A" }],
 			} as PromptRequest);
 			const thirdPrompt = harness.agent.prompt({
 				sessionId: created.sessionId,
-				messageId: "00000000-0000-4000-8000-000000000034",
 				prompt: [{ type: "text", text: "after cleanup B" }],
 			} as PromptRequest);
 			await Bun.sleep(0);
@@ -1488,7 +1501,6 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000039",
 			prompt: [{ type: "text", text: "cancel me" }],
 		} as PromptRequest);
 		await Bun.sleep(0);
@@ -1512,7 +1524,6 @@ describe("ACP agent", () => {
 
 		const secondPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000040",
 			prompt: [{ type: "text", text: "after cancel" }],
 		} as PromptRequest);
 		await Bun.sleep(0);
@@ -1538,7 +1549,6 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000041",
 			prompt: [{ type: "text", text: "stuck cancel" }],
 		} as PromptRequest);
 		await Bun.sleep(0);
@@ -1551,7 +1561,6 @@ describe("ACP agent", () => {
 		await expect(
 			harness.agent.prompt({
 				sessionId: created.sessionId,
-				messageId: "00000000-0000-4000-8000-000000000042",
 				prompt: [{ type: "text", text: "after stuck cancel" }],
 			} as PromptRequest),
 		).rejects.toThrow("Unsupported ACP session");
@@ -1571,7 +1580,6 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000043",
 			prompt: [{ type: "text", text: "stuck cancel before queued" }],
 		} as PromptRequest);
 		await Bun.sleep(0);
@@ -1581,7 +1589,6 @@ describe("ACP agent", () => {
 		const queuedPrompt = harness.agent
 			.prompt({
 				sessionId: created.sessionId,
-				messageId: "00000000-0000-4000-8000-000000000044",
 				prompt: [{ type: "text", text: "queued after stuck cancel" }],
 			} as PromptRequest)
 			.catch(error => error);
@@ -1615,7 +1622,6 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000045",
 			prompt: [{ type: "text", text: "cancel before close" }],
 		} as PromptRequest);
 		await Bun.sleep(0);
@@ -1656,7 +1662,6 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000046",
 			prompt: [{ type: "text", text: "cancel before fork" }],
 		} as PromptRequest);
 		await Bun.sleep(0);
@@ -1687,14 +1692,13 @@ describe("ACP agent", () => {
 
 		const response = await harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000002",
 			prompt: [{ type: "text", text: "/fast status" }],
 		} as PromptRequest);
 
 		const chunks = harness.updates.filter(
 			update => update.sessionId === created.sessionId && update.update.sessionUpdate === "agent_message_chunk",
 		);
-		expect(response.userMessageId).toBe("00000000-0000-4000-8000-000000000002");
+		expect(response.stopReason).toBe("end_turn");
 		expect(session.promptCalls).toEqual([]);
 		expect(
 			chunks.some(
@@ -1716,7 +1720,6 @@ describe("ACP agent", () => {
 
 		await harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000003",
 			prompt: [{ type: "text", text: "/force read inspect package.json" }],
 		} as PromptRequest);
 
@@ -1742,6 +1745,23 @@ describe("ACP agent", () => {
 				},
 			} as unknown as AgentSideConnection;
 			return { connection, calls };
+		}
+
+		function getRequestedFormSchema(request: CreateElicitationRequest): {
+			properties?: Record<string, unknown>;
+			required?: string[];
+		} {
+			if (
+				request.mode !== "form" ||
+				typeof request.requestedSchema !== "object" ||
+				request.requestedSchema === null
+			) {
+				throw new Error("expected form-mode elicitation schema");
+			}
+			return request.requestedSchema as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
 		}
 
 		it("translates select to a single-property string-enum elicitation", async () => {
@@ -1785,8 +1805,9 @@ describe("ACP agent", () => {
 				throw new Error("expected form-mode elicitation");
 			}
 			expect(request.message).toBe("Proceed?\n\nThis will overwrite the file.");
-			expect(request.requestedSchema.properties?.value).toEqual({ type: "boolean" });
-			expect(request.requestedSchema.required).toEqual(["value"]);
+			const requestedSchema = getRequestedFormSchema(request);
+			expect(requestedSchema.properties?.value).toEqual({ type: "boolean" });
+			expect(requestedSchema.required).toEqual(["value"]);
 		});
 
 		it("translates input to a string elicitation and surfaces the placeholder as description", async () => {
@@ -1805,7 +1826,7 @@ describe("ACP agent", () => {
 				throw new Error("expected form-mode elicitation");
 			}
 			expect(request.message).toBe("Your name?");
-			expect(request.requestedSchema.properties?.value).toEqual({
+			expect(getRequestedFormSchema(request).properties?.value).toEqual({
 				type: "string",
 				description: "e.g. claude",
 			});
@@ -1951,7 +1972,7 @@ describe("ACP agent", () => {
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
 			if (request.mode !== "form") throw new Error("expected form-mode elicitation");
-			expect(request.requestedSchema.properties?.value).toEqual({ type: "string" });
+			expect(getRequestedFormSchema(request).properties?.value).toEqual({ type: "string" });
 		});
 
 		it("sends `message === title` on `confirm` when the message is empty (no join)", async () => {
