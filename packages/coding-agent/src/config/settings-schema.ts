@@ -146,6 +146,7 @@ interface BooleanDef {
 interface StringDef {
 	type: "string";
 	default: string | undefined;
+	nullable?: boolean;
 	ui?: UiString;
 }
 
@@ -382,6 +383,7 @@ export const SETTINGS_SCHEMA = {
 	"modelProfile.default": {
 		type: "string",
 		default: undefined,
+		nullable: true,
 		ui: {
 			tab: "model",
 			label: "Default Model Profile",

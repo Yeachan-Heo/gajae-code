@@ -230,6 +230,97 @@ describe("model profile activation", () => {
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
+	test("materialization preserves durable siblings hidden by a whole runtime reset", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		settings.set("task.agentModelOverrides", { planner: "durable/planner" });
+		settings.override("task.agentModelOverrides", null as never);
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		const materialized = materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor:medium",
+		});
+		expect(materialized).toBe(true);
+		settings.clearOverride("task.agentModelOverrides");
+
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+			planner: "durable/planner",
+			executor: "provider-c/executor:medium",
+			architect: "provider-a/architect",
+		});
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			planner: "durable/planner",
+			executor: "provider-c/executor:medium",
+			architect: "provider-a/architect",
+		});
+	});
+	test("batch materialization preserves hidden durable model and agent siblings", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		settings.set("modelRoles", { smol: "durable/smol" });
+		settings.set("task.agentModelOverrides", { planner: "durable/planner" });
+		settings.override("modelRoles", null as never);
+		settings.override("task.agentModelOverrides", null as never);
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		const materialized = materializeActiveModelProfileAssignments({
+			session,
+			settings,
+			assignments: new Map([
+				["default", "provider-c/default:low"],
+				["executor", "provider-c/executor:medium"],
+			]),
+		});
+		expect(materialized).toBe(true);
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			smol: "durable/smol",
+			default: "provider-c/default:low",
+		});
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+			planner: "durable/planner",
+			executor: "provider-c/executor:medium",
+			architect: "provider-a/architect",
+		});
+
+		settings.clearOverride("modelRoles");
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("modelRoles")).toEqual({
+			smol: "durable/smol",
+			default: "provider-c/default:low",
+		});
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			planner: "durable/planner",
+			executor: "provider-c/executor:medium",
+			architect: "provider-a/architect",
+		});
+	});
+	test("materialized explicit assignments release only their whole-reset leaves", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		settings.override("task.agentModelOverrides", null as never);
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		const materialized = materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor:medium",
+		});
+		expect(materialized).toBe(true);
+		settings.clearAgentModelOverride("executor");
+		settings.set("task.agentModelOverrides", {
+			executor: "durable/executor-added-after-materialization",
+			planner: "durable/planner-added-after-materialization",
+		});
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "durable/executor-added-after-materialization",
+			architect: "provider-a/architect",
+		});
+	});
 
 	test("materializing a default override stores the selected default and clears the profile", async () => {
 		const session = fakeSession();
@@ -311,7 +402,7 @@ describe("model profile activation", () => {
 			return originalSet(path, value);
 		}) as typeof settings.set;
 		let flushCount = 0;
-		settings.flush = async () => {
+		settings.flushOrThrow = async () => {
 			flushCount += 1;
 		};
 
@@ -384,7 +475,7 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		settings.flush = async () => {
+		settings.flushOrThrow = async () => {
 			throw new Error("flush failed");
 		};
 
@@ -398,6 +489,13 @@ describe("model profile activation", () => {
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.Low);
 		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(settings.getGlobal("modelRoles")).toBeUndefined();
+		expect(settings.getGlobal("task.agentModelOverrides")).toBeUndefined();
+		expect(settings.getGlobal("defaultThinkingLevel")).toBeUndefined();
+		expect(settings.getRuntimeModelRoles()).toEqual({});
+		expect(settings.getRuntimeAgentModelOverrides()).toEqual({
+			executor: "provider-a/original",
+		});
 	});
 
 	test("precedence composes configured, default, mpreset, and explicit overrides", async () => {

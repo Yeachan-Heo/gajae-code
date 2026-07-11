@@ -55,7 +55,7 @@ function createControllerContext(
 		setCalls.push({ path: path as string, value });
 		return originalSet(path, value);
 	}) as typeof settings.set;
-	settings.flush = vi.fn(async () => {}) as typeof settings.flush;
+	settings.flushOrThrow = vi.fn(async () => {}) as typeof settings.flushOrThrow;
 
 	const profiles = new Map((options.profiles ?? [codexProfile, minimaxProfile]).map(entry => [entry.name, entry]));
 	let activeProfile = options.activeProfile;

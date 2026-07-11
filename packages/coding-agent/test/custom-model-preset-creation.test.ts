@@ -633,6 +633,12 @@ describe("custom model preset creation", () => {
 		expect(settings.get("modelRoles").default).toBe("my-oai/gpt-custom:low");
 		expect(settings.get("task.agentModelOverrides").executor).toBe("my-oai/gpt-custom");
 		expect(activeProfiles.at(-1)).toBeUndefined();
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "my-oai/gpt-custom:low",
+		});
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+			executor: "my-oai/gpt-custom",
+		});
 
 		await restoreMaterializedModelProfileForDeletion({ settings, session, snapshot });
 
@@ -640,6 +646,63 @@ describe("custom model preset creation", () => {
 		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("other-session");
+		expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+		expect(settings.getGlobal("modelRoles")).toBeUndefined();
+		expect(settings.getGlobal("task.agentModelOverrides")).toBeUndefined();
+	});
+	it("keeps materialized state inactive when later settings restoration cannot commit", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-default",
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: "my-oai/gpt-custom",
+			},
+			source: "user",
+		};
+		const settings = Settings.isolated({
+			"modelProfile.default": "custom-default",
+			"task.agentModelOverrides": { critic: "runtime/critic" },
+		});
+		let activeProfile: string | undefined = "custom-default";
+		const session = {
+			model: currentModel("other", "active"),
+			thinkingLevel: undefined,
+			sessionId: "session",
+			setActiveModelProfile: (profileName: string | undefined) => {
+				activeProfile = profileName;
+			},
+			getActiveModelProfile: () => activeProfile,
+		};
+		const snapshot = await materializeModelProfileForDeletion({
+			session,
+			settings,
+			modelRegistry: createRegistry([[customProfile.name, customProfile]]),
+			profileName: "custom-default",
+		});
+		const materializedGlobalRoles = settings.getGlobal("modelRoles");
+		const materializedGlobalAgents = settings.getGlobal("task.agentModelOverrides");
+		const materializedRuntimeRoles = settings.getRuntimeModelRoles();
+		const materializedRuntimeAgents = settings.getRuntimeAgentModelOverrides();
+		const materializedProfileState = settings.getRuntimeModelProfileDefaultState();
+		const flushSpy = spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("restore flush failed"));
+
+		try {
+			await expect(restoreMaterializedModelProfileForDeletion({ settings, session, snapshot })).rejects.toThrow(
+				"restore flush failed",
+			);
+		} finally {
+			flushSpy.mockRestore();
+		}
+
+		expect(activeProfile).toBeUndefined();
+		expect(settings.getGlobal("modelRoles")).toEqual(materializedGlobalRoles);
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual(materializedGlobalAgents);
+		expect(settings.getRuntimeModelRoles()).toEqual(materializedRuntimeRoles);
+		expect(settings.getRuntimeAgentModelOverrides()).toEqual(materializedRuntimeAgents);
+		expect(settings.getRuntimeModelProfileDefaultState()).toEqual(materializedProfileState);
+		expect(settings.get("modelProfile.default")).toBeUndefined();
 	});
 	it("rolls back deletion materialization when settings flush fails", async () => {
 		const customProfile: ModelProfileDefinition = {
@@ -664,7 +727,7 @@ describe("custom model preset creation", () => {
 			},
 			getActiveModelProfile: () => activeProfiles.at(-1),
 		};
-		const flushSpy = spyOn(settings, "flush").mockRejectedValueOnce(new Error("flush failed"));
+		const flushSpy = spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
 
 		try {
 			await expect(
@@ -683,6 +746,64 @@ describe("custom model preset creation", () => {
 		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("custom-default");
+	});
+	it("preserves malformed runtime resets through deletion materialization rollback", async () => {
+		const customProfile: ModelProfileDefinition = {
+			name: "custom-default",
+			displayName: "Custom Default",
+			requiredProviders: ["my-oai"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: "my-oai/gpt-custom",
+			},
+			source: "user",
+		};
+		const settings = Settings.isolated({
+			"modelProfile.default": "custom-default",
+		});
+		settings.set("task.agentModelOverrides", {
+			critic: "durable/critic",
+			executor: "durable/executor-hidden-by-reset",
+		});
+		settings.override("task.agentModelOverrides", { executor: false } as never);
+		const session = {
+			model: currentModel("other", "active"),
+			thinkingLevel: undefined,
+			sessionId: "session",
+			setActiveModelProfile: () => {},
+			getActiveModelProfile: () => "custom-default",
+		};
+		const flushSpy = spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		try {
+			await expect(
+				materializeModelProfileForDeletion({
+					session,
+					settings,
+					modelRegistry: createRegistry([[customProfile.name, customProfile]]),
+					profileName: "custom-default",
+				}),
+			).rejects.toThrow("flush failed");
+		} finally {
+			flushSpy.mockRestore();
+		}
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({
+			critic: "durable/critic",
+			executor: "durable/executor-hidden-by-reset",
+		});
+
+		settings.set("task.agentModelOverrides", {
+			critic: "durable/critic",
+			executor: "durable/executor-added-after-rollback",
+		});
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "durable/critic",
+		});
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "durable/critic",
+			executor: "durable/executor-added-after-rollback",
+		});
 	});
 	it("restores a deleted custom preset when post-delete notification fails", async () => {
 		const unsafeDisplayName = "Custom\x1b[31m Default\x1b[0m\nRestored";

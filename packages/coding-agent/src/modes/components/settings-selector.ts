@@ -704,6 +704,7 @@ export class SettingsSelectorComponent extends Container {
 	#statusPreviewText: Text | null = null;
 	#currentTabId: SettingTab | "plugins" = "appearance";
 	#textInputActive = false;
+	#modelProfileSelectionPending = false;
 
 	constructor(
 		private readonly context: SettingsRuntimeContext,
@@ -937,11 +938,29 @@ export class SettingsSelectorComponent extends Container {
 			options,
 			currentValue,
 			value => {
-				this.#setSettingValue(def.path, value);
-				this.callbacks.onChange(def.path, value);
-				done(value);
+				if (this.#modelProfileSelectionPending) return;
+				if (def.path === "modelProfile.default") this.#modelProfileSelectionPending = true;
+				if (def.path !== "modelProfile.default") {
+					this.#setSettingValue(def.path, value);
+					this.callbacks.onChange(def.path, value);
+					done(value);
+					return;
+				}
+
+				const settle = () => {
+					this.#modelProfileSelectionPending = false;
+					const committedValue = this.#getSubmenuCurrentValue(def.path, settings.get(def.path));
+					done(committedValue);
+				};
+				const result = this.callbacks.onChange(def.path, value) as unknown;
+				if (result instanceof Promise) {
+					void result.then(settle, settle);
+				} else {
+					settle();
+				}
 			},
 			() => {
+				if (this.#modelProfileSelectionPending) return;
 				onPreviewCancel?.();
 				done();
 			},
@@ -1167,6 +1186,7 @@ export class SettingsSelectorComponent extends Container {
 	}
 
 	handleInput(data: string): void {
+		if (this.#modelProfileSelectionPending) return;
 		// Handle tab switching — but NOT when a text input is active, since
 		// arrow keys must reach the cursor and Tab must not switch tabs.
 		if (

@@ -1,12 +1,16 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	ModelSelectorComponent,
 	type ModelSelectorSelection,
 } from "@gajae-code/coding-agent/modes/components/model-selector";
+import type { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";
@@ -89,13 +93,19 @@ function createSelector(
 	);
 }
 
-function createControllerContext(options: { missingCredentials?: boolean } = {}) {
-	const settings = Settings.isolated({
-		"task.agentModelOverrides": { executor: "provider-a/original-executor" },
-		"modelProfile.default": "old-profile",
-	});
+function createControllerContext(
+	options: { missingCredentials?: boolean; settings?: Settings; mockFlush?: boolean } = {},
+) {
+	const settings =
+		options.settings ??
+		Settings.isolated({
+			"task.agentModelOverrides": { executor: "provider-a/original-executor" },
+			"modelProfile.default": "old-profile",
+		});
 	const flush = vi.fn(async () => {});
-	settings.flush = flush as typeof settings.flush;
+	if (options.mockFlush !== false) {
+		settings.flushOrThrow = flush as typeof settings.flushOrThrow;
+	}
 	const setCalls: Array<{ path: string; value: unknown }> = [];
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
@@ -109,6 +119,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		scopedModels: [],
 		modelRegistry: createRegistry(options),
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
+		getAvailableThinkingLevels: () => [],
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
@@ -116,13 +127,14 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		},
 	};
 	const ctx = {
-		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+		ui: { setFocus: vi.fn(), requestRender: vi.fn(), terminal: { columns: 120 } },
 		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
-		editor: {},
+		editor: { getTopBorderAvailableWidth: () => 120 },
 		settings,
 		session,
-		statusLine: { invalidate: vi.fn() },
+		statusLine: { invalidate: vi.fn(), getPreviewContent: () => "preview", updateSettings: vi.fn() },
 		updateEditorBorderColor: vi.fn(),
+		updateEditorTopBorder: vi.fn(),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 	};
@@ -382,5 +394,49 @@ describe("model selector profiles", () => {
 		expect(session.setModelTemporaryCalls).toEqual([]);
 		expect(session.model).toBe(alternateModel);
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
+	});
+	test("settings selector validates before committing the restart default", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-settings-profile-"));
+		const cwd = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		resetSettingsForTest();
+
+		try {
+			const persisted = await Settings.init({ cwd, agentDir });
+			persisted.set("modelProfile.default", "old-profile");
+			await persisted.flushOrThrow();
+
+			const { ctx, settings, session } = createControllerContext({
+				missingCredentials: true,
+				settings: persisted,
+				mockFlush: false,
+			});
+			const controller = new SelectorController(ctx as never);
+			controller.showSettingsSelector();
+			await Bun.sleep(20);
+
+			const component = ctx.editorContainer.addChild.mock.calls.at(-1)?.[0] as SettingsSelectorComponent;
+			component.handleInput("\x1b[C"); // Model tab.
+			component.handleInput("\n"); // Open Default Model Profile.
+			component.handleInput("\n"); // Request profile-a.
+
+			expect(settings.get("modelProfile.default")).toBe("old-profile");
+			await Bun.sleep(10);
+			expect(ctx.showError).toHaveBeenCalledWith(
+				'Model profile "Profile Alpha" requires credentials for: provider-a. Run /login and configure the missing provider(s), then retry.',
+			);
+			expect(session.setModelTemporaryCalls).toEqual([]);
+			expect(settings.get("modelProfile.default")).toBe("old-profile");
+			expect(component.render(120).join("\n")).toContain("old-profile");
+
+			await settings.flushOrThrow();
+			resetSettingsForTest();
+			const fresh = await Settings.init({ cwd, agentDir });
+			expect(fresh.get("modelProfile.default")).toBe("old-profile");
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });

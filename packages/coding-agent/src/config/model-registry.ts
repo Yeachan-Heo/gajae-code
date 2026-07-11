@@ -129,6 +129,19 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 
 /** Alias for ModelRoleInfo - used for both built-in and custom roles */
 export type RoleInfo = ModelRoleInfo;
+function getOwnString(record: Record<string, string>, key: string): string | undefined {
+	const value = Object.hasOwn(record, key) ? record[key] : undefined;
+	return typeof value === "string" ? value : undefined;
+}
+
+function setOwnString(record: Record<string, string>, key: string, value: string): void {
+	Object.defineProperty(record, key, {
+		value,
+		enumerable: true,
+		configurable: true,
+		writable: true,
+	});
+}
 
 /**
  * Return the canonical set of known roles for selector/carousel UI.
@@ -1702,18 +1715,18 @@ export class ModelRegistry {
 		const targetSettings = this.#modelBindingsTargetSettings;
 		if (!targetSettings) return;
 		const bindings = this.#configuredModelBindings;
-		const nextModelRoles = { ...targetSettings.get("modelRoles") };
+		const nextModelRoles = { ...targetSettings.getRuntimeModelRoles() };
 		const configuredModelRoles = bindings?.modelRoles ?? {};
 		const configuredModelRoleKeys = new Set(Object.keys(configuredModelRoles));
 		for (const role of this.#appliedModelBindingRoles) {
 			if (configuredModelRoleKeys.has(role)) continue;
 			const lastApplied = this.#lastAppliedModelBindingRoles.get(role);
-			if (lastApplied !== undefined && nextModelRoles[role] === lastApplied) {
+			if (lastApplied !== undefined && getOwnString(nextModelRoles, role) === lastApplied) {
 				const baseline = this.#modelBindingRoleBaselines.get(role);
 				if (baseline === undefined) {
 					delete nextModelRoles[role];
 				} else {
-					nextModelRoles[role] = baseline;
+					setOwnString(nextModelRoles, role, baseline);
 				}
 			}
 			this.#modelBindingRoleBaselines.delete(role);
@@ -1723,28 +1736,28 @@ export class ModelRegistry {
 			if (!modelId) continue;
 			const previousApplied = this.#lastAppliedModelBindingRoles.get(role);
 			if (!this.#modelBindingRoleBaselines.has(role)) {
-				this.#modelBindingRoleBaselines.set(role, nextModelRoles[role]);
+				this.#modelBindingRoleBaselines.set(role, getOwnString(nextModelRoles, role));
 			}
-			if (previousApplied === undefined || nextModelRoles[role] === previousApplied) {
-				nextModelRoles[role] = modelId;
+			if (previousApplied === undefined || getOwnString(nextModelRoles, role) === previousApplied) {
+				setOwnString(nextModelRoles, role, modelId);
 				this.#lastAppliedModelBindingRoles.set(role, modelId);
 			}
 		}
 		targetSettings.override("modelRoles", nextModelRoles);
 		this.#appliedModelBindingRoles = new Set(Object.keys(configuredModelRoles));
 
-		const nextAgentModelOverrides = { ...targetSettings.get("task.agentModelOverrides") };
+		const nextAgentModelOverrides = { ...targetSettings.getRuntimeAgentModelOverrides() };
 		const configuredAgentModelOverrides = bindings?.agentModelOverrides ?? {};
 		const configuredAgentModelOverrideKeys = new Set(Object.keys(configuredAgentModelOverrides));
 		for (const agentName of this.#appliedAgentModelBindingOverrides) {
 			if (configuredAgentModelOverrideKeys.has(agentName)) continue;
 			const lastApplied = this.#lastAppliedAgentModelBindingOverrides.get(agentName);
-			if (lastApplied !== undefined && nextAgentModelOverrides[agentName] === lastApplied) {
+			if (lastApplied !== undefined && getOwnString(nextAgentModelOverrides, agentName) === lastApplied) {
 				const baseline = this.#agentModelBindingBaselines.get(agentName);
 				if (baseline === undefined) {
 					delete nextAgentModelOverrides[agentName];
 				} else {
-					nextAgentModelOverrides[agentName] = baseline;
+					setOwnString(nextAgentModelOverrides, agentName, baseline);
 				}
 			}
 			this.#agentModelBindingBaselines.delete(agentName);
@@ -1754,10 +1767,10 @@ export class ModelRegistry {
 			if (!modelId) continue;
 			const previousApplied = this.#lastAppliedAgentModelBindingOverrides.get(agentName);
 			if (!this.#agentModelBindingBaselines.has(agentName)) {
-				this.#agentModelBindingBaselines.set(agentName, nextAgentModelOverrides[agentName]);
+				this.#agentModelBindingBaselines.set(agentName, getOwnString(nextAgentModelOverrides, agentName));
 			}
-			if (previousApplied === undefined || nextAgentModelOverrides[agentName] === previousApplied) {
-				nextAgentModelOverrides[agentName] = modelId;
+			if (previousApplied === undefined || getOwnString(nextAgentModelOverrides, agentName) === previousApplied) {
+				setOwnString(nextAgentModelOverrides, agentName, modelId);
 				this.#lastAppliedAgentModelBindingOverrides.set(agentName, modelId);
 			}
 		}

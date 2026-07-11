@@ -13,7 +13,7 @@ type JsonSchemaObject = {
 	$id?: string;
 	title?: string;
 	description?: string;
-	type?: string;
+	type?: string | readonly string[];
 	properties?: Record<string, JsonSchema>;
 	additionalProperties?: JsonSchema;
 	items?: JsonSchema;
@@ -109,7 +109,7 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 		case "boolean":
 			return { type: "boolean" };
 		case "string":
-			return { type: "string" };
+			return { type: "nullable" in definition && definition.nullable ? ["string", "null"] : "string" };
 		case "number":
 			return { type: "number" };
 		case "enum":

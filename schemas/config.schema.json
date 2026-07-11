@@ -208,7 +208,10 @@
 			"type": "object",
 			"properties": {
 				"default": {
-					"type": "string",
+					"type": [
+						"string",
+						"null"
+					],
 					"description": "Model profile applied automatically at startup"
 				}
 			},

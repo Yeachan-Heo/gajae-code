@@ -597,6 +597,8 @@ export class ModelSelectorComponent extends Container {
 		} else {
 			// Reload config and cached discovery state without blocking on live provider refresh
 			await this.#modelRegistry.refresh("offline");
+			this.#roles = {};
+			this.#loadRoleModels();
 
 			// Check for models.json errors
 			const loadError = this.#modelRegistry.getError();
@@ -1737,6 +1739,28 @@ export class ModelSelectorComponent extends Container {
 		return undefined;
 	}
 
+	#reloadRoleModelsFromSettings(): void {
+		this.#roles = {};
+		this.#loadRoleModels();
+		this.#updateList();
+	}
+
+	#commitAssignment(selection: Extract<ModelSelectorSelection, { kind: "assignment" }>): void {
+		try {
+			const result = this.#onSelectCallback(selection);
+			if (result) {
+				void result.then(
+					() => this.#reloadRoleModelsFromSettings(),
+					() => this.#reloadRoleModelsFromSettings(),
+				);
+			} else {
+				this.#reloadRoleModelsFromSettings();
+			}
+		} catch {
+			this.#reloadRoleModelsFromSettings();
+		}
+	}
+
 	#handleSelect(
 		item: ModelItem | CanonicalModelItem,
 		role: GjcModelAssignmentTargetId | null,
@@ -1758,7 +1782,7 @@ export class ModelSelectorComponent extends Container {
 
 		// For temporary role, don't save to settings - just notify caller
 		if (role === null) {
-			this.#onSelectCallback({
+			this.#commitAssignment({
 				kind: "assignment",
 				model: item.model,
 				role: null,
@@ -1775,13 +1799,7 @@ export class ModelSelectorComponent extends Container {
 				? item.selector
 				: formatModelSelectorValue(item.selector, selectedThinkingLevel);
 
-		// Update local state for UI
-		for (const targetRole of roles ?? [role]) {
-			this.#roles[targetRole] = { model: item.model, thinkingLevel: selectedThinkingLevel };
-		}
-
-		// Notify caller (for updating agent state if needed)
-		this.#onSelectCallback({
+		this.#commitAssignment({
 			kind: "assignment",
 			model: item.model,
 			role,
@@ -1789,9 +1807,6 @@ export class ModelSelectorComponent extends Container {
 			thinkingLevel: selectedThinkingLevel,
 			selector: selectorValue,
 		});
-
-		// Update list to show new badges
-		this.#updateList();
 	}
 
 	getSearchInput(): Input {

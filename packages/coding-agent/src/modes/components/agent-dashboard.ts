@@ -82,6 +82,7 @@ interface AgentDashboardModelContext {
 	modelRegistry?: ModelRegistry;
 	activeModelPattern?: string;
 	defaultModelPattern?: string;
+	persistModelOverride?: (agentName: string, value: string | undefined) => void;
 }
 
 const SOURCE_ORDER: Record<AgentSource, number> = {
@@ -465,16 +466,17 @@ export class AgentDashboard extends Container {
 		this.#settingsManager.set("task.disabledAgents", disabled);
 	}
 
-	#persistModelOverrides(): void {
-		if (!this.#settingsManager) return;
-		const overrides: Record<string, string> = {};
-		for (const agent of this.#allAgents) {
-			const value = agent.overrideModel?.trim();
-			if (value) {
-				overrides[agent.name] = value;
-			}
+	#persistModelOverride(agentName: string, value: string | undefined): void {
+		if (this.modelContext.persistModelOverride) {
+			this.modelContext.persistModelOverride(agentName, value);
+			return;
 		}
-		this.#settingsManager.set("task.agentModelOverrides", overrides);
+		if (!this.#settingsManager) return;
+		if (value) {
+			this.#settingsManager.setAgentModelOverride(agentName, value);
+		} else {
+			this.#settingsManager.clearAgentModelOverride(agentName);
+		}
 	}
 
 	#toggleSelectedAgent(): void {
@@ -504,9 +506,10 @@ export class AgentDashboard extends Container {
 		if (!this.#editingAgentName) return;
 		const selected = this.#allAgents.find(agent => agent.name === this.#editingAgentName);
 		if (!selected) return;
-		const value = rawValue.trim();
-		selected.overrideModel = value || undefined;
-		this.#persistModelOverrides();
+		const value = rawValue.trim() || undefined;
+		this.#persistModelOverride(selected.name, value);
+		selected.overrideModel =
+			this.#settingsManager?.get("task.agentModelOverrides")[selected.name]?.trim() || undefined;
 		this.#editingAgentName = null;
 		this.#editInput = null;
 		this.#applyFilters();

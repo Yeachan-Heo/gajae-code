@@ -65,6 +65,10 @@ export interface SettingsOptions {
 	/** Initial overrides */
 	overrides?: Partial<Record<SettingPath, unknown>>;
 }
+export interface RuntimeModelProfileDefaultState {
+	suppressed: boolean;
+	value: string | undefined;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Path Utilities
@@ -88,16 +92,29 @@ function getByPath(obj: RawSettings, segments: string[]): unknown {
  * Set a nested value in an object by path segments.
  * Creates intermediate objects as needed.
  */
+function setOwnValue(target: RawSettings, key: string, value: unknown): void {
+	Object.defineProperty(target, key, {
+		value,
+		enumerable: true,
+		configurable: true,
+		writable: true,
+	});
+}
+
+function assignStringRecord(target: Record<string, string>, source: Record<string, string>): void {
+	for (const [key, value] of Object.entries(source)) setOwnValue(target, key, value);
+}
+
 function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 	let current = obj;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const segment = segments[i];
 		if (!(segment in current) || typeof current[segment] !== "object" || current[segment] === null) {
-			current[segment] = {};
+			setOwnValue(current, segment, {});
 		}
 		current = current[segment] as RawSettings;
 	}
-	current[segments[segments.length - 1]] = value;
+	setOwnValue(current, segments[segments.length - 1], value);
 }
 
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
@@ -143,11 +160,18 @@ function shallowStringRecord(value: unknown): Record<string, string> {
 
 	const result: Record<string, string> = {};
 	for (const [key, item] of Object.entries(value)) {
-		if (typeof item === "string") {
-			result[key] = item;
-		}
+		if (typeof item === "string") setOwnValue(result, key, item);
 	}
 	return result;
+}
+function isRecordObject(value: unknown): value is RawSettings {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+type RuntimeModelRecordPath = "modelRoles" | "task.agentModelOverrides";
+
+function isRuntimeModelRecordPath(path: SettingPath | string): path is RuntimeModelRecordPath {
+	return path === "modelRoles" || path === "task.agentModelOverrides";
 }
 
 function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, cwd: string): string[] | undefined {
@@ -204,6 +228,11 @@ export class Settings {
 	#project: RawSettings = {};
 	/** Runtime overrides (not persisted) */
 	#overrides: RawSettings = {};
+	/** Opaque runtime resets that must survive sanitized internal rewrites. */
+	#runtimeModelWholeResets = new Set<RuntimeModelRecordPath>();
+	#runtimeModelResetKeys = new Map<RuntimeModelRecordPath, Set<string>>();
+	#runtimeModelWholeResetReleasedKeys = new Map<RuntimeModelRecordPath, Set<string>>();
+	#runtimeModelProfileDefaultSuppressed = false;
 	/** Merged view (global + project + overrides) */
 	#merged: RawSettings = {};
 
@@ -225,7 +254,11 @@ export class Settings {
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
-				setByPath(this.#overrides, key.split("."), value);
+				if (isRuntimeModelRecordPath(key)) {
+					this.#storeRuntimeModelRecord(key, value);
+				} else {
+					setByPath(this.#overrides, key.split("."), value);
+				}
 			}
 		}
 	}
@@ -291,6 +324,9 @@ export class Settings {
 		const segments = path.split(".");
 		const value = getByPath(this.#merged, segments);
 		if (value !== undefined) {
+			if (path === "modelRoles" || path === "task.agentModelOverrides") {
+				return shallowStringRecord(value) as SettingValue<P>;
+			}
 			const pathScopedValue = resolvePathScopedStringArray(path, value, this.#cwd);
 			return (pathScopedValue ?? value) as SettingValue<P>;
 		}
@@ -305,7 +341,14 @@ export class Settings {
 	 */
 	getGlobal<P extends SettingPath>(path: P): SettingValue<P> | undefined {
 		const value = getByPath(this.#global, path.split("."));
-		return value === undefined ? undefined : (value as SettingValue<P>);
+		if (value === undefined) return undefined;
+		if (path === "modelProfile.default") {
+			return (typeof value === "string" ? value : undefined) as SettingValue<P> | undefined;
+		}
+		if (path === "modelRoles" || path === "task.agentModelOverrides") {
+			return shallowStringRecord(value) as SettingValue<P>;
+		}
+		return value as SettingValue<P>;
 	}
 
 	/** Check whether a setting is present in loaded settings/overrides rather than coming from schema defaults. */
@@ -337,6 +380,11 @@ export class Settings {
 	 * Apply runtime overrides (not persisted).
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+		if (isRuntimeModelRecordPath(path)) {
+			this.#replaceRuntimeModelRecord(path, value);
+			return;
+		}
+		if (path === "modelProfile.default") this.#runtimeModelProfileDefaultSuppressed = false;
 		const segments = path.split(".");
 		setByPath(this.#overrides, segments, value);
 		this.#rebuildMerged();
@@ -346,11 +394,22 @@ export class Settings {
 	 * Clear a runtime override.
 	 */
 	clearOverride(path: SettingPath): void {
+		const clearedWholeReset = isRuntimeModelRecordPath(path) && this.#runtimeModelWholeResets.delete(path);
+		const clearedResetKeys = isRuntimeModelRecordPath(path) && this.#runtimeModelResetKeys.delete(path);
+		const clearedReleasedKeys =
+			isRuntimeModelRecordPath(path) && this.#runtimeModelWholeResetReleasedKeys.delete(path);
+		const clearedProfileSuppression = path === "modelProfile.default" && this.#runtimeModelProfileDefaultSuppressed;
+		if (path === "modelProfile.default") this.#runtimeModelProfileDefaultSuppressed = false;
 		const segments = path.split(".");
 		let current = this.#overrides;
 		for (let i = 0; i < segments.length - 1; i++) {
 			const segment = segments[i];
-			if (!(segment in current)) return;
+			if (!(segment in current)) {
+				if (clearedWholeReset || clearedResetKeys || clearedReleasedKeys || clearedProfileSuppression) {
+					this.#rebuildMerged();
+				}
+				return;
+			}
 			current = current[segment] as RawSettings;
 		}
 		delete current[segments[segments.length - 1]];
@@ -403,6 +462,14 @@ export class Settings {
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#overrides = structuredClone(this.#overrides);
+		cloned.#runtimeModelWholeResets = new Set(this.#runtimeModelWholeResets);
+		cloned.#runtimeModelResetKeys = new Map(
+			[...this.#runtimeModelResetKeys].map(([modelPath, keys]) => [modelPath, new Set(keys)]),
+		);
+		cloned.#runtimeModelWholeResetReleasedKeys = new Map(
+			[...this.#runtimeModelWholeResetReleasedKeys].map(([modelPath, keys]) => [modelPath, new Set(keys)]),
+		);
+		cloned.#runtimeModelProfileDefaultSuppressed = this.#runtimeModelProfileDefaultSuppressed;
 		cloned.#rebuildMerged();
 		cloned.#fireAllHooks();
 		return cloned;
@@ -477,10 +544,99 @@ export class Settings {
 	}
 
 	/**
-	 * Set a model role (helper for modelRoles record).
+	 * Store a runtime model record without exposing malformed/reset leaves through
+	 * public reads. Whole-record resets and reset-valued leaves live in separate
+	 * metadata so sanitized binding/profile rewrites cannot erase them.
+	 */
+	#storeRuntimeModelRecord(path: RuntimeModelRecordPath, value: unknown): void {
+		if (value === undefined) {
+			setByPath(this.#overrides, path.split("."), undefined);
+			return;
+		}
+		setByPath(this.#overrides, path.split("."), shallowStringRecord(value));
+
+		if (!isRecordObject(value)) {
+			this.#runtimeModelWholeResets.add(path);
+			this.#runtimeModelResetKeys.delete(path);
+			this.#runtimeModelWholeResetReleasedKeys.delete(path);
+			return;
+		}
+
+		const resetKeys = new Set(this.#runtimeModelResetKeys.get(path));
+		const releasedKeys = this.#runtimeModelWholeResetReleasedKeys.get(path);
+		for (const [key, item] of Object.entries(value)) {
+			if (typeof item !== "string" && item !== undefined) {
+				resetKeys.add(key);
+				releasedKeys?.delete(key);
+			}
+		}
+		if (resetKeys.size > 0) {
+			this.#runtimeModelResetKeys.set(path, resetKeys);
+		} else {
+			this.#runtimeModelResetKeys.delete(path);
+		}
+	}
+
+	/**
+	 * Replace visible runtime strings while preserving opaque reset state. This
+	 * path is used by binding/profile refreshes that only see sanitized records.
+	 */
+	#replaceRuntimeModelRecord(path: RuntimeModelRecordPath, value: unknown): void {
+		this.#storeRuntimeModelRecord(path, value);
+		this.#rebuildMerged();
+	}
+
+	/** Apply one explicit user assignment over any reset for that leaf. */
+	#overrideRuntimeModelRecord(path: RuntimeModelRecordPath, key: string, modelId: string): void {
+		const next = shallowStringRecord(getByPath(this.#overrides, path.split(".")));
+		setOwnValue(next, key, modelId);
+		const resetKeys = this.#runtimeModelResetKeys.get(path);
+		if (resetKeys) {
+			resetKeys.delete(key);
+			if (resetKeys.size === 0) this.#runtimeModelResetKeys.delete(path);
+		}
+		if (this.#runtimeModelWholeResets.has(path)) {
+			const releasedKeys = this.#runtimeModelWholeResetReleasedKeys.get(path) ?? new Set<string>();
+			releasedKeys.add(key);
+			this.#runtimeModelWholeResetReleasedKeys.set(path, releasedKeys);
+		}
+		setByPath(this.#overrides, path.split("."), next);
+		this.#rebuildMerged();
+	}
+
+	/** Persist one model role without changing runtime reset/override state. */
+	persistModelRole(role: ModelRole | string, modelId: string): void {
+		const current = shallowStringRecord(getByPath(this.#global, ["modelRoles"]));
+		setOwnValue(current, role, modelId);
+		this.set("modelRoles", current);
+	}
+
+	/** Persist one agent model without changing runtime reset/override state. */
+	persistAgentModelOverride(agentName: string, modelId: string): void {
+		const current = shallowStringRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
+		setOwnValue(current, agentName, modelId);
+		this.set("task.agentModelOverrides", current);
+	}
+	/** Replace the durable model-role record exactly, preserving prior absence. */
+	replacePersistedModelRoles(value: Record<string, string> | undefined): void {
+		setByPath(this.#global, ["modelRoles"], value);
+		this.#modified.add("modelRoles");
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	/** Replace the durable agent-model record exactly, preserving prior absence. */
+	replacePersistedAgentModelOverrides(value: Record<string, string> | undefined): void {
+		setByPath(this.#global, ["task", "agentModelOverrides"], value);
+		this.#modified.add("task.agentModelOverrides");
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	/**
+	 * Set a model role while keeping a project/profile-shadowed live value aligned.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string): void {
-		const current = shallowStringRecord(getByPath(this.#global, ["modelRoles"]));
 		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
 		const updateRuntimeOverride =
 			!!runtimeOverrides &&
@@ -488,32 +644,52 @@ export class Settings {
 			!Array.isArray(runtimeOverrides) &&
 			Object.hasOwn(runtimeOverrides, role);
 
-		this.set("modelRoles", { ...current, [role]: modelId });
+		this.persistModelRole(role, modelId);
 
-		if (updateRuntimeOverride) {
-			this.override("modelRoles", { ...shallowStringRecord(runtimeOverrides), [role]: modelId });
+		if (updateRuntimeOverride || this.get("modelRoles")[role] !== modelId) {
+			this.#overrideRuntimeModelRecord("modelRoles", role, modelId);
 		}
 	}
 	/**
-	 * Set an agent model override while keeping any live runtime override aligned.
+	 * Set an agent model override while keeping any live project/profile override aligned.
 	 *
-	 * Runtime model profiles override `task.agentModelOverrides` for the current
-	 * session. A user-selected role assignment must win immediately in that same
-	 * session, but only the explicit agent change should be persisted.
+	 * Runtime model profiles and project settings can override
+	 * `task.agentModelOverrides` for the current session. A user-selected role
+	 * assignment must win immediately in that same session, but only the explicit
+	 * agent change should be persisted.
 	 */
 	setAgentModelOverride(agentName: string, modelId: string): void {
-		const current = shallowStringRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
 		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
 		const updateRuntimeOverride =
 			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
 
-		this.set("task.agentModelOverrides", { ...current, [agentName]: modelId });
+		this.persistAgentModelOverride(agentName, modelId);
 
-		if (updateRuntimeOverride) {
-			this.override("task.agentModelOverrides", {
-				...shallowStringRecord(runtimeOverrides),
-				[agentName]: modelId,
-			});
+		if (updateRuntimeOverride || this.get("task.agentModelOverrides")[agentName] !== modelId) {
+			this.#overrideRuntimeModelRecord("task.agentModelOverrides", agentName, modelId);
+		}
+	}
+
+	/** Clear one persisted agent assignment and any matching live string override. */
+	clearAgentModelOverride(agentName: string): void {
+		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
+		const runtimeModelId =
+			isRecordObject(runtimeOverrides) && typeof runtimeOverrides[agentName] === "string"
+				? runtimeOverrides[agentName]
+				: undefined;
+		const current = shallowStringRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
+		if (
+			Object.hasOwn(current, agentName) &&
+			(runtimeModelId === undefined || current[agentName] === runtimeModelId)
+		) {
+			delete current[agentName];
+			this.set("task.agentModelOverrides", current);
+		}
+
+		if (runtimeModelId !== undefined) {
+			const next = shallowStringRecord(runtimeOverrides);
+			delete next[agentName];
+			this.override("task.agentModelOverrides", next);
 		}
 	}
 
@@ -531,18 +707,68 @@ export class Settings {
 	getModelRoles(): ReadOnlyDict<string> {
 		return { ...this.get("modelRoles") };
 	}
+	/** Get visible runtime-only role strings without lower-precedence layers. */
+	getRuntimeModelRoles(): Record<string, string> {
+		return shallowStringRecord(getByPath(this.#overrides, ["modelRoles"]));
+	}
+
+	/** Get visible runtime-only agent strings without lower-precedence layers. */
+	getRuntimeAgentModelOverrides(): Record<string, string> {
+		return shallowStringRecord(getByPath(this.#overrides, ["task", "agentModelOverrides"]));
+	}
+	getPersistedModelProfileDefaultState(): RuntimeModelProfileDefaultState {
+		const value = getByPath(this.#global, ["modelProfile", "default"]);
+		return {
+			suppressed: value === null,
+			value: typeof value === "string" ? value : undefined,
+		};
+	}
+
+	persistModelProfileDefaultSuppression(): void {
+		setByPath(this.#global, ["modelProfile", "default"], null);
+		this.#modified.add("modelProfile.default");
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	restorePersistedModelProfileDefault(state: RuntimeModelProfileDefaultState): void {
+		setByPath(this.#global, ["modelProfile", "default"], state.suppressed ? null : state.value);
+		this.#modified.add("modelProfile.default");
+		this.#rebuildMerged();
+		this.#queueSave();
+	}
+
+	getRuntimeModelProfileDefaultState(): RuntimeModelProfileDefaultState {
+		const value = getByPath(this.#overrides, ["modelProfile", "default"]);
+		return {
+			suppressed: this.#runtimeModelProfileDefaultSuppressed,
+			value: typeof value === "string" ? value : undefined,
+		};
+	}
+
+	suppressModelProfileDefault(): void {
+		this.clearOverride("modelProfile.default");
+		this.#runtimeModelProfileDefaultSuppressed = true;
+		this.#rebuildMerged();
+	}
+
+	restoreRuntimeModelProfileDefault(state: RuntimeModelProfileDefaultState): void {
+		this.clearOverride("modelProfile.default");
+		if (state.suppressed) {
+			this.#runtimeModelProfileDefaultSuppressed = true;
+			this.#rebuildMerged();
+		} else if (state.value !== undefined) {
+			this.override("modelProfile.default", state.value);
+		}
+	}
 
 	/*
 	 * Override model roles (helper for modelRoles record).
 	 */
 	overrideModelRoles(roles: ReadOnlyDict<string>): void {
-		const next = shallowStringRecord(getByPath(this.#overrides, ["modelRoles"]));
 		for (const [role, modelId] of Object.entries(roles)) {
-			if (modelId) {
-				next[role] = modelId;
-			}
+			if (modelId) this.#overrideRuntimeModelRecord("modelRoles", role, modelId);
 		}
-		this.override("modelRoles", next);
 	}
 
 	/**
@@ -879,8 +1105,46 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	#rebuildMerged(): void {
-		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#project);
-		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
+		const lower = this.#deepMerge(this.#deepMerge({}, this.#global), this.#project);
+		this.#merged = this.#deepMerge(lower, this.#overrides);
+
+		for (const modelPath of ["modelRoles", "task.agentModelOverrides"] as const) {
+			const segments = modelPath.split(".");
+			const lowerValue = getByPath(lower, segments);
+			const runtimeValue = getByPath(this.#overrides, segments);
+			const resetKeys = this.#runtimeModelResetKeys.get(modelPath);
+			const hasRuntimeState =
+				runtimeValue !== undefined || this.#runtimeModelWholeResets.has(modelPath) || resetKeys !== undefined;
+			if (lowerValue === undefined && !hasRuntimeState) continue;
+
+			const lowerRecord = shallowStringRecord(lowerValue);
+			const effective: Record<string, string> = {};
+			if (this.#runtimeModelWholeResets.has(modelPath)) {
+				for (const key of this.#runtimeModelWholeResetReleasedKeys.get(modelPath) ?? []) {
+					const value = lowerRecord[key];
+					if (value !== undefined) setOwnValue(effective, key, value);
+				}
+			} else {
+				assignStringRecord(effective, lowerRecord);
+				if (resetKeys) {
+					for (const key of resetKeys) delete effective[key];
+				}
+			}
+			assignStringRecord(effective, shallowStringRecord(runtimeValue));
+			setByPath(this.#merged, segments, effective);
+		}
+		const runtimeProfileDefault = getByPath(this.#overrides, ["modelProfile", "default"]);
+		if (runtimeProfileDefault === undefined) {
+			const globalProfileDefault = getByPath(this.#global, ["modelProfile", "default"]);
+			if (globalProfileDefault === null) {
+				setByPath(this.#merged, ["modelProfile", "default"], undefined);
+			} else if (typeof globalProfileDefault === "string") {
+				setByPath(this.#merged, ["modelProfile", "default"], globalProfileDefault);
+			}
+		}
+		if (this.#runtimeModelProfileDefaultSuppressed) {
+			setByPath(this.#merged, ["modelProfile", "default"], undefined);
+		}
 	}
 
 	#fireAllHooks(): void {
@@ -897,22 +1161,13 @@ export class Settings {
 		const result = { ...base };
 		for (const key of Object.keys(overrides)) {
 			const override = overrides[key];
-			const baseVal = base[key];
-
 			if (override === undefined) continue;
 
-			if (
-				typeof override === "object" &&
-				override !== null &&
-				!Array.isArray(override) &&
-				typeof baseVal === "object" &&
-				baseVal !== null &&
-				!Array.isArray(baseVal)
-			) {
-				result[key] = this.#deepMerge(baseVal as RawSettings, override as RawSettings);
-			} else {
-				result[key] = override;
-			}
+			const baseValue = base[key];
+			const mergedValue = isRecordObject(override)
+				? this.#deepMerge(isRecordObject(baseValue) ? baseValue : {}, override)
+				: override;
+			setOwnValue(result, key, mergedValue);
 		}
 		return result;
 	}

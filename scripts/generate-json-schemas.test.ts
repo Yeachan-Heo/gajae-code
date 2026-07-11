@@ -21,4 +21,8 @@ describe("generated JSON Schemas", () => {
 		const providerSchema = modelsSchema.properties.providers.additionalProperties;
 		expect(providerSchema.properties.webSearch.enum).toEqual(["on", "off", "auto"]);
 	});
+	it("allows the durable model profile suppression tombstone", () => {
+		const configSchema = JSON_SCHEMA_OUTPUTS.find(output => output.path === "schemas/config.schema.json")?.schema as any;
+		expect(configSchema.properties.modelProfile.properties.default.type).toEqual(["string", "null"]);
+	});
 });

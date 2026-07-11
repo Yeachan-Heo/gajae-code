@@ -77,9 +77,38 @@ const RequestTransformSchema = z
 	})
 	.strict();
 
+function setOwnValue(target: Record<string, unknown>, key: string, value: unknown): void {
+	Object.defineProperty(target, key, {
+		value,
+		writable: true,
+		enumerable: true,
+		configurable: true,
+	});
+}
+
+const SAFE_RECORD_KEY_PREFIX = "binding:";
+
+const SafeNonEmptyStringRecordSchema = z.preprocess(
+	value => {
+		if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+		const encoded: Record<string, unknown> = {};
+		for (const [key, item] of Object.entries(value)) {
+			setOwnValue(encoded, `${SAFE_RECORD_KEY_PREFIX}${key}`, item);
+		}
+		return encoded;
+	},
+	z.record(z.string(), z.string().min(1)).overwrite(encoded => {
+		const decoded: Record<string, string> = {};
+		for (const [key, item] of Object.entries(encoded)) {
+			setOwnValue(decoded, key.slice(SAFE_RECORD_KEY_PREFIX.length), item);
+		}
+		return decoded;
+	}),
+);
+
 const ModelBindingsSchema = z.object({
-	modelRoles: z.record(z.string(), z.string().min(1)).optional(),
-	agentModelOverrides: z.record(z.string(), z.string().min(1)).optional(),
+	modelRoles: SafeNonEmptyStringRecordSchema.optional(),
+	agentModelOverrides: SafeNonEmptyStringRecordSchema.optional(),
 });
 export const ProfileRoleSchema = z.enum(["default", "executor", "architect", "planner", "critic"]);
 
