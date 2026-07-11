@@ -63,7 +63,15 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
-import type { SessionStorage, SessionStorageStat, SessionStorageWriter } from "./session-storage";
+import type {
+	SessionStorage,
+	SessionStorageSnapshot,
+	SessionStorageStat,
+	SessionStorageWriter,
+	SessionStorageWriterCloseState,
+	VerifiedSessionDeleteResult,
+	VerifiedSessionDeleteTarget,
+} from "./session-storage";
 import { FileSessionStorage, MemorySessionStorage } from "./session-storage";
 
 export const CURRENT_SESSION_VERSION = 3;
@@ -425,6 +433,56 @@ export interface SessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 }
+// =============================================================================
+// Strict ACP authorization inventory (fail-closed, never partial authority)
+// =============================================================================
+
+/** Kind of failure surfaced by strict scoped inventory. Any failure grants zero authority. */
+export type StrictInventoryFailureKind =
+	| "root"
+	| "scan"
+	| "lstat"
+	| "read"
+	| "parse"
+	| "stat"
+	| "header"
+	| "cwd"
+	| "containment"
+	| "identity";
+
+/** Sanitized strict-inventory failure. Never carries raw file content. */
+export interface StrictInventoryFailure {
+	kind: StrictInventoryFailureKind;
+	message: string;
+	path?: string;
+}
+
+/** One exact-identity candidate suitable for ACP authorization binding. */
+export interface StrictInventoryCandidate {
+	/** Canonical absolute transcript path. */
+	path: string;
+	/** Session id parsed from the header. */
+	id: string;
+	/** Canonical cwd parsed from the header. */
+	cwd: string;
+	/** Descriptor-bound transcript identity (dev, ino, ...). */
+	identity: SessionStorageStat;
+}
+
+/**
+ * Strict inventory result. `complete` carries the full validated candidate set;
+ * `failure` carries every sanitized failure and grants zero page/cursor/authority.
+ * A failure result is never reduced to a partial candidate set.
+ */
+export type StrictInventoryResult =
+	| { kind: "complete"; candidates: StrictInventoryCandidate[] }
+	| { kind: "failure"; failures: StrictInventoryFailure[] };
+
+/** Certainty-aware close outcome for strict ACP disposal. */
+export type SessionManagerCloseOutcome =
+	| { kind: "closed" }
+	| { kind: "close_failed_retryable"; error: Error }
+	| { kind: "close_unknown"; error: Error };
 
 export type ReadonlySessionManager = Pick<
 	SessionManager,
@@ -2490,6 +2548,7 @@ class NdjsonFileWriter {
 	#error: Error | undefined;
 	#pendingWrites: Promise<void> = Promise.resolve();
 	#onError: ((err: Error) => void) | undefined;
+	#closeDrained = false;
 
 	constructor(storage: SessionStorage, path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }) {
 		this.#onError = options?.onError;
@@ -2583,35 +2642,61 @@ class NdjsonFileWriter {
 		}
 	}
 
-	/** Close the writer, flushing all data. */
+	/** Close the writer, flushing all data. Retryable across certified pre-dispatch failures. */
 	async close(): Promise<void> {
-		if (this.#closed || this.#closing) return;
+		// Terminal (confirmed closed or quarantined close_unknown): no further attempts.
+		if (this.#closed) return;
+		// Re-entry guard: once a fresh attempt has started draining, block concurrent
+		// close() calls. A retry after a certified pre-dispatch failure has #closing
+		// reset and #closeDrained set, so it re-enters to actually re-dispatch the
+		// underlying OS close — the wrapper must NOT mark itself closed on a retryable
+		// failure, and must allow a genuine later retry.
+		if (this.#closing) return;
+
 		this.#closing = true;
 
-		let closeError: Error | undefined;
-		try {
-			await this.flush();
-		} catch (err) {
-			closeError = toError(err);
-		}
-
-		try {
-			await this.#pendingWrites;
-		} catch (err) {
-			if (!closeError) closeError = toError(err);
+		let drainError: Error | undefined;
+		// Only drain once: a retry after a pre-dispatch failure has already flushed
+		// pending writes, and the underlying writer rejects further flushes while in
+		// the retryable state. Re-draining would mask the close retry with that error.
+		if (!this.#closeDrained) {
+			try {
+				await this.flush();
+			} catch (err) {
+				drainError = toError(err);
+			}
+			try {
+				await this.#pendingWrites;
+			} catch (err) {
+				if (!drainError) drainError = toError(err);
+			}
+			this.#closeDrained = true;
 		}
 
 		try {
 			await this.#writer.close();
 		} catch (err) {
-			const endErr = this.#recordError(err);
-			if (!closeError) closeError = endErr;
+			if (this.#writer.getCloseState() === "close_failed_retryable") {
+				// Certified pre-dispatch failure: the numeric fd is still owned and a
+				// later retry is safe. Do NOT mark the wrapper closed, do NOT poison
+				// #error (the retry must still be able to flush/close), and reset
+				// #closing so the retry can actually re-dispatch. Surface the failure —
+				// a partial close is never reported as success.
+				this.#closing = false;
+				throw toError(err);
+			}
+			// close_unknown (quarantined) or other dispatched failure: terminal. Record
+			// the error and mark the wrapper closed so no retry/finalizer touches the
+			// uncertain fd again.
+			this.#closed = true;
+			throw this.#recordError(err);
 		}
 
+		// Confirmed closed (underlying close succeeded).
 		this.#closed = true;
 
-		if (!closeError && this.#error) closeError = this.#error;
-		if (closeError) throw closeError;
+		if (drainError) throw drainError;
+		if (this.#error) throw this.#error;
 	}
 
 	/** Check if there's a stored error. */
@@ -2619,16 +2704,49 @@ class NdjsonFileWriter {
 		return this.#error;
 	}
 
-	/** True while the writer accepts new writes (not closing or closed). */
+	/**
+	 * True only while the writer accepts new writes. A retryable close failure
+	 * leaves the wrapper non-terminal but the underlying fd rejects writes, so
+	 * callers route appends around it rather than through it.
+	 */
 	isOpen(): boolean {
-		return !this.#closed && !this.#closing;
+		if (this.#closed || this.#closing) return false;
+		return this.#writer.getCloseState() === "open";
 	}
 
+	/**
+	 * Truthful synchronous close used by the atomic-rewrite path: dispatches the
+	 * underlying close synchronously and throws on failure so a close failure is
+	 * observable BEFORE the rename step. No fire-and-forget: the old suppression
+	 * (`close().catch(() => {})`) let a rename proceed on an unclosed file.
+	 */
 	closeSync(): void {
 		if (this.#closed) return;
+		if (this.#closing) return;
+		// The sync path's writeSync bypasses the async queue, so #pendingWrites is
+		// not applicable; the caller has already issued every writeSync before this.
+		try {
+			this.#writer.closeSync();
+		} catch (err) {
+			if (this.#writer.getCloseState() === "close_failed_retryable") {
+				// Retryable: keep the wrapper open for the cleanup retry in the caller's
+				// catch block; surface the failure so the rename is skipped.
+				throw toError(err);
+			}
+			this.#closed = true;
+			throw this.#recordError(err);
+		}
 		this.#closed = true;
-		this.#closing = true;
-		this.#writer.close().catch(() => {});
+	}
+
+	/** Certainty-aware close state of the underlying storage writer. */
+	getCloseState(): SessionStorageWriterCloseState {
+		return this.#writer.getCloseState();
+	}
+
+	/** Stored error for a non-success underlying close state. */
+	getCloseError(): Error | undefined {
+		return this.#writer.getCloseError();
 	}
 }
 
@@ -3760,7 +3878,15 @@ export class SessionManager {
 			writer.closeSync();
 			this.#replaceSessionFileSync(tempPath, this.#sessionFile);
 		} catch (err) {
-			writer.closeSync();
+			// closeSync is now truthful and may throw; wrap the best-effort cleanup so
+			// the original error (write/close failure) is the one surfaced, not the
+			// cleanup failure. The rename above was already skipped because closeSync
+			// threw before it.
+			try {
+				writer.closeSync();
+			} catch {
+				// Best-effort cleanup of the temp writer's descriptor.
+			}
 			void this.storage.unlink(tempPath).catch(() => {});
 			throw toError(err);
 		}
@@ -3857,6 +3983,73 @@ export class SessionManager {
 		});
 		this.#disposeResidentTextBlobStore();
 		if (this.#persistError) throw this.#persistError;
+	}
+	/** Flush while open, then strictly close; retryable close skips the invalid second flush. */
+	async flushAndCloseStrict(): Promise<SessionManagerCloseOutcome> {
+		if (this.#persistWriter?.getCloseState() !== "close_failed_retryable") {
+			await this.flush();
+		}
+		return this.closeStrict();
+	}
+
+	/**
+	 * Strictly flush and close the persist writer, returning the certainty-aware close
+	 * outcome without manufacturing success. The existing {@link close} path is
+	 * preserved for best-effort callers; this seam lets strict ACP disposal prove
+	 * writer closure before any destructive operation.
+	 */
+	async closeStrict(): Promise<SessionManagerCloseOutcome> {
+		let outcome: SessionManagerCloseOutcome = { kind: "closed" };
+		await this.#queuePersistTask(async () => {
+			const writer = this.#persistWriter;
+			if (!writer) {
+				this.#flushed = true;
+				return;
+			}
+			try {
+				await writer.close();
+			} catch {
+				// Outcome is captured from the underlying writer's close state below.
+			}
+			outcome = this.#closeOutcomeFromWriter(writer);
+			if (outcome.kind === "closed") {
+				this.#flushed = true;
+				// Confirmed closed: release writer ownership.
+				this.#persistWriter = undefined;
+				this.#persistWriterPath = undefined;
+			} else if (outcome.kind === "close_unknown") {
+				// Quarantined (terminal): release ownership so no retry/finalizer
+				// touches the uncertain fd again.
+				this.#persistWriter = undefined;
+				this.#persistWriterPath = undefined;
+			}
+			// close_failed_retryable: RETAIN the writer so a later closeStrict() call
+			// can actually re-dispatch the OS close (ownership stays proven). The
+			// wrapper must not manufacture success or surrender a retryable fd.
+		});
+		// Only tear down the resident blob store on a terminal outcome; a retryable
+		// close leaves the session live for a genuine retry.
+		if (!this.#persistWriter) {
+			this.#disposeResidentTextBlobStore();
+		}
+		return outcome;
+	}
+
+	#closeOutcomeFromWriter(writer: NdjsonFileWriter): SessionManagerCloseOutcome {
+		const state = writer.getCloseState();
+		const error = writer.getCloseError();
+		switch (state) {
+			case "closed":
+				return { kind: "closed" };
+			case "close_failed_retryable":
+				return { kind: "close_failed_retryable", error: error ?? new Error("Writer close failed before dispatch") };
+			case "close_unknown":
+				return { kind: "close_unknown", error: error ?? new Error("Writer close outcome is unknown") };
+			default:
+				// "open" should not occur after close() returned, but treat defensively as
+				// a non-quiescent terminal state rather than confirmed closed.
+				return { kind: "close_unknown", error: error ?? new Error("Writer close did not dispatch") };
+		}
 	}
 
 	getCwd(): string {
@@ -5399,4 +5592,153 @@ export class SessionManager {
 			return [];
 		}
 	}
+	/**
+	 * Strict raw scoped inventory for ACP authorization. Enumerates the scoped
+	 * session directory without suppressing any root/scan/lstat/read/parse/stat/
+	 * header/cwd/containment/identity failure. A failure result carries every
+	 * sanitized failure and grants zero authority — it is never reduced to a
+	 * partial candidate set. Display/global {@link list} behavior is unaffected.
+	 */
+	static inventorySessionsStrict(
+		cwd: string,
+		options?: { sessionDir?: string; storage?: SessionStorage },
+	): StrictInventoryResult {
+		const storage = options?.storage ?? new FileSessionStorage();
+		const dir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
+		if (!storage.listFilesStrictSync) {
+			return {
+				kind: "failure",
+				failures: [{ kind: "scan", message: "Strict scoped session scan is unavailable", path: dir }],
+			};
+		}
+		const strictScan = storage.listFilesStrictSync.bind(storage);
+
+		let files: string[];
+		try {
+			files = strictScan(dir, "*.jsonl");
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException)?.code;
+			// Only a confirmed ENOENT proves the scoped root is genuinely absent,
+			// which is a complete (zero-candidate) inventory. Any other root/scan
+			// error (EACCES/EIO/EPERM/ENOTDIR/...) is fail-closed: it must never
+			// reduce to authoritative absence and grants zero authority. The
+			// forgiving existsSync preflight is intentionally absent — fs.existsSync
+			// collapses EACCES/EIO/EPERM onto a false return and would let a
+			// permission-denied root masquerade as a confirmed-empty directory.
+			if (code === "ENOENT") {
+				return { kind: "complete", candidates: [] };
+			}
+			void err;
+			const failureKind: StrictInventoryFailureKind =
+				code === "EACCES" || code === "EPERM" || code === "ENOTDIR" ? "root" : "scan";
+			return {
+				kind: "failure",
+				failures: [
+					{
+						kind: failureKind,
+						message:
+							failureKind === "root"
+								? "Scoped session root could not be inspected"
+								: "Scoped session directory scan failed",
+						path: dir,
+					},
+				],
+			};
+		}
+
+		const failures: StrictInventoryFailure[] = [];
+		const candidates: StrictInventoryCandidate[] = [];
+		for (const file of files) {
+			const candidate = inventoryReadCandidate(storage, file, cwd, dir);
+			if ("failures" in candidate) {
+				failures.push(...candidate.failures);
+				continue;
+			}
+			candidates.push(candidate.candidate);
+		}
+		if (failures.length > 0) {
+			return { kind: "failure", failures };
+		}
+		return { kind: "complete", candidates };
+	}
+
+	/**
+	 * Propagate the storage-layer verified hard delete bound to exact identity evidence.
+	 * Never performs ID lookup or first-match selection; the caller supplies the exact
+	 * authorization target captured from a complete strict inventory.
+	 */
+	async deleteSessionVerified(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult> {
+		if (!this.storage.deleteSessionVerified) {
+			throw new Error("Storage backend does not support verified session deletion");
+		}
+		return this.storage.deleteSessionVerified(target);
+	}
+}
+const strictInventoryDecoder = new TextDecoder("utf-8", { fatal: false });
+
+/** Strictly read + validate one scoped session candidate. Never suppresses a failure. */
+function inventoryReadCandidate(
+	storage: SessionStorage,
+	file: string,
+	expectedCwd: string,
+	sessionDir: string,
+): { candidate: StrictInventoryCandidate } | { failures: StrictInventoryFailure[] } {
+	const failures: StrictInventoryFailure[] = [];
+	const resolvedFile = path.resolve(file);
+	if (!pathIsWithin(path.resolve(sessionDir), resolvedFile)) {
+		return {
+			failures: [{ kind: "containment", message: "Candidate is outside the scoped session directory", path: file }],
+		};
+	}
+	if (!storage.readSnapshotSync) {
+		return { failures: [{ kind: "read", message: "Storage backend cannot read exact bytes", path: file }] };
+	}
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = storage.readSnapshotSync(file);
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException)?.code;
+		if (code === "ELOOP" || code === "SYMLINK") {
+			failures.push({ kind: "lstat", message: "Candidate is a symlink", path: file });
+		} else {
+			failures.push({ kind: "read", message: "Candidate could not be read", path: file });
+		}
+		return { failures };
+	}
+	if (!snapshot.stat.isFile) {
+		failures.push({ kind: "lstat", message: "Candidate is not a regular file", path: file });
+		return { failures };
+	}
+	const newline = snapshot.bytes.indexOf(0x0a);
+	const headerBytes = newline === -1 ? snapshot.bytes : snapshot.bytes.subarray(0, newline);
+	let header: Record<string, unknown> | undefined;
+	try {
+		const text = strictInventoryDecoder.decode(headerBytes).trim();
+		const value: unknown = text ? JSON.parse(text) : undefined;
+		header = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+	} catch {
+		header = undefined;
+	}
+	if (!header) {
+		failures.push({ kind: "parse", message: "Candidate header is not valid JSON", path: file });
+		return { failures };
+	}
+	if (header.type !== "session") {
+		failures.push({ kind: "header", message: "Candidate header is not a session header", path: file });
+		return { failures };
+	}
+	if (typeof header.id !== "string" || header.id.length === 0) {
+		failures.push({ kind: "identity", message: "Candidate header is missing a session id", path: file });
+		return { failures };
+	}
+	if (typeof header.cwd !== "string") {
+		failures.push({ kind: "cwd", message: "Candidate header is missing a cwd", path: file });
+		return { failures };
+	}
+	const canonicalHeaderCwd = resolveEquivalentPath(header.cwd);
+	if (canonicalHeaderCwd !== resolveEquivalentPath(expectedCwd)) {
+		failures.push({ kind: "cwd", message: "Candidate cwd does not match the scoped workspace", path: file });
+		return { failures };
+	}
+	return { candidate: { path: resolvedFile, id: header.id, cwd: header.cwd, identity: snapshot.stat } };
 }

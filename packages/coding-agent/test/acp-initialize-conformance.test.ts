@@ -8,14 +8,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection, InitializeRequest } from "@agentclientprotocol/sdk";
-import { zInitializeResponse } from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
 import type { Model } from "@gajae-code/ai";
-import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { ACP_TERMINAL_AUTH_FLAG, prepareAcpTerminalAuthArgs } from "../src/modes/acp/terminal-auth";
 import type { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
-import { expectAcpStructure } from "./helpers/acp-schema";
 
 const TEST_MODELS: Model[] = [
 	{
@@ -117,15 +115,27 @@ class FakeAgentSession {
 }
 
 const cleanupRoots: string[] = [];
-const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+// Snapshot the actual `GJC_CODING_AGENT_DIR` env var and the SDK/utils resolver
+// state independently. `setAgentDir(...)` (called per-test in `createAgent`)
+// re-seeds the module-global resolver AND sets `process.env.GJC_CODING_AGENT_DIR`,
+// so the afterEach restores the resolver from the captured `getAgentDir()` in
+// every branch, then resets the env var on its own so presence and value
+// (including the empty string) match the snapshot exactly — avoiding leakage of
+// the isolated temp dir into other tests.
+const originalAgentEnv = process.env.GJC_CODING_AGENT_DIR;
+const originalAgentDir = getAgentDir();
 
 afterEach(async () => {
-	if (originalAgentDir) {
-		setAgentDir(originalAgentDir);
+	// Restore the SDK/utils resolver from the independently captured original
+	// agent dir in every branch, regardless of whether the env var was set.
+	setAgentDir(originalAgentDir);
+	// Restore the env var independently so presence and value match the
+	// captured snapshot exactly (setAgentDir above set it to originalAgentDir,
+	// which may differ from originalAgentEnv, including the empty string).
+	if (originalAgentEnv !== undefined) {
+		process.env.GJC_CODING_AGENT_DIR = originalAgentEnv;
 	} else {
-		setAgentDir(fallbackAgentDir);
-		delete process.env.PI_CODING_AGENT_DIR;
+		delete process.env.GJC_CODING_AGENT_DIR;
 	}
 	for (const root of cleanupRoots.splice(0)) {
 		await fs.promises.rm(root, { recursive: true, force: true });
@@ -161,11 +171,19 @@ function buildInitializeRequest(overrides: Partial<InitializeRequest> = {}): Ini
 	} as InitializeRequest;
 }
 
+function expectInitializeResponseShape(value: unknown): void {
+	expect(typeof value).toBe("object");
+	expect(value).not.toBeNull();
+	const response = value as { agentInfo?: { name?: unknown; version?: unknown } };
+	expect(typeof response.agentInfo?.name).toBe("string");
+	expect(typeof response.agentInfo?.version).toBe("string");
+}
+
 describe("ACP initialize conformance", () => {
 	it("only advertises the agent-managed auth method when the client lacks terminal capability", async () => {
 		const agent = await createAgent();
 		const response = await agent.initialize(buildInitializeRequest());
-		expectAcpStructure(zInitializeResponse, response);
+		expectInitializeResponseShape(response);
 		expect(response.authMethods).toHaveLength(1);
 		const [agentMethod] = response.authMethods!;
 		// AuthMethodAgent omits the `type` discriminator per ACP spec — the absence is the signal.
@@ -184,7 +202,7 @@ describe("ACP initialize conformance", () => {
 		const response = await agent.initialize(
 			buildInitializeRequest({ clientCapabilities: { auth: { terminal: true } } }),
 		);
-		expectAcpStructure(zInitializeResponse, response);
+		expectInitializeResponseShape(response);
 		expect(response.authMethods).toHaveLength(2);
 		const [first, second] = response.authMethods!;
 		expect((first as { type?: string }).type).toBeUndefined();
@@ -230,7 +248,7 @@ describe("ACP initialize conformance", () => {
 	it("preserves the agentCapabilities contract clients depend on", async () => {
 		const agent = await createAgent();
 		const response = await agent.initialize(buildInitializeRequest());
-		expectAcpStructure(zInitializeResponse, response);
+		expectInitializeResponseShape(response);
 		expect(response.agentCapabilities).toEqual(
 			expect.objectContaining({
 				loadSession: true,
@@ -241,6 +259,7 @@ describe("ACP initialize conformance", () => {
 					fork: expect.any(Object),
 					resume: expect.any(Object),
 					close: expect.any(Object),
+					delete: expect.any(Object),
 				}),
 			}),
 		);

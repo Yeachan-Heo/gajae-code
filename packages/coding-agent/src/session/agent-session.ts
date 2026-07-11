@@ -303,6 +303,7 @@ import type {
 	NewSessionOptions,
 	SessionContext,
 	SessionManager,
+	SessionManagerCloseOutcome,
 } from "./session-manager";
 import { getLatestCompactionEntry, transferSessionMessageIdentity } from "./session-manager";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -3859,6 +3860,18 @@ export class AgentSession {
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
 	}
+	/**
+	 * Strict writer close for ACP session delete. On the first attempt it flushes
+	 * pending writes, then returns the certainty-aware close outcome so the caller
+	 * can block destructive mutation on a non-`closed` result. When the manager
+	 * retains a retryable writer (a prior `close_failed_retryable`), the flush is
+	 * NOT repeated: the underlying writer rejects flushes while in the retryable
+	 * state, and `SessionManager.closeStrict()` owns the flush/close sequencing so
+	 * a second call can return `closed` once the OS close lands.
+	 */
+	async closeWriterStrict(): Promise<SessionManagerCloseOutcome> {
+		return this.sessionManager.flushAndCloseStrict();
+	}
 
 	/**
 	 * Bounded, best-effort teardown of the subprocess-spawning resources this session
@@ -3957,6 +3970,20 @@ export class AgentSession {
 		} finally {
 			this.#allowAcpAgentInitiatedTurns = previousAllowAcpAgentInitiatedTurns;
 		}
+	}
+
+	/**
+	 * Owner-scoped async-delivery snapshot used by the strict ACP delete
+	 * quiescence barrier to PROVE quiescence after a best-effort drain. Unlike
+	 * {@link drainAsyncJobDeliveriesForAcp}'s boolean return (which conflates
+	 * "nothing to drain" with "timed out"), this reads the live state directly so
+	 * any remaining queued/delivering work is observable and can block mutation.
+	 */
+	getAsyncDeliveryStateForAcp(): { queued: number; delivering: boolean } {
+		const manager = AsyncJobManager.instance();
+		if (!manager) return { queued: 0, delivering: false };
+		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		return manager.getDeliveryState(ownerFilter);
 	}
 
 	/** Most recent assistant message in agent state. */

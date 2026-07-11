@@ -2,8 +2,15 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
-import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
-import { zSessionNotification } from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
+import {
+	AgentSideConnection,
+	type Client,
+	ClientSideConnection,
+	ndJsonStream,
+	type RequestPermissionRequest,
+	type RequestPermissionResponse,
+	type SessionNotification,
+} from "@agentclientprotocol/sdk";
 import type { Model } from "@gajae-code/ai";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import {
@@ -15,7 +22,6 @@ import {
 import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
 import type { AgentSession, AgentSessionEvent } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
-import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-schema";
 
 function makeAssistantMessage(text: string) {
 	return {
@@ -42,10 +48,84 @@ function getChunkMessageId(event: { update: object }): string | undefined {
 	return typeof update.messageId === "string" ? update.messageId : undefined;
 }
 
-function expectAcpNotifications(updates: SessionNotification[]): void {
-	for (const update of updates) {
-		expectAcpStructure(zSessionNotification, update);
+/**
+ * In-memory SDK 1.2.1 loopback oracle. An `AgentSideConnection` (exactly the
+ * producer surface production uses to emit `session/update`) is wired to a
+ * `ClientSideConnection` over a pair of NDJSON streams. The consumer validates
+ * every inbound `session/update` with the SDK's authoritative
+ * `SessionNotification` schema before our callback fires, so a notification is
+ * schema-valid iff the consumer delivered it. This replaces the former
+ * hand-written `sessionUpdate` discriminator subset, which only approximated
+ * conformance and could not reject malformed required fields.
+ */
+class CapturingClient implements Client {
+	readonly received: SessionNotification[] = [];
+	async sessionUpdate(params: SessionNotification): Promise<void> {
+		this.received.push(params);
 	}
+	async requestPermission(_params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+		return { outcome: { outcome: "cancelled" } };
+	}
+}
+
+function wireLoopback(): { agent: AgentSideConnection; client: CapturingClient } {
+	const agentToClient = new TransformStream();
+	const clientToAgent = new TransformStream();
+	const client = new CapturingClient();
+	// ClientSideConnection = the ACP client that receives and validates
+	// `session/update`; it reads agent→client and writes client→agent.
+	new ClientSideConnection(() => client, ndJsonStream(clientToAgent.writable, agentToClient.readable));
+	// AgentSideConnection = the agent that emits session updates, mirroring how
+	// AcpAgent drives the real connection. The agent factory is never invoked
+	// here — only the agent side sends (sessionUpdate / requestPermission); no
+	// client→agent request is ever issued.
+	const agent = new AgentSideConnection(
+		() => ({}) as never,
+		ndJsonStream(agentToClient.writable, clientToAgent.readable),
+	);
+	return { agent, client };
+}
+
+/**
+ * Round-trip notifications through the public SDK NDJSON wire boundary and
+ * return only the ones the SDK's `SessionNotification` schema accepted. The
+ * trailing `requestPermission` is a deterministic flush: NDJSON is ordered and
+ * the SDK validates each inbound `session/update` synchronously before
+ * dispatch, so awaiting the request's response guarantees every prior
+ * notification has already been validated (and either delivered or rejected).
+ */
+async function wireAccept(notifications: SessionNotification[]): Promise<SessionNotification[]> {
+	const { agent, client } = wireLoopback();
+	for (const notification of notifications) {
+		await agent.sessionUpdate(notification);
+	}
+	await agent.requestPermission({
+		sessionId: "wire-flush",
+		toolCall: { toolCallId: "wire-flush" },
+		options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }],
+	});
+	return client.received;
+}
+
+/** Assert every notification is accepted by the authoritative SDK schema. */
+async function expectAcpNotifications(updates: SessionNotification[]): Promise<void> {
+	const accepted = await wireAccept(updates);
+	expect(accepted).toHaveLength(updates.length);
+	expect(accepted.map(notification => notification.sessionId)).toEqual(
+		updates.map(notification => notification.sessionId),
+	);
+}
+
+/** Assert a single notification passes the authoritative SDK schema. */
+async function expectSessionNotificationValid(notification: SessionNotification): Promise<void> {
+	const accepted = await wireAccept([notification]);
+	expect(accepted).toHaveLength(1);
+}
+
+/** Assert a malformed notification is rejected by the authoritative SDK schema. */
+async function expectSessionNotificationRejected(notification: SessionNotification): Promise<void> {
+	const accepted = await wireAccept([notification]);
+	expect(accepted).toHaveLength(0);
 }
 
 const TEST_MODEL: Model = {
@@ -98,7 +178,7 @@ class ReplayTestSession {
 }
 
 describe("ACP event mapper", () => {
-	it("attaches a stable messageId to live assistant chunks", () => {
+	it("attaches a stable messageId to live assistant chunks", async () => {
 		const assistantMessage = makeAssistantMessage("chunk");
 		const getMessageId = (message: unknown): string | undefined =>
 			message === assistantMessage ? "a80f1ff7-4f0a-4e6b-9f09-c94857b62a4a" : undefined;
@@ -124,7 +204,7 @@ describe("ACP event mapper", () => {
 
 		expect(textUpdates).toHaveLength(1);
 		expect(thoughtUpdates).toHaveLength(1);
-		expectAcpNotifications([...textUpdates, ...thoughtUpdates]);
+		await expectAcpNotifications([...textUpdates, ...thoughtUpdates]);
 		expect(textUpdates[0] ? getChunkMessageId(textUpdates[0]) : undefined).toBe(
 			"a80f1ff7-4f0a-4e6b-9f09-c94857b62a4a",
 		);
@@ -167,7 +247,7 @@ describe("ACP event mapper", () => {
 		).toEqual([]);
 	});
 
-	it("maps automatic compaction lifecycle events to ACP session metadata", () => {
+	it("maps automatic compaction lifecycle events to ACP session metadata", async () => {
 		const start = mapAgentSessionEventToAcpSessionUpdates(
 			{ type: "auto_compaction_start", reason: "threshold", action: "context-full" } as AgentSessionEvent,
 			"session-1",
@@ -222,10 +302,10 @@ describe("ACP event mapper", () => {
 				},
 			},
 		]);
-		expectAcpNotifications([...start, ...end]);
+		await expectAcpNotifications([...start, ...end]);
 	});
 
-	it("returns idle metadata when compaction finishes outside a prompt", () => {
+	it("returns idle metadata when compaction finishes outside a prompt", async () => {
 		const [notification] = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "auto_compaction_end",
@@ -246,10 +326,10 @@ describe("ACP event mapper", () => {
 			running: false,
 			gjcRunning: false,
 		});
-		expectAcpNotifications(notification ? [notification] : []);
+		await expectAcpNotifications(notification ? [notification] : []);
 	});
 
-	it("emits final assistant text when no text deltas were observed", () => {
+	it("emits final assistant text when no text deltas were observed", async () => {
 		const assistantMessage = makeAssistantMessage("final response");
 		const progress = { textEmitted: false, thoughtEmitted: false };
 
@@ -272,11 +352,11 @@ describe("ACP event mapper", () => {
 				},
 			},
 		]);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		expect(progress.textEmitted).toBe(true);
 	});
 
-	it("does not duplicate final assistant text after streaming deltas", () => {
+	it("does not duplicate final assistant text after streaming deltas", async () => {
 		const assistantMessage = makeAssistantMessage("streamed response");
 		const progress = { textEmitted: false, thoughtEmitted: false };
 		const options = {
@@ -302,11 +382,11 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(deltaUpdates).toHaveLength(1);
-		expectAcpNotifications(deltaUpdates);
+		await expectAcpNotifications(deltaUpdates);
 		expect(doneUpdates).toEqual([]);
 	});
 
-	it("emits a diff ToolCallContent for each per-file edit result", () => {
+	it("emits a diff ToolCallContent for each per-file edit result", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -329,7 +409,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			content?: Array<{ type: string; path?: string; oldText?: string | null; newText?: string }>;
@@ -344,7 +424,7 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "foo.ts" }, { path: "bar.ts" }, { path: "skipped.ts" }]);
 	});
 
-	it("emits a diff ToolCallContent for single-file edit details", () => {
+	it("emits a diff ToolCallContent for single-file edit details", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -365,7 +445,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			content?: Array<{ type: string; path?: string; oldText?: string | null; newText?: string }>;
@@ -378,7 +458,7 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "single.ts" }]);
 	});
 
-	it("emits locations on tool_execution_update from args", () => {
+	it("emits locations on tool_execution_update from args", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_update",
@@ -391,13 +471,13 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as { sessionUpdate: string; locations?: { path: string }[] };
 		expect(update.sessionUpdate).toBe("tool_call_update");
 		expect(update.locations).toEqual([{ path: "src/foo.ts" }]);
 	});
 
-	it("preserves command text when a command tool update replaces content", () => {
+	it("preserves command text when a command tool update replaces content", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_update",
@@ -410,7 +490,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
@@ -424,7 +504,7 @@ describe("ACP event mapper", () => {
 		});
 	});
 
-	it("preserves command text when tool update details accompany empty content", () => {
+	it("preserves command text when tool update details accompany empty content", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_update",
@@ -437,7 +517,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
@@ -451,7 +531,7 @@ describe("ACP event mapper", () => {
 		});
 	});
 
-	it("keeps terminal content alongside readable text", () => {
+	it("keeps terminal content alongside readable text", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_update",
@@ -467,7 +547,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
@@ -477,7 +557,7 @@ describe("ACP event mapper", () => {
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
 	});
 
-	it("keeps terminal content alongside readable end text", () => {
+	it("keeps terminal content alongside readable end text", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -493,7 +573,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
@@ -503,7 +583,7 @@ describe("ACP event mapper", () => {
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
 	});
 
-	it("preserves command text when a command tool final update replaces content", () => {
+	it("preserves command text when a command tool final update replaces content", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -523,7 +603,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
@@ -534,7 +614,7 @@ describe("ACP event mapper", () => {
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
 	});
 
-	it("keeps terminal content alongside readable error and message fields", () => {
+	it("keeps terminal content alongside readable error and message fields", async () => {
 		const errorUpdates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -558,7 +638,7 @@ describe("ACP event mapper", () => {
 
 		expect(errorUpdates).toHaveLength(1);
 		expect(messageUpdates).toHaveLength(1);
-		expectAcpNotifications([...errorUpdates, ...messageUpdates]);
+		await expectAcpNotifications([...errorUpdates, ...messageUpdates]);
 		const errorUpdate = errorUpdates[0]!.update as {
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
 		};
@@ -578,7 +658,7 @@ describe("ACP event mapper", () => {
 		});
 	});
 
-	it("keeps plain command output visible without terminal details", () => {
+	it("keeps plain command output visible without terminal details", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -591,7 +671,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
 		};
@@ -599,7 +679,7 @@ describe("ACP event mapper", () => {
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "hello from stdout" } }]);
 	});
 
-	it("embeds only terminal content from direct terminalId", () => {
+	it("embeds only terminal content from direct terminalId", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -612,14 +692,14 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			content?: Array<{ type: string; terminalId?: string }>;
 		};
 		expect(update.content).toEqual([{ type: "terminal", terminalId: "term-1" }]);
 	});
 
-	it("does not duplicate existing terminal content", () => {
+	it("does not duplicate existing terminal content", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_end",
@@ -635,13 +715,13 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			content?: Array<{ type: string; terminalId?: string }>;
 		};
 		expect(update.content?.filter(item => item.type === "terminal" && item.terminalId === "term-1")).toHaveLength(1);
 	});
-	it("shows bash commands in visible tool call content", () => {
+	it("shows bash commands in visible tool call content", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
@@ -653,7 +733,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			toolCallId?: string;
@@ -672,7 +752,7 @@ describe("ACP event mapper", () => {
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "$ npm run check" } }]);
 	});
 
-	it("maps shell and exec tool starts as execute", () => {
+	it("maps shell and exec tool starts as execute", async () => {
 		for (const toolName of ["shell", "exec"] as const) {
 			const updates = mapAgentSessionEventToAcpSessionUpdates(
 				{
@@ -685,7 +765,7 @@ describe("ACP event mapper", () => {
 			);
 
 			expect(updates).toHaveLength(1);
-			expectAcpNotifications(updates);
+			await expectAcpNotifications(updates);
 			const update = updates[0]!.update as {
 				sessionUpdate: string;
 				kind?: string;
@@ -762,7 +842,7 @@ describe("ACP event mapper", () => {
 			updates.length = 0;
 			await agent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] });
 
-			expectAcpNotifications(updates);
+			await expectAcpNotifications(updates);
 			const toolCall = updates.find(update => update.update.sessionUpdate === "tool_call")?.update as
 				| { rawInput?: unknown; content?: unknown }
 				| undefined;
@@ -781,7 +861,7 @@ describe("ACP event mapper", () => {
 			await fs.promises.rm(root, { recursive: true, force: true });
 		}
 	});
-	it("builds replayed bash tool calls from JSON string arguments", () => {
+	it("builds replayed bash tool calls from JSON string arguments", async () => {
 		const replayArgs = normalizeReplayToolArguments(JSON.stringify({ command: "npm test", cwd: "/repo" }));
 		const update = buildToolCallStartUpdate({
 			toolCallId: "toolu_replay_1",
@@ -790,7 +870,7 @@ describe("ACP event mapper", () => {
 			status: "completed",
 		});
 
-		expectAcpStructure(zSessionNotification, { sessionId: "session-1", update });
+		await expectSessionNotificationValid({ sessionId: "session-1", update });
 		expect(update).toMatchObject({
 			sessionUpdate: "tool_call",
 			toolCallId: "toolu_replay_1",
@@ -802,7 +882,7 @@ describe("ACP event mapper", () => {
 		});
 	});
 
-	it("builds replayed read tool-call locations against the replay cwd", () => {
+	it("builds replayed read tool-call locations against the replay cwd", async () => {
 		const replayArgs = normalizeReplayToolArguments(JSON.stringify({ path: "src/foo.ts" }));
 		const update = buildToolCallStartUpdate({
 			toolCallId: "toolu_replay_read",
@@ -812,7 +892,7 @@ describe("ACP event mapper", () => {
 			status: "completed",
 		});
 
-		expectAcpStructure(zSessionNotification, { sessionId: "session-1", update });
+		await expectSessionNotificationValid({ sessionId: "session-1", update });
 		expect(update).toMatchObject({
 			sessionUpdate: "tool_call",
 			toolCallId: "toolu_replay_read",
@@ -825,7 +905,7 @@ describe("ACP event mapper", () => {
 		expect("content" in update).toBe(false);
 	});
 
-	it("keeps malformed replay arguments as raw input without command content", () => {
+	it("keeps malformed replay arguments as raw input without command content", async () => {
 		const replayArgs = normalizeReplayToolArguments("{not json");
 		const update = buildToolCallStartUpdate({
 			toolCallId: "toolu_replay_bad",
@@ -834,7 +914,7 @@ describe("ACP event mapper", () => {
 			status: "completed",
 		});
 
-		expectAcpStructure(zSessionNotification, { sessionId: "session-1", update });
+		await expectSessionNotificationValid({ sessionId: "session-1", update });
 		expect(update).toMatchObject({
 			sessionUpdate: "tool_call",
 			toolCallId: "toolu_replay_bad",
@@ -846,7 +926,7 @@ describe("ACP event mapper", () => {
 		expect("content" in update).toBe(false);
 	});
 
-	it("keeps object replay arguments unchanged and builds command content", () => {
+	it("keeps object replay arguments unchanged and builds command content", async () => {
 		const rawArgs = { command: "bun test", cwd: "/repo" };
 		const replayArgs = normalizeReplayToolArguments(rawArgs);
 		const update = buildToolCallStartUpdate({
@@ -857,7 +937,7 @@ describe("ACP event mapper", () => {
 		});
 
 		expect(replayArgs.args).toBe(rawArgs);
-		expectAcpStructure(zSessionNotification, { sessionId: "session-1", update });
+		await expectSessionNotificationValid({ sessionId: "session-1", update });
 		expect(update).toMatchObject({
 			title: "bash: bun test",
 			status: "completed",
@@ -865,7 +945,7 @@ describe("ACP event mapper", () => {
 			content: [{ type: "content", content: { type: "text", text: "$ bun test" } }],
 		});
 	});
-	it("does not add command text content to non-command tool starts", () => {
+	it("does not add command text content to non-command tool starts", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
@@ -877,7 +957,7 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			title?: string;
@@ -893,7 +973,7 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "README.md" }]);
 		expect("content" in update).toBe(false);
 	});
-	it("resolves tool_execution_start locations against mapper cwd", () => {
+	it("resolves tool_execution_start locations against mapper cwd", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
@@ -906,13 +986,13 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as { sessionUpdate: string; locations?: { path: string }[]; content?: unknown };
 		expect(update.sessionUpdate).toBe("tool_call");
 		expect(update.locations).toEqual([{ path: path.resolve("/repo", "src/file.ts") }]);
 		expect("content" in update).toBe(false);
 	});
-	it("emits distinct locations for move-style path arguments", () => {
+	it("emits distinct locations for move-style path arguments", async () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
@@ -924,13 +1004,13 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
+		await expectAcpNotifications(updates);
 		const update = updates[0]!.update as { sessionUpdate: string; locations?: { path: string }[] };
 		expect(update.sessionUpdate).toBe("tool_call");
 		expect(update.locations).toEqual([{ path: "src/current.ts" }, { path: "src/old.ts" }, { path: "src/new.ts" }]);
 	});
 
-	it("rejects mutated ACP notification discriminators", () => {
+	it("rejects mutated ACP notification discriminators", async () => {
 		const [notification] = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
@@ -941,11 +1021,11 @@ describe("ACP event mapper", () => {
 			"session-1",
 		);
 
-		expectAcpStructure(zSessionNotification, notification);
-		expectAcpStructureRejects(zSessionNotification, {
-			...notification,
+		await expectSessionNotificationValid(notification!);
+		await expectSessionNotificationRejected({
+			...notification!,
 			update: { ...notification!.update, sessionUpdate: "tool_call_updates" },
-		});
-		expectAcpStructureRejects(zSessionNotification, { ...notification, sessionId: 42 });
+		} as unknown as SessionNotification);
+		await expectSessionNotificationRejected({ ...notification!, sessionId: 42 } as unknown as SessionNotification);
 	});
 });

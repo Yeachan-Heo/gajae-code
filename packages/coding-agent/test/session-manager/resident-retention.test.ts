@@ -128,7 +128,10 @@ class ThrowingWriterStorage extends MemorySessionStorage {
 			flush: () => writer.flush(),
 			fsync: () => writer.fsync(),
 			close: () => writer.close(),
+			closeSync: () => writer.closeSync(),
 			getError: () => writer.getError(),
+			getCloseState: () => writer.getCloseState(),
+			getCloseError: () => writer.getCloseError(),
 		};
 	}
 }
@@ -147,7 +150,10 @@ class ThrowingRewriteStorage extends MemorySessionStorage {
 			flush: () => writer.flush(),
 			fsync: () => writer.fsync(),
 			close: () => writer.close(),
+			closeSync: () => writer.closeSync(),
 			getError: () => writer.getError(),
+			getCloseState: () => writer.getCloseState(),
+			getCloseError: () => writer.getCloseError(),
 		};
 	}
 }
