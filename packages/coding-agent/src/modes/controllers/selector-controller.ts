@@ -160,7 +160,15 @@ export class SelectorController {
 	 */
 	showSelector(create: (done: () => void) => { component: Component; focus: Component }): void {
 		const done = () => {
-			this.ctx.restoreComposer();
+			// Prefer the pet-aware composer restore (InteractiveMode.restoreComposer); fall back
+			// to a plain editor swap for contexts that predate it (e.g. lightweight test doubles).
+			if (typeof this.ctx.restoreComposer === "function") {
+				this.ctx.restoreComposer();
+			} else {
+				this.ctx.editorContainer.clear();
+				this.ctx.editorContainer.addChild(this.ctx.editor);
+				this.ctx.ui.setFocus(this.ctx.editor);
+			}
 		};
 		const { component, focus } = create(done);
 		this.ctx.editorContainer.clear();
