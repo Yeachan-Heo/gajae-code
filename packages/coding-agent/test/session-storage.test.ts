@@ -468,8 +468,15 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		expect(recordedArtifactsIdentity).toBeDefined();
 		rmSpy.mockRestore();
 
-		// Replace the artifact directory with a fresh one (different ino) before retrying.
-		await fsp.rm(artifactsDir, { recursive: true, force: true });
+		// Replace the artifact directory with a fresh one whose inode is guaranteed to
+		// differ from the recorded one. Rename the original directory to a retained
+		// sibling so its inode stays allocated — Linux may otherwise reuse the same
+		// inode when the path is removed and immediately recreated, collapsing the
+		// expected identity mismatch — then create a new directory at the original
+		// path and write the replacement payload. The retained sibling lives under
+		// tempDir, so the existing afterEach cleanup removes it.
+		const retainedOriginal = path.join(tempDir, "replaced-retry-original");
+		await fsp.rename(artifactsDir, retainedOriginal);
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "replacement payload");
 
