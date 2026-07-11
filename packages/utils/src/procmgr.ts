@@ -13,19 +13,13 @@ export interface ShellConfig {
 }
 let cachedShellConfig: ShellConfig | null = null;
 
-/**
- * Strip disabled macOS malloc-stack-logging vars from `process.env` in place.
- *
- * macOS leaves `MallocStackLogging=0` (or similar) inherited by debug-attached
- * shells. Bun's libc init then prints `MallocStackLogging: can't turn off
- * malloc stack logging because it was not enabled.` to stderr for every
- * subprocess. Scrubbing once at startup means every child we spawn — bash,
- * bun subagents, plugin installs, ptree commands — inherits a clean env.
- */
-export function scrubProcessEnv(): void {
-	delete process.env.MallocStackLogging;
-	delete process.env.MallocStackLoggingNoCompact;
-}
+// NOTE: there is intentionally no `scrubProcessEnv()` here. Deleting the
+// macOS `MallocStackLogging*` vars from `process.env` cannot clean children
+// spawned without an explicit `env`: Bun snapshots the spawn-default
+// environment at startup (verified on Bun 1.3.14). The launch boundary is
+// the re-exec guard in coding-agent's `src/cli/malloc-env-guard.ts` plus the
+// Rust-side `env_remove` in `crates/pi-natives/src/pty.rs`; JS spawn sites
+// that build an explicit env use `filterProcessEnv` (see `buildSpawnEnv`).
 
 /**
  * Check if a shell binary is executable.

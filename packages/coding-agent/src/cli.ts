@@ -80,9 +80,12 @@ async function installRuntimeGlobals(): Promise<void> {
 	const { warnIfMacOSNoFileLimitTooLow } = await import("./cli/nofile-limit");
 	warnIfMacOSNoFileLimitTooLow();
 
-	// Strip macOS malloc-stack-logging env vars before any subprocess is spawned.
-	// Otherwise every child bun process (subagents, plugin installs, ptree spawns,
-	// etc.) prints a `MallocStackLogging: can't turn off …` warning to stderr.
+	// Strip macOS malloc-stack-logging env vars from the JS view of the
+	// environment. This only protects spawns that explicitly forward
+	// `process.env`; Bun's spawn-default env is a startup snapshot that
+	// ignores these deletes. The real launch boundary is the re-exec guard at
+	// the top of runCli() (src/cli/malloc-env-guard.ts) plus the Rust-side
+	// env_remove in crates/pi-natives/src/pty.rs.
 	delete process.env.MallocStackLogging;
 	delete process.env.MallocStackLoggingNoCompact;
 }
@@ -278,6 +281,24 @@ export function routeRootArgv(argv: readonly string[]): string[] {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	// macOS malloc-stack-logging contamination (Xcode schemes, Instruments,
+	// `launchctl setenv`) cannot be scrubbed from inside this process: Bun
+	// snapshots the spawn-default environment at startup, so `delete
+	// process.env.X` never reaches children spawned without an explicit
+	// `env`, and libmalloc spams every TTY-attached child with
+	// `MallocStackLogging:` warnings — flooding the terminal UI. Re-exec once
+	// with a clean environment before any fast path or subprocess. This
+	// inlines mallocEnvNeedsReexec() so uncontaminated startups load nothing
+	// extra; keep it in sync with src/cli/malloc-env-guard.ts.
+	if (
+		process.platform === "darwin" &&
+		!process.env.GJC_MALLOC_ENV_REEXEC &&
+		(process.env.MallocStackLogging !== undefined || process.env.MallocStackLoggingNoCompact !== undefined)
+	) {
+		const { reexecWithoutMallocEnv } = await import("./cli/malloc-env-guard");
+		process.exitCode = await reexecWithoutMallocEnv();
+		return;
+	}
 	if (isNotifyDaemonInternalFastPath(argv)) {
 		await runNotifyDaemonInternalFastPath(argv);
 		return;

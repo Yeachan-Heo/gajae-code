@@ -551,6 +551,15 @@ fn run_pty_sync(
 			cmd.env(key, value);
 		}
 	}
+	// macOS malloc-stack-logging vars must never reach PTY children: the
+	// builder snapshots the live parent environ (which Bun cannot unset from
+	// JS — its spawn-default env is a startup snapshot), stderr in a PTY is
+	// always a TTY, and libmalloc prints a `MallocStackLogging:` warning for
+	// every spawned process — flooding the terminal UI. Remove them
+	// unconditionally, even when a caller forwards them explicitly.
+	for name in ["MallocStackLogging", "MallocStackLoggingNoCompact"] {
+		cmd.env_remove(name);
+	}
 	ct.heartbeat()
 		.map_err(|err| Error::from_reason(format!("PTY setup cancelled before spawn: {err}")))?;
 
@@ -1001,6 +1010,43 @@ mod tests {
 		assert!(!result.cancelled);
 		assert!(!result.timed_out);
 		assert!(started.elapsed() < max_duration);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn pty_child_never_inherits_macos_malloc_stack_logging_env() {
+		let _guard = PTY_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+		// SAFETY: PTY_TEST_LOCK serializes this test against the other PTY
+		// tests in this module; the vars are removed again before the lock is
+		// released.
+		unsafe {
+			std::env::set_var("MallocStackLogging", "1");
+			std::env::set_var("MallocStackLoggingNoCompact", "1");
+		}
+		let out_path = test_path("malloc-env");
+		let mut config = test_config(&format!(
+			"printenv MallocStackLogging MallocStackLoggingNoCompact > {} 2>/dev/null; true",
+			out_path.display()
+		));
+		// Even an explicit forward of the vars must be stripped.
+		config.env = Some(HashMap::from([
+			("MallocStackLogging".to_string(), "1".to_string()),
+			("MallocStackLoggingNoCompact".to_string(), "1".to_string()),
+		]));
+		let (_tx, rx) = mpsc::channel();
+		let result = run_pty_sync(config, None, rx, task::CancelToken::new(Some(20_000), None));
+		unsafe {
+			std::env::remove_var("MallocStackLogging");
+			std::env::remove_var("MallocStackLoggingNoCompact");
+		}
+		let result = result.expect("PTY run should complete");
+		assert_eq!(result.exit_code, Some(0));
+		let leaked = fs::read_to_string(&out_path).unwrap_or_default();
+		let _ = fs::remove_file(&out_path);
+		assert!(
+			leaked.trim().is_empty(),
+			"PTY child inherited macOS malloc stack logging env: {leaked:?}"
+		);
 	}
 
 	#[test]

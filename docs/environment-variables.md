@@ -496,6 +496,16 @@ These are consumed via `@gajae-code/utils/dirs` and affect where coding-agent st
 
 Current implementation: `GJC_BASH_NO_LOGIN`/`ANTHROPIC_MODEL_BASH_NO_LOGIN` are active; when either is set, `getShellArgs()` returns `['-c']`.
 
+### macOS malloc stack logging launch boundary
+
+| Variable                       | Behavior                                                                                                                                       |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MallocStackLogging`           | Never forwarded to any child. When present at startup on macOS, `gjc` re-execs itself once with a scrubbed environment (see below).             |
+| `MallocStackLoggingNoCompact`  | Same handling as `MallocStackLogging`.                                                                                                          |
+| `GJC_MALLOC_ENV_REEXEC`        | Internal loop guard set on the re-exec'd process. Do not set manually.                                                                          |
+
+When a `gjc` process starts on macOS with `MallocStackLogging*` in its environment (Xcode schemes, Instruments, `launchctl setenv`, debug-attached shells), libmalloc prints `MallocStackLogging:` warnings to every TTY-attached child, and Bun's spawn-default environment is a startup snapshot that JS-side deletes cannot clean. `runCli()` therefore re-execs itself once with a scrubbed environment (`packages/coding-agent/src/cli/malloc-env-guard.ts`), and the native PTY spawner removes both vars unconditionally (`crates/pi-natives/src/pty.rs`). The only residual output is the initial process's own libmalloc lines, printed by libc before any JS runs. Fix the source with `launchctl unsetenv MallocStackLogging MallocStackLoggingNoCompact` and restart the terminal app.
+
 ---
 
 ## 8) UI/theme/session detection (auto-detected env)
