@@ -181,7 +181,7 @@ export function formatModelProfileCredentialError(profileLabel: string, provider
 	return `Model profile "${profileLabel}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
 }
 
-function resolveModelProfileName(profileName: string, profiles: ReadonlyMap<string, unknown>): string {
+export function resolveModelProfileName(profileName: string, profiles: ReadonlyMap<string, unknown>): string {
 	// A retired-name alias is fallback-only: never shadow a profile that actually
 	// exists under the requested name (e.g. a user-defined `codex-standard`).
 	if (profiles.has(profileName)) return profileName;

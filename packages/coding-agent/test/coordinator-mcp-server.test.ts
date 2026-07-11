@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
+import type { ModelProfileDefinition } from "../src/config/model-profiles";
+import type { CoordinatorModelProfileLoader } from "../src/coordinator-mcp/model-preset";
 import {
 	boundedAwaitTurnTimeoutMs,
 	boundedEventWatchTimeoutMs,
@@ -200,6 +202,45 @@ function privateTmuxCommandRunner(command: string[]): Promise<{ exitCode: number
 		return Promise.resolve({ exitCode: 0, stdout: tmuxIdentity(command), stderr: "" });
 	if (isTmuxPromptDeliveryCommand(command)) return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
 	return Promise.resolve({ exitCode: 1, stdout: "", stderr: "unexpected command" });
+}
+
+const testModelProfileLoader: CoordinatorModelProfileLoader = () =>
+	new Map<string, ModelProfileDefinition>([
+		["codex-eco", { name: "codex-eco", requiredProviders: [], modelMapping: {}, source: "builtin" }],
+		["codex-medium", { name: "codex-medium", requiredProviders: [], modelMapping: {}, source: "builtin" }],
+	]);
+
+function safeCoordinatorOwnerProbe() {
+	return {
+		readCallerCgroup: async () => "0::/gjc-coordinator-test.scope\n",
+		probeServer: async () => ({
+			state: "safe" as const,
+			pid: PRIVATE_OWNER_PID,
+			startTime: PRIVATE_OWNER_START_TIME,
+			cgroup: { classification: "safe" as const },
+		}),
+	};
+}
+
+async function mpresetLaunchCommandRunner(commands: string[][], command: string[]) {
+	commands.push(command);
+	if (tmuxSubcommand(command) === "new-session") {
+		const sessionId = command[command.indexOf("-s") + 1]!;
+		await writeReadyMarkerFromTmuxLaunch(command);
+		return { exitCode: 0, stdout: `${sessionId}:0.0 %24 $24\n`, stderr: "" };
+	}
+	if (tmuxSubcommand(command) === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+	if (tmuxSubcommand(command) === "display-message") {
+		const sessionId = command[command.indexOf("-t") + 1] ?? "session";
+		return command.at(-1)?.includes("session_name")
+			? { exitCode: 0, stdout: `${sessionId}:0.0 %24 $24\n`, stderr: "" }
+			: { exitCode: 0, stdout: tmuxIdentity(command), stderr: "" };
+	}
+	if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
+	if (tmuxSubcommand(command) === "capture-pane") return { exitCode: 0, stdout: "idle\n", stderr: "" };
+	if (tmuxSubcommand(command) === "if-shell")
+		return { exitCode: 0, stdout: "__gjc_coordinator_cleanup_ok__\n", stderr: "" };
+	return { exitCode: 1, stdout: "", stderr: "unexpected command" };
 }
 
 function expectPrivateTmuxMutations(commands: string[][], socketKey = PRIVATE_SOCKET): void {
@@ -1375,8 +1416,287 @@ describe("Coordinator MCP server protocol", () => {
 			worktree: true,
 			sessionId: payload.session.session_id,
 			launchId: payload.session.launch_id,
+			mpreset: null,
 			readinessMarkerFile: payload.session.readiness_marker_file,
 		});
+	});
+	it.each([
+		["gjc_coordinator_start_session", "codex-eco"],
+		["gjc_coordinator_start_session", "codex-medium"],
+		["gjc_delegate_plan", "codex-eco"],
+		["gjc_delegate_plan", "codex-medium"],
+		["gjc_delegate_execute", "codex-eco"],
+		["gjc_delegate_execute", "codex-medium"],
+		["gjc_delegate_team", "codex-eco"],
+		["gjc_delegate_team", "codex-medium"],
+	] as const)("launches a fresh %s session with authoritative mpreset %s", async (name, mpreset) => {
+		const root = await tempRoot();
+		const commands: string[][] = [];
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "state", `fresh-${name}-${mpreset}`),
+				GJC_COORDINATOR_MCP_SESSION_COMMAND: "gjc --worktree",
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				ownerIsolationProbe: safeCoordinatorOwnerProbe(),
+				resolveModelProfiles: testModelProfileLoader,
+				commandRunner: async command => await mpresetLaunchCommandRunner(commands, command),
+			},
+		});
+		const response = await server.callTool(
+			name,
+			name === "gjc_coordinator_start_session"
+				? { cwd: root, allow_mutation: true, mpreset }
+				: { cwd: root, task: "exercise the selected profile", allow_mutation: true, mpreset },
+		);
+
+		expect(response).toMatchObject({ ok: true, session: { mpreset } });
+		const launches = commands.filter(command => tmuxSubcommand(command) === "new-session");
+		expect(launches).toHaveLength(1);
+		expect(launches[0]?.at(-1)).toContain(`--mpreset ${shellQuote(mpreset)}`);
+	});
+
+	it("canonicalizes a legacy mpreset alias into the child command like the CLI", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "mpreset-alias");
+		const commands: string[][] = [];
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_SESSION_COMMAND: "gjc --worktree",
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				ownerIsolationProbe: safeCoordinatorOwnerProbe(),
+				resolveModelProfiles: testModelProfileLoader,
+				commandRunner: async command => await mpresetLaunchCommandRunner(commands, command),
+			},
+		});
+		// `codex-standard` is a fallback-only alias for the built-in `codex-medium`.
+		const response = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			allow_mutation: true,
+			mpreset: "codex-standard",
+		});
+		const launchCommand = commands.find(command => tmuxSubcommand(command) === "new-session")?.at(-1) ?? "";
+
+		expect(response).toMatchObject({ ok: true, session: { mpreset: "codex-medium" } });
+		expect(launchCommand).toContain("--mpreset 'codex-medium'");
+		expect(launchCommand).not.toContain("codex-standard");
+	});
+
+	it.each([
+		"gjc_coordinator_start_session",
+		"gjc_delegate_execute",
+	] as const)("rejects unknown mpreset before %s session side effects", async name => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", `invalid-${name}`);
+		const commands: string[][] = [];
+		let starts = 0;
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				resolveModelProfiles: testModelProfileLoader,
+				startSession: async input => {
+					starts++;
+					return await readyStart(input, { cwd: input.cwd });
+				},
+				commandRunner: async command => {
+					commands.push(command);
+					return { exitCode: 0, stdout: "", stderr: "" };
+				},
+			},
+		});
+		const response = await server.callTool(
+			name,
+			name === "gjc_coordinator_start_session"
+				? { cwd: root, allow_mutation: true, mpreset: "unknown" }
+				: { cwd: root, task: "must not run", allow_mutation: true, mpreset: "unknown" },
+		);
+
+		expect(response).toEqual({
+			ok: false,
+			reason: "unknown_model_profile",
+			mpreset: "unknown",
+			available_profiles: ["codex-eco", "codex-medium"],
+		});
+		expect(starts).toBe(0);
+		expect(commands).toEqual([]);
+		expect(await fs.readdir(path.join(stateRoot, "local", "repo", "sessions")).catch(() => [])).toEqual([]);
+		expect(await fs.readdir(path.join(stateRoot, "local", "repo", "turns")).catch(() => [])).toEqual([]);
+	});
+
+	it("surfaces a fresh session mpreset through list_sessions and read_status", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "mpreset-readback");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				ownerIsolationProbe: privateOwnerProbe(),
+				resolveModelProfiles: testModelProfileLoader,
+				startSession: async input => await readyStart(input, { cwd: input.cwd }),
+				commandRunner: privateTmuxCommandRunner,
+			},
+		});
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			allow_mutation: true,
+			mpreset: "codex-medium",
+		});
+		const sessionId = startedSessionId(started);
+		const listed = await server.callTool("gjc_coordinator_list_sessions");
+		const status = await server.callTool("gjc_coordinator_read_status", { session_id: sessionId });
+
+		expect(listed).toMatchObject({
+			sessions: [expect.objectContaining({ session_id: sessionId, mpreset: "codex-medium" })],
+		});
+		expect(status).toMatchObject({ session: { session_id: sessionId, mpreset: "codex-medium" } });
+	});
+
+	it.each([
+		["codex-eco", "codex-eco", true],
+		["codex-eco", "codex-medium", false],
+		["codex-eco", null, true],
+		[null, "codex-medium", false],
+		[null, null, true],
+	] as const)("enforces delegate mpreset reuse profile %s requested %s", async (sessionMpreset, requestedMpreset, ok) => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", `mpreset-reuse-${sessionMpreset}-${requestedMpreset}`);
+		let starts = 0;
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				ownerIsolationProbe: privateOwnerProbe(),
+				resolveModelProfiles: testModelProfileLoader,
+				startSession: async input => {
+					starts++;
+					return await readyStart(input, { cwd: input.cwd });
+				},
+				commandRunner: privateTmuxCommandRunner,
+			},
+		});
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			allow_mutation: true,
+			...(sessionMpreset ? { mpreset: sessionMpreset } : {}),
+		});
+		const sessionId = startedSessionId(started);
+		const response = await server.callTool("gjc_delegate_execute", {
+			cwd: root,
+			task: "reuse the existing session",
+			session_id: sessionId,
+			allow_mutation: true,
+			...(requestedMpreset ? { mpreset: requestedMpreset } : {}),
+		});
+
+		if (!ok) {
+			expect(response).toEqual({
+				ok: false,
+				reason: "mpreset_conflict",
+				session_id: sessionId,
+				session_mpreset: sessionMpreset,
+				requested_mpreset: requestedMpreset,
+			});
+		} else {
+			expect(response).toMatchObject({ ok: true, session_id: sessionId });
+			expect(response).not.toHaveProperty("reason");
+		}
+		expect(starts).toBe(1);
+	});
+
+	it("keeps the delegate model hint out of the child command while mpreset remains authoritative", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "mpreset-model-separation");
+		const commands: string[][] = [];
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_SESSION_COMMAND: "gjc --worktree",
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				ownerIsolationProbe: safeCoordinatorOwnerProbe(),
+				resolveModelProfiles: testModelProfileLoader,
+				commandRunner: async command => await mpresetLaunchCommandRunner(commands, command),
+			},
+		});
+		const response = await server.callTool("gjc_delegate_execute", {
+			cwd: root,
+			task: "preserve metadata separation",
+			model: "hint-provider/hint-model",
+			mpreset: "codex-eco",
+			allow_mutation: true,
+		});
+		const sessionId = startedSessionId(response);
+		const turnId = String((response as { turn_id?: unknown }).turn_id);
+		const launchCommand = commands.find(command => tmuxSubcommand(command) === "new-session")?.at(-1) ?? "";
+		const persisted = JSON.stringify(await privateSessionProof(stateRoot, sessionId));
+		const queuedTurn = JSON.parse(
+			await fs.readFile(path.join(stateRoot, "local", "repo", "turns", `${turnId}.json`), "utf8"),
+		) as { prompt?: { text?: unknown } };
+		const queuedPromptText = String(queuedTurn.prompt?.text ?? "");
+
+		expect(response).toMatchObject({ ok: true, session: { mpreset: "codex-eco" } });
+		expect(launchCommand).toContain("--mpreset 'codex-eco'");
+		expect(launchCommand).not.toContain("hint-provider/hint-model");
+		expect(queuedPromptText).toContain("Optional model hint: hint-provider/hint-model");
+		expect(JSON.stringify({ commands, persisted, queuedPromptText })).not.toContain("--default");
+		expect(JSON.stringify({ commands, persisted, queuedPromptText })).not.toContain("modelProfile.default");
+	});
+
+	it("leaves the child command unchanged when mpreset is omitted", async () => {
+		const root = await tempRoot();
+		const commands: string[][] = [];
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "state", "mpreset-omitted"),
+				GJC_COORDINATOR_MCP_SESSION_COMMAND: "gjc --worktree",
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				ownerIsolationProbe: safeCoordinatorOwnerProbe(),
+				resolveModelProfiles: testModelProfileLoader,
+				commandRunner: async command => await mpresetLaunchCommandRunner(commands, command),
+			},
+		});
+		const response = await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+		const launchCommand = commands.find(command => tmuxSubcommand(command) === "new-session")?.at(-1) ?? "";
+
+		expect(response).toMatchObject({ ok: true });
+		expect(response.session).not.toHaveProperty("mpreset");
+		expect(launchCommand).toEndWith("gjc --worktree");
+		expect(launchCommand).not.toContain("--mpreset");
 	});
 
 	it("rejects missing and mismatched coordinator launch attestations", async () => {

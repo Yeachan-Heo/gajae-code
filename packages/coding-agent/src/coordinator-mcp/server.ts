@@ -31,6 +31,12 @@ import {
 } from "../gjc-runtime/tmux-owner-isolation";
 
 import {
+	type CoordinatorModelProfileLoader,
+	loadCoordinatorModelProfiles,
+	resolveCoordinatorMpreset,
+} from "./model-preset";
+
+import {
 	assertCoordinatorArtifactPath,
 	assertCoordinatorWorkdir,
 	buildCoordinatorMcpConfig,
@@ -61,6 +67,7 @@ interface JsonRpcResponse {
 interface SessionStartInput {
 	cwd: string;
 	prompt?: string;
+	mpreset?: string | null;
 	namespace: { profile: string | null; repo: string | null };
 	worktree: true;
 	sessionId: string;
@@ -115,6 +122,7 @@ interface CoordinatorServices {
 	startSession?: (input: SessionStartInput) => unknown | Promise<unknown>;
 	commandRunner?: CommandRunner;
 	ownerIsolationProbe?: OwnerIsolationProbe;
+	resolveModelProfiles?: CoordinatorModelProfileLoader;
 }
 
 interface CoordinatorMcpServerOptions {
@@ -329,6 +337,11 @@ function toolSchema(name: CoordinatorToolName): {
 		type: "string",
 		description: "Artifact path inside configured safe roots.",
 	};
+	const mpreset = {
+		type: "string",
+		description:
+			"Optional GJC model profile (`gjc --mpreset <profile>`) to authoritatively activate for a fresh session; resolved through the merged built-in/custom profile registry and applied from the first turn. Unknown names are rejected with the available-profile listing.",
+	};
 	const common = { type: "object", properties: {} as Record<string, unknown> };
 	if (name === "gjc_coordinator_register_session") {
 		return {
@@ -360,6 +373,7 @@ function toolSchema(name: CoordinatorToolName): {
 				properties: {
 					cwd,
 					prompt: { type: "string" },
+					mpreset,
 					allow_mutation: allowMutation,
 				},
 				required: ["cwd", "allow_mutation"],
@@ -561,6 +575,7 @@ function toolSchema(name: CoordinatorToolName): {
 						type: "boolean",
 						description: "When reusing a session with an active turn, supersede it before sending.",
 					},
+					mpreset,
 					model: {
 						type: "string",
 						description: "Optional model hint passed in prompt metadata; no provider default is implied.",
@@ -2296,6 +2311,27 @@ async function reconcileRuntimeAcknowledgement(
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
+
+/**
+ * Append an authoritative `--mpreset <profile>` to the coordinator child launch
+ * command so the spawned GJC session activates the selected profile from its
+ * first turn. The profile name is validated against the merged registry before
+ * reaching here; it is still shell-quoted as defense in depth.
+ *
+ * Precedence note: this matches `gjc --mpreset <profile>` semantics exactly, so
+ * an explicit model-affecting flag already present in the operator-configured
+ * `sessionCommand` (e.g. a `--model`/`--thinking` baked into the launch command)
+ * follows the same CLI precedence as a direct `gjc --mpreset ... --model ...`
+ * invocation. The effective profile recorded on the session is the
+ * coordinator-resolved request, not a child-attested activation receipt; a
+ * cross-process activation receipt is a possible future enhancement and is out
+ * of scope for the per-session selection contract here.
+ */
+export function buildCoordinatorSessionCommand(sessionCommand: string, mpreset: string | null | undefined): string {
+	if (!mpreset) return sessionCommand;
+	return `${sessionCommand} --mpreset ${shellQuote(mpreset)}`;
+}
+
 function makeTurnRecord(
 	config: CoordinatorMcpConfig,
 	sessionId: string,
@@ -2607,7 +2643,7 @@ async function startTmuxSession(
 		`${GJC_TMUX_OWNER_SERVER_KEY_ENV}=${shellQuote(socketKey)}`,
 		`${GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV}=${shellQuote(input.launchId)}`,
 		`${GJC_COORDINATOR_SESSION_READINESS_FILE_ENV}=${shellQuote(input.readinessMarkerFile)}`,
-		config.sessionCommand,
+		buildCoordinatorSessionCommand(config.sessionCommand, input.mpreset),
 	].join(" ");
 	const tmuxArgv = [
 		"tmux",
@@ -2815,6 +2851,7 @@ async function startTmuxSession(
 		cwd: input.cwd,
 		createdAt: new Date().toISOString(),
 		sessionCommand: config.sessionCommand,
+		...(input.mpreset ? { mpreset: input.mpreset } : {}),
 		runtimeStateFile,
 		__coordinatorOwnerTransaction: ownerTransaction,
 		launchId: input.launchId,
@@ -3122,12 +3159,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	const services = options.services ?? {};
 	const namespaceDir = coordinatorNamespacePath(config);
 	const commandRunner = services.commandRunner ?? runCommand;
+	const loadModelProfiles = services.resolveModelProfiles ?? loadCoordinatorModelProfiles;
 	const readinessTimeoutMs = boundedRuntimeReadinessTimeoutMs(env.GJC_COORDINATOR_MCP_RUNTIME_READINESS_TIMEOUT_MS);
 	async function withSessionTransition<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
 		return await withSessionMutation(`${namespaceDir}::${sessionId}`, operation);
 	}
 
-	async function startCoordinatorSession(cwd: string, prompt?: string): Promise<Record<string, unknown>> {
+	async function startCoordinatorSession(
+		cwd: string,
+		prompt?: string,
+		mpreset?: string | null,
+	): Promise<Record<string, unknown>> {
 		const sessionId = `gjc-coordinator-${randomUUID().slice(0, 8)}`;
 		const launchId = randomUUID();
 		const readinessRoot = path.join(namespaceDir, "launch-readiness");
@@ -3142,6 +3184,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			cwd,
 			prompt,
 			namespace: config.namespace,
+			mpreset,
 			worktree: true,
 			sessionId,
 			launchId,
@@ -3921,6 +3964,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const task = hasTask ? String(args.task) : hasPrompt ? String(args.prompt) : null;
 				if (!task) return { ok: false, reason: "task_required" };
 				await preflightCoordinatorMutation(namespaceDir);
+				const mpresetResolution = await resolveCoordinatorMpreset(args.mpreset, loadModelProfiles);
+				if (!mpresetResolution.ok) {
+					return {
+						ok: false,
+						reason: mpresetResolution.reason,
+						mpreset: mpresetResolution.mpreset,
+						available_profiles: mpresetResolution.available_profiles,
+					};
+				}
+
 				const promptAliasIgnored = hasTask && hasPrompt;
 				const mutationRequested = args.allow_mutation === true;
 				const taggedPrompt = workflowPrompt(delegateWorkflow, name, canonicalCwd, task, {
@@ -3950,15 +4003,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							session_id: sessionId,
 						};
 					}
+					if (mpresetResolution.mpreset !== null) {
+						const sessionMpreset = typeof existing.mpreset === "string" ? existing.mpreset : null;
+						if (sessionMpreset !== mpresetResolution.mpreset) {
+							return {
+								ok: false,
+								reason: "mpreset_conflict",
+								session_id: sessionId,
+								session_mpreset: sessionMpreset,
+								requested_mpreset: mpresetResolution.mpreset,
+							};
+						}
+					}
+
 					session = existing;
 					reusedSession = true;
 				} else {
-					session = await startCoordinatorSession(canonicalCwd);
+					session = await startCoordinatorSession(canonicalCwd, undefined, mpresetResolution.mpreset);
 					const ownerTransaction = asRecord(session.__coordinatorOwnerTransaction) as {
 						commit?: () => void;
 						rollback?: () => Promise<"cleaned" | "failed" | "unverifiable">;
 					} | null;
 					try {
+						if (mpresetResolution.mpreset) session.mpreset = mpresetResolution.mpreset;
 						await writeJsonFile(sessionFile(session.session_id), session);
 						await appendCoordinatorEvent(namespaceDir, {
 							kind: "session.started",
@@ -4071,9 +4138,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				requireCoordinatorMutation(config, "sessions", args);
 				const cwd = await assertCoordinatorWorkdir(config, args.cwd);
 				await preflightCoordinatorMutation(namespaceDir);
+				const mpresetResolution = await resolveCoordinatorMpreset(args.mpreset, loadModelProfiles);
+				if (!mpresetResolution.ok) {
+					return {
+						ok: false,
+						reason: mpresetResolution.reason,
+						mpreset: mpresetResolution.mpreset,
+						available_profiles: mpresetResolution.available_profiles,
+					};
+				}
+
 				const session = await startCoordinatorSession(
 					cwd,
 					typeof args.prompt === "string" ? args.prompt : undefined,
+					mpresetResolution.mpreset,
 				);
 				const ownerTransaction = asRecord(session.__coordinatorOwnerTransaction) as {
 					commit?: () => void;
@@ -4081,6 +4159,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				} | null;
 				let sessionState: CoordinatorSessionState;
 				try {
+					if (mpresetResolution.mpreset) session.mpreset = mpresetResolution.mpreset;
 					await writeJsonFile(sessionFile(session.session_id), session);
 					await appendCoordinatorEvent(namespaceDir, {
 						kind: "session.started",
