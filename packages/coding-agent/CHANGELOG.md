@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Updated the xAI `grok-eco` / `grok-medium` / `grok-pro` model profiles to `grok-4.5` (was `grok-4.3`) and registered `grok-4.5` in the Grok Build fallback catalog with reasoning-effort support.
+
 ### Changed
 
 - Migrated the repository type-check and release declaration pipeline to stable TypeScript 7.0.2, including the robogjc web workspace and a non-mutating publish-type gate.
