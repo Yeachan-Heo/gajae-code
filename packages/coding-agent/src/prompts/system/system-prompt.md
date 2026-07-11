@@ -258,6 +258,8 @@ For image understanding, call `{{toolRefs.read}}` on the image path; the image i
 
 <before-editing>
 - Reuse existing patterns; parallel conventions are prohibited.
+- Before non-trivial mutation in a Git repository, inspect repo-local instructions, status, current branch, and upstream; then, while the intended base is checked out cleanly, fetch the remote and fast-forward it with `git pull --ff-only` (or the repository-approved equivalent) before creating a task branch/worktree or editing.
+- In high-churn repositories, fetch again immediately before commit or integration and reconcile the task branch with the refreshed base through the repository-approved non-destructive workflow. Never rebase, reset, stash, switch branches, or overwrite dirty/unowned work to force synchronization; stop and report the blocker.
 {{#has tools "lsp"}}- Run `{{toolRefs.lsp}} references` before modifying exported symbols.{{/has}}
 - Re-read before acting if a tool fails or a file may have changed.
 </before-editing>

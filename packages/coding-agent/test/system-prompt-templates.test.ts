@@ -232,6 +232,21 @@ describe("system Handlebars prompt templates", () => {
 		const reduction = 1 - subBytes / fullBytes;
 		expect(reduction).toBeGreaterThanOrEqual(0.25);
 	});
+	test("system-prompt requires safe base synchronization before editing", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+
+		for (const subagent of [false, true]) {
+			const rendered = prompt.render(template, { ...baseRenderContext, subagent });
+			expect(rendered).toContain("Before non-trivial mutation");
+			expect(rendered).toContain("fetch again immediately before commit or integration");
+			expect(rendered).toContain("git pull --ff-only");
+			expect(rendered).toContain("while the intended base is checked out cleanly");
+			expect(rendered).toContain("repository-approved non-destructive workflow");
+			expect(rendered).toContain("before creating a task branch/worktree or editing");
+			expect(rendered).toContain("Never rebase, reset, stash, switch branches, or overwrite dirty/unowned work");
+		}
+	});
 	test("system-prompt renders MCP discovery hint when enabled", async () => {
 		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
 		const template = await Bun.file(templatePath).text();

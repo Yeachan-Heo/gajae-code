@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- The default coding-agent prompt now requires safe remote synchronization before non-trivial Git mutations: inspect branch/upstream state, fast-forward the intended base with `git pull --ff-only`, re-sync high-churn repositories before integration, and never overwrite dirty or unowned work to force an update.
 
 ## [0.9.6] - 2026-07-10
 ### Changed
