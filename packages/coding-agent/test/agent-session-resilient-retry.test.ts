@@ -83,8 +83,9 @@ describe("AgentSession resilient retry", () => {
 	}
 
 	function buildStatusErrorSession(options: {
-		errorMessage: string;
-		errorStatus: number;
+		errorMessage?: string;
+		errorStatus?: number;
+		errorKind?: AssistantMessage["errorKind"];
 		recoveredContent?: string;
 	}): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -119,8 +120,9 @@ describe("AgentSession resilient retry", () => {
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
 						stopReason: "error",
-						errorMessage: options.errorMessage,
-						errorStatus: options.errorStatus,
+						...(options.errorMessage === undefined ? {} : { errorMessage: options.errorMessage }),
+						...(options.errorStatus === undefined ? {} : { errorStatus: options.errorStatus }),
+						...(options.errorKind === undefined ? {} : { errorKind: options.errorKind }),
 						timestamp: Date.now(),
 					};
 					stream.push({ type: "start", partial: message });
@@ -240,6 +242,40 @@ describe("AgentSession resilient retry", () => {
 		expect(last.stopReason).toBe("error");
 		expect(last.errorMessage).toContain("401");
 	});
+	it("surfaces typed provider safety stops without text and without retrying", async () => {
+		session = buildStatusErrorSession({
+			errorKind: "provider_safety_stop",
+			recoveredContent: "should not retry",
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger typed provider safety stop");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorKind).toBe("provider_safety_stop");
+		expect(last.errorMessage).toBeUndefined();
+	});
+	it("surfaces persisted legacy provider safety stops without retrying", async () => {
+		session = buildStatusErrorSession({
+			errorMessage: "Refusal (no details provided)",
+			recoveredContent: "should not retry",
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger persisted legacy provider safety stop");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorKind).toBeUndefined();
+		expect(last.errorMessage).toBe("Refusal (no details provided)");
+	});
 
 	it("surfaces provider safety refusals without retrying", async () => {
 		// Anthropic stop_reason "refusal"/"sensitive" maps to stopReason "error"
@@ -250,6 +286,7 @@ describe("AgentSession resilient retry", () => {
 			"Refusal (cyber): This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy. To learn more, see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback.",
 			"Refusal (no details provided)",
 			"Content flagged by safety filters",
+			"Blocked under Anthropic's Usage Policy.",
 		];
 		for (const refusal of refusals) {
 			session = buildSession({ responses: [{ throw: refusal }] });
@@ -268,20 +305,27 @@ describe("AgentSession resilient retry", () => {
 		}
 	});
 
-	it("still retries errors that merely mention a refusal mid-sentence", async () => {
-		// Guard the anchored match: transient copy that contains the word
-		// "refusal" in passing must not be terminalized.
-		session = buildSession({
-			responses: [{ throw: "connection error after upstream refusal handshake" }, { content: ["recovered"] }],
-		});
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
-		const { retryStartEvents } = track(session);
+	it("retries errors that merely mention legacy safety-stop labels mid-sentence", async () => {
+		const incidentalMessages = [
+			"connection error after upstream refusal handshake",
+			"connection error: content flagged by safety filters in a prior response",
+			"connection error: request was blocked under Anthropic's Usage Policy while retrying",
+		];
+		for (const errorMessage of incidentalMessages) {
+			session = buildSession({
+				responses: [{ throw: errorMessage }, { content: ["recovered"] }],
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
 
-		await session.prompt("mid-sentence refusal mention");
-		await session.waitForIdle();
+			await session.prompt("mid-sentence legacy safety-stop label");
+			await session.waitForIdle();
 
-		expect(retryStartEvents.length).toBeGreaterThanOrEqual(1);
-		expect(lastAssistant(session).stopReason).toBe("stop");
+			expect(retryStartEvents.length).toBeGreaterThanOrEqual(1);
+			expect(lastAssistant(session).stopReason).toBe("stop");
+			await session.dispose();
+			session = undefined;
+		}
 	});
 
 	it("surfaces deliberate request aborts without retrying", async () => {

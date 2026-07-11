@@ -51,6 +51,43 @@ export type {
 export { normalizeSchemaForGoogle };
 
 type GoogleApiType = "google-generative-ai" | "google-gemini-cli" | "google-vertex";
+const PROVIDER_SAFETY_STOP = "provider_safety_stop";
+
+function isGoogleCandidateSafetyStopReason(reason: string): boolean {
+	switch (reason) {
+		case "SAFETY":
+		case "IMAGE_SAFETY":
+		case "PROHIBITED_CONTENT":
+		case "IMAGE_PROHIBITED_CONTENT":
+		case "SPII":
+		case "BLOCKLIST":
+		case "RECITATION":
+		case "IMAGE_RECITATION":
+		case "MODEL_ARMOR":
+			return true;
+		default:
+			return false;
+	}
+}
+
+function isGooglePromptSafetyStopReason(reason: string): boolean {
+	switch (reason) {
+		case "SAFETY":
+		case "IMAGE_SAFETY":
+		case "PROHIBITED_CONTENT":
+		case "BLOCKLIST":
+		case "MODEL_ARMOR":
+		case "JAILBREAK":
+			return true;
+		default:
+			return false;
+	}
+}
+
+function getGooglePromptBlockReason(promptFeedback: GenerateContentResponse["promptFeedback"]): string | undefined {
+	const blockReason = promptFeedback?.blockReason;
+	return typeof blockReason === "string" && blockReason.length > 0 ? blockReason : undefined;
+}
 
 /**
  * Thinking level for Gemini 3 models. Mirrors Google's `ThinkingLevel` enum values.
@@ -607,9 +644,24 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 		}
 
 		if (candidate?.finishReason) {
-			output.stopReason = mapStopReason(candidate.finishReason);
-			if (output.content.some(b => b.type === "toolCall")) {
-				output.stopReason = "toolUse";
+			if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
+				output.errorKind = PROVIDER_SAFETY_STOP;
+				output.stopReason = "error";
+			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+				output.stopReason = mapStopReason(candidate.finishReason);
+				if (output.stopReason === "stop" && output.content.some(b => b.type === "toolCall")) {
+					output.stopReason = "toolUse";
+				}
+			}
+		}
+
+		const blockReason = getGooglePromptBlockReason(chunk.promptFeedback);
+		if (blockReason) {
+			if (isGooglePromptSafetyStopReason(blockReason)) {
+				output.errorKind = PROVIDER_SAFETY_STOP;
+				output.stopReason = "error";
+			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+				output.stopReason = "error";
 			}
 		}
 

@@ -65,6 +65,7 @@ import { MCPManager } from "../../runtime-mcp/manager";
 import type { MCPServerConfig } from "../../runtime-mcp/types";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE } from "../../session/messages";
+import { isLegacyProviderSafetyStopMessage } from "../../session/provider-safety-stop";
 import {
 	SessionManager,
 	type SessionInfo as StoredSessionInfo,
@@ -1563,8 +1564,10 @@ export class AcpAgent implements Agent {
 			case "length":
 				return "max_tokens";
 			case "error": {
-				const errorMessage = lastAssistant?.errorMessage ?? "";
-				if (/content[_ ]?filter|refus(al|ed)/i.test(errorMessage)) {
+				if (lastAssistant?.errorKind === "provider_safety_stop") {
+					return "refusal";
+				}
+				if (isLegacyProviderSafetyStopMessage(lastAssistant?.errorMessage ?? "")) {
 					return "refusal";
 				}
 				return "end_turn";

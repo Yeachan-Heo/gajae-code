@@ -332,6 +332,19 @@ function isCompiledGrammarTooLargeStrictError(
 		/too large/i.test(messageParts)
 	);
 }
+function hasContentFilterSafetyCode(capturedErrorResponse: CapturedHttpErrorResponse | undefined): boolean {
+	const bodyJson = capturedErrorResponse?.bodyJson;
+	if (typeof bodyJson !== "object" || bodyJson === null || Array.isArray(bodyJson)) return false;
+	if (Reflect.get(bodyJson, "code") === "content_filter") return true;
+
+	const error = Reflect.get(bodyJson, "error");
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		!Array.isArray(error) &&
+		Reflect.get(error, "code") === "content_filter"
+	);
+}
 
 // LIMITATION: The think tag parser uses naive string matching for <think>/<thinking> tags.
 // If MiniMax models output these literal strings in code blocks, XML examples, or explanations,
@@ -720,6 +733,13 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				const calls = kimiHealer.drainCompleted();
 				for (const call of calls) emitHealedToolCall(call);
 			};
+			let providerSafetyStop = false;
+			const markProviderSafetyStop = (errorMessage?: string): void => {
+				providerSafetyStop = true;
+				output.errorKind = "provider_safety_stop";
+				output.stopReason = "error";
+				if (errorMessage) output.errorMessage = errorMessage;
+			};
 
 			for await (const chunk of iterateWithIdleTimeout(openaiStream, {
 				watchdog: firstEventWatchdog,
@@ -751,13 +771,23 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 
 				if (choice.finish_reason) {
 					const finishReasonResult = mapStopReason(choice.finish_reason);
-					output.stopReason = finishReasonResult.stopReason;
-					if (finishReasonResult.errorMessage) {
-						output.errorMessage = finishReasonResult.errorMessage;
+					if (choice.finish_reason === "content_filter") {
+						markProviderSafetyStop(finishReasonResult.errorMessage);
+					} else if (!providerSafetyStop) {
+						output.stopReason = finishReasonResult.stopReason;
+						if (finishReasonResult.errorMessage) {
+							output.errorMessage = finishReasonResult.errorMessage;
+						}
 					}
 				}
 
 				if (choice.delta) {
+					if (typeof choice.delta.refusal === "string" && choice.delta.refusal.length > 0) {
+						appendTextDelta(choice.delta.refusal);
+						if (!providerSafetyStop) {
+							markProviderSafetyStop("Provider returned a safety refusal");
+						}
+					}
 					const normalizedDeltaText = normalizeStreamingContentText(choice.delta.content);
 					if (normalizedDeltaText.length > 0) {
 						if (!firstTokenTime) firstTokenTime = Date.now();
@@ -927,15 +957,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		} catch (error) {
 			for (const block of output.content) delete (block as any).index;
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
+			const capturedErrorResponse = getCapturedErrorResponse?.();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error) ?? getCapturedErrorResponse?.()?.status;
+			output.errorStatus = extractHttpStatusFromError(error) ?? capturedErrorResponse?.status;
 			output.errorMessage =
 				firstEventTimeoutError?.message ??
-				(await finalizeErrorMessage(error, rawRequestDump, getCapturedErrorResponse?.()));
+				(await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse));
 			// Some providers via OpenRouter include extra details here.
 			const rawMetadata = (error as { error?: { metadata?: { raw?: string } } })?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
+			if (hasContentFilterSafetyCode(capturedErrorResponse)) {
+				output.errorKind = "provider_safety_stop";
+			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });

@@ -4,6 +4,7 @@
 ### Fixed
 
 - Made Bedrock model visibility reflect credential-only static/shared AWS sources with supported profile shapes, authenticated real bearer-token requests, and stopped advertising unsupported ECS/IRSA sources (#1934).
+- Added a typed provider safety-stop classification across Anthropic, OpenAI-compatible, and Google streams so callers can distinguish policy terminations from generic provider errors without parsing display text.
 
 ## [0.9.6] - 2026-07-10
 ### Fixed
