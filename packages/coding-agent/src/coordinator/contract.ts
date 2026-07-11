@@ -12,6 +12,7 @@ export const COORDINATOR_MCP_TOOL_NAMES = [
 	"gjc_coordinator_watch_events",
 	"gjc_coordinator_register_session",
 	"gjc_coordinator_start_session",
+	"gjc_coordinator_stop_session",
 	"gjc_coordinator_send_prompt",
 	"gjc_coordinator_submit_question_answer",
 	"gjc_coordinator_read_turn",
