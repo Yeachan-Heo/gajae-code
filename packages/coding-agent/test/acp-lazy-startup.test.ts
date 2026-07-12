@@ -182,7 +182,11 @@ describe("ACP lazy startup", () => {
 			const sessionResponse = await newSessionPromise;
 			expect(sessionResponse.sessionId).toEqual(expect.any(String));
 		} finally {
-			await Promise.allSettled([clientToAgent.writable.close(), agentToClient.writable.close()]);
+			const closeConnection = (connection: unknown): void => {
+				(connection as { connection: { close(error?: Error): void } }).connection.close();
+			};
+			closeConnection(agentConnection);
+			closeConnection(serverConnection);
 			await Promise.allSettled([agentConnection.closed, serverConnection.closed]);
 		}
 	});
