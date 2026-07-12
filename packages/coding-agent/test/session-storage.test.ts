@@ -1101,9 +1101,13 @@ describe("readSelectedSessionSnapshot captured-bytes hydration", () => {
 		const candidate = makeCandidate(file);
 		const result = readSelectedSessionSnapshot(storage, candidate, tempDir);
 		if ("failures" in result) throw new Error("expected snapshot before replacement");
-		// Replace the pathname with a fresh file (new inode) AFTER the snapshot was captured.
+		// Create the replacement while the original inode is still allocated, then
+		// swap the pathname. This makes the identity change deterministic even on
+		// filesystems that immediately reuse an inode after unlink.
+		const replacement = `${file}.replacement`;
+		await Bun.write(replacement, `${header}\nREPLACEMENT-BODY\n`);
 		await fsp.unlink(file);
-		await Bun.write(file, `${header}\nREPLACEMENT-BODY\n`);
+		await fsp.rename(replacement, file);
 		// The captured bytes still reflect the ORIGINAL content — hydration did not
 		// reopen the now-replaced pathname.
 		expect(new TextDecoder().decode(result.bytes)).toBe(`${header}\n${originalBody}\n`);
