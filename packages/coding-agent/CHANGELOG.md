@@ -9,6 +9,9 @@
 ### Fixed
 
 - IRC deliveries now accept their exchange batch in the recipient's volatile current-session queue before recipient/main UI observations or sender success. Awaited deliveries generate the reply first, then accept the ordered incoming + auto-reply pair and commit the IRC roster claim before observation; provider failures and sender aborts before acceptance leave no ghost exchange, while observer failures after acceptance are isolated. This is not a durability guarantee: durable history injection remains a later flush and no fsync, recovery, persistent IDs, or deduplication was added.
+### Fixed
+
+- Project and user runtime skills now honor Claude-compatible `model` and `effort` frontmatter on slash invocation and automatic skill chaining. Context-qualified selectors such as `opus[1m]` resolve to the newest available matching family model with the requested context window, run in a fresh transient turn when chaining from an active stream, restore the prior session model afterward, and fail closed when unavailable instead of silently running on an unrelated default model.
 
 ## [0.10.0] - 2026-07-12
 

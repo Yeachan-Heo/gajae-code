@@ -81,6 +81,8 @@ function toRuntimeSkill(skill: CapabilitySkill, source: RuntimeSkillDiscoverySou
 		baseDir: skill.path.replace(/[\\/]SKILL\.md$/, ""),
 		source: `runtime:${source}`,
 		hide: skill.frontmatter?.hide === true,
+		model: typeof skill.frontmatter?.model === "string" ? skill.frontmatter.model : undefined,
+		effort: typeof skill.frontmatter?.effort === "string" ? skill.frontmatter.effort : undefined,
 		_source: { ...skill._source, providerName: "Runtime skill discovery" },
 	};
 }

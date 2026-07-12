@@ -38,6 +38,10 @@ export interface SkillPromptDetails {
 	path: string;
 	args?: string;
 	lineCount: number;
+	/** Raw model selector requested by the invoked SKILL.md frontmatter. */
+	requestedModel?: string;
+	/** Raw reasoning effort requested by the invoked SKILL.md frontmatter. */
+	requestedEffort?: string;
 	subskillActivation?: LoadedSubskillActivation;
 	subskillActivationSet?: LoadedSubskillActivation[];
 	/** Internal: tag used by AgentSession to remove the pending-display chip

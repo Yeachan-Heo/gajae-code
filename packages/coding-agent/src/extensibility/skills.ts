@@ -17,6 +17,10 @@ export interface Skill {
 	filePath: string;
 	baseDir: string;
 	source: string;
+	/** Optional Claude-compatible model selector requested by SKILL.md frontmatter. */
+	model?: string;
+	/** Optional Claude-compatible reasoning effort requested by SKILL.md frontmatter. */
+	effort?: string;
 	/**
 	 * When `true`, the skill is loaded and reachable via `skill://<name>` and
 	 * skill slash aliases, but is excluded from the rendered system prompt's
@@ -88,6 +92,8 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 			source: options.source,
 			hide: capSkill.frontmatter?.hide === true,
+			model: typeof capSkill.frontmatter?.model === "string" ? capSkill.frontmatter.model : undefined,
+			effort: typeof capSkill.frontmatter?.effort === "string" ? capSkill.frontmatter.effort : undefined,
 			_source: capSkill._source,
 		})),
 		warnings: (result.warnings ?? []).map(message => ({ skillPath: options.dir, message })),
@@ -196,6 +202,8 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 				baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 				source: `${capSkill._source.provider}:${capSkill.level}`,
 				hide: capSkill.frontmatter?.hide === true,
+				model: typeof capSkill.frontmatter?.model === "string" ? capSkill.frontmatter.model : undefined,
+				effort: typeof capSkill.frontmatter?.effort === "string" ? capSkill.frontmatter.effort : undefined,
 				_source: capSkill._source,
 			});
 			realPathSet.add(resolvedPath);
@@ -233,6 +241,8 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 					baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 					source: "custom:user",
 					hide: capSkill.frontmatter?.hide === true,
+					model: typeof capSkill.frontmatter?.model === "string" ? capSkill.frontmatter.model : undefined,
+					effort: typeof capSkill.frontmatter?.effort === "string" ? capSkill.frontmatter.effort : undefined,
 					_source: { ...capSkill._source, providerName: "Custom" },
 				},
 				path: capSkill.path,
@@ -407,7 +417,7 @@ export function resolveSkillSlashCommands(
 }
 
 export async function buildSkillPromptMessage(
-	skill: Pick<Skill, "name" | "filePath" | "content">,
+	skill: Pick<Skill, "name" | "filePath" | "content" | "model" | "effort">,
 	args: string,
 	context?: BuildSkillPromptMessageContext,
 ): Promise<BuiltSkillPromptMessage> {
@@ -424,6 +434,8 @@ export async function buildSkillPromptMessage(
 		path: skill.filePath,
 		args: trimmedArgs || undefined,
 		lineCount: body ? body.split("\n").length : 0,
+		requestedModel: skill.model,
+		requestedEffort: skill.effort,
 	};
 	if (context?.subskillActivationSet) {
 		details.subskillActivationSet = context.subskillActivationSet;

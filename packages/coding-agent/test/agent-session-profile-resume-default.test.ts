@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import type { Model } from "@gajae-code/ai";
+import type { AssistantMessage, Model } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import {
 	applyPreparedModelProfileActivation,
 	prepareModelProfileActivation,
@@ -10,6 +12,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 
@@ -43,13 +46,23 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		tempDir.removeSync();
 	});
 
-	function makeSession(startModel: Model): AgentSession {
+	function makeSession(
+		startModel: Model,
+		requestedModels?: string[],
+		allowSkillRuntimePreferences: boolean = true,
+	): AgentSession {
+		const mock = createMockModel({ responses: [{ content: ["Done"] }] });
 		const agent = new Agent({
+			getApiKey: () => "test-key",
 			initialState: {
 				model: startModel,
 				systemPrompt: ["Test"],
 				tools: [],
 				messages: [],
+			},
+			streamFn: (model, context, options) => {
+				requestedModels?.push(`${model.provider}/${model.id}`);
+				return mock.stream(model, context, options);
 			},
 		});
 		return new AgentSession({
@@ -57,6 +70,7 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			allowSkillRuntimePreferences,
 		});
 	}
 
@@ -100,7 +114,268 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		// Resume still restores the explicit base default, not the transient model.
 		expect(session.sessionManager.buildSessionContext().models.default).toBe("openai-codex/gpt-5.5");
 	});
+	it("applies a skill's requested model and effort for its turn, then restores the session model", async () => {
+		const { base, profileMain } = resolveModels();
+		const requestedModels: string[] = [];
+		session = makeSession(base, requestedModels);
+		const originalThinking = session.thinkingLevel;
 
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "# Creative\nWrite.",
+			display: true,
+			attribution: "user",
+			details: {
+				name: "creative",
+				path: "/tmp/creative/SKILL.md",
+				lineCount: 2,
+				requestedModel: "opus[1m]",
+				requestedEffort: "high",
+			},
+		});
+
+		expect(requestedModels).toEqual([`${profileMain.provider}/${profileMain.id}`]);
+		expect(session.model).toBe(base);
+		expect(session.thinkingLevel).toBe(originalThinking);
+	});
+	it("resolves a single-integer Claude family version as the newest available model", async () => {
+		const { base } = resolveModels();
+		const sonnet5 = modelRegistry.find("anthropic", "claude-sonnet-5");
+		if (!sonnet5) throw new Error("Expected anthropic sonnet 5 model to exist");
+		const requestedModels: string[] = [];
+		session = makeSession(base, requestedModels);
+
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "# Creative\nWrite.",
+			display: true,
+			attribution: "user",
+			details: {
+				name: "creative",
+				path: "/tmp/creative/SKILL.md",
+				lineCount: 2,
+				requestedModel: "sonnet",
+			},
+		});
+
+		expect(requestedModels).toEqual([`${sonnet5.provider}/${sonnet5.id}`]);
+		expect(session.model).toBe(base);
+	});
+	it("keeps an explicit session model authoritative over skill frontmatter", async () => {
+		const { base } = resolveModels();
+		const requestedModels: string[] = [];
+		session = makeSession(base, requestedModels);
+		await session.setModel(base);
+
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "# Creative\nWrite.",
+			display: true,
+			attribution: "user",
+			details: {
+				name: "creative",
+				path: "/tmp/creative/SKILL.md",
+				lineCount: 2,
+				requestedModel: "opus[1m]",
+				requestedEffort: "high",
+			},
+		});
+
+		expect(requestedModels).toEqual([`${base.provider}/${base.id}`]);
+		expect(session.model).toBe(base);
+	});
+	it("keeps an explicit model profile authoritative over skill frontmatter", async () => {
+		const { base } = resolveModels();
+		const requestedModels: string[] = [];
+		session = makeSession(base, requestedModels);
+		await session.setModelTemporary(base, undefined, { persistAsSessionDefault: true });
+
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "# Creative\nWrite.",
+			display: true,
+			attribution: "user",
+			details: {
+				name: "creative",
+				path: "/tmp/creative/SKILL.md",
+				lineCount: 2,
+				requestedModel: "opus[1m]",
+				requestedEffort: "high",
+			},
+		});
+
+		expect(requestedModels).toEqual([`${base.provider}/${base.id}`]);
+		expect(session.model).toBe(base);
+	});
+	it("fails closed when a skill's requested context window is unavailable", async () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+
+		const invocation = session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "# Creative\nWrite.",
+			display: true,
+			attribution: "user",
+			details: {
+				name: "creative",
+				path: "/tmp/creative/SKILL.md",
+				lineCount: 2,
+				requestedModel: "opus[2m]",
+			},
+		});
+
+		await expect(invocation).rejects.toThrow(/no available model has that context window/);
+		expect(session.model).toBe(base);
+	});
+
+	it("defers a chained skill with model metadata to a fresh model turn", async () => {
+		const { base, profileMain } = resolveModels();
+		const requestedModels: string[] = [];
+		let streamCalls = 0;
+		let finishFirst: (() => void) | undefined;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: base, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model => {
+				streamCalls += 1;
+				requestedModels.push(`${model.provider}/${model.id}`);
+				const stream = new AssistantMessageEventStream();
+				const message = {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					stopReason: "stop",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					timestamp: Date.now(),
+				} as AssistantMessage;
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: message });
+					if (streamCalls === 1) {
+						finishFirst = () => stream.push({ type: "done", reason: "stop", message });
+					} else {
+						stream.push({ type: "done", reason: "stop", message });
+					}
+				});
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+
+		const firstTurn = session.prompt("start");
+		for (let i = 0; i < 100 && !finishFirst; i += 1) await Bun.sleep(5);
+		expect(finishFirst).toBeDefined();
+
+		await session.sendCustomMessage(
+			{
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: "# Interview\nContinue.",
+				display: true,
+				attribution: "user",
+				details: {
+					name: "vc-characterchat-interview",
+					path: "/tmp/interview/SKILL.md",
+					lineCount: 2,
+					requestedModel: "opus[1m]",
+					requestedEffort: "high",
+				},
+			},
+			{ triggerTurn: false },
+		);
+		finishFirst?.();
+		await firstTurn;
+		for (let i = 0; i < 200 && requestedModels.length < 2; i += 1) await Bun.sleep(5);
+
+		expect(requestedModels).toEqual([`${base.provider}/${base.id}`, `${profileMain.provider}/${profileMain.id}`]);
+		expect(session.model).toBe(base);
+	});
+	it("drops a deferred skill when its runtime model preferences cannot be applied", async () => {
+		const { base } = resolveModels();
+		const requestedModels: string[] = [];
+		let finishFirst: (() => void) | undefined;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: base, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				const stream = new AssistantMessageEventStream();
+				const message = {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					stopReason: "stop",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					timestamp: Date.now(),
+				} as AssistantMessage;
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: message });
+					if (requestedModels.length === 1) {
+						finishFirst = () => stream.push({ type: "done", reason: "stop", message });
+					} else {
+						stream.push({ type: "done", reason: "stop", message });
+					}
+				});
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+
+		const firstTurn = session.prompt("start");
+		for (let i = 0; i < 100 && !finishFirst; i += 1) await Bun.sleep(5);
+		expect(finishFirst).toBeDefined();
+
+		await session.sendCustomMessage(
+			{
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: "# Interview\nContinue.",
+				display: true,
+				attribution: "user",
+				details: {
+					name: "vc-characterchat-interview",
+					path: "/tmp/interview/SKILL.md",
+					lineCount: 2,
+					requestedModel: "opus[2m]",
+				},
+			},
+			{ triggerTurn: false },
+		);
+		finishFirst?.();
+		await firstTurn;
+		await Bun.sleep(50);
+
+		expect(requestedModels).toEqual([`${base.provider}/${base.id}`]);
+		expect(JSON.stringify(agent.state.messages)).not.toContain("# Interview");
+
+		await session.prompt("after");
+		expect(requestedModels).toEqual([`${base.provider}/${base.id}`, `${base.provider}/${base.id}`]);
+	});
 	it("rollback of a failed activation restores the pre-activation resume default, not the transient live model", async () => {
 		// A = persisted resume default, B = transient live model (e.g. retry/
 		// fallback/plan switch), profileMain = the profile's main model the failed

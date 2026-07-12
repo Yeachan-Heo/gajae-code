@@ -2356,6 +2356,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillWarnings,
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
+			allowSkillRuntimePreferences: !hasExplicitModel,
 			taskDepth,
 			toolRegistry,
 			workflowGateToolSession: toolSession,

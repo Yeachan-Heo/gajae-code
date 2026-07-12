@@ -143,8 +143,10 @@ import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
 	formatModelString,
+	parseModelPattern,
 	parseModelString,
 	type ResolvedModelRoleValue,
+	resolveAllowedModels,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
@@ -248,7 +250,7 @@ import {
 import { assertWorkflowMutationAllowed } from "../skill-state/deep-interview-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
-import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
+import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
 	collectDiscoverableTools,
@@ -402,6 +404,8 @@ export interface AgentSessionConfig {
 	skillsSettings?: SkillsSettings;
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
+	/** Whether implicit SKILL.md model/effort defaults may override this session for a skill turn. */
+	allowSkillRuntimePreferences?: boolean;
 	/** Task recursion depth for nested sessions. Top-level sessions use 0. */
 	taskDepth?: number;
 	/** Tool registry for LSP and settings */
@@ -1189,6 +1193,8 @@ export class AgentSession {
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
 	#defaultModelSelectionTail: Promise<void> = Promise.resolve();
+	#allowSkillRuntimePreferences: boolean;
+	#skillRuntimeRestoreState: { model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -1546,6 +1552,7 @@ export class AgentSession {
 		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
+		this.#allowSkillRuntimePreferences = config.allowSkillRuntimePreferences ?? true;
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
@@ -5541,6 +5548,147 @@ export class AgentSession {
 		}
 	}
 
+	#hasApplicableSkillRuntimePreferences(message: Pick<CustomMessage<unknown>, "customType" | "details">): boolean {
+		if (!this.#allowSkillRuntimePreferences || message.customType !== SKILL_PROMPT_MESSAGE_TYPE) return false;
+		if (!message.details || typeof message.details !== "object") return false;
+		const details = message.details as { requestedModel?: unknown; requestedEffort?: unknown };
+		return (
+			(typeof details.requestedModel === "string" && details.requestedModel.trim().length > 0) ||
+			(typeof details.requestedEffort === "string" && details.requestedEffort.trim().length > 0)
+		);
+	}
+
+	async #beginSkillPromptRuntimePreferences(
+		message: Pick<CustomMessage<unknown>, "customType" | "details">,
+	): Promise<boolean> {
+		if (!this.#hasApplicableSkillRuntimePreferences(message)) return false;
+		if (!message.details || typeof message.details !== "object") return false;
+		const details = message.details as {
+			name?: unknown;
+			requestedModel?: unknown;
+			requestedEffort?: unknown;
+		};
+		const skillName = typeof details.name === "string" && details.name.trim() ? details.name.trim() : "unknown";
+		const rawModel = typeof details.requestedModel === "string" ? details.requestedModel.trim() : "";
+		const rawEffort = typeof details.requestedEffort === "string" ? details.requestedEffort.trim().toLowerCase() : "";
+		if (!rawModel && !rawEffort) return false;
+
+		const ownsRestoreState = this.#skillRuntimeRestoreState === undefined;
+		const currentModel = this.model;
+		if (!currentModel) throw new Error(`Skill "${skillName}" cannot select a model before session initialization`);
+		if (ownsRestoreState) {
+			this.#skillRuntimeRestoreState = { model: currentModel, thinkingLevel: this.thinkingLevel };
+		}
+		try {
+			const requestedEffort = rawEffort ? parseThinkingLevel(rawEffort) : undefined;
+			if (rawEffort && !requestedEffort) {
+				throw new Error(`Skill "${skillName}" requested unsupported effort "${rawEffort}"`);
+			}
+
+			const inheritModel =
+				rawModel === "" || rawModel.toLowerCase() === "inherit" || rawModel.toLowerCase() === "default";
+			if (inheritModel) {
+				if (requestedEffort) this.setThinkingLevel(requestedEffort);
+				return ownsRestoreState;
+			}
+
+			const contextMatch = /\[(\d+(?:\.\d+)?)(k|m)?\]$/i.exec(rawModel);
+			const contextMultiplier = contextMatch?.[2]?.toLowerCase() === "m" ? 1_000_000 : contextMatch?.[2] ? 1_000 : 1;
+			const minimumContextWindow = contextMatch ? Number(contextMatch[1]) * contextMultiplier : 0;
+			let availableModels = await resolveAllowedModels(this.#modelRegistry, this.settings, {
+				usageOrder: this.settings.getStorage()?.getModelUsageOrder(),
+			});
+			if (minimumContextWindow > 0) {
+				availableModels = availableModels.filter(model => model.contextWindow >= minimumContextWindow);
+				if (availableModels.length === 0) {
+					throw new Error(
+						`Skill "${skillName}" requested model "${rawModel}", but no available model has that context window`,
+					);
+				}
+			}
+
+			const modelSelector = rawModel.replace(/\[(?:\d+(?:\.\d+)?(?:k|m)?)\]$/i, "").trim();
+			if (!modelSelector) {
+				throw new Error(`Skill "${skillName}" requested invalid model "${rawModel}"`);
+			}
+			const familyMatch = /^(?:claude-)?(opus|sonnet|haiku)$/i.exec(modelSelector);
+			let resolvedModel: Model | undefined;
+			let selectorThinkingLevel: ThinkingLevel | undefined;
+			let selectorHasThinkingLevel = false;
+			if (familyMatch?.[1]) {
+				const family = familyMatch[1].toLowerCase();
+				let latest: { major: number; minor: number } | undefined;
+				const familyVersionPattern = new RegExp(
+					`^claude-${family}-(\\d+)(?:[.-](\\d{1,2}))?(?=$|-(?:\\d{8}|high|low|medium|max|xhigh|thinking|fast)(?:-|:|$))`,
+					"i",
+				);
+				for (const model of availableModels) {
+					const versionMatch = familyVersionPattern.exec(model.id);
+					if (!versionMatch?.[1]) continue;
+					const attachedVersion = versionMatch[2] === undefined && versionMatch[1].length === 2;
+					const candidate = {
+						major: Number(attachedVersion ? versionMatch[1][0] : versionMatch[1]),
+						minor: Number(attachedVersion ? versionMatch[1][1] : (versionMatch[2] ?? 0)),
+					};
+					if (
+						!latest ||
+						candidate.major > latest.major ||
+						(candidate.major === latest.major && candidate.minor > latest.minor)
+					) {
+						latest = candidate;
+						resolvedModel = model;
+					}
+				}
+			}
+			if (!resolvedModel) {
+				const resolved = parseModelPattern(
+					modelSelector,
+					availableModels,
+					{ usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
+					{ modelRegistry: this.#modelRegistry },
+				);
+				resolvedModel = resolved.model;
+				selectorThinkingLevel = resolved.thinkingLevel;
+				selectorHasThinkingLevel = resolved.explicitThinkingLevel;
+			}
+			if (!resolvedModel) {
+				throw new Error(`Skill "${skillName}" requested unavailable model "${rawModel}"`);
+			}
+			const thinkingLevel = selectorHasThinkingLevel ? selectorThinkingLevel : requestedEffort;
+			if (modelsAreEqual(resolvedModel, this.model)) {
+				if (thinkingLevel) {
+					this.setThinkingLevel(thinkingLevel);
+					this.emitNotice(
+						"info",
+						`Skill "${skillName}" selected ${resolvedModel.provider}/${resolvedModel.id} (${thinkingLevel}) for this turn.`,
+						"skill-runtime",
+					);
+				}
+				return ownsRestoreState;
+			}
+			await this.setModelTemporary(resolvedModel, thinkingLevel);
+			this.emitNotice(
+				"info",
+				`Skill "${skillName}" selected ${resolvedModel.provider}/${resolvedModel.id}${thinkingLevel ? ` (${thinkingLevel})` : ""} for this turn.`,
+				"skill-runtime",
+			);
+			return ownsRestoreState;
+		} catch (error) {
+			if (ownsRestoreState) await this.#restoreSkillPromptRuntimePreferences();
+			throw error;
+		}
+	}
+
+	async #restoreSkillPromptRuntimePreferences(): Promise<void> {
+		const restore = this.#skillRuntimeRestoreState;
+		if (!restore) return;
+		this.#skillRuntimeRestoreState = undefined;
+		if (!modelsAreEqual(restore.model, this.model)) {
+			await this.setModelTemporary(restore.model, restore.thinkingLevel);
+		}
+		this.setThinkingLevel(restore.thinkingLevel);
+	}
+
 	async #syncSkillPromptActiveState(
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
@@ -5638,12 +5786,14 @@ export class AgentSession {
 			attribution: message.attribution ?? "agent",
 			timestamp: Date.now(),
 		};
+		const ownsSkillRuntimeRestore = await this.#beginSkillPromptRuntimePreferences(customMessage);
 
 		await this.#syncSkillPromptActiveStateSafely(customMessage, true);
 		try {
 			await this.#promptWithMessage(customMessage, textContent, options);
 		} finally {
 			await this.#syncSkillPromptActiveStateSafely(customMessage, false);
+			if (ownsSkillRuntimeRestore) await this.#restoreSkillPromptRuntimePreferences();
 		}
 	}
 
@@ -6160,8 +6310,26 @@ export class AgentSession {
 
 		const prependMessages = queuedMessages.slice(0, -1);
 		const textContent = this.#getCustomMessageTextContent(message);
-		await this.#syncSkillPromptActiveStateSafely(message, true);
+		let ownsSkillRuntimeRestore = false;
 		try {
+			try {
+				ownsSkillRuntimeRestore = await this.#beginSkillPromptRuntimePreferences(message);
+			} catch (error) {
+				if (!this.#hasApplicableSkillRuntimePreferences(message)) throw error;
+				const safePrependMessages = prependMessages.filter(
+					queuedMessage => !this.#hasApplicableSkillRuntimePreferences(queuedMessage),
+				);
+				this.#pendingNextTurnMessages = [...safePrependMessages, ...this.#pendingNextTurnMessages];
+				this.emitNotice(
+					"error",
+					`Deferred skill invocation was dropped because its runtime model preferences could not be applied: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+					"skill-runtime",
+				);
+				return;
+			}
+			await this.#syncSkillPromptActiveStateSafely(message, true);
 			await this.#promptWithMessage(message, textContent, {
 				prependMessages,
 				skipPostPromptRecoveryWait: true,
@@ -6171,6 +6339,7 @@ export class AgentSession {
 			throw error;
 		} finally {
 			await this.#syncSkillPromptActiveStateSafely(message, false);
+			if (ownsSkillRuntimeRestore) await this.#restoreSkillPromptRuntimePreferences();
 		}
 	}
 
@@ -6226,6 +6395,10 @@ export class AgentSession {
 			attribution: message.attribution ?? "agent",
 			timestamp: Date.now(),
 		};
+		if (this.isStreaming && this.#hasApplicableSkillRuntimePreferences(appMessage)) {
+			this.#queueHiddenNextTurnMessage(appMessage, true);
+			return;
+		}
 		if (this.isStreaming) {
 			if (options?.deliverAs === "nextTurn") {
 				this.#queueHiddenNextTurnMessage(appMessage, options?.triggerTurn ?? false);
@@ -6249,6 +6422,7 @@ export class AgentSession {
 					this.#queueHiddenNextTurnMessage(appMessage, false);
 					return;
 				}
+				const ownsSkillRuntimeRestore = await this.#beginSkillPromptRuntimePreferences(appMessage);
 				await this.#syncSkillPromptActiveStateSafely(appMessage, true);
 				try {
 					await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
@@ -6256,6 +6430,7 @@ export class AgentSession {
 					});
 				} finally {
 					await this.#syncSkillPromptActiveStateSafely(appMessage, false);
+					if (ownsSkillRuntimeRestore) await this.#restoreSkillPromptRuntimePreferences();
 				}
 				return;
 			}
@@ -6276,6 +6451,7 @@ export class AgentSession {
 				this.#queueHiddenNextTurnMessage(appMessage, false);
 				return;
 			}
+			const ownsSkillRuntimeRestore = await this.#beginSkillPromptRuntimePreferences(appMessage);
 			await this.#syncSkillPromptActiveStateSafely(appMessage, true);
 			try {
 				await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
@@ -6283,6 +6459,7 @@ export class AgentSession {
 				});
 			} finally {
 				await this.#syncSkillPromptActiveStateSafely(appMessage, false);
+				if (ownsSkillRuntimeRestore) await this.#restoreSkillPromptRuntimePreferences();
 			}
 			return;
 		}
@@ -6910,6 +7087,7 @@ export class AgentSession {
 		if (!apiKey) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
+		if (role === "default") this.#allowSkillRuntimePreferences = false;
 
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
@@ -6980,6 +7158,7 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
+		if (options?.persistAsSessionDefault) this.#allowSkillRuntimePreferences = false;
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
 		this.sessionManager.appendModelChange(

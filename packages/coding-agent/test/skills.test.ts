@@ -92,6 +92,24 @@ describe("skills", () => {
 			expect(validSkill?.source).toBe("test");
 			expect(warnings).toHaveLength(0);
 		});
+		it("loads model and effort frontmatter for runtime execution", async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "skill-runtime-metadata-"));
+			try {
+				const skillDir = path.join(dir, "creative");
+				await fs.mkdir(skillDir);
+				await fs.writeFile(
+					path.join(skillDir, "SKILL.md"),
+					"---\nname: creative\ndescription: Creative skill\nmodel: opus[1m]\neffort: high\n---\n\nWrite.",
+				);
+
+				const { skills } = await loadSkillsFromDir({ dir, source: "test" });
+
+				expect(skills[0]?.model).toBe("opus[1m]");
+				expect(skills[0]?.effort).toBe("high");
+			} finally {
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		});
 
 		it("should load skill when name doesn't match parent directory", async () => {
 			const { skills } = await loadFixtureRoot();
@@ -513,6 +531,19 @@ description: Skill loaded from a tilde-expanded custom directory.
 			expect(built.details.args).toBe(args);
 			expect(built.message).toContain(`User: ${args}`);
 			expect(built.message).toContain("END");
+		});
+		it("carries Claude-compatible model and effort frontmatter into runtime details", async () => {
+			const skill = {
+				...makeSkill("creative"),
+				content: "---\nname: creative\nmodel: opus[1m]\neffort: high\n---\n\n# Creative\nWrite.",
+				model: "opus[1m]",
+				effort: "high",
+			} as Skill & { model: string; effort: string };
+
+			const built = await buildSkillPromptMessage(skill, "");
+
+			expect(built.details.requestedModel).toBe("opus[1m]");
+			expect(built.details.requestedEffort).toBe("high");
 		});
 	});
 });

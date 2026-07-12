@@ -14,6 +14,8 @@ export interface SkillFrontmatter {
 	description?: string;
 	globs?: string[];
 	alwaysApply?: boolean;
+	model?: string;
+	effort?: string;
 	/**
 	 * When `true`, the skill is loaded and accessible via `skill://<name>` (and
 	 * `/skill:<name>` slash commands), but is omitted from the rendered system
