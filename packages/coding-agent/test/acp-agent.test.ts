@@ -3021,6 +3021,92 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	function replacePathWithSameContents(file: string): void {
+		const replacement = `${file}.replacement`;
+		fs.writeFileSync(replacement, fs.readFileSync(file));
+		fs.unlinkSync(file);
+		fs.renameSync(replacement, file);
+	}
+
+	it("fork of an active session refuses to reauthorize a transcript replaced after admission", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const sessionPath = session.sessionManager.getSessionFile()!;
+		expect(fs.existsSync(sessionPath)).toBe(true);
+		// Create the replacement while the original inode is still allocated so
+		// immediate inode reuse cannot make this platform-dependent.
+		replacePathWithSameContents(sessionPath);
+		const sessionDir = path.dirname(sessionPath);
+		const beforeFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
+		await expect(
+			harness.agent.unstable_forkSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] }),
+		).rejects.toThrow(/could not be bound to a verified descriptor/);
+		// No fork publication leaked: the directory is unchanged.
+		const afterFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
+		expect(afterFiles).toEqual(beforeFiles);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("load admission binds the receipt to the selected descriptor identity, not a post-selection pathname restat", async () => {
+		const harness = await createHarness();
+		const { id, path: sessionPath } = await persistInactiveSession(harness.cwdA, "provenance-load");
+		// Replace the transcript inside the selection→admission window:
+		// switchSession runs immediately after the descriptor-bound read (which
+		// binds the original inode) and immediately before receipt admission, so
+		// swapping the pathname to a fresh inode here isolates whether the receipt
+		// is bound to the selected identity or a fresh mutable-path restat.
+		const realSwitch = FakeAgentSession.prototype.switchSession;
+		const switchSpy = spyOn(FakeAgentSession.prototype, "switchSession").mockImplementation(async function (
+			this: FakeAgentSession,
+			switchPath: string,
+		) {
+			const result = await realSwitch.call(this, switchPath);
+			replacePathWithSameContents(switchPath);
+			return result;
+		});
+		try {
+			await harness.agent.loadSession({ sessionId: id, cwd: harness.cwdA, mcpServers: [] });
+		} finally {
+			switchSpy.mockRestore();
+		}
+		// Close is non-destructive and retains the receipt; the session is inactive.
+		await harness.agent.closeSession({ sessionId: id });
+		// The receipt is bound to the SELECTED inode; the pathname now holds the
+		// replacement inode, so a fresh strict inventory revalidates a different
+		// identity and fails closed — it never reauthorizes the replacement that a
+		// restat-based admission receipt would have bound.
+		await expect(harness.agent.deleteSession({ sessionId: id })).rejects.toThrow(/changed since authority/);
+		expect(fs.existsSync(sessionPath)).toBe(true);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("resume admission binds the receipt to the selected descriptor identity, not a post-selection pathname restat", async () => {
+		const harness = await createHarness();
+		const { id, path: sessionPath } = await persistInactiveSession(harness.cwdA, "provenance-resume");
+		const realSwitch = FakeAgentSession.prototype.switchSession;
+		const switchSpy = spyOn(FakeAgentSession.prototype, "switchSession").mockImplementation(async function (
+			this: FakeAgentSession,
+			switchPath: string,
+		) {
+			const result = await realSwitch.call(this, switchPath);
+			replacePathWithSameContents(switchPath);
+			return result;
+		});
+		try {
+			await harness.agent.resumeSession({ sessionId: id, cwd: harness.cwdA, mcpServers: [] });
+		} finally {
+			switchSpy.mockRestore();
+		}
+		await harness.agent.closeSession({ sessionId: id });
+		await expect(harness.agent.deleteSession({ sessionId: id })).rejects.toThrow(/changed since authority/);
+		expect(fs.existsSync(sessionPath)).toBe(true);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("strict scoped inventory rejects a header cwd mismatch", async () => {
 		const harness = await createHarness();
 		const { path: sessionPath } = await persistInactiveSession(harness.cwdA, "wrong-header-cwd");

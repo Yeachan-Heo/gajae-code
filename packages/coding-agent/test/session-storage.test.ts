@@ -1120,4 +1120,44 @@ describe("readSelectedSessionSnapshot captured-bytes hydration", () => {
 			expect(rebound.failures[0]!.kind).toBe("identity");
 		}
 	});
+	it("fails closed on a same-id/same-inode in-place header cwd mutation", async () => {
+		const header = JSON.stringify({ type: "session", id: "selected-id", cwd: tempDir });
+		const body = JSON.stringify({ type: "message", role: "user", content: "hi" });
+		const file = path.join(tempDir, "mutated.jsonl");
+		await Bun.write(file, `${header}\n${body}\n`);
+		// Capture the authoritative candidate bound to the original descriptor.
+		const candidate = makeCandidate(file);
+		// Rewrite the header cwd IN PLACE (truncate-and-write keeps the inode):
+		// same file, same id, same (dev, ino) — only the recorded namespace cwd is
+		// swapped. This is the in-place mutation the binding must reject.
+		const mutatedHeader = JSON.stringify({ type: "session", id: "selected-id", cwd: "/foreign/namespace" });
+		await fsp.writeFile(file, `${mutatedHeader}\n${body}\n`);
+		// Sanity: the descriptor identity is unchanged, so this exercises the cwd
+		// binding rather than the pre-existing dev/ino check.
+		const restatted = storage.statSync(file);
+		expect(restatted.dev).toBe(candidate.identity.dev);
+		expect(restatted.ino).toBe(candidate.identity.ino);
+		const result = readSelectedSessionSnapshot(storage, candidate, tempDir);
+		expect("failures" in result).toBe(true);
+		if ("failures" in result) {
+			expect(result.failures[0]!.kind).toBe("cwd");
+		}
+	});
+
+	it("accepts a header cwd that canonicalizes to the authoritative candidate cwd", async () => {
+		// The candidate's authoritative cwd is tempDir; the on-disk header cwd is
+		// a string-distinct but canonically-equivalent path, proving the binding
+		// normalizes (via resolveEquivalentPath) rather than demanding a
+		// byte-identical cwd — which would wrongly reject legitimate hydration.
+		const equivalentCwd = path.join(tempDir, ".");
+		const header = JSON.stringify({ type: "session", id: "selected-id", cwd: equivalentCwd });
+		const body = JSON.stringify({ type: "message", role: "user", content: "hi" });
+		const file = path.join(tempDir, "equivalent.jsonl");
+		await Bun.write(file, `${header}\n${body}\n`);
+		const candidate = makeCandidate(file); // cwd: tempDir (authoritative)
+		const result = readSelectedSessionSnapshot(storage, candidate, tempDir);
+		if ("failures" in result) throw new Error(`expected snapshot, got ${result.failures[0]!.kind}`);
+		expect(new TextDecoder().decode(result.bytes)).toBe(`${header}\n${body}\n`);
+		expect(result.candidate.cwd).toBe(tempDir);
+	});
 });

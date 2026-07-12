@@ -6074,5 +6074,21 @@ export function readSelectedSessionSnapshot(
 	if (typeof header.cwd !== "string") {
 		return { failures: [{ kind: "cwd", message: "Selected session header is missing a cwd", path: candidate.path }] };
 	}
+	// Re-bind the header cwd to the authoritative candidate captured at strict
+	// inventory time: the snapshot is read through a fresh descriptor, so a
+	// same-id/same-ino in-place header cwd mutation must fail closed here rather
+	// than hydrate a different namespace. Canonicalize with the same convention
+	// used by inventoryReadCandidate.
+	if (resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(candidate.cwd)) {
+		return {
+			failures: [
+				{
+					kind: "cwd",
+					message: "Selected session header cwd does not match the authoritative candidate",
+					path: candidate.path,
+				},
+			],
+		};
+	}
 	return { candidate, bytes: snapshot.bytes, identity: snapshot.stat };
 }

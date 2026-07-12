@@ -42,7 +42,7 @@ import {
 	type Usage,
 } from "@agentclientprotocol/sdk";
 import type { AssistantMessage, Model } from "@gajae-code/ai";
-import { logger, toError } from "@gajae-code/utils";
+import { logger } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import { disableProvider, enableProvider, reset as resetCapabilities } from "../../capability";
 import { Settings } from "../../config/settings";
@@ -201,6 +201,20 @@ type AcpIssuedReceipt = {
 	cwd: string;
 	transcriptIdentity: { dev: bigint; ino: bigint };
 	reason: string | undefined;
+};
+/**
+ * Immutable provenance carried into active-session receipt issuance. The
+ * path + (dev, ino) identity the receipt binds to MUST come from either the
+ * descriptor-bound {@link SelectedSessionSnapshot} candidate (load/resume) or
+ * the owned publication commit/identity (new/fork) — never a fresh mutable-path
+ * stat taken after hydration/configuration. A post-hydration restat would
+ * convert a selected descriptor into fresh pathname authority, re-deriving
+ * identity from a path that could have been replaced between selection and
+ * admission.
+ */
+type AcpAdmissionProvenance = {
+	transcriptPath: string;
+	transcriptIdentity: { dev: bigint; ino: bigint };
 };
 /**
  * Delay between `session/new` (or `session/load` / `session/resume` /
@@ -1382,11 +1396,13 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
+		const owned = this.#captureOwnedPublication(session, "new");
 		return await this.#registerPreparedSession(
 			session,
 			mcpServers,
 			canonicalCwd,
-			this.#captureOwnedPublication(session, "new"),
+			owned,
+			this.#admissionFromOwned(owned),
 		);
 	}
 
@@ -1492,7 +1508,13 @@ export class AcpAgent implements Agent {
 					source: "fork",
 				}
 			: this.#captureOwnedPublication(session, "fork");
-		return await this.#registerPreparedSession(session, params.mcpServers ?? [], canonicalCwd, owned);
+		return await this.#registerPreparedSession(
+			session,
+			params.mcpServers ?? [],
+			canonicalCwd,
+			owned,
+			this.#admissionFromOwned(owned),
+		);
 	}
 
 	async #openStoredSession(
@@ -1503,6 +1525,7 @@ export class AcpAgent implements Agent {
 		sessionId: string,
 	): Promise<ManagedSessionRecord> {
 		const session = await this.#createSession(canonicalCwd);
+		let admission: AcpAdmissionProvenance | undefined;
 		try {
 			const current = this.#resolveStrictLifecycleCandidate(sessionId, ns);
 			if (
@@ -1518,13 +1541,21 @@ export class AcpAgent implements Agent {
 			if (!success) {
 				throw new Error(`ACP session load was cancelled: ${sessionId}`);
 			}
+			// Admission provenance is the descriptor-bound selected candidate
+			// identity captured above — NOT a post-hydration pathname restat. The
+			// receipt must bind the exact identity that was selected, never a fresh
+			// mutable-path identity read after hydration/configuration.
+			admission = {
+				transcriptPath: selected.candidate.path,
+				transcriptIdentity: { dev: selected.candidate.identity.dev, ino: selected.candidate.identity.ino },
+			};
 		} catch (error) {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
 		// load/resume hydrate from a stored source, not a freshly-owned
 		// publication: rollback must never delete the source transcript.
-		return await this.#registerPreparedSession(session, mcpServers, canonicalCwd, undefined);
+		return await this.#registerPreparedSession(session, mcpServers, canonicalCwd, undefined, admission);
 	}
 
 	async #registerPreparedSession(
@@ -1532,6 +1563,7 @@ export class AcpAgent implements Agent {
 		mcpServers: McpServer[],
 		canonicalCwd: string,
 		ownedPublication?: ManagedSessionRecord["ownedPublication"],
+		admission?: AcpAdmissionProvenance,
 	): Promise<ManagedSessionRecord> {
 		const record = this.#createManagedSessionRecord(session, canonicalCwd);
 		record.ownedPublication = ownedPublication;
@@ -1554,7 +1586,7 @@ export class AcpAgent implements Agent {
 			// active session. The receipt is the sole id -> cwd/transcript route for
 			// later inactive delete/fork and survives close.
 			this.#ensureNamespace(canonicalCwd);
-			this.#issueReceiptForActiveSession(canonicalCwd, record);
+			this.#issueReceiptForActiveSession(canonicalCwd, record, admission);
 			this.#sessions.set(session.sessionId, record);
 			return record;
 		} catch (error) {
@@ -1603,6 +1635,16 @@ export class AcpAgent implements Agent {
 			artifactsDir: file.slice(0, -6),
 			source,
 		};
+	}
+	/**
+	 * Derive active-admission receipt provenance from a captured owned
+	 * publication (new/fork). The owned publication identity IS the admission
+	 * identity — the receipt binds the exact freshly-owned transcript, never a
+	 * later pathname restat. Returns undefined when the publication was not
+	 * captured (transcript not persisted), which refuses admission.
+	 */
+	#admissionFromOwned(owned: ManagedSessionRecord["ownedPublication"]): AcpAdmissionProvenance | undefined {
+		return owned ? { transcriptPath: owned.transcriptPath, transcriptIdentity: owned.transcriptIdentity } : undefined;
 	}
 
 	#ensureLifetimeSubscription(record: ManagedSessionRecord): void {
@@ -1784,27 +1826,35 @@ export class AcpAgent implements Agent {
 				throw new Error(`ACP session fork is unavailable while a prompt is in progress: ${sessionId}`);
 			}
 			this.#assertActiveReceiptOwnership(loaded);
+			const receipt = this.#issuedReceipts.get(sessionId)!;
+			// Flush so the on-disk bytes reflect every in-memory append, then bind
+			// those bytes through ONE verified descriptor read against the ALREADY-
+			// ISSUED unique receipt identity. The receipt is the sole fork authority:
+			// its (dev, ino) is the binding identity passed to readSelectedSessionSnapshot,
+			// which re-reads the descriptor and fails closed if the live transcript was
+			// replaced (new dev/ino). This never refreshes authority by restatting the
+			// mutable pathname — a replaced transcript cannot be reauthorized for fork.
 			await loaded.session.sessionManager.flush();
-			const sessionPath = loaded.session.sessionManager.getSessionFile();
-			if (!sessionPath) {
-				throw new Error(`ACP session cannot be forked before it is persisted: ${sessionId}`);
-			}
-			// Build an exact-identity candidate from the flushed live session and
-			// bind its content through one verified descriptor read.
 			const ns = this.#ensureNamespace(loaded.canonicalCwd);
-			let stat: SessionStorageStat;
-			try {
-				stat = new FileSessionStorage().statSync(sessionPath);
-			} catch (error) {
-				throw new Error(`ACP session ${sessionId} could not be read for fork: ${toError(error).message}`);
-			}
-			const liveCandidate: StrictInventoryCandidate = {
-				path: sessionPath,
-				id: loaded.session.sessionId,
-				cwd: loaded.session.sessionManager.getCwd(),
-				identity: stat,
+			// readSelectedSessionSnapshot only compares dev/ino against the candidate;
+			// the remaining SessionStorageStat fields are descriptive-only (unused by
+			// the read or by switchSession, which consumes only path + bytes) and are
+			// NOT a fresh authority derivation.
+			const receiptCandidate: StrictInventoryCandidate = {
+				path: receipt.transcriptPath,
+				id: sessionId,
+				cwd: receipt.cwd,
+				identity: {
+					dev: receipt.transcriptIdentity.dev,
+					ino: receipt.transcriptIdentity.ino,
+					size: 0,
+					mtimeMs: 0,
+					mtimeNs: 0n,
+					mtime: new Date(0),
+					isFile: true,
+				},
 			};
-			return this.#readSelectedSessionSnapshot(liveCandidate, ns);
+			return this.#readSelectedSessionSnapshot(receiptCandidate, ns);
 		}
 
 		// Inactive fork source: route through issued authority only. Never use
@@ -2047,26 +2097,33 @@ export class AcpAgent implements Agent {
 
 	/**
 	 * Issue a MANDATORY authority receipt for an active session before it is
-	 * published to {@link #sessions}. Issuance is fallible: a transcript that is
-	 * not persisted, whose identity cannot be read, or whose id is already
-	 * absorbing (ambiguous / deleted tombstone) or issued under a different cwd
-	 * refuses admission by throwing — so no active record is ever published
-	 * without an exact unique receipt, and no active control can later rely on
-	 * {@link #sessions} alone. Only an exact same-identity re-admission (e.g.
-	 * resume of an already-admitted idempotent receipt) is a no-op.
+	 * published to {@link #sessions}. Issuance is fallible: a transcript whose
+	 * descriptor-bound/owned admission provenance is missing (not persisted),
+	 * or whose id is already absorbing (ambiguous / deleted tombstone) or
+	 * issued under a different cwd refuses admission by throwing — so no active
+	 * record is ever published without an exact unique receipt, and no active
+	 * control can later rely on {@link #sessions} alone. Only an exact
+	 * same-identity re-admission (e.g. resume of an already-admitted idempotent
+	 * receipt) is a no-op.
+	 *
+	 * The receipt binds the EXACT {@link AcpAdmissionProvenance} identity — the
+	 * descriptor-bound selected candidate (load/resume) or the owned publication
+	 * (new/fork). It NEVER restats the mutable transcript pathname: restatting
+	 * after hydration/configuration would convert a selected descriptor into
+	 * fresh pathname authority and could bind a receipt to a transcript that was
+	 * replaced between selection and admission.
 	 */
-	#issueReceiptForActiveSession(canonicalCwd: string, record: ManagedSessionRecord): void {
+	#issueReceiptForActiveSession(
+		canonicalCwd: string,
+		record: ManagedSessionRecord,
+		admission: AcpAdmissionProvenance | undefined,
+	): void {
 		const sessionId = record.session.sessionId;
-		const file = record.session.sessionManager.getSessionFile();
-		if (!file) {
+		if (!admission) {
 			throw new Error(`ACP session ${sessionId} cannot be admitted: transcript is not persisted`);
 		}
-		let stat: SessionStorageStat;
-		try {
-			stat = new FileSessionStorage().statSync(file);
-		} catch {
-			throw new Error(`ACP session ${sessionId} cannot be admitted: transcript identity is unreadable`);
-		}
+		const transcriptPath = admission.transcriptPath;
+		const transcriptIdentity = admission.transcriptIdentity;
 		const existing = this.#issuedReceipts.get(sessionId);
 		if (existing !== undefined) {
 			if (existing.state !== "unique") {
@@ -2084,9 +2141,9 @@ export class AcpAgent implements Agent {
 				);
 			}
 			if (
-				existing.transcriptPath === file &&
-				existing.transcriptIdentity.dev === stat.dev &&
-				existing.transcriptIdentity.ino === stat.ino
+				existing.transcriptPath === transcriptPath &&
+				existing.transcriptIdentity.dev === transcriptIdentity.dev &&
+				existing.transcriptIdentity.ino === transcriptIdentity.ino
 			) {
 				// Same exact identity: idempotent re-admission (e.g. resume after close).
 				return;
@@ -2100,9 +2157,9 @@ export class AcpAgent implements Agent {
 			state: "unique",
 			canonicalCwd,
 			sessionDir: this.#resolveSessionDirForCwd(canonicalCwd),
-			transcriptPath: file,
+			transcriptPath,
 			cwd: canonicalCwd,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: { dev: transcriptIdentity.dev, ino: transcriptIdentity.ino },
 			reason: undefined,
 		});
 	}
