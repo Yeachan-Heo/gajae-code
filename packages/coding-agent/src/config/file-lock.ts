@@ -4,7 +4,7 @@ import { isEnoent } from "@gajae-code/utils/fs-error";
 
 export interface FileLockOptions {
 	staleMs?: number;
-	retries?: number;
+	retries?: number | "forever";
 	retryDelayMs?: number;
 }
 
@@ -192,8 +192,10 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise
 async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
+	const retries = opts.retries;
+	const maxAttempts = retries === "forever" ? Infinity : retries;
 
-	for (let attempt = 0; attempt < opts.retries; attempt++) {
+	for (let attempt = 0; attempt < maxAttempts; attempt++) {
 		const owner = await tryAcquireLock(lockPath);
 		if (owner) {
 			return () => releaseLock(lockPath, owner);

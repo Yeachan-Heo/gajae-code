@@ -26,6 +26,7 @@ import {
 	TelegramUpdatePoller,
 } from "../src/notifications/telegram-daemon";
 import { runDaemonInternal, runDaemonSmoke } from "../src/notifications/telegram-daemon-cli";
+import type { TopicRegistryState } from "../src/notifications/topic-registry";
 
 const THREADED_FALLBACK_NOTICE =
 	"Flat Telegram private chat supports outbound notifications and inline ask buttons only. Enable Threaded Mode in @BotFather > Bot Settings > Threads Settings for free-text replies and session commands.";
@@ -134,6 +135,25 @@ async function readTopicAuthorityState(agentDir: string): Promise<TopicAuthority
 	return JSON.parse(
 		await fs.promises.readFile(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"),
 	) as TopicAuthorityState;
+}
+type RootsRegistryState = {
+	version?: number;
+	roots?: string[];
+	sessions?: Record<string, string>;
+	sessionLeases?: Record<string, { leaseId: string; refreshedAt: number }>;
+	orphanCandidates?: Record<string, { observedAt: number; leaseId: string; topicId: string }>;
+	// Unknown/legacy sibling keys are carried verbatim by the daemon's registry;
+	// the index signature lets regression tests assert they survive compaction.
+	[key: string]: unknown;
+};
+
+/** Read the persisted notification-roots registry as the daemon wrote it. */
+async function readRootsState(agentDir: string): Promise<RootsRegistryState> {
+	try {
+		return JSON.parse(await fs.promises.readFile(daemonPaths(agentDir).roots, "utf8")) as RootsRegistryState;
+	} catch {
+		return {};
+	}
 }
 
 function forumTopicEditedUpdate(
@@ -476,7 +496,7 @@ describe("telegram daemon", () => {
 		expect(result).toEqual({ acquired: false, attached: true });
 	});
 
-	test("live owner token/chat mismatch blocks attach without registering a root", async () => {
+	test("live owner token/chat mismatch blocks attach but registration-before-ownership still writes the new session root and lease", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
@@ -511,7 +531,17 @@ describe("telegram daemon", () => {
 
 		expect(result).toBe("blocked");
 		expect(spawns).toBe(0);
-		expect(fs.existsSync(paths.roots)).toBe(false);
+		expect(fs.existsSync(paths.roots)).toBe(true);
+		// Registration-before-ownership hard gate: the new session root is
+		// registered (with a fresh session lease) before ownership is attempted,
+		// so a blocked attach still leaves a roots registry the daemon can serve.
+		const newRoot = path.join(agentDir, "new-session", ".gjc", "state");
+		const registry = JSON.parse(fs.readFileSync(paths.roots, "utf8")) as RootsRegistryState;
+		expect(registry.roots).toContain(newRoot);
+		expect(registry.sessions?.["new-session"]).toBe(newRoot);
+		expect(registry.sessionLeases?.["new-session"]).toEqual(
+			expect.objectContaining({ leaseId: expect.any(String), refreshedAt: expect.any(Number) }),
+		);
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
 			ownerId: "old",
 			tokenFingerprint: "old-fp",
@@ -4184,8 +4214,20 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
-	await registerNotificationRoot({ settings: s, cwd, sessionId: "stale" });
-	await registerNotificationRoot({ settings: s, cwd, sessionId: "dead" });
+	await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "stale",
+		randomId: () => "lease-stale",
+		now: () => 1000,
+	});
+	await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "dead",
+		randomId: () => "lease-dead",
+		now: () => 1000,
+	});
 	const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
 	fs.mkdirSync(endpointDir, { recursive: true });
 	fs.writeFileSync(
@@ -4204,6 +4246,7 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 		}),
 	);
 	const bot = new FakeBotApi();
+	let now = 120_000;
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
@@ -4212,9 +4255,21 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 		pidAlive: () => false,
-		now: () => 120_000,
+		now: () => now,
 	});
 	await daemon.loadTopics();
+
+	// First confirmed absence records deletion candidates but reaps nothing yet.
+	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	const afterFirst = await readRootsState(agentDir);
+	expect(afterFirst.orphanCandidates?.stale).toEqual({ observedAt: 120_000, leaseId: "lease-stale", topicId: "101" });
+	expect(afterFirst.orphanCandidates?.dead).toEqual({ observedAt: 120_000, leaseId: "lease-dead", topicId: "102" });
+
+	// Once each candidate has survived its own grace window, both topics are
+	// reaped and their candidate + lease evidence is compacted away.
+	now = 180_000;
+	bot.calls = [];
 	await daemon.scanRoots();
 	expect(
 		bot.calls
@@ -4223,13 +4278,27 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 			.sort(),
 	).toEqual([101, 102]);
 	expect(daemon.sessions.size).toBe(0);
+	const afterReap = await readRootsState(agentDir);
+	expect(afterReap.orphanCandidates?.stale).toBeUndefined();
+	expect(afterReap.orphanCandidates?.dead).toBeUndefined();
+	expect(afterReap.sessionLeases?.stale).toBeUndefined();
+	expect(afterReap.sessionLeases?.dead).toBeUndefined();
 });
 
-test("scanRoots reaps missing endpoint topics only when all roots are readable and grace has elapsed", async () => {
+test("scanRoots reaps missing endpoint topics from a readable-empty or definitively-gone (ENOENT) registered root after grace, and compacts the reaped missing root", async () => {
+	// A readable-empty registered root (scenario 1) and a definitively-gone
+	// ENOENT registered root (scenario 2) both authorize a candidate, then a
+	// reap across two scans past the candidate grace window.
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
-	await registerNotificationRoot({ settings: s, cwd, sessionId: "missing" });
+	await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "missing",
+		randomId: () => "lease-missing",
+		now: () => 1000,
+	});
 	fs.mkdirSync(path.join(cwd, ".gjc", "state", "notifications"), { recursive: true });
 	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
 	fs.writeFileSync(
@@ -4237,42 +4306,1127 @@ test("scanRoots reaps missing endpoint topics only when all roots are readable a
 		JSON.stringify({ topics: { missing: { topicId: "201", identitySent: true, createdAt: 0, name: "missing" } } }),
 	);
 	const bot = new FakeBotApi();
+	let now = 120_000;
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot,
-		now: () => 120_000,
+		now: () => now,
 	});
 	await daemon.loadTopics();
 	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	expect((await readRootsState(agentDir)).orphanCandidates?.missing).toMatchObject({
+		leaseId: "lease-missing",
+		topicId: "201",
+		observedAt: 120_000,
+	});
+	now = 180_000;
+	await daemon.scanRoots();
 	expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([201]);
 
-	const blockedAgentDir = tempAgentDir();
-	const blockedSettings = setPrivateAgentDir(settings(blockedAgentDir), blockedAgentDir);
+	// Own registered root is definitively gone (its notifications dir never
+	// existed → readdir raises ENOENT): confirmed-missing absence authorizes a
+	// candidate too, then a reap after grace. On the exact {ok:true} delete the
+	// session mapping/lease/candidate and the now-unreferenced missing root are
+	// compacted. (Non-ENOENT ambiguity is covered elsewhere and stays fail-closed.)
+	const goneAgentDir = tempAgentDir();
+	const goneSettings = setPrivateAgentDir(settings(goneAgentDir), goneAgentDir);
+	const goneCwd = path.join(goneAgentDir, "gone");
+	const goneRoot = path.join(goneCwd, ".gjc", "state");
 	await registerNotificationRoot({
-		settings: blockedSettings,
-		cwd: path.join(blockedAgentDir, "unreadable"),
-		sessionId: "kept",
+		settings: goneSettings,
+		cwd: goneCwd,
+		sessionId: "gone",
+		randomId: () => "lease-gone",
+		now: () => 1000,
 	});
-	fs.mkdirSync(daemonPaths(blockedAgentDir).dir, { recursive: true });
+	fs.mkdirSync(daemonPaths(goneAgentDir).dir, { recursive: true });
 	fs.writeFileSync(
-		path.join(daemonPaths(blockedAgentDir).dir, "telegram-topics.json"),
-		JSON.stringify({ topics: { kept: { topicId: "202", identitySent: true, createdAt: 0, name: "kept" } } }),
+		path.join(daemonPaths(goneAgentDir).dir, "telegram-topics.json"),
+		JSON.stringify({ topics: { gone: { topicId: "202", identitySent: true, createdAt: 0, name: "gone" } } }),
 	);
-	const blockedBot = new FakeBotApi();
-	const blockedDaemon = new TelegramNotificationDaemon({
-		settings: blockedSettings,
+	const goneBot = new FakeBotApi();
+	let goneNow = 120_000;
+	const goneDaemon = new TelegramNotificationDaemon({
+		settings: goneSettings,
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
-		botApi: blockedBot,
-		now: () => 120_000,
+		botApi: goneBot,
+		now: () => goneNow,
 	});
-	await blockedDaemon.loadTopics();
-	await blockedDaemon.scanRoots();
-	expect(blockedBot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	await goneDaemon.loadTopics();
+	await goneDaemon.scanRoots();
+	expect(goneBot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	expect((await readRootsState(goneAgentDir)).orphanCandidates?.gone).toMatchObject({
+		leaseId: "lease-gone",
+		topicId: "202",
+		observedAt: 120_000,
+	});
+	goneNow = 180_000;
+	await goneDaemon.scanRoots();
+	expect(goneBot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([202]);
+	const goneRoots = await readRootsState(goneAgentDir);
+	expect(goneRoots.orphanCandidates?.gone).toBeUndefined();
+	expect(goneRoots.sessionLeases?.gone).toBeUndefined();
+	expect(goneRoots.sessions?.gone).toBeUndefined();
+	expect(goneRoots.roots).not.toContain(goneRoot);
+});
+
+describe("telegram daemon orphan reaping (two-phase candidate-then-reap)", () => {
+	/** Seed a ready, lease-matching orphan candidate + topic so a single scan reaps it. */
+	function seedReadyOrphan(agentDir: string, sessionId: string, topicId: string, leaseId = "L"): string {
+		const rootDir = path.join(agentDir, "repo", ".gjc", "state");
+		fs.mkdirSync(path.join(rootDir, "notifications"), { recursive: true });
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({ topics: { [sessionId]: { topicId, identitySent: true, createdAt: 0, name: sessionId } } }),
+		);
+		fs.writeFileSync(
+			daemonPaths(agentDir).roots,
+			JSON.stringify(
+				{
+					version: 1,
+					roots: [rootDir],
+					sessions: { [sessionId]: rootDir },
+					sessionLeases: { [sessionId]: { leaseId, refreshedAt: 0 } },
+					orphanCandidates: { [sessionId]: { observedAt: 1000, leaseId, topicId } },
+				},
+				null,
+				2,
+			),
+		);
+		return rootDir;
+	}
+
+	/** Real fs wrapper that lets a single test intercept roots-registry I/O. */
+	function wrapFs(overrides: {
+		readFile?: TelegramDaemonFs["readFile"];
+		rename?: TelegramDaemonFs["rename"];
+	}): TelegramDaemonFs {
+		const base = fs.promises as unknown as TelegramDaemonFs;
+		return {
+			mkdir: (p, o) => base.mkdir(p, o).then(() => undefined),
+			readFile: overrides.readFile ?? ((p, e) => base.readFile(p, e)),
+			writeFile: (p, d, o) => base.writeFile(p, d, o),
+			rename: overrides.rename ?? ((a, b) => base.rename(a, b).then(() => undefined)),
+			unlink: p => base.unlink(p),
+			open: (p, f, m) => base.open(p, f, m),
+			readdir: p => base.readdir(p),
+			chmod: (p, m) => base.chmod(p, m),
+		} as TelegramDaemonFs;
+	}
+	/** Whether the session's topic is still persisted in telegram-topics.json. */
+	async function topicPersisted(agentDir: string, sessionId: string): Promise<boolean> {
+		const state = await readTopicAuthorityState(agentDir);
+		return Boolean(state.topics?.[sessionId]);
+	}
+
+	/** Read the roots registry, apply a scalar malformation, then re-write it verbatim. */
+	function patchRootsRegistry(agentDir: string, patch: (raw: RootsRegistryState) => void): void {
+		const file = daemonPaths(agentDir).roots;
+		const raw = JSON.parse(fs.readFileSync(file, "utf8")) as RootsRegistryState;
+		patch(raw);
+		fs.writeFileSync(file, JSON.stringify(raw));
+	}
+
+	class DeleteOutcomeBotApi extends FakeBotApi {
+		constructor(public outcome: "throw" | "empty" | "ok-false" | "ok-true") {
+			super();
+		}
+		async call(method: string, body: unknown): Promise<unknown> {
+			if (method === "deleteForumTopic") {
+				this.calls.push({ method, body });
+				if (this.outcome === "throw") throw new Error("telegram 500");
+				if (this.outcome === "empty") return {};
+				if (this.outcome === "ok-false") return { ok: false };
+				return { ok: true };
+			}
+			return super.call(method, body);
+		}
+	}
+
+	test("repeated registration refreshes the lease and resets the orphan candidate grace clock", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S", randomId: () => "lease-1", now: () => 1000 });
+		fs.mkdirSync(path.join(cwd, ".gjc", "state", "notifications"), { recursive: true });
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({ topics: { S: { topicId: "11", identitySent: true, createdAt: 0, name: "s" } } }),
+		);
+		const bot = new FakeBotApi();
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		// First absence establishes a candidate anchored to the original lease.
+		let roots = await readRootsState(agentDir);
+		expect(roots.orphanCandidates?.S).toMatchObject({ leaseId: "lease-1", topicId: "11", observedAt: 120_000 });
+
+		// Re-register: a fresh lease id is written and the candidate is cleared, so
+		// the old absence proof can never authorize a delete.
+		await registerNotificationRoot({
+			settings: s,
+			cwd,
+			sessionId: "S",
+			randomId: () => "lease-2",
+			now: () => 130_000,
+		});
+		roots = await readRootsState(agentDir);
+		expect(roots.sessionLeases?.S).toEqual({ leaseId: "lease-2", refreshedAt: 130_000 });
+		expect(roots.orphanCandidates?.S).toBeUndefined();
+
+		// Far past the original grace window, but the reset candidate is freshly
+		// observed → not reaped. Only after it survives its own window is it reaped.
+		now = 200_000;
+		bot.calls = [];
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		roots = await readRootsState(agentDir);
+		expect(roots.orphanCandidates?.S).toMatchObject({ leaseId: "lease-2", topicId: "11", observedAt: 200_000 });
+		now = 260_001;
+		bot.calls = [];
+		await daemon.scanRoots();
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([11]);
+	});
+
+	test("the candidate grace window is independent of topic age: 59,999 keeps, 60,000 reaps", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S", randomId: () => "L", now: () => 0 });
+		fs.mkdirSync(path.join(cwd, ".gjc", "state", "notifications"), { recursive: true });
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		// Topic is created at t=0, so it is long past its own grace window for the
+		// whole test; only the candidate's own observedAt clock gates the reap.
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({ topics: { S: { topicId: "21", identitySent: true, createdAt: 0, name: "s" } } }),
+		);
+		const bot = new FakeBotApi();
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots(); // candidate observedAt = 120_000
+		now = 179_999; // candidate age 59,999ms → still under the window
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		now = 180_000; // candidate age 60,000ms → past the window
+		bot.calls = [];
+		await daemon.scanRoots();
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([21]);
+	});
+
+	test("only stale and dead-PID endpoints qualify; live, malformed, and active sessions are protected", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		const endpointDir = path.join(cwd, ".gjc", "state", "notifications");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		for (const sid of ["live", "malformed", "stale", "dead"]) {
+			await registerNotificationRoot({
+				settings: s,
+				cwd,
+				sessionId: sid,
+				randomId: () => `lease-${sid}`,
+				now: () => 0,
+			});
+		}
+		fs.writeFileSync(
+			path.join(endpointDir, "live.json"),
+			JSON.stringify({ url: "ws://live", token: "t", pid: 4242 }),
+		);
+		fs.writeFileSync(path.join(endpointDir, "malformed.json"), JSON.stringify({ url: 123, token: "t" }));
+		fs.writeFileSync(
+			path.join(endpointDir, "stale.json"),
+			JSON.stringify({ url: "ws://stale", token: "t", stale: true }),
+		);
+		fs.writeFileSync(
+			path.join(endpointDir, "dead.json"),
+			JSON.stringify({ url: "ws://dead", token: "t", pid: 999999 }),
+		);
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({
+				topics: {
+					live: { topicId: "31", identitySent: true, createdAt: 0, name: "live" },
+					malformed: { topicId: "32", identitySent: true, createdAt: 0, name: "malformed" },
+					stale: { topicId: "33", identitySent: true, createdAt: 0, name: "stale" },
+					dead: { topicId: "34", identitySent: true, createdAt: 0, name: "dead" },
+					active: { topicId: "35", identitySent: true, createdAt: 0, name: "active" },
+				},
+			}),
+		);
+		const bot = new FakeBotApi();
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: pid => pid === 4242,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		// An in-memory connected session is unconditionally protected.
+		daemon.connectSession("active", "ws://active", "t");
+		await daemon.scanRoots(); // first absence: candidates only for stale + dead
+		now = 180_000;
+		bot.calls = [];
+		await daemon.scanRoots();
+		expect(
+			bot.calls
+				.filter(c => c.method === "deleteForumTopic")
+				.map(c => c.body.message_thread_id)
+				.sort(),
+		).toEqual([33, 34]);
+		expect(daemon.sessions.has("live")).toBe(true);
+		expect(daemon.sessions.has("active")).toBe(true);
+		expect(await topicPersisted(agentDir, "malformed")).toBe(true);
+		// The protective live reading reconnects the session instead of reaping it.
+		expect(FakeWs.instances.some(ws => ws.url.startsWith("ws://live"))).toBe(true);
+	});
+
+	test("a live duplicate endpoint in another root protects the session over a stale reading", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const rootA = path.join(agentDir, "repoA", ".gjc", "state");
+		const rootB = path.join(agentDir, "repoB", ".gjc", "state");
+		fs.mkdirSync(path.join(rootA, "notifications"), { recursive: true });
+		fs.mkdirSync(path.join(rootB, "notifications"), { recursive: true });
+		fs.writeFileSync(
+			path.join(rootA, "notifications", "dup.json"),
+			JSON.stringify({ url: "ws://stale", token: "t", stale: true }),
+		);
+		fs.writeFileSync(
+			path.join(rootB, "notifications", "dup.json"),
+			JSON.stringify({ url: "ws://live", token: "t", pid: 4242 }),
+		);
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({ topics: { dup: { topicId: "41", identitySent: true, createdAt: 0, name: "dup" } } }),
+		);
+		fs.writeFileSync(
+			daemonPaths(agentDir).roots,
+			JSON.stringify({
+				version: 1,
+				roots: [rootA, rootB].sort(),
+				sessions: { dup: rootA },
+				sessionLeases: { dup: { leaseId: "L", refreshedAt: 0 } },
+			}),
+		);
+		const bot = new FakeBotApi();
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: pid => pid === 4242,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		now = 180_000;
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(await topicPersisted(agentDir, "dup")).toBe(true);
+		expect(daemon.sessions.has("dup")).toBe(true);
+		expect(FakeWs.instances.some(ws => ws.url.startsWith("ws://live"))).toBe(true);
+	});
+
+	test("legacy and malformed registry mappings fail closed (no valid lease ⇒ never reaped)", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const rootDir = path.join(agentDir, "repo", ".gjc", "state");
+		fs.mkdirSync(path.join(rootDir, "notifications"), { recursive: true });
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({
+				topics: {
+					legacy: { topicId: "51", identitySent: true, createdAt: 0, name: "legacy" },
+					badlease: { topicId: "52", identitySent: true, createdAt: 0, name: "badlease" },
+				},
+			}),
+		);
+		// Legacy schema (no sessionLeases) and a malformed lease entry (non-string
+		// leaseId) are both dropped by the strict parser → no lease ⇒ fail closed.
+		fs.writeFileSync(
+			daemonPaths(agentDir).roots,
+			JSON.stringify({
+				version: 1,
+				roots: [rootDir],
+				sessions: { legacy: rootDir, badlease: rootDir },
+				sessionLeases: { badlease: { leaseId: 123, refreshedAt: "oops" } },
+			}),
+		);
+		const bot = new FakeBotApi();
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		now = 180_000;
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(await topicPersisted(agentDir, "legacy")).toBe(true);
+		expect(await topicPersisted(agentDir, "badlease")).toBe(true);
+		const roots = await readRootsState(agentDir);
+		expect(roots.orphanCandidates?.legacy).toBeUndefined();
+		expect(roots.orphanCandidates?.badlease).toBeUndefined();
+	});
+
+	test("an unrelated unreadable root (ENOENT or non-ENOENT) does not veto reaping of a readable-root session", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const readableRoot = path.join(agentDir, "readable", ".gjc", "state");
+		const enoentRoot = path.join(agentDir, "enoent", ".gjc", "state");
+		const notDirRoot = path.join(agentDir, "notdir", ".gjc", "state");
+		fs.mkdirSync(path.join(readableRoot, "notifications"), { recursive: true });
+		// enoentRoot: its notifications dir is simply absent (ENOENT on readdir).
+		// notDirRoot: the notifications path is a regular file (ENOTDIR, non-ENOENT).
+		fs.mkdirSync(notDirRoot, { recursive: true });
+		fs.writeFileSync(path.join(notDirRoot, "notifications"), "not a dir");
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({ topics: { orphan: { topicId: "55", identitySent: true, createdAt: 0, name: "orphan" } } }),
+		);
+		fs.writeFileSync(
+			daemonPaths(agentDir).roots,
+			JSON.stringify({
+				version: 1,
+				roots: [readableRoot, enoentRoot, notDirRoot].sort(),
+				sessions: { orphan: readableRoot },
+				sessionLeases: { orphan: { leaseId: "L", refreshedAt: 0 } },
+			}),
+		);
+		const bot = new FakeBotApi();
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		now = 180_000;
+		await daemon.scanRoots();
+		// "orphan"'s own root is readable + empty, so it is reaped even though two
+		// unrelated roots are unreadable (one ENOENT, one non-ENOENT).
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([55]);
+	});
+
+	test("array-shaped registry maps (sessions, sessionLeases, orphanCandidates) never authorize deletion", async () => {
+		// If Object.entries were applied to these arrays, their numeric-string
+		// indices ("0") would surface a ready reap candidate for session "0".
+		// Strict Array.isArray rejection drops every map, so the seeded candidate
+		// stays invisible and the topic can never be deleted.
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const rootDir = path.join(agentDir, "repo", ".gjc", "state");
+		fs.mkdirSync(path.join(rootDir, "notifications"), { recursive: true }); // readable-empty
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({ topics: { "0": { topicId: "11", identitySent: true, createdAt: 0, name: "s" } } }),
+		);
+		fs.writeFileSync(
+			daemonPaths(agentDir).roots,
+			JSON.stringify({
+				version: 1,
+				roots: [rootDir],
+				sessions: [rootDir],
+				sessionLeases: [{ leaseId: "L", refreshedAt: 0 }],
+				orphanCandidates: [{ observedAt: 1000, leaseId: "L", topicId: "11" }],
+			}),
+		);
+		const bot = new FakeBotApi();
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		// Seeded observedAt (1000) is already far past the grace window at t=120000.
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		now = 200_000;
+		bot.calls = [];
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(await topicPersisted(agentDir, "0")).toBe(true);
+	});
+
+	// A deletion candidate is only ever dropped by a strict scalar-domain check;
+	// the old type-only check let these malformed-but-type-valid scalars authorize
+	// a destructive delete. Each row seeds a candidate that is the would-be
+	// authority — a valid, lease-matching, topic-matching, already-mature absence
+	// proof (via seedReadyOrphan) — then malforms exactly one scalar so only the
+	// new domain check stands between it and a deleteForumTopic.
+	type ScalarPatch = (raw: RootsRegistryState) => void;
+	type MalformedScalarRow = [label: string, config: { seedTopicId: string; seedLeaseId: string; patch?: ScalarPatch }];
+
+	const malformedScalarRows: MalformedScalarRow[] = [
+		["empty leaseId (session lease + candidate)", { seedTopicId: "11", seedLeaseId: "" }],
+		[
+			"negative candidate observedAt",
+			{
+				seedTopicId: "11",
+				seedLeaseId: "L",
+				patch: r => {
+					r.orphanCandidates!.S!.observedAt = -1;
+				},
+			},
+		],
+		[
+			"fractional candidate observedAt",
+			{
+				seedTopicId: "11",
+				seedLeaseId: "L",
+				patch: r => {
+					r.orphanCandidates!.S!.observedAt = 1.5;
+				},
+			},
+		],
+		[
+			"negative session-lease refreshedAt",
+			{
+				seedTopicId: "11",
+				seedLeaseId: "L",
+				patch: r => {
+					r.sessionLeases!.S!.refreshedAt = -5;
+				},
+			},
+		],
+		[
+			"fractional session-lease refreshedAt",
+			{
+				seedTopicId: "11",
+				seedLeaseId: "L",
+				patch: r => {
+					r.sessionLeases!.S!.refreshedAt = 2.5;
+				},
+			},
+		],
+		["candidate topicId '0' (zero)", { seedTopicId: "0", seedLeaseId: "L" }],
+		["candidate topicId '-1' (negative)", { seedTopicId: "-1", seedLeaseId: "L" }],
+		["candidate topicId '1.5' (fraction)", { seedTopicId: "1.5", seedLeaseId: "L" }],
+		["candidate topicId ' 1 ' (whitespace)", { seedTopicId: " 1 ", seedLeaseId: "L" }],
+		["candidate topicId '1e3' (exponent)", { seedTopicId: "1e3", seedLeaseId: "L" }],
+		["candidate topicId 'abc' (non-digits)", { seedTopicId: "abc", seedLeaseId: "L" }],
+		["candidate topicId '01' (leading zero)", { seedTopicId: "01", seedLeaseId: "L" }],
+	];
+
+	test.each(
+		malformedScalarRows,
+	)("a malformed-scalar deletion candidate that would otherwise be the authority (%s) never matures into a delete", async (_label, {
+		seedTopicId,
+		seedLeaseId,
+		patch,
+	}) => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const rootDir = seedReadyOrphan(agentDir, "S", seedTopicId, seedLeaseId);
+		if (patch) patchRootsRegistry(agentDir, patch);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		// No candidate maturation ⇒ no remote deleteForumTopic call.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		// No local forget: the topic record is still persisted.
+		expect(await topicPersisted(agentDir, "S")).toBe(true);
+		// No compaction: the session mapping and its registered root survive.
+		const roots = await readRootsState(agentDir);
+		expect(roots.sessions?.S).toBe(rootDir);
+		expect(roots.roots).toEqual([rootDir]);
+	});
+
+	test("an ambiguous mapped root protects its session over stale/dead endpoint evidence in another readable root", async () => {
+		// The session's authoritative root is unreadable (non-ENOENT), so its
+		// absence is indeterminate and fail-closed. A dead-PID endpoint for the
+		// same session in a separate readable root must not override that — the
+		// mapped root may still hold an endpoint that could not be enumerated.
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const authoritativeRoot = path.join(agentDir, "auth", ".gjc", "state");
+		const evidenceRoot = path.join(agentDir, "ev", ".gjc", "state");
+		// notifications is a regular file → readdir raises ENOTDIR (ambiguous).
+		fs.mkdirSync(authoritativeRoot, { recursive: true });
+		fs.writeFileSync(path.join(authoritativeRoot, "notifications"), "not a dir");
+		fs.mkdirSync(path.join(evidenceRoot, "notifications"), { recursive: true });
+		fs.writeFileSync(
+			path.join(evidenceRoot, "notifications", "S.json"),
+			JSON.stringify({ url: "ws://dead", token: "t", pid: 999999 }),
+		);
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({ topics: { S: { topicId: "21", identitySent: true, createdAt: 0, name: "s" } } }),
+		);
+		fs.writeFileSync(
+			daemonPaths(agentDir).roots,
+			JSON.stringify({
+				version: 1,
+				roots: [authoritativeRoot, evidenceRoot].sort(),
+				sessions: { S: authoritativeRoot },
+				sessionLeases: { S: { leaseId: "L", refreshedAt: 0 } },
+			}),
+		);
+		const bot = new FakeBotApi();
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			pidAlive: () => false,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		// The dead endpoint alone looks orphaned, but the mapped root's ambiguity
+		// blocks candidate creation entirely.
+		expect((await readRootsState(agentDir)).orphanCandidates?.S).toBeUndefined();
+		now = 180_000;
+		bot.calls = [];
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(await topicPersisted(agentDir, "S")).toBe(true);
+	});
+
+	test("the locked delete revalidates the lease and aborts when it no longer matches the candidate", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		seedReadyOrphan(agentDir, "S", "61", "L1");
+		const rootsFile = daemonPaths(agentDir).roots;
+		// Intercept roots reads: maintain (read #2) sees the seeded, matching lease
+		// and is a no-op; from reap's unlocked read onward the on-disk lease is
+		// mutated so the locked delete's fresh re-read diverges from the candidate.
+		let rootsReads = 0;
+		const wrappedFs = wrapFs({
+			readFile: async (p, e) => {
+				if (p === rootsFile) {
+					rootsReads++;
+					if (rootsReads > 2) {
+						const raw = JSON.parse(await fs.promises.readFile(p, e)) as RootsRegistryState;
+						(raw.sessionLeases!.S as { leaseId: string }).leaseId = "L2-diverged";
+						return JSON.stringify(raw);
+					}
+				}
+				return fs.promises.readFile(p, e);
+			},
+		});
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			fs: wrappedFs,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		// Revalidation aborted the delete before the remote call; the topic survives.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(await topicPersisted(agentDir, "S")).toBe(true);
+	});
+	test("a stale candidate topic id cannot delete a reused session topic", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		seedReadyOrphan(agentDir, "S", "41", "L");
+		const topicsFile = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		const topicState = JSON.parse(fs.readFileSync(topicsFile, "utf8")) as TopicRegistryState;
+		topicState.topics.S!.topicId = "42";
+		fs.writeFileSync(topicsFile, JSON.stringify(topicState));
+
+		const bot = new FakeBotApi();
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect((await readRootsState(agentDir)).orphanCandidates?.S).toEqual({
+			observedAt: 120_000,
+			leaseId: "L",
+			topicId: "42",
+		});
+
+		now = 180_000;
+		await daemon.scanRoots();
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([42]);
+	});
+
+	test.each([
+		["a thrown error", "throw"],
+		["an empty object {}", "empty"],
+		["{ok:false}", "ok-false"],
+	] as const)("a non-success deleteForumTopic response (%s) leaves the topic and registry uncompacted", async (_name, outcome) => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		seedReadyOrphan(agentDir, "S", "71", "L");
+		const bot = new DeleteOutcomeBotApi(outcome);
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(true);
+		// Ambiguous/failed responses never authorize local forgetting or compaction.
+		expect(await topicPersisted(agentDir, "S")).toBe(true);
+		const roots = await readRootsState(agentDir);
+		expect(roots.orphanCandidates?.S).toBeDefined();
+		expect(roots.sessionLeases?.S).toBeDefined();
+	});
+	test("a failed orphan deletion remains retryable and succeeds on the next scan", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		seedReadyOrphan(agentDir, "S", "73", "L");
+		const bot = new DeleteOutcomeBotApi("ok-false");
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+
+		await daemon.scanRoots();
+		expect(await topicPersisted(agentDir, "S")).toBe(true);
+		expect((await readRootsState(agentDir)).orphanCandidates?.S).toBeDefined();
+
+		bot.outcome = "ok-true";
+		await daemon.scanRoots();
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([
+			73, 73,
+		]);
+		expect(await topicPersisted(agentDir, "S")).toBe(false);
+		expect((await readRootsState(agentDir)).orphanCandidates?.S).toBeUndefined();
+	});
+
+	test("an exact {ok:true} deleteForumTopic response compacts the registry and forgets the topic", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		seedReadyOrphan(agentDir, "S", "72", "L");
+		const bot = new DeleteOutcomeBotApi("ok-true");
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([72]);
+		expect(await topicPersisted(agentDir, "S")).toBe(false);
+		const roots = await readRootsState(agentDir);
+		expect(roots.orphanCandidates?.S).toBeUndefined();
+		expect(roots.sessionLeases?.S).toBeUndefined();
+	});
+
+	test("a local registry-compaction failure retains the candidate + lease evidence", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const rootsFile = daemonPaths(agentDir).roots;
+		seedReadyOrphan(agentDir, "S", "81", "L");
+		// The atomic rename that publishes the compacted registry fails; the
+		// in-memory topic is already forgotten, but the on-disk evidence survives.
+		const wrappedFs = wrapFs({
+			rename: async (oldPath, newPath) => {
+				if (newPath === rootsFile) throw new Error("disk full");
+				await fs.promises.rename(oldPath, newPath);
+			},
+		});
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			fs: wrappedFs,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(true);
+		expect(await topicPersisted(agentDir, "S")).toBe(false);
+		const roots = await readRootsState(agentDir);
+		expect(roots.orphanCandidates?.S).toBeDefined();
+		expect(roots.sessionLeases?.S).toBeDefined();
+	});
+
+	test("a persistTopicsExcluding failure after an exact {ok:true} delete keeps the topic and every registry record", async () => {
+		// Persistence-before-forgetting contract: Telegram confirms the topic
+		// delete with literal {ok:true}, but persistTopicsExcluding(sessionId) —
+		// the atomic rename that publishes the prospective telegram-topics.json
+		// snapshot (excluding the deleted session) — fails. The daemon must not
+		// forget the topic in memory or compact the roots registry: the on-disk
+		// topic, candidate, lease, session mapping, and registered root all
+		// survive so a later scan can retry the reap. Contrast the
+		// roots-compaction failure above, where the topic publish already
+		// succeeded and the topic WAS forgotten locally.
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const topicsFile = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		const rootDir = seedReadyOrphan(agentDir, "S", "82", "L");
+		// Fail the atomic publish of the topics snapshot only (not the roots
+		// registry): the delete succeeded remotely, but local forgetting is gated
+		// on that publish succeeding first.
+		const wrappedFs = wrapFs({
+			rename: async (oldPath, newPath) => {
+				if (newPath === topicsFile) throw new Error("disk full");
+				await fs.promises.rename(oldPath, newPath);
+			},
+		});
+		const bot = new DeleteOutcomeBotApi("ok-true");
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			fs: wrappedFs,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		// The exact {ok:true} delete was attempted remotely, but the atomic
+		// publish failed — so the topic is still persisted on disk.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(true);
+		expect(await topicPersisted(agentDir, "S")).toBe(true);
+		// …and still observable in daemon behavior: a fresh scan re-attempts the
+		// delete because the topic was never forgotten in memory.
+		bot.calls = [];
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(true);
+		// No compaction or local forgetting: every registry record survives intact.
+		const roots = await readRootsState(agentDir);
+		expect(roots.orphanCandidates?.S).toBeDefined();
+		expect(roots.sessionLeases?.S).toBeDefined();
+		expect(roots.sessions?.S).toBe(rootDir);
+		expect(roots.roots).toEqual([rootDir]);
+	});
+
+	test("registry compaction is selective: unrelated sessions, leases, and unknown fields survive", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const rootDir = path.join(agentDir, "repo", ".gjc", "state");
+		fs.mkdirSync(path.join(rootDir, "notifications"), { recursive: true });
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({
+				topics: {
+					reap: { topicId: "91", identitySent: true, createdAt: 0, name: "reap" },
+					keep: { topicId: "92", identitySent: true, createdAt: 0, name: "keep" },
+				},
+			}),
+		);
+		// "keep" is protected by a live endpoint so it is never a candidate.
+		fs.writeFileSync(
+			path.join(rootDir, "notifications", "keep.json"),
+			JSON.stringify({ url: "ws://keep", token: "t", pid: 4242 }),
+		);
+		fs.writeFileSync(
+			daemonPaths(agentDir).roots,
+			JSON.stringify({
+				version: 1,
+				roots: [rootDir],
+				sessions: { reap: rootDir, keep: rootDir },
+				sessionLeases: { reap: { leaseId: "Lreap", refreshedAt: 0 }, keep: { leaseId: "Lkeep", refreshedAt: 0 } },
+				orphanCandidates: { reap: { observedAt: 1000, leaseId: "Lreap", topicId: "91" } },
+				futureField: { stable: true, nested: { x: 1 } },
+			}),
+		);
+		FakeWs.instances = [];
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: pid => pid === 4242,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([91]);
+		expect(await topicPersisted(agentDir, "reap")).toBe(false);
+		expect(await topicPersisted(agentDir, "keep")).toBe(true);
+		const roots = await readRootsState(agentDir);
+		expect(roots.orphanCandidates?.reap).toBeUndefined();
+		expect(roots.sessionLeases?.reap).toBeUndefined();
+		expect(roots.sessionLeases?.keep).toEqual({ leaseId: "Lkeep", refreshedAt: 0 });
+		expect(roots.futureField).toEqual({ stable: true, nested: { x: 1 } });
+	});
+
+	test("a same-session registration serializes behind an in-flight delete and writes a fresh lease", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		seedReadyOrphan(agentDir, "race", "101", "L1");
+		const bot = new FakeBotApi();
+		let releaseDelete: () => void = () => {};
+		const deleteGate = new Promise<void>(resolve => {
+			releaseDelete = resolve;
+		});
+		let signalDeleteHoldingLock: () => void = () => {};
+		const deleteHoldingLock = new Promise<void>(resolve => {
+			signalDeleteHoldingLock = resolve;
+		});
+		(bot as FakeBotApi).call = (async (method: string, body: any) => {
+			bot.calls.push({ method, body });
+			if (method === "deleteForumTopic") {
+				signalDeleteHoldingLock(); // the delete is now holding the forever roots lock
+				await deleteGate; // …and keeps holding it across the remote call
+				return { ok: true };
+			}
+			return { ok: true, result: true };
+		}) as any;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		const scanP = daemon.scanRoots();
+		// Wait until the reap is provably holding the forever roots lock at its gated call.
+		await deleteHoldingLock;
+		// The forever lock queues this registration behind the in-flight delete.
+		const regP = registerNotificationRoot({
+			settings: s,
+			cwd: path.join(agentDir, "repo"),
+			sessionId: "race",
+			randomId: () => "L2",
+			now: () => 130_000,
+		});
+		releaseDelete();
+		await Promise.all([scanP, regP]);
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(true);
+		expect(await topicPersisted(agentDir, "race")).toBe(false);
+		const roots = await readRootsState(agentDir);
+		// Delete compacted the old proof; the queued registration wrote a fresh lease.
+		expect(roots.sessionLeases?.race).toEqual({ leaseId: "L2", refreshedAt: 130_000 });
+		expect(roots.orphanCandidates?.race).toBeUndefined();
+	});
+
+	test("an unrelated registration is not compacted away by a concurrent delete of another session", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const rootDir = path.join(agentDir, "repo", ".gjc", "state");
+		fs.mkdirSync(path.join(rootDir, "notifications"), { recursive: true });
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+			JSON.stringify({ topics: { a: { topicId: "111", identitySent: true, createdAt: 0, name: "a" } } }),
+		);
+		fs.writeFileSync(
+			daemonPaths(agentDir).roots,
+			JSON.stringify({
+				version: 1,
+				roots: [rootDir],
+				sessions: { a: rootDir, b: rootDir },
+				sessionLeases: { a: { leaseId: "La", refreshedAt: 0 }, b: { leaseId: "Lb", refreshedAt: 0 } },
+				orphanCandidates: { a: { observedAt: 1000, leaseId: "La", topicId: "111" } },
+			}),
+		);
+		const bot = new FakeBotApi();
+		let releaseDelete: () => void = () => {};
+		const deleteGate = new Promise<void>(resolve => {
+			releaseDelete = resolve;
+		});
+		let signalDeleteHoldingLock: () => void = () => {};
+		const deleteHoldingLock = new Promise<void>(resolve => {
+			signalDeleteHoldingLock = resolve;
+		});
+		(bot as FakeBotApi).call = (async (method: string, body: any) => {
+			bot.calls.push({ method, body });
+			if (method === "deleteForumTopic") {
+				signalDeleteHoldingLock(); // the delete is now holding the forever roots lock
+				await deleteGate; // …and keeps holding it across the remote call
+				return { ok: true };
+			}
+			return { ok: true, result: true };
+		}) as any;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		const scanP = daemon.scanRoots();
+		await deleteHoldingLock; // wait until the reap is provably holding the lock
+		const regP = registerNotificationRoot({
+			settings: s,
+			cwd: path.join(agentDir, "repo"),
+			sessionId: "b",
+			randomId: () => "Lb2",
+			now: () => 130_000,
+		});
+		releaseDelete();
+		await Promise.all([scanP, regP]);
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([111]);
+		const roots = await readRootsState(agentDir);
+		// Session "a" was reaped + compacted; unrelated session "b"'s lease survives.
+		expect(roots.sessionLeases?.a).toBeUndefined();
+		expect(roots.sessionLeases?.b).toEqual({ leaseId: "Lb2", refreshedAt: 130_000 });
+		expect(roots.orphanCandidates?.b).toBeUndefined();
+	});
+	// A persisted TopicRecord.createdAt that is not a non-negative safe integer
+	// must never satisfy orphan deletion grace, even when the orphan candidate is
+	// otherwise fully valid, lease-matching, and mature. TopicRegistry.load()
+	// normalizes non-number createdAt to 0 (which would otherwise pass grace),
+	// and carries negative/fractional/unsafe integers verbatim; the daemon marks
+	// these sessions from the raw persisted JSON at loadTopics and fail-closes
+	// topicPastOrphanGrace for the lifetime of the topic.
+	const malformedCreatedAtRows: [label: string, createdAt: unknown][] = [
+		["negative createdAt", -1],
+		["fractional createdAt", 1.5],
+		["unsafe integer createdAt", Number.MAX_SAFE_INTEGER + 1],
+		["string createdAt", "oops"],
+		["null createdAt", null],
+		["omitted createdAt", undefined],
+		["object createdAt", {}],
+		["array createdAt", [1000]],
+		["boolean createdAt", true],
+	];
+
+	test.each(
+		malformedCreatedAtRows,
+	)("a malformed persisted topic createdAt (%s) never satisfies orphan deletion grace even with a mature candidate", async (_label, createdAt) => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		// Seed a fully valid, mature, lease-matching orphan candidate — the
+		// ONLY thing standing between it and a deleteForumTopic is the
+		// malformed persisted topic createdAt.
+		const rootDir = seedReadyOrphan(agentDir, "S", "11", "L");
+		// Overwrite the seeded (valid) createdAt with the malformed value.
+		const topicsFile = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		const topicRaw = JSON.parse(fs.readFileSync(topicsFile, "utf8")) as { topics: Record<string, any> };
+		topicRaw.topics.S.createdAt = createdAt;
+		fs.writeFileSync(topicsFile, JSON.stringify(topicRaw));
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		// No deleteForumTopic: the malformed createdAt fail-closes orphan grace.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		// The topic record is not forgotten locally.
+		expect(await topicPersisted(agentDir, "S")).toBe(true);
+		// No compaction: session mapping, lease, candidate, and root all survive.
+		const roots = await readRootsState(agentDir);
+		expect(roots.sessions?.S).toBe(rootDir);
+		expect(roots.sessionLeases?.S).toBeDefined();
+		expect(roots.orphanCandidates?.S).toBeDefined();
+		expect(roots.roots).toEqual([rootDir]);
+	});
+
+	test("a valid non-negative safe-integer createdAt still reaps after candidate grace", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		// createdAt: 0 (valid) + observedAt: 1000 (already mature at t=120000).
+		seedReadyOrphan(agentDir, "S", "11", "L");
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			now: () => 120_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		// Valid createdAt + mature candidate → reaped normally.
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([11]);
+		expect(await topicPersisted(agentDir, "S")).toBe(false);
+	});
 });
 
 test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {

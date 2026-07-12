@@ -311,33 +311,330 @@ async function tryOpenWx(fsImpl: TelegramDaemonFs, file: string): Promise<boolea
 		throw error;
 	}
 }
+/**
+ * Per-session registration lease. Refreshed with a fresh random `leaseId` on
+ * every {@link registerNotificationRoot} so a same-session re-registration
+ * invalidates any deletion proof an older registration established. The daemon
+ * never reaps a topic whose candidate lease no longer matches the live lease.
+ */
+interface SessionLease {
+	leaseId: string;
+	refreshedAt: number;
+}
+
+/**
+ * Per-session orphan-topic deletion candidate. Created on the first confirmed
+ * continuous absence; a topic is reaped only once this candidate has itself
+ * survived {@link ORPHAN_TOPIC_GRACE_MS} AND its lease still matches the live
+ * session lease (no intervening registration/publication).
+ */
+interface OrphanCandidate {
+	observedAt: number;
+	leaseId: string;
+	topicId: string;
+}
+
+/**
+ * Validated, decision-only view over the raw notification-roots registry. The
+ * raw object is carried verbatim through every read-modify-write so unknown,
+ * legacy, or unrelated fields survive; only strictly-valid entries populate the
+ * decision maps — ambiguous/malformed/legacy state never authorizes deletion.
+ */
+interface RootsRegistryView {
+	raw: Record<string, unknown>;
+	roots: string[];
+	sessions: Map<string, string>;
+	sessionLeases: Map<string, SessionLease>;
+	orphanCandidates: Map<string, OrphanCandidate>;
+}
+
+/** Non-empty string scalar: every registry id (leaseId, map key) must be one. */
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+/** Non-negative safe integer scalar: every registry timestamp must be one. */
+function isNonNegativeSafeInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Canonical positive safe-integer string scalar: every candidate topicId must be
+ * one. Rejects zero, negatives, fractions, leading zeros, whitespace, exponents,
+ * and any non-digit, so a malformed candidate id can never match a live topic
+ * record and authorize a destructive delete.
+ */
+function isCanonicalTopicId(value: unknown): value is string {
+	if (typeof value !== "string") return false;
+	if (!/^[1-9][0-9]*$/.test(value)) return false;
+	return Number.isSafeInteger(Number(value));
+}
+
+function parseRootsList(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const roots: string[] = [];
+	for (const entry of value) {
+		if (typeof entry === "string" && entry.length > 0) roots.push(entry);
+	}
+	return roots;
+}
+
+function parseStringMap(value: unknown): Map<string, string> {
+	const map = new Map<string, string>();
+	if (!value || typeof value !== "object" || Array.isArray(value)) return map;
+	for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+		if (typeof key === "string" && key.length > 0 && typeof val === "string") map.set(key, val);
+	}
+	return map;
+}
+
+function parseSessionLeases(value: unknown): Map<string, SessionLease> {
+	const map = new Map<string, SessionLease>();
+	if (!value || typeof value !== "object" || Array.isArray(value)) return map;
+	for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+		if (!isNonEmptyString(key) || !val || typeof val !== "object" || Array.isArray(val)) continue;
+		const lease = val as { leaseId?: unknown; refreshedAt?: unknown };
+		if (!isNonEmptyString(lease.leaseId) || !isNonNegativeSafeInteger(lease.refreshedAt)) continue;
+		map.set(key, { leaseId: lease.leaseId, refreshedAt: lease.refreshedAt });
+	}
+	return map;
+}
+
+function parseOrphanCandidates(value: unknown): Map<string, OrphanCandidate> {
+	const map = new Map<string, OrphanCandidate>();
+	if (!value || typeof value !== "object" || Array.isArray(value)) return map;
+	for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+		if (!isNonEmptyString(key) || !val || typeof val !== "object" || Array.isArray(val)) continue;
+		const candidate = val as { observedAt?: unknown; leaseId?: unknown; topicId?: unknown };
+		if (
+			!isNonNegativeSafeInteger(candidate.observedAt) ||
+			!isNonEmptyString(candidate.leaseId) ||
+			!isCanonicalTopicId(candidate.topicId)
+		)
+			continue;
+		map.set(key, {
+			observedAt: candidate.observedAt,
+			leaseId: candidate.leaseId,
+			topicId: candidate.topicId,
+		});
+	}
+	return map;
+}
+
+async function readRootsRegistry(fsImpl: TelegramDaemonFs, rootsFile: string): Promise<RootsRegistryView> {
+	const parsed = await readJson<unknown>(fsImpl, rootsFile);
+	const raw: Record<string, unknown> =
+		parsed && typeof parsed === "object" ? { ...(parsed as Record<string, unknown>) } : {};
+	return {
+		raw,
+		roots: parseRootsList(raw.roots),
+		sessions: parseStringMap(raw.sessions),
+		sessionLeases: parseSessionLeases(raw.sessionLeases),
+		orphanCandidates: parseOrphanCandidates(raw.orphanCandidates),
+	};
+}
+
+/**
+ * Persist the raw roots registry verbatim; only the schema `version` is
+ * normalized. Every other key — known or unknown, well-formed or legacy — is
+ * carried through untouched. Known maps are never rebuilt here: callers patch
+ * the raw object per exact changed session (see the raw* helpers) so malformed
+ * and unrelated entries inside those maps survive every write.
+ */
+async function persistRootsRegistry(
+	fsImpl: TelegramDaemonFs,
+	rootsFile: string,
+	raw: Record<string, unknown>,
+): Promise<void> {
+	raw.version = 1;
+	await writeJsonAtomic(fsImpl, rootsFile, raw);
+}
+
+/**
+ * Return the raw object held at `key`, or a fresh object when the field is
+ * absent or not a plain object. The returned map is the live raw field, so
+ * callers mutate it in place and reassign it (a freshly-created map is recorded
+ * on reassignment). Known maps are patched per exact session, never normalized,
+ * so malformed/unknown entries inside them are preserved across every patch.
+ */
+function rawObjectField(raw: Record<string, unknown>, key: string): Record<string, unknown> {
+	const existing = raw[key];
+	if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+		return existing as Record<string, unknown>;
+	}
+	return {};
+}
+
+function setRawSessionMapping(raw: Record<string, unknown>, sessionId: string, root: string): void {
+	const map = rawObjectField(raw, "sessions");
+	map[sessionId] = root;
+	raw.sessions = map;
+}
+
+function deleteRawSessionMapping(raw: Record<string, unknown>, sessionId: string): boolean {
+	const map = rawObjectField(raw, "sessions");
+	if (!(sessionId in map)) return false;
+	delete map[sessionId];
+	raw.sessions = map;
+	return true;
+}
+
+function setRawLease(raw: Record<string, unknown>, sessionId: string, lease: SessionLease): void {
+	const map = rawObjectField(raw, "sessionLeases");
+	map[sessionId] = { leaseId: lease.leaseId, refreshedAt: lease.refreshedAt };
+	raw.sessionLeases = map;
+}
+
+function deleteRawLease(raw: Record<string, unknown>, sessionId: string): boolean {
+	const map = rawObjectField(raw, "sessionLeases");
+	if (!(sessionId in map)) return false;
+	delete map[sessionId];
+	raw.sessionLeases = map;
+	return true;
+}
+
+function setRawCandidate(raw: Record<string, unknown>, sessionId: string, candidate: OrphanCandidate): void {
+	const map = rawObjectField(raw, "orphanCandidates");
+	map[sessionId] = {
+		observedAt: candidate.observedAt,
+		leaseId: candidate.leaseId,
+		topicId: candidate.topicId,
+	};
+	raw.orphanCandidates = map;
+}
+
+function deleteRawCandidate(raw: Record<string, unknown>, sessionId: string): boolean {
+	const map = rawObjectField(raw, "orphanCandidates");
+	if (!(sessionId in map)) return false;
+	delete map[sessionId];
+	raw.orphanCandidates = map;
+	return true;
+}
+
+/** Append `root` unless already present, preserving every existing entry (incl. malformed). */
+function addRawRoot(raw: Record<string, unknown>, root: string): void {
+	const existing = raw.roots;
+	const arr = Array.isArray(existing) ? existing : [];
+	if (arr.indexOf(root) !== -1) return;
+	const next = arr.slice();
+	next.push(root);
+	raw.roots = next;
+}
+
+/** Remove exactly the `root` string, preserving every other entry (incl. malformed). */
+function removeRawRoot(raw: Record<string, unknown>, root: string): boolean {
+	const existing = raw.roots;
+	if (!Array.isArray(existing)) return false;
+	const idx = existing.indexOf(root);
+	if (idx === -1) return false;
+	const next = existing.slice();
+	next.splice(idx, 1);
+	raw.roots = next;
+	return true;
+}
+
+/** Whether any recognizable (string -> string) raw session mapping references `root`. */
+function rawRootReferenced(raw: Record<string, unknown>, root: string): boolean {
+	const map = rawObjectField(raw, "sessions");
+	for (const val of Object.values(map)) {
+		if (typeof val === "string" && val === root) return true;
+	}
+	return false;
+}
+
+/**
+ * Serialize notification-roots registry mutations with an opt-in forever wait.
+ * The daemon's destructive orphan-topic delete transaction holds this lock for
+ * its whole duration — including the remote Telegram call — so an in-flight
+ * deletion cannot race a fresh registration (and the endpoint publication it
+ * gates). Only this module opts into the forever wait; a wedged delete defers
+ * configured Telegram startup rather than deleting a newly-live session topic.
+ */
+function withRootsLock<T>(_fsImpl: TelegramDaemonFs, rootsFile: string, fn: () => Promise<T>): Promise<T> {
+	return withFileLock(rootsFile, fn, { retries: "forever", staleMs: 10_000 });
+}
+
+/** Classified readability of a single session endpoint discovery file. */
+type EndpointEvidence =
+	| { kind: "live"; url: string; token: string }
+	| { kind: "stale"; url: string; token: string }
+	| { kind: "dead"; url: string; token: string }
+	| { kind: "malformed" };
+/**
+ * Readability of a notification root's `notifications/` directory.
+ * - `readable`: enumerated successfully.
+ * - `missing`: confirmed gone (ENOENT) — its sessions' absence is authoritative.
+ * - `ambiguous`: permission/IO error — absence is indeterminate, so fail closed.
+ */
+type RootReadStatus = "readable" | "missing" | "ambiguous";
+
+function classifyEndpointEvidence(
+	endpoint: { url: string; token: string; pid?: number; stale?: boolean },
+	pidAlive: (pid: number) => boolean,
+): EndpointEvidence {
+	if (endpoint.stale) return { kind: "stale", url: endpoint.url, token: endpoint.token };
+	if (endpoint.pid !== undefined && !pidAlive(endpoint.pid))
+		return { kind: "dead", url: endpoint.url, token: endpoint.token };
+	return { kind: "live", url: endpoint.url, token: endpoint.token };
+}
+
+/** Protective evidence (live or malformed/indeterminate) must never authorize deletion. */
+function endpointEvidenceIsProtective(ev: EndpointEvidence): boolean {
+	return ev.kind === "live" || ev.kind === "malformed";
+}
+
+/**
+ * Merge endpoint evidence for a session across roots. Protective readings win
+ * unconditionally: a live or malformed endpoint anywhere protects the session,
+ * so a stale/dead file in another root can never clobber a live duplicate.
+ */
+function mergeEndpointEvidence(map: Map<string, EndpointEvidence>, sessionId: string, next: EndpointEvidence): void {
+	const prev = map.get(sessionId);
+	if (!prev) {
+		map.set(sessionId, next);
+		return;
+	}
+	if (endpointEvidenceIsProtective(prev)) return;
+	if (endpointEvidenceIsProtective(next)) map.set(sessionId, next);
+}
 
 export async function registerNotificationRoot(input: {
 	settings: Settings;
 	cwd: string;
 	sessionId: string;
 	fs?: TelegramDaemonFs;
+	/** Clock used for lease timestamps; defaults to wall time. */
+	now?: () => number;
+	/** Random lease-id factory; defaults to a process-unique value. */
+	randomId?: () => string;
 }): Promise<string> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	await ensureDir(fsImpl, paths.dir);
 	const root = notificationRootForCwd(input.cwd);
-	await withFileLock(
-		paths.roots,
-		async () => {
-			const current =
-				(await readJson<{ roots?: string[]; sessions?: Record<string, string> }>(fsImpl, paths.roots)) ?? {};
-			const roots = new Set(current.roots ?? []);
-			roots.add(root);
-			await writeJsonAtomic(fsImpl, paths.roots, {
-				version: 1,
-				roots: Array.from(roots).sort(),
-				sessions: { ...(current.sessions ?? {}), [input.sessionId]: root },
-			});
-		},
-		{ staleMs: 10_000 },
-	);
+	const now = input.now ?? Date.now;
+	const randomId = input.randomId ?? defaultRootsLeaseId;
+	// Registration completes before any endpoint publication: it is the first
+	// writer of the session lease, and it clears any orphan candidate so a
+	// re-registering session is never reaped from stale absence proof. The
+	// forever roots lock serializes this against an in-flight daemon delete.
+	await withRootsLock(fsImpl, paths.roots, async () => {
+		const view = await readRootsRegistry(fsImpl, paths.roots);
+		const raw = view.raw;
+		// Patch the raw registry per exact changed session; malformed/unknown
+		// entries inside the known maps are preserved (never normalized).
+		addRawRoot(raw, root);
+		setRawSessionMapping(raw, input.sessionId, root);
+		setRawLease(raw, input.sessionId, { leaseId: randomId(), refreshedAt: now() });
+		deleteRawCandidate(raw, input.sessionId);
+		await persistRootsRegistry(fsImpl, paths.roots, raw);
+	});
+
 	return root;
+}
+
+function defaultRootsLeaseId(): string {
+	return `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function notificationRootForCwd(cwd: string): string {
@@ -694,6 +991,7 @@ export async function ensureTelegramDaemonRunning(
 ): Promise<EnsureDaemonResult> {
 	const cfg = getNotificationConfig(input.settings);
 	if (!isTelegramConfigured(cfg)) return "disabled";
+	await registerNotificationRoot({ ...input, fs: deps.fs });
 	const root = notificationRootForCwd(input.cwd);
 	const fp = tokenFingerprint(cfg.botToken);
 	const spawned = await spawnTelegramDaemonOwner(
@@ -708,14 +1006,12 @@ export async function ensureTelegramDaemonRunning(
 		// A still-live owner is running an OLDER daemon generation than this host
 		// (e.g. a pre-upgrade daemon reused in place across an in-place upgrade).
 		// Attaching would silently drop this host's newer ask-ack / control frames,
-		// so register this session's root first — so the replacement daemon serves
-		// it — then hand off through the tested SIGTERM/control reload path to bring
-		// up a fresh current-generation daemon.
-		await registerNotificationRoot({ ...input, fs: deps.fs });
+		// so hand off through the tested SIGTERM/control reload path to bring up a
+		// fresh current-generation daemon. Root registration already completed
+		// before ownership work, so the replacement daemon can serve this session.
 		await reloadStaleGenerationOwner(input.settings, deps);
 		return "owner_spawned";
 	}
-	await registerNotificationRoot({ ...input, fs: deps.fs });
 	return spawned.result;
 }
 
@@ -1025,6 +1321,16 @@ export class TelegramNotificationDaemon {
 	private readonly fsImpl: TelegramDaemonFs;
 	private readonly botApi: BotApi;
 	private readonly topics = new TopicRegistry();
+	/**
+	 * Sessions whose raw persisted topic createdAt was not a non-negative safe
+	 * integer at load. TopicRegistry.load() normalizes a non-number createdAt
+	 * to 0 — which would otherwise satisfy orphan grace and authorize a
+	 * destructive delete — so the daemon remembers these sessions and
+	 * fail-closes them in topicPastOrphanGrace for the lifetime of their topic.
+	 * The set is cleared/rebuilt on every loadTopics and cleared on legitimate
+	 * forget so a later fresh lifecycle is never poisoned.
+	 */
+	private readonly invalidCreatedAtTopics = new Set<string>();
 	/** Serializes registry snapshots so an older atomic write cannot overwrite newer rename state. */
 	private topicsPersistQueue: Promise<void> = Promise.resolve();
 	/** Daemon edit attempts that can race an accepted user service message. */
@@ -1700,46 +2006,151 @@ export class TelegramNotificationDaemon {
 
 	async scanRoots(): Promise<void> {
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
-		const rootState = await readJson<{ roots?: string[] }>(this.fsImpl, paths.roots);
-		const endpointSessionIds = new Set<string>();
-		let allRootsReadable = true;
-		for (const root of rootState?.roots ?? []) {
+		const view = await readRootsRegistry(this.fsImpl, paths.roots);
+		const { evidence, rootStatus } = await this.collectEndpointEvidence(view.roots);
+
+		// Connect live endpoints first so an active session is never mistaken for orphaned.
+		for (const [sessionId, ev] of evidence) {
+			if (this.sessions.has(sessionId)) continue;
+			if (ev.kind !== "live") continue;
+			const endpointKey = endpointGenerationKey(ev.url, ev.token);
+			if (this.closedEndpointKeys.get(sessionId) === endpointKey) continue;
+			this.closedEndpointKeys.delete(sessionId);
+			this.connectSession(sessionId, ev.url, ev.token);
+		}
+
+		// Candidate maintenance and reaping both re-read fresh under the forever
+		// roots lock, so a concurrent registration serializes against deletion
+		// authority and cannot race endpoint publication into an unsafe delete.
+		await this.maintainOrphanCandidates(evidence, rootStatus);
+
+		await this.reapReadyOrphanCandidates();
+	}
+
+	/**
+	 * Inventory endpoint discovery files across all roots, classifying each
+	 * session as live/stale/dead/malformed. Unreadable roots contribute no
+	 * evidence (and do not globally veto cleanup); a protective reading anywhere
+	 * wins over a stale/dead one so a live duplicate is never reaped.
+	 */
+	private async collectEndpointEvidence(
+		roots: string[],
+	): Promise<{ evidence: Map<string, EndpointEvidence>; rootStatus: Map<string, RootReadStatus> }> {
+		const evidence = new Map<string, EndpointEvidence>();
+		const rootStatus = new Map<string, RootReadStatus>();
+		const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
+		for (const root of roots) {
 			const dir = path.join(root, "notifications");
 			let files: string[];
 			try {
 				files = await this.fsImpl.readdir(dir);
-			} catch {
-				allRootsReadable = false;
+			} catch (error) {
+				// ENOENT confirms the mapped root is gone: its sessions' absence is
+				// authoritative. Any other error (permission/IO) is ambiguous and
+				// fails closed — it neither qualifies a session nor vetoes globally.
+				rootStatus.set(root, (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "ambiguous");
 				continue;
 			}
+			rootStatus.set(root, "readable");
 			for (const file of files.filter(item => item.endsWith(".json"))) {
 				const sessionId = path.basename(file, ".json");
-				endpointSessionIds.add(sessionId);
-				if (this.sessions.has(sessionId)) continue;
 				try {
 					const endpoint = readEndpoint(path.join(dir, file));
-					// Skip endpoint files whose owning process is gone or that are
-					// explicitly stale (e.g. a hard-closed session): reconnecting
-					// would chase a dead, token-bearing record forever. Once the
-					// associated topic is past the grace window, reap it through the
-					// same best-effort delete path as graceful session shutdown.
-					const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
-					if (endpoint.stale || (endpoint.pid !== undefined && !pidAlive(endpoint.pid))) {
-						await this.deleteOrphanedTopic(sessionId);
-						continue;
-					}
-					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
-					if (this.closedEndpointKeys.get(sessionId) === endpointKey) continue;
-					this.closedEndpointKeys.delete(sessionId);
-					this.connectSession(sessionId, endpoint.url, endpoint.token);
-				} catch {}
+					mergeEndpointEvidence(evidence, sessionId, classifyEndpointEvidence(endpoint, pidAlive));
+				} catch {
+					mergeEndpointEvidence(evidence, sessionId, { kind: "malformed" });
+				}
 			}
 		}
-		if (allRootsReadable) {
+		return { evidence, rootStatus };
+	}
+
+	/**
+	 * Whether `sessionId` is a legitimate orphan-deletion candidate: no active
+	 * connection and only stale/dead endpoint evidence, or confirmed absence
+	 * from a registered root that is itself confirmed empty (readable) or gone
+	 * (missing/ENOENT). Live/malformed/ambiguous evidence and unknown or
+	 * ambiguous registered roots protect the session (fail closed). This is
+	 * independent of topic age — both grace windows are enforced only at
+	 * reap/delete time, never when (re)creating a candidate.
+	 */
+	private endpointOrphanQualifies(
+		sessionId: string,
+		evidence: Map<string, EndpointEvidence>,
+		rootStatus: Map<string, RootReadStatus>,
+		registeredRoot: string | undefined,
+	): boolean {
+		if (this.sessions.has(sessionId) || !registeredRoot) return false;
+		// The mapped root must itself be confirmed readable or missing. Stale/dead
+		// evidence from another root cannot override ambiguity at the authoritative
+		// root, which may still contain a live endpoint that could not be read.
+		const status = rootStatus.get(registeredRoot);
+		if (status !== "readable" && status !== "missing") return false;
+		const ev = evidence.get(sessionId);
+		return ev === undefined || ev.kind === "stale" || ev.kind === "dead";
+	}
+
+	/**
+	 * Under the forever roots lock, create/refresh/clear per-session orphan
+	 * candidates from the current evidence. A candidate is (re)created only when
+	 * its proof is stale — absent, or invalidated by a re-registration (lease
+	 * changed) or topic recreation (topicId changed) — restarting the grace
+	 * clock. Protected sessions clear any lingering candidate. Eligibility is
+	 * independent of topic age; both grace windows are checked at reap/delete.
+	 */
+	private async maintainOrphanCandidates(
+		evidence: Map<string, EndpointEvidence>,
+		rootStatus: Map<string, RootReadStatus>,
+	): Promise<void> {
+		const paths = daemonPaths(this.opts.settings.getAgentDir());
+		const now = this.runtime.now();
+		await withRootsLock(this.fsImpl, paths.roots, async () => {
+			const view = await readRootsRegistry(this.fsImpl, paths.roots);
+			const raw = view.raw;
+			let mutated = false;
 			for (const sessionId of this.topics.sessionIds()) {
-				if (!this.sessions.has(sessionId) && !endpointSessionIds.has(sessionId))
-					await this.deleteOrphanedTopic(sessionId);
+				const record = this.topics.get(sessionId);
+				if (!record) continue;
+				const registeredRoot = view.sessions.get(sessionId);
+				const qualifies = this.endpointOrphanQualifies(sessionId, evidence, rootStatus, registeredRoot);
+				const lease = view.sessionLeases.get(sessionId);
+				const existing = view.orphanCandidates.get(sessionId);
+				if (!qualifies || !lease) {
+					if (existing) {
+						deleteRawCandidate(raw, sessionId);
+						mutated = true;
+					}
+					continue;
+				}
+				const proofStale = !existing || existing.leaseId !== lease.leaseId || existing.topicId !== record.topicId;
+				if (proofStale) {
+					setRawCandidate(raw, sessionId, {
+						observedAt: now,
+						leaseId: lease.leaseId,
+						topicId: record.topicId,
+					});
+					mutated = true;
+				}
 			}
+			if (mutated) await persistRootsRegistry(this.fsImpl, paths.roots, raw);
+		});
+	}
+
+	/**
+	 * Reap orphan candidates that have survived the candidate grace window. The
+	 * final exact, locked revalidation happens inside {@link deleteOrphanedTopic};
+	 * this pass only selects candidates old enough to consider.
+	 */
+	private async reapReadyOrphanCandidates(): Promise<void> {
+		const paths = daemonPaths(this.opts.settings.getAgentDir());
+		const now = this.runtime.now();
+		const view = await readRootsRegistry(this.fsImpl, paths.roots);
+		for (const [sessionId, candidate] of view.orphanCandidates) {
+			if (now - candidate.observedAt < ORPHAN_TOPIC_GRACE_MS) continue;
+			const record = this.topics.get(sessionId);
+			if (!record || record.topicId !== candidate.topicId) continue;
+			if (!this.topicPastOrphanGrace(sessionId)) continue;
+			await this.deleteOrphanedTopic(sessionId);
 		}
 	}
 
@@ -2058,12 +2469,117 @@ export class TelegramNotificationDaemon {
 
 	private topicPastOrphanGrace(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
-		return record !== undefined && this.runtime.now() - record.createdAt >= ORPHAN_TOPIC_GRACE_MS;
+		if (record === undefined) return false;
+		// Fail-closed at the daemon boundary: a persisted createdAt that is not a
+		// non-negative safe integer must never satisfy orphan deletion grace. The
+		// invalidCreatedAtTopics marker catches values TopicRegistry.load()
+		// normalized to 0 (string/null/undefined/…); the record check catches
+		// values the registry carried verbatim (negative/fractional/unsafe int).
+		if (this.invalidCreatedAtTopics.has(sessionId)) return false;
+		if (!isNonNegativeSafeInteger(record.createdAt)) return false;
+		return this.runtime.now() - record.createdAt >= ORPHAN_TOPIC_GRACE_MS;
 	}
 
+	/**
+	 * Final orphan-topic delete transaction. Runs entirely under the forever
+	 * roots lock (held across the remote Telegram call) so an in-flight deletion
+	 * cannot race a fresh registration or endpoint publication. It
+	 * fresh-reinventories the target endpoint evidence under the lock (not just
+	 * the in-memory sessions map), revalidates the candidate/lease/both grace
+	 * windows, and only on a literal Telegram `{ok:true}` PLUS successful local
+	 * topic persistence forgets in memory and selectively compacts the registry.
+	 */
 	private async deleteOrphanedTopic(sessionId: string): Promise<void> {
-		if (!this.topicPastOrphanGrace(sessionId)) return;
-		await this.deleteTopic(sessionId);
+		const record = this.topics.get(sessionId);
+		if (!record) return;
+		const paths = daemonPaths(this.opts.settings.getAgentDir());
+		await withRootsLock(this.fsImpl, paths.roots, async () => {
+			const view = await readRootsRegistry(this.fsImpl, paths.roots);
+			const raw = view.raw;
+
+			// Fresh target endpoint evidence under the forever lock — do not rely
+			// only on the in-memory sessions map. A revived session resets its
+			// stale candidate; indeterminate evidence fails closed.
+			const { evidence, rootStatus } = await this.collectEndpointEvidence(view.roots);
+			const connected = this.sessions.has(sessionId);
+			const freshEv = evidence.get(sessionId);
+			if (connected || (freshEv !== undefined && freshEv.kind === "live")) {
+				if (deleteRawCandidate(raw, sessionId)) await persistRootsRegistry(this.fsImpl, paths.roots, raw);
+				return;
+			}
+			const registeredRoot = view.sessions.get(sessionId);
+			if (!this.endpointOrphanQualifies(sessionId, evidence, rootStatus, registeredRoot)) return;
+
+			// Deletion authority: candidate + live lease + both grace windows must agree.
+			const lease = view.sessionLeases.get(sessionId);
+			const candidate = view.orphanCandidates.get(sessionId);
+			if (!lease || !candidate) return;
+			if (candidate.leaseId !== lease.leaseId) return;
+			if (candidate.topicId !== record.topicId) return;
+			const current = this.topics.get(sessionId);
+			if (!current || current.topicId !== record.topicId) return;
+			if (this.runtime.now() - candidate.observedAt < ORPHAN_TOPIC_GRACE_MS) return;
+			if (!this.topicPastOrphanGrace(sessionId)) return;
+
+			let res: { ok?: boolean } | undefined;
+			try {
+				const removed = this.pool.removeWhere(item => item.sessionId === sessionId);
+				for (const item of removed) {
+					if (item.payload.selectedAck)
+						this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
+				}
+				await this.flushPool();
+				res = (await this.botApi.call("deleteForumTopic", {
+					chat_id: this.opts.chatId,
+					message_thread_id: Number(record.topicId),
+				})) as { ok?: boolean };
+			} catch {
+				return;
+			}
+			// Literal {ok:true} is required; ambiguous responses never compact.
+			if (res?.ok !== true) return;
+
+			// Local topic persistence MUST succeed before registry compaction and
+			// before mutating live state: a prospective snapshot is persisted first,
+			// and only on success do we forget in memory and compact. A failure
+			// retains the in-memory topic and all registry evidence for retry.
+			try {
+				await this.persistTopicsExcluding(sessionId);
+			} catch (err) {
+				logger.warn(
+					`notifications: topic persistence failed before orphan compact for ${sessionId}: ${String(err)}`,
+				);
+				return;
+			}
+			this.forgetTopicLocally(sessionId);
+
+			// Selective compaction: remove this session's candidate, lease, and
+			// mapping. Remove the registered root only when it is confirmed gone
+			// (ENOENT) and no remaining recognizable session mapping references it.
+			deleteRawCandidate(raw, sessionId);
+			deleteRawLease(raw, sessionId);
+			const compactedRoot = deleteRawSessionMapping(raw, sessionId) ? registeredRoot : undefined;
+			if (compactedRoot && rootStatus.get(compactedRoot) === "missing" && !rawRootReferenced(raw, compactedRoot)) {
+				removeRawRoot(raw, compactedRoot);
+			}
+			try {
+				await persistRootsRegistry(this.fsImpl, paths.roots, raw);
+			} catch (err) {
+				logger.warn(`notifications: failed to compact orphan registry for ${sessionId}: ${String(err)}`);
+			}
+		});
+	}
+
+	private forgetTopicLocally(sessionId: string): void {
+		this.topics.delete(sessionId);
+		this.invalidCreatedAtTopics.delete(sessionId);
+		for (const k of [...this.liveMessages.keys()]) {
+			if (k.startsWith(`${sessionId}:`)) this.liveMessages.delete(k);
+		}
+		this.topicOwnerByIdentity.forEach((ownerSessionId, identityKey) => {
+			if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
+		});
+		this.pendingThreadedFrames.delete(sessionId);
 	}
 
 	/** Best-effort delete of a session topic once its local notification endpoint shuts down. */
@@ -2083,16 +2599,19 @@ export class TelegramNotificationDaemon {
 				chat_id: this.opts.chatId,
 				message_thread_id: Number(record.topicId),
 			})) as { ok?: boolean };
-			if (res?.ok === false) return;
-			this.topics.delete(sessionId);
-			for (const k of [...this.liveMessages.keys()]) {
-				if (k.startsWith(`${sessionId}:`)) this.liveMessages.delete(k);
+			// Exact-success: only literal {ok:true} authorizes local forgetting.
+			if (res?.ok !== true) return;
+			// Persist a prospective topic snapshot BEFORE mutating live state; a
+			// persistence failure retains the in-memory topic for a later retry.
+			try {
+				await this.persistTopicsExcluding(sessionId);
+			} catch (err) {
+				logger.warn(
+					`notifications: topic persistence failed before graceful forget for ${sessionId}: ${String(err)}`,
+				);
+				return;
 			}
-			this.topicOwnerByIdentity.forEach((ownerSessionId, identityKey) => {
-				if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
-			});
-			this.pendingThreadedFrames.delete(sessionId);
-			await this.persistTopics();
+			this.forgetTopicLocally(sessionId);
 		} catch {
 			// Best-effort: missing Telegram topic permissions must not stop teardown.
 		}
@@ -2108,9 +2627,51 @@ export class TelegramNotificationDaemon {
 		return pending;
 	}
 
+	/**
+	 * Persist a prospective topic-registry snapshot that excludes `sessionId`,
+	 * through the same serialization queue as {@link persistTopics}. The snapshot
+	 * is captured at queue-execution time, and callers MUST only mutate live
+	 * topic state after this resolves — so a persistence failure leaves both the
+	 * in-memory registry and the on-disk file unchanged (nothing is forgotten).
+	 */
+	private persistTopicsExcluding(sessionId: string): Promise<void> {
+		const pending = this.topicsPersistQueue.then(async () => {
+			const snapshot = this.topics.serialize();
+			const prospective: TopicRegistryState = { topics: { ...snapshot.topics } };
+			delete prospective.topics[sessionId];
+			const paths = daemonPaths(this.opts.settings.getAgentDir());
+			await ensureDir(this.fsImpl, paths.dir);
+			await writeJsonAtomic(this.fsImpl, path.join(paths.dir, "telegram-topics.json"), prospective);
+		});
+		this.topicsPersistQueue = pending.catch(() => undefined);
+		return pending;
+	}
+
 	async loadTopics(): Promise<void> {
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
 		const raw = await readJson<TopicRegistryState>(this.fsImpl, path.join(paths.dir, "telegram-topics.json"));
+		// Rebuild the daemon-owned set of sessions whose raw persisted topic
+		// createdAt is not a non-negative safe integer. TopicRegistry.load()
+		// normalizes a non-number createdAt to 0 — which would otherwise satisfy
+		// orphan grace and authorize a destructive delete — so the daemon
+		// remembers these sessions and fail-closes them in topicPastOrphanGrace
+		// for the lifetime of their topic. (Negative, fractional, and unsafe
+		// integers pass the registry's typeof check and are carried verbatim, so
+		// they are caught here too.) The set is cleared/rebuilt on every load so
+		// a legitimate forget followed by a fresh lifecycle is never poisoned.
+		this.invalidCreatedAtTopics.clear();
+		const rawTopics = raw && typeof raw === "object" ? (raw as TopicRegistryState).topics : undefined;
+		if (rawTopics && typeof rawTopics === "object") {
+			for (const [sessionId, topic] of Object.entries(rawTopics)) {
+				if (
+					topic &&
+					typeof topic === "object" &&
+					!isNonNegativeSafeInteger((topic as { createdAt?: unknown }).createdAt)
+				) {
+					this.invalidCreatedAtTopics.add(sessionId);
+				}
+			}
+		}
 		// Restore the full serialized registry (topicId + identitySent + name) so a
 		// fresh daemon after reload does not resend identity headers or lose renames.
 		if (raw && typeof raw === "object") this.topics.load(raw);
