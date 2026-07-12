@@ -2004,7 +2004,7 @@ describe("Coordinator MCP server protocol", () => {
 				env: {
 					GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
-					GJC_COORDINATOR_MCP_RUNTIME_READINESS_TIMEOUT_MS: "1000",
+					GJC_COORDINATOR_MCP_RUNTIME_READINESS_TIMEOUT_MS: "30000",
 					GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
 					GJC_COORDINATOR_MCP_PROFILE: "local",
 					GJC_COORDINATOR_MCP_REPO: winner,
@@ -2046,6 +2046,21 @@ describe("Coordinator MCP server protocol", () => {
 			const active = JSON.parse(await Bun.file(activeFile).text()) as { turn_id: string };
 			if (winner === "runtime") {
 				const sessionStateFile = path.join(stateRoot, "local", winner, "session-states", `${sessionId}.json`);
+				// The coordinator's prepareActiveTurn writes a "booting" session-state for THIS turn as its
+				// last write before awaiting readiness. Wait for that specific write (matched by current_turn_id)
+				// so the terminal state injected below is the final writer and cannot be clobbered by it.
+				await waitForCondition(async () => {
+					if (!(await Bun.file(sessionStateFile).exists())) return false;
+					try {
+						const booting = JSON.parse(await Bun.file(sessionStateFile).text()) as {
+							state?: string;
+							current_turn_id?: string | null;
+						};
+						return booting.state === "booting" && booting.current_turn_id === active.turn_id;
+					} catch {
+						return false;
+					}
+				});
 				await Bun.write(
 					sessionStateFile,
 					JSON.stringify({
@@ -2072,6 +2087,8 @@ describe("Coordinator MCP server protocol", () => {
 			}
 			let terminal: Record<string, unknown> | null = null;
 			const expectedStatus = winner === "runtime" ? "completed" : "failed";
+			// Terminalization is authoritative and observed here; keep this observation budget well below
+			// the it() timeout (20_000) so it can never collide with the readiness timeout (30_000) above.
 			await waitForCondition(async () => {
 				terminal = await server.callTool("gjc_coordinator_read_turn", {
 					session_id: sessionId,
@@ -2080,13 +2097,13 @@ describe("Coordinator MCP server protocol", () => {
 				return (
 					terminal.ok === true && (terminal.turn as { status?: string } | undefined)?.status === expectedStatus
 				);
-			});
+			}, 5_000);
 			expect(terminal).toMatchObject({ ok: true, turn: { status: expectedStatus } });
 			await writeReadyMarker(launch);
 			await sending;
 			expect(commands).toEqual([]);
 		}
-	});
+	}, 20_000);
 
 	it("fails closed for unverified origins and trusts only strict legacy registration", async () => {
 		const root = await tempRoot();
