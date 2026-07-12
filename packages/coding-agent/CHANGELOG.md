@@ -43,6 +43,9 @@
 - `NotificationServer#pushFrame` now rejects `ActionNeeded` frames; emit asks and idle notifications through `registerAsk` / `noteIdle` so controlled asks remain capability-gated per connection (#2029).
 - A rolling/in-place upgrade that left a still-live pre-upgrade Telegram daemon owning the lock is now reloaded instead of silently attached. The old daemon speaks the pre-#1999 wire protocol without ask-ack/controls, so its `Selected!` acknowledgements were dropped; an operational `DAEMON_GENERATION` (tied to `NOTIFICATION_PROTOCOL_VERSION`) now flags a fresh live owner running an older generation as reload-required, and the new host registers its session root then hands off through the cooperative SIGTERM/control path (#2028).
 - A numeric gate reply is an option index: an out-of-range index is no longer accepted as free-text `Other`. `mapAnswerToGate` returns a discriminated result and the unattended handler closes the exact claim/receipt and reissues instead of durably accepting or emitting a `Selected!` ack; the JSON-string free-text path is preserved (#2030).
+### Added
+
+- Added an explicit `GJC_TELEGRAM_FORUM_OWNER_USER_ID` opt-in for pairing notifications with an already-configured Telegram forum supergroup. Topic delivery is enabled only when Bot API confirms `type=supergroup` and `is_forum=true`, and every inbound message or callback must come from the configured owner id; the default private-chat-only fail-closed behavior is unchanged.
 
 ## [0.9.6] - 2026-07-10
 ### Changed

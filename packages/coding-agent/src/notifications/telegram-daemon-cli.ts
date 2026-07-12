@@ -213,6 +213,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		rich: cfg.rich,
 		richDraft: cfg.richDraft,
 		topics: cfg.topics,
+		forumSupergroupOwnerId: process.env.GJC_TELEGRAM_FORUM_OWNER_USER_ID?.trim() || undefined,
 		pid: deps.processPid ?? process.pid,
 		control: {
 			shouldStop: async owner => {

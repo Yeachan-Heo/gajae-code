@@ -2227,6 +2227,72 @@ test("forum lifecycle commands fail closed even when addressed to this bot usern
 	expect(bot.calls.filter(c => c.method === "getChat")).toHaveLength(0);
 });
 
+test("explicit forum-supergroup opt-in creates topics and accepts only the configured owner", async () => {
+	FakeWs.instances = [];
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { id: body.chat_id, type: "supergroup", is_forum: true } };
+		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 7001 } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "-10042",
+		botApi: bot,
+		forumSupergroupOwnerId: "99",
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("S", "ws://s", "ts");
+	const session = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+	expect(bot.calls.find(c => c.method === "createForumTopic")?.body).toEqual({ chat_id: "-10042", name: "r/b" });
+
+	await daemon.handleTelegramUpdate({
+		update_id: 301,
+		message: {
+			from: { id: 100 },
+			chat: { id: -10042, type: "supergroup" },
+			message_thread_id: 7001,
+			message_id: 11,
+			text: "intruder",
+		},
+	});
+	expect(FakeWs.instances[0]!.sent).toHaveLength(0);
+
+	await daemon.handleTelegramUpdate({
+		update_id: 302,
+		callback_query: {
+			id: "intruder-callback",
+			from: { id: 100 },
+			message: { chat: { id: -10042, type: "supergroup" }, message_thread_id: 7001 },
+			data: "gjc:unknown",
+		},
+	});
+	expect(bot.calls.filter(c => c.method === "answerCallbackQuery")).toHaveLength(0);
+	expect(FakeWs.instances[0]!.sent).toHaveLength(0);
+
+	await daemon.handleTelegramUpdate({
+		update_id: 303,
+		message: {
+			from: { id: 99 },
+			chat: { id: -10042, type: "supergroup" },
+			message_thread_id: 7001,
+			message_id: 12,
+			text: "owner turn",
+		},
+	});
+	expect(FakeWs.instances[0]!.sent).toHaveLength(1);
+	expect(JSON.parse(FakeWs.instances[0]!.sent[0]!)).toMatchObject({
+		type: "user_message",
+		sessionId: "S",
+		text: "owner turn",
+	});
+});
+
 test("forum lifecycle commands fail closed when bot username is unavailable", async () => {
 	const bot = new FakeBotApi();
 	const daemon = new TelegramNotificationDaemon({
