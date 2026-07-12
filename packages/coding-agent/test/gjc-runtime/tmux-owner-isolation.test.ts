@@ -297,6 +297,19 @@ describe("tmux owner isolation", () => {
 			}).classification,
 		).toBe("safe");
 		expect(
+			classifyCgroup({
+				platform: "linux",
+				cgroupText: [
+					"13:blkio:/system.slice/sshd.service",
+					"11:memory:/user.slice/user-1000.slice/session-169114.scope",
+					"10:pids:/user.slice/user-1000.slice/session-169114.scope",
+				].join("\n"),
+			}),
+		).toEqual({
+			classification: "safe",
+			scope: "/user.slice/user-1000.slice/session-169114.scope",
+		});
+		expect(
 			(
 				await planTmuxOwnerIsolation(request, {
 					...probe("safe"),

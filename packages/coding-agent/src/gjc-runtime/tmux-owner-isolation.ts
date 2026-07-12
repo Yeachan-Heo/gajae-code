@@ -77,6 +77,8 @@ export function classifyCgroup(input: { platform: NodeJS.Platform; cgroupText?: 
 			classification: "unverifiable",
 			diagnostic: "cgroup_metadata_malformed",
 		};
+	const scope = paths.find(value => /(?:^|\/)(?:user|session|app|init|gjc)[^/]*\.scope(?:\/|$)/.test(value));
+	if (scope) return { classification: "safe", scope };
 	const hasUnrelatedService = paths.some(value =>
 		value.split("/").some(component => component.endsWith(".service") && !/^user@\d+\.service$/.test(component)),
 	);
@@ -85,8 +87,6 @@ export function classifyCgroup(input: { platform: NodeJS.Platform; cgroupText?: 
 			classification: "unsafe_service",
 			diagnostic: "service_cgroup_inheritance",
 		};
-	const scope = paths.find(value => /(?:^|\/)(?:user|session|app|init|gjc)[^/]*\.scope(?:\/|$)/.test(value));
-	if (scope) return { classification: "safe", scope };
 	if (paths.every(value => value === "/")) return { classification: "safe", scope: "/" };
 	return {
 		classification: "unverifiable",
