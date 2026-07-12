@@ -6,6 +6,9 @@
 
 - Added an owner-proof idle session reaper and `gjc_coordinator_stop_session` for ephemeral (delegate-created) coordinator sessions. Termination goes exclusively through the owner-proof `forceCloseGjcTmuxSession` path (pid, native session id, owner generation, server key, and start time all verified before SIGTERM) — never a raw `process.kill`. The reaper binds each close to the persisted runtime-state file, re-validates ephemeral and no-active-turn at kill time under the same per-session mutation lock as delegate reuse, and purges state only on verified termination (#2080).
 
+### Fixed
+
+- The coordinator MCP now re-nudges the runtime's prompt submit while a delivered turn is still unacknowledged. `--worktree` (and other TUI) runtimes can attest interactive input readiness a moment before their composer actually accepts a submit, so the single delivery `Enter` was dropped and the pasted prompt sat unsent — `tmux_keys_sent` yet never acknowledged, which failed the turn at the ack timeout (a read-only `gjc_coordinator_start_session` review would stall until the timeout and never run). Each `read_turn`/`await_turn` reconcile now re-sends only `Enter` (owner-proof gated; no re-paste so the prompt is never duplicated, no `Escape` so a turn that just started is never interrupted) while the turn is delivered-but-unacknowledged, so the prompt submits the moment the composer goes live; the ack timeout still fails a runtime that truly never comes up.
 ## [0.10.0] - 2026-07-12
 
 ### Added

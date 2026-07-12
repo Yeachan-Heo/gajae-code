@@ -2316,7 +2316,11 @@ async function reconcileRuntimeAcknowledgement(
 	turn: TurnRecord,
 	sessionState: CoordinatorSessionState | null,
 	ackTimeoutMs: number,
-	options: { failOnTimeout: boolean } = { failOnTimeout: true },
+	options: {
+		failOnTimeout: boolean;
+		runner?: CommandRunner;
+		ownerIsolationProbe?: OwnerIsolationProbe;
+	} = { failOnTimeout: true },
 ): Promise<TurnRecord> {
 	const session = asRecord(await readJsonFile(path.join(namespaceDir, "sessions", `${turn.session_id}.json`)));
 	if (
@@ -2330,6 +2334,16 @@ async function reconcileRuntimeAcknowledgement(
 	}
 	if (sessionState && runtimeStateAcknowledgesTurn(turn, sessionState)) {
 		return await markTurnAcknowledgedFromRuntimeState(namespaceDir, turn, sessionState);
+	}
+	if (
+		options.runner &&
+		session &&
+		turn.delivery.tmux_keys_sent === true &&
+		turn.delivery.prompt_acknowledged !== true &&
+		turn.delivery.state === "tmux_keys_sent" &&
+		ACTIVE_TURN_STATUSES.has(turn.status)
+	) {
+		await nudgeTmuxPromptSubmit(session, options.runner, options.ownerIsolationProbe);
 	}
 	if (options.failOnTimeout && turnAwaitingRuntimeAckExpired(turn, Date.now(), ackTimeoutMs)) {
 		return await markTurnFailedForUnacknowledgedDelivery(namespaceDir, turn, ackTimeoutMs);
@@ -2971,12 +2985,11 @@ async function captureTmuxTail(
 	return captured.stdout.split("\n").slice(-lines);
 }
 
-async function sendTmuxPrompt(
+async function resolveOwnerProvenTmuxPane(
 	session: Record<string, unknown>,
-	prompt: string,
-	runner: CommandRunner = runCommand,
+	runner: CommandRunner,
 	ownerIsolationProbe?: OwnerIsolationProbe,
-): Promise<boolean> {
+): Promise<{ paneId: string; socketKey: string; proveCurrentServer: () => Promise<boolean> } | null> {
 	const target = typeof session.tmux_target === "string" ? session.tmux_target : session.tmuxTarget;
 	const socketKey = typeof session.tmux_socket_key === "string" ? session.tmux_socket_key : session.tmuxSocketKey;
 	const serverKey =
@@ -2993,9 +3006,9 @@ async function sendTmuxPrompt(
 		typeof startTime !== "string" ||
 		startTime.length === 0
 	)
-		return false;
+		return null;
 	const paneId = session.pane_id ?? session.paneId;
-	if (typeof paneId !== "string" || !(await proveImmutableTmuxTarget(session, runner))) return false;
+	if (typeof paneId !== "string" || !(await proveImmutableTmuxTarget(session, runner))) return null;
 	const probe = ownerIsolationProbe ?? (await coordinatorOwnerIsolationProbe(runner));
 	const proveCurrentServer = async (): Promise<boolean> => {
 		const proof = await probe.probeServer(socketKey);
@@ -3006,7 +3019,36 @@ async function sendTmuxPrompt(
 			(process.platform !== "linux" || proof.cgroup?.classification === "safe")
 		);
 	};
-	return await sendTmuxPromptKeys(paneId, prompt, runner, socketKey, proveCurrentServer);
+	return { paneId, socketKey, proveCurrentServer };
+}
+
+async function sendTmuxPrompt(
+	session: Record<string, unknown>,
+	prompt: string,
+	runner: CommandRunner = runCommand,
+	ownerIsolationProbe?: OwnerIsolationProbe,
+): Promise<boolean> {
+	const resolved = await resolveOwnerProvenTmuxPane(session, runner, ownerIsolationProbe);
+	if (!resolved) return false;
+	return await sendTmuxPromptKeys(resolved.paneId, prompt, runner, resolved.socketKey, resolved.proveCurrentServer);
+}
+
+async function nudgeTmuxPromptSubmit(
+	session: Record<string, unknown>,
+	runner: CommandRunner = runCommand,
+	ownerIsolationProbe?: OwnerIsolationProbe,
+): Promise<boolean> {
+	// Re-submit an already-delivered-but-unacknowledged prompt. The prompt text is already pasted
+	// into the composer by the initial sendTmuxPrompt, but the runtime's TUI can attest input
+	// readiness before its composer actually accepts a submit, so that first Enter is dropped and
+	// the prompt sits unsent (tmux_keys_sent yet never acknowledged → the turn fails at the ack
+	// timeout). Re-send ONLY Enter — no re-paste (would duplicate the prompt), no Escape (could
+	// interrupt a turn that just started) — so the pasted prompt submits once the composer is live.
+	const resolved = await resolveOwnerProvenTmuxPane(session, runner, ownerIsolationProbe);
+	if (!resolved) return false;
+	if (!(await resolved.proveCurrentServer())) return false;
+	const submitted = await runner(["tmux", "-L", resolved.socketKey, "send-keys", "-t", resolved.paneId, "Enter"]);
+	return submitted.exitCode === 0;
 }
 
 async function hasTmuxSession(
@@ -3729,6 +3771,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					: currentState;
 			return await reconcileRuntimeAcknowledgement(namespaceDir, current, state, promptAckTimeoutMs, {
 				failOnTimeout,
+				runner: commandRunner,
+				ownerIsolationProbe: services.ownerIsolationProbe,
 			});
 		});
 	}

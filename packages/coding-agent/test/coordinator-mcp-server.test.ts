@@ -606,6 +606,72 @@ describe("Coordinator MCP server protocol", () => {
 		expect(commands.at(-1)).toEqual(["tmux", "-L", PRIVATE_SOCKET, "send-keys", "-t", "%24", "Enter"]);
 	});
 
+	it("re-nudges Enter on reconcile when a delivered prompt is not yet acknowledged", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "renudge-delivery");
+		const commands: string[][] = [];
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+				// Long enough that read_turn's reconcile does not fail the turn — it stays active while awaiting ack.
+				GJC_COORDINATOR_MCP_PROMPT_ACK_TIMEOUT_MS: "60000",
+			},
+			services: {
+				ownerIsolationProbe: privateOwnerProbe(),
+				commandRunner: async command => {
+					commands.push(command);
+					if (tmuxSubcommand(command) === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (tmuxSubcommand(command) === "display-message")
+						return { exitCode: 0, stdout: tmuxIdentity(command), stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
+					if (tmuxSubcommand(command) === "capture-pane") return { exitCode: 0, stdout: "idle\n", stderr: "" };
+					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+				},
+			},
+		});
+
+		await server.callTool("gjc_coordinator_register_session", {
+			session_id: "visible-session",
+			cwd: root,
+			tmux_session: "visible-session",
+			tmux_target: "visible-session:0.0",
+			visible: true,
+			allow_mutation: true,
+		});
+		await persistPrivateOwnerProof(stateRoot, "visible-session");
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "do work",
+			allow_mutation: true,
+		});
+		expect(sent.delivery).toMatchObject({
+			tmux_keys_sent: true,
+			prompt_acknowledged: false,
+			state: "tmux_keys_sent",
+		});
+
+		const enterCommand = ["tmux", "-L", PRIVATE_SOCKET, "send-keys", "-t", "%24", "Enter"];
+		const enters = () => commands.filter(command => JSON.stringify(command) === JSON.stringify(enterCommand)).length;
+		// The initial delivery submitted exactly one Escape+Enter.
+		expect(enters()).toBe(1);
+
+		// The runtime never acknowledged: its TUI composer can lag behind the readiness marker, so the
+		// delivery Enter was dropped and the prompt sits unsent. A read_turn reconcile must re-nudge Enter
+		// to resubmit — without failing the still-active turn.
+		const read = await server.callTool("gjc_coordinator_read_turn", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+		});
+		expect(read).toMatchObject({
+			ok: true,
+			turn: { status: "active", delivery: { tmux_keys_sent: true, prompt_acknowledged: false } },
+		});
+		expect(enters()).toBeGreaterThan(1);
+	});
 	it("fails tmux-delivered turns that never receive a runtime prompt ack", async () => {
 		const root = await tempRoot();
 		const stateRoot = path.join(root, ".gjc", "state", "unacknowledged-delivery");
