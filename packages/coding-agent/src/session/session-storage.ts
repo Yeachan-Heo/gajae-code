@@ -117,6 +117,14 @@ export interface SessionStorage {
 	readBytesSync?(path: string): Uint8Array;
 	/** Exact bytes and descriptor-bound identity captured from one opened regular file. */
 	readSnapshotSync?(path: string): SessionStorageSnapshot;
+	/**
+	 * Bounded prefix read for strict inventory headers. Opens the file once with
+	 * O_NOFOLLOW and captures descriptor-bound (dev, ino) identity exactly like
+	 * {@link readSnapshotSync}, but reads at most `maxBytes` so a strict inventory
+	 * never loads an entire transcript body. The returned `stat.size` is the real
+	 * file size; `bytes` is the bounded prefix.
+	 */
+	readSnapshotPrefixSync?(path: string, maxBytes: number): SessionStorageSnapshot;
 	statSync(path: string): SessionStorageStat;
 	listFilesSync(dir: string, pattern: string): string[];
 	/**
@@ -141,6 +149,14 @@ export interface SessionStorage {
 	 * for a partial deletion.
 	 */
 	deleteSessionVerified?(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult>;
+	/**
+	 * Portable exclusive same-directory transcript publication. Hard-links the
+	 * staged transcript to its final name (failing with EEXIST if the destination
+	 * already exists — never overwrites or merges) then removes the stage. The
+	 * memory backend provides the atomic equivalent. Used by the fork transaction
+	 * so the transcript is committed only after artifacts are cloned.
+	 */
+	publishTranscriptExclusive?(stagePath: string, finalPath: string): Promise<void>;
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter;
 }
 
@@ -415,6 +431,26 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
+	readSnapshotPrefixSync(fpath: string, maxBytes: number): SessionStorageSnapshot {
+		const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
+		const fd = fs.openSync(fpath, flags);
+		try {
+			const stat = statFromNode(fs.fstatSync(fd, { bigint: true }));
+			if (!stat.isFile) throw new Error(`Not a regular file: ${fpath}`);
+			const length = Math.min(maxBytes, stat.size);
+			const buf = Buffer.alloc(length);
+			let offset = 0;
+			while (offset < length) {
+				const bytesRead = fs.readSync(fd, buf, offset, length - offset, offset);
+				if (bytesRead === 0) break;
+				offset += bytesRead;
+			}
+			return { bytes: buf.subarray(0, offset), stat };
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+
 	statSync(path: string): SessionStorageStat {
 		return statFromNode(fs.statSync(path, { bigint: true }));
 	}
@@ -468,6 +504,26 @@ export class FileSessionStorage implements SessionStorage {
 			fs.renameSync(path, nextPath);
 		} catch (err) {
 			throw toError(err);
+		}
+	}
+
+	/**
+	 * Portable exclusive same-directory publication: hard-link the staged
+	 * transcript to its final name (fails with EEXIST if the destination exists),
+	 * then remove the stage. The link is the atomic commit point; once it
+	 * succeeds the final transcript is authoritative, so a stage-removal failure
+	 * is swallowed (the orphaned stage is harmless temp garbage).
+	 */
+	async publishTranscriptExclusive(stagePath: string, finalPath: string): Promise<void> {
+		fs.linkSync(stagePath, finalPath);
+		try {
+			fs.unlinkSync(stagePath);
+		} catch (err) {
+			if (!isEnoent(err)) {
+				void err;
+				// Publication already committed via the link; only the stage cleanup
+				// failed. Swallow so the transaction reports success.
+			}
 		}
 	}
 
@@ -825,6 +881,13 @@ export class MemorySessionStorage implements SessionStorage {
 		return { bytes: Buffer.from(entry.content), stat: this.#statFor(entry) };
 	}
 
+	readSnapshotPrefixSync(path: string, maxBytes: number): SessionStorageSnapshot {
+		const entry = this.#files.get(path);
+		if (!entry) throw new Error(`File not found: ${path}`);
+		// stat.size reflects the full virtual file; bytes is the bounded prefix.
+		return { bytes: Buffer.from(entry.content.subarray(0, maxBytes)), stat: this.#statFor(entry) };
+	}
+
 	statSync(path: string): SessionStorageStat {
 		const entry = this.#files.get(path);
 		if (!entry) throw new Error(`File not found: ${path}`);
@@ -882,6 +945,22 @@ export class MemorySessionStorage implements SessionStorage {
 		if (!entry) throw new Error(`File not found: ${path}`);
 		this.#files.set(nextPath, entry);
 		this.#files.delete(path);
+	}
+
+	/**
+	 * Atomic in-memory equivalent of exclusive publication: fail if the
+	 * destination exists, otherwise move the staged entry to the final name in
+	 * one logical step (Map set + delete), never overwriting or merging.
+	 */
+	publishTranscriptExclusive(stagePath: string, finalPath: string): Promise<void> {
+		if (this.#files.has(finalPath)) {
+			return Promise.reject(new Error(`Destination already exists: ${finalPath}`));
+		}
+		const entry = this.#files.get(stagePath);
+		if (!entry) return Promise.reject(new Error(`Stage not found: ${stagePath}`));
+		this.#files.set(finalPath, entry);
+		this.#files.delete(stagePath);
+		return Promise.resolve();
 	}
 
 	unlink(path: string): Promise<void> {

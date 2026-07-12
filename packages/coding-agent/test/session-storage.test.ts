@@ -3,7 +3,13 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionManager } from "../src/session/session-manager";
+import { cloneArtifactsExclusive } from "../src/session/artifacts";
+import {
+	readSelectedSessionSnapshot,
+	SessionManager,
+	STRICT_INVENTORY_HEADER_PREFIX_BYTES,
+	type StrictInventoryCandidate,
+} from "../src/session/session-manager";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
@@ -799,5 +805,315 @@ describe("SessionManager.inventorySessionsStrict root inspection failures", () =
 		expect(result.failures).toHaveLength(1);
 		expect(result.failures[0].kind).toBe("scan");
 		expect(result.failures[0].message).not.toContain("EIO");
+	});
+});
+describe("FileSessionStorage.readSnapshotPrefixSync bounded header prefix", () => {
+	let tempDir: string;
+	let storage: FileSessionStorage;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-prefix-read-"));
+		storage = new FileSessionStorage();
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("returns only the bounded byte prefix while preserving full descriptor stat identity", async () => {
+		const payload = "X".repeat(4096);
+		const file = path.join(tempDir, "big.jsonl");
+		await Bun.write(file, payload);
+		const snapshot = storage.readSnapshotPrefixSync(file, 64);
+		// Bounded: only the prefix bytes are materialized, not the whole body.
+		expect(snapshot.bytes.length).toBe(64);
+		expect(new TextDecoder().decode(snapshot.bytes)).toBe(payload.slice(0, 64));
+		// Full stat identity preserved: size is the real file size; dev/ino match a full read.
+		expect(snapshot.stat.size).toBe(payload.length);
+		const full = storage.readSnapshotSync(file);
+		expect(snapshot.stat.dev).toBe(full.stat.dev);
+		expect(snapshot.stat.ino).toBe(full.stat.ino);
+		expect(snapshot.stat.isFile).toBe(true);
+	});
+
+	it("returns the whole file when maxBytes exceeds the real file size", async () => {
+		const payload = "small bounded payload";
+		const file = path.join(tempDir, "small.jsonl");
+		await Bun.write(file, payload);
+		const snapshot = storage.readSnapshotPrefixSync(file, 1 << 20);
+		expect(snapshot.bytes.length).toBe(payload.length);
+		expect(snapshot.stat.size).toBe(payload.length);
+	});
+
+	it("opens with O_NOFOLLOW so a symlinked path fails closed (ELOOP/SYMLINK)", async () => {
+		const real = path.join(tempDir, "real.jsonl");
+		const link = path.join(tempDir, "link.jsonl");
+		await Bun.write(real, "payload");
+		await fsp.symlink(real, link);
+		let err: unknown;
+		try {
+			storage.readSnapshotPrefixSync(link, 64);
+			throw new Error("expected readSnapshotPrefixSync to throw");
+		} catch (e) {
+			err = e;
+		}
+		// The sync O_NOFOLLOW open surfaces the symlink rejection (ELOOP on macOS/Linux).
+		expect(err).toBeInstanceOf(Error);
+		expect((err as NodeJS.ErrnoException)?.code).toMatch(/ELOOP|SYMLINK/);
+	});
+});
+
+describe("MemorySessionStorage.readSnapshotPrefixSync bounded header prefix", () => {
+	it("returns the bounded prefix while reporting the full virtual file size and identity", () => {
+		const storage = new MemorySessionStorage();
+		const payload = "Y".repeat(2048);
+		storage.writeTextSync("/sessions/big.jsonl", payload);
+		const snapshot = storage.readSnapshotPrefixSync("/sessions/big.jsonl", 32);
+		expect(snapshot.bytes.length).toBe(32);
+		// stat.size is the full virtual file; bytes is the bounded prefix.
+		expect(snapshot.stat.size).toBe(payload.length);
+		const full = storage.readSnapshotSync("/sessions/big.jsonl");
+		expect(snapshot.stat.ino).toBe(full.stat.ino);
+	});
+});
+
+describe("SessionManager.inventorySessionsStrict missing-newline header rejection", () => {
+	let tempDir: string;
+	let storage: FileSessionStorage;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-strict-nl-"));
+		storage = new FileSessionStorage();
+	});
+
+	afterEach(async () => {
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("flags a header missing its terminating newline within the bounded prefix (zero authority)", async () => {
+		// A valid session header object but with NO trailing newline: the strict
+		// inventory cannot bound the header within its prefix and must fail closed.
+		const file = path.join(tempDir, "no-newline.jsonl");
+		await Bun.write(file, JSON.stringify({ type: "session", id: "no-nl", cwd: tempDir }));
+		const result = SessionManager.inventorySessionsStrict(tempDir, { sessionDir: tempDir, storage });
+		expect(result.kind).toBe("failure");
+		// Zero authority: a failure grants no candidate set at all.
+		expect(result).not.toHaveProperty("candidates");
+		if (result.kind !== "failure") throw new Error("unreachable");
+		expect(result.failures).toEqual([expect.objectContaining({ kind: "parse", path: file })]);
+		expect(result.failures[0]!.message).toMatch(/terminating newline/);
+		// The transcript is untouched — the inventory never mutates.
+		expect(fs.existsSync(file)).toBe(true);
+	});
+
+	it("flags an overlong header whose first newline lies beyond the bounded prefix", async () => {
+		// First line exceeds the 1 MiB inventory prefix: no terminating newline is
+		// observable within the bounded read, so the header cannot be bounded.
+		const file = path.join(tempDir, "overlong.jsonl");
+		const overlong = `{ "type": "session", "id": "overlong", "cwd": ${JSON.stringify(tempDir)}, "pad": "${"z".repeat(STRICT_INVENTORY_HEADER_PREFIX_BYTES + 64)}"}`;
+		await Bun.write(file, overlong);
+		const result = SessionManager.inventorySessionsStrict(tempDir, { sessionDir: tempDir, storage });
+		expect(result.kind).toBe("failure");
+		expect(result).not.toHaveProperty("candidates");
+		if (result.kind !== "failure") throw new Error("unreachable");
+		expect(result.failures[0]!.kind).toBe("parse");
+		expect(result.failures[0]!.message).toMatch(/terminating newline/);
+	});
+});
+
+describe("FileSessionStorage.publishTranscriptExclusive exclusive publication", () => {
+	let tempDir: string;
+	let storage: FileSessionStorage;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-publish-"));
+		storage = new FileSessionStorage();
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("fails without clobbering a pre-existing destination (destination + stage untouched)", async () => {
+		const stage = path.join(tempDir, ".stage.jsonl");
+		const dest = path.join(tempDir, "final.jsonl");
+		await Bun.write(stage, "stage payload");
+		await Bun.write(dest, "pre-existing destination bytes");
+		// linkSync to an existing destination fails with EEXIST — never overwrites.
+		await expect(storage.publishTranscriptExclusive(stage, dest)).rejects.toThrow();
+		// Destination bytes are unchanged; the stage survives for caller cleanup.
+		expect(await Bun.file(dest).text()).toBe("pre-existing destination bytes");
+		expect(fs.existsSync(stage)).toBe(true);
+		expect(await Bun.file(stage).text()).toBe("stage payload");
+	});
+
+	it("commits by linking the stage to the final name and then removing the stage", async () => {
+		const stage = path.join(tempDir, ".stage2.jsonl");
+		const dest = path.join(tempDir, "final2.jsonl");
+		await Bun.write(stage, "committed payload");
+		await storage.publishTranscriptExclusive(stage, dest);
+		expect(fs.existsSync(stage)).toBe(false);
+		expect(await Bun.file(dest).text()).toBe("committed payload");
+	});
+});
+
+describe("MemorySessionStorage.publishTranscriptExclusive exclusive publication", () => {
+	it("rejects without overwriting or merging a pre-existing destination", async () => {
+		const storage = new MemorySessionStorage();
+		storage.writeTextSync("/sessions/.stage.jsonl", "stage payload");
+		storage.writeTextSync("/sessions/final.jsonl", "destination sentinel");
+		await expect(
+			storage.publishTranscriptExclusive("/sessions/.stage.jsonl", "/sessions/final.jsonl"),
+		).rejects.toThrow(/Destination already exists/);
+		// Destination content unchanged; stage retained.
+		expect(storage.readTextSync("/sessions/final.jsonl")).toBe("destination sentinel");
+		expect(storage.existsSync("/sessions/.stage.jsonl")).toBe(true);
+	});
+
+	it("moves the stage to the final name atomically when the destination is new", async () => {
+		const storage = new MemorySessionStorage();
+		storage.writeTextSync("/sessions/.stage.jsonl", "moved payload");
+		await storage.publishTranscriptExclusive("/sessions/.stage.jsonl", "/sessions/final.jsonl");
+		expect(storage.existsSync("/sessions/.stage.jsonl")).toBe(false);
+		expect(storage.readTextSync("/sessions/final.jsonl")).toBe("moved payload");
+	});
+});
+
+describe("cloneArtifactsExclusive transactional artifact clone", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-clone-"));
+	});
+
+	afterEach(async () => {
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("refuses a pre-existing destination without mutating source or destination", async () => {
+		const source = path.join(tempDir, "src");
+		const dest = path.join(tempDir, "dst");
+		await fsp.mkdir(source, { recursive: true });
+		await Bun.write(path.join(source, "a.txt"), "a");
+		await fsp.mkdir(dest, { recursive: true });
+		await Bun.write(path.join(dest, "existing"), "destination sentinel");
+		await expect(cloneArtifactsExclusive(source, dest)).rejects.toThrow(/already exists/);
+		// Neither source nor destination is touched.
+		expect(await Bun.file(path.join(dest, "existing")).text()).toBe("destination sentinel");
+		expect(await Bun.file(path.join(source, "a.txt")).text()).toBe("a");
+	});
+
+	it("succeeds as a no-op when the source is absent (no destination created)", async () => {
+		const dest = path.join(tempDir, "absent-dst");
+		expect(await cloneArtifactsExclusive(path.join(tempDir, "missing"), dest)).toBe(false);
+		expect(fs.existsSync(dest)).toBe(false);
+	});
+
+	it("rejects a pre-existing destination even when the source is absent", async () => {
+		const dest = path.join(tempDir, "existing-absent-dst");
+		await fsp.mkdir(dest, { recursive: false });
+		await Bun.write(path.join(dest, "sentinel.txt"), "sentinel");
+
+		await expect(cloneArtifactsExclusive(path.join(tempDir, "missing"), dest)).rejects.toThrow(/already exists/);
+		expect(await Bun.file(path.join(dest, "sentinel.txt")).text()).toBe("sentinel");
+	});
+
+	it("removes the transaction-owned destination on an injected special (symlink) entry", async () => {
+		const source = path.join(tempDir, "src");
+		const dest = path.join(tempDir, "dst");
+		await fsp.mkdir(source, { recursive: true });
+		await Bun.write(path.join(source, "regular.txt"), "regular");
+		// A symlink inside the source: special entries are refused mid-clone.
+		const target = path.join(tempDir, "link-target");
+		await Bun.write(target, "target");
+		await fsp.symlink(target, path.join(source, "evil-link"));
+		await expect(cloneArtifactsExclusive(source, dest)).rejects.toThrow(/non-regular artifact entry/);
+		// The transaction-owned destination is removed; the source (incl. symlink) is untouched.
+		expect(fs.existsSync(dest)).toBe(false);
+		expect(await Bun.file(path.join(source, "regular.txt")).text()).toBe("regular");
+		expect(fs.lstatSync(path.join(source, "evil-link")).isSymbolicLink()).toBe(true);
+	});
+
+	it("rejects a symlinked artifact root without creating a destination", async () => {
+		const actualSource = path.join(tempDir, "actual-src");
+		const sourceLink = path.join(tempDir, "src-link");
+		const dest = path.join(tempDir, "dst");
+		await fsp.mkdir(actualSource, { recursive: true });
+		await Bun.write(path.join(actualSource, "secret.txt"), "secret");
+		await fsp.symlink(actualSource, sourceLink);
+
+		await expect(cloneArtifactsExclusive(sourceLink, dest)).rejects.toThrow(/not a regular directory/);
+		expect(fs.existsSync(dest)).toBe(false);
+		expect(await Bun.file(path.join(actualSource, "secret.txt")).text()).toBe("secret");
+	});
+
+	it("clones regular files and nested directories exclusively into a new destination", async () => {
+		const source = path.join(tempDir, "src");
+		const dest = path.join(tempDir, "dst");
+		await fsp.mkdir(path.join(source, "nested"), { recursive: true });
+		await Bun.write(path.join(source, "a.txt"), "a");
+		await Bun.write(path.join(source, "nested", "b.txt"), "b");
+		expect(await cloneArtifactsExclusive(source, dest)).toBe(true);
+		expect(await Bun.file(path.join(dest, "a.txt")).text()).toBe("a");
+		expect(await Bun.file(path.join(dest, "nested", "b.txt")).text()).toBe("b");
+	});
+});
+
+describe("readSelectedSessionSnapshot captured-bytes hydration", () => {
+	let tempDir: string;
+	let storage: FileSessionStorage;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-selected-"));
+		storage = new FileSessionStorage();
+	});
+
+	afterEach(async () => {
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	function makeCandidate(file: string, id = "selected-id"): StrictInventoryCandidate {
+		const stat = storage.statSync(file);
+		return { path: file, id, cwd: tempDir, identity: stat };
+	}
+
+	it("captures exact bytes bound to the verified descriptor in one read", async () => {
+		const header = JSON.stringify({ type: "session", id: "selected-id", cwd: tempDir });
+		const body = JSON.stringify({ type: "message", role: "user", content: "hi" });
+		const file = path.join(tempDir, "selected.jsonl");
+		await Bun.write(file, `${header}\n${body}\n`);
+		const result = readSelectedSessionSnapshot(storage, makeCandidate(file), tempDir);
+		if ("failures" in result) throw new Error(`expected snapshot, got ${result.failures[0]!.kind}`);
+		// Hydration bytes equal the exact file content and bind to the candidate identity.
+		expect(new TextDecoder().decode(result.bytes)).toBe(`${header}\n${body}\n`);
+		expect(result.identity.dev).toBe(result.candidate.identity.dev);
+		expect(result.identity.ino).toBe(result.candidate.identity.ino);
+	});
+
+	it("uses captured bytes rather than reopening a replaced pathname, and fails closed on identity change", async () => {
+		const header = JSON.stringify({ type: "session", id: "selected-id", cwd: tempDir });
+		const originalBody = "ORIGINAL-BODY";
+		const file = path.join(tempDir, "replaceable.jsonl");
+		await Bun.write(file, `${header}\n${originalBody}\n`);
+		// Capture the candidate ONCE — its identity binds the original descriptor.
+		const candidate = makeCandidate(file);
+		const result = readSelectedSessionSnapshot(storage, candidate, tempDir);
+		if ("failures" in result) throw new Error("expected snapshot before replacement");
+		// Replace the pathname with a fresh file (new inode) AFTER the snapshot was captured.
+		await fsp.unlink(file);
+		await Bun.write(file, `${header}\nREPLACEMENT-BODY\n`);
+		// The captured bytes still reflect the ORIGINAL content — hydration did not
+		// reopen the now-replaced pathname.
+		expect(new TextDecoder().decode(result.bytes)).toBe(`${header}\n${originalBody}\n`);
+		expect(new TextDecoder().decode(result.bytes)).not.toContain("REPLACEMENT-BODY");
+		// A fresh read bound to the SAME (old) candidate identity fails closed: the
+		// replaced file has a different (dev, ino), so zero authority is issued.
+		const rebound = readSelectedSessionSnapshot(storage, candidate, tempDir);
+		expect("failures" in rebound).toBe(true);
+		if ("failures" in rebound) {
+			expect(rebound.failures[0]!.kind).toBe("identity");
+		}
 	});
 });

@@ -42,7 +42,7 @@ import {
 	type Usage,
 } from "@agentclientprotocol/sdk";
 import type { AssistantMessage, Model } from "@gajae-code/ai";
-import { logger } from "@gajae-code/utils";
+import { logger, toError } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import { disableProvider, enableProvider, reset as resetCapabilities } from "../../capability";
 import { Settings } from "../../config/settings";
@@ -67,6 +67,8 @@ import type { AgentSession, AgentSessionEvent } from "../../session/agent-sessio
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE } from "../../session/messages";
 import { isLegacyProviderSafetyStopMessage } from "../../session/provider-safety-stop";
 import {
+	readSelectedSessionSnapshot,
+	type SelectedSessionSnapshot,
 	SessionManager,
 	type SessionInfo as StoredSessionInfo,
 	type StrictInventoryCandidate,
@@ -75,6 +77,7 @@ import {
 import {
 	FileSessionStorage,
 	type SessionStorageFileIdentity,
+	type SessionStorageStat,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
@@ -87,6 +90,7 @@ import {
 	mapAgentWireEventPayloadToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
+import type { AcpSessionFactoryDescriptor } from "./acp-mode";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 const ACP_DEFAULT_MODE_ID = "default";
@@ -97,14 +101,39 @@ const MODEL_CONFIG_ID = "model";
 const THINKING_CONFIG_ID = "thinking";
 const THINKING_OFF = "off";
 const SESSION_PAGE_SIZE = 50;
+/**
+ * Version prefix for scoped list cursors. Versions the cursor grammar so a
+ * future shape is distinguishable from `acp1` and a pre-`acp1`/foreign cursor
+ * never parses as a valid scoped cursor.
+ */
+const ACP_CURSOR_VERSION = "acp1";
 
 /**
- * One immutable authorization snapshot built from a complete strict scoped inventory.
- * `entries` maps every discovered session id to either the single exact-identity
- * candidate (authoritative) or a conflict tombstone (duplicate/unsafe). The snapshot
- * is built once, before pagination, so a duplicate beyond page 1 is known before the
- * first page response. Lifecycle changes bump {@link #authorityGeneration} and
- * invalidate the snapshot.
+ * Exact unsigned-integer parse: reject empty, non-digit, and values beyond
+ * `Number.MAX_SAFE_INTEGER`. Unlike `parseInt`/`Number`, it never silently
+ * coerces (`parseInt("123abc") === 123`, `Number("1e21") === 1e21`, leading
+ * zeros, sign, whitespace) so a malformed/truncated cursor field fails closed.
+ */
+function parseSafeUint(text: string): number {
+	if (!/^[0-9]+$/.test(text)) {
+		throw new Error(`Invalid ACP session cursor field: ${text}`);
+	}
+	const value = Number(text);
+	if (!Number.isSafeInteger(value)) {
+		throw new Error(`ACP session cursor field is out of safe range: ${text}`);
+	}
+	return value;
+}
+
+/**
+ * One immutable authorization snapshot built from a complete strict scoped
+ * inventory for a single CWD namespace. `entries` maps every discovered
+ * session id to either the single exact-identity candidate (authoritative) or
+ * a conflict tombstone (duplicate/cross-cwd/unsafe). The snapshot is built
+ * once per namespace, before pagination, so a duplicate beyond page 1 is known
+ * before the first page response. A lifecycle change in this CWD bumps the
+ * owning {@link AcpNamespace.generation} and discards this snapshot; other
+ * CWDs' snapshots and cursors are unaffected.
  */
 type AcpAuthorityEntry =
 	| { kind: "candidate"; candidate: StrictInventoryCandidate }
@@ -119,13 +148,59 @@ type PendingDeleteEvidence = {
 	transcriptIdentity: SessionStorageFileIdentity;
 	artifactsIdentity?: SessionStorageFileIdentity;
 };
-
 type AcpAuthoritySnapshot = {
-	scope: string;
 	entries: Map<string, AcpAuthorityEntry>;
 	/** Ordered unique session ids (conflicts appear once at first sight) for paging. */
 	orderedIds: string[];
 	generation: number;
+};
+
+/**
+ * One admitted CWD namespace. Each explicit-CWD lifecycle/list call admits a
+ * namespace with its OWN nonce/generation/snapshot so a lifecycle change in one
+ * CWD never invalidates another CWD's pagination cursor or authority. The
+ * sessionDir is resolved at admission and re-resolved on every inventory so an
+ * explicit shared `--session-dir` root is honored for every CWD once detected.
+ */
+type AcpNamespace = {
+	canonicalCwd: string;
+	sessionDir: string;
+	/** Random per-namespace binder embedded in scoped list cursors. */
+	nonce: string;
+	/** Bumped on any lifecycle change in this CWD; discards the cached snapshot. */
+	generation: number;
+	snapshot: AcpAuthoritySnapshot | undefined;
+};
+
+/**
+ * Connection-local authority receipt: the ONLY `sessionId -> canonical
+ * cwd/session-dir/transcript` mapping. Issued by a successful explicit-CWD
+ * strict inventory, create, adopted load/resume, or committed fork. A bare id
+ * with no receipt gets a lookup-free no-op (delete) or not-found (fork); it
+ * never triggers a storage scan or first-match lookup. An `ambiguous` receipt
+ * is an absorbing fail-closed state (duplicate / cross-cwd collision) that
+ * never re-authorizes delete, fork, or reissue.
+ */
+type AcpIssuedReceipt = {
+	/**
+	 * Absorbing receipt state machine.
+	 * - `unique`: bound to one exact transcript identity under one cwd; the only
+	 *   state that authorizes active control and inactive delete/fork.
+	 * - `ambiguous`: absorbing (duplicate within an inventory, cross-cwd
+	 *   collision, or a same-cwd replacement). Never re-authorizes and never
+	 *   reissues for the rest of the connection.
+	 * - `deleted`: absorbing tombstone retained after a successful verified
+	 *   delete. A recreated transcript under the same id cannot reissue or
+	 *   re-authorize until reconnect; a second delete of a genuinely-gone id is
+	 *   still a lookup-free no-op via fresh identity revalidation.
+	 */
+	state: "unique" | "ambiguous" | "deleted";
+	canonicalCwd: string;
+	sessionDir: string;
+	transcriptPath: string;
+	cwd: string;
+	transcriptIdentity: { dev: bigint; ino: bigint };
+	reason: string | undefined;
 };
 /**
  * Delay between `session/new` (or `session/load` / `session/resume` /
@@ -204,6 +279,13 @@ type AcpSessionTerminalState =
 
 type ManagedSessionRecord = {
 	session: AgentSession;
+	/**
+	 * Immutable canonical cwd this active session belongs to. Set when the
+	 * session is admitted (new/load/resume/fork) and never mutated afterwards;
+	 * it scopes per-record delete/fork authority and per-CWD invalidation
+	 * without any connection-global cwd lock.
+	 */
+	canonicalCwd: string;
 	mcpManager: MCPManager | undefined;
 	promptTurn: PromptTurnState | undefined;
 	promptQueue: PromptQueueState;
@@ -225,6 +307,20 @@ type ManagedSessionRecord = {
 	// Resolves when an in-progress terminal delete settles. Concurrent delete
 	// callers and abort/shutdown join this promise.
 	terminalPromise: Promise<DeleteSessionResponse> | undefined;
+	// Provenance of a newly-owned publication (fork/new transcript + artifacts).
+	// Set only for lifecycle paths that CREATE a fresh transcript (new/fork);
+	// load/resume leave it undefined so their stored source is never deleted on
+	// rollback. On response/bootstrap failure #rollbackUnpublishedRecord
+	// verified-deletes only this exact owned publication before dropping the
+	// receipt/record.
+	ownedPublication:
+		| {
+				transcriptPath: string;
+				transcriptIdentity: { dev: bigint; ino: bigint };
+				artifactsDir: string;
+				source: "new" | "fork";
+		  }
+		| undefined;
 };
 
 type ReplayableMessage = {
@@ -260,7 +356,13 @@ type MCPSourceMap = {
 	[name: string]: MCPSource;
 };
 
-type CreateAcpSession = (cwd: string) => Promise<AgentSession>;
+/**
+ * Per-`session/new` session factory plus the connection-wide explicit
+ * `--session-dir` authority root (see {@link AcpSessionFactoryDescriptor}). The
+ * descriptor is the authoritative source of the session-dir override, known
+ * before the first `session/list`, so heuristic learning is unnecessary.
+ */
+type CreateAcpSession = AcpSessionFactoryDescriptor;
 
 /**
  * Bridge a single ExtensionUIContext call to the ACP `unstable_createElicitation`
@@ -465,11 +567,32 @@ export class AcpAgent implements Agent {
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
-	/** Immutable canonical cwd locked by the first successful explicit-cwd lifecycle/list call. */
-	#canonicalCwdScope: string | undefined;
-	/** Authority snapshot from the last complete strict scoped inventory. Invalidation bumps this. */
-	#authorityGeneration = 0;
-	#authoritySnapshot: AcpAuthoritySnapshot | undefined;
+	/**
+	 * Per-CWD authority namespaces (keyed by canonical cwd). Each explicit-CWD
+	 * lifecycle/list call admits one namespace with its own nonce/generation/
+	 * snapshot, so multiple CWDs coexist on a single connection without any
+	 * connection-global cwd lock or cross-cwd rejection.
+	 */
+	#namespaces = new Map<string, AcpNamespace>();
+	/**
+	 * Authority receipts: the sole `sessionId -> namespace/transcript` route.
+	 * Only a successful explicit-CWD strict inventory, create, adopted
+	 * load/resume, or committed fork issues a `unique` receipt; bare ids with no
+	 * receipt get a lookup-free no-op (delete) or not-found (fork) and never
+	 * trigger a storage scan. Ambiguous receipts are absorbing fail-closed state.
+	 */
+	#issuedReceipts = new Map<string, AcpIssuedReceipt>();
+	/**
+	 * Connection-wide custom session-directory override (flat `--session-dir`),
+	 * seeded at construction from the {@link CreateAcpSession} factory descriptor.
+	 * When set, every per-CWD namespace's strict inventory/list/load resolves this
+	 * exact shared root BEFORE any session is created, so a fresh-connection scoped
+	 * list/load authorizes the configured `--session-dir` on the first call.
+	 * Undefined means each namespace uses its per-CWD default layout. This is the
+	 * authoritative source of truth — it is never heuristically learned from
+	 * created/loaded sessions.
+	 */
+	#sharedSessionDirOverride: string | undefined;
 	/**
 	 * Same-connection retry evidence for an incomplete verified delete. Keyed by
 	 * session id. Phase-aware: every cleanup_pending carries the transcript
@@ -487,6 +610,10 @@ export class AcpAgent implements Agent {
 		this.#connection = connection;
 		this.#initialSession = initialSession;
 		this.#createSession = createSession;
+		// Seed the explicit `--session-dir` authority root before any lifecycle/
+		// list call so a fresh-connection scoped list resolves the exact configured
+		// session-dir. Undefined keeps the per-CWD default layout.
+		this.#sharedSessionDirOverride = createSession.sessionDir;
 	}
 
 	setCancelCleanupTimeoutForTesting(timeoutMs: number): void {
@@ -555,28 +682,36 @@ export class AcpAgent implements Agent {
 
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
 		this.#rejectIfShuttingDown();
-		// Stage scope before the lifecycle op; commit only after it succeeds so a
-		// failed first call does not pin the connection to a cwd it never served.
-		const canonical = this.#stageCanonicalScope(params.cwd);
-		const record = await this.#trackLifecycle(() => this.#createNewSessionRecord(params.cwd, params.mcpServers));
-		this.#rejectIfShuttingDown();
-		this.#commitCanonicalScope(canonical);
-		this.#invalidateAuthority();
-		const response: NewSessionResponse = {
-			sessionId: record.session.sessionId,
-			configOptions: this.#buildConfigOptions(record.session),
-			modes: this.#buildModeState(record.session),
-		};
-		this.#scheduleBootstrapUpdates(record.session.sessionId);
-		return response;
+		// Resolve the canonical cwd without any connection-global lock: multiple
+		// cwds coexist on one connection. The namespace is admitted (and authority
+		// invalidated) only after the lifecycle op succeeds.
+		const canonical = this.#stageCanonicalCwd(params.cwd);
+		const record = await this.#trackLifecycle(() => this.#createNewSessionRecord(params.mcpServers, canonical));
+		try {
+			this.#rejectIfShuttingDown();
+			this.#invalidateAuthority(canonical);
+			const response: NewSessionResponse = {
+				sessionId: record.session.sessionId,
+				configOptions: this.#buildConfigOptions(record.session),
+				modes: this.#buildModeState(record.session),
+			};
+			this.#scheduleBootstrapUpdates(record.session.sessionId);
+			return response;
+		} catch (error) {
+			// Atomic with response success: a build/bootstrap failure removes the
+			// committed-but-unpublished record, drops its receipt, and disposes it
+			// so no half-admitted authority or active session is left behind.
+			await this.#rollbackUnpublishedRecord(record);
+			throw error;
+		}
 	}
 
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
 		this.#rejectIfShuttingDown();
-		const canonical = this.#stageCanonicalScope(params.cwd);
+		const canonical = this.#stageCanonicalCwd(params.cwd);
 		const existingRecord = this.#sessions.get(params.sessionId);
 		const record = await this.#trackLifecycle(() =>
-			this.#loadManagedSession(params.sessionId, params.cwd, params.mcpServers),
+			this.#loadManagedSession(params.sessionId, params.cwd, params.mcpServers, canonical),
 		);
 		try {
 			this.#rejectIfShuttingDown();
@@ -584,22 +719,19 @@ export class AcpAgent implements Agent {
 			this.#rejectIfShuttingDown();
 			// Construct every fallible response/bootstrap value inside the
 			// transaction so a build/schedule failure rolls back the prepared
-			// record and never pins the connection.
+			// record without leaving a half-loaded session.
 			const response: LoadSessionResponse = {
 				configOptions: this.#buildConfigOptions(record.session),
 				modes: this.#buildModeState(record.session),
 			};
 			this.#scheduleBootstrapUpdates(record.session.sessionId);
-			// Commit the cwd scope only after replay, response construction, and
-			// bootstrap scheduling all succeed — a failed first load leaves no
-			// half-loaded session and does not pin the connection.
-			this.#commitCanonicalScope(canonical);
-			this.#invalidateAuthority();
+			this.#invalidateAuthority(canonical);
 			return response;
 		} catch (error) {
 			// Any pre-return failure: roll back the prepared record so a failed
-			// first load leaves no half-loaded session and does not pin the
-			// connection, and commit no cwd scope.
+			// load leaves no half-loaded session. The receipt (if any) is retained
+			// because the stored transcript still exists on disk and remains
+			// authoritatively deletable/forkable as an inactive session.
 			if (record !== existingRecord) {
 				this.#sessions.delete(record.session.sessionId);
 				await this.#disposeSessionRecord(record);
@@ -610,13 +742,15 @@ export class AcpAgent implements Agent {
 
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		this.#rejectIfShuttingDown();
-		const scope = params.cwd ? this.#stageCanonicalScope(params.cwd) : undefined;
+		const canonical = params.cwd ? this.#stageCanonicalCwd(params.cwd) : undefined;
 		for (const record of this.#sessions.values()) {
 			await record.session.sessionManager.flush();
 		}
 		this.#rejectIfShuttingDown();
-		// Cwd-less / global listing stays display-only and non-authorizing.
-		if (!scope) {
+		// Cwd-less / global listing stays display-only and non-authorizing: it
+		// creates no namespace, issues no receipt, bumps no generation, and never
+		// authorizes delete/fork/control. Its cursor stays a plain offset.
+		if (!canonical) {
 			const sessions = await this.#listStoredSessions(undefined);
 			const offset = this.#parseCursor(params.cursor ?? undefined);
 			const paged = sessions.slice(offset, offset + SESSION_PAGE_SIZE);
@@ -626,69 +760,86 @@ export class AcpAgent implements Agent {
 				nextCursor: nextOffset < sessions.length ? String(nextOffset) : undefined,
 			};
 		}
-		// Explicit scoped list: stage scope, strict raw inventory, build the full
-		// authorization/conflict snapshot BEFORE page slicing so duplicate ids
-		// beyond page 1 are known before the first page response. Scope commits
-		// only after cursor validation, stored-session read, and full response
-		// construction succeed — a failed first list never pins the connection.
+		// Explicit scoped list admits one namespace and builds the full
+		// authorization/conflict snapshot BEFORE page slicing so duplicate /
+		// cross-cwd ids beyond page 1 are known before the first page response.
+		const ns = this.#ensureNamespace(canonical);
 		if (params.cursor === undefined) {
-			// A new first-page request is a new issuance event. Refresh the complete
-			// snapshot and invalidate cursors minted by the previous issuance.
-			this.#invalidateAuthority();
+			// A new first-page request is a new issuance event. Rebuild the
+			// complete snapshot and invalidate cursors minted by the previous
+			// issuance for THIS namespace only; other cwds are unaffected.
+			this.#invalidateAuthority(canonical);
 		}
-		const snapshot = this.#buildAuthoritySnapshot(scope);
-		// Scoped cursors carry the authority generation at which they were minted
-		// (form `${generation}:${offset}`). A lifecycle change between page 1 and
-		// page 2 bumps the generation, so the old cursor is rejected instead of
-		// silently rebuilding at the new generation. The cwd-less display cursor
-		// stays a plain offset (see #parseCursor).
-		const offset = this.#parseScopedCursor(params.cursor ?? undefined, snapshot.generation);
-		const stored = await this.#listStoredSessions(scope);
+		const snapshot = this.#buildAuthoritySnapshot(ns);
+		// Scoped cursors use the anchored versioned grammar
+		// `acp1:<nonce>:<generation>:<offset>`. The `acp1` prefix versions the
+		// shape; the nonce binds the cursor to this namespace only; the generation
+		// binds it to the exact authority snapshot. A lifecycle change in this cwd
+		// between page 1 and page 2 bumps this namespace's generation, so the old
+		// cursor is rejected instead of silently rebuilt, and a cursor minted by a
+		// different cwd (or a pre-`acp1`/malformed token) never parses.
+		const offset = this.#parseScopedCursor(params.cursor ?? undefined, ns);
+		const stored = await this.#listStoredSessions(canonical, ns.sessionDir);
 		const storedById = new Map(stored.map(s => [s.id, s] as const));
 		const pageIds = snapshot.orderedIds.slice(offset, offset + SESSION_PAGE_SIZE);
 		const nextOffset = offset + pageIds.length;
 		const pageSessions = pageIds.map(id => storedById.get(id)).filter((s): s is StoredSessionInfo => s !== undefined);
-		const response: ListSessionsResponse = {
+		return {
 			sessions: pageSessions.map(session => this.#toSessionInfo(session)),
-			nextCursor: nextOffset < snapshot.orderedIds.length ? `${snapshot.generation}:${nextOffset}` : undefined,
+			nextCursor:
+				nextOffset < snapshot.orderedIds.length
+					? `${ACP_CURSOR_VERSION}:${ns.nonce}:${ns.generation}:${nextOffset}`
+					: undefined,
 		};
-		// Commit the scope only after cursor validation, stored-session read, and
-		// full response construction succeed.
-		this.#commitCanonicalScope(scope);
-		return response;
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
 		this.#rejectIfShuttingDown();
-		const canonical = this.#stageCanonicalScope(params.cwd);
+		const canonical = this.#stageCanonicalCwd(params.cwd);
+		const existingRecord = this.#sessions.get(params.sessionId);
 		const record = await this.#trackLifecycle(() =>
-			this.#resumeManagedSession(params.sessionId, params.cwd, params.mcpServers ?? []),
+			this.#resumeManagedSession(params.sessionId, params.cwd, params.mcpServers ?? [], canonical),
 		);
-		this.#rejectIfShuttingDown();
-		this.#commitCanonicalScope(canonical);
-		this.#invalidateAuthority();
-		const response: ResumeSessionResponse = {
-			configOptions: this.#buildConfigOptions(record.session),
-			modes: this.#buildModeState(record.session),
-		};
-		this.#scheduleBootstrapUpdates(record.session.sessionId);
-		return response;
+		try {
+			this.#rejectIfShuttingDown();
+			this.#invalidateAuthority(canonical);
+			const response: ResumeSessionResponse = {
+				configOptions: this.#buildConfigOptions(record.session),
+				modes: this.#buildModeState(record.session),
+			};
+			this.#scheduleBootstrapUpdates(record.session.sessionId);
+			return response;
+		} catch (error) {
+			// Atomic with response success. An already-admitted session (resume of a
+			// loaded id) is left untouched; only a freshly-prepared record that never
+			// returned to the client is rolled back.
+			if (record !== existingRecord) {
+				await this.#rollbackUnpublishedRecord(record);
+			}
+			throw error;
+		}
 	}
 
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
 		this.#rejectIfShuttingDown();
-		const canonical = this.#stageCanonicalScope(params.cwd);
-		const record = await this.#trackLifecycle(() => this.#forkManagedSession(params));
-		this.#rejectIfShuttingDown();
-		this.#commitCanonicalScope(canonical);
-		this.#invalidateAuthority();
-		const response: ForkSessionResponse = {
-			sessionId: record.session.sessionId,
-			configOptions: this.#buildConfigOptions(record.session),
-			modes: this.#buildModeState(record.session),
-		};
-		this.#scheduleBootstrapUpdates(record.session.sessionId);
-		return response;
+		const canonical = this.#stageCanonicalCwd(params.cwd);
+		const record = await this.#trackLifecycle(() => this.#forkManagedSession(params, canonical));
+		try {
+			this.#rejectIfShuttingDown();
+			this.#invalidateAuthority(canonical);
+			const response: ForkSessionResponse = {
+				sessionId: record.session.sessionId,
+				configOptions: this.#buildConfigOptions(record.session),
+				modes: this.#buildModeState(record.session),
+			};
+			this.#scheduleBootstrapUpdates(record.session.sessionId);
+			return response;
+		} catch (error) {
+			// Atomic with response success: a build/bootstrap failure removes the
+			// committed-but-unpublished fork, drops its receipt, and disposes it.
+			await this.#rollbackUnpublishedRecord(record);
+			throw error;
+		}
 	}
 
 	async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
@@ -697,40 +848,57 @@ export class AcpAgent implements Agent {
 			return {};
 		}
 		this.#rejectIfTerminal(record);
+		this.#assertActiveReceiptOwnership(record);
 		await this.#closeManagedSession(params.sessionId, record);
-		this.#invalidateAuthority();
+		// Close is non-destructive: the transcript stays on disk, so the receipt
+		// is retained and the record's own namespace is invalidated.
+		this.#invalidateAuthority(record.canonicalCwd);
 		return {};
 	}
 
 	/**
 	 * Hard delete an ACP session. `DeleteSessionRequest` carries only `sessionId`;
-	 * the server owns authorization through the immutable canonical cwd scope and
-	 * the complete strict scoped inventory snapshot.
+	 * the server owns authorization through connection-local receipts — the sole
+	 * `sessionId -> cwd/transcript` route — never through a global scan.
 	 *
-	 * - No scope / unknown / already-deleted id → lookup-free `{}`.
-	 * - Duplicate/conflict id → visible error; neither transcript nor artifacts change.
+	 * - Unknown / never-issued id → lookup-free `{}` (no scan). A deleted id is a
+	 *   retained tombstone: a genuinely-gone transcript is still a no-op, while a
+	 *   recreated transcript under the same id fails closed (old authority cannot
+	 *   re-authorize) until reconnect.
+	 * - Ambiguous (duplicate / cross-cwd) id → visible error; nothing changes.
 	 * - Active session → reserve `deleting`, drain/cancel prompt, flush, strict
 	 *   dispose/close, recheck identity/state, then verified artifact-first deletion.
+	 * - Inactive session → receipt routes to its namespace, fresh strict inventory
+	 *   revalidates the exact candidate before verified deletion.
 	 * - Concurrent delete callers join the terminal promise.
 	 */
 	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-		// Before scope: return {} without scanning/listing storage.
-		if (this.#canonicalCwdScope === undefined) {
+		const sessionId = params.sessionId;
+		const record = this.#sessions.get(sessionId);
+		if (record) {
+			if (this.#shuttingDown) {
+				throw new Error("ACP session delete is unavailable during shutdown");
+			}
+			this.#assertActiveReceiptOwnership(record);
+			return await this.#deleteActiveSession(sessionId, record);
+		}
+		// Inactive: route through issued authority only. No global lookup/scan.
+		const receipt = this.#issuedReceipts.get(sessionId);
+		if (receipt === undefined) {
+			// Unknown / unissued / never observed: lookup-free no-op.
 			return {};
 		}
 		if (this.#shuttingDown) {
 			throw new Error("ACP session delete is unavailable during shutdown");
 		}
-		const record = this.#sessions.get(params.sessionId);
-		if (record) {
-			return await this.#deleteActiveSession(params.sessionId, record);
+		if (receipt.state === "ambiguous") {
+			throw new Error(`ACP session delete failed: ${receipt.reason ?? "session id is ambiguous"}`);
 		}
-		// Inactive: read authority from the strict inventory snapshot.
-		return await this.#deleteInactiveSession(params.sessionId);
+		return await this.#deleteInactiveSession(sessionId, receipt);
 	}
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-		const record = this.#getSessionRecord(params.sessionId);
+		const record = this.#requireOwnedActiveRecord(params.sessionId);
 		this.#rejectIfTerminal(record);
 		this.#applyModeChange(record.session, params.modeId);
 		await this.#connection.sessionUpdate({
@@ -742,7 +910,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
-		const record = this.#getSessionRecord(params.sessionId);
+		const record = this.#requireOwnedActiveRecord(params.sessionId);
 		this.#rejectIfTerminal(record);
 		if (typeof params.value === "boolean") {
 			throw new Error(`Unsupported boolean ACP config option: ${params.configId}`);
@@ -784,7 +952,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
-		const record = this.#getSessionRecord(params.sessionId);
+		const record = this.#requireOwnedActiveRecord(params.sessionId);
 		this.#rejectIfTerminal(record);
 		const activeTurn = record.promptTurn;
 		if (activeTurn && !activeTurn.settled && record.session.isStreaming) {
@@ -1003,7 +1171,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async cancel(params: { sessionId: string }): Promise<void> {
-		const record = this.#getSessionRecord(params.sessionId);
+		const record = this.#requireOwnedActiveRecord(params.sessionId);
 		const promptTurn = record.promptTurn;
 		if (!promptTurn || promptTurn.settled) {
 			return;
@@ -1172,9 +1340,12 @@ export class AcpAgent implements Agent {
 						.filter((p): p is Promise<DeleteSessionResponse> => p !== undefined);
 					await Promise.allSettled(terminalPromises);
 					await this.#disposeAllSessions();
-					// Clear connection-local authority.
-					this.#authoritySnapshot = undefined;
-					this.#canonicalCwdScope = undefined;
+					// Clear connection-local authority: namespaces, receipts, and the
+					// detected session-dir override all drop so a later connection
+					// starts fully unissued (no cross-connection authority survives).
+					this.#namespaces.clear();
+					this.#issuedReceipts.clear();
+					this.#sharedSessionDirOverride = undefined;
 				})();
 			},
 			{ once: true },
@@ -1203,18 +1374,28 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #createNewSessionRecord(cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
-		const session = await this.#createSession(path.resolve(cwd));
+	async #createNewSessionRecord(mcpServers: McpServer[], canonicalCwd: string): Promise<ManagedSessionRecord> {
+		const session = await this.#createSession(canonicalCwd);
 		try {
 			await session.sessionManager.ensureOnDisk();
 		} catch (error) {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers);
+		return await this.#registerPreparedSession(
+			session,
+			mcpServers,
+			canonicalCwd,
+			this.#captureOwnedPublication(session, "new"),
+		);
 	}
 
-	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
+	async #loadManagedSession(
+		sessionId: string,
+		cwd: string,
+		mcpServers: McpServer[],
+		canonicalCwd: string,
+	): Promise<ManagedSessionRecord> {
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
 			this.#rejectIfTerminal(existing);
@@ -1223,11 +1404,17 @@ export class AcpAgent implements Agent {
 			return existing;
 		}
 
-		const candidate = this.#resolveStrictLifecycleCandidate(sessionId, cwd);
-		return await this.#openStoredSession(candidate, cwd, mcpServers, sessionId);
+		const ns = this.#ensureNamespace(canonicalCwd);
+		const candidate = this.#resolveStrictLifecycleCandidate(sessionId, ns);
+		return await this.#openStoredSession(candidate, canonicalCwd, ns, mcpServers, sessionId);
 	}
 
-	async #resumeManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
+	async #resumeManagedSession(
+		sessionId: string,
+		cwd: string,
+		mcpServers: McpServer[],
+		canonicalCwd: string,
+	): Promise<ManagedSessionRecord> {
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
 			this.#rejectIfTerminal(existing);
@@ -1236,18 +1423,20 @@ export class AcpAgent implements Agent {
 			return existing;
 		}
 
-		const candidate = this.#resolveStrictLifecycleCandidate(sessionId, cwd);
-		return await this.#openStoredSession(candidate, cwd, mcpServers, sessionId);
+		const ns = this.#ensureNamespace(canonicalCwd);
+		const candidate = this.#resolveStrictLifecycleCandidate(sessionId, ns);
+		return await this.#openStoredSession(candidate, canonicalCwd, ns, mcpServers, sessionId);
 	}
 
 	/**
-	 * Resolve a single exact-one scoped candidate via a fresh strict inventory.
-	 * Rejects duplicates and inventory failures — never falls back to a forgiving
-	 * first-match lookup. Used by load/resume so authoritative lifecycle paths bind
-	 * exact identity before opening a stored session.
+	 * Resolve a single exact-one scoped candidate via a fresh strict inventory for
+	 * the given namespace. Rejects duplicates, cross-cwd collisions, and inventory
+	 * failures — never falls back to a forgiving first-match lookup. Used by
+	 * load/resume so authoritative lifecycle paths bind exact identity before
+	 * opening a stored session.
 	 */
-	#resolveStrictLifecycleCandidate(sessionId: string, scope: string): StrictInventoryCandidate {
-		const snapshot = this.#buildFreshAuthoritySnapshot(scope);
+	#resolveStrictLifecycleCandidate(sessionId: string, ns: AcpNamespace): StrictInventoryCandidate {
+		const snapshot = this.#buildFreshAuthoritySnapshot(ns);
 		const entry = snapshot.entries.get(sessionId);
 		if (!entry) {
 			throw new Error(`ACP session not found: ${sessionId}`);
@@ -1258,11 +1447,31 @@ export class AcpAgent implements Agent {
 		return entry.candidate;
 	}
 
-	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
-		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
-		const session = await this.#createSession(path.resolve(params.cwd));
+	/**
+	 * Bind a resolved candidate to its exact descriptor content via one
+	 * O_NOFOLLOW read, validating path/id/cwd/(dev,ino). The returned bytes are
+	 * the authoritative selected-session content; the session is hydrated from
+	 * them without reopening the path. Any mismatch throws and issues zero
+	 * authority.
+	 */
+	#readSelectedSessionSnapshot(candidate: StrictInventoryCandidate, ns: AcpNamespace): SelectedSessionSnapshot {
+		const storage = new FileSessionStorage();
+		const result = readSelectedSessionSnapshot(storage, candidate, ns.sessionDir);
+		if ("failures" in result) {
+			throw new Error(
+				`ACP session ${candidate.id} could not be bound to a verified descriptor: ${result.failures
+					.map(f => `${f.kind}: ${f.message}`)
+					.join("; ")}`,
+			);
+		}
+		return result;
+	}
+
+	async #forkManagedSession(params: ForkSessionRequest, canonicalCwd: string): Promise<ManagedSessionRecord> {
+		const sourceSnapshot = await this.#resolveForkSourceSnapshot(params.sessionId);
+		const session = await this.#createSession(canonicalCwd);
 		try {
-			const success = await session.switchSession(sourcePath);
+			const success = await session.switchSession(sourceSnapshot.candidate.path, sourceSnapshot);
 			if (!success) {
 				throw new Error(`ACP session fork was cancelled: ${params.sessionId}`);
 			}
@@ -1274,18 +1483,28 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, params.mcpServers ?? []);
+		const commit = session.sessionManager.getLastForkCommit();
+		const owned: ManagedSessionRecord["ownedPublication"] = commit
+			? {
+					transcriptPath: commit.path,
+					transcriptIdentity: commit.identity,
+					artifactsDir: commit.path.slice(0, -6),
+					source: "fork",
+				}
+			: this.#captureOwnedPublication(session, "fork");
+		return await this.#registerPreparedSession(session, params.mcpServers ?? [], canonicalCwd, owned);
 	}
 
 	async #openStoredSession(
 		issued: StrictInventoryCandidate,
-		cwd: string,
+		canonicalCwd: string,
+		ns: AcpNamespace,
 		mcpServers: McpServer[],
 		sessionId: string,
 	): Promise<ManagedSessionRecord> {
-		const session = await this.#createSession(path.resolve(cwd));
+		const session = await this.#createSession(canonicalCwd);
 		try {
-			const current = this.#resolveStrictLifecycleCandidate(sessionId, cwd);
+			const current = this.#resolveStrictLifecycleCandidate(sessionId, ns);
 			if (
 				current.path !== issued.path ||
 				current.cwd !== issued.cwd ||
@@ -1294,7 +1513,8 @@ export class AcpAgent implements Agent {
 			) {
 				throw new Error(`ACP session ${sessionId} changed while opening`);
 			}
-			const success = await session.switchSession(current.path);
+			const selected = this.#readSelectedSessionSnapshot(current, ns);
+			const success = await session.switchSession(current.path, selected);
 			if (!success) {
 				throw new Error(`ACP session load was cancelled: ${sessionId}`);
 			}
@@ -1302,11 +1522,19 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers);
+		// load/resume hydrate from a stored source, not a freshly-owned
+		// publication: rollback must never delete the source transcript.
+		return await this.#registerPreparedSession(session, mcpServers, canonicalCwd, undefined);
 	}
 
-	async #registerPreparedSession(session: AgentSession, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
-		const record = this.#createManagedSessionRecord(session);
+	async #registerPreparedSession(
+		session: AgentSession,
+		mcpServers: McpServer[],
+		canonicalCwd: string,
+		ownedPublication?: ManagedSessionRecord["ownedPublication"],
+	): Promise<ManagedSessionRecord> {
+		const record = this.#createManagedSessionRecord(session, canonicalCwd);
+		record.ownedPublication = ownedPublication;
 		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
 		// The lifetime subscription normally follows the bootstrap race guard, but
 		// prompt() installs it eagerly once the client has demonstrated session ownership.
@@ -1317,6 +1545,16 @@ export class AcpAgent implements Agent {
 				await this.#disposeSessionRecord(record);
 				throw new Error("ACP session lifecycle is unavailable during shutdown");
 			}
+			// Admit the namespace and issue a MANDATORY authority receipt BEFORE the
+			// record is published to #sessions. Receipt issuance is fallible (see
+			// #issueReceiptForActiveSession): a transcript that cannot be
+			// identity-bound, or an id that is already absorbing/foreign, refuses
+			// admission. Because this throw happens before #sessions.set, the catch
+			// below disposes the never-committed record and leaves no half-admitted
+			// active session. The receipt is the sole id -> cwd/transcript route for
+			// later inactive delete/fork and survives close.
+			this.#ensureNamespace(canonicalCwd);
+			this.#issueReceiptForActiveSession(canonicalCwd, record);
 			this.#sessions.set(session.sessionId, record);
 			return record;
 		} catch (error) {
@@ -1325,9 +1563,10 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	#createManagedSessionRecord(session: AgentSession): ManagedSessionRecord {
+	#createManagedSessionRecord(session: AgentSession, canonicalCwd: string): ManagedSessionRecord {
 		return {
 			session,
+			canonicalCwd,
 			mcpManager: undefined,
 			promptTurn: undefined,
 			promptQueue: { promise: Promise.resolve(), release: undefined },
@@ -1339,6 +1578,30 @@ export class AcpAgent implements Agent {
 			terminalState: "active",
 			terminalFailure: undefined,
 			terminalPromise: undefined,
+			ownedPublication: undefined,
+		};
+	}
+
+	/**
+	 * Capture newly-owned publication provenance for a freshly-created (new)
+	 * transcript: exact path + descriptor identity. Returns undefined when the
+	 * transcript is not yet persisted. Used only by lifecycle paths that CREATE a
+	 * fresh transcript so rollback can verified-delete exactly that publication.
+	 */
+	#captureOwnedPublication(session: AgentSession, source: "new" | "fork"): ManagedSessionRecord["ownedPublication"] {
+		const file = session.sessionManager.getSessionFile();
+		if (!file) return undefined;
+		let stat: SessionStorageStat;
+		try {
+			stat = new FileSessionStorage().statSync(file);
+		} catch {
+			return undefined;
+		}
+		return {
+			transcriptPath: file,
+			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			artifactsDir: file.slice(0, -6),
+			source,
 		};
 	}
 
@@ -1386,13 +1649,121 @@ export class AcpAgent implements Agent {
 			});
 		}
 	}
+	/**
+	 * Assert that an active record owns a current `unique` authority receipt for
+	 * its canonical cwd. Every active control (prompt/config/mode/close/cancel/
+	 * delete/fork) must pass this gate so none can act on {@link #sessions}
+	 * alone: a record whose receipt was flipped absorbing by a concurrent
+	 * list/delete, or never issued, refuses control.
+	 */
+	#assertActiveReceiptOwnership(record: ManagedSessionRecord): void {
+		const receipt = this.#issuedReceipts.get(record.session.sessionId);
+		if (receipt === undefined || receipt.state !== "unique" || receipt.canonicalCwd !== record.canonicalCwd) {
+			throw new Error(`ACP session ${record.session.sessionId} has no active authority receipt`);
+		}
+	}
 
-	#getSessionRecord(sessionId: string): ManagedSessionRecord {
+	/**
+	 * Resolve an active record AND assert its exact unique receipt ownership.
+	 * Used by active controls that throw on an unknown/unsupported id.
+	 */
+	#requireOwnedActiveRecord(sessionId: string): ManagedSessionRecord {
 		const record = this.#sessions.get(sessionId);
 		if (!record) {
 			throw new Error(`Unsupported ACP session: ${sessionId}`);
 		}
+		this.#assertActiveReceiptOwnership(record);
 		return record;
+	}
+
+	/**
+	 * Roll back an unpublished lifecycle record: the response/bootstrap
+	 * construction failed, so the client never received the session id. Remove
+	 * the committed-but-unreturned record, drop the receipt this op issued, and
+	 * dispose the record safely so no half-admitted authority or active session
+	 * survives a failed response. For a freshly-owned new/fork publication
+	 * ({@link ManagedSessionRecord.ownedPublication}) the exact transcript +
+	 * artifacts are verified-deleted before the receipt/record drop. A load/resume
+	 * record has no owned publication: its stored source transcript is never
+	 * deleted on rollback.
+	 */
+	async #rollbackUnpublishedRecord(record: ManagedSessionRecord): Promise<void> {
+		const sessionId = record.session.sessionId;
+		if (this.#sessions.get(sessionId) === record) {
+			this.#sessions.delete(sessionId);
+		}
+		const owned = record.ownedPublication;
+		const canonicalCwd = record.canonicalCwd;
+		// Dispose the record first so the session's persist writer is closed (a
+		// Windows file handle would block unlink), then verified-delete only the
+		// exact owned new/fork publication. Load/resume (no owned publication)
+		// never reaches the delete, so its stored source transcript is retained.
+		await this.#disposeSessionRecord(record);
+		if (owned) {
+			await this.#verifiedDeleteOwnedPublication(sessionId, canonicalCwd, owned);
+		}
+		this.#issuedReceipts.delete(sessionId);
+	}
+
+	/**
+	 * Verified-delete only the exact newly-owned fork/new publication. Builds a
+	 * {@link VerifiedSessionDeleteTarget} bound to the owned transcript identity
+	 * so the storage backend removes the matching artifact directory first and
+	 * the transcript last — a partial cleanup (cleanup_pending) is acceptable for
+	 * an unpublished publication and is logged, never thrown, so rollback never
+	 * masks the original response/bootstrap failure.
+	 */
+	async #verifiedDeleteOwnedPublication(
+		sessionId: string,
+		canonicalCwd: string,
+		owned: NonNullable<ManagedSessionRecord["ownedPublication"]>,
+	): Promise<void> {
+		const sessionDir = this.#resolveSessionDirForCwd(canonicalCwd);
+		const storage = new FileSessionStorage();
+		if (!storage.deleteSessionVerified) return;
+		const target: VerifiedSessionDeleteTarget = {
+			sessionsRoot: sessionDir,
+			transcriptPath: owned.transcriptPath,
+			sessionId,
+			cwd: canonicalCwd,
+			transcriptIdentity: owned.transcriptIdentity,
+		};
+		try {
+			const result = await storage.deleteSessionVerified(target);
+			if (result.kind === "cleanup_pending") {
+				logger.warn("Rollback left partial fork/new publication cleanup pending", {
+					sessionId,
+					phase: result.phase,
+				});
+			}
+		} catch (error) {
+			logger.warn("Failed to verified-delete owned publication during rollback", { sessionId, error });
+		}
+	}
+
+	/**
+	 * Retain a successful delete as an absorbing `deleted` tombstone instead of
+	 * dropping the receipt. A recreated transcript under the same id cannot
+	 * reissue or re-authorize until reconnect; a second delete of a genuinely
+	 * gone id is still a no-op because inactive delete revalidates fresh
+	 * identity (the tombstone's stale identity never matches a new file).
+	 */
+	#retainDeletedReceipt(sessionId: string): void {
+		const receipt = this.#issuedReceipts.get(sessionId);
+		if (receipt !== undefined) {
+			receipt.state = "deleted";
+			receipt.reason = "Session was deleted; authority revoked until reconnect";
+			return;
+		}
+		this.#issuedReceipts.set(sessionId, {
+			state: "deleted",
+			canonicalCwd: "",
+			sessionDir: "",
+			transcriptPath: "",
+			cwd: "",
+			transcriptIdentity: { dev: 0n, ino: 0n },
+			reason: "Session was deleted; authority revoked until reconnect",
+		});
 	}
 
 	#assertMatchingCwd(session: AgentSession, cwd: string): void {
@@ -1403,7 +1774,7 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #resolveForkSourceSessionPath(sessionId: string): Promise<string> {
+	async #resolveForkSourceSnapshot(sessionId: string): Promise<SelectedSessionSnapshot> {
 		const loaded = this.#sessions.get(sessionId);
 		if (loaded) {
 			if (loaded.terminalState !== "active") {
@@ -1412,29 +1783,59 @@ export class AcpAgent implements Agent {
 			if (isPromptTurnInFlight(loaded.promptTurn)) {
 				throw new Error(`ACP session fork is unavailable while a prompt is in progress: ${sessionId}`);
 			}
+			this.#assertActiveReceiptOwnership(loaded);
 			await loaded.session.sessionManager.flush();
 			const sessionPath = loaded.session.sessionManager.getSessionFile();
 			if (!sessionPath) {
 				throw new Error(`ACP session cannot be forked before it is persisted: ${sessionId}`);
 			}
-			return sessionPath;
+			// Build an exact-identity candidate from the flushed live session and
+			// bind its content through one verified descriptor read.
+			const ns = this.#ensureNamespace(loaded.canonicalCwd);
+			let stat: SessionStorageStat;
+			try {
+				stat = new FileSessionStorage().statSync(sessionPath);
+			} catch (error) {
+				throw new Error(`ACP session ${sessionId} could not be read for fork: ${toError(error).message}`);
+			}
+			const liveCandidate: StrictInventoryCandidate = {
+				path: sessionPath,
+				id: loaded.session.sessionId,
+				cwd: loaded.session.sessionManager.getCwd(),
+				identity: stat,
+			};
+			return this.#readSelectedSessionSnapshot(liveCandidate, ns);
 		}
 
-		// Inactive fork source: exact-one scoped lookup only. Never use global
-		// listAll/first-match — that was the P1 data-loss path.
-		const scope = this.#canonicalCwdScope;
-		if (!scope) {
-			throw new Error(`ACP session not found (no scope established): ${sessionId}`);
+		// Inactive fork source: route through issued authority only. Never use
+		// global listAll/first-match — that was the P1 data-loss path. A bare id
+		// with no receipt is not-found; an ambiguous receipt fail-closes.
+		const receipt = this.#issuedReceipts.get(sessionId);
+		if (receipt === undefined) {
+			throw new Error(`ACP session not found: ${sessionId}`);
 		}
-		const snapshot = this.#buildFreshAuthoritySnapshot(scope);
+		if (receipt.state === "ambiguous") {
+			throw new Error(`ACP session fork failed: ${receipt.reason ?? "session id is ambiguous"}`);
+		}
+		const ns = this.#ensureNamespace(receipt.canonicalCwd);
+		const snapshot = this.#buildFreshAuthoritySnapshot(ns);
 		const entry = snapshot.entries.get(sessionId);
 		if (!entry) {
 			throw new Error(`ACP session not found: ${sessionId}`);
 		}
-		if (entry.kind !== "candidate") {
+		if (entry.kind === "conflict") {
 			throw new Error(`ACP session fork failed: ${entry.reason}`);
 		}
-		return entry.candidate.path;
+		const candidate = entry.candidate;
+		if (
+			candidate.path !== receipt.transcriptPath ||
+			candidate.cwd !== receipt.cwd ||
+			candidate.identity.dev !== receipt.transcriptIdentity.dev ||
+			candidate.identity.ino !== receipt.transcriptIdentity.ino
+		) {
+			throw new Error(`ACP session ${sessionId} changed since authority was issued`);
+		}
+		return this.#readSelectedSessionSnapshot(candidate, ns);
 	}
 
 	async #handlePromptEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
@@ -1598,31 +1999,139 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Validate the cwd and reject cross-cwd calls against an already-committed scope,
-	 * WITHOUT committing. Returns the canonical (resolved) cwd. Pair with
-	 * {@link #commitCanonicalScope} after the lifecycle operation succeeds so a failed
-	 * first new/load/resume/fork/list never pins the connection to a cwd it never served.
+	 * Resolve and validate the canonical cwd for an explicit-cwd call. Unlike the
+	 * former single-scope model this NEVER rejects a different cwd: multiple cwds
+	 * coexist on one connection, each admitted as its own namespace on success.
+	 * Returns the canonical (resolved) cwd; callers invalidate the matching
+	 * namespace after the lifecycle op succeeds.
 	 */
-	#stageCanonicalScope(cwd: string): string {
+	#stageCanonicalCwd(cwd: string): string {
 		this.#assertAbsoluteCwd(cwd);
-		const canonical = path.resolve(cwd);
-		if (this.#canonicalCwdScope !== undefined && this.#canonicalCwdScope !== canonical) {
-			throw new Error(`ACP connection is scoped to ${this.#canonicalCwdScope}, not ${canonical}`);
-		}
-		return canonical;
+		return path.resolve(cwd);
 	}
 
-	/** Commit the canonical cwd scope on the first successful explicit-cwd call. */
-	#commitCanonicalScope(canonical: string): void {
-		if (this.#canonicalCwdScope === undefined) {
-			this.#canonicalCwdScope = canonical;
+	/**
+	 * Resolve the session directory used for a cwd's strict inventory/list. The
+	 * descriptor-seeded connection-wide `--session-dir` override wins (flat shared
+	 * root for every cwd); otherwise an already-admitted namespace's resolved dir;
+	 * otherwise the per-cwd default. The override is known before the first
+	 * lifecycle/list call (see {@link #sharedSessionDirOverride}), never learned.
+	 */
+	#resolveSessionDirForCwd(canonicalCwd: string): string {
+		if (this.#sharedSessionDirOverride !== undefined) {
+			return this.#sharedSessionDirOverride;
+		}
+		const ns = this.#namespaces.get(canonicalCwd);
+		if (ns) {
+			return ns.sessionDir;
+		}
+		return SessionManager.getDefaultSessionDir(canonicalCwd);
+	}
+
+	/** Get (creating if necessary) the namespace for a canonical cwd. */
+	#ensureNamespace(canonicalCwd: string): AcpNamespace {
+		const existing = this.#namespaces.get(canonicalCwd);
+		if (existing) {
+			return existing;
+		}
+		const ns: AcpNamespace = {
+			canonicalCwd,
+			sessionDir: this.#resolveSessionDirForCwd(canonicalCwd),
+			nonce: crypto.randomUUID(),
+			generation: 0,
+			snapshot: undefined,
+		};
+		this.#namespaces.set(canonicalCwd, ns);
+		return ns;
+	}
+
+	/**
+	 * Issue a MANDATORY authority receipt for an active session before it is
+	 * published to {@link #sessions}. Issuance is fallible: a transcript that is
+	 * not persisted, whose identity cannot be read, or whose id is already
+	 * absorbing (ambiguous / deleted tombstone) or issued under a different cwd
+	 * refuses admission by throwing — so no active record is ever published
+	 * without an exact unique receipt, and no active control can later rely on
+	 * {@link #sessions} alone. Only an exact same-identity re-admission (e.g.
+	 * resume of an already-admitted idempotent receipt) is a no-op.
+	 */
+	#issueReceiptForActiveSession(canonicalCwd: string, record: ManagedSessionRecord): void {
+		const sessionId = record.session.sessionId;
+		const file = record.session.sessionManager.getSessionFile();
+		if (!file) {
+			throw new Error(`ACP session ${sessionId} cannot be admitted: transcript is not persisted`);
+		}
+		let stat: SessionStorageStat;
+		try {
+			stat = new FileSessionStorage().statSync(file);
+		} catch {
+			throw new Error(`ACP session ${sessionId} cannot be admitted: transcript identity is unreadable`);
+		}
+		const existing = this.#issuedReceipts.get(sessionId);
+		if (existing !== undefined) {
+			if (existing.state !== "unique") {
+				// Absorbing tombstone (ambiguous / deleted): a replaced, duplicated,
+				// or recreated id cannot regain active authority this connection.
+				throw new Error(
+					`ACP session ${sessionId} cannot be readmitted: prior authority is absorbing (${existing.state})`,
+				);
+			}
+			if (existing.canonicalCwd !== canonicalCwd) {
+				existing.state = "ambiguous";
+				existing.reason = "Session id issued under multiple cwds";
+				throw new Error(
+					`ACP session ${sessionId} cannot be admitted under ${canonicalCwd}: already issued under ${existing.canonicalCwd}`,
+				);
+			}
+			if (
+				existing.transcriptPath === file &&
+				existing.transcriptIdentity.dev === stat.dev &&
+				existing.transcriptIdentity.ino === stat.ino
+			) {
+				// Same exact identity: idempotent re-admission (e.g. resume after close).
+				return;
+			}
+			// Different identity under the same cwd: replacement -> revocation.
+			existing.state = "ambiguous";
+			existing.reason = "Session transcript was replaced; authority revoked";
+			throw new Error(`ACP session ${sessionId} cannot be readmitted: transcript identity changed`);
+		}
+		this.#issuedReceipts.set(sessionId, {
+			state: "unique",
+			canonicalCwd,
+			sessionDir: this.#resolveSessionDirForCwd(canonicalCwd),
+			transcriptPath: file,
+			cwd: canonicalCwd,
+			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			reason: undefined,
+		});
+	}
+
+	/**
+	 * Flip a receipt to the absorbing `ambiguous` state (duplicate within an
+	 * inventory or cross-cwd collision). Once ambiguous it never re-authorizes
+	 * delete, fork, or reissue for the rest of the connection.
+	 */
+	#markReceiptAmbiguous(sessionId: string, reason: string): void {
+		const receipt = this.#issuedReceipts.get(sessionId);
+		if (receipt !== undefined && receipt.state === "unique") {
+			receipt.state = "ambiguous";
+			receipt.reason = reason;
 		}
 	}
 
-	/** Bump the generation and discard the authority snapshot on lifecycle changes. */
-	#invalidateAuthority(): void {
-		this.#authorityGeneration += 1;
-		this.#authoritySnapshot = undefined;
+	/**
+	 * Scope-local invalidation: bump ONE namespace's generation and discard its
+	 * cached snapshot. A lifecycle change in cwd A never invalidates cwd B's
+	 * pagination cursor or authority.
+	 */
+	#invalidateAuthority(canonicalCwd: string): void {
+		const ns = this.#namespaces.get(canonicalCwd);
+		if (!ns) {
+			return;
+		}
+		ns.generation += 1;
+		ns.snapshot = undefined;
 	}
 
 	#rejectIfTerminal(record: ManagedSessionRecord): void {
@@ -1638,58 +2147,151 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Build (or reuse) the complete authorization snapshot from a strict raw scoped
-	 * inventory. The cached pagination snapshot is reused for display/list paging.
-	 * Any inventory failure throws a sanitized error — it grants zero authority.
-	 * The snapshot binds every discovered id to its exact-identity candidate or a
-	 * conflict tombstone BEFORE pagination, so duplicates beyond page 1 are known
-	 * before the first page response.
+	 * Build (or reuse) the complete authorization snapshot for one namespace from
+	 * a strict raw scoped inventory. The cached pagination snapshot is reused for
+	 * display/list paging. Any inventory failure throws a sanitized error — it
+	 * grants zero authority. The snapshot binds every discovered id to its
+	 * exact-identity candidate or a conflict tombstone (duplicate / cross-cwd)
+	 * BEFORE pagination, so duplicates beyond page 1 are known before the first
+	 * page response. A cache miss issues `unique` receipts for every observed
+	 * candidate (the sole id -> namespace/transcript authority route).
 	 */
-	#buildAuthoritySnapshot(scope: string): AcpAuthoritySnapshot {
-		if (this.#authoritySnapshot?.scope === scope) {
-			return this.#authoritySnapshot;
+	#buildAuthoritySnapshot(ns: AcpNamespace): AcpAuthoritySnapshot {
+		if (ns.snapshot) {
+			return ns.snapshot;
 		}
-		return this.#rebuildAuthoritySnapshot(scope, true);
+		return this.#rebuildAuthoritySnapshot(ns, true, true);
 	}
 
 	/**
-	 * Build a FRESH authorization snapshot, ignoring the cached pagination snapshot.
-	 * Destructive authority (delete, inactive fork) must read storage at mutation
-	 * time so an external create/remove/replace/duplicate between list and delete
-	 * cannot yield a stale no-op or wrong mutation. The result is NOT cached: it
-	 * must not poison the generation-aware pagination cursor contract.
+	 * Build a FRESH authorization snapshot for one namespace, ignoring the cached
+	 * pagination snapshot. Destructive authority (delete, inactive fork, load/
+	 * resume candidate resolution) must read storage at mutation time so an
+	 * external create/remove/replace/duplicate between list and delete cannot
+	 * yield a stale no-op or wrong mutation. The result is NOT cached and issues
+	 * no new receipts: it only revalidates already-issued authority.
 	 */
-	#buildFreshAuthoritySnapshot(scope: string): AcpAuthoritySnapshot {
-		return this.#rebuildAuthoritySnapshot(scope, false);
+	#buildFreshAuthoritySnapshot(ns: AcpNamespace): AcpAuthoritySnapshot {
+		return this.#rebuildAuthoritySnapshot(ns, false, false);
 	}
 
-	#rebuildAuthoritySnapshot(scope: string, cache: boolean): AcpAuthoritySnapshot {
-		const inventory = SessionManager.inventorySessionsStrict(scope);
+	#rebuildAuthoritySnapshot(ns: AcpNamespace, cache: boolean, issueReceipts: boolean): AcpAuthoritySnapshot {
+		const sessionDir = this.#resolveSessionDirForCwd(ns.canonicalCwd);
+		ns.sessionDir = sessionDir;
+		// An explicit flat `--session-dir` is a shared authority root: multiple
+		// admitted cwds coexist in one directory, so a foreign-cwd record is a
+		// classified observation (for collision detection), not an inventory
+		// failure. Default per-cwd roots stay strict (foreign record = failure).
+		const sharedRoot = this.#sharedSessionDirOverride !== undefined && sessionDir === this.#sharedSessionDirOverride;
+		const inventory = SessionManager.inventorySessionsStrict(ns.canonicalCwd, { sessionDir, sharedRoot });
 		if (inventory.kind === "failure") {
 			const messages = inventory.failures.map(f => `${f.kind}: ${f.message}`);
 			throw new Error(`ACP scoped session inventory is incomplete: ${messages.join("; ")}`);
+		}
+		// Index foreign candidates (same flat root, different cwd) by id so a
+		// requested-cwd id that ALSO appears under another cwd is detected as a
+		// cross-cwd collision within this one complete-root scan, before paging.
+		const foreignById = new Map<string, StrictInventoryCandidate>();
+		for (const foreignCandidate of inventory.foreign ?? []) {
+			if (!foreignById.has(foreignCandidate.id)) {
+				foreignById.set(foreignCandidate.id, foreignCandidate);
+			}
 		}
 		const entries = new Map<string, AcpAuthorityEntry>();
 		const orderedIds: string[] = [];
 		for (const candidate of inventory.candidates) {
 			const existing = entries.get(candidate.id);
 			if (existing) {
+				// Duplicate within this inventory -> conflict; the receipt (if any)
+				// becomes ambiguously absorbing for the rest of the connection.
 				entries.set(candidate.id, { kind: "conflict", reason: "Duplicate session id in scoped inventory" });
-			} else {
-				entries.set(candidate.id, { kind: "candidate", candidate });
-				orderedIds.push(candidate.id);
+				this.#markReceiptAmbiguous(candidate.id, "Duplicate session id in scoped inventory");
+				continue;
+			}
+			// Cross-cwd collision within the shared root: the same id also lives
+			// under another admitted cwd. Surface as a conflict and flip the
+			// receipt absorbing so neither cwd's copy can re-authorize.
+			if (foreignById.has(candidate.id)) {
+				entries.set(candidate.id, {
+					kind: "conflict",
+					reason: "Session id is also present under another cwd in the shared session directory",
+				});
+				this.#markReceiptAmbiguous(candidate.id, "Session id observed under multiple cwds");
+				continue;
+			}
+			// Cross-cwd collision via a previously-issued receipt: same id already
+			// issued under a different cwd this connection.
+			const receipt = this.#issuedReceipts.get(candidate.id);
+			if (receipt !== undefined && receipt.state === "unique" && receipt.canonicalCwd !== ns.canonicalCwd) {
+				entries.set(candidate.id, {
+					kind: "conflict",
+					reason: `Session id is also active or issued under cwd ${receipt.canonicalCwd}`,
+				});
+				this.#markReceiptAmbiguous(candidate.id, "Session id observed under multiple cwds");
+				continue;
+			}
+			entries.set(candidate.id, { kind: "candidate", candidate });
+			orderedIds.push(candidate.id);
+			if (issueReceipts) {
+				this.#issueUniqueReceipt(ns.canonicalCwd, sessionDir, candidate);
 			}
 		}
 		const snapshot: AcpAuthoritySnapshot = {
-			scope,
 			entries,
 			orderedIds,
-			generation: this.#authorityGeneration,
+			generation: ns.generation,
 		};
 		if (cache) {
-			this.#authoritySnapshot = snapshot;
+			ns.snapshot = snapshot;
 		}
 		return snapshot;
+	}
+
+	/**
+	 * Issue or revalidate a `unique` receipt for an inventory candidate. Only an
+	 * exact same-identity re-observation keeps the receipt `unique`; a same-cwd
+	 * replacement (different transcript identity) flips it absorbing — it is a
+	 * revocation, never a refresh — and an already-absorbing receipt (ambiguous /
+	 * deleted tombstone) is never reissued.
+	 */
+	#issueUniqueReceipt(canonicalCwd: string, sessionDir: string, candidate: StrictInventoryCandidate): void {
+		const existing = this.#issuedReceipts.get(candidate.id);
+		if (existing !== undefined) {
+			// Absorbing receipts (ambiguous / deleted tombstone) are never
+			// reissued: a replaced, duplicated, or recreated id cannot regain
+			// authority this connection.
+			if (existing.state !== "unique") {
+				return;
+			}
+			if (existing.canonicalCwd !== canonicalCwd) {
+				existing.state = "ambiguous";
+				existing.reason = "Session id issued under multiple cwds";
+				return;
+			}
+			// Same cwd + same exact identity: idempotent re-observation, stays unique.
+			if (
+				existing.transcriptPath === candidate.path &&
+				existing.cwd === candidate.cwd &&
+				existing.transcriptIdentity.dev === candidate.identity.dev &&
+				existing.transcriptIdentity.ino === candidate.identity.ino
+			) {
+				return;
+			}
+			// Same cwd + different identity: the transcript was replaced. This is a
+			// revocation, not a refresh — the old identity can never re-authorize.
+			existing.state = "ambiguous";
+			existing.reason = "Session transcript was replaced; authority revoked";
+			return;
+		}
+		this.#issuedReceipts.set(candidate.id, {
+			state: "unique",
+			canonicalCwd,
+			sessionDir,
+			transcriptPath: candidate.path,
+			cwd: candidate.cwd,
+			transcriptIdentity: { dev: candidate.identity.dev, ino: candidate.identity.ino },
+			reason: undefined,
+		});
 	}
 
 	/**
@@ -1715,7 +2317,8 @@ export class AcpAgent implements Agent {
 			throw new Error(`ACP session ${sessionId} is being deleted`);
 		}
 		record.terminalState = "deleting";
-		const scope = this.#canonicalCwdScope!;
+		const canonicalCwd = record.canonicalCwd;
+		const ns = this.#ensureNamespace(canonicalCwd);
 		const terminalPromise = (async (): Promise<DeleteSessionResponse> => {
 			try {
 				// Quiesce — failure is terminal (never swallow).
@@ -1755,7 +2358,7 @@ export class AcpAgent implements Agent {
 					record.terminalFailure = new Error(`ACP session ${sessionId} is not persisted and cannot be deleted`);
 					throw new Error(`ACP session ${sessionId} is not persisted and cannot be deleted`);
 				}
-				const snapshot = this.#buildFreshAuthoritySnapshot(scope);
+				const snapshot = this.#buildFreshAuthoritySnapshot(ns);
 				const entry = snapshot.entries.get(sessionId);
 				if (entry?.kind !== "candidate") {
 					record.terminalState = "terminal_failure";
@@ -1788,11 +2391,15 @@ export class AcpAgent implements Agent {
 						`ACP session ${sessionId} delete is incomplete: ${outcome.phase} cleanup pending (${outcome.error.message})`,
 					);
 				}
-				// Fully deleted: clear retry evidence, remove from active map, dispose.
+				// Fully deleted: clear retry evidence, remove from active map,
+				// retain an absorbing `deleted` tombstone receipt (so a recreated
+				// transcript cannot reissue until reconnect), and dispose.
+				// Invalidation is scope-local to this namespace only.
 				record.terminalState = "deleted";
 				this.#pendingDeleteEvidence.delete(sessionId);
 				this.#sessions.delete(sessionId);
-				this.#invalidateAuthority();
+				this.#retainDeletedReceipt(sessionId);
+				this.#invalidateAuthority(canonicalCwd);
 				await this.#disposeSessionRecord(record);
 				return {};
 			} catch (error) {
@@ -1804,7 +2411,7 @@ export class AcpAgent implements Agent {
 					record.terminalFailure = error instanceof Error ? error : new Error(String(error));
 				}
 				record.terminalPromise = undefined;
-				this.#invalidateAuthority();
+				this.#invalidateAuthority(canonicalCwd);
 				throw error;
 			}
 		})();
@@ -1813,25 +2420,22 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Delete an inactive (not currently loaded) session. The ID must have been
-	 * issued by the last complete scoped authority snapshot; an absent/unissued ID
-	 * returns lookup-free `{}` with NO inventory scan. Only after issuance may a
-	 * fresh strict inventory revalidate the same exact candidate before mutation.
-	 * A repeat-unknown (issued but gone from the fresh inventory) is also lookup-free `{}`.
+	 * Delete an inactive (not currently loaded) session. The caller has already
+	 * resolved the authority receipt (the sole `id -> cwd/transcript` route) and
+	 * rejected an `ambiguous` receipt at the call site; an absent/unissued id is a
+	 * lookup-free no-op. A `unique` OR `deleted`-tombstone receipt flows through
+	 * here, where a fresh strict inventory scoped to the receipt's namespace
+	 * revalidates the same exact candidate before mutation. A repeat-unknown
+	 * (issued but gone, including a second delete of a tombstoned id) is a
+	 * lookup-free `{}`; a recreated transcript fails the identity check
+	 * (tombstone identity never matches a new file) so old authority cannot
+	 * re-authorize a replacement.
 	 */
-	async #deleteInactiveSession(sessionId: string): Promise<DeleteSessionResponse> {
-		const scope = this.#canonicalCwdScope!;
-		// Gate: only IDs issued by the last complete scoped authority snapshot
-		// may trigger a fresh inventory scan. Absent/unissued → lookup-free {}.
-		const issued = this.#authoritySnapshot?.entries.get(sessionId);
-		if (!issued) {
-			return {};
-		}
-		if (issued.kind === "conflict") {
-			throw new Error(`ACP session delete failed: ${issued.reason}`);
-		}
-		// Fresh strict inventory to revalidate the same exact candidate.
-		const snapshot = this.#buildFreshAuthoritySnapshot(scope);
+	async #deleteInactiveSession(sessionId: string, receipt: AcpIssuedReceipt): Promise<DeleteSessionResponse> {
+		// Fresh strict inventory scoped to the receipt's namespace to revalidate
+		// the exact candidate before mutation. Conflicts/absence here fail-closed.
+		const ns = this.#ensureNamespace(receipt.canonicalCwd);
+		const snapshot = this.#buildFreshAuthoritySnapshot(ns);
 		const entry = snapshot.entries.get(sessionId);
 		if (!entry) {
 			// Repeat unknown: issued but no longer present in the fresh inventory.
@@ -1842,10 +2446,10 @@ export class AcpAgent implements Agent {
 		}
 		const candidate = entry.candidate;
 		if (
-			candidate.path !== issued.candidate.path ||
-			candidate.cwd !== issued.candidate.cwd ||
-			candidate.identity.dev !== issued.candidate.identity.dev ||
-			candidate.identity.ino !== issued.candidate.identity.ino
+			candidate.path !== receipt.transcriptPath ||
+			candidate.cwd !== receipt.cwd ||
+			candidate.identity.dev !== receipt.transcriptIdentity.dev ||
+			candidate.identity.ino !== receipt.transcriptIdentity.ino
 		) {
 			throw new Error(`ACP session ${sessionId} changed since authority was issued`);
 		}
@@ -1868,7 +2472,8 @@ export class AcpAgent implements Agent {
 			);
 		}
 		this.#pendingDeleteEvidence.delete(sessionId);
-		this.#invalidateAuthority();
+		this.#retainDeletedReceipt(sessionId);
+		this.#invalidateAuthority(receipt.canonicalCwd);
 		return {};
 	}
 
@@ -2281,8 +2886,8 @@ export class AcpAgent implements Agent {
 		return usage;
 	}
 
-	async #listStoredSessions(cwd?: string): Promise<StoredSessionInfo[]> {
-		const sessions = cwd ? await SessionManager.list(cwd) : await SessionManager.listAll();
+	async #listStoredSessions(cwd?: string, sessionDir?: string): Promise<StoredSessionInfo[]> {
+		const sessions = cwd ? await SessionManager.list(cwd, sessionDir) : await SessionManager.listAll();
 		return sessions.sort((left, right) => right.modified.getTime() - left.modified.getTime());
 	}
 
@@ -2290,34 +2895,42 @@ export class AcpAgent implements Agent {
 		if (!cursor) {
 			return 0;
 		}
-		const parsed = Number.parseInt(cursor, 10);
-		if (!Number.isFinite(parsed) || parsed < 0) {
-			throw new Error(`Invalid ACP session cursor: ${cursor}`);
-		}
-		return parsed;
+		// The cwd-less display cursor is a plain page offset. Exact unsigned
+		// parse (no parseInt/Number coercion) so a malformed cursor fails closed.
+		return parseSafeUint(cursor);
 	}
 
 	/**
-	 * Parse a scoped cursor of the form `${generation}:${offset}` and reject it when
-	 * its embedded generation no longer matches the current authority generation.
-	 * Unlike the cwd-less display cursor, the scoped cursor binds the page offset to
-	 * the exact authority snapshot that produced it, so a lifecycle invalidation
-	 * between pages is observable instead of silently rebuilt.
+	 * Parse a scoped cursor of the anchored versioned grammar
+	 * `acp1:<nonce>:<generation>:<offset>` and reject it unless its version
+	 * prefix, embedded nonce, and generation all match the target namespace.
+	 * The `acp1` prefix versions the grammar; the nonce is the per-namespace
+	 * opaque random binder; the generation binds the cursor to the exact
+	 * authority generation that produced it. So a lifecycle invalidation in THIS
+	 * cwd between page 1 and page 2 (generation bump) is observable, a cursor
+	 * minted by a different cwd (nonce mismatch) can never page another cwd's
+	 * namespace, and a pre-`acp1`/foreign/malformed cursor never parses. All
+	 * numeric fields use exact safe-unsigned-integer parsing (no sign,
+	 * whitespace, exponent, or `parseInt` shortcut); the nonce is matched as an
+	 * opaque string, never parsed as an integer.
 	 */
-	#parseScopedCursor(cursor: string | undefined, currentGeneration: number): number {
+	#parseScopedCursor(cursor: string | undefined, ns: AcpNamespace): number {
 		if (!cursor) {
 			return 0;
 		}
-		const separator = cursor.indexOf(":");
-		if (separator <= 0) {
+		const match = /^acp1:([^:]+):([0-9]+):([0-9]+)$/.exec(cursor);
+		if (!match) {
 			throw new Error(`Invalid ACP session cursor: ${cursor}`);
 		}
-		const generation = Number.parseInt(cursor.slice(0, separator), 10);
-		const offset = Number.parseInt(cursor.slice(separator + 1), 10);
-		if (!Number.isFinite(generation) || generation < 0 || !Number.isFinite(offset) || offset < 0) {
-			throw new Error(`Invalid ACP session cursor: ${cursor}`);
+		const [, nonce, generationText, offsetText] = match;
+		if (nonce !== ns.nonce) {
+			throw new Error(
+				"ACP session list cursor is bound to a different workspace; the scoped session inventory changed",
+			);
 		}
-		if (generation !== currentGeneration) {
+		const generation = parseSafeUint(generationText);
+		const offset = parseSafeUint(offsetText);
+		if (generation !== ns.generation) {
 			throw new Error("ACP session list cursor is stale; the scoped session inventory changed");
 		}
 		return offset;

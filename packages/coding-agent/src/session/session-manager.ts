@@ -33,7 +33,7 @@ import type { TtsrInjectionRecord } from "../export/ttsr";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 
 import * as git from "../utils/git";
-import { ArtifactManager } from "./artifacts";
+import { ArtifactManager, cloneArtifactsExclusive } from "./artifacts";
 import {
 	type BlobPutResult,
 	BlobStore,
@@ -472,6 +472,45 @@ export interface StrictInventoryFailure {
 }
 
 /** One exact-identity candidate suitable for ACP authorization binding. */
+/**
+ * Generous fixed bound for strict inventory header-prefix reads. Inventory
+ * validates only the first JSONL line (the session header); this cap ensures a
+ * strict inventory never loads an entire transcript body. A header whose first
+ * newline is not present within this prefix fails the complete strict inventory
+ * (overlong/missing newline) and issues zero authority.
+ */
+export const STRICT_INVENTORY_HEADER_PREFIX_BYTES = 1 << 20; // 1 MiB
+
+/**
+ * Exact selected-session content bound to one verified descriptor. `bytes` is
+ * the full transcript captured from a single O_NOFOLLOW read whose (dev, ino)
+ * identity matches the strict inventory {@link StrictInventoryCandidate}; callers
+ * hydrate from these exact bytes without reopening the path.
+ */
+export interface SelectedSessionSnapshot {
+	candidate: StrictInventoryCandidate;
+	bytes: Uint8Array;
+	/** Descriptor identity captured from the one authoritative full read. */
+	identity: SessionStorageStat;
+}
+
+/**
+ * Commit receipt for a fork transaction: the published transcript path and the
+ * exact descriptor identity captured after publication. Retained on the manager
+ * so ACP can record newly-owned publication provenance for rollback.
+ */
+export interface ForkCommitReceipt {
+	path: string;
+	identity: { dev: bigint; ino: bigint };
+}
+
+/** Result of {@link SessionManager.fork}: old/new paths plus the commit receipt. */
+export interface ForkCommitResult {
+	oldSessionFile: string;
+	newSessionFile: string;
+	commit: ForkCommitReceipt;
+}
+
 export interface StrictInventoryCandidate {
 	/** Canonical absolute transcript path. */
 	path: string;
@@ -489,7 +528,19 @@ export interface StrictInventoryCandidate {
  * A failure result is never reduced to a partial candidate set.
  */
 export type StrictInventoryResult =
-	| { kind: "complete"; candidates: StrictInventoryCandidate[] }
+	| {
+			kind: "complete";
+			candidates: StrictInventoryCandidate[];
+			/**
+			 * Valid records whose header cwd belongs to a DIFFERENT admitted
+			 * namespace in the same explicit shared root. Present only under the
+			 * shared-root policy (`sharedRoot: true`); a foreign record is a
+			 * classified observation used for cross-cwd collision detection, never
+			 * a default-root inventory failure and never displayed/issued as a
+			 * candidate for the requested cwd.
+			 */
+			foreign?: StrictInventoryCandidate[];
+	  }
 	| { kind: "failure"; failures: StrictInventoryFailure[] };
 
 /** Certainty-aware close outcome for strict ACP disposal. */
@@ -1141,6 +1192,26 @@ export async function loadEntriesFromFile(
 		return [];
 	}
 
+	return entries;
+}
+
+const snapshotEntryDecoder = new TextDecoder("utf-8");
+
+/**
+ * Parse session entries from exact captured descriptor bytes, mirroring
+ * {@link loadEntriesFromFile}'s header validation but without reopening the
+ * path. Used by {@link SessionManager.setSessionFile} when an authoritative
+ * selected-session snapshot is supplied so the hydrated content is exactly the
+ * verified descriptor's bytes.
+ */
+export function hydrateEntriesFromSnapshotBytes(bytes: Uint8Array): FileEntry[] {
+	const content = snapshotEntryDecoder.decode(bytes);
+	const entries = parseJsonlLenient<FileEntry>(content);
+	if (entries.length === 0) return entries;
+	const header = entries[0] as SessionHeader;
+	if (header.type !== "session" || typeof header.id !== "string") {
+		return [];
+	}
 	return entries;
 }
 
@@ -3146,6 +3217,8 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#ensuredOnDisk: boolean = false;
+	/** Last committed fork receipt (new path + identity); undefined until a fork commits. */
+	#lastForkCommit: ForkCommitReceipt | undefined;
 	#fileEntries: FileEntry[] = [];
 	#byId: Map<string, SessionEntry> = new Map();
 	#labelsById: Map<string, string> = new Map();
@@ -3350,6 +3423,7 @@ export class SessionManager {
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
+		this.#lastForkCommit = undefined;
 		this.#resetResidentTextBlobStore();
 		this.#reexternalizeFileEntriesForResidentStore();
 		this.#bumpAllRevisions();
@@ -3390,13 +3464,15 @@ export class SessionManager {
 	}
 
 	/** Switch to a different session file (used for resume and branching) */
-	async setSessionFile(sessionFile: string): Promise<void> {
+	async setSessionFile(sessionFile: string, snapshot?: { bytes: Uint8Array }): Promise<void> {
 		await this.#closePersistWriter();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
 		this.#sessionFile = path.resolve(sessionFile);
 		writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
-		this.#fileEntries = await loadEntriesFromFile(this.#sessionFile, this.storage);
+		this.#fileEntries = snapshot
+			? hydrateEntriesFromSnapshotBytes(snapshot.bytes)
+			: await loadEntriesFromFile(this.#sessionFile, this.storage);
 		if (this.#fileEntries.length > 0) {
 			const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
 			this.#sessionId = header?.id ?? createSessionId();
@@ -3449,58 +3525,145 @@ export class SessionManager {
 	}
 
 	/**
-	 * Fork the current session, creating a new session file with the same entries.
-	 * Returns both the old and new session file paths for artifact copying.
-	 * @returns { oldSessionFile, newSessionFile } or undefined if not persisting
+	 * Fork the current session as one fail-closed transaction: stage the new
+	 * transcript, clone artifacts exclusively, then publish the transcript LAST
+	 * via portable exclusive same-directory publication. On failure only the
+	 * transaction-owned stages/destination are removed and the old manager state
+	 * is restored; the source transcript and artifacts are never touched. Returns
+	 * the old/new paths plus a {@link ForkCommitReceipt}, or undefined when not
+	 * persisting.
 	 */
-	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
+	async fork(): Promise<ForkCommitResult | undefined> {
 		if (!this.persist || !this.#sessionFile) {
 			return undefined;
 		}
 
 		const oldSessionFile = this.#sessionFile;
 		const oldSessionId = this.#sessionId;
-		const materializedEntries = materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores());
+		const oldArtifactDir = oldSessionFile.slice(0, -6);
 
-		// Close the current writer
+		// Close the current writer and capture the pre-fork state for rollback.
 		await this.#closePersistWriter();
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
+		const oldState = this.captureState();
 
-		// Create new session ID and header
-		this.#sessionId = createSessionId();
+		// Compute the new id/header/file WITHOUT committing manager state yet.
+		const newSessionId = createSessionId();
 		const timestamp = new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-		this.#sessionFile = path.join(this.getSessionDir(), `${fileTimestamp}_${this.#sessionId}.jsonl`);
+		const newSessionFile = path.join(this.getSessionDir(), `${fileTimestamp}_${newSessionId}.jsonl`);
+		const newArtifactDir = newSessionFile.slice(0, -6);
 
-		// Update the header with new ID but keep all entries
+		const materializedEntries = materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores());
 		const oldHeader = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
 		const newHeader: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
-			id: this.#sessionId,
+			id: newSessionId,
 			title: oldHeader?.title ?? this.#sessionName,
 			titleSource: oldHeader?.titleSource ?? this.#titleSource,
 			timestamp,
 			cwd: this.cwd,
 			parentSession: oldSessionId,
 		};
+		const newFileEntries: FileEntry[] = [
+			newHeader,
+			...materializedEntries.filter((e): e is SessionEntry => e.type !== "session"),
+		];
+
+		// Prepare durable entries for staging (externalize resident blobs), exactly
+		// like #rewriteFile but written to a holding stage path instead of the final.
+		const stagedEntries = await Promise.all(
+			materializeResidentEntriesForPersistenceSync(newFileEntries, this.#residentBlobStores()).map(entry =>
+				prepareEntryForPersistence(entry, this.#blobStore),
+			),
+		);
+
+		const dir = path.resolve(newSessionFile, "..");
+		const stagePath = path.join(dir, `.${path.basename(newSessionFile)}.${Snowflake.next()}.stage`);
+		let stageWritten = false;
+		let artifactsCloned = false;
+		try {
+			await this.#stageTranscript(stagePath, stagedEntries);
+			stageWritten = true;
+			// Clone artifacts BEFORE publishing the transcript: a partial artifact
+			// tree must never coexist with a published fork transcript.
+			artifactsCloned = await cloneArtifactsExclusive(oldArtifactDir, newArtifactDir);
+			// Publish the transcript LAST via portable exclusive same-directory
+			// publication (link stage -> final, then remove stage).
+			await this.#publishTranscriptExclusive(stagePath, newSessionFile);
+			stageWritten = false; // stage consumed by publication
+		} catch (err) {
+			// Remove only transaction-owned stages/destination; never touch source.
+			if (stageWritten) {
+				await this.storage.unlink(stagePath).catch(() => {});
+			}
+			if (artifactsCloned) {
+				await fs.promises.rm(newArtifactDir, { recursive: true, force: true }).catch(() => {});
+			}
+			this.restoreState(oldState);
+			throw toError(err);
+		}
+
+		// Commit manager state to the fork only after publication succeeded.
+		this.#sessionId = newSessionId;
 		this.#sessionName = newHeader.title;
 		this.#titleSource = newHeader.titleSource;
-
-		// Replace the header in fileEntries
-		const entries = materializedEntries.filter((e): e is SessionEntry => e.type !== "session");
-		this.#fileEntries = [newHeader, ...entries];
+		this.#sessionFile = newSessionFile;
+		this.#fileEntries = newFileEntries;
 		this.#resetResidentTextBlobStore();
 		this.#reexternalizeFileEntriesForResidentStore();
+		this.#flushed = true;
+		this.#ensuredOnDisk = true;
 		this.#bumpAllRevisions();
 
-		// Write the new session file
-		this.#flushed = false;
-		await this.#rewriteFile();
+		const commitStat = this.storage.statSync(newSessionFile);
+		const commit: ForkCommitReceipt = {
+			path: newSessionFile,
+			identity: { dev: commitStat.dev, ino: commitStat.ino },
+		};
+		this.#lastForkCommit = commit;
+		return { oldSessionFile, newSessionFile, commit };
+	}
 
-		return { oldSessionFile, newSessionFile: this.#sessionFile };
+	/**
+	 * Stage transcript entries to a holding path in the target directory. The
+	 * stage is NOT the final session file; {@link #publishTranscriptExclusive}
+	 * commits it atomically after artifacts are cloned.
+	 */
+	async #stageTranscript(stagePath: string, entries: FileEntry[]): Promise<void> {
+		const writer = new NdjsonFileWriter(this.storage, stagePath, { flags: "w" });
+		try {
+			for (const entry of entries) {
+				await writer.write(entry);
+			}
+			await writer.flush();
+			await writer.fsync();
+			await writer.close();
+		} catch (err) {
+			try {
+				await writer.close();
+			} catch {
+				// Best-effort cleanup of the stage writer's descriptor.
+			}
+			await this.storage.unlink(stagePath).catch(() => {});
+			throw toError(err);
+		}
+	}
+
+	/**
+	 * Portable exclusive same-directory publication of a staged transcript.
+	 * Delegates to the storage backend's atomic link/rename-equivalent; fails
+	 * closed if the destination already exists (no overwrite/merge).
+	 */
+	async #publishTranscriptExclusive(stagePath: string, finalPath: string): Promise<void> {
+		const publish = this.storage.publishTranscriptExclusive;
+		if (!publish) {
+			throw new Error("Storage backend does not support exclusive transcript publication");
+		}
+		await publish.call(this.storage, stagePath, finalPath);
 	}
 
 	/**
@@ -4101,6 +4264,15 @@ export class SessionManager {
 
 	getSessionFile(): string | undefined {
 		return this.#sessionFile;
+	}
+
+	/**
+	 * Last committed fork receipt (published transcript path + descriptor
+	 * identity). Read by ACP to record newly-owned fork publication provenance
+	 * for rollback. Undefined until a {@link fork} transaction commits.
+	 */
+	getLastForkCommit(): ForkCommitReceipt | undefined {
+		return this.#lastForkCommit;
 	}
 
 	/**
@@ -5644,10 +5816,23 @@ export class SessionManager {
 	 */
 	static inventorySessionsStrict(
 		cwd: string,
-		options?: { sessionDir?: string; storage?: SessionStorage },
+		options?: {
+			sessionDir?: string;
+			storage?: SessionStorage;
+			/**
+			 * Explicit shared-root policy for a flat `--session-dir` shared by
+			 * multiple admitted cwds. When true, a record whose header cwd differs
+			 * from the requested cwd is classified as a `foreign` observation
+			 * (used for cross-cwd collision detection) instead of a `cwd` failure,
+			 * so two cwds can coexist in one flat root. Default per-cwd roots stay
+			 * strict: a foreign record there is still a hard inventory failure.
+			 */
+			sharedRoot?: boolean;
+		},
 	): StrictInventoryResult {
 		const storage = options?.storage ?? new FileSessionStorage();
 		const dir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
+		const sharedRoot = options?.sharedRoot ?? false;
 		if (!storage.listFilesStrictSync) {
 			return {
 				kind: "failure",
@@ -5691,18 +5876,30 @@ export class SessionManager {
 
 		const failures: StrictInventoryFailure[] = [];
 		const candidates: StrictInventoryCandidate[] = [];
+		const foreign: StrictInventoryCandidate[] = [];
+		const canonicalRequestedCwd = resolveEquivalentPath(cwd);
 		for (const file of files) {
-			const candidate = inventoryReadCandidate(storage, file, cwd, dir);
+			const candidate = inventoryReadCandidate(storage, file, cwd, dir, sharedRoot);
 			if ("failures" in candidate) {
 				failures.push(...candidate.failures);
 				continue;
 			}
-			candidates.push(candidate.candidate);
+			const record = candidate.candidate;
+			// Under the shared-root policy a record belonging to another admitted
+			// cwd is a valid classified observation, not an authoritative
+			// candidate for the requested cwd: route it to `foreign` for
+			// cross-cwd collision detection while displaying/issuing only the
+			// requested cwd's own records.
+			if (sharedRoot && resolveEquivalentPath(record.cwd) !== canonicalRequestedCwd) {
+				foreign.push(record);
+			} else {
+				candidates.push(record);
+			}
 		}
 		if (failures.length > 0) {
 			return { kind: "failure", failures };
 		}
-		return { kind: "complete", candidates };
+		return { kind: "complete", candidates, foreign };
 	}
 
 	/**
@@ -5725,6 +5922,7 @@ function inventoryReadCandidate(
 	file: string,
 	expectedCwd: string,
 	sessionDir: string,
+	sharedRoot: boolean = false,
 ): { candidate: StrictInventoryCandidate } | { failures: StrictInventoryFailure[] } {
 	const failures: StrictInventoryFailure[] = [];
 	const resolvedFile = path.resolve(file);
@@ -5733,12 +5931,12 @@ function inventoryReadCandidate(
 			failures: [{ kind: "containment", message: "Candidate is outside the scoped session directory", path: file }],
 		};
 	}
-	if (!storage.readSnapshotSync) {
+	if (!storage.readSnapshotPrefixSync) {
 		return { failures: [{ kind: "read", message: "Storage backend cannot read exact bytes", path: file }] };
 	}
 	let snapshot: SessionStorageSnapshot;
 	try {
-		snapshot = storage.readSnapshotSync(file);
+		snapshot = storage.readSnapshotPrefixSync(file, STRICT_INVENTORY_HEADER_PREFIX_BYTES);
 	} catch (err) {
 		const code = (err as NodeJS.ErrnoException)?.code;
 		if (code === "ELOOP" || code === "SYMLINK") {
@@ -5753,7 +5951,18 @@ function inventoryReadCandidate(
 		return { failures };
 	}
 	const newline = snapshot.bytes.indexOf(0x0a);
-	const headerBytes = newline === -1 ? snapshot.bytes : snapshot.bytes.subarray(0, newline);
+	if (newline === -1) {
+		// Overlong or missing first newline: the header is not bounded within the
+		// inventory prefix. Fail the complete strict inventory — never grant
+		// authority on an unreadable/unbounded header.
+		failures.push({
+			kind: "parse",
+			message: "Candidate header is missing its terminating newline within the bounded inventory prefix",
+			path: file,
+		});
+		return { failures };
+	}
+	const headerBytes = snapshot.bytes.subarray(0, newline);
 	let header: Record<string, unknown> | undefined;
 	try {
 		const text = strictInventoryDecoder.decode(headerBytes).trim();
@@ -5779,9 +5988,91 @@ function inventoryReadCandidate(
 		return { failures };
 	}
 	const canonicalHeaderCwd = resolveEquivalentPath(header.cwd);
-	if (canonicalHeaderCwd !== resolveEquivalentPath(expectedCwd)) {
+	// In shared explicit-root mode a foreign-CWD record is a valid observation
+	// (it belongs to another admitted namespace in the same flat root): it is
+	// classified by the caller, never a failure. Default per-CWD roots stay
+	// strict — a record whose cwd does not match the scoped workspace is a hard
+	// failure, preserving the existing wrong-cwd guarantee everywhere else.
+	if (!sharedRoot && canonicalHeaderCwd !== resolveEquivalentPath(expectedCwd)) {
 		failures.push({ kind: "cwd", message: "Candidate cwd does not match the scoped workspace", path: file });
 		return { failures };
 	}
 	return { candidate: { path: resolvedFile, id: header.id, cwd: header.cwd, identity: snapshot.stat } };
+}
+
+/**
+ * Read and validate the authoritative full content of a selected session through
+ * ONE O_NOFOLLOW descriptor read, binding the captured bytes to the strict
+ * inventory candidate's exact (dev, ino) identity. The returned bytes are the
+ * exact selected-session content; callers hydrate from them without reopening
+ * the path. A containment/path/id/cwd/dev/ino mismatch issues zero authority.
+ */
+export function readSelectedSessionSnapshot(
+	storage: SessionStorage,
+	candidate: StrictInventoryCandidate,
+	sessionDir: string,
+): SelectedSessionSnapshot | { failures: StrictInventoryFailure[] } {
+	const failures: StrictInventoryFailure[] = [];
+	const resolvedFile = path.resolve(candidate.path);
+	if (!pathIsWithin(path.resolve(sessionDir), resolvedFile)) {
+		return {
+			failures: [
+				{ kind: "containment", message: "Selected session is outside the scoped directory", path: candidate.path },
+			],
+		};
+	}
+	if (!storage.readSnapshotSync) {
+		return { failures: [{ kind: "read", message: "Storage backend cannot read exact bytes", path: candidate.path }] };
+	}
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = storage.readSnapshotSync(candidate.path);
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException)?.code;
+		if (code === "ELOOP" || code === "SYMLINK") {
+			failures.push({ kind: "lstat", message: "Selected session is a symlink", path: candidate.path });
+		} else {
+			failures.push({ kind: "read", message: "Selected session could not be read", path: candidate.path });
+		}
+		return { failures };
+	}
+	if (!snapshot.stat.isFile) {
+		return { failures: [{ kind: "lstat", message: "Selected session is not a regular file", path: candidate.path }] };
+	}
+	if (snapshot.stat.dev !== candidate.identity.dev || snapshot.stat.ino !== candidate.identity.ino) {
+		return {
+			failures: [
+				{
+					kind: "identity",
+					message: "Selected session descriptor identity does not match the verified candidate",
+					path: candidate.path,
+				},
+			],
+		};
+	}
+	const newline = snapshot.bytes.indexOf(0x0a);
+	const headerBytes = newline === -1 ? snapshot.bytes : snapshot.bytes.subarray(0, newline);
+	let header: Record<string, unknown> | undefined;
+	try {
+		const text = strictInventoryDecoder.decode(headerBytes).trim();
+		const value: unknown = text ? JSON.parse(text) : undefined;
+		header = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+	} catch {
+		header = undefined;
+	}
+	if (header?.type !== "session" || typeof header.id !== "string" || header.id !== candidate.id) {
+		return {
+			failures: [
+				{
+					kind: "identity",
+					message: "Selected session header id does not match the candidate",
+					path: candidate.path,
+				},
+			],
+		};
+	}
+	if (typeof header.cwd !== "string") {
+		return { failures: [{ kind: "cwd", message: "Selected session header is missing a cwd", path: candidate.path }] };
+	}
+	return { candidate, bytes: snapshot.bytes, identity: snapshot.stat };
 }

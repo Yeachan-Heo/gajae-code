@@ -325,4 +325,40 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			rethrowWithStderr(oracle, error);
 		}
 	}, 60_000);
+
+	it("two CWDs coexist, isolate, and delete independently over a real subprocess link", async () => {
+		const oracle = await spawnOracle();
+		const { connection, root } = oracle;
+		const workspaceA = path.join(root, "workspace-a");
+		const workspaceB = path.join(root, "workspace-b");
+		await fs.promises.mkdir(workspaceA, { recursive: true });
+		await fs.promises.mkdir(workspaceB, { recursive: true });
+		try {
+			await connection.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+			// Two CWDs coexist on one connection without any cross-cwd rejection.
+			const sessionA = (await connection.newSession({ cwd: workspaceA, mcpServers: [] })).sessionId;
+			const sessionB = (await connection.newSession({ cwd: workspaceB, mcpServers: [] })).sessionId;
+			expect(typeof sessionA).toBe("string");
+			expect(typeof sessionB).toBe("string");
+			expect(sessionA).not.toBe(sessionB);
+
+			// Each cwd's scoped list observes only its own namespace.
+			const listA = await connection.listSessions({ cwd: workspaceA });
+			const listB = await connection.listSessions({ cwd: workspaceB });
+			expect(listA.sessions.map(session => session.sessionId)).toContain(sessionA);
+			expect(listA.sessions.map(session => session.sessionId)).not.toContain(sessionB);
+			expect(listB.sessions.map(session => session.sessionId)).toContain(sessionB);
+			expect(listB.sessions.map(session => session.sessionId)).not.toContain(sessionA);
+
+			// Deleting in workspaceA does not touch workspaceB.
+			expect(await connection.deleteSession({ sessionId: sessionA })).toEqual({});
+			const listAAfter = await connection.listSessions({ cwd: workspaceA });
+			expect(listAAfter.sessions.map(session => session.sessionId)).not.toContain(sessionA);
+			const listBAfter = await connection.listSessions({ cwd: workspaceB });
+			expect(listBAfter.sessions.map(session => session.sessionId)).toContain(sessionB);
+		} catch (error) {
+			rethrowWithStderr(oracle, error);
+		}
+	}, 60_000);
 });

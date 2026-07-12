@@ -6826,7 +6826,9 @@ export class AgentSession {
 
 	/**
 	 * Fork the current session, creating a new session file with the exact same state.
-	 * Copies all entries and artifacts to the new session.
+	 * Transcript + artifacts are committed as one fail-closed transaction by the
+	 * session manager (clone artifacts, then publish transcript last); this method
+	 * no longer performs a separate warning-and-continue artifact copy.
 	 * Unlike newSession(), this preserves all messages in the agent state.
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
@@ -6854,38 +6856,31 @@ export class AgentSession {
 			return false;
 		}
 
-		// Copy artifacts directory if it exists
-		const oldArtifactDir = forkResult.oldSessionFile.slice(0, -6);
-		const newArtifactDir = forkResult.newSessionFile.slice(0, -6);
-
-		try {
-			const oldDirStat = await fs.promises.stat(oldArtifactDir);
-			if (oldDirStat.isDirectory()) {
-				await fs.promises.cp(oldArtifactDir, newArtifactDir, { recursive: true });
-			}
-		} catch (err) {
-			if (!isEnoent(err)) {
-				logger.warn("Failed to copy artifacts during fork", {
-					oldArtifactDir,
-					newArtifactDir,
-					error: err instanceof Error ? err.message : String(err),
-				});
-			}
-		}
-
 		// Update agent session ID
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 
 		this.#resetIrcRosterDeliveryState();
 
-		// Emit session_switch event with reason "fork" to hooks
+		// Emit session_switch event with reason "fork" to hooks. This is a POSTCOMMIT
+		// hook: by this point the fork (transcript + artifacts + new session id) is
+		// already durably committed, so a listener throw must NOT turn a successful
+		// fork into a deceptive failure or roll back the committed session. It is
+		// reported as a post_commit_hook_error and the fork stays committed. A future
+		// precommit extension must be a separate cancelable hook emitted before staging.
 		if (this.#extensionRunner) {
-			await this.#extensionRunner.emit({
-				type: "session_switch",
-				reason: "fork",
-				previousSessionFile,
-			});
+			try {
+				await this.#extensionRunner.emit({
+					type: "session_switch",
+					reason: "fork",
+					previousSessionFile,
+				});
+			} catch (hookError) {
+				logger.warn("post_commit_hook_error: session_switch (fork) listener threw; fork remains committed", {
+					previousSessionFile,
+					error: hookError instanceof Error ? hookError.message : String(hookError),
+				});
+			}
 		}
 
 		return true;
@@ -10901,7 +10896,7 @@ export class AgentSession {
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
-	async switchSession(sessionPath: string): Promise<boolean> {
+	async switchSession(sessionPath: string, snapshot?: { bytes: Uint8Array }): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -10953,7 +10948,7 @@ export class AgentSession {
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 
 		try {
-			await this.sessionManager.setSessionFile(sessionPath);
+			await this.sessionManager.setSessionFile(sessionPath, snapshot);
 			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 
