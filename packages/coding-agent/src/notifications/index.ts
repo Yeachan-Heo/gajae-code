@@ -55,7 +55,7 @@ import {
 	sessionTag,
 } from "./config";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
-import { ensureTelegramDaemonRunning } from "./telegram-daemon";
+import { ensureTelegramDaemonRunning, type EnsureDaemonResult } from "./telegram-daemon";
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -1259,6 +1259,28 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 		});
 
 		try {
+			// Configured-Telegram session: a fresh daemon registration MUST succeed
+			// before this session publishes an endpoint, registers its answer source,
+			// or pins its identity header. Only `owner_spawned` / `attached` are
+			// success; `blocked`, `disabled`, a thrown registration/lock/state error,
+			// or any other result would leave the session orphaned/mis-routed, so emit
+			// the bounded diagnostic and fail before any publication. Non-Telegram
+			// sessions skip this gate entirely.
+			if (settingsAvailable && settings && isTelegramConfigured(cfg)) {
+				let daemonResult: EnsureDaemonResult;
+				try {
+					daemonResult = await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
+				} catch (e) {
+					logger.warn(`notifications: Telegram daemon registration failed: ${String(e)}`);
+					return "failed";
+				}
+				if (daemonResult !== "owner_spawned" && daemonResult !== "attached") {
+					logger.warn(
+						`notifications: Telegram daemon registration ${daemonResult}; not publishing session endpoint`,
+					);
+					return "failed";
+				}
+			}
 			const endpoint = await server.start();
 
 			// Interactive answer source: the ask tool races the local UI against this.
@@ -1323,14 +1345,6 @@ export function createNotificationsExtension(api: ExtensionAPI, options: { setti
 				await stopSession(id);
 			});
 			logger.info(`notifications: serving session ${id} at ${endpoint.url}`);
-
-			if (settingsAvailable && settings && isTelegramConfigured(cfg)) {
-				try {
-					await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
-				} catch (e) {
-					logger.warn(`notifications: failed to ensure Telegram daemon: ${String(e)}`);
-				}
-			}
 
 			// One-time identity header (repo/branch/machine/session) pinned at the top
 			// of the session thread by the daemon.
