@@ -10425,18 +10425,24 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: incomingTimestamp,
 		};
-		void this.#emitSessionEvent({ type: "irc_message", message: incomingRecord });
-		this.#forwardIrcRelayToMain({
-			observationId: incomingObservationId,
-			from: args.from,
-			to: this.#agentId ?? "?",
-			body: args.message,
-			kind: "message",
-			timestamp: incomingTimestamp,
-		});
+		const announceIncoming = () => {
+			this.#emitIrcObservation(incomingRecord);
+			this.#forwardIrcRelayToMain({
+				observationId: incomingObservationId,
+				from: args.from,
+				to: this.#agentId ?? "?",
+				body: args.message,
+				kind: "message",
+				timestamp: incomingTimestamp,
+			});
+		};
 
 		if (!awaitReply) {
+			args.signal?.throwIfAborted();
+			// Volatile session acceptance happens before any recipient or main-UI
+			// observation, and before this delivery reports success to its sender.
 			this.#queueBackgroundExchangeInjection([incomingRecord]);
+			announceIncoming();
 			return { replyText: null };
 		}
 
@@ -10444,33 +10450,46 @@ export class AgentSession {
 			from: args.from,
 			message: args.message,
 		});
-		const { replyText } = await this.runEphemeralTurn({
+		// Generate the reply before accepting or surfacing the exchange. Provider
+		// failures and sender aborts therefore leave no accepted IRC batch or UI
+		// observation. The deferred roster claim is committed only after the pair
+		// below is accepted.
+		const { replyText, commitRosterClaim, releaseRosterClaim } = await this.runEphemeralTurn({
 			promptText: incomingPrompt,
 			signal: args.signal,
+			deferRosterCommit: true,
 		});
+		try {
+			const replyObservationId = crypto.randomUUID();
+			const replyRecord: CustomMessage = {
+				role: "custom",
+				customType: "irc:autoreply",
+				content: `[IRC you → \`${args.from}\` (auto)]\n\n${replyText}`,
+				display: true,
+				details: { observationId: replyObservationId, to: args.from, reply: replyText },
+				attribution: "agent",
+				timestamp: Date.now(),
+			};
+			// Accept the ordered pair as one volatile batch before committing its
+			// roster claim, notifying either UI, or resolving the sender delivery.
+			args.signal?.throwIfAborted();
+			this.#queueBackgroundExchangeInjection([incomingRecord, replyRecord]);
+			commitRosterClaim?.();
+			announceIncoming();
+			this.#emitIrcObservation(replyRecord);
+			this.#forwardIrcRelayToMain({
+				observationId: replyObservationId,
+				from: this.#agentId ?? "?",
+				to: args.from,
+				body: replyText,
+				kind: "reply",
+				timestamp: replyRecord.timestamp,
+			});
 
-		const replyObservationId = crypto.randomUUID();
-		const replyRecord: CustomMessage = {
-			role: "custom",
-			customType: "irc:autoreply",
-			content: `[IRC you → \`${args.from}\` (auto)]\n\n${replyText}`,
-			display: true,
-			details: { observationId: replyObservationId, to: args.from, reply: replyText },
-			attribution: "agent",
-			timestamp: Date.now(),
-		};
-		void this.#emitSessionEvent({ type: "irc_message", message: replyRecord });
-		this.#forwardIrcRelayToMain({
-			observationId: replyObservationId,
-			from: this.#agentId ?? "?",
-			to: args.from,
-			body: replyText,
-			kind: "reply",
-			timestamp: replyRecord.timestamp,
-		});
-		this.#queueBackgroundExchangeInjection([incomingRecord, replyRecord]);
-
-		return { replyText };
+			return { replyText };
+		} finally {
+			releaseRosterClaim?.();
+		}
 	}
 
 	/**
@@ -10510,7 +10529,17 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: args.timestamp,
 		};
-		mainSession.emitIrcRelayObservation(relayRecord);
+		try {
+			mainSession.emitIrcRelayObservation(relayRecord);
+		} catch (error) {
+			logger.warn("Failed to forward IRC relay observation", { error: String(error) });
+		}
+	}
+
+	#emitIrcObservation(message: CustomMessage): void {
+		void this.#emitSessionEvent({ type: "irc_message", message }).catch(error => {
+			logger.warn("Failed to emit IRC observation", { error: String(error) });
+		});
 	}
 
 	/**
@@ -10518,7 +10547,7 @@ export class AgentSession {
 	 * Does not persist the record to history. Public so other sessions can forward.
 	 */
 	emitIrcRelayObservation(record: CustomMessage): void {
-		void this.#emitSessionEvent({ type: "irc_message", message: record });
+		this.#emitIrcObservation(record);
 	}
 
 	emitSubagentSteerObservation(args: { from: string; to: string; body: string; timestamp?: number }): void {
@@ -10648,8 +10677,16 @@ export class AgentSession {
 		promptText: string;
 		onTextDelta?: (delta: string) => void;
 		signal?: AbortSignal;
-	}): Promise<{ replyText: string; assistantMessage: AssistantMessage }> {
+		/** Defer the successful roster-claim commit until the caller accepts its exchange. */
+		deferRosterCommit?: boolean;
+	}): Promise<{
+		replyText: string;
+		assistantMessage: AssistantMessage;
+		commitRosterClaim?: () => void;
+		releaseRosterClaim?: () => void;
+	}> {
 		const rosterClaim = this.#claimIrcRosterCandidate();
+		let rosterClaimDeferred = false;
 		try {
 			const model = this.model;
 			if (!model) {
@@ -10718,12 +10755,31 @@ export class AgentSession {
 			if (!assistantMessage) {
 				throw new Error("Ephemeral turn ended without a final message");
 			}
+			if (rosterClaim && args.deferRosterCommit) {
+				rosterClaimDeferred = true;
+				let rosterClaimSettled = false;
+				const settleRosterClaim = (commit: boolean) => {
+					if (rosterClaimSettled) return;
+					rosterClaimSettled = true;
+					if (commit) {
+						this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
+					} else {
+						this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
+					}
+				};
+				return {
+					replyText: dedupeIrcReply(replyText.trim()),
+					assistantMessage,
+					commitRosterClaim: () => settleRosterClaim(true),
+					releaseRosterClaim: () => settleRosterClaim(false),
+				};
+			}
 			if (rosterClaim) {
 				this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 			return { replyText: dedupeIrcReply(replyText.trim()), assistantMessage };
 		} finally {
-			if (rosterClaim) {
+			if (rosterClaim && !rosterClaimDeferred) {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 		}
