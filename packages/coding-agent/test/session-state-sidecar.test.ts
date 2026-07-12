@@ -143,6 +143,54 @@ describe("coordinator runtime state sidecar", () => {
 		}
 	});
 
+	it("persists agent state for a coordinator-managed --worktree runtime whose cwd differs from the recorded delegate cwd", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const delegateCwd = path.join(root, "repo"); // what the coordinator recorded
+		const worktreeCwd = path.join(root, "repo.gajae-code-worktrees", "wt-1"); // where the agent runs
+		await fs.mkdir(delegateCwd, { recursive: true });
+		await fs.mkdir(worktreeCwd, { recursive: true });
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "gjc-coordinator-abc";
+		// The coordinator's own initial write: session_id is the coordinator id, but cwd/workdir are the
+		// DELEGATE cwd (the runtime has not yet created its worktree) and source is "coordinator".
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: "gjc-coordinator-abc",
+				state: "running",
+				ready_for_input: false,
+				updated_at: "2026-01-01T00:00:00.000Z",
+				current_turn_id: null,
+				last_turn_id: null,
+				live: null,
+				cwd: delegateCwd,
+				workdir: delegateCwd,
+				session_file: null,
+				source: "coordinator",
+			})}\n`,
+		);
+
+		// The agent, running inside the --worktree, emits turn_start with the WORKTREE cwd + its own
+		// agent session file — both differ from the coordinator's recorded delegate cwd.
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{
+				sessionId: "agent-internal-id",
+				cwd: worktreeCwd,
+				sessionFile: path.join(worktreeCwd, ".gjc", "session.json"),
+			},
+		);
+
+		// The write must land (identity is the matching coordinator session_id). Before the fix the cwd
+		// mismatch threw, so the file stayed frozen at source="coordinator" and no agent state was ever
+		// surfaced to the coordinator.
+		const after = await readJson(stateFile);
+		expect(after.source).toBe("agent_session_event");
+		expect(after.session_id).toBe("gjc-coordinator-abc");
+	});
+
 	it("refreshes updated_at for duplicate same-state running writes after the heartbeat", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");

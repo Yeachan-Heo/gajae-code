@@ -508,6 +508,18 @@ function assertPreviousRuntimeStateIdentity(
 	input: { sessionId: string; cwd: string; sessionFile: string | null },
 ): void {
 	if (Object.keys(previous).length === 0) return;
+	// The coordinator writes the initial state (source "coordinator") with the *delegate* cwd, before
+	// the --worktree runtime has created its worktree. The runtime then legitimately runs in a worktree
+	// cwd (and writes its own agent session_file) that differ from that initial record. Only the
+	// coordinator session_id is stable across that handoff, so gate identity on session_id alone for
+	// the coordinator→agent transition. Any other prior state (agent→agent, or a genuinely stale/
+	// foreign record) keeps the full cwd/workdir/session_file guard that rejects stale writes — without
+	// this, the identity mismatch rejected EVERY agent state write and the coordinator's view froze at
+	// the initial "running" (ack timeouts, unrelayed questions, hung turns).
+	if (process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() && previous.source === "coordinator") {
+		if (previous.session_id !== input.sessionId) throw new PreviousRuntimeStateReadError();
+		return;
+	}
 	if (
 		previous.session_id !== input.sessionId ||
 		typeof previous.cwd !== "string" ||
