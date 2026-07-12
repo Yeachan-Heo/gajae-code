@@ -508,6 +508,31 @@ function assertPreviousRuntimeStateIdentity(
 	input: { sessionId: string; cwd: string; sessionFile: string | null },
 ): void {
 	if (Object.keys(previous).length === 0) return;
+	// The coordinator writes the initial state (source "coordinator") with the *delegate* cwd, before
+	// the --worktree runtime has created its worktree. The runtime then legitimately runs in a worktree
+	// cwd (and writes its own agent session_file) that differ from that initial record, so the cwd/
+	// workdir/session_file guard cannot apply to that one coordinator→agent handoff. Bypass it ONLY for
+	// the fresh, non-terminal initial record of THIS launch:
+	//   - session_id must match — never accept a foreign session;
+	//   - launch_id must match this runtime's launch — a truncated-id collision or a stale predecessor
+	//     from another launch is rejected, not silently accepted;
+	//   - the record must not already be terminal — a coordinator terminal state (written by
+	//     report_status, which also promotes a queued turn) must NOT be reopened by a late async event
+	//     from the old runtime, which would otherwise falsely bind/ack the promoted turn and suppress
+	//     its prompt-ack timeout.
+	// Every other prior state (agent→agent, or a genuinely stale/foreign record) keeps the full guard.
+	if (process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() && previous.source === "coordinator") {
+		const launchId = process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV]?.trim();
+		if (
+			previous.session_id !== input.sessionId ||
+			previous.state === "completed" ||
+			previous.state === "errored" ||
+			!launchId ||
+			previous.launch_id !== launchId
+		)
+			throw new PreviousRuntimeStateReadError();
+		return;
+	}
 	if (
 		previous.session_id !== input.sessionId ||
 		typeof previous.cwd !== "string" ||

@@ -6,6 +6,10 @@
 
 - Added an owner-proof idle session reaper and `gjc_coordinator_stop_session` for ephemeral (delegate-created) coordinator sessions. Termination goes exclusively through the owner-proof `forceCloseGjcTmuxSession` path (pid, native session id, owner generation, server key, and start time all verified before SIGTERM) — never a raw `process.kill`. The reaper binds each close to the persisted runtime-state file, re-validates ephemeral and no-active-turn at kill time under the same per-session mutation lock as delegate reuse, and purges state only on verified termination (#2080).
 
+### Fixed
+
+- A coordinator-managed `--worktree` delegate runtime now reports its runtime state (turn_start / running / needs_user_input / completed) back to the coordinator. The runtime executes inside a git worktree whose cwd differs from the delegate cwd the coordinator recorded in its initial `source: "coordinator"` state write, so the cwd/workdir/session_file identity guard threw `PreviousRuntimeStateReadError` on every agent-emitted write and the coordinator's view froze at the initial `running` (spurious ack timeouts, unrelayed `needs_user_input` questions, hung turns). The guard now skips the cwd/workdir/session_file check for that one coordinator→agent handoff **only** when the prior record is the coordinator's own **fresh, non-terminal** write for **this launch**: the coordinator `session_id` and `launch_id` must both match and the record must not already be terminal. This rejects a late async event from a superseded runtime reopening a coordinator-terminal state (which would otherwise falsely bind/ack a promoted queued turn and suppress its prompt-ack timeout) and rejects a stale predecessor from another launch on a truncated-id collision; agent→agent and genuinely stale/foreign prior records keep the full guard (#2085).
+
 ## [0.10.0] - 2026-07-12
 
 ### Added
