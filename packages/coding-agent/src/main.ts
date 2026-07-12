@@ -291,11 +291,18 @@ export async function applyStartupModelProfiles(args: {
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
-		options: { thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"] } = {},
+		options: {
+			thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"];
+			preserveSkillRuntimePreferences?: boolean;
+		} = {},
 	): Promise<void> => {
 		await activateModelProfile(
 			{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-			{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+			{
+				persistDefault,
+				thinkingLevelOverride: options.thinkingLevelOverride,
+				preserveSkillRuntimePreferences: options.preserveSkillRuntimePreferences,
+			},
 		);
 	};
 
@@ -309,10 +316,14 @@ export async function applyStartupModelProfiles(args: {
 	}
 
 	if (defaultProfile) {
+		// Config-driven auto activation is an ambient default, not an explicit
+		// per-invocation model pick: skill frontmatter model/effort preferences
+		// must stay applicable for skill turns.
 		await applyProfile(defaultProfile, false, {
 			thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
 				? args.settings.get("defaultThinkingLevel")
 				: undefined,
+			preserveSkillRuntimePreferences: true,
 		});
 	}
 	if (args.parsedArgs.mpreset) {

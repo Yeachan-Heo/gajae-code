@@ -7145,12 +7145,18 @@ export class AgentSession {
 	 * `persistAsSessionDefault: true` so the profile's main model becomes the
 	 * session default and survives resume, while still not being written to
 	 * global settings (new sessions keep the global default).
+	 *
+	 * `persistAsSessionDefault` also marks the session model as explicitly
+	 * chosen, disabling SKILL.md model/effort preferences — unless
+	 * `preserveSkillRuntimePreferences` is set, which config-driven startup
+	 * profile auto-activation uses because an ambient config default must not
+	 * silence skill frontmatter.
 	 * @throws Error if no API key available for the model
 	 */
 	async setModelTemporary(
 		model: Model,
 		thinkingLevel?: ThinkingLevel,
-		options?: { persistAsSessionDefault?: boolean },
+		options?: { persistAsSessionDefault?: boolean; preserveSkillRuntimePreferences?: boolean },
 	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
@@ -7158,7 +7164,9 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
-		if (options?.persistAsSessionDefault) this.#allowSkillRuntimePreferences = false;
+		if (options?.persistAsSessionDefault && !options?.preserveSkillRuntimePreferences) {
+			this.#allowSkillRuntimePreferences = false;
+		}
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
 		this.sessionManager.appendModelChange(

@@ -39,19 +39,31 @@ function fakeRegistry(
 	return registry;
 }
 
+type SetModelTemporaryOptions = { persistAsSessionDefault?: boolean; preserveSkillRuntimePreferences?: boolean };
+
 function fakeSession(initial = model("initial-provider", "initial")) {
 	const session = {
 		model: initial as Model | undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
 		sessionId: "session-1",
-		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
-		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
-			session.setModelTemporaryCalls.push({ model: next, thinkingLevel });
+		setModelTemporaryCalls: [] as Array<{
+			model: Model;
+			thinkingLevel?: ThinkingLevel;
+			options?: SetModelTemporaryOptions;
+		}>,
+		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel, options?: SetModelTemporaryOptions) {
+			session.setModelTemporaryCalls.push({ model: next, thinkingLevel, options });
 			session.model = next;
 			session.thinkingLevel = thinkingLevel;
 		},
 	};
-	return session as AgentSession & { setModelTemporaryCalls: Array<{ model: Model; thinkingLevel?: ThinkingLevel }> };
+	return session as AgentSession & {
+		setModelTemporaryCalls: Array<{
+			model: Model;
+			thinkingLevel?: ThinkingLevel;
+			options?: SetModelTemporaryOptions;
+		}>;
+	};
 }
 describe("CLI model profile args", () => {
 	test("parses --mpreset with separate value", () => {
@@ -156,6 +168,40 @@ test("deferred explicit CLI --model is reapplied after --mpreset activation", as
 	).toEqual(["profile-provider/default:high", "cli-provider/explicit:undefined"]);
 	expect(session.setModelTemporaryCalls.at(-1)?.model).toBe(explicitModel);
 	expect(session.model).toBe(explicitModel);
+});
+
+test("config default profile activation preserves skill runtime preferences; --mpreset does not", async () => {
+	const settings = Settings.isolated({ "modelProfile.default": "default-profile" });
+	const session = fakeSession();
+	const registry = fakeRegistry([
+		{
+			name: "default-profile",
+			requiredProviders: ["profile-provider"],
+			modelMapping: { default: "profile-provider/default:medium" },
+			source: "user",
+		},
+		{
+			name: "session-profile",
+			requiredProviders: ["cli-provider"],
+			modelMapping: { default: "cli-provider/explicit:high" },
+			source: "user",
+		},
+	]) as never;
+
+	await applyStartupModelProfiles({
+		session,
+		settings,
+		modelRegistry: registry,
+		parsedArgs: { mpreset: "session-profile" },
+		startupModel: undefined,
+		startupThinkingLevel: undefined,
+	});
+
+	expect(
+		session.setModelTemporaryCalls.map(
+			call => `${call.model.provider}/${call.model.id}:${call.options?.preserveSkillRuntimePreferences === true}`,
+		),
+	).toEqual(["profile-provider/default:true", "cli-provider/explicit:false"]);
 });
 
 test("ACP session factory applies default profile and --mpreset before returning session", async () => {

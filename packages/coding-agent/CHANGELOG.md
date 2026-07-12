@@ -12,6 +12,7 @@
 ### Fixed
 
 - Project and user runtime skills now honor Claude-compatible `model` and `effort` frontmatter on slash invocation and automatic skill chaining. Context-qualified selectors such as `opus[1m]` resolve to the newest available matching family model with the requested context window, run in a fresh transient turn when chaining from an active stream, restore the prior session model afterward, and fail closed when unavailable instead of silently running on an unrelated default model.
+- Config-driven startup activation of `modelProfile.default` no longer disables SKILL.md `model`/`effort` runtime preferences. The ambient config profile default now stays overridable by skill frontmatter for the skill turn, while explicit selections (CLI `--model`, `--mpreset`, interactive `/model` or profile activation) remain authoritative over skill frontmatter.
 
 ## [0.10.0] - 2026-07-12
 

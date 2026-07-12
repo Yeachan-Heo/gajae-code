@@ -46,6 +46,13 @@ export interface PrepareModelProfileActivationOptions {
 export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
 	thinkingLevelOverride?: ThinkingLevel;
+	/**
+	 * Config-driven startup auto-activation sets an ambient session default and
+	 * must keep SKILL.md model/effort preferences applicable. Explicit user
+	 * activations (interactive selector, `--mpreset`) leave this unset so the
+	 * user's pick stays authoritative over skill frontmatter.
+	 */
+	preserveSkillRuntimePreferences?: boolean;
 }
 export interface PreparedModelProfileActivation {
 	profileName: string;
@@ -371,6 +378,7 @@ export async function applyPreparedModelProfileActivation(
 				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
 				{
 					persistAsSessionDefault: true,
+					preserveSkillRuntimePreferences: options.preserveSkillRuntimePreferences,
 				},
 			);
 			modelChanged = true;

@@ -207,6 +207,38 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		expect(requestedModels).toEqual([`${base.provider}/${base.id}`]);
 		expect(session.model).toBe(base);
 	});
+	it("keeps skill frontmatter applicable when the profile default is config-driven", async () => {
+		const { base, profileMain } = resolveModels();
+		const requestedModels: string[] = [];
+		session = makeSession(base, requestedModels);
+		// Startup auto-activation of `modelProfile.default` from config: ambient
+		// default, not an explicit user pick.
+		await session.setModelTemporary(base, undefined, {
+			persistAsSessionDefault: true,
+			preserveSkillRuntimePreferences: true,
+		});
+		// Preserving skill prefs must not weaken the resume-default recording.
+		expect(session.sessionManager.buildSessionContext().models.default).toBe("openai-codex/gpt-5.5");
+		const originalThinking = session.thinkingLevel;
+
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "# Creative\nWrite.",
+			display: true,
+			attribution: "user",
+			details: {
+				name: "creative",
+				path: "/tmp/creative/SKILL.md",
+				lineCount: 2,
+				requestedModel: "opus[1m]",
+				requestedEffort: "high",
+			},
+		});
+
+		expect(requestedModels).toEqual([`${profileMain.provider}/${profileMain.id}`]);
+		expect(session.model).toBe(base);
+		expect(session.thinkingLevel).toBe(originalThinking);
+	});
 	it("fails closed when a skill's requested context window is unavailable", async () => {
 		const { base } = resolveModels();
 		session = makeSession(base);
