@@ -179,6 +179,8 @@ export interface InteractiveModeContext {
 	setPetMode(mode: PetMode): void;
 	/** Live-preview a pet skin during a selector without persisting. */
 	previewPetMode(mode: PetMode): void;
+	/** Commit a settings-overlay pet preview without re-mounting the composer. */
+	commitPetPreviewMode(mode: PetMode): void;
 	/** Re-mount the composer (pet-aware) after an overlay/selector closes. */
 	restoreComposer(): void;
 	startPendingSubmission(input: {

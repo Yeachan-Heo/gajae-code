@@ -25,6 +25,7 @@ import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } 
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
+import { createPetSelectItems, isPetAvailable } from "./pet-capability";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingsForTab, type SettingDef } from "./settings-defs";
 import type { StatusLineSegmentOptions } from "./status-line";
@@ -661,6 +662,8 @@ export interface SettingsRuntimeContext {
 	availableModelProfiles: string[];
 	/** Working directory for plugins tab */
 	cwd: string;
+	/** Whether this terminal can render the pet overlay. */
+	petAvailable?: boolean;
 }
 
 /** Status line settings subset for preview */
@@ -841,7 +844,7 @@ export class SettingsSelectorComponent extends Container {
 		currentValue: string,
 		done: (value?: string) => void,
 	): Container {
-		let options = def.options;
+		let options: ReadonlyArray<SelectItem> = def.options;
 
 		// Special case: inject runtime options for thinking level
 		if (def.path === "defaultThinkingLevel") {
@@ -856,6 +859,9 @@ export class SettingsSelectorComponent extends Container {
 		}
 		if (def.path === "statusLine.preset") {
 			options = options.filter(option => option.value !== "custom");
+		}
+		if (def.path === "pet.mode") {
+			options = createPetSelectItems(options, currentValue, this.context.petAvailable ?? isPetAvailable());
 		}
 		// Preview handlers
 		let onPreview: ((value: string) => void | Promise<void>) | undefined;

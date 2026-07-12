@@ -24,19 +24,20 @@ function makeStubs(columns = 80, rows = 30) {
 		invalidate() {},
 	} as unknown as CustomEditor;
 	let emitter: (() => string | null) | undefined;
+	const terminal = {
+		columns,
+		rows,
+		write: (data: string) => {
+			written.push(data);
+		},
+	};
 	const ui = {
 		requestRender: () => {},
 		setPostRenderEmitter: (fn?: () => string | null) => {
 			emitter = fn;
 		},
 		terminalAvailable: true,
-		terminal: {
-			columns,
-			rows,
-			write: (data: string) => {
-				written.push(data);
-			},
-		},
+		terminal,
 	} as unknown as TUI;
 	const editorContainer = new Container();
 	const floorContainer = new Container();
@@ -49,6 +50,10 @@ function makeStubs(columns = 80, rows = 30) {
 		written,
 		getEmitter: () => emitter,
 		getRenderedWidth: () => renderedWidth,
+		setTerminalSize: (nextColumns: number, nextRows: number) => {
+			terminal.columns = nextColumns;
+			terminal.rows = nextRows;
+		},
 	};
 }
 
@@ -59,7 +64,7 @@ function makeWidget(
 		bottomOffset?: number;
 		isWorking?: () => boolean;
 		autoFlexGapMs?: [number, number] | null;
-		protocol?: "sixel" | "kitty";
+		protocol?: "sixel" | "kitty" | null;
 	} = {},
 ) {
 	const stubs = makeStubs(columns, rows);
@@ -70,7 +75,7 @@ function makeWidget(
 		floorContainer: stubs.floorContainer,
 		isWorking: options.isWorking ?? (() => false),
 		getComposerBottomOffset: () => stubs.floorContainer.render(columns).length + (options.bottomOffset ?? 0),
-		forcePixelProtocol: options.protocol ?? "sixel",
+		forcePixelProtocol: options.protocol === null ? undefined : (options.protocol ?? "sixel"),
 		autoFlexGapMs: options.autoFlexGapMs !== undefined ? options.autoFlexGapMs : null,
 	});
 	return { ...stubs, widget };
@@ -95,6 +100,65 @@ describe("GajaePetWidget", () => {
 			expect(payload).toContain("\x1bP0;1;0q");
 			// Pet is inset one column from the right edge (x = 80 - 4 - 1 = 75 -> col 76).
 			expect(payload).toContain(`;${80 - 4 - 1 + 1}H`);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("owns and deletes a distinct Kitty image ID per widget", () => {
+		const first = makeWidget(80, 30, { protocol: "kitty" });
+		const second = makeWidget(80, 30, { protocol: "kitty" });
+		try {
+			first.widget.setMode("red");
+			second.widget.setMode("red");
+			const firstPayload = first.getEmitter()?.();
+			const secondPayload = second.getEmitter()?.();
+			const firstId = firstPayload?.match(/i=(\d+)/)?.[1];
+			const secondId = secondPayload?.match(/i=(\d+)/)?.[1];
+
+			expect(firstId).toBeDefined();
+			expect(secondId).toBeDefined();
+			expect(firstId).not.toBe(secondId);
+			expect(Number(firstId)).toBeGreaterThan(0);
+			expect(Number(secondId)).toBeGreaterThan(0);
+
+			first.written.length = 0;
+			first.widget.setMode("off");
+			expect(first.written.some(chunk => chunk.includes(`a=d,d=I,i=${firstId}`))).toBe(true);
+			expect(first.written.some(chunk => chunk.includes(`i=${secondId}`))).toBe(false);
+		} finally {
+			first.widget.dispose();
+			second.widget.dispose();
+		}
+	});
+
+	it("clears the last Sixel footprint when disabled", () => {
+		const { widget, written, getEmitter } = makeWidget();
+		try {
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+			written.length = 0;
+
+			widget.setMode("off");
+
+			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("clears the previous Sixel footprint after the terminal becomes too narrow", () => {
+		const { widget, getEmitter, setTerminalSize } = makeWidget();
+		try {
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1b[28;76H");
+			setTerminalSize(12, 30);
+
+			const cleanup = getEmitter()?.();
+
+			expect(cleanup).toContain("\x1b[28;76H\x1b[4X");
+			expect(cleanup).not.toContain("\x1bP0;1;0q");
+			expect(getEmitter()?.()).toBeNull();
 		} finally {
 			widget.dispose();
 		}

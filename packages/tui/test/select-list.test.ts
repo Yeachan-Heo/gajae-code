@@ -202,4 +202,109 @@ describe("SelectList", () => {
 		expect(list.render(80)).toContain("  No matching commands");
 		expect(cancelled).toBe(true);
 	});
+
+	it("dims disabled items and excludes them from selection", () => {
+		const selected: string[] = [];
+		const list = new SelectList(
+			[
+				{ value: "enabled", label: "enabled" },
+				{ value: "blocked", label: "blocked", disabled: true },
+			],
+			5,
+			{ ...testTheme, description: text => `<dim>${text}</dim>` },
+		);
+		list.onSelect = item => selected.push(item.value);
+
+		const blockedLine = list.render(80).find(line => line.includes("blocked"));
+		expect(blockedLine).toStartWith("<dim>");
+		list.setSelectedIndex(1);
+		expect(list.getSelectedItem()?.value).toBe("enabled");
+		list.handleInput("\n");
+
+		expect(selected).toEqual(["enabled"]);
+	});
+
+	it("keeps page navigation inside disabled boundaries", () => {
+		const list = new SelectList(
+			[
+				{ value: "top-blocked", label: "top-blocked", disabled: true },
+				{ value: "one", label: "one" },
+				{ value: "middle-blocked", label: "middle-blocked", disabled: true },
+				{ value: "three", label: "three" },
+				{ value: "bottom-blocked", label: "bottom-blocked", disabled: true },
+			],
+			2,
+			testTheme,
+		);
+
+		list.handleInput("\x1b[5~");
+		expect(list.getSelectedItem()?.value).toBe("one");
+		list.handleInput("\x1b[6~");
+		expect(list.getSelectedItem()?.value).toBe("three");
+		list.handleInput("\x1b[6~");
+		expect(list.getSelectedItem()?.value).toBe("three");
+	});
+
+	it("skips disabled runs while wrapping arrow navigation", () => {
+		const changed: string[] = [];
+		const list = new SelectList(
+			[
+				{ value: "one", label: "one" },
+				{ value: "blocked-a", label: "blocked-a", disabled: true },
+				{ value: "blocked-b", label: "blocked-b", disabled: true },
+				{ value: "four", label: "four" },
+			],
+			5,
+			testTheme,
+		);
+		list.onSelectionChange = item => changed.push(item.value);
+
+		list.handleInput("\x1b[B");
+		list.handleInput("\x1b[B");
+		list.handleInput("\x1b[A");
+
+		expect(changed).toEqual(["four", "one", "four"]);
+	});
+
+	it("suppresses selection and callbacks when filtering to disabled items", () => {
+		const selected: string[] = [];
+		const changed: string[] = [];
+		const list = new SelectList(
+			[
+				{ value: "enabled", label: "enabled" },
+				{ value: "blocked", label: "blocked", disabled: true },
+			],
+			5,
+			testTheme,
+		);
+		list.onSelect = item => selected.push(item.value);
+		list.onSelectionChange = item => changed.push(item.value);
+
+		list.setFilter("blocked");
+		list.handleInput("\x1b[B");
+		list.handleInput("\n");
+
+		expect(list.getSelectedItem()).toBeNull();
+		expect(selected).toEqual([]);
+		expect(changed).toEqual([]);
+	});
+
+	it("resolves programmatic selection around disabled boundaries", () => {
+		const list = new SelectList(
+			[
+				{ value: "one", label: "one" },
+				{ value: "blocked-a", label: "blocked-a", disabled: true },
+				{ value: "blocked-b", label: "blocked-b", disabled: true },
+				{ value: "four", label: "four" },
+				{ value: "blocked-end", label: "blocked-end", disabled: true },
+			],
+			5,
+			testTheme,
+		);
+
+		list.setSelectedIndex(1);
+		expect(list.getSelectedItem()?.value).toBe("four");
+		list.setSelectedIndex(4);
+		expect(list.getSelectedItem()?.value).toBe("four");
+	});
 });

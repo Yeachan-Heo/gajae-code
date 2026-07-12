@@ -26,6 +26,7 @@
 - Added a transport-agnostic, secret-safe shared notification service (status, health, test delivery, ownership-protected recovery) consumed by both the `gjc notify` CLI and the cross-mode `/notify` slash command (TUI + ACP), so onboarding and daemon recovery no longer duplicate daemon/config logic per surface. `/notify` now exposes `status|health|test|recovery|setup` and `gjc notify` gains `health`/`test`/`recovery` with `--probe`/`--message` (#2050).
 - Added beginner-safe `gjc daemon` operational shortcuts sharing one operator contract so the guided human surface and machine-readable `--json` never drift: a `restart` alias that resolves to reload-if-running-else-spawn, concise per-daemon output by default with `--verbose`/`-v` for runtime detail and the full roots list, and an actionable structured recovery path when token/chat ownership mismatches instead of a large payload ending in `blocked`. Exit codes stay 0 on success / 1 on failure (#2057).
 - Added fail-closed ACP session deletion: the delete path refuses rather than proceeding when the target session cannot be safely resolved, and retains the inode in the replacement case (#2074).
+- Added an opt-in `/pet RedGajae|BlueGajae|off` composer companion with idle gaze, working claw motion, and occasional automatic flex animation on compatible Sixel- and Kitty-graphics terminals; unsupported terminals now show a warning and disable pet choices.
 
 ### Changed
 
@@ -36,6 +37,8 @@
 ### Fixed
 
 - The coordinator MCP owner-server probe now recognizes tmux ≥3.7's missing-server diagnostic (`error connecting to <socket> (No such file or directory)`) as an absent server. tmux 3.7 changed the wording from the older `no server running on <socket>`, which the coordinator probe did not match — so a brand-new coordinator socket (which never has a server yet) was misclassified `unverifiable` instead of `absent`, and **every** `gjc_delegate_*` / session create failed closed with `coordinator_tmux_owner_server_unverifiable` on tmux ≥3.7. The coordinator and `gjc` harness probes now match the same no-server wordings the other owner-isolation probes already did.
+- Cleared Kitty and Sixel pet images on disable, disposal, relocation, and narrow-terminal fallback, with randomized widget-owned Kitty image IDs preventing predictable cross-process collisions and cross-widget deletion; saved pets now activate when a delayed Windows Sixel capability probe succeeds.
+
 - Preserved explicit Telegram forum-topic renames as durable user-owned names, immediately re-asserting delayed edits while retaining restart and rename-race recovery (#1910).
 - Prevented typed provider safety stops from entering automatic retry loops and aligned ACP refusal reporting with the provider-native classification.
 - `gjc resume` now aliases value-less `--resume`, requests confirmation before opening and continues a resumable tail once only; terminal tails open idle, and headless bare resume exits with explicit `--resume <id>` guidance (#1973).

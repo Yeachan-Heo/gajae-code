@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/extensibility/slash-commands";
+import { PET_UNAVAILABLE_WARNING } from "@gajae-code/coding-agent/modes/components/pet-capability";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
@@ -6,6 +9,18 @@ import {
 	executeBuiltinSlashCommand,
 	lookupBuiltinSlashCommand,
 } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
+import { ImageProtocol, TERMINAL } from "@gajae-code/tui";
+
+const mutableTerminal = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
+const originalImageProtocol = mutableTerminal.imageProtocol;
+
+beforeAll(async () => {
+	await initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+});
+
+afterEach(() => {
+	mutableTerminal.imageProtocol = originalImageProtocol;
+});
 
 function createTuiRuntime() {
 	const handleCopyCommand = vi.fn();
@@ -41,11 +56,66 @@ function createClearTuiRuntime() {
 }
 
 describe("builtin /pet slash command", () => {
-	it("exposes off plus the registry-driven skin choices", () => {
+	it("exposes the named Gajae choices", () => {
 		const petCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "pet");
 
-		expect(petCommand?.subcommands?.map(command => command.name)).toEqual(["off", "red", "blue"]);
-		expect(petCommand?.inlineHint).toBe("[off|red|blue]");
+		expect(petCommand?.subcommands?.map(command => command.name)).toEqual(["off", "RedGajae", "BlueGajae"]);
+		expect(petCommand?.inlineHint).toBe("[off|RedGajae|BlueGajae]");
+	});
+
+	it("maps named Gajae commands to their internal modes", async () => {
+		mutableTerminal.imageProtocol = ImageProtocol.Kitty;
+		const setPetMode = vi.fn();
+		const setText = vi.fn();
+		const showStatus = vi.fn();
+		const ctx = { setPetMode, showStatus, editor: { setText } } as unknown as InteractiveModeContext;
+		const runtime = { ctx, handleBackgroundCommand: () => undefined };
+
+		expect(await executeBuiltinSlashCommand("/pet redgajae", runtime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/pet BlueGajae", runtime)).toBe(true);
+
+		expect(setPetMode.mock.calls.map(call => call[0])).toEqual(["red", "blue"]);
+	});
+
+	it("rejects internal color IDs and legacy aliases as public commands", async () => {
+		mutableTerminal.imageProtocol = ImageProtocol.Kitty;
+		const setPetMode = vi.fn();
+		const showStatus = vi.fn();
+		const ctx = { setPetMode, showStatus, editor: { setText: vi.fn() } } as unknown as InteractiveModeContext;
+
+		for (const token of ["red", "blue", "on"]) {
+			expect(
+				await executeBuiltinSlashCommand(`/pet ${token}`, { ctx, handleBackgroundCommand: () => undefined }),
+			).toBe(true);
+		}
+		expect(setPetMode).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledTimes(3);
+		expect(showStatus).toHaveBeenLastCalledWith("Usage: /pet [off|RedGajae|BlueGajae]", { dim: true });
+	});
+
+	it("warns instead of enabling a named pet when overlays are unavailable", async () => {
+		mutableTerminal.imageProtocol = null;
+		const setPetMode = vi.fn();
+		const showStatus = vi.fn();
+		const ctx = { setPetMode, showStatus, editor: { setText: vi.fn() } } as unknown as InteractiveModeContext;
+
+		expect(await executeBuiltinSlashCommand("/pet RedGajae", { ctx, handleBackgroundCommand: () => undefined })).toBe(
+			true,
+		);
+		expect(setPetMode).not.toHaveBeenCalled();
+		expect(showStatus.mock.calls[0]?.[0]).toContain(PET_UNAVAILABLE_WARNING);
+		expect(showStatus.mock.calls[0]?.[1]).toEqual({ dim: false });
+	});
+
+	it("completes named pets case-insensitively", async () => {
+		const petCommand = BUILTIN_SLASH_COMMANDS.find(command => command.name === "pet");
+
+		for (const prefix of ["r", "R", "ReD"]) {
+			const completions = await petCommand?.getArgumentCompletions?.(prefix);
+			expect(completions?.map(item => item.label)).toEqual(["RedGajae"]);
+		}
+
+		expect(petCommand?.getInlineHint?.("ReD")).toBe("Gajae");
 	});
 });
 describe("builtin /copy slash command", () => {

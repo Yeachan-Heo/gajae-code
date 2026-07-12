@@ -35,7 +35,7 @@ function buildArgumentCompletions(subcommands: SubcommandDef[]): (prefix: string
 		if (argumentPrefix.includes(" ")) return null; // past the subcommand
 		const lower = argumentPrefix.toLowerCase();
 		const matches = subcommands
-			.filter(s => s.name.startsWith(lower))
+			.filter(s => s.name.toLowerCase().startsWith(lower))
 			.map(s => ({
 				value: `${s.name} `,
 				label: s.name,
@@ -59,7 +59,7 @@ function buildSubcommandInlineHint(subcommands: SubcommandDef[]): (argumentText:
 			// Still typing subcommand name — show remaining chars + usage
 			const prefix = trimmed.toLowerCase();
 			if (prefix.length === 0) return null;
-			const match = subcommands.find(s => s.name.startsWith(prefix));
+			const match = subcommands.find(s => s.name.toLowerCase().startsWith(prefix));
 			if (!match) return null;
 			const remaining = match.name.slice(prefix.length);
 			return remaining + (match.usage ? ` ${match.usage}` : "");
@@ -68,7 +68,7 @@ function buildSubcommandInlineHint(subcommands: SubcommandDef[]): (argumentText:
 		// Subcommand typed — show remaining usage params
 		const subName = trimmed.slice(0, spaceIndex).toLowerCase();
 		const afterSub = trimmed.slice(spaceIndex + 1);
-		const sub = subcommands.find(s => s.name === subName);
+		const sub = subcommands.find(s => s.name.toLowerCase() === subName);
 		if (!sub?.usage) return null;
 
 		if (afterSub.length > 0) {

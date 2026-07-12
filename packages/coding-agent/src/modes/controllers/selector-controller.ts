@@ -79,6 +79,7 @@ import { HistorySearchComponent } from "../components/history-search";
 import { JobsOverlayComponent } from "../components/jobs-overlay";
 import { ModelSelectorComponent } from "../components/model-selector";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
+import { isPetAvailable } from "../components/pet-capability";
 import { PetSelectorComponent } from "../components/pet-selector";
 import { PluginSelectorComponent } from "../components/plugin-selector";
 import {
@@ -492,6 +493,7 @@ export class SelectorController {
 						availableThemes,
 						availableModelProfiles: [...this.ctx.session.modelRegistry.getModelProfiles().keys()],
 						cwd: getProjectDir(),
+						petAvailable: isPetAvailable(),
 					},
 					{
 						onChange: (id, value) => this.handleSettingChange(id, value),
@@ -591,6 +593,7 @@ export class SelectorController {
 	showPetSelector(): void {
 		const stored = settings.get("pet.mode");
 		const initial: PetMode = isPetMode(stored) ? stored : "off";
+		const available = isPetAvailable();
 		this.showSelector(done => {
 			// Live-preview via previewMode (no editor re-mount, so the overlay stays);
 			// Enter commits + persists, Esc restores the initial skin.
@@ -607,6 +610,7 @@ export class SelectorController {
 				mode => {
 					this.ctx.previewPetMode(mode);
 				},
+				available,
 			);
 			return { component: selector, focus: selector.getSelectList() };
 		});
@@ -763,10 +767,9 @@ export class SelectorController {
 				break;
 			}
 			case "pet.mode":
-				// The settings submenu already persisted the value; apply it to the live
-				// widget via previewMode (the settings overlay is still open, so a full
-				// re-mount would tear it down — restoreComposer re-mounts on close).
-				this.ctx.previewPetMode(value as PetMode);
+				// The settings submenu already persisted the value; commit it without
+				// re-mounting the composer while the settings overlay is open.
+				this.ctx.commitPetPreviewMode(value as PetMode);
 				break;
 			case "symbolPreset": {
 				setSymbolPreset(value as "unicode" | "nerd" | "ascii").then(() => {

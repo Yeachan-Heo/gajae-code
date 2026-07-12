@@ -87,6 +87,7 @@ import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
 import { IrcSplitViewComponent } from "./components/irc-sidebar";
+import { getPetUnavailableWarning, isPetAvailable } from "./components/pet-capability";
 import { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import {
@@ -617,8 +618,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.hookWidgetContainerBelow);
 		this.ui.setBottomPinnedComponent(this.statusLine);
 		this.ui.setFocus(this.editor);
+		this.petWidget?.dispose();
 		this.petWidget = this.#createPetWidget(this.editor);
-		this.petWidget.setMode(settings.get("pet.mode"));
+		const configuredPetMode = settings.get("pet.mode");
+		this.petWidget.setMode(configuredPetMode);
 		// The async sixel capability probe can enable graphics after the saved
 		// pet mode was applied and dropped (no protocol yet at startup).
 		// Re-apply the configured mode when capability arrives so the pet
@@ -631,6 +634,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.petWidget.setMode(saved);
 			}
 		});
+		if (configuredPetMode !== "off" && !isPetAvailable()) {
+			this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+		}
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
@@ -1079,6 +1085,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	setPetMode(mode: PetMode): void {
+		if (mode !== "off" && !isPetAvailable()) {
+			this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+			this.ui.requestRender();
+			return;
+		}
 		this.petWidget?.setMode(mode);
 		settings.set("pet.mode", mode);
 		this.ui.requestRender();
@@ -1086,6 +1097,11 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	previewPetMode(mode: PetMode): void {
 		this.petWidget?.previewMode(mode);
+		this.ui.requestRender();
+	}
+
+	commitPetPreviewMode(mode: PetMode): void {
+		this.petWidget?.commitPreviewMode(mode);
 		this.ui.requestRender();
 	}
 
@@ -2223,7 +2239,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		nextEditor.setText(previousText);
 		previousEditor.dispose();
 
-		const petMode = this.petWidget?.mode ?? settings.get("pet.mode");
+		const petMode = settings.get("pet.mode");
 		this.petWidget?.dispose();
 
 		this.editorContainer.clear();
