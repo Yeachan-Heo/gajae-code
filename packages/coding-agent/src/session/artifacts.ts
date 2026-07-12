@@ -6,7 +6,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-
+import { isEnoent } from "@gajae-code/utils";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 export interface ArtifactSaveOptions {
 	maxBytes?: number;
@@ -146,5 +146,65 @@ export class ArtifactManager {
 		const files = await this.listFiles();
 		const match = files.find(f => f.startsWith(`${id}.`));
 		return match ? path.join(this.#dir, match) : null;
+	}
+}
+
+/**
+ * Narrow exclusive clone of a session artifact directory used by the fork
+ * transaction. The destination MUST be new even when the source is absent:
+ * any pre-existing path fails closed (no overwrite, no merge). The helper
+ * returns true only while it owns a successfully cloned destination; an absent
+ * source returns false after removing the empty destination it acquired.
+ * Only regular files and directories are cloned; a symlink, socket, device,
+ * FIFO, or other special entry aborts the clone. On any failure the
+ * transaction-owned destination is removed before throwing.
+ */
+export async function cloneArtifactsExclusive(sourceDir: string, destDir: string): Promise<boolean> {
+	try {
+		await fs.mkdir(destDir, { recursive: false });
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+			throw new Error(`Artifact destination already exists: ${destDir}`);
+		}
+		throw err;
+	}
+
+	try {
+		let sourceStat: Awaited<ReturnType<typeof fs.lstat>>;
+		try {
+			sourceStat = await fs.lstat(sourceDir);
+		} catch (err) {
+			if (isEnoent(err)) {
+				await fs.rmdir(destDir);
+				return false;
+			}
+			throw err;
+		}
+		if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) {
+			throw new Error(`Artifact source is not a regular directory: ${sourceDir}`);
+		}
+		await cloneArtifactsTreeExclusive(sourceDir, destDir);
+		return true;
+	} catch (err) {
+		// Remove only the destination acquired by this invocation.
+		await fs.rm(destDir, { recursive: true, force: true }).catch(() => {});
+		throw err;
+	}
+}
+
+async function cloneArtifactsTreeExclusive(source: string, dest: string): Promise<void> {
+	const entries = await fs.readdir(source, { withFileTypes: true });
+	for (const entry of entries) {
+		const srcPath = path.join(source, entry.name);
+		const destPath = path.join(dest, entry.name);
+		if (entry.isDirectory()) {
+			await fs.mkdir(destPath, { recursive: false });
+			await cloneArtifactsTreeExclusive(srcPath, destPath);
+		} else if (entry.isFile()) {
+			await fs.copyFile(srcPath, destPath);
+		} else {
+			// symlink / socket / device / FIFO / …: never clone special entries.
+			throw new Error(`Refusing to clone non-regular artifact entry: ${srcPath}`);
+		}
 	}
 }

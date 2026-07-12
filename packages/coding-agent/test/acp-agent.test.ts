@@ -153,8 +153,12 @@ class FakeAgentSession {
 	constructor(
 		cwd: string,
 		private readonly models: Model[] = TEST_MODELS,
+		// Optional flat shared session-dir, mirroring the real
+		// `AcpSessionFactoryDescriptor.sessionDir` override. Undefined keeps the
+		// per-CWD default layout so existing single-cwd call sites are unchanged.
+		sessionDir?: string,
 	) {
-		this.sessionManager = SessionManager.create(cwd);
+		this.sessionManager = SessionManager.create(cwd, sessionDir);
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent = {
 			sessionId: this.sessionId,
@@ -465,7 +469,10 @@ afterEach(async () => {
 	}
 });
 
-async function createHarness(options?: { createSessionGate?: Promise<void> }): Promise<AgentHarness> {
+async function createHarness(options?: {
+	createSessionGate?: Promise<void>;
+	sharedSessionDir?: string;
+}): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-test-"));
 	cleanupRoots.push(root);
 	const agentDir = path.join(root, "agent");
@@ -488,17 +495,21 @@ async function createHarness(options?: { createSessionGate?: Promise<void> }): P
 		closed: Promise.withResolvers<void>().promise,
 	} as unknown as AgentSideConnection;
 
-	const initialSession = new FakeAgentSession(cwdA);
+	const initialSession = new FakeAgentSession(cwdA, undefined, options?.sharedSessionDir);
 	sessions.push(initialSession);
-	const factory = async (cwd: string): Promise<AgentSession> => {
+	const createSession = async (cwd: string): Promise<AgentSession> => {
 		await options?.createSessionGate;
-		const session = new FakeAgentSession(cwd);
+		const session = new FakeAgentSession(cwd, undefined, options?.sharedSessionDir);
 		sessions.push(session);
 		return session as unknown as AgentSession;
 	};
+	// The factory doubles as the `AcpSessionFactoryDescriptor`: its `sessionDir`
+	// is the authoritative connection-wide override (known before the first
+	// lifecycle/list call). Undefined keeps the per-CWD default layout.
+	const factoryDescriptor = Object.assign(createSession, { sessionDir: options?.sharedSessionDir });
 
 	return {
-		agent: new AcpAgent(connection, factory, initialSession as unknown as AgentSession),
+		agent: new AcpAgent(connection, factoryDescriptor, initialSession as unknown as AgentSession),
 		updates,
 		abortController,
 		sessions,
@@ -2097,9 +2108,10 @@ describe("ACP agent", () => {
 		return { id, path: sessionPath };
 	}
 
-	it("returns {} for delete when no scope has been established (lookup-free)", async () => {
+	it("returns {} for delete of an unissued id before any scoped list (lookup-free)", async () => {
 		const harness = await createHarness();
-		// No explicit-cwd lifecycle/list call yet → scope is undefined.
+		// No explicit-cwd lifecycle/list call has issued any authority receipt yet,
+		// so delete is a lookup-free no-op that never scans storage.
 		const result = await harness.agent.deleteSession({ sessionId: "nonexistent-id" });
 		expect(result).toEqual({});
 		// Repeat is also a no-op.
@@ -2108,9 +2120,10 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("returns {} for delete of unknown/already-deleted id within scope", async () => {
+	it("returns {} for delete of an unissued id even after a scoped list (lookup-free)", async () => {
 		const harness = await createHarness();
-		// Lock scope via scoped list.
+		// A scoped list issues authority receipts only for ids it observes; an id
+		// never observed has no receipt → delete stays a lookup-free no-op.
 		await harness.agent.listSessions({ cwd: harness.cwdA });
 		expect(await harness.agent.deleteSession({ sessionId: "no-such-id" })).toEqual({});
 		// Repeat no-op.
@@ -2119,14 +2132,23 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("rejects cross-cwd lifecycle calls after scope is locked", async () => {
+	it("two CWDs coexist on one connection with isolated scoped lists", async () => {
 		const harness = await createHarness();
-		// Lock scope to cwdA.
-		await harness.agent.listSessions({ cwd: harness.cwdA });
-		// Cross-cwd list must error before authorization/mutation.
-		await expect(harness.agent.listSessions({ cwd: harness.cwdB })).rejects.toThrow(/scoped to/);
-		// Cross-cwd delete also cannot authorize.
-		expect(await harness.agent.deleteSession({ sessionId: "anything" })).toEqual({});
+		// Multiple CWDs coexist on one connection: a second cwd lifecycle never
+		// rejects after the first (the old single-scope "scoped to" guard is gone).
+		const createdA = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const createdB = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
+		expect(typeof createdA.sessionId).toBe("string");
+		expect(typeof createdB.sessionId).toBe("string");
+		expect(createdA.sessionId).not.toBe(createdB.sessionId);
+		// Each cwd's scoped list observes only its own namespace — transcripts,
+		// receipts, and authority never leak across cwds.
+		const listA = await harness.agent.listSessions({ cwd: harness.cwdA });
+		const listB = await harness.agent.listSessions({ cwd: harness.cwdB });
+		expect(listA.sessions.some(s => s.sessionId === createdA.sessionId)).toBe(true);
+		expect(listA.sessions.some(s => s.sessionId === createdB.sessionId)).toBe(false);
+		expect(listB.sessions.some(s => s.sessionId === createdB.sessionId)).toBe(true);
+		expect(listB.sessions.some(s => s.sessionId === createdA.sessionId)).toBe(false);
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
@@ -2135,12 +2157,13 @@ describe("ACP agent", () => {
 		const harness = await createHarness();
 		// Create a real session on disk in cwdA.
 		const { id } = await persistInactiveSession(harness.cwdA);
-		// Cwd-less list works (display-only) but does NOT establish scope.
+		// Cwd-less list works (display-only): it admits no namespace, issues no
+		// authority receipt, and bumps no generation.
 		const globalList = await harness.agent.listSessions({});
 		expect(globalList.sessions.some(s => s.sessionId === id)).toBe(true);
-		// Delete without scope → lookup-free {} (the real session is untouched).
+		// Delete with no receipt issued → lookup-free {} (the real session is untouched).
 		expect(await harness.agent.deleteSession({ sessionId: id })).toEqual({});
-		// Now lock scope and verify the session is still present.
+		// An explicit scoped list in cwdA issues a receipt; the session is still present.
 		const scopedList = await harness.agent.listSessions({ cwd: harness.cwdA });
 		expect(scopedList.sessions.some(s => s.sessionId === id)).toBe(true);
 		harness.abortController.abort();
@@ -2176,6 +2199,30 @@ describe("ACP agent", () => {
 		await expect(harness.agent.deleteSession({ sessionId: id })).rejects.toThrow(/Duplicate/);
 		expect(fs.existsSync(originalPath)).toBe(true);
 		expect(fs.existsSync(dupPath)).toBe(true);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("marks a cross-cwd duplicate id as absorbing ambiguity with no mutation", async () => {
+		const harness = await createHarness();
+		const { id, path: cwdAPath } = await persistInactiveSession(harness.cwdA, "cwd-a-original");
+		// Plant the same id under cwdB (header cwd = cwdB) so cwdB's strict
+		// inventory observes the id under a different namespace.
+		const cwdBDir = SessionManager.getDefaultSessionDir(harness.cwdB);
+		fs.mkdirSync(cwdBDir, { recursive: true });
+		const cwdBPath = path.join(cwdBDir, `planted-${id}.jsonl`);
+		fs.writeFileSync(cwdBPath, `${JSON.stringify({ type: "session", id, cwd: harness.cwdB, version: 2 })}\n`);
+		// list cwdA issues a unique receipt for id under cwdA.
+		await harness.agent.listSessions({ cwd: harness.cwdA });
+		// list cwdB observes the same id under cwdB → cross-cwd collision → the
+		// receipt flips to the absorbing `ambiguous` state for the connection.
+		await harness.agent.listSessions({ cwd: harness.cwdB });
+		// Delete must fail-closed; neither transcript is touched.
+		await expect(harness.agent.deleteSession({ sessionId: id })).rejects.toThrow(/multiple cwds/);
+		// Ambiguous is absorbing: a repeat delete also fails (it never re-authorizes).
+		await expect(harness.agent.deleteSession({ sessionId: id })).rejects.toThrow(/multiple cwds/);
+		expect(fs.existsSync(cwdAPath)).toBe(true);
+		expect(fs.existsSync(cwdBPath)).toBe(true);
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
@@ -2236,7 +2283,7 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("isolates authority between connections (reconnect starts unscoped)", async () => {
+	it("isolates authority between connections (reconnect starts unissued)", async () => {
 		// Connection A deletes a session.
 		const harnessA = await createHarness();
 		const { id } = await persistInactiveSession(harnessA.cwdA, "conn-a");
@@ -2244,9 +2291,9 @@ describe("ACP agent", () => {
 		await harnessA.agent.deleteSession({ sessionId: id });
 		harnessA.abortController.abort();
 		await Bun.sleep(0);
-		// Connection B (fresh agent) starts unscoped.
+		// Connection B (fresh agent) starts with no issued receipts.
 		const harnessB = await createHarness();
-		// B's delete without scope is lookup-free {}.
+		// B's delete with no receipt is lookup-free {}.
 		expect(await harnessB.agent.deleteSession({ sessionId: id })).toEqual({});
 		harnessB.abortController.abort();
 		await Bun.sleep(0);
@@ -2287,8 +2334,317 @@ describe("ACP agent", () => {
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
+
 	// =========================================================================
-	// session/delete — cleanup_pending, fresh destructive authority, scope staging
+	// multi-CWD coexistence — independent cursors, ownership, authority, deletes
+	// =========================================================================
+
+	it("per-CWD cursors are independent: a lifecycle change in one cwd invalidates only its cursor", async () => {
+		const harness = await createHarness();
+		// 51 sessions per cwd span two pages (page size 50) so each mints a cursor.
+		for (let i = 0; i < 51; i++) {
+			await persistInactiveSession(harness.cwdA, `a-${i}`);
+			await persistInactiveSession(harness.cwdB, `b-${i}`);
+		}
+		const page1A = await harness.agent.listSessions({ cwd: harness.cwdA });
+		const page1B = await harness.agent.listSessions({ cwd: harness.cwdB });
+		expect(page1A.sessions.length).toBe(50);
+		expect(page1B.sessions.length).toBe(50);
+		expect(page1A.nextCursor).toBeDefined();
+		expect(page1B.nextCursor).toBeDefined();
+		// Each namespace embeds its own opaque nonce binder in the versioned
+		// grammar `acp1:<nonce>:<generation>:<offset>`; the nonce is segment [1].
+		expect(page1A.nextCursor!.split(":")[0]).toBe("acp1");
+		const nonceA = page1A.nextCursor!.split(":")[1]!;
+		const nonceB = page1B.nextCursor!.split(":")[1]!;
+		expect(nonceA).not.toBe(nonceB);
+		// A lifecycle change in cwdA (delete one cwdA session via its issued receipt)
+		// bumps only cwdA's generation; cwdB's cursor stays valid.
+		await harness.agent.deleteSession({ sessionId: page1A.sessions[0]!.sessionId });
+		await expect(harness.agent.listSessions({ cwd: harness.cwdA, cursor: page1A.nextCursor })).rejects.toThrow(
+			/stale/,
+		);
+		// cwdB page 2 with its own (still-valid) cursor succeeds.
+		const page2B = await harness.agent.listSessions({ cwd: harness.cwdB, cursor: page1B.nextCursor });
+		expect(page2B.sessions.length).toBe(1);
+		expect(page2B.nextCursor).toBeUndefined();
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("a scoped cursor from one cwd cannot page another cwd's namespace", async () => {
+		const harness = await createHarness();
+		// Only cwdA needs >50 sessions to mint a scoped cursor.
+		for (let i = 0; i < 51; i++) {
+			await persistInactiveSession(harness.cwdA, `a-${i}`);
+		}
+		const page1A = await harness.agent.listSessions({ cwd: harness.cwdA });
+		expect(page1A.nextCursor).toBeDefined();
+		// The cursor carries cwdA's namespace nonce; cwdB's namespace has a
+		// different nonce, so the cursor is rejected as bound elsewhere — it can
+		// never page (or authorize) a different cwd's namespace.
+		await expect(harness.agent.listSessions({ cwd: harness.cwdB, cursor: page1A.nextCursor })).rejects.toThrow(
+			/bound to a different workspace/,
+		);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("rejects load/resume of an active session under the wrong cwd (immutable ownership)", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		// The active session is immutably owned by cwdA. A load/resume under cwdB
+		// is rejected before any mutation — ownership never rebinds to a new cwd.
+		await expect(
+			harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdB, mcpServers: [] }),
+		).rejects.toThrow(/already loaded for/);
+		await expect(
+			harness.agent.resumeSession({ sessionId: created.sessionId, cwd: harness.cwdB, mcpServers: [] }),
+		).rejects.toThrow(/already loaded for/);
+		// The same-cwd repeat load still succeeds (ownership is immutable, not blocking).
+		await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("wrong-cwd inactive load/resume is not found (no cross-cwd leakage)", async () => {
+		const harness = await createHarness();
+		const { id } = await persistInactiveSession(harness.cwdA, "cwd-a-only");
+		// The session lives only in cwdA's namespace; cwdB's strict inventory
+		// cannot observe it, so load/resume under cwdB is not found — it never
+		// falls back to a forgiving cross-cwd lookup.
+		await expect(harness.agent.loadSession({ sessionId: id, cwd: harness.cwdB, mcpServers: [] })).rejects.toThrow(
+			/not found/,
+		);
+		await expect(harness.agent.resumeSession({ sessionId: id, cwd: harness.cwdB, mcpServers: [] })).rejects.toThrow(
+			/not found/,
+		);
+		// cwdA can still load it.
+		await harness.agent.loadSession({ sessionId: id, cwd: harness.cwdA, mcpServers: [] });
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("close retains authority for a later inactive delete", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const sessionPath = session.sessionManager.getSessionFile()!;
+		expect(fs.existsSync(sessionPath)).toBe(true);
+		// Close is non-destructive: the transcript stays on disk and the authority
+		// receipt is retained, so the now-inactive session stays deletable.
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		expect(fs.existsSync(sessionPath)).toBe(true);
+		expect(await harness.agent.deleteSession({ sessionId: created.sessionId })).toEqual({});
+		expect(fs.existsSync(sessionPath)).toBe(false);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("honors a connection-wide shared session-dir override known at construction", async () => {
+		const sharedDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-shared-"));
+		cleanupRoots.push(sharedDir);
+		const harness = await createHarness({ sharedSessionDir: sharedDir });
+		// The override is the descriptor's authoritative session-dir, known before
+		// any session is created. A fresh-connection scoped list resolves it.
+		const emptyList = await harness.agent.listSessions({ cwd: harness.cwdA });
+		expect(emptyList.sessions).toHaveLength(0);
+		// A session created in cwdA lands in the shared dir, not cwdA's default.
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const sharedPath = session.sessionManager.getSessionFile()!;
+		expect(sharedPath.startsWith(sharedDir + path.sep)).toBe(true);
+		// A scoped list in cwdA inventories the shared dir and finds the session.
+		const listA = await harness.agent.listSessions({ cwd: harness.cwdA });
+		expect(listA.sessions.some(s => s.sessionId === created.sessionId)).toBe(true);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	// =========================================================================
+	// shared flat session-dir — two cwds coexist, foreign classified not shown
+	// =========================================================================
+
+	it("two cwds coexist in one shared flat session-dir: each lists only its own", async () => {
+		const sharedDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-shared-"));
+		cleanupRoots.push(sharedDir);
+		const harness = await createHarness({ sharedSessionDir: sharedDir });
+		// Create one session under each cwd; both transcripts land in the SAME
+		// flat directory with their own header cwd.
+		const a = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const b = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
+		expect(a.sessionId).not.toBe(b.sessionId);
+		// A scoped list in cwdA inventories the whole shared root but displays
+		// ONLY cwdA's session; cwdB's record is classified as foreign, not shown.
+		const listA = await harness.agent.listSessions({ cwd: harness.cwdA });
+		expect(listA.sessions.map(s => s.sessionId)).toEqual([a.sessionId]);
+		expect(listA.sessions.some(s => s.sessionId === b.sessionId)).toBe(false);
+		// Symmetrically, cwdB lists only its own session.
+		const listB = await harness.agent.listSessions({ cwd: harness.cwdB });
+		expect(listB.sessions.map(s => s.sessionId)).toEqual([b.sessionId]);
+		expect(listB.sessions.some(s => s.sessionId === a.sessionId)).toBe(false);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("a shared-root cross-cwd duplicate id becomes absorbing ambiguity and is not displayed", async () => {
+		const sharedDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-shared-"));
+		cleanupRoots.push(sharedDir);
+		const harness = await createHarness({ sharedSessionDir: sharedDir });
+		// Issue authority for the id under cwdA first (plant cwdA's record + list),
+		// THEN plant the same id under cwdB so the next list observes the collision.
+		const id = "shared-dup-id";
+		const headerA = JSON.stringify({ type: "session", id, cwd: harness.cwdA, version: 2 });
+		const headerB = JSON.stringify({ type: "session", id, cwd: harness.cwdB, version: 2 });
+		fs.writeFileSync(path.join(sharedDir, "a.jsonl"), `${headerA}\n`);
+		await harness.agent.listSessions({ cwd: harness.cwdA });
+		fs.writeFileSync(path.join(sharedDir, "b.jsonl"), `${headerB}\n`);
+		// cwdA's next list scans the whole root and detects the same id under
+		// cwdB: cross-cwd collision -> the id is not displayed and its receipt
+		// flips to the absorbing ambiguous state.
+		const listA = await harness.agent.listSessions({ cwd: harness.cwdA });
+		expect(listA.sessions.some(s => s.sessionId === id)).toBe(false);
+		// Delete of the now-ambiguous id fails closed; nothing is removed.
+		await expect(harness.agent.deleteSession({ sessionId: id })).rejects.toThrow(/multiple cwds/);
+		expect(fs.existsSync(path.join(sharedDir, "a.jsonl"))).toBe(true);
+		expect(fs.existsSync(path.join(sharedDir, "b.jsonl"))).toBe(true);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("default per-cwd root still treats a foreign-cwd record as a strict inventory failure", async () => {
+		const harness = await createHarness();
+		// In a DEFAULT (non-shared) layout, plant a record whose header cwd is
+		// cwdB inside cwdA's own session directory. This must remain a hard
+		// inventory failure — the shared-root classification never applies.
+		const dirA = SessionManager.getDefaultSessionDir(harness.cwdA);
+		await fs.promises.mkdir(dirA, { recursive: true });
+		const foreignHeader = JSON.stringify({ type: "session", id: "foreign-id", cwd: harness.cwdB, version: 2 });
+		fs.writeFileSync(path.join(dirA, "foreign.jsonl"), `${foreignHeader}\n`);
+		await expect(harness.agent.listSessions({ cwd: harness.cwdA })).rejects.toThrow(/incomplete/);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	// =========================================================================
+	// scoped cursor grammar — anchored, versioned, exact
+	// =========================================================================
+
+	it("rejects malformed and pre-acp1 scoped cursors", async () => {
+		const harness = await createHarness();
+		// 51 sessions mint a valid scoped cursor for cwdA.
+		for (let i = 0; i < 51; i++) {
+			await persistInactiveSession(harness.cwdA, `filler-${i}`);
+		}
+		const page1 = await harness.agent.listSessions({ cwd: harness.cwdA });
+		expect(page1.nextCursor).toBeDefined();
+		// The grammar is `acp1:<nonce>:<generation>:<offset>`; any deviation fails.
+		const valid = page1.nextCursor!;
+		expect(valid.split(":")[0]).toBe("acp1");
+		const nonce = valid.split(":")[1]!;
+		const malformed: string[] = [
+			"garbage",
+			`${valid.split(":")[0]}:${nonce}:0:0:0:0`, // too many fields
+			`1:2:3`, // pre-acp1 / unversioned
+			`acp1:${nonce}`, // missing generation + offset
+			`acp1:${nonce}:0`, // missing offset
+			`acp1:${nonce}:0:0:extra`, // trailing field
+			`acp1:${nonce}:0a:0`, // non-digit generation
+			`acp1:${nonce}:-1:0`, // sign in generation
+			`acp1:${nonce}:0:1e2`, // exponent in offset
+			`acp1:${nonce}: 0 :0`, // whitespace
+		];
+		for (const cursor of malformed) {
+			await expect(harness.agent.listSessions({ cwd: harness.cwdA, cursor })).rejects.toThrow(
+				/Invalid ACP session cursor/,
+			);
+		}
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("a scoped cursor with a foreign nonce is rejected as bound to a different workspace", async () => {
+		const harness = await createHarness();
+		for (let i = 0; i < 51; i++) {
+			await persistInactiveSession(harness.cwdA, `filler-${i}`);
+		}
+		const page1 = await harness.agent.listSessions({ cwd: harness.cwdA });
+		// Well-formed acp1 grammar but a nonce that belongs to no namespace here.
+		const foreignCursor = `acp1:00000000-0000-0000-0000-000000000000:${page1.nextCursor!.split(":")[2]}:0`;
+		await expect(harness.agent.listSessions({ cwd: harness.cwdA, cursor: foreignCursor })).rejects.toThrow(
+			/bound to a different workspace/,
+		);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	// =========================================================================
+	// absorbing receipt state machine — replacement, delete tombstone, recreate
+	// =========================================================================
+
+	it("a replaced transcript (same id, same cwd, new identity) flips the receipt absorbing and blocks delete", async () => {
+		const harness = await createHarness();
+		const { id, path: sessionPath } = await persistInactiveSession(harness.cwdA, "original");
+		// First scoped list issues a unique receipt bound to the original identity.
+		await harness.agent.listSessions({ cwd: harness.cwdA });
+		// Replace the transcript: same header id + cwd, but a fresh inode.
+		fs.unlinkSync(sessionPath);
+		const header = JSON.stringify({ type: "session", id, cwd: harness.cwdA, version: 2 });
+		fs.writeFileSync(sessionPath, `${header}\n`);
+		// Re-list observes the replacement -> the receipt becomes absorbing
+		// (revocation, not a refresh).
+		await harness.agent.listSessions({ cwd: harness.cwdA });
+		await expect(harness.agent.deleteSession({ sessionId: id })).rejects.toThrow(/replaced|revoked|ambiguous/);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("a successful delete retains a tombstone: a second delete is a no-op and a recreate cannot re-authorize", async () => {
+		const harness = await createHarness();
+		const { id, path: sessionPath } = await persistInactiveSession(harness.cwdA, "doomed");
+		await harness.agent.listSessions({ cwd: harness.cwdA });
+		// First delete succeeds and removes the transcript.
+		expect(await harness.agent.deleteSession({ sessionId: id })).toEqual({});
+		expect(fs.existsSync(sessionPath)).toBe(false);
+		// Second delete of the genuinely-gone tombstoned id is a lookup-free no-op.
+		expect(await harness.agent.deleteSession({ sessionId: id })).toEqual({});
+		// Recreate a transcript under the same id (fresh inode).
+		const header = JSON.stringify({ type: "session", id, cwd: harness.cwdA, version: 2 });
+		fs.writeFileSync(sessionPath, `${header}\n`);
+		// Re-list must NOT reissue authority for the recreated id (tombstone stays).
+		await harness.agent.listSessions({ cwd: harness.cwdA });
+		// The old receipt cannot authorize the recreated transcript.
+		await expect(harness.agent.deleteSession({ sessionId: id })).rejects.toThrow(/changed since authority/);
+		expect(fs.existsSync(sessionPath)).toBe(true);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("an active control requires an exact unique receipt: an ambiguous id refuses prompt/mode", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		// Plant a duplicate of the active id in cwdA's directory, then list so
+		// the snapshot detects the duplicate and flips the receipt ambiguous.
+		const session = harness.findSession(created.sessionId)!;
+		const sessionDir = path.dirname(session.sessionManager.getSessionFile()!);
+		const dupPath = path.join(sessionDir, `${created.sessionId}-dup.jsonl`);
+		const header = JSON.stringify({ type: "session", id: created.sessionId, cwd: harness.cwdA, version: 2 });
+		fs.writeFileSync(dupPath, `${header}\n`);
+		await harness.agent.listSessions({ cwd: harness.cwdA });
+		// Now the active session's receipt is absorbing; every active control
+		// refuses on the ownership gate rather than acting on #sessions alone.
+		await expect(harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" })).rejects.toThrow(
+			/no active authority receipt/,
+		);
+		await expect(
+			harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "hi" }] }),
+		).rejects.toThrow(/no active authority receipt/);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	// =========================================================================
+	// session/delete — cleanup_pending, fresh destructive authority, namespace staging
 	// =========================================================================
 
 	it("active delete surfaces cleanup_pending (artifacts) without removing the record or reporting success", async () => {
@@ -2474,18 +2830,18 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("unissued inactive delete returns {} without scan (snapshot-gated)", async () => {
+	it("unissued inactive delete returns {} without scan (receipt-gated)", async () => {
 		const harness = await createHarness();
-		// Establish scope with an empty scoped list (caches an empty authority snapshot).
+		// An empty scoped list admits the namespace but issues no receipts.
 		const empty = await harness.agent.listSessions({ cwd: harness.cwdA });
 		expect(empty.sessions).toHaveLength(0);
 		// External mutation after the list: a new session lands on disk, but its ID
-		// was never issued by the cached authority snapshot → lookup-free {}.
+		// was never issued a receipt → delete is a lookup-free {} (no inventory scan).
 		const { id, path } = await persistInactiveSession(harness.cwdA, "created-after-list");
 		expect(await harness.agent.deleteSession({ sessionId: id })).toEqual({});
 		// The file is untouched — no fresh inventory scan was performed.
 		expect(fs.existsSync(path)).toBe(true);
-		// After a fresh list, the ID is issued and a delete can proceed.
+		// After a fresh list, the ID is issued a receipt and a delete can proceed.
 		await harness.agent.listSessions({ cwd: harness.cwdA });
 		expect(await harness.agent.deleteSession({ sessionId: id })).toEqual({});
 		expect(fs.existsSync(path)).toBe(false);
@@ -2770,7 +3126,7 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("rejects a cross-cwd list before flushing loaded sessions", async () => {
+	it("a scoped list flushes loaded sessions from every cwd before paging", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
@@ -2780,8 +3136,12 @@ describe("ACP agent", () => {
 			flushes += 1;
 			return realFlush();
 		};
-		await expect(harness.agent.listSessions({ cwd: harness.cwdB })).rejects.toThrow(/scoped to/);
-		expect(flushes).toBe(0);
+		// A scoped list in a DIFFERENT cwd still flushes every loaded session
+		// (the flush is global) before its inventory — multi-CWD coexistence does
+		// not skip flushing, and the second-cwd list succeeds instead of rejecting.
+		const listB = await harness.agent.listSessions({ cwd: harness.cwdB });
+		expect(Array.isArray(listB.sessions)).toBe(true);
+		expect(flushes).toBeGreaterThanOrEqual(1);
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
@@ -2803,7 +3163,7 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("an invalid first scoped cursor does not pin cwd scope", async () => {
+	it("an invalid first scoped cursor does not block a different cwd", async () => {
 		const harness = await createHarness();
 		await expect(harness.agent.listSessions({ cwd: harness.cwdA, cursor: "invalid" })).rejects.toThrow();
 		const created = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
@@ -2812,7 +3172,7 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("a failed first load response build does not pin cwd scope", async () => {
+	it("a failed first load response build does not block a different cwd", async () => {
 		const harness = await createHarness();
 		const { id } = await persistInactiveSession(harness.cwdA, "response-build-failure");
 		const modelSpy = spyOn(FakeAgentSession.prototype, "getAvailableModels").mockImplementationOnce(() => {
@@ -2828,31 +3188,141 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("a failed first lifecycle call does not pin the scope to that cwd", async () => {
+	it("a failed first lifecycle call does not block other cwds", async () => {
 		const harness = await createHarness();
-		// First call: load a nonexistent session in cwdA — must fail without committing scope.
+		// First call: load a nonexistent session in cwdA — must fail.
 		await expect(
 			harness.agent.loadSession({ sessionId: "no-such-session", cwd: harness.cwdA, mcpServers: [] }),
 		).rejects.toThrow(/not found/);
-		// A later lifecycle call in a different cwd must succeed (scope was not pinned).
+		// A later lifecycle call in a different cwd must succeed (no global cwd lock).
 		const created = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
 		expect(typeof created.sessionId).toBe("string");
-		// Scope is now committed to cwdB; cwdA is rejected before mutation.
-		await expect(harness.agent.listSessions({ cwd: harness.cwdA })).rejects.toThrow(/scoped to/);
+		// cwdA is still independently usable — multi-CWD, not single-scope.
+		const listA = await harness.agent.listSessions({ cwd: harness.cwdA });
+		expect(Array.isArray(listA.sessions)).toBe(true);
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
 
-	it("a failed first scoped list does not pin the scope to that cwd", async () => {
+	it("a failed first scoped list does not block a different cwd", async () => {
 		const harness = await createHarness();
 		const { path: goodPath } = await persistInactiveSession(harness.cwdA, "good");
 		// Corrupt the inventory so the first scoped list in cwdA fails.
 		const sessionDir = path.dirname(goodPath);
 		fs.writeFileSync(path.join(sessionDir, "corrupt.jsonl"), "{ not valid json\n");
 		await expect(harness.agent.listSessions({ cwd: harness.cwdA })).rejects.toThrow(/incomplete/);
-		// Scope was not committed: a scoped list in cwdB must succeed.
+		// cwdA's failure does not block cwdB: a scoped list in cwdB must succeed.
 		const other = await harness.agent.listSessions({ cwd: harness.cwdB });
 		expect(Array.isArray(other.sessions)).toBe(true);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+	// =========================================================================
+	// Fork/new rollback — committed owned publication verified-deleted on
+	// response/bootstrap failure; load/resume source transcript retained
+	// =========================================================================
+
+	it("fork response failure after commit verified-deletes only the owned publication, leaving the load source", async () => {
+		const harness = await createHarness();
+		// Persist an inactive load/resume source and issue authority via a scoped list.
+		const { id: sourceId, path: sourcePath } = await persistInactiveSession(harness.cwdA, "fork-rollback-source");
+		await harness.agent.listSessions({ cwd: harness.cwdA });
+		const sessionDir = path.dirname(sourcePath);
+		const beforeFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
+		expect(beforeFiles).toHaveLength(1);
+
+		// Deterministic proof the fork COMMITTED before the response failure: wrap
+		// SessionManager.fork to record the owned publication path it produced.
+		const realSmFork = SessionManager.prototype.fork;
+		const realModels = FakeAgentSession.prototype.getAvailableModels;
+		let forkCommitted = false;
+		let committedForkPath: string | undefined;
+		const smForkSpy = spyOn(SessionManager.prototype, "fork").mockImplementation(async function (
+			this: SessionManager,
+		) {
+			const result = await realSmFork.call(this);
+			if (result) {
+				forkCommitted = true;
+				committedForkPath = result.newSessionFile;
+			}
+			return result;
+		});
+		// Inject a deterministic response-build failure AFTER the record commits.
+		// #buildConfigOptions is the first post-commit caller of getAvailableModels;
+		// the forkCommitted guard guarantees the throw lands in the fork try-block,
+		// driving #rollbackUnpublishedRecord rather than a pre-commit dispose leak.
+		const modelSpy = spyOn(FakeAgentSession.prototype, "getAvailableModels").mockImplementation(function (
+			this: FakeAgentSession,
+		) {
+			if (forkCommitted) throw new Error("fork response build failed");
+			return realModels.call(this);
+		});
+		try {
+			await expect(
+				harness.agent.unstable_forkSession({ sessionId: sourceId, cwd: harness.cwdA, mcpServers: [] }),
+			).rejects.toThrow(/fork response build failed/);
+		} finally {
+			smForkSpy.mockRestore();
+			modelSpy.mockRestore();
+		}
+
+		// The fork committed an owned publication before the failure.
+		expect(committedForkPath).toBeDefined();
+		expect(committedForkPath).not.toBe(sourcePath);
+		// Rollback verified-deleted the owned fork transcript AND its artifact directory.
+		expect(fs.existsSync(committedForkPath!)).toBe(false);
+		expect(fs.existsSync(committedForkPath!.slice(0, -6))).toBe(false);
+		// The load/resume source transcript remains untouched.
+		expect(fs.existsSync(sourcePath)).toBe(true);
+		// No leaked fork transcript or stage: only the source remains.
+		const afterFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
+		expect(afterFiles).toEqual(beforeFiles);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("new session response failure after commit verified-deletes the owned new publication", async () => {
+		const harness = await createHarness();
+		const sessionDir = SessionManager.getDefaultSessionDir(harness.cwdA);
+		fs.mkdirSync(sessionDir, { recursive: true });
+		const beforeFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
+
+		// #buildConfigOptions is the first post-commit caller of getAvailableModels,
+		// so mockImplementationOnce fires after #createNewSessionRecord committed
+		// the new transcript + receipt, driving #rollbackUnpublishedRecord.
+		const modelSpy = spyOn(FakeAgentSession.prototype, "getAvailableModels").mockImplementationOnce(() => {
+			throw new Error("new response build failed");
+		});
+		await expect(harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] })).rejects.toThrow(
+			/new response build failed/,
+		);
+		modelSpy.mockRestore();
+		// The owned new publication was verified-deleted on rollback: no transcript
+		// or artifact directory survives the failed response.
+		const afterFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
+		expect(afterFiles).toEqual(beforeFiles);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("load response failure leaves the stored source transcript intact (no owned publication to delete)", async () => {
+		const harness = await createHarness();
+		const { id, path: sourcePath } = await persistInactiveSession(harness.cwdA, "load-rollback-source");
+		await harness.agent.listSessions({ cwd: harness.cwdA });
+		// Load/resume hydrates from a stored source with NO owned publication: a
+		// response failure rolls back the prepared record but never deletes source.
+		const modelSpy = spyOn(FakeAgentSession.prototype, "getAvailableModels").mockImplementationOnce(() => {
+			throw new Error("load response build failed");
+		});
+		await expect(harness.agent.loadSession({ sessionId: id, cwd: harness.cwdA, mcpServers: [] })).rejects.toThrow(
+			/load response build failed/,
+		);
+		modelSpy.mockRestore();
+		// The source transcript is untouched by the load rollback.
+		expect(fs.existsSync(sourcePath)).toBe(true);
+		// The source remains authoritatively deletable afterwards (receipt retained).
+		expect(await harness.agent.deleteSession({ sessionId: id })).toEqual({});
+		expect(fs.existsSync(sourcePath)).toBe(false);
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});

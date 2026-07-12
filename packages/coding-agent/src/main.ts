@@ -36,6 +36,7 @@ import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
+import type { AcpSessionFactoryDescriptor } from "./modes/acp";
 import type { SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
@@ -267,8 +268,6 @@ type CreateSessionForMain = (
 	context?: { skipPostCreateModelRefresh?: boolean },
 ) => Promise<CreateAgentSessionResult>;
 
-type AcpSessionFactory = (cwd: string) => Promise<AgentSession>;
-
 export interface AcpSessionFactoryOptions {
 	baseOptions: CreateAgentSessionOptions;
 	settings: Settings;
@@ -340,7 +339,14 @@ export async function applyStartupModelProfilesOrExit(
 }
 
 /**
- * Build the per-`session/new` factory used by ACP mode.
+ * Build the per-`session/new` factory descriptor used by ACP mode.
+ *
+ * The returned descriptor is a callable factory (backward-compatible with every
+ * `(cwd) => …` call site) that also carries the connection-wide explicit
+ * `--session-dir` as {@link AcpSessionFactoryDescriptor.sessionDir}. AcpAgent
+ * seeds its authority-root override from that field at construction so a
+ * fresh-connection scoped `session/list` resolves the exact configured
+ * session-dir before any session is created.
  *
  * MCP servers in ACP sessions are owned exclusively by the ACP client, which
  * supplies them through `session/new.mcpServers` and re-applies them via
@@ -349,8 +355,8 @@ export async function applyStartupModelProfilesOrExit(
  * `.mcp.json` discovery path — otherwise host MCP tools land in the session's
  * tool registry and shadow the client-supplied servers (issue #1234).
  */
-export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
-	return async cwd => {
+export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactoryDescriptor {
+	const create = async (cwd: string): Promise<AgentSession> => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
 		const hasStartupProfile = Boolean(nextSettings.get("modelProfile.default") || args.parsedArgs.mpreset);
 		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
@@ -381,6 +387,9 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		applyExtensionFlagValues(nextSession, args.rawArgs);
 		return nextSession;
 	};
+	// Bundle the explicit `--session-dir` authority root onto the callable
+	// factory so AcpAgent learns it from the descriptor, not heuristically.
+	return Object.assign(create, { sessionDir: args.sessionDir });
 }
 
 interface InteractiveModeFactoryOptions {
@@ -895,7 +904,7 @@ type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promis
 export interface RunRootCommandDependencies {
 	createAgentSession?: typeof createAgentSession;
 	discoverAuthStorage?: typeof discoverAuthStorage;
-	runAcpMode?: (createSession: AcpSessionFactory) => Promise<void>;
+	runAcpMode?: (createSession: AcpSessionFactoryDescriptor) => Promise<void>;
 	settings?: Settings;
 	rlmPreset?: RlmPreset;
 	suppressProcessExit?: boolean;

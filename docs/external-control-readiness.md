@@ -61,6 +61,9 @@ Readiness claim:
 - ACP is implemented and covered for current editor/client contracts: initialize conformance, agent capability advertisement, lazy startup, stdout JSON-RPC hygiene, client-owned MCP isolation, event mapping, file bridge routing, terminal routing, and permission routing.
 - ACP is not the preferred bot control-plane surface. It is not positioned as a multi-session external bot coordinator, and it does not replace Coordinator MCP reports/artifacts/turn state.
 - A real prompt still depends on the selected provider/model credentials, so required PR smokes should stay on provider-independent initialize, lifecycle, bridge, and mapper tests.
+- A single ACP connection supports multiple explicit CWDs. Each cwd is admitted as its own authority namespace (per-cwd nonce/generation/snapshot) with no connection-global cwd lock, so a lifecycle change in one cwd never invalidates another cwd's pagination cursor or authority. An explicit flat `--session-dir` is honored as one shared authority root known before the first `session/list`: under that shared-root mode two cwds coexist in the same directory — a foreign-cwd record is classified (so a same-id collision across cwds is detected and fails closed) but never displayed or issued as a candidate for the requested cwd. Default per-cwd roots stay strict: a record whose cwd does not match the scoped workspace is a hard inventory failure.
+- Each session has immutable ownership (the canonical cwd it was admitted under), and every active control (prompt/config/mode/close/cancel/delete/fork) requires an exact unique connection-local authority receipt — no active control acts on the in-memory session map alone. A cwd-less `session/list` (no `cwd`) stays display-only and non-authorizing: it issues no authority receipt and can never authorize delete, fork, or control. Authority receipts follow an absorbing state machine: only an exact same-identity re-observation stays `unique`; a same-cwd replacement, a duplicate, or a cross-cwd collision flips the receipt `ambiguous`, and a successful verified delete retains a `deleted` tombstone, so a replaced or recreated id can never re-authorize or reissue until reconnect. Scoped list cursors use an anchored versioned grammar (`acp1:<nonce>:<generation>:<offset>`) with exact integer parsing.
+- Multi-CWD authority is connection-local and does not change the practical local-user threat model. ACP runs over a local stdio connection for a trusted local user who already owns the filesystem, so the fail-closed duplicate/replacement checks harden against accidental and concurrency-induced ambiguity rather than against a hostile local process that can win filesystem races.
 
 Current entrypoints:
 
@@ -93,6 +96,14 @@ Primary references:
 - `packages/coding-agent/src/modes/acp/acp-agent.ts`
 - `packages/coding-agent/src/modes/acp/acp-client-bridge.ts`
 - `packages/coding-agent/src/modes/acp/acp-event-mapper.ts`
+
+#### Multi-CWD session authority
+
+One ACP connection supports multiple explicit CWDs simultaneously. Each explicit-cwd `session/list` or lifecycle call admits one authority namespace with its own opaque nonce, generation counter, and authorization snapshot; there is no connection-global cwd lock and no cross-cwd rejection. A lifecycle change (new/load/resume/fork/close/delete) in one cwd bumps only that cwd's generation and discards only that cwd's cached snapshot, so another cwd's scoped pagination cursor stays valid.
+
+Each active session carries an immutable canonical cwd (set at admission and never mutated), and an inactive session is reachable for delete/fork only through a connection-local authority receipt — the sole `sessionId -> cwd/transcript` route. A bare id with no receipt is a lookup-free no-op (delete) or not-found (fork); it never triggers a storage scan or forgiving first-match lookup. A cwd-less `session/list` (no `cwd`) is display-only: it admits no namespace, issues no receipt, and cannot authorize delete/fork/control.
+
+Ambiguity and deletion are absorbing for the connection: a duplicate id within one inventory, the same id observed under more than one cwd, or a same-cwd transcript replacement flips the receipt to an ambiguous state that never re-authorizes delete, fork, or reissue; a successful verified delete retains a `deleted` tombstone so a recreated transcript under the same id cannot reissue or re-authorize until reconnect. A fresh strict inventory revalidates exact file identity before any destructive mutation so a replaced transcript cannot authorize its replacement. Lifecycle admission is transactional: a failed new/resume/fork response removes the unpublished record and drops its receipt rather than leaving half-admitted authority. This does not constitute a bot control plane and does not add protection against a hostile local process that can win filesystem races; the practical local-user threat model is unchanged.
 
 ### Bridge HTTPS
 

@@ -62,8 +62,9 @@ class LazyFakeSession {
 	disposed = false;
 	settings = { get: (_path: string) => false };
 
-	constructor(cwd: string) {
-		this.sessionManager = SessionManager.inMemory(cwd);
+	constructor(cwd: string, sessionDir?: string) {
+		this.sessionManager =
+			sessionDir === undefined ? SessionManager.inMemory(cwd) : SessionManager.create(cwd, sessionDir);
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent = { sessionId: this.sessionId, waitForIdle: async () => {} };
 	}
@@ -138,6 +139,9 @@ class LazyFakeSession {
 
 describe("ACP lazy startup", () => {
 	it("answers initialize before creating the first AgentSession", async () => {
+		using tempDir = TempDir.createSync("@gjc-acp-lazy-startup-");
+		const cwd = tempDir.path();
+		const sessionDir = path.join(cwd, "sessions");
 		const clientToAgent = new TransformStream();
 		const agentToClient = new TransformStream();
 		const client = new TestClient();
@@ -174,11 +178,11 @@ describe("ACP lazy startup", () => {
 			);
 			expect(createCalls).toBe(0);
 
-			const newSessionPromise = agentConnection.newSession({ cwd: "/tmp/acp-lazy-startup", mcpServers: [] });
+			const newSessionPromise = agentConnection.newSession({ cwd, mcpServers: [] });
 			await Bun.sleep(20);
 			expect(createCalls).toBe(1);
 
-			blockedCreation.resolve(new LazyFakeSession("/tmp/acp-lazy-startup") as unknown as AgentSession);
+			blockedCreation.resolve(new LazyFakeSession(cwd, sessionDir) as unknown as AgentSession);
 			const sessionResponse = await newSessionPromise;
 			expect(sessionResponse.sessionId).toEqual(expect.any(String));
 		} finally {

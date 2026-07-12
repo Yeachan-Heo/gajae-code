@@ -5,6 +5,21 @@ import { AcpAgent } from "./acp-agent";
 
 export type AcpSessionFactory = (cwd: string) => Promise<AgentSession>;
 
+/**
+ * {@link AcpSessionFactory} bundled with the connection-wide explicit
+ * `--session-dir` authority root. The descriptor is itself callable (it extends
+ * {@link AcpSessionFactory}) so existing `(cwd) => …` call sites and test seams
+ * keep working unchanged. {@link sessionDir}, when present, is the flat shared
+ * root every per-CWD namespace resolves for its strict inventory/list/load
+ * BEFORE any session is created — closing the fresh-connection scoped-list gap
+ * where the configured `--session-dir` was previously unknown until the first
+ * session/new. It is the authoritative source of truth: there is no heuristic
+ * discovery from created/loaded sessions. Undefined means per-CWD default layout.
+ */
+export interface AcpSessionFactoryDescriptor extends AcpSessionFactory {
+	readonly sessionDir?: string;
+}
+
 export interface AcpConnectionHandle {
 	connection: AgentSideConnection;
 	agent: AcpAgent;
@@ -12,7 +27,7 @@ export interface AcpConnectionHandle {
 
 export function createAcpConnection(
 	transport: Stream,
-	createSession: AcpSessionFactory,
+	createSession: AcpSessionFactoryDescriptor,
 	initialSession?: AgentSession,
 ): AgentSideConnection {
 	return createAcpConnectionWithAgent(transport, createSession, initialSession).connection;
@@ -26,7 +41,7 @@ export function createAcpConnection(
  */
 export function createAcpConnectionWithAgent(
 	transport: Stream,
-	createSession: AcpSessionFactory,
+	createSession: AcpSessionFactoryDescriptor,
 	initialSession?: AgentSession,
 ): AcpConnectionHandle {
 	let agent: AcpAgent | undefined;
@@ -37,7 +52,10 @@ export function createAcpConnectionWithAgent(
 	return { connection, agent: agent! };
 }
 
-export async function runAcpMode(createSession: AcpSessionFactory, initialSession?: AgentSession): Promise<never> {
+export async function runAcpMode(
+	createSession: AcpSessionFactoryDescriptor,
+	initialSession?: AgentSession,
+): Promise<never> {
 	const input = stream.Writable.toWeb(process.stdout);
 	const output = stream.Readable.toWeb(process.stdin);
 	const transport = ndJsonStream(input, output);

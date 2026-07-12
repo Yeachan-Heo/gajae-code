@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
+import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -247,5 +248,83 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		if (!assistantEntry) throw new Error("Expected assistant entry");
 		expect(JSON.stringify(assistantEntry.message.content)).toContain("[Session persistence truncated large content]");
 		expect(JSON.stringify(assistantEntry.message.content)).not.toContain("blob:sha256:");
+	});
+});
+describe("transactional fork: stage/clone/publish ordering and rollback", () => {
+	it("clones artifacts into the new artifact directory on a successful fork", async () => {
+		const sentinel = `fork artifact sentinel ${"a".repeat(2048)}`;
+		const { sm, artifactsDir } = await makeLargeSession(sentinel);
+		// Seed a real (non-resident) tool artifact in the source artifact directory.
+		await Bun.write(path.join(artifactsDir, "tool-artifact.txt"), "tool output");
+		const oldSessionFile = sm.getSessionFile();
+		if (!oldSessionFile) throw new Error("Expected persisted source session file");
+		const forked = await sm.fork();
+		if (!forked) throw new Error("Expected fork result");
+		const newArtifactDir = forked.newSessionFile.slice(0, -6);
+		// The published fork transcript exists and the source transcript remains.
+		expect(fs.existsSync(forked.newSessionFile)).toBe(true);
+		expect(fs.existsSync(oldSessionFile)).toBe(true);
+		// Artifacts were cloned into the NEW artifact directory before publication.
+		expect(await Bun.file(path.join(newArtifactDir, "tool-artifact.txt")).text()).toBe("tool output");
+		// Resident content is preserved on the forked manager.
+		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
+		await sm.close();
+	});
+
+	it("publishes no transcript when artifact copy fails and restores the old manager state", async () => {
+		const sentinel = `fork rollback artifact ${"r".repeat(2048)}`;
+		const { sm, root, sessionFile, artifactsDir } = await makeLargeSession(sentinel);
+		const sessionDir = path.dirname(sessionFile);
+		const beforeFiles = fs.readdirSync(sessionDir);
+		const oldSessionId = sm.getSessionId();
+		// Inject an uncloneable special entry into the source artifacts directory so
+		// cloneArtifactsExclusive fails closed mid-transaction (deterministic, no race).
+		await fs.promises.symlink(path.join(root, "link-target"), path.join(artifactsDir, "evil-link"));
+		await expect(sm.fork()).rejects.toThrow(/non-regular artifact entry/);
+		// No new transcript published and no leftover stage file in the session dir.
+		const afterFiles = fs.readdirSync(sessionDir);
+		expect(afterFiles).toEqual(beforeFiles);
+		expect(afterFiles.some(f => f.endsWith(".stage"))).toBe(false);
+		// Old manager state restored: same id/file, resident content still readable.
+		expect(sm.getSessionId()).toBe(oldSessionId);
+		expect(sm.getSessionFile()).toBe(sessionFile);
+		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
+		expect(JSON.stringify(sm.buildSessionContext())).toContain(sentinel);
+		// Source artifacts (including the injected symlink) are untouched.
+		expect(fs.lstatSync(path.join(artifactsDir, "evil-link")).isSymbolicLink()).toBe(true);
+		await sm.close();
+	});
+
+	it("publishes no transcript when exclusive publication fails, cleans the stage, and restores state", async () => {
+		const sentinel = `fork rollback publish ${"p".repeat(2048)}`;
+		const { sm, sessionFile } = await makeLargeSession(sentinel);
+		const sessionDir = path.dirname(sessionFile);
+		const beforeFiles = fs.readdirSync(sessionDir);
+		const oldSessionId = sm.getSessionId();
+		// Deterministic publish failure via the storage seam: the staged transcript
+		// cannot be linked to its final name. No time-based race is involved.
+		let stagedPath: string | undefined;
+		const publishSpy = vi
+			.spyOn(FileSessionStorage.prototype, "publishTranscriptExclusive")
+			.mockImplementation((stage: string) => {
+				stagedPath = stage;
+				return Promise.reject(new Error("simulated exclusive publish failure"));
+			});
+		try {
+			await expect(sm.fork()).rejects.toThrow(/simulated exclusive publish failure/);
+		} finally {
+			publishSpy.mockRestore();
+		}
+		// The transaction-owned stage was cleaned up; no new transcript published.
+		expect(stagedPath).toBeDefined();
+		expect(fs.existsSync(stagedPath!)).toBe(false);
+		const afterFiles = fs.readdirSync(sessionDir);
+		expect(afterFiles).toEqual(beforeFiles);
+		expect(afterFiles.some(f => f.endsWith(".stage"))).toBe(false);
+		// Old manager state restored: same id/file, resident content intact.
+		expect(sm.getSessionId()).toBe(oldSessionId);
+		expect(sm.getSessionFile()).toBe(sessionFile);
+		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
+		await sm.close();
 	});
 });
