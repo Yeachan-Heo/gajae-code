@@ -51,9 +51,9 @@ export type {
 export { normalizeSchemaForGoogle };
 
 type GoogleApiType = "google-generative-ai" | "google-gemini-cli" | "google-vertex";
-const PROVIDER_SAFETY_STOP = "provider_safety_stop";
+export const PROVIDER_SAFETY_STOP = "provider_safety_stop";
 
-function isGoogleCandidateSafetyStopReason(reason: string): boolean {
+export function isGoogleCandidateSafetyStopReason(reason: string): boolean {
 	switch (reason) {
 		case "SAFETY":
 		case "IMAGE_SAFETY":
@@ -70,7 +70,7 @@ function isGoogleCandidateSafetyStopReason(reason: string): boolean {
 	}
 }
 
-function isGooglePromptSafetyStopReason(reason: string): boolean {
+export function isGooglePromptSafetyStopReason(reason: string): boolean {
 	switch (reason) {
 		case "SAFETY":
 		case "IMAGE_SAFETY":
@@ -84,7 +84,7 @@ function isGooglePromptSafetyStopReason(reason: string): boolean {
 	}
 }
 
-function getGooglePromptBlockReason(promptFeedback: GenerateContentResponse["promptFeedback"]): string | undefined {
+export function getGooglePromptBlockReason(promptFeedback: { blockReason?: unknown } | undefined): string | undefined {
 	const blockReason = promptFeedback?.blockReason;
 	return typeof blockReason === "string" && blockReason.length > 0 ? blockReason : undefined;
 }

@@ -880,6 +880,8 @@ describe("ACP agent", () => {
 			"Refusal (no details provided)",
 			"Content flagged by safety filters",
 			"Blocked under Anthropic's Usage Policy.",
+			"Provider finish_reason: content_filter",
+			"provider FINISH_REASON: CONTENT_FILTER\t",
 		];
 		for (const errorMessage of persistedLabels) {
 			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -909,6 +911,25 @@ describe("ACP agent", () => {
 			"connection error after upstream refusal handshake",
 			"connection error: content flagged by safety filters in a prior response",
 			"connection error: request was blocked under Anthropic's Usage Policy while retrying",
+			"connection error: Provider finish_reason: content_filter",
+			"Provider finish_reason: content_filter timeout",
+			"Content flagged by safety filtersXYZ",
+			"Blocked under vendor Usage Policymaker timeout",
+			"Refusal (unterminated transient transport error",
+			" Provider finish_reason: content_filter",
+			"Provider finish_reason: content_filter\n",
+			"Provider finish_reason: content_filter\r\n",
+			"Refusal: ",
+			"Refusal (cyber): ",
+			"Refusal( cyber )",
+			"Refusal ( cyber)",
+			"Refusal (cyber )",
+			"Refusal (cy(ber))",
+			"Blocked under xUsage Policy",
+			"Provider finish_reason:content_filter",
+			"Provider finish_reason:\tcontent_filter",
+			"Provider finish_reason:  content_filter",
+			"Provider finish_reason: \tcontent_filter",
 		];
 		for (const errorMessage of incidentalMessages) {
 			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });

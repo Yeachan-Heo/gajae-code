@@ -40,10 +40,14 @@ import {
 	convertMessages,
 	convertTools,
 	type GoogleThinkingLevel,
+	getGooglePromptBlockReason,
+	isGoogleCandidateSafetyStopReason,
+	isGooglePromptSafetyStopReason,
 	isThinkingPart,
 	mapStopReasonString,
 	mapToolChoice,
 	nextToolCallId,
+	PROVIDER_SAFETY_STOP,
 	pushBlockEndEvent,
 	pushToolCallEvents,
 	retainThoughtSignature,
@@ -255,6 +259,9 @@ interface CloudCodeAssistResponseChunk {
 			};
 			finishReason?: string;
 		}>;
+		promptFeedback?: {
+			blockReason?: string;
+		};
 		usageMetadata?: {
 			promptTokenCount?: number;
 			candidatesTokenCount?: number;
@@ -537,9 +544,26 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					}
 
 					if (candidate?.finishReason) {
-						output.stopReason = mapStopReasonString(candidate.finishReason);
-						if (output.content.some(b => b.type === "toolCall")) {
-							output.stopReason = "toolUse";
+						if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
+							hasContent = true;
+							output.errorKind = PROVIDER_SAFETY_STOP;
+							output.stopReason = "error";
+						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+							output.stopReason = mapStopReasonString(candidate.finishReason);
+							if (output.stopReason === "stop" && output.content.some(b => b.type === "toolCall")) {
+								output.stopReason = "toolUse";
+							}
+						}
+					}
+
+					const blockReason = getGooglePromptBlockReason(responseData.promptFeedback);
+					if (blockReason) {
+						hasContent = true;
+						if (isGooglePromptSafetyStopReason(blockReason)) {
+							output.errorKind = PROVIDER_SAFETY_STOP;
+							output.stopReason = "error";
+						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+							output.stopReason = "error";
 						}
 					}
 
