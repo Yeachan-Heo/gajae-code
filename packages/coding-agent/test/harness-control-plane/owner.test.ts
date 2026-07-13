@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { callEndpoint } from "../../src/harness-control-plane/control-endpoint";
+import { ControlServer, callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import { RuntimeOwner, resolveOwner, resolveOwnerLive } from "../../src/harness-control-plane/owner";
 import { acquireLease } from "../../src/harness-control-plane/session-lease";
 import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
@@ -25,6 +25,7 @@ class FakeTransport implements HarnessSessionTransport {
 	closeError: Error | null = null;
 	closeCalls = 0;
 	closeImpl: ((call: number) => Promise<void>) | null = null;
+	unsubscribeImpl: (() => void) | null = null;
 	async getState(): Promise<SessionStateSnapshot> {
 		return this.state;
 	}
@@ -41,6 +42,9 @@ class FakeTransport implements HarnessSessionTransport {
 	async waitForAgentStart(afterCursor: number): Promise<{ cursor: number } | null> {
 		const found = this.agentStarts.find(c => c > afterCursor);
 		return found === undefined ? null : { cursor: found };
+	}
+	onEventFrame(_listener: (frame: Record<string, unknown>) => void): () => void {
+		return () => this.unsubscribeImpl?.();
 	}
 	async close(): Promise<void> {
 		this.closeCalls += 1;
@@ -347,20 +351,38 @@ describe("RuntimeOwner (in-process integration)", () => {
 		owner = null;
 	});
 
-	it("returns the memoized cleanup result to a reentrant stop caller", async () => {
+	it("allows transport cleanup to await a reentrant stop without deadlocking", async () => {
 		const transport = new FakeTransport();
-		const observed: { reentrant: Promise<void> | null } = { reentrant: null };
+		let reentrantCompleted = false;
 		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
 		transport.closeImpl = async () => {
-			observed.reentrant = owner?.stop() ?? null;
+			await owner?.stop();
+			reentrantCompleted = true;
 		};
 		await owner.start();
 
-		const first = owner.stop();
-		await first;
+		const outcome = await Promise.race([owner.stop().then(() => "stopped"), Bun.sleep(250).then(() => "timeout")]);
 
-		expect(observed.reentrant).toBe(first);
-		expect(owner.stop()).toBe(first);
+		expect(outcome).toBe("stopped");
+		expect(reentrantCompleted).toBe(true);
+		expect(transport.closeCalls).toBe(1);
+		expect((await resolveOwner(root, SID)).live).toBe(false);
+		owner = null;
+	});
+
+	it("publishes the stop result before synchronous unsubscribe reentrancy", async () => {
+		const transport = new FakeTransport();
+		let reentrantCalls = 0;
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
+		transport.unsubscribeImpl = () => {
+			reentrantCalls += 1;
+			void owner?.stop();
+		};
+		await owner.start();
+
+		await owner.stop();
+
+		expect(reentrantCalls).toBe(1);
 		expect(transport.closeCalls).toBe(1);
 		expect((await resolveOwner(root, SID)).live).toBe(false);
 		owner = null;
@@ -390,6 +412,45 @@ describe("RuntimeOwner (in-process integration)", () => {
 		const failures = (await readEvents(root, SID, 0)).filter(event => event.kind === "owner_transport_stop_failed");
 		expect(failures).toHaveLength(1);
 		expect(failures[0]?.evidence.error).toContain(cleanupError.message);
+		owner = null;
+	});
+
+	it("retains the lease when control-server cleanup cannot be verified", async () => {
+		const transport = new FakeTransport();
+		const serverError = new Error("control endpoint cleanup failed");
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			acceptanceTimeoutMs: 200,
+			controlServerFactory(socketPath, handler) {
+				const server = new ControlServer(socketPath, handler);
+				const close = server.close.bind(server);
+				server.close = async () => {
+					await close();
+					throw serverError;
+				};
+				return server;
+			},
+		});
+		const info = await owner.start();
+
+		await owner.stop();
+
+		expect(transport.closeCalls).toBe(1);
+		const retained = await resolveOwner(root, SID);
+		expect(retained.live).toBe(true);
+		expect(retained.lease?.ownerId).toBe(info.ownerId);
+		const failures = (await readEvents(root, SID, 0)).filter(event => event.kind === "owner_server_stop_failed");
+		expect(failures).toHaveLength(1);
+		expect(failures[0]?.evidence.error).toContain(serverError.message);
+		const replacement = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport: new FakeTransport(),
+			acceptanceTimeoutMs: 200,
+		});
+		await expect(replacement.start()).rejects.toThrow(/lease_held/);
 		owner = null;
 	});
 

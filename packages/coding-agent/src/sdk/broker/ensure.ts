@@ -17,7 +17,20 @@ const DISCOVERY_TIMEOUT_MS = 10_000;
 // owned-process teardown convention (SIGTERM -> grace -> SIGKILL -> hard cap).
 const REAP_GRACEFUL_MS = 2_000;
 const REAP_SIGKILL_CAP_MS = 2_000;
-const owners = new Map<string, { stop: () => Promise<void> }>();
+interface BrokerOwner {
+	stop(): Promise<void>;
+}
+const owners = new Map<string, BrokerOwner>();
+const ensureInFlight = new Map<string, Promise<BrokerDiscovery>>();
+const reapErrorGuards = new WeakSet<ChildProcess>();
+interface ReapTiming {
+	gracefulMs: number;
+	killVerifyMs: number;
+}
+const DEFAULT_REAP_TIMING: ReapTiming = {
+	gracefulMs: REAP_GRACEFUL_MS,
+	killVerifyMs: REAP_SIGKILL_CAP_MS,
+};
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
@@ -31,12 +44,19 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
  * teardown (e.g. a transient signal-delivery failure); that is diagnostic only
  * and never counts as exit, so the escalation cannot be skipped mid-shutdown.
  */
-async function reapSpawnedBroker(child: ChildProcess): Promise<void> {
+async function reapSpawnedBroker(child: ChildProcess, timing: ReapTiming = DEFAULT_REAP_TIMING): Promise<void> {
 	// A spawn failure (e.g. ENOENT) never created a kernel process: pid is
 	// undefined and there is nothing to signal or await. The `error` event is the
 	// only signal and is diagnostic here — termination trivially holds, so do not
 	// run out the TERM/KILL windows or report a stuck child that never existed.
 	if (child.pid === undefined) return;
+	// Reaping owns repeated teardown diagnostics too. Keep exactly one error
+	// listener for the retained child so a later signal-delivery error cannot
+	// become an unhandled EventEmitter error after the spawn listener is consumed.
+	if (!reapErrorGuards.has(child)) {
+		child.on("error", () => {});
+		reapErrorGuards.add(child);
+	}
 
 	// Awaits an authoritative exit signal, never a transient `error`. Resolves on
 	// an `exit`/`close` event or when the codes are already set; the caller
@@ -50,31 +70,57 @@ async function reapSpawnedBroker(child: ChildProcess): Promise<void> {
 		}
 		return promise;
 	};
+	// Observed exit is authoritative: only non-null exit/signal codes prove the
+	// child is gone, regardless of which event (if any) resolved the wait.
+	const hasExited = (): boolean => child.exitCode !== null || child.signalCode !== null;
 	const signal = (sig: NodeJS.Signals): void => {
+		if (hasExited()) return;
 		try {
 			child.kill(sig);
 		} catch {
 			// already exited between the liveness check and the kill
 		}
 	};
-	// Observed exit is authoritative: only non-null exit/signal codes prove the
-	// child is gone, regardless of which event (if any) resolved the wait.
-	const hasExited = (): boolean => child.exitCode !== null || child.signalCode !== null;
+	if (hasExited()) return;
 	signal("SIGTERM");
-	await Promise.race([awaitVerifiedExit(), sleep(REAP_GRACEFUL_MS)]);
+	await Promise.race([awaitVerifiedExit(), sleep(timing.gracefulMs)]);
 	if (hasExited()) return;
 	signal("SIGKILL");
-	await Promise.race([awaitVerifiedExit(), sleep(REAP_SIGKILL_CAP_MS)]);
+	await Promise.race([awaitVerifiedExit(), sleep(timing.killVerifyMs)]);
 	if (hasExited()) return;
 	// SIGKILL is uninterruptible; a child still alive past this bounded wait is a
 	// kernel-level stuck state. Surface it rather than silently orphaning the spawn.
 	throw new Error(`Detached SDK broker (pid ${child.pid}) did not exit after SIGKILL during reap.`);
 }
 
-/** Starts the detached broker entrypoint when discovery has no live owner. */
-export async function ensureBroker(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
+function registerBrokerOwner(
+	agentDir: string,
+	child: ChildProcess,
+	timing: ReapTiming = DEFAULT_REAP_TIMING,
+): BrokerOwner {
+	const owner: BrokerOwner = {
+		async stop(): Promise<void> {
+			// Retain the authority handle when exit cannot be verified. A later ensure
+			// must retry this exact child before it may spawn a replacement.
+			await reapSpawnedBroker(child, timing);
+			if (owners.get(agentDir) === owner) owners.delete(agentDir);
+		},
+	};
+	owners.set(agentDir, owner);
+	return owner;
+}
+
+async function ensureBrokerOnce(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
 	const existing = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 	if (existing) return existing;
+
+	// A prior locally-owned broker without live discovery must be reaped before
+	// replacement. Failure stays fail-closed in `owners` and prevents a new spawn.
+	const priorOwner = owners.get(settings.agentDir);
+	if (priorOwner) await priorOwner.stop();
+	const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	if (discoveredAfterCleanup) return discoveredAfterCleanup;
+
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
 	const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
 		detached: true,
@@ -86,14 +132,7 @@ export async function ensureBroker(settings: EnsureBrokerSettings): Promise<Brok
 	child.once("error", error => {
 		spawnError = error;
 	});
-	const stop = async (): Promise<void> => {
-		try {
-			await reapSpawnedBroker(child);
-		} finally {
-			owners.delete(settings.agentDir);
-		}
-	};
-	owners.set(settings.agentDir, { stop });
+	const owner = registerBrokerOwner(settings.agentDir, child);
 	const deadline = Date.now() + DISCOVERY_TIMEOUT_MS;
 	let discoveryError: unknown;
 	while (Date.now() < deadline) {
@@ -125,17 +164,38 @@ export async function ensureBroker(settings: EnsureBrokerSettings): Promise<Brok
 				? discoveryError
 				: new Error("Timed out waiting for detached SDK broker discovery.");
 	try {
-		await stop();
+		await owner.stop();
 	} catch (cleanupError) {
 		throw new AggregateError([failure, cleanupError], "SDK broker discovery and spawned broker cleanup both failed.");
 	}
 	throw failure;
 }
+
+/** Starts the detached broker entrypoint when discovery has no live owner. */
+export function ensureBroker(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
+	const existing = ensureInFlight.get(settings.agentDir);
+	if (existing) return existing;
+	const pending = ensureBrokerOnce(settings);
+	ensureInFlight.set(settings.agentDir, pending);
+	const clear = (): void => {
+		if (ensureInFlight.get(settings.agentDir) === pending) ensureInFlight.delete(settings.agentDir);
+	};
+	void pending.then(clear, clear);
+	return pending;
+}
 /** Test hook: returns a stop handle for the detached broker this process spawned. */
-export function brokerOwnerForTest(agentDir: string): { stop: () => Promise<void> } | undefined {
+export function brokerOwnerForTest(agentDir: string): BrokerOwner | undefined {
 	return owners.get(agentDir);
 }
 /** Test hook: drives the detached-broker reap on a controllable child surface. */
-export function reapSpawnedBrokerForTest(child: ChildProcess): Promise<void> {
-	return reapSpawnedBroker(child);
+export function reapSpawnedBrokerForTest(child: ChildProcess, timing: ReapTiming = DEFAULT_REAP_TIMING): Promise<void> {
+	return reapSpawnedBroker(child, timing);
+}
+/** Test hook: installs an exact controllable owner to exercise replacement fencing. */
+export function registerBrokerOwnerForTest(
+	agentDir: string,
+	child: ChildProcess,
+	timing: ReapTiming = DEFAULT_REAP_TIMING,
+): BrokerOwner {
+	return registerBrokerOwner(agentDir, child, timing);
 }

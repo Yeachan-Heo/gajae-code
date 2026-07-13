@@ -220,20 +220,27 @@ describe("SDK harness child lifecycle", () => {
 		expect((error as AggregateError).errors).toEqual([clientCloseError, childStopError]);
 	});
 
-	it("surfaces spawned-child cleanup failure instead of hiding an orphan", async () => {
-		const pending = createSdkSessionTransport({
+	it("preserves discovery timeout and spawned-child cleanup failures", async () => {
+		const cleanupError = new Error("exact child did not exit");
+		const error = await createSdkSessionTransport({
 			repo: "/repo",
 			sessionId: "missing",
 			discoveryTimeoutMs: 0,
 			readEndpoint: async () => null,
 			spawn: () => ({
 				async stop() {
-					throw new Error("exact child did not exit");
+					throw cleanupError;
 				},
 			}),
-		});
+		}).then(
+			() => undefined,
+			failure => failure,
+		);
 
-		await expect(pending).rejects.toThrow("exact child did not exit");
+		expect(error).toBeInstanceOf(AggregateError);
+		const causes = (error as AggregateError).errors;
+		expect(causes[0]).toMatchObject({ name: "HarnessSdkTransportError", code: "endpoint_unavailable" });
+		expect(causes[1]).toBe(cleanupError);
 	});
 
 	it("awaits spawned-child stop exactly once when a post-spawn discovery read throws", async () => {

@@ -10,7 +10,13 @@ export interface HarnessSessionTransport {
 	sendPrompt(prompt: string): Promise<{ commandId: string; ack: boolean }>;
 	eventCursor(): number;
 	waitForAgentStart(afterCursor: number, timeoutMs: number): Promise<{ cursor: number } | null>;
+	/**
+	 * Await every transport-owned cleanup step. Reentrant RuntimeOwner.stop() calls
+	 * made from this async cleanup context may be awaited without starting another
+	 * teardown pipeline.
+	 */
 	close(): Promise<void>;
+	/** Return a synchronous disposer that fully severs this event subscription. */
 	onEventFrame?(listener: (frame: Record<string, unknown>) => void): () => void;
 	isLive?(): boolean;
 	lastFrameAt?(): string | null;

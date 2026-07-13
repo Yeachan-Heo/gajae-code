@@ -156,13 +156,20 @@ export async function createSdkSessionTransport(
 		}
 	}
 	if (!endpoint) {
-		// Await child stop so a discovery failure never orphans the spawned session;
-		// a stop rejection propagates rather than being swallowed.
-		await child?.stop();
-		throw new HarnessSdkTransportError(
+		const timeoutError = new HarnessSdkTransportError(
 			"endpoint_unavailable",
 			`SDK endpoint for harness session ${options.sessionId} did not appear within ${timeoutMs}ms.`,
 		);
+		try {
+			// Await child stop so a discovery timeout never orphans the spawned session.
+			await child?.stop();
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[timeoutError, cleanupError],
+				"SDK endpoint discovery timed out and spawned harness child cleanup failed.",
+			);
+		}
+		throw timeoutError;
 	}
 
 	let client: SdkClient;

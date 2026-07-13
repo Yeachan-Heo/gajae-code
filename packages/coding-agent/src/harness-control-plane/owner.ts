@@ -11,13 +11,14 @@
  * Stateless `gjc harness` CLI calls reach the owner via {@link resolveOwner} + the endpoint.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { AgentWireOwnerObservation } from "../modes/shared/agent-wire/event-contract";
 import { observeAgentWireFrame } from "../modes/shared/agent-wire/event-observation";
 import { classifyRecovery } from "./classifier";
-import { ControlServer, type EndpointRequest } from "./control-endpoint";
+import { ControlServer, type EndpointHandler, type EndpointRequest } from "./control-endpoint";
 import { defaultFinalizeChecks, type FinalizeChecks, runFinalize, type ValidationCommandSpec } from "./finalize";
 import { type OperateResult, operate } from "./operate";
 import { preserveDirtyWorktree } from "./preserve";
@@ -89,6 +90,8 @@ export interface OwnerOptions {
 	clock?: () => number;
 	finalizeChecks?: FinalizeChecks;
 	validationCommands?: ValidationCommandSpec[];
+	/** Test seam for deterministic control-endpoint teardown failures. */
+	controlServerFactory?: (socketPath: string, handler: EndpointHandler) => ControlServer;
 }
 
 export interface OwnerStartInfo {
@@ -103,7 +106,9 @@ const DEFAULT_ACCEPT_TIMEOUT_MS = 60_000;
 
 export class RuntimeOwner {
 	readonly ownerId: string;
-	#opts: Required<Omit<OwnerOptions, "clock" | "finalizeChecks" | "validationCommands">> & { clock?: () => number };
+	#opts: Required<Omit<OwnerOptions, "clock" | "finalizeChecks" | "validationCommands" | "controlServerFactory">> & {
+		clock?: () => number;
+	};
 	#server: ControlServer;
 	#cursor = 0;
 	#leaseEpoch = 0;
@@ -115,6 +120,7 @@ export class RuntimeOwner {
 	#framePump: Promise<void> = Promise.resolve();
 	#coalesced = new Map<string, true>();
 	#stopPromise: Promise<void> | null = null;
+	#stopContext = new AsyncLocalStorage<boolean>();
 
 	constructor(opts: OwnerOptions) {
 		this.ownerId = opts.ownerId ?? `owner-${randomUUID()}`;
@@ -131,7 +137,10 @@ export class RuntimeOwner {
 		};
 		this.#finalizeChecks = opts.finalizeChecks;
 		this.#validationCommands = opts.validationCommands;
-		this.#server = new ControlServer(this.#socketPath, req => this.#handle(req));
+		this.#server = (opts.controlServerFactory ?? ((socketPath, handler) => new ControlServer(socketPath, handler)))(
+			this.#socketPath,
+			req => this.#handle(req),
+		);
 	}
 
 	async start(): Promise<OwnerStartInfo> {
@@ -644,33 +653,50 @@ export class RuntimeOwner {
 	}
 
 	stop(): Promise<void> {
-		this.#stopPromise ??= this.#stopOnce();
-		return this.#stopPromise;
+		// Publish the shared result before any externally supplied teardown callback can
+		// reenter stop(). Reentrant callbacks are already part of this cleanup pipeline,
+		// so awaiting stop() from that async context completes locally instead of forming
+		// a promise cycle with the outer transport/server close.
+		if (this.#stopContext.getStore()) return Promise.resolve();
+		if (this.#stopPromise) return this.#stopPromise;
+		const pending = Promise.withResolvers<void>();
+		this.#stopPromise = pending.promise;
+		void this.#stopOnce().then(pending.resolve, pending.reject);
+		return pending.promise;
 	}
 
 	async #stopOnce(): Promise<void> {
-		this.#unsubscribeFrames?.();
+		let cleanupVerified = true;
+		const unsubscribe = this.#unsubscribeFrames;
 		this.#unsubscribeFrames = null;
+		if (unsubscribe) {
+			try {
+				this.#stopContext.run(true, unsubscribe);
+			} catch (error) {
+				cleanupVerified = false;
+				await this.#emit("critical", "owner_unsubscribe_failed", { error: String(error) }).catch(() => {});
+			}
+		}
 		await this.#framePump.catch(() => {});
 		if (this.#heartbeatTimer) {
 			clearInterval(this.#heartbeatTimer);
 			this.#heartbeatTimer = null;
 		}
-		await this.#server.close().catch(() => {});
-		// Fail closed: only surrender authority once the transport has been verifiably torn
-		// down. If close cannot be confirmed the spawned child it owns may still be live, so
-		// releasing the lease here would open an interval where a replacement owner takes over
-		// while the old process remains — the exact orphan this owner exists to prevent. The
-		// cleanup failure is surfaced as a diagnostic (critical event); the lease stays held so
-		// no replacement authority can be minted without observed termination.
-		let transportClosed = true;
 		try {
-			await this.#opts.transport.close();
+			await this.#stopContext.run(true, () => this.#server.close());
 		} catch (error) {
-			transportClosed = false;
+			cleanupVerified = false;
+			await this.#emit("critical", "owner_server_stop_failed", { error: String(error) }).catch(() => {});
+		}
+		// Fail closed: only surrender authority once every authority-bearing callback,
+		// control endpoint, and transport has been verifiably torn down.
+		try {
+			await this.#stopContext.run(true, () => this.#opts.transport.close());
+		} catch (error) {
+			cleanupVerified = false;
 			await this.#emit("critical", "owner_transport_stop_failed", { error: String(error) }).catch(() => {});
 		}
-		if (transportClosed) {
+		if (cleanupVerified) {
 			await releaseLease(this.#opts.root, this.#opts.sessionId, this.ownerId).catch(() => {});
 		}
 	}
