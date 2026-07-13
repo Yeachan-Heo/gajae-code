@@ -985,20 +985,13 @@ export class SelectorController {
 								assignments,
 							});
 							if (!materializedProfile) {
-								const overrides = this.ctx.settings.get("task.agentModelOverrides");
-								const nextOverrides = { ...overrides };
-								let writesOverrides = false;
 								for (const targetRole of targetRoles) {
 									const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
 									if (target.settingsPath === "modelRoles") {
 										this.ctx.settings.setModelRole(targetRole, value);
 									} else {
-										nextOverrides[targetRole] = value;
-										writesOverrides = true;
+										this.ctx.settings.setAgentModelOverride(targetRole, value);
 									}
-								}
-								if (writesOverrides) {
-									this.ctx.settings.set("task.agentModelOverrides", nextOverrides);
 								}
 							}
 							modelSelector.refreshRoleAssignments({
@@ -1069,10 +1062,7 @@ export class SelectorController {
 								if (target.settingsPath === "modelRoles") {
 									this.ctx.settings.setModelRole(role, value);
 								} else {
-									this.ctx.settings.set("task.agentModelOverrides", {
-										...this.ctx.settings.get("task.agentModelOverrides"),
-										[role]: value,
-									});
+									this.ctx.settings.setAgentModelOverride(role, value);
 								}
 							}
 							modelSelector.refreshRoleAssignments({
