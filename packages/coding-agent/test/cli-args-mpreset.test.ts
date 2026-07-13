@@ -3,9 +3,10 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
+import { ModelProfileCredentialError } from "../src/config/model-profile-activation";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
-import { applyStartupModelProfiles } from "../src/main";
+import { applyStartupModelProfiles, applyStartupModelProfilesOrExit } from "../src/main";
 import { parseCliCredentialSelector } from "../src/runtime-credential-selector";
 import type { AgentSession } from "../src/session/agent-session";
 
@@ -14,7 +15,11 @@ const model = (provider: string, id: string): Model =>
 
 function fakeRegistry(
 	profiles: ModelProfileDefinition[],
-	options: { profilesAfterRefresh?: ModelProfileDefinition[]; modelsAfterRefresh?: Model[] } = {},
+	options: {
+		profilesAfterRefresh?: ModelProfileDefinition[];
+		modelsAfterRefresh?: Model[];
+		unauthenticatedProviders?: readonly string[];
+	} = {},
 ) {
 	let activeProfiles = profiles;
 	let activeModels = [model("profile-provider", "default"), model("cli-provider", "explicit")];
@@ -24,7 +29,8 @@ function fakeRegistry(
 		getModelProfile: (name: string) => new Map(activeProfiles.map(profile => [profile.name, profile])).get(name),
 		getModelProfiles: () => new Map(activeProfiles.map(profile => [profile.name, profile])),
 		getAvailableModelProfileNames: () => activeProfiles.map(profile => profile.name).sort(),
-		getApiKeyForProvider: async () => "key",
+		getApiKeyForProvider: async (provider: string) =>
+			options.unauthenticatedProviders?.includes(provider) ? undefined : "key",
 		getAll: () => activeModels,
 		async refresh(strategy = "online-if-uncached") {
 			registry.refreshCalls.push(strategy);
@@ -128,6 +134,71 @@ test("explicit CLI --model/--thinking are reapplied after --mpreset activation",
 	expect(session.model?.provider).toBe("cli-provider");
 	expect(session.model?.id).toBe("explicit");
 	expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
+});
+test("startup profile activation reports missing credentials as a typed error", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "expired-profile" });
+
+	let thrown: unknown;
+	try {
+		await applyStartupModelProfiles({
+			session,
+			settings,
+			modelRegistry: fakeRegistry(
+				[
+					{
+						name: "expired-profile",
+						requiredProviders: ["expired-provider"],
+						modelMapping: { default: "expired-provider/default:medium" },
+						source: "user",
+					},
+				],
+				{ unauthenticatedProviders: ["expired-provider"] },
+			) as never,
+			parsedArgs: {},
+			startupModel: undefined,
+			startupThinkingLevel: undefined,
+		});
+	} catch (error) {
+		thrown = error;
+	}
+
+	expect(thrown).toBeInstanceOf(ModelProfileCredentialError);
+	expect((thrown as Error).message).toContain(
+		'Model profile "expired-profile" requires credentials for: expired-provider',
+	);
+	expect(session.setModelTemporaryCalls).toEqual([]);
+});
+
+test("interactive startup profile fallback returns credential guidance instead of exiting", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "expired-profile" });
+
+	const message = await applyStartupModelProfilesOrExit(
+		{
+			session,
+			settings,
+			modelRegistry: fakeRegistry(
+				[
+					{
+						name: "expired-profile",
+						requiredProviders: ["expired-provider"],
+						modelMapping: { default: "expired-provider/default:medium" },
+						source: "user",
+					},
+				],
+				{ unauthenticatedProviders: ["expired-provider"] },
+			) as never,
+			parsedArgs: {},
+			startupModel: undefined,
+			startupThinkingLevel: undefined,
+		},
+		{ interactiveCredentialFallback: true },
+	);
+
+	expect(message).toContain('Model profile "expired-profile" requires credentials for: expired-provider');
+	expect(message).toContain("Run /login");
+	expect(session.setModelTemporaryCalls).toEqual([]);
 });
 test("deferred explicit CLI --model is reapplied after --mpreset activation", async () => {
 	const explicitModel = model("cli-provider", "explicit");

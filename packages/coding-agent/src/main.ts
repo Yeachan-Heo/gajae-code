@@ -26,7 +26,7 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
-import { activateModelProfile } from "./config/model-profile-activation";
+import { activateModelProfile, ModelProfileCredentialError } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
@@ -412,13 +412,22 @@ export async function applyStartupModelProfiles(args: {
 	}
 }
 
+export interface StartupModelProfileExitOptions {
+	interactiveCredentialFallback?: boolean;
+}
+
 export async function applyStartupModelProfilesOrExit(
 	args: Parameters<typeof applyStartupModelProfiles>[0],
-): Promise<void> {
+	options: StartupModelProfileExitOptions = {},
+): Promise<string | undefined> {
 	try {
 		await applyStartupModelProfiles(args);
+		return undefined;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		if (options.interactiveCredentialFallback && error instanceof ModelProfileCredentialError) {
+			return message;
+		}
 		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
 		process.exit(1);
 	}
@@ -1289,14 +1298,20 @@ export async function runRootCommand(
 			await deps.rlmPreset.onSessionCreated(session);
 		}
 
-		await applyStartupModelProfilesOrExit({
-			session,
-			settings: settingsInstance,
-			modelRegistry,
-			parsedArgs,
-			startupModel: sessionOptions.model,
-			startupThinkingLevel: sessionOptions.thinkingLevel,
-		});
+		const startupModelProfileError = await applyStartupModelProfilesOrExit(
+			{
+				session,
+				settings: settingsInstance,
+				modelRegistry,
+				parsedArgs,
+				startupModel: sessionOptions.model,
+				startupThinkingLevel: sessionOptions.thinkingLevel,
+			},
+			{ interactiveCredentialFallback: isInteractive },
+		);
+		if (startupModelProfileError) {
+			notifs.push({ kind: "error", message: startupModelProfileError });
+		}
 
 		if (modelFallbackMessage) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
@@ -1310,7 +1325,7 @@ export async function runRootCommand(
 			notifs.push({ kind: "info", message: credentialAutoImportNotice });
 		}
 
-		if (isInteractive && !session.model && !modelFallbackMessage) {
+		if (isInteractive && !session.model && !modelFallbackMessage && !startupModelProfileError) {
 			notifs.push({
 				kind: "info",
 				message: `No usable model is configured yet. ${formatModelOnboardingGuidance()}`,
