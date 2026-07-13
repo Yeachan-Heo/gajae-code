@@ -594,6 +594,8 @@ export class InteractiveMode implements InteractiveModeContext {
 				{
 					getViewportRows: () => this.ui.terminal.rows,
 					getReservedBottomRows: getWelcomeReservedBottomRows,
+					// Compaction can shrink a long transcript to one summary; do not resurrect the launch logo then.
+					shouldRender: () => this.chatContainer.children.length === 0 && this.session.messages.length === 0,
 					changelogMarkdown: this.#changelogMarkdown,
 					collapseChangelog: settings.get("collapseChangelog"),
 				},

@@ -116,6 +116,18 @@ describe("WelcomeComponent viewport sizing", () => {
 		expect(lines.some(line => line.includes("GJC Forge"))).toBe(true);
 		expect(lines.some(line => line.includes("What's New"))).toBe(true);
 	});
+	it("honors the caller render gate before consuming launch-surface rows", () => {
+		let shouldRender = true;
+		const welcome = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii", {
+			getViewportRows: () => 24,
+			getReservedBottomRows: () => 6,
+			shouldRender: () => shouldRender,
+		});
+
+		expect(welcome.render(100)).toHaveLength(18);
+		shouldRender = false;
+		expect(welcome.render(100)).toEqual([]);
+	});
 	it("integrates changelog highlights without overflowing narrow CJK content", () => {
 		const welcome = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii", {
 			getViewportRows: () => 16,

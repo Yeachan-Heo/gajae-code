@@ -18,6 +18,8 @@ export type WelcomeLogoMode = "unicode" | "square" | "ascii";
 export interface WelcomeComponentOptions {
 	getViewportRows?: () => number | undefined;
 	getReservedBottomRows?: (termWidth: number) => number;
+	/** Optional gate for callers that retire the launch surface after transcript content appears. */
+	shouldRender?: () => boolean;
 	changelogMarkdown?: string;
 	collapseChangelog?: boolean;
 	buildLabel?: string;
@@ -107,6 +109,9 @@ export class WelcomeComponent implements Component {
 	}
 
 	render(termWidth: number): string[] {
+		if (this.options.shouldRender?.() === false) {
+			return [];
+		}
 		const boxWidth = Math.max(0, termWidth);
 		if (boxWidth < 4) {
 			return [];
