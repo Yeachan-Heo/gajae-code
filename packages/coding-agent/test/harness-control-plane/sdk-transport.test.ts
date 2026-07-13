@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { createSdkSessionTransport } from "../../src/harness-control-plane/sdk-transport";
+import { createSdkSessionTransport, ownedHarnessSessionForTest } from "../../src/harness-control-plane/sdk-transport";
 import type { SdkClient } from "../../src/sdk/client";
 
 type Responses = {
@@ -318,5 +318,51 @@ describe("SDK harness child lifecycle", () => {
 		expect(stopCalls).toBe(1);
 		expect(error).toBeInstanceOf(AggregateError);
 		expect((error as AggregateError).errors).toEqual([discoveryError, cleanupError]);
+	});
+	it("does not signal an already-exited exact child and memoizes verified cleanup", async () => {
+		const signals: NodeJS.Signals[] = [];
+		const child = {
+			exitCode: 0,
+			exited: Promise.resolve(0),
+			kill(signal: number | NodeJS.Signals = "SIGTERM") {
+				if (typeof signal === "string") signals.push(signal);
+			},
+		};
+		const session = ownedHarnessSessionForTest(child, { termGraceMs: 1, killVerifyMs: 1 });
+
+		const first = session.stop();
+		const concurrent = session.stop();
+		expect(concurrent).toBe(first);
+		await first;
+		expect(signals).toEqual([]);
+		expect(session.stop()).toBe(first);
+	});
+
+	it("allows exact-child cleanup to retry after unverified termination", async () => {
+		const exit = Promise.withResolvers<number>();
+		const signals: NodeJS.Signals[] = [];
+		const child = {
+			exitCode: null as number | null,
+			exited: exit.promise,
+			kill(signal: number | NodeJS.Signals = "SIGTERM") {
+				if (typeof signal === "string") signals.push(signal);
+			},
+		};
+		const session = ownedHarnessSessionForTest(child, { termGraceMs: 1, killVerifyMs: 1 });
+
+		const first = session.stop();
+		await expect(first).rejects.toMatchObject({
+			name: "HarnessSdkTransportError",
+			code: "endpoint_unavailable",
+		});
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+
+		child.exitCode = 0;
+		exit.resolve(0);
+		const retry = session.stop();
+		expect(retry).not.toBe(first);
+		await retry;
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(session.stop()).toBe(retry);
 	});
 });

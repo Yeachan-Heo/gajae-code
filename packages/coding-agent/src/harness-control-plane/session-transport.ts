@@ -11,9 +11,9 @@ export interface HarnessSessionTransport {
 	eventCursor(): number;
 	waitForAgentStart(afterCursor: number, timeoutMs: number): Promise<{ cursor: number } | null>;
 	/**
-	 * Await every transport-owned cleanup step. Reentrant RuntimeOwner.stop() calls
-	 * made from this async cleanup context may be awaited without starting another
-	 * teardown pipeline.
+	 * Await every transport-owned cleanup step. A direct reentrant RuntimeOwner.stop()
+	 * issued synchronously before close() first suspends may be awaited to break the
+	 * cleanup cycle; descendant tasks receive the truthful outer stop result.
 	 */
 	close(): Promise<void>;
 	/** Return a synchronous disposer that fully severs this event subscription. */

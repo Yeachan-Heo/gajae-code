@@ -6,6 +6,7 @@ import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
 	brokerDiscoveryPath,
+	brokerProcessIncarnation,
 	isPidAlive,
 	newBrokerToken,
 	readBrokerDiscovery,
@@ -404,6 +405,8 @@ export class Broker {
 		await this.index.open();
 		await this.ledger.open();
 		const now = Date.now();
+		const incarnation = brokerProcessIncarnation(process.pid);
+		if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
 		const token = newBrokerToken();
 		this.#transport = new BrokerTransport(this, token, this.settings.port);
 		const port = await this.#transport.start();
@@ -413,6 +416,7 @@ export class Broker {
 			packageGeneration: this.settings.packageGeneration,
 			ownerId: this.#owner,
 			pid: process.pid,
+			incarnation,
 			host: "127.0.0.1",
 			port,
 			url: `ws://127.0.0.1:${port}`,

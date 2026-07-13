@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { type BrokerDiscovery, readBrokerDiscovery } from "./discovery";
+import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand } from "./runtime";
 export interface EnsureBrokerSettings {
 	agentDir: string;
@@ -19,6 +19,8 @@ const REAP_GRACEFUL_MS = 2_000;
 const REAP_SIGKILL_CAP_MS = 2_000;
 interface BrokerOwner {
 	stop(): Promise<void>;
+	canReuse(discovery: BrokerDiscovery | null): boolean;
+	markReady(discovery: BrokerDiscovery): boolean;
 }
 const owners = new Map<string, BrokerOwner>();
 const ensureInFlight = new Map<string, Promise<BrokerDiscovery>>();
@@ -98,12 +100,33 @@ function registerBrokerOwner(
 	child: ChildProcess,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): BrokerOwner {
+	const incarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
+	let state: "starting" | "ready" | "cleanup-unverified" = "starting";
+	const matches = (discovery: BrokerDiscovery | null): boolean =>
+		Boolean(
+			discovery &&
+				child.pid !== undefined &&
+				incarnation &&
+				discovery.pid === child.pid &&
+				discovery.incarnation === incarnation,
+		);
 	const owner: BrokerOwner = {
 		async stop(): Promise<void> {
-			// Retain the authority handle when exit cannot be verified. A later ensure
-			// must retry this exact child before it may spawn a replacement.
-			await reapSpawnedBroker(child, timing);
+			try {
+				await reapSpawnedBroker(child, timing);
+			} catch (error) {
+				state = "cleanup-unverified";
+				throw error;
+			}
 			if (owners.get(agentDir) === owner) owners.delete(agentDir);
+		},
+		canReuse(discovery): boolean {
+			return state === "ready" && matches(discovery);
+		},
+		markReady(discovery): boolean {
+			if (!matches(discovery)) return false;
+			state = "ready";
+			return true;
 		},
 	};
 	owners.set(agentDir, owner);
@@ -111,15 +134,18 @@ function registerBrokerOwner(
 }
 
 async function ensureBrokerOnce(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
-	const existing = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-	if (existing) return existing;
-
-	// A prior locally-owned broker without live discovery must be reaped before
-	// replacement. Failure stays fail-closed in `owners` and prevents a new spawn.
 	const priorOwner = owners.get(settings.agentDir);
-	if (priorOwner) await priorOwner.stop();
-	const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-	if (discoveredAfterCleanup) return discoveredAfterCleanup;
+	const existing = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	if (priorOwner) {
+		// A retained cleanup failure fences every discovery record. Only a ready
+		// record bound to this exact child incarnation may be reused.
+		if (priorOwner.canReuse(existing)) return existing!;
+		await priorOwner.stop();
+		const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		if (discoveredAfterCleanup) return discoveredAfterCleanup;
+	} else if (existing) {
+		return existing;
+	}
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
 	const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
@@ -142,7 +168,11 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings): Promise<BrokerD
 		if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
 		try {
 			const discovered = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-			if (discovered) return discovered;
+			if (discovered) {
+				if (owner.markReady(discovered)) return discovered;
+				await owner.stop();
+				return discovered;
+			}
 		} catch (error) {
 			// A transient read failure (e.g. a half-written record) must not orphan the
 			// child; remember it and keep polling. It is surfaced if discovery fails.

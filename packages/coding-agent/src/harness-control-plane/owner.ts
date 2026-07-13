@@ -11,7 +11,6 @@
  * Stateless `gjc harness` CLI calls reach the owner via {@link resolveOwner} + the endpoint.
  */
 
-import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -36,6 +35,7 @@ import {
 	canWriteEvents,
 	classifyLeaseStatus,
 	heartbeat,
+	LeaseError,
 	readLease,
 	releaseLease,
 	type SessionLease,
@@ -79,6 +79,15 @@ function reconcileLiveOwnerState(state: SessionState): { state: SessionState; re
 	};
 }
 
+function flattenAggregateCauses(errors: readonly unknown[]): unknown[] {
+	const causes: unknown[] = [];
+	for (const error of errors) {
+		if (error instanceof AggregateError) causes.push(...flattenAggregateCauses(error.errors));
+		else causes.push(error);
+	}
+	return causes;
+}
+
 export interface OwnerOptions {
 	root: string;
 	sessionId: string;
@@ -92,6 +101,9 @@ export interface OwnerOptions {
 	validationCommands?: ValidationCommandSpec[];
 	/** Test seam for deterministic control-endpoint teardown failures. */
 	controlServerFactory?: (socketPath: string, handler: EndpointHandler) => ControlServer;
+	/** Test seams; production retries verified shutdown without a finite limit. */
+	cleanupRetryMs?: number;
+	cleanupRetryLimit?: number;
 }
 
 export interface OwnerStartInfo {
@@ -103,6 +115,8 @@ export interface OwnerStartInfo {
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_HEARTBEAT_MS = 10_000;
 const DEFAULT_ACCEPT_TIMEOUT_MS = 60_000;
+const DEFAULT_CLEANUP_RETRY_MS = 500;
+const MAX_RETAINED_CLEANUP_FAILURES = 32;
 
 export class RuntimeOwner {
 	readonly ownerId: string;
@@ -112,6 +126,7 @@ export class RuntimeOwner {
 	#server: ControlServer;
 	#cursor = 0;
 	#leaseEpoch = 0;
+	#leaseHeld = false;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
 	#socketPath: string;
 	#finalizeChecks?: FinalizeChecks;
@@ -120,7 +135,9 @@ export class RuntimeOwner {
 	#framePump: Promise<void> = Promise.resolve();
 	#coalesced = new Map<string, true>();
 	#stopPromise: Promise<void> | null = null;
-	#stopContext = new AsyncLocalStorage<boolean>();
+	#directStopReentry = false;
+	#lastStopFailures: unknown[] = [];
+	#reportedStopFailures = new Set<string>();
 
 	constructor(opts: OwnerOptions) {
 		this.ownerId = opts.ownerId ?? `owner-${randomUUID()}`;
@@ -134,6 +151,8 @@ export class RuntimeOwner {
 			heartbeatMs: opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
 			acceptanceTimeoutMs: opts.acceptanceTimeoutMs ?? DEFAULT_ACCEPT_TIMEOUT_MS,
 			clock: opts.clock,
+			cleanupRetryMs: opts.cleanupRetryMs ?? DEFAULT_CLEANUP_RETRY_MS,
+			cleanupRetryLimit: opts.cleanupRetryLimit ?? Number.POSITIVE_INFINITY,
 		};
 		this.#finalizeChecks = opts.finalizeChecks;
 		this.#validationCommands = opts.validationCommands;
@@ -144,6 +163,28 @@ export class RuntimeOwner {
 	}
 
 	async start(): Promise<OwnerStartInfo> {
+		try {
+			return await this.#startOnce();
+		} catch (startError) {
+			try {
+				await this.stop();
+			} catch (cleanupError) {
+				const cleanupCauses = flattenAggregateCauses([cleanupError]);
+				throw new AggregateError(
+					[startError, ...cleanupCauses],
+					"Runtime owner startup and exact-child rollback failed.",
+				);
+			}
+			if (this.#lastStopFailures.length > 0)
+				throw new AggregateError(
+					[startError, ...flattenAggregateCauses(this.#lastStopFailures)],
+					"Runtime owner startup failed after retrying exact-child rollback.",
+				);
+			throw startError;
+		}
+	}
+
+	async #startOnce(): Promise<OwnerStartInfo> {
 		const { root, sessionId } = this.#opts;
 		const eventsPath = sessionPaths(root, sessionId).events;
 		const existing = await readEvents(root, sessionId, 0);
@@ -156,12 +197,8 @@ export class RuntimeOwner {
 			ttlMs: this.#opts.ttlMs,
 			clock: this.#opts.clock,
 		});
+		this.#leaseHeld = true;
 		this.#leaseEpoch = lease.leaseEpoch;
-		await this.#server.listen();
-		await this.#emit("info", "owner_started", { ownerId: this.ownerId, leaseEpoch: this.#leaseEpoch });
-		if (this.#opts.transport.onEventFrame) {
-			this.#unsubscribeFrames = this.#opts.transport.onEventFrame(frame => this.#handleFrame(frame));
-		}
 		this.#heartbeatTimer = setInterval(() => {
 			void heartbeat(root, sessionId, this.ownerId, this.#opts.ttlMs, this.#opts.clock).catch(err => {
 				// Self-stop if a legitimate dead-owner takeover revoked our lease.
@@ -169,6 +206,11 @@ export class RuntimeOwner {
 			});
 		}, this.#opts.heartbeatMs);
 		this.#heartbeatTimer.unref?.();
+		await this.#server.listen();
+		await this.#emit("info", "owner_started", { ownerId: this.ownerId, leaseEpoch: this.#leaseEpoch });
+		if (this.#opts.transport.onEventFrame) {
+			this.#unsubscribeFrames = this.#opts.transport.onEventFrame(frame => this.#handleFrame(frame));
+		}
 		return { ownerId: this.ownerId, socketPath: this.#socketPath, leaseEpoch: this.#leaseEpoch };
 	}
 
@@ -653,51 +695,104 @@ export class RuntimeOwner {
 	}
 
 	stop(): Promise<void> {
-		// Publish the shared result before any externally supplied teardown callback can
-		// reenter stop(). Reentrant callbacks are already part of this cleanup pipeline,
-		// so awaiting stop() from that async context completes locally instead of forming
-		// a promise cycle with the outer transport/server close.
-		if (this.#stopContext.getStore()) return Promise.resolve();
+		// Publish the shared external result before invoking teardown. A cleanup
+		// callback may consume one synchronous reentry allowance to break the direct
+		// `close() -> stop()` cycle; descendants scheduled from that callback do not
+		// inherit the allowance and must await this truthful outer result.
+		if (this.#directStopReentry) {
+			this.#directStopReentry = false;
+			return Promise.resolve();
+		}
 		if (this.#stopPromise) return this.#stopPromise;
 		const pending = Promise.withResolvers<void>();
 		this.#stopPromise = pending.promise;
-		void this.#stopOnce().then(pending.resolve, pending.reject);
+		void this.#stopUntilVerified().then(pending.resolve, pending.reject);
 		return pending.promise;
 	}
 
+	#invokeCleanup<T>(callback: () => T): T {
+		this.#directStopReentry = true;
+		try {
+			return callback();
+		} finally {
+			this.#directStopReentry = false;
+		}
+	}
+
+	async #stopUntilVerified(): Promise<void> {
+		this.#lastStopFailures = [];
+		this.#reportedStopFailures.clear();
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await this.#stopOnce();
+				return;
+			} catch (error) {
+				if (this.#lastStopFailures.length === MAX_RETAINED_CLEANUP_FAILURES) this.#lastStopFailures.shift();
+				this.#lastStopFailures.push(error);
+				if (attempt >= this.#opts.cleanupRetryLimit)
+					throw new AggregateError(this.#lastStopFailures, "Runtime owner cleanup could not be verified.");
+				await Bun.sleep(this.#opts.cleanupRetryMs);
+			}
+		}
+	}
+
+	async #reportStopFailure(kind: string, error: unknown): Promise<void> {
+		if (this.#reportedStopFailures.has(kind)) return;
+		this.#reportedStopFailures.add(kind);
+		await this.#emit("critical", kind, { error: String(error) }).catch(() => {});
+	}
+
 	async #stopOnce(): Promise<void> {
-		let cleanupVerified = true;
+		const failures: unknown[] = [];
 		const unsubscribe = this.#unsubscribeFrames;
-		this.#unsubscribeFrames = null;
 		if (unsubscribe) {
 			try {
-				this.#stopContext.run(true, unsubscribe);
+				this.#invokeCleanup(unsubscribe);
+				this.#unsubscribeFrames = null;
 			} catch (error) {
-				cleanupVerified = false;
-				await this.#emit("critical", "owner_unsubscribe_failed", { error: String(error) }).catch(() => {});
+				failures.push(error);
+				await this.#reportStopFailure("owner_unsubscribe_failed", error);
 			}
 		}
 		await this.#framePump.catch(() => {});
+
+		// The transport owns the exact spawned child. Keep the heartbeat and control
+		// endpoint live until its termination is verified so a replacement cannot
+		// acquire authority merely because this daemon exits.
+		try {
+			await this.#invokeCleanup(() => this.#opts.transport.close());
+		} catch (error) {
+			failures.push(error);
+			await this.#reportStopFailure("owner_transport_stop_failed", error);
+		}
+		if (failures.length > 0) throw new AggregateError(failures, "Runtime owner transport cleanup failed.");
+
+		try {
+			await this.#invokeCleanup(() => this.#server.close());
+		} catch (error) {
+			failures.push(error);
+			await this.#reportStopFailure("owner_server_stop_failed", error);
+		}
+		if (failures.length > 0) throw new AggregateError(failures, "Runtime owner endpoint cleanup failed.");
+
+		if (this.#leaseHeld) {
+			try {
+				await releaseLease(this.#opts.root, this.#opts.sessionId, this.ownerId);
+				this.#leaseHeld = false;
+			} catch (error) {
+				if (error instanceof LeaseError && error.code === "not_lease_holder") {
+					// A successor already owns the lease. Our transport and endpoint are
+					// verified closed, so there is no old authority left to release.
+					this.#leaseHeld = false;
+				} else {
+					await this.#reportStopFailure("owner_lease_release_failed", error);
+					throw error;
+				}
+			}
+		}
 		if (this.#heartbeatTimer) {
 			clearInterval(this.#heartbeatTimer);
 			this.#heartbeatTimer = null;
-		}
-		try {
-			await this.#stopContext.run(true, () => this.#server.close());
-		} catch (error) {
-			cleanupVerified = false;
-			await this.#emit("critical", "owner_server_stop_failed", { error: String(error) }).catch(() => {});
-		}
-		// Fail closed: only surrender authority once every authority-bearing callback,
-		// control endpoint, and transport has been verifiably torn down.
-		try {
-			await this.#stopContext.run(true, () => this.#opts.transport.close());
-		} catch (error) {
-			cleanupVerified = false;
-			await this.#emit("critical", "owner_transport_stop_failed", { error: String(error) }).catch(() => {});
-		}
-		if (cleanupVerified) {
-			await releaseLease(this.#opts.root, this.#opts.sessionId, this.ownerId).catch(() => {});
 		}
 	}
 }

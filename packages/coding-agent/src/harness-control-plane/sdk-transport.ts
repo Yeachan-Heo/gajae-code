@@ -300,9 +300,10 @@ export async function createSdkSessionTransport(
 	};
 }
 
-interface ReapableChild {
+export interface ReapableHarnessChild {
 	kill(signal?: number | NodeJS.Signals): void;
 	readonly exited: Promise<number>;
+	readonly exitCode: number | null;
 }
 
 /**
@@ -311,18 +312,20 @@ interface ReapableChild {
  * and therefore fails closed after SIGKILL rather than being mistaken for termination.
  * Failure to verify exit after SIGKILL throws — the caller must not assume the child died.
  */
-async function reapChild(child: ReapableChild, termGraceMs: number, killVerifyMs: number): Promise<void> {
+async function reapChild(child: ReapableHarnessChild, termGraceMs: number, killVerifyMs: number): Promise<void> {
 	const exited = child.exited.then(
 		() => true,
 		() => false,
 	);
 	const send = (signal: NodeJS.Signals): void => {
+		if (child.exitCode !== null) return;
 		try {
 			child.kill(signal);
 		} catch {
 			// Kill may fail if the child already exited; the exited race below is authoritative.
 		}
 	};
+	if (child.exitCode !== null) return;
 	send("SIGTERM");
 	let verified = await Promise.race([exited, Bun.sleep(termGraceMs).then(() => false)]);
 	if (!verified) {
@@ -332,6 +335,25 @@ async function reapChild(child: ReapableChild, termGraceMs: number, killVerifyMs
 	if (!verified) {
 		throw new HarnessSdkTransportError("endpoint_unavailable", "Harness child session did not exit after SIGKILL.");
 	}
+}
+
+function ownedHarnessSession(
+	child: ReapableHarnessChild,
+	termGraceMs: number,
+	killVerifyMs: number,
+): SpawnedHarnessSession {
+	let stopPromise: Promise<void> | null = null;
+	return {
+		stop(): Promise<void> {
+			if (stopPromise) return stopPromise;
+			const pending = reapChild(child, termGraceMs, killVerifyMs);
+			stopPromise = pending;
+			void pending.catch(() => {
+				if (stopPromise === pending) stopPromise = null;
+			});
+			return pending;
+		},
+	};
 }
 
 export function spawnNormalHarnessSession(
@@ -361,7 +383,13 @@ export function spawnNormalHarnessSession(
 	child.unref();
 	const termGraceMs = options.termGraceMs ?? TERM_GRACE_MS;
 	const killVerifyMs = options.killVerifyMs ?? KILL_VERIFY_MS;
-	return {
-		stop: () => reapChild(child, termGraceMs, killVerifyMs),
-	};
+	return ownedHarnessSession(child, termGraceMs, killVerifyMs);
+}
+
+/** Test hook for exact-child stop serialization and retry semantics. */
+export function ownedHarnessSessionForTest(
+	child: ReapableHarnessChild,
+	options: { termGraceMs?: number; killVerifyMs?: number } = {},
+): SpawnedHarnessSession {
+	return ownedHarnessSession(child, options.termGraceMs ?? TERM_GRACE_MS, options.killVerifyMs ?? KILL_VERIFY_MS);
 }

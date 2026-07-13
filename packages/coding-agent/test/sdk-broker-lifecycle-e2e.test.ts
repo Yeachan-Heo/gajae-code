@@ -45,6 +45,23 @@ async function incarnation(pid: number): Promise<string> {
 	return value;
 }
 
+async function stopDiscoveredBroker(agentDir: string): Promise<void> {
+	const discovery = await readSdkBrokerDiscovery(agentDir);
+	if (!discovery) return;
+	const stillOwned = (): boolean => processIncarnation(discovery.pid) === discovery.incarnation;
+	const waitForExit = async (timeoutMs: number): Promise<boolean> => {
+		const deadline = Date.now() + timeoutMs;
+		while (stillOwned() && Date.now() < deadline) await Bun.sleep(10);
+		return !stillOwned();
+	};
+	if (!stillOwned()) return;
+	process.kill(discovery.pid, "SIGTERM");
+	if (await waitForExit(2_000)) return;
+	if (!stillOwned()) return;
+	process.kill(discovery.pid, "SIGKILL");
+	if (!(await waitForExit(2_000))) throw new Error(`Test broker ${discovery.pid} did not exit after SIGKILL.`);
+}
+
 async function liveLifecycleSession(root: string, agentDir: string, sessionId: string) {
 	const stateRoot = path.join(root, ".gjc", "state");
 	const request = { operation: "session.create", sessionId, cwd: root, stateRoot } as const;
@@ -990,6 +1007,7 @@ test("shipped sdk session-host-internal stays alive only after a semantic ready 
 		);
 		expect(broker.url).toStartWith("ws://127.0.0.1:");
 	} finally {
+		await stopDiscoveredBroker(agentDir);
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);

@@ -9,6 +9,7 @@ import { lifecycleArgs } from "../src/commands/sdk";
 import { Broker } from "../src/sdk/broker/broker";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
+	type BrokerDiscovery,
 	brokerDiscoveryPath,
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
@@ -97,9 +98,39 @@ describe("SDK broker identity and discovery", () => {
 			heartbeatAt: Date.now(),
 		};
 		await writeBrokerDiscovery(dir, d);
-		expect(redactBrokerDiscovery(d).token).toBe("[redacted]");
+		const persisted = await readBrokerDiscovery(dir);
+		expect(persisted).not.toBeNull();
+		expect(redactBrokerDiscovery(persisted!).token).toBe("[redacted]");
 		if (process.platform !== "win32")
 			expect((await fs.stat(path.join(dir, "sdk", "broker.json"))).mode & 0o777).toBe(0o600);
+	});
+
+	it("rejects discovery bound to a different process incarnation", async () => {
+		const dir = await temp();
+		await writeBrokerDiscovery(dir, {
+			version: 1,
+			protocolVersion: 3,
+			packageGeneration: "test",
+			ownerId: "stale",
+			pid: process.pid,
+			incarnation: "different-incarnation",
+			host: "127.0.0.1",
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "secret",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		});
+
+		expect(await readBrokerDiscovery(dir)).toBeNull();
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+	it("treats a truncated discovery record as unavailable", async () => {
+		const dir = await temp();
+		await fs.mkdir(path.dirname(brokerDiscoveryPath(dir)), { recursive: true });
+		await fs.writeFile(brokerDiscoveryPath(dir), '{"version":1,"pid":');
+		expect(await readBrokerDiscovery(dir)).toBeNull();
+		await fs.rm(dir, { recursive: true, force: true });
 	});
 	it("refreshes discovery heartbeat, removes it on stop, and can restart", async () => {
 		const dir = await temp();
@@ -257,7 +288,21 @@ describe("SDK broker identity and discovery", () => {
 			gracefulMs: 1,
 			killVerifyMs: 1,
 		});
-		const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
+		const competingDiscovery: BrokerDiscovery = {
+			version: 1,
+			protocolVersion: 3,
+			packageGeneration: "test",
+			ownerId: "competitor",
+			pid: process.pid,
+			incarnation: "competing-incarnation",
+			host: "127.0.0.1",
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "competitor-token",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		};
+		const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(competingDiscovery);
 		try {
 			await expect(owner.stop()).rejects.toThrow("did not exit after SIGKILL");
 			expect(brokerOwnerForTest(dir)).toBe(owner);
