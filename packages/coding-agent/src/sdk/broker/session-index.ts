@@ -32,6 +32,7 @@ export interface IndexedSession {
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
+	endpointIncarnation?: string;
 	live: boolean;
 	indexSeq: number;
 	lifecycleRequestId?: string;
@@ -41,6 +42,31 @@ export interface SessionList {
 	indexSeq: number;
 	sessions: IndexedSession[];
 	warnings: string[];
+}
+/**
+ * Stable SHA-256 over the endpoint's immutable authority tuple (generation,
+ * endpoint mtime, pid, sessionId). The sorted-key canonical form is identical
+ * to JSON.stringify for this fixed shape, so callers may reproduce it directly.
+ */
+export function endpointIncarnation(
+	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
+	sessionId: string,
+): string | undefined {
+	if (
+		!Number.isSafeInteger(record.endpointGeneration) ||
+		record.endpointGeneration <= 0 ||
+		!Number.isSafeInteger(record.pid) ||
+		record.pid <= 0 ||
+		typeof record.endpointMtimeMs !== "number" ||
+		!Number.isFinite(record.endpointMtimeMs) ||
+		record.endpointMtimeMs <= 0
+	)
+		return undefined;
+	return createHash("sha256")
+		.update(
+			`{"endpointGeneration":${JSON.stringify(record.endpointGeneration)},"endpointMtimeMs":${JSON.stringify(record.endpointMtimeMs)},"pid":${JSON.stringify(record.pid)},"sessionId":${JSON.stringify(sessionId)}}`,
+		)
+		.digest("hex");
 }
 const canonical = (event: Omit<SessionIndexEvent, "checksum">) => JSON.stringify(event);
 export const sessionIndexChecksum = (event: Omit<SessionIndexEvent, "checksum">) =>
@@ -222,11 +248,29 @@ export class SessionIndex {
 	}
 
 	listSessions(): SessionList {
+		return this.#summarize(event => event.sessionId);
+	}
+
+	/**
+	 * Non-folded live-endpoint observations for clients that must detect
+	 * concurrent same-ID authority. Internal lifecycle callers continue using
+	 * listSessions(), whose latest-by-sessionId projection is intentionally
+	 * stable.
+	 */
+	listProductionSessions(): SessionList {
+		return this.#summarize(
+			event =>
+				`${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.pid}\u0000${path.resolve(event.locator.stateRoot)}`,
+		);
+	}
+
+	#summarize(keyFn: (event: SessionIndexEvent) => string): SessionList {
 		const latest = new Map<string, SessionIndexEvent>();
 		for (const event of this.#events) {
-			const previous = latest.get(event.sessionId);
+			const key = keyFn(event);
+			const previous = latest.get(key);
 			latest.set(
-				event.sessionId,
+				key,
 				event.type === "host_heartbeat" && previous
 					? {
 							...event,
@@ -245,6 +289,7 @@ export class SessionIndex {
 				endpointGeneration: event.endpointGeneration,
 				pid: event.pid,
 				endpointMtimeMs: event.endpointMtimeMs,
+				endpointIncarnation: endpointIncarnation(event, event.sessionId),
 				lifecycleRequestId: event.lifecycleRequestId,
 				terminalUncertain: event.type === "lifecycle_terminal" || event.terminalUncertain === true,
 				indexSeq: event.indexSeq,
