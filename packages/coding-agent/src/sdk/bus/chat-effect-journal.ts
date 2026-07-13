@@ -10,7 +10,14 @@ import {
 export const CHAT_EFFECT_JOURNAL_VERSION = 1;
 export const MAX_TERMINAL_CHAT_EFFECTS = 128;
 
-export function chatEffectJournalPath(agentDir: string, transport: "discord" | "slack"): string {
+/**
+ * Transports backed by a durable chat-effect journal. Telegram joins the union
+ * so the orphan-topic deletion claim reuses the same fsynced, generation-bound,
+ * crash-replayable durability contract as Discord/Slack provider effects.
+ */
+export type ChatEffectTransport = "discord" | "slack" | "telegram";
+
+export function chatEffectJournalPath(agentDir: string, transport: ChatEffectTransport): string {
 	return conversationStorePath(agentDir, transport, "effects.json");
 }
 
@@ -24,6 +31,12 @@ export interface ChatEffectReceipt {
 	threadId?: string;
 	timestamp?: string;
 	status?: string;
+	/**
+	 * Absolute deadline (ms epoch) a provider rate-limit (`retry_after`) backs a
+	 * nonterminal effect until. Persisted so a restart honors it before any
+	 * retried provider call instead of relying on in-memory state alone.
+	 */
+	retryAt?: number;
 }
 
 /**
@@ -33,7 +46,7 @@ export interface ChatEffectReceipt {
 export interface ChatEffect<TPayload = unknown> extends ConversationRecord {
 	id: string;
 	kind: string;
-	transport: "discord" | "slack";
+	transport: ChatEffectTransport;
 	sessionId?: string;
 	endpointGeneration: number;
 	payload: TPayload;
@@ -49,7 +62,7 @@ export interface ChatEffect<TPayload = unknown> extends ConversationRecord {
 export interface EnqueueChatEffect<TPayload> {
 	id: string;
 	kind: string;
-	transport: "discord" | "slack";
+	transport: ChatEffectTransport;
 	sessionId?: string;
 	endpointGeneration: number;
 	payload: TPayload;
@@ -123,7 +136,7 @@ export class ChatEffectJournal {
 
 	constructor(input: {
 		agentDir: string;
-		transport: "discord" | "slack";
+		transport: ChatEffectTransport;
 		fs?: ConversationStoreFs;
 		now?: () => number;
 		pid?: number;
@@ -150,7 +163,7 @@ export class ChatEffectJournal {
 		return Object.values((await this.#store.load()).conversations);
 	}
 
-	async replayable(transport: "discord" | "slack", endpointGeneration: number): Promise<ChatEffect[]> {
+	async replayable(transport: ChatEffectTransport, endpointGeneration: number): Promise<ChatEffect[]> {
 		const now = this.#now();
 		return (await this.list()).filter(
 			effect =>
@@ -339,12 +352,37 @@ export class ChatEffectJournal {
 		return terminalized;
 	}
 
+	/** Updates the receipt of an already-terminal effect without reopening it. */
+	async updateTerminalReceipt<TPayload = unknown>(
+		id: string,
+		receipt: ChatEffectReceipt,
+	): Promise<ChatEffect<TPayload> | undefined> {
+		let updated: ChatEffect<TPayload> | undefined;
+		const now = this.#now();
+		await this.#store.transact(id, current => {
+			if (current?.state !== "terminal") return current;
+			updated = {
+				...current,
+				generation: current.generation + 1,
+				receipt,
+				updatedAt: now,
+			} as ChatEffect<TPayload>;
+			return updated;
+		});
+		if (updated) await this.#pruneTerminal();
+		return updated;
+	}
+
 	async #pruneTerminal(): Promise<void> {
 		const referenced = new Set<string>();
 		for (const mapping of Object.values((await this.#mappings.load()).conversations))
 			collectEffectReferences(mapping, referenced);
 		const terminal = (await this.list())
-			.filter(effect => effect.state === "terminal")
+			.filter(
+				effect =>
+					effect.state === "terminal" &&
+					(effect.transport !== "telegram" || effect.receipt?.status?.startsWith("reconciled")),
+			)
 			.sort((left, right) => left.updatedAt - right.updatedAt);
 		for (const effect of terminal.slice(0, Math.max(0, terminal.length - MAX_TERMINAL_CHAT_EFFECTS))) {
 			if (!referenced.has(effect.id)) await this.#store.delete(effect.id, effect.generation);

@@ -8,6 +8,7 @@ import { withFileLock } from "../../config/file-lock";
 import type { Settings } from "../../config/settings";
 import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
+import { type ChatEffect, ChatEffectJournal, type ChatEffectLease } from "./chat-effect-journal";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand, parseRichToggleCommand, parseTelegramControlCommand } from "./config-commands";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
@@ -60,7 +61,7 @@ import { decideThreadedInbound, type InboundAttachment } from "./threaded-inboun
 import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
 import { TopicRegistry, type TopicRegistryState } from "./topic-registry";
 
-export type EnsureDaemonResult = "owner_spawned" | "attached" | "disabled" | "blocked";
+export type EnsureDaemonResult = "owner_spawned" | "attached" | "disabled" | "blocked" | "deferred";
 
 export interface DaemonState {
 	pid: number;
@@ -87,9 +88,16 @@ export interface TelegramDaemonFs {
 	writeFile(path: string, data: string, opts?: fs.WriteFileOptions): Promise<void>;
 	rename(oldPath: string, newPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
-	open(path: string, flags: string, mode?: number): Promise<{ close(): Promise<void> }>;
+	open(path: string, flags: string, mode?: number): Promise<{ close(): Promise<void>; sync?(): Promise<void> }>;
 	readdir(path: string): Promise<string[]>;
 	chmod(path: string, mode: number): Promise<void>;
+	/**
+	 * Optional realpath resolver. Existing roots and the longest existing ancestor
+	 * of a missing root are canonicalized so symlink workspaces collapse to one
+	 * stable identity before and after directory creation. Every non-ENOENT
+	 * resolution failure is ambiguous and fails closed.
+	 */
+	realpath?(path: string): Promise<string>;
 }
 
 export interface SpawnResult {
@@ -176,6 +184,9 @@ const QUEUED_REACTION = "👀";
 const PENDING_TOPIC_FRAME_LIMIT = 20;
 const SEEN_UPDATE_ID_LIMIT = 1_000;
 const ORPHAN_TOPIC_GRACE_MS = 60_000;
+// Bounded AbortSignal timeout for a single deleteForumTopic call so a stalled
+// provider I/O cannot hang the daemon or hold a deletion claim indefinitely.
+const TOPIC_DELETE_TIMEOUT_MS = 15_000;
 const CONSUMED_REACTION = "✅";
 
 function splitTelegramPlainText(text: string, max = TELEGRAM_MESSAGE_LIMIT): string[] {
@@ -295,10 +306,32 @@ async function readJson<T>(fsImpl: TelegramDaemonFs, file: string): Promise<T | 
 }
 
 async function writeJsonAtomic(fsImpl: TelegramDaemonFs, file: string, data: unknown): Promise<void> {
+	const dir = path.dirname(file);
 	const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-	await fsImpl.writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-	await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
-	await fsImpl.rename(tmp, file);
+	try {
+		await fsImpl.writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+		await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
+		// Fsync the temp file (data) and, after the atomic rename, the parent
+		// directory (directory entry) so a crash never leaves a half-written or
+		// unlinked file. Mirrors the ConversationStore durability contract; the
+		// optional sync() is absent only on injected test fs implementations.
+		const fileHandle = await fsImpl.open(tmp, "r");
+		try {
+			await fileHandle.sync?.();
+		} finally {
+			await fileHandle.close();
+		}
+		await fsImpl.rename(tmp, file);
+		const dirHandle = await fsImpl.open(dir, "r");
+		try {
+			await dirHandle.sync?.();
+		} finally {
+			await dirHandle.close();
+		}
+	} catch (error) {
+		await fsImpl.unlink(tmp).catch(() => undefined);
+		throw error;
+	}
 }
 
 async function tryOpenWx(fsImpl: TelegramDaemonFs, file: string): Promise<boolean> {
@@ -312,36 +345,390 @@ async function tryOpenWx(fsImpl: TelegramDaemonFs, file: string): Promise<boolea
 	}
 }
 
+/**
+ * Per-session registration lease. Refreshed with a fresh random `leaseId` on
+ * every {@link registerNotificationRoot} so a same-session re-registration
+ * invalidates any orphan candidate an older registration established. The
+ * daemon never reaps a topic whose candidate lease no longer matches the live
+ * lease — a fresh registration (session restart) cancels a stale reap.
+ */
+interface SessionLease {
+	leaseId: string;
+	refreshedAt: number;
+}
+
+/**
+ * Per-session orphan-topic deletion candidate. Recorded on the first confirmed
+ * continuous absence; a topic is reaped only once this candidate has survived
+ * {@link ORPHAN_TOPIC_GRACE_MS} from `observedAt` AND its lease still matches
+ * the live session lease (no intervening registration/publication).
+ */
+interface OrphanCandidate {
+	observedAt: number;
+	leaseId: string;
+	topicId: string;
+}
+
+/**
+ * Validated, decision-only view over the raw notification-roots registry. The
+ * raw object is carried verbatim through every read-modify-write so unknown,
+ * legacy, or unrelated fields survive; only strictly-valid entries populate the
+ * decision maps — ambiguous/malformed/legacy state never authorizes a deletion.
+ */
+interface RootsRegistryView {
+	raw: Record<string, unknown>;
+	roots: string[];
+	sessions: Map<string, string>;
+	sessionLeases: Map<string, SessionLease>;
+	orphanCandidates: Map<string, OrphanCandidate>;
+}
+/**
+ * Per-session absence evidence derived from a session's MAPPED root during a
+ * roots scan (F001). Decides whether an absence candidate may be created or
+ * continued: only `absent`/`missing` authorize it; `present` clears it, and
+ * `ambiguous` (unreadable/malformed mapped root) clears/defers it so an
+ * unreadable root can never be mistaken for confirmed absence.
+ */
+type SessionAbsenceEvidence = { kind: "present" } | { kind: "absent" } | { kind: "missing" } | { kind: "ambiguous" };
+
+/** Non-empty string scalar: every registry id (leaseId, map key) must be one. */
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+/** Non-negative safe-integer scalar: every registry timestamp must be one. */
+function isNonNegativeSafeInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Canonical positive safe-integer string scalar: every candidate topicId must
+ * be one. Rejects zero, negatives, fractions, leading zeros, whitespace,
+ * exponents, and any non-digit, so a malformed candidate id can never match a
+ * live topic record and authorize a destructive delete.
+ */
+function isCanonicalTopicId(value: unknown): value is string {
+	if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) return false;
+	return Number.isSafeInteger(Number(value));
+}
+/** True only for a definitive "no such file or directory" filesystem error. */
+function isENOENTError(err: unknown): boolean {
+	return err instanceof Error && (err as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function parseRootsList(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const roots: string[] = [];
+	for (const entry of value) if (typeof entry === "string" && entry.length > 0) roots.push(entry);
+	return roots;
+}
+
+function parseStringRecord(value: unknown): Map<string, string> {
+	const map = new Map<string, string>();
+	if (!value || typeof value !== "object" || Array.isArray(value)) return map;
+	for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+		if (isNonEmptyString(key) && typeof val === "string") map.set(key, val);
+	}
+	return map;
+}
+
+function parseSessionLeases(value: unknown): Map<string, SessionLease> {
+	const map = new Map<string, SessionLease>();
+	if (!value || typeof value !== "object" || Array.isArray(value)) return map;
+	for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+		if (!isNonEmptyString(key) || !val || typeof val !== "object" || Array.isArray(val)) continue;
+		const lease = val as { leaseId?: unknown; refreshedAt?: unknown };
+		if (!isNonEmptyString(lease.leaseId) || !isNonNegativeSafeInteger(lease.refreshedAt)) continue;
+		map.set(key, { leaseId: lease.leaseId, refreshedAt: lease.refreshedAt });
+	}
+	return map;
+}
+
+function parseOrphanCandidates(value: unknown): Map<string, OrphanCandidate> {
+	const map = new Map<string, OrphanCandidate>();
+	if (!value || typeof value !== "object" || Array.isArray(value)) return map;
+	for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+		if (!isNonEmptyString(key) || !val || typeof val !== "object" || Array.isArray(val)) continue;
+		const candidate = val as { observedAt?: unknown; leaseId?: unknown; topicId?: unknown };
+		if (
+			!isNonNegativeSafeInteger(candidate.observedAt) ||
+			!isNonEmptyString(candidate.leaseId) ||
+			!isCanonicalTopicId(candidate.topicId)
+		)
+			continue;
+		map.set(key, {
+			observedAt: candidate.observedAt,
+			leaseId: candidate.leaseId,
+			topicId: candidate.topicId,
+		});
+	}
+	return map;
+}
+
+async function readRootsRegistry(fsImpl: TelegramDaemonFs, rootsFile: string): Promise<RootsRegistryView> {
+	const parsed = await readJson<unknown>(fsImpl, rootsFile);
+	const raw: Record<string, unknown> =
+		parsed && typeof parsed === "object" && !Array.isArray(parsed) ? { ...(parsed as Record<string, unknown>) } : {};
+	return {
+		raw,
+		roots: parseRootsList(raw.roots),
+		sessions: parseStringRecord(raw.sessions),
+		sessionLeases: parseSessionLeases(raw.sessionLeases),
+		orphanCandidates: parseOrphanCandidates(raw.orphanCandidates),
+	};
+}
+
+/**
+ * Persist the raw roots registry verbatim; only the schema `version` is
+ * normalized. Every other key — known or unknown, well-formed or legacy — is
+ * carried through untouched so unknown registry fields survive every write.
+ */
+async function persistRootsRegistry(
+	fsImpl: TelegramDaemonFs,
+	rootsFile: string,
+	raw: Record<string, unknown>,
+): Promise<void> {
+	raw.version = 1;
+	await writeJsonAtomic(fsImpl, rootsFile, raw);
+}
+
+/** Return the live raw object held at `key`, or a fresh object when the field is
+ * absent or not a plain object. Callers mutate it in place and reassign it. */
+function rawObjectField(raw: Record<string, unknown>, key: string): Record<string, unknown> {
+	const existing = raw[key];
+	return existing && typeof existing === "object" && !Array.isArray(existing)
+		? (existing as Record<string, unknown>)
+		: {};
+}
+
+function addRawRoot(raw: Record<string, unknown>, root: string): void {
+	const existing = raw.roots;
+	const arr = Array.isArray(existing) ? existing : [];
+	if (arr.indexOf(root) !== -1) return;
+	const next = arr.slice();
+	next.push(root);
+	raw.roots = next;
+}
+
+function setRawSessionMapping(raw: Record<string, unknown>, sessionId: string, root: string): void {
+	const map = rawObjectField(raw, "sessions");
+	map[sessionId] = root;
+	raw.sessions = map;
+}
+
+function setRawLease(raw: Record<string, unknown>, sessionId: string, lease: SessionLease): void {
+	const map = rawObjectField(raw, "sessionLeases");
+	map[sessionId] = { leaseId: lease.leaseId, refreshedAt: lease.refreshedAt };
+	raw.sessionLeases = map;
+}
+
+function deleteRawLease(raw: Record<string, unknown>, sessionId: string): boolean {
+	const map = rawObjectField(raw, "sessionLeases");
+	if (!(sessionId in map)) return false;
+	delete map[sessionId];
+	raw.sessionLeases = map;
+	return true;
+}
+/** Remove a session→root mapping verbatim; returns whether it existed. */
+function deleteRawSessionMapping(raw: Record<string, unknown>, sessionId: string): boolean {
+	const map = rawObjectField(raw, "sessions");
+	if (!(sessionId in map)) return false;
+	delete map[sessionId];
+	raw.sessions = map;
+	return true;
+}
+
+function deleteRawRootIfUnreferenced(raw: Record<string, unknown>, root: string): boolean {
+	const sessions = raw.sessions;
+	if (!sessions || typeof sessions !== "object" || Array.isArray(sessions)) return false;
+	if (Object.values(sessions as Record<string, unknown>).some(value => value === root)) return false;
+	if (!Array.isArray(raw.roots)) return false;
+	const next = raw.roots.filter(value => value !== root);
+	if (next.length === raw.roots.length) return false;
+	raw.roots = next;
+	return true;
+}
+
+function setRawCandidate(raw: Record<string, unknown>, sessionId: string, candidate: OrphanCandidate): void {
+	const map = rawObjectField(raw, "orphanCandidates");
+	map[sessionId] = {
+		observedAt: candidate.observedAt,
+		leaseId: candidate.leaseId,
+		topicId: candidate.topicId,
+	};
+	raw.orphanCandidates = map;
+}
+
+function deleteRawCandidate(raw: Record<string, unknown>, sessionId: string): boolean {
+	const map = rawObjectField(raw, "orphanCandidates");
+	if (!(sessionId in map)) return false;
+	delete map[sessionId];
+	raw.orphanCandidates = map;
+	return true;
+}
+
+/**
+ * Run a roots-registry mutation under the bounded host-wide roots file lock. The
+ * lock is held ONLY for the read-modify-write (bounded retries); callers MUST
+ * NOT perform root inventory reads, pool flushes, or network calls inside
+ * `mutate` — those run lock-free so a stalled deletion never blocks the host.
+ */
+async function mutateRootsRegistry(
+	fsImpl: TelegramDaemonFs,
+	rootsFile: string,
+	mutate: (view: RootsRegistryView) => boolean,
+): Promise<void> {
+	await withFileLock(
+		rootsFile,
+		async () => {
+			const view = await readRootsRegistry(fsImpl, rootsFile);
+			if (mutate(view)) await persistRootsRegistry(fsImpl, rootsFile, view.raw);
+		},
+		{ staleMs: 10_000 },
+	);
+}
+
+/** Effect kind + id for a per-session telegram forum-topic deletion claim. */
+const TELEGRAM_TOPIC_DELETE_KIND = "telegram.topic_delete";
+/** Lease a deletion claim long enough for a bounded remote delete + crash window. */
+const TELEGRAM_DELETION_LEASE_MS = 60_000;
+const TELEGRAM_DELETION_RETRY_MS = 1_000;
+
+function topicDeleteEffectId(sessionId: string, topicId: string, leaseId: string): string {
+	// Scope terminal effects to the exact registration generation. Reusing a
+	// session or topic id under a fresh lease must never inherit an old terminal
+	// deletion record.
+	return `${TELEGRAM_TOPIC_DELETE_KIND}:${sessionId}:${topicId}:${leaseId}`;
+}
+/** Payload of a telegram topic-delete effect. Provider identifiers only. */
+interface TelegramTopicDeletePayload {
+	chatId: string;
+	topicId: string;
+	/**
+	 * Persisted registration lease this deletion was authorized under. Crash
+	 * replay and selective roots compaction validate it so a fresh registration
+	 * (different lease) is never compacted or short-circuited.
+	 */
+	leaseId: string;
+}
+function isTelegramTopicDeletePayload(value: unknown): value is TelegramTopicDeletePayload {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const payload = value as Partial<TelegramTopicDeletePayload>;
+	return isNonEmptyString(payload.chatId) && isCanonicalTopicId(payload.topicId) && isNonEmptyString(payload.leaseId);
+}
+/** True while a topic deletion has not completed local crash reconciliation. */
+async function hasUnreconciledDeletionClaim(agentDir: string, sessionId: string): Promise<boolean> {
+	const journal = new ChatEffectJournal({ agentDir, transport: "telegram" });
+	const effects = await journal.list();
+	return effects.some(
+		e =>
+			e.transport === "telegram" &&
+			e.kind === TELEGRAM_TOPIC_DELETE_KIND &&
+			e.sessionId === sessionId &&
+			(e.state !== "terminal" || !e.receipt?.status?.startsWith("reconciled")),
+	);
+}
+class TelegramDeletionInProgressError extends Error {}
+
+function telegramAdmissionLockPath(agentDir: string, sessionId: string): string {
+	const key = crypto.createHash("sha256").update(sessionId).digest("hex").slice(0, 32);
+	return path.join(daemonPaths(agentDir).dir, `telegram-admission-${key}`);
+}
+
 export async function registerNotificationRoot(input: {
 	settings: Settings;
 	cwd: string;
 	sessionId: string;
 	fs?: TelegramDaemonFs;
-}): Promise<string> {
+	now?: () => number;
+	randomId?: () => string;
+}): Promise<{ root: string; leaseId: string }> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	await ensureDir(fsImpl, paths.dir);
-	const root = notificationRootForCwd(input.cwd);
+	// Canonicalize the workspace first so a not-yet-created state directory still
+	// inherits realpath identity from a symlinked workspace. Canonicalize the full
+	// root again when it already exists (including a symlinked state directory).
+	const root = await canonicalNotificationRoot(fsImpl, input.cwd);
+	const now = input.now ?? Date.now;
+	// A FRESH leaseId on every registration is the registration generation: it
+	// invalidates any orphan candidate an older registration established, so a
+	// session restart cancels a stale reap. Idempotent re-registrations refresh
+	// the same lease slot under the bounded roots lock.
+	const leaseId = input.randomId?.() ?? crypto.randomBytes(12).toString("base64url");
+	const refreshedAt = now();
+	if (!isNonEmptyString(leaseId) || !isNonNegativeSafeInteger(refreshedAt)) {
+		throw new Error("Telegram notification root registration requires a valid lease");
+	}
+	let deletionInProgress = false;
 	await withFileLock(
-		paths.roots,
+		telegramAdmissionLockPath(input.settings.getAgentDir(), input.sessionId),
 		async () => {
-			const current =
-				(await readJson<{ roots?: string[]; sessions?: Record<string, string> }>(fsImpl, paths.roots)) ?? {};
-			const roots = new Set(current.roots ?? []);
-			roots.add(root);
-			await writeJsonAtomic(fsImpl, paths.roots, {
-				version: 1,
-				roots: Array.from(roots).sort(),
-				sessions: { ...(current.sessions ?? {}), [input.sessionId]: root },
+			if (await hasUnreconciledDeletionClaim(input.settings.getAgentDir(), input.sessionId)) {
+				deletionInProgress = true;
+				return;
+			}
+			await mutateRootsRegistry(fsImpl, paths.roots, view => {
+				addRawRoot(view.raw, root);
+				setRawSessionMapping(view.raw, input.sessionId, root);
+				setRawLease(view.raw, input.sessionId, { leaseId, refreshedAt });
+				return true;
 			});
 		},
 		{ staleMs: 10_000 },
 	);
-	return root;
+	if (deletionInProgress) throw new TelegramDeletionInProgressError();
+	// Return the exact admission identity (canonical root + lease) so callers
+	// propagate the bound generation rather than re-reading an unbound current
+	// registry value later.
+	return { root, leaseId };
 }
 
 function notificationRootForCwd(cwd: string): string {
 	return path.join(cwd, ".gjc", "state");
+}
+/**
+ * Canonicalize an authority path through its longest existing ancestor, so a
+ * workspace/state directory that is created after registration retains the
+ * same identity (including `/var`→`/private/var`-style host aliases). Every
+ * non-ENOENT resolution failure is ambiguous and fails closed.
+ */
+async function canonicalizePath(fsImpl: TelegramDaemonFs, target: string): Promise<string> {
+	const lexical = path.resolve(target);
+	const realpath = fsImpl.realpath;
+	if (!realpath) return lexical;
+	const missingParts: string[] = [];
+	let cursor = lexical;
+	while (true) {
+		try {
+			const canonicalAncestor = await realpath(cursor);
+			return path.join(canonicalAncestor, ...missingParts);
+		} catch (error) {
+			if (!isENOENTError(error)) throw error;
+			const parent = path.dirname(cursor);
+			if (parent === cursor) return lexical;
+			missingParts.unshift(path.basename(cursor));
+			cursor = parent;
+		}
+	}
+}
+
+async function canonicalNotificationRoot(fsImpl: TelegramDaemonFs, cwd: string): Promise<string> {
+	const canonicalCwd = await canonicalizePath(fsImpl, cwd);
+	return canonicalizePath(fsImpl, notificationRootForCwd(canonicalCwd));
+}
+
+/**
+ * Admission identity bound immutably to a connected {@link SessionSocket} at
+ * connect time. The close/delete path uses these bound values and NEVER
+ * re-reads the current registry, so a predecessor socket cannot be upgraded by
+ * a successor registration's lease/root.
+ */
+interface SessionAdmissionIdentity {
+	/** Realpath-equivalent root this socket was admitted under. */
+	canonicalRoot: string;
+	/** Registration lease stamped at admission (registration generation). */
+	leaseId: string;
 }
 
 function ownerIdentityMatches(state: DaemonState, tokenFingerprint: string, chatId: string): boolean {
@@ -689,13 +1076,48 @@ export async function spawnTelegramDaemonOwner(
 }
 
 export async function ensureTelegramDaemonRunning(
-	input: { settings: Settings; cwd: string; sessionId: string },
+	input: {
+		settings: Settings;
+		cwd: string;
+		sessionId: string;
+		/**
+		 * Synchronous callback invoked with the exact registration identity
+		 * `{canonicalRoot, leaseId}` immediately after the registration lease is
+		 * committed, BEFORE this function returns. The caller uses it to stamp the
+		 * immutable publication identity onto the endpoint file so the daemon
+		 * binds endpoint-carried identity rather than inferring a lease from the
+		 * registry. Not invoked when registration is deferred/blocked/disabled.
+		 */
+		onRegistered?: (identity: { canonicalRoot: string; leaseId: string }) => void;
+	},
 	deps: TelegramDaemonDeps = {},
 ): Promise<EnsureDaemonResult> {
 	const cfg = getNotificationConfig(input.settings);
 	if (!isTelegramConfigured(cfg)) return "disabled";
-	const root = notificationRootForCwd(input.cwd);
+	const agentDir = input.settings.getAgentDir();
+	// Use the same two-step canonical state-root identity as registration.
+	const fsImpl = deps.fs ?? nodeFs;
+	const root = await canonicalNotificationRoot(fsImpl, input.cwd);
 	const fp = tokenFingerprint(cfg.botToken);
+
+	// An unresolved claim must have a daemon owner available to finish crash
+	// reconciliation, but the caller must not publish a fresh endpoint yet.
+	if (await hasUnreconciledDeletionClaim(agentDir, input.sessionId)) {
+		const recoveryOwner = await spawnTelegramDaemonOwner(
+			{ settings: input.settings, roots: [root], tokenFingerprint: fp, chatId: cfg.chatId },
+			deps,
+		);
+		if (recoveryOwner.result === "blocked") {
+			logger.warn(`notifications: failed to ensure Telegram daemon: ${recoveryOwner.warnings.join("; ")}`);
+			return "blocked";
+		}
+		if (recoveryOwner.reloadRequired) await reloadStaleGenerationOwner(input.settings, deps);
+		logger.warn(
+			`notifications: deferring Telegram daemon registration for ${input.sessionId}: topic deletion reconciliation in progress`,
+		);
+		return "deferred";
+	}
+
 	const spawned = await spawnTelegramDaemonOwner(
 		{ settings: input.settings, roots: [root], tokenFingerprint: fp, chatId: cfg.chatId },
 		deps,
@@ -704,18 +1126,25 @@ export async function ensureTelegramDaemonRunning(
 		logger.warn(`notifications: failed to ensure Telegram daemon: ${spawned.warnings.join("; ")}`);
 		return spawned.result;
 	}
+	// Commit the registration lease only after ownership/attachment succeeds and
+	// before the caller publishes its SDK endpoint. A mismatched live owner must
+	// not leave behind a root or lease that can later authorize cleanup.
+	try {
+		const registration = await registerNotificationRoot({ ...input, fs: deps.fs });
+		// Propagate the exact admission identity synchronously so the caller
+		// stamps it onto the endpoint file BEFORE any broker registration or
+		// identity frame. The daemon binds this endpoint-carried identity, never
+		// inferring a lease from the current registry.
+		input.onRegistered?.({ canonicalRoot: registration.root, leaseId: registration.leaseId });
+	} catch (error) {
+		if (error instanceof TelegramDeletionInProgressError) return "deferred";
+		throw error;
+	}
 	if (spawned.reloadRequired) {
-		// A still-live owner is running an OLDER daemon generation than this host
-		// (e.g. a pre-upgrade daemon reused in place across an in-place upgrade).
-		// Attaching would silently drop this host's newer ask-ack / control frames,
-		// so register this session's root first — so the replacement daemon serves
-		// it — then hand off through the tested SIGTERM/control reload path to bring
-		// up a fresh current-generation daemon.
-		await registerNotificationRoot({ ...input, fs: deps.fs });
+		// The replacement daemon reads the registration committed above.
 		await reloadStaleGenerationOwner(input.settings, deps);
 		return "owner_spawned";
 	}
-	await registerNotificationRoot({ ...input, fs: deps.fs });
 	return spawned.result;
 }
 
@@ -911,7 +1340,7 @@ export class TelegramUpdatePoller {
 /** Mutable dispatch state shared by session frames and inbound Telegram updates. */
 export class TelegramEventDispatchState {
 	readonly busy = new Set<string>();
-	readonly inboundReactions = new Map<number, { messageId: number }>();
+	readonly inboundReactions = new Map<number, { messageId: number; sessionId: string; generation: number }>();
 	readonly seenUpdateIds = new Set<number>();
 }
 
@@ -965,12 +1394,38 @@ export interface TelegramDaemonOptions {
 	 * built-in `{repo}/{branch} - {title}` composition and its fallbacks.
 	 */
 	topics?: { nameTemplate?: string };
+	/**
+	 * Bounded AbortSignal timeout (ms) for a single `deleteForumTopic` call.
+	 * Defaults to {@link TOPIC_DELETE_TIMEOUT_MS}. Injectable so tests drive the
+	 * deletion-timeout seam deterministically.
+	 */
+	topicDeleteTimeoutMs?: number;
+	/**
+	 * Injectable durable deletion-claim journal (per-session topic-delete state
+	 * machine). Defaults to a {@link ChatEffectJournal} rooted at the canonical
+	 * `agentDir/sdk/daemons/telegram` store. Tests inject a shared journal to
+	 * assert crash-replay and terminal compaction.
+	 */
+	deletionJournal?: ChatEffectJournal;
 }
 
 interface SessionSocket {
 	sessionId: string;
 	token: string;
+	/** Exact endpoint incarnation (`url + token`) bound at admission. */
 	endpointKey: string;
+	/**
+	 * Canonical (realpath-equivalent) root this socket was admitted under.
+	 * Bound at connect time from the session's mapped registry root; the close
+	 * path revalidates against the CURRENT mapped root and revokes on mismatch.
+	 */
+	canonicalRoot: string;
+	/**
+	 * Registration lease bound at admission. The close/delete path uses this
+	 * immutable value and never re-reads the current registry lease, so a
+	 * predecessor socket cannot delete/compact under a successor lease.
+	 */
+	leaseId: string;
 	ws: WebSocket;
 	pending: Map<string, { sessionId: string; actionId: string }>;
 	/** True once the server advertised the `client_ping_pong` capability. */
@@ -1014,6 +1469,13 @@ interface TelegramQueuePayload {
 	send: ThreadedSend;
 	topicId?: string;
 	selectedAck?: SelectedAckQueueItem;
+	/**
+	 * Per-session topic generation stamped at admission time (F002). Every
+	 * delivery revalidates this against the live generation before any provider
+	 * call; a frame whose generation no longer matches (topic fenced for
+	 * deletion or regenerated) is dropped. Absent for flat (non-topic) sends.
+	 */
+	topicGeneration?: number;
 }
 
 export class TelegramNotificationDaemon {
@@ -1029,6 +1491,11 @@ export class TelegramNotificationDaemon {
 	private running = false;
 	private readonly fsImpl: TelegramDaemonFs;
 	private readonly botApi: BotApi;
+	private readonly providerBotApi: BotApi;
+	private readonly topicOperations = new Map<string, number>();
+	private readonly topicOperationWaiters = new Map<string, Set<() => void>>();
+	private readonly closingSessions = new Set<string>();
+	private readonly topicCreations = new Map<string, Promise<string | undefined>>();
 	private readonly topics = new TopicRegistry();
 	/** Serializes registry snapshots so an older atomic write cannot overwrite newer rename state. */
 	private topicsPersistQueue: Promise<void> = Promise.resolve();
@@ -1048,6 +1515,29 @@ export class TelegramNotificationDaemon {
 	private readonly pendingThreadedFrames = new Map<string, PendingThreadedFrame[]>();
 	/** Endpoint generation tombstones for sessions that already sent session_closed. */
 	private readonly closedEndpointKeys = new Map<string, string>();
+	/**
+	 * Per-session send-admission fence state (F002). `liveTopicGeneration` holds
+	 * the generation stamped on the currently-live topic; a frame is admitted
+	 * only while its stamped generation still matches it. `fencedTopicGeneration`
+	 * records the generation being deleted so the fence is observable while a
+	 * deletion is in flight; once deletion completes both are cleared, and a
+	 * resumed topic receives a fresh generation a late enqueue can never match.
+	 */
+	private readonly liveTopicGeneration = new Map<string, number>();
+	private readonly fencedTopicGeneration = new Map<string, number>();
+	private readonly fencedTopicIds = new Set<string>();
+	private topicGenerationCounter = 0;
+	/** Per-session 429 retry_after backoff deadline (ms via opts.now). Seeded from
+	 * the DURABLY persisted deletion-effect receipt on re-entry/restart so a
+	 * crash never forgets an outstanding `retry_after` before re-calling the
+	 * provider. See {@link performTopicDeletion}. */
+	private readonly deletionRetryAfter = new Map<string, number>();
+	/**
+	 * Durable, fsynced per-session topic-deletion claim journal (F003/F004).
+	 * Defaults to the canonical `agentDir/sdk/daemons/telegram` store; injectable
+	 * for deterministic crash-replay/compaction tests.
+	 */
+	private readonly deletionJournal: ChatEffectJournal;
 	/** True once the daemon has nudged the user to enable Threaded Mode. */
 	private threadedFallbackNoticeSent = false;
 	/** Sessions whose identity header was already sent flat (Threaded Mode off). */
@@ -1061,7 +1551,7 @@ export class TelegramNotificationDaemon {
 		return this.dispatchState.busy;
 	}
 	/** Inbound update id → originating Telegram message, for delivery reactions. */
-	private get inboundReactions(): Map<number, { messageId: number }> {
+	private get inboundReactions(): Map<number, { messageId: number; sessionId: string; generation: number }> {
 		return this.dispatchState.inboundReactions;
 	}
 	/**
@@ -1434,9 +1924,12 @@ export class TelegramNotificationDaemon {
 
 	constructor(private readonly opts: TelegramDaemonOptions) {
 		this.fsImpl = opts.fs ?? nodeFs;
+		this.deletionJournal =
+			opts.deletionJournal ??
+			new ChatEffectJournal({ agentDir: opts.settings.getAgentDir(), transport: "telegram", now: opts.now });
 		this.replyStore = new ReplySentStore({ agentDir: opts.settings.getAgentDir(), fs: opts.fs });
 		this.aliasTable = createAliasTable();
-		this.botApi =
+		this.providerBotApi =
 			opts.botApi ??
 			new TelegramBotTransport({
 				botToken: opts.botToken,
@@ -1444,6 +1937,9 @@ export class TelegramNotificationDaemon {
 				fetchImpl: opts.fetchImpl,
 				setTimeoutImpl: opts.setTimeoutImpl,
 			});
+		this.botApi = {
+			call: (method, body, callOpts) => this.callGuardedBotApi(method, body, callOpts),
+		};
 		this.runtime = new NotificationOperatorRuntime({
 			now: opts.now,
 			setTimeoutImpl: opts.setTimeoutImpl,
@@ -1459,6 +1955,61 @@ export class TelegramNotificationDaemon {
 			backoff: this.pollConflictBackoff,
 			processUpdate: update => this.processTelegramUpdate(update),
 		});
+	}
+	private beginTopicOperation(sessionId: string, generation: number): (() => void) | undefined {
+		if (this.fencedTopicGeneration.has(sessionId) || this.liveTopicGeneration.get(sessionId) !== generation) {
+			return undefined;
+		}
+		this.topicOperations.set(sessionId, (this.topicOperations.get(sessionId) ?? 0) + 1);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const remaining = (this.topicOperations.get(sessionId) ?? 1) - 1;
+			if (remaining > 0) {
+				this.topicOperations.set(sessionId, remaining);
+				return;
+			}
+			this.topicOperations.delete(sessionId);
+			const waiters = this.topicOperationWaiters.get(sessionId);
+			this.topicOperationWaiters.delete(sessionId);
+			for (const resolve of waiters ?? []) resolve();
+		};
+	}
+
+	private async drainTopicOperations(sessionId: string): Promise<void> {
+		if ((this.topicOperations.get(sessionId) ?? 0) === 0) return;
+		await new Promise<void>(resolve => {
+			const waiters = this.topicOperationWaiters.get(sessionId) ?? new Set<() => void>();
+			waiters.add(resolve);
+			this.topicOperationWaiters.set(sessionId, waiters);
+		});
+	}
+
+	private async callGuardedBotApi(
+		method: string,
+		body: unknown,
+		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
+	): Promise<unknown> {
+		const threadId =
+			body && typeof body === "object" && !Array.isArray(body)
+				? (body as { message_thread_id?: unknown }).message_thread_id
+				: undefined;
+		if (threadId === undefined) return this.providerBotApi.call(method, body, callOpts);
+		const sessionId = this.topics.sessionForTopic(String(threadId));
+		if (!sessionId) {
+			if (this.fencedTopicIds.has(String(threadId))) throw new Error("Telegram topic is fenced");
+			return this.providerBotApi.call(method, body, callOpts);
+		}
+		const generation = this.admissionGeneration(sessionId);
+		if (generation === undefined) throw new Error("Telegram topic is fenced");
+		const release = this.beginTopicOperation(sessionId, generation);
+		if (!release) throw new Error("Telegram topic is fenced");
+		try {
+			return await this.providerBotApi.call(method, body, callOpts);
+		} finally {
+			release();
+		}
 	}
 
 	private createSessionRouter(): OperatorEventRouter<SessionSocket> {
@@ -1512,6 +2063,13 @@ export class TelegramNotificationDaemon {
 						finishImmediately({ status: "failed", reason: "route_missing" });
 						return;
 					}
+					// F002: a threaded Selected ack must carry the live topic generation;
+					// a fenced (mid-delete) topic cannot receive it.
+					const topicGeneration = topicId ? this.admissionGeneration(session.sessionId) : undefined;
+					if (topicId && topicGeneration === undefined) {
+						finishImmediately({ status: "failed", reason: "route_missing" });
+						return;
+					}
 					const existing = [...new Set(this.selectedAckPending.values())].find(item => item.cacheKey === cacheKey);
 					if (existing) {
 						if (
@@ -1546,6 +2104,7 @@ export class TelegramNotificationDaemon {
 							send: { method: "sendMessage", lane: "ask", text: "Selected!" },
 							topicId,
 							selectedAck: item,
+							...(topicGeneration !== undefined ? { topicGeneration } : {}),
 						},
 					});
 					await this.flushPool();
@@ -1631,7 +2190,7 @@ export class TelegramNotificationDaemon {
 					const target = this.inboundReactions.get(msg.updateId as number);
 					if (target && msg.state === "consumed") {
 						this.inboundReactions.delete(msg.updateId as number);
-						await this.setReaction(target.messageId, CONSUMED_REACTION);
+						await this.setReaction(target.sessionId, target.messageId, CONSUMED_REACTION, target.generation);
 					}
 				},
 			})
@@ -1639,9 +2198,23 @@ export class TelegramNotificationDaemon {
 				name: "session_closed",
 				matches: msg => msg.type === "session_closed",
 				handle: async session => {
+					this.closingSessions.add(session.sessionId);
 					this.busy.delete(session.sessionId);
 					this.closedEndpointKeys.set(session.sessionId, session.endpointKey);
-					await this.deleteTopic(session.sessionId);
+					await this.topicCreations.get(session.sessionId)?.catch(() => undefined);
+					// Close-path deletion authority uses ONLY the socket's BOUND
+					// admission lease (canonicalRoot, leaseId, endpoint incarnation
+					// stamped from the endpoint file at admission). NEVER re-read the
+					// current registry lease. A predecessor socket bound to an older
+					// lease cannot delete/compact under a successor lease: the durable
+					// performTopicDeletion path re-validates the bound lease against
+					// the live registry under the admission lock and short-circuits as
+					// "superseded" when they differ (no provider deletion, no
+					// compaction, no generation restoration).
+					const closeLeaseId = session.leaseId;
+					if (isNonEmptyString(closeLeaseId)) {
+						await this.deleteTopic(session.sessionId, closeLeaseId);
+					}
 					this.dropSession(session, "session_closed");
 				},
 			});
@@ -1704,51 +2277,299 @@ export class TelegramNotificationDaemon {
 	}
 
 	async scanRoots(): Promise<void> {
+		await this.reconcileDeletionJournal();
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
-		const rootState = await readJson<{ roots?: string[] }>(this.fsImpl, paths.roots);
-		const endpointSessionIds = new Set<string>();
-		let allRootsReadable = true;
-		for (const root of rootState?.roots ?? []) {
+		// F001: per-root/per-session evidence replaces the global all-roots-readable
+		// veto. Each registered root is classified independently — `readable`,
+		// `missing` (ENOENT only), or `ambiguous` (any other readdir error) — and
+		// each session's absence evidence is derived from ITS MAPPED root only, so
+		// an unrelated unreadable root never blocks another session. Malformed or
+		// unreadable matching endpoint files are tracked as protective (ambiguous)
+		// evidence so they can never be mistaken for confirmed absence.
+		const view = await readRootsRegistry(this.fsImpl, paths.roots);
+		// Canonicalize the inventory view as one identity graph before scanning.
+		// This also handles registries written by older versions: a still-live
+		// symlink root and its real path collapse in memory, and session mappings
+		// that point at the legacy alias follow the same canonical root. Resolution
+		// failures remain lexical so the later root read classifies them ambiguous.
+		const canonicalByRegisteredRoot = new Map<string, string>();
+		const canonicalRoots: string[] = [];
+		const unresolvedCanonicalRoots = new Set<string>();
+		for (const registeredRoot of view.roots) {
+			let canonicalRoot = registeredRoot;
+			try {
+				canonicalRoot = await canonicalizePath(this.fsImpl, registeredRoot);
+			} catch {
+				// Preserve unresolved authority as a distinct root, but mark it
+				// ambiguous even when its directory can still be enumerated.
+				unresolvedCanonicalRoots.add(canonicalRoot);
+			}
+			canonicalByRegisteredRoot.set(registeredRoot, canonicalRoot);
+			if (!canonicalRoots.includes(canonicalRoot)) canonicalRoots.push(canonicalRoot);
+		}
+		view.roots = canonicalRoots;
+		for (const [sessionId, mappedRoot] of view.sessions) {
+			view.sessions.set(sessionId, canonicalByRegisteredRoot.get(mappedRoot) ?? mappedRoot);
+		}
+		const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
+		const rootStatus = new Map<string, "readable" | "missing" | "ambiguous">();
+		// root -> (sessionId -> endpoint classification) for readable roots only.
+		const rootSessionFiles = new Map<string, Map<string, "live" | "stale" | "malformed">>();
+		// sessionId -> live endpoint records collected across ALL readable roots.
+		// Each entry carries the immutable publication identity stamped onto the
+		// endpoint file by the session server. The daemon binds THIS identity
+		// (never inferring a lease from the registry); it only validates the
+		// carried identity against the current registry to detect stale endpoints.
+		const liveBySession = new Map<
+			string,
+			Array<{ canonicalRoot: string; leaseId: string; url: string; token: string }>
+		>();
+		const liveEndpointSessions = new Set<string>();
+		// Sessions whose endpoint identity is ambiguous (missing/malformed/mismatched
+		// carried identity, duplicate across roots, or conflicting identity). Fail-
+		// closed: never connect, never first-wins, never authorizes cleanup.
+		const ambiguousSessions = new Set<string>();
+		for (const root of view.roots) {
+			if (unresolvedCanonicalRoots.has(root)) {
+				rootStatus.set(root, "ambiguous");
+				continue;
+			}
 			const dir = path.join(root, "sdk");
 			let files: string[];
 			try {
 				files = await this.fsImpl.readdir(dir);
-			} catch {
-				allRootsReadable = false;
+			} catch (err) {
+				// Definitively missing (ENOENT) counts as confirmed absence for a
+				// mapped session; every other readdir error is ambiguous and must
+				// withhold/defer that root's sessions only.
+				rootStatus.set(root, isENOENTError(err) ? "missing" : "ambiguous");
 				continue;
 			}
+			rootStatus.set(root, "readable");
+			const fileMap = new Map<string, "live" | "stale" | "malformed">();
 			for (const file of files.filter(item => item.endsWith(".json"))) {
 				const sessionId = path.basename(file, ".json");
-				endpointSessionIds.add(sessionId);
-				if (this.sessions.has(sessionId)) continue;
+				if (this.fencedTopicGeneration.has(sessionId)) {
+					const connected = this.sessions.get(sessionId);
+					if (connected) this.dropSession(connected, "topic_deletion_pending");
+					fileMap.set(sessionId, "stale");
+					continue;
+				}
 				try {
 					const endpoint = readEndpoint(path.join(dir, file));
-					// Skip endpoint files whose owning process is gone or that are
-					// explicitly stale (e.g. a hard-closed session): reconnecting
-					// would chase a dead, token-bearing record forever. Once the
-					// associated topic is past the grace window, reap it through the
-					// same best-effort delete path as graceful session shutdown.
-					const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
+					// Explicit stale/dead endpoint files are absence evidence the
+					// candidate reconciliation below may reap through the grace
+					// window; reconnecting them would chase a dead, token-bearing
+					// record forever.
 					if (endpoint.stale || (endpoint.pid !== undefined && !pidAlive(endpoint.pid))) {
-						await this.deleteOrphanedTopic(sessionId);
+						fileMap.set(sessionId, "stale");
 						continue;
 					}
-					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
-					if (this.closedEndpointKeys.get(sessionId) === endpointKey) continue;
-					this.closedEndpointKeys.delete(sessionId);
-					this.connectSession(sessionId, endpoint.url, endpoint.token);
-				} catch {}
+					// The endpoint MUST carry immutable publication identity
+					// (canonicalRoot + leaseId). A live endpoint missing either is
+					// malformed/ambiguous: the daemon never infers a lease from the
+					// registry. This also fails-closed for the predecessor race:
+					// an endpoint carrying a stale lease is rejected below as
+					// mismatched.
+					if (!isNonEmptyString(endpoint.canonicalRoot) || !isNonEmptyString(endpoint.leaseId)) {
+						fileMap.set(sessionId, "malformed");
+						ambiguousSessions.add(sessionId);
+						continue;
+					}
+					const mappedRoot = view.sessions.get(sessionId);
+					const currentLease = view.sessionLeases.get(sessionId)?.leaseId;
+					if (
+						mappedRoot !== root ||
+						endpoint.canonicalRoot !== root ||
+						currentLease === undefined ||
+						endpoint.leaseId !== currentLease
+					) {
+						fileMap.set(sessionId, "malformed");
+						ambiguousSessions.add(sessionId);
+						continue;
+					}
+					fileMap.set(sessionId, "live");
+					liveEndpointSessions.add(sessionId);
+					const entries = liveBySession.get(sessionId) ?? [];
+					entries.push({
+						canonicalRoot: endpoint.canonicalRoot,
+						leaseId: endpoint.leaseId,
+						url: endpoint.url,
+						token: endpoint.token,
+					});
+					liveBySession.set(sessionId, entries);
+				} catch {
+					// Malformed/unreadable matching endpoint file: protective
+					// evidence. It must NOT be treated as absence.
+					fileMap.set(sessionId, "malformed");
+					ambiguousSessions.add(sessionId);
+				}
+			}
+			rootSessionFiles.set(root, fileMap);
+		}
+		// Duplicate/conflicting identity is ambiguous and non-authorizing: a
+		// session with live endpoints carrying different publication identities
+		// (canonicalRoot + leaseId) can never prove which belongs to the fresh
+		// registration. Fail closed — disconnect/revoke any stale attached
+		// control, and never first-wins.
+		for (const [sessionId, entries] of liveBySession) {
+			const distinctIdentity = new Set(
+				entries.map(
+					entry => `${entry.canonicalRoot}\0${entry.leaseId}\0${endpointGenerationKey(entry.url, entry.token)}`,
+				),
+			);
+			if (distinctIdentity.size > 1) {
+				ambiguousSessions.add(sessionId);
+				const connected = this.sessions.get(sessionId);
+				if (connected) this.dropSession(connected, "ambiguous_duplicate_endpoint");
 			}
 		}
-		if (allRootsReadable) {
-			for (const sessionId of this.topics.sessionIds()) {
-				if (!this.sessions.has(sessionId) && !endpointSessionIds.has(sessionId))
-					await this.deleteOrphanedTopic(sessionId);
+		// Revalidation: every connected socket is checked against the CURRENT
+		// registry identity every scan. A successor registration (different
+		// lease) revokes the stale socket and any pending/session control. This
+		// is the immutable revalidation contract: current registry values cannot
+		// retroactively upgrade an old socket. The socket's BOUND lease (stamped
+		// from the endpoint file at admission) is compared against the live
+		// registry lease — a mismatch means a successor registration won.
+		const toRevoke: Array<{ sock: SessionSocket; reason: string }> = [];
+		for (const [sessionId, sock] of this.sessions) {
+			if (this.fencedTopicGeneration.has(sessionId)) continue;
+			if (ambiguousSessions.has(sessionId)) continue; // already revoked above
+			const currentLease = view.sessionLeases.get(sessionId)?.leaseId;
+			const mappedRoot = view.sessions.get(sessionId);
+			const matchingEndpoint = liveBySession
+				.get(sessionId)
+				?.some(
+					entry =>
+						entry.canonicalRoot === sock.canonicalRoot &&
+						entry.leaseId === sock.leaseId &&
+						endpointGenerationKey(entry.url, entry.token) === sock.endpointKey,
+				);
+			if (
+				!isNonEmptyString(sock.leaseId) ||
+				!isNonEmptyString(sock.canonicalRoot) ||
+				currentLease !== sock.leaseId ||
+				mappedRoot !== sock.canonicalRoot ||
+				matchingEndpoint !== true
+			) {
+				toRevoke.push({ sock, reason: "admission_identity_mismatch" });
 			}
+		}
+		for (const { sock, reason } of toRevoke) this.dropSession(sock, reason);
+		// Admission: only a live endpoint carrying immutable publication identity
+		// (canonicalRoot + leaseId) that MATCHES the current registry lease may
+		// connect/protect the topic. The daemon binds the ENDPOINT-CARRIED
+		// identity (never inferring from the registry), and validates it against
+		// the registry to reject stale predecessor endpoints whose lease no longer
+		// matches the fresh registration. This closes the predecessor race: a
+		// fresh registry lease with a predecessor endpoint file remaining is
+		// mismatched → ambiguous → never connects.
+		for (const [sessionId, entries] of liveBySession) {
+			if (ambiguousSessions.has(sessionId)) continue;
+			if (this.fencedTopicGeneration.has(sessionId)) continue;
+			if (this.sessions.has(sessionId)) continue; // already connected + revalidated
+			const entry = entries[0]!;
+			const currentLease = view.sessionLeases.get(sessionId)?.leaseId;
+			const mappedRoot = view.sessions.get(sessionId);
+			if (
+				currentLease === undefined ||
+				mappedRoot === undefined ||
+				entry.leaseId !== currentLease ||
+				entry.canonicalRoot !== mappedRoot
+			) {
+				ambiguousSessions.add(sessionId);
+				continue;
+			}
+			const endpointKey = endpointGenerationKey(entry.url, entry.token);
+			if (this.closedEndpointKeys.get(sessionId) === endpointKey) continue;
+			this.closedEndpointKeys.delete(sessionId);
+			// Bind the ENDPOINT-CARRIED identity (immutable for the socket lifetime).
+			this.connectSession(sessionId, entry.url, entry.token, {
+				canonicalRoot: entry.canonicalRoot,
+				leaseId: entry.leaseId,
+			});
+		}
+		// Derive per-session absence evidence from each session's MAPPED root.
+		const absenceEvidence = new Map<string, SessionAbsenceEvidence>();
+		for (const sessionId of this.topics.sessionIds()) {
+			// Ambiguous identity withholds/withholds cleanup: never reap.
+			if (ambiguousSessions.has(sessionId)) {
+				absenceEvidence.set(sessionId, { kind: "ambiguous" });
+				continue;
+			}
+			if (this.sessions.has(sessionId) || liveEndpointSessions.has(sessionId)) {
+				absenceEvidence.set(sessionId, { kind: "present" });
+				continue;
+			}
+			const mappedRoot = view.sessions.get(sessionId);
+			if (!mappedRoot) {
+				absenceEvidence.set(sessionId, { kind: "ambiguous" });
+				continue;
+			}
+			const status = rootStatus.get(mappedRoot);
+			if (status === "missing") {
+				absenceEvidence.set(sessionId, { kind: "missing" });
+			} else if (status !== "readable") {
+				// Unreadable (ambiguous) mapped root, or a registered root no
+				// longer present in the registry list: defer, never reap.
+				absenceEvidence.set(sessionId, { kind: "ambiguous" });
+			} else {
+				const file = rootSessionFiles.get(mappedRoot)?.get(sessionId);
+				absenceEvidence.set(
+					sessionId,
+					file === "live"
+						? { kind: "present" }
+						: file === "malformed"
+							? { kind: "ambiguous" }
+							: { kind: "absent" }, // no file, or explicit stale/dead evidence
+				);
+			}
+		}
+		await this.reconcileOrphanCandidates(view, absenceEvidence);
+	}
+
+	private async sessionAdmissionIsCurrent(session: SessionSocket): Promise<boolean> {
+		if (!isNonEmptyString(session.canonicalRoot) || !isNonEmptyString(session.leaseId)) return false;
+		const view = await readRootsRegistry(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).roots);
+		if (
+			view.sessions.get(session.sessionId) !== session.canonicalRoot ||
+			view.sessionLeases.get(session.sessionId)?.leaseId !== session.leaseId
+		) {
+			return false;
+		}
+		try {
+			const endpoint = readEndpoint(path.join(session.canonicalRoot, "sdk", `${session.sessionId}.json`));
+			return (
+				endpoint.canonicalRoot === session.canonicalRoot &&
+				endpoint.leaseId === session.leaseId &&
+				endpointGenerationKey(endpoint.url, endpoint.token) === session.endpointKey
+			);
+		} catch {
+			return false;
 		}
 	}
 
-	connectSession(sessionId: string, url: string, token: string): void {
+	private async sendToCurrentSession(session: SessionSocket, frame: Record<string, unknown>): Promise<boolean> {
+		if (this.sessions.get(session.sessionId) !== session) return false;
+		if (!(await this.sessionAdmissionIsCurrent(session))) {
+			if (this.sessions.get(session.sessionId) === session) {
+				this.dropSession(session, "admission_identity_mismatch");
+			}
+			return false;
+		}
+		if (this.sessions.get(session.sessionId) !== session || session.ws.readyState !== WebSocket.OPEN) {
+			return false;
+		}
+		try {
+			session.ws.send(JSON.stringify(frame));
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	connectSession(sessionId: string, url: string, token: string, identity: SessionAdmissionIdentity): void {
+		this.closingSessions.delete(sessionId);
 		const WS = this.opts.WebSocketImpl ?? WebSocket;
 		const ws = new WS(`${url}/?token=${encodeURIComponent(token)}`);
 		const endpointKey = endpointGenerationKey(url, token);
@@ -1757,6 +2578,14 @@ export class TelegramNotificationDaemon {
 			sessionId,
 			token,
 			endpointKey,
+			// Bind the admission identity (canonical root + registration lease)
+			// immutably to this socket. The token IS the endpoint incarnation: it is
+			// freshly minted per endpoint publication, so (canonicalRoot, sessionId,
+			// leaseId, token) is the exact admission tuple. The close/delete path
+			// uses these bound values and never re-reads the current registry, so a
+			// predecessor socket cannot be upgraded by a successor registration.
+			canonicalRoot: identity.canonicalRoot,
+			leaseId: identity.leaseId,
 			ws,
 			pending: new Map(),
 			capable: false,
@@ -1775,41 +2604,50 @@ export class TelegramNotificationDaemon {
 			session.replayPending = true;
 			session.replayQueue = [];
 			const replayCursor = this.topics.replayCursor(sessionId);
-			if (session.ws.readyState === WebSocket.OPEN) {
-				try {
-					session.ws.send(
-						JSON.stringify({
-							type: "hello",
-							protocolVersion: NOTIFICATION_PROTOCOL_VERSION,
-							capabilities: [CLIENT_PING_PONG_CAPABILITY, ASK_CONTROLS_CAPABILITY, ASK_SELECTED_ACK_CAPABILITY],
-						}),
-					);
-				} catch {}
-				try {
-					session.ws.send(
-						JSON.stringify({
-							type: "event_replay",
-							id: session.replayId,
-							sinceGeneration: replayCursor?.generation ?? 1,
-							sinceSeq: replayCursor?.seq ?? 0,
-						}),
-					);
-				} catch {}
-			}
-			// Eagerly create the session's Telegram topic as soon as it connects, so
-			// a thread exists the moment a notifications-enabled session is live —
-			// not lazily on the first delivered frame (which only arrives once the
-			// user sends a prompt). A provisional "GJC <id>" name is used; the
-			// identity_header frame renames it to "{repo}/{branch} - {title}" later.
-			void this.ensureTopic(sessionId, this.topicNameFor(sessionId, {})).catch(() => undefined);
+			void (async () => {
+				if (this.sessions.get(sessionId) !== session || !(await this.sessionAdmissionIsCurrent(session))) {
+					this.dropSession(session, "admission_identity_mismatch");
+					return;
+				}
+				if (session.ws.readyState === WebSocket.OPEN) {
+					try {
+						session.ws.send(
+							JSON.stringify({
+								type: "hello",
+								protocolVersion: NOTIFICATION_PROTOCOL_VERSION,
+								capabilities: [
+									CLIENT_PING_PONG_CAPABILITY,
+									ASK_CONTROLS_CAPABILITY,
+									ASK_SELECTED_ACK_CAPABILITY,
+								],
+							}),
+						);
+					} catch {}
+					try {
+						session.ws.send(
+							JSON.stringify({
+								type: "event_replay",
+								id: session.replayId,
+								sinceGeneration: replayCursor?.generation ?? 1,
+								sinceSeq: replayCursor?.seq ?? 0,
+							}),
+						);
+					} catch {}
+				}
+				void this.ensureTopic(sessionId, this.topicNameFor(sessionId, {})).catch(() => undefined);
+			})().catch(err => {
+				logger.error("notifications daemon: endpoint admission check failed", { error: String(err) });
+				this.dropSession(session, "admission_check_failed");
+			});
 		});
 		ws.addEventListener("message", ev => {
-			// Identity guard: a delayed frame from a superseded socket must not act
-			// through the replacement session.
-			if (this.sessions.get(sessionId) !== session) return;
-			void this.handleSessionMessage(session, JSON.parse(String(ev.data))).catch(err => {
-				// Surface frame-handling failures (e.g. a rejected ask sendMessage) to
-				// the daemon log instead of an invisible unhandled rejection.
+			void (async () => {
+				if (this.sessions.get(sessionId) !== session || !(await this.sessionAdmissionIsCurrent(session))) {
+					this.dropSession(session, "admission_identity_mismatch");
+					return;
+				}
+				await this.handleSessionMessage(session, JSON.parse(String(ev.data)));
+			})().catch(err => {
 				logger.error("notifications daemon: handleSessionMessage failed", { error: String(err) });
 			});
 		});
@@ -1982,11 +2820,16 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async submitThreadedFrame(sessionId: string, send: ThreadedSend, topicId: string): Promise<void> {
+		// F002 admission fence: stamp the live topic generation and reject once the
+		// topic is fenced for deletion. A post-fence enqueue reads an undefined
+		// generation and returns, so it can never target the old topic.
+		const topicGeneration = this.admissionGeneration(sessionId);
+		if (topicGeneration === undefined) return;
 		this.pool.submit({
 			sessionId,
 			lane: send.lane,
 			coalesceKey: send.coalesceKey,
-			payload: { send, topicId },
+			payload: { send, topicId, topicGeneration },
 		});
 		await this.flushPool();
 	}
@@ -2048,75 +2891,497 @@ export class TelegramNotificationDaemon {
 	 * one-time nudge) or drop fail-closed for a non-private chat.
 	 */
 	private async ensureTopic(sessionId: string, name: string): Promise<string | undefined> {
+		if (this.closingSessions.has(sessionId)) return undefined;
 		if (!(await this.pairedChatIsPrivate())) return undefined;
+		if (this.closingSessions.has(sessionId) || this.fencedTopicGeneration.has(sessionId)) return undefined;
 		const existing = this.topics.get(sessionId);
-		if (existing) return existing.topicId;
-		try {
-			const rec = await this.topics.getOrCreateTopic(
-				sessionId,
-				async () => {
-					const res = (await this.botApi.call("createForumTopic", {
-						chat_id: this.opts.chatId,
-						name,
-					})) as { result?: { message_thread_id?: number } };
-					const tid = res.result?.message_thread_id;
-					if (tid === undefined || tid === null) throw new Error("createForumTopic: no message_thread_id");
-					return String(tid);
-				},
-				this.opts.now,
-				// The create winner records the name it actually used; callers that
-				// merely JOIN an in-flight create must not overwrite it locally, or a
-				// later identity rename would be wrongly skipped (topic stuck at the
-				// provisional name on Telegram).
-				name,
-			);
-			await this.persistTopics();
-			return rec.topicId;
-		} catch {
-			return undefined;
+		if (existing) {
+			this.ensureLiveTopicGeneration(sessionId);
+			return existing.topicId;
 		}
+		const pending = this.topicCreations.get(sessionId);
+		if (pending) return pending;
+
+		const creation = (async (): Promise<string | undefined> => {
+			try {
+				const rec = await this.topics.getOrCreateTopic(
+					sessionId,
+					async () => {
+						const res = (await this.botApi.call("createForumTopic", {
+							chat_id: this.opts.chatId,
+							name,
+						})) as { result?: { message_thread_id?: number } };
+						const tid = res.result?.message_thread_id;
+						if (tid === undefined || tid === null) throw new Error("createForumTopic: no message_thread_id");
+						return String(tid);
+					},
+					this.opts.now,
+					name,
+				);
+				await this.persistTopics();
+				if (!this.closingSessions.has(sessionId)) this.ensureLiveTopicGeneration(sessionId);
+				return rec.topicId;
+			} catch {
+				return undefined;
+			}
+		})();
+		this.topicCreations.set(sessionId, creation);
+		try {
+			return await creation;
+		} finally {
+			if (this.topicCreations.get(sessionId) === creation) this.topicCreations.delete(sessionId);
+		}
+	}
+
+	/** Assign a live generation for a topic that has none yet (created/resumed),
+	 * without disturbing an existing live generation or a fenced one. */
+	private ensureLiveTopicGeneration(sessionId: string): void {
+		if (this.liveTopicGeneration.has(sessionId)) return;
+		if (this.fencedTopicGeneration.has(sessionId)) return;
+		this.assignTopicGeneration(sessionId);
 	}
 
 	private topicPastOrphanGrace(sessionId: string): boolean {
 		const record = this.topics.get(sessionId);
-		return record !== undefined && this.runtime.now() - record.createdAt >= ORPHAN_TOPIC_GRACE_MS;
+		if (!record) return false;
+		// Strictly validate createdAt before it contributes to destructive grace.
+		// TopicRegistry only checks `typeof === "number"`, so it normalizes a
+		// missing/legacy value to 0 and passes through NaN/Infinity/negative/
+		// out-of-range values — any of which could make a malformed record look
+		// long-past-grace and authorize a false reap. Fail closed unless createdAt
+		// is a positive safe-integer timestamp not in the future.
+		const createdAt = record.createdAt;
+		const now = this.runtime.now();
+		if (!isNonNegativeSafeInteger(createdAt) || createdAt <= 0 || createdAt > now) return false;
+		return now - createdAt >= ORPHAN_TOPIC_GRACE_MS;
 	}
 
-	private async deleteOrphanedTopic(sessionId: string): Promise<void> {
-		if (!this.topicPastOrphanGrace(sessionId)) return;
-		await this.deleteTopic(sessionId);
+	/**
+	 * The generation a NEW send for `sessionId` would be stamped with (F002), or
+	 * `undefined` when the session has no live topic or its topic is fenced for
+	 * deletion — admission then rejects the send.
+	 */
+	private admissionGeneration(sessionId: string): number | undefined {
+		if (this.closingSessions.has(sessionId)) return undefined;
+		if (this.fencedTopicGeneration.has(sessionId)) return undefined;
+		return this.liveTopicGeneration.get(sessionId);
 	}
 
-	/** Best-effort delete of a session topic once its local notification endpoint shuts down. */
-	private async deleteTopic(sessionId: string): Promise<void> {
+	/** Assign a fresh live generation for a created/resumed topic (F002). */
+	private assignTopicGeneration(sessionId: string): number {
+		const next = ++this.topicGenerationCounter;
+		this.liveTopicGeneration.set(sessionId, next);
+		this.fencedTopicGeneration.delete(sessionId);
+		const topicId = this.topics.get(sessionId)?.topicId;
+		if (topicId) this.fencedTopicIds.delete(topicId);
+		return next;
+	}
+
+	/**
+	 * Best-effort, crash-safe delete of a session topic. The send admission fence
+	 * is raised FIRST (no late submitThreadedFrame/continuation can target the
+	 * topic), queued items are cancelled, the pool is drained OUTSIDE any
+	 * registry lock, then the remote delete runs through the durable deletion
+	 * claim (fsynced intent before the call, terminal recorded before local
+	 * forgetting). `leaseId` is the persisted registration lease this deletion is
+	 * authorized under; it scopes the topic-specific effect and selective roots
+	 * compaction so a fresh registration (different lease) is never compacted. A
+	 * topic left by an uncertain/429 delete keeps its fence and is retried by the
+	 * next scan; a resumed session receives a fresh generation.
+	 */
+	private async deleteTopic(sessionId: string, leaseId: string): Promise<void> {
+		if (!isNonEmptyString(leaseId)) return;
 		const record = this.topics.get(sessionId);
-		if (!record) return;
-		try {
-			// Drop queued sends for this session before deleting the topic; otherwise
-			// rate-limited frames can flush later into a deleted topic or across resume.
-			const removed = this.pool.removeWhere(item => item.sessionId === sessionId);
-			for (const item of removed) {
-				if (item.payload.selectedAck)
-					this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
-			}
-			await this.flushPool();
-			const res = (await this.botApi.call("deleteForumTopic", {
-				chat_id: this.opts.chatId,
-				message_thread_id: Number(record.topicId),
-			})) as { ok?: boolean };
-			if (res?.ok === false) return;
-			this.topics.delete(sessionId);
-			for (const k of [...this.liveMessages.keys()]) {
-				if (k.startsWith(`${sessionId}:`)) this.liveMessages.delete(k);
-			}
-			this.topicOwnerByIdentity.forEach((ownerSessionId, identityKey) => {
-				if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
-			});
-			this.pendingThreadedFrames.delete(sessionId);
-			await this.persistTopics();
-		} catch {
-			// Best-effort: missing Telegram topic permissions must not stop teardown.
+		if (!record || !isCanonicalTopicId(record.topicId)) return;
+		// FENCE: invalidate the live generation so new submits/requeues are
+		// rejected and every in-flight delivery revalidates and skips. A
+		// post-fence enqueue cannot target the old topic: admissionGeneration()
+		// is undefined while fenced, so it is stamped with a later generation.
+		this.fencedTopicGeneration.set(sessionId, this.liveTopicGeneration.get(sessionId) ?? 0);
+		this.liveTopicGeneration.delete(sessionId);
+		this.fencedTopicIds.add(record.topicId);
+		// CANCEL queued sends for this session before deleting the topic;
+		// otherwise rate-limited frames can flush into a deleted topic or across
+		// resume.
+		const removed = this.pool.removeWhere(item => item.sessionId === sessionId);
+		for (const item of removed) {
+			if (item.payload.selectedAck)
+				this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
 		}
+		// DRAIN outside registry locks: let any in-flight flush complete. Granted
+		// items revalidate against the (now-removed) live generation and skip.
+		await this.flushPool();
+		await this.drainTopicOperations(sessionId);
+		// DELETE via the durable claim. Terminal remote success is recorded before
+		// local forgetting; an uncertain/429 outcome retains the claim for retry.
+		const generation = this.fencedTopicGeneration.get(sessionId) ?? 0;
+		const outcome = await this.performTopicDeletion(sessionId, record.topicId, generation, leaseId);
+		if (outcome === "terminal") {
+			this.finalizeTopicDeletion(sessionId);
+			await this.persistTopics().catch(() => undefined);
+			// Selective roots compaction: remove ONLY the exact matching
+			// candidate/lease/session mapping. A fresh registration whose lease
+			// differs survives (re-read durably under the roots lock).
+			await this.compactRootsAfterDeletion(sessionId, record.topicId, leaseId);
+			await this.deletionJournal.updateTerminalReceipt<TelegramTopicDeletePayload>(
+				topicDeleteEffectId(sessionId, record.topicId, leaseId),
+				{ provider: "telegram", status: "reconciled" },
+			);
+		} else if (outcome === "superseded" && this.topics.get(sessionId)?.topicId === record.topicId) {
+			this.assignTopicGeneration(sessionId);
+		}
+	}
+
+	/**
+	 * Establish/reuse the durable deletion claim, call `deleteForumTopic` with
+	 * `noRetry` and a bounded AbortSignal, and record terminal/uncertain state.
+	 * Returns "terminal" when the topic is confirmed deleted (or already
+	 * deleted), "uncertain" when the call must be retried (429/abort/transport).
+	 * `leaseId` is recorded in the payload so crash replay and compaction can
+	 * validate exact session/topic/lease; the effect id is topic-scoped so a
+	 * terminal record for a superseded topic never applies here.
+	 */
+	private async performTopicDeletion(
+		sessionId: string,
+		topicId: string,
+		generation: number,
+		leaseId: string,
+	): Promise<"terminal" | "uncertain" | "superseded"> {
+		const effectId = topicDeleteEffectId(sessionId, topicId, leaseId);
+		const payload: TelegramTopicDeletePayload = { chatId: this.opts.chatId, topicId, leaseId };
+		let lease: ChatEffectLease | undefined;
+		let terminal = false;
+		let superseded = false;
+		await withFileLock(
+			telegramAdmissionLockPath(this.opts.settings.getAgentDir(), sessionId),
+			async () => {
+				const roots = await readRootsRegistry(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).roots);
+				if (roots.sessionLeases.get(sessionId)?.leaseId !== leaseId) {
+					superseded = true;
+					return;
+				}
+
+				let existing = await this.deletionJournal.read<TelegramTopicDeletePayload>(effectId);
+				if (
+					existing &&
+					(existing.transport !== "telegram" ||
+						existing.kind !== TELEGRAM_TOPIC_DELETE_KIND ||
+						existing.sessionId !== sessionId ||
+						!isTelegramTopicDeletePayload(existing.payload) ||
+						existing.payload.chatId !== payload.chatId ||
+						existing.payload.topicId !== payload.topicId ||
+						existing.payload.leaseId !== payload.leaseId)
+				) {
+					return;
+				}
+				const now = this.runtime.now();
+				const memRetryUntil = this.deletionRetryAfter.get(sessionId);
+				if (memRetryUntil !== undefined && now < memRetryUntil) return;
+				const durableRetryAt = existing?.receipt?.retryAt;
+				if (typeof durableRetryAt === "number" && Number.isFinite(durableRetryAt) && now < durableRetryAt) {
+					this.deletionRetryAfter.set(sessionId, durableRetryAt);
+					return;
+				}
+				if (existing?.state === "terminal") {
+					terminal = true;
+					return;
+				}
+
+				if (!existing) {
+					const created = await this.deletionJournal.enqueueAndClaim<TelegramTopicDeletePayload>(
+						{
+							id: effectId,
+							kind: TELEGRAM_TOPIC_DELETE_KIND,
+							transport: "telegram",
+							sessionId,
+							endpointGeneration: generation,
+							payload,
+						},
+						this.opts.ownerId,
+						TELEGRAM_DELETION_LEASE_MS,
+					);
+					if (created) {
+						existing = created;
+						lease = { owner: this.opts.ownerId, epoch: created.epoch };
+					}
+				}
+				if (!lease && existing) {
+					const claimed = await this.deletionJournal.claim<TelegramTopicDeletePayload>(
+						effectId,
+						this.opts.ownerId,
+						TELEGRAM_DELETION_LEASE_MS,
+					);
+					if (claimed?.state === "leased") {
+						lease = { owner: this.opts.ownerId, epoch: claimed.epoch };
+					}
+				}
+			},
+			{ staleMs: 10_000 },
+		);
+		if (terminal) return "terminal";
+		if (superseded) return "superseded";
+		if (!lease) return "uncertain";
+		const result = await this.callDeleteForumTopic(topicId);
+		if (result.outcome === "deleted") {
+			await this.deletionJournal.record(effectId, lease, "terminal", {
+				provider: "telegram",
+				status: "deleted",
+			});
+			this.deletionRetryAfter.delete(sessionId);
+			return "terminal";
+		}
+		// Persist retry_after DURABLY so it survives a restart: record the absolute
+		// deadline on the receipt and seed the in-memory backoff for this run.
+		const retryAt =
+			typeof result.retryAfterSec === "number" && result.retryAfterSec > 0
+				? this.runtime.now() + result.retryAfterSec * 1000
+				: this.runtime.now() + TELEGRAM_DELETION_RETRY_MS;
+		this.deletionRetryAfter.set(sessionId, retryAt);
+		await this.deletionJournal.record(effectId, lease, "uncertain", {
+			provider: "telegram",
+			status: result.retryAfterSec ? `retry_after:${result.retryAfterSec}` : "uncertain",
+			retryAt,
+		});
+		return "uncertain";
+	}
+
+	/**
+	 * Call `deleteForumTopic` once with `noRetry` and a bounded AbortSignal.
+	 * Honors Telegram `parameters.retry_after` and reconciles an already-applied
+	 * delete (topic/message-thread not found) as success.
+	 */
+	private async callDeleteForumTopic(
+		topicId: string,
+	): Promise<{ outcome: "deleted" | "uncertain"; retryAfterSec?: number }> {
+		const controller = new AbortController();
+		const timeoutMs = this.opts.topicDeleteTimeoutMs ?? TOPIC_DELETE_TIMEOUT_MS;
+		const timer = (this.opts.setTimeoutImpl ?? setTimeout)(() => controller.abort(), timeoutMs);
+		try {
+			const res = (await this.providerBotApi.call(
+				"deleteForumTopic",
+				{ chat_id: this.opts.chatId, message_thread_id: Number(topicId) },
+				{ signal: controller.signal, noRetry: true },
+			)) as {
+				ok?: boolean;
+				error_code?: number;
+				description?: string;
+				parameters?: { retry_after?: unknown };
+			};
+			if (res?.ok === true) return { outcome: "deleted" };
+			const description = String(res?.description ?? "");
+			// Already-applied delete (topic/thread no longer exists) reconciles as success.
+			if (
+				res?.ok === false &&
+				/not found|already deleted|message thread not found|topic deleted/i.test(description)
+			) {
+				return { outcome: "deleted" };
+			}
+			// 429 rate limit: honor retry_after, retain uncertain for re-attempt.
+			if (res?.ok === false && (res.error_code === 429 || res.parameters?.retry_after !== undefined)) {
+				const retryAfter = Number(res.parameters?.retry_after);
+				return {
+					outcome: "uncertain",
+					retryAfterSec: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
+				};
+			}
+			return { outcome: "uncertain" };
+		} catch {
+			// Abort/network/transport error: retain uncertain; a later scan retries.
+			return { outcome: "uncertain" };
+		} finally {
+			(this.opts.clearTimeoutImpl ?? clearTimeout)(timer);
+		}
+	}
+
+	/**
+	 * Local cleanup after a confirmed terminal deletion: remove the topic record,
+	 * its live-message index, identity ownership, pending frames, and generation.
+	 * Selective: only the exact session is compacted (F005). Safe to call from
+	 * crash replay for a terminal claim WITHOUT re-calling Telegram.
+	 */
+	private finalizeTopicDeletion(sessionId: string): void {
+		this.topics.delete(sessionId);
+		for (const k of [...this.liveMessages.keys()]) {
+			if (k.startsWith(`${sessionId}:`)) this.liveMessages.delete(k);
+		}
+		this.topicOwnerByIdentity.forEach((ownerSessionId, identityKey) => {
+			if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
+		});
+		this.pendingThreadedFrames.delete(sessionId);
+		this.liveTopicGeneration.delete(sessionId);
+		this.fencedTopicGeneration.delete(sessionId);
+	}
+
+	/**
+	 * F001 continuous-absence reconciliation driven by per-session MAPPED-root
+	 * evidence. A `present` OR `ambiguous` session (connected, live endpoint, or
+	 * an unreadable/malformed mapped root that cannot confirm absence) clears any
+	 * candidate so a fresh grace window restarts once the ambiguity resolves; an
+	 * unrelated unreadable root only withholds ITS own sessions. Only `absent`/
+	 * `missing` evidence — under a VALID lease and a strictly-valid createdAt —
+	 * may create/continue a candidate, and a candidate is reaped only once it has
+	 * survived the grace window AND its lease still matches the live lease. The
+	 * durable reap (network call) runs OUTSIDE the roots lock.
+	 */
+	private async reconcileOrphanCandidates(
+		view: RootsRegistryView,
+		absenceEvidence: Map<string, SessionAbsenceEvidence>,
+	): Promise<void> {
+		const now = this.runtime.now();
+		const paths = daemonPaths(this.opts.settings.getAgentDir());
+		for (const sessionId of this.topics.sessionIds()) {
+			const evidence = absenceEvidence.get(sessionId);
+			const candidate = view.orphanCandidates.get(sessionId);
+			// Present OR ambiguous evidence must never authorize a reap: clear any
+			// candidate so the grace window restarts once presence/ambiguity
+			// resolves. (No evidence ⇒ unmapped session ⇒ defer fail-closed.)
+			if (!evidence || evidence.kind === "present" || evidence.kind === "ambiguous") {
+				if (candidate)
+					await mutateRootsRegistry(this.fsImpl, paths.roots, v => deleteRawCandidate(v.raw, sessionId));
+				continue;
+			}
+			// Absence confirmed (absent/missing). A valid lease is REQUIRED to
+			// create or continue a candidate: a missing/invalid lease never
+			// authorizes a reap, so clear any stale candidate instead.
+			const lease = view.sessionLeases.get(sessionId);
+			if (!lease) {
+				if (candidate)
+					await mutateRootsRegistry(this.fsImpl, paths.roots, v => deleteRawCandidate(v.raw, sessionId));
+				continue;
+			}
+			const record = this.topics.get(sessionId);
+			if (!record) continue;
+			if (!this.topicPastOrphanGrace(sessionId)) continue;
+			// Skip while a 429 retry_after backoff is in effect.
+			const retryUntil = this.deletionRetryAfter.get(sessionId);
+			if (retryUntil !== undefined && now < retryUntil) continue;
+			if (!candidate) {
+				// First confirmed continuous absence: record a candidate.
+				await mutateRootsRegistry(this.fsImpl, paths.roots, v => {
+					setRawCandidate(v.raw, sessionId, {
+						observedAt: now,
+						leaseId: lease.leaseId,
+						topicId: record.topicId,
+					});
+					return true;
+				});
+				continue;
+			}
+			if (candidate.leaseId !== lease.leaseId || candidate.topicId !== record.topicId) {
+				// A fresh registration or changed topic invalidates the prior
+				// observation. Require a complete new continuous-absence window.
+				await mutateRootsRegistry(this.fsImpl, paths.roots, v => {
+					setRawCandidate(v.raw, sessionId, {
+						observedAt: now,
+						leaseId: lease.leaseId,
+						topicId: record.topicId,
+					});
+					return true;
+				});
+				continue;
+			}
+			if (now - candidate.observedAt < ORPHAN_TOPIC_GRACE_MS) continue;
+			// Reap through the fenced, durable deletion path. The live lease
+			// authorizes the deletion and scopes selective roots compaction.
+			await this.deleteTopic(sessionId, lease.leaseId);
+		}
+	}
+
+	/**
+	 * F004 crash reconciliation of the durable deletion journal, run once at
+	 * startup after topics are loaded. It validates EXACT session/topic/lease for
+	 * every effect: a terminal claim completes local cleanup WITHOUT calling
+	 * Telegram again and compacts roots for its exact lease; a nonterminal claim
+	 * for a superseded topic/gone topic is terminalized; otherwise the remote
+	 * delete is re-attempted (honoring the durable retry_after).
+	 */
+	private async reconcileDeletionJournal(): Promise<void> {
+		const effects = (await this.deletionJournal.list()).filter(
+			(e): e is ChatEffect<TelegramTopicDeletePayload> =>
+				e.transport === "telegram" &&
+				e.kind === TELEGRAM_TOPIC_DELETE_KIND &&
+				isTelegramTopicDeletePayload(e.payload) &&
+				(e.state !== "terminal" || !e.receipt?.status?.startsWith("reconciled")),
+		);
+		for (const effect of effects) {
+			const sessionId = effect.sessionId;
+			if (!sessionId || effect.payload.chatId !== this.opts.chatId) continue;
+			const payload = effect.payload;
+			const record = this.topics.get(sessionId);
+			const roots = await readRootsRegistry(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).roots);
+			const currentLease = roots.sessionLeases.get(sessionId)?.leaseId;
+			const leaseMatches = currentLease === undefined || currentLease === payload.leaseId;
+
+			if (effect.state === "terminal") {
+				this.fencedTopicIds.add(payload.topicId);
+				if (leaseMatches && record?.topicId === payload.topicId) {
+					this.finalizeTopicDeletion(sessionId);
+					await this.persistTopics().catch(() => undefined);
+				}
+				if (leaseMatches) {
+					await this.compactRootsAfterDeletion(sessionId, payload.topicId, payload.leaseId);
+				}
+				await this.deletionJournal.updateTerminalReceipt(effect.id, {
+					provider: "telegram",
+					status: leaseMatches ? "reconciled" : "reconciled_superseded",
+				});
+				continue;
+			}
+
+			// Never replay a nonterminal delete against a different registration
+			// generation. Terminalizing it releases the admission barrier without a
+			// second provider call.
+			if (!currentLease || currentLease !== payload.leaseId || record?.topicId !== payload.topicId) {
+				await this.deletionJournal
+					.terminalize(effect.id, { provider: "telegram", status: "reconciled_superseded" })
+					.catch(() => undefined);
+				continue;
+			}
+			this.fencedTopicGeneration.set(
+				sessionId,
+				this.liveTopicGeneration.get(sessionId) ?? effect.endpointGeneration,
+			);
+			this.liveTopicGeneration.delete(sessionId);
+			this.fencedTopicIds.add(payload.topicId);
+			const outcome = await this.performTopicDeletion(
+				sessionId,
+				record.topicId,
+				effect.endpointGeneration,
+				payload.leaseId,
+			);
+			if (outcome === "terminal") {
+				this.finalizeTopicDeletion(sessionId);
+				await this.persistTopics().catch(() => undefined);
+				await this.compactRootsAfterDeletion(sessionId, record.topicId, payload.leaseId);
+				await this.deletionJournal.updateTerminalReceipt(effect.id, {
+					provider: "telegram",
+					status: "reconciled",
+				});
+			}
+		}
+	}
+	/**
+	 * Selective local-roots compaction after a confirmed (terminal) deletion.
+	 * Removes ONLY the exact matching candidate/lease/session mapping for the
+	 * deleted topic + lease, re-read durably under the roots lock so a fresh
+	 * registration (different lease) or a different topic survives untouched.
+	 */
+	private async compactRootsAfterDeletion(sessionId: string, topicId: string, leaseId: string): Promise<void> {
+		const paths = daemonPaths(this.opts.settings.getAgentDir());
+		await mutateRootsRegistry(this.fsImpl, paths.roots, v => {
+			const candidate = v.orphanCandidates.get(sessionId);
+			if (candidate && candidate.topicId === topicId && candidate.leaseId === leaseId) {
+				deleteRawCandidate(v.raw, sessionId);
+			}
+			const lease = v.sessionLeases.get(sessionId);
+			if (leaseId && lease && lease.leaseId === leaseId) {
+				const root = v.sessions.get(sessionId);
+				deleteRawLease(v.raw, sessionId);
+				deleteRawSessionMapping(v.raw, sessionId);
+				if (root) deleteRawRootIfUnreferenced(v.raw, root);
+			}
+			return true;
+		});
 	}
 
 	private persistTopics(): Promise<void> {
@@ -2135,6 +3400,10 @@ export class TelegramNotificationDaemon {
 		// Restore the full serialized registry (topicId + identitySent + name) so a
 		// fresh daemon after reload does not resend identity headers or lose renames.
 		if (raw && typeof raw === "object") this.topics.load(raw);
+		// Assign a fresh per-session admission generation to every restored topic.
+		// The rate-limit pool is in-memory only, so a restart has no stale queued
+		// frames; each live topic starts a new generation its first send adopts.
+		for (const sessionId of this.topics.sessionIds()) this.ensureLiveTopicGeneration(sessionId);
 	}
 
 	/** Download a Telegram file by its file_path (from getFile) into memory. */
@@ -2285,6 +3554,12 @@ export class TelegramNotificationDaemon {
 			);
 		}
 		for (const item of batch) {
+			// F002: revalidate the stamped topic generation before any provider call.
+			// A frame whose generation no longer matches the live topic (fenced for
+			// deletion or regenerated) is dropped. Flat (non-topic) sends carry no
+			// generation and are never gated here.
+			const stampedGen = item.payload.topicGeneration;
+			if (typeof stampedGen === "number" && stampedGen !== this.liveTopicGeneration.get(item.sessionId)) continue;
 			const selectedAck = item.payload.selectedAck;
 			if (selectedAck) {
 				const { topicId } = item.payload;
@@ -2425,6 +3700,7 @@ export class TelegramNotificationDaemon {
 											richClass: undefined,
 										},
 										topicId,
+										topicGeneration: item.payload.topicGeneration,
 									},
 								});
 							}
@@ -2457,8 +3733,13 @@ export class TelegramNotificationDaemon {
 							// already shows this text); a missing/deleted backing message (or a
 							// transport error) resends so the first chunk is never lost.
 							let edited = false;
+							const release =
+								typeof stampedGen === "number"
+									? this.beginTopicOperation(item.sessionId, stampedGen)
+									: () => {};
+							if (!release) continue;
 							try {
-								const res = (await this.botApi.call("editMessageText", {
+								const res = (await this.providerBotApi.call("editMessageText", {
 									chat_id: this.opts.chatId,
 									message_id: existingId,
 									text: chunks[0],
@@ -2467,6 +3748,8 @@ export class TelegramNotificationDaemon {
 								edited = res?.ok !== false || /not modified/i.test(String(res?.description ?? ""));
 							} catch {
 								edited = false;
+							} finally {
+								release();
 							}
 							if (edited) {
 								firstMessageId = existingId;
@@ -2515,6 +3798,7 @@ export class TelegramNotificationDaemon {
 											richClass: undefined,
 										},
 										topicId,
+										topicGeneration: item.payload.topicGeneration,
 									},
 								});
 							}
@@ -2661,16 +3945,25 @@ export class TelegramNotificationDaemon {
 	}
 
 	/** Set a native reaction on an inbound thread message (best-effort). */
-	private async setReaction(messageId: number, emoji: string): Promise<void> {
-		if (!(await this.pairedChatIsPrivate())) return;
+	private async setReaction(
+		sessionId: string,
+		messageId: number,
+		emoji: string,
+		generation = this.admissionGeneration(sessionId),
+	): Promise<void> {
+		if (generation === undefined || !(await this.pairedChatIsPrivate())) return;
+		const release = this.beginTopicOperation(sessionId, generation);
+		if (!release) return;
 		try {
-			await this.botApi.call("setMessageReaction", {
+			await this.providerBotApi.call("setMessageReaction", {
 				chat_id: this.opts.chatId,
 				message_id: messageId,
 				reaction: [{ type: "emoji", emoji }],
 			});
 		} catch {
 			// Best-effort: reactions may be disallowed in the chat; never throw.
+		} finally {
+			release();
 		}
 	}
 
@@ -3137,7 +4430,7 @@ export class TelegramNotificationDaemon {
 			if (inbound.kind === "duplicate") return;
 			if (inbound.kind === "inject") {
 				const session = this.sessions.get(inbound.sessionId);
-				if (session?.ws.readyState === WebSocket.OPEN) {
+				if (session?.ws.readyState === WebSocket.OPEN && (await this.sessionAdmissionIsCurrent(session))) {
 					const attachmentResult = inbound.attachment
 						? await this.resolveInboundAttachment(inbound.attachment, inbound.sessionId)
 						: undefined;
@@ -3177,12 +4470,8 @@ export class TelegramNotificationDaemon {
 							await sendControlNotice(control.usage);
 							return;
 						}
-						if (session?.ws.readyState !== WebSocket.OPEN) {
-							await sendControlNotice("Session control unavailable: session is disconnected.");
-							return;
-						}
-						session.ws.send(
-							JSON.stringify({
+						if (
+							!(await this.sendToCurrentSession(session, {
 								type: "control_command",
 								sessionId: inbound.sessionId,
 								token: session.token,
@@ -3190,8 +4479,10 @@ export class TelegramNotificationDaemon {
 								updateId: inbound.updateId,
 								threadId: inbound.threadId,
 								command: control.command,
-							}),
-						);
+							}))
+						) {
+							await sendControlNotice("Session control unavailable: session is disconnected.");
+						}
 						return;
 					}
 					const cfg = hasMedia ? undefined : parseInThreadConfigCommand(inbound.text);
@@ -3201,20 +4492,25 @@ export class TelegramNotificationDaemon {
 					// to the ask's custom-input slot), so route the latest pending ask here.
 					const pendingAsk = cfg || hasMedia ? undefined : [...session.pending.values()].at(-1);
 					if (pendingAsk) {
-						session.ws.send(
-							JSON.stringify({
+						if (
+							!(await this.sendToCurrentSession(session, {
 								type: "reply",
 								id: pendingAsk.actionId,
 								answer: inbound.text,
 								token: session.token,
-							}),
-						);
+							}))
+						) {
+							return;
+						}
 						await this.rememberSeenUpdateId(inbound.updateId);
-						if (inbound.messageId !== undefined) await this.setReaction(inbound.messageId, QUEUED_REACTION);
+						if (inbound.messageId !== undefined) {
+							await this.setReaction(inbound.sessionId, inbound.messageId, QUEUED_REACTION);
+						}
 						return;
 					}
-					session.ws.send(
-						JSON.stringify(
+					if (
+						!(await this.sendToCurrentSession(
+							session,
 							cfg
 								? { type: "config_command", sessionId: inbound.sessionId, token: session.token, ...cfg }
 								: {
@@ -3226,16 +4522,27 @@ export class TelegramNotificationDaemon {
 										threadId: inbound.threadId,
 										images,
 									},
-						),
-					);
+						))
+					) {
+						return;
+					}
 					await this.rememberSeenUpdateId(inbound.updateId);
 					// User turns get a native delivery double-check: queued on receipt,
 					// flipped to consumed when the session acks the turn that picks it
 					// up. Config commands are not user turns and get no reaction.
 					if (!cfg && inbound.messageId !== undefined) {
-						this.inboundReactions.set(inbound.updateId, { messageId: inbound.messageId });
-						await this.setReaction(inbound.messageId, QUEUED_REACTION);
+						const generation = this.admissionGeneration(inbound.sessionId);
+						if (generation !== undefined) {
+							this.inboundReactions.set(inbound.updateId, {
+								messageId: inbound.messageId,
+								sessionId: inbound.sessionId,
+								generation,
+							});
+							await this.setReaction(inbound.sessionId, inbound.messageId, QUEUED_REACTION, generation);
+						}
 					}
+				} else if (session) {
+					this.dropSession(session, "admission_identity_mismatch");
 				}
 				return;
 			}
@@ -3248,13 +4555,27 @@ export class TelegramNotificationDaemon {
 		});
 		if (decision.kind === "reply") {
 			const session = this.sessions.get(decision.sessionId);
-			if (session?.ws.readyState !== WebSocket.OPEN || !session.pending.has(decision.actionId)) {
+			const admissionCurrent = session ? await this.sessionAdmissionIsCurrent(session) : false;
+			if (session && !admissionCurrent) this.dropSession(session, "admission_identity_mismatch");
+			if (
+				session?.ws.readyState !== WebSocket.OPEN ||
+				!session.pending.has(decision.actionId) ||
+				!admissionCurrent
+			) {
 				await this.sendStaleGuidance(callbackId);
 				return;
 			}
-			session.ws.send(
-				JSON.stringify({ type: "reply", id: decision.actionId, answer: decision.answer, token: session.token }),
-			);
+			if (
+				!(await this.sendToCurrentSession(session, {
+					type: "reply",
+					id: decision.actionId,
+					answer: decision.answer,
+					token: session.token,
+				}))
+			) {
+				await this.sendStaleGuidance(callbackId);
+				return;
+			}
 			await this.answerCallbackQueryBestEffort(callbackId);
 		} else if (decision.kind === "stale") {
 			await this.sendStaleGuidance(callbackId);
@@ -3299,17 +4620,21 @@ export class TelegramNotificationDaemon {
 		});
 		if (!this.running) return;
 		this.runtime.start();
-		this.startFlushTimer();
-		this.startScanTimer();
-		this.startTypingTimer();
 		try {
 			await this.refreshBotIdentity();
 			await this.registerBotCommands();
 			await this.loadAliases();
 			await this.loadTopics();
+			// F004: reconcile the durable deletion journal before scanning so a
+			// crash-completed (terminal) deletion finishes local cleanup without
+			// calling Telegram again, and a nonterminal claim is re-attempted.
+			await this.reconcileDeletionJournal();
 			await this.loadSeenUpdateIds();
 			await this.replyStore.load();
 			await this.runScan();
+			this.startFlushTimer();
+			this.startScanTimer();
+			this.startTypingTimer();
 			// Owner-only: start the session-lifecycle control server now that
 			// ownership is confirmed (singleton-safe). Best-effort; degrades.
 			await this.startLifecycleControl();
