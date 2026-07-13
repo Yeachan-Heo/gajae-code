@@ -4,8 +4,8 @@ import { YAML } from "bun";
 import { withFileLock } from "../../config/file-lock";
 import type { Settings } from "../../config/settings";
 import { getNotificationConfig, isTelegramConfigured } from "./config";
-import { daemonPaths } from "./daemon-paths";
-import type { TelegramDaemonOptions } from "./telegram-daemon";
+import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import type { DaemonState, TelegramDaemonOptions } from "./telegram-daemon";
 
 type TelegramDaemonRunner = {
 	run(): Promise<void>;
@@ -21,7 +21,18 @@ export interface RunDaemonInternalDeps {
 	DaemonImpl?: TelegramDaemonConstructor;
 	processPid?: number;
 	pidAlive?: (pid: number) => boolean;
+	/** Clock used by the ownership-progress watchdog; defaults to `Date.now`. */
+	now?: () => number;
+	/** Timer pair backing the ownership-progress watchdog; defaults to the globals. */
+	setInterval?: (callback: () => void, ms: number) => Timer;
+	clearInterval?: (timer: Timer) => void;
+	/** Reads persisted daemon ownership state; defaults to the real reader. */
+	readDaemonState?: (settings: Settings) => Promise<DaemonState | undefined>;
 }
+
+/** Ownership-watchdog cadence: re-check daemon state this often while running. */
+const OWNER_WATCHDOG_INTERVAL_MS = 5_000;
+const OWNER_STALL_MS = 3 * HEARTBEAT_TTL_MS;
 
 function argValue(argv: string[], name: string): string | undefined {
 	const i = argv.indexOf(name);
@@ -207,8 +218,10 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const cfg = getNotificationConfig(settings as Settings);
 	if (!isTelegramConfigured(cfg)) return;
 	const { clearTelegramControlRequest, readTelegramControlRequest } = await import("./telegram-daemon-control");
-	const Daemon: TelegramDaemonConstructor =
-		deps.DaemonImpl ?? (await import("./telegram-daemon")).TelegramNotificationDaemon;
+	const telegramDaemonModule =
+		!deps.DaemonImpl || !deps.readDaemonState ? await import("./telegram-daemon") : undefined;
+	const Daemon: TelegramDaemonConstructor = deps.DaemonImpl ?? telegramDaemonModule!.TelegramNotificationDaemon;
+	const readState = deps.readDaemonState ?? telegramDaemonModule!.readDaemonState;
 	const daemon = new Daemon({
 		settings: settings as Settings,
 		ownerId,
@@ -234,14 +247,53 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 			},
 		},
 	});
-	// Signals are a process concern: install them at the daemon-internal boundary,
-	// not inside the embeddable daemon class. SIGTERM is the reload wakeup path.
+	// Signals and the ownership watchdog are process concerns: keep them at the
+	// daemon-internal boundary rather than in the shared embeddable daemon.
 	const onSignal = (): void => daemon.requestStop("signal");
+	const now = deps.now ?? Date.now;
+	const schedule = deps.setInterval ?? setInterval;
+	const unschedule = deps.clearInterval ?? clearInterval;
+	let watchdogActive = true;
+	let watchdogTickInFlight = false;
+	let stopRequested = false;
+	let lastHeartbeatAt: number | undefined;
+	let stalledSince: number | undefined;
+	const watchdogTick = async (): Promise<void> => {
+		if (!watchdogActive || watchdogTickInFlight || stopRequested) return;
+		watchdogTickInFlight = true;
+		try {
+			const state = await readState(settings as Settings);
+			if (!watchdogActive || !state) return;
+			if (state.ownerId !== ownerId) {
+				stopRequested = true;
+				daemon.requestStop("stop");
+				return;
+			}
+			if (lastHeartbeatAt === undefined || state.heartbeatAt !== lastHeartbeatAt) {
+				lastHeartbeatAt = state.heartbeatAt;
+				stalledSince = now();
+				return;
+			}
+			stalledSince ??= now();
+			if (now() - stalledSince >= OWNER_STALL_MS) {
+				stopRequested = true;
+				daemon.requestStop("stop");
+			}
+		} catch {
+			// Missing, malformed, or temporarily unreadable state is ambiguous. Only
+			// positive supersession or observed heartbeat non-progress can stop.
+		} finally {
+			watchdogTickInFlight = false;
+		}
+	};
+	const watchdog = schedule(() => void watchdogTick(), OWNER_WATCHDOG_INTERVAL_MS);
 	process.once("SIGTERM", onSignal);
 	process.once("SIGINT", onSignal);
 	try {
 		await daemon.run();
 	} finally {
+		watchdogActive = false;
+		unschedule(watchdog);
 		process.off("SIGTERM", onSignal);
 		process.off("SIGINT", onSignal);
 	}

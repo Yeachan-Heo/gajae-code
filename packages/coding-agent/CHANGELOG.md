@@ -24,6 +24,7 @@
 - Preserved clipboard image attachments when the interactive editor clears the composer before dispatching the submit callback, so Alt+V image placeholders still send their image blocks instead of placeholder-only text (#2126).
 - Extension contexts now receive a defensive copy from `getSystemPrompt()` instead of the live mutable system-prompt array, so an in-place mutation by an in-process extension can no longer bypass context-revision tracking and serve stale display-only context-usage estimates.
 - Completed bracketed-paste input now returns a manually paged transcript to live output before the paste is dispatched, including asynchronous consumed and unconsumed paste paths.
+- Prevented orphaned background processes by reaping failed detached harness owners and their SDK session children with bounded TERM/KILL verification, making isolated ACP wire tests own and stop their exact SDK broker before deleting temporary state, and adding a cooperative Telegram daemon watchdog that stops superseded or non-progressing owners.
 
 ## [0.10.0] - 2026-07-12
 

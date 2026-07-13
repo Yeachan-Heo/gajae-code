@@ -30,6 +30,7 @@ import {
 	type RequestPermissionResponse,
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
+import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
 
 /** Minimal host→client callback impl for the SDK callbacks. */
 class OracleClient implements Client {
@@ -116,6 +117,11 @@ afterEach(async () => {
 		await teardown(oracle);
 	}
 	for (const root of cleanupRoots.splice(0)) {
+		// The broker is pre-started and owned by THIS test process for `<root>/agent`,
+		// so stop it through the exact owner handle (verified ChildProcess reap) BEFORE
+		// removing the owned root — including the failure path where `spawnOracle`
+		// threw after the pre-start but before `activeOracle` was assigned.
+		await brokerOwnerForTest(path.join(root, "agent"))?.stop();
 		await fs.promises.rm(root, { recursive: true, force: true });
 	}
 });
@@ -181,6 +187,13 @@ async function spawnOracle(): Promise<Oracle> {
 
 	const workspace = path.join(root, "workspace");
 	await fs.promises.mkdir(workspace, { recursive: true });
+
+	// Pre-start the isolated broker in THIS test process (tracked by the SDK owner
+	// map) with the same sanitized child env, so the ACP subprocess only attaches
+	// to it via discovery and never spawns — and is never orphaned — a detached
+	// broker of its own. The owned directories above already exist, so the broker
+	// can publish discovery as soon as it is ready.
+	await ensureBroker({ agentDir: path.join(root, "agent"), env });
 
 	const proc = Bun.spawn(["bun", "packages/coding-agent/src/cli.ts", "--mode", "acp", "--no-extensions"], {
 		cwd: repoRoot,

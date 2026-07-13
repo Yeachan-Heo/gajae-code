@@ -123,3 +123,83 @@ describe("SDK harness transport response validation", () => {
 		await expect(sdkTransport.sendPrompt("hello")).resolves.toEqual({ commandId: "command-id", ack: true });
 	});
 });
+describe("SDK harness child lifecycle", () => {
+	it("awaits spawned-child cleanup before reporting discovery failure", async () => {
+		const releaseStop = Promise.withResolvers<void>();
+		let stopStarted = false;
+		let settled = false;
+		const pending = createSdkSessionTransport({
+			repo: "/repo",
+			sessionId: "missing",
+			discoveryTimeoutMs: 0,
+			readEndpoint: async () => null,
+			spawn: () => ({
+				async stop() {
+					stopStarted = true;
+					await releaseStop.promise;
+				},
+			}),
+		});
+		const outcome = pending.then(
+			() => undefined,
+			error => error,
+		);
+		void outcome.then(() => {
+			settled = true;
+		});
+
+		await Bun.sleep(0);
+		expect(stopStarted).toBe(true);
+		expect(settled).toBe(false);
+		releaseStop.resolve();
+		const error = await outcome;
+		expect(error).toMatchObject({ name: "HarnessSdkTransportError", code: "endpoint_unavailable" });
+	});
+
+	it("awaits spawned-child cleanup when the connected transport closes", async () => {
+		responses = validResponses();
+		const releaseStop = Promise.withResolvers<void>();
+		let endpointReads = 0;
+		let stopStarted = false;
+		const sdkTransport = await createSdkSessionTransport({
+			repo: "/repo",
+			sessionId: "session",
+			discoveryTimeoutMs: 1_000,
+			readEndpoint: async () => (endpointReads++ === 0 ? null : { url: "ws://sdk.test", token: "token" }),
+			spawn: () => ({
+				async stop() {
+					stopStarted = true;
+					await releaseStop.promise;
+				},
+			}),
+			connect: async () => client as unknown as SdkClient,
+		});
+		let closed = false;
+		const close = sdkTransport.close().then(() => {
+			closed = true;
+		});
+
+		await Bun.sleep(0);
+		expect(stopStarted).toBe(true);
+		expect(closed).toBe(false);
+		releaseStop.resolve();
+		await close;
+		expect(closed).toBe(true);
+	});
+
+	it("surfaces spawned-child cleanup failure instead of hiding an orphan", async () => {
+		const pending = createSdkSessionTransport({
+			repo: "/repo",
+			sessionId: "missing",
+			discoveryTimeoutMs: 0,
+			readEndpoint: async () => null,
+			spawn: () => ({
+				async stop() {
+					throw new Error("exact child did not exit");
+				},
+			}),
+		});
+
+		await expect(pending).rejects.toThrow("exact child did not exit");
+	});
+});

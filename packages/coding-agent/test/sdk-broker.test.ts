@@ -1,17 +1,18 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { getSessionsDir } from "@gajae-code/utils";
 import { lifecycleArgs } from "../src/commands/sdk";
 import { Broker } from "../src/sdk/broker/broker";
+import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
 	brokerDiscoveryPath,
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
-import { ensureBroker } from "../src/sdk/broker/ensure";
+import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { readSessionLifecycleLaunchRequest } from "../src/sdk/broker/lifecycle";
 import { resolveSdkInternalSpawnCommand } from "../src/sdk/broker/runtime";
@@ -110,6 +111,57 @@ describe("SDK broker identity and discovery", () => {
 		expect(restarted.token).not.toBe(first.token);
 		const owner = (await import("../src/sdk/broker/ensure")).brokerOwnerForTest(dir);
 		await owner?.stop();
+	}, 15_000);
+	it("terminates and reaps the spawned broker when discovery times out", async () => {
+		const dir = await temp();
+		// Force ensureBroker's discovery reads to never resolve a live record so the
+		// discovery wait is doomed from the start. The real broker still spawns and
+		// stays alive as a detached daemon, which is exactly the orphan path the reap
+		// must close. Capture its pid from the discovery file (bypassing the spy)
+		// before ensureBroker times out and reaps it.
+		const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
+		try {
+			const { promise: gotPid, resolve: onPid } = Promise.withResolvers<number | undefined>();
+			void (async () => {
+				const deadline = Date.now() + 12_000;
+				while (Date.now() < deadline) {
+					try {
+						const raw = JSON.parse(await fs.readFile(brokerDiscovery.brokerDiscoveryPath(dir), "utf8")) as {
+							pid?: number;
+						};
+						if (typeof raw.pid === "number") return onPid(raw.pid);
+					} catch {}
+					await sleep(25);
+				}
+				onPid(undefined);
+			})();
+			await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(
+				"Timed out waiting for detached SDK broker discovery.",
+			);
+			const brokerPid = await gotPid;
+			// The spawned detached broker must have been terminated + reaped, not orphaned.
+			expect(typeof brokerPid).toBe("number");
+			expect(brokerDiscovery.isPidAlive(brokerPid!)).toBe(false);
+			// No owner handle leaked for the failed agent dir.
+			expect(brokerOwnerForTest(dir)).toBeUndefined();
+		} finally {
+			spy.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
+	it("fails fast and reaps the spawned broker when it exits before discovery", async () => {
+		const dir = await temp();
+		// Plant an unsupported session-index snapshot so the spawned broker's start()
+		// rejects immediately and it exits before publishing discovery. ensureBroker
+		// must take the early-exit path (not the 10s timeout) and leave no orphan.
+		await fs.mkdir(path.join(dir, "sdk", "sessions"), { recursive: true });
+		await fs.writeFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), JSON.stringify({ version: 99 }));
+		await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(/exited before discovery/);
+		// No owner handle leaked for the failed agent dir.
+		expect(brokerOwnerForTest(dir)).toBeUndefined();
+		// No discovery record was published: the broker exited before writing one.
+		await expect(fs.stat(brokerDiscoveryPath(dir))).rejects.toThrow();
+		await fs.rm(dir, { recursive: true, force: true });
 	}, 15_000);
 	it("leaves exactly one live detached broker after concurrent process startup", async () => {
 		const dir = await temp();

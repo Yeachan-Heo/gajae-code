@@ -545,6 +545,8 @@ interface OwnerSpawnResult {
 	socketKey: string | null;
 	fallbackReason: string | null;
 	blockerReason: string | null;
+	/** Exact-PID reap proof for a direct detached-owner child declared not-live (no orphan). */
+	detachedOwnerReaped?: { pid: number; verified: boolean } | null;
 }
 
 function shellQuote(value: string): string {
@@ -867,6 +869,38 @@ export default class Harness extends Command {
 			await new Promise(r => setTimeout(r, 50));
 		}
 		return false;
+	}
+	/**
+	 * Reap an exact detached-owner child the parent spawned but declared not-live. The parent
+	 * owns this PID's lifecycle (it spawned it), so shutdown is exact-owner scoped: SIGTERM, a
+	 * bounded grace wait, then SIGKILL, then verify the SAME PID exited via its exit promise.
+	 * Never name-based — the spawned Subprocess pins the exact owner identity, so a not-live
+	 * declaration must not orphan a daemon the parent brought into being.
+	 */
+	async #reapDetachedOwner(
+		child: Bun.Subprocess<"ignore", "ignore", "ignore">,
+	): Promise<{ pid: number; verified: boolean }> {
+		// A resolved exit promise proves the PID is gone; a rejection is NOT proof of exit (it may
+		// surface an error observing the subprocess), so map it to false and let the SIGKILL
+		// escalation + cleanup-uncertain surfacing handle the uncertainty.
+		const exited = child.exited.then(
+			() => true,
+			() => false,
+		);
+		const send = (signal: NodeJS.Signals): void => {
+			try {
+				child.kill(signal);
+			} catch {
+				// Kill may fail if the child already exited; the exited race below is authoritative.
+			}
+		};
+		send("SIGTERM");
+		let verified = await Promise.race([exited, Bun.sleep(2000).then(() => false)]);
+		if (!verified) {
+			send("SIGKILL");
+			verified = await Promise.race([exited, Bun.sleep(1000).then(() => false)]);
+		}
+		return { pid: child.pid, verified };
 	}
 
 	async #harnessOwnerIsolationProbe(tmuxCommand: string): Promise<OwnerIsolationProbe> {
@@ -1235,6 +1269,7 @@ export default class Harness extends Command {
 		});
 		child.unref();
 		const live = await this.#waitForOwner(root, sessionId);
+		const detachedOwnerReaped = live ? null : await this.#reapDetachedOwner(child);
 		return {
 			live,
 			runtime: "detached",
@@ -1242,6 +1277,7 @@ export default class Harness extends Command {
 			socketKey: null,
 			fallbackReason,
 			blockerReason: live ? null : "detached-owner-not-live",
+			...(detachedOwnerReaped ? { detachedOwnerReaped } : {}),
 		};
 	}
 
@@ -1311,6 +1347,7 @@ export default class Harness extends Command {
 		let ownerFallbackReason: string | null = null;
 		let ownerBlockerReason: string | null = null;
 		let ownerSocketKey: string | null = null;
+		let ownerDetachedReaped: { pid: number; verified: boolean } | null = null;
 		if (input.detach === true) {
 			const ownerSpawn = await this.#spawnDetachedOwner(root, sessionId, workspace);
 			ownerLive = ownerSpawn.live;
@@ -1318,6 +1355,7 @@ export default class Harness extends Command {
 			ownerFallbackReason = ownerSpawn.fallbackReason;
 			ownerBlockerReason = ownerSpawn.blockerReason;
 			ownerSocketKey = ownerSpawn.socketKey;
+			ownerDetachedReaped = ownerSpawn.detachedOwnerReaped ?? null;
 			handle.viewportHandle = {
 				kind: "event-monitor",
 				tmuxSessionName: ownerSpawn.tmuxSessionName,
@@ -1342,7 +1380,13 @@ export default class Harness extends Command {
 		// A live endpoint never proves a failed tmux launch safe: preserve the isolation/provenance blocker.
 		if (ownerBlockerReason) {
 			state.lifecycle = "blocked";
-			state.blockers = [...state.blockers, ownerBlockerReason];
+			// `detached-owner-not-live` is the lifecycle status; an unverified reap (the exact
+			// spawned child never confirmed exit after SIGKILL) is a stronger, distinct signal that
+			// must not be masked by the not-live blocker alone.
+			const ownerBlockers = [ownerBlockerReason];
+			if (ownerDetachedReaped && !ownerDetachedReaped.verified)
+				ownerBlockers.push("detached-owner-cleanup-uncertain");
+			state.blockers = [...state.blockers, ...ownerBlockers];
 			state.handle = handle;
 			state.updatedAt = nowIso();
 			await writeSessionState(root, state);
@@ -1358,6 +1402,7 @@ export default class Harness extends Command {
 					...(ownerSocketKey ? { tmuxOwnerSocketKey: ownerSocketKey } : {}),
 					...(ownerFallbackReason ? { ownerFallbackReason } : {}),
 					...(ownerBlockerReason ? { reason: ownerBlockerReason } : {}),
+					...(ownerDetachedReaped ? { detachedOwnerReaped: ownerDetachedReaped } : {}),
 				},
 				!ownerBlockerReason,
 			),
