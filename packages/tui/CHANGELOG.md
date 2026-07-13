@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added opt-in disabled items to `SelectList` (`SelectItem.disabled`): disabled entries render dimmed, arrow/page navigation and filter resets skip them, selection callbacks never fire for them, and lists where every item is disabled stay safe to render and navigate.
+
 ### Fixed
 
 - Terminal graphics protocols are no longer assumed under terminal multiplexers: the blind Kitty fallback for `TERM=tmux-*`/`screen-*` (and detected kitty/iTerm2 protocols leaking through multiplexer env) emitted raw graphics escapes the multiplexer consumed, leaving the Gajae composer pet invisible while its out-of-band cursor writes intermittently corrupted the TUI frame. Image protocols are now unconditionally dropped under tmux/screen/zellij (shared multiplexer predicate with the renderer host policy, including `$TMUX_PANE`, `$STY`, `$ZELLIJ`, and `GJC_TMUX_LAUNCHED`) unless `PI_FORCE_IMAGE_PROTOCOL` explicitly forces a protocol, which remains an expert override.
