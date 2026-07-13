@@ -10,7 +10,7 @@
 
 ### Fixed
 
-- ACP connections now retain independent broker-issued authority across multiple working directories. Realpath-equivalent workspace identities collapse aliases; CWD-less close/delete and idempotency bind to exact endpoint or transcript incarnations; production duplicate observations remain visible; and ambiguity synchronously revokes attached control for the connection. Scoped bindings remain atomic and pagination cursors use exact decimal grammar.
+- ACP connections now retain independent broker-issued authority across multiple working directories. Realpath-equivalent workspace identities collapse aliases; live attach/close carry endpoint generation and incarnation; saved delete/resume/fork carry the full transcript identity through the lifecycle effect; production duplicate observations remain visible; and missing, changed, or ambiguous broker authority synchronously revokes attached and reverse control. Scoped bindings remain atomic and pagination cursors use exact decimal grammar.
 
 ## [0.10.1] - 2026-07-13
 

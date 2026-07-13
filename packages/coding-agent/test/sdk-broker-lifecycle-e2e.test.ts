@@ -47,7 +47,12 @@ async function incarnation(pid: number): Promise<string> {
 
 async function liveLifecycleSession(root: string, agentDir: string, sessionId: string) {
 	const stateRoot = path.join(root, ".gjc", "state");
-	const request = { operation: "session.create", sessionId, cwd: root, stateRoot } as const;
+	const request = {
+		operation: "session.create",
+		sessionId,
+		cwd: root,
+		stateRoot,
+	} as const;
 	const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "sdk", "session-host-internal"], {
 		cwd: root,
 		env: {
@@ -346,9 +351,16 @@ setInterval(()=>{},1000);
 			throw new Error("Expected a durable lifecycle child identity.");
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${request.sessionId}.lifecycle.ready.json`),
-			JSON.stringify({ pid: fixturePid, effectMarker: request.effectMarker, incarnation }),
+			JSON.stringify({
+				pid: fixturePid,
+				effectMarker: request.effectMarker,
+				incarnation,
+			}),
 		);
-		expect(await lifecycle).toMatchObject({ ok: false, error: { code: "readiness_timeout" } });
+		expect(await lifecycle).toMatchObject({
+			ok: false,
+			error: { code: "readiness_timeout" },
+		});
 		expect(Date.now() - started).toBeLessThan(1_500);
 		expect(() => process.kill(fixturePid!, 0)).toThrow();
 	} finally {
@@ -555,7 +567,10 @@ test("broker rejects a ready foreign host for the spawned session id", async () 
 				socket.send(JSON.stringify({ type: "hello", connectionId: "foreign" }));
 			},
 			message(socket, message) {
-				const frame = JSON.parse(String(message)) as { id?: string; type?: string };
+				const frame = JSON.parse(String(message)) as {
+					id?: string;
+					type?: string;
+				};
 				if (frame.type !== "event_replay" || !frame.id) return;
 				replayRequests++;
 				void fs.readFile(foreignIdPath, "utf8").then(sessionId =>
@@ -564,7 +579,14 @@ test("broker rejects a ready foreign host for the spawned session id", async () 
 							type: "event_replay_result",
 							id: frame.id,
 							ok: true,
-							events: [{ type: "event", name: "session_ready", sessionId, generation: 1 }],
+							events: [
+								{
+									type: "event",
+									name: "session_ready",
+									sessionId,
+									generation: 1,
+								},
+							],
 						}),
 					),
 				);
@@ -650,7 +672,12 @@ test("broker refuses same-generation close authority from a prior endpoint incar
 		await fs.mkdir(path.dirname(endpoint), { recursive: true });
 		await fs.writeFile(
 			endpoint,
-			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "successor-token" }),
+			JSON.stringify({
+				sessionId,
+				pid: process.pid,
+				url: "ws://127.0.0.1:1",
+				token: "successor-token",
+			}),
 		);
 		const endpointMtimeMs = (await fs.stat(endpoint)).mtimeMs;
 		await broker.index.append({
@@ -674,10 +701,17 @@ test("broker refuses same-generation close authority from a prior endpoint incar
 		expect(
 			await broker.handleRequest(
 				"session.close",
-				{ sessionId, endpointGeneration: 1, endpointIncarnation: staleEndpointIncarnation },
+				{
+					sessionId,
+					endpointGeneration: 1,
+					endpointIncarnation: staleEndpointIncarnation,
+				},
 				"stale-incarnation-close",
 			),
-		).toEqual({ ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } });
+		).toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "session endpoint is stale" },
+		});
 		expect(await fs.readFile(endpoint, "utf8")).toContain("successor-token");
 	} finally {
 		await broker.stop();
@@ -761,7 +795,12 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "live-owner-token" }),
+			JSON.stringify({
+				sessionId,
+				pid: process.pid,
+				url: "ws://127.0.0.1:1",
+				token: "live-owner-token",
+			}),
 		);
 		await broker.index.append({
 			type: "host_registered",
@@ -790,7 +829,9 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 		}
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
-			result: { sessions: [expect.objectContaining({ sessionId, endpointGeneration: 17 })] },
+			result: {
+				sessions: [expect.objectContaining({ sessionId, endpointGeneration: 17 })],
+			},
 		});
 	} finally {
 		await broker.stop();
@@ -809,11 +850,20 @@ test("broker never signals a PID reused after its lifecycle marker was written",
 		await fs.mkdir(path.dirname(endpoint), { recursive: true });
 		await fs.writeFile(
 			endpoint,
-			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "stale" }),
+			JSON.stringify({
+				sessionId,
+				pid: process.pid,
+				url: "ws://127.0.0.1:1",
+				token: "stale",
+			}),
 		);
 		await fs.writeFile(
 			marker,
-			JSON.stringify({ pid: process.pid, effectMarker: "old-effect", incarnation: "reused-process-incarnation" }),
+			JSON.stringify({
+				pid: process.pid,
+				effectMarker: "old-effect",
+				incarnation: "reused-process-incarnation",
+			}),
 		);
 		await broker.index.append({
 			type: "host_registered",
@@ -855,11 +905,20 @@ test("broker records terminal uncertainty when SIGKILL re-verification fails aft
 		await fs.mkdir(path.dirname(endpoint), { recursive: true });
 		await fs.writeFile(
 			endpoint,
-			JSON.stringify({ sessionId, pid: child.pid, url: "ws://127.0.0.1:1", token: "unreachable" }),
+			JSON.stringify({
+				sessionId,
+				pid: child.pid,
+				url: "ws://127.0.0.1:1",
+				token: "unreachable",
+			}),
 		);
 		await fs.writeFile(
 			marker,
-			JSON.stringify({ pid: child.pid, effectMarker: "fixture", incarnation: await incarnation(child.pid) }),
+			JSON.stringify({
+				pid: child.pid,
+				effectMarker: "fixture",
+				incarnation: await incarnation(child.pid),
+			}),
 		);
 		await broker.index.append({
 			type: "host_registered",
@@ -882,7 +941,9 @@ test("broker records terminal uncertainty when SIGKILL re-verification fails aft
 		expect(await fs.readFile(marker, "utf8")).toContain('"fixture"');
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
-			result: { sessions: [expect.objectContaining({ sessionId, terminalUncertain: true })] },
+			result: {
+				sessions: [expect.objectContaining({ sessionId, terminalUncertain: true })],
+			},
 		});
 	} finally {
 		process.kill = originalKill;
@@ -917,7 +978,9 @@ if (process.platform === "darwin") {
 			expect(childPid).toBeGreaterThan(0);
 			expect(await broker.handleRequest("session.list", {})).toMatchObject({
 				ok: true,
-				result: { sessions: [expect.objectContaining({ terminalUncertain: true })] },
+				result: {
+					sessions: [expect.objectContaining({ terminalUncertain: true })],
+				},
 			});
 		} finally {
 			if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
@@ -950,7 +1013,16 @@ test("broker starts from the production broker entrypoint with no sessions", asy
 		expect(discovery.url).toStartWith("ws://127.0.0.1:");
 		expect(await broker.handleRequest("session.list", {})).toEqual({
 			ok: true,
-			result: { indexSeq: 0, sessions: [], warnings: [] },
+			result: {
+				indexSeq: 0,
+				sessions: [],
+				warnings: [],
+				brokerIdentity: {
+					ownerId: discovery.ownerId,
+					packageGeneration: discovery.packageGeneration,
+					startedAt: discovery.startedAt,
+				},
+			},
 			indexSeq: 0,
 		});
 	} finally {
@@ -966,11 +1038,22 @@ test("shipped sdk session-host-internal stays alive only after a semantic ready 
 	brokerDirs.push(agentDir);
 	try {
 		const { child, endpoint } = await liveLifecycleSession(root, agentDir, sessionId);
-		const client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 2_000, reconnectAttempts: 0 });
+		const client = await SdkClient.connect(endpoint.url, endpoint.token, {
+			timeoutMs: 2_000,
+			reconnectAttempts: 0,
+		});
 		try {
-			const replay = await client.request({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 });
+			const replay = await client.request({
+				type: "event_replay",
+				sinceGeneration: 1,
+				sinceSeq: 0,
+			});
 			expect(replay.events).toContainEqual(
-				expect.objectContaining({ type: "event", name: "session_ready", sessionId }),
+				expect.objectContaining({
+					type: "event",
+					name: "session_ready",
+					sessionId,
+				}),
 			);
 			expect(child.exitCode).toBeNull();
 			expect(await client.query("session.metadata")).toMatchObject({
@@ -1019,9 +1102,15 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 			error: { code: "resource_gone" },
 		});
 		await expect(
-			SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 250, reconnectAttempts: 0 }),
+			SdkClient.connect(endpoint.url, endpoint.token, {
+				timeoutMs: 250,
+				reconnectAttempts: 0,
+			}),
 		).rejects.toThrow();
-		expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true, result: { sessions: [] } });
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			ok: true,
+			result: { sessions: [] },
+		});
 		expect(
 			(await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
 				.split("\n")
@@ -1045,7 +1134,10 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 		expect(await acp.listSessions({})).toEqual({ sessions: [] });
 		expect(await readSdkBrokerDiscovery(agentDirs[0])).not.toBeNull();
 
-		const mcp = createSdkMcpServer({ repo: path.join(root, "mcp"), agentDir: agentDirs[1] });
+		const mcp = createSdkMcpServer({
+			repo: path.join(root, "mcp"),
+			agentDir: agentDirs[1],
+		});
 		expect(await mcp.callTool("gjc_session_global", { operation: "session.list" })).toMatchObject({
 			ok: true,
 			result: { sessions: [] },
@@ -1054,7 +1146,12 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 
 		const output: unknown[] = [];
 		await runSdkSessionCli(
-			{ action: "global", operation: "session.list", agentDir: agentDirs[2], repo: path.join(root, "daemon") },
+			{
+				action: "global",
+				operation: "session.list",
+				agentDir: agentDirs[2],
+				repo: path.join(root, "daemon"),
+			},
 			value => output.push(value),
 		);
 		expect(output).toMatchObject([{ ok: true, result: { sessions: [] } }]);

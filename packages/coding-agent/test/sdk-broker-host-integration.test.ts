@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
-import { SessionIndex } from "../src/sdk/broker/session-index";
+import { endpointIncarnation, SessionIndex } from "../src/sdk/broker/session-index";
 
 const event = (
 	type: "host_registered" | "host_heartbeat" | "host_unregistered",
@@ -32,9 +32,25 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 		await busIndex.append(event("host_registered", "live", stateRoot, endpointMtimeMs));
 		await busIndex.append(event("host_heartbeat", "live", stateRoot));
 		await busIndex.append(event("host_heartbeat", "live", stateRoot));
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "live", endpointGeneration: 1 })).toEqual({
+		const liveEndpointIncarnation = endpointIncarnation(
+			{ endpointGeneration: 1, pid: process.pid, endpointMtimeMs },
+			"live",
+		)!;
+		expect(
+			await broker.handleRequest("session.get_endpoint", {
+				sessionId: "live",
+				endpointGeneration: 1,
+				endpointIncarnation: liveEndpointIncarnation,
+			}),
+		).toEqual({
 			ok: true,
-			result: { sessionId: "live", pid: process.pid, token: "session-secret" },
+			result: {
+				sessionId: "live",
+				pid: process.pid,
+				token: "session-secret",
+				endpointGeneration: 1,
+				endpointIncarnation: liveEndpointIncarnation,
+			},
 		});
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,

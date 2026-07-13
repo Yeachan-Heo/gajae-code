@@ -132,6 +132,22 @@ function hasValidTranscriptAuthority(path: unknown, identity: unknown): path is 
 	return typeof path === "string" && path.length > 0 && isSessionLifecycleTranscriptIdentity(identity);
 }
 
+/**
+ * Compares an optional caller-supplied transcript identity against the freshly
+ * validated transcript. Non-ACP callers may omit the identity (compatibility);
+ * any supplied identity that does not match all five fields returns endpoint_stale
+ * before any launch effect.
+ */
+function rejectStaleSuppliedIdentity(
+	supplied: unknown,
+	validated: SessionLifecycleTranscriptIdentity,
+): BrokerResponse | undefined {
+	if (supplied === undefined) return undefined;
+	if (!isSessionLifecycleTranscriptIdentity(supplied) || !sameTranscriptIdentity(supplied, validated))
+		return fail("endpoint_stale", "Saved session transcript identity is stale.");
+	return undefined;
+}
+
 export function readSessionLifecycleLaunchRequest(value: string | undefined): SessionLifecycleLaunchRequest {
 	if (!value) throw new Error("GJC_SDK_LIFECYCLE_REQUEST is required.");
 	const request = JSON.parse(value) as Partial<SessionLifecycleLaunchRequest>;
@@ -321,7 +337,11 @@ function validateSavedTranscript(
 	if (matches.length !== 1 || !isCanonicalSessionId(matches[0]!.id))
 		return fail("invalid_input", `${label} saved session does not match the requested workspace and session id.`);
 	const match = matches[0]!;
-	return { path: match.path, id: match.id, identity: serializeTranscriptIdentity(match.identity) };
+	return {
+		path: match.path,
+		id: match.id,
+		identity: serializeTranscriptIdentity(match.identity),
+	};
 }
 async function validateLiveResumeScope(
 	broker: Broker,
@@ -451,14 +471,24 @@ export interface ProcessIncarnationOptions {
 
 function runProcessIncarnationCommand(command: string, args: readonly string[]): ProcessIncarnationCommandResult {
 	try {
-		const result = Bun.spawnSync([command, ...args], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
-		return { exitCode: result.exitCode, stdout: Buffer.from(result.stdout).toString("utf8") };
+		const result = Bun.spawnSync([command, ...args], {
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "ignore",
+		});
+		return {
+			exitCode: result.exitCode,
+			stdout: Buffer.from(result.stdout).toString("utf8"),
+		};
 	} catch {
 		return undefined;
 	}
 }
 
-function windowsProcessIncarnationCommand(pid: number): { command: string; args: string[] } {
+function windowsProcessIncarnationCommand(pid: number): {
+	command: string;
+	args: string[];
+} {
 	return {
 		command: POWERSHELL_PROCESS_INCARNATION_COMMAND,
 		args: [
@@ -630,7 +660,9 @@ async function readEffectMarker(file: string): Promise<EffectMarker | undefined>
 
 async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
 	await fs.mkdir(path.join(root, "sdk"), { recursive: true, mode: 0o700 });
-	await fs.writeFile(lifecycleMarkerPath(root, id), JSON.stringify(marker), { mode: 0o600 });
+	await fs.writeFile(lifecycleMarkerPath(root, id), JSON.stringify(marker), {
+		mode: 0o600,
+	});
 }
 
 /** The child writes this only after its endpoint and semantic ready event are both live. */
@@ -686,7 +718,9 @@ async function removeOwnedLifecycleArtifacts(root: string, id: string, expected:
 		return;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
 	try {
-		const endpoint = JSON.parse(await fs.readFile(endpointPath, "utf8")) as { pid?: unknown };
+		const endpoint = JSON.parse(await fs.readFile(endpointPath, "utf8")) as {
+			pid?: unknown;
+		};
 		if (endpoint.pid === expected.pid && hasObservedProcessExit(expected.pid))
 			await fs.rm(endpointPath, { force: true });
 	} catch {}
@@ -816,7 +850,11 @@ async function endpointRemoved(root: string, id: string): Promise<boolean> {
 async function waitForClose(
 	broker: Broker,
 	id: string,
-	record: { locator: { stateRoot: string }; endpointGeneration: number; pid: number },
+	record: {
+		locator: { stateRoot: string };
+		endpointGeneration: number;
+		pid: number;
+	},
 	timeoutMs: number,
 ): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
@@ -1030,6 +1068,8 @@ async function launchInput(
 		if (!savedPath) return fail("invalid_input", "sessionPath is required to resume a saved session.");
 		const saved = validateSavedTranscript(broker, cwd, savedPath, requested, "Saved");
 		if ("ok" in saved) return saved;
+		const stale = rejectStaleSuppliedIdentity(input.sessionIdentity, saved.identity);
+		if (stale) return stale;
 		return {
 			id: requested,
 			cwd,
@@ -1049,6 +1089,8 @@ async function launchInput(
 		return fail("invalid_input", "sourceSessionId or sourceSessionPath is required to fork a session.");
 	const source = validateSavedTranscript(broker, sourceCwd, sourceSessionPath, sourceSessionId, "Source");
 	if ("ok" in source) return source;
+	const stale = rejectStaleSuppliedIdentity(input.sourceSessionIdentity, source.identity);
+	if (stale) return stale;
 	return {
 		id: randomUUID(),
 		cwd,
@@ -1134,7 +1176,11 @@ async function validateDeletePath(
 		const firstLine = Buffer.from(
 			snapshot.bytes.subarray(0, newline === -1 ? snapshot.bytes.length : newline),
 		).toString("utf8");
-		const header = JSON.parse(firstLine) as { type?: unknown; id?: unknown; cwd?: unknown };
+		const header = JSON.parse(firstLine) as {
+			type?: unknown;
+			id?: unknown;
+			cwd?: unknown;
+		};
 		if (header.type !== "session" || header.id !== id)
 			return fail("invalid_input", "session.delete path does not contain the requested session.");
 		if (typeof header.cwd !== "string")
@@ -1154,12 +1200,21 @@ async function validateDeletePath(
 			transcriptPath: resolved,
 			sessionId: id,
 			cwd,
-			transcriptIdentity: { dev: snapshot.stat.dev, ino: snapshot.stat.ino },
+			transcriptIdentity: {
+				dev: snapshot.stat.dev,
+				ino: snapshot.stat.ino,
+				size: snapshot.stat.size,
+				mtimeMs: snapshot.stat.mtimeMs,
+				mtimeNs: snapshot.stat.mtimeNs,
+			},
 		},
 		metadataRoot: requestedRoot,
 	};
 }
-type CloseAuthority = { endpointGeneration: number; endpointIncarnation: string };
+type CloseAuthority = {
+	endpointGeneration: number;
+	endpointIncarnation: string;
+};
 type CloseRecord = {
 	locator: { repo: string; stateRoot: string };
 	endpointGeneration: number;
@@ -1490,7 +1545,10 @@ export async function executeLifecycle(
 		if ("error" in requestedAuthority) return requestedAuthority.error;
 		if (requestedAuthority.authority && !sameCloseAuthority(requestedAuthority.authority, record, id))
 			return fail("endpoint_stale", "session endpoint is stale");
-		await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, effectMarker: randomUUID() });
+		await broker.ledger.transition(identity, "effect_started", {
+			intendedSessionId: id,
+			effectMarker: randomUUID(),
+		});
 
 		let usedSignalFallback = false;
 		let note: string | undefined;
@@ -1608,7 +1666,10 @@ export async function executeLifecycle(
 		if (record?.live) return fail("live_session", "Refusing to delete a live session; close it first.");
 		const validated = await validateDeletePath(broker, input, id, record);
 		if ("ok" in validated) return validated;
-		await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, effectMarker: randomUUID() });
+		await broker.ledger.transition(identity, "effect_started", {
+			intendedSessionId: id,
+			effectMarker: randomUUID(),
+		});
 		let deleted: Awaited<ReturnType<FileSessionStorage["deleteSessionVerified"]>>;
 		try {
 			deleted = await validated.storage.deleteSessionVerified(validated.target);
@@ -1653,7 +1714,9 @@ export async function executeLifecycle(
 				pid: record.pid,
 			});
 		try {
-			await fs.rm(lifecycleMarkerPath(validated.metadataRoot, id), { force: true });
+			await fs.rm(lifecycleMarkerPath(validated.metadataRoot, id), {
+				force: true,
+			});
 		} catch (error) {
 			return fail(
 				"cleanup_pending",

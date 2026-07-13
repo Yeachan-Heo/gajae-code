@@ -81,12 +81,22 @@ interface PromptWaiter {
 
 type PromptCorrelation = { commandId?: string; turnId?: string };
 
-type BrokerConnection = { adapter: AcpSdkAdapter; client: SdkClient };
+type BrokerConnection = {
+	adapter: AcpSdkAdapter;
+	client: SdkClient;
+};
 type PendingAttachment = { epoch: number; task: Promise<void> };
+type ReverseGate = {
+	sessionId: string;
+	epoch: number;
+	broker: BrokerIdentity;
+	adapter: AcpSdkAdapter | undefined;
+};
 
 type SessionRecord = {
 	cwd: string;
 	canonicalCwd: string;
+	broker: BrokerIdentity;
 	adapter: AcpSdkAdapter;
 	unsubscribe: () => void;
 	reconnectUnsubscribe: () => void;
@@ -123,8 +133,21 @@ type SavedSessionIdentity = {
 	mtimeMs: number;
 	mtimeNs: string;
 };
-type LiveSessionAuthority = { endpointGeneration: number; endpointIncarnation: string };
+type LiveSessionAuthority = {
+	endpointGeneration: number;
+	endpointIncarnation: string;
+};
 type SavedSessionAuthority = { path: string; identity: SavedSessionIdentity };
+/**
+ * Broker boot identity exposed by discovery and every `session.list` result. The
+ * random ownerId is the authority discriminator; package generation and start
+ * time are diagnostic metadata and cannot extend authority across owner changes.
+ */
+type BrokerIdentity = {
+	ownerId: string;
+	packageGeneration: string;
+	startedAt: number;
+};
 
 /**
  * Connection authority is broker-issued, not lexical. Each scoped observation
@@ -134,6 +157,7 @@ type SavedSessionAuthority = { path: string; identity: SavedSessionIdentity };
 type SessionAuthority = {
 	canonicalCwd: string;
 	live?: LiveSessionAuthority;
+	broker: BrokerIdentity;
 	saved?: SavedSessionAuthority;
 };
 
@@ -202,6 +226,27 @@ function savedAuthority(value: unknown): SavedSessionAuthority | undefined {
 	if (typeof sessionPath !== "string" || !sessionPath || !identity) return undefined;
 	return { path: sessionPath, identity };
 }
+/** Broker boot identity exposed by discovery and every session.list result. */
+function brokerIdentity(value: unknown): BrokerIdentity | undefined {
+	const candidate = object(value);
+	if (!candidate) return undefined;
+	const { ownerId, packageGeneration, startedAt } = candidate;
+	if (
+		typeof ownerId !== "string" ||
+		!ownerId ||
+		typeof packageGeneration !== "string" ||
+		!packageGeneration ||
+		typeof startedAt !== "number" ||
+		!Number.isSafeInteger(startedAt) ||
+		startedAt <= 0
+	)
+		return undefined;
+	return { ownerId, packageGeneration, startedAt };
+}
+
+function sameBrokerIdentity(left: BrokerIdentity, right: BrokerIdentity): boolean {
+	return left.ownerId === right.ownerId;
+}
 
 /**
  * Canonical scope of a broker observation. The broker exposes a per-session
@@ -265,12 +310,14 @@ export function paginateAcpSessions(listed: unknown[], cwd: string | undefined, 
 			if (canonical) return path.resolve(canonical) === path.resolve(cwd);
 			return path.resolve(value.locator.repo) === path.resolve(cwd);
 		});
-	const sessions = filtered
-		.slice(offset, offset + SESSION_PAGE_SIZE)
-		.map(
-			value =>
-				({ sessionId: value.sessionId, cwd: value.locator.repo, title: value.sessionId }) satisfies SessionInfo,
-		);
+	const sessions = filtered.slice(offset, offset + SESSION_PAGE_SIZE).map(
+		value =>
+			({
+				sessionId: value.sessionId,
+				cwd: value.locator.repo,
+				title: value.sessionId,
+			}) satisfies SessionInfo,
+	);
 	return {
 		sessions,
 		nextCursor: offset + sessions.length < filtered.length ? String(offset + sessions.length) : undefined,
@@ -357,7 +404,10 @@ export type TranscriptReplayBlock = { type: "text"; text: string } | { type: "im
  */
 export interface TranscriptReplayContent {
 	blocks: TranscriptReplayBlock[];
-	images: { available: false; reason: "historical_transcript_images_unavailable" };
+	images: {
+		available: false;
+		reason: "historical_transcript_images_unavailable";
+	};
 }
 
 export function transcriptReplayContent(entry: unknown): TranscriptReplayContent {
@@ -369,7 +419,10 @@ export function transcriptReplayContent(entry: unknown): TranscriptReplayContent
 		);
 	return {
 		blocks: record.body.length > 0 ? [{ type: "text", text: record.body }] : [],
-		images: { available: false, reason: "historical_transcript_images_unavailable" },
+		images: {
+			available: false,
+			reason: "historical_transcript_images_unavailable",
+		},
 	};
 }
 
@@ -592,7 +645,9 @@ export async function applyAcpPermissionMode(
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
 	const mode = resolveAcpPermissionMode(capabilities, env);
-	await adapter.control("permission_mode.set", { mode: mode === "prompt" ? "prompt" : "allow" });
+	await adapter.control("permission_mode.set", {
+		mode: mode === "prompt" ? "prompt" : "allow",
+	});
 }
 
 /** Applies CLI-provided ACP startup settings through SDK controls before session exposure. */
@@ -634,7 +689,9 @@ export function createAcpExtensionUiContext(
 	): Promise<unknown> => {
 		if (!capabilities?.elicitation?.form || dialog?.signal?.aborted) return undefined;
 		const request = (
-			connection as unknown as { unstable_createElicitation(input: JsonObject): Promise<JsonObject> }
+			connection as unknown as {
+				unstable_createElicitation(input: JsonObject): Promise<JsonObject>;
+			}
 		).unstable_createElicitation({
 			sessionId: getSessionId(),
 			message,
@@ -697,6 +754,7 @@ export class AcpAgent implements Agent {
 	readonly #sessionEpochs = new Map<string, number>();
 	readonly #tearingDown = new Map<string, number>();
 	#clientCapabilities: ClientCapabilities | undefined;
+	#brokerIdentity: BrokerIdentity | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	#disposed = false;
@@ -739,12 +797,22 @@ export class AcpAgent implements Agent {
 		}
 		return {
 			protocolVersion: PROTOCOL_VERSION,
-			agentInfo: { name: "gajae-code", title: "Gajae Code", version: packageJson.version },
+			agentInfo: {
+				name: "gajae-code",
+				title: "Gajae Code",
+				version: packageJson.version,
+			},
 			authMethods,
 			agentCapabilities: {
 				loadSession: true,
 				promptCapabilities: { embeddedContext: true, image: true },
-				sessionCapabilities: { list: {}, fork: {}, resume: {}, close: {}, delete: {} },
+				sessionCapabilities: {
+					list: {},
+					fork: {},
+					resume: {},
+					close: {},
+					delete: {},
+				},
 			},
 		};
 	}
@@ -806,7 +874,9 @@ export class AcpAgent implements Agent {
 			{
 				cwd: params.cwd,
 				sourceSessionId: params.sessionId,
-				sourceSessionPath: source,
+				sourceSessionPath: source.path,
+				sourceSessionIdentity: source.identity,
+				brokerOwnerId: this.#sessionBrokerOwnerId(params.sessionId),
 				target: { path: params.cwd },
 			},
 			randomUUID(),
@@ -830,6 +900,7 @@ export class AcpAgent implements Agent {
 			await (await this.#brokerAdapter()).global("session.list", params.cwd ? { cwd: params.cwd } : undefined),
 		);
 		const listing = object(response?.result) ?? response;
+		this.#observeBrokerIdentity(listing);
 		const listed = Array.isArray(listing?.sessions) ? listing.sessions : [];
 		const observations =
 			Array.isArray(listing?.observations) && listing.observations.length > 0 ? listing.observations : listed;
@@ -845,7 +916,10 @@ export class AcpAgent implements Agent {
 			if (typeof candidate?.sessionId !== "string") continue;
 			const scope = brokerSessionScope(candidate);
 			if (!scope) continue;
-			const entry = observed.get(candidate.sessionId) ?? { count: 0, scopes: new Set<string>() };
+			const entry = observed.get(candidate.sessionId) ?? {
+				count: 0,
+				scopes: new Set<string>(),
+			};
 			entry.count++;
 			entry.scopes.add(scope);
 			observed.set(candidate.sessionId, entry);
@@ -891,6 +965,7 @@ export class AcpAgent implements Agent {
 			return {};
 		}
 		const current = await this.#currentLiveAuthority(params.sessionId, authority.canonicalCwd);
+		this.#assertSessionNotAmbiguous(params.sessionId);
 		if (
 			!current ||
 			current.endpointGeneration !== live.endpointGeneration ||
@@ -911,6 +986,7 @@ export class AcpAgent implements Agent {
 						sessionId: params.sessionId,
 						endpointGeneration: live.endpointGeneration,
 						endpointIncarnation: live.endpointIncarnation,
+						brokerOwnerId: authority.broker.ownerId,
 					},
 					this.#lifecycleIdempotencyKey(params.sessionId, "session.close", live.endpointIncarnation),
 				);
@@ -939,6 +1015,7 @@ export class AcpAgent implements Agent {
 		if (!live && !authority.saved) return {};
 		if (live) {
 			const current = await this.#currentLiveAuthority(params.sessionId, cwd);
+			this.#assertSessionNotAmbiguous(params.sessionId);
 			if (
 				!current ||
 				current.endpointGeneration !== live.endpointGeneration ||
@@ -960,6 +1037,7 @@ export class AcpAgent implements Agent {
 							sessionId: params.sessionId,
 							endpointGeneration: live.endpointGeneration,
 							endpointIncarnation: live.endpointIncarnation,
+							brokerOwnerId: authority.broker.ownerId,
 						},
 						this.#lifecycleIdempotencyKey(params.sessionId, "session.close", live.endpointIncarnation),
 					);
@@ -983,6 +1061,7 @@ export class AcpAgent implements Agent {
 					sessionId: params.sessionId,
 					sessionPath: saved.path,
 					sessionIdentity: saved.identity,
+					brokerOwnerId: authority.broker.ownerId,
 					cwd,
 					target: { path: cwd },
 				},
@@ -998,10 +1077,15 @@ export class AcpAgent implements Agent {
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		if (params.modeId !== ACP_DEFAULT_MODE_ID && params.modeId !== ACP_PLAN_MODE_ID)
 			throw new Error(`Unsupported ACP mode: ${params.modeId}`);
-		await this.#adapter(params.sessionId).control("mode.plan.set", { on: params.modeId === ACP_PLAN_MODE_ID });
+		await this.#adapter(params.sessionId).control("mode.plan.set", {
+			on: params.modeId === ACP_PLAN_MODE_ID,
+		});
 		await this.#publishSessionUpdate(params.sessionId, {
 			sessionId: params.sessionId,
-			update: { sessionUpdate: "current_mode_update", currentModeId: params.modeId },
+			update: {
+				sessionUpdate: "current_mode_update",
+				currentModeId: params.modeId,
+			},
 		});
 		return {};
 	}
@@ -1011,24 +1095,34 @@ export class AcpAgent implements Agent {
 			throw new Error(`Unsupported boolean ACP config option: ${params.configId}`);
 		switch (params.configId) {
 			case MODE_CONFIG_ID:
-				await this.setSessionMode({ sessionId: params.sessionId, modeId: params.value });
+				await this.setSessionMode({
+					sessionId: params.sessionId,
+					modeId: params.value,
+				});
 				break;
 			case MODEL_CONFIG_ID:
 				await this.#adapter(params.sessionId).setModel(params.value);
 				break;
 			case THINKING_CONFIG_ID:
-				await this.#adapter(params.sessionId).control("thinking.set", { level: params.value });
+				await this.#adapter(params.sessionId).control("thinking.set", {
+					level: params.value,
+				});
 				break;
 			default: {
 				const operation = ACP_CONFIG_CONTROL_OPERATIONS[params.configId];
 				if (!operation) throw new Error(`Unknown ACP config option: ${params.configId}`);
-				await this.#adapter(params.sessionId).control(operation, { mode: params.value });
+				await this.#adapter(params.sessionId).control(operation, {
+					mode: params.value,
+				});
 			}
 		}
 		const state = await this.#sessionState(params.sessionId);
 		await this.#publishSessionUpdate(params.sessionId, {
 			sessionId: params.sessionId,
-			update: { sessionUpdate: "config_option_update", configOptions: state.configOptions ?? [] },
+			update: {
+				sessionUpdate: "config_option_update",
+				configOptions: state.configOptions ?? [],
+			},
 		});
 		return { configOptions: state.configOptions ?? [] };
 	}
@@ -1060,7 +1154,10 @@ export class AcpAgent implements Agent {
 						text: payload.text,
 						...(payload.images.length ? { images: payload.images } : {}),
 					})
-					.then(acknowledgement => ({ kind: "acknowledged" as const, acknowledgement })),
+					.then(acknowledgement => ({
+						kind: "acknowledged" as const,
+						acknowledgement,
+					})),
 				response.then(value => ({ kind: "settled" as const, value })),
 			]);
 			if (first.kind === "settled") return first.value;
@@ -1151,6 +1248,14 @@ export class AcpAgent implements Agent {
 		return scope ? `acp:${operation}:${id}:${scope}` : `acp:${operation}:${id}`;
 	}
 
+	#sessionBrokerOwnerId(id: string): string {
+		this.#assertSessionNotAmbiguous(id);
+		const authority = this.#sessionAuthority.get(id);
+		if (!authority)
+			throw new AcpSdkAdapterError("unavailable", `Broker did not issue boot authority for ACP session ${id}.`);
+		return authority.broker.ownerId;
+	}
+
 	#isAlreadyGone(error: unknown): boolean {
 		return (
 			typeof error === "object" &&
@@ -1162,6 +1267,39 @@ export class AcpAgent implements Agent {
 	#assertSessionNotAmbiguous(id: string): void {
 		if (this.#ambiguousSessionIds.has(id))
 			throw new AcpSdkAdapterError("conflict", `ACP session ${id} has ambiguous cwd authority.`);
+	}
+	/**
+	 * Capture the broker boot identity from discovery or a session.list result.
+	 * Missing identity is fail-closed because no session authority may outlive or
+	 * cross an unidentified broker process.
+	 */
+	#observeBrokerIdentity(result: JsonObject | undefined): void {
+		const identity = brokerIdentity(result?.brokerIdentity);
+		if (!identity) {
+			this.#markAllSessionsAmbiguous();
+			this.#brokerIdentity = undefined;
+			throw new AcpSdkAdapterError("unavailable", "SDK broker did not issue a valid boot identity.");
+		}
+		const current = this.#brokerIdentity;
+		this.#brokerIdentity = identity;
+		if (current && !sameBrokerIdentity(current, identity)) this.#markAllSessionsAmbiguous();
+	}
+
+	#requireBrokerIdentity(): BrokerIdentity {
+		const identity = this.#brokerIdentity;
+		if (identity) return identity;
+		this.#markAllSessionsAmbiguous();
+		throw new AcpSdkAdapterError("unavailable", "SDK broker boot identity is unavailable.");
+	}
+
+	#markAllSessionsAmbiguous(): void {
+		const ids = new Set([
+			...this.#sessionAuthority.keys(),
+			...this.#sessions.keys(),
+			...this.#attaching.keys(),
+			...this.#resolvingExisting.keys(),
+		]);
+		for (const id of ids) this.#markSessionAmbiguous(id);
 	}
 
 	/**
@@ -1202,8 +1340,14 @@ export class AcpAgent implements Agent {
 	#bindSessionAuthority(id: string, canonicalCwd: string): void {
 		this.#validateSessionAuthorityBinding(id, canonicalCwd);
 		const existing = this.#sessionAuthority.get(id);
+		const observedBroker = this.#requireBrokerIdentity();
+		if (existing && !sameBrokerIdentity(existing.broker, observedBroker)) {
+			this.#markSessionAmbiguous(id);
+			throw new AcpSdkAdapterError("conflict", `ACP session ${id} broker authority changed after issuance.`);
+		}
 		this.#sessionAuthority.set(id, {
 			canonicalCwd: path.resolve(canonicalCwd),
+			broker: observedBroker,
 			live: existing?.live,
 			saved: existing?.saved,
 		});
@@ -1214,7 +1358,9 @@ export class AcpAgent implements Agent {
 		const existing = this.#sessionAuthority.get(id);
 		const observedLive = liveAuthority(session);
 		const observedSaved = savedAuthority(session);
+		const observedBroker = this.#requireBrokerIdentity();
 		if (
+			(existing && !sameBrokerIdentity(existing.broker, observedBroker)) ||
 			(existing?.live &&
 				observedLive &&
 				(existing.live.endpointGeneration !== observedLive.endpointGeneration ||
@@ -1226,6 +1372,7 @@ export class AcpAgent implements Agent {
 		}
 		this.#sessionAuthority.set(id, {
 			canonicalCwd: path.resolve(canonicalCwd),
+			broker: observedBroker,
 			live: existing?.live ?? observedLive,
 			saved: existing?.saved ?? observedSaved,
 		});
@@ -1238,7 +1385,12 @@ export class AcpAgent implements Agent {
 			this.#markSessionAmbiguous(id);
 			throw new AcpSdkAdapterError("conflict", `ACP session ${id} saved transcript authority changed.`);
 		}
-		this.#sessionAuthority.set(id, { canonicalCwd: existing.canonicalCwd, live: existing.live, saved });
+		this.#sessionAuthority.set(id, {
+			canonicalCwd: existing.canonicalCwd,
+			broker: existing.broker,
+			live: existing.live,
+			saved,
+		});
 	}
 
 	async #attachExisting(id: string, cwd: string): Promise<void> {
@@ -1285,7 +1437,11 @@ export class AcpAgent implements Agent {
 		const indexed = await this.#scopedBrokerSession(id, cwd);
 		this.#assertSessionEpoch(id, epoch);
 		if (indexed?.live) {
-			const result = await this.#brokerEndpoint(id, indexed.endpointGeneration);
+			const authority = liveAuthority(indexed);
+			if (!authority) throw new AcpSdkAdapterError("unavailable", `Broker did not issue live authority for ${id}.`);
+			const result = await this.#brokerEndpoint(id, authority);
+			this.#assertSessionEpoch(id, epoch);
+			await this.#revalidateLiveAuthority(id, authority);
 			this.#assertSessionEpoch(id, epoch);
 			await this.#attach(id, cwd, endpoint(result), epoch);
 			return;
@@ -1295,7 +1451,14 @@ export class AcpAgent implements Agent {
 		this.#assertSessionEpoch(id, epoch);
 		const result = await (await this.#brokerAdapter()).global(
 			"session.resume",
-			{ cwd, sessionId: id, sessionPath: saved, target: { path: cwd } },
+			{
+				cwd,
+				sessionId: id,
+				sessionPath: saved.path,
+				sessionIdentity: saved.identity,
+				brokerOwnerId: this.#sessionBrokerOwnerId(id),
+				target: { path: cwd },
+			},
 			randomUUID(),
 		);
 		this.#assertSessionEpoch(id, epoch);
@@ -1308,6 +1471,7 @@ export class AcpAgent implements Agent {
 		this.#assertSessionNotAmbiguous(id);
 		const response = object(await (await this.#brokerAdapter()).global("session.list", { cwd }));
 		const result = object(response?.result) ?? response;
+		this.#observeBrokerIdentity(result);
 		const canonicalCwd =
 			typeof result?.canonicalCwd === "string" ? path.resolve(result.canonicalCwd) : path.resolve(cwd);
 		const listed = Array.isArray(result?.sessions) ? result.sessions : [];
@@ -1374,19 +1538,27 @@ export class AcpAgent implements Agent {
 	async #attachEndpoint(id: string, cwd: string, discovered: Endpoint, epoch: number): Promise<void> {
 		let adapter: AcpSdkAdapter | undefined;
 		try {
-			adapter = await AcpSdkAdapter.connect({
-				url: discovered.url,
-				token: discovered.token,
-				connection: this.#reverseConnection(id),
-				providers: this.#providers(),
-			});
-			this.#assertSessionEpoch(id, epoch);
 			const authority = this.#sessionAuthority.get(id);
 			if (!authority)
 				throw new AcpSdkAdapterError("unavailable", `Broker did not issue authority for ACP session ${id}.`);
+			const gate: ReverseGate = {
+				sessionId: id,
+				epoch,
+				broker: authority.broker,
+				adapter: undefined,
+			};
+			adapter = await AcpSdkAdapter.connect({
+				url: discovered.url,
+				token: discovered.token,
+				connection: this.#reverseConnection(id, gate),
+				providers: this.#providers(),
+			});
+			gate.adapter = adapter;
+			this.#assertSessionEpoch(id, epoch);
 			const record: SessionRecord = {
 				cwd,
 				canonicalCwd: authority.canonicalCwd,
+				broker: authority.broker,
 				adapter,
 				unsubscribe: () => {},
 				reconnectUnsubscribe: () => {},
@@ -1488,9 +1660,32 @@ export class AcpAgent implements Agent {
 	}
 
 	/** Machine-local endpoint lookup; never routed through ACP extension methods. */
-	async #brokerEndpoint(sessionId: string, endpointGeneration: number | undefined): Promise<unknown> {
-		const input = { sessionId, ...(endpointGeneration === undefined ? {} : { endpointGeneration }) };
-		return await (await this.#brokerConnection()).client.global("session.get_endpoint", input);
+	async #brokerEndpoint(sessionId: string, authority: LiveSessionAuthority): Promise<unknown> {
+		return await (await this.#brokerConnection()).client.global("session.get_endpoint", {
+			sessionId,
+			brokerOwnerId: this.#sessionBrokerOwnerId(sessionId),
+			endpointGeneration: authority.endpointGeneration,
+			endpointIncarnation: authority.endpointIncarnation,
+		});
+	}
+
+	/**
+	 * Revalidate the full live authority tuple (generation + incarnation) after
+	 * an endpoint lookup but before publishing the adapter, so a same-generation
+	 * successor that appeared between list and get_endpoint is caught.
+	 */
+	async #revalidateLiveAuthority(id: string, expected: LiveSessionAuthority): Promise<void> {
+		const canonicalCwd = this.#sessionAuthority.get(id)?.canonicalCwd;
+		if (!canonicalCwd) return;
+		const current = await this.#currentLiveAuthority(id, canonicalCwd);
+		if (
+			!current ||
+			current.endpointGeneration !== expected.endpointGeneration ||
+			current.endpointIncarnation !== expected.endpointIncarnation
+		) {
+			this.#markSessionAmbiguous(id);
+			throw new AcpSdkAdapterError("conflict", `ACP session ${id} live authority changed before attachment.`);
+		}
 	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
@@ -1500,10 +1695,20 @@ export class AcpAgent implements Agent {
 				await ensureBroker({ agentDir: this.#agentDir });
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
+				this.#observeBrokerIdentity({
+					brokerIdentity: discovery,
+				});
 				const client = await SdkClient.connect(discovery.url, discovery.token);
-				const adapter = new AcpSdkAdapter({ url: discovery.url, token: discovery.token, client });
+				const adapter = new AcpSdkAdapter({
+					url: discovery.url,
+					token: discovery.token,
+					client,
+				});
 				adapter.onReconnectFailed(() => {
-					if (this.#broker === pending) this.#broker = undefined;
+					if (this.#broker !== pending) return;
+					this.#markAllSessionsAmbiguous();
+					this.#brokerIdentity = undefined;
+					this.#broker = undefined;
 					void adapter.close().catch(() => undefined);
 				});
 				await adapter.start();
@@ -1515,7 +1720,11 @@ export class AcpAgent implements Agent {
 		try {
 			return await pending;
 		} catch (error) {
-			if (this.#broker === pending) this.#broker = undefined;
+			if (this.#broker === pending) {
+				this.#markAllSessionsAmbiguous();
+				this.#brokerIdentity = undefined;
+				this.#broker = undefined;
+			}
 			throw error;
 		}
 	}
@@ -1527,12 +1736,12 @@ export class AcpAgent implements Agent {
 		return record.adapter;
 	}
 
-	async #resolveSavedSession(id: string, cwd: string): Promise<string> {
+	async #resolveSavedSession(id: string, cwd: string): Promise<SavedSessionAuthority> {
 		await this.#scopedBrokerSession(id, cwd);
 		const saved = await this.#fetchSavedAuthority(id, cwd);
 		if (!saved) throw new AcpSdkAdapterError("not_found", `Saved ACP session does not exist: ${id}`);
 		this.#captureSavedAuthority(id, saved);
-		return saved.path;
+		return saved;
 	}
 
 	/** Fetch the broker-resolved saved session authority for an id scoped to cwd. */
@@ -1541,6 +1750,7 @@ export class AcpAgent implements Agent {
 			await (await this.#brokerAdapter()).global("session.list", { resolveSessionId: id, cwd }),
 		);
 		const result = object(response?.result) ?? response;
+		this.#observeBrokerIdentity(result);
 		const savedSession = object(result?.savedSession);
 		if (savedSession?.id !== id) return undefined;
 		return savedAuthority(savedSession);
@@ -1553,6 +1763,7 @@ export class AcpAgent implements Agent {
 	async #currentLiveAuthority(id: string, canonicalCwd: string): Promise<LiveSessionAuthority | undefined> {
 		const response = object(await (await this.#brokerAdapter()).global("session.list", { cwd: canonicalCwd }));
 		const result = object(response?.result) ?? response;
+		this.#observeBrokerIdentity(result);
 		const scope =
 			typeof result?.canonicalCwd === "string" ? path.resolve(result.canonicalCwd) : path.resolve(canonicalCwd);
 		const listed = Array.isArray(result?.sessions) ? result.sessions : [];
@@ -1616,7 +1827,7 @@ export class AcpAgent implements Agent {
 		return acpProviderRegistrations(this.#clientCapabilities);
 	}
 
-	#reverseConnection(sessionId: string): AcpReverseConnection {
+	#reverseConnection(sessionId: string, gate: ReverseGate): AcpReverseConnection {
 		const methods: Record<string, string> = {
 			"fs.readTextFile": "readTextFile",
 			"fs.writeTextFile": "writeTextFile",
@@ -1626,6 +1837,7 @@ export class AcpAgent implements Agent {
 		};
 		return {
 			request: async (method: string, params: JsonObject): Promise<unknown> => {
+				this.#assertReverseGate(sessionId, gate);
 				const name = methods[method] ?? method;
 				const target = (this.#connection as unknown as Record<string, unknown>)[name];
 				if (typeof target !== "function")
@@ -1634,6 +1846,30 @@ export class AcpAgent implements Agent {
 				return await (target as (input: JsonObject) => Promise<unknown>)(request);
 			},
 		};
+	}
+
+	/**
+	 * Synchronously gate every reverse callback by session id, epoch, broker
+	 * identity, current authority, and exact adapter identity. Ambiguity revokes
+	 * the record and advances the epoch synchronously, so even while
+	 * adapter.close is held a reverse request can never reach the ACP client.
+	 */
+	#assertReverseGate(id: string, gate: ReverseGate): void {
+		if (this.#disposed || this.#ambiguousSessionIds.has(id) || this.#sessionEpoch(id) !== gate.epoch)
+			throw new AcpSdkAdapterError("connection_closed", `ACP session ${id} authority was revoked.`);
+		const record = this.#sessions.get(id);
+		if (!record || record.adapter !== gate.adapter)
+			throw new AcpSdkAdapterError("connection_closed", `ACP session ${id} authority was revoked.`);
+		const authority = this.#sessionAuthority.get(id);
+		const currentBroker = this.#brokerIdentity;
+		if (
+			!authority ||
+			!currentBroker ||
+			!sameBrokerIdentity(gate.broker, authority.broker) ||
+			!sameBrokerIdentity(gate.broker, record.broker) ||
+			!sameBrokerIdentity(gate.broker, currentBroker)
+		)
+			throw new AcpSdkAdapterError("connection_closed", `ACP session ${id} authority was revoked.`);
 	}
 
 	#observeSessionActivity(record: SessionRecord, frame: JsonObject): void {
@@ -1708,7 +1944,9 @@ export class AcpAgent implements Agent {
 		)
 			return;
 		record.activePrompt = undefined;
-		waiter.resolve({ stopReason: waiter.cancelRequested ? "cancelled" : "end_turn" });
+		waiter.resolve({
+			stopReason: waiter.cancelRequested ? "cancelled" : "end_turn",
+		});
 	}
 
 	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter): Promise<void> {
