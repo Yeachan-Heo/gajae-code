@@ -26,6 +26,10 @@
 
 - Accepted or declined initial external credential-import decisions now persist across normal restarts and upgrades, suppressing automatic startup and bare `/login` discovery; same-version legacy markers remain compatible and explicit `/provider` import remains available ([#2117](https://github.com/Yeachan-Heo/gajae-code/issues/2117)).
 
+### Fixed
+
+- ACP connections now retain independent session authority across multiple working directories while permanently revoking an ID that the SDK broker reports under conflicting workspaces. CWD-less close/delete and active controls fail closed after ambiguity, scoped-list bindings commit atomically, and malformed pagination cursors are rejected instead of accepting numeric prefixes.
+
 ## [0.10.1] - 2026-07-13
 
 ### Added
