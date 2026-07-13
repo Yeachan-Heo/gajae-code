@@ -143,6 +143,107 @@ describe("coordinator runtime state sidecar", () => {
 		}
 	});
 
+	// Shared setup for the coordinator→agent handoff tests: the coordinator has written an initial
+	// runtime-state (source "coordinator") with the DELEGATE cwd + this session's launch id, and the
+	// --worktree runtime now emits turn_start from a different WORKTREE cwd + its own agent session file.
+	async function coordinatorHandoff(previousOverrides: Record<string, unknown>): Promise<{
+		stateFile: string;
+		worktreeCwd: string;
+		agentSessionFile: string;
+	}> {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const delegateCwd = path.join(root, "repo");
+		const worktreeCwd = path.join(root, "repo.gajae-code-worktrees", "wt-1");
+		await fs.mkdir(delegateCwd, { recursive: true });
+		await fs.mkdir(worktreeCwd, { recursive: true });
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "gjc-coordinator-abc";
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: "gjc-coordinator-abc",
+				state: "running",
+				ready_for_input: false,
+				updated_at: "2026-01-01T00:00:00.000Z",
+				current_turn_id: "turn-1",
+				last_turn_id: null,
+				live: null,
+				cwd: delegateCwd,
+				workdir: delegateCwd,
+				session_file: null,
+				source: "coordinator",
+				...previousOverrides,
+			})}\n`,
+		);
+		return { stateFile, worktreeCwd, agentSessionFile: path.join(worktreeCwd, ".gjc", "session.json") };
+	}
+
+	it("accepts the coordinator→agent handoff when the coordinator-written launch id matches this launch", async () => {
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "launch-1";
+		const { stateFile, worktreeCwd, agentSessionFile } = await coordinatorHandoff({ launch_id: "launch-1" });
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: "agent-internal-id", cwd: worktreeCwd, sessionFile: agentSessionFile },
+		);
+
+		// The agent write lands despite the cwd/session_file mismatch — the launch id authorized it.
+		const after = await readJson(stateFile);
+		expect(after.source).toBe("agent_session_event");
+		expect(after.session_id).toBe("gjc-coordinator-abc");
+	});
+
+	it("rejects the handoff when the coordinator record carries a different launch (superseded/foreign)", async () => {
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "launch-new";
+		const { stateFile, worktreeCwd, agentSessionFile } = await coordinatorHandoff({ launch_id: "launch-old" });
+
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "agent-internal-id", cwd: worktreeCwd, sessionFile: agentSessionFile },
+			),
+		).rejects.toThrow();
+		const after = await readJson(stateFile);
+		expect(after.source).toBe("coordinator");
+		expect(after.launch_id).toBe("launch-old");
+	});
+
+	it("rejects the handoff when the coordinator record has no launch id (non-handoff coordinator write)", async () => {
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "launch-1";
+		const { stateFile, worktreeCwd, agentSessionFile } = await coordinatorHandoff({});
+
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "agent-internal-id", cwd: worktreeCwd, sessionFile: agentSessionFile },
+			),
+		).rejects.toThrow();
+		expect((await readJson(stateFile)).source).toBe("coordinator");
+	});
+
+	it("rejects a late event that would reopen a coordinator-terminal state even with a matching launch", async () => {
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "launch-1";
+		const { stateFile, worktreeCwd, agentSessionFile } = await coordinatorHandoff({
+			launch_id: "launch-1",
+			state: "completed",
+			ready_for_input: true,
+			current_turn_id: "turn-promoted-b",
+		});
+
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "agent-internal-id", cwd: worktreeCwd, sessionFile: agentSessionFile },
+			),
+		).rejects.toThrow();
+		const after = await readJson(stateFile);
+		expect(after.source).toBe("coordinator");
+		expect(after.state).toBe("completed");
+		expect(after.current_turn_id).toBe("turn-promoted-b");
+	});
+
 	it("refreshes updated_at for duplicate same-state running writes after the heartbeat", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");

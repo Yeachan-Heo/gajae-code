@@ -6,6 +6,10 @@
 
 - Added an owner-proof idle session reaper and `gjc_coordinator_stop_session` for ephemeral (delegate-created) coordinator sessions. Termination goes exclusively through the owner-proof `forceCloseGjcTmuxSession` path (pid, native session id, owner generation, server key, and start time all verified before SIGTERM) — never a raw `process.kill`. The reaper binds each close to the persisted runtime-state file, re-validates ephemeral and no-active-turn at kill time under the same per-session mutation lock as delegate reuse, and purges state only on verified termination (#2080).
 
+### Fixed
+
+- A coordinator-managed `--worktree` delegate runtime now reports its runtime state (turn_start / running / completed) back to the coordinator. The runtime executes in a git worktree whose cwd differs from the delegate cwd the coordinator recorded in its initial `source: "coordinator"` state write, so the runtime-state identity guard (keyed on cwd/workdir/session_file) threw `PreviousRuntimeStateReadError` on every agent-emitted write and the coordinator's view froze at the initial `running` (spurious ack timeouts, hung turns). The coordinator now copies its session's `launch_id` onto its own runtime-state writes, and the runtime skips the cwd/workdir/session_file check for the coordinator→agent handoff **only** when the prior record is the coordinator's own **non-terminal** write whose `launch_id` equals this runtime's `GJC_COORDINATOR_SESSION_LAUNCH_ID`. A superseded/foreign launch (including a truncated 32-bit session-id/state-file collision) and a terminal coordinator state (which a late event must not reopen) are rejected; the bypass is one-shot by construction because `writeSessionStateUnlocked` refuses to overwrite a runtime-authored (`agent_session_event`) record. Every other prior state keeps the full guard (#2094).
+
 ## [0.10.0] - 2026-07-12
 
 ### Added

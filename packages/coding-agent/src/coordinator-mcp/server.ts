@@ -227,6 +227,11 @@ interface CoordinatorSessionState {
 	last_turn_id: string | null;
 	updated_at: string;
 	source: "coordinator" | "agent_session_event" | "process_postmortem";
+	// The coordinator's launch id for this session, copied from the session record onto every
+	// coordinator-authored runtime-state write. It lets the coordinator-managed runtime authorize its
+	// first state write (whose worktree cwd differs from the delegate cwd the coordinator recorded)
+	// against the launch it was actually spawned for — a superseded/foreign launch is rejected.
+	launch_id?: string;
 
 	live: boolean | null;
 	reason: string | null;
@@ -1892,6 +1897,10 @@ async function writeSessionStateUnlocked(
 		last_turn_id: options.lastTurnId ?? previous?.last_turn_id ?? null,
 		updated_at: new Date().toISOString(),
 		source: options.source ?? "coordinator",
+		// Copy the launch id from the coordinator's own session record so the runtime can authorize its
+		// first state write against the launch it was spawned for. Only coordinator-created sessions have
+		// a launch id; registered/foreign sessions omit it (and never take the coordinator→agent bypass).
+		...(typeof session?.launch_id === "string" && session.launch_id.trim() ? { launch_id: session.launch_id } : {}),
 		live: options.live ?? previous?.live ?? null,
 		reason: options.reason ?? null,
 		cwd,

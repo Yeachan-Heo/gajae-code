@@ -508,6 +508,33 @@ function assertPreviousRuntimeStateIdentity(
 	input: { sessionId: string; cwd: string; sessionFile: string | null },
 ): void {
 	if (Object.keys(previous).length === 0) return;
+	// The coordinator writes the initial runtime-state (source "coordinator") with the delegate cwd,
+	// before the --worktree runtime has created its worktree; the runtime then legitimately runs in a
+	// worktree cwd (and writes its own agent session_file). The cwd/workdir/session_file guard cannot
+	// apply to that one coordinator→agent handoff. Skip it ONLY for the coordinator's own non-terminal
+	// record of THIS launch:
+	//   - session_id must match — never accept a foreign session;
+	//   - launch_id (which the coordinator copies onto its state writes from its own session record)
+	//     must equal this runtime's GJC_COORDINATOR_SESSION_LAUNCH_ID — a superseded/foreign launch, or a
+	//     truncated 32-bit session-id/state-file collision, is rejected rather than silently adopted;
+	//   - the record must not already be terminal — a late async event from a superseded runtime may not
+	//     reopen a coordinator-terminal state (which would falsely bind/ack a promoted queued turn).
+	// This is one-shot by construction: once the runtime writes agent_session_event, the coordinator's
+	// writeSessionStateUnlocked refuses to overwrite a non-coordinator record, so the runtime never sees
+	// a source "coordinator" predecessor again. Every other prior state (agent→agent, or a genuinely
+	// stale/foreign record) keeps the full cwd/workdir/session_file guard.
+	if (process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() && previous.source === "coordinator") {
+		const launchId = process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV]?.trim();
+		if (
+			previous.session_id !== input.sessionId ||
+			previous.state === "completed" ||
+			previous.state === "errored" ||
+			!launchId ||
+			previous.launch_id !== launchId
+		)
+			throw new PreviousRuntimeStateReadError();
+		return;
+	}
 	if (
 		previous.session_id !== input.sessionId ||
 		typeof previous.cwd !== "string" ||

@@ -21,6 +21,7 @@ import {
 } from "../src/coordinator-mcp/server";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	persistCoordinatorRuntimeStateFromPostmortem,
 } from "../src/gjc-runtime/session-state-sidecar";
@@ -29,6 +30,7 @@ import { createOwnerIntent, replaceOwnerGeneration } from "../src/gjc-runtime/tm
 const tempDirs: string[] = [];
 const ORIGINAL_RUNTIME_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 const ORIGINAL_RUNTIME_SESSION_ID = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+const ORIGINAL_RUNTIME_LAUNCH_ID = process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV];
 
 async function tempRoot(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-server-"));
@@ -253,6 +255,8 @@ afterEach(async () => {
 	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_RUNTIME_STATE_FILE;
 	if (ORIGINAL_RUNTIME_SESSION_ID === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = ORIGINAL_RUNTIME_SESSION_ID;
+	if (ORIGINAL_RUNTIME_LAUNCH_ID === undefined) delete process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV];
+	else process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = ORIGINAL_RUNTIME_LAUNCH_ID;
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -604,6 +608,61 @@ describe("Coordinator MCP server protocol", () => {
 		expect(commands.slice(-4).map(tmuxSubcommand)).toEqual(TMUX_PROMPT_DELIVERY_COMMANDS);
 		expect(commands.at(-2)).toEqual(["tmux", "-L", PRIVATE_SOCKET, "send-keys", "-t", "%24", "Escape"]);
 		expect(commands.at(-1)).toEqual(["tmux", "-L", PRIVATE_SOCKET, "send-keys", "-t", "%24", "Enter"]);
+	});
+
+	it("persists the session launch id onto the coordinator's own runtime-state writes", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "launch-id-persist");
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				ownerIsolationProbe: privateOwnerProbe(),
+				startSession: async input =>
+					readyStart(input, {
+						sessionId: input.sessionId,
+						tmuxSession: "delegate-session",
+						tmuxTarget: "delegate-session:0.0",
+						tmuxSocketKey: PRIVATE_SOCKET,
+						tmuxOwnerServerKey: PRIVATE_SOCKET,
+						tmuxOwnerGeneration: "delegate-generation",
+						tmuxOwnerServerPid: PRIVATE_OWNER_PID,
+						tmuxOwnerServerStartTime: PRIVATE_OWNER_START_TIME,
+						tmuxNativeSessionId: "$delegate-session",
+						paneId: "%24",
+						cwd: input.cwd,
+						createdAt: "2026-06-28T00:00:00.000Z",
+					}),
+				commandRunner: async command => {
+					if (tmuxSubcommand(command) === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (tmuxSubcommand(command) === "display-message")
+						return { exitCode: 0, stdout: tmuxIdentity(command), stderr: "" };
+					return { exitCode: 0, stdout: "", stderr: "" };
+				},
+			},
+		});
+
+		const start = await server.callTool("gjc_coordinator_start_session", { cwd: root, allow_mutation: true });
+		const sessionId = (start.session as { session_id: string }).session_id;
+		const sessionRecord = JSON.parse(
+			await fs.readFile(path.join(stateRoot, "local", "repo", "sessions", `${sessionId}.json`), "utf8"),
+		);
+		const runtimeState = JSON.parse(
+			await fs.readFile(path.join(stateRoot, "local", "repo", "session-states", `${sessionId}.json`), "utf8"),
+		);
+
+		// The runtime-state the --worktree runtime reads back MUST carry the session's launch id — this is
+		// the exact shape the sidecar handoff check depends on. Without this persistence the launch-id gate
+		// would reject every legitimate agent state write.
+		expect(typeof sessionRecord.launch_id).toBe("string");
+		expect((sessionRecord.launch_id as string).length).toBeGreaterThan(0);
+		expect(runtimeState.source).toBe("coordinator");
+		expect(runtimeState.launch_id).toBe(sessionRecord.launch_id);
 	});
 
 	it("fails tmux-delivered turns that never receive a runtime prompt ack", async () => {
@@ -4710,6 +4769,9 @@ setInterval(() => {}, 1000);
 		});
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = JSON.parse(
+			await fs.readFile(path.join(stateRoot, "local", "repo", "sessions", `${sessionId}.json`), "utf8"),
+		).launch_id;
 		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
 			sessionId,
 			cwd: root,
@@ -4754,6 +4816,12 @@ setInterval(() => {}, 1000);
 		});
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = JSON.parse(
+			await fs.readFile(
+				path.join(path.dirname(path.dirname(stateFile)), "sessions", path.basename(stateFile)),
+				"utf8",
+			),
+		).launch_id;
 		const generation = await replaceOwnerGeneration(root, sessionId, "terminal-preservation-generation");
 		await createOwnerIntent(root, {
 			generation,
@@ -4850,6 +4918,11 @@ setInterval(() => {}, 1000);
 			blockReconciliation = true;
 			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+			// The real --worktree runtime always carries its launch id in the environment; mirror that so
+			// the coordinator→agent handoff authority check sees the launch the session was spawned for.
+			process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = JSON.parse(
+				await fs.readFile(path.join(stateRoot, "local", "repo", "sessions", `${sessionId}.json`), "utf8"),
+			).launch_id;
 			const reconcile = server.callTool("gjc_coordinator_read_turn", {
 				session_id: sessionId,
 				turn_id: turn.turn_id,
