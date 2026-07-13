@@ -23,6 +23,8 @@ class FakeTransport implements HarnessSessionTransport {
 	accept = true;
 	agentStarts: number[] = [];
 	closeError: Error | null = null;
+	closeCalls = 0;
+	closeImpl: ((call: number) => Promise<void>) | null = null;
 	async getState(): Promise<SessionStateSnapshot> {
 		return this.state;
 	}
@@ -41,6 +43,8 @@ class FakeTransport implements HarnessSessionTransport {
 		return found === undefined ? null : { cursor: found };
 	}
 	async close(): Promise<void> {
+		this.closeCalls += 1;
+		await this.closeImpl?.(this.closeCalls);
 		if (this.closeError) throw this.closeError;
 	}
 }
@@ -316,6 +320,77 @@ describe("RuntimeOwner (in-process integration)", () => {
 		// child the transport owns may still be live, so the lease stays held — no interval exists
 		// where an unverified live transport has released the lease.
 		expect((await resolveOwner(root, SID)).live).toBe(true);
+	});
+
+	it("serializes simultaneous stop calls through one cleanup result", async () => {
+		const transport = new FakeTransport();
+		const closeStarted = Promise.withResolvers<void>();
+		const releaseClose = Promise.withResolvers<void>();
+		transport.closeImpl = async () => {
+			closeStarted.resolve();
+			await releaseClose.promise;
+		};
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
+		await owner.start();
+
+		const first = owner.stop();
+		const second = owner.stop();
+		expect(second).toBe(first);
+		await closeStarted.promise;
+		expect(transport.closeCalls).toBe(1);
+
+		releaseClose.resolve();
+		await Promise.all([first, second]);
+		expect(owner.stop()).toBe(first);
+		expect(transport.closeCalls).toBe(1);
+		expect((await resolveOwner(root, SID)).live).toBe(false);
+		owner = null;
+	});
+
+	it("returns the memoized cleanup result to a reentrant stop caller", async () => {
+		const transport = new FakeTransport();
+		const observed: { reentrant: Promise<void> | null } = { reentrant: null };
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
+		transport.closeImpl = async () => {
+			observed.reentrant = owner?.stop() ?? null;
+		};
+		await owner.start();
+
+		const first = owner.stop();
+		await first;
+
+		expect(observed.reentrant).toBe(first);
+		expect(owner.stop()).toBe(first);
+		expect(transport.closeCalls).toBe(1);
+		expect((await resolveOwner(root, SID)).live).toBe(false);
+		owner = null;
+	});
+
+	it("memoizes a failed cleanup so a simultaneous success cannot release authority", async () => {
+		const transport = new FakeTransport();
+		const releaseClose = Promise.withResolvers<void>();
+		const cleanupError = new Error("first cleanup could not verify child exit");
+		transport.closeImpl = async call => {
+			await releaseClose.promise;
+			if (call === 1) throw cleanupError;
+		};
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
+		const info = await owner.start();
+
+		const first = owner.stop();
+		const simultaneous = owner.stop();
+		releaseClose.resolve();
+		await Promise.all([first, simultaneous]);
+
+		expect(simultaneous).toBe(first);
+		expect(transport.closeCalls).toBe(1);
+		const retained = await resolveOwner(root, SID);
+		expect(retained.live).toBe(true);
+		expect(retained.lease?.ownerId).toBe(info.ownerId);
+		const failures = (await readEvents(root, SID, 0)).filter(event => event.kind === "owner_transport_stop_failed");
+		expect(failures).toHaveLength(1);
+		expect(failures[0]?.evidence.error).toContain(cleanupError.message);
+		owner = null;
 	});
 
 	it("blocks replacement owner takeover while transport cleanup is unverified", async () => {

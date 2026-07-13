@@ -114,6 +114,7 @@ export class RuntimeOwner {
 	#unsubscribeFrames: (() => void) | null = null;
 	#framePump: Promise<void> = Promise.resolve();
 	#coalesced = new Map<string, true>();
+	#stopPromise: Promise<void> | null = null;
 
 	constructor(opts: OwnerOptions) {
 		this.ownerId = opts.ownerId ?? `owner-${randomUUID()}`;
@@ -642,7 +643,12 @@ export class RuntimeOwner {
 		return this.#response(state, { retired: true });
 	}
 
-	async stop(): Promise<void> {
+	stop(): Promise<void> {
+		this.#stopPromise ??= this.#stopOnce();
+		return this.#stopPromise;
+	}
+
+	async #stopOnce(): Promise<void> {
 		this.#unsubscribeFrames?.();
 		this.#unsubscribeFrames = null;
 		await this.#framePump.catch(() => {});
