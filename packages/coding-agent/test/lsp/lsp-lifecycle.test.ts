@@ -1,8 +1,14 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getOrCreateClient, sendRequest, shutdownAll, waitForProjectLoaded } from "../../src/lsp/client";
+import {
+	getOrCreateClient,
+	sendNotification,
+	sendRequest,
+	shutdownAll,
+	waitForProjectLoaded,
+} from "../../src/lsp/client";
 import type { ServerConfig } from "../../src/lsp/types";
 import { disposeAllOwnedProcesses } from "../../src/runtime/process-lifecycle";
 
@@ -78,6 +84,67 @@ describe("LSP lifecycle behavior", () => {
 		}
 	});
 
+	for (const code of ["EPIPE", "ERR_STREAM_DESTROYED"] as const) {
+		it(`contains stdin ${code} peer closure at the LSP transport and evicts the client`, async () => {
+			const cwd = await tempDir("gjc-lsp-peer-close-");
+			const unhandled: unknown[] = [];
+			const onUnhandled = (error: unknown) => {
+				unhandled.push(error);
+			};
+			process.on("unhandledRejection", onUnhandled);
+			try {
+				const script = await writeFakeLspServer(cwd);
+				const config = serverConfig(BUN, [script]);
+				const first = await getOrCreateClient(config, cwd, 1_000);
+				const pending = sendRequest(first, "workspace/neverResponds", null, undefined, 5_000);
+				const pendingSettled = pending.then(
+					() => new Error("request unexpectedly resolved"),
+					error => (error instanceof Error ? error : new Error(String(error))),
+				);
+				const peerClosed = Object.assign(new Error("peer closed"), { code });
+				const flush = spyOn(first.proc.stdin, "flush").mockImplementation(() => Promise.reject(peerClosed));
+
+				try {
+					void sendNotification(first, "test/afterClose", { payload: "x".repeat(1024) });
+					expect((await pendingSettled).message).toBe("LSP server exited: transport closed");
+					await Bun.sleep(10);
+					expect(unhandled).toEqual([]);
+				} finally {
+					flush.mockRestore();
+				}
+
+				await expect(sendRequest(first, "test/staleClient", null, undefined, 100)).rejects.toThrow(
+					"LSP server exited: transport closed",
+				);
+				const second = await getOrCreateClient(config, cwd, 1_000);
+				expect(second).not.toBe(first);
+				expect(second.proc.exitCode).toBeNull();
+			} finally {
+				process.off("unhandledRejection", onUnhandled);
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+
+	it("does not hide non-peer sink failures or evict a healthy client", async () => {
+		const cwd = await tempDir("gjc-lsp-write-failure-");
+		try {
+			const script = await writeFakeLspServer(cwd);
+			const config = serverConfig(BUN, [script]);
+			const client = await getOrCreateClient(config, cwd, 1_000);
+			const writeFailure = Object.assign(new Error("write failed"), { code: "EIO" });
+			const flush = spyOn(client.proc.stdin, "flush").mockImplementation(() => Promise.reject(writeFailure));
+
+			try {
+				await expect(sendNotification(client, "test/writeFailure", {})).rejects.toBe(writeFailure);
+			} finally {
+				flush.mockRestore();
+			}
+			expect(await getOrCreateClient(config, cwd, 1_000)).toBe(client);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
 	it("waitForProjectLoaded removes its abort listener after project loading settles", async () => {
 		const controller = new AbortController();
 		let activeAbortListeners = 0;

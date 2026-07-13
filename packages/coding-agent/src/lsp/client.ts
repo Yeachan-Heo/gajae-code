@@ -1,4 +1,4 @@
-import { isEnoent, logger, untilAborted } from "@gajae-code/utils";
+import { isEnoent, isKnownSinkPeerClosedError, logger, untilAborted } from "@gajae-code/utils";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { registerResourceOwner, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
@@ -21,6 +21,7 @@ import { detectLanguageId, fileToUri } from "./utils";
 
 const clients = new Map<string, LspClient>();
 const killedClients = new WeakSet<LspClient>();
+const transportClosedClients = new WeakSet<LspClient>();
 const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
 const lspCleanupOwner = registerResourceOwner("lsp:clients", shutdownAll);
@@ -81,6 +82,21 @@ function deleteCachedClient(key: string, client: LspClient): void {
 	}
 }
 
+function transportClosedError(): Error {
+	return new Error("LSP server exited: transport closed");
+}
+
+function handleClientTransportClosed(client: LspClient): void {
+	if (transportClosedClients.has(client)) return;
+	transportClosedClients.add(client);
+	deleteCachedClient(client.name, client);
+	client.resolveProjectLoaded();
+	rejectPendingRequests(client, transportClosedError());
+	void client.owner?.dispose().catch(error => {
+		logger.debug("Failed to dispose LSP after transport closure", { error: String(error) });
+	});
+}
+
 function deleteClientLock(key: string, clientPromise: Promise<LspClient>): void {
 	if (clientLocks.get(key) === clientPromise) {
 		clientLocks.delete(key);
@@ -88,7 +104,13 @@ function deleteClientLock(key: string, clientPromise: Promise<LspClient>): void 
 }
 
 function evictDeadCachedClient(key: string, client: LspClient): void {
-	if (client.proc.exitCode === null && !client.proc.killed && !client.owner?.disposed && !killedClients.has(client))
+	if (
+		client.proc.exitCode === null &&
+		!client.proc.killed &&
+		!client.owner?.disposed &&
+		!killedClients.has(client) &&
+		!transportClosedClients.has(client)
+	)
 		return;
 	deleteCachedClient(key, client);
 	client.resolveProjectLoaded();
@@ -262,7 +284,17 @@ function queueWriteMessage(
 	client: LspClient,
 	message: LspJsonRpcRequest | LspJsonRpcNotification | LspJsonRpcResponse,
 ): Promise<void> {
-	const write = client.writeQueue.catch(() => {}).then(() => writeMessage(client.proc.stdin, message));
+	const write = client.writeQueue
+		.catch(() => {})
+		.then(async () => {
+			if (transportClosedClients.has(client)) return;
+			try {
+				await writeMessage(client.proc.stdin, message);
+			} catch (error) {
+				if (!isKnownSinkPeerClosedError(error)) throw error;
+				handleClientTransportClosed(client);
+			}
+		});
 	client.writeQueue = write.catch(() => {});
 	return write;
 }
@@ -601,6 +633,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 
 			// Send initialized notification
 			await sendNotification(client, "initialized", {});
+			if (transportClosedClients.has(client)) throw transportClosedError();
 
 			return client;
 		} catch (err) {
@@ -862,6 +895,7 @@ export async function sendRequest(
 	signal?: AbortSignal,
 	timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
 ): Promise<unknown> {
+	if (transportClosedClients.has(client)) throw transportClosedError();
 	// Atomically increment and capture request ID
 	const id = ++client.requestId;
 	if (signal?.aborted) {
