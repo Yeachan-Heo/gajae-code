@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
+import { resolveAgentModelPatterns, resolveModelOverride } from "@gajae-code/coding-agent/config/model-resolver";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
@@ -86,6 +87,10 @@ describe("SelectorController model batch assignments", () => {
 	});
 	test("all role agents selection writes every role-agent override and leaves DEFAULT unchanged", async () => {
 		const { ctx, settings, setModelCalls } = createControllerContext();
+		settings.override("task.agentModelOverrides", {
+			executor: "provider-a/profile-executor:medium",
+			architect: "provider-a/profile-architect:low",
+		});
 		const selector = await openSelector(ctx);
 
 		await selector.__testSelectAssignment({
@@ -98,6 +103,14 @@ describe("SelectorController model batch assignments", () => {
 
 		expect(setModelCalls).toEqual([]);
 		expect(settings.getModelRole("default")).toBe("provider-a/original-default:medium");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/selected:low",
+			architect: "provider-a/selected:low",
+			planner: "provider-a/selected:low",
+			critic: "provider-a/selected:low",
+		});
+
+		settings.clearOverride("task.agentModelOverrides");
 		expect(settings.get("task.agentModelOverrides")).toEqual({
 			executor: "provider-a/selected:low",
 			architect: "provider-a/selected:low",
@@ -138,5 +151,41 @@ describe("SelectorController model batch assignments", () => {
 		expect(ctx.showStatus).toHaveBeenCalledWith(
 			"All model targets set to provider-a/selected:high for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		);
+	});
+	test("role assignment replaces active profile override immediately and persists the explicit selection", async () => {
+		const { ctx, settings } = createControllerContext();
+		settings.override("task.agentModelOverrides", {
+			executor: "provider-a/profile-executor:medium",
+			architect: "provider-a/profile-architect:low",
+		});
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "architect",
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/selected:high",
+		});
+
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/profile-executor:medium",
+			architect: "provider-a/selected:high",
+		});
+
+		const modelPatterns = resolveAgentModelPatterns({
+			settingsOverride: settings.get("task.agentModelOverrides").architect,
+			agentModel: "provider-a/profile-architect:low",
+			settings,
+		});
+		const resolved = resolveModelOverride(modelPatterns, ctx.session.modelRegistry, settings);
+		expect(resolved.model).toBe(selectedModel);
+		expect(resolved.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(resolved.explicitThinkingLevel).toBe(true);
+
+		settings.clearOverride("task.agentModelOverrides");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-a/original-executor:low",
+			architect: "provider-a/selected:high",
+		});
 	});
 });
