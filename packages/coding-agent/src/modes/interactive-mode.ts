@@ -87,6 +87,7 @@ import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
 import { IrcSplitViewComponent } from "./components/irc-sidebar";
+import { getPetUnavailableWarning, isPetAvailable } from "./components/pet-capability";
 import { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import {
@@ -633,6 +634,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.petWidget.setMode(saved);
 			}
 		});
+		if (configuredPetMode !== "off" && !isPetAvailable()) {
+			this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+		}
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
@@ -1081,6 +1085,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	setPetMode(mode: PetMode): void {
+		if (mode !== "off" && !isPetAvailable()) {
+			this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+			this.ui.requestRender();
+			return;
+		}
 		this.petWidget?.setMode(mode);
 		settings.set("pet.mode", mode);
 		this.ui.requestRender();
