@@ -18,6 +18,7 @@ import {
 	COORDINATOR_RUNTIME_READINESS_TIMEOUT_MAX_MS,
 	coordinatorOwnerIsolationProbe,
 	createCoordinatorMcpServer,
+	PROMPT_SUBMIT_KEY_SETTLE_MS,
 } from "../src/coordinator-mcp/server";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -604,6 +605,61 @@ describe("Coordinator MCP server protocol", () => {
 		expect(commands.slice(-4).map(tmuxSubcommand)).toEqual(TMUX_PROMPT_DELIVERY_COMMANDS);
 		expect(commands.at(-2)).toEqual(["tmux", "-L", PRIVATE_SOCKET, "send-keys", "-t", "%24", "Escape"]);
 		expect(commands.at(-1)).toEqual(["tmux", "-L", PRIVATE_SOCKET, "send-keys", "-t", "%24", "Enter"]);
+	});
+
+	it("waits between the Escape and the submit Enter so the runtime does not parse ESC+CR as one sequence", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "state", "esc-cr-settle");
+		const timeline: Array<{ command: string[]; at: number }> = [];
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				ownerIsolationProbe: privateOwnerProbe(),
+				commandRunner: async command => {
+					timeline.push({ command, at: Date.now() });
+					if (tmuxSubcommand(command) === "has-session") return { exitCode: 0, stdout: "", stderr: "" };
+					if (tmuxSubcommand(command) === "display-message")
+						return { exitCode: 0, stdout: tmuxIdentity(command), stderr: "" };
+					if (isTmuxPromptDeliveryCommand(command)) return { exitCode: 0, stdout: "", stderr: "" };
+					return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+				},
+			},
+		});
+
+		await server.callTool("gjc_coordinator_register_session", {
+			session_id: "visible-session",
+			cwd: root,
+			tmux_session: "visible-session",
+			tmux_target: "visible-session:0.0",
+			visible: true,
+			allow_mutation: true,
+		});
+		await persistPrivateOwnerProof(stateRoot, "visible-session");
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "do work",
+			allow_mutation: true,
+		});
+		expect(sent.delivery).toMatchObject({ tmux_keys_sent: true, state: "tmux_keys_sent" });
+
+		const isSendKey = (entry: { command: string[] }, key: string) =>
+			entry.command.at(-1) === key && tmuxSubcommand(entry.command) === "send-keys";
+		const escapeKey = timeline.findLast(entry => isSendKey(entry, "Escape"));
+		const enterKey = timeline.findLast(entry => isSendKey(entry, "Enter"));
+		expect(escapeKey).toBeDefined();
+		expect(enterKey).toBeDefined();
+		// The submit Enter is sent, but only after the Escape has had time to register as a standalone
+		// keypress — otherwise ESC (\x1b) immediately followed by CR (\r) is parsed as one sequence and
+		// the Enter is swallowed, so the pasted prompt never submits.
+		expect((enterKey as { at: number }).at - (escapeKey as { at: number }).at).toBeGreaterThanOrEqual(
+			PROMPT_SUBMIT_KEY_SETTLE_MS - 20,
+		);
 	});
 
 	it("fails tmux-delivered turns that never receive a runtime prompt ack", async () => {

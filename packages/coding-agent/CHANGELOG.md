@@ -6,6 +6,10 @@
 
 - Added an owner-proof idle session reaper and `gjc_coordinator_stop_session` for ephemeral (delegate-created) coordinator sessions. Termination goes exclusively through the owner-proof `forceCloseGjcTmuxSession` path (pid, native session id, owner generation, server key, and start time all verified before SIGTERM) — never a raw `process.kill`. The reaper binds each close to the persisted runtime-state file, re-validates ephemeral and no-active-turn at kill time under the same per-session mutation lock as delegate reuse, and purges state only on verified termination (#2080).
 
+### Fixed
+
+- The coordinator MCP prompt delivery now waits briefly between the autocomplete-dismiss `Escape` and the submit `Enter`. A lone `Escape` (`\x1b`) sent immediately before `Enter` (`\r`) is parsed by the runtime's terminal input as a single ESC-prefixed sequence (the ESC-timeout ambiguity), which swallowed the `Enter` — the pasted prompt was never submitted, so a delegate turn hung with `tmux_keys_sent` set but never acknowledged and failed at the ack timeout (reproduced deterministically against a live `--worktree` runtime: removing the `Escape` or separating it from the `Enter` makes the prompt submit; the delivered keys are otherwise dropped). `sendTmuxPromptKeys` now lets the `Escape` register as a standalone keypress before sending `Enter`, so a single delivery submits reliably with no re-send needed.
+
 ## [0.10.0] - 2026-07-12
 
 ### Added

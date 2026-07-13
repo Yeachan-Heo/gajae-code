@@ -2470,6 +2470,12 @@ async function runCommand(
 	return { exitCode, stdout, stderr };
 }
 
+// A lone Escape (\x1b) delivered immediately before Enter (\r) is parsed by the runtime's terminal
+// input as a single ESC-prefixed sequence (the classic ESC-timeout ambiguity), which swallows the
+// Enter — the pasted prompt is then never submitted and the turn hangs until the ack timeout. This
+// settle window lets the Escape register as a standalone keypress before Enter is sent.
+export const PROMPT_SUBMIT_KEY_SETTLE_MS = 150;
+
 async function sendTmuxPromptKeys(
 	target: string,
 	prompt: string,
@@ -2501,6 +2507,7 @@ async function sendTmuxPromptKeys(
 	}
 	const dismissedAutocomplete = await runMutation([...tmux, "send-keys", "-t", target, "Escape"]);
 	if (dismissedAutocomplete?.exitCode !== 0) return false;
+	await new Promise(resolve => setTimeout(resolve, PROMPT_SUBMIT_KEY_SETTLE_MS));
 	const submitted = await runMutation([...tmux, "send-keys", "-t", target, "Enter"]);
 	return submitted?.exitCode === 0;
 }
