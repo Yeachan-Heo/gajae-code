@@ -99,6 +99,8 @@ async function createSession(tools: AgentTool[], bridge?: ClientBridge): Promise
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});
 
+	// Session default is `allow`; ACP registers a prompt bridge alongside prompt mode (see acp-agent).
+	sess.setSdkPermissionMode("prompt");
 	if (bridge) sess.setClientBridge(bridge);
 	return sess;
 }
@@ -130,6 +132,7 @@ async function createSessionWithMockModel(
 		modelRegistry: { getApiKey: () => "test-key" } as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});
+	sess.setSdkPermissionMode("prompt");
 	sess.setClientBridge(bridge);
 	return sess;
 }

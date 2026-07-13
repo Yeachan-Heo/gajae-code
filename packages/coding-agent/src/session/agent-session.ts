@@ -1253,8 +1253,9 @@ export class AgentSession {
 	#allowAcpAgentInitiatedTurns = false;
 	/** Per-session memory of allow_always / reject_always decisions for gated tools. */
 	#acpPermissionDecisions: Map<string, "allow_always" | "reject_always"> = new Map();
-	/** SDK-controlled permission policy applied before ACP client prompting. */
-	#sdkPermissionMode: "prompt" | "allow" | "deny" = "prompt";
+	/** SDK-controlled permission policy applied before ACP client prompting. Defaults to `allow` so callers
+	 * without a reverse permission provider (TUI, print/headless) run guarded tools; ACP/SDK set this explicitly. */
+	#sdkPermissionMode: "prompt" | "allow" | "deny" = "allow";
 	/** Permission provider registered by a live SDK reverse lease. */
 	#sdkPermissionProvider:
 		| ((
