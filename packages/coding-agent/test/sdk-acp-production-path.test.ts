@@ -459,6 +459,45 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		expect.objectContaining({ input: { sessionId: created.sessionId, endpointGeneration: 1 } }),
 	]);
 	expect(providerRegistrations).toHaveLength(registrationsBeforeLiveAttach + 2);
+	const crossScopeAbort = new AbortController();
+	const crossScopeLoader = new AcpAgent(
+		{
+			signal: crossScopeAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	holdEndpointResponse = true;
+	const attachFromOwnedCwd = crossScopeLoader.loadSession({
+		sessionId: created.sessionId,
+		cwd,
+		mcpServers: [],
+	});
+	await waitFor(() => releaseEndpointResponse !== undefined, "cross-cwd held endpoint response");
+	const conflictingAttach = crossScopeLoader.loadSession({
+		sessionId: created.sessionId,
+		cwd: path.join(directory, "other-workspace"),
+		mcpServers: [],
+	});
+	holdEndpointResponse = false;
+	releaseEndpointResponse!();
+	releaseEndpointResponse = undefined;
+	const [ownedAttachResult, conflictingAttachResult] = await Promise.allSettled([
+		bounded(attachFromOwnedCwd, "owned side of cross-cwd attach"),
+		bounded(conflictingAttach, "conflicting side of cross-cwd attach"),
+	]);
+	expect(conflictingAttachResult).toMatchObject({
+		status: "rejected",
+		reason: expect.objectContaining({ code: "conflict" }),
+	});
+	if (ownedAttachResult.status === "rejected")
+		expect(ownedAttachResult.reason).toMatchObject({ code: expect.stringMatching(/conflict|connection_closed/) });
+	const brokerRequestsAfterConflict = brokerRequests.length;
+	await expect(crossScopeLoader.closeSession({ sessionId: created.sessionId })).rejects.toMatchObject({
+		code: "conflict",
+	});
+	expect(brokerRequests).toHaveLength(brokerRequestsAfterConflict);
+	crossScopeAbort.abort();
 	const racingAbort = new AbortController();
 	const racingLoader = new AcpAgent(
 		{ signal: racingAbort.signal, closed: Promise.withResolvers<void>().promise } as unknown as AgentSideConnection,

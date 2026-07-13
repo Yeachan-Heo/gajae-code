@@ -141,7 +141,7 @@ export function paginateAcpSessions(listed: unknown[], cwd: string | undefined, 
 			(value): value is BrokerSession & { locator: { repo: string } } =>
 				typeof value?.sessionId === "string" && typeof value.locator?.repo === "string",
 		)
-		.filter(value => !cwd || value.locator.repo === cwd);
+		.filter(value => !cwd || path.resolve(value.locator.repo) === path.resolve(cwd));
 	const sessions = filtered
 		.slice(offset, offset + SESSION_PAGE_SIZE)
 		.map(
@@ -570,6 +570,7 @@ export class AcpAgent implements Agent {
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
+	readonly #ambiguousSessionIds = new Set<string>();
 	readonly #sessionEpochs = new Map<string, number>();
 	readonly #tearingDown = new Map<string, number>();
 	#clientCapabilities: ClientCapabilities | undefined;
@@ -644,14 +645,14 @@ export class AcpAgent implements Agent {
 			randomUUID(),
 		);
 		const id = sessionId(result);
-		this.#knownSessionCwds.set(id, params.cwd);
 		try {
+			this.#bindSessionCwd(id, params.cwd);
 			await this.#attach(id, params.cwd, endpoint(result));
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
 			this.#scheduleBootstrap(id);
 			return { sessionId: id, ...(await this.#sessionState(id)) };
 		} catch (error) {
-			await this.#discardNewSession(id);
+			if (!this.#ambiguousSessionIds.has(id)) await this.#discardNewSession(id);
 			throw error;
 		}
 	}
@@ -688,48 +689,64 @@ export class AcpAgent implements Agent {
 			randomUUID(),
 		);
 		const id = sessionId(result);
-		this.#knownSessionCwds.set(id, params.cwd);
 		try {
+			this.#bindSessionCwd(id, params.cwd);
 			await this.#attach(id, params.cwd, endpoint(result));
 			this.#scheduleBootstrap(id);
 			return { sessionId: id, ...(await this.#sessionState(id)) };
 		} catch (error) {
-			await this.#discardNewSession(id);
+			if (!this.#ambiguousSessionIds.has(id)) await this.#discardNewSession(id);
 			throw error;
 		}
 	}
 
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		if (params.cwd) this.#assertAbsoluteCwd(params.cwd);
+		const offset = this.#cursor(params.cursor);
 		const result = object(await (await this.#brokerAdapter()).global("session.list"));
 		const listing = object(result?.result) ?? result;
 		const listed = Array.isArray(listing?.sessions) ? listing.sessions : [];
+		const observed = new Map<string, { count: number; cwds: Set<string> }>();
+		for (const session of listed) {
+			const candidate = object(session) as BrokerSession | undefined;
+			if (typeof candidate?.sessionId !== "string" || typeof candidate.locator?.repo !== "string") continue;
+			const entry = observed.get(candidate.sessionId) ?? { count: 0, cwds: new Set<string>() };
+			entry.count++;
+			entry.cwds.add(path.resolve(candidate.locator.repo));
+			observed.set(candidate.sessionId, entry);
+		}
+		const conflictingIds = new Set<string>();
+		for (const [id, entry] of observed) {
+			const knownCwd = this.#knownSessionCwds.get(id);
+			const conflictsWithKnown =
+				knownCwd !== undefined && (entry.cwds.size !== 1 || !entry.cwds.has(path.resolve(knownCwd)));
+			if (entry.count <= 1 && entry.cwds.size <= 1 && !conflictsWithKnown) continue;
+			this.#markSessionAmbiguous(id);
+			conflictingIds.add(id);
+		}
 		if (params.cwd) {
-			const discovered = new Set<string>();
+			const canonicalCwd = path.resolve(params.cwd);
+			const bindings = new Set<string>();
 			for (const session of listed) {
 				const candidate = object(session) as BrokerSession | undefined;
 				if (
 					typeof candidate?.sessionId !== "string" ||
 					typeof candidate.locator?.repo !== "string" ||
-					path.resolve(candidate.locator.repo) !== path.resolve(params.cwd)
+					path.resolve(candidate.locator.repo) !== canonicalCwd
 				)
 					continue;
-				if (discovered.has(candidate.sessionId))
+				if (conflictingIds.has(candidate.sessionId))
 					throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${candidate.sessionId}`);
-				discovered.add(candidate.sessionId);
-				const knownCwd = this.#knownSessionCwds.get(candidate.sessionId);
-				if (knownCwd && path.resolve(knownCwd) !== path.resolve(params.cwd))
-					throw new AcpSdkAdapterError(
-						"conflict",
-						`ACP session ${candidate.sessionId} has conflicting cwd authority.`,
-					);
-				this.#knownSessionCwds.set(candidate.sessionId, params.cwd);
+				this.#validateSessionCwdBinding(candidate.sessionId, params.cwd);
+				bindings.add(candidate.sessionId);
 			}
+			for (const id of bindings) this.#knownSessionCwds.set(id, params.cwd);
 		}
-		return paginateAcpSessions(listed, params.cwd ?? undefined, this.#cursor(params.cursor));
+		return paginateAcpSessions(listed, params.cwd ?? undefined, offset);
 	}
 
 	async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+		this.#assertSessionNotAmbiguous(params.sessionId);
 		const record = this.#sessions.get(params.sessionId);
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		// ACP close has no cwd. Only connection-owned sessions may reach broker lifecycle control.
@@ -745,6 +762,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+		this.#assertSessionNotAmbiguous(params.sessionId);
 		const record = this.#sessions.get(params.sessionId);
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		// ACP's delete request has no cwd. Only delete sessions this connection has
@@ -752,17 +770,18 @@ export class AcpAgent implements Agent {
 		if (!cwd) return {};
 		this.#beginTeardown(params.sessionId);
 		try {
-			await this.#teardownSession(params.sessionId, "deleted", true);
 			let saved: string;
 			try {
 				saved = await this.#resolveSavedSession(params.sessionId, cwd);
 			} catch (error) {
 				if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
+					await this.#teardownSession(params.sessionId, "deleted", false);
 					this.#knownSessionCwds.delete(params.sessionId);
 					return {};
 				}
 				throw error;
 			}
+			await this.#teardownSession(params.sessionId, "deleted", true);
 			await (await this.#brokerAdapter()).global(
 				"session.delete",
 				{ sessionId: params.sessionId, sessionPath: saved, cwd, target: { path: cwd } },
@@ -814,6 +833,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
+		this.#assertSessionNotAmbiguous(params.sessionId);
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
@@ -852,6 +872,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async cancel(params: { sessionId: string }): Promise<void> {
+		this.#assertSessionNotAmbiguous(params.sessionId);
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${params.sessionId}`);
 		const waiter = record.activePrompt;
@@ -930,26 +951,53 @@ export class AcpAgent implements Agent {
 			((error.code === "not_found" || error.code === "resource_gone") as boolean)
 		);
 	}
+	#assertSessionNotAmbiguous(id: string): void {
+		if (this.#ambiguousSessionIds.has(id))
+			throw new AcpSdkAdapterError("conflict", `ACP session ${id} has ambiguous cwd authority.`);
+	}
+
+	#markSessionAmbiguous(id: string): void {
+		this.#knownSessionCwds.delete(id);
+		if (this.#ambiguousSessionIds.has(id)) return;
+		this.#ambiguousSessionIds.add(id);
+		this.#advanceSessionEpoch(id);
+	}
+
+	#validateSessionCwdBinding(id: string, cwd: string): void {
+		this.#assertSessionNotAmbiguous(id);
+		const knownCwd = this.#knownSessionCwds.get(id);
+		if (!knownCwd || path.resolve(knownCwd) === path.resolve(cwd)) return;
+		this.#markSessionAmbiguous(id);
+		throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+	}
+
+	#bindSessionCwd(id: string, cwd: string): void {
+		this.#validateSessionCwdBinding(id, cwd);
+		this.#knownSessionCwds.set(id, cwd);
+	}
 
 	async #attachExisting(id: string, cwd: string): Promise<void> {
+		this.#assertSessionNotAmbiguous(id);
 		const epoch = this.#sessionEpoch(id);
 		const attached = this.#sessions.get(id);
 		if (attached) {
-			if (path.resolve(attached.cwd) !== path.resolve(cwd))
+			if (path.resolve(attached.cwd) !== path.resolve(cwd)) {
+				this.#markSessionAmbiguous(id);
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			}
 			return;
 		}
-		const knownCwd = this.#knownSessionCwds.get(id);
-		if (knownCwd && path.resolve(knownCwd) !== path.resolve(cwd))
-			throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+		this.#validateSessionCwdBinding(id, cwd);
 		const resolving = this.#resolvingExisting.get(id);
 		if (resolving?.epoch === epoch) {
 			await resolving.task;
 			this.#assertSessionEpoch(id, epoch);
 			const resolved = this.#sessions.get(id);
 			if (!resolved) throw new AcpSdkAdapterError("unavailable", `ACP session ${id} did not attach.`);
-			if (path.resolve(resolved.cwd) !== path.resolve(cwd))
+			if (path.resolve(resolved.cwd) !== path.resolve(cwd)) {
+				this.#markSessionAmbiguous(id);
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			}
 			return;
 		}
 
@@ -987,36 +1035,48 @@ export class AcpAgent implements Agent {
 	}
 
 	async #scopedBrokerSession(id: string, cwd: string): Promise<BrokerSession | undefined> {
+		this.#assertSessionNotAmbiguous(id);
 		const response = object(await (await this.#brokerAdapter()).global("session.list", { cwd }));
 		const result = object(response?.result) ?? response;
 		const matches: BrokerSession[] = [];
 		for (const item of Array.isArray(result?.sessions) ? result.sessions : []) {
 			const session = object(item) as BrokerSession | undefined;
 			if (session?.sessionId !== id) continue;
-			if (typeof session.locator?.repo !== "string" || path.resolve(session.locator.repo) !== path.resolve(cwd))
+			if (typeof session.locator?.repo !== "string" || path.resolve(session.locator.repo) !== path.resolve(cwd)) {
+				this.#markSessionAmbiguous(id);
 				throw new AcpSdkAdapterError("conflict", `Broker returned conflicting session scope for ${id}.`);
+			}
 			matches.push(session);
 		}
-		if (matches.length > 1) throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${id}`);
+		if (matches.length > 1) {
+			this.#markSessionAmbiguous(id);
+			throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${id}`);
+		}
 		return matches[0];
 	}
 
 	async #attach(id: string, cwd: string, discovered: Endpoint, epoch = this.#sessionEpoch(id)): Promise<void> {
+		this.#assertSessionNotAmbiguous(id);
 		this.#assertSessionEpoch(id, epoch);
 		const existing = this.#sessions.get(id);
 		if (existing) {
-			if (path.resolve(existing.cwd) !== path.resolve(cwd))
+			if (path.resolve(existing.cwd) !== path.resolve(cwd)) {
+				this.#markSessionAmbiguous(id);
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			}
 			return;
 		}
+		this.#validateSessionCwdBinding(id, cwd);
 		const attaching = this.#attaching.get(id);
 		if (attaching?.epoch === epoch) {
 			await attaching.task;
 			this.#assertSessionEpoch(id, epoch);
 			const attached = this.#sessions.get(id);
 			if (!attached) throw new AcpSdkAdapterError("unavailable", `ACP session ${id} did not attach.`);
-			if (path.resolve(attached.cwd) !== path.resolve(cwd))
+			if (path.resolve(attached.cwd) !== path.resolve(cwd)) {
+				this.#markSessionAmbiguous(id);
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			}
 			return;
 		}
 
@@ -1054,8 +1114,8 @@ export class AcpAgent implements Agent {
 			record.reconnectUnsubscribe = adapter.onReconnectFailed(error =>
 				this.#recoverSessionAfterTransportFailure(id, adapter!, error),
 			);
+			this.#bindSessionCwd(id, cwd);
 			this.#sessions.set(id, record);
-			this.#knownSessionCwds.set(id, cwd);
 			await applyAcpPermissionMode(adapter, this.#clientCapabilities);
 			this.#assertSessionEpoch(id, epoch);
 		} catch (error) {
@@ -1203,12 +1263,15 @@ export class AcpAgent implements Agent {
 	}
 
 	#adapter(id: string): AcpSdkAdapter {
+		this.#assertSessionNotAmbiguous(id);
 		const record = this.#sessions.get(id);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unsupported ACP session: ${id}`);
 		return record.adapter;
 	}
 
 	async #resolveSavedSession(id: string, cwd: string): Promise<string> {
+		this.#validateSessionCwdBinding(id, cwd);
+		await this.#scopedBrokerSession(id, cwd);
 		const response = object(
 			await (await this.#brokerAdapter()).global("session.list", { resolveSessionId: id, cwd }),
 		);
@@ -1216,6 +1279,7 @@ export class AcpAgent implements Agent {
 		const saved = object(result?.savedSession);
 		if (saved?.id !== id || typeof saved.path !== "string")
 			throw new AcpSdkAdapterError("not_found", `Saved ACP session does not exist: ${id}`);
+		this.#bindSessionCwd(id, cwd);
 		return saved.path;
 	}
 
@@ -1448,9 +1512,10 @@ export class AcpAgent implements Agent {
 	}
 
 	#cursor(cursor: string | null | undefined): number {
-		if (!cursor) return 0;
-		const value = Number.parseInt(cursor, 10);
-		if (!Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid ACP session cursor: ${cursor}`);
+		if (cursor === null || cursor === undefined) return 0;
+		if (!/^(0|[1-9]\d*)$/.test(cursor)) throw new Error(`Invalid ACP session cursor: ${cursor}`);
+		const value = Number(cursor);
+		if (!Number.isSafeInteger(value)) throw new Error(`Invalid ACP session cursor: ${cursor}`);
 		return value;
 	}
 
@@ -1486,6 +1551,7 @@ export class AcpAgent implements Agent {
 		this.#attaching.clear();
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
+		this.#ambiguousSessionIds.clear();
 		this.#tearingDown.clear();
 		if (this.#broker) {
 			const broker = this.#broker;
