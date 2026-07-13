@@ -670,7 +670,10 @@ export class ExtensionRunner {
 		}
 	}
 
-	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+	async emit<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		wrapHandler?: <T>(invoke: () => Promise<T>) => Promise<T>,
+	): Promise<RunnerEmitResult<TEvent>> {
 		const handlers = this.#handlersByEvent.get(event.type) ?? [];
 		if (handlers.length === 0) return undefined as RunnerEmitResult<TEvent>;
 
@@ -678,7 +681,8 @@ export class ExtensionRunner {
 		let result: SessionBeforeEventResult | SessionCompactingResult | undefined;
 
 		for (const { ext, handler } of handlers) {
-			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			const invoke = () => this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			const handlerResult = wrapHandler ? await wrapHandler(invoke) : await invoke();
 
 			if (this.#isSessionBeforeEvent(event) && handlerResult) {
 				result = handlerResult as SessionBeforeEventResult;
