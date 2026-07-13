@@ -65,7 +65,7 @@ import {
 	sessionTag,
 } from "./config";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
-import { ensureTelegramDaemonRunning } from "./telegram-daemon";
+import { ensureTelegramDaemonRunning, stampEndpointPublicationIdentity } from "./telegram-daemon";
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -652,29 +652,6 @@ function resolveToken(): string {
 	// `GJC_NOTIFICATIONS_TOKEN` remains an enablement compatibility flag, never
 	// a reusable endpoint credential. Every host identity gets fresh authority.
 	return crypto.randomBytes(24).toString("base64url");
-}
-
-async function stampEndpointPublicationIdentity(
-	endpointPath: string,
-	identity: { canonicalRoot: string; leaseId: string },
-): Promise<void> {
-	const raw = JSON.parse(await fs.promises.readFile(endpointPath, "utf8")) as Record<string, unknown>;
-	raw.canonicalRoot = identity.canonicalRoot;
-	raw.leaseId = identity.leaseId;
-	const tmp = `${endpointPath}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
-	try {
-		await fs.promises.writeFile(tmp, JSON.stringify(raw), { mode: 0o600, flag: "wx" });
-		const handle = await fs.promises.open(tmp, "r");
-		try {
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-		await fs.promises.rename(tmp, endpointPath);
-	} catch (error) {
-		await fs.promises.unlink(tmp).catch(() => undefined);
-		throw error;
-	}
 }
 
 function parseAnswer(answerJson: string): unknown {
