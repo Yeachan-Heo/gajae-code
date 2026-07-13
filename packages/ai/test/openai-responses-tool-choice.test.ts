@@ -143,4 +143,49 @@ describe("OpenAI responses tool choice capability", () => {
 		expect(result.stopReason).toBe("error");
 		expect(getToolChoiceCapabilityOverride(testModel)).toBeUndefined();
 	});
+
+	it("omits tools and tool_choice when /btw passes empty tools + toolChoice none", async () => {
+		// Mirrors AgentSession.runEphemeralTurn: context.tools = [] is truthy, so
+		// a bare `if (context.tools)` used to emit tools:[] + tool_choice:"none",
+		// which Responses proxies (including grok-build) reject with
+		// "A tool_choice was set on the request but no tools were specified."
+		let payload: Record<string, unknown> | undefined;
+		const testModel = model();
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+				return okResponse(testModel.id);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		await streamOpenAIResponses(
+			testModel,
+			{
+				messages: [{ role: "user", content: "btw what is X", timestamp: 0 }],
+				tools: [],
+			},
+			{ apiKey: "test-key", toolChoice: "none" },
+		).result();
+		expect(payload?.tools).toBeUndefined();
+		expect(payload?.tool_choice).toBeUndefined();
+	});
+
+	it("keeps tool_choice none when real tools are present", async () => {
+		let payload: Record<string, unknown> | undefined;
+		const testModel = model();
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+				return okResponse(testModel.id);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		await streamOpenAIResponses(testModel, testContext, {
+			apiKey: "test-key",
+			toolChoice: "none",
+		}).result();
+		expect(Array.isArray(payload?.tools)).toBe(true);
+		expect((payload?.tools as unknown[]).length).toBeGreaterThan(0);
+		expect(payload?.tool_choice).toBe("none");
+	});
 });
