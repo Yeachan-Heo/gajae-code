@@ -7,6 +7,11 @@
 - Renamed the notifications SDK to the Gajae-Code SDK: `docs/notifications-sdk.md` is now `docs/sdk.md`, `src/notifications/` is now `src/sdk/bus/`, and `src/sdk.ts` is now the `src/sdk/` module directory. Old deep-import specifiers no longer resolve.
 - Moved SDK discovery from `.gjc/state/notifications/` to `.gjc/state/sdk/`. Restart sessions and daemons together when upgrading; the runtime does not dual-scan the old and new directories.
 - Removed the `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` external ingress modes. Machine clients must use the SDK WebSocket interfaces documented in `docs/sdk.md`; no RPC or Bridge compatibility path remains.
+
+### Fixed
+
+- ACP connections now retain independent session authority across multiple working directories while permanently revoking an ID that the SDK broker reports under conflicting workspaces. CWD-less close/delete and active controls fail closed after ambiguity, scoped-list bindings commit atomically, and malformed pagination cursors are rejected instead of accepting numeric prefixes.
+
 ## [0.10.1] - 2026-07-13
 
 ### Added

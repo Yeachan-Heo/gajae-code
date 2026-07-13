@@ -19,6 +19,7 @@ The SDK endpoint is loopback-only and is created with the session. It provides t
 ## ACP readiness
 
 ACP remains a stdio editor protocol. Its session control uses the SDK adapter internally; it is not a replacement external bot-control protocol.
+One ACP connection may manage sessions from multiple absolute working directories. The SDK broker remains the canonical lifecycle authority, while the ACP adapter keeps a connection-local session-to-CWD binding for methods such as close and delete that do not carry a CWD. If the broker exposes the same session ID under conflicting workspaces, that ID becomes non-authorizing for the rest of the connection and lifecycle operations fail closed.
 
 ## Verification references
 
