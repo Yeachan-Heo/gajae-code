@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Shared the temporary stdout error listener across terminal instances, preventing `MaxListenersExceededWarning` during repeated TUI start/stop cycles while retaining late detached-PTY error handling.
 
 ## [0.10.1] - 2026-07-13
 ### Fixed
