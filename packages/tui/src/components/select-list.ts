@@ -20,7 +20,7 @@ export interface SelectItem {
 	value: string;
 	label: string;
 	description?: string;
-	/** Dim hint text shown inline after cursor when this item is selected */
+	/** Autocomplete hint consumed by Editor; SelectList does not render it. */
 	hint?: string;
 	/**
 	 * Renders dimmed and can never be selected: navigation skips it, selection
@@ -57,6 +57,8 @@ export class SelectList implements Component {
 	#filteredItems: ReadonlyArray<SelectItem>;
 	/** Index of the selected enabled item, or `-1` when no enabled item exists. */
 	#selectedIndex: number = 0;
+	/** First rendered item while selection is absent. */
+	#viewportStartIndex: number = 0;
 
 	onSelect?: (item: SelectItem) => void;
 	onCancel?: () => void;
@@ -70,21 +72,25 @@ export class SelectList implements Component {
 	) {
 		this.#filteredItems = items;
 		this.#selectedIndex = this.#firstEnabledIndex();
+		this.#syncViewportToIndex(Math.max(0, this.#selectedIndex));
 	}
 
 	setFilter(filter: string): void {
 		this.#filteredItems = this.items.filter(item => item.value.toLowerCase().startsWith(filter.toLowerCase()));
 		this.#selectedIndex = this.#firstEnabledIndex();
+		this.#syncViewportToIndex(Math.max(0, this.#selectedIndex));
 	}
 
 	setSelectedIndex(index: number): void {
 		if (this.#filteredItems.length === 0) {
 			this.#selectedIndex = -1;
+			this.#viewportStartIndex = 0;
 			return;
 		}
 		const clamped = Math.max(0, Math.min(index, this.#filteredItems.length - 1));
 		this.#selectedIndex =
 			this.#findEnabledIndex(clamped, 1, false) ?? this.#findEnabledIndex(clamped, -1, false) ?? -1;
+		this.#syncViewportToIndex(this.#selectedIndex >= 0 ? this.#selectedIndex : clamped);
 	}
 
 	invalidate(): void {
@@ -102,11 +108,10 @@ export class SelectList implements Component {
 
 		const primaryColumnWidth = this.#getPrimaryColumnWidth();
 
-		// Calculate visible range with scrolling
-		const startIndex = Math.max(
-			0,
-			Math.min(this.#selectedIndex - Math.floor(this.maxVisible / 2), this.#filteredItems.length - this.maxVisible),
-		);
+		// Calculate visible range with scrolling. Selection owns the viewport when
+		// present; otherwise navigation moves an independent viewport anchor.
+		const startIndex =
+			this.#selectedIndex >= 0 ? this.#startIndexForSelection(this.#selectedIndex) : this.#clampedViewportStart();
 		const endIndex = Math.min(startIndex + this.maxVisible, this.#filteredItems.length);
 
 		// Render visible items
@@ -271,6 +276,10 @@ export class SelectList implements Component {
 
 	#moveSelection(direction: 1 | -1): void {
 		if (this.#filteredItems.length === 0) return;
+		if (this.#selectedIndex < 0 && this.#firstEnabledIndex() < 0) {
+			this.#moveViewport(direction, true);
+			return;
+		}
 		const start =
 			this.#selectedIndex < 0
 				? direction === 1
@@ -278,21 +287,64 @@ export class SelectList implements Component {
 					: this.#filteredItems.length - 1
 				: (this.#selectedIndex + direction + this.#filteredItems.length) % this.#filteredItems.length;
 		const next = this.#findEnabledIndex(start, direction, true);
-		if (next === undefined || next === this.#selectedIndex) return;
+		if (next === undefined) return;
+		if (next === this.#selectedIndex) {
+			// Preserve the legacy enabled-only callback contract while suppressing
+			// no-op previews when disabled entries collapse navigation to one item.
+			if (this.#allItemsEnabled()) this.#notifySelectionChange();
+			return;
+		}
 		this.#selectedIndex = next;
+		this.#syncViewportToIndex(next);
 		this.#notifySelectionChange();
 	}
 
 	#movePage(direction: 1 | -1): void {
 		if (this.#filteredItems.length === 0) return;
+		if (this.#selectedIndex < 0 && this.#firstEnabledIndex() < 0) {
+			this.#moveViewport(direction * this.maxVisible, false);
+			return;
+		}
 		const from = this.#selectedIndex < 0 ? (direction === 1 ? -1 : this.#filteredItems.length) : this.#selectedIndex;
 		const target = Math.max(0, Math.min(this.#filteredItems.length - 1, from + direction * this.maxVisible));
 		const next =
 			this.#findEnabledIndex(target, direction, false) ??
 			this.#findEnabledIndex(target, direction === 1 ? -1 : 1, false);
-		if (next === undefined || next === this.#selectedIndex) return;
+		if (next === undefined) return;
+		if (next === this.#selectedIndex) {
+			if (this.#allItemsEnabled()) this.#notifySelectionChange();
+			return;
+		}
 		this.#selectedIndex = next;
+		this.#syncViewportToIndex(next);
 		this.#notifySelectionChange();
+	}
+
+	#allItemsEnabled(): boolean {
+		return this.#filteredItems.every(item => !item.disabled);
+	}
+
+	#maxViewportStart(): number {
+		return Math.max(0, this.#filteredItems.length - this.maxVisible);
+	}
+
+	#clampedViewportStart(): number {
+		return Math.max(0, Math.min(this.#viewportStartIndex, this.#maxViewportStart()));
+	}
+
+	#startIndexForSelection(index: number): number {
+		return Math.max(0, Math.min(index - Math.floor(this.maxVisible / 2), this.#maxViewportStart()));
+	}
+
+	#syncViewportToIndex(index: number): void {
+		this.#viewportStartIndex = this.#startIndexForSelection(index);
+	}
+
+	#moveViewport(delta: number, wrap: boolean): void {
+		const maxStart = this.#maxViewportStart();
+		if (maxStart === 0) return;
+		const next = this.#viewportStartIndex + delta;
+		this.#viewportStartIndex = wrap ? (next + maxStart + 1) % (maxStart + 1) : Math.max(0, Math.min(next, maxStart));
 	}
 
 	#notifySelectionChange(): void {

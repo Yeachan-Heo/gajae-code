@@ -203,6 +203,37 @@ describe("SelectList", () => {
 		expect(cancelled).toBe(true);
 	});
 
+	it("preserves enabled-only callbacks when arrow navigation wraps to the same item", () => {
+		const changed: string[] = [];
+		const list = new SelectList([{ value: "only", label: "only" }], 5, testTheme);
+		list.onSelectionChange = item => changed.push(item.value);
+
+		list.handleInput("\x1b[B");
+		list.handleInput("\x1b[A");
+
+		expect(changed).toEqual(["only", "only"]);
+	});
+
+	it("preserves enabled-only callbacks at page boundaries", () => {
+		const changed: string[] = [];
+		const list = new SelectList(
+			[
+				{ value: "one", label: "one" },
+				{ value: "two", label: "two" },
+				{ value: "three", label: "three" },
+			],
+			2,
+			testTheme,
+		);
+		list.onSelectionChange = item => changed.push(item.value);
+
+		list.handleInput("\x1b[5~");
+		list.setSelectedIndex(2);
+		list.handleInput("\x1b[6~");
+
+		expect(changed).toEqual(["one", "three"]);
+	});
+
 	it("dims disabled items and excludes them from selection", () => {
 		const selected: string[] = [];
 		const list = new SelectList(
@@ -266,6 +297,28 @@ describe("SelectList", () => {
 		expect(changed).toEqual(["four", "one", "four"]);
 	});
 
+	it("suppresses no-op callbacks when disabled items leave one enabled choice", () => {
+		const changed: string[] = [];
+		const list = new SelectList(
+			[
+				{ value: "off", label: "off" },
+				{ value: "blocked-a", label: "blocked-a", disabled: true },
+				{ value: "blocked-b", label: "blocked-b", disabled: true },
+			],
+			2,
+			testTheme,
+		);
+		list.onSelectionChange = item => changed.push(item.value);
+
+		list.handleInput("\x1b[B");
+		list.handleInput("\x1b[A");
+		list.handleInput("\x1b[6~");
+		list.handleInput("\x1b[5~");
+
+		expect(list.getSelectedItem()?.value).toBe("off");
+		expect(changed).toEqual([]);
+	});
+
 	it("suppresses selection and callbacks when filtering to disabled items", () => {
 		const selected: string[] = [];
 		const changed: string[] = [];
@@ -308,7 +361,7 @@ describe("SelectList", () => {
 		expect(list.getSelectedItem()?.value).toBe("four");
 	});
 
-	it("reports no selection instead of a phantom position when every item is disabled", () => {
+	it("moves the viewport without creating a selection when every item is disabled", () => {
 		const selected: string[] = [];
 		const changed: string[] = [];
 		const items = ["a", "b", "c", "d", "e", "f"].map(value => ({ value, label: value, disabled: true }));
@@ -316,24 +369,32 @@ describe("SelectList", () => {
 		list.onSelect = item => selected.push(item.value);
 		list.onSelectionChange = item => changed.push(item.value);
 
-		const lines = list.render(80);
+		const firstPage = list.render(80);
+		expect(firstPage).toContain("  a");
+		expect(firstPage).toContain("  c");
+		expect(firstPage).not.toContain("  d");
+		expect(firstPage).toContain("  (-/6)");
+		expect(firstPage.some(line => line.includes("→"))).toBe(false);
 
-		// Scrolled all-disabled list: dimmed rows, no cursor, and the scroll
-		// indicator must not claim a selected row.
-		expect(lines.some(line => line.includes("(-/6)"))).toBe(true);
-		expect(lines.some(line => line.includes("(1/6)"))).toBe(false);
-		expect(lines.some(line => line.includes("→"))).toBe(false);
+		list.handleInput("\x1b[6~"); // page down clamps to the last viewport
+		const lastPage = list.render(80);
+		expect(lastPage).not.toContain("  a");
+		expect(lastPage).toContain("  d");
+		expect(lastPage).toContain("  f");
+		expect(lastPage).toContain("  (-/6)");
+
+		list.handleInput("\x1b[5~"); // page up returns to the first viewport
+		expect(list.render(80)).toContain("  a");
+		list.handleInput("\x1b[A"); // up wraps the viewport to the end
+		expect(list.render(80)).toContain("  f");
+		list.handleInput("\x1b[B"); // down wraps it back to the start
+		expect(list.render(80)).toContain("  a");
+
+		list.setSelectedIndex(3); // programmatic navigation moves the viewport only
+		expect(list.render(80)).toContain("  d");
+		list.handleInput("\n");
+
 		expect(list.getSelectedItem()).toBeNull();
-
-		list.handleInput("\x1b[B"); // down
-		list.handleInput("\x1b[A"); // up
-		list.handleInput("\x1b[6~"); // page down
-		list.handleInput("\x1b[5~"); // page up
-		list.setSelectedIndex(3);
-		list.handleInput("\n"); // confirm
-
-		expect(list.getSelectedItem()).toBeNull();
-		expect(list.render(80).some(line => line.includes("(-/6)"))).toBe(true);
 		expect(selected).toEqual([]);
 		expect(changed).toEqual([]);
 	});
