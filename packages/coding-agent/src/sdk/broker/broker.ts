@@ -16,7 +16,7 @@ import { deriveIdempotencyIdentity } from "./identity";
 import { executeLifecycle, isCanonicalSessionId } from "./lifecycle";
 
 import { LifecycleLedger } from "./lifecycle-ledger";
-import { type IndexedSession, SessionIndex } from "./session-index";
+import { endpointIncarnation, type IndexedSession, SessionIndex } from "./session-index";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -157,31 +157,12 @@ function canonicalJson(value: unknown): string {
 }
 
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
-function endpointIncarnation(
-	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
-	sessionId: string,
-): string | undefined {
-	if (
-		!Number.isSafeInteger(record.endpointGeneration) ||
-		record.endpointGeneration <= 0 ||
-		!Number.isSafeInteger(record.pid) ||
-		record.pid <= 0 ||
-		typeof record.endpointMtimeMs !== "number" ||
-		!Number.isFinite(record.endpointMtimeMs) ||
-		record.endpointMtimeMs <= 0
-	)
-		return undefined;
-	return createHash("sha256")
-		.update(
-			canonicalJson({
-				endpointGeneration: record.endpointGeneration,
-				endpointMtimeMs: record.endpointMtimeMs,
-				pid: record.pid,
-				sessionId,
-			}),
-		)
-		.digest("hex");
-}
+type SavedSessionIdentity = { dev: string; ino: string; size: number; mtimeMs: number; mtimeNs: string };
+type BrokerListedSession = IndexedSession & {
+	canonicalCwd: string;
+	path?: string;
+	sessionIdentity?: SavedSessionIdentity;
+};
 function expectedEndpointAuthority(input: Record<string, unknown>): EndpointAuthority | BrokerResponse {
 	const endpointGeneration = input.endpointGeneration;
 	const endpointIncarnation = input.endpointIncarnation;
@@ -239,9 +220,20 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
 			};
 		case "session.resume":
-		case "session.close":
-		case "session.delete":
 			return { sessionId: id };
+		case "session.close":
+			return {
+				sessionId: id,
+				endpointGeneration: input.endpointGeneration,
+				endpointIncarnation: input.endpointIncarnation,
+			};
+		case "session.delete":
+			return {
+				sessionId: id,
+				cwd: input.cwd,
+				sessionPath: input.sessionPath,
+				sessionIdentity: input.sessionIdentity,
+			};
 		default:
 			return { operation, root, sessionId: id };
 	}
@@ -511,6 +503,84 @@ export class Broker {
 			throw e;
 		}
 	}
+	/** Realpath-equivalent canonical workspace identity; falls back to lexical resolution. */
+	async #canonicalCwd(cwd: string): Promise<string> {
+		try {
+			return await fs.realpath(path.resolve(cwd));
+		} catch {
+			return path.resolve(cwd);
+		}
+	}
+	/** Immutable transcript file identity for saved-session authority. */
+	async #transcriptIdentity(
+		transcriptPath: string,
+	): Promise<{ dev: string; ino: string; size: number; mtimeMs: number; mtimeNs: string } | undefined> {
+		try {
+			const stat = await fs.stat(transcriptPath, { bigint: true });
+			return {
+				dev: stat.dev.toString(),
+				ino: stat.ino.toString(),
+				size: Number(stat.size),
+				mtimeMs: Number(stat.mtimeMs),
+				mtimeNs: stat.mtimeNs.toString(),
+			};
+		} catch {
+			return undefined;
+		}
+	}
+	#savedAuthorities(cwd: string): Map<string, { path: string; identity: SavedSessionIdentity }> {
+		const inventory = SessionManager.inventorySessionsStrict(cwd, {
+			sessionDir: SessionManager.getDefaultSessionDir(cwd, this.settings.agentDir),
+		});
+		if (inventory.kind !== "complete") return new Map();
+		const authorities = new Map<string, { path: string; identity: SavedSessionIdentity } | undefined>();
+		for (const candidate of inventory.candidates) {
+			if (authorities.has(candidate.id)) {
+				authorities.set(candidate.id, undefined);
+				continue;
+			}
+			authorities.set(candidate.id, {
+				path: candidate.path,
+				identity: {
+					dev: candidate.identity.dev.toString(),
+					ino: candidate.identity.ino.toString(),
+					size: candidate.identity.size,
+					mtimeMs: candidate.identity.mtimeMs,
+					mtimeNs: candidate.identity.mtimeNs.toString(),
+				},
+			});
+		}
+		return new Map(
+			[...authorities.entries()].filter(
+				(entry): entry is [string, { path: string; identity: SavedSessionIdentity }] => entry[1] !== undefined,
+			),
+		);
+	}
+
+	async #listedSessions(
+		sessions: IndexedSession[],
+		saved: Map<string, { path: string; identity: SavedSessionIdentity }>,
+		savedScope?: string,
+	): Promise<BrokerListedSession[]> {
+		const canonical = new Map<string, Promise<string>>();
+		return Promise.all(
+			sessions.map(async session => {
+				const repo = session.locator.repo;
+				let pending = canonical.get(repo);
+				if (!pending) {
+					pending = this.#canonicalCwd(repo);
+					canonical.set(repo, pending);
+				}
+				const canonicalCwd = await pending;
+				const savedAuthority = canonicalCwd === savedScope ? saved.get(session.sessionId) : undefined;
+				return {
+					...session,
+					canonicalCwd,
+					...(savedAuthority ? { path: savedAuthority.path, sessionIdentity: savedAuthority.identity } : {}),
+				};
+			}),
+		);
+	}
 	async handleRequest(
 		operation: string,
 		input: Record<string, unknown>,
@@ -522,23 +592,40 @@ export class Broker {
 		input = normalization.input;
 		if (operation === "session.list") {
 			await this.index.refresh();
-			const result = this.index.listSessions();
+			const indexed = this.index.listSessions();
+			const production = this.index.listProductionSessions();
 			const resolveSessionId = typeof input.resolveSessionId === "string" ? input.resolveSessionId : undefined;
 			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
+			const canonicalCwd = cwd ? await this.#canonicalCwd(cwd) : undefined;
+			const savedAuthorities = cwd ? this.#savedAuthorities(cwd) : new Map();
+			const [sessions, observations] = await Promise.all([
+				this.#listedSessions(indexed.sessions, savedAuthorities, canonicalCwd),
+				this.#listedSessions(
+					production.sessions.filter(session => session.live),
+					savedAuthorities,
+					canonicalCwd,
+				),
+			]);
+			const result = {
+				indexSeq: indexed.indexSeq,
+				sessions,
+				...(observations.length ? { observations } : {}),
+				warnings: indexed.warnings,
+				...(canonicalCwd ? { canonicalCwd } : {}),
+			};
 			if (resolveSessionId && cwd) {
 				const sessionDir = SessionManager.getDefaultSessionDir(cwd, this.settings.agentDir);
 				const match = await resolveResumableSession(resolveSessionId, cwd, sessionDir);
-				return {
-					ok: true,
-					result: {
-						...result,
-						savedSession:
-							match && match.session.id === resolveSessionId
-								? { id: match.session.id, path: match.session.path }
-								: undefined,
-					},
-					indexSeq: result.indexSeq,
-				};
+				let savedSession: { id: string; path: string; sessionIdentity?: SavedSessionIdentity } | undefined;
+				if (match && match.session.id === resolveSessionId) {
+					const sessionIdentity = await this.#transcriptIdentity(match.session.path);
+					savedSession = {
+						id: match.session.id,
+						path: match.session.path,
+						...(sessionIdentity ? { sessionIdentity } : {}),
+					};
+				}
+				return { ok: true, result: { ...result, savedSession }, indexSeq: result.indexSeq };
 			}
 			return { ok: true, result, indexSeq: result.indexSeq };
 		}

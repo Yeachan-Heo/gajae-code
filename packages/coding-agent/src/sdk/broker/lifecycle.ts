@@ -105,6 +105,18 @@ function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionL
 		/^\d+$/.test(identity.mtimeNs)
 	);
 }
+function sameTranscriptIdentity(
+	left: SessionLifecycleTranscriptIdentity,
+	right: SessionLifecycleTranscriptIdentity,
+): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.size === right.size &&
+		left.mtimeMs === right.mtimeMs &&
+		left.mtimeNs === right.mtimeNs
+	);
+}
 
 function hasValidTranscriptAuthority(path: unknown, identity: unknown): path is string {
 	return typeof path === "string" && path.length > 0 && isSessionLifecycleTranscriptIdentity(identity);
@@ -1050,6 +1062,13 @@ async function validateDeletePath(
 	} catch {
 		return fail("not_found", "Requested saved session does not exist or cannot be read.");
 	}
+	const suppliedIdentity = input.sessionIdentity;
+	if (
+		suppliedIdentity !== undefined &&
+		(!isSessionLifecycleTranscriptIdentity(suppliedIdentity) ||
+			!sameTranscriptIdentity(suppliedIdentity, serializeTranscriptIdentity(snapshot.stat)))
+	)
+		return fail("endpoint_stale", "Saved session transcript identity is stale.");
 	try {
 		const newline = snapshot.bytes.indexOf(0x0a);
 		const firstLine = Buffer.from(

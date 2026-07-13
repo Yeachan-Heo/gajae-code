@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { endpointIncarnation } from "../src/sdk/broker/session-index";
 
 type TestServer = {
 	port: number | undefined;
@@ -14,6 +15,7 @@ type TestServer = {
 const directories: string[] = [];
 const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
 
+const SAVED_IDENTITY = { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "4000000" };
 afterEach(async () => {
 	for (const server of servers.splice(0)) server.stop(true);
 	for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
@@ -110,6 +112,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let brokerSessions: Record<string, unknown>[] = [
 		{ sessionId: "owned-session", locator: { repo: cwd }, live: true, endpointGeneration: 1 },
 	];
+	const ownedEndpointIncarnation = endpointIncarnation(
+		{ endpointGeneration: 1, pid: process.pid, endpointMtimeMs: 1 },
+		"owned-session",
+	)!;
 	const lifecycleInputs: Record<string, unknown>[] = [];
 	const brokerRequests: Record<string, unknown>[] = [];
 	const promptInputs: Record<string, unknown>[] = [];
@@ -163,6 +169,25 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					}
 					if (frame.operation === "session.list") {
 						const input = frame.input as Record<string, unknown>;
+						const sessions = brokerSessions.map(session => {
+							const endpointGeneration =
+								typeof session.endpointGeneration === "number" ? session.endpointGeneration : 1;
+							const pid = typeof session.pid === "number" ? session.pid : process.pid;
+							const endpointMtimeMs =
+								typeof session.endpointMtimeMs === "number" ? session.endpointMtimeMs : endpointGeneration;
+							return {
+								...session,
+								canonicalCwd: path.resolve((session.locator as { repo: string }).repo),
+								pid,
+								endpointMtimeMs,
+								endpointIncarnation: endpointIncarnation(
+									{ endpointGeneration, pid, endpointMtimeMs },
+									String(session.sessionId),
+								),
+								path: path.join(cwd, "owned-session.jsonl"),
+								sessionIdentity: SAVED_IDENTITY,
+							};
+						});
 						socket.send(
 							JSON.stringify({
 								type: "broker_response",
@@ -170,8 +195,18 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								ok: true,
 								result:
 									input.resolveSessionId === "owned-session"
-										? { savedSession: { id: "owned-session", path: path.join(cwd, "owned-session.jsonl") } }
-										: { sessions: brokerSessions },
+										? {
+												canonicalCwd: path.resolve(typeof input.cwd === "string" ? input.cwd : cwd),
+												savedSession: {
+													id: "owned-session",
+													path: path.join(cwd, "owned-session.jsonl"),
+													sessionIdentity: SAVED_IDENTITY,
+												},
+											}
+										: {
+												canonicalCwd: path.resolve(typeof input.cwd === "string" ? input.cwd : cwd),
+												sessions,
+											},
 							}),
 						);
 						return;
@@ -528,7 +563,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	);
 	const brokerRequestsBeforeConflict = brokerRequests.length;
 	await expect(conflictingLoader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] })).rejects.toThrow(
-		"Broker returned duplicate session id",
+		"Broker returned ambiguous session authority",
 	);
 	expect(brokerRequests.slice(brokerRequestsBeforeConflict)).toEqual([
 		expect.objectContaining({ operation: "session.list", input: { cwd } }),
@@ -549,7 +584,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const brokerRequestsBeforeScopeConflict = brokerRequests.length;
 	await expect(
 		scopeConflictingLoader.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
-	).rejects.toThrow("Broker returned conflicting session scope");
+	).rejects.toThrow("Broker returned ambiguous session authority");
 	expect(brokerRequests.slice(brokerRequestsBeforeScopeConflict)).toEqual([
 		expect.objectContaining({ operation: "session.list", input: { cwd } }),
 	]);
@@ -569,12 +604,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	});
 	const closeRequests = brokerRequests.filter(request => request.operation === "session.close");
 	expect(new Set(closeRequests.map(request => request.idempotencyKey))).toEqual(
-		new Set([`acp:session.close:${created.sessionId}`]),
+		new Set([`acp:session.close:${created.sessionId}:${ownedEndpointIncarnation}`]),
 	);
 	expect(brokerRequests).toContainEqual(
 		expect.objectContaining({
 			operation: "session.delete",
-			idempotencyKey: `acp:session.delete:${created.sessionId}`,
+			idempotencyKey: expect.stringMatching(new RegExp(`^acp:session\\.delete:${created.sessionId}:[a-f0-9]{64}$`)),
 		}),
 	);
 	brokerSessions = [{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 }];
