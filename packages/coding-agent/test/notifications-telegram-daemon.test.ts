@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
+import { type ChatEffect, ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import {
 	markdownToTelegramHtml,
 	splitTelegramHtml,
@@ -236,6 +237,130 @@ class FailingCallbackAckBotApi extends FakeBotApi {
 	}
 }
 
+/** Snapshot of the durable notification-roots registry for orphan-cleanup assertions. */
+function rootsRegistrySnapshot(agentDir: string): {
+	roots: string[];
+	sessions: Record<string, string>;
+	sessionLeases: Record<string, { leaseId: string; refreshedAt: number }>;
+	orphanCandidates: Record<string, { observedAt: number; leaseId: string; topicId: string }>;
+} {
+	const file = daemonPaths(agentDir).roots;
+	if (!fs.existsSync(file)) {
+		return { roots: [], sessions: {}, sessionLeases: {}, orphanCandidates: {} };
+	}
+	return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+/** Snapshot of the persisted telegram topic registry. */
+function topicRegistrySnapshot(agentDir: string): {
+	topics: Record<string, { topicId: string; createdAt: number; [key: string]: unknown }>;
+} {
+	const file = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	if (!fs.existsSync(file)) return { topics: {} };
+	return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+/** Read the durable telegram deletion-claim effects for crash-replay/retry assertions. */
+async function telegramDeletionEffects(agentDir: string): Promise<ChatEffect[]> {
+	return new ChatEffectJournal({ agentDir, transport: "telegram" }).list();
+}
+/**
+ * Register a notification root and publish a live identity-bearing endpoint file
+ * (canonicalRoot + leaseId stamped from the registration). The daemon binds this
+ * endpoint-carried identity and validates it against the registry — it never
+ * infers a lease from the registry. Returns the exact admission identity.
+ */
+async function publishIdentityEndpoint(
+	s: Settings,
+	cwd: string,
+	sessionId: string,
+	url: string,
+	token: string,
+	opts?: { now?: () => number; randomId?: () => string; pid?: number },
+): Promise<{ canonicalRoot: string; leaseId: string }> {
+	const reg = await registerNotificationRoot({ settings: s, cwd, sessionId, ...(opts ?? {}) });
+	const dir = path.join(reg.root, "sdk");
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(dir, `${sessionId}.json`),
+		JSON.stringify({
+			url,
+			token,
+			...(opts?.pid === undefined ? {} : { pid: opts.pid }),
+			canonicalRoot: reg.root,
+			leaseId: reg.leaseId,
+		}),
+	);
+	return { canonicalRoot: reg.root, leaseId: reg.leaseId };
+}
+
+async function connectIdentitySession(
+	daemon: TelegramNotificationDaemon,
+	sessionId: string,
+	url: string,
+	token: string,
+): Promise<void> {
+	const daemonSettings = (daemon as unknown as { opts: { settings: Settings } }).opts.settings;
+	const cwd = path.join(daemonSettings.getAgentDir(), "test-workspaces", encodeURIComponent(sessionId));
+	const identity = await publishIdentityEndpoint(daemonSettings, cwd, sessionId, url, token);
+	daemon.connectSession(sessionId, url, token, identity);
+}
+
+/**
+ * TelegramDaemonFs whose `readdir` fails with a non-ENOENT error (EACCES) for one
+ * mapped root's sdk dir, so the scan classifies that root as ambiguous instead of
+ * confirmed absence. Every other operation delegates to the real fs.
+ */
+function fsWithUnreadableReaddir(withheldSdkDir: string): TelegramDaemonFs {
+	const accessError = Object.assign(new Error("permission denied"), { code: "EACCES" });
+	return {
+		mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+		readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+		writeFile: async (file, data, opts) => {
+			await fs.promises.writeFile(file, data, opts);
+		},
+		rename: (oldPath, newPath) => fs.promises.rename(oldPath, newPath).then(() => undefined),
+		unlink: file => fs.promises.unlink(file),
+		open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
+		readdir: file => (file === withheldSdkDir ? Promise.reject(accessError) : fs.promises.readdir(file)),
+		chmod: (file, mode) => fs.promises.chmod(file, mode),
+	};
+}
+
+function fsWithUnresolvableRealpath(withheldRoot: string): TelegramDaemonFs {
+	const accessError = Object.assign(new Error("permission denied"), { code: "EACCES" });
+	return {
+		mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+		readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+		writeFile: async (file, data, opts) => {
+			await fs.promises.writeFile(file, data, opts);
+		},
+		rename: (oldPath, newPath) => fs.promises.rename(oldPath, newPath).then(() => undefined),
+		unlink: file => fs.promises.unlink(file),
+		open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
+		readdir: file => fs.promises.readdir(file),
+		chmod: (file, mode) => fs.promises.chmod(file, mode),
+		realpath: file => (file === withheldRoot ? Promise.reject(accessError) : fs.promises.realpath(file)),
+	};
+}
+
+/** FakeBotApi that rate-limits (429 + retry_after) the first deleteForumTopic, then succeeds. */
+class RateLimitedDeleteBotApi extends FakeBotApi {
+	deleteAttempts = 0;
+	retryAfterSec = 30;
+	override async call(method: string, body: unknown): Promise<unknown> {
+		if (method === "deleteForumTopic") {
+			this.calls.push({ method, body });
+			this.deleteAttempts++;
+			if (this.deleteAttempts === 1) {
+				return { ok: false, error_code: 429, parameters: { retry_after: this.retryAfterSec } };
+			}
+			return { ok: true, result: true };
+		}
+		return super.call(method, body);
+	}
+}
+
 describe("telegram daemon", () => {
 	test("N concurrent ensureTelegramDaemonRunning creates exactly one owner", async () => {
 		const agentDir = tempAgentDir();
@@ -308,7 +433,7 @@ describe("telegram daemon", () => {
 		expect(registry.roots).toHaveLength(12);
 		expect(Object.keys(registry.sessions)).toHaveLength(12);
 		for (let i = 0; i < 12; i++) {
-			expect(registry.sessions[`s${i}`]).toBe(path.join(agentDir, `cwd-${i}`, ".gjc", "state"));
+			expect(registry.sessions[`s${i}`]).toBe(path.join(fs.realpathSync(agentDir), `cwd-${i}`, ".gjc", "state"));
 		}
 	});
 
@@ -407,11 +532,11 @@ describe("telegram daemon", () => {
 	test("TelegramEventDispatchState groups dispatch state without changing maps", () => {
 		const state = new TelegramEventDispatchState();
 		state.busy.add("S");
-		state.inboundReactions.set(7, { messageId: 70 });
+		state.inboundReactions.set(7, { messageId: 70, sessionId: "S", generation: 1 });
 		state.seenUpdateIds.add(99);
 
 		expect([...state.busy]).toEqual(["S"]);
-		expect(state.inboundReactions.get(7)).toEqual({ messageId: 70 });
+		expect(state.inboundReactions.get(7)).toEqual({ messageId: 70, sessionId: "S", generation: 1 });
 		expect(state.seenUpdateIds.has(99)).toBe(true);
 	});
 
@@ -647,7 +772,7 @@ describe("telegram daemon", () => {
 		expect(after.ownerId).not.toBe("old");
 		expect(after.generation).toBe(DAEMON_GENERATION);
 		// The new session's root is persisted so the replacement daemon serves it.
-		expect(after.roots).toContain(path.join(cwd, ".gjc", "state"));
+		expect(after.roots).toContain(path.join(fs.realpathSync(agentDir), "new-session", ".gjc", "state"));
 	});
 
 	test("#2028 ensureTelegramDaemonRunning reuses a current-generation live owner without a reload", async () => {
@@ -676,6 +801,40 @@ describe("telegram daemon", () => {
 		// Still the original owner; the new session's root is registered onto it.
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("old");
 		expect(fs.existsSync(paths.roots)).toBe(true);
+	});
+
+	test("ensureTelegramDaemonRunning exposes the exact committed registration identity", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, {
+			pid: process.pid,
+			generation: DAEMON_GENERATION,
+			heartbeatAt: Date.now(),
+		});
+		const cwd = path.join(agentDir, "published-workspace");
+		let captured: { canonicalRoot: string; leaseId: string } | undefined;
+		const result = await ensureTelegramDaemonRunning(
+			{
+				settings: s,
+				cwd,
+				sessionId: "published-session",
+				onRegistered: identity => {
+					captured = identity;
+				},
+			},
+			{
+				pidAlive: () => true,
+				sleep: async () => undefined,
+			},
+		);
+		const registry = rootsRegistrySnapshot(agentDir);
+
+		expect(result).toBe("attached");
+		expect(captured?.canonicalRoot).toBe(registry.sessions["published-session"]);
+		expect(captured?.leaseId).toBe(registry.sessionLeases["published-session"].leaseId);
+		expect(captured?.canonicalRoot).toBe(
+			path.join(fs.realpathSync(agentDir), "published-workspace", ".gjc", "state"),
+		);
 	});
 
 	test("idle self-exit after timeout releases ownership", async () => {
@@ -884,8 +1043,8 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("A", "ws://a", "ta");
-		daemon.connectSession("B", "ws://b", "tb");
+		await connectIdentitySession(daemon, "A", "ws://a", "ta");
+		await connectIdentitySession(daemon, "B", "ws://b", "tb");
 		await daemon.handleSessionMessage(daemon.sessions.get("B")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -918,7 +1077,7 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -938,6 +1097,101 @@ describe("telegram daemon", () => {
 		expect(bot.calls.some(c => c.method === "answerCallbackQuery")).toBe(true);
 	});
 
+	test("a stale ask alias does not revoke a still-current session", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
+		const session = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(session, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Q",
+			options: ["Y"],
+		});
+		const alias = bot.calls.find(call => call.method === "sendMessage")!.body.reply_markup.inline_keyboard[0][0]
+			.callback_data;
+		session.pending.clear();
+		FakeWs.instances[0]!.sent = [];
+
+		await daemon.handleTelegramUpdate({
+			update_id: 1,
+			callback_query: { id: "cb", data: alias, message: { chat: { id: 42 } } },
+		});
+
+		expect(daemon.sessions.get("S")).toBe(session);
+		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
+		expect(bot.calls.some(call => call.method === "sendMessage" && String(call.body.text).includes("stale"))).toBe(
+			true,
+		);
+	});
+	test("a socket closed during authority revalidation drops the inbound update without throwing", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
+		const session = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		const threadId = bot.calls.find(call => call.method === "sendMessage")!.body.message_thread_id;
+		const originalAdmissionCheck = (
+			daemon as unknown as {
+				sessionAdmissionIsCurrent(target: typeof session): Promise<boolean>;
+			}
+		).sessionAdmissionIsCurrent.bind(daemon);
+		let checks = 0;
+		Object.assign(daemon, {
+			sessionAdmissionIsCurrent: async (target: typeof session) => {
+				checks++;
+				if (checks === 2) {
+					target.ws.close();
+					return true;
+				}
+				return originalAdmissionCheck(target);
+			},
+		});
+		FakeWs.instances[0]!.sent = [];
+
+		await expect(
+			daemon.handleTelegramUpdate({
+				update_id: 1,
+				message: {
+					chat: { id: 42 },
+					message_thread_id: threadId,
+					message_id: 1,
+					text: "race",
+				},
+			}),
+		).resolves.toBeUndefined();
+
+		expect(checks).toBe(2);
+		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
+		expect(daemon.sessions.has("S")).toBe(false);
+	});
 	test("unknown and expired aliases are stale guidance with zero frames", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
@@ -951,7 +1205,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("A", "ws://a", "ta");
+		await connectIdentitySession(daemon, "A", "ws://a", "ta");
 		await daemon.handleTelegramUpdate({
 			callback_query: { id: "cb", data: "missing", message: { chat: { id: 42 } } },
 		});
@@ -981,7 +1235,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("A", "ws://a", "ta");
+		await connectIdentitySession(daemon, "A", "ws://a", "ta");
 
 		await daemon.handleTelegramUpdate({
 			callback_query: { id: "cb", data: "missing", message: { chat: { id: -10042 } } },
@@ -1006,7 +1260,7 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -1043,7 +1297,7 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -1073,7 +1327,7 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -1109,9 +1363,9 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://old", "old-token");
+		await connectIdentitySession(daemon, "S", "ws://old", "old-token");
 		const oldSocket = FakeWs.instances[0]!;
-		daemon.connectSession("S", "ws://new", "new-token");
+		await connectIdentitySession(daemon, "S", "ws://new", "new-token");
 		const newSocket = FakeWs.instances[1]!;
 		const newSession = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(newSession, {
@@ -1154,7 +1408,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		daemon.messageRoutes.set("55", { sessionId: "S", actionId: "A" });
 		daemon.sessions.get("S")!.pending.set("A", { sessionId: "S", actionId: "A" });
 		await daemon.handleTelegramUpdate({
@@ -1182,7 +1436,7 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		// Emit an ask: creates the forum topic, registers the pending ask, sends the message.
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
@@ -1241,7 +1495,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -1292,7 +1546,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(session, {
 			type: "action_needed",
@@ -1360,7 +1614,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(session, {
 			type: "action_needed",
@@ -1412,7 +1666,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(session, {
 			type: "action_needed",
@@ -1451,7 +1705,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(session, {
 			type: "action_needed",
@@ -1492,7 +1746,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(session, {
 			type: "action_needed",
@@ -1512,7 +1766,7 @@ describe("telegram daemon", () => {
 			WebSocketImpl: FakeWs as any,
 		});
 		await restarted.loadTopics();
-		restarted.connectSession("S", "ws://s-restarted", "ts-restarted");
+		await connectIdentitySession(restarted, "S", "ws://s-restarted", "ts-restarted");
 		const recoveredSession = restarted.sessions.get("S")!;
 		await restarted.handleSessionMessage(recoveredSession, {
 			type: "ask_selected_ack_request",
@@ -1568,7 +1822,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(session, {
 			type: "action_needed",
@@ -1643,7 +1897,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as never,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(session, {
 			type: "action_needed",
@@ -1665,7 +1919,7 @@ describe("telegram daemon", () => {
 			session,
 			"session_closed",
 		);
-		daemon.connectSession("S", "ws://replacement", "replacement-token");
+		await connectIdentitySession(daemon, "S", "ws://replacement", "replacement-token");
 		const replacement = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(replacement, {
 			type: "ask_selected_ack_request",
@@ -1712,7 +1966,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(session, {
 			type: "action_needed",
@@ -1766,7 +2020,7 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -1799,7 +2053,7 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		// Create the topic + pending via an ask, then resolve it so nothing is pending.
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
@@ -1835,7 +2089,7 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "identity_header",
 			sessionId: "S",
@@ -1876,7 +2130,7 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -1914,7 +2168,7 @@ describe("telegram daemon", () => {
 			WebSocketImpl: FakeWs as any,
 		});
 		Object.assign(daemon, { botUsername: "GajaeCodeBot" });
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -1950,7 +2204,7 @@ describe("telegram daemon", () => {
 			botApi: bot,
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "identity_header",
 			sessionId: "S",
@@ -1982,7 +2236,7 @@ describe("telegram daemon", () => {
 		});
 		await restarted.loadTopics();
 		await restarted.loadSeenUpdateIds();
-		restarted.connectSession("S", "ws://s2", "ts2");
+		await connectIdentitySession(restarted, "S", "ws://s2", "ts2");
 
 		await restarted.handleTelegramUpdate({
 			update_id: 77,
@@ -2030,10 +2284,7 @@ describe("telegram daemon", () => {
 
 		// Endpoint discovery files live at <cwd>/.gjc/state/sdk/<sessionId>.json.
 		const writeEndpoint = async (cwd: string, sessionId: string, url: string) => {
-			await registerNotificationRoot({ settings: s, cwd, sessionId });
-			const dir = path.join(cwd, ".gjc", "state", "sdk");
-			fs.mkdirSync(dir, { recursive: true });
-			fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ url, token: "tok" }));
+			await publishIdentityEndpoint(s, cwd, sessionId, url, "tok");
 		};
 
 		// Session A exists from the start so the run loop reaches the long-poll branch.
@@ -2175,11 +2426,7 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const cwd = path.join(agentDir, "sess-cwd");
-		await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
-		const roots = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as { roots: string[] };
-		const endpointDir = path.join(roots.roots[0]!, "sdk");
-		fs.mkdirSync(endpointDir, { recursive: true });
-		fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://s", token: "ts" }));
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts");
 
 		let now = 0;
 		const liveness: Array<() => void> = [];
@@ -2206,6 +2453,7 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 		// liveness can start; then the link goes half-open (no further frames,
 		// socket never closes, no pong will arrive).
 		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		await new Promise(resolve => setTimeout(resolve, 10));
 
 		// Advance past the heartbeat TTL and fire any liveness probe. Post-fix this
 		// detects the missing pong, drops the stale session, and reconnects.
@@ -2247,6 +2495,7 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 						// Drop the only session so the next loop iteration idle-exits
 						// once the daemon survives the rejection (post-fix path).
 						daemon.sessions.get("S")?.ws.close();
+						queueMicrotask(() => daemon.requestStop());
 						throw new Error("network down: getUpdates rejected");
 					}
 					return { ok: true, result: [] };
@@ -2255,6 +2504,7 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 			},
 		};
 
+		await publishIdentityEndpoint(s, path.join(agentDir, "repo"), "S", "ws://s", "ts");
 		const daemon = new TelegramNotificationDaemon({
 			settings: s,
 			ownerId: "owner",
@@ -2271,7 +2521,6 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 			setIntervalImpl: (() => 0) as any,
 			clearIntervalImpl: (() => {}) as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
 
 		await expect(daemon.run()).resolves.toBeUndefined();
 		expect(getUpdatesCalls).toBeGreaterThanOrEqual(1);
@@ -2370,7 +2619,7 @@ test("non-addressable forum lifecycle commands in known topics are dropped", asy
 			WebSocketImpl: FakeWs as any,
 		});
 		Object.assign(daemon, { lifecycleControlActive: true, botUsername });
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		const session = daemon.sessions.get("S")!;
 		await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
 		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
@@ -2973,8 +3222,8 @@ test("live sessions with the same repo branch create distinct topics", async () 
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("S1", "ws://s1", "t1");
-	daemon.connectSession("S2", "ws://s2", "t2");
+	await connectIdentitySession(daemon, "S1", "ws://s1", "t1");
+	await connectIdentitySession(daemon, "S2", "ws://s2", "t2");
 	const first = daemon.sessions.get("S1")!;
 	const second = daemon.sessions.get("S2")!;
 
@@ -3375,17 +3624,32 @@ test("activity busy frame sends a typing chat action into the session topic", as
 
 test("session_closed deletes the topic and resume creates a fresh visible topic", async () => {
 	const agentDir = tempAgentDir();
+	const s = settings(agentDir);
+	const reg = await registerNotificationRoot({
+		settings: s,
+		cwd: path.join(agentDir, "repo"),
+		sessionId: "S",
+	});
 	const bot = new FakeBotApi();
 	let now = 0;
 	const daemon = new TelegramNotificationDaemon({
-		settings: settings(agentDir),
+		settings: s,
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot,
+		WebSocketImpl: FakeWs as any,
 		now: () => now,
 	});
-	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		endpointKey: "ws://s\0tok",
+		canonicalRoot: reg.root,
+		leaseId: reg.leaseId,
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
 
 	await daemon.handleSessionMessage(session as any, {
 		type: "identity_header",
@@ -3411,7 +3675,9 @@ test("session_closed deletes the topic and resume creates a fresh visible topic"
 
 	now = 10_000;
 	bot.calls = [];
-	await daemon.handleSessionMessage(session as any, {
+	await connectIdentitySession(daemon, "S", "ws://resumed", "tok2");
+	const resumedSession = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(resumedSession, {
 		type: "identity_header",
 		sessionId: "S",
 		repo: "r",
@@ -3430,6 +3696,197 @@ test("session_closed deletes the topic and resume creates a fresh visible topic"
 	);
 });
 
+test("session_closed drains an in-flight topic creation and deletes the created topic", async () => {
+	const agentDir = tempAgentDir();
+	const s = settings(agentDir);
+	const reg = await registerNotificationRoot({ settings: s, cwd: path.join(agentDir, "repo"), sessionId: "S" });
+	const createStarted = Promise.withResolvers<void>();
+	const releaseCreate = Promise.withResolvers<void>();
+	const calls: Array<{ method: string; body: any }> = [];
+	const bot = {
+		async call(method: string, body: unknown): Promise<unknown> {
+			calls.push({ method, body });
+			if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+			if (method === "createForumTopic") {
+				createStarted.resolve();
+				await releaseCreate.promise;
+				return { ok: true, result: { message_thread_id: 901 } };
+			}
+			if (method === "sendMessage") return { ok: true, result: { message_id: calls.length } };
+			return { ok: true, result: true };
+		},
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		endpointKey: "ws://s\0tok",
+		canonicalRoot: reg.root,
+		leaseId: reg.leaseId,
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
+
+	const identity = daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	await createStarted.promise;
+	const close = daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
+	await Promise.resolve();
+	expect(calls.some(call => call.method === "deleteForumTopic")).toBe(false);
+
+	releaseCreate.resolve();
+	await Promise.all([identity, close]);
+	expect(calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+	expect(calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id)).toEqual([
+		901,
+	]);
+	expect(topicRegistrySnapshot(agentDir).topics.S).toBeUndefined();
+});
+
+test("TOPIC_CLOSED is uncertain and retains the topic, fence, and registry for retry", async () => {
+	const agentDir = tempAgentDir();
+	const s = settings(agentDir);
+	const reg = await registerNotificationRoot({ settings: s, cwd: path.join(agentDir, "repo"), sessionId: "S" });
+	const calls: Array<{ method: string; body: any }> = [];
+	const bot = {
+		async call(method: string, body: unknown): Promise<unknown> {
+			calls.push({ method, body });
+			if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+			if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 902 } };
+			if (method === "sendMessage") return { ok: true, result: { message_id: calls.length } };
+			if (method === "deleteForumTopic") {
+				return { ok: false, error_code: 400, description: "Bad Request: TOPIC_CLOSED" };
+			}
+			return { ok: true, result: true };
+		},
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		endpointKey: "ws://s\0tok",
+		canonicalRoot: reg.root,
+		leaseId: reg.leaseId,
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	await daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
+
+	expect(calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
+	expect(topicRegistrySnapshot(agentDir).topics.S?.topicId).toBe("902");
+	expect(rootsRegistrySnapshot(agentDir).sessions.S).toBeDefined();
+	const effect = (await telegramDeletionEffects(agentDir)).find(item => item.sessionId === "S");
+	expect(effect).toMatchObject({ state: "uncertain", receipt: { status: "uncertain" } });
+});
+
+test("a fresh registration that wins before delete intent restores topic admission without deleting", async () => {
+	const agentDir = tempAgentDir();
+	const s = settings(agentDir);
+	const cwd = path.join(agentDir, "repo");
+	const reg = await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "S",
+		randomId: () => "lease-old",
+	});
+	const sendStarted = Promise.withResolvers<void>();
+	const releaseSend = Promise.withResolvers<void>();
+	const calls: Array<{ method: string; body: any }> = [];
+	const bot = {
+		async call(method: string, body: unknown): Promise<unknown> {
+			calls.push({ method, body });
+			const request = body as { text?: unknown };
+			if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+			if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 903 } };
+			if (method === "sendMessage" && String(request.text).includes("hold-delete")) {
+				sendStarted.resolve();
+				await releaseSend.promise;
+			}
+			if (method === "sendMessage") return { ok: true, result: { message_id: calls.length } };
+			return { ok: true, result: true };
+		},
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		rich: { enabled: false },
+	});
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		endpointKey: "ws://s\0tok",
+		canonicalRoot: reg.root,
+		leaseId: reg.leaseId,
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+
+	const heldSend = daemon.handleSessionMessage(session as any, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "finalized",
+		text: "hold-delete",
+	});
+	await sendStarted.promise;
+	const close = daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
+	await Promise.resolve();
+	await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "S",
+		randomId: () => "lease-new",
+	});
+	releaseSend.resolve();
+	await Promise.all([heldSend, close]);
+
+	expect(calls.some(call => call.method === "deleteForumTopic")).toBe(false);
+	expect(rootsRegistrySnapshot(agentDir).sessionLeases.S.leaseId).toBe("lease-new");
+
+	await connectIdentitySession(daemon, "S", "ws://resumed", "tok2");
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "finalized",
+		text: "after-superseded-delete",
+	});
+	const resumedSend = calls.find(
+		call => call.method === "sendMessage" && String(call.body.text).includes("after-superseded-delete"),
+	);
+	expect(resumedSend?.body.message_thread_id).toBe(903);
+});
+
 test("session_closed clears reply message routes for the closed session", async () => {
 	FakeWs.instances = [];
 	const agentDir = tempAgentDir();
@@ -3443,8 +3900,8 @@ test("session_closed clears reply message routes for the closed session", async 
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("S", "ws://s", "ts");
-	daemon.connectSession("T", "ws://t", "tt");
+	await connectIdentitySession(daemon, "S", "ws://s", "ts");
+	await connectIdentitySession(daemon, "T", "ws://t", "tt");
 	daemon.messageRoutes.set("s-ask", { sessionId: "S", actionId: "ask" });
 	daemon.messageRoutes.set("s-other", { sessionId: "S", actionId: "other" });
 	daemon.messageRoutes.set("t-ask", { sessionId: "T", actionId: "ask" });
@@ -3460,10 +3917,13 @@ test("session_closed tombstones its endpoint generation so scans do not recreate
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
-	await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
-	const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
+	const reg1 = await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
+	const endpointDir = path.join(reg1.root, "sdk");
 	fs.mkdirSync(endpointDir, { recursive: true });
-	fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://live", token: "ts", pid: 4242 }));
+	fs.writeFileSync(
+		path.join(endpointDir, "S.json"),
+		JSON.stringify({ url: "ws://live", token: "ts", pid: 4242, canonicalRoot: reg1.root, leaseId: reg1.leaseId }),
+	);
 
 	const bot = new FakeBotApi();
 	const daemon = new TelegramNotificationDaemon({
@@ -3517,7 +3977,11 @@ test("session_closed tombstones its endpoint generation so scans do not recreate
 	expect(FakeWs.instances).toHaveLength(1);
 	expect(bot.calls.some(c => c.method === "createForumTopic")).toBe(false);
 
-	fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://resumed", token: "ts2", pid: 4242 }));
+	const reg2 = await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
+	fs.writeFileSync(
+		path.join(endpointDir, "S.json"),
+		JSON.stringify({ url: "ws://resumed", token: "ts2", pid: 4242, canonicalRoot: reg2.root, leaseId: reg2.leaseId }),
+	);
 	await daemon.scanRoots();
 	expect(FakeWs.instances).toHaveLength(2);
 	FakeWs.instances[1]!.dispatchEvent(new Event("open"));
@@ -3537,7 +4001,7 @@ test("inbound thread message gets a queued reaction, flipped to consumed on ack"
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("S", "ws://s", "ts");
+	await connectIdentitySession(daemon, "S", "ws://s", "ts");
 	const session = daemon.sessions.get("S")!;
 	// Create the topic and learn its thread id from the pinned identity message.
 	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
@@ -3585,7 +4049,7 @@ test("inbound photo is downloaded and forwarded as an image in the user_message"
 		fetchImpl,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("S", "ws://s", "ts");
+	await connectIdentitySession(daemon, "S", "ws://s", "ts");
 	const session = daemon.sessions.get("S")!;
 	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
 	const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
@@ -3626,7 +4090,7 @@ test("inbound document is saved to a tmp file and its path injected into the tex
 		fetchImpl,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("S", "ws://s", "ts");
+	await connectIdentitySession(daemon, "S", "ws://s", "ts");
 	const session = daemon.sessions.get("S")!;
 	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
 	const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
@@ -3679,7 +4143,7 @@ test("inbound document with a path-traversal filename stays sandboxed in the pri
 		fetchImpl,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("S", "ws://s", "ts");
+	await connectIdentitySession(daemon, "S", "ws://s", "ts");
 	const session = daemon.sessions.get("S")!;
 	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
 	const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
@@ -3729,7 +4193,7 @@ test("daemon attachment temp dirs are removed by the shutdown cleanup path", asy
 		fetchImpl,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("S", "ws://s", "ts");
+	await connectIdentitySession(daemon, "S", "ws://s", "ts");
 	const session = daemon.sessions.get("S")!;
 	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
 	const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
@@ -3765,7 +4229,7 @@ test("outbound file_attachment frame triggers a sendDocument upload to the topic
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("S", "ws://s", "ts");
+	await connectIdentitySession(daemon, "S", "ws://s", "ts");
 	const session = daemon.sessions.get("S")!;
 	await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
 	bot.calls = [];
@@ -3789,14 +4253,8 @@ test("outbound file_attachment frame triggers a sendDocument upload to the topic
 });
 
 describe("telegram daemon reconnect reconciliation", () => {
-	function endpointFor(agentDir: string, cwd: string, s: Settings, sessionId: string) {
-		return (async () => {
-			await registerNotificationRoot({ settings: s, cwd, sessionId });
-			const roots = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as { roots: string[] };
-			const dir = path.join(roots.roots[0]!, "sdk");
-			fs.mkdirSync(dir, { recursive: true });
-			fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ url: "ws://s", token: "ts" }));
-		})();
+	function endpointFor(_agentDir: string, cwd: string, s: Settings, sessionId: string) {
+		return publishIdentityEndpoint(s, cwd, sessionId, "ws://s", "ts");
 	}
 
 	test("identity-guarded replacement survives delayed old close and old message", async () => {
@@ -3824,6 +4282,7 @@ describe("telegram daemon reconnect reconciliation", () => {
 		});
 		await daemon.scanRoots();
 		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		await new Promise(resolve => setTimeout(resolve, 10));
 		now += 25_000;
 		for (const cb of liveness) cb();
 		await daemon.scanRoots();
@@ -3867,6 +4326,7 @@ describe("telegram daemon reconnect reconciliation", () => {
 		await daemon.scanRoots();
 		// Legacy server: advertises capabilities WITHOUT client_ping_pong.
 		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 1, capabilities: ["threaded"] });
+		await new Promise(resolve => setTimeout(resolve, 10));
 		expect(liveness).toHaveLength(0);
 		now += 100_000;
 		for (const cb of liveness) cb();
@@ -3903,6 +4363,7 @@ describe("telegram daemon reconnect reconciliation", () => {
 		});
 		await daemon.scanRoots();
 		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		await new Promise(resolve => setTimeout(resolve, 10));
 		now += 25_000;
 		for (const cb of liveness) cb();
 		await daemon.scanRoots();
@@ -3942,11 +4403,7 @@ describe("telegram daemon reconnect answer routing", () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const cwd = path.join(agentDir, "cwd");
-		await registerNotificationRoot({ settings: s, cwd, sessionId: "S" });
-		const roots = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as { roots: string[] };
-		const dir = path.join(roots.roots[0]!, "sdk");
-		fs.mkdirSync(dir, { recursive: true });
-		fs.writeFileSync(path.join(dir, "S.json"), JSON.stringify({ url: "ws://s", token: "ts" }));
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts");
 
 		let now = 0;
 		const liveness: Array<() => void> = [];
@@ -3968,6 +4425,7 @@ describe("telegram daemon reconnect answer routing", () => {
 		});
 		await daemon.scanRoots();
 		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		await new Promise(resolve => setTimeout(resolve, 10));
 		now += 25_000;
 		for (const cb of liveness) cb();
 		await daemon.scanRoots();
@@ -4093,7 +4551,7 @@ test("requestStop aborts the active long poll and run() exits, releasing ownersh
 			return 0;
 		}) as any,
 	});
-	daemon.connectSession("S", "ws://s", "t");
+	await connectIdentitySession(daemon, "S", "ws://s", "t");
 	const runPromise = daemon.run();
 	await pollStarted;
 	daemon.requestStop("signal");
@@ -4171,10 +4629,7 @@ test("a fresh daemon scanRoots reconnects an existing session endpoint", async (
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
-	await registerNotificationRoot({ settings: s, cwd, sessionId: "live-session" });
-	const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
-	fs.mkdirSync(endpointDir, { recursive: true });
-	fs.writeFileSync(path.join(endpointDir, "live-session.json"), JSON.stringify({ url: "ws://live", token: "tok" }));
+	await publishIdentityEndpoint(s, cwd, "live-session", "ws://live", "tok");
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
@@ -4201,7 +4656,11 @@ test("connectSession eagerly creates a Telegram topic on connect (before any fra
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("sess-abc123", "ws://x", "tok");
+	const registration = await publishIdentityEndpoint(s, path.join(agentDir, "repo"), "sess-abc123", "ws://x", "tok");
+	daemon.connectSession("sess-abc123", "ws://x", "tok", {
+		canonicalRoot: registration.canonicalRoot,
+		leaseId: registration.leaseId,
+	});
 	// FakeWs does not auto-dispatch "open"; fire it to exercise the connect hook.
 	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
 	await new Promise(r => setTimeout(r, 10));
@@ -4239,7 +4698,11 @@ test("identity_header during an in-flight eager create still renames the topic",
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 	});
-	daemon.connectSession("sess-xyz999", "ws://x", "tok");
+	const registration = await publishIdentityEndpoint(s, path.join(agentDir, "repo"), "sess-xyz999", "ws://x", "tok");
+	daemon.connectSession("sess-xyz999", "ws://x", "tok", {
+		canonicalRoot: registration.canonicalRoot,
+		leaseId: registration.leaseId,
+	});
 	// Eager create starts and blocks in-flight on createGate.
 	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
 	await Promise.resolve();
@@ -4276,12 +4739,21 @@ test("scanRoots connects only live endpoints (skips stale + dead-PID records)", 
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
-	await registerNotificationRoot({ settings: s, cwd, sessionId: "live" });
+	const liveReg = await registerNotificationRoot({ settings: s, cwd, sessionId: "live" });
 	await registerNotificationRoot({ settings: s, cwd, sessionId: "stale" });
 	await registerNotificationRoot({ settings: s, cwd, sessionId: "dead" });
 	const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
 	fs.mkdirSync(endpointDir, { recursive: true });
-	fs.writeFileSync(path.join(endpointDir, "live.json"), JSON.stringify({ url: "ws://live", token: "t", pid: 4242 }));
+	fs.writeFileSync(
+		path.join(endpointDir, "live.json"),
+		JSON.stringify({
+			url: "ws://live",
+			token: "t",
+			pid: 4242,
+			canonicalRoot: liveReg.root,
+			leaseId: liveReg.leaseId,
+		}),
+	);
 	fs.writeFileSync(
 		path.join(endpointDir, "stale.json"),
 		JSON.stringify({ url: "ws://stale", token: "t", pid: 4242, stale: true }),
@@ -4304,13 +4776,14 @@ test("scanRoots connects only live endpoints (skips stale + dead-PID records)", 
 	expect(FakeWs.instances.every(ws => ws.url.startsWith("ws://live"))).toBe(true);
 });
 
-test("scanRoots reaps stale and dead-PID session topics after the orphan grace window", async () => {
+test("scanRoots records stale and dead-PID orphan candidates on first scan and reaps both after continuous grace", async () => {
 	FakeWs.instances = [];
+	let now = 70_000;
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
-	await registerNotificationRoot({ settings: s, cwd, sessionId: "stale" });
-	await registerNotificationRoot({ settings: s, cwd, sessionId: "dead" });
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "stale", now: () => now });
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "dead", now: () => now });
 	const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
 	fs.mkdirSync(endpointDir, { recursive: true });
 	fs.writeFileSync(
@@ -4323,8 +4796,8 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
 		JSON.stringify({
 			topics: {
-				stale: { topicId: "101", identitySent: true, createdAt: 0, name: "stale" },
-				dead: { topicId: "102", identitySent: true, createdAt: 0, name: "dead" },
+				stale: { topicId: "101", identitySent: true, createdAt: 1_000, name: "stale" },
+				dead: { topicId: "102", identitySent: true, createdAt: 1_000, name: "dead" },
 			},
 		}),
 	);
@@ -4337,9 +4810,22 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 		pidAlive: () => false,
-		now: () => 120_000,
+		now: () => now,
 	});
 	await daemon.loadTopics();
+
+	// First scan: stale/dead endpoints confirm absence, but the continuous-absence
+	// candidate contract only RECORDS a candidate — no destructive delete yet.
+	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	const afterFirst = rootsRegistrySnapshot(agentDir);
+	expect(Object.keys(afterFirst.orphanCandidates).sort()).toEqual(["dead", "stale"]);
+	expect(afterFirst.orphanCandidates.stale.topicId).toBe("101");
+	expect(afterFirst.orphanCandidates.dead.topicId).toBe("102");
+
+	// Second scan after the continuous grace window: both candidates survived
+	// under the same lease and are reaped through the durable deletion path.
+	now = 130_000;
 	await daemon.scanRoots();
 	expect(
 		bot.calls
@@ -4350,16 +4836,19 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 	expect(daemon.sessions.size).toBe(0);
 });
 
-test("scanRoots reaps missing endpoint topics only when all roots are readable and grace has elapsed", async () => {
+test("scanRoots records a missing-root (ENOENT) orphan candidate on first scan and reaps after continuous grace", async () => {
+	let now = 70_000;
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
-	await registerNotificationRoot({ settings: s, cwd, sessionId: "missing" });
-	fs.mkdirSync(path.join(cwd, ".gjc", "state", "sdk"), { recursive: true });
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "missing", now: () => now });
+	// No endpoint dir created: the mapped root's sdk dir is ENOENT (confirmed absence).
 	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
 	fs.writeFileSync(
 		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
-		JSON.stringify({ topics: { missing: { topicId: "201", identitySent: true, createdAt: 0, name: "missing" } } }),
+		JSON.stringify({
+			topics: { missing: { topicId: "201", identitySent: true, createdAt: 1_000, name: "missing" } },
+		}),
 	);
 	const bot = new FakeBotApi();
 	const daemon = new TelegramNotificationDaemon({
@@ -4368,36 +4857,395 @@ test("scanRoots reaps missing endpoint topics only when all roots are readable a
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot,
-		now: () => 120_000,
+		now: () => now,
 	});
 	await daemon.loadTopics();
+
+	// First scan: ENOENT confirms absence, but only a candidate is recorded.
+	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	const afterFirst = rootsRegistrySnapshot(agentDir);
+	expect(afterFirst.orphanCandidates.missing).toEqual({
+		observedAt: 70_000,
+		leaseId: afterFirst.sessionLeases.missing.leaseId,
+		topicId: "201",
+	});
+
+	// Second scan after continuous grace: the candidate is reaped.
+	now = 130_000;
 	await daemon.scanRoots();
 	expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([201]);
+});
 
-	const blockedAgentDir = tempAgentDir();
-	const blockedSettings = setPrivateAgentDir(settings(blockedAgentDir), blockedAgentDir);
-	await registerNotificationRoot({
-		settings: blockedSettings,
-		cwd: path.join(blockedAgentDir, "unreadable"),
-		sessionId: "kept",
+test("an ENOENT mapped root reaps only after continuous grace and compacts its exact root/session/lease/candidate (F001/F005)", async () => {
+	let now = 70_000;
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	const registration = await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "orphan",
+		now: () => now,
+		randomId: () => "lease-enoent",
 	});
-	fs.mkdirSync(daemonPaths(blockedAgentDir).dir, { recursive: true });
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
 	fs.writeFileSync(
-		path.join(daemonPaths(blockedAgentDir).dir, "telegram-topics.json"),
-		JSON.stringify({ topics: { kept: { topicId: "202", identitySent: true, createdAt: 0, name: "kept" } } }),
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({
+			topics: { orphan: { topicId: "301", identitySent: true, createdAt: 1_000, name: "orphan" } },
+		}),
 	);
-	const blockedBot = new FakeBotApi();
-	const blockedDaemon = new TelegramNotificationDaemon({
-		settings: blockedSettings,
+	const expectedRoot = registration.root;
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
-		botApi: blockedBot,
-		now: () => 120_000,
+		botApi: bot,
+		now: () => now,
 	});
-	await blockedDaemon.loadTopics();
-	await blockedDaemon.scanRoots();
-	expect(blockedBot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	await daemon.loadTopics();
+
+	// First scan: ENOENT mapped root => confirmed absence; a candidate is recorded
+	// but no destructive delete runs.
+	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	const afterFirst = rootsRegistrySnapshot(agentDir);
+	expect(afterFirst.orphanCandidates.orphan).toEqual({
+		observedAt: 70_000,
+		leaseId: "lease-enoent",
+		topicId: "301",
+	});
+	expect(afterFirst.sessionLeases.orphan.leaseId).toBe("lease-enoent");
+	expect(afterFirst.sessions.orphan).toBe(expectedRoot);
+	expect(afterFirst.roots).toEqual([expectedRoot]);
+
+	// Second scan after continuous grace: the candidate survived under the same
+	// lease, so the topic is reaped through the durable deletion path.
+	now = 130_000;
+	await daemon.scanRoots();
+	expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([301]);
+
+	// F005 selective compaction: ONLY this session's candidate/lease/session
+	// mapping is removed, and the now-unreferenced root is pruned.
+	const afterReap = rootsRegistrySnapshot(agentDir);
+	expect(afterReap.orphanCandidates.orphan).toBeUndefined();
+	expect(afterReap.sessionLeases.orphan).toBeUndefined();
+	expect(afterReap.sessions.orphan).toBeUndefined();
+	expect(afterReap.roots).toEqual([]);
+	expect(topicRegistrySnapshot(agentDir).topics.orphan).toBeUndefined();
+	const effects = await telegramDeletionEffects(agentDir);
+	const reap = effects.find(e => e.kind === "telegram.topic_delete" && e.sessionId === "orphan");
+	expect(reap?.state).toBe("terminal");
+	expect(reap?.payload).toMatchObject({ topicId: "301", leaseId: "lease-enoent" });
+});
+
+test("a non-ENOENT readdir failure on one mapped root withholds only its sessions and never blocks an unrelated missing root (F001)", async () => {
+	let now = 70_000;
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const withheldCwd = path.join(agentDir, "withheld");
+	const missingCwd = path.join(agentDir, "missing");
+	const withheldRegistration = await registerNotificationRoot({
+		settings: s,
+		cwd: withheldCwd,
+		sessionId: "withheld",
+		now: () => now,
+	});
+	await registerNotificationRoot({ settings: s, cwd: missingCwd, sessionId: "reaped", now: () => now });
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({
+			topics: {
+				withheld: { topicId: "401", identitySent: true, createdAt: 1_000, name: "withheld" },
+				reaped: { topicId: "402", identitySent: true, createdAt: 1_000, name: "reaped" },
+			},
+		}),
+	);
+	// The withheld root's sdk dir is unreadable (EACCES => ambiguous evidence),
+	// while the missing root's sdk dir simply does not exist (ENOENT => absence).
+	const withheldSdkDir = path.join(withheldRegistration.root, "sdk");
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fs: fsWithUnreadableReaddir(withheldSdkDir),
+		now: () => now,
+	});
+	await daemon.loadTopics();
+
+	// First scan: "withheld" is ambiguous (no candidate), "reaped" records one.
+	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	const afterFirst = rootsRegistrySnapshot(agentDir);
+	expect(afterFirst.orphanCandidates.withheld).toBeUndefined();
+	expect(afterFirst.orphanCandidates.reaped).toBeDefined();
+
+	// Second scan after grace: "reaped" is reaped while "withheld" is STILL withheld.
+	now = 130_000;
+	await daemon.scanRoots();
+	expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([402]);
+	expect(bot.calls.some(c => c.method === "deleteForumTopic" && c.body.message_thread_id === 401)).toBe(false);
+
+	// The withheld session's topic, root mapping, and lease are all preserved.
+	const afterReap = rootsRegistrySnapshot(agentDir);
+	expect(afterReap.sessions.withheld).toBeDefined();
+	expect(afterReap.sessionLeases.withheld).toBeDefined();
+	expect(topicRegistrySnapshot(agentDir).topics.withheld).toBeDefined();
+});
+
+test("a fresh same-session registration between the candidate scan and the reap scan restarts the grace window (F001 lease invalidation)", async () => {
+	let now = 70_000;
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "S",
+		now: () => now,
+		randomId: () => "lease-first",
+	});
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({ topics: { S: { topicId: "501", identitySent: true, createdAt: 1_000, name: "S" } } }),
+	);
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		now: () => now,
+	});
+	await daemon.loadTopics();
+
+	// First scan: candidate recorded under the first lease.
+	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	expect(rootsRegistrySnapshot(agentDir).orphanCandidates.S.leaseId).toBe("lease-first");
+
+	// A fresh same-session registration mints a new lease generation.
+	await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "S",
+		now: () => now,
+		randomId: () => "lease-second",
+	});
+	expect(rootsRegistrySnapshot(agentDir).sessionLeases.S.leaseId).toBe("lease-second");
+
+	// Second scan after the original grace window: the candidate's lease no longer
+	// matches the live lease, so the grace window RESTARTS under the new lease
+	// instead of reaping. No deletion; registry entries survive (no compaction).
+	now = 130_000;
+	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	const afterRestart = rootsRegistrySnapshot(agentDir);
+	expect(afterRestart.orphanCandidates.S).toEqual({
+		observedAt: 130_000,
+		leaseId: "lease-second",
+		topicId: "501",
+	});
+	expect(afterRestart.sessionLeases.S.leaseId).toBe("lease-second");
+	expect(afterRestart.sessions.S).toBeDefined();
+	expect(topicRegistrySnapshot(agentDir).topics.S).toBeDefined();
+});
+
+test("a 429 deleteForumTopic retains the topic and durable retry metadata, and a fresh daemon honors retryAt (F004)", async () => {
+	let now = 70_000;
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "S",
+		now: () => now,
+		randomId: () => "lease-retry",
+	});
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({ topics: { S: { topicId: "601", identitySent: true, createdAt: 1_000, name: "S" } } }),
+	);
+	const bot = new RateLimitedDeleteBotApi();
+	bot.retryAfterSec = 30;
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		now: () => now,
+	});
+	await daemon.loadTopics();
+
+	// First scan records the candidate.
+	await daemon.scanRoots();
+	// Second scan reaps, but deleteForumTopic is rate-limited (429).
+	now = 130_000;
+	await daemon.scanRoots();
+	const attempts = bot.calls.filter(c => c.method === "deleteForumTopic");
+	expect(attempts).toHaveLength(1);
+	expect(attempts[0]!.body.message_thread_id).toBe(601);
+	// The topic is retained (uncertain outcome) and the retry deadline is durable.
+	expect(topicRegistrySnapshot(agentDir).topics.S).toBeDefined();
+	const claim = (await telegramDeletionEffects(agentDir)).find(
+		e => e.sessionId === "S" && e.kind === "telegram.topic_delete",
+	);
+	expect(claim?.state).toBe("uncertain");
+	expect(claim?.receipt?.retryAt).toBe(160_000);
+
+	// A fresh daemon (restart) before retryAt must NOT call the provider: the
+	// durable retry deadline is honored straight from the persisted receipt.
+	const freshDaemon = new TelegramNotificationDaemon({
+		settings: setPrivateAgentDir(settings(agentDir), agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		now: () => now,
+	});
+	await freshDaemon.loadTopics();
+	now = 140_000; // before retryAt (160_000)
+	await freshDaemon.scanRoots();
+	expect(bot.calls.filter(c => c.method === "deleteForumTopic")).toHaveLength(1);
+
+	// After retryAt elapses the fresh daemon re-attempts and succeeds.
+	now = 170_000;
+	await freshDaemon.scanRoots();
+	expect(bot.calls.filter(c => c.method === "deleteForumTopic")).toHaveLength(2);
+	expect(topicRegistrySnapshot(agentDir).topics.S).toBeUndefined();
+	const finalClaim = (await telegramDeletionEffects(agentDir)).find(
+		e => e.sessionId === "S" && e.kind === "telegram.topic_delete",
+	);
+	expect(finalClaim?.state).toBe("terminal");
+});
+
+test("a terminal deletion record for the same session/topic under an old lease cannot short-circuit a new lease generation (F005)", async () => {
+	let now = 70_000;
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	// Seed a terminal deletion record for an OLD lease (a prior completed delete
+	// that left a durable terminal marker for the same session/topic).
+	const seedJournal = new ChatEffectJournal({ agentDir, transport: "telegram", now: () => now });
+	const oldEffectId = "telegram.topic_delete:S:701:lease-old";
+	const seeded = await seedJournal.enqueueAndClaim(
+		{
+			id: oldEffectId,
+			kind: "telegram.topic_delete",
+			transport: "telegram",
+			sessionId: "S",
+			endpointGeneration: 0,
+			payload: { chatId: "42", topicId: "701", leaseId: "lease-old" },
+		},
+		"owner",
+		60_000,
+	);
+	expect(seeded).toBeDefined();
+	await seedJournal.record(oldEffectId, { owner: "owner", epoch: seeded!.epoch }, "terminal", {
+		provider: "telegram",
+		status: "reconciled",
+	});
+
+	// A fresh registration mints a NEW lease for the same session/topic.
+	await registerNotificationRoot({
+		settings: s,
+		cwd,
+		sessionId: "S",
+		now: () => now,
+		randomId: () => "lease-new",
+	});
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({ topics: { S: { topicId: "701", identitySent: true, createdAt: 1_000, name: "S" } } }),
+	);
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		now: () => now,
+	});
+	await daemon.loadTopics();
+
+	// First scan records a candidate under the NEW lease.
+	await daemon.scanRoots();
+	expect(rootsRegistrySnapshot(agentDir).orphanCandidates.S.leaseId).toBe("lease-new");
+
+	// Second scan after grace: the new lease's deletion is NOT short-circuited by
+	// the old terminal record (effect ids are lease-scoped). The provider IS called.
+	now = 130_000;
+	await daemon.scanRoots();
+	expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([701]);
+	const effects = await telegramDeletionEffects(agentDir);
+	expect(effects.find(e => e.id === "telegram.topic_delete:S:701:lease-new")?.state).toBe("terminal");
+	expect(effects.find(e => e.id === oldEffectId)?.state).toBe("terminal");
+});
+
+test("a late frame after session_closed targets a fresh topic and never the deleted thread (F002 send fence)", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	const reg = await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts");
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	daemon.connectSession("S", "ws://s", "ts", { canonicalRoot: reg.canonicalRoot, leaseId: reg.leaseId });
+	const session = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(session, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	const deletedThreadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+	// session_closed fences and deletes the topic; queued/in-flight sends cancel.
+	await daemon.handleSessionMessage(session, { type: "session_closed", sessionId: "S" });
+	expect(bot.calls.some(c => c.method === "deleteForumTopic" && c.body.message_thread_id === deletedThreadId)).toBe(
+		true,
+	);
+
+	// A late frame arriving after the close must never reach the deleted thread.
+	// Reconnecting and sending creates a FRESH topic; the deleted id is fenced out.
+	const callsBeforeLate = bot.calls.length;
+	await connectIdentitySession(daemon, "S", "ws://s2", "ts2");
+	const resumed = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(resumed, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+		title: "resumed",
+	});
+	await daemon.handleSessionMessage(resumed, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "finalized",
+		text: "late-after-close",
+	});
+	const lateSends = bot.calls.slice(callsBeforeLate).filter(c => c.method === "sendMessage");
+	expect(lateSends.length).toBeGreaterThan(0);
+	expect(lateSends.some(c => c.body.message_thread_id === deletedThreadId)).toBe(false);
 });
 
 test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {
@@ -5086,7 +5934,7 @@ describe("telegram daemon rich overflow boundary (G006)", () => {
 });
 
 describe("telegram daemon action-needed rich delivery (G004)", () => {
-	function makeAskDaemon(bot: FakeBotApi, rich: { enabled: boolean }) {
+	async function makeAskDaemon(bot: FakeBotApi, rich: { enabled: boolean }) {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const daemon = new TelegramNotificationDaemon({
@@ -5098,14 +5946,14 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			WebSocketImpl: FakeWs as any,
 			rich,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		return daemon;
 	}
 
 	test("ask rich success: one sendRichMessage with reply_markup, route registered, callback + free-text reply route", async () => {
 		FakeWs.instances = [];
 		const bot = new RichFakeBotApi();
-		const daemon = makeAskDaemon(bot, { enabled: true });
+		const daemon = await makeAskDaemon(bot, { enabled: true });
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -5150,7 +5998,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			FakeWs.instances = [];
 			const bot = new RichFakeBotApi();
 			bot.richBehavior = behavior;
-			const daemon = makeAskDaemon(bot, { enabled: true });
+			const daemon = await makeAskDaemon(bot, { enabled: true });
 			await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 				type: "action_needed",
 				kind: "ask",
@@ -5182,7 +6030,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 	test("idle rich: one sendRichMessage without reply_markup and no message route", async () => {
 		FakeWs.instances = [];
 		const bot = new RichFakeBotApi();
-		const daemon = makeAskDaemon(bot, { enabled: true });
+		const daemon = await makeAskDaemon(bot, { enabled: true });
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "idle",
@@ -5200,7 +6048,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 	test("off (rich.enabled=false) ask: byte-identical HTML, zero sendRichMessage", async () => {
 		FakeWs.instances = [];
 		const bot = new RichFakeBotApi();
-		const daemon = makeAskDaemon(bot, { enabled: false });
+		const daemon = await makeAskDaemon(bot, { enabled: false });
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -5306,7 +6154,7 @@ describe("telegram daemon /rich toggle (G005)", () => {
 			WebSocketImpl: FakeWs as any,
 			rich: { enabled: true },
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		await connectIdentitySession(daemon, "S", "ws://s", "ts");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
@@ -5435,5 +6283,509 @@ describe("telegram daemon /rich toggle (G005)", () => {
 			),
 		).toBe(true);
 		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.text === "Rich messages: off")).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Admission identity: canonical root (realpath/symlink collapse), bound lease,
+// duplicate-endpoint fail-closed, and predecessor/successor authority gaps.
+// Every test asserts both no destructive provider call and no stale delivery.
+// ---------------------------------------------------------------------------
+describe("telegram daemon admission identity (endpoint-carried publication identity)", () => {
+	/** Write an identity-bearing live endpoint at an explicit path. */
+	function writeIdentityEndpoint(
+		endpointDir: string,
+		sessionId: string,
+		url: string,
+		token: string,
+		canonicalRoot: string,
+		leaseId: string,
+		pid = 4242,
+	): void {
+		fs.mkdirSync(endpointDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(endpointDir, `${sessionId}.json`),
+			JSON.stringify({ url, token, pid, canonicalRoot, leaseId }),
+		);
+	}
+
+	/** Seed a telegram topic record so absence/reap evidence is exercised. */
+	function seedTopic(agentDir: string, sessionId: string, topicId: string): void {
+		fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+		const file = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		const existing = fs.existsSync(file)
+			? (JSON.parse(fs.readFileSync(file, "utf8")) as { topics: Record<string, unknown> })
+			: { topics: {} };
+		existing.topics[sessionId] = { topicId, identitySent: true, createdAt: 1_000, name: sessionId };
+		fs.writeFileSync(file, JSON.stringify(existing));
+	}
+
+	test("realpath symlink alias collapse: alias and real target register the same canonical root identity", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const real = path.join(agentDir, "real-workspace");
+		const alias = path.join(agentDir, "alias-workspace");
+		fs.mkdirSync(real, { recursive: true });
+		fs.symlinkSync(real, alias);
+		const canonicalRoot = path.join(fs.realpathSync(real), ".gjc", "state");
+
+		const fromAlias = await registerNotificationRoot({
+			settings: s,
+			cwd: alias,
+			sessionId: "S",
+			randomId: () => "lease-1",
+		});
+		expect(fromAlias.root).toBe(canonicalRoot);
+		expect(fromAlias.leaseId).toBe("lease-1");
+
+		await registerNotificationRoot({ settings: s, cwd: real, sessionId: "S", randomId: () => "lease-2" });
+
+		const registry = rootsRegistrySnapshot(agentDir);
+		expect(registry.roots).toEqual([canonicalRoot]);
+		expect(registry.sessions.S).toBe(canonicalRoot);
+		expect(registry.sessionLeases.S.leaseId).toBe("lease-2");
+	});
+
+	test("missing workspace keeps one canonical identity before and after directory creation", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "created-after-registration");
+		const first = await registerNotificationRoot({
+			settings: s,
+			cwd,
+			sessionId: "S",
+			randomId: () => "lease-1",
+		});
+		fs.mkdirSync(cwd, { recursive: true });
+		const second = await registerNotificationRoot({
+			settings: s,
+			cwd,
+			sessionId: "S",
+			randomId: () => "lease-2",
+		});
+
+		expect(first.root).toBe(second.root);
+		expect(second.root).toBe(path.join(fs.realpathSync(cwd), ".gjc", "state"));
+		expect(rootsRegistrySnapshot(agentDir).roots).toEqual([second.root]);
+	});
+	test("scan collapses a legacy symlink root and canonical root before endpoint admission", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const real = path.join(agentDir, "real-legacy");
+		const alias = path.join(agentDir, "alias-legacy");
+		fs.mkdirSync(real, { recursive: true });
+		fs.symlinkSync(real, alias);
+		const legacyRoot = path.join(alias, ".gjc", "state");
+		const registryPath = daemonPaths(agentDir).roots;
+		fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+		fs.writeFileSync(
+			registryPath,
+			JSON.stringify({
+				version: 1,
+				roots: [legacyRoot],
+				sessions: { legacy: legacyRoot },
+				sessionLeases: { legacy: { leaseId: "legacy-lease", refreshedAt: 1 } },
+			}),
+		);
+
+		const identity = await publishIdentityEndpoint(s, alias, "S", "ws://s", "ts", {
+			randomId: () => "lease-1",
+		});
+		const persisted = rootsRegistrySnapshot(agentDir);
+		expect(persisted.roots).toContain(legacyRoot);
+		expect(persisted.roots).toContain(identity.canonicalRoot);
+
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: new FakeBotApi(),
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+		});
+		await daemon.scanRoots();
+
+		expect(daemon.sessions.get("S")?.canonicalRoot).toBe(identity.canonicalRoot);
+		expect(FakeWs.instances.filter(ws => ws.url.includes("ws://s"))).toHaveLength(1);
+	});
+	test("a non-ENOENT root canonicalization failure is ambiguous even when readdir would succeed", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "unresolvable-root");
+		const identity = await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", {
+			randomId: () => "lease-1",
+		});
+		seedTopic(agentDir, "S", "501");
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			fs: fsWithUnresolvableRealpath(identity.canonicalRoot),
+			pidAlive: () => true,
+			now: () => 130_000,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+
+		expect(daemon.sessions.has("S")).toBe(false);
+		expect(FakeWs.instances).toHaveLength(0);
+		expect(bot.calls.some(call => call.method === "deleteForumTopic")).toBe(false);
+		expect(rootsRegistrySnapshot(agentDir).orphanCandidates?.S).toBeUndefined();
+	});
+	test("daemon restart after symlink alias removal does not falsely reap a live canonical workspace", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const real = path.join(agentDir, "real-ws");
+		const alias = path.join(agentDir, "alias-ws");
+		fs.mkdirSync(real, { recursive: true });
+		fs.symlinkSync(real, alias);
+		await publishIdentityEndpoint(s, alias, "S", "ws://s", "ts", { randomId: () => "lease-1", now: () => 70_000 });
+		seedTopic(agentDir, "S", "501");
+
+		const bot = new FakeBotApi();
+		let now = 70_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		expect(daemon.sessions.has("S")).toBe(true);
+
+		fs.unlinkSync(alias);
+
+		bot.calls = [];
+		now = 130_000;
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(daemon.sessions.has("S")).toBe(true);
+	});
+
+	test("duplicate same-session endpoints across roots are ambiguous: neither first-wins nor authorizes cleanup", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const rootA = path.join(agentDir, "root-a");
+		const rootB = path.join(agentDir, "root-b");
+		fs.mkdirSync(rootA, { recursive: true });
+		fs.mkdirSync(rootB, { recursive: true });
+		const regA = await registerNotificationRoot({
+			settings: s,
+			cwd: rootA,
+			sessionId: "S",
+			randomId: () => "lease-a",
+		});
+		const regB = await registerNotificationRoot({
+			settings: s,
+			cwd: rootB,
+			sessionId: "other",
+			randomId: () => "lease-b",
+		});
+		// Duplicate S endpoint file in BOTH distinct canonical roots with different identity.
+		writeIdentityEndpoint(path.join(regA.root, "sdk"), "S", "ws://a", "ta", regA.root, regA.leaseId);
+		writeIdentityEndpoint(path.join(regB.root, "sdk"), "S", "ws://b", "tb", regB.root, "lease-b-dup");
+		seedTopic(agentDir, "S", "501");
+
+		const bot = new FakeBotApi();
+		let now = 70_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+
+		expect(daemon.sessions.has("S")).toBe(false);
+		expect(FakeWs.instances.some(ws => ws.url.includes("ws://a") || ws.url.includes("ws://b"))).toBe(false);
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(rootsRegistrySnapshot(agentDir).orphanCandidates?.S).toBeUndefined();
+
+		now = 130_000;
+		await daemon.scanRoots();
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(daemon.sessions.has("S")).toBe(false);
+	});
+
+	test("predecessor socket close after successor registration cannot delete or compact", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://old", "told", { randomId: () => "lease-old", now: () => 1000 });
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		const predSession = daemon.sessions.get("S")!;
+		expect(predSession.leaseId).toBe("lease-old");
+
+		await daemon.handleSessionMessage(predSession, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+
+		await registerNotificationRoot({
+			settings: s,
+			cwd,
+			sessionId: "S",
+			randomId: () => "lease-new",
+			now: () => 2000,
+		});
+		bot.calls = [];
+		await daemon.handleSessionMessage(predSession, { type: "session_closed", sessionId: "S" });
+
+		expect(bot.calls.some(c => c.method === "deleteForumTopic" && c.body.message_thread_id === threadId)).toBe(false);
+		const afterClose = rootsRegistrySnapshot(agentDir);
+		expect(afterClose.sessionLeases.S.leaseId).toBe("lease-new");
+		expect(afterClose.sessions.S).toBeDefined();
+		expect(topicRegistrySnapshot(agentDir).topics.S).toBeDefined();
+	});
+
+	test("successor registration revokes a predecessor socket: late sends are dropped and the successor connects", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://old", "told", { randomId: () => "lease-old" });
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		const predSocket = FakeWs.instances[0]!;
+		expect(daemon.sessions.get("S")?.leaseId).toBe("lease-old");
+		const predecessor = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(predecessor, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "old",
+			branch: "old",
+		});
+		const threadId = bot.calls.find(call => call.method === "sendMessage")!.body.message_thread_id;
+		const predecessorSends = predSocket.sent.length;
+
+		await publishIdentityEndpoint(s, cwd, "S", "ws://new", "tnew", { randomId: () => "lease-new" });
+		await daemon.handleTelegramUpdate({
+			update_id: 99,
+			message: {
+				chat: { id: 42 },
+				message_thread_id: threadId,
+				message_id: 99,
+				text: "must not reach predecessor",
+			},
+		});
+		expect(predSocket.sent).toHaveLength(predecessorSends);
+		expect(daemon.sessions.get("S")?.ws).not.toBe(predSocket as any);
+
+		// No scan is required for revocation: Telegram-originated control and every
+		// inbound predecessor frame revalidate bound authority before acting.
+		bot.calls = [];
+		predSocket.emit({ type: "action_needed", kind: "ask", id: "stale", question: "Q", options: ["Y"] });
+		await new Promise(resolve => setTimeout(resolve, 10));
+		expect(bot.calls.some(c => c.method === "sendMessage")).toBe(false);
+		expect(daemon.sessions.get("S")?.ws).not.toBe(predSocket as any);
+
+		await daemon.scanRoots();
+		expect(daemon.sessions.get("S")?.ws).not.toBe(predSocket as any);
+		expect(daemon.sessions.get("S")?.leaseId).toBe("lease-new");
+
+		const successor = daemon.sessions.get("S")!;
+		bot.calls = [];
+		await daemon.handleSessionMessage(successor, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r2",
+			branch: "b2",
+		});
+		expect(bot.calls.some(c => c.method === "editForumTopic" || c.method === "sendMessage")).toBe(true);
+	});
+
+	test("a single valid successor connects and operates after a predecessor is gone", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", { randomId: () => "lease-1" });
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		expect(daemon.sessions.has("S")).toBe(true);
+		expect(daemon.sessions.get("S")!.leaseId).toBe("lease-1");
+
+		const session = daemon.sessions.get("S")!;
+		FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
+		expect(bot.calls.some(c => c.method === "createForumTopic")).toBe(true);
+
+		const before = daemon.sessions.get("S")!;
+		await daemon.scanRoots();
+		expect(daemon.sessions.get("S")).toBe(before);
+	});
+
+	test("endpoint incarnation replacement revokes a socket even when root and lease are unchanged", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		const identity = await publishIdentityEndpoint(s, cwd, "S", "ws://old", "told", {
+			randomId: () => "lease-1",
+		});
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		const predecessor = FakeWs.instances[0]!;
+		expect(daemon.sessions.get("S")?.ws).toBe(predecessor as any);
+
+		writeIdentityEndpoint(
+			path.join(identity.canonicalRoot, "sdk"),
+			"S",
+			"ws://new",
+			"tnew",
+			identity.canonicalRoot,
+			identity.leaseId,
+		);
+		bot.calls = [];
+		predecessor.emit({ type: "action_needed", kind: "ask", id: "stale", question: "Q", options: ["Y"] });
+		await new Promise(resolve => setTimeout(resolve, 10));
+
+		expect(bot.calls.some(call => call.method === "sendMessage")).toBe(false);
+		expect(daemon.sessions.get("S")?.ws).not.toBe(predecessor as any);
+
+		await daemon.scanRoots();
+		expect(daemon.sessions.get("S")?.leaseId).toBe("lease-1");
+		expect(FakeWs.instances.some(ws => ws.url.includes("ws://new"))).toBe(true);
+	});
+	test("predecessor race: fresh registry lease with predecessor endpoint file remaining never connects or deletes", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		// Predecessor registers and publishes an identity-bearing endpoint.
+		await publishIdentityEndpoint(s, cwd, "S", "ws://old", "told", { randomId: () => "lease-old" });
+		seedTopic(agentDir, "S", "501");
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+
+		// Successor registers (fresh lease) but the predecessor endpoint file is
+		// NOT yet overwritten — it still carries the OLD lease. This is the exact
+		// race window: registry has lease-new, endpoint file carries lease-old.
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S", randomId: () => "lease-new" });
+		await daemon.scanRoots();
+
+		// The predecessor endpoint (carrying lease-old) does NOT match the fresh
+		// registry lease (lease-new) → mismatched carried identity → ambiguous →
+		// NEVER connects. No topic created, no close/delete possible.
+		expect(daemon.sessions.has("S")).toBe(false);
+		expect(FakeWs.instances.some(ws => ws.url.includes("ws://old"))).toBe(false);
+		expect(bot.calls.some(c => c.method === "createForumTopic")).toBe(false);
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+
+		// Once the successor publishes its own identity-bearing endpoint (carrying
+		// lease-new), the scan connects it — the predecessor endpoint is superseded.
+		await publishIdentityEndpoint(s, cwd, "S", "ws://new", "tnew", { randomId: () => "lease-new" });
+		await daemon.scanRoots();
+		expect(daemon.sessions.has("S")).toBe(true);
+		expect(daemon.sessions.get("S")!.leaseId).toBe("lease-new");
+	});
+
+	test("endpoint missing publication identity is ambiguous and never connects", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		// Register but write a legacy endpoint WITHOUT canonicalRoot/leaseId.
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S", randomId: () => "lease-1" });
+		const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		fs.writeFileSync(path.join(endpointDir, "S.json"), JSON.stringify({ url: "ws://s", token: "ts", pid: 4242 }));
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+
+		// Missing publication identity → malformed → ambiguous → never connects.
+		// The daemon never infers a lease from the registry.
+		expect(daemon.sessions.has("S")).toBe(false);
+		expect(FakeWs.instances.some(ws => ws.url.includes("ws://s"))).toBe(false);
 	});
 });
