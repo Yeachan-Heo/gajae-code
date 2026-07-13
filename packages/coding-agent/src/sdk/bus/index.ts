@@ -65,6 +65,7 @@ import {
 	sessionTag,
 } from "./config";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
+import { toSdkModelCatalogEntry } from "./model-catalog";
 import { ensureTelegramDaemonRunning } from "./telegram-daemon";
 
 // ===========================================================================
@@ -1161,14 +1162,7 @@ function sdkQuerySurface(
 			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
 		getDiff,
 		getUsage: () => ctx.sessionManager.getUsageStatistics(),
-		getModels: () =>
-			ctx.modelRegistry.getAll().map(model => ({
-				provider: model.provider,
-				id: model.id,
-				name: model.name,
-				contextWindow: model.contextWindow,
-				maxTokens: model.maxTokens,
-			})),
+		getModels: () => ctx.modelRegistry.getAll().map(toSdkModelCatalogEntry),
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => ctx.workflowGate?.listPendingGates?.() ?? [],
 		getConfigItems: () => {

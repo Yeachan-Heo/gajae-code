@@ -94,6 +94,47 @@ test("model.set atomically promotes an explicit thinking level for the active an
 	const client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 4_000, reconnectAttempts: 0 });
 
 	try {
+		type SdkModelCatalogItem = {
+			provider: string;
+			id: string;
+			name: string;
+			contextWindow: number;
+			maxTokens: number;
+			reasoning: boolean;
+			thinking?: {
+				minLevel: Effort;
+				maxLevel: Effort;
+				levels?: Effort[];
+				defaultLevel?: Effort;
+				mode: string;
+			};
+		};
+		const modelsFrame = (await client.query("models.list/current")) as {
+			page?: { items?: SdkModelCatalogItem[] };
+		};
+		const catalog = modelsFrame.page?.items ?? [];
+		expect(catalog.find(model => model.id === "initial-model")).toMatchObject({
+			provider: "runtime-provider",
+			id: "initial-model",
+			name: "Initial Model",
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+			reasoning: false,
+		});
+		expect(catalog.find(model => model.id === "reasoning-model")).toMatchObject({
+			provider: "runtime-provider",
+			id: "reasoning-model",
+			name: "Reasoning Model",
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+			reasoning: true,
+			thinking: {
+				minLevel: Effort.Minimal,
+				maxLevel: Effort.High,
+				defaultLevel: Effort.Low,
+				mode: "effort",
+			},
+		});
 		await expect(
 			client.control("model.set", {
 				id: "runtime-provider/initial-model",
