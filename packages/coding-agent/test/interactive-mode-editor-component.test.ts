@@ -3,9 +3,9 @@ import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { Agent } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
-import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { initTheme, theme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { CURSOR_MARKER, Text, visibleWidth } from "@gajae-code/tui";
+import { CURSOR_MARKER, ImageProtocol, setTerminalImageProtocol, TERMINAL, Text, visibleWidth } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import type {
@@ -585,5 +585,50 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(mode.editor.onSubmit).toBeDefined();
 		expect(mode.editor.onEscape).toBeDefined();
 		expect(refreshSpy).toHaveBeenCalled();
+	});
+
+	it("preserves a pending pet mode across editor replacement", () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		vi.spyOn(mode, "refreshSlashCommandState").mockResolvedValue();
+		try {
+			setTerminalImageProtocol(null);
+			settings.set("pet.mode", "red");
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			expect(mode.petWidget?.mode).toBe("off");
+
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			expect(mode.petWidget?.mode).toBe("off");
+
+			expect(settings.get("pet.mode")).toBe("red");
+			setTerminalImageProtocol(ImageProtocol.Sixel);
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			expect(mode.petWidget?.mode).toBe("red");
+		} finally {
+			setTerminalImageProtocol(originalProtocol);
+		}
+	});
+
+	it("disposes a pre-init pet widget before init replaces it", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		vi.spyOn(mode, "refreshSlashCommandState").mockResolvedValue();
+		try {
+			setTerminalImageProtocol(null);
+			settings.set("pet.mode", "red");
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			const preInitWidget = mode.petWidget;
+			if (!preInitWidget) throw new Error("Expected pre-init pet widget");
+			const dispose = vi.spyOn(preInitWidget, "dispose");
+
+			await mode.init();
+
+			expect(dispose).toHaveBeenCalledTimes(1);
+			expect(mode.petWidget).not.toBe(preInitWidget);
+			expect(mode.petWidget?.mode).toBe("off");
+
+			setTerminalImageProtocol(ImageProtocol.Sixel);
+			expect(mode.petWidget?.mode).toBe("red");
+		} finally {
+			setTerminalImageProtocol(originalProtocol);
+		}
 	});
 });
