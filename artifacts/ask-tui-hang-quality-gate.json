@@ -1,0 +1,41 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "Architecture: the fix restores the intended layering — the workflow gate is the headless (non-TUI) answer path, the local extension UI is the attended path. Root cause traced to the SDK-canonical-bus change constructing BrokerWorkflowGateEmitter unconditionally (agent-session.ts:1684) while isUnattended() is hardcoded true (workflow-gate-broker.ts:134); gating on presence of an interactive UI is the correct, minimal decision point and matches the pre-existing 'Headless fallback' comment. Product: attended TUI asks no longer hang; headless/SDK asks still route to the gate. Code: single guard change plus explanatory comment, no dead code, no new abstraction; regression test added covering the exact hang condition and the preserved headless path.",
+    "commands": ["read packages/coding-agent/src/tools/ask.ts:760-772", "read packages/coding-agent/src/modes/shared/agent-wire/workflow-gate-broker.ts:134-145", "read packages/coding-agent/src/session/agent-session.ts:1684"],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "Unit + typecheck lanes pass (ask.test.ts 66/0, ultragoal-ask-guard 9/0, tsc exit 0). Red-team: the added regression test reproduces the hang condition (attended context + always-unattended durable gate emitter) and asserts emitGate is NOT called and the local selector resolves; the preserved headless tests assert emitGate IS still called with hasUI:false.",
+    "e2eCommands": ["bun test packages/coding-agent/test/tools/ask.test.ts", "bun test packages/coding-agent/test/tools/ultragoal-ask-guard.test.ts"],
+    "redTeamCommands": ["bun test packages/coding-agent/test/tools/ask.test.ts"],
+    "artifactRefs": [
+      { "id": "qa-report", "kind": "package-test-report", "path": "artifacts/ask-tui-hang-qa-report.json", "description": "package-surface QA + adversarial matrix for the ask TUI hang fix" }
+    ],
+    "contractCoverage": [
+      { "id": "c1", "contractRef": "ask-attended-uses-local-ui", "obligation": "When an interactive UI is present the ask tool must use the local selector, never the headless workflow gate.", "status": "covered", "surfaceEvidenceRefs": ["s1"], "adversarialCaseRefs": ["a1"] },
+      { "id": "c2", "contractRef": "ask-headless-uses-gate", "obligation": "With no interactive UI, unattended asks must still route to the workflow gate.", "status": "covered", "surfaceEvidenceRefs": ["s1"], "adversarialCaseRefs": ["a2"] }
+    ],
+    "surfaceEvidence": [
+      { "id": "s1", "contractRef": "ask tool routing (package)", "surface": "package", "invocation": "bun test packages/coding-agent/test/tools/ask.test.ts", "verdict": "passed", "artifactRefs": ["qa-report"] }
+    ],
+    "adversarialCases": [
+      { "id": "a1", "contractRef": "ask-attended-uses-local-ui", "scenario": "Attended context (hasUI true + ui.select) with a durable gate emitter whose isUnattended() is always true.", "expectedBehavior": "Local selector invoked; emitGate not called; ask resolves without hanging.", "verdict": "passed", "artifactRefs": ["qa-report"] },
+      { "id": "a2", "contractRef": "ask-headless-uses-gate", "scenario": "Headless context (no ui, hasUI false) with unattended gate emitter.", "expectedBehavior": "Routes to emitGate() as before.", "verdict": "passed", "artifactRefs": ["qa-report"] }
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "No blockers surfaced; full targeted verification reran cleanly after the change.",
+    "fullRerun": true,
+    "rerunCommands": ["bun test packages/coding-agent/test/tools/ask.test.ts", "bun test packages/coding-agent/test/tools/ultragoal-ask-guard.test.ts", "bunx tsc --noEmit -p packages/coding-agent/tsconfig.json"],
+    "blockers": []
+  }
+}

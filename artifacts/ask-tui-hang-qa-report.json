@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "kind": "package-test-report",
+  "story": "G001 fix ask tool hangs indefinitely on attended TUI",
+  "surface": "package",
+  "rootCause": "BrokerWorkflowGateEmitter is constructed unconditionally per session (agent-session.ts:1684) and isUnattended() always returns true (workflow-gate-broker.ts:134). ask.ts computed canUseWorkflowGate purely from isUnattended(), so attended TUI asks routed to emitGate() and blocked forever waiting on a remote responder.",
+  "fix": "ask.ts gates canUseWorkflowGate on the absence of a local interactive UI (context.hasUI && context.ui). The workflow gate is the headless (non-TUI) answer path only; when a UI is present the local selector is used.",
+  "changedFiles": [
+    "packages/coding-agent/src/tools/ask.ts",
+    "packages/coding-agent/test/tools/ask.test.ts"
+  ],
+  "verification": [
+    {
+      "id": "ask-unit",
+      "invocation": "bun test packages/coding-agent/test/tools/ask.test.ts",
+      "observed": "66 pass / 0 fail / 263 expect() calls",
+      "verdict": "passed"
+    },
+    {
+      "id": "ultragoal-ask-guard",
+      "invocation": "bun test packages/coding-agent/test/tools/ultragoal-ask-guard.test.ts",
+      "observed": "9 pass / 0 fail",
+      "verdict": "passed"
+    },
+    {
+      "id": "typecheck",
+      "invocation": "bunx tsc --noEmit -p packages/coding-agent/tsconfig.json",
+      "observed": "exit=0",
+      "verdict": "passed"
+    }
+  ],
+  "adversarial": [
+    {
+      "id": "attended-no-hang",
+      "scenario": "Attended context (hasUI true + ui.select present) with a durable workflow-gate emitter whose isUnattended() returns true — the exact hang condition.",
+      "expected": "Local selector is invoked; emitGate() is NOT called; ask resolves.",
+      "observed": "New regression test 'prefers the local interactive UI over the workflow gate when a UI context is present' asserts emitGate not called, select called once, result selectedOptions=[\"yes\"]. Passed.",
+      "verdict": "passed"
+    },
+    {
+      "id": "headless-still-gates",
+      "scenario": "Headless context (no ui, hasUI false) with an unattended gate emitter.",
+      "expected": "Routes to emitGate() as before.",
+      "observed": "Existing tests 'emits deep-interview question gates by default' and 'passes optional metadata for ... SDK workflow gate asks' still pass with hasUI:false expecting emitGate. Passed.",
+      "verdict": "passed"
+    }
+  ]
+}
