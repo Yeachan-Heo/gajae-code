@@ -651,7 +651,9 @@ export class RuntimeOwner {
 			this.#heartbeatTimer = null;
 		}
 		await this.#server.close().catch(() => {});
-		await this.#opts.transport.close().catch(() => {});
+		await this.#opts.transport.close().catch(async error => {
+			await this.#emit("critical", "owner_transport_stop_failed", { error: String(error) }).catch(() => {});
+		});
 		await releaseLease(this.#opts.root, this.#opts.sessionId, this.ownerId).catch(() => {});
 	}
 }

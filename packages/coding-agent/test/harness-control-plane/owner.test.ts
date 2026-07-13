@@ -22,6 +22,7 @@ class FakeTransport implements HarnessSessionTransport {
 	ack = true;
 	accept = true;
 	agentStarts: number[] = [];
+	closeError: Error | null = null;
 	async getState(): Promise<SessionStateSnapshot> {
 		return this.state;
 	}
@@ -39,7 +40,9 @@ class FakeTransport implements HarnessSessionTransport {
 		const found = this.agentStarts.find(c => c > afterCursor);
 		return found === undefined ? null : { cursor: found };
 	}
-	async close(): Promise<void> {}
+	async close(): Promise<void> {
+		if (this.closeError) throw this.closeError;
+	}
 }
 
 let root: string;
@@ -295,6 +298,21 @@ describe("RuntimeOwner (in-process integration)", () => {
 			after = await resolveOwner(root, SID);
 		}
 		expect(after.live).toBe(false);
+	});
+	it("records transport stop failure before releasing the owner lease", async () => {
+		const transport = new FakeTransport();
+		transport.closeError = new Error("child did not exit after SIGKILL");
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
+		await owner.start();
+
+		await owner.stop();
+		owner = null;
+
+		const events = await readEvents(root, SID, 0);
+		const failure = events.find(event => event.kind === "owner_transport_stop_failed");
+		expect(failure?.severity).toBe("critical");
+		expect(failure?.evidence.error).toContain("child did not exit after SIGKILL");
+		expect((await resolveOwner(root, SID)).live).toBe(false);
 	});
 });
 
