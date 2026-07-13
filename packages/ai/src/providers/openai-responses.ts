@@ -543,7 +543,13 @@ function buildParams(
 	// TODO: openai responses has no top-level `frequency_penalty` field as of the current SDK;
 	// `StreamOptions.frequencyPenalty` is intentionally dropped for this provider.
 
-	if (context.tools) {
+	// Use `.length` (not truthiness): empty arrays are truthy, and
+	// `AgentSession.runEphemeralTurn` (`/btw`, IRC replies) intentionally
+	// passes `context.tools = []` with `toolChoice: "none"`. Emitting
+	// `tools: []` + `tool_choice: "none"` is rejected by openai-responses
+	// proxies (e.g. grok-build: "A tool_choice was set on the request but no
+	// tools were specified.") and mirrors the openai-completions #1227 fix.
+	if (context.tools?.length) {
 		params.tools = convertTools(context.tools, supportsStrictMode(model), model);
 		if (options?.toolChoice) {
 			const toolChoice = resolveToolChoice(model, options.toolChoice);
@@ -566,6 +572,13 @@ function buildParams(
 		if (params.tools.some(t => (t as { type?: string }).type === "custom")) {
 			params.parallel_tool_calls = false;
 		}
+	}
+
+	// Defence-in-depth: `tool_choice: "none"` with no tools to gate is
+	// redundant and rejected by some Responses proxies when tools is missing
+	// or empty. Drop it whenever the resolved tools list is empty.
+	if (params.tool_choice === "none" && (!Array.isArray(params.tools) || params.tools.length === 0)) {
+		delete params.tool_choice;
 	}
 
 	applyResponsesReasoningParams(params, model, options, messages, effort =>

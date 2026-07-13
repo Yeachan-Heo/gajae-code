@@ -171,4 +171,30 @@ describe("Azure OpenAI responses tool choice capability", () => {
 		expect(result.stopReason).toBe("error");
 		expect(getToolChoiceCapabilityOverride(testModel)).toBeUndefined();
 	});
+
+	it("omits tools and tool_choice when /btw passes empty tools + toolChoice none", async () => {
+		let payload: Record<string, unknown> | undefined;
+		const testModel = model();
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+				return okResponse(testModel.id);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		await streamAzureOpenAIResponses(
+			testModel,
+			{
+				messages: [{ role: "user", content: "btw what is X", timestamp: 0 }],
+				tools: [],
+			},
+			{
+				apiKey: "test-key",
+				azureBaseUrl: testModel.baseUrl,
+				toolChoice: "none",
+			},
+		).result();
+		expect(payload?.tools).toBeUndefined();
+		expect(payload?.tool_choice).toBeUndefined();
+	});
 });

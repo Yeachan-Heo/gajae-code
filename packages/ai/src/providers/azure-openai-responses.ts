@@ -309,7 +309,13 @@ function buildParams(
 
 	applyCommonResponsesSamplingParams(params, options, model.provider);
 
-	if (context.tools) {
+	// Use `.length` (not truthiness): empty arrays are truthy, and
+	// `AgentSession.runEphemeralTurn` (`/btw`, IRC replies) intentionally
+	// passes `context.tools = []` with `toolChoice: "none"`. Emitting
+	// `tools: []` + `tool_choice: "none"` is rejected by Responses APIs
+	// ("A tool_choice was set on the request but no tools were specified.")
+	// and mirrors the openai-completions / openai-responses #1227 fix.
+	if (context.tools?.length) {
 		params.tools = convertTools(context.tools);
 		if (options?.toolChoice) {
 			const toolChoice = resolveToolChoice(model, options.toolChoice);
@@ -323,6 +329,11 @@ function buildParams(
 			}
 			params.tool_choice = mapToOpenAIResponsesToolChoice(toolChoice.resolvedChoice);
 		}
+	}
+
+	// Defence-in-depth: drop `tool_choice: "none"` when there are no tools.
+	if (params.tool_choice === "none" && (!Array.isArray(params.tools) || params.tools.length === 0)) {
+		delete params.tool_choice;
 	}
 
 	applyResponsesReasoningParams(params, model, options, messages);
