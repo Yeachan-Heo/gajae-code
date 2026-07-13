@@ -155,7 +155,7 @@ export class RuntimeOwner {
 		this.#heartbeatTimer = setInterval(() => {
 			void heartbeat(root, sessionId, this.ownerId, this.#opts.ttlMs, this.#opts.clock).catch(err => {
 				// Self-stop if a legitimate dead-owner takeover revoked our lease.
-				if (err instanceof Error && err.message.includes("not_lease_holder")) void this.stop();
+				if (err instanceof Error && err.message.includes("not_lease_holder")) void this.stop().catch(() => {});
 			});
 		}, this.#opts.heartbeatMs);
 		this.#heartbeatTimer.unref?.();
@@ -638,7 +638,7 @@ export class RuntimeOwner {
 		state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
 		await writeSessionState(this.#opts.root, state);
 		await this.#emit("info", "owner_retired", {});
-		queueMicrotask(() => void this.stop());
+		queueMicrotask(() => void this.stop().catch(() => {}));
 		return this.#response(state, { retired: true });
 	}
 
@@ -651,10 +651,22 @@ export class RuntimeOwner {
 			this.#heartbeatTimer = null;
 		}
 		await this.#server.close().catch(() => {});
-		await this.#opts.transport.close().catch(async error => {
+		// Fail closed: only surrender authority once the transport has been verifiably torn
+		// down. If close cannot be confirmed the spawned child it owns may still be live, so
+		// releasing the lease here would open an interval where a replacement owner takes over
+		// while the old process remains — the exact orphan this owner exists to prevent. The
+		// cleanup failure is surfaced as a diagnostic (critical event); the lease stays held so
+		// no replacement authority can be minted without observed termination.
+		let transportClosed = true;
+		try {
+			await this.#opts.transport.close();
+		} catch (error) {
+			transportClosed = false;
 			await this.#emit("critical", "owner_transport_stop_failed", { error: String(error) }).catch(() => {});
-		});
-		await releaseLease(this.#opts.root, this.#opts.sessionId, this.ownerId).catch(() => {});
+		}
+		if (transportClosed) {
+			await releaseLease(this.#opts.root, this.#opts.sessionId, this.ownerId).catch(() => {});
+		}
 	}
 }
 

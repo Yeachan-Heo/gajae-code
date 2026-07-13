@@ -299,7 +299,7 @@ describe("RuntimeOwner (in-process integration)", () => {
 		}
 		expect(after.live).toBe(false);
 	});
-	it("records transport stop failure before releasing the owner lease", async () => {
+	it("records transport stop failure and retains the owner lease (fail closed)", async () => {
 		const transport = new FakeTransport();
 		transport.closeError = new Error("child did not exit after SIGKILL");
 		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
@@ -312,7 +312,66 @@ describe("RuntimeOwner (in-process integration)", () => {
 		const failure = events.find(event => event.kind === "owner_transport_stop_failed");
 		expect(failure?.severity).toBe("critical");
 		expect(failure?.evidence.error).toContain("child did not exit after SIGKILL");
+		// Fail closed: an unverified transport teardown must NOT surrender authority. The spawned
+		// child the transport owns may still be live, so the lease stays held — no interval exists
+		// where an unverified live transport has released the lease.
+		expect((await resolveOwner(root, SID)).live).toBe(true);
+	});
+
+	it("blocks replacement owner takeover while transport cleanup is unverified", async () => {
+		const transport = new FakeTransport();
+		transport.closeError = new Error("child did not exit after SIGKILL");
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
+		const priorOwnerInfo = await owner.start();
+
+		// stop() fails closed: transport teardown is unverified, so authority is retained.
+		await owner.stop();
+		owner = null;
+
+		// Authority/lease is still held by the original owner.
+		const retained = await resolveOwner(root, SID);
+		expect(retained.live).toBe(true);
+		expect(retained.lease?.ownerId).toBe(priorOwnerInfo.ownerId);
+
+		// A replacement owner cannot mint authority while the original lease is still held —
+		// takeover is refused rather than minting overlapping control of the live child.
+		const replacement = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport: new FakeTransport(),
+			acceptanceTimeoutMs: 200,
+		});
+		await expect(replacement.start()).rejects.toThrow(/lease_held/);
+		// No new live owner was minted: the original still holds the lease.
+		const afterReplacement = await resolveOwner(root, SID);
+		expect(afterReplacement.live).toBe(true);
+		expect(afterReplacement.lease?.ownerId).toBe(priorOwnerInfo.ownerId);
+	});
+
+	it("releases the owner lease after successful transport cleanup and allows replacement takeover", async () => {
+		const transport = new FakeTransport();
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
+		const priorOwnerInfo = await owner.start();
+
+		await owner.stop();
+		owner = null;
+
+		// Verified teardown surrenders authority cleanly — no lease remains.
 		expect((await resolveOwner(root, SID)).live).toBe(false);
+
+		// A replacement owner can mint authority once the original released the lease.
+		const replacement = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport: new FakeTransport(),
+			acceptanceTimeoutMs: 200,
+		});
+		owner = replacement;
+		const takeover = await replacement.start();
+		expect(takeover.ownerId).not.toBe(priorOwnerInfo.ownerId);
+		const after = await resolveOwner(root, SID);
+		expect(after.live).toBe(true);
+		expect(after.lease?.ownerId).toBe(takeover.ownerId);
 	});
 });
 

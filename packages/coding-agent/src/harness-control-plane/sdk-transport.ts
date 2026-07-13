@@ -139,7 +139,21 @@ export async function createSdkSessionTransport(
 	const deadline = Date.now() + timeoutMs;
 	while (!endpoint && Date.now() < deadline) {
 		await new Promise(resolve => setTimeout(resolve, DISCOVERY_POLL_MS));
-		endpoint = await readEndpoint(options.repo, options.sessionId);
+		try {
+			endpoint = await readEndpoint(options.repo, options.sessionId);
+		} catch (error) {
+			// A discovery read that fails after spawn must not orphan the spawned child;
+			// await stop before propagating, preserving both causes on dual failure (no double stop).
+			try {
+				await child?.stop();
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"SDK endpoint discovery and spawned harness child cleanup both failed.",
+				);
+			}
+			throw error;
+		}
 	}
 	if (!endpoint) {
 		// Await child stop so a discovery failure never orphans the spawned session;
@@ -260,12 +274,21 @@ export async function createSdkSessionTransport(
 		},
 		async close(): Promise<void> {
 			live = false;
+			const failures: unknown[] = [];
 			try {
 				await client.close();
-			} finally {
+			} catch (error) {
+				failures.push(error);
+			}
+			try {
 				// Await child stop so close never orphans the spawned session.
 				await child?.stop();
+			} catch (error) {
+				failures.push(error);
 			}
+			if (failures.length > 1)
+				throw new AggregateError(failures, "SDK client and harness child cleanup both failed.");
+			if (failures.length === 1) throw failures[0];
 		},
 	};
 }
@@ -277,8 +300,8 @@ interface ReapableChild {
 
 /**
  * Stop an exact spawned child: SIGTERM with bounded grace, SIGKILL escalation, then
- * authoritative `child.exited` verification. A rejected exit promise is NOT proof of exit,
- * so it maps to not-yet-exited and lets the SIGKILL escalation handle the uncertainty.
+ * authoritative `child.exited` verification. A rejected exit promise is NOT proof of exit
+ * and therefore fails closed after SIGKILL rather than being mistaken for termination.
  * Failure to verify exit after SIGKILL throws — the caller must not assume the child died.
  */
 async function reapChild(child: ReapableChild, termGraceMs: number, killVerifyMs: number): Promise<void> {

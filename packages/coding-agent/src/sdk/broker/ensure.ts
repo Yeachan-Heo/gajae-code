@@ -25,14 +25,28 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
  * owned {@link ChildProcess} (never by name). SIGTERM escalates to SIGKILL after
  * a bounded grace window; a child still alive after SIGKILL is surfaced rather
  * than silently orphaned. Reaping is idempotent once the child has exited.
+ *
+ * Termination is proven only by an observed exit — an `exit`/`close` event or a
+ * non-null `exitCode`/`signalCode`. A still-live child can emit `error` during
+ * teardown (e.g. a transient signal-delivery failure); that is diagnostic only
+ * and never counts as exit, so the escalation cannot be skipped mid-shutdown.
  */
 async function reapSpawnedBroker(child: ChildProcess): Promise<void> {
-	const awaitExit = (): Promise<boolean> => {
-		const { promise, resolve } = Promise.withResolvers<boolean>();
-		if (child.exitCode !== null || child.signalCode !== null) resolve(true);
+	// A spawn failure (e.g. ENOENT) never created a kernel process: pid is
+	// undefined and there is nothing to signal or await. The `error` event is the
+	// only signal and is diagnostic here — termination trivially holds, so do not
+	// run out the TERM/KILL windows or report a stuck child that never existed.
+	if (child.pid === undefined) return;
+
+	// Awaits an authoritative exit signal, never a transient `error`. Resolves on
+	// an `exit`/`close` event or when the codes are already set; the caller
+	// re-checks the codes after the race, so resolution alone is never proof.
+	const awaitVerifiedExit = (): Promise<void> => {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		if (child.exitCode !== null || child.signalCode !== null) resolve();
 		else {
-			child.once("exit", () => resolve(true));
-			child.once("error", () => resolve(true));
+			child.once("exit", () => resolve());
+			child.once("close", () => resolve());
 		}
 		return promise;
 	};
@@ -43,10 +57,15 @@ async function reapSpawnedBroker(child: ChildProcess): Promise<void> {
 			// already exited between the liveness check and the kill
 		}
 	};
+	// Observed exit is authoritative: only non-null exit/signal codes prove the
+	// child is gone, regardless of which event (if any) resolved the wait.
+	const hasExited = (): boolean => child.exitCode !== null || child.signalCode !== null;
 	signal("SIGTERM");
-	if (await Promise.race([awaitExit(), sleep(REAP_GRACEFUL_MS).then(() => false)])) return;
+	await Promise.race([awaitVerifiedExit(), sleep(REAP_GRACEFUL_MS)]);
+	if (hasExited()) return;
 	signal("SIGKILL");
-	if (await Promise.race([awaitExit(), sleep(REAP_SIGKILL_CAP_MS).then(() => false)])) return;
+	await Promise.race([awaitVerifiedExit(), sleep(REAP_SIGKILL_CAP_MS)]);
+	if (hasExited()) return;
 	// SIGKILL is uninterruptible; a child still alive past this bounded wait is a
 	// kernel-level stuck state. Surface it rather than silently orphaning the spawn.
 	throw new Error(`Detached SDK broker (pid ${child.pid}) did not exit after SIGKILL during reap.`);
@@ -68,8 +87,11 @@ export async function ensureBroker(settings: EnsureBrokerSettings): Promise<Brok
 		spawnError = error;
 	});
 	const stop = async (): Promise<void> => {
-		await reapSpawnedBroker(child);
-		owners.delete(settings.agentDir);
+		try {
+			await reapSpawnedBroker(child);
+		} finally {
+			owners.delete(settings.agentDir);
+		}
 	};
 	owners.set(settings.agentDir, { stop });
 	const deadline = Date.now() + DISCOVERY_TIMEOUT_MS;
@@ -93,16 +115,27 @@ export async function ensureBroker(settings: EnsureBrokerSettings): Promise<Brok
 	// discovery): the spawned broker never became reachable. Terminate and reap it
 	// so the failure cannot leave a detached orphan behind, then surface why.
 	const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
-	await stop();
-	if (spawnError) throw new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`);
-	if (exitedBeforeDiscovery)
-		throw new Error(
-			`Detached SDK broker exited before discovery (code=${child.exitCode}, signal=${child.signalCode}).`,
-		);
-	if (discoveryError) throw discoveryError;
-	throw new Error("Timed out waiting for detached SDK broker discovery.");
+	const failure = spawnError
+		? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
+		: exitedBeforeDiscovery
+			? new Error(
+					`Detached SDK broker exited before discovery (code=${child.exitCode}, signal=${child.signalCode}).`,
+				)
+			: discoveryError
+				? discoveryError
+				: new Error("Timed out waiting for detached SDK broker discovery.");
+	try {
+		await stop();
+	} catch (cleanupError) {
+		throw new AggregateError([failure, cleanupError], "SDK broker discovery and spawned broker cleanup both failed.");
+	}
+	throw failure;
 }
 /** Test hook: returns a stop handle for the detached broker this process spawned. */
 export function brokerOwnerForTest(agentDir: string): { stop: () => Promise<void> } | undefined {
 	return owners.get(agentDir);
+}
+/** Test hook: drives the detached-broker reap on a controllable child surface. */
+export function reapSpawnedBrokerForTest(child: ChildProcess): Promise<void> {
+	return reapSpawnedBroker(child);
 }

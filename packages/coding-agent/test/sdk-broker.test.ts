@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
+import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { getSessionsDir } from "@gajae-code/utils";
@@ -12,7 +14,7 @@ import {
 	redactBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
-import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
+import { brokerOwnerForTest, ensureBroker, reapSpawnedBrokerForTest } from "../src/sdk/broker/ensure";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { readSessionLifecycleLaunchRequest } from "../src/sdk/broker/lifecycle";
 import { resolveSdkInternalSpawnCommand } from "../src/sdk/broker/runtime";
@@ -163,6 +165,59 @@ describe("SDK broker identity and discovery", () => {
 		await expect(fs.stat(brokerDiscoveryPath(dir))).rejects.toThrow();
 		await fs.rm(dir, { recursive: true, force: true });
 	}, 15_000);
+	it("escalates to SIGKILL and awaits verified exit when a live child emits error after SIGTERM", async () => {
+		// Reproduces the PR #2157 review blocker: a still-live broker child emits
+		// `error` during SIGTERM (e.g. a transient signal-delivery failure). The
+		// reaper must treat that as diagnostic only, escalate to SIGKILL, and await
+		// an actual exit/close — never resolve on `error` alone and orphan the child.
+		// This condition is not deterministically reproducible with a real OS process,
+		// so a controllable child surface drives the exact reap control flow. Before
+		// the fix the `error` event resolved the wait as if the child had exited, so
+		// SIGKILL was never reached and the process stayed alive.
+		const signals: NodeJS.Signals[] = [];
+		const child = Object.assign(new EventEmitter(), {
+			pid: 4242,
+			exitCode: null as number | null,
+			signalCode: null as NodeJS.Signals | null,
+			kill(sig: NodeJS.Signals): boolean {
+				signals.push(sig);
+				if (sig === "SIGTERM") {
+					// Still-live child surfaces an error mid-teardown without exiting.
+					queueMicrotask(() => child.emit("error", new Error("signal delivery failed during teardown")));
+					return true;
+				}
+				if (sig === "SIGKILL") {
+					queueMicrotask(() => {
+						child.signalCode = "SIGKILL";
+						child.emit("exit", null, "SIGKILL");
+					});
+					return true;
+				}
+				return false;
+			},
+		});
+		// Production always retains ensureBroker's spawn-error listener on the child;
+		// keep one here so emitting `error` matches that surface (and is not fatal).
+		child.on("error", () => {});
+		await expect(reapSpawnedBrokerForTest(child as unknown as ChildProcess)).resolves.toBeUndefined();
+		// SIGTERM's emitted `error` must NOT count as exit: escalation reached SIGKILL.
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		// Termination was proven by an observed exit, not by the earlier `error`.
+		expect(child.signalCode).toBe("SIGKILL");
+	}, 10_000);
+	it("reaps a spawn failure with no process as a no-op instead of waiting on SIGKILL", async () => {
+		// A spawn failure (e.g. ENOENT) never created a kernel process: pid is
+		// undefined and there is nothing to signal or await. Reaping must be a no-op
+		// rather than running out the SIGKILL cap and reporting a stuck child that
+		// never existed — the distinct failure this owner must keep closed.
+		const child = Object.assign(new EventEmitter(), {
+			pid: undefined,
+			exitCode: null as number | null,
+			signalCode: null as NodeJS.Signals | null,
+			kill: (): boolean => false,
+		});
+		await expect(reapSpawnedBrokerForTest(child as unknown as ChildProcess)).resolves.toBeUndefined();
+	}, 10_000);
 	it("leaves exactly one live detached broker after concurrent process startup", async () => {
 		const dir = await temp();
 		const children = [0, 1].map(() =>
