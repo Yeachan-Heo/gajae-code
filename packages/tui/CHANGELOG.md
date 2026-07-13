@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in disabled items to `SelectList` (`SelectItem.disabled`): disabled entries render dimmed, arrow/page navigation and filter resets skip them, selection callbacks never fire for them, and programmatic selection snaps to the nearest enabled item. A list whose visible items are all disabled coherently reports no selection: `getSelectedItem()` returns `null`, no row shows a cursor, and the scroll indicator reports `(-/N)` instead of a phantom position.
+
 ## [0.10.1] - 2026-07-13
 ### Fixed
 

@@ -328,6 +328,8 @@ interface SelectItem {
 	value: string;
 	label: string;
 	description?: string;
+	hint?: string; // Dim inline hint shown after the cursor while selected
+	disabled?: boolean; // Dimmed, unselectable entry (see "Disabled items")
 }
 
 interface SelectListTheme {
@@ -352,6 +354,7 @@ list.onSelect = (item) => console.log("Selected:", item);
 list.onCancel = () => console.log("Cancelled");
 list.onSelectionChange = (item) => console.log("Highlighted:", item);
 list.setFilter("opt"); // Filter items
+list.setSelectedIndex(1); // Programmatic selection (snaps to an enabled item)
 ```
 
 **Controls:**
@@ -359,6 +362,19 @@ list.setFilter("opt"); // Filter items
 - Arrow keys: Navigate
 - Enter: Select
 - Escape: Cancel
+
+**Disabled items:**
+
+Items with `disabled: true` stay visible but can never be selected:
+
+- They render dimmed (via `theme.description`) and never show the selection cursor.
+- Arrow keys and PageUp/PageDown skip over them (wrapping past them at list edges).
+- Filtering (`setFilter`) resets the selection to the first *enabled* item.
+- `setSelectedIndex(i)` snaps to the nearest enabled item (searching forward, then backward).
+- `onSelect` and `onSelectionChange` never fire for a disabled item.
+- When every visible item is disabled the list has no selection: `getSelectedItem()`
+  returns `null`, navigation is a no-op, and the scroll indicator reports the
+  position as `(-/N)` instead of claiming a selected row.
 
 ### SettingsList
 
