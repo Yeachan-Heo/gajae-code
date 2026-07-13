@@ -1490,6 +1490,10 @@ export class AgentSession {
 	// async event handlers settle. Subscribers treat agent_end as readiness, so
 	// publishing it earlier lets a successor corrupt the prior prompt's lifecycle.
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	// A scheduled continuation owns this terminal boundary until it either starts
+	// the successor or proves it cannot. Holds prevent a false idle event while
+	// preserving the predecessor for cancellation and preflight failures.
+	#pendingAgentEndContinuationHolds = new Map<symbol, AgentSessionEvent>();
 
 	#obfuscator: SecretObfuscator | undefined;
 	#checkpointState: CheckpointState | undefined = undefined;
@@ -1550,10 +1554,6 @@ export class AgentSession {
 
 	#beginInFlight(): void {
 		this.#promptInFlightCount++;
-		// A successor that starts before a deferred terminal event is published keeps
-		// the session continuously busy; emitting the predecessor's idle boundary later
-		// would create a false readiness window between the two prompts.
-		this.#pendingAgentEndEmit = undefined;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
 		}
@@ -1583,8 +1583,49 @@ export class AgentSession {
 		}
 	}
 
-	#suppressDeferredAgentEndForContinuation(): void {
-		this.#pendingAgentEndEmit = undefined;
+	#reserveDeferredAgentEndForContinuation(): symbol | undefined {
+		const pending = this.#pendingAgentEndEmit;
+		if (!pending) return undefined;
+		const hold = Symbol("deferred-agent-end-continuation");
+		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+		return hold;
+	}
+
+	#claimDeferredAgentEndForContinuation(hold: symbol | undefined): AgentSessionEvent | undefined {
+		if (!hold) return undefined;
+		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
+		this.#pendingAgentEndContinuationHolds.delete(hold);
+		if (pending && this.#pendingAgentEndEmit === pending) {
+			this.#pendingAgentEndEmit = undefined;
+			for (const [candidate, candidatePending] of this.#pendingAgentEndContinuationHolds) {
+				if (candidatePending === pending) this.#pendingAgentEndContinuationHolds.delete(candidate);
+			}
+		}
+		return pending;
+	}
+
+	#restoreDeferredAgentEndAfterContinuationFailure(pending: AgentSessionEvent | undefined): void {
+		if (pending && !this.#pendingAgentEndEmit) {
+			this.#pendingAgentEndEmit = pending;
+		}
+		this.#flushPendingAgentEnd();
+	}
+
+	#releaseDeferredAgentEndContinuation(hold: symbol | undefined): void {
+		if (!hold) return;
+		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
+		this.#pendingAgentEndContinuationHolds.delete(hold);
+		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
+	}
+
+	#releaseDeferredAgentEndContinuations(): void {
+		let pending: AgentSessionEvent | undefined;
+		for (const candidate of this.#pendingAgentEndContinuationHolds.values()) {
+			pending = candidate;
+			break;
+		}
+		this.#pendingAgentEndContinuationHolds.clear();
+		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
 	}
 
 	#endInFlight(): void {
@@ -1597,7 +1638,12 @@ export class AgentSession {
 	}
 
 	#flushPendingAgentEnd(): void {
-		if (this.#promptInFlightCount > 0 || this.#agentEventHandlersInFlight > 0 || this.#queuedExtensionEventCount > 0)
+		if (
+			this.#promptInFlightCount > 0 ||
+			this.#agentEventHandlersInFlight > 0 ||
+			this.#queuedExtensionEventCount > 0 ||
+			this.#pendingAgentEndContinuationHolds.size > 0
+		)
 			return;
 		const pending = this.#pendingAgentEndEmit;
 		if (!pending) return;
@@ -2864,6 +2910,7 @@ export class AgentSession {
 				try {
 					await scheduler.wait(delayMs, { signal });
 				} catch {
+					options?.onSkip?.();
 					return;
 				}
 			}
@@ -2890,24 +2937,39 @@ export class AgentSession {
 		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
 		onError?: (error: unknown) => void;
 	}): Promise<void> {
-		if (options?.suppressPredecessorAgentEnd) {
-			this.#suppressDeferredAgentEndForContinuation();
-		}
-
+		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
+			? this.#reserveDeferredAgentEndForContinuation()
+			: undefined;
+		let terminalized = false;
+		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained") => {
+			if (terminalized) return;
+			terminalized = true;
+			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+			options?.onSkip?.(reason);
+		};
+		const fail = (error: unknown) => {
+			if (terminalized) return;
+			terminalized = true;
+			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+			logger.warn("agent.continue failed after scheduling", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			options?.onError?.(error);
+		};
 		const scheduledGeneration = options?.generation;
 		const signal = this.#postPromptTasksAbortController.signal;
 		return this.#schedulePostPromptTask(
 			async () => {
 				if (signal.aborted) {
-					options?.onSkip?.("aborted_signal");
+					skip("aborted_signal");
 					return;
 				}
 				if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-					options?.onSkip?.("generation_changed");
+					skip("generation_changed");
 					return;
 				}
 				if (options?.shouldContinue && !options.shouldContinue()) {
-					options.onSkip?.("queue_drained");
+					skip("queue_drained");
 					return;
 				}
 				try {
@@ -2915,15 +2977,33 @@ export class AgentSession {
 					if (!options?.skipCompactionCheck) {
 						await this.#checkEstimatedContextBeforePrompt();
 					}
-					await this.agent.continue();
+					if (signal.aborted) {
+						skip("aborted_signal");
+						return;
+					}
+					if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+						skip("generation_changed");
+						return;
+					}
+					if (options?.shouldContinue && !options.shouldContinue()) {
+						skip("queue_drained");
+						return;
+					}
+					const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
+					try {
+						await this.agent.continue();
+					} catch (error) {
+						this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+						throw error;
+					}
 				} catch (error) {
-					logger.warn("agent.continue failed after scheduling", {
-						error: error instanceof Error ? error.message : String(error),
-					});
-					options?.onError?.(error);
+					fail(error);
 				}
 			},
-			{ delayMs: options?.delayMs },
+			{
+				delayMs: options?.delayMs,
+				onSkip: () => skip("aborted_signal"),
+			},
 		);
 	}
 
@@ -2989,11 +3069,7 @@ export class AgentSession {
 	}
 
 	#scheduleAutoContinuePrompt(generation: number): void {
-		// The turn whose agent_end triggered auto-compaction is being continued, so
-		// that agent_end is not a terminal readiness signal. Suppress the deferred
-		// predecessor before the post-prompt flush can leak an idle boundary; the
-		// continuation emits the authoritative terminal agent_end when it settles.
-		this.#suppressDeferredAgentEndForContinuation();
+		const predecessorAgentEndHold = this.#reserveDeferredAgentEndForContinuation();
 		const continuePrompt = async () => {
 			await this.#promptWithMessage(
 				{
@@ -3003,26 +3079,32 @@ export class AgentSession {
 					timestamp: Date.now(),
 				},
 				autoContinuePrompt,
-				{ skipPostPromptRecoveryWait: true, skipCompactionCheck: true },
+				{
+					skipPostPromptRecoveryWait: true,
+					skipCompactionCheck: true,
+					predecessorAgentEndHold,
+				},
 			);
 		};
 		const scheduledGeneration = generation;
 		const signal = this.#postPromptTasksAbortController.signal;
 		this.#trackPostPromptTask(
 			(async () => {
-				await Promise.resolve();
-				if (signal.aborted) {
-					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-					return;
-				}
-				if (this.#promptGeneration !== scheduledGeneration) {
-					this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
-					return;
-				}
 				try {
+					await Promise.resolve();
+					if (signal.aborted) {
+						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+						return;
+					}
+					if (this.#promptGeneration !== scheduledGeneration) {
+						this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+						return;
+					}
 					await continuePrompt();
 				} catch (error) {
 					this.#logCompactionContinuationError("auto_continue_prompt", error);
+				} finally {
+					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 				}
 			})(),
 		);
@@ -3035,11 +3117,13 @@ export class AgentSession {
 
 		const pendingTasks = Array.from(this.#postPromptTasks);
 		if (pendingTasks.length === 0) {
+			this.#releaseDeferredAgentEndContinuations();
 			this.#resolvePostPromptTasks();
 			return;
 		}
 
 		await Promise.allSettled(pendingTasks);
+		this.#releaseDeferredAgentEndContinuations();
 		if (this.#postPromptTasks.size === 0) {
 			this.#resolvePostPromptTasks();
 		}
@@ -3049,6 +3133,7 @@ export class AgentSession {
 		this.#postPromptTasksAbortController.abort();
 		this.#postPromptTasksAbortController = new AbortController();
 		this.#postPromptTasks.clear();
+		this.#releaseDeferredAgentEndContinuations();
 		this.#resolveTtsrResume();
 		this.#resolvePostPromptTasks();
 	}
@@ -5999,9 +6084,12 @@ export class AgentSession {
 		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
+			predecessorAgentEndHold?: symbol;
 		},
 	): Promise<void> {
 		this.#beginInFlight();
+		const predecessorAgentEndHold =
+			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
 		const generation = this.#promptGeneration;
 		const preflightSignal = this.#promptPreflightAbortController.signal;
 
@@ -6178,7 +6266,8 @@ export class AgentSession {
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			options?.onPreflightAccepted?.();
-			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions);
+			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
 				rosterClaim &&
@@ -6206,6 +6295,7 @@ export class AgentSession {
 				);
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
+			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 			this.#endInFlight();
 		}
 	}
@@ -10555,12 +10645,26 @@ export class AgentSession {
 		this.#resolveRetry();
 	}
 
-	async #promptAgentWithIdleRetry(messages: AgentMessage[], options?: { toolChoice?: ToolChoice }): Promise<void> {
+	async #promptAgentWithIdleRetry(
+		messages: AgentMessage[],
+		options?: { toolChoice?: ToolChoice },
+		predecessorAgentEndHold?: symbol,
+	): Promise<void> {
 		const deadline = Date.now() + 30_000;
+		let continuationHold = predecessorAgentEndHold;
 		for (;;) {
 			try {
-				await this.agent.prompt(messages, options);
-				return;
+				const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(
+					continuationHold ?? this.#reserveDeferredAgentEndForContinuation(),
+				);
+				continuationHold = undefined;
+				try {
+					await this.agent.prompt(messages, options);
+					return;
+				} catch (error) {
+					this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+					throw error;
+				}
 			} catch (err) {
 				if (!(err instanceof AgentBusyError)) {
 					throw err;

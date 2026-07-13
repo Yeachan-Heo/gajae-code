@@ -189,6 +189,80 @@ test("serializes ordered operations while retry.now bypasses the session chain",
 	expect(started).toEqual(["retry", "first", "second"]);
 });
 
+test("abort-and-prompt cancels pending preflight but waits for prior ordered controls", async () => {
+	const prompt = OPERATIONS.find(row => row.sdkId === "turn.prompt")!;
+	const model = OPERATIONS.find(row => row.sdkId === "model.set")!;
+	const replacement = OPERATIONS.find(row => row.sdkId === "turn.abort_and_prompt")!;
+	const promptStarted = Promise.withResolvers<void>();
+	const modelStarted = Promise.withResolvers<void>();
+	const preflight = Promise.withResolvers<void>();
+	const longModelOperation = Promise.withResolvers<void>();
+	const calls: string[] = [];
+	const surface = {
+		prompt: async () => {
+			calls.push("prompt");
+			promptStarted.resolve();
+			await preflight.promise;
+		},
+		setModel: async () => {
+			calls.push("model");
+			modelStarted.resolve();
+			await longModelOperation.promise;
+		},
+		abortAndPrompt: () => {
+			calls.push("replacement");
+		},
+		cancelPendingPreflights: () => {
+			calls.push("cancel");
+			preflight.resolve();
+		},
+	} as unknown as ControlSurface;
+	const initial = dispatchControl(surface, prompt, { ...request(prompt), input: { text: "pending" } });
+	await promptStarted.promise;
+	const ordered = dispatchControl(surface, model, request(model));
+	const replace = dispatchControl(surface, replacement, { ...request(replacement), input: { text: "replace" } });
+
+	expect(calls).toEqual(["prompt", "cancel"]);
+	await modelStarted.promise;
+	expect(calls).toEqual(["prompt", "cancel", "model"]);
+	longModelOperation.resolve();
+	await Promise.all([initial, ordered, replace]);
+	expect(calls).toEqual(["prompt", "cancel", "model", "replacement"]);
+});
+
+test("serializes concurrent abort-and-prompt replacements after preflight cancellation", async () => {
+	const replacement = OPERATIONS.find(row => row.sdkId === "turn.abort_and_prompt")!;
+	const firstStarted = Promise.withResolvers<void>();
+	const releaseFirst = Promise.withResolvers<void>();
+	const calls: string[] = [];
+	const surface = {
+		abortAndPrompt: async (text: string) => {
+			calls.push(`replacement:${text}`);
+			if (text === "first") {
+				firstStarted.resolve();
+				await releaseFirst.promise;
+			}
+		},
+		cancelPendingPreflights: () => calls.push("cancel"),
+	} as unknown as ControlSurface;
+	const first = dispatchControl(surface, replacement, {
+		...request(replacement),
+		id: "first",
+		input: { text: "first" },
+	});
+	const second = dispatchControl(surface, replacement, {
+		...request(replacement),
+		id: "second",
+		input: { text: "second" },
+	});
+	expect(calls).toEqual(["cancel", "cancel"]);
+	await firstStarted.promise;
+	expect(calls).toEqual(["cancel", "cancel", "replacement:first"]);
+	releaseFirst.resolve();
+	await Promise.all([first, second]);
+	expect(calls).toEqual(["cancel", "cancel", "replacement:first", "replacement:second"]);
+});
+
 test("preserves typed registry errors and maps unknown failures to internal", async () => {
 	const tools = OPERATIONS.find(row => row.sdkId === "tools.active.set")!;
 	const typed = await dispatchControl(

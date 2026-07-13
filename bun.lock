@@ -77,6 +77,9 @@
         "zod": "catalog:",
       },
       "devDependencies": {
+        "@babel/traverse": "catalog:",
+        "@babel/types": "catalog:",
+        "@types/babel__traverse": "catalog:",
         "@types/bun": "catalog:",
         "@types/ws": "catalog:",
       },

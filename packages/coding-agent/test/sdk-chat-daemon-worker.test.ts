@@ -70,6 +70,11 @@ class FakeDiscordProvider implements DiscordProvider {
 	threads: DiscordThread[] = [];
 	messages: Array<{ threadId: string; content: string; components?: DiscordMessageComponent[] }> = [];
 	#threadWaiters: Array<{ count: number; resolve: () => void }> = [];
+	#messageWaiters: Array<{
+		predicate: (message: { threadId: string; content: string; components?: DiscordMessageComponent[] }) => boolean;
+		resolve: () => void;
+	}> = [];
+	#archiveWaiters: Array<{ count: number; resolve: () => void }> = [];
 	archives: string[] = [];
 	handler: ((event: DiscordInboundEvent) => Promise<void>) | undefined;
 	startupInbound: DiscordInboundEvent | undefined;
@@ -79,6 +84,34 @@ class FakeDiscordProvider implements DiscordProvider {
 		const waiter = Promise.withResolvers<void>();
 		this.#threadWaiters.push({ count, resolve: waiter.resolve });
 		return waiter.promise;
+	}
+	waitForMessage(
+		predicate: (message: { threadId: string; content: string; components?: DiscordMessageComponent[] }) => boolean,
+	): Promise<void> {
+		if (this.messages.some(predicate)) return Promise.resolve();
+		const waiter = Promise.withResolvers<void>();
+		this.#messageWaiters.push({ predicate, resolve: waiter.resolve });
+		return waiter.promise;
+	}
+	#resolveMessageWaiters(): void {
+		this.#messageWaiters = this.#messageWaiters.filter(waiter => {
+			if (!this.messages.some(waiter.predicate)) return true;
+			waiter.resolve();
+			return false;
+		});
+	}
+	waitForArchiveCount(count: number): Promise<void> {
+		if (this.archives.length >= count) return Promise.resolve();
+		const waiter = Promise.withResolvers<void>();
+		this.#archiveWaiters.push({ count, resolve: waiter.resolve });
+		return waiter.promise;
+	}
+	#resolveArchiveWaiters(): void {
+		this.#archiveWaiters = this.#archiveWaiters.filter(waiter => {
+			if (this.archives.length < waiter.count) return true;
+			waiter.resolve();
+			return false;
+		});
 	}
 	#resolveThreadWaiters(): void {
 		this.#threadWaiters = this.#threadWaiters.filter(waiter => {
@@ -120,11 +153,13 @@ class FakeDiscordProvider implements DiscordProvider {
 			content: input.content,
 			...(input.components ? { components: input.components } : {}),
 		});
+		this.#resolveMessageWaiters();
 		return { id: String(this.messages.length) };
 	}
 	async deferInteraction(): Promise<void> {}
 	async archiveThread(input: { threadId: string }): Promise<void> {
 		this.archives.push(input.threadId);
+		this.#resolveArchiveWaiters();
 	}
 	async unarchiveThread(): Promise<void> {
 		throw new Error("closed threads require replacement");
@@ -255,14 +290,11 @@ describe("chat daemon worker", () => {
 			expect.objectContaining({ type: "query_request", query: "todo.list", input: {} }),
 		);
 		expect(provider.threads).toHaveLength(1);
+		const turnStreamPosted = provider.waitForMessage(message => message.content === "GJC turn stream\noutbound");
 		client.handler?.({ type: "turn_stream", sessionId: "session", text: "outbound" });
-		for (
-			let attempt = 0;
-			attempt < 100 && !provider.messages.some(message => message.content === "GJC turn stream\noutbound");
-			attempt++
-		)
-			await Bun.sleep(1);
+		await turnStreamPosted;
 		expect(provider.messages).toContainEqual({ threadId: "thread-1", content: "GJC turn stream\noutbound" });
+		const actionPosted = provider.waitForMessage(message => message.components !== undefined);
 		client.handler?.({
 			type: "action_needed",
 			sessionId: "session",
@@ -271,8 +303,7 @@ describe("chat daemon worker", () => {
 			question: "Continue?",
 			options: ["safe"],
 		});
-		for (let attempt = 0; attempt < 50 && !provider.messages.some(message => message.components); attempt++)
-			await Bun.sleep(1);
+		await actionPosted;
 		const actionCustomId = provider.messages.find(message => message.components)?.components?.[0]?.components[0]
 			?.customId;
 		expect(actionCustomId).toBeDefined();
@@ -351,14 +382,16 @@ describe("chat daemon worker", () => {
 			threadId: "thread-1",
 			content: JSON.stringify({ ok: true, result: { operation: "session.list", status: "completed" } }),
 		});
+		const archivedThread = provider.waitForArchiveCount(1);
 		client.handler?.({ type: "event", name: "session_closed", sessionId: "session" });
-		for (let attempt = 0; attempt < 100 && provider.archives.length === 0; attempt++) await Bun.sleep(1);
+		await archivedThread;
 		expect(provider.archives).toEqual(["thread-1"]);
 		client.handler?.({ type: "event", name: "session_ready", sessionId: "session", generation: 2 });
 		await Bun.sleep(10);
 		expect(provider.threads).toHaveLength(1);
+		const replacementThread = provider.waitForThreadCount(2);
 		client.handler?.({ type: "event", name: "session_ready", sessionId: "session", generation: 1 });
-		for (let attempt = 0; attempt < 50 && provider.threads.length < 2; attempt++) await Bun.sleep(1);
+		await replacementThread;
 		expect(provider.threads).toHaveLength(2);
 		await runtime.stop();
 		expect(client.closed).toBe(true);
@@ -961,6 +994,12 @@ describe("chat daemon worker", () => {
 			expect(provider.threads).toHaveLength(1);
 			expect(frames).toContainEqual(expect.objectContaining({ type: "event_replay" }));
 
+			const queryResultPosted = provider.waitForMessage(
+				message =>
+					message.threadId === "thread-1" &&
+					message.content ===
+						JSON.stringify({ ok: true, result: { operation: "todo.list", status: "completed" } }),
+			);
 			await provider.handler?.({
 				id: "wire-query",
 				guildId: "guild",
@@ -969,6 +1008,7 @@ describe("chat daemon worker", () => {
 				authorId: "human",
 				content: "/sdk query todo.list {}",
 			});
+			await queryResultPosted;
 			expect(frames).toContainEqual(
 				expect.objectContaining({ type: "query_request", query: "todo.list", input: {} }),
 			);

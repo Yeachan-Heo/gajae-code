@@ -447,6 +447,20 @@ export interface StrictSessionOpenFailure {
 	reason: ResumeTailError["reason"] | "identity-mismatch";
 }
 
+/** Exact transcript bytes and authority captured from one descriptor-bound read. */
+export interface CapturedSessionTranscriptSnapshot {
+	sourcePath: string;
+	identity: ResumeSessionIdentity;
+	content: Uint8Array;
+	storage: SessionStorage;
+}
+
+export type StrictSessionCaptureResult =
+	| { kind: "captured"; snapshot: CapturedSessionTranscriptSnapshot }
+	| ResumeTailError;
+
+export type StrictSessionForkResult = { kind: "forked"; manager: SessionManager } | StrictSessionOpenFailure;
+
 /** Result of opening an inspected session without create-or-rewrite fallback. */
 export type StrictSessionOpenResult = StrictSessionOpenSuccess | StrictSessionOpenFailure;
 
@@ -1190,6 +1204,7 @@ function sameResumeStat(left: SessionStorageStat, right: SessionStorageStat): bo
 
 interface ResumeInspectionSnapshot {
 	identity: ResumeSessionIdentity;
+	content: Uint8Array;
 	entries: FileEntry[];
 	context: SessionContext;
 	migrationApplied: boolean;
@@ -1363,7 +1378,7 @@ function inspectResumeSessionFile(
 			mtimeNs: snapshot.mtimeNs,
 			sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
 		};
-		return { identity, entries, context, migrationApplied };
+		return { identity, content: Uint8Array.from(bytes), entries, context, migrationApplied };
 	} catch {
 		return { kind: "error", reason: "malformed" };
 	}
@@ -3658,7 +3673,7 @@ export class SessionManager {
 	}
 
 	/** Sync version for initial creation (no existing writer to close) */
-	#newSessionSync(options?: NewSessionOptions): string | undefined {
+	#newSessionSync(options?: NewSessionOptions, writeBreadcrumb = true): string | undefined {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
@@ -3693,7 +3708,7 @@ export class SessionManager {
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 			this.#sessionFile = path.join(this.getSessionDir(), `${fileTimestamp}_${this.#sessionId}.jsonl`);
-			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			if (writeBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		}
 		this.#resetResidentTextBlobStore();
 		return this.#sessionFile;
@@ -5592,6 +5607,11 @@ export class SessionManager {
 		return computeDefaultSessionDir(cwd, storage, getSessionsDir(agentDir));
 	}
 
+	/** Resolve the default session directory without creating or migrating storage. */
+	static getDefaultSessionDirReadOnly(cwd: string, agentDir?: string): string {
+		const { encodedDirName } = getDefaultSessionDirName(cwd);
+		return path.join(getSessionsDir(agentDir), encodedDirName);
+	}
 	/**
 	 * Create a new session.
 	 * @param cwd Working directory (stored in session header)
@@ -5680,6 +5700,159 @@ export class SessionManager {
 			return await collectSessionsFromFiles([...files], storage);
 		} catch {
 			return [];
+		}
+	}
+
+	/** Capture exact source content for a strict fork without granting write ownership. */
+	static captureTranscriptStrict(
+		filePath: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): StrictSessionCaptureResult {
+		const inspected = inspectResumeSessionFile(filePath, storage);
+		if ("kind" in inspected) return inspected;
+		return {
+			kind: "captured",
+			snapshot: {
+				sourcePath: path.resolve(filePath),
+				identity: inspected.identity,
+				content: Uint8Array.from(inspected.content),
+				storage,
+			},
+		};
+	}
+
+	/**
+	 * Fork strictly from captured source bytes. The source pathname is used only to
+	 * revalidate captured authority before destination initialization and transcript
+	 * persistence; destination history always comes from the captured bytes.
+	 */
+	static async forkFromCaptured(
+		snapshot: CapturedSessionTranscriptSnapshot,
+		cwd: string,
+		sessionDir?: string,
+	): Promise<StrictSessionForkResult> {
+		if (crypto.createHash("sha256").update(snapshot.content).digest("hex") !== snapshot.identity.sha256) {
+			return { kind: "error", reason: "identity-mismatch" };
+		}
+
+		let forkEntries: FileEntry[] = [];
+		try {
+			const content = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.content);
+			for (const line of content.split(/\r?\n/)) {
+				if (line.length > 0) JSON.parse(line);
+			}
+			forkEntries = parseSessionEntries(content);
+			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
+			if (sourceHeader?.type !== "session" || sourceHeader.id !== snapshot.identity.sessionId)
+				return { kind: "error", reason: "identity-mismatch" };
+			migrateToCurrentVersion(forkEntries);
+			if (!hasStrictSessionSchema(forkEntries)) return { kind: "error", reason: "malformed" };
+		} catch {
+			return { kind: "error", reason: "malformed" };
+		}
+
+		const revalidated = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
+		if ("kind" in revalidated) return revalidated;
+		if (!sameResumeIdentity(snapshot.identity, revalidated.identity)) {
+			return { kind: "error", reason: "identity-mismatch" };
+		}
+
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, snapshot.storage);
+		const removeSessionDirOnFailure =
+			snapshot.storage instanceof FileSessionStorage && !snapshot.storage.existsSync(dir);
+		let manager: SessionManager | undefined;
+		let authorityFailure: StrictSessionOpenFailure | undefined;
+		try {
+			manager = new SessionManager(cwd, dir, true, snapshot.storage);
+			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
+			manager.#fileEntries = forkEntries;
+			const sourceHeader = manager.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
+			const historyEntries = manager.#fileEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+			manager.#newSessionSync({ parentSession: sourceHeader?.id }, false);
+			manager.#resetResidentTextBlobStore();
+			const newHeader = manager.#fileEntries[0] as SessionHeader;
+			newHeader.title = sourceHeader?.title;
+			newHeader.titleSource = sourceHeader?.titleSource;
+			const residentBlobStores = manager.#residentBlobStores();
+			manager.#fileEntries = [
+				newHeader,
+				...historyEntries.map(entry => prepareEntryForResidentSync(entry, residentBlobStores) as SessionEntry),
+			];
+			manager.#sessionName = newHeader.title;
+			manager.#titleSource = newHeader.titleSource;
+			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
+			manager.#buildIndex();
+			manager.#bumpAllRevisions();
+			const beforeWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
+			if ("kind" in beforeWrite) {
+				authorityFailure = beforeWrite;
+				throw new Error("Captured fork source authority changed before destination write.");
+			}
+			if (!sameResumeIdentity(snapshot.identity, beforeWrite.identity)) {
+				authorityFailure = { kind: "error", reason: "identity-mismatch" };
+				throw new Error("Captured fork source authority changed before destination write.");
+			}
+			await manager.#rewriteFile();
+			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
+			return { kind: "forked", manager };
+		} catch (error) {
+			if (manager) {
+				const sessionFile = manager.#sessionFile;
+				const cleanupErrors: Error[] = [];
+				try {
+					await manager.close();
+				} catch (cleanupError) {
+					cleanupErrors.push(toError(cleanupError));
+				}
+				if (sessionFile) {
+					try {
+						await manager.storage.unlink(sessionFile);
+					} catch (cleanupError) {
+						if (!isEnoent(cleanupError)) cleanupErrors.push(toError(cleanupError));
+					}
+					if (manager.storage instanceof FileSessionStorage) {
+						try {
+							await fs.promises.rm(sessionFile.slice(0, -6), { recursive: true, force: true });
+						} catch (cleanupError) {
+							cleanupErrors.push(toError(cleanupError));
+						}
+						try {
+							const sessionFileName = path.basename(sessionFile);
+							const transientPrefix = `.${sessionFileName}.`;
+							const backupPrefix = `${sessionFileName}.`;
+							for (const name of await fs.promises.readdir(path.dirname(sessionFile))) {
+								if (
+									(name.startsWith(transientPrefix) && name.endsWith(".tmp")) ||
+									(name.startsWith(backupPrefix) && name.endsWith(".bak"))
+								) {
+									await fs.promises.rm(path.join(path.dirname(sessionFile), name), {
+										recursive: true,
+										force: true,
+									});
+								}
+							}
+						} catch (cleanupError) {
+							if (!isEnoent(cleanupError)) cleanupErrors.push(toError(cleanupError));
+						}
+					}
+				}
+				if (removeSessionDirOnFailure) {
+					try {
+						await fs.promises.rmdir(dir);
+					} catch (cleanupError) {
+						const code = (cleanupError as NodeJS.ErrnoException).code;
+						if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST")
+							cleanupErrors.push(toError(cleanupError));
+					}
+				}
+				if (cleanupErrors.length > 0) {
+					throw new Error(`Failed to clean up fork destination: ${cleanupErrors[0]!.message}`, {
+						cause: toError(error),
+					});
+				}
+				if (authorityFailure) return authorityFailure;
+			}
+			throw error;
 		}
 	}
 

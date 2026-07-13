@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import {
 	type ConversationRecord,
 	ConversationStore,
@@ -59,6 +61,41 @@ export interface ChatEffectLease {
 	epoch: number;
 }
 
+type EffectReferenceMapping = ConversationRecord & Record<string, unknown>;
+
+function hasImmutableEnqueueIdentity<TPayload>(
+	effect: ChatEffect<TPayload>,
+	input: EnqueueChatEffect<TPayload>,
+): boolean {
+	return (
+		effect.transport === input.transport &&
+		effect.kind === input.kind &&
+		effect.sessionId === input.sessionId &&
+		effect.endpointGeneration === input.endpointGeneration &&
+		isDeepStrictEqual(effect.payload, input.payload)
+	);
+}
+
+function requireImmutableEnqueueIdentity<TPayload>(
+	effect: ChatEffect<TPayload>,
+	input: EnqueueChatEffect<TPayload>,
+): void {
+	if (!hasImmutableEnqueueIdentity(effect, input))
+		throw new Error(`Chat effect ${input.id} already exists with a different immutable identity`);
+}
+
+function collectEffectReferences(value: unknown, references: Set<string>): void {
+	if (Array.isArray(value)) {
+		for (const entry of value) collectEffectReferences(entry, references);
+		return;
+	}
+	if (!value || typeof value !== "object") return;
+	for (const [key, candidate] of Object.entries(value)) {
+		if ((key === "effectId" || key.endsWith("EffectId")) && typeof candidate === "string") references.add(candidate);
+		else collectEffectReferences(candidate, references);
+	}
+}
+
 function nonEmpty(value: string, name: string): void {
 	if (!value) throw new Error(`Chat effect ${name} is required`);
 }
@@ -80,6 +117,8 @@ function canClaim(effect: ChatEffect, now: number): boolean {
  */
 export class ChatEffectJournal {
 	readonly #store: ConversationStore<ChatEffect>;
+	readonly #mappings: ConversationStore<EffectReferenceMapping>;
+
 	readonly #now: () => number;
 
 	constructor(input: {
@@ -94,6 +133,8 @@ export class ChatEffectJournal {
 		lockTimeoutMs?: number;
 	}) {
 		this.#store = new ConversationStore<ChatEffect>({ ...input, kind: input.transport, fileName: "effects.json" });
+		this.#mappings = new ConversationStore<EffectReferenceMapping>({ ...input, kind: input.transport });
+
 		this.#now = input.now ?? Date.now;
 	}
 
@@ -121,7 +162,11 @@ export class ChatEffectJournal {
 		nonEmpty(input.id, "id");
 		nonEmpty(input.kind, "kind");
 		const existing = await this.read<TPayload>(input.id);
-		if (existing) return existing;
+		if (existing) {
+			requireImmutableEnqueueIdentity(existing, input);
+			return existing;
+		}
+
 		const now = this.#now();
 		const effect: ChatEffect<TPayload> = {
 			...input,
@@ -134,6 +179,7 @@ export class ChatEffectJournal {
 		if (await this.#store.write(input.id, undefined, effect)) return effect;
 		const raced = await this.read<TPayload>(input.id);
 		if (!raced) throw new Error(`Unable to enqueue chat effect ${input.id}`);
+		requireImmutableEnqueueIdentity(raced, input);
 		return raced;
 	}
 
@@ -154,7 +200,11 @@ export class ChatEffectJournal {
 		let claimed: ChatEffect<TPayload> | undefined;
 		const now = this.#now();
 		await this.#store.transact(input.id, current => {
-			if (current) return current;
+			if (current) {
+				requireImmutableEnqueueIdentity(current as ChatEffect<TPayload>, input);
+				return current;
+			}
+
 			claimed = {
 				...input,
 				generation: 1,
@@ -266,11 +316,14 @@ export class ChatEffectJournal {
 	}
 
 	/** Irreversibly rejects an effect whose mapping never accepted its authority. */
-	async terminalize(id: string, receipt: ChatEffectReceipt): Promise<ChatEffect | undefined> {
+	async terminalize(id: string, receipt: ChatEffectReceipt, lease?: ChatEffectLease): Promise<ChatEffect | undefined> {
 		let terminalized: ChatEffect | undefined;
 		const now = this.#now();
 		await this.#store.transact(id, current => {
 			if (!current || current.state === "terminal") return current;
+			if (current.state === "leased" && (!lease || current.owner !== lease.owner || current.epoch !== lease.epoch))
+				return current;
+
 			terminalized = {
 				...current,
 				generation: current.generation + 1,
@@ -287,11 +340,14 @@ export class ChatEffectJournal {
 	}
 
 	async #pruneTerminal(): Promise<void> {
+		const referenced = new Set<string>();
+		for (const mapping of Object.values((await this.#mappings.load()).conversations))
+			collectEffectReferences(mapping, referenced);
 		const terminal = (await this.list())
 			.filter(effect => effect.state === "terminal")
 			.sort((left, right) => left.updatedAt - right.updatedAt);
 		for (const effect of terminal.slice(0, Math.max(0, terminal.length - MAX_TERMINAL_CHAT_EFFECTS))) {
-			await this.#store.delete(effect.id, effect.generation);
+			if (!referenced.has(effect.id)) await this.#store.delete(effect.id, effect.generation);
 		}
 	}
 }

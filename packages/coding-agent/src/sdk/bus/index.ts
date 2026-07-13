@@ -1007,6 +1007,10 @@ function sessionIdFromFile(file: string | undefined): string | undefined {
 	return underscore >= 0 ? base.slice(underscore + 1) : undefined;
 }
 
+function safeLifecycleRequestId(value: string | undefined): string | undefined {
+	return value && /^[A-Za-z0-9._-]{1,128}$/.test(value) ? value : undefined;
+}
+
 function validateProviderDefinitions(capability: string, definitions: unknown): void {
 	if (capability !== "host_tools" && capability !== "host_uri") return;
 	const invalid = (message: string): never => {
@@ -1331,7 +1335,7 @@ function sdkControlSurface(
 			pendingPreflightCancellations.delete(cancelPreflight);
 		}
 	};
-	const surface: ControlSurface = {
+	const surface: ControlSurface & { cancelPendingPreflights(): void } = {
 		prompt: (text, images) => submitPrompt(text, images),
 		steer: text => sendSteer(text),
 		followUp: text => submitPrompt(text, undefined, false, "followUp"),
@@ -1341,10 +1345,10 @@ function sdkControlSurface(
 			return { aborted: true };
 		},
 		abortAndPrompt: async text => {
-			cancelPendingPreflights();
 			await awaitAbortReady();
 			return await submitPrompt(text, undefined, true);
 		},
+		cancelPendingPreflights,
 		answerAsk: (id, answer) => {
 			const pending = pendingInteractive.get(id);
 			if (!pending) throw Object.assign(new Error(`Ask ${id} was not found.`), { code: "resource_gone" });
@@ -1629,6 +1633,7 @@ export function createNotificationsExtension(
 
 	async function startSession(ctx: ExtensionContext): Promise<"started" | "already" | "disabled" | "failed"> {
 		const id = sessionId(ctx);
+		const lifecycleRequestId = safeLifecycleRequestId(process.env.GJC_LIFECYCLE_REQUEST_ID);
 		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
 		const notificationsEnabledForSession = isEnabledForSession(id, cfg);
 		const sdkEnabledForSession = shouldHostSdk(settings, isNotificationEligibleContext(ctx));
@@ -2218,6 +2223,7 @@ export function createNotificationsExtension(
 								locator,
 								pid: process.pid,
 								endpointMtimeMs,
+								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},
 						unregister: async input => {

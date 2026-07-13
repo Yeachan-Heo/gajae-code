@@ -240,6 +240,8 @@ export declare class Process {
   static fromPath(path: string): Array<Process>
   /** Operating-system process identifier for this process reference. */
   get pid(): number
+  /** Kernel-derived identity evidence for this exact process incarnation. */
+  get incarnation(): string
   /** Parent process id for this process, when available. */
   get ppid(): number | null
   /** Launch arguments for this process. */

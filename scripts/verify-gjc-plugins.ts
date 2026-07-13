@@ -174,12 +174,262 @@ function normalizeShellContinuations(contents: string): string {
 	return contents.replace(/\\\r?\n[ \t]*/g, " ");
 }
 
-const machineTmuxRoutePattern =
-	/(?:\b(?:capture-pane|pipe-pane)\b|\[\s*["'](?:capture|pipe)["']\s*,\s*["']pane["']\s*\]\.join\(\s*["']-["']\s*\)|\btmux\s+(?:watch|load-buffer|paste-buffer|send-keys)\b|(?:scripts\/)?gjc-session\/(?:prompt|tail|watch)(?:\.sh)?\b|\bgjc-session\s+(?:prompt|tail|watch)\b|(?:\.\/)?(?:scripts\/)?gjc-session\/create\.sh(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|[^\s]+)){3}|\bgjc-session\s+create(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|[^\s]+)){3})/g;
-const installableMachineRouteReferences = [...files].flatMap(([rel, text]) => {
-	const normalizedText = normalizeShellContinuations(text);
-	return [...normalizedText.matchAll(machineTmuxRoutePattern)].map(match => `${rel}:${match[0]}`);
-});
+const tmuxMachineIngressOperations = [
+	"capture-pane",
+	"pipe-pane",
+	"send-keys",
+	"load-buffer",
+	"paste-buffer",
+	"set-buffer",
+] as const;
+const tmuxMachineIngressOperationPattern = new RegExp(`\\b(?:${tmuxMachineIngressOperations.join("|")})\\b`, "g");
+const tmuxMachineIngressOperationTest = new RegExp(tmuxMachineIngressOperationPattern.source);
+const directMachineTmuxRoutePattern =
+	/(?:\btmux\s+watch\b|(?:scripts\/)?gjc-session\/(?:prompt|tail|watch)(?:\.sh)?\b|\bgjc-session\s+(?:prompt|tail|watch)\b|(?:\.\/)?(?:scripts\/)?gjc-session\/create\.sh(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|[^\s]+)){3}|\bgjc-session\s+create(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|[^\s]+)){3})/g;
+
+// Rendered bundles are text, so normalize statically provable shell/JS values and scan the results
+// in addition to direct operation spellings.
+type StaticValue = string | string[];
+
+function splitTopLevel(source: string, delimiter: string): string[] {
+	const parts: string[] = [];
+	let start = 0;
+	let depth = 0;
+	let quote: "'" | '"' | "`" | null = null;
+	for (let index = 0; index < source.length; index++) {
+		const char = source[index];
+		if (quote) {
+			if (char === "\\") {
+				index++;
+			} else if (char === quote) {
+				quote = null;
+			}
+			continue;
+		}
+		if (char === "'" || char === '"' || char === "`") {
+			quote = char;
+		} else if (char === "(" || char === "[" || char === "{") {
+			depth++;
+		} else if (char === ")" || char === "]" || char === "}") {
+			depth--;
+		} else if (char === delimiter && depth === 0) {
+			parts.push(source.slice(start, index));
+			start = index + 1;
+		}
+	}
+	parts.push(source.slice(start));
+	return parts;
+}
+
+function wrappedBy(source: string, opener: string, closer: string): boolean {
+	if (!source.startsWith(opener) || !source.endsWith(closer)) return false;
+	let depth = 0;
+	let quote: "'" | '"' | "`" | null = null;
+	for (let index = 0; index < source.length; index++) {
+		const char = source[index];
+		if (quote) {
+			if (char === "\\") {
+				index++;
+			} else if (char === quote) {
+				quote = null;
+			}
+			continue;
+		}
+		if (char === "'" || char === '"' || char === "`") {
+			quote = char;
+		} else if (char === opener) {
+			depth++;
+		} else if (char === closer && --depth === 0) {
+			return index === source.length - 1;
+		}
+	}
+	return false;
+}
+
+function expandShellVariables(source: string, values: ReadonlyMap<string, StaticValue>): string | null {
+	let unresolved = false;
+	const expanded = source.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, braced, bare) => {
+		const value = values.get(braced ?? bare);
+		if (typeof value !== "string") {
+			unresolved = true;
+			return match;
+		}
+		return value;
+	});
+	return unresolved ? null : expanded;
+}
+
+function templateInterpolationEnd(source: string, start: number): number | null {
+	let depth = 1;
+	let quote: "'" | '"' | "`" | null = null;
+	for (let index = start; index < source.length; index++) {
+		const char = source[index];
+		if (quote) {
+			if (char === "\\") {
+				index++;
+			} else if (char === quote) {
+				quote = null;
+			}
+			continue;
+		}
+		if (char === "'" || char === '"' || char === "`") {
+			quote = char;
+		} else if (char === "{") {
+			depth++;
+		} else if (char === "}" && --depth === 0) {
+			return index;
+		}
+	}
+	return null;
+}
+
+function evaluateStaticString(expression: string, values: ReadonlyMap<string, StaticValue>, depth = 0): string | null {
+	if (depth > 12) return null;
+	const source = expression.trim();
+	if (!source) return null;
+	if (wrappedBy(source, "(", ")")) return evaluateStaticString(source.slice(1, -1), values, depth + 1);
+
+	const concatenated = splitTopLevel(source, "+");
+	if (concatenated.length > 1) {
+		const parts = concatenated.map(part => evaluateStaticString(part, values, depth + 1));
+		return parts.every((part): part is string => part !== null) ? parts.join("") : null;
+	}
+
+	const join = source.match(/^(\[[\s\S]*\])\.join\(([\s\S]*)\)$/);
+	if (join) {
+		const array = evaluateStaticArray(join[1], values, depth + 1);
+		const separator = evaluateStaticString(join[2], values, depth + 1);
+		return array && separator !== null ? array.join(separator) : null;
+	}
+
+	const first = source[0];
+	if ((first === "'" || first === '"') && source.at(-1) === first) {
+		const literal = source.slice(1, -1).replace(/\\([\\'"$`])/g, "$1");
+		return first === "'" ? literal : expandShellVariables(literal, values);
+	}
+	if (first === "`" && source.at(-1) === "`") {
+		let value = "";
+		const template = source.slice(1, -1);
+		for (let index = 0; index < template.length; index++) {
+			if (template[index] !== "$" || template[index + 1] !== "{") {
+				value += template[index];
+				continue;
+			}
+			const end = templateInterpolationEnd(template, index + 2);
+			if (end === null) return null;
+			const interpolation = evaluateStaticString(template.slice(index + 2, end), values, depth + 1);
+			if (interpolation === null) return null;
+			value += interpolation;
+			index = end;
+		}
+		return value.replace(/\\([\\`$])/g, "$1");
+	}
+
+	const shellVariable = source.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/);
+	if (shellVariable) {
+		const value = values.get(shellVariable[1]);
+		return typeof value === "string" ? value : null;
+	}
+	const namedValue = values.get(source);
+	if (typeof namedValue === "string") return namedValue;
+	return /^[A-Za-z0-9_./:-]+$/.test(source) ? source : null;
+}
+
+function shellWords(source: string): string[] {
+	const words: string[] = [];
+	let word = "";
+	let quote: "'" | '"' | null = null;
+	for (let index = 0; index < source.length; index++) {
+		const char = source[index];
+		if (quote) {
+			word += char;
+			if (char === "\\") {
+				word += source[++index] ?? "";
+			} else if (char === quote) {
+				quote = null;
+			}
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			word += char;
+		} else if (/\s/.test(char)) {
+			if (word) words.push(word);
+			word = "";
+		} else {
+			word += char;
+		}
+	}
+	if (word) words.push(word);
+	return words;
+}
+
+function evaluateStaticArray(expression: string, values: ReadonlyMap<string, StaticValue>, depth = 0): string[] | null {
+	if (depth > 12) return null;
+	const source = expression.trim();
+	const namedValue = values.get(source);
+	if (Array.isArray(namedValue)) return namedValue;
+	const body = wrappedBy(source, "[", "]")
+		? source.slice(1, -1)
+		: wrappedBy(source, "(", ")")
+			? source.slice(1, -1)
+			: null;
+	if (body === null) return null;
+	const elements = source.startsWith("[") ? splitTopLevel(body, ",") : shellWords(body);
+	const valuesByElement = elements.map(element => evaluateStaticString(element, values, depth + 1));
+	return valuesByElement.every((value): value is string => value !== null) ? valuesByElement : null;
+}
+
+function normalizedStaticValues(contents: string): string[] {
+	const values = new Map<string, StaticValue>();
+	const normalized: string[] = [];
+	const assignmentPattern =
+		/(?:^|[;{\n])\s*(?:(?:export|local|readonly)\s+)?(?:(?:const|let|var)\s+)?([A-Za-z_$][A-Za-z0-9_$]*)(?:\s*:[^=;\n]+)?\s*=\s*([^;\n]+)/g;
+	for (const match of contents.matchAll(assignmentPattern)) {
+		const name = match[1];
+		const expression = match[2];
+		const array = evaluateStaticArray(expression, values);
+		const value = array ?? evaluateStaticString(expression, values);
+		if (value === null) continue;
+		values.set(name, value);
+		normalized.push(Array.isArray(value) ? value.join(" ") : value);
+	}
+
+	for (const match of contents.matchAll(/\[[^\]\r\n]+\](?:\.join\([^\)\r\n]*\))?/g)) {
+		const value = match[0].includes(".join(")
+			? evaluateStaticString(match[0], values)
+			: evaluateStaticArray(match[0], values)?.join(" ") ?? null;
+		if (value !== null) normalized.push(value);
+	}
+	for (const match of contents.matchAll(/`(?:\\.|[^`\r\n])*`/g)) {
+		const value = evaluateStaticString(match[0], values);
+		if (value !== null) normalized.push(value);
+	}
+	for (const match of contents.matchAll(/(?:"(?:\\.|[^"\r\n])*"|'(?:\\.|[^'\r\n])*'|`(?:\\.|[^`\r\n])*`)(?:\s*\+\s*(?:"(?:\\.|[^"\r\n])*"|'(?:\\.|[^'\r\n])*'|`(?:\\.|[^`\r\n])*`))+/g)) {
+		const value = evaluateStaticString(match[0], values);
+		if (value !== null) normalized.push(value);
+	}
+	return normalized;
+}
+
+function machineTmuxRouteReferences(contents: string): string[] {
+	const normalizedContents = normalizeShellContinuations(contents);
+	const references = new Set<string>();
+	for (const match of normalizedContents.matchAll(tmuxMachineIngressOperationPattern)) {
+		references.add(match[0]);
+	}
+	for (const match of normalizedContents.matchAll(directMachineTmuxRoutePattern)) {
+		references.add(match[0]);
+	}
+	for (const value of normalizedStaticValues(normalizedContents)) {
+		if (tmuxMachineIngressOperationTest.test(value)) references.add(`normalized:${value}`);
+	}
+	return [...references];
+}
+
+const installableMachineRouteReferences = [...files].flatMap(([rel, text]) =>
+	machineTmuxRouteReferences(text).map(reference => `${rel}:${reference}`),
+);
 const machineTmuxRouteRegressionFixtures = [
 	"tmux pipe-pane -t owner 'sink'",
 	'"$TMUX_BIN" pipe-pane -t owner "sink"',
@@ -192,9 +442,21 @@ const machineTmuxRouteRegressionFixtures = [
 	"gjc-session create bot /repo --file task.md",
 	"gjc-session create bot /repo resume",
 	"gjc-session create bot /repo \\\n  positional-prompt",
+	'op=capture; op="${op}-pane"; tmux "$op" -p',
+	'op=pipe; op="${op}-pane"; cmd=(tmux "$op" -t owner sink); "${cmd[@]}"',
+	"['pipe-', 'pane'].join('')",
+	'const cmd = ["tmux", ["pipe-", "pane"].join("")]; Bun.spawn(cmd[0], { args: cmd.slice(1) })',
+	'const operation = "capture" + "-pane"; tmux "$operation" -p',
+	'const operation = `send-${"keys"}`; tmux "$operation" -t owner C-m',
+	'const operation = "load-" + "buffer"; tmux "$operation" -b owner',
+	'const operation = `paste-${"buffer"}`; tmux "$operation" -b owner',
+	'tmux_executable=tmux; operation=load; operation="${operation}-buffer"; argv=("$tmux_executable" "$operation" -b owner); "${argv[@]}"',
+	'run_tmux() { local command=tmux; "$command" "$@"; }; operation=send; operation="${operation}-keys"; run_tmux "$operation" -t owner C-m',
+	"tmux set-buffer prompt",
+	'const operation = ["set", "buffer"].join("-"); tmux "$operation" prompt',
 ];
 const uncoveredMachineTmuxRoutes = machineTmuxRouteRegressionFixtures.filter(
-	fixture => !new RegExp(machineTmuxRoutePattern.source).test(normalizeShellContinuations(fixture)),
+	fixture => machineTmuxRouteReferences(fixture).length === 0,
 );
 gate(
 	"tmux machine-ingress matcher covers regression fixtures",

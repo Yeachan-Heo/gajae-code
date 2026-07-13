@@ -260,8 +260,8 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
 	const sessionContext = context(cwd, sessionId);
-	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	void handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
 	socket.send(JSON.stringify({ type: "event_replay", id: "replay-1", sinceGeneration: 1, sinceSeq: 0 }));
 	await waitFor(
 		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "replay-1"),
@@ -705,6 +705,93 @@ test("SDK host terminalizes a never-resolving preflight on abort and fences late
 	expect(frames.filter(frame => frame.type === "control_response" && frame.id === "never-preflight")).toHaveLength(1);
 	expect(frames.some(frame => frame.type === "agent_failed" || frame.type === "agent_start")).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
+});
+
+test("SDK host abort-and-prompt cancels a never-resolving preflight before replacement submission", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-never-preflight-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-abort-prompt-never-preflight-${Date.now()}`;
+	const live = { idle: false };
+	const preflightStarted = Promise.withResolvers<void>();
+	const neverPreflight = Promise.withResolvers<never>();
+	const abortSettled = Promise.withResolvers<void>();
+	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
+	let abortStarted = false;
+	const sessionContext = {
+		...context(cwd, sessionId, "main", live),
+		abort: () => {
+			abortStarted = true;
+			return abortSettled.promise;
+		},
+	};
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			if (content === "never resolve") {
+				preflightStarted.resolve();
+				await neverPreflight.promise;
+			}
+			options?.onPreflightAccepted?.();
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "never-preflight-abort-and-prompt",
+			operation: "turn.prompt",
+			input: { text: "never resolve" },
+		}),
+	);
+	await preflightStarted.promise;
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "abort-and-prompt-never-preflight",
+			operation: "turn.abort_and_prompt",
+			input: { text: "replacement" },
+		}),
+	);
+	await waitFor(() => abortStarted, "abort-and-prompt abort prelude");
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "never-preflight-abort-and-prompt"),
+		"never-resolving preflight cancellation",
+	);
+	expect(deliveries).toHaveLength(1);
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "never-preflight-abort-and-prompt"),
+	).toMatchObject({
+		ok: false,
+		error: { code: "busy", message: "Prompt preflight was cancelled before execution." },
+	});
+
+	live.idle = true;
+	abortSettled.resolve();
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-and-prompt-never-preflight"),
+		"abort-and-prompt replacement response",
+	);
+	expect(deliveries.map(([content]) => content)).toEqual(["never resolve", "replacement"]);
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "abort-and-prompt-never-preflight"),
+	).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
 test("SDK host waits for asynchronous abort unwind before delivering an abort-and-prompt replacement", async () => {

@@ -1298,7 +1298,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 				const retryCustomId = `gjc:1:ask-retry:${retry.pendingActionNonce!}`;
 				provider.deferInteraction = async () => {
-					throw new Error("definite pre-send");
+					throw new Error("Discord API request failed (400)");
 				};
 				await expect(
 					restarted.handleInbound(inbound(retry.threadId!, "definite-pre-send", 1, retryCustomId)),
@@ -2036,7 +2036,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			await expect(restarted.start()).rejects.toThrow("Discord interaction callback failed");
 			const effectId = `discord:app:guild:parent:${conversation.threadId}:callback-health`;
 			expect((await new ChatEffectJournal({ agentDir, transport: "discord" }).read(effectId))?.receipt).toEqual({
-				status: "callback_failed",
+				status: "defer_intent",
 			});
 		});
 	});
@@ -2158,5 +2158,316 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			await restarted?.stop();
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
+	});
+	test("preserves a lost defer response as a token-free SDK-recoverable intent", async () => {
+		const frames: Record<string, unknown>[] = [];
+		await withDaemon(
+			async (daemon, provider, agentDir) => {
+				const conversation = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					content: "Choose",
+					actionId: "ask",
+					options: ["Yes"],
+				});
+				provider.deferInteraction = async () => {
+					throw new Error("connection lost after Discord accepted the callback");
+				};
+				await expect(
+					daemon.handleInbound(inbound(conversation.threadId!, "defer-response-lost", 1)),
+				).rejects.toThrow("Discord interaction callback failed");
+
+				const effectId = `discord:app:guild:parent:${conversation.threadId}:defer-response-lost`;
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+				expect(await journal.read(effectId)).toMatchObject({
+					state: "accepted",
+					receipt: { status: "defer_intent" },
+				});
+				expect(
+					await fs.readFile(path.join(agentDir, "sdk", "daemons", "discord", "effects.json"), "utf8"),
+				).not.toContain("token-defer-response-lost");
+
+				const recovery = new DiscordNotificationDaemon({
+					agentDir,
+					repo: agentDir,
+					guildId: "guild",
+					parentChannelId: "parent",
+					provider,
+					resolveEndpoint: async () => ({
+						generation: 1,
+						isCurrent: () => true,
+						send: frame => {
+							frames.push(frame);
+						},
+					}),
+				});
+				await recovery.start();
+				expect(frames).toMatchObject([
+					{ type: "reply", id: "ask", answer: "yes", idempotencyKey: expect.any(String) },
+				]);
+				expect(await journal.read(effectId)).toMatchObject({ state: "terminal" });
+				await recovery.stop();
+			},
+			{
+				resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
+			},
+		);
+	});
+
+	test("fences a stopped Gateway start and keeps repeated starts idempotent", async () => {
+		await withDaemon(async (daemon, provider) => {
+			const startEntered = Promise.withResolvers<void>();
+			const releaseStart = Promise.withResolvers<void>();
+			let starts = 0;
+			let stops = 0;
+			let blockStart = true;
+			provider.start = async onEvent => {
+				starts++;
+				if (blockStart) {
+					startEntered.resolve();
+					await releaseStart.promise;
+				}
+				provider.handler = onEvent;
+			};
+			provider.stop = async () => {
+				stops++;
+				provider.handler = undefined;
+			};
+
+			const starting = daemon.start();
+			await startEntered.promise;
+			const stopping = daemon.stop();
+			releaseStart.resolve();
+			await stopping;
+			await starting;
+			expect(provider.handler).toBeUndefined();
+			expect(stops).toBeGreaterThan(0);
+
+			blockStart = false;
+			await daemon.start();
+			await daemon.start();
+			expect(starts).toBe(2);
+		});
+	});
+
+	test("uses immutable journal identities and fences live leases from stale cleanup", async () => {
+		await withDaemon(async (_daemon, _provider, agentDir) => {
+			const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+			const input = {
+				id: "immutable-effect",
+				kind: "post-message",
+				transport: "discord" as const,
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: { threadId: "thread", content: "first" },
+			};
+			await journal.enqueue(input);
+			expect((await journal.enqueue(input)).id).toBe(input.id);
+			await expect(
+				journal.enqueue({ ...input, payload: { threadId: "thread", content: "changed" } }),
+			).rejects.toThrow("immutable identity");
+			await expect(journal.enqueueAndClaim({ ...input, kind: "archive" }, "owner", 60_000)).rejects.toThrow(
+				"immutable identity",
+			);
+
+			const leased = await journal.enqueueAndClaim(
+				{ ...input, id: "live-effect", payload: { threadId: "thread", content: "live" } },
+				"owner",
+				60_000,
+			);
+			expect(leased).toBeDefined();
+			await journal.terminalize("live-effect", { status: "stale_noop" });
+			expect(await journal.read("live-effect")).toMatchObject({ state: "leased", owner: "owner" });
+			await journal.record("live-effect", { owner: "owner", epoch: leased!.epoch }, "terminal");
+		});
+	});
+
+	test("keeps a terminal effect referenced by a crash-window receipt through terminal pruning", async () => {
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			const effectId = `discord:app:guild:parent:${conversation.threadId}:prune-receipt`;
+			const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+			await journal.enqueue({
+				id: effectId,
+				kind: "discord.inbound.command",
+				transport: "discord",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					type: "command",
+					content: "/sdk query preserved",
+					idempotencyKey: effectId,
+					routing: {
+						guildId: "guild",
+						parentId: "parent",
+						threadId: conversation.threadId!,
+						eventId: "prune-receipt",
+						kind: "command",
+					},
+				},
+			});
+			const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+			const key = `app:guild:parent:${conversation.threadId}`;
+			const mapping = await store.read(key);
+			expect(mapping).toBeDefined();
+			await store.write(key, mapping!.generation, {
+				...mapping!,
+				generation: mapping!.generation + 1,
+				updatedAt: Date.now(),
+				inboundDispatches: [
+					{
+						key: "prune-receipt",
+						eventId: "prune-receipt",
+						kind: "command",
+						endpointGeneration: 1,
+						effectId,
+						idempotencyKey: effectId,
+					},
+				],
+			});
+			const lease = await journal.claim(effectId, "owner", 60_000);
+			await journal.record(effectId, { owner: "owner", epoch: lease!.epoch }, "terminal");
+			for (let index = 0; index < 129; index++) {
+				const id = `terminal-prune-${index}`;
+				await journal.enqueue({
+					id,
+					kind: "post-message",
+					transport: "discord",
+					sessionId: "session",
+					endpointGeneration: 1,
+					payload: { threadId: conversation.threadId!, content: String(index) },
+				});
+				const terminalLease = await journal.claim(id, "owner", 60_000);
+				await journal.record(id, { owner: "owner", epoch: terminalLease!.epoch }, "terminal");
+			}
+			expect(await journal.read(effectId)).toMatchObject({ state: "terminal" });
+
+			const restarted = new DiscordNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				guildId: "guild",
+				parentChannelId: "parent",
+				provider,
+				resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
+			});
+			await restarted.start();
+			expect((await store.read(key))?.inboundDispatches ?? []).toEqual([]);
+			await restarted.stop();
+		});
+	});
+
+	test("retains a receipt with a missing referenced effect for scheduled recovery", async () => {
+		await withDaemon(async (daemon, _provider, agentDir) => {
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+			const key = `app:guild:parent:${conversation.threadId}`;
+			const mapping = await store.read(key);
+			expect(mapping).toBeDefined();
+			const effectId = `discord:app:guild:parent:${conversation.threadId}:missing-effect`;
+			await store.write(key, mapping!.generation, {
+				...mapping!,
+				generation: mapping!.generation + 1,
+				updatedAt: Date.now(),
+				inboundDispatches: [
+					{
+						key: "missing-effect",
+						eventId: "missing-effect",
+						kind: "command",
+						endpointGeneration: 1,
+						effectId,
+						idempotencyKey: effectId,
+					},
+				],
+			});
+
+			await daemon.start();
+			await Bun.sleep(30);
+			expect((await store.read(key))?.inboundDispatches).toEqual([
+				expect.objectContaining({ effectId, eventId: "missing-effect" }),
+			]);
+		});
+	});
+
+	test("backfills a legacy active mapping's archive effect lineage from its creation nonce", async () => {
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+			const threadId = "legacy-active";
+			const createNonce = "legacy-active-cycle";
+			const key = `app:guild:parent:${threadId}`;
+			await store.transact(key, () => ({
+				generation: 1,
+				state: "active",
+				appId: "app",
+				guildId: "guild",
+				parentChannelId: "parent",
+				threadId,
+				sessionId: "legacy-active-session",
+				endpointGeneration: 1,
+				createNonce,
+				updatedAt: 1,
+				seenEventIds: [],
+				seenInteractionIds: [],
+			}));
+
+			await daemon.archive("legacy-active-session");
+			expect(await store.read(key)).toMatchObject({ state: "archived", effectIncarnationId: createNonce });
+			expect(provider.archived).toEqual([{ threadId }]);
+			const archive = (await new ChatEffectJournal({ agentDir, transport: "discord" }).list()).find(
+				effect => effect.kind === "archive" && effect.id.startsWith(`archive:${threadId}:${createNonce}:`),
+			);
+			expect(archive).toBeDefined();
+		});
+	});
+
+	test("backfills a legacy archived mapping before resuming its next lifecycle cycle", async () => {
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+			const threadId = "legacy-archived";
+			const createNonce = "legacy-archived-cycle";
+			const key = `app:guild:parent:${threadId}`;
+			await store.transact(key, () => ({
+				generation: 1,
+				state: "archived",
+				appId: "app",
+				guildId: "guild",
+				parentChannelId: "parent",
+				threadId,
+				sessionId: "legacy-archived-session",
+				endpointGeneration: 1,
+				createNonce,
+				updatedAt: 1,
+				seenEventIds: [],
+				seenInteractionIds: [],
+			}));
+
+			const resumed = await daemon.resume("legacy-archived-session", 2);
+			expect(resumed).toMatchObject({ state: "active", effectIncarnationId: createNonce });
+			expect(provider.unarchived).toEqual([threadId]);
+			await daemon.archive("legacy-archived-session");
+			const effects = (await new ChatEffectJournal({ agentDir, transport: "discord" }).list()).filter(
+				effect =>
+					(effect.kind === "archive" || effect.kind === "unarchive") &&
+					effect.id.includes(`:${threadId}:${createNonce}:`),
+			);
+			expect(effects).toHaveLength(2);
+			expect(new Set(effects.map(effect => effect.id)).size).toBe(2);
+		});
+	});
+
+	test("uses a fresh durable archive occurrence for every archive cycle", async () => {
+		await withDaemon(async (daemon, provider, agentDir) => {
+			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			await daemon.archive("session");
+			await daemon.resume("session", 1);
+			await daemon.archive("session");
+			expect(provider.archived).toEqual([
+				{ threadId: conversation.threadId! },
+				{ threadId: conversation.threadId! },
+			]);
+			const archiveEffects = (await new ChatEffectJournal({ agentDir, transport: "discord" }).list()).filter(
+				effect => effect.kind === "archive" && effect.receipt?.status === "archive",
+			);
+			expect(new Set(archiveEffects.map(effect => effect.id)).size).toBe(2);
+		});
 	});
 });

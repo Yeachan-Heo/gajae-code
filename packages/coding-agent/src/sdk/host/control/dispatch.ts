@@ -79,6 +79,10 @@ interface IdempotencyEntry {
 }
 const idempotentRequests = new WeakMap<ControlSurface, Map<string, IdempotencyEntry>>();
 
+type PreflightCancellableSurface = ControlSurface & {
+	cancelPendingPreflights?(): void;
+};
+
 function failure(
 	id: string,
 	code: ControlErrorCode,
@@ -353,6 +357,11 @@ export function dispatchControl(
 			failure(request.id, "invalid_input", "confirm: true is required for this destructive operation."),
 		);
 	const work = () => execute(surface, row, request);
+	if (row.sdkId === "turn.abort_and_prompt") {
+		const cancellable = surface as PreflightCancellableSurface;
+		if (Object.hasOwn(cancellable, "cancelPendingPreflights")) cancellable.cancelPendingPreflights?.();
+		return serialize(surface, work);
+	}
 	if (row.idempotency === "idempotent" && request.idempotencyKey) return idempotent(surface, row, request, work);
 	return row.idempotency === "ordered" && row.sdkId !== "retry.now" ? serialize(surface, work) : work();
 }

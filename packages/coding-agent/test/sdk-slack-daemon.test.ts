@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
 import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
+import { ConversationStore } from "../src/sdk/bus/conversation-store";
+import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
 import { type SlackEndpoint, SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider, type SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
@@ -21,24 +23,62 @@ class FakeSlack {
 	failFinds = 0;
 	onAck?: (envelopeId: string) => Promise<void>;
 	postGate?: Promise<void>;
+	startGate?: Promise<void>;
+	startUntilStopped = false;
 	postStarts = 0;
+	#postStartWaiters: Array<{ count: number; resolve: () => void }> = [];
+	#startWaiters: Array<{ count: number; resolve: () => void }> = [];
+	#startStopGate = Promise.withResolvers<void>();
+	startCalls = 0;
 	stops = 0;
-	onFind?: () => Promise<void>;
+	onFind?: (clientMsgId: string) => Promise<void>;
 	onStart?: (handler: (envelope: SlackSocketEnvelope) => void | Promise<void>) => Promise<void>;
 
 	async start(handler: (envelope: SlackSocketEnvelope) => void | Promise<void>): Promise<void> {
+		this.startCalls++;
+		this.#resolveStartWaiters();
 		if (this.failStart) throw new Error("Socket Mode disconnected");
+		if (this.startUntilStopped) await this.#startStopGate.promise;
+		else await this.startGate;
 		this.handler = handler;
 		await this.onStart?.(handler);
 	}
 
 	async stop(): Promise<void> {
 		this.stops++;
+		this.#startStopGate.resolve();
 	}
 
 	async ack(envelopeId: string): Promise<void> {
 		this.acks.push(envelopeId);
 		await this.onAck?.(envelopeId);
+	}
+
+	waitForPostStartCount(count: number): Promise<void> {
+		if (this.postStarts >= count) return Promise.resolve();
+		const waiter = Promise.withResolvers<void>();
+		this.#postStartWaiters.push({ count, resolve: waiter.resolve });
+		return waiter.promise;
+	}
+	waitForStartCount(count: number): Promise<void> {
+		if (this.startCalls >= count) return Promise.resolve();
+		const waiter = Promise.withResolvers<void>();
+		this.#startWaiters.push({ count, resolve: waiter.resolve });
+		return waiter.promise;
+	}
+	#resolveStartWaiters(): void {
+		this.#startWaiters = this.#startWaiters.filter(waiter => {
+			if (this.startCalls < waiter.count) return true;
+			waiter.resolve();
+			return false;
+		});
+	}
+	#resolvePostStartWaiters(): void {
+		this.#postStartWaiters = this.#postStartWaiters.filter(waiter => {
+			if (this.postStarts < waiter.count) return true;
+			waiter.resolve();
+			return false;
+		});
 	}
 
 	async postMessage(input: {
@@ -48,6 +88,7 @@ class FakeSlack {
 		clientMsgId: string;
 	}): Promise<{ channel: string; ts: string; client_msg_id: string }> {
 		this.postStarts++;
+		this.#resolvePostStartWaiters();
 		await this.postGate;
 		if (this.failPost) throw new Error("Slack rate limited");
 		this.posts.push(input);
@@ -72,13 +113,38 @@ class FakeSlack {
 			throw new SlackProviderError("connection", "chat.postMessage");
 		}
 
-		await this.onFind?.();
+		await this.onFind?.(input.clientMsgId);
 		return this.knownMessages.get(input.clientMsgId) ?? null;
 	}
 }
 
 function endpoint(sessionId: string, generation = 1): SlackEndpoint {
 	return { sessionId, url: "ws://localhost", token: "not-persisted", path: "", generation };
+}
+
+type LoadBarrier = {
+	remaining: number;
+	gate: Promise<void>;
+	onBlocked: () => void;
+};
+
+class BlockingSlackStore extends ConversationStore<SlackConversation> {
+	constructor(
+		agentDir: string,
+		private readonly barrier: LoadBarrier,
+	) {
+		super({ agentDir, kind: "slack" });
+	}
+
+	async load() {
+		const document = await super.load();
+		if (this.barrier.remaining > 0) {
+			this.barrier.remaining--;
+			this.barrier.onBlocked();
+			await this.barrier.gate;
+		}
+		return document;
+	}
 }
 
 async function withDaemon(
@@ -346,7 +412,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				publicationOwnerId: "second",
 			});
 			const firstPost = first.postRoot("session", "root");
-			for (let attempt = 0; attempt < 100 && fake.postStarts === 0; attempt++) await Bun.sleep(1);
+			await fake.waitForPostStartCount(1);
 			const key = "T1:C1:intent:session";
 			const firstLease = await first.store.read(key);
 			if (!firstLease) throw new Error("Slack root lease was not persisted");
@@ -415,7 +481,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				publicationOwnerId: "second",
 			});
 			const firstPost = first.notify("session", "question", "action");
-			for (let attempt = 0; attempt < 100 && fake.postStarts === 0; attempt++) await Bun.sleep(1);
+			await fake.waitForPostStartCount(1);
 			const key = "T1:C1:intent:session";
 			const firstLease = await first.store.read(key);
 			if (!firstLease) throw new Error("Slack action lease was not persisted");
@@ -439,7 +505,9 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				expect.objectContaining({ channel: "C1", threadTs: "1.1", text: "question" }),
 			]);
 			expect(
-				await new ChatEffectJournal({ agentDir, transport: "slack" }).read("action:session:action"),
+				await new ChatEffectJournal({ agentDir, transport: "slack" }).read(
+					"action:session:action:stable-action-id",
+				),
 			).toMatchObject({
 				state: "terminal",
 				receipt: {
@@ -453,6 +521,27 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
+	});
+
+	it("mints a new durable occurrence for a repeated outbound action", async () => {
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			await daemon.postRoot("session", "root");
+			await daemon.notify("session", "first action", "action");
+			await daemon.resolveAction("session", "action");
+			await daemon.notify("session", "second action", "action");
+			expect(fake.posts.filter(post => post.threadTs !== undefined).map(post => post.text)).toEqual([
+				"first action",
+				"second action",
+			]);
+			const effects = (await new ChatEffectJournal({ agentDir, transport: "slack" }).list()).filter(effect =>
+				effect.id.startsWith("action:session:action:"),
+			);
+			expect(effects).toHaveLength(2);
+			expect(effects.map(effect => (effect.payload as { text?: unknown }).text)).toEqual([
+				"first action",
+				"second action",
+			]);
+		});
 	});
 
 	it("allows one cross-store lease holder to publish a shared outbound action", async () => {
@@ -555,14 +644,14 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const reconciliationStarted = Promise.withResolvers<void>();
 			const releaseReconciliation = Promise.withResolvers<void>();
 			fake.postGate = releasePost.promise;
-			fake.onFind = async () => {
-				if (fake.posts.length === 0) return;
+			fake.onFind = async clientMsgId => {
+				if (clientMsgId !== "client-id-1" || fake.posts.length === 0) return;
 				reconciliationStarted.resolve();
 				await releaseReconciliation.promise;
 			};
 			fake.failPostProtocolAfterAccept = true;
 			const posting = daemon.postRoot("session", "root");
-			for (let attempt = 0; attempt < 20 && fake.postStarts === 0; attempt++) await Bun.sleep(1);
+			await fake.waitForPostStartCount(1);
 			setEndpointGeneration(2);
 			releasePost.resolve();
 			await reconciliationStarted.promise;
@@ -590,15 +679,15 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const reconciliationStarted = Promise.withResolvers<void>();
 			const releaseReconciliation = Promise.withResolvers<void>();
 			fake.postGate = releasePost.promise;
-			fake.onFind = async () => {
-				if (fake.posts.length === 0) return;
+			fake.onFind = async clientMsgId => {
+				if (clientMsgId !== "client-id-1" || fake.posts.length === 0) return;
 				reconciliationStarted.resolve();
 				await releaseReconciliation.promise;
 			};
 			fake.failPostProtocolAfterAccept = true;
 
 			const generationOne = daemon.postRoot("session", "generation one root", 1);
-			for (let attempt = 0; attempt < 20 && fake.postStarts === 0; attempt++) await Bun.sleep(1);
+			await fake.waitForPostStartCount(1);
 			setEndpointGeneration(2);
 			releasePost.resolve();
 			await reconciliationStarted.promise;
@@ -645,6 +734,127 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				payload: { threadTs: resumed.rootTs, text: "generation two notification" },
 			});
 		});
+	});
+
+	it("publishes the non-creator same-daemon rollover notification in the new root thread", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-rollover-same-daemon-"));
+		let daemon: SlackNotificationDaemon | undefined;
+		try {
+			const fake = new FakeSlack();
+			let generation = 1;
+			const releaseLoads = Promise.withResolvers<void>();
+			const loadsBlocked = Promise.withResolvers<void>();
+			let blockedLoads = 0;
+			const barrier: LoadBarrier = {
+				remaining: 0,
+				gate: releaseLoads.promise,
+				onBlocked: () => {
+					if (++blockedLoads === 2) loadsBlocked.resolve();
+				},
+			};
+			const store = new BlockingSlackStore(agentDir, barrier);
+			daemon = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				store,
+				createClient: () => ({ send() {} }),
+				resolveEndpoint: async sessionId => endpoint(sessionId, generation),
+			});
+			await daemon.postRoot("session", "generation one", 1);
+			generation = 2;
+			barrier.remaining = 2;
+			const notifications = [
+				daemon.notify("session", "first generation-two notification", undefined, 2),
+				daemon.notify("session", "second generation-two notification", undefined, 2),
+			];
+			await loadsBlocked.promise;
+			releaseLoads.resolve();
+			const [first, second] = await Promise.all(notifications);
+			expect(first.rootTs).toBe(second.rootTs);
+			const rolloverRoots = fake.posts.filter(
+				post =>
+					post.threadTs === undefined &&
+					(post.text === "first generation-two notification" ||
+						post.text === "second generation-two notification"),
+			);
+			expect(rolloverRoots).toHaveLength(1);
+			const threaded = fake.posts.filter(
+				post =>
+					post.threadTs === first.rootTs &&
+					(post.text === "first generation-two notification" ||
+						post.text === "second generation-two notification"),
+			);
+			expect(threaded).toHaveLength(1);
+			expect(threaded[0]?.text).not.toBe(rolloverRoots[0]?.text);
+		} finally {
+			await daemon?.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("serializes rollover publication across daemon instances sharing the store", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-rollover-cross-daemon-"));
+		try {
+			const fake = new FakeSlack();
+			let generation = 1;
+			const releaseLoads = Promise.withResolvers<void>();
+			const loadsBlocked = Promise.withResolvers<void>();
+			let blockedLoads = 0;
+			const barrier: LoadBarrier = {
+				remaining: 0,
+				gate: releaseLoads.promise,
+				onBlocked: () => {
+					if (++blockedLoads === 2) loadsBlocked.resolve();
+				},
+			};
+			let id = 0;
+			const options = (store: ConversationStore<SlackConversation>, publicationOwnerId: string) => ({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				store,
+				publicationOwnerId,
+				randomId: () => `client-${++id}`,
+				createClient: () => ({ send() {} }),
+				resolveEndpoint: async (sessionId: string) => endpoint(sessionId, generation),
+			});
+			const initial = new SlackNotificationDaemon(options(new BlockingSlackStore(agentDir, barrier), "initial"));
+			await initial.postRoot("session", "generation one", 1);
+			generation = 2;
+			barrier.remaining = 2;
+			const first = new SlackNotificationDaemon(options(new BlockingSlackStore(agentDir, barrier), "first"));
+			const second = new SlackNotificationDaemon(options(new BlockingSlackStore(agentDir, barrier), "second"));
+			const notifications = [
+				first.notify("session", "first generation-two notification", undefined, 2),
+				second.notify("session", "second generation-two notification", undefined, 2),
+			];
+			await loadsBlocked.promise;
+			releaseLoads.resolve();
+			const [one, two] = await Promise.all(notifications);
+			expect(one.rootTs).toBe(two.rootTs);
+			const rolloverRoots = fake.posts.filter(
+				post =>
+					post.threadTs === undefined &&
+					(post.text === "first generation-two notification" ||
+						post.text === "second generation-two notification"),
+			);
+			expect(rolloverRoots).toHaveLength(1);
+			const threaded = fake.posts.filter(
+				post =>
+					post.threadTs === one.rootTs &&
+					(post.text === "first generation-two notification" ||
+						post.text === "second generation-two notification"),
+			);
+			expect(threaded).toHaveLength(1);
+			expect(threaded[0]?.text).not.toBe(rolloverRoots[0]?.text);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
 	});
 
 	it("recovers a live transient provider failure without restart, input, or another notification", async () => {
@@ -917,6 +1127,80 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await expect(daemon.start()).rejects.toThrow("disconnected");
 			fake.failStart = false;
 			await expect(daemon.start()).resolves.toBeUndefined();
+		});
+	});
+
+	it("cancels a recovery-started Socket Mode open after stop invalidates its lifecycle generation", async () => {
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			const root = await daemon.postRoot("session", "root");
+			const releaseRecovery = Promise.withResolvers<void>();
+			const recoveryStarted = Promise.withResolvers<void>();
+			fake.onFind = async () => {
+				recoveryStarted.resolve();
+				await releaseRecovery.promise;
+			};
+			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
+				id: "recovery-before-start",
+				kind: "provider-post",
+				transport: "slack",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					channel: "C1",
+					threadTs: root.rootTs,
+					text: "recovery before start",
+					clientMsgId: "recovery-before-start",
+				},
+			});
+			const starting = daemon.start();
+			await recoveryStarted.promise;
+			let stopped = false;
+			const stopping = daemon.stop().then(() => {
+				stopped = true;
+			});
+			await Promise.resolve();
+			expect(stopped).toBe(false);
+			releaseRecovery.resolve();
+			await Promise.all([starting, stopping]);
+			expect(fake.startCalls).toBe(0);
+			expect(fake.stops).toBe(0);
+			await Promise.all([daemon.start(), daemon.start()]);
+			expect(fake.startCalls).toBe(1);
+			await daemon.stop();
+			expect(fake.stops).toBe(1);
+		});
+	});
+
+	it("waits for an in-flight Socket Mode open before stop returns", async () => {
+		await withDaemon(async (daemon, fake) => {
+			const releaseStart = Promise.withResolvers<void>();
+			fake.startGate = releaseStart.promise;
+			const starting = daemon.start();
+			await fake.waitForStartCount(1);
+			expect(fake.startCalls).toBe(1);
+			let stopped = false;
+			const stopping = daemon.stop().then(() => {
+				stopped = true;
+			});
+			await Promise.resolve();
+			expect(stopped).toBe(false);
+			releaseStart.resolve();
+			await Promise.all([starting, stopping]);
+			expect(fake.startCalls).toBe(1);
+			expect(fake.stops).toBe(1);
+		});
+	});
+
+	it("stops a Socket Mode open that completes only after provider stop without a duplicate close", async () => {
+		await withDaemon(async (daemon, fake) => {
+			fake.startUntilStopped = true;
+			const starting = daemon.start();
+			await fake.waitForStartCount(1);
+			expect(fake.startCalls).toBe(1);
+
+			const stopping = daemon.stop();
+			await Promise.all([starting, stopping]);
+			expect(fake.stops).toBe(1);
 		});
 	});
 

@@ -6,7 +6,10 @@ afterEach(() => {
 	for (const server of servers.splice(0)) server.stop(true);
 });
 
-function start(handler: (frame: Record<string, unknown>, socket: any) => void): {
+function start(
+	handler: (frame: Record<string, unknown>, socket: any) => void,
+	options: { sendHello?: boolean } = {},
+): {
 	url: string;
 	token: string;
 	stop: () => Promise<void>;
@@ -22,7 +25,8 @@ function start(handler: (frame: Record<string, unknown>, socket: any) => void): 
 		},
 		websocket: {
 			open(socket) {
-				socket.send(JSON.stringify({ type: "hello", connectionId: "client-test" }));
+				if (options.sendHello !== false)
+					socket.send(JSON.stringify({ type: "hello", connectionId: "client-test" }));
 			},
 			message(socket, raw) {
 				handler(JSON.parse(String(raw)), socket);
@@ -171,6 +175,33 @@ test("SdkClient ignores a stale failed socket while a retried request is in flig
 	await client.close();
 });
 
+test("SdkClient reports a missing hello as a protocol error before a later deadline", async () => {
+	const host = start(() => {}, { sendHello: false });
+	await expect(
+		SdkClient.connect(host.url, host.token, {
+			timeoutMs: 75,
+			deadline: Date.now() + 1_000,
+			reconnectAttempts: 0,
+		}),
+	).rejects.toMatchObject({
+		code: "reconnect_exhausted",
+		details: expect.objectContaining({
+			code: "protocol_error",
+			message: "SDK server did not send a hello frame.",
+		}),
+	});
+});
+
+test("SdkClient reports a missing hello as a deadline error after its deadline", async () => {
+	const host = start(() => {}, { sendHello: false });
+	await expect(
+		SdkClient.connect(host.url, host.token, {
+			timeoutMs: 250,
+			deadline: Date.now() + 100,
+			reconnectAttempts: 0,
+		}),
+	).rejects.toMatchObject({ code: "timeout", message: "SDK client deadline elapsed." });
+});
 test("SdkClient bounds a peer that accepts TCP but never completes the WebSocket upgrade", async () => {
 	const hangingUpgrade = Bun.serve({
 		hostname: "127.0.0.1",

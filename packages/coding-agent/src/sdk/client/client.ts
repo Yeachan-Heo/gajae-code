@@ -23,6 +23,9 @@ export class SdkClientError extends Error {
 
 export interface SdkClientOptions {
 	timeoutMs?: number;
+	/** Absolute wall-clock deadline shared by connect, hello, retry, and request work. */
+	deadline?: number;
+
 	reconnectAttempts?: number;
 	reconnectBackoffMs?: number;
 }
@@ -79,6 +82,8 @@ export class SdkClient {
 	readonly #timeoutMs: number;
 	readonly #reconnectAttempts: number;
 	readonly #reconnectBackoffMs: number;
+	readonly #deadline?: number;
+
 	#socket: WebSocket | null = null;
 	#opening: Promise<WebSocket> | null = null;
 	#pending = new Map<string, Pending>();
@@ -91,6 +96,7 @@ export class SdkClient {
 	#helloReceived = new WeakSet<WebSocket>();
 	#resolveHello?: () => void;
 	#rejectHello?: (error: Error) => void;
+	#helloTimer?: ReturnType<typeof setTimeout>;
 
 	#closed = false;
 	connectionId?: string;
@@ -98,6 +104,9 @@ export class SdkClient {
 		this.#url = url;
 		this.#token = token;
 		this.#timeoutMs = options.timeoutMs ?? 10_000;
+		this.#deadline =
+			typeof options.deadline === "number" && Number.isFinite(options.deadline) ? options.deadline : undefined;
+
 		this.#reconnectAttempts = options.reconnectAttempts ?? 3;
 		this.#reconnectBackoffMs = options.reconnectBackoffMs ?? 25;
 	}
@@ -134,6 +143,8 @@ export class SdkClient {
 
 	send(frame: SdkFrame): void {
 		if (this.#closed) throw new SdkClientError("connection_closed", "SDK client closed");
+		this.#throwIfDeadlineElapsed();
+
 		const socket = this.#socket;
 		if (!socket || socket.readyState !== WebSocket.OPEN)
 			throw new SdkClientError("connection_closed", "SDK WebSocket is not connected");
@@ -197,9 +208,11 @@ export class SdkClient {
 	}
 	async #request(frame: Frame, options: SdkRequestOptions): Promise<unknown> {
 		if (this.#closed) throw new SdkClientError("connection_closed", "SDK client closed");
+		this.#throwIfDeadlineElapsed();
 		await this.#connect();
+		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
+		if (timeoutMs <= 0) throw this.#deadlineError();
 		const id = randomUUID();
-		const timeoutMs = options.timeoutMs ?? this.#timeoutMs;
 		return await new Promise<unknown>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.#pending.delete(id);
@@ -211,12 +224,30 @@ export class SdkClient {
 			} catch (error) {
 				clearTimeout(timer);
 				this.#pending.delete(id);
-				reject(new SdkClientError("unavailable", "SDK WebSocket send failed", error));
+				reject(
+					error instanceof SdkClientError
+						? error
+						: new SdkClientError("unavailable", "SDK WebSocket send failed", error),
+				);
 			}
 		});
 	}
 
+	#deadlineError(): SdkClientError {
+		return new SdkClientError("timeout", "SDK client deadline elapsed.");
+	}
+
+	#remainingTimeout(limit = this.#timeoutMs): number {
+		if (this.#deadline === undefined) return limit;
+		return Math.min(limit, Math.max(0, this.#deadline - Date.now()));
+	}
+
+	#throwIfDeadlineElapsed(): void {
+		if (this.#deadline !== undefined && Date.now() >= this.#deadline) throw this.#deadlineError();
+	}
+
 	async #connect(): Promise<WebSocket> {
+		this.#throwIfDeadlineElapsed();
 		if (this.#socket?.readyState === WebSocket.OPEN) {
 			await this.#waitForHello(this.#socket);
 			return this.#socket;
@@ -233,6 +264,7 @@ export class SdkClient {
 	async #openWithRetry(): Promise<WebSocket> {
 		let lastError: unknown;
 		for (let attempt = 0; attempt <= this.#reconnectAttempts; attempt++) {
+			this.#throwIfDeadlineElapsed();
 			let socket: WebSocket | undefined;
 			try {
 				socket = await this.#open();
@@ -241,15 +273,22 @@ export class SdkClient {
 			} catch (error) {
 				lastError = error;
 				socket?.close();
-				if (attempt < this.#reconnectAttempts) await sleep(this.#reconnectBackoffMs * 2 ** attempt);
+				if (attempt < this.#reconnectAttempts) {
+					const backoffMs = this.#remainingTimeout(this.#reconnectBackoffMs * 2 ** attempt);
+					if (backoffMs <= 0) break;
+					await sleep(backoffMs);
+				}
 			}
 		}
+		if (this.#deadline !== undefined && Date.now() >= this.#deadline) throw this.#deadlineError();
 		const error = new SdkClientError("reconnect_exhausted", "SDK WebSocket reconnect attempts exhausted", lastError);
 		for (const handler of this.#reconnectFailedHandlers) handler(error);
 		throw error;
 	}
 
 	#open(): Promise<WebSocket> {
+		const timeoutMs = this.#remainingTimeout();
+		if (timeoutMs <= 0) return Promise.reject(this.#deadlineError());
 		return new Promise((resolve, reject) => {
 			const url = new URL(this.#url);
 			url.searchParams.set("token", this.#token);
@@ -309,8 +348,8 @@ export class SdkClient {
 				try {
 					socket.close();
 				} catch {}
-				reject(new SdkClientError("timeout", `SDK WebSocket connection timed out after ${this.#timeoutMs}ms`));
-			}, this.#timeoutMs);
+				reject(new SdkClientError("timeout", `SDK WebSocket connection timed out after ${timeoutMs}ms`));
+			}, timeoutMs);
 			timer.unref?.();
 		});
 	}
@@ -325,21 +364,32 @@ export class SdkClient {
 
 	#beginHello(socket: WebSocket): void {
 		this.#helloSocket = socket;
+		const timeoutMs = this.#remainingTimeout();
 		this.#helloPromise = new Promise<void>((resolve, reject) => {
 			this.#resolveHello = resolve;
 			this.#rejectHello = reject;
+			if (timeoutMs <= 0) {
+				reject(this.#deadlineError());
+				return;
+			}
 			// A server that never sends its hello must fail typed instead of
 			// hanging the caller until the request timeout.
 			const timer = setTimeout(() => {
 				if (this.#helloSocket !== socket) return;
-				this.#rejectHello?.(new SdkClientError("protocol_error", "SDK server did not send a hello frame."));
+				this.#rejectHello?.(
+					this.#deadline !== undefined && Date.now() >= this.#deadline
+						? this.#deadlineError()
+						: new SdkClientError("protocol_error", "SDK server did not send a hello frame."),
+				);
 				this.#clearHello();
-			}, this.#timeoutMs);
+			}, timeoutMs);
+			this.#helloTimer = timer;
 			timer.unref?.();
 		});
 	}
 
 	async #waitForHello(socket: WebSocket): Promise<void> {
+		this.#throwIfDeadlineElapsed();
 		if (this.#helloReceived.has(socket)) return;
 		if (this.#helloSocket === socket && this.#helloPromise) {
 			await this.#helloPromise;
@@ -349,6 +399,10 @@ export class SdkClient {
 	}
 
 	#clearHello(): void {
+		if (this.#helloTimer !== undefined) {
+			clearTimeout(this.#helloTimer);
+			this.#helloTimer = undefined;
+		}
 		this.#helloSocket = null;
 		this.#helloPromise = null;
 		this.#resolveHello = undefined;

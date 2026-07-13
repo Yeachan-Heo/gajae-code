@@ -1,12 +1,19 @@
 import { dlopen, ptr } from "bun:ffi";
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { Process } from "@gajae-code/natives";
 import { getSessionsDir, resolveEquivalentPath } from "@gajae-code/utils";
 
-import { planLaunchWorktree, prepareLaunchWorktree } from "../../gjc-runtime/launch-worktree";
+import {
+	ensureLaunchWorktree,
+	ensureReusableNodeModules,
+	type GjcLaunchWorktreePlan,
+	planLaunchWorktree,
+} from "../../gjc-runtime/launch-worktree";
+
 import { SessionManager } from "../../session/session-manager";
 import {
 	FileSessionStorage,
@@ -15,6 +22,8 @@ import {
 } from "../../session/session-storage";
 import { SdkClient, SdkClientError } from "../client/client";
 import type { Broker, BrokerCleanupEvidence, BrokerResponse } from "./broker";
+
+import type { LifecycleEffectIntent, LifecycleWorktreeIntent } from "./lifecycle-ledger";
 
 import { resolveSdkInternalSpawnCommand } from "./runtime";
 
@@ -27,7 +36,8 @@ const DARWIN_PROC_BSDINFO_SIZE = 136;
 const DARWIN_PROC_BSDINFO_START_SECONDS_OFFSET = 120;
 const DARWIN_PROC_BSDINFO_START_MICROSECONDS_OFFSET = 128;
 const POWERSHELL_PROCESS_INCARNATION_COMMAND = "powershell.exe";
-const WIN32_PROCESS_INCARNATION_OUTPUT = /^(\d+)\t(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z)(?:\r?\n)?$/;
+const WIN32_PROCESS_INCARNATION_OUTPUT = /^(\d+)\t(0|[1-9]\d*)(?:\r?\n)?$/;
+const MAX_WINDOWS_FILETIME_TICKS = 18_446_744_073_709_551_615n;
 
 const darwinProcLibrary =
 	process.platform === "darwin"
@@ -160,7 +170,7 @@ type SessionLaunch = {
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
 	modelPreset?: string;
 	worktree?: SessionLifecycleWorktreeTarget;
-	worktreeReceipt?: SessionLifecycleWorktreeReceipt;
+	worktreePlan?: GjcLaunchWorktreePlan;
 };
 
 type CleanupEvidence = BrokerCleanupEvidence;
@@ -448,21 +458,26 @@ function windowsProcessIncarnationCommand(pid: number): { command: string; args:
 				"$ErrorActionPreference = 'Stop'",
 				"$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
 				`$process = Get-Process -Id ${pid} -ErrorAction Stop`,
-				'$startTime = $process.StartTime.ToUniversalTime().ToString("o")',
-				'[Console]::Out.WriteLine(("{0}`t{1}" -f $process.Id, $startTime))',
+				"$filetime = [UInt64]($process.StartTime.ToUniversalTime().ToFileTimeUtc())",
+				'[Console]::Out.WriteLine(("{0}`t{1}" -f $process.Id, $filetime))',
 			].join("; "),
 		],
 	};
 }
 
+function isWindowsFiletimeTicks(value: string): boolean {
+	if (!/^(?:0|[1-9]\d*)$/.test(value)) return false;
+	try {
+		return BigInt(value) <= MAX_WINDOWS_FILETIME_TICKS;
+	} catch {
+		return false;
+	}
+}
+
 function parseWin32ProcessIncarnation(pid: number, output: string): string | undefined {
 	const match = WIN32_PROCESS_INCARNATION_OUTPUT.exec(output);
-	if (!match) return undefined;
-	if (match[1] !== String(pid)) return undefined;
-	const startedAt = match[2];
-	const date = new Date(startedAt);
-	if (!Number.isFinite(date.getTime()) || date.toISOString() !== `${startedAt.slice(0, 23)}Z`) return undefined;
-	return `win32:${startedAt}`;
+	if (!match || match[1] !== String(pid) || !isWindowsFiletimeTicks(match[2])) return undefined;
+	return `windows:${match[2]}`;
 }
 
 /** Parse the microsecond-resolution start timestamp returned by Darwin proc_pidinfo. */
@@ -479,13 +494,29 @@ export function parseDarwinProcessIncarnation(info: Uint8Array): string | undefi
 	}
 }
 
-/** A PID is reusable; bind it to the OS-provided process start incarnation. */
+function isProcessIncarnation(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		(/^(?:linux:\d+|darwin:[1-9]\d*:\d+)$/.test(value) ||
+			(value.startsWith("windows:") && isWindowsFiletimeTicks(value.slice("windows:".length))))
+	);
+}
+
+/** A PID is reusable; bind it to the strongest OS-provided process start incarnation available. */
 export function processIncarnation(pid: number, options: ProcessIncarnationOptions = {}): string | undefined {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
 	const platform = options.platform ?? process.platform;
+	if (platform === process.platform && options.runCommand === undefined) {
+		try {
+			const nativeProcess = Process.fromPid(pid) as { incarnation?: unknown } | null;
+			if (isProcessIncarnation(nativeProcess?.incarnation)) return nativeProcess.incarnation;
+		} catch {
+			// Fall through to the platform-specific reader.
+		}
+	}
 	if (platform === "linux") {
 		try {
-			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+			const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
 			const close = stat.lastIndexOf(")");
 			const startTicks = stat
 				.slice(close + 2)
@@ -524,6 +555,10 @@ export function processIncarnation(pid: number, options: ProcessIncarnationOptio
 			: undefined;
 	}
 	return undefined;
+}
+
+function hasProcessIncarnationAuthority(): boolean {
+	return processIncarnation(process.pid) !== undefined;
 }
 
 type ProcessObservation = "alive" | "exited" | "uncertain";
@@ -679,6 +714,7 @@ async function terminateSpawnedChild(
 	broker: Broker,
 	id: string,
 	root: string,
+	deadline: number,
 	expected?: EffectMarker,
 ): Promise<boolean> {
 	const pid = child.pid;
@@ -688,10 +724,10 @@ async function terminateSpawnedChild(
 		child.exitCode !== null
 			? "exited"
 			: observeProcess(pid, incarnation, value => processIncarnationForBroker(broker, value));
-	const waitForExit = async (deadline: number): Promise<ProcessObservation> => {
+	const waitForExit = async (until: number): Promise<ProcessObservation> => {
 		let observation = observe();
-		while (observation !== "exited" && Date.now() < deadline) {
-			await sleep(POLL_MS);
+		while (observation !== "exited" && Date.now() < until) {
+			await sleep(Math.max(0, Math.min(POLL_MS, until - Date.now())));
 			observation = observe();
 		}
 		return observation;
@@ -706,7 +742,9 @@ async function terminateSpawnedChild(
 				return false;
 			}
 		} else {
-			observation = await waitForExit(Date.now() + CLOSE_TIMEOUT_MS);
+			const remaining = Math.max(0, deadline - Date.now());
+			const gracefulDeadline = Date.now() + Math.min(CLOSE_TIMEOUT_MS, Math.floor(remaining / 2));
+			observation = await waitForExit(gracefulDeadline);
 		}
 	}
 	if (observation === "alive") {
@@ -717,7 +755,7 @@ async function terminateSpawnedChild(
 				return false;
 			}
 		} else {
-			observation = await waitForExit(Date.now() + CLOSE_TIMEOUT_MS);
+			observation = await waitForExit(deadline);
 		}
 	}
 	if (observation !== "exited") {
@@ -838,10 +876,9 @@ async function waitForReady(
 	broker: Broker,
 	id: string,
 	root: string,
-	timeoutMs: number,
+	deadline: number,
 	expected: EffectMarker,
 ): Promise<ReadinessResult> {
-	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (
 			observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
@@ -860,6 +897,7 @@ async function waitForReady(
 			const endpoint = authority.endpoint as { url: string; token: string };
 			const client = await SdkClient.connect(endpoint.url, endpoint.token, {
 				timeoutMs: connectionTimeoutMs,
+				deadline,
 				reconnectAttempts: 0,
 			});
 			try {
@@ -899,6 +937,31 @@ async function waitForReady(
 	}
 	return { kind: "timeout" };
 }
+
+function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorktreeIntent | undefined {
+	if (!plan) return undefined;
+	return {
+		repoRoot: path.resolve(plan.repoRoot),
+		worktreePath: path.resolve(plan.worktreePath),
+		detached: plan.detached,
+		baseRef: plan.baseRef,
+		...(plan.branchName ? { branchName: plan.branchName } : {}),
+	};
+}
+
+function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
+	const prepared = ensureLaunchWorktree(plan);
+	if (!prepared.enabled || path.resolve(prepared.worktreePath) !== path.resolve(plan.worktreePath))
+		throw new Error("Lifecycle worktree preparation did not preserve the durable worktree identity.");
+	ensureReusableNodeModules(prepared.repoRoot, prepared.worktreePath);
+	return {
+		enabled: true,
+		cwd: path.resolve(prepared.worktreePath),
+		created: prepared.created,
+		reused: prepared.reused,
+		...(prepared.branchName ? { branch: prepared.branchName } : {}),
+	};
+}
 async function launchInput(
 	broker: Broker,
 	operation: "session.create" | "session.fork" | "session.resume",
@@ -921,25 +984,22 @@ async function launchInput(
 	if (worktree === null || (worktree !== undefined && requestedCwd === undefined))
 		return fail("invalid_input", "Lifecycle worktree target is invalid.");
 	let cwd = sourceCwd;
-	let worktreeReceipt: SessionLifecycleWorktreeReceipt | undefined;
+	let worktreePlan: GjcLaunchWorktreePlan | undefined;
 	if (worktree) {
 		try {
-			const prepared = prepareLaunchWorktree(sourceCwd, [
-				worktree.name ? `--worktree=${worktree.name}` : "--worktree",
-			]);
-			if (!prepared.worktree.enabled) return fail("invalid_input", "Lifecycle worktree target is invalid.");
-			cwd = path.resolve(prepared.cwd);
-			worktreeReceipt = {
-				enabled: true,
-				cwd,
-				created: prepared.worktree.created,
-				reused: prepared.worktree.reused,
-				...(prepared.worktree.branchName ? { branch: prepared.worktree.branchName } : {}),
-			};
+			const planned = planLaunchWorktree(
+				sourceCwd,
+				worktree.name
+					? { enabled: true, detached: false, name: worktree.name }
+					: { enabled: true, detached: true, name: null },
+			);
+			if (!planned.enabled) return fail("invalid_input", "Lifecycle worktree target is invalid.");
+			worktreePlan = planned;
+			cwd = path.resolve(planned.worktreePath);
 		} catch (error) {
 			return fail(
 				"invalid_input",
-				`Unable to prepare lifecycle worktree: ${error instanceof Error ? error.message : String(error)}`,
+				`Unable to plan lifecycle worktree: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
 	}
@@ -951,7 +1011,7 @@ async function launchInput(
 	const modelPreset = text(input.modelPreset);
 
 	if (operation === "session.create")
-		return { id: randomUUID(), cwd, root: resolvedRoot, modelPreset, worktree, worktreeReceipt };
+		return { id: randomUUID(), cwd, root: resolvedRoot, modelPreset, worktree, worktreePlan };
 	if (operation === "session.resume") {
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
 		const savedPath = text(input.sessionPath);
@@ -966,7 +1026,7 @@ async function launchInput(
 			sessionIdentity: saved.identity,
 			modelPreset,
 			worktree,
-			worktreeReceipt,
+			worktreePlan,
 		};
 	}
 	const sourceSessionId = text(input.sourceSessionId) ?? text(input.sourceId);
@@ -987,7 +1047,7 @@ async function launchInput(
 		sourceCwd,
 		modelPreset,
 		worktree,
-		worktreeReceipt,
+		worktreePlan,
 	};
 }
 
@@ -1086,6 +1146,7 @@ type CloseRecord = {
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
+	lifecycleRequestId?: string;
 };
 
 function endpointIncarnation(record: CloseRecord, sessionId: string): string | undefined {
@@ -1132,6 +1193,18 @@ function sameCloseAuthority(authority: CloseAuthority, record: CloseRecord, sess
 	return (
 		authority.endpointGeneration === record.endpointGeneration &&
 		authority.endpointIncarnation === endpointIncarnation(record, sessionId)
+	);
+}
+
+function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
+	return (
+		current.live &&
+		current.pid === expected.pid &&
+		typeof expected.lifecycleRequestId === "string" &&
+		expected.lifecycleRequestId.length > 0 &&
+		current.lifecycleRequestId === expected.lifecycleRequestId &&
+		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
 }
 
@@ -1236,10 +1309,49 @@ export async function executeLifecycle(
 		}
 		const timeout = readinessTimeout(input);
 		if (typeof timeout !== "number") return timeout;
+		const lifecycleDeadline = Date.now() + timeout;
 		const launch = await launchInput(broker, operation, input);
 		if ("ok" in launch) return launch;
+		if (!hasProcessIncarnationAuthority())
+			return fail(
+				"incarnation_unavailable",
+				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
+			);
 		const effectMarker = randomUUID();
-		await broker.ledger.transition(identity, "effect_started", { intendedSessionId: launch.id, effectMarker });
+		const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
+		const effectIntent: LifecycleEffectIntent = {
+			sessionId: launch.id,
+			...(plannedWorktreeIntent ? { worktree: plannedWorktreeIntent } : {}),
+		};
+
+		await broker.ledger.transition(identity, "effect_started", {
+			intendedSessionId: launch.id,
+			effectMarker,
+			effectIntent,
+		});
+		if (!hasProcessIncarnationAuthority())
+			return fail(
+				"incarnation_unavailable",
+				"OS process incarnation authority is unavailable; refusing to prepare a lifecycle worktree.",
+			);
+		let worktreeReceipt: SessionLifecycleWorktreeReceipt | undefined;
+		try {
+			if (launch.worktreePlan) worktreeReceipt = preparePlannedWorktree(launch.worktreePlan);
+		} catch (error) {
+			return fail(
+				"spawn_failed",
+				`Unable to prepare lifecycle worktree: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		const cleanupReserveMs = Math.min(CLOSE_TIMEOUT_MS, Math.max(1, Math.floor(timeout / 4)));
+		const readinessDeadline = lifecycleDeadline - cleanupReserveMs;
+		if (Date.now() >= readinessDeadline)
+			return fail("readiness_timeout", "Lifecycle preparation exhausted the readiness deadline before spawning.");
+		if (!hasProcessIncarnationAuthority())
+			return fail(
+				"incarnation_unavailable",
+				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
+			);
 		const cmd = command();
 		const request: SessionLifecycleLaunchRequest = {
 			operation,
@@ -1283,7 +1395,7 @@ export async function executeLifecycle(
 			spawned.unref();
 		} catch (error) {
 			const terminated = child
-				? await terminateSpawnedChild(child, broker, launch.id, launch.root, spawnedAuthority)
+				? await terminateSpawnedChild(child, broker, launch.id, launch.root, lifecycleDeadline, spawnedAuthority)
 				: true;
 			return terminated
 				? fail("spawn_failed", `Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`)
@@ -1295,9 +1407,16 @@ export async function executeLifecycle(
 		if (!child || !spawnedAuthority)
 			return fail("spawn_failed", "Unable to retain the spawned session process identity.");
 		await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
-		const readiness = await waitForReady(broker, launch.id, launch.root, timeout, spawnedAuthority);
+		const readiness = await waitForReady(broker, launch.id, launch.root, readinessDeadline, spawnedAuthority);
 		if (readiness.kind !== "ready") {
-			const terminated = await terminateSpawnedChild(child, broker, launch.id, launch.root, spawnedAuthority);
+			const terminated = await terminateSpawnedChild(
+				child,
+				broker,
+				launch.id,
+				launch.root,
+				lifecycleDeadline,
+				spawnedAuthority,
+			);
 			if (!terminated)
 				return fail(
 					"terminal_uncertain",
@@ -1313,7 +1432,14 @@ export async function executeLifecycle(
 		await reconcileReadyScope(broker, launch.id, launch.cwd);
 		const verified = await currentReadyAuthority(broker, launch.id, launch.root, spawnedAuthority);
 		if (!verified || !sameReadyAuthority(readiness.authority, verified)) {
-			const terminated = await terminateSpawnedChild(child, broker, launch.id, launch.root, spawnedAuthority);
+			const terminated = await terminateSpawnedChild(
+				child,
+				broker,
+				launch.id,
+				launch.root,
+				lifecycleDeadline,
+				spawnedAuthority,
+			);
 			return terminated
 				? fail("endpoint_stale", "Session endpoint changed while lifecycle readiness was being verified.")
 				: fail(
@@ -1327,7 +1453,7 @@ export async function executeLifecycle(
 				sessionId: launch.id,
 				cwd: launch.cwd,
 				endpoint: verified.endpoint,
-				...(launch.worktreeReceipt ? { worktree: launch.worktreeReceipt } : {}),
+				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
 			},
 		};
 	}
@@ -1336,7 +1462,7 @@ export async function executeLifecycle(
 	if (!id) return fail("invalid_input", "sessionId is required.");
 	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
 	await broker.index.refresh();
-	const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
 		if (!record) return fail("not_found", "session is not indexed");
 		if (record.terminalUncertain)
@@ -1349,10 +1475,21 @@ export async function executeLifecycle(
 
 		let usedSignalFallback = false;
 		let note: string | undefined;
-		const endpointResult = await broker.handleRequest("session.get_endpoint", {
+		let endpointResult = await broker.handleRequest("session.get_endpoint", {
 			sessionId: id,
 			endpointGeneration: record.endpointGeneration,
 		});
+		if (!endpointResult.ok && endpointResult.error.code === "endpoint_stale" && !requestedAuthority.authority) {
+			await broker.index.refresh();
+			const refreshed = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+			if (refreshed && sameCloseProcessIdentity(record, refreshed)) {
+				record = refreshed;
+				endpointResult = await broker.handleRequest("session.get_endpoint", {
+					sessionId: id,
+					endpointGeneration: record.endpointGeneration,
+				});
+			}
+		}
 		if (!endpointResult.ok) {
 			if (endpointResult.error.code === "endpoint_stale") return endpointResult;
 			if (endpointResult.error.code !== "resource_gone") return endpointResult;
@@ -1405,29 +1542,42 @@ export async function executeLifecycle(
 					"Session endpoint is unavailable and its durable process identity could not be verified.",
 				);
 			note = "Endpoint close was unreachable; sent SIGTERM to the durably identified session process.";
-			if (!(await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS))) {
-				const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
-				if (stale) return stale;
-				if (!(await signalVerifiedSession(record, id, "SIGKILL")))
-					return fail(
-						"close_refused",
-						"Session did not close after transport fallback and its durable process identity could not be verified for SIGKILL.",
-					);
-				note =
-					"Endpoint close was unreachable and SIGTERM did not complete within the bounded deadline; sent SIGKILL to the durably identified session process.";
-				if (!(await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS))) {
-					await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
-					return fail(
-						"terminal_uncertain",
-						"Session did not unregister, remove its endpoint, and exit after bounded transport fallback.",
-					);
-				}
+		}
+
+		let closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
+		if (!closed && !usedSignalFallback) {
+			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
+			if (stale) return stale;
+			if (!(await signalVerifiedSession(record, id, "SIGTERM"))) {
+				await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
+				return fail(
+					"terminal_uncertain",
+					"Session acknowledged session.close but its durable process identity could not be verified for shutdown escalation.",
+				);
 			}
-		} else if (!(await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS))) {
+			note =
+				"Session acknowledged session.close but graceful teardown did not complete within the bounded deadline; sent SIGTERM to the durably identified session process.";
+			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
+		}
+		if (!closed) {
+			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
+			if (stale) return stale;
+			if (!(await signalVerifiedSession(record, id, "SIGKILL"))) {
+				await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
+				return fail(
+					"terminal_uncertain",
+					"Session did not close after SIGTERM and its durable process identity could not be verified for SIGKILL.",
+				);
+			}
+			note =
+				"Session teardown did not complete after SIGTERM within the bounded deadline; sent SIGKILL to the durably identified session process.";
+			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
+		}
+		if (!closed) {
 			await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
 			return fail(
 				"terminal_uncertain",
-				"Session acknowledged session.close but did not unregister, remove its endpoint, and exit before the deadline.",
+				"Session did not unregister, remove its endpoint, and exit after bounded shutdown escalation.",
 			);
 		}
 

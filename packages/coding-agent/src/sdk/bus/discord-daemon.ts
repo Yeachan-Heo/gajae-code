@@ -129,6 +129,19 @@ type DiscordInboundRouting = {
 	actionNonce?: string;
 };
 
+function backfilledEffectIncarnationId(record: DiscordConversation): string {
+	if (record.effectIncarnationId) return record.effectIncarnationId;
+	if (record.createNonce) return record.createNonce;
+	return `legacy-${createHash("sha256")
+		.update(
+			[record.appId, record.guildId, record.parentChannelId, record.threadId ?? "", record.sessionId ?? ""].join(
+				"\u0000",
+			),
+		)
+		.digest("hex")
+		.slice(0, 32)}`;
+}
+
 type DiscordInboundClaim = {
 	receipt: DiscordInboundDispatchReceipt;
 	liveCallbackEffect?: ChatEffect<DiscordInboundEffectPayload>;
@@ -140,6 +153,7 @@ export class DiscordNotificationDaemon {
 	readonly #now: () => number;
 	readonly #creates = new Map<string, Promise<DiscordConversation>>();
 	readonly #resumes = new Map<string, Promise<DiscordConversation | undefined>>();
+	readonly #archives = new Map<string, Promise<void>>();
 	readonly #resolveEndpoint: (
 		sessionId: string,
 		expectedGeneration?: number,
@@ -148,6 +162,11 @@ export class DiscordNotificationDaemon {
 	readonly #activeWork = new Set<Promise<unknown>>();
 	readonly #inflightInbound = new Set<string>();
 	#started = false;
+	#lifecycleGeneration = 0;
+	#startTask: Promise<void> | undefined;
+	#stopTask: Promise<void> | undefined;
+	#providerStarting = false;
+
 	#leaseRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 	#leaseRecoveryAt: number | undefined;
 	#leaseRecoveryFailures = 0;
@@ -164,37 +183,102 @@ export class DiscordNotificationDaemon {
 	}
 
 	async start(): Promise<void> {
-		// Provider start is the delivery boundary; complete crash recovery first.
-		await this.#reconcileTerminalInboundReceipts();
-		const closingBeforeProviderRecoveryFailed = await this.#recoverClosingConversations();
-		const providerRecoveryFailed = await this.#drainProviderEffects();
-		await this.#reconcileTerminalInboundReceipts();
-		const closingAfterProviderRecoveryFailed = await this.#recoverClosingConversations();
-		const recoveryFailed =
-			closingBeforeProviderRecoveryFailed || providerRecoveryFailed || closingAfterProviderRecoveryFailed;
-		await this.#drainPendingDispatches();
-		this.#started = true;
+		if (this.#started && !this.#stopTask) return;
+		if (this.#stopTask) {
+			await this.#stopTask;
+			return await this.start();
+		}
+		if (this.#startTask) return await this.#startTask;
+
+		const lifecycleGeneration = ++this.#lifecycleGeneration;
+		const task = this.#start(lifecycleGeneration);
+		this.#startTask = task;
 		try {
+			await task;
+		} finally {
+			if (this.#startTask === task) this.#startTask = undefined;
+		}
+	}
+
+	async #start(lifecycleGeneration: number): Promise<void> {
+		try {
+			// Provider start is the delivery boundary; complete crash recovery first.
+			await this.#reconcileTerminalInboundReceipts();
+			const closingBeforeProviderRecoveryFailed = await this.#recoverClosingConversations();
+			const providerRecoveryFailed = await this.#drainProviderEffects();
+			await this.#reconcileTerminalInboundReceipts();
+			const closingAfterProviderRecoveryFailed = await this.#recoverClosingConversations();
+			const inboundRecoveryFailed = await this.#drainPendingDispatches();
+			const recoveryFailed =
+				closingBeforeProviderRecoveryFailed ||
+				providerRecoveryFailed ||
+				closingAfterProviderRecoveryFailed ||
+				inboundRecoveryFailed;
+			if (lifecycleGeneration !== this.#lifecycleGeneration) return;
+
+			this.#started = true;
 			await this.#scheduleLeaseRecovery(recoveryFailed);
-			await this.options.provider.start(
-				event => this.#track(this.handleInbound(event)),
-				() => {},
-			);
+			// stop() invalidates this generation before awaiting recovery or start. This
+			// guard is immediately adjacent to the Gateway-open boundary.
+			if (lifecycleGeneration !== this.#lifecycleGeneration) {
+				this.#started = false;
+				return;
+			}
+			this.#providerStarting = true;
+			try {
+				await this.options.provider.start(
+					event => this.#track(this.handleInbound(event)),
+					() => {},
+				);
+			} finally {
+				this.#providerStarting = false;
+			}
+			if (lifecycleGeneration !== this.#lifecycleGeneration) {
+				this.#started = false;
+				await this.options.provider.stop();
+			}
 		} catch (error) {
-			this.#started = false;
-			if (this.#leaseRecoveryTimer) clearTimeout(this.#leaseRecoveryTimer);
-			this.#leaseRecoveryTimer = undefined;
-			this.#leaseRecoveryAt = undefined;
+			if (lifecycleGeneration === this.#lifecycleGeneration) {
+				this.#started = false;
+				if (this.#leaseRecoveryTimer) clearTimeout(this.#leaseRecoveryTimer);
+				this.#leaseRecoveryTimer = undefined;
+				this.#leaseRecoveryAt = undefined;
+			}
 			throw error;
 		}
 	}
 
 	async stop(): Promise<void> {
+		if (this.#stopTask) return await this.#stopTask;
+
+		const starting = this.#startTask;
+		const stopProvider = this.#started || this.#providerStarting;
+		++this.#lifecycleGeneration;
+		this.#started = false;
 		if (this.#leaseRecoveryTimer) clearTimeout(this.#leaseRecoveryTimer);
 		this.#leaseRecoveryTimer = undefined;
 		this.#leaseRecoveryAt = undefined;
 
-		if (this.#started) {
+		const task = this.#stop(starting, stopProvider);
+		this.#stopTask = task;
+		try {
+			await task;
+		} finally {
+			if (this.#stopTask === task) this.#stopTask = undefined;
+		}
+	}
+
+	async #stop(starting: Promise<void> | undefined, stopProvider: boolean): Promise<void> {
+		// Calling provider.stop() before awaiting start lets a provider cancel a
+		// Gateway open that is already in flight. #start rechecks the generation
+		// after it resolves and closes any late open.
+		if (stopProvider) await this.options.provider.stop();
+		try {
+			await starting;
+		} catch {
+			// The caller of start() owns its recovery/start error; stop still drains it.
+		}
+		if (this.#providerStarting || this.#started) {
 			this.#started = false;
 			await this.options.provider.stop();
 		}
@@ -250,12 +334,27 @@ export class DiscordNotificationDaemon {
 	}
 
 	async archive(sessionId: string): Promise<void> {
+		const running = this.#archives.get(sessionId);
+		if (running) return await running;
+		const task = this.#archive(sessionId);
+		this.#archives.set(sessionId, task);
+		try {
+			await task;
+		} finally {
+			this.#archives.delete(sessionId);
+		}
+	}
+
+	async #archive(sessionId: string): Promise<void> {
 		const record = await this.#bySession(sessionId);
 		if (!record?.threadId || record.state !== "active") return;
 		await this.#requireLiveBinding(record.sessionId!, record.endpointGeneration!);
-		await this.#threadEffect(`archive:${record.threadId}`, record, "archive");
-		await this.#requireLiveBinding(record.sessionId!, record.endpointGeneration!);
-		await this.#replace(record, { ...record, state: "archived", archivedAt: this.#now() });
+		const archiving = await this.#beginArchive(record);
+		const occurrenceId = archiving.archiveOccurrenceId;
+		if (!occurrenceId || !archiving.archiveEffectId) throw new Error("Discord archive occurrence is unavailable");
+		await this.#threadEffect(archiving.archiveEffectId, archiving, "archive", false, false, occurrenceId);
+		await this.#requireLiveBinding(archiving.sessionId!, archiving.endpointGeneration!);
+		await this.#completeArchive(archiving, occurrenceId);
 	}
 
 	async resume(sessionId: string, endpointGeneration: number): Promise<DiscordConversation | undefined> {
@@ -278,28 +377,32 @@ export class DiscordNotificationDaemon {
 			return undefined;
 		}
 		await this.#requireLiveBinding(sessionId, endpointGeneration);
+		const resumeOccurrenceId = randomUUID();
+		const effectIncarnationId = backfilledEffectIncarnationId(record);
 		const resuming = await this.#replace(record, {
 			...record,
 			state: "resuming",
 			endpointGeneration,
+			effectIncarnationId,
+			resumeOccurrenceId,
+			resumeEffectId: `unarchive:${record.threadId}:${effectIncarnationId}:${resumeOccurrenceId}`,
 			pendingActionId: undefined,
 			pendingActionNonce: undefined,
 			pendingActionEffectId: undefined,
 		});
-
 		try {
-			await this.#threadEffect(`unarchive:${resuming.threadId}:${endpointGeneration}`, resuming, "unarchive");
+			const occurrenceId = resuming.resumeOccurrenceId;
+			if (!occurrenceId || !resuming.resumeEffectId) throw new Error("Discord resume occurrence is unavailable");
+			await this.#threadEffect(resuming.resumeEffectId, resuming, "unarchive", false, false, occurrenceId);
 			await this.#requireLiveBinding(sessionId, endpointGeneration);
-			return await this.#replace(resuming, {
-				...resuming,
-				state: "active",
-				archivedAt: undefined,
-			});
+			return await this.#completeResume(resuming, occurrenceId);
 		} catch {
 			await this.#requireLiveBinding(sessionId, endpointGeneration);
 			const superseded = await this.#replace(resuming, {
 				...resuming,
 				state: "archived",
+				resumeOccurrenceId: undefined,
+				resumeEffectId: undefined,
 				pendingActionId: undefined,
 				pendingActionNonce: undefined,
 				pendingActionEffectId: undefined,
@@ -476,11 +579,17 @@ export class DiscordNotificationDaemon {
 			});
 		});
 		if (!valid || !receipt) {
-			await this.#terminalizeRejectedInbound(effectId);
+			await this.#terminalizeRejectedInbound(
+				effectId,
+				liveCallbackEffect ? { owner: this.#dispatchOwner, epoch: liveCallbackEffect.epoch } : undefined,
+			);
 			return "invalid";
 		}
 		if (liveCallbackEffect && liveCallbackEffect.id !== receipt.effectId) {
-			await this.#terminalizeRejectedInbound(liveCallbackEffect.id);
+			await this.#terminalizeRejectedInbound(liveCallbackEffect.id, {
+				owner: this.#dispatchOwner,
+				epoch: liveCallbackEffect.epoch,
+			});
 			liveCallbackEffect = undefined;
 		}
 		return { receipt, liveCallbackEffect };
@@ -507,7 +616,8 @@ export class DiscordNotificationDaemon {
 
 		const current = await this.#currentInboundRecord(record, receipt);
 		if (!current) {
-			await this.#terminalizeInbound(record, receipt, "rejected");
+			await this.#terminalizeInbound(record, receipt, "rejected", lease);
+
 			return;
 		}
 		record = current;
@@ -516,7 +626,8 @@ export class DiscordNotificationDaemon {
 			// I/O so recovery can safely resume SDK delivery whether defer reached Discord
 			// or the process stopped first.
 			if (!interaction) {
-				await this.#terminalizeInbound(record, receipt, "callback_token_unavailable");
+				await this.#terminalizeInbound(record, receipt, "callback_token_unavailable", lease);
+
 				return;
 			}
 
@@ -567,9 +678,12 @@ export class DiscordNotificationDaemon {
 				if (!reclaimed) return;
 				effect = reclaimed;
 				lease = { owner: this.#dispatchOwner, epoch: effect.epoch };
-			} catch {
+			} catch (error) {
+				const definitelyUnsent = this.#isDefiniteCallbackPreSendFailure(error);
 				await this.#rescheduleAfterEffectTransition(
-					this.#effects.record(effect.id, lease, "accepted", { status: "callback_failed" }),
+					this.#effects.record(effect.id, lease, "accepted", {
+						status: definitelyUnsent ? "callback_pre_send_failure" : "defer_intent",
+					}),
 				);
 				throw new Error("Discord interaction callback failed");
 			} finally {
@@ -579,7 +693,8 @@ export class DiscordNotificationDaemon {
 
 		const dispatchable = await this.#currentInboundRecord(record, receipt);
 		if (!dispatchable) {
-			await this.#terminalizeInbound(record, receipt, "stale_binding");
+			await this.#terminalizeInbound(record, receipt, "stale_binding", lease);
+
 			return;
 		}
 		record = dispatchable;
@@ -634,7 +749,8 @@ export class DiscordNotificationDaemon {
 			if (!(await renew())) return;
 			const beforeSend = await this.#currentInboundRecord(record, receipt);
 			if (!beforeSend) {
-				await this.#terminalizeInbound(record, receipt, "stale_binding");
+				await this.#terminalizeInbound(record, receipt, "stale_binding", lease);
+
 				return;
 			}
 			record = beforeSend;
@@ -689,8 +805,9 @@ export class DiscordNotificationDaemon {
 		);
 	}
 
-	async #drainPendingDispatches(): Promise<void> {
+	async #drainPendingDispatches(): Promise<boolean> {
 		await this.#reconcileTerminalInboundReceipts();
+		let recoveryFailed = false;
 		const dispatched = new Set<string>();
 		for (const record of Object.values((await this.#store.load()).conversations)) {
 			if (!record.threadId || !record.sessionId || record.state !== "active") continue;
@@ -720,6 +837,12 @@ export class DiscordNotificationDaemon {
 					continue;
 				}
 				const effect = await this.#effects.read(receipt.effectId);
+				if (!effect) {
+					// Referenced effects are retained by terminal pruning. Preserve the
+					// receipt and retry recovery rather than acknowledging lost authority.
+					recoveryFailed = true;
+					continue;
+				}
 				if (effect?.state === "terminal") {
 					await this.#finishInbound(record, receipt);
 					continue;
@@ -772,6 +895,7 @@ export class DiscordNotificationDaemon {
 			}
 			await this.#dispatchInbound(adopted.record, endpoint, adopted.receipt);
 		}
+		return recoveryFailed;
 	}
 	async #adoptOrphanInbound(
 		effectId: string,
@@ -892,15 +1016,39 @@ export class DiscordNotificationDaemon {
 			),
 		});
 	}
-	async #terminalizeRejectedInbound(effectId: string): Promise<void> {
-		await this.#effects.terminalize(effectId, { status: "rejected" });
+	#hasLiveEffectLease(effect: ChatEffect | undefined): boolean {
+		return (
+			effect?.state === "leased" && typeof effect.owner === "string" && (effect.leaseExpiresAt ?? 0) > this.#now()
+		);
+	}
+	async #terminalizeEffect(id: string, status: string, lease?: ChatEffectLease): Promise<boolean> {
+		if (lease) {
+			const terminalized = await this.#effects.record(id, lease, "terminal", { status });
+			return terminalized?.state === "terminal";
+		}
+		const effect = await this.#effects.read(id);
+		if (!effect || effect.state === "terminal") return true;
+		if (effect.state === "uncertain" || this.#hasLiveEffectLease(effect)) return false;
+		if (effect.state === "leased") {
+			const claimed = await this.#effects.claim(id, this.#providerOwner, this.#providerLeaseMs);
+			if (!claimed) return false;
+			await this.#effects.record(id, { owner: this.#providerOwner, epoch: claimed.epoch }, "uncertain", {
+				status: "stale_lease_expired",
+			});
+			return false;
+		}
+		return (await this.#effects.terminalize(id, { status }))?.state === "terminal";
+	}
+	async #terminalizeRejectedInbound(effectId: string, lease?: ChatEffectLease): Promise<void> {
+		await this.#terminalizeEffect(effectId, "rejected", lease);
 	}
 	async #terminalizeInbound(
 		record: DiscordConversation,
 		receipt: DiscordInboundDispatchReceipt,
 		status: string,
+		lease?: ChatEffectLease,
 	): Promise<void> {
-		await this.#effects.terminalize(receipt.effectId, { status });
+		if (!(await this.#terminalizeEffect(receipt.effectId, status, lease))) return;
 		const key = discordConversationKey({
 			appId: record.appId,
 			guildId: record.guildId,
@@ -1039,6 +1187,13 @@ export class DiscordNotificationDaemon {
 			(error as ChatDeliveryError).phase === "pre_send"
 		);
 	}
+	#isDefiniteCallbackPreSendFailure(error: unknown): boolean {
+		// This is intentionally limited to Discord's received-and-rejected callback
+		// response. Transport errors, connection loss, and arbitrary provider errors
+		// leave the persisted defer intent authoritative because the callback may have
+		// been accepted before its HTTP response was lost.
+		return error instanceof Error && /^Discord API request failed \(4\d\d\)$/.test(error.message);
+	}
 
 	async #ensureConversation(input: DiscordNotificationInput): Promise<DiscordConversation> {
 		const existing = await this.#bySession(input.sessionId);
@@ -1158,6 +1313,7 @@ export class DiscordNotificationDaemon {
 				sessionId,
 				endpointGeneration,
 				createNonce: intent.createNonce,
+				effectIncarnationId: old?.effectIncarnationId ?? intent.effectIncarnationId ?? randomUUID(),
 				updatedAt: this.#now(),
 				seenEventIds: old?.seenEventIds ?? [],
 				seenInteractionIds: old?.seenInteractionIds ?? [],
@@ -1294,6 +1450,96 @@ export class DiscordNotificationDaemon {
 			);
 		}
 		return (await this.#store.read(key))!;
+	}
+	async #beginArchive(record: DiscordConversation): Promise<DiscordConversation> {
+		const key = discordConversationKey({
+			appId: record.appId,
+			guildId: record.guildId,
+			parentChannelId: record.parentChannelId,
+			threadId: record.threadId!,
+		});
+		let archiving: DiscordConversation | undefined;
+		await this.#store.transact(key, current => {
+			if (
+				current?.state !== "active" ||
+				current.sessionId !== record.sessionId ||
+				current.endpointGeneration !== record.endpointGeneration
+			)
+				return current;
+			if (current.archiveOccurrenceId) {
+				archiving = current;
+				return current;
+			}
+			const archiveOccurrenceId = randomUUID();
+			const effectIncarnationId = backfilledEffectIncarnationId(current);
+			archiving = normalizeDiscordConversation({
+				...current,
+				generation: current.generation + 1,
+				updatedAt: this.#now(),
+				effectIncarnationId,
+				archiveOccurrenceId,
+				archiveEffectId: `archive:${current.threadId}:${effectIncarnationId}:${archiveOccurrenceId}`,
+			});
+
+			return archiving;
+		});
+		if (!archiving) throw new Error("Discord archive intent lost its authority");
+		return archiving;
+	}
+	async #completeArchive(record: DiscordConversation, occurrenceId: string): Promise<void> {
+		const key = discordConversationKey({
+			appId: record.appId,
+			guildId: record.guildId,
+			parentChannelId: record.parentChannelId,
+			threadId: record.threadId!,
+		});
+		await this.#store.transact(key, current => {
+			if (
+				current?.state !== "active" ||
+				current.sessionId !== record.sessionId ||
+				current.archiveOccurrenceId !== occurrenceId
+			)
+				return current;
+			return normalizeDiscordConversation({
+				...current,
+				generation: current.generation + 1,
+				updatedAt: this.#now(),
+				state: "archived",
+				archivedAt: this.#now(),
+				archiveOccurrenceId: undefined,
+				archiveEffectId: undefined,
+			});
+		});
+	}
+	async #completeResume(record: DiscordConversation, occurrenceId: string): Promise<DiscordConversation> {
+		const key = discordConversationKey({
+			appId: record.appId,
+			guildId: record.guildId,
+			parentChannelId: record.parentChannelId,
+			threadId: record.threadId!,
+		});
+		const completed = await this.#store.transact(key, current => {
+			if (
+				!current ||
+				current.sessionId !== record.sessionId ||
+				current.endpointGeneration !== record.endpointGeneration
+			)
+				return current;
+			if (current.state === "active" && current.resumeOccurrenceId === undefined) return current;
+			if (current.state !== "resuming" || current.resumeOccurrenceId !== occurrenceId) return current;
+			return normalizeDiscordConversation({
+				...current,
+				generation: current.generation + 1,
+				updatedAt: this.#now(),
+				state: "active",
+				archivedAt: undefined,
+				resumeOccurrenceId: undefined,
+				resumeEffectId: undefined,
+			});
+		});
+		if (completed?.state !== "active" || completed.sessionId !== record.sessionId)
+			throw new Error("Discord resume occurrence lost its authority");
+		return completed;
 	}
 	async #abandonCreator(intentKey: string, intent: DiscordConversation): Promise<void> {
 		await this.#store.transact(intentKey, current => {
@@ -1542,15 +1788,30 @@ export class DiscordNotificationDaemon {
 		allowInactive = false,
 	): Promise<void> {
 		const nonce = discordEffectNonce(id);
+		const existingEffect = await this.#effects.read<{
+			threadId: string;
+			content: string;
+			nonce: string;
+			components?: DiscordMessageComponent[];
+		}>(id);
+		const payload = existingEffect?.payload ?? {
+			threadId: record.threadId!,
+			content,
+			nonce,
+			...(components ? { components } : {}),
+		};
 		await this.#runEffect(
 			id,
 			"post-message",
 			record.sessionId,
 			record.endpointGeneration!,
-			{ threadId: record.threadId!, content, nonce, ...(components ? { components } : {}) },
+			payload,
 			async ensure => {
 				await ensure();
-				const reconciled = await this.options.provider.findMessageByNonce({ threadId: record.threadId!, nonce });
+				const reconciled = await this.options.provider.findMessageByNonce({
+					threadId: payload.threadId,
+					nonce: payload.nonce,
+				});
 				if (reconciled)
 					return {
 						provider: "discord",
@@ -1560,10 +1821,10 @@ export class DiscordNotificationDaemon {
 					};
 				await ensure();
 				const posted = await this.options.provider.postMessage({
-					threadId: record.threadId!,
-					content,
-					nonce,
-					...(components ? { components } : {}),
+					threadId: payload.threadId,
+					content: payload.content,
+					nonce: payload.nonce,
+					...(payload.components ? { components: payload.components } : {}),
 				});
 				return { provider: "discord", messageId: posted.id, threadId: record.threadId, status: "posted" };
 			},
@@ -1593,13 +1854,15 @@ export class DiscordNotificationDaemon {
 		operation: "archive" | "unarchive",
 		locked = false,
 		closing = false,
+		occurrenceId?: string,
 	): Promise<void> {
 		await this.#runEffect(
 			id,
 			operation,
 			record.sessionId,
 			record.endpointGeneration!,
-			{ threadId: record.threadId!, locked },
+			{ threadId: record.threadId!, locked, ...(occurrenceId === undefined ? {} : { occurrenceId }) },
+
 			async (ensure, beforeProvider) => {
 				await ensure();
 				beforeProvider();
@@ -1622,7 +1885,11 @@ export class DiscordNotificationDaemon {
 					: !!current &&
 						current.state === (operation === "archive" ? "active" : "resuming") &&
 						current.generation === record.generation &&
-						current.endpointGeneration === record.endpointGeneration;
+						current.endpointGeneration === record.endpointGeneration &&
+						(occurrenceId === undefined ||
+							(operation === "archive"
+								? current.archiveEffectId === id && current.archiveOccurrenceId === occurrenceId
+								: current.resumeEffectId === id && current.resumeOccurrenceId === occurrenceId));
 				return (
 					mappingCurrent &&
 					(closing ||
@@ -1692,7 +1959,8 @@ export class DiscordNotificationDaemon {
 			intent.parentChannelId === payload.parentId &&
 			discordEffectNonce(`create:${intent.sessionId}:${intent.createNonce}`) === payload.nonce;
 		if (!matchesIntent || !intent) {
-			if (effect.state !== "terminal") await this.#effects.terminalize(effect.id, { status: "rejected" });
+			if (effect.state !== "terminal") await this.#terminalizeEffect(effect.id, "rejected");
+
 			return;
 		}
 		if (!(await this.#bindingCurrent(effect.sessionId, effect.endpointGeneration))) {
@@ -1734,6 +2002,7 @@ export class DiscordNotificationDaemon {
 					sessionId: intent.sessionId,
 					endpointGeneration: intent.endpointGeneration,
 					createNonce: intent.createNonce,
+					effectIncarnationId: intent.createNonce,
 					updatedAt: this.#now(),
 					seenEventIds: [],
 					seenInteractionIds: [],
@@ -1744,8 +2013,16 @@ export class DiscordNotificationDaemon {
 	async #drainProviderEffects(): Promise<boolean> {
 		let failed = false;
 		for (const effect of await this.#effects.list()) {
-			if (effect.transport !== "discord" || (effect.state === "terminal" && effect.kind !== "create-thread"))
+			if (
+				effect.transport !== "discord" ||
+				(effect.state === "terminal" &&
+					effect.kind !== "create-thread" &&
+					effect.kind !== "archive" &&
+					effect.kind !== "unarchive")
+			)
 				continue;
+			if (this.#hasLiveEffectLease(effect)) continue;
+
 			const payload = effect.payload as {
 				guildId?: string;
 				parentId?: string;
@@ -1755,6 +2032,7 @@ export class DiscordNotificationDaemon {
 				content?: string;
 				components?: DiscordMessageComponent[];
 				locked?: boolean;
+				occurrenceId?: string;
 			};
 			const providerEffect =
 				effect.kind === "post-message" || effect.kind === "archive" || effect.kind === "unarchive";
@@ -1764,7 +2042,8 @@ export class DiscordNotificationDaemon {
 					!payload.threadId ||
 					(effect.kind === "post-message" && payload.content === undefined))
 			) {
-				await this.#effects.terminalize(effect.id, { status: "stale_noop" });
+				await this.#terminalizeEffect(effect.id, "stale_noop");
+
 				continue;
 			}
 			try {
@@ -1786,7 +2065,7 @@ export class DiscordNotificationDaemon {
 						record.endpointGeneration !== effect.endpointGeneration ||
 						(effect.id.startsWith("action-publication:") && record.pendingActionEffectId !== effect.id)
 					) {
-						await this.#effects.terminalize(effect.id, { status: "stale_noop" });
+						await this.#terminalizeEffect(effect.id, "stale_noop");
 					} else {
 						await this.#postEffect(
 							effect.id,
@@ -1811,15 +2090,29 @@ export class DiscordNotificationDaemon {
 						effect.kind === "archive" &&
 						payload.locked === true &&
 						effect.id === this.#closeArchiveEffectId(record!);
+					const occurrenceId = payload.occurrenceId;
+					const occurrenceMatches =
+						closeArchive ||
+						(!!record &&
+							typeof occurrenceId === "string" &&
+							effect.id === (effect.kind === "archive" ? record.archiveEffectId : record.resumeEffectId) &&
+							(effect.kind === "archive"
+								? record.archiveOccurrenceId === occurrenceId
+								: record.resumeOccurrenceId === occurrenceId));
 					if (
 						!record ||
 						(!closeArchive &&
 							(effect.kind === "archive" ? record.state !== "active" : record.state !== "resuming")) ||
-						record.endpointGeneration !== effect.endpointGeneration
+						record.endpointGeneration !== effect.endpointGeneration ||
+						!occurrenceMatches
 					) {
-						await this.#effects.terminalize(effect.id, { status: "stale_noop" });
+						await this.#terminalizeEffect(effect.id, "stale_noop");
 					} else {
-						await this.#threadEffect(effect.id, record, effect.kind, payload.locked, closeArchive);
+						await this.#threadEffect(effect.id, record, effect.kind, payload.locked, closeArchive, occurrenceId);
+						if (!closeArchive && occurrenceId) {
+							if (effect.kind === "archive") await this.#completeArchive(record, occurrenceId);
+							else await this.#completeResume(record, occurrenceId);
+						}
 					}
 				}
 			} catch {
@@ -1886,7 +2179,7 @@ export class DiscordNotificationDaemon {
 				failed = true;
 			}
 			try {
-				await this.#drainPendingDispatches();
+				failed = (await this.#drainPendingDispatches()) || failed;
 			} catch {
 				failed = true;
 			}
