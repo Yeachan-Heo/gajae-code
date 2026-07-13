@@ -763,10 +763,9 @@ export class SelectorController {
 				break;
 			}
 			case "pet.mode":
-				// The settings submenu already persisted the value; apply it to the live
-				// widget via previewMode (the settings overlay is still open, so a full
-				// re-mount would tear it down — restoreComposer re-mounts on close).
-				this.ctx.previewPetMode(value as PetMode);
+				// The settings submenu already persisted the value; commit it without
+				// re-mounting the composer while the settings overlay is open.
+				this.ctx.commitPetPreviewMode(value as PetMode);
 				break;
 			case "symbolPreset": {
 				setSymbolPreset(value as "unicode" | "nerd" | "ascii").then(() => {
