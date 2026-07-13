@@ -306,22 +306,44 @@ export function routeInboundUpdate(update: unknown, ctx: RouteInboundContext): R
 	return { kind: "ignore" };
 }
 
-/** Read `{url, token, pid?, stale?}` from an endpoint discovery file. */
-export function readEndpoint(path: string): { url: string; token: string; pid?: number; stale?: boolean } {
+/** Read `{url, token, pid?, stale?, canonicalRoot?, leaseId?}` from an endpoint discovery file. */
+export function readEndpoint(path: string): {
+	url: string;
+	token: string;
+	pid?: number;
+	stale?: boolean;
+	canonicalRoot?: string;
+	leaseId?: string;
+} {
 	const raw = JSON.parse(fs.readFileSync(path, "utf8")) as {
 		url?: unknown;
 		token?: unknown;
 		pid?: unknown;
 		stale?: unknown;
+		canonicalRoot?: unknown;
+		leaseId?: unknown;
 	};
-	if (typeof raw.url !== "string" || typeof raw.token !== "string") {
+	if (
+		typeof raw.url !== "string" ||
+		raw.url.length === 0 ||
+		typeof raw.token !== "string" ||
+		raw.token.length === 0 ||
+		(raw.pid !== undefined && (typeof raw.pid !== "number" || !Number.isSafeInteger(raw.pid) || raw.pid <= 0)) ||
+		(raw.stale !== undefined && typeof raw.stale !== "boolean") ||
+		(raw.canonicalRoot !== undefined && (typeof raw.canonicalRoot !== "string" || raw.canonicalRoot.length === 0)) ||
+		(raw.leaseId !== undefined && (typeof raw.leaseId !== "string" || raw.leaseId.length === 0))
+	) {
 		throw new Error(`invalid endpoint file: ${path}`);
 	}
 	return {
 		url: raw.url,
 		token: raw.token,
-		pid: typeof raw.pid === "number" ? raw.pid : undefined,
+		...(raw.pid === undefined ? {} : { pid: raw.pid }),
 		stale: raw.stale === true,
+		...(typeof raw.canonicalRoot === "string" && raw.canonicalRoot.length > 0
+			? { canonicalRoot: raw.canonicalRoot }
+			: {}),
+		...(typeof raw.leaseId === "string" && raw.leaseId.length > 0 ? { leaseId: raw.leaseId } : {}),
 	};
 }
 
