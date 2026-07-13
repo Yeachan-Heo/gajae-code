@@ -1,6 +1,13 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Shared the temporary stdout error listener across terminal instances, preventing `MaxListenersExceededWarning` during repeated TUI start/stop cycles while retaining late detached-PTY error handling.
+
+### Added
+
+- Added opt-in disabled items to `SelectList` (`SelectItem.disabled`): disabled entries render dimmed; arrow navigation wraps while page navigation clamps and both skip disabled targets; filter resets choose the first enabled item; and programmatic selection searches forward from the requested index before falling back backward. Callbacks never receive disabled entries, while enabled-only arrow/page inputs preserve their existing notification behavior. All-disabled lists keep a null selection while an independent viewport remains navigable, with no cursor and a `(-/N)` scroll position.
 
 ## [0.10.1] - 2026-07-13
 ### Fixed
