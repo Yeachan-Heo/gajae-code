@@ -38,6 +38,28 @@ const KITTY_DROP_FRACTION = 0.45;
 const petKittyDropPx = (cellHeightPx: number): number =>
 	Math.min(Math.max(0, cellHeightPx - 1), Math.floor(cellHeightPx * KITTY_DROP_FRACTION));
 const PET_RAISE_ROWS = 1;
+const allocatedPetKittyImageIds = new Set<number>();
+
+function allocatePetKittyImageId(): number {
+	let id = 0;
+	while (id === 0 || allocatedPetKittyImageIds.has(id)) {
+		id = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0;
+	}
+	allocatedPetKittyImageIds.add(id);
+	return id;
+}
+
+interface SixelFootprint {
+	x: number;
+	y: number;
+	columns: number;
+	rows: number;
+}
+
+function sameFootprint(left: SixelFootprint, right: SixelFootprint): boolean {
+	return left.x === right.x && left.y === right.y && left.columns === right.columns && left.rows === right.rows;
+}
+
 /** Working animation: the shared para-para beats looped end to end. */
 const WORK_LOOP_TOTAL = PARA_PARA_STEPS.reduce((sum, [, ms]) => sum + ms, 0);
 /** Random gap between automatic claw flexes (fires while idle AND working). */
@@ -127,6 +149,8 @@ export class GajaePetWidget {
 	/** Cell metrics the current frames were built for; a change triggers a rebuild. */
 	#builtCellW = 0;
 	#builtCellH = 0;
+	#kittyImageId: number | undefined;
+	#lastSixelFootprint: SixelFootprint | undefined;
 
 	constructor(options: {
 		ui: TUI;
@@ -182,10 +206,15 @@ export class GajaePetWidget {
 		}
 	}
 
+	commitPreviewMode(mode: PetMode): void {
+		this.#applyMode(mode, false);
+	}
+
 	#applyMode(mode: PetMode, mountComposer: boolean): void {
 		if (mode === this.#mode) return;
 
 		if (mode === "off") {
+			this.#writeImageCleanup();
 			this.#mode = "off";
 			this.#animation?.unregister();
 			this.#animation = undefined;
@@ -200,6 +229,7 @@ export class GajaePetWidget {
 
 		const protocol = this.#forcedProtocol ?? GajaePetWidget.pixelProtocol();
 		if (!protocol) return;
+		if (this.#mode !== "off") this.#writeImageCleanup();
 		this.#mode = mode;
 		this.#frame = "base";
 		this.#flexUntil = 0;
@@ -220,6 +250,7 @@ export class GajaePetWidget {
 		this.#builtCellW = cell.widthPx;
 		this.#builtCellH = cell.heightPx;
 		const skin: PetSkinId = this.#mode === "off" ? "red" : this.#mode;
+		if (protocol === "kitty") this.#kittyImageId ??= allocatePetKittyImageId();
 		this.#pixel = buildGajaePixelFrames({
 			protocol,
 			skin,
@@ -228,11 +259,17 @@ export class GajaePetWidget {
 			targetRows: 2,
 			sixelTopPaddingPx: protocol === "sixel" ? PET_SIXEL_DROP_PX : 0,
 			kittyCellYOffsetPx: protocol === "kitty" ? petKittyDropPx(cell.heightPx) : 0,
+			kittyImageId: protocol === "kitty" ? this.#kittyImageId : undefined,
 		});
 		this.#framedEditor.setReserve(this.#pixel.columns + PET_SIDE_MARGIN);
 	}
 
 	dispose(): void {
+		this.#writeImageCleanup();
+		if (this.#kittyImageId !== undefined) {
+			allocatedPetKittyImageIds.delete(this.#kittyImageId);
+			this.#kittyImageId = undefined;
+		}
 		this.#animation?.unregister();
 		this.#animation = undefined;
 		this.#ui.setPostRenderEmitter(undefined);
@@ -335,14 +372,30 @@ export class GajaePetWidget {
 		return { x, y };
 	}
 
-	#clearPetPayload(x: number, y: number): string {
-		const pixel = this.#pixel;
-		if (pixel?.protocol !== "sixel") return "";
+	#clearSixelFootprint(footprint: SixelFootprint): string {
 		let out = "\x1b[0m";
-		for (let row = 0; row < pixel.rasterRows; row++) {
-			out += `\x1b[${y + row + 1};${x + 1}H\x1b[${pixel.columns}X`;
+		for (let row = 0; row < footprint.rows; row++) {
+			out += `\x1b[${footprint.y + row + 1};${footprint.x + 1}H\x1b[${footprint.columns}X`;
 		}
 		return out;
+	}
+
+	#imageCleanupPayload(): string {
+		if (this.#pixel?.protocol === "kitty") {
+			if (this.#kittyImageId === undefined) return "";
+			return `\x1b_Ga=d,d=I,i=${this.#kittyImageId},q=2\x1b\\`;
+		}
+		if (!this.#lastSixelFootprint) return "";
+		const payload = this.#clearSixelFootprint(this.#lastSixelFootprint);
+		this.#lastSixelFootprint = undefined;
+		return payload;
+	}
+
+	#writeImageCleanup(): void {
+		const payload = this.#imageCleanupPayload();
+		if (payload && this.#ui.terminalAvailable) {
+			this.#ui.terminal.write(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`);
+		}
 	}
 
 	/** Draw escape payload at the pet's absolute position. */
@@ -350,10 +403,22 @@ export class GajaePetWidget {
 		const pixel = this.#pixel;
 		if (!pixel) return null;
 		const pos = this.#petPosition();
-		if (!pos) return null;
+		if (!pos) {
+			const cleanup = this.#imageCleanupPayload();
+			return cleanup || null;
+		}
 		const { x, y } = pos;
+		let out = "";
 
-		let out = clearPet ? this.#clearPetPayload(x, y) : "";
+		if (pixel.protocol === "sixel") {
+			const footprint = { x, y, columns: pixel.columns, rows: pixel.rasterRows };
+			if (this.#lastSixelFootprint && !sameFootprint(this.#lastSixelFootprint, footprint)) {
+				out += this.#clearSixelFootprint(this.#lastSixelFootprint);
+			}
+			if (clearPet) out += this.#clearSixelFootprint(footprint);
+			this.#lastSixelFootprint = footprint;
+		}
+
 		out += `\x1b[${y + 1};${x + 1}H${pixel.frames[this.#frame]}`;
 		return out;
 	}
