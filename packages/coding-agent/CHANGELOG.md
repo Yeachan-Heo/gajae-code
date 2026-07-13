@@ -10,7 +10,7 @@
 
 ### Fixed
 
-- ACP connections now retain independent session authority across multiple working directories while permanently revoking an ID that the SDK broker reports under conflicting workspaces. CWD-less close/delete and active controls fail closed after ambiguity, scoped-list bindings commit atomically, and malformed pagination cursors are rejected instead of accepting numeric prefixes.
+- ACP connections now retain independent broker-issued authority across multiple working directories. Realpath-equivalent workspace identities collapse aliases; CWD-less close/delete and idempotency bind to exact endpoint or transcript incarnations; production duplicate observations remain visible; and ambiguity synchronously revokes attached control for the connection. Scoped bindings remain atomic and pagination cursors use exact decimal grammar.
 
 ## [0.10.1] - 2026-07-13
 
