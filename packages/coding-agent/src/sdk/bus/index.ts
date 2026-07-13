@@ -654,6 +654,29 @@ function resolveToken(): string {
 	return crypto.randomBytes(24).toString("base64url");
 }
 
+async function stampEndpointPublicationIdentity(
+	endpointPath: string,
+	identity: { canonicalRoot: string; leaseId: string },
+): Promise<void> {
+	const raw = JSON.parse(await fs.promises.readFile(endpointPath, "utf8")) as Record<string, unknown>;
+	raw.canonicalRoot = identity.canonicalRoot;
+	raw.leaseId = identity.leaseId;
+	const tmp = `${endpointPath}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+	try {
+		await fs.promises.writeFile(tmp, JSON.stringify(raw), { mode: 0o600, flag: "wx" });
+		const handle = await fs.promises.open(tmp, "r");
+		try {
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await fs.promises.rename(tmp, endpointPath);
+	} catch (error) {
+		await fs.promises.unlink(tmp).catch(() => undefined);
+		throw error;
+	}
+}
+
 function parseAnswer(answerJson: string): unknown {
 	try {
 		return JSON.parse(answerJson);
@@ -2199,8 +2222,46 @@ export function createNotificationsExtension(
 		});
 
 		try {
+			// Telegram topic ownership is destructive state, so a configured session
+			// must attach its daemon and commit its registration lease before the
+			// shared SDK endpoint is published. A blocked or deferred Telegram owner
+			// fails this session start; unrelated sessions remain unaffected.
+			// Capture the exact Telegram registration identity so it can be stamped
+			// onto the endpoint file as immutable publication identity. The daemon
+			// binds this endpoint-carried identity — it never infers a lease from
+			// the registry. Declared outside the Telegram guard so the stamp runs
+			// unconditionally after the endpoint is published.
+			let registrationIdentity: { canonicalRoot: string; leaseId: string } | undefined;
+			if (notificationsEnabledForSession && settingsAvailable && settings && isTelegramConfigured(cfg)) {
+				try {
+					const telegram = await ensureTelegramDaemonRunning({
+						settings,
+						cwd: ctx.cwd,
+						sessionId: id,
+						onRegistered: identity => {
+							registrationIdentity = identity;
+						},
+					});
+					if (telegram !== "owner_spawned" && telegram !== "attached") {
+						logger.warn(`notifications: Telegram daemon registration ${telegram}; not publishing SDK endpoint`);
+						return "failed";
+					}
+				} catch (e) {
+					logger.warn(`notifications: Telegram daemon registration failed: ${String(e)}`);
+					return "failed";
+				}
+			}
 			await host.start();
 			const endpoint = await server.start();
+			// Stamp the immutable publication identity onto the just-created endpoint
+			// file BEFORE broker registration, logging, or identity frames. The native
+			// server writes the endpoint first; this read-modify-write adds
+			// canonicalRoot + leaseId so the daemon can bind and validate
+			// endpoint-carried identity (never inferring a lease from the registry).
+			if (registrationIdentity) {
+				const endpointPath = path.join(stateRoot, "sdk", `${id}.json`);
+				await stampEndpointPublicationIdentity(endpointPath, registrationIdentity);
+			}
 			const agentDir = settings?.getAgentDir?.();
 			if (agentDir) {
 				try {
@@ -2318,8 +2379,6 @@ export function createNotificationsExtension(
 
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
-					if (isTelegramConfigured(cfg))
-						await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
 					if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
 					if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
 				} catch (e) {
@@ -2415,6 +2474,11 @@ export function createNotificationsExtension(
 			return "started";
 		} catch (e) {
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
+			try {
+				server.stop();
+			} catch (stopError) {
+				logger.warn(`notifications: startup server cleanup failed: ${String(stopError)}`);
+			}
 			stopBrokerHeartbeat();
 			try {
 				await host.stop();

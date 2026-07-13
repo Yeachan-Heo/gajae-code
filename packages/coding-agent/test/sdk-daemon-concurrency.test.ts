@@ -273,5 +273,42 @@ describe("ChatEffectJournal", () => {
 		const effects = await journal.list();
 		expect(effects.filter(effect => effect.state !== "terminal")).toHaveLength(130);
 		expect(effects.filter(effect => effect.state === "terminal")).toHaveLength(MAX_TERMINAL_CHAT_EFFECTS);
-	});
+	}, 15_000);
+
+	test("bounds Telegram terminal history only after local reconciliation completes", async () => {
+		const fs = new MemoryConversationStoreFs();
+		const journal = new ChatEffectJournal({ agentDir: "/agent", transport: "telegram", fs, now: () => 1 });
+		for (let index = 0; index < MAX_TERMINAL_CHAT_EFFECTS + 2; index++) {
+			const id = `telegram-delete-${index}`;
+			const claimed = await journal.enqueueAndClaim(
+				{
+					id,
+					kind: "telegram.topic_delete",
+					transport: "telegram",
+					sessionId: `session-${index}`,
+					endpointGeneration: 1,
+					payload: { chatId: "42", topicId: String(index + 1), leaseId: `lease-${index}` },
+				},
+				"owner",
+				10,
+			);
+			await journal.record(id, { owner: "owner", epoch: claimed!.epoch }, "terminal", {
+				provider: "telegram",
+				status: "deleted",
+			});
+		}
+		expect((await journal.list()).filter(effect => effect.state === "terminal")).toHaveLength(
+			MAX_TERMINAL_CHAT_EFFECTS + 2,
+		);
+
+		for (let index = 0; index < MAX_TERMINAL_CHAT_EFFECTS + 2; index++) {
+			await journal.updateTerminalReceipt(`telegram-delete-${index}`, {
+				provider: "telegram",
+				status: "reconciled",
+			});
+		}
+		const terminal = (await journal.list()).filter(effect => effect.state === "terminal");
+		expect(terminal).toHaveLength(MAX_TERMINAL_CHAT_EFFECTS);
+		expect(terminal.every(effect => effect.receipt?.status === "reconciled")).toBe(true);
+	}, 15_000);
 });
