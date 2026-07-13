@@ -20,7 +20,14 @@ afterEach(async () => {
 /** Reference formula: sorted-key JSON.stringify over the authority tuple. */
 const incarnation = (sessionId: string, generation: number, mtimeMs: number, pid: number) =>
 	createHash("sha256")
-		.update(JSON.stringify({ endpointGeneration: generation, endpointMtimeMs: mtimeMs, pid, sessionId }))
+		.update(
+			JSON.stringify({
+				endpointGeneration: generation,
+				endpointMtimeMs: mtimeMs,
+				pid,
+				sessionId,
+			}),
+		)
 		.digest("hex");
 
 const registered = (overrides: {
@@ -33,7 +40,10 @@ const registered = (overrides: {
 }) => ({
 	type: "host_registered" as const,
 	sessionId: overrides.sessionId,
-	locator: { repo: overrides.repo ?? "repo", stateRoot: overrides.stateRoot ?? "root" },
+	locator: {
+		repo: overrides.repo ?? "repo",
+		stateRoot: overrides.stateRoot ?? "root",
+	},
 	endpointGeneration: overrides.endpointGeneration,
 	pid: overrides.pid,
 	...(overrides.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: overrides.endpointMtimeMs }),
@@ -43,10 +53,22 @@ test("production index preserves cross-workspace duplicate session ids as distin
 	const dir = await temp();
 	const index = await new SessionIndex(dir).open();
 	await index.append(
-		registered({ sessionId: "shared", repo: "/ws-a", endpointGeneration: 1, pid: 111_111, endpointMtimeMs: 1000 }),
+		registered({
+			sessionId: "shared",
+			repo: "/ws-a",
+			endpointGeneration: 1,
+			pid: 111_111,
+			endpointMtimeMs: 1000,
+		}),
 	);
 	await index.append(
-		registered({ sessionId: "shared", repo: "/ws-b", endpointGeneration: 1, pid: 222_222, endpointMtimeMs: 2000 }),
+		registered({
+			sessionId: "shared",
+			repo: "/ws-b",
+			endpointGeneration: 1,
+			pid: 222_222,
+			endpointMtimeMs: 2000,
+		}),
 	);
 	const shared = index.listProductionSessions().sessions.filter(session => session.sessionId === "shared");
 	expect(shared).toHaveLength(2);
@@ -58,10 +80,20 @@ test("production index preserves same-id successor generations as distinct evide
 	const dir = await temp();
 	const index = await new SessionIndex(dir).open();
 	await index.append(
-		registered({ sessionId: "successor", endpointGeneration: 1, pid: 111_111, endpointMtimeMs: 1000 }),
+		registered({
+			sessionId: "successor",
+			endpointGeneration: 1,
+			pid: 111_111,
+			endpointMtimeMs: 1000,
+		}),
 	);
 	await index.append(
-		registered({ sessionId: "successor", endpointGeneration: 2, pid: 111_111, endpointMtimeMs: 2000 }),
+		registered({
+			sessionId: "successor",
+			endpointGeneration: 2,
+			pid: 111_111,
+			endpointMtimeMs: 2000,
+		}),
 	);
 	const sessions = index.listProductionSessions().sessions.filter(session => session.sessionId === "successor");
 	expect(sessions).toHaveLength(2);
@@ -75,10 +107,20 @@ test("internal listSessions still folds to the latest record per session id (bac
 	const dir = await temp();
 	const index = await new SessionIndex(dir).open();
 	await index.append(
-		registered({ sessionId: "successor", endpointGeneration: 1, pid: 111_111, endpointMtimeMs: 1000 }),
+		registered({
+			sessionId: "successor",
+			endpointGeneration: 1,
+			pid: 111_111,
+			endpointMtimeMs: 1000,
+		}),
 	);
 	await index.append(
-		registered({ sessionId: "successor", endpointGeneration: 2, pid: 111_111, endpointMtimeMs: 2000 }),
+		registered({
+			sessionId: "successor",
+			endpointGeneration: 2,
+			pid: 111_111,
+			endpointMtimeMs: 2000,
+		}),
 	);
 	const sessions = index.listSessions().sessions.filter(session => session.sessionId === "successor");
 	expect(sessions).toHaveLength(1);
@@ -88,7 +130,14 @@ test("internal listSessions still folds to the latest record per session id (bac
 test("production index exposes a stable endpointIncarnation matching the authority formula", async () => {
 	const dir = await temp();
 	const index = await new SessionIndex(dir).open();
-	await index.append(registered({ sessionId: "ep", endpointGeneration: 5, pid: 333_333, endpointMtimeMs: 5000 }));
+	await index.append(
+		registered({
+			sessionId: "ep",
+			endpointGeneration: 5,
+			pid: 333_333,
+			endpointMtimeMs: 5000,
+		}),
+	);
 	const [session] = index.listSessions().sessions;
 	expect(session.endpointIncarnation).toBe(incarnation("ep", 5, 5000, 333_333));
 	expect(session.endpointIncarnation).toBe(endpointIncarnation(session, "ep"));
@@ -98,7 +147,13 @@ test("production index exposes a stable endpointIncarnation matching the authori
 test("production index omits endpointIncarnation when endpoint authority is incomplete", async () => {
 	const dir = await temp();
 	const index = await new SessionIndex(dir).open();
-	await index.append(registered({ sessionId: "incomplete", endpointGeneration: 5, pid: 333_333 }));
+	await index.append(
+		registered({
+			sessionId: "incomplete",
+			endpointGeneration: 5,
+			pid: 333_333,
+		}),
+	);
 	expect(index.listSessions().sessions[0]?.endpointIncarnation).toBeUndefined();
 });
 
@@ -109,13 +164,17 @@ test("scoped session.list issues a realpath canonicalCwd resolving lexical alias
 	const broker = new Broker({ agentDir: dir });
 	await broker.index.open();
 	try {
-		const aliased = await broker.handleRequest("session.list", { cwd: path.join(workspace, ".") });
+		const aliased = await broker.handleRequest("session.list", {
+			cwd: path.join(workspace, "."),
+		});
 		expect(aliased.ok).toBe(true);
 		if (!aliased.ok) throw new Error("expected ok");
 		const aliasedResult = aliased.result as { canonicalCwd?: string };
 		const real = await fs.realpath(workspace);
 		expect(aliasedResult.canonicalCwd).toBe(real);
-		const direct = await broker.handleRequest("session.list", { cwd: workspace });
+		const direct = await broker.handleRequest("session.list", {
+			cwd: workspace,
+		});
 		expect(direct.ok).toBe(true);
 		if (!direct.ok) throw new Error("expected ok");
 		expect((direct.result as { canonicalCwd?: string }).canonicalCwd).toBe(real);
@@ -151,7 +210,10 @@ test("scoped session.list exposes immutable transcript identity for a saved sess
 	const broker = new Broker({ agentDir });
 	await broker.index.open();
 	try {
-		const response = await broker.handleRequest("session.list", { cwd: workspace, resolveSessionId: sessionId });
+		const response = await broker.handleRequest("session.list", {
+			cwd: workspace,
+			resolveSessionId: sessionId,
+		});
 		expect(response.ok).toBe(true);
 		if (!response.ok) throw new Error("expected ok");
 		const result = response.result as {
@@ -159,7 +221,13 @@ test("scoped session.list exposes immutable transcript identity for a saved sess
 			savedSession?: {
 				id: string;
 				path: string;
-				sessionIdentity?: { dev: string; ino: string; size: number; mtimeMs: number; mtimeNs: string };
+				sessionIdentity?: {
+					dev: string;
+					ino: string;
+					size: number;
+					mtimeMs: number;
+					mtimeNs: string;
+				};
 			};
 		};
 		expect(result.canonicalCwd).toBe(await fs.realpath(workspace));
@@ -207,7 +275,9 @@ test("broker session.list exposes live duplicate observations without destabiliz
 			endpointMtimeMs: 2000,
 		}),
 	);
-	const response = await broker.handleRequest("session.list", { cwd: workspaceA });
+	const response = await broker.handleRequest("session.list", {
+		cwd: workspaceA,
+	});
 	expect(response.ok).toBe(true);
 	if (!response.ok) throw new Error("expected ok");
 	const result = response.result as {
@@ -221,6 +291,65 @@ test("broker session.list exposes live duplicate observations without destabiliz
 	);
 });
 
+test("foreign workspace observations never inherit requested-workspace saved authority", async () => {
+	const root = await temp();
+	const agentDir = path.join(root, "agent");
+	const workspaceA = path.join(root, "workspace-a");
+	const workspaceB = path.join(root, "workspace-b");
+	await Promise.all([fs.mkdir(workspaceA), fs.mkdir(workspaceB)]);
+	const saved = SessionManager.create(workspaceA, SessionManager.getDefaultSessionDir(workspaceA, agentDir));
+	await saved.ensureOnDisk();
+	const sessionId = saved.getSessionId();
+	const sessionPath = saved.getSessionFile();
+	if (!sessionPath) throw new Error("expected saved session path");
+	await saved.close();
+
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	try {
+		await broker.index.append(
+			registered({
+				sessionId,
+				repo: workspaceA,
+				stateRoot: path.join(workspaceA, ".gjc", "state"),
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: 1000,
+			}),
+		);
+		const foreignResponse = await broker.handleRequest("session.list", { cwd: workspaceB });
+		if (!foreignResponse.ok) throw new Error("expected foreign observation list");
+		const foreignResult = foreignResponse.result as {
+			observations: Array<{
+				sessionId: string;
+				canonicalCwd: string;
+				path?: string;
+				sessionIdentity?: unknown;
+			}>;
+		};
+		const foreign = foreignResult.observations.find(session => session.sessionId === sessionId);
+		expect(foreign).toMatchObject({ sessionId, canonicalCwd: await fs.realpath(workspaceA) });
+		expect(foreign?.path).toBeUndefined();
+		expect(foreign?.sessionIdentity).toBeUndefined();
+
+		const foreignResolve = await broker.handleRequest("session.list", {
+			cwd: workspaceB,
+			resolveSessionId: sessionId,
+		});
+		if (!foreignResolve.ok) throw new Error("expected foreign resolve list");
+		expect((foreignResolve.result as { savedSession?: unknown }).savedSession).toBeUndefined();
+
+		const ownedResolve = await broker.handleRequest("session.list", {
+			cwd: workspaceA,
+			resolveSessionId: sessionId,
+		});
+		if (!ownedResolve.ok) throw new Error("expected owned resolve list");
+		expect((ownedResolve.result as { savedSession?: { path?: string } }).savedSession?.path).toBe(sessionPath);
+	} finally {
+		await broker.stop();
+	}
+});
+
 test("close idempotency identities are scoped to endpoint incarnation", async () => {
 	const root = await temp();
 	const broker = new Broker({ agentDir: root });
@@ -229,12 +358,20 @@ test("close idempotency identities are scoped to endpoint incarnation", async ()
 	const secondIncarnation = "b".repeat(64);
 	await broker.handleRequest(
 		"session.close",
-		{ sessionId: "successor", endpointGeneration: 1, endpointIncarnation: firstIncarnation },
+		{
+			sessionId: "successor",
+			endpointGeneration: 1,
+			endpointIncarnation: firstIncarnation,
+		},
 		"same-key",
 	);
 	await broker.handleRequest(
 		"session.close",
-		{ sessionId: "successor", endpointGeneration: 2, endpointIncarnation: secondIncarnation },
+		{
+			sessionId: "successor",
+			endpointGeneration: 2,
+			endpointIncarnation: secondIncarnation,
+		},
 		"same-key",
 	);
 	const entries = (await fs.readFile(path.join(root, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
@@ -244,6 +381,99 @@ test("close idempotency identities are scoped to endpoint incarnation", async ()
 	const accepted = entries.filter(entry => entry.state === "accepted");
 	expect(accepted).toHaveLength(2);
 	expect(new Set(accepted.map(entry => entry.identity)).size).toBe(2);
+});
+
+test("saved lifecycle idempotency identities are scoped to full transcript identity", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const transcriptPath = path.join(workspace, "saved.jsonl");
+	await fs.mkdir(workspace, { recursive: true });
+	const broker = new Broker({ agentDir: root });
+	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	const first = { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5" };
+	const second = { ...first, size: 6, mtimeMs: 7, mtimeNs: "8" };
+	const requests: Array<[string, Record<string, unknown>]> = [
+		[
+			"session.resume",
+			{
+				sessionId: "saved",
+				sessionPath: transcriptPath,
+				sessionIdentity: first,
+				cwd: workspace,
+				target: { path: workspace },
+			},
+		],
+		[
+			"session.fork",
+			{
+				sourceSessionId: "saved",
+				sourceSessionPath: transcriptPath,
+				sourceSessionIdentity: first,
+				cwd: workspace,
+				target: { path: workspace },
+			},
+		],
+		[
+			"session.delete",
+			{
+				sessionId: "saved",
+				sessionPath: transcriptPath,
+				sessionIdentity: first,
+				cwd: workspace,
+				target: { path: workspace },
+			},
+		],
+	];
+	for (const [operation, input] of requests) {
+		await broker.handleRequest(operation, input, "same-key");
+		const identityField = operation === "session.fork" ? "sourceSessionIdentity" : "sessionIdentity";
+		await broker.handleRequest(operation, { ...input, [identityField]: second }, "same-key");
+	}
+	const entries = (await fs.readFile(path.join(root, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+		.split("\n")
+		.filter(Boolean)
+		.map(line => JSON.parse(line) as { identity: string; state: string });
+	const accepted = entries.filter(entry => entry.state === "accepted");
+	expect(accepted).toHaveLength(6);
+	expect(new Set(accepted.map(entry => entry.identity)).size).toBe(6);
+});
+
+test("broker boot authority is revalidated before endpoint or lifecycle effects", async () => {
+	const root = await temp();
+	const broker = new Broker({ agentDir: root, packageGeneration: "test" });
+	const discovery = await broker.start();
+	try {
+		await expect(
+			broker.handleRequest("session.get_endpoint", {
+				sessionId: "missing",
+				brokerOwnerId: "stale-owner",
+			}),
+		).resolves.toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "broker boot authority is stale" },
+		});
+		await expect(
+			broker.handleRequest(
+				"session.close",
+				{ sessionId: "missing", brokerOwnerId: "stale-owner" },
+				"stale-owner-close",
+			),
+		).resolves.toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "broker boot authority is stale" },
+		});
+		await expect(
+			broker.handleRequest("session.get_endpoint", {
+				sessionId: "missing",
+				brokerOwnerId: discovery.ownerId,
+			}),
+		).resolves.toMatchObject({ ok: false, error: { code: "resource_gone" } });
+		const ledgerPath = path.join(root, "sdk", "lifecycle-ledger.jsonl");
+		const ledger = await fs.readFile(ledgerPath, "utf8").catch(() => "");
+		expect(ledger.trim()).toBe("");
+	} finally {
+		await broker.stop();
+	}
 });
 
 test("delete rejects a recreated transcript before any deletion effect", async () => {
@@ -278,6 +508,138 @@ test("delete rejects a recreated transcript before any deletion effect", async (
 		},
 		"delete-stale-transcript",
 	);
-	expect(response).toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+	expect(response).toMatchObject({
+		ok: false,
+		error: { code: "endpoint_stale" },
+	});
 	expect(await fs.stat(sessionPath)).toBeDefined();
+});
+
+test("session.list exposes immutable broker identity from the running discovery", async () => {
+	const dir = await temp();
+	const broker = new Broker({
+		agentDir: dir,
+		packageGeneration: "test-generation",
+	});
+	await broker.index.open();
+	broker.discovery = {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test-generation",
+		ownerId: "owner-abc",
+		pid: process.pid,
+		host: "127.0.0.1",
+		port: 9,
+		url: "ws://127.0.0.1:9",
+		token: "discovery-token",
+		startedAt: 42_000,
+		heartbeatAt: 42_000,
+	};
+	try {
+		const response = await broker.handleRequest("session.list", {});
+		expect(response.ok).toBe(true);
+		if (!response.ok) throw new Error("expected ok");
+		const result = response.result as {
+			brokerIdentity?: {
+				ownerId: string;
+				packageGeneration: string;
+				startedAt: number;
+			};
+		};
+		expect(result.brokerIdentity).toEqual({
+			ownerId: "owner-abc",
+			packageGeneration: "test-generation",
+			startedAt: 42_000,
+		});
+	} finally {
+		broker.discovery = null;
+		await broker.stop();
+	}
+});
+
+test("resume rejects a stale saved-session identity before any launch effect", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	await fs.mkdir(workspace, { recursive: true });
+	const saved = SessionManager.create(workspace, SessionManager.getDefaultSessionDir(workspace, agentDir));
+	await saved.ensureOnDisk();
+	const sessionId = saved.getSessionId();
+	const sessionPath = saved.getSessionFile();
+	if (!sessionPath) throw new Error("expected saved session file");
+	const stat = await fs.stat(sessionPath, { bigint: true });
+	const staleIdentity = {
+		dev: stat.dev.toString(),
+		ino: stat.ino.toString(),
+		size: Number(stat.size),
+		mtimeMs: Number(stat.mtimeMs),
+		mtimeNs: stat.mtimeNs.toString(),
+	};
+	// In-place modification after initial authority: same dev/ino, changed size/mtime.
+	await fs.appendFile(sessionPath, `${JSON.stringify({ type: "user", content: "tamper" })}\n`);
+	const broker = new Broker({ agentDir });
+	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	try {
+		const response = await broker.handleRequest(
+			"session.resume",
+			{
+				sessionId,
+				sessionPath,
+				sessionIdentity: staleIdentity,
+				cwd: workspace,
+				target: { path: workspace },
+			},
+			"resume-stale-identity",
+		);
+		expect(response).toMatchObject({
+			ok: false,
+			error: { code: "endpoint_stale" },
+		});
+		expect(await fs.stat(sessionPath)).toBeDefined();
+	} finally {
+		await broker.stop();
+	}
+});
+
+test("fork rejects a stale source-session identity before any launch effect", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	await fs.mkdir(workspace, { recursive: true });
+	const saved = SessionManager.create(workspace, SessionManager.getDefaultSessionDir(workspace, agentDir));
+	await saved.ensureOnDisk();
+	const sessionId = saved.getSessionId();
+	const sessionPath = saved.getSessionFile();
+	if (!sessionPath) throw new Error("expected saved session file");
+	const stat = await fs.stat(sessionPath, { bigint: true });
+	const staleIdentity = {
+		dev: stat.dev.toString(),
+		ino: stat.ino.toString(),
+		size: Number(stat.size),
+		mtimeMs: Number(stat.mtimeMs),
+		mtimeNs: stat.mtimeNs.toString(),
+	};
+	await fs.appendFile(sessionPath, `${JSON.stringify({ type: "user", content: "tamper" })}\n`);
+	const broker = new Broker({ agentDir });
+	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	try {
+		const response = await broker.handleRequest(
+			"session.fork",
+			{
+				sourceSessionId: sessionId,
+				sourceSessionPath: sessionPath,
+				sourceSessionIdentity: staleIdentity,
+				cwd: workspace,
+				target: { path: workspace },
+			},
+			"fork-stale-identity",
+		);
+		expect(response).toMatchObject({
+			ok: false,
+			error: { code: "endpoint_stale" },
+		});
+		expect(await fs.stat(sessionPath)).toBeDefined();
+	} finally {
+		await broker.stop();
+	}
 });

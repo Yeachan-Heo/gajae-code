@@ -6,8 +6,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpSdkAdapter } from "../src/sdk/acp";
 
-type TestSessionIdentity = { dev: string; ino: string; size: number; mtimeMs: number; mtimeNs: string };
+type TestSessionIdentity = {
+	dev: string;
+	ino: string;
+	size: number;
+	mtimeMs: number;
+	mtimeNs: string;
+};
 type BrokerSession = {
 	sessionId: string;
 	locator: { repo: string };
@@ -23,7 +30,11 @@ type BrokerRequest = {
 	input?: Record<string, unknown>;
 	idempotencyKey?: string;
 };
-type TestServer = { port: number | undefined; upgrade(request: Request): boolean; stop(close?: boolean): void };
+type TestServer = {
+	port: number | undefined;
+	upgrade(request: Request): boolean;
+	stop(close?: boolean): void;
+};
 
 const directories: string[] = [];
 const servers: TestServer[] = [];
@@ -35,6 +46,14 @@ function realpath(value: string): string {
 	} catch {
 		return path.resolve(value);
 	}
+}
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+	const deadline = Date.now() + 2_000;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(5);
+	}
+	throw new Error(`Timed out waiting for ${label}`);
 }
 
 function incarnation(seed: string): string {
@@ -89,6 +108,10 @@ async function createHarness(): Promise<{
 	refreshPromptAcknowledged(): Promise<void>;
 	endpointClosed: Promise<void>;
 	refreshEndpointClosed(): Promise<void>;
+	setBrokerIdentity(identity: { ownerId: string; packageGeneration: string; startedAt: number }): void;
+	setMutateOnGetEndpoint(fn: (() => void) | undefined): void;
+	reverseReadTextFileCalls: number;
+	sendEndpointFrame(frame: Record<string, unknown>): void;
 }> {
 	const root = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-multi-cwd-"));
 	directories.push(root);
@@ -102,6 +125,13 @@ async function createHarness(): Promise<{
 	let promptAcknowledged = Promise.withResolvers<void>();
 	let endpointClosed = Promise.withResolvers<void>();
 	let endpointPort: number | undefined;
+	let brokerIdentityValue = {
+		ownerId: "test-owner",
+		packageGeneration: "test",
+		startedAt: Date.now(),
+	};
+	let mutateOnGetEndpoint: (() => void) | undefined;
+	let reverseReadTextFileCalls = 0;
 
 	let broker!: TestServer;
 	broker = Bun.serve({
@@ -117,7 +147,9 @@ async function createHarness(): Promise<{
 				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
 			},
 			message(socket, raw) {
-				const frame = JSON.parse(String(raw)) as BrokerRequest & { id?: string };
+				const frame = JSON.parse(String(raw)) as BrokerRequest & {
+					id?: string;
+				};
 				requests.push(frame);
 				if (frame.operation === "session.list") {
 					const requestedId = frame.input?.resolveSessionId;
@@ -127,17 +159,30 @@ async function createHarness(): Promise<{
 							session =>
 								session.sessionId === requestedId && realpath(session.locator.repo) === realpath(requestedCwd),
 						);
-						const result = match
-							? {
-									canonicalCwd: realpath(requestedCwd),
-									savedSession: {
-										id: match.sessionId,
-										path: match.path ?? path.join(match.locator.repo, `${match.sessionId}.jsonl`),
-										sessionIdentity: match.sessionIdentity ?? savedIdentity(`${match.sessionId}-default`),
-									},
-								}
-							: { canonicalCwd: realpath(requestedCwd), savedSession: undefined };
-						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
+						const result = {
+							brokerIdentity: brokerIdentityValue,
+							...(match
+								? {
+										canonicalCwd: realpath(requestedCwd),
+										savedSession: {
+											id: match.sessionId,
+											path: match.path ?? path.join(match.locator.repo, `${match.sessionId}.jsonl`),
+											sessionIdentity: match.sessionIdentity ?? savedIdentity(`${match.sessionId}-default`),
+										},
+									}
+								: {
+										canonicalCwd: realpath(requestedCwd),
+										savedSession: undefined,
+									}),
+						};
+						socket.send(
+							JSON.stringify({
+								type: "broker_response",
+								id: frame.id,
+								ok: true,
+								result,
+							}),
+						);
 						return;
 					}
 					const canonical = typeof requestedCwd === "string" ? realpath(requestedCwd) : undefined;
@@ -146,30 +191,54 @@ async function createHarness(): Promise<{
 						canonicalCwd: realpath(session.locator.repo),
 					}));
 					const result = {
+						brokerIdentity: brokerIdentityValue,
 						sessions,
 						...(canonical ? { canonicalCwd: canonical } : {}),
 					};
-					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
-					return;
-				}
-				if (frame.operation === "session.get_endpoint") {
 					socket.send(
 						JSON.stringify({
 							type: "broker_response",
 							id: frame.id,
 							ok: true,
-							result: { url: `ws://127.0.0.1:${endpointPort}`, token: endpointToken },
+							result,
 						}),
 					);
 					return;
 				}
-				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
+				if (frame.operation === "session.get_endpoint") {
+					if (mutateOnGetEndpoint) {
+						const fn = mutateOnGetEndpoint;
+						mutateOnGetEndpoint = undefined;
+						fn();
+					}
+					socket.send(
+						JSON.stringify({
+							type: "broker_response",
+							id: frame.id,
+							ok: true,
+							result: {
+								url: `ws://127.0.0.1:${endpointPort}`,
+								token: endpointToken,
+							},
+						}),
+					);
+					return;
+				}
+				socket.send(
+					JSON.stringify({
+						type: "broker_response",
+						id: frame.id,
+						ok: true,
+						result: {},
+					}),
+				);
 			},
 		},
 	}) as TestServer;
 	servers.push(broker);
 
 	let endpoint!: TestServer;
+	let endpointSocket: { send(message: string): void } | undefined;
 	endpoint = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -179,9 +248,17 @@ async function createHarness(): Promise<{
 		websocket: {
 			open(socket) {
 				endpointPort = endpoint.port;
-				socket.send(JSON.stringify({ type: "hello", connectionId: "acp-endpoint-1", protocolVersion: 3 }));
+				endpointSocket = socket;
+				socket.send(
+					JSON.stringify({
+						type: "hello",
+						connectionId: "acp-endpoint-1",
+						protocolVersion: 3,
+					}),
+				);
 			},
 			close() {
+				endpointSocket = undefined;
 				endpointClosed.resolve();
 			},
 			message(socket, raw) {
@@ -253,6 +330,10 @@ async function createHarness(): Promise<{
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 			sessionUpdate: async () => {},
+			readTextFile: async () => {
+				reverseReadTextFileCalls++;
+				return "";
+			},
 		} as unknown as AgentSideConnection,
 		{ agentDir },
 	);
@@ -311,6 +392,18 @@ async function createHarness(): Promise<{
 			endpointClosed = Promise.withResolvers<void>();
 			return endpointClosed.promise;
 		},
+		setBrokerIdentity(identity) {
+			brokerIdentityValue = identity;
+		},
+		setMutateOnGetEndpoint(fn) {
+			mutateOnGetEndpoint = fn;
+		},
+		get reverseReadTextFileCalls() {
+			return reverseReadTextFileCalls;
+		},
+		sendEndpointFrame(frame) {
+			endpointSocket?.send(JSON.stringify(frame));
+		},
 	};
 }
 
@@ -368,7 +461,11 @@ test("a cross-cwd session id conflict revokes prior authority for the connection
 	await expect(harness.agent.listSessions({ cwd: harness.cwdA })).rejects.toMatchObject({ code: "conflict" });
 	const beforeLifecycle = harness.requests.length;
 	await expect(
-		harness.agent.loadSession({ sessionId: "shared", cwd: harness.cwdA, mcpServers: [] }),
+		harness.agent.loadSession({
+			sessionId: "shared",
+			cwd: harness.cwdA,
+			mcpServers: [],
+		}),
 	).rejects.toMatchObject({ code: "conflict" });
 	await expect(harness.agent.closeSession({ sessionId: "shared" })).rejects.toMatchObject({ code: "conflict" });
 	await expect(harness.agent.deleteSession({ sessionId: "shared" })).rejects.toMatchObject({ code: "conflict" });
@@ -444,7 +541,10 @@ test("session cursors use exact decimal grammar and paginate within one cwd", as
 	const first = await harness.agent.listSessions({ cwd: harness.cwdA });
 	expect(first.sessions).toHaveLength(50);
 	expect(first.nextCursor).toBe("50");
-	const second = await harness.agent.listSessions({ cwd: harness.cwdA, cursor: first.nextCursor });
+	const second = await harness.agent.listSessions({
+		cwd: harness.cwdA,
+		cursor: first.nextCursor,
+	});
 	expect(second.sessions).toHaveLength(10);
 	expect(second.nextCursor).toBeUndefined();
 	harness.abort.abort();
@@ -461,16 +561,22 @@ test("symlink aliases of one workspace do not split cwd authority scope", async 
 
 	// Scoping through the alias binds the canonical (realpath) authority.
 	const viaAlias = await harness.agent.listSessions({ cwd: aliasDir });
-	expect(viaAlias).toMatchObject({ sessions: [{ sessionId: "aliased", cwd: realpathDir }] });
+	expect(viaAlias).toMatchObject({
+		sessions: [{ sessionId: "aliased", cwd: realpathDir }],
+	});
 
 	// Scoping through the realpath must not conflict: both collapse to one canonical scope.
 	const viaReal = await harness.agent.listSessions({ cwd: realpathDir });
-	expect(viaReal).toMatchObject({ sessions: [{ sessionId: "aliased", cwd: realpathDir }] });
+	expect(viaReal).toMatchObject({
+		sessions: [{ sessionId: "aliased", cwd: realpathDir }],
+	});
 
 	// A lexical-only model would have treated the alias as a second scope and revoked authority.
 	await expect(harness.agent.closeSession({ sessionId: "aliased" })).resolves.toEqual({});
 	expect(harness.requests.filter(request => request.operation === "session.close")).toEqual([
-		expect.objectContaining({ idempotencyKey: `acp:session.close:aliased:${incarnation("alias-inc")}` }),
+		expect.objectContaining({
+			idempotencyKey: `acp:session.close:aliased:${incarnation("alias-inc")}`,
+		}),
 	]);
 	harness.abort.abort();
 });
@@ -521,12 +627,16 @@ test("close and delete idempotency keys are scoped to exact broker authority", a
 	await expect(harness.agent.closeSession({ sessionId: "live-1" })).resolves.toEqual({});
 	const close = harness.requests.filter(request => request.operation === "session.close")[0]!;
 	expect(close.idempotencyKey).toBe(`acp:session.close:live-1:${incarnation("live-inc")}`);
-	expect(close.input).toMatchObject({ endpointGeneration: 1, endpointIncarnation: incarnation("live-inc") });
+	expect(close.input).toMatchObject({
+		endpointGeneration: 1,
+		brokerOwnerId: "test-owner",
+		endpointIncarnation: incarnation("live-inc"),
+	});
 
 	await expect(harness.agent.deleteSession({ sessionId: "archived" })).resolves.toEqual({});
 	const remove = harness.requests.filter(request => request.operation === "session.delete")[0]!;
 	expect(remove.idempotencyKey).toMatch(/^acp:session\.delete:archived:[a-f0-9]{64}$/);
-	expect(remove.input).toMatchObject({ sessionIdentity: identity });
+	expect(remove.input).toMatchObject({ brokerOwnerId: "test-owner", sessionIdentity: identity });
 	expect(remove.input?.idempotencyKey).toBeUndefined();
 	harness.abort.abort();
 });
@@ -535,17 +645,28 @@ test("ambiguity revokes attached prompt, cancel, ext control, and reverse capabi
 	const harness = await createHarness();
 	harness.setSessions([liveSession("attached", harness.cwdA, "attached-inc")]);
 	harness.refreshEndpointClosed();
-	await harness.agent.loadSession({ sessionId: "attached", cwd: harness.cwdA, mcpServers: [] });
+	await harness.agent.loadSession({
+		sessionId: "attached",
+		cwd: harness.cwdA,
+		mcpServers: [],
+	});
 
 	// Relocate the session to a second workspace and observe it: ambiguity is terminal.
 	harness.moveSession("attached", harness.cwdB, "attached-inc-b");
 	await expect(
-		harness.agent.loadSession({ sessionId: "attached", cwd: harness.cwdB, mcpServers: [] }),
+		harness.agent.loadSession({
+			sessionId: "attached",
+			cwd: harness.cwdB,
+			mcpServers: [],
+		}),
 	).rejects.toMatchObject({ code: "conflict" });
 
 	// No prompt, cancel, ext control, or reverse capability may reach the revoked session.
 	await expect(
-		harness.agent.prompt({ sessionId: "attached", prompt: [{ type: "text", text: "again" }] }),
+		harness.agent.prompt({
+			sessionId: "attached",
+			prompt: [{ type: "text", text: "again" }],
+		}),
 	).rejects.toMatchObject({ code: "conflict" });
 	await expect(harness.agent.cancel({ sessionId: "attached" })).rejects.toMatchObject({ code: "conflict" });
 	await expect(
@@ -555,4 +676,157 @@ test("ambiguity revokes attached prompt, cancel, ext control, and reverse capabi
 			input: { on: true },
 		}),
 	).resolves.toMatchObject({ ok: false, error: { code: "conflict" } });
+});
+
+test("a same-generation successor between list and get_endpoint cannot attach", async () => {
+	const harness = await createHarness();
+	harness.setSessions([liveSession("successor", harness.cwdA, "successor-first")]);
+	harness.refreshEndpointClosed();
+
+	// Between the authority-capturing list and the post-endpoint revalidation list,
+	// the broker replaces the endpoint with a same-generation successor.
+	harness.setMutateOnGetEndpoint(() => harness.moveSession("successor", harness.cwdA, "successor-second"));
+
+	await expect(
+		harness.agent.loadSession({
+			sessionId: "successor",
+			cwd: harness.cwdA,
+			mcpServers: [],
+		}),
+	).rejects.toMatchObject({ code: "conflict" });
+
+	// The ambiguous id remains non-authorizing for the connection lifetime.
+	harness.setSessions([liveSession("successor", harness.cwdA, "successor-second")]);
+	await expect(harness.agent.closeSession({ sessionId: "successor" })).rejects.toMatchObject({ code: "conflict" });
+	harness.abort.abort();
+});
+
+test("broker restart revokes cached authority even with matching session metadata", async () => {
+	const harness = await createHarness();
+	harness.setSessions([liveSession("restart-proof", harness.cwdA, "restart-inc")]);
+	await harness.agent.listSessions({ cwd: harness.cwdA });
+
+	// A successor broker has a new random owner even when its package metadata matches.
+	harness.setBrokerIdentity({
+		ownerId: "successor-owner",
+		packageGeneration: "test",
+		startedAt: Date.now() + 1,
+	});
+
+	const closeBefore = harness.requests.filter(request => request.operation === "session.close").length;
+	await expect(harness.agent.closeSession({ sessionId: "restart-proof" })).rejects.toMatchObject({
+		code: "conflict",
+	});
+	expect(harness.requests.filter(request => request.operation === "session.close")).toHaveLength(closeBefore);
+	harness.abort.abort();
+});
+
+test("missing broker boot identity revokes cached authority before lifecycle mutation", async () => {
+	const harness = await createHarness();
+	harness.setSessions([liveSession("identity-required", harness.cwdA, "identity-required-inc")]);
+	await harness.agent.listSessions({ cwd: harness.cwdA });
+
+	harness.setBrokerIdentity({ ownerId: "", packageGeneration: "test", startedAt: Date.now() });
+	const closeBefore = harness.requests.filter(request => request.operation === "session.close").length;
+	await expect(harness.agent.closeSession({ sessionId: "identity-required" })).rejects.toMatchObject({
+		code: "unavailable",
+	});
+	expect(harness.requests.filter(request => request.operation === "session.close")).toHaveLength(closeBefore);
+	harness.abort.abort();
+});
+
+test("a held-close reverse filesystem request cannot reach the ACP client after ambiguity", async () => {
+	const harness = await createHarness();
+	const closeHeld = Promise.withResolvers<void>();
+	const originalClose = AcpSdkAdapter.prototype.close;
+	AcpSdkAdapter.prototype.close = async function () {
+		await closeHeld.promise;
+		return await originalClose.call(this);
+	};
+	try {
+		await harness.agent.initialize({
+			protocolVersion: 1,
+			clientCapabilities: { fs: { readTextFile: true } },
+		});
+		harness.setSessions([liveSession("reverse-held", harness.cwdA, "reverse-held-inc")]);
+		harness.refreshEndpointClosed();
+		await harness.agent.loadSession({
+			sessionId: "reverse-held",
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+
+		harness.sendEndpointFrame({
+			type: "reverse_request",
+			id: "rev-before",
+			connectionId: "acp-endpoint-1",
+			capability: "fs",
+			leaseId: "lease-fs",
+			payload: { method: "fs.readTextFile", payload: { path: "/before" } },
+		});
+		await waitFor(() => harness.reverseReadTextFileCalls === 1, "pre-ambiguity reverse delivery");
+
+		harness.moveSession("reverse-held", harness.cwdB, "reverse-held-inc-b");
+		await expect(
+			harness.agent.loadSession({
+				sessionId: "reverse-held",
+				cwd: harness.cwdB,
+				mcpServers: [],
+			}),
+		).rejects.toMatchObject({ code: "conflict" });
+
+		// The socket is deliberately still open because adapter.close is held.
+		// The synchronous reverse gate, not transport teardown, must deny dispatch.
+		harness.sendEndpointFrame({
+			type: "reverse_request",
+			id: "rev-after",
+			connectionId: "acp-endpoint-1",
+			capability: "fs",
+			leaseId: "lease-fs",
+			payload: { method: "fs.readTextFile", payload: { path: "/after" } },
+		});
+		await Bun.sleep(100);
+		expect(harness.reverseReadTextFileCalls).toBe(1);
+	} finally {
+		AcpSdkAdapter.prototype.close = originalClose;
+		closeHeld.resolve();
+		harness.abort.abort();
+	}
+});
+
+test("a stale saved identity blocks resume before any session.resume mutation", async () => {
+	const harness = await createHarness();
+	harness.setSessions([savedSession("stale-resume", harness.cwdA, "resume-original")]);
+	await harness.agent.listSessions({ cwd: harness.cwdA });
+
+	// The transcript is recreated under the same id and scope.
+	harness.recreateSaved("stale-resume", harness.cwdA, "resume-recreated");
+	const resumeBefore = harness.requests.filter(request => request.operation === "session.resume").length;
+	await expect(
+		harness.agent.resumeSession({
+			sessionId: "stale-resume",
+			cwd: harness.cwdA,
+			mcpServers: [],
+		}),
+	).rejects.toMatchObject({ code: "conflict" });
+	expect(harness.requests.filter(request => request.operation === "session.resume")).toHaveLength(resumeBefore);
+	harness.abort.abort();
+});
+
+test("a stale saved identity blocks fork before any session.fork mutation", async () => {
+	const harness = await createHarness();
+	harness.setSessions([savedSession("stale-fork", harness.cwdA, "fork-original")]);
+	await harness.agent.listSessions({ cwd: harness.cwdA });
+
+	harness.recreateSaved("stale-fork", harness.cwdA, "fork-recreated");
+	const forkBefore = harness.requests.filter(request => request.operation === "session.fork").length;
+	await expect(
+		harness.agent.unstable_forkSession({
+			sessionId: "stale-fork",
+			cwd: harness.cwdA,
+			mcpServers: [],
+		}),
+	).rejects.toMatchObject({ code: "conflict" });
+	expect(harness.requests.filter(request => request.operation === "session.fork")).toHaveLength(forkBefore);
+	harness.abort.abort();
 });

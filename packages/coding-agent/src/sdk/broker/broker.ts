@@ -51,10 +51,17 @@ export type BrokerResponse =
 	| { ok: true; result?: unknown; indexSeq?: number }
 	| {
 			ok: false;
-			error: { code: BrokerErrorCode; message: string; cleanup?: BrokerCleanupEvidence };
+			error: {
+				code: BrokerErrorCode;
+				message: string;
+				cleanup?: BrokerCleanupEvidence;
+			};
 			indexSeq?: number;
 	  };
-const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({ ok: false, error: { code, message } });
+const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({
+	ok: false,
+	error: { code, message },
+});
 
 type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
@@ -71,7 +78,10 @@ function normalizeAliasedString(
 	const supplied = [canonical, ...aliases].filter(name => input[name] !== undefined).map(name => input[name]);
 	if (supplied.length === 0) return { value: undefined };
 	if (supplied.some(value => typeof value !== "string" || value.length === 0))
-		return { value: undefined, error: `${canonical} must be a non-empty string` };
+		return {
+			value: undefined,
+			error: `${canonical} must be a non-empty string`,
+		};
 	const values = supplied.map(value => normalize(value as string));
 	if (values.some(value => value !== values[0])) return { value: undefined, error: `${canonical} aliases conflict` };
 	return { value: values[0] };
@@ -79,6 +89,9 @@ function normalizeAliasedString(
 
 function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
+	const brokerOwnerId = input.brokerOwnerId;
+	if (brokerOwnerId !== undefined && (typeof brokerOwnerId !== "string" || brokerOwnerId.length === 0))
+		return error("invalid_input", "brokerOwnerId must be a non-empty string");
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
 	if (session.value !== undefined) {
@@ -157,8 +170,17 @@ function canonicalJson(value: unknown): string {
 		.join(",")}}`;
 }
 
-type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
-type SavedSessionIdentity = { dev: string; ino: string; size: number; mtimeMs: number; mtimeNs: string };
+type EndpointAuthority = {
+	endpointGeneration?: number;
+	endpointIncarnation?: string;
+};
+type SavedSessionIdentity = {
+	dev: string;
+	ino: string;
+	size: number;
+	mtimeMs: number;
+	mtimeNs: string;
+};
 type BrokerListedSession = IndexedSession & {
 	canonicalCwd: string;
 	path?: string;
@@ -211,20 +233,23 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 			return cwd ? path.join(cwd, ".gjc", "state") : undefined;
 		})();
 	const id = string(input.sessionId, input.id);
+	const brokerOwnerId = string(input.brokerOwnerId);
 	switch (operation) {
 		case "session.create":
-			return { root };
+			return { root, brokerOwnerId };
 		case "session.fork":
 			return {
 				root,
+				brokerOwnerId,
 				sourceSessionId: string(input.sourceSessionId, input.sourceId),
-				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
+				sourceSessionIdentity: input.sourceSessionIdentity,
 			};
 		case "session.resume":
-			return { sessionId: id };
+			return { sessionId: id, brokerOwnerId, sessionIdentity: input.sessionIdentity };
 		case "session.close":
 			return {
 				sessionId: id,
+				brokerOwnerId,
 				endpointGeneration: input.endpointGeneration,
 				endpointIncarnation: input.endpointIncarnation,
 			};
@@ -232,11 +257,11 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 			return {
 				sessionId: id,
 				cwd: input.cwd,
-				sessionPath: input.sessionPath,
+				brokerOwnerId,
 				sessionIdentity: input.sessionIdentity,
 			};
 		default:
-			return { operation, root, sessionId: id };
+			return { operation, root, sessionId: id, brokerOwnerId };
 	}
 }
 
@@ -263,7 +288,12 @@ export class Broker {
 	#heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	#heartbeatWrite: Promise<void> = Promise.resolve();
 	constructor(settings: BrokerSettings) {
-		this.settings = { packageGeneration: "unknown", port: 0, heartbeatTtlMs: BROKER_HEARTBEAT_TTL_MS, ...settings };
+		this.settings = {
+			packageGeneration: "unknown",
+			port: 0,
+			heartbeatTtlMs: BROKER_HEARTBEAT_TTL_MS,
+			...settings,
+		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
@@ -281,9 +311,16 @@ export class Broker {
 				Number.isInteger(lock.pid) &&
 				lock.pid > 0
 			)
-				return { ownerId: lock.ownerId, pid: lock.pid, identity: `owner:${lock.ownerId}` };
+				return {
+					ownerId: lock.ownerId,
+					pid: lock.pid,
+					identity: `owner:${lock.ownerId}`,
+				};
 		} catch {}
-		return { pid: 0, identity: `contents:${createHash("sha256").update(raw).digest("hex")}` };
+		return {
+			pid: 0,
+			identity: `contents:${createHash("sha256").update(raw).digest("hex")}`,
+		};
 	}
 	async #readLock(): Promise<BrokerLockSnapshot | null> {
 		try {
@@ -313,7 +350,12 @@ export class Broker {
 		try {
 			await fs.writeFile(
 				this.#lockRecordPath(),
-				JSON.stringify({ version: 1, ownerId: this.#owner, pid: process.pid, acquiredAt: Date.now() }),
+				JSON.stringify({
+					version: 1,
+					ownerId: this.#owner,
+					pid: process.pid,
+					acquiredAt: Date.now(),
+				}),
 				{ flag: "wx", mode: 0o600 },
 			);
 		} catch (e) {
@@ -500,7 +542,16 @@ export class Broker {
 			const current = this.index.listSessions().sessions.find(session => session.sessionId === record.sessionId);
 			if (!current || !sameEndpointRecord(record, current) || !matchesEndpointAuthority(current, authority))
 				return error("endpoint_stale", "session endpoint is stale");
-			return { ok: true, result: endpoint };
+			const currentIncarnation = endpointIncarnation(current, current.sessionId);
+			if (!currentIncarnation) return error("endpoint_stale", "session endpoint incarnation is unavailable");
+			return {
+				ok: true,
+				result: {
+					...endpoint,
+					endpointGeneration: current.endpointGeneration,
+					endpointIncarnation: currentIncarnation,
+				},
+			};
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code === "ENOENT")
 				return error("resource_gone", "session endpoint record is gone");
@@ -516,9 +567,16 @@ export class Broker {
 		}
 	}
 	/** Immutable transcript file identity for saved-session authority. */
-	async #transcriptIdentity(
-		transcriptPath: string,
-	): Promise<{ dev: string; ino: string; size: number; mtimeMs: number; mtimeNs: string } | undefined> {
+	async #transcriptIdentity(transcriptPath: string): Promise<
+		| {
+				dev: string;
+				ino: string;
+				size: number;
+				mtimeMs: number;
+				mtimeNs: string;
+		  }
+		| undefined
+	> {
 		try {
 			const stat = await fs.stat(transcriptPath, { bigint: true });
 			return {
@@ -580,7 +638,12 @@ export class Broker {
 				return {
 					...session,
 					canonicalCwd,
-					...(savedAuthority ? { path: savedAuthority.path, sessionIdentity: savedAuthority.identity } : {}),
+					...(savedAuthority
+						? {
+								path: savedAuthority.path,
+								sessionIdentity: savedAuthority.identity,
+							}
+						: {}),
 				};
 			}),
 		);
@@ -594,6 +657,8 @@ export class Broker {
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
+		if (input.brokerOwnerId !== undefined && (!this.discovery || input.brokerOwnerId !== this.discovery.ownerId))
+			return error("endpoint_stale", "broker boot authority is stale");
 		if (operation === "session.list") {
 			await this.index.refresh();
 			const indexed = this.index.listSessions();
@@ -616,6 +681,15 @@ export class Broker {
 				...(observations.length ? { observations } : {}),
 				warnings: indexed.warnings,
 				...(canonicalCwd ? { canonicalCwd } : {}),
+				...(this.discovery
+					? {
+							brokerIdentity: {
+								ownerId: this.discovery.ownerId,
+								packageGeneration: this.discovery.packageGeneration,
+								startedAt: this.discovery.startedAt,
+							},
+						}
+					: {}),
 			};
 			if (resolveSessionId && cwd) {
 				const sessionDir = SessionManager.getDefaultSessionDir(cwd, this.settings.agentDir);
@@ -629,7 +703,11 @@ export class Broker {
 						...(sessionIdentity ? { sessionIdentity } : {}),
 					};
 				}
-				return { ok: true, result: { ...result, savedSession }, indexSeq: result.indexSeq };
+				return {
+					ok: true,
+					result: { ...result, savedSession },
+					indexSeq: result.indexSeq,
+				};
 			}
 			return { ok: true, result, indexSeq: result.indexSeq };
 		}

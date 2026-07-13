@@ -16,7 +16,13 @@ type TestServer = {
 const directories: string[] = [];
 const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
 
-const SAVED_IDENTITY = { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "4000000" };
+const SAVED_IDENTITY = {
+	dev: "1",
+	ino: "2",
+	size: 3,
+	mtimeMs: 4,
+	mtimeNs: "4000000",
+};
 afterEach(async () => {
 	for (const server of servers.splice(0)) server.stop(true);
 	for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
@@ -45,6 +51,7 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 	const agentDir = path.join(directory, ".gjc", "agent");
 	const token = "acp-broker-token";
 	const requests: Array<Record<string, unknown>> = [];
+	const brokerStartedAt = Date.now();
 	let server!: TestServer;
 	server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -61,7 +68,21 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				requests.push(frame);
-				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+				socket.send(
+					JSON.stringify({
+						type: "broker_response",
+						id: frame.id,
+						ok: true,
+						result: {
+							sessions: [],
+							brokerIdentity: {
+								ownerId: "test-owner",
+								packageGeneration: "test",
+								startedAt: brokerStartedAt,
+							},
+						},
+					}),
+				);
 			},
 		},
 	});
@@ -82,11 +103,17 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, { agentDir });
-	const result = await agent.extMethod("_gjc/sdk/global", { operation: "session.list" });
+	const result = await agent.extMethod("_gjc/sdk/global", {
+		operation: "session.list",
+	});
 
 	expect(result).toMatchObject({ ok: true, result: { sessions: [] } });
 	expect(requests).toEqual([
-		expect.objectContaining({ type: "broker_request", operation: "session.list", input: {} }),
+		expect.objectContaining({
+			type: "broker_request",
+			operation: "session.list",
+			input: {},
+		}),
 	]);
 	expect(requests[0]).not.toHaveProperty("sessionId");
 	const lifecycle = await agent.extMethod("_gjc/sdk/global", {
@@ -94,7 +121,10 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 		input: { cwd: directory },
 		idempotencyKey: "must-not-reach-broker",
 	});
-	expect(lifecycle).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
+	expect(lifecycle).toMatchObject({
+		ok: false,
+		error: { code: "operation_prohibited" },
+	});
 	expect(JSON.stringify(lifecycle)).not.toContain(token);
 	expect(requests).toHaveLength(1);
 	abort.abort();
@@ -107,13 +137,19 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const cwd = path.join(directory, "workspace");
 	const token = "acp-contract-token";
 	let brokerSessions: Record<string, unknown>[] = [
-		{ sessionId: "owned-session", locator: { repo: cwd }, live: true, endpointGeneration: 1 },
+		{
+			sessionId: "owned-session",
+			locator: { repo: cwd },
+			live: true,
+			endpointGeneration: 1,
+		},
 	];
 	const ownedEndpointIncarnation = endpointIncarnation(
 		{ endpointGeneration: 1, pid: process.pid, endpointMtimeMs: 1 },
 		"owned-session",
 	)!;
 	const lifecycleInputs: Record<string, unknown>[] = [];
+	const contractBrokerStartedAt = Date.now();
 	const brokerRequests: Record<string, unknown>[] = [];
 	const promptInputs: Record<string, unknown>[] = [];
 	const controlOperations: string[] = [];
@@ -143,7 +179,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 				if (frame.type === "register_provider") {
 					providerRegistrations.push(frame);
 					socket.send(
-						JSON.stringify({ type: "register_provider_result", id: frame.id, ok: true, leaseId: "lease" }),
+						JSON.stringify({
+							type: "register_provider_result",
+							id: frame.id,
+							ok: true,
+							leaseId: "lease",
+						}),
 					);
 					return;
 				}
@@ -190,8 +231,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								type: "broker_response",
 								id: frame.id,
 								ok: true,
-								result:
-									input.resolveSessionId === "owned-session"
+								result: {
+									brokerIdentity: {
+										ownerId: "test-owner",
+										packageGeneration: "test",
+										startedAt: contractBrokerStartedAt,
+									},
+									...(input.resolveSessionId === "owned-session"
 										? {
 												canonicalCwd: path.resolve(typeof input.cwd === "string" ? input.cwd : cwd),
 												savedSession: {
@@ -203,7 +249,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 										: {
 												canonicalCwd: path.resolve(typeof input.cwd === "string" ? input.cwd : cwd),
 												sessions,
-											},
+											}),
+								},
 							}),
 						);
 						return;
@@ -228,7 +275,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 						respond();
 						return;
 					}
-					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
+					socket.send(
+						JSON.stringify({
+							type: "broker_response",
+							id: frame.id,
+							ok: true,
+							result: {},
+						}),
+					);
 					return;
 				}
 				if (frame.type === "query_request") {
@@ -238,7 +292,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								type: "query_response",
 								id: frame.id,
 								ok: true,
-								result: { usage: { tokens: 0, contextWindow: 200_000, percent: 0, source: "provider_anchor" } },
+								result: {
+									usage: {
+										tokens: 0,
+										contextWindow: 200_000,
+										percent: 0,
+										source: "provider_anchor",
+									},
+								},
 							}),
 						);
 						return;
@@ -265,7 +326,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 										]
 									: [];
 					socket.send(
-						JSON.stringify({ type: "query_response", id: frame.id, ok: true, result: { page: { items } } }),
+						JSON.stringify({
+							type: "query_response",
+							id: frame.id,
+							ok: true,
+							result: { page: { items } },
+						}),
 					);
 					return;
 				}
@@ -277,9 +343,21 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 						// This real-host activity frame precedes acknowledgement, so it must
 						// not settle a normal fresh prompt below the acknowledgement boundary.
 						if (promptInputs.length === 1)
-							socket.send(JSON.stringify({ type: "activity", sessionId: "owned-session", state: "idle" }));
+							socket.send(
+								JSON.stringify({
+									type: "activity",
+									sessionId: "owned-session",
+									state: "idle",
+								}),
+							);
 						if (promptDeliveredWhileBusy)
-							socket.send(JSON.stringify({ type: "activity", sessionId: "owned-session", state: "busy" }));
+							socket.send(
+								JSON.stringify({
+									type: "activity",
+									sessionId: "owned-session",
+									state: "busy",
+								}),
+							);
 					}
 					socket.send(
 						JSON.stringify({
@@ -288,7 +366,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 							ok: true,
 							result:
 								frame.operation === "turn.prompt"
-									? { commandId: "prompt-command", turnId: "prompt-turn", accepted: true }
+									? {
+											commandId: "prompt-command",
+											turnId: "prompt-turn",
+											accepted: true,
+										}
 									: frame.operation === "turn.abort"
 										? { aborted: abortAcknowledged }
 										: {},
@@ -336,7 +418,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		.prompt({
 			sessionId: created.sessionId,
 			prompt: [
-				{ type: "resource_link", name: "README", uri: "file:///workspace/README.md" },
+				{
+					type: "resource_link",
+					name: "README",
+					uri: "file:///workspace/README.md",
+				},
 				{ type: "image", data: "image-bytes", mimeType: "image/png" },
 			],
 		})
@@ -350,7 +436,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		images: [{ data: "image-bytes", mimeType: "image/png" }],
 	});
 	await expect(
-		agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "second" }] }),
+		agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "second" }],
+		}),
 	).rejects.toThrow("ACP session already has an active prompt.");
 	await Bun.sleep(20);
 	expect(firstSettled).toBe(false);
@@ -365,18 +454,45 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	);
 	await Bun.sleep(20);
 	expect(firstSettled).toBe(false);
-	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "activity",
+			sessionId: created.sessionId,
+			state: "idle",
+		}),
+	);
 	await Bun.sleep(20);
 	expect(firstSettled).toBe(false);
-	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
-	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
-	expect(await bounded(firstPrompt, "first prompt completion")).toEqual({ stopReason: "end_turn" });
+	promptSocket!.send(
+		JSON.stringify({
+			type: "activity",
+			sessionId: created.sessionId,
+			state: "busy",
+		}),
+	);
+	promptSocket!.send(
+		JSON.stringify({
+			type: "activity",
+			sessionId: created.sessionId,
+			state: "idle",
+		}),
+	);
+	expect(await bounded(firstPrompt, "first prompt completion")).toEqual({
+		stopReason: "end_turn",
+	});
 	const usageUpdate = updates.find(update => update.update.sessionUpdate === "usage_update");
-	expect(usageUpdate?.update).toMatchObject({ sessionUpdate: "usage_update", size: 200_000, used: 0 });
+	expect(usageUpdate?.update).toMatchObject({
+		sessionUpdate: "usage_update",
+		size: 200_000,
+		used: 0,
+	});
 
 	let cancelledSettled = false;
 	const cancelledPrompt = agent
-		.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "cancel me" }] })
+		.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "cancel me" }],
+		})
 		.then(value => {
 			cancelledSettled = true;
 			return value;
@@ -386,8 +502,20 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(controlOperations).toContain("turn.abort");
 	await Bun.sleep(20);
 	expect(cancelledSettled).toBe(false);
-	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
-	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "activity",
+			sessionId: created.sessionId,
+			state: "busy",
+		}),
+	);
+	promptSocket!.send(
+		JSON.stringify({
+			type: "activity",
+			sessionId: created.sessionId,
+			state: "idle",
+		}),
+	);
 	expect(await bounded(cancelledPrompt, "cancelled prompt completion")).toEqual({ stopReason: "cancelled" });
 	expect(
 		updates.filter(update => {
@@ -410,18 +538,41 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await expect(
 		bounded(agent.cancel({ sessionId: created.sessionId }), "failed cancel acknowledgement"),
 	).rejects.toThrow("SDK did not acknowledge cancellation");
-	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
-	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "activity",
+			sessionId: created.sessionId,
+			state: "busy",
+		}),
+	);
+	promptSocket!.send(
+		JSON.stringify({
+			type: "activity",
+			sessionId: created.sessionId,
+			state: "idle",
+		}),
+	);
 	expect(await bounded(abortFailurePrompt, "abort-failure prompt completion")).toEqual({ stopReason: "end_turn" });
 	abortAcknowledged = true;
 	promptDeliveredWhileBusy = true;
-	const steeringPrompt = agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "steer me" }] });
+	const steeringPrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "steer me" }],
+	});
 	await waitFor(() => promptInputs.length === 4, "steering prompt delivery");
 	promptDeliveredWhileBusy = false;
 	// The host sent busy before the acknowledgement. The first valid idle after
 	// that boundary must finish the steering prompt without a second busy frame.
-	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
-	expect(await bounded(steeringPrompt, "steering prompt completion")).toEqual({ stopReason: "end_turn" });
+	promptSocket!.send(
+		JSON.stringify({
+			type: "activity",
+			sessionId: created.sessionId,
+			state: "idle",
+		}),
+	);
+	expect(await bounded(steeringPrompt, "steering prompt completion")).toEqual({
+		stopReason: "end_turn",
+	});
 
 	await expect(
 		agent.prompt({
@@ -429,13 +580,20 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			prompt: [
 				{
 					type: "resource",
-					resource: { uri: "file:///workspace/archive.bin", blob: "bytes", mimeType: "application/octet-stream" },
+					resource: {
+						uri: "file:///workspace/archive.bin",
+						blob: "bytes",
+						mimeType: "application/octet-stream",
+					},
 				},
 			],
 		}),
 	).rejects.toThrow("Unsupported embedded resource MIME type");
 	await expect(
-		agent.newSession({ cwd, mcpServers: [{ type: "http", name: "unavailable", url: "http://127.0.0.1" }] as never }),
+		agent.newSession({
+			cwd,
+			mcpServers: [{ type: "http", name: "unavailable", url: "http://127.0.0.1" }] as never,
+		}),
 	).rejects.toThrow("MCP servers are unsupported under SDK-backed ACP.");
 
 	const observerAbort = new AbortController();
@@ -469,7 +627,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 				update: expect.objectContaining({
 					sessionUpdate: "session_info_update",
 					_meta: {
-						gjcTranscriptImageReplay: { available: false, reason: "historical_transcript_images_unavailable" },
+						gjcTranscriptImageReplay: {
+							available: false,
+							reason: "historical_transcript_images_unavailable",
+						},
 					},
 				}),
 			}),
@@ -489,14 +650,25 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await bounded(
 		Promise.all([
 			loader.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
-			loader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+			loader.resumeSession({
+				sessionId: created.sessionId,
+				cwd,
+				mcpServers: [],
+			}),
 		]),
 		"concurrent live attach",
 	);
 	const liveAttachRequests = brokerRequests.slice(brokerRequestsBeforeLiveAttach);
 	expect(liveAttachRequests.filter(request => request.operation === "session.resume")).toHaveLength(0);
 	expect(liveAttachRequests.filter(request => request.operation === "session.get_endpoint")).toEqual([
-		expect.objectContaining({ input: { sessionId: created.sessionId, endpointGeneration: 1 } }),
+		expect.objectContaining({
+			input: {
+				sessionId: created.sessionId,
+				brokerOwnerId: "test-owner",
+				endpointGeneration: 1,
+				endpointIncarnation: ownedEndpointIncarnation,
+			},
+		}),
 	]);
 	expect(providerRegistrations).toHaveLength(registrationsBeforeLiveAttach + 2);
 	const crossScopeAbort = new AbortController();
@@ -531,7 +703,9 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		reason: expect.objectContaining({ code: "conflict" }),
 	});
 	if (ownedAttachResult.status === "rejected")
-		expect(ownedAttachResult.reason).toMatchObject({ code: expect.stringMatching(/conflict|connection_closed/) });
+		expect(ownedAttachResult.reason).toMatchObject({
+			code: expect.stringMatching(/conflict|connection_closed/),
+		});
 	const brokerRequestsAfterConflict = brokerRequests.length;
 	await expect(crossScopeLoader.closeSession({ sessionId: created.sessionId })).rejects.toMatchObject({
 		code: "conflict",
@@ -540,12 +714,19 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	crossScopeAbort.abort();
 	const racingAbort = new AbortController();
 	const racingLoader = new AcpAgent(
-		{ signal: racingAbort.signal, closed: Promise.withResolvers<void>().promise } as unknown as AgentSideConnection,
+		{
+			signal: racingAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
 		{ agentDir },
 	);
 	await bounded(racingLoader.listSessions({ cwd }), "scope racing loader");
 	holdEndpointResponse = true;
-	const staleAttach = racingLoader.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] });
+	const staleAttach = racingLoader.loadSession({
+		sessionId: created.sessionId,
+		cwd,
+		mcpServers: [],
+	});
 	await waitFor(() => releaseEndpointResponse !== undefined, "held endpoint response");
 	await bounded(racingLoader.closeSession({ sessionId: created.sessionId }), "close racing loader");
 	holdEndpointResponse = false;
@@ -553,30 +734,54 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	releaseEndpointResponse = undefined;
 	await expect(bounded(staleAttach, "stale attachment rejection")).rejects.toThrow("closed while attaching");
 	await expect(
-		racingLoader.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "stale" }] }),
+		racingLoader.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "stale" }],
+		}),
 	).rejects.toThrow("Unsupported ACP session");
 	racingAbort.abort();
 
 	brokerSessions = [
-		{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 },
-		{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 2 },
+		{
+			sessionId: created.sessionId,
+			locator: { repo: cwd },
+			live: true,
+			endpointGeneration: 1,
+		},
+		{
+			sessionId: created.sessionId,
+			locator: { repo: cwd },
+			live: true,
+			endpointGeneration: 2,
+		},
 	];
 	const conflictAbort = new AbortController();
 	const conflictingLoader = new AcpAgent(
-		{ signal: conflictAbort.signal, closed: Promise.withResolvers<void>().promise } as unknown as AgentSideConnection,
+		{
+			signal: conflictAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
 		{ agentDir },
 	);
 	const brokerRequestsBeforeConflict = brokerRequests.length;
-	await expect(conflictingLoader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] })).rejects.toThrow(
-		"Broker returned ambiguous session authority",
-	);
+	await expect(
+		conflictingLoader.resumeSession({
+			sessionId: created.sessionId,
+			cwd,
+			mcpServers: [],
+		}),
+	).rejects.toThrow("Broker returned ambiguous session authority");
 	expect(brokerRequests.slice(brokerRequestsBeforeConflict)).toEqual([
 		expect.objectContaining({ operation: "session.list", input: { cwd } }),
 	]);
 	conflictAbort.abort();
 
 	brokerSessions = [
-		{ sessionId: created.sessionId, locator: { repo: path.join(directory, "other-workspace") }, live: true },
+		{
+			sessionId: created.sessionId,
+			locator: { repo: path.join(directory, "other-workspace") },
+			live: true,
+		},
 	];
 	const scopeConflictAbort = new AbortController();
 	const scopeConflictingLoader = new AcpAgent(
@@ -588,14 +793,28 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	);
 	const brokerRequestsBeforeScopeConflict = brokerRequests.length;
 	await expect(
-		scopeConflictingLoader.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		scopeConflictingLoader.loadSession({
+			sessionId: created.sessionId,
+			cwd,
+			mcpServers: [],
+		}),
 	).rejects.toThrow("Broker returned ambiguous session authority");
 	expect(brokerRequests.slice(brokerRequestsBeforeScopeConflict)).toEqual([
 		expect.objectContaining({ operation: "session.list", input: { cwd } }),
 	]);
 	scopeConflictAbort.abort();
-	brokerSessions = [{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 }];
-	const deletingPrompt = agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "delete me" }] });
+	brokerSessions = [
+		{
+			sessionId: created.sessionId,
+			locator: { repo: cwd },
+			live: true,
+			endpointGeneration: 1,
+		},
+	];
+	const deletingPrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "delete me" }],
+	});
 	const deletingPromptError = deletingPrompt.then(
 		() => undefined,
 		(error: unknown) => error,
@@ -617,7 +836,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			idempotencyKey: expect.stringMatching(new RegExp(`^acp:session\\.delete:${created.sessionId}:[a-f0-9]{64}$`)),
 		}),
 	);
-	brokerSessions = [{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 }];
+	brokerSessions = [
+		{
+			sessionId: created.sessionId,
+			locator: { repo: cwd },
+			live: true,
+			endpointGeneration: 1,
+		},
+	];
 	const frameFailureAbort = new AbortController();
 	let rejectFrameUpdates = false;
 	let frameBootstrapPublished = false;
@@ -633,7 +859,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		{ agentDir },
 	);
 	await bounded(
-		frameFailureAgent.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		frameFailureAgent.resumeSession({
+			sessionId: created.sessionId,
+			cwd,
+			mcpServers: [],
+		}),
 		"frame failure attach",
 	);
 	await waitFor(() => frameBootstrapPublished, "frame failure bootstrap");
@@ -646,7 +876,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	promptSocket!.send(
 		JSON.stringify({
 			type: "event",
-			payload: { event: { type: "auto_compaction_start", reason: "manual", action: "manual" } },
+			payload: {
+				event: {
+					type: "auto_compaction_start",
+					reason: "manual",
+					action: "manual",
+				},
+			},
 		}),
 	);
 	await expect(bounded(frameFailurePrompt, "frame failure prompt rejection")).rejects.toMatchObject({
@@ -654,7 +890,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		message: "ACP session frame processing failed: delivery broke",
 	});
 	await expect(
-		frameFailureAgent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "closed" }] }),
+		frameFailureAgent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "closed" }],
+		}),
 	).rejects.toThrow("Unsupported ACP session");
 	frameFailureAbort.abort();
 	loaderAbort.abort();

@@ -69,7 +69,16 @@ describe("SDK broker WebSocket transport", () => {
 				type: "broker_response",
 				id: "list",
 				ok: true,
-				result: { indexSeq: 0, sessions: [], warnings: [] },
+				result: {
+					indexSeq: 0,
+					sessions: [],
+					warnings: [],
+					brokerIdentity: {
+						ownerId: discovery.ownerId,
+						packageGeneration: discovery.packageGeneration,
+						startedAt: discovery.startedAt,
+					},
+				},
 				indexSeq: 0,
 			});
 			ws.send(
@@ -122,7 +131,16 @@ describe("SDK broker WebSocket transport", () => {
 				type: "broker_response",
 				id: "healthy-list",
 				ok: true,
-				result: { indexSeq: 0, sessions: [], warnings: [] },
+				result: {
+					indexSeq: 0,
+					sessions: [],
+					warnings: [],
+					brokerIdentity: {
+						ownerId: discovery.ownerId,
+						packageGeneration: discovery.packageGeneration,
+						startedAt: discovery.startedAt,
+					},
+				},
 				indexSeq: 0,
 			});
 			oversizedClient.close();

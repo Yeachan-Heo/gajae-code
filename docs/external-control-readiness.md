@@ -19,7 +19,7 @@ The SDK endpoint is loopback-only and is created with the session. It provides t
 ## ACP readiness
 
 ACP remains a stdio editor protocol. Its session control uses the SDK adapter internally; it is not a replacement external bot-control protocol.
-One ACP connection may manage sessions from multiple absolute working directories. The SDK broker issues realpath-equivalent workspace identities plus exact live-endpoint and saved-transcript authority; ACP echoes those identities for CWD-less close/delete and scopes lifecycle idempotency to the same incarnation. Conflicting workspaces, duplicate live observations, successor generations, recreated transcripts, or authority drift permanently revoke that session ID and any attached ACP control for the connection.
+One ACP connection may manage sessions from multiple absolute working directories. The SDK broker issues a realpath-equivalent workspace scope, a per-boot owner identity, exact live-endpoint generation/incarnation, and full saved-transcript file identity. ACP carries those capabilities through live attach/close and saved delete/resume/fork, and scopes lifecycle idempotency to the same endpoint or transcript incarnation. Missing or changed broker ownership, conflicting workspaces, duplicate live observations, successor generations, or recreated transcripts synchronously invalidate the session authority and reverse capabilities before asynchronous adapter teardown.
 
 ## Verification references
 

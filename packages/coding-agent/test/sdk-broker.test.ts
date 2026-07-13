@@ -410,7 +410,13 @@ describe("SDK broker identity and discovery", () => {
 			}),
 		).toEqual({
 			ok: true,
-			result: { sessionId: "s", pid: process.pid, token: "session-secret" },
+			result: {
+				sessionId: "s",
+				pid: process.pid,
+				token: "session-secret",
+				endpointGeneration: 3,
+				endpointIncarnation,
+			},
 		});
 		expect(
 			await broker.handleRequest("session.get_endpoint", {

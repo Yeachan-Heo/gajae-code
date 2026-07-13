@@ -161,6 +161,20 @@ export interface SessionStorageFileIdentity {
 	ino: bigint;
 }
 
+/**
+ * Full five-field transcript file identity (dev, ino, size, mtimeMs, mtimeNs).
+ * Preserved end-to-end from broker validation through {@link deleteSessionVerified};
+ * every field is revalidated immediately before the unlink/rename delete effect so
+ * an in-place-modified transcript (same dev/ino, changed size/mtime) cannot be deleted.
+ */
+export interface SessionStorageTranscriptIdentity {
+	dev: bigint;
+	ino: bigint;
+	size: number;
+	mtimeMs: number;
+	mtimeNs: bigint;
+}
+
 /** Kind of verification failure surfaced by {@link deleteSessionVerified}. */
 export type VerifiedDeleteFailureKind =
 	| "containment"
@@ -201,8 +215,8 @@ export interface VerifiedSessionDeleteTarget {
 	sessionId: string;
 	/** Expected canonical cwd parsed from the header. */
 	cwd: string;
-	/** Expected transcript file `(dev, ino)` captured at authorization. */
-	transcriptIdentity: SessionStorageFileIdentity;
+	/** Full transcript file identity (dev, ino, size, mtimeMs, mtimeNs) captured at authorization. */
+	transcriptIdentity: SessionStorageTranscriptIdentity;
 	/**
 	 * For retry after an `artifacts` `cleanup_pending`: the recorded artifact
 	 * directory identity to re-accept. A replacement/different artifact directory
@@ -530,7 +544,7 @@ export class FileSessionStorage implements SessionStorage {
 		}
 		const initial = this.#verifiedReadAndHeader(transcriptPath, sessionId, cwd);
 		const initialStat = initial.snapshot.stat;
-		if (initialStat.dev !== transcriptIdentity.dev || initialStat.ino !== transcriptIdentity.ino) {
+		if (!sameVerifiedTranscriptStat(initialStat, transcriptIdentity)) {
 			throw new SessionDeleteVerificationError("identity", "Transcript identity does not match authorization");
 		}
 		const parentIdentity = this.#directoryIdentity(path.dirname(transcriptPath));
@@ -563,10 +577,10 @@ export class FileSessionStorage implements SessionStorage {
 
 		const revalidate = this.#verifiedReadAndHeader(transcriptPath, sessionId, cwd);
 		const revalidateStat = revalidate.snapshot.stat;
-		if (revalidateStat.dev !== initialStat.dev || revalidateStat.ino !== initialStat.ino) {
+		if (!sameVerifiedTranscriptStat(revalidateStat, transcriptIdentity)) {
 			throw new SessionDeleteVerificationError(
 				"identity",
-				"Transcript identity changed after artifact removal (replacement detected)",
+				"Transcript identity does not match authorization after artifact removal",
 			);
 		}
 		const parentIdentityNow = this.#directoryIdentity(path.dirname(transcriptPath));
@@ -582,7 +596,10 @@ export class FileSessionStorage implements SessionStorage {
 				kind: "cleanup_pending",
 				phase: "transcript",
 				error: toError(err),
-				transcriptIdentity: { dev: revalidateStat.dev, ino: revalidateStat.ino },
+				transcriptIdentity: {
+					dev: revalidateStat.dev,
+					ino: revalidateStat.ino,
+				},
 			};
 		}
 		return { kind: "deleted" };
@@ -686,6 +703,17 @@ function matchesPattern(name: string, pattern: string): boolean {
 		return name.endsWith(pattern.slice(1));
 	}
 	return name === pattern;
+}
+
+/** True when a live transcript stat matches every authorization field (all five). */
+function sameVerifiedTranscriptStat(stat: SessionStorageStat, identity: SessionStorageTranscriptIdentity): boolean {
+	return (
+		stat.dev === identity.dev &&
+		stat.ino === identity.ino &&
+		stat.size === identity.size &&
+		stat.mtimeMs === identity.mtimeMs &&
+		stat.mtimeNs === identity.mtimeNs
+	);
 }
 
 class MemorySessionStorageWriter implements SessionStorageWriter {
@@ -922,7 +950,7 @@ export class MemorySessionStorage implements SessionStorage {
 		const entry = this.#files.get(transcriptPath);
 		if (!entry) return Promise.resolve({ kind: "deleted" });
 		const snapshot = this.readSnapshotSync(transcriptPath);
-		if (snapshot.stat.dev !== transcriptIdentity.dev || snapshot.stat.ino !== transcriptIdentity.ino) {
+		if (!sameVerifiedTranscriptStat(snapshot.stat, transcriptIdentity)) {
 			return Promise.reject(new SessionDeleteVerificationError("identity", "Transcript identity mismatch"));
 		}
 		const header = parseFirstJsonlLine(snapshot.bytes);
