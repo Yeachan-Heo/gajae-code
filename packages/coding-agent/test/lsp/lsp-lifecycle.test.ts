@@ -2,7 +2,13 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getOrCreateClient, sendRequest, shutdownAll, waitForProjectLoaded } from "../../src/lsp/client";
+import {
+	getOrCreateClient,
+	sendNotification,
+	sendRequest,
+	shutdownAll,
+	waitForProjectLoaded,
+} from "../../src/lsp/client";
 import type { ServerConfig } from "../../src/lsp/types";
 import { disposeAllOwnedProcesses } from "../../src/runtime/process-lifecycle";
 
@@ -12,6 +18,16 @@ const ORIGINAL_XDG_CONFIG_HOME = Bun.env.XDG_CONFIG_HOME;
 
 async function tempDir(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix));
+}
+
+async function captureError(promise: Promise<unknown>): Promise<Error> {
+	try {
+		await promise;
+	} catch (error) {
+		if (error instanceof Error) return error;
+		throw error;
+	}
+	throw new Error("Expected promise to reject");
 }
 
 function serverConfig(command: string, args: string[] = []): ServerConfig {
@@ -73,6 +89,61 @@ describe("LSP lifecycle behavior", () => {
 			const secondExitCode = await second.proc.exited;
 			expect(secondExitCode).not.toBeNull();
 			expect(first.pendingRequests.size).toBe(0);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		"EPIPE",
+		"ERR_STREAM_DESTROYED",
+	] as const)("terminalizes and evicts a client when its owned stdin sink reports %s", async code => {
+		const cwd = await tempDir("gjc-lsp-peer-close-");
+		try {
+			const script = await writeFakeLspServer(cwd);
+			const config = serverConfig(BUN, [script]);
+			const first = await getOrCreateClient(config, cwd, 1_000);
+			const serializationError = Object.assign(new Error("serialization failed"), { code });
+			const params = {
+				toJSON(): never {
+					throw serializationError;
+				},
+			};
+			expect(await captureError(sendNotification(first, "test/serialization", params))).toBe(serializationError);
+
+			const pending = captureError(sendRequest(first, "workspace/neverResponds", null, undefined, 60_000));
+			expect(first.pendingRequests.size).toBe(1);
+			await Bun.sleep(10);
+
+			const unrelatedSinkError = Object.assign(new Error("unrelated sink failure"), { code: "EIO" });
+			Object.defineProperty(first.proc.stdin, "flush", {
+				configurable: true,
+				value: async () => {
+					throw unrelatedSinkError;
+				},
+			});
+			expect(await captureError(sendNotification(first, "test/unrelatedFailure", {}))).toBe(unrelatedSinkError);
+			expect(first.pendingRequests.size).toBe(1);
+
+			const peerClosedError = Object.assign(new Error("peer closed"), { code });
+			Object.defineProperty(first.proc.stdin, "flush", {
+				configurable: true,
+				value: async () => {
+					throw peerClosedError;
+				},
+			});
+			await sendNotification(first, "test/afterClose", {});
+			const pendingError = await pending;
+			expect(pendingError.message).toBe("LSP transport closed");
+			expect(pendingError.cause).toBe(peerClosedError);
+			expect(first.pendingRequests.size).toBe(0);
+
+			const staleRequestError = await captureError(sendRequest(first, "test/stale", null));
+			expect(staleRequestError).toBe(pendingError);
+
+			const second = await getOrCreateClient(config, cwd, 1_000);
+			expect(second).not.toBe(first);
+			expect(second.proc.exitCode).toBeNull();
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}

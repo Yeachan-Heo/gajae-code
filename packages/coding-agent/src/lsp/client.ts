@@ -1,4 +1,4 @@
-import { isEnoent, logger, untilAborted } from "@gajae-code/utils";
+import { isEnoent, isKnownSinkPeerClosedError, logger, untilAborted } from "@gajae-code/utils";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { registerResourceOwner, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
@@ -23,6 +23,8 @@ const clients = new Map<string, LspClient>();
 const killedClients = new WeakSet<LspClient>();
 const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
+const transportClosedErrors = new WeakMap<LspClient, Error>();
+const LSP_TRANSPORT_CLOSED_MESSAGE = "LSP transport closed";
 const lspCleanupOwner = registerResourceOwner("lsp:clients", shutdownAll);
 
 // Idle timeout configuration (disabled by default)
@@ -93,6 +95,21 @@ function evictDeadCachedClient(key: string, client: LspClient): void {
 	deleteCachedClient(key, client);
 	client.resolveProjectLoaded();
 	rejectPendingRequests(client, new Error("LSP server exited"));
+}
+
+function terminalizeTransport(client: LspClient, cause: unknown): Error {
+	const existingError = transportClosedErrors.get(client);
+	if (existingError) return existingError;
+
+	const error = new Error(LSP_TRANSPORT_CLOSED_MESSAGE, { cause });
+	transportClosedErrors.set(client, error);
+	deleteCachedClient(client.name, client);
+	client.resolveProjectLoaded();
+	rejectPendingRequests(client, error);
+	void client.owner?.dispose().catch(disposeError => {
+		logger.debug("Failed to dispose terminal LSP transport owner", { error: String(disposeError) });
+	});
+	return error;
 }
 // =============================================================================
 // Client Capabilities
@@ -250,19 +267,29 @@ function findHeaderEnd(buffer: Uint8Array): number {
 }
 
 async function writeMessage(
-	sink: Bun.FileSink,
+	client: LspClient,
 	message: LspJsonRpcRequest | LspJsonRpcNotification | LspJsonRpcResponse,
 ): Promise<void> {
 	const content = JSON.stringify(message);
-	sink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
-	await sink.flush();
+	const terminalError = transportClosedErrors.get(client);
+	if (terminalError) throw terminalError;
+
+	try {
+		client.proc.stdin.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
+		await client.proc.stdin.flush();
+	} catch (error) {
+		if (isKnownSinkPeerClosedError(error)) {
+			throw terminalizeTransport(client, error);
+		}
+		throw error;
+	}
 }
 
 function queueWriteMessage(
 	client: LspClient,
 	message: LspJsonRpcRequest | LspJsonRpcNotification | LspJsonRpcResponse,
 ): Promise<void> {
-	const write = client.writeQueue.catch(() => {}).then(() => writeMessage(client.proc.stdin, message));
+	const write = client.writeQueue.catch(() => {}).then(() => writeMessage(client, message));
 	client.writeQueue = write.catch(() => {});
 	return write;
 }
@@ -601,6 +628,8 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 
 			// Send initialized notification
 			await sendNotification(client, "initialized", {});
+			const terminalError = transportClosedErrors.get(client);
+			if (terminalError) throw terminalError;
 
 			return client;
 		} catch (err) {
@@ -862,6 +891,8 @@ export async function sendRequest(
 	signal?: AbortSignal,
 	timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
 ): Promise<unknown> {
+	const terminalError = transportClosedErrors.get(client);
+	if (terminalError) throw terminalError;
 	// Atomically increment and capture request ID
 	const id = ++client.requestId;
 	if (signal?.aborted) {
@@ -949,7 +980,12 @@ export async function sendNotification(client: LspClient, method: string, params
 	};
 
 	client.lastActivity = Date.now();
-	await queueWriteMessage(client, notification);
+	try {
+		await queueWriteMessage(client, notification);
+	} catch (error) {
+		if (transportClosedErrors.get(client) === error) return;
+		throw error;
+	}
 }
 
 /**
