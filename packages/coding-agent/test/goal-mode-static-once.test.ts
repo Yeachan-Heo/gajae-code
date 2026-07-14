@@ -59,12 +59,17 @@ describe("goal-mode static-once context injection", () => {
 		});
 	}
 
+	async function promptAndWait(text: string): Promise<void> {
+		await session.prompt(text);
+		await session.waitForIdle();
+	}
+
 	it("injects goal-mode-context exactly once across multiple turns with an unchanged goal", async () => {
 		createSession();
 		setActiveGoal("Ship the release", "goal-1");
 
 		for (let turn = 0; turn < 5; turn++) {
-			await session.prompt(`turn ${turn}`);
+			await promptAndWait(`turn ${turn}`);
 		}
 
 		// Static-once: exactly one durable goal-mode-context copy despite 5 turns.
@@ -80,12 +85,12 @@ describe("goal-mode static-once context injection", () => {
 	it("re-injects once when the active goal is replaced", async () => {
 		createSession();
 		setActiveGoal("First objective", "goal-1");
-		await session.prompt("turn a");
-		await session.prompt("turn b");
+		await promptAndWait("turn a");
+		await promptAndWait("turn b");
 		expect(goalContextCount(session.messages)).toBe(1);
 
 		setActiveGoal("Second objective", "goal-2");
-		await session.prompt("turn c");
+		await promptAndWait("turn c");
 
 		// A new activation identity triggers exactly one more injection.
 		expect(goalContextCount(session.messages)).toBe(2);
