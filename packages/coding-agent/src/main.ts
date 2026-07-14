@@ -24,6 +24,7 @@ import type { Args } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { runListModelsCommand } from "./cli/list-models";
+import { resolveListModelsRefreshStrategy } from "./cli/list-models-refresh";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
 import { activateModelProfile } from "./config/model-profile-activation";
@@ -1039,7 +1040,7 @@ export async function runRootCommand(
 	}
 
 	if (parsedArgs.listModels !== undefined) {
-		await modelRegistry.refresh("online");
+		await modelRegistry.refresh(resolveListModelsRefreshStrategy());
 		const searchPattern = typeof parsedArgs.listModels === "string" ? parsedArgs.listModels : undefined;
 		await runListModelsCommand({
 			modelRegistry,
