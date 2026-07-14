@@ -95,6 +95,12 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 	expect(lifecycle).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
 	expect(JSON.stringify(lifecycle)).not.toContain(token);
 	expect(requests).toHaveLength(1);
+	expect(await agent.listSessions({ cursor: "0" })).toEqual({ sessions: [], nextCursor: undefined });
+	expect(requests).toHaveLength(2);
+	for (const cursor of ["1junk", "1e2", " 1", "+1", "01", "", "9007199254740992"])
+		await expect(agent.listSessions({ cursor })).rejects.toThrow(`Invalid ACP session cursor: ${cursor}`);
+	await expect(agent.listSessions({ cursor: 1 as never })).rejects.toThrow("Invalid ACP session cursor: 1");
+	expect(requests).toHaveLength(2);
 	abort.abort();
 });
 

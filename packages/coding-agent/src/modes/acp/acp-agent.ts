@@ -701,6 +701,7 @@ export class AcpAgent implements Agent {
 
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		if (params.cwd) this.#assertAbsoluteCwd(params.cwd);
+		const cursor = this.#cursor(params.cursor);
 		const result = object(await (await this.#brokerAdapter()).global("session.list"));
 		const listing = object(result?.result) ?? result;
 		const listed = Array.isArray(listing?.sessions) ? listing.sessions : [];
@@ -726,7 +727,7 @@ export class AcpAgent implements Agent {
 				this.#knownSessionCwds.set(candidate.sessionId, params.cwd);
 			}
 		}
-		return paginateAcpSessions(listed, params.cwd ?? undefined, this.#cursor(params.cursor));
+		return paginateAcpSessions(listed, params.cwd ?? undefined, cursor);
 	}
 
 	async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
@@ -1447,10 +1448,12 @@ export class AcpAgent implements Agent {
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
 	}
 
-	#cursor(cursor: string | null | undefined): number {
-		if (!cursor) return 0;
-		const value = Number.parseInt(cursor, 10);
-		if (!Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid ACP session cursor: ${cursor}`);
+	#cursor(cursor: unknown): number {
+		if (cursor == null) return 0;
+		if (typeof cursor !== "string" || !/^(?:0|[1-9]\d*)$/.test(cursor))
+			throw new Error(`Invalid ACP session cursor: ${String(cursor)}`);
+		const value = Number(cursor);
+		if (!Number.isSafeInteger(value)) throw new Error(`Invalid ACP session cursor: ${cursor}`);
 		return value;
 	}
 
