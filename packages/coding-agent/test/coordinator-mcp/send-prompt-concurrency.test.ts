@@ -72,8 +72,21 @@ describe("send_prompt same-session concurrency", () => {
 											});
 											return { ok: true, result: { sessionId } };
 										}
-										if (operation === "session.list")
-											return { ok: true, result: { sessions: brokerSessions } };
+										if (operation === "session.list") {
+											const listCwd = typeof input.cwd === "string" ? input.cwd : undefined;
+											return {
+												ok: true,
+												result: {
+													sessions: brokerSessions,
+													...(listCwd
+														? {
+																workspaceGrantId: `grant:${listCwd}`,
+																workspaceIdentity: { dev: "1", ino: "1" },
+															}
+														: {}),
+												},
+											};
+										}
 										if (operation === "session.get_endpoint") {
 											return { ok: true, result: { url: sessionUrl, token: "session-token" } };
 										}

@@ -11,11 +11,13 @@ import { Settings } from "../src/config/settings";
 import {
 	boundedRuntimePromptAckTimeoutMs,
 	COORDINATOR_RUNTIME_PROMPT_ACK_TIMEOUT_MAX_MS,
+	createCoordinatorMcpServer,
 } from "../src/coordinator-mcp/server";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 } from "../src/gjc-runtime/session-state-sidecar";
+import type { SdkClient } from "../src/sdk/client/client";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -115,5 +117,153 @@ describe("Coordinator MCP runtime readiness", () => {
 			authStorage.close();
 			await fsp.rm(cwd, { recursive: true, force: true });
 		}
+	});
+
+	it("satisfies mandatory broker owner and workspace grant authority on production lifecycle calls", async () => {
+		const cwd = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-auth-")));
+		const agentDir = path.join(cwd, "agent-global");
+		const stateRoot = path.join(cwd, ".gjc", "coordinator-state");
+		await fsp.mkdir(path.join(agentDir, "sdk"), { recursive: true });
+		await fsp.mkdir(path.join(cwd, ".gjc", "state", "sdk"), { recursive: true });
+
+		// Strict broker: rejects any request whose brokerOwnerId is not the exact current
+		// discovery owner, and rejects cwd-bearing lifecycle calls lacking a grant + {dev,ino}
+		// obtained from a prior scoped session.list. Mirrors the production broker admission.
+		let owner = "owner-v1";
+		const grants = new Map<string, { dev: string; ino: string }>();
+		const brokerSessions: Array<Record<string, unknown>> = [];
+		const discoveryPath = path.join(agentDir, "sdk", "broker.json");
+		const writeDiscovery = async () =>
+			Bun.write(
+				discoveryPath,
+				JSON.stringify({
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "test",
+					ownerId: owner,
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://broker.test",
+					token: "broker-secret",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}),
+			);
+		await writeDiscovery();
+
+		let created = 0;
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: cwd,
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions,questions,reports",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: {
+				getAgentDir: () => agentDir,
+				resolveModelProfiles: () => new Map(),
+				connectSdk: async () =>
+					({
+						global: async (operation: string, input: Record<string, unknown>) => {
+							if (input.brokerOwnerId !== owner)
+								return {
+									ok: false,
+									error: { code: "endpoint_stale", message: "broker boot authority is stale" },
+								};
+							if (operation === "session.list") {
+								const listCwd = typeof input.cwd === "string" ? input.cwd : undefined;
+								if (!listCwd) return { ok: true, result: { sessions: brokerSessions } };
+								const grantId = `grant:${listCwd}:${owner}`;
+								grants.set(grantId, { dev: "1", ino: "1" });
+								return {
+									ok: true,
+									result: {
+										sessions: brokerSessions,
+										workspaceGrantId: grantId,
+										workspaceIdentity: { dev: "1", ino: "1" },
+									},
+								};
+							}
+							if (operation === "session.get_endpoint")
+								return { ok: true, result: { url: "ws://sdk.test/ep", token: "Bearer ep" } };
+							if (operation === "session.close") {
+								const index = brokerSessions.findIndex(session => session.sessionId === input.sessionId);
+								if (index >= 0) brokerSessions.splice(index, 1);
+								return { ok: true, result: { sessionId: input.sessionId } };
+							}
+							if (operation === "session.create") {
+								const grantId = typeof input.workspaceGrantId === "string" ? input.workspaceGrantId : "";
+								const identity = input.workspaceIdentity as { dev?: string; ino?: string } | undefined;
+								const grant = grants.get(grantId);
+								if (!grant || !identity || identity.dev !== grant.dev || identity.ino !== grant.ino)
+									return {
+										ok: false,
+										error: { code: "endpoint_stale", message: "workspace grant is stale or missing" },
+									};
+								const sessionId = `session-${++created}`;
+								await Bun.write(
+									path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`),
+									JSON.stringify({ url: "ws://sdk.test", token: "session-token" }),
+								);
+								brokerSessions.push({
+									sessionId,
+									locator: { repo: cwd },
+									live: true,
+									endpointGeneration: 1,
+									pid: 100 + created,
+									endpointMtimeMs: created,
+								});
+								return { ok: true, result: { sessionId } };
+							}
+							return { ok: true, result: {} };
+						},
+						control: async () => ({ accepted: true, command_id: "c", turn_id: "t" }),
+						query: async () => ({
+							type: "query_response",
+							id: "q",
+							ok: true,
+							page: { items: [], complete: true, revision: "r" },
+						}),
+						close: async () => {},
+					}) as unknown as SdkClient,
+			},
+		});
+
+		// create (cwd-bearing) carries the owner proof and the grant + {dev,ino} from a
+		// scoped session.list; a strict broker that rejects missing authority accepts it.
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd,
+			idempotency_key: "auth-create",
+			allow_mutation: true,
+		});
+		expect(started).toMatchObject({ ok: true, session: { session_id: "session-1" } });
+
+		// The exact current discovery.ownerId is re-read per call: rotating the broker owner
+		// flips the injected proof, and the strict broker still accepts the new owner.
+		owner = "owner-v2";
+		await writeDiscovery();
+		const startedAgain = await server.callTool("gjc_coordinator_start_session", {
+			cwd,
+			idempotency_key: "auth-create-v2",
+			allow_mutation: true,
+		});
+		expect(startedAgain).toMatchObject({ ok: true, session: { session_id: "session-2" } });
+
+		// close (non-cwd-bearing) carries only the owner proof and is accepted by the strict broker.
+		const sessionFile = path.join(stateRoot, "local", "repo", "sessions", "session-1.json");
+		const record = JSON.parse(await fsp.readFile(sessionFile, "utf8"));
+		await Bun.write(
+			sessionFile,
+			JSON.stringify({ ...record, ephemeral: true, created_at: new Date(Date.now() - 31 * 60_000).toISOString() }),
+		);
+		const stopped = await server.callTool("gjc_coordinator_stop_session", {
+			session_id: "session-1",
+			allow_mutation: true,
+		});
+		expect(stopped).toMatchObject({ ok: true, closed: true, session_id: "session-1" });
+
+		await fsp.rm(cwd, { recursive: true, force: true });
 	});
 });

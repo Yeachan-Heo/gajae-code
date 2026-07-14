@@ -10,8 +10,8 @@
  * Over the public SDK 1.2.1 surface (`ClientSideConnection` / `ndJsonStream`)
  * this proves the full lifecycle against a real subprocess: capability
  * advertisement → create → explicit scoped list → artifact creation → delete →
- * post-delete list absence → transcript/artifact absence → repeat-delete no-op
- * `{}` → unknown-delete no-op `{}`. Strict unit tests in `acp-agent.test.ts`
+ * post-delete list absence → canonical transcript tombstone/artifact absence →
+ * repeat-delete no-op `{}` → unknown-delete no-op `{}`. Strict unit tests in
  * remain the authority proof for the duplicate/identity/close-state edge cases.
  *
  * No process-global env mutation, no gates/formatters/commits/pushes.
@@ -30,6 +30,7 @@ import {
 	type RequestPermissionResponse,
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
+import { isCanonicalSessionDeletedTombstone } from "../src/session/session-storage";
 
 /** Minimal host→client callback impl for the SDK callbacks. */
 class OracleClient implements Client {
@@ -313,8 +314,12 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			const listAfter = await connection.listSessions({ cwd: workspace });
 			expect(listAfter.sessions.map(session => session.sessionId)).not.toContain(sessionId);
 
-			// Transcript and its artifacts directory (and artifact) are gone.
-			expect(fs.existsSync(sessionPath)).toBe(false);
+			// The authorized transcript object remains as a canonical tombstone; only
+			// sibling artifacts are removed. This proves delete never unlinks a mutable
+			// pathname after authority validation.
+			const tombstone = JSON.parse((await fs.promises.readFile(sessionPath, "utf8")).trim());
+			expect(isCanonicalSessionDeletedTombstone(tombstone)).toBe(true);
+			expect(tombstone.id).toBe(sessionId);
 			expect(fs.existsSync(artifactsDir)).toBe(false);
 			expect(fs.existsSync(artifactPath)).toBe(false);
 

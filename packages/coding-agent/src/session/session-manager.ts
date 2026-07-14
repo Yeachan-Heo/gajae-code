@@ -65,6 +65,7 @@ import {
 } from "./messages";
 import type {
 	SessionStorage,
+	SessionStorageFileIdentity,
 	SessionStorageSnapshot,
 	SessionStorageStat,
 	SessionStorageWriter,
@@ -72,7 +73,7 @@ import type {
 	VerifiedSessionDeleteResult,
 	VerifiedSessionDeleteTarget,
 } from "./session-storage";
-import { FileSessionStorage, MemorySessionStorage } from "./session-storage";
+import { FileSessionStorage, isCanonicalSessionDeletedTombstone, MemorySessionStorage } from "./session-storage";
 
 export const CURRENT_SESSION_VERSION = 3;
 function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
@@ -2614,11 +2615,20 @@ class NdjsonFileWriter {
 	#onError: ((err: Error) => void) | undefined;
 	#closeDrained = false;
 
-	constructor(storage: SessionStorage, path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }) {
+	constructor(
+		storage: SessionStorage,
+		path: string,
+		options?: {
+			flags?: "a" | "w";
+			onError?: (err: Error) => void;
+			expectedObjectIdentity?: SessionStorageFileIdentity;
+		},
+	) {
 		this.#onError = options?.onError;
 		this.#writer = storage.openWriter(path, {
 			flags: options?.flags ?? "a",
 			onError: (err: Error) => this.#recordError(err),
+			...(options?.expectedObjectIdentity ? { expectedObjectIdentity: options.expectedObjectIdentity } : {}),
 		});
 	}
 
@@ -3181,6 +3191,16 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#ensuredOnDisk: boolean = false;
+	/**
+	 * Strict lifecycle object-identity binding. When set, every persist-writer reopen
+	 * and full rewrite operates through the exact descriptor-bound {dev, ino} rather
+	 * than the public pathname: a successor installed at the pathname fails closed
+	 * and is never written/truncated. Ordinary sessions leave this undefined and
+	 * retain the atomic-rename behavior. `dev/ino` is the only stable ownership
+	 * field because size/mtime change on every persist.
+	 */
+	#strictObjectIdentity: SessionStorageFileIdentity | undefined;
+	#strictBoundPath: string | undefined;
 	#fileEntries: FileEntry[] = [];
 	#byId: Map<string, SessionEntry> = new Map();
 	#labelsById: Map<string, string> = new Map();
@@ -3791,11 +3811,15 @@ export class SessionManager {
 			// the entry through the async rewrite path so it still lands on disk.
 			return undefined;
 		}
-		// Note: caller must await _closePersistWriter() before calling this if switching files
+		// Note: caller must await _closePersistWriter() before calling this if switching files.
+		// A strict-bound reopen validates the authorized {dev, ino} at open: a pathname
+		// replacement fails closed before a byte is appended to the successor.
 		this.#persistWriter = new NdjsonFileWriter(this.storage, this.#sessionFile, {
+			flags: "a",
 			onError: err => {
 				this.#recordPersistError(err);
 			},
+			...(this.#isStrictBound() ? { expectedObjectIdentity: this.#strictObjectIdentity } : {}),
 		});
 		this.#persistWriterPath = this.#sessionFile;
 		return this.#persistWriter;
@@ -3945,8 +3969,75 @@ export class SessionManager {
 		}
 	}
 
+	/** True only while a strict binding is active for the current session file. */
+	#isStrictBound(): boolean {
+		return this.#strictObjectIdentity !== undefined && this.#strictBoundPath === this.#sessionFile;
+	}
+
+	/**
+	 * Descriptor-bound full rewrite for a strict-bound session. Writes through the
+	 * live file's descriptor (no-follow open + dev/ino validation + truncate through
+	 * the descriptor), never a temp-file/pathname rename. The inode is preserved; a
+	 * pathname replacement fails closed before truncation, leaving the successor
+	 * bytes untouched. Trades atomic rename for stable object identity — only for
+	 * strict lifecycle-bound sessions.
+	 */
+	#writeEntriesBoundSync(entries: FileEntry[]): void {
+		if (!this.#sessionFile) return;
+		const writer = new NdjsonFileWriter(this.storage, this.#sessionFile, {
+			flags: "w",
+			expectedObjectIdentity: this.#strictObjectIdentity,
+			onError: err => {
+				this.#recordPersistError(err);
+			},
+		});
+		try {
+			for (const entry of entries) {
+				writer.writeSync(entry);
+			}
+			writer.closeSync();
+		} catch (err) {
+			try {
+				writer.closeSync();
+			} catch {
+				// Best-effort cleanup of the bound descriptor.
+			}
+			throw toError(err);
+		}
+	}
+
+	async #writeEntriesBound(entries: FileEntry[]): Promise<void> {
+		if (!this.#sessionFile) return;
+		const writer = new NdjsonFileWriter(this.storage, this.#sessionFile, {
+			flags: "w",
+			expectedObjectIdentity: this.#strictObjectIdentity,
+			onError: err => {
+				this.#recordPersistError(err);
+			},
+		});
+		try {
+			for (const entry of entries) {
+				await writer.write(entry);
+			}
+			await writer.flush();
+			await writer.fsync();
+			await writer.close();
+		} catch (err) {
+			try {
+				await writer.close();
+			} catch {
+				// Best-effort cleanup of the bound descriptor.
+			}
+			throw toError(err);
+		}
+	}
+
 	#writeEntriesAtomicallySync(entries: FileEntry[]): void {
 		if (!this.#sessionFile) return;
+		if (this.#isStrictBound()) {
+			this.#writeEntriesBoundSync(entries);
+			return;
+		}
 		const dir = path.resolve(this.#sessionFile, "..");
 		const tempPath = path.join(dir, `.${path.basename(this.#sessionFile)}.${Snowflake.next()}.tmp`);
 		const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
@@ -3973,6 +4064,10 @@ export class SessionManager {
 	}
 	async #writeEntriesAtomically(entries: FileEntry[]): Promise<void> {
 		if (!this.#sessionFile) return;
+		if (this.#isStrictBound()) {
+			await this.#writeEntriesBound(entries);
+			return;
+		}
 		const dir = path.resolve(this.#sessionFile, "..");
 		const tempPath = path.join(dir, `.${path.basename(this.#sessionFile)}.${Snowflake.next()}.tmp`);
 		const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
@@ -4175,6 +4270,31 @@ export class SessionManager {
 		if (this.#flushed && !this.#needsFullRewriteOnNextPersist) return;
 		await this.#rewriteFile();
 		this.#ensuredOnDisk = true;
+	}
+	/**
+	 * Bind future persistence to the {dev, ino} of the current destination file,
+	 * captured after {@link ensureOnDisk}. The lifecycle child calls this for a
+	 * newly created session so resume/fork/create persistence cannot reopen or
+	 * replace a successor pathname: every subsequent append reopen and full rewrite
+	 * validates the authorized object and fails closed on a mismatch. Returns an
+	 * error if the destination is not yet on disk. Idempotent for an already-bound
+	 * manager bound to the current file.
+	 */
+	bindCreatedDestinationStrict(): { kind: "bound" } | { kind: "error"; reason: "missing" } {
+		if (!this.persist || !this.#sessionFile) return { kind: "error", reason: "missing" };
+		if (this.#strictObjectIdentity !== undefined && this.#strictBoundPath === this.#sessionFile) {
+			return { kind: "bound" };
+		}
+		if (!this.storage.existsSync(this.#sessionFile)) return { kind: "error", reason: "missing" };
+		const stat = this.storage.statSync(this.#sessionFile);
+		this.#strictObjectIdentity = { dev: stat.dev, ino: stat.ino };
+		this.#strictBoundPath = this.#sessionFile;
+		return { kind: "bound" };
+	}
+
+	/** The authorized {dev, ino} a strict-bound manager persists through, or undefined. */
+	getStrictObjectIdentity(): SessionStorageFileIdentity | undefined {
+		return this.#isStrictBound() ? this.#strictObjectIdentity : undefined;
 	}
 
 	/** Flush pending writes to disk. Call before switching sessions or on shutdown. */
@@ -5793,6 +5913,16 @@ export class SessionManager {
 				throw new Error("Captured fork source authority changed before destination write.");
 			}
 			await manager.#rewriteFile();
+			// Capture and adopt the newly created destination object. The first rewrite
+			// used the ordinary atomic-rename path (the binding was not yet set), so the
+			// destination is a fresh inode; stat it now and bind so every subsequent
+			// append/rewrite operates through this exact object. A successor installed at
+			// the destination pathname later fails closed.
+			if (manager.#sessionFile) {
+				const destinationStat = manager.storage.statSync(manager.#sessionFile);
+				manager.#strictObjectIdentity = { dev: destinationStat.dev, ino: destinationStat.ino };
+				manager.#strictBoundPath = manager.#sessionFile;
+			}
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
 			return { kind: "forked", manager };
 		} catch (error) {
@@ -5897,6 +6027,13 @@ export class SessionManager {
 			await manager.close();
 			return { kind: "error", reason: "identity-mismatch" };
 		}
+		// Adopt the authorized dev/ino as stable live-persistence ownership. The full
+		// five-field identity is admission evidence; only {dev, ino} is stable across
+		// future persists (size/mtime change on every append/rewrite). Bound here, the
+		// resumed session's later appends/rewrites validate this object and fail closed
+		// if the public pathname is replaced by a successor.
+		manager.#strictObjectIdentity = { dev: identity.dev, ino: identity.ino };
+		manager.#strictBoundPath = manager.#sessionFile;
 		writeTerminalBreadcrumb(manager.cwd, identity.canonicalPath);
 		return { kind: "opened", manager };
 	}
@@ -6040,6 +6177,7 @@ export class SessionManager {
 				failures.push(...candidate.failures);
 				continue;
 			}
+			if ("omit" in candidate) continue;
 			candidates.push(candidate.candidate);
 		}
 		if (failures.length > 0) {
@@ -6049,9 +6187,10 @@ export class SessionManager {
 	}
 
 	/**
-	 * Propagate the storage-layer verified hard delete bound to exact identity evidence.
-	 * Never performs ID lookup or first-match selection; the caller supplies the exact
-	 * authorization target captured from a complete strict inventory.
+	 * Propagate the storage-layer verified logical delete (descriptor-bound tombstone)
+	 * bound to exact identity evidence. Never performs ID lookup or first-match
+	 * selection; the caller supplies the exact authorization target captured from a
+	 * complete strict inventory.
 	 */
 	async deleteSessionVerified(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult> {
 		if (!this.storage.deleteSessionVerified) {
@@ -6068,7 +6207,7 @@ function inventoryReadCandidate(
 	file: string,
 	expectedCwd: string,
 	sessionDir: string,
-): { candidate: StrictInventoryCandidate } | { failures: StrictInventoryFailure[] } {
+): { candidate: StrictInventoryCandidate } | { failures: StrictInventoryFailure[] } | { omit: true } {
 	const failures: StrictInventoryFailure[] = [];
 	const resolvedFile = path.resolve(file);
 	if (!pathIsWithin(path.resolve(sessionDir), resolvedFile)) {
@@ -6108,6 +6247,12 @@ function inventoryReadCandidate(
 	if (!header) {
 		failures.push({ kind: "parse", message: "Candidate header is not valid JSON", path: file });
 		return { failures };
+	}
+	// Canonical logical-deletion tombstone: recognize and omit only the exact schema.
+	// A malformed lookalike (wrong type, or missing/empty id/cwd) is NOT treated as
+	// deleted and falls through to the fail-closed header check below.
+	if (isCanonicalSessionDeletedTombstone(header)) {
+		return { omit: true };
 	}
 	if (header.type !== "session") {
 		failures.push({ kind: "header", message: "Candidate header is not a session header", path: file });

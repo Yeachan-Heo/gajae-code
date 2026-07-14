@@ -6,9 +6,13 @@ import * as path from "node:path";
 import { SessionManager } from "../src/session/session-manager";
 import {
 	FileSessionStorage,
+	isCanonicalSessionDeletedTombstone,
 	MemorySessionStorage,
+	SESSION_DELETED_TOMBSTONE_TYPE,
 	SessionDeleteVerificationError,
 	type SessionStorage,
+	type SessionStorageFileIdentity,
+	SessionStorageObjectIdentityError,
 	SessionStorageWriterRetryableCloseError,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
@@ -22,6 +26,19 @@ const fullIdentity = (identity: { dev: bigint; ino: bigint; size: number; mtimeM
 	mtimeMs: identity.mtimeMs,
 	mtimeNs: identity.mtimeNs,
 });
+
+/** Parse the first JSONL line of a real on-disk file as a record (tombstone assertions). */
+const parseFirstLine = (p: string): Record<string, unknown> | undefined => {
+	const text = fs.readFileSync(p, "utf-8");
+	const firstLine = text.split("\n")[0]?.trim();
+	if (!firstLine) return undefined;
+	try {
+		const value: unknown = JSON.parse(firstLine);
+		return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+	} catch {
+		return undefined;
+	}
+};
 
 describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 	let tempDir: string;
@@ -218,7 +235,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		);
 		return transcriptPath;
 	}
-	it("removes the verified artifact directory first, then the transcript last", async () => {
+	it("tombstones the verified transcript after removing artifacts first", async () => {
 		const transcriptPath = await createTranscript("happy");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
@@ -235,8 +252,15 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 
 		const result = await storage.deleteSessionVerified(target);
 		expect(result).toEqual({ kind: "deleted" });
+		// Artifacts are physically removed first.
 		expect(fs.existsSync(artifactsDir)).toBe(false);
-		expect(fs.existsSync(transcriptPath)).toBe(false);
+		// Logical deletion: the public pathname survives and now carries the canonical
+		// tombstone (object-bound), not the session header. It is never unlinked.
+		expect(fs.existsSync(transcriptPath)).toBe(true);
+		const header = parseFirstLine(transcriptPath);
+		expect(isCanonicalSessionDeletedTombstone(header)).toBe(true);
+		expect(header?.type).toBe(SESSION_DELETED_TOMBSTONE_TYPE);
+		expect(header?.id).toBe("session-id");
 	});
 
 	it("artifact rm failure returns cleanup_pending and leaves the transcript intact for retry", async () => {
@@ -324,7 +348,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptIdentity: fullIdentity(stat),
 		};
 		// Concurrent in-place modification during artifact removal: initial authority
-		// matches, but the file changes before the pre-unlink revalidation.
+		// matches, but the file changes before the pre-tombstone descriptor revalidation.
 		const originalRm = fsp.rm.bind(fsp);
 		vi.spyOn(fsp, "rm").mockImplementation(async (rmPath, options) => {
 			await fsp.appendFile(transcriptPath, `${JSON.stringify({ type: "assistant", content: "tamper" })}\n`);
@@ -383,18 +407,20 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		rmSpy.mockRestore();
 
 		// Retry bound to the recorded artifact identity: same directory matches and the
-		// verified hard delete completes.
+		// verified logical delete completes.
 		const retried = await storage.deleteSessionVerified({
 			...target,
 			expectedArtifactsIdentity: recordedArtifactsIdentity,
 		});
 		expect(retried).toEqual({ kind: "deleted" });
-		expect(fs.existsSync(transcriptPath)).toBe(false);
+		// Retry completes the logical deletion: artifacts gone, transcript tombstoned.
 		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect(fs.existsSync(transcriptPath)).toBe(true);
+		expect(isCanonicalSessionDeletedTombstone(parseFirstLine(transcriptPath))).toBe(true);
 	});
 
-	it("transcript unlink failure after artifact removal returns typed cleanup_pending(transcript) and keeps the transcript", async () => {
-		const transcriptPath = await createTranscript("unlink-failure");
+	it("tombstone descriptor-write failure after artifact removal returns typed cleanup_pending(transcript) and keeps the transcript", async () => {
+		const transcriptPath = await createTranscript("tombstone-failure");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
@@ -408,21 +434,25 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptIdentity: fullIdentity(stat),
 		};
 
-		// Inject a non-ENOENT unlink failure (EACCES, not the ENOENT that maps to deleted).
-		const unlinkErr = Object.assign(new Error("transcript unlink denied"), {
-			code: "EACCES",
+		// Inject a failure in the descriptor-bound destructive effect (the truncation
+		// step of the tombstone write). Truncation is the first mutating step, so the
+		// authorized object is left intact; the public pathname is never unlinked.
+		vi.spyOn(fs, "ftruncateSync").mockImplementationOnce(() => {
+			throw new Error("tombstone truncate denied");
 		});
-		vi.spyOn(storage, "unlink").mockRejectedValueOnce(unlinkErr);
 
 		const result = await storage.deleteSessionVerified(target);
 		expect(result.kind).toBe("cleanup_pending");
 		if (result.kind !== "cleanup_pending") throw new Error("unreachable");
 		expect(result.phase).toBe("transcript");
 		expect(result.error).toBeInstanceOf(Error);
+		expect(result.error.message).toBe("tombstone truncate denied");
 		expect(result.transcriptIdentity).toEqual({ dev: stat.dev, ino: stat.ino });
-		// Artifacts were removed first (intended); the transcript survives (no data loss).
+		// Artifacts were removed first (intended); the authorized transcript survives
+		// untouched (the tombstone truncation failed before any byte was written).
 		expect(fs.existsSync(artifactsDir)).toBe(false);
 		expect(fs.existsSync(transcriptPath)).toBe(true);
+		expect(parseFirstLine(transcriptPath)?.type).toBe("session");
 	});
 
 	it("a symlinked artifact directory is rejected as a symlink before any mutation", async () => {
@@ -453,8 +483,8 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 	});
 
 	it("a symlinked transcript is rejected before any mutation", async () => {
-		// readSnapshotSync opens with O_NOFOLLOW, which makes opening a symlink fail
-		// with ELOOP on both Linux and macOS -> typed "symlink" verification failure.
+		// The descriptor open uses O_NOFOLLOW, which makes opening a symlink fail with
+		// ELOOP on both Linux and macOS -> typed "symlink" verification failure.
 		const realTranscript = await createTranscript("symlink-target");
 		const transcriptPath = path.join(tempDir, "symlink-tx.jsonl");
 		await fsp.symlink(realTranscript, transcriptPath);
@@ -483,14 +513,15 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		expect(fs.existsSync(realTranscript)).toBe(true);
 	});
 
-	it("transcript identity replaced after artifact removal fails closed before unlink", async () => {
+	it("a path replacement at the final effect survives untouched and produces a typed stale failure", async () => {
 		const transcriptPath = await createTranscript("replacement");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
 
-		// Capture the real snapshot (and its bound identity) before installing the spy.
+		// Capture the exact authorized bytes/identity before the deletion window.
 		const realSnapshot = storage.readSnapshotSync(transcriptPath);
+		const originalContent = Buffer.from(realSnapshot.bytes).toString("utf-8");
 		const target: VerifiedSessionDeleteTarget = {
 			sessionsRoot: tempDir,
 			transcriptPath,
@@ -499,27 +530,31 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptIdentity: fullIdentity(realSnapshot.stat),
 		};
 
-		// On the post-artifact revalidation read (2nd call) return a replaced (dev, ino):
-		// the file the authorization bound to has been swapped out after artifacts removal.
-		let snapshotCalls = 0;
-		vi.spyOn(storage, "readSnapshotSync").mockImplementation(() => {
-			snapshotCalls++;
-			if (snapshotCalls === 2) {
-				return {
-					bytes: realSnapshot.bytes,
-					stat: { ...realSnapshot.stat, ino: realSnapshot.stat.ino + 1n },
-				};
-			}
-			return realSnapshot;
+		// During artifact cleanup (while the authorized descriptor is retained), install a
+		// path replacement: move the authorized transcript aside and place a fresh object at
+		// the public pathname. The retained descriptor still binds the original object, so
+		// the destructive tombstone effect hits the authorized object — never the pathname.
+		const retained = path.join(tempDir, "replacement-authorized.jsonl");
+		const originalRm = fsp.rm.bind(fsp);
+		vi.spyOn(fsp, "rm").mockImplementation(async (rmPath, options) => {
+			await fsp.rename(transcriptPath, retained);
+			await Bun.write(transcriptPath, originalContent);
+			return originalRm(rmPath, options);
 		});
 
 		const err = await storage.deleteSessionVerified(target).catch(e => e);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
-		expect((err as SessionDeleteVerificationError).kind).toBe("identity");
-		expect((err as Error).message).toContain("after artifact removal");
-		// Artifacts were removed (intended); the transcript was never unlinked (no data loss).
+		expect((err as SessionDeleteVerificationError).kind).toBe("stale");
+		// Artifacts were removed (intended).
 		expect(fs.existsSync(artifactsDir)).toBe(false);
+		// The replacement at the public pathname survived untouched (never unlinked) and
+		// still carries the live session header.
 		expect(fs.existsSync(transcriptPath)).toBe(true);
+		expect(parseFirstLine(transcriptPath)?.type).toBe("session");
+		// The authorized object was tombstoned through the retained descriptor (it now
+		// lives at the moved path); the destructive effect was object-bound, not path-bound.
+		expect(fs.existsSync(retained)).toBe(true);
+		expect(isCanonicalSessionDeletedTombstone(parseFirstLine(retained))).toBe(true);
 	});
 
 	it("retry with a replaced artifact directory identity fails closed before mutation", async () => {
@@ -677,7 +712,7 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 		storage.writeTextSync(transcriptPath, `${JSON.stringify(header)}\n`);
 	}
 
-	it("deletes a verified matching transcript", async () => {
+	it("tombstones a verified matching transcript", async () => {
 		const transcriptPath = path.join(sessionsRoot, "s.jsonl");
 		seedTranscript(transcriptPath);
 		const stat = storage.readSnapshotSync(transcriptPath).stat;
@@ -689,7 +724,11 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 			transcriptIdentity: fullIdentity(stat),
 		});
 		expect(result).toEqual({ kind: "deleted" });
-		expect(storage.existsSync(transcriptPath)).toBe(false);
+		// Logical-deletion parity: the key survives and carries the canonical tombstone.
+		expect(storage.existsSync(transcriptPath)).toBe(true);
+		const tombstone = JSON.parse(storage.readTextSync(transcriptPath).split("\n")[0]);
+		expect(isCanonicalSessionDeletedTombstone(tombstone)).toBe(true);
+		expect(tombstone.id).toBe("session-id");
 	});
 
 	it("rejects a transcript outside the sessions root (containment parity)", async () => {
@@ -911,5 +950,285 @@ describe("SessionManager.inventorySessionsStrict root inspection failures", () =
 		expect(result.failures).toHaveLength(1);
 		expect(result.failures[0].kind).toBe("scan");
 		expect(result.failures[0].message).not.toContain("EIO");
+	});
+});
+describe("SessionManager.inventorySessionsStrict session_deleted tombstones", () => {
+	let tempDir: string;
+	let storage: FileSessionStorage;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-strict-tombstone-"));
+		storage = new FileSessionStorage();
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("omits a canonical session_deleted tombstone from a complete inventory", () => {
+		// Canonical tombstone: recognized and omitted (not a candidate, not a failure).
+		storage.writeTextSync(
+			path.join(tempDir, "deleted.jsonl"),
+			`${JSON.stringify({ type: SESSION_DELETED_TOMBSTONE_TYPE, id: "deleted-id", cwd: tempDir, deletedAt: "2025-01-01T00:00:00Z" })}\n`,
+		);
+		// A live session in the same directory is still enumerated.
+		storage.writeTextSync(
+			path.join(tempDir, "live.jsonl"),
+			`${JSON.stringify({ type: "session", id: "live-id", cwd: tempDir })}\n`,
+		);
+
+		const result = SessionManager.inventorySessionsStrict(tempDir, { sessionDir: tempDir, storage });
+		expect(result).toEqual({ kind: "complete", candidates: [expect.objectContaining({ id: "live-id" })] });
+	});
+
+	it("fails closed on a malformed session_deleted lookalike (never treated as deleted)", () => {
+		// Missing id/cwd: not the canonical schema -> must NOT be omitted -> fail closed.
+		storage.writeTextSync(
+			path.join(tempDir, "malformed.jsonl"),
+			`${JSON.stringify({ type: SESSION_DELETED_TOMBSTONE_TYPE })}\n`,
+		);
+
+		const result = SessionManager.inventorySessionsStrict(tempDir, { sessionDir: tempDir, storage });
+		expect(result.kind).toBe("failure");
+		// Zero-authority: a failure grants no candidate set at all.
+		expect(result).not.toHaveProperty("candidates");
+		if (result.kind !== "failure") return;
+		expect(result.failures).toHaveLength(1);
+		expect(result.failures[0].kind).toBe("header");
+	});
+});
+/**
+ * Replace a pathname with successor content via a fresh temp file + rename. The
+ * rename moves a brand-new inode over the target, guaranteeing the public pathname
+ * now resolves to a different {dev, ino} than the authorized object.
+ */
+function installSuccessor(target: string, content: string): void {
+	const tmp = path.join(
+		path.dirname(target),
+		`.${path.basename(target)}.successor-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
+	);
+	fs.writeFileSync(tmp, content);
+	fs.renameSync(tmp, target);
+}
+
+describe("FileSessionStorageWriter descriptor-bound object identity", () => {
+	let tempDir: string;
+	let storage: FileSessionStorage;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-bound-writer-"));
+		storage = new FileSessionStorage();
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("descriptor-bound append validates dev/ino and appends through the descriptor", () => {
+		const fpath = path.join(tempDir, "bound-append.jsonl");
+		fs.writeFileSync(fpath, "line-a\n");
+		const stat = fs.statSync(fpath, { bigint: true });
+		const identity: SessionStorageFileIdentity = { dev: stat.dev, ino: stat.ino };
+
+		const writer = storage.openWriter(fpath, { flags: "a", expectedObjectIdentity: identity });
+		writer.writeLineSync("line-b\n");
+		writer.closeSync();
+
+		expect(fs.readFileSync(fpath, "utf-8")).toBe("line-a\nline-b\n");
+		// Append through the descriptor preserves the authorized inode.
+		expect(fs.statSync(fpath, { bigint: true }).ino).toBe(identity.ino);
+	});
+
+	it("descriptor-bound full rewrite truncates through the validated descriptor, preserving inode", () => {
+		const fpath = path.join(tempDir, "bound-rewrite.jsonl");
+		fs.writeFileSync(fpath, "old-content-that-must-be-replaced\n");
+		const stat = fs.statSync(fpath, { bigint: true });
+		const identity: SessionStorageFileIdentity = { dev: stat.dev, ino: stat.ino };
+
+		const writer = storage.openWriter(fpath, { flags: "w", expectedObjectIdentity: identity });
+		writer.writeLineSync("new-content\n");
+		writer.closeSync();
+
+		expect(fs.readFileSync(fpath, "utf-8")).toBe("new-content\n");
+		expect(fs.statSync(fpath, { bigint: true }).ino).toBe(identity.ino);
+	});
+
+	it("replacement before a bound append fails closed and leaves successor bytes untouched", () => {
+		const fpath = path.join(tempDir, "append-replaced.jsonl");
+		fs.writeFileSync(fpath, "authorized\n");
+		const stat = fs.statSync(fpath, { bigint: true });
+		const identity: SessionStorageFileIdentity = { dev: stat.dev, ino: stat.ino };
+
+		installSuccessor(fpath, "successor-bytes\n");
+		expect(fs.statSync(fpath, { bigint: true }).ino).not.toBe(identity.ino);
+
+		expect(() => storage.openWriter(fpath, { flags: "a", expectedObjectIdentity: identity })).toThrow(
+			SessionStorageObjectIdentityError,
+		);
+		// No byte appended to the successor; its content survives verbatim.
+		expect(fs.readFileSync(fpath, "utf-8")).toBe("successor-bytes\n");
+	});
+
+	it("replacement before a bound full rewrite fails closed without truncating the successor", () => {
+		const fpath = path.join(tempDir, "rewrite-replaced.jsonl");
+		fs.writeFileSync(fpath, "authorized\n");
+		const stat = fs.statSync(fpath, { bigint: true });
+		const identity: SessionStorageFileIdentity = { dev: stat.dev, ino: stat.ino };
+
+		installSuccessor(fpath, "successor-bytes\n");
+		const successorSize = fs.statSync(fpath).size;
+		expect(fs.statSync(fpath, { bigint: true }).ino).not.toBe(identity.ino);
+
+		expect(() => storage.openWriter(fpath, { flags: "w", expectedObjectIdentity: identity })).toThrow(
+			SessionStorageObjectIdentityError,
+		);
+		// ftruncate runs only AFTER dev/ino validation; the successor was never truncated.
+		expect(fs.readFileSync(fpath, "utf-8")).toBe("successor-bytes\n");
+		expect(fs.statSync(fpath).size).toBe(successorSize);
+	});
+
+	it("a bound append to a missing pathname fails closed with a missing-object identity", () => {
+		const fpath = path.join(tempDir, "missing.jsonl");
+		const identity: SessionStorageFileIdentity = { dev: 0n, ino: 999n };
+
+		let caught: unknown;
+		try {
+			storage.openWriter(fpath, { flags: "a", expectedObjectIdentity: identity });
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).toBeInstanceOf(SessionStorageObjectIdentityError);
+		const err = caught as SessionStorageObjectIdentityError;
+		expect(err.actual.dev).toBe(-1n);
+		expect(err.actual.ino).toBe(-1n);
+		expect(err.expected).toEqual(identity);
+	});
+});
+
+describe("MemorySessionStorageWriter descriptor-bound object identity", () => {
+	it("bound append fails closed after an in-memory replacement, leaving successor bytes untouched", () => {
+		const storage = new MemorySessionStorage();
+		storage.writeTextSync("/mem.jsonl", "authorized\n");
+		const identity: SessionStorageFileIdentity = { dev: 0n, ino: storage.statSync("/mem.jsonl").ino };
+
+		// Unlink + rewrite allocates a fresh memory inode, replacing the object.
+		storage.unlinkSync("/mem.jsonl");
+		storage.writeTextSync("/mem.jsonl", "successor\n");
+		expect(storage.statSync("/mem.jsonl").ino).not.toBe(identity.ino);
+
+		expect(() => storage.openWriter("/mem.jsonl", { flags: "a", expectedObjectIdentity: identity })).toThrow(
+			SessionStorageObjectIdentityError,
+		);
+		expect(storage.readTextSync("/mem.jsonl")).toBe("successor\n");
+	});
+
+	it("a non-bound memory writer retains ordinary create/append semantics", () => {
+		const storage = new MemorySessionStorage();
+		// No expectedObjectIdentity: the writer creates the entry and appends normally.
+		const writer = storage.openWriter("/plain.jsonl");
+		writer.writeLineSync("plain-line\n");
+		writer.closeSync();
+		expect(storage.readTextSync("/plain.jsonl")).toBe("plain-line\n");
+	});
+});
+
+describe("SessionManager strict object-identity persistence binding", () => {
+	let tempDir: string;
+	let storage: FileSessionStorage;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-strict-bind-"));
+		storage = new FileSessionStorage();
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("bindCreatedDestinationStrict pins all subsequent persists to the authorized inode", async () => {
+		const manager = SessionManager.create(tempDir, tempDir, storage);
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile()!;
+
+		expect(manager.bindCreatedDestinationStrict()).toEqual({ kind: "bound" });
+		const identity = manager.getStrictObjectIdentity()!;
+		expect(identity).toBeDefined();
+
+		// Append + full rewrite both route through the bound descriptor; the inode
+		// never changes (no atomic rename replacement).
+		manager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+		await manager.rewriteEntries();
+		expect(fs.statSync(sessionFile, { bigint: true }).ino).toBe(identity.ino);
+
+		manager.appendMessage({ role: "user", content: "second", timestamp: Date.now() });
+		await manager.rewriteEntries();
+		expect(fs.statSync(sessionFile, { bigint: true }).ino).toBe(identity.ino);
+
+		// Idempotent rebind to the same file is a no-op success.
+		expect(manager.bindCreatedDestinationStrict()).toEqual({ kind: "bound" });
+		await manager.close();
+	});
+
+	it("bindCreatedDestinationStrict errors when the destination is not yet on disk", () => {
+		const manager = SessionManager.create(tempDir, tempDir, storage);
+		// No ensureOnDisk(): the destination file does not exist yet.
+		expect(manager.bindCreatedDestinationStrict()).toEqual({ kind: "error", reason: "missing" });
+		expect(manager.getStrictObjectIdentity()).toBeUndefined();
+	});
+
+	it("a bound full rewrite after pathname replacement fails closed, leaving the successor untouched", async () => {
+		const manager = SessionManager.create(tempDir, tempDir, storage);
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile()!;
+		manager.bindCreatedDestinationStrict();
+		const identity = manager.getStrictObjectIdentity()!;
+
+		installSuccessor(sessionFile, "successor-transcript\n");
+		expect(fs.statSync(sessionFile, { bigint: true }).ino).not.toBe(identity.ino);
+
+		await expect(manager.rewriteEntries()).rejects.toThrow();
+		// The successor transcript was never truncated or renamed over.
+		expect(fs.readFileSync(sessionFile, "utf-8")).toBe("successor-transcript\n");
+
+		await manager.close().catch(() => {});
+	});
+
+	it("a bound append reopen after pathname replacement fails closed, leaving the successor untouched", async () => {
+		const manager = SessionManager.create(tempDir, tempDir, storage);
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile()!;
+		manager.bindCreatedDestinationStrict();
+		const identity = manager.getStrictObjectIdentity()!;
+
+		installSuccessor(sessionFile, "successor-transcript\n");
+		expect(fs.statSync(sessionFile, { bigint: true }).ino).not.toBe(identity.ino);
+
+		// The hot append path reopens a bound writer synchronously; a replacement
+		// throws before any byte reaches the successor.
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "post-replacement", timestamp: Date.now() }),
+		).toThrow();
+		expect(fs.readFileSync(sessionFile, "utf-8")).toBe("successor-transcript\n");
+
+		await manager.close().catch(() => {});
+	});
+
+	it("an ordinary unbound session still replaces the file via atomic rename (inode changes)", async () => {
+		const manager = SessionManager.create(tempDir, tempDir, storage);
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile()!;
+
+		expect(manager.getStrictObjectIdentity()).toBeUndefined();
+		const beforeIno = fs.statSync(sessionFile, { bigint: true }).ino;
+
+		manager.appendMessage({ role: "user", content: "rewrite", timestamp: Date.now() });
+		await manager.rewriteEntries();
+
+		// Ordinary path renames a temp over the file: a fresh inode replaces the old one.
+		expect(fs.statSync(sessionFile, { bigint: true }).ino).not.toBe(beforeIno);
+		await manager.close();
 	});
 });

@@ -1,5 +1,6 @@
 import path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
+import { enrichBrokerAuthority, SdkBrokerAuthorityError } from "../broker/client-authority";
 import { ensureBroker } from "../broker/ensure";
 import { SdkClient, SdkClientError } from "../client/client";
 import {
@@ -108,6 +109,8 @@ function asString(args: Arguments, name: string): string | null {
 function resultError(error: unknown): { ok: false; error: { code: string; message: string; path?: string } } {
 	if (error instanceof SdkDiscoveryError)
 		return { ok: false, error: { code: error.code, path: path.basename(error.path), message: error.message } };
+	if (error instanceof SdkBrokerAuthorityError)
+		return { ok: false, error: { code: error.code, message: error.message } };
 	if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
 	return {
 		ok: false,
@@ -253,7 +256,8 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 				const broker = await readSdkBrokerDiscovery(agentDir);
 				if (!broker) return { ok: false, error: { code: "not_found", message: "SDK broker not found" } };
 				client = await connect(broker.url, broker.token);
-				const response = await client.global(operation, input, { idempotencyKey });
+				const globalInput = await enrichBrokerAuthority(client, broker, operation, input);
+				const response = await client.global(operation, globalInput, { idempotencyKey });
 				return isLifecycleOperation(operation) ? redactLifecycleCredentials(response) : response;
 			} catch (error) {
 				return resultError(error);

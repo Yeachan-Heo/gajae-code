@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { getProjectDir } from "@gajae-code/utils";
 import type { Args } from "../src/cli/args";
 import { parseArgs } from "../src/cli/args";
 import {
@@ -177,7 +178,7 @@ describe("bare resume startup gating", () => {
 			},
 		});
 		expect(pickerEvents).toEqual(["theme", "list"]);
-		expect(listedCwd).toBe(process.cwd());
+		expect(listedCwd).toBe(getProjectDir());
 		expect(listedSessionDir).toBe("/sessions/custom");
 		expect(pickerCalls).toBe(0);
 		expect(opens).toBe(0);

@@ -1,7 +1,10 @@
 import * as fs from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { getAgentDir } from "@gajae-code/utils";
+import { enrichBrokerAuthority, SdkBrokerAuthorityError } from "../broker/client-authority";
+import type { BrokerDiscovery } from "../broker/discovery";
 import { ensureBroker } from "../broker/ensure";
+
 import {
 	listSdkSessionEndpoints,
 	readSdkBrokerDiscovery,
@@ -148,11 +151,12 @@ async function confirmEndpointCredentialOutput(): Promise<boolean> {
 	}
 }
 
-async function connectBroker(agentDir: string): Promise<SdkClient> {
+async function connectBroker(agentDir: string): Promise<{ client: SdkClient; discovery: BrokerDiscovery }> {
 	await ensureBroker({ agentDir });
 	const discovery = await readSdkBrokerDiscovery(agentDir);
 	if (!discovery) throw new SdkSessionCliError("broker_unavailable", "SDK broker discovery is unavailable.", 1);
-	return await SdkClient.connect(discovery.url, discovery.token);
+	const client = await SdkClient.connect(discovery.url, discovery.token);
+	return { client, discovery };
 }
 
 async function connectSession(repo: string, sessionId: string): Promise<SdkClient> {
@@ -175,9 +179,10 @@ function brokerAbsent(error: unknown): boolean {
 
 async function runList(repo: string, agentDir: string): Promise<unknown> {
 	try {
-		const client = await connectBroker(agentDir);
+		const { client, discovery } = await connectBroker(agentDir);
 		try {
-			return await client.global("session.list", {});
+			const listInput = await enrichBrokerAuthority(client, discovery, "session.list", {});
+			return await client.global("session.list", listInput);
 		} finally {
 			await client.close();
 		}
@@ -239,9 +244,10 @@ export async function runSdkSessionCli(
 			const idempotencyKey = args.idempotencyKey;
 			if (isLifecycleOperation(operation) && !idempotencyKey)
 				throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for lifecycle operations.", 2);
-			const client = await connectBroker(agentDir);
+			const { client, discovery } = await connectBroker(agentDir);
 			try {
-				writeOutput(await client.global(operation, input, { idempotencyKey }));
+				const globalInput = await enrichBrokerAuthority(client, discovery, operation, input);
+				writeOutput(await client.global(operation, globalInput, { idempotencyKey }));
 			} finally {
 				await client.close();
 			}
@@ -260,15 +266,17 @@ export async function runSdkSessionCli(
 		const cliError =
 			error instanceof SdkSessionCliError
 				? error
-				: error instanceof SdkClientError
+				: error instanceof SdkBrokerAuthorityError
 					? new SdkSessionCliError(error.code, error.message, 1)
-					: error instanceof SdkDiscoveryError
+					: error instanceof SdkClientError
 						? new SdkSessionCliError(error.code, error.message, 1)
-						: new SdkSessionCliError(
-								"operation_failed",
-								error instanceof Error ? error.message : "SDK operation failed.",
-								1,
-							);
+						: error instanceof SdkDiscoveryError
+							? new SdkSessionCliError(error.code, error.message, 1)
+							: new SdkSessionCliError(
+									"operation_failed",
+									error instanceof Error ? error.message : "SDK operation failed.",
+									1,
+								);
 		writeOutput({ ok: false, error: { code: cliError.code, message: cliError.message } });
 		setExitCode(cliError.exitCode);
 	}

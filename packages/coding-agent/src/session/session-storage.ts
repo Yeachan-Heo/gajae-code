@@ -86,6 +86,17 @@ export interface SessionStorageWriterOpenOptions {
 	onError?: (err: Error) => void;
 	/** Injectable OS-close dispatcher; defaults to `fs.closeSync`. */
 	closeAdapter?: SessionStorageWriterCloseAdapter;
+	/**
+	 * Expected stable object identity `{dev, ino}`. When set, the writer opens the
+	 * pathname no-follow WITHOUT truncating, fstats the descriptor, and compares
+	 * dev/ino before any mutation. A mismatch (pathname replacement, deletion, or
+	 * symlink) closes the descriptor and throws before a single byte is written or
+	 * truncated. For a full-rewrite (`"w"`) open the validated descriptor is
+	 * truncated in place, binding the rewrite to the authorized object rather than a
+	 * pathname rename/replacement. Omitted for ordinary sessions, which retain the
+	 * existing create/truncate/append semantics over the public pathname.
+	 */
+	expectedObjectIdentity?: SessionStorageFileIdentity;
 }
 
 export interface SessionStorageWriter {
@@ -142,10 +153,10 @@ export interface SessionStorage {
 	unlinkSync(path: string): void;
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
 	/**
-	 * Verified hard delete bound to exact identity evidence. Removes the verified
-	 * artifact directory first, revalidates, and unlinks the transcript last. Returns
-	 * typed partial-cleanup evidence for exact-identity retry; never returns success
-	 * for a partial deletion.
+	 * Verified logical delete bound to exact identity evidence. Removes the verified
+	 * artifact directory first, revalidates, and tombstones the transcript through the
+	 * retained descriptor last. Returns typed partial-cleanup evidence for exact-identity
+	 * retry; never returns success for a partial deletion.
 	 */
 	deleteSessionVerified?(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult>;
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter;
@@ -164,8 +175,8 @@ export interface SessionStorageFileIdentity {
 /**
  * Full five-field transcript file identity (dev, ino, size, mtimeMs, mtimeNs).
  * Preserved end-to-end from broker validation through {@link deleteSessionVerified};
- * every field is revalidated immediately before the unlink/rename delete effect so
- * an in-place-modified transcript (same dev/ino, changed size/mtime) cannot be deleted.
+ * every field is revalidated immediately before the descriptor-bound tombstone effect
+ * so an in-place-modified transcript (same dev/ino, changed size/mtime) cannot be deleted.
  */
 export interface SessionStorageTranscriptIdentity {
 	dev: bigint;
@@ -183,13 +194,19 @@ export type VerifiedDeleteFailureKind =
 	| "identity"
 	| "header"
 	| "cwd"
-	| "artifacts";
+	| "artifacts"
+	| "stale";
 
 /**
  * Thrown by {@link deleteSessionVerified} when canonical containment, transcript
  * non-symlink/identity, header id/cwd, parent identity, or artifact identity
- * verification fails. These are visible, sanitized failures: they never mutate
- * the transcript or artifacts and grant zero authority.
+ * verification fails, or when the public name no longer resolves to the authorized
+ * descriptor identity after the tombstone effect (`stale`). Failures detected
+ * before artifact cleanup mutate neither transcript nor artifacts. Identity drift
+ * detected after artifact cleanup leaves the transcript untouched but may leave
+ * auxiliary artifacts removed. A `stale` failure means the authorized object was
+ * tombstoned through the descriptor while a replacement at the public name
+ * survived untouched.
  */
 export class SessionDeleteVerificationError extends Error {
 	readonly kind: VerifiedDeleteFailureKind;
@@ -197,6 +214,37 @@ export class SessionDeleteVerificationError extends Error {
 		super(message, options);
 		this.name = "SessionDeleteVerificationError";
 		this.kind = kind;
+	}
+}
+/**
+ * Sentinel for a pathname that could not be resolved to any object: the file was
+ * missing, unopenable, or a symlink, so there is no real {dev, ino} to compare.
+ */
+const MISSING_OBJECT_IDENTITY: SessionStorageFileIdentity = { dev: -1n, ino: -1n };
+/**
+ * Thrown when a descriptor-bound persist writer (append or full rewrite) opens a
+ * pathname that no longer resolves to the authorized {dev, ino} object. The
+ * descriptor is closed before any mutation, so a successor installed at the public
+ * pathname is never written or truncated: future persistence fails closed rather
+ * than silently adopting a replacement. `actual` is {@link MISSING_OBJECT_IDENTITY}
+ * when the pathname could not be opened or stated at all.
+ */
+export class SessionStorageObjectIdentityError extends Error {
+	override readonly name = "SessionStorageObjectIdentityError";
+	readonly expected: SessionStorageFileIdentity;
+	readonly actual: SessionStorageFileIdentity;
+	constructor(
+		pathname: string,
+		expected: SessionStorageFileIdentity,
+		actual: SessionStorageFileIdentity,
+		options?: ErrorOptions,
+	) {
+		super(
+			`Persist writer object identity mismatch at ${pathname}: expected {dev:${expected.dev},ino:${expected.ino}}, got {dev:${actual.dev},ino:${actual.ino}}`,
+			options,
+		);
+		this.expected = expected;
+		this.actual = actual;
 	}
 }
 
@@ -226,8 +274,9 @@ export interface VerifiedSessionDeleteTarget {
 }
 
 /**
- * Outcome of a verified hard delete. Artifact removal happens first; only after
- * revalidation is the transcript unlinked last. A partial deletion returns
+ * Outcome of a verified logical delete. Artifact removal happens first; only after
+ * revalidation is the transcript tombstoned through the retained descriptor last
+ * (the public pathname is never unlinked). A partial deletion returns
  * `cleanup_pending` with exact evidence for same-connection retry — never
  * `deleted` and never `{}`.
  */
@@ -249,6 +298,56 @@ export type VerifiedSessionDeleteResult =
 			/** Transcript identity at failure time for retry binding. */
 			transcriptIdentity: SessionStorageFileIdentity;
 	  };
+
+/** Canonical logical-deletion marker written through the authorized descriptor. */
+export const SESSION_DELETED_TOMBSTONE_TYPE = "session_deleted";
+
+/**
+ * Canonical logical-deletion tombstone. Written through the authorized transcript
+ * descriptor (truncate + fsync) in place of the session header: the public
+ * transcript pathname is never unlinked, so a path replacement cannot be deleted.
+ * Strict inventory recognizes and omits only this exact schema; a malformed
+ * lookalike fails closed instead of being treated as deleted.
+ */
+export interface SessionDeletedTombstone extends Record<string, unknown> {
+	type: typeof SESSION_DELETED_TOMBSTONE_TYPE;
+	id: string;
+	cwd: string;
+	deletedAt: string;
+}
+
+/** True only for the exact canonical `session_deleted` tombstone schema. */
+export function isCanonicalSessionDeletedTombstone(
+	header: Record<string, unknown> | undefined,
+): header is SessionDeletedTombstone {
+	if (!header) return false;
+	const keys = Object.keys(header).sort();
+	const deletedAt = header.deletedAt;
+	return (
+		keys.length === 4 &&
+		keys[0] === "cwd" &&
+		keys[1] === "deletedAt" &&
+		keys[2] === "id" &&
+		keys[3] === "type" &&
+		header.type === SESSION_DELETED_TOMBSTONE_TYPE &&
+		typeof header.id === "string" &&
+		header.id.length > 0 &&
+		typeof header.cwd === "string" &&
+		typeof deletedAt === "string" &&
+		Number.isFinite(Date.parse(deletedAt))
+	);
+}
+
+/** Canonical tombstone JSONL line (with trailing newline) for descriptor-bound deletion. */
+function sessionDeletedTombstoneLine(sessionId: string, cwd: string): string {
+	const tombstone: SessionDeletedTombstone = {
+		type: SESSION_DELETED_TOMBSTONE_TYPE,
+		id: sessionId,
+		cwd,
+		deletedAt: new Date().toISOString(),
+	};
+	return `${JSON.stringify(tombstone)}\n`;
+}
 
 /** Default OS-close dispatcher: a direct `fs.closeSync`. */
 const defaultCloseAdapter: SessionStorageWriterCloseAdapter = {
@@ -283,10 +382,67 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		if (!fs.existsSync(dir)) {
 			fs.mkdirSync(dir, { recursive: true });
 		}
-		// Open file once, keep fd for lifetime
-		this.#fd = fs.openSync(fpath, flags === "w" ? "w" : "a");
+		// Open file once, keep fd for lifetime. A descriptor-bound open (expected
+		// object identity set) opens no-follow WITHOUT truncating, validates dev/ino
+		// from the descriptor, and only then truncates through it for a full rewrite;
+		// a pathname replacement fails closed before any mutation.
+		this.#fd = options?.expectedObjectIdentity
+			? this.#openBoundDescriptor(fpath, flags, options.expectedObjectIdentity)
+			: fs.openSync(fpath, flags === "w" ? "w" : "a");
 		// Register for cleanup if abandoned without close()
 		writerRegistry.register(this, this.#fd, this);
+	}
+	/**
+	 * Descriptor-bound open used when {@link SessionStorageWriterOpenOptions.expectedObjectIdentity}
+	 * is set. Opens the pathname no-follow WITHOUT truncating, fstats the descriptor,
+	 * and compares dev/ino to the authorized object before any mutation. A mismatch
+	 * (replacement, deletion, symlink, or non-regular file) closes the descriptor and
+	 * throws before a byte is written. For a full-rewrite (`"w"`) open the validated
+	 * descriptor is truncated in place via `ftruncate`, binding the rewrite to the
+	 * authorized inode rather than a pathname rename/replacement.
+	 */
+	#openBoundDescriptor(fpath: string, flags: "a" | "w", expected: SessionStorageFileIdentity): number {
+		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+		// Open no-follow without truncating. O_APPEND gives append semantics for "a";
+		// the "w" path truncates through the validated descriptor via ftruncate after
+		// the dev/ino match, never via O_TRUNC.
+		const openFlags = (flags === "w" ? fs.constants.O_RDWR : fs.constants.O_RDWR | fs.constants.O_APPEND) | noFollow;
+		let fd: number;
+		try {
+			fd = fs.openSync(fpath, openFlags);
+		} catch (err) {
+			throw new SessionStorageObjectIdentityError(fpath, expected, MISSING_OBJECT_IDENTITY, {
+				cause: toError(err),
+			});
+		}
+		let stat: fs.BigIntStats;
+		try {
+			stat = fs.fstatSync(fd, { bigint: true });
+		} catch (err) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Best-effort: we are about to throw the identity mismatch regardless.
+			}
+			throw new SessionStorageObjectIdentityError(fpath, expected, MISSING_OBJECT_IDENTITY, {
+				cause: toError(err),
+			});
+		}
+		const actual: SessionStorageFileIdentity = { dev: stat.dev, ino: stat.ino };
+		if (!stat.isFile() || actual.dev !== expected.dev || actual.ino !== expected.ino) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Best-effort: the mismatch is reported, not the close error.
+			}
+			throw new SessionStorageObjectIdentityError(fpath, expected, actual);
+		}
+		if (flags === "w") {
+			// Descriptor-bound rewrite: truncate ONLY through the validated descriptor.
+			// The inode is preserved; the public pathname is never replaced.
+			fs.ftruncateSync(fd, 0);
+		}
+		return fd;
 	}
 
 	#recordError(err: unknown): Error {
@@ -530,9 +686,13 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 	/**
-	 * Verified hard delete bound to exact identity evidence. Artifact directory first,
-	 * revalidate, transcript last. Partial deletion returns typed cleanup_pending
-	 * evidence; identity/symlink/containment/header/cwd mismatch throws.
+	 * Verified logical delete bound to exact identity evidence and the authorized
+	 * transcript descriptor. Opens the transcript once with no-follow read/write flags,
+	 * validates the full five-field identity and header from that descriptor, retains it
+	 * through artifact cleanup, revalidates the descriptor, then truncates + fsyncs a
+	 * canonical `session_deleted` tombstone through it. The public pathname is never
+	 * unlinked; after the effect the public name must still resolve to the authorized
+	 * (dev, ino) or a typed `stale` failure is thrown (a replacement survived untouched).
 	 */
 	async deleteSessionVerified(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult> {
 		const { sessionsRoot, transcriptPath, sessionId, cwd, transcriptIdentity, expectedArtifactsIdentity } = target;
@@ -542,77 +702,92 @@ export class FileSessionStorage implements SessionStorage {
 		if (!pathIsWithin(sessionsRoot, transcriptPath)) {
 			throw new SessionDeleteVerificationError("containment", "Transcript is outside the sessions root");
 		}
-		const initial = this.#verifiedReadAndHeader(transcriptPath, sessionId, cwd);
-		const initialStat = initial.snapshot.stat;
-		if (!sameVerifiedTranscriptStat(initialStat, transcriptIdentity)) {
-			throw new SessionDeleteVerificationError("identity", "Transcript identity does not match authorization");
-		}
-		const parentIdentity = this.#directoryIdentity(path.dirname(transcriptPath));
 
-		const artifactsDir = transcriptPath.slice(0, -6);
-		const artifactsIdentity = this.#optionalDirectoryIdentity(artifactsDir);
-		if (artifactsIdentity) {
-			if (
-				expectedArtifactsIdentity &&
-				(artifactsIdentity.dev !== expectedArtifactsIdentity.dev ||
-					artifactsIdentity.ino !== expectedArtifactsIdentity.ino)
-			) {
+		// Open the authorized transcript ONCE with no-follow read/write flags and retain
+		// the descriptor through validation, artifact cleanup, and the destructive effect.
+		// The effect is object-bound to this descriptor's (dev, ino); the public pathname
+		// is never unlinked, so a path replacement cannot be deleted.
+		const fd = this.#openTranscriptDescriptor(transcriptPath);
+		try {
+			const initialStat = this.#readHeaderFromDescriptor(fd, sessionId, cwd);
+			if (!sameVerifiedTranscriptStat(initialStat, transcriptIdentity)) {
+				throw new SessionDeleteVerificationError("identity", "Transcript identity does not match authorization");
+			}
+			const parentIdentity = this.#directoryIdentity(path.dirname(transcriptPath));
+
+			const artifactsDir = transcriptPath.slice(0, -6);
+			const artifactsIdentity = this.#optionalDirectoryIdentity(artifactsDir);
+			if (artifactsIdentity) {
+				if (
+					expectedArtifactsIdentity &&
+					(artifactsIdentity.dev !== expectedArtifactsIdentity.dev ||
+						artifactsIdentity.ino !== expectedArtifactsIdentity.ino)
+				) {
+					throw new SessionDeleteVerificationError(
+						"artifacts",
+						"Artifact directory identity does not match recorded cleanup evidence",
+					);
+				}
+				try {
+					await fsp.rm(artifactsDir, { recursive: true, force: true });
+				} catch (err) {
+					return {
+						kind: "cleanup_pending",
+						phase: "artifacts",
+						error: toError(err),
+						artifactsIdentity,
+						transcriptIdentity: { dev: initialStat.dev, ino: initialStat.ino },
+					};
+				}
+			}
+
+			// Revalidate the retained descriptor: the bound object must be unchanged.
+			const revalidateStat = this.#fstatDescriptor(fd);
+			if (!sameVerifiedTranscriptStat(revalidateStat, transcriptIdentity)) {
 				throw new SessionDeleteVerificationError(
-					"artifacts",
-					"Artifact directory identity does not match recorded cleanup evidence",
+					"identity",
+					"Transcript identity does not match authorization after artifact removal",
 				);
 			}
+			const parentIdentityNow = this.#directoryIdentity(path.dirname(transcriptPath));
+			if (parentIdentityNow.dev !== parentIdentity.dev || parentIdentityNow.ino !== parentIdentity.ino) {
+				throw new SessionDeleteVerificationError("identity", "Parent directory identity changed during deletion");
+			}
+
+			// Destructive effect bound to the descriptor: truncate + write + fsync the
+			// canonical tombstone through the retained descriptor. The pathname is untouched.
 			try {
-				await fsp.rm(artifactsDir, { recursive: true, force: true });
+				this.#writeTombstoneViaDescriptor(fd, sessionId, cwd);
 			} catch (err) {
 				return {
 					kind: "cleanup_pending",
-					phase: "artifacts",
+					phase: "transcript",
 					error: toError(err),
-					artifactsIdentity,
-					transcriptIdentity: { dev: initialStat.dev, ino: initialStat.ino },
+					transcriptIdentity: { dev: revalidateStat.dev, ino: revalidateStat.ino },
 				};
 			}
-		}
 
-		const revalidate = this.#verifiedReadAndHeader(transcriptPath, sessionId, cwd);
-		const revalidateStat = revalidate.snapshot.stat;
-		if (!sameVerifiedTranscriptStat(revalidateStat, transcriptIdentity)) {
-			throw new SessionDeleteVerificationError(
-				"identity",
-				"Transcript identity does not match authorization after artifact removal",
-			);
+			// Post-effect verification: the public name must still resolve to the authorized
+			// descriptor identity (dev, ino). A replacement installed at the pathname during
+			// the window survived untouched (the pathname was never unlinked) and is reported
+			// as a typed `stale` failure rather than being silently deleted.
+			const publicIdentity = this.#publicNameIdentity(transcriptPath);
+			if (publicIdentity.dev !== initialStat.dev || publicIdentity.ino !== initialStat.ino) {
+				throw new SessionDeleteVerificationError(
+					"stale",
+					"Public transcript name no longer resolves to the authorized descriptor identity",
+				);
+			}
+			return { kind: "deleted" };
+		} finally {
+			fs.closeSync(fd);
 		}
-		const parentIdentityNow = this.#directoryIdentity(path.dirname(transcriptPath));
-		if (parentIdentityNow.dev !== parentIdentity.dev || parentIdentityNow.ino !== parentIdentity.ino) {
-			throw new SessionDeleteVerificationError("identity", "Parent directory identity changed during deletion");
-		}
-
-		try {
-			await this.unlink(transcriptPath);
-		} catch (err) {
-			if (isEnoent(err)) return { kind: "deleted" };
-			return {
-				kind: "cleanup_pending",
-				phase: "transcript",
-				error: toError(err),
-				transcriptIdentity: {
-					dev: revalidateStat.dev,
-					ino: revalidateStat.ino,
-				},
-			};
-		}
-		return { kind: "deleted" };
 	}
 
-	#verifiedReadAndHeader(
-		transcriptPath: string,
-		expectedSessionId: string,
-		expectedCwd: string,
-	): { snapshot: SessionStorageSnapshot } {
-		let snapshot: SessionStorageSnapshot;
+	/** Open the transcript once with no-follow read/write flags; symlink/stat failures map to typed errors. */
+	#openTranscriptDescriptor(transcriptPath: string): number {
 		try {
-			snapshot = this.readSnapshotSync(transcriptPath);
+			return fs.openSync(transcriptPath, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0));
 		} catch (err) {
 			const code = (err as NodeJS.ErrnoException)?.code;
 			if (code === "ELOOP" || code === "SYMLINK") {
@@ -622,10 +797,15 @@ export class FileSessionStorage implements SessionStorage {
 				cause: toError(err),
 			});
 		}
-		if (!snapshot.stat.isFile) {
+	}
+
+	/** fstat + read + header/id/cwd validation from one retained descriptor. */
+	#readHeaderFromDescriptor(fd: number, expectedSessionId: string, expectedCwd: string): SessionStorageStat {
+		const stat = statFromNode(fs.fstatSync(fd, { bigint: true }));
+		if (!stat.isFile) {
 			throw new SessionDeleteVerificationError("symlink", "Transcript is not a regular file");
 		}
-		const header = parseFirstJsonlLine(snapshot.bytes);
+		const header = parseFirstJsonlLine(fs.readFileSync(fd));
 		if (!header) {
 			throw new SessionDeleteVerificationError("header", "Transcript header is missing or unreadable");
 		}
@@ -641,7 +821,43 @@ export class FileSessionStorage implements SessionStorage {
 		if (canonicalPathSync(header.cwd) !== canonicalPathSync(expectedCwd)) {
 			throw new SessionDeleteVerificationError("cwd", "Transcript header cwd does not match authorization");
 		}
-		return { snapshot };
+		return stat;
+	}
+
+	/** fstat the retained descriptor for five-field revalidation. */
+	#fstatDescriptor(fd: number): SessionStorageStat {
+		return statFromNode(fs.fstatSync(fd, { bigint: true }));
+	}
+
+	/** Truncate + write + fsync the canonical tombstone through the retained descriptor. */
+	#writeTombstoneViaDescriptor(fd: number, sessionId: string, cwd: string): void {
+		const tombstoneBuf = Buffer.from(sessionDeletedTombstoneLine(sessionId, cwd), "utf-8");
+		fs.ftruncateSync(fd, 0);
+		let written = 0;
+		while (written < tombstoneBuf.length) {
+			const n = fs.writeSync(fd, tombstoneBuf, written, tombstoneBuf.length - written, written);
+			if (n === 0) throw new Error("Short tombstone write");
+			written += n;
+		}
+		fs.fsyncSync(fd);
+	}
+
+	/** Resolve the public pathname to its (dev, ino); a missing name is reported as `stale`. */
+	#publicNameIdentity(transcriptPath: string): SessionStorageFileIdentity {
+		try {
+			const stat = fs.statSync(transcriptPath, { bigint: true });
+			return { dev: stat.dev, ino: stat.ino };
+		} catch (err) {
+			if (isEnoent(err)) {
+				throw new SessionDeleteVerificationError(
+					"stale",
+					"Public transcript name no longer resolves to the authorized descriptor identity",
+				);
+			}
+			throw new SessionDeleteVerificationError("stat", "Public transcript name could not be inspected", {
+				cause: toError(err),
+			});
+		}
 	}
 
 	#directoryIdentity(dirPath: string): SessionStorageFileIdentity {
@@ -731,6 +947,20 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		this.#path = path;
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter;
+		const expected = options?.expectedObjectIdentity;
+		if (expected) {
+			// Descriptor-bound parity: a pathname that does not resolve to the authorized
+			// {dev, ino} fails closed before any append/truncate. The memory backend
+			// preserves the entry inode across writeTextSync, so a bound rewrite keeps the
+			// same object identity after truncation.
+			if (!this.#storage.existsSync(path)) {
+				throw new SessionStorageObjectIdentityError(path, expected, MISSING_OBJECT_IDENTITY);
+			}
+			const stat = this.#storage.statSync(path);
+			if (stat.dev !== expected.dev || stat.ino !== expected.ino) {
+				throw new SessionStorageObjectIdentityError(path, expected, { dev: stat.dev, ino: stat.ino });
+			}
+		}
 		if ((options?.flags ?? "a") === "w") {
 			this.#storage.writeTextSync(path, "");
 		}
@@ -984,7 +1214,23 @@ export class MemorySessionStorage implements SessionStorage {
 				new SessionDeleteVerificationError("artifacts", "Artifact path exists but is not a directory"),
 			);
 		}
-		this.#files.delete(transcriptPath);
+		// Logical-deletion parity with the file backend: write the canonical tombstone in
+		// place (preserving the entry identity) instead of removing the key, so the public
+		// name still resolves to the authorized object and is never unlinked.
+		const authorizedIno = entry.ino;
+		this.writeTextSync(transcriptPath, sessionDeletedTombstoneLine(sessionId, cwd));
+		// Post-effect verification parity: the public key must still resolve to the
+		// authorized identity (dev/ino). writeTextSync preserves the ino of an existing
+		// entry, so this holds in the single-threaded memory backend.
+		const publicStat = this.statSync(transcriptPath);
+		if (publicStat.ino !== authorizedIno) {
+			return Promise.reject(
+				new SessionDeleteVerificationError(
+					"stale",
+					"Public transcript name no longer resolves to the authorized descriptor identity",
+				),
+			);
+		}
 		return Promise.resolve({ kind: "deleted" });
 	}
 

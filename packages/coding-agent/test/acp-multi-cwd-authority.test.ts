@@ -13,6 +13,7 @@ type TestSessionIdentity = {
 	ino: string;
 	size: number;
 	mtimeMs: number;
+	sha256: string;
 	mtimeNs: string;
 };
 type BrokerSession = {
@@ -60,15 +61,43 @@ function incarnation(seed: string): string {
 	return createHash("sha256").update(seed).digest("hex");
 }
 
-function savedIdentity(tag: string): TestSessionIdentity {
-	const digest = createHash("sha256").update(tag).digest("hex");
+/** Deterministic transcript fixture bytes bound to an identity tag. */
+function transcriptFixtureBytes(identityTag: string): string {
+	return JSON.stringify({ type: "session", id: "fixture", tag: identityTag }).concat("\n");
+}
+
+/**
+ * Writes the fixture transcript bound to an identity tag and returns the exact
+ * opened identity the production broker issues: bigint fstat {dev,ino,size,mtime}
+ * plus a SHA-256 digest over the same descriptor-bound bytes. Recreating under a
+ * new tag rewrites the file, so dev/ino/size/mtime/sha256 drift keeps the stale
+ * and recreation oracles meaningful.
+ */
+function writeTranscriptIdentity(transcriptPath: string, identityTag: string): TestSessionIdentity {
+	fs.writeFileSync(transcriptPath, transcriptFixtureBytes(identityTag));
+	const stat = fs.statSync(transcriptPath, { bigint: true });
 	return {
-		dev: "2049",
-		ino: String((BigInt(`0x${digest.slice(0, 12)}`) % 1_000_000n) + 1n),
-		size: 1024,
-		mtimeMs: Number((BigInt(`0x${digest.slice(12, 24)}`) % 1_000_000n) + 1_700_000_000_000n),
-		mtimeNs: String((BigInt(`0x${digest.slice(24, 36)}`) % 1_000_000_000n) + 1n),
+		dev: stat.dev.toString(),
+		ino: stat.ino.toString(),
+		size: Number(stat.size),
+		mtimeMs: Number(stat.mtimeMs),
+		mtimeNs: stat.mtimeNs.toString(),
+		sha256: createHash("sha256").update(fs.readFileSync(transcriptPath)).digest("hex"),
 	};
+}
+
+/** Exact workspace object identity {dev,ino} from a bigint fstat of the opened directory. */
+function workspaceIdentityOf(cwd: string): { dev: string; ino: string } | undefined {
+	try {
+		const stat = fs.statSync(realpath(cwd), { bigint: true });
+		return { dev: stat.dev.toString(), ino: stat.ino.toString() };
+	} catch {
+		return undefined;
+	}
+}
+function workspaceGrantIdOf(cwd: string): string | undefined {
+	const identity = workspaceIdentityOf(cwd);
+	return identity ? `test-grant:${identity.dev}:${identity.ino}` : undefined;
 }
 
 function liveSession(sessionId: string, repo: string, seed: string, generation = 1): BrokerSession {
@@ -83,12 +112,13 @@ function liveSession(sessionId: string, repo: string, seed: string, generation =
 }
 
 function savedSession(sessionId: string, repo: string, identityTag: string): BrokerSession {
+	const transcriptPath = path.join(repo, `${sessionId}.jsonl`);
 	return {
 		sessionId,
 		locator: { repo },
 		canonicalCwd: repo,
-		path: path.join(repo, `${sessionId}.jsonl`),
-		sessionIdentity: savedIdentity(identityTag),
+		path: transcriptPath,
+		sessionIdentity: writeTranscriptIdentity(transcriptPath, identityTag),
 	};
 }
 
@@ -110,6 +140,7 @@ async function createHarness(): Promise<{
 	refreshEndpointClosed(): Promise<void>;
 	setBrokerIdentity(identity: { ownerId: string; packageGeneration: string; startedAt: number }): void;
 	setMutateOnGetEndpoint(fn: (() => void) | undefined): void;
+	setMutateOnEndpointOpen(fn: (() => void) | undefined): void;
 	reverseReadTextFileCalls: number;
 	sendEndpointFrame(frame: Record<string, unknown>): void;
 }> {
@@ -131,6 +162,7 @@ async function createHarness(): Promise<{
 		startedAt: Date.now(),
 	};
 	let mutateOnGetEndpoint: (() => void) | undefined;
+	let mutateOnEndpointOpen: (() => void) | undefined;
 	let reverseReadTextFileCalls = 0;
 
 	let broker!: TestServer;
@@ -151,6 +183,18 @@ async function createHarness(): Promise<{
 					id?: string;
 				};
 				requests.push(frame);
+				const requestInput = (frame.input ?? {}) as { brokerOwnerId?: unknown };
+				if (typeof requestInput.brokerOwnerId !== "string" || requestInput.brokerOwnerId.length === 0) {
+					socket.send(
+						JSON.stringify({
+							type: "broker_response",
+							id: frame.id,
+							ok: false,
+							error: { code: "invalid_input", message: "brokerOwnerId must be a non-empty string" },
+						}),
+					);
+					return;
+				}
 				if (frame.operation === "session.list") {
 					const requestedId = frame.input?.resolveSessionId;
 					const requestedCwd = frame.input?.cwd;
@@ -159,15 +203,23 @@ async function createHarness(): Promise<{
 							session =>
 								session.sessionId === requestedId && realpath(session.locator.repo) === realpath(requestedCwd),
 						);
+						const scope = workspaceIdentityOf(requestedCwd);
 						const result = {
 							brokerIdentity: brokerIdentityValue,
+							...(scope ? { workspaceIdentity: scope } : {}),
+							...(scope ? { workspaceGrantId: workspaceGrantIdOf(requestedCwd) } : {}),
 							...(match
 								? {
 										canonicalCwd: realpath(requestedCwd),
 										savedSession: {
 											id: match.sessionId,
 											path: match.path ?? path.join(match.locator.repo, `${match.sessionId}.jsonl`),
-											sessionIdentity: match.sessionIdentity ?? savedIdentity(`${match.sessionId}-default`),
+											sessionIdentity:
+												match.sessionIdentity ??
+												writeTranscriptIdentity(
+													match.path ?? path.join(match.locator.repo, `${match.sessionId}.jsonl`),
+													`${match.sessionId}-default`,
+												),
 										},
 									}
 								: {
@@ -186,6 +238,7 @@ async function createHarness(): Promise<{
 						return;
 					}
 					const canonical = typeof requestedCwd === "string" ? realpath(requestedCwd) : undefined;
+					const scope = typeof requestedCwd === "string" ? workspaceIdentityOf(requestedCwd) : undefined;
 					const sessions = brokerSessions.map(session => ({
 						...session,
 						canonicalCwd: realpath(session.locator.repo),
@@ -194,6 +247,8 @@ async function createHarness(): Promise<{
 						brokerIdentity: brokerIdentityValue,
 						sessions,
 						...(canonical ? { canonicalCwd: canonical } : {}),
+						...(scope ? { workspaceIdentity: scope } : {}),
+						...(scope && canonical ? { workspaceGrantId: workspaceGrantIdOf(canonical) } : {}),
 					};
 					socket.send(
 						JSON.stringify({
@@ -201,6 +256,23 @@ async function createHarness(): Promise<{
 							id: frame.id,
 							ok: true,
 							result,
+						}),
+					);
+					return;
+				}
+				if (frame.operation === "session.create") {
+					const createdId = `created-${brokerSessions.length + 1}`;
+					const createCwd = typeof frame.input?.cwd === "string" ? frame.input.cwd : cwdA;
+					brokerSessions = [...brokerSessions, liveSession(createdId, createCwd, `${createdId}-inc`)];
+					socket.send(
+						JSON.stringify({
+							type: "broker_response",
+							id: frame.id,
+							ok: true,
+							result: {
+								sessionId: createdId,
+								endpoint: { url: `ws://127.0.0.1:${endpointPort}`, token: endpointToken },
+							},
 						}),
 					);
 					return;
@@ -249,6 +321,11 @@ async function createHarness(): Promise<{
 			open(socket) {
 				endpointPort = endpoint.port;
 				endpointSocket = socket;
+				if (mutateOnEndpointOpen) {
+					const fn = mutateOnEndpointOpen;
+					mutateOnEndpointOpen = undefined;
+					fn();
+				}
 				socket.send(
 					JSON.stringify({
 						type: "hello",
@@ -360,14 +437,15 @@ async function createHarness(): Promise<{
 			);
 		},
 		recreateSaved(sessionId, repo, identityTag) {
+			const transcriptPath = path.join(repo, `${sessionId}.jsonl`);
 			brokerSessions = brokerSessions.map(session =>
 				session.sessionId === sessionId
 					? {
 							...session,
 							locator: { repo },
 							canonicalCwd: repo,
-							path: path.join(repo, `${sessionId}.jsonl`),
-							sessionIdentity: savedIdentity(identityTag),
+							path: transcriptPath,
+							sessionIdentity: writeTranscriptIdentity(transcriptPath, identityTag),
 						}
 					: session,
 			);
@@ -397,6 +475,9 @@ async function createHarness(): Promise<{
 		},
 		setMutateOnGetEndpoint(fn) {
 			mutateOnGetEndpoint = fn;
+		},
+		setMutateOnEndpointOpen(fn) {
+			mutateOnEndpointOpen = fn;
 		},
 		get reverseReadTextFileCalls() {
 			return reverseReadTextFileCalls;
@@ -613,15 +694,9 @@ test("a recreated saved transcript cannot be deleted under stale identity author
 
 test("close and delete idempotency keys are scoped to exact broker authority", async () => {
 	const harness = await createHarness();
-	const identity = savedIdentity("archived-original");
-	harness.setSessions([
-		{
-			...savedSession("archived", harness.cwdA, "archived-original"),
-			path: path.join(harness.cwdA, "archived.jsonl"),
-			sessionIdentity: identity,
-		},
-		liveSession("live-1", harness.cwdA, "live-inc"),
-	]);
+	const archived = savedSession("archived", harness.cwdA, "archived-original");
+	const identity = archived.sessionIdentity!;
+	harness.setSessions([archived, liveSession("live-1", harness.cwdA, "live-inc")]);
 	await harness.agent.listSessions({ cwd: harness.cwdA });
 
 	await expect(harness.agent.closeSession({ sessionId: "live-1" })).resolves.toEqual({});
@@ -828,5 +903,93 @@ test("a stale saved identity blocks fork before any session.fork mutation", asyn
 		}),
 	).rejects.toMatchObject({ code: "conflict" });
 	expect(harness.requests.filter(request => request.operation === "session.fork")).toHaveLength(forkBefore);
+	harness.abort.abort();
+});
+test("a late batch authority failure leaves zero published authority and poisons the connection", async () => {
+	const harness = await createHarness();
+	// Pre-establish "second" in cwdB so a later in-scope observation conflicts mid-batch.
+	harness.setSessions([liveSession("second", harness.cwdB, "second-inc")]);
+	await harness.agent.listSessions({ cwd: harness.cwdB });
+
+	// The broker now returns a cwdA batch where "second" has drifted into cwdA,
+	// conflicting with its committed cwdB authority after "first" has staged.
+	harness.setSessions([
+		liveSession("first", harness.cwdA, "first-inc"),
+		liveSession("second", harness.cwdA, "second-inc"),
+	]);
+	const closeBefore = harness.requests.filter(request => request.operation === "session.close").length;
+	await expect(harness.agent.listSessions({ cwd: harness.cwdA })).rejects.toMatchObject({ code: "conflict" });
+	// Zero published authority: "first" was staged but never committed, so no broker
+	// close targets it and a local close returns cleanly without broker work.
+	expect(harness.requests.filter(request => request.operation === "session.close")).toHaveLength(closeBefore);
+	await expect(harness.agent.closeSession({ sessionId: "first" })).resolves.toEqual({});
+	expect(harness.requests.filter(request => request.operation === "session.close")).toHaveLength(closeBefore);
+	// The connection is permanently poisoned: no further authority can be captured,
+	// even for an id that never conflicted.
+	harness.setSessions([liveSession("first", harness.cwdA, "first-inc")]);
+	await expect(harness.agent.listSessions({ cwd: harness.cwdA })).rejects.toMatchObject({ code: "conflict" });
+	harness.abort.abort();
+});
+
+test("a successfully closed session id is tombstoned and cannot rebind on the same connection", async () => {
+	const harness = await createHarness();
+	harness.setSessions([liveSession("closed-once", harness.cwdA, "closed-inc")]);
+	await harness.agent.listSessions({ cwd: harness.cwdA });
+	await harness.agent.closeSession({ sessionId: "closed-once" });
+
+	// The broker still serves the id in the same scope, but the close tombstone
+	// permanently blocks the reused id from rebinding authority here.
+	harness.setSessions([liveSession("closed-once", harness.cwdA, "closed-inc")]);
+	await expect(harness.agent.listSessions({ cwd: harness.cwdA })).rejects.toMatchObject({ code: "conflict" });
+	harness.abort.abort();
+});
+
+test("a same-generation successor in the post-connect await window cannot publish authority", async () => {
+	const harness = await createHarness();
+	harness.setSessions([liveSession("post-connect", harness.cwdA, "inc-first")]);
+	harness.refreshEndpointClosed();
+	// A same-generation successor replaces the endpoint during the post-connect
+	// await window (socket open), after the pre-attach revalidation has passed.
+	harness.setMutateOnEndpointOpen(() => harness.moveSession("post-connect", harness.cwdA, "inc-second"));
+
+	await expect(
+		harness.agent.loadSession({
+			sessionId: "post-connect",
+			cwd: harness.cwdA,
+			mcpServers: [],
+		}),
+	).rejects.toMatchObject({ code: "conflict" });
+
+	// The connected-but-unpublished adapter is torn down and the successor id is
+	// permanently non-authorizing for the connection lifetime.
+	await harness.endpointClosed;
+	harness.setMutateOnEndpointOpen(undefined);
+	harness.setSessions([liveSession("post-connect", harness.cwdA, "inc-second")]);
+	await expect(harness.agent.closeSession({ sessionId: "post-connect" })).rejects.toMatchObject({
+		code: "conflict",
+	});
+	harness.abort.abort();
+});
+
+test("create and list broker calls carry the observed exact broker owner proof", async () => {
+	const harness = await createHarness();
+	await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+	await harness.agent.listSessions({ cwd: harness.cwdA });
+
+	// Every broker request carries the observed broker owner proof.
+	expect(harness.requests.length).toBeGreaterThan(0);
+	for (const request of harness.requests) expect(request.input?.brokerOwnerId).toBe("test-owner");
+
+	// ACP performs scoped workspace admission (session.list) before session.create,
+	// and create re-sends the workspace identity the broker issued for that admission.
+	const firstListIndex = harness.requests.findIndex(request => request.operation === "session.list");
+	const createIndex = harness.requests.findIndex(request => request.operation === "session.create");
+	expect(firstListIndex).toBeGreaterThanOrEqual(0);
+	expect(createIndex).toBeGreaterThan(firstListIndex);
+	const createRequest = harness.requests[createIndex]!;
+	expect(createRequest.input?.workspaceIdentity).toEqual(workspaceIdentityOf(harness.cwdA));
+	expect(createRequest.input?.workspaceGrantId).toBe(workspaceGrantIdOf(harness.cwdA));
+	const listRequests = harness.requests.filter(request => request.operation === "session.list");
+	expect(listRequests.length).toBeGreaterThan(0);
 	harness.abort.abort();
 });

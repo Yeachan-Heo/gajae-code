@@ -21,11 +21,12 @@ import {
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
 import { SdkClient, SdkClientError } from "../client/client";
+import { WorkspaceCapability, type WorkspaceIdentity } from "./authority";
 import type { Broker, BrokerCleanupEvidence, BrokerResponse } from "./broker";
-
 import type { LifecycleEffectIntent, LifecycleWorktreeIntent } from "./lifecycle-ledger";
 
 import { resolveSdkInternalSpawnCommand } from "./runtime";
+import { endpointIncarnation } from "./session-index";
 
 const READY_TIMEOUT_MS = 10_000;
 const MAX_READY_TIMEOUT_MS = 60_000;
@@ -78,7 +79,12 @@ export interface SessionLifecycleTranscriptIdentity {
 	size: number;
 	mtimeMs: number;
 	mtimeNs: string;
+	/** Required SHA-256 content digest over the same descriptor-bound snapshot. */
+	sha256: string;
 }
+
+/** Exact workspace object identity from a bigint fstat of an opened directory. */
+export type SessionLifecycleWorkspaceIdentity = WorkspaceIdentity;
 
 export interface SessionLifecycleLaunchRequest {
 	operation: "session.create" | "session.fork" | "session.resume";
@@ -95,6 +101,8 @@ export interface SessionLifecycleLaunchRequest {
 	effectMarker?: string;
 	modelPreset?: string;
 	worktree?: SessionLifecycleWorktreeTarget;
+	/** Broker-bound workspace object identity the child must re-bind via fstat(cwd). */
+	workspaceIdentity: SessionLifecycleWorkspaceIdentity;
 }
 
 function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionLifecycleTranscriptIdentity {
@@ -112,7 +120,9 @@ function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionL
 		Number.isFinite(identity.mtimeMs) &&
 		identity.mtimeMs >= 0 &&
 		typeof identity.mtimeNs === "string" &&
-		/^\d+$/.test(identity.mtimeNs)
+		/^\d+$/.test(identity.mtimeNs) &&
+		typeof identity.sha256 === "string" &&
+		/^[0-9a-f]{64}$/.test(identity.sha256)
 	);
 }
 function sameTranscriptIdentity(
@@ -124,7 +134,19 @@ function sameTranscriptIdentity(
 		left.ino === right.ino &&
 		left.size === right.size &&
 		left.mtimeMs === right.mtimeMs &&
-		left.mtimeNs === right.mtimeNs
+		left.mtimeNs === right.mtimeNs &&
+		left.sha256 === right.sha256
+	);
+}
+
+function isWorkspaceIdentity(value: unknown): value is SessionLifecycleWorkspaceIdentity {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const identity = value as Record<string, unknown>;
+	return (
+		typeof identity.dev === "string" &&
+		/^\d+$/.test(identity.dev) &&
+		typeof identity.ino === "string" &&
+		/^\d+$/.test(identity.ino)
 	);
 }
 
@@ -133,18 +155,16 @@ function hasValidTranscriptAuthority(path: unknown, identity: unknown): path is 
 }
 
 /**
- * Compares an optional caller-supplied transcript identity against the freshly
- * validated transcript. Non-ACP callers may omit the identity (compatibility);
- * any supplied identity that does not match all five fields returns endpoint_stale
- * before any launch effect.
+ * Requires the caller to return the complete broker-issued transcript identity,
+ * including its SHA-256 digest, and compares it against the descriptor-bound
+ * snapshot freshly captured by the broker before any lifecycle effect.
  */
 function rejectStaleSuppliedIdentity(
 	supplied: unknown,
 	validated: SessionLifecycleTranscriptIdentity,
 ): BrokerResponse | undefined {
-	if (supplied === undefined) return undefined;
 	if (!isSessionLifecycleTranscriptIdentity(supplied) || !sameTranscriptIdentity(supplied, validated))
-		return fail("endpoint_stale", "Saved session transcript identity is stale.");
+		return fail("endpoint_stale", "Saved session transcript identity is stale or missing.");
 	return undefined;
 }
 
@@ -176,6 +196,7 @@ export function readSessionLifecycleLaunchRequest(value: string | undefined): Se
 			(typeof request.effectMarker !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(request.effectMarker))) ||
 		(request.modelPreset !== undefined && (typeof request.modelPreset !== "string" || !request.modelPreset)) ||
 		(request.worktree !== undefined && !isLifecycleWorktreeTarget(request.worktree)) ||
+		!isWorkspaceIdentity(request.workspaceIdentity) ||
 		(request.operation === "session.resume" &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
 		(request.operation === "session.fork" &&
@@ -266,6 +287,7 @@ type ResumeScope = {
 		size: number;
 		mtimeMs: number;
 		mtimeNs: bigint;
+		sha256: string;
 	};
 };
 function sameResumeLocator(record: LiveResumeRecord, cwd: string, root: string): boolean {
@@ -281,7 +303,8 @@ function sameResumeSessionIdentity(left: ResumeScope, right: ResumeScope): boole
 		left.sessionIdentity.ino === right.sessionIdentity.ino &&
 		left.sessionIdentity.size === right.sessionIdentity.size &&
 		left.sessionIdentity.mtimeMs === right.sessionIdentity.mtimeMs &&
-		left.sessionIdentity.mtimeNs === right.sessionIdentity.mtimeNs
+		left.sessionIdentity.mtimeNs === right.sessionIdentity.mtimeNs &&
+		left.sessionIdentity.sha256 === right.sessionIdentity.sha256
 	);
 }
 function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRecord): boolean {
@@ -300,12 +323,13 @@ type ValidatedTranscript = {
 	identity: SessionLifecycleTranscriptIdentity;
 };
 
-function serializeTranscriptIdentity(identity: {
+export function serializeTranscriptIdentity(identity: {
 	dev: bigint;
 	ino: bigint;
 	size: number;
 	mtimeMs: number;
 	mtimeNs: bigint;
+	sha256: string;
 }): SessionLifecycleTranscriptIdentity {
 	return {
 		dev: identity.dev.toString(),
@@ -313,6 +337,7 @@ function serializeTranscriptIdentity(identity: {
 		size: identity.size,
 		mtimeMs: identity.mtimeMs,
 		mtimeNs: identity.mtimeNs.toString(),
+		sha256: identity.sha256,
 	};
 }
 
@@ -337,10 +362,24 @@ function validateSavedTranscript(
 	if (matches.length !== 1 || !isCanonicalSessionId(matches[0]!.id))
 		return fail("invalid_input", `${label} saved session does not match the requested workspace and session id.`);
 	const match = matches[0]!;
+	// Re-read the matched transcript through the same descriptor-bound capture that
+	// computes the SHA-256 digest, then prove the inventory stat still binds to it.
+	const captured = SessionManager.captureTranscriptStrict(match.path);
+	if (captured.kind !== "captured")
+		return fail("endpoint_stale", `${label} saved session authority changed before launch authorization.`);
+	const identity = captured.snapshot.identity;
+	if (
+		identity.dev !== match.identity.dev ||
+		identity.ino !== match.identity.ino ||
+		identity.size !== match.identity.size ||
+		identity.mtimeMs !== match.identity.mtimeMs ||
+		identity.mtimeNs !== match.identity.mtimeNs
+	)
+		return fail("endpoint_stale", `${label} saved session authority changed before launch authorization.`);
 	return {
 		path: match.path,
 		id: match.id,
-		identity: serializeTranscriptIdentity(match.identity),
+		identity: serializeTranscriptIdentity(identity),
 	};
 }
 async function validateLiveResumeScope(
@@ -397,11 +436,23 @@ async function validateLiveResumeScope(
 	if (matches.length !== 1)
 		return fail("endpoint_stale", "Requested saved session does not match the live session scope.");
 	const session = matches[0]!;
+	const captured = SessionManager.captureTranscriptStrict(canonicalSessionPath);
+	if (captured.kind !== "captured")
+		return fail("endpoint_stale", "Requested saved session authority changed while verifying the live scope.");
+	const capturedIdentity = captured.snapshot.identity;
+	if (
+		capturedIdentity.dev !== session.identity.dev ||
+		capturedIdentity.ino !== session.identity.ino ||
+		capturedIdentity.size !== session.identity.size ||
+		capturedIdentity.mtimeMs !== session.identity.mtimeMs ||
+		capturedIdentity.mtimeNs !== session.identity.mtimeNs
+	)
+		return fail("endpoint_stale", "Requested saved session authority changed while verifying the live scope.");
 	return {
 		cwd,
 		stateRoot: root,
 		sessionPath: canonicalSessionPath,
-		sessionIdentity: session.identity,
+		sessionIdentity: capturedIdentity,
 	};
 }
 async function reconcileReadyScope(broker: Broker, id: string, scope: string | undefined): Promise<void> {
@@ -440,8 +491,29 @@ type ReadyAuthority = {
 	endpointSource: string;
 	endpointMtimeMs: number;
 	endpointGeneration: number;
+	workspaceIdentity: SessionLifecycleWorkspaceIdentity;
+	sourceTranscriptDigest?: string;
+	destinationTranscript?: SessionLifecycleTranscriptIdentity;
 };
 type ReadinessResult = { kind: "ready"; authority: ReadyAuthority } | { kind: "child_exited" } | { kind: "timeout" };
+type LifecycleReadyWitness = EffectMarker & {
+	workspaceIdentity: SessionLifecycleWorkspaceIdentity;
+	sourceTranscriptDigest?: string;
+	destinationTranscript?: SessionLifecycleTranscriptIdentity;
+};
+
+/**
+ * What the broker proves survives through final readiness: the owned effect
+ * marker and process incarnation, the bound workspace object identity, the
+ * source transcript digest (fork/resume), the destination transcript witness,
+ * and the endpoint authority.
+ */
+type ReadinessExpectation = {
+	effect: EffectMarker;
+	workspaceIdentity: SessionLifecycleWorkspaceIdentity;
+	sourceTranscriptDigest?: string;
+	destinationCwd: string;
+};
 const processIncarnationReadersForTest = new WeakMap<Broker, (pid: number) => string | undefined>();
 
 export function setProcessIncarnationForTest(
@@ -657,6 +729,45 @@ async function readEffectMarker(file: string): Promise<EffectMarker | undefined>
 		return undefined;
 	}
 }
+async function readReadyWitness(file: string): Promise<LifecycleReadyWitness | undefined> {
+	try {
+		const value: unknown = JSON.parse(await fs.readFile(file, "utf8"));
+		if (!isEffectMarker(value)) return undefined;
+		const witness = value as Partial<LifecycleReadyWitness>;
+		if (!isWorkspaceIdentity(witness.workspaceIdentity)) return undefined;
+		if (witness.sourceTranscriptDigest !== undefined && !/^[0-9a-f]{64}$/.test(witness.sourceTranscriptDigest))
+			return undefined;
+		if (
+			witness.destinationTranscript !== undefined &&
+			!isSessionLifecycleTranscriptIdentity(witness.destinationTranscript)
+		)
+			return undefined;
+		const ready: LifecycleReadyWitness = {
+			pid: witness.pid!,
+			effectMarker: witness.effectMarker!,
+			incarnation: witness.incarnation!,
+			workspaceIdentity: witness.workspaceIdentity,
+			...(witness.sourceTranscriptDigest ? { sourceTranscriptDigest: witness.sourceTranscriptDigest } : {}),
+			...(witness.destinationTranscript ? { destinationTranscript: witness.destinationTranscript } : {}),
+		};
+		return ready;
+	} catch {
+		return undefined;
+	}
+}
+
+function witnessMatchesExpectation(witness: LifecycleReadyWitness, expectation: ReadinessExpectation): boolean {
+	if (
+		witness.workspaceIdentity.dev !== expectation.workspaceIdentity.dev ||
+		witness.workspaceIdentity.ino !== expectation.workspaceIdentity.ino ||
+		!witness.destinationTranscript
+	)
+		return false;
+	if (expectation.sourceTranscriptDigest !== undefined) {
+		if (witness.sourceTranscriptDigest !== expectation.sourceTranscriptDigest) return false;
+	}
+	return true;
+}
 
 async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
 	await fs.mkdir(path.join(root, "sdk"), { recursive: true, mode: 0o700 });
@@ -666,13 +777,31 @@ async function writeEffectMarker(root: string, id: string, marker: EffectMarker)
 }
 
 /** The child writes this only after its endpoint and semantic ready event are both live. */
-export async function writeSessionLifecycleReady(root: string, id: string, effectMarker: string): Promise<void> {
+export async function writeSessionLifecycleReady(
+	root: string,
+	id: string,
+	witness: {
+		effectMarker: string;
+		workspaceIdentity: SessionLifecycleWorkspaceIdentity;
+		sourceTranscriptDigest?: string;
+		destinationTranscript?: SessionLifecycleTranscriptIdentity;
+	},
+): Promise<void> {
 	const incarnation = processIncarnation(process.pid);
 	if (!incarnation) throw new Error("Lifecycle child has no readable OS incarnation.");
 	await fs.mkdir(path.join(root, "sdk"), { recursive: true, mode: 0o700 });
-	await fs.writeFile(lifecycleReadyPath(root, id), JSON.stringify({ pid: process.pid, effectMarker, incarnation }), {
-		mode: 0o600,
-	});
+	await fs.writeFile(
+		lifecycleReadyPath(root, id),
+		JSON.stringify({
+			pid: process.pid,
+			effectMarker: witness.effectMarker,
+			incarnation,
+			workspaceIdentity: witness.workspaceIdentity,
+			...(witness.sourceTranscriptDigest ? { sourceTranscriptDigest: witness.sourceTranscriptDigest } : {}),
+			...(witness.destinationTranscript ? { destinationTranscript: witness.destinationTranscript } : {}),
+		}),
+		{ mode: 0o600 },
+	);
 }
 
 async function hasDurableProcessIdentity(
@@ -875,9 +1004,11 @@ async function currentReadyAuthority(
 	broker: Broker,
 	id: string,
 	root: string,
-	expected: EffectMarker,
+	expectation: ReadinessExpectation,
 ): Promise<ReadyAuthority | undefined> {
-	if (!(await hasOwnedReadinessEvidence(broker, root, id, expected))) return undefined;
+	if (!(await hasOwnedReadinessEvidence(broker, root, id, expectation.effect))) return undefined;
+	const witness = await readReadyWitness(lifecycleReadyPath(root, id));
+	if (!witness || !witnessMatchesExpectation(witness, expectation)) return undefined;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
 	try {
 		const [endpointSource, endpointMetadata] = await Promise.all([
@@ -894,13 +1025,31 @@ async function currentReadyAuthority(
 		const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 		if (
 			!record?.live ||
-			record.pid !== expected.pid ||
+			record.pid !== expectation.effect.pid ||
 			resolveEquivalentPath(record.locator.stateRoot) !== resolveEquivalentPath(root) ||
 			record.endpointMtimeMs !== endpointMetadata.mtimeMs ||
-			endpoint.pid !== expected.pid ||
+			endpoint.pid !== expectation.effect.pid ||
 			endpoint.sessionId !== id ||
 			typeof endpoint.url !== "string" ||
 			typeof endpoint.token !== "string"
+		)
+			return undefined;
+		// Re-capture the destination transcript on every poll. Readiness is valid
+		// only while the child-reported destination object/content remains the sole
+		// strict inventory candidate for this session id in the bound workspace.
+		const inventory = SessionManager.inventorySessionsStrict(expectation.destinationCwd, {
+			sessionDir: SessionManager.getDefaultSessionDir(expectation.destinationCwd, broker.settings.agentDir),
+		});
+		if (inventory.kind !== "complete") return undefined;
+		const destinations = inventory.candidates.filter(candidate => candidate.id === id);
+		if (destinations.length !== 1 || !witness.destinationTranscript) return undefined;
+		const recaptured = SessionManager.captureTranscriptStrict(destinations[0]!.path);
+		if (
+			recaptured.kind !== "captured" ||
+			!sameTranscriptIdentity(
+				witness.destinationTranscript,
+				serializeTranscriptIdentity(recaptured.snapshot.identity),
+			)
 		)
 			return undefined;
 		return {
@@ -908,6 +1057,9 @@ async function currentReadyAuthority(
 			endpointSource,
 			endpointMtimeMs: endpointMetadata.mtimeMs,
 			endpointGeneration: record.endpointGeneration,
+			workspaceIdentity: witness.workspaceIdentity,
+			...(witness.sourceTranscriptDigest ? { sourceTranscriptDigest: witness.sourceTranscriptDigest } : {}),
+			...(witness.destinationTranscript ? { destinationTranscript: witness.destinationTranscript } : {}),
 		};
 	} catch {
 		return undefined;
@@ -918,7 +1070,14 @@ function sameReadyAuthority(left: ReadyAuthority, right: ReadyAuthority): boolea
 	return (
 		left.endpointSource === right.endpointSource &&
 		left.endpointMtimeMs === right.endpointMtimeMs &&
-		left.endpointGeneration === right.endpointGeneration
+		left.endpointGeneration === right.endpointGeneration &&
+		left.workspaceIdentity.dev === right.workspaceIdentity.dev &&
+		left.workspaceIdentity.ino === right.workspaceIdentity.ino &&
+		left.sourceTranscriptDigest === right.sourceTranscriptDigest &&
+		((!left.destinationTranscript && !right.destinationTranscript) ||
+			(!!left.destinationTranscript &&
+				!!right.destinationTranscript &&
+				sameTranscriptIdentity(left.destinationTranscript, right.destinationTranscript)))
 	);
 }
 
@@ -927,16 +1086,17 @@ async function waitForReady(
 	id: string,
 	root: string,
 	deadline: number,
-	expected: EffectMarker,
+	expectation: ReadinessExpectation,
 ): Promise<ReadinessResult> {
 	while (Date.now() < deadline) {
 		if (
-			observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
-			"exited"
+			observeProcess(expectation.effect.pid, expectation.effect.incarnation, value =>
+				processIncarnationForBroker(broker, value),
+			) === "exited"
 		)
 			return { kind: "child_exited" };
 		try {
-			const authority = await currentReadyAuthority(broker, id, root, expected);
+			const authority = await currentReadyAuthority(broker, id, root, expectation);
 			if (!authority) {
 				const remaining = deadline - Date.now();
 				if (remaining > 0) await sleep(Math.min(POLL_MS, remaining));
@@ -973,7 +1133,7 @@ async function waitForReady(
 						);
 					})
 				) {
-					const current = await currentReadyAuthority(broker, id, root, expected);
+					const current = await currentReadyAuthority(broker, id, root, expectation);
 					if (current && sameReadyAuthority(authority, current)) return { kind: "ready", authority: current };
 				}
 			} finally {
@@ -1165,12 +1325,15 @@ async function validateDeletePath(
 		return fail("not_found", "Requested saved session does not exist or cannot be read.");
 	}
 	const suppliedIdentity = input.sessionIdentity;
+	const snapshotIdentity = serializeTranscriptIdentity({
+		...snapshot.stat,
+		sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+	});
 	if (
-		suppliedIdentity !== undefined &&
-		(!isSessionLifecycleTranscriptIdentity(suppliedIdentity) ||
-			!sameTranscriptIdentity(suppliedIdentity, serializeTranscriptIdentity(snapshot.stat)))
+		!isSessionLifecycleTranscriptIdentity(suppliedIdentity) ||
+		!sameTranscriptIdentity(suppliedIdentity, snapshotIdentity)
 	)
-		return fail("endpoint_stale", "Saved session transcript identity is stale.");
+		return fail("endpoint_stale", "Saved session transcript identity is stale or missing.");
 	try {
 		const newline = snapshot.bytes.indexOf(0x0a);
 		const firstLine = Buffer.from(
@@ -1222,29 +1385,6 @@ type CloseRecord = {
 	endpointMtimeMs?: number;
 	lifecycleRequestId?: string;
 };
-
-function endpointIncarnation(record: CloseRecord, sessionId: string): string | undefined {
-	if (
-		!Number.isSafeInteger(record.endpointGeneration) ||
-		record.endpointGeneration <= 0 ||
-		!Number.isSafeInteger(record.pid) ||
-		record.pid <= 0 ||
-		typeof record.endpointMtimeMs !== "number" ||
-		!Number.isFinite(record.endpointMtimeMs) ||
-		record.endpointMtimeMs <= 0
-	)
-		return undefined;
-	return createHash("sha256")
-		.update(
-			JSON.stringify({
-				endpointGeneration: record.endpointGeneration,
-				endpointMtimeMs: record.endpointMtimeMs,
-				pid: record.pid,
-				sessionId,
-			}),
-		)
-		.digest("hex");
-}
 
 function requestedCloseAuthority(input: Input): { authority: CloseAuthority | undefined } | { error: BrokerResponse } {
 	const endpointGeneration = input.endpointGeneration;
@@ -1329,6 +1469,7 @@ export async function executeLifecycle(
 	operation: string,
 	input: Input,
 	identity: string,
+	borrowedWorkspaceCapability: WorkspaceCapability | undefined,
 ): Promise<BrokerResponse> {
 	const requestedSessionId = sessionId(input);
 	if (requestedSessionId !== undefined && !isCanonicalSessionId(requestedSessionId))
@@ -1351,6 +1492,7 @@ export async function executeLifecycle(
 					return fail("live_session", "Session is already live but its endpoint incarnation is unavailable.");
 				const endpoint = await broker.handleRequest("session.get_endpoint", {
 					sessionId: requestedSessionId,
+					brokerOwnerId: broker.ownerId,
 					endpointGeneration: existing.endpointGeneration,
 					endpointIncarnation: initialIncarnation,
 				});
@@ -1391,145 +1533,253 @@ export async function executeLifecycle(
 				"incarnation_unavailable",
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
-		const effectMarker = randomUUID();
-		const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
-		const effectIntent: LifecycleEffectIntent = {
-			sessionId: launch.id,
-			...(plannedWorktreeIntent ? { worktree: plannedWorktreeIntent } : {}),
+		// Keep the admitted workspace-root capability alive through the complete
+		// lifecycle effect. A planned worktree is a second authority object: create it
+		// only while the root remains bound, then open and retain its own capability
+		// for child startup/readiness. Borrowed grants remain broker-owned.
+		const workspaceRoot = lifecycleCwd(input);
+		if (!workspaceRoot) return fail("invalid_input", "A target path is required.");
+		let rootCapability = borrowedWorkspaceCapability;
+		let ownsRootCapability = false;
+		if (!rootCapability) {
+			try {
+				rootCapability = await WorkspaceCapability.open(workspaceRoot);
+				ownsRootCapability = true;
+			} catch {
+				return fail("endpoint_stale", "Lifecycle workspace root could not be opened for authority binding.");
+			}
+		}
+		let workspaceCapability = rootCapability;
+		let ownsWorkspaceCapability = false;
+		let workspaceIdentity = workspaceCapability.identity;
+		const assertRootBound = async (): Promise<boolean> => {
+			try {
+				await rootCapability.assertPathStillBound(workspaceRoot);
+				return true;
+			} catch {
+				return false;
+			}
 		};
+		const assertWorkspaceBound = async (): Promise<boolean> => {
+			try {
+				await workspaceCapability.assertPathStillBound(launch.cwd);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		try {
+			if (!(await assertRootBound()))
+				return fail("endpoint_stale", "Lifecycle workspace root identity changed before preparation.");
+			const effectMarker = randomUUID();
+			const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
+			const effectIntent: LifecycleEffectIntent = {
+				sessionId: launch.id,
+				...(plannedWorktreeIntent ? { worktree: plannedWorktreeIntent } : {}),
+			};
 
-		await broker.ledger.transition(identity, "effect_started", {
-			intendedSessionId: launch.id,
-			effectMarker,
-			effectIntent,
-		});
-		if (!hasProcessIncarnationAuthority())
-			return fail(
-				"incarnation_unavailable",
-				"OS process incarnation authority is unavailable; refusing to prepare a lifecycle worktree.",
-			);
-		let worktreeReceipt: SessionLifecycleWorktreeReceipt | undefined;
-		try {
-			if (launch.worktreePlan) worktreeReceipt = preparePlannedWorktree(launch.worktreePlan);
-		} catch (error) {
-			return fail(
-				"spawn_failed",
-				`Unable to prepare lifecycle worktree: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
-		const cleanupReserveMs = Math.min(CLOSE_TIMEOUT_MS, Math.max(1, Math.floor(timeout / 4)));
-		const readinessDeadline = lifecycleDeadline - cleanupReserveMs;
-		if (Date.now() >= readinessDeadline)
-			return fail("readiness_timeout", "Lifecycle preparation exhausted the readiness deadline before spawning.");
-		if (!hasProcessIncarnationAuthority())
-			return fail(
-				"incarnation_unavailable",
-				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
-			);
-		const cmd = command();
-		const request: SessionLifecycleLaunchRequest = {
-			operation,
-			sessionId: launch.id,
-			cwd: launch.cwd,
-			stateRoot: launch.root,
-			effectMarker,
-			...(launch.sourceSessionId ? { sourceSessionId: launch.sourceSessionId } : {}),
-			...(launch.sourceSessionPath ? { sourceSessionPath: launch.sourceSessionPath } : {}),
-			...(launch.sourceSessionIdentity ? { sourceSessionIdentity: launch.sourceSessionIdentity } : {}),
-			...(launch.sourceCwd ? { sourceCwd: launch.sourceCwd } : {}),
-			...(launch.sessionPath ? { sessionPath: launch.sessionPath } : {}),
-			...(launch.sessionIdentity ? { sessionIdentity: launch.sessionIdentity } : {}),
-			...(launch.modelPreset ? { modelPreset: launch.modelPreset } : {}),
-			...(launch.worktree ? { worktree: launch.worktree } : {}),
-		};
-		let child: ChildProcess | undefined;
-		let spawnedAuthority: EffectMarker | undefined;
-		try {
-			const spawned = spawn(cmd.file, cmd.args, {
-				cwd: launch.cwd,
-				detached: true,
-				stdio: "ignore",
-				env: {
-					...process.env,
-					GJC_AGENT_DIR: broker.settings.agentDir,
-					GJC_CODING_AGENT_DIR: broker.settings.agentDir,
-					GJC_SESSION_ID: launch.id,
-					GJC_STATE_ROOT: launch.root,
-					GJC_LIFECYCLE_REQUEST_ID: effectMarker,
-					GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
-				},
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: launch.id,
+				effectMarker,
+				effectIntent,
 			});
-			child = spawned;
-			const pid = spawned.pid;
-			if (!pid) throw new Error("spawned session has no pid");
-			const incarnation = processIncarnationForBroker(broker, pid);
-			if (!incarnation) throw new Error("spawned session has no readable OS incarnation");
-			spawnedAuthority = { pid, effectMarker, incarnation };
-			await writeEffectMarker(launch.root, launch.id, spawnedAuthority);
-			spawned.unref();
-		} catch (error) {
-			const terminated = child
-				? await terminateSpawnedChild(child, broker, launch.id, launch.root, lifecycleDeadline, spawnedAuthority)
-				: true;
-			return terminated
-				? fail("spawn_failed", `Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`)
-				: fail(
-						"terminal_uncertain",
-						`Unable to establish spawned-session ownership and could not prove the child dead: ${error instanceof Error ? error.message : String(error)}`,
-					);
-		}
-		if (!child || !spawnedAuthority)
-			return fail("spawn_failed", "Unable to retain the spawned session process identity.");
-		await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
-		const readiness = await waitForReady(broker, launch.id, launch.root, readinessDeadline, spawnedAuthority);
-		if (readiness.kind !== "ready") {
-			const terminated = await terminateSpawnedChild(
-				child,
-				broker,
-				launch.id,
-				launch.root,
-				lifecycleDeadline,
-				spawnedAuthority,
-			);
-			if (!terminated)
+			if (!hasProcessIncarnationAuthority())
 				return fail(
-					"terminal_uncertain",
-					`Session ${launch.id} did not become ready and its spawned process could not be verified dead.`,
+					"incarnation_unavailable",
+					"OS process incarnation authority is unavailable; refusing to prepare a lifecycle worktree.",
 				);
-			return readiness.kind === "child_exited"
-				? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
-				: fail(
-						"readiness_timeout",
-						`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
-					);
-		}
-		await reconcileReadyScope(broker, launch.id, launch.cwd);
-		const verified = await currentReadyAuthority(broker, launch.id, launch.root, spawnedAuthority);
-		if (!verified || !sameReadyAuthority(readiness.authority, verified)) {
-			const terminated = await terminateSpawnedChild(
-				child,
-				broker,
-				launch.id,
-				launch.root,
-				lifecycleDeadline,
-				spawnedAuthority,
-			);
-			return terminated
-				? fail("endpoint_stale", "Session endpoint changed while lifecycle readiness was being verified.")
-				: fail(
-						"terminal_uncertain",
-						"Session readiness authority changed and its spawned process could not be verified dead.",
-					);
-		}
-		return {
-			ok: true,
-			result: {
+			let worktreeReceipt: SessionLifecycleWorktreeReceipt | undefined;
+			try {
+				if (launch.worktreePlan) worktreeReceipt = preparePlannedWorktree(launch.worktreePlan);
+			} catch (error) {
+				return fail(
+					"spawn_failed",
+					`Unable to prepare lifecycle worktree: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+			// The source workspace root must still be the exact admitted object after
+			// worktree preparation. Only then may the new worktree become the child
+			// workspace authority retained through spawn and readiness.
+			if (!(await assertRootBound()))
+				return fail("endpoint_stale", "Lifecycle workspace root identity changed during preparation.");
+			if (launch.cwd !== path.resolve(workspaceRoot)) {
+				try {
+					workspaceCapability = await WorkspaceCapability.open(launch.cwd);
+					ownsWorkspaceCapability = true;
+					workspaceIdentity = workspaceCapability.identity;
+				} catch {
+					return fail("endpoint_stale", "Lifecycle worktree could not be opened for authority binding.");
+				}
+			}
+			if (!(await assertWorkspaceBound()))
+				return fail("endpoint_stale", "Lifecycle workspace object identity changed during preparation.");
+			const cleanupReserveMs = Math.min(CLOSE_TIMEOUT_MS, Math.max(1, Math.floor(timeout / 4)));
+			const readinessDeadline = lifecycleDeadline - cleanupReserveMs;
+			if (Date.now() >= readinessDeadline)
+				return fail("readiness_timeout", "Lifecycle preparation exhausted the readiness deadline before spawning.");
+			if (!hasProcessIncarnationAuthority())
+				return fail(
+					"incarnation_unavailable",
+					"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
+				);
+			const cmd = command();
+			const sourceTranscriptDigest =
+				operation === "session.resume"
+					? launch.sessionIdentity?.sha256
+					: operation === "session.fork"
+						? launch.sourceSessionIdentity?.sha256
+						: undefined;
+			const request: SessionLifecycleLaunchRequest = {
+				operation,
 				sessionId: launch.id,
 				cwd: launch.cwd,
-				endpoint: verified.endpoint,
-				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
-			},
-		};
+				stateRoot: launch.root,
+				effectMarker,
+				workspaceIdentity,
+				...(launch.sourceSessionId ? { sourceSessionId: launch.sourceSessionId } : {}),
+				...(launch.sourceSessionPath ? { sourceSessionPath: launch.sourceSessionPath } : {}),
+				...(launch.sourceSessionIdentity ? { sourceSessionIdentity: launch.sourceSessionIdentity } : {}),
+				...(launch.sourceCwd ? { sourceCwd: launch.sourceCwd } : {}),
+				...(launch.sessionPath ? { sessionPath: launch.sessionPath } : {}),
+				...(launch.sessionIdentity ? { sessionIdentity: launch.sessionIdentity } : {}),
+				...(launch.modelPreset ? { modelPreset: launch.modelPreset } : {}),
+				...(launch.worktree ? { worktree: launch.worktree } : {}),
+			};
+			let child: ChildProcess | undefined;
+			let spawnedAuthority: EffectMarker | undefined;
+			try {
+				const spawned = spawn(cmd.file, cmd.args, {
+					cwd: launch.cwd,
+					detached: true,
+					stdio: "ignore",
+					env: {
+						...process.env,
+						GJC_AGENT_DIR: broker.settings.agentDir,
+						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
+						GJC_SESSION_ID: launch.id,
+						GJC_STATE_ROOT: launch.root,
+						GJC_LIFECYCLE_REQUEST_ID: effectMarker,
+						GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+					},
+				});
+				child = spawned;
+				const pid = spawned.pid;
+				if (!pid) throw new Error("spawned session has no pid");
+				const incarnation = processIncarnationForBroker(broker, pid);
+				if (!incarnation) throw new Error("spawned session has no readable OS incarnation");
+				spawnedAuthority = { pid, effectMarker, incarnation };
+				await writeEffectMarker(launch.root, launch.id, spawnedAuthority);
+				spawned.unref();
+			} catch (error) {
+				const terminated = child
+					? await terminateSpawnedChild(child, broker, launch.id, launch.root, lifecycleDeadline, spawnedAuthority)
+					: true;
+				return terminated
+					? fail(
+							"spawn_failed",
+							`Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`,
+						)
+					: fail(
+							"terminal_uncertain",
+							`Unable to establish spawned-session ownership and could not prove the child dead: ${error instanceof Error ? error.message : String(error)}`,
+						);
+			}
+			if (!child || !spawnedAuthority)
+				return fail("spawn_failed", "Unable to retain the spawned session process identity.");
+			// Assert the opened workspace object still binds immediately after spawn.
+			if (!(await assertWorkspaceBound())) {
+				const terminated = await terminateSpawnedChild(
+					child,
+					broker,
+					launch.id,
+					launch.root,
+					lifecycleDeadline,
+					spawnedAuthority,
+				);
+				return terminated
+					? fail("endpoint_stale", "Lifecycle workspace object identity changed after spawning.")
+					: fail(
+							"terminal_uncertain",
+							"Lifecycle workspace object identity changed after spawning and its spawned process could not be verified dead.",
+						);
+			}
+			const expectation: ReadinessExpectation = {
+				effect: spawnedAuthority,
+				workspaceIdentity,
+				destinationCwd: launch.cwd,
+				...(sourceTranscriptDigest ? { sourceTranscriptDigest } : {}),
+			};
+			await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
+			const readiness = await waitForReady(broker, launch.id, launch.root, readinessDeadline, expectation);
+			if (readiness.kind !== "ready") {
+				const terminated = await terminateSpawnedChild(
+					child,
+					broker,
+					launch.id,
+					launch.root,
+					lifecycleDeadline,
+					spawnedAuthority,
+				);
+				if (!terminated)
+					return fail(
+						"terminal_uncertain",
+						`Session ${launch.id} did not become ready and its spawned process could not be verified dead.`,
+					);
+				return readiness.kind === "child_exited"
+					? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
+					: fail(
+							"readiness_timeout",
+							`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
+						);
+			}
+			await reconcileReadyScope(broker, launch.id, launch.cwd);
+			// Assert the opened workspace object still binds immediately before success.
+			if (!(await assertWorkspaceBound())) {
+				const terminated = await terminateSpawnedChild(
+					child,
+					broker,
+					launch.id,
+					launch.root,
+					lifecycleDeadline,
+					spawnedAuthority,
+				);
+				return terminated
+					? fail("endpoint_stale", "Lifecycle workspace object identity changed before readiness.")
+					: fail(
+							"terminal_uncertain",
+							"Lifecycle workspace object identity changed before readiness and its spawned process could not be verified dead.",
+						);
+			}
+			const verified = await currentReadyAuthority(broker, launch.id, launch.root, expectation);
+			if (!verified || !sameReadyAuthority(readiness.authority, verified)) {
+				const terminated = await terminateSpawnedChild(
+					child,
+					broker,
+					launch.id,
+					launch.root,
+					lifecycleDeadline,
+					spawnedAuthority,
+				);
+				return terminated
+					? fail("endpoint_stale", "Session endpoint changed while lifecycle readiness was being verified.")
+					: fail(
+							"terminal_uncertain",
+							"Session readiness authority changed and its spawned process could not be verified dead.",
+						);
+			}
+			return {
+				ok: true,
+				result: {
+					sessionId: launch.id,
+					cwd: launch.cwd,
+					endpoint: verified.endpoint,
+					...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
+				},
+			};
+		} finally {
+			if (ownsWorkspaceCapability) await workspaceCapability.close();
+			if (ownsRootCapability) await rootCapability.close();
+		}
 	}
 
 	const id = sessionId(input);
@@ -1554,6 +1804,7 @@ export async function executeLifecycle(
 		let note: string | undefined;
 		let endpointResult = await broker.handleRequest("session.get_endpoint", {
 			sessionId: id,
+			brokerOwnerId: broker.ownerId,
 			endpointGeneration: record.endpointGeneration,
 		});
 		if (!endpointResult.ok && endpointResult.error.code === "endpoint_stale" && !requestedAuthority.authority) {
@@ -1563,6 +1814,7 @@ export async function executeLifecycle(
 				record = refreshed;
 				endpointResult = await broker.handleRequest("session.get_endpoint", {
 					sessionId: id,
+					brokerOwnerId: broker.ownerId,
 					endpointGeneration: record.endpointGeneration,
 				});
 			}
@@ -1582,6 +1834,7 @@ export async function executeLifecycle(
 				});
 				const refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
 					sessionId: id,
+					brokerOwnerId: broker.ownerId,
 					endpointGeneration: record.endpointGeneration,
 				});
 				if (!refreshedEndpointResult.ok) return refreshedEndpointResult;
@@ -1666,6 +1919,14 @@ export async function executeLifecycle(
 		if (record?.live) return fail("live_session", "Refusing to delete a live session; close it first.");
 		const validated = await validateDeletePath(broker, input, id, record);
 		if ("ok" in validated) return validated;
+		// Reassert the borrowed workspace grant still binds before the delete effect.
+		if (borrowedWorkspaceCapability) {
+			try {
+				await borrowedWorkspaceCapability.assertPathStillBound(validated.target.cwd);
+			} catch {
+				return fail("endpoint_stale", "Workspace root no longer binds to its grant before deletion.");
+			}
+		}
 		await broker.ledger.transition(identity, "effect_started", {
 			intendedSessionId: id,
 			effectMarker: randomUUID(),

@@ -1,4 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,13 +17,39 @@ type TestServer = {
 const directories: string[] = [];
 const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
 
-const SAVED_IDENTITY = {
-	dev: "1",
-	ino: "2",
-	size: 3,
-	mtimeMs: 4,
-	mtimeNs: "4000000",
-};
+/** Exact transcript identity the production broker issues: bigint fstat plus a SHA-256 over the descriptor-bound bytes. */
+function transcriptIdentityOf(transcriptPath: string): {
+	dev: string;
+	ino: string;
+	size: number;
+	mtimeMs: number;
+	mtimeNs: string;
+	sha256: string;
+} {
+	const stat = fs.statSync(transcriptPath, { bigint: true });
+	return {
+		dev: stat.dev.toString(),
+		ino: stat.ino.toString(),
+		size: Number(stat.size),
+		mtimeMs: Number(stat.mtimeMs),
+		mtimeNs: stat.mtimeNs.toString(),
+		sha256: createHash("sha256").update(fs.readFileSync(transcriptPath)).digest("hex"),
+	};
+}
+
+/** Exact workspace object identity {dev,ino} from a bigint fstat of the opened directory. */
+function workspaceIdentityOf(cwd: string): { dev: string; ino: string } | undefined {
+	try {
+		const stat = fs.statSync(fs.realpathSync(cwd), { bigint: true });
+		return { dev: stat.dev.toString(), ino: stat.ino.toString() };
+	} catch {
+		return undefined;
+	}
+}
+function workspaceGrantIdOf(cwd: string): string | undefined {
+	const identity = workspaceIdentityOf(cwd);
+	return identity ? `test-grant:${identity.dev}:${identity.ino}` : undefined;
+}
 afterEach(async () => {
 	for (const server of servers.splice(0)) server.stop(true);
 	for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
@@ -67,6 +95,18 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				requests.push(frame);
+				const requestInput = (frame.input ?? {}) as { brokerOwnerId?: unknown };
+				if (typeof requestInput.brokerOwnerId !== "string" || requestInput.brokerOwnerId.length === 0) {
+					socket.send(
+						JSON.stringify({
+							type: "broker_response",
+							id: frame.id,
+							ok: false,
+							error: { code: "invalid_input", message: "brokerOwnerId must be a non-empty string" },
+						}),
+					);
+					return;
+				}
 				socket.send(
 					JSON.stringify({
 						type: "broker_response",
@@ -115,7 +155,7 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 		expect.objectContaining({
 			type: "broker_request",
 			operation: "session.list",
-			input: {},
+			input: { brokerOwnerId: "test-owner" },
 		}),
 	]);
 	expect(requests[0]).not.toHaveProperty("sessionId");
@@ -162,6 +202,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let abortAcknowledged = true;
 	let promptDeliveredWhileBusy = false;
 	let holdEndpointResponse = false;
+	let savedIdentity!: {
+		dev: string;
+		ino: string;
+		size: number;
+		mtimeMs: number;
+		mtimeNs: string;
+		sha256: string;
+	};
 	let releaseEndpointResponse: (() => void) | undefined;
 
 	let server!: ReturnType<typeof Bun.serve>;
@@ -193,6 +241,18 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 				}
 				if (frame.type === "broker_request") {
 					brokerRequests.push(frame);
+					const brokerInput = (frame.input ?? {}) as { brokerOwnerId?: unknown };
+					if (typeof brokerInput.brokerOwnerId !== "string" || brokerInput.brokerOwnerId.length === 0) {
+						socket.send(
+							JSON.stringify({
+								type: "broker_response",
+								id: frame.id,
+								ok: false,
+								error: { code: "invalid_input", message: "brokerOwnerId must be a non-empty string" },
+							}),
+						);
+						return;
+					}
 					if (frame.operation === "session.create") {
 						lifecycleInputs.push(frame.input as Record<string, unknown>);
 						socket.send(
@@ -210,6 +270,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					}
 					if (frame.operation === "session.list") {
 						const input = frame.input as Record<string, unknown>;
+						const scopeWorkspace = typeof input.cwd === "string" ? workspaceIdentityOf(input.cwd) : undefined;
 						const sessions = brokerSessions.map(session => {
 							const endpointGeneration =
 								typeof session.endpointGeneration === "number" ? session.endpointGeneration : 1;
@@ -226,7 +287,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 									String(session.sessionId),
 								),
 								path: path.join(cwd, "owned-session.jsonl"),
-								sessionIdentity: SAVED_IDENTITY,
+								sessionIdentity: savedIdentity,
 							};
 						});
 						socket.send(
@@ -240,13 +301,17 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 										packageGeneration: "test",
 										startedAt: contractBrokerStartedAt,
 									},
+									...(scopeWorkspace ? { workspaceIdentity: scopeWorkspace } : {}),
+									...(scopeWorkspace && typeof input.cwd === "string"
+										? { workspaceGrantId: workspaceGrantIdOf(input.cwd) }
+										: {}),
 									...(input.resolveSessionId === "owned-session"
 										? {
 												canonicalCwd: path.resolve(typeof input.cwd === "string" ? input.cwd : cwd),
 												savedSession: {
 													id: "owned-session",
 													path: path.join(cwd, "owned-session.jsonl"),
-													sessionIdentity: SAVED_IDENTITY,
+													sessionIdentity: savedIdentity,
 												},
 											}
 										: {
@@ -386,6 +451,9 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	servers.push(server);
 	await mkdir(path.join(agentDir, "sdk"), { recursive: true });
 	await mkdir(cwd, { recursive: true });
+	const ownedTranscriptPath = path.join(cwd, "owned-session.jsonl");
+	await writeFile(ownedTranscriptPath, JSON.stringify({ type: "session", id: "owned-session" }).concat("\n"));
+	savedIdentity = transcriptIdentityOf(ownedTranscriptPath);
 	await writeFile(
 		path.join(agentDir, "sdk", "broker.json"),
 		JSON.stringify({
@@ -418,7 +486,17 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(initialized.agentCapabilities?.mcpCapabilities).toBeUndefined();
 	const created = await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session");
 	expect(created.sessionId).toBe("owned-session");
-	expect(lifecycleInputs).toEqual([expect.objectContaining({ cwd, modelPreset: "codex-medium" })]);
+	expect(lifecycleInputs).toEqual([
+		expect.objectContaining({
+			cwd,
+			modelPreset: "codex-medium",
+			brokerOwnerId: "test-owner",
+			// ACP performs scoped workspace admission before session.create and
+			// re-sends the workspace identity the broker issued for that admission.
+			workspaceIdentity: workspaceIdentityOf(cwd),
+			workspaceGrantId: workspaceGrantIdOf(cwd),
+		}),
+	]);
 
 	let firstSettled = false;
 	const firstPrompt = agent
@@ -767,7 +845,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		}),
 	).rejects.toThrow("Broker returned ambiguous session authority");
 	expect(brokerRequests.slice(brokerRequestsBeforeConflict)).toEqual([
-		expect.objectContaining({ operation: "session.list", input: { cwd } }),
+		expect.objectContaining({
+			operation: "session.list",
+			input: expect.objectContaining({ cwd, brokerOwnerId: "test-owner" }),
+		}),
 	]);
 	conflictAbort.abort();
 
@@ -795,7 +876,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		}),
 	).rejects.toThrow("Broker returned ambiguous session authority");
 	expect(brokerRequests.slice(brokerRequestsBeforeScopeConflict)).toEqual([
-		expect.objectContaining({ operation: "session.list", input: { cwd } }),
+		expect.objectContaining({
+			operation: "session.list",
+			input: expect.objectContaining({ cwd, brokerOwnerId: "test-owner" }),
+		}),
 	]);
 	scopeConflictAbort.abort();
 	brokerSessions = [

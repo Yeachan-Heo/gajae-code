@@ -31,6 +31,12 @@ function brokerEndpointIncarnation(
 		.digest("hex");
 }
 
+const BROKER_OWNER_ID = "test";
+const brokerWorkspaceGrant = (cwd: string): Record<string, unknown> => ({
+	workspaceGrantId: `grant:${cwd}`,
+	workspaceIdentity: { dev: "1", ino: "1" },
+});
+
 type EndpointRequestHandler = (input: Record<string, unknown>, sessions: Array<Record<string, unknown>>) => unknown;
 type SdkControlServerOptions = {
 	platform?: NodeJS.Platform;
@@ -121,7 +127,16 @@ async function createSdkControlServer(
 						options: { idempotencyKey?: string } = {},
 					) => {
 						controls.push({ operation, input, idempotencyKey: options.idempotencyKey });
-						if (operation === "session.list") return { ok: true, result: { sessions: brokerSessions } };
+						if (operation === "session.list") {
+							const listCwd = typeof input.cwd === "string" ? input.cwd : undefined;
+							return {
+								ok: true,
+								result: {
+									sessions: brokerSessions,
+									...(listCwd ? brokerWorkspaceGrant(listCwd) : {}),
+								},
+							};
+						}
 						if (operation === "session.get_endpoint") {
 							if (endpointRequestHandler) return endpointRequestHandler(input, brokerSessions);
 							return {
@@ -270,17 +285,18 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(publicResult).not.toContain("session-record-secret");
 		expect(publicResult).not.toContain("session-state-secret");
 		expect(controls).toEqual([
-			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
+			{ operation: "session.list", input: { cwd: root, brokerOwnerId: BROKER_OWNER_ID }, idempotencyKey: undefined },
 			{
 				operation: "session.get_endpoint",
 				input: {
 					sessionId: "visible-session",
 					endpointGeneration: 1,
 					endpointIncarnation: brokerEndpointIncarnation("visible-session", 1, 101, 1),
+					brokerOwnerId: BROKER_OWNER_ID,
 				},
 				idempotencyKey: "register-1",
 			},
-			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
+			{ operation: "session.list", input: { cwd: root, brokerOwnerId: BROKER_OWNER_ID }, idempotencyKey: undefined },
 		]);
 	});
 	it("marks lifecycle-created sessions ready after successful SDK lifecycle binding", async () => {
@@ -300,10 +316,48 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			session_state: { state: "ready_for_input", ready_for_input: true },
 		});
 		expect(controls.map(control => control.operation)).toEqual([
+			"session.list",
 			"session.create",
 			"session.list",
 			"session.get_endpoint",
 		]);
+	});
+
+	it("injects mandatory broker owner and workspace grant authority into cwd-bearing lifecycle calls", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "authority-injection",
+			allow_mutation: true,
+		});
+		expect(started).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+
+		const createIndex = controls.findIndex(control => control.operation === "session.create");
+		expect(createIndex).toBeGreaterThan(0);
+		// A scoped, owner-authenticated session.list immediately precedes the create and
+		// carries the exact current discovery owner; it is not caller-supplied.
+		const precedingList = controls[createIndex - 1]!;
+		expect(precedingList).toEqual({
+			operation: "session.list",
+			input: { cwd: root, brokerOwnerId: BROKER_OWNER_ID },
+			idempotencyKey: undefined,
+		});
+		// The create merges the owner proof and the grant + {dev,ino} derived from that list.
+		const create = controls[createIndex]!;
+		expect(create.input).toEqual({
+			cwd: root,
+			target: { path: root },
+			brokerOwnerId: BROKER_OWNER_ID,
+			...brokerWorkspaceGrant(root),
+		});
+		expect(create.idempotencyKey).toBe("authority-injection");
+		// Transient authority is coordinator-derived and never caller-spoofable.
+		expect(create.input.brokerOwnerId).toBe(BROKER_OWNER_ID);
+		expect(typeof create.input.workspaceGrantId).toBe("string");
+		expect(create.input.workspaceIdentity).toEqual({ dev: "1", ino: "1" });
 	});
 
 	it("preserves multiline delegated task text in one SDK turn.prompt control", async () => {
@@ -572,7 +626,9 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			],
 		});
 		expect(JSON.stringify(status)).not.toContain("stale-secret");
-		expect(controls).toEqual([{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined }]);
+		expect(controls).toEqual([
+			{ operation: "session.list", input: { cwd: root, brokerOwnerId: BROKER_OWNER_ID }, idempotencyKey: undefined },
+		]);
 	});
 	it("reads bounded tail output through the SDK", async () => {
 		const root = await tempRoot();
@@ -660,7 +716,13 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(lifecycleControls(controls)).toEqual([
 			{
 				operation: "session.create",
-				input: { cwd: root, target: { path: root }, modelPreset: "codex-eco" },
+				input: {
+					cwd: root,
+					target: { path: root },
+					modelPreset: "codex-eco",
+					brokerOwnerId: BROKER_OWNER_ID,
+					...brokerWorkspaceGrant(root),
+				},
 				idempotencyKey: "preset-start",
 			},
 		]);
@@ -725,6 +787,8 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			input: {
 				cwd: root,
 				target: { path: root, worktree: { enabled: true, name: "hermes" } },
+				brokerOwnerId: BROKER_OWNER_ID,
+				...brokerWorkspaceGrant(root),
 			},
 			idempotencyKey: "worktree-start",
 		});
@@ -1262,7 +1326,16 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		}
 		expect(lifecycleControls(controls)).toEqual(
 			expect.arrayContaining([
-				{ operation: "session.create", input: { cwd: root, target: { path: root } }, idempotencyKey: "plan" },
+				{
+					operation: "session.create",
+					input: {
+						cwd: root,
+						target: { path: root },
+						brokerOwnerId: BROKER_OWNER_ID,
+						...brokerWorkspaceGrant(root),
+					},
+					idempotencyKey: "plan",
+				},
 				{
 					operation: "turn.prompt",
 					input: { text: expect.stringContaining("/skill:ralplan") },

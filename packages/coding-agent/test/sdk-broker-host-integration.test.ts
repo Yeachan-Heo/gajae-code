@@ -38,6 +38,7 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 		)!;
 		expect(
 			await broker.handleRequest("session.get_endpoint", {
+				brokerOwnerId: broker.ownerId,
 				sessionId: "live",
 				endpointGeneration: 1,
 				endpointIncarnation: liveEndpointIncarnation,
@@ -52,17 +53,23 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 				endpointIncarnation: liveEndpointIncarnation,
 			},
 		});
-		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+		expect(await broker.handleRequest("session.list", { brokerOwnerId: broker.ownerId })).toMatchObject({
 			ok: true,
 			result: { indexSeq: 3, sessions: [{ sessionId: "live", live: true, endpointMtimeMs }] },
 		});
 		await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "live", pid: process.pid, token: "replaced" }));
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "live", endpointGeneration: 1 })).toEqual({
+		expect(
+			await broker.handleRequest("session.get_endpoint", {
+				brokerOwnerId: broker.ownerId,
+				sessionId: "live",
+				endpointGeneration: 1,
+			}),
+		).toEqual({
 			ok: false,
 			error: { code: "endpoint_stale", message: "session endpoint is stale" },
 		});
 		await busIndex.append(event("host_unregistered", "live", stateRoot));
-		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+		expect(await broker.handleRequest("session.list", { brokerOwnerId: broker.ownerId })).toMatchObject({
 			ok: true,
 			result: { indexSeq: 4, sessions: [] },
 		});

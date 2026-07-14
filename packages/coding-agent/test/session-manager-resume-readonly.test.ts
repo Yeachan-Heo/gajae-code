@@ -151,18 +151,19 @@ class ReplaceAfterSnapshotStorage extends FileSessionStorage {
 }
 class ReplaceBeforeThirdInspectionStorage extends FileSessionStorage {
 	#stats = 0;
+	readonly #replacementPath: string;
+	readonly #sourcePath: string;
 
-	constructor(
-		private readonly replacementPath: string,
-		private readonly sourcePath: string,
-	) {
+	constructor(replacementPath: string, sourcePath: string) {
 		super();
+		this.#replacementPath = replacementPath;
+		this.#sourcePath = fs.realpathSync(sourcePath);
 	}
 
 	override statSync(filePath: string): SessionStorageStat {
-		if (path.resolve(filePath) === path.resolve(this.sourcePath)) {
+		if (fs.realpathSync(filePath) === this.#sourcePath) {
 			this.#stats++;
-			if (this.#stats === 5) fs.renameSync(this.replacementPath, filePath);
+			if (this.#stats === 5) fs.renameSync(this.#replacementPath, filePath);
 		}
 		return super.statSync(filePath);
 	}

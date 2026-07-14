@@ -10,6 +10,8 @@ import {
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
 	type SessionLifecycleTranscriptIdentity,
+	type SessionLifecycleWorkspaceIdentity,
+	serializeTranscriptIdentity,
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import {
@@ -42,6 +44,21 @@ type LifecycleTranscriptSource = {
 };
 
 function sameTranscriptIdentity(
+	actual: { dev: bigint; ino: bigint; size: number; mtimeMs: number; mtimeNs: bigint; sha256: string },
+	expected: SessionLifecycleTranscriptIdentity,
+): boolean {
+	return (
+		actual.dev.toString() === expected.dev &&
+		actual.ino.toString() === expected.ino &&
+		actual.size === expected.size &&
+		actual.mtimeMs === expected.mtimeMs &&
+		actual.mtimeNs.toString() === expected.mtimeNs &&
+		actual.sha256 === expected.sha256
+	);
+}
+
+/** Stat-only comparison for inventory candidates (which carry no content digest). */
+function sameTranscriptStat(
 	actual: { dev: bigint; ino: bigint; size: number; mtimeMs: number; mtimeNs: bigint },
 	expected: SessionLifecycleTranscriptIdentity,
 ): boolean {
@@ -52,6 +69,18 @@ function sameTranscriptIdentity(
 		actual.mtimeMs === expected.mtimeMs &&
 		actual.mtimeNs.toString() === expected.mtimeNs
 	);
+}
+
+async function lifecycleWorkspaceIdentity(cwd: string): Promise<SessionLifecycleWorkspaceIdentity> {
+	const stat = await fs.stat(cwd, { bigint: true });
+	return { dev: stat.dev.toString(), ino: stat.ino.toString() };
+}
+
+function sameWorkspaceIdentity(
+	left: SessionLifecycleWorkspaceIdentity,
+	right: SessionLifecycleWorkspaceIdentity,
+): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
 }
 
 function lifecycleTranscriptSource(request: SessionLifecycleLaunchRequest, cwd: string): LifecycleTranscriptSource {
@@ -89,7 +118,7 @@ function verifyLifecycleTranscript(
 		candidate =>
 			candidate.path === path.resolve(source.path) &&
 			candidate.id === source.id &&
-			sameTranscriptIdentity(candidate.identity, source.identity),
+			sameTranscriptStat(candidate.identity, source.identity),
 	);
 	if (matches.length !== 1)
 		throw new Error("Lifecycle saved session authority changed before the session host started.");
@@ -172,6 +201,11 @@ async function runSessionHost(): Promise<void> {
 	const cwd = process.cwd();
 	if ((await fs.realpath(request.cwd)) !== (await fs.realpath(cwd)))
 		throw new Error(`Lifecycle worktree mismatch: expected ${request.cwd}, got ${cwd}.`);
+	// Bind the workspace object before reading any history or creating state; a
+	// deleted/recreated directory yields a different {dev,ino} and must abort.
+	const workspaceIdentity = await lifecycleWorkspaceIdentity(cwd);
+	if (!sameWorkspaceIdentity(workspaceIdentity, request.workspaceIdentity))
+		throw new Error("Lifecycle workspace object identity does not match the broker-bound workspace.");
 	if (
 		process.env.GJC_STATE_ROOT !== undefined &&
 		path.resolve(process.env.GJC_STATE_ROOT) !== path.resolve(request.stateRoot)
@@ -205,8 +239,53 @@ async function runSessionHost(): Promise<void> {
 			`Lifecycle session id mismatch: expected ${request.sessionId}, got ${session.sessionManager.getSessionId()}.`,
 		);
 	await session.sessionManager.ensureOnDisk();
+	// Establish stable object-identity ownership of the destination before readiness.
+	// Resume/fork adopted the authorized {dev, ino} when the manager opened; a newly
+	// created session binds its freshly written destination here so every subsequent
+	// persist (append reopen and full rewrite) operates through the authorized inode
+	// and fails closed if the public pathname is later replaced by a successor.
+	if (request.operation === "session.create") {
+		const bound = session.sessionManager.bindCreatedDestinationStrict();
+		if (bound.kind === "error") throw new Error("Lifecycle created destination could not be bound before readiness.");
+	}
+	// Recheck workspace and transcript content after manager open/ensure and before
+	// writing readiness: a same-stat swap or workspace replacement must never succeed.
+	const rebound = await lifecycleWorkspaceIdentity(cwd);
+	if (!sameWorkspaceIdentity(rebound, workspaceIdentity))
+		throw new Error("Lifecycle workspace object identity changed before readiness.");
+	const destinationFile = session.sessionManager.getSessionFile();
+	if (!destinationFile) throw new Error("Lifecycle destination transcript was not created before readiness.");
+	const destination = SessionManager.captureTranscriptStrict(destinationFile);
+	if (destination.kind !== "captured")
+		throw new Error("Lifecycle destination transcript could not be bound before readiness.");
+	const destinationTranscript = serializeTranscriptIdentity(destination.snapshot.identity);
+	// The destination object identity must be bound (resume/fork/create all establish
+	// it above) and must match the captured destination. This is the resulting
+	// identity future persistence is pinned to: a mismatch means readiness would
+	// publish an unbound destination, so abort before any readiness effect.
+	const boundIdentity = session.sessionManager.getStrictObjectIdentity();
+	if (
+		!boundIdentity ||
+		boundIdentity.dev !== destination.snapshot.identity.dev ||
+		boundIdentity.ino !== destination.snapshot.identity.ino
+	)
+		throw new Error("Lifecycle destination object identity is not bound before readiness.");
+	let sourceTranscriptDigest: string | undefined;
+	if (request.operation === "session.resume" && request.sessionIdentity) {
+		// Preserve the pre-effect source digest as a separate readiness witness.
+		// Legitimate session bootstrap may append to the descriptor-bound destination
+		// before readiness, so its freshly captured identity is proven independently.
+		sourceTranscriptDigest = request.sessionIdentity.sha256;
+	} else if (request.operation === "session.fork" && request.sourceSessionIdentity) {
+		sourceTranscriptDigest = request.sourceSessionIdentity.sha256;
+	}
 	if (request.effectMarker)
-		await writeSessionLifecycleReady(request.stateRoot, request.sessionId, request.effectMarker);
+		await writeSessionLifecycleReady(request.stateRoot, request.sessionId, {
+			effectMarker: request.effectMarker,
+			workspaceIdentity: rebound,
+			...(sourceTranscriptDigest ? { sourceTranscriptDigest } : {}),
+			...(destinationTranscript ? { destinationTranscript } : {}),
+		});
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);
 	await new Promise<void>(() => {});

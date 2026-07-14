@@ -60,9 +60,14 @@ describe("SDK broker WebSocket transport", () => {
 				ok: false,
 				error: { code: "invalid_input", message: "malformed JSON" },
 			});
-			const request = { type: "broker_request", id: "list", operation: "session.list", input: {} };
+			const request = {
+				type: "broker_request",
+				id: "list",
+				operation: "session.list",
+				input: { brokerOwnerId: discovery.ownerId },
+			};
 			expect(JSON.stringify(request)).toBe(
-				'{"type":"broker_request","id":"list","operation":"session.list","input":{}}',
+				`{"type":"broker_request","id":"list","operation":"session.list","input":{"brokerOwnerId":"${discovery.ownerId}"}}`,
 			);
 			ws.send(JSON.stringify(request));
 			expect(await nextFrame(ws)).toEqual({
@@ -86,7 +91,7 @@ describe("SDK broker WebSocket transport", () => {
 					type: "broker_request",
 					id: "create",
 					operation: "session.create",
-					input: {},
+					input: { brokerOwnerId: discovery.ownerId },
 					idempotencyKey: "key",
 				}),
 			);
@@ -125,7 +130,12 @@ describe("SDK broker WebSocket transport", () => {
 				error: { code: "payload_too_large", message: "broker JSON frame exceeds 4 MiB limit" },
 			});
 			healthyClient.send(
-				JSON.stringify({ type: "broker_request", id: "healthy-list", operation: "session.list", input: {} }),
+				JSON.stringify({
+					type: "broker_request",
+					id: "healthy-list",
+					operation: "session.list",
+					input: { brokerOwnerId: discovery.ownerId },
+				}),
 			);
 			expect(await nextFrame(healthyClient)).toEqual({
 				type: "broker_response",
