@@ -58,6 +58,12 @@ function isOnPath(dir: string): boolean {
 	return pathDirs().some(d => (realpath(d) ?? d) === want);
 }
 
+function executableNames(command: string): string[] {
+	if (process.platform !== "win32") return [command];
+	const extensions = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").map(ext => ext.trim()).filter(Boolean);
+	return [command, ...extensions.map(ext => `${command}${ext.toLowerCase()}`)];
+}
+
 interface GjcHit {
 	dir: string;
 	file: string;
@@ -69,23 +75,40 @@ function findGjcOnPath(): GjcHit[] {
 	const hits: GjcHit[] = [];
 	const seen = new Set<string>();
 	for (const dir of pathDirs()) {
-		const file = path.join(dir, "gjc");
-		if (seen.has(file) || !lexists(file)) continue;
-		seen.add(file);
-		hits.push({ dir, file, real: realpath(file) });
+		for (const name of executableNames("gjc")) {
+			const file = path.join(dir, name);
+			const key = process.platform === "win32" ? path.normalize(file).toLowerCase() : path.normalize(file);
+			if (seen.has(key) || !lexists(file)) continue;
+			seen.add(key);
+			hits.push({ dir, file, real: realpath(file) });
+			break;
+		}
 	}
 	return hits;
 }
 
-function describe(real: string | null): string {
+function describe(hit: GjcHit): string {
+	const real = hit.real;
 	if (!real) return "broken symlink / unresolved";
 	if (real === cliSourceReal) return "workspace source (cli.ts) — OK";
+	if (resolvesToWorkspaceSource(hit.file)) return "workspace source (Bun shim) — OK";
 	if (/[/\\]dist[/\\]/.test(real)) return `compiled binary: ${real}`;
 	if (real.includes("$bunfs")) return `compiled binary (bunfs): ${real}`;
-	if (real.includes(`${path.sep}node_modules${path.sep}gajae-code${path.sep}`)) {
-		return `published wrapper: ${real}`;
-	}
+	if (real.includes(`${path.sep}node_modules${path.sep}gajae-code${path.sep}`)) return `published wrapper: ${real}`;
 	return real;
+}
+
+function resolvesToWorkspaceSource(fromFile: string): boolean {
+	try {
+		const resolved = Bun.resolveSync("@gajae-code/coding-agent/cli", fromFile);
+		return (realpath(resolved) ?? resolved) === cliSourceReal;
+	} catch {
+		return false;
+	}
+}
+
+function isSourceHit(hit: GjcHit | undefined): boolean {
+	return !!hit && (hit.real === cliSourceReal || resolvesToWorkspaceSource(hit.file));
 }
 
 function smokeTest(gjcPath: string): { ok: boolean; output: string } {
@@ -95,12 +118,12 @@ function smokeTest(gjcPath: string): { ok: boolean; output: string } {
 }
 
 function assertResolvedGjcIsSource(winner: GjcHit | undefined): void {
-	if (!winner || winner.real === cliSourceReal) return;
+	if (!winner || isSourceHit(winner)) return;
 
 	console.error("");
 	console.error("✗ Linked, but `gjc` still resolves to a different command earlier on PATH.");
 	console.error(`  Resolved: ${winner.file}`);
-	console.error(`       -> ${describe(winner.real)}`);
+	console.error(`       -> ${describe(winner)}`);
 	console.error(`  Expected source: ${cliSourceReal}`);
 	console.error(`  The managed link was created at: ${path.join(targetDir, "gjc")}`);
 	console.error("  Move the managed link directory earlier on PATH or remove the shadowing command.");
@@ -169,9 +192,9 @@ function check(): never {
 	}
 
 	const winner = hits[0];
-	const onSource = winner.real === cliSourceReal;
+	const onSource = isSourceHit(winner);
 	console.log(`gjc resolves to: ${winner.file}`);
-	console.log(`            -> ${describe(winner.real)}`);
+	console.log(`            -> ${describe(winner)}`);
 
 	if (!onSource) {
 		console.error("");
@@ -227,7 +250,7 @@ function link(): never {
 	// Warn about any drifted `gjc` that shadows the link (earlier on PATH).
 	for (const hit of findGjcOnPath()) {
 		if (hit.file === target) break; // our link wins from here on
-		if (hit.real === cliSourceReal) continue; // another correct source link — harmless
+		if (isSourceHit(hit)) continue; // another correct source link — harmless
 		if (realpath(hit.file) === realpath(repoBinShadow) || hit.file === repoBinShadow) {
 			fs.rmSync(hit.file, { force: true });
 			console.log(`✓ Removed in-repo shadow: ${hit.file}`);
@@ -235,7 +258,7 @@ function link(): never {
 		}
 		console.warn("");
 		console.warn(`! A different \`gjc\` shadows the dev link (earlier on PATH): ${hit.file}`);
-		console.warn(`    -> ${describe(hit.real)}`);
+		console.warn(`    -> ${describe(hit)}`);
 		if (hit.dir === path.join(HOME, ".bun", "bin")) {
 			console.warn("    Remove the published global install: bun remove -g gajae-code");
 		} else {
