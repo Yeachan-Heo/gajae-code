@@ -38,6 +38,15 @@ class DetachingTerminal implements Terminal {
 		this.#hideCursorFails = fails;
 	}
 
+	setWriteFailureAt(writeFailureAt: number | undefined): void {
+		this.#writeFailureAt = writeFailureAt;
+		if (writeFailureAt === undefined) this.#available = true;
+	}
+
+	failNextWrite(): void {
+		this.#writeFailureAt = this.#writes.length + 1;
+	}
+
 	start(_onInput: (data: string) => void, _onResize: () => void): void {}
 
 	stop(): void {}
@@ -113,6 +122,12 @@ class DetachingTerminal implements Terminal {
 
 	setProgress(active: boolean): void {
 		this.write(active ? "\x1b]9;4;3\x07" : "\x1b]9;4;0;\x07");
+	}
+}
+
+class UnexpectedErrorTerminal extends DetachingTerminal {
+	override write(_data: string): void {
+		throw new Error("unexpected terminal failure");
 	}
 }
 
@@ -249,6 +264,35 @@ describe("terminal detach handling", () => {
 		expect(terminal.writes.length).toBe(writesAfterDetach);
 	});
 
+	it("preserves an unexpected terminal operation error", () => {
+		const tui = new TUI(new UnexpectedErrorTerminal());
+		tui.addChild(new StaticComponent("hello"));
+		expect(() => tui.start()).toThrow("unexpected terminal failure");
+	});
+
+	it("acknowledges structured post-render emissions only after a successful frame write", async () => {
+		const terminal = new DetachingTerminal();
+		const tui = new TUI(terminal);
+		const component = new StaticComponent("hello");
+		const delivered = vi.fn();
+		tui.addChild(component);
+		tui.start();
+		await settle();
+
+		tui.setPostRenderEmitter(() => ({ payload: "overlay", onDelivered: delivered }));
+		terminal.failNextWrite();
+		component.setLine("changed");
+		tui.requestRender(true);
+		await settle();
+		expect(delivered).not.toHaveBeenCalled();
+
+		terminal.setWriteFailureAt(undefined);
+		tui.start();
+		await settle();
+		expect(delivered).toHaveBeenCalledTimes(1);
+		tui.stop();
+	});
+
 	it("swallows cursor cleanup failures and suppresses later renders", async () => {
 		const terminal = new DetachingTerminal();
 		const tui = new TUI(terminal, true);
@@ -268,5 +312,28 @@ describe("terminal detach handling", () => {
 		expect(() => tui.requestRender(true)).not.toThrow();
 		await settle();
 		expect(terminal.writes.length).toBe(writesBeforeCursorFailure);
+	});
+
+	it("reports undeliverable registered cleanup during TUI.stop", () => {
+		const tui = new TUI(new DetachingTerminal());
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const flush = vi.fn(() => false);
+
+		try {
+			tui.registerTerminalCleanup({
+				flush,
+				pendingDiagnostic: () =>
+					"Undeliverable Gajae Pet cleanup at terminal shutdown (Kitty images: 1, Sixel footprints: 1).",
+			});
+
+			tui.stop();
+
+			expect(warn).toHaveBeenCalledWith(
+				"Undeliverable Gajae Pet cleanup at terminal shutdown (Kitty images: 1, Sixel footprints: 1).",
+			);
+			expect(flush).toHaveBeenCalledTimes(1);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 });

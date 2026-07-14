@@ -40,6 +40,19 @@ const SEGMENT_RESET = "\x1b[0m";
 const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
+
+/** An overlay payload whose state transition is acknowledged only after its frame writes. */
+export interface PostRenderEmission {
+	payload: string;
+	onDelivered?: () => void;
+}
+
+/** TUI-lifetime cleanup participant for terminal artifacts that outlive UI components. */
+export interface TerminalCleanupParticipant {
+	flush(): boolean;
+	pendingDiagnostic(): string | null;
+}
+
 type InputListener = (data: string) => InputListenerResult;
 
 /**
@@ -470,6 +483,14 @@ export class Container implements ViewportAnchorProvider {
 	}
 }
 
+function isTerminalDetachError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const code = (error as NodeJS.ErrnoException).code;
+	return (
+		code === "EIO" || code === "EPIPE" || code === "ERR_STREAM_DESTROYED" || code === "ERR_STREAM_WRITE_AFTER_END"
+	);
+}
+
 const MAX_REPORTED_RENDER_ERRORS = 200;
 const reportedRenderErrors = new Set<string>();
 
@@ -629,6 +650,8 @@ export class TUI extends Container {
 	#stopped = false;
 	#terminalUnavailable = false;
 	#bottomPinnedComponent: Component | null = null;
+
+	#terminalCleanupParticipants = new Set<TerminalCleanupParticipant>();
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -976,6 +999,8 @@ export class TUI extends Container {
 		this.#hideCursor();
 		this.#querySixelSupport();
 		this.#queryCellSize();
+		this.flushTerminalCleanup();
+
 		this.requestRender(true);
 	}
 
@@ -1014,9 +1039,15 @@ export class TUI extends Container {
 		}
 		try {
 			operation();
-		} catch {
-			this.#markTerminalUnavailable();
-			return false;
+		} catch (error) {
+			if (isTerminalDetachError(error) || !this.terminal.available) {
+				this.#markTerminalUnavailable();
+				return false;
+			}
+			logger.error("Unexpected terminal operation failure", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			throw error;
 		}
 		if (!this.terminal.available) {
 			this.#markTerminalUnavailable();
@@ -1182,6 +1213,8 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		this.flushTerminalCleanup();
+
 		this.#clearSixelProbeState();
 		this.#stopped = true;
 		if (this.#renderTimer) {
@@ -1206,6 +1239,7 @@ export class TUI extends Container {
 		}
 		this.#showCursor();
 		try {
+			this.#reportUndeliverableTerminalCleanup();
 			this.terminal.stop();
 		} catch {
 			this.#markTerminalUnavailable();
@@ -2589,24 +2623,48 @@ export class TUI extends Container {
 		return { seq, toRow: targetRow };
 	}
 
+	/** Register cleanup work whose delivery must survive a component's disposal. */
+	registerTerminalCleanup(participant: TerminalCleanupParticipant): () => void {
+		this.#terminalCleanupParticipants.add(participant);
+		return () => this.#terminalCleanupParticipants.delete(participant);
+	}
+
+	/** Retry durable cleanup after recovery or before an orderly terminal stop. */
+	flushTerminalCleanup(): void {
+		for (const participant of this.#terminalCleanupParticipants) participant.flush();
+	}
+
+	/** Write cleanup directly and report actual terminal delivery. */
+	writeTerminalCleanup(payload: string): boolean {
+		return this.#writeTerminal(payload);
+	}
+
+	/** Report cleanup that cannot be delivered because this TUI is permanently stopping. */
+	#reportUndeliverableTerminalCleanup(): void {
+		for (const participant of this.#terminalCleanupParticipants) {
+			const diagnostic = participant.pendingDiagnostic();
+			if (diagnostic) console.warn(diagnostic);
+		}
+	}
+
 	/**
 	 * Register an emitter whose escape payload is appended to every render
 	 * write (inside its own synchronized-output block, cursor saved/restored).
 	 * Used for absolute-positioned overlays such as pixel-image pets that live
 	 * outside the line-based component model. Return null to emit nothing.
 	 */
-	setPostRenderEmitter(emitter: (() => string | null) | undefined): void {
+	setPostRenderEmitter(emitter: (() => string | PostRenderEmission | null) | undefined): void {
 		this.#postRenderEmitter = emitter;
 	}
 
-	#postRenderEmitter: (() => string | null) | undefined;
-
+	#postRenderEmitter: (() => string | PostRenderEmission | null) | undefined;
 	#writeRenderBufferAndReanchorImeCursor(
 		buffer: string,
 		cursorPos: { row: number; col: number } | null,
 		totalLines: number,
 	): boolean {
-		const overlay = this.#postRenderEmitter?.();
+		const emitted = this.#postRenderEmitter?.();
+		const overlay = typeof emitted === "string" ? emitted : emitted?.payload;
 		if (overlay) {
 			// DECSC/DECRC keep the hardware cursor stable; the dedicated
 			// synchronized block prevents visible tearing while the overlay
@@ -2614,8 +2672,9 @@ export class TUI extends Container {
 			buffer += `\x1b[?2026h\x1b7${overlay}\x1b8\x1b[?2026l`;
 		}
 		if (!this.#writeTerminal(buffer)) return false;
-		if (!this.#imeCursorActive) return true;
-		return this.#writeCursorPosition(cursorPos, totalLines);
+		if (this.#imeCursorActive && !this.#writeCursorPosition(cursorPos, totalLines)) return false;
+		if (typeof emitted !== "string") emitted?.onDelivered?.();
+		return true;
 	}
 
 	/**
