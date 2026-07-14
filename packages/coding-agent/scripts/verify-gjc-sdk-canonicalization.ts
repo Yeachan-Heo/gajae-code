@@ -13,9 +13,13 @@ const repoRoot = process.env.GJC_SDK_CANONICALIZATION_SCAN_ROOT
 const scannerPath = "packages/coding-agent/scripts/verify-gjc-sdk-canonicalization.ts";
 const packageManifestPath = "packages/coding-agent/package.json";
 const retiredPythonRpcPackagePath = "python/gjc-rpc/";
-const retiredBridgeClientPackagePattern = /^packages\/[^/]*bridge-client[^/]*\//;
+const bridgeClientPackageManifestPath = "packages/bridge-client/package.json";
+const bridgeClientPackageName = "@gajae-code/bridge-client";
 const bridgeOrUnattendedImportPattern =
-	/(?:\b(?:import|export)\s+(?:type\s+)?(?:[^"'`;]*?\s+from\s+)?|\bimport\s*\(\s*)["'][^"']*(?:bridge-client|(?:^|\/)unattended)(?:["'/]|$)/g;
+	/(?:\b(?:import|export)\s+(?:type\s+)?(?:[^"'`;]*?\s+from\s+)?|\bimport\s*\(\s*)["'][^"']*(?:(?:^|\/)unattended)(?:["'/]|$)/g;
+const bridgeClientImportPattern = /(?:\bfrom\s*|\bimport\s*\(\s*)["'](@gajae-code\/bridge-client[^"']*)["']/g;
+const legacyBridgeClientSurfacePattern = /\b(?:BridgeClient|handshake|commands|SSE|control)\b/;
+
 const pythonUnattendedProtocolClientPattern =
 	/\b(?:negotiate_unattended|UnattendedAccepted|UnattendedBudget|parse_unattended_accepted|workflow_gate_response)\b/g;
 const pythonGjcRpcImportPattern = /^\s*(?:from\s+gjc_rpc(?:\.|\s)|import\s+gjc_rpc(?:\.|\s|,|$))/gm;
@@ -239,10 +243,6 @@ function tmuxPrimitiveOccurrences(contents: string): TmuxPrimitiveOccurrence[] {
 		}
 	}
 	return [...occurrences.values()].sort((left, right) => left.start - right.start);
-}
-
-function isWorkspacePackageManifest(file: string): boolean {
-	return file === "package.json" || (file.startsWith("packages/") && file.endsWith("/package.json"));
 }
 
 function resolveExportTarget(exports: Record<string, unknown>, subpath: string): unknown {
@@ -838,18 +838,118 @@ function rpcModeInvocationViolations(file: string, contents: string): string[] {
 }
 
 function bridgeClientPackageMetadataViolation(file: string, contents: string): string | undefined {
-	if (!file.endsWith("package.json")) return undefined;
-	try {
-		const manifest = JSON.parse(contents) as { name?: unknown };
-		if (isWorkspacePackageManifest(file) && manifest.name === "@gajae-code/bridge-client") {
-			return `${file}: uses retired bridge-client package identity`;
-		}
-	} catch {
+	if (
+		!file.endsWith("package.json") ||
+		(file !== bridgeClientPackageManifestPath && !contents.includes(bridgeClientPackageName))
+	)
 		return undefined;
+	try {
+		const manifest = JSON.parse(contents) as {
+			catalog?: Record<string, unknown>;
+			dependencies?: Record<string, unknown>;
+			name?: unknown;
+			optionalDependencies?: Record<string, unknown>;
+			peerDependencies?: Record<string, unknown>;
+			workspaces?: { catalog?: Record<string, unknown> };
+		};
+		if (file === bridgeClientPackageManifestPath) {
+			if (manifest.name !== bridgeClientPackageName)
+				return `${file}: is not the canonical bridge-client package manifest`;
+			if (
+				Object.keys(manifest.dependencies ?? {}).length > 0 ||
+				Object.keys(manifest.peerDependencies ?? {}).length > 0 ||
+				Object.keys(manifest.optionalDependencies ?? {}).length > 0
+			)
+				return `${file}: canonical bridge-client package must remain runtime-dependency-free`;
+			return undefined;
+		}
+		if (
+			file === "package.json" &&
+			(typeof manifest.catalog?.[bridgeClientPackageName] === "string" ||
+				typeof manifest.workspaces?.catalog?.[bridgeClientPackageName] === "string")
+		)
+			return undefined;
+		if (file === packageManifestPath && typeof manifest.dependencies?.[bridgeClientPackageName] === "string")
+			return undefined;
+	} catch {
+		return `${file}: declares unsupported bridge-client package metadata`;
 	}
-	return /["']@gajae-code\/bridge-client["']\s*:/.test(contents)
-		? `${file}: declares removed bridge-client package metadata`
-		: undefined;
+
+	return `${file}: declares unsupported bridge-client package metadata`;
+}
+
+function bridgeClientImportViolations(file: string, contents: string): string[] {
+	const violations: string[] = [];
+	for (const match of contents.matchAll(bridgeClientImportPattern)) {
+		const specifier = match[1];
+		const start = match.index ?? 0;
+		if (specifier !== bridgeClientPackageName) {
+			violations.push(`${file}:${lineNumber(contents, start)}: imports unsupported bridge-client subpath`);
+			continue;
+		}
+		const statementStart = Math.max(contents.lastIndexOf(";", start), contents.lastIndexOf("\n", start - 512));
+		const statement = contents.slice(statementStart + 1, start);
+		if (legacyBridgeClientSurfacePattern.test(statement)) {
+			violations.push(`${file}:${lineNumber(contents, start)}: imports historical bridge-client protocol surface`);
+		}
+	}
+	if (!isGeneratedDocumentationIndex(file) && /\.[cm]?[jt]sx?$/u.test(file) && /\bBridgeClient\b/.test(contents)) {
+		violations.push(`${file}: historical BridgeClient surface survived`);
+	}
+	return violations;
+}
+
+function bridgeClientOwnershipViolations(file: string, contents: string): string[] {
+	if (!file.startsWith("packages/bridge-client/src/") || !/\.(?:[cm]?[jt]sx?)$/u.test(file)) return [];
+	const violations: string[] = [];
+	for (const match of contents.matchAll(relativeImportPattern)) {
+		const specifier = match[1] ?? match[2];
+		const start = match.index ?? 0;
+		if (
+			specifier.startsWith(".") &&
+			!path.posix
+				.normalize(path.posix.join(path.posix.dirname(file), specifier))
+				.startsWith("packages/bridge-client/")
+		) {
+			violations.push(`${file}:${lineNumber(contents, start)}: bridge-client import escapes its package`);
+		}
+		if (
+			/(?:^|\/)(?:coding-agent|agent-session|sdk\/(?:host|session)|session)(?:\/|$)|@gajae-code\/coding-agent/.test(
+				specifier,
+			)
+		) {
+			violations.push(
+				`${file}:${lineNumber(contents, start)}: bridge-client imports coding-agent or AgentSession authority`,
+			);
+		}
+		if (/\b(?:AgentSession|SessionManager|SessionHost|HostControl|SdkHost|SDKHost|HostSession)\b/.test(match[0])) {
+			violations.push(`${file}:${lineNumber(contents, start)}: bridge-client imports host or session authority`);
+		}
+		if (/^node:(?:net|http|https|child_process)(?:\/|$)/.test(specifier)) {
+			violations.push(
+				`${file}:${lineNumber(contents, start)}: bridge-client imports server or process ownership module ${specifier}`,
+			);
+		}
+		if (legacyBridgeClientSurfacePattern.test(match[0])) {
+			violations.push(`${file}:${lineNumber(contents, start)}: bridge-client imports historical protocol surface`);
+		}
+	}
+	for (const pattern of [
+		/\b(?:AgentSession|SessionManager|SessionHost|HostControl|SdkHost|SDKHost|HostSession)\b/g,
+		/\b(?:Bun\.serve|(?:createServer|createSecureServer)\s*\(|\.listen\s*\(|(?:spawn|spawnSync|exec|execFile|fork)\s*\(|process\.)/g,
+	]) {
+		for (const match of contents.matchAll(pattern)) {
+			violations.push(
+				`${file}:${lineNumber(contents, match.index ?? 0)}: bridge-client owns forbidden host, session, server, listener, or process authority`,
+			);
+		}
+	}
+	for (const match of contents.matchAll(/\b(?:BridgeClient|handshake|commands|SSE)\b/g)) {
+		violations.push(
+			`${file}:${lineNumber(contents, match.index ?? 0)}: bridge-client retains historical protocol symbol ${match[0]}`,
+		);
+	}
+	return [...new Set(violations)];
 }
 
 // These are the only server owners permitted to couple a listener to session/control internals.
@@ -1643,9 +1743,7 @@ async function scan(): Promise<string[]> {
 		if (retiredIngressSource(file)) {
 			violations.push(`${file}: retired RPC/bridge/unattended ingress source survived`);
 		}
-		if (retiredBridgeClientPackagePattern.test(file)) {
-			violations.push(`${file}: removed bridge-client workspace package source survived`);
-		}
+
 		if (file.startsWith(retiredPythonRpcPackagePath)) {
 			violations.push(`${file}: retired Python gjc-rpc package source survived`);
 		}
@@ -1696,8 +1794,11 @@ async function scan(): Promise<string[]> {
 		violations.push(...rpcModeInvocationViolations(file, contents));
 		if (isActiveLegacyPythonRpcTarget(file)) violations.push(...legacyPythonRpcViolations(file, contents));
 		if (file === packageManifestPath) violations.push(...scanPackageExports(contents, files));
+		violations.push(...bridgeClientImportViolations(file, contents));
+		violations.push(...bridgeClientOwnershipViolations(file, contents));
 		const bridgeClientMetadataViolation = bridgeClientPackageMetadataViolation(file, contents);
 		if (bridgeClientMetadataViolation) violations.push(bridgeClientMetadataViolation);
+
 		if (isProductionTypeScript(file)) contentsByFile.set(file, contents);
 		const wrapper = machineWrapperEntrypoints.get(file);
 		if (wrapper) violations.push(...directMachineWrapperRouteViolations(file, wrapper, contents));
@@ -1711,10 +1812,9 @@ async function scan(): Promise<string[]> {
 			);
 		}
 		for (const match of contents.matchAll(bridgeOrUnattendedImportPattern)) {
-			violations.push(
-				`${file}:${lineNumber(contents, match.index ?? 0)}: imports removed bridge-client or unattended surface`,
-			);
+			violations.push(`${file}:${lineNumber(contents, match.index ?? 0)}: imports removed unattended surface`);
 		}
+
 		for (const match of contents.matchAll(/\bGJC_BRIDGE_[A-Z0-9_]*\b/g)) {
 			violations.push(
 				`${file}:${lineNumber(contents, match.index ?? 0)}: forbidden bridge environment reference ${match[0]}`,
@@ -2392,19 +2492,58 @@ async function selfTest(): Promise<void> {
 	const realManifest = await Bun.file(path.join(repoRoot, packageManifestPath)).text();
 	await runSelfTestFixture({ [packageManifestPath]: realManifest }, 0);
 	await runSelfTestFixture(
-		{ "packages/bridge-client/src/index.ts": "export const legacyBridge = true;\n" },
-		1,
-		"removed bridge-client workspace package source survived",
+		{
+			"package.json": '{"catalog":{"@gajae-code/bridge-client":"0.10.1"}}\n',
+			"packages/bridge-client/package.json": '{"name":"@gajae-code/bridge-client"}\n',
+			"packages/bridge-client/src/index.ts": "export class SdkClient {}\nexport type SdkClientOptions = {};\n",
+			"packages/coding-agent/package.json": '{"dependencies":{"@gajae-code/bridge-client":"catalog:"}}\n',
+			"packages/coding-agent/src/sdk/client/client.ts":
+				'export { SdkClient } from "@gajae-code/bridge-client";\nexport type { SdkClientOptions } from "@gajae-code/bridge-client";\n',
+		},
+		0,
 	);
 	await runSelfTestFixture(
-		{ "package.json": '{"catalog":{"@gajae-code/bridge-client":"0.0.0"}}\n' },
+		{
+			"packages/bridge-client/package.json":
+				'{"name":"@gajae-code/bridge-client","dependencies":{"unsafe":"1.0.0"}}\n',
+		},
 		1,
-		"declares removed bridge-client package metadata",
+		"canonical bridge-client package must remain runtime-dependency-free",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/bridge-client/src/client.ts": 'import { HostControl } from "./host-control";\nvoid HostControl;\n',
+		},
+		1,
+		"bridge-client imports host or session authority",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/bridge-client/src/client.ts": 'Bun.serve({ fetch() { return new Response("ok"); } });\n',
+		},
+		1,
+		"bridge-client owns forbidden host, session, server, listener, or process authority",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/bridge-client/src/client.ts":
+				'import { AgentSession } from "../../coding-agent/src/session/agent-session";\nvoid AgentSession;\n',
+		},
+		1,
+		"bridge-client import escapes its package",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/bridge-client/src/client.ts":
+				'import { SdkClient } from "@gajae-code/coding-agent";\nvoid SdkClient;\n',
+		},
+		1,
+		"bridge-client imports coding-agent or AgentSession authority",
 	);
 	await runSelfTestFixture(
 		{ "packages/renamed-workspace/package.json": '{"name":"@gajae-code/bridge-client"}\n' },
 		1,
-		"uses retired bridge-client package identity",
+		"declares unsupported bridge-client package metadata",
 	);
 	await runSelfTestFixture(
 		{
@@ -2412,7 +2551,46 @@ async function selfTest(): Promise<void> {
 				'import { BridgeClient } from "@gajae-code/bridge-client";\nvoid BridgeClient;\n',
 		},
 		1,
-		"imports removed bridge-client or unattended surface",
+		"historical BridgeClient surface survived",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/consumer.ts":
+				'import { handshake } from "@gajae-code/bridge-client";\nvoid handshake;\n',
+		},
+		1,
+		"imports historical bridge-client protocol surface",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/consumer.ts":
+				'import { commands } from "@gajae-code/bridge-client";\nvoid commands;\n',
+		},
+		1,
+		"imports historical bridge-client protocol surface",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/consumer.ts":
+				'import { SdkClient } from "@gajae-code/bridge-client/commands";\nvoid SdkClient;\n',
+		},
+		1,
+		"imports unsupported bridge-client subpath",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/consumer.ts": 'import { SSE } from "@gajae-code/bridge-client";\nvoid SSE;\n',
+		},
+		1,
+		"imports historical bridge-client protocol surface",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/consumer.ts":
+				'import { control } from "@gajae-code/bridge-client";\nvoid control;\n',
+		},
+		1,
+		"imports historical bridge-client protocol surface",
 	);
 	await runSelfTestFixture(
 		{
@@ -2420,7 +2598,7 @@ async function selfTest(): Promise<void> {
 				'import { legacyUnattended } from "./unattended";\nvoid legacyUnattended;\n',
 		},
 		1,
-		"imports removed bridge-client or unattended surface",
+		"imports removed unattended surface",
 	);
 	await runSelfTestFixture(
 		{

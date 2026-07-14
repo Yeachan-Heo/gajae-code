@@ -264,7 +264,12 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		dir: "packages/coding-agent",
 		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
 	};
-	const targetingPackages: WorkspacePackage[] = [codingAgent];
+	const bridgeClient: WorkspacePackage = {
+		name: "@gajae-code/bridge-client",
+		dir: "packages/bridge-client",
+		manifest: { name: "@gajae-code/bridge-client", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const targetingPackages: WorkspacePackage[] = [codingAgent, bridgeClient];
 	const testFiles = [
 		"packages/coding-agent/test/edit/foo.test.ts",
 		"packages/coding-agent/test/edit/bar.test.ts",
@@ -399,6 +404,29 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("release-publish-dry-run");
 	});
 
+	test("bridge-client changes retain package validation alongside release publish coverage", () => {
+		const tasks = targeted(["packages/bridge-client/src/index.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys.filter(key => key === "check:@gajae-code/bridge-client")).toHaveLength(1);
+		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
+		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
+		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
+		expect(keys.filter(key => key === "bridge-client-sdk-package-smoke")).toHaveLength(1);
+		expect(tasks.find(task => task.key === "bridge-client-sdk-package-smoke")?.command).toEqual([
+			"bun",
+			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
+		]);
+	});
+
+	test("release evidence source changes select contract, dry-run, and focused evidence coverage once", () => {
+		const tasks = targeted(["scripts/release-evidence.ts", "scripts/ci-release-publish.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
+		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
+		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
+		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
+	});
+
 	test("unscoped wrapper package changes keep wrapper-version smoke with release validation", () => {
 		const tasks = targeted(["packages/gajae-code/bin/gjc.js"]);
 		const keys = tasks.map(task => task.key);
@@ -443,6 +471,11 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
 	};
 
+	const bridgeClient: WorkspacePackage = {
+		name: "@gajae-code/bridge-client",
+		dir: "packages/bridge-client",
+		manifest: { name: "@gajae-code/bridge-client", scripts: { check: "biome check .", test: "bun test" } },
+	};
 	test("push mode splits the package-wide coding-agent test across bounded shards", () => {
 		const tasks = planTasks(["packages/coding-agent/src/edit/foo.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
@@ -465,6 +498,30 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 
 		const entries = describeTasks(tasks);
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.native).toBe(true);
+	});
+
+	test("push mode schedules release evidence contract, dry-run, and focused coverage once", () => {
+		const tasks = planTasks(["scripts/release-evidence.ts", "scripts/ci-release-publish.ts"], [codingAgent]);
+		const keys = tasks.map(task => task.key);
+		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
+		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
+		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
+		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
+	});
+
+	test("push mode selects the bridge-client SDK package smoke exactly once for package and SDK client changes", () => {
+		const tasks = planTasks(
+			["packages/bridge-client/package.json", "packages/coding-agent/src/sdk/client/client.ts"],
+			[codingAgent, bridgeClient],
+		);
+		const keys = tasks.map(task => task.key);
+		expect(keys.filter(key => key === "bridge-client-sdk-package-smoke")).toHaveLength(1);
+		expect(tasks.find(task => task.key === "bridge-client-sdk-package-smoke")?.command).toEqual([
+			"bun",
+			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
+		]);
+		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
+		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 	});
 
 	test("full-workspace changes partition root tests into matrix shards", () => {

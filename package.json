@@ -22,6 +22,7 @@
       "@gajae-code/stats": "0.10.1",
       "@gajae-code/agent-core": "0.10.1",
       "@gajae-code/ai": "0.10.1",
+      "@gajae-code/bridge-client": "0.10.1",
 
       "@gajae-code/coding-agent": "0.10.1",
       "@gajae-code/natives": "0.10.1",

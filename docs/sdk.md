@@ -20,6 +20,20 @@ N-API, or wire-protocol change is required for a new integration.
 > Telegram daemon is a reference client layered on top of this SDK; it is not the
 > upstream topology.
 
+## TypeScript transport client
+
+Install the standalone transport-only client when connecting to the v3 SDK WebSocket endpoint from TypeScript:
+
+```bash
+bun add @gajae-code/bridge-client
+```
+
+```ts
+import { SdkClient } from "@gajae-code/bridge-client";
+```
+
+`@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
+
 ## Architecture
 
 ```

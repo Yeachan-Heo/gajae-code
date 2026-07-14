@@ -13,6 +13,8 @@ For cross-language or process-isolated control, use the [SDK WebSocket machine i
 bun add @gajae-code/coding-agent
 ```
 
+For process-isolated TypeScript integrations, install `@gajae-code/bridge-client` and import `SdkClient` from that standalone transport-only package. `@gajae-code/coding-agent/sdk` remains a compatibility re-export with the same `SdkClient` class identity and associated types. Both surfaces use only the v3 SDK transport; no historical BridgeClient backend protocol, handshake/commands/SSE endpoint, or direct host-control path is restored.
+
 ## Entry points
 
 `@gajae-code/coding-agent` exports the SDK APIs from the package root (and also via `@gajae-code/coding-agent/sdk`).

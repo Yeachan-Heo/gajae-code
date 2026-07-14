@@ -58,6 +58,15 @@ function canonicalEvidenceRecords(): PackageEvidenceRecord[] {
 	return PUBLIC_PACKAGE_DEFINITIONS.map(evidenceRecord);
 }
 
+function workflowJob(workflow: string, name: string): string {
+	const marker = `   ${name}:`;
+	const start = workflow.indexOf(marker);
+	if (start === -1) throw new Error(`Missing workflow job ${name}`);
+	const remainder = workflow.slice(start + marker.length);
+	const nextJob = remainder.search(/\n   [a-z][a-z0-9_]*:/u);
+	return workflow.slice(start, nextJob === -1 ? workflow.length : start + marker.length + nextJob);
+}
+
 describe("unscoped gajae-code package publication", () => {
 	test("manifest exposes gjc and depends on the scoped CLI package", async () => {
 		const aliasManifest = await readManifest("packages/gajae-code");
@@ -92,11 +101,14 @@ describe("unscoped gajae-code package publication", () => {
 
 	test("release publish order publishes the alias after its scoped dependency", async () => {
 		const releaseScript = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
+		const bridgeClientIndex = releaseScript.indexOf('dir: "packages/bridge-client"');
 		const codingAgentIndex = releaseScript.indexOf('dir: "packages/coding-agent"');
 		const aliasIndex = releaseScript.indexOf('dir: "packages/gajae-code"');
 
 		expect(codingAgentIndex).toBeGreaterThan(-1);
 		expect(aliasIndex).toBeGreaterThan(codingAgentIndex);
+		expect(bridgeClientIndex).toBeGreaterThan(-1);
+		expect(bridgeClientIndex).toBeLessThan(codingAgentIndex);
 	});
 
 	test("native platform packages publish before the stable loader package", () => {
@@ -291,6 +303,7 @@ describe("immutable stable release contracts", () => {
 		const evidencedDirs = PUBLIC_PACKAGE_DEFINITIONS.map(definition => definition.dir).sort();
 
 		expect(PUBLIC_PACKAGE_DEFINITIONS).toHaveLength(14);
+		expect(publishPackages).toHaveLength(14);
 		expect(publishedDirs).toEqual(evidencedDirs);
 	});
 
@@ -419,14 +432,47 @@ describe("native release binary coverage", () => {
 		expect(workflow).toContain("pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*-h${{ needs.rust-hash.outputs.hash }}");
 	});
 
-	test("tag publication requires the non-skippable SDK closure", async () => {
+	test("tag publication uses the fail-closed named-job evidence chain and SDK closure", async () => {
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
+		const sdkClosure = workflowJob(workflow, "sdk_closure");
+		const releaseBinary = workflowJob(workflow, "release_binary");
+		const expectedEvidence = workflowJob(workflow, "release_npm_expected");
+		const npmPublish = workflowJob(workflow, "release_npm_publish");
+		const finalEvidence = workflowJob(workflow, "release_github_final_evidence");
+		const githubVerify = workflowJob(workflow, "release_github_verify");
+		const finalize = workflowJob(workflow, "release_github_finalize");
 
-		expect(workflow).toContain("sdk_closure:");
-		expect(workflow).toContain("run: bun run check:sdk-closure");
-		expect(workflow).toContain("needs: [check, sdk_closure, native_linux, native_release, rust-hash]");
-		expect(workflow).toContain("needs.sdk_closure.result == 'success'");
-		expect(workflow).toContain("needs: [release_binary, release_github_verify, rust-hash, sdk_closure]");
+		expect(sdkClosure).toContain("run: bun run check:sdk-closure");
+		expect(sdkClosure).toContain("startsWith(github.ref, 'refs/tags/v') && !cancelled()");
+		expect(releaseBinary).toContain("needs: [check, sdk_closure, native_linux, native_release, rust-hash]");
+		expect(releaseBinary).toContain("needs.sdk_closure.result == 'success'");
+
+		expect(expectedEvidence).toContain("needs: [release_github_draft, release_context, release_source_verify, rust-hash]");
+		expect(expectedEvidence).toContain("needs.release_source_verify.result == 'success'");
+		expect(expectedEvidence).toContain("needs.release_context.outputs.skip-npm != 'true'");
+		expect(npmPublish).toContain("needs: [release_npm_expected, release_context, release_source_verify]");
+		expect(npmPublish).toContain("needs.release_npm_expected.result == 'success'");
+		expect(npmPublish).toContain("needs.release_source_verify.result == 'success'");
+		expect(npmPublish).toContain("needs.release_context.outputs.skip-npm != 'true'");
+		expect(finalEvidence).toContain("needs: [release_npm_publish, release_context, release_source_verify]");
+		expect(finalEvidence).toContain("needs.release_npm_publish.result == 'success'");
+		expect(finalEvidence).toContain("needs.release_source_verify.result == 'success'");
+		expect(githubVerify).toContain("needs: [release_github_final_evidence, release_context, release_source_verify]");
+		expect(githubVerify).toContain("needs.release_github_final_evidence.result == 'success'");
+		expect(githubVerify).toContain("needs.release_source_verify.result == 'success'");
+		expect(finalize).toContain("needs: [release_npm_publish, release_github_final_evidence, release_github_verify, release_context, release_source_verify]");
+		expect(finalize).toContain("needs.release_npm_publish.result == 'success'");
+		expect(finalize).toContain("needs.release_github_final_evidence.result == 'success'");
+		expect(finalize).toContain("needs.release_github_verify.result == 'success'");
+		expect(finalize).toContain("needs.release_source_verify.result == 'success'");
+		expect(finalize).toContain("needs.release_context.outputs.skip-npm != 'true'");
+
+		expect(finalEvidence).toContain('cmp "$existing_dir/$final_asset" "$evidence_dir/$final_asset"');
+		expect(finalize).toContain('for asset in "$expected_asset" "$final_asset"; do');
+		expect(finalize.indexOf("for asset in")).toBeLessThan(finalize.indexOf("gh release edit"));
+		expect(finalize.indexOf("--verify-stable-finalization")).toBeLessThan(finalize.indexOf("gh release edit"));
+		expect(finalize).not.toContain("needs: [release_npm_publish, release_context]");
+		expect(workflow).not.toContain("needs: [release_binary, release_github_verify, rust-hash, sdk_closure]");
 	});
 
 	test("linux native platform packages declare their glibc requirement", async () => {

@@ -484,8 +484,10 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 		add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
 	}
 	if (publishChanged) {
-		add(tasks, "release-publish-contract", "Release publish contract tests", ["bun", "run", "test:release"]);
-		add(tasks, "release-publish-dry-run", "Release publish dry-run", ["bun", "scripts/ci-release-publish.ts", "--dry-run"]);
+		addReleasePublishTasks(tasks);
+	}
+	if (paths.some(isBridgeClientSdkPackageSmokePath)) {
+		add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 	}
 
 	if (rustChanged) {
@@ -559,12 +561,13 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 			continue;
 		}
 		if (isReleasePublishPath(changedPath)) {
-			add(tasks, "release-publish-contract", "Release publish contract tests", ["bun", "run", "test:release"]);
-			add(tasks, "release-publish-dry-run", "Release publish dry-run", ["bun", "scripts/ci-release-publish.ts", "--dry-run"]);
+			addReleasePublishTasks(tasks);
 			if (isUnscopedWrapperPath(changedPath)) {
 				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
 			}
-			continue;
+		}
+		if (isBridgeClientSdkPackageSmokePath(changedPath)) {
+			add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 		}
 
 
@@ -815,6 +818,12 @@ function isReleaseHarnessScriptPath(changedPath: string): boolean {
 	].includes(changedPath);
 }
 
+function addReleasePublishTasks(tasks: Map<string, Task>): void {
+	add(tasks, "release-publish-contract", "Release publish contract tests", ["bun", "run", "test:release"]);
+	add(tasks, "release-publish-dry-run", "Release publish dry-run", ["bun", "scripts/ci-release-publish.ts", "--dry-run"]);
+	addTestFileTask(tasks, "scripts/release-evidence.test.ts");
+}
+
 
 function isRustPath(changedPath: string): boolean {
 	const fileName = path.basename(changedPath);
@@ -831,6 +840,13 @@ function isInstallPath(changedPath: string): boolean {
 
 function isCodingAgentRuntimePath(changedPath: string): boolean {
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
+}
+
+function isBridgeClientSdkPackageSmokePath(changedPath: string): boolean {
+	return (
+		changedPath.startsWith("packages/bridge-client/") ||
+		changedPath.startsWith("packages/coding-agent/src/sdk/client/")
+	);
 }
 
 function isDeepInterviewOnly(paths: readonly string[]): boolean {
@@ -862,6 +878,8 @@ function isToolingScriptPath(changedPath: string): boolean {
 function isReleasePublishPath(changedPath: string): boolean {
 	return (
 		changedPath === "scripts/ci-release-publish.ts" ||
+		changedPath === "scripts/release-evidence.ts" ||
+		changedPath.startsWith("packages/bridge-client/") ||
 		changedPath.startsWith("packages/gajae-code/") ||
 		changedPath.startsWith("packages/natives-") ||
 		changedPath === "packages/natives/package.json"
