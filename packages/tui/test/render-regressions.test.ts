@@ -796,7 +796,7 @@ describe("TUI terminal-state regressions", () => {
 			Bun.env.TMUX = "1";
 			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 
-			const term = new VirtualTerminal(32, 5);
+			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const initialLines = rows("prefix-", 5);
 			const table = ["┌───────┐", "│ row-a │", "│ row-b │", "└───────┘"];
@@ -839,7 +839,7 @@ describe("TUI terminal-state regressions", () => {
 			Bun.env.TMUX = "1";
 			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 
-			const term = new VirtualTerminal(32, 5);
+			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const initialLines = rows("old-", 5);
 			const component = new MutableLinesComponent(initialLines);
