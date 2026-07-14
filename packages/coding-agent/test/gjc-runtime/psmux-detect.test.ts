@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
 	__setBinaryResolverForTests,
+	__setExecutableIdentityResolverForTests,
 	clearPsmuxDetectionCache,
 	detectPsmux,
 	GJC_PSMUX_COMMAND_ENV,
@@ -17,7 +18,7 @@ function psmuxVersionOutput(): string {
 }
 
 function tmuxVersionOutput(): string {
-	return "tmux 3.3\n";
+	return "tmux 3.3.6\n";
 }
 
 function failingRunner() {
@@ -40,11 +41,13 @@ beforeEach(() => {
 	__setBinaryResolverForTests(candidate =>
 		candidate === "psmux" || candidate === "pmux" || candidate === "tmux" ? `/usr/bin/${candidate}` : null,
 	);
+	__setExecutableIdentityResolverForTests(path => path.toLowerCase());
 });
 
 afterEach(() => {
 	clearPsmuxDetectionCache();
 	__setBinaryResolverForTests(null);
+	__setExecutableIdentityResolverForTests(null);
 });
 
 describe("PSMUX_BINARY_NAMES", () => {
@@ -191,6 +194,111 @@ describe("resolveGjcTmuxBinary", () => {
 		expect(resolved.isPsmux).toBe(true);
 	});
 
+	it("classifies an explicit Windows tmux.exe alias by matching the psmux executable identity", () => {
+		__setBinaryResolverForTests(candidate => {
+			if (candidate === "tmux") return "C:\\WinGet\\Links\\tmux.exe";
+			if (candidate === "psmux") return "C:\\WinGet\\Links\\psmux.exe";
+			return null;
+		});
+		__setExecutableIdentityResolverForTests(path =>
+			path.endsWith("tmux.exe") || path.endsWith("psmux.exe") ? "win-file-id:2086" : null,
+		);
+
+		const resolved = resolveGjcTmuxBinary({
+			platform: "win32",
+			env: { GJC_TMUX_COMMAND: "tmux" },
+			runner: buildRunner(tmuxVersionOutput()),
+		});
+
+		expect(resolved).toEqual({ command: "tmux", isPsmux: true, viaExplicitOverride: true });
+	});
+
+	it("fails closed when an explicit Windows tmux.exe identity cannot be established", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "tmux" ? "C:\\WinGet\\Links\\tmux.exe" : null));
+		__setExecutableIdentityResolverForTests(() => null);
+
+		expect(() =>
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: { GJC_TMUX_COMMAND: "tmux" },
+				runner: buildRunner(tmuxVersionOutput()),
+			}),
+		).toThrow("gjc_tmux_provider_ambiguous");
+	});
+
+	it("keeps a distinct Windows tmux.exe on native-tmux semantics", () => {
+		__setBinaryResolverForTests(candidate => `C:\\tools\\${candidate}.exe`);
+		__setExecutableIdentityResolverForTests(path => path.toLowerCase());
+
+		const resolved = resolveGjcTmuxBinary({
+			platform: "win32",
+			env: { GJC_TMUX_COMMAND: "tmux" },
+			runner: buildRunner(tmuxVersionOutput()),
+		});
+
+		expect(resolved).toEqual({ command: "tmux", isPsmux: false, viaExplicitOverride: true });
+	});
+
+	it("fails closed when canonical psmux companions conflict", () => {
+		__setBinaryResolverForTests(candidate => `C:\\tools\\${candidate}.exe`);
+		__setExecutableIdentityResolverForTests(path => {
+			if (path.endsWith("tmux.exe") || path.endsWith("psmux.exe")) return "same-file";
+			return "different-file";
+		});
+
+		expect(() =>
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: { GJC_TMUX_COMMAND: "tmux" },
+				runner: buildRunner(tmuxVersionOutput()),
+			}),
+		).toThrow("companion identities conflict");
+	});
+
+	it("fails closed when GJC_PSMUX_COMMAND selects a different executable", () => {
+		__setBinaryResolverForTests(candidate => `C:\\tools\\${candidate}.exe`);
+		__setExecutableIdentityResolverForTests(path => path.toLowerCase());
+
+		expect(() =>
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: { GJC_TMUX_COMMAND: "tmux", GJC_PSMUX_COMMAND: "C:\\other\\psmux-wrapper.exe" },
+				runner: buildRunner(tmuxVersionOutput()),
+			}),
+		).toThrow("GJC_PSMUX_COMMAND selects a different executable");
+	});
+
+	it("fails closed when Windows alias resolution throws", () => {
+		__setBinaryResolverForTests(candidate => {
+			if (candidate === "tmux") throw new Error("resolver failure");
+			return null;
+		});
+
+		expect(() =>
+			resolveGjcTmuxBinary({
+				platform: "win32",
+				env: { GJC_TMUX_COMMAND: "tmux" },
+				runner: buildRunner(tmuxVersionOutput()),
+			}),
+		).toThrow("selected Windows tmux command resolution failed");
+	});
+
+	it("classifies a generic wrapper when GJC_PSMUX_COMMAND matches its executable identity", () => {
+		__setBinaryResolverForTests(candidate => {
+			if (candidate === "wrapper-tmux") return "C:\\tools\\wrapper-tmux.exe";
+			if (candidate === "wrapper-psmux") return "C:\\tools\\wrapper-psmux.exe";
+			return null;
+		});
+		__setExecutableIdentityResolverForTests(() => "same-wrapper");
+
+		const resolved = resolveGjcTmuxBinary({
+			platform: "win32",
+			env: { GJC_TMUX_COMMAND: "wrapper-tmux", GJC_PSMUX_COMMAND: "wrapper-psmux" },
+			runner: buildRunner(tmuxVersionOutput()),
+		});
+
+		expect(resolved).toEqual({ command: "wrapper-tmux", isPsmux: true, viaExplicitOverride: true });
+	});
 	it("treats an explicit Windows psmux path as psmux without relying on the version banner", () => {
 		const resolved = resolveGjcTmuxBinary({
 			platform: "win32",

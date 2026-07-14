@@ -200,4 +200,143 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		});
 		expect(replacementAccepted).toBe(true);
 	});
+	it("orders an accepted prompt before a later default selection through provider start", async () => {
+		const { emitBeforeAgentStart } = createSession();
+		const preflightStarted = Promise.withResolvers<void>();
+		const releasePreflight = Promise.withResolvers<void>();
+		emitBeforeAgentStart.mockImplementationOnce(async () => {
+			preflightStarted.resolve();
+			await releasePreflight.promise;
+			return undefined;
+		});
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-model" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const apiKeySpy = vi.spyOn(modelRegistry, "getApiKey");
+
+		const prompt = session.prompt("held in preflight");
+		await preflightStarted.promise;
+		const selection = session.setDefaultModelSelection(selectionModel, undefined);
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(apiKeySpy.mock.calls.some(([model]) => model === selectionModel)).toBe(false);
+		releasePreflight.resolve();
+		await prompt;
+		await selection;
+		expect(apiKeySpy.mock.calls.some(([model]) => model === selectionModel)).toBe(true);
+	});
+
+	it("orders an accepted default selection before later prompt preflight", async () => {
+		const { emitBeforeAgentStart } = createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-model" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const selectionValidationStarted = Promise.withResolvers<void>();
+		const releaseSelectionValidation = Promise.withResolvers<void>();
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
+			if (model === selectionModel) {
+				selectionValidationStarted.resolve();
+				await releaseSelectionValidation.promise;
+				return "selection-key";
+			}
+			return "test-key";
+		});
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined);
+		await selectionValidationStarted.promise;
+		const prompt = session.prompt("wait behind selection");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(emitBeforeAgentStart).not.toHaveBeenCalled();
+		releaseSelectionValidation.resolve();
+		await selection;
+		await prompt;
+		expect(emitBeforeAgentStart).toHaveBeenCalledTimes(1);
+	});
+
+	it("fails awaited same-session selection reentrancy with a stable busy result", async () => {
+		const { emitBeforeAgentStart } = createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		let reentrantError: unknown;
+		emitBeforeAgentStart.mockImplementationOnce(async () => {
+			try {
+				await session.setDefaultModelSelection(currentModel, undefined);
+			} catch (error) {
+				reentrantError = error;
+			}
+			return undefined;
+		});
+
+		await session.prompt("reentrant selection");
+
+		expect(reentrantError).toMatchObject({
+			name: "AgentBusyError",
+			code: "busy",
+			message: "Agent session admission is busy due to same-session reentrancy.",
+		});
+	});
+	it("cancels a queued prompt without starving later admission", async () => {
+		createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-model" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const selectionValidationStarted = Promise.withResolvers<void>();
+		const releaseSelectionValidation = Promise.withResolvers<void>();
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
+			if (model === selectionModel) {
+				selectionValidationStarted.resolve();
+				await releaseSelectionValidation.promise;
+				return "selection-key";
+			}
+			return "test-key";
+		});
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined);
+		await selectionValidationStarted.promise;
+		const queuedPrompt = session.prompt("cancel while queued");
+		await session.abort();
+		releaseSelectionValidation.resolve();
+		await selection;
+		await expect(queuedPrompt).rejects.toMatchObject({ code: "busy" });
+
+		await session.prompt("successor prompt");
+	});
+	it("disposal drains an active selection", async () => {
+		createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-model" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const validationStarted = Promise.withResolvers<void>();
+		const releaseValidation = Promise.withResolvers<void>();
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
+			if (model === selectionModel) {
+				validationStarted.resolve();
+				await releaseValidation.promise;
+				return "selection-key";
+			}
+			return "test-key";
+		});
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined);
+		await validationStarted.promise;
+		const queuedPrompt = session.prompt("queued during disposal");
+		const disposal = session.dispose();
+		const queuedResult = queuedPrompt.then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		releaseValidation.resolve();
+		await selection;
+		const result = await queuedResult;
+		expect(result).toMatchObject({ status: "rejected", error: { code: "busy" } });
+		await disposal;
+		session = undefined as unknown as AgentSession;
+	});
 });

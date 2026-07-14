@@ -354,6 +354,18 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
 	expect(await bounded(cancelledPrompt, "cancelled prompt completion")).toEqual({ stopReason: "cancelled" });
+	expect(
+		updates.filter(update => {
+			const payload = update.update as {
+				sessionUpdate?: string;
+				content?: Array<{ content?: { text?: string } }>;
+			};
+			return (
+				payload.sessionUpdate === "agent_message_chunk" &&
+				payload.content?.some(item => /failed/i.test(item.content?.text ?? ""))
+			);
+		}),
+	).toHaveLength(0);
 	const abortFailurePrompt = agent.prompt({
 		sessionId: created.sessionId,
 		prompt: [{ type: "text", text: "abort failure" }],

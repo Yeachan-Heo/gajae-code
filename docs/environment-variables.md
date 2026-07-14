@@ -248,21 +248,17 @@ This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a 
 | `GJC_TMUX_COMMAND` | tmux binary/name override for every GJC tmux flow (`GJC_TEAM_TMUX_COMMAND` is honored as a team-path alias). This is not a shell command line; include only the executable path/name, not flags. |
 | `GJC_TMUX_PROFILE` | Set `0`/`false`/`off` to apply only the required ownership tags and skip the scroll/mouse/clipboard profile |
 | `GJC_MOUSE` | Set `0`/`false`/`off` to skip `mouse on`, leaving wheel scrolling to the host terminal instead of tmux copy-mode |
-| `GJC_PSMUX_COMMAND` | Force the resolved multiplexer to be treated as psmux (skips the version-banner probe). Useful when the binary is a thin wrapper that does not advertise `psmux` in `-V` output. |
-| `GJC_PSMUX_DETECTION` | Set `0`/`false`/`off` to skip psmux detection entirely. GJC falls back to treating the resolved command as plain tmux. |
+| `GJC_PSMUX_COMMAND` | Identifies a psmux wrapper for Windows alias resolution. The value must resolve to the same executable identity as the selected `tmux` command; unresolved or conflicting evidence fails closed. |
+| `GJC_PSMUX_DETECTION` | Set `0`/`false`/`off` to skip banner-based psmux detection. Executable-name and alias-identity safety checks still apply. |
 | `GJC_PSMUX_FORCE_DETECT` | Set `1`/`true`/`on` to re-probe the multiplexer on every call instead of caching the per-process verdict. |
 
-#### Windows psmux support
+#### Windows psmux detection boundary
 
-On native Windows, [psmux](https://github.com/psmux/psmux) is the supported tmux-compatible multiplexer for `gjc --tmux`, `gjc session`, and `gjc team`. Psmux may be installed as `psmux.exe` or through its `tmux.exe` / `pmux.exe` aliases; the same guidance applies when `GJC_TMUX_COMMAND` is left at the default `tmux` but the executable on PATH is actually psmux.
+On native Windows, [psmux](https://github.com/psmux/psmux) may be installed as `psmux.exe`, `pmux.exe`, or a `tmux.exe` alias. The alias can report only a generic `tmux 3.3.6` banner, so GJC compares the selected `tmux.exe` executable identity with resolved `psmux.exe` / `pmux.exe` companions. A matching identity is classified as psmux; distinct identities preserve native-tmux semantics.
 
-Detection runs once per process: GJC walks `psmux`, then `pmux`, then `tmux` on Windows PATH, picks the first binary that resolves, and probes it with `<binary> -V`. The probe verdict is cached for the lifetime of the process. The cached verdict keys off the resolved binary path, so renaming or installing a different binary in the same PATH slot still gets re-probed on next launch.
+If the selected command, an explicit `GJC_PSMUX_COMMAND`, or a resolved companion cannot be identified consistently, GJC reports `gjc_tmux_provider_ambiguous` and refuses before applying native-tmux target or mutation semantics. Correct `PATH`, set `GJC_TMUX_COMMAND` to a verified executable, or make `GJC_PSMUX_COMMAND` resolve to the same wrapper identity.
 
-The probe matches the `psmux` and `pmux` substrings in the version banner. If psmux is installed under a custom wrapper that hides the version banner, set `GJC_PSMUX_COMMAND` to that wrapper path so the multiplexer is treated as psmux without a probe. To turn detection off entirely (for example to debug a non-psmux Windows tmux port), set `GJC_PSMUX_DETECTION=off`.
-
-Native Windows `gjc --tmux` builds a real PowerShell-encoded plan when psmux is on PATH: `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ...` invokes gjc inside a psmux-managed session, the same ownership-tag (`@gjc-profile`) and project/branch/session-identity markers round-trip via `set-option` / `show-options` / `list-sessions -F`, and `gjc team` spawns worker panes via `split-window` against the same psmux session. Worker commands are emitted with PowerShell-safe `$env:VAR = 'value';` assignments so psmux's ConPTY panes inherit `GJC_TEAM_*` correctly.
-
-The `mouse`, `set-clipboard`, and `mode-style` UX profile options are filtered out of the emitted profile when the resolved multiplexer is psmux because psmux historically does not round-trip those keys; the `@gjc-profile` ownership tag and the branch / project / session identity markers are still emitted because those are the ones that gate `gjc session` and `gjc team`. If you want the full UX profile on Windows, set `GJC_TMUX_COMMAND=tmux` against a real tmux binary (via WSL or a separate install).
+Managed psmux creation, attachment, lifecycle mutation, and team startup remain unsupported because psmux does not provide the immutable native session identity required by GJC's owner-isolation contract. Use WSL with native tmux, or another verified native tmux installation, for those managed flows. `/pet` separately reports actionable multiplexer graphics guidance when image escapes are unavailable.
 
 #### Windows psmux namespace boundary
 

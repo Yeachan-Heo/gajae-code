@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -1227,6 +1228,19 @@ export class StreamingEditFileCache {
 		return this.#totalBytes;
 	}
 }
+type SessionAdmissionKind = "prompt" | "selection";
+
+type SessionAdmissionEntry = {
+	kind: SessionAdmissionKind;
+	ready: PromiseWithResolvers<void>;
+	settled: PromiseWithResolvers<void>;
+	released: boolean;
+};
+
+type SessionAdmissionLease = {
+	release(): void;
+};
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -1241,7 +1255,10 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
-	#defaultModelSelectionTail: Promise<void> = Promise.resolve();
+	#sessionAdmissionQueue: SessionAdmissionEntry[] = [];
+	#activeSessionAdmission: SessionAdmissionEntry | undefined;
+	#sessionAdmissionClosed = false;
+	#sessionAdmissionContext = new AsyncLocalStorage<SessionAdmissionEntry>();
 	#defaultModelSelectionMutationRevision = 0;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
@@ -1574,6 +1591,75 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Failed to release macOS power assertion", { error: String(error) });
 		}
+	}
+
+	#sessionAdmissionBusyError(): AgentBusyError {
+		return Object.assign(new AgentBusyError("Agent session admission is busy due to same-session reentrancy."), {
+			code: "busy",
+		});
+	}
+
+	#activateNextSessionAdmission(): void {
+		if (this.#activeSessionAdmission || this.#sessionAdmissionClosed) return;
+		const next = this.#sessionAdmissionQueue.shift();
+		if (!next) return;
+		this.#activeSessionAdmission = next;
+		next.ready.resolve();
+	}
+
+	async #withSessionAdmission<T>(
+		kind: SessionAdmissionKind,
+		body: (lease: SessionAdmissionLease) => Promise<T>,
+	): Promise<T> {
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
+
+		const entry: SessionAdmissionEntry = {
+			kind,
+			ready: Promise.withResolvers<void>(),
+			settled: Promise.withResolvers<void>(),
+			released: false,
+		};
+		this.#sessionAdmissionQueue.push(entry);
+		this.#activateNextSessionAdmission();
+		await entry.ready.promise;
+		if (this.#sessionAdmissionClosed || this.#isDisposed) {
+			entry.released = true;
+			entry.settled.resolve();
+			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
+			this.#activateNextSessionAdmission();
+			throw this.#sessionAdmissionBusyError();
+		}
+
+		const release = () => {
+			if (entry.released) return;
+			entry.released = true;
+			entry.settled.resolve();
+			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
+			this.#activateNextSessionAdmission();
+		};
+		try {
+			return await this.#sessionAdmissionContext.run(entry, () => body({ release }));
+		} finally {
+			release();
+		}
+	}
+
+	async #closeSessionAdmission(): Promise<void> {
+		this.#sessionAdmissionClosed = true;
+		const queued = this.#sessionAdmissionQueue.splice(0);
+		for (const entry of queued) {
+			entry.released = true;
+			entry.ready.reject(this.#sessionAdmissionBusyError());
+			entry.settled.resolve();
+		}
+		const active = this.#activeSessionAdmission;
+		if (active?.kind === "prompt") {
+			this.#promptGeneration++;
+			this.#promptPreflightAbortController.abort();
+		}
+		if (active) await active.settled.promise;
 	}
 
 	#beginInFlight(): void {
@@ -4134,11 +4220,12 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	async dispose(): Promise<void> {
+		this.#evalExecutionDisposing = true;
+		await this.#closeSessionAdmission();
 		this.#isDisposed = true;
 		this.#pendingBackgroundExchanges = [];
 		this.yieldQueue.clear();
 		this.agent.setOnBeforeYield(undefined);
-		this.#evalExecutionDisposing = true;
 		try {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
 				await this.#extensionRunner.emit({ type: "session_shutdown" });
@@ -6043,45 +6130,56 @@ export class AgentSession {
 			return;
 		}
 
-		if (workflowIntentDiff) {
-			this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
-		}
+		const admissionGeneration = this.#promptGeneration;
+		const admissionSignal = this.#promptPreflightAbortController.signal;
+		await this.#withSessionAdmission("prompt", async admission => {
+			this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
+			if (workflowIntentDiff) {
+				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
+			}
 
-		// Skip eager todo prelude when the user has already queued a directive
-		const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
-		const eagerTodoPrelude =
-			!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTodoPrelude(expandedText) : undefined;
+			// Skip eager todo prelude when the user has already queued a directive
+			const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
+			const eagerTodoPrelude =
+				!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTodoPrelude(expandedText) : undefined;
 
-		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-		if (options?.images) {
-			userContent.push(...options.images);
-		}
+			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
+			if (options?.images) {
+				userContent.push(...options.images);
+			}
 
-		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
-		const message = options?.synthetic
-			? { role: "developer" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() }
-			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
-		await this.refreshGjcSubskillTools();
+			const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
+			const message = options?.synthetic
+				? {
+						role: "developer" as const,
+						content: userContent,
+						attribution: promptAttribution,
+						timestamp: Date.now(),
+					}
+				: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+			await this.refreshGjcSubskillTools();
 
-		if (eagerTodoPrelude?.toolChoice) {
-			this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
-				label: "eager-todo",
-			});
-		}
+			if (eagerTodoPrelude?.toolChoice) {
+				this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
+					label: "eager-todo",
+				});
+			}
 
-		try {
-			await this.#promptWithMessage(message, expandedText, {
-				...options,
-				prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
-			});
-		} finally {
-			// Clean up residual eager-todo directive if the prompt never consumed it
-			// (e.g., compaction aborted, validation failed).
-			this.#toolChoiceQueue.removeByLabel("eager-todo");
-		}
-		if (!options?.synthetic) {
-			await this.#enforcePlanModeToolDecision();
-		}
+			try {
+				await this.#promptWithMessage(message, expandedText, {
+					...options,
+					prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
+					admissionLease: admission,
+				});
+			} finally {
+				// Clean up residual eager-todo directive if the prompt never consumed it
+				// (e.g., compaction aborted, validation failed).
+				this.#toolChoiceQueue.removeByLabel("eager-todo");
+			}
+			if (!options?.synthetic) {
+				await this.#enforcePlanModeToolDecision();
+			}
+		});
 	}
 
 	async #syncSkillPromptActiveState(
@@ -6172,22 +6270,27 @@ export class AgentSession {
 			return;
 		}
 
-		const customMessage: CustomMessage<T> = {
-			role: "custom",
-			customType: message.customType,
-			content: message.content,
-			display: message.display,
-			details: message.details,
-			attribution: message.attribution ?? "agent",
-			timestamp: Date.now(),
-		};
+		const admissionGeneration = this.#promptGeneration;
+		const admissionSignal = this.#promptPreflightAbortController.signal;
+		await this.#withSessionAdmission("prompt", async admission => {
+			this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
+			const customMessage: CustomMessage<T> = {
+				role: "custom",
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+				attribution: message.attribution ?? "agent",
+				timestamp: Date.now(),
+			};
 
-		await this.#syncSkillPromptActiveStateSafely(customMessage, true);
-		try {
-			await this.#promptWithMessage(customMessage, textContent, options);
-		} finally {
-			await this.#syncSkillPromptActiveStateSafely(customMessage, false);
-		}
+			await this.#syncSkillPromptActiveStateSafely(customMessage, true);
+			try {
+				await this.#promptWithMessage(customMessage, textContent, { ...options, admissionLease: admission });
+			} finally {
+				await this.#syncSkillPromptActiveStateSafely(customMessage, false);
+			}
+		});
 	}
 
 	async #promptWithMessage(
@@ -6197,6 +6300,7 @@ export class AgentSession {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
+			admissionLease?: SessionAdmissionLease;
 		},
 	): Promise<void> {
 		this.#beginInFlight();
@@ -6383,6 +6487,7 @@ export class AgentSession {
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
 				...this.#managedFallbackPromptOptions(),
+				...(options?.admissionLease ? { onRunAccepted: options.admissionLease.release } : undefined),
 			};
 			options?.onPreflightAccepted?.();
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -7837,11 +7942,7 @@ export class AgentSession {
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<DefaultModelSelectionResult> {
-		const predecessor = this.#defaultModelSelectionTail;
-		const transaction = Promise.withResolvers<void>();
-		this.#defaultModelSelectionTail = transaction.promise;
-		try {
-			await predecessor;
+		return this.#withSessionAdmission("selection", async () => {
 			if (thinkingLevel === ThinkingLevel.Inherit) {
 				throw new Error("Default model selection cannot inherit a thinking level");
 			}
@@ -7911,9 +8012,7 @@ export class AgentSession {
 				}
 			}
 			return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
-		} finally {
-			transaction.resolve();
-		}
+		});
 	}
 	/**
 	 * Cycle to next/previous model.
@@ -10948,7 +11047,7 @@ export class AgentSession {
 
 	async #promptAgentWithIdleRetry(
 		messages: AgentMessage[],
-		options?: { toolChoice?: ToolChoice; fallbackManaged?: boolean },
+		options?: { toolChoice?: ToolChoice; fallbackManaged?: boolean; onRunAccepted?: () => void },
 		predecessorAgentEndHold?: symbol,
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;

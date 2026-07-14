@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { postmortem, TempDir } from "@gajae-code/utils";
-import type { Args } from "../src/cli/args";
+import { type Args, parseArgs } from "../src/cli/args";
 import { Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
 import {
@@ -467,6 +467,100 @@ describe("startup update contract", () => {
 			}
 		}
 	}, 15_000);
+	it("reaches login recovery before a credentialless default profile can abort startup", async () => {
+		using tempDir = TempDir.createSync("@gjc-auth-bootstrap-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const stop = new Error("stop auth bootstrap harness");
+		const parsed = parseArgs(["login", "openai-codex"]);
+		const settings = Settings.isolated({
+			"marketplace.autoUpdate": "off",
+			"startup.checkUpdate": false,
+			"modelProfile.default": "codex-medium",
+		});
+		let initialized = false;
+
+		try {
+			await expect(
+				runRootCommand(parsed, [], {
+					createAgentSession: async () => fakeSessionResult(),
+					discoverAuthStorage: async () => authStorage,
+					settings,
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					getChangelogForDisplay: async () => undefined,
+					createInteractiveMode: () =>
+						({
+							init: async () => {
+								initialized = true;
+							},
+							showNewVersionNotification: () => {},
+							renderInitialMessages: () => {},
+							editor: { setText: () => {} },
+							showOAuthSelector: async (mode: string, provider?: string) => {
+								expect(mode).toBe("login");
+								expect(provider).toBe("openai-codex");
+							},
+							handleBackgroundCommand: () => {},
+							showError: () => {},
+							getUserInput: async () => {
+								throw stop;
+							},
+						}) as unknown as InteractiveMode,
+				}),
+			).rejects.toBe(stop);
+			expect(initialized).toBe(true);
+			expect(parsed.messages).toEqual(["/login openai-codex"]);
+			expect(parsed.authBootstrap).toBe(true);
+			expect(settings.get("modelProfile.default")).toBe("codex-medium");
+		} finally {
+			authStorage.close();
+		}
+	});
+	it("keeps credential validation active for noninteractive login-shaped input", async () => {
+		using tempDir = TempDir.createSync("@gjc-auth-bootstrap-text-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const settings = Settings.isolated({
+			"marketplace.autoUpdate": "off",
+			"startup.checkUpdate": false,
+			"modelProfile.default": "codex-medium",
+		});
+		const parsed = parseArgs(["--mode", "text", "login", "openai-codex"]);
+		let printModeStarted = false;
+		const exit = new Error("exit 1");
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((): never => {
+			throw exit;
+		});
+		const stderr: string[] = [];
+		const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+
+		try {
+			await expect(
+				runRootCommand(parsed, [], {
+					createAgentSession: async () => fakeSessionResult(),
+					discoverAuthStorage: async () => authStorage,
+					settings,
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					runPrintMode: async () => {
+						printModeStarted = true;
+					},
+				}),
+			).rejects.toBe(exit);
+			expect(exitSpy).toHaveBeenCalledWith(1);
+			expect(printModeStarted).toBe(false);
+			expect(settings.get("modelProfile.default")).toBe("codex-medium");
+			expect(stderr.join("")).toContain('Model profile "codex-medium" requires credentials for: openai-codex');
+		} finally {
+			stderrSpy.mockRestore();
+			exitSpy.mockRestore();
+			authStorage.close();
+		}
+	});
 	it("keeps updater and default-installer APIs outside startup wiring", async () => {
 		const source = await Bun.file(new URL("../src/main.ts", import.meta.url)).text();
 

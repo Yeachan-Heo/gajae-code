@@ -131,7 +131,7 @@ const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[A-Za-z0-9_]{1,32}\|>)/g;
  * so the delimiter can no longer be tokenized as a reserved control token while the
  * text stays human-readable.
  */
-function neutralizeReservedControlTokens(text: string): string {
+export function neutralizeReservedControlTokens(text: string): string {
 	if (!text.includes("<|")) return text;
 	return text.replace(RESERVED_CONTROL_TOKEN_RE, "<\u200b|");
 }
@@ -148,8 +148,8 @@ function neutralizeReservedControlTokens(text: string): string {
  * evolve; the zero-width-space insertion is idempotent (`<\u200b|` no longer
  * matches `<|`) and keeps the text human-readable.
  */
-export function neutralizeResponsesInputControlTokens(items: ResponseInput): ResponseInput {
-	return items.map(item => deepNeutralizeReservedControlTokens(item)) as ResponseInput;
+export function neutralizeResponsesInputControlTokens<T>(items: readonly T[]): T[] {
+	return items.map(item => deepNeutralizeReservedControlTokens(item) as T);
 }
 
 function deepNeutralizeReservedControlTokens(value: unknown): unknown {

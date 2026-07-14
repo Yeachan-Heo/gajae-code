@@ -24,6 +24,8 @@ import type { AssistantMessage, Message, Model } from "@gajae-code/ai/types";
 import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
+	neutralizeReservedControlTokens,
+	neutralizeResponsesInputControlTokens,
 	normalizeResponsesToolCallId,
 } from "@gajae-code/ai/utils";
 import { $env, logger } from "@gajae-code/utils";
@@ -479,10 +481,12 @@ export async function requestOpenAiRemoteCompaction(
 	const endpoint = resolveOpenAiCompactEndpoint(model, options?.authCredentialType);
 	const request: OpenAiRemoteCompactionRequest = {
 		model: model.id,
-		input: trimOpenAiCompactInput(
-			compactInput,
-			resolveOpenAiCompactInputBudget(model.contextWindow, model.maxTokens),
-			instructions,
+		input: neutralizeResponsesInputControlTokens(
+			trimOpenAiCompactInput(
+				compactInput,
+				resolveOpenAiCompactInputBudget(model.contextWindow, model.maxTokens),
+				instructions,
+			),
 		),
 		instructions,
 	};
@@ -553,10 +557,17 @@ export async function requestRemoteCompaction(
 	request: RemoteCompactionRequest,
 	signal?: AbortSignal,
 ): Promise<RemoteCompactionResponse> {
+	// The prompt embeds the serialized transcript, which can carry leaked Harmony
+	// control-token markers (e.g. `<|channel|>analysis`) from model output; a
+	// gpt-5.6-backed summarization endpoint rejects those with `Request blocked`.
+	const sanitizedRequest: RemoteCompactionRequest = {
+		systemPrompt: neutralizeReservedControlTokens(request.systemPrompt),
+		prompt: neutralizeReservedControlTokens(request.prompt),
+	};
 	const response = await fetch(endpoint, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify(request),
+		body: JSON.stringify(sanitizedRequest),
 		signal,
 	});
 

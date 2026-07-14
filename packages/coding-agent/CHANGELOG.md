@@ -17,10 +17,14 @@
 
 - Fenced SDK WebSocket lifecycle callbacks and request settlement to the owning retry cycle/socket incarnation, so stale open, close, error, message, and timeout delivery cannot reject or corrupt work on a replacement connection; sent mutations remain non-replayed and deterministic race regressions cover the reconnect boundary (#2164).
 - Owned LSP stdin `EPIPE` and `ERR_STREAM_DESTROYED` failures now terminalize and evict only the affected client, reject pending and stale requests with a stable transport-closed error, and permit clean client recreation without suppressing serialization or unrelated sink failures (#2138).
+- Serialized fresh prompt preflight and durable default-model selection through deterministic per-session admission, preventing a later `model.set` from overtaking an earlier prompt while preserving provider-stream and continuation behavior (#2199).
 
 - Gajae Pet overlays no longer leak images or stale pixels across lifecycle changes: each widget owns a randomized Kitty image ID (deleted on disable, replace, switch, and dispose), the previous Sixel footprint is tracked and erased on movement, resize, and narrow-terminal fallback, replaced pet widgets are disposed before their successors install, and a saved pet preference survives editor replacement while graphics are still unavailable (so a delayed Sixel capability probe can still activate it). Teardown is exception-safe and idempotent: a failed or unavailable terminal write never aborts logical disposal or steals a successor widget's overlay slot, and Sixel/Kitty cleanup authority is retained until the erase is actually delivered so a later mode switch or dispose retries it.
 - Gajae Pet cleanup that fails during final widget disposal is now retained by the TUI for retry, and Kitty image IDs remain reserved until their exact-ID delete is delivered.
 - Fixed `gjc --tmux` startup from GNOME and other VTE terminals by recognizing `vte-spawn-*.scope` only when cgroup metadata proves matching user-manager ancestry (#2159).
+- Fixed native Windows `GJC_TMUX_COMMAND=tmux` resolution when WinGet's `tmux.exe` is a psmux alias with a generic `tmux` banner: GJC now compares executable identity with the installed `psmux.exe`/`pmux.exe` companions and fails closed when identity cannot be established instead of authorizing native-tmux semantics (#2086).
+
+- Accepted or declined initial external credential-import decisions now persist across normal restarts and upgrades, suppressing automatic startup and bare `/login` discovery; same-version legacy markers remain compatible and explicit `/provider` import remains available ([#2117](https://github.com/Yeachan-Heo/gajae-code/issues/2117)).
 
 ## [0.10.1] - 2026-07-13
 

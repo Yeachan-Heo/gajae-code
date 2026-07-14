@@ -1298,14 +1298,16 @@ export async function runRootCommand(
 			await deps.rlmPreset.onSessionCreated(session);
 		}
 
-		await applyStartupModelProfilesOrExit({
-			session,
-			settings: settingsInstance,
-			modelRegistry,
-			parsedArgs,
-			startupModel: sessionOptions.model,
-			startupThinkingLevel: sessionOptions.thinkingLevel,
-		});
+		if (!(parsedArgs.authBootstrap === true && isInteractive)) {
+			await applyStartupModelProfilesOrExit({
+				session,
+				settings: settingsInstance,
+				modelRegistry,
+				parsedArgs,
+				startupModel: sessionOptions.model,
+				startupThinkingLevel: sessionOptions.thinkingLevel,
+			});
+		}
 
 		if (modelFallbackMessage) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });

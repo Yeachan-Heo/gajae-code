@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+
 /**
  * Windows psmux detection and tmux-binary resolution.
  *
@@ -45,8 +47,7 @@ const DEFAULT_BINARY_RESOLVER: BinaryResolver = candidate => {
 	if (!candidate) return null;
 	const stripped = candidate.trim().replace(/^["']|["']$/g, "");
 	if (!stripped) return null;
-	if (Bun.which(stripped)) return stripped;
-	return null;
+	return Bun.which(stripped);
 };
 
 let activeBinaryResolver: BinaryResolver = DEFAULT_BINARY_RESOLVER;
@@ -54,6 +55,25 @@ let activeBinaryResolver: BinaryResolver = DEFAULT_BINARY_RESOLVER;
 /** @internal Test-only seam; production code never calls this. */
 export function __setBinaryResolverForTests(resolver: BinaryResolver | null): void {
 	activeBinaryResolver = resolver ?? DEFAULT_BINARY_RESOLVER;
+}
+
+export type ExecutableIdentityResolver = (path: string) => string | null;
+
+const DEFAULT_EXECUTABLE_IDENTITY_RESOLVER: ExecutableIdentityResolver = executablePath => {
+	try {
+		const realPath = fs.realpathSync.native(executablePath);
+		const stat = fs.statSync(realPath);
+		return stat.ino === 0 ? realPath.toLowerCase() : `${stat.dev}:${stat.ino}`;
+	} catch {
+		return null;
+	}
+};
+
+let activeExecutableIdentityResolver: ExecutableIdentityResolver = DEFAULT_EXECUTABLE_IDENTITY_RESOLVER;
+
+/** @internal Test-only seam; production code never calls this. */
+export function __setExecutableIdentityResolverForTests(resolver: ExecutableIdentityResolver | null): void {
+	activeExecutableIdentityResolver = resolver ?? DEFAULT_EXECUTABLE_IDENTITY_RESOLVER;
 }
 
 interface CacheEntry {
@@ -140,6 +160,62 @@ function detectPsmuxForCommand(command: string, runner: PsmuxSpawnRunner): boole
 	return outputMentionsPsmux(output);
 }
 
+function classifyWindowsTmuxAlias(command: string, env: NodeJS.ProcessEnv, runner: PsmuxSpawnRunner): boolean {
+	if (isNamedPsmuxCommand(command)) return true;
+	try {
+		if (detectPsmuxForCommand(command, runner)) return true;
+	} catch {
+		throw new Error("gjc_tmux_provider_ambiguous: selected Windows tmux command resolution failed");
+	}
+	if (normalizedCommandBaseName(command) !== "tmux" && !env[GJC_PSMUX_COMMAND_ENV]?.trim()) return false;
+
+	let selectedPath: string | null;
+	try {
+		selectedPath = resolveBinaryPath(command);
+	} catch {
+		throw new Error("gjc_tmux_provider_ambiguous: selected Windows tmux command resolution failed");
+	}
+	if (!selectedPath) {
+		throw new Error("gjc_tmux_provider_ambiguous: selected Windows tmux command could not be resolved");
+	}
+	const selectedIdentity = activeExecutableIdentityResolver(selectedPath);
+	if (!selectedIdentity) {
+		throw new Error("gjc_tmux_provider_ambiguous: selected Windows tmux executable identity is unavailable");
+	}
+
+	const explicitCompanion = env[GJC_PSMUX_COMMAND_ENV]?.trim();
+	const companions = [
+		...new Set([explicitCompanion, "psmux", "pmux"].filter((value): value is string => Boolean(value))),
+	];
+	let matched = false;
+	let distinct = false;
+	for (const companion of companions) {
+		let companionPath: string | null;
+		try {
+			companionPath = resolveBinaryPath(companion);
+		} catch {
+			throw new Error(`gjc_tmux_provider_ambiguous: Windows ${companion} command resolution failed`);
+		}
+		if (!companionPath) {
+			if (companion === explicitCompanion)
+				throw new Error("gjc_tmux_provider_ambiguous: GJC_PSMUX_COMMAND could not be resolved");
+			continue;
+		}
+		const companionIdentity = activeExecutableIdentityResolver(companionPath);
+		if (!companionIdentity) {
+			throw new Error(`gjc_tmux_provider_ambiguous: Windows ${companion} executable identity is unavailable`);
+		}
+		if (companionIdentity === selectedIdentity) matched = true;
+		else {
+			distinct = true;
+			if (companion === explicitCompanion)
+				throw new Error("gjc_tmux_provider_ambiguous: GJC_PSMUX_COMMAND selects a different executable");
+		}
+	}
+	if (matched && distinct) throw new Error("gjc_tmux_provider_ambiguous: Windows psmux companion identities conflict");
+	return matched;
+}
+
 /**
  * Decide whether command resolves to a psmux binary by probing its version
  * output. The result is cached per process unless force is set or
@@ -209,13 +285,15 @@ export function resolveGjcTmuxBinary(options: ResolveGjcTmuxBinaryOptions = {}):
 	const explicit = env.GJC_TMUX_COMMAND?.trim() || env.GJC_TEAM_TMUX_COMMAND?.trim();
 	if (explicit) {
 		const isPsmux =
-			platform === "win32" && isNamedPsmuxCommand(explicit) ? true : detectPsmux(explicit, { env, runner });
+			platform === "win32"
+				? classifyWindowsTmuxAlias(explicit, env, runner)
+				: detectPsmux(explicit, { env, runner });
 		return { command: explicit, isPsmux, viaExplicitOverride: true };
 	}
 	if (platform === "win32") {
 		for (const candidate of PSMUX_BINARY_NAMES) {
 			if (resolveBinaryPath(candidate)) {
-				const isPsmux = isNamedPsmuxCommand(candidate) ? true : detectPsmux(candidate, { env, runner });
+				const isPsmux = classifyWindowsTmuxAlias(candidate, env, runner);
 				return { command: candidate, isPsmux, viaExplicitOverride: false };
 			}
 		}

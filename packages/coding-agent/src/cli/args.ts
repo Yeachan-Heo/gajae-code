@@ -57,6 +57,8 @@ export interface Args {
 	fileArgs: string[];
 	/** Retained for test/runtime compatibility; extension-defined flags are no longer parsed. */
 	unknownFlags: Map<string, boolean | string>;
+	/** Exact interactive startup login intent, recognized before model-profile activation. */
+	authBootstrap?: true;
 }
 
 function isStartupSlashCommandArg(arg: string | undefined): boolean {
@@ -66,6 +68,13 @@ function isStartupSlashCommandArg(arg: string | undefined): boolean {
 		arg === "/provicer" ||
 		arg?.startsWith("/provicer:") === true
 	);
+}
+
+function isStartupLoginCommandArg(args: readonly string[], index: number): boolean {
+	const command = args[index];
+	if (command !== "/login" && command !== "login") return false;
+	const argumentCount = args.length - index - 1;
+	return argumentCount === 0 || (argumentCount === 1 && !args[index + 1].startsWith("-"));
 }
 
 export function parseArgs(args: string[]): Args {
@@ -78,6 +87,12 @@ export function parseArgs(args: string[]): Args {
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
 
+		if (isStartupLoginCommandArg(args, i)) {
+			result.authBootstrap = true;
+			const loginCommand = arg === "login" ? "/login" : arg;
+			result.messages.push([loginCommand, ...args.slice(i + 1)].join(" "));
+			break;
+		}
 		if (isStartupSlashCommandArg(arg)) {
 			result.messages.push(args.slice(i).join(" "));
 			break;

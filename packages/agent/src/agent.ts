@@ -292,6 +292,8 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 	/** Disable transport replay; fallback accounting is owned by the caller. */
 	fallbackManaged?: boolean;
+	/** Called synchronously after this invocation claims the agent run, before asynchronous provider work. */
+	onRunAccepted?: () => void;
 	/** Called once immediately before every managed upstream request. */
 	nextFallbackAttempt?: AgentLoopConfig["nextFallbackAttempt"];
 	/** Called after a managed upstream request is accepted and committed. */
@@ -1313,6 +1315,7 @@ export class Agent {
 		this.#state.isStreaming = true;
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
+		options?.onRunAccepted?.();
 
 		const fallbackManaged = options?.fallbackManaged === true;
 		const managedLogicalRunOwner = fallbackManaged ? (this.#managedLogicalRunOwner ?? runId) : undefined;
