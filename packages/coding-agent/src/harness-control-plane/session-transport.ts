@@ -4,6 +4,14 @@ export interface SessionStateSnapshot {
 	followupQueueDepth: number;
 }
 
+export interface HarnessSessionTransportCloseContext {
+	/**
+	 * One-shot object capability for the transport's exact direct close implementation.
+	 * It may be consumed only synchronously, before close() returns its promise.
+	 */
+	completeDirectOwnerStopReentry(): Promise<void>;
+}
+
 /** SDK-backed transport contract for a live harness session. */
 export interface HarnessSessionTransport {
 	getState(): Promise<SessionStateSnapshot>;
@@ -11,11 +19,11 @@ export interface HarnessSessionTransport {
 	eventCursor(): number;
 	waitForAgentStart(afterCursor: number, timeoutMs: number): Promise<{ cursor: number } | null>;
 	/**
-	 * Await every transport-owned cleanup step. A direct reentrant RuntimeOwner.stop()
-	 * issued synchronously before close() first suspends may be awaited to break the
-	 * cleanup cycle; descendant tasks receive the truthful outer stop result.
+	 * Await every transport-owned cleanup step. A transport that must break a direct
+	 * close/owner-stop cycle consumes the invocation-scoped context capability rather
+	 * than calling public RuntimeOwner.stop(), whose result always represents full cleanup.
 	 */
-	close(): Promise<void>;
+	close(context?: HarnessSessionTransportCloseContext): Promise<void>;
 	/** Return a synchronous disposer that fully severs this event subscription. */
 	onEventFrame?(listener: (frame: Record<string, unknown>) => void): () => void;
 	isLive?(): boolean;

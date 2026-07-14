@@ -5,7 +5,11 @@ import * as path from "node:path";
 import { ControlServer, callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import { RuntimeOwner, resolveOwner, resolveOwnerLive } from "../../src/harness-control-plane/owner";
 import { acquireLease, readLease, releaseLease } from "../../src/harness-control-plane/session-lease";
-import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
+import type {
+	HarnessSessionTransport,
+	HarnessSessionTransportCloseContext,
+	SessionStateSnapshot,
+} from "../../src/harness-control-plane/session-transport";
 import {
 	controlSocketPath,
 	readEvents,
@@ -24,7 +28,7 @@ class FakeTransport implements HarnessSessionTransport {
 	agentStarts: number[] = [];
 	closeError: Error | null = null;
 	closeCalls = 0;
-	closeImpl: ((call: number) => Promise<void>) | null = null;
+	closeImpl: ((call: number, context: HarnessSessionTransportCloseContext) => Promise<void>) | null = null;
 	unsubscribeImpl: (() => void) | null = null;
 	async getState(): Promise<SessionStateSnapshot> {
 		return this.state;
@@ -46,9 +50,12 @@ class FakeTransport implements HarnessSessionTransport {
 	onEventFrame(_listener: (frame: Record<string, unknown>) => void): () => void {
 		return () => this.unsubscribeImpl?.();
 	}
-	async close(): Promise<void> {
+	async close(context?: HarnessSessionTransportCloseContext): Promise<void> {
 		this.closeCalls += 1;
-		await this.closeImpl?.(this.closeCalls);
+		if (this.closeImpl) {
+			if (!context) throw new Error("Test transport close context is required.");
+			await this.closeImpl(this.closeCalls, context);
+		}
 		if (this.closeError) throw this.closeError;
 	}
 }
@@ -394,8 +401,8 @@ describe("RuntimeOwner (in-process integration)", () => {
 		const transport = new FakeTransport();
 		let reentrantCompleted = false;
 		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
-		transport.closeImpl = async () => {
-			await owner?.stop();
+		transport.closeImpl = async (_call, context) => {
+			await context.completeDirectOwnerStopReentry();
 			reentrantCompleted = true;
 		};
 		await owner.start();
@@ -409,6 +416,72 @@ describe("RuntimeOwner (in-process integration)", () => {
 		owner = null;
 	});
 
+	it("does not grant a synchronous foreign caller the direct close capability", async () => {
+		const transport = new FakeTransport();
+		const closeEntered = Promise.withResolvers<void>();
+		const releaseClose = Promise.withResolvers<void>();
+		const foreignDone = Promise.withResolvers<void>();
+		let directResolved = false;
+		let foreignResolved = false;
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
+		transport.closeImpl = (_call, context) => {
+			const foreignCallback = (): void => {
+				void owner?.stop().then(() => {
+					foreignResolved = true;
+					foreignDone.resolve();
+				});
+			};
+			foreignCallback();
+			const direct = context.completeDirectOwnerStopReentry().then(() => {
+				directResolved = true;
+			});
+			return (async () => {
+				await direct;
+				closeEntered.resolve();
+				await releaseClose.promise;
+			})();
+		};
+		await owner.start();
+
+		const outer = owner.stop();
+		await closeEntered.promise;
+		await Bun.sleep(0);
+		expect(directResolved).toBe(true);
+		expect(foreignResolved).toBe(false);
+
+		releaseClose.resolve();
+		await outer;
+		await foreignDone.promise;
+		expect(foreignResolved).toBe(true);
+		expect(transport.closeCalls).toBe(1);
+		expect((await resolveOwner(root, SID)).live).toBe(false);
+		owner = null;
+	});
+
+	it("expires an unused direct close capability before descendant work runs", async () => {
+		const transport = new FakeTransport();
+		const closeEntered = Promise.withResolvers<void>();
+		const releaseClose = Promise.withResolvers<void>();
+		let captured: HarnessSessionTransportCloseContext | null = null;
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
+		transport.closeImpl = async (_call, context) => {
+			captured = context;
+			closeEntered.resolve();
+			await releaseClose.promise;
+		};
+		await owner.start();
+
+		const outer = owner.stop();
+		await closeEntered.promise;
+		expect(() => captured?.completeDirectOwnerStopReentry()).toThrow(
+			"Runtime owner direct stop reentry capability is no longer available.",
+		);
+
+		releaseClose.resolve();
+		await outer;
+		expect(transport.closeCalls).toBe(1);
+		owner = null;
+	});
 	it("does not grant descendant cleanup tasks early stop completion", async () => {
 		const transport = new FakeTransport();
 		const releaseClose = Promise.withResolvers<void>();

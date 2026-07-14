@@ -40,7 +40,12 @@ import {
 	releaseLease,
 	type SessionLease,
 } from "./session-lease";
-import { type HarnessSessionTransport, type SessionStateSnapshot, singleFlightAccept } from "./session-transport";
+import {
+	type HarnessSessionTransport,
+	type HarnessSessionTransportCloseContext,
+	type SessionStateSnapshot,
+	singleFlightAccept,
+} from "./session-transport";
 import { buildStateView, nextAllowedActions, submitUnavailableReason } from "./state-machine";
 import {
 	appendEvent,
@@ -135,7 +140,6 @@ export class RuntimeOwner {
 	#framePump: Promise<void> = Promise.resolve();
 	#coalesced = new Map<string, true>();
 	#stopPromise: Promise<void> | null = null;
-	#directStopReentry = false;
 	#lastStopFailures: unknown[] = [];
 	#reportedStopFailures = new Set<string>();
 
@@ -695,14 +699,9 @@ export class RuntimeOwner {
 	}
 
 	stop(): Promise<void> {
-		// Publish the shared external result before invoking teardown. A cleanup
-		// callback may consume one synchronous reentry allowance to break the direct
-		// `close() -> stop()` cycle; descendants scheduled from that callback do not
-		// inherit the allowance and must await this truthful outer result.
-		if (this.#directStopReentry) {
-			this.#directStopReentry = false;
-			return Promise.resolve();
-		}
+		// Every public caller receives the one truthful shared teardown result. Only
+		// the object capability passed to the exact transport.close() invocation can
+		// break a direct cleanup cycle; ambient synchronous callers have no bypass.
 		if (this.#stopPromise) return this.#stopPromise;
 		const pending = Promise.withResolvers<void>();
 		this.#stopPromise = pending.promise;
@@ -710,12 +709,22 @@ export class RuntimeOwner {
 		return pending.promise;
 	}
 
-	#invokeCleanup<T>(callback: () => T): T {
-		this.#directStopReentry = true;
+	#closeTransport(): Promise<void> {
+		let available = true;
+		const context: HarnessSessionTransportCloseContext = Object.freeze({
+			completeDirectOwnerStopReentry(): Promise<void> {
+				if (!available) throw new Error("Runtime owner direct stop reentry capability is no longer available.");
+				available = false;
+				return Promise.resolve();
+			},
+		});
 		try {
-			return callback();
+			return this.#opts.transport.close(context);
 		} finally {
-			this.#directStopReentry = false;
+			// An async close implementation runs synchronously until it returns its
+			// promise. Expire the capability at that boundary so descendants cannot
+			// acquire completion authority after the direct invocation.
+			available = false;
 		}
 	}
 
@@ -747,7 +756,7 @@ export class RuntimeOwner {
 		const unsubscribe = this.#unsubscribeFrames;
 		if (unsubscribe) {
 			try {
-				this.#invokeCleanup(unsubscribe);
+				unsubscribe();
 				this.#unsubscribeFrames = null;
 			} catch (error) {
 				failures.push(error);
@@ -760,7 +769,7 @@ export class RuntimeOwner {
 		// endpoint live until its termination is verified so a replacement cannot
 		// acquire authority merely because this daemon exits.
 		try {
-			await this.#invokeCleanup(() => this.#opts.transport.close());
+			await this.#closeTransport();
 		} catch (error) {
 			failures.push(error);
 			await this.#reportStopFailure("owner_transport_stop_failed", error);
@@ -768,7 +777,7 @@ export class RuntimeOwner {
 		if (failures.length > 0) throw new AggregateError(failures, "Runtime owner transport cleanup failed.");
 
 		try {
-			await this.#invokeCleanup(() => this.#server.close());
+			await this.#server.close();
 		} catch (error) {
 			failures.push(error);
 			await this.#reportStopFailure("owner_server_stop_failed", error);
