@@ -1252,7 +1252,9 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		);
 		if (attached.exitCode === 0) return true;
 		if (isTmuxAttachDisconnectError(attached)) {
-			(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr),
+			);
 			return true;
 		}
 		if (isWindowsPsmuxAttachConnectionRefused(plan, attached)) {
@@ -1268,7 +1270,9 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 					`psmux attach retry exited: code=${retryAttached.exitCode ?? "null"}${retrySig}\n`,
 				);
 				if (retryAttached.exitCode === 0) return true;
-				(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach retry failed", retryAttached.stderr));
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					formatTmuxLaunchDiagnostic("attach retry failed", retryAttached.stderr),
+				);
 				return true;
 			}
 		}

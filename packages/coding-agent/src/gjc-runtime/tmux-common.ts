@@ -284,7 +284,10 @@ export function buildGjcTmuxProfileCommands(
 		return commands.filter(command => {
 			const flag = command.args[0];
 			const key = command.args[command.args.length - 2];
-			if (PSMUX_UNSUPPORTED_PROFILE_KEYS.has(String(key)) && (flag === "set-option" || flag === "set-window-option")) {
+			if (
+				PSMUX_UNSUPPORTED_PROFILE_KEYS.has(String(key)) &&
+				(flag === "set-option" || flag === "set-window-option")
+			) {
 				return false;
 			}
 			// psmux 3.3.0 also rejects the ownership-tag round-trip (set-option

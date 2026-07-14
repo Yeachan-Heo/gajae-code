@@ -678,24 +678,25 @@ describe("default GJC tmux launch", () => {
 		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
 		try {
-			expect(() =>
-				launchDefaultTmuxIfNeeded({
-					parsed: args({ messages: ["hello world"], tmux: true }),
-					rawArgs: ["--tmux", "hello world"],
-					cwd: "/repo",
-					env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
-					argv: ["bun", "packages/coding-agent/src/cli.ts"],
-					execPath: "/bin/bun",
-					platform: "win32",
-					tty: { stdin: true, stdout: true, columns: 178, rows: 35 },
-					tmuxAvailable: true,
-					currentBranch: "feature/demo",
-					existingBranchSessionName: null,
-					spawnSync: (command, spawnArgs, options) => {
-						calls.push({ command, args: spawnArgs, options });
-						return { exitCode: 0, stdout: "" };
-					},
-				}),
+			expect(
+				() =>
+					launchDefaultTmuxIfNeeded({
+						parsed: args({ messages: ["hello world"], tmux: true }),
+						rawArgs: ["--tmux", "hello world"],
+						cwd: "/repo",
+						env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+						argv: ["bun", "packages/coding-agent/src/cli.ts"],
+						execPath: "/bin/bun",
+						platform: "win32",
+						tty: { stdin: true, stdout: true, columns: 178, rows: 35 },
+						tmuxAvailable: true,
+						currentBranch: "feature/demo",
+						existingBranchSessionName: null,
+						spawnSync: (command, spawnArgs, options) => {
+							calls.push({ command, args: spawnArgs, options });
+							return { exitCode: 0, stdout: "" };
+						},
+					}),
 				// psmux bypass: the upstream owner-isolation throw is replaced with an
 				// empty diagnostic guard. Mutation, kill, and set-option are still
 				// skipped (no rename/profile window and no owner publication), but
@@ -870,32 +871,32 @@ describe("default GJC tmux launch", () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
 		try {
-			expect(() =>
-				launchDefaultTmuxIfNeeded({
-					parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
-					rawArgs: ["--tmux", "--continue", "hello world"],
-					cwd: "/repo",
-					env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
-					argv: ["bun", "packages/coding-agent/src/cli.ts"],
-					execPath: "/bin/bun",
-					platform: "win32",
-					tty: interactiveTty,
-					tmuxAvailable: true,
-					worktreeBranch: "feature/demo",
-					existingBranchSessionName: "gajae_code_feature",
-					diagnosticWriter: message => diagnostics.push(message),
-					spawnSync: (command, spawnArgs, options) => {
-						calls.push({ command, args: spawnArgs, options });
-						return { exitCode: 0, stdout: NATIVE_SESSION_ID };
-					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
-				},
-			}),
-			// psmux bypass: the upstream owner-isolation throw is replaced with an
-			// empty diagnostic guard that continues with the legacy launch flow.
-			// No tmux mutation, retry, or attach is attempted before the gate.
-		).not.toThrow();
-		expect(calls).toEqual([]);
-		expect(diagnostics).toEqual([expect.stringContaining("psmux cannot provide immutable owner identity")]);
+			expect(
+				() =>
+					launchDefaultTmuxIfNeeded({
+						parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
+						rawArgs: ["--tmux", "--continue", "hello world"],
+						cwd: "/repo",
+						env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+						argv: ["bun", "packages/coding-agent/src/cli.ts"],
+						execPath: "/bin/bun",
+						platform: "win32",
+						tty: interactiveTty,
+						tmuxAvailable: true,
+						worktreeBranch: "feature/demo",
+						existingBranchSessionName: "gajae_code_feature",
+						diagnosticWriter: message => diagnostics.push(message),
+						spawnSync: (command, spawnArgs, options) => {
+							calls.push({ command, args: spawnArgs, options });
+							return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+						},
+					}),
+				// psmux bypass: the upstream owner-isolation throw is replaced with an
+				// empty diagnostic guard that continues with the legacy launch flow.
+				// No tmux mutation, retry, or attach is attempted before the gate.
+			).not.toThrow();
+			expect(calls).toEqual([]);
+			expect(diagnostics).toEqual([expect.stringContaining("psmux cannot provide immutable owner identity")]);
 		} finally {
 			__setBinaryResolverForTests(null);
 		}
@@ -2093,7 +2094,9 @@ it("captures psmux stderr in the attach-failed diagnostic", () => {
 	// pre-launch owner-identity refusal; on Windows the early psmux skip
 	// keeps the original psmux diagnostic. Either is acceptable.
 	const first = diagnostics[0];
-	expect(first.includes("psmux cannot provide immutable owner identity") || first.includes("new-session failed")).toBe(true);
+	expect(first.includes("psmux cannot provide immutable owner identity") || first.includes("new-session failed")).toBe(
+		true,
+	);
 });
 
 it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windows", () => {
@@ -2266,25 +2269,26 @@ it("preserves a native Linux profile failure without retrying or cleaning up", (
 it("refuses psmux without name-only mutation, retry, attach, or cleanup", () => {
 	const calls: Array<{ command: string; args: string[] }> = [];
 	const diagnostics: string[] = [];
-	expect(() =>
-		launchDefaultTmuxIfNeeded({
-			parsed: args({ messages: ["hello world"], tmux: true }),
-			rawArgs: ["--tmux", "hello world"],
-			cwd: "/repo",
-			env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
-			argv: ["bun", "packages/coding-agent/src/cli.ts"],
-			execPath: "/bin/bun",
-			platform: "win32",
-			tty: interactiveTty,
-			tmuxAvailable: true,
-			currentBranch: "",
-			existingBranchSessionName: null,
-			diagnosticWriter: message => diagnostics.push(message),
-			spawnSync: (_command, spawnArgs) => {
-				calls.push({ command: spawnArgs[0], args: spawnArgs });
-				return { exitCode: 0, stdout: "" };
-			},
-		}),
+	expect(
+		() =>
+			launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello world"], tmux: true }),
+				rawArgs: ["--tmux", "hello world"],
+				cwd: "/repo",
+				env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+				argv: ["bun", "packages/coding-agent/src/cli.ts"],
+				execPath: "/bin/bun",
+				platform: "win32",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				currentBranch: "",
+				existingBranchSessionName: null,
+				diagnosticWriter: message => diagnostics.push(message),
+				spawnSync: (_command, spawnArgs) => {
+					calls.push({ command: spawnArgs[0], args: spawnArgs });
+					return { exitCode: 0, stdout: "" };
+				},
+			}),
 		// psmux bypass: the upstream owner-isolation throw is replaced with an
 		// empty diagnostic guard. Mutation / retry / cleanup are still skipped,
 		// but attach-session is now reached via the fast-path helper so the pane
@@ -2293,14 +2297,9 @@ it("refuses psmux without name-only mutation, retry, attach, or cleanup", () => 
 	expect(calls.filter(call => call.command === "new-session")).toHaveLength(0);
 	expect(
 		calls.some(call =>
-			[
-				"has-session",
-				"rename-window",
-				"set-option",
-				"set-window-option",
-				"resize-window",
-				"kill-session",
-			].includes(call.command),
+			["has-session", "rename-window", "set-option", "set-window-option", "resize-window", "kill-session"].includes(
+				call.command,
+			),
 		),
 	).toBe(false);
 	expect(calls.some(call => call.command === "attach-session")).toBe(true);
@@ -2824,31 +2823,31 @@ describe("tmux owner isolation launch gate", () => {
 		const calls: string[][] = [];
 		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
 		try {
-			expect(() =>
-				launchDefaultTmuxIfNeeded({
-					parsed: args({ messages: ["hello"], tmux: true, continue: true }),
-					rawArgs: ["--tmux", "--continue", "hello"],
-					cwd: launchTestRoot,
-					env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
-					argv: ["bun", "cli.ts"],
-					execPath: "/bin/bun",
-					platform: "win32",
-					tty: interactiveTty,
-					tmuxAvailable: true,
-					currentBranch: "feature/demo",
-					worktreeBranch: "feature/demo",
-					existingBranchSessionName: "managed",
-					spawnSync: (_command, spawnArgs) => {
-						calls.push(spawnArgs);
-						return { exitCode: 0 };
-					return { exitCode: 0 };
-				},
-			}),
-			// psmux bypass: the upstream owner-isolation throw is replaced with an
-			// empty diagnostic guard. No mutation (rename/profile/set-option/
-			// resize) and no kill is performed on the existing session.
-		).not.toThrow();
-		expect(calls).toEqual([]);
+			expect(
+				() =>
+					launchDefaultTmuxIfNeeded({
+						parsed: args({ messages: ["hello"], tmux: true, continue: true }),
+						rawArgs: ["--tmux", "--continue", "hello"],
+						cwd: launchTestRoot,
+						env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+						argv: ["bun", "cli.ts"],
+						execPath: "/bin/bun",
+						platform: "win32",
+						tty: interactiveTty,
+						tmuxAvailable: true,
+						currentBranch: "feature/demo",
+						worktreeBranch: "feature/demo",
+						existingBranchSessionName: "managed",
+						spawnSync: (_command, spawnArgs) => {
+							calls.push(spawnArgs);
+							return { exitCode: 0 };
+						},
+					}),
+				// psmux bypass: the upstream owner-isolation throw is replaced with an
+				// empty diagnostic guard. No mutation (rename/profile/set-option/
+				// resize) and no kill is performed on the existing session.
+			).not.toThrow();
+			expect(calls).toEqual([]);
 		} finally {
 			__setBinaryResolverForTests(null);
 		}
@@ -2858,31 +2857,32 @@ describe("tmux owner isolation launch gate", () => {
 		const calls: string[][] = [];
 		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
 		try {
-			expect(() =>
-				launchDefaultTmuxIfNeeded({
-					parsed: args({ messages: ["hello"], tmux: true }),
-					rawArgs: ["--tmux", "hello"],
-					cwd: launchTestRoot,
-					env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
-					argv: ["bun", "cli.ts"],
-					execPath: "/bin/bun",
-					platform: "win32",
-					tty: interactiveTty,
-					tmuxAvailable: true,
-					existingBranchSessionName: null,
-					spawnSync: (_command, spawnArgs) => {
-						calls.push(spawnArgs);
-						if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed" };
-					return { exitCode: 0 };
-				},
-			}),
-			// psmux bypass: the upstream owner-isolation throw is replaced with
-			// an empty diagnostic guard. attach-session now runs through the
-			// fast-path helper; on a failed attach the helper returns true
-			// without killing the just-created session, so ownership of the
-			// reusable session name stays with psmux.
-		).not.toThrow();
-		expect(calls.some(call => call[0] === "kill-session")).toBe(false);
+			expect(
+				() =>
+					launchDefaultTmuxIfNeeded({
+						parsed: args({ messages: ["hello"], tmux: true }),
+						rawArgs: ["--tmux", "hello"],
+						cwd: launchTestRoot,
+						env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+						argv: ["bun", "cli.ts"],
+						execPath: "/bin/bun",
+						platform: "win32",
+						tty: interactiveTty,
+						tmuxAvailable: true,
+						existingBranchSessionName: null,
+						spawnSync: (_command, spawnArgs) => {
+							calls.push(spawnArgs);
+							if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed" };
+							return { exitCode: 0 };
+						},
+					}),
+				// psmux bypass: the upstream owner-isolation throw is replaced with
+				// an empty diagnostic guard. attach-session now runs through the
+				// fast-path helper; on a failed attach the helper returns true
+				// without killing the just-created session, so ownership of the
+				// reusable session name stays with psmux.
+			).not.toThrow();
+			expect(calls.some(call => call[0] === "kill-session")).toBe(false);
 		} finally {
 			__setBinaryResolverForTests(null);
 		}
