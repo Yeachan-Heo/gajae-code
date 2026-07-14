@@ -132,6 +132,37 @@ function aggregateAcpFailure(code: string, message: string, failures: unknown[])
 		errors: aggregate.errors,
 	});
 }
+type AcpCwdFlavor = "posix" | "win32";
+
+function normalizeAbsoluteAcpCwd(value: string, flavor: AcpCwdFlavor): string | undefined {
+	if (!value || value.includes("\0")) return undefined;
+	if (flavor === "posix") {
+		if (!path.posix.isAbsolute(value)) return undefined;
+		const doubleRoot = value.startsWith("//") && !value.startsWith("///");
+		const offset = doubleRoot ? 2 : 1;
+		const normalizedBody = path.posix.normalize(`/${value.slice(offset)}`).slice(1);
+		return `${doubleRoot ? "//" : "/"}${normalizedBody}`;
+	}
+
+	const normalizedSeparators = value.replaceAll("/", "\\");
+	if (/^\\\\[?.](?:\\|$)/.test(normalizedSeparators)) return undefined;
+	const driveQualified = /^[A-Za-z]:\\/.test(normalizedSeparators);
+	const uncQualified = /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(normalizedSeparators);
+	if (!driveQualified && !uncQualified) return undefined;
+	return path.win32.normalize(normalizedSeparators);
+}
+
+export function matchesAbsoluteAcpCwd(
+	locator: string,
+	cwd: string | undefined,
+	flavor: AcpCwdFlavor = process.platform === "win32" ? "win32" : "posix",
+): boolean {
+	const normalizedLocator = normalizeAbsoluteAcpCwd(locator, flavor);
+	if (normalizedLocator === undefined) return false;
+	if (cwd === undefined) return true;
+	const normalizedCwd = normalizeAbsoluteAcpCwd(cwd, flavor);
+	return normalizedCwd !== undefined && normalizedLocator === normalizedCwd;
+}
 
 /** Applies ACP's offset cursor after narrowing the broker listing to the requested cwd. */
 export function paginateAcpSessions(listed: unknown[], cwd: string | undefined, offset: number): ListSessionsResponse {
@@ -141,7 +172,7 @@ export function paginateAcpSessions(listed: unknown[], cwd: string | undefined, 
 			(value): value is BrokerSession & { locator: { repo: string } } =>
 				typeof value?.sessionId === "string" && typeof value.locator?.repo === "string",
 		)
-		.filter(value => !cwd || value.locator.repo === cwd);
+		.filter(value => matchesAbsoluteAcpCwd(value.locator.repo, cwd));
 	const sessions = filtered
 		.slice(offset, offset + SESSION_PAGE_SIZE)
 		.map(
@@ -711,14 +742,14 @@ export class AcpAgent implements Agent {
 				if (
 					typeof candidate?.sessionId !== "string" ||
 					typeof candidate.locator?.repo !== "string" ||
-					path.resolve(candidate.locator.repo) !== path.resolve(params.cwd)
+					!matchesAbsoluteAcpCwd(candidate.locator.repo, params.cwd)
 				)
 					continue;
 				if (discovered.has(candidate.sessionId))
 					throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${candidate.sessionId}`);
 				discovered.add(candidate.sessionId);
 				const knownCwd = this.#knownSessionCwds.get(candidate.sessionId);
-				if (knownCwd && path.resolve(knownCwd) !== path.resolve(params.cwd))
+				if (knownCwd && !matchesAbsoluteAcpCwd(knownCwd, params.cwd))
 					throw new AcpSdkAdapterError(
 						"conflict",
 						`ACP session ${candidate.sessionId} has conflicting cwd authority.`,

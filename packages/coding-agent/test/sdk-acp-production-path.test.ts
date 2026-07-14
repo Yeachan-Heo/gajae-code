@@ -43,6 +43,7 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 	const agentDir = path.join(directory, ".gjc", "agent");
 	const token = "acp-broker-token";
 	const requests: Array<Record<string, unknown>> = [];
+	let brokerSessions: Record<string, unknown>[] = [];
 	let server!: TestServer;
 	server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -59,7 +60,14 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				requests.push(frame);
-				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } }));
+				socket.send(
+					JSON.stringify({
+						type: "broker_response",
+						id: frame.id,
+						ok: true,
+						result: { sessions: brokerSessions },
+					}),
+				);
 			},
 		},
 	});
@@ -95,6 +103,29 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 	expect(lifecycle).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
 	expect(JSON.stringify(lifecycle)).not.toContain(token);
 	expect(requests).toHaveLength(1);
+	const scopedCwd = path.join(process.cwd(), "workspace");
+	brokerSessions = [
+		{ sessionId: "relative", locator: { repo: "workspace" } },
+		{ sessionId: "dot-relative", locator: { repo: "./workspace" } },
+		{ sessionId: "empty", locator: { repo: "" } },
+		{ sessionId: "sentinel", locator: { repo: "unknown" } },
+		{ sessionId: "drive-relative", locator: { repo: "C:workspace" } },
+		{ sessionId: "windows-root-relative", locator: { repo: String.raw`\workspace` } },
+	];
+	expect(await agent.listSessions({})).toEqual({ sessions: [], nextCursor: undefined });
+	expect(await agent.listSessions({ cwd: scopedCwd })).toEqual({ sessions: [], nextCursor: undefined });
+	const requestsAfterScopedList = requests.length;
+	for (const session of brokerSessions) {
+		await agent.closeSession({ sessionId: String(session.sessionId) });
+		await agent.deleteSession({ sessionId: String(session.sessionId) });
+	}
+	expect(requests).toHaveLength(requestsAfterScopedList);
+	const equivalentCwd = `${scopedCwd}${path.sep}.`;
+	brokerSessions = [{ sessionId: "absolute", locator: { repo: equivalentCwd } }];
+	expect(await agent.listSessions({ cwd: scopedCwd })).toEqual({
+		sessions: [{ sessionId: "absolute", cwd: equivalentCwd, title: "absolute" }],
+		nextCursor: undefined,
+	});
 	abort.abort();
 });
 
