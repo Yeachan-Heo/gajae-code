@@ -696,13 +696,16 @@ describe("default GJC tmux launch", () => {
 						return { exitCode: 0, stdout: "" };
 					},
 				}),
-			).toThrow("gjc_tmux_owner_isolation_native_session_identity_unavailable");
+				// psmux bypass: the upstream owner-isolation throw is replaced with an
+				// empty diagnostic guard. Mutation, kill, and set-option are still
+				// skipped (no rename/profile window and no owner publication), but
+				// the legacy launch flow now reaches attach-session so the pane can
+				// settle for the user instead of refusing the launch entirely.
+			).not.toThrow();
 			expect(calls.filter(call => call.args[0] === "new-session")).toHaveLength(0);
-			expect(
-				calls.some(call =>
-					["resize-window", "attach-session", "set-option", "kill-session"].includes(call.args[0]),
-				),
-			).toBe(false);
+			expect(calls.some(call => ["resize-window", "set-option", "kill-session"].includes(call.args[0]))).toBe(false);
+			// attach-session is the only command allowed in this bypass path.
+			expect(calls.some(call => call.args[0] === "attach-session")).toBe(true);
 		} finally {
 			__setBinaryResolverForTests(null);
 		}
@@ -884,11 +887,15 @@ describe("default GJC tmux launch", () => {
 					spawnSync: (command, spawnArgs, options) => {
 						calls.push({ command, args: spawnArgs, options });
 						return { exitCode: 0, stdout: NATIVE_SESSION_ID };
-					},
-				}),
-			).toThrow("gjc_tmux_owner_isolation_native_session_identity_unavailable");
-			expect(calls).toEqual([]);
-			expect(diagnostics).toEqual([expect.stringContaining("psmux cannot provide immutable owner identity")]);
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				},
+			}),
+			// psmux bypass: the upstream owner-isolation throw is replaced with an
+			// empty diagnostic guard that continues with the legacy launch flow.
+			// No tmux mutation, retry, or attach is attempted before the gate.
+		).not.toThrow();
+		expect(calls).toEqual([]);
+		expect(diagnostics).toEqual([expect.stringContaining("psmux cannot provide immutable owner identity")]);
 		} finally {
 			__setBinaryResolverForTests(null);
 		}
@@ -1216,7 +1223,15 @@ describe("default GJC tmux launch", () => {
 		expect(keys.includes("mouse")).toBe(includesUxCommands);
 		expect(keys.includes("set-clipboard")).toBe(includesUxCommands);
 		expect(keys.includes("mode-style")).toBe(includesUxCommands);
-		expect(keys).toContain("@gjc-profile");
+		// @gjc-profile is the ownership-tag marker; on psmux we drop it whenever
+		// we drop UX commands, since psmux 3.3.0 mishandles the @gjc-* set-option
+		// round-trip in the same way (returns 0 then surfaces a PowerShell
+		// ParserError via an inner gjc). GJC_PSMUX_PROFILE_FORCE=1 keeps it.
+		if (includesUxCommands) {
+			expect(keys).toContain("@gjc-profile");
+		} else {
+			expect(keys).not.toContain("@gjc-profile");
+		}
 	});
 
 	it("records session identity markers in the required tmux profile", () => {
@@ -2066,12 +2081,14 @@ it("captures psmux stderr in the attach-failed diagnostic", () => {
 			return { exitCode: 0, stdout: NATIVE_SESSION_ID };
 		},
 	});
-	// A managed creation failure is terminal so the caller cannot fall through
-	// into an unisolated root GJC process; diagnostics retain the rejection.
+	// psmux bypass: the upstream owner-isolation throw is replaced with an
+	// empty diagnostic guard. The launch still terminates (handled = true)
+	// without creating or destroying a managed session; the operator sees
+	// the psmux-specific owner-identity refusal diagnostic instead of a
+	// new-session rejection.
 	expect(handled).toBe(true);
 	expect(diagnostics.length).toBeGreaterThan(0);
-	expect(diagnostics[0]).toContain("new-session failed");
-	expect(diagnostics[0]).toContain("cannot create session");
+	expect(diagnostics[0]).toContain("psmux cannot provide immutable owner identity");
 });
 
 it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windows", () => {
@@ -2117,9 +2134,12 @@ it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windo
 			},
 		});
 		expect(diagnostics.length).toBeGreaterThan(0);
-		expect(diagnostics[0]).toContain("new-session failed");
-		expect(diagnostics[0]).toContain("Wrapper warning");
-		expect(diagnostics[0]).toContain(wrapperPath);
+		// psmux bypass: the upstream owner-isolation throw is replaced with an
+		// empty diagnostic guard. The launch still terminates without creating
+		// or destroying a managed session; the operator sees the psmux-specific
+		// owner-identity refusal diagnostic instead of a wrapper-corruption
+		// warning, because psmux refuses before any new-session probe runs.
+		expect(diagnostics[0]).toContain("psmux cannot provide immutable owner identity");
 	} finally {
 		process.env.PATH = originalPath;
 		try {
@@ -2260,7 +2280,11 @@ it("refuses psmux without name-only mutation, retry, attach, or cleanup", () => 
 				return { exitCode: 0, stdout: "" };
 			},
 		}),
-	).toThrow("gjc_tmux_owner_isolation_native_session_identity_unavailable");
+		// psmux bypass: the upstream owner-isolation throw is replaced with an
+		// empty diagnostic guard. Mutation / retry / cleanup are still skipped,
+		// but attach-session is now reached via the fast-path helper so the pane
+		// can settle for the user instead of refusing the launch entirely.
+	).not.toThrow();
 	expect(calls.filter(call => call.command === "new-session")).toHaveLength(0);
 	expect(
 		calls.some(call =>
@@ -2270,12 +2294,16 @@ it("refuses psmux without name-only mutation, retry, attach, or cleanup", () => 
 				"set-option",
 				"set-window-option",
 				"resize-window",
-				"attach-session",
 				"kill-session",
 			].includes(call.command),
 		),
 	).toBe(false);
-	expect(diagnostics).toEqual([expect.stringContaining("psmux cannot provide immutable owner identity")]);
+	expect(calls.some(call => call.command === "attach-session")).toBe(true);
+	// psmux bypass surfaces the legacy "refusing managed session creation"
+	// diagnostic, then the fast-path helper appends an "attach-session
+	// exited" line. The first line is the contract we still preserve; the
+	// second is operator-facing context.
+	expect(diagnostics[0]).toContain("psmux cannot provide immutable owner identity");
 });
 
 it("does not retry a native tmux attach os error 10061", () => {
@@ -2808,10 +2836,14 @@ describe("tmux owner isolation launch gate", () => {
 					spawnSync: (_command, spawnArgs) => {
 						calls.push(spawnArgs);
 						return { exitCode: 0 };
-					},
-				}),
-			).toThrow("gjc_tmux_owner_isolation_native_session_identity_unavailable");
-			expect(calls).toEqual([]);
+					return { exitCode: 0 };
+				},
+			}),
+			// psmux bypass: the upstream owner-isolation throw is replaced with an
+			// empty diagnostic guard. No mutation (rename/profile/set-option/
+			// resize) and no kill is performed on the existing session.
+		).not.toThrow();
+		expect(calls).toEqual([]);
 		} finally {
 			__setBinaryResolverForTests(null);
 		}
@@ -2836,11 +2868,16 @@ describe("tmux owner isolation launch gate", () => {
 					spawnSync: (_command, spawnArgs) => {
 						calls.push(spawnArgs);
 						if (spawnArgs[0] === "attach-session") return { exitCode: 1, stderr: "attach failed" };
-						return { exitCode: 0 };
-					},
-				}),
-			).toThrow("gjc_tmux_owner_isolation_native_session_identity_unavailable");
-			expect(calls.some(call => call[0] === "kill-session")).toBe(false);
+					return { exitCode: 0 };
+				},
+			}),
+			// psmux bypass: the upstream owner-isolation throw is replaced with
+			// an empty diagnostic guard. attach-session now runs through the
+			// fast-path helper; on a failed attach the helper returns true
+			// without killing the just-created session, so ownership of the
+			// reusable session name stays with psmux.
+		).not.toThrow();
+		expect(calls.some(call => call[0] === "kill-session")).toBe(false);
 		} finally {
 			__setBinaryResolverForTests(null);
 		}

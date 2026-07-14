@@ -1275,7 +1275,14 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("psmux attach failed", attached.stderr));
 		return true;
 	};
-
+	// On psmux we cannot prove immutable owner identity, so the legacy
+	// existing-session attach path's mutation guards all bail out. Skip the
+	// attach attempt; the diagnostic the upstream throw used to surface is
+	// emitted by the pre-launch guard at the top of this function so we do
+	// not duplicate it here.
+	if (plan.attachSessionName && plan.isPsmux) {
+		return true;
+	}
 	if (plan.attachSessionName) {
 		let existingTarget: string;
 		let existingProof: ReturnType<typeof proveGjcTmuxSessionMutationTarget> | undefined;
@@ -1334,6 +1341,13 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		(context.diagnosticWriter ?? safeStderrWrite)("tmux required ownership metadata was unavailable");
 		return true;
 	}
+	// On psmux we cannot prove immutable owner identity (cgroup path is
+	// not_applicable), so the post-create owner-isolation guards always
+	// return false and we would otherwise end up creating a session that we
+	// then refuse to mutate or attach. Skip the new-session path entirely and
+	// jump straight to the legacy attach fast-path, which still reaches
+	// attach-session for the user.
+	if (plan.isPsmux) return attachForPsmuxFastPath();
 	const created = createIsolatedTmuxSession(
 		plan,
 		rawSpawnSync,
