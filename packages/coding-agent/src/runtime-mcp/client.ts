@@ -93,15 +93,15 @@ async function initializeConnection(
 	transport: MCPTransport,
 	options?: {
 		signal?: AbortSignal;
+		/** Whether to advertise the roots/list capability (default: true). */
+		advertiseRoots?: boolean;
 		/** Called after the initialize response (which sets the session ID) but before notifications/initialized. */
 		onInitialized?: () => void | Promise<void>;
 	},
 ): Promise<MCPInitializeResult> {
 	const params: MCPInitializeParams = {
 		protocolVersion: PROTOCOL_VERSION,
-		capabilities: {
-			roots: { listChanged: false },
-		},
+		capabilities: options?.advertiseRoots === false ? {} : { roots: { listChanged: false } },
 		clientInfo: CLIENT_INFO,
 	};
 
@@ -135,6 +135,8 @@ export async function connectToServer(
 	config: MCPServerConfig,
 	options?: {
 		signal?: AbortSignal;
+		/** Whether to advertise the roots/list capability (default: true). */
+		advertiseRoots?: boolean;
 		onNotification?: (method: string, params: unknown) => void;
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
 	},
@@ -150,14 +152,14 @@ export async function connectToServer(
 			transport.onNotification = options.onNotification;
 		}
 
-		// Always handle standard MCP server-to-client requests (ping, roots/list).
-		// The initialize request declares roots capability, so we must respond to
-		// roots/list — even for short-lived test connections.
+		// Always install a handler for standard MCP server-to-client requests.
+		// Callers that do not advertise roots can reject roots/list via onRequest.
 		transport.onRequest = options?.onRequest ?? defaultRequestHandler;
 
 		try {
 			const initResult = await initializeConnection(transport, {
 				signal: connectSignal,
+				advertiseRoots: options?.advertiseRoots,
 				async onInitialized() {
 					// Open the SSE stream before sending initialized, so server-to-client
 					// requests triggered by on_initialized (e.g. roots/list) are delivered.

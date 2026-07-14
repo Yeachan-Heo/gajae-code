@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import { logger } from "@gajae-code/utils";
 import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
 import { StdioTransport } from "../../src/runtime-mcp/transports/stdio";
@@ -131,5 +132,58 @@ describe("MCP HTTP transport lifecycle", () => {
 		await transport.startSSEListener();
 
 		await transport.close();
+	});
+	test("redacts background SSE parser diagnostics without changing error or close handling", async () => {
+		const credential = "sse-query-credential";
+		const rawSseMarker = "MALICIOUS_SSE_PAYLOAD_MARKER";
+		const server = Bun.serve({
+			port: 0,
+			idleTimeout: 255,
+			fetch() {
+				const stream = new ReadableStream({
+					start(controller) {
+						controller.enqueue(new TextEncoder().encode(`data: ${rawSseMarker}\n\n`));
+						controller.close();
+					},
+				});
+				return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
+			},
+		});
+		const url = `${server.url.href}?access_token=${credential}`;
+		const transport = new HttpTransport({ type: "http", url, timeout: 1_000 });
+		const errors: Error[] = [];
+		let closeCount = 0;
+		const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
+		const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+		let closed = false;
+
+		try {
+			transport.onError = error => errors.push(error);
+			transport.onClose = () => {
+				closeCount += 1;
+			};
+
+			await transport.connect();
+			await transport.startSSEListener();
+			await waitFor(() => errors.length === 1 && closeCount === 1);
+
+			expect(errors[0]).toBeInstanceOf(SyntaxError);
+			expect(debugSpy).toHaveBeenCalledWith("HTTP SSE stream error");
+			const loggedText = JSON.stringify([debugSpy, infoSpy, warnSpy, errorSpy].flatMap(spy => spy.mock.calls));
+			expect(loggedText).not.toContain(credential);
+			expect(loggedText).not.toContain(server.url.href);
+			expect(loggedText).not.toContain("?access_token=");
+			expect(loggedText).not.toContain(rawSseMarker);
+
+			await transport.close();
+			closed = true;
+			expect(closeCount).toBe(2);
+		} finally {
+			if (!closed) await transport.close();
+			await server.stop(true);
+			vi.restoreAllMocks();
+		}
 	});
 });

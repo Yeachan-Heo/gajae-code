@@ -123,7 +123,7 @@ export class HttpTransport implements MCPTransport {
 			}
 		} catch (error) {
 			if (error instanceof Error && error.name !== "AbortError") {
-				logger.debug("HTTP SSE stream error", { url: this.config.url, error: error.message });
+				logger.debug("HTTP SSE stream error");
 				this.onError?.(error);
 			}
 		}

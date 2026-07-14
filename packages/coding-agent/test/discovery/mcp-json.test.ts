@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { loadCapability } from "@gajae-code/coding-agent/discovery";
 import { type MCPServer, mcpCapability } from "../../src/capability/mcp";
+import { loadMCPJsonFile } from "../../src/discovery/mcp-json";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 
 async function loadStandaloneMcpConfig(cwd: string): Promise<MCPServer[]> {
@@ -16,6 +17,76 @@ async function loadStandaloneMcpConfig(cwd: string): Promise<MCPServer[]> {
 
 function envPlaceholder(name: string): string {
 	return `\${${name}}`;
+}
+function isSymlinkUnavailable(error: unknown): boolean {
+	if (typeof error !== "object" || error === null || !("code" in error) || typeof error.code !== "string") {
+		return false;
+	}
+	return ["EACCES", "EINVAL", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EPERM"].includes(error.code);
+}
+
+async function canCreateFileSymlink(): Promise<boolean> {
+	const probeDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-symlink-probe-"));
+	const targetPath = path.join(probeDir, "target.json");
+	const symlinkPath = path.join(probeDir, "link.json");
+	try {
+		await fs.writeFile(targetPath, "{}");
+		await fs.symlink(targetPath, symlinkPath, "file");
+		return true;
+	} catch (error) {
+		if (isSymlinkUnavailable(error)) return false;
+		throw error;
+	} finally {
+		await fs.rm(probeDir, { recursive: true, force: true });
+	}
+}
+async function canCreateDirectoryLink(): Promise<boolean> {
+	const probeDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-directory-link-probe-"));
+	const targetPath = path.join(probeDir, "target");
+	const linkPath = path.join(probeDir, "link");
+	try {
+		await fs.mkdir(targetPath);
+		await fs.symlink(targetPath, linkPath, process.platform === "win32" ? "junction" : "dir");
+		return true;
+	} catch (error) {
+		if (isSymlinkUnavailable(error)) return false;
+		throw error;
+	} finally {
+		await fs.rm(probeDir, { recursive: true, force: true });
+	}
+}
+
+const exactConfigFileTest = test.skipIf(!(await canCreateFileSymlink()));
+const exactConfigDirectoryTest = test.skipIf(!(await canCreateDirectoryLink()));
+
+function exactConfigText(name: string): string {
+	return JSON.stringify({
+		mcpServers: {
+			[name]: {
+				type: "stdio",
+				command: "exact-mcp",
+			},
+		},
+	});
+}
+
+interface Utf8FileReader {
+	readFile(options: { encoding: "utf8" }): Promise<string>;
+}
+
+function interceptNextExactConfigRead(afterRead: () => Promise<void>): void {
+	const openFile = fs.open;
+	vi.spyOn(fs, "open").mockImplementationOnce(async (file, flags, mode) => {
+		const handle = await openFile(file, flags, mode);
+		const reader = handle as unknown as Utf8FileReader;
+		const readFile = reader.readFile.bind(reader);
+		vi.spyOn(reader, "readFile").mockImplementationOnce(async options => {
+			const content = await readFile(options);
+			await afterRead();
+			return content;
+		});
+		return handle;
+	});
 }
 
 describe("standalone mcp.json oauth env expansion", () => {
@@ -145,5 +216,93 @@ describe("standalone mcp.json oauth env expansion", () => {
 		expect(server?.noInheritEnv).toBe(true);
 		const loaded = await loadAllMCPConfigs(tempDir, { filterExa: false });
 		expect(loaded.configs.isolated).toMatchObject({ noInheritEnv: true });
+	});
+});
+describe("explicit MCP JSON exact-file trust", () => {
+	let tempDir = "";
+
+	beforeEach(async () => {
+		tempDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-exact-file-")));
+	});
+
+	afterEach(async () => {
+		await fs.rm(tempDir, { recursive: true, force: true });
+		vi.restoreAllMocks();
+	});
+
+	test("loads a regular exact config through the descriptor-bound reader", async () => {
+		const configPath = path.join(tempDir, "exact.json");
+		await fs.writeFile(configPath, exactConfigText("exact"));
+
+		const result = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
+
+		expect(result.items.map(server => server.name)).toEqual(["exact"]);
+		expect(result.warnings).toEqual([]);
+	});
+
+	exactConfigFileTest("rejects symbolic-link exact configs with the generic warning", async () => {
+		const targetPath = path.join(tempDir, "target.json");
+		const configPath = path.join(tempDir, "exact.json");
+		await fs.writeFile(targetPath, exactConfigText("target"));
+		await fs.symlink(targetPath, configPath, "file");
+
+		const result = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
+
+		expect(result).toEqual({
+			items: [],
+			warnings: ["MCP configuration unavailable"],
+			disabledServers: [],
+		});
+	});
+	exactConfigDirectoryTest("rejects symbolic-link/junction parent directories with the generic warning", async () => {
+		const targetDirectory = path.join(tempDir, "target");
+		const linkedDirectory = path.join(tempDir, "linked");
+		await fs.mkdir(targetDirectory);
+		await fs.writeFile(path.join(targetDirectory, "exact.json"), exactConfigText("target"));
+		await fs.symlink(targetDirectory, linkedDirectory, process.platform === "win32" ? "junction" : "dir");
+
+		const result = await loadMCPJsonFile(path.join(linkedDirectory, "exact.json"), "project", {
+			quiet: true,
+			useCache: false,
+		});
+
+		expect(result).toEqual({
+			items: [],
+			warnings: ["MCP configuration unavailable"],
+			disabledServers: [],
+		});
+	});
+
+	test("fails closed when a descriptor-backed exact config is mutated or replaced after reading", async () => {
+		const configPath = path.join(tempDir, "exact.json");
+		const originalConfig = exactConfigText("original");
+		const mutatedConfig = exactConfigText("changed!");
+		expect(Buffer.byteLength(mutatedConfig)).toBe(Buffer.byteLength(originalConfig));
+		await fs.writeFile(configPath, originalConfig);
+
+		interceptNextExactConfigRead(async () => {
+			await fs.writeFile(configPath, mutatedConfig);
+		});
+		const mutationResult = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
+		expect(mutationResult).toEqual({
+			items: [],
+			warnings: ["MCP configuration unavailable"],
+			disabledServers: [],
+		});
+		vi.restoreAllMocks();
+
+		await fs.writeFile(configPath, originalConfig);
+		const replacementPath = path.join(tempDir, "replacement.json");
+		await fs.writeFile(replacementPath, originalConfig);
+
+		interceptNextExactConfigRead(async () => {
+			await fs.rename(replacementPath, configPath);
+		});
+		const replacementResult = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
+		expect(replacementResult).toEqual({
+			items: [],
+			warnings: ["MCP configuration unavailable"],
+			disabledServers: [],
+		});
 	});
 });
