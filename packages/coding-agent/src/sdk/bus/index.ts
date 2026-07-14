@@ -2305,11 +2305,15 @@ export function createNotificationsExtension(
 					});
 					if (telegram !== "owner_spawned" && telegram !== "attached") {
 						logger.warn(`notifications: Telegram daemon registration ${telegram}; not publishing SDK endpoint`);
-						return "failed";
+						finishStartup({ status: "failed" });
+						if (!(await stopSession(id, "session", runtime))) await cleanupAbandonedStartup();
+						return { status: "failed" };
 					}
 				} catch (e) {
 					logger.warn(`notifications: Telegram daemon registration failed: ${String(e)}`);
-					return "failed";
+					finishStartup({ status: "failed" });
+					if (!(await stopSession(id, "session", runtime))) await cleanupAbandonedStartup();
+					return { status: "failed" };
 				}
 			}
 			await host.start();

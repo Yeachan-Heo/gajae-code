@@ -941,6 +941,10 @@ describe("telegram daemon", () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		const identity = await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", {
+			randomId: () => "lease-1",
+		});
 		const bot = new FakeBotApi();
 		const daemon = new TelegramNotificationDaemon({
 			settings: s,
@@ -951,9 +955,12 @@ describe("telegram daemon", () => {
 			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
-		daemon.connectSession("S", "ws://s", "ts");
+		daemon.connectSession("S", "ws://s", "ts", identity);
 		const socket = FakeWs.instances[0]!;
 		socket.dispatchEvent(new Event("open"));
+		for (let attempt = 0; attempt < 100 && socket.sent.length === 0; attempt++) {
+			await new Promise(resolve => setTimeout(resolve, 1));
+		}
 		const session = daemon.sessions.get("S")!;
 		const liveDuringReplay = {
 			type: "action_needed",
@@ -1011,9 +1018,15 @@ describe("telegram daemon", () => {
 		).toBe(1);
 		expect(bot.calls.some(call => String(call.body.text).includes("already-delivered-history"))).toBe(false);
 
-		daemon.connectSession("S", "ws://s-reconnected", "ts-2");
+		const replacementIdentity = await publishIdentityEndpoint(s, cwd, "S", "ws://s-reconnected", "ts-2", {
+			randomId: () => "lease-2",
+		});
+		daemon.connectSession("S", "ws://s-reconnected", "ts-2", replacementIdentity);
 		const replacementSocket = FakeWs.instances[1]!;
 		replacementSocket.dispatchEvent(new Event("open"));
+		for (let attempt = 0; attempt < 100 && replacementSocket.sent.length === 0; attempt++) {
+			await new Promise(resolve => setTimeout(resolve, 1));
+		}
 		expect(replacementSocket.sent.map(frame => JSON.parse(frame))).toContainEqual({
 			type: "event_replay",
 			id: "telegram-startup-replay:S",
@@ -4681,7 +4694,9 @@ test("identity_header during an in-flight eager create still renames the topic",
 	});
 	// Eager create starts and blocks in-flight on createGate.
 	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
-	await Promise.resolve();
+	for (let attempt = 0; attempt < 100 && !bot.calls.some(call => call.method === "createForumTopic"); attempt++) {
+		await new Promise(resolve => setTimeout(resolve, 1));
+	}
 	// identity_header arrives live while replay is pending, then appears in the
 	// replay snapshot too. The barrier must apply it exactly once.
 	const session = daemon.sessions.get("sess-xyz999")!;
