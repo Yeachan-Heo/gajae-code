@@ -98,6 +98,70 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 	abort.abort();
 });
 
+test("failed scoped list publication does not authorize earlier sessions", async () => {
+	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-list-atomic-"));
+	directories.push(directory);
+	const agentDir = path.join(directory, ".gjc", "agent");
+	const cwd = path.join(directory, "workspace");
+	const token = "acp-list-atomic-token";
+	const requests: Array<Record<string, unknown>> = [];
+	let server!: TestServer;
+	server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			if (new URL(request.url).searchParams.get("token") !== token)
+				return new Response("Unauthorized", { status: 401 });
+			if (!server.upgrade(request)) return new Response("Upgrade failed", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+			},
+			message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+				requests.push(frame);
+				const result =
+					frame.operation === "session.list"
+						? {
+								sessions: [
+									{ sessionId: "earlier-session", locator: { repo: cwd } },
+									{ sessionId: "duplicate-session", locator: { repo: cwd } },
+									{ sessionId: "duplicate-session", locator: { repo: cwd } },
+								],
+							}
+						: {};
+				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
+			},
+		},
+	});
+	servers.push(server);
+	await writeBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test",
+		ownerId: "test-owner",
+		pid: process.pid,
+		host: "127.0.0.1",
+		port: server.port!,
+		url: `ws://127.0.0.1:${server.port!}`,
+		token,
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	});
+
+	const abort = new AbortController();
+	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, { agentDir });
+	await expect(agent.listSessions({ cwd })).rejects.toThrow("Broker returned duplicate session id");
+
+	const requestCount = requests.length;
+	expect(await agent.closeSession({ sessionId: "earlier-session" })).toEqual({});
+	expect(requests).toHaveLength(requestCount);
+	expect(await agent.deleteSession({ sessionId: "earlier-session" })).toEqual({});
+	expect(requests).toHaveLength(requestCount);
+	abort.abort();
+});
+
 test("production ACP preserves lifecycle, turn, replay, and connection ownership contracts over SDK WebSockets", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-contract-"));
 	directories.push(directory);

@@ -723,8 +723,8 @@ export class AcpAgent implements Agent {
 						"conflict",
 						`ACP session ${candidate.sessionId} has conflicting cwd authority.`,
 					);
-				this.#knownSessionCwds.set(candidate.sessionId, params.cwd);
 			}
+			for (const sessionId of discovered) this.#knownSessionCwds.set(sessionId, params.cwd);
 		}
 		return paginateAcpSessions(listed, params.cwd ?? undefined, this.#cursor(params.cursor));
 	}
