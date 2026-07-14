@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type PlanRequest, planTmuxOwnerIsolationSync } from "../../src/gjc-runtime/tmux-owner-isolation";
 import { resolveOwner } from "../../src/harness-control-plane/owner";
-import { readLease } from "../../src/harness-control-plane/session-lease";
 import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
@@ -191,12 +190,30 @@ async function runHarness(
 }
 
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
+async function retireLiveOwnerForCleanup(timeoutMs = 5_000): Promise<void> {
+	let owner = await resolveOwner(root, SID);
+	if (!owner.live) return;
+	if (!owner.socketPath) {
+		throw new Error("Live detached harness owner has no routable control endpoint; preserving roots.");
+	}
+	const retired = await runHarness(["retire", "--session", SID]);
+	if (retired.code !== 0 || (retired.json?.evidence as { retired?: unknown } | undefined)?.retired !== true) {
+		throw new Error("Live detached harness owner refused routed retirement; preserving roots.");
+	}
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		owner = await resolveOwner(root, SID);
+		if (!owner.live) return;
+		await sleep(25);
+	}
+	throw new Error("Routed detached harness owner did not exit before broker cleanup; preserving roots.");
+}
 
 beforeEach(async () => {
 	// Short paths keep the AF_UNIX socket path under the sun_path limit.
 	root = await mkdtemp(path.join(tmpdir(), "h"));
 	workspace = await mkdtemp(path.join(tmpdir(), "hw"));
-	cliEnv = createHarnessCliEnv(repoRoot);
+	cliEnv = await createHarnessCliEnv(repoRoot);
 	tmuxCommand = await createFakeTmuxBin(root);
 
 	disableSdkHost = false;
@@ -204,32 +221,25 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	sdkServer.stop(true);
-	cliEnv.cleanup();
-	const serverPid = await readFile(path.join(root, "tmux-server.pid"), "utf8")
-		.then(value => Number(value.trim()))
-		.catch(error => {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-			throw error;
-		});
-	if (serverPid !== null && Number.isSafeInteger(serverPid) && serverPid > 0) {
-		try {
-			process.kill(serverPid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-		}
+	let ownerTeardownError: unknown;
+	try {
+		sdkServer.stop(true);
+		await retireLiveOwnerForCleanup();
+	} catch (error) {
+		ownerTeardownError = error;
 	}
-	const lease = await readLease(root, SID).catch(error => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	});
-	if (lease?.pid) {
-		try {
-			process.kill(lease.pid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+	try {
+		await cliEnv.cleanup({ preserveFiles: ownerTeardownError !== undefined });
+	} catch (brokerCleanupError) {
+		if (ownerTeardownError) {
+			throw new AggregateError(
+				[ownerTeardownError, brokerCleanupError],
+				"Detached harness owner and SDK broker cleanup both failed; preserving roots.",
+			);
 		}
+		throw brokerCleanupError;
 	}
+	if (ownerTeardownError) throw ownerTeardownError;
 	await rm(root, { recursive: true, force: true });
 	await rm(workspace, { recursive: true, force: true });
 });

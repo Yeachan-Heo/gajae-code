@@ -93,7 +93,7 @@ const passingFinalizeChecks: FinalizeChecks = {
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "h"));
-	cliEnv = createHarnessCliEnv(repoRoot);
+	cliEnv = await createHarnessCliEnv(repoRoot);
 	await writeSessionState(root, seed(root));
 	owner = new RuntimeOwner({
 		root,
@@ -107,10 +107,26 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	cliEnv.cleanup();
-	await owner?.stop();
-	await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
-	hungServer = null;
+	let ownerTeardownError: unknown;
+	try {
+		await owner?.stop();
+		await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
+		hungServer = null;
+	} catch (error) {
+		ownerTeardownError = error;
+	}
+	try {
+		await cliEnv.cleanup();
+	} catch (brokerCleanupError) {
+		if (ownerTeardownError) {
+			throw new AggregateError(
+				[ownerTeardownError, brokerCleanupError],
+				"Harness runtime owner and SDK broker cleanup both failed; preserving roots.",
+			);
+		}
+		throw brokerCleanupError;
+	}
+	if (ownerTeardownError) throw ownerTeardownError;
 	await rm(root, { recursive: true, force: true });
 });
 

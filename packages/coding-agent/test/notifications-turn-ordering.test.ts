@@ -2,8 +2,10 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
+import { isolatedNotificationSettings, stopIsolatedNotificationBroker } from "./helpers/notification-settings";
 
 /**
  * Regression for the text-before-ask ordering bug: the assistant text that
@@ -41,9 +43,11 @@ type TestContextUsage = {
 type TestModel = { id?: string };
 
 const tempDirs: string[] = [];
+const agentDirs: string[] = [];
 const openSockets: WebSocket[] = [];
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openSockets.splice(0)) ws.close();
+	for (const agentDir of agentDirs.splice(0)) await stopIsolatedNotificationBroker(agentDir);
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -56,6 +60,10 @@ async function setup(options: { contextUsage?: TestContextUsage | false; model?:
 	token: string;
 	sid: string;
 }> {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-order-"));
+	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => {
@@ -64,10 +72,7 @@ async function setup(options: { contextUsage?: TestContextUsage | false; model?:
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api);
-
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-order-"));
-	tempDirs.push(cwd);
+	createNotificationsExtension(api, { settings: isolatedNotificationSettings(agentDir) });
 	const sid = `order-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -85,6 +90,7 @@ async function setup(options: { contextUsage?: TestContextUsage | false; model?:
 	} as never;
 
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
+	expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
 
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");

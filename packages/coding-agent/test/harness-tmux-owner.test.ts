@@ -3,7 +3,7 @@ import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { planTmuxOwnerIsolation } from "../src/gjc-runtime/tmux-owner-isolation";
-import { readLease } from "../src/harness-control-plane/session-lease";
+import { resolveOwner } from "../src/harness-control-plane/owner";
 import { createHarnessCliEnv, type HarnessCliEnv } from "./harness-control-plane/cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
@@ -13,6 +13,7 @@ const sessionId = "tmux-owner-test";
 let root: string;
 let workspace: string;
 let cliEnv: HarnessCliEnv;
+let ownerRoute: { tmuxCommand: string; env: NodeJS.ProcessEnv } | null;
 
 async function createUnverifiableTmux(): Promise<{ command: string; log: string }> {
 	const bin = path.join(root, "bin");
@@ -121,92 +122,84 @@ async function runHarness(
 	tmuxCommand: string,
 	expectedExitCode = 0,
 	env: NodeJS.ProcessEnv = {},
+	args: string[] = ["start", "--input", JSON.stringify({ harness: "gajae-code", workspace, sessionId, detach: true })],
 ): Promise<Record<string, unknown>> {
-	const proc = Bun.spawn(
-		[
-			"bun",
-			cliEntry,
-			"harness",
-			"start",
-			"--input",
-			JSON.stringify({ harness: "gajae-code", workspace, sessionId, detach: true }),
-		],
-		{
-			cwd: workspace,
-			env: {
-				...cliEnv.env,
-				GJC_HARNESS_STATE_ROOT: root,
-				GJC_HARNESS_TEST_ASSUME_LINUX_OWNER_ISOLATION: "1",
-				// The owner process must not inherit the test runner's ambient tmux client:
-				// its startup title update would target that shared server instead of the
-				// private -L socket exercised by this fixture.
-				TMUX: "",
-				GJC_TMUX_COMMAND: tmuxCommand,
-				...env,
-			},
-			stdout: "pipe",
-			stderr: "pipe",
+	const proc = Bun.spawn(["bun", cliEntry, "harness", ...args], {
+		cwd: workspace,
+		env: {
+			...cliEnv.env,
+			GJC_HARNESS_STATE_ROOT: root,
+			GJC_HARNESS_TEST_ASSUME_LINUX_OWNER_ISOLATION: "1",
+			// The owner process must not inherit the test runner's ambient tmux client:
+			// its startup title update would target that shared server instead of the
+			// private -L socket exercised by this fixture.
+			TMUX: "",
+			GJC_TMUX_COMMAND: tmuxCommand,
+			...env,
 		},
-	);
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 	const [output, stderr, exitCode] = await Promise.all([
 		new Response(proc.stdout).text(),
 		new Response(proc.stderr).text(),
 		proc.exited,
 	]);
 	if (exitCode !== expectedExitCode) throw new Error(`harness exit ${exitCode}: ${stderr || output}`);
-	return JSON.parse(output) as Record<string, unknown>;
+	const result = JSON.parse(output) as Record<string, unknown>;
+	if (args[0] === "start" && (result.state as { ownerLive?: unknown } | undefined)?.ownerLive === true) {
+		ownerRoute = { tmuxCommand, env: { ...env } };
+	}
+	return result;
 }
 
-const LEASE_EXIT_TIMEOUT_MS = 5_000;
+const OWNER_EXIT_TIMEOUT_MS = 5_000;
 
-/**
- * Bounded, exact-PID exit wait for a lease owner the test signalled. Returns true once `pid`
- * is confirmed gone (ESRCH on signal-0), false on timeout. The pid is not a child of this
- * process (the owner was detached and reparented), so there is no local zombie to reap — the
- * kernel/init reaps it on exit and signal-0 then reports ESRCH.
- */
-async function waitForExactExit(pid: number, timeoutMs: number): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
+async function retireLiveOwnerForCleanup(): Promise<void> {
+	let owner = await resolveOwner(root, sessionId);
+	if (!owner.live) return;
+	if (!owner.socketPath || !ownerRoute) {
+		throw new Error("Live harness owner has no retained control route; preserving roots.");
+	}
+	const retired = await runHarness(ownerRoute.tmuxCommand, 0, ownerRoute.env, ["retire", "--session", sessionId]);
+	if ((retired.evidence as { retired?: unknown } | undefined)?.retired !== true) {
+		throw new Error("Live harness owner refused routed retirement; preserving roots.");
+	}
+	const deadline = Date.now() + OWNER_EXIT_TIMEOUT_MS;
 	while (Date.now() < deadline) {
-		try {
-			process.kill(pid, 0);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
-			throw error;
-		}
+		owner = await resolveOwner(root, sessionId);
+		if (!owner.live) return;
 		await Bun.sleep(25);
 	}
-	return false;
+	throw new Error("Routed harness owner did not exit before broker cleanup; preserving roots.");
 }
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-tmux-owner-"));
 	workspace = await mkdtemp(path.join(tmpdir(), "harness-tmux-workspace-"));
-	cliEnv = createHarnessCliEnv(repoRoot);
+	cliEnv = await createHarnessCliEnv(repoRoot);
+	ownerRoute = null;
 });
 
 afterEach(async () => {
-	const lease = await readLease(root, sessionId).catch(error => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	});
-	let leaseExitFailed: number | null = null;
-	if (lease?.pid) {
-		try {
-			process.kill(lease.pid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-		}
-		// Bounded exact lease-PID exit wait: a live detached owner must tear down (and signal its
-		// descendants) before we delete the roots. A timeout is a real leak — fail loudly and
-		// PRESERVE the roots for inspection instead of silently rm-ing an orphaned tree.
-		if (!(await waitForExactExit(lease.pid, LEASE_EXIT_TIMEOUT_MS))) leaseExitFailed = lease.pid;
+	let ownerTeardownError: unknown;
+	try {
+		await retireLiveOwnerForCleanup();
+	} catch (error) {
+		ownerTeardownError = error;
 	}
-	cliEnv.cleanup();
-	if (leaseExitFailed !== null)
-		throw new Error(
-			`detached owner lease pid ${leaseExitFailed} did not exit within ${LEASE_EXIT_TIMEOUT_MS}ms; preserving roots for inspection`,
-		);
+	try {
+		await cliEnv.cleanup({ preserveFiles: ownerTeardownError !== undefined });
+	} catch (brokerCleanupError) {
+		if (ownerTeardownError) {
+			throw new AggregateError(
+				[ownerTeardownError, brokerCleanupError],
+				"Detached harness owner and SDK broker cleanup both failed; preserving roots.",
+			);
+		}
+		throw brokerCleanupError;
+	}
+	if (ownerTeardownError) throw ownerTeardownError;
 	await rm(root, { recursive: true, force: true });
 	await rm(workspace, { recursive: true, force: true });
 });

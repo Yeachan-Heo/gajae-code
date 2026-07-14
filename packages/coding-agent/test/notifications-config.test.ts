@@ -24,6 +24,7 @@ import {
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { daemonPaths } from "../src/sdk/bus/telegram-daemon";
 import { SessionManager } from "../src/session/session-manager";
+import { isolatedNotificationSettings, stopIsolatedNotificationBroker } from "./helpers/notification-settings";
 
 const BASE_CFG: NotificationConfig = {
 	enabled: false,
@@ -68,8 +69,10 @@ const PRIMARY_GLOBAL_CFG: NotificationConfig = {
 	sessionScope: "primary",
 };
 const tempDirs: string[] = [];
+const brokerAgentDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+	for (const agentDir of brokerAgentDirs.splice(0)) await stopIsolatedNotificationBroker(agentDir);
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -350,7 +353,7 @@ describe("notifications config", () => {
 		tempDirs.push(cwd);
 		const previous = process.env.GJC_NOTIFICATIONS;
 		delete process.env.GJC_NOTIFICATIONS;
-		const settings = Settings.isolated({
+		const settings = isolatedNotificationSettings(cwd, {
 			"notifications.enabled": true,
 			"notifications.telegram.botToken": " ",
 			"notifications.telegram.chatId": "\t",
@@ -451,6 +454,7 @@ describe("notifications config", () => {
 			});
 			disposers.push(() => explicitExtensionSubagent.session.dispose());
 			await topLevel.session.extensionRunner?.emit({ type: "session_start" });
+			brokerAgentDirs.push(cwd);
 			await subagent.session.extensionRunner?.emit({ type: "session_start" });
 			await parentPrefixSubagent.session.extensionRunner?.emit({ type: "session_start" });
 			await agentTypeOnlySubagent.session.extensionRunner?.emit({ type: "session_start" });
@@ -485,13 +489,16 @@ describe("notifications config", () => {
 			expect(fs.existsSync(explicitExtensionSubagentEndpoint)).toBe(false);
 			expect(fs.existsSync(daemonPaths(cwd).roots)).toBe(false);
 		} finally {
-			await Promise.all(disposers.reverse().map(dispose => dispose()));
-			if (previous === undefined) {
-				delete process.env.GJC_NOTIFICATIONS;
-			} else {
-				process.env.GJC_NOTIFICATIONS = previous;
+			try {
+				await Promise.all(disposers.reverse().map(dispose => dispose()));
+			} finally {
+				if (previous === undefined) {
+					delete process.env.GJC_NOTIFICATIONS;
+				} else {
+					process.env.GJC_NOTIFICATIONS = previous;
+				}
+				resetSettingsForTest();
 			}
-			resetSettingsForTest();
 		}
 	}, 30000);
 
@@ -503,7 +510,7 @@ describe("notifications config", () => {
 		delete process.env.GJC_NOTIFICATIONS;
 		delete process.env.GJC_SPAWNED_BY_SESSION;
 		const adapterSettings = (scope: "all" | "primary"): Settings =>
-			Settings.isolated({
+			isolatedNotificationSettings(cwd, {
 				"notifications.enabled": true,
 				"notifications.discord.botToken": "discord-token",
 				"notifications.discord.applicationId": "discord-application",
@@ -555,6 +562,7 @@ describe("notifications config", () => {
 			delete process.env.GJC_NOTIFICATIONS;
 
 			await suppressed.session.extensionRunner?.emit({ type: "session_start" });
+			brokerAgentDirs.push(cwd);
 			await preserved.session.extensionRunner?.emit({ type: "session_start" });
 			await optedIn.session.extensionRunner?.emit({ type: "session_start" });
 
@@ -562,12 +570,15 @@ describe("notifications config", () => {
 			expect(fs.existsSync(endpointFor(preserved.session.sessionId))).toBe(true);
 			expect(fs.existsSync(endpointFor(optedIn.session.sessionId))).toBe(true);
 		} finally {
-			await Promise.all(disposers.reverse().map(dispose => dispose()));
-			if (previousNotif === undefined) delete process.env.GJC_NOTIFICATIONS;
-			else process.env.GJC_NOTIFICATIONS = previousNotif;
-			if (previousSpawn === undefined) delete process.env.GJC_SPAWNED_BY_SESSION;
-			else process.env.GJC_SPAWNED_BY_SESSION = previousSpawn;
-			resetSettingsForTest();
+			try {
+				await Promise.all(disposers.reverse().map(dispose => dispose()));
+			} finally {
+				if (previousNotif === undefined) delete process.env.GJC_NOTIFICATIONS;
+				else process.env.GJC_NOTIFICATIONS = previousNotif;
+				if (previousSpawn === undefined) delete process.env.GJC_SPAWNED_BY_SESSION;
+				else process.env.GJC_SPAWNED_BY_SESSION = previousSpawn;
+				resetSettingsForTest();
+			}
 		}
 	}, 30000);
 

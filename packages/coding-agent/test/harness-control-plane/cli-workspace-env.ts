@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { brokerOwnerForTest, ensureBroker } from "../../src/sdk/broker/ensure";
 
 interface PackageManifest {
 	name?: unknown;
@@ -21,7 +22,7 @@ interface RepoLinkMarker {
 
 export interface HarnessCliEnv {
 	env: NodeJS.ProcessEnv;
-	cleanup(): void;
+	cleanup(options?: { preserveFiles?: boolean }): Promise<void>;
 }
 
 function readPackageName(manifestPath: string): string | null {
@@ -128,27 +129,45 @@ function createRepoNodeModulesLinks(repoRoot: string, packages: LinkedWorkspaceP
 	};
 }
 
-export function createHarnessCliEnv(repoRoot: string, baseEnv: NodeJS.ProcessEnv = process.env): HarnessCliEnv {
+export async function createHarnessCliEnv(
+	repoRoot: string,
+	baseEnv: NodeJS.ProcessEnv = process.env,
+): Promise<HarnessCliEnv> {
 	const nodePathRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-harness-node-path-"));
 	const registryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-harness-root-registry-"));
 	const packages = collectWorkspacePackages(repoRoot);
 	linkWorkspacePackages(path.join(nodePathRoot, "@gajae-code"), packages);
 	const cleanupRepoLinks = createRepoNodeModulesLinks(repoRoot, packages);
 
+	// Harness subprocesses must never inherit the operator's notifications or agent state.
+	const tempAgentDir = path.join(registryRoot, "agent");
+
 	const existingNodePath = baseEnv.NODE_PATH;
 	const env: NodeJS.ProcessEnv = {
 		...baseEnv,
 		[WORKSPACE_NODE_MODULES_ENV]: path.join(repoRoot, "node_modules"),
 		GJC_HARNESS_ROOT_REGISTRY_DIR: registryRoot,
+		GJC_NOTIFICATIONS: "0",
+		GJC_CODING_AGENT_DIR: tempAgentDir,
+		PI_CODING_AGENT_DIR: tempAgentDir,
 		NODE_PATH: existingNodePath ? `${nodePathRoot}${path.delimiter}${existingNodePath}` : nodePathRoot,
 	};
+	delete env.GJC_NOTIFICATIONS_TOKEN;
+
+	const cleanupFiles = (): void => {
+		cleanupRepoLinks();
+		fs.rmSync(nodePathRoot, { recursive: true, force: true });
+		fs.rmSync(registryRoot, { recursive: true, force: true });
+	};
+	await ensureBroker({ agentDir: tempAgentDir, env });
+	const brokerOwner = brokerOwnerForTest(tempAgentDir);
+	if (!brokerOwner) throw new Error(`Harness test broker owner was not retained for ${tempAgentDir}.`);
 
 	return {
 		env,
-		cleanup() {
-			cleanupRepoLinks();
-			fs.rmSync(nodePathRoot, { recursive: true, force: true });
-			fs.rmSync(registryRoot, { recursive: true, force: true });
+		async cleanup(options) {
+			await brokerOwner.stop();
+			if (!options?.preserveFiles) cleanupFiles();
 		},
 	};
 }

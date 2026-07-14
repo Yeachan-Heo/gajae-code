@@ -2,10 +2,10 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Settings } from "../src/config/settings";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
+import { isolatedNotificationSettings, stopIsolatedNotificationBroker } from "./helpers/notification-settings";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Promise<void> {
@@ -22,9 +22,11 @@ type Frame = { type: string; redact?: boolean };
 
 const tempDirs: string[] = [];
 const openSockets: WebSocket[] = [];
+const agentDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openSockets.splice(0)) ws.close();
+	for (const agentDir of agentDirs.splice(0)) await stopIsolatedNotificationBroker(agentDir);
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -48,11 +50,12 @@ function createHarness(redact: boolean) {
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	const settings = Settings.isolated({ "notifications.redact": redact });
-	createNotificationsExtension(api, { settings });
-
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-file-redaction-"));
 	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
+	const settings = isolatedNotificationSettings(agentDir, { "notifications.redact": redact });
+	createNotificationsExtension(api, { settings });
 	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	let sid = `file-redaction-${suffix}`;
 	const ctx = {

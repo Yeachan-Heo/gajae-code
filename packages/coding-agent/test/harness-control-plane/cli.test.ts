@@ -12,6 +12,7 @@ import {
 	sessionPaths,
 	writeSessionState,
 } from "../../src/harness-control-plane/storage";
+import { brokerOwnerForTest } from "../../src/sdk/broker/ensure";
 import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
@@ -25,14 +26,14 @@ let originalGjcSessionId: string | undefined;
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-cli-root-"));
 	workspace = realpathSync(await mkdtemp(path.join(tmpdir(), "harness-cli-ws-")));
-	cliEnv = createHarnessCliEnv(repoRoot);
+	cliEnv = await createHarnessCliEnv(repoRoot);
 	originalGjcSessionId = process.env.GJC_SESSION_ID;
 	process.env.GJC_SESSION_ID = "test-session";
 	cliEnv.env.GJC_SESSION_ID = "test-session";
 });
 
 afterEach(async () => {
-	cliEnv.cleanup();
+	await cliEnv.cleanup();
 	await rm(root, { recursive: true, force: true });
 	await rm(workspace, { recursive: true, force: true });
 	if (originalGjcSessionId === undefined) {
@@ -173,7 +174,7 @@ async function seedOwnerDiedBeforeFirstPrompt(sessionId: string): Promise<void> 
 }
 
 describe("gjc harness CLI (foundation)", () => {
-	it("test CLI env cleanup removes overlapping created links and preserves pre-existing links", async () => {
+	it("test CLI env isolates operator state, cleans created links, and preserves pre-existing links", async () => {
 		const fakeRepo = await mkdtemp(path.join(tmpdir(), "harness-cli-env-repo-"));
 		try {
 			const packageDir = path.join(fakeRepo, "packages", "ai");
@@ -181,18 +182,38 @@ describe("gjc harness CLI (foundation)", () => {
 			await writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name: "@gajae-code/ai" }), "utf8");
 			const linkPath = path.join(fakeRepo, "node_modules", "@gajae-code", "ai");
 
-			const first = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
-			const second = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
+			const first = await createHarnessCliEnv(fakeRepo, {
+				GJC_NOTIFICATIONS: "1",
+				GJC_NOTIFICATIONS_TOKEN: "live-token",
+				GJC_CODING_AGENT_DIR: "/production/gjc-agent",
+				PI_CODING_AGENT_DIR: "/production/pi-agent",
+			});
+			const second = await createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
+			expect(first.env.GJC_NOTIFICATIONS).toBe("0");
+			expect(first.env.GJC_NOTIFICATIONS_TOKEN).toBeUndefined();
+			expect(first.env.GJC_CODING_AGENT_DIR).toBe(path.join(first.env.GJC_HARNESS_ROOT_REGISTRY_DIR!, "agent"));
+			expect(first.env.PI_CODING_AGENT_DIR).toBe(first.env.GJC_CODING_AGENT_DIR);
+			const firstAgentDir = first.env.GJC_CODING_AGENT_DIR!;
+			expect(brokerOwnerForTest(firstAgentDir)).toBeDefined();
 			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
-			first.cleanup();
+			await first.cleanup();
+			expect(brokerOwnerForTest(firstAgentDir)).toBeUndefined();
 			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
-			second.cleanup();
+			await second.cleanup();
 			expect(await Bun.file(linkPath).exists()).toBe(false);
+
+			const preserved = await createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
+			const preservedRoot = preserved.env.GJC_HARNESS_ROOT_REGISTRY_DIR!;
+			const preservedAgentDir = preserved.env.GJC_CODING_AGENT_DIR!;
+			await preserved.cleanup({ preserveFiles: true });
+			expect(brokerOwnerForTest(preservedAgentDir)).toBeUndefined();
+			expect((await lstat(preservedRoot)).isDirectory()).toBe(true);
+			await preserved.cleanup();
 
 			await mkdir(path.dirname(linkPath), { recursive: true });
 			await symlink(packageDir, linkPath, "dir");
-			const withPreexistingLink = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
-			withPreexistingLink.cleanup();
+			const withPreexistingLink = await createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
+			await withPreexistingLink.cleanup();
 			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
 		} finally {
 			await rm(fakeRepo, { recursive: true, force: true });
