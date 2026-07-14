@@ -51,12 +51,100 @@ interface MCPConfigFile {
 			};
 		}
 	>;
+	disabledServers?: string[];
+}
+export interface MCPJsonLoadResult extends LoadResult<MCPServer> {
+	disabledServers: string[];
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every(item => typeof item === "string");
+}
+function isStringRecord(value: unknown): value is Record<string, string> {
+	return isRecord(value) && Object.values(value).every(item => typeof item === "string");
+}
+function isOptionalBoolean(value: unknown): boolean {
+	return value === undefined || typeof value === "boolean";
+}
+function isOptionalString(value: unknown): boolean {
+	return value === undefined || typeof value === "string";
+}
+function isValidAuthConfig(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		(value.type === "oauth" || value.type === "apikey") &&
+		isOptionalString(value.credentialId) &&
+		isOptionalString(value.tokenUrl) &&
+		isOptionalString(value.clientId) &&
+		isOptionalString(value.clientSecret)
+	);
+}
+function isValidOAuthConfig(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		isOptionalString(value.clientId) &&
+		isOptionalString(value.clientSecret) &&
+		isOptionalString(value.redirectUri) &&
+		(value.callbackPort === undefined ||
+			(typeof value.callbackPort === "number" &&
+				Number.isInteger(value.callbackPort) &&
+				value.callbackPort >= 1 &&
+				value.callbackPort <= 65_535)) &&
+		isOptionalString(value.callbackPath)
+	);
+}
+function isValidExactServerConfig(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	return (
+		isOptionalBoolean(value.enabled) &&
+		isOptionalBoolean(value.autoload) &&
+		isOptionalBoolean(value.noInheritEnv) &&
+		(value.timeout === undefined ||
+			(typeof value.timeout === "number" && Number.isFinite(value.timeout) && value.timeout > 0)) &&
+		isOptionalString(value.command) &&
+		(value.args === undefined || isStringArray(value.args)) &&
+		(value.env === undefined || isStringRecord(value.env)) &&
+		isOptionalString(value.cwd) &&
+		isOptionalString(value.url) &&
+		(value.headers === undefined || isStringRecord(value.headers)) &&
+		(value.type === undefined || value.type === "stdio" || value.type === "sse" || value.type === "http") &&
+		(value.auth === undefined || isValidAuthConfig(value.auth)) &&
+		(value.oauth === undefined || isValidOAuthConfig(value.oauth))
+	);
+}
+function validateExactMCPConfig(config: unknown): {
+	config: MCPConfigFile | null;
+	hasInvalidServer: boolean;
+} {
+	if (!isRecord(config)) return { config: null, hasInvalidServer: false };
+	if (config.disabledServers !== undefined && !isStringArray(config.disabledServers)) {
+		return { config: null, hasInvalidServer: false };
+	}
+	if (config.mcpServers === undefined) {
+		return { config: config as MCPConfigFile, hasInvalidServer: false };
+	}
+	if (!isRecord(config.mcpServers)) return { config: null, hasInvalidServer: false };
+	const validServers: Record<string, unknown> = {};
+	let hasInvalidServer = false;
+	for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
+		if (isValidExactServerConfig(serverConfig)) {
+			validServers[name] = serverConfig;
+		} else {
+			hasInvalidServer = true;
+		}
+	}
+	return {
+		config: { ...config, mcpServers: validServers } as MCPConfigFile,
+		hasInvalidServer,
+	};
 }
 
 /**
  * Transform raw MCP config to canonical MCPServer format.
  */
-function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServer[] {
+function transformMCPConfig(config: MCPConfigFile, source: SourceMeta, quiet = false): MCPServer[] {
 	const servers: MCPServer[] = [];
 
 	if (config.mcpServers) {
@@ -66,7 +154,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 			if (serverConfig.enabled !== undefined) {
 				if (typeof serverConfig.enabled === "boolean") {
 					enabled = serverConfig.enabled;
-				} else {
+				} else if (!quiet) {
 					logger.warn("MCP server has invalid 'enabled' value, ignoring", { name, value: serverConfig.enabled });
 				}
 			}
@@ -79,7 +167,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 					serverConfig.timeout > 0
 				) {
 					timeout = serverConfig.timeout;
-				} else {
+				} else if (!quiet) {
 					logger.warn("MCP server has invalid 'timeout' value, ignoring", { name, value: serverConfig.timeout });
 				}
 			}
@@ -88,7 +176,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 			if (serverConfig.autoload !== undefined) {
 				if (typeof serverConfig.autoload === "boolean") {
 					autoload = serverConfig.autoload;
-				} else {
+				} else if (!quiet) {
 					logger.warn("MCP server has invalid 'autoload' value, ignoring", { name, value: serverConfig.autoload });
 				}
 			}
@@ -97,7 +185,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 			if (serverConfig.noInheritEnv !== undefined) {
 				if (typeof serverConfig.noInheritEnv === "boolean") {
 					noInheritEnv = serverConfig.noInheritEnv;
-				} else {
+				} else if (!quiet) {
 					logger.warn("MCP server has invalid 'noInheritEnv' value, ignoring", {
 						name,
 						value: serverConfig.noInheritEnv,
@@ -142,30 +230,50 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 /**
  * Load MCP servers from a JSON file.
  */
-async function loadMCPJsonFile(
-	_ctx: LoadContext,
-	path: string,
+export async function loadMCPJsonFile(
+	filePath: string,
 	level: "user" | "project",
-): Promise<LoadResult<MCPServer>> {
+	options?: { quiet?: boolean; useCache?: boolean },
+): Promise<MCPJsonLoadResult> {
 	const warnings: string[] = [];
 	const items: MCPServer[] = [];
 
-	const content = await readFile(path);
+	const content =
+		options?.useCache === false
+			? await Bun.file(filePath)
+					.text()
+					.catch(() => null)
+			: await readFile(filePath);
 	if (content === null) {
-		return { items, warnings };
+		if (options?.quiet) warnings.push("MCP configuration unavailable");
+		return { items, warnings, disabledServers: [] };
 	}
 
-	const config = tryParseJson<MCPConfigFile>(content);
+	const config = tryParseJson<unknown>(content);
 	if (!config) {
-		warnings.push(`Failed to parse JSON in ${path}`);
-		return { items, warnings };
+		warnings.push(options?.quiet ? "MCP configuration unavailable" : `Failed to parse JSON in ${filePath}`);
+		return { items, warnings, disabledServers: [] };
 	}
+	let validConfig: MCPConfigFile;
+	if (options?.quiet) {
+		const validation = validateExactMCPConfig(config);
+		if (!validation.config) {
+			warnings.push("MCP configuration unavailable");
+			return { items, warnings, disabledServers: [] };
+		}
+		if (validation.hasInvalidServer) warnings.push("MCP configuration unavailable");
+		validConfig = validation.config;
+	} else {
+		validConfig = config as MCPConfigFile;
+	}
+	const source = createSourceMeta(PROVIDER_ID, filePath, level);
+	items.push(...transformMCPConfig(validConfig, source, options?.quiet));
 
-	const source = createSourceMeta(PROVIDER_ID, path, level);
-	const servers = transformMCPConfig(config, source);
-	items.push(...servers);
-
-	return { items, warnings };
+	return {
+		items,
+		warnings,
+		disabledServers: isStringArray(validConfig.disabledServers) ? validConfig.disabledServers : [],
+	};
 }
 
 /**
@@ -174,7 +282,7 @@ async function loadMCPJsonFile(
 async function load(ctx: LoadContext): Promise<LoadResult<MCPServer>> {
 	const filenames = ["mcp.json", ".mcp.json"];
 	const results = await Promise.all(
-		filenames.map(filename => loadMCPJsonFile(ctx, path.join(ctx.cwd, filename), "project")),
+		filenames.map(filename => loadMCPJsonFile(path.join(ctx.cwd, filename), "project")),
 	);
 
 	const allItems = results.flatMap(r => r.items);

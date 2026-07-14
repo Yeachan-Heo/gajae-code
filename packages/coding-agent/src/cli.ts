@@ -189,6 +189,7 @@ export class RootHelpCommand extends Command {
 		}),
 		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 		"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
+		"mcp-config": Flags.string({ description: "Tools-only MCP config file (absolute path)" }),
 		"allow-home": Flags.boolean({ description: "Allow starting in ~ without auto-switching to a temp dir" }),
 		mode: Flags.string({
 			description: "Output mode: text (default), json, or acp",

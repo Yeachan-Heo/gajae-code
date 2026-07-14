@@ -193,6 +193,7 @@ export function resolveAcpStartupOptions(
 		| "hooks"
 		| "messages"
 		| "mpreset"
+		| "mcpConfig"
 		| "model"
 		| "models"
 		| "noLsp"
@@ -233,7 +234,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.fork ? ["--fork"] : []),
 		...(parsed.hooks?.length ? ["--hook"] : []),
 		...(parsed.messages.length > 0 ? ["initial prompt"] : []),
-		...(parsed.models?.length ? ["--models"] : []),
+		...(parsed.mcpConfig !== undefined ? ["--mcp-config"] : []),
 		...(parsed.noLsp ? ["--no-lsp"] : []),
 		...(parsed.noPty ? ["--no-pty"] : []),
 		...(parsed.noRules ? ["--no-rules"] : []),
@@ -427,6 +428,7 @@ export async function applyStartupModelProfilesOrExit(
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+		await args.session.dispose();
 		process.exit(1);
 	}
 }
@@ -783,6 +785,7 @@ async function buildSessionOptions(
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
 	};
+	if (parsed.mcpConfig !== undefined) options.mcpConfigPath = parsed.mcpConfig;
 
 	const systemPromptSource = parsed.systemPrompt;
 	const resolvedSystemPrompt = await resolvePromptInput(systemPromptSource, "system prompt");
@@ -1337,6 +1340,9 @@ export async function runRootCommand(
 			process.stderr.write(
 				`${chalk.yellow(`\nAdvanced manual config remains available at ${ModelsConfigFile.path()}`)}\n`,
 			);
+			await session.dispose();
+			stopThemeWatcher();
+			await postmortem.quit(1);
 			process.exit(1);
 		}
 

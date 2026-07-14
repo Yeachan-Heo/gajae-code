@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { MCPManager } from "../../src/runtime-mcp/manager";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadMCPJsonFile } from "../../src/discovery/mcp-json";
+import { createMCPManager, MCPManager } from "../../src/runtime-mcp/manager";
 import type { JsonRpcMessage } from "../../src/runtime-mcp/types";
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> {
@@ -53,7 +57,7 @@ describe("MCP manager lifecycle cleanup", () => {
 		const manager = new MCPManager(process.cwd());
 		const result = await manager.connectServers(
 			{
-				bad: { command: "node", args: ["-e", stdioServerScript("failTools")], timeout: 1_000 },
+				bad: { command: process.execPath, args: ["-e", stdioServerScript("failTools")], timeout: 1_000 },
 			},
 			{},
 		);
@@ -62,6 +66,307 @@ describe("MCP manager lifecycle cleanup", () => {
 		expect(result.errors.get("bad")).toContain("boom");
 		expect(manager.getConnectedServers()).toEqual([]);
 		await expect(manager.waitForConnection("bad")).rejects.toThrow("MCP server not connected: bad");
+	});
+	test("factory creates a tools-only exact-config manager and redacts real server errors", async () => {
+		const sentinel = "EXACT_SERVER_SECRET";
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				if (req.method !== "POST") return new Response(null, { status: 405 });
+				const request = (await req.json()) as { id?: string | number; method?: string };
+				const id = request.id ?? 0;
+				if (request.method === "initialize") {
+					return Response.json({
+						jsonrpc: "2.0",
+						id,
+						result: {
+							protocolVersion: "2025-03-26",
+							capabilities: { tools: {} },
+							serverInfo: { name: "redacted", version: "1" },
+						},
+					});
+				}
+				if (request.method === "tools/list") {
+					return Response.json({
+						jsonrpc: "2.0",
+						id,
+						error: { code: -32000, message: `server rejected ${sentinel}` },
+					});
+				}
+				return Response.json({ jsonrpc: "2.0", id, result: {} });
+			},
+		});
+		const cwd = await mkdtemp(join(tmpdir(), "gjc-mcp-factory-exact-"));
+		const configPath = join(cwd, "exact.json");
+		let manager: MCPManager | undefined;
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						redacted: { type: "http", url: server.url.href },
+					},
+				}),
+			);
+			const created = await createMCPManager(cwd, { configPath });
+			manager = created.manager;
+
+			expect(manager.isToolsOnly()).toBe(true);
+			expect(created.result.connectedServers).toEqual([]);
+			expect(created.result.tools).toEqual([]);
+			expect(Array.from(created.result.errors)).toEqual([["redacted", "MCP server unavailable"]]);
+			expect(Array.from(created.result.errors.values()).join("\n")).not.toContain(sentinel);
+		} finally {
+			if (manager) await manager.disconnectAll();
+			await server.stop(true);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("factory creates a normal manager without an exact config", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "gjc-mcp-factory-normal-"));
+		let manager: MCPManager | undefined;
+		try {
+			const created = await createMCPManager(cwd);
+			manager = created.manager;
+
+			expect(manager.isToolsOnly()).toBe(false);
+		} finally {
+			if (manager) await manager.disconnectAll();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("loads only an explicit config with an immutable tools-only manager", async () => {
+		let toolListCalls = 0;
+		let toolCallCount = 0;
+		let resourceListCalls = 0;
+		let promptListCalls = 0;
+		let initializeCapabilities: Record<string, unknown> | undefined;
+		const requestMethods: string[] = [];
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				if (req.method !== "POST") return new Response(null, { status: 405 });
+				const request = (await req.json()) as {
+					id?: string | number;
+					method?: string;
+					params?: { capabilities?: Record<string, unknown> };
+				};
+				requestMethods.push(request.method ?? "");
+				const id = request.id ?? 0;
+				switch (request.method) {
+					case "initialize":
+						initializeCapabilities = request.params?.capabilities;
+						return Response.json({
+							jsonrpc: "2.0",
+							id,
+							result: {
+								protocolVersion: "2025-03-26",
+								capabilities: { tools: {}, resources: {}, prompts: {} },
+								serverInfo: { name: "exact", version: "1" },
+								instructions: "do not expose",
+							},
+						});
+					case "tools/list":
+						toolListCalls++;
+						return Response.json({
+							jsonrpc: "2.0",
+							id,
+							result: { tools: [{ name: "exact-tool", inputSchema: { type: "object" } }] },
+						});
+					case "tools/call":
+						toolCallCount++;
+						return Response.json({
+							jsonrpc: "2.0",
+							id,
+							result: { content: [{ type: "text", text: "exact-ok" }] },
+						});
+					case "resources/list":
+					case "resources/templates/list":
+						resourceListCalls++;
+						return Response.json({ jsonrpc: "2.0", id, result: { resources: [] } });
+					case "prompts/list":
+						promptListCalls++;
+						return Response.json({ jsonrpc: "2.0", id, result: { prompts: [] } });
+					default:
+						return Response.json({ jsonrpc: "2.0", id, result: {} });
+				}
+			},
+		});
+		const cwd = await mkdtemp(join(tmpdir(), "gjc-mcp-exact-"));
+		const configPath = join(cwd, "exact.json");
+		const manager = new MCPManager(cwd, null, { toolsOnly: true });
+		const normalManager = new MCPManager(cwd);
+		let toolChanges = 0;
+
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						exact: { type: "http", url: server.url.href, timeout: 1_000 },
+						manual: { type: "http", url: server.url.href, timeout: 1_000, autoload: false },
+						disabled: { type: "http", url: server.url.href, timeout: 1_000 },
+						bad: { type: "stdio" },
+					},
+					disabledServers: ["disabled"],
+				}),
+			);
+			await Bun.write(
+				join(cwd, "mcp.json"),
+				JSON.stringify({ mcpServers: { foreign: { type: "http", url: server.url.href, timeout: 1_000 } } }),
+			);
+			expect(manager.isToolsOnly()).toBe(true);
+			expect(normalManager.isToolsOnly()).toBe(false);
+			expect(
+				(await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false })).disabledServers,
+			).toEqual(["disabled"]);
+			await expect(normalManager.discoverAndConnect({ configPath })).rejects.toThrow(
+				"Explicit MCP config requires a tools-only MCP manager",
+			);
+			await expect(manager.discoverAndConnect()).rejects.toThrow(
+				"Tools-only MCP manager requires an explicit config path",
+			);
+
+			manager.setOnToolsChanged(() => toolChanges++);
+			const result = await manager.discoverAndConnect({ configPath });
+
+			expect(result.connectedServers).toEqual(["exact"]);
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__exact_tool"]);
+			const toolResult = await result.tools[0]!.execute("exact-call", {}, undefined, {} as never);
+			expect(toolResult.content).toEqual([{ type: "text", text: "exact-ok" }]);
+			expect(toolCallCount).toBe(1);
+			expect(initializeCapabilities).toEqual({});
+			expect(requestMethods).toEqual(["initialize", "notifications/initialized", "tools/list", "tools/call"]);
+			expect(result.errors.get("bad")).toBe("MCP server unavailable");
+			const repeated = await manager.discoverAndConnect({ configPath });
+			expect(repeated.connectedServers).toEqual(["exact"]);
+			expect(repeated.tools.map(tool => tool.name)).toEqual(["mcp__exact_tool"]);
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__exact_tool"]);
+			expect(manager.getServerResources("exact")).toBeUndefined();
+			expect(manager.getServerPrompts("exact")).toBeUndefined();
+			expect(manager.getServerInstructions().size).toBe(0);
+			expect(resourceListCalls).toBe(0);
+			expect(promptListCalls).toBe(0);
+			expect(toolChanges).toBe(0);
+			expect(manager.getConnection("exact")?.transport.onClose).toBeUndefined();
+
+			await manager.refreshServerTools("exact");
+			expect(toolListCalls).toBe(1);
+			await expect(manager.reconnectServer("exact")).resolves.toBeNull();
+		} finally {
+			await manager.disconnectAll();
+			await server.stop(true);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("rejects a malformed exact-config enabled control before connecting", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "gjc-mcp-malformed-enabled-"));
+		const configPath = join(cwd, "exact.json");
+		const manager = new MCPManager(cwd, null, { toolsOnly: true });
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						invalid: { type: "http", url: "http://127.0.0.1:1", enabled: "true" },
+					},
+				}),
+			);
+			const loaded = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
+			expect(loaded.items).toEqual([]);
+			expect(loaded.warnings).toEqual(["MCP configuration unavailable"]);
+			const result = await manager.discoverAndConnect({ configPath });
+			expect(result.connectedServers).toEqual([]);
+			expect(result.tools).toEqual([]);
+			expect(Array.from(result.errors)).toEqual([["$config", "MCP configuration unavailable"]]);
+		} finally {
+			await manager.disconnectAll();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a malformed exact-config autoload control before connecting", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "gjc-mcp-malformed-autoload-"));
+		const configPath = join(cwd, "exact.json");
+		const manager = new MCPManager(cwd, null, { toolsOnly: true });
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						invalid: { type: "http", url: "http://127.0.0.1:1", autoload: "false" },
+					},
+				}),
+			);
+			const loaded = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
+			expect(loaded.items).toEqual([]);
+			expect(loaded.warnings).toEqual(["MCP configuration unavailable"]);
+			const result = await manager.discoverAndConnect({ configPath });
+			expect(result.connectedServers).toEqual([]);
+			expect(result.tools).toEqual([]);
+			expect(Array.from(result.errors)).toEqual([["$config", "MCP configuration unavailable"]]);
+		} finally {
+			await manager.disconnectAll();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("returns one sanitized diagnostic for missing, invalid, and partially invalid exact configs", async () => {
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				if (req.method !== "POST") return new Response(null, { status: 405 });
+				const request = (await req.json()) as { id?: string | number; method?: string };
+				const id = request.id ?? 0;
+				if (request.method === "initialize") {
+					return Response.json({
+						jsonrpc: "2.0",
+						id,
+						result: {
+							protocolVersion: "2025-03-26",
+							capabilities: { tools: {} },
+							serverInfo: { name: "partial", version: "1" },
+						},
+					});
+				}
+				if (request.method === "tools/list") {
+					return Response.json({ jsonrpc: "2.0", id, result: { tools: [] } });
+				}
+				return Response.json({ jsonrpc: "2.0", id, result: {} });
+			},
+		});
+		const cwd = await mkdtemp(join(tmpdir(), "gjc-mcp-config-diagnostics-"));
+		const configPath = join(cwd, "exact.json");
+		const manager = new MCPManager(cwd, null, { toolsOnly: true });
+		try {
+			const missing = await manager.discoverAndConnect({ configPath });
+			expect(Array.from(missing.errors)).toEqual([["$config", "MCP configuration unavailable"]]);
+
+			await Bun.write(configPath, "{");
+			const invalid = await manager.discoverAndConnect({ configPath });
+			expect(Array.from(invalid.errors)).toEqual([["$config", "MCP configuration unavailable"]]);
+
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						valid: { type: "http", url: server.url.href },
+						invalid: { type: "http", url: server.url.href, enabled: "true" },
+					},
+				}),
+			);
+			const loaded = await loadMCPJsonFile(configPath, "project", { quiet: true, useCache: false });
+			expect(loaded.items.map(serverConfig => serverConfig.name)).toEqual(["valid"]);
+			expect(loaded.warnings).toEqual(["MCP configuration unavailable"]);
+			const partial = await manager.discoverAndConnect({ configPath });
+			expect(partial.connectedServers).toEqual(["valid"]);
+			expect(Array.from(partial.errors)).toEqual([["$config", "MCP configuration unavailable"]]);
+		} finally {
+			await manager.disconnectAll();
+			await server.stop(true);
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	test("disconnect cancels an in-flight reconnect backoff", async () => {

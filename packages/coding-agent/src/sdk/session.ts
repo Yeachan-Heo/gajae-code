@@ -340,8 +340,12 @@ export interface CreateAgentSessionOptions {
 
 	/** @deprecated MCP runtime discovery is quarantined and ignored. */
 	enableMCP?: boolean;
-	/** Existing MCP manager to reuse (skips discovery, propagates to toolSession). */
+	/** Existing MCP manager to reuse (skips discovery, propagates to toolSession).
+	 * Mutually exclusive with mcpConfigPath. */
 	mcpManager?: MCPManager;
+	/** Load MCP tools for a top-level session only from this caller-owned config file.
+	 * Mutually exclusive with mcpManager. */
+	mcpConfigPath?: string;
 
 	/** Enable LSP integration (tool, formatting, diagnostics, warmup). Default: true */
 	enableLsp?: boolean;
@@ -903,10 +907,21 @@ export function resolveIntentTracingEnabled(intentTracingSetting: boolean | unde
 	return (!!intentTracingSetting || $flag("PI_INTENT_TRACING")) && hasUI;
 }
 
+const MCP_CONFIG_PATH_AND_MANAGER_ERROR = "mcpConfigPath and mcpManager are mutually exclusive";
+const MCP_TOOLS_ONLY_MANAGER_SUBSESSION_ERROR = "tools-only MCP managers cannot be reused in sub-sessions";
+
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const lifecycleStartupCapability = (
 		options as CreateAgentSessionOptions & { [lifecycleStartupCapabilityOption]?: SdkStartupCapability }
 	)[lifecycleStartupCapabilityOption];
+	const isCanonicalSubSession =
+		(options.taskDepth ?? 0) > 0 || Boolean(options.parentTaskPrefix) || Boolean(options.currentAgentType);
+	if (options.mcpConfigPath !== undefined && options.mcpManager !== undefined) {
+		throw new Error(MCP_CONFIG_PATH_AND_MANAGER_ERROR);
+	}
+	if (isCanonicalSubSession && options.mcpManager?.isToolsOnly()) {
+		throw new Error(MCP_TOOLS_ONLY_MANAGER_SUBSESSION_ERROR);
+	}
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
@@ -1257,6 +1272,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
+	let cleanupOwnedMcpManager: (() => Promise<void>) | undefined;
 	const enableLsp = options.enableLsp ?? true;
 	const backgroundJobsEnabled = isBackgroundJobSupportEnabled(settings);
 	const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
@@ -1464,14 +1480,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time("createAllTools", createTools, toolSession, options.toolNames);
 
-		// MCP runtime discovery is quarantined for the GJC surface. Keep an
-		// explicitly supplied manager only for legacy in-process callers that own
-		// lifecycle themselves; never discover project/user MCP configs here. The
-		// owned manager for always-on plugin-bundle MCP servers is created further
-		// below, after `customTools` is populated, so its tools can be surfaced as
-		// always-on tools per the plugin product contract.
+		// MCP runtime discovery is quarantined for the GJC surface. A top-level
+		// session may load only a caller-supplied exact config; project and user
+		// MCP configs are never discovered here. Existing managers remain available
+		// for legacy in-process callers, and plugin-bundle managers are created
+		// below after `customTools` is populated.
 		let mcpManager: MCPManager | undefined = options.mcpManager;
 		let ownsMcpManager = false;
+		const explicitMcpConfigPath = !isSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 		const customTools: CustomTool[] = [];
 
 		// Add image tools when the active model or configured image providers can generate images.
@@ -1542,12 +1558,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			logger.warn("Failed to load always-on GJC plugin tools", { error });
 		}
 
-		// Always-on GJC plugin-bundle MCP servers. Top-level sessions own a manager
-		// and connect the validated servers; subagents inherit the parent's manager
-		// via options.mcpManager and never spawn their own (prevents duplicate
-		// processes and leaks). Per the plugin product contract, connected MCP tools
-		// are surfaced as always-on tools rather than gated behind MCP selection.
-		if (!mcpManager && !options.parentTaskPrefix) {
+		if (explicitMcpConfigPath !== undefined) {
+			const owned = new MCPManager(cwd, null, { toolsOnly: true });
+			owned.setAuthStorage(authStorage);
+			mcpManager = owned;
+			ownsMcpManager = true;
+			cleanupOwnedMcpManager = () => owned.disconnectAll();
+			try {
+				const result = await owned.discoverAndConnect({ configPath: explicitMcpConfigPath });
+				customTools.push(...(result.tools as CustomTool[]));
+				if (result.errors.size > 0 || result.tools.length === 0) {
+					logger.warn("MCP tools could not be loaded.");
+				}
+			} catch {
+				logger.warn("MCP tools could not be loaded.");
+			}
+		} else if (!mcpManager && !isSubSession) {
+			// Always-on GJC plugin-bundle MCP servers. Top-level sessions own a manager
+			// and connect the validated servers; subagents inherit the parent's manager
+			// via options.mcpManager and never spawn their own (prevents duplicate
+			// processes and leaks). Per the plugin product contract, connected MCP tools
+			// are surfaced as always-on tools rather than gated behind MCP selection.
 			try {
 				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
 				for (const q of quarantine) {
@@ -1582,13 +1613,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			} catch (error) {
 				logger.warn("Failed to wire GJC plugin MCP servers", { error });
 			}
-		} else if (options.parentTaskPrefix) {
+		} else if (isSubSession) {
 			// Subagent: inherit the parent's always-on plugin MCP tools WITHOUT
 			// owning the manager (no connect, no callbacks, no disposal). The
 			// top-level session installed its manager as the process-global
 			// instance; reading getTools() surfaces the same always-on tools so the
 			// product decision holds for subagent sessions too.
-			const inherited = mcpManager ?? MCPManager.instance();
+			const singleton = MCPManager.instance();
+			const inherited = mcpManager ?? (singleton?.isToolsOnly() ? undefined : singleton);
 			if (inherited) {
 				try {
 					const inheritedTools = inherited.getTools();
@@ -1598,11 +1630,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 		}
-		// Only top-level sessions own the global MCPManager. Subagents already
-		// receive the parent's manager via options.mcpManager; reassigning the
-		// singleton to the same value is a no-op. Keep the gate explicit to mirror
-		// the AsyncJobManager ownership rule.
-		if (mcpManager && !options.parentTaskPrefix) MCPManager.setInstance(mcpManager);
+		// Exact-config managers are session-local. Plugin managers keep their
+		// existing top-level singleton behavior for bundled runtime surfaces.
+		if (mcpManager && !mcpManager.isToolsOnly() && !isSubSession && explicitMcpConfigPath === undefined) {
+			MCPManager.setInstance(mcpManager);
+		}
 
 		// Custom tool and extension discovery is quarantined from the public GJC utility surface.
 		// Explicit SDK extension factories are still honored; callers use them to
@@ -1969,7 +2001,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 
 			// Build combined append prompt: memory instructions + MCP server instructions
-			const serverInstructions = mcpManager?.getServerInstructions();
+			const serverInstructions =
+				explicitMcpConfigPath === undefined ? mcpManager?.getServerInstructions() : undefined;
 			let appendPrompt: string | undefined = memoryInstructions ?? undefined;
 			if (serverInstructions && serverInstructions.size > 0) {
 				const parts: string[] = [];
@@ -2389,8 +2422,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// AsyncJobManager on teardown; subagents inherit the parent's and
 			// **MUST NOT** tear it down.
 			ownedAsyncJobManager: asyncJobManager,
-			// Only the owned plugin-bundle MCP manager is torn down on dispose;
-			// subagents/callers that merely observe the global must not (see
+			// Only an MCP manager owned by this session is torn down on dispose;
+			// subagents and callers that merely observe a manager must not (see
 			// AgentSession.dispose).
 			ownedMcpManager: ownsMcpManager ? mcpManager : undefined,
 			scopedModels: options.scopedModels,
@@ -2414,20 +2447,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			reloadSshTool,
 			requestedToolNames: requestedToolNameSet,
 			discoverableToolAllowedNames: options.discoverableToolAllowedNames,
-			getMcpServerInstructions: mcpManager
-				? () => {
-						const raw = mcpManager.getServerInstructions();
-						if (!raw || raw.size === 0) return raw;
-						const out = new Map<string, string>();
-						for (const [name, text] of raw) {
-							out.set(
-								name,
-								text.length > MAX_MCP_INSTRUCTIONS_LENGTH ? text.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH) : text,
-							);
+			getMcpServerInstructions:
+				mcpManager && explicitMcpConfigPath === undefined
+					? () => {
+							const raw = mcpManager.getServerInstructions();
+							if (!raw || raw.size === 0) return raw;
+							const out = new Map<string, string>();
+							for (const [name, text] of raw) {
+								out.set(
+									name,
+									text.length > MAX_MCP_INSTRUCTIONS_LENGTH
+										? text.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH)
+										: text,
+								);
+							}
+							return out;
 						}
-						return out;
-					}
-				: undefined,
+					: undefined,
 			mcpDiscoveryEnabled,
 			initialSelectedMCPToolNames,
 			defaultSelectedMCPToolNames,
@@ -2562,9 +2598,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			),
 		);
 
-		// Wire MCP manager callbacks to session for reactive tool updates.
-		// Skip when reusing a parent's manager — the parent owns the callbacks.
-		if (mcpManager && !options.mcpManager) {
+		// Exact-config managers do not receive reactive callbacks; their tools are
+		// registered once in the session-owned catalog.
+		if (mcpManager && !options.mcpManager && explicitMcpConfigPath === undefined) {
 			// The owned plugin-bundle manager surfaces its tools as always-on custom
 			// tools (registered above), so it must NOT drive refreshMCPTools — that
 			// path strips MCP bridge tools and re-gates them behind MCP selection,
@@ -2629,6 +2665,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await session.dispose();
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
+				await cleanupOwnedMcpManager?.();
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);
 				await disposeVmContextsByOwner(evalKernelOwnerId);
 			}
