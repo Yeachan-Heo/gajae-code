@@ -4,9 +4,10 @@ import * as os from "node:os";
 import path from "node:path";
 import { AcpSdkAdapter } from "../src/sdk/acp";
 import { Broker } from "../src/sdk/broker";
+import { enrichBrokerAuthority } from "../src/sdk/broker/client-authority";
 import { sendAuthorizedChatOperation } from "../src/sdk/bus/chat-command-policy";
 import { runSdkSessionCli } from "../src/sdk/cli/session-cli";
-import { SdkClient } from "../src/sdk/client";
+import { readSdkBrokerDiscovery, SdkClient } from "../src/sdk/client";
 import { createSdkMcpServer } from "../src/sdk/mcp";
 import { type Adapter, OPERATIONS, type Operation } from "../src/sdk/protocol/operation-registry";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
@@ -247,6 +248,29 @@ function expectObservation(host: AdapterFixture, before: number, operation: Oper
 		expect(observed).toContainEqual({ kind: "global", operation: operation.sdkId });
 }
 
+/**
+ * Enriches a broker operation input with the same production client authority
+ * the SDK CLI and MCP server inject: the current-boot `brokerOwnerId` and, for
+ * cwd-bearing lifecycle operations, a real broker-issued workspace grant
+ * obtained from `session.list`. The disposition harness thereby exercises real
+ * broker ingress (via `enrichBrokerAuthority`) rather than fabricating
+ * boot-transient authority fields.
+ */
+async function enrichBrokerInput(
+	host: AdapterFixture,
+	operation: string,
+	input: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+	const discovery = await readSdkBrokerDiscovery(host.agentDir);
+	if (!discovery) throw new Error("SDK broker discovery is unavailable for authority enrichment");
+	const client = await SdkClient.connect(host.brokerEndpoint.url, host.brokerEndpoint.token);
+	try {
+		return await enrichBrokerAuthority(client, discovery, operation, input);
+	} finally {
+		await client.close();
+	}
+}
+
 async function assertAcpRow(operation: Operation, secret: boolean): Promise<void> {
 	const host = await fixture();
 	const expected = expectedOutcome("acp", operation, secret);
@@ -269,13 +293,19 @@ async function assertAcpRow(operation: Operation, secret: boolean): Promise<void
 				});
 		} else if (operation.kind === "global") {
 			if (expected === "forwarded") {
+				const globalInput = await enrichBrokerInput(host, operation.sdkId, input);
 				const code = expectedGlobalErrors[operation.sdkId];
 				if (code)
-					await expect(adapter.global(operation.sdkId, input, `parity-${operation.id}`)).rejects.toMatchObject({
+					await expect(
+						adapter.global(operation.sdkId, globalInput, `parity-${operation.id}`),
+					).rejects.toMatchObject({
 						code,
 					});
 				else
-					expectSemanticResult(operation, await adapter.global(operation.sdkId, input, `parity-${operation.id}`));
+					expectSemanticResult(
+						operation,
+						await adapter.global(operation.sdkId, globalInput, `parity-${operation.id}`),
+					);
 			} else
 				await expect(adapter.global(operation.sdkId, input)).rejects.toMatchObject({
 					code: expectedAcpRejection(operation, secret),

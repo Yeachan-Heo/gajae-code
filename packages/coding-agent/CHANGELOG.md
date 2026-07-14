@@ -28,7 +28,7 @@
 
 ### Fixed
 
-- ACP connections now retain independent broker-issued authority across multiple working directories. Realpath-equivalent workspace identities collapse aliases; live attach/close carry endpoint generation and incarnation; saved delete/resume/fork carry the full transcript identity through the lifecycle effect; production duplicate observations remain visible; and missing, changed, or ambiguous broker authority synchronously revokes attached and reverse control. Scoped bindings remain atomic and pagination cursors use exact decimal grammar.
+- ACP connections now retain independent broker-issued authority across multiple working directories. Scoped listings issue current-boot owner proofs and opaque grants backed by retained opened directory handles; lifecycle mutations revalidate the same workspace object through child readiness. Live adapters are generation/incarnation checked after setup immediately before publication, and scoped authority batches publish atomically with permanent ambiguity/reused-ID tombstones. Saved resume/fork/delete authority carries the full transcript stat tuple plus SHA-256 digest; lifecycle readiness binds source, destination, workspace, process, and endpoint witnesses; strict resumed persistence remains descriptor-bound; and verified deletion writes a descriptor-bound `session_deleted` tombstone instead of unlinking a mutable pathname. Transient owner/grant tokens are excluded from durable semantic idempotency hashes so accepted work remains retryable across broker restart while started/awaiting effects become terminally uncertain.
 
 ## [0.10.1] - 2026-07-13
 

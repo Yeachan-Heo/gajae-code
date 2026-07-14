@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { processIncarnation } from "../../src/sdk/broker/process-incarnation";
 
 async function withTempRoot(run: (root: string) => Promise<void>): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coord-race-"));
@@ -28,12 +29,15 @@ describe("send_prompt same-session concurrency", () => {
 			const sessionUrl = "ws://127.0.0.1:4313";
 			const agentDir = path.join(root, "agent-global");
 			const brokerSessions: Array<Record<string, unknown>> = [];
+			const brokerIncarnation = processIncarnation(process.pid);
+			if (!brokerIncarnation) throw new Error("Expected current process incarnation for broker discovery fixture.");
 			await writeBrokerDiscovery(agentDir, {
 				version: 1,
 				protocolVersion: 3,
 				packageGeneration: "test",
 				ownerId: "test-owner",
 				pid: process.pid,
+				incarnation: brokerIncarnation,
 				host: "127.0.0.1",
 				port: 4312,
 				url: brokerUrl,
@@ -72,8 +76,21 @@ describe("send_prompt same-session concurrency", () => {
 											});
 											return { ok: true, result: { sessionId } };
 										}
-										if (operation === "session.list")
-											return { ok: true, result: { sessions: brokerSessions } };
+										if (operation === "session.list") {
+											const listCwd = typeof input.cwd === "string" ? input.cwd : undefined;
+											return {
+												ok: true,
+												result: {
+													sessions: brokerSessions,
+													...(listCwd
+														? {
+																workspaceGrantId: `grant:${listCwd}`,
+																workspaceIdentity: { dev: "1", ino: "1" },
+															}
+														: {}),
+												},
+											};
+										}
 										if (operation === "session.get_endpoint") {
 											return { ok: true, result: { url: sessionUrl, token: "session-token" } };
 										}

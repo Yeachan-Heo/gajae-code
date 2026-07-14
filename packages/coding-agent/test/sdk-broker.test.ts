@@ -23,13 +23,40 @@ import {
 } from "../src/sdk/broker/ensure";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { readSessionLifecycleLaunchRequest } from "../src/sdk/broker/lifecycle";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "../src/sdk/broker/runtime";
 import { SessionManager } from "../src/session/session-manager";
-import { FileSessionStorage } from "../src/session/session-storage";
+import { FileSessionStorage, isCanonicalSessionDeletedTombstone } from "../src/session/session-storage";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-"));
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const brokerEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
+/**
+ * Interns a broker workspace grant for cwd via a scoped session.list and returns
+ * the broker-issued grant id + {dev,ino} identity to inject into cwd-bearing
+ * create/fork/resume/delete requests. Grant ids are boot-transient and stripped
+ * from durable idempotency hashes by the broker, so acquiring a fresh grant per
+ * request keeps lifecycle replays stable across transient grant ids.
+ */
+const workspaceGrantOf = async (broker: Broker, cwd: string) => {
+	const response = await broker.handleRequest("session.list", { brokerOwnerId: broker.ownerId, cwd });
+	if (!response.ok) throw new Error("Expected scoped session.list to issue a workspace grant.");
+	const result = response.result as { workspaceGrantId?: unknown; workspaceIdentity?: unknown };
+	if (typeof result.workspaceGrantId !== "string" || typeof result.workspaceIdentity !== "object")
+		throw new Error("Scoped session.list did not issue a complete workspace grant.");
+	return { workspaceGrantId: result.workspaceGrantId, workspaceIdentity: result.workspaceIdentity };
+};
+const transcriptIdentityOf = (filePath: string) => {
+	const snapshot = new FileSessionStorage().readSnapshotSync(filePath);
+	return {
+		dev: snapshot.stat.dev.toString(),
+		ino: snapshot.stat.ino.toString(),
+		size: snapshot.stat.size,
+		mtimeMs: snapshot.stat.mtimeMs,
+		mtimeNs: snapshot.stat.mtimeNs.toString(),
+		sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+	};
+};
 
 it("SDK internal commands self-spawn compiled binaries without source entrypoints", () => {
 	const compiled = {
@@ -58,6 +85,7 @@ it("SDK lifecycle model presets reach the session host parser", () => {
 
 			cwd: "/repo",
 			modelPreset: "codex-eco",
+			workspaceIdentity: { dev: "1", ino: "2" },
 		}),
 	);
 	expect(lifecycleArgs(request, "/repo", "/agent").mpreset).toBe("codex-eco");
@@ -84,12 +112,15 @@ describe("SDK broker identity and discovery", () => {
 		const dir = await temp();
 		const a = await getBrokerIdentityKey(dir);
 		expect(await getBrokerIdentityKey(dir)).toBe(a);
+		const incarnation = processIncarnation(process.pid);
+		if (!incarnation) throw new Error("Expected current process incarnation for broker discovery fixture.");
 		const d = {
 			version: 1 as const,
 			protocolVersion: 3 as const,
 			packageGeneration: "test",
 			ownerId: "x",
 			pid: process.pid,
+			incarnation,
 			host: "127.0.0.1" as const,
 			port: 1,
 			url: "ws://127.0.0.1:1",
@@ -131,6 +162,13 @@ describe("SDK broker identity and discovery", () => {
 		await fs.writeFile(brokerDiscoveryPath(dir), '{"version":1,"pid":');
 		expect(await readBrokerDiscovery(dir)).toBeNull();
 		await fs.rm(dir, { recursive: true, force: true });
+	});
+	it("publishes one complete broker identity atomically under concurrent first use", async () => {
+		const dir = await temp();
+		const keys = await Promise.all(Array.from({ length: 32 }, () => getBrokerIdentityKey(dir)));
+		expect(new Set(keys).size).toBe(1);
+		expect(keys[0]).toMatch(/^[0-9a-f]{64}$/);
+		expect((await fs.readFile(path.join(dir, "sdk", "broker.identity"), "utf8")).trim()).toBe(keys[0]);
 	});
 	it("refreshes discovery heartbeat, removes it on stop, and can restart", async () => {
 		const dir = await temp();
@@ -404,6 +442,7 @@ describe("SDK broker identity and discovery", () => {
 			.digest("hex");
 		expect(
 			await broker.handleRequest("session.get_endpoint", {
+				brokerOwnerId: broker.ownerId,
 				sessionId: "s",
 				endpointGeneration: 3,
 				endpointIncarnation,
@@ -420,6 +459,7 @@ describe("SDK broker identity and discovery", () => {
 		});
 		expect(
 			await broker.handleRequest("session.get_endpoint", {
+				brokerOwnerId: broker.ownerId,
 				sessionId: "s",
 				endpointGeneration: 3,
 				endpointIncarnation: "0".repeat(64),
@@ -428,7 +468,13 @@ describe("SDK broker identity and discovery", () => {
 			ok: false,
 			error: { code: "endpoint_stale", message: "session endpoint is stale" },
 		});
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "s", endpointGeneration: 2 })).toEqual({
+		expect(
+			await broker.handleRequest("session.get_endpoint", {
+				brokerOwnerId: broker.ownerId,
+				sessionId: "s",
+				endpointGeneration: 2,
+			}),
+		).toEqual({
 			ok: false,
 			error: { code: "endpoint_stale", message: "session endpoint is stale" },
 		});
@@ -440,7 +486,13 @@ describe("SDK broker identity and discovery", () => {
 			pid: process.pid,
 			endpointMtimeMs: endpointMtimeMs + 1,
 		});
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "s", endpointGeneration: 4 })).toEqual({
+		expect(
+			await broker.handleRequest("session.get_endpoint", {
+				brokerOwnerId: broker.ownerId,
+				sessionId: "s",
+				endpointGeneration: 4,
+			}),
+		).toEqual({
 			ok: false,
 			error: { code: "endpoint_stale", message: "session endpoint is stale" },
 		});
@@ -476,13 +528,16 @@ describe("SDK broker identity and discovery", () => {
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 			});
+			const grant = await workspaceGrantOf(broker, requestedCwd);
 			const result = await broker.handleRequest(
 				"session.resume",
 				{
+					brokerOwnerId: broker.ownerId,
 					cwd: requestedCwd,
 					target: { path: requestedCwd },
 					sessionId,
 					sessionPath,
+					...grant,
 				},
 				"cross-scope-resume",
 			);
@@ -504,7 +559,12 @@ describe("SDK broker identity and discovery", () => {
 		const broker = new Broker({ agentDir: dir });
 		await broker.start();
 		try {
-			const input = { sessionId: "saved", sessionPath: path.join(dir, "missing.json"), trace: "first" };
+			const input = {
+				brokerOwnerId: broker.ownerId,
+				sessionId: "saved",
+				sessionPath: path.join(dir, "missing.json"),
+				trace: "first",
+			};
 			const first = await broker.handleRequest("session.delete", input, "caller-key");
 			expect(await broker.handleRequest("session.delete", input, "caller-key")).toEqual(first);
 			expect(await broker.handleRequest("session.delete", { ...input, trace: "changed" }, "caller-key")).toEqual({
@@ -523,15 +583,25 @@ describe("SDK broker identity and discovery", () => {
 		const requested = path.join(sessions, "requested.jsonl");
 		const other = path.join(sessions, "other.jsonl");
 		await fs.mkdir(sessions, { recursive: true });
+		await fs.mkdir(cwd, { recursive: true });
 		await fs.writeFile(requested, `${JSON.stringify({ type: "session", id: "requested" })}\n`);
 		await fs.writeFile(other, `${JSON.stringify({ type: "session", id: "other" })}\n`);
 		const broker = new Broker({ agentDir: dir });
 		await broker.start();
 		try {
+			const grant = await workspaceGrantOf(broker, cwd);
+			const otherIdentity = transcriptIdentityOf(other);
 			expect(
 				await broker.handleRequest(
 					"session.delete",
-					{ sessionId: "requested", sessionPath: other, cwd },
+					{
+						brokerOwnerId: broker.ownerId,
+						sessionId: "requested",
+						sessionPath: other,
+						sessionIdentity: otherIdentity,
+						cwd,
+						...grant,
+					},
 					"delete-cross-session",
 				),
 			).toEqual({
@@ -542,7 +612,13 @@ describe("SDK broker identity and discovery", () => {
 			expect(
 				await broker.handleRequest(
 					"session.delete",
-					{ sessionId: "requested", sessionPath: path.join(dir, "outside.jsonl"), cwd },
+					{
+						brokerOwnerId: broker.ownerId,
+						sessionId: "requested",
+						sessionPath: path.join(dir, "outside.jsonl"),
+						cwd,
+						...grant,
+					},
 					"delete-outside-root",
 				),
 			).toEqual({
@@ -562,7 +638,7 @@ describe("SDK broker identity and discovery", () => {
 			expect(
 				await broker.handleRequest(
 					"session.delete",
-					{ sessionId: "requested", sessionPath: linked, cwd },
+					{ brokerOwnerId: broker.ownerId, sessionId: "requested", sessionPath: linked, cwd, ...grant },
 					"delete-symlink-escape",
 				),
 			).toEqual({
@@ -583,12 +659,21 @@ describe("SDK broker identity and discovery", () => {
 		const dir = await temp();
 		const broker = new Broker({ agentDir: dir });
 		try {
-			expect(await broker.handleRequest("session.get_endpoint", { sessionId: "../escape" })).toEqual({
+			expect(
+				await broker.handleRequest("session.get_endpoint", {
+					brokerOwnerId: broker.ownerId,
+					sessionId: "../escape",
+				}),
+			).toEqual({
 				ok: false,
 				error: { code: "invalid_input", message: "sessionId must be a canonical safe identifier" },
 			});
 			expect(
-				await broker.handleRequest("session.close", { sessionId: "session-a", id: "session-b" }, "alias-conflict"),
+				await broker.handleRequest(
+					"session.close",
+					{ brokerOwnerId: broker.ownerId, sessionId: "session-a", id: "session-b" },
+					"alias-conflict",
+				),
 			).toEqual({ ok: false, error: { code: "invalid_input", message: "sessionId aliases conflict" } });
 			await expect(fs.stat(path.join(dir, "sdk", "escape.json"))).rejects.toThrow();
 		} finally {
@@ -601,8 +686,14 @@ describe("SDK broker identity and discovery", () => {
 		const broker = new Broker({ agentDir: dir });
 		await broker.start();
 		try {
-			const first = await broker.handleRequest("session.close", { sessionId: "missing" }, "same-close");
-			expect(await broker.handleRequest("session.close", { id: "missing" }, "same-close")).toEqual(first);
+			const first = await broker.handleRequest(
+				"session.close",
+				{ brokerOwnerId: broker.ownerId, sessionId: "missing" },
+				"same-close",
+			);
+			expect(
+				await broker.handleRequest("session.close", { brokerOwnerId: broker.ownerId, id: "missing" }, "same-close"),
+			).toEqual(first);
 		} finally {
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
@@ -616,7 +707,7 @@ describe("SDK broker identity and discovery", () => {
 			expect(
 				await broker.handleRequest(
 					"session.create",
-					{ cwd: dir, stateRoot: path.join(dir, "alternate-state") },
+					{ brokerOwnerId: broker.ownerId, cwd: dir, stateRoot: path.join(dir, "alternate-state") },
 					"alternate-state-root",
 				),
 			).toEqual({
@@ -650,12 +741,23 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: 999_999_999,
 			});
+			const grant = await workspaceGrantOf(broker, cwd);
+			const sessionIdentity = transcriptIdentityOf(sessionPath);
 			expect(
-				await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "verified-delete-key"),
+				await broker.handleRequest(
+					"session.delete",
+					{ brokerOwnerId: broker.ownerId, sessionId, sessionPath, sessionIdentity, cwd, ...grant },
+					"verified-delete-key",
+				),
 			).toEqual({ ok: true, result: { sessionId } });
-			await expect(fs.stat(sessionPath)).rejects.toThrow();
+			// Verified delete tombstones the transcript in place as a canonical
+			// session_deleted descriptor (the pathname is never unlinked); the
+			// artifacts directory is still removed and a scoped list omits it.
+			const tombstone = JSON.parse((await fs.readFile(sessionPath, "utf8")).trim());
+			expect(isCanonicalSessionDeletedTombstone(tombstone)).toBe(true);
+			expect(tombstone.id).toBe(sessionId);
 			await expect(fs.stat(artifactsDir)).rejects.toThrow();
-			expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			expect(await broker.handleRequest("session.list", { brokerOwnerId: broker.ownerId, cwd })).toMatchObject({
 				ok: true,
 				result: { sessions: [] },
 			});
@@ -685,9 +787,11 @@ describe("SDK broker identity and discovery", () => {
 			transcriptIdentity: { dev: 5n, ino: 6n },
 		});
 		try {
+			const grant = await workspaceGrantOf(broker, cwd);
+			const sessionIdentity = transcriptIdentityOf(sessionPath);
 			const pending = await broker.handleRequest(
 				"session.delete",
-				{ sessionId, sessionPath, cwd },
+				{ brokerOwnerId: broker.ownerId, sessionId, sessionPath, sessionIdentity, cwd, ...grant },
 				"pending-delete-key",
 			);
 			expect(pending).toEqual({
@@ -703,7 +807,11 @@ describe("SDK broker identity and discovery", () => {
 				},
 			});
 			expect(
-				await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "pending-delete-key"),
+				await broker.handleRequest(
+					"session.delete",
+					{ brokerOwnerId: broker.ownerId, sessionId, sessionPath, sessionIdentity, cwd, ...grant },
+					"pending-delete-key",
+				),
 			).toEqual(pending);
 			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
 		} finally {
@@ -777,7 +885,9 @@ describe("SDK broker identity and discovery", () => {
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 			});
-			expect(await broker.handleRequest("session.close", { sessionId }, "rotating-close")).toEqual({
+			expect(
+				await broker.handleRequest("session.close", { brokerOwnerId: broker.ownerId, sessionId }, "rotating-close"),
+			).toEqual({
 				ok: false,
 				error: { code: "endpoint_stale", message: "session endpoint is stale" },
 			});
@@ -839,7 +949,9 @@ describe("SDK broker identity and discovery", () => {
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 			});
-			expect(await broker.handleRequest("session.close", { sessionId }, "flush-close")).toEqual({
+			expect(
+				await broker.handleRequest("session.close", { brokerOwnerId: broker.ownerId, sessionId }, "flush-close"),
+			).toEqual({
 				ok: false,
 				error: { code: "flush_failed", message: "session flush failed" },
 			});

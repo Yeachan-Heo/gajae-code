@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { brokerOwnerForTest } from "../../src/sdk/broker/ensure";
 import { SdkClient } from "../../src/sdk/client";
 import { SessionManager } from "../../src/session/session-manager";
+import { isCanonicalSessionDeletedTombstone } from "../../src/session/session-storage";
 
 type BrokerResult = { ok: boolean; result?: Record<string, unknown>; error?: { code?: string } };
 export type LifecycleGlobal = (
@@ -113,6 +114,19 @@ function success(result: BrokerResult): Record<string, unknown> {
 	if (!result.ok || !result.result) throw new Error(`Lifecycle operation failed: ${JSON.stringify(result)}`);
 	return result.result;
 }
+function transcriptIdentity(filePath: string) {
+	const captured = SessionManager.captureTranscriptStrict(filePath);
+	if (captured.kind !== "captured") throw new Error(`Could not capture transcript identity for ${filePath}.`);
+	const identity = captured.snapshot.identity;
+	return {
+		dev: identity.dev.toString(),
+		ino: identity.ino.toString(),
+		size: identity.size,
+		mtimeMs: identity.mtimeMs,
+		mtimeNs: identity.mtimeNs.toString(),
+		sha256: identity.sha256,
+	};
+}
 
 /** Exercises G03-G07 through a supplied shipped-interface invocation, never a direct adapter. */
 export async function createLifecycleFixture(): Promise<LifecycleFixture> {
@@ -164,11 +178,20 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 			const sourceId = savedSession.getSessionId();
 			const sourcePath = savedSession.getSessionFile();
 			if (!sourcePath) throw new Error("Product session API did not create a saved session path.");
+			await savedSession.close();
+			const resumeIdentity = transcriptIdentity(sourcePath);
 
 			const resumed = success(
 				await global(
 					"session.resume",
-					{ cwd: repo, target: { path: repo }, stateRoot, sessionId: sourceId, sessionPath: sourcePath },
+					{
+						cwd: repo,
+						target: { path: repo },
+						stateRoot,
+						sessionId: sourceId,
+						sessionPath: sourcePath,
+						sessionIdentity: resumeIdentity,
+					},
 					"resume-key",
 				),
 			);
@@ -178,7 +201,14 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 				success(
 					await global(
 						"session.resume",
-						{ cwd: repo, target: { path: repo }, stateRoot, sessionId: sourceId, sessionPath: sourcePath },
+						{
+							cwd: repo,
+							target: { path: repo },
+							stateRoot,
+							sessionId: sourceId,
+							sessionPath: sourcePath,
+							sessionIdentity: resumeIdentity,
+						},
 						"resume-key",
 					),
 				),
@@ -192,6 +222,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 						stateRoot,
 						sessionId: sourceId,
 						sessionPath: sourcePath,
+						sessionIdentity: resumeIdentity,
 						body: "changed",
 					},
 					"resume-key",
@@ -199,6 +230,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 			success(await global("session.close", { sessionId: sourceId }, "close-resumed-key"));
 			await assertClosed(agentDir, stateRoot, sourceId, resumedEndpoint);
+			const forkSourceIdentity = transcriptIdentity(sourcePath);
 
 			const forked = success(
 				await global(
@@ -209,6 +241,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 						stateRoot,
 						sourceSessionId: sourceId,
 						sourceSessionPath: sourcePath,
+						sourceSessionIdentity: forkSourceIdentity,
 					},
 					"fork-key",
 				),
@@ -225,6 +258,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 							stateRoot,
 							sourceSessionId: sourceId,
 							sourceSessionPath: sourcePath,
+							sourceSessionIdentity: forkSourceIdentity,
 						},
 						"fork-key",
 					),
@@ -239,6 +273,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 						stateRoot,
 						sourceSessionId: sourceId,
 						sourceSessionPath: sourcePath,
+						sourceSessionIdentity: forkSourceIdentity,
 						body: "changed",
 					},
 					"fork-key",
@@ -256,26 +291,36 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 				throw new Error(`Fork persisted outside agent session root: ${forkPath}`);
 			success(await global("session.close", { sessionId: forkId }, "close-fork-key"));
 			await assertClosed(agentDir, stateRoot, forkId, forkEndpoint);
+			const forkDeleteIdentity = transcriptIdentity(forkPath);
 
 			const deleted = success(
 				await global(
 					"session.delete",
-					{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
+					{
+						sessionId: forkId,
+						stateRoot,
+						cwd: repo,
+						sessionPath: forkPath,
+						sessionIdentity: forkDeleteIdentity,
+					},
 					"delete-key",
 				),
 			);
 			expect(deleted).toMatchObject({ sessionId: forkId });
-			expect(
-				await fs.access(forkPath).then(
-					() => true,
-					() => false,
-				),
-			).toBe(false);
+			const tombstone = JSON.parse((await fs.readFile(forkPath, "utf8")).trim());
+			expect(isCanonicalSessionDeletedTombstone(tombstone)).toBe(true);
+			expect(tombstone.id).toBe(forkId);
 			expect(
 				success(
 					await global(
 						"session.delete",
-						{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
+						{
+							sessionId: forkId,
+							stateRoot,
+							cwd: repo,
+							sessionPath: forkPath,
+							sessionIdentity: forkDeleteIdentity,
+						},
 						"delete-key",
 					),
 				),
@@ -283,7 +328,13 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 			expect(
 				await global(
 					"session.delete",
-					{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: sourcePath },
+					{
+						sessionId: forkId,
+						stateRoot,
+						cwd: repo,
+						sessionPath: sourcePath,
+						sessionIdentity: forkDeleteIdentity,
+					},
 					"delete-key",
 				),
 			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });

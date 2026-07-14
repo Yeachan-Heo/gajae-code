@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -62,13 +63,35 @@ async function stopDiscoveredBroker(agentDir: string): Promise<void> {
 	if (!(await waitForExit(2_000))) throw new Error(`Test broker ${discovery.pid} did not exit after SIGKILL.`);
 }
 
+/** Fixture source: a stub lifecycle child that publishes an endpoint, registers in
+ * the host index, records its pid/request, and stays alive. The test writes the
+ * ready witness itself to control the readiness evidence deterministically. */
+function lifecycleWitnessFixtureSource(pidPath: string, requestPath: string): string {
+	return `
+const fs=require('fs'), path=require('path'), crypto=require('crypto');
+const root=process.env.GJC_STATE_ROOT, id=process.env.GJC_SESSION_ID, agent=process.env.GJC_AGENT_DIR;
+fs.mkdirSync(path.join(root,'sdk'),{recursive:true});
+fs.writeFileSync(${JSON.stringify(pidPath)},String(process.pid));
+fs.writeFileSync(${JSON.stringify(requestPath)},process.env.GJC_SDK_LIFECYCLE_REQUEST);
+const endpoint=path.join(root,'sdk',id+'.json');
+fs.writeFileSync(endpoint,JSON.stringify({sessionId:id,pid:process.pid,url:'ws://127.0.0.1:1',token:'witness'}));
+const m=fs.statSync(endpoint).mtimeMs;
+const log=path.join(agent,'sdk','sessions','index.jsonl');fs.mkdirSync(path.dirname(log),{recursive:true});const indexSeq=fs.existsSync(log)?fs.readFileSync(log,'utf8').trim().split('\\n').filter(Boolean).length+1:1;
+const event={type:'host_registered',sessionId:id,locator:{repo:agent,stateRoot:root},endpointGeneration:1,pid:process.pid,endpointMtimeMs:m,version:1,indexSeq,ts:Date.now()};
+event.checksum=crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');fs.appendFileSync(log,JSON.stringify(event)+'\\n');
+setInterval(()=>{},1000);
+`;
+}
+
 async function liveLifecycleSession(root: string, agentDir: string, sessionId: string) {
 	const stateRoot = path.join(root, ".gjc", "state");
+	const workspaceStat = await fs.stat(root, { bigint: true });
 	const request = {
 		operation: "session.create",
 		sessionId,
 		cwd: root,
 		stateRoot,
+		workspaceIdentity: { dev: workspaceStat.dev.toString(), ino: workspaceStat.ino.toString() },
 	} as const;
 	const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "sdk", "session-host-internal"], {
 		cwd: root,
@@ -115,6 +138,98 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 	}
 }
 
+/**
+ * Test-only authority admission matching production clients: every request carries
+ * the current broker owner, and cwd-bearing lifecycle operations first acquire the
+ * retained workspace grant issued by scoped session.list.
+ */
+function authorizedRequest(broker: Broker, operation: string, input: Record<string, unknown>, idempotencyKey?: string) {
+	const cwdBearing =
+		operation === "session.create" ||
+		operation === "session.fork" ||
+		operation === "session.resume" ||
+		operation === "session.delete";
+	const promise = (async () => {
+		const authorized: Record<string, unknown> = { ...input, brokerOwnerId: broker.ownerId };
+		if (cwdBearing && typeof input.cwd === "string") {
+			const listed = await broker.handleRequest("session.list", {
+				brokerOwnerId: broker.ownerId,
+				cwd: input.cwd,
+			});
+			if (!listed.ok) return listed;
+			const result = listed.result as {
+				workspaceGrantId?: unknown;
+				workspaceIdentity?: unknown;
+			};
+			if (
+				typeof result.workspaceGrantId !== "string" ||
+				typeof result.workspaceIdentity !== "object" ||
+				result.workspaceIdentity === null
+			)
+				throw new Error("Scoped session.list did not issue workspace authority.");
+			authorized.workspaceGrantId = result.workspaceGrantId;
+			authorized.workspaceIdentity = result.workspaceIdentity;
+		}
+		return broker.handleRequest(operation, authorized, idempotencyKey);
+	})();
+	void promise.catch(() => {});
+	return promise;
+}
+
+test("lifecycle worktree creation retains both source-root and child-worktree authority", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-worktree-authority-"));
+	const agentDir = path.join(root, "agent");
+	const repo = path.join(root, "repo");
+	await fs.mkdir(repo, { recursive: true });
+	execFileSync("git", ["init"], { cwd: repo });
+	execFileSync("git", ["config", "user.name", "GJC Test"], { cwd: repo });
+	execFileSync("git", ["config", "user.email", "gjc@example.invalid"], { cwd: repo });
+	await fs.writeFile(path.join(repo, "tracked.txt"), "authority\n");
+	execFileSync("git", ["add", "tracked.txt"], { cwd: repo });
+	execFileSync("git", ["commit", "-m", "fixture"], { cwd: repo });
+	const broker = new Broker({ agentDir });
+	let sessionId: string | undefined;
+	try {
+		await broker.start();
+		const created = await authorizedRequest(
+			broker,
+			"session.create",
+			{
+				cwd: repo,
+				target: { path: repo, worktree: { enabled: true } },
+				readinessTimeoutMs: 15_000,
+			},
+			"worktree-authority-create",
+		);
+		expect(created).toMatchObject({
+			ok: true,
+			result: { worktree: { created: true, enabled: true } },
+		});
+		if (!created.ok) throw new Error(`Expected worktree lifecycle create to succeed: ${JSON.stringify(created)}`);
+		const result = created.result as {
+			cwd: string;
+			sessionId: string;
+			worktree: { cwd: string };
+		};
+		if (
+			typeof result.cwd !== "string" ||
+			typeof result.sessionId !== "string" ||
+			typeof result.worktree.cwd !== "string"
+		)
+			throw new Error(`Unexpected worktree result: ${JSON.stringify(created)}`);
+		sessionId = result.sessionId;
+		expect(path.resolve(result.cwd)).toBe(path.resolve(result.worktree.cwd));
+		expect(path.resolve(result.cwd)).not.toBe(path.resolve(repo));
+		expect((await fs.stat(result.cwd)).isDirectory()).toBe(true);
+	} finally {
+		if (sessionId)
+			await authorizedRequest(broker, "session.close", { sessionId }, "worktree-authority-close").catch(
+				() => undefined,
+			);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
 test("lifecycle host rejects a transcript replaced after strict authorization before it can be consumed", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-transcript-race-"));
 	const agentDir = path.join(root, "agent");
@@ -129,6 +244,9 @@ test("lifecycle host rejects a transcript replaced after strict authorization be
 		if (inventory.kind !== "complete") throw new Error("Expected strict session inventory.");
 		const candidate = inventory.candidates.find(item => item.path === sessionPath);
 		if (!candidate) throw new Error("Expected strict session candidate.");
+		const captured = SessionManager.captureTranscriptStrict(sessionPath);
+		if (captured.kind !== "captured") throw new Error("Expected captured transcript.");
+		const rootStat = await fs.stat(root, { bigint: true });
 		const replacementPath = `${sessionPath}.replacement`;
 		await fs.writeFile(replacementPath, `${await fs.readFile(sessionPath, "utf8")}\n`);
 		const originalInventory = SessionManager.inventorySessionsStrict;
@@ -157,6 +275,11 @@ test("lifecycle host rejects a transcript replaced after strict authorization be
 							size: candidate.identity.size,
 							mtimeMs: candidate.identity.mtimeMs,
 							mtimeNs: candidate.identity.mtimeNs.toString(),
+							sha256: captured.snapshot.identity.sha256,
+						},
+						workspaceIdentity: {
+							dev: rootStat.dev.toString(),
+							ino: rootStat.ino.toString(),
 						},
 					},
 					root,
@@ -191,6 +314,9 @@ test("lifecycle fork rejects a source replaced after capture without destination
 		if (inventory.kind !== "complete") throw new Error("Expected strict source session inventory.");
 		const candidate = inventory.candidates.find(item => item.path === sourcePath);
 		if (!candidate) throw new Error("Expected strict source session candidate.");
+		const captured = SessionManager.captureTranscriptStrict(sourcePath);
+		if (captured.kind !== "captured") throw new Error("Expected captured source transcript.");
+		const targetStat = await fs.stat(targetCwd, { bigint: true });
 		const replacementPath = `${sourcePath}.replacement`;
 		await fs.writeFile(replacementPath, await fs.readFile(sourcePath));
 		const destinationSessionDir = SessionManager.getDefaultSessionDirReadOnly(targetCwd, agentDir);
@@ -222,6 +348,11 @@ test("lifecycle fork rejects a source replaced after capture without destination
 							size: candidate.identity.size,
 							mtimeMs: candidate.identity.mtimeMs,
 							mtimeNs: candidate.identity.mtimeNs.toString(),
+							sha256: captured.snapshot.identity.sha256,
+						},
+						workspaceIdentity: {
+							dev: targetStat.dev.toString(),
+							ino: targetStat.ino.toString(),
 						},
 					},
 					targetCwd,
@@ -347,7 +478,8 @@ setInterval(()=>{},1000);
 		process.env.GJC_HANGING_UPGRADE_URL = `ws://127.0.0.1:${hangingUpgrade.port}`;
 		await broker.start();
 		const started = Date.now();
-		const lifecycle = broker.handleRequest(
+		const lifecycle = authorizedRequest(
+			broker,
 			"session.create",
 			{ cwd: agentDir, stateRoot, readinessTimeoutMs: 300 },
 			"hanging-upgrade",
@@ -424,12 +556,14 @@ setInterval(()=>{},1000);
 	try {
 		const started = Date.now();
 		const [first, second] = await Promise.all([
-			broker.handleRequest(
+			authorizedRequest(
+				broker,
 				"session.create",
 				{ stateRoot, cwd: agentDir, readinessTimeoutMs: 300, body: "first", modelPreset: "codex-eco" },
 				"create-1",
 			),
-			broker.handleRequest(
+			authorizedRequest(
+				broker,
 				"session.create",
 				{ stateRoot, cwd: agentDir, readinessTimeoutMs: 300, body: "second", modelPreset: "codex-eco" },
 				"create-2",
@@ -445,7 +579,7 @@ setInterval(()=>{},1000);
 			modelPreset: "codex-eco",
 		});
 		expect((await fs.readdir(path.join(stateRoot, "sdk"))).filter(name => name.endsWith(".json"))).toEqual([]);
-		const listed = await broker.handleRequest("session.list", {});
+		const listed = await authorizedRequest(broker, "session.list", {});
 		expect(listed.ok).toBe(true);
 		if (!listed.ok) throw new Error(listed.error.message);
 		expect(listed.result).toMatchObject({ sessions: [] });
@@ -479,7 +613,8 @@ test("broker rejects a cross-workspace cold fork source before spawning", async 
 		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${fixture}`;
 		await broker.start();
 		expect(
-			await broker.handleRequest(
+			await authorizedRequest(
+				broker,
 				"session.fork",
 				{
 					cwd: targetCwd,
@@ -520,7 +655,8 @@ test("broker rejects invalid and oversized readiness timeouts before spawning", 
 		await broker.start();
 		for (const readinessTimeoutMs of [0, 60_001]) {
 			expect(
-				await broker.handleRequest(
+				await authorizedRequest(
+					broker,
 					"session.create",
 					{ cwd: agentDir, readinessTimeoutMs },
 					`invalid-timeout-${readinessTimeoutMs}`,
@@ -553,7 +689,7 @@ test("broker fails promptly when the owned lifecycle child exits before readines
 		await broker.start();
 		const started = Date.now();
 		expect(
-			await broker.handleRequest("session.create", { cwd: agentDir, readinessTimeoutMs: 2_000 }, "child-exits"),
+			await authorizedRequest(broker, "session.create", { cwd: agentDir, readinessTimeoutMs: 2_000 }, "child-exits"),
 		).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
 		expect(Date.now() - started).toBeLessThan(1_000);
 	} finally {
@@ -632,7 +768,8 @@ setInterval(()=>{},1000);
 		process.env.GJC_FOREIGN_ENDPOINT_URL = `ws://127.0.0.1:${foreign.port}`;
 		await broker.start();
 		expect(
-			await broker.handleRequest(
+			await authorizedRequest(
+				broker,
 				"session.create",
 				{ cwd: agentDir, stateRoot, readinessTimeoutMs: 1_000 },
 				"foreign-ready",
@@ -664,7 +801,7 @@ test("broker refuses a stale registered PID when no durable effect marker proves
 			endpointGeneration: 1,
 			pid: process.pid,
 		});
-		expect(await broker.handleRequest("session.close", { sessionId: "stale" }, "stale-close")).toEqual({
+		expect(await authorizedRequest(broker, "session.close", { sessionId: "stale" }, "stale-close")).toEqual({
 			ok: false,
 			error: {
 				code: "close_refused",
@@ -716,7 +853,8 @@ test("broker refuses same-generation close authority from a prior endpoint incar
 			)
 			.digest("hex");
 		expect(
-			await broker.handleRequest(
+			await authorizedRequest(
+				broker,
 				"session.close",
 				{
 					sessionId,
@@ -786,7 +924,7 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 				}
 				return originalHandleRequest(operation, input, idempotencyKey);
 			};
-			const result = await broker.handleRequest("session.close", { sessionId }, `close-rebind-${label}`);
+			const result = await authorizedRequest(broker, "session.close", { sessionId }, `close-rebind-${label}`);
 			expect(injected).toBe(true);
 			expect(result).toMatchObject({ ok: false, error: { code: expectedCode } });
 		}
@@ -829,8 +967,8 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 		});
 
 		const [first, second] = await Promise.all([
-			broker.handleRequest("session.resume", { sessionId, sessionPath, cwd: root }, "resume-first"),
-			broker.handleRequest("session.resume", { sessionId, sessionPath, cwd: root }, "resume-second"),
+			authorizedRequest(broker, "session.resume", { sessionId, sessionPath, cwd: root }, "resume-first"),
+			authorizedRequest(broker, "session.resume", { sessionId, sessionPath, cwd: root }, "resume-second"),
 		]);
 
 		for (const resumed of [first, second]) {
@@ -844,7 +982,7 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 				},
 			});
 		}
-		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+		expect(await authorizedRequest(broker, "session.list", {})).toMatchObject({
 			ok: true,
 			result: {
 				sessions: [expect.objectContaining({ sessionId, endpointGeneration: 17 })],
@@ -890,7 +1028,7 @@ test("broker never signals a PID reused after its lifecycle marker was written",
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpoint)).mtimeMs,
 		});
-		expect(await broker.handleRequest("session.close", { sessionId }, "reused-close")).toEqual({
+		expect(await authorizedRequest(broker, "session.close", { sessionId }, "reused-close")).toEqual({
 			ok: false,
 			error: {
 				code: "close_refused",
@@ -950,13 +1088,13 @@ test("broker records terminal uncertainty when SIGKILL re-verification fails aft
 				writeFileSync(marker, JSON.stringify({ pid: child.pid, effectMarker: "fixture", incarnation: "replaced" }));
 			return signal === 0 || signal === undefined ? originalKill(pid, signal) : undefined;
 		}) as typeof process.kill;
-		expect(await broker.handleRequest("session.close", { sessionId }, "unkillable-close")).toMatchObject({
+		expect(await authorizedRequest(broker, "session.close", { sessionId }, "unkillable-close")).toMatchObject({
 			ok: false,
 			error: { code: "terminal_uncertain" },
 		});
 		expect(await fs.readFile(endpoint, "utf8")).toContain("unreachable");
 		expect(await fs.readFile(marker, "utf8")).toContain('"fixture"');
-		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+		expect(await authorizedRequest(broker, "session.list", {})).toMatchObject({
 			ok: true,
 			result: {
 				sessions: [expect.objectContaining({ sessionId, terminalUncertain: true })],
@@ -986,14 +1124,15 @@ if (process.platform === "darwin") {
 		await broker.start();
 		try {
 			expect(
-				await broker.handleRequest(
+				await authorizedRequest(
+					broker,
 					"session.create",
 					{ cwd: agentDir, readinessTimeoutMs: 100 },
 					"unreadable-incarnation",
 				),
 			).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
 			expect(childPid).toBeGreaterThan(0);
-			expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			expect(await authorizedRequest(broker, "session.list", {})).toMatchObject({
 				ok: true,
 				result: {
 					sessions: [expect.objectContaining({ terminalUncertain: true })],
@@ -1028,7 +1167,7 @@ test("broker starts from the production broker entrypoint with no sessions", asy
 	try {
 		const discovery = await broker.start();
 		expect(discovery.url).toStartWith("ws://127.0.0.1:");
-		expect(await broker.handleRequest("session.list", {})).toEqual({
+		expect(await authorizedRequest(broker, "session.list", {})).toEqual({
 			ok: true,
 			result: {
 				indexSeq: 0,
@@ -1107,15 +1246,15 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 		// its host_registered event; wait for the session to be indexed so session.close
 		// does not race the registration (slow CI runners surfaced "session is not indexed").
 		await waitFor(async () => {
-			const listed = (await broker.handleRequest("session.list", {})) as {
+			const listed = (await authorizedRequest(broker, "session.list", {})) as {
 				result?: { sessions?: Array<{ sessionId?: string }> };
 			};
 			return listed.result?.sessions?.some(session => session.sessionId === sessionId) ? true : undefined;
 		}, "session indexed before close");
-		const closed = await broker.handleRequest("session.close", { sessionId }, "close-1");
+		const closed = await authorizedRequest(broker, "session.close", { sessionId }, "close-1");
 		expect(closed).toMatchObject({ ok: true, result: { sessionId } });
 		expect(await child.exited).toBe(0);
-		expect(await broker.handleRequest("session.get_endpoint", { sessionId })).toMatchObject({
+		expect(await authorizedRequest(broker, "session.get_endpoint", { sessionId })).toMatchObject({
 			ok: false,
 			error: { code: "resource_gone" },
 		});
@@ -1125,7 +1264,7 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 				reconnectAttempts: 0,
 			}),
 		).rejects.toThrow();
-		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+		expect(await authorizedRequest(broker, "session.list", {})).toMatchObject({
 			ok: true,
 			result: { sessions: [] },
 		});
@@ -1136,7 +1275,7 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 				.map(line => JSON.parse(line) as { type?: string; sessionId?: string })
 				.at(-1),
 		).toMatchObject({ type: "host_unregistered", sessionId });
-		expect(await broker.handleRequest("session.close", { sessionId }, "close-1")).toEqual(closed);
+		expect(await authorizedRequest(broker, "session.close", { sessionId }, "close-1")).toEqual(closed);
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
@@ -1178,3 +1317,239 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);
+test("broker rejects a workspace deleted and recreated before spawn", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-workspace-swap-"));
+	const agentDir = path.join(root, "agent");
+	const workspace = path.join(root, "workspace");
+	await fs.mkdir(workspace, { recursive: true });
+	const broker = new Broker({ agentDir });
+	try {
+		await broker.start();
+		const originalTransition = broker.ledger.transition.bind(broker.ledger);
+		let swapped = false;
+		broker.ledger.transition = (async (identity: string, state: string, fields?: unknown) => {
+			const result = await originalTransition(identity, state as never, fields as never);
+			if (!swapped && state === "effect_started") {
+				swapped = true;
+				await fs.rm(workspace, { recursive: true, force: true });
+				await fs.mkdir(workspace);
+			}
+			return result;
+		}) as typeof broker.ledger.transition;
+		const result = (await authorizedRequest(
+			broker,
+			"session.create",
+			{ cwd: workspace, stateRoot: path.join(workspace, ".gjc", "state"), readinessTimeoutMs: 2_000 },
+			"workspace-swap",
+		)) as { ok: false; error: { code: string } };
+		expect(result.ok).toBe(false);
+		expect(swapped).toBe(true);
+		expect(result.error.code).toBe("endpoint_stale");
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 10_000);
+
+test("broker rejects a source transcript tampered with restored stat via sha256 digest", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-source-tamper-"));
+	const agentDir = path.join(root, "agent");
+	const cwd = path.join(root, "repo");
+	await fs.mkdir(cwd, { recursive: true });
+	const session = SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir));
+	const broker = new Broker({ agentDir });
+	try {
+		await session.ensureOnDisk();
+		const sessionPath = session.getSessionFile();
+		if (!sessionPath) throw new Error("Expected saved source session path.");
+		const captured = SessionManager.captureTranscriptStrict(sessionPath);
+		if (captured.kind !== "captured") throw new Error("Expected captured source transcript.");
+		const original = captured.snapshot.identity;
+		// Tamper in-place: different content of the same length, then restore stat
+		// (dev/ino unchanged; mtime restored to nanosecond precision) so only the
+		// sha256 content digest differs.
+		const content = await fs.readFile(sessionPath, "utf8");
+		const tampered = `${content.slice(0, -1)}\t`;
+		await fs.writeFile(sessionPath, tampered);
+		const seconds = Number(original.mtimeNs) / 1_000_000_000;
+		await fs.utimes(sessionPath, seconds, seconds);
+		expect(
+			await authorizedRequest(
+				broker,
+				"session.fork",
+				{
+					cwd,
+					stateRoot: path.join(cwd, ".gjc", "state"),
+					sourceSessionId: session.getSessionId(),
+					sourceSessionPath: sessionPath,
+					sourceSessionIdentity: {
+						dev: original.dev.toString(),
+						ino: original.ino.toString(),
+						size: original.size,
+						mtimeMs: original.mtimeMs,
+						mtimeNs: original.mtimeNs.toString(),
+						sha256: original.sha256,
+					},
+				},
+				"source-tamper",
+			),
+		).toMatchObject({
+			ok: false,
+			error: { code: "endpoint_stale", message: "Saved session transcript identity is stale or missing." },
+		});
+	} finally {
+		await session.close();
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 10_000);
+
+test("broker rejects a resumed destination transcript replaced before ready", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-dest-replace-"));
+	const agentDir = path.join(root, "agent");
+	const cwd = path.join(root, "repo");
+	await fs.mkdir(cwd, { recursive: true });
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const session = SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir));
+	const fixture = path.join(agentDir, "dest-fixture.js");
+	const pidPath = path.join(agentDir, "dest.pid");
+	const requestPath = path.join(agentDir, "dest.request.json");
+	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	let fixturePid = 0;
+	const broker = new Broker({ agentDir });
+	try {
+		await session.ensureOnDisk();
+		const sessionPath = session.getSessionFile();
+		if (!sessionPath) throw new Error("Expected saved session path.");
+		const sessionId = session.getSessionId();
+		const captured = SessionManager.captureTranscriptStrict(sessionPath);
+		if (captured.kind !== "captured") throw new Error("Expected captured transcript.");
+		const originalSha256 = captured.snapshot.identity.sha256;
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(fixture, lifecycleWitnessFixtureSource(pidPath, requestPath));
+		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${fixture}`;
+		await broker.start();
+		const lifecycle = authorizedRequest(
+			broker,
+			"session.resume",
+			{
+				sessionId,
+				sessionPath,
+				sessionIdentity: {
+					dev: captured.snapshot.identity.dev.toString(),
+					ino: captured.snapshot.identity.ino.toString(),
+					size: captured.snapshot.identity.size,
+					mtimeMs: captured.snapshot.identity.mtimeMs,
+					mtimeNs: captured.snapshot.identity.mtimeNs.toString(),
+					sha256: captured.snapshot.identity.sha256,
+				},
+				cwd,
+				stateRoot,
+				readinessTimeoutMs: 2_000,
+			},
+			"dest-replace",
+		);
+		const request = await waitFor(async () => {
+			try {
+				return JSON.parse(await fs.readFile(requestPath, "utf8")) as { effectMarker?: string; sessionId?: string };
+			} catch {
+				return undefined;
+			}
+		}, "destination fixture request");
+		fixturePid = Number(await fs.readFile(pidPath, "utf8"));
+		const incarnationValue = processIncarnation(fixturePid);
+		if (!incarnationValue || !request.effectMarker || !request.sessionId)
+			throw new Error("Expected a durable destination fixture identity.");
+		// Replace the resumed destination content before the ready witness is written.
+		const content = await fs.readFile(sessionPath, "utf8");
+		await fs.writeFile(sessionPath, `${content}\n`);
+		const workspaceStat = await fs.stat(cwd, { bigint: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${request.sessionId}.lifecycle.ready.json`),
+			JSON.stringify({
+				pid: fixturePid,
+				effectMarker: request.effectMarker,
+				incarnation: incarnationValue,
+				workspaceIdentity: { dev: workspaceStat.dev.toString(), ino: workspaceStat.ino.toString() },
+				sourceTranscriptDigest: originalSha256,
+				destinationTranscript: {
+					dev: captured.snapshot.identity.dev.toString(),
+					ino: captured.snapshot.identity.ino.toString(),
+					size: captured.snapshot.identity.size,
+					mtimeMs: captured.snapshot.identity.mtimeMs,
+					mtimeNs: captured.snapshot.identity.mtimeNs.toString(),
+					sha256: originalSha256,
+				},
+			}),
+		);
+		expect(await lifecycle).toMatchObject({ ok: false, error: { code: "readiness_timeout" } });
+		expect(() => process.kill(fixturePid, 0)).toThrow();
+	} finally {
+		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		if (fixturePid)
+			try {
+				process.kill(fixturePid, "SIGKILL");
+			} catch {}
+		await session.close();
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 15_000);
+
+test("broker rejects a ready witness whose workspace identity does not bind", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-witness-mismatch-"));
+	const agentDir = path.join(root, "agent");
+	const cwd = path.join(root, "repo");
+	await fs.mkdir(cwd, { recursive: true });
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const fixture = path.join(agentDir, "witness-fixture.js");
+	const pidPath = path.join(agentDir, "witness.pid");
+	const requestPath = path.join(agentDir, "witness.request.json");
+	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	let fixturePid = 0;
+	const broker = new Broker({ agentDir });
+	try {
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(fixture, lifecycleWitnessFixtureSource(pidPath, requestPath));
+		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${fixture}`;
+		await broker.start();
+		const lifecycle = authorizedRequest(
+			broker,
+			"session.create",
+			{ cwd, stateRoot, readinessTimeoutMs: 2_000 },
+			"witness-mismatch",
+		);
+		const request = await waitFor(async () => {
+			try {
+				return JSON.parse(await fs.readFile(requestPath, "utf8")) as { effectMarker?: string; sessionId?: string };
+			} catch {
+				return undefined;
+			}
+		}, "witness fixture request");
+		fixturePid = Number(await fs.readFile(pidPath, "utf8"));
+		const incarnationValue = processIncarnation(fixturePid);
+		if (!incarnationValue || !request.effectMarker || !request.sessionId)
+			throw new Error("Expected a durable witness fixture identity.");
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${request.sessionId}.lifecycle.ready.json`),
+			JSON.stringify({
+				pid: fixturePid,
+				effectMarker: request.effectMarker,
+				incarnation: incarnationValue,
+				workspaceIdentity: { dev: "1", ino: "2" },
+			}),
+		);
+		expect(await lifecycle).toMatchObject({ ok: false, error: { code: "readiness_timeout" } });
+		expect(() => process.kill(fixturePid, 0)).toThrow();
+	} finally {
+		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		if (fixturePid)
+			try {
+				process.kill(fixturePid, "SIGKILL");
+			} catch {}
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 15_000);

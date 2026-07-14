@@ -18,13 +18,17 @@ export async function getBrokerIdentityKey(agentDir: string): Promise<string> {
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		const key = randomBytes(32).toString("hex");
+		const temporary = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
 		try {
-			await fs.writeFile(file, `${key}\n`, { encoding: "utf8", mode: MODE, flag: "wx" });
-			await fs.chmod(file, MODE);
+			await fs.writeFile(temporary, `${key}\n`, { encoding: "utf8", mode: MODE, flag: "wx" });
+			await fs.chmod(temporary, MODE);
+			await fs.link(temporary, file);
 			return key;
 		} catch (writeError) {
 			if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") throw writeError;
 			return getBrokerIdentityKey(agentDir);
+		} finally {
+			await fs.rm(temporary, { force: true });
 		}
 	}
 }

@@ -2036,20 +2036,72 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		});
 	}
 
+	/**
+	 * Broker lifecycle operations that mutate a cwd-bound workspace. Each requires a
+	 * fresh, owner-authenticated workspace grant obtained from a scoped session.list
+	 * immediately before the mutation. Mirrors the broker's cwd-bearing admission set.
+	 */
+	const BROKER_CWD_BEARING_LIFECYCLE_OPERATIONS = new Set([
+		"session.create",
+		"session.fork",
+		"session.resume",
+		"session.delete",
+	]);
+
+	/**
+	 * Boot-transient broker authority the coordinator derives per request from discovery
+	 * and a scoped session.list. Callers cannot supply or override these fields; any
+	 * caller-provided values are stripped before the request reaches the broker.
+	 */
+	const BROKER_TRANSIENT_AUTHORITY_FIELDS = new Set(["brokerOwnerId", "workspaceGrantId", "workspaceIdentity"]);
+
+	function brokerRequestWithOwner(input: Record<string, unknown>, ownerId: string): Record<string, unknown> {
+		const request: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(input))
+			if (!BROKER_TRANSIENT_AUTHORITY_FIELDS.has(key)) request[key] = value;
+		request.brokerOwnerId = ownerId;
+		return request;
+	}
+
 	async function brokerSession(
-		_cwd: string,
+		cwd: string,
 		operation: string,
 		input: Record<string, unknown>,
 		idempotencyKey?: string,
 	): Promise<unknown> {
 		const discovery = await readSdkBrokerDiscovery(services.getAgentDir?.() ?? getAgentDir());
 		if (!discovery) throw new SdkClientError("not_found", "SDK broker discovery is unavailable.");
+		// brokerOwnerId is the exact current boot owner proof; callers cannot override it.
+		const request = brokerRequestWithOwner(input, discovery.ownerId);
 		const client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
 			discovery.url,
 			discovery.token,
 		);
 		try {
-			return await client.global(operation, input, { ...(idempotencyKey ? { idempotencyKey } : {}) });
+			if (BROKER_CWD_BEARING_LIFECYCLE_OPERATIONS.has(operation)) {
+				const workspace = optionalString(request.cwd) ?? optionalString(cwd);
+				if (!workspace) throw new SdkClientError("invalid_input", "Lifecycle operation requires a workspace cwd.");
+				// Obtain a fresh workspace grant from a scoped, owner-authenticated session.list
+				// immediately before the mutation. workspaceGrantId and the {dev,ino} identity are
+				// boot-transient and must be re-derived per request; callers cannot supply them.
+				const listing = brokerResult(
+					await client.global("session.list", brokerRequestWithOwner({ cwd: workspace }, discovery.ownerId)),
+				);
+				const workspaceGrantId = optionalString(listing.workspaceGrantId);
+				const workspaceIdentity = asRecord(listing.workspaceIdentity);
+				if (
+					!workspaceGrantId ||
+					!workspaceIdentity ||
+					typeof workspaceIdentity.dev !== "string" ||
+					workspaceIdentity.dev.length === 0 ||
+					typeof workspaceIdentity.ino !== "string" ||
+					workspaceIdentity.ino.length === 0
+				)
+					throw new SdkClientError("endpoint_stale", "Scoped session.list returned no usable workspace grant.");
+				request.workspaceGrantId = workspaceGrantId;
+				request.workspaceIdentity = { dev: workspaceIdentity.dev, ino: workspaceIdentity.ino };
+			}
+			return await client.global(operation, request, { ...(idempotencyKey ? { idempotencyKey } : {}) });
 		} finally {
 			await client.close();
 		}

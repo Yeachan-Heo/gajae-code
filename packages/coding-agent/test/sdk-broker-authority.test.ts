@@ -2,7 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { Broker } from "../src/sdk/broker/broker";
+import { WorkspaceCapability } from "../src/sdk/broker/authority";
+import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
 import { endpointIncarnation, SessionIndex } from "../src/sdk/broker/session-index";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -16,6 +17,26 @@ const temp = async () => {
 afterEach(async () => {
 	for (const dir of directories.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 });
+/** Bigint {dev,ino} identity of a workspace directory, matching the broker contract. */
+const workspaceIdentity = async (dir: string) => {
+	const stat = await fs.stat(dir, { bigint: true });
+	return { dev: stat.dev.toString(), ino: stat.ino.toString() };
+};
+/** Interns a workspace grant for cwd via session.list and returns its id + identity. */
+const listWorkspaceGrant = async (
+	broker: Broker,
+	cwd: string,
+): Promise<{ grantId: string; identity: { dev: string; ino: string } }> => {
+	const response = await broker.handleRequest("session.list", { brokerOwnerId: broker.ownerId, cwd });
+	if (!response.ok) throw new Error("expected session.list to succeed");
+	const result = response.result as {
+		workspaceGrantId?: string;
+		workspaceIdentity?: { dev: string; ino: string };
+	};
+	if (!result.workspaceGrantId || !result.workspaceIdentity)
+		throw new Error("expected broker to issue a workspace grant");
+	return { grantId: result.workspaceGrantId, identity: result.workspaceIdentity };
+};
 
 /** Reference formula: sorted-key JSON.stringify over the authority tuple. */
 const incarnation = (sessionId: string, generation: number, mtimeMs: number, pid: number) =>
@@ -165,6 +186,7 @@ test("scoped session.list issues a realpath canonicalCwd resolving lexical alias
 	await broker.index.open();
 	try {
 		const aliased = await broker.handleRequest("session.list", {
+			brokerOwnerId: broker.ownerId,
 			cwd: path.join(workspace, "."),
 		});
 		expect(aliased.ok).toBe(true);
@@ -172,7 +194,11 @@ test("scoped session.list issues a realpath canonicalCwd resolving lexical alias
 		const aliasedResult = aliased.result as { canonicalCwd?: string };
 		const real = await fs.realpath(workspace);
 		expect(aliasedResult.canonicalCwd).toBe(real);
+		expect((aliased.result as { workspaceIdentity?: { dev: string; ino: string } }).workspaceIdentity).toEqual(
+			await workspaceIdentity(workspace),
+		);
 		const direct = await broker.handleRequest("session.list", {
+			brokerOwnerId: broker.ownerId,
 			cwd: workspace,
 		});
 		expect(direct.ok).toBe(true);
@@ -188,10 +214,11 @@ test("scoped session.list omits canonicalCwd when cwd is absent (wire compatibil
 	const broker = new Broker({ agentDir: dir });
 	await broker.index.open();
 	try {
-		const response = await broker.handleRequest("session.list", {});
+		const response = await broker.handleRequest("session.list", { brokerOwnerId: broker.ownerId });
 		expect(response.ok).toBe(true);
 		if (!response.ok) throw new Error("expected ok");
 		expect((response.result as { canonicalCwd?: string }).canonicalCwd).toBeUndefined();
+		expect((response.result as { workspaceIdentity?: unknown }).workspaceIdentity).toBeUndefined();
 	} finally {
 		await broker.stop();
 	}
@@ -211,6 +238,7 @@ test("scoped session.list exposes immutable transcript identity for a saved sess
 	await broker.index.open();
 	try {
 		const response = await broker.handleRequest("session.list", {
+			brokerOwnerId: broker.ownerId,
 			cwd: workspace,
 			resolveSessionId: sessionId,
 		});
@@ -218,6 +246,7 @@ test("scoped session.list exposes immutable transcript identity for a saved sess
 		if (!response.ok) throw new Error("expected ok");
 		const result = response.result as {
 			canonicalCwd?: string;
+			workspaceIdentity?: { dev: string; ino: string };
 			savedSession?: {
 				id: string;
 				path: string;
@@ -227,10 +256,12 @@ test("scoped session.list exposes immutable transcript identity for a saved sess
 					size: number;
 					mtimeMs: number;
 					mtimeNs: string;
+					sha256: string;
 				};
 			};
 		};
 		expect(result.canonicalCwd).toBe(await fs.realpath(workspace));
+		expect(result.workspaceIdentity).toEqual(await workspaceIdentity(workspace));
 		expect(result.savedSession?.id).toBe(sessionId);
 		expect(result.savedSession?.path).toBe(sessionPath);
 		const identity = result.savedSession?.sessionIdentity;
@@ -242,6 +273,9 @@ test("scoped session.list exposes immutable transcript identity for a saved sess
 			size: Number(stat.size),
 			mtimeMs: Number(stat.mtimeMs),
 			mtimeNs: stat.mtimeNs.toString(),
+			sha256: createHash("sha256")
+				.update(await fs.readFile(sessionPath))
+				.digest("hex"),
 		});
 	} finally {
 		await broker.stop();
@@ -276,6 +310,7 @@ test("broker session.list exposes live duplicate observations without destabiliz
 		}),
 	);
 	const response = await broker.handleRequest("session.list", {
+		brokerOwnerId: broker.ownerId,
 		cwd: workspaceA,
 	});
 	expect(response.ok).toBe(true);
@@ -317,7 +352,10 @@ test("foreign workspace observations never inherit requested-workspace saved aut
 				endpointMtimeMs: 1000,
 			}),
 		);
-		const foreignResponse = await broker.handleRequest("session.list", { cwd: workspaceB });
+		const foreignResponse = await broker.handleRequest("session.list", {
+			brokerOwnerId: broker.ownerId,
+			cwd: workspaceB,
+		});
 		if (!foreignResponse.ok) throw new Error("expected foreign observation list");
 		const foreignResult = foreignResponse.result as {
 			observations: Array<{
@@ -333,6 +371,7 @@ test("foreign workspace observations never inherit requested-workspace saved aut
 		expect(foreign?.sessionIdentity).toBeUndefined();
 
 		const foreignResolve = await broker.handleRequest("session.list", {
+			brokerOwnerId: broker.ownerId,
 			cwd: workspaceB,
 			resolveSessionId: sessionId,
 		});
@@ -340,6 +379,7 @@ test("foreign workspace observations never inherit requested-workspace saved aut
 		expect((foreignResolve.result as { savedSession?: unknown }).savedSession).toBeUndefined();
 
 		const ownedResolve = await broker.handleRequest("session.list", {
+			brokerOwnerId: broker.ownerId,
 			cwd: workspaceA,
 			resolveSessionId: sessionId,
 		});
@@ -359,6 +399,7 @@ test("close idempotency identities are scoped to endpoint incarnation", async ()
 	await broker.handleRequest(
 		"session.close",
 		{
+			brokerOwnerId: broker.ownerId,
 			sessionId: "successor",
 			endpointGeneration: 1,
 			endpointIncarnation: firstIncarnation,
@@ -369,6 +410,7 @@ test("close idempotency identities are scoped to endpoint incarnation", async ()
 		"session.close",
 		{
 			sessionId: "successor",
+			brokerOwnerId: broker.ownerId,
 			endpointGeneration: 2,
 			endpointIncarnation: secondIncarnation,
 		},
@@ -388,8 +430,10 @@ test("saved lifecycle idempotency identities are scoped to full transcript ident
 	const workspace = path.join(root, "workspace");
 	const transcriptPath = path.join(workspace, "saved.jsonl");
 	await fs.mkdir(workspace, { recursive: true });
+	const wsIdentity = await workspaceIdentity(workspace);
 	const broker = new Broker({ agentDir: root });
 	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	const grant = await listWorkspaceGrant(broker, workspace);
 	const first = { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5" };
 	const second = { ...first, size: 6, mtimeMs: 7, mtimeNs: "8" };
 	const requests: Array<[string, Record<string, unknown>]> = [
@@ -425,9 +469,15 @@ test("saved lifecycle idempotency identities are scoped to full transcript ident
 		],
 	];
 	for (const [operation, input] of requests) {
-		await broker.handleRequest(operation, input, "same-key");
+		const owned = {
+			...input,
+			brokerOwnerId: broker.ownerId,
+			workspaceIdentity: wsIdentity,
+			workspaceGrantId: grant.grantId,
+		};
+		await broker.handleRequest(operation, owned, "same-key");
 		const identityField = operation === "session.fork" ? "sourceSessionIdentity" : "sessionIdentity";
-		await broker.handleRequest(operation, { ...input, [identityField]: second }, "same-key");
+		await broker.handleRequest(operation, { ...owned, [identityField]: second }, "same-key");
 	}
 	const entries = (await fs.readFile(path.join(root, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
 		.split("\n")
@@ -497,13 +547,17 @@ test("delete rejects a recreated transcript before any deletion effect", async (
 	await fs.appendFile(sessionPath, "\n");
 	const broker = new Broker({ agentDir });
 	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	const grant = await listWorkspaceGrant(broker, workspace);
 	const response = await broker.handleRequest(
 		"session.delete",
 		{
+			brokerOwnerId: broker.ownerId,
 			sessionId,
 			sessionPath,
 			sessionIdentity: staleIdentity,
 			cwd: workspace,
+			workspaceGrantId: grant.grantId,
+			workspaceIdentity: grant.identity,
 			target: { path: workspace },
 		},
 		"delete-stale-transcript",
@@ -528,6 +582,7 @@ test("session.list exposes immutable broker identity from the running discovery"
 		packageGeneration: "test-generation",
 		ownerId: "owner-abc",
 		pid: process.pid,
+		incarnation: "test-incarnation",
 		host: "127.0.0.1",
 		port: 9,
 		url: "ws://127.0.0.1:9",
@@ -536,7 +591,7 @@ test("session.list exposes immutable broker identity from the running discovery"
 		heartbeatAt: 42_000,
 	};
 	try {
-		const response = await broker.handleRequest("session.list", {});
+		const response = await broker.handleRequest("session.list", { brokerOwnerId: "owner-abc" });
 		expect(response.ok).toBe(true);
 		if (!response.ok) throw new Error("expected ok");
 		const result = response.result as {
@@ -575,18 +630,22 @@ test("resume rejects a stale saved-session identity before any launch effect", a
 		mtimeMs: Number(stat.mtimeMs),
 		mtimeNs: stat.mtimeNs.toString(),
 	};
-	// In-place modification after initial authority: same dev/ino, changed size/mtime.
-	await fs.appendFile(sessionPath, `${JSON.stringify({ type: "user", content: "tamper" })}\n`);
 	const broker = new Broker({ agentDir });
 	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	const grant = await listWorkspaceGrant(broker, workspace);
+	// In-place modification after grant issuance: same dev/ino, changed size/mtime.
+	await fs.appendFile(sessionPath, `${JSON.stringify({ type: "user", content: "tamper" })}\n`);
 	try {
 		const response = await broker.handleRequest(
 			"session.resume",
 			{
 				sessionId,
+				brokerOwnerId: broker.ownerId,
 				sessionPath,
 				sessionIdentity: staleIdentity,
 				cwd: workspace,
+				workspaceGrantId: grant.grantId,
+				workspaceIdentity: grant.identity,
 				target: { path: workspace },
 			},
 			"resume-stale-identity",
@@ -619,17 +678,21 @@ test("fork rejects a stale source-session identity before any launch effect", as
 		mtimeMs: Number(stat.mtimeMs),
 		mtimeNs: stat.mtimeNs.toString(),
 	};
-	await fs.appendFile(sessionPath, `${JSON.stringify({ type: "user", content: "tamper" })}\n`);
 	const broker = new Broker({ agentDir });
 	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	const grant = await listWorkspaceGrant(broker, workspace);
+	await fs.appendFile(sessionPath, `${JSON.stringify({ type: "user", content: "tamper" })}\n`);
 	try {
 		const response = await broker.handleRequest(
 			"session.fork",
 			{
 				sourceSessionId: sessionId,
+				brokerOwnerId: broker.ownerId,
 				sourceSessionPath: sessionPath,
 				sourceSessionIdentity: staleIdentity,
 				cwd: workspace,
+				workspaceGrantId: grant.grantId,
+				workspaceIdentity: grant.identity,
 				target: { path: workspace },
 			},
 			"fork-stale-identity",
@@ -641,5 +704,350 @@ test("fork rejects a stale source-session identity before any launch effect", as
 		expect(await fs.stat(sessionPath)).toBeDefined();
 	} finally {
 		await broker.stop();
+	}
+});
+
+test("missing brokerOwnerId is rejected before any side effect", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	await fs.mkdir(workspace, { recursive: true });
+	const broker = new Broker({ agentDir: root });
+	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	try {
+		expect(await broker.handleRequest("session.list", { cwd: workspace })).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "brokerOwnerId must be a non-empty string" },
+		});
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "missing" })).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "brokerOwnerId must be a non-empty string" },
+		});
+		expect(await broker.handleRequest("session.create", { cwd: workspace }, "missing-owner-create")).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "brokerOwnerId must be a non-empty string" },
+		});
+		const ledger = await fs.readFile(path.join(root, "sdk", "lifecycle-ledger.jsonl"), "utf8").catch(() => "");
+		expect(ledger.trim()).toBe("");
+	} finally {
+		await broker.stop();
+	}
+});
+
+test("wrong brokerOwnerId is rejected before any index, endpoint, or ledger effect", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	await fs.mkdir(workspace, { recursive: true });
+	const broker = new Broker({ agentDir: root, packageGeneration: "test" });
+	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	try {
+		for (const [operation, input, key] of [
+			["session.list", { cwd: workspace }, undefined],
+			["session.get_endpoint", { sessionId: "missing" }, undefined],
+			["session.create", { cwd: workspace }, "wrong-owner-create"],
+		] as Array<[string, Record<string, unknown>, string | undefined]>) {
+			expect(await broker.handleRequest(operation, { ...input, brokerOwnerId: "wrong-owner" }, key)).toEqual({
+				ok: false,
+				error: { code: "endpoint_stale", message: "broker boot authority is stale" },
+			});
+		}
+		const ledger = await fs.readFile(path.join(root, "sdk", "lifecycle-ledger.jsonl"), "utf8").catch(() => "");
+		expect(ledger.trim()).toBe("");
+	} finally {
+		await broker.stop();
+	}
+});
+
+test("lifecycle workspace grant admission rejects a missing grant id before the ledger", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const transcriptPath = path.join(workspace, "saved.jsonl");
+	await fs.mkdir(workspace, { recursive: true });
+	const broker = new Broker({ agentDir: root });
+	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	try {
+		const response = await broker.handleRequest(
+			"session.delete",
+			{
+				brokerOwnerId: broker.ownerId,
+				sessionId: "saved",
+				sessionPath: transcriptPath,
+				sessionIdentity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5" },
+				cwd: workspace,
+				workspaceIdentity: await workspaceIdentity(workspace),
+				target: { path: workspace },
+			},
+			"missing-workspace-grant",
+		);
+		expect(response).toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "workspace grant id is stale or missing" },
+		});
+		const ledger = await fs.readFile(path.join(root, "sdk", "lifecycle-ledger.jsonl"), "utf8").catch(() => "");
+		expect(ledger.trim()).toBe("");
+	} finally {
+		await broker.stop();
+	}
+});
+
+test("lifecycle workspace grant admission rejects an unknown grant id before the ledger", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const transcriptPath = path.join(workspace, "saved.jsonl");
+	await fs.mkdir(workspace, { recursive: true });
+	const broker = new Broker({ agentDir: root });
+	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	try {
+		const response = await broker.handleRequest(
+			"session.delete",
+			{
+				brokerOwnerId: broker.ownerId,
+				sessionId: "saved",
+				sessionPath: transcriptPath,
+				sessionIdentity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5" },
+				cwd: workspace,
+				workspaceGrantId: "not-a-realized-grant",
+				workspaceIdentity: await workspaceIdentity(workspace),
+				target: { path: workspace },
+			},
+			"unknown-workspace-grant",
+		);
+		expect(response).toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "workspace grant id is stale or missing" },
+		});
+		const ledger = await fs.readFile(path.join(root, "sdk", "lifecycle-ledger.jsonl"), "utf8").catch(() => "");
+		expect(ledger.trim()).toBe("");
+	} finally {
+		await broker.stop();
+	}
+});
+
+test("lifecycle workspace grant admission revokes a mismatched identity before the ledger", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const transcriptPath = path.join(workspace, "saved.jsonl");
+	await fs.mkdir(workspace, { recursive: true });
+	const broker = new Broker({ agentDir: root });
+	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	try {
+		const grant = await listWorkspaceGrant(broker, workspace);
+		expect(broker.workspaceGrantsForTest()).toHaveLength(1);
+		const response = await broker.handleRequest(
+			"session.delete",
+			{
+				brokerOwnerId: broker.ownerId,
+				sessionId: "saved",
+				sessionPath: transcriptPath,
+				sessionIdentity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5" },
+				cwd: workspace,
+				workspaceGrantId: grant.grantId,
+				workspaceIdentity: { dev: "stale-dev", ino: "stale-ino" },
+				target: { path: workspace },
+			},
+			"mismatched-workspace-identity",
+		);
+		expect(response).toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "workspace identity is stale or missing" },
+		});
+		// The mismatched identity revoked the drifted grant before any ledger row.
+		expect(broker.workspaceGrantsForTest()).toHaveLength(0);
+		const ledger = await fs.readFile(path.join(root, "sdk", "lifecycle-ledger.jsonl"), "utf8").catch(() => "");
+		expect(ledger.trim()).toBe("");
+	} finally {
+		await broker.stop();
+	}
+});
+
+test("a workspace root swap revokes the retained grant before any lifecycle effect", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const transcriptPath = path.join(workspace, "saved.jsonl");
+	await fs.mkdir(workspace, { recursive: true });
+	const broker = new Broker({ agentDir: root });
+	await Promise.all([broker.index.open(), broker.ledger.open()]);
+	try {
+		// Intern a grant against the original root, then swap the directory entirely.
+		const grant = await listWorkspaceGrant(broker, workspace);
+		expect(broker.workspaceGrantsForTest()).toHaveLength(1);
+		const retained = broker.workspaceGrantsForTest()[0]!;
+		await fs.rm(workspace, { recursive: true, force: true });
+		await fs.mkdir(workspace, { recursive: true });
+		const response = await broker.handleRequest(
+			"session.delete",
+			{
+				brokerOwnerId: broker.ownerId,
+				sessionId: "saved",
+				sessionPath: transcriptPath,
+				sessionIdentity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5" },
+				cwd: workspace,
+				workspaceGrantId: grant.grantId,
+				workspaceIdentity: grant.identity,
+				target: { path: workspace },
+			},
+			"root-swap",
+		);
+		expect(response).toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "workspace root no longer binds to its grant" },
+		});
+		// The drifted grant was revoked before any ledger row, and its handle closed.
+		expect(broker.workspaceGrantsForTest()).toHaveLength(0);
+		expect(retained.capability.closed).toBe(true);
+		const ledger = await fs.readFile(path.join(root, "sdk", "lifecycle-ledger.jsonl"), "utf8").catch(() => "");
+		expect(ledger.trim()).toBe("");
+	} finally {
+		await broker.stop();
+	}
+});
+
+test("WorkspaceCapability retains its opened-directory identity and closes deterministically", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "ws");
+	await fs.mkdir(workspace, { recursive: true });
+	const capability = await WorkspaceCapability.open(workspace);
+	try {
+		expect(capability.canonicalCwd).toBe(await fs.realpath(workspace));
+		expect(capability.identity).toEqual(await workspaceIdentity(workspace));
+		expect(capability.closed).toBe(false);
+		// The retained handle still proves the original binding is live.
+		await capability.assertPathStillBound(workspace);
+	} finally {
+		await capability.close();
+	}
+	expect(capability.closed).toBe(true);
+	// A second close is a deterministic no-op.
+	await expect(capability.close()).resolves.toBeUndefined();
+});
+
+test("WorkspaceCapability rejects a path that no longer binds to the opened root", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const other = path.join(root, "other");
+	await Promise.all([fs.mkdir(workspace), fs.mkdir(other)]);
+	const capability = await WorkspaceCapability.open(workspace);
+	try {
+		await expect(capability.assertPathStillBound(other)).rejects.toThrow();
+	} finally {
+		await capability.close();
+	}
+});
+test("scoped session.list retains and reuses one workspace grant per bound root", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const other = path.join(root, "other");
+	await Promise.all([fs.mkdir(workspace), fs.mkdir(other)]);
+	const broker = new Broker({ agentDir: root });
+	await broker.index.open();
+	try {
+		const first = await listWorkspaceGrant(broker, workspace);
+		expect(broker.workspaceGrantsForTest()).toHaveLength(1);
+		expect(first.identity).toEqual(await workspaceIdentity(workspace));
+		// A repeated list for the same still-bound workspace reuses the grant; no
+		// redundant handle is retained (no per-list FD leak).
+		const second = await listWorkspaceGrant(broker, workspace);
+		expect(second.grantId).toBe(first.grantId);
+		expect(second.identity).toEqual(first.identity);
+		expect(broker.workspaceGrantsForTest()).toHaveLength(1);
+		expect(broker.workspaceGrantsForTest()[0]!.capability.closed).toBe(false);
+		// A distinct workspace interns a second, independent grant.
+		const foreign = await listWorkspaceGrant(broker, other);
+		expect(foreign.grantId).not.toBe(first.grantId);
+		expect(broker.workspaceGrantsForTest()).toHaveLength(2);
+	} finally {
+		await broker.stop();
+	}
+});
+
+test("broker stop closes all retained workspace grant handles", async () => {
+	const root = await temp();
+	const workspaceA = path.join(root, "workspace-a");
+	const workspaceB = path.join(root, "workspace-b");
+	await Promise.all([fs.mkdir(workspaceA), fs.mkdir(workspaceB)]);
+	const broker = new Broker({ agentDir: root });
+	await broker.index.open();
+	let grants: ReturnType<typeof broker.workspaceGrantsForTest>;
+	try {
+		await listWorkspaceGrant(broker, workspaceA);
+		await listWorkspaceGrant(broker, workspaceB);
+		grants = broker.workspaceGrantsForTest();
+		expect(grants).toHaveLength(2);
+		expect(grants.every(grant => !grant.capability.closed)).toBe(true);
+	} finally {
+		await broker.stop();
+	}
+	// After stop, the grant registry is cleared and every retained handle is closed.
+	expect(broker.workspaceGrantsForTest()).toHaveLength(0);
+	expect(grants.every(grant => grant.capability.closed)).toBe(true);
+});
+
+test("owner rotation keeps durable hashes reachable despite a new grant id", async () => {
+	const root = await temp();
+	const workspace = path.join(root, "workspace");
+	const transcriptPath = path.join(workspace, "saved.jsonl");
+	await fs.mkdir(workspace, { recursive: true });
+	const ledgerPath = path.join(root, "sdk", "lifecycle-ledger.jsonl");
+	const acceptedLedgerEntries = async () =>
+		(await fs.readFile(ledgerPath, "utf8").catch(() => ""))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { state: string })
+			.filter(entry => entry.state === "accepted");
+	// First boot: intern a grant and attempt a delete that fails inside the
+	// lifecycle effect (the transcript does not exist) but records a ledger row.
+	const brokerA = new Broker({ agentDir: root });
+	await Promise.all([brokerA.index.open(), brokerA.ledger.open()]);
+	let firstResponse: BrokerResponse;
+	let grantAId: string;
+	try {
+		const grantA = await listWorkspaceGrant(brokerA, workspace);
+		grantAId = grantA.grantId;
+		firstResponse = await brokerA.handleRequest(
+			"session.delete",
+			{
+				brokerOwnerId: brokerA.ownerId,
+				sessionId: "saved",
+				sessionPath: transcriptPath,
+				sessionIdentity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5" },
+				cwd: workspace,
+				workspaceGrantId: grantA.grantId,
+				workspaceIdentity: grantA.identity,
+				target: { path: workspace },
+			},
+			"rotation-replay",
+		);
+	} finally {
+		await brokerA.stop();
+	}
+	expect((firstResponse as { ok: boolean }).ok).toBe(false);
+	expect(await acceptedLedgerEntries()).toHaveLength(1);
+	// Second boot (new owner): list issues a brand-new grant id, but the durable
+	// request hash excludes the transient grant id and broker owner, so the same
+	// idempotency key replays the recorded outcome without re-executing the effect.
+	const brokerB = new Broker({ agentDir: root });
+	await Promise.all([brokerB.index.open(), brokerB.ledger.open()]);
+	try {
+		const grantB = await listWorkspaceGrant(brokerB, workspace);
+		expect(grantB.grantId).not.toBe(grantAId);
+		expect(brokerB.workspaceGrantsForTest()).toHaveLength(1);
+		const replay = await brokerB.handleRequest(
+			"session.delete",
+			{
+				brokerOwnerId: brokerB.ownerId,
+				sessionId: "saved",
+				sessionPath: transcriptPath,
+				sessionIdentity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5" },
+				cwd: workspace,
+				workspaceGrantId: grantB.grantId,
+				workspaceIdentity: grantB.identity,
+				target: { path: workspace },
+			},
+			"rotation-replay",
+		);
+		expect(replay).toEqual(firstResponse);
+		// No second ledger row: the durable hash matched across the owner rotation.
+		expect(await acceptedLedgerEntries()).toHaveLength(1);
+	} finally {
+		await brokerB.stop();
 	}
 });

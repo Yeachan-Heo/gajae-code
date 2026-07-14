@@ -119,8 +119,16 @@ type BrokerSession = {
 	endpointIncarnation?: string;
 	path?: string;
 	sessionIdentity?: SavedSessionIdentity;
+	workspaceIdentity?: WorkspaceIdentity;
 };
 
+/**
+ * Descriptor-bound workspace identity for an opened directory: stringified
+ * bigint `fstat` `{dev,ino}`. Additive broker evidence that binds a scope
+ * without making its lexical path authoritative; lifecycle calls echo it so the
+ * broker can rebind the descriptor, but it never overrides canonical cwd scope.
+ */
+type WorkspaceIdentity = { dev: string; ino: string };
 /**
  * Broker-issued transcript identity for a saved session. Mirrors the broker's
  * {@link SessionLifecycleTranscriptIdentity} so ACP can revalidate that the
@@ -132,6 +140,7 @@ type SavedSessionIdentity = {
 	size: number;
 	mtimeMs: number;
 	mtimeNs: string;
+	sha256: string;
 };
 type LiveSessionAuthority = {
 	endpointGeneration: number;
@@ -159,6 +168,8 @@ type SessionAuthority = {
 	live?: LiveSessionAuthority;
 	broker: BrokerIdentity;
 	saved?: SavedSessionAuthority;
+	workspaceIdentity?: WorkspaceIdentity;
+	workspaceGrantId?: string;
 };
 
 function parseAcpStartupOptions(value: unknown): AcpStartupOptions | undefined {
@@ -183,7 +194,7 @@ function object(value: unknown): JsonObject | undefined {
 function savedSessionIdentity(value: unknown): SavedSessionIdentity | undefined {
 	const candidate = object(value);
 	if (!candidate) return undefined;
-	const { dev, ino, size, mtimeMs, mtimeNs } = candidate;
+	const { dev, ino, size, mtimeMs, mtimeNs, sha256 } = candidate;
 	if (
 		typeof dev !== "string" ||
 		!/^\d+$/.test(dev) ||
@@ -196,10 +207,12 @@ function savedSessionIdentity(value: unknown): SavedSessionIdentity | undefined 
 		!Number.isFinite(mtimeMs) ||
 		mtimeMs < 0 ||
 		typeof mtimeNs !== "string" ||
-		!/^\d+$/.test(mtimeNs)
+		!/^\d+$/.test(mtimeNs) ||
+		typeof sha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(sha256)
 	)
 		return undefined;
-	return { dev, ino, size, mtimeMs, mtimeNs };
+	return { dev, ino, size, mtimeMs, mtimeNs, sha256 };
 }
 
 /** Live endpoint authority exposed by the broker for indexed live sessions. */
@@ -225,6 +238,18 @@ function savedAuthority(value: unknown): SavedSessionAuthority | undefined {
 	const identity = savedSessionIdentity(candidate?.sessionIdentity);
 	if (typeof sessionPath !== "string" || !sessionPath || !identity) return undefined;
 	return { path: sessionPath, identity };
+}
+/** Descriptor-bound workspace identity (stringified bigint fstat {dev,ino}) exposed alongside canonicalCwd. */
+function workspaceIdentity(value: unknown): WorkspaceIdentity | undefined {
+	const candidate = object(value);
+	const dev = candidate?.dev;
+	const ino = candidate?.ino;
+	if (typeof dev !== "string" || !/^\d+$/.test(dev) || typeof ino !== "string" || !/^\d+$/.test(ino)) return undefined;
+	return { dev, ino };
+}
+/** Broker-issued, boot-transient workspace grant id exposed alongside canonicalCwd. */
+function workspaceGrantId(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 /** Broker boot identity exposed by discovery and every session.list result. */
 function brokerIdentity(value: unknown): BrokerIdentity | undefined {
@@ -267,7 +292,8 @@ function sameSavedIdentity(left: SavedSessionIdentity, right: SavedSessionIdenti
 		left.ino === right.ino &&
 		left.size === right.size &&
 		left.mtimeMs === right.mtimeMs &&
-		left.mtimeNs === right.mtimeNs
+		left.mtimeNs === right.mtimeNs &&
+		left.sha256 === right.sha256
 	);
 }
 
@@ -753,6 +779,8 @@ export class AcpAgent implements Agent {
 	readonly #ambiguousSessionIds = new Set<string>();
 	readonly #sessionEpochs = new Map<string, number>();
 	readonly #tearingDown = new Map<string, number>();
+	readonly #sessionTombstones = new Set<string>();
+	#poisoned = false;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#brokerIdentity: BrokerIdentity | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
@@ -826,11 +854,16 @@ export class AcpAgent implements Agent {
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
 		this.#assertNoMcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
+		this.#assertConnectionNotPoisoned();
+		const workspace = await this.#workspaceAuthority(params.cwd);
 		const result = await (await this.#brokerAdapter()).global(
 			"session.create",
 			{
 				cwd: params.cwd,
 				target: { path: params.cwd },
+				brokerOwnerId: this.#requireBrokerIdentity().ownerId,
+				workspaceIdentity: workspace.identity,
+				workspaceGrantId: workspace.grantId,
 				...(this.#startupOptions?.modelPreset ? { modelPreset: this.#startupOptions.modelPreset } : {}),
 			},
 			randomUUID(),
@@ -868,7 +901,9 @@ export class AcpAgent implements Agent {
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
 		this.#assertNoMcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
+		this.#assertConnectionNotPoisoned();
 		const source = await this.#resolveSavedSession(params.sessionId, params.cwd);
+		const sourceAuthority = this.#sessionAuthority.get(params.sessionId);
 		const result = await (await this.#brokerAdapter()).global(
 			"session.fork",
 			{
@@ -878,6 +913,8 @@ export class AcpAgent implements Agent {
 				sourceSessionIdentity: source.identity,
 				brokerOwnerId: this.#sessionBrokerOwnerId(params.sessionId),
 				target: { path: params.cwd },
+				...(sourceAuthority?.workspaceIdentity ? { workspaceIdentity: sourceAuthority.workspaceIdentity } : {}),
+				...(sourceAuthority?.workspaceGrantId ? { workspaceGrantId: sourceAuthority.workspaceGrantId } : {}),
 			},
 			randomUUID(),
 		);
@@ -895,9 +932,12 @@ export class AcpAgent implements Agent {
 
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		if (params.cwd) this.#assertAbsoluteCwd(params.cwd);
+		this.#assertConnectionNotPoisoned();
 		const offset = this.#cursor(params.cursor);
+		const adapter = await this.#brokerAdapter();
+		const brokerOwnerId = this.#requireBrokerIdentity().ownerId;
 		const response = object(
-			await (await this.#brokerAdapter()).global("session.list", params.cwd ? { cwd: params.cwd } : undefined),
+			await adapter.global("session.list", params.cwd ? { cwd: params.cwd, brokerOwnerId } : { brokerOwnerId }),
 		);
 		const listing = object(response?.result) ?? response;
 		this.#observeBrokerIdentity(listing);
@@ -910,6 +950,8 @@ export class AcpAgent implements Agent {
 				: params.cwd
 					? path.resolve(params.cwd)
 					: undefined;
+		const scopeWorkspace = workspaceIdentity(listing?.workspaceIdentity);
+		const scopeGrantId = workspaceGrantId(listing?.workspaceGrantId);
 		const observed = new Map<string, { count: number; scopes: Set<string> }>();
 		for (const value of observations) {
 			const candidate = object(value) as BrokerSession | undefined;
@@ -934,17 +976,38 @@ export class AcpAgent implements Agent {
 			conflictingIds.add(id);
 		}
 		if (canonicalCwd) {
-			const bindings = new Map<string, BrokerSession>();
+			// All-or-nothing: stage every in-scope binding against an immutable clone
+			// and commit only after the whole batch validates. Any authority failure
+			// permanently poisons the connection so no partial authority is published.
+			const staging = new Map(this.#sessionAuthority);
+			const order: string[] = [];
 			for (const value of listed) {
 				const candidate = object(value) as BrokerSession | undefined;
 				if (typeof candidate?.sessionId !== "string") continue;
 				if (brokerSessionScope(candidate) !== canonicalCwd) continue;
-				if (conflictingIds.has(candidate.sessionId))
+				if (conflictingIds.has(candidate.sessionId)) {
+					this.#poisonConnection();
 					throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${candidate.sessionId}`);
-				this.#validateSessionAuthorityBinding(candidate.sessionId, canonicalCwd);
-				bindings.set(candidate.sessionId, candidate);
+				}
+				try {
+					staging.set(
+						candidate.sessionId,
+						this.#stageSessionAuthority(
+							staging,
+							candidate.sessionId,
+							canonicalCwd,
+							candidate,
+							scopeWorkspace,
+							scopeGrantId,
+						),
+					);
+					order.push(candidate.sessionId);
+				} catch (error) {
+					this.#poisonConnection();
+					throw error;
+				}
 			}
-			for (const [id, session] of bindings) this.#captureAuthority(id, canonicalCwd, session);
+			for (const id of order) this.#sessionAuthority.set(id, staging.get(id)!);
 		}
 		return paginateAcpSessions(listed, canonicalCwd ?? params.cwd ?? undefined, offset);
 	}
@@ -962,6 +1025,7 @@ export class AcpAgent implements Agent {
 				this.#finishTeardown(params.sessionId);
 			}
 			this.#sessionAuthority.delete(params.sessionId);
+			this.#tombstoneSession(params.sessionId);
 			return {};
 		}
 		const current = await this.#currentLiveAuthority(params.sessionId, authority.canonicalCwd);
@@ -997,6 +1061,7 @@ export class AcpAgent implements Agent {
 			this.#finishTeardown(params.sessionId);
 		}
 		this.#sessionAuthority.delete(params.sessionId);
+		this.#tombstoneSession(params.sessionId);
 		if (failures.length > 0)
 			throw aggregateAcpFailure(
 				"terminal_uncertain",
@@ -1051,6 +1116,7 @@ export class AcpAgent implements Agent {
 			} catch (error) {
 				if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
 					this.#sessionAuthority.delete(params.sessionId);
+					this.#tombstoneSession(params.sessionId);
 					return {};
 				}
 				throw error;
@@ -1062,12 +1128,15 @@ export class AcpAgent implements Agent {
 					sessionPath: saved.path,
 					sessionIdentity: saved.identity,
 					brokerOwnerId: authority.broker.ownerId,
+					...(authority.workspaceIdentity ? { workspaceIdentity: authority.workspaceIdentity } : {}),
+					...(authority.workspaceGrantId ? { workspaceGrantId: authority.workspaceGrantId } : {}),
 					cwd,
 					target: { path: cwd },
 				},
 				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete", savedIdentityDigest(saved.identity)),
 			);
 			this.#sessionAuthority.delete(params.sessionId);
+			this.#tombstoneSession(params.sessionId);
 			return {};
 		} finally {
 			this.#finishTeardown(params.sessionId);
@@ -1196,7 +1265,15 @@ export class AcpAgent implements Agent {
 	async extMethod(method: string, params: JsonObject): Promise<JsonObject> {
 		try {
 			if (method === "_gjc/sdk/global") {
-				const result = await (await this.#brokerAdapter()).handle(method, params);
+				const adapter = await this.#brokerAdapter();
+				const input = object(params.input) ?? {};
+				const result = await adapter.handle(method, {
+					...params,
+					input: {
+						...input,
+						brokerOwnerId: this.#requireBrokerIdentity().ownerId,
+					},
+				});
 				return object(result) ?? {};
 			}
 			if (method === "_gjc/sdk/control" || method === "_gjc/sdk/query") {
@@ -1269,6 +1346,33 @@ export class AcpAgent implements Agent {
 			throw new AcpSdkAdapterError("conflict", `ACP session ${id} has ambiguous cwd authority.`);
 	}
 	/**
+	 * A tombstoned id (ambiguity or successful close/delete) can never rebind
+	 * authority on this connection. Checked only where new authority would be
+	 * captured, so local teardown of an unbound id still returns cleanly.
+	 */
+	#assertSessionNotTombstoned(id: string): void {
+		if (this.#sessionTombstones.has(id))
+			throw new AcpSdkAdapterError("conflict", `ACP session ${id} authority was permanently revoked.`);
+	}
+	/** Record a permanent per-id tombstone after a successful close or delete. */
+	#tombstoneSession(id: string): void {
+		this.#sessionTombstones.add(id);
+	}
+	/**
+	 * A poisoned connection can never capture new authority. Set when a scoped
+	 * session.list batch fails all-or-nothing validation; every authority-bearing
+	 * session is revoked synchronously so no attached or reverse capability
+	 * survives the failure.
+	 */
+	#assertConnectionNotPoisoned(): void {
+		if (this.#poisoned) throw new AcpSdkAdapterError("conflict", "ACP connection authority was permanently revoked.");
+	}
+	#poisonConnection(): void {
+		if (this.#poisoned) return;
+		this.#poisoned = true;
+		this.#markAllSessionsAmbiguous();
+	}
+	/**
 	 * Capture the broker boot identity from discovery or a session.list result.
 	 * Missing identity is fail-closed because no session authority may outlive or
 	 * cross an unidentified broker process.
@@ -1311,6 +1415,7 @@ export class AcpAgent implements Agent {
 	 */
 	#markSessionAmbiguous(id: string): void {
 		this.#sessionAuthority.delete(id);
+		this.#sessionTombstones.add(id);
 		if (this.#ambiguousSessionIds.has(id)) return;
 		this.#ambiguousSessionIds.add(id);
 		this.#advanceSessionEpoch(id);
@@ -1331,13 +1436,19 @@ export class AcpAgent implements Agent {
 
 	#validateSessionAuthorityBinding(id: string, canonicalCwd: string): void {
 		this.#assertSessionNotAmbiguous(id);
+		this.#assertSessionNotTombstoned(id);
 		const known = this.#sessionAuthority.get(id)?.canonicalCwd;
 		if (!known || path.resolve(known) === path.resolve(canonicalCwd)) return;
 		this.#markSessionAmbiguous(id);
 		throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
 	}
 
-	#bindSessionAuthority(id: string, canonicalCwd: string): void {
+	#bindSessionAuthority(
+		id: string,
+		canonicalCwd: string,
+		scopeWorkspace?: WorkspaceIdentity,
+		scopeGrantId?: string,
+	): void {
 		this.#validateSessionAuthorityBinding(id, canonicalCwd);
 		const existing = this.#sessionAuthority.get(id);
 		const observedBroker = this.#requireBrokerIdentity();
@@ -1350,12 +1461,27 @@ export class AcpAgent implements Agent {
 			broker: observedBroker,
 			live: existing?.live,
 			saved: existing?.saved,
+			workspaceIdentity: existing?.workspaceIdentity ?? scopeWorkspace,
+			workspaceGrantId: existing?.workspaceGrantId ?? scopeGrantId,
 		});
 	}
 
-	/** Merge broker-issued live/saved authority from a scoped observation. */
-	#captureAuthority(id: string, canonicalCwd: string, session: BrokerSession): void {
-		const existing = this.#sessionAuthority.get(id);
+	/**
+	 * Pure validation + projection of a scoped broker observation against an
+	 * existing authority entry. Throws on cwd, broker, live, or saved drift;
+	 * never mutates connection state so callers can stage into an immutable clone.
+	 */
+	#computeSessionAuthority(
+		existing: SessionAuthority | undefined,
+		id: string,
+		canonicalCwd: string,
+		session: BrokerSession,
+		scopeWorkspace: WorkspaceIdentity | undefined,
+		scopeGrantId: string | undefined,
+	): SessionAuthority {
+		const known = existing?.canonicalCwd;
+		if (known && path.resolve(known) !== path.resolve(canonicalCwd))
+			throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
 		const observedLive = liveAuthority(session);
 		const observedSaved = savedAuthority(session);
 		const observedBroker = this.#requireBrokerIdentity();
@@ -1366,16 +1492,53 @@ export class AcpAgent implements Agent {
 				(existing.live.endpointGeneration !== observedLive.endpointGeneration ||
 					existing.live.endpointIncarnation !== observedLive.endpointIncarnation)) ||
 			(existing?.saved && observedSaved && !sameSavedIdentity(existing.saved.identity, observedSaved.identity))
-		) {
-			this.#markSessionAmbiguous(id);
+		)
 			throw new AcpSdkAdapterError("conflict", `ACP session ${id} authority changed after issuance.`);
-		}
-		this.#sessionAuthority.set(id, {
+		return {
 			canonicalCwd: path.resolve(canonicalCwd),
 			broker: observedBroker,
 			live: existing?.live ?? observedLive,
 			saved: existing?.saved ?? observedSaved,
-		});
+			workspaceIdentity: existing?.workspaceIdentity ?? scopeWorkspace,
+			workspaceGrantId: existing?.workspaceGrantId ?? scopeGrantId,
+		};
+	}
+
+	/** Merge broker-issued live/saved authority from a scoped observation. */
+	#captureAuthority(
+		id: string,
+		canonicalCwd: string,
+		session: BrokerSession,
+		scopeWorkspace?: WorkspaceIdentity,
+		scopeGrantId?: string,
+	): void {
+		this.#assertSessionNotTombstoned(id);
+		const existing = this.#sessionAuthority.get(id);
+		try {
+			this.#sessionAuthority.set(
+				id,
+				this.#computeSessionAuthority(existing, id, canonicalCwd, session, scopeWorkspace, scopeGrantId),
+			);
+		} catch (error) {
+			this.#markSessionAmbiguous(id);
+			throw error;
+		}
+	}
+
+	/**
+	 * Stage a binding into an immutable clone without mutating live authority, so
+	 * a scoped session.list batch commits only after every binding validates.
+	 */
+	#stageSessionAuthority(
+		staging: Map<string, SessionAuthority>,
+		id: string,
+		canonicalCwd: string,
+		session: BrokerSession,
+		scopeWorkspace: WorkspaceIdentity | undefined,
+		scopeGrantId: string | undefined,
+	): SessionAuthority {
+		this.#assertSessionNotTombstoned(id);
+		return this.#computeSessionAuthority(staging.get(id), id, canonicalCwd, session, scopeWorkspace, scopeGrantId);
 	}
 
 	#captureSavedAuthority(id: string, saved: SavedSessionAuthority): void {
@@ -1390,6 +1553,8 @@ export class AcpAgent implements Agent {
 			broker: existing.broker,
 			live: existing.live,
 			saved,
+			workspaceIdentity: existing.workspaceIdentity,
+			workspaceGrantId: existing.workspaceGrantId,
 		});
 	}
 
@@ -1457,6 +1622,12 @@ export class AcpAgent implements Agent {
 				sessionPath: saved.path,
 				sessionIdentity: saved.identity,
 				brokerOwnerId: this.#sessionBrokerOwnerId(id),
+				...(this.#sessionAuthority.get(id)?.workspaceIdentity
+					? { workspaceIdentity: this.#sessionAuthority.get(id)!.workspaceIdentity! }
+					: {}),
+				...(this.#sessionAuthority.get(id)?.workspaceGrantId
+					? { workspaceGrantId: this.#sessionAuthority.get(id)!.workspaceGrantId! }
+					: {}),
 				target: { path: cwd },
 			},
 			randomUUID(),
@@ -1467,13 +1638,40 @@ export class AcpAgent implements Agent {
 		await this.#attach(id, cwd, endpoint(result), epoch);
 	}
 
+	async #workspaceAuthority(
+		cwd: string,
+	): Promise<{ canonicalCwd: string; identity: WorkspaceIdentity; grantId: string }> {
+		const adapter = await this.#brokerAdapter();
+		const response = object(
+			await adapter.global("session.list", {
+				cwd,
+				brokerOwnerId: this.#requireBrokerIdentity().ownerId,
+			}),
+		);
+		const result = object(response?.result) ?? response;
+		this.#observeBrokerIdentity(result);
+		const canonicalCwd = typeof result?.canonicalCwd === "string" ? path.resolve(result.canonicalCwd) : undefined;
+		const identity = workspaceIdentity(result?.workspaceIdentity);
+		const grantId = workspaceGrantId(result?.workspaceGrantId);
+		if (!canonicalCwd || !identity || !grantId)
+			throw new AcpSdkAdapterError("unavailable", "SDK broker did not issue opened workspace authority.");
+		return { canonicalCwd, identity, grantId };
+	}
 	async #scopedBrokerSession(id: string, cwd: string): Promise<BrokerSession | undefined> {
 		this.#assertSessionNotAmbiguous(id);
-		const response = object(await (await this.#brokerAdapter()).global("session.list", { cwd }));
+		this.#assertConnectionNotPoisoned();
+		const response = object(
+			await (await this.#brokerAdapter()).global("session.list", {
+				cwd,
+				brokerOwnerId: this.#requireBrokerIdentity().ownerId,
+			}),
+		);
 		const result = object(response?.result) ?? response;
 		this.#observeBrokerIdentity(result);
 		const canonicalCwd =
 			typeof result?.canonicalCwd === "string" ? path.resolve(result.canonicalCwd) : path.resolve(cwd);
+		const scopeWorkspace = workspaceIdentity(result?.workspaceIdentity);
+		const scopeGrantId = workspaceGrantId(result?.workspaceGrantId);
 		const listed = Array.isArray(result?.sessions) ? result.sessions : [];
 		const observations =
 			Array.isArray(result?.observations) && result.observations.length > 0 ? result.observations : listed;
@@ -1493,8 +1691,8 @@ export class AcpAgent implements Agent {
 		}
 		this.#validateSessionAuthorityBinding(id, canonicalCwd);
 		const match = matches[0];
-		if (match) this.#captureAuthority(id, canonicalCwd, match);
-		else this.#bindSessionAuthority(id, canonicalCwd);
+		if (match) this.#captureAuthority(id, canonicalCwd, match, scopeWorkspace, scopeGrantId);
+		else this.#bindSessionAuthority(id, canonicalCwd, scopeWorkspace, scopeGrantId);
 		return match;
 	}
 
@@ -1570,9 +1768,17 @@ export class AcpAgent implements Agent {
 			record.reconnectUnsubscribe = adapter.onReconnectFailed(error =>
 				this.#recoverSessionAfterTransportFailure(id, adapter!, error),
 			);
-			this.#sessions.set(id, record);
 			await applyAcpPermissionMode(adapter, this.#clientCapabilities);
 			this.#assertSessionEpoch(id, epoch);
+			// Final live generation+incarnation and broker-owner revalidation after
+			// connect, permission/provider setup, and subscription construction,
+			// immediately before the sole synchronous #sessions.set publication. A
+			// same-generation successor that appeared in this await window is caught
+			// here, before any reverse capability or adapter can reach the ACP client.
+			// Reverse callbacks stay unusable until publication because the gate
+			// requires the published record's exact adapter identity.
+			await this.#revalidateAttachmentAuthority(id, epoch);
+			this.#sessions.set(id, record);
 		} catch (error) {
 			if (adapter && this.#sessions.get(id)?.adapter === adapter) {
 				await this.#teardownSession(id, "attachment failed");
@@ -1687,6 +1893,31 @@ export class AcpAgent implements Agent {
 			throw new AcpSdkAdapterError("conflict", `ACP session ${id} live authority changed before attachment.`);
 		}
 	}
+	/**
+	 * Final live generation+incarnation and broker-owner revalidation performed
+	 * after AcpSdkAdapter.connect, permission/provider setup, and subscription
+	 * construction, immediately before the sole synchronous #sessions.set. The
+	 * post-connect await window (socket open, provider handshake) is the last gap
+	 * in which a same-generation successor or broker restart can appear before the
+	 * adapter becomes reachable; any drift fails closed before publication.
+	 */
+	async #revalidateAttachmentAuthority(id: string, epoch: number): Promise<void> {
+		this.#assertSessionNotAmbiguous(id);
+		this.#assertSessionEpoch(id, epoch);
+		const authority = this.#sessionAuthority.get(id);
+		if (!authority?.live) return;
+		const current = await this.#currentLiveAuthority(id, authority.canonicalCwd);
+		this.#assertSessionNotAmbiguous(id);
+		this.#assertSessionEpoch(id, epoch);
+		if (
+			!current ||
+			current.endpointGeneration !== authority.live.endpointGeneration ||
+			current.endpointIncarnation !== authority.live.endpointIncarnation
+		) {
+			this.#markSessionAmbiguous(id);
+			throw new AcpSdkAdapterError("conflict", `ACP session ${id} live authority changed before publication.`);
+		}
+	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
 		if (!this.#broker) {
@@ -1747,7 +1978,11 @@ export class AcpAgent implements Agent {
 	/** Fetch the broker-resolved saved session authority for an id scoped to cwd. */
 	async #fetchSavedAuthority(id: string, cwd: string): Promise<SavedSessionAuthority | undefined> {
 		const response = object(
-			await (await this.#brokerAdapter()).global("session.list", { resolveSessionId: id, cwd }),
+			await (await this.#brokerAdapter()).global("session.list", {
+				resolveSessionId: id,
+				cwd,
+				brokerOwnerId: this.#requireBrokerIdentity().ownerId,
+			}),
 		);
 		const result = object(response?.result) ?? response;
 		this.#observeBrokerIdentity(result);
@@ -1761,7 +1996,12 @@ export class AcpAgent implements Agent {
 	 * Returns undefined when the session is no longer live in that scope.
 	 */
 	async #currentLiveAuthority(id: string, canonicalCwd: string): Promise<LiveSessionAuthority | undefined> {
-		const response = object(await (await this.#brokerAdapter()).global("session.list", { cwd: canonicalCwd }));
+		const response = object(
+			await (await this.#brokerAdapter()).global("session.list", {
+				cwd: canonicalCwd,
+				brokerOwnerId: this.#requireBrokerIdentity().ownerId,
+			}),
+		);
 		const result = object(response?.result) ?? response;
 		this.#observeBrokerIdentity(result);
 		const scope =
@@ -2120,6 +2360,8 @@ export class AcpAgent implements Agent {
 		this.#sessionAuthority.clear();
 		this.#ambiguousSessionIds.clear();
 		this.#tearingDown.clear();
+		this.#sessionTombstones.clear();
+		this.#poisoned = true;
 		if (this.#broker) {
 			const broker = this.#broker;
 			this.#broker = undefined;

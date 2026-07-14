@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { resolveResumableSession, SessionManager } from "../../session/session-manager";
+import { isWorkspaceIdentity, WorkspaceCapability, type WorkspaceIdentity } from "./authority";
 import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
@@ -90,7 +91,7 @@ function normalizeAliasedString(
 function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
 	const brokerOwnerId = input.brokerOwnerId;
-	if (brokerOwnerId !== undefined && (typeof brokerOwnerId !== "string" || brokerOwnerId.length === 0))
+	if (typeof brokerOwnerId !== "string" || brokerOwnerId.length === 0)
 		return error("invalid_input", "brokerOwnerId must be a non-empty string");
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
@@ -180,6 +181,7 @@ type SavedSessionIdentity = {
 	size: number;
 	mtimeMs: number;
 	mtimeNs: string;
+	sha256: string;
 };
 type BrokerListedSession = IndexedSession & {
 	canonicalCwd: string;
@@ -233,23 +235,22 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 			return cwd ? path.join(cwd, ".gjc", "state") : undefined;
 		})();
 	const id = string(input.sessionId, input.id);
-	const brokerOwnerId = string(input.brokerOwnerId);
+	const workspaceIdentity = input.workspaceIdentity;
 	switch (operation) {
 		case "session.create":
-			return { root, brokerOwnerId };
+			return { root, workspaceIdentity };
 		case "session.fork":
 			return {
 				root,
-				brokerOwnerId,
+				workspaceIdentity,
 				sourceSessionId: string(input.sourceSessionId, input.sourceId),
 				sourceSessionIdentity: input.sourceSessionIdentity,
 			};
 		case "session.resume":
-			return { sessionId: id, brokerOwnerId, sessionIdentity: input.sessionIdentity };
+			return { sessionId: id, workspaceIdentity, sessionIdentity: input.sessionIdentity };
 		case "session.close":
 			return {
 				sessionId: id,
-				brokerOwnerId,
 				endpointGeneration: input.endpointGeneration,
 				endpointIncarnation: input.endpointIncarnation,
 			};
@@ -257,13 +258,35 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 			return {
 				sessionId: id,
 				cwd: input.cwd,
-				brokerOwnerId,
+				workspaceIdentity,
 				sessionIdentity: input.sessionIdentity,
 			};
 		default:
-			return { operation, root, sessionId: id, brokerOwnerId };
+			return { operation, root, sessionId: id, workspaceIdentity };
 	}
 }
+
+/** Strips the boot-transient owner proof and workspace grant id so durable hashes survive a restart. */
+function withoutTransientAuthority(input: Record<string, unknown>): Record<string, unknown> {
+	const durable: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(input))
+		if (key !== "brokerOwnerId" && key !== "workspaceGrantId") durable[key] = value;
+	return durable;
+}
+
+type WorkspaceAdmission =
+	| { kind: "admitted"; grant: WorkspaceGrant | null }
+	| { kind: "rejected"; response: BrokerResponse };
+
+/** Retained, broker-owned workspace capability grant for the current boot. */
+type WorkspaceGrant = {
+	id: string;
+	capability: WorkspaceCapability;
+};
+
+/** Exact canonical path+identity key under which a grant is interned for a boot. */
+const workspaceGrantKey = (canonicalCwd: string, identity: WorkspaceIdentity): string =>
+	`${canonicalCwd}|${identity.dev}|${identity.ino}`;
 
 const BROKER_LOCK_RECORD = "owner.json";
 const BROKER_LOCK_STARTUP_WAIT_MS = 1_000;
@@ -287,6 +310,14 @@ export class Broker {
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	#heartbeatWrite: Promise<void> = Promise.resolve();
+	/**
+	 * Retained workspace capability grants for the current broker boot, keyed by
+	 * random grant id. The broker owns every retained FileHandle and closes them
+	 * all on stop. Grants never cross a boot: a new owner starts with no grants,
+	 * so owner rotation clears all retained workspace authority.
+	 */
+	readonly #workspaceGrants = new Map<string, WorkspaceGrant>();
+	readonly #workspaceGrantByKey = new Map<string, string>();
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			packageGeneration: "unknown",
@@ -468,6 +499,10 @@ export class Broker {
 	get ownsDiscovery(): boolean {
 		return this.discovery?.ownerId === this.#owner;
 	}
+	/** Current-boot owner proof that every ingress must present exactly. */
+	get ownerId(): string {
+		return this.#owner;
+	}
 	status(): ReturnType<typeof redactBrokerDiscovery> | null {
 		return this.discovery ? redactBrokerDiscovery(this.discovery) : null;
 	}
@@ -486,6 +521,7 @@ export class Broker {
 		}
 		await this.#heartbeatWrite;
 		await Promise.allSettled(this.#chains.values());
+		await this.#closeWorkspaceGrants();
 		await this.#transport?.stop();
 		this.#transport = null;
 		if (this.discovery?.ownerId === this.#owner) {
@@ -567,28 +603,18 @@ export class Broker {
 		}
 	}
 	/** Immutable transcript file identity for saved-session authority. */
-	async #transcriptIdentity(transcriptPath: string): Promise<
-		| {
-				dev: string;
-				ino: string;
-				size: number;
-				mtimeMs: number;
-				mtimeNs: string;
-		  }
-		| undefined
-	> {
-		try {
-			const stat = await fs.stat(transcriptPath, { bigint: true });
-			return {
-				dev: stat.dev.toString(),
-				ino: stat.ino.toString(),
-				size: Number(stat.size),
-				mtimeMs: Number(stat.mtimeMs),
-				mtimeNs: stat.mtimeNs.toString(),
-			};
-		} catch {
-			return undefined;
-		}
+	async #transcriptIdentity(transcriptPath: string): Promise<SavedSessionIdentity | undefined> {
+		const captured = SessionManager.captureTranscriptStrict(transcriptPath);
+		if (captured.kind !== "captured") return undefined;
+		const identity = captured.snapshot.identity;
+		return {
+			dev: identity.dev.toString(),
+			ino: identity.ino.toString(),
+			size: identity.size,
+			mtimeMs: identity.mtimeMs,
+			mtimeNs: identity.mtimeNs.toString(),
+			sha256: identity.sha256,
+		};
 	}
 	#savedAuthorities(cwd: string): Map<string, { path: string; identity: SavedSessionIdentity }> {
 		const inventory = SessionManager.inventorySessionsStrict(cwd, {
@@ -601,6 +627,16 @@ export class Broker {
 				authorities.set(candidate.id, undefined);
 				continue;
 			}
+			const captured = SessionManager.captureTranscriptStrict(candidate.path);
+			if (
+				captured.kind !== "captured" ||
+				captured.snapshot.identity.dev !== candidate.identity.dev ||
+				captured.snapshot.identity.ino !== candidate.identity.ino ||
+				captured.snapshot.identity.size !== candidate.identity.size ||
+				captured.snapshot.identity.mtimeMs !== candidate.identity.mtimeMs ||
+				captured.snapshot.identity.mtimeNs !== candidate.identity.mtimeNs
+			)
+				throw new Error(`Saved session authority changed during scoped inventory: ${candidate.id}`);
 			authorities.set(candidate.id, {
 				path: candidate.path,
 				identity: {
@@ -609,6 +645,7 @@ export class Broker {
 					size: candidate.identity.size,
 					mtimeMs: candidate.identity.mtimeMs,
 					mtimeNs: candidate.identity.mtimeNs.toString(),
+					sha256: captured.snapshot.identity.sha256,
 				},
 			});
 		}
@@ -648,6 +685,101 @@ export class Broker {
 			}),
 		);
 	}
+	/**
+	 * Opens the requested workspace directory, interns one retained capability
+	 * grant per exact canonical path+identity for the current boot, and returns
+	 * the grant id plus diagnostic identity. Repeated lists for the same
+	 * still-bound workspace reuse the grant and close the redundant handle.
+	 */
+	async #internWorkspaceGrant(cwd: string): Promise<WorkspaceAdmission> {
+		let capability: WorkspaceCapability;
+		try {
+			capability = await WorkspaceCapability.open(cwd);
+		} catch {
+			return { kind: "rejected", response: error("invalid_input", "workspace cwd must be an openable directory") };
+		}
+		const key = workspaceGrantKey(capability.canonicalCwd, capability.identity);
+		const existingId = this.#workspaceGrantByKey.get(key);
+		const existing = existingId ? this.#workspaceGrants.get(existingId) : undefined;
+		if (existing && !existing.capability.closed) {
+			await capability.close();
+			return { kind: "admitted", grant: existing };
+		}
+		// A root swap leaves a drifted grant at this canonical path with a stale
+		// identity; revoke it so its retained handle does not leak across lists.
+		this.#revokeDriftedWorkspaceGrants(capability.canonicalCwd, capability.identity);
+		const grant: WorkspaceGrant = { id: randomBytes(12).toString("hex"), capability };
+		this.#workspaceGrants.set(grant.id, grant);
+		this.#workspaceGrantByKey.set(key, grant.id);
+		return { kind: "admitted", grant };
+	}
+
+	/** Revoke retained grants whose canonical path matches but identity has drifted. */
+	#revokeDriftedWorkspaceGrants(canonicalCwd: string, identity: WorkspaceIdentity): void {
+		for (const [id, grant] of this.#workspaceGrants)
+			if (
+				grant.capability.canonicalCwd === canonicalCwd &&
+				(grant.capability.identity.dev !== identity.dev || grant.capability.identity.ino !== identity.ino)
+			)
+				this.#revokeWorkspaceGrant(id);
+	}
+
+	/** Drop and deterministically close a single retained grant. */
+	#revokeWorkspaceGrant(id: string): void {
+		const grant = this.#workspaceGrants.get(id);
+		if (!grant) return;
+		this.#workspaceGrants.delete(id);
+		const key = workspaceGrantKey(grant.capability.canonicalCwd, grant.capability.identity);
+		if (this.#workspaceGrantByKey.get(key) === id) this.#workspaceGrantByKey.delete(key);
+		void grant.capability.close();
+	}
+
+	/** Close every retained grant; called on broker stop so no handle leaks. */
+	async #closeWorkspaceGrants(): Promise<void> {
+		const grants = [...this.#workspaceGrants.values()];
+		this.#workspaceGrants.clear();
+		this.#workspaceGrantByKey.clear();
+		await Promise.allSettled(grants.map(grant => grant.capability.close()));
+	}
+
+	/**
+	 * Resolves the broker-retained workspace grant for a cwd-bearing lifecycle
+	 * operation. Requires the current-boot owner, a grant id, and a matching
+	 * identity, and asserts the public path still binds to the retained object
+	 * before any ledger/idempotency/effect. Missing, unknown, or drifted grants
+	 * are revoked and rejected before the durable ledger row is begun.
+	 */
+	async #admitWorkspaceGrant(operation: string, input: Record<string, unknown>): Promise<WorkspaceAdmission> {
+		const cwdBearing =
+			operation === "session.create" ||
+			operation === "session.fork" ||
+			operation === "session.resume" ||
+			operation === "session.delete";
+		const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
+		if (!cwdBearing || !cwd) return { kind: "admitted", grant: null };
+		const suppliedGrantId = typeof input.workspaceGrantId === "string" ? input.workspaceGrantId : undefined;
+		if (!suppliedGrantId)
+			return { kind: "rejected", response: error("endpoint_stale", "workspace grant id is stale or missing") };
+		const grant = this.#workspaceGrants.get(suppliedGrantId);
+		if (!grant || grant.capability.closed)
+			return { kind: "rejected", response: error("endpoint_stale", "workspace grant id is stale or missing") };
+		const supplied = input.workspaceIdentity;
+		if (
+			!isWorkspaceIdentity(supplied) ||
+			supplied.dev !== grant.capability.identity.dev ||
+			supplied.ino !== grant.capability.identity.ino
+		) {
+			this.#revokeWorkspaceGrant(suppliedGrantId);
+			return { kind: "rejected", response: error("endpoint_stale", "workspace identity is stale or missing") };
+		}
+		try {
+			await grant.capability.assertPathStillBound(cwd);
+		} catch {
+			this.#revokeWorkspaceGrant(suppliedGrantId);
+			return { kind: "rejected", response: error("endpoint_stale", "workspace root no longer binds to its grant") };
+		}
+		return { kind: "admitted", grant };
+	}
 	async handleRequest(
 		operation: string,
 		input: Record<string, unknown>,
@@ -657,7 +789,7 @@ export class Broker {
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
-		if (input.brokerOwnerId !== undefined && (!this.discovery || input.brokerOwnerId !== this.discovery.ownerId))
+		if (input.brokerOwnerId !== (this.discovery?.ownerId ?? this.#owner))
 			return error("endpoint_stale", "broker boot authority is stale");
 		if (operation === "session.list") {
 			await this.index.refresh();
@@ -665,51 +797,70 @@ export class Broker {
 			const production = this.index.listProductionSessions();
 			const resolveSessionId = typeof input.resolveSessionId === "string" ? input.resolveSessionId : undefined;
 			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
-			const canonicalCwd = cwd ? await this.#canonicalCwd(cwd) : undefined;
-			const savedAuthorities = cwd ? this.#savedAuthorities(cwd) : new Map();
-			const [sessions, observations] = await Promise.all([
-				this.#listedSessions(indexed.sessions, savedAuthorities, canonicalCwd),
-				this.#listedSessions(
-					production.sessions.filter(session => session.live),
-					savedAuthorities,
-					canonicalCwd,
-				),
-			]);
-			const result = {
-				indexSeq: indexed.indexSeq,
-				sessions,
-				...(observations.length ? { observations } : {}),
-				warnings: indexed.warnings,
-				...(canonicalCwd ? { canonicalCwd } : {}),
-				...(this.discovery
-					? {
-							brokerIdentity: {
-								ownerId: this.discovery.ownerId,
-								packageGeneration: this.discovery.packageGeneration,
-								startedAt: this.discovery.startedAt,
-							},
-						}
-					: {}),
-			};
-			if (resolveSessionId && cwd) {
-				const sessionDir = SessionManager.getDefaultSessionDir(cwd, this.settings.agentDir);
-				const match = await resolveResumableSession(resolveSessionId, cwd, sessionDir);
-				let savedSession: { id: string; path: string; sessionIdentity?: SavedSessionIdentity } | undefined;
-				if (match && match.session.id === resolveSessionId) {
-					const sessionIdentity = await this.#transcriptIdentity(match.session.path);
-					savedSession = {
-						id: match.session.id,
-						path: match.session.path,
-						...(sessionIdentity ? { sessionIdentity } : {}),
+			let canonicalCwd: string | undefined;
+			let workspaceIdentity: WorkspaceIdentity | undefined;
+			let workspaceGrantId: string | undefined;
+			if (cwd) {
+				const admission = await this.#internWorkspaceGrant(cwd);
+				if (admission.kind === "rejected") return admission.response;
+				canonicalCwd = admission.grant!.capability.canonicalCwd;
+				workspaceIdentity = admission.grant!.capability.identity;
+				workspaceGrantId = admission.grant!.id;
+			}
+			try {
+				const savedAuthorities = cwd ? this.#savedAuthorities(cwd) : new Map();
+				const [sessions, observations] = await Promise.all([
+					this.#listedSessions(indexed.sessions, savedAuthorities, canonicalCwd),
+					this.#listedSessions(
+						production.sessions.filter(session => session.live),
+						savedAuthorities,
+						canonicalCwd,
+					),
+				]);
+				const result = {
+					indexSeq: indexed.indexSeq,
+					sessions,
+					...(observations.length ? { observations } : {}),
+					warnings: indexed.warnings,
+					...(canonicalCwd
+						? {
+								canonicalCwd,
+								...(workspaceIdentity ? { workspaceIdentity } : {}),
+								workspaceGrantId: workspaceGrantId!,
+							}
+						: {}),
+					...(this.discovery
+						? {
+								brokerIdentity: {
+									ownerId: this.discovery.ownerId,
+									packageGeneration: this.discovery.packageGeneration,
+									startedAt: this.discovery.startedAt,
+								},
+							}
+						: {}),
+				};
+				if (resolveSessionId && cwd) {
+					const sessionDir = SessionManager.getDefaultSessionDir(cwd, this.settings.agentDir);
+					const match = await resolveResumableSession(resolveSessionId, cwd, sessionDir);
+					let savedSession: { id: string; path: string; sessionIdentity?: SavedSessionIdentity } | undefined;
+					if (match && match.session.id === resolveSessionId) {
+						const sessionIdentity = await this.#transcriptIdentity(match.session.path);
+						savedSession = {
+							id: match.session.id,
+							path: match.session.path,
+							...(sessionIdentity ? { sessionIdentity } : {}),
+						};
+					}
+					return {
+						ok: true,
+						result: { ...result, savedSession },
+						indexSeq: result.indexSeq,
 					};
 				}
-				return {
-					ok: true,
-					result: { ...result, savedSession },
-					indexSeq: result.indexSeq,
-				};
+				return { ok: true, result, indexSeq: result.indexSeq };
+			} catch {
+				return error("endpoint_stale", "workspace session authority changed during scoped listing");
 			}
-			return { ok: true, result, indexSeq: result.indexSeq };
 		}
 		if (operation === "session.get_endpoint") return this.#endpoint(input);
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
@@ -717,7 +868,15 @@ export class Broker {
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
-		const requestHash = createHash("sha256").update(canonicalJson({ operation, input })).digest("hex");
+		const requestHash = createHash("sha256")
+			.update(canonicalJson({ operation, input: withoutTransientAuthority(input) }))
+			.digest("hex");
+		// Resolve the broker-retained workspace grant only after the durable hashes
+		// are derived, so a rejection cannot leak a handle. The grant is borrowed by
+		// the lifecycle effect and never closed here; the broker owns its handle.
+		const admission = await this.#admitWorkspaceGrant(operation, input);
+		if (admission.kind === "rejected") return admission.response;
+		const workspaceCapability = admission.grant?.capability;
 		const prev = this.#chains.get(target) ?? Promise.resolve();
 		let release!: () => void;
 		const current = new Promise<void>(resolve => (release = resolve));
@@ -734,7 +893,7 @@ export class Broker {
 			if (begun.kind === "terminal_uncertain")
 				return error("terminal_uncertain", "prior lifecycle operation outcome is uncertain");
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
-			const response = await executeLifecycle(this, operation, input, identity);
+			const response = await executeLifecycle(this, operation, input, identity, workspaceCapability);
 			await this.ledger.transition(identity, response.ok ? "terminal_ok" : "terminal_error", {
 				resultSessionId:
 					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
@@ -748,5 +907,10 @@ export class Broker {
 			release();
 			if (this.#chains.get(target) === current) this.#chains.delete(target);
 		}
+	}
+
+	/** Test-only snapshot of retained workspace grants (borrowed; do not close). */
+	workspaceGrantsForTest(): ReadonlyArray<{ id: string; capability: WorkspaceCapability }> {
+		return [...this.#workspaceGrants.values()].map(grant => ({ id: grant.id, capability: grant.capability }));
 	}
 }
