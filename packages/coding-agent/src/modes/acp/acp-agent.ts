@@ -132,6 +132,23 @@ function aggregateAcpFailure(code: string, message: string, failures: unknown[])
 		errors: aggregate.errors,
 	});
 }
+type AcpCwdFlavor = "posix" | "win32";
+
+export function matchesAbsoluteAcpCwd(
+	locator: string,
+	cwd: string | undefined,
+	flavor: AcpCwdFlavor = process.platform === "win32" ? "win32" : "posix",
+): boolean {
+	const paths = flavor === "win32" ? path.win32 : path.posix;
+	const isFullyQualified = (value: string): boolean => {
+		if (!value || !paths.isAbsolute(value)) return false;
+		if (flavor !== "win32") return true;
+		const root = paths.parse(value).root.replaceAll("/", "\\");
+		return /^[A-Za-z]:[\\/]$/.test(root) || root.startsWith("\\\\");
+	};
+	if (!isFullyQualified(locator)) return false;
+	return cwd === undefined || (isFullyQualified(cwd) && paths.resolve(locator) === paths.resolve(cwd));
+}
 
 /** Applies ACP's offset cursor after narrowing the broker listing to the requested cwd. */
 export function paginateAcpSessions(listed: unknown[], cwd: string | undefined, offset: number): ListSessionsResponse {
@@ -141,7 +158,7 @@ export function paginateAcpSessions(listed: unknown[], cwd: string | undefined, 
 			(value): value is BrokerSession & { locator: { repo: string } } =>
 				typeof value?.sessionId === "string" && typeof value.locator?.repo === "string",
 		)
-		.filter(value => !cwd || value.locator.repo === cwd);
+		.filter(value => matchesAbsoluteAcpCwd(value.locator.repo, cwd));
 	const sessions = filtered
 		.slice(offset, offset + SESSION_PAGE_SIZE)
 		.map(
@@ -711,14 +728,14 @@ export class AcpAgent implements Agent {
 				if (
 					typeof candidate?.sessionId !== "string" ||
 					typeof candidate.locator?.repo !== "string" ||
-					path.resolve(candidate.locator.repo) !== path.resolve(params.cwd)
+					!matchesAbsoluteAcpCwd(candidate.locator.repo, params.cwd)
 				)
 					continue;
 				if (discovered.has(candidate.sessionId))
 					throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${candidate.sessionId}`);
 				discovered.add(candidate.sessionId);
 				const knownCwd = this.#knownSessionCwds.get(candidate.sessionId);
-				if (knownCwd && path.resolve(knownCwd) !== path.resolve(params.cwd))
+				if (knownCwd && !matchesAbsoluteAcpCwd(knownCwd, params.cwd))
 					throw new AcpSdkAdapterError(
 						"conflict",
 						`ACP session ${candidate.sessionId} has conflicting cwd authority.`,
