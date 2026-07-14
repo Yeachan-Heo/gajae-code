@@ -182,6 +182,34 @@ test("SdkClient gates requests on hello and correlates success and typed errors"
 	});
 });
 
+test("SdkClient settles owner responses before isolated frame observers", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const socket = await connect(client);
+		const observed: string[] = [];
+		let closePromise: Promise<void> | undefined;
+		client.onFrame(() => {
+			throw new Error("observer failure");
+		});
+		client.onFrame(frame => {
+			observed.push(String(frame.type));
+			closePromise = client.close();
+		});
+		client.onFrame(() => {
+			observed.push("after-close");
+		});
+
+		const request = client.control("settle-before-observers");
+		await flush();
+		const frame = sent(socket);
+		socket.message({ type: "control_response", id: frame.id, ok: true, result: { settled: true } });
+
+		await expect(request).resolves.toMatchObject({ result: { settled: true } });
+		expect(observed).toEqual(["control_response", "after-close"]);
+		await closePromise;
+	});
+});
+
 test("SdkClient rejects malformed frames and a lost response with typed transport errors", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
@@ -273,7 +301,12 @@ test("SdkClient fences stale socket callbacks and never replays sent mutations",
 		second.open();
 		second.message({ type: "hello", connectionId: "second" });
 		for (let index = 0; index < 4; index++) await flush();
+		const observedResponseIds: string[] = [];
+		client.onFrame(frame => {
+			if (typeof frame.id === "string") observedResponseIds.push(frame.id);
+		});
 		const replacementFrame = sent(second);
+		if (typeof replacementFrame.id !== "string") throw new Error("replacement request id missing");
 		for (const listener of staleMessage) {
 			const event = new MessageEvent("message", {
 				data: JSON.stringify({ type: "control_response", id: replacementFrame.id, ok: true }),
@@ -281,8 +314,10 @@ test("SdkClient fences stale socket callbacks and never replays sent mutations",
 			if (typeof listener === "function") listener(event);
 			else listener.handleEvent(event);
 		}
+		expect(observedResponseIds).toEqual([]);
 		second.message({ type: "control_response", id: replacementFrame.id, ok: true });
 		await expect(replacementRequest).resolves.toMatchObject({ ok: true });
+		expect(observedResponseIds).toEqual([replacementFrame.id]);
 
 		const mutation = client.control("mutate", { value: 1 });
 		await flush();

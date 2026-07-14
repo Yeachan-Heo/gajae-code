@@ -66,6 +66,28 @@ describe("SDK operation inventory", () => {
 		expect(result.exitCode, output(result)).toBe(0);
 	});
 
+	it("locks private mid-run maintenance test seams out of the public SDK", async () => {
+		const records = (await Bun.file(inventory).json()) as Array<{
+			sourceId: string;
+			decision: string;
+			rationale?: string;
+		}>;
+		const expected = new Map([
+			[
+				"agent_session:runMidRunMaintenanceForTests",
+				"test-only maintenance seam, not a user-facing SDK control seam",
+			],
+			[
+				"agent_session:estimateMidRunContextTokensForTests",
+				"test-only estimator seam, not a user-facing SDK control seam",
+			],
+		]);
+		for (const [sourceId, rationale] of expected) {
+			const record = records.find(candidate => candidate.sourceId === sourceId);
+			expect(record).toEqual(expect.objectContaining({ sourceId, decision: "exclude", rationale }));
+		}
+	});
+
 	it("rejects a generated matrix with a dropped row", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-inventory-"));
 		tempDirs.push(directory);

@@ -48,7 +48,11 @@ describe("compiled daemon smoke coverage", () => {
 	}
 
 	async function buildCompiledDaemonSmokeBinary(outPath: string): Promise<void> {
-		const proc = Bun.spawn(["bun", "run", "build"], { cwd: repoRoot, stdout: "pipe", stderr: "pipe" });
+		const proc = Bun.spawn(["bun", "run", "build"], {
+			cwd: path.join(repoRoot, "packages/coding-agent"),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
 		const [exitCode, stdout, stderr] = await Promise.all([
 			proc.exited,
 			new Response(proc.stdout).text(),

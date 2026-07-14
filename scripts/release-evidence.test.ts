@@ -39,6 +39,7 @@ import {
 } from "./release-evidence";
 import {
 	downloadNpmRegistryTarball,
+	RegistryPropagationPendingError,
 	publishRetainedPackage,
 	assertReleaseSerializationGuard,
 	parseReleasePublishCli,
@@ -409,6 +410,87 @@ describe("release package evidence", () => {
 			},
 		})).resolves.toEqual(exact);
 		expect(publishes).toBe(1);
+		expect(delays).toEqual([1_000]);
+	});
+
+	test("waits for an exact target while the stable tag is still propagating", async () => {
+		const { records } = expectedFixture();
+		const record = records[0]!;
+		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
+		const exact = observation(record);
+		let observationCall = 0;
+		const delays: number[] = [];
+		let publishes = 0;
+
+		await expect(publishRetainedPackage(record, "retained.tgz", {
+			readTarball: async () => tarball,
+			observe: async () => {
+				observationCall += 1;
+				if (observationCall === 1) return undefined;
+				if (observationCall === 2) throw new RegistryPropagationPendingError("stable tag still points to prior version");
+				return exact;
+			},
+			publish: async () => {
+				publishes += 1;
+				return { exitCode: 0, output: "" };
+			},
+			delay: async milliseconds => {
+				delays.push(milliseconds);
+			},
+		})).resolves.toEqual(exact);
+		expect(publishes).toBe(1);
+		expect(delays).toEqual([1_000]);
+	});
+
+	test("settles a pre-existing exact target without republishing while its stable tag propagates", async () => {
+		const { records } = expectedFixture();
+		const record = records[0]!;
+		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
+		const exact = observation(record);
+		let observationCall = 0;
+		const delays: number[] = [];
+		let publishes = 0;
+
+		await expect(publishRetainedPackage(record, "retained.tgz", {
+			readTarball: async () => tarball,
+			observe: async () => {
+				observationCall += 1;
+				if (observationCall === 1) throw new RegistryPropagationPendingError("stable tag still points to prior version");
+				return exact;
+			},
+			publish: async () => {
+				publishes += 1;
+				return { exitCode: 0, output: "" };
+			},
+			delay: async milliseconds => {
+				delays.push(milliseconds);
+			},
+		})).resolves.toEqual(exact);
+		expect(publishes).toBe(0);
+		expect(delays).toEqual([1_000]);
+	});
+
+	test("settles a concurrent publication while its stable tag propagates", async () => {
+		const { records } = expectedFixture();
+		const record = records[0]!;
+		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${record.name}","version":"${record.version}","dependencies":{}}\n`));
+		const exact = observation(record);
+		let observationCall = 0;
+		const delays: number[] = [];
+
+		await expect(publishRetainedPackage(record, "retained.tgz", {
+			readTarball: async () => tarball,
+			observe: async () => {
+				observationCall += 1;
+				if (observationCall === 1) return undefined;
+				if (observationCall === 2) throw new RegistryPropagationPendingError("stable tag still points to prior version");
+				return exact;
+			},
+			publish: async () => ({ exitCode: 1, output: "E409 already published" }),
+			delay: async milliseconds => {
+				delays.push(milliseconds);
+			},
+		})).resolves.toEqual(exact);
 		expect(delays).toEqual([1_000]);
 	});
 

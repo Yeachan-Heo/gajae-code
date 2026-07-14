@@ -497,7 +497,7 @@ export class SdkClient {
 		if (frame.type === "hello" || frame.type === "server_hello" || frame.type === "broker_hello") {
 			if (incarnation.phase === "hello" && this.#isCandidate(incarnation.cycle, incarnation)) {
 				this.#acceptHello(incarnation, frame);
-				if (this.#isActive(incarnation)) for (const handler of this.#frameHandlers) handler(frame);
+				if (this.#isActive(incarnation)) this.#notifyFrameHandlers(frame);
 				return;
 			}
 			if (!this.#isActive(incarnation)) return;
@@ -511,13 +511,25 @@ export class SdkClient {
 			for (const handler of this.#reconnectHandlers) handler();
 		}
 		if (!this.#isActive(incarnation)) return;
-		for (const handler of this.#frameHandlers) handler(frame);
 		const id =
 			typeof frame.id === "string" ? frame.id : typeof frame.requestId === "string" ? frame.requestId : undefined;
-		if (!id) return;
-		const pending = this.#pending.get(id);
-		if (!pending || pending.incarnation !== incarnation) return;
-		this.#settlePending(id, pending, frame.ok === false || frame.status === "error" ? errorFrom(frame) : frame);
+		if (id) {
+			const pending = this.#pending.get(id);
+			if (pending?.incarnation === incarnation) {
+				this.#settlePending(id, pending, frame.ok === false || frame.status === "error" ? errorFrom(frame) : frame);
+			}
+		}
+		this.#notifyFrameHandlers(frame);
+	}
+
+	#notifyFrameHandlers(frame: Frame): void {
+		for (const handler of this.#frameHandlers) {
+			try {
+				handler(frame);
+			} catch {
+				// Observers cannot change transport settlement or prevent later observers.
+			}
+		}
 	}
 
 	#acceptHello(incarnation: Incarnation, frame: Frame): void {

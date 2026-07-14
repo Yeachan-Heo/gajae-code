@@ -6,7 +6,12 @@ import { callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
 import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
 import { readEvents, writeSessionState } from "../../src/harness-control-plane/storage";
-import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
+import {
+	type EventEnvelope,
+	SESSION_SCHEMA_VERSION,
+	type SessionHandle,
+	type SessionState,
+} from "../../src/harness-control-plane/types";
 
 /** In-process RPC that lets a test push event frames through the owner's onEventFrame path. */
 class FrameTransport implements HarnessSessionTransport {
@@ -66,6 +71,16 @@ class FrameTransport implements HarnessSessionTransport {
 
 const flush = (): Promise<void> => new Promise(r => setTimeout(r, 40));
 
+async function waitForEventKind(kind: string, timeoutMs = 1_000): Promise<EventEnvelope[]> {
+	const deadline = Date.now() + timeoutMs;
+	while (true) {
+		const events = await readEvents(root, SID, 0);
+		if (events.some(event => event.kind === kind)) return events;
+		if (Date.now() >= deadline) return events;
+		await Bun.sleep(10);
+	}
+}
+
 let root: string;
 const SID = "fr";
 let owner: RuntimeOwner | null = null;
@@ -119,9 +134,7 @@ describe("owner frame -> observability", () => {
 			result: { details: { status: "ok" } },
 		});
 		transport.emit({ type: "agent_end" });
-		await flush();
-
-		const events = await readEvents(root, SID, 0);
+		const events = await waitForEventKind("rpc_agent_completed");
 		const kinds = events.map(e => e.kind);
 		expect(kinds).toContain("rpc_tool_started");
 		expect(kinds).toContain("rpc_agent_completed");

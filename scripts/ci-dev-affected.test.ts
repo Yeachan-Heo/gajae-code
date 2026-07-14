@@ -279,6 +279,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/sdk-host-wiring.test.ts",
 		"packages/coding-agent/test/sdk/index.test.ts",
 		"packages/coding-agent/test/other/index.test.ts",
+		"packages/bridge-client/test/client.test.ts",
 	];
 
 	function targeted(paths: readonly string[]) {
@@ -405,13 +406,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	});
 
 	test("bridge-client changes retain package validation alongside release publish coverage", () => {
-		const tasks = targeted(["packages/bridge-client/src/index.ts"]);
+		const tasks = targeted(["packages/bridge-client/src/client.ts"]);
 		const keys = tasks.map(task => task.key);
 		expect(keys.filter(key => key === "check:@gajae-code/bridge-client")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
 		expect(keys.filter(key => key === "bridge-client-sdk-package-smoke")).toHaveLength(1);
+		expect(keys.filter(key => key === "test:packages/bridge-client/test/client.test.ts")).toHaveLength(1);
 		expect(tasks.find(task => task.key === "bridge-client-sdk-package-smoke")?.command).toEqual([
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",

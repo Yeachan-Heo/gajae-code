@@ -568,6 +568,16 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		}
 		if (isBridgeClientSdkPackageSmokePath(changedPath)) {
 			add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
+			const bridgeClientOwner = owningPackage(changedPath, packages);
+			if (bridgeClientOwner?.manifest.scripts?.check) {
+				add(
+					tasks,
+					`check:${bridgeClientOwner.name}`,
+					`Check ${bridgeClientOwner.name}`,
+					packageScriptCommand("check"),
+					resolvePackageCwd(bridgeClientOwner.dir),
+				);
+			}
 		}
 
 
