@@ -874,6 +874,108 @@ describe("coordinator runtime state sidecar", () => {
 			reason: "session_id_mismatch",
 		});
 	});
+	it("accepts case-equivalent Windows runtime-state paths", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "windows-state.json");
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "windows-session",
+				state: "completed",
+				cwd: "C:\\Users\\Operator\\Repo",
+				workdir: "C:\\Users\\Operator\\Repo\\.\\",
+				session_file: "C:\\Users\\Operator\\Repo\\.gjc\\session.jsonl",
+			}),
+		);
+
+		await expect(
+			readTerminalRuntimeStateMarker({
+				stateFile,
+				sessionId: "windows-session",
+				cwd: "c:\\users\\operator\\repo",
+				sessionFile: "c:\\users\\operator\\repo\\.gjc\\session.jsonl",
+				platform: "win32",
+			}),
+		).resolves.toEqual({ terminal: true, state: "completed" });
+		await expect(
+			readTerminalRuntimeStateMarker({
+				stateFile,
+				sessionId: "windows-session",
+				cwd: "D:\\Users\\Operator\\Repo",
+				sessionFile: "c:\\users\\operator\\repo\\.gjc\\session.jsonl",
+				platform: "win32",
+			}),
+		).resolves.toEqual({ terminal: false, reason: "cwd_mismatch" });
+	});
+	it("writes and preserves Windows case- and dot-equivalent runtime identities without accepting another drive", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "windows-runtime-state.json");
+		const sessionId = "windows-runtime-identity";
+		const initialContext = {
+			sessionId: "fallback",
+			cwd: "C:\\Users\\Operator\\Repo",
+			sessionFile: "C:\\Users\\Operator\\Repo\\.gjc\\session.jsonl",
+			platform: "win32" as const,
+		};
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start" }, initialContext);
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("Windows terminal"), {
+			...initialContext,
+			cwd: "c:\\USERS\\OPERATOR\\REPO\\.\\",
+			sessionFile: "c:\\USERS\\OPERATOR\\REPO\\.gjc\\.\\session.jsonl",
+		});
+		const terminal = await readPayload(stateFile);
+		expect(terminal).toMatchObject({
+			session_id: sessionId,
+			state: "completed",
+			cwd: "c:\\USERS\\OPERATOR\\REPO",
+			workdir: "c:\\USERS\\OPERATOR\\REPO",
+			session_file: "c:\\USERS\\OPERATOR\\REPO\\.gjc\\session.jsonl",
+			final_response: { source: "agent_end", text: "Windows terminal" },
+		});
+
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, initialContext);
+		expect(await readPayload(stateFile)).toEqual(terminal);
+
+		const beforeRejectedWrite = await Bun.file(stateFile).text();
+		await expect(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+				...initialContext,
+				cwd: "D:\\Users\\Operator\\Repo",
+				sessionFile: "D:\\Users\\Operator\\Repo\\.gjc\\session.jsonl",
+			}),
+		).rejects.toThrow("invalid or unreadable");
+		expect(await Bun.file(stateFile).text()).toBe(beforeRejectedWrite);
+	});
+	it("rejects case-different POSIX runtime-state identities", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "posix-runtime-state.json");
+		const sessionId = "posix-runtime-identity";
+		const cwd = path.join(root, "workspace");
+		const sessionFile = path.join(cwd, "session.jsonl");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId: "fallback", cwd, sessionFile },
+		);
+		const beforeRejectedWrite = await Bun.file(stateFile).text();
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{
+					sessionId: "fallback",
+					cwd: path.join(root, "WORKSPACE"),
+					sessionFile: path.join(root, "WORKSPACE", "session.jsonl"),
+				},
+			),
+		).rejects.toThrow("invalid or unreadable");
+		expect(await Bun.file(stateFile).text()).toBe(beforeRejectedWrite);
+	});
 
 	it("rejects non-terminal and mismatched runtime markers", async () => {
 		const root = await tempRoot();

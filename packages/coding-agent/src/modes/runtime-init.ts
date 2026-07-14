@@ -7,10 +7,12 @@
  * caller-supplied hooks.
  */
 import * as path from "node:path";
+import { ThinkingLevel } from "@gajae-code/agent-core";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
+import { parseThinkingLevel } from "../thinking";
 import type { TodoPhase } from "../tools/todo-write";
 
 /** Action name for an extension-originated send failure. */
@@ -148,6 +150,21 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			sdkControl: async (operation, input) => {
 				switch (operation) {
+					case "model.set": {
+						const selector = typeof input.id === "string" ? input.id : "";
+						const slashIndex = selector.indexOf("/");
+						const model =
+							slashIndex > 0
+								? session.modelRegistry.find(selector.slice(0, slashIndex), selector.slice(slashIndex + 1))
+								: undefined;
+						const thinkingLevel =
+							typeof input.thinkingLevel === "string" ? parseThinkingLevel(input.thinkingLevel) : undefined;
+						if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
+							throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {
+								code: "invalid_input",
+							});
+						return await session.setDefaultModelSelection(model, thinkingLevel);
+					}
 					case "todo.replace": {
 						const phases = input.items;
 						if (

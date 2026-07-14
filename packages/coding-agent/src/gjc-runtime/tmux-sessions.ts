@@ -49,6 +49,7 @@ import {
 	type TmuxOwnerIsolationExecutionResult,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
+import { buildWindowsPowerShellInnerCommand } from "./windows-powershell-command";
 
 export interface GjcTmuxSessionStatus {
 	name: string;
@@ -127,6 +128,10 @@ export interface ForceCloseOwnerDependencies {
 
 const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 5_000;
 const FORCE_CLOSE_VERDICT_POLL_MS = 50;
+
+export interface CreateGjcTmuxSessionOptions {
+	platform?: NodeJS.Platform;
+}
 
 export type CreateOwnerIsolationTestDependencies = {
 	probe?: Partial<OwnerIsolationProbeSync>;
@@ -354,15 +359,19 @@ export function statusGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv
 	throw new Error(`gjc_tmux_session_not_found:${sessionName}`);
 }
 
-export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus {
-	const tmuxCommand = resolveGjcTmuxCommand(env);
+export function createGjcTmuxSession(
+	env: NodeJS.ProcessEnv = process.env,
+	options: CreateGjcTmuxSessionOptions = {},
+): GjcTmuxSessionStatus {
+	const platform = options.platform ?? process.platform;
+	const tmuxCommand = resolveGjcTmuxCommand(env, platform);
 	const sessionName = buildGjcTmuxSessionName(env);
 	const cwd = process.cwd();
 	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName;
 	const stateFile =
 		env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
 		tmuxRuntimeSessionPath(cwd, env.GJC_SESSION_ID?.trim() || sessionId, buildGjcTmuxSessionSlug(sessionName));
-	const stateDir = path.dirname(stateFile);
+	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
 	const childEnvironment: Record<string, string> = {
 		GJC_TMUX_LAUNCHED: "1",
@@ -373,12 +382,9 @@ export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcT
 		[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
 	};
 	const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
-	const powershellQuote = (value: string): string => `'${value.replace(/'/g, "''")}'`;
 	const command =
-		process.platform === "win32"
-			? `${Object.entries(childEnvironment)
-					.map(([name, value]) => `$env:${name} = ${powershellQuote(value)}`)
-					.join("; ")}; gjc`
+		platform === "win32"
+			? buildWindowsPowerShellInnerCommand({ command: ["gjc"], environment: childEnvironment })
 			: `exec env ${Object.entries(childEnvironment)
 					.map(([name, value]) => `${name}=${shellQuote(value)}`)
 					.join(" ")} gjc`;
@@ -388,11 +394,11 @@ export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcT
 		"-d",
 		"-s",
 		sessionName,
-		...(process.platform === "win32" ? [] : ["-P", "-F", "#{session_id}"]),
+		...(platform === "win32" ? [] : ["-P", "-F", "#{session_id}"]),
 		command,
 	];
 	function probeTmuxServer(tmuxCommand: string, env: NodeJS.ProcessEnv): TmuxServerProof {
-		if (process.platform !== "linux") {
+		if (platform !== "linux") {
 			return {
 				state: "safe",
 				pid: 1,
@@ -421,7 +427,7 @@ export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcT
 				.split(/\s+/)[19];
 			if (!startTime) return { state: "unverifiable" };
 			const cgroup = classifyCgroup({
-				platform: process.platform,
+				platform,
 				cgroupText: fsSync.readFileSync(`/proc/${pid}/cgroup`, "utf8"),
 			});
 			return {
@@ -484,7 +490,7 @@ export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcT
 				}
 			}),
 	};
-	if (resolveGjcTmuxBinary({ env }).isPsmux)
+	if (resolveGjcTmuxBinary({ env, platform }).isPsmux)
 		throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
 
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
@@ -492,7 +498,7 @@ export function createGjcTmuxSession(env: NodeJS.ProcessEnv = process.env): GjcT
 		{
 			schema_version: 1,
 			op: "plan",
-			platform: process.platform,
+			platform,
 			session_id: sessionId,
 			owner_generation: generation,
 			baseline,

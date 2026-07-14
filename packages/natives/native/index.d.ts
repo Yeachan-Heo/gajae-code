@@ -240,6 +240,8 @@ export declare class Process {
   static fromPath(path: string): Array<Process>
   /** Operating-system process identifier for this process reference. */
   get pid(): number
+  /** Kernel-derived identity evidence for this exact process incarnation. */
+  get incarnation(): string
   /** Parent process id for this process, when available. */
   get ppid(): number | null
   /** Launch arguments for this process. */
@@ -329,7 +331,7 @@ export declare class Shell {
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_10_0(): void
+export declare function __piNativesV0_10_1(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.

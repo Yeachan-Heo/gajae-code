@@ -4,6 +4,7 @@ import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CursorRegistry, cursorMac, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
+import { Q10ThinkingMetadataError } from "../src/sdk/models.js";
 
 const huge = (value: string) => `${value}${"x".repeat(140_000)}`;
 function surface(transcript: unknown[] = []) {
@@ -102,6 +103,62 @@ describe("SDK query pagination", () => {
 			connectionId: "c",
 		});
 		expect(reused.error?.code).toBe("invalid_input");
+	});
+
+	it("routes Q10 and every models alias through the same installed paged registry", async () => {
+		const models = [
+			{ provider: "one", id: "one", name: huge("one") },
+			{ provider: "two", id: "two", name: huge("two") },
+			{ provider: "three", id: "three", name: huge("three") },
+		];
+		const store = new RevisionStore("s1");
+		const cursors = new CursorRegistry("token", store);
+		const query = new QueryHandlers(
+			{ ...surface(), getModels: () => models, installedQueries: new Set(["models.list/current"]) },
+			"s1",
+			store,
+			cursors,
+		);
+
+		const first = await query.dispatch({ query: "models.list", input: { current: true }, connectionId: "c" });
+		expect(first.page?.items.map(item => (item as { id: string }).id)).toEqual(["one"]);
+		expect(first.page?.complete).toBe(false);
+		const second = await query.dispatch({
+			query: "models.current",
+			cursor: first.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(second.page?.items.map(item => (item as { id: string }).id)).toEqual(["two"]);
+		const third = await query.dispatch({
+			query: "models.list/current",
+			cursor: second.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(third.page?.items.map(item => (item as { id: string }).id)).toEqual(["three"]);
+		expect(third.page?.complete).toBe(true);
+
+		const raw = await query.dispatch({ query: "Q10", connectionId: "c" });
+		expect(raw.page?.items.map(item => (item as { id: string }).id)).toEqual(["one"]);
+	});
+
+	it("returns safe Q10 projection failures through the query envelope", async () => {
+		const store = new RevisionStore("s1");
+		const query = new QueryHandlers(
+			{
+				...surface(),
+				getModels: () => {
+					throw new Q10ThinkingMetadataError("private-provider", "private-model", "missing_thinking");
+				},
+			},
+			"s1",
+			store,
+			new CursorRegistry("token", store),
+		);
+		const response = await query.dispatch({ query: "models.current", connectionId: "c" });
+		expect(response.error).toEqual({
+			code: "internal",
+			message: "Invalid thinking metadata for private-provider/private-model: missing_thinking",
+		});
 	});
 
 	it("rotates pins so sequential completed walks do not exhaust one connection", async () => {

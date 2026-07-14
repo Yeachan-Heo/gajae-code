@@ -63,8 +63,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			expect(askTool).toBeDefined();
 
 			const ctx = {
-				hasUI: true,
-				ui: { select: async () => undefined, editor: async () => undefined },
+				hasUI: false,
 				abort: () => {},
 			} as unknown as AgentToolContext;
 

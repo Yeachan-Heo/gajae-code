@@ -23,6 +23,9 @@ export class SdkClientError extends Error {
 
 export interface SdkClientOptions {
 	timeoutMs?: number;
+	/** Absolute wall-clock deadline shared by connect, hello, retry, and request work. */
+	deadline?: number;
+
 	reconnectAttempts?: number;
 	reconnectBackoffMs?: number;
 }
@@ -39,15 +42,35 @@ export type SdkReconnectHandler = () => void;
 export type SdkReconnectFailedHandler = (error: SdkClientError) => void;
 
 type Frame = SdkFrame;
+type Cycle = {
+	readonly generation: number;
+	phase: "opening" | "backoff" | "complete" | "aborted";
+	candidate: Incarnation | null;
+	promise?: Promise<Incarnation>;
+	backoffTimer?: ReturnType<typeof setTimeout>;
+	rejectBackoff?: (error: Error) => void;
+};
+type Incarnation = {
+	readonly generation: number;
+	readonly cycle: Cycle;
+	readonly socket: WebSocket;
+	phase: "opening" | "hello" | "active" | "retired";
+	tornDown: boolean;
+	openTimer?: ReturnType<typeof setTimeout>;
+	failure?: Error;
+	helloTimer?: ReturnType<typeof setTimeout>;
+	resolveOpen?: () => void;
+	rejectOpen?: (error: Error) => void;
+	resolveHello?: () => void;
+	rejectHello?: (error: Error) => void;
+	listeners: Array<["open" | "error" | "close" | "message", EventListener]>;
+};
 type Pending = {
+	readonly incarnation: Incarnation;
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
 };
-
-function sleep(ms: number): Promise<void> {
-	return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function errorFrom(frame: Frame): SdkClientError {
 	const error = frame.error;
@@ -79,25 +102,26 @@ export class SdkClient {
 	readonly #timeoutMs: number;
 	readonly #reconnectAttempts: number;
 	readonly #reconnectBackoffMs: number;
-	#socket: WebSocket | null = null;
-	#opening: Promise<WebSocket> | null = null;
+	readonly #deadline?: number;
+	#currentSocketRecord: Incarnation | null = null;
+	#opening: Cycle | null = null;
+	#cycleGeneration = 0;
+	#incarnationGeneration = 0;
 	#pending = new Map<string, Pending>();
 	#frameHandlers = new Set<SdkFrameHandler>();
 	#reconnectHandlers = new Set<SdkReconnectHandler>();
 	#reconnectFailedHandlers = new Set<SdkReconnectFailedHandler>();
 
-	#helloSocket: WebSocket | null = null;
-	#helloPromise: Promise<void> | null = null;
-	#helloReceived = new WeakSet<WebSocket>();
-	#resolveHello?: () => void;
-	#rejectHello?: (error: Error) => void;
-
 	#closed = false;
 	connectionId?: string;
+
 	constructor(url: string, token: string, options: SdkClientOptions = {}) {
 		this.#url = url;
 		this.#token = token;
 		this.#timeoutMs = options.timeoutMs ?? 10_000;
+		this.#deadline =
+			typeof options.deadline === "number" && Number.isFinite(options.deadline) ? options.deadline : undefined;
+
 		this.#reconnectAttempts = options.reconnectAttempts ?? 3;
 		this.#reconnectBackoffMs = options.reconnectBackoffMs ?? 25;
 	}
@@ -134,11 +158,15 @@ export class SdkClient {
 
 	send(frame: SdkFrame): void {
 		if (this.#closed) throw new SdkClientError("connection_closed", "SDK client closed");
-		const socket = this.#socket;
-		if (!socket || socket.readyState !== WebSocket.OPEN)
+		this.#throwIfDeadlineElapsed();
+		const current = this.#currentSocketRecord ?? this.#opening?.candidate;
+		const authoritative =
+			this.#isActive(current ?? null) ||
+			(!!current && current.phase === "hello" && this.#isCandidate(current.cycle, current));
+		if (!current || !authoritative || current.socket.readyState !== WebSocket.OPEN)
 			throw new SdkClientError("connection_closed", "SDK WebSocket is not connected");
 		try {
-			socket.send(JSON.stringify(frame));
+			current.socket.send(JSON.stringify(frame));
 		} catch (error) {
 			throw new SdkClientError("unavailable", "SDK WebSocket send failed", error);
 		}
@@ -150,16 +178,22 @@ export class SdkClient {
 	}
 
 	async close(): Promise<void> {
+		if (this.#closed) return;
 		this.#closed = true;
-		this.#socket?.close();
-		this.#socket = null;
-		this.#rejectHello?.(new SdkClientError("connection_closed", "SDK client closed"));
-		this.#clearHello();
-		for (const pending of this.#pending.values()) {
-			clearTimeout(pending.timer);
-			pending.reject(new SdkClientError("connection_closed", "SDK client closed"));
+		const cycle = this.#opening;
+		if (cycle) {
+			cycle.phase = "aborted";
+			if (cycle.backoffTimer) clearTimeout(cycle.backoffTimer);
+			if (cycle.candidate)
+				this.#retire(cycle.candidate, new SdkClientError("connection_closed", "SDK client closed"), true);
+			cycle.rejectBackoff?.(new SdkClientError("connection_closed", "SDK client closed"));
+			cycle.rejectBackoff = undefined;
+			if (this.#opening === cycle) this.#opening = null;
 		}
-		this.#pending.clear();
+		const current = this.#currentSocketRecord;
+		if (current) this.#retire(current, new SdkClientError("connection_closed", "SDK client closed"), true);
+		for (const [id, pending] of this.#pending)
+			this.#settlePending(id, pending, new SdkClientError("connection_closed", "SDK client closed"));
 	}
 
 	async control(
@@ -177,6 +211,7 @@ export class SdkClient {
 			options,
 		);
 	}
+
 	async query(
 		query: string,
 		input: Record<string, unknown> = {},
@@ -188,6 +223,7 @@ export class SdkClient {
 			options,
 		);
 	}
+
 	async global(
 		operation: string,
 		input: Record<string, unknown> = {},
@@ -195,204 +231,376 @@ export class SdkClient {
 	): Promise<unknown> {
 		return await this.#request({ type: "broker_request", operation, input }, options);
 	}
+
 	async #request(frame: Frame, options: SdkRequestOptions): Promise<unknown> {
 		if (this.#closed) throw new SdkClientError("connection_closed", "SDK client closed");
-		await this.#connect();
+		this.#throwIfDeadlineElapsed();
+		const incarnation = await this.#connect();
+		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
+		if (timeoutMs <= 0) throw this.#deadlineError();
 		const id = randomUUID();
-		const timeoutMs = options.timeoutMs ?? this.#timeoutMs;
 		return await new Promise<unknown>((resolve, reject) => {
-			const timer = setTimeout(() => {
-				this.#pending.delete(id);
-				reject(new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`));
-			}, timeoutMs);
-			this.#pending.set(id, { resolve, reject, timer });
+			const pending: Pending = {
+				incarnation,
+				resolve,
+				reject,
+				timer: setTimeout(
+					() =>
+						this.#settlePending(
+							id,
+							pending,
+							new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`),
+						),
+					timeoutMs,
+				),
+			};
+			this.#pending.set(id, pending);
+			if (!this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN) {
+				this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket is not connected"));
+				return;
+			}
 			try {
-				this.send({ ...frame, id, ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}) });
+				incarnation.socket.send(
+					JSON.stringify({
+						...frame,
+						id,
+						...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+					}),
+				);
 			} catch (error) {
-				clearTimeout(timer);
-				this.#pending.delete(id);
-				reject(new SdkClientError("unavailable", "SDK WebSocket send failed", error));
+				this.#settlePending(
+					id,
+					pending,
+					error instanceof SdkClientError
+						? error
+						: new SdkClientError("unavailable", "SDK WebSocket send failed", error),
+				);
 			}
 		});
 	}
 
-	async #connect(): Promise<WebSocket> {
-		if (this.#socket?.readyState === WebSocket.OPEN) {
-			await this.#waitForHello(this.#socket);
-			return this.#socket;
-		}
-		if (this.#opening) return await this.#opening;
-		this.#opening = this.#openWithRetry();
-		try {
-			return await this.#opening;
-		} finally {
-			this.#opening = null;
-		}
+	#deadlineError(): SdkClientError {
+		return new SdkClientError("timeout", "SDK client deadline elapsed.");
 	}
 
-	async #openWithRetry(): Promise<WebSocket> {
+	#remainingTimeout(limit = this.#timeoutMs): number {
+		if (this.#deadline === undefined) return limit;
+		return Math.min(limit, Math.max(0, this.#deadline - Date.now()));
+	}
+
+	#throwIfDeadlineElapsed(): void {
+		if (this.#deadline !== undefined && Date.now() >= this.#deadline) throw this.#deadlineError();
+	}
+
+	async #connect(): Promise<Incarnation> {
+		this.#throwIfDeadlineElapsed();
+		const current = this.#currentSocketRecord;
+		if (current && this.#isActive(current) && current.socket.readyState === WebSocket.OPEN) return current;
+		if (current)
+			this.#retire(current, new SdkClientError("connection_closed", "SDK WebSocket connection closed"), true);
+		let cycle = this.#opening;
+		if (!cycle) {
+			cycle = { generation: ++this.#cycleGeneration, phase: "opening", candidate: null };
+			this.#opening = cycle;
+			cycle.promise = this.#openWithRetry(cycle);
+		}
+		return await cycle.promise!;
+	}
+
+	async #openWithRetry(cycle: Cycle): Promise<Incarnation> {
 		let lastError: unknown;
 		for (let attempt = 0; attempt <= this.#reconnectAttempts; attempt++) {
-			let socket: WebSocket | undefined;
+			if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
+				const error = this.#deadlineError();
+				this.#completeCycle(cycle, error);
+				throw error;
+			}
+			if (!this.#isOpening(cycle)) throw new SdkClientError("connection_closed", "SDK client closed");
 			try {
-				socket = await this.#open();
-				await this.#waitForHello(socket);
-				return socket;
+				const incarnation = await this.#open(cycle);
+				if (!this.#isActive(incarnation) && (!this.#isOpening(cycle) || cycle.candidate !== incarnation))
+					throw new SdkClientError("connection_closed", "SDK WebSocket is not connected");
+				await this.#waitForHello(incarnation);
+				if (this.#isActive(incarnation)) return incarnation;
+				throw new SdkClientError("connection_closed", "SDK WebSocket is not connected");
 			} catch (error) {
 				lastError = error;
-				socket?.close();
-				if (attempt < this.#reconnectAttempts) await sleep(this.#reconnectBackoffMs * 2 ** attempt);
+				if (!this.#isOpening(cycle)) throw error;
+				const candidate = cycle.candidate;
+				if (candidate && candidate.phase !== "active")
+					this.#retire(
+						candidate,
+						error instanceof SdkClientError
+							? error
+							: new SdkClientError("unavailable", "SDK WebSocket connection failed", error),
+						true,
+					);
+				if (attempt < this.#reconnectAttempts) {
+					const backoffMs = this.#remainingTimeout(this.#reconnectBackoffMs * 2 ** attempt);
+					if (backoffMs <= 0) break;
+					cycle.phase = "backoff";
+					await new Promise<void>((resolve, reject) => {
+						cycle.rejectBackoff = reject;
+						cycle.backoffTimer = setTimeout(resolve, backoffMs);
+					});
+					cycle.rejectBackoff = undefined;
+					cycle.backoffTimer = undefined;
+					if (!this.#isOpening(cycle)) throw new SdkClientError("connection_closed", "SDK client closed");
+					cycle.phase = "opening";
+				}
 			}
 		}
+		if (!this.#isOpening(cycle)) throw new SdkClientError("connection_closed", "SDK client closed");
+		if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
+			const error = this.#deadlineError();
+			this.#completeCycle(cycle, error);
+			throw error;
+		}
+		cycle.phase = "complete";
+		if (this.#opening === cycle) this.#opening = null;
 		const error = new SdkClientError("reconnect_exhausted", "SDK WebSocket reconnect attempts exhausted", lastError);
 		for (const handler of this.#reconnectFailedHandlers) handler(error);
 		throw error;
 	}
 
-	#open(): Promise<WebSocket> {
+	#completeCycle(cycle: Cycle, error: SdkClientError): void {
+		if (cycle.backoffTimer) clearTimeout(cycle.backoffTimer);
+		cycle.rejectBackoff?.(error);
+		cycle.rejectBackoff = undefined;
+		cycle.backoffTimer = undefined;
+		const candidate = cycle.candidate;
+		if (candidate) this.#retire(candidate, error, true);
+		cycle.candidate = null;
+		cycle.phase = "complete";
+		if (this.#opening === cycle) this.#opening = null;
+	}
+
+	#open(cycle: Cycle): Promise<Incarnation> {
+		const timeoutMs = this.#remainingTimeout();
+		if (timeoutMs <= 0) return Promise.reject(this.#deadlineError());
 		return new Promise((resolve, reject) => {
 			const url = new URL(this.#url);
 			url.searchParams.set("token", this.#token);
 			const socket = new WebSocket(url);
-			let timer: NodeJS.Timeout | undefined;
-			const onOpen = () => {
-				cleanup();
-				if (this.#closed) {
-					try {
-						socket.close();
-					} catch {}
-					reject(new SdkClientError("connection_closed", "SDK client closed"));
-					return;
-				}
-				this.#socket = socket;
-				this.#beginHello(socket);
-				resolve(socket);
+			const incarnation: Incarnation = {
+				generation: ++this.#incarnationGeneration,
+				cycle,
+				socket,
+				phase: "opening",
+				tornDown: false,
+				listeners: [],
+				resolveOpen: () => resolve(incarnation),
+				rejectOpen: reject,
 			};
-			const onError = (event: Event) => {
-				cleanup();
-				const eventWithDetail = event as Event & { error?: unknown; message?: unknown };
-				const detail = eventWithDetail.error;
-				reject(
-					detail instanceof Error
-						? detail
-						: new Error(
-								typeof eventWithDetail.message === "string"
-									? eventWithDetail.message
-									: "SDK WebSocket connection failed",
-							),
-				);
+			cycle.candidate = incarnation;
+			const add = (type: "open" | "error" | "close" | "message", listener: EventListener, once = false) => {
+				incarnation.listeners.push([type, listener]);
+				socket.addEventListener(type, listener, once ? { once: true } : undefined);
 			};
-			const cleanup = () => {
-				socket.removeEventListener("open", onOpen);
-				socket.removeEventListener("error", onError);
-				if (timer !== undefined) {
-					clearTimeout(timer);
-					timer = undefined;
-				}
-			};
-			socket.addEventListener("open", onOpen, { once: true });
-			socket.addEventListener("error", onError, { once: true });
-			socket.addEventListener("message", event => this.#onMessage(event.data, socket));
-			socket.addEventListener("close", () => {
-				if (this.#socket !== socket) return;
-				this.#socket = null;
-				if (this.#helloSocket === socket) {
-					this.#rejectHello?.(
-						new SdkClientError("connection_closed", "SDK WebSocket closed before server hello."),
-					);
-					this.#clearHello();
-				}
-				this.#rejectPending(new SdkClientError("connection_closed", "SDK WebSocket connection closed"));
-			});
-			timer = setTimeout(() => {
-				cleanup();
-				try {
-					socket.close();
-				} catch {}
-				reject(new SdkClientError("timeout", `SDK WebSocket connection timed out after ${this.#timeoutMs}ms`));
-			}, this.#timeoutMs);
-			timer.unref?.();
+			add(
+				"open",
+				(() => {
+					if (!this.#isCandidate(cycle, incarnation) || incarnation.phase !== "opening") return;
+					if (incarnation.openTimer) clearTimeout(incarnation.openTimer);
+					incarnation.phase = "hello";
+					incarnation.resolveOpen?.();
+					incarnation.resolveOpen = undefined;
+					incarnation.rejectOpen = undefined;
+					this.#beginHello(incarnation);
+				}) as EventListener,
+				true,
+			);
+			add("error", ((event: Event) => this.#onSocketFailure(incarnation, event)) as EventListener);
+			add("close", (() => this.#onSocketFailure(incarnation)) as EventListener);
+			add("message", ((event: MessageEvent) => this.#onMessage(event.data, incarnation)) as EventListener);
+			incarnation.openTimer = setTimeout(() => this.#onOpenTimeout(incarnation, timeoutMs), timeoutMs);
+			incarnation.openTimer.unref?.();
 		});
 	}
 
-	#rejectPending(error: SdkClientError): void {
-		for (const pending of this.#pending.values()) {
-			clearTimeout(pending.timer);
-			pending.reject(error);
-		}
-		this.#pending.clear();
-	}
-
-	#beginHello(socket: WebSocket): void {
-		this.#helloSocket = socket;
-		this.#helloPromise = new Promise<void>((resolve, reject) => {
-			this.#resolveHello = resolve;
-			this.#rejectHello = reject;
-			// A server that never sends its hello must fail typed instead of
-			// hanging the caller until the request timeout.
-			const timer = setTimeout(() => {
-				if (this.#helloSocket !== socket) return;
-				this.#rejectHello?.(new SdkClientError("protocol_error", "SDK server did not send a hello frame."));
-				this.#clearHello();
-			}, this.#timeoutMs);
-			timer.unref?.();
-		});
-	}
-
-	async #waitForHello(socket: WebSocket): Promise<void> {
-		if (this.#helloReceived.has(socket)) return;
-		if (this.#helloSocket === socket && this.#helloPromise) {
-			await this.#helloPromise;
+	#beginHello(incarnation: Incarnation): void {
+		const timeoutMs = this.#remainingTimeout();
+		if (timeoutMs <= 0) {
+			this.#retire(incarnation, this.#deadlineError(), true);
 			return;
 		}
-		throw new SdkClientError("connection_closed", "SDK WebSocket is not connected");
+		incarnation.helloTimer = setTimeout(() => {
+			if (!this.#isCandidate(incarnation.cycle, incarnation) || incarnation.phase !== "hello") return;
+			const error =
+				this.#deadline !== undefined && Date.now() >= this.#deadline
+					? this.#deadlineError()
+					: new SdkClientError("protocol_error", "SDK server did not send a hello frame.");
+			incarnation.rejectHello?.(error);
+			this.#retire(incarnation, error, true);
+		}, timeoutMs);
+		incarnation.helloTimer.unref?.();
 	}
 
-	#clearHello(): void {
-		this.#helloSocket = null;
-		this.#helloPromise = null;
-		this.#resolveHello = undefined;
-		this.#rejectHello = undefined;
+	#waitForHello(incarnation: Incarnation): Promise<void> {
+		if (incarnation.failure) return Promise.reject(incarnation.failure);
+		if (this.#isActive(incarnation)) return Promise.resolve();
+		if (!this.#isCandidate(incarnation.cycle, incarnation) || incarnation.phase !== "hello")
+			return Promise.reject(new SdkClientError("connection_closed", "SDK WebSocket is not connected"));
+		return new Promise((resolve, reject) => {
+			incarnation.resolveHello = resolve;
+			incarnation.rejectHello = reject;
+		});
 	}
 
-	#onMessage(value: unknown, socket: WebSocket): void {
-		if (this.#socket !== socket) return;
+	#onOpenTimeout(incarnation: Incarnation, timeoutMs: number): void {
+		if (!this.#isCandidate(incarnation.cycle, incarnation) || incarnation.phase !== "opening") return;
+		const error =
+			this.#deadline !== undefined && Date.now() >= this.#deadline
+				? this.#deadlineError()
+				: new SdkClientError("timeout", `SDK WebSocket connection timed out after ${timeoutMs}ms`);
+		incarnation.rejectOpen?.(error);
+		this.#retire(incarnation, error, true);
+	}
+
+	#onSocketFailure(incarnation: Incarnation, event?: Event): void {
+		if (!this.#isCandidate(incarnation.cycle, incarnation) && !this.#isActive(incarnation)) return;
+		const detail = event as (Event & { error?: unknown; message?: unknown }) | undefined;
+		const error =
+			detail?.error instanceof Error
+				? detail.error
+				: new SdkClientError(
+						"connection_closed",
+						typeof detail?.message === "string" ? detail.message : "SDK WebSocket connection closed",
+					);
+		if (incarnation.phase === "opening") incarnation.rejectOpen?.(error);
+		if (incarnation.phase === "hello") incarnation.rejectHello?.(error);
+		this.#retire(
+			incarnation,
+			error instanceof SdkClientError
+				? error
+				: new SdkClientError("unavailable", "SDK WebSocket connection failed", error),
+			true,
+		);
+	}
+
+	#onMessage(value: unknown, incarnation: Incarnation): void {
+		if (!this.#isCandidate(incarnation.cycle, incarnation) && !this.#isActive(incarnation)) return;
 		let frame: Frame;
 		try {
 			frame = parseFrame(value);
 			if (frame.type === "control_command_result" && typeof frame.message === "string")
 				frame = parseFrame(frame.message);
 		} catch (error) {
-			this.#rejectPending(
+			this.#rejectPendingFor(
+				incarnation,
 				error instanceof SdkClientError
 					? error
-					: new SdkClientError("protocol_error", "SDK server sent a malformed frame.", error),
+					: new SdkClientError("protocol_error", "SDK server sent malformed frame.", error),
 			);
 			return;
 		}
 		if (frame.type === "hello" || frame.type === "server_hello" || frame.type === "broker_hello") {
-			// Per-session hosts advertise connectionId; the broker's hello carries
-			// only protocolVersion. Both mark the connection as ready.
-			if (typeof frame.connectionId === "string") {
-				const reconnecting = this.connectionId !== undefined && this.connectionId !== frame.connectionId;
-				this.connectionId = frame.connectionId;
-				if (reconnecting) for (const handler of this.#reconnectHandlers) handler();
+			if (incarnation.phase === "hello" && this.#isCandidate(incarnation.cycle, incarnation)) {
+				this.#acceptHello(incarnation, frame);
+				if (this.#isActive(incarnation)) for (const handler of this.#frameHandlers) handler(frame);
+				return;
 			}
-			this.#helloReceived.add(socket);
-			if (this.#helloSocket === socket) {
-				this.#resolveHello?.();
-				this.#clearHello();
-			}
+			if (!this.#isActive(incarnation)) return;
+			if (
+				typeof frame.connectionId !== "string" ||
+				frame.connectionId.length === 0 ||
+				frame.connectionId === this.connectionId
+			)
+				return;
+			this.connectionId = frame.connectionId;
+			for (const handler of this.#reconnectHandlers) handler();
 		}
+		if (!this.#isActive(incarnation)) return;
 		for (const handler of this.#frameHandlers) handler(frame);
 		const id =
 			typeof frame.id === "string" ? frame.id : typeof frame.requestId === "string" ? frame.requestId : undefined;
 		if (!id) return;
 		const pending = this.#pending.get(id);
-		if (!pending) return;
+		if (!pending || pending.incarnation !== incarnation) return;
+		this.#settlePending(id, pending, frame.ok === false || frame.status === "error" ? errorFrom(frame) : frame);
+	}
+
+	#acceptHello(incarnation: Incarnation, frame: Frame): void {
+		if (!this.#isCandidate(incarnation.cycle, incarnation) || incarnation.phase !== "hello") return;
+		if (incarnation.helloTimer) clearTimeout(incarnation.helloTimer);
+		const reconnecting =
+			typeof frame.connectionId === "string" &&
+			frame.connectionId.length > 0 &&
+			this.connectionId !== undefined &&
+			this.connectionId !== frame.connectionId;
+		if (typeof frame.connectionId === "string" && frame.connectionId.length > 0)
+			this.connectionId = frame.connectionId;
+		incarnation.phase = "active";
+		this.#currentSocketRecord = incarnation;
+		incarnation.cycle.phase = "complete";
+		if (this.#opening === incarnation.cycle) this.#opening = null;
+		const resolveHello = incarnation.resolveHello;
+		incarnation.resolveHello = undefined;
+		incarnation.rejectHello = undefined;
+		resolveHello?.();
+		if (reconnecting) for (const handler of this.#reconnectHandlers) handler();
+	}
+
+	#settlePending(id: string, pending: Pending, result: unknown): void {
+		if (this.#pending.get(id) !== pending) return;
 		this.#pending.delete(id);
 		clearTimeout(pending.timer);
-		if (frame.ok === false || frame.status === "error") pending.reject(errorFrom(frame));
-		else pending.resolve(frame);
+		if (result instanceof Error) pending.reject(result);
+		else pending.resolve(result);
+	}
+	#rejectPendingFor(incarnation: Incarnation, error: SdkClientError): void {
+		for (const [id, pending] of this.#pending)
+			if (pending.incarnation === incarnation) this.#settlePending(id, pending, error);
+	}
+	#retire(incarnation: Incarnation, error: SdkClientError, closeSocket: boolean): void {
+		if (incarnation.tornDown) return;
+		const phase = incarnation.phase;
+		incarnation.phase = "retired";
+		incarnation.failure = error;
+		if (phase === "opening") incarnation.rejectOpen?.(error);
+		if (phase === "hello") incarnation.rejectHello?.(error);
+		incarnation.resolveOpen = undefined;
+		incarnation.rejectOpen = undefined;
+		incarnation.resolveHello = undefined;
+		incarnation.rejectHello = undefined;
+		this.#rejectPendingFor(incarnation, error);
+		if (this.#currentSocketRecord === incarnation) this.#currentSocketRecord = null;
+		if (incarnation.cycle.candidate === incarnation) incarnation.cycle.candidate = null;
+		this.#teardown(incarnation, closeSocket);
+	}
+	#teardown(incarnation: Incarnation, closeSocket: boolean): void {
+		if (incarnation.tornDown) return;
+		incarnation.tornDown = true;
+		if (incarnation.openTimer) clearTimeout(incarnation.openTimer);
+		if (incarnation.helloTimer) clearTimeout(incarnation.helloTimer);
+		for (const [type, listener] of incarnation.listeners) incarnation.socket.removeEventListener(type, listener);
+		incarnation.listeners = [];
+		if (closeSocket)
+			try {
+				incarnation.socket.close();
+			} catch {}
+	}
+	#isCandidate(cycle: Cycle, incarnation: Incarnation): boolean {
+		return (
+			!this.#closed &&
+			this.#opening === cycle &&
+			cycle.candidate === incarnation &&
+			cycle.generation > 0 &&
+			incarnation.generation > 0 &&
+			incarnation.cycle === cycle &&
+			(cycle.phase === "opening" || cycle.phase === "backoff")
+		);
+	}
+	#isOpening(cycle: Cycle): boolean {
+		return !this.#closed && this.#opening === cycle && (cycle.phase === "opening" || cycle.phase === "backoff");
+	}
+	#isActive(incarnation: Incarnation | null): boolean {
+		return (
+			!!incarnation &&
+			incarnation.generation > 0 &&
+			!this.#closed &&
+			this.#currentSocketRecord === incarnation &&
+			incarnation.phase === "active"
+		);
 	}
 }

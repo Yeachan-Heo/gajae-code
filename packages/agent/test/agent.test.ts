@@ -365,4 +365,38 @@ describe("Agent", () => {
 		expect(agent.metadataForProvider("any")).toEqual({ user_id: "static" });
 		expect(agent.metadata).toEqual({ user_id: "static" });
 	});
+	it("preserves HTTP status from thrown transport errors", async () => {
+		for (const [property, status] of [
+			["errorStatus", 401],
+			["status", 502],
+		] as const) {
+			const mock = createMockModel();
+			const streamFn = async () => {
+				throw Object.assign(new Error("transport failed"), { [property]: status });
+			};
+			const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+
+			await agent.prompt("hello");
+
+			const message = agent.state.messages.at(-1);
+			expect(message?.role).toBe("assistant");
+			if (message?.role !== "assistant") throw new Error("Expected synthesized assistant error");
+			expect(message.errorStatus).toBe(status);
+		}
+	});
+
+	it("prioritizes errorStatus over HTTP status mentioned in a transport error message", async () => {
+		const mock = createMockModel();
+		const streamFn = async () => {
+			throw Object.assign(new Error("request failed after HTTP 502"), { errorStatus: 401 });
+		};
+		const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+
+		await agent.prompt("hello");
+
+		const message = agent.state.messages.at(-1);
+		expect(message?.role).toBe("assistant");
+		if (message?.role !== "assistant") throw new Error("Expected synthesized assistant error");
+		expect(message.errorStatus).toBe(401);
+	});
 });

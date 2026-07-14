@@ -52,6 +52,7 @@ import {
 	type ModelProfileDefinition,
 	mergeModelProfiles,
 } from "./model-profiles";
+import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import {
 	type ModelOverride,
 	type ModelProfileConfig,
@@ -1019,10 +1020,10 @@ export class ModelRegistry {
 	#modelBindingsTargetSettings: Settings | undefined;
 	#appliedModelBindingRoles = new Set<string>();
 	#appliedAgentModelBindingOverrides = new Set<string>();
-	#modelBindingRoleBaselines = new Map<string, string | undefined>();
-	#agentModelBindingBaselines = new Map<string, string | undefined>();
-	#lastAppliedModelBindingRoles = new Map<string, string>();
-	#lastAppliedAgentModelBindingOverrides = new Map<string, string>();
+	#modelBindingRoleBaselines = new Map<string, ModelSelectorValue | undefined>();
+	#agentModelBindingBaselines = new Map<string, ModelSelectorValue | undefined>();
+	#lastAppliedModelBindingRoles = new Map<string, ModelSelectorValue>();
+	#lastAppliedAgentModelBindingOverrides = new Map<string, ModelSelectorValue>();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#lastStaticLoadMtime: number | null = null;
@@ -1698,6 +1699,19 @@ export class ModelRegistry {
 		this.#applyConfiguredModelBindingsToTarget();
 	}
 
+	#cloneModelSelectorValue(value: ModelSelectorValue | undefined): ModelSelectorValue | undefined {
+		return Array.isArray(value) ? [...value] : value;
+	}
+
+	#modelSelectorValuesEqual(left: ModelSelectorValue | undefined, right: ModelSelectorValue | undefined): boolean {
+		const leftSelectors = normalizeModelSelectorValue(left);
+		const rightSelectors = normalizeModelSelectorValue(right);
+		return (
+			leftSelectors.length === rightSelectors.length &&
+			leftSelectors.every((selector, index) => selector === rightSelectors[index])
+		);
+	}
+
 	#applyConfiguredModelBindingsToTarget(): void {
 		const targetSettings = this.#modelBindingsTargetSettings;
 		if (!targetSettings) return;
@@ -1708,26 +1722,25 @@ export class ModelRegistry {
 		for (const role of this.#appliedModelBindingRoles) {
 			if (configuredModelRoleKeys.has(role)) continue;
 			const lastApplied = this.#lastAppliedModelBindingRoles.get(role);
-			if (lastApplied !== undefined && nextModelRoles[role] === lastApplied) {
+			if (lastApplied !== undefined && this.#modelSelectorValuesEqual(nextModelRoles[role], lastApplied)) {
 				const baseline = this.#modelBindingRoleBaselines.get(role);
 				if (baseline === undefined) {
 					delete nextModelRoles[role];
 				} else {
-					nextModelRoles[role] = baseline;
+					nextModelRoles[role] = this.#cloneModelSelectorValue(baseline)!;
 				}
 			}
 			this.#modelBindingRoleBaselines.delete(role);
 			this.#lastAppliedModelBindingRoles.delete(role);
 		}
-		for (const [role, modelId] of Object.entries(configuredModelRoles)) {
-			if (!modelId) continue;
+		for (const [role, selector] of Object.entries(configuredModelRoles)) {
 			const previousApplied = this.#lastAppliedModelBindingRoles.get(role);
 			if (!this.#modelBindingRoleBaselines.has(role)) {
-				this.#modelBindingRoleBaselines.set(role, nextModelRoles[role]);
+				this.#modelBindingRoleBaselines.set(role, this.#cloneModelSelectorValue(nextModelRoles[role]));
 			}
-			if (previousApplied === undefined || nextModelRoles[role] === previousApplied) {
-				nextModelRoles[role] = modelId;
-				this.#lastAppliedModelBindingRoles.set(role, modelId);
+			if (previousApplied === undefined || this.#modelSelectorValuesEqual(nextModelRoles[role], previousApplied)) {
+				nextModelRoles[role] = this.#cloneModelSelectorValue(selector)!;
+				this.#lastAppliedModelBindingRoles.set(role, this.#cloneModelSelectorValue(selector)!);
 			}
 		}
 		targetSettings.override("modelRoles", nextModelRoles);
@@ -1739,26 +1752,34 @@ export class ModelRegistry {
 		for (const agentName of this.#appliedAgentModelBindingOverrides) {
 			if (configuredAgentModelOverrideKeys.has(agentName)) continue;
 			const lastApplied = this.#lastAppliedAgentModelBindingOverrides.get(agentName);
-			if (lastApplied !== undefined && nextAgentModelOverrides[agentName] === lastApplied) {
+			if (
+				lastApplied !== undefined &&
+				this.#modelSelectorValuesEqual(nextAgentModelOverrides[agentName], lastApplied)
+			) {
 				const baseline = this.#agentModelBindingBaselines.get(agentName);
 				if (baseline === undefined) {
 					delete nextAgentModelOverrides[agentName];
 				} else {
-					nextAgentModelOverrides[agentName] = baseline;
+					nextAgentModelOverrides[agentName] = this.#cloneModelSelectorValue(baseline)!;
 				}
 			}
 			this.#agentModelBindingBaselines.delete(agentName);
 			this.#lastAppliedAgentModelBindingOverrides.delete(agentName);
 		}
-		for (const [agentName, modelId] of Object.entries(configuredAgentModelOverrides)) {
-			if (!modelId) continue;
+		for (const [agentName, selector] of Object.entries(configuredAgentModelOverrides)) {
 			const previousApplied = this.#lastAppliedAgentModelBindingOverrides.get(agentName);
 			if (!this.#agentModelBindingBaselines.has(agentName)) {
-				this.#agentModelBindingBaselines.set(agentName, nextAgentModelOverrides[agentName]);
+				this.#agentModelBindingBaselines.set(
+					agentName,
+					this.#cloneModelSelectorValue(nextAgentModelOverrides[agentName]),
+				);
 			}
-			if (previousApplied === undefined || nextAgentModelOverrides[agentName] === previousApplied) {
-				nextAgentModelOverrides[agentName] = modelId;
-				this.#lastAppliedAgentModelBindingOverrides.set(agentName, modelId);
+			if (
+				previousApplied === undefined ||
+				this.#modelSelectorValuesEqual(nextAgentModelOverrides[agentName], previousApplied)
+			) {
+				nextAgentModelOverrides[agentName] = this.#cloneModelSelectorValue(selector)!;
+				this.#lastAppliedAgentModelBindingOverrides.set(agentName, this.#cloneModelSelectorValue(selector)!);
 			}
 		}
 		targetSettings.override("task.agentModelOverrides", nextAgentModelOverrides);

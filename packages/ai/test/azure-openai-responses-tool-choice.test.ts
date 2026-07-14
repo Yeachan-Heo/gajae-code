@@ -132,6 +132,26 @@ describe("Azure OpenAI responses tool choice capability", () => {
 		expectSingleCleanFallbackEvents(events);
 	});
 
+	it("does not retry forced tool choice in managed mode", async () => {
+		let calls = 0;
+		const testModel = model({ id: "managed-runtime-azure" });
+		global.fetch = Object.assign(
+			async () => {
+				calls += 1;
+				return createErrorResponse("tool_choice forces tool use is not compatible with this model");
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		const result = await streamAzureOpenAIResponses(testModel, testContext, {
+			apiKey: "test-key",
+			azureBaseUrl: testModel.baseUrl,
+			toolChoice: { type: "function", function: { name: "search" } },
+			fallbackManaged: true,
+		}).result();
+		expect(calls).toBe(1);
+		expect(result.stopReason).toBe("error");
+	});
+
 	it("propagates unrelated 400 without retry or registry mark", async () => {
 		let calls = 0;
 		const testModel = model({ id: "unrelated-azure" });

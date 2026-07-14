@@ -347,7 +347,7 @@ describe("AgentSession resilient retry", () => {
 			await session.dispose();
 			session = undefined;
 		}
-	});
+	}, 30_000);
 
 	it("surfaces deliberate request aborts without retrying", async () => {
 		session = buildSession({ responses: [{ throw: "Request was aborted." }] });

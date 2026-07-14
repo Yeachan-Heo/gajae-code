@@ -18,7 +18,7 @@ export interface ControlSurface {
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;
 	replaceTodo(items: ControlValue): Promise<ControlValue> | ControlValue;
-	setModel(id: string): Promise<ControlValue> | ControlValue;
+	setModel(id: string, thinkingLevel?: ControlValue): Promise<ControlValue> | ControlValue;
 	cycleModel(): Promise<ControlValue> | ControlValue;
 	setThinking(level: ControlValue): Promise<ControlValue> | ControlValue;
 	cycleThinking(): Promise<ControlValue> | ControlValue;

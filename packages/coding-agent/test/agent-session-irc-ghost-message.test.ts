@@ -277,6 +277,28 @@ describe("AgentSession respondAsBackground failure visibility", () => {
 		expect(rosterDeliveryCount(harness)).toBe(1);
 	});
 
+	it("commits the roster claim before an idle awaited-exchange observer accepts a changed roster", async () => {
+		const harness = createHarness();
+		addPeer(harness.registry);
+		let observerDelivery: Promise<{ replyText: string | null }> | undefined;
+		harness.session.agent.subscribe(event => {
+			if (
+				event.type === "message_start" &&
+				event.message.role === "custom" &&
+				event.message.customType === "irc:incoming" &&
+				!observerDelivery
+			) {
+				addPeer(harness.registry, "3-Observer");
+				observerDelivery = harness.session.respondAsBackground({ from: "3-Observer", message: "observer ping" });
+			}
+		});
+
+		await harness.session.respondAsBackground({ from: "0-Main", message: "ping" });
+		if (!observerDelivery) throw new Error("Expected the idle IRC observer to accept a follow-up exchange");
+		await expect(observerDelivery).resolves.toEqual({ replyText: "pong" });
+		expect(rosterDeliveryCount(harness)).toBe(2);
+	});
+
 	it("releases an IRC roster claim when reply generation fails before acceptance", async () => {
 		let fail = true;
 		const harness = createHarness({

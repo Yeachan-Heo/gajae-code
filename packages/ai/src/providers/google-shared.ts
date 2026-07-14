@@ -20,6 +20,7 @@ import type {
 } from "../types";
 import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
 import {
@@ -868,7 +869,11 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 					new Error(`Google API error (${response.status}): ${extractGoogleErrorMessage(errorText)}`),
 					response.status,
 				);
-				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, true)) {
+				if (
+					!options?.fallbackManaged &&
+					firstTokenTime === undefined &&
+					isForcedToolChoiceUnsupportedError(error, true)
+				) {
 					const beforeMark = resolveToolChoice(model, options?.toolChoice);
 					markToolChoiceIncapability(model, "auto", error.message);
 					stream.push({
@@ -938,6 +943,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error);
 			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;

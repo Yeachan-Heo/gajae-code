@@ -79,6 +79,7 @@ describe("deobfuscateSessionContext", () => {
 			messages: [unchangedMessage, message],
 			thinkingLevel: "off",
 			models: {},
+			configuredModelChains: {},
 			injectedTtsrRules: [],
 			ttsrMessageCount: 0,
 			selectedMCPToolNames: [],

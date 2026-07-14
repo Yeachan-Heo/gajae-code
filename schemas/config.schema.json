@@ -229,7 +229,24 @@
 		},
 		"modelRoles": {
 			"type": "object",
-			"additionalProperties": true,
+			"additionalProperties": {
+				"anyOf": [
+					{
+						"type": "string",
+						"minLength": 1,
+						"pattern": "\\S"
+					},
+					{
+						"type": "array",
+						"minItems": 1,
+						"items": {
+							"type": "string",
+							"minLength": 1,
+							"pattern": "\\S"
+						}
+					}
+				]
+			},
 			"default": {}
 		},
 		"modelProfile": {
@@ -745,8 +762,35 @@
 				},
 				"agentModelOverrides": {
 					"type": "object",
-					"additionalProperties": true,
+					"additionalProperties": {
+						"anyOf": [
+							{
+								"type": "string",
+								"minLength": 1,
+								"pattern": "\\S"
+							},
+							{
+								"type": "array",
+								"minItems": 1,
+								"items": {
+									"type": "string",
+									"minLength": 1,
+									"pattern": "\\S"
+								}
+							}
+						]
+					},
 					"default": {}
+				}
+			},
+			"additionalProperties": false
+		},
+		"fallback": {
+			"type": "object",
+			"properties": {
+				"maxAttempts": {
+					"type": "number",
+					"default": 3
 				}
 			},
 			"additionalProperties": false
@@ -781,20 +825,6 @@
 					"type": "number",
 					"description": "Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
 					"default": 5
-				},
-				"fallbackChains": {
-					"type": "object",
-					"additionalProperties": true,
-					"default": {}
-				},
-				"fallbackRevertPolicy": {
-					"type": "string",
-					"enum": [
-						"cooldown-expiry",
-						"never"
-					],
-					"description": "When to return to the primary model after a fallback",
-					"default": "cooldown-expiry"
 				}
 			},
 			"additionalProperties": false

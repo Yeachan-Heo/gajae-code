@@ -12,6 +12,7 @@ import {
 import { parseModelString } from "@gajae-code/coding-agent/config/model-resolver";
 import { ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import modelsJson from "../../ai/src/models.json";
+import { selectorHead } from "../src/config/model-selector-value";
 
 type Role = "default" | "executor" | "planner" | "critic" | "architect";
 
@@ -22,21 +23,21 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "codex-eco",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-terra:high",
-			executor: "openai-codex/gpt-5.6-luna:high",
-			planner: "openai-codex/gpt-5.6-terra:medium",
-			critic: "openai-codex/gpt-5.6-terra:high",
-			architect: "openai-codex/gpt-5.6-sol:medium",
+			default: "openai-codex/gpt-5.6-terra:low",
+			executor: "openai-codex/gpt-5.6-luna:low",
+			planner: "openai-codex/gpt-5.6-luna:high",
+			critic: "openai-codex/gpt-5.6-terra:xhigh",
+			architect: "openai-codex/gpt-5.6-terra:high",
 		},
 	},
 	{
 		name: "codex-medium",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-sol:medium",
-			executor: "openai-codex/gpt-5.6-terra:xhigh",
+			default: "openai-codex/gpt-5.6-sol:low",
+			executor: "openai-codex/gpt-5.6-terra:low",
 			planner: "openai-codex/gpt-5.6-terra:high",
-			critic: "openai-codex/gpt-5.6-terra:xhigh",
+			critic: "openai-codex/gpt-5.6-sol:xhigh",
 			architect: "openai-codex/gpt-5.6-sol:high",
 		},
 	},
@@ -44,11 +45,11 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "codex-pro",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-sol:xhigh",
-			executor: "openai-codex/gpt-5.6-terra:xhigh",
+			default: "openai-codex/gpt-5.6-sol:medium",
+			executor: "openai-codex/gpt-5.6-terra:medium",
 			planner: "openai-codex/gpt-5.6-sol:high",
-			critic: "openai-codex/gpt-5.6-sol:xhigh",
-			architect: "openai-codex/gpt-5.6-sol:max",
+			critic: "openai-codex/gpt-5.6-sol:max",
+			architect: "openai-codex/gpt-5.6-sol:xhigh",
 		},
 	},
 	{
@@ -298,21 +299,21 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
 			default: "anthropic/claude-opus-4-8:xhigh",
-			executor: "openai-codex/gpt-5.6-terra:xhigh",
-			planner: "openai-codex/gpt-5.6-terra:high",
-			critic: "openai-codex/gpt-5.6-terra:xhigh",
-			architect: "openai-codex/gpt-5.6-sol:xhigh",
+			executor: "openai-codex/gpt-5.6-terra:low",
+			planner: "anthropic/claude-sonnet-5",
+			critic: "openai-codex/gpt-5.6-sol:xhigh",
+			architect: "openai-codex/gpt-5.6-sol:high",
 		},
 	},
 	{
 		name: "codex-opencodego",
 		requiredProviders: ["openai-codex", "opencode-go"],
 		mapping: {
-			default: "openai-codex/gpt-5.6-terra:xhigh",
+			default: "openai-codex/gpt-5.6-sol:low",
 			executor: "opencode-go/deepseek-v4-pro",
 			planner: "opencode-go/kimi-k2.6",
 			critic: "opencode-go/mimo-v2.5-pro",
-			architect: "openai-codex/gpt-5.6-sol:xhigh",
+			architect: "openai-codex/gpt-5.6-sol:high",
 		},
 	},
 	{
@@ -320,7 +321,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
 			default: "anthropic/claude-fable-5:high",
-			executor: "openai-codex/gpt-5.6-terra:xhigh",
+			executor: "openai-codex/gpt-5.6-terra:medium",
 			planner: "anthropic/claude-opus-4-8:medium",
 			critic: "anthropic/claude-opus-4-8:high",
 			architect: "openai-codex/gpt-5.6-sol:xhigh",
@@ -350,6 +351,38 @@ function selectorExists(selector: string): boolean {
 	return (modelsJson as Record<string, Record<string, unknown>>)[parsed.provider]?.[parsed.id] !== undefined;
 }
 
+function builtinMapping(name: string): Record<Role, string> {
+	const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === name);
+	if (!profile) throw new Error(`Missing built-in profile: ${name}`);
+	if (roles.some(role => profile.modelMapping[role] === undefined)) {
+		throw new Error(`Built-in profile is missing a role mapping: ${name}`);
+	}
+	return profile.modelMapping as Record<Role, string>;
+}
+
+function substituteCodexFamily(selector: string, source: "sol" | "terra", target: "terra" | "luna"): string {
+	const match = /^openai-codex\/gpt-5\.6-(sol|terra|luna):(.+)$/.exec(selector);
+	if (!match) throw new Error(`Expected GPT-5.6 Codex selector, got: ${selector}`);
+	return match[1] === source ? `openai-codex/gpt-5.6-${target}:${match[2]}` : selector;
+}
+
+const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> = {
+	"opus-codex": {
+		default: "anthropic/claude-opus-4-8:xhigh",
+		planner: "anthropic/claude-sonnet-5",
+	},
+	"codex-opencodego": {
+		executor: "opencode-go/deepseek-v4-pro",
+		planner: "opencode-go/kimi-k2.6",
+		critic: "opencode-go/mimo-v2.5-pro",
+	},
+	"fable-opus-codex": {
+		default: "anthropic/claude-fable-5:high",
+		planner: "anthropic/claude-opus-4-8:medium",
+		critic: "anthropic/claude-opus-4-8:high",
+	},
+};
+
 describe("built-in model profile catalog", () => {
 	test("contains exact 28-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
@@ -359,6 +392,47 @@ describe("built-in model profile catalog", () => {
 			const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === expected.name);
 			expect(profile?.requiredProviders).toEqual(expected.requiredProviders);
 			expect(profile?.modelMapping).toEqual(expected.mapping);
+		}
+	});
+
+	test("codex Eco is Medium with Terra lowered to Luna and Sol lowered to Terra", () => {
+		const eco = builtinMapping("codex-eco");
+		const medium = builtinMapping("codex-medium");
+		const loweredMedium = Object.fromEntries(
+			roles.map(role => [
+				role,
+				substituteCodexFamily(substituteCodexFamily(medium[role], "terra", "luna"), "sol", "terra"),
+			]),
+		) as Record<Role, string>;
+
+		expect(eco).toEqual(loweredMedium);
+		expect(Object.values(eco).some(selector => selector.includes("gpt-5.6-sol"))).toBe(false);
+	});
+
+	test("combo Codex roles project their source preset at the same role", () => {
+		const medium = builtinMapping("codex-medium");
+		const pro = builtinMapping("codex-pro");
+		const opusCodex = builtinMapping("opus-codex");
+		const codexOpencodego = builtinMapping("codex-opencodego");
+		const fableOpusCodex = builtinMapping("fable-opus-codex");
+
+		for (const role of ["executor", "critic", "architect"] as const) {
+			expect(opusCodex[role]).toBe(medium[role]);
+		}
+		for (const role of ["default", "architect"] as const) {
+			expect(codexOpencodego[role]).toBe(medium[role]);
+		}
+		for (const role of ["executor", "architect"] as const) {
+			expect(fableOpusCodex[role]).toBe(pro[role]);
+		}
+	});
+
+	test("combo non-Codex cells retain their fixed baselines", () => {
+		for (const [profileName, expectedMapping] of Object.entries(fixedNonCodexComboMappings)) {
+			const mapping = builtinMapping(profileName);
+			for (const [role, selector] of Object.entries(expectedMapping) as Array<[Role, string]>) {
+				expect(mapping[role]).toBe(selector);
+			}
 		}
 	});
 
@@ -376,8 +450,9 @@ describe("built-in model profile catalog", () => {
 				const selector = profile.modelMapping[role];
 				expect(selector).toBeDefined();
 				expect(ProfileModelSelectorSchema.safeParse(selector).success).toBe(true);
-				expect(parseModelString(selector ?? "")).toBeDefined();
-				if (selector && !selectorExists(selector)) missing.push(`${profile.name}.${role}=${selector}`);
+				expect(parseModelString(selectorHead(selector) ?? "")).toBeDefined();
+				if (selector && !selectorExists(selectorHead(selector) ?? ""))
+					missing.push(`${profile.name}.${role}=${selector}`);
 			}
 		}
 		expect(missing).toEqual([]);
@@ -445,7 +520,7 @@ describe("built-in model profile catalog", () => {
 			for (const role of roles) {
 				const selector = profile.modelMapping[role];
 				expect(selector).toBeDefined();
-				const parsed = parseModelString(selector ?? "");
+				const parsed = parseModelString(selectorHead(selector) ?? "");
 				expect(parsed?.provider).toBe("minimax-code");
 				expect(parsed?.id).toBe("minimax-m3");
 			}

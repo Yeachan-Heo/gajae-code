@@ -3,6 +3,14 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Glob } from "bun";
+import {
+	canonicalJsonBytes,
+	PUBLIC_PACKAGE_DEFINITIONS,
+	expectedEvidenceSha256,
+	validateExpectedEvidence,
+	validateFinalEvidence,
+	verifyFinalEvidence,
+} from "./release-evidence";
 
 interface PackageJson {
 	name?: string;
@@ -20,19 +28,85 @@ export interface SyncViolation {
 	line?: number;
 }
 type PublicFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
+interface GitHubReleaseAsset {
+	name: string;
+	browser_download_url: string;
+}
+
+interface GitHubRelease {
+	id: number;
+	tag_name: string;
+	draft: boolean;
+	prerelease: boolean;
+	published_at: string | null;
+	html_url: string;
+	assets: GitHubReleaseAsset[];
+}
+
+interface GitObjectReference {
+	sha: string;
+	type: string;
+}
+
+interface ReleaseSyncState {
+	generated_content_sha256: string;
+	release: {
+		id: number;
+		published_at: string;
+		tag: string;
+		url: string;
+		version: string;
+	};
+	schema_version: number;
+	source: {
+		changelog_path: string;
+		commit_sha: string;
+		repository: string;
+	};
+}
+
+interface ExpectedDeployedRelease {
+	id: number;
+	publishedAt: string;
+	tag: string;
+	url: string;
+	version: string;
+	changelogPath: string;
+	commitSha: string;
+}
 
 const PUBLIC_HOMEPAGE = "https://gajae-code.com";
+const PUBLIC_RELEASE_STATE = `${PUBLIC_HOMEPAGE}/release-sync.json`;
+const SOURCE_REPOSITORY = "Yeachan-Heo/gajae-code";
+const SOURCE_LATEST_RELEASE_API = `https://api.github.com/repos/${SOURCE_REPOSITORY}/releases/latest`;
+const SOURCE_GIT_API = `https://api.github.com/repos/${SOURCE_REPOSITORY}/git`;
+const EXPECTED_EVIDENCE_ASSET = "gajae-release-packages-expected-v1.json";
+const FINAL_EVIDENCE_ASSET = "gajae-release-packages-v1.json";
+const STABLE_BINARY_ASSETS = [
+	"gjc-linux-x64",
+	"gjc-linux-arm64",
+	"gjc-darwin-arm64",
+	"gjc-darwin-x64",
+	"gjc-windows-x64.exe",
+] as const;
+const STABLE_TAG_RE = /^v(\d+\.\d+\.\d+)$/;
+const SHA256_RE = /^[a-f0-9]{64}$/;
+const SHA1_RE = /^[a-f0-9]{40}$/;
+const CANONICAL_CHANGELOG_PATH = "packages/coding-agent/CHANGELOG.md";
 const GENERATED_DOCS_INDEX = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
 const VERSIONED_MARKETING_RE = /\b(?:New in|Also new in|Gajae Code|Gajae-Code|Feature card for the)\s+(\d+\.\d+\.\d+)\b/gi;
 const MARKETING_VERSION_FILES = ["README.md", "docs/**/*.md", "packages/*/README.md"];
 const LIVE_FETCH_TIMEOUT_MS = 5_000;
+const PUBLIC_FETCH_HEADERS = { "User-Agent": "gajae-code-public-version-sync/2.0" };
+const PUBLIC_RELEASE_PACKAGE_NAMES = PUBLIC_PACKAGE_DEFINITIONS.map((definition) => definition.name);
 
 async function pathExists(candidate: string): Promise<boolean> {
 	try {
 		await fs.access(candidate);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return false;
+		throw error;
 	}
 }
 
@@ -91,10 +165,7 @@ export async function buildDocsIndexOutput(repoRoot: string): Promise<string> {
 	].join("\n");
 }
 
-async function canonicalVersionForRepo(repoRoot: string): Promise<string | undefined> {
-	const rootPackage = await readJson<PackageJson>(path.join(repoRoot, "package.json"));
-	return rootPackage.workspaces?.catalog?.["@gajae-code/coding-agent"];
-}
+
 
 export async function checkPublicVersionSync(repoRoot = path.join(import.meta.dir, "..")): Promise<SyncViolation[]> {
 	const violations: SyncViolation[] = [];
@@ -185,44 +256,321 @@ export async function checkPublicVersionSync(repoRoot = path.join(import.meta.di
 	return violations;
 }
 
-export async function checkLivePublicVersionSync(repoRoot = path.join(import.meta.dir, ".."), fetchImpl: PublicFetch = fetch, timeoutMs = LIVE_FETCH_TIMEOUT_MS): Promise<SyncViolation[]> {
-	const violations: SyncViolation[] = [];
-	const canonicalVersion = await canonicalVersionForRepo(repoRoot);
+async function fetchLiveResponse(
+	fetchImpl: PublicFetch,
+	url: string,
+	timeoutMs: number,
+): Promise<Response> {
+	return fetchImpl(url, {
+		headers: PUBLIC_FETCH_HEADERS,
+		signal: AbortSignal.timeout(timeoutMs),
+	});
+}
 
-	if (!canonicalVersion) {
-		violations.push({ path: "package.json", message: "Missing canonical @gajae-code/coding-agent catalog version." });
-		return violations;
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, expectedKeys: readonly string[]): boolean {
+	const keys = Object.keys(value).sort();
+	return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index]);
+}
+
+function normalizePublishedAt(value: string): string | undefined {
+	const timestamp = new Date(value);
+	if (Number.isNaN(timestamp.valueOf())) return undefined;
+	return timestamp.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function parseGitObjectReference(value: unknown): GitObjectReference | undefined {
+	if (!isRecord(value) || !isRecord(value.object)) return undefined;
+	const { sha, type } = value.object;
+	if (typeof sha !== "string" || typeof type !== "string") return undefined;
+	return { sha, type };
+}
+
+function parseRelease(value: unknown): GitHubRelease | undefined {
+	if (!isRecord(value)) return undefined;
+	const { id, tag_name, draft, prerelease, published_at, html_url, assets } = value;
+	if (
+		typeof id !== "number" ||
+		!Number.isSafeInteger(id) ||
+		typeof tag_name !== "string" ||
+		typeof draft !== "boolean" ||
+		typeof prerelease !== "boolean" ||
+		(published_at !== null && typeof published_at !== "string") ||
+		typeof html_url !== "string" ||
+		!Array.isArray(assets)
+	) {
+		return undefined;
 	}
 
+	const parsedAssets: GitHubReleaseAsset[] = [];
+	for (const asset of assets) {
+		if (!isRecord(asset) || typeof asset.name !== "string" || typeof asset.browser_download_url !== "string") return undefined;
+		parsedAssets.push({ name: asset.name, browser_download_url: asset.browser_download_url });
+	}
+	return { id, tag_name, draft, prerelease, published_at, html_url, assets: parsedAssets };
+}
+
+function releaseAsset(release: GitHubRelease, name: string): GitHubReleaseAsset | undefined {
+	return release.assets.find((asset) => asset.name === name);
+}
+
+function releaseCompletenessViolation(release: GitHubRelease): SyncViolation | undefined {
+	if (release.draft || release.prerelease) {
+		return { path: SOURCE_LATEST_RELEASE_API, message: `Latest source release ${release.tag_name} must be published and non-prerelease.` };
+	}
+	const tagMatch = release.tag_name.match(STABLE_TAG_RE);
+	if (!tagMatch) return { path: SOURCE_LATEST_RELEASE_API, message: `Published release ${release.tag_name} is not an exact stable vX.Y.Z tag.` };
+	if (release.published_at === null || normalizePublishedAt(release.published_at) === undefined) {
+		return { path: SOURCE_LATEST_RELEASE_API, message: `Published release ${release.tag_name} has no valid published_at timestamp.` };
+	}
+	for (const name of [...STABLE_BINARY_ASSETS, EXPECTED_EVIDENCE_ASSET, FINAL_EVIDENCE_ASSET]) {
+		if (releaseAsset(release, name) === undefined) {
+			return { path: SOURCE_LATEST_RELEASE_API, message: `Published release ${release.tag_name} is incomplete: missing ${name}.` };
+		}
+	}
+	return undefined;
+}
+
+async function resolvePeeledTagCommit(
+	tag: string,
+	fetchImpl: PublicFetch,
+	timeoutMs: number,
+): Promise<string | SyncViolation> {
 	let response: Response;
 	try {
-		response = await fetchImpl(PUBLIC_HOMEPAGE, {
-			headers: { "User-Agent": "gajae-code-public-version-sync/1.0" },
-			signal: AbortSignal.timeout(timeoutMs),
+		response = await fetchLiveResponse(fetchImpl, `${SOURCE_GIT_API}/ref/tags/${encodeURIComponent(tag)}`, timeoutMs);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { path: SOURCE_GIT_API, message: `Failed to resolve immutable tag ${tag}: ${message}` };
+	}
+	if (!response.ok) return { path: SOURCE_GIT_API, message: `Tag ${tag} lookup returned HTTP ${response.status}.` };
+
+	let object = parseGitObjectReference(await response.json());
+	if (object === undefined) return { path: SOURCE_GIT_API, message: `Tag ${tag} lookup returned an invalid Git object.` };
+
+	for (let depth = 0; depth <= 4; depth++) {
+		if (!SHA1_RE.test(object.sha)) return { path: SOURCE_GIT_API, message: `Tag ${tag} resolved to an invalid object SHA.` };
+		if (object.type === "commit") return object.sha;
+		if (object.type !== "tag" || depth === 4) {
+			return { path: SOURCE_GIT_API, message: `Tag ${tag} did not peel to a commit within four annotated-tag hops.` };
+		}
+
+		try {
+			response = await fetchLiveResponse(fetchImpl, `${SOURCE_GIT_API}/tags/${object.sha}`, timeoutMs);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return { path: SOURCE_GIT_API, message: `Failed to peel immutable tag ${tag}: ${message}` };
+		}
+		if (!response.ok) return { path: SOURCE_GIT_API, message: `Annotated tag ${tag} lookup returned HTTP ${response.status}.` };
+		object = parseGitObjectReference(await response.json());
+		if (object === undefined) return { path: SOURCE_GIT_API, message: `Annotated tag ${tag} returned an invalid Git object.` };
+	}
+
+	return { path: SOURCE_GIT_API, message: `Tag ${tag} did not resolve to a commit.` };
+}
+
+function parseReleaseSyncState(text: string): ReleaseSyncState | SyncViolation {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { path: PUBLIC_RELEASE_STATE, message: `Deployed release state is not valid JSON: ${message}` };
+	}
+	if (!isRecord(parsed) || !hasOnlyKeys(parsed, ["generated_content_sha256", "release", "schema_version", "source"])) {
+		return { path: PUBLIC_RELEASE_STATE, message: "Deployed release state must use the closed schema-1 top-level shape." };
+	}
+	if (parsed.schema_version !== 1 || typeof parsed.generated_content_sha256 !== "string" || !SHA256_RE.test(parsed.generated_content_sha256)) {
+		return { path: PUBLIC_RELEASE_STATE, message: "Deployed release state has an invalid schema version or generated-content digest." };
+	}
+	if (!isRecord(parsed.release) || !hasOnlyKeys(parsed.release, ["id", "published_at", "tag", "url", "version"])) {
+		return { path: PUBLIC_RELEASE_STATE, message: "Deployed release state has an invalid release record." };
+	}
+	if (!isRecord(parsed.source) || !hasOnlyKeys(parsed.source, ["changelog_path", "commit_sha", "repository"])) {
+		return { path: PUBLIC_RELEASE_STATE, message: "Deployed release state has an invalid source record." };
+	}
+
+	const release = parsed.release;
+	const source = parsed.source;
+	if (
+		typeof release.id !== "number" ||
+		!Number.isSafeInteger(release.id) ||
+		typeof release.published_at !== "string" ||
+		typeof release.tag !== "string" ||
+		typeof release.url !== "string" ||
+		typeof release.version !== "string" ||
+		typeof source.changelog_path !== "string" ||
+		typeof source.commit_sha !== "string" ||
+		typeof source.repository !== "string"
+	) {
+		return { path: PUBLIC_RELEASE_STATE, message: "Deployed release state contains values with invalid types." };
+	}
+	if (
+		release.id < 1 ||
+		!STABLE_TAG_RE.test(release.tag) ||
+		release.version !== release.tag.slice(1) ||
+		!SHA1_RE.test(source.commit_sha) ||
+		normalizePublishedAt(release.published_at) === undefined
+	) {
+		return { path: PUBLIC_RELEASE_STATE, message: "Deployed release state contains an invalid release or source identity." };
+	}
+	const state: ReleaseSyncState = {
+		generated_content_sha256: parsed.generated_content_sha256,
+		release: {
+			id: release.id,
+			published_at: release.published_at,
+			tag: release.tag,
+			url: release.url,
+			version: release.version,
+		},
+		schema_version: parsed.schema_version,
+		source: {
+			changelog_path: source.changelog_path,
+			commit_sha: source.commit_sha,
+			repository: source.repository,
+		},
+	};
+	const canonical = `${JSON.stringify(state, null, 2)}\n`;
+	if (text !== canonical) {
+		return { path: PUBLIC_RELEASE_STATE, message: "Deployed release state is not canonical schema-1 JSON." };
+	}
+	return state;
+}
+
+function compareDeployedReleaseState(state: ReleaseSyncState, expected: ExpectedDeployedRelease): SyncViolation | undefined {
+	if (state.release.id !== expected.id) return { path: PUBLIC_RELEASE_STATE, message: `Deployed release id ${state.release.id} does not match latest complete release ${expected.id}.` };
+	if (state.release.tag !== expected.tag) return { path: PUBLIC_RELEASE_STATE, message: `Deployed release tag ${state.release.tag} does not match latest complete release ${expected.tag}.` };
+	if (state.release.version !== expected.version) return { path: PUBLIC_RELEASE_STATE, message: `Deployed release version ${state.release.version} does not match latest complete release ${expected.version}.` };
+	if (state.release.url !== expected.url) return { path: PUBLIC_RELEASE_STATE, message: "Deployed release URL does not match the latest complete release URL." };
+	if (state.release.published_at !== expected.publishedAt) return { path: PUBLIC_RELEASE_STATE, message: "Deployed release timestamp does not match the latest complete release timestamp." };
+	if (state.source.changelog_path !== expected.changelogPath) return { path: PUBLIC_RELEASE_STATE, message: `Deployed source changelog path ${state.source.changelog_path} does not match canonical ${expected.changelogPath}.` };
+	if (state.source.repository !== SOURCE_REPOSITORY) return { path: PUBLIC_RELEASE_STATE, message: `Deployed source repository ${state.source.repository} does not match ${SOURCE_REPOSITORY}.` };
+	if (state.source.commit_sha !== expected.commitSha) return { path: PUBLIC_RELEASE_STATE, message: "Deployed source commit does not match the latest complete release tag's peeled commit." };
+	return undefined;
+}
+
+function parseEvidenceText(text: string, label: string): unknown {
+	try {
+		return JSON.parse(text);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`${label} is not valid JSON: ${message}`);
+	}
+}
+
+function validateRemoteFinalEvidence(
+	finalEvidenceText: string,
+	expectedEvidenceText: string,
+	options: {
+		sourceCommit: string;
+		releaseVersion: string;
+		packageNames: readonly string[];
+	},
+): void {
+	const expected = validateExpectedEvidence(parseEvidenceText(expectedEvidenceText, "Expected evidence"));
+	const final = validateFinalEvidence(parseEvidenceText(finalEvidenceText, "Final evidence"));
+	if (expectedEvidenceText !== canonicalJsonBytes(expected).toString("utf8")) throw new Error("Expected evidence is not canonical JSON.");
+	if (finalEvidenceText !== canonicalJsonBytes(final).toString("utf8")) throw new Error("Final evidence is not canonical JSON.");
+	const expectedDigest = expectedEvidenceSha256(expected);
+	if (expected.source_commit !== options.sourceCommit || final.source_commit !== options.sourceCommit) {
+		throw new Error("Evidence source commit does not match the immutable release tag.");
+	}
+	if (expected.release_version !== options.releaseVersion || final.release_version !== options.releaseVersion) {
+		throw new Error("Evidence release version does not match the immutable release tag.");
+	}
+	const expectedPackageNames = expected.packages.map((record) => record.name);
+	if (JSON.stringify(expectedPackageNames) !== JSON.stringify(options.packageNames)) {
+		throw new Error("Evidence package set does not match the immutable public package contract.");
+	}
+	verifyFinalEvidence(expected, final, expectedDigest);
+}
+
+export async function checkLivePublicVersionSync(
+	_repoRoot = path.join(import.meta.dir, ".."),
+	fetchImpl: PublicFetch = fetch,
+	timeoutMs = LIVE_FETCH_TIMEOUT_MS,
+): Promise<SyncViolation[]> {
+	let latestReleaseResponse: Response;
+	try {
+		latestReleaseResponse = await fetchLiveResponse(fetchImpl, SOURCE_LATEST_RELEASE_API, timeoutMs);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return [{ path: SOURCE_LATEST_RELEASE_API, message: `Failed to fetch latest published source release: ${message}` }];
+	}
+	if (!latestReleaseResponse.ok) {
+		return [{ path: SOURCE_LATEST_RELEASE_API, message: `Latest published source release returned HTTP ${latestReleaseResponse.status}.` }];
+	}
+
+	const release = parseRelease(await latestReleaseResponse.json());
+	if (release === undefined) {
+		return [{ path: SOURCE_LATEST_RELEASE_API, message: "Latest published source release returned an invalid release record." }];
+	}
+
+	const completenessViolation = releaseCompletenessViolation(release);
+	if (completenessViolation !== undefined) return [completenessViolation];
+	const tagMatch = release.tag_name.match(STABLE_TAG_RE);
+	if (tagMatch === null || release.published_at === null) {
+		return [{ path: SOURCE_LATEST_RELEASE_API, message: "Latest stable source release is malformed." }];
+	}
+
+	const peeledCommit = await resolvePeeledTagCommit(release.tag_name, fetchImpl, timeoutMs);
+	if (typeof peeledCommit !== "string") return [peeledCommit];
+
+	const expectedAsset = releaseAsset(release, EXPECTED_EVIDENCE_ASSET);
+	const finalAsset = releaseAsset(release, FINAL_EVIDENCE_ASSET);
+	if (expectedAsset === undefined || finalAsset === undefined) return [{ path: SOURCE_LATEST_RELEASE_API, message: "Latest stable source release is missing required package evidence assets." }];
+
+	let expectedEvidenceResponse: Response;
+	let finalEvidenceResponse: Response;
+	try {
+		[expectedEvidenceResponse, finalEvidenceResponse] = await Promise.all([
+			fetchLiveResponse(fetchImpl, expectedAsset.browser_download_url, timeoutMs),
+			fetchLiveResponse(fetchImpl, finalAsset.browser_download_url, timeoutMs),
+		]);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return [{ path: SOURCE_LATEST_RELEASE_API, message: `Failed to fetch final release package evidence: ${message}` }];
+	}
+	if (!expectedEvidenceResponse.ok || !finalEvidenceResponse.ok) {
+		return [{ path: SOURCE_LATEST_RELEASE_API, message: "Latest stable source release package evidence assets could not be downloaded." }];
+	}
+	try {
+		validateRemoteFinalEvidence(await finalEvidenceResponse.text(), await expectedEvidenceResponse.text(), {
+			sourceCommit: peeledCommit,
+			releaseVersion: tagMatch[1],
+			packageNames: PUBLIC_RELEASE_PACKAGE_NAMES,
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		violations.push({ path: PUBLIC_HOMEPAGE, message: `Failed to fetch public homepage: ${message}` });
-		return violations;
+		return [{ path: SOURCE_LATEST_RELEASE_API, message: `Latest stable source release has invalid final package evidence: ${message}` }];
 	}
 
-	if (!response.ok) {
-		violations.push({ path: PUBLIC_HOMEPAGE, message: `Public homepage returned HTTP ${response.status}.` });
-		return violations;
+	let stateResponse: Response;
+	try {
+		stateResponse = await fetchLiveResponse(fetchImpl, PUBLIC_RELEASE_STATE, timeoutMs);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return [{ path: PUBLIC_RELEASE_STATE, message: `Failed to fetch deployed release state: ${message}` }];
 	}
+	if (!stateResponse.ok) return [{ path: PUBLIC_RELEASE_STATE, message: `Deployed release state returned HTTP ${stateResponse.status}.` }];
 
-	const homepage = await response.text();
-	const visibleVersion = homepage.match(/\bv(\d+\.\d+\.\d+)\b/i)?.[1];
-	if (!visibleVersion) {
-		violations.push({ path: PUBLIC_HOMEPAGE, message: "Public homepage does not expose a visible vX.Y.Z version marker." });
-	} else if (visibleVersion !== canonicalVersion) {
-		violations.push({
-			path: PUBLIC_HOMEPAGE,
-			message: `Public homepage version ${visibleVersion} does not match canonical ${canonicalVersion}. Redeploy or update the public site metadata.`,
-		});
-	}
-
-	return violations;
+	const state = parseReleaseSyncState(await stateResponse.text());
+	if ("message" in state) return [state];
+	const publishedAt = normalizePublishedAt(release.published_at);
+	if (publishedAt === undefined) return [{ path: SOURCE_LATEST_RELEASE_API, message: "Latest stable source release has an invalid published_at timestamp." }];
+	const violation = compareDeployedReleaseState(state, {
+		id: release.id,
+		publishedAt,
+		tag: release.tag_name,
+		url: release.html_url,
+		version: tagMatch[1],
+		changelogPath: CANONICAL_CHANGELOG_PATH,
+		commitSha: peeledCommit,
+	});
+	return violation === undefined ? [] : [violation];
 }
 if (import.meta.main) {
 	const live = process.argv.includes("--live");

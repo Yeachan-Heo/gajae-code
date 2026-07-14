@@ -163,6 +163,20 @@ describe("TopicRegistry", () => {
 		expect(reloaded.needsIdentity("s1")).toBe(false);
 		expect(reloaded.sessionForTopic("t1")).toBe("s1");
 	});
+	test("persists a monotonic SDK replay cursor across daemon restarts", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "t1");
+		expect(reg.replayCursor("s1")).toBeUndefined();
+		expect(reg.markReplayCursor("s1", 2, 7)).toBe(true);
+		expect(reg.markReplayCursor("s1", 2, 6)).toBe(false);
+		expect(reg.markReplayCursor("s1", 1, 99)).toBe(false);
+
+		const reloaded = new TopicRegistry(reg.serialize());
+		expect(reloaded.replayCursor("s1")).toEqual({ generation: 2, seq: 7 });
+		expect(reloaded.markReplayCursor("s1", 3, 1)).toBe(true);
+		expect(reloaded.replayCursor("s1")).toEqual({ generation: 3, seq: 1 });
+	});
+
 	test("concurrent getOrCreateTopic for one session creates exactly one topic (no race)", async () => {
 		const reg = new TopicRegistry();
 		let creates = 0;

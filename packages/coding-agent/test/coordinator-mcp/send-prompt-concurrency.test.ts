@@ -84,7 +84,7 @@ describe("send_prompt same-session concurrency", () => {
 							: ({
 									control: async (operation: string) => {
 										expect(operation).toBe("turn.prompt");
-										return { accepted: true };
+										return { accepted: true, commandId: "runtime-command", turnId: "runtime-turn" };
 									},
 									close: async () => {},
 								} as never),

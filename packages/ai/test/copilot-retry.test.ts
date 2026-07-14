@@ -89,6 +89,21 @@ describe("callWithCopilotModelRetry", () => {
 		expect(calls).toBe(3);
 	});
 
+	it("does not replay a managed Copilot attempt", async () => {
+		let calls = 0;
+		const err = copilotError({ status: 400, code: "model_not_supported", message: "transient" });
+		await expect(
+			callWithCopilotModelRetry(
+				async () => {
+					calls += 1;
+					throw err;
+				},
+				{ provider: "github-copilot", fallbackManaged: true },
+			),
+		).rejects.toBe(err);
+		expect(calls).toBe(1);
+	});
+
 	it("succeeds on the second attempt when the first is transient", async () => {
 		let calls = 0;
 		const result = await callWithCopilotModelRetry(

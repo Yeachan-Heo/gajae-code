@@ -1,18 +1,25 @@
 import { describe, expect, it, test } from "bun:test";
-import { ThinkingLevel } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+
 import type { Model } from "@gajae-code/ai";
+import { TempDir } from "@gajae-code/utils";
 import {
 	activateModelProfile,
 	applyPreparedModelProfileActivation,
 	formatModelProfileCredentialError,
 	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
+	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
 } from "../src/config/model-profile-activation";
+
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
-import type { ModelRegistry } from "../src/config/model-registry";
+import { kNoAuth, type ModelRegistry } from "../src/config/model-registry";
+import { resolveModelChainWithAuth } from "../src/config/model-resolver";
 import { Settings } from "../src/config/settings";
+import { AgentSession } from "../src/session/agent-session";
+import { SessionManager } from "../src/session/session-manager";
 
 const model = (provider: string, id: string, thinking?: Model["thinking"]): Model =>
 	({
@@ -75,10 +82,24 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 			}),
 			model("openai-codex", "gpt-5.6-luna", {
 				mode: "effort",
-				minLevel: ThinkingLevel.Medium,
+				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
 			}),
 			model("openai-codex", "gpt-5.3-codex-spark"),
+			model("anthropic", "claude-opus-4-8", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
+			model("anthropic", "claude-fable-5", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
+			model("anthropic", "claude-sonnet-5"),
+			model("opencode-go", "deepseek-v4-pro"),
+			model("opencode-go", "kimi-k2.6"),
+			model("opencode-go", "mimo-v2.5-pro"),
 			model("minimax-code", "minimax-m3"),
 			model("minimax-code-cn", "minimax-m3"),
 			model("kimi-code", "kimi-k2.5"),
@@ -97,6 +118,20 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
+		configuredModelChains: new Map<string, readonly string[]>(),
+		seedDefaultFallbackResolutionCalls: [] as Array<{
+			activeIndex: number;
+			skips: Array<{ selector: string; reason: string }>;
+		}>,
+		getConfiguredModelChain(role: string) {
+			return this.configuredModelChains.get(role);
+		},
+		setConfiguredModelChain(role: string, entries: readonly string[]) {
+			this.configuredModelChains.set(role, [...entries]);
+		},
+		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
+			this.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
+		},
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
@@ -130,6 +165,327 @@ describe("model profile activation", () => {
 		});
 	});
 
+	test("keeps unauthenticated fallback heads and authenticated mixed-provider tails", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "fallback-profile",
+			requiredProviders: [],
+			modelMapping: {
+				default: ["provider-a/default:high", "provider-b/executor"],
+				executor: ["provider-c/executor", "provider-b/executor"],
+			},
+			source: "user",
+		};
+		const session = fakeSession();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry({ missingProviders: ["provider-a", "provider-c"], profiles: [profile] }),
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(prepared.defaultChain).toEqual(["provider-a/default:high", "provider-b/executor"]);
+		expect(prepared.agentModelOverrides.executor).toEqual(["provider-c/executor", "provider-b/executor"]);
+		await applyPreparedModelProfileActivation(prepared);
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-a/default:high", "provider-b/executor"]);
+	});
+
+	test("preserves unavailable default-chain entries and activates the valid tail", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unavailable-head",
+			requiredProviders: [],
+			modelMapping: { default: ["provider-a/missing", "provider-b/executor"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ profiles: [profile] }),
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(session.model).toMatchObject({ provider: "provider-b", id: "executor" });
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-a/missing", "provider-b/executor"]);
+		expect(session.seedDefaultFallbackResolutionCalls).toEqual([
+			{ activeIndex: 1, skips: [{ selector: "provider-a/missing", reason: "unknown_model" }] },
+		]);
+	});
+
+	test("preserves a fully unresolved executor chain and skips it without request attempts", async () => {
+		const executorChain = ["provider-a/unknown-executor", "provider-b/unknown-executor"];
+		const profile: ModelProfileDefinition = {
+			name: "unresolved-executor",
+			requiredProviders: [],
+			modelMapping: { default: "provider-a/default", executor: executorChain },
+			source: "user",
+		};
+		const settings = Settings.isolated();
+		await activateModelProfile({
+			session: fakeSession(),
+			modelRegistry: fakeRegistry({ profiles: [profile] }),
+			settings,
+			profileName: profile.name,
+		});
+
+		expect(settings.get("task.agentModelOverrides").executor).toEqual(executorChain);
+		let credentialLookups = 0;
+		const resolution = await resolveModelChainWithAuth(
+			executorChain,
+			{
+				getAvailable: () => [],
+				getApiKey: async () => {
+					credentialLookups += 1;
+					return kNoAuth;
+				},
+			},
+			settings,
+			"session-1",
+			{ managedFallback: true },
+		);
+		expect(resolution.model).toBeUndefined();
+		expect(resolution).toMatchObject({
+			activeIndex: executorChain.length,
+			skips: executorChain.map(selector => ({ selector, reason: "unknown_model" })),
+		});
+		expect(credentialLookups).toBe(0);
+	});
+
+	test("preserves unavailable middle and tail entries while resolving the first usable default", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unavailable-middle-tail",
+			requiredProviders: [],
+			modelMapping: { default: ["provider-a/default", "provider-a/missing", "provider-b/missing"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ profiles: [profile] }),
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(session.model).toMatchObject({ provider: "provider-a", id: "default" });
+		expect(session.getConfiguredModelChain("default")).toEqual([
+			"provider-a/default",
+			"provider-a/missing",
+			"provider-b/missing",
+		]);
+		expect(session.seedDefaultFallbackResolutionCalls).toEqual([{ activeIndex: 0, skips: [] }]);
+	});
+
+	test("skips authenticated Cursor default heads before seeding a retryable fallback chain", async () => {
+		const cursor = { ...model("cursor", "agent"), api: "cursor-agent" } as Model;
+		const fallback = model("provider-b", "executor");
+		const profile: ModelProfileDefinition = {
+			name: "cursor-default-head",
+			requiredProviders: [],
+			modelMapping: { default: ["cursor/agent", "provider-b/executor"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		const registry = { ...fakeRegistry({ profiles: [profile] }), getAll: () => [cursor, fallback] };
+		await activateModelProfile({
+			session,
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(session.model).toMatchObject({ provider: "provider-b", id: "executor" });
+		expect(session.getConfiguredModelChain("default")).toEqual(["cursor/agent", "provider-b/executor"]);
+		expect(session.seedDefaultFallbackResolutionCalls).toEqual([
+			{
+				activeIndex: 1,
+				skips: [
+					{
+						selector: "cursor/agent",
+						reason:
+							"Cursor model cursor/agent requires provider-side tool execution and cannot be used in a retryable fallback chain",
+					},
+				],
+			},
+		]);
+	});
+
+	test("skips unauthenticated default-chain entries and seeds the authenticated tail", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unauthenticated-head",
+			requiredProviders: [],
+			modelMapping: { default: ["provider-a/default:high", "provider-b/executor"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ missingProviders: ["provider-a"], profiles: [profile] }),
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(session.model).toMatchObject({ provider: "provider-b", id: "executor" });
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-a/default:high", "provider-b/executor"]);
+		expect(session.seedDefaultFallbackResolutionCalls).toEqual([
+			{ activeIndex: 1, skips: [{ selector: "provider-a/default:high", reason: "unauthenticated" }] },
+		]);
+	});
+
+	test("hard required providers still gate activation", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "hard-required",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: ["provider-b/executor", "provider-c/executor"] },
+			source: "user",
+		};
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: fakeRegistry({ missingProviders: ["provider-a"], profiles: [profile] }),
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow('Model profile "hard-required" requires credentials for: provider-a.');
+	});
+
+	test("accepts the kNoAuth sentinel for required keyless providers", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "keyless-required",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getApiKeyForProvider: async () => kNoAuth,
+		};
+
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).resolves.toMatchObject({ profileName: profile.name });
+	});
+
+	test("installs the default chain and restores the previous chain on rollback", async () => {
+		const session = fakeSession();
+		session.setConfiguredModelChain("default", ["provider-c/default"]);
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		settings.flush = async () => {
+			throw new Error("flush failed");
+		};
+
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+			"flush failed",
+		);
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
+	});
+
+	test("rollback from an unconfigured session clears the profile chain before reopen", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-chain-rollback-");
+		try {
+			const previousModel = model("provider-c", "default");
+			const manager = SessionManager.create(tempDir.path(), tempDir.path());
+			const sessionRegistry = { ...fakeRegistry(), getApiKey: async () => kNoAuth };
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: sessionRegistry as unknown as ModelRegistry,
+			});
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: sessionRegistry as unknown as ModelRegistry,
+				settings,
+				profileName: "profile-a",
+			});
+			settings.flush = async () => {
+				throw new Error("flush failed");
+			};
+
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"flush failed",
+			);
+			expect(manager.buildSessionContext().configuredModelChains.default?.entries).toEqual(["provider-c/default"]);
+
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted session file");
+			await manager.close();
+
+			const reopened = await SessionManager.open(sessionFile);
+			try {
+				expect(reopened.buildSessionContext().models.default).toBe("provider-c/default");
+				expect(reopened.buildSessionContext().configuredModelChains.default?.entries).toEqual([
+					"provider-c/default",
+				]);
+			} finally {
+				await reopened.close();
+			}
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	test("restores a persisted AgentSession configured chain and activates its head on resume", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-chain-resume-");
+		try {
+			const head = model("provider-a", "default");
+			const fallback = model("provider-b", "executor");
+			const manager = SessionManager.create(tempDir.path(), tempDir.path());
+			const configuringSession = new AgentSession({
+				agent: new Agent({ initialState: { model: fallback, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: {
+					getAvailable: () => [head, fallback],
+					getApiKey: async () => kNoAuth,
+				} as unknown as ModelRegistry,
+			});
+			configuringSession.setConfiguredModelChain(
+				"default",
+				["provider-a/default", "provider-b/executor"],
+				"profile-activation",
+			);
+			manager.appendModelChange("provider-b/executor", "default");
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted session file");
+			await manager.close();
+
+			const reopened = await SessionManager.open(sessionFile);
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model: fallback, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: reopened,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: {
+					getAvailable: () => [head, fallback],
+					getApiKey: async () => kNoAuth,
+				} as unknown as ModelRegistry,
+			});
+			try {
+				expect(await session.switchSession(sessionFile)).toBe(true);
+				expect(session.getConfiguredModelChain("default")).toEqual(["provider-a/default", "provider-b/executor"]);
+				expect(session.model).toMatchObject({ provider: "provider-a", id: "default" });
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
 	test("alternative selector rewrite stays within matching provider group", async () => {
 		const prepared = await prepareModelProfileActivation({
 			session: fakeSession(),
@@ -159,21 +515,79 @@ describe("model profile activation", () => {
 			architect: "provider-b/executor",
 		});
 	});
-	test("builtin codex-eco preserves high-effort Luna and Terra selectors", async () => {
-		const registry = fakeRegistry({ profiles: [...BUILTIN_MODEL_PROFILES] });
-		const catalog = BUILTIN_MODEL_PROFILES.find(profile => profile.name === "codex-eco");
-		expect(catalog?.modelMapping.executor).toBe("openai-codex/gpt-5.6-luna:high");
-
+	test.each([
+		[
+			"codex-eco",
+			{
+				default: "openai-codex/gpt-5.6-terra:low",
+				executor: "openai-codex/gpt-5.6-luna:low",
+				planner: "openai-codex/gpt-5.6-luna:high",
+				critic: "openai-codex/gpt-5.6-terra:xhigh",
+				architect: "openai-codex/gpt-5.6-terra:high",
+			},
+		],
+		[
+			"codex-medium",
+			{
+				default: "openai-codex/gpt-5.6-sol:low",
+				executor: "openai-codex/gpt-5.6-terra:low",
+				planner: "openai-codex/gpt-5.6-terra:high",
+				critic: "openai-codex/gpt-5.6-sol:xhigh",
+				architect: "openai-codex/gpt-5.6-sol:high",
+			},
+		],
+		[
+			"codex-pro",
+			{
+				default: "openai-codex/gpt-5.6-sol:medium",
+				executor: "openai-codex/gpt-5.6-terra:medium",
+				planner: "openai-codex/gpt-5.6-sol:high",
+				critic: "openai-codex/gpt-5.6-sol:max",
+				architect: "openai-codex/gpt-5.6-sol:xhigh",
+			},
+		],
+		[
+			"opus-codex",
+			{
+				default: "anthropic/claude-opus-4-8:xhigh",
+				executor: "openai-codex/gpt-5.6-terra:low",
+				planner: "anthropic/claude-sonnet-5",
+				critic: "openai-codex/gpt-5.6-sol:xhigh",
+				architect: "openai-codex/gpt-5.6-sol:high",
+			},
+		],
+		[
+			"codex-opencodego",
+			{
+				default: "openai-codex/gpt-5.6-sol:low",
+				executor: "opencode-go/deepseek-v4-pro",
+				planner: "opencode-go/kimi-k2.6",
+				critic: "opencode-go/mimo-v2.5-pro",
+				architect: "openai-codex/gpt-5.6-sol:high",
+			},
+		],
+		[
+			"fable-opus-codex",
+			{
+				default: "anthropic/claude-fable-5:high",
+				executor: "openai-codex/gpt-5.6-terra:medium",
+				planner: "anthropic/claude-opus-4-8:medium",
+				critic: "anthropic/claude-opus-4-8:high",
+				architect: "openai-codex/gpt-5.6-sol:xhigh",
+			},
+		],
+	] satisfies Array<
+		[string, Record<string, string>]
+	>)("prepares the reconstructed five-role mapping for %s", async (profileName, expected) => {
 		const prepared = await prepareModelProfileActivation({
 			session: fakeSession(),
-			modelRegistry: registry,
+			modelRegistry: fakeRegistry({ profiles: [...BUILTIN_MODEL_PROFILES] }),
 			settings: Settings.isolated(),
-			profileName: "codex-eco",
+			profileName,
 		});
-		expect(prepared.agentModelOverrides.executor).toBe("openai-codex/gpt-5.6-luna:high");
-		expect(prepared.agentModelOverrides.architect).toBe("openai-codex/gpt-5.6-sol:medium");
-		expect(prepared.agentModelOverrides.planner).toBe("openai-codex/gpt-5.6-terra:medium");
-		expect(prepared.agentModelOverrides.critic).toBe("openai-codex/gpt-5.6-terra:high");
+
+		const defaultSelector = `${prepared.defaultModel?.provider}/${prepared.defaultModel?.id}:${prepared.defaultThinkingLevel}`;
+		expect({ default: defaultSelector, ...prepared.agentModelOverrides }).toEqual(expected);
 	});
 
 	test("session-only changes active model and replaces runtime overrides without persisted sets", async () => {
@@ -228,6 +642,56 @@ describe("model profile activation", () => {
 		});
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("materializing a non-default role retains the active default chain from the live fallback", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "default-chain-profile",
+			requiredProviders: [],
+			modelMapping: { default: ["provider-a/default", "provider-b/executor", "provider-c/default"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": profile.name });
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry({ profiles: [profile] }),
+			settings,
+			profileName: profile.name,
+		});
+		session.model = model("provider-b", "executor");
+		session.thinkingLevel = undefined;
+
+		materializeActiveModelProfileAssignment({
+			session,
+			settings,
+			role: "executor",
+			selector: "provider-c/executor",
+		});
+
+		expect(settings.get("modelRoles").default).toEqual(["provider-b/executor", "provider-c/default"]);
+	});
+
+	test("profile deletion materializes the complete default fallback chain", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "delete-chain-profile",
+			requiredProviders: [],
+			modelMapping: { default: ["provider-a/default:high", "provider-b/executor", "provider-c/default"] },
+			source: "user",
+		};
+		const settings = Settings.isolated({ "modelProfile.default": profile.name });
+		await materializeModelProfileForDeletion({
+			session: fakeSession(),
+			modelRegistry: fakeRegistry({ profiles: [profile] }),
+			settings,
+			profileName: profile.name,
+		});
+
+		expect(settings.get("modelRoles").default).toEqual([
+			"provider-a/default:high",
+			"provider-b/executor",
+			"provider-c/default",
+		]);
 	});
 
 	test("materializing a default override stores the selected default and clears the profile", async () => {
@@ -452,11 +916,16 @@ function stubXiaomiRegistry(
 }
 
 function stubXiaomiSession() {
+	const configuredModelChains = new Map<string, readonly string[]>();
 	return {
 		model: undefined,
 		thinkingLevel: ThinkingLevel.Medium,
 		sessionId: "test-session",
 		setModelTemporary: async () => {},
+		setConfiguredModelChain: (role: string, entries: readonly string[]) => {
+			configuredModelChains.set(role, [...entries]);
+		},
+		getConfiguredModelChain: (role: string) => configuredModelChains.get(role),
 		setActiveModelProfile: () => {},
 		getActiveModelProfile: () => undefined,
 	};

@@ -764,6 +764,112 @@ describe("telegram daemon", () => {
 		expect(daemonConstructed).toBe(false);
 	});
 
+	test("requests startup replay and restores identity from replay envelopes", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		const socket = FakeWs.instances[0]!;
+		socket.dispatchEvent(new Event("open"));
+		const session = daemon.sessions.get("S")!;
+		const liveDuringReplay = {
+			type: "action_needed",
+			kind: "ask",
+			id: "live",
+			question: "Now?",
+			options: ["Yes"],
+		};
+		await daemon.handleSessionMessage(session, liveDuringReplay);
+		expect(session.pending.has("live")).toBe(false);
+		expect(socket.sent.map(frame => JSON.parse(frame))).toContainEqual({
+			type: "event_replay",
+			id: "telegram-startup-replay:S",
+			sinceGeneration: 1,
+			sinceSeq: 0,
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: "telegram-startup-replay:S",
+			generation: 1,
+			lastSeq: 4,
+			events: [
+				{
+					type: "event",
+					name: "action_needed",
+					payload: { type: "action_needed", kind: "ask", id: "stale", question: "Old?", options: ["No"] },
+				},
+				{
+					type: "event",
+					name: "identity_header",
+					payload: { type: "identity_header", sessionId: "S", repo: "gajae-code", branch: "dev" },
+				},
+				{
+					type: "event",
+					name: "action_needed",
+					payload: liveDuringReplay,
+				},
+				{
+					type: "event",
+					name: "turn_stream",
+					payload: {
+						type: "turn_stream",
+						sessionId: "S",
+						phase: "finalized",
+						text: "already-delivered-history",
+					},
+				},
+			],
+		});
+		expect(bot.calls.some(call => call.method === "createForumTopic")).toBe(true);
+		expect(session.pending.has("stale")).toBe(false);
+		expect(session.pending.has("live")).toBe(true);
+		expect(
+			bot.calls.filter(call => call.method === "sendMessage" && String(call.body.text).includes("Now?")).length,
+		).toBe(1);
+		expect(bot.calls.some(call => String(call.body.text).includes("already-delivered-history"))).toBe(false);
+
+		daemon.connectSession("S", "ws://s-reconnected", "ts-2");
+		const replacementSocket = FakeWs.instances[1]!;
+		replacementSocket.dispatchEvent(new Event("open"));
+		expect(replacementSocket.sent.map(frame => JSON.parse(frame))).toContainEqual({
+			type: "event_replay",
+			id: "telegram-startup-replay:S",
+			sinceGeneration: 1,
+			sinceSeq: 4,
+		});
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "event_replay_result",
+			id: "telegram-startup-replay:S",
+			generation: 1,
+			lastSeq: 5,
+			events: [
+				{
+					type: "event",
+					generation: 1,
+					seq: 5,
+					name: "turn_stream",
+					payload: {
+						type: "turn_stream",
+						sessionId: "S",
+						phase: "finalized",
+						text: "delivered-before-reconnect",
+					},
+				},
+			],
+		});
+		expect(bot.calls.some(call => String(call.body.text).includes("delivered-before-reconnect"))).toBe(false);
+	});
+
 	test("callback alias from session B routes only to session B", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
@@ -3391,6 +3497,13 @@ test("session_closed tombstones its endpoint generation so scans do not recreate
 	await daemon.scanRoots();
 	expect(FakeWs.instances).toHaveLength(1);
 	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+		type: "event_replay_result",
+		id: "telegram-startup-replay:S",
+		generation: 1,
+		lastSeq: 0,
+		events: [],
+	});
 	await waitForCreate();
 	await waitForTopicRecord();
 
@@ -4130,18 +4243,26 @@ test("identity_header during an in-flight eager create still renames the topic",
 	// Eager create starts and blocks in-flight on createGate.
 	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
 	await Promise.resolve();
-	// identity_header arrives while the create is still in flight -> joins it.
+	// identity_header arrives live while replay is pending, then appears in the
+	// replay snapshot too. The barrier must apply it exactly once.
 	const session = daemon.sessions.get("sess-xyz999")!;
-	const identityP = daemon.handleSessionMessage(session as any, {
+	const identity = {
 		type: "identity_header",
 		sessionId: "sess-xyz999",
 		repo: "myrepo",
 		branch: "mybranch",
+	};
+	await daemon.handleSessionMessage(session, identity);
+	const replayP = daemon.handleSessionMessage(session, {
+		type: "event_replay_result",
+		id: "telegram-startup-replay:sess-xyz999",
+		generation: 1,
+		lastSeq: 1,
+		events: [{ type: "event", name: "identity_header", payload: identity }],
 	});
 	await Promise.resolve();
 	releaseCreate("777"); // now resolve the single shared create
-	await identityP;
-	await new Promise(r => setTimeout(r, 10));
+	await replayP;
 	// Exactly one topic created (provisional name), then renamed to identity name.
 	expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(1);
 	expect(bot.calls.find(c => c.method === "createForumTopic")!.body.name).toBe("GJC xyz999");

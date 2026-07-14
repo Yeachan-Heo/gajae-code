@@ -114,6 +114,28 @@ test("dispatches every control registry operation to its ControlSurface method",
 	expect(calls).toEqual(rows.map(row => methodByOperation[row.sdkId]));
 });
 
+test("forwards an optional thinking level with model.set without changing legacy calls", async () => {
+	const model = OPERATIONS.find(row => row.sdkId === "model.set")!;
+	const calls: unknown[][] = [];
+	const surface = {
+		setModel: (...args: unknown[]) => {
+			calls.push(args);
+			return { changed: true };
+		},
+	} as unknown as ControlSurface;
+
+	await dispatchControl(surface, model, { ...request(model), input: { id: "provider/model" } });
+	await dispatchControl(surface, model, {
+		...request(model),
+		input: { id: "provider/model", thinkingLevel: "high" },
+	});
+
+	expect(calls).toEqual([
+		["provider/model", undefined],
+		["provider/model", "high"],
+	]);
+});
+
 test("rejects unknown operations, malformed input, and missing destructive confirmation", async () => {
 	const surface = {} as ControlSurface;
 	const unknown = await dispatchControl(surface, undefined, { id: "x", operation: "no.such.operation", input: {} });
@@ -167,6 +189,80 @@ test("serializes ordered operations while retry.now bypasses the session chain",
 	expect(started).toEqual(["retry", "first", "second"]);
 });
 
+test("abort-and-prompt cancels pending preflight but waits for prior ordered controls", async () => {
+	const prompt = OPERATIONS.find(row => row.sdkId === "turn.prompt")!;
+	const model = OPERATIONS.find(row => row.sdkId === "model.set")!;
+	const replacement = OPERATIONS.find(row => row.sdkId === "turn.abort_and_prompt")!;
+	const promptStarted = Promise.withResolvers<void>();
+	const modelStarted = Promise.withResolvers<void>();
+	const preflight = Promise.withResolvers<void>();
+	const longModelOperation = Promise.withResolvers<void>();
+	const calls: string[] = [];
+	const surface = {
+		prompt: async () => {
+			calls.push("prompt");
+			promptStarted.resolve();
+			await preflight.promise;
+		},
+		setModel: async () => {
+			calls.push("model");
+			modelStarted.resolve();
+			await longModelOperation.promise;
+		},
+		abortAndPrompt: () => {
+			calls.push("replacement");
+		},
+		cancelPendingPreflights: () => {
+			calls.push("cancel");
+			preflight.resolve();
+		},
+	} as unknown as ControlSurface;
+	const initial = dispatchControl(surface, prompt, { ...request(prompt), input: { text: "pending" } });
+	await promptStarted.promise;
+	const ordered = dispatchControl(surface, model, request(model));
+	const replace = dispatchControl(surface, replacement, { ...request(replacement), input: { text: "replace" } });
+
+	expect(calls).toEqual(["prompt", "cancel"]);
+	await modelStarted.promise;
+	expect(calls).toEqual(["prompt", "cancel", "model"]);
+	longModelOperation.resolve();
+	await Promise.all([initial, ordered, replace]);
+	expect(calls).toEqual(["prompt", "cancel", "model", "replacement"]);
+});
+
+test("serializes concurrent abort-and-prompt replacements after preflight cancellation", async () => {
+	const replacement = OPERATIONS.find(row => row.sdkId === "turn.abort_and_prompt")!;
+	const firstStarted = Promise.withResolvers<void>();
+	const releaseFirst = Promise.withResolvers<void>();
+	const calls: string[] = [];
+	const surface = {
+		abortAndPrompt: async (text: string) => {
+			calls.push(`replacement:${text}`);
+			if (text === "first") {
+				firstStarted.resolve();
+				await releaseFirst.promise;
+			}
+		},
+		cancelPendingPreflights: () => calls.push("cancel"),
+	} as unknown as ControlSurface;
+	const first = dispatchControl(surface, replacement, {
+		...request(replacement),
+		id: "first",
+		input: { text: "first" },
+	});
+	const second = dispatchControl(surface, replacement, {
+		...request(replacement),
+		id: "second",
+		input: { text: "second" },
+	});
+	expect(calls).toEqual(["cancel", "cancel"]);
+	await firstStarted.promise;
+	expect(calls).toEqual(["cancel", "cancel", "replacement:first"]);
+	releaseFirst.resolve();
+	await Promise.all([first, second]);
+	expect(calls).toEqual(["cancel", "cancel", "replacement:first", "replacement:second"]);
+});
+
 test("preserves typed registry errors and maps unknown failures to internal", async () => {
 	const tools = OPERATIONS.find(row => row.sdkId === "tools.active.set")!;
 	const typed = await dispatchControl(
@@ -189,6 +285,41 @@ test("preserves typed registry errors and maps unknown failures to internal", as
 		request(tools),
 	);
 	expect(internal.error).toEqual({ code: "internal", message: "Control operation failed." });
+});
+
+test("bounds default model selection recovery details on the SDK error", async () => {
+	const model = OPERATIONS.find(row => row.sdkId === "model.set")!;
+	const response = await dispatchControl(
+		{
+			setModel: () => {
+				throw {
+					code: "default_model_selection_recovery",
+					message: "private failure text",
+					recovery: {
+						message: "private failure text",
+						rollback: {
+							disposition: "partial",
+							failures: [{ stage: "durable", message: "private durable text" }],
+						},
+					},
+				};
+			},
+		} as unknown as ControlSurface,
+		model,
+		request(model),
+	);
+
+	expect(response.error).toEqual({
+		code: "default_model_selection_recovery",
+		message: "Default model selection could not be completed after durable selection.",
+		details: {
+			message: "Default model selection could not be completed after durable selection.",
+			rollback: {
+				disposition: "partial",
+				failures: [{ stage: "durable", message: "Durable default selection recovery could not be completed." }],
+			},
+		},
+	});
 });
 
 test("replays matching idempotency requests, rejects conflicts, and evicts LRU entries", async () => {

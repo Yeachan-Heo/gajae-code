@@ -228,7 +228,12 @@ export class SessionIndex {
 			latest.set(
 				event.sessionId,
 				event.type === "host_heartbeat" && previous
-					? { ...event, locator: previous.locator, endpointMtimeMs: previous.endpointMtimeMs }
+					? {
+							...event,
+							locator: previous.locator,
+							endpointMtimeMs: previous.endpointMtimeMs,
+							lifecycleRequestId: previous.lifecycleRequestId,
+						}
 					: event,
 			);
 		}

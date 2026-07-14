@@ -313,38 +313,52 @@ describe("CustomEditor bracketed paste interception", () => {
 		expect(editor.getText()).toBe("hello");
 	});
 
-	it("keeps later input behind a pending async consumed paste", async () => {
+	it("follows live before dispatching an async consumed paste and replays later input afterward", async () => {
 		const editor = createEditor();
 		const pasteDecision = Promise.withResolvers<boolean>();
-		editor.onPasteText = vi.fn(() => pasteDecision.promise);
-
+		const trace: string[] = [];
 		editor.handleInput("before ");
+		editor.onViewportFollowLive = () => trace.push("follow");
+		editor.onPasteText = () => {
+			trace.push("paste");
+			return pasteDecision.promise;
+		};
+
 		editor.handleInput("\x1b[200~/tmp/clipboard-2026-06-04-120441-CAC144E7.png\x1b[201~");
 		editor.handleInput("after");
 
 		expect(editor.getText()).toBe("before ");
+		expect(trace).toEqual(["follow", "paste"]);
 
 		pasteDecision.resolve(true);
 		await Bun.sleep(0);
 
 		expect(editor.getText()).toBe("before after");
+		expect(trace).toEqual(["follow", "paste", "follow"]);
 	});
 
-	it("replays async unconsumed paste before later input", async () => {
+	it("follows live before dispatching an async unconsumed paste and replays paste before later input", async () => {
 		const editor = createEditor();
 		const pasteDecision = Promise.withResolvers<boolean>();
-		editor.onPasteText = vi.fn(() => pasteDecision.promise);
-
+		const trace: string[] = [];
 		editor.handleInput("before ");
+		editor.onViewportFollowLive = () => trace.push("follow");
+		editor.onPasteText = () => {
+			trace.push("paste");
+			return pasteDecision.promise;
+		};
+
 		editor.handleInput("\x1b[200~middle \x1b[201~");
 		editor.handleInput("after");
 
 		expect(editor.getText()).toBe("before ");
+		expect(trace).toEqual(["follow", "paste"]);
 
 		pasteDecision.resolve(false);
 		await Bun.sleep(0);
 
 		expect(editor.getText()).toBe("before middle after");
+		expect(trace).toEqual(["follow", "paste", "follow"]);
 	});
 
 	it("drops queued input and ignores late async paste decisions after timeout", async () => {

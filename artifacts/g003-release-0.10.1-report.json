@@ -1,0 +1,42 @@
+{
+	"schemaVersion": 1,
+	"kind": "package-release-test-report",
+	"story": "G003 Release 0.10.1",
+	"releaseTag": "v0.10.1",
+	"sourceCommit": "ff03e588a06e4e0c174d43c817d656d3dc2122df",
+	"npm": {
+		"live": "14/14 public packages at 0.10.1",
+		"verifiedVia": "npm view <pkg>@0.10.1 version",
+		"packages": [
+			"gajae-code", "@gajae-code/coding-agent", "@gajae-code/natives",
+			"@gajae-code/natives-darwin-x64", "@gajae-code/natives-darwin-arm64",
+			"@gajae-code/natives-linux-x64", "@gajae-code/natives-linux-arm64",
+			"@gajae-code/natives-win32-x64", "@gajae-code/utils", "@gajae-code/ai",
+			"@gajae-code/tui", "@gajae-code/agent-core", "@gajae-code/stats", "@gajae-code/bridge-client"
+		]
+	},
+	"githubRelease": {
+		"verifiedVia": "gh api repos/Yeachan-Heo/gajae-code/releases/tags/v0.10.1 (REST)",
+		"id": 352998068,
+		"draft": false,
+		"prerelease": false,
+		"assets": [
+			"gjc-darwin-arm64", "gjc-darwin-x64", "gjc-linux-arm64", "gjc-linux-x64",
+			"gjc-windows-x64.exe", "gajae-release-packages-expected-v1.json", "gajae-release-packages-v1.json"
+		]
+	},
+	"tag": { "verifiedVia": "git ls-remote origin refs/tags/v0.10.1", "sha": "ff03e588a06e4e0c174d43c817d656d3dc2122df" },
+	"pipelineFixes": [
+		"release_npm_publish now runs bun install before ci-release-publish (TS2688 @types/bun fix)",
+		"rpc-default-model-selection-docs test survives the release changelog roll",
+		"status-line-cache-redteam test exercises context via SSOT getContextUsage"
+	],
+	"knownPipelineBugsForDevFollowup": [
+		"observeRegistryPackage has no post-publish readback retry/backoff — each npm-registry propagation delay failed release_npm_publish; required N reruns (idempotent skip made this safe, not lossy)",
+		"release_github_verify runs gh without a checkout or GH_REPO env → 'not a git repository'; did not block final publish but is a latent job bug"
+	],
+	"deviations": [
+		"v0.10.0->0.10.1 skipped 0.10.1 twice then landed as 0.10.1 per user override of the immutable-tag fail-forward policy; safe because nothing was published under any burned tag (verified npm E404 before retag)"
+	],
+	"mergeBackToDev": "origin/main (ff03e588) merged into origin/dev as 5bb33348"
+}

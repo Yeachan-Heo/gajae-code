@@ -197,6 +197,42 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(rebuildCount).toBe(2);
 	});
 
+	it("retries an identical MCP refresh after a superseding explicit rebuild fails", async () => {
+		// Given
+		const firstRebuildEntered = Promise.withResolvers<void>();
+		const releaseFirstRebuild = Promise.withResolvers<void>();
+		const explicitRefreshError = new Error("explicit rebuild failed");
+		let rebuildCount = 0;
+		const { session } = newSession(async toolNames => {
+			const rebuild = ++rebuildCount;
+			if (rebuild === 1) {
+				firstRebuildEntered.resolve();
+				await releaseFirstRebuild.promise;
+			}
+			if (rebuild === 2) throw explicitRefreshError;
+			return `tools:${toolNames.join(",")}`;
+		});
+		const tool = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search");
+
+		// When
+		const firstRefresh = session.refreshMCPTools([tool]);
+		await firstRebuildEntered.promise;
+		let explicitFailure: unknown;
+		try {
+			await session.refreshBaseSystemPrompt();
+		} catch (error) {
+			explicitFailure = error;
+		}
+		expect(explicitFailure).toBe(explicitRefreshError);
+		releaseFirstRebuild.resolve();
+		await firstRefresh;
+		await session.refreshMCPTools([tool]);
+
+		// Then
+		expect(rebuildCount).toBe(3);
+		expect(session.systemPrompt).toEqual(["tools:read,mcp__nucleus_search"]);
+	});
+
 	it("ignores incidental insertion order in the refresh argument", async () => {
 		let rebuildCount = 0;
 		const { session } = newSession(async toolNames => {

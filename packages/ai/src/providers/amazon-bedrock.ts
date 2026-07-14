@@ -30,6 +30,7 @@ import type {
 } from "../types";
 import { normalizeToolCallId, resolveCacheRetention, sanitizeJsonStrings } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
@@ -317,7 +318,12 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					new Error(`Bedrock HTTP ${response.status}: ${errBody.slice(0, 1000)}`),
 					response.status,
 				);
-				if (firstTokenTime === undefined && !fallbackRan && isForcedToolChoiceUnsupportedError(error, true)) {
+				if (
+					firstTokenTime === undefined &&
+					!fallbackRan &&
+					!options.fallbackManaged &&
+					isForcedToolChoiceUnsupportedError(error, true)
+				) {
 					response = await retryWithoutForcedToolChoice(error.message);
 				} else {
 					throw error;
@@ -349,6 +355,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 							firstTokenTime === undefined &&
 							sentForcedToolChoice &&
 							!fallbackRan &&
+							!options.fallbackManaged &&
 							isForcedToolChoiceUnsupportedError(error, true)
 						) {
 							response = await retryWithoutForcedToolChoice(error.message);
@@ -432,6 +439,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error);
 			const baseMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			// Enrich error with thinking block diagnostics for signature-related failures
 			let diagnostics = "";

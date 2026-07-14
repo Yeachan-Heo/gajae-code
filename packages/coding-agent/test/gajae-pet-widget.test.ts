@@ -24,19 +24,42 @@ function makeStubs(columns = 80, rows = 30) {
 		invalidate() {},
 	} as unknown as CustomEditor;
 	let emitter: (() => string | null) | undefined;
+	let available = true;
+	let failWrites = false;
+	const pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
+	const flushTerminalCleanup = () => {
+		while (available && pendingTerminalCleanup.length > 0) {
+			const pending = pendingTerminalCleanup[0];
+			try {
+				terminal.write(pending.payload);
+			} catch {
+				return;
+			}
+			pendingTerminalCleanup.shift();
+			pending.onDelivered?.();
+		}
+	};
+	const terminal = {
+		columns,
+		rows,
+		write: (data: string) => {
+			if (failWrites) throw new Error("injected terminal write failure");
+			written.push(data);
+		},
+	};
 	const ui = {
 		requestRender: () => {},
 		setPostRenderEmitter: (fn?: () => string | null) => {
 			emitter = fn;
 		},
-		terminalAvailable: true,
-		terminal: {
-			columns,
-			rows,
-			write: (data: string) => {
-				written.push(data);
-			},
+		queueTerminalCleanup: (payload: string, onDelivered?: () => void) => {
+			pendingTerminalCleanup.push({ payload, onDelivered });
+			flushTerminalCleanup();
 		},
+		get terminalAvailable() {
+			return available;
+		},
+		terminal,
 	} as unknown as TUI;
 	const editorContainer = new Container();
 	const floorContainer = new Container();
@@ -49,6 +72,18 @@ function makeStubs(columns = 80, rows = 30) {
 		written,
 		getEmitter: () => emitter,
 		getRenderedWidth: () => renderedWidth,
+		setTerminalSize: (nextColumns: number, nextRows: number) => {
+			terminal.columns = nextColumns;
+			terminal.rows = nextRows;
+		},
+		setTerminalAvailable: (value: boolean) => {
+			available = value;
+		},
+		setWriteFailure: (value: boolean) => {
+			failWrites = value;
+		},
+		flushTerminalCleanup,
+		getPendingTerminalCleanupCount: () => pendingTerminalCleanup.length,
 	};
 }
 
@@ -59,7 +94,7 @@ function makeWidget(
 		bottomOffset?: number;
 		isWorking?: () => boolean;
 		autoFlexGapMs?: [number, number] | null;
-		protocol?: "sixel" | "kitty";
+		protocol?: "sixel" | "kitty" | null;
 	} = {},
 ) {
 	const stubs = makeStubs(columns, rows);
@@ -70,7 +105,7 @@ function makeWidget(
 		floorContainer: stubs.floorContainer,
 		isWorking: options.isWorking ?? (() => false),
 		getComposerBottomOffset: () => stubs.floorContainer.render(columns).length + (options.bottomOffset ?? 0),
-		forcePixelProtocol: options.protocol ?? "sixel",
+		forcePixelProtocol: options.protocol === null ? undefined : (options.protocol ?? "sixel"),
 		autoFlexGapMs: options.autoFlexGapMs !== undefined ? options.autoFlexGapMs : null,
 	});
 	return { ...stubs, widget };
@@ -99,6 +134,310 @@ describe("GajaePetWidget", () => {
 		} finally {
 			widget.dispose();
 		}
+	});
+
+	it("owns and deletes a distinct Kitty image ID per widget", () => {
+		const first = makeWidget(80, 30, { protocol: "kitty" });
+		const second = makeWidget(80, 30, { protocol: "kitty" });
+		try {
+			first.widget.setMode("red");
+			second.widget.setMode("red");
+			const firstPayload = first.getEmitter()?.();
+			const secondPayload = second.getEmitter()?.();
+			const firstId = firstPayload?.match(/i=(\d+)/)?.[1];
+			const secondId = secondPayload?.match(/i=(\d+)/)?.[1];
+
+			expect(firstId).toBeDefined();
+			expect(secondId).toBeDefined();
+			expect(firstId).not.toBe(secondId);
+			expect(Number(firstId)).toBeGreaterThan(0);
+			expect(Number(secondId)).toBeGreaterThan(0);
+
+			first.written.length = 0;
+			first.widget.setMode("off");
+			expect(first.written.some(chunk => chunk.includes(`a=d,d=I,i=${firstId}`))).toBe(true);
+			expect(first.written.some(chunk => chunk.includes(`i=${secondId}`))).toBe(false);
+		} finally {
+			first.widget.dispose();
+			second.widget.dispose();
+		}
+	});
+
+	it("clears the last Sixel footprint when disabled", () => {
+		const { widget, written, getEmitter } = makeWidget();
+		try {
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+			written.length = 0;
+
+			widget.setMode("off");
+
+			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("clears the previous Sixel footprint after the terminal becomes too narrow", () => {
+		const { widget, getEmitter, setTerminalSize } = makeWidget();
+		try {
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1b[28;76H");
+			setTerminalSize(12, 30);
+
+			const cleanup = getEmitter()?.();
+
+			expect(cleanup).toContain("\x1b[28;76H\x1b[4X");
+			expect(cleanup).not.toContain("\x1bP0;1;0q");
+			expect(getEmitter()?.()).toBeNull();
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("retains cleanup authority when the render write that carried it fails, and dispose retries", () => {
+		const { widget, written, getEmitter, setTerminalSize, setTerminalAvailable } = makeWidget();
+		widget.setMode("red");
+		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+		setTerminalSize(12, 30);
+
+		// The emitter hands the cleanup payload to the TUI, but the enclosing
+		// render write fails (availability drops), so delivery is never
+		// acknowledged and the authority must survive.
+		expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
+		setTerminalAvailable(false);
+		expect(getEmitter()?.()).toBeNull();
+
+		written.length = 0;
+		setTerminalAvailable(true);
+		widget.dispose();
+
+		expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+	});
+
+	it("re-emits the retained cleanup through the emitter once the terminal recovers", () => {
+		const { widget, getEmitter, setTerminalSize, setTerminalAvailable } = makeWidget();
+		try {
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+			setTerminalSize(12, 30);
+			expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
+
+			// Frame write fails; authority is retained.
+			setTerminalAvailable(false);
+			expect(getEmitter()?.()).toBeNull();
+
+			// Recovered terminal: the emitter carries the erase again, and the
+			// following pass acknowledges the successful delivery.
+			setTerminalAvailable(true);
+			expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
+			expect(getEmitter()?.()).toBeNull();
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("retries Sixel cleanup that fails during final disposal", () => {
+		const { flushTerminalCleanup, getEmitter, getPendingTerminalCleanupCount, setWriteFailure, widget, written } =
+			makeWidget();
+		widget.setMode("red");
+		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+		written.length = 0;
+
+		setWriteFailure(true);
+		widget.dispose();
+		expect(getPendingTerminalCleanupCount()).toBe(1);
+		expect(written).toHaveLength(0);
+
+		setWriteFailure(false);
+		flushTerminalCleanup();
+		expect(getPendingTerminalCleanupCount()).toBe(0);
+		expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+	});
+
+	it("reserves a Kitty image ID until failed final-disposal cleanup is delivered", () => {
+		const imageIds = [101, 101, 202, 101];
+		vi.spyOn(crypto, "getRandomValues").mockImplementation(values => {
+			if (!values) throw new Error("Expected a typed array");
+			const ids = new Uint32Array(
+				values.buffer,
+				values.byteOffset,
+				values.byteLength / Uint32Array.BYTES_PER_ELEMENT,
+			);
+			ids[0] = imageIds.shift() ?? 303;
+			return values;
+		});
+
+		const stubs = makeStubs();
+		const makeKitty = () =>
+			new GajaePetWidget({
+				ui: stubs.ui,
+				editor: stubs.editor,
+				editorContainer: stubs.editorContainer,
+				floorContainer: stubs.floorContainer,
+				isWorking: () => false,
+				getComposerBottomOffset: () => 0,
+				forcePixelProtocol: "kitty",
+				autoFlexGapMs: null,
+			});
+
+		const first = makeKitty();
+		first.setMode("red");
+		expect(stubs.getEmitter()?.()).toContain("i=101");
+		stubs.setWriteFailure(true);
+		first.dispose();
+		expect(stubs.getPendingTerminalCleanupCount()).toBe(1);
+
+		const second = makeKitty();
+		second.setMode("red");
+		expect(stubs.getEmitter()?.()).toContain("i=202");
+
+		stubs.setWriteFailure(false);
+		stubs.flushTerminalCleanup();
+		expect(stubs.getPendingTerminalCleanupCount()).toBe(0);
+		expect(stubs.written.some(chunk => chunk.includes("a=d,d=I,i=101"))).toBe(true);
+
+		const third = makeKitty();
+		third.setMode("red");
+		expect(stubs.getEmitter()?.()).toContain("i=101");
+		second.dispose();
+		third.dispose();
+	});
+
+	it("completes logical teardown when the cleanup write throws", () => {
+		const { widget, editorContainer, getEmitter, getRenderedWidth, setWriteFailure } = makeWidget();
+		widget.setMode("red");
+		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+
+		setWriteFailure(true);
+		widget.dispose();
+
+		// The thrown write must not abort teardown: the shared emitter slot is
+		// released, the composer is unframed, and the widget is terminal.
+		expect(getEmitter()).toBeUndefined();
+		expect(widget.mode).toBe("off");
+		editorContainer.render(80);
+		expect(getRenderedWidth()).toBe(80);
+		widget.setMode("red");
+		expect(getEmitter()).toBeUndefined();
+	});
+
+	it("keeps a disposed widget from clearing its successor's overlay emitter", () => {
+		const stubs = makeStubs();
+		const make = () =>
+			new GajaePetWidget({
+				ui: stubs.ui,
+				editor: stubs.editor,
+				editorContainer: stubs.editorContainer,
+				floorContainer: stubs.floorContainer,
+				isWorking: () => false,
+				getComposerBottomOffset: () => stubs.floorContainer.render(80).length,
+				forcePixelProtocol: "sixel",
+				autoFlexGapMs: null,
+			});
+		const first = make();
+		first.setMode("red");
+		first.dispose();
+
+		const second = make();
+		try {
+			second.setMode("red");
+			const successorEmitter = stubs.getEmitter();
+			expect(successorEmitter).toBeDefined();
+
+			first.dispose();
+
+			expect(stubs.getEmitter()).toBe(successorEmitter);
+		} finally {
+			second.dispose();
+		}
+	});
+
+	it("keeps a stale first-time dispose from stealing a successor's emitter or composer mount", () => {
+		const stubs = makeStubs();
+		const make = () =>
+			new GajaePetWidget({
+				ui: stubs.ui,
+				editor: stubs.editor,
+				editorContainer: stubs.editorContainer,
+				floorContainer: stubs.floorContainer,
+				isWorking: () => false,
+				getComposerBottomOffset: () => stubs.floorContainer.render(80).length,
+				forcePixelProtocol: "sixel",
+				autoFlexGapMs: null,
+			});
+		// The predecessor is never disposed before the successor takes over.
+		const first = make();
+		first.setMode("red");
+		const second = make();
+		try {
+			second.setMode("red");
+			const successorEmitter = stubs.getEmitter();
+			expect(successorEmitter).toBeDefined();
+
+			first.dispose();
+
+			expect(stubs.getEmitter()).toBe(successorEmitter);
+			// The successor's framed composer stays mounted (editor still narrowed).
+			stubs.editorContainer.render(80);
+			expect(stubs.getRenderedWidth()).toBe(80 - 5);
+		} finally {
+			second.dispose();
+		}
+	});
+
+	it("re-arms Kitty cleanup when the pet is re-placed after a narrow-terminal pass consumed it", () => {
+		const { widget, written, getEmitter, setTerminalSize } = makeWidget(12, 30, { protocol: "kitty" });
+		try {
+			widget.setMode("red");
+			// Too narrow: the emitter returns the delete escape and consumes the
+			// pending cleanup.
+			expect(getEmitter()?.()).toContain("\x1b_Ga=d");
+			expect(getEmitter()?.()).toBeNull();
+
+			// Wide again: the next frame re-places the image.
+			setTerminalSize(80, 30);
+			expect(getEmitter()?.()).toContain("\x1b_G");
+			written.length = 0;
+
+			widget.dispose();
+
+			expect(written.some(chunk => chunk.includes("\x1b_Ga=d,d=I,i="))).toBe(true);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("retains Sixel cleanup authority while the terminal is unavailable and erases once it returns", () => {
+		const { widget, written, getEmitter, setTerminalAvailable } = makeWidget();
+		widget.setMode("red");
+		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+		written.length = 0;
+
+		setTerminalAvailable(false);
+		widget.setMode("off");
+		expect(written).toHaveLength(0);
+
+		setTerminalAvailable(true);
+		widget.dispose();
+
+		expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+	});
+
+	it("retains Sixel cleanup authority when the erase write throws and retries on dispose", () => {
+		const { widget, written, getEmitter, setWriteFailure } = makeWidget();
+		widget.setMode("red");
+		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+		written.length = 0;
+
+		setWriteFailure(true);
+		widget.setMode("off");
+		expect(written).toHaveLength(0);
+
+		setWriteFailure(false);
+		widget.dispose();
+
+		expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
 	});
 
 	it("hides the overlay instead of covering editor text on a narrow terminal", () => {

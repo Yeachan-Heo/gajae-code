@@ -12,7 +12,11 @@ import {
 	type SessionLifecycleTranscriptIdentity,
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
-import { type ResumeSessionIdentity, SessionManager } from "../session/session-manager";
+import {
+	type CapturedSessionTranscriptSnapshot,
+	type ResumeSessionIdentity,
+	SessionManager,
+} from "../session/session-manager";
 
 export function lifecycleArgs(request: SessionLifecycleLaunchRequest, cwd: string, agentDir: string): ParsedArgs {
 	return {
@@ -24,7 +28,7 @@ export function lifecycleArgs(request: SessionLifecycleLaunchRequest, cwd: strin
 		...(request.operation === "session.fork"
 			? {
 					fork: request.sourceSessionPath ?? request.sourceSessionId,
-					sessionDir: SessionManager.getDefaultSessionDir(cwd, agentDir),
+					sessionDir: SessionManager.getDefaultSessionDirReadOnly(cwd, agentDir),
 				}
 			: {}),
 	};
@@ -105,20 +109,21 @@ function sameLifecycleTranscriptSnapshot(left: ResumeSessionIdentity, right: Res
 	);
 }
 
-async function captureLifecycleTranscript(
+function captureLifecycleTranscript(
 	request: SessionLifecycleLaunchRequest,
 	cwd: string,
 	agentDir: string,
-): Promise<ResumeSessionIdentity> {
+): CapturedSessionTranscriptSnapshot {
 	const source = verifyLifecycleTranscript(request, cwd, agentDir);
-	const inspected = await SessionManager.inspectSessionTailReadOnly(source.path);
+	const captured = SessionManager.captureTranscriptStrict(source.path);
 	if (
-		inspected.kind === "error" ||
-		inspected.identity.sessionId !== source.id ||
-		!sameTranscriptIdentity(inspected.identity, source.identity)
+		captured.kind !== "captured" ||
+		captured.snapshot.sourcePath !== path.resolve(source.path) ||
+		captured.snapshot.identity.sessionId !== source.id ||
+		!sameTranscriptIdentity(captured.snapshot.identity, source.identity)
 	)
 		throw new Error("Lifecycle saved session authority changed before the session host consumed it.");
-	return inspected.identity;
+	return captured.snapshot;
 }
 
 async function revalidateLifecycleTranscript(snapshot: ResumeSessionIdentity): Promise<void> {
@@ -137,21 +142,24 @@ export async function openLifecycleSessionManager(
 	if (request.operation === "session.create") {
 		return { parsed, sessionManager: await createSessionManager(parsed, cwd) };
 	}
-	const snapshot = await captureLifecycleTranscript(request, cwd, agentDir);
+	const snapshot = captureLifecycleTranscript(request, cwd, agentDir);
 	let sessionManager: SessionManager | undefined;
 	if (request.operation === "session.resume") {
-		const opened = await SessionManager.openExistingStrict(snapshot, parsed.sessionDir);
+		const opened = await SessionManager.openExistingStrict(snapshot.identity, parsed.sessionDir);
 		if (opened.kind === "error")
 			throw new Error("Lifecycle saved session authority changed while the session host opened it.");
 		sessionManager = opened.manager;
+		try {
+			await revalidateLifecycleTranscript(snapshot.identity);
+		} catch (error) {
+			await sessionManager.close();
+			throw error;
+		}
 	} else {
-		sessionManager = await createSessionManager(parsed, cwd);
-	}
-	try {
-		await revalidateLifecycleTranscript(snapshot);
-	} catch (error) {
-		await sessionManager?.close();
-		throw error;
+		const forked = await SessionManager.forkFromCaptured(snapshot, cwd, parsed.sessionDir);
+		if (forked.kind === "error")
+			throw new Error("Lifecycle saved session authority changed while the session host forked it.");
+		sessionManager = forked.manager;
 	}
 	return { parsed, sessionManager };
 }

@@ -3,7 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isKnownSinkPeerClosedError } from "@gajae-code/utils";
-import { VERSION } from "@gajae-code/utils/dirs";
+import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
 
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
@@ -80,11 +80,13 @@ interface CoordinatorServices {
 	connectSdk?: (url: string, token: string) => Promise<SdkClient>;
 	getAgentDir?: () => string;
 	resolveModelProfiles?: CoordinatorModelProfileLoader;
+	canonicalizePath?: (value: string) => Promise<string>;
 }
 
 interface CoordinatorMcpServerOptions {
 	env?: NodeJS.ProcessEnv;
 	services?: CoordinatorServices;
+	platform?: NodeJS.Platform;
 }
 
 interface LegacyHandlerOptions {
@@ -115,6 +117,8 @@ interface TurnRecord {
 		target: string | null;
 		tmux_keys_sent?: boolean;
 		prompt_acknowledged?: boolean;
+		runtime_command_id?: string;
+		runtime_turn_id?: string;
 		state?: "queued" | "tmux_keys_sent" | "acknowledged" | "unavailable" | "unacknowledged";
 		attempts: Array<{
 			delivered: boolean;
@@ -760,12 +764,60 @@ function boundedPublicResponse(response: Record<string, unknown>): Record<string
 	return asRecord(value) ?? { ok: false, error: { code: "unavailable", message: "Invalid coordinator response." } };
 }
 
-function publicSdkAcknowledgement(result: unknown): Record<string, unknown> {
+interface RuntimePromptAcknowledgement {
+	accepted: true;
+	command_id: string;
+	turn_id: string;
+}
+
+function acknowledgementPayload(result: unknown): Record<string, unknown> | null {
 	const response = asRecord(result);
+	if (!response) return null;
+	const envelope = ["ok", "result", "error"].some(key => Object.hasOwn(response, key));
+	if (!envelope) return response;
+	if (response.ok !== true || !Object.hasOwn(response, "result") || Object.hasOwn(response, "error")) return null;
+	return asRecord(response.result);
+}
+
+function runtimeAcknowledgementIdentity(
+	acknowledgement: Record<string, unknown>,
+	camelCaseKey: "commandId" | "turnId",
+	snakeCaseKey: "command_id" | "turn_id",
+): string {
+	const values = [camelCaseKey, snakeCaseKey]
+		.filter(key => Object.hasOwn(acknowledgement, key))
+		.map(key => acknowledgement[key]);
+	if (values.length === 0)
+		throw new SdkClientError("unavailable", `SDK prompt acknowledgement omitted ${snakeCaseKey}.`);
+	if (
+		values.some(value => typeof value !== "string" || !SAFE_EXTERNAL_ID_PATTERN.test(value)) ||
+		new Set(values).size !== 1
+	)
+		throw new SdkClientError("unavailable", `SDK prompt acknowledgement has invalid ${snakeCaseKey}.`);
+	return values[0] as string;
+}
+
+function normalizeRuntimePromptAcknowledgement(result: unknown): RuntimePromptAcknowledgement {
+	const acknowledgement = acknowledgementPayload(result);
+	if (acknowledgement?.accepted !== true)
+		throw new SdkClientError("unavailable", "SDK did not acknowledge prompt delivery.");
 	return {
-		...(response?.accepted === true ? { accepted: true } : {}),
-		...(typeof response?.turn_id === "string" ? { turn_id: response.turn_id } : {}),
+		accepted: true,
+		command_id: runtimeAcknowledgementIdentity(acknowledgement, "commandId", "command_id"),
+		turn_id: runtimeAcknowledgementIdentity(acknowledgement, "turnId", "turn_id"),
 	};
+}
+
+function publicSdkAcknowledgement(result: RuntimePromptAcknowledgement): Record<string, unknown> {
+	return {
+		accepted: true,
+		command_id: result.command_id,
+		turn_id: result.turn_id,
+	};
+}
+
+function publicSdkAccepted(result: unknown): Record<string, unknown> {
+	return acknowledgementPayload(result)?.accepted === true ? { accepted: true } : {};
 }
 
 async function listJsonFiles(dir: string): Promise<unknown[]> {
@@ -802,11 +854,20 @@ function brokerSessionScope(record: Record<string, unknown>): string | null {
 	return firstString(asRecord(record.locator) ?? {}, ["repo"]);
 }
 
-function scopedBrokerSessions(values: unknown[], cwd: string): Array<Record<string, unknown>> {
-	const scope = path.resolve(cwd);
+function sameCanonicalPath(left: string, right: string, platform: NodeJS.Platform): boolean {
+	return normalizePathForComparison(left, platform) === normalizePathForComparison(right, platform);
+}
+
+function scopedBrokerSessions(
+	values: unknown[],
+	cwd: string,
+	platform: NodeJS.Platform,
+): Array<Record<string, unknown>> {
+	const pathApi = platform === "win32" ? path.win32 : path;
+	const scope = pathApi.resolve(cwd);
 	return jsonRecords(values).filter(session => {
 		const sessionScope = brokerSessionScope(session);
-		return sessionScope !== null && path.resolve(sessionScope) === scope;
+		return sessionScope !== null && sameCanonicalPath(pathApi.resolve(sessionScope), scope, platform);
 	});
 }
 
@@ -1781,6 +1842,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	const config = buildCoordinatorMcpConfig(env);
 	const promptAckTimeoutMs = boundedRuntimePromptAckTimeoutMs(env.GJC_COORDINATOR_MCP_PROMPT_ACK_TIMEOUT_MS);
 	const services = options.services ?? {};
+	const platform = options.platform ?? process.platform;
 	const loadModelProfiles = services.resolveModelProfiles ?? loadCoordinatorModelProfiles;
 	const namespaceDir = coordinatorNamespacePath(config);
 	const sessionTransitionTails = new Map<string, Promise<void>>();
@@ -1810,8 +1872,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			endpoint.url,
 			endpoint.token,
 		);
+		const isPromptOperation =
+			operation === "turn.prompt" || operation === "turn.follow_up" || operation === "turn.abort_and_prompt";
 		try {
-			return await client.control(operation, input, { idempotencyKey });
+			return await client.control(operation, input, {
+				idempotencyKey,
+				...(isPromptOperation ? { timeoutMs: promptAckTimeoutMs } : {}),
+			});
 		} finally {
 			await client.close();
 		}
@@ -1865,10 +1932,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
-	function requirePromptAcknowledgement(result: unknown): void {
-		if (asRecord(result)?.accepted !== true) {
-			throw new SdkClientError("unavailable", "SDK did not acknowledge prompt delivery.");
-		}
+	function requirePromptAcknowledgement(result: unknown): RuntimePromptAcknowledgement {
+		return normalizeRuntimePromptAcknowledgement(result);
 	}
 
 	function sdkError(error: unknown): Record<string, unknown> {
@@ -2004,7 +2069,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 	async function canonicalBrokerWorkspace(cwd: string): Promise<string> {
 		try {
-			return await fs.realpath(cwd);
+			return await (services.canonicalizePath ?? (value => fs.realpath(value)))(cwd);
 		} catch {
 			throw new SdkClientError("not_found", "Coordinator workspace cannot be resolved.");
 		}
@@ -2060,7 +2125,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			} catch {
 				continue;
 			}
-			if (canonicalWorkspace === workspace) matches.push({ session, workspace: canonicalWorkspace });
+			if (sameCanonicalPath(canonicalWorkspace, workspace, platform))
+				matches.push({ session, workspace: canonicalWorkspace });
 		}
 		if (matches.length !== 1)
 			throw new SdkClientError(
@@ -2117,7 +2183,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (!sessionId || !cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
 			throw new SdkClientError("not_found", "Coordinator session has no incarnation-bound broker identity.");
 		const workspace = await canonicalBrokerWorkspace(cwd);
-		if (workspace !== persistedWorkspace)
+		if (!sameCanonicalPath(workspace, persistedWorkspace, platform))
 			throw new SdkClientError("endpoint_stale", "Coordinator session workspace binding is stale.");
 		const binding = await exactBrokerSessionBinding(sessionId, workspace, idempotencyKey);
 		if (binding.endpointGeneration !== persistedGeneration || binding.endpointIncarnation !== persistedIncarnation)
@@ -2130,7 +2196,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const listings = await Promise.all(
 			roots.map(async root => {
 				const listing = brokerResult(await brokerSession(root, "session.list", { cwd: root }));
-				return scopedBrokerSessions(Array.isArray(listing.sessions) ? listing.sessions : [], root);
+				return scopedBrokerSessions(Array.isArray(listing.sessions) ? listing.sessions : [], root, platform);
 			}),
 		);
 		return listings.flat();
@@ -2166,7 +2232,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				workspace = await canonicalBrokerWorkspace(cwd);
 				const authority = await exactBrokerSessionAuthority(id, workspace);
 				if (
-					authority.workspace !== persistedWorkspace ||
+					!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
 					authority.endpointGeneration !== persistedGeneration ||
 					authority.endpointIncarnation !== persistedIncarnation
 				)
@@ -2397,6 +2463,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		prompt: string,
 		operation: "turn.prompt" | "turn.follow_up" | "turn.abort_and_prompt",
 		previousActiveTurn: TurnRecord | null,
+		acknowledgement: RuntimePromptAcknowledgement,
 	): Promise<TurnRecord> {
 		const timestamp = new Date().toISOString();
 		if (operation === "turn.abort_and_prompt" && previousActiveTurn) {
@@ -2416,6 +2483,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			queued,
 			target: null,
 			prompt_acknowledged: true,
+			runtime_command_id: acknowledgement.command_id,
+			runtime_turn_id: acknowledgement.turn_id,
 			state: "acknowledged",
 			attempts: [{ delivered: true, channel: "runtime_ack", created_at: timestamp, reason: null }],
 		};
@@ -2735,7 +2804,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									};
 								}
 								const existingCwd = optionalString(existing.cwd);
-								if (!existingCwd || (await canonicalBrokerWorkspace(existingCwd)) !== canonicalCwd)
+								if (
+									!existingCwd ||
+									!sameCanonicalPath(await canonicalBrokerWorkspace(existingCwd), canonicalCwd, platform)
+								)
 									return {
 										ok: false,
 										error: {
@@ -2745,7 +2817,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									};
 								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd, idempotencyKey);
 								if (
-									optionalString(existing.broker_workspace) !== canonicalCwd ||
+									!sameCanonicalPath(
+										optionalString(existing.broker_workspace) ?? "",
+										canonicalCwd,
+										platform,
+									) ||
 									existing.endpoint_generation !== binding.endpointGeneration ||
 									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
 								)
@@ -2811,8 +2887,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										? "turn.follow_up"
 										: "turn.prompt";
 							const result = await controlSession(session, operation, { text: taggedPrompt }, idempotencyKey);
-							requirePromptAcknowledgement(result);
-							const turn = await recordAcceptedPrompt(sessionId, taggedPrompt, operation, previousActiveTurn);
+							const acknowledgement = requirePromptAcknowledgement(result);
+							const turn = await recordAcceptedPrompt(
+								sessionId,
+								taggedPrompt,
+								operation,
+								previousActiveTurn,
+								acknowledgement,
+							);
 							await appendCoordinatorEvent(namespaceDir, {
 								kind: "delegation.started",
 								sessionId,
@@ -2839,7 +2921,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								session: publicCoordinatorSession(session),
 								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
-								result: publicSdkAcknowledgement(result),
+								result: publicSdkAcknowledgement(acknowledgement),
 								...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
 							};
 							return args.await_completion === true
@@ -2931,8 +3013,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						const lifecycle = publicLifecycleReceipt(created, sessionId);
 						if (prompt) {
 							const result = await controlSession(session, "turn.prompt", { text: prompt }, idempotencyKey);
-							requirePromptAcknowledgement(result);
-							const turn = await recordAcceptedPrompt(sessionId, prompt, "turn.prompt", null);
+							const acknowledgement = requirePromptAcknowledgement(result);
+							const turn = await recordAcceptedPrompt(sessionId, prompt, "turn.prompt", null, acknowledgement);
 							return {
 								ok: true,
 								session: publicCoordinatorSession(session),
@@ -2945,6 +3027,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								delivered: turn.delivery.delivered,
 								operation: "turn.prompt",
 								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+								result: publicSdkAcknowledgement(acknowledgement),
 								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 							};
 						}
@@ -3011,8 +3094,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										? "turn.follow_up"
 										: "turn.prompt";
 							const result = await controlSession(currentSession, operation, { text: prompt }, idempotencyKey);
-							requirePromptAcknowledgement(result);
-							const turn = await recordAcceptedPrompt(sessionId, prompt, operation, previousActiveTurn);
+							const acknowledgement = requirePromptAcknowledgement(result);
+							const turn = await recordAcceptedPrompt(
+								sessionId,
+								prompt,
+								operation,
+								previousActiveTurn,
+								acknowledgement,
+							);
 							return {
 								ok: true,
 								session_id: sessionId,
@@ -3022,7 +3111,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								queued: turn.delivery.queued,
 								delivered: turn.delivery.delivered,
 								operation,
-								result: publicSdkAcknowledgement(result),
+								result: publicSdkAcknowledgement(acknowledgement),
 								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
 								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 							};
@@ -3067,7 +3156,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							ok: true,
 							session_id: sessionId,
 							operation: "ask.answer",
-							result: publicSdkAcknowledgement(result),
+							result: publicSdkAccepted(result),
 						};
 					},
 				);

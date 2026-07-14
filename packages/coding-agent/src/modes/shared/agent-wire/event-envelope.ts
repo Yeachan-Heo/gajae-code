@@ -67,14 +67,13 @@ export function agentSessionEventType(event: AgentSessionEvent): AgentWireEventT
 		case "auto_compaction_end":
 		case "auto_retry_start":
 		case "auto_retry_end":
-		case "retry_fallback_applied":
-		case "retry_fallback_succeeded":
 		case "ttsr_triggered":
 		case "todo_reminder":
 		case "todo_auto_clear":
 		case "irc_message":
 		case "subagent_steer_message":
 		case "notice":
+		case "model_fallback_switched":
 		case "thinking_level_changed":
 		case "goal_updated":
 			return event.type;

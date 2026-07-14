@@ -119,22 +119,68 @@ export function sanitizeOpenAIResponsesHistoryItemsForReplay(items: Array<Record
 		return sanitized ? [sanitized] : [];
 	});
 }
+const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[A-Za-z0-9_]{1,32}\|>)/g;
+/**
+ * Neutralize leaked OpenAI Harmony / control tokens (`<|channel|>`, `<|message|>`,
+ * `<|call|>`, `<|constrain|>`, `<|recipient|>`, `<|content|>`, ...) in replayed
+ * history text. A subagent whose tool-call channel degenerates can dump raw
+ * control-token scaffolding into its reply text; once that poisoned text lands in
+ * history the Codex / Responses endpoint rejects every subsequent request with
+ * `Request blocked (code=invalid_prompt)`, permanently wedging the session because
+ * the offending item is re-sent on each turn. Insert a zero-width space after `<`
+ * so the delimiter can no longer be tokenized as a reserved control token while the
+ * text stays human-readable.
+ */
+export function neutralizeReservedControlTokens(text: string): string {
+	if (!text.includes("<|")) return text;
+	return text.replace(RESERVED_CONTROL_TOKEN_RE, "<\u200b|");
+}
+
+/**
+ * Neutralize leaked reserved control tokens across every string in an outgoing
+ * Responses `input` array. This is the request-boundary complement to the
+ * replay-history sanitizer: leaked Harmony markers (`<|channel|>analysis`, ...)
+ * can enter the payload from assistant reasoning summaries, live-converted
+ * message/tool-output text, or user-authored content — not just replayed
+ * history — and every gpt-5.6 request that carries one is rejected with
+ * `Request blocked (code=invalid_prompt)`. Walking every string (rather than an
+ * item-type allowlist) guarantees no leak source is missed as item shapes
+ * evolve; the zero-width-space insertion is idempotent (`<\u200b|` no longer
+ * matches `<|`) and keeps the text human-readable.
+ */
+export function neutralizeResponsesInputControlTokens<T>(items: readonly T[]): T[] {
+	return items.map(item => deepNeutralizeReservedControlTokens(item) as T);
+}
+
+function deepNeutralizeReservedControlTokens(value: unknown): unknown {
+	if (typeof value === "string") return neutralizeReservedControlTokens(value);
+	if (Array.isArray(value)) return value.map(deepNeutralizeReservedControlTokens);
+	if (value && typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [key, nested] of Object.entries(value)) {
+			out[key] = deepNeutralizeReservedControlTokens(nested);
+		}
+		return out;
+	}
+	return value;
+}
+
 function stringifyResponsesStringParamForReplay(value: unknown): string {
-	if (typeof value === "string") return value.toWellFormed();
+	if (typeof value === "string") return neutralizeReservedControlTokens(value.toWellFormed());
 	try {
 		const encoded = JSON.stringify(value);
-		if (typeof encoded === "string") return encoded.toWellFormed();
+		if (typeof encoded === "string") return neutralizeReservedControlTokens(encoded.toWellFormed());
 	} catch {
 		// Fall through to String().
 	}
-	return String(value ?? "").toWellFormed();
+	return neutralizeReservedControlTokens(String(value ?? "").toWellFormed());
 }
 
 function normalizeResponsesMessageTextForReplay(value: unknown): string {
-	if (typeof value === "string") return value.toWellFormed();
+	if (typeof value === "string") return neutralizeReservedControlTokens(value.toWellFormed());
 	if (value && typeof value === "object") {
 		const nestedText = (value as { text?: unknown }).text;
-		if (typeof nestedText === "string") return nestedText.toWellFormed();
+		if (typeof nestedText === "string") return neutralizeReservedControlTokens(nestedText.toWellFormed());
 	}
 	return stringifyResponsesStringParamForReplay(value);
 }
@@ -163,7 +209,7 @@ function normalizeResponsesImageUrlForReplay(value: unknown): NormalizedResponse
 }
 
 function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
-	if (typeof content === "string") return content.toWellFormed();
+	if (typeof content === "string") return neutralizeReservedControlTokens(content.toWellFormed());
 	if (!Array.isArray(content)) return content;
 	return content.map(part => {
 		if (!part || typeof part !== "object") return part;
@@ -197,12 +243,11 @@ function sanitizeResponsesStringFieldsForReplay(item: Record<string, unknown>): 
 	if (item.type === "custom_tool_call" && "input" in item && typeof item.input !== "string") {
 		item.input = stringifyResponsesStringParamForReplay(item.input);
 	}
-	if (
-		(item.type === "function_call_output" || item.type === "custom_tool_call_output") &&
-		"output" in item &&
-		typeof item.output !== "string"
-	) {
-		item.output = stringifyResponsesStringParamForReplay(item.output);
+	if ((item.type === "function_call_output" || item.type === "custom_tool_call_output") && "output" in item) {
+		item.output =
+			typeof item.output === "string"
+				? neutralizeReservedControlTokens(item.output.toWellFormed())
+				: stringifyResponsesStringParamForReplay(item.output);
 	}
 }
 

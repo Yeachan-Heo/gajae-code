@@ -166,6 +166,11 @@ async function runHarness(
 		env: {
 			...cliEnv.env,
 			GJC_HARNESS_STATE_ROOT: root,
+			// The fake tmux server is a child of this test process, not a real systemd scope.
+			// Keep normal lifecycle cases independent of the runner's caller cgroup; the scoped
+			// bootstrap failure case below explicitly overrides this fixture value.
+			GJC_HARNESS_TEST_CALLER_CGROUP: "/\n",
+			GJC_HARNESS_TEST_SERVER_CGROUP: "/\n",
 
 			GJC_TMUX_COMMAND: tmuxCommand,
 			...(disableSdkHost ? { GJC_SDK_DISABLE: "1" } : {}),

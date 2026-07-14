@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { THINKING_CONTROL_MODES } from "@gajae-code/ai";
 import {
 	applyGeneratedModelPolicies,
 	clampThinkingLevelForModel,
@@ -9,7 +10,7 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
 } from "@gajae-code/ai/model-thinking";
-import type { Api, Model, Provider } from "@gajae-code/ai/types";
+import type { Api, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
 
 function createModel<TApi extends Api>(overrides: {
 	id: string;
@@ -30,6 +31,14 @@ function createModel<TApi extends Api>(overrides: {
 		maxTokens: 32000,
 	});
 }
+
+describe("thinking control modes", () => {
+	it("exports the canonical runtime vocabulary without duplicates", () => {
+		const modes: readonly ThinkingControlMode[] = THINKING_CONTROL_MODES;
+		expect(modes).toEqual(["effort", "budget", "google-level", "anthropic-adaptive", "anthropic-budget-effort"]);
+		expect(new Set(modes).size).toBe(modes.length);
+	});
+});
 
 describe("model thinking metadata", () => {
 	it("stores supported efforts for Codex mini in model metadata", () => {

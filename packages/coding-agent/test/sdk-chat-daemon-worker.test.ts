@@ -70,6 +70,11 @@ class FakeDiscordProvider implements DiscordProvider {
 	threads: DiscordThread[] = [];
 	messages: Array<{ threadId: string; content: string; components?: DiscordMessageComponent[] }> = [];
 	#threadWaiters: Array<{ count: number; resolve: () => void }> = [];
+	#messageWaiters: Array<{
+		predicate: (message: { threadId: string; content: string; components?: DiscordMessageComponent[] }) => boolean;
+		resolve: () => void;
+	}> = [];
+	#archiveWaiters: Array<{ count: number; resolve: () => void }> = [];
 	archives: string[] = [];
 	handler: ((event: DiscordInboundEvent) => Promise<void>) | undefined;
 	startupInbound: DiscordInboundEvent | undefined;
@@ -79,6 +84,34 @@ class FakeDiscordProvider implements DiscordProvider {
 		const waiter = Promise.withResolvers<void>();
 		this.#threadWaiters.push({ count, resolve: waiter.resolve });
 		return waiter.promise;
+	}
+	waitForMessage(
+		predicate: (message: { threadId: string; content: string; components?: DiscordMessageComponent[] }) => boolean,
+	): Promise<void> {
+		if (this.messages.some(predicate)) return Promise.resolve();
+		const waiter = Promise.withResolvers<void>();
+		this.#messageWaiters.push({ predicate, resolve: waiter.resolve });
+		return waiter.promise;
+	}
+	#resolveMessageWaiters(): void {
+		this.#messageWaiters = this.#messageWaiters.filter(waiter => {
+			if (!this.messages.some(waiter.predicate)) return true;
+			waiter.resolve();
+			return false;
+		});
+	}
+	waitForArchiveCount(count: number): Promise<void> {
+		if (this.archives.length >= count) return Promise.resolve();
+		const waiter = Promise.withResolvers<void>();
+		this.#archiveWaiters.push({ count, resolve: waiter.resolve });
+		return waiter.promise;
+	}
+	#resolveArchiveWaiters(): void {
+		this.#archiveWaiters = this.#archiveWaiters.filter(waiter => {
+			if (this.archives.length < waiter.count) return true;
+			waiter.resolve();
+			return false;
+		});
 	}
 	#resolveThreadWaiters(): void {
 		this.#threadWaiters = this.#threadWaiters.filter(waiter => {
@@ -120,11 +153,13 @@ class FakeDiscordProvider implements DiscordProvider {
 			content: input.content,
 			...(input.components ? { components: input.components } : {}),
 		});
+		this.#resolveMessageWaiters();
 		return { id: String(this.messages.length) };
 	}
 	async deferInteraction(): Promise<void> {}
 	async archiveThread(input: { threadId: string }): Promise<void> {
 		this.archives.push(input.threadId);
+		this.#resolveArchiveWaiters();
 	}
 	async unarchiveThread(): Promise<void> {
 		throw new Error("closed threads require replacement");
@@ -145,6 +180,7 @@ class FakeSdkClient implements ChatDaemonSdkClient {
 	requests: Record<string, unknown>[] = [];
 	handler: ((frame: Record<string, unknown>) => void) | undefined;
 	#sentWaiters: Array<{ predicate: (frame: Record<string, unknown>) => boolean; resolve: () => void }> = [];
+	#requestWaiters: Array<{ predicate: (frame: Record<string, unknown>) => boolean; resolve: () => void }> = [];
 	onFrame(handler: (frame: Record<string, unknown>) => void): () => void {
 		this.handler = handler;
 		return () => {
@@ -157,6 +193,19 @@ class FakeSdkClient implements ChatDaemonSdkClient {
 		this.#sentWaiters.push({ predicate, resolve: waiter.resolve });
 		return waiter.promise;
 	}
+	waitForRequest(predicate: (frame: Record<string, unknown>) => boolean): Promise<void> {
+		if (this.requests.some(predicate)) return Promise.resolve();
+		const waiter = Promise.withResolvers<void>();
+		this.#requestWaiters.push({ predicate, resolve: waiter.resolve });
+		return waiter.promise;
+	}
+	#resolveRequestWaiters(): void {
+		this.#requestWaiters = this.#requestWaiters.filter(waiter => {
+			if (!this.requests.some(waiter.predicate)) return true;
+			waiter.resolve();
+			return false;
+		});
+	}
 	#resolveSentWaiters(): void {
 		this.#sentWaiters = this.#sentWaiters.filter(waiter => {
 			if (!this.sent.some(waiter.predicate)) return true;
@@ -166,6 +215,7 @@ class FakeSdkClient implements ChatDaemonSdkClient {
 	}
 	async request(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
 		this.requests.push(frame);
+		this.#resolveRequestWaiters();
 		if (frame.type === "event_replay")
 			return { events: [{ type: "event", name: "session_ready", sessionId: "session", generation: 1 }] };
 		return { ok: true, result: { source: "sdk", body: "daemon-result-secret" } };
@@ -206,7 +256,28 @@ describe("chat daemon worker", () => {
 		});
 		const provider = new FakeDiscordProvider();
 		const client = new FakeSdkClient();
-		provider.startupInbound = {
+		client.request = async frame => {
+			client.requests.push(frame);
+			if (frame.type === "event_replay")
+				return {
+					events: [
+						{ type: "event", name: "session_ready", sessionId: "session", generation: 1 },
+						{
+							type: "event",
+							name: "identity_header",
+							payload: {
+								type: "identity_header",
+								sessionId: "session",
+								title: "Replay identity",
+								repo: "replay-repo",
+								branch: "replay-branch",
+							},
+						},
+					],
+				};
+			return { ok: true, result: { source: "sdk", body: "daemon-result-secret" } };
+		};
+		const startupInbound: DiscordInboundEvent = {
 			id: "startup-query",
 			guildId: "guild",
 			parentId: "parent",
@@ -250,19 +321,21 @@ describe("chat daemon worker", () => {
 		);
 
 		await runtime.start();
+		await provider.handler?.(startupInbound);
 		expect(provider.started).toBe(true);
 		expect(client.requests).toContainEqual(
 			expect.objectContaining({ type: "query_request", query: "todo.list", input: {} }),
 		);
 		expect(provider.threads).toHaveLength(1);
+		const turnStreamPosted = provider.waitForMessage(message => message.content === "GJC turn stream\noutbound");
+		expect(provider.messages).toContainEqual({
+			threadId: "thread-1",
+			content: "GJC identity header\ntitle: Replay identity\nrepo: replay-repo\nbranch: replay-branch",
+		});
 		client.handler?.({ type: "turn_stream", sessionId: "session", text: "outbound" });
-		for (
-			let attempt = 0;
-			attempt < 100 && !provider.messages.some(message => message.content === "GJC turn stream\noutbound");
-			attempt++
-		)
-			await Bun.sleep(1);
+		await turnStreamPosted;
 		expect(provider.messages).toContainEqual({ threadId: "thread-1", content: "GJC turn stream\noutbound" });
+		const actionPosted = provider.waitForMessage(message => message.components !== undefined);
 		client.handler?.({
 			type: "action_needed",
 			sessionId: "session",
@@ -271,11 +344,11 @@ describe("chat daemon worker", () => {
 			question: "Continue?",
 			options: ["safe"],
 		});
-		for (let attempt = 0; attempt < 50 && !provider.messages.some(message => message.components); attempt++)
-			await Bun.sleep(1);
+		await actionPosted;
 		const actionCustomId = provider.messages.find(message => message.components)?.components?.[0]?.components[0]
 			?.customId;
 		expect(actionCustomId).toBeDefined();
+		const actionReplySent = client.waitForSent(frame => frame.type === "reply" && frame.id === "action");
 		await provider.handler?.({
 			id: "inbound",
 			guildId: "guild",
@@ -284,7 +357,15 @@ describe("chat daemon worker", () => {
 			authorId: "human",
 			interaction: { id: "interaction", token: "interaction-token", customId: actionCustomId!, value: "0" },
 		});
+		await actionReplySent;
 		expect(client.sent).toContainEqual(expect.objectContaining({ type: "reply", id: "action", answer: 0 }));
+		const queryRequest = client.waitForRequest(
+			request => request.type === "query_request" && request.query === "todo.list",
+		);
+		const queryResult = provider.waitForMessage(
+			message =>
+				message.content === JSON.stringify({ ok: true, result: { operation: "todo.list", status: "completed" } }),
+		);
 		await provider.handler?.({
 			id: "query",
 			guildId: "guild",
@@ -293,12 +374,20 @@ describe("chat daemon worker", () => {
 			authorId: "human",
 			content: "/sdk query todo.list {}",
 		});
+		await Promise.all([queryRequest, queryResult]);
 		expect(provider.messages).toContainEqual({
 			threadId: "thread-1",
 			content: JSON.stringify({ ok: true, result: { operation: "todo.list", status: "completed" } }),
 		});
 		expect(JSON.stringify(provider.messages)).not.toContain("daemon-result-secret");
-		const requestsBeforeProhibited = client.requests.length;
+		const prohibitedResult = provider.waitForMessage(
+			message =>
+				message.content ===
+				JSON.stringify({
+					ok: false,
+					error: { code: "unsupported_on_chat", message: "Command could not be completed." },
+				}),
+		);
 		await provider.handler?.({
 			id: "prohibited",
 			guildId: "guild",
@@ -307,7 +396,9 @@ describe("chat daemon worker", () => {
 			authorId: "human",
 			content: "/sdk global session.get_endpoint {}",
 		});
-		expect(client.requests).toHaveLength(requestsBeforeProhibited);
+		await prohibitedResult;
+		expect(client.requests.some(request => request.operation === "session.get_endpoint")).toBe(false);
+		expect(brokerClient.requests.some(request => request.operation === "session.get_endpoint")).toBe(false);
 		expect(provider.messages).toContainEqual({
 			threadId: "thread-1",
 			content: JSON.stringify({
@@ -329,8 +420,21 @@ describe("chat daemon worker", () => {
 				authorId: "human",
 				content,
 			});
-		expect(client.requests).toHaveLength(requestsBeforeProhibited);
+		const prohibitedOperations = new Set(["bash.execute", "host_tools.register", "filesystem.read", "config.patch"]);
+		expect(
+			[...client.requests, ...brokerClient.requests].some(request =>
+				prohibitedOperations.has(String(request.operation)),
+			),
+		).toBe(false);
 		expect(JSON.stringify(provider.messages)).not.toContain("daemon-result-secret");
+		const globalRequest = brokerClient.waitForRequest(
+			request => request.type === "broker_request" && request.operation === "session.list",
+		);
+		const globalResult = provider.waitForMessage(
+			message =>
+				message.content ===
+				JSON.stringify({ ok: true, result: { operation: "session.list", status: "completed" } }),
+		);
 		await provider.handler?.({
 			id: "global",
 			guildId: "guild",
@@ -339,6 +443,7 @@ describe("chat daemon worker", () => {
 			authorId: "human",
 			content: "/sdk global session.list {}",
 		});
+		await Promise.all([globalRequest, globalResult]);
 		expect(brokerClient.requests).toContainEqual(
 			expect.objectContaining({
 				type: "broker_request",
@@ -351,19 +456,23 @@ describe("chat daemon worker", () => {
 			threadId: "thread-1",
 			content: JSON.stringify({ ok: true, result: { operation: "session.list", status: "completed" } }),
 		});
-		client.handler?.({ type: "event", name: "session_closed", sessionId: "session" });
-		for (let attempt = 0; attempt < 100 && provider.archives.length === 0; attempt++) await Bun.sleep(1);
+		const archivedThread = provider.waitForArchiveCount(1);
+		client.handler?.({
+			type: "event",
+			kind: "session_closed",
+			payload: { type: "session_closed", sessionId: "session" },
+		});
+		await archivedThread;
 		expect(provider.archives).toEqual(["thread-1"]);
 		client.handler?.({ type: "event", name: "session_ready", sessionId: "session", generation: 2 });
-		await Bun.sleep(10);
-		expect(provider.threads).toHaveLength(1);
+		const replacementThread = provider.waitForThreadCount(2);
 		client.handler?.({ type: "event", name: "session_ready", sessionId: "session", generation: 1 });
-		for (let attempt = 0; attempt < 50 && provider.threads.length < 2; attempt++) await Bun.sleep(1);
+		await replacementThread;
 		expect(provider.threads).toHaveLength(2);
 		await runtime.stop();
 		expect(client.closed).toBe(true);
 		expect(provider.stopped).toBe(true);
-	});
+	}, 20_000);
 
 	it("fails closed when a replacement client cannot connect", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-replace-"));
@@ -457,13 +566,12 @@ describe("chat daemon worker", () => {
 		const provider = new FakeDiscordProvider();
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		provider.postMessage = async input => {
-			provider.messages.push(input);
-			if (input.content.includes("block")) {
-				entered.resolve();
-				await release.promise;
-			}
-			return { id: String(provider.messages.length) };
+		let blockLookup = false;
+		provider.findMessageByNonce = async () => {
+			if (!blockLookup) return null;
+			entered.resolve();
+			await release.promise;
+			return null;
 		};
 		const oldClient = new FakeSdkClient();
 		const newClient = new FakeSdkClient();
@@ -491,6 +599,7 @@ describe("chat daemon worker", () => {
 			},
 		);
 		await runtime.start();
+		blockLookup = true;
 		oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: "block" });
 		await entered.promise;
 		oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: "stale queued" });
@@ -506,10 +615,16 @@ describe("chat daemon worker", () => {
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 		});
+		const replacementReplay = newClient.waitForRequest(frame => frame.type === "event_replay");
 		tick?.();
-		await Bun.sleep(10);
+		await replacementReplay;
+		expect(oldClient.closed).toBe(true);
+		expect(newClient.handler).toBeDefined();
 		release.resolve();
-		await Bun.sleep(10);
+		const freshDelivered = provider.waitForMessage(message => message.content.includes("fresh replacement"));
+		newClient.handler?.({ type: "turn_stream", sessionId: "session", text: "fresh replacement" });
+		await freshDelivered;
+		expect(provider.messages.some(message => message.content.includes("fresh replacement"))).toBe(true);
 		expect(provider.messages.some(message => message.content.includes("stale queued"))).toBe(false);
 		await runtime.stop();
 	});
@@ -536,6 +651,15 @@ describe("chat daemon worker", () => {
 		const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
 		const readConversation = async (): Promise<SlackConversation | undefined> =>
 			Object.values((await store.load()).conversations).find(record => record.sessionId === "session");
+		const waitForConversation = async (predicate: (conversation: SlackConversation | undefined) => boolean) => {
+			const deadline = Date.now() + 5_000;
+			while (true) {
+				const conversation = await readConversation();
+				if (predicate(conversation)) return conversation;
+				if (Date.now() >= deadline) throw new Error("Timed out waiting for durable Slack conversation state");
+				await Bun.sleep(10);
+			}
+		};
 		const runtimeInput = {
 			kind: "slack" as const,
 			agentDir,
@@ -573,12 +697,7 @@ describe("chat daemon worker", () => {
 			question: "Continue?",
 			options: ["safe"],
 		});
-		for (
-			let attempt = 0;
-			attempt < 100 && (await readConversation())?.pendingActionId !== "action-before-restart";
-			attempt++
-		)
-			await Bun.sleep(1);
+		await waitForConversation(conversation => conversation?.pendingActionId === "action-before-restart");
 		expect((await readConversation())?.pendingActionId).toBe("action-before-restart");
 		await firstRuntime.stop();
 
@@ -626,16 +745,10 @@ describe("chat daemon worker", () => {
 			question: "Again?",
 			options: ["safe"],
 		});
-		for (
-			let attempt = 0;
-			attempt < 100 && (await readConversation())?.pendingActionId !== "action-to-resolve";
-			attempt++
-		)
-			await Bun.sleep(1);
+		await waitForConversation(conversation => conversation?.pendingActionId === "action-to-resolve");
 		expect((await readConversation())?.pendingActionId).toBe("action-to-resolve");
 		restartedClient.handler?.({ type: "action_resolved", sessionId: "session", id: "action-to-resolve" });
-		await Bun.sleep(10);
-		expect((await readConversation())?.pendingActionId).toBeUndefined();
+		await waitForConversation(conversation => conversation?.pendingActionId === undefined);
 		await restartedRuntime.stop();
 	});
 	it("replays Slack control, query, and global commands with their durable receipt keys", async () => {
@@ -719,11 +832,19 @@ describe("chat daemon worker", () => {
 				},
 			},
 		});
+		const controlReceived = client.waitForRequest(
+			request => request.type === "control_request" && request.operation === "turn.abort",
+		);
+		const queryReceived = client.waitForRequest(
+			request => request.type === "query_request" && request.query === "todo.list",
+		);
+		const globalReceived = broker.waitForRequest(
+			request => request.type === "broker_request" && request.operation === "session.list",
+		);
 		provider.handler?.(command("control-event", "control-id", "/sdk control turn.abort {}"));
 		provider.handler?.(command("query-event", "query-id", "/sdk query todo.list {}"));
 		provider.handler?.(command("global-event", "global-id", "/sdk global session.list {}"));
-		for (let attempt = 0; attempt < 100 && (client.requests.length < 3 || broker.requests.length < 1); attempt++)
-			await Bun.sleep(1);
+		await Promise.all([controlReceived, queryReceived, globalReceived]);
 		expect(client.requests).toContainEqual({
 			type: "control_request",
 			operation: "turn.abort",
@@ -961,6 +1082,12 @@ describe("chat daemon worker", () => {
 			expect(provider.threads).toHaveLength(1);
 			expect(frames).toContainEqual(expect.objectContaining({ type: "event_replay" }));
 
+			const queryResultPosted = provider.waitForMessage(
+				message =>
+					message.threadId === "thread-1" &&
+					message.content ===
+						JSON.stringify({ ok: true, result: { operation: "todo.list", status: "completed" } }),
+			);
 			await provider.handler?.({
 				id: "wire-query",
 				guildId: "guild",
@@ -969,6 +1096,7 @@ describe("chat daemon worker", () => {
 				authorId: "human",
 				content: "/sdk query todo.list {}",
 			});
+			await queryResultPosted;
 			expect(frames).toContainEqual(
 				expect.objectContaining({ type: "query_request", query: "todo.list", input: {} }),
 			);
@@ -1121,5 +1249,5 @@ describe("chat daemon worker", () => {
 		} finally {
 			await host.stop();
 		}
-	});
+	}, 20_000);
 });

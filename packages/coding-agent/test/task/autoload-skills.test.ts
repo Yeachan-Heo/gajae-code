@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { kNoAuth } from "../../src/config/model-registry";
+
 import { Settings } from "../../src/config/settings";
 import type { Skill } from "../../src/extensibility/skills";
 import * as skillsModule from "../../src/extensibility/skills";
@@ -38,6 +40,9 @@ function createMockSession(
 		},
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async () => {},
+		setConfiguredModelChain: () => {},
+		getConfiguredModelChain: () => undefined,
+		seedDefaultFallbackResolution: () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {
@@ -89,6 +94,8 @@ describe("autoloadSkills in executor", () => {
 		settings: Settings.isolated(),
 		modelRegistry: {
 			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
 		} as unknown as import("../../src/config/model-registry").ModelRegistry,
 		enableLsp: false,
 	};

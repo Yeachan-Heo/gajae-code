@@ -19,6 +19,10 @@ type JsonSchemaObject = {
 	items?: JsonSchema;
 	enum?: readonly string[];
 	default?: unknown;
+	minItems?: number;
+	minLength?: number;
+	pattern?: string;
+	anyOf?: JsonSchema[];
 };
 
 type SettingsSchema = typeof SETTINGS_SCHEMA;
@@ -120,8 +124,19 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 				items: arrayItemsSchema(definition.default, "items" in definition ? definition.items : undefined),
 			};
 		case "record":
-			return { type: "object", additionalProperties: true };
+			return {
+				type: "object",
+				additionalProperties: recordValueSchema("valueSchema" in definition ? definition.valueSchema : undefined),
+			};
 	}
+}
+
+function recordValueSchema(valueSchema?: { readonly type: "model-selector-value" }): JsonSchema {
+	if (valueSchema?.type !== "model-selector-value") return true;
+	const selector = { type: "string", minLength: 1, pattern: "\\S" };
+	return {
+		anyOf: [selector, { type: "array", minItems: 1, items: selector }],
+	};
 }
 
 function arrayItemsSchema(defaultValue: unknown, items?: { enum?: readonly string[] }): JsonSchema {

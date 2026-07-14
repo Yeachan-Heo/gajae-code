@@ -434,13 +434,14 @@ export class InputController {
 			}
 
 			const runner = this.ctx.session.extensionRunner;
+			const pendingImages = this.ctx.pendingImages;
 			let inputImages = this.#visiblePendingImagesForText(text);
 
 			if (runner?.hasHandlers("input")) {
 				const result = await runner.emitInput(text, inputImages, "interactive");
 				if (result?.handled) {
 					this.ctx.editor.setText("");
-					this.ctx.pendingImages = [];
+					this.#clearPendingImagesIfOwnedBy(pendingImages);
 					return;
 				}
 				if (result?.text !== undefined) {
@@ -530,7 +531,7 @@ export class InputController {
 				this.ctx.editor.addToHistory(text);
 				this.ctx.editor.setText("");
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
-				this.ctx.pendingImages = [];
+				this.#clearPendingImagesIfOwnedBy(pendingImages);
 				// Record the signature so the queued message's eventual delivery
 				// (a user-role `message_start` event) leaves any draft the user has
 				// typed since queuing intact. Same protection as #783, applied to
@@ -582,7 +583,7 @@ export class InputController {
 			if (this.ctx.onInputCallback) {
 				// Include any pending images from clipboard paste
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
-				this.ctx.pendingImages = [];
+				this.#clearPendingImagesIfOwnedBy(pendingImages);
 
 				// Render user message immediately, then let session events catch up
 				const submission = this.ctx.startPendingSubmission({ text, images });
@@ -1104,11 +1105,14 @@ export class InputController {
 				return false;
 			}
 
-			this.ctx.pendingImages.push({
-				type: "image",
-				data: image.data,
-				mimeType: image.mimeType,
-			});
+			this.ctx.pendingImages = [
+				...this.ctx.pendingImages,
+				{
+					type: "image",
+					data: image.data,
+					mimeType: image.mimeType,
+				},
+			];
 			this.ctx.editor.insertText(`${formatPastedImageReference(this.#nextImagePlaceholder(), image.resolvedPath)} `);
 			this.ctx.showStatus(`Attached image: ${path.basename(image.resolvedPath)}`, { dim: true });
 			this.ctx.ui.requestRender();
@@ -1151,8 +1155,31 @@ export class InputController {
 		return images.length > 0 ? images : undefined;
 	}
 
+	#clearPendingImagesIfOwnedBy(pendingImages: InteractiveModeContext["pendingImages"]): void {
+		if (this.ctx.pendingImages === pendingImages) {
+			this.ctx.pendingImages = [];
+		}
+	}
+
 	#clearPendingImagesIfPlaceholdersRemoved(text: string): void {
 		if (this.ctx.pendingImages.length === 0 || IMAGE_PLACEHOLDER_PRESENT_PATTERN.test(text)) {
+			return;
+		}
+		// Editor submit resets the composer and emits onChange("") before onSubmit(result).
+		// Defer the empty-buffer clear so the submit handler can still resolve image
+		// placeholders against pendingImages, while manual clears still drop stale images.
+		if (text.length === 0) {
+			const pendingImages = this.ctx.pendingImages;
+			const pendingImageCount = pendingImages.length;
+			queueMicrotask(() => {
+				if (
+					this.ctx.pendingImages === pendingImages &&
+					pendingImages.length === pendingImageCount &&
+					this.ctx.editor.getText().length === 0
+				) {
+					this.ctx.pendingImages = [];
+				}
+			});
 			return;
 		}
 		this.ctx.pendingImages = [];
@@ -1185,11 +1212,14 @@ export class InputController {
 					}
 				}
 
-				this.ctx.pendingImages.push({
-					type: "image",
-					data: imageData.data,
-					mimeType: imageData.mimeType,
-				});
+				this.ctx.pendingImages = [
+					...this.ctx.pendingImages,
+					{
+						type: "image",
+						data: imageData.data,
+						mimeType: imageData.mimeType,
+					},
+				];
 				this.ctx.editor.insertText(`${this.#nextImagePlaceholder()} `);
 				this.ctx.ui.requestRender();
 				return true;

@@ -248,6 +248,7 @@ export class CustomEditor extends Editor {
 			const paste = this.#pasteHandler.process(data);
 			if (paste.handled) {
 				if (paste.pasteContent !== undefined) {
+					this.onViewportFollowLive?.();
 					this.#handleBracketedPaste(paste.pasteContent, paste.remaining);
 				}
 				return;

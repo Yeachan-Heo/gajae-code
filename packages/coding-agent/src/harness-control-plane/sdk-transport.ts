@@ -5,6 +5,8 @@ import type { HarnessSessionTransport, SessionStateSnapshot } from "./session-tr
 
 const DISCOVERY_TIMEOUT_MS = 10_000;
 const DISCOVERY_POLL_MS = 50;
+const TERM_GRACE_MS = 2_000;
+const KILL_VERIFY_MS = 1_000;
 
 export class HarnessSdkTransportError extends Error {
 	constructor(
@@ -18,7 +20,7 @@ export class HarnessSdkTransportError extends Error {
 }
 
 export interface SpawnedHarnessSession {
-	kill(signal?: NodeJS.Signals): void;
+	stop(): Promise<void>;
 }
 
 export interface CreateSdkSessionTransportOptions {
@@ -137,17 +139,53 @@ export async function createSdkSessionTransport(
 	const deadline = Date.now() + timeoutMs;
 	while (!endpoint && Date.now() < deadline) {
 		await new Promise(resolve => setTimeout(resolve, DISCOVERY_POLL_MS));
-		endpoint = await readEndpoint(options.repo, options.sessionId);
+		try {
+			endpoint = await readEndpoint(options.repo, options.sessionId);
+		} catch (error) {
+			// A discovery read that fails after spawn must not orphan the spawned child;
+			// await stop before propagating, preserving both causes on dual failure (no double stop).
+			try {
+				await child?.stop();
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"SDK endpoint discovery and spawned harness child cleanup both failed.",
+				);
+			}
+			throw error;
+		}
 	}
 	if (!endpoint) {
-		child?.kill("SIGTERM");
-		throw new HarnessSdkTransportError(
+		const timeoutError = new HarnessSdkTransportError(
 			"endpoint_unavailable",
 			`SDK endpoint for harness session ${options.sessionId} did not appear within ${timeoutMs}ms.`,
 		);
+		try {
+			// Await child stop so a discovery timeout never orphans the spawned session.
+			await child?.stop();
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[timeoutError, cleanupError],
+				"SDK endpoint discovery timed out and spawned harness child cleanup failed.",
+			);
+		}
+		throw timeoutError;
 	}
 
-	const client = await (options.connect ?? SdkClient.connect)(endpoint.url, endpoint.token);
+	let client: SdkClient;
+	try {
+		client = await (options.connect ?? SdkClient.connect)(endpoint.url, endpoint.token);
+	} catch (error) {
+		try {
+			await child?.stop();
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[error, cleanupError],
+				"SDK connection and spawned harness child cleanup both failed.",
+			);
+		}
+		throw error;
+	}
 	let cursor = 0;
 	let lastFrameAt: string | null = null;
 	let live = true;
@@ -177,7 +215,23 @@ export async function createSdkSessionTransport(
 			for (const listener of frames) listener(normalized);
 		}
 	};
-	await replay();
+	try {
+		await replay();
+	} catch (error) {
+		const failures: unknown[] = [error];
+		try {
+			await client.close();
+		} catch (cleanupError) {
+			failures.push(cleanupError);
+		}
+		try {
+			await child?.stop();
+		} catch (cleanupError) {
+			failures.push(cleanupError);
+		}
+		if (failures.length > 1) throw new AggregateError(failures, "SDK replay and harness child cleanup failed.");
+		throw error;
+	}
 
 	return {
 		async getState(): Promise<SessionStateSnapshot> {
@@ -227,13 +281,86 @@ export async function createSdkSessionTransport(
 		},
 		async close(): Promise<void> {
 			live = false;
-			await client.close();
-			child?.kill("SIGTERM");
+			const failures: unknown[] = [];
+			try {
+				await client.close();
+			} catch (error) {
+				failures.push(error);
+			}
+			try {
+				// Await child stop so close never orphans the spawned session.
+				await child?.stop();
+			} catch (error) {
+				failures.push(error);
+			}
+			if (failures.length > 1)
+				throw new AggregateError(failures, "SDK client and harness child cleanup both failed.");
+			if (failures.length === 1) throw failures[0];
 		},
 	};
 }
 
-export function spawnNormalHarnessSession(repo: string, sessionId: string): SpawnedHarnessSession {
+export interface ReapableHarnessChild {
+	kill(signal?: number | NodeJS.Signals): void;
+	readonly exited: Promise<number>;
+	readonly exitCode: number | null;
+}
+
+/**
+ * Stop an exact spawned child: SIGTERM with bounded grace, SIGKILL escalation, then
+ * authoritative `child.exited` verification. A rejected exit promise is NOT proof of exit
+ * and therefore fails closed after SIGKILL rather than being mistaken for termination.
+ * Failure to verify exit after SIGKILL throws — the caller must not assume the child died.
+ */
+async function reapChild(child: ReapableHarnessChild, termGraceMs: number, killVerifyMs: number): Promise<void> {
+	const exited = child.exited.then(
+		() => true,
+		() => false,
+	);
+	const send = (signal: NodeJS.Signals): void => {
+		if (child.exitCode !== null) return;
+		try {
+			child.kill(signal);
+		} catch {
+			// Kill may fail if the child already exited; the exited race below is authoritative.
+		}
+	};
+	if (child.exitCode !== null) return;
+	send("SIGTERM");
+	let verified = await Promise.race([exited, Bun.sleep(termGraceMs).then(() => false)]);
+	if (!verified) {
+		send("SIGKILL");
+		verified = await Promise.race([exited, Bun.sleep(killVerifyMs).then(() => false)]);
+	}
+	if (!verified) {
+		throw new HarnessSdkTransportError("endpoint_unavailable", "Harness child session did not exit after SIGKILL.");
+	}
+}
+
+function ownedHarnessSession(
+	child: ReapableHarnessChild,
+	termGraceMs: number,
+	killVerifyMs: number,
+): SpawnedHarnessSession {
+	let stopPromise: Promise<void> | null = null;
+	return {
+		stop(): Promise<void> {
+			if (stopPromise) return stopPromise;
+			const pending = reapChild(child, termGraceMs, killVerifyMs);
+			stopPromise = pending;
+			void pending.catch(() => {
+				if (stopPromise === pending) stopPromise = null;
+			});
+			return pending;
+		},
+	};
+}
+
+export function spawnNormalHarnessSession(
+	repo: string,
+	sessionId: string,
+	options: { termGraceMs?: number; killVerifyMs?: number } = {},
+): SpawnedHarnessSession {
 	const entry = process.argv[1];
 	if (process.env.GJC_SDK_DISABLE === "1") {
 		throw new HarnessSdkTransportError(
@@ -254,5 +381,15 @@ export function spawnNormalHarnessSession(repo: string, sessionId: string): Spaw
 		stderr: "ignore",
 	});
 	child.unref();
-	return { kill: signal => child.kill(signal) };
+	const termGraceMs = options.termGraceMs ?? TERM_GRACE_MS;
+	const killVerifyMs = options.killVerifyMs ?? KILL_VERIFY_MS;
+	return ownedHarnessSession(child, termGraceMs, killVerifyMs);
+}
+
+/** Test hook for exact-child stop serialization and retry semantics. */
+export function ownedHarnessSessionForTest(
+	child: ReapableHarnessChild,
+	options: { termGraceMs?: number; killVerifyMs?: number } = {},
+): SpawnedHarnessSession {
+	return ownedHarnessSession(child, options.termGraceMs ?? TERM_GRACE_MS, options.killVerifyMs ?? KILL_VERIFY_MS);
 }

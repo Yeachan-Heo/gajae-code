@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { EMBEDDED_DOCS } from "../src/internal-urls/docs-index.generated";
 
 function runBunEval(script: string) {
 	const result = Bun.spawnSync({
@@ -13,6 +14,8 @@ function runBunEval(script: string) {
 	expect(result.exitCode, stderr || stdout).toBe(0);
 	return stdout;
 }
+
+const DOCS_WITH_SOURCE_PARITY = ["gpt-5.6-codex-preset-benchmark.md", "models.md"] as const;
 
 describe("internal-urls docs index loading", () => {
 	it("does not load the generated docs corpus when importing the barrel", () => {
@@ -40,5 +43,11 @@ describe("internal-urls docs index loading", () => {
 		const result = JSON.parse(stdout.trim()) as { contentType: string; contentLength: number };
 		expect(result.contentType).toBe("text/markdown");
 		expect(result.contentLength).toBeGreaterThan(0);
+	});
+
+	it.each([...DOCS_WITH_SOURCE_PARITY])("matches the source %s document", async fileName => {
+		const source = await Bun.file(path.join(import.meta.dir, "../../../docs", fileName)).text();
+
+		expect(EMBEDDED_DOCS[fileName]).toBe(source);
 	});
 });

@@ -3,7 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
-import { postmortem } from "@gajae-code/utils";
+import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { sessionRuntimeDir } from "./session-layout";
 import {
 	isValidOwnerIntent,
@@ -76,11 +76,21 @@ export interface RuntimeStateContext {
 	sessionId: string;
 	cwd: string;
 	sessionFile?: string | null;
+	/** Optional platform seam for deterministic cross-platform path identity checks. */
+	platform?: NodeJS.Platform;
 	branch?: string | null;
 	/** Public-safe owner metadata used to persist the canonical terminal verdict. */
 	ownerTerminal?: OwnerTerminalContext | null;
 	/** Internal fail-closed marker set only when managed owner metadata is malformed or missing. */
 	ownerTerminalMetadataInvalid?: boolean;
+}
+
+interface RuntimeStateIdentity {
+	sessionId: string;
+	cwd: string;
+	workdir: string;
+	sessionFile: string | null;
+	platform: NodeJS.Platform;
 }
 
 interface RuntimeStateSidecarPayload {
@@ -201,27 +211,27 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 	}
 }
 
-function sameResolvedPath(left: string, right: string): boolean {
-	return path.resolve(left) === path.resolve(right);
+function sameResolvedPath(left: string, right: string, platform: NodeJS.Platform = process.platform): boolean {
+	return normalizePathForComparison(left, platform) === normalizePathForComparison(right, platform);
 }
 
-function normalizedIdentity(context: Pick<RuntimeStateContext, "sessionId" | "cwd" | "sessionFile">): {
-	sessionId: string;
-	cwd: string;
-	workdir: string;
-	sessionFile: string | null;
-} {
+function normalizedIdentity(
+	context: Pick<RuntimeStateContext, "sessionId" | "cwd" | "sessionFile" | "platform">,
+): RuntimeStateIdentity {
 	const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	const sessionId = explicitStateFile
 		? process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || context.sessionId.trim()
 		: context.sessionId.trim();
 	const cwd = context.cwd.trim();
+	const platform = context.platform ?? process.platform;
+	const pathApi = platform === "win32" ? path.win32 : path;
 	if (!sessionId || !cwd) throw new PreviousRuntimeStateReadError();
 	return {
 		sessionId,
-		cwd: path.resolve(cwd),
-		workdir: path.resolve(cwd),
-		sessionFile: context.sessionFile == null ? null : path.resolve(context.sessionFile),
+		cwd: pathApi.resolve(cwd),
+		workdir: pathApi.resolve(cwd),
+		sessionFile: context.sessionFile == null ? null : pathApi.resolve(context.sessionFile),
+		platform,
 	};
 }
 
@@ -268,7 +278,10 @@ export async function readTerminalRuntimeStateMarker(input: {
 	sessionId?: string | null;
 	cwd?: string | null;
 	sessionFile?: string | null;
+	platform?: NodeJS.Platform;
 }): Promise<TerminalRuntimeStateStatus> {
+	const platform = input.platform ?? process.platform;
+	const pathApi = platform === "win32" ? path.win32 : path;
 	const stateFile = input.stateFile?.trim();
 	const sessionId = input.sessionId?.trim();
 	const cwd = input.cwd?.trim();
@@ -287,15 +300,18 @@ export async function readTerminalRuntimeStateMarker(input: {
 	if (!validRuntimeStateMarker(value)) return { terminal: false, reason: "invalid_state_marker" };
 	const payload = value;
 	if (payload.session_id !== sessionId) return { terminal: false, reason: "session_id_mismatch" };
-	if (!sameResolvedPath(payload.cwd as string, cwd) || !sameResolvedPath(payload.workdir as string, cwd))
+	if (
+		!sameResolvedPath(payload.cwd as string, cwd, platform) ||
+		!sameResolvedPath(payload.workdir as string, cwd, platform)
+	)
 		return { terminal: false, reason: "cwd_mismatch" };
-	const sessionFile = input.sessionFile == null ? null : path.resolve(input.sessionFile);
+	const sessionFile = input.sessionFile == null ? null : pathApi.resolve(input.sessionFile);
 	if (
 		payload.session_file !== sessionFile &&
 		!(
 			typeof payload.session_file === "string" &&
 			typeof sessionFile === "string" &&
-			sameResolvedPath(payload.session_file, sessionFile)
+			sameResolvedPath(payload.session_file, sessionFile, platform)
 		)
 	)
 		return { terminal: false, reason: "session_file_mismatch" };
@@ -484,41 +500,35 @@ function rememberWrittenPayload(stateFile: string, payload: Record<string, unkno
 		lastPayloadByStateFile.delete(stateFile);
 	}
 }
-function shouldPreserveTerminalPayload(
-	previous: RuntimeStateSidecarPayload,
-	input: { sessionId: string; cwd: string; sessionFile: string | null },
-): boolean {
+function shouldPreserveTerminalPayload(previous: RuntimeStateSidecarPayload, input: RuntimeStateIdentity): boolean {
 	if (!validRuntimeStateMarker(previous)) return false;
 	if (previous.state !== "completed" && previous.state !== "errored") return false;
 	const source = previous.final_response?.source;
 	if (source !== "agent_end" && source !== "launch_error") return false;
 	return (
 		previous.session_id === input.sessionId &&
-		sameResolvedPath(previous.cwd as string, input.cwd) &&
-		sameResolvedPath(previous.workdir as string, input.cwd) &&
+		sameResolvedPath(previous.cwd as string, input.cwd, input.platform) &&
+		sameResolvedPath(previous.workdir as string, input.cwd, input.platform) &&
 		(previous.session_file === input.sessionFile ||
 			(typeof previous.session_file === "string" &&
 				typeof input.sessionFile === "string" &&
-				sameResolvedPath(previous.session_file, input.sessionFile)))
+				sameResolvedPath(previous.session_file, input.sessionFile, input.platform)))
 	);
 }
 
-function assertPreviousRuntimeStateIdentity(
-	previous: Record<string, unknown>,
-	input: { sessionId: string; cwd: string; sessionFile: string | null },
-): void {
+function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, input: RuntimeStateIdentity): void {
 	if (Object.keys(previous).length === 0) return;
 	if (
 		previous.session_id !== input.sessionId ||
 		typeof previous.cwd !== "string" ||
 		typeof previous.workdir !== "string" ||
-		!sameResolvedPath(previous.cwd, input.cwd) ||
-		!sameResolvedPath(previous.workdir, input.cwd) ||
+		!sameResolvedPath(previous.cwd, input.cwd, input.platform) ||
+		!sameResolvedPath(previous.workdir, input.cwd, input.platform) ||
 		(previous.session_file !== input.sessionFile &&
 			!(
 				typeof previous.session_file === "string" &&
 				typeof input.sessionFile === "string" &&
-				sameResolvedPath(previous.session_file, input.sessionFile)
+				sameResolvedPath(previous.session_file, input.sessionFile, input.platform)
 			))
 	)
 		throw new PreviousRuntimeStateReadError();

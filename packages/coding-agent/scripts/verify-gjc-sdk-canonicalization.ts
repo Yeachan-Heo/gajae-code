@@ -3,6 +3,9 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type ParserPlugin, parse } from "@babel/parser";
+import traverse, { type Binding, type NodePath } from "@babel/traverse";
+import * as t from "@babel/types";
 
 const repoRoot = process.env.GJC_SDK_CANONICALIZATION_SCAN_ROOT
 	? path.resolve(process.env.GJC_SDK_CANONICALIZATION_SCAN_ROOT)
@@ -16,7 +19,27 @@ const bridgeOrUnattendedImportPattern =
 const pythonUnattendedProtocolClientPattern =
 	/\b(?:negotiate_unattended|UnattendedAccepted|UnattendedBudget|parse_unattended_accepted|workflow_gate_response)\b/g;
 const pythonGjcRpcImportPattern = /^\s*(?:from\s+gjc_rpc(?:\.|\s)|import\s+gjc_rpc(?:\.|\s|,|$))/gm;
-const modeRpcInvocationPatterns = [/--mode(?:\s+|=)["']?rpc(?:\b|["'])/g, /["']--mode["']\s*,\s*["']rpc["']/g];
+const retiredExternalModeInvocationPatterns = [
+	/--mode(?:\s+|=)["']?(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*(?:\b|["'])/gi,
+	/["']--mode["']\s*,\s*["'](?:rpc|bridge|unattended)[A-Za-z0-9_.-]*["']/gi,
+];
+const constructedRetiredIngressPatterns = [
+	/\[\s*["']r["']\s*,\s*["']pc["']\s*\]\.join\(\s*["']{2}\s*\)/g,
+	/["']r["']\s*\+\s*["']pc["']/g,
+	/`(?:r|\$\{\s*["']r["']\s*\})(?:pc|\$\{\s*["']pc["']\s*\})`/g,
+	/\[\s*["']brid["']\s*,\s*["']ge["']\s*\]\.join\(\s*["']{2}\s*\)/gi,
+	/`(?:brid|\$\{\s*["']brid["']\s*\})(?:ge|\$\{\s*["']ge["']\s*\})`/gi,
+	/\[\s*["']un["']\s*,\s*["']attended["']\s*\]\.join\(\s*["']{2}\s*\)/gi,
+	/`(?:un|\$\{\s*["']un["']\s*\})(?:attended|\$\{\s*["']attended["']\s*\})`/gi,
+	/["'](?:\.\/)?modes\/["']\s*\+\s*["'](?:rpc|bridge|unattended)[A-Za-z0-9_.-]*["']/gi,
+	/\[\s*["'](?:\.\/)?modes["']\s*,\s*["'](?:rpc|bridge|unattended)[A-Za-z0-9_.-]*["']\s*\]\.join\(\s*["']\/["']\s*\)/gi,
+];
+const retiredModeValuePattern = /^(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*$/i;
+const retiredModeArgumentPattern = /^--mode(?:\s+|=)(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*$/i;
+const MAX_STATIC_FILE_STEPS = 1_024;
+const MAX_STATIC_EXPRESSION_STEPS = 256;
+const MAX_STATIC_ALIAS_HOPS = 64;
+
 const allowedRpcModeInvocationTests = new Set([
 	"packages/coding-agent/test/sdk-downgrade-rollback.test.ts",
 	"packages/coding-agent/test/sdk-removed-ingresses.test.ts",
@@ -35,11 +58,187 @@ const machineTmuxDocumentationPaths = new Set([
 ]);
 const machineTmuxDocumentationPattern =
 	/(?:scripts\/gjc-session\/(?:prompt|tail)\.sh|\b(?:load-buffer|paste-buffer|send-keys|capture-pane|pipe-pane)\b|(?:\.\/)?(?:scripts\/)?gjc-session\/create\.sh(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|[^\s]+)){3})/g;
-const tmuxMachineBusPrimitivePattern = /\b(?:load-buffer|paste-buffer|send-keys|capture-pane|pipe-pane)\b/g;
-const tmuxPaneViewingPattern =
-	/\b(?:capture-pane|pipe-pane)\b|\[\s*["'](?:capture|pipe)["']\s*,\s*["']pane["']\s*\]\.join\(\s*["']-["']\s*\)/g;
 function normalizeShellContinuations(contents: string): string {
 	return contents.replace(/\\\r?\n[ \t]*/g, " ");
+}
+
+type TmuxMachineBusPrimitive =
+	| "load-buffer"
+	| "paste-buffer"
+	| "send-keys"
+	| "capture-pane"
+	| "pipe-pane"
+	| "set-buffer";
+
+const tmuxMachineBusPrimitives: readonly TmuxMachineBusPrimitive[] = [
+	"load-buffer",
+	"paste-buffer",
+	"send-keys",
+	"capture-pane",
+	"pipe-pane",
+	"set-buffer",
+];
+
+interface TmuxPrimitiveOccurrence {
+	primitive: TmuxMachineBusPrimitive;
+	start: number;
+	end: number;
+}
+
+interface StaticStringAssignment {
+	name: string;
+	expression: string;
+	start: number;
+}
+
+function maskCodeComments(contents: string): string {
+	let masked = "";
+	let quote: "'" | '"' | "`" | undefined;
+	for (let index = 0; index < contents.length; index++) {
+		const character = contents[index];
+		if (quote) {
+			masked += character;
+			if (character === "\\") {
+				masked += contents[index + 1] ?? "";
+				index++;
+			} else if (character === quote) {
+				quote = undefined;
+			}
+			continue;
+		}
+		if (character === "'" || character === '"' || character === "`") {
+			quote = character;
+			masked += character;
+			continue;
+		}
+		if (character === "/" && contents[index + 1] === "/") {
+			while (index < contents.length && contents[index] !== "\n") {
+				masked += " ";
+				index++;
+			}
+			masked += contents[index] ?? "";
+			continue;
+		}
+		if (character === "/" && contents[index + 1] === "*") {
+			masked += "  ";
+			index++;
+			while (index + 1 < contents.length && !(contents[index] === "*" && contents[index + 1] === "/")) {
+				masked += contents[index] === "\n" ? "\n" : " ";
+				index++;
+			}
+			if (index + 1 < contents.length) {
+				masked += "  ";
+				index++;
+			}
+			continue;
+		}
+		masked += character;
+	}
+	return masked;
+}
+
+function quotedStringValue(expression: string): string | undefined {
+	const match = /^(["'])([^\\\r\n]*)\1$/.exec(expression.trim());
+	return match?.[2];
+}
+
+function staticStringValue(expression: string, bindings: ReadonlyMap<string, string>): string | undefined {
+	const trimmed = expression.trim();
+	const literal = quotedStringValue(trimmed);
+	if (literal !== undefined) return literal;
+	if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(trimmed)) return bindings.get(trimmed);
+	if (trimmed.startsWith("`") && trimmed.endsWith("`")) {
+		const interpolated = trimmed
+			.slice(1, -1)
+			.replace(/\$\{\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\}/g, (source, name: string) => bindings.get(name) ?? source);
+		return interpolated.includes("${") ? undefined : interpolated;
+	}
+	const join = /^\[\s*([^\]]*?)\s*\]\.join\(\s*(["'])([^\\\r\n]*)\2\s*\)$/.exec(trimmed);
+	if (join) {
+		const parts = join[1].split(",").map(part => staticStringValue(part, bindings));
+		return parts.every((part): part is string => part !== undefined) ? parts.join(join[3]) : undefined;
+	}
+	const parts = trimmed.split("+").map(part => part.trim());
+	if (parts.length > 1) {
+		const values = parts.map(part => staticStringValue(part, bindings));
+		return values.every((part): part is string => part !== undefined) ? values.join("") : undefined;
+	}
+	return undefined;
+}
+
+function staticStringBindings(contents: string): {
+	assignments: StaticStringAssignment[];
+	masked: string;
+	values: ReadonlyMap<string, string>;
+} {
+	const masked = maskCodeComments(contents);
+	const assignments: StaticStringAssignment[] = [];
+	for (const match of masked.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([^;\r\n]+);?/g)) {
+		const expression = match[2];
+		const start = (match.index ?? 0) + match[0].lastIndexOf(expression);
+		assignments.push({ name: match[1], expression, start });
+	}
+	const values = new Map<string, string>();
+	for (let pass = 0; pass < assignments.length; pass++) {
+		let changed = false;
+		for (const assignment of assignments) {
+			const value = staticStringValue(assignment.expression, values);
+			if (value === undefined || values.get(assignment.name) === value) continue;
+			values.set(assignment.name, value);
+			changed = true;
+		}
+		if (!changed) break;
+	}
+	return { assignments, masked, values };
+}
+
+function tmuxPrimitiveOccurrences(contents: string): TmuxPrimitiveOccurrence[] {
+	const { assignments, masked, values: bindings } = staticStringBindings(contents);
+	const occurrences = new Map<string, TmuxPrimitiveOccurrence>();
+	const add = (primitive: TmuxMachineBusPrimitive, start: number, end: number) => {
+		occurrences.set(`${primitive}:${start}`, { primitive, start, end });
+	};
+	for (const match of masked.matchAll(
+		/["'`](load-buffer|paste-buffer|send-keys|capture-pane|pipe-pane|set-buffer)["'`]/g,
+	)) {
+		add(match[1] as TmuxMachineBusPrimitive, match.index ?? 0, (match.index ?? 0) + match[0].length);
+	}
+	for (const match of masked.matchAll(/\b(load-buffer|paste-buffer|send-keys|capture-pane|pipe-pane|set-buffer)\b/g)) {
+		add(match[1] as TmuxMachineBusPrimitive, match.index ?? 0, (match.index ?? 0) + match[0].length);
+	}
+	for (const primitive of tmuxMachineBusPrimitives) {
+		const [prefix, suffix] = primitive.split("-");
+		const construction = new RegExp(
+			"(?:\\[\\s*[\"']" +
+				prefix +
+				"[\"']\\s*,\\s*[\"']-?" +
+				suffix +
+				"[\"']\\s*\\]\\s*\\.join\\(\\s*[\"']-?[\"']\\s*\\)|[\"']" +
+				prefix +
+				"[\"']\\s*\\+\\s*[\"']-?" +
+				suffix +
+				"[\"']|`(?:" +
+				prefix +
+				"|\\$\\{\\s*[\"']" +
+				prefix +
+				"[\"']\\s*\\})-(?:" +
+				suffix +
+				"|\\$\\{\\s*[\"']" +
+				suffix +
+				"[\"']\\s*\\})`)",
+			"g",
+		);
+		for (const match of masked.matchAll(construction)) {
+			add(primitive, match.index ?? 0, (match.index ?? 0) + match[0].length);
+		}
+	}
+	for (const assignment of assignments) {
+		const value = bindings.get(assignment.name);
+		if (value && tmuxMachineBusPrimitives.includes(value as TmuxMachineBusPrimitive)) {
+			add(value as TmuxMachineBusPrimitive, assignment.start, assignment.start + assignment.expression.length);
+		}
+	}
+	return [...occurrences.values()].sort((left, right) => left.start - right.start);
 }
 
 function isWorkspacePackageManifest(file: string): boolean {
@@ -66,7 +265,7 @@ function exportTargetStrings(target: unknown): string[] {
 }
 
 function retiredIngressSource(file: string): boolean {
-	return /\/src\/(?:modes\/(?:rpc|bridge|unattended)(?:\/|$)|(?:rpc|bridge|unattended)(?:\/|\.[cm]?[jt]sx?$))/.test(
+	return /\/src\/(?:modes\/(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*(?:\/|$)|(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*(?:\/|\.[cm]?[jt]sx?$))/i.test(
 		file,
 	);
 }
@@ -151,18 +350,491 @@ function legacyPythonRpcViolations(file: string, contents: string): string[] {
 	return violations;
 }
 
+type RetiredModeSourceType = "unambiguous" | "commonjs" | "module";
+type StaticAnalysisBudgetKind = "file_steps" | "expression_steps" | "alias_hops";
+type StaticStringResult = { kind: "known"; value: string } | { kind: "unknown"; reason: string };
+type StaticArrayResult = { kind: "known"; values: string[] } | { kind: "unknown"; reason: string };
+type StaticDefinitionResult = { kind: "definition"; definition: StaticDefinition } | StaticStringResult;
+
+interface RetiredModeParserOptions {
+	sourceType: RetiredModeSourceType;
+	plugins: ParserPlugin[];
+}
+
+interface StaticAnalysisFileState {
+	steps: number;
+}
+
+interface StaticEvaluationContext {
+	file: string;
+	expressionSteps: number;
+	aliasHops: number;
+	activeBindings: Set<Binding>;
+	evaluationSteps: NodePath<t.Expression>[];
+}
+
+interface StaticDefinition {
+	expressionPath: NodePath<t.Expression>;
+	start: number;
+	end: number;
+}
+
+class StaticAnalysisParseError extends Error {
+	constructor(file: string, line: number, column: number) {
+		super(`${file}:${line}:${column}: static retired-mode analysis parse failed`);
+		this.name = "StaticAnalysisParseError";
+	}
+}
+
+class StaticAnalysisBudgetExceeded extends Error {
+	constructor(file: string, node: t.Node, kind: StaticAnalysisBudgetKind, limit: number, observed: number) {
+		const location = staticNodeLocation(node);
+		super(
+			`${file}:${location.line}:${location.column}: static retired-mode analysis budget exceeded (kind=${kind}, limit=${limit}, observed=${observed})`,
+		);
+		this.name = "StaticAnalysisBudgetExceeded";
+	}
+}
+
 function isExecutableSource(file: string): boolean {
 	return /\.(?:[cm]?[jt]sx?|py)$/.test(file);
+}
+
+function retiredModeParserOptions(file: string): RetiredModeParserOptions | undefined {
+	const importAttributePlugins: ParserPlugin[] = ["importAttributes"];
+	if (file.endsWith(".d.mts")) {
+		return {
+			sourceType: "module",
+			plugins: [["typescript", { dts: true, disallowAmbiguousJSXLike: true }]],
+		};
+	}
+	if (file.endsWith(".d.cts")) {
+		return {
+			sourceType: "commonjs",
+			plugins: [["typescript", { dts: true, disallowAmbiguousJSXLike: true }]],
+		};
+	}
+	if (file.endsWith(".d.ts")) {
+		return { sourceType: "unambiguous", plugins: [["typescript", { dts: true }]] };
+	}
+	if (file.endsWith(".tsx")) return { sourceType: "unambiguous", plugins: ["typescript", "jsx"] };
+	if (file.endsWith(".mts")) {
+		return {
+			sourceType: "unambiguous",
+			plugins: [["typescript", { disallowAmbiguousJSXLike: true }]],
+		};
+	}
+	if (file.endsWith(".cts")) {
+		return {
+			sourceType: "commonjs",
+			plugins: [["typescript", { disallowAmbiguousJSXLike: true }]],
+		};
+	}
+	if (file.endsWith(".ts")) return { sourceType: "unambiguous", plugins: ["typescript"] };
+	if (file.endsWith(".jsx")) return { sourceType: "unambiguous", plugins: ["jsx", ...importAttributePlugins] };
+	if (file.endsWith(".cjs")) return { sourceType: "commonjs", plugins: importAttributePlugins };
+	if (file.endsWith(".js") || file.endsWith(".mjs")) {
+		return { sourceType: "unambiguous", plugins: importAttributePlugins };
+	}
+	return undefined;
+}
+
+function parserErrorLocation(error: unknown): { line: number; column: number } {
+	const parserError = error as { loc?: unknown };
+	const location = parserError.loc;
+	if (location && typeof location === "object") {
+		const parserLocation = location as { line?: unknown; column?: unknown };
+		if (typeof parserLocation.line === "number" && typeof parserLocation.column === "number") {
+			return { line: parserLocation.line, column: parserLocation.column };
+		}
+	}
+	return { line: 1, column: 0 };
+}
+
+function parseRetiredModeSource(file: string, contents: string): t.File | undefined {
+	const options = retiredModeParserOptions(file);
+	if (!options) return undefined;
+	try {
+		return parse(contents, options);
+	} catch (error) {
+		const location = parserErrorLocation(error);
+		throw new StaticAnalysisParseError(file, location.line, location.column);
+	}
+}
+
+function staticNodeLocation(node: t.Node): { line: number; column: number } {
+	return { line: node.loc?.start.line ?? 1, column: node.loc?.start.column ?? 0 };
+}
+
+function staticNodeOffset(node: t.Node): number | undefined {
+	return typeof node.start === "number" ? node.start : undefined;
+}
+
+function staticNodeEnd(node: t.Node): number | undefined {
+	return typeof node.end === "number" ? node.end : undefined;
+}
+
+function staticKnown(value: string): StaticStringResult {
+	return { kind: "known", value };
+}
+
+function staticUnknown(reason: string): StaticStringResult {
+	return { kind: "unknown", reason };
+}
+
+function staticExpressionPath(path: NodePath, key: string): NodePath<t.Expression> | undefined {
+	const childPath = path.get(key) as NodePath | NodePath[];
+	if (Array.isArray(childPath) || !childPath.isExpression()) return undefined;
+	return childPath;
+}
+
+function staticExecutionContext(path: NodePath): NodePath | undefined {
+	let current: NodePath | null = path;
+	while (current) {
+		if (current.isProgram() || current.isFunction()) return current;
+		current = current.parentPath;
+	}
+	return undefined;
+}
+
+function isExecutionContextAncestor(ancestor: NodePath, descendant: NodePath): boolean {
+	let current: NodePath | null = descendant;
+	while (current) {
+		if (current.node === ancestor.node) return true;
+		current = current.parentPath;
+	}
+	return false;
+}
+
+function recordStaticEvaluationStep(path: NodePath<t.Expression>, context: StaticEvaluationContext): void {
+	context.evaluationSteps.push(path);
+	context.expressionSteps++;
+	if (context.expressionSteps > MAX_STATIC_EXPRESSION_STEPS) {
+		throw new StaticAnalysisBudgetExceeded(
+			context.file,
+			path.node,
+			"expression_steps",
+			MAX_STATIC_EXPRESSION_STEPS,
+			context.expressionSteps,
+		);
+	}
+}
+
+function commitStaticFileSteps(
+	evaluationSteps: readonly NodePath<t.Expression>[],
+	file: string,
+	fileState: StaticAnalysisFileState,
+): void {
+	for (const path of evaluationSteps) {
+		fileState.steps++;
+		if (fileState.steps > MAX_STATIC_FILE_STEPS) {
+			throw new StaticAnalysisBudgetExceeded(file, path.node, "file_steps", MAX_STATIC_FILE_STEPS, fileState.steps);
+		}
+	}
+}
+
+function incrementStaticAliasHop(path: NodePath<t.Identifier>, context: StaticEvaluationContext): void {
+	context.aliasHops++;
+	if (context.aliasHops > MAX_STATIC_ALIAS_HOPS) {
+		throw new StaticAnalysisBudgetExceeded(
+			context.file,
+			path.node,
+			"alias_hops",
+			MAX_STATIC_ALIAS_HOPS,
+			context.aliasHops,
+		);
+	}
+}
+
+function bindingInitializer(binding: Binding): StaticDefinitionResult {
+	if (!binding.path.isVariableDeclarator()) return staticUnknown("unsupported binding");
+	const declaration = binding.path.node;
+	if (!t.isIdentifier(declaration.id) || declaration.id.name !== binding.identifier.name) {
+		return staticUnknown("unsupported binding");
+	}
+	const initializerPath = staticExpressionPath(binding.path, "init");
+	if (!initializerPath) return staticUnknown("missing initializer");
+	const start = staticNodeOffset(initializerPath.node);
+	const end = staticNodeEnd(initializerPath.node);
+	if (start === undefined || end === undefined) return staticUnknown("missing initializer position");
+	return { kind: "definition", definition: { expressionPath: initializerPath, start, end } };
+}
+
+function assignmentPathForViolation(violationPath: NodePath): NodePath<t.AssignmentExpression> | undefined {
+	if (violationPath.isAssignmentExpression()) return violationPath;
+	const parentPath = violationPath.parentPath;
+	if (parentPath?.isAssignmentExpression() && parentPath.node.left === violationPath.node) return parentPath;
+	return undefined;
+}
+
+function staticAssignmentDefinition(binding: Binding, violationPath: NodePath): StaticDefinitionResult {
+	const assignmentPath = assignmentPathForViolation(violationPath);
+	if (assignmentPath?.node.operator !== "=") return staticUnknown("unsupported write");
+	if (!t.isIdentifier(assignmentPath.node.left)) return staticUnknown("unsupported write");
+	if (assignmentPath.scope.getBinding(assignmentPath.node.left.name) !== binding) {
+		return staticUnknown("unsupported write");
+	}
+	if (!assignmentPath.parentPath?.isExpressionStatement()) return staticUnknown("ambiguous write");
+	const expressionPath = staticExpressionPath(assignmentPath, "right");
+	if (!expressionPath) return staticUnknown("unsupported write");
+	const start = staticNodeOffset(assignmentPath.node);
+	const end = staticNodeEnd(assignmentPath.node);
+	if (start === undefined || end === undefined) return staticUnknown("missing write position");
+	return { kind: "definition", definition: { expressionPath, start, end } };
+}
+
+function isUnambiguousStaticWrite(path: NodePath<t.AssignmentExpression>, context: NodePath): boolean {
+	let current: NodePath | null = path.parentPath;
+	while (current && current.node !== context.node) {
+		if (
+			current.isIfStatement() ||
+			current.isSwitchCase() ||
+			current.isForStatement() ||
+			current.isForInStatement() ||
+			current.isForOfStatement() ||
+			current.isWhileStatement() ||
+			current.isDoWhileStatement() ||
+			current.isTryStatement() ||
+			current.isConditionalExpression() ||
+			current.isLogicalExpression()
+		) {
+			return false;
+		}
+		current = current.parentPath;
+	}
+	return current !== null;
+}
+
+function staticReachingDefinition(identifierPath: NodePath<t.Identifier>, binding: Binding): StaticDefinitionResult {
+	const initialDefinition = bindingInitializer(binding);
+	if (initialDefinition.kind !== "definition") return initialDefinition;
+	const useOffset = staticNodeOffset(identifierPath.node);
+	const bindingContext = staticExecutionContext(binding.path);
+	const useContext = staticExecutionContext(identifierPath);
+	if (useOffset === undefined || !bindingContext || !useContext) return staticUnknown("missing use position");
+	if (bindingContext.node !== useContext.node) {
+		if (binding.kind !== "const" || !binding.constant || !isExecutionContextAncestor(bindingContext, useContext)) {
+			return staticUnknown("ambiguous cross-context binding");
+		}
+		return initialDefinition;
+	}
+	if (initialDefinition.definition.end > useOffset) return staticUnknown("direct TDZ");
+
+	let selectedDefinition = initialDefinition.definition;
+	for (const violationPath of binding.constantViolations) {
+		const violationContext = staticExecutionContext(violationPath);
+		if (!violationContext || violationContext.node !== bindingContext.node) {
+			return staticUnknown("ambiguous cross-context write");
+		}
+		const violationOffset = staticNodeOffset(violationPath.node);
+		if (violationOffset === undefined) return staticUnknown("missing write position");
+		if (violationOffset >= useOffset) continue;
+		const writeDefinition = staticAssignmentDefinition(binding, violationPath);
+		if (writeDefinition.kind !== "definition") return writeDefinition;
+		if (writeDefinition.definition.end > useOffset) return staticUnknown("ambiguous write order");
+		const assignmentPath = assignmentPathForViolation(violationPath);
+		if (!assignmentPath || !isUnambiguousStaticWrite(assignmentPath, bindingContext)) {
+			return staticUnknown("ambiguous write");
+		}
+		if (writeDefinition.definition.start === selectedDefinition.start) return staticUnknown("ambiguous write order");
+		if (writeDefinition.definition.start > selectedDefinition.start) selectedDefinition = writeDefinition.definition;
+	}
+	return { kind: "definition", definition: selectedDefinition };
+}
+
+function evaluateStaticArrayElements(
+	path: NodePath<t.ArrayExpression>,
+	context: StaticEvaluationContext,
+): StaticArrayResult {
+	recordStaticEvaluationStep(path, context);
+	const elementPaths = path.get("elements");
+	if (!Array.isArray(elementPaths)) return { kind: "unknown", reason: "unsupported array" };
+	const values: string[] = [];
+	for (const elementPath of elementPaths) {
+		if (!elementPath.isExpression()) return { kind: "unknown", reason: "unsupported array element" };
+		const value = evaluateStaticString(elementPath, context);
+		if (value.kind !== "known") return value;
+		values.push(value.value);
+	}
+	return { kind: "known", values };
+}
+
+function evaluateStaticJoin(path: NodePath<t.CallExpression>, context: StaticEvaluationContext): StaticStringResult {
+	if (path.node.optional) return staticUnknown("unsupported call");
+	const calleePath = staticExpressionPath(path, "callee");
+	if (!calleePath?.isMemberExpression()) return staticUnknown("unsupported call");
+	if (
+		calleePath.node.computed ||
+		calleePath.node.optional ||
+		!t.isIdentifier(calleePath.node.property, { name: "join" })
+	) {
+		return staticUnknown("unsupported call");
+	}
+	const objectPath = staticExpressionPath(calleePath, "object");
+	if (!objectPath?.isArrayExpression()) return staticUnknown("unsupported call");
+	const argumentPaths = path.get("arguments");
+	if (!Array.isArray(argumentPaths) || argumentPaths.length > 1) return staticUnknown("unsupported call");
+	let separator = ",";
+	if (argumentPaths.length === 1) {
+		const separatorPath = argumentPaths[0];
+		if (!separatorPath.isExpression()) return staticUnknown("unsupported call");
+		const separatorResult = evaluateStaticString(separatorPath, context);
+		if (separatorResult.kind !== "known") return separatorResult;
+		separator = separatorResult.value;
+	}
+	const arrayResult = evaluateStaticArrayElements(objectPath as NodePath<t.ArrayExpression>, context);
+	return arrayResult.kind === "known" ? staticKnown(arrayResult.values.join(separator)) : arrayResult;
+}
+
+function evaluateStaticIdentifier(path: NodePath<t.Identifier>, context: StaticEvaluationContext): StaticStringResult {
+	const binding = path.scope.getBinding(path.node.name);
+	if (!binding) return staticUnknown("missing binding");
+	if (context.activeBindings.has(binding)) return staticUnknown("binding cycle");
+	const definition = staticReachingDefinition(path, binding);
+	if (definition.kind !== "definition") return definition;
+	context.activeBindings.add(binding);
+	try {
+		incrementStaticAliasHop(path, context);
+		return evaluateStaticString(definition.definition.expressionPath, context);
+	} finally {
+		context.activeBindings.delete(binding);
+	}
+}
+
+function evaluateStaticString(path: NodePath<t.Expression>, context: StaticEvaluationContext): StaticStringResult {
+	recordStaticEvaluationStep(path, context);
+	const node = path.node;
+	if (t.isStringLiteral(node)) return staticKnown(node.value);
+	if (t.isIdentifier(node)) return evaluateStaticIdentifier(path as NodePath<t.Identifier>, context);
+	if (
+		t.isTSAsExpression(node) ||
+		t.isTSTypeAssertion(node) ||
+		t.isTSSatisfiesExpression(node) ||
+		t.isTSNonNullExpression(node) ||
+		t.isParenthesizedExpression(node)
+	) {
+		const expressionPath = staticExpressionPath(path, "expression");
+		return expressionPath ? evaluateStaticString(expressionPath, context) : staticUnknown("unsupported wrapper");
+	}
+	if (t.isTemplateLiteral(node)) {
+		const expressionPaths = path.get("expressions");
+		if (!Array.isArray(expressionPaths) || expressionPaths.length !== node.expressions.length) {
+			return staticUnknown("unsupported template");
+		}
+		let value = "";
+		for (let index = 0; index < node.quasis.length; index++) {
+			const cooked = node.quasis[index]?.value.cooked;
+			if (cooked === null || cooked === undefined) return staticUnknown("unsupported template");
+			value += cooked;
+			if (index === expressionPaths.length) continue;
+			const expressionPath = expressionPaths[index];
+			if (!expressionPath.isExpression()) return staticUnknown("unsupported template");
+			const expressionResult = evaluateStaticString(expressionPath, context);
+			if (expressionResult.kind !== "known") return expressionResult;
+			value += expressionResult.value;
+		}
+		return staticKnown(value);
+	}
+	if (t.isBinaryExpression(node) && node.operator === "+") {
+		const leftPath = staticExpressionPath(path, "left");
+		const rightPath = staticExpressionPath(path, "right");
+		if (!leftPath || !rightPath) return staticUnknown("unsupported binary expression");
+		const left = evaluateStaticString(leftPath, context);
+		if (left.kind !== "known") return left;
+		const right = evaluateStaticString(rightPath, context);
+		return right.kind === "known" ? staticKnown(left.value + right.value) : right;
+	}
+	if (t.isCallExpression(node)) return evaluateStaticJoin(path as NodePath<t.CallExpression>, context);
+	return staticUnknown("unsupported expression");
+}
+
+function isStaticModeCandidate(
+	elements: readonly ({ path: NodePath<t.Expression>; value: string | undefined } | undefined)[],
+): boolean {
+	return elements.some(element => element?.value === "--mode" || /^--mode(?:\s+|=)/.test(element?.value ?? ""));
+}
+
+function staticRetiredModeInvocationViolations(file: string, contents: string): string[] {
+	const ast = parseRetiredModeSource(file, contents);
+	if (!ast) return [];
+	const fileState: StaticAnalysisFileState = { steps: 0 };
+	const violations = new Set<string>();
+	traverse(ast, {
+		ArrayExpression(arrayPath) {
+			const elementPaths = arrayPath.get("elements");
+			if (!Array.isArray(elementPaths)) return;
+			const evaluationSteps: NodePath<t.Expression>[] = [];
+			const elements: Array<{ path: NodePath<t.Expression>; value: string | undefined } | undefined> = [];
+			for (const elementPath of elementPaths) {
+				if (!elementPath.isExpression()) {
+					elements.push(undefined);
+					continue;
+				}
+				const context: StaticEvaluationContext = {
+					file,
+					expressionSteps: 0,
+					aliasHops: 0,
+					activeBindings: new Set<Binding>(),
+					evaluationSteps,
+				};
+				const result = evaluateStaticString(elementPath, context);
+				elements.push({ path: elementPath, value: result.kind === "known" ? result.value : undefined });
+			}
+			if (!isStaticModeCandidate(elements)) return;
+			commitStaticFileSteps(evaluationSteps, file, fileState);
+			for (let index = 0; index < elements.length; index++) {
+				const current = elements[index];
+				if (!current?.value) continue;
+				const preceding = index > 0 ? elements[index - 1] : undefined;
+				if (
+					!retiredModeArgumentPattern.test(current.value) &&
+					!(preceding?.value === "--mode" && retiredModeValuePattern.test(current.value))
+				)
+					continue;
+				const violationPath = preceding?.value === "--mode" ? preceding.path : current.path;
+				violations.add(`${file}:${staticNodeLocation(violationPath.node).line}: invokes removed --mode rpc`);
+			}
+		},
+	});
+	return [...violations];
+}
+
+function legacyRpcModeAliasViolations(file: string, contents: string): string[] {
+	const { masked, values: bindings } = staticStringBindings(contents);
+	const violations: string[] = [];
+	for (const match of masked.matchAll(/\[[^\]\r\n]*\]/g)) {
+		const argv = match[0].slice(1, -1).split(",");
+		for (let index = 0; index < argv.length; index++) {
+			const expression = argv[index].trim();
+			if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(expression)) continue;
+			const value = staticStringValue(expression, bindings);
+			const preceding = index > 0 ? staticStringValue(argv[index - 1], bindings) : undefined;
+			if (
+				value !== undefined &&
+				(retiredModeArgumentPattern.test(value) || (preceding === "--mode" && retiredModeValuePattern.test(value)))
+			) {
+				violations.push(`${file}:${lineNumber(contents, match.index ?? 0)}: invokes removed --mode rpc`);
+			}
+		}
+	}
+	return violations;
 }
 
 function rpcModeInvocationViolations(file: string, contents: string): string[] {
 	if (isGeneratedDocumentationIndex(file) || !isExecutableSource(file) || allowedRpcModeInvocationTests.has(file))
 		return [];
-	return modeRpcInvocationPatterns.flatMap(pattern =>
+	const patterns = [...retiredExternalModeInvocationPatterns, ...constructedRetiredIngressPatterns];
+	const violations = patterns.flatMap(pattern =>
 		[...contents.matchAll(pattern)].map(
 			match => `${file}:${lineNumber(contents, match.index ?? 0)}: invokes removed --mode rpc`,
 		),
 	);
+	if (retiredModeParserOptions(file)) {
+		violations.push(...staticRetiredModeInvocationViolations(file, contents));
+	} else {
+		violations.push(...legacyRpcModeAliasViolations(file, contents));
+	}
+	return [...new Set(violations)];
 }
 
 function bridgeClientPackageMetadataViolation(file: string, contents: string): string | undefined {
@@ -209,9 +881,6 @@ function isSource(file: string): boolean {
 }
 
 const teamRuntimeTmuxPath = "packages/coding-agent/src/gjc-runtime/team-runtime.ts";
-const teamRuntimeWorkerPayloadArgs =
-	/^\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*[A-Za-z_$][A-Za-z0-9_$.]*\s*,\s*[A-Za-z_$][A-Za-z0-9_$.]*\s*\],\s*\{/;
-const teamRuntimeEnterArgs = /^\s*,\s*["']-t["']\s*,\s*[A-Za-z_$][A-Za-z0-9_$.]*\s*,\s*["']Enter["']\s*\],\s*\{/;
 
 const coordinatorMcpRoot = "packages/coding-agent/src/coordinator-mcp/server.ts";
 function isPublishedGjcSessionShellHelper(file: string): boolean {
@@ -414,6 +1083,25 @@ function tmuxCreateStartupViolations(file: string, contents: string): string[] {
 	if (arityGuards.length !== 1 || topLevelArityGuards.length !== 1 || twoOperandArityChecks.length !== 1) {
 		violation(arityGuard?.index ?? 0, "human-only tmux owner must have one fail-closed exact two-operand guard");
 	}
+	const positionalRewrites = [...contents.matchAll(/^\s*(?:set\s+--(?:\s|$)|shift(?:\s|$))/gm)];
+	if (positionalRewrites.length > 0) {
+		violation(
+			positionalRewrites[0].index ?? 0,
+			"human-only tmux owner must not rewrite positional arguments before launch",
+		);
+	}
+	const guardStart = arityGuard?.index ?? 0;
+	const guardNeutralizers = [
+		...contents.matchAll(
+			/(?:^|\n)\s*(?:(?:function\s+)?(?:exit|echo)\s*(?:\(\s*\))?\s*\{|alias\s+(?:exit|echo)\b|enable\s+-n\s+(?:exit|echo)\b)/gm,
+		),
+	].filter(match => (match.index ?? 0) < guardStart);
+	if (guardNeutralizers.length > 0) {
+		violation(
+			guardNeutralizers[0].index ?? 0,
+			"human-only tmux owner must not neutralize the exact two-operand guard",
+		);
+	}
 
 	const canonicalCommand = /^\s*command\s*=\s*\[\s*os\.environ\[\s*["']GJC_SESSION_GJC_BIN["']\s*\]\s*\]\s*$/gm;
 	const canonicalCommands = [...contents.matchAll(canonicalCommand)];
@@ -432,6 +1120,46 @@ function tmuxCreateStartupViolations(file: string, contents: string): string[] {
 	}
 	const canonicalInteractivePopenAssignment =
 		/^\s*child\s*=\s*subprocess\.Popen\(\s*command\s*(?:,\s*cwd\s*=\s*os\.environ\[\s*["']GJC_SESSION_WORKDIR["']\s*\])?\s*\)\s*$/;
+	const expectedLifecycleCallsites = [
+		{
+			operation: "terminal observer",
+			pattern:
+				/\bcompleted\s*=\s*subprocess\.run\(\s*\[\s*os\.environ\[\s*["']GJC_SESSION_GJC_BIN["']\s*\]\s*,\s*["']--internal-tmux-owner-isolation["']\s*\]\s*,/g,
+		},
+		{
+			operation: "owner-isolation plan",
+			pattern:
+				/\bPLAN_RESPONSE\s*=\s*"\$\(\s*printf\s+["'][^"']*["']\s+"\$PLAN_LINE"\s*\|\s*"\$GJC_BIN"\s+--internal-tmux-owner-isolation\s*\)"/g,
+		},
+		{
+			operation: "post-spawn proof",
+			pattern:
+				/\bPOST_SPAWN_RESPONSE\s*=\s*"\$\(\s*printf\s+["'][^"']*["']\s+"\$PLAN_LINE"\s*\|\s*"\$GJC_BIN"\s+--internal-tmux-owner-isolation\s*\)"/g,
+		},
+		{
+			operation: "generation publication",
+			pattern:
+				/\bGENERATION_PUBLISH_RESPONSE\s*=\s*"\$\(\s*printf\s+["'][^"']*["']\s+"\$GENERATION_PUBLISH_REQUEST"\s*\|\s*"\$GJC_BIN"\s+--internal-tmux-owner-isolation\s*\)"/g,
+		},
+		{
+			operation: "terminal monitor",
+			pattern:
+				/\bif\s+verdict\s*=\s*"\$\(\s*printf\s+["'][^"']*["']\s+"\$request"\s*\|\s*timeout\s+"[^"]+"\s+"\$GJC_SESSION_GJC_BIN"\s+--internal-tmux-owner-isolation\s*\)"\s*;\s*then/g,
+		},
+	];
+	const expectedLifecycleRanges: ShellRange[] = [];
+	for (const callsite of expectedLifecycleCallsites) {
+		const matches = [...contents.matchAll(callsite.pattern)];
+		if (matches.length !== 1) {
+			violation(
+				matches[0]?.index ?? 0,
+				`human-only tmux owner must bind one exact ${callsite.operation} lifecycle callsite`,
+			);
+			continue;
+		}
+		const match = matches[0];
+		expectedLifecycleRanges.push({ start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
+	}
 	const pythonCommandAssignment =
 		/^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?=(?:\(\s*)?(?:command\b|\[\s*\*?command\b|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s*\(\s*command\b))[^\n]*$/gm;
 	for (const match of contents.matchAll(pythonCommandAssignment)) {
@@ -465,6 +1193,14 @@ function tmuxCreateStartupViolations(file: string, contents: string): string[] {
 			continue;
 		}
 		if (isLifecycleCall) {
+			const lifecycleStart = match.index ?? 0;
+			if (!expectedLifecycleRanges.some(range => lifecycleStart >= range.start && lifecycleStart < range.end)) {
+				violation(
+					lifecycleStart,
+					"human-only tmux owner must bind owner-isolation to its expected lifecycle callsite",
+				);
+				continue;
+			}
 			allowedGjcEnvironmentReferences.push({ start: argument.start, end: argument.start + argument.text.length });
 			continue;
 		}
@@ -474,6 +1210,30 @@ function tmuxCreateStartupViolations(file: string, contents: string): string[] {
 				"human-only tmux owner must invoke GJC only with zero interactive argv or the exact owner-isolation lifecycle argv",
 			);
 		}
+	}
+	for (const match of contents.matchAll(/\[\s*["']gjc["'](?:\s*,|\s*\])/g)) {
+		violation(match.index ?? 0, "human-only tmux owner must not launch a literal gjc executable");
+	}
+	for (const match of contents.matchAll(/(?:^|\n)\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*["']gjc["']\s*$/gm)) {
+		violation(match.index ?? 0, "human-only tmux owner must not alias or wrap the gjc executable");
+	}
+	for (const match of contents.matchAll(
+		/(?:^|\n)\s*(?:alias\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*['"]?gjc\b|(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{[^\n]*\bgjc\b)/gm,
+	)) {
+		violation(match.index ?? 0, "human-only tmux owner must not alias or wrap the gjc executable");
+	}
+	for (const match of contents.matchAll(
+		/(?:^|[|;&({]\s*|\b(?:command|exec|env|sudo|nice|nohup)\s+)["']?gjc["']?(?=\s|$)/gm,
+	)) {
+		violation(match.index ?? 0, "human-only tmux owner must not launch a literal gjc executable");
+	}
+	for (const match of contents.matchAll(
+		/\benv(?:\s+(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)|"[^"]*"|'[^']*'))*\s+["']?gjc["']?(?=\s|$)/gm,
+	)) {
+		violation(match.index ?? 0, "human-only tmux owner must not launch a literal gjc executable");
+	}
+	for (const match of contents.matchAll(/\b(?:bash|sh)\s+-c\s+(["'])[^\r\n]*?\bgjc\b/g)) {
+		violation(match.index ?? 0, "human-only tmux owner must not alias or wrap the gjc executable");
 	}
 	if (interactiveLaunches !== 1) {
 		violation(0, "human-only tmux owner must launch exactly one zero-argv interactive GJC process");
@@ -503,14 +1263,23 @@ function tmuxCreateStartupViolations(file: string, contents: string): string[] {
 	}
 
 	const normalizedContents = normalizeShellContinuations(contents);
+	const normalizedExpectedLifecycleRanges = expectedLifecycleCallsites.flatMap(callsite =>
+		[...normalizedContents.matchAll(callsite.pattern)].map(match => ({
+			start: match.index ?? 0,
+			end: (match.index ?? 0) + match[0].length,
+		})),
+	);
 	const shellGjcInvocations =
 		/(?:^|[|;&(]\s*|\b(?:command|exec)\s+|\btimeout\s+(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s]+)\s+)(["']?)\$(?:GJC_BIN|GJC_SESSION_GJC_BIN|\{(?:GJC_BIN|GJC_SESSION_GJC_BIN)\})\1([^\r\n;|&)]*)/gm;
 	for (const match of normalizedContents.matchAll(shellGjcInvocations)) {
 		const argumentsText = (match[2] ?? "").trim().replace(/["']$/, "");
-		const isZeroArgInteractiveLaunch = argumentsText.length === 0;
 		const isLifecycleCall = /^(?:["']?--internal-tmux-owner-isolation["']?)$/.test(argumentsText);
-		if (!isZeroArgInteractiveLaunch && !isLifecycleCall) {
-			violation(match.index ?? 0, "human-only tmux owner invokes GJC with a non-lifecycle startup argument");
+		const invocationStart = match.index ?? 0;
+		if (
+			!isLifecycleCall ||
+			!normalizedExpectedLifecycleRanges.some(range => invocationStart >= range.start && invocationStart < range.end)
+		) {
+			violation(invocationStart, "human-only tmux owner invokes GJC with a non-lifecycle startup argument");
 		}
 	}
 	for (const reference of shellGjcBinaryReferenceViolations(contents)) {
@@ -529,9 +1298,131 @@ const coordinatorDirectAuthorityPatterns = [
 	/\b(?:agentSession|agent_session|session)\s*\.\s*(?:prompt|promptCustomMessage|abort|abortAndPrompt|followUp|answer)\s*\(/g,
 ];
 
-function isSanctionedTeamRuntimeTmuxInput(file: string, primitive: string, args: string): boolean {
-	if (file !== teamRuntimeTmuxPath || primitive !== "send-keys") return false;
-	return teamRuntimeWorkerPayloadArgs.test(args) || teamRuntimeEnterArgs.test(args);
+function braceBlockRange(contents: string, openingBrace: number): ShellRange | undefined {
+	const structural = maskCodeComments(contents.slice(openingBrace));
+	let depth = 0;
+	let quote: "'" | '"' | "`" | undefined;
+	for (let relative = 0; relative < structural.length; relative++) {
+		const character = structural[relative];
+		if (quote) {
+			if (character === "\\") relative++;
+			else if (character === quote) quote = undefined;
+			continue;
+		}
+		if (character === "'" || character === '"' || character === "`") {
+			quote = character;
+			continue;
+		}
+		if (character === "{") depth++;
+		if (character === "}") depth--;
+		if (depth === 0) return { start: openingBrace, end: openingBrace + relative + 1 };
+	}
+	return undefined;
+}
+
+function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
+	const guardMatches = [...contents.matchAll(/if\s*\(\s*useSendKeysFallback\s*\)\s*\{/g)];
+	const payloadMatches = [
+		...contents.matchAll(
+			/Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*workerCommand\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
+		),
+	];
+	const enterMatches = [
+		...contents.matchAll(
+			/const\s+sendKeys\s*=\s*Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*["']Enter["']\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
+		),
+	];
+	const fallbackPredicateMatches = [
+		...contents.matchAll(
+			/function\s+shouldDispatchWorkerWithSendKeys\([^)]*\)\s*:\s*boolean\s*\{\s*return\s+platform\s*===\s*["']win32["']\s*\|\|\s*path\.basename\(tmuxCommand\)\.toLowerCase\(\)\s*===\s*["']psmux["']\s*;\s*\}/g,
+		),
+	];
+	const useFallbackMatches = [
+		...contents.matchAll(
+			/const\s+useSendKeysFallback\s*=\s*shouldDispatchWorkerWithSendKeys\(config\.tmux_command\)\s*;/g,
+		),
+	];
+	const splitWorkerCommandMatches = [
+		...contents.matchAll(/\.\.\.\(useSendKeysFallback\s*\?\s*\[\]\s*:\s*\[workerCommand\]\)\s*,/g),
+	];
+	if (
+		guardMatches.length !== 1 ||
+		payloadMatches.length !== 1 ||
+		enterMatches.length !== 1 ||
+		fallbackPredicateMatches.length !== 1 ||
+		useFallbackMatches.length !== 1 ||
+		splitWorkerCommandMatches.length !== 1
+	)
+		return [];
+	const guardStart = guardMatches[0].index ?? 0;
+	const payloadStart = payloadMatches[0].index ?? 0;
+	const enterStart = enterMatches[0].index ?? 0;
+	const voidStart = contents.indexOf("void sendKeys.exitCode;", enterStart);
+	if (
+		(useFallbackMatches[0].index ?? 0) >= (splitWorkerCommandMatches[0].index ?? 0) ||
+		(splitWorkerCommandMatches[0].index ?? 0) >= guardStart ||
+		payloadStart >= enterStart ||
+		voidStart < enterStart
+	)
+		return [];
+	const guard = guardMatches[0];
+	const openingBrace = (guard.index ?? 0) + guard[0].lastIndexOf("{");
+	const range = braceBlockRange(contents, openingBrace);
+	if (!range) return [];
+	if (
+		payloadStart < range.start ||
+		payloadStart >= range.end ||
+		enterStart < range.start ||
+		enterStart >= range.end ||
+		contents.indexOf("void sendKeys.exitCode;", enterStart) >= range.end
+	)
+		return [];
+	return [
+		{ start: payloadStart, end: payloadStart + payloadMatches[0][0].length },
+		{ start: enterStart, end: enterStart + enterMatches[0][0].length },
+	];
+}
+
+function isExactTmuxScrollCopyModeSendKeys(
+	file: string,
+	contents: string,
+	occurrence: TmuxPrimitiveOccurrence,
+): boolean {
+	if (file !== "packages/coding-agent/src/modes/tmux-scroll.ts" || occurrence.primitive !== "send-keys") return false;
+	const openingBracket = contents.lastIndexOf("[", occurrence.start);
+	const closingBracket = contents.indexOf("]", occurrence.end);
+	if (openingBracket === -1 || closingBracket === -1) return false;
+	return /^\[\s*["']send-keys["']\s*,\s*\.\.\.targetArgs\s*,\s*["']-X["']\s*,\s*(?:["']history-bottom["']|["']search-backward["']\s*,\s*TMUX_PREVIOUS_USER_INPUT_SEARCH_PATTERN)\s*\]$/.test(
+		contents.slice(openingBracket, closingBracket + 1),
+	);
+}
+
+function isTypeOnlyTmuxPrimitiveOccurrence(contents: string, occurrence: TmuxPrimitiveOccurrence): boolean {
+	const lineStart = contents.lastIndexOf("\n", occurrence.start) + 1;
+	const lineEnd = contents.indexOf("\n", occurrence.end);
+	return /^\s*(?:export\s+)?type\b/.test(contents.slice(lineStart, lineEnd === -1 ? contents.length : lineEnd));
+}
+
+function tmuxMachineBusViolations(file: string, contents: string): string[] {
+	const allowedTeamFallbackRanges = file === teamRuntimeTmuxPath ? exactTeamRuntimeSendKeysRanges(contents) : [];
+	const violations: string[] = [];
+	for (const occurrence of tmuxPrimitiveOccurrences(contents)) {
+		const isExactTeamFallback =
+			occurrence.primitive === "send-keys" &&
+			allowedTeamFallbackRanges.some(range => occurrence.start >= range.start && occurrence.end <= range.end);
+		if (
+			isExactTeamFallback ||
+			isExactTmuxScrollCopyModeSendKeys(file, contents, occurrence) ||
+			isTypeOnlyTmuxPrimitiveOccurrence(contents, occurrence)
+		)
+			continue;
+		const detail =
+			occurrence.primitive === "capture-pane" || occurrence.primitive === "pipe-pane"
+				? `tmux ${occurrence.primitive} pane access is outside sanctioned test fixtures`
+				: `tmux ${occurrence.primitive} content injection is outside sanctioned process lifecycle`;
+		violations.push(`${file}:${lineNumber(contents, occurrence.start)}: ${detail}`);
+	}
+	return violations;
 }
 
 function lineNumber(contents: string, offset: number): number {
@@ -657,12 +1548,12 @@ function scanPackageExports(contents: string, sourceFiles: readonly string[]): s
 	const violations: string[] = [];
 	for (const [exportPath, target] of Object.entries(manifest.exports)) {
 		if (target === null) continue;
-		if (/^\.\/modes\/rpc(?:\/|$)/.test(exportPath)) {
+		if (/^\.\/modes\/rpc(?:[A-Za-z0-9_./-]|$)/i.test(exportPath)) {
 			violations.push(
 				`${packageManifestPath}: removed RPC mode remains externally exported as ${JSON.stringify(exportPath)}`,
 			);
 		}
-		if (/(?:^|\/|[-_])(?:bridge|unattended)(?:\/|[-_]|$)/.test(exportPath)) {
+		if (/(?:^|\/|[-_])(?:bridge|unattended)[A-Za-z0-9_.-]*(?:\/|$)/i.test(exportPath)) {
 			violations.push(
 				`${packageManifestPath}: removed bridge or unattended surface remains externally exported as ${JSON.stringify(exportPath)}`,
 			);
@@ -772,10 +1663,22 @@ async function scan(): Promise<string[]> {
 		}
 		if (isPublishedGjcSessionShellHelper(file)) {
 			const contents = await Bun.file(path.join(repoRoot, file)).text();
-			const normalizedContents = normalizeShellContinuations(contents);
-			for (const match of normalizedContents.matchAll(tmuxMachineBusPrimitivePattern)) {
+			const occurrences = tmuxPrimitiveOccurrences(contents);
+			for (const match of contents.matchAll(
+				/\b(?:load-buffer|paste-buffer|send-keys|capture-pane|pipe-pane|set-buffer)\b/g,
+			)) {
+				const start = match.index ?? 0;
+				if (!occurrences.some(occurrence => start >= occurrence.start && start < occurrence.end)) {
+					occurrences.push({
+						primitive: match[0] as TmuxMachineBusPrimitive,
+						start,
+						end: start + match[0].length,
+					});
+				}
+			}
+			for (const occurrence of occurrences) {
 				violations.push(
-					`${file}:${lineNumber(normalizedContents, match.index ?? 0)}: published shell helper performs tmux machine prompt injection or pane viewing`,
+					`${file}:${lineNumber(contents, occurrence.start)}: published shell helper performs tmux machine prompt injection or pane viewing`,
 				);
 			}
 			violations.push(...tmuxCreateStartupViolations(file, contents));
@@ -801,7 +1704,7 @@ async function scan(): Promise<string[]> {
 		if (file === rootAcpEntrypoint) violations.push(...rootAcpModeViolations(contents));
 
 		for (const match of contents.matchAll(
-			/(?:import|export)\s+(?:type\s+)?(?:[\s\S]*?\s+from\s+)?["'][^"']*modes\/(?:rpc|bridge)(?:["'/]|$)/g,
+			/(?:import|export)\s+(?:type\s+)?(?:[\s\S]*?\s+from\s+)?["'][^"']*modes\/(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*(?:["'/]|$)/gi,
 		)) {
 			violations.push(
 				`${file}:${lineNumber(contents, match.index ?? 0)}: imports removed modes/rpc or modes/bridge`,
@@ -875,39 +1778,20 @@ async function scan(): Promise<string[]> {
 			violations.push(`${file}: listener imports AgentSession or dispatch internals outside a sanctioned host`);
 		}
 
-		if (isProductionTypeScriptOrJavaScript(file) && file !== coordinatorMcpRoot) {
-			for (const match of contents.matchAll(tmuxPaneViewingPattern)) {
-				const primitive = match[0].includes("capture") ? "capture-pane" : "pipe-pane";
-				violations.push(
-					`${file}:${lineNumber(contents, match.index ?? 0)}: tmux ${primitive} pane access is outside sanctioned test fixtures`,
-				);
-			}
-		}
-
-		if (isProductionTypeScript(file) && file !== coordinatorMcpRoot) {
-			for (const match of contents.matchAll(
-				/(?:Bun\.(?:spawn|spawnSync)|runner)\s*\(\s*\[[^\]]*?\b(?:tmux|tmux_command)\b[^\]]*?["'](set-buffer|paste-buffer|send-keys)["']([^\n]*)/g,
-			)) {
-				const primitive = match[1];
-				const args = match[2];
-				if (!isSanctionedTeamRuntimeTmuxInput(file, primitive, args)) {
-					violations.push(
-						`${file}:${lineNumber(contents, match.index ?? 0)}: tmux ${primitive} content injection is outside sanctioned process lifecycle`,
-					);
+		if (isProductionTypeScriptOrJavaScript(file)) {
+			if (file === coordinatorMcpRoot) {
+				for (const occurrence of tmuxPrimitiveOccurrences(contents)) {
+					const detail =
+						occurrence.primitive === "capture-pane" || occurrence.primitive === "pipe-pane"
+							? "coordinator MCP reads tmux pane content outside SDK queries"
+							: `tmux ${occurrence.primitive} content injection is outside sanctioned process lifecycle`;
+					violations.push(`${file}:${lineNumber(contents, occurrence.start)}: ${detail}`);
 				}
+			} else {
+				violations.push(...tmuxMachineBusViolations(file, contents));
 			}
 		}
 		if (file === coordinatorMcpRoot) {
-			for (const match of contents.matchAll(/\b(set-buffer|paste-buffer|send-keys)\b/g)) {
-				violations.push(
-					`${file}:${lineNumber(contents, match.index ?? 0)}: tmux ${match[1]} content injection is outside sanctioned process lifecycle`,
-				);
-			}
-			for (const match of contents.matchAll(tmuxPaneViewingPattern)) {
-				violations.push(
-					`${file}:${lineNumber(contents, match.index ?? 0)}: coordinator MCP reads tmux pane content outside SDK queries`,
-				);
-			}
 			for (const pattern of coordinatorDirectAuthorityPatterns) {
 				for (const match of contents.matchAll(pattern)) {
 					violations.push(
@@ -929,10 +1813,16 @@ async function scan(): Promise<string[]> {
 	return violations;
 }
 
+interface SelfTestFixtureOptions {
+	expectedDiagnostics?: readonly string[];
+	timeoutMs?: number;
+}
+
 async function runSelfTestFixture(
 	files: Record<string, string>,
 	expectedExitCode: number,
 	expectedOutput?: string,
+	options: SelfTestFixtureOptions = {},
 ): Promise<void> {
 	const fixture = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-canonicalization-"));
 	try {
@@ -944,22 +1834,102 @@ async function runSelfTestFixture(
 		const init = Bun.spawnSync(["git", "init", "-q"], { cwd: fixture, stdout: "pipe", stderr: "pipe" });
 		const add = Bun.spawnSync(["git", "add", "."], { cwd: fixture, stdout: "pipe", stderr: "pipe" });
 		if (init.exitCode !== 0 || add.exitCode !== 0) throw new Error("unable to create scanner self-test fixture");
-		const result = Bun.spawnSync([process.execPath, import.meta.path], {
+		const timeoutMs = options.timeoutMs ?? 10_000;
+		const scanner = Bun.spawn([process.execPath, import.meta.path], {
 			cwd: repoRoot,
 			env: { ...process.env, GJC_SDK_CANONICALIZATION_SCAN_ROOT: fixture },
 			stdout: "pipe",
 			stderr: "pipe",
+			timeout: timeoutMs,
 		});
-		const output = `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`;
-		if (result.exitCode !== expectedExitCode) {
-			throw new Error(`self-test expected exit ${expectedExitCode}, got ${result.exitCode}: ${output}`);
+		const [exitCode, stdout, stderr] = await Promise.all([
+			scanner.exited,
+			new Response(scanner.stdout).text(),
+			new Response(scanner.stderr).text(),
+		]);
+		const output = `${stdout}${stderr}`;
+		if (scanner.signalCode !== null) {
+			throw new Error(`self-test timed out after ${timeoutMs}ms: ${output}`);
+		}
+		if (exitCode !== expectedExitCode) {
+			throw new Error(`self-test expected exit ${expectedExitCode}, got ${exitCode}: ${output}`);
 		}
 		if (expectedOutput && !output.includes(expectedOutput)) {
 			throw new Error(`self-test expected output ${JSON.stringify(expectedOutput)}, got: ${output}`);
 		}
+		if (options.expectedDiagnostics) {
+			const diagnostics = output.split(/\r?\n/).filter(line => line.endsWith(": invokes removed --mode rpc"));
+			if (
+				diagnostics.length !== options.expectedDiagnostics.length ||
+				diagnostics.some((diagnostic, index) => diagnostic !== options.expectedDiagnostics?.[index])
+			) {
+				throw new Error(
+					`self-test expected diagnostics ${JSON.stringify(options.expectedDiagnostics)}, got ${JSON.stringify(diagnostics)}`,
+				);
+			}
+		}
 	} finally {
 		await fs.rm(fixture, { recursive: true, force: true });
 	}
+}
+
+const retiredModeFixtureDirectory = "packages/coding-agent/test/fixtures/";
+
+function retiredModeFixturePath(name: string): string {
+	return `${retiredModeFixtureDirectory}${name}`;
+}
+
+function retiredModeDiagnostic(file: string, line = 1): string {
+	return `${file}:${line}: invokes removed --mode rpc`;
+}
+
+interface ExactRetiredModeFixtureOptions {
+	expectedOutput?: string;
+	timeoutMs?: number;
+}
+
+async function runExactRetiredModeFixture(
+	name: string,
+	contents: string,
+	expectedExitCode: number,
+	expectedDiagnostics: readonly string[],
+	options: ExactRetiredModeFixtureOptions = {},
+): Promise<void> {
+	const file = retiredModeFixturePath(name);
+	await runSelfTestFixture({ [file]: contents }, expectedExitCode, options.expectedOutput, {
+		expectedDiagnostics,
+		timeoutMs: options.timeoutMs,
+	});
+}
+
+function staticBinaryExpression(left: string, right: string, operandCount: number): string {
+	return [JSON.stringify(left), JSON.stringify(right), ...Array.from({ length: operandCount - 2 }, () => '""')].join(
+		" + ",
+	);
+}
+
+function sourceLocationAt(contents: string, offset: number): { line: number; column: number } {
+	return {
+		line: lineNumber(contents, offset),
+		column: offset - contents.lastIndexOf("\n", offset - 1) - 1,
+	};
+}
+
+function staticBudgetDiagnostic(
+	file: string,
+	location: { line: number; column: number },
+	kind: StaticAnalysisBudgetKind,
+	limit: number,
+	observed: number,
+): string {
+	return `${file}:${location.line}:${location.column}: static retired-mode analysis budget exceeded (kind=${kind}, limit=${limit}, observed=${observed})`;
+}
+
+function aliasChainSource(bindingCount: number): string {
+	const bindings = Array.from({ length: bindingCount }, (_, index) =>
+		index === 0 ? 'const a0 = "rpc";' : `const a${index} = a${index - 1};`,
+	);
+	return `${bindings.join("\n")}\nBun.spawnSync(["--mode", a${bindingCount - 1}]);\n`;
 }
 
 async function selfTest(): Promise<void> {
@@ -967,6 +1937,389 @@ async function selfTest(): Promise<void> {
 		{ "packages/coding-agent/package.json": '{"exports":{"./modes/rpc/*":"./src/modes/rpc/*.ts"}}\n' },
 		1,
 		"removed RPC mode remains externally exported",
+	);
+	await runSelfTestFixture(
+		{ "packages/coding-agent/package.json": '{"exports":{"./modes/rpc-compat/*":"./src/modes/rpc-compat/*.ts"}}\n' },
+		1,
+		"removed RPC mode remains externally exported",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/test/fixtures/rpc-compat-mode.ts": 'Bun.spawnSync(["gjc", "--mode", "rpc-compat"]);\n',
+		},
+		1,
+		"invokes removed --mode rpc",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/test/fixtures/bridge-compat-mode.ts":
+				'Bun.spawnSync(["gjc", "--mode", "bridge-compat"]);\n',
+		},
+		1,
+		"invokes removed --mode rpc",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/test/fixtures/aliased-retired-modes.ts":
+				'const rpcMode = "rpc";\nlet bridgeMode = "bridge-compat";\nvar unattendedMode = "unattended";\nBun.spawnSync(["gjc", "--mode", rpcMode]);\nBun.spawnSync(["gjc", "--mode", bridgeMode]);\nBun.spawnSync(["gjc", "--mode", unattendedMode]);\n',
+		},
+		1,
+		"invokes removed --mode rpc",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/test/fixtures/constructed-aliased-retired-modes.ts":
+				'const rpcPrefix = "r";\nconst rpcMode = rpcPrefix + "pc";\nconst bridgeMode = ["brid", "ge-compat"].join("");\nconst unattendedPrefix = "un";\nvar unattendedMode = unattendedPrefix + "attended";\nconst args = ["gjc", "--mode", rpcMode];\nBun.spawnSync(args);\nBun.spawnSync(["gjc", "--mode", bridgeMode]);\nBun.spawnSync(["gjc", "--mode", unattendedMode]);\n',
+		},
+		1,
+		"invokes removed --mode rpc",
+	);
+	await runExactRetiredModeFixture(
+		"typed-rpc-alias.ts",
+		'const retiredMode: string = "rpc"; Bun.spawnSync(["gjc", "--mode", retiredMode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("typed-rpc-alias.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"typed-bridge-alias.ts",
+		'const retiredMode: string = "bridge-compat"; Bun.spawnSync(["gjc", "--mode", retiredMode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("typed-bridge-alias.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"typed-unattended-alias.ts",
+		'const retiredMode: string = "unattended"; Bun.spawnSync(["gjc", "--mode", retiredMode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("typed-unattended-alias.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"ts-as-string.ts",
+		'const mode = "rpc" as string; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("ts-as-string.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"ts-as-const.ts",
+		'const mode = "rpc" as const; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("ts-as-const.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"ts-use-assertion.ts",
+		'const mode = "rpc"; Bun.spawnSync(["gjc", "--mode", mode as string]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("ts-use-assertion.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"ts-angle-assertion.ts",
+		'const mode = <string>"rpc"; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("ts-angle-assertion.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"ts-satisfies.ts",
+		'const mode = "rpc" satisfies string; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("ts-satisfies.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"ts-non-null.ts",
+		'const mode = ("rpc" as string)!; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("ts-non-null.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"parenthesized-alias.ts",
+		'const mode = (("rpc")); Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("parenthesized-alias.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"typed-alias-chain.ts",
+		'const prefix: string = "r"; const mode = (prefix + "pc") as string; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("typed-alias-chain.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"template-alias.ts",
+		`const prefix = "r"; const mode = \`\${prefix}pc\`; Bun.spawnSync(["gjc", "--mode", mode]);\n`,
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("template-alias.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"literal-join-alias.ts",
+		'const mode = ["r", "pc"].join(""); Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("literal-join-alias.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"constructed-mode-flag-alias.ts",
+		'const flag = ["--", "mode"].join(""); const mode: string = "rpc"; Bun.spawnSync(["gjc", flag, mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("constructed-mode-flag-alias.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"constructed-mode-flag-join.ts",
+		'Bun.spawnSync(["gjc", ["--m", "ode"].join(""), "rpc"]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("constructed-mode-flag-join.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"constructed-mode-flag-binary.ts",
+		'const mode: string = "rpc"; Bun.spawnSync(["gjc", "--m" + "ode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("constructed-mode-flag-binary.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"constructed-mode-flag-template.ts",
+		`const suffix = "ode"; Bun.spawnSync(["gjc", \`--m\${suffix}\`, "rpc"]);\n`,
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("constructed-mode-flag-template.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"constructed-mode-flag-aliased.ts",
+		'const flag = ["--m", "ode"].join(""); const mode: string = "rpc"; Bun.spawnSync(["gjc", flag, mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("constructed-mode-flag-aliased.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"inner-retired-shadow.ts",
+		'const mode = "acp";\n{ const mode: string = "rpc"; Bun.spawnSync(["gjc", "--mode", mode]); }\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("inner-retired-shadow.ts"), 2)],
+	);
+	await runExactRetiredModeFixture(
+		"closure-forward-const.ts",
+		'const launch = () => Bun.spawnSync(["gjc", "--mode", mode]);\nconst mode = "rpc";\nlaunch();\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("closure-forward-const.ts"), 1)],
+	);
+	await runExactRetiredModeFixture(
+		"safe-block-shadow.ts",
+		'const mode = "rpc"; { const mode = "acp"; Bun.spawnSync(["gjc", "--mode", mode]); }\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"parameter-shadow.ts",
+		'const mode = "rpc"; function launch(mode: string) { Bun.spawnSync(["gjc", "--mode", mode]); } launch("acp");\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"catch-shadow.ts",
+		'const mode = "rpc"; try { throw "acp"; } catch (mode) { Bun.spawnSync(["gjc", "--mode", mode]); }\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"destructure-shadow.ts",
+		'const mode = "rpc"; const { mode: shadow } = { mode: "acp" }; Bun.spawnSync(["gjc", "--mode", shadow]);\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"sibling-shadow.ts",
+		'{ const mode = "rpc"; void mode; } { const mode = "acp"; Bun.spawnSync(["gjc", "--mode", mode]); }\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"direct-tdz.ts",
+		'Bun.spawnSync(["gjc", "--mode", mode]); const mode = "rpc";\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"pre-use-safe-to-retired.ts",
+		'let mode = "acp"; mode = "rpc"; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("pre-use-safe-to-retired.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"pre-use-retired-to-safe.ts",
+		'let mode = "rpc"; mode = "acp"; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"later-safe-write.ts",
+		'let mode = "rpc"; Bun.spawnSync(["gjc", "--mode", mode]); mode = "acp";\n',
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("later-safe-write.ts"))],
+	);
+	await runExactRetiredModeFixture(
+		"later-retired-write.ts",
+		'let mode = "acp"; Bun.spawnSync(["gjc", "--mode", mode]); mode = "rpc";\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"branch-write.ts",
+		'let mode = "acp"; if (condition) mode = "rpc"; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"compound-write.ts",
+		'let mode = "rpc"; mode += "-compat"; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"update-write.ts",
+		'let mode = "rpc"; mode++; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"dynamic-member-controls.ts",
+		'const dynamicMode = process.env.MODE; const state = { mode: "rpc" }; Bun.spawnSync(["gjc", "--mode", dynamicMode]); Bun.spawnSync(["gjc", "--mode", state.mode]);\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"typed-acp-control.ts",
+		'const mode: string = "acp"; Bun.spawnSync(["gjc", "--mode", mode]);\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture("unused-retired-alias.ts", 'const mode = "rpc"; void mode;\n', 0, []);
+	await runExactRetiredModeFixture(
+		"unrelated-array.ts",
+		'const values = ["rpc", "bridge-compat", "unattended"]; void values;\n',
+		0,
+		[],
+	);
+	await runExactRetiredModeFixture(
+		"cycle.ts",
+		'const a = b; const b = a; Bun.spawnSync(["gjc", "--mode", a]);\n',
+		0,
+		[],
+		{ timeoutMs: 2_000 },
+	);
+	await runExactRetiredModeFixture("deduplicated-direct-mode.ts", 'Bun.spawnSync(["gjc", "--mode", "rpc"]);\n', 1, [
+		retiredModeDiagnostic(retiredModeFixturePath("deduplicated-direct-mode.ts")),
+	]);
+	await runExactRetiredModeFixture(
+		"harmless-comment.ts",
+		'// RPC compatibility was retired; use ACP instead.\nconst mode = "acp";\nvoid mode;\n',
+		0,
+		[],
+	);
+	const parserFixtures: ReadonlyArray<readonly [string, string]> = [
+		["parser-js.js", 'const mode = "acp";\n'],
+		["parser-jsx.jsx", "const element = <div />;\nvoid element;\n"],
+		["parser-mjs.mjs", 'export const mode = "acp";\n'],
+		["parser-cjs.cjs", 'const mode = "acp";\n'],
+		["parser-ts.ts", 'const mode: string = "acp";\n'],
+		["parser-tsx.tsx", "const element: JSX.Element = <div />;\nvoid element;\n"],
+		["parser-mts.mts", 'export const mode: string = "acp";\n'],
+		["parser-cts.cts", 'const mode: string = "acp";\n'],
+		["parser-d-ts.d.ts", "declare const mode: string;\n"],
+		["parser-d-mts.d.mts", "export declare const mode: string;\n"],
+		["parser-d-cts.d.cts", "declare const mode: string;\n"],
+		["parser-import-attributes.js", 'import value from "./fixture.json" with { type: "json" };\nvoid value;\n'],
+		["parser-shebang.js", '#!/usr/bin/env bun\nconst mode = "acp";\n'],
+	];
+	for (const [name, contents] of parserFixtures) {
+		await runExactRetiredModeFixture(name, contents, 0, []);
+	}
+	const malformedSource = "const mode: string = ;\n";
+	await runExactRetiredModeFixture("malformed.ts", malformedSource, 2, [], {
+		expectedOutput: `${retiredModeFixturePath("malformed.ts")}:1:21: static retired-mode analysis parse failed`,
+	});
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/test/fixtures/python-text-only.py":
+				'def launch():\n    subprocess.run(["gjc", "--mode", "rpc"])\n',
+		},
+		1,
+		undefined,
+		{
+			expectedDiagnostics: [retiredModeDiagnostic("packages/coding-agent/test/fixtures/python-text-only.py", 2)],
+		},
+	);
+	// 128/129 literals joined by binary nodes consume exactly 255/257 expression steps.
+	const expressionUnderSource = `Bun.spawnSync(["--mode", ${staticBinaryExpression("r", "pc", 128)}]);\n`;
+	await runExactRetiredModeFixture("expression-step-under-limit.ts", expressionUnderSource, 1, [
+		retiredModeDiagnostic(retiredModeFixturePath("expression-step-under-limit.ts")),
+	]);
+	const expressionOverSource = `Bun.spawnSync(["--mode", ${staticBinaryExpression("r", "pc", 129)}]);\n`;
+	const expressionOverOffset = expressionOverSource.lastIndexOf('""');
+	await runExactRetiredModeFixture("expression-step-over-limit.ts", expressionOverSource, 2, [], {
+		expectedOutput: staticBudgetDiagnostic(
+			retiredModeFixturePath("expression-step-over-limit.ts"),
+			sourceLocationAt(expressionOverSource, expressionOverOffset),
+			"expression_steps",
+			256,
+			257,
+		),
+	});
+	// a63 through a0 follows 64 bindings and evaluates 65 nodes including the literal initializer.
+	const aliasUnderSource = aliasChainSource(64);
+	await runExactRetiredModeFixture("alias-hop-under-limit.ts", aliasUnderSource, 1, [
+		retiredModeDiagnostic(retiredModeFixturePath("alias-hop-under-limit.ts"), 65),
+	]);
+	const aliasOverSource = aliasChainSource(65);
+	const aliasOverOffset = aliasOverSource.indexOf("a0;", aliasOverSource.indexOf("const a1"));
+	await runExactRetiredModeFixture("alias-hop-over-limit.ts", aliasOverSource, 2, [], {
+		expectedOutput: staticBudgetDiagnostic(
+			retiredModeFixturePath("alias-hop-over-limit.ts"),
+			sourceLocationAt(aliasOverSource, aliasOverOffset),
+			"alias_hops",
+			64,
+			65,
+		),
+	});
+	// Four arrays each consume one --mode literal plus a 255-node safe value: 4 × 256 = 1,024.
+	const fileUnderSource = Array.from(
+		{ length: 4 },
+		() => `["--mode", ${staticBinaryExpression("a", "cp", 128)}];`,
+	).join("\n");
+	await runExactRetiredModeFixture("file-step-under-limit.ts", `${fileUnderSource}\n`, 0, []);
+	const fileOverSource = `${fileUnderSource}\n["--mode", "acp"];\n`;
+	const fileOverOffset = fileOverSource.lastIndexOf('"--mode"');
+	await runExactRetiredModeFixture("file-step-over-limit.ts", fileOverSource, 2, [], {
+		expectedOutput: staticBudgetDiagnostic(
+			retiredModeFixturePath("file-step-over-limit.ts"),
+			sourceLocationAt(fileOverSource, fileOverOffset),
+			"file_steps",
+			1_024,
+			1_025,
+		),
+	});
+	const unrelatedFileBudgetSource = Array.from(
+		{ length: 4 },
+		() => `["unrelated", ${staticBinaryExpression("a", "cp", 128)}];`,
+	).join("\n");
+	await runExactRetiredModeFixture(
+		"unrelated-file-step-control.ts",
+		`${unrelatedFileBudgetSource}\n["--mode", "rpc"];\n`,
+		1,
+		[retiredModeDiagnostic(retiredModeFixturePath("unrelated-file-step-control.ts"), 5)],
+	);
+
+	await runSelfTestFixture(
+		{ "packages/coding-agent/src/modes/bridge-compat/legacy.ts": "export const retired = true;\n" },
+		1,
+		"retired RPC/bridge/unattended ingress source survived",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/test/fixtures/constructed-rpc-option.ts":
+				'const mode = ["r", "pc"].join("");\nconst flags = { options: [mode] };\nvoid flags;\n',
+		},
+		1,
+		"invokes removed --mode rpc",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/consumer.ts":
+				'const legacyIngress = ["./modes", "unattended-compat"].join("/");\nvoid legacyIngress;\n',
+		},
+		1,
+		"invokes removed --mode rpc",
 	);
 	await runSelfTestFixture(
 		{
@@ -1102,10 +2455,37 @@ async function selfTest(): Promise<void> {
 [[ $# -eq 2 ]] || { echo "Usage: $0 <session-name> <worktree-path>" >&2; exit 2; }
 command = [os.environ["GJC_SESSION_GJC_BIN"]]
 child = subprocess.Popen(command)
-subprocess.run([os.environ["GJC_SESSION_GJC_BIN"], "--internal-tmux-owner-isolation"])
-"$GJC_BIN" --internal-tmux-owner-isolation
+completed = subprocess.run([os.environ["GJC_SESSION_GJC_BIN"], "--internal-tmux-owner-isolation"], input="{}")
+PLAN_RESPONSE="$(printf '%s\\n' "$PLAN_LINE" | "$GJC_BIN" --internal-tmux-owner-isolation)"
+POST_SPAWN_RESPONSE="$(printf '%s\\n' "$PLAN_LINE" | "$GJC_BIN" --internal-tmux-owner-isolation)"
+GENERATION_PUBLISH_RESPONSE="$(printf '%s\\n' "$GENERATION_PUBLISH_REQUEST" | "$GJC_BIN" --internal-tmux-owner-isolation)"
+if verdict="$(printf '%s\\n' "$request" | timeout "1s" "$GJC_SESSION_GJC_BIN" --internal-tmux-owner-isolation)"; then
+  true
+fi
 `;
 	await runSelfTestFixture({ "scripts/gjc-session/create.sh": canonicalCreateFixture }, 0);
+	await runSelfTestFixture(
+		{ "scripts/gjc-session/create.sh": `${canonicalCreateFixture}\nsubprocess.Popen(["gjc"])\n` },
+		1,
+		"must not launch a literal gjc executable",
+	);
+	await runSelfTestFixture(
+		{ "scripts/gjc-session/create.sh": `${canonicalCreateFixture}\nlauncher="gjc"\n"$launcher"\n` },
+		1,
+		"must not alias or wrap the gjc executable",
+	);
+	await runSelfTestFixture(
+		{
+			"scripts/gjc-session/create.sh": `${canonicalCreateFixture}\nrunner(){ gjc --internal-tmux-owner-isolation; }\nrunner\n`,
+		},
+		1,
+		"must not alias or wrap the gjc executable",
+	);
+	await runSelfTestFixture(
+		{ "scripts/gjc-session/create.sh": `${canonicalCreateFixture}\n"$GJC_BIN" --internal-tmux-owner-isolation\n` },
+		1,
+		"invokes GJC with a non-lifecycle startup argument",
+	);
 	await runSelfTestFixture(
 		{ "scripts/gjc-session/create.sh": `${canonicalCreateFixture}\nGJC_SESSION_FLAGS=unsafe\n` },
 		1,
@@ -1120,6 +2500,36 @@ subprocess.run([os.environ["GJC_SESSION_GJC_BIN"], "--internal-tmux-owner-isolat
 		},
 		1,
 		"must have one fail-closed exact two-operand guard",
+	);
+	await runSelfTestFixture(
+		{
+			"scripts/gjc-session/create.sh": canonicalCreateFixture.replace(
+				'[[ $# -eq 2 ]] || { echo "Usage: $0 <session-name> <worktree-path>" >&2; exit 2; }',
+				'set -- rewritten positional arguments\n[[ $# -eq 2 ]] || { echo "Usage: $0 <session-name> <worktree-path>" >&2; exit 2; }',
+			),
+		},
+		1,
+		"must not rewrite positional arguments before launch",
+	);
+	await runSelfTestFixture(
+		{
+			"scripts/gjc-session/create.sh": canonicalCreateFixture.replace(
+				'[[ $# -eq 2 ]] || { echo "Usage: $0 <session-name> <worktree-path>" >&2; exit 2; }',
+				'shift\n[[ $# -eq 2 ]] || { echo "Usage: $0 <session-name> <worktree-path>" >&2; exit 2; }',
+			),
+		},
+		1,
+		"must not rewrite positional arguments before launch",
+	);
+	await runSelfTestFixture(
+		{
+			"scripts/gjc-session/create.sh": canonicalCreateFixture.replace(
+				'[[ $# -eq 2 ]] || { echo "Usage: $0 <session-name> <worktree-path>" >&2; exit 2; }',
+				'exit(){ return 0; }\n[[ $# -eq 2 ]] || { echo "Usage: $0 <session-name> <worktree-path>" >&2; exit 2; }',
+			),
+		},
+		1,
+		"must not neutralize the exact two-operand guard",
 	);
 	await runSelfTestFixture(
 		{
@@ -1478,12 +2888,54 @@ subprocess.run([os.environ["GJC_SESSION_GJC_BIN"], "--internal-tmux-owner-isolat
 		1,
 		"tmux send-keys content injection is outside sanctioned process lifecycle",
 	);
+	const canonicalTeamRuntimeSendKeysFixture = `
+function shouldDispatchWorkerWithSendKeys(tmuxCommand: string, platform: NodeJS.Platform = process.platform): boolean {
+	return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";
+}
+const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(config.tmux_command);
+const splitArgs = [...(useSendKeysFallback ? [] : [workerCommand]),];
+if (useSendKeysFallback) {
+	Bun.spawnSync([config.tmux_command, "send-keys", "-l", "-t", paneId, workerCommand], {
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	const sendKeys = Bun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "Enter"], {
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	void sendKeys.exitCode;
+}
+`;
+	await runSelfTestFixture(
+		{ "packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture },
+		0,
+	);
 	await runSelfTestFixture(
 		{
-			"packages/coding-agent/src/gjc-runtime/team-runtime.ts":
-				'Bun.spawnSync([config.tmux_command, "send-keys", "-l", "-t", paneId, workerCommand], { stdout: "ignore" });\nBun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "Enter"], { stdout: "ignore" });\n',
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				'return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";',
+				"return true;",
+			),
 		},
-		0,
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				'return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";',
+				'return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux" || tmuxCommand === "tmux";',
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": `${canonicalTeamRuntimeSendKeysFixture}\nBun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "prompt"]);\n`,
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
 	);
 	await runSelfTestFixture(
 		{
@@ -1548,6 +3000,39 @@ subprocess.run([os.environ["GJC_SESSION_GJC_BIN"], "--internal-tmux-owner-isolat
 		},
 		1,
 		"tmux pipe-pane pane access is outside sanctioned test fixtures",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/unsanctioned-pane.ts":
+				"const paneAction = `capture-$" +
+				'{"pane"}`;\nconst executable = ["tm", "ux"].join("");\nconst argv = [executable, paneAction, "-p"];\nconst invoke = Bun.spawnSync;\ninvoke(argv);\n',
+		},
+		1,
+		"tmux capture-pane pane access is outside sanctioned test fixtures",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/unsanctioned-pane.ts":
+				'const paneAction = "pipe" + "-pane";\nfunction runTmux(argv: string[]) { return Bun.spawnSync(["tmux", ...argv]); }\nrunTmux([paneAction, "sink"]);\n',
+		},
+		1,
+		"tmux pipe-pane pane access is outside sanctioned test fixtures",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/unsanctioned-input.ts":
+				'const executable = ["tm", "ux"].join("");\nconst primitive = ["send", "keys"].join("-");\nconst argv = [executable, primitive, "-t", "pane", "prompt"];\nconst invoke = Bun.spawnSync;\ninvoke(argv);\n',
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/unsanctioned-input.ts":
+				'const primitive = "paste" + "-buffer";\nfunction runTmux(argv: string[]) { return Bun.spawnSync(["tmux", ...argv]); }\nrunTmux([primitive, "-t", "pane"]);\n',
+		},
+		1,
+		"tmux paste-buffer content injection is outside sanctioned process lifecycle",
 	);
 	await runSelfTestFixture(
 		{

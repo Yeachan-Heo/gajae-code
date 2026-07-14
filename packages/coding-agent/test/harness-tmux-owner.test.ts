@@ -137,6 +137,10 @@ async function runHarness(
 				...cliEnv.env,
 				GJC_HARNESS_STATE_ROOT: root,
 				GJC_HARNESS_TEST_ASSUME_LINUX_OWNER_ISOLATION: "1",
+				// The owner process must not inherit the test runner's ambient tmux client:
+				// its startup title update would target that shared server instead of the
+				// private -L socket exercised by this fixture.
+				TMUX: "",
 				GJC_TMUX_COMMAND: tmuxCommand,
 				...env,
 			},
@@ -153,6 +157,28 @@ async function runHarness(
 	return JSON.parse(output) as Record<string, unknown>;
 }
 
+const LEASE_EXIT_TIMEOUT_MS = 5_000;
+
+/**
+ * Bounded, exact-PID exit wait for a lease owner the test signalled. Returns true once `pid`
+ * is confirmed gone (ESRCH on signal-0), false on timeout. The pid is not a child of this
+ * process (the owner was detached and reparented), so there is no local zombie to reap — the
+ * kernel/init reaps it on exit and signal-0 then reports ESRCH.
+ */
+async function waitForExactExit(pid: number, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			process.kill(pid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+			throw error;
+		}
+		await Bun.sleep(25);
+	}
+	return false;
+}
+
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-tmux-owner-"));
 	workspace = await mkdtemp(path.join(tmpdir(), "harness-tmux-workspace-"));
@@ -164,14 +190,23 @@ afterEach(async () => {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 		throw error;
 	});
+	let leaseExitFailed: number | null = null;
 	if (lease?.pid) {
 		try {
 			process.kill(lease.pid, "SIGTERM");
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
 		}
+		// Bounded exact lease-PID exit wait: a live detached owner must tear down (and signal its
+		// descendants) before we delete the roots. A timeout is a real leak — fail loudly and
+		// PRESERVE the roots for inspection instead of silently rm-ing an orphaned tree.
+		if (!(await waitForExactExit(lease.pid, LEASE_EXIT_TIMEOUT_MS))) leaseExitFailed = lease.pid;
 	}
 	cliEnv.cleanup();
+	if (leaseExitFailed !== null)
+		throw new Error(
+			`detached owner lease pid ${leaseExitFailed} did not exit within ${LEASE_EXIT_TIMEOUT_MS}ms; preserving roots for inspection`,
+		);
 	await rm(root, { recursive: true, force: true });
 	await rm(workspace, { recursive: true, force: true });
 });
@@ -432,4 +467,23 @@ describe("HarnessCommand tmux-resident owner startup", () => {
 		expect((result.state as Record<string, unknown>).ownerLive).toBe(true);
 		await expect(access(path.join(root, sessionId, "owner-lifecycle", "generation.json"))).rejects.toThrow();
 	});
+	it("reaps the exact detached-owner child (no orphan) when it never becomes live", async () => {
+		// missing-tmux routes to the direct detached-owner fallback; disabling SDK hosting makes the
+		// spawned __owner child fail transport creation, so it never publishes a live lease. The
+		// parent must not orphan that exact child: reap the PID it spawned and verify bounded exit
+		// (exact-owner scoped, never a name-based broad kill, never a leftover daemon).
+		const result = await runHarness(path.join(root, "missing-tmux"), 1, { GJC_SDK_DISABLE: "1" });
+		const evidence = result.evidence as Record<string, unknown>;
+
+		expect(evidence.ownerRuntime).toBe("detached");
+		expect(evidence.ownerFallbackReason).toBe("tmux-unavailable");
+		expect((result.state as Record<string, unknown>).ownerLive).toBe(false);
+		const reaped = evidence.detachedOwnerReaped as { pid: number; verified: boolean };
+		expect(reaped).toBeDefined();
+		expect(Number.isSafeInteger(reaped.pid)).toBe(true);
+		expect(reaped.pid).toBeGreaterThan(0);
+		// `verified` derives from the child's authoritative exit promise (recycle-proof), proving
+		// the exact spawned owner was reaped within the bounded grace before the parent returned.
+		expect(reaped.verified).toBe(true);
+	}, 60_000);
 });

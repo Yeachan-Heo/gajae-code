@@ -3,9 +3,9 @@ import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { Agent } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
-import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { initTheme, theme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { CURSOR_MARKER, Text, visibleWidth } from "@gajae-code/tui";
+import { CURSOR_MARKER, ImageProtocol, setTerminalImageProtocol, TERMINAL, Text, visibleWidth } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import type {
@@ -91,6 +91,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 			thinkingLevel: "off",
 			serviceTier: undefined,
 			models: {},
+			configuredModelChains: {},
 			injectedTtsrRules: [],
 			selectedMCPToolNames: [],
 			hasPersistedMCPToolSelection: false,
@@ -585,5 +586,81 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(mode.editor.onSubmit).toBeDefined();
 		expect(mode.editor.onEscape).toBeDefined();
 		expect(refreshSpy).toHaveBeenCalled();
+	});
+
+	it("preserves a pending pet mode across editor replacement", () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		vi.spyOn(mode, "refreshSlashCommandState").mockResolvedValue();
+		try {
+			setTerminalImageProtocol(null);
+			settings.set("pet.mode", "red");
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			expect(mode.petWidget?.mode).toBe("off");
+
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			expect(mode.petWidget?.mode).toBe("off");
+
+			expect(settings.get("pet.mode")).toBe("red");
+			setTerminalImageProtocol(ImageProtocol.Sixel);
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			expect(mode.petWidget?.mode).toBe("red");
+		} finally {
+			setTerminalImageProtocol(originalProtocol);
+		}
+	});
+
+	it("disposes a pre-init pet widget before init replaces it", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		vi.spyOn(mode, "refreshSlashCommandState").mockResolvedValue();
+		try {
+			setTerminalImageProtocol(null);
+			settings.set("pet.mode", "red");
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			const preInitWidget = mode.petWidget;
+			if (!preInitWidget) throw new Error("Expected pre-init pet widget");
+			const dispose = vi.spyOn(preInitWidget, "dispose");
+
+			await mode.init();
+
+			expect(dispose).toHaveBeenCalledTimes(1);
+			expect(mode.petWidget).not.toBe(preInitWidget);
+			expect(mode.petWidget?.mode).toBe("off");
+
+			setTerminalImageProtocol(ImageProtocol.Sixel);
+			expect(mode.petWidget?.mode).toBe("red");
+		} finally {
+			setTerminalImageProtocol(originalProtocol);
+		}
+	});
+
+	it("commits pet modes through the shared result-returning policy", () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		vi.spyOn(mode, "refreshSlashCommandState").mockResolvedValue();
+		try {
+			settings.set("pet.mode", "off");
+			const showStatus = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
+
+			// Capability is rechecked immediately before mutation: a rejected
+			// commit surfaces the warning and never persists.
+			setTerminalImageProtocol(null);
+			expect(mode.setPetMode("red")).toBe(false);
+			expect(settings.get("pet.mode")).toBe("off");
+			expect(mode.petWidget?.mode ?? "off").toBe("off");
+			expect(showStatus).toHaveBeenCalledTimes(1);
+
+			expect(mode.commitPetPreviewMode("red")).toBe(false);
+			expect(settings.get("pet.mode")).toBe("off");
+			expect(showStatus).toHaveBeenCalledTimes(2);
+
+			// An accepted commit persists only after the widget mutation applies.
+			setTerminalImageProtocol(ImageProtocol.Sixel);
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			expect(mode.setPetMode("red")).toBe(true);
+			expect(settings.get("pet.mode")).toBe("red");
+			expect(mode.commitPetPreviewMode("off")).toBe(true);
+			expect(settings.get("pet.mode")).toBe("off");
+		} finally {
+			setTerminalImageProtocol(originalProtocol);
+		}
 	});
 });

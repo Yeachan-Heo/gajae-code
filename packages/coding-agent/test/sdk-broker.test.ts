@@ -1,17 +1,26 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
+import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { getSessionsDir } from "@gajae-code/utils";
 import { lifecycleArgs } from "../src/commands/sdk";
 import { Broker } from "../src/sdk/broker/broker";
+import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
+	type BrokerDiscovery,
 	brokerDiscoveryPath,
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
-import { ensureBroker } from "../src/sdk/broker/ensure";
+import {
+	brokerOwnerForTest,
+	ensureBroker,
+	reapSpawnedBrokerForTest,
+	registerBrokerOwnerForTest,
+} from "../src/sdk/broker/ensure";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { readSessionLifecycleLaunchRequest } from "../src/sdk/broker/lifecycle";
 import { resolveSdkInternalSpawnCommand } from "../src/sdk/broker/runtime";
@@ -89,23 +98,263 @@ describe("SDK broker identity and discovery", () => {
 			heartbeatAt: Date.now(),
 		};
 		await writeBrokerDiscovery(dir, d);
-		expect(redactBrokerDiscovery(d).token).toBe("[redacted]");
+		const persisted = await readBrokerDiscovery(dir);
+		expect(persisted).not.toBeNull();
+		expect(redactBrokerDiscovery(persisted!).token).toBe("[redacted]");
 		if (process.platform !== "win32")
 			expect((await fs.stat(path.join(dir, "sdk", "broker.json"))).mode & 0o777).toBe(0o600);
+	});
+
+	it("rejects discovery bound to a different process incarnation", async () => {
+		const dir = await temp();
+		await writeBrokerDiscovery(dir, {
+			version: 1,
+			protocolVersion: 3,
+			packageGeneration: "test",
+			ownerId: "stale",
+			pid: process.pid,
+			incarnation: "different-incarnation",
+			host: "127.0.0.1",
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "secret",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		});
+
+		expect(await readBrokerDiscovery(dir)).toBeNull();
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+	it("treats a truncated discovery record as unavailable", async () => {
+		const dir = await temp();
+		await fs.mkdir(path.dirname(brokerDiscoveryPath(dir)), { recursive: true });
+		await fs.writeFile(brokerDiscoveryPath(dir), '{"version":1,"pid":');
+		expect(await readBrokerDiscovery(dir)).toBeNull();
+		await fs.rm(dir, { recursive: true, force: true });
 	});
 	it("refreshes discovery heartbeat, removes it on stop, and can restart", async () => {
 		const dir = await temp();
 		const broker = new Broker({ agentDir: dir, heartbeatTtlMs: 45 });
 		const first = await broker.start();
-		await sleep(100);
-		expect(await readBrokerDiscovery(dir, 45)).not.toBeNull();
+		const deadline = Date.now() + 5_000;
+		let refreshed = await readBrokerDiscovery(dir);
+		while ((!refreshed || refreshed.heartbeatAt <= first.heartbeatAt) && Date.now() < deadline) {
+			await sleep(10);
+			refreshed = await readBrokerDiscovery(dir);
+		}
+		expect(refreshed?.heartbeatAt).toBeGreaterThan(first.heartbeatAt);
 		await broker.stop();
 		await expect(fs.stat(brokerDiscoveryPath(dir))).rejects.toThrow();
-		const restarted = await ensureBroker({ agentDir: dir, heartbeatTtlMs: 45 });
+		const restarted = await ensureBroker({ agentDir: dir });
 		expect(restarted.token).not.toBe(first.token);
 		const owner = (await import("../src/sdk/broker/ensure")).brokerOwnerForTest(dir);
 		await owner?.stop();
 	}, 15_000);
+	it("terminates and reaps the spawned broker when discovery times out", async () => {
+		const dir = await temp();
+		// Force ensureBroker's discovery reads to never resolve a live record so the
+		// discovery wait is doomed from the start. The real broker still spawns and
+		// stays alive as a detached daemon, which is exactly the orphan path the reap
+		// must close. Capture its pid from the discovery file (bypassing the spy)
+		// before ensureBroker times out and reaps it.
+		const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
+		try {
+			const { promise: gotPid, resolve: onPid } = Promise.withResolvers<number | undefined>();
+			void (async () => {
+				const deadline = Date.now() + 12_000;
+				while (Date.now() < deadline) {
+					try {
+						const raw = JSON.parse(await fs.readFile(brokerDiscovery.brokerDiscoveryPath(dir), "utf8")) as {
+							pid?: number;
+						};
+						if (typeof raw.pid === "number") return onPid(raw.pid);
+					} catch {}
+					await sleep(25);
+				}
+				onPid(undefined);
+			})();
+			await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(
+				"Timed out waiting for detached SDK broker discovery.",
+			);
+			const brokerPid = await gotPid;
+			// The spawned detached broker must have been terminated + reaped, not orphaned.
+			expect(typeof brokerPid).toBe("number");
+			expect(brokerDiscovery.isPidAlive(brokerPid!)).toBe(false);
+			// No owner handle leaked for the failed agent dir.
+			expect(brokerOwnerForTest(dir)).toBeUndefined();
+		} finally {
+			spy.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
+	it("fails fast and reaps the spawned broker when it exits before discovery", async () => {
+		const dir = await temp();
+		// Plant an unsupported session-index snapshot so the spawned broker's start()
+		// rejects immediately and it exits before publishing discovery. ensureBroker
+		// must take the early-exit path (not the 10s timeout) and leave no orphan.
+		await fs.mkdir(path.join(dir, "sdk", "sessions"), { recursive: true });
+		await fs.writeFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), JSON.stringify({ version: 99 }));
+		await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(/exited before discovery/);
+		// No owner handle leaked for the failed agent dir.
+		expect(brokerOwnerForTest(dir)).toBeUndefined();
+		// No discovery record was published: the broker exited before writing one.
+		await expect(fs.stat(brokerDiscoveryPath(dir))).rejects.toThrow();
+		await fs.rm(dir, { recursive: true, force: true });
+	}, 15_000);
+	it("escalates to SIGKILL and awaits verified exit when a live child emits error after SIGTERM", async () => {
+		// Reproduces the PR #2157 review blocker: a still-live broker child emits
+		// `error` during SIGTERM (e.g. a transient signal-delivery failure). The
+		// reaper must treat that as diagnostic only, escalate to SIGKILL, and await
+		// an actual exit/close — never resolve on `error` alone and orphan the child.
+		// This condition is not deterministically reproducible with a real OS process,
+		// so a controllable child surface drives the exact reap control flow. Before
+		// the fix the `error` event resolved the wait as if the child had exited, so
+		// SIGKILL was never reached and the process stayed alive.
+		const signals: NodeJS.Signals[] = [];
+		const child = Object.assign(new EventEmitter(), {
+			pid: 4242,
+			exitCode: null as number | null,
+			signalCode: null as NodeJS.Signals | null,
+			kill(sig: NodeJS.Signals): boolean {
+				signals.push(sig);
+				if (sig === "SIGTERM") {
+					// Still-live child surfaces an error mid-teardown without exiting.
+					queueMicrotask(() => child.emit("error", new Error("signal delivery failed during teardown")));
+					return true;
+				}
+				if (sig === "SIGKILL") {
+					queueMicrotask(() => {
+						child.signalCode = "SIGKILL";
+						child.emit("exit", null, "SIGKILL");
+					});
+					return true;
+				}
+				return false;
+			},
+		});
+		// Production always retains ensureBroker's spawn-error listener on the child;
+		// keep one here so emitting `error` matches that surface (and is not fatal).
+		child.on("error", () => {});
+		await expect(reapSpawnedBrokerForTest(child as unknown as ChildProcess)).resolves.toBeUndefined();
+		// SIGTERM's emitted `error` must NOT count as exit: escalation reached SIGKILL.
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		// Termination was proven by an observed exit, not by the earlier `error`.
+		expect(child.signalCode).toBe("SIGKILL");
+	}, 10_000);
+
+	it("does not signal a child whose exit is already authoritative", async () => {
+		const signals: NodeJS.Signals[] = [];
+		const child = Object.assign(new EventEmitter(), {
+			pid: 4243,
+			exitCode: 0 as number | null,
+			signalCode: null as NodeJS.Signals | null,
+			kill(sig: NodeJS.Signals): boolean {
+				signals.push(sig);
+				return true;
+			},
+		});
+
+		await reapSpawnedBrokerForTest(child as unknown as ChildProcess, { gracefulMs: 1, killVerifyMs: 1 });
+
+		expect(signals).toEqual([]);
+	});
+	it("reaps a spawn failure with no process as a no-op instead of waiting on SIGKILL", async () => {
+		// A spawn failure (e.g. ENOENT) never created a kernel process: pid is
+		// undefined and there is nothing to signal or await. Reaping must be a no-op
+		// rather than running out the SIGKILL cap and reporting a stuck child that
+		// never existed — the distinct failure this owner must keep closed.
+		const child = Object.assign(new EventEmitter(), {
+			pid: undefined,
+			exitCode: null as number | null,
+			signalCode: null as NodeJS.Signals | null,
+			kill: (): boolean => false,
+		});
+		await expect(reapSpawnedBrokerForTest(child as unknown as ChildProcess)).resolves.toBeUndefined();
+	}, 10_000);
+
+	it("retains unverified broker authority and fences replacement startup", async () => {
+		const dir = await temp();
+		const signals: NodeJS.Signals[] = [];
+		const child = Object.assign(new EventEmitter(), {
+			pid: 4244,
+			exitCode: null as number | null,
+			signalCode: null as NodeJS.Signals | null,
+			kill(sig: NodeJS.Signals): boolean {
+				signals.push(sig);
+				return true;
+			},
+		});
+		const owner = registerBrokerOwnerForTest(dir, child as unknown as ChildProcess, {
+			gracefulMs: 1,
+			killVerifyMs: 1,
+		});
+		const competingDiscovery: BrokerDiscovery = {
+			version: 1,
+			protocolVersion: 3,
+			packageGeneration: "test",
+			ownerId: "competitor",
+			pid: process.pid,
+			incarnation: "competing-incarnation",
+			host: "127.0.0.1",
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "competitor-token",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		};
+		const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(competingDiscovery);
+		try {
+			await expect(owner.stop()).rejects.toThrow("did not exit after SIGKILL");
+			expect(brokerOwnerForTest(dir)).toBe(owner);
+
+			// A new ensure must retry the exact retained owner and reject; it may not
+			// discard that authority handle and spawn a replacement.
+			await expect(ensureBroker({ agentDir: dir })).rejects.toThrow("did not exit after SIGKILL");
+			expect(brokerOwnerForTest(dir)).toBe(owner);
+			expect(signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"]);
+
+			child.signalCode = "SIGKILL";
+			await owner.stop();
+			expect(brokerOwnerForTest(dir)).toBeUndefined();
+		} finally {
+			spy.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not let a stale stop handle delete its successor owner", async () => {
+		const dir = await temp();
+		const exitedChild = (pid: number) =>
+			Object.assign(new EventEmitter(), {
+				pid,
+				exitCode: 0 as number | null,
+				signalCode: null as NodeJS.Signals | null,
+				kill: (): boolean => true,
+			});
+		const first = registerBrokerOwnerForTest(dir, exitedChild(4245) as unknown as ChildProcess);
+		const successor = registerBrokerOwnerForTest(dir, exitedChild(4246) as unknown as ChildProcess);
+
+		await first.stop();
+		expect(brokerOwnerForTest(dir)).toBe(successor);
+		await successor.stop();
+		expect(brokerOwnerForTest(dir)).toBeUndefined();
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	it("shares one in-process startup and owner across concurrent ensure calls", async () => {
+		const dir = await temp();
+		const first = ensureBroker({ agentDir: dir });
+		const second = ensureBroker({ agentDir: dir });
+
+		expect(second).toBe(first);
+		const [left, right] = await Promise.all([first, second]);
+		expect(right).toEqual(left);
+		const owner = brokerOwnerForTest(dir);
+		expect(owner).toBeDefined();
+		await owner?.stop();
+		expect(brokerOwnerForTest(dir)).toBeUndefined();
+		await fs.rm(dir, { recursive: true, force: true });
+	});
 	it("leaves exactly one live detached broker after concurrent process startup", async () => {
 		const dir = await temp();
 		const children = [0, 1].map(() =>

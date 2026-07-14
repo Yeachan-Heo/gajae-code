@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/coding-agent",
-	"version": "0.10.0",
+	"version": "0.10.1",
 	"description": "Gajae Code CLI with read, bash, edit, write tools and session management",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo and Gajae Code Contributors",
@@ -73,6 +73,9 @@
 		"zod": "catalog:"
 	},
 	"devDependencies": {
+		"@babel/traverse": "catalog:",
+		"@babel/types": "catalog:",
+		"@types/babel__traverse": "catalog:",
 		"@types/bun": "catalog:",
 		"@types/ws": "catalog:"
 	},
@@ -120,6 +123,8 @@
 			"types": "./src/sdk/index.ts",
 			"import": "./src/sdk/index.ts"
 		},
+		"./sdk/models": null,
+		"./sdk/models.js": null,
 		"./sdk/bus": {
 			"types": "./src/sdk/bus/index.ts",
 			"import": "./src/sdk/bus/index.ts"

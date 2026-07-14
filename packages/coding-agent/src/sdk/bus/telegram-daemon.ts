@@ -981,6 +981,11 @@ interface SessionSocket {
 	awaitingNonce: string | undefined;
 	/** Per-session liveness interval handle (only set for capable sessions). */
 	pingTimer: ReturnType<typeof setInterval> | undefined;
+	/** Correlation id for the startup replay barrier. */
+	replayId: string;
+	/** Queues live frames until startup replay is applied. */
+	replayPending: boolean;
+	replayQueue: Record<string, unknown>[];
 }
 
 interface PendingThreadedFrame {
@@ -1758,12 +1763,18 @@ export class TelegramNotificationDaemon {
 			lastPongAt: 0,
 			awaitingNonce: undefined,
 			pingTimer: undefined,
+			replayId: `telegram-startup-replay:${sessionId}`,
+			replayPending: false,
+			replayQueue: [],
 		};
 		this.sessions.set(sessionId, session);
 		// Bidirectional capability advertisement: announce client_ping_pong once the
 		// socket is open. Sent on "open" only — a real WHATWG WebSocket cannot send
 		// while CONNECTING — and liveness starts only after a capable ServerHello.
 		ws.addEventListener("open", () => {
+			session.replayPending = true;
+			session.replayQueue = [];
+			const replayCursor = this.topics.replayCursor(sessionId);
 			if (session.ws.readyState === WebSocket.OPEN) {
 				try {
 					session.ws.send(
@@ -1771,6 +1782,16 @@ export class TelegramNotificationDaemon {
 							type: "hello",
 							protocolVersion: NOTIFICATION_PROTOCOL_VERSION,
 							capabilities: [CLIENT_PING_PONG_CAPABILITY, ASK_CONTROLS_CAPABILITY, ASK_SELECTED_ACK_CAPABILITY],
+						}),
+					);
+				} catch {}
+				try {
+					session.ws.send(
+						JSON.stringify({
+							type: "event_replay",
+							id: session.replayId,
+							sinceGeneration: replayCursor?.generation ?? 1,
+							sinceSeq: replayCursor?.seq ?? 0,
 						}),
 					);
 				} catch {}
@@ -2665,6 +2686,65 @@ export class TelegramNotificationDaemon {
 	}
 
 	async handleSessionMessage(session: SessionSocket, msg: any): Promise<void> {
+		if (session.replayPending) {
+			const matchingReplay = msg?.type === "event_replay_result" && msg.id === session.replayId;
+			if (!matchingReplay) {
+				session.replayQueue.push(msg as Record<string, unknown>);
+				return;
+			}
+			session.replayPending = false;
+			const replayValid =
+				Number.isSafeInteger(msg.generation) &&
+				msg.generation >= 1 &&
+				Number.isSafeInteger(msg.lastSeq) &&
+				msg.lastSeq >= 0 &&
+				Array.isArray(msg.events);
+			const replayed: Record<string, unknown>[] = replayValid
+				? (msg.events as unknown[]).flatMap((event: unknown): Record<string, unknown>[] => {
+						if (!event || typeof event !== "object" || Array.isArray(event)) return [];
+						const envelope = event as Record<string, unknown>;
+						const payload = envelope.payload;
+						return [
+							payload && typeof payload === "object" && !Array.isArray(payload)
+								? (payload as Record<string, unknown>)
+								: envelope,
+						];
+					})
+				: [];
+			// Replay restores durable attachment state only. Live notification effects
+			// (turn streams, context updates, lifecycle messages) may already have been
+			// delivered before a reconnect and must never be rendered a second time.
+			const identityIndex = replayed.findLastIndex(frame => frame.type === "identity_header");
+			const currentGeneration = identityIndex < 0 ? replayed : replayed.slice(identityIndex);
+			const latestIdentity = identityIndex < 0 ? undefined : replayed[identityIndex];
+			const latestActions = new Map<string, Record<string, unknown>>();
+			for (const frame of currentGeneration) {
+				if ((frame.type === "action_needed" || frame.type === "action_resolved") && typeof frame.id === "string")
+					latestActions.set(frame.id, frame);
+			}
+			const replayState = [...(latestIdentity ? [latestIdentity] : []), ...latestActions.values()];
+			const replayCounts = new Map<string, number>();
+			for (const frame of replayState) {
+				const fingerprint = JSON.stringify(frame);
+				replayCounts.set(fingerprint, (replayCounts.get(fingerprint) ?? 0) + 1);
+				await this.handleSessionMessage(session, frame);
+			}
+			const queued = session.replayQueue.splice(0);
+			for (const frame of queued) {
+				const fingerprint = JSON.stringify(frame);
+				const remaining = replayCounts.get(fingerprint) ?? 0;
+				if (remaining > 0) {
+					if (remaining === 1) replayCounts.delete(fingerprint);
+					else replayCounts.set(fingerprint, remaining - 1);
+					continue;
+				}
+				await this.handleSessionMessage(session, frame);
+			}
+			if (replayValid && this.topics.markReplayCursor(session.sessionId, msg.generation, msg.lastSeq))
+				await this.persistTopics();
+			return;
+		}
+		if (msg?.type === "event_replay_result") return;
 		if (await this.sessionRouter.dispatch(session, msg as Record<string, unknown>)) return;
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
 			const send = renderThreadedFrame(msg);

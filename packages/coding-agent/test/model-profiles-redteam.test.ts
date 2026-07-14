@@ -117,7 +117,7 @@ describe("model profile red-team schema and catalog cases", () => {
 		});
 	});
 
-	test("mergeModelProfiles aggregates underdeclared providers from mappings", () => {
+	test("mergeModelProfiles does not add underdeclared mapped providers to activation prerequisites", () => {
 		const merged = mergeModelProfiles({
 			underdeclared: {
 				required_providers: ["provider-a"],
@@ -125,7 +125,7 @@ describe("model profile red-team schema and catalog cases", () => {
 			},
 		});
 
-		expect(merged.get("underdeclared")?.requiredProviders).toEqual(["provider-a", "provider-b"]);
+		expect(merged.get("underdeclared")?.requiredProviders).toEqual(["provider-a"]);
 	});
 
 	test("resolveProfileBindings on a default-only mapping returns only defaultSelector", () => {

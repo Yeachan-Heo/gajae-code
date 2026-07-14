@@ -29,6 +29,7 @@ import { findConfigFile } from "./config";
 import { activateModelProfile } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
+import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
@@ -406,9 +407,15 @@ export async function applyStartupModelProfiles(args: {
 
 	// Explicit CLI --model/--thinking must win over any activated profile.
 	if (explicitModel) {
-		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking);
+		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking, {
+			persistAsSessionDefault: true,
+			cause: "startup-override",
+		});
+		const selector = `${explicitModel.provider}/${explicitModel.id}`;
+		args.session.setConfiguredModelChain("default", [selector], "startup-override", undefined, true);
+		args.session.seedDefaultFallbackResolution(0, []);
 	} else if (args.parsedArgs.thinking && args.session.model) {
-		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking);
+		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking, { cause: "startup-override" });
 	}
 }
 
@@ -842,7 +849,9 @@ async function buildSessionOptions(
 							scopedModel.model.provider === rememberedResolvedModel.provider &&
 							scopedModel.model.id === rememberedResolvedModel.id,
 					)
-				: scopedModels.find(scopedModel => scopedModel.model.id.toLowerCase() === remembered.toLowerCase());
+				: scopedModels.find(
+						scopedModel => scopedModel.model.id.toLowerCase() === selectorHead(remembered)?.toLowerCase(),
+					);
 			if (rememberedModel) {
 				options.model = rememberedModel.model;
 				// Apply explicit thinking level from remembered role value

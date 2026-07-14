@@ -2,6 +2,18 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $credentialEnv, $env, $pickCredentialEnv, extractHttpStatusFromError } from "@gajae-code/utils";
+import { assertManagedAttempt } from "./utils/fallback-transport";
+
+const managedAttemptValidated = Symbol("managedAttemptValidated");
+
+function hasValidatedManagedAttempt(options: object | undefined): boolean {
+	return (options as Record<symbol, unknown> | undefined)?.[managedAttemptValidated] === true;
+}
+
+function markManagedAttemptValidated<T extends object>(options: T): T {
+	return Object.assign(options, { [managedAttemptValidated]: true });
+}
+
 import { getCustomApi } from "./api-registry";
 import type { Effort } from "./model-thinking";
 import {
@@ -276,6 +288,10 @@ export function stream<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
+	if (!hasValidatedManagedAttempt(options)) assertManagedAttempt(options);
+	if (options?.fallbackManaged) {
+		options = { ...options, requestMaxRetries: 0, streamMaxRetries: 0 } as OptionsForApi<TApi>;
+	}
 	// Check custom API registry first (extension-provided APIs like "vertex-Anthropic model-api")
 	const customApiProvider = getCustomApi(model.api);
 	if (customApiProvider) {
@@ -395,6 +411,16 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	assertManagedAttempt(options);
+	if (options?.fallbackManaged) {
+		options = {
+			...options,
+			requestMaxRetries: 0,
+			streamMaxRetries: 0,
+			onAuthError: undefined,
+		};
+		options = markManagedAttemptValidated(options);
+	}
 	const retryApiKey = options?.onAuthError ? (options.apiKey ?? getEnvApiKey(model.provider)) : undefined;
 	if (retryApiKey) {
 		const outer = new AssistantMessageEventStream();
@@ -662,12 +688,14 @@ function mapOptionsForApi<TApi extends Api>(
 		maxTokens: options?.maxTokens || Math.min(model.maxTokens, 32000),
 		signal: options?.signal,
 		apiKey: apiKey || options?.apiKey,
+		fallbackManaged: options?.fallbackManaged,
+		fallbackAttempt: options?.fallbackAttempt,
 		cacheRetention: options?.cacheRetention ?? model.cacheRetention,
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
-		requestMaxRetries: options?.requestMaxRetries,
-		streamMaxRetries: options?.streamMaxRetries,
+		requestMaxRetries: options?.fallbackManaged ? 0 : options?.requestMaxRetries,
+		streamMaxRetries: options?.fallbackManaged ? 0 : options?.streamMaxRetries,
 		metadata: options?.metadata,
 		sessionId: options?.sessionId,
 		providerSessionState: options?.providerSessionState,
@@ -675,6 +703,7 @@ function mapOptionsForApi<TApi extends Api>(
 		onResponse: options?.onResponse,
 		onSseEvent: options?.onSseEvent,
 		execHandlers: options?.execHandlers,
+		[managedAttemptValidated]: hasValidatedManagedAttempt(options),
 	};
 
 	switch (model.api) {

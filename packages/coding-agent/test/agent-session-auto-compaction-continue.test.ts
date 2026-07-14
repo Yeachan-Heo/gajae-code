@@ -317,6 +317,40 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("flushes the predecessor terminal event when a queued continuation is cancelled before agent.continue", async () => {
+		session.agent.followUp({
+			role: "custom",
+			customType: "test",
+			content: [{ type: "text", text: "Queued" }],
+			display: false,
+			timestamp: Date.now(),
+		});
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const compactionFinished = Promise.withResolvers<void>();
+		const events: string[] = [];
+		session.subscribe(event => {
+			events.push(event.type);
+			if (event.type === "auto_compaction_end") compactionFinished.resolve();
+		});
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		await compactionFinished.promise;
+		for (let index = 0; index < 100; index++) {
+			if (session.hasPostPromptWork) break;
+			await Promise.resolve();
+		}
+		expect(session.hasPostPromptWork).toBe(true);
+
+		await session.abort();
+		await session.waitForIdle();
+		for (let index = 0; index < 20; index++) await Promise.resolve();
+
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(events.filter(type => type === "agent_end")).toHaveLength(1);
+	});
+
 	it("threshold queued-followup continuation suppresses predecessor terminal readiness", async () => {
 		session.agent.followUp({
 			role: "custom",

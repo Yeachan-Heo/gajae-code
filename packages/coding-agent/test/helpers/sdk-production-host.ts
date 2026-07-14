@@ -4,6 +4,7 @@ import { getBundledModel } from "@gajae-code/ai";
 import { Settings } from "../../src/config/settings";
 import { initializeExtensions } from "../../src/modes/runtime-init";
 import { createAgentSession } from "../../src/sdk";
+import { brokerOwnerForTest } from "../../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../../src/sdk/bus";
 import { SessionManager } from "../../src/session/session-manager";
 
@@ -64,8 +65,12 @@ export async function startProductionSdkHost(
 		sessionId: session.sessionId,
 		observed,
 		stop: async () => {
-			await session.extensionRunner?.emit({ type: "session_shutdown" });
-			await session.dispose();
+			try {
+				await session.extensionRunner?.emit({ type: "session_shutdown" });
+				await session.dispose();
+			} finally {
+				await brokerOwnerForTest(agentDir)?.stop();
+			}
 		},
 	};
 }

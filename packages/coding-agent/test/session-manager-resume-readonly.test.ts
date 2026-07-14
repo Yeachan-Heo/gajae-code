@@ -142,8 +142,29 @@ class ReplaceAfterSnapshotStorage extends FileSessionStorage {
 
 	override readSnapshotSync(filePath: string): SessionStorageSnapshot {
 		const snapshot = super.readSnapshotSync(filePath);
-		if (this.armed) fs.renameSync(this.replacementPath, filePath);
+		if (this.armed) {
+			this.armed = false;
+			fs.renameSync(this.replacementPath, filePath);
+		}
 		return snapshot;
+	}
+}
+class ReplaceBeforeThirdInspectionStorage extends FileSessionStorage {
+	#stats = 0;
+
+	constructor(
+		private readonly replacementPath: string,
+		private readonly sourcePath: string,
+	) {
+		super();
+	}
+
+	override statSync(filePath: string): SessionStorageStat {
+		if (path.resolve(filePath) === path.resolve(this.sourcePath)) {
+			this.#stats++;
+			if (this.#stats === 5) fs.renameSync(this.replacementPath, filePath);
+		}
+		return super.statSync(filePath);
 	}
 }
 
@@ -229,6 +250,25 @@ describe("SessionManager read-only resume", () => {
 		expectStrictFailure(await SessionManager.openExistingStrict(inspection.identity, root, storage), "unstable");
 		expect(storage.writes).toBe(0);
 		expect(fs.readFileSync(filePath, "utf-8")).toBe(replacement);
+	});
+	it("removes a newly created fork directory when final source authority changes", async () => {
+		const root = makeTempDir();
+		const sourcePath = path.join(root, "source.jsonl");
+		const replacementPath = path.join(root, "replacement.jsonl");
+		const destinationDir = path.join(root, "destination-sessions");
+		const targetCwd = path.join(root, "target");
+		fs.mkdirSync(targetCwd);
+		fs.writeFileSync(sourcePath, sessionText("session-a"));
+		fs.writeFileSync(replacementPath, sessionText("session-b"));
+		const storage = new ReplaceBeforeThirdInspectionStorage(replacementPath, sourcePath);
+		const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
+		if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
+
+		expect(await SessionManager.forkFromCaptured(captured.snapshot, targetCwd, destinationDir)).toEqual({
+			kind: "error",
+			reason: "identity-mismatch",
+		});
+		expect(fs.existsSync(destinationDir)).toBe(false);
 	});
 
 	it("fails closed with typed reasons for replacement, malformed, deletion, and unstable reads", async () => {

@@ -914,19 +914,24 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		progress.recentOutput = [];
 	};
 
+	const forwardSubagentEvent = (
+		event: AgentEvent | Extract<AgentSessionEvent, { type: "model_fallback_switched" }>,
+	) => {
+		if (!options.eventBus) return;
+		options.eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, {
+			index,
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			assignment,
+			event,
+		});
+	};
+
 	const processEvent = (event: AgentEvent) => {
 		if (resolved) return;
 
-		if (options.eventBus) {
-			options.eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, {
-				index,
-				agent: agent.name,
-				agentSource: agent.source,
-				task,
-				assignment,
-				event,
-			});
-		}
+		forwardSubagentEvent(event);
 
 		const now = Date.now();
 		let flushProgress = false;
@@ -1234,6 +1239,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				authFallbackUsed,
 				requestedModel,
 				fallbackReason,
+				activeIndex,
+				parentFallbackSelector,
+				skips,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
@@ -1241,6 +1249,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelRegistry,
 					settings,
 					options.parentSessionId,
+					{ managedFallback: true },
 				),
 			);
 			if (model) {
@@ -1431,6 +1440,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			);
 
 			activeSession = session;
+			// Each subagent invocation owns a fresh controller; its configured chain
+			// is scoped to this child session and never shares parent sticky state.
+			// Auth-aware resolution can substitute the parent model only after every
+			// override entry was unavailable. Rebase the controller to that concrete
+			// parent selector so its request is never charged to override index zero.
+			session.setConfiguredModelChain(
+				"default",
+				parentFallbackSelector ? [parentFallbackSelector] : modelPatterns,
+				"subagent",
+				agent.name,
+				true,
+			);
+			if (activeIndex !== undefined && !parentFallbackSelector) {
+				session.seedDefaultFallbackResolution(activeIndex, skips);
+			}
 			const liveSubagentId = options.subagentId ?? id;
 			const manager = AsyncJobManager.instance();
 			if (manager) {
@@ -1590,6 +1614,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						};
 					}
 					scheduleProgress(true);
+					return;
+				}
+				if (event.type === "model_fallback_switched") {
+					forwardSubagentEvent(event);
 					return;
 				}
 				if (isAgentEvent(event)) {

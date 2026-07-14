@@ -131,7 +131,9 @@ export class QueryHandlers {
 		try {
 			const query = request.query.startsWith("Q")
 				? request.query
-				: `Q${String(names.indexOf(request.query) + 1).padStart(2, "0")}`;
+				: request.query === "models.list" || request.query === "models.current"
+					? "Q10"
+					: `Q${String(names.indexOf(request.query) + 1).padStart(2, "0")}`;
 			if (
 				this.surface.installedQueries instanceof Set &&
 				!this.surface.installedQueries.has(names[Number(query.slice(1)) - 1] ?? "")

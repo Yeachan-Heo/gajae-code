@@ -6,10 +6,13 @@ import * as path from "node:path";
 import { parseNotifyArgs, promptForToken, runNotifyCliCommand, runNotifyCommand } from "../src/cli/notify-cli";
 import { Settings } from "../src/config/settings";
 import { getNotificationConfig, maskToken } from "../src/sdk/bus/config";
+import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
+import type { DaemonState } from "../src/sdk/bus/telegram-daemon";
 import {
 	createLightweightDaemonSettings,
 	loadLightweightDaemonSettings,
 	ownerPidFromOwnerId,
+	type RunDaemonInternalDeps,
 	runDaemonInternal,
 } from "../src/sdk/bus/telegram-daemon-cli";
 
@@ -759,5 +762,142 @@ describe("notify daemon-internal lightweight startup", () => {
 		expect(ownerPidFromOwnerId("12345")).toBe(12345);
 		expect(ownerPidFromOwnerId("owner-12345")).toBeUndefined();
 		expect(ownerPidFromOwnerId("0-dead")).toBeUndefined();
+	});
+});
+
+describe("notify daemon-internal ownership-progress watchdog", () => {
+	function tempAgentDir(): string {
+		return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notify-daemon-agent-"));
+	}
+
+	function configuredDaemonSettings(agentDir: string) {
+		return createLightweightDaemonSettings({
+			agentDir,
+			rawConfig: { notifications: { enabled: true, telegram: { botToken: "1234:token", chatId: "999" } } },
+		});
+	}
+
+	function daemonState(ownerId: string, heartbeatAt: number): DaemonState {
+		return {
+			pid: 4242,
+			ownerId,
+			tokenFingerprint: "fingerprint",
+			chatId: "999",
+			startedAt: 1,
+			heartbeatAt,
+			roots: [],
+			version: 1,
+		};
+	}
+
+	async function startWatchdog(initialState: DaemonState | undefined) {
+		const agentDir = tempAgentDir();
+		const daemonDone = Promise.withResolvers<void>();
+		let scheduled: (() => void) | undefined;
+		let currentState = initialState;
+		let readFailure = false;
+		let currentTime = 0;
+		let cleared = false;
+		const stopReasons: Array<"reload" | "signal" | "stop" | undefined> = [];
+		class BlockingDaemon {
+			requestStop(reason?: "reload" | "signal" | "stop"): void {
+				stopReasons.push(reason);
+				daemonDone.resolve();
+			}
+			async run(): Promise<void> {
+				await daemonDone.promise;
+			}
+		}
+		const timer = {} as Timer;
+		const deps: RunDaemonInternalDeps = {
+			pidAlive: () => true,
+			now: () => currentTime,
+			SettingsImpl: {
+				async init() {
+					return configuredDaemonSettings(agentDir);
+				},
+			},
+			DaemonImpl: BlockingDaemon as never,
+			readDaemonState: async () => {
+				if (readFailure) throw new Error("state temporarily unreadable");
+				return currentState;
+			},
+			setInterval: callback => {
+				scheduled = callback;
+				return timer;
+			},
+			clearInterval: handle => {
+				expect(handle).toBe(timer);
+				cleared = true;
+			},
+		};
+		const run = runDaemonInternal(["--owner-id", "4242-current", "--agent-dir", agentDir], deps);
+		while (!scheduled) await Bun.sleep(0);
+		return {
+			run,
+			stopReasons,
+			setState(state: DaemonState | undefined) {
+				currentState = state;
+			},
+			setReadFailure(value: boolean) {
+				readFailure = value;
+			},
+			setNow(value: number) {
+				currentTime = value;
+			},
+			async tick() {
+				scheduled!();
+				await Bun.sleep(0);
+			},
+			wasCleared: () => cleared,
+		};
+	}
+
+	test("stops cooperatively when persisted ownership is superseded", async () => {
+		const harness = await startWatchdog(daemonState("4242-current", 10));
+		await harness.tick();
+		harness.setState(daemonState("9999-replacement", 20));
+		await harness.tick();
+		await harness.run;
+
+		expect(harness.stopReasons).toEqual(["stop"]);
+		expect(harness.wasCleared()).toBe(true);
+	});
+
+	test("stops only after 60 seconds without observed heartbeat progress", async () => {
+		const harness = await startWatchdog(daemonState("4242-current", 10));
+		await harness.tick();
+		harness.setNow(3 * HEARTBEAT_TTL_MS - 1);
+		await harness.tick();
+		expect(harness.stopReasons).toEqual([]);
+
+		harness.setState(daemonState("4242-current", 11));
+		await harness.tick();
+		harness.setNow(6 * HEARTBEAT_TTL_MS - 2);
+		await harness.tick();
+		expect(harness.stopReasons).toEqual([]);
+
+		harness.setNow(6 * HEARTBEAT_TTL_MS - 1);
+		await harness.tick();
+		await harness.run;
+		expect(harness.stopReasons).toEqual(["stop"]);
+		expect(harness.wasCleared()).toBe(true);
+	});
+
+	test("ignores absent and unreadable state until positive supersession", async () => {
+		const harness = await startWatchdog(undefined);
+		await harness.tick();
+		harness.setReadFailure(true);
+		await harness.tick();
+		harness.setReadFailure(false);
+		harness.setState(daemonState("4242-current", 10));
+		await harness.tick();
+		expect(harness.stopReasons).toEqual([]);
+
+		harness.setState(daemonState("9999-replacement", 20));
+		await harness.tick();
+		await harness.run;
+		expect(harness.stopReasons).toEqual(["stop"]);
+		expect(harness.wasCleared()).toBe(true);
 	});
 });

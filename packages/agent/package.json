@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/agent-core",
-	"version": "0.10.0",
+	"version": "0.10.1",
 	"description": "General-purpose agent with transport abstraction, state management, and attachment support",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo and Gajae Code Contributors",

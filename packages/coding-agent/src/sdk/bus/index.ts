@@ -52,6 +52,7 @@ import { SessionIndex } from "../broker/session-index";
 import { SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
+import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { registerTelegramFileSink } from "./attachment-registry";
 import { ensureDiscordDaemon, ensureSlackDaemon } from "./chat-daemon-control";
@@ -504,6 +505,8 @@ interface SessionRuntime {
 	disposeGateListener: () => void;
 	/** Whether notification-only delivery and answer resources are active. */
 	notificationsActive: boolean;
+	/** Set as soon as terminal teardown is requested, before startup settles. */
+	stopping: boolean;
 	/** Recreates notification-only resources after `/notify on`. */
 	enableNotifications: () => void;
 	/** Deregisters canonical workflow-gate terminal cleanup. */
@@ -544,13 +547,15 @@ interface SessionRuntime {
 	/** Stops optional broker presence heartbeats. */
 	stopBrokerHeartbeat: () => void;
 }
+type SessionStartStatus = "started" | "already" | "disabled" | "failed";
+type SessionStartResult = { status: SessionStartStatus; runtime?: SessionRuntime };
 
 function pushSessionFrame(
 	runtime: Pick<SessionRuntime, "server" | "host">,
 	frame: { type: string; [key: string]: unknown },
 ): void {
-	runtime.server.pushFrame(JSON.stringify(frame));
 	runtime.host.emitEvent({ kind: frame.type, payload: frame });
+	runtime.server.pushFrame(JSON.stringify(frame));
 }
 
 /** Agent lifecycle is SDK session truth, independent of optional chat delivery. */
@@ -1007,6 +1012,10 @@ function sessionIdFromFile(file: string | undefined): string | undefined {
 	return underscore >= 0 ? base.slice(underscore + 1) : undefined;
 }
 
+function safeLifecycleRequestId(value: string | undefined): string | undefined {
+	return value && /^[A-Za-z0-9._-]{1,128}$/.test(value) ? value : undefined;
+}
+
 function validateProviderDefinitions(capability: string, definitions: unknown): void {
 	if (capability !== "host_tools" && capability !== "host_uri") return;
 	const invalid = (message: string): never => {
@@ -1101,6 +1110,7 @@ function installedOperations(ctx: ExtensionContext, kind: "control" | "query"): 
 function sdkQuerySurface(
 	ctx: ExtensionContext,
 	id: string,
+	api: ExtensionAPI,
 	getInstalledDefinitions: (capability: string) => unknown | undefined = () => undefined,
 	getLiveState: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number } = () => ({
 		isStreaming: false,
@@ -1157,14 +1167,12 @@ function sdkQuerySurface(
 			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
 		getDiff,
 		getUsage: () => ctx.sessionManager.getUsageStatistics(),
-		getModels: () =>
-			ctx.modelRegistry.getAll().map(model => ({
-				provider: model.provider,
-				id: model.id,
-				name: model.name,
-				contextWindow: model.contextWindow,
-				maxTokens: model.maxTokens,
-			})),
+		getModels: () => {
+			const models = ctx.modelRegistry.getAll();
+			const currentModel = ctx.model;
+			const currentThinkingLevel = api.getThinkingLevel();
+			return projectQ10Models({ models, currentModel, currentThinkingLevel });
+		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => ctx.workflowGate?.listPendingGates?.() ?? [],
 		getConfigItems: () => {
@@ -1222,8 +1230,8 @@ function sdkControlSurface(
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
 	};
 	const bindings = new Set(ctx.sdkBindings?.() ?? []);
-	const send = (text: string, deliverAs?: "steer" | "followUp") => {
-		api.sendUserMessage(text, deliverAs ? { deliverAs } : undefined);
+	const sendSteer = (text: string) => {
+		api.sendUserMessage(text, { deliverAs: "steer" });
 		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {
@@ -1252,7 +1260,7 @@ function sdkControlSurface(
 			await Bun.sleep(10);
 		}
 	};
-	const submitPrompt = async (text: string, images: unknown, forceFresh = false) => {
+	const submitPrompt = async (text: string, images: unknown, forceFresh = false, deliverAs?: "steer" | "followUp") => {
 		if (forceFresh && (isBusy() || !ctx.isIdle())) {
 			throw Object.assign(new Error("Previous turn did not finish aborting before replacement prompt submission."), {
 				code: "busy",
@@ -1298,7 +1306,7 @@ function sdkControlSurface(
 		try {
 			submission = Promise.resolve(
 				api.sendUserMessage(content, {
-					...(!forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
+					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
 					onPreflightAccepted,
 				}),
 			);
@@ -1331,20 +1339,20 @@ function sdkControlSurface(
 			pendingPreflightCancellations.delete(cancelPreflight);
 		}
 	};
-	const surface: ControlSurface = {
+	const surface: ControlSurface & { cancelPendingPreflights(): void } = {
 		prompt: (text, images) => submitPrompt(text, images),
-		steer: text => send(text, "steer"),
-		followUp: text => send(text, "followUp"),
+		steer: text => sendSteer(text),
+		followUp: text => submitPrompt(text, undefined, false, "followUp"),
 		abort: () => {
 			cancelPendingPreflights();
 			ctx.abort();
 			return { aborted: true };
 		},
 		abortAndPrompt: async text => {
-			cancelPendingPreflights();
 			await awaitAbortReady();
 			return await submitPrompt(text, undefined, true);
 		},
+		cancelPendingPreflights,
 		answerAsk: (id, answer) => {
 			const pending = pendingInteractive.get(id);
 			if (!pending) throw Object.assign(new Error(`Ask ${id} was not found.`), { code: "resource_gone" });
@@ -1385,7 +1393,18 @@ function sdkControlSurface(
 			return ctx.operateGoal(op as "create" | "get" | "resume" | "pause" | "complete" | "drop", objective);
 		},
 		replaceTodo: items => typed("todo.replace", { items }),
-		setModel: async id => ({ changed: await api.setModel(resolveModel(id)) }),
+		setModel: async (id, requestedThinkingLevel) => {
+			const model = resolveModel(id);
+			if (requestedThinkingLevel === undefined) return { changed: await api.setModel(model) };
+			const thinkingLevel =
+				typeof requestedThinkingLevel === "string" ? parseThinkingLevel(requestedThinkingLevel) : undefined;
+			if (!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
+				throw Object.assign(
+					new Error("model.set thinkingLevel must be off, minimal, low, medium, high, xhigh, or max."),
+					{ code: "invalid_input" },
+				);
+			return typed("model.set", { id: `${model.provider}/${model.id}`, thinkingLevel });
+		},
 		cycleModel: async () => {
 			if (!bindings.has("cycleModel"))
 				return unavailable("model.cycle", "no session model-cycle seam is installed")();
@@ -1515,6 +1534,7 @@ export function createNotificationsExtension(
 ): void {
 	const runtimes = new Map<string, SessionRuntime>();
 	const disabledSessions = new Set<string>();
+	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
 	let deferredIdentityRotation: { event: { previousSessionFile?: string }; ctx: ExtensionContext } | undefined;
@@ -1528,8 +1548,18 @@ export function createNotificationsExtension(
 	const sessionId = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
 	const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
-	async function stopSession(id: string, reason: "session" | "notifications" = "session"): Promise<boolean> {
+	async function stopSession(
+		id: string,
+		reason: "session" | "notifications" = "session",
+		expectedRuntime?: SessionRuntime,
+	): Promise<boolean> {
+		const requestedRuntime = runtimes.get(id);
+		if (expectedRuntime && requestedRuntime !== expectedRuntime) return false;
+		if (reason === "session" && requestedRuntime) requestedRuntime.stopping = true;
+		const pendingStart = sessionStartPromises.get(id);
+		if (pendingStart) await pendingStart;
 		const rt = runtimes.get(id);
+		if (expectedRuntime && rt !== expectedRuntime) return false;
 		if (!rt) {
 			if (activeRuntimeId === id) activeRuntimeId = undefined;
 			return false;
@@ -1578,6 +1608,7 @@ export function createNotificationsExtension(
 		} catch (e) {
 			logger.warn(`sdk host: stop failed: ${String(e)}`);
 		}
+		rt.host.reverse.dispose();
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
 		for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
 		rt.pendingInteractive.clear();
@@ -1616,16 +1647,20 @@ export function createNotificationsExtension(
 		return ctx.sessionMetadata?.kind !== "sub";
 	}
 
-	async function startSession(ctx: ExtensionContext): Promise<"started" | "already" | "disabled" | "failed"> {
+	async function startSession(ctx: ExtensionContext): Promise<SessionStartResult> {
 		const id = sessionId(ctx);
+		const lifecycleRequestId = safeLifecycleRequestId(process.env.GJC_LIFECYCLE_REQUEST_ID);
 		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
 		const notificationsEnabledForSession = isEnabledForSession(id, cfg);
 		const sdkEnabledForSession = shouldHostSdk(settings, isNotificationEligibleContext(ctx));
 		if (!isNotificationEligibleContext(ctx) || (!notificationsEnabledForSession && !sdkEnabledForSession))
-			return "disabled";
-		if (runtimes.has(id)) {
+			return { status: "disabled" };
+		const pendingStart = sessionStartPromises.get(id);
+		if (pendingStart) return pendingStart;
+		const existingRuntime = runtimes.get(id);
+		if (existingRuntime) {
 			activeRuntimeId = id;
-			return "already";
+			return { status: "already", runtime: existingRuntime };
 		}
 
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
@@ -1776,6 +1811,7 @@ export function createNotificationsExtension(
 			sdkQuerySurface(
 				ctx,
 				id,
+				api,
 				capability => host?.reverse.getInstalledDefinitions(capability),
 				() => {
 					// Live session truth: the agent loop drives rt.busy on
@@ -1846,7 +1882,9 @@ export function createNotificationsExtension(
 			onRequest: options.onSdkRequest,
 			afterControlResponse: async (connectionId, request, response) => {
 				if (
-					(request.operation === "turn.prompt" || request.operation === "turn.abort_and_prompt") &&
+					(request.operation === "turn.prompt" ||
+						request.operation === "turn.follow_up" ||
+						request.operation === "turn.abort_and_prompt") &&
 					response.ok === true &&
 					response.result &&
 					typeof response.result === "object" &&
@@ -1921,6 +1959,65 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
+
+		// Install the runtime before either transport can expose the host. session_start
+		// is deliberately fire-and-forget, so agent lifecycle events and direct v3
+		// seam replies can otherwise arrive between server.start() and the old
+		// registration below. Keeping this state live first makes those frames
+		// replayable rather than dropping them (or dereferencing an absent runtime).
+		runtime = {
+			server,
+			host,
+			revisions,
+			cursors,
+			id,
+			idleSeq: 0,
+			pendingInteractive,
+			disposeAnswerSource: () => {},
+			disposeFileSink: () => {},
+			disposeGateListener: () => {},
+			notificationsActive: false,
+			enableNotifications: () => {},
+			disposeGateTerminalController: () => {},
+			disposeAckRecoveryParticipant: () => {},
+			disposeGateEmitterListener: () => {},
+			workflowGate: undefined,
+			gatePresentations,
+			stopping: false,
+			cancelPostmortemCleanup: () => {},
+			stopBrokerHeartbeat,
+
+			redact,
+			verbosity,
+			stream: streamingEnabled(),
+			sessionTag: tag,
+			busy: false,
+			pendingPromptCorrelations,
+			activePromptCorrelation: undefined,
+			recordPromptTerminal,
+			pendingInbound: new Set<number>(),
+		};
+		runtimes.set(id, runtime);
+		activeRuntimeId = id;
+		const startSettled = Promise.withResolvers<SessionStartResult>();
+		sessionStartPromises.set(id, startSettled.promise);
+		const finishStartup = (result: SessionStartResult): void => {
+			if (sessionStartPromises.get(id) === startSettled.promise) sessionStartPromises.delete(id);
+			startSettled.resolve(result);
+		};
+		const cleanupAbandonedStartup = async (): Promise<void> => {
+			try {
+				server.stop();
+			} catch {}
+			try {
+				await host.stop();
+				host.reverse.dispose();
+			} catch {}
+			try {
+				cursors.close();
+				await revisions.close();
+			} catch {}
+		};
 
 		server.onSdkFrame((err, inbound) => {
 			if (err || !inbound) return;
@@ -2187,7 +2284,39 @@ export function createNotificationsExtension(
 
 		try {
 			await host.start();
+			if (runtimes.get(id) !== runtime) {
+				finishStartup({ status: "failed" });
+				await cleanupAbandonedStartup();
+				return { status: "failed" };
+			}
+			// Startup contract: identity is committed to the replayable SDK event log
+			// immediately after the host starts, before awaiting notification transport
+			// startup. Native frames are ephemeral, so ensure configured daemon owners
+			// before broadcasting identity; late SDK consumers still recover it from
+			// event_replay.
+			const identityHeader = {
+				type: "identity_header",
+				sessionId: id,
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+			};
+			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			const endpoint = await server.start();
+			if (runtimes.get(id) !== runtime) {
+				finishStartup({ status: "failed" });
+				await cleanupAbandonedStartup();
+				return { status: "failed" };
+			}
+			if (notificationsEnabledForSession && settingsAvailable && settings) {
+				try {
+					if (isTelegramConfigured(cfg))
+						await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
+					if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
+					if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
+				} catch (e) {
+					logger.warn(`notifications: failed to ensure notification daemon: ${String(e)}`);
+				}
+			}
+			server.pushFrame(JSON.stringify(identityHeader));
 			const agentDir = settings?.getAgentDir?.();
 			if (agentDir) {
 				try {
@@ -2205,6 +2334,7 @@ export function createNotificationsExtension(
 								locator,
 								pid: process.pid,
 								endpointMtimeMs,
+								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},
 						unregister: async input => {
@@ -2228,39 +2358,7 @@ export function createNotificationsExtension(
 				}
 			}
 
-			runtime = {
-				server,
-				host,
-				revisions,
-				cursors,
-				id,
-				idleSeq: 0,
-				pendingInteractive,
-				disposeAnswerSource: () => {},
-				disposeFileSink: () => {},
-				disposeGateListener: () => {},
-				notificationsActive: false,
-				enableNotifications: () => {},
-				disposeGateTerminalController: () => {},
-				disposeAckRecoveryParticipant: () => {},
-				disposeGateEmitterListener: () => {},
-				workflowGate: undefined,
-				gatePresentations,
-				cancelPostmortemCleanup: () => {},
-				stopBrokerHeartbeat,
-
-				redact,
-				verbosity,
-				stream: streamingEnabled(),
-				sessionTag: tag,
-				busy: false,
-				pendingPromptCorrelations,
-				activePromptCorrelation: undefined,
-				recordPromptTerminal,
-				pendingInbound: new Set<number>(),
-			};
-			runtimes.set(id, runtime);
-			activeRuntimeId = id;
+			runtime.stopBrokerHeartbeat = stopBrokerHeartbeat;
 			const startedRuntime = runtime;
 			runtime.enableNotifications = () => {
 				const runtime = startedRuntime;
@@ -2302,30 +2400,6 @@ export function createNotificationsExtension(
 				await stopSession(runtime!.id);
 			});
 			logger.info(`notifications: serving session ${id} at ${endpoint.url}`);
-
-			if (notificationsEnabledForSession && settingsAvailable && settings) {
-				try {
-					if (isTelegramConfigured(cfg))
-						await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
-					if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
-					if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
-				} catch (e) {
-					logger.warn(`notifications: failed to ensure notification daemon: ${String(e)}`);
-				}
-			}
-
-			// One-time identity header (repo/branch/machine/session) pinned at the top
-			// of the session thread by the daemon.
-			try {
-				pushSessionFrame(runtime, {
-					type: "identity_header",
-					sessionId: id,
-					...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
-				});
-			} catch (e) {
-				logger.warn(`notifications: identity_header failed: ${String(e)}`);
-			}
-
 			// A workflow-gate emitter can be installed after session startup.
 			// Attach dynamically so the SDK bus presents every durable gate.
 			const attachWorkflowGate = (gate: WorkflowGateEmitter | undefined): void => {
@@ -2399,16 +2473,13 @@ export function createNotificationsExtension(
 			};
 			activeRuntime.disposeGateEmitterListener = registerWorkflowGateEmitterListener(id, attachWorkflowGate);
 			if (ctx.workflowGate) attachWorkflowGate(ctx.workflowGate);
-			return "started";
+			finishStartup({ status: "started", runtime });
+			return { status: "started", runtime };
 		} catch (e) {
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
-			stopBrokerHeartbeat();
-			try {
-				await host.stop();
-			} catch (stopError) {
-				logger.warn(`sdk host: startup cleanup failed: ${String(stopError)}`);
-			}
-			return "failed";
+			finishStartup({ status: "failed" });
+			if (!(await stopSession(id, "session", runtime))) await cleanupAbandonedStartup();
+			return { status: "failed" };
 		}
 	}
 
@@ -2456,18 +2527,27 @@ export function createNotificationsExtension(
 					return;
 				}
 				disabledSessions.delete(id);
-				const existing = runtimes.get(id);
-				if (existing) existing.enableNotifications();
-				const result = existing ? "started" : await startSession(ctx);
+				const result = await startSession(ctx);
+				const expectedRuntime = result.runtime;
+				const expectedGeneration = expectedRuntime?.host.generation;
+				const enabled =
+					(result.status === "started" || result.status === "already") &&
+					sessionId(ctx) === id &&
+					activeRuntimeId === id &&
+					runtimes.get(id) === expectedRuntime &&
+					expectedRuntime?.host.started === true &&
+					expectedRuntime.host.generation === expectedGeneration &&
+					expectedRuntime.stopping === false;
+				if (enabled) expectedRuntime.enableNotifications();
 				ctx.ui.notify(
-					result === "started"
-						? "Notifications enabled for this session."
-						: result === "already"
-							? "Notifications already enabled for this session."
-							: result === "failed"
-								? "Notifications failed to start for this session."
-								: "Notifications are not configured. Run `gjc notify setup` or set GJC_NOTIFICATIONS=1.",
-					result === "failed" ? "error" : result === "disabled" ? "warning" : "info",
+					enabled
+						? result.status === "started"
+							? "Notifications enabled for this session."
+							: "Notifications already enabled for this session."
+						: result.status === "failed"
+							? "Notifications failed to start for this session."
+							: "Notifications were not enabled because the active session changed during startup.",
+					enabled ? "info" : result.status === "failed" ? "error" : "warning",
 				);
 				return;
 			}

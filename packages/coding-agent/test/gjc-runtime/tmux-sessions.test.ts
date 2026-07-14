@@ -3,6 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { buildWindowsPowerShellInnerCommand } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import {
 	__setBinaryResolverForTests,
 	clearPsmuxDetectionCache,
@@ -481,6 +482,77 @@ describe("GJC tmux session management", () => {
 		} finally {
 			__setBinaryResolverForTests(null);
 		}
+	});
+	it("builds a BOM-free encoded command for psmux with literal PowerShell values and arguments", () => {
+		const encoded = buildWindowsPowerShellInnerCommand({
+			command: ["C:\\Program Files\\GJC\\O'Brien\\gjc.exe"],
+			args: ["--resume", "operator's session", "--label=O'Brien"],
+			environment: {
+				GJC_PSMUX_COMMAND: "C:\\Program Files\\O'Brien\\psmux.exe",
+				GJC_TEST_VALUE: "operator's value",
+			},
+		});
+		const encodedMatch = encoded.match(/-EncodedCommand\s+(\S+)/);
+		expect(encodedMatch).not.toBeNull();
+		if (!encodedMatch) throw new Error("expected PowerShell encoded command");
+
+		const decoded = Buffer.from(encodedMatch[1], "base64");
+		expect(decoded[0]).not.toBe(0xff);
+		expect(decoded[1]).not.toBe(0xfe);
+		const script = decoded.toString("utf16le");
+		expect(script[0]).toBe("$");
+		expect(script).toContain("$env:GJC_PSMUX_COMMAND = 'C:\\Program Files\\O''Brien\\psmux.exe'");
+		expect(script).toContain("$env:GJC_TEST_VALUE = 'operator''s value'");
+		expect(script).toContain(
+			"& 'C:\\Program Files\\GJC\\O''Brien\\gjc.exe' '--resume' 'operator''s session' '--label=O''Brien'",
+		);
+	});
+
+	it("passes the shared encoded command to injected win32 session creation", () => {
+		let plannedArgv: string[] | undefined;
+		__setCreateOwnerIsolationForTests({
+			execute: plan => {
+				if (!plan.ok) throw new Error("expected owner-isolation plan");
+				plannedArgv = plan.execution.argv;
+				return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+			},
+		});
+		const stateFile = "C:\\Users\\O'Brien\\runtime-state.json";
+		expect(() =>
+			createGjcTmuxSession(
+				{
+					GJC_PSMUX_DETECTION: "off",
+					GJC_TMUX_COMMAND: "tmux",
+					GJC_TMUX_SESSION: "psmux-session",
+					GJC_COORDINATOR_SESSION_ID: "operator's session",
+					GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+				},
+				{ platform: "win32" },
+			),
+		).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
+		expect(plannedArgv?.slice(0, -1)).toEqual(["tmux", "new-session", "-d", "-s", "psmux-session"]);
+
+		const innerCommand = plannedArgv?.at(-1);
+		const encodedMatch = innerCommand?.match(/-EncodedCommand\s+(\S+)/);
+		expect(encodedMatch).not.toBeNull();
+		if (!encodedMatch) throw new Error("expected session new-command encoded command");
+		const script = Buffer.from(encodedMatch[1], "base64").toString("utf16le");
+		const generation = script.match(/\$env:GJC_TMUX_OWNER_GENERATION = '([^']+)'/)?.[1];
+		expect(generation).toBeDefined();
+		if (!generation) throw new Error("expected generated owner identity");
+		expect(innerCommand).toBe(
+			buildWindowsPowerShellInnerCommand({
+				command: ["gjc"],
+				environment: {
+					GJC_TMUX_LAUNCHED: "1",
+					GJC_TMUX_OWNER_GENERATION: generation,
+					GJC_TMUX_OWNER_STATE_DIR: "C:\\Users\\O'Brien",
+					GJC_TMUX_OWNER_SERVER_KEY: "tmux",
+					GJC_COORDINATOR_SESSION_ID: "operator's session",
+					GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+				},
+			}),
+		);
 	});
 	it("refuses psmux before attach-session mutation", () => {
 		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));

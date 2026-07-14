@@ -1,5 +1,6 @@
 import { sanitizeText } from "@gajae-code/utils";
 import type { GjcModelAssignmentTargetId } from "./model-registry";
+import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { ModelsConfig } from "./models-config-schema";
 
 export type ModelProfileRole = GjcModelAssignmentTargetId;
@@ -18,14 +19,14 @@ export interface ModelProfileDefinition {
 	 * means any single xiaomi credential satisfies the group.
 	 */
 	alternativeProviderGroups?: readonly (readonly string[])[];
-	modelMapping: Partial<Record<ModelProfileRole, string>>;
+	modelMapping: Partial<Record<ModelProfileRole, ModelSelectorValue>>;
 	source: "builtin" | "user";
 }
 
 export interface ResolvedProfileBinding {
-	defaultSelector?: string;
-	modelRoles: Record<string, string>;
-	agentModelOverrides: Partial<Record<Exclude<ModelProfileRole, "default">, string>>;
+	defaultSelector?: ModelSelectorValue;
+	modelRoles: Record<string, ModelSelectorValue>;
+	agentModelOverrides: Partial<Record<Exclude<ModelProfileRole, "default">, ModelSelectorValue>>;
 }
 
 function parseModelSelectorProvider(selector: string): string | undefined {
@@ -36,29 +37,31 @@ function parseModelSelectorProvider(selector: string): string | undefined {
 
 export function deriveModelProfileMappedProviders(definition: Pick<ModelProfileDefinition, "modelMapping">): string[] {
 	const providers = new Set<string>();
-	for (const selector of Object.values(definition.modelMapping)) {
-		if (!selector) continue;
-		const provider = parseModelSelectorProvider(selector);
-		if (provider) providers.add(provider);
+	for (const selectorValue of Object.values(definition.modelMapping)) {
+		for (const selector of normalizeModelSelectorValue(selectorValue)) {
+			const provider = parseModelSelectorProvider(selector);
+			if (provider) providers.add(provider);
+		}
 	}
 	return [...providers].sort((a, b) => a.localeCompare(b));
 }
 
+/**
+ * Return the providers explicitly declared as hard prerequisites.
+ * Model mappings may reference fallback providers, but those references are
+ * resolution-time candidates rather than activation requirements.
+ */
 export function aggregateModelProfileRequiredProviders(
 	requiredProviders: readonly string[],
-	definition: Pick<ModelProfileDefinition, "modelMapping">,
+	_definition: Pick<ModelProfileDefinition, "modelMapping">,
 ): string[] {
-	const providers = new Set(requiredProviders);
-	for (const provider of deriveModelProfileMappedProviders(definition)) {
-		providers.add(provider);
-	}
-	return [...providers];
+	return [...new Set(requiredProviders)];
 }
 
 const profile = (
 	name: string,
 	requiredProviders: string[],
-	modelMapping: Partial<Record<ModelProfileRole, string>>,
+	modelMapping: Partial<Record<ModelProfileRole, ModelSelectorValue>>,
 	alternativeProviderGroups?: readonly (readonly string[])[],
 ): ModelProfileDefinition => ({
 	name,
@@ -70,25 +73,25 @@ const profile = (
 
 export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	profile("codex-eco", ["openai-codex"], {
-		default: "openai-codex/gpt-5.6-terra:high",
-		executor: "openai-codex/gpt-5.6-luna:high",
-		planner: "openai-codex/gpt-5.6-terra:medium",
-		critic: "openai-codex/gpt-5.6-terra:high",
-		architect: "openai-codex/gpt-5.6-sol:medium",
+		default: "openai-codex/gpt-5.6-terra:low",
+		executor: "openai-codex/gpt-5.6-luna:low",
+		planner: "openai-codex/gpt-5.6-luna:high",
+		critic: "openai-codex/gpt-5.6-terra:xhigh",
+		architect: "openai-codex/gpt-5.6-terra:high",
 	}),
 	profile("codex-medium", ["openai-codex"], {
-		default: "openai-codex/gpt-5.6-sol:medium",
-		executor: "openai-codex/gpt-5.6-terra:xhigh",
+		default: "openai-codex/gpt-5.6-sol:low",
+		executor: "openai-codex/gpt-5.6-terra:low",
 		planner: "openai-codex/gpt-5.6-terra:high",
-		critic: "openai-codex/gpt-5.6-terra:xhigh",
+		critic: "openai-codex/gpt-5.6-sol:xhigh",
 		architect: "openai-codex/gpt-5.6-sol:high",
 	}),
 	profile("codex-pro", ["openai-codex"], {
-		default: "openai-codex/gpt-5.6-sol:xhigh",
-		executor: "openai-codex/gpt-5.6-terra:xhigh",
+		default: "openai-codex/gpt-5.6-sol:medium",
+		executor: "openai-codex/gpt-5.6-terra:medium",
 		planner: "openai-codex/gpt-5.6-sol:high",
-		critic: "openai-codex/gpt-5.6-sol:xhigh",
-		architect: "openai-codex/gpt-5.6-sol:max",
+		critic: "openai-codex/gpt-5.6-sol:max",
+		architect: "openai-codex/gpt-5.6-sol:xhigh",
 	}),
 	profile("opencodego", ["opencode-go"], {
 		default: "opencode-go/kimi-k2.6",
@@ -256,21 +259,21 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	}),
 	profile("opus-codex", ["anthropic", "openai-codex"], {
 		default: "anthropic/claude-opus-4-8:xhigh",
-		executor: "openai-codex/gpt-5.6-terra:xhigh",
-		planner: "openai-codex/gpt-5.6-terra:high",
-		critic: "openai-codex/gpt-5.6-terra:xhigh",
-		architect: "openai-codex/gpt-5.6-sol:xhigh",
+		executor: "openai-codex/gpt-5.6-terra:low",
+		planner: "anthropic/claude-sonnet-5",
+		critic: "openai-codex/gpt-5.6-sol:xhigh",
+		architect: "openai-codex/gpt-5.6-sol:high",
 	}),
 	profile("codex-opencodego", ["openai-codex", "opencode-go"], {
-		default: "openai-codex/gpt-5.6-terra:xhigh",
+		default: "openai-codex/gpt-5.6-sol:low",
 		executor: "opencode-go/deepseek-v4-pro",
 		planner: "opencode-go/kimi-k2.6",
 		critic: "opencode-go/mimo-v2.5-pro",
-		architect: "openai-codex/gpt-5.6-sol:xhigh",
+		architect: "openai-codex/gpt-5.6-sol:high",
 	}),
 	profile("fable-opus-codex", ["anthropic", "openai-codex"], {
 		default: "anthropic/claude-fable-5:high",
-		executor: "openai-codex/gpt-5.6-terra:xhigh",
+		executor: "openai-codex/gpt-5.6-terra:medium",
 		planner: "anthropic/claude-opus-4-8:medium",
 		critic: "anthropic/claude-opus-4-8:high",
 		architect: "openai-codex/gpt-5.6-sol:xhigh",

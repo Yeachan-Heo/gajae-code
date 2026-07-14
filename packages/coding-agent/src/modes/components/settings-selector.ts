@@ -25,6 +25,7 @@ import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } 
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
+import { createPetSelectItems, getPetUnavailableWarning, isPetAvailable } from "./pet-capability";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingsForTab, type SettingDef } from "./settings-defs";
 import type { StatusLineSegmentOptions } from "./status-line";
@@ -661,6 +662,8 @@ export interface SettingsRuntimeContext {
 	availableModelProfiles: string[];
 	/** Working directory for plugins tab */
 	cwd: string;
+	/** Whether this terminal can render the pet overlay. */
+	petAvailable?: boolean;
 }
 
 /** Status line settings subset for preview */
@@ -684,6 +687,13 @@ export interface SettingsCallbacks {
 	onThemePreviewCancel?: (theme: string) => void | Promise<void>;
 	/** Called to live-preview the gajae pet skin while browsing the pet setting. */
 	onPetPreview?: (mode: string) => void;
+	/**
+	 * Commit a pet mode through the shared result-returning policy. The policy
+	 * rechecks capability immediately before mutation and owns persistence, so
+	 * the settings surface never persists `pet.mode` ahead of acceptance.
+	 * Returns whether the commit was accepted.
+	 */
+	onPetCommit?: (mode: string) => boolean;
 	/** Called for status line preview while configuring */
 	onStatusLinePreview?: (settings: StatusLinePreviewSettings) => void;
 	/** Get current rendered status line for inline preview */
@@ -841,7 +851,7 @@ export class SettingsSelectorComponent extends Container {
 		currentValue: string,
 		done: (value?: string) => void,
 	): Container {
-		let options = def.options;
+		let options: ReadonlyArray<SelectItem> = def.options;
 
 		// Special case: inject runtime options for thinking level
 		if (def.path === "defaultThinkingLevel") {
@@ -856,6 +866,14 @@ export class SettingsSelectorComponent extends Container {
 		}
 		if (def.path === "statusLine.preset") {
 			options = options.filter(option => option.value !== "custom");
+		}
+		let description = def.description;
+		if (def.path === "pet.mode") {
+			const petAvailable = this.context.petAvailable ?? isPetAvailable();
+			options = createPetSelectItems(options, currentValue, petAvailable);
+			// Unsupported terminals must see the same actionable guidance the
+			// startup notice and /pet show, not only dimmed option descriptions.
+			if (!petAvailable) description = getPetUnavailableWarning();
 		}
 		// Preview handlers
 		let onPreview: ((value: string) => void | Promise<void>) | undefined;
@@ -943,10 +961,18 @@ export class SettingsSelectorComponent extends Container {
 
 		return new SelectSubmenu(
 			def.label,
-			def.description,
+			description,
 			options,
 			currentValue,
 			value => {
+				if (def.path === "pet.mode") {
+					// The shared pet commit policy rechecks capability immediately
+					// before mutation and persists only on acceptance; the settings
+					// surface must not persist ahead of that result.
+					const accepted = this.callbacks.onPetCommit?.(value) ?? false;
+					done(accepted ? value : undefined);
+					return;
+				}
 				this.#setSettingValue(def.path, value);
 				this.callbacks.onChange(def.path, value);
 				done(value);

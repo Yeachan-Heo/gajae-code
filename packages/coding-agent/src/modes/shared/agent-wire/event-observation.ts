@@ -197,14 +197,23 @@ export function observeAgentSessionEvent(event: AgentSessionEvent): AgentWireOwn
 				semantic: false,
 				coalesceKey: null,
 			});
-		case "retry_fallback_applied":
-		case "retry_fallback_succeeded":
+		case "model_fallback_switched":
 			return obs(event, {
-				kind: "rpc_retry_fallback",
+				kind: "rpc_model_fallback_switched",
 				signal: null,
-				evidence: { phase: event.type, role: str(event.role) ?? null },
-				severity: "warn",
-				semantic: false,
+				evidence: {
+					eventId: str(event.eventId) ?? null,
+					from: str(event.from) ?? null,
+					to: str(event.to) ?? null,
+					reason: str(event.reason) ?? null,
+					role: str(event.role) ?? null,
+					scope: str(event.scope) ?? null,
+					activeIndex: num(event.activeIndex) ?? null,
+					chainLength: num(event.chainLength) ?? null,
+					attemptsUsed: num(event.attemptsUsed) ?? null,
+				},
+				severity: "info",
+				semantic: true,
 				coalesceKey: null,
 			});
 		case "ttsr_triggered":

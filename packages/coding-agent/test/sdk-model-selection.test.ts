@@ -351,4 +351,71 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await session.dispose();
 		}
 	});
+
+	test("restores the configured default-chain head over legacy models.default on resume", async () => {
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		// Legacy scalar model diverges from the configured chain head.
+		sessionManager.appendModelChange("runtime-provider/runtime-reasoning-model", "default");
+		sessionManager.appendConfiguredModelChain({
+			role: "default",
+			entries: ["runtime-provider/runtime-model", "runtime-provider/runtime-reasoning-model"],
+			origin: "model_selection",
+			explicitHead: true,
+		});
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await sessionManager.close();
+
+		authStorage.setRuntimeApiKey("runtime-provider", "test-key");
+		const resumedManager = await SessionManager.open(sessionFile, tempDir);
+		const { session } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			sessionManager: resumedManager,
+		});
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-model");
+		} finally {
+			await session.dispose();
+		}
+	});
+	test("falls back to the global default without seeding an exhausted persisted controller", async () => {
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		sessionManager.appendConfiguredModelChain({
+			role: "default",
+			entries: ["missing-provider/first", "missing-provider/second"],
+			origin: "model_selection",
+			explicitHead: true,
+		});
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await sessionManager.close();
+
+		authStorage.setRuntimeApiKey("runtime-provider", "test-key");
+		const settings = Settings.isolated();
+		settings.setModelRole("default", "runtime-provider/runtime-model");
+		const resumedManager = await SessionManager.open(sessionFile, tempDir);
+		const { session } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			settings,
+			sessionManager: resumedManager,
+		});
+
+		try {
+			expect(session.model).toMatchObject({ provider: "runtime-provider", id: "runtime-model" });
+			expect(session.getConfiguredModelChain("default")).toEqual([
+				"missing-provider/first",
+				"missing-provider/second",
+			]);
+		} finally {
+			await session.dispose();
+		}
+	});
 });

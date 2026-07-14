@@ -44,8 +44,8 @@ import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
 	parseModelPattern,
-	parseModelString,
 	resolveAllowedModels,
+	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
@@ -1080,18 +1080,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let modelFallbackMessage: string | undefined;
 	// If session has data, try to restore model from it.
 	// Skip restore when an explicit model was requested.
-	const defaultModelStr = existingSession.models.default;
-	if (!hasExplicitModel && !model && hasExistingSession && defaultModelStr) {
+	let restoredDefaultResolution: Awaited<ReturnType<typeof resolveModelChainWithAuth>> | undefined;
+	const configuredDefaultEntries = existingSession.configuredModelChains?.default?.entries;
+	const defaultModelEntries =
+		configuredDefaultEntries ?? (existingSession.models.default ? [existingSession.models.default] : []);
+	if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
 		await logger.time("restoreSessionModel", async () => {
-			const parsedModel = parseModelString(defaultModelStr);
-			if (parsedModel) {
-				const restoredModel = modelRegistry.find(parsedModel.provider, parsedModel.id);
-				if (restoredModel && (await hasModelApiKey(restoredModel))) {
-					model = restoredModel;
-				}
-			}
+			restoredDefaultResolution = await resolveModelChainWithAuth(
+				defaultModelEntries,
+				modelRegistry,
+				settings,
+				providerSessionId,
+				{ managedFallback: defaultModelEntries.length > 1 },
+			);
+			model = restoredDefaultResolution.model;
 			if (!model) {
-				modelFallbackMessage = `Could not restore model ${defaultModelStr}`;
+				modelFallbackMessage = `Could not restore model chain ${defaultModelEntries.join(" → ")}`;
 			}
 		});
 	}
@@ -1312,8 +1316,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	try {
+		let promptMetadataModel: Model | undefined;
 		const getActiveModelString = (): string | undefined => {
-			const activeModel = agent?.state.model;
+			const activeModel = promptMetadataModel ?? agent?.state.model;
 			if (activeModel) return formatModelString(activeModel);
 			if (model) return formatModelString(model);
 			return undefined;
@@ -1895,30 +1900,43 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
+			candidateModel?: Model,
 		): Promise<BuildSystemPromptResult> => {
 			toolContextStore.setToolNames(toolNames);
-			const activeToolNames = new Set(toolNames);
-			const discoverableBuiltinTools: DiscoverableTool[] =
-				effectiveDiscoveryMode === "all"
-					? collectDiscoverableTools(
-							Array.from(tools.values()).filter(
-								tool => tool.loadMode === "discoverable" && !activeToolNames.has(tool.name),
-							),
-							{ source: "builtin" },
-						)
-					: [];
-			const discoverableMCPTools: DiscoverableTool[] = mcpDiscoveryEnabled
-				? collectDiscoverableTools(
-						Array.from(tools.values()).filter(
-							tool => isMCPToolName(tool.name) && !activeToolNames.has(tool.name),
-						),
-						{ source: "mcp" },
-					)
-				: [];
-			const discoverableToolsForDesc: DiscoverableTool[] = [...discoverableBuiltinTools, ...discoverableMCPTools];
-			const promptTools = buildSystemPromptToolMetadata(tools, {
-				search_tool_bm25: { description: renderSearchToolBm25Description(discoverableToolsForDesc) },
-			});
+			const { discoverableBuiltinTools, discoverableMCPTools, promptTools } = (() => {
+				const previousPromptMetadataModel = promptMetadataModel;
+				promptMetadataModel = candidateModel;
+				try {
+					const activeToolNames = new Set(toolNames);
+					const discoverableBuiltinTools: DiscoverableTool[] =
+						effectiveDiscoveryMode === "all"
+							? collectDiscoverableTools(
+									Array.from(tools.values()).filter(
+										tool => tool.loadMode === "discoverable" && !activeToolNames.has(tool.name),
+									),
+									{ source: "builtin" },
+								)
+							: [];
+					const discoverableMCPTools: DiscoverableTool[] = mcpDiscoveryEnabled
+						? collectDiscoverableTools(
+								Array.from(tools.values()).filter(
+									tool => isMCPToolName(tool.name) && !activeToolNames.has(tool.name),
+								),
+								{ source: "mcp" },
+							)
+						: [];
+					const discoverableToolsForDesc: DiscoverableTool[] = [
+						...discoverableBuiltinTools,
+						...discoverableMCPTools,
+					];
+					const promptTools = buildSystemPromptToolMetadata(tools, {
+						search_tool_bm25: { description: renderSearchToolBm25Description(discoverableToolsForDesc) },
+					});
+					return { discoverableBuiltinTools, discoverableMCPTools, promptTools };
+				} finally {
+					promptMetadataModel = previousPromptMetadataModel;
+				}
+			})();
 			const memoryInstructions = await resolveMemoryBackend(settings).buildDeveloperInstructions(
 				agentDir,
 				settings,
@@ -2400,6 +2418,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			providerSessionState: options.providerSessionState,
 		});
 		hasSession = true;
+		const restoredModelWasSelected = restoredDefaultResolution?.model === model;
+		if (restoredDefaultResolution && restoredModelWasSelected) {
+			session.seedDefaultFallbackResolution(restoredDefaultResolution.activeIndex, restoredDefaultResolution.skips);
+		} else if (restoredDefaultResolution && model) {
+			session.setDefaultFallbackRuntimeModel(formatModelString(model));
+		}
 		if (asyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
 				isStale: entry => asyncJobManager.isDeliverySuppressed(entry.jobId),

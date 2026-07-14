@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-13
+
 ### Fixed
 
 - Broken stdout pipes no longer crash early CLI output with a fatal internal-error dump. The process-level fallback exits quietly with numeric status 141 only for `EPIPE` observed directly from `process.stdout.write` or carrying `syscall: "write"` with an open descriptor matching stdout or the same unchanged pipe identity; unrelated socket/child-pipe errors, unattributed `EPIPE`, and process-level `ERR_STREAM_DESTROYED` keep the existing fatal diagnostics and status 1. Local output owners use separate sink-aware classification so expected peer closure does not become a universal process policy.

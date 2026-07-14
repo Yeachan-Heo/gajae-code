@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type AgentMessage, canContinuePersistedHistory } from "@gajae-code/agent-core";
+import type { ConfiguredModelChainEntry as SharedConfiguredModelChainEntry } from "@gajae-code/agent-core/compaction";
 import type {
 	ImageContent,
 	Message,
@@ -221,6 +222,14 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	thinkingLevel?: string | null;
 }
 
+/** Persisted configured fallback chain for one model role. */
+export type ConfiguredModelChainEntry = SharedConfiguredModelChainEntry;
+
+export type ConfiguredModelChain = Pick<
+	ConfiguredModelChainEntry,
+	"role" | "entries" | "origin" | "identity" | "explicitHead" | "cleared"
+>;
+
 export interface ServiceTierChangeEntry extends SessionEntryBase {
 	type: "service_tier_change";
 	serviceTier: ServiceTier | null;
@@ -353,10 +362,30 @@ export type SessionEntry =
 	| TtsrInjectionEntry
 	| MCPToolSelectionEntry
 	| SessionInitEntry
-	| ModeChangeEntry;
+	| ModeChangeEntry
+	| ConfiguredModelChainEntry;
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
+
+export type DefaultModelSelectionStage = {
+	readonly entryRevision: number;
+	readonly headerExportRevision: number;
+	readonly sessionId: string;
+	readonly sessionFile: string | undefined;
+	readonly entries: readonly FileEntry[];
+	readonly tempPath: string | undefined;
+	readonly persistsToExistingFile: boolean;
+};
+
+export type DefaultModelSelectionPromotion =
+	| { readonly kind: "promoted" }
+	| { readonly kind: "not_promoted"; readonly error?: Error }
+	| { readonly kind: "unknown"; readonly error: Error };
+
+type SessionFileReplacementSyncOutcome =
+	| { readonly kind: "replaced" }
+	| { readonly kind: "restored_previous"; readonly error: Error };
 
 /** Tree node for getTree() - defensive copy of session structure */
 export interface SessionTreeNode {
@@ -372,6 +401,9 @@ export interface SessionContext {
 	serviceTier?: ServiceTier;
 	/** Model roles: { default: "provider/modelId", small: "provider/modelId", ... } */
 	models: Record<string, string>;
+	/** Configured fallback chains for model roles on the active branch. */
+	configuredModelChains: Record<string, ConfiguredModelChain>;
+
 	/** Names of TTSR rules that have been injected this session */
 	injectedTtsrRules: string[];
 	/** Rich TTSR rule injection records for repeat resume. */
@@ -427,6 +459,20 @@ export interface StrictSessionOpenFailure {
 	kind: "error";
 	reason: ResumeTailError["reason"] | "identity-mismatch";
 }
+
+/** Exact transcript bytes and authority captured from one descriptor-bound read. */
+export interface CapturedSessionTranscriptSnapshot {
+	sourcePath: string;
+	identity: ResumeSessionIdentity;
+	content: Uint8Array;
+	storage: SessionStorage;
+}
+
+export type StrictSessionCaptureResult =
+	| { kind: "captured"; snapshot: CapturedSessionTranscriptSnapshot }
+	| ResumeTailError;
+
+export type StrictSessionForkResult = { kind: "forked"; manager: SessionManager } | StrictSessionOpenFailure;
 
 /** Result of opening an inspected session without create-or-rewrite fallback. */
 export type StrictSessionOpenResult = StrictSessionOpenSuccess | StrictSessionOpenFailure;
@@ -744,6 +790,31 @@ export function parseSessionEntries(content: string): FileEntry[] {
 	return parseJsonlLenient<FileEntry>(content);
 }
 
+function normalizeConfiguredModelChainEntry(entry: unknown): ConfiguredModelChain | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
+	const candidate = entry as Partial<ConfiguredModelChainEntry>;
+	if (typeof candidate.role !== "string" || candidate.role.length === 0) return undefined;
+	if (candidate.cleared === true) {
+		return {
+			role: candidate.role,
+			entries: [],
+			origin: typeof candidate.origin === "string" ? candidate.origin : "session",
+			explicitHead: candidate.explicitHead === true,
+			cleared: true,
+		};
+	}
+	if (!Array.isArray(candidate.entries)) return undefined;
+	const entries = candidate.entries.filter((model): model is string => typeof model === "string" && model.length > 0);
+	if (entries.length === 0) return undefined;
+	return {
+		role: candidate.role,
+		entries,
+		origin: typeof candidate.origin === "string" ? candidate.origin : "session",
+		...(typeof candidate.identity === "string" ? { identity: candidate.identity } : {}),
+		explicitHead: candidate.explicitHead === true,
+	};
+}
+
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		if (entries[i].type === "compaction") {
@@ -781,6 +852,8 @@ export function buildSessionContext(
 			thinkingLevel: "off",
 			serviceTier: undefined,
 			models: {},
+			configuredModelChains: {},
+
 			injectedTtsrRules: [],
 			injectedTtsrRuleRecords: [],
 			ttsrMessageCount: 0,
@@ -804,6 +877,8 @@ export function buildSessionContext(
 			thinkingLevel: "off",
 			serviceTier: undefined,
 			models: {},
+			configuredModelChains: {},
+
 			injectedTtsrRules: [],
 			injectedTtsrRuleRecords: [],
 			ttsrMessageCount: 0,
@@ -829,6 +904,8 @@ export function buildSessionContext(
 	let thinkingLevel: string | undefined = "off";
 	let serviceTier: ServiceTier | undefined;
 	const models: Record<string, string> = {};
+	const configuredModelChains: Record<string, ConfiguredModelChain> = {};
+
 	let compaction: CompactionEntry | null = null;
 	const injectedTtsrRulesSet = new Set<string>();
 	const injectedTtsrRuleRecords = new Map<string, TtsrInjectionRecord>();
@@ -858,6 +935,13 @@ export function buildSessionContext(
 				if (role === "default") {
 					hasExplicitDefaultModel = true;
 				}
+			}
+		} else if (entry.type === "configured_model_chain") {
+			const configuredChain = normalizeConfiguredModelChainEntry(entry);
+			if (configuredChain?.cleared) {
+				delete configuredModelChains[configuredChain.role];
+			} else if (configuredChain) {
+				configuredModelChains[configuredChain.role] = configuredChain;
 			}
 		} else if (entry.type === "service_tier_change") {
 			serviceTier = entry.serviceTier ?? undefined;
@@ -897,6 +981,16 @@ export function buildSessionContext(
 	}
 
 	const injectedTtsrRules = Array.from(injectedTtsrRulesSet);
+	for (const [role, model] of Object.entries(models)) {
+		if (role in configuredModelChains) continue;
+		configuredModelChains[role] = {
+			role,
+			entries: [model],
+			origin: "legacy_session",
+			explicitHead: true,
+		};
+	}
+
 	const injectedTtsrRuleRecordsArray = Array.from(injectedTtsrRuleRecords.values());
 
 	// Build messages and collect corresponding entries
@@ -996,6 +1090,8 @@ export function buildSessionContext(
 		thinkingLevel,
 		serviceTier,
 		models,
+		configuredModelChains,
+
 		injectedTtsrRules,
 		injectedTtsrRuleRecords: injectedTtsrRuleRecordsArray,
 		ttsrMessageCount,
@@ -1014,6 +1110,13 @@ function cloneSessionContext(context: SessionContext): SessionContext {
 		...context,
 		messages,
 		models: { ...context.models },
+		configuredModelChains: Object.fromEntries(
+			Object.entries(context.configuredModelChains ?? {}).map(([role, chain]) => [
+				role,
+				{ ...chain, entries: [...chain.entries] },
+			]),
+		),
+
 		injectedTtsrRules: [...context.injectedTtsrRules],
 		injectedTtsrRuleRecords: context.injectedTtsrRuleRecords?.map(record => ({ ...record })),
 		ttsrMessageCount: context.ttsrMessageCount,
@@ -1171,6 +1274,7 @@ function sameResumeStat(left: SessionStorageStat, right: SessionStorageStat): bo
 
 interface ResumeInspectionSnapshot {
 	identity: ResumeSessionIdentity;
+	content: Uint8Array;
 	entries: FileEntry[];
 	context: SessionContext;
 	migrationApplied: boolean;
@@ -1217,6 +1321,9 @@ function hasStrictSessionSchema(entries: FileEntry[]): boolean {
 					!(typeof value.provider === "string" && typeof value.modelId === "string")
 				)
 					return false;
+				break;
+			case "configured_model_chain":
+				if (!normalizeConfiguredModelChainEntry(value)) return false;
 				break;
 			case "compaction":
 				if (
@@ -1344,7 +1451,7 @@ function inspectResumeSessionFile(
 			mtimeNs: snapshot.mtimeNs,
 			sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
 		};
-		return { identity, entries, context, migrationApplied };
+		return { identity, content: Uint8Array.from(bytes), entries, context, migrationApplied };
 	} catch {
 		return { kind: "error", reason: "malformed" };
 	}
@@ -3131,6 +3238,7 @@ interface SessionManagerStateSnapshot {
 	titleSource: "auto" | "user" | undefined;
 	sessionFile: string | undefined;
 	flushed: boolean;
+	ensuredOnDisk: boolean;
 	needsFullRewriteOnNextPersist: boolean;
 	fileEntries: FileEntry[];
 	materializedFileEntries: FileEntry[];
@@ -3323,6 +3431,7 @@ export class SessionManager {
 			titleSource: this.#titleSource,
 			sessionFile: this.#sessionFile,
 			flushed: this.#flushed,
+			ensuredOnDisk: this.#ensuredOnDisk,
 			needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
 			// Snapshot entry objects by reference: switch/reload replaces the active entry array,
 			// so rollback does not need structured cloning of extension/custom details.
@@ -3335,15 +3444,23 @@ export class SessionManager {
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
 		const restoredFileEntries = [...snapshot.materializedFileEntries];
+		const retainsPersistWriter =
+			this.#persistWriter?.isOpen() === true &&
+			this.#sessionId === snapshot.sessionId &&
+			this.#sessionFile === snapshot.sessionFile &&
+			this.#persistWriterPath === snapshot.sessionFile;
 		this.#sessionId = snapshot.sessionId;
 		this.#sessionName = snapshot.sessionName;
 		this.#titleSource = snapshot.titleSource;
 		this.#sessionFile = snapshot.sessionFile;
 		this.#flushed = snapshot.flushed;
+		this.#ensuredOnDisk = snapshot.ensuredOnDisk;
 		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
 		this.#fileEntries = restoredFileEntries;
-		this.#persistWriter = undefined;
-		this.#persistWriterPath = undefined;
+		if (!retainsPersistWriter) {
+			this.#persistWriter = undefined;
+			this.#persistWriterPath = undefined;
+		}
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
@@ -3629,7 +3746,7 @@ export class SessionManager {
 	}
 
 	/** Sync version for initial creation (no existing writer to close) */
-	#newSessionSync(options?: NewSessionOptions): string | undefined {
+	#newSessionSync(options?: NewSessionOptions, writeBreadcrumb = true): string | undefined {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
@@ -3664,7 +3781,7 @@ export class SessionManager {
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 			this.#sessionFile = path.join(this.getSessionDir(), `${fileTimestamp}_${this.#sessionId}.jsonl`);
-			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			if (writeBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		}
 		this.#resetResidentTextBlobStore();
 		return this.#sessionFile;
@@ -3788,7 +3905,11 @@ export class SessionManager {
 	// shared `*.bak` glob on both real and in-memory storage backends and promote it back to
 	// the primary on the next session-dir scan.
 
-	#replaceSessionFileAfterEpermSync(tempPath: string, targetPath: string, renameError: unknown): void {
+	#replaceSessionFileAfterEpermSync(
+		tempPath: string,
+		targetPath: string,
+		renameError: unknown,
+	): SessionFileReplacementSyncOutcome {
 		const dir = path.resolve(targetPath, "..");
 		const backupPath = path.join(dir, `${path.basename(targetPath)}.${Snowflake.next()}.bak`);
 		try {
@@ -3796,7 +3917,7 @@ export class SessionManager {
 		} catch (err) {
 			if (isEnoent(err)) {
 				this.storage.renameSync(tempPath, targetPath);
-				return;
+				return { kind: "replaced" };
 			}
 			throw toError(renameError);
 		}
@@ -3815,7 +3936,7 @@ export class SessionManager {
 					{ cause: originalError },
 				);
 			}
-			throw replaceError;
+			return { kind: "restored_previous", error: replaceError };
 		}
 
 		try {
@@ -3829,6 +3950,7 @@ export class SessionManager {
 				});
 			}
 		}
+		return { kind: "replaced" };
 	}
 
 	async #replaceSessionFileAfterEperm(tempPath: string, targetPath: string, renameError: unknown): Promise<void> {
@@ -3883,13 +4005,13 @@ export class SessionManager {
 		}
 	}
 
-	#replaceSessionFileSync(tempPath: string, targetPath: string): void {
+	#replaceSessionFileSync(tempPath: string, targetPath: string): SessionFileReplacementSyncOutcome {
 		try {
 			this.storage.renameSync(tempPath, targetPath);
+			return { kind: "replaced" };
 		} catch (err) {
 			if (hasFsCode(err, "EPERM")) {
-				this.#replaceSessionFileAfterEpermSync(tempPath, targetPath, err);
-				return;
+				return this.#replaceSessionFileAfterEpermSync(tempPath, targetPath, err);
 			}
 
 			throw toError(err);
@@ -3906,7 +4028,8 @@ export class SessionManager {
 				writer.writeSync(entry);
 			}
 			writer.closeSync();
-			this.#replaceSessionFileSync(tempPath, this.#sessionFile);
+			const replacement = this.#replaceSessionFileSync(tempPath, this.#sessionFile);
+			if (replacement.kind === "restored_previous") throw replacement.error;
 		} catch (err) {
 			// closeSync is now truthful and may throw; wrap the best-effort cleanup so
 			// the original error (write/close failure) is the one surfaced, not the
@@ -3949,6 +4072,38 @@ export class SessionManager {
 		}
 	}
 
+	async #writeStagedDefaultModelSelection(
+		entries: readonly FileEntry[],
+		sessionFile: string,
+	): Promise<string | undefined> {
+		if (!this.storage.existsSync(sessionFile)) return undefined;
+		const dir = path.resolve(sessionFile, "..");
+		const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.default-selection.tmp`);
+		const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
+		try {
+			const persistedEntries = await Promise.all(
+				materializeResidentEntriesForPersistenceSync([...entries], this.#residentBlobStores()).map(entry =>
+					prepareEntryForPersistence(entry, this.#blobStore),
+				),
+			);
+			for (const entry of persistedEntries) {
+				await writer.write(entry);
+			}
+			await writer.flush();
+			await writer.fsync();
+			await writer.close();
+			return tempPath;
+		} catch (error) {
+			try {
+				await writer.close();
+			} catch {}
+			try {
+				await this.storage.unlink(tempPath);
+			} catch {}
+			throw toError(error);
+		}
+	}
+
 	async #rewriteFile(): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#queuePersistTask(async () => {
@@ -3979,6 +4134,109 @@ export class SessionManager {
 
 	isPersisted(): boolean {
 		return this.persist;
+	}
+
+	async stageDefaultModelSelection(
+		model: string,
+		thinkingLevel: string | undefined,
+		options?: { readonly appendThinkingLevel: boolean },
+	): Promise<DefaultModelSelectionStage> {
+		const entryRevision = this.#entryRevision;
+		const headerExportRevision = this.#headerExportRevision;
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		const entryIds = new Map(this.#byId);
+		let parentId = this.#leafId;
+		const entries = [...this.#fileEntries];
+		const temporaryEntry: ModelChangeEntry = {
+			type: "model_change",
+			id: generateId(entryIds),
+			parentId,
+			timestamp: new Date().toISOString(),
+			model,
+			role: "temporary",
+		};
+		entryIds.set(temporaryEntry.id, temporaryEntry);
+		entries.push(temporaryEntry);
+		parentId = temporaryEntry.id;
+		if (options?.appendThinkingLevel) {
+			const thinkingEntry: ThinkingLevelChangeEntry = {
+				type: "thinking_level_change",
+				id: generateId(entryIds),
+				parentId,
+				timestamp: new Date().toISOString(),
+				thinkingLevel: thinkingLevel ?? null,
+			};
+			entryIds.set(thinkingEntry.id, thinkingEntry);
+			entries.push(thinkingEntry);
+			parentId = thinkingEntry.id;
+		}
+		const modelEntry: ModelChangeEntry = {
+			type: "model_change",
+			id: generateId(entryIds),
+			parentId,
+			timestamp: new Date().toISOString(),
+			model,
+			role: "default",
+		};
+		entries.push(modelEntry);
+		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.storage.existsSync(sessionFile);
+		const tempPath = persistsToExistingFile
+			? await this.#writeStagedDefaultModelSelection(entries, sessionFile)
+			: undefined;
+		return {
+			entryRevision,
+			headerExportRevision,
+			sessionId,
+			sessionFile,
+			entries,
+			tempPath,
+			persistsToExistingFile,
+		};
+	}
+
+	promoteDefaultModelSelection(stage: DefaultModelSelectionStage): DefaultModelSelectionPromotion {
+		if (
+			stage.entryRevision !== this.#entryRevision ||
+			stage.headerExportRevision !== this.#headerExportRevision ||
+			stage.sessionId !== this.#sessionId ||
+			stage.sessionFile !== this.#sessionFile
+		) {
+			return { kind: "not_promoted" };
+		}
+		if (stage.persistsToExistingFile) {
+			if (!stage.tempPath || !this.#sessionFile)
+				return { kind: "unknown", error: new Error("Missing staged session replacement") };
+			try {
+				this.#closePersistWriterInternalSync();
+				const replacement = this.#replaceSessionFileSync(stage.tempPath, this.#sessionFile);
+				if (replacement.kind === "restored_previous") {
+					return { kind: "not_promoted", error: replacement.error };
+				}
+			} catch (error) {
+				if (this.#persistWriter?.getCloseState() === "close_failed_retryable") {
+					return { kind: "not_promoted", error: new Error("Session replacement could not be completed.") };
+				}
+				return { kind: "unknown", error: toError(error) };
+			}
+		}
+		this.#fileEntries = [...stage.entries];
+		this.#resetResidentTextBlobStore();
+		this.#reexternalizeFileEntriesForResidentStore();
+		this.#needsFullRewriteOnNextPersist = false;
+		this.#flushed = stage.persistsToExistingFile;
+		this.#ensuredOnDisk = stage.persistsToExistingFile;
+		this.#bumpAllRevisions();
+		return { kind: "promoted" };
+	}
+
+	async discardDefaultModelSelectionStage(stage: DefaultModelSelectionStage): Promise<void> {
+		if (!stage.tempPath) return;
+		try {
+			await this.storage.unlink(stage.tempPath);
+		} catch (error) {
+			if (!isEnoent(error)) throw toError(error);
+		}
 	}
 
 	/**
@@ -4387,6 +4645,24 @@ export class SessionManager {
 				this.#usageStatistics.cost += usage.cost.total;
 			}
 		}
+	}
+
+	/** Append a configured fallback chain as child of current leaf, then advance leaf. Returns entry id. */
+	appendConfiguredModelChain(chain: ConfiguredModelChain): string {
+		const entry: ConfiguredModelChainEntry = {
+			type: "configured_model_chain",
+			id: generateId(this.#byId),
+			parentId: this.#leafId,
+			timestamp: new Date().toISOString(),
+			role: chain.role,
+			entries: [...chain.entries],
+			origin: chain.origin,
+			identity: chain.identity,
+			explicitHead: chain.explicitHead,
+			cleared: chain.cleared,
+		};
+		this.#appendEntry(entry);
+		return entry.id;
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -5422,6 +5698,11 @@ export class SessionManager {
 		return computeDefaultSessionDir(cwd, storage, getSessionsDir(agentDir));
 	}
 
+	/** Resolve the default session directory without creating or migrating storage. */
+	static getDefaultSessionDirReadOnly(cwd: string, agentDir?: string): string {
+		const { encodedDirName } = getDefaultSessionDirName(cwd);
+		return path.join(getSessionsDir(agentDir), encodedDirName);
+	}
 	/**
 	 * Create a new session.
 	 * @param cwd Working directory (stored in session header)
@@ -5510,6 +5791,159 @@ export class SessionManager {
 			return await collectSessionsFromFiles([...files], storage);
 		} catch {
 			return [];
+		}
+	}
+
+	/** Capture exact source content for a strict fork without granting write ownership. */
+	static captureTranscriptStrict(
+		filePath: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): StrictSessionCaptureResult {
+		const inspected = inspectResumeSessionFile(filePath, storage);
+		if ("kind" in inspected) return inspected;
+		return {
+			kind: "captured",
+			snapshot: {
+				sourcePath: path.resolve(filePath),
+				identity: inspected.identity,
+				content: Uint8Array.from(inspected.content),
+				storage,
+			},
+		};
+	}
+
+	/**
+	 * Fork strictly from captured source bytes. The source pathname is used only to
+	 * revalidate captured authority before destination initialization and transcript
+	 * persistence; destination history always comes from the captured bytes.
+	 */
+	static async forkFromCaptured(
+		snapshot: CapturedSessionTranscriptSnapshot,
+		cwd: string,
+		sessionDir?: string,
+	): Promise<StrictSessionForkResult> {
+		if (crypto.createHash("sha256").update(snapshot.content).digest("hex") !== snapshot.identity.sha256) {
+			return { kind: "error", reason: "identity-mismatch" };
+		}
+
+		let forkEntries: FileEntry[] = [];
+		try {
+			const content = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.content);
+			for (const line of content.split(/\r?\n/)) {
+				if (line.length > 0) JSON.parse(line);
+			}
+			forkEntries = parseSessionEntries(content);
+			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
+			if (sourceHeader?.type !== "session" || sourceHeader.id !== snapshot.identity.sessionId)
+				return { kind: "error", reason: "identity-mismatch" };
+			migrateToCurrentVersion(forkEntries);
+			if (!hasStrictSessionSchema(forkEntries)) return { kind: "error", reason: "malformed" };
+		} catch {
+			return { kind: "error", reason: "malformed" };
+		}
+
+		const revalidated = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
+		if ("kind" in revalidated) return revalidated;
+		if (!sameResumeIdentity(snapshot.identity, revalidated.identity)) {
+			return { kind: "error", reason: "identity-mismatch" };
+		}
+
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, snapshot.storage);
+		const removeSessionDirOnFailure =
+			snapshot.storage instanceof FileSessionStorage && !snapshot.storage.existsSync(dir);
+		let manager: SessionManager | undefined;
+		let authorityFailure: StrictSessionOpenFailure | undefined;
+		try {
+			manager = new SessionManager(cwd, dir, true, snapshot.storage);
+			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
+			manager.#fileEntries = forkEntries;
+			const sourceHeader = manager.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
+			const historyEntries = manager.#fileEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+			manager.#newSessionSync({ parentSession: sourceHeader?.id }, false);
+			manager.#resetResidentTextBlobStore();
+			const newHeader = manager.#fileEntries[0] as SessionHeader;
+			newHeader.title = sourceHeader?.title;
+			newHeader.titleSource = sourceHeader?.titleSource;
+			const residentBlobStores = manager.#residentBlobStores();
+			manager.#fileEntries = [
+				newHeader,
+				...historyEntries.map(entry => prepareEntryForResidentSync(entry, residentBlobStores) as SessionEntry),
+			];
+			manager.#sessionName = newHeader.title;
+			manager.#titleSource = newHeader.titleSource;
+			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
+			manager.#buildIndex();
+			manager.#bumpAllRevisions();
+			const beforeWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
+			if ("kind" in beforeWrite) {
+				authorityFailure = beforeWrite;
+				throw new Error("Captured fork source authority changed before destination write.");
+			}
+			if (!sameResumeIdentity(snapshot.identity, beforeWrite.identity)) {
+				authorityFailure = { kind: "error", reason: "identity-mismatch" };
+				throw new Error("Captured fork source authority changed before destination write.");
+			}
+			await manager.#rewriteFile();
+			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
+			return { kind: "forked", manager };
+		} catch (error) {
+			if (manager) {
+				const sessionFile = manager.#sessionFile;
+				const cleanupErrors: Error[] = [];
+				try {
+					await manager.close();
+				} catch (cleanupError) {
+					cleanupErrors.push(toError(cleanupError));
+				}
+				if (sessionFile) {
+					try {
+						await manager.storage.unlink(sessionFile);
+					} catch (cleanupError) {
+						if (!isEnoent(cleanupError)) cleanupErrors.push(toError(cleanupError));
+					}
+					if (manager.storage instanceof FileSessionStorage) {
+						try {
+							await fs.promises.rm(sessionFile.slice(0, -6), { recursive: true, force: true });
+						} catch (cleanupError) {
+							cleanupErrors.push(toError(cleanupError));
+						}
+						try {
+							const sessionFileName = path.basename(sessionFile);
+							const transientPrefix = `.${sessionFileName}.`;
+							const backupPrefix = `${sessionFileName}.`;
+							for (const name of await fs.promises.readdir(path.dirname(sessionFile))) {
+								if (
+									(name.startsWith(transientPrefix) && name.endsWith(".tmp")) ||
+									(name.startsWith(backupPrefix) && name.endsWith(".bak"))
+								) {
+									await fs.promises.rm(path.join(path.dirname(sessionFile), name), {
+										recursive: true,
+										force: true,
+									});
+								}
+							}
+						} catch (cleanupError) {
+							if (!isEnoent(cleanupError)) cleanupErrors.push(toError(cleanupError));
+						}
+					}
+				}
+				if (removeSessionDirOnFailure) {
+					try {
+						await fs.promises.rmdir(dir);
+					} catch (cleanupError) {
+						const code = (cleanupError as NodeJS.ErrnoException).code;
+						if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST")
+							cleanupErrors.push(toError(cleanupError));
+					}
+				}
+				if (cleanupErrors.length > 0) {
+					throw new Error(`Failed to clean up fork destination: ${cleanupErrors[0]!.message}`, {
+						cause: toError(error),
+					});
+				}
+				if (authorityFailure) return authorityFailure;
+			}
+			throw error;
 		}
 	}
 

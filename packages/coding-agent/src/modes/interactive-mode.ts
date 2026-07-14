@@ -62,7 +62,7 @@ import {
 	scheduleLaunchStarReminderAfterFirstRender,
 	starReminderLaunchGate,
 } from "../reminders/star-reminder";
-import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent, TemporaryProviderSessionScope } from "../session/agent-session";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions } from "../session/session-manager";
@@ -87,6 +87,12 @@ import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
 import { IrcSplitViewComponent } from "./components/irc-sidebar";
+import {
+	getPetUnavailableWarning,
+	isPetAvailable,
+	isPetCapabilityProbePending,
+	warnWhenPetCapabilitySettled,
+} from "./components/pet-capability";
 import { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import {
@@ -389,6 +395,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#cleanupUnsubscribe?: () => void;
 	#subprocessTeardownUnsubscribe?: () => void;
 	#petProtocolUnsubscribe?: () => void;
+	/** Cancels a startup pet-unavailable warning still awaiting probe settlement. */
+	#petUnavailableWarningDisposer?: () => void;
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
 	#planModePreviousTools: string[] | undefined;
@@ -399,6 +407,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#goalSuppressNextContinuation = false;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
+	#planModeProviderSessionScope: TemporaryProviderSessionScope | undefined;
 	#planModeHasEntered = false;
 	#planReviewContainer: Container | undefined;
 	readonly lspServers: LspStartupServerInfo[] | undefined = undefined;
@@ -617,8 +626,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.addChild(this.hookWidgetContainerBelow);
 		this.ui.setBottomPinnedComponent(this.statusLine);
 		this.ui.setFocus(this.editor);
+		this.petWidget?.dispose();
 		this.petWidget = this.#createPetWidget(this.editor);
-		this.petWidget.setMode(settings.get("pet.mode"));
+		const configuredPetMode = settings.get("pet.mode");
+		this.petWidget.setMode(configuredPetMode);
 		// The async sixel capability probe can enable graphics after the saved
 		// pet mode was applied and dropped (no protocol yet at startup).
 		// Re-apply the configured mode when capability arrives so the pet
@@ -631,6 +642,19 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.petWidget.setMode(saved);
 			}
 		});
+		if (configuredPetMode !== "off" && !isPetAvailable()) {
+			// The async Sixel capability probe (started by TUI.start()) may still
+			// enable graphics; warn only once the capability question is settled
+			// so a supported terminal is never told it is incompatible.
+			this.#petUnavailableWarningDisposer?.();
+			this.#petUnavailableWarningDisposer = warnWhenPetCapabilitySettled({
+				probePending: isPetCapabilityProbePending(),
+				onUnavailable: () => {
+					this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+					this.ui.requestRender();
+				},
+			});
+		}
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
@@ -1078,15 +1102,35 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.setTopBorder(undefined);
 	}
 
-	setPetMode(mode: PetMode): void {
-		this.petWidget?.setMode(mode);
+	/**
+	 * Single result-returning pet commit policy shared by every entry path
+	 * (`/pet`, the pet selector, and the Settings submenu). Capability is
+	 * rechecked immediately before mutation, and the preference persists only
+	 * after the commit is accepted.
+	 */
+	#commitPetMode(mode: PetMode, apply: (mode: PetMode) => void): boolean {
+		if (mode !== "off" && !isPetAvailable()) {
+			this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+			this.ui.requestRender();
+			return false;
+		}
+		apply(mode);
 		settings.set("pet.mode", mode);
 		this.ui.requestRender();
+		return true;
+	}
+
+	setPetMode(mode: PetMode): boolean {
+		return this.#commitPetMode(mode, next => this.petWidget?.setMode(next));
 	}
 
 	previewPetMode(mode: PetMode): void {
 		this.petWidget?.previewMode(mode);
 		this.ui.requestRender();
+	}
+
+	commitPetPreviewMode(mode: PetMode): boolean {
+		return this.#commitPetMode(mode, next => this.petWidget?.commitPreviewMode(next));
 	}
 
 	restoreComposer(): void {
@@ -1310,8 +1354,18 @@ export class InteractiveMode implements InteractiveModeContext {
 				return;
 			}
 			try {
-				await this.session.setModelTemporary(resolved.model, planThinkingLevel);
+				this.#planModeProviderSessionScope = this.session.beginTemporaryProviderSessionScope("plan-mode");
+				await this.session.setModelTemporary(resolved.model, planThinkingLevel, {
+					cause: "temporary-operation",
+					reason: "plan-mode",
+					providerSessionScope: this.#planModeProviderSessionScope,
+				});
 			} catch (error) {
+				const scope = this.#planModeProviderSessionScope;
+				if (scope) {
+					this.session.restoreTemporaryProviderSessionScope(scope);
+					this.#planModeProviderSessionScope = undefined;
+				}
 				this.showWarning(
 					`Failed to switch to plan model for plan mode: ${error instanceof Error ? error.message : String(error)}`,
 				);
@@ -1327,8 +1381,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!pending) return;
 		this.#pendingModelSwitch = undefined;
 		try {
-			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
+			this.#planModeProviderSessionScope ??= this.session.beginTemporaryProviderSessionScope("plan-mode");
+			await this.session.setModelTemporary(pending.model, pending.thinkingLevel, {
+				cause: "temporary-operation",
+				reason: "plan-mode",
+				providerSessionScope: this.#planModeProviderSessionScope,
+			});
 		} catch (error) {
+			const scope = this.#planModeProviderSessionScope;
+			if (scope) {
+				this.session.restoreTemporaryProviderSessionScope(scope);
+				this.#planModeProviderSessionScope = undefined;
+			}
 			this.showWarning(
 				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
 			);
@@ -1485,30 +1549,34 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (previousTools && previousTools.length > 0) {
 			await this.session.setActiveToolsByName(previousTools);
 		}
-		if (this.#planModePreviousModelState) {
+		const scope = this.#planModeProviderSessionScope;
+		if (scope && !this.session.isStreaming) {
+			const restored = this.session.restoreTemporaryProviderSessionScope(scope);
+			if (restored) this.#planModeProviderSessionScope = undefined;
+		} else if (this.#planModePreviousModelState) {
 			const prev = this.#planModePreviousModelState;
 			if (modelsAreEqual(this.session.model, prev.model)) {
-				// Same model — only thinking level may differ. Avoid setModelTemporary()
-				// which would reset provider-side sessions (openai-responses/OpenAI code backend) and
-				// break conversation continuity.
 				this.session.setThinkingLevel(prev.thinkingLevel);
 			} else if (this.session.isStreaming) {
 				this.#pendingModelSwitch = { model: prev.model, thinkingLevel: prev.thinkingLevel };
 			} else {
-				await this.session.setModelTemporary(prev.model, prev.thinkingLevel);
+				await this.session.setModelTemporary(prev.model, prev.thinkingLevel, {
+					cause: "restore",
+					reason: "plan-mode",
+				});
 			}
-			// If #applyPlanModeModel queued a deferred switch to the plan-role model
-			// (because the session was streaming on entry), drop it now: we are
-			// leaving plan mode, so flushing it on the next agent_end would land the
-			// session on the plan-role model after the user has exited plan mode
-			// (issue #816). Only clear when the pending target matches the plan-role
-			// model — leave any unrelated user-queued switch intact.
-			const pending = this.#pendingModelSwitch;
-			if (pending) {
-				const planResolution = this.session.resolveRoleModelWithThinking("plan");
-				if (planResolution.model && modelsAreEqual(pending.model, planResolution.model)) {
-					this.#pendingModelSwitch = undefined;
-				}
+		}
+		// If #applyPlanModeModel queued a deferred switch to the plan-role model
+		// (because the session was streaming on entry), drop it now: we are
+		// leaving plan mode, so flushing it on the next agent_end would land the
+		// session on the plan-role model after the user has exited plan mode
+		// (issue #816). Only clear when the pending target matches the plan-role
+		// model — leave any unrelated user-queued switch intact.
+		const pending = this.#pendingModelSwitch;
+		if (pending) {
+			const planResolution = this.session.resolveRoleModelWithThinking("plan");
+			if (planResolution.model && modelsAreEqual(pending.model, planResolution.model)) {
+				this.#pendingModelSwitch = undefined;
 			}
 		}
 		this.session.setStandingResolveHandler?.(null);
@@ -2090,6 +2158,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	stop(): void {
 		this.#petProtocolUnsubscribe?.();
 		this.#petProtocolUnsubscribe = undefined;
+		this.#petUnavailableWarningDisposer?.();
+		this.#petUnavailableWarningDisposer = undefined;
 		this.petWidget?.dispose();
 		this.petWidget = undefined;
 		if (this.loadingAnimation) {
@@ -2223,7 +2293,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		nextEditor.setText(previousText);
 		previousEditor.dispose();
 
-		const petMode = this.petWidget?.mode ?? settings.get("pet.mode");
+		const petMode = settings.get("pet.mode");
 		this.petWidget?.dispose();
 
 		this.editorContainer.clear();

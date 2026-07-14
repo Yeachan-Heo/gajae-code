@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
+import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SdkClient } from "../../src/sdk/client/client";
 
 const tempDirs: string[] = [];
@@ -63,23 +64,19 @@ async function createServer(
 		);
 		return sessions.filter(session => !closedSessionIds.has(session.sessionId as string));
 	}
-	await fs.mkdir(path.join(agentDir, "sdk"), { recursive: true });
-	await Bun.write(
-		path.join(agentDir, "sdk", "broker.json"),
-		JSON.stringify({
-			version: 1,
-			protocolVersion: 3,
-			packageGeneration: "test",
-			ownerId: "test",
-			pid: process.pid,
-			host: "127.0.0.1",
-			port: 1,
-			url: "ws://sdk.example.test",
-			token: "test-token",
-			startedAt: Date.now(),
-			heartbeatAt: Date.now(),
-		}),
-	);
+	await writeBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test",
+		ownerId: "test",
+		pid: process.pid,
+		host: "127.0.0.1",
+		port: 1,
+		url: "ws://sdk.example.test",
+		token: "test-token",
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	});
 	const server = createCoordinatorMcpServer({
 		env: {
 			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,

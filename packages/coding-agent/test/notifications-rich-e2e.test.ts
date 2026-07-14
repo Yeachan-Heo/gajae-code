@@ -133,6 +133,28 @@ async function connectRealPipeline(rich?: { enabled: boolean }): Promise<Harness
 	// which is exactly where registerNotificationRoot points the daemon to scan.
 	const stateRoot = path.join(cwd, ".gjc", "state");
 	const srv = new NotificationServer(sessionId, "tok", stateRoot, true);
+	srv.onSdkFrame((error, inbound) => {
+		if (error || !inbound) return;
+		const frame = JSON.parse(inbound.json) as Record<string, unknown>;
+		if (frame.type !== "event_replay") return;
+		srv.sendTo(
+			inbound.connectionId,
+			JSON.stringify({
+				type: "event_replay_result",
+				id: frame.id,
+				ok: true,
+				generation: 1,
+				lastSeq: 1,
+				events: [
+					{
+						type: "event",
+						name: "identity_header",
+						payload: { type: "identity_header", sessionId, repo: "rich-e2e", branch: "test" },
+					},
+				],
+			}),
+		);
+	});
 	const ep = await srv.start();
 	expect(ep.url).toContain("ws://127.0.0.1:");
 

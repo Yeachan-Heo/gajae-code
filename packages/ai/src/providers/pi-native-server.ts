@@ -56,6 +56,7 @@ const ALLOWED_OPTION_KEYS: ReadonlySet<keyof SimpleStreamOptions> = new Set([
 	"headers",
 	"initiatorOverride",
 	"maxRetryDelayMs",
+	"fallbackManaged",
 	"metadata",
 	"sessionId",
 	"streamFirstEventTimeoutMs",

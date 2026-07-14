@@ -82,7 +82,7 @@ describe("TUI bottom-pinned layout", () => {
 		});
 
 		it("keeps the pinned group on the last row after a viewport resize", async () => {
-			const term = new VirtualTerminal(40, 6);
+			const term = new VirtualTerminal(40, 6, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const header = new LinesComponent(["forge"]);
 			const pinned = new LinesComponent(["status", "composer"]);

@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+	DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
+	parseDefaultModelSelectionRecovery,
+} from "../../../session/default-model-selection";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import type { ControlInput, ControlSurface, ControlValue } from "./operations";
 
@@ -17,6 +21,7 @@ export interface ControlError {
 	code: ControlErrorCode;
 	message: string;
 	currentRevision?: string;
+	details?: ControlValue;
 }
 
 export interface ControlResponse {
@@ -74,8 +79,27 @@ interface IdempotencyEntry {
 }
 const idempotentRequests = new WeakMap<ControlSurface, Map<string, IdempotencyEntry>>();
 
-function failure(id: string, code: ControlErrorCode, message: string, currentRevision?: string): ControlResponse {
-	return { id, ok: false, error: { code, message, ...(currentRevision === undefined ? {} : { currentRevision }) } };
+type PreflightCancellableSurface = ControlSurface & {
+	cancelPendingPreflights?(): void;
+};
+
+function failure(
+	id: string,
+	code: ControlErrorCode,
+	message: string,
+	currentRevision?: string,
+	details?: ControlValue,
+): ControlResponse {
+	return {
+		id,
+		ok: false,
+		error: {
+			code,
+			message,
+			...(currentRevision === undefined ? {} : { currentRevision }),
+			...(details === undefined ? {} : { details }),
+		},
+	};
 }
 
 function isInput(value: unknown): value is ControlInput {
@@ -136,7 +160,7 @@ function invoke(
 		case "todo.replace":
 			return surface.replaceTodo(input.items);
 		case "model.set":
-			return surface.setModel(text(input, "id"));
+			return surface.setModel(text(input, "id"), input.thinkingLevel);
 		case "model.cycle":
 			return surface.cycleModel();
 		case "thinking.set":
@@ -224,10 +248,17 @@ function invoke(
 }
 
 function errorResponse(id: string, row: Operation, error: unknown): ControlResponse {
-	const candidate = error as { code?: unknown; message?: unknown };
+	const candidate = error as { code?: unknown; message?: unknown; recovery?: unknown };
 	const code = typeof candidate?.code === "string" ? candidate.code : undefined;
 	const message = typeof candidate?.message === "string" ? candidate.message : "Control operation failed.";
 	if (error instanceof BusyError) return failure(id, "busy", message);
+	if (code === "default_model_selection_recovery" && row.errorCodes.includes(code)) {
+		const recovery = parseDefaultModelSelectionRecovery(candidate.recovery) ?? {
+			message: DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
+			rollback: { disposition: "unknown" as const, failures: [] },
+		};
+		return failure(id, code, DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE, undefined, recovery);
+	}
 	if (code && (row.errorCodes.includes(code) || SHARED_ERROR_CODES.has(code))) return failure(id, code, message);
 	if (code === "resource_gone" || /not found|gone/i.test(message)) return failure(id, "resource_gone", message);
 	if (code === "unknown_gate") return failure(id, "resource_gone", message);
@@ -326,6 +357,11 @@ export function dispatchControl(
 			failure(request.id, "invalid_input", "confirm: true is required for this destructive operation."),
 		);
 	const work = () => execute(surface, row, request);
+	if (row.sdkId === "turn.abort_and_prompt") {
+		const cancellable = surface as PreflightCancellableSurface;
+		if (Object.hasOwn(cancellable, "cancelPendingPreflights")) cancellable.cancelPendingPreflights?.();
+		return serialize(surface, work);
+	}
 	if (row.idempotency === "idempotent" && request.idempotencyKey) return idempotent(surface, row, request, work);
 	return row.idempotency === "ordered" && row.sdkId !== "retry.now" ? serialize(surface, work) : work();
 }

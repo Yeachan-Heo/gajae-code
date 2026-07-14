@@ -2450,6 +2450,30 @@ describe("AskTool deep-interview recorder persistence", () => {
 		);
 	});
 
+	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {
+		// Regression: a durable workflow-gate emitter now exists for every session and
+		// its isUnattended() is always true. Attended TUI asks must still use the local
+		// selector instead of stranding on emitGate() waiting for a remote responder.
+		const gateEmitter = {
+			isUnattended: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["no"] })),
+		};
+		const select = vi.fn(async () => "yes");
+		const context = createContext({ select });
+		const result = await new AskTool(
+			createSession({ getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		).execute(
+			"call-attended-no-gate",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(gateEmitter.emitGate).not.toHaveBeenCalled();
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(result.details?.selectedOptions).toEqual(["yes"]);
+	});
+
 	it("keeps deepInterview optional and rejects malformed metadata", () => {
 		expect(
 			askSchema.safeParse({ questions: [{ id: "q", question: "Pick?", options: [{ label: "A" }] }] }).success,

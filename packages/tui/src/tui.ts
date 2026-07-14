@@ -279,31 +279,41 @@ function isViewportSensitiveHost(
 	env: Record<string, string | undefined>,
 	platform: NodeJS.Platform,
 	includeNativeWindows: boolean,
+	includeProcessTerminal: boolean,
 ): boolean {
-	return isMultiplexerSession(env) || isWindowsTerminalSession(env) || (includeNativeWindows && platform === "win32");
+	return (
+		isMultiplexerSession(env) ||
+		isWindowsTerminalSession(env) ||
+		includeProcessTerminal ||
+		(includeNativeWindows && platform === "win32")
+	);
 }
 /**
  * True when repainting only the live viewport is safer than clearing/replaying
- * the full transcript. Native Windows console hosts are included even when
- * WT_SESSION is absent because PowerShell/ConPTY launch chains can drop terminal
- * identity variables while keeping the same scroll-jump behavior.
+ * the full transcript. Real process terminals are viewport-sensitive because
+ * their native scrollback position is not observable by the renderer. Native
+ * Windows console hosts are also recognized from platform identity when that
+ * process-terminal capability is unavailable.
  */
 export function shouldUseViewportRepaintForHost(
 	env: Record<string, string | undefined> = Bun.env,
 	platform: NodeJS.Platform = process.platform,
-	options: { includeNativeWindows?: boolean } = {},
+	options: { includeNativeWindows?: boolean; includeProcessTerminal?: boolean } = {},
 ): boolean {
 	const multiplexed = isMultiplexerSession(env);
 	const includeNativeWindows = options.includeNativeWindows ?? true;
+	const includeProcessTerminal = options.includeProcessTerminal ?? false;
 	return (
-		isViewportSensitiveHost(env, platform, includeNativeWindows) &&
+		isViewportSensitiveHost(env, platform, includeNativeWindows, includeProcessTerminal) &&
 		!(multiplexed && useLegacyMultiplexerFullRender(env))
 	);
 }
 
 function useViewportRepaintPath(terminal: Terminal): boolean {
+	if (terminal.isProcessTerminal !== true) return false;
 	return shouldUseViewportRepaintForHost(Bun.env, process.platform, {
-		includeNativeWindows: terminal.isProcessTerminal === true,
+		includeNativeWindows: true,
+		includeProcessTerminal: true,
 	});
 }
 
@@ -319,7 +329,8 @@ function allowsHostNeutralOverflowRepaint(
 }
 
 function shouldPreserveScrollbackOnFullClear(terminal: Terminal): boolean {
-	return isViewportSensitiveHost(Bun.env, process.platform, terminal.isProcessTerminal === true);
+	if (terminal.isProcessTerminal !== true) return false;
+	return isViewportSensitiveHost(Bun.env, process.platform, true, true);
 }
 
 /**
@@ -618,6 +629,7 @@ export class TUI extends Container {
 	#stopped = false;
 	#terminalUnavailable = false;
 	#bottomPinnedComponent: Component | null = null;
+	#pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -962,6 +974,7 @@ export class TUI extends Container {
 				this.requestResizeRender();
 			},
 		);
+		this.flushTerminalCleanup();
 		this.#hideCursor();
 		this.#querySixelSupport();
 		this.#queryCellSize();
@@ -1171,6 +1184,7 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		this.flushTerminalCleanup();
 		this.#clearSixelProbeState();
 		this.#stopped = true;
 		if (this.#renderTimer) {
@@ -1229,7 +1243,7 @@ export class TUI extends Container {
 	 * `PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER=1` to restore the legacy tmux redraw.
 	 */
 	requestResizeRender(): void {
-		this.requestRender(!useViewportRepaintPath(this.terminal) && !isTermuxSession(), "resize");
+		this.requestRender(!useViewportRepaintPath(this.terminal), "resize");
 	}
 
 	requestRender(force = false, source = "unknown"): void {
@@ -2298,11 +2312,9 @@ export class TUI extends Container {
 				viewportRepaint(`terminal height changed (${this.#previousHeight} -> ${height})`);
 				return;
 			}
-			if (!isTermuxSession() && !isMultiplexerSession()) {
-				logRedraw(`terminal height changed (${this.#previousHeight} -> ${height})`);
-				fullRender(true, "terminal height changed");
-				return;
-			}
+			logRedraw(`terminal height changed (${this.#previousHeight} -> ${height})`);
+			fullRender(true, "terminal height changed");
+			return;
 		}
 
 		// Content shrunk below the previous render and no overlays - re-render to clear empty rows
@@ -2357,8 +2369,8 @@ export class TUI extends Container {
 		}
 
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
-		if (firstChanged >= newLines.length && nextLiveViewportTop !== prevViewportTop) {
-			viewportRepaint(`tail shrink changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
+		if (newLines.length < this.#previousLines.length && nextLiveViewportTop !== prevViewportTop) {
+			viewportRepaint(`content contraction changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
 			return;
 		}
 		// All changes are in deleted lines (nothing to render, just clear)
@@ -2602,6 +2614,22 @@ export class TUI extends Container {
 		}
 
 		return { seq, toRow: targetRow };
+	}
+
+	/** Retain terminal cleanup until a write succeeds, even after its component is disposed. */
+	queueTerminalCleanup(payload: string, onDelivered?: () => void): void {
+		this.#pendingTerminalCleanup.push({ payload, onDelivered });
+		this.flushTerminalCleanup();
+	}
+
+	/** Retry queued terminal cleanup after terminal recovery or before shutdown. */
+	flushTerminalCleanup(): void {
+		while (this.#pendingTerminalCleanup.length > 0) {
+			const pending = this.#pendingTerminalCleanup[0];
+			if (!this.#writeTerminal(pending.payload)) return;
+			this.#pendingTerminalCleanup.shift();
+			pending.onDelivered?.();
+		}
 	}
 
 	/**

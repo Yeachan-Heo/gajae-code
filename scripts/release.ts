@@ -14,6 +14,8 @@ import { $, Glob } from "bun";
 const changelogGlob = new Glob("packages/*/CHANGELOG.md");
 const packageJsonGlob = new Glob("packages/*/package.json");
 const cargoTomlGlob = new Glob("crates/*/Cargo.toml");
+const stableVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
+
 
 function git(args: readonly string[]) {
 	return $`git -c core.fsmonitor=false -c core.untrackedCache=false ${args}`;
@@ -23,101 +25,245 @@ function git(args: readonly string[]) {
 // Shared functions
 // =============================================================================
 
-async function watchCI(): Promise<boolean> {
+interface ReleaseRunObservation {
+	databaseId: number;
+	status: "queued" | "in_progress" | "completed" | "waiting" | "requested" | "pending" | "action_required";
+	conclusion: string | null;
+	name: "CI";
+	headSha: string;
+	headBranch: string;
+	event: string;
+}
+
+export interface ReleaseRunJobObservation {
+	databaseId: number;
+	status: string;
+	conclusion: string | null;
+	name: string;
+}
+
+export const STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME = "Finalize stable GitHub Release";
+
+export type StableReleaseFinalizationReceipt =
+	| { outcome: "missing" }
+	| { outcome: "multiple"; jobs: readonly ReleaseRunJobObservation[] }
+	| { outcome: "incomplete"; job: ReleaseRunJobObservation }
+	| { outcome: "skipped"; job: ReleaseRunJobObservation }
+	| { outcome: "cancelled"; job: ReleaseRunJobObservation }
+	| { outcome: "failed"; job: ReleaseRunJobObservation }
+	| { outcome: "success"; job: ReleaseRunJobObservation };
+
+export function classifyStableReleaseFinalizationReceipt(
+	jobs: readonly ReleaseRunJobObservation[],
+): StableReleaseFinalizationReceipt {
+	const finalizationJobs = jobs.filter(job => job.name === STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME);
+	if (finalizationJobs.length === 0) return { outcome: "missing" };
+	if (finalizationJobs.length !== 1) return { outcome: "multiple", jobs: finalizationJobs };
+
+	const [job] = finalizationJobs;
+	if (job === undefined) throw new Error("Expected exactly one stable release finalization job");
+	if (job.status !== "completed") return { outcome: "incomplete", job };
+	if (job.conclusion === "success") return { outcome: "success", job };
+	if (job.conclusion === "skipped") return { outcome: "skipped", job };
+	if (job.conclusion === "cancelled") return { outcome: "cancelled", job };
+	return { outcome: "failed", job };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function outputOf(result: { stdout: Uint8Array; stderr: Uint8Array }): string {
+	return `${Buffer.from(result.stdout).toString()}${Buffer.from(result.stderr).toString()}`.trim();
+}
+
+function parseReleaseRuns(output: string, commitSha: string, expectedTag?: string): ReleaseRunObservation[] {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(output) as unknown;
+	} catch (error) {
+		throw new Error(`Cannot parse CI run query for ${commitSha}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!Array.isArray(raw)) throw new Error(`CI run query for ${commitSha} did not return an array`);
+	const statuses = new Set<ReleaseRunObservation["status"]>([
+		"queued",
+		"in_progress",
+		"completed",
+		"waiting",
+		"requested",
+		"pending",
+		"action_required",
+	]);
+	const observations: ReleaseRunObservation[] = [];
+	for (const entry of raw) {
+		if (!isObject(entry)) throw new Error(`CI run query for ${commitSha} returned a non-object run`);
+		const databaseId = entry.databaseId;
+		const status = entry.status;
+		const conclusion = entry.conclusion;
+		const name = entry.name;
+		const headSha = entry.headSha;
+		const headBranch = entry.headBranch;
+		const event = entry.event;
+		if (typeof databaseId !== "number" || !Number.isSafeInteger(databaseId) || databaseId <= 0) throw new Error(`CI run query for ${commitSha} returned an invalid databaseId`);
+		if (typeof status !== "string" || !statuses.has(status as ReleaseRunObservation["status"])) {
+			throw new Error(`CI run ${databaseId} for ${commitSha} returned an invalid status`);
+		}
+		if (conclusion !== null && typeof conclusion !== "string") {
+			throw new Error(`CI run ${databaseId} for ${commitSha} returned an invalid conclusion`);
+		}
+		if (name !== "CI") throw new Error(`CI run ${databaseId} for ${commitSha} is not the expected CI workflow`);
+		if (headSha !== commitSha) throw new Error(`CI run ${databaseId} does not observe expected commit ${commitSha}`);
+		if (typeof headBranch !== "string" || headBranch.length === 0) {
+			throw new Error(`CI run ${databaseId} for ${commitSha} returned an invalid head branch`);
+		}
+		if (typeof event !== "string" || event.length === 0) throw new Error(`CI run ${databaseId} for ${commitSha} returned an invalid event`);
+		if (expectedTag !== undefined && (headBranch !== expectedTag || event !== "push")) {
+			throw new Error(`CI run ${databaseId} is not the expected push of release tag ${expectedTag}`);
+		}
+		observations.push({ databaseId, status: status as ReleaseRunObservation["status"], conclusion, name, headSha, headBranch, event });
+	}
+	return observations;
+}
+
+function parseReleaseRunJobs(output: string, runId: number): ReleaseRunJobObservation[] {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(output) as unknown;
+	} catch (error) {
+		throw new Error(`Cannot parse jobs for CI run ${runId}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!isObject(raw) || !Array.isArray(raw.jobs)) throw new Error(`CI run ${runId} jobs query did not return a jobs array`);
+	return raw.jobs.map((entry, index) => {
+		if (!isObject(entry)) throw new Error(`CI run ${runId} jobs[${index}] is not an object`);
+		const databaseId = entry.databaseId;
+		const status = entry.status;
+		const conclusion = entry.conclusion;
+		const name = entry.name;
+		if (typeof databaseId !== "number" || !Number.isSafeInteger(databaseId) || databaseId <= 0) throw new Error(`CI run ${runId} jobs[${index}] has an invalid databaseId`);
+		if (typeof status !== "string" || status.length === 0) throw new Error(`CI run ${runId} jobs[${index}] has an invalid status`);
+		if (conclusion !== null && typeof conclusion !== "string") throw new Error(`CI run ${runId} jobs[${index}] has an invalid conclusion`);
+		if (typeof name !== "string" || name.length === 0) throw new Error(`CI run ${runId} jobs[${index}] has an invalid name`);
+		return { databaseId, status, conclusion, name };
+	});
+}
+
+async function queryReleaseRuns(commitSha: string, expectedTag?: string): Promise<ReleaseRunObservation[]> {
+	const result = expectedTag === undefined
+		? await $`gh run list --workflow ci.yml --commit ${commitSha} --json databaseId,status,conclusion,name,headSha,headBranch,event`.quiet().nothrow()
+		: await $`gh run list --workflow ci.yml --branch ${expectedTag} --commit ${commitSha} --json databaseId,status,conclusion,name,headSha,headBranch,event`.quiet().nothrow();
+	if (result.exitCode !== 0) throw new Error(`Cannot query CI runs for ${commitSha}: ${outputOf(result) || `exit ${result.exitCode ?? "unknown"}`}`);
+	return parseReleaseRuns(result.stdout.toString(), commitSha, expectedTag);
+}
+
+async function queryReleaseRunJobs(runId: number): Promise<ReleaseRunJobObservation[]> {
+	const result = await $`gh run view ${runId} --json jobs`.quiet().nothrow();
+	if (result.exitCode !== 0) throw new Error(`Cannot query jobs for CI run ${runId}: ${outputOf(result) || `exit ${result.exitCode ?? "unknown"}`}`);
+	return parseReleaseRunJobs(result.stdout.toString(), runId);
+}
+
+async function failedJobLog(jobId: number): Promise<string> {
+	const result = await $`gh run view --job ${jobId} --log-failed`.quiet().nothrow();
+	if (result.exitCode !== 0) throw new Error(`Cannot query failed log for CI job ${jobId}: ${outputOf(result) || `exit ${result.exitCode ?? "unknown"}`}`);
+	return result.stdout.toString().trim();
+}
+
+async function printFailedJobLog(job: ReleaseRunJobObservation): Promise<void> {
+	const log = await failedJobLog(job.databaseId);
+	if (!log) return;
+	const tail = log.split("\n").slice(-20).join("\n");
+	console.error(`\n--- Last 20 lines of ${job.name} ---\n${tail}\n`);
+}
+
+async function reportStableReleaseFinalizationFailure(
+	run: ReleaseRunObservation,
+	receipt: Exclude<StableReleaseFinalizationReceipt, { outcome: "success" }>,
+): Promise<void> {
+	const runReference = `CI run ${run.databaseId} for release tag ${run.headBranch}`;
+	switch (receipt.outcome) {
+		case "missing":
+			console.error(`\nRelease finalization missing:\n  - ${runReference} did not contain required job "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". The GitHub Release was not confirmed final; inspect and rerun this CI workflow.`);
+			return;
+		case "multiple":
+			console.error(`\nRelease finalization ambiguous:\n  - ${runReference} contained ${receipt.jobs.length} jobs named "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". The GitHub Release was not confirmed final; inspect the CI workflow.`);
+			return;
+		case "incomplete":
+			console.error(`\nRelease finalization incomplete:\n  - ${runReference} reported "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}" as ${receipt.job.status}. The GitHub Release was not confirmed final; inspect and rerun this CI workflow.`);
+			return;
+		case "skipped":
+			console.error(`\nRelease finalization skipped:\n  - ${runReference} skipped "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". Its release gates did not complete, so do not treat the tag as released; inspect the CI workflow.`);
+			return;
+		case "cancelled":
+			console.error(`\nRelease finalization cancelled:\n  - ${runReference} cancelled "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". The GitHub Release was not confirmed final; inspect and rerun this CI workflow.`);
+			await printFailedJobLog(receipt.job);
+			return;
+		case "failed":
+			console.error(`\nRelease finalization failed:\n  - ${runReference} concluded "${receipt.job.conclusion ?? "unknown"}" for "${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}". The GitHub Release was not confirmed final; inspect the failed job log.`);
+			await printFailedJobLog(receipt.job);
+			return;
+	}
+}
+
+async function watchCI(expectedTag?: string): Promise<boolean> {
 	const commitSha = (await git(["rev-parse", "HEAD"]).text()).trim();
+	if (!/^[0-9a-f]{40}$/u.test(commitSha)) throw new Error("Cannot resolve the current commit for CI observation");
 	console.log(`  Commit: ${commitSha.slice(0, 8)}`);
+	if (expectedTag !== undefined) console.log(`  Release tag: ${expectedTag}`);
 
 	while (true) {
-		const runsOutput = await $`gh run list --commit ${commitSha} --json databaseId,status,conclusion,name`.text();
-		const runs: Array<{ databaseId: number; status: string; conclusion: string | null; name: string }> =
-			JSON.parse(runsOutput);
-
+		const runs = await queryReleaseRuns(commitSha, expectedTag);
 		if (runs.length === 0) {
 			console.log("  Waiting for CI to start...");
 			await Bun.sleep(3000);
 			continue;
 		}
 
-		// Check job-level status for in-progress runs (fail fast on first job failure)
-		const failedJobs: Array<{ workflow: string; job: string; jobId: number; conclusion: string }> = [];
-		const inProgressRuns = runs.filter((r) => r.status === "in_progress" || r.status === "queued");
-
-		for (const run of inProgressRuns) {
-			const jobsOutput =
-				await $`gh run view ${run.databaseId} --json jobs`.quiet().nothrow().text();
-			try {
-				const { jobs } = JSON.parse(jobsOutput) as {
-					jobs: Array<{ name: string; databaseId: number; status: string; conclusion: string | null }>;
-				};
-				for (const job of jobs) {
-					if (job.status === "completed" && job.conclusion !== "success" && job.conclusion !== "skipped") {
-						failedJobs.push({
-							workflow: run.name,
-							job: job.name,
-							jobId: job.databaseId,
-							conclusion: job.conclusion ?? "unknown",
-						});
-					}
+		const failedJobs: Array<{ workflow: string; job: ReleaseRunJobObservation }> = [];
+		for (const run of runs.filter(run => run.status !== "completed")) {
+			for (const job of await queryReleaseRunJobs(run.databaseId)) {
+				if (job.status === "completed" && job.conclusion !== "success" && job.conclusion !== "skipped") {
+					failedJobs.push({ workflow: run.name, job });
 				}
-			} catch {
-				// Ignore parse errors
 			}
 		}
 
 		if (failedJobs.length > 0) {
 			console.error("\nCI job failed:");
-			for (const f of failedJobs) {
-				console.error(`  - ${f.workflow} / ${f.job} (job ${f.jobId}): ${f.conclusion}`);
-				// Tail the failed job's log
-				const log = await $`gh run view --job ${f.jobId} --log-failed`.quiet().nothrow().text();
-				if (log.trim()) {
-					const lines = log.trimEnd().split("\n");
-					const tail = lines.slice(-20).join("\n");
-					console.error(`\n--- Last 20 lines of ${f.job} ---\n${tail}\n`);
-				}
+			for (const { workflow, job } of failedJobs) {
+				console.error(`  - ${workflow} / ${job.name} (job ${job.databaseId}): ${job.conclusion ?? "unknown"}`);
+				await printFailedJobLog(job);
 			}
 			return false;
 		}
 
-		// Check workflow-level status
-		const pending = runs.filter((r) => r.status !== "completed");
-		const failed = runs.filter((r) => r.status === "completed" && r.conclusion !== "success");
-		const passed = runs.filter((r) => r.status === "completed" && r.conclusion === "success");
-
+		const pending = runs.filter(run => run.status !== "completed");
+		const failed = runs.filter(run => run.status === "completed" && run.conclusion !== "success");
+		const passed = runs.filter(run => run.status === "completed" && run.conclusion === "success");
 		console.log(`  ${passed.length} passed, ${pending.length} pending, ${failed.length} failed`);
 
 		if (failed.length > 0) {
 			console.error("\nCI failed:");
-			for (const r of failed) {
-				console.error(`  - ${r.name}: ${r.conclusion}`);
-				// Fetch failed jobs and tail their logs
-				const jobsOutput = await $`gh run view ${r.databaseId} --json jobs`.quiet().nothrow().text();
-				try {
-					const { jobs } = JSON.parse(jobsOutput) as {
-						jobs: Array<{ name: string; databaseId: number; status: string; conclusion: string | null }>;
-					};
-					for (const job of jobs) {
-						if (job.conclusion !== "success" && job.conclusion !== "skipped") {
-							const log = await $`gh run view --job ${job.databaseId} --log-failed`.quiet().nothrow().text();
-							if (log.trim()) {
-								const lines = log.trimEnd().split("\n");
-								const tail = lines.slice(-20).join("\n");
-								console.error(`\n--- Last 20 lines of ${job.name} (job ${job.databaseId}) ---\n${tail}\n`);
-							}
-						}
-					}
-				} catch {
-					// Ignore parse errors
+			for (const run of failed) {
+				console.error(`  - ${run.name}: ${run.conclusion}`);
+				for (const job of await queryReleaseRunJobs(run.databaseId)) {
+					if (job.conclusion !== "success" && job.conclusion !== "skipped") await printFailedJobLog(job);
 				}
 			}
 			return false;
 		}
 
 		if (pending.length === 0) {
+			if (expectedTag !== undefined) {
+				for (const run of passed) {
+					const receipt = classifyStableReleaseFinalizationReceipt(await queryReleaseRunJobs(run.databaseId));
+					if (receipt.outcome !== "success") {
+						await reportStableReleaseFinalizationFailure(run, receipt);
+						return false;
+					}
+				}
+			}
 			console.log("  All CI checks passed!\n");
 			return true;
 		}
-
 		await Bun.sleep(5000);
 	}
 }
@@ -169,11 +315,16 @@ async function cmdWatch(): Promise<void> {
 	process.exit(success ? 0 : 1);
 }
 
+export function isStableReleaseVersion(version: string): boolean {
+	return stableVersionPattern.test(version);
+}
+
 function parseVersion(v: string): [number, number, number] {
-	const match = v.replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)/);
-	if (!match) throw new Error(`Invalid version: ${v}`);
+	const match = v.match(/^v?((?:0|[1-9]\d*))\.((?:0|[1-9]\d*))\.((?:0|[1-9]\d*))$/u);
+	if (!match) throw new Error(`Invalid stable version: ${v}`);
 	return [parseInt(match[1]), parseInt(match[2]), parseInt(match[3])];
 }
+
 
 function compareVersions(a: string, b: string): number {
 	const [aMajor, aMinor, aPatch] = parseVersion(a);
@@ -182,6 +333,118 @@ function compareVersions(a: string, b: string): number {
 	if (aMinor !== bMinor) return aMinor - bMinor;
 	return aPatch - bPatch;
 }
+async function assertImmutableNewTag(version: string): Promise<void> {
+	const tag = `v${version}`;
+	const local = await git(["show-ref", "--verify", "--quiet", `refs/tags/${tag}`]).quiet().nothrow();
+	if (local.exitCode === 0) {
+		throw new Error(`Refusing to reuse existing local tag ${tag}; corrections require a newer version`);
+	}
+	const remote = await git(["ls-remote", "--tags", "origin", `refs/tags/${tag}`, `refs/tags/${tag}^{}`]).quiet().nothrow();
+	if (remote.exitCode !== 0) throw new Error(`Cannot verify immutable remote tag ${tag}`);
+	if (remote.stdout.toString().trim() !== "") {
+		throw new Error(`Refusing to reuse existing remote tag ${tag}; corrections require a newer version`);
+	}
+}
+
+async function fetchRemoteTags(): Promise<void> {
+	const result = await git(["fetch", "--quiet", "origin", "--tags"]).quiet().nothrow();
+	if (result.exitCode !== 0) throw new Error(`Cannot fetch remote tags from origin: ${outputOf(result) || `exit ${result.exitCode ?? "unknown"}`}`);
+}
+
+export function releaseAtomicPushArgs(version: string): readonly string[] {
+	if (!isStableReleaseVersion(version)) throw new Error(`Release version must be exact stable X.Y.Z, received ${version}`);
+	const tag = `v${version}`;
+	return ["push", "--atomic", "origin", "HEAD:refs/heads/main", `refs/tags/${tag}:refs/tags/${tag}`];
+}
+
+export function assertAtomicPushRemoteState(output: string, sourceCommit: string, tag: string): void {
+	const mainRef = "refs/heads/main";
+	const tagRef = `refs/tags/${tag}`;
+	const peeledTagRef = `${tagRef}^{}`;
+	const expectedRefs = new Set([mainRef, tagRef, peeledTagRef]);
+	const observed = new Map<string, string>();
+	for (const line of output.trim().split("\n")) {
+		if (line === "") continue;
+		const fields = line.split("\t");
+		if (fields.length !== 2 || !/^[0-9a-f]{40}$/u.test(fields[0]!) || !expectedRefs.has(fields[1]!)) {
+			throw new Error(`Cannot verify atomic release push: malformed ls-remote output ${JSON.stringify(line)}`);
+		}
+		if (observed.has(fields[1]!)) throw new Error(`Cannot verify atomic release push: duplicate ref ${fields[1]!}`);
+		observed.set(fields[1]!, fields[0]!);
+	}
+	if (observed.get(mainRef) !== sourceCommit) {
+		throw new Error(`Cannot verify atomic release push: ${mainRef} does not resolve to the release commit`);
+	}
+	const remoteTag = observed.get(tagRef);
+	if (remoteTag === undefined) {
+		throw new Error(`Cannot verify atomic release push: ${tagRef} is missing`);
+	}
+	if ((observed.get(peeledTagRef) ?? remoteTag) !== sourceCommit) {
+		throw new Error(`Cannot verify atomic release push: ${tagRef} does not peel to the release commit`);
+	}
+}
+
+async function pushReleaseRefsAtomically(version: string): Promise<void> {
+	const sourceCommit = (await git(["rev-parse", "HEAD"]).text()).trim();
+	if (!/^[0-9a-f]{40}$/u.test(sourceCommit)) throw new Error("Cannot resolve release commit for atomic push");
+	const push = await git(releaseAtomicPushArgs(version)).quiet().nothrow();
+	if (push.exitCode !== 0) {
+		throw new Error(`Atomic push of main and v${version} was rejected; neither ref may be retried independently: ${outputOf(push) || `exit ${push.exitCode ?? "unknown"}`}`);
+	}
+	const tag = `v${version}`;
+	const remote = await git(["ls-remote", "origin", "refs/heads/main", `refs/tags/${tag}`, `refs/tags/${tag}^{}`]).quiet().nothrow();
+	if (remote.exitCode !== 0) {
+		throw new Error(`Cannot verify atomic release push; do not independently push main or ${tag}: ${outputOf(remote) || `exit ${remote.exitCode ?? "unknown"}`}`);
+	}
+	assertAtomicPushRemoteState(remote.stdout.toString(), sourceCommit, tag);
+}
+
+async function latestVerifiedRemoteStableTag(): Promise<string> {
+	const result = await git(["ls-remote", "--tags", "origin", "refs/tags/v*"]).quiet().nothrow();
+	if (result.exitCode !== 0) throw new Error(`Cannot verify remote stable tags: ${outputOf(result) || `exit ${result.exitCode ?? "unknown"}`}`);
+	const tags = new Set<string>();
+	for (const line of result.stdout.toString().trim().split("\n")) {
+		if (line === "") continue;
+		const fields = line.split("\t");
+		if (fields.length !== 2 || !/^[0-9a-f]{40}$/u.test(fields[0]!)) {
+			throw new Error(`Cannot verify remote stable tags: malformed ls-remote output ${JSON.stringify(line)}`);
+		}
+		const match = fields[1]!.match(/^refs\/tags\/(v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))(?:\^\{\})?$/u);
+		if (match) tags.add(match[1]!);
+	}
+	if (tags.size === 0) throw new Error("No stable vX.Y.Z tag exists on origin to compare against");
+	return [...tags].reduce((latest, tag) => compareVersions(tag, latest) > 0 ? tag : latest);
+}
+
+async function assertReleaseVersionConsistency(version: string, publicPkgPaths: readonly string[]): Promise<void> {
+	const publicPackageNames: string[] = [];
+	for (const pkgPath of publicPkgPaths) {
+		const manifest = await Bun.file(pkgPath).json() as unknown;
+		if (!isObject(manifest) || typeof manifest.name !== "string" || typeof manifest.version !== "string" || manifest.private === true) {
+			throw new Error(`Cannot verify public package release version in ${pkgPath}`);
+		}
+		if (manifest.version !== version) throw new Error(`Public package ${manifest.name} in ${pkgPath} has version ${manifest.version}, expected ${version}`);
+		publicPackageNames.push(manifest.name);
+	}
+
+	const rootPackage = await Bun.file("package.json").json() as unknown;
+	if (!isObject(rootPackage) || !isObject(rootPackage.workspaces) || !isObject(rootPackage.workspaces.catalog)) {
+		throw new Error("Cannot verify root workspace catalog release versions");
+	}
+	const catalog = rootPackage.workspaces.catalog;
+	for (const [name, catalogVersion] of Object.entries(catalog)) {
+		if (!name.startsWith("@gajae-code/")) continue;
+		if (catalogVersion !== version) throw new Error(`Root catalog ${name} has version ${String(catalogVersion)}, expected ${version}`);
+	}
+	for (const name of publicPackageNames.filter(name => name.startsWith("@gajae-code/"))) {
+		if (catalog[name] !== version) throw new Error(`Root catalog does not match public package ${name} at ${version}`);
+	}
+
+	const cargoToml = await Bun.file("Cargo.toml").text();
+	const workspaceVersion = cargoToml.match(/^\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m)?.[1];
+	if (workspaceVersion !== version) throw new Error(`Cargo workspace version ${workspaceVersion ?? "<missing>"} does not match ${version}`);
+}
+
 
 async function cmdRelease(version: string): Promise<void> {
 	console.log("\n=== Release Script ===\n");
@@ -204,12 +467,17 @@ async function cmdRelease(version: string): Promise<void> {
 	}
 	console.log("  Working directory clean");
 
-	const latestTag = (await git(["describe", "--tags", "--abbrev=0"]).text()).trim();
-	if (compareVersions(version, latestTag) <= 0) {
-		console.error(`Error: Version ${version} must be greater than latest tag ${latestTag}`);
-		process.exit(1);
+	if (!isStableReleaseVersion(version)) {
+		throw new Error(`Release version must be exact stable X.Y.Z, received ${version}`);
 	}
-	console.log(`  Version ${version} > ${latestTag}\n`);
+	await fetchRemoteTags();
+	await assertImmutableNewTag(version);
+	const latestTag = await latestVerifiedRemoteStableTag();
+	if (compareVersions(version, latestTag) <= 0) {
+		throw new Error(`Version ${version} must be greater than latest stable tag ${latestTag}`);
+	}
+	console.log(`  Version ${version} > verified origin tag ${latestTag}; tag v${version} is unused locally and on origin\n`);
+
 
 	// 2. Update package versions
 	console.log(`Updating package versions to ${version}…`);
@@ -267,6 +535,8 @@ async function cmdRelease(version: string): Promise<void> {
 			}
 		}
 	}
+	await assertReleaseVersionConsistency(version, publicPkgPaths);
+	console.log("  All public package, Cargo workspace, and @gajae-code catalog versions match");
 	console.log();
 
 	// 3b. Rename the pi-natives version sentinel so any `.node` left on disk from
@@ -328,30 +598,30 @@ async function cmdRelease(version: string): Promise<void> {
 
 	// 7. Commit and tag
 	console.log("Committing and tagging...");
-	await git(["add", "."]);
+	await git(["add", "--update"]);
 	await git(["commit", "-m", `chore: bump version to ${version}`]);
-	await git(["tag", `v${version}`]);
+	await git(["tag", "--no-sign", `v${version}`]);
 	console.log();
 
 	// 8. Push
 	console.log("Pushing to remote...");
-	await git(["push", "origin", "main"]);
-	await git(["push", "origin", `v${version}`]);
+	await pushReleaseRefsAtomically(version);
 	console.log();
 
 	// 9. Watch CI
 	console.log("Watching CI...");
-	const success = await watchCI();
+	const success = await watchCI(`v${version}`);
 
 	if (success) {
 		console.log(`=== Released v${version} ===`);
 	} else {
-		console.log("\nTo retry after fixing (repeat until CI passes):");
-		console.log("  git commit -m \"fix: <brief description>\"");
-		console.log("  git push origin main");
-		console.log(`  git tag -f v${version} && git push origin v${version} --force`);
-		console.log("  bun scripts/release.ts watch");
+		console.error("\nStable release correction required:");
+		console.error("  Keep the published tag immutable; do not retag, delete, or force-push it.");
+		console.error("  Commit the fix, choose a newer X.Y.Z version, and run the release script again.");
+		console.error("  Partial or conflicting npm publication cannot be repaired in place.");
+		console.error("  bun scripts/release.ts <newer-version>");
 		process.exit(1);
+
 	}
 }
 
@@ -359,23 +629,36 @@ async function cmdRelease(version: string): Promise<void> {
 // Main
 // =============================================================================
 
-const arg = process.argv[2];
+export type ReleaseCli = { mode: "watch" } | { mode: "release"; version: string };
 
-if (!arg) {
-	console.error("Usage:");
-	console.error("  bun scripts/release.ts <version>   Full release");
-	console.error("  bun scripts/release.ts watch       Watch CI for current commit");
-	process.exit(1);
+export function parseReleaseCli(argv: readonly string[]): ReleaseCli {
+	if (argv.length !== 1) throw new Error("Release accepts exactly one argument: watch or an exact stable X.Y.Z version");
+	const [argument] = argv;
+	if (argument === "watch") return { mode: "watch" };
+	if (argument !== undefined && isStableReleaseVersion(argument)) return { mode: "release", version: argument };
+	throw new Error(`Unknown command or invalid version: ${argument ?? "<missing>"}`);
 }
 
-if (arg === "watch") {
-	await cmdWatch();
-} else if (/^\d+\.\d+\.\d+/.test(arg)) {
-	await cmdRelease(arg);
-} else {
-	console.error(`Unknown command or invalid version: ${arg}`);
+function printUsage(): void {
 	console.error("Usage:");
 	console.error("  bun scripts/release.ts <version>   Full release");
 	console.error("  bun scripts/release.ts watch       Watch CI for current commit");
-	process.exit(1);
+}
+
+if (import.meta.main) {
+	let command: ReleaseCli | undefined;
+	try {
+		command = parseReleaseCli(process.argv.slice(2));
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		printUsage();
+		process.exitCode = 1;
+	}
+	if (command !== undefined) {
+		if (command.mode === "watch") {
+			await cmdWatch();
+		} else {
+			await cmdRelease(command.version);
+		}
+	}
 }

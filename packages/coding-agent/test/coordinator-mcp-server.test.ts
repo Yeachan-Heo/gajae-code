@@ -4,7 +4,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../src/coordinator-mcp/server";
-import type { SdkClient } from "../src/sdk/client/client";
+import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
 
 const tempDirs: string[] = [];
 
@@ -32,6 +33,13 @@ function brokerEndpointIncarnation(
 }
 
 type EndpointRequestHandler = (input: Record<string, unknown>, sessions: Array<Record<string, unknown>>) => unknown;
+type SdkControlServerOptions = {
+	platform?: NodeJS.Platform;
+	canonicalizePath?: (value: string) => Promise<string>;
+	controlResult?: (control: SdkControl) => unknown;
+	promptAckTimeoutMs?: number;
+	controlOptions?: Array<{ idempotencyKey?: string; timeoutMs?: number }>;
+};
 function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	return controls.filter(
 		control => control.operation !== "session.list" && control.operation !== "session.get_endpoint",
@@ -68,6 +76,7 @@ async function createSdkControlServer(
 	],
 	sessionCommand?: string,
 	endpointRequestHandler?: EndpointRequestHandler,
+	serverOptions: SdkControlServerOptions = {},
 ): Promise<ReturnType<typeof createCoordinatorMcpServer>> {
 	const stateRoot = path.join(root, ".gjc", "coordinator-state");
 	const agentDir = path.join(root, "agent-global");
@@ -80,19 +89,32 @@ async function createSdkControlServer(
 			GJC_COORDINATOR_MCP_PROFILE: "local",
 			GJC_COORDINATOR_MCP_REPO: "repo",
 			...(sessionCommand ? { GJC_COORDINATOR_MCP_SESSION_COMMAND: sessionCommand } : {}),
+			...(serverOptions.promptAckTimeoutMs === undefined
+				? {}
+				: { GJC_COORDINATOR_MCP_PROMPT_ACK_TIMEOUT_MS: String(serverOptions.promptAckTimeoutMs) }),
 		},
+		platform: serverOptions.platform,
 		services: {
 			getAgentDir: () => agentDir,
 			resolveModelProfiles: () => new Map([["codex-eco", { name: "codex-eco" }]]),
+			canonicalizePath: serverOptions.canonicalizePath,
 			connectSdk: async () =>
 				({
 					control: async (
 						operation: string,
 						input: Record<string, unknown>,
-						options: { idempotencyKey?: string },
+						options: { idempotencyKey?: string; timeoutMs?: number },
 					) => {
-						controls.push({ operation, input, idempotencyKey: options.idempotencyKey });
-						return { accepted: true, turn_id: `sdk-${controls.length}` };
+						const control = { operation, input, idempotencyKey: options.idempotencyKey };
+						controls.push(control);
+						serverOptions.controlOptions?.push(options);
+						return (
+							serverOptions.controlResult?.(control) ?? {
+								accepted: true,
+								command_id: `sdk-command-${controls.length}`,
+								turn_id: `sdk-turn-${controls.length}`,
+							}
+						);
 					},
 					global: async (
 						operation: string,
@@ -170,23 +192,19 @@ async function createSdkControlServer(
 		},
 	});
 	await fs.mkdir(path.join(root, ".gjc", "state", "sdk"), { recursive: true });
-	await fs.mkdir(path.join(agentDir, "sdk"), { recursive: true });
-	await Bun.write(
-		path.join(agentDir, "sdk", "broker.json"),
-		JSON.stringify({
-			version: 1,
-			protocolVersion: 3,
-			packageGeneration: "test",
-			ownerId: "test",
-			pid: process.pid,
-			host: "127.0.0.1",
-			port: 1,
-			url: "ws://sdk.example.test",
-			token: "broker-discovery-secret",
-			startedAt: Date.now(),
-			heartbeatAt: Date.now(),
-		}),
-	);
+	await writeBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test",
+		ownerId: "test",
+		pid: process.pid,
+		host: "127.0.0.1",
+		port: 1,
+		url: "ws://sdk.example.test",
+		token: "broker-discovery-secret",
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	});
 	await Bun.write(
 		path.join(root, ".gjc", "state", "sdk", "visible-session.json"),
 		JSON.stringify({ url: "ws://sdk.example.test", token: "session-endpoint-secret" }),
@@ -261,6 +279,262 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			},
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
 		]);
+	});
+	it("marks lifecycle-created sessions ready after successful SDK lifecycle binding", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "ready-after-binding",
+			allow_mutation: true,
+		});
+
+		expect(started).toMatchObject({
+			ok: true,
+			session: { session_id: "created-session-1" },
+			session_state: { state: "ready_for_input", ready_for_input: true },
+		});
+		expect(controls.map(control => control.operation)).toEqual([
+			"session.create",
+			"session.list",
+			"session.get_endpoint",
+		]);
+	});
+
+	it("preserves multiline delegated task text in one SDK turn.prompt control", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const task = "first line\n\n  exact indentation\nlast line";
+
+		const delegated = await server.callTool("gjc_delegate_execute", {
+			cwd: root,
+			session_id: "visible-session",
+			task,
+			idempotency_key: "multiline-delegation",
+			allow_mutation: true,
+		});
+
+		expect(delegated).toMatchObject({ ok: true, workflow: "execute" });
+		const promptControls = controls.filter(control => control.operation === "turn.prompt");
+		expect(promptControls).toHaveLength(1);
+		expect(promptControls[0]).toEqual(
+			expect.objectContaining({
+				input: { text: expect.stringContaining(`Task:\n${task}\n\nReturn durable status`) },
+			}),
+		);
+	});
+
+	it("normalizes camelCase runtime acknowledgement identities into durable and public turns", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: () => ({
+				type: "control_response",
+				id: "runtime-ack-1",
+				ok: true,
+				result: { accepted: true, commandId: "runtime-command-1", turnId: "runtime-turn-1" },
+			}),
+		});
+		await registerSdkSession(server, root);
+
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "acknowledged work",
+			idempotency_key: "camel-ack",
+			allow_mutation: true,
+		});
+
+		expect(sent).toMatchObject({
+			ok: true,
+			result: { accepted: true, command_id: "runtime-command-1", turn_id: "runtime-turn-1" },
+			turn: {
+				delivery: { runtime_command_id: "runtime-command-1", runtime_turn_id: "runtime-turn-1" },
+			},
+		});
+		const turnId = sent.turn_id;
+		if (typeof turnId !== "string") throw new Error("missing durable coordinator turn id");
+		const persisted = JSON.parse(
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${turnId}.json`),
+				"utf8",
+			),
+		) as { delivery: Record<string, unknown> };
+		expect(persisted.delivery).toMatchObject({
+			runtime_command_id: "runtime-command-1",
+			runtime_turn_id: "runtime-turn-1",
+		});
+	});
+
+	it("accepts drive-letter and separator differences through the injected Windows platform seam", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const canonicalWorkspace = "C:\\Workspaces\\Coordinator\\Repo";
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			undefined,
+			[
+				{
+					sessionId: "visible-session",
+					locator: { repo: "c:/workspaces/coordinator/repo" },
+					live: true,
+					endpointGeneration: 1,
+					pid: 101,
+					endpointMtimeMs: 1,
+				},
+			],
+			undefined,
+			undefined,
+			{
+				platform: "win32",
+				canonicalizePath: async value => path.win32.normalize(value === root ? canonicalWorkspace : value),
+			},
+		);
+		const registered = await registerSdkSession(server, root);
+		expect(registered).toMatchObject({ ok: true, session: { cwd: canonicalWorkspace } });
+		expect(await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" })).toMatchObject({
+			ok: true,
+			status: { live: true },
+		});
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "case-safe workspace",
+				idempotency_key: "windows-case-safe",
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: true });
+	});
+
+	it("fails closed before turn persistence for malformed acknowledgement envelopes and conflicting aliases", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const acknowledgements: Record<string, unknown> = {
+			"missing-acceptance": { commandId: "runtime-command-1", turnId: "runtime-turn-1" },
+			"malformed-identity": { accepted: true, commandId: "invalid/runtime-command", turnId: "runtime-turn-2" },
+			"envelope-without-ok": {
+				result: { accepted: true, commandId: "runtime-command-1", turnId: "runtime-turn-1" },
+			},
+			"envelope-without-result": {
+				ok: true,
+				accepted: true,
+				commandId: "runtime-command-1",
+				turnId: "runtime-turn-1",
+			},
+			"envelope-with-error": {
+				ok: true,
+				result: { accepted: true, commandId: "runtime-command-1", turnId: "runtime-turn-1" },
+				error: { code: "unavailable" },
+			},
+			"envelope-error-only": { error: { code: "unavailable" } },
+			"conflicting-command-aliases": {
+				ok: true,
+				result: {
+					accepted: true,
+					commandId: "runtime-command-1",
+					command_id: "runtime-command-2",
+					turnId: "runtime-turn-1",
+				},
+			},
+			"conflicting-turn-aliases": {
+				accepted: true,
+				commandId: "runtime-command-1",
+				turnId: "runtime-turn-1",
+				turn_id: "runtime-turn-2",
+			},
+			"follow-up-without-turn": { accepted: true, commandId: "runtime-command-1" },
+		};
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control => acknowledgements[control.idempotencyKey ?? ""],
+		});
+		await registerSdkSession(server, root);
+
+		for (const [idempotencyKey, queue] of [
+			["missing-acceptance", false],
+			["malformed-identity", false],
+			["envelope-without-ok", false],
+			["envelope-without-result", false],
+			["envelope-with-error", false],
+			["envelope-error-only", false],
+			["conflicting-command-aliases", false],
+			["conflicting-turn-aliases", false],
+			["follow-up-without-turn", true],
+		] as const) {
+			expect(
+				await server.callTool("gjc_coordinator_send_prompt", {
+					session_id: "visible-session",
+					prompt: "must not be recorded",
+					idempotency_key: idempotencyKey,
+					...(queue ? { queue: true } : {}),
+					allow_mutation: true,
+				}),
+			).toMatchObject({ ok: false, error: { code: "unavailable" } });
+		}
+		expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(8);
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(1);
+		await expect(
+			fs.readdir(path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns")),
+		).rejects.toMatchObject({ code: "ENOENT" });
+	});
+	it("passes the bounded acknowledgement timeout to the SDK and surfaces timeout errors", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const controlOptions: Array<{ idempotencyKey?: string; timeoutMs?: number }> = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			promptAckTimeoutMs: 17,
+			controlOptions,
+			controlResult: () => {
+				throw new SdkClientError("timeout", "SDK request timed out after 17ms");
+			},
+		});
+		await registerSdkSession(server, root);
+
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "bounded timeout",
+				idempotency_key: "bounded-timeout",
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, error: { code: "timeout" } });
+		expect(controls.filter(control => control.operation === "turn.prompt")).toEqual([
+			{ operation: "turn.prompt", input: { text: "bounded timeout" }, idempotencyKey: "bounded-timeout" },
+		]);
+		expect(controlOptions).toContainEqual({ idempotencyKey: "bounded-timeout", timeoutMs: 17 });
+		await expect(
+			fs.readdir(path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns")),
+		).rejects.toMatchObject({ code: "ENOENT" });
+	});
+	it("caps and defaults prompt acknowledgement timeouts passed to the SDK", async () => {
+		for (const [configuredTimeoutMs, expectedTimeoutMs] of [
+			[undefined, 10_000],
+			[300_001, 300_000],
+		] as const) {
+			const root = await tempRoot();
+			const controls: SdkControl[] = [];
+			const controlOptions: Array<{ idempotencyKey?: string; timeoutMs?: number }> = [];
+			const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+				promptAckTimeoutMs: configuredTimeoutMs,
+				controlOptions,
+			});
+			await registerSdkSession(server, root);
+			expect(
+				await server.callTool("gjc_coordinator_send_prompt", {
+					session_id: "visible-session",
+					prompt: "bounded prompt acknowledgement",
+					idempotency_key: `prompt-timeout-${expectedTimeoutMs}`,
+					allow_mutation: true,
+				}),
+			).toMatchObject({ ok: true });
+			expect(controlOptions).toEqual([
+				{ idempotencyKey: `prompt-timeout-${expectedTimeoutMs}`, timeoutMs: expectedTimeoutMs },
+			]);
+		}
 	});
 
 	it("derives aggregate liveness from scoped broker records", async () => {
@@ -892,7 +1166,11 @@ describe("Coordinator MCP canonical SDK controls", () => {
 	it("routes prompts, follow-ups, abort-and-prompts, and answers through SDK controls with caller keys", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
-		const server = await createSdkControlServer(root, controls);
+		const controlOptions: Array<{ idempotencyKey?: string; timeoutMs?: number }> = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			promptAckTimeoutMs: 17,
+			controlOptions,
+		});
 		await registerSdkSession(server, root);
 		const first = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
@@ -908,7 +1186,28 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			idempotency_key: "prompt-2",
 			allow_mutation: true,
 		});
-		expect(queued).toMatchObject({ ok: true, operation: "turn.follow_up", turn: { status: "queued" } });
+		expect(queued).toMatchObject({
+			ok: true,
+			operation: "turn.follow_up",
+			result: { accepted: true, command_id: expect.any(String), turn_id: expect.any(String) },
+			turn: {
+				status: "queued",
+				delivery: { runtime_command_id: expect.any(String), runtime_turn_id: expect.any(String) },
+			},
+		});
+		const queuedTurnId = queued.turn_id;
+		if (typeof queuedTurnId !== "string") throw new Error("missing queued coordinator turn id");
+		const queuedAcknowledgement = queued.result as { command_id?: unknown; turn_id?: unknown };
+		const persistedQueuedTurn = JSON.parse(
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${queuedTurnId}.json`),
+				"utf8",
+			),
+		) as { delivery: Record<string, unknown> };
+		expect(persistedQueuedTurn.delivery).toMatchObject({
+			runtime_command_id: queuedAcknowledgement.command_id,
+			runtime_turn_id: queuedAcknowledgement.turn_id,
+		});
 		expect(
 			await server.callTool("gjc_coordinator_send_prompt", {
 				session_id: "visible-session",
@@ -932,6 +1231,12 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			{ operation: "turn.follow_up", input: { text: "follow up" }, idempotencyKey: "prompt-2" },
 			{ operation: "turn.abort_and_prompt", input: { text: "replace" }, idempotencyKey: "prompt-3" },
 			{ operation: "ask.answer", input: { id: "ask-1", answer: { choice: "yes" } }, idempotencyKey: "answer-1" },
+		]);
+		expect(controlOptions).toEqual([
+			{ idempotencyKey: "prompt-1", timeoutMs: 17 },
+			{ idempotencyKey: "prompt-2", timeoutMs: 17 },
+			{ idempotencyKey: "prompt-3", timeoutMs: 17 },
+			{ idempotencyKey: "answer-1" },
 		]);
 	});
 

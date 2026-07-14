@@ -1,3 +1,4 @@
+import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Component, OverlayHandle, TUI } from "@gajae-code/tui";
 import { Container, Spacer, Text } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
@@ -22,6 +23,7 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
 import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
 import { applyInjectedUserSubmission } from "../utils/injected-user-submission";
@@ -54,6 +56,21 @@ export class ExtensionUiController {
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
 		switch (operation) {
+			case "model.set": {
+				const selector = typeof input.id === "string" ? input.id : "";
+				const slashIndex = selector.indexOf("/");
+				const model =
+					slashIndex > 0
+						? session.modelRegistry.find(selector.slice(0, slashIndex), selector.slice(slashIndex + 1))
+						: undefined;
+				const thinkingLevel =
+					typeof input.thinkingLevel === "string" ? parseThinkingLevel(input.thinkingLevel) : undefined;
+				if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
+					throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {
+						code: "invalid_input",
+					});
+				return await session.setDefaultModelSelection(model, thinkingLevel);
+			}
 			case "todo.replace": {
 				const phases = input.items;
 				if (
@@ -231,6 +248,11 @@ export class ExtensionUiController {
 		}
 	};
 
+	/** Re-mount the pet-aware composer after a transient hook UI closes. */
+	#restoreComposerEditor(): void {
+		this.ctx.restoreComposer();
+	}
+
 	/**
 	 * Initialize the hook system with TUI-based UI context.
 	 */
@@ -304,7 +326,7 @@ export class ExtensionUiController {
 			setModel: async model => {
 				const key = await this.ctx.session.modelRegistry.getApiKey(model);
 				if (!key) return false;
-				await this.ctx.session.setModel(model);
+				await this.ctx.session.setModel(model, "default", { cause: "user-selection" });
 				return true;
 			},
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
@@ -594,7 +616,7 @@ export class ExtensionUiController {
 			setModel: async model => {
 				const key = await this.ctx.session.modelRegistry.getApiKey(model);
 				if (!key) return false;
-				await this.ctx.session.setModel(model);
+				await this.ctx.session.setModel(model, "default", { cause: "user-selection" });
 				return true;
 			},
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
@@ -1029,8 +1051,7 @@ export class ExtensionUiController {
 	 */
 	hideHookSelector(): void {
 		this.ctx.hookSelector?.dispose();
-		this.ctx.editorContainer.clear();
-		this.ctx.editorContainer.addChild(this.ctx.editor);
+		this.#restoreComposerEditor();
 		this.ctx.hookSelector = undefined;
 		this.ctx.ui.setFocus(this.ctx.editor);
 		this.ctx.ui.requestRender();
@@ -1091,8 +1112,7 @@ export class ExtensionUiController {
 	 */
 	hideHookInput(): void {
 		this.ctx.hookInput?.dispose();
-		this.ctx.editorContainer.clear();
-		this.ctx.editorContainer.addChild(this.ctx.editor);
+		this.#restoreComposerEditor();
 		this.ctx.hookInput = undefined;
 		this.ctx.ui.setFocus(this.ctx.editor);
 		this.ctx.ui.requestRender();
@@ -1141,8 +1161,7 @@ export class ExtensionUiController {
 	 * Hide the hook editor.
 	 */
 	hideHookEditor(): void {
-		this.ctx.editorContainer.clear();
-		this.ctx.editorContainer.addChild(this.ctx.editor);
+		this.#restoreComposerEditor();
 		this.ctx.hookEditor = undefined;
 		this.ctx.ui.setFocus(this.ctx.editor);
 		this.ctx.ui.requestRender();
@@ -1185,8 +1204,7 @@ export class ExtensionUiController {
 			closed = true;
 			this.#clearActiveHookCustom();
 			if (!options?.overlay) {
-				this.ctx.editorContainer.clear();
-				this.ctx.editorContainer.addChild(this.ctx.editor);
+				this.#restoreComposerEditor();
 				this.ctx.editor.setText(savedText);
 			}
 			this.ctx.ui.setFocus(this.ctx.editor);

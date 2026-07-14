@@ -38,6 +38,7 @@ import {
 import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { toFirepassWireModelId, toFireworksWireModelId } from "../utils/fireworks-model-id";
 import {
 	type CapturedHttpErrorResponse,
@@ -512,13 +513,18 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				openaiStream = await callWithCopilotModelRetry(() => createCompletionsStream(), {
 					provider: model.provider,
 					signal: requestSignal,
+					fallbackManaged: options?.fallbackManaged,
 				});
 			} catch (error) {
 				const capturedErrorResponse = getCapturedErrorResponse();
 				const sentForcedToolChoice = isForcedToolChoice(
 					(rawRequestDump?.body as { tool_choice?: unknown } | undefined)?.tool_choice,
 				);
-				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, sentForcedToolChoice)) {
+				if (
+					!options?.fallbackManaged &&
+					firstTokenTime === undefined &&
+					isForcedToolChoiceUnsupportedError(error, sentForcedToolChoice)
+				) {
 					const reason = await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse);
 					markToolChoiceIncapability(model, "auto", reason);
 					const resolvedToolChoice = resolveToolChoice(model, options?.toolChoice);
@@ -534,6 +540,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					});
 					openaiStream = await createCompletionsStream();
 				} else if (
+					!options?.fallbackManaged &&
 					isOpenRouterAnthropicModel(model) &&
 					!disableStrictTools &&
 					isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
@@ -546,7 +553,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					disableStrictTools = true;
 					openaiStream = await createCompletionsStream("none");
 				} else {
-					if (!shouldRetryWithoutStrictTools(error, capturedErrorResponse, appliedToolStrictMode, context.tools)) {
+					if (
+						options?.fallbackManaged ||
+						!shouldRetryWithoutStrictTools(error, capturedErrorResponse, appliedToolStrictMode, context.tools)
+					) {
 						throw error;
 					}
 					openaiStream = await createCompletionsStream("none");
@@ -960,6 +970,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			const capturedErrorResponse = getCapturedErrorResponse?.();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error) ?? capturedErrorResponse?.status;
+			output.transportFailure = transportFailureFacts(error, capturedErrorResponse);
 			output.errorMessage =
 				firstEventTimeoutError?.message ??
 				(await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse));

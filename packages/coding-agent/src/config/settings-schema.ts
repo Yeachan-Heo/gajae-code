@@ -4,6 +4,7 @@ import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
+import type { ModelSelectorValue } from "./model-selector-value";
 
 const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
 const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
@@ -171,9 +172,14 @@ interface ArrayDef<T> {
 	ui?: UiBase;
 }
 
+interface RecordValueDef {
+	type: "model-selector-value";
+}
+
 interface RecordDef<T> {
 	type: "record";
 	default: Record<string, T>;
+	valueSchema?: RecordValueDef;
 	ui?: UiBase;
 }
 
@@ -201,7 +207,8 @@ export interface ModelTagsSettings {
 // Typed defaults for array/record settings — named constants avoid `as` casts
 // under `as const` while still letting SettingValue infer the correct element type.
 const EMPTY_STRING_ARRAY: string[] = [];
-const EMPTY_STRING_RECORD: Record<string, string> = {};
+const EMPTY_MODEL_SELECTOR_RECORD: Record<string, ModelSelectorValue> = {};
+const MODEL_SELECTOR_VALUE_SCHEMA = { type: "model-selector-value" } as const;
 const DEFAULT_CYCLE_ORDER: string[] = ["default"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
@@ -390,7 +397,7 @@ export const SETTINGS_SCHEMA = {
 
 	disabledExtensions: { type: "array", default: DEFAULT_DISABLED_EXTENSIONS },
 
-	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
+	modelRoles: { type: "record", default: EMPTY_MODEL_SELECTOR_RECORD, valueSchema: MODEL_SELECTOR_VALUE_SCHEMA },
 	"modelProfile.default": {
 		type: "string",
 		default: undefined,
@@ -1050,6 +1057,12 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"fallback.maxAttempts": {
+		type: "number",
+		default: 3,
+		validate: (value: number) => Number.isInteger(value) && value > 0,
+	},
+
 	// Retries
 	"retry.enabled": { type: "boolean", default: true },
 
@@ -1099,25 +1112,6 @@ export const SETTINGS_SCHEMA = {
 			label: "Provider Stream Retries",
 			description:
 				"Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
-		},
-	},
-	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
-	"retry.fallbackRevertPolicy": {
-		type: "enum",
-		values: ["cooldown-expiry", "never"] as const,
-		default: "cooldown-expiry",
-		ui: {
-			tab: "model",
-			label: "Fallback Revert Policy",
-			description: "When to return to the primary model after a fallback",
-			options: [
-				{
-					value: "cooldown-expiry",
-					label: "Cooldown expiry",
-					description: "Return to the primary model after its suppression window ends",
-				},
-				{ value: "never", label: "Never", description: "Stay on the fallback model until manually changed" },
-			],
 		},
 	},
 
@@ -2915,7 +2909,8 @@ export const SETTINGS_SCHEMA = {
 
 	"task.agentModelOverrides": {
 		type: "record",
-		default: {} as Record<string, string>,
+		default: {} as Record<string, ModelSelectorValue>,
+		valueSchema: MODEL_SELECTOR_VALUE_SCHEMA,
 	},
 
 	"tasks.todoClearDelay": {
@@ -3495,7 +3490,7 @@ export interface GroupTypeMap {
 	statusLine: StatusLineSettings;
 	thinkingBudgets: ThinkingBudgetsSettings;
 	stt: SttSettings;
-	modelRoles: Record<string, string>;
+	modelRoles: Record<string, ModelSelectorValue>;
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];
 	shellMinimizer: ShellMinimizerSettings;

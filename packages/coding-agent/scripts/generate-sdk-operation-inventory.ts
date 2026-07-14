@@ -140,6 +140,20 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:hasExtensionHandlers": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:registerBeforeAgentStartContributor": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setSdkPermissionProvider": "internal reverse-provider plumbing, not a user-facing SDK control seam",
+	"agent_session:beginTemporaryProviderSessionScope":
+		"internal temporary model/provider restoration scope, not a user-facing SDK control seam",
+	"agent_session:restoreTemporaryProviderSessionScope":
+		"internal temporary model/provider restoration scope, not a user-facing SDK control seam",
+	"agent_session:commitTemporaryProviderSessionScope":
+		"internal temporary model/provider restoration scope, not a user-facing SDK control seam",
+	"agent_session:getConfiguredModelChain":
+		"internal profile and fallback-chain state, not a user-facing SDK control seam",
+	"agent_session:setConfiguredModelChain":
+		"internal profile and fallback-chain state, not a user-facing SDK control seam",
+	"agent_session:setDefaultFallbackRuntimeModel":
+		"internal fallback runtime bookkeeping, not a user-facing SDK control seam",
+	"agent_session:seedDefaultFallbackResolution":
+		"internal fallback resolution bookkeeping, not a user-facing SDK control seam",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
@@ -152,6 +166,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:clearContext": "context.clear",
 	"agent_session:setSessionName": "session.rename",
 	"agent_session:setModel": "model.set",
+	"agent_session:setDefaultModelSelection": "model.set",
 	"agent_session:cycleModel": "model.cycle",
 	"agent_session:setThinkingLevel": "thinking.set",
 	"agent_session:cycleThinkingLevel": "thinking.cycle",

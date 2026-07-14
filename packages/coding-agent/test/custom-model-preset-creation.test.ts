@@ -505,6 +505,61 @@ describe("custom model preset creation", () => {
 		selector.handleInput("\n");
 		expect(selections).toEqual([]);
 	});
+	it("keeps same-head different-tail profiles distinct and captures every fallback provider", async () => {
+		const sameHeadDifferentTail: ModelProfileDefinition = {
+			name: "same-head-different-tail",
+			displayName: "Same head, different tail",
+			requiredProviders: ["anthropic", "my-oai", "other-provider"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: ["anthropic/claude:high", "other-provider/different-tail:max"],
+			},
+			source: "user",
+		};
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			Settings.isolated({
+				"task.agentModelOverrides": {
+					executor: ["anthropic/claude:high", "other-provider/tail:max"],
+				},
+			}),
+			createRegistry([[sameHeadDifferentTail.name, sameHeadDifferentTail]], {
+				models: [
+					currentModel("my-oai", "gpt-custom"),
+					currentModel("anthropic", "claude"),
+					currentModel("other-provider", "tail"),
+				],
+			}),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+			{ currentThinkingLevel: ThinkingLevel.Low },
+		);
+		await Bun.sleep(0);
+
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(text).toContain("Create custom preset");
+		expect(text).not.toContain("Already saved as Same head, different tail");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selections).toEqual([
+			{
+				kind: "createProfile",
+				profile: {
+					required_providers: ["anthropic", "my-oai", "other-provider"],
+					model_mapping: {
+						default: "my-oai/gpt-custom:low",
+						executor: ["anthropic/claude:high", "other-provider/tail:max"],
+					},
+				},
+			},
+		]);
+	});
 	it("emits custom preset rename and delete actions from preset rows", async () => {
 		const customProfile: ModelProfileDefinition = {
 			name: "custom-row",
@@ -616,6 +671,9 @@ describe("custom model preset creation", () => {
 			model: currentModel("other", "active"),
 			thinkingLevel: undefined,
 			sessionId: "session",
+			getConfiguredModelChain: () => undefined,
+			setConfiguredModelChain: () => {},
+
 			setActiveModelProfile: (profileName: string | undefined) => {
 				activeProfiles.push(profileName);
 			},
@@ -659,6 +717,8 @@ describe("custom model preset creation", () => {
 			model: currentModel("other", "active"),
 			thinkingLevel: undefined,
 			sessionId: "session",
+			getConfiguredModelChain: () => undefined,
+			setConfiguredModelChain: () => {},
 			setActiveModelProfile: (profileName: string | undefined) => {
 				activeProfiles.push(profileName);
 			},
@@ -759,6 +819,8 @@ describe("custom model preset creation", () => {
 				model: currentModel("my-oai", "gpt-custom"),
 				thinkingLevel: ThinkingLevel.Low,
 				sessionId: "session",
+				getConfiguredModelChain: () => undefined,
+				setConfiguredModelChain: () => {},
 				scopedModels: [],
 				modelRegistry: registry,
 				setActiveModelProfile: (profileName: string | undefined) => activeProfiles.push(profileName),

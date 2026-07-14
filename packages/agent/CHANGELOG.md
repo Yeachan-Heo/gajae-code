@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Extended the gpt-5.6 `Request blocked (code=invalid_prompt)` fix to the compaction paths that bypass the streaming transport. Remote OpenAI compaction (`/responses/compact`, `compaction.remoteEnabled` default on — the "remote compact task" in openai/codex#32028) built its native `input` from reasoning signatures, verbatim history items, and message/tool text without neutralizing leaked Harmony control-token markers (e.g. `<|channel|>analysis`), so gpt-5.6 rejected the compaction request and, on retry, could escalate to account-level blocking. `requestOpenAiRemoteCompaction` now neutralizes reserved control tokens across the whole outgoing `input`, and the generic `requestRemoteCompaction` prompt/systemPrompt are neutralized too. Local summarization was already covered by the streaming-transport request-boundary fix.
+
 ## [0.10.0] - 2026-07-12
 
 ### Fixed

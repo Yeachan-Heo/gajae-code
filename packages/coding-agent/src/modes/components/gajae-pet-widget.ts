@@ -6,7 +6,6 @@ import {
 	type GajaePixelFrameName,
 	type GajaePixelFrames,
 	getCellDimensions,
-	ImageProtocol,
 	PARA_PARA_STEPS,
 	PET_SKINS,
 	type PetMode,
@@ -14,10 +13,10 @@ import {
 	petBurstDurationMs,
 	petBurstFrame,
 	registerAnimationCallback,
-	TERMINAL,
 	type TUI,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "./custom-editor";
+import { getPetPixelProtocol } from "./pet-capability";
 
 /** Re-exported from the tui skin registry so widget-relative imports stay valid. */
 export type { PetMode, PetSkinId };
@@ -38,6 +37,35 @@ const KITTY_DROP_FRACTION = 0.45;
 const petKittyDropPx = (cellHeightPx: number): number =>
 	Math.min(Math.max(0, cellHeightPx - 1), Math.floor(cellHeightPx * KITTY_DROP_FRACTION));
 const PET_RAISE_ROWS = 1;
+const allocatedPetKittyImageIds = new Set<number>();
+
+function allocatePetKittyImageId(): number {
+	let id = 0;
+	while (id === 0 || allocatedPetKittyImageIds.has(id)) {
+		id = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0;
+	}
+	allocatedPetKittyImageIds.add(id);
+	return id;
+}
+
+interface SixelFootprint {
+	x: number;
+	y: number;
+	columns: number;
+	rows: number;
+}
+
+function sameFootprint(left: SixelFootprint, right: SixelFootprint): boolean {
+	return left.x === right.x && left.y === right.y && left.columns === right.columns && left.rows === right.rows;
+}
+
+/**
+ * Which widget currently owns each TUI's single shared post-render emitter
+ * slot. A stale or repeated dispose (or off-switch) of a predecessor widget
+ * must never clear a successor's overlay authority.
+ */
+const petOverlayEmitterOwners = new WeakMap<TUI, GajaePetWidget>();
+
 /** Working animation: the shared para-para beats looped end to end. */
 const WORK_LOOP_TOTAL = PARA_PARA_STEPS.reduce((sum, [, ms]) => sum + ms, 0);
 /** Random gap between automatic claw flexes (fires while idle AND working). */
@@ -127,6 +155,20 @@ export class GajaePetWidget {
 	/** Cell metrics the current frames were built for; a change triggers a rebuild. */
 	#builtCellW = 0;
 	#builtCellH = 0;
+	#kittyImageId: number | undefined;
+	/** True while a kitty placement may exist on screen; cleared only after the delete escape is delivered. */
+	#kittyCleanupPending = false;
+	/** Last emitted Sixel raster position; retained until an erase is actually delivered. */
+	#lastSixelFootprint: SixelFootprint | undefined;
+	/** Terminal state: a disposed widget never touches the TUI or shared slots again. */
+	#disposed = false;
+	/**
+	 * True while the previous overlay frame carried the cleanup payload. The
+	 * TUI writes the frame after the emitter returns, so delivery is
+	 * acknowledged only on the next emitter pass — and only while the terminal
+	 * stayed available, since a failed render write drops availability.
+	 */
+	#frameCleanupAwaitingAck = false;
 
 	constructor(options: {
 		ui: TUI;
@@ -154,9 +196,7 @@ export class GajaePetWidget {
 
 	/** Protocol available for the real-pixel pet, if any. */
 	static pixelProtocol(): "sixel" | "kitty" | null {
-		if (TERMINAL.imageProtocol === ImageProtocol.Kitty) return "kitty";
-		if (TERMINAL.imageProtocol === ImageProtocol.Sixel) return "sixel";
-		return null;
+		return getPetPixelProtocol();
 	}
 
 	get mode(): PetMode {
@@ -182,14 +222,19 @@ export class GajaePetWidget {
 		}
 	}
 
+	commitPreviewMode(mode: PetMode): void {
+		this.#applyMode(mode, false);
+	}
+
 	#applyMode(mode: PetMode, mountComposer: boolean): void {
-		if (mode === this.#mode) return;
+		if (this.#disposed || mode === this.#mode) return;
 
 		if (mode === "off") {
+			this.#writeImageCleanup();
 			this.#mode = "off";
 			this.#animation?.unregister();
 			this.#animation = undefined;
-			this.#ui.setPostRenderEmitter(undefined);
+			this.#releaseOverlayEmitter();
 			this.#floorContainer.clear();
 			this.#pixel = undefined;
 			this.#framedEditor.setReserve(0);
@@ -200,6 +245,7 @@ export class GajaePetWidget {
 
 		const protocol = this.#forcedProtocol ?? GajaePetWidget.pixelProtocol();
 		if (!protocol) return;
+		if (this.#mode !== "off") this.#writeImageCleanup();
 		this.#mode = mode;
 		this.#frame = "base";
 		this.#flexUntil = 0;
@@ -210,6 +256,7 @@ export class GajaePetWidget {
 		// the composer stays pinned to the terminal bottom.
 		this.#floorContainer.clear();
 		this.#ui.setPostRenderEmitter(() => this.#overlayPayload());
+		petOverlayEmitterOwners.set(this.#ui, this);
 		this.#animation ??= registerAnimationCallback(now => this.#tick(now), 80);
 		this.#ui.requestRender(true);
 	}
@@ -220,6 +267,10 @@ export class GajaePetWidget {
 		this.#builtCellW = cell.widthPx;
 		this.#builtCellH = cell.heightPx;
 		const skin: PetSkinId = this.#mode === "off" ? "red" : this.#mode;
+		if (protocol === "kitty") {
+			this.#kittyImageId ??= allocatePetKittyImageId();
+			this.#kittyCleanupPending = true;
+		}
 		this.#pixel = buildGajaePixelFrames({
 			protocol,
 			skin,
@@ -228,17 +279,49 @@ export class GajaePetWidget {
 			targetRows: 2,
 			sixelTopPaddingPx: protocol === "sixel" ? PET_SIXEL_DROP_PX : 0,
 			kittyCellYOffsetPx: protocol === "kitty" ? petKittyDropPx(cell.heightPx) : 0,
+			kittyImageId: protocol === "kitty" ? this.#kittyImageId : undefined,
 		});
 		this.#framedEditor.setReserve(this.#pixel.columns + PET_SIDE_MARGIN);
 	}
 
 	dispose(): void {
-		this.#animation?.unregister();
-		this.#animation = undefined;
-		this.#ui.setPostRenderEmitter(undefined);
-		this.#floorContainer.clear();
-		this.#framedEditor.setReserve(0);
-		this.#mountEditor(false);
+		if (this.#disposed) return;
+		this.#disposed = true;
+		const kittyImageId = this.#kittyImageId;
+		const cleanupPayload = this.#imageCleanupPayload();
+		try {
+			if (cleanupPayload) {
+				this.#ui.queueTerminalCleanup(
+					`\x1b[?2026h\x1b7${cleanupPayload}\x1b8\x1b[?2026l`,
+					kittyImageId === undefined ? undefined : () => allocatedPetKittyImageIds.delete(kittyImageId),
+				);
+			} else if (kittyImageId !== undefined) {
+				allocatedPetKittyImageIds.delete(kittyImageId);
+			}
+			this.#consumeCleanupAuthority();
+			this.#kittyImageId = undefined;
+		} finally {
+			this.#animation?.unregister();
+			this.#animation = undefined;
+			this.#releaseOverlayEmitter();
+			this.#mode = "off";
+			this.#pixel = undefined;
+			this.#floorContainer.clear();
+			this.#framedEditor.setReserve(0);
+			// Restore the plain composer only while our framed wrapper is still
+			// mounted; a successor widget may already own the editor container.
+			if (this.#editorContainer.children.includes(this.#framedEditor)) {
+				this.#mountEditor(false);
+			}
+		}
+	}
+
+	/** Clear the shared post-render slot only while this widget still owns it. */
+	#releaseOverlayEmitter(): void {
+		if (petOverlayEmitterOwners.get(this.#ui) === this) {
+			this.#ui.setPostRenderEmitter(undefined);
+			petOverlayEmitterOwners.delete(this.#ui);
+		}
 	}
 
 	#mountEditor(framed: boolean): void {
@@ -335,14 +418,50 @@ export class GajaePetWidget {
 		return { x, y };
 	}
 
-	#clearPetPayload(x: number, y: number): string {
-		const pixel = this.#pixel;
-		if (pixel?.protocol !== "sixel") return "";
+	#clearSixelFootprint(footprint: SixelFootprint): string {
 		let out = "\x1b[0m";
-		for (let row = 0; row < pixel.rasterRows; row++) {
-			out += `\x1b[${y + row + 1};${x + 1}H\x1b[${pixel.columns}X`;
+		for (let row = 0; row < footprint.rows; row++) {
+			out += `\x1b[${footprint.y + row + 1};${footprint.x + 1}H\x1b[${footprint.columns}X`;
 		}
 		return out;
+	}
+
+	/** Pending on-screen image cleanup. Pure: authority is consumed separately, on delivery. */
+	#imageCleanupPayload(): string {
+		let out = "";
+		if (this.#kittyCleanupPending && this.#kittyImageId !== undefined) {
+			out += `\x1b_Ga=d,d=I,i=${this.#kittyImageId},q=2\x1b\\`;
+		}
+		if (this.#lastSixelFootprint) {
+			out += this.#clearSixelFootprint(this.#lastSixelFootprint);
+		}
+		return out;
+	}
+
+	#consumeCleanupAuthority(): void {
+		this.#kittyCleanupPending = false;
+		this.#lastSixelFootprint = undefined;
+	}
+
+	/**
+	 * Best-effort direct erase of the on-screen pet image. Cleanup authority is
+	 * consumed only after the write is actually delivered: an unavailable
+	 * terminal or a throwing write keeps the erase pending so a later mode
+	 * switch or dispose can retry it.
+	 */
+	#writeImageCleanup(): void {
+		if (!this.#ui.terminalAvailable) return;
+		const payload = this.#imageCleanupPayload();
+		if (!payload) return;
+		try {
+			this.#ui.terminal.write(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`);
+		} catch {
+			// Keep the footprint/placement authority; the terminal write layer
+			// reports availability separately and callers retry on the next
+			// lifecycle transition.
+			return;
+		}
+		this.#consumeCleanupAuthority();
 	}
 
 	/** Draw escape payload at the pet's absolute position. */
@@ -350,10 +469,40 @@ export class GajaePetWidget {
 		const pixel = this.#pixel;
 		if (!pixel) return null;
 		const pos = this.#petPosition();
-		if (!pos) return null;
+		if (!pos) {
+			// Deferred delivery acknowledgement: the TUI writes the frame after
+			// this emitter returns, and that write can fail. Consume the cleanup
+			// authority only once a later pass observes the terminal survived
+			// the frame that carried the payload; otherwise retain it so a later
+			// lifecycle cleanup retries the erase/delete.
+			if (this.#frameCleanupAwaitingAck && this.#ui.terminalAvailable) {
+				this.#consumeCleanupAuthority();
+			}
+			this.#frameCleanupAwaitingAck = false;
+			if (!this.#ui.terminalAvailable) return null;
+			const cleanup = this.#imageCleanupPayload();
+			if (!cleanup) return null;
+			this.#frameCleanupAwaitingAck = true;
+			return cleanup;
+		}
+		// A full frame supersedes any cleanup-only frame still awaiting ack.
+		this.#frameCleanupAwaitingAck = false;
 		const { x, y } = pos;
+		let out = "";
 
-		let out = clearPet ? this.#clearPetPayload(x, y) : "";
+		if (pixel.protocol === "sixel") {
+			const footprint = { x, y, columns: pixel.columns, rows: pixel.rasterRows };
+			if (this.#lastSixelFootprint && !sameFootprint(this.#lastSixelFootprint, footprint)) {
+				out += this.#clearSixelFootprint(this.#lastSixelFootprint);
+			}
+			if (clearPet) out += this.#clearSixelFootprint(footprint);
+			this.#lastSixelFootprint = footprint;
+		} else {
+			// A kitty frame emitted below (re)places the image, so cleanup is
+			// pending again even if a narrow-terminal pass consumed it earlier.
+			this.#kittyCleanupPending = true;
+		}
+
 		out += `\x1b[${y + 1};${x + 1}H${pixel.frames[this.#frame]}`;
 		return out;
 	}

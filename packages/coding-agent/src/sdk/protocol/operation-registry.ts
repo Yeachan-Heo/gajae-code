@@ -76,7 +76,7 @@ const controls = [
 	["mode.plan.set", "Set plan mode."],
 	["mode.goal.operate", "Operate goal mode."],
 	["todo.replace", "Replace the session todo list."],
-	["model.set", "Set the active model."],
+	["model.set", "Set the active model, optionally promoting its effective thinking level as the default."],
 	["model.cycle", "Cycle the active model."],
 	["thinking.set", "Set thinking level."],
 	["thinking.cycle", "Cycle thinking level."],
@@ -191,6 +191,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 
 function controlErrors(id: string): string[] {
 	const errors: Record<string, string[]> = {
+		C13: ["invalid_request", "busy", "default_model_selection_recovery"],
 		C36: ["revision_conflict", "secret_input_forbidden"],
 		C38: ["authentication_failed", "provider_required"],
 		C39: ["provider_required", "registration_failed"],

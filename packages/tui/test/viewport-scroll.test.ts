@@ -129,6 +129,27 @@ describe("TUI manual viewport paging", () => {
 		}
 	});
 
+	it("repaints all rows when content contracts from height plus one to height minus one", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		const content = new Lines(Array.from({ length: 6 }, (_value, index) => `line-${index}`));
+		tui.addChild(content);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(visible(term)).toEqual(["line-1", "line-2", "line-3", "line-4", "line-5"]);
+
+			content.replace(["line-0", "line-1", "line-2", "line-3"]);
+			tui.requestRender();
+			await settle(term);
+
+			expect(visible(term)).toEqual(["line-0", "line-1", "line-2", "line-3", ""]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("keeps the manual viewport stable across new output until following live", async () => {
 		const term = new VirtualTerminal(30, 5);
 		const tui = new TUI(term);
@@ -215,7 +236,7 @@ describe("TUI manual viewport paging", () => {
 	});
 
 	it("keeps Windows Terminal pinned when a normal assistant answer starts before status/editor", async () => {
-		const term = new VirtualTerminal(30, 6);
+		const term = new VirtualTerminal(30, 6, { isProcessTerminal: true });
 		const tui = new TUI(term);
 		const chat = new Lines(Array.from({ length: 12 }, (_value, index) => `line-${index}`));
 		const working = new Lines(["thinking"]);
@@ -260,7 +281,7 @@ describe("TUI manual viewport paging", () => {
 	});
 
 	it("keeps Windows Terminal live output pinned when offscreen lines change during streaming", async () => {
-		const term = new VirtualTerminal(30, 5);
+		const term = new VirtualTerminal(30, 5, { isProcessTerminal: true });
 		const tui = new TUI(term);
 		const content = new Lines(["status-0", ...Array.from({ length: 11 }, (_value, index) => `line-${index}`)]);
 		tui.addChild(content);
@@ -291,7 +312,7 @@ describe("TUI manual viewport paging", () => {
 	});
 
 	it("keeps Windows Terminal pinned when offscreen status lines disappear", async () => {
-		const term = new VirtualTerminal(30, 5);
+		const term = new VirtualTerminal(30, 5, { isProcessTerminal: true });
 		const tui = new TUI(term);
 		const content = new Lines(["status-0", ...Array.from({ length: 11 }, (_value, index) => `line-${index}`)]);
 		tui.addChild(content);

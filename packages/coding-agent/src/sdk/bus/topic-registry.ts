@@ -31,6 +31,10 @@ export interface TopicRecord {
 	userNameUpdateId?: number;
 	/** Stable repo/branch identity used when topic names are user-owned or customized. */
 	identityKey?: string;
+	/** Last SDK event generation durably consumed by the notification daemon. */
+	replayGeneration?: number;
+	/** Last SDK event sequence durably consumed within replayGeneration. */
+	replaySeq?: number;
 }
 
 /** Serialisable shape persisted to disk. */
@@ -71,6 +75,13 @@ export class TopicRegistry {
 				typeof raw.userNameUpdateId === "number" &&
 				Number.isSafeInteger(raw.userNameUpdateId) &&
 				raw.userNameUpdateId >= 0;
+			const hasValidReplayCursor =
+				typeof raw.replayGeneration === "number" &&
+				Number.isSafeInteger(raw.replayGeneration) &&
+				raw.replayGeneration >= 1 &&
+				typeof raw.replaySeq === "number" &&
+				Number.isSafeInteger(raw.replaySeq) &&
+				raw.replaySeq >= 0;
 			const record: TopicRecord = {
 				topicId: raw.topicId,
 				identitySent: raw.identitySent === true,
@@ -80,6 +91,7 @@ export class TopicRegistry {
 				...(hasValidUserAuthority && raw.nameReconcilePending === true ? { nameReconcilePending: true } : {}),
 				...(hasValidUserAuthority ? { userNameUpdateId: raw.userNameUpdateId } : {}),
 				...(typeof raw.identityKey === "string" ? { identityKey: raw.identityKey } : {}),
+				...(hasValidReplayCursor ? { replayGeneration: raw.replayGeneration, replaySeq: raw.replaySeq } : {}),
 			};
 			this.topics.set(sessionId, record);
 			this.byTopic.set(record.topicId, sessionId);
@@ -151,6 +163,26 @@ export class TopicRegistry {
 		const record = this.topics.get(sessionId);
 		if (!record || record.identityKey === identityKey) return false;
 		record.identityKey = identityKey;
+		return true;
+	}
+
+	/** Last durably consumed SDK event cursor for reconnect replay. */
+	replayCursor(sessionId: string): { generation: number; seq: number } | undefined {
+		const record = this.topics.get(sessionId);
+		return record?.replayGeneration !== undefined && record.replaySeq !== undefined
+			? { generation: record.replayGeneration, seq: record.replaySeq }
+			: undefined;
+	}
+
+	/** Advance the durable reconnect cursor without allowing stale responses to move it backwards. */
+	markReplayCursor(sessionId: string, generation: number, seq: number): boolean {
+		const record = this.topics.get(sessionId);
+		if (!record) return false;
+		const currentGeneration = record.replayGeneration ?? 0;
+		const currentSeq = record.replaySeq ?? 0;
+		if (generation < currentGeneration || (generation === currentGeneration && seq <= currentSeq)) return false;
+		record.replayGeneration = generation;
+		record.replaySeq = seq;
 		return true;
 	}
 

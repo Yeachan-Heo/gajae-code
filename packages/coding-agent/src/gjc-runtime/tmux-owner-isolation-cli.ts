@@ -53,27 +53,63 @@ function isKnownNoServerDiagnostic(stderr: string): boolean {
 	);
 }
 
-async function tmuxServerProof(socketKey: string, tmuxControlArgv?: string[]): Promise<TmuxServerProof> {
-	void socketKey;
-	if (!tmuxControlArgv?.length) return { state: "unverifiable" };
-	const controlArgv = tmuxControlArgv;
+interface TmuxListSessionsResult {
+	exitCode: number | null;
+	stdout: string;
+	stderr: string;
+}
+
+interface TmuxServerProofOptions {
+	platform?: NodeJS.Platform;
+	runListSessions?: (argv: string[]) => TmuxListSessionsResult;
+}
+
+function runTmuxListSessions(controlArgv: string[]): TmuxListSessionsResult {
 	const subprocess = Bun.spawnSync([...controlArgv, "list-sessions", "-F", "#{pid}\t#{session_name}"], {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
-	const stderr = Buffer.from(subprocess.stderr).toString();
+	return {
+		exitCode: subprocess.exitCode,
+		stdout: Buffer.from(subprocess.stdout).toString(),
+		stderr: Buffer.from(subprocess.stderr).toString(),
+	};
+}
+
+function parseTmuxSessionRows(stdout: string): { pid: number; sessionNames: string[] } | null {
+	const lines = stdout.split("\n");
+	if (lines[lines.length - 1] === "") lines.pop();
+	let pid: number | undefined;
+	const sessionNames: string[] = [];
+	for (const rawLine of lines) {
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		const columns = line.split("\t");
+		if (columns.length !== 2 || !/^[1-9]\d*$/.test(columns[0]) || !columns[1].trim()) return null;
+		const rowPid = Number(columns[0]);
+		if (!Number.isSafeInteger(rowPid) || (pid !== undefined && pid !== rowPid)) return null;
+		pid = rowPid;
+		sessionNames.push(columns[1]);
+	}
+	return pid === undefined ? null : { pid, sessionNames };
+}
+
+/** Probes a tmux server using an injectable list-sessions runner for platform-bounded callers. */
+export async function tmuxServerProof(
+	socketKey: string,
+	tmuxControlArgv?: string[],
+	options: TmuxServerProofOptions = {},
+): Promise<TmuxServerProof> {
+	void socketKey;
+	if (!tmuxControlArgv?.length) return { state: "unverifiable" };
+	const platform = options.platform ?? process.platform;
+	const subprocess = options.runListSessions?.(tmuxControlArgv) ?? runTmuxListSessions(tmuxControlArgv);
 	if (subprocess.exitCode !== 0)
-		return isKnownNoServerDiagnostic(stderr) ? { state: "absent" } : { state: "unverifiable" };
-	const lines = Buffer.from(subprocess.stdout)
-		.toString()
-		.split("\n")
-		.map(line => line.trim())
-		.filter(Boolean);
-	const [pidText] = lines[0]?.split("\t") ?? [];
-	const pid = Number(pidText);
-	const sessionNames = lines.map(line => line.split("\t")[1]).filter((name): name is string => Boolean(name));
-	if (!Number.isSafeInteger(pid) || pid <= 0) return { state: "unverifiable" };
-	if (process.platform !== "linux") {
+		return isKnownNoServerDiagnostic(subprocess.stderr) ? { state: "absent" } : { state: "unverifiable" };
+	if (!subprocess.stdout.trim()) return { state: "absent" };
+	const rows = parseTmuxSessionRows(subprocess.stdout);
+	if (!rows) return { state: "unverifiable" };
+	const { pid, sessionNames } = rows;
+	if (platform !== "linux") {
 		return {
 			state: "safe",
 			pid,
@@ -82,7 +118,7 @@ async function tmuxServerProof(socketKey: string, tmuxControlArgv?: string[]): P
 			sessionNames,
 		};
 	}
-	const cgroup = classifyCgroup({ platform: process.platform, cgroupText: await readCgroup(String(pid)) });
+	const cgroup = classifyCgroup({ platform, cgroupText: await readCgroup(String(pid)) });
 	const startTime = await readProcessStartTime(pid);
 	if (!startTime) return { state: "unverifiable", pid, cgroup, sessionNames };
 	return {

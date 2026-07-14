@@ -17,6 +17,7 @@
  *   POST /v1/messages                      → Anthropic messages in/out
  *   POST /v1/responses                     → OpenAI Responses in/out
  */
+
 import { logger } from "@gajae-code/utils";
 import type { AuthStorage } from "../auth-storage";
 import { Effort } from "../model-thinking";
@@ -26,6 +27,7 @@ import * as openaiResponses from "../providers/openai-responses-server";
 import * as piNative from "../providers/pi-native-server";
 import { streamSimple } from "../stream";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
+import { beginAttempt, classifyFallbackTrigger } from "../utils/fallback-transport";
 import { parseBind } from "../utils/parse-bind";
 import {
 	captureRequestHeaders,
@@ -260,6 +262,90 @@ async function refreshGatewayApiKeyAfterAuthError(
 	return storage.getApiKey(provider, undefined, { modelId: model.id, signal });
 }
 
+/**
+ * Records a managed gateway failure against the credential selected for this
+ * request. This deliberately never returns a replacement key: the outer
+ * fallback controller owns the next attempt and is the only component allowed
+ * to make another upstream request.
+ */
+async function markManagedGatewayCredentialFailure(
+	storage: AuthStorage,
+	model: Model<Api>,
+	apiKey: string,
+	error: unknown,
+	signal: AbortSignal,
+	format: string,
+	peer: string,
+): Promise<void> {
+	const trigger = classifyFallbackTrigger(error);
+	try {
+		if (trigger.class === "auth") {
+			await storage.invalidateCredentialMatching(model.provider, apiKey, signal);
+		} else if (trigger.class === "quota" || trigger.class === "rate_limit") {
+			await storage.markUsageLimitReached(model.provider, undefined, {
+				retryAfterMs: trigger.retryAfterMs,
+				signal,
+			});
+		} else {
+			return;
+		}
+		logger.debug("auth-gateway recorded managed credential failure", {
+			format,
+			provider: model.provider,
+			peer,
+			trigger: trigger.class,
+		});
+	} catch (markError) {
+		// Credential bookkeeping must not replace the upstream failure returned to
+		// the fallback controller.
+		logger.warn("auth-gateway failed to record managed credential failure", {
+			format,
+			provider: model.provider,
+			peer,
+			error: markError instanceof Error ? markError.message : String(markError),
+		});
+	}
+}
+
+function observeManagedGatewayFailure(
+	events: AssistantMessageEventStream,
+	markFailure: (error: unknown) => Promise<void>,
+): AssistantMessageEventStream {
+	let marked = false;
+	const markOnce = async (error: unknown): Promise<void> => {
+		if (marked) return;
+		marked = true;
+		await markFailure(error);
+	};
+	async function* observed() {
+		try {
+			for await (const event of events) {
+				if (event.type === "error") {
+					await markOnce(event.error.transportFailure ?? { kind: "transport", status: event.error.errorStatus });
+				}
+				yield event;
+			}
+		} catch (error) {
+			await markOnce(error);
+			throw error;
+		}
+	}
+	const result = observed() as unknown as AssistantMessageEventStream;
+	result.result = async () => {
+		try {
+			const message = await events.result();
+			if (message.stopReason === "error") {
+				await markOnce(message.transportFailure ?? { kind: "transport", status: message.errorStatus });
+			}
+			return message;
+		} catch (error) {
+			await markOnce(error);
+			throw error;
+		}
+	};
+	return result;
+}
+
 function clientClosedResponse(route: { module: FormatModule }): Response {
 	return route.module.formatError(499, "request_aborted", "client closed request");
 }
@@ -361,17 +447,21 @@ async function handleFormatEndpoint(
 
 	const streamOpts = buildStreamOptions(parsed, model.api, controller.signal);
 	streamOpts.apiKey = apiKey;
-	streamOpts.onAuthError = (provider, oldKey, error) =>
-		refreshGatewayApiKeyAfterAuthError(
-			bootOpts.storage,
-			model,
-			provider,
-			oldKey,
-			error,
-			controller.signal,
-			route.label,
-			peer,
-		);
+	if (streamOpts.fallbackManaged) {
+		streamOpts.fallbackAttempt = beginAttempt(model.id, "auth-gateway");
+	} else {
+		streamOpts.onAuthError = (provider, oldKey, error) =>
+			refreshGatewayApiKeyAfterAuthError(
+				bootOpts.storage,
+				model,
+				provider,
+				oldKey,
+				error,
+				controller.signal,
+				route.label,
+				peer,
+			);
+	}
 
 	logger.info("auth-gateway request", {
 		format: route.label,
@@ -387,9 +477,33 @@ async function handleFormatEndpoint(
 		if (controller.signal.aborted) return clientClosedResponse(route);
 		events = streamSimple(model, parsed.context, streamOpts);
 	} catch (error) {
+		if (streamOpts.fallbackManaged) {
+			await markManagedGatewayCredentialFailure(
+				bootOpts.storage,
+				model,
+				apiKey,
+				error,
+				controller.signal,
+				route.label,
+				peer,
+			);
+		}
 		const classified = classifyGatewayError(error);
 		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
 		return route.module.formatError(classified.status, classified.type, classified.message);
+	}
+	if (streamOpts.fallbackManaged) {
+		events = observeManagedGatewayFailure(events, error =>
+			markManagedGatewayCredentialFailure(
+				bootOpts.storage,
+				model,
+				apiKey,
+				error,
+				controller.signal,
+				route.label,
+				peer,
+			),
+		);
 	}
 
 	if (!parsed.stream) {
@@ -509,17 +623,21 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	// only inject server-controlled fields. The OpenAI code backend temperature/topP strip
 	// matches `buildStreamOptions` — OpenAI code backend rejects them with a 400.
 	const streamOpts: SimpleStreamOptions = { ...parsed.options, apiKey, signal: controller.signal };
-	streamOpts.onAuthError = (provider, oldKey, error) =>
-		refreshGatewayApiKeyAfterAuthError(
-			bootOpts.storage,
-			model,
-			provider,
-			oldKey,
-			error,
-			controller.signal,
-			"pi-native",
-			peer,
-		);
+	if (streamOpts.fallbackManaged) {
+		streamOpts.fallbackAttempt = beginAttempt(model.id, "auth-gateway-pi-native");
+	} else {
+		streamOpts.onAuthError = (provider, oldKey, error) =>
+			refreshGatewayApiKeyAfterAuthError(
+				bootOpts.storage,
+				model,
+				provider,
+				oldKey,
+				error,
+				controller.signal,
+				"pi-native",
+				peer,
+			);
+	}
 	if (model.api === "openai-codex-responses") {
 		delete streamOpts.temperature;
 		delete streamOpts.topP;
@@ -547,9 +665,33 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		if (controller.signal.aborted) return aborted();
 		events = streamSimple(model, parsed.context, streamOpts);
 	} catch (error) {
+		if (streamOpts.fallbackManaged) {
+			await markManagedGatewayCredentialFailure(
+				bootOpts.storage,
+				model,
+				apiKey,
+				error,
+				controller.signal,
+				"pi-native",
+				peer,
+			);
+		}
 		const classified = classifyGatewayError(error);
 		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
 		return piNative.formatError(classified.status, classified.type, classified.message);
+	}
+	if (streamOpts.fallbackManaged) {
+		events = observeManagedGatewayFailure(events, error =>
+			markManagedGatewayCredentialFailure(
+				bootOpts.storage,
+				model,
+				apiKey,
+				error,
+				controller.signal,
+				"pi-native",
+				peer,
+			),
+		);
 	}
 
 	if (!parsed.stream) {

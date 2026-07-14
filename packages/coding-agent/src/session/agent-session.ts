@@ -28,6 +28,9 @@ import {
 	type AgentTool,
 	assertImagePlaceholdersHavePayload,
 	canContinuePersistedHistory,
+	type ManagedAttemptContinuationOwnership,
+	type ManagedAttemptDecision,
+	type ManagedAttemptOutcome,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
@@ -74,20 +77,20 @@ import type {
 	TextContent,
 	ToolCall,
 	ToolChoice,
+	TransportFailureFacts,
 	Usage,
 	UsageReport,
 } from "@gajae-code/ai";
 import {
-	calculateRateLimitBackoffMs,
 	clearAnthropicFastModeFallback,
 	getSupportedEfforts,
 	isContextOverflow,
 	isUsageLimitError,
 	modelsAreEqual,
-	parseRateLimitReason,
 	resolveServiceTier,
 	streamSimple,
 } from "@gajae-code/ai";
+import { beginAttempt, classifyFallbackTrigger } from "@gajae-code/ai/utils/fallback-transport";
 
 export interface ForkContextSeedMetadata {
 	sourceSessionId: string;
@@ -137,18 +140,26 @@ import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
-import { GJC_MODEL_ASSIGNMENT_TARGETS, MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
+import {
+	GJC_MODEL_ASSIGNMENT_TARGETS,
+	isAuthenticated,
+	MODEL_ROLE_IDS,
+	type ModelRegistry,
+} from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
 	formatModelString,
+	managedCursorFallbackUnavailableReason,
 	parseModelString,
 	type ResolvedModelRoleValue,
+	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
+import { normalizeModelSelectorValue } from "../config/model-selector-value";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
-import type { Settings, SkillsSettings } from "../config/settings";
+import type { GlobalDefaultModelRoleCommit, Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
@@ -196,7 +207,6 @@ import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import { buildSkillPromptMessage, type Skill, type SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
-
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
 import {
 	assertNonEmptyGjcSessionId,
@@ -286,6 +296,20 @@ import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-
 import { buildWorkflowIntentDiff, WORKFLOW_INTENT_DIFF_CUSTOM_TYPE } from "../workflow/workflow-intent-diff";
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
 import type { AuthStorage } from "./auth-storage";
+import {
+	DefaultModelSelectionRecoveryError,
+	type DefaultModelSelectionResult,
+	type DefaultModelSelectionRollbackStage,
+} from "./default-model-selection";
+import {
+	type ConfiguredFallbackChain,
+	effectiveFallbackDelay,
+	FallbackChainController,
+	type FallbackTriggerClass,
+} from "./fallback-chain-controller";
+
+export { DefaultModelSelectionRecoveryError } from "./default-model-selection";
+
 import type {
 	ClientBridge,
 	ClientBridgePermissionOption,
@@ -315,6 +339,7 @@ import { formatSessionDumpText } from "./session-dump-format";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
+	DefaultModelSelectionStage,
 	NewSessionOptions,
 	SessionContext,
 	SessionManager,
@@ -354,8 +379,18 @@ export type AgentSessionEvent =
 			unbounded?: boolean;
 	  }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
-	| { type: "retry_fallback_applied"; from: string; to: string; role: string }
-	| { type: "retry_fallback_succeeded"; model: string; role: string }
+	| {
+			type: "model_fallback_switched";
+			eventId: string;
+			from: string;
+			to: string;
+			reason: string;
+			role: string;
+			scope: string;
+			activeIndex: number;
+			chainLength: number;
+			attemptsUsed: number;
+	  }
 	| { type: "ttsr_triggered"; rules: Rule[] }
 	| { type: "todo_reminder"; todos: TodoItem[]; attempt: number; maxAttempts: number }
 	| { type: "todo_auto_clear" }
@@ -434,7 +469,11 @@ export interface AgentSessionConfig {
 	/** Current session message-to-LLM conversion pipeline */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
-	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
+	rebuildSystemPrompt?: (
+		toolNames: string[],
+		tools: Map<string, AgentTool>,
+		candidateModel?: Model,
+	) => Promise<{ systemPrompt: string[] }>;
 	/** Initial workspace tree snapshot used for the first volatile per-turn context message. */
 	workspaceTree?: WorkspaceTree;
 	/** Rebuild the SSH tool from current capability discovery results. */
@@ -553,6 +592,37 @@ export interface ModelCycleResult {
 	isScoped: boolean;
 }
 
+export type ModelChangeCause =
+	| "user-selection"
+	| "profile-activation"
+	| "fallback-switch"
+	| "restore"
+	| "rollback"
+	| "startup-override"
+	| "temporary-operation";
+
+export type TemporaryModelReason =
+	| "plan-mode"
+	| "context-promotion"
+	| "temporary-cycle"
+	| "profile-preview"
+	| "extension-temporary"
+	| "other";
+
+/** Opaque handle for a non-destructive temporary provider-session scope. */
+export interface TemporaryProviderSessionScope {
+	readonly reason: TemporaryModelReason;
+}
+
+interface TemporaryProviderSessionScopeRecord {
+	token: TemporaryProviderSessionScope;
+	autoOwned: boolean;
+	model: Model | undefined;
+	thinkingLevel: ThinkingLevel | undefined;
+	fallbackController: FallbackChainController | undefined;
+	providerSessionState: Map<string, ProviderSessionState>;
+}
+
 /** Result from cycleRoleModels() */
 export interface RoleModelCycleResult {
 	model: Model;
@@ -588,9 +658,6 @@ export interface SessionStats {
 
 /** Standard thinking levels */
 
-type RetryFallbackChains = Record<string, string[]>;
-
-type RetryFallbackRevertPolicy = "never" | "cooldown-expiry";
 type RetryErrorClassification =
 	| "none"
 	| "overflow"
@@ -600,42 +667,6 @@ type RetryErrorClassification =
 	| "transient"
 	| "local_unavailable"
 	| "unknown";
-
-interface RetryFallbackSelector {
-	raw: string;
-	provider: string;
-	id: string;
-	thinkingLevel: ThinkingLevel | undefined;
-}
-
-interface ActiveRetryFallbackState {
-	role: string;
-	originalSelector: string;
-	originalThinkingLevel: ThinkingLevel | undefined;
-	lastAppliedFallbackThinkingLevel: ThinkingLevel | undefined;
-}
-
-function parseRetryFallbackSelector(selector: string): RetryFallbackSelector | undefined {
-	const trimmed = selector.trim();
-	if (!trimmed) return undefined;
-	const parsed = parseModelString(trimmed);
-	if (!parsed) return undefined;
-	return {
-		raw: trimmed,
-		provider: parsed.provider,
-		id: parsed.id,
-		thinkingLevel: parsed.thinkingLevel,
-	};
-}
-
-function formatRetryFallbackSelector(model: Model, thinkingLevel: ThinkingLevel | undefined): string {
-	const selector = formatModelString(model);
-	return thinkingLevel ? `${selector}:${thinkingLevel}` : selector;
-}
-
-function formatRetryFallbackBaseSelector(selector: RetryFallbackSelector): string {
-	return `${selector.provider}/${selector.id}`;
-}
 
 function isLocalModelEndpoint(model: Model | undefined): boolean {
 	if (!model) return false;
@@ -1210,6 +1241,8 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
+	#defaultModelSelectionTail: Promise<void> = Promise.resolve();
+	#defaultModelSelectionMutationRevision = 0;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -1220,6 +1253,8 @@ export class AgentSession {
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
 	#eventListenerSnapshot: readonly AgentSessionEventListener[] = Object.freeze([]);
+	/** Resolution-time switches that occur before a consumer can subscribe. */
+	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
 
 	#rebuildEventListenerSnapshot(): void {
 		this.#eventListenerSnapshot = Object.freeze([...this.#eventListeners]);
@@ -1253,8 +1288,9 @@ export class AgentSession {
 	#allowAcpAgentInitiatedTurns = false;
 	/** Per-session memory of allow_always / reject_always decisions for gated tools. */
 	#acpPermissionDecisions: Map<string, "allow_always" | "reject_always"> = new Map();
-	/** SDK-controlled permission policy applied before ACP client prompting. */
-	#sdkPermissionMode: "prompt" | "allow" | "deny" = "prompt";
+	/** SDK-controlled permission policy applied before ACP client prompting. Defaults to `allow` so callers
+	 * without a reverse permission provider (TUI, print/headless) run guarded tools; ACP/SDK set this explicitly. */
+	#sdkPermissionMode: "prompt" | "allow" | "deny" = "allow";
 	/** Permission provider registered by a live SDK reverse lease. */
 	#sdkPermissionProvider:
 		| ((
@@ -1292,7 +1328,9 @@ export class AgentSession {
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
-	#activeRetryFallback: ActiveRetryFallbackState | undefined = undefined;
+	#defaultFallbackController: FallbackChainController | undefined;
+	#defaultFallbackExhaustedLastTurn = false;
+	#fallbackInvocationId = 0;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
 	#lastGoalReminderAssistantTimestamp: number | undefined = undefined;
@@ -1367,7 +1405,11 @@ export class AgentSession {
 	#onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#rebuildSystemPrompt:
-		| ((toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>)
+		| ((
+				toolNames: string[],
+				tools: Map<string, AgentTool>,
+				candidateModel?: Model,
+		  ) => Promise<{ systemPrompt: string[] }>)
 		| undefined;
 	#getMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
 	#reloadSshTool: (() => Promise<AgentTool | null>) | undefined;
@@ -1384,6 +1426,9 @@ export class AgentSession {
 	 * the dominant cause of prompt-cache invalidation in long sessions.
 	 */
 	#lastAppliedToolSignature: string | undefined;
+	#pendingAppliedToolSignature: string | undefined;
+	#baseSystemPromptGeneration = 0;
+	#pendingBaseSystemPromptRebuilds = new Set<Promise<void>>();
 	#mcpDiscoveryEnabled = false;
 	#discoverableMCPTools = new Map<string, DiscoverableMCPTool>();
 	#discoverableMCPSearchIndex: DiscoverableMCPSearchIndex | null = null;
@@ -1467,6 +1512,10 @@ export class AgentSession {
 	// async event handlers settle. Subscribers treat agent_end as readiness, so
 	// publishing it earlier lets a successor corrupt the prior prompt's lifecycle.
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	// A scheduled continuation owns this terminal boundary until it either starts
+	// the successor or proves it cannot. Holds prevent a false idle event while
+	// preserving the predecessor for cancellation and preflight failures.
+	#pendingAgentEndContinuationHolds = new Map<symbol, AgentSessionEvent>();
 
 	#obfuscator: SecretObfuscator | undefined;
 	#checkpointState: CheckpointState | undefined = undefined;
@@ -1479,6 +1528,8 @@ export class AgentSession {
 	#promptPreflightAbortController = new AbortController();
 
 	#providerSessionState = new Map<string, ProviderSessionState>();
+	#temporaryProviderSessionScopes: TemporaryProviderSessionScopeRecord[] = [];
+
 	/**
 	 * Provider keys for which the Anthropic fast-mode auto-fallback fired this
 	 * session (the provider rejected `speed:"fast"` and we retried without it).
@@ -1527,10 +1578,6 @@ export class AgentSession {
 
 	#beginInFlight(): void {
 		this.#promptInFlightCount++;
-		// A successor that starts before a deferred terminal event is published keeps
-		// the session continuously busy; emitting the predecessor's idle boundary later
-		// would create a false readiness window between the two prompts.
-		this.#pendingAgentEndEmit = undefined;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
 		}
@@ -1560,8 +1607,49 @@ export class AgentSession {
 		}
 	}
 
-	#suppressDeferredAgentEndForContinuation(): void {
-		this.#pendingAgentEndEmit = undefined;
+	#reserveDeferredAgentEndForContinuation(): symbol | undefined {
+		const pending = this.#pendingAgentEndEmit;
+		if (!pending) return undefined;
+		const hold = Symbol("deferred-agent-end-continuation");
+		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+		return hold;
+	}
+
+	#claimDeferredAgentEndForContinuation(hold: symbol | undefined): AgentSessionEvent | undefined {
+		if (!hold) return undefined;
+		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
+		this.#pendingAgentEndContinuationHolds.delete(hold);
+		if (pending && this.#pendingAgentEndEmit === pending) {
+			this.#pendingAgentEndEmit = undefined;
+			for (const [candidate, candidatePending] of this.#pendingAgentEndContinuationHolds) {
+				if (candidatePending === pending) this.#pendingAgentEndContinuationHolds.delete(candidate);
+			}
+		}
+		return pending;
+	}
+
+	#restoreDeferredAgentEndAfterContinuationFailure(pending: AgentSessionEvent | undefined): void {
+		if (pending && !this.#pendingAgentEndEmit) {
+			this.#pendingAgentEndEmit = pending;
+		}
+		this.#flushPendingAgentEnd();
+	}
+
+	#releaseDeferredAgentEndContinuation(hold: symbol | undefined): void {
+		if (!hold) return;
+		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
+		this.#pendingAgentEndContinuationHolds.delete(hold);
+		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
+	}
+
+	#releaseDeferredAgentEndContinuations(): void {
+		let pending: AgentSessionEvent | undefined;
+		for (const candidate of this.#pendingAgentEndContinuationHolds.values()) {
+			pending = candidate;
+			break;
+		}
+		this.#pendingAgentEndContinuationHolds.clear();
+		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
 	}
 
 	#endInFlight(): void {
@@ -1574,7 +1662,12 @@ export class AgentSession {
 	}
 
 	#flushPendingAgentEnd(): void {
-		if (this.#promptInFlightCount > 0 || this.#agentEventHandlersInFlight > 0 || this.#queuedExtensionEventCount > 0)
+		if (
+			this.#promptInFlightCount > 0 ||
+			this.#agentEventHandlersInFlight > 0 ||
+			this.#queuedExtensionEventCount > 0 ||
+			this.#pendingAgentEndContinuationHolds.size > 0
+		)
 			return;
 		const pending = this.#pendingAgentEndEmit;
 		if (!pending) return;
@@ -1624,7 +1717,6 @@ export class AgentSession {
 		if (config.providerSessionState) {
 			this.#providerSessionState = config.providerSessionState;
 		}
-		this.#validateRetryFallbackChains();
 		this.#toolRegistry = config.toolRegistry ?? new Map();
 		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
@@ -1672,7 +1764,11 @@ export class AgentSession {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
-				await this.agent.prompt(messages.length === 1 ? first : messages);
+				if (messages.length === 1) {
+					await this.agent.prompt(first, this.#managedFallbackPromptOptions());
+				} else {
+					await this.agent.prompt(messages, this.#managedFallbackPromptOptions());
+				}
 			},
 			scheduleIdleFlush: run => {
 				this.#schedulePostPromptTask(
@@ -1871,6 +1967,90 @@ export class AgentSession {
 	/** Provider-scoped mutable state store for transport/session caches. */
 	get providerSessionState(): Map<string, ProviderSessionState> {
 		return this.#providerSessionState;
+	}
+
+	/** Suspend provider state without closing it while a temporary model is active. */
+	beginTemporaryProviderSessionScope(reason: TemporaryModelReason): TemporaryProviderSessionScope {
+		return this.#beginTemporaryProviderSessionScope(reason, false);
+	}
+
+	#beginTemporaryProviderSessionScope(
+		reason: TemporaryModelReason,
+		autoOwned: boolean,
+	): TemporaryProviderSessionScope {
+		const token: TemporaryProviderSessionScope = Object.freeze({ reason });
+		this.#temporaryProviderSessionScopes.push({
+			token,
+			autoOwned,
+			model: this.model,
+			thinkingLevel: this.#thinkingLevel,
+			fallbackController: this.#defaultFallbackController,
+			providerSessionState: this.#providerSessionState,
+		});
+		this.#rebindProviderSessionState(new Map());
+		const temporaryModel = this.model;
+		this.#defaultFallbackController = new FallbackChainController(
+			{
+				role: "default",
+				entries: temporaryModel ? [formatModelString(temporaryModel)] : [],
+				origin: "temporary-provider-scope",
+				explicitHead: true,
+			},
+			this.settings.get("fallback.maxAttempts"),
+		);
+		return token;
+	}
+
+	/** Returns the topmost auto-owned scope without retaining a separate ownership handle. */
+	#currentAutoTemporaryProviderSessionScope(): TemporaryProviderSessionScopeRecord | undefined {
+		return this.#temporaryProviderSessionScopes.findLast(scope => scope.autoOwned);
+	}
+
+	/** Restore a temporary scope, unwinding any auto-owned scopes above it. */
+	restoreTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): boolean {
+		const scopeIndex = this.#temporaryProviderSessionScopes.findLastIndex(scope => scope.token === token);
+		if (
+			scopeIndex < 0 ||
+			this.#temporaryProviderSessionScopes.slice(scopeIndex + 1).some(scope => !scope.autoOwned)
+		) {
+			return false;
+		}
+		while (this.#temporaryProviderSessionScopes.length > scopeIndex) {
+			this.#restoreTopTemporaryProviderSessionScope();
+		}
+		return true;
+	}
+
+	#restoreTopTemporaryProviderSessionScope(): void {
+		const scope = this.#temporaryProviderSessionScopes.pop();
+		if (!scope) return;
+		this.#closeProviderSessionMap(this.#providerSessionState, "temporary scope restore");
+		this.#rebindProviderSessionState(scope.providerSessionState);
+		this.#defaultFallbackController = scope.fallbackController;
+		const previousEditMode = this.#resolveActiveEditMode();
+		if (scope.model) {
+			this.agent.setModel(scope.model);
+			this.#syncAppendOnlyContext(scope.model);
+		}
+		this.#thinkingLevel = scope.thinkingLevel;
+		this.agent.setThinkingLevel(toReasoningEffort(scope.thinkingLevel));
+		void this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	/** Promote a temporary scope. The suspended provider state is permanently closed. */
+	commitTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): boolean {
+		const scope = this.#temporaryProviderSessionScopes.at(-1);
+		if (!scope || scope.token !== token) return false;
+		this.#temporaryProviderSessionScopes.pop();
+		this.#closeProviderSessionMap(scope.providerSessionState, "temporary scope commit");
+		return true;
+	}
+
+	/** Permanently discard every suspended map while retaining the active map. */
+	#commitAllTemporaryProviderSessionScopes(): void {
+		const scopes = this.#temporaryProviderSessionScopes;
+		this.#temporaryProviderSessionScopes = [];
+		for (const scope of scopes) this.#closeProviderSessionMap(scope.providerSessionState, "permanent model change");
 	}
 
 	async buildForkContextSeed(options: ForkContextSeedOptions): Promise<ForkContextSeed> {
@@ -2605,13 +2785,6 @@ export class AgentSession {
 					assistantMsg.stopReason !== "aborted" &&
 					this.#retryAttempt > 0
 				) {
-					if (this.#activeRetryFallback && this.model) {
-						await this.#emitSessionEvent({
-							type: "retry_fallback_succeeded",
-							model: formatRetryFallbackSelector(this.model, this.thinkingLevel),
-							role: this.#activeRetryFallback.role,
-						});
-					}
 					await this.#emitSessionEvent({
 						type: "auto_retry_end",
 						success: true,
@@ -2711,6 +2884,7 @@ export class AgentSession {
 			this.#lastAssistantMessage = undefined;
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
+				this.#resolveRetry();
 				return;
 			}
 
@@ -2841,6 +3015,7 @@ export class AgentSession {
 				try {
 					await scheduler.wait(delayMs, { signal });
 				} catch {
+					options?.onSkip?.();
 					return;
 				}
 			}
@@ -2867,40 +3042,72 @@ export class AgentSession {
 		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
 		onError?: (error: unknown) => void;
 	}): Promise<void> {
-		if (options?.suppressPredecessorAgentEnd) {
-			this.#suppressDeferredAgentEndForContinuation();
-		}
-
+		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
+			? this.#reserveDeferredAgentEndForContinuation()
+			: undefined;
+		let terminalized = false;
+		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained") => {
+			if (terminalized) return;
+			terminalized = true;
+			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+			options?.onSkip?.(reason);
+		};
+		const fail = (error: unknown) => {
+			if (terminalized) return;
+			terminalized = true;
+			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+			logger.warn("agent.continue failed after scheduling", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			options?.onError?.(error);
+		};
 		const scheduledGeneration = options?.generation;
 		const signal = this.#postPromptTasksAbortController.signal;
 		return this.#schedulePostPromptTask(
 			async () => {
 				if (signal.aborted) {
-					options?.onSkip?.("aborted_signal");
+					skip("aborted_signal");
 					return;
 				}
 				if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-					options?.onSkip?.("generation_changed");
+					skip("generation_changed");
 					return;
 				}
 				if (options?.shouldContinue && !options.shouldContinue()) {
-					options.onSkip?.("queue_drained");
+					skip("queue_drained");
 					return;
 				}
 				try {
-					await this.#maybeRestoreRetryFallbackPrimary();
 					if (!options?.skipCompactionCheck) {
 						await this.#checkEstimatedContextBeforePrompt();
 					}
-					await this.agent.continue();
+					if (signal.aborted) {
+						skip("aborted_signal");
+						return;
+					}
+					if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+						skip("generation_changed");
+						return;
+					}
+					if (options?.shouldContinue && !options.shouldContinue()) {
+						skip("queue_drained");
+						return;
+					}
+					const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
+					try {
+						await this.agent.continue(this.#managedFallbackPromptOptions());
+					} catch (error) {
+						this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+						throw error;
+					}
 				} catch (error) {
-					logger.warn("agent.continue failed after scheduling", {
-						error: error instanceof Error ? error.message : String(error),
-					});
-					options?.onError?.(error);
+					fail(error);
 				}
 			},
-			{ delayMs: options?.delayMs },
+			{
+				delayMs: options?.delayMs,
+				onSkip: () => skip("aborted_signal"),
+			},
 		);
 	}
 
@@ -2966,11 +3173,7 @@ export class AgentSession {
 	}
 
 	#scheduleAutoContinuePrompt(generation: number): void {
-		// The turn whose agent_end triggered auto-compaction is being continued, so
-		// that agent_end is not a terminal readiness signal. Suppress the deferred
-		// predecessor before the post-prompt flush can leak an idle boundary; the
-		// continuation emits the authoritative terminal agent_end when it settles.
-		this.#suppressDeferredAgentEndForContinuation();
+		const predecessorAgentEndHold = this.#reserveDeferredAgentEndForContinuation();
 		const continuePrompt = async () => {
 			await this.#promptWithMessage(
 				{
@@ -2980,26 +3183,32 @@ export class AgentSession {
 					timestamp: Date.now(),
 				},
 				autoContinuePrompt,
-				{ skipPostPromptRecoveryWait: true, skipCompactionCheck: true },
+				{
+					skipPostPromptRecoveryWait: true,
+					skipCompactionCheck: true,
+					predecessorAgentEndHold,
+				},
 			);
 		};
 		const scheduledGeneration = generation;
 		const signal = this.#postPromptTasksAbortController.signal;
 		this.#trackPostPromptTask(
 			(async () => {
-				await Promise.resolve();
-				if (signal.aborted) {
-					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-					return;
-				}
-				if (this.#promptGeneration !== scheduledGeneration) {
-					this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
-					return;
-				}
 				try {
+					await Promise.resolve();
+					if (signal.aborted) {
+						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+						return;
+					}
+					if (this.#promptGeneration !== scheduledGeneration) {
+						this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+						return;
+					}
 					await continuePrompt();
 				} catch (error) {
 					this.#logCompactionContinuationError("auto_continue_prompt", error);
+				} finally {
+					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 				}
 			})(),
 		);
@@ -3012,11 +3221,13 @@ export class AgentSession {
 
 		const pendingTasks = Array.from(this.#postPromptTasks);
 		if (pendingTasks.length === 0) {
+			this.#releaseDeferredAgentEndContinuations();
 			this.#resolvePostPromptTasks();
 			return;
 		}
 
 		await Promise.allSettled(pendingTasks);
+		this.#releaseDeferredAgentEndContinuations();
 		if (this.#postPromptTasks.size === 0) {
 			this.#resolvePostPromptTasks();
 		}
@@ -3026,6 +3237,7 @@ export class AgentSession {
 		this.#postPromptTasksAbortController.abort();
 		this.#postPromptTasksAbortController = new AbortController();
 		this.#postPromptTasks.clear();
+		this.#releaseDeferredAgentEndContinuations();
 		this.#resolveTtsrResume();
 		this.#resolvePostPromptTasks();
 	}
@@ -3850,6 +4062,7 @@ export class AgentSession {
 	subscribe(listener: AgentSessionEventListener): () => void {
 		this.#eventListeners.push(listener);
 		this.#rebuildEventListenerSnapshot();
+		for (const event of this.#pendingFallbackSwitches.splice(0)) listener(event);
 
 		// Return unsubscribe function for this specific listener
 		return () => {
@@ -4043,20 +4256,27 @@ export class AgentSession {
 		await Promise.race([work, Bun.sleep(timeoutMs)]);
 	}
 
-	#closeAllProviderSessions(reason: string): void {
-		for (const [providerKey, state] of this.#providerSessionState) {
+	#rebindProviderSessionState(providerSessionState: Map<string, ProviderSessionState>): void {
+		this.#providerSessionState = providerSessionState;
+		this.agent.providerSessionState = providerSessionState;
+	}
+
+	#closeProviderSessionMap(providerSessionState: Map<string, ProviderSessionState>, reason: string): void {
+		for (const [providerKey, state] of providerSessionState) {
 			try {
 				state.close();
 			} catch (error) {
-				logger.warn("Failed to close provider session state", {
-					providerKey,
-					reason,
-					error: String(error),
-				});
+				logger.warn("Failed to close provider session state", { providerKey, reason, error: String(error) });
 			}
 		}
+		providerSessionState.clear();
+	}
 
-		this.#providerSessionState.clear();
+	#closeAllProviderSessions(reason: string): void {
+		const maps = new Set<Map<string, ProviderSessionState>>([this.#providerSessionState]);
+		for (const scope of this.#temporaryProviderSessionScopes) maps.add(scope.providerSessionState);
+		this.#temporaryProviderSessionScopes = [];
+		for (const providerSessionState of maps) this.#closeProviderSessionMap(providerSessionState, reason);
 	}
 
 	// =========================================================================
@@ -4309,6 +4529,55 @@ export class AgentSession {
 
 	#resolveActiveEditMode(): EditMode {
 		return resolveEditMode(this.#getEditModeSession());
+	}
+
+	#resolveEditModeForModel(model: Model): EditMode {
+		return resolveEditMode({
+			settings: this.settings,
+			getActiveModelString: () => formatModelString(model),
+		});
+	}
+
+	async #prepareDefaultModelSelectionPrompt(model: Model): Promise<string[] | undefined> {
+		if (!this.#rebuildSystemPrompt) return undefined;
+		if (!this.getActiveToolNames().includes("edit")) return undefined;
+		if (this.#resolveActiveEditMode() === this.#resolveEditModeForModel(model)) return undefined;
+		const built = await this.#rebuildSystemPrompt(this.getActiveToolNames(), this.#toolRegistry, model);
+		return built.systemPrompt;
+	}
+
+	#reserveBaseSystemPromptGeneration(): number {
+		this.#baseSystemPromptGeneration++;
+		return this.#baseSystemPromptGeneration;
+	}
+
+	async #runAdmittedBaseSystemPromptRebuild<T>(build: () => Promise<T>): Promise<T> {
+		const completion = Promise.withResolvers<void>();
+		this.#pendingBaseSystemPromptRebuilds.add(completion.promise);
+		try {
+			return await build();
+		} finally {
+			completion.resolve();
+			this.#pendingBaseSystemPromptRebuilds.delete(completion.promise);
+		}
+	}
+
+	async #waitForAdmittedBaseSystemPromptRebuilds(): Promise<void> {
+		while (this.#pendingBaseSystemPromptRebuilds.size > 0) {
+			await Promise.all(this.#pendingBaseSystemPromptRebuilds);
+		}
+	}
+
+	#applyPreparedDefaultModelSelectionPrompt(systemPrompt: string[] | undefined): void {
+		if (!systemPrompt) return;
+		this.#reserveBaseSystemPromptGeneration();
+		this.#baseSystemPrompt = systemPrompt;
+		this.agent.setSystemPrompt(this.#baseSystemPrompt);
+		const activeToolNames = this.getActiveToolNames();
+		const activeTools = activeToolNames
+			.map(name => this.#toolRegistry.get(name))
+			.filter((tool): tool is AgentTool => tool != null);
+		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
 	}
 
 	async #syncEditToolModeAfterModelChange(previousEditMode: EditMode): Promise<void> {
@@ -4694,6 +4963,13 @@ export class AgentSession {
 				this.#selectedDiscoveredToolNames.delete(name);
 			}
 		}
+		const signature = this.#computeAppliedToolSignature(validToolNames, tools);
+		const promptRelevantToolsChanged =
+			signature !== (this.#pendingAppliedToolSignature ?? this.#lastAppliedToolSignature);
+		if (promptRelevantToolsChanged) {
+			this.#defaultModelSelectionMutationRevision++;
+			this.#pendingAppliedToolSignature = signature;
+		}
 		this.#setGuardedAgentTools(tools);
 
 		// Active tool set changed → discoverable tool list (which excludes already-active tools)
@@ -4705,14 +4981,27 @@ export class AgentSession {
 		// `refreshMCPTools` -> `#applyActiveToolsByName` even though the resulting
 		// tool list is byte-identical. Skipping the rebuild keeps the system prompt
 		// stable, which is required for Anthropic prompt caching to keep hitting.
-		if (this.#rebuildSystemPrompt) {
-			const signature = this.#computeAppliedToolSignature(validToolNames, tools);
-			if (signature !== this.#lastAppliedToolSignature) {
-				const built = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry);
-				this.#baseSystemPrompt = built.systemPrompt;
-				this.agent.setSystemPrompt(this.#baseSystemPrompt);
-				this.#lastAppliedToolSignature = signature;
+		if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
+			const generation = this.#reserveBaseSystemPromptGeneration();
+			try {
+				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
+					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
+				);
+				if (generation === this.#baseSystemPromptGeneration) {
+					this.#baseSystemPrompt = built.systemPrompt;
+					this.agent.setSystemPrompt(this.#baseSystemPrompt);
+					this.#lastAppliedToolSignature = signature;
+					this.#pendingAppliedToolSignature = undefined;
+				}
+			} catch (error) {
+				if (generation === this.#baseSystemPromptGeneration) {
+					this.#pendingAppliedToolSignature = undefined;
+				}
+				throw error;
 			}
+		} else if (promptRelevantToolsChanged) {
+			this.#lastAppliedToolSignature = signature;
+			this.#pendingAppliedToolSignature = undefined;
 		}
 		if (options?.persistMCPSelection !== false) {
 			this.#persistSelectedMCPToolNamesIfChanged(previousSelectedMCPToolNames);
@@ -4791,7 +5080,20 @@ export class AgentSession {
 	async refreshBaseSystemPrompt(): Promise<void> {
 		if (!this.#rebuildSystemPrompt) return;
 		const activeToolNames = this.getActiveToolNames();
-		const built = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
+		const generation = this.#reserveBaseSystemPromptGeneration();
+		this.#defaultModelSelectionMutationRevision++;
+		let built: { systemPrompt: string[] };
+		try {
+			built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
+				this.#rebuildSystemPrompt!(activeToolNames, this.#toolRegistry),
+			);
+		} catch (error) {
+			if (generation === this.#baseSystemPromptGeneration) {
+				this.#pendingAppliedToolSignature = undefined;
+			}
+			throw error;
+		}
+		if (generation !== this.#baseSystemPromptGeneration) return;
 		this.#baseSystemPrompt = built.systemPrompt;
 		this.agent.setSystemPrompt(this.#baseSystemPrompt);
 		// Refresh the cached signature so a subsequent `#applyActiveToolsByName` with
@@ -4801,6 +5103,7 @@ export class AgentSession {
 			.map(name => this.#toolRegistry.get(name))
 			.filter((tool): tool is AgentTool => tool != null);
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
+		this.#pendingAppliedToolSignature = undefined;
 	}
 
 	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
@@ -5893,14 +6196,23 @@ export class AgentSession {
 		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
+			predecessorAgentEndHold?: symbol;
 		},
 	): Promise<void> {
 		this.#beginInFlight();
+		const predecessorAgentEndHold =
+			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
 		const generation = this.#promptGeneration;
 		const preflightSignal = this.#promptPreflightAbortController.signal;
-
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		try {
+			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+			if (message.role === "user") {
+				await this.#resetDefaultFallbackForNewTurn();
+				await this.#ensureDefaultFallbackResolution();
+				this.#defaultFallbackChain().resetAttemptBudget();
+				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+			}
 			// Flush any pending bash messages before the new prompt
 			this.#flushPendingBashMessages();
 			this.#flushPendingPythonMessages();
@@ -5908,8 +6220,6 @@ export class AgentSession {
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
-
-			await this.#maybeRestoreRetryFallbackPrimary();
 
 			// Validate model
 			if (!this.model) {
@@ -6070,9 +6380,13 @@ export class AgentSession {
 				return;
 			}
 
-			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
+			const agentPromptOptions = {
+				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
+				...this.#managedFallbackPromptOptions(),
+			};
 			options?.onPreflightAccepted?.();
-			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions);
+			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
 				rosterClaim &&
@@ -6100,6 +6414,7 @@ export class AgentSession {
 				);
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
+			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 			this.#endInFlight();
 		}
 	}
@@ -6958,6 +7273,8 @@ export class AgentSession {
 		this.abortBash();
 		this.abortEval();
 		const postPromptDrain = this.#cancelPostPromptTasks();
+		const managedLogicalRunId =
+			this.#defaultFallbackChain().chain.entries.length > 1 ? this.agent.currentManagedLogicalRunId : undefined;
 		this.agent.abort();
 		const cleanup = Promise.all([postPromptDrain, this.agent.waitForIdle()]).then(
 			() => ({ type: "settled" as const }),
@@ -6985,6 +7302,11 @@ export class AgentSession {
 			}
 		}
 		await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
+		if (managedLogicalRunId !== undefined) {
+			// Agent-core owns terminalization for the logical managed run, which
+			// remains stable across fallback attempt retries.
+			this.agent.requestRunTerminal(managedLogicalRunId, { stopReason: "cancelled" });
+		}
 		// waitForIdle resolves before #promptWithMessage's finally and asynchronous
 		// event handlers necessarily unwind. Keep their counters intact: #endInFlight
 		// and the event barrier publish deferred readiness only when they actually settle.
@@ -7047,6 +7369,7 @@ export class AgentSession {
 		await this.abort();
 		this.#cancelOwnAsyncJobs();
 		this.#closeAllProviderSessions("new session");
+		this.#rebindProviderSessionState(new Map());
 		this.agent.reset();
 		if (options?.drop && previousSessionFile) {
 			try {
@@ -7223,7 +7546,7 @@ export class AgentSession {
 	async setModel(
 		model: Model,
 		role: string = "default",
-		options?: { selector?: string; thinkingLevel?: ThinkingLevel },
+		options?: { selector?: string; thinkingLevel?: ThinkingLevel; cause?: ModelChangeCause },
 	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
@@ -7231,14 +7554,38 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
-		this.#clearActiveRetryFallback();
-		this.#setModelWithProviderSessionReset(model);
+		this.#setModelAuthoritatively(model, options?.cause ?? "user-selection");
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
 		this.settings.setModelRole(
 			role,
 			this.#formatRoleModelValue(role, model, options?.selector, options?.thinkingLevel),
 		);
+		if (role === "default") {
+			this.#defaultFallbackController = undefined;
+			this.#defaultFallbackExhaustedLastTurn = false;
+		}
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+
+		// Persist configured intent rather than a transient controller index. A pick
+		// inside an existing chain keeps its deterministic suffix; a different
+		// thinking choice for the same concrete model becomes the new head followed
+		// by that concrete entry's tail. Picks outside the chain are one-entry intent.
+		const configuredChain = this.getConfiguredModelChain(role);
+		if (configuredChain) {
+			const selectedSelector = this.#canonicalSelector(model, options?.selector, options?.thinkingLevel);
+			const exactIndex = configuredChain.indexOf(selectedSelector);
+			const concreteIndex = configuredChain.findIndex(entry => {
+				const parsed = parseModelString(entry);
+				return parsed?.provider === model.provider && parsed.id === model.id;
+			});
+			const entries =
+				exactIndex !== -1
+					? configuredChain.slice(exactIndex)
+					: concreteIndex !== -1
+						? [selectedSelector, ...configuredChain.slice(concreteIndex + 1)]
+						: [selectedSelector];
+			this.setConfiguredModelChain(role, entries, "model_selection");
+		}
 
 		// Apply the explicitly selected thinking level when the selector supplies one;
 		// otherwise prefer the model's configured defaultLevel, then preserve the current level.
@@ -7252,6 +7599,52 @@ export class AgentSession {
 
 	getActiveModelProfile(): string | undefined {
 		return this.#activeModelProfile;
+	}
+
+	/** Return the persisted configured fallback selectors for a model role. */
+	getConfiguredModelChain(role: string): readonly string[] | undefined {
+		return this.sessionManager.buildSessionContext().configuredModelChains[role]?.entries;
+	}
+
+	/** Persist the configured fallback selectors for a model role. */
+	setConfiguredModelChain(
+		role: string,
+		entries: readonly string[],
+		origin: string,
+		identity?: string,
+		explicitHead = true,
+	): void {
+		this.sessionManager.appendConfiguredModelChain({
+			role,
+			entries: [...entries],
+			origin,
+			identity,
+			explicitHead,
+			cleared: entries.length === 0,
+		});
+	}
+
+	/**
+	 * Replace only the in-memory default fallback controller. Used when startup
+	 * falls through an unavailable persisted chain to the global default, which
+	 * must not mutate the persisted configured intent.
+	 */
+	setDefaultFallbackRuntimeModel(selector: string): void {
+		this.#defaultFallbackController = new FallbackChainController(
+			{ role: "default", entries: [selector], origin: "runtime", explicitHead: true },
+			this.settings.get("fallback.maxAttempts"),
+		);
+		this.#defaultFallbackExhaustedLastTurn = false;
+	}
+
+	/**
+	 * Seed default fallback state after guarded auth-aware model resolution skips chain entries.
+	 * The configured chain's role, origin, and identity are retained by the controller.
+	 */
+	seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>): void {
+		const controller = this.#defaultFallbackChain();
+		controller.seedResolution(activeIndex, skips);
+		this.#emitResolutionFallbackSwitch(controller);
 	}
 
 	/**
@@ -7292,28 +7685,236 @@ export class AgentSession {
 	async setModelTemporary(
 		model: Model,
 		thinkingLevel?: ThinkingLevel,
-		options?: { persistAsSessionDefault?: boolean },
-	): Promise<void> {
+		options?: {
+			persistAsSessionDefault?: boolean;
+			cause?: ModelChangeCause;
+			reason?: TemporaryModelReason;
+			providerSessionScope?: TemporaryProviderSessionScope;
+		},
+		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
+	): Promise<TemporaryProviderSessionScope | void> {
+		const suppliedScope = options?.providerSessionScope;
+		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
+
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
 		if (!apiKey) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
+		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
 
-		this.#clearActiveRetryFallback();
-		this.#setModelWithProviderSessionReset(model);
-		this.sessionManager.appendModelChange(
-			`${model.provider}/${model.id}`,
-			options?.persistAsSessionDefault ? "default" : "temporary",
-		);
-		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+		const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
+		const autoCreateScope = isTemporaryOperation && !suppliedScope;
+		const currentAutoScope = this.#currentAutoTemporaryProviderSessionScope();
+		const replaceAutoScope =
+			autoCreateScope &&
+			currentAutoScope !== undefined &&
+			this.#temporaryProviderSessionScopes.at(-1) === currentAutoScope;
+		if (replaceAutoScope && currentAutoScope) {
+			this.#restoreTopTemporaryProviderSessionScope();
+		}
+		const scope = isTemporaryOperation
+			? (suppliedScope ??
+				(replaceAutoScope && this.model && modelsAreEqual(this.model, model)
+					? undefined
+					: this.#beginTemporaryProviderSessionScope(options?.reason ?? "other", true)))
+			: undefined;
+		const ownsScope = scope !== undefined && !suppliedScope;
+		try {
+			if (isTemporaryOperation) {
+				this.agent.setModel(model);
+				this.#syncAppendOnlyContext(model);
+			} else {
+				this.#setModelAuthoritatively(model, options?.cause ?? "temporary-operation");
+			}
+			this.sessionManager.appendModelChange(
+				`${model.provider}/${model.id}`,
+				options?.persistAsSessionDefault ? "default" : "temporary",
+			);
+			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
-		// Apply explicit thinking level if given; otherwise prefer the model's
-		// configured defaultLevel; otherwise re-clamp the current level.
-		this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
-		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+			// Apply explicit thinking level if given; otherwise prefer the model's
+			// configured defaultLevel; otherwise re-clamp the current level.
+			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+		} catch (error) {
+			if (ownsScope) this.restoreTemporaryProviderSessionScope(scope);
+			throw error;
+		}
+		return scope;
 	}
 
+	async #restoreDefaultModelSelectionCommit(
+		commit: GlobalDefaultModelRoleCommit,
+	): Promise<{ readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } | undefined> {
+		try {
+			if (await this.settings.restoreGlobalDefaultModelRoleIfCurrent(commit)) return undefined;
+			return {
+				stage: "durable",
+				message: "A newer default selection prevented durable recovery.",
+			};
+		} catch {
+			logger.warn("Failed to restore durable default model selection after session promotion failure", {
+				code: "default_model_selection_recovery_failed",
+				rollbackStage: "durable",
+			});
+			return {
+				stage: "durable",
+				message: "Durable default selection recovery could not be completed.",
+			};
+		}
+	}
+
+	async #discardDefaultModelSelectionStage(
+		stage: DefaultModelSelectionStage,
+	): Promise<{ readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } | undefined> {
+		try {
+			await this.sessionManager.discardDefaultModelSelectionStage(stage);
+			return undefined;
+		} catch {
+			logger.warn("Failed to discard staged default model selection after session promotion failure", {
+				code: "default_model_selection_recovery_failed",
+				rollbackStage: "session",
+			});
+			return {
+				stage: "session",
+				message: "Session replacement recovery could not be completed.",
+			};
+		}
+	}
+
+	async #throwDefaultModelSelectionRecovery(
+		error: Error,
+		stage: DefaultModelSelectionStage,
+		commit: GlobalDefaultModelRoleCommit,
+	): Promise<never> {
+		const sessionFailure = await this.#discardDefaultModelSelectionStage(stage);
+		const durableFailure = await this.#restoreDefaultModelSelectionCommit(commit);
+		const failures = [sessionFailure, durableFailure].filter(
+			(failure): failure is { readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } =>
+				failure !== undefined,
+		);
+		throw new DefaultModelSelectionRecoveryError(error.message, {
+			message: error.message,
+			rollback: {
+				disposition: failures.length === 0 ? "restored" : "partial",
+				failures,
+			},
+		});
+	}
+
+	#publishDefaultModelSelection(model: Model, thinkingLevel: ThinkingLevel, systemPrompt: string[] | undefined): void {
+		this.#clearActiveRetryFallback();
+		this.#setModelWithProviderSessionReset(model);
+		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
+		this.#thinkingLevel = thinkingLevel;
+		this.agent.setThinkingLevel(toReasoningEffort(thinkingLevel));
+		if (thinkingLevelChanged) {
+			const event: AgentSessionEvent = { type: "thinking_level_changed", thinkingLevel };
+			for (const listener of this.#eventListenerSnapshot) {
+				try {
+					listener(event);
+				} catch {
+					logger.warn("Default model selection event listener failed", {
+						code: "default_model_selection_listener_failed",
+						disposition: "continue",
+					});
+				}
+			}
+		}
+		this.#applyPreparedDefaultModelSelectionPrompt(systemPrompt);
+		try {
+			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+		} catch {
+			logger.warn("Failed to record model usage after default model selection", {
+				code: "default_model_selection_model_usage_record_failed",
+				disposition: "continue",
+			});
+		}
+	}
+
+	async setDefaultModelSelection(
+		model: Model,
+		thinkingLevel: ThinkingLevel | undefined,
+	): Promise<DefaultModelSelectionResult> {
+		const predecessor = this.#defaultModelSelectionTail;
+		const transaction = Promise.withResolvers<void>();
+		this.#defaultModelSelectionTail = transaction.promise;
+		try {
+			await predecessor;
+			if (thinkingLevel === ThinkingLevel.Inherit) {
+				throw new Error("Default model selection cannot inherit a thinking level");
+			}
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+			if (!apiKey) {
+				throw new Error(`No API key for ${model.provider}/${model.id}`);
+			}
+			const resolvedLevel = resolveThinkingLevelForModel(model, thinkingLevel);
+			const effectiveLevel =
+				resolvedLevel ??
+				resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
+				ThinkingLevel.Off;
+			await this.waitForIdle();
+			await this.sessionManager.flush();
+			await this.#waitForAdmittedBaseSystemPromptRebuilds();
+			const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
+			const preparedSystemPrompt = await this.#prepareDefaultModelSelectionPrompt(model);
+			const stage = await this.sessionManager.stageDefaultModelSelection(
+				`${model.provider}/${model.id}`,
+				effectiveLevel,
+				{ appendThinkingLevel: true },
+			);
+			let durableCommit: GlobalDefaultModelRoleCommit;
+			try {
+				durableCommit = await this.settings.setGlobalModelRoleAndFlush(
+					"default",
+					formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
+				);
+			} catch (error) {
+				await this.sessionManager.discardDefaultModelSelectionStage(stage);
+				throw error;
+			}
+			if (this.#defaultModelSelectionMutationRevision !== expectedMutationRevision) {
+				await this.#throwDefaultModelSelectionRecovery(
+					new Error("Default model selection was superseded before session promotion"),
+					stage,
+					durableCommit,
+				);
+			}
+			const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
+			switch (promotion.kind) {
+				case "promoted": {
+					this.#publishDefaultModelSelection(model, effectiveLevel, preparedSystemPrompt);
+					break;
+				}
+				case "not_promoted": {
+					return this.#throwDefaultModelSelectionRecovery(
+						promotion.error ?? new Error("Default model selection was superseded before session promotion"),
+						stage,
+						durableCommit,
+					);
+				}
+				case "unknown": {
+					const message = "Session replacement outcome could not be determined.";
+					throw new DefaultModelSelectionRecoveryError(message, {
+						message,
+						rollback: {
+							disposition: "unknown",
+							failures: [
+								{
+									stage: "session",
+									message: "Session replacement outcome could not be determined.",
+								},
+							],
+						},
+					});
+				}
+			}
+			return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
+		} finally {
+			transaction.resolve();
+		}
+	}
 	/**
 	 * Cycle to next/previous model.
 	 * Uses scoped models (from --models flag) if available, otherwise all available models.
@@ -7385,9 +7986,12 @@ export class AgentSession {
 		const next = roleModels[nextIndex];
 
 		if (options?.temporary) {
-			await this.setModelTemporary(next.model, next.explicitThinkingLevel ? next.thinkingLevel : undefined);
+			await this.setModelTemporary(next.model, next.explicitThinkingLevel ? next.thinkingLevel : undefined, {
+				cause: "temporary-operation",
+				reason: "temporary-cycle",
+			});
 		} else {
-			await this.setModel(next.model, next.role);
+			await this.setModel(next.model, next.role, { cause: "user-selection" });
 			if (next.explicitThinkingLevel && next.thinkingLevel !== undefined) {
 				this.setThinkingLevel(next.thinkingLevel);
 			}
@@ -7419,7 +8023,6 @@ export class AgentSession {
 	}
 
 	async #cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
-		const previousEditMode = this.#resolveActiveEditMode();
 		const scopedModels = await this.#getScopedModelsWithApiKey();
 		if (scopedModels.length <= 1) return undefined;
 
@@ -7431,22 +8034,15 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const next = scopedModels[nextIndex];
 
-		// Apply model
-		this.#clearActiveRetryFallback();
-		this.#setModelWithProviderSessionReset(next.model);
-		this.sessionManager.appendModelChange(`${next.model.provider}/${next.model.id}`);
-		this.settings.setModelRole("default", this.#formatRoleModelValue("default", next.model));
-		this.settings.getStorage()?.recordModelUsage(`${next.model.provider}/${next.model.id}`);
+		await this.setModel(next.model, "default", { cause: "user-selection" });
 
 		// Apply the scoped model's configured thinking level
 		this.setThinkingLevel(next.thinkingLevel);
-		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
 	}
 
 	async #cycleAvailableModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
-		const previousEditMode = this.#resolveActiveEditMode();
 		const availableModels = this.#modelRegistry.getAvailable();
 		if (availableModels.length <= 1) return undefined;
 
@@ -7463,14 +8059,9 @@ export class AgentSession {
 			throw new Error(`No API key for ${nextModel.provider}/${nextModel.id}`);
 		}
 
-		this.#clearActiveRetryFallback();
-		this.#setModelWithProviderSessionReset(nextModel);
-		this.sessionManager.appendModelChange(`${nextModel.provider}/${nextModel.id}`);
-		this.settings.setModelRole("default", this.#formatRoleModelValue("default", nextModel));
-		this.settings.getStorage()?.recordModelUsage(`${nextModel.provider}/${nextModel.id}`);
+		await this.setModel(nextModel, "default", { cause: "user-selection" });
 		// Re-apply the current thinking level for the newly selected model
 		this.setThinkingLevel(this.thinkingLevel);
-		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}
@@ -7496,6 +8087,7 @@ export class AgentSession {
 
 		this.#thinkingLevel = effectiveLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(effectiveLevel));
+		if (isChanging) this.#defaultModelSelectionMutationRevision++;
 
 		if (persist && effectiveLevel !== undefined) {
 			this.settings.set("defaultThinkingLevel", effectiveLevel);
@@ -8653,7 +9245,10 @@ export class AgentSession {
 		if (!targetModel) return false;
 
 		try {
-			await this.setModelTemporary(targetModel);
+			await this.setModelTemporary(targetModel, undefined, {
+				cause: "temporary-operation",
+				reason: "context-promotion",
+			});
 			logger.debug("Context promotion switched model on overflow", {
 				from: `${currentModel.provider}/${currentModel.id}`,
 				to: `${targetModel.provider}/${targetModel.id}`,
@@ -8682,14 +9277,33 @@ export class AgentSession {
 		return candidate;
 	}
 
-	#setModelWithProviderSessionReset(model: Model): void {
+	#canonicalSelector(model: Model, selector?: string, thinkingLevel?: ThinkingLevel): string {
+		const parsed = selector ? parseModelString(selector) : undefined;
+		const base = parsed ? `${parsed.provider}/${parsed.id}` : `${model.provider}/${model.id}`;
+		return thinkingLevel === undefined ? (selector ?? base) : `${base}:${String(thinkingLevel).toLowerCase()}`;
+	}
+
+	#clearActiveRetryFallback(): void {
+		this.#defaultFallbackController = undefined;
+		this.#defaultFallbackExhaustedLastTurn = false;
+	}
+
+	#setModelWithProviderSessionReset(model: Model | undefined): void {
+		this.#defaultModelSelectionMutationRevision++;
 		const currentModel = this.model;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
 		}
 		this.agent.setModel(model);
+	}
 
-		// Re-evaluate append-only context mode — provider or setting may have changed
+	#setModelAuthoritatively(model: Model, cause: ModelChangeCause): void {
+		// Only a non-temporary cause makes a model switch authoritative: it commits
+		// any suspended provider-session scopes instead of restoring them later.
+		if (cause !== "temporary-operation") this.#commitAllTemporaryProviderSessionScopes();
+		const currentModel = this.model;
+		if (currentModel) this.#closeProviderSessionsForModelSwitch(currentModel, model);
+		this.agent.setModel(model);
 		this.#syncAppendOnlyContext(model);
 	}
 
@@ -8722,15 +9336,15 @@ export class AgentSession {
 		}
 	}
 
-	#closeProviderSessionsForModelSwitch(currentModel: Model, nextModel: Model): void {
+	#closeProviderSessionsForModelSwitch(currentModel: Model, nextModel: Model | undefined): void {
 		const providerKeys = new Set<string>();
-		if (currentModel.api === "openai-codex-responses" || nextModel.api === "openai-codex-responses") {
+		if (currentModel.api === "openai-codex-responses" || nextModel?.api === "openai-codex-responses") {
 			providerKeys.add("openai-codex-responses");
 		}
 		if (currentModel.api === "openai-responses") {
 			providerKeys.add(`openai-responses:${currentModel.provider}`);
 		}
-		if (nextModel.api === "openai-responses") {
+		if (nextModel?.api === "openai-responses") {
 			providerKeys.add(`openai-responses:${nextModel.provider}`);
 		}
 
@@ -9636,20 +10250,30 @@ export class AgentSession {
 	 * (auth/400/not-found) surface immediately; usage-limit, transient, and
 	 * unknown/no-code errors are retryable.
 	 */
+
 	#isRetryableError(message: AssistantMessage): boolean {
-		const classification = this.#classifyErrorForRetry(message);
-		if (classification === "local_unavailable") {
-			return this.#hasRetryFallbackCandidate({
-				currentSelector: this.model ? formatRetryFallbackSelector(this.model, this.thinkingLevel) : undefined,
-				requireNonLocal: true,
-			});
+		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
+		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
+		if (!managedFallback) {
+			const classification = this.#classifyErrorForRetry(message);
+			return (
+				classification === "usage_limit" ||
+				classification === "transient" ||
+				classification === "unknown" ||
+				classification === "first_event_timeout"
+			);
 		}
-		return (
-			classification === "usage_limit" ||
-			classification === "transient" ||
-			classification === "unknown" ||
-			classification === "first_event_timeout"
-		);
+		const trigger = classifyFallbackTrigger({ message: message.errorMessage, status: message.errorStatus });
+		if (
+			trigger.class === "rate_limit" ||
+			trigger.class === "quota" ||
+			trigger.class === "auth" ||
+			trigger.class === "server"
+		) {
+			return true;
+		}
+		const classification = this.#classifyErrorForRetry(message);
+		return classification === "transient" || classification === "unknown" || classification === "first_event_timeout";
 	}
 
 	#isTransientErrorMessage(errorMessage: string): boolean {
@@ -9784,232 +10408,6 @@ export class AgentSession {
 		return "unknown";
 	}
 
-	#getRetryFallbackChains(): RetryFallbackChains {
-		const configuredChains = this.settings.get("retry.fallbackChains");
-		if (!configuredChains || typeof configuredChains !== "object") return {};
-		return configuredChains as RetryFallbackChains;
-	}
-
-	#validateRetryFallbackChains(): void {
-		const configuredChains = this.settings.get("retry.fallbackChains");
-		if (configuredChains === undefined) return;
-		if (!configuredChains || typeof configuredChains !== "object" || Array.isArray(configuredChains)) {
-			const msg = "retry.fallbackChains must be a mapping of role names to selector arrays.";
-			logger.warn(msg);
-			this.configWarnings.push(msg);
-			return;
-		}
-
-		for (const [role, chain] of Object.entries(configuredChains)) {
-			if (!Array.isArray(chain)) {
-				const msg = `Fallback chain for role '${role}' must be an array of selector strings.`;
-				logger.warn(msg);
-				this.configWarnings.push(msg);
-				continue;
-			}
-			for (const selectorStr of chain) {
-				if (typeof selectorStr !== "string") {
-					const msg = `Fallback chain for role '${role}' contains a non-string selector.`;
-					logger.warn(msg);
-					this.configWarnings.push(msg);
-					continue;
-				}
-				const parsed = parseRetryFallbackSelector(selectorStr);
-				if (!parsed) {
-					const msg = `Invalid fallback selector format in role '${role}': ${selectorStr}`;
-					logger.warn(msg);
-					this.configWarnings.push(msg);
-					continue;
-				}
-				const exists = this.#modelRegistry.find(parsed.provider, parsed.id);
-				if (!exists) {
-					const msg = `Fallback chain for role '${role}' references unknown model: ${selectorStr}`;
-					logger.warn(msg);
-					this.configWarnings.push(msg);
-				}
-			}
-		}
-	}
-
-	#getRetryFallbackRevertPolicy(): RetryFallbackRevertPolicy {
-		return this.settings.get("retry.fallbackRevertPolicy") === "never" ? "never" : "cooldown-expiry";
-	}
-
-	#getRetryFallbackPrimarySelector(role: string): RetryFallbackSelector | undefined {
-		const configuredSelector = this.settings.getModelRole(role);
-		return configuredSelector ? parseRetryFallbackSelector(configuredSelector) : undefined;
-	}
-
-	#clearActiveRetryFallback(): void {
-		this.#activeRetryFallback = undefined;
-	}
-
-	#isRetryFallbackSelectorSuppressed(selector: RetryFallbackSelector): boolean {
-		return this.#modelRegistry.isSelectorSuppressed(selector.raw);
-	}
-
-	#noteRetryFallbackCooldown(currentSelector: string, retryAfterMs: number | undefined, errorMessage: string): void {
-		let cooldownMs = retryAfterMs;
-		if (!cooldownMs || cooldownMs <= 0) {
-			const reason = parseRateLimitReason(errorMessage);
-			cooldownMs = reason === "UNKNOWN" ? 5 * 60 * 1000 : calculateRateLimitBackoffMs(reason);
-		}
-		this.#modelRegistry.suppressSelector(currentSelector, Date.now() + cooldownMs);
-	}
-
-	#resolveRetryFallbackRole(currentSelector: string): string | undefined {
-		const parsedCurrent = parseRetryFallbackSelector(currentSelector);
-		if (!parsedCurrent) return undefined;
-		const currentBaseSelector = formatRetryFallbackBaseSelector(parsedCurrent);
-		for (const role of Object.keys(this.#getRetryFallbackChains())) {
-			const primarySelector = this.#getRetryFallbackPrimarySelector(role);
-			if (!primarySelector) continue;
-			if (primarySelector.raw === currentSelector) return role;
-			if (formatRetryFallbackBaseSelector(primarySelector) === currentBaseSelector) return role;
-		}
-		return undefined;
-	}
-
-	#getRetryFallbackEffectiveChain(role: string): RetryFallbackSelector[] {
-		const primarySelector = this.#getRetryFallbackPrimarySelector(role);
-		if (!primarySelector) return [];
-		const chain = [primarySelector];
-		const seen = new Set<string>([primarySelector.raw]);
-		for (const selector of this.#getRetryFallbackChains()[role] ?? []) {
-			const parsed = parseRetryFallbackSelector(selector);
-			if (!parsed || seen.has(parsed.raw)) continue;
-			seen.add(parsed.raw);
-			chain.push(parsed);
-		}
-		return chain;
-	}
-
-	#hasRetryFallbackCandidate(options: { currentSelector: string | undefined; requireNonLocal?: boolean }): boolean {
-		if (!options.currentSelector) return false;
-		const role = this.#activeRetryFallback?.role ?? this.#resolveRetryFallbackRole(options.currentSelector);
-		if (!role) return false;
-		for (const selector of this.#findRetryFallbackCandidates(role, options.currentSelector)) {
-			if (this.#isRetryFallbackSelectorSuppressed(selector)) continue;
-			const candidate = this.#modelRegistry.find(selector.provider, selector.id);
-			if (!candidate) continue;
-			if (options.requireNonLocal && isLocalModelEndpoint(candidate)) continue;
-			return true;
-		}
-		return false;
-	}
-
-	#findRetryFallbackCandidates(role: string, currentSelector: string): RetryFallbackSelector[] {
-		const chain = this.#getRetryFallbackEffectiveChain(role);
-		if (chain.length <= 1) return [];
-		const parsedCurrent = parseRetryFallbackSelector(currentSelector);
-		const currentBaseSelector = parsedCurrent ? formatRetryFallbackBaseSelector(parsedCurrent) : undefined;
-		const exactIndex = chain.findIndex(selector => selector.raw === currentSelector);
-		if (exactIndex >= 0) return chain.slice(exactIndex + 1);
-		const baseIndex = currentBaseSelector
-			? chain.findIndex(selector => formatRetryFallbackBaseSelector(selector) === currentBaseSelector)
-			: -1;
-		if (baseIndex >= 0) return chain.slice(baseIndex + 1);
-		return chain.slice(1);
-	}
-
-	async #applyRetryFallbackCandidate(
-		role: string,
-		selector: RetryFallbackSelector,
-		currentSelector: string,
-	): Promise<void> {
-		const candidate = this.#modelRegistry.find(selector.provider, selector.id);
-		if (!candidate) {
-			throw new Error(`Retry fallback model not found: ${selector.raw}`);
-		}
-		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.sessionId);
-		if (!apiKey) {
-			throw new Error(`No API key for retry fallback ${selector.raw}`);
-		}
-
-		const currentThinkingLevel = this.thinkingLevel;
-		const nextThinkingLevel = selector.thinkingLevel ?? currentThinkingLevel;
-
-		this.#setModelWithProviderSessionReset(candidate);
-		this.sessionManager.appendModelChange(`${candidate.provider}/${candidate.id}`, "temporary");
-		this.settings.getStorage()?.recordModelUsage(`${candidate.provider}/${candidate.id}`);
-		this.setThinkingLevel(nextThinkingLevel);
-		if (!this.#activeRetryFallback) {
-			this.#activeRetryFallback = {
-				role,
-				originalSelector: currentSelector,
-				originalThinkingLevel: currentThinkingLevel,
-				lastAppliedFallbackThinkingLevel: nextThinkingLevel,
-			};
-		} else {
-			this.#activeRetryFallback.lastAppliedFallbackThinkingLevel = nextThinkingLevel;
-		}
-		await this.#emitSessionEvent({
-			type: "retry_fallback_applied",
-			from: currentSelector,
-			to: selector.raw,
-			role,
-		});
-	}
-
-	async #tryRetryModelFallback(currentSelector: string, options?: { requireNonLocal?: boolean }): Promise<boolean> {
-		const role = this.#activeRetryFallback?.role ?? this.#resolveRetryFallbackRole(currentSelector);
-		if (!role) return false;
-
-		for (const selector of this.#findRetryFallbackCandidates(role, currentSelector)) {
-			if (this.#isRetryFallbackSelectorSuppressed(selector)) continue;
-			const candidate = this.#modelRegistry.find(selector.provider, selector.id);
-			if (!candidate) continue;
-			if (options?.requireNonLocal && isLocalModelEndpoint(candidate)) continue;
-			const apiKey = await this.#modelRegistry.getApiKey(candidate, this.sessionId);
-			if (!apiKey) continue;
-			await this.#applyRetryFallbackCandidate(role, selector, currentSelector);
-			return true;
-		}
-
-		return false;
-	}
-
-	async #maybeRestoreRetryFallbackPrimary(): Promise<void> {
-		if (!this.#activeRetryFallback) return;
-		if (this.#getRetryFallbackRevertPolicy() !== "cooldown-expiry") return;
-
-		const {
-			originalSelector: originalSelectorRaw,
-			originalThinkingLevel,
-			lastAppliedFallbackThinkingLevel,
-		} = this.#activeRetryFallback;
-		const originalSelector = parseRetryFallbackSelector(originalSelectorRaw);
-		if (!originalSelector) {
-			this.#clearActiveRetryFallback();
-			return;
-		}
-
-		const currentModel = this.model;
-		if (!currentModel) return;
-		const currentSelector = formatRetryFallbackSelector(currentModel, this.thinkingLevel);
-		if (currentSelector === originalSelector.raw) {
-			if (!this.#isRetryFallbackSelectorSuppressed(originalSelector)) {
-				this.#clearActiveRetryFallback();
-			}
-			return;
-		}
-		if (this.#isRetryFallbackSelectorSuppressed(originalSelector)) return;
-
-		const primaryModel = this.#modelRegistry.find(originalSelector.provider, originalSelector.id);
-		if (!primaryModel) return;
-		const apiKey = await this.#modelRegistry.getApiKey(primaryModel, this.sessionId);
-		if (!apiKey) return;
-
-		const currentThinkingLevel = this.thinkingLevel;
-		const thinkingToApply =
-			currentThinkingLevel === lastAppliedFallbackThinkingLevel ? originalThinkingLevel : currentThinkingLevel;
-		this.#setModelWithProviderSessionReset(primaryModel);
-		this.sessionManager.appendModelChange(`${primaryModel.provider}/${primaryModel.id}`, "temporary");
-		this.settings.getStorage()?.recordModelUsage(`${primaryModel.provider}/${primaryModel.id}`);
-		this.setThinkingLevel(thinkingToApply);
-		this.#clearActiveRetryFallback();
-	}
-
 	#parseRetryAfterMsFromError(errorMessage: string): number | undefined {
 		const now = Date.now();
 		const retryAfterMsMatch = /retry-after-ms\s*[:=]\s*(\d+)/i.exec(errorMessage);
@@ -10057,149 +10455,394 @@ export class AgentSession {
 			}
 		}
 
-		// Smart Fallback if no exact headers found
+		// No provider retry hint was available.
 		return undefined;
 	}
 
+	#managedFallbackPromptOptions(): {
+		fallbackManaged?: boolean;
+		nextFallbackAttempt?: (model: Model) => ReturnType<typeof beginAttempt>;
+		onManagedAttemptAccepted?: () => void;
+		onManagedAttemptOutcome?: (
+			outcome: ManagedAttemptOutcome,
+		) => ManagedAttemptDecision | Promise<ManagedAttemptDecision>;
+	} {
+		const controller = this.#defaultFallbackChain();
+		if (controller.chain.entries.length < 2) return {};
+		return {
+			fallbackManaged: true,
+			nextFallbackAttempt: model => {
+				controller.onAttemptStarted();
+				return beginAttempt(formatModelString(model), String(++this.#fallbackInvocationId));
+			},
+			onManagedAttemptAccepted: () => controller.resetAttemptBudget(),
+			onManagedAttemptOutcome: outcome => this.#handleManagedAttemptOutcome(outcome),
+		};
+	}
+
+	async #resetDefaultFallbackForNewTurn(): Promise<void> {
+		if (!this.#defaultFallbackExhaustedLastTurn) return;
+		const controller = this.#defaultFallbackChain();
+		this.#defaultFallbackExhaustedLastTurn = false;
+		controller.resetForNewTurn();
+		if (controller.chain.entries.length > 1) {
+			await this.#advanceDefaultFallback(controller, "new_turn", 0);
+		}
+	}
+
+	async #ensureDefaultFallbackResolution(): Promise<void> {
+		const controller = this.#defaultFallbackChain();
+		if (controller.chain.entries.length < 2) return;
+		const resolutionStart = controller.activeIndex;
+		const resolution = await resolveModelChainWithAuth(
+			controller.chain.entries.slice(resolutionStart),
+			this.#modelRegistry,
+			this.settings,
+			this.sessionId,
+			{ managedFallback: true },
+		);
+		const activeIndex = resolutionStart + resolution.activeIndex;
+		if (activeIndex > resolutionStart) {
+			this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
+		} else {
+			controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
+		}
+		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
+		this.#setModelAuthoritatively(resolution.model, "restore");
+		this.setThinkingLevel(resolution.explicitThinkingLevel ? resolution.thinkingLevel : this.thinkingLevel);
+	}
+
 	/**
-	 * Handle retryable errors with exponential backoff.
-	 * @returns true if retry was initiated, false if max retries exceeded or disabled
+	 * Materialize the default controller from the persisted configured-chain
+	 * metadata. Consumers seed only resolution state; role/origin/identity stay
+	 * intrinsic to controller construction and are never inferred at runtime.
 	 */
-	async #handleRetryableError(message: AssistantMessage): Promise<boolean> {
-		const retrySettings = this.settings.getGroup("retry");
-		if (!retrySettings.enabled) return false;
-		const retryClassification = this.#classifyErrorForRetry(message);
-		const unboundedClass = retryClassification === "transient" || retryClassification === "unknown";
-		const localUnavailable = retryClassification === "local_unavailable";
+	#defaultFallbackChain(): FallbackChainController {
+		const configuredChain = this.sessionManager.buildSessionContext().configuredModelChains.default;
+		const settingsEntries = normalizeModelSelectorValue(
+			this.settings.getModelRole("default") ?? (this.model ? formatModelString(this.model) : undefined),
+		);
+		const materializeSettingsChain =
+			configuredChain?.origin === "legacy_session" &&
+			configuredChain.entries.length === 1 &&
+			settingsEntries.length > 1;
+		if (materializeSettingsChain) {
+			this.setConfiguredModelChain("default", settingsEntries, "modelRoles");
+		}
+		const chain: ConfiguredFallbackChain = materializeSettingsChain
+			? { role: "default", entries: settingsEntries, origin: "modelRoles", explicitHead: true }
+			: configuredChain
+				? { ...configuredChain, entries: [...configuredChain.entries] }
+				: { role: "default", entries: settingsEntries, origin: "session", explicitHead: true };
+		const existing = this.#defaultFallbackController;
+		if (
+			existing &&
+			(existing.chain.origin === "runtime" || existing.chain.entries.join("\u0000") === chain.entries.join("\u0000"))
+		) {
+			return existing;
+		}
+		this.#defaultFallbackController = new FallbackChainController(chain, this.settings.get("fallback.maxAttempts"));
+		return this.#defaultFallbackController;
+	}
 
-		const generation = this.#promptGeneration;
-		this.#retryAttempt++;
+	async #handleManagedAttemptOutcome(outcome: ManagedAttemptOutcome): Promise<ManagedAttemptDecision> {
+		if (outcome.type === "run_terminal") {
+			this.#defaultFallbackChain().resetAttemptBudget();
+			return { type: "terminal", terminal: { stopReason: outcome.reason } };
+		}
+		return this.#handleRetryableError(
+			outcome.failure.message,
+			true,
+			outcome.failure.transportFailure,
+		) as Promise<ManagedAttemptDecision>;
+	}
 
-		// Create retry promise on first attempt so waitForRetry() can await it
-		// Ensure only one promise exists (avoid orphaned promises from concurrent calls)
-		if (!this.#retryPromise) {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			this.#retryPromise = promise;
-			this.#retryResolve = resolve;
+	#managedFallbackExhaustionMessage(discarded: AssistantMessage, errorMessage: string): AssistantMessage {
+		return {
+			...discarded,
+			content: [{ type: "text", text: "" }],
+			stopReason: "error",
+			errorMessage,
+			timestamp: Date.now(),
+		};
+	}
+
+	#managedFallbackExhaustionDecision(discarded: AssistantMessage, errorMessage: string): ManagedAttemptDecision {
+		return {
+			type: "terminal",
+			terminal: {
+				stopReason: "exhausted",
+				messages: [this.#managedFallbackExhaustionMessage(discarded, errorMessage)],
+			},
+		};
+	}
+
+	#fallbackTriggerFor(
+		message: AssistantMessage,
+		allowLegacyUsageLimit: boolean,
+		transportFailure?: TransportFailureFacts,
+	): { class: FallbackTriggerClass; retryAfterMs?: number } | undefined {
+		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
+		if (transport.class !== "other") return transport;
+		const classification = this.#classifyErrorForRetry(message);
+		if (allowLegacyUsageLimit && classification === "usage_limit") {
+			return { class: "quota" };
+		}
+		if (classification === "transient" || classification === "first_event_timeout" || classification === "unknown") {
+			return { class: "server", retryAfterMs: transport.retryAfterMs };
+		}
+		return undefined;
+	}
+
+	async #advanceDefaultFallback(
+		controller: FallbackChainController,
+		reason: string,
+		attemptsUsed: number,
+	): Promise<boolean> {
+		while (!controller.isExhausted()) {
+			const selector = controller.currentSelector();
+			if (!selector) return false;
+			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+				settings: this.settings,
+				matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
+				modelRegistry: this.#modelRegistry,
+			});
+			if (!resolved.model) {
+				controller.onResolutionSkip("unknown_model");
+				continue;
+			}
+			const managedCursorUnavailable = managedCursorFallbackUnavailableReason(resolved.model, selector);
+			if (managedCursorUnavailable) {
+				controller.onResolutionSkip(managedCursorUnavailable);
+				continue;
+			}
+			const key = await this.#modelRegistry.getApiKey(resolved.model, this.sessionId);
+			if (!key) {
+				controller.onResolutionSkip("unauthenticated");
+				continue;
+			}
+			const from =
+				controller.tried.at(-1)?.selector ?? controller.chain.entries[controller.activeIndex - 1] ?? selector;
+			const to = selector;
+			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
+			this.setThinkingLevel(resolved.explicitThinkingLevel ? resolved.thinkingLevel : this.thinkingLevel);
+			if (from !== to) {
+				this.#emit({
+					type: "model_fallback_switched",
+					eventId: crypto.randomUUID(),
+					from,
+					to,
+					reason,
+					role:
+						controller.chain.origin === "subagent"
+							? (controller.chain.identity ?? controller.chain.role)
+							: controller.chain.role,
+					scope: controller.chain.origin === "subagent" ? "subagent-call" : "session",
+					activeIndex: controller.activeIndex,
+					chainLength: controller.chain.entries.length,
+					attemptsUsed,
+				});
+			}
+			return true;
+		}
+		return false;
+	}
+
+	#emitResolutionFallbackSwitch(controller: FallbackChainController): void {
+		if (controller.activeIndex <= 0) return;
+		const to = controller.currentSelector();
+		const from = controller.chain.entries[controller.activeIndex - 1];
+		if (!from || !to || from === to) return;
+		const event: Extract<AgentSessionEvent, { type: "model_fallback_switched" }> = {
+			type: "model_fallback_switched",
+			eventId: crypto.randomUUID(),
+			from,
+			to,
+			reason: "resolution",
+			role:
+				controller.chain.origin === "subagent"
+					? (controller.chain.identity ?? controller.chain.role)
+					: controller.chain.role,
+			scope: controller.chain.origin === "subagent" ? "subagent-call" : "session",
+			activeIndex: controller.activeIndex,
+			chainLength: controller.chain.entries.length,
+			attemptsUsed: 0,
+		};
+		if (this.#eventListeners.length === 0) {
+			this.#pendingFallbackSwitches.push(event);
+		} else {
+			this.#emit(event);
+		}
+	}
+
+	#fallbackExhaustionError(controller: FallbackChainController): string {
+		const tried = controller.tried.map(failure => `${failure.selector} (${failure.reason})`).join(", ") || "none";
+		const skipped = controller.skips.map(skip => `${skip.selector} (${skip.reason})`).join(", ") || "none";
+		return `Model fallback chain exhausted; models tried: ${tried}; models skipped: ${skipped}`;
+	}
+
+	async #markFailedManagedCredential(trigger: { class: FallbackTriggerClass; retryAfterMs?: number }): Promise<void> {
+		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit"))
+			return;
+
+		const authStorage = this.#modelRegistry.authStorage;
+		if (trigger.class === "auth") {
+			const apiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
+			if (isAuthenticated(apiKey)) {
+				await authStorage.invalidateCredentialMatching(this.model.provider, apiKey, { sessionId: this.sessionId });
+			}
+			return;
 		}
 
-		if (!unboundedClass && this.#retryAttempt > retrySettings.maxRetries) {
-			// Max retries exceeded, emit final failure and reset
-			await this.#emitSessionEvent({
-				type: "auto_retry_end",
-				success: false,
-				attempt: this.#retryAttempt - 1,
-				finalError: message.errorMessage,
-			});
-			this.#retryAttempt = 0;
-			this.#resolveRetry(); // Resolve so waitForRetry() completes
+		await authStorage.markUsageLimitReached(this.model.provider, this.sessionId, {
+			retryAfterMs: trigger.retryAfterMs,
+		});
+	}
+
+	/** Handle retryable errors with exponential backoff. */
+	async #handleRetryableError(
+		message: AssistantMessage,
+		managedOutcome = false,
+		transportFailure?: TransportFailureFacts,
+	): Promise<boolean | ManagedAttemptDecision> {
+		const controller = this.#defaultFallbackChain();
+		const managedFallback = controller.chain.entries.length > 1;
+		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+		if (!trigger) {
+			return managedOutcome
+				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
+				: false;
+		}
+		const retrySettings = this.settings.getGroup("retry");
+		const legacyRetryConfigured =
+			this.settings.has("retry.enabled") ||
+			this.settings.has("retry.maxRetries") ||
+			this.settings.has("retry.baseDelayMs") ||
+			this.settings.has("retry.maxDelayMs");
+		// A bare default retry configuration must preserve the historical
+		// fail-closed behavior for generic provider errors. Explicit retry
+		// settings opt into the resilient legacy retry path.
+		if (!managedFallback && (!retrySettings.enabled || !legacyRetryConfigured)) return false;
+		const legacyClassification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
+		const legacyUnbounded = legacyClassification === "transient" || legacyClassification === "unknown";
+		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const outcome = managedFallback
+			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
+			: !legacyUnbounded && attemptsUsed > retrySettings.maxRetries
+				? "exhausted"
+				: "retry";
+		if (outcome === "exhausted") {
+			if (managedFallback) {
+				const errorMessage = this.#fallbackExhaustionError(controller);
+				this.emitNotice("error", errorMessage, "fallback");
+				this.#defaultFallbackExhaustedLastTurn = true;
+				controller.resetSticky();
+				return managedOutcome ? this.#managedFallbackExhaustionDecision(message, errorMessage) : false;
+			}
 			return false;
 		}
 
+		const generation = this.#promptGeneration;
 		const errorMessage = message.errorMessage || "Unknown error";
-		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
-		let delayMs = retrySettings.baseDelayMs * 2 ** (this.#retryAttempt - 1);
-		let switchedCredential = false;
-		let switchedModel = false;
-
-		if (this.model && isUsageLimitError(errorMessage)) {
-			const retryAfterMs = parsedRetryAfterMs ?? calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
-			const switched = await this.#modelRegistry.authStorage.markUsageLimitReached(
-				this.model.provider,
-				this.sessionId,
-				{
-					retryAfterMs,
-					baseUrl: this.model.baseUrl,
-				},
-			);
-			if (switched) {
-				switchedCredential = true;
-				delayMs = 0;
-			} else if (retryAfterMs > delayMs) {
-				// No more accounts to switch to — wait out the backoff
-				delayMs = retryAfterMs;
-			}
-		}
-
-		const currentSelector = this.model ? formatRetryFallbackSelector(this.model, this.thinkingLevel) : undefined;
-		if (!switchedCredential && currentSelector) {
-			this.#noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);
-			switchedModel = await this.#tryRetryModelFallback(currentSelector, { requireNonLocal: localUnavailable });
-			if (switchedModel) {
-				delayMs = 0;
-			} else if (parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
-				delayMs = parsedRetryAfterMs;
-			}
-		}
-
-		// Fail-fast cap: if the provider asks us to wait longer than
-		// retry.maxDelayMs and we have no fallback credential or model to
-		// switch to, surface the error instead of sleeping. Defends against
-		// 3-hour Anthropic rate-limit windows that would otherwise leave a
-		// subagent (or interactive session) silently hung. The original
-		// assistant error message is preserved in agent state so the caller
-		// can act on it.
-		const maxDelayMs = retrySettings.maxDelayMs;
-		if (unboundedClass && !switchedCredential && !switchedModel) {
-			// Retry forever: honor a provider-supplied wait, otherwise cap the
-			// exponential backoff at the ceiling instead of giving up.
-			if (parsedRetryAfterMs !== undefined) {
-				delayMs = Math.max(delayMs, parsedRetryAfterMs);
-			} else if (maxDelayMs > 0) {
-				delayMs = Math.min(delayMs, maxDelayMs);
-			}
-		}
-		if (!unboundedClass && maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel) {
-			const attempt = this.#retryAttempt;
+		const retryAfterMs =
+			trigger.retryAfterMs ?? (managedFallback ? undefined : this.#parseRetryAfterMsFromError(errorMessage));
+		const delayMs =
+			outcome === "advance"
+				? 0
+				: managedFallback
+					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed, retryAfterMs)
+					: retryAfterMs !== undefined
+						? Math.max(retrySettings.baseDelayMs * 2 ** Math.max(0, attemptsUsed - 1), retryAfterMs)
+						: retrySettings.baseDelayMs * 2 ** Math.max(0, attemptsUsed - 1);
+		if (!managedFallback && !legacyUnbounded && retrySettings.maxDelayMs > 0 && delayMs > retrySettings.maxDelayMs) {
 			this.#retryAttempt = 0;
 			await this.#emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
-				attempt,
-				finalError: `Provider requested ${delayMs}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+				attempt: attemptsUsed,
+				finalError: `Provider requested ${delayMs}ms wait, exceeds retry.maxDelayMs (${retrySettings.maxDelayMs}ms). Original error: ${errorMessage}`,
 			});
 			this.#resolveRetry();
 			return false;
 		}
 
-		// Create and install the backoff abort controller BEFORE emitting
-		// auto_retry_start, so a synchronous retryNow()/abortRetry() invoked from
-		// an event subscriber (e.g. the TUI Esc handler) is not lost in the gap
-		// between the event and the controller assignment.
-		const retryAbortController = new AbortController();
-		this.#retryAbortController?.abort();
-		this.#retryAbortController = retryAbortController;
-		this.#retryNowRequested = false;
-
-		await this.#emitSessionEvent({
-			type: "auto_retry_start",
-			attempt: this.#retryAttempt,
-			maxAttempts: retrySettings.maxRetries,
-			delayMs,
-			errorMessage,
-			unbounded: unboundedClass,
-		});
-
-		// Remove error message from agent state (keep in session for history)
-		const messages = this.agent.state.messages;
-		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-			this.agent.replaceMessages(messages.slice(0, -1));
-		}
-
-		// Wait with exponential backoff (abortable).
-		try {
-			await scheduler.wait(delayMs, { signal: retryAbortController.signal });
-		} catch {
-			if (this.#retryAbortController !== retryAbortController) {
-				return false;
+		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
+			if (managedFallback) await this.#markFailedManagedCredential(trigger);
+			let advanced = outcome !== "advance";
+			let resolutionError: unknown;
+			if (outcome === "advance") {
+				try {
+					advanced = await this.#advanceDefaultFallback(controller, trigger.class, attemptsUsed);
+				} catch (error) {
+					resolutionError = error;
+				}
 			}
-			this.#retryAbortController = undefined;
-			if (this.#retryNowRequested) {
-				// Retry-now: skip the remaining backoff and fall through to
-				// re-attempt immediately (keeps the retry session alive).
-				this.#retryNowRequested = false;
-			} else {
-				// Aborted during sleep (cancel) - emit end event so UI can clean up
+			if (!advanced) {
+				const errorMessage = resolutionError
+					? `${this.#fallbackExhaustionError(controller)}; resolution failed: ${resolutionError instanceof Error ? resolutionError.message : String(resolutionError)}`
+					: this.#fallbackExhaustionError(controller);
+				this.emitNotice("error", errorMessage, "fallback");
+				if (managedOutcome && ownership) {
+					this.agent.requestRunTerminal(ownership.logicalRunId, {
+						stopReason: "exhausted",
+						messages: [this.#managedFallbackExhaustionMessage(message, errorMessage)],
+					});
+				}
+				this.#defaultFallbackExhaustedLastTurn = true;
+				controller.resetSticky();
+				this.#retryAttempt = 0;
+				this.#resolveRetry();
+				return;
+			}
+
+			this.#retryAttempt = attemptsUsed;
+			if (!this.#retryPromise) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				this.#retryPromise = promise;
+				this.#retryResolve = resolve;
+			}
+
+			const retryAbortController = new AbortController();
+			this.#retryAbortController?.abort();
+			this.#retryAbortController = retryAbortController;
+			this.#retryNowRequested = false;
+			await this.#emitSessionEvent({
+				type: "auto_retry_start",
+				attempt: this.#retryAttempt,
+				maxAttempts: managedFallback ? controller.maxAttempts : retrySettings.maxRetries,
+				delayMs,
+				errorMessage,
+				unbounded: !managedFallback && legacyUnbounded,
+			});
+
+			const messages = this.agent.state.messages;
+			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+				this.agent.replaceMessages(messages.slice(0, -1));
+			}
+
+			try {
+				await scheduler.wait(delayMs, { signal: retryAbortController.signal });
+			} catch {
+				if (this.#retryAbortController !== retryAbortController) return;
+				this.#retryAbortController = undefined;
+				if (this.#retryNowRequested) {
+					// Fall through below so the retry continues immediately.
+				} else {
+					const attempt = this.#retryAttempt;
+					this.#retryAttempt = 0;
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError: "Retry cancelled",
+					});
+					this.#resolveRetry();
+					return;
+				}
+			}
+			if (retryAbortController.signal.aborted && !this.#retryNowRequested) {
+				if (this.#retryAbortController !== retryAbortController) return;
+				this.#retryAbortController = undefined;
 				const attempt = this.#retryAttempt;
 				this.#retryAttempt = 0;
 				await this.#emitSessionEvent({
@@ -10209,28 +10852,55 @@ export class AgentSession {
 					finalError: "Retry cancelled",
 				});
 				this.#resolveRetry();
-				return false;
+				return;
 			}
-		}
-		if (this.#retryAbortController === retryAbortController) {
-			this.#retryAbortController = undefined;
-		}
+			if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
+			this.#retryNowRequested = false;
 
-		// Retry via continue() outside the agent_end event callback chain.
-		// If the scheduled continue cannot run — it throws (e.g. AgentBusyError from a
-		// concurrent turn, or "Cannot continue ...") or is skipped because a newer
-		// generation took over — the agent_end that normally resolves #retryPromise
-		// never arrives. Finalize the retry in that case so #waitForPostPromptRecovery
-		// (and the in-flight prompt holding it open) cannot wedge the session as
-		// permanently busy, which would turn every later prompt() into a
-		// non-recoverable AgentBusyError loop.
-		this.#scheduleAgentContinue({
-			delayMs: 1,
-			generation,
-			onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
-			onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
-		});
+			if (managedOutcome) {
+				try {
+					await this.#checkEstimatedContextBeforePrompt();
+					if (!ownership?.isCurrent()) {
+						const attempt = this.#retryAttempt;
+						this.#retryAttempt = 0;
+						await this.#emitSessionEvent({
+							type: "auto_retry_end",
+							success: false,
+							attempt,
+							finalError: "Retry continuation was superseded",
+						});
+						this.#resolveRetry();
+						return;
+					}
+					await this.agent.continue(this.#managedFallbackPromptOptions());
+					return;
+				} catch (error) {
+					const attempt = this.#retryAttempt;
+					this.#retryAttempt = 0;
+					try {
+						await this.#emitSessionEvent({
+							type: "auto_retry_end",
+							success: false,
+							attempt,
+							finalError: error instanceof Error ? error.message : String(error),
+						});
+					} finally {
+						this.#resolveRetry();
+					}
+					throw error;
+				}
+			}
 
+			this.#scheduleAgentContinue({
+				delayMs: 1,
+				generation,
+				onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
+				onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
+			});
+		};
+
+		if (managedOutcome) return { type: "retry", continuation: retry };
+		await retry();
 		return true;
 	}
 
@@ -10276,12 +10946,26 @@ export class AgentSession {
 		this.#resolveRetry();
 	}
 
-	async #promptAgentWithIdleRetry(messages: AgentMessage[], options?: { toolChoice?: ToolChoice }): Promise<void> {
+	async #promptAgentWithIdleRetry(
+		messages: AgentMessage[],
+		options?: { toolChoice?: ToolChoice; fallbackManaged?: boolean },
+		predecessorAgentEndHold?: symbol,
+	): Promise<void> {
 		const deadline = Date.now() + 30_000;
+		let continuationHold = predecessorAgentEndHold;
 		for (;;) {
 			try {
-				await this.agent.prompt(messages, options);
-				return;
+				const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(
+					continuationHold ?? this.#reserveDeferredAgentEndForContinuation(),
+				);
+				continuationHold = undefined;
+				try {
+					await this.agent.prompt(messages, options);
+					return;
+				} catch (error) {
+					this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+					throw error;
+				}
 			} catch (err) {
 				if (!(err instanceof AgentBusyError)) {
 					throw err;
@@ -10756,8 +11440,9 @@ export class AgentSession {
 			// Accept the ordered pair as one volatile batch before committing its
 			// roster claim, notifying either UI, or resolving the sender delivery.
 			args.signal?.throwIfAborted();
-			this.#queueBackgroundExchangeInjection([incomingRecord, replyRecord]);
+			this.#queueBackgroundExchangeInjection([incomingRecord, replyRecord], { deferFlush: true });
 			commitRosterClaim?.();
+			this.#flushOrSchedulePendingBackgroundExchanges();
 			announceIncoming();
 			this.#emitIrcObservation(replyRecord);
 			this.#forwardIrcRelayToMain({
@@ -11115,8 +11800,12 @@ export class AgentSession {
 		return messages;
 	}
 
-	#queueBackgroundExchangeInjection(messages: CustomMessage[]): void {
+	#queueBackgroundExchangeInjection(messages: CustomMessage[], options?: { deferFlush?: boolean }): void {
 		this.#pendingBackgroundExchanges.push(messages);
+		if (!options?.deferFlush) this.#flushOrSchedulePendingBackgroundExchanges();
+	}
+
+	#flushOrSchedulePendingBackgroundExchanges(): void {
 		if (!this.isStreaming) {
 			this.#flushPendingBackgroundExchanges();
 			return;
@@ -11234,6 +11923,7 @@ export class AgentSession {
 		this.#followUpMessages = [];
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
+		let unavailableDefaultChainMessage: string | undefined;
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
@@ -11254,35 +11944,34 @@ export class AgentSession {
 			this.agent.replaceMessages(sessionContext.messages);
 			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
-			if (switchingToDifferentSession) {
-				this.#closeAllProviderSessions("session switch");
-			} else if (didReloadConversationChange) {
-				this.#closeAllProviderSessions("session reload");
+			if (switchingToDifferentSession || didReloadConversationChange) {
+				this.#closeAllProviderSessions(switchingToDifferentSession ? "session switch" : "session reload");
+				this.#rebindProviderSessionState(new Map());
 			}
 
-			// Restore model if saved
-			const defaultModelStr = sessionContext.models.default;
-			if (defaultModelStr) {
-				const slashIdx = defaultModelStr.indexOf("/");
-				if (slashIdx > 0) {
-					const provider = defaultModelStr.slice(0, slashIdx);
-					const modelId = defaultModelStr.slice(slashIdx + 1);
-					const availableModels = this.#modelRegistry.getAvailable();
-					const match = availableModels.find(m => m.provider === provider && m.id === modelId);
-					if (match) {
-						const currentModel = this.model;
-						const shouldResetProviderState =
-							switchingToDifferentSession ||
-							(currentModel !== undefined &&
-								(currentModel.provider !== match.provider ||
-									currentModel.id !== match.id ||
-									currentModel.api !== match.api));
-						if (shouldResetProviderState) {
-							this.#setModelWithProviderSessionReset(match);
-						} else {
-							this.agent.setModel(match);
-						}
-					}
+			const configuredDefaultChain = sessionContext.configuredModelChains.default?.entries;
+			const defaultEntries =
+				configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []);
+			this.#defaultFallbackController = undefined;
+			if (defaultEntries.length > 0) {
+				const resolution = await resolveModelChainWithAuth(
+					defaultEntries,
+					this.#modelRegistry,
+					this.settings,
+					this.sessionId,
+					{ managedFallback: true },
+				);
+				const controller = this.#defaultFallbackChain();
+				this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
+				if (!resolution.model) {
+					unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
+					throw new Error(unavailableDefaultChainMessage);
+				}
+				if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
+					this.#setModelAuthoritatively(resolution.model, "restore");
+				}
+				if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
+					this.setThinkingLevel(resolution.thinkingLevel);
 				}
 			}
 
@@ -11326,6 +12015,7 @@ export class AgentSession {
 			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);
+			this.#defaultFallbackController = undefined;
 			this.#syncAgentSessionId(previousSessionState.sessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			let restoreMcpError: unknown;
@@ -11365,6 +12055,10 @@ export class AgentSession {
 			this.#reconnectToAgent();
 			if (restoreMcpError) {
 				throw restoreMcpError;
+			}
+			if (unavailableDefaultChainMessage) {
+				this.emitNotice("error", `Could not restore session model: ${unavailableDefaultChainMessage}`, "fallback");
+				return false;
 			}
 			throw error;
 		}
@@ -11424,6 +12118,8 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#resetHindsightConversationTrackingIfHindsight();
+		this.#closeAllProviderSessions("session branch");
+		this.#rebindProviderSessionState(new Map());
 
 		// Reload messages from entries (works for both file and in-memory mode)
 		const sessionContext = this.buildDisplaySessionContext();

@@ -46,18 +46,25 @@ import {
 	type GjcTmuxSessionStatus,
 	proveGjcTmuxSessionMutationTarget,
 } from "./tmux-sessions";
+import {
+	buildWindowsPowerShellInnerCommand,
+	GJC_TMUX_LAUNCHED_ENV,
+	type WindowsPowerShellInnerCommandOptions,
+} from "./windows-powershell-command";
 
+export type { WindowsPowerShellInnerCommandOptions };
 export {
 	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
+	buildWindowsPowerShellInnerCommand,
 	GJC_DEFAULT_TMUX_SESSION,
 	GJC_TMUX_COMMAND_ENV,
+	GJC_TMUX_LAUNCHED_ENV,
 	GJC_TMUX_MOUSE_ENV,
 	GJC_TMUX_PROFILE_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 };
 
-export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";
 export const GJC_TMUX_WINDOW_LABEL_MAX_WIDTH = 48;
 
@@ -214,20 +221,6 @@ function buildPosixTmuxExitMarkerPrefix(markerPath: string): string {
 	].join("; ");
 }
 
-function buildPowerShellTmuxExitMarkerFinally(markerPath: string): string {
-	const markerDir = path.win32.dirname(markerPath);
-	return [
-		"} finally {",
-		"\ttry {",
-		`\t\tNew-Item -ItemType Directory -Force -Path ${powershellQuote(markerDir)} -ErrorAction Stop | Out-Null`,
-		"\t\t$__gjcTmuxExitMarker = @{ schema_version = 1; source = 'tmux_inner_shell'; ended_at = (Get-Date).ToUniversalTime().ToString('o'); exit_code = $__gjcTmuxExitCode } | ConvertTo-Json -Compress",
-		`\t\tSet-Content -LiteralPath ${powershellQuote(markerPath)} -Value $__gjcTmuxExitMarker -Encoding UTF8 -ErrorAction Stop`,
-		"\t} catch {",
-		"\t}",
-		"}",
-	].join("\n");
-}
-
 interface CommandResolutionContext {
 	cwd: string;
 	argv: string[];
@@ -347,53 +340,8 @@ function buildEnvAssignments(values: Record<string, string> | undefined): string
 	const entries = Object.entries(values ?? {});
 	return entries.length === 0 ? "" : ` ${entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")}`;
 }
-function powershellQuote(value: string): string {
-	return `'${value.replace(/'/g, "''")}'`;
-}
 function stripRootTmuxFlag(rawArgs: string[]): string[] {
 	return rawArgs.filter(arg => arg !== "--tmux");
-}
-
-function buildWindowsPowerShellInnerCommand(context: CommandResolutionContext, rawArgs: string[]): string {
-	const command = resolveCurrentGjcCommand(context);
-	const envLines = Object.entries({ [GJC_TMUX_LAUNCHED_ENV]: "1", ...(context.extraEnv ?? {}) }).map(
-		([key, value]) => `$env:${key} = ${powershellQuote(value)}`,
-	);
-	// Resolve the inner command and arguments. PowerShell's `&` call operator
-	// accepts a single command followed by its arguments directly (no script
-	// block needed). Wrapping the call in `& { ... }` would be invalid because
-	// adjacent single-quoted tokens inside a script block body are a parser
-	// error: `& { 'a' 'b' }` fails with "Unexpected token 'b'" because PowerShell
-	// only concatenates adjacent *double-quoted* strings, and even then only in
-	// expression position. Emitting the arguments as a comma-separated array
-	// (`& 'cmd' @('a','b')`) is also rejected because arrays are not valid as
-	// the second-and-later positional arguments to `&` in command position. The
-	// correct form is `& 'cmd' 'arg1' 'arg2'` — exactly what the joined
-	// resolvedCommand + innerArgs produces below.
-	const resolvedCommand = command.map(powershellQuote).join(" ");
-	const innerArgs = stripRootTmuxFlag(rawArgs).map(powershellQuote).join(" ");
-	const invocation = `& ${resolvedCommand} ${innerArgs}`;
-	const exitLine = "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
-	const script = context.tmuxExitMarkerPath
-		? [
-				...envLines,
-				"$__gjcTmuxExitCode = 1",
-				"try {",
-				`\t${invocation}`,
-				"\tif ($null -ne $LASTEXITCODE) { $__gjcTmuxExitCode = $LASTEXITCODE } else { $__gjcTmuxExitCode = 1 }",
-				buildPowerShellTmuxExitMarkerFinally(context.tmuxExitMarkerPath),
-				"exit $__gjcTmuxExitCode",
-			].join("\n")
-		: [...envLines, invocation, exitLine].join("\n");
-	// Encode the script as UTF-16LE base64 for pwsh -EncodedCommand. Do NOT
-	// prepend a UTF-16LE BOM (0xFF 0xFE): the BOM survives the decode and is
-	// inserted as a literal U+FEFF character in front of the first script
-	// token, which pwsh then reports as a "term not recognized" parse error
-	// (e.g. "﻿$env:GJC_TMUX_LAUNCHED"). pwsh expects the decoded buffer to
-	// start with the first character of the script, not with a BOM.
-	const body = Buffer.from(script, "utf16le");
-	const encodedCommand = body.toString("base64");
-	return `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
 }
 
 export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProfileResult {
@@ -463,7 +411,13 @@ function pathModuleForPlatform(platform: NodeJS.Platform | undefined): typeof pa
 }
 
 function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[]): string {
-	if (isWindowsPlatform(context.platform)) return buildWindowsPowerShellInnerCommand(context, rawArgs);
+	if (isWindowsPlatform(context.platform))
+		return buildWindowsPowerShellInnerCommand({
+			command: resolveCurrentGjcCommand(context),
+			args: stripRootTmuxFlag(rawArgs),
+			environment: context.extraEnv,
+			tmuxExitMarkerPath: context.tmuxExitMarkerPath,
+		});
 	const command = resolveCurrentGjcCommand(context);
 	const quoted = [...command, ...stripRootTmuxFlag(rawArgs)].map(shellQuote).join(" ");
 	const invocation = `env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments(context.extraEnv)} ${quoted}`;

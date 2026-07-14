@@ -215,7 +215,7 @@ describe("G015 debug flag cache and carried width red-team", () => {
 	it("DEBUG-OFF-ZERO-COST", async () => {
 		const appendSpy = vi.spyOn(fs, "appendFileSync");
 		const component = new MutableLinesComponent(Array.from({ length: 14 }, (_v, i) => `line-${i}`));
-		const term = new VirtualTerminal(24, 5);
+		const term = new VirtualTerminal(24, 5, { isProcessTerminal: true });
 		await withTui(term, component, async tui => {
 			TUI.resetRenderCountersForTest();
 			for (let i = 0; i < 12; i++) {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { ModelRegistry } from "../../src/config/model-registry";
+import { kNoAuth, type ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import type { LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "../../src/sdk";
@@ -38,6 +38,9 @@ function createHangingSession(): HangingSessionHandle {
 		} as never,
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_names: string[]) => {},
+		setConfiguredModelChain: () => {},
+		getConfiguredModelChain: () => undefined,
+		seedDefaultFallbackResolution: () => {},
 		subscribe: (_listener: (event: AgentSessionEvent) => void) => () => {},
 		prompt: async (_text: string, _options?: PromptOptions) => {
 			await hang;
@@ -75,6 +78,9 @@ function createUsageSession(usages: unknown | readonly unknown[]): AgentSession 
 		sessionManager: { appendSessionInit: () => {} } as never,
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async () => {},
+		setConfiguredModelChain: () => {},
+		getConfiguredModelChain: () => undefined,
+		seedDefaultFallbackResolution: () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			queueMicrotask(() => {
 				for (const usage of Array.isArray(usages) ? usages : [usages]) {
@@ -156,7 +162,11 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		task: "do work",
 		index: 0,
 		id: "subagent-walltime",
-		modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
+		modelRegistry: {
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
+		} as unknown as ModelRegistry,
 		enableLsp: false,
 	};
 
@@ -194,6 +204,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			sessionManager: { appendSessionInit: () => {} } as never,
 			getActiveToolNames: () => ["read", "yield"],
 			setActiveToolsByName: async () => {},
+			setConfiguredModelChain: () => {},
+			getConfiguredModelChain: () => undefined,
+			seedDefaultFallbackResolution: () => {},
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				// Fire a synthetic yield on the next tick to drive runSubprocess to
 				// completion without depending on the real agent loop.
@@ -283,6 +296,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			sessionManager: { appendSessionInit: () => {} } as never,
 			getActiveToolNames: () => ["read", "yield"],
 			setActiveToolsByName: async () => {},
+			setConfiguredModelChain: () => {},
+			getConfiguredModelChain: () => undefined,
+			seedDefaultFallbackResolution: () => {},
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				listenerRef = listener;
 				return () => {};
@@ -342,6 +358,9 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			sessionManager: { appendSessionInit: () => {} } as never,
 			getActiveToolNames: () => ["read", "yield"],
 			setActiveToolsByName: async () => {},
+			setConfiguredModelChain: () => {},
+			getConfiguredModelChain: () => undefined,
+			seedDefaultFallbackResolution: () => {},
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				queueMicrotask(() => {
 					listener({

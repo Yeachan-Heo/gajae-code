@@ -74,6 +74,7 @@ function createSelector(
 		currentModel?: Model;
 		currentThinkingLevel?: ThinkingLevel;
 		activeModelProfile?: string;
+		configuredDefaultChain?: readonly string[];
 	} = {},
 ) {
 	const ui = { requestRender: vi.fn() } as unknown as TUI;
@@ -108,6 +109,13 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		sessionId: "session-1",
 		scopedModels: [],
 		modelRegistry: createRegistry(options),
+		configuredChains: {} as Record<string, readonly string[]>,
+		getConfiguredModelChain(role: string): readonly string[] | undefined {
+			return this.configuredChains[role];
+		},
+		setConfiguredModelChain(role: string, entries: readonly string[]) {
+			this.configuredChains[role] = entries;
+		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
@@ -226,6 +234,23 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("(current)");
 	});
 
+	test("landing header reflects the active fallback model snapshot", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {}, {
+			currentModel: alternateModel,
+			currentThinkingLevel: ThinkingLevel.Low,
+			activeModelProfile: "profile-a",
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Current: preset Profile Alpha · provider-a/alternate (low)");
+		expect(rendered).not.toContain("Current: preset Profile Alpha · provider-a/default");
+		expect(rendered).toContain("DEFAULT: provider-a/alternate (low)");
+		expect(rendered).not.toContain("DEFAULT: provider-a/default");
+	});
+
 	test("enter toggles a usable provider group's expansion", async () => {
 		installTestTheme();
 		const selector = createSelector(() => {});
@@ -312,6 +337,43 @@ describe("model selector profiles", () => {
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("provider-a/alternate DEFAULT (inherit)");
 		expect(rendered).not.toContain("provider-a/default DEFAULT");
+	});
+
+	test("direct fallback chains make the runtime fallback both Current and DEFAULT", async () => {
+		installTestTheme();
+		const settings = Settings.isolated({
+			modelRoles: { default: ["provider-a/default:high", "provider-a/alternate:low"] },
+		});
+		const selector = createSelector(() => {}, {
+			settings,
+			currentModel: alternateModel,
+			currentThinkingLevel: ThinkingLevel.Low,
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Current: provider-a/alternate (low)");
+		expect(rendered).toContain("DEFAULT: provider-a/alternate (low)");
+		expect(rendered).not.toContain("DEFAULT: provider-a/default");
+	});
+
+	test("persisted session fallback chains make the active head both Current and DEFAULT", async () => {
+		installTestTheme();
+		const settings = Settings.isolated({ modelRoles: { default: "provider-a/default:high" } });
+		const selector = createSelector(() => {}, {
+			settings,
+			currentModel: alternateModel,
+			currentThinkingLevel: ThinkingLevel.Low,
+			configuredDefaultChain: ["provider-a/alternate:low", "provider-a/default:high"],
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Current: provider-a/alternate (low)");
+		expect(rendered).toContain("DEFAULT: provider-a/alternate (low)");
+		expect(rendered).not.toContain("DEFAULT: provider-a/default");
 	});
 
 	test("Apply for this session activates profile through setModelTemporary", async () => {

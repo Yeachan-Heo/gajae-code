@@ -206,7 +206,7 @@ describe("TUI glitch audit (reported glitch classes)", () => {
 	it("no alternate-buffer sequences in a multiplexer full-clear path (uses 2J, never alt-buffer)", async () => {
 		Bun.env.TMUX = "1";
 		Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = "1";
-		const term = new VirtualTerminal(40, 6);
+		const term = new VirtualTerminal(40, 6, { isProcessTerminal: true });
 		const tui = new TUI(term);
 		tui.start();
 		const component = new MutableLinesComponent(["m-0", "m-1", "m-2"]);
