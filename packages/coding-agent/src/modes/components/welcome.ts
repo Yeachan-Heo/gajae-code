@@ -10,7 +10,7 @@ export interface RecentSession {
 
 export interface LspServerInfo {
 	name: string;
-	status: "ready" | "error" | "connecting";
+	status: "idle" | "ready" | "error" | "connecting";
 	fileTypes: string[];
 }
 
@@ -172,9 +172,9 @@ export class WelcomeComponent implements Component {
 				const icon =
 					server.status === "ready"
 						? theme.styledSymbol("status.success", "success")
-						: server.status === "connecting"
-							? theme.styledSymbol("status.pending", "muted")
-							: theme.styledSymbol("status.error", "error");
+						: server.status === "error"
+							? theme.styledSymbol("status.error", "error")
+							: theme.styledSymbol("status.pending", "muted");
 				const exts = server.fileTypes.slice(0, 3).join(" ");
 				lspLines.push(` ${icon} ${theme.fg("muted", server.name)} ${theme.fg("dim", exts)}`);
 			}

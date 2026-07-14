@@ -88,7 +88,6 @@ import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../e
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
 import { LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
-import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import { resolveMemoryBackend } from "../memory-backend";
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -157,7 +156,6 @@ import {
 	type ToolSession,
 	WebSearchTool,
 	WriteTool,
-	warmupLspServers,
 } from "../tools";
 import { ToolContextStore } from "../tools/context";
 import { getImageGenTools } from "../tools/image-gen";
@@ -415,7 +413,7 @@ export interface CreateAgentSessionResult {
 	mcpManager?: MCPManager;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
-	/** LSP servers detected for startup; warmup may continue in the background */
+	/** LSP servers configured for lazy startup in interactive mode */
 	lspServers?: LspStartupServerInfo[];
 	/** Shared event bus for tool/extension communication */
 	eventBus: EventBus;
@@ -2482,47 +2480,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 
-		// Start LSP warmup in the background so startup does not block on language server initialization.
-		// Print/script invocations (`hasUI=false`) don't render the warmup status indicator AND typically
-		// finish before LSP servers would have stabilized — warming them just spends CPU parsing big
-		// `initialize` responses concurrently with the LLM stream consumer, jittering perceived latency.
-		// Tools that need an LSP server still spin one up on demand through `getOrCreateClient`.
-		let lspServers: CreateAgentSessionResult["lspServers"];
-		if (enableLsp && options.hasUI && settings.get("lsp.diagnosticsOnWrite")) {
-			lspServers = discoverStartupLspServers(cwd);
-			if (lspServers.length > 0) {
-				void (async () => {
-					try {
-						const result = await logger.time("warmupLspServers", warmupLspServers, cwd);
-						const serversByName = new Map(result.servers.map(server => [server.name, server] as const));
-						for (const server of lspServers ?? []) {
-							const next = serversByName.get(server.name);
-							if (!next) continue;
-							server.status = next.status;
-							server.fileTypes = next.fileTypes;
-							server.error = next.error;
-						}
-						const event: LspStartupEvent = {
-							type: "completed",
-							servers: result.servers,
-						};
-						eventBus.emit(LSP_STARTUP_EVENT_CHANNEL, event);
-					} catch (error) {
-						const errorMessage = error instanceof Error ? error.message : String(error);
-						logger.warn("LSP server warmup failed", { cwd, error: errorMessage });
-						for (const server of lspServers ?? []) {
-							server.status = "error";
-							server.error = errorMessage;
-						}
-						const event: LspStartupEvent = {
-							type: "failed",
-							error: errorMessage,
-						};
-						eventBus.emit(LSP_STARTUP_EVENT_CHANNEL, event);
-					}
-				})();
-			}
-		}
+		// Discover configured LSP servers for the interactive status display without starting them.
+		// LSP-backed write operations create clients on demand through `getOrCreateClient`.
+		const lspServers =
+			enableLsp && options.hasUI && settings.get("lsp.diagnosticsOnWrite")
+				? discoverStartupLspServers(cwd)
+				: undefined;
 
 		logger.time("startMemoryStartupTask", () =>
 			Promise.resolve(
