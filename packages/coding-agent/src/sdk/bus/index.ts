@@ -2349,8 +2349,9 @@ export function createNotificationsExtension(
 			}
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
-					if (isTelegramConfigured(cfg))
-						await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
+					// Telegram was already registered before endpoint publication so
+					// its stamped lease remains current. Only non-Telegram daemons
+					// are ensured after publication.
 					if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
 					if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
 				} catch (e) {
