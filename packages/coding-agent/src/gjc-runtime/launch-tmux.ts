@@ -251,7 +251,13 @@ function isInteractiveRootLaunch(parsed: Args, tty: TtyState): boolean {
 }
 
 function isBunVirtualPath(value: string | undefined): boolean {
-	return value?.startsWith("/$bunfs/") === true;
+	if (!value) return false;
+	// bun compiles standalone binaries with two interchangeable virtual paths:
+	//   /$bunfs/root/<exe>          — in-process VFS entries
+	//   B:/~BUN/root/<exe>          — the install-root path exposed as process.execPath
+	// Both refer to the running binary itself and must never be passed to a child
+	// shell — PowerShell parses them as cmdlets and dies with a ParserError.
+	return value.startsWith("/$bunfs/") || /^[A-Za-z]:[\\/]+~BUN[\\/]+/.test(value);
 }
 
 const MAX_TMUX_DIAGNOSTIC_DETAIL_CODE_POINTS = 240;
@@ -1237,6 +1243,38 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		spawnSync(plan.tmuxCommand, ["has-session", "-t", createdSessionExactTarget(plan, env)], probeOptions);
 	const attachCreatedSession = (): TmuxSpawnResult =>
 		spawnSync(plan.tmuxCommand, ["attach-session", "-t", createdSessionExactTarget(plan, env)], attachOptions);
+	const attachForPsmuxFastPath = (): boolean => {
+		const attached = attachCreatedSession();
+		const sig = attached.signalCode ? ` signal=${attached.signalCode}` : "";
+		const stderrTail = (attached.stderr ?? "").trim().split(/\r?\n/).filter(Boolean).slice(-3).join(" | ");
+		(context.diagnosticWriter ?? safeStderrWrite)(
+			`psmux attach-session exited: code=${attached.exitCode ?? "null"}${sig}${stderrTail ? ` stderr=${stderrTail}` : ""}\n`,
+		);
+		if (attached.exitCode === 0) return true;
+		if (isTmuxAttachDisconnectError(attached)) {
+			(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr));
+			return true;
+		}
+		if (isWindowsPsmuxAttachConnectionRefused(plan, attached)) {
+			waitForWindowsPsmuxAttachRetry();
+			const probeAfterAttach = probeHasSession();
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				`psmux attach recovery probe: exitCode=${probeAfterAttach.exitCode ?? "null"} stderr=${(probeAfterAttach.stderr ?? "").trim()}\n`,
+			);
+			if (probeAfterAttach.exitCode === 0) {
+				const retryAttached = attachCreatedSession();
+				const retrySig = retryAttached.signalCode ? ` signal=${retryAttached.signalCode}` : "";
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					`psmux attach retry exited: code=${retryAttached.exitCode ?? "null"}${retrySig}\n`,
+				);
+				if (retryAttached.exitCode === 0) return true;
+				(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach retry failed", retryAttached.stderr));
+				return true;
+			}
+		}
+		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("psmux attach failed", attached.stderr));
+		return true;
+	};
 
 	if (plan.attachSessionName) {
 		let existingTarget: string;
@@ -1353,6 +1391,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			(context.diagnosticWriter ?? safeStderrWrite)(
 				"tmux created session proof failed; preserving session without mutation.\n",
 			);
+			if (plan.isPsmux) return attachForPsmuxFastPath();
 			return true;
 		}
 		renameTmuxWindow(plan.tmuxCommand, windowTitle, spawnSync, controlOptions, createdSessionExactTarget(plan, env));
@@ -1450,6 +1489,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		(context.diagnosticWriter ?? safeStderrWrite)(
 			"tmux created session proof failed; preserving session without attach.\n",
 		);
+		if (plan.isPsmux) return attachForPsmuxFastPath();
 		return true;
 	}
 	try {
@@ -1469,6 +1509,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		(context.diagnosticWriter ?? safeStderrWrite)(
 			"tmux created session proof failed after lifecycle publication; preserving session without attach.\n",
 		);
+		if (plan.isPsmux) return attachForPsmuxFastPath();
 		return true;
 	}
 	// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.

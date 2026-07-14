@@ -284,10 +284,19 @@ export function buildGjcTmuxProfileCommands(
 		return commands.filter(command => {
 			const flag = command.args[0];
 			const key = command.args[command.args.length - 2];
-			return !(
-				PSMUX_UNSUPPORTED_PROFILE_KEYS.has(String(key)) &&
-				(flag === "set-option" || flag === "set-window-option")
-			);
+			if (PSMUX_UNSUPPORTED_PROFILE_KEYS.has(String(key)) && (flag === "set-option" || flag === "set-window-option")) {
+				return false;
+			}
+			// psmux 3.3.0 also rejects the ownership-tag round-trip (set-option
+			// @gjc-*): psmux returns a 0 exit code but spawns an inner gjc to
+			// process the value, and that inner gjc drops a PowerShell parser
+			// error on Windows. Drop the same way we drop UX profile keys; the
+			// `gjc session` / `gjc team` ownership guarantees are not enforceable
+			// on a multiplexer that can't reliably store the option.
+			if (String(key).startsWith("@gjc-") && flag === "set-option") {
+				return false;
+			}
+			return true;
 		});
 	}
 	return commands;
