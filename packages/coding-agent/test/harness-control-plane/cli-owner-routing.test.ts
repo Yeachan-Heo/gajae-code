@@ -93,7 +93,7 @@ const passingFinalizeChecks: FinalizeChecks = {
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "h"));
-	cliEnv = createHarnessCliEnv(repoRoot);
+	cliEnv = await createHarnessCliEnv(repoRoot);
 	await writeSessionState(root, seed(root));
 	owner = new RuntimeOwner({
 		root,
@@ -107,10 +107,10 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	cliEnv.cleanup();
 	await owner?.stop();
 	await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
 	hungServer = null;
+	await cliEnv.cleanup();
 	await rm(root, { recursive: true, force: true });
 });
 

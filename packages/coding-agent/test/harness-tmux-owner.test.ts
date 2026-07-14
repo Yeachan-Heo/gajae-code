@@ -182,7 +182,7 @@ async function waitForExactExit(pid: number, timeoutMs: number): Promise<boolean
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-tmux-owner-"));
 	workspace = await mkdtemp(path.join(tmpdir(), "harness-tmux-workspace-"));
-	cliEnv = createHarnessCliEnv(repoRoot);
+	cliEnv = await createHarnessCliEnv(repoRoot);
 });
 
 afterEach(async () => {
@@ -202,7 +202,7 @@ afterEach(async () => {
 		// PRESERVE the roots for inspection instead of silently rm-ing an orphaned tree.
 		if (!(await waitForExactExit(lease.pid, LEASE_EXIT_TIMEOUT_MS))) leaseExitFailed = lease.pid;
 	}
-	cliEnv.cleanup();
+	await cliEnv.cleanup();
 	if (leaseExitFailed !== null)
 		throw new Error(
 			`detached owner lease pid ${leaseExitFailed} did not exit within ${LEASE_EXIT_TIMEOUT_MS}ms; preserving roots for inspection`,

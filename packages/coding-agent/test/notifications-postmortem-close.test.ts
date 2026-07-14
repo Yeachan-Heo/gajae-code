@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
-import { isolatedNotificationSettings } from "./helpers/notification-settings";
+import { isolatedNotificationSettings, stopIsolatedNotificationBroker } from "./helpers/notification-settings";
 
 /**
  * Regression for "hard terminal close orphans the Telegram topic": a native
@@ -32,9 +32,11 @@ type Frame = { type: string; sessionId?: string };
 type CleanupCallback = (reason: postmortem.Reason) => void | Promise<void>;
 
 const tempDirs: string[] = [];
+const agentDirs: string[] = [];
 const openSockets: WebSocket[] = [];
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openSockets.splice(0)) ws.close();
+	for (const agentDir of agentDirs.splice(0)) await stopIsolatedNotificationBroker(agentDir);
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 	vi.restoreAllMocks();
 });
@@ -42,6 +44,8 @@ afterEach(() => {
 function createHarness(prefix: string) {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => {
@@ -51,7 +55,7 @@ function createHarness(prefix: string) {
 		sendUserMessage: () => {},
 	} as never;
 	createNotificationsExtension(api, {
-		settings: isolatedNotificationSettings(path.join(cwd, ".agent")),
+		settings: isolatedNotificationSettings(agentDir),
 	});
 
 	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;

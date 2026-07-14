@@ -7,7 +7,7 @@ import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { renderThreadedFrame } from "../src/sdk/bus/threaded-render";
-import { isolatedNotificationSettings } from "./helpers/notification-settings";
+import { isolatedNotificationSettings, stopIsolatedNotificationBroker } from "./helpers/notification-settings";
 
 // ---------------------------------------------------------------------------
 // 1) Pure render contract: streamed turn frames become editable, and live +
@@ -62,6 +62,7 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = { type: string; phase?: string; text?: string; messageRef?: string };
 
 const tempDirs: string[] = [];
+const agentDirs: string[] = [];
 const openSockets: WebSocket[] = [];
 const envKeys = [
 	"GJC_NOTIFICATIONS",
@@ -71,17 +72,14 @@ const envKeys = [
 ] as const;
 let savedEnv: Record<string, string | undefined> = {};
 
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openSockets.splice(0)) {
 		try {
 			ws.close();
 		} catch {}
 	}
-	for (const dir of tempDirs.splice(0)) {
-		try {
-			fs.rmSync(dir, { recursive: true, force: true });
-		} catch {}
-	}
+	for (const agentDir of agentDirs.splice(0)) await stopIsolatedNotificationBroker(agentDir);
+	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 	for (const k of envKeys) {
 		if (savedEnv[k] === undefined) delete process.env[k];
 		else process.env[k] = savedEnv[k];
@@ -98,6 +96,8 @@ function setEnv(over: Partial<Record<(typeof envKeys)[number], string>>): void {
 async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unknown; frames: Frame[] }> {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-stream-"));
 	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
@@ -105,7 +105,7 @@ async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unk
 		sendUserMessage: () => {},
 	} as never;
 	createNotificationsExtension(api, {
-		settings: isolatedNotificationSettings(path.join(cwd, ".agent")),
+		settings: isolatedNotificationSettings(agentDir),
 	});
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {

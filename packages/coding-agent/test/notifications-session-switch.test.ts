@@ -14,7 +14,7 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { getAskAnswerSource } from "../src/tools/ask-answer-registry";
-import { isolatedNotificationSettings } from "./helpers/notification-settings";
+import { isolatedNotificationSettings, stopIsolatedNotificationBroker } from "./helpers/notification-settings";
 
 /**
  * Regression for "the SDK notification transport spawns a new session instead of renaming":
@@ -39,9 +39,11 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = { type: string; title?: string; sessionId?: string; state?: string };
 
 const tempDirs: string[] = [];
+const agentDirs: string[] = [];
 const openSockets: WebSocket[] = [];
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openSockets.splice(0)) ws.close();
+	for (const agentDir of agentDirs.splice(0)) await stopIsolatedNotificationBroker(agentDir);
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -59,6 +61,8 @@ async function withNotifications<T>(fn: () => Promise<T>): Promise<T> {
 function createHarness(prefix: string, initialName: string | undefined = "Original") {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
 	const api = {
@@ -70,7 +74,7 @@ function createHarness(prefix: string, initialName: string | undefined = "Origin
 		sendUserMessage: () => {},
 	} as never;
 	createNotificationsExtension(api, {
-		settings: isolatedNotificationSettings(path.join(cwd, ".agent")),
+		settings: isolatedNotificationSettings(agentDir),
 	});
 
 	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -149,6 +153,8 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 	const targetSessionId = targetSessionManager.getSessionId();
 	await targetSessionManager.close();
 	if (!targetSessionFile) throw new Error("Expected persisted target session");
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
 
 	const handlers = new Map<string, Handler>();
 	const api = {
@@ -157,7 +163,7 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 		sendUserMessage: async () => {},
 	} as never;
 	createNotificationsExtension(api, {
-		settings: isolatedNotificationSettings(path.join(cwd, ".agent")),
+		settings: isolatedNotificationSettings(agentDir),
 	});
 	const ctx = { cwd, sessionManager: currentSessionManager } as never;
 	const predecessorSessionId = currentSessionManager.getSessionId();
@@ -205,6 +211,8 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 test("turn.prompt preflight rejection returns a correlated failure without an accepted lifecycle", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-preflight-"));
 	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
 	const handlers = new Map<string, Handler>();
 	createNotificationsExtension(
 		{
@@ -215,7 +223,7 @@ test("turn.prompt preflight rejection returns a correlated failure without an ac
 			},
 		} as never,
 		{
-			settings: isolatedNotificationSettings(path.join(cwd, ".agent")),
+			settings: isolatedNotificationSettings(agentDir),
 		},
 	);
 	const sessionId = `preflight-${process.pid}-${Date.now()}`;
@@ -273,6 +281,8 @@ test("turn.prompt preflight rejection returns a correlated failure without an ac
 test("accepted turn.prompt submission failures emit a correlated terminal event", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-terminal-failure-"));
 	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
 	const handlers = new Map<string, Handler>();
 	createNotificationsExtension(
 		{
@@ -286,7 +296,7 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 			},
 		} as never,
 		{
-			settings: isolatedNotificationSettings(path.join(cwd, ".agent")),
+			settings: isolatedNotificationSettings(agentDir),
 		},
 	);
 	const sessionId = `terminal-failure-${process.pid}-${Date.now()}`;
@@ -356,6 +366,8 @@ test("session_switch rotates SDK authority while preserving topic identity", asy
 	try {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-switch-"));
 		tempDirs.push(cwd);
+		const agentDir = path.join(cwd, ".agent");
+		agentDirs.push(agentDir);
 		const handlers = new Map<string, Handler>();
 		const api = {
 			on: (event: string, handler: Handler) => {
@@ -365,7 +377,7 @@ test("session_switch rotates SDK authority while preserving topic identity", asy
 			sendUserMessage: () => {},
 		} as never;
 		createNotificationsExtension(api, {
-			settings: isolatedNotificationSettings(path.join(cwd, ".agent")),
+			settings: isolatedNotificationSettings(agentDir),
 		});
 
 		const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;

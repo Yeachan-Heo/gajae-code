@@ -191,12 +191,25 @@ async function runHarness(
 }
 
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
+async function waitForExactExit(pid: number, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			process.kill(pid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+			throw error;
+		}
+		await sleep(25);
+	}
+	throw new Error(`Detached harness owner pid ${pid} did not exit within ${timeoutMs}ms.`);
+}
 
 beforeEach(async () => {
 	// Short paths keep the AF_UNIX socket path under the sun_path limit.
 	root = await mkdtemp(path.join(tmpdir(), "h"));
 	workspace = await mkdtemp(path.join(tmpdir(), "hw"));
-	cliEnv = createHarnessCliEnv(repoRoot);
+	cliEnv = await createHarnessCliEnv(repoRoot);
 	tmuxCommand = await createFakeTmuxBin(root);
 
 	disableSdkHost = false;
@@ -205,7 +218,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	sdkServer.stop(true);
-	cliEnv.cleanup();
+	const signalled = new Set<number>();
 	const serverPid = await readFile(path.join(root, "tmux-server.pid"), "utf8")
 		.then(value => Number(value.trim()))
 		.catch(error => {
@@ -218,6 +231,7 @@ afterEach(async () => {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
 		}
+		signalled.add(serverPid);
 	}
 	const lease = await readLease(root, SID).catch(error => {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -229,7 +243,10 @@ afterEach(async () => {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
 		}
+		signalled.add(lease.pid);
 	}
+	for (const pid of signalled) await waitForExactExit(pid);
+	await cliEnv.cleanup();
 	await rm(root, { recursive: true, force: true });
 	await rm(workspace, { recursive: true, force: true });
 });
