@@ -48,6 +48,15 @@ test("ACP paginates after cwd filtering and terminates the filtered cursor", () 
 	});
 });
 
+test("ACP cwd filtering accepts path-equivalent workspace spellings", () => {
+	expect(
+		paginateAcpSessions([{ sessionId: "workspace", locator: { repo: "/workspace" } }], "/workspace/.", 0),
+	).toEqual({
+		sessions: [{ sessionId: "workspace", cwd: "/workspace", title: "workspace" }],
+		nextCursor: undefined,
+	});
+});
+
 test("ACP reports live SDK config values and mode rather than hard-coded defaults", () => {
 	const state = acpSessionStateFromConfig({
 		result: {
