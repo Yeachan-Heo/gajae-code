@@ -5188,6 +5188,18 @@ test("a terminal deletion record for the same session/topic under an old lease c
 });
 
 test("a late frame after session_closed targets a fresh topic and never the deleted thread (F002 send fence)", async () => {
+	class StableFenceWs extends FakeWs {
+		override close() {
+			this.readyState = 3;
+		}
+		override dispatchEvent(event: Event): boolean {
+			if (event.type === "close") {
+				this.readyState = 3;
+				return true;
+			}
+			return super.dispatchEvent(event);
+		}
+	}
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
@@ -5199,6 +5211,7 @@ test("a late frame after session_closed targets a fresh topic and never the dele
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot,
+		WebSocketImpl: StableFenceWs as any,
 	});
 	daemon.connectSession("S", "ws://s", "ts", { canonicalRoot: reg.canonicalRoot, leaseId: reg.leaseId });
 	const session = daemon.sessions.get("S")!;
