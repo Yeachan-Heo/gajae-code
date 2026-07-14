@@ -186,27 +186,40 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	const lease = await readLease(root, sessionId).catch(error => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	});
-	let leaseExitFailed: number | null = null;
-	if (lease?.pid) {
-		try {
-			process.kill(lease.pid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+	let ownerTeardownError: unknown;
+	try {
+		const lease = await readLease(root, sessionId).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+			throw error;
+		});
+		if (lease?.pid) {
+			try {
+				process.kill(lease.pid, "SIGTERM");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+			}
+			// A live detached owner must exit before its broker or roots are removed.
+			if (!(await waitForExactExit(lease.pid, LEASE_EXIT_TIMEOUT_MS))) {
+				throw new Error(
+					`detached owner lease pid ${lease.pid} did not exit within ${LEASE_EXIT_TIMEOUT_MS}ms; preserving roots for inspection`,
+				);
+			}
 		}
-		// Bounded exact lease-PID exit wait: a live detached owner must tear down (and signal its
-		// descendants) before we delete the roots. A timeout is a real leak — fail loudly and
-		// PRESERVE the roots for inspection instead of silently rm-ing an orphaned tree.
-		if (!(await waitForExactExit(lease.pid, LEASE_EXIT_TIMEOUT_MS))) leaseExitFailed = lease.pid;
+	} catch (error) {
+		ownerTeardownError = error;
 	}
-	await cliEnv.cleanup();
-	if (leaseExitFailed !== null)
-		throw new Error(
-			`detached owner lease pid ${leaseExitFailed} did not exit within ${LEASE_EXIT_TIMEOUT_MS}ms; preserving roots for inspection`,
-		);
+	try {
+		await cliEnv.cleanup();
+	} catch (brokerCleanupError) {
+		if (ownerTeardownError) {
+			throw new AggregateError(
+				[ownerTeardownError, brokerCleanupError],
+				"Detached harness owner and SDK broker cleanup both failed; preserving roots.",
+			);
+		}
+		throw brokerCleanupError;
+	}
+	if (ownerTeardownError) throw ownerTeardownError;
 	await rm(root, { recursive: true, force: true });
 	await rm(workspace, { recursive: true, force: true });
 });

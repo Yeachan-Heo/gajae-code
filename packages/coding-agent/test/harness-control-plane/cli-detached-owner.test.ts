@@ -217,36 +217,52 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	sdkServer.stop(true);
-	const signalled = new Set<number>();
-	const serverPid = await readFile(path.join(root, "tmux-server.pid"), "utf8")
-		.then(value => Number(value.trim()))
-		.catch(error => {
+	let ownerTeardownError: unknown;
+	try {
+		sdkServer.stop(true);
+		const signalled = new Set<number>();
+		const serverPid = await readFile(path.join(root, "tmux-server.pid"), "utf8")
+			.then(value => Number(value.trim()))
+			.catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw error;
+			});
+		if (serverPid !== null && Number.isSafeInteger(serverPid) && serverPid > 0) {
+			try {
+				process.kill(serverPid, "SIGTERM");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+			}
+			signalled.add(serverPid);
+		}
+		const lease = await readLease(root, SID).catch(error => {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 			throw error;
 		});
-	if (serverPid !== null && Number.isSafeInteger(serverPid) && serverPid > 0) {
-		try {
-			process.kill(serverPid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+		if (lease?.pid) {
+			try {
+				process.kill(lease.pid, "SIGTERM");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+			}
+			signalled.add(lease.pid);
 		}
-		signalled.add(serverPid);
+		for (const pid of signalled) await waitForExactExit(pid);
+	} catch (error) {
+		ownerTeardownError = error;
 	}
-	const lease = await readLease(root, SID).catch(error => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	});
-	if (lease?.pid) {
-		try {
-			process.kill(lease.pid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+	try {
+		await cliEnv.cleanup();
+	} catch (brokerCleanupError) {
+		if (ownerTeardownError) {
+			throw new AggregateError(
+				[ownerTeardownError, brokerCleanupError],
+				"Detached harness owner and SDK broker cleanup both failed; preserving roots.",
+			);
 		}
-		signalled.add(lease.pid);
+		throw brokerCleanupError;
 	}
-	for (const pid of signalled) await waitForExactExit(pid);
-	await cliEnv.cleanup();
+	if (ownerTeardownError) throw ownerTeardownError;
 	await rm(root, { recursive: true, force: true });
 	await rm(workspace, { recursive: true, force: true });
 });

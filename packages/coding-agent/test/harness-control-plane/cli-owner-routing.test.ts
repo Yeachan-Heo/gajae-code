@@ -107,10 +107,26 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	await owner?.stop();
-	await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
-	hungServer = null;
-	await cliEnv.cleanup();
+	let ownerTeardownError: unknown;
+	try {
+		await owner?.stop();
+		await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
+		hungServer = null;
+	} catch (error) {
+		ownerTeardownError = error;
+	}
+	try {
+		await cliEnv.cleanup();
+	} catch (brokerCleanupError) {
+		if (ownerTeardownError) {
+			throw new AggregateError(
+				[ownerTeardownError, brokerCleanupError],
+				"Harness runtime owner and SDK broker cleanup both failed; preserving roots.",
+			);
+		}
+		throw brokerCleanupError;
+	}
+	if (ownerTeardownError) throw ownerTeardownError;
 	await rm(root, { recursive: true, force: true });
 });
 
