@@ -197,4 +197,24 @@ describe("Azure OpenAI responses tool choice capability", () => {
 		expect(payload?.tools).toBeUndefined();
 		expect(payload?.tool_choice).toBeUndefined();
 	});
+
+	it("keeps tool_choice none when real tools are present", async () => {
+		let payload: Record<string, unknown> | undefined;
+		const testModel = model();
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+				return okResponse(testModel.id);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		await streamAzureOpenAIResponses(testModel, testContext, {
+			apiKey: "test-key",
+			azureBaseUrl: testModel.baseUrl,
+			toolChoice: "none",
+		}).result();
+		expect(Array.isArray(payload?.tools)).toBe(true);
+		expect((payload?.tools as unknown[]).length).toBeGreaterThan(0);
+		expect(payload?.tool_choice).toBe("none");
+	});
 });
