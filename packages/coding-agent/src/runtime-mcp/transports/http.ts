@@ -15,7 +15,7 @@ import type {
 	MCPSseServerConfig,
 	MCPTransport,
 } from "../../runtime-mcp/types";
-import { toJsonRpcError } from "../../runtime-mcp/types";
+import { MCPExpectedFailure, toJsonRpcError } from "../../runtime-mcp/types";
 
 /**
  * HTTP transport for MCP servers.
@@ -123,7 +123,7 @@ export class HttpTransport implements MCPTransport {
 			}
 		} catch (error) {
 			if (error instanceof Error && error.name !== "AbortError") {
-				logger.debug("HTTP SSE stream error", { url: this.config.url, error: error.message });
+				logger.debug("HTTP SSE stream error");
 				this.onError?.(error);
 			}
 		}
@@ -160,10 +160,14 @@ export class HttpTransport implements MCPTransport {
 				if (newHeaders) {
 					// Persist refreshed headers so subsequent requests use them directly
 					this.config = { ...this.config, headers: newHeaders };
-					return this.#executeRequest<T>(method, params, options);
+					try {
+						return await this.#executeRequest<T>(method, params, options);
+					} catch (retryError) {
+						throw retryError instanceof MCPExpectedFailure ? retryError : new MCPExpectedFailure(retryError);
+					}
 				}
 			}
-			throw error;
+			throw error instanceof MCPExpectedFailure ? error : new MCPExpectedFailure(error);
 		}
 	}
 
@@ -173,7 +177,7 @@ export class HttpTransport implements MCPTransport {
 		options: MCPRequestOptions | undefined,
 	): Promise<T> {
 		if (!this.#connected) {
-			throw new Error("Transport not connected");
+			throw new MCPExpectedFailure();
 		}
 
 		const id = Snowflake.next();
@@ -238,10 +242,27 @@ export class HttpTransport implements MCPTransport {
 			}
 
 			// Handle JSON response
-			const result = (await response.json()) as JsonRpcResponse;
+			if (!response.body) {
+				throw new MCPExpectedFailure();
+			}
+			const parsedResult = await response.json();
 
-			if (result.error) {
-				throw new Error(`MCP error ${result.error.code}: ${result.error.message}`);
+			if (
+				typeof parsedResult !== "object" ||
+				parsedResult === null ||
+				!("id" in parsedResult) ||
+				parsedResult.id !== id ||
+				(!("result" in parsedResult) && !("error" in parsedResult))
+			) {
+				throw new MCPExpectedFailure();
+			}
+
+			const result = parsedResult as JsonRpcResponse;
+			if ("error" in result) {
+				if (!result.error) {
+					throw new MCPExpectedFailure();
+				}
+				throw new MCPExpectedFailure(new Error(`MCP error ${result.error.code}: ${result.error.message}`));
 			}
 
 			return result.result as T;
@@ -260,7 +281,7 @@ export class HttpTransport implements MCPTransport {
 
 	#parseSSEResponse<T>(response: Response, expectedId: string | number, options?: MCPRequestOptions): Promise<T> {
 		if (!response.body) {
-			throw new Error("No response body");
+			throw new MCPExpectedFailure();
 		}
 
 		const timeout = this.config.timeout ?? 30000;
@@ -294,10 +315,19 @@ export class HttpTransport implements MCPTransport {
 						) {
 							captured = true;
 							drainController.abort();
-							if (message.error) {
-								reject(new Error(`MCP error ${message.error.code}: ${message.error.message}`));
+							const response = message as JsonRpcResponse;
+							if ("error" in response) {
+								if (!response.error) {
+									reject(new MCPExpectedFailure());
+								} else {
+									reject(
+										new MCPExpectedFailure(
+											new Error(`MCP error ${response.error.code}: ${response.error.message}`),
+										),
+									);
+								}
 							} else {
-								resolve(message.result as T);
+								resolve(response.result as T);
 							}
 							return;
 						}
@@ -306,18 +336,18 @@ export class HttpTransport implements MCPTransport {
 					}
 				}
 				if (!captured) {
-					reject(new Error(`No response received for request ID ${expectedId}`));
+					reject(new MCPExpectedFailure());
 				}
 			} catch (error) {
 				if (captured) return;
 				if (error instanceof Error && error.name === "AbortError") {
 					if (options?.signal?.aborted) {
-						reject(error);
+						reject(new MCPExpectedFailure(error));
 					} else {
-						reject(new Error(`SSE response timeout after ${timeout}ms`));
+						reject(new MCPExpectedFailure(new Error(`SSE response timeout after ${timeout}ms`)));
 					}
 				} else {
-					reject(error as Error);
+					reject(error instanceof MCPExpectedFailure ? error : new MCPExpectedFailure(error));
 				}
 			} finally {
 				clearTimeout(timeoutId);
@@ -390,7 +420,7 @@ export class HttpTransport implements MCPTransport {
 
 	async notify(method: string, params?: Record<string, unknown>): Promise<void> {
 		if (!this.#connected) {
-			throw new Error("Transport not connected");
+			throw new MCPExpectedFailure();
 		}
 
 		const body = {
@@ -447,9 +477,9 @@ export class HttpTransport implements MCPTransport {
 		} catch (error) {
 			clearTimeout(timeoutId);
 			if (error instanceof Error && error.name === "AbortError") {
-				throw new Error(`Notify timeout after ${timeout}ms`);
+				throw new MCPExpectedFailure(new Error(`Notify timeout after ${timeout}ms`));
 			}
-			throw error;
+			throw error instanceof MCPExpectedFailure ? error : new MCPExpectedFailure(error);
 		}
 	}
 

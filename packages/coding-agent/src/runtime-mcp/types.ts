@@ -223,6 +223,16 @@ export interface MCPToolCallResult {
 // Transport Types
 // =============================================================================
 
+/** Expected configured-server transport or protocol failure. */
+export class MCPExpectedFailure extends Error {
+	constructor(cause?: unknown) {
+		super(
+			cause instanceof Error ? cause.message : "MCP server operation failed",
+			cause === undefined ? undefined : { cause },
+		);
+		this.name = "MCPExpectedFailure";
+	}
+}
 export interface MCPRequestOptions {
 	/** Abort signal (e.g. Escape-to-interrupt) */
 	signal?: AbortSignal;

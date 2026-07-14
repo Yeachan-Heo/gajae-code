@@ -1,11 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
-import { applyStartupModelProfiles } from "../src/main";
+import { applyStartupModelProfiles, applyStartupModelProfilesOrExit } from "../src/main";
 import { parseCliCredentialSelector } from "../src/runtime-credential-selector";
 import type { AgentSession } from "../src/session/agent-session";
 
@@ -126,6 +126,54 @@ describe("CLI credential selector args", () => {
 	});
 });
 
+describe("MCP config CLI args", () => {
+	test("parses absolute config paths in both supported syntaxes", () => {
+		expect(parseArgs(["--mcp-config", "/tmp/gjc-mcp.json"]).mcpConfig).toBe("/tmp/gjc-mcp.json");
+		expect(parseArgs(["--mcp-config=/tmp/gjc-mcp.json"]).mcpConfig).toBe("/tmp/gjc-mcp.json");
+	});
+
+	test("rejects missing or non-absolute config paths", () => {
+		for (const args of [
+			["--mcp-config"],
+			["--mcp-config", "relative/mcp.json"],
+			["--mcp-config="],
+			["--mcp-config=relative/mcp.json"],
+		]) {
+			expect(() => parseArgs(args)).toThrow(CliParseError);
+			expect(() => parseArgs(args)).toThrow("--mcp-config requires <absolute-path>");
+		}
+	});
+	test("rejects repeated config paths in every supported syntax", () => {
+		for (const argv of [
+			["--mcp-config", "/tmp/gjc-mcp.json", "--mcp-config", "/tmp/gjc-mcp.json"],
+			["--mcp-config", "/tmp/gjc-mcp.json", "--mcp-config", "/tmp/other-mcp.json"],
+			["--mcp-config", "/tmp/gjc-mcp.json", "--mcp-config=/tmp/other-mcp.json"],
+			["--mcp-config=/tmp/gjc-mcp.json", "--mcp-config", "/tmp/other-mcp.json"],
+		]) {
+			let thrown: unknown;
+			try {
+				parseArgs(argv);
+			} catch (error) {
+				thrown = error;
+			}
+
+			expect(thrown).toBeInstanceOf(CliParseError);
+			expect(thrown).toHaveProperty("message", "--mcp-config can only be specified once");
+		}
+	});
+
+	test("rejects non-standalone config routes during parsing", () => {
+		const rejectedArgs = [
+			["--mcp-config", "/tmp/gjc-mcp.json", "--mode", "acp"],
+			["--mcp-config", "/tmp/gjc-mcp.json", "--export", "/tmp/session.jsonl"],
+			["--mcp-config", "/tmp/gjc-mcp.json", "--list-models"],
+		];
+		for (const args of rejectedArgs) {
+			expect(() => parseArgs(args)).toThrow(CliParseError);
+		}
+	});
+});
+
 test("explicit CLI --model/--thinking are reapplied after --mpreset activation", async () => {
 	const session = fakeSession(model("cli-provider", "explicit"));
 	const settings = Settings.isolated();
@@ -179,6 +227,34 @@ test("deferred explicit CLI --model is reapplied after --mpreset activation", as
 	).toEqual(["profile-provider/default:high", "cli-provider/explicit:undefined"]);
 	expect(session.setModelTemporaryCalls.at(-1)?.model).toBe(explicitModel);
 	expect(session.model).toBe(explicitModel);
+});
+
+test("startup profile activation failure disposes the session before exit", async () => {
+	const session = fakeSession();
+	let disposed = false;
+	session.dispose = async () => {
+		await Promise.resolve();
+		disposed = true;
+	};
+	const exitSpy = vi.spyOn(process, "exit").mockImplementation((code?: string | number | null | undefined): never => {
+		if (!disposed) throw new Error("process exited before session cleanup");
+		throw new Error(`exit ${code}`);
+	});
+	const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+	try {
+		await expect(
+			applyStartupModelProfilesOrExit({
+				session,
+				settings: Settings.isolated(),
+				modelRegistry: fakeRegistry([]) as never,
+				parsedArgs: { mpreset: "missing-profile" },
+			}),
+		).rejects.toThrow("exit 1");
+		expect(exitSpy).toHaveBeenCalledWith(1);
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
 });
 
 test("explicit CLI --model rebases the resumed session default chain", async () => {

@@ -16,7 +16,7 @@ import type {
 	MCPStdioServerConfig,
 	MCPTransport,
 } from "../../runtime-mcp/types";
-import { toJsonRpcError } from "../../runtime-mcp/types";
+import { MCPExpectedFailure, toJsonRpcError } from "../../runtime-mcp/types";
 
 /**
  * Stdio transport for MCP servers.
@@ -90,7 +90,7 @@ export class StdioTransport implements MCPTransport {
 	 */
 	async connect(): Promise<void> {
 		if (this.#closePromise) {
-			throw new Error("Transport is closing");
+			throw new MCPExpectedFailure();
 		}
 		if (this.#connected) return;
 
@@ -101,14 +101,19 @@ export class StdioTransport implements MCPTransport {
 					...Bun.env,
 					...this.config.env,
 				};
+		const cwd = this.config.cwd ?? getProjectDir();
 
-		this.#process = spawnOwnedProcess([this.config.command, ...args], {
-			cwd: this.config.cwd ?? getProjectDir(),
-			env,
-			stdin: "pipe",
-			gracefulMs: CLOSE_WAIT_MS,
-			name: `mcp-stdio:${this.config.command}`,
-		});
+		try {
+			this.#process = spawnOwnedProcess([this.config.command, ...args], {
+				cwd,
+				env,
+				stdin: "pipe",
+				gracefulMs: CLOSE_WAIT_MS,
+				name: `mcp-stdio:${this.config.command}`,
+			});
+		} catch (error) {
+			throw new MCPExpectedFailure(error);
+		}
 
 		this.#connected = true;
 
@@ -121,6 +126,7 @@ export class StdioTransport implements MCPTransport {
 
 	async #startReadLoop(): Promise<void> {
 		if (!this.#process?.child.stdout) return;
+		let failure: MCPExpectedFailure | undefined;
 		try {
 			for await (const line of readJsonl(this.#process.child.stdout)) {
 				if (!this.#connected) break;
@@ -131,11 +137,12 @@ export class StdioTransport implements MCPTransport {
 				}
 			}
 		} catch (error) {
+			failure = new MCPExpectedFailure(error);
 			if (this.#connected) {
-				this.onError?.(error instanceof Error ? error : new Error(String(error)));
+				this.onError?.(failure);
 			}
 		} finally {
-			this.#handleClose();
+			this.#handleClose(failure);
 		}
 	}
 
@@ -180,8 +187,16 @@ export class StdioTransport implements MCPTransport {
 			const pending = this.#pendingRequests.get(response.id);
 			if (pending) {
 				this.#pendingRequests.delete(response.id);
-				if (response.error) {
-					pending.reject(new Error(`MCP error ${response.error.code}: ${response.error.message}`));
+				if (!("result" in response) && !("error" in response)) {
+					pending.reject(new MCPExpectedFailure());
+				} else if ("error" in response) {
+					if (!response.error) {
+						pending.reject(new MCPExpectedFailure());
+					} else {
+						pending.reject(
+							new MCPExpectedFailure(new Error(`MCP error ${response.error.code}: ${response.error.message}`)),
+						);
+					}
 				} else {
 					pending.resolve(response.result);
 				}
@@ -228,8 +243,8 @@ export class StdioTransport implements MCPTransport {
 		stdin.flush();
 	}
 
-	#handleClose(): void {
-		void this.#closeInternal(true);
+	#handleClose(failure?: MCPExpectedFailure): void {
+		void this.#closeInternal(true, failure);
 	}
 
 	async request<T = unknown>(
@@ -239,7 +254,7 @@ export class StdioTransport implements MCPTransport {
 	): Promise<T> {
 		const stdin = this.#getStdin();
 		if (!this.#connected || !stdin) {
-			throw new Error("Transport not connected");
+			throw new MCPExpectedFailure();
 		}
 
 		const id = Snowflake.next();
@@ -255,7 +270,7 @@ export class StdioTransport implements MCPTransport {
 
 		if (signal?.aborted) {
 			const reason = signal.reason instanceof Error ? signal.reason : new Error("Aborted");
-			return Promise.reject(reason);
+			return Promise.reject(new MCPExpectedFailure(reason));
 		}
 
 		const { promise, resolve, reject } = Promise.withResolvers<T>();
@@ -278,7 +293,7 @@ export class StdioTransport implements MCPTransport {
 		const onAbort = () => {
 			cleanup();
 			const reason = signal?.reason instanceof Error ? signal.reason : new Error("Aborted");
-			reject(reason);
+			reject(new MCPExpectedFailure(reason));
 		};
 
 		if (signal) {
@@ -298,7 +313,7 @@ export class StdioTransport implements MCPTransport {
 
 		timer = setTimeout(() => {
 			cleanup();
-			reject(new Error(`Request timeout after ${timeout}ms`));
+			reject(new MCPExpectedFailure(new Error(`Request timeout after ${timeout}ms`)));
 		}, timeout);
 
 		const message = `${JSON.stringify(request)}\n`;
@@ -308,7 +323,7 @@ export class StdioTransport implements MCPTransport {
 			stdin.flush();
 		} catch (error: unknown) {
 			cleanup();
-			reject(error instanceof Error ? error : new Error(String(error)));
+			reject(new MCPExpectedFailure(error));
 		}
 
 		return promise;
@@ -317,7 +332,7 @@ export class StdioTransport implements MCPTransport {
 	async notify(method: string, params?: Record<string, unknown>): Promise<void> {
 		const stdin = this.#getStdin();
 		if (!this.#connected || !stdin) {
-			throw new Error("Transport not connected");
+			throw new MCPExpectedFailure();
 		}
 
 		const notification = {
@@ -327,29 +342,33 @@ export class StdioTransport implements MCPTransport {
 		};
 
 		const message = `${JSON.stringify(notification)}\n`;
-		// Bun's FileSink has write() method directly
-		stdin.write(message);
-		stdin.flush();
+		try {
+			// Bun's FileSink has write() method directly
+			stdin.write(message);
+			stdin.flush();
+		} catch (error) {
+			throw new MCPExpectedFailure(error);
+		}
 	}
 
 	async close(): Promise<void> {
 		await this.#closeInternal(false);
 	}
 
-	#closeInternal(fromReadLoop: boolean): Promise<void> {
+	#closeInternal(fromReadLoop: boolean, failure?: MCPExpectedFailure): Promise<void> {
 		if (this.#closePromise) return this.#closePromise;
-		this.#closePromise = this.#finishClose(fromReadLoop).finally(() => {
+		this.#closePromise = this.#finishClose(fromReadLoop, failure).finally(() => {
 			this.#closePromise = null;
 		});
 		return this.#closePromise;
 	}
 
-	async #finishClose(fromReadLoop: boolean): Promise<void> {
+	async #finishClose(fromReadLoop: boolean, failure?: MCPExpectedFailure): Promise<void> {
 		const wasConnected = this.#connected;
 		this.#connected = false;
 
 		for (const [, pending] of this.#pendingRequests) {
-			pending.reject(new Error("Transport closed"));
+			pending.reject(failure ?? new MCPExpectedFailure());
 		}
 		this.#pendingRequests.clear();
 

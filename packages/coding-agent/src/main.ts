@@ -193,6 +193,7 @@ export function resolveAcpStartupOptions(
 		| "hooks"
 		| "messages"
 		| "mpreset"
+		| "mcpConfig"
 		| "model"
 		| "models"
 		| "noLsp"
@@ -234,6 +235,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.hooks?.length ? ["--hook"] : []),
 		...(parsed.messages.length > 0 ? ["initial prompt"] : []),
 		...(parsed.models?.length ? ["--models"] : []),
+		...(parsed.mcpConfig !== undefined ? ["--mcp-config"] : []),
 		...(parsed.noLsp ? ["--no-lsp"] : []),
 		...(parsed.noPty ? ["--no-pty"] : []),
 		...(parsed.noRules ? ["--no-rules"] : []),
@@ -427,6 +429,7 @@ export async function applyStartupModelProfilesOrExit(
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+		await args.session.dispose();
 		process.exit(1);
 	}
 }
@@ -783,6 +786,7 @@ async function buildSessionOptions(
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
 	};
+	if (parsed.mcpConfig !== undefined) options.mcpConfigPath = parsed.mcpConfig;
 
 	const systemPromptSource = parsed.systemPrompt;
 	const resolvedSystemPrompt = await resolvePromptInput(systemPromptSource, "system prompt");
@@ -1295,7 +1299,16 @@ export async function runRootCommand(
 
 		// Research-mode (RLM) preset: hard tool-boundary assertion after the registry is assembled.
 		if (deps.rlmPreset?.onSessionCreated) {
-			await deps.rlmPreset.onSessionCreated(session);
+			try {
+				await deps.rlmPreset.onSessionCreated(session);
+			} catch (error) {
+				try {
+					await session.dispose();
+				} catch {
+					logger.warn("Failed to dispose session after RLM post-create error");
+				}
+				throw error;
+			}
 		}
 
 		if (!(parsedArgs.authBootstrap === true && isInteractive)) {
@@ -1337,52 +1350,70 @@ export async function runRootCommand(
 			process.stderr.write(
 				`${chalk.yellow(`\nAdvanced manual config remains available at ${ModelsConfigFile.path()}`)}\n`,
 			);
+			await session.dispose();
+			stopThemeWatcher();
+			await postmortem.quit(1);
 			process.exit(1);
 		}
 
 		if (isInteractive) {
-			startupUpdate.startBeforeInteractiveInitialization();
-			const changelogMarkdown = await logger.time(
-				"main:getChangelogForDisplay",
-				deps.getChangelogForDisplay ?? getChangelogForDisplay,
-				parsedArgs,
-			);
+			let exitForTiming = false;
+			try {
+				startupUpdate.startBeforeInteractiveInitialization();
+				const changelogMarkdown = await logger.time(
+					"main:getChangelogForDisplay",
+					deps.getChangelogForDisplay ?? getChangelogForDisplay,
+					parsedArgs,
+				);
 
-			const scopedModelsForDisplay = sessionOptions.scopedModels ?? scopedModels;
-			if (scopedModelsForDisplay.length > 0) {
-				const modelList = scopedModelsForDisplay
-					.map(scopedModel => {
-						const thinkingStr = !scopedModel.thinkingLevel ? `:${scopedModel.thinkingLevel}` : "";
-						return `${scopedModel.model.id}${thinkingStr}`;
-					})
-					.join(", ");
-				process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
-			}
-
-			if ($env.PI_TIMING) {
-				logger.printTimings();
-				if ($env.PI_TIMING === "x") {
-					process.exit(0);
+				const scopedModelsForDisplay = sessionOptions.scopedModels ?? scopedModels;
+				if (scopedModelsForDisplay.length > 0) {
+					const modelList = scopedModelsForDisplay
+						.map(scopedModel => {
+							const thinkingStr = !scopedModel.thinkingLevel ? `:${scopedModel.thinkingLevel}` : "";
+							return `${scopedModel.model.id}${thinkingStr}`;
+						})
+						.join(", ");
+					process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
 				}
+
+				if ($env.PI_TIMING) {
+					logger.printTimings();
+					exitForTiming = $env.PI_TIMING === "x";
+				}
+
+				if (!exitForTiming) {
+					logger.endTiming();
+					await runInteractiveMode(
+						session,
+						VERSION,
+						changelogMarkdown,
+						notifs,
+						startupUpdate,
+						parsedArgs.messages,
+						setToolUIContext,
+						lspServers,
+						mcpManager,
+						eventBus,
+						initialMessage,
+						initialImages,
+						deps.createInteractiveMode,
+						bareResumeAction,
+					);
+				}
+			} catch (error) {
+				try {
+					await session.dispose();
+				} catch {
+					logger.warn("Failed to dispose session after interactive error");
+				}
+				throw error;
 			}
 
-			logger.endTiming();
-			await runInteractiveMode(
-				session,
-				VERSION,
-				changelogMarkdown,
-				notifs,
-				startupUpdate,
-				parsedArgs.messages,
-				setToolUIContext,
-				lspServers,
-				mcpManager,
-				eventBus,
-				initialMessage,
-				initialImages,
-				deps.createInteractiveMode,
-				bareResumeAction,
-			);
+			if (exitForTiming) {
+				await session.dispose();
+				process.exit(0);
+			}
 		} else {
 			const runPrint = deps.runPrintMode ?? (await import("./modes/print-mode")).runPrintMode;
 			await runPrint(session, {
