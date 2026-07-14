@@ -8,7 +8,7 @@ import { withFileLock } from "../../config/file-lock";
 import type { Settings } from "../../config/settings";
 import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
-import { type ChatEffect, ChatEffectJournal, type ChatEffectLease } from "./chat-effect-journal";
+import { ChatEffectJournal, type ChatEffectLease } from "./chat-effect-journal";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand, parseRichToggleCommand, parseTelegramControlCommand } from "./config-commands";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
@@ -594,11 +594,51 @@ const TELEGRAM_TOPIC_DELETE_KIND = "telegram.topic_delete";
 const TELEGRAM_DELETION_LEASE_MS = 60_000;
 const TELEGRAM_DELETION_RETRY_MS = 1_000;
 
-function topicDeleteEffectId(sessionId: string, topicId: string, leaseId: string): string {
+function topicDeleteEffectId(chatId: string, sessionId: string, topicId: string, leaseId: string): string {
 	// Scope terminal effects to the exact registration generation. Reusing a
 	// session or topic id under a fresh lease must never inherit an old terminal
-	// deletion record.
-	return `${TELEGRAM_TOPIC_DELETE_KIND}:${sessionId}:${topicId}:${leaseId}`;
+	// deletion record. The chat identity is embedded so a current-chat deletion
+	// can never collide with a prior-chat effect for the same session/topic/lease.
+	return `${TELEGRAM_TOPIC_DELETE_KIND}:${chatId}:${sessionId}:${topicId}:${leaseId}`;
+}
+/**
+ * Tri-state classification of durable roots-registry authority for a deletion
+ * claim. Exact current requires a successfully read, structurally valid registry
+ * with a valid session mapping and a matching lease. Superseded requires a
+ * successfully read, structurally valid registry whose valid current lease/mapping
+ * differ from the claim, positively proving a successor. A missing file, an
+ * absent session entry, malformed top-level/fields, corrupt JSON, unreadable I/O,
+ * or an ambiguous identity is UNKNOWN — fail-closed.
+ */
+type DeletionAuthorityEvidence = "exact_current" | "superseded" | "unknown";
+
+async function evaluateDeletionAuthority(
+	fsImpl: TelegramDaemonFs,
+	rootsFile: string,
+	sessionId: string,
+	leaseId: string,
+): Promise<DeletionAuthorityEvidence> {
+	let parsed: unknown;
+	try {
+		parsed = await readJson<unknown>(fsImpl, rootsFile);
+	} catch {
+		// Corrupt JSON, unreadable I/O, or any non-ENOENT read failure: UNKNOWN.
+		return "unknown";
+	}
+	// Missing file (ENOENT) is UNKNOWN: neither a successor nor the current authority can be proven.
+	if (parsed === undefined) return "unknown";
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "unknown";
+	const raw = parsed as Record<string, unknown>;
+	const sessionLeases = parseSessionLeases(raw.sessionLeases);
+	const sessions = parseStringRecord(raw.sessions);
+	const lease = sessionLeases.get(sessionId);
+	const mappedRoot = sessions.get(sessionId);
+	// Absent session entry is UNKNOWN: cannot prove a successor or current authority.
+	if (!lease || !mappedRoot) return "unknown";
+	if (lease.leaseId === leaseId) return "exact_current";
+	// A structurally valid registry with a nonmatching current lease + mapping
+	// positively proves a successor registration.
+	return "superseded";
 }
 /** Payload of a telegram topic-delete effect. Provider identifiers only. */
 interface TelegramTopicDeletePayload {
@@ -616,6 +656,28 @@ function isTelegramTopicDeletePayload(value: unknown): value is TelegramTopicDel
 	const payload = value as Partial<TelegramTopicDeletePayload>;
 	return isNonEmptyString(payload.chatId) && isCanonicalTopicId(payload.topicId) && isNonEmptyString(payload.leaseId);
 }
+/**
+ * Result of acquiring durable deletion authority under the per-session admission
+ * lock (phase 1). `prepared` carries the exact effect id/payload/lease a caller
+ * may apply a fence and call Telegram with; `terminal` reports an already
+ * exact-current terminal claim whose local cleanup may be finished without a
+ * provider call; `quarantined` marks a malformed/prior-chat effect for a
+ * non-destructive terminal receipt (no provider/fence/topic removal/compaction);
+ * `deferred` withholds ALL successor-sensitive mutation
+ * (unknown/superseded/backoff/unclaimable). The fence, queue cancellation,
+ * drain, and provider call run ONLY after a `prepared`/`terminal` result.
+ */
+type DeletionAuthority =
+	| {
+			status: "prepared";
+			effectId: string;
+			payload: TelegramTopicDeletePayload;
+			lease: ChatEffectLease;
+			generation: number;
+	  }
+	| { status: "terminal"; effectId: string; payload: TelegramTopicDeletePayload }
+	| { status: "quarantined"; effectId: string }
+	| { status: "deferred"; reason: "unknown" | "superseded" | "backoff" | "unclaimable" };
 /** True while a topic deletion has not completed local crash reconciliation. */
 async function hasUnreconciledDeletionClaim(agentDir: string, sessionId: string): Promise<boolean> {
 	const journal = new ChatEffectJournal({ agentDir, transport: "telegram" });
@@ -705,6 +767,12 @@ export async function stampEndpointPublicationIdentity(
 			await handle.close();
 		}
 		await fs.promises.rename(tmp, endpointPath);
+		const directory = await fs.promises.open(path.dirname(endpointPath), "r");
+		try {
+			await directory.sync();
+		} finally {
+			await directory.close();
+		}
 	} catch (error) {
 		await fs.promises.unlink(tmp).catch(() => undefined);
 		throw error;
@@ -1552,7 +1620,7 @@ export class TelegramNotificationDaemon {
 	/** Per-session 429 retry_after backoff deadline (ms via opts.now). Seeded from
 	 * the DURABLY persisted deletion-effect receipt on re-entry/restart so a
 	 * crash never forgets an outstanding `retry_after` before re-calling the
-	 * provider. See {@link performTopicDeletion}. */
+	 * provider. See {@link TelegramNotificationDaemon.acquireDeletionAuthority}. */
 	private readonly deletionRetryAfter = new Map<string, number>();
 	/**
 	 * Durable, fsynced per-session topic-deletion claim journal (F003/F004).
@@ -2575,7 +2643,14 @@ export class TelegramNotificationDaemon {
 
 	private async sessionAdmissionIsCurrent(session: SessionSocket): Promise<boolean> {
 		if (!isNonEmptyString(session.canonicalRoot) || !isNonEmptyString(session.leaseId)) return false;
-		const view = await readRootsRegistry(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).roots);
+		let view: RootsRegistryView;
+		try {
+			view = await readRootsRegistry(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).roots);
+		} catch {
+			// Corrupt or unreadable registry authority is unknown. Fail closed
+			// without turning an expected evidence failure into an unhandled route error.
+			return false;
+		}
 		if (
 			view.sessions.get(session.sessionId) !== session.canonicalRoot ||
 			view.sessionLeases.get(session.sessionId)?.leaseId !== session.leaseId
@@ -3033,7 +3108,7 @@ export class TelegramNotificationDaemon {
 		if (!record || !isCanonicalTopicId(record.topicId)) return;
 		const generation = this.liveTopicGeneration.get(sessionId) ?? 0;
 		await this.deletionJournal.enqueue<TelegramTopicDeletePayload>({
-			id: topicDeleteEffectId(sessionId, record.topicId, leaseId),
+			id: topicDeleteEffectId(this.opts.chatId, sessionId, record.topicId, leaseId),
 			kind: TELEGRAM_TOPIC_DELETE_KIND,
 			transport: "telegram",
 			sessionId,
@@ -3043,160 +3118,207 @@ export class TelegramNotificationDaemon {
 	}
 
 	/**
-	 * Best-effort, crash-safe delete of a session topic. The send admission fence
-	 * is raised FIRST (no late submitThreadedFrame/continuation can target the
-	 * topic), queued items are cancelled, the pool is drained OUTSIDE any
-	 * registry lock, then the remote delete runs through the durable deletion
-	 * claim (fsynced intent before the call, terminal recorded before local
-	 * forgetting). `leaseId` is the persisted registration lease this deletion is
-	 * authorized under; it scopes the topic-specific effect and selective roots
-	 * compaction so a fresh registration (different lease) is never compacted. A
-	 * topic left by an uncertain/429 delete keeps its fence and is retried by the
-	 * next scan; a resumed session receives a fresh generation.
+	 * Crash-safe delete of a session topic, split into two phases so NO
+	 * successor-sensitive mutation can occur before exact durable authority is
+	 * acquired. PHASE 1 runs under the per-session admission lock: it validates
+	 * exact-current root/session/lease authority (tri-state fail-closed) and
+	 * atomically establishes/claims the durable deletion effect, returning a
+	 * typed prepared authority (effect id/payload/lease) or a terminal/quarantined
+	 * status. Only after the lock releases does PHASE 2 raise the send-admission
+	 * fence, cancel queued sends, drain in-flight operations, and call Telegram
+	 * with the prepared lease — provider I/O stays outside the lock. If authority
+	 * is unknown/superseded/backoff/unclaimable the call returns WITHOUT any
+	 * successor-sensitive mutation (no fence, no queue/ack cancellation, no
+	 * flush/drain, no provider call). `leaseId` is the persisted registration
+	 * lease this deletion is authorized under; it scopes the topic-specific effect
+	 * and selective roots compaction so a fresh registration is never compacted.
 	 */
 	private async deleteTopic(sessionId: string, leaseId: string): Promise<void> {
 		if (!isNonEmptyString(leaseId)) return;
 		const record = this.topics.get(sessionId);
 		if (!record || !isCanonicalTopicId(record.topicId)) return;
-		// FENCE: invalidate the live generation so new submits/requeues are
-		// rejected and every in-flight delivery revalidates and skips. A
-		// post-fence enqueue cannot target the old topic: admissionGeneration()
-		// is undefined while fenced, so it is stamped with a later generation.
-		this.fencedTopicGeneration.set(sessionId, this.liveTopicGeneration.get(sessionId) ?? 0);
+		const generation = this.liveTopicGeneration.get(sessionId) ?? 0;
+		// PHASE 1: acquire durable authority under the admission lock BEFORE any
+		// fence, queue removal, ack cancellation, flush, drain, or provider call.
+		const authority = await this.acquireDeletionAuthority(sessionId, record.topicId, leaseId, generation);
+		if (authority.status === "deferred") {
+			// unknown/superseded/backoff/unclaimable: NO successor-sensitive mutation.
+			return;
+		}
+		if (authority.status === "quarantined") {
+			// A malformed/prior-chat effect is terminalized with a non-destructive
+			// reconciled-quarantine receipt: NO provider call, fence, topic removal,
+			// or roots compaction, and it no longer blocks current-session registration.
+			await this.quarantineDeletionEffect(authority.effectId);
+			return;
+		}
+		// PHASE 2 (lock-free): raise the fence, cancel queued sends, drain, then
+		// call Telegram with the prepared lease. Provider I/O never holds the lock.
+		this.fencedTopicGeneration.set(sessionId, generation);
 		this.liveTopicGeneration.delete(sessionId);
 		this.fencedTopicIds.add(record.topicId);
-		// CANCEL queued sends for this session before deleting the topic;
-		// otherwise rate-limited frames can flush into a deleted topic or across
-		// resume.
 		const removed = this.pool.removeWhere(item => item.sessionId === sessionId);
 		for (const item of removed) {
 			if (item.payload.selectedAck)
 				this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
 		}
-		// DRAIN outside registry locks: let any in-flight flush complete. Granted
-		// items revalidate against the (now-removed) live generation and skip.
 		await this.flushPool();
 		await this.drainTopicOperations(sessionId);
-		// DELETE via the durable claim. Terminal remote success is recorded before
-		// local forgetting; an uncertain/429 outcome retains the claim for retry.
-		const generation = this.fencedTopicGeneration.get(sessionId) ?? 0;
-		const outcome = await this.performTopicDeletion(sessionId, record.topicId, generation, leaseId);
-		if (outcome === "terminal") {
+		if (authority.status === "terminal") {
+			// Exact-current terminal claim: finish local cleanup WITHOUT a provider call.
 			this.finalizeTopicDeletion(sessionId);
-			// Local topic-registry removal must persist successfully BEFORE roots
-			// compaction and before the journal receipt becomes reconciled. A failed
-			// write leaves the durable claim terminal-but-not-reconciled so a
-			// restart (reconcileDeletionJournal) finishes local cleanup without
-			// another destructive provider delete.
 			try {
 				await this.persistTopics();
 			} catch {
 				return;
 			}
-			// Selective roots compaction: remove ONLY the exact matching
-			// candidate/lease/session mapping. A fresh registration whose lease
-			// differs survives (re-read durably under the roots lock).
 			await this.compactRootsAfterDeletion(sessionId, record.topicId, leaseId);
-			await this.deletionJournal.updateTerminalReceipt<TelegramTopicDeletePayload>(
-				topicDeleteEffectId(sessionId, record.topicId, leaseId),
-				{ provider: "telegram", status: "reconciled" },
-			);
-		} else if (outcome === "superseded" && this.topics.get(sessionId)?.topicId === record.topicId) {
-			this.assignTopicGeneration(sessionId);
+			await this.deletionJournal.updateTerminalReceipt(authority.effectId, {
+				provider: "telegram",
+				status: "reconciled",
+			});
+			return;
+		}
+		// authority.status === "prepared": call Telegram, then finish local cleanup.
+		const outcome = await this.executeTopicDeletion(authority, sessionId);
+		if (outcome === "terminal") {
+			this.finalizeTopicDeletion(sessionId);
+			// Local topic-registry removal must persist successfully BEFORE roots
+			// compaction and before the journal receipt becomes reconciled. A failed
+			// write leaves the durable claim terminal-but-not-reconciled so a restart
+			// (reconcileDeletionJournal) finishes local cleanup without another delete.
+			try {
+				await this.persistTopics();
+			} catch {
+				return;
+			}
+			await this.compactRootsAfterDeletion(sessionId, record.topicId, leaseId);
+			await this.deletionJournal.updateTerminalReceipt(authority.effectId, {
+				provider: "telegram",
+				status: "reconciled",
+			});
 		}
 	}
 
 	/**
-	 * Establish/reuse the durable deletion claim, call `deleteForumTopic` with
-	 * `noRetry` and a bounded AbortSignal, and record terminal/uncertain state.
-	 * Returns "terminal" when the topic is confirmed deleted (or already
-	 * deleted), "uncertain" when the call must be retried (429/abort/transport).
-	 * `leaseId` is recorded in the payload so crash replay and compaction can
-	 * validate exact session/topic/lease; the effect id is topic-scoped so a
-	 * terminal record for a superseded topic never applies here.
+	 * PHASE 1 acquisition (under the per-session admission lock). Validates exact
+	 * current root/session/lease authority via the tri-state evaluator and
+	 * atomically establishes/claims the durable deletion effect. Returns a
+	 * `prepared` authority (effect id/payload/lease) for an acquired claim, a
+	 * `terminal` status for an already exact-current terminal claim, a
+	 * `quarantined` status for a malformed/prior-chat effect, or `deferred`
+	 * (unknown/superseded/backoff/unclaimable) which withholds ALL mutation. No
+	 * provider call, fence, queue cancellation, flush, or drain is ever made here.
 	 */
-	private async performTopicDeletion(
+	private async acquireDeletionAuthority(
 		sessionId: string,
 		topicId: string,
-		generation: number,
 		leaseId: string,
-	): Promise<"terminal" | "uncertain" | "superseded"> {
-		const effectId = topicDeleteEffectId(sessionId, topicId, leaseId);
+		generation: number,
+	): Promise<DeletionAuthority> {
+		const effectId = topicDeleteEffectId(this.opts.chatId, sessionId, topicId, leaseId);
 		const payload: TelegramTopicDeletePayload = { chatId: this.opts.chatId, topicId, leaseId };
-		let lease: ChatEffectLease | undefined;
-		let terminal = false;
-		let superseded = false;
-		const establishClaim = async () => {
-			const roots = await readRootsRegistry(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).roots);
-			if (roots.sessionLeases.get(sessionId)?.leaseId !== leaseId) {
-				superseded = true;
-				return;
-			}
-
-			let existing = await this.deletionJournal.read<TelegramTopicDeletePayload>(effectId);
-			if (
-				existing &&
-				(existing.transport !== "telegram" ||
-					existing.kind !== TELEGRAM_TOPIC_DELETE_KIND ||
-					existing.sessionId !== sessionId ||
-					!isTelegramTopicDeletePayload(existing.payload) ||
-					existing.payload.chatId !== payload.chatId ||
-					existing.payload.topicId !== payload.topicId ||
-					existing.payload.leaseId !== payload.leaseId)
-			) {
-				return;
-			}
-			const now = this.runtime.now();
-			const memRetryUntil = this.deletionRetryAfter.get(sessionId);
-			if (memRetryUntil !== undefined && now < memRetryUntil) return;
-			const durableRetryAt = existing?.receipt?.retryAt;
-			if (typeof durableRetryAt === "number" && Number.isFinite(durableRetryAt) && now < durableRetryAt) {
-				this.deletionRetryAfter.set(sessionId, durableRetryAt);
-				return;
-			}
-			if (existing?.state === "terminal") {
-				terminal = true;
-				return;
-			}
-
-			if (!existing) {
-				const created = await this.deletionJournal.enqueueAndClaim<TelegramTopicDeletePayload>(
-					{
-						id: effectId,
-						kind: TELEGRAM_TOPIC_DELETE_KIND,
-						transport: "telegram",
-						sessionId,
-						endpointGeneration: generation,
-						payload,
-					},
-					this.opts.ownerId,
-					TELEGRAM_DELETION_LEASE_MS,
-				);
-				if (created) {
-					existing = created;
-					lease = { owner: this.opts.ownerId, epoch: created.epoch };
+		let authority: DeletionAuthority = { status: "deferred", reason: "unclaimable" };
+		await withFileLock(
+			telegramAdmissionLockPath(this.opts.settings.getAgentDir(), sessionId),
+			async () => {
+				const rootsFile = daemonPaths(this.opts.settings.getAgentDir()).roots;
+				const evidence = await evaluateDeletionAuthority(this.fsImpl, rootsFile, sessionId, leaseId);
+				// UNKNOWN preserves the claim untouched; superseded is positively proven.
+				if (evidence !== "exact_current") {
+					authority = { status: "deferred", reason: evidence };
+					return;
 				}
-			}
-			if (!lease && existing) {
-				const claimed = await this.deletionJournal.claim<TelegramTopicDeletePayload>(
-					effectId,
-					this.opts.ownerId,
-					TELEGRAM_DELETION_LEASE_MS,
-				);
-				if (claimed?.state === "leased") {
-					lease = { owner: this.opts.ownerId, epoch: claimed.epoch };
+				let existing = await this.deletionJournal.read<TelegramTopicDeletePayload>(effectId);
+				// An existing effect whose immutable payload is foreign, malformed, or
+				// belongs to a different/prior chat is quarantined, never replayed/claimed.
+				if (
+					existing &&
+					(existing.transport !== "telegram" ||
+						existing.kind !== TELEGRAM_TOPIC_DELETE_KIND ||
+						existing.sessionId !== sessionId ||
+						!isTelegramTopicDeletePayload(existing.payload) ||
+						existing.payload.chatId !== payload.chatId ||
+						existing.payload.topicId !== payload.topicId ||
+						existing.payload.leaseId !== payload.leaseId)
+				) {
+					authority = { status: "quarantined", effectId };
+					return;
 				}
-			}
-		};
-		await withFileLock(telegramAdmissionLockPath(this.opts.settings.getAgentDir(), sessionId), establishClaim, {
-			staleMs: 10_000,
-		});
-		if (terminal) return "terminal";
-		if (superseded) return "superseded";
-		if (!lease) return "uncertain";
-		const result = await this.callDeleteForumTopic(topicId);
+				const now = this.runtime.now();
+				const memRetryUntil = this.deletionRetryAfter.get(sessionId);
+				if (typeof memRetryUntil === "number" && now < memRetryUntil) {
+					authority = { status: "deferred", reason: "backoff" };
+					return;
+				}
+				const durableRetryAt = existing?.receipt?.retryAt;
+				if (typeof durableRetryAt === "number" && Number.isFinite(durableRetryAt) && now < durableRetryAt) {
+					this.deletionRetryAfter.set(sessionId, durableRetryAt);
+					authority = { status: "deferred", reason: "backoff" };
+					return;
+				}
+				if (existing?.state === "terminal") {
+					authority = { status: "terminal", effectId, payload };
+					return;
+				}
+				let lease: ChatEffectLease | undefined;
+				if (!existing) {
+					const created = await this.deletionJournal.enqueueAndClaim<TelegramTopicDeletePayload>(
+						{
+							id: effectId,
+							kind: TELEGRAM_TOPIC_DELETE_KIND,
+							transport: "telegram",
+							sessionId,
+							endpointGeneration: generation,
+							payload,
+						},
+						this.opts.ownerId,
+						TELEGRAM_DELETION_LEASE_MS,
+					);
+					if (created) {
+						existing = created;
+						lease = { owner: this.opts.ownerId, epoch: created.epoch };
+					}
+				}
+				if (!lease && existing) {
+					const claimed = await this.deletionJournal.claim<TelegramTopicDeletePayload>(
+						effectId,
+						this.opts.ownerId,
+						TELEGRAM_DELETION_LEASE_MS,
+					);
+					if (claimed?.state === "leased") {
+						lease = { owner: this.opts.ownerId, epoch: claimed.epoch };
+					}
+				}
+				if (!lease) {
+					authority = { status: "deferred", reason: "unclaimable" };
+					return;
+				}
+				authority = { status: "prepared", effectId, payload, lease, generation };
+			},
+			{ staleMs: 10_000 },
+		);
+		return authority;
+	}
+
+	/**
+	 * PHASE 2 (lock-free): call `deleteForumTopic` once with the prepared lease and
+	 * record terminal/uncertain state. Returns "terminal" only when the provider
+	 * confirms the delete (`res.ok === true`); every non-OK response, throw,
+	 * abort, and timeout is "uncertain" (429 preserves retry_after).
+	 */
+	private async executeTopicDeletion(
+		authority: {
+			status: "prepared";
+			effectId: string;
+			payload: TelegramTopicDeletePayload;
+			lease: ChatEffectLease;
+		},
+		sessionId: string,
+	): Promise<"terminal" | "uncertain"> {
+		const result = await this.callDeleteForumTopic(authority.payload.topicId);
 		if (result.outcome === "deleted") {
-			await this.deletionJournal.record(effectId, lease, "terminal", {
+			await this.deletionJournal.record(authority.effectId, authority.lease, "terminal", {
 				provider: "telegram",
 				status: "deleted",
 			});
@@ -3210,7 +3332,7 @@ export class TelegramNotificationDaemon {
 				? this.runtime.now() + result.retryAfterSec * 1000
 				: this.runtime.now() + TELEGRAM_DELETION_RETRY_MS;
 		this.deletionRetryAfter.set(sessionId, retryAt);
-		await this.deletionJournal.record(effectId, lease, "uncertain", {
+		await this.deletionJournal.record(authority.effectId, authority.lease, "uncertain", {
 			provider: "telegram",
 			status: result.retryAfterSec ? `retry_after:${result.retryAfterSec}` : "uncertain",
 			retryAt,
@@ -3220,8 +3342,9 @@ export class TelegramNotificationDaemon {
 
 	/**
 	 * Call `deleteForumTopic` once with `noRetry` and a bounded AbortSignal.
-	 * Honors Telegram `parameters.retry_after` and reconciles an already-applied
-	 * delete (topic/message-thread not found) as success.
+	 * Fail-closed: `deleted` is returned ONLY for `res.ok === true`. Every non-OK
+	 * response (including not-found/already-deleted/TOPIC_CLOSED), throw, abort,
+	 * and timeout is `uncertain`; a 429 preserves the exact `retry_after`.
 	 */
 	private async callDeleteForumTopic(
 		topicId: string,
@@ -3240,15 +3363,11 @@ export class TelegramNotificationDaemon {
 				description?: string;
 				parameters?: { retry_after?: unknown };
 			};
+			// The ONLY positive deletion signal is an explicit OK. Any non-OK body —
+			// even a not-found/already-deleted/TOPIC_CLOSED description — is ambiguous:
+			// the topic id may have been reused, the chat may have changed, or the
+			// response may be a transport-level fabrication. Re-attempt later.
 			if (res?.ok === true) return { outcome: "deleted" };
-			const description = String(res?.description ?? "");
-			// Already-applied delete (topic/thread no longer exists) reconciles as success.
-			if (
-				res?.ok === false &&
-				/not found|already deleted|message thread not found|topic deleted/i.test(description)
-			) {
-				return { outcome: "deleted" };
-			}
 			// 429 rate limit: honor retry_after, retain uncertain for re-attempt.
 			if (res?.ok === false && (res.error_code === 429 || res.parameters?.retry_after !== undefined)) {
 				const retryAfter = Number(res.parameters?.retry_after);
@@ -3360,89 +3479,92 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
+	private async quarantineDeletionEffect(effectId: string): Promise<void> {
+		const effect = await this.deletionJournal.read(effectId);
+		if (!effect) return;
+		const receipt = { provider: "telegram", status: "reconciled_quarantine" };
+		if (effect.state === "terminal") {
+			await this.deletionJournal.updateTerminalReceipt(effectId, receipt);
+			return;
+		}
+		const lease =
+			effect.state === "leased" && isNonEmptyString(effect.owner)
+				? { owner: effect.owner, epoch: effect.epoch }
+				: undefined;
+		await this.deletionJournal.terminalize(effectId, receipt, lease);
+	}
+
 	/**
 	 * F004 crash reconciliation of the durable deletion journal, run once at
-	 * startup after topics are loaded. It validates EXACT session/topic/lease for
-	 * every effect: a terminal claim completes local cleanup WITHOUT calling
-	 * Telegram again and compacts roots for its exact lease; a nonterminal claim
-	 * for a superseded topic/gone topic is terminalized; otherwise the remote
-	 * delete is re-attempted (honoring the durable retry_after).
+	 * startup after topics are loaded. Every effect is classified by tri-state
+	 * durable authority evidence: UNKNOWN preserves the claim untouched (no
+	 * provider call, no fence, no topic removal, no roots compaction, and it keeps
+	 * blocking registration); a positively proven SUPERSEDED claim is terminalized
+	 * with a non-destructive reconciled-superseded receipt; an EXACT-CURRENT
+	 * terminal claim finishes local cleanup WITHOUT calling Telegram again; and an
+	 * exact-current nonterminal claim is replayed through the unified deletion flow
+	 * (which re-acquires authority — and its backoff — before any fence or provider
+	 * call). A prior-chat effect is quarantined with a non-destructive
+	 * reconciled-quarantine receipt so it never blocks current-session registration.
 	 */
 	private async reconcileDeletionJournal(): Promise<void> {
 		const effects = (await this.deletionJournal.list()).filter(
-			(e): e is ChatEffect<TelegramTopicDeletePayload> =>
+			e =>
 				e.transport === "telegram" &&
 				e.kind === TELEGRAM_TOPIC_DELETE_KIND &&
-				isTelegramTopicDeletePayload(e.payload) &&
 				(e.state !== "terminal" || !e.receipt?.status?.startsWith("reconciled")),
 		);
+		const rootsFile = daemonPaths(this.opts.settings.getAgentDir()).roots;
 		for (const effect of effects) {
 			const sessionId = effect.sessionId;
-			if (!sessionId || effect.payload.chatId !== this.opts.chatId) continue;
+			if (!sessionId || !isTelegramTopicDeletePayload(effect.payload)) {
+				await this.quarantineDeletionEffect(effect.id);
+				continue;
+			}
 			const payload = effect.payload;
+			const expectedEffectId = topicDeleteEffectId(payload.chatId, sessionId, payload.topicId, payload.leaseId);
+			// Foreign chat, malformed identity, and legacy/colliding identifiers are
+			// quarantined non-destructively. None may authorize a provider call or
+			// current-chat topic/root mutation.
+			if (payload.chatId !== this.opts.chatId || effect.id !== expectedEffectId) {
+				await this.quarantineDeletionEffect(effect.id);
+				continue;
+			}
+			const evidence = await evaluateDeletionAuthority(this.fsImpl, rootsFile, sessionId, payload.leaseId);
+			// Requirement 2: UNKNOWN preserves the claim untouched and keeps blocking.
+			if (evidence === "unknown") continue;
+			if (evidence === "superseded") {
+				// Positively proven successor: terminalize non-destructively.
+				await this.deletionJournal
+					.terminalize(effect.id, { provider: "telegram", status: "reconciled_superseded" })
+					.catch(() => undefined);
+				continue;
+			}
 			const record = this.topics.get(sessionId);
-			const roots = await readRootsRegistry(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).roots);
-			const currentLease = roots.sessionLeases.get(sessionId)?.leaseId;
-			const leaseMatches = currentLease === undefined || currentLease === payload.leaseId;
-
 			if (effect.state === "terminal") {
+				// EXACT-CURRENT terminal: finish local cleanup without a provider call.
 				this.fencedTopicIds.add(payload.topicId);
-				if (leaseMatches && record?.topicId === payload.topicId) {
+				if (record?.topicId === payload.topicId) {
 					this.finalizeTopicDeletion(sessionId);
-					// Topic-registry removal must persist before compaction and
-					// before the receipt becomes reconciled. A failed write leaves
-					// the terminal claim non-reconciled so a later restart retries
-					// local cleanup without another provider delete.
+					// Topic-registry removal must persist before compaction and before the
+					// receipt becomes reconciled. A failed write leaves the terminal claim
+					// non-reconciled so a later restart retries local cleanup without a delete.
 					try {
 						await this.persistTopics();
 					} catch {
 						continue;
 					}
 				}
-				if (leaseMatches) {
-					await this.compactRootsAfterDeletion(sessionId, payload.topicId, payload.leaseId);
-				}
-				await this.deletionJournal.updateTerminalReceipt(effect.id, {
-					provider: "telegram",
-					status: leaseMatches ? "reconciled" : "reconciled_superseded",
-				});
-				continue;
-			}
-
-			// Never replay a nonterminal delete against a different registration
-			// generation. Terminalizing it releases the admission barrier without a
-			// second provider call.
-			if (!currentLease || currentLease !== payload.leaseId || record?.topicId !== payload.topicId) {
-				await this.deletionJournal
-					.terminalize(effect.id, { provider: "telegram", status: "reconciled_superseded" })
-					.catch(() => undefined);
-				continue;
-			}
-			this.fencedTopicGeneration.set(
-				sessionId,
-				this.liveTopicGeneration.get(sessionId) ?? effect.endpointGeneration,
-			);
-			this.liveTopicGeneration.delete(sessionId);
-			this.fencedTopicIds.add(payload.topicId);
-			const outcome = await this.performTopicDeletion(
-				sessionId,
-				record.topicId,
-				effect.endpointGeneration,
-				payload.leaseId,
-			);
-			if (outcome === "terminal") {
-				this.finalizeTopicDeletion(sessionId);
-				try {
-					await this.persistTopics();
-				} catch {
-					continue;
-				}
-				await this.compactRootsAfterDeletion(sessionId, record.topicId, payload.leaseId);
+				await this.compactRootsAfterDeletion(sessionId, payload.topicId, payload.leaseId);
 				await this.deletionJournal.updateTerminalReceipt(effect.id, {
 					provider: "telegram",
 					status: "reconciled",
 				});
+				continue;
 			}
+			// EXACT-CURRENT nonterminal: replay through the unified deletion flow,
+			// which re-acquires authority (and honors backoff) before any fence/call.
+			await this.deleteTopic(sessionId, payload.leaseId);
 		}
 	}
 	/**
