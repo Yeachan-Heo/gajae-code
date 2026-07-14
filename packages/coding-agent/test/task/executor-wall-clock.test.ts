@@ -24,11 +24,13 @@ import { EventBus } from "../../src/utils/event-bus";
 interface HangingSessionHandle {
 	session: AgentSession;
 	abortCalls: () => number;
+	promptStarted: Promise<void>;
 }
 
 function createHangingSession(): HangingSessionHandle {
 	let abortCount = 0;
 	const { promise: hang, resolve: releaseHang } = Promise.withResolvers<void>();
+	const { promise: promptStarted, resolve: markPromptStarted } = Promise.withResolvers<void>();
 	const session: Partial<AgentSession> = {
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
@@ -43,6 +45,7 @@ function createHangingSession(): HangingSessionHandle {
 		seedDefaultFallbackResolution: () => {},
 		subscribe: (_listener: (event: AgentSessionEvent) => void) => () => {},
 		prompt: async (_text: string, _options?: PromptOptions) => {
+			markPromptStarted();
 			await hang;
 		},
 		waitForIdle: async () => {
@@ -58,6 +61,7 @@ function createHangingSession(): HangingSessionHandle {
 	return {
 		session: session as AgentSession,
 		abortCalls: () => abortCount,
+		promptStarted,
 	};
 }
 
@@ -146,6 +150,7 @@ const invalidRawCostCases: ReadonlyArray<{
 
 describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 	afterEach(() => {
+		vi.useRealTimers();
 		vi.restoreAllMocks();
 	});
 
@@ -171,16 +176,20 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 	};
 
 	it("aborts a stalled subagent and surfaces a runtime-limit reason", async () => {
+		vi.useFakeTimers();
 		const settings = Settings.isolated({ "task.maxRuntimeMs": 50 });
 		const handle = createHangingSession();
 		mockCreateAgentSession(handle.session);
 
 		const startedAt = Date.now();
-		const result = await runSubprocess({
+		const pending = runSubprocess({
 			...baseOptions,
 			id: "subagent-timeout",
 			settings,
 		});
+		await handle.promptStarted;
+		vi.advanceTimersByTime(50);
+		const result = await pending;
 		const elapsedMs = Date.now() - startedAt;
 
 		expect(result.aborted).toBe(true);
