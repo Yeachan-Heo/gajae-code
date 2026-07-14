@@ -488,14 +488,16 @@ describe("default GJC tmux launch", () => {
 	it("POSIX tmux inner wrapper writes a public-safe exit marker and preserves exit status", () => {
 		if (process.platform === "win32") return;
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-exit-marker-"));
+		const entrypoint = path.join(cwd, "exit.js");
+		fs.writeFileSync(entrypoint, "process.exit(7);\n");
 		try {
 			const plan = buildDefaultTmuxLaunchPlan({
 				parsed: args({ messages: ["-c", "exit 7"], tmux: true }),
 				rawArgs: ["--tmux", "-c", "exit 7"],
 				cwd,
 				env: {},
-				argv: ["bun", "/bin/sh"],
-				execPath: "/bin/bun",
+				argv: [process.execPath, entrypoint],
+				execPath: process.execPath,
 				platform: "linux",
 				tty: interactiveTty,
 				tmuxAvailable: true,
@@ -674,12 +676,12 @@ describe("default GJC tmux launch", () => {
 		expect(calls[setWindowSizeIndex]?.args).toEqual(["set-window-option", "-t", "$0:", "window-size", "latest"]);
 	});
 
-	it("refuses psmux before creating, resizing, or attaching a session", () => {
+	it("creates exactly one foreground unmanaged psmux session", () => {
 		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
-		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
+		const calls: string[][] = [];
 		try {
-			expect(() =>
-				launchDefaultTmuxIfNeeded({
+			expect(
+				launchDefaultTmuxIfNeededRaw({
 					parsed: args({ messages: ["hello world"], tmux: true }),
 					rawArgs: ["--tmux", "hello world"],
 					cwd: "/repo",
@@ -691,18 +693,130 @@ describe("default GJC tmux launch", () => {
 					tmuxAvailable: true,
 					currentBranch: "feature/demo",
 					existingBranchSessionName: null,
-					spawnSync: (command, spawnArgs, options) => {
-						calls.push({ command, args: spawnArgs, options });
-						return { exitCode: 0, stdout: "" };
+					spawnSync: (_command, spawnArgs) => {
+						calls.push(spawnArgs);
+						if (spawnArgs[0] !== "list-sessions") return { exitCode: 0 };
+						if (calls.filter(call => call[0] === "list-sessions").length === 1)
+							return { exitCode: 1, stderr: "no server running" };
+						const created = calls.find(call => call[0] === "new-session")!;
+						return { exitCode: 0, stdout: `${created[created.indexOf("-s") + 1]}\n` };
+					},
+				}),
+			).toBe(true);
+			const newSession = calls[1] ?? [];
+			const sessionName = newSession[newSession.indexOf("-s") + 1];
+			expect(calls.map(call => call[0])).toEqual(["list-sessions", "new-session"]);
+			expect(calls[0]).toEqual(["list-sessions", "-F", "#{session_name}"]);
+			expect(sessionName).toBeDefined();
+			expect(newSession).not.toContain("-d");
+			expect(calls.some(call => ["set-option", "kill-session", "resize-window"].includes(call[0]!))).toBe(false);
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
+	});
+
+	it.each([
+		"GJC_COORDINATOR_SESSION_BRANCH",
+		"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+		"GJC_COORDINATOR_SESSION_READINESS_FILE",
+	])("refuses psmux before mutation when %s is the only lifecycle marker", markerName => {
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
+		const calls: string[][] = [];
+		try {
+			expect(() =>
+				launchDefaultTmuxIfNeededRaw({
+					parsed: args({ tmux: true }),
+					rawArgs: ["--tmux"],
+					cwd: "/repo",
+					env: {
+						GJC_TMUX_COMMAND: "psmux",
+						GJC_PSMUX_COMMAND: "psmux",
+						[markerName]: " marker ",
+					},
+					argv: ["bun", "cli.ts"],
+					execPath: "/bin/bun",
+					platform: "win32",
+					tty: interactiveTty,
+					tmuxAvailable: true,
+					currentBranch: "",
+					spawnSync: (_command, spawnArgs) => {
+						calls.push(spawnArgs);
+						return { exitCode: 0 };
 					},
 				}),
 			).toThrow("gjc_tmux_owner_isolation_native_session_identity_unavailable");
-			expect(calls.filter(call => call.args[0] === "new-session")).toHaveLength(0);
-			expect(
-				calls.some(call =>
-					["resize-window", "attach-session", "set-option", "kill-session"].includes(call.args[0]),
-				),
-			).toBe(false);
+			expect(calls).toEqual([]);
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
+	});
+
+	it("refuses name-only explicit psmux continuation without creating or attaching", () => {
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
+		const calls: string[][] = [];
+		const diagnostics: string[] = [];
+		try {
+			launchDefaultTmuxIfNeededRaw({
+				parsed: args({ messages: ["hello"], tmux: true }),
+				rawArgs: ["--tmux", "hello"],
+				cwd: "/repo",
+				env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux", GJC_TMUX_SESSION: "continued" },
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "win32",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: "continued",
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					return spawnArgs[0] === "list-sessions"
+						? { exitCode: 0, stdout: "continued\ncontinuation-decoy\n" }
+						: { exitCode: 0 };
+				},
+				diagnosticWriter: message => diagnostics.push(message),
+			});
+			expect(calls).toEqual([["list-sessions", "-F", "#{session_name}"]]);
+			expect(diagnostics.join("\n")).toContain("name-only and cannot be attached safely");
+		} finally {
+			__setBinaryResolverForTests(null);
+		}
+	});
+
+	it("preserves an unmanaged psmux session when foreground creation fails", () => {
+		const results = [
+			{ exitCode: 1, stderr: "no server running" },
+			{ exitCode: 1, stderr: "create failed" },
+		];
+		const expectedCreates = 1;
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
+		const calls: string[][] = [];
+		const diagnostics: string[] = [];
+		try {
+			launchDefaultTmuxIfNeededRaw({
+				parsed: args({ tmux: true }),
+				rawArgs: ["--tmux"],
+				cwd: "/repo",
+				env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "win32",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				currentBranch: "",
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					const result = results.shift()!;
+					if (spawnArgs[0] !== "list-sessions" || result.exitCode !== 0 || ("stdout" in result && result.stdout))
+						return result;
+					const created = calls.find(call => call[0] === "new-session");
+					const sessionName = created?.[created.indexOf("-s") + 1] ?? "continued";
+					return { ...result, stdout: `${sessionName}\n` };
+				},
+				diagnosticWriter: message => diagnostics.push(message),
+			});
+			expect(calls.filter(call => call[0] === "new-session")).toHaveLength(expectedCreates);
+			expect(calls.some(call => ["set-option", "kill-session", "resize-window"].includes(call[0]!))).toBe(false);
+			expect(diagnostics).toHaveLength(1);
 		} finally {
 			__setBinaryResolverForTests(null);
 		}
@@ -791,23 +905,40 @@ describe("default GJC tmux launch", () => {
 		expect(plan.innerCommand).toContain("'/home/me/.local/bin/gjc' 'hello world'");
 	});
 
-	it("falls back to gjc when compiled Bun virtual entrypoint has no host exec path", () => {
-		const plan = buildDefaultTmuxLaunchPlan({
-			parsed: args({ messages: ["hello world"], tmux: true }),
-			rawArgs: ["--tmux"],
-			cwd: "/repo",
-			env: {},
-			argv: ["gjc", "/$bunfs/root/gjc-linux-x64"],
-			execPath: "/$bunfs/root/gjc-linux-x64",
-			platform: "darwin",
-			tty: interactiveTty,
-			tmuxAvailable: true,
-			currentBranch: "",
-			existingBranchSessionName: null,
-		});
+	it("fails closed when a compiled Bun virtual entrypoint has no same-artifact host path", () => {
+		expect(() =>
+			buildDefaultTmuxLaunchPlan({
+				parsed: args({ messages: ["hello world"], tmux: true }),
+				rawArgs: ["--tmux"],
+				cwd: "/repo",
+				env: {},
+				argv: ["gjc", "/$bunfs/root/gjc-linux-x64"],
+				execPath: "/$bunfs/root/gjc-linux-x64",
+				platform: "darwin",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				currentBranch: "",
+				existingBranchSessionName: null,
+			}),
+		).toThrow("Bun virtual paths and PATH fallback are not accepted");
+	});
 
-		expect(plan?.innerCommand).not.toContain("$bunfs");
-		expect(plan?.innerCommand).toContain("'gjc'");
+	it("fails closed for Windows Bun virtual executable paths", () => {
+		expect(() =>
+			buildDefaultTmuxLaunchPlan({
+				parsed: args({ messages: ["hello world"], tmux: true }),
+				rawArgs: ["--tmux", "hello world"],
+				cwd: "C:\\repo",
+				env: {},
+				argv: ["B:\\~BUN\\bun.exe", "B:\\~BUN\\root\\gjc-windows-x64.exe"],
+				execPath: "B:\\~BUN\\root\\gjc-windows-x64.exe",
+				platform: "win32",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				currentBranch: "",
+				existingBranchSessionName: null,
+			}),
+		).toThrow("Bun virtual paths and PATH fallback are not accepted");
 	});
 
 	it("does not implicitly attach existing tagged session for plain worktree branch launch", () => {
@@ -2036,11 +2167,11 @@ it("captures psmux stderr in the attach-failed diagnostic", () => {
 	// emits the captured text so future regressions in the same lane are
 	// diagnosable from the test surface alone.
 	const diagnostics: string[] = [];
-	const handled = launchDefaultTmuxIfNeeded({
+	const handled = launchDefaultTmuxIfNeededRaw({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
-		env: {},
+		env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
 		argv: ["bun", "packages/coding-agent/src/cli.ts"],
 		execPath: "/bin/bun",
 		platform: "win32",
@@ -2093,11 +2224,11 @@ it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windo
 	process.env.PATH = dir + path.delimiter + (originalPath ?? "");
 	try {
 		const diagnostics: string[] = [];
-		launchDefaultTmuxIfNeeded({
+		launchDefaultTmuxIfNeededRaw({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
-			env: {},
+			env: { GJC_TMUX_COMMAND: "psmux", GJC_PSMUX_COMMAND: "psmux" },
 			argv: ["bun", "packages/coding-agent/src/cli.ts"],
 			execPath: "/bin/bun",
 			platform: "win32",

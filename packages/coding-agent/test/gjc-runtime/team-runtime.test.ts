@@ -3148,94 +3148,77 @@ describe("buildWorkerCommand prompt normalization", () => {
 	});
 });
 
-describe("resolveGjcWorkerCommand bun prefix for script entrypoints", () => {
-	const origArgv = process.argv;
-	afterEach(() => {
-		process.argv = origArgv;
+describe("resolveGjcWorkerCommand invocation authority", () => {
+	it("reuses a real standalone executable from the invocation on POSIX and Windows", () => {
+		expect(
+			resolveGjcWorkerCommand("/repo", {}, "linux", ["/opt/gjc/gjc", "/$bunfs/root/gjc-linux-x64"], "/$bunfs/exec"),
+		).toBe("'/opt/gjc/gjc'");
+		expect(
+			resolveGjcWorkerCommand(
+				"C:\\repo",
+				{},
+				"win32",
+				["B:\\~BUN\\bun.exe", "\\$bunfs\\root\\gjc-windows-x64.exe"],
+				"C:\\Program Files\\GJC\\gjc.exe",
+			),
+		).toBe("'C:\\Program Files\\GJC\\gjc.exe'");
 	});
 
-	it("prepends the bun runtime when argv[1] ends in .js", async () => {
-		process.argv = ["C:\\Users\\withfox\\.bun\\bin\\bun.exe", "C:\\repo\\packages\\coding-agent\\bin\\gjc.js"];
-		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		// Pass win32 + a Windows-shaped execPath explicitly: the bun-prefix
-		// invariant is Windows-only — on POSIX a bare `node bin/gjc.js` works
-		// because node IS the script interpreter, so the prefix would be
-		// redundant noise. The execPath override keeps the test assertion
-		// stable across POSIX runners (which have a bare `bun`, no `.exe`).
-		const out = resolveGjcWorkerCommand(
-			"C:\\repo",
-			process.env,
-			"win32",
-			process.argv,
-			"C:\\Users\\withfox\\.bun\\bin\\bun.exe",
-		);
-		// Result must reference bun.exe AND the original .js path; without
-		// the bun prefix, Windows would dispatch the .js file through the
-		// .js file association (cscript.exe), which fails immediately with
-		// a Windows Script Host JScript error dialog.
-		expect(out).toContain("bun.exe");
-		expect(out).toContain("bin\\gjc.js");
-		expect(out.indexOf("bun.exe")).toBeLessThan(out.indexOf("gjc.js"));
+	it("preserves the exact source runtime and script argv", () => {
+		expect(
+			resolveGjcWorkerCommand(
+				"C:\\repo",
+				{},
+				"win32",
+				["C:\\Program Files\\Bun\\bun.exe", ".\\packages\\coding-agent\\src\\cli.ts"],
+				"C:\\different\\bun.exe",
+			),
+		).toBe("'C:\\Program Files\\Bun\\bun.exe' 'C:\\repo\\packages\\coding-agent\\src\\cli.ts'");
+		expect(
+			resolveGjcWorkerCommand(
+				"/repo",
+				{},
+				"linux",
+				["/opt/bun/bin/bun", "./packages/coding-agent/src/cli.ts"],
+				"/different/bun",
+			),
+		).toBe("'/opt/bun/bin/bun' '/repo/packages/coding-agent/src/cli.ts'");
 	});
 
-	it("prepends the bun runtime when argv[1] ends in .mjs", async () => {
-		process.argv = ["bun", "/repo/packages/coding-agent/src/cli.mjs"];
-		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		// pass win32 + a Windows-shaped execPath explicitly so the test is
-		// portable across POSIX runners (which have a bare `bun`, no `.exe`).
-		const out = resolveGjcWorkerCommand(
-			"/repo",
-			process.env,
-			"win32",
-			process.argv,
-			"C:\\Users\\withfox\\.bun\\bin\\bun.exe",
-		);
-		expect(out).toContain("bun");
-		expect(out).toContain("cli.mjs");
+	it("rejects a different GJC discovered only through PATH", () => {
+		expect(() =>
+			resolveGjcWorkerCommand(
+				"/repo",
+				{ PATH: "/different-gjc/bin" },
+				"linux",
+				["/$bunfs/root/gjc", "/$bunfs/root/gjc-linux-x64"],
+				"/$bunfs/exec",
+			),
+		).toThrow("Unable to determine the GJC worker executable");
 	});
 
-	it("does not emit Bun virtual packaged entrypoints as POSIX worker executables", async () => {
-		process.argv = ["gjc", "/$bunfs/root/gjc-linux-x64"];
-		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		const out = resolveGjcWorkerCommand("/repo", {}, "linux", process.argv, "/opt/gjc/gjc-linux-x64", () => null);
-
-		expect(out).toBe("'/opt/gjc/gjc-linux-x64'");
-		expect(out).not.toContain("$bunfs");
+	it("fails closed with actionable guidance when only Bun virtual paths exist", () => {
+		expect(() =>
+			resolveGjcWorkerCommand(
+				"C:\\repo",
+				{},
+				"win32",
+				["B:\\~BUN\\bun.exe", "\\$bunfs\\root\\gjc-windows-x64.exe"],
+				"B:\\~BUN\\exec",
+			),
+		).toThrow("Set GJC_TEAM_WORKER_COMMAND");
 	});
 
-	it("falls back to a PATH-resolved gjc when the packaged process executable is also virtual", async () => {
-		process.argv = ["gjc", "/$bunfs/root/gjc-linux-x64"];
-		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		const out = resolveGjcWorkerCommand("/repo", {}, "linux", process.argv, "/$bunfs/root/gjc-linux-x64", command =>
-			command === "gjc" ? "/usr/local/bin/gjc" : null,
-		);
-
-		expect(out).toBe("'/usr/local/bin/gjc'");
-		expect(out).not.toContain("$bunfs");
-	});
-
-	it("falls back to plain gjc when packaged entrypoint and PATH probe are not usable", async () => {
-		process.argv = ["gjc", "/$bunfs/root/gjc-linux-x64"];
-		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		const out = resolveGjcWorkerCommand("/repo", {}, "linux", process.argv, "/$bunfs/root/gjc-linux-x64", () => null);
-
-		expect(out).toBe("gjc");
-		expect(out).not.toContain("$bunfs");
-	});
-
-	it("does not emit Bun virtual packaged entrypoints as Windows worker executables", async () => {
-		process.argv = ["gjc", "\\$bunfs\\root\\gjc-windows-x64.exe"];
-		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		const out = resolveGjcWorkerCommand(
+	it("never emits Bun virtual paths into a PowerShell worker command", () => {
+		const command = resolveGjcWorkerCommand(
 			"C:\\repo",
 			{},
 			"win32",
-			process.argv,
-			"C:\\Program Files\\gjc\\gjc.exe",
-			() => null,
+			["B:\\~BUN\\bun.exe", "\\$bunfs\\root\\gjc-windows-x64.exe"],
+			"C:\\Program Files\\GJC\\gjc.exe",
 		);
 
-		expect(out).toBe("'C:\\Program Files\\gjc\\gjc.exe'");
-		expect(out).not.toContain("$bunfs");
+		expect(command).toBe("'C:\\Program Files\\GJC\\gjc.exe'");
+		expect(command).not.toMatch(/B:\/~BUN|B:\\~BUN|\/\$bunfs|\\\$bunfs/i);
 	});
 });

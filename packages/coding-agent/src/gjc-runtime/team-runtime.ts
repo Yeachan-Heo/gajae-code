@@ -1995,25 +1995,32 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	}
 	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
 }
-type CommandPathResolver = (command: string) => string | null;
-
 function isBunVirtualPath(candidate: string | undefined): boolean {
-	const normalized = candidate?.trim().replace(/\\/g, "/");
-	return normalized === "/$bunfs" || normalized?.startsWith("/$bunfs/") === true;
+	const normalized = candidate?.trim().replace(/\\/g, "/").toLowerCase();
+	return (
+		normalized === "/$bunfs" ||
+		normalized?.startsWith("/$bunfs/") === true ||
+		normalized === "b:/~bun" ||
+		normalized?.startsWith("b:/~bun/") === true
+	);
 }
 
-function resolveFallbackGjcWorkerCommand(
-	platform: NodeJS.Platform,
-	execPath: string,
-	which: CommandPathResolver,
-): string {
-	const pathModule = platform === "win32" ? path.win32 : path;
-	const quote = platform === "win32" ? powershellQuote : shellQuote;
-	const executable = execPath.trim();
-	if (executable && !isBunVirtualPath(executable) && pathModule.isAbsolute(executable)) return quote(executable);
-	const gjcPath = which("gjc")?.trim();
-	if (gjcPath && !isBunVirtualPath(gjcPath)) return quote(gjcPath);
-	return "gjc";
+function isAbsoluteRealPath(candidate: string | undefined, pathModule: typeof path): candidate is string {
+	const normalized = candidate?.trim();
+	return Boolean(normalized && !isBunVirtualPath(normalized) && pathModule.isAbsolute(normalized));
+}
+function isGjcExecutablePath(candidate: string | undefined, pathModule: typeof path): candidate is string {
+	return isAbsoluteRealPath(candidate, pathModule) && /^gjc(?:[._-]|$)/i.test(pathModule.basename(candidate.trim()));
+}
+
+function formatWorkerExecutable(platform: NodeJS.Platform, executable: string): string {
+	return (platform === "win32" ? powershellQuote : shellQuote)(executable);
+}
+
+function unresolvedWorkerAuthorityError(): Error {
+	return new Error(
+		"Unable to determine the GJC worker executable from this invocation. Set GJC_TEAM_WORKER_COMMAND to the exact GJC command, or launch GJC from a real executable path instead of a Bun virtual path.",
+	);
 }
 
 export function resolveGjcWorkerCommand(
@@ -2022,24 +2029,36 @@ export function resolveGjcWorkerCommand(
 	platform: NodeJS.Platform = process.platform,
 	argv: string[] = process.argv,
 	execPath = process.execPath,
-	which: CommandPathResolver = Bun.which,
 ): string {
 	const explicit = env.GJC_TEAM_WORKER_COMMAND?.trim();
-	if (explicit) return explicit;
-	const entrypoint = argv[1];
-	if (isBunVirtualPath(entrypoint)) return resolveFallbackGjcWorkerCommand(platform, execPath, which);
-	if (!entrypoint) return "gjc";
-	const pathModule = platform === "win32" ? path.win32 : path;
-	const resolvedEntrypoint = pathModule.isAbsolute(entrypoint) ? entrypoint : pathModule.resolve(cwd, entrypoint);
-	if (platform === "win32") {
-		if (entrypoint.endsWith(".ts") || entrypoint.endsWith(".js") || entrypoint.endsWith(".mjs"))
-			return `${powershellQuote(execPath)} ${powershellQuote(resolvedEntrypoint)}`;
-		if (pathModule.basename(entrypoint).startsWith("gjc")) return powershellQuote(resolvedEntrypoint);
-		return "gjc";
+	if (explicit) {
+		if (isBunVirtualPath(explicit)) throw unresolvedWorkerAuthorityError();
+		return explicit;
 	}
-	if (entrypoint.endsWith(".ts")) return `${shellQuote(execPath)} ${shellQuote(resolvedEntrypoint)}`;
-	if (path.basename(entrypoint).startsWith("gjc")) return shellQuote(path.resolve(cwd, entrypoint));
-	return "gjc";
+
+	const pathModule = platform === "win32" ? path.win32 : path.posix;
+	const runtime = argv[0]?.trim();
+	const entrypoint = argv[1]?.trim();
+	const sourceEntrypoint = entrypoint && !isBunVirtualPath(entrypoint) && /\.(?:[cm]?[jt]s)$/i.test(entrypoint);
+
+	if (sourceEntrypoint) {
+		const sourceRuntime = isAbsoluteRealPath(runtime, pathModule)
+			? runtime
+			: isAbsoluteRealPath(execPath, pathModule)
+				? execPath.trim()
+				: undefined;
+		if (!sourceRuntime) throw unresolvedWorkerAuthorityError();
+		const absoluteEntrypoint = pathModule.isAbsolute(entrypoint) ? entrypoint : pathModule.resolve(cwd, entrypoint);
+		if (!isAbsoluteRealPath(absoluteEntrypoint, pathModule)) throw unresolvedWorkerAuthorityError();
+		return `${formatWorkerExecutable(platform, sourceRuntime)} ${formatWorkerExecutable(platform, absoluteEntrypoint)}`;
+	}
+
+	const executable =
+		(isGjcExecutablePath(entrypoint, pathModule) ? entrypoint : undefined) ??
+		(isGjcExecutablePath(execPath, pathModule) ? execPath.trim() : undefined) ??
+		(isGjcExecutablePath(runtime, pathModule) ? runtime : undefined);
+	if (!executable) throw unresolvedWorkerAuthorityError();
+	return formatWorkerExecutable(platform, executable);
 }
 /** @internal Exported for unit tests. */
 export function buildWorkerCommand(
