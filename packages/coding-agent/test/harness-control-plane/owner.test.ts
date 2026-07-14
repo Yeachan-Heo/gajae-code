@@ -402,7 +402,7 @@ describe("RuntimeOwner (in-process integration)", () => {
 		let reentrantCompleted = false;
 		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });
 		transport.closeImpl = async (_call, context) => {
-			await context.completeDirectOwnerStopReentry();
+			await context.acknowledgeDirectOwnerStopReentry();
 			reentrantCompleted = true;
 		};
 		await owner.start();
@@ -432,7 +432,7 @@ describe("RuntimeOwner (in-process integration)", () => {
 				});
 			};
 			foreignCallback();
-			const direct = context.completeDirectOwnerStopReentry().then(() => {
+			const direct = context.acknowledgeDirectOwnerStopReentry().then(() => {
 				directResolved = true;
 			});
 			return (async () => {
@@ -473,7 +473,7 @@ describe("RuntimeOwner (in-process integration)", () => {
 
 		const outer = owner.stop();
 		await closeEntered.promise;
-		expect(() => captured?.completeDirectOwnerStopReentry()).toThrow(
+		expect(() => captured?.acknowledgeDirectOwnerStopReentry()).toThrow(
 			"Runtime owner direct stop reentry capability is no longer available.",
 		);
 

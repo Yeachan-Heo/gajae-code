@@ -711,8 +711,10 @@ export class RuntimeOwner {
 
 	#closeTransport(): Promise<void> {
 		let available = true;
+		// `available` is the authority boundary; freezing the wrapper is only
+		// defense-in-depth against mutation by the receiving transport.
 		const context: HarnessSessionTransportCloseContext = Object.freeze({
-			completeDirectOwnerStopReentry(): Promise<void> {
+			acknowledgeDirectOwnerStopReentry(): Promise<void> {
 				if (!available) throw new Error("Runtime owner direct stop reentry capability is no longer available.");
 				available = false;
 				return Promise.resolve();

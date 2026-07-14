@@ -6,10 +6,13 @@ export interface SessionStateSnapshot {
 
 export interface HarnessSessionTransportCloseContext {
 	/**
-	 * One-shot object capability for the transport's exact direct close implementation.
-	 * It may be consumed only synchronously, before close() returns its promise.
+	 * Immediate cycle-break acknowledgment for the exact direct close path.
+	 *
+	 * Invoke this method synchronously before an async close() reaches its first await
+	 * (or before a non-async close() returns its promise); the returned promise may be
+	 * awaited later. It does NOT signal that RuntimeOwner teardown has completed.
 	 */
-	completeDirectOwnerStopReentry(): Promise<void>;
+	acknowledgeDirectOwnerStopReentry(): Promise<void>;
 }
 
 /** SDK-backed transport contract for a live harness session. */
@@ -19,9 +22,10 @@ export interface HarnessSessionTransport {
 	eventCursor(): number;
 	waitForAgentStart(afterCursor: number, timeoutMs: number): Promise<{ cursor: number } | null>;
 	/**
-	 * Await every transport-owned cleanup step. A transport that must break a direct
-	 * close/owner-stop cycle consumes the invocation-scoped context capability rather
-	 * than calling public RuntimeOwner.stop(), whose result always represents full cleanup.
+	 * Await every transport-owned cleanup step. close() MUST NOT call public
+	 * RuntimeOwner.stop(), which would circularly await this close and hang. A transport
+	 * that needs that direct cycle break must synchronously invoke
+	 * `context.acknowledgeDirectOwnerStopReentry()` before its first await.
 	 */
 	close(context?: HarnessSessionTransportCloseContext): Promise<void>;
 	/** Return a synchronous disposer that fully severs this event subscription. */
