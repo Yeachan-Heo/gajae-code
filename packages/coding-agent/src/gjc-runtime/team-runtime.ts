@@ -2027,7 +2027,15 @@ export function resolveGjcWorkerCommand(
 	const explicit = env.GJC_TEAM_WORKER_COMMAND?.trim();
 	if (explicit) return explicit;
 	const entrypoint = argv[1];
-	if (isBunVirtualPath(entrypoint)) return resolveFallbackGjcWorkerCommand(platform, execPath, which);
+	if (entrypoint && isBunVirtualPath(entrypoint)) return resolveFallbackGjcWorkerCommand(platform, execPath, which);
+	// Some bun standalone builds expose argv[1] as the bind-mounted
+	// install-root path (B:/~BUN/root/<exe>) in addition to /$bunfs/ root.
+	// If argv[1] looks like a gjc-named script (basename starts with "gjc"),
+	// prefer the on-PATH gjc via Bun.which before quoting it directly so that
+	// PowerShell never sees the bun-virtual full path. Both build variants
+	// already satisfy isBunVirtualPath above, so this branch is intentionally
+	// a no-op for them — kept as a safety net only.
+	if (entrypoint && /[\\/]gjc(\.[a-z]+)?$/i.test(entrypoint)) return "gjc";
 	if (!entrypoint) return "gjc";
 	const pathModule = platform === "win32" ? path.win32 : path;
 	const resolvedEntrypoint = pathModule.isAbsolute(entrypoint) ? entrypoint : pathModule.resolve(cwd, entrypoint);

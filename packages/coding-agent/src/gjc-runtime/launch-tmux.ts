@@ -1351,7 +1351,31 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	// then refuse to mutate or attach. Skip the new-session path entirely and
 	// jump straight to the legacy attach fast-path, which still reaches
 	// attach-session for the user.
-	if (plan.isPsmux) return attachForPsmuxFastPath();
+	if (plan.isPsmux) {
+		// If the psmux server isn't running, start it detached so the attach
+		// below has something to attach to. `has-session` against a missing
+		// server exits with a "no server running" stderr; treat that as the
+		// signal to launch a fresh server + session pair before attaching.
+		const serverProbe = spawnSync(
+			plan.tmuxCommand,
+			["list-sessions"],
+			newSessionOptions,
+		);
+		if (serverProbe.exitCode !== 0) {
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				`gjc --tmux: psmux server not running (list-sessions exit=${serverProbe.exitCode}); starting detached session ${plan.sessionName}\n`,
+			);
+			// detached: true so the spawned server survives gjc exiting.
+			const spawn = rawSpawnSync(
+				plan.tmuxCommand,
+				["new-session", "-d", "-s", plan.sessionName, "-c", plan.cwd],
+				{ ...newSessionOptions, detached: true },
+			);
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				`gjc --tmux: detached new-session exit=${spawn.exitCode} stderr=${(spawn.stderr ?? "").trim()}\n`,
+			);
+		}
+	}
 	const created = createIsolatedTmuxSession(
 		plan,
 		rawSpawnSync,
