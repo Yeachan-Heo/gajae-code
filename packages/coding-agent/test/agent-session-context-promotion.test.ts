@@ -168,8 +168,9 @@ describe("AgentSession context promotion", () => {
 			modelRegistry,
 		});
 
+		const originalMap = session.providerSessionState;
 		const closeSpy = vi.fn();
-		session.providerSessionState.set("openai-codex-responses", {
+		originalMap.set("openai-codex-responses", {
 			close: closeSpy,
 		} satisfies ProviderSessionState);
 
@@ -181,8 +182,25 @@ describe("AgentSession context promotion", () => {
 
 		expect(session.model?.provider).toBe(codexModel.provider);
 		expect(session.model?.id).toBe(codexModel.id);
+		// Context promotion is a temporary operation: the prior provider session is
+		// suspended (non-destructive), not closed, during the switch.
+		expect(closeSpy).toHaveBeenCalledTimes(0);
+		const promotedMap = session.providerSessionState;
+		const promotedClose = vi.fn();
+		promotedMap.set("promoted", { close: promotedClose } satisfies ProviderSessionState);
+
+		await session.setModelTemporary(sparkModel, undefined, {
+			cause: "temporary-operation",
+			reason: "context-promotion",
+		});
+		expect(session.providerSessionState).toBe(originalMap);
+		expect(promotedClose).toHaveBeenCalledTimes(1);
+		expect(closeSpy).toHaveBeenCalledTimes(0);
+
+		// A subsequent permanent model change commits the restored provider session
+		// exactly once.
+		await session.setModel(codexModel, "default", { cause: "user-selection" });
 		expect(closeSpy).toHaveBeenCalledTimes(1);
-		expect(session.providerSessionState.size).toBe(0);
 	});
 
 	it("does not promote or continue typed provider safety stops", async () => {
@@ -301,8 +319,11 @@ describe("AgentSession context promotion", () => {
 
 		expect(session.model?.provider).toBe(codexModel.provider);
 		expect(session.model?.id).toBe(codexModel.id);
+		// Manual temporary switch suspends the prior provider session (non-destructive).
+		expect(closeSpy).toHaveBeenCalledTimes(0);
+		// Committing via a permanent selection closes the suspended session exactly once.
+		await session.setModel(codexModel, "default", { cause: "user-selection" });
 		expect(closeSpy).toHaveBeenCalledTimes(1);
-		expect(session.providerSessionState.size).toBe(0);
 	});
 
 	it("clears codex provider session state when branching rewrites history", async () => {

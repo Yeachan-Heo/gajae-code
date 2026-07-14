@@ -40,6 +40,7 @@ import {
 } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import {
 	createWatchdog,
@@ -299,9 +300,12 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 					await notifyProviderResponse(options, response, model, request_id);
 					return data;
 				},
-				{ provider: model.provider, signal: requestSignal },
+				{ provider: model.provider, signal: requestSignal, fallbackManaged: options?.fallbackManaged },
 			).catch(async error => {
-				if (!isForcedToolChoiceUnsupportedError(error, isForcedOpenAIResponsesToolChoice(params.tool_choice))) {
+				if (
+					options?.fallbackManaged ||
+					!isForcedToolChoiceUnsupportedError(error, isForcedOpenAIResponsesToolChoice(params.tool_choice))
+				) {
 					throw error;
 				}
 				const reason = await finalizeErrorMessage(error, rawRequestDump);
@@ -380,6 +384,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error);
 			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
 			output.duration = Date.now() - startTime;

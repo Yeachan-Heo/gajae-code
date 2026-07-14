@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, AgentLoopConfig, AgentMessage } from "@gajae-code/agent-core/types";
+import type { AgentContext, AgentLoopConfig, AgentMessage, StreamFn } from "@gajae-code/agent-core/types";
 import type { Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createUserMessage } from "./helpers";
@@ -57,6 +57,34 @@ describe("agent-loop harmony-leak mitigation wiring (openai-codex)", () => {
 		// The contaminated assistant message was dropped from the working context,
 		// so the model does not see its own leak as history on the retry.
 		expect(assistantContains(context.messages, "<invoke name=")).toBe(false);
+	});
+
+	it("does not retry a Harmony leak when fallback is managed", async () => {
+		const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		const mock = createMockModel({
+			provider: "openai-codex",
+			responses: [{ content: [LEAKED] }, { content: ["unreachable"] }],
+		});
+		let upstreamRequests = 0;
+		const streamFn: StreamFn = (...args) => {
+			upstreamRequests++;
+			return mock.stream(...args);
+		};
+		const audits: Array<{ action: string }> = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			fallbackManaged: true,
+			onHarmonyLeak: event => {
+				audits.push(event);
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("hi")], context, config, undefined, streamFn);
+		await expect(Array.fromAsync(stream)).rejects.toThrow("Detected GPT-5 Harmony protocol leakage");
+
+		expect(upstreamRequests).toBe(1);
+		expect(audits.map(audit => audit.action)).toEqual(["escalated"]);
 	});
 
 	it("detects a leaked <invoke> envelope for non-codex providers too", async () => {

@@ -108,4 +108,25 @@ describe("Google shared tool choice", () => {
 		expect(bodies[1]?.contents).toEqual(bodies[0]?.contents);
 		expectSingleCleanFallbackEvents(events);
 	});
+
+	it("does not retry forced tool choice in managed mode", async () => {
+		let calls = 0;
+		const testModel = { ...model, id: "managed-runtime-google" };
+		const result = await streamGoogleGenAI({
+			model: testModel,
+			api: "google-generative-ai",
+			options: { toolChoice: "required", fallbackManaged: true },
+			prepare: () => ({
+				params: buildGoogleGenerateContentParams(testModel, context, { toolChoice: "required" }),
+				url: "https://google.example.test/stream",
+				headers: {},
+				fetch: async () => {
+					calls += 1;
+					return createErrorResponse("forced tool_choice is not supported");
+				},
+			}),
+		}).result();
+		expect(calls).toBe(1);
+		expect(result.stopReason).toBe("error");
+	});
 });

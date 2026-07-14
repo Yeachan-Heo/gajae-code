@@ -140,6 +140,20 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:hasExtensionHandlers": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:registerBeforeAgentStartContributor": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setSdkPermissionProvider": "internal reverse-provider plumbing, not a user-facing SDK control seam",
+	"agent_session:beginTemporaryProviderSessionScope":
+		"internal temporary model/provider restoration scope, not a user-facing SDK control seam",
+	"agent_session:restoreTemporaryProviderSessionScope":
+		"internal temporary model/provider restoration scope, not a user-facing SDK control seam",
+	"agent_session:commitTemporaryProviderSessionScope":
+		"internal temporary model/provider restoration scope, not a user-facing SDK control seam",
+	"agent_session:getConfiguredModelChain":
+		"internal profile and fallback-chain state, not a user-facing SDK control seam",
+	"agent_session:setConfiguredModelChain":
+		"internal profile and fallback-chain state, not a user-facing SDK control seam",
+	"agent_session:setDefaultFallbackRuntimeModel":
+		"internal fallback runtime bookkeeping, not a user-facing SDK control seam",
+	"agent_session:seedDefaultFallbackResolution":
+		"internal fallback resolution bookkeeping, not a user-facing SDK control seam",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {

@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
+import type { ModelSelectorValue } from "@gajae-code/coding-agent/config/model-selector-value";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	ModelSelectorComponent,
@@ -106,6 +107,13 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		sessionId: "session-1",
 		scopedModels: [],
 		modelRegistry: createRegistry(options),
+		configuredChains: {} as Record<string, readonly string[]>,
+		getConfiguredModelChain(role: string): readonly string[] | undefined {
+			return this.configuredChains[role];
+		},
+		setConfiguredModelChain(role: string, entries: readonly string[]) {
+			this.configuredChains[role] = entries;
+		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
@@ -280,7 +288,10 @@ describe("model selector profile red-team", () => {
 
 test("delete action restores the profile when post-delete notification fails", async () => {
 	const profiles = new Map<string, ModelProfileDefinition>([[userProfile.name, { ...userProfile }]]);
-	const deletedConfigs: Record<string, { required_providers: string[]; model_mapping: Record<string, string> }> = {};
+	const deletedConfigs: Record<
+		string,
+		{ required_providers: string[]; model_mapping: Record<string, ModelSelectorValue> }
+	> = {};
 	const registry = {
 		...createRegistry({ profiles: [...profiles.values()] }),
 		getModelProfiles: () => new Map(profiles),
@@ -298,7 +309,10 @@ test("delete action restores the profile when post-delete notification fails", a
 			return config;
 		}),
 		saveCustomModelProfile: vi.fn(
-			async (name: string, config: { required_providers: string[]; model_mapping: Record<string, string> }) => {
+			async (
+				name: string,
+				config: { required_providers: string[]; model_mapping: Record<string, ModelSelectorValue> },
+			) => {
 				profiles.set(name, {
 					name,
 					requiredProviders: [...config.required_providers],

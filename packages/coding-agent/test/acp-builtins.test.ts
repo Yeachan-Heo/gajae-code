@@ -498,6 +498,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: undefined,
 		});
@@ -517,6 +518,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
 		});
@@ -534,6 +536,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
 		});

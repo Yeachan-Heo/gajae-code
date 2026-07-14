@@ -17,8 +17,6 @@ const WHITELISTED_EMPTY_EVENT_TYPES = [
 	"message_start",
 	"auto_retry_start",
 	"auto_retry_end",
-	"retry_fallback_applied",
-	"retry_fallback_succeeded",
 	"ttsr_triggered",
 	"irc_message",
 	"notice",

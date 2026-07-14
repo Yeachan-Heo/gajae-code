@@ -91,6 +91,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 			thinkingLevel: "off",
 			serviceTier: undefined,
 			models: {},
+			configuredModelChains: {},
 			injectedTtsrRules: [],
 			selectedMCPToolNames: [],
 			hasPersistedMCPToolSelection: false,

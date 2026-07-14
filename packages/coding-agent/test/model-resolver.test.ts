@@ -3,10 +3,12 @@ import { Effort, type Model } from "@gajae-code/ai";
 import {
 	expandRoleAlias,
 	findInitialModel,
+	managedCursorFallbackUnavailableReason,
 	parseModelPattern,
 	parseModelString,
 	resolveAgentModelPatterns,
 	resolveCliModel,
+	resolveModelChainWithAuth,
 	resolveModelFromString,
 	resolveModelOverride,
 	resolveModelRoleValue,
@@ -14,6 +16,42 @@ import {
 	restoreModelFromSession,
 } from "@gajae-code/coding-agent/config/model-resolver";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+
+test("rejects Cursor transports from retryable managed fallback chains at resolution", () => {
+	const cursor = { ...mockModels[0], api: "cursor-agent", provider: "cursor" } as Model;
+	expect(managedCursorFallbackUnavailableReason(cursor, "cursor/claude-4-sonnet")).toBe(
+		"Cursor model cursor/claude-4-sonnet requires provider-side tool execution and cannot be used in a retryable fallback chain",
+	);
+	expect(managedCursorFallbackUnavailableReason(mockModels[0], "anthropic/claude-sonnet-4-5")).toBeUndefined();
+});
+
+test("skips a Cursor chain head during managed auth-aware resolution", async () => {
+	const cursor = { ...mockModels[0], api: "cursor-agent", provider: "cursor" } as Model;
+	const resolution = await resolveModelChainWithAuth(
+		["cursor/claude-sonnet-4-5", "openai/gpt-4o"],
+		{ getAvailable: () => [cursor, mockModels[1]], getApiKey: async () => "key" } as never,
+		undefined,
+		undefined,
+		{ managedFallback: true },
+	);
+	expect(resolution.model).toBe(mockModels[1]);
+	expect(resolution.activeIndex).toBe(1);
+	expect(resolution.skips[0]?.reason).toContain("cannot be used in a retryable fallback chain");
+});
+
+test("does not skip a Cursor single-entry selection when managed fallback is requested", async () => {
+	const cursor = { ...mockModels[0], api: "cursor-agent", provider: "cursor" } as Model;
+	const resolution = await resolveModelChainWithAuth(
+		["cursor/claude-sonnet-4-5"],
+		{ getAvailable: () => [cursor], getApiKey: async () => "key" } as never,
+		undefined,
+		undefined,
+		{ managedFallback: true },
+	);
+	expect(resolution.model).toBe(cursor);
+	expect(resolution.activeIndex).toBe(0);
+	expect(resolution.skips).toEqual([]);
+});
 
 // Mock models for testing
 const mockModels: Model<"anthropic-messages">[] = [

@@ -1,0 +1,249 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
+import { Agent, type AgentOptions } from "@gajae-code/agent-core";
+import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+
+import { TempDir } from "@gajae-code/utils";
+
+function assistantLifecycleEvents(events: AgentSessionEvent[]): AgentSessionEvent[] {
+	return events.filter(
+		event =>
+			(event.type === "message_start" || event.type === "message_update" || event.type === "message_end") &&
+			"message" in event &&
+			event.message.role === "assistant",
+	);
+}
+
+function selector(model: Model): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+	let timer: NodeJS.Timeout;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`TIMEOUT: ${label}`)), 5_000);
+	});
+	return Promise.race([promise, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
+function failedStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage & { transportFailure: { kind: "transport"; status: number } } = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "rate limit exceeded",
+			errorStatus: 429,
+			timestamp: Date.now(),
+			transportFailure: { kind: "transport", status: 429 },
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+
+describe("AgentSession managed fallback attempt transaction", () => {
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let session: AgentSession | undefined;
+
+	beforeEach(async () => {
+		tempDir = TempDir.createSync("@fallback-transaction-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+	});
+
+	afterEach(async () => {
+		await session?.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+		vi.restoreAllMocks();
+	});
+
+	function createSession(
+		streamFn: AgentOptions["streamFn"],
+		maxAttempts = 3,
+	): { agent: Agent; primary: Model; fallback: Model } {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-key`,
+			initialState: { model: primary, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": maxAttempts,
+			"retry.baseDelayMs": 1,
+		});
+		settings.setModelRole("default", selector(primary));
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		session.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
+		return { agent, primary, fallback };
+	}
+
+	it("discards failed managed attempts and publishes the accepted lifecycle once in order", async () => {
+		const calls: string[] = [];
+		let firstRunId: number | undefined;
+		const { agent } = createSession((model, context, options) => {
+			calls.push(selector(model));
+			if (calls.length === 1) firstRunId = agent.activeRunId;
+			if (calls.length === 2) expect(agent.activeRunId).not.toBe(firstRunId);
+			return calls.length < 3
+				? failedStream(model)
+				: createMockModel({ responses: [{ content: ["accepted"] }] }).stream(model, context, options);
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("retry twice then accept");
+		await session!.waitForIdle();
+
+		expect(calls).toHaveLength(3);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(assistantLifecycleEvents(events).filter(event => event.type === "message_start")).toHaveLength(1);
+		expect(assistantLifecycleEvents(events).filter(event => event.type === "message_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(1);
+		const lifecycle = assistantLifecycleEvents(events)
+			.map(event => event.type)
+			.concat(
+				events.filter(event => event.type === "turn_end" || event.type === "agent_end").map(event => event.type),
+			);
+		expect(lifecycle.slice(-3)).toEqual(["message_end", "turn_end", "agent_end"]);
+		expect(session!.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("emits exhausted completion exactly once through the agent finalizer", async () => {
+		const { agent, primary, fallback } = createSession(model => failedStream(model), 3);
+		const terminalSpy = vi.spyOn(agent, "requestRunTerminal");
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("exhaust chain");
+		await session!.waitForIdle();
+
+		const agentEnds = events.filter(event => event.type === "agent_end");
+		const assistantLifecycle = assistantLifecycleEvents(events);
+		expect(terminalSpy).toHaveBeenCalledTimes(1);
+		expect(agentEnds).toHaveLength(1);
+		expect(assistantLifecycle.map(event => event.type)).toEqual(["message_start", "message_end"]);
+		expect(
+			[...assistantLifecycle, ...agentEnds]
+				.sort((left, right) => events.indexOf(left) - events.indexOf(right))
+				.map(event => event.type),
+		).toEqual(["message_start", "message_end", "agent_end"]);
+		const terminal = terminalSpy.mock.calls[0]![1].messages![0] as AssistantMessage;
+		expect(terminal).toMatchObject({ role: "assistant", stopReason: "error" });
+		expect(terminal.errorMessage).toContain(selector(primary));
+		expect(terminal.errorMessage).toContain(selector(fallback));
+		expect(session!.messages).toContainEqual(
+			expect.objectContaining({ role: "assistant", errorMessage: terminal.errorMessage }),
+		);
+	});
+
+	it("finalizes exhausted when every fallback tail entry is unavailable during resolution", async () => {
+		const { agent, primary } = createSession(model => failedStream(model), 1);
+		session!.setConfiguredModelChain("default", [selector(primary), "unknown/unavailable-tail"], "test");
+		const terminalSpy = vi.spyOn(agent, "requestRunTerminal");
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("exhaust unavailable tail");
+		await session!.waitForIdle();
+
+		expect(terminalSpy).toHaveBeenCalledTimes(1);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(terminalSpy.mock.calls[0]![1]).toMatchObject({ stopReason: "exhausted" });
+		const terminal = terminalSpy.mock.calls[0]![1].messages![0] as AssistantMessage;
+		expect(terminal.errorMessage).toContain(selector(primary));
+		expect(terminal.errorMessage).toContain("unknown/unavailable-tail (unknown_model)");
+	});
+
+	it("preserves exhausted completion when a subscriber aborts after unavailable-tail diagnostics", async () => {
+		const { agent, primary, fallback } = createSession(model => failedStream(model), 3);
+		session!.setConfiguredModelChain(
+			"default",
+			[selector(primary), selector(fallback), "unknown/unavailable-tail"],
+			"test",
+		);
+		const terminalSpy = vi.spyOn(agent, "requestRunTerminal");
+		const events: AgentSessionEvent[] = [];
+		let abort: Promise<void> | undefined;
+		session!.subscribe(event => {
+			events.push(event);
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				abort ??= session!.abort();
+			}
+		});
+
+		await session!.prompt("retry twice then exhaust unavailable tail");
+		await abort;
+		await session!.waitForIdle();
+
+		const agentEnds = events.filter(event => event.type === "agent_end");
+		expect(agentEnds).toHaveLength(1);
+		expect(terminalSpy).toHaveBeenCalledTimes(2);
+		expect(terminalSpy.mock.calls).toEqual([
+			[terminalSpy.mock.calls[0]![0], expect.objectContaining({ stopReason: "exhausted" })],
+			[terminalSpy.mock.calls[0]![0], expect.objectContaining({ stopReason: "cancelled" })],
+		]);
+		expect(agentEnds[0]).toMatchObject({
+			messages: [
+				expect.objectContaining({
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: expect.stringContaining("unknown/unavailable-tail (unknown_model)"),
+				}),
+			],
+		});
+		expect(agentEnds).not.toContainEqual(expect.objectContaining({ stopReason: "cancelled" }));
+	});
+	it("settles a rejected managed continuation without duplicate terminal events", async () => {
+		const { agent } = createSession(model => failedStream(model));
+		vi.spyOn(agent, "continue").mockRejectedValueOnce(new Error("managed continuation rejected"));
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await withTimeout(session!.prompt("reject managed continuation"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(session!.isRetrying).toBe(false);
+		expect(session!.isStreaming).toBe(false);
+		const retryEnds = events.filter(
+			(event): event is Extract<AgentSessionEvent, { type: "auto_retry_end" }> => event.type === "auto_retry_end",
+		);
+		expect(retryEnds).toEqual([
+			expect.objectContaining({ success: false, attempt: 1, finalError: "managed continuation rejected" }),
+		]);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+	});
+});

@@ -8,6 +8,7 @@ import {
 } from "@gajae-code/ai/providers/openai-codex-responses";
 import type { Context, Model, ProviderSessionState } from "@gajae-code/ai/types";
 import { getAgentDir, setAgentDir, TempDir } from "@gajae-code/utils";
+import { classifyFallbackTrigger } from "../src/utils/fallback-transport";
 
 const originalFetch = global.fetch;
 const originalAgentDir = getAgentDir();
@@ -270,6 +271,90 @@ describe("openai-codex streaming", () => {
 			"https://chatgpt.com/backend-api/codex/responses",
 			"https://chatgpt.com/backend-api/codex/responses",
 		]);
+	});
+
+	it.each([
+		[false, 2],
+		[true, 1],
+	])("uses one websocket request per managed connection-limit failure", async (fallbackManaged, expectedRequests) => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let requests = 0;
+		class ConnectionLimitWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+			send(): void {
+				requests += 1;
+				if (requests === 1) {
+					this.sendJson({
+						type: "error",
+						error: { code: "websocket_connection_limit_reached", message: "connection limit" },
+					});
+					return;
+				}
+				this.emitCodexResponse({
+					messageId: "msg_reconnected",
+					responseId: "resp_reconnected",
+					text: "reconnected",
+				});
+			}
+		}
+		global.WebSocket = ConnectionLimitWebSocket as unknown as typeof WebSocket;
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: true },
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				sessionId: `connection-limit-${fallbackManaged}`,
+				preferWebsockets: true,
+				fallbackManaged,
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+		expect(requests).toBe(expectedRequests);
+		expect(result.stopReason).toBe(fallbackManaged ? "error" : "stop");
+	});
+
+	it("does not replay a managed websocket failure over SSE", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let websocketRequests = 0;
+		const fetchMock = vi.fn(async () => new Response(createCompletedCodexSse("unexpected replay"), { status: 200 }));
+		global.fetch = fetchMock as unknown as typeof fetch;
+		class BufferedCloseWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+			send(): void {
+				websocketRequests += 1;
+				this.sendJson({
+					type: "response.output_item.added",
+					item: { type: "message", id: "partial", role: "assistant", status: "in_progress", content: [] },
+				});
+				this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+				this.sendJson({ type: "response.output_text.delta", delta: "partial" });
+				this.readyState = MockWebSocket.CLOSED;
+				this.emit("close", { code: 1006 } as unknown as Event);
+			}
+		}
+		global.WebSocket = BufferedCloseWebSocket as unknown as typeof WebSocket;
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: true },
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				sessionId: "managed-sse-replay",
+				preferWebsockets: true,
+				fallbackManaged: true,
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+		expect(websocketRequests).toBe(1);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
 	});
 
 	it("times out SSE streams that only emit no-progress status events", async () => {
@@ -766,6 +851,17 @@ describe("openai-codex streaming", () => {
 		expect(result.stopReason).toBe("error");
 		expect((result.errorMessage ?? "").toLowerCase()).toContain("rate limit");
 		expect(result.errorMessage).not.toContain("Body already used");
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			status: 429,
+			providerCode: "rate_limit_exceeded",
+		});
+		expect(
+			result.transportFailure?.headers instanceof Headers
+				? result.transportFailure.headers.get("retry-after")
+				: undefined,
+		).toBe("600");
+		expect(classifyFallbackTrigger(result.transportFailure)).toEqual({ class: "rate_limit", retryAfterMs: 600_000 });
 	});
 
 	it("honors requestMaxRetries before a Codex SSE stream is established", async () => {

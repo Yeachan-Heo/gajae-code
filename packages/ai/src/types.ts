@@ -28,6 +28,7 @@ import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-respo
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
 import type { OpenAIResponsesOptions } from "./providers/openai-responses";
 import type { AssistantMessageEventStream } from "./utils/event-stream";
+import type { FallbackAttemptToken, TransportFailureFacts } from "./utils/fallback-transport";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream";
 
@@ -323,6 +324,10 @@ export interface StreamOptions {
 	maxTokens?: number;
 	signal?: AbortSignal;
 	apiKey?: string;
+	/** Disables all transport-level replay; the fallback controller owns retries. */
+	fallbackManaged?: boolean;
+	/** Opaque token returned by beginAttempt for a managed transport invocation. */
+	fallbackAttempt?: FallbackAttemptToken;
 	/**
 	 * Called when a provider returns 401 before any replay-unsafe assistant
 	 * event has been emitted. Returning a different key retries the provider
@@ -615,6 +620,8 @@ export interface AssistantMessage {
 	errorKind?: AssistantErrorKind;
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
+	/** Typed upstream failure facts retained for retry classification without parsing errorMessage. */
+	transportFailure?: TransportFailureFacts;
 	/**
 	 * Stable identifiers for request features the provider silently dropped
 	 * during this turn (e.g. `"priority"`). Set when a server-side rejection

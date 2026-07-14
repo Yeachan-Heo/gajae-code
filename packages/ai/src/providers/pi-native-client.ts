@@ -44,6 +44,7 @@ const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"cursorExecHandlers",
 	"cursorOnToolResult",
 	"providerSessionState",
+	"fallbackAttempt",
 ]);
 
 function buildWireOptions(options: SimpleStreamOptions | undefined): Record<string, unknown> {
@@ -70,15 +71,27 @@ async function decodeGatewayError(response: Response): Promise<Error> {
 		if (typeof err === "object" && err !== null) {
 			const message = (err as { message?: unknown }).message;
 			const type = (err as { type?: unknown }).type;
+			const code = (err as { code?: unknown }).code;
 			const out = new Error(typeof message === "string" ? message : `auth-gateway ${status}`);
-			(out as { status?: number; type?: string }).status = status;
-			if (typeof type === "string") (out as { type?: string }).type = type;
+			const transportError = out as Error & {
+				status?: number;
+				type?: string;
+				providerCode?: string;
+				headers?: Headers;
+			};
+			transportError.status = status;
+			transportError.headers = response.headers;
+			if (typeof type === "string") transportError.type = type;
+			if (typeof code === "string") transportError.providerCode = code;
+			else if (typeof type === "string") transportError.providerCode = type;
 			return out;
 		}
 	}
 	const text = typeof body === "string" ? body : JSON.stringify(body);
 	const err = new Error(`auth-gateway ${status}: ${text || response.statusText}`);
-	(err as { status?: number }).status = status;
+	const transportError = err as Error & { status?: number; headers?: Headers };
+	transportError.status = status;
+	transportError.headers = response.headers;
 	return err;
 }
 
@@ -180,19 +193,18 @@ export function streamPiNative<TApi extends Api>(
 			}
 
 			if (!sawTerminal) {
-				// SSE closed before a terminal event reached us — synthesize one
-				// so awaiters of `.result()` resolve instead of hanging forever.
-				// Matches the gateway's own defensive fallback in
-				// `pi-native-server.encodeStream`.
 				const aborted = signal?.aborted === true;
-				const partial = makeSyntheticAssistant(model as Model<Api>);
 				if (aborted) {
+					const partial = makeSyntheticAssistant(model as Model<Api>);
 					partial.stopReason = "aborted";
 					partial.errorMessage = "stream closed without terminal event";
 					stream.push({ type: "error", reason: "aborted", error: partial });
 				} else {
-					partial.stopReason = "stop";
-					stream.push({ type: "done", reason: "stop", message: partial });
+					const error = Object.assign(new Error("pi-native SSE stream closed without terminal event"), {
+						status: 502,
+						headers: response.headers,
+					});
+					stream.fail(error);
 				}
 			}
 			stream.end();

@@ -15,6 +15,7 @@ import {
 import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
+import { selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { type Settings, settings } from "../../config/settings";
 import { DebugSelectorComponent } from "../../debug";
@@ -40,6 +41,7 @@ import {
 	theme,
 } from "../../modes/theme/theme";
 import type { InteractiveModeContext, OAuthSelectorOptions } from "../../modes/types";
+
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
 import {
@@ -665,7 +667,7 @@ export class SelectorController {
 		const dashboard = await AgentDashboard.create(getProjectDir(), this.ctx.settings, this.ctx.ui.terminal.rows, {
 			modelRegistry: this.ctx.session.modelRegistry,
 			activeModelPattern,
-			defaultModelPattern,
+			defaultModelPattern: selectorHead(defaultModelPattern),
 		});
 		this.showSelector(done => {
 			dashboard.onClose = () => {
@@ -934,14 +936,23 @@ export class SelectorController {
 						}
 						if (selection.kind === "profile") {
 							await this.#applyModelProfile(selection.profileName, selection.setDefault);
+
 							done();
 							this.ctx.ui.requestRender();
 							return;
 						}
 						const { model, role, thinkingLevel, selector: selectedSelector } = selection;
 						if (role === null) {
-							// Temporary: update agent state but don't persist to settings
-							await this.ctx.session.setModelTemporary(model, thinkingLevel);
+							// Temporary: update agent state but don't persist to settings. AgentSession
+							// restores its prior auto-owned scope before creating the next one.
+							await this.ctx.session.setModelTemporary(model, thinkingLevel, {
+								cause: "temporary-operation",
+								reason: "other",
+							});
+
+							this.ctx.session.setDefaultFallbackRuntimeModel(
+								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
+							);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Temporary model: ${selectedSelector ?? model.id}`);
@@ -973,7 +984,9 @@ export class SelectorController {
 								await this.ctx.session.setModel(model, "default", {
 									selector: defaultSelector,
 									thinkingLevel,
+									cause: "user-selection",
 								});
+
 								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
 									this.ctx.session.setThinkingLevel(thinkingLevel);
 								}
@@ -1018,6 +1031,7 @@ export class SelectorController {
 							await this.ctx.session.setModel(model, role, {
 								selector: selectedSelector,
 								thinkingLevel,
+								cause: "user-selection",
 							});
 							const value = formatModelSelectorValue(
 								selectedSelector ?? `${model.provider}/${model.id}`,
@@ -1092,6 +1106,7 @@ export class SelectorController {
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
 					activeModelProfile:
 						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
+					configuredDefaultChain: this.ctx.session.getConfiguredModelChain?.("default"),
 					isFastForProvider: provider => this.ctx.session.isFastForProvider(provider),
 					isFastForSubagentProvider: provider => this.ctx.session.isFastForSubagentProvider(provider),
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),

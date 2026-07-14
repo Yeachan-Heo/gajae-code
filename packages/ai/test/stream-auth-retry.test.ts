@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { registerCustomApi, unregisterCustomApis } from "@gajae-code/ai";
+import { beginAttempt, registerCustomApi, unregisterCustomApis } from "@gajae-code/ai";
 import { streamSimple } from "@gajae-code/ai/stream";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@gajae-code/ai/types";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -104,6 +104,33 @@ describe("streamSimple auth retry", () => {
 		expect((await stream.result()).content).toEqual([{ type: "text", text: "ok" }]);
 		expect(keys).toEqual(["old-key", "new-key"]);
 		expect(authCalls).toBe(1);
+	});
+
+	it("does not replay auth failures for a managed attempt", async () => {
+		let requests = 0;
+		let authCalls = 0;
+		registerCustomApi(
+			API,
+			() => {
+				requests += 1;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => stream.fail(authError()));
+				return stream;
+			},
+			SOURCE_ID,
+		);
+		const stream = streamSimple(model(), context, {
+			apiKey: "old-key",
+			fallbackManaged: true,
+			fallbackAttempt: beginAttempt("test-provider/test", 1),
+			onAuthError: async () => {
+				authCalls += 1;
+				return "new-key";
+			},
+		});
+		await expect(stream.result()).rejects.toMatchObject({ status: 401 });
+		expect(requests).toBe(1);
+		expect(authCalls).toBe(0);
 	});
 
 	it("retries when a provider emits start then a 401 error event before content", async () => {

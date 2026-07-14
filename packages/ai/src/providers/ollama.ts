@@ -16,6 +16,7 @@ import type {
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import { parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
@@ -431,7 +432,11 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 					`HTTP ${response.status} from ${baseUrl}/api/chat: ${await response.text().catch(() => "")}`,
 				);
 				(error as Error & { status?: number }).status = response.status;
-				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, true)) {
+				if (
+					firstTokenTime === undefined &&
+					!options.fallbackManaged &&
+					isForcedToolChoiceUnsupportedError(error, true)
+				) {
 					markToolChoiceIncapability(model, "auto", error.message);
 					stream.push({
 						type: "toolChoiceIncapability",
@@ -590,6 +595,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error);
 			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) {

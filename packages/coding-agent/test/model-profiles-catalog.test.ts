@@ -12,6 +12,7 @@ import {
 import { parseModelString } from "@gajae-code/coding-agent/config/model-resolver";
 import { ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import modelsJson from "../../ai/src/models.json";
+import { selectorHead } from "../src/config/model-selector-value";
 
 type Role = "default" | "executor" | "planner" | "critic" | "architect";
 
@@ -449,8 +450,9 @@ describe("built-in model profile catalog", () => {
 				const selector = profile.modelMapping[role];
 				expect(selector).toBeDefined();
 				expect(ProfileModelSelectorSchema.safeParse(selector).success).toBe(true);
-				expect(parseModelString(selector ?? "")).toBeDefined();
-				if (selector && !selectorExists(selector)) missing.push(`${profile.name}.${role}=${selector}`);
+				expect(parseModelString(selectorHead(selector) ?? "")).toBeDefined();
+				if (selector && !selectorExists(selectorHead(selector) ?? ""))
+					missing.push(`${profile.name}.${role}=${selector}`);
 			}
 		}
 		expect(missing).toEqual([]);
@@ -518,7 +520,7 @@ describe("built-in model profile catalog", () => {
 			for (const role of roles) {
 				const selector = profile.modelMapping[role];
 				expect(selector).toBeDefined();
-				const parsed = parseModelString(selector ?? "");
+				const parsed = parseModelString(selectorHead(selector) ?? "");
 				expect(parsed?.provider).toBe("minimax-code");
 				expect(parsed?.id).toBe("minimax-m3");
 			}

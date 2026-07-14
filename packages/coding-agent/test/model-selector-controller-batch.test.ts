@@ -27,8 +27,11 @@ function createControllerContext() {
 	const setModelCalls: Array<{
 		model: Model;
 		role: string;
-		options?: { selector?: string; thinkingLevel?: ThinkingLevel };
+		options?: { cause?: "user-selection"; selector?: string; thinkingLevel?: ThinkingLevel };
 	}> = [];
+	const setModelTemporary = vi.fn(async () => {});
+	const setDefaultFallbackRuntimeModel = vi.fn();
+
 	const session = {
 		model: model("provider-a", "current") as Model | undefined,
 		thinkingLevel: ThinkingLevel.Medium as ThinkingLevel | undefined,
@@ -46,12 +49,18 @@ function createControllerContext() {
 			resolveCanonicalModel: () => undefined,
 			getApiKey: vi.fn(async () => "key"),
 		},
-		async setModel(nextModel: Model, role: string, options?: { selector?: string; thinkingLevel?: ThinkingLevel }) {
+		async setModel(
+			nextModel: Model,
+			role: string,
+			options?: { cause?: "user-selection"; selector?: string; thinkingLevel?: ThinkingLevel },
+		) {
 			setModelCalls.push({ model: nextModel, role, options });
 			this.model = nextModel;
 			if (options?.thinkingLevel) this.thinkingLevel = options.thinkingLevel;
 		},
-		async setModelTemporary() {},
+		setModelTemporary,
+		setDefaultFallbackRuntimeModel,
+
 		setThinkingLevel(thinkingLevel: ThinkingLevel) {
 			this.thinkingLevel = thinkingLevel;
 		},
@@ -72,7 +81,15 @@ function createControllerContext() {
 		showError: vi.fn(),
 		notifyConfigChanged: vi.fn(async () => {}),
 	};
-	return { ctx, settings, session, setModelCalls };
+	return {
+		ctx,
+		settings,
+		session,
+		setModelCalls,
+		setModelTemporary,
+
+		setDefaultFallbackRuntimeModel,
+	};
 }
 
 async function openSelector(ctx: ReturnType<typeof createControllerContext>["ctx"]): Promise<ModelSelectorComponent> {
@@ -138,7 +155,7 @@ describe("SelectorController model batch assignments", () => {
 			{
 				model: selectedModel,
 				role: "default",
-				options: { selector: "provider-a/selected", thinkingLevel: ThinkingLevel.High },
+				options: { cause: "user-selection", selector: "provider-a/selected", thinkingLevel: ThinkingLevel.High },
 			},
 		]);
 		expect(settings.getModelRole("default")).toBe("provider-a/selected:high");
@@ -151,6 +168,45 @@ describe("SelectorController model batch assignments", () => {
 		expect(ctx.showStatus).toHaveBeenCalledWith(
 			"All model targets set to provider-a/selected:high for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		);
+	});
+
+	test("temporary selection replaces the live fallback chain with the selected model", async () => {
+		const { ctx, settings, setModelTemporary, setDefaultFallbackRuntimeModel } = createControllerContext();
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: null,
+			thinkingLevel: ThinkingLevel.Low,
+			selector: "provider-a/selected:low",
+		});
+
+		expect(setModelTemporary).toHaveBeenCalledWith(selectedModel, ThinkingLevel.Low, {
+			cause: "temporary-operation",
+			reason: "other",
+		});
+		expect(setDefaultFallbackRuntimeModel).toHaveBeenCalledWith("provider-a/selected:low");
+		expect(settings.getModelRole("default")).toBe("provider-a/original-default:medium");
+	});
+
+	test("relies on AgentSession to replace the prior temporary provider-session scope", async () => {
+		const { ctx, setModelTemporary } = createControllerContext();
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: null,
+			thinkingLevel: ThinkingLevel.Low,
+			selector: "provider-a/selected:low",
+		});
+		await selector.__testSelectAssignment({
+			model: model("provider-a", "replacement"),
+			role: null,
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/replacement:high",
+		});
+
+		expect(setModelTemporary).toHaveBeenCalledTimes(2);
 	});
 	test("role assignment replaces active profile override immediately and persists the explicit selection", async () => {
 		const { ctx, settings } = createControllerContext();

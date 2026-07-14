@@ -160,4 +160,22 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		// Apply-for-this-session setting untouched.
 		expect(session.settings.get("modelProfile.default")).toBe(globalProfileDefaultBefore);
 	});
+	it("replaces a configured fallback chain when the user explicitly selects a default model", async () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+
+		// Simulate a profile-activated configured chain [A, B].
+		session.setConfiguredModelChain(
+			"default",
+			["anthropic/claude-opus-4-8", "openai-codex/gpt-5.5"],
+			"profile-activation",
+		);
+		expect(session.getConfiguredModelChain("default")).toEqual(["anthropic/claude-opus-4-8", "openai-codex/gpt-5.5"]);
+
+		// Explicit user selection of C supersedes the stale chain: resume and
+		// snapshots must follow the latest choice, without the old tail.
+		await session.setModel(base);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-5.5"]);
+		expect(session.sessionManager.buildSessionContext().models.default).toBe("openai-codex/gpt-5.5");
+	});
 });

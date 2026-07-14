@@ -1,11 +1,19 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { registerCustomApi, unregisterCustomApis } from "../src/api-registry";
+import { startAuthGateway } from "../src/auth-gateway/server";
+import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { Effort } from "../src/model-thinking";
 import { encodeStream, formatError, parseRequest } from "../src/providers/pi-native-server";
 import type {
+	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	Context,
+	Model,
 	Usage,
 } from "../src/types";
 
@@ -65,6 +73,9 @@ const baseContext: Context = {
 	messages: [{ role: "user", content: "hi", timestamp: 0 }],
 };
 
+const SYNC_THROW_SOURCE = "auth-gateway-sync-throw-test";
+const SYNC_THROW_API = "auth-gateway-sync-throw-test" as Api;
+
 describe("pi-native parseRequest", () => {
 	it("accepts modelId + context and returns canonical shape", () => {
 		const parsed = parseRequest({
@@ -78,6 +89,16 @@ describe("pi-native parseRequest", () => {
 		expect(parsed.options.temperature).toBe(0.5);
 		expect(parsed.options.reasoning).toBe(Effort.High);
 		expect(parsed.stream).toBe(false);
+	});
+
+	it("preserves fallback managed mode while dropping its local attempt token", () => {
+		const parsed = parseRequest({
+			modelId: "x",
+			context: baseContext,
+			options: { fallbackManaged: true, fallbackAttempt: { shouldNotCrossWire: true } },
+		});
+		expect(parsed.options.fallbackManaged).toBe(true);
+		expect(parsed.options.fallbackAttempt).toBeUndefined();
 	});
 
 	it("falls back to model.id when modelId is absent (streamProxy compat)", () => {
@@ -276,5 +297,215 @@ describe("pi-native formatError", () => {
 		expect(res.status).toBe(401);
 		expect(res.headers.get("Content-Type")).toBe("application/json; charset=utf-8");
 		expect(await res.json()).toEqual({ error: { type: "authentication_error", message: "no credential" } });
+	});
+});
+
+describe("pi-native managed gateway credential failure marking", () => {
+	it.each([
+		{ status: 401, message: "invalid API key", classification: "auth" },
+		{ status: 429, message: "rate limit exceeded", classification: "rate limit" },
+	])("marks a streamed $classification failure once and rotates credentials for an explicitly managed pi-native request", async ({
+		status,
+		message,
+	}) => {
+		let upstreamRequests = 0;
+		const credentials: string[] = [];
+		const upstream = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: req => {
+				upstreamRequests += 1;
+				credentials.push(req.headers.get("authorization") ?? "");
+				return new Response(JSON.stringify({ error: { message } }), {
+					status,
+					headers: { "Content-Type": "application/json" },
+				});
+			},
+		});
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-gateway-managed-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "auth.db"));
+		const storage = new AuthStorage(store);
+		const provider = "gateway-managed-test";
+		const model: Model<Api> = {
+			id: "gateway-managed-model",
+			name: "Gateway managed test model",
+			api: "openai-completions",
+			provider,
+			baseUrl: upstream.url.toString(),
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+		};
+		await storage.set(provider, [
+			{ type: "api_key", key: "gateway-key-one" },
+			{ type: "api_key", key: "gateway-key-two" },
+		]);
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["gateway-test-token"],
+			version: "test",
+			storage,
+			resolveModel: id => (id === model.id ? model : undefined),
+			listModels: () => [model],
+		});
+		const request = () =>
+			fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { Authorization: "Bearer gateway-test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({
+					modelId: model.id,
+					context: baseContext,
+					stream: true,
+					options: { fallbackManaged: true },
+				}),
+			});
+		try {
+			const first = await request();
+			expect(first.status).toBe(200);
+			await first.text();
+			expect(upstreamRequests).toBe(1);
+			expect(credentials).toEqual(["Bearer gateway-key-one"]);
+
+			const second = await request();
+			expect(second.status).toBe(200);
+			await second.text();
+			expect(upstreamRequests).toBe(2);
+			expect(credentials).toEqual(["Bearer gateway-key-one", "Bearer gateway-key-two"]);
+		} finally {
+			await gateway.close();
+			upstream.stop(true);
+			store.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("replays a translated OpenAI request with a refreshed credential after an auth failure", async () => {
+		let upstreamRequests = 0;
+		const credentials: string[] = [];
+		const upstream = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: req => {
+				upstreamRequests += 1;
+				credentials.push(req.headers.get("authorization") ?? "");
+				if (upstreamRequests === 1) {
+					return new Response(JSON.stringify({ error: { message: "invalid API key" } }), {
+						status: 401,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response(
+					`${[
+						'data: {"choices":[{"delta":{"content":"ok"},"index":0}]}',
+						'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}',
+						"data: [DONE]",
+					].join("\n\n")}\n\n`,
+					{ headers: { "Content-Type": "text/event-stream" } },
+				);
+			},
+		});
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-gateway-translated-retry-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "auth.db"));
+		const storage = new AuthStorage(store);
+		const provider = "gateway-translated-retry-test";
+		const model: Model<Api> = {
+			id: "gateway-translated-retry-model",
+			name: "Gateway translated retry test model",
+			api: "openai-completions",
+			provider,
+			baseUrl: upstream.url.toString(),
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+		};
+		await storage.set(provider, [
+			{ type: "api_key", key: "gateway-key-one" },
+			{ type: "api_key", key: "gateway-key-two" },
+		]);
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["gateway-test-token"],
+			version: "test",
+			storage,
+			resolveModel: id => (id === model.id ? model : undefined),
+		});
+		try {
+			const response = await fetch(`${gateway.url}/v1/chat/completions`, {
+				method: "POST",
+				headers: { Authorization: "Bearer gateway-test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({ model: model.id, messages: [{ role: "user", content: "hi" }], stream: true }),
+			});
+			expect(response.status).toBe(200);
+			expect(await response.text()).toContain("[DONE]");
+			expect(upstreamRequests).toBe(2);
+			expect(credentials).toEqual(["Bearer gateway-key-one", "Bearer gateway-key-two"]);
+		} finally {
+			await gateway.close();
+			upstream.stop(true);
+			store.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("marks a synchronous explicitly managed pi-native stream failure before returning the original error", async () => {
+		const keys: Array<string | undefined> = [];
+		registerCustomApi(
+			SYNC_THROW_API,
+			(_model, _context, options) => {
+				keys.push(options?.apiKey);
+				throw Object.assign(new Error("invalid API key"), { status: 401 });
+			},
+			SYNC_THROW_SOURCE,
+		);
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-gateway-sync-throw-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "auth.db"));
+		const storage = new AuthStorage(store);
+		const provider = "gateway-sync-throw-test";
+		const model: Model<Api> = {
+			id: "gateway-sync-throw-model",
+			name: "Gateway synchronous throw test model",
+			api: SYNC_THROW_API,
+			provider,
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+		};
+		await storage.set(provider, [
+			{ type: "api_key", key: "gateway-key-one" },
+			{ type: "api_key", key: "gateway-key-two" },
+		]);
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["gateway-test-token"],
+			version: "test",
+			storage,
+			resolveModel: id => (id === model.id ? model : undefined),
+		});
+		const request = () =>
+			fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { Authorization: "Bearer gateway-test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({
+					modelId: model.id,
+					context: baseContext,
+					stream: true,
+					options: { fallbackManaged: true },
+				}),
+			});
+		try {
+			expect((await request()).status).toBe(401);
+			expect((await request()).status).toBe(401);
+			expect(keys).toEqual(["gateway-key-one", "gateway-key-two"]);
+		} finally {
+			unregisterCustomApis(SYNC_THROW_SOURCE);
+			await gateway.close();
+			store.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 });

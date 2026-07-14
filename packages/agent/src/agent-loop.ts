@@ -6,12 +6,14 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
+	classifyFallbackTrigger,
 	EventStream,
 	isContextOverflow,
 	isZodSchema,
 	streamSimple,
 	type ToolResultMessage,
 	type TSchema,
+	transportFailureFacts,
 	validateToolArguments,
 	zodToWireSchema,
 } from "@gajae-code/ai";
@@ -51,10 +53,30 @@ import type {
 	AgentMessage,
 	AgentTool,
 	AgentToolResult,
+	ManagedAttemptOutcome,
 	StreamFn,
 } from "./types";
 
 /** Sentinel returned by the abort race in `streamAssistantResponse`. */
+/**
+ * Defensive caps for a provisional managed attempt. These are intentionally
+ * well above ordinary streamed responses; they only bound memory when an
+ * upstream emits an unbounded event stream before the attempt can commit.
+ */
+export const MANAGED_ATTEMPT_MAX_STAGED_EVENTS = 10_000;
+export const MANAGED_ATTEMPT_MAX_STAGED_BYTES = 16 * 1024 * 1024;
+
+class ManagedAttemptBufferOverflowError extends Error {
+	readonly status = 503;
+
+	constructor() {
+		super("Managed fallback attempt exceeded the provisional event buffer limit");
+		this.name = "ManagedAttemptBufferOverflowError";
+	}
+}
+
+const managedAttemptTextEncoder = new TextEncoder();
+
 const ABORTED: unique symbol = Symbol("agent-loop-aborted");
 /**
  * Detect empty "successful" responses that indicate a proxy-level context
@@ -64,6 +86,66 @@ const ABORTED: unique symbol = Symbol("agent-loop-aborted");
  */
 function isEmptyResponseOverflow(message: AssistantMessage): boolean {
 	return isContextOverflow(message);
+}
+
+/** Managed fallback owns retry policy; only typed transport facts may discard an attempt. */
+function managedTransportFailure(failure: unknown) {
+	if (failure && typeof failure === "object" && "transportFailure" in failure) {
+		const facts = (failure as { transportFailure?: unknown }).transportFailure;
+		if (facts && typeof facts === "object") return transportFailureFacts(facts);
+	}
+	return transportFailureFacts(failure);
+}
+
+function managedRetryableFailure(failure: unknown): boolean {
+	const facts = managedTransportFailure(failure);
+	if (!facts) return false;
+	const trigger = classifyFallbackTrigger(facts);
+	return (
+		trigger.class === "rate_limit" ||
+		trigger.class === "quota" ||
+		trigger.class === "auth" ||
+		trigger.class === "server"
+	);
+}
+
+function managedFailureOutcome(message: AssistantMessage): ManagedAttemptOutcome {
+	return {
+		type: "retryable_discarded",
+		failure: { message, transportFailure: managedTransportFailure(message) },
+	};
+}
+
+function managedFailureMessage(error: unknown, config: AgentLoopConfig): AssistantMessage {
+	const details = error as { message?: unknown; errorStatus?: unknown; status?: unknown };
+	const status =
+		typeof details.errorStatus === "number"
+			? details.errorStatus
+			: typeof details.status === "number"
+				? details.status
+				: undefined;
+	const transportFailure =
+		managedTransportFailure(error) ?? (status === undefined ? undefined : { kind: "transport" as const, status });
+	return {
+		role: "assistant",
+		content: [],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "error",
+		errorMessage: typeof details.message === "string" ? details.message : String(error),
+		errorStatus: status,
+		...(transportFailure ? { transportFailure } : {}),
+		timestamp: Date.now(),
+	};
 }
 
 class HarmonyLeakInterruption extends Error {
@@ -132,6 +214,7 @@ export function agentLoop(
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
+	emitManagedAgentStart = true,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
 
@@ -141,16 +224,19 @@ export function agentLoop(
 			...context,
 			messages: [...context.messages, ...prompts],
 		};
-
-		stream.push({ type: "agent_start" });
-		stream.push({ type: "turn_start" });
+		const transaction = config.fallbackManaged
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent)
+			: undefined;
+		const attemptStream = transaction ?? stream;
+		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
+		attemptStream.push({ type: "turn_start" });
 		for (const prompt of prompts) {
 			stream.push({ type: "message_start", message: prompt });
 			stream.push({ type: "message_end", message: prompt });
 		}
 
 		try {
-			await runLoop(currentContext, newMessages, config, signal, stream, streamFn);
+			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
 			stream.fail(err);
 		}
@@ -172,6 +258,7 @@ export function agentLoopContinue(
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
+	emitManagedAgentStart = true,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
@@ -186,12 +273,15 @@ export function agentLoopContinue(
 	(async () => {
 		const newMessages: AgentMessage[] = [];
 		const currentContext: AgentContext = { ...context };
-
-		stream.push({ type: "agent_start" });
-		stream.push({ type: "turn_start" });
+		const transaction = config.fallbackManaged
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent)
+			: undefined;
+		const attemptStream = transaction ?? stream;
+		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
+		attemptStream.push({ type: "turn_start" });
 
 		try {
-			await runLoop(currentContext, newMessages, config, signal, stream, streamFn);
+			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
 			stream.fail(err);
 		}
@@ -205,6 +295,94 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+}
+
+/** Capture an event-time value because providers commonly mutate partial messages in place. */
+function managedAttemptSnapshot<T>(value: T): T {
+	return structuredClone(value);
+}
+
+/**
+ * Holds managed-attempt assistant output above the public event stream. A
+ * cancelled provider attempt is therefore unobservable to sessions and their
+ * side-effect consumers. Non-managed streams bypass this object entirely.
+ */
+class ManagedAttemptTransaction {
+	#batch: Array<
+		| { type: "event"; event: AgentEvent }
+		| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent }
+	> = [];
+	#stagedEventCount = 0;
+	#stagedBytes = 0;
+	#discarded = false;
+	#committed = false;
+
+	constructor(
+		private readonly stream: EventStream<AgentEvent, AgentMessage[]>,
+		private readonly onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void,
+	) {}
+
+	push(event: AgentEvent): void {
+		if (this.#committed) {
+			this.stream.push(event);
+			return;
+		}
+		this.#stage(event);
+	}
+
+	end(messages: AgentMessage[]): void {
+		this.stream.end(messages);
+	}
+
+	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
+		this.#batch.push({
+			type: "assistant_event",
+			message: managedAttemptSnapshot(message),
+			event: managedAttemptSnapshot(event),
+		});
+	}
+
+	flush(): void {
+		if (this.#discarded || this.#committed) return;
+		for (const item of this.#batch) {
+			if (item.type === "assistant_event") {
+				this.onAssistantMessageEvent?.(item.message, item.event);
+			} else {
+				this.stream.push(item.event);
+			}
+		}
+		this.#batch = [];
+		this.#stagedBytes = 0;
+		this.#stagedEventCount = 0;
+		this.#committed = true;
+	}
+
+	discard(): void {
+		this.#batch = [];
+		this.#stagedBytes = 0;
+		this.#stagedEventCount = 0;
+		this.#discarded = true;
+	}
+
+	#stage(event: AgentEvent): void {
+		let bytes: number;
+		try {
+			bytes = managedAttemptTextEncoder.encode(JSON.stringify(event)).byteLength;
+		} catch {
+			bytes = MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1;
+		}
+		if (
+			this.#stagedEventCount + 1 > MANAGED_ATTEMPT_MAX_STAGED_EVENTS ||
+			this.#stagedBytes + bytes > MANAGED_ATTEMPT_MAX_STAGED_BYTES
+		) {
+			this.discard();
+			throw new ManagedAttemptBufferOverflowError();
+		}
+		this.#batch.push({ type: "event", event: managedAttemptSnapshot(event) });
+		this.#stagedEventCount += 1;
+
+		this.#stagedBytes += bytes;
+	}
 }
 
 /**
@@ -549,6 +727,7 @@ async function runLoop(
 	signal: AbortSignal | undefined,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	streamFn?: StreamFn,
+	initialTransaction?: ManagedAttemptTransaction,
 ): Promise<void> {
 	const telemetry = resolveTelemetry(config.telemetry, config.sessionId);
 	const invokeAgentSpan = startInvokeAgentSpan(telemetry, config.model);
@@ -566,6 +745,7 @@ async function runLoop(
 				invokeAgentSpan,
 				stepCounter,
 				streamFn,
+				initialTransaction,
 			),
 		);
 	} catch (err) {
@@ -593,6 +773,7 @@ async function runLoopBody(
 	invokeAgentSpan: Span | undefined,
 	stepCounter: StepCounter,
 	streamFn?: StreamFn,
+	initialTransaction?: ManagedAttemptTransaction,
 ): Promise<void> {
 	let firstTurn = true;
 	// Check for steering messages at start (user may have typed while waiting)
@@ -606,13 +787,21 @@ async function runLoopBody(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			const transaction =
+				initialTransaction ??
+				(config.fallbackManaged
+					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent)
+					: undefined);
+			initialTransaction = undefined;
+			const attemptStream = transaction ?? stream;
 			if (!firstTurn) {
-				stream.push({ type: "turn_start" });
+				attemptStream.push({ type: "turn_start" });
 			} else {
 				firstTurn = false;
 			}
 
-			// Process pending messages (inject before next assistant response)
+			// Commit queued user input outside the provisional assistant transaction so a
+			// discarded managed attempt cannot lose it before its retry continuation.
 			if (pendingMessages.length > 0) {
 				for (const message of pendingMessages) {
 					stream.push({ type: "message_start", message });
@@ -628,15 +817,26 @@ async function runLoopBody(
 				await config.syncContextBeforeModelCall(currentContext);
 			}
 
+			const contextMessageCount = currentContext.messages.length;
+			const newMessageCount = newMessages.length;
+
 			// Stream assistant response
 			let recovered: HarmonyRecoveredToolCall | undefined;
 			let message: AssistantMessage;
+			const attemptTransaction = transaction;
 			try {
+				const attemptConfig = attemptTransaction
+					? {
+							...config,
+							onAssistantMessageEvent: (partial: AssistantMessage, event: AssistantMessageEvent) =>
+								attemptTransaction.stageAssistantMessageEvent(partial, event),
+						}
+					: config;
 				message = await streamAssistantResponse(
 					currentContext,
-					config,
+					attemptConfig,
 					signal,
-					stream,
+					attemptTransaction ? (attemptTransaction as unknown as EventStream<AgentEvent, AgentMessage[]>) : stream,
 					telemetry,
 					invokeAgentSpan,
 					stepCounter,
@@ -652,7 +852,21 @@ async function runLoopBody(
 				harmonyRetryAttempt = 0;
 				harmonyTruncateResumeCount = 0;
 			} catch (err) {
-				if (!(err instanceof HarmonyLeakInterruption)) throw err;
+				if (!(err instanceof HarmonyLeakInterruption)) {
+					if (config.fallbackManaged && transaction && managedRetryableFailure(err)) {
+						transaction.discard();
+						currentContext.messages.splice(contextMessageCount);
+						newMessages.splice(newMessageCount);
+						await config.onManagedAttemptOutcome?.(managedFailureOutcome(managedFailureMessage(err, config)));
+						stream.end(newMessages);
+						return;
+					}
+					throw err;
+				}
+				if (config.fallbackManaged) {
+					await emitHarmonyAudit(config, err, "escalated", harmonyRetryAttempt);
+					throw err;
+				}
 				if (err.recovered) {
 					if (harmonyTruncateResumeCount >= 2) {
 						await emitHarmonyAudit(config, err, "escalated", harmonyRetryAttempt);
@@ -708,6 +922,30 @@ async function runLoopBody(
 				message.errorMessage = message.errorMessage
 					? `${message.errorMessage} | Provider returned an empty response with anomalously low token usage (possible context overflow via proxy)`
 					: "Provider returned an empty response with anomalously low token usage (possible context overflow via proxy)";
+			}
+
+			if (config.fallbackManaged && message.stopReason === "error" && managedRetryableFailure(message)) {
+				transaction?.discard();
+				currentContext.messages.splice(contextMessageCount);
+				newMessages.splice(newMessageCount);
+				await config.onManagedAttemptOutcome?.(managedFailureOutcome(message));
+				stream.end(newMessages);
+				return;
+			}
+
+			if (config.fallbackManaged && message.stopReason === "aborted") {
+				transaction?.discard();
+				currentContext.messages.splice(contextMessageCount);
+				newMessages.splice(newMessageCount);
+				await config.onManagedAttemptOutcome?.({ type: "run_terminal", reason: "cancelled" });
+				stream.end(newMessages);
+				return;
+			}
+
+			// One provider invocation is committed before any tool can run.
+			transaction?.flush();
+			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
+				await config.onManagedAttemptAccepted?.();
 			}
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -925,8 +1163,10 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
+			const fallbackAttempt = config.fallbackManaged ? config.nextFallbackAttempt?.(config.model) : undefined;
 			const response = await streamFunction(config.model, llmContext, {
 				...config,
+				fallbackAttempt,
 				apiKey: resolvedApiKey,
 				authCredentialType,
 				metadata: resolvedMetadata,

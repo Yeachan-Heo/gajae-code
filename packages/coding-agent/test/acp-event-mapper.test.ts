@@ -121,6 +121,42 @@ describe("ACP event mapper", () => {
 		).toEqual([]);
 	});
 
+	it("maps model fallback switches to one ACP session notice", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "model_fallback_switched",
+				eventId: "fallback-1",
+				from: "anthropic/claude-sonnet",
+				to: "openai/gpt-5",
+				reason: "rate_limit",
+				role: "default",
+				scope: "session",
+				activeIndex: 1,
+				chainLength: 2,
+				attemptsUsed: 3,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		expect(updates[0]!.update).toEqual({
+			sessionUpdate: "session_info_update",
+			_meta: {
+				gjcModelFallbackSwitched: true,
+				gjcModelFallbackEventId: "fallback-1",
+				gjcModelFallbackFrom: "anthropic/claude-sonnet",
+				gjcModelFallbackTo: "openai/gpt-5",
+				gjcModelFallbackReason: "rate_limit",
+				gjcModelFallbackRole: "default",
+				gjcModelFallbackScope: "session",
+				gjcModelFallbackActiveIndex: 1,
+				gjcModelFallbackChainLength: 2,
+				gjcModelFallbackAttemptsUsed: 3,
+			},
+		});
+	});
+
 	it("maps automatic compaction lifecycle events to ACP session metadata", () => {
 		const start = mapAgentSessionEventToAcpSessionUpdates(
 			{ type: "auto_compaction_start", reason: "threshold", action: "context-full" } as AgentSessionEvent,

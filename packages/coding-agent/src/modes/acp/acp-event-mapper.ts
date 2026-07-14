@@ -232,6 +232,24 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "todo_auto_clear":
 			return [toSessionNotification(sessionId, { sessionUpdate: "plan", entries: [] })];
+		case "model_fallback_switched":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcModelFallbackSwitched: true,
+						gjcModelFallbackEventId: event.eventId,
+						gjcModelFallbackFrom: event.from,
+						gjcModelFallbackTo: event.to,
+						gjcModelFallbackReason: event.reason,
+						gjcModelFallbackRole: event.role,
+						gjcModelFallbackScope: event.scope,
+						gjcModelFallbackActiveIndex: event.activeIndex,
+						gjcModelFallbackChainLength: event.chainLength,
+						gjcModelFallbackAttemptsUsed: event.attemptsUsed,
+					},
+				}),
+			];
 		// These event types are intentionally not represented as ACP session updates.
 		case "agent_start":
 		case "agent_end":
@@ -278,8 +296,6 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "auto_retry_start":
 		case "auto_retry_end":
-		case "retry_fallback_applied":
-		case "retry_fallback_succeeded":
 		case "ttsr_triggered":
 		case "irc_message":
 		case "subagent_steer_message":

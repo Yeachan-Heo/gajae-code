@@ -241,14 +241,12 @@ describe("streamPiNative event flow", () => {
 		await expect(stream.result()).rejects.toThrow(/502/);
 	});
 
-	it("synthesizes a terminal `done` when the SSE stream closes silently", async () => {
-		// Models the gateway dropping mid-stream — without this synthetic terminator,
-		// `.result()` would hang forever.
+	it("fails with classified transport evidence when the SSE stream closes silently", async () => {
 		const halfEvents: AssistantMessageEvent[] = [{ type: "start", partial: baseAssistant() }];
 		const encoder = new TextEncoder();
 		const body = new ReadableStream<Uint8Array>({
 			start(controller) {
-				for (const e of halfEvents) controller.enqueue(encoder.encode(`data: ${JSON.stringify(e)}\n\n`));
+				for (const event of halfEvents) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
 				controller.close();
 			},
 		});
@@ -256,13 +254,11 @@ describe("streamPiNative event flow", () => {
 			new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } })) as FetchImpl;
 
 		const stream = streamPiNative(fakeModel(), baseContext, { apiKey: "k", fetch: fetchImpl });
-		const seen = await collectEvents(stream);
-		expect(seen.length).toBeGreaterThanOrEqual(2);
-		expect(seen[seen.length - 1].type).toBe("done");
-
-		const result = await stream.result();
-		expect(result.role).toBe("assistant");
-		expect(result.stopReason).toBe("stop");
+		await expect(collectEvents(stream)).rejects.toMatchObject({
+			message: "pi-native SSE stream closed without terminal event",
+			status: 502,
+		});
+		await expect(stream.result()).rejects.toMatchObject({ status: 502 });
 	});
 
 	it("fails fast when the caller's signal is already aborted before fetch fires", async () => {

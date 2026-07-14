@@ -61,7 +61,6 @@ describe("agent-wire event observation red-team", () => {
 			{ type: "tool_execution_end", toolCallId: null, toolName: {}, result: LONG_SECRET, isError: "yes" },
 			{ type: "auto_retry_start", attempt: "first", errorMessage: LONG_SECRET },
 			{ type: "auto_retry_end", success: "true", attempt: null },
-			{ type: "retry_fallback_applied", role: { text: LONG_SECRET } },
 			{ type: "ttsr_triggered", rules: null },
 			{ type: "notice", level: 17, message: LONG_SECRET, source: { raw: LONG_SECRET } },
 			{ type: "goal_updated", goal: LONG_SECRET },

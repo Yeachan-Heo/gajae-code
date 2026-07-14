@@ -697,6 +697,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						await runtime.session.setModel(selection.model, "default", {
 							selector: selection.selector,
 							thinkingLevel: existingDefaultThinkingLevel,
+							cause: "user-selection",
 						});
 						if (existingDefaultThinkingLevel) {
 							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);

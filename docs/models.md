@@ -201,8 +201,30 @@ profiles:
       critic: openai/o3:high
 ```
 
-`model_mapping` keys are role names (`default`, `executor`, `architect`, `planner`, `critic`). Each role maps to exactly one model selector in the form `provider/modelId[:effort]`; comma-separated fallback chains are not supported in a single role value.
-`required_providers` is the aggregate set of providers required across the profile's mapped roles, not a per-role fallback chain.
+`model_mapping` keys are role names (`default`, `executor`, `architect`, `planner`, `critic`). Every role accepts either one `provider/modelId[:effort]` selector or a non-empty ordered array of selectors; the first entry is primary and later entries are fallback candidates. `required_providers` is the aggregate set of providers required across the profile's mapped roles.
+
+### Fallback chains
+
+Preset `model_mapping` roles, top-level `modelRoles`, and `task.agentModelOverrides` all accept `string | string[]`. Keep one selector per line when a chain needs to be readable:
+
+```yaml
+profiles:
+  reliable:
+    required_providers: [anthropic, openai]
+    model_mapping:
+      default: [anthropic/claude-sonnet-4-5, openai/gpt-4o-mini]
+modelBindings:
+  modelRoles:
+    default: [anthropic/claude-sonnet-4-5, openai/gpt-4o-mini]
+  agentModelOverrides:
+    executor: [anthropic/claude-sonnet-4-5, openai/gpt-4o-mini]
+```
+
+Resolution-time skips for unavailable, unauthenticated, or unknown entries cost zero attempts and advance immediately. Only request-time retryable failures (such as 429, quota, authentication, or 5xx failures) consume an entry's `fallback.maxAttempts` total attempts (default: `3`). The active default fallback remains sticky for the session; role-override fallback state is fresh for each subagent call. The active model is shown consistently in status and `/model`.
+
+Managed fallback attempts buffer provisional streamed output until an attempt is accepted, so output can appear later than it does for a one-model stream. Current Cursor-agent transports are fail-closed unavailable in retryable fallback chains: resolution rejects them with `Cursor model <selector> requires provider-side tool execution and cannot be used in a retryable fallback chain` because they do not provide a client-side tool-call mode.
+
+Cancellation discards provisional output and emits exactly one cancelled `agent_end`; RPC, ACP, and the TUI therefore settle once. On load, the source-aware one-shot migration reads legacy `retry.fallbackChains`, prepends the effective role chain, and writes the ordered, deduplicated result to the corresponding role array; the legacy key is then ignored.
 
 Built-in profiles are grouped by provider mix and tier:
 

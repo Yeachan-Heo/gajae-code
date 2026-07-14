@@ -34,6 +34,7 @@ function makeEmptyContext(): SessionContext {
 		thinkingLevel: "off",
 		serviceTier: undefined,
 		models: {},
+		configuredModelChains: {},
 		injectedTtsrRules: [],
 		selectedMCPToolNames: [],
 		hasPersistedMCPToolSelection: false,

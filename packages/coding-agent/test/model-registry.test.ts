@@ -2710,6 +2710,28 @@ describe("ModelRegistry", () => {
 		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("proxy/executor-selector");
 	});
 
+	test("applies full fallback chains from model bindings", async () => {
+		await Settings.init({ inMemory: true });
+		writeRawModelsConfig({
+			modelBindings: {
+				modelRoles: { default: ["proxy/primary", "proxy/fallback"] },
+				agentModelOverrides: { executor: ["proxy/executor", "proxy/executor-fallback"] },
+			},
+			providers: {
+				proxy: providerConfig("https://proxy.example/v1", [{ id: "primary" }], "openai-completions"),
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.applyConfiguredModelBindings(Settings.instance);
+
+		expect(Settings.instance.get("modelRoles").default).toEqual(["proxy/primary", "proxy/fallback"]);
+		expect(Settings.instance.get("task.agentModelOverrides").executor).toEqual([
+			"proxy/executor",
+			"proxy/executor-fallback",
+		]);
+	});
+
 	test("defers model bindings until settings are initialized", () => {
 		writeRawModelsConfig({
 			modelBindings: {

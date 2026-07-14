@@ -326,7 +326,7 @@ export class ExtensionUiController {
 			setModel: async model => {
 				const key = await this.ctx.session.modelRegistry.getApiKey(model);
 				if (!key) return false;
-				await this.ctx.session.setModel(model);
+				await this.ctx.session.setModel(model, "default", { cause: "user-selection" });
 				return true;
 			},
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
@@ -616,7 +616,7 @@ export class ExtensionUiController {
 			setModel: async model => {
 				const key = await this.ctx.session.modelRegistry.getApiKey(model);
 				if (!key) return false;
-				await this.ctx.session.setModel(model);
+				await this.ctx.session.setModel(model, "default", { cause: "user-selection" });
 				return true;
 			},
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,

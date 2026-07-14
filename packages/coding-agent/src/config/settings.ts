@@ -32,6 +32,7 @@ import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset }
 import { AgentStorage } from "../session/agent-storage";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import { withFileLock } from "./file-lock";
+import { isModelSelectorValue, type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import {
 	type BashInterceptorRule,
 	type GroupPrefix,
@@ -62,12 +63,13 @@ type SettingsPatch = {
 	readonly modelRole?: string;
 	readonly modelRoleRevision?: number;
 	readonly configVersion?: string;
+	readonly legacyFallbackMigration?: boolean;
 };
 
 export interface GlobalDefaultModelRoleCommit {
-	readonly previousDefault: string | undefined;
+	readonly previousDefault: ModelSelectorValue | undefined;
 	readonly previousModelRolesExisted: boolean;
-	readonly committedDefault: string | undefined;
+	readonly committedDefault: ModelSelectorValue | undefined;
 	readonly committedConfigVersion?: string;
 	readonly defaultRevision: number;
 }
@@ -117,6 +119,40 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 	current[segments[segments.length - 1]] = value;
 }
 
+/** Delete a nested value and prune now-empty objects. */
+function deleteByPath(obj: RawSettings, segments: string[]): void {
+	const parents: RawSettings[] = [];
+	let current: RawSettings = obj;
+	for (let i = 0; i < segments.length - 1; i++) {
+		const next = current[segments[i]];
+		if (!next || typeof next !== "object" || Array.isArray(next)) return;
+		parents.push(current);
+		current = next as RawSettings;
+	}
+	delete current[segments[segments.length - 1]];
+	for (let i = parents.length - 1; i >= 0; i--) {
+		const child = parents[i][segments[i]];
+		if (child && typeof child === "object" && !Array.isArray(child) && Object.keys(child).length === 0) {
+			delete parents[i][segments[i]];
+		}
+	}
+}
+
+function legacyFallbackChains(value: unknown): Record<string, unknown> {
+	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function hasOwnModelRole(source: RawSettings, role: string): boolean {
+	const roles = getByPath(source, ["modelRoles"]);
+	return !!roles && typeof roles === "object" && !Array.isArray(roles) && Object.hasOwn(roles, role);
+}
+
+function selectorChain(value: unknown): string[] {
+	if (typeof value === "string") return normalizeModelSelectorValue(value);
+	if (!Array.isArray(value) || !value.every(item => typeof item === "string")) return [];
+	return normalizeModelSelectorValue(value);
+}
+
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
@@ -160,15 +196,13 @@ function rawSettingsRecord(value: unknown): RawSettings | undefined {
 	return value as RawSettings;
 }
 
-function shallowStringRecord(value: unknown): Record<string, string> {
+function shallowModelSelectorRecord(value: unknown): Record<string, ModelSelectorValue> {
 	const record = rawSettingsRecord(value);
 	if (!record) return {};
 
-	const result: Record<string, string> = {};
+	const result: Record<string, ModelSelectorValue> = {};
 	for (const [key, item] of Object.entries(record)) {
-		if (typeof item === "string") {
-			result[key] = item;
-		}
+		if (isModelSelectorValue(item)) result[key] = Array.isArray(item) ? [...item] : item;
 	}
 	return result;
 }
@@ -227,15 +261,15 @@ function readConfigVersion(filePath: string): string | undefined {
 	}
 }
 
-function defaultModelRoleFrom(raw: RawSettings): string | undefined {
+function defaultModelRoleFrom(raw: RawSettings): ModelSelectorValue | undefined {
 	const value = rawSettingsRecord(raw.modelRoles)?.default;
-	return typeof value === "string" ? value : undefined;
+	return isModelSelectorValue(value) ? (Array.isArray(value) ? [...value] : value) : undefined;
 }
 
 function setRawModelRole(
 	raw: RawSettings,
 	role: string,
-	modelId: string | undefined,
+	modelId: ModelSelectorValue | undefined,
 	removeContainerWhenEmpty = false,
 ): void {
 	const roles = { ...rawSettingsRecord(raw.modelRoles) };
@@ -254,7 +288,7 @@ function setRawModelRole(
 function updateModelRolesPatch(
 	patch: SettingsPatch,
 	role: string,
-	modelId: string | undefined,
+	modelId: ModelSelectorValue | undefined,
 	removeContainerWhenEmpty = false,
 ): SettingsPatch {
 	const raw: RawSettings = { modelRoles: structuredClone(patch.value) };
@@ -268,7 +302,11 @@ function settingsPatchKey(patch: SettingsPatch): string {
 
 function applySettingsPatch(raw: RawSettings, patch: SettingsPatch): void {
 	if (patch.modelRole) {
-		setRawModelRole(raw, patch.modelRole, patch.value as string | undefined);
+		setRawModelRole(raw, patch.modelRole, patch.value as ModelSelectorValue | undefined);
+		return;
+	}
+	if (patch.value === undefined) {
+		deleteByPath(raw, patch.path.split("."));
 		return;
 	}
 	setByPath(raw, patch.path.split("."), patch.value);
@@ -301,6 +339,10 @@ export class Settings {
 	#saveTimer?: NodeJS.Timeout;
 	#saveTail: Promise<void> = Promise.resolve();
 	#globalModelRoleTail: Promise<void> = Promise.resolve();
+
+	/** Legacy fallback migration warnings emitted once per settings instance. */
+	#legacyFallbackMigrationWarnings = 0;
+	#legacyFallbackMigrationGlobalFingerprint: string | undefined;
 
 	/** Whether to persist changes */
 	#persist: boolean;
@@ -501,8 +543,7 @@ export class Settings {
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#overrides = structuredClone(this.#overrides);
-		cloned.#rebuildMerged();
-		cloned.#fireAllHooks();
+		await cloned.#normalizeAfterLoad();
 		return cloned;
 	}
 
@@ -588,7 +629,7 @@ export class Settings {
 		this.setGlobalModelRole(role, modelId);
 
 		if (updateRuntimeOverride) {
-			this.override("modelRoles", { ...shallowStringRecord(runtimeOverrides), [role]: modelId });
+			this.override("modelRoles", { ...shallowModelSelectorRecord(runtimeOverrides), [role]: modelId });
 		}
 	}
 
@@ -739,7 +780,7 @@ export class Settings {
 
 	#setGlobalModelRoleInMemory(
 		role: string,
-		modelId: string | undefined,
+		modelId: ModelSelectorValue | undefined,
 		removeContainerWhenEmpty: boolean,
 		updatePendingPatch = false,
 	): void {
@@ -785,7 +826,7 @@ export class Settings {
 	 * session, but only the explicit agent change should be persisted.
 	 */
 	setAgentModelOverride(agentName: string, modelId: string): void {
-		const current = shallowStringRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
+		const current = shallowModelSelectorRecord(getByPath(this.#global, ["task", "agentModelOverrides"]));
 		const runtimeOverrides = getByPath(this.#overrides, ["task", "agentModelOverrides"]);
 		const updateRuntimeOverride =
 			!!runtimeOverrides && typeof runtimeOverrides === "object" && !Array.isArray(runtimeOverrides);
@@ -794,7 +835,7 @@ export class Settings {
 
 		if (updateRuntimeOverride) {
 			this.override("task.agentModelOverrides", {
-				...shallowStringRecord(runtimeOverrides),
+				...shallowModelSelectorRecord(runtimeOverrides),
 				[agentName]: modelId,
 			});
 		}
@@ -803,7 +844,7 @@ export class Settings {
 	/**
 	 * Get a model role (helper for modelRoles record).
 	 */
-	getModelRole(role: ModelRole | string): string | undefined {
+	getModelRole(role: ModelRole | string): ModelSelectorValue | undefined {
 		const roles = this.get("modelRoles");
 		return roles[role];
 	}
@@ -811,15 +852,15 @@ export class Settings {
 	/**
 	 * Get all model roles (helper for modelRoles record).
 	 */
-	getModelRoles(): ReadOnlyDict<string> {
+	getModelRoles(): Readonly<Record<string, ModelSelectorValue>> {
 		return { ...this.get("modelRoles") };
 	}
 
 	/*
 	 * Override model roles (helper for modelRoles record).
 	 */
-	overrideModelRoles(roles: ReadOnlyDict<string>): void {
-		const next = shallowStringRecord(getByPath(this.#overrides, ["modelRoles"]));
+	overrideModelRoles(roles: Readonly<Record<string, ModelSelectorValue>>): void {
+		const next = shallowModelSelectorRecord(getByPath(this.#overrides, ["modelRoles"]));
 		for (const [role, modelId] of Object.entries(roles)) {
 			if (modelId) {
 				next[role] = modelId;
@@ -858,10 +899,52 @@ export class Settings {
 
 		this.#project = await projectPromise;
 
-		// Build merged view (global → project → overrides; project wins over global)
-		this.#rebuildMerged();
-		this.#fireAllHooks();
+		await this.#normalizeAfterLoad();
 		return this;
+	}
+
+	async #normalizeAfterLoad(): Promise<void> {
+		this.#sanitizeModelSelectorRecords();
+		this.#rebuildMerged();
+		this.#legacyFallbackMigrationGlobalFingerprint = YAML.stringify(this.#global, null, 2);
+		this.#migrateRetryFallbackChains();
+		// The migration recheck is only meaningful for migration-originated
+		// writes; when migration touched nothing global, ordinary saves must
+		// not run the conflict branch.
+		if (!this.#modified.has("modelRoles") && ![...this.#modified.keys()].some(p => p.startsWith("retry.fallback"))) {
+			this.#legacyFallbackMigrationGlobalFingerprint = undefined;
+		}
+		await this.flush();
+		this.#fireAllHooks();
+	}
+
+	/**
+	 * Drop malformed selector-record values (objects, empty arrays, blank
+	 * members) from every source so runtime consumers see only values the
+	 * published JSON schema accepts.
+	 */
+	#sanitizeModelSelectorRecords(): void {
+		for (const source of [this.#global, this.#project, this.#overrides]) {
+			for (const pathSegments of [["modelRoles"], ["task", "agentModelOverrides"]]) {
+				const raw = getByPath(source, pathSegments);
+				if (raw === undefined) continue;
+				if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+					logger.warn("Settings: replaced malformed model selector record", {
+						path: pathSegments.join("."),
+					});
+					setByPath(source, pathSegments, {});
+					continue;
+				}
+				const sanitized = shallowModelSelectorRecord(raw);
+				if (Object.keys(sanitized).length !== Object.keys(raw).length) {
+					logger.warn("Settings: dropped invalid model selector values", {
+						path: pathSegments.join("."),
+						dropped: Object.keys(raw).filter(key => !(key in sanitized)),
+					});
+				}
+				setByPath(source, pathSegments, sanitized);
+			}
+		}
 	}
 
 	async #loadYaml(filePath: string): Promise<RawSettings> {
@@ -892,6 +975,105 @@ export class Settings {
 		} catch {
 			return {};
 		}
+	}
+
+	/** Convert retry.fallbackChains after global/project/override precedence is known. */
+	#migrateRetryFallbackChains(): void {
+		const globalChains = legacyFallbackChains(getByPath(this.#global, ["retry", "fallbackChains"]));
+		const projectChains = legacyFallbackChains(getByPath(this.#project, ["retry", "fallbackChains"]));
+		const overrideChains = legacyFallbackChains(getByPath(this.#overrides, ["retry", "fallbackChains"]));
+		const roles = new Set([
+			...Object.keys(globalChains),
+			...Object.keys(projectChains),
+			...Object.keys(overrideChains),
+		]);
+		const retainedGlobalChains: Record<string, unknown> = {};
+
+		const effectiveRoles = shallowModelSelectorRecord(getByPath(this.#merged, ["modelRoles"]));
+		for (const role of roles) {
+			const source = Object.hasOwn(overrideChains, role)
+				? "override"
+				: Object.hasOwn(projectChains, role)
+					? "project"
+					: "global";
+			const tailValue =
+				source === "override"
+					? overrideChains[role]
+					: source === "project"
+						? projectChains[role]
+						: globalChains[role];
+			const primary = selectorChain(effectiveRoles[role]);
+			const tail = selectorChain(tailValue);
+			const chain = [...new Set([...primary, ...tail])];
+
+			if (primary.length === 0 || tail.length === 0) {
+				this.#warnLegacyFallbackMigration(
+					`retry.fallbackChains.${role} could not be migrated because it lacks a valid primary selector or tail.`,
+				);
+				continue;
+			}
+
+			const target =
+				source === "override" || hasOwnModelRole(this.#overrides, role)
+					? this.#overrides
+					: source === "project" || hasOwnModelRole(this.#project, role)
+						? this.#project
+						: this.#global;
+			const targetRoles = shallowModelSelectorRecord(getByPath(target, ["modelRoles"]));
+			setByPath(target, ["modelRoles"], { ...targetRoles, [role]: chain });
+			if (target === this.#global) {
+				this.#recordLegacyFallbackMigrationPatch("modelRoles", getByPath(this.#global, ["modelRoles"]));
+			}
+			if (target !== this.#global && Object.hasOwn(globalChains, role))
+				retainedGlobalChains[role] = globalChains[role];
+			if (source === "project") {
+				this.#warnLegacyFallbackMigration(
+					`retry.fallbackChains.${role} is project-owned and was migrated in memory only.`,
+				);
+			}
+		}
+
+		for (const source of [this.#project, this.#overrides]) {
+			deleteByPath(source, ["retry", "fallbackChains"]);
+			deleteByPath(source, ["retry", "fallbackRevertPolicy"]);
+		}
+
+		if (Object.keys(retainedGlobalChains).length > 0) {
+			setByPath(this.#global, ["retry", "fallbackChains"], retainedGlobalChains);
+			this.#recordLegacyFallbackMigrationPatch("retry.fallbackChains", retainedGlobalChains);
+		} else if (getByPath(this.#global, ["retry", "fallbackChains"]) !== undefined) {
+			deleteByPath(this.#global, ["retry", "fallbackChains"]);
+			this.#recordLegacyFallbackMigrationPatch("retry.fallbackChains", undefined);
+		}
+		if (
+			Object.keys(retainedGlobalChains).length === 0 &&
+			getByPath(this.#global, ["retry", "fallbackRevertPolicy"]) !== undefined
+		) {
+			deleteByPath(this.#global, ["retry", "fallbackRevertPolicy"]);
+			this.#recordLegacyFallbackMigrationPatch("retry.fallbackRevertPolicy", undefined);
+		}
+		this.#rebuildMerged();
+	}
+
+	#recordLegacyFallbackMigrationPatch(path: string, value: unknown): void {
+		const existing = this.#modified.get(path);
+		if (existing && !existing.legacyFallbackMigration) {
+			this.#modified.set(path, { ...existing, value: structuredClone(value) });
+			return;
+		}
+		this.#modified.set(path, {
+			path,
+			value: structuredClone(value),
+			generation: ++this.#nextGeneration,
+			configVersion: this.#defaultModelRoleOwnership.configVersion,
+			legacyFallbackMigration: true,
+		});
+	}
+
+	#warnLegacyFallbackMigration(message: string): void {
+		if (this.#legacyFallbackMigrationWarnings >= 10) return;
+		this.#legacyFallbackMigrationWarnings++;
+		logger.warn(`Settings: ${message}`);
 	}
 
 	async #migrateFromLegacy(): Promise<void> {
@@ -1148,7 +1330,7 @@ export class Settings {
 		if (patch.modelRole === "default") return false;
 
 		const durableDefault = defaultModelRoleFrom(raw);
-		const roles = shallowStringRecord(patch.value);
+		const roles = shallowModelSelectorRecord(patch.value);
 		if (durableDefault === undefined) delete roles.default;
 		else roles.default = durableDefault;
 		setByPath(raw, ["modelRoles"], roles);
@@ -1159,16 +1341,37 @@ export class Settings {
 		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
 
 		const configPath = this.#configPath;
-		const patches = this.#pendingPatchesInGenerationOrder();
+		let patches = this.#pendingPatchesInGenerationOrder();
 		let durableBeforeWrite: RawSettings | undefined;
 		let durableVersionBeforeWrite: string | undefined;
 
 		const save = this.#saveTail.then(() =>
 			withFileLock(configPath, async () => {
+				const migrationFingerprint = this.#legacyFallbackMigrationGlobalFingerprint;
+				this.#legacyFallbackMigrationGlobalFingerprint = undefined;
 				const current = await this.#loadYaml(configPath);
 				const currentConfigVersion = readConfigVersion(configPath);
 				durableBeforeWrite = structuredClone(current);
 				durableVersionBeforeWrite = currentConfigVersion;
+
+				if (migrationFingerprint !== undefined && YAML.stringify(current, null, 2) !== migrationFingerprint) {
+					this.#global = current;
+					this.#rebuildMerged();
+					if (getByPath(current, ["retry", "fallbackChains"]) !== undefined) {
+						this.#defaultModelRoleOwnership.configVersion = currentConfigVersion;
+						this.#defaultModelRoleOwnership.defaultLineageKnown = false;
+						this.#migrateRetryFallbackChains();
+						patches = this.#pendingPatchesInGenerationOrder();
+					} else {
+						for (const patch of patches) {
+							if (!patch.legacyFallbackMigration) continue;
+							const key = settingsPatchKey(patch);
+							if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
+						}
+						patches = patches.filter(patch => !patch.legacyFallbackMigration);
+					}
+				}
+
 				const externalLineageBreak = currentConfigVersion !== this.#defaultModelRoleOwnership.configVersion;
 				const applicablePatches = patches.filter(
 					patch =>

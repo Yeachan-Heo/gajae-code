@@ -1114,8 +1114,20 @@
 						"type": "string"
 					},
 					"additionalProperties": {
-						"type": "string",
-						"minLength": 1
+						"anyOf": [
+							{
+								"type": "string",
+								"minLength": 1
+							},
+							{
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
+							}
+						]
 					}
 				},
 				"agentModelOverrides": {
@@ -1124,8 +1136,20 @@
 						"type": "string"
 					},
 					"additionalProperties": {
-						"type": "string",
-						"minLength": 1
+						"anyOf": [
+							{
+								"type": "string",
+								"minLength": 1
+							},
+							{
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
+							}
+						]
 					}
 				}
 			},
@@ -1188,8 +1212,22 @@
 							]
 						},
 						"additionalProperties": {
-							"type": "string",
-							"minLength": 1
+							"anyOf": [
+								{
+									"type": "string",
+									"minLength": 1,
+									"pattern": "^[^,/]+\\/[^,:]+(?::(?:minimal|low|medium|high|xhigh|max))?$"
+								},
+								{
+									"minItems": 1,
+									"type": "array",
+									"items": {
+										"type": "string",
+										"minLength": 1,
+										"pattern": "^[^,/]+\\/[^,:]+(?::(?:minimal|low|medium|high|xhigh|max))?$"
+									}
+								}
+							]
 						}
 					}
 				},

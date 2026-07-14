@@ -62,7 +62,7 @@ import {
 	scheduleLaunchStarReminderAfterFirstRender,
 	starReminderLaunchGate,
 } from "../reminders/star-reminder";
-import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent, TemporaryProviderSessionScope } from "../session/agent-session";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions } from "../session/session-manager";
@@ -407,6 +407,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#goalSuppressNextContinuation = false;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
+	#planModeProviderSessionScope: TemporaryProviderSessionScope | undefined;
 	#planModeHasEntered = false;
 	#planReviewContainer: Container | undefined;
 	readonly lspServers: LspStartupServerInfo[] | undefined = undefined;
@@ -1353,8 +1354,18 @@ export class InteractiveMode implements InteractiveModeContext {
 				return;
 			}
 			try {
-				await this.session.setModelTemporary(resolved.model, planThinkingLevel);
+				this.#planModeProviderSessionScope = this.session.beginTemporaryProviderSessionScope("plan-mode");
+				await this.session.setModelTemporary(resolved.model, planThinkingLevel, {
+					cause: "temporary-operation",
+					reason: "plan-mode",
+					providerSessionScope: this.#planModeProviderSessionScope,
+				});
 			} catch (error) {
+				const scope = this.#planModeProviderSessionScope;
+				if (scope) {
+					this.session.restoreTemporaryProviderSessionScope(scope);
+					this.#planModeProviderSessionScope = undefined;
+				}
 				this.showWarning(
 					`Failed to switch to plan model for plan mode: ${error instanceof Error ? error.message : String(error)}`,
 				);
@@ -1370,8 +1381,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!pending) return;
 		this.#pendingModelSwitch = undefined;
 		try {
-			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
+			this.#planModeProviderSessionScope ??= this.session.beginTemporaryProviderSessionScope("plan-mode");
+			await this.session.setModelTemporary(pending.model, pending.thinkingLevel, {
+				cause: "temporary-operation",
+				reason: "plan-mode",
+				providerSessionScope: this.#planModeProviderSessionScope,
+			});
 		} catch (error) {
+			const scope = this.#planModeProviderSessionScope;
+			if (scope) {
+				this.session.restoreTemporaryProviderSessionScope(scope);
+				this.#planModeProviderSessionScope = undefined;
+			}
 			this.showWarning(
 				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
 			);
@@ -1528,30 +1549,34 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (previousTools && previousTools.length > 0) {
 			await this.session.setActiveToolsByName(previousTools);
 		}
-		if (this.#planModePreviousModelState) {
+		const scope = this.#planModeProviderSessionScope;
+		if (scope && !this.session.isStreaming) {
+			const restored = this.session.restoreTemporaryProviderSessionScope(scope);
+			if (restored) this.#planModeProviderSessionScope = undefined;
+		} else if (this.#planModePreviousModelState) {
 			const prev = this.#planModePreviousModelState;
 			if (modelsAreEqual(this.session.model, prev.model)) {
-				// Same model — only thinking level may differ. Avoid setModelTemporary()
-				// which would reset provider-side sessions (openai-responses/OpenAI code backend) and
-				// break conversation continuity.
 				this.session.setThinkingLevel(prev.thinkingLevel);
 			} else if (this.session.isStreaming) {
 				this.#pendingModelSwitch = { model: prev.model, thinkingLevel: prev.thinkingLevel };
 			} else {
-				await this.session.setModelTemporary(prev.model, prev.thinkingLevel);
+				await this.session.setModelTemporary(prev.model, prev.thinkingLevel, {
+					cause: "restore",
+					reason: "plan-mode",
+				});
 			}
-			// If #applyPlanModeModel queued a deferred switch to the plan-role model
-			// (because the session was streaming on entry), drop it now: we are
-			// leaving plan mode, so flushing it on the next agent_end would land the
-			// session on the plan-role model after the user has exited plan mode
-			// (issue #816). Only clear when the pending target matches the plan-role
-			// model — leave any unrelated user-queued switch intact.
-			const pending = this.#pendingModelSwitch;
-			if (pending) {
-				const planResolution = this.session.resolveRoleModelWithThinking("plan");
-				if (planResolution.model && modelsAreEqual(pending.model, planResolution.model)) {
-					this.#pendingModelSwitch = undefined;
-				}
+		}
+		// If #applyPlanModeModel queued a deferred switch to the plan-role model
+		// (because the session was streaming on entry), drop it now: we are
+		// leaving plan mode, so flushing it on the next agent_end would land the
+		// session on the plan-role model after the user has exited plan mode
+		// (issue #816). Only clear when the pending target matches the plan-role
+		// model — leave any unrelated user-queued switch intact.
+		const pending = this.#pendingModelSwitch;
+		if (pending) {
+			const planResolution = this.session.resolveRoleModelWithThinking("plan");
+			if (planResolution.model && modelsAreEqual(pending.model, planResolution.model)) {
+				this.#pendingModelSwitch = undefined;
 			}
 		}
 		this.session.setStandingResolveHandler?.(null);

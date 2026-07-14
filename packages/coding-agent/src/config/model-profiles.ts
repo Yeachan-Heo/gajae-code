@@ -1,5 +1,6 @@
 import { sanitizeText } from "@gajae-code/utils";
 import type { GjcModelAssignmentTargetId } from "./model-registry";
+import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { ModelsConfig } from "./models-config-schema";
 
 export type ModelProfileRole = GjcModelAssignmentTargetId;
@@ -18,14 +19,14 @@ export interface ModelProfileDefinition {
 	 * means any single xiaomi credential satisfies the group.
 	 */
 	alternativeProviderGroups?: readonly (readonly string[])[];
-	modelMapping: Partial<Record<ModelProfileRole, string>>;
+	modelMapping: Partial<Record<ModelProfileRole, ModelSelectorValue>>;
 	source: "builtin" | "user";
 }
 
 export interface ResolvedProfileBinding {
-	defaultSelector?: string;
-	modelRoles: Record<string, string>;
-	agentModelOverrides: Partial<Record<Exclude<ModelProfileRole, "default">, string>>;
+	defaultSelector?: ModelSelectorValue;
+	modelRoles: Record<string, ModelSelectorValue>;
+	agentModelOverrides: Partial<Record<Exclude<ModelProfileRole, "default">, ModelSelectorValue>>;
 }
 
 function parseModelSelectorProvider(selector: string): string | undefined {
@@ -36,29 +37,31 @@ function parseModelSelectorProvider(selector: string): string | undefined {
 
 export function deriveModelProfileMappedProviders(definition: Pick<ModelProfileDefinition, "modelMapping">): string[] {
 	const providers = new Set<string>();
-	for (const selector of Object.values(definition.modelMapping)) {
-		if (!selector) continue;
-		const provider = parseModelSelectorProvider(selector);
-		if (provider) providers.add(provider);
+	for (const selectorValue of Object.values(definition.modelMapping)) {
+		for (const selector of normalizeModelSelectorValue(selectorValue)) {
+			const provider = parseModelSelectorProvider(selector);
+			if (provider) providers.add(provider);
+		}
 	}
 	return [...providers].sort((a, b) => a.localeCompare(b));
 }
 
+/**
+ * Return the providers explicitly declared as hard prerequisites.
+ * Model mappings may reference fallback providers, but those references are
+ * resolution-time candidates rather than activation requirements.
+ */
 export function aggregateModelProfileRequiredProviders(
 	requiredProviders: readonly string[],
-	definition: Pick<ModelProfileDefinition, "modelMapping">,
+	_definition: Pick<ModelProfileDefinition, "modelMapping">,
 ): string[] {
-	const providers = new Set(requiredProviders);
-	for (const provider of deriveModelProfileMappedProviders(definition)) {
-		providers.add(provider);
-	}
-	return [...providers];
+	return [...new Set(requiredProviders)];
 }
 
 const profile = (
 	name: string,
 	requiredProviders: string[],
-	modelMapping: Partial<Record<ModelProfileRole, string>>,
+	modelMapping: Partial<Record<ModelProfileRole, ModelSelectorValue>>,
 	alternativeProviderGroups?: readonly (readonly string[])[],
 ): ModelProfileDefinition => ({
 	name,

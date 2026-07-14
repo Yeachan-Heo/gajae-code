@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type AgentMessage, canContinuePersistedHistory } from "@gajae-code/agent-core";
+import type { ConfiguredModelChainEntry as SharedConfiguredModelChainEntry } from "@gajae-code/agent-core/compaction";
 import type {
 	ImageContent,
 	Message,
@@ -221,6 +222,14 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	thinkingLevel?: string | null;
 }
 
+/** Persisted configured fallback chain for one model role. */
+export type ConfiguredModelChainEntry = SharedConfiguredModelChainEntry;
+
+export type ConfiguredModelChain = Pick<
+	ConfiguredModelChainEntry,
+	"role" | "entries" | "origin" | "identity" | "explicitHead" | "cleared"
+>;
+
 export interface ServiceTierChangeEntry extends SessionEntryBase {
 	type: "service_tier_change";
 	serviceTier: ServiceTier | null;
@@ -353,7 +362,8 @@ export type SessionEntry =
 	| TtsrInjectionEntry
 	| MCPToolSelectionEntry
 	| SessionInitEntry
-	| ModeChangeEntry;
+	| ModeChangeEntry
+	| ConfiguredModelChainEntry;
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
@@ -391,6 +401,9 @@ export interface SessionContext {
 	serviceTier?: ServiceTier;
 	/** Model roles: { default: "provider/modelId", small: "provider/modelId", ... } */
 	models: Record<string, string>;
+	/** Configured fallback chains for model roles on the active branch. */
+	configuredModelChains: Record<string, ConfiguredModelChain>;
+
 	/** Names of TTSR rules that have been injected this session */
 	injectedTtsrRules: string[];
 	/** Rich TTSR rule injection records for repeat resume. */
@@ -777,6 +790,31 @@ export function parseSessionEntries(content: string): FileEntry[] {
 	return parseJsonlLenient<FileEntry>(content);
 }
 
+function normalizeConfiguredModelChainEntry(entry: unknown): ConfiguredModelChain | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
+	const candidate = entry as Partial<ConfiguredModelChainEntry>;
+	if (typeof candidate.role !== "string" || candidate.role.length === 0) return undefined;
+	if (candidate.cleared === true) {
+		return {
+			role: candidate.role,
+			entries: [],
+			origin: typeof candidate.origin === "string" ? candidate.origin : "session",
+			explicitHead: candidate.explicitHead === true,
+			cleared: true,
+		};
+	}
+	if (!Array.isArray(candidate.entries)) return undefined;
+	const entries = candidate.entries.filter((model): model is string => typeof model === "string" && model.length > 0);
+	if (entries.length === 0) return undefined;
+	return {
+		role: candidate.role,
+		entries,
+		origin: typeof candidate.origin === "string" ? candidate.origin : "session",
+		...(typeof candidate.identity === "string" ? { identity: candidate.identity } : {}),
+		explicitHead: candidate.explicitHead === true,
+	};
+}
+
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		if (entries[i].type === "compaction") {
@@ -814,6 +852,8 @@ export function buildSessionContext(
 			thinkingLevel: "off",
 			serviceTier: undefined,
 			models: {},
+			configuredModelChains: {},
+
 			injectedTtsrRules: [],
 			injectedTtsrRuleRecords: [],
 			ttsrMessageCount: 0,
@@ -837,6 +877,8 @@ export function buildSessionContext(
 			thinkingLevel: "off",
 			serviceTier: undefined,
 			models: {},
+			configuredModelChains: {},
+
 			injectedTtsrRules: [],
 			injectedTtsrRuleRecords: [],
 			ttsrMessageCount: 0,
@@ -862,6 +904,8 @@ export function buildSessionContext(
 	let thinkingLevel: string | undefined = "off";
 	let serviceTier: ServiceTier | undefined;
 	const models: Record<string, string> = {};
+	const configuredModelChains: Record<string, ConfiguredModelChain> = {};
+
 	let compaction: CompactionEntry | null = null;
 	const injectedTtsrRulesSet = new Set<string>();
 	const injectedTtsrRuleRecords = new Map<string, TtsrInjectionRecord>();
@@ -891,6 +935,13 @@ export function buildSessionContext(
 				if (role === "default") {
 					hasExplicitDefaultModel = true;
 				}
+			}
+		} else if (entry.type === "configured_model_chain") {
+			const configuredChain = normalizeConfiguredModelChainEntry(entry);
+			if (configuredChain?.cleared) {
+				delete configuredModelChains[configuredChain.role];
+			} else if (configuredChain) {
+				configuredModelChains[configuredChain.role] = configuredChain;
 			}
 		} else if (entry.type === "service_tier_change") {
 			serviceTier = entry.serviceTier ?? undefined;
@@ -930,6 +981,16 @@ export function buildSessionContext(
 	}
 
 	const injectedTtsrRules = Array.from(injectedTtsrRulesSet);
+	for (const [role, model] of Object.entries(models)) {
+		if (role in configuredModelChains) continue;
+		configuredModelChains[role] = {
+			role,
+			entries: [model],
+			origin: "legacy_session",
+			explicitHead: true,
+		};
+	}
+
 	const injectedTtsrRuleRecordsArray = Array.from(injectedTtsrRuleRecords.values());
 
 	// Build messages and collect corresponding entries
@@ -1029,6 +1090,8 @@ export function buildSessionContext(
 		thinkingLevel,
 		serviceTier,
 		models,
+		configuredModelChains,
+
 		injectedTtsrRules,
 		injectedTtsrRuleRecords: injectedTtsrRuleRecordsArray,
 		ttsrMessageCount,
@@ -1047,6 +1110,13 @@ function cloneSessionContext(context: SessionContext): SessionContext {
 		...context,
 		messages,
 		models: { ...context.models },
+		configuredModelChains: Object.fromEntries(
+			Object.entries(context.configuredModelChains ?? {}).map(([role, chain]) => [
+				role,
+				{ ...chain, entries: [...chain.entries] },
+			]),
+		),
+
 		injectedTtsrRules: [...context.injectedTtsrRules],
 		injectedTtsrRuleRecords: context.injectedTtsrRuleRecords?.map(record => ({ ...record })),
 		ttsrMessageCount: context.ttsrMessageCount,
@@ -1251,6 +1321,9 @@ function hasStrictSessionSchema(entries: FileEntry[]): boolean {
 					!(typeof value.provider === "string" && typeof value.modelId === "string")
 				)
 					return false;
+				break;
+			case "configured_model_chain":
+				if (!normalizeConfiguredModelChainEntry(value)) return false;
 				break;
 			case "compaction":
 				if (
@@ -4572,6 +4645,24 @@ export class SessionManager {
 				this.#usageStatistics.cost += usage.cost.total;
 			}
 		}
+	}
+
+	/** Append a configured fallback chain as child of current leaf, then advance leaf. Returns entry id. */
+	appendConfiguredModelChain(chain: ConfiguredModelChain): string {
+		const entry: ConfiguredModelChainEntry = {
+			type: "configured_model_chain",
+			id: generateId(this.#byId),
+			parentId: this.#leafId,
+			timestamp: new Date().toISOString(),
+			role: chain.role,
+			entries: [...chain.entries],
+			origin: chain.origin,
+			identity: chain.identity,
+			explicitHead: chain.explicitHead,
+			cleared: chain.cleared,
+		};
+		this.#appendEntry(entry);
+		return entry.id;
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.

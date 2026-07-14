@@ -25,11 +25,73 @@ export type StreamFn = (
 	...args: Parameters<typeof streamSimple>
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
+/** Stable identifier for a managed logical run, shared by all of its retry attempts. */
+export type ManagedLogicalRunId = number;
+
+/** Terminal completion requested for a logical run. */
+export interface RunTerminalRequest {
+	stopReason: "cancelled" | "error" | "exhausted";
+	messages?: AgentMessage[];
+}
+
+/**
+ * Ownership token supplied when Agent invokes a retry continuation.
+ *
+ * A continuation MUST verify `isCurrent()` immediately before starting a
+ * follow-up invocation and abandon the retry when it returns false. The token
+ * becomes invalid when its originating run is force-aborted or superseded.
+ * Coding-agent retry continuations must accept this argument and must not call
+ * `agent.continue()` after ownership has been lost.
+ */
+export interface ManagedAttemptContinuationOwnership {
+	/** Per-attempt run-loop id; use only for attempt-local ownership checks. */
+	readonly runId: number;
+	/** Stable managed logical-run id; use for all terminal completion requests. */
+	readonly logicalRunId: ManagedLogicalRunId;
+	readonly generation: number;
+	isCurrent(): boolean;
+}
+
+/** Runs after a discarded attempt is idle, only while its ownership token remains current. */
+export type ManagedAttemptContinuation = (ownership: ManagedAttemptContinuationOwnership) => void | Promise<void>;
+
+/** Decision returned by managed fallback policy for one provisional attempt. */
+export type ManagedAttemptDecision =
+	| { type: "retry"; continuation: ManagedAttemptContinuation }
+	| { type: "terminal"; terminal: RunTerminalRequest };
+
+/** Structured result for one managed upstream invocation. */
+export type ManagedAttemptOutcome =
+	| {
+			type: "retryable_discarded";
+			failure: {
+				message: AssistantMessage;
+				/** Exact provider transport facts, including retry headers, for fallback policy. */
+				transportFailure?: import("@gajae-code/ai").TransportFailureFacts;
+			};
+	  }
+	| { type: "run_terminal"; reason: "cancelled" | "error" | "exhausted" };
+
+export type ManagedAttemptOutcomeHandler = (
+	outcome: ManagedAttemptOutcome,
+) => ManagedAttemptDecision | Promise<ManagedAttemptDecision>;
+
 /**
  * Configuration for the agent loop.
  */
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
+	/**
+	 * Supplies a fresh opaque token at each concrete managed transport invocation.
+	 * The callback runs at the stream boundary so controller accounting matches
+	 * upstream request count, including multi-step tool turns.
+	 */
+	nextFallbackAttempt?: (model: Model) => SimpleStreamOptions["fallbackAttempt"];
+	/** Called after a managed upstream request is accepted and committed. */
+	onManagedAttemptAccepted?: () => void | Promise<void>;
+
+	/** Receives a managed invocation outcome without publishing provisional lifecycle events. */
+	onManagedAttemptOutcome?: ManagedAttemptOutcomeHandler;
 
 	/**
 	 * When to interrupt tool execution for steering messages.
@@ -470,8 +532,8 @@ export type AgentEvent =
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
-			/** Indicates whether the loop ended normally or suspended at a pause checkpoint. */
-			stopReason?: "completed" | "paused";
+			/** Indicates whether the loop ended normally, suspended, or was cancelled. */
+			stopReason?: "completed" | "paused" | "cancelled";
 			/** Present iff `AgentTelemetryConfig` was supplied on this run. */
 			telemetry?: AgentRunSummary;
 			coverage?: AgentRunCoverage;

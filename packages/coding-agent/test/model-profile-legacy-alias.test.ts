@@ -51,6 +51,8 @@ interface TestSession {
 	setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel): Promise<void>;
 	setActiveModelProfile(name: string | undefined): void;
 	getActiveModelProfile(): string | undefined;
+	getConfiguredModelChain(role: string): readonly string[] | undefined;
+	setConfiguredModelChain(role: string, entries: readonly string[]): void;
 }
 
 function fakeRegistry(extraProfiles: ModelProfileDefinition[] = []) {
@@ -71,6 +73,8 @@ function fakeRegistry(extraProfiles: ModelProfileDefinition[] = []) {
 
 function fakeSession() {
 	let activeModelProfile: string | undefined;
+	const configuredModelChains = new Map<string, readonly string[]>();
+
 	const session: TestSession = {
 		model: codexModel,
 		thinkingLevel: ThinkingLevel.Low,
@@ -80,6 +84,12 @@ function fakeSession() {
 			session.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			session.model = next;
 			session.thinkingLevel = thinkingLevel;
+		},
+		getConfiguredModelChain(role: string) {
+			return configuredModelChains.get(role);
+		},
+		setConfiguredModelChain(role: string, entries: readonly string[]) {
+			configuredModelChains.set(role, [...entries]);
 		},
 		setActiveModelProfile(name: string | undefined) {
 			activeModelProfile = name;

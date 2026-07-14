@@ -59,6 +59,7 @@ function createControllerContext(
 
 	const profiles = new Map((options.profiles ?? [codexProfile, minimaxProfile]).map(entry => [entry.name, entry]));
 	let activeProfile = options.activeProfile;
+	let configuredDefaultChain: readonly string[] | undefined;
 	const session = {
 		model: undefined as Model | undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
@@ -69,6 +70,10 @@ function createControllerContext(
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
 			this.thinkingLevel = thinkingLevel;
+		},
+		getConfiguredModelChain: () => configuredDefaultChain,
+		setConfiguredModelChain(_role: string, chain: readonly string[]) {
+			configuredDefaultChain = chain;
 		},
 		setActiveModelProfile: vi.fn((name: string | undefined) => {
 			activeProfile = name;

@@ -30,14 +30,14 @@ const ACP_EMPTY_WHITELIST = new Set([
 	"message_start",
 	"auto_retry_start",
 	"auto_retry_end",
-	"retry_fallback_applied",
-	"retry_fallback_succeeded",
 	"ttsr_triggered",
 	"irc_message",
 	"notice",
 	"thinking_level_changed",
 	"goal_updated",
 ]);
+
+const ACP_NOTICE_EVENT_TYPES = ["model_fallback_switched"] as const;
 
 describe("agent-wire conformance matrix", () => {
 	it("fixture coverage equals AGENT_WIRE_EVENT_TYPES exactly", () => {
@@ -80,7 +80,12 @@ describe("agent-wire conformance matrix", () => {
 	});
 
 	it("ACP produces session updates for the non-whitelisted event types", () => {
-		for (const type of ["tool_execution_start", "tool_execution_end", "todo_reminder"] as const) {
+		for (const type of [
+			"tool_execution_start",
+			"tool_execution_end",
+			"todo_reminder",
+			...ACP_NOTICE_EVENT_TYPES,
+		] as const) {
 			const acp = mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(EVENT_FIXTURES[type]), "sess");
 			expect(acp.length).toBeGreaterThan(0);
 		}

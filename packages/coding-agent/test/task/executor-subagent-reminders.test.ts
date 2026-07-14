@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
 import { type AssistantMessage, Effort, type Model } from "@gajae-code/ai";
+import { kNoAuth } from "../../src/config/model-registry";
+
 import { Settings } from "../../src/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import { AgentRegistry } from "../../src/registry/agent-registry";
@@ -61,6 +63,8 @@ function createMockSession(
 		},
 		getActiveToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},
+		setConfiguredModelChain: () => {},
+		seedDefaultFallbackResolution: () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {
@@ -113,7 +117,11 @@ describe("runSubprocess yield reminders", () => {
 		index: 0,
 		id: "subagent-1",
 		settings: Settings.isolated(),
-		modelRegistry: { refresh: async () => {} } as unknown as import("../../src/config/model-registry").ModelRegistry,
+		modelRegistry: {
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
+		} as unknown as import("../../src/config/model-registry").ModelRegistry,
 		enableLsp: false,
 	};
 
@@ -133,6 +141,72 @@ describe("runSubprocess yield reminders", () => {
 			},
 		};
 	}
+
+	const model = {
+		provider: "test",
+		id: "mock",
+		name: "Mock",
+		api: "openai-responses",
+		contextWindow: 1_000,
+		maxTokens: 1_000,
+	} as Model;
+	const modelRegistry = {
+		refresh: async () => {},
+		getAvailable: () => [model],
+		getApiKey: async () => kNoAuth,
+	} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+	it("forwards fallback switches to the parent event bus", async () => {
+		const fallbackEvents: AgentSessionEvent[] = [];
+		const eventBus = new EventBus();
+		eventBus.on("task:subagent:event", payload => {
+			const event = (payload as { event: AgentSessionEvent }).event;
+			if (event.type === "model_fallback_switched") fallbackEvents.push(event);
+		});
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-1",
+				from: "primary/model",
+				to: "fallback/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 1,
+				chainLength: 2,
+				attemptsUsed: 3,
+			});
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fallback-forwarding",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-forwarding",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+
+		expect(fallbackEvents).toEqual([
+			expect.objectContaining({
+				type: "model_fallback_switched",
+				from: "primary/model",
+				to: "fallback/model",
+				role: "executor",
+				scope: "subagent",
+			}),
+		]);
+	});
 
 	it("waits for session_start extension user messages before prompting the subagent", async () => {
 		let extensionSendUserMessage: ExtensionActions["sendUserMessage"] | undefined;
@@ -205,6 +279,8 @@ describe("runSubprocess yield reminders", () => {
 		const createAgentSessionSpy = mockCreateAgentSession(session);
 		const modelRegistry = {
 			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
 		} as unknown as import("../../src/config/model-registry").ModelRegistry;
 		const refreshSpy = vi.spyOn(modelRegistry, "refresh");
 
@@ -497,6 +573,7 @@ describe("runSubprocess yield reminders", () => {
 		const modelRegistry = {
 			refresh: async () => {},
 			getAvailable: () => [{ provider: "openai", id: "gpt-4o", name: "GPT-4o" }],
+			getApiKey: async () => kNoAuth,
 		} as unknown as import("../../src/config/model-registry").ModelRegistry;
 
 		await runSubprocess({
@@ -516,6 +593,7 @@ describe("runSubprocess yield reminders", () => {
 		const modelRegistry = {
 			refresh: async () => {},
 			getAvailable: () => [{ provider: "openai", id: "gpt-4o", name: "GPT-4o" }],
+			getApiKey: async () => kNoAuth,
 		} as unknown as import("../../src/config/model-registry").ModelRegistry;
 
 		const cases = [
@@ -780,6 +858,8 @@ describe("runSubprocess yield reminders", () => {
 		const modelRegistry = {
 			authStorage: fakeAuthStorage,
 			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
 		} as unknown as import("../../src/config/model-registry").ModelRegistry;
 
 		await runSubprocess({ ...baseOptions, id: "subagent-registry-only", modelRegistry });
@@ -796,6 +876,8 @@ describe("runSubprocess yield reminders", () => {
 		const modelRegistry = {
 			authStorage: registryStorage,
 			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
 		} as unknown as import("../../src/config/model-registry").ModelRegistry;
 
 		const result = await runSubprocess({
@@ -830,7 +912,11 @@ describe("runSubprocess telemetry propagation", () => {
 		index: 0,
 		id: "subagent-telemetry",
 		settings: Settings.isolated(),
-		modelRegistry: { refresh: async () => {} } as unknown as import("../../src/config/model-registry").ModelRegistry,
+		modelRegistry: {
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
+		} as unknown as import("../../src/config/model-registry").ModelRegistry,
 		enableLsp: false,
 	};
 

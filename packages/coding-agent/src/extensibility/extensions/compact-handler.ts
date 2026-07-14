@@ -24,7 +24,7 @@ export async function runExtensionCompact(
 
 interface SetModelCapableSession {
 	modelRegistry: { getApiKey(model: Model): Promise<string | undefined> };
-	setModel(model: Model): Promise<unknown>;
+	setModel(model: Model, role?: string, options?: { cause?: string }): Promise<unknown>;
 }
 
 /**
@@ -35,6 +35,6 @@ interface SetModelCapableSession {
 export async function runExtensionSetModel(session: SetModelCapableSession, model: Model): Promise<boolean> {
 	const key = await session.modelRegistry.getApiKey(model);
 	if (!key) return false;
-	await session.setModel(model);
+	await session.setModel(model, "default", { cause: "user-selection" });
 	return true;
 }
