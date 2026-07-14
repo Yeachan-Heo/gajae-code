@@ -772,6 +772,26 @@ interface PublishRetainedPackageOperations {
 	readTarball(record: PackageEvidenceRecord, tarballPath: string): Promise<Buffer>;
 	observe(record: PackageEvidenceRecord, retainedTarball: Buffer): Promise<RegistryPackageObservation | undefined>;
 	publish(tarballPath: string): Promise<PublishAttempt>;
+	delay?(ms: number): Promise<void>;
+}
+
+const REGISTRY_PROPAGATION_ATTEMPTS = 6;
+const REGISTRY_PROPAGATION_BASE_DELAY_MS = 1_000;
+
+async function observeAfterRegistryPropagation(
+	record: PackageEvidenceRecord,
+	retainedTarball: Buffer,
+	operations: PublishRetainedPackageOperations,
+): Promise<RegistryPackageObservation | undefined> {
+	const delay = operations.delay ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
+	for (let attempt = 1; attempt <= REGISTRY_PROPAGATION_ATTEMPTS; attempt++) {
+		const observed = await operations.observe(record, retainedTarball);
+		if (observed !== undefined) return observed;
+		if (attempt < REGISTRY_PROPAGATION_ATTEMPTS) {
+			await delay(REGISTRY_PROPAGATION_BASE_DELAY_MS * attempt);
+		}
+	}
+	return undefined;
 }
 
 export async function publishRetainedPackage(
@@ -806,8 +826,8 @@ export async function publishRetainedPackage(
 		}
 		throw new Error(`npm publish failed for ${record.name}@${record.version}: ${publish.output || `exit ${publish.exitCode ?? "unknown"}`}`);
 	}
-	const observed = await operations.observe(record, retainedTarball);
-	if (observed === undefined) throw new Error(`Registry did not expose ${record.name}@${record.version} after publish`);
+	const observed = await observeAfterRegistryPropagation(record, retainedTarball, operations);
+	if (observed === undefined) throw new Error(`Registry did not expose ${record.name}@${record.version} after publish (registry propagation not observed after ${REGISTRY_PROPAGATION_ATTEMPTS} attempts)`);
 	assertExactRegistryObservation(record, observed);
 	return observed;
 }
