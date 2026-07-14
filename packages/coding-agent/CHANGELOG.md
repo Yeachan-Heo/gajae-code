@@ -22,6 +22,8 @@
 - Fixed `gjc --tmux` startup from GNOME and other VTE terminals by recognizing `vte-spawn-*.scope` only when cgroup metadata proves matching user-manager ancestry (#2159).
 - Fixed native Windows `GJC_TMUX_COMMAND=tmux` resolution when WinGet's `tmux.exe` is a psmux alias with a generic `tmux` banner: GJC now compares executable identity with the installed `psmux.exe`/`pmux.exe` companions and fails closed when identity cannot be established instead of authorizing native-tmux semantics (#2086).
 
+- Accepted or declined initial external credential-import decisions now persist across normal restarts and upgrades, suppressing automatic startup and bare `/login` discovery; same-version legacy markers remain compatible and explicit `/provider` import remains available ([#2117](https://github.com/Yeachan-Heo/gajae-code/issues/2117)).
+
 ## [0.10.1] - 2026-07-13
 
 ### Added

@@ -3,7 +3,7 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle } from "@gajae-code/tui";
 import { Input, isPetMode, Loader, Spacer, Text } from "@gajae-code/tui";
-import { getAgentDbPath, getProjectDir } from "@gajae-code/utils";
+import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
 import {
 	activateModelProfile,
 	type MaterializeModelProfileForDeletionResult,
@@ -45,9 +45,22 @@ import type { InteractiveModeContext, OAuthSelectorOptions } from "../../modes/t
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
 import {
+	CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING,
+	CREDENTIAL_AUTO_IMPORT_PERSISTENCE_WARNING,
+	CREDENTIAL_AUTO_IMPORT_REFRESH_WARNING,
+	CREDENTIAL_AUTO_IMPORT_RETRY_WARNING,
 	CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING,
+	CREDENTIAL_AUTO_IMPORT_STATE_UNREADABLE_WARNING,
+	type CredentialAutoImportStateReadResult,
+	type CredentialAutoImportStateStore,
+	createCredentialAutoImportStateStore,
+	formatCredentialAutoImportCandidateLabel,
+	formatCredentialAutoImportPrompt,
+	isCredentialAutoImportStateResolvedForVersion,
+	logCredentialAutoImportFailures,
 	runExternalCredentialAutoImport,
 } from "../../setup/credential-auto-import";
+
 import {
 	filterAutoImportOAuthCredentials,
 	formatDiscoverySummary,
@@ -145,7 +158,14 @@ function formatProviderOnboardingCommandGuide(): string {
 }
 
 export class SelectorController {
-	constructor(private ctx: InteractiveModeContext) {}
+	#credentialAutoImportStateStore?: CredentialAutoImportStateStore;
+
+	constructor(
+		private ctx: InteractiveModeContext,
+		credentialAutoImportStateStore?: CredentialAutoImportStateStore,
+	) {
+		this.#credentialAutoImportStateStore = credentialAutoImportStateStore;
+	}
 
 	async #refreshOAuthProviderAuthState(): Promise<void> {
 		const oauthProviders = getOAuthProviders();
@@ -1658,34 +1678,110 @@ export class SelectorController {
 			options?.allowExternalCredentialDiscovery === true &&
 			options.trigger === "bare-login"
 		) {
-			const preview = await runExternalCredentialAutoImport({
-				authStorage: {
-					importCredentialIfAbsent: async () => ({
-						inserted: false,
-						reason: "skipped-existing",
-						provider: "",
-						entries: [],
-					}),
-				},
-				trigger: "bare-login",
-				discover: options.externalCredentialDiscover,
-			});
-			const result = preview.discovery ?? { importable: [], skipped: [], environment: [] };
-			const candidates = filterAutoImportOAuthCredentials(result.importable);
-			if (candidates.length > 0) {
-				const confirmed = await this.ctx.showHookConfirm(
-					`Import ${candidates.length} external credential(s)?`,
-					`${formatDiscoverySummary({ ...result, importable: candidates }).join("\n")}\n\n${CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING}`,
-				);
-				if (confirmed) {
-					const summary = await runExternalCredentialAutoImport({
-						authStorage: this.ctx.session.modelRegistry.authStorage,
-						trigger: "bare-login",
-						discover: options.externalCredentialDiscover,
-					});
-					externalCredentialCandidates = summary.imported;
-					if (externalCredentialCandidates.length > 0) {
-						await this.ctx.session.modelRegistry.refresh("offline");
+			const stateStore =
+				this.#credentialAutoImportStateStore ??
+				createCredentialAutoImportStateStore(this.ctx.settings.getAgentDir());
+			let stateRead: CredentialAutoImportStateReadResult | undefined;
+			try {
+				stateRead = await stateStore.read();
+			} catch {
+				logger.warn("Credential auto-import state read failed", { classification: "state-read-failed" });
+				stateRead = { state: {}, problems: [], unreadable: true };
+			}
+			if (stateRead?.unreadable === true) {
+				logger.warn("Credential auto-import state unavailable", { classification: "state-unreadable" });
+				this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_STATE_UNREADABLE_WARNING);
+			} else if (stateRead && !isCredentialAutoImportStateResolvedForVersion(stateRead.state, VERSION)) {
+				const preview = await runExternalCredentialAutoImport({
+					authStorage: {
+						importCredentialIfAbsent: async () => ({
+							inserted: false,
+							reason: "skipped-existing",
+							provider: "",
+							entries: [],
+						}),
+					},
+					trigger: "bare-login",
+					discover: options.externalCredentialDiscover,
+				});
+				if (!preview.discovered) {
+					this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING);
+				} else {
+					const result = preview.discovery ?? { importable: [], skipped: [], environment: [] };
+					const candidates = filterAutoImportOAuthCredentials(result.importable);
+					const previewSourceFailures = preview.failures.filter(failure => failure.credential === undefined);
+					if (candidates.length === 0 && previewSourceFailures.length > 0) {
+						this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING);
+					} else if (candidates.length > 0) {
+						const confirmed = await this.ctx.showHookConfirm(
+							`Import ${candidates.length} external credential(s)?`,
+							`${formatCredentialAutoImportPrompt(candidates)}\n\n${CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING}`,
+						);
+						if (!confirmed) {
+							let persisted = false;
+							try {
+								persisted = await stateStore.write({ initialImportResolution: "declined" });
+							} catch {
+								logger.warn("Credential auto-import state persistence failed", {
+									classification: "state-write-failed",
+								});
+							}
+							if (!persisted) this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_PERSISTENCE_WARNING);
+						} else {
+							const summary = await runExternalCredentialAutoImport({
+								authStorage: this.ctx.session.modelRegistry.authStorage,
+								trigger: "bare-login",
+								discover: options.externalCredentialDiscover,
+							});
+							if (!summary.discovered) {
+								logCredentialAutoImportFailures("bare-login", summary.failures);
+								this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_RETRY_WARNING);
+							} else {
+								const secondResult = summary.discovery ?? { importable: [], skipped: [], environment: [] };
+								const secondCandidates = filterAutoImportOAuthCredentials(secondResult.importable);
+								const secondSourceFailures = summary.failures.filter(
+									failure => failure.credential === undefined,
+								);
+								const handledCandidates = summary.imported.length + summary.skipped.length > 0;
+								if (handledCandidates || (secondCandidates.length === 0 && secondSourceFailures.length === 0)) {
+									let persisted = false;
+									try {
+										persisted = await stateStore.write({ initialImportResolution: "accepted" });
+									} catch {
+										logger.warn("Credential auto-import state persistence failed", {
+											classification: "state-write-failed",
+										});
+									}
+									if (!persisted) this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_PERSISTENCE_WARNING);
+									externalCredentialCandidates = summary.imported.map(credential => ({
+										...credential,
+										source: formatCredentialAutoImportCandidateLabel(credential),
+									}));
+									if (!handledCandidates) {
+										this.ctx.showStatus("External credentials were no longer available to import.");
+									}
+									if (summary.imported.length > 0) {
+										try {
+											await this.ctx.session.modelRegistry.refresh("offline");
+										} catch {
+											logger.warn("Credential auto-import refresh failed", {
+												classification: "refresh-failed",
+											});
+											this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_REFRESH_WARNING);
+										}
+									}
+									if (handledCandidates && summary.failures.length > 0) {
+										logCredentialAutoImportFailures("bare-login", summary.failures);
+										this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_RETRY_WARNING);
+									}
+								} else if (secondCandidates.length > 0 && summary.failures.length > 0) {
+									logCredentialAutoImportFailures("bare-login", summary.failures);
+									this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_RETRY_WARNING);
+								} else {
+									this.ctx.showWarning(CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING);
+								}
+							}
+						}
 					}
 				}
 			}
