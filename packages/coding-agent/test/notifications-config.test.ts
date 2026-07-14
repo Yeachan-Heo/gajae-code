@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../src/extensibility/extensions";
 import { createAgentSession } from "../src/sdk";
 import {
 	buildRedactedAction,
@@ -22,7 +23,7 @@ import {
 	tokenFingerprint,
 } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
-import { daemonPaths } from "../src/sdk/bus/telegram-daemon";
+import { daemonPaths, ensureTelegramDaemonRunning } from "../src/sdk/bus/telegram-daemon";
 import { SessionManager } from "../src/session/session-manager";
 
 const BASE_CFG: NotificationConfig = {
@@ -568,6 +569,117 @@ describe("notifications config", () => {
 			if (previousSpawn === undefined) delete process.env.GJC_SPAWNED_BY_SESSION;
 			else process.env.GJC_SPAWNED_BY_SESSION = previousSpawn;
 			resetSettingsForTest();
+		}
+	}, 30000);
+	test("never-registered notifications extension captures no command or daemon artifacts", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-unregistered-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-agent-"));
+		tempDirs.push(cwd, agentDir);
+		const sessionId = "session-unregistered";
+		let notify: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void } | undefined;
+		const api = {
+			registerCommand(
+				name: string,
+				command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void },
+			) {
+				if (name === "notify") notify = command;
+			},
+		} as unknown as ExtensionAPI;
+		const extensionShouldRegister = shouldRegisterNotificationsExtension({ cfg: BASE_CFG, env: {} });
+
+		expect(extensionShouldRegister).toBe(false);
+		if (extensionShouldRegister) createNotificationsExtension(api);
+		expect(notify).toBeUndefined();
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "notifications", `${sessionId}.json`))).toBe(false);
+		expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
+	});
+	test("captured /notify on uses the production daemon ensurer once and awaits endpoint shutdown", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-command-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-agent-"));
+		tempDirs.push(cwd, agentDir);
+		const sessionId = "session-command";
+		const settings = new Proxy(
+			Settings.isolated({
+				"notifications.enabled": false,
+				"notifications.telegram.botToken": "123456:temporary-test-token",
+				"notifications.telegram.chatId": "temporary-chat",
+			}),
+			{
+				get(target, prop) {
+					if (prop === "getAgentDir") return () => agentDir;
+					const value = Reflect.get(target, prop, target);
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			},
+		) as Settings;
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		let notify: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void } | undefined;
+		let spawns = 0;
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+			registerCommand(
+				name: string,
+				command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void },
+			) {
+				if (name === "notify") notify = command;
+			},
+		} as unknown as ExtensionAPI;
+		const context = {
+			cwd,
+			sessionManager: {
+				getSessionId: () => sessionId,
+				getSessionName: () => "command harness",
+			},
+			ui: { notify: () => {} },
+		} as unknown as ExtensionCommandContext;
+
+		createNotificationsExtension(api, {
+			settings,
+			ensureTelegramDaemon: input =>
+				ensureTelegramDaemonRunning(input, {
+					pid: 4242,
+					pidAlive: () => true,
+					spawn: () => {
+						spawns++;
+						return { unref() {} };
+					},
+				}),
+		});
+
+		const endpoint = path.join(cwd, ".gjc", "state", "notifications", `${sessionId}.json`);
+		const roots = daemonPaths(agentDir).roots;
+		const sessionStart = handlers.get("session_start");
+		const sessionShutdown = handlers.get("session_shutdown");
+		if (!sessionStart || !sessionShutdown || !notify)
+			throw new Error("notifications extension did not register its command handlers");
+		let shutdownCompleted = false;
+		try {
+			await sessionStart({}, context);
+			expect(fs.existsSync(endpoint)).toBe(false);
+			expect(fs.existsSync(roots)).toBe(false);
+
+			settings.override("notifications.enabled", true);
+			await notify.handler("on", context);
+			expect(fs.existsSync(endpoint)).toBe(true);
+			expect(fs.existsSync(roots)).toBe(true);
+			const registeredRoots = JSON.parse(fs.readFileSync(roots, "utf8")) as { roots: string[] };
+			expect(registeredRoots.roots).toEqual([path.join(cwd, ".gjc", "state")]);
+			expect(spawns).toBe(1);
+
+			await notify.handler("on", context);
+			expect(fs.existsSync(endpoint)).toBe(true);
+			expect((JSON.parse(fs.readFileSync(roots, "utf8")) as { roots: string[] }).roots).toEqual([
+				path.join(cwd, ".gjc", "state"),
+			]);
+			expect(spawns).toBe(1);
+
+			await sessionShutdown({}, context);
+			shutdownCompleted = true;
+			expect(fs.existsSync(endpoint)).toBe(false);
+		} finally {
+			if (!shutdownCompleted) await sessionShutdown({}, context);
 		}
 	}, 30000);
 

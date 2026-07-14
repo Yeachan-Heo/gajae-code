@@ -3,21 +3,26 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
 import { parseLaunchWorktreeMode } from "@gajae-code/coding-agent/gjc-runtime/launch-worktree";
 import type { SessionCreateFrame } from "@gajae-code/coding-agent/sdk/bus/index";
 import {
 	attachLifecycleControl,
 	buildCreateArgv,
+	buildOrchestratorDeps,
 	type ControlServerLike,
 	createRateLimiter,
 	daemonCloseSession,
 	daemonResumeSession,
 	daemonSpawnCreate,
 	fileLedgerStore,
+	type LifecycleControlServer,
+	type LifecycleControlServerFactory,
 	outcomeToResponse,
 } from "@gajae-code/coding-agent/sdk/bus/lifecycle-control-runtime";
 import type { LedgerEntry, OrchestratorDeps } from "@gajae-code/coding-agent/sdk/bus/lifecycle-orchestrator";
+import { startDaemonLifecycleControl } from "@gajae-code/coding-agent/sdk/bus/telegram-daemon";
+import { Settings } from "../src/config/settings";
+import { acquireDaemonOwnership, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 
 const PAIRED = "42";
 
@@ -49,9 +54,10 @@ function createFrame(over: Partial<SessionCreateFrame> = {}): SessionCreateFrame
 }
 
 function stubDeps(): OrchestratorDeps {
-	let n = 0;
 	return {
 		pairedChatId: PAIRED,
+		auditRedactionKey: new Uint8Array(32).fill(7),
+		isPsmuxProvider: () => false,
 		now: () => 1000,
 		store: { read: async () => ({ version: 1, entries: {} }), write: async () => {} },
 		audit: () => {},
@@ -71,10 +77,172 @@ function stubDeps(): OrchestratorDeps {
 			topicThreadId: "",
 			mode: "reattached",
 		}),
-		newLifecycleRequestId: () => `lc-${++n}`,
-		newSessionId: () => `sess-${++n}`,
 	};
 }
+it("requires exactly a 32-byte audit redaction key for production deps", () => {
+	expect(() =>
+		buildOrchestratorDeps({
+			pairedChatId: PAIRED,
+			agentNotificationsDir: "C:\\temporary\\notifications",
+			auditRedactionKey: new Uint8Array(31),
+		}),
+	).toThrow("invalid_audit_redaction_key");
+});
+it("forwards the supplied 32-byte audit key unchanged and rejects invalid or missing keys before wiring", () => {
+	let registered = 0;
+	const controlServer: ControlServerLike = {
+		onLifecycleRequest: () => {
+			registered += 1;
+		},
+		respond: () => {},
+	};
+	const key = new Uint8Array(32).fill(0xa5);
+	const deps = startDaemonLifecycleControl({
+		controlServer,
+		pairedChatId: PAIRED,
+		agentDir: "C:\\temporary\\notifications-forwarding",
+		auditRedactionKey: key,
+	});
+	expect(deps.auditRedactionKey).toBe(key);
+	expect(registered).toBe(1);
+
+	const invalidAgentDir = path.join(os.tmpdir(), `gjc-invalid-audit-key-${Date.now()}`);
+	const auditPath = path.join(invalidAgentDir, "notifications", "telegram-lifecycle-audit.jsonl");
+	for (const auditRedactionKey of [new Uint8Array(31), undefined as unknown as Uint8Array]) {
+		registered = 0;
+		expect(() =>
+			startDaemonLifecycleControl({
+				controlServer,
+				pairedChatId: PAIRED,
+				agentDir: invalidAgentDir,
+				auditRedactionKey,
+			}),
+		).toThrow();
+		expect(registered).toBe(0);
+		expect(fs.existsSync(auditPath)).toBe(false);
+	}
+});
+
+function daemonSettings(agentDir: string): Settings {
+	const base = Settings.isolated({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "123456:secret-token",
+		"notifications.telegram.chatId": PAIRED,
+	}) as Settings;
+	return new Proxy(base, {
+		get(target, prop) {
+			if (prop === "getAgentDir") return () => agentDir;
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
+}
+
+function immediateTimeout(): typeof setTimeout {
+	return ((callback: () => void) => {
+		callback();
+		return 0;
+	}) as unknown as typeof setTimeout;
+}
+
+async function startAsOwner(settings: Settings, ownerId: string): Promise<void> {
+	await acquireDaemonOwnership({
+		settings,
+		tokenFingerprint: "fingerprint",
+		chatId: PAIRED,
+		pid: process.pid,
+		randomId: () => ownerId,
+	});
+}
+
+it("passes the daemon-derived audit key through real lifecycle startup without a fallback", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-audit-key-"));
+	const settings = daemonSettings(agentDir);
+	await startAsOwner(settings, "audit-key-owner");
+
+	let capturedKey: Uint8Array | undefined;
+	let registered = 0;
+	const factory: LifecycleControlServerFactory = () =>
+		({
+			onLifecycleRequest: () => {
+				registered++;
+			},
+			respond: () => {},
+			start: async () => undefined,
+			stop: () => {},
+		}) as LifecycleControlServer;
+	const daemon = new TelegramNotificationDaemon({
+		settings,
+		ownerId: "audit-key-owner",
+		botToken: "bot-token",
+		chatId: PAIRED,
+		botApi: { call: async () => ({ ok: true, result: [] }) } as never,
+		idleTimeoutMs: 10,
+		now: (() => {
+			let now = 0;
+			return () => (now += 11);
+		})(),
+		setTimeoutImpl: immediateTimeout(),
+		createLifecycleControlServer: factory,
+		createLifecycleOrchestratorDeps: input => {
+			capturedKey = input.auditRedactionKey;
+			return { ...stubDeps(), auditRedactionKey: input.auditRedactionKey };
+		},
+	});
+
+	await daemon.run();
+
+	expect(Buffer.from(capturedKey ?? []).toString("hex")).toBe(
+		"03936c8324cc679ecdc4bca97b2a88acaedf993ec45a8e6b3196033a6f9727a6",
+	);
+	expect(registered).toBe(1);
+});
+
+it("does not attach lifecycle audit dependencies or fall back when daemon key derivation has no token", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-missing-audit-key-"));
+	const settings = daemonSettings(agentDir);
+	await startAsOwner(settings, "missing-audit-key-owner");
+
+	let dependenciesBuilt = 0;
+	let registered = 0;
+	let started = 0;
+	let stopped = 0;
+	const factory: LifecycleControlServerFactory = () =>
+		({
+			onLifecycleRequest: () => {
+				registered++;
+			},
+			respond: () => {},
+			start: async () => {
+				started++;
+			},
+			stop: () => {
+				stopped++;
+			},
+		}) as LifecycleControlServer;
+	const daemon = new TelegramNotificationDaemon({
+		settings,
+		ownerId: "missing-audit-key-owner",
+		botToken: undefined as unknown as string,
+		chatId: PAIRED,
+		botApi: { call: async () => ({ ok: true, result: [] }) } as never,
+		idleTimeoutMs: 10,
+		now: (() => {
+			let now = 0;
+			return () => (now += 11);
+		})(),
+		setTimeoutImpl: immediateTimeout(),
+		createLifecycleControlServer: factory,
+		createLifecycleOrchestratorDeps: () => {
+			dependenciesBuilt++;
+			return stubDeps();
+		},
+	});
+
+	await daemon.run();
+
+	expect([dependenciesBuilt, registered, started, stopped]).toEqual([0, 0, 0, 1]);
+});
 
 describe("lifecycle control runtime", () => {
 	it("buildCreateArgv emits only launcher-supported flags (no --session-id)", () => {
@@ -1451,6 +1619,18 @@ describe("lifecycle control runtime", () => {
 				}),
 			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
 			let listSessionsCalled = false;
+			await expect(
+				daemonResumeSession(env, {
+					sessionsRoot: root,
+					listSessions: () => {
+						listSessionsCalled = true;
+						return [];
+					},
+				})({
+					sessionIdOrPrefix: "resume-123",
+				}),
+			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
+			expect(listSessionsCalled).toBe(false);
 			await expect(
 				daemonResumeSession(env, {
 					sessionsRoot: root,

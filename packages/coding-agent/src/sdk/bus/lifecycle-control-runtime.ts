@@ -10,6 +10,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
+import type { NotificationControlServer as NativeNotificationControlServer } from "@gajae-code/natives";
 import { tmuxRuntimeSessionPath } from "../../gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -40,7 +41,13 @@ import {
 	type GjcTmuxSessionStatus,
 	listGjcTmuxSessions,
 } from "../../gjc-runtime/tmux-sessions";
-import type { ResumeCandidate, SessionCreateFrame, SessionLifecycleRequest, SessionLifecycleResponse } from "./index";
+import type {
+	LifecycleErrorReason,
+	ResumeCandidate,
+	SessionCreateFrame,
+	SessionLifecycleRequest,
+	SessionLifecycleResponse,
+} from "./index";
 import { normalizeLifecyclePath } from "./lifecycle-commands";
 import {
 	type AuditEvent,
@@ -54,6 +61,16 @@ import {
 	type ResumeEffectResult,
 } from "./lifecycle-orchestrator";
 import { listRecentSessions } from "./recent-activity";
+
+type NativeControlServerConstructor = new (
+	token: string,
+	ownerId: string,
+	agentDir?: string,
+) => NativeNotificationControlServer;
+
+interface NativeControlServerModule {
+	NotificationControlServer: NativeControlServerConstructor;
+}
 
 /** Minimal view of the native control server this runtime depends on. */
 export interface ControlServerLike {
@@ -79,6 +96,24 @@ export type LifecycleControlServerFactory = (input: {
 	ownerId: string;
 	agentDir: string;
 }) => LifecycleControlServer;
+const lifecycleErrorReasons = new Set<LifecycleErrorReason>([
+	"unauthorized",
+	"rate_limited",
+	"duplicate_conflict",
+	"invalid_target",
+	"ambiguous_target",
+	"spawn_failed",
+	"discovery_timeout",
+	"readiness_timeout",
+	"close_refused",
+	"not_found",
+	"terminal_uncertain",
+	"unsupported_platform",
+]);
+
+function isLifecycleErrorReason(value: unknown): value is LifecycleErrorReason {
+	return typeof value === "string" && lifecycleErrorReasons.has(value as LifecycleErrorReason);
+}
 
 /** Atomic + fsynced file-backed idempotency ledger store. */
 function ledgerReadError(error: unknown): Error {
@@ -94,7 +129,7 @@ function isLedgerDoc(value: unknown): value is LedgerDoc {
 	return Object.values(doc.entries).every(entry => {
 		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
 		const candidate = entry as Partial<LedgerEntry>;
-		return (
+		const isBaseEntry =
 			typeof candidate.requestHash === "string" &&
 			(candidate.state === "in_progress" ||
 				candidate.state === "success" ||
@@ -108,8 +143,30 @@ function isLedgerDoc(value: unknown): value is LedgerDoc {
 			typeof candidate.updatedAt === "number" &&
 			!!candidate.targetSummary &&
 			typeof candidate.targetSummary === "object" &&
-			!Array.isArray(candidate.targetSummary)
-		);
+			!Array.isArray(candidate.targetSummary);
+		if (!isBaseEntry) return false;
+		if (candidate.state === "failure" || candidate.state === "terminal_uncertain")
+			return isLifecycleErrorReason(candidate.reason);
+		if (candidate.state !== "success") return true;
+		switch (candidate.verb) {
+			case "session_create":
+				return (
+					typeof candidate.intendedSessionId === "string" &&
+					typeof candidate.sessionId === "string" &&
+					typeof candidate.tmuxSession === "string" &&
+					typeof candidate.endpointUrl === "string"
+				);
+			case "session_close":
+				return typeof candidate.sessionId === "string" && typeof candidate.processGone === "boolean";
+			case "session_resume":
+				return (
+					typeof candidate.sessionId === "string" &&
+					typeof candidate.tmuxSession === "string" &&
+					typeof candidate.endpointUrl === "string" &&
+					(candidate.resumeMode === "reattached" || candidate.resumeMode === "cold_restarted")
+				);
+		}
+		return false;
 	});
 }
 
@@ -639,6 +696,91 @@ async function assertLifecycleTmuxServerSafe(input: {
 		throw new Error(`gjc_lifecycle_owner_${proof.state === "unsafe" ? "server_unsafe" : "server_unverifiable"}`);
 }
 
+async function completeLifecycleSpawnTransaction(input: {
+	tmux: string;
+	env: NodeJS.ProcessEnv;
+	sessionId: string;
+	generation: string;
+	stateDir: string;
+	cwd: string;
+	sessionName: string;
+	sessionStateFile: string;
+	argv: string[];
+	ownerIsolationProbe?: OwnerIsolationProbe;
+	prepareSpawn?: () => void;
+}): Promise<void> {
+	const previousBaseline = await captureOwnerGenerationBaseline(input.stateDir, input.sessionId);
+	let ownerExecution: LifecycleAttemptExecution | undefined;
+	try {
+		ownerExecution = await executeLifecycleTmuxOwnerPlan({
+			...input,
+			previousBaseline,
+			onAttemptCreated: attempt => {
+				ownerExecution = attempt;
+			},
+		});
+		if (
+			!ownerExecution.nativeSessionId ||
+			ownerExecution.serverPid === undefined ||
+			ownerExecution.serverStartTime === undefined
+		)
+			throw new Error("gjc_lifecycle_owner_server_unverifiable");
+		await applyRequiredLifecycleTmuxMetadata(
+			input.tmux,
+			`${ownerExecution.nativeSessionId}:`,
+			input.env,
+			{
+				sessionId: input.sessionId,
+				sessionStateFile: input.sessionStateFile,
+				project: input.cwd,
+				ownerGeneration: input.generation,
+				ownerServerKey: ownerExecution.serverKey,
+			},
+			{
+				nativeSessionId: ownerExecution.nativeSessionId,
+				attemptSession: ownerExecution.attemptSession,
+				serverPid: ownerExecution.serverPid,
+			},
+		);
+		if (
+			!(await reproveLifecycleAttempt({
+				tmux: input.tmux,
+				env: input.env,
+				serverKey: ownerExecution.serverKey,
+				nativeSessionId: ownerExecution.nativeSessionId,
+				attemptSession: ownerExecution.attemptSession,
+				expectedServerPid: ownerExecution.serverPid,
+				expectedServerStartTime: ownerExecution.serverStartTime,
+				ownerIsolationProbe: input.ownerIsolationProbe,
+			}))
+		)
+			throw new Error("gjc_lifecycle_owner_server_unverifiable");
+		if (!(await isLifecycleGenerationUnchanged(input.stateDir, input.sessionId, previousBaseline)))
+			throw new Error("gjc_lifecycle_owner_generation_changed");
+		await replaceOwnerGeneration(input.stateDir, input.sessionId, input.generation, previousBaseline);
+	} catch (error) {
+		let cleanupFailure: unknown;
+		if (ownerExecution?.attemptCreated) {
+			try {
+				await cleanupLifecycleAttempt({
+					tmux: input.tmux,
+					env: input.env,
+					serverKey: ownerExecution.serverKey,
+					nativeSessionId: ownerExecution.nativeSessionId,
+					attemptSession: ownerExecution.attemptSession,
+					expectedServerPid: ownerExecution.serverPid,
+					expectedServerStartTime: ownerExecution.serverStartTime,
+					ownerIsolationProbe: input.ownerIsolationProbe,
+				});
+			} catch (cleanupError) {
+				cleanupFailure = cleanupError;
+			}
+		}
+		if (cleanupFailure !== undefined)
+			throw new AggregateError([error, cleanupFailure], "gjc_lifecycle_cleanup_uncertain");
+		throw error;
+	}
+}
 /** Real daemon-safe tmux launcher: canonical owner-isolation plan + GJC tags. */
 export function daemonSpawnCreate(
 	env: NodeJS.ProcessEnv = process.env,
@@ -656,7 +798,6 @@ export function daemonSpawnCreate(
 		const sessionStateFile = lifecycleRuntimeStateFile(cwd, ids.intendedSessionId, name);
 		const stateDir = path.dirname(sessionStateFile);
 		const generation = crypto.randomUUID();
-		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, ids.intendedSessionId);
 		// Detached: no interactive TTY needed (daemon-safe). These values contain
 		// only opaque ids and paths needed by the resident sidecar to publish its
 		// exact-owner terminal verdict.
@@ -673,91 +814,24 @@ export function daemonSpawnCreate(
 		};
 		if (ids.startupPromptRef) childEnv.GJC_STARTUP_PROMPT_REF = ids.startupPromptRef;
 		const envPairs = Object.entries(childEnv)
-			.map(([k, v]) => `${k}=${shellQuote(v)}`)
+			.map(([key, value]) => `${key}=${shellQuote(value)}`)
 			.join(" ");
 		const command = `cd ${shellQuote(cwd)} && exec env ${envPairs} gjc ${args.map(shellQuote).join(" ")}`;
-		let ownerExecution: LifecycleAttemptExecution | undefined;
-		try {
-			ownerExecution = await executeLifecycleTmuxOwnerPlan({
-				tmux,
-				env,
-				sessionId: ids.intendedSessionId,
-				generation,
-				stateDir,
-				cwd,
-				sessionName: name,
-				argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
-				ownerIsolationProbe: opts.ownerIsolationProbe,
-				onAttemptCreated: attempt => {
-					ownerExecution = attempt;
-				},
-				previousBaseline,
-
-				prepareSpawn: () => {
-					if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
-				},
-			});
-			if (!ownerExecution.nativeSessionId || ownerExecution.serverPid === undefined)
-				throw new Error("gjc_lifecycle_owner_server_unverifiable");
-			const target = `${ownerExecution.nativeSessionId}:`;
-			await applyRequiredLifecycleTmuxMetadata(
-				tmux,
-				target,
-				env,
-				{
-					sessionId: ids.intendedSessionId,
-					sessionStateFile,
-					project: cwd,
-					ownerGeneration: generation,
-					ownerServerKey: ownerExecution.serverKey,
-				},
-				{
-					nativeSessionId: ownerExecution.nativeSessionId,
-					attemptSession: ownerExecution.attemptSession,
-					serverPid: ownerExecution.serverPid,
-				},
-			);
-			if (
-				!ownerExecution.nativeSessionId ||
-				ownerExecution.serverPid === undefined ||
-				ownerExecution.serverStartTime === undefined ||
-				!(await reproveLifecycleAttempt({
-					tmux,
-					env,
-					serverKey: ownerExecution.serverKey,
-					nativeSessionId: ownerExecution.nativeSessionId,
-					attemptSession: ownerExecution.attemptSession,
-					expectedServerPid: ownerExecution.serverPid,
-					expectedServerStartTime: ownerExecution.serverStartTime,
-					ownerIsolationProbe: opts.ownerIsolationProbe,
-				}))
-			)
-				throw new Error("gjc_lifecycle_owner_server_unverifiable");
-			if (!(await isLifecycleGenerationUnchanged(stateDir, ids.intendedSessionId, previousBaseline)))
-				throw new Error("gjc_lifecycle_owner_generation_changed");
-			await replaceOwnerGeneration(stateDir, ids.intendedSessionId, generation, previousBaseline);
-		} catch (error) {
-			let cleanupFailure: unknown;
-			if (ownerExecution?.attemptCreated) {
-				try {
-					await cleanupLifecycleAttempt({
-						tmux,
-						env,
-						serverKey: ownerExecution.serverKey,
-						nativeSessionId: ownerExecution.nativeSessionId,
-						attemptSession: ownerExecution.attemptSession,
-						expectedServerPid: ownerExecution.serverPid,
-						expectedServerStartTime: ownerExecution.serverStartTime,
-						ownerIsolationProbe: opts.ownerIsolationProbe,
-					});
-				} catch (cleanupError) {
-					cleanupFailure = cleanupError;
-				}
-			}
-			if (cleanupFailure !== undefined)
-				throw new AggregateError([error, cleanupFailure], "gjc_lifecycle_cleanup_uncertain");
-			throw error;
-		}
+		await completeLifecycleSpawnTransaction({
+			tmux,
+			env,
+			sessionId: ids.intendedSessionId,
+			generation,
+			stateDir,
+			cwd,
+			sessionName: name,
+			sessionStateFile,
+			argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
+			ownerIsolationProbe: opts.ownerIsolationProbe,
+			prepareSpawn: () => {
+				if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
+			},
+		});
 
 		return {
 			sessionId: ids.intendedSessionId,
@@ -911,7 +985,6 @@ export function daemonResumeSession(
 		const sessionStateFile = lifecycleRuntimeStateFile(resolvedResumeCwd, resumeId, name);
 		const stateDir = path.dirname(sessionStateFile);
 		const generation = crypto.randomUUID();
-		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, resumeId);
 		const childEnv: Record<string, string> = {
 			GJC_TMUX_LAUNCHED: "1",
 			GJC_NOTIFICATIONS: "1",
@@ -925,84 +998,18 @@ export function daemonResumeSession(
 			.map(([key, value]) => `${key}=${shellQuote(value)}`)
 			.join(" ");
 		const command = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${envPairs} gjc --resume ${shellQuote(resumeId)}`;
-		let ownerExecution: LifecycleAttemptExecution | undefined;
-		try {
-			ownerExecution = await executeLifecycleTmuxOwnerPlan({
-				tmux,
-				env,
-				sessionId: resumeId,
-				generation,
-				stateDir,
-				cwd: resolvedResumeCwd,
-				sessionName: name,
-				argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
-				ownerIsolationProbe: opts.ownerIsolationProbe,
-				onAttemptCreated: attempt => {
-					ownerExecution = attempt;
-				},
-				previousBaseline,
-			});
-			if (!ownerExecution.nativeSessionId || ownerExecution.serverPid === undefined)
-				throw new Error("gjc_lifecycle_owner_server_unverifiable");
-			const tgt = `${ownerExecution.nativeSessionId}:`;
-			await applyRequiredLifecycleTmuxMetadata(
-				tmux,
-				tgt,
-				env,
-				{
-					sessionId: resumeId,
-					sessionStateFile,
-					project: resolvedResumeCwd,
-					ownerGeneration: generation,
-					ownerServerKey: ownerExecution.serverKey,
-				},
-				{
-					nativeSessionId: ownerExecution.nativeSessionId,
-					attemptSession: ownerExecution.attemptSession,
-					serverPid: ownerExecution.serverPid,
-				},
-			);
-			if (
-				!ownerExecution.nativeSessionId ||
-				ownerExecution.serverPid === undefined ||
-				ownerExecution.serverStartTime === undefined ||
-				!(await reproveLifecycleAttempt({
-					tmux,
-					env,
-					serverKey: ownerExecution.serverKey,
-					nativeSessionId: ownerExecution.nativeSessionId,
-					attemptSession: ownerExecution.attemptSession,
-					expectedServerPid: ownerExecution.serverPid,
-					expectedServerStartTime: ownerExecution.serverStartTime,
-					ownerIsolationProbe: opts.ownerIsolationProbe,
-				}))
-			)
-				throw new Error("gjc_lifecycle_owner_server_unverifiable");
-			if (!(await isLifecycleGenerationUnchanged(stateDir, resumeId, previousBaseline)))
-				throw new Error("gjc_lifecycle_owner_generation_changed");
-			await replaceOwnerGeneration(stateDir, resumeId, generation, previousBaseline);
-		} catch (error) {
-			let cleanupFailure: unknown;
-			if (ownerExecution?.attemptCreated) {
-				try {
-					await cleanupLifecycleAttempt({
-						tmux,
-						env,
-						serverKey: ownerExecution.serverKey,
-						nativeSessionId: ownerExecution.nativeSessionId,
-						attemptSession: ownerExecution.attemptSession,
-						expectedServerPid: ownerExecution.serverPid,
-						expectedServerStartTime: ownerExecution.serverStartTime,
-						ownerIsolationProbe: opts.ownerIsolationProbe,
-					});
-				} catch (cleanupError) {
-					cleanupFailure = cleanupError;
-				}
-			}
-			if (cleanupFailure !== undefined)
-				throw new AggregateError([error, cleanupFailure], "gjc_lifecycle_cleanup_uncertain");
-			throw error;
-		}
+		await completeLifecycleSpawnTransaction({
+			tmux,
+			env,
+			sessionId: resumeId,
+			generation,
+			stateDir,
+			cwd: resolvedResumeCwd,
+			sessionName: name,
+			sessionStateFile,
+			argv: [tmux, "new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, "sh", "-c", command],
+			ownerIsolationProbe: opts.ownerIsolationProbe,
+		});
 
 		return {
 			sessionId: resumeId,
@@ -1033,39 +1040,50 @@ export function outcomeToResponse(frame: SessionLifecycleRequest, outcome: Lifec
 		};
 	}
 	const e = outcome.entry;
+	if (e.state !== "success") throw new Error("invalid lifecycle success ledger entry");
 	if (frame.type === "session_create") {
+		if (typeof e.sessionId !== "string" || typeof e.endpointUrl !== "string")
+			throw new Error("invalid create success ledger entry");
 		return {
 			type: "session_create_response",
 			requestId: frame.requestId,
 			status: "ok",
 			lifecycleRequestId: frame.lifecycleRequestId,
-			sessionId: e.sessionId ?? e.intendedSessionId ?? "",
+			sessionId: e.sessionId,
 			matchedBy: "spawn_marker",
-			endpoint: { url: e.endpointUrl ?? "", token: "" },
+			endpoint: { url: e.endpointUrl, token: "" },
 			topic: { chatId: frame.chatId, threadId: "" },
 			target: frame.target,
 		};
 	}
 	if (frame.type === "session_close") {
+		if (typeof e.sessionId !== "string" || typeof e.processGone !== "boolean")
+			throw new Error("invalid close success ledger entry");
 		return {
 			type: "session_close_response",
 			requestId: frame.requestId,
 			status: "ok",
-			sessionId: e.sessionId ?? "",
-			processGone: e.processGone ?? false,
+			sessionId: e.sessionId,
+			processGone: e.processGone,
 			historyPreserved: true,
 			// The killed session's per-session endpoint record is reaped by the
 			// daemon's dead-PID scan (scanRoots), so it is effectively stale.
-			endpointStale: e.processGone ?? false,
+			endpointStale: e.processGone,
 		};
 	}
+	if (
+		typeof e.sessionId !== "string" ||
+		typeof e.endpointUrl !== "string" ||
+		(e.resumeMode !== "reattached" && e.resumeMode !== "cold_restarted")
+	)
+		throw new Error("invalid resume success ledger entry");
 	return {
 		type: "session_resume_response",
 		requestId: frame.requestId,
 		status: "ok",
-		sessionId: e.sessionId ?? "",
-		mode: outcome.mode ?? "reattached",
-		endpoint: { url: e.endpointUrl ?? "", token: "" },
+		sessionId: e.sessionId,
+		mode: outcome.mode ?? e.resumeMode,
+		endpoint: { url: e.endpointUrl, token: "" },
 		topic: { chatId: frame.chatId, threadId: "" },
 	};
 }
@@ -1125,6 +1143,10 @@ function isSafeLifecycleId(value: unknown): value is string {
 	return typeof value === "string" && !hasLoneUtf16Surrogate(value);
 }
 
+function isNonEmptySafeLifecycleId(value: unknown): value is string {
+	return isSafeLifecycleId(value) && value.length > 0;
+}
+
 /** The native server authenticates callbacks before redacting the control token. */
 type AuthenticatedNativeLifecycleRequest =
 	| Omit<SessionCreateFrame, "token">
@@ -1148,8 +1170,8 @@ function isBoundedRequestFrame(frame: unknown): frame is AuthenticatedNativeLife
 	switch (frame.type) {
 		case "session_create":
 			return (
-				isSafeLifecycleId(frame.lifecycleRequestId) &&
-				isSafeLifecycleId(frame.intendedSessionId) &&
+				isNonEmptySafeLifecycleId(frame.lifecycleRequestId) &&
+				isNonEmptySafeLifecycleId(frame.intendedSessionId) &&
 				(typeof frame.startupPromptRef === "undefined" || typeof frame.startupPromptRef === "string") &&
 				(typeof frame.modelPreset === "undefined" || typeof frame.modelPreset === "string") &&
 				((frame.target.kind === "worktree" &&
@@ -1230,16 +1252,21 @@ export function attachLifecycleControl(server: ControlServerLike, deps: Orchestr
 export function buildOrchestratorDeps(input: {
 	pairedChatId: string;
 	agentNotificationsDir: string;
+	/** Required in-memory, 32-byte audit-v2 redaction key. */
+	auditRedactionKey: Uint8Array;
 	/** Root of saved session histories (`<agentDir>/sessions`), for resume resolution. */
 	sessionsRoot?: string;
 	env?: NodeJS.ProcessEnv;
 }): OrchestratorDeps {
+	if (input.auditRedactionKey.byteLength !== 32) throw new Error("invalid_audit_redaction_key");
 	const env = input.env ?? process.env;
 	return {
 		pairedChatId: input.pairedChatId,
+		auditRedactionKey: input.auditRedactionKey,
 		now: () => Date.now(),
 		store: fileLedgerStore(path.join(input.agentNotificationsDir, "telegram-lifecycle-idempotency.json")),
 		audit: fileAudit(path.join(input.agentNotificationsDir, "telegram-lifecycle-audit.jsonl")),
+		isPsmuxProvider: () => resolveGjcTmuxBinary({ env }).isPsmux,
 		allowCreate: createRateLimiter(3, 10 * 60 * 1000),
 		writeStartupPrompt: async (requestId, prompt) => {
 			if (prompt === undefined) return undefined;
@@ -1254,8 +1281,6 @@ export function buildOrchestratorDeps(input: {
 		spawnCreate: daemonSpawnCreate(env),
 		closeSession: daemonCloseSession(env),
 		resumeSession: daemonResumeSession(env, { sessionsRoot: input.sessionsRoot }),
-		newLifecycleRequestId: () => `lc-${crypto.randomUUID()}`,
-		newSessionId: () => `s${crypto.randomUUID().slice(0, 8)}`,
 	};
 }
 
@@ -1266,6 +1291,6 @@ export function buildOrchestratorDeps(input: {
 export const createNativeControlServer: LifecycleControlServerFactory = ({ token, ownerId, agentDir }) => {
 	// Lazy require so loading this module (for the orchestrator / wiring / tests)
 	// never eagerly resolves the native addon — only a real production start does.
-	const { NotificationControlServer } = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
-	return new NotificationControlServer(token, ownerId, agentDir) as unknown as LifecycleControlServer;
+	const { NotificationControlServer } = require("@gajae-code/natives") as NativeControlServerModule;
+	return new NotificationControlServer(token, ownerId, agentDir);
 };

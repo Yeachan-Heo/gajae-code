@@ -17,7 +17,6 @@ const nativeBindings = loadNative();
 nativeBindings.initNativeCrashDiagnostics?.();
 // --- generated native exports (do not edit) ---
 // classes
-export const ComputerController = nativeBindings.ComputerController;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
 export const NotificationControlServer = nativeBindings.NotificationControlServer;

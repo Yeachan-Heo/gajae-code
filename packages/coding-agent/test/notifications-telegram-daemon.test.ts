@@ -77,6 +77,9 @@ function topicStateFs(onTopicStateWrite: () => Promise<void>): TelegramDaemonFs 
 class FakeWs extends EventTarget {
 	static OPEN = 1;
 	readyState = 1;
+	setReadyState(readyState: number): void {
+		this.readyState = readyState;
+	}
 	sent: string[] = [];
 	constructor(public url = "") {
 		super();
@@ -121,6 +124,31 @@ class FakeBotApi {
 		if (method === "sendMessage") return { ok: true, result: { message_id: this.calls.length } };
 		return { ok: true, result: true };
 	}
+}
+async function unavailableControlHarness(fsImpl?: TelegramDaemonFs) {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		rich: { enabled: false },
+		WebSocketImpl: FakeWs as any,
+		...(fsImpl ? { fs: fsImpl } : {}),
+	});
+	daemon.connectSession("S", "ws://s", "ts");
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	const threadId = bot.calls.find(call => call.method === "sendMessage")!.body.message_thread_id as number;
+	bot.calls = [];
+	return { agentDir, bot, daemon, threadId };
 }
 
 type TopicAuthorityState = {
@@ -1016,7 +1044,7 @@ describe("telegram daemon", () => {
 		});
 		const alias = bot.calls.find(c => c.method === "sendMessage")!.body.reply_markup.inline_keyboard[0][0]
 			.callback_data;
-		FakeWs.instances[0]!.readyState = 3;
+		FakeWs.instances[0]!.setReadyState(3);
 		await daemon.handleTelegramUpdate({ callback_query: { id: "cb", data: alias, message: { chat: { id: 42 } } } });
 		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
 		expect(bot.calls.some(c => c.method === "answerCallbackQuery" && c.body.text === "Button is stale")).toBe(true);
@@ -1861,6 +1889,167 @@ describe("telegram daemon", () => {
 		});
 		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
 	});
+	test("unavailable private threaded controls publish seen state before one exact notice", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		const threadId = bot.calls.find(call => call.method === "sendMessage")!.body.message_thread_id;
+		daemon.sessions.delete("S");
+		bot.calls = [];
+		const update = {
+			update_id: 81,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/usage", message_id: 101 },
+		};
+		await daemon.handleTelegramUpdate(update);
+		await daemon.handleTelegramUpdate(update);
+		expect(bot.calls.filter(call => call.method === "sendMessage").map(call => call.body.text)).toEqual([
+			"Session control unavailable: this local GJC session is disconnected.",
+		]);
+	});
+	test.each([
+		"writeFile",
+		"rename",
+	] as const)("unavailable control %s failure is silent and does not retain the update in memory", async failingMethod => {
+		let fail = true;
+		const fsImpl: TelegramDaemonFs = {
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+			writeFile: (file, data, opts) =>
+				fail && failingMethod === "writeFile" && file.includes("telegram-seen-updates")
+					? Promise.reject(new Error("disk failure"))
+					: fs.promises.writeFile(file, data, opts),
+			rename: (oldPath, newPath) =>
+				fail && failingMethod === "rename" && newPath.includes("telegram-seen-updates")
+					? Promise.reject(new Error("rename failure"))
+					: fs.promises.rename(oldPath, newPath).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+		};
+		const { bot, daemon, threadId } = await unavailableControlHarness(fsImpl);
+		daemon.sessions.delete("S");
+		const update = {
+			update_id: 82,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/usage", message_id: 102 },
+		};
+		await daemon.handleTelegramUpdate(update);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+		fail = false;
+		await daemon.handleTelegramUpdate(update);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
+	});
+
+	test("unavailable control publishes state before notice and restart suppresses it", async () => {
+		const { agentDir, bot, daemon, threadId } = await unavailableControlHarness();
+		daemon.sessions.delete("S");
+		let persistedBeforeSend = false;
+		const originalCall = bot.call.bind(bot);
+		bot.call = async (method, body) => {
+			if (method === "sendMessage") persistedBeforeSend = fs.existsSync(daemonPaths(agentDir).seenUpdates);
+			return originalCall(method, body);
+		};
+		const update = {
+			update_id: 83,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/usage", message_id: 103 },
+		};
+		await daemon.handleTelegramUpdate(update);
+		expect(persistedBeforeSend).toBe(true);
+		const restarted = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "other",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		await restarted.loadTopics();
+		await restarted.loadSeenUpdateIds();
+		bot.calls = [];
+		await restarted.handleTelegramUpdate(update);
+		expect(bot.calls).toEqual([]);
+	});
+
+	test("private and media boundaries do not emit unavailable control notices", async () => {
+		const { agentDir, bot, daemon, threadId } = await unavailableControlHarness();
+		daemon.sessions.delete("S");
+		bot.calls = [];
+		Reflect.set(daemon, "pairedChatPrivate", undefined);
+		const originalCall = bot.call.bind(bot);
+		bot.call = async (method, body) => {
+			if (method === "getChat") return { ok: true, result: { id: 42, type: "group" } };
+			return originalCall(method, body);
+		};
+		await daemon.handleTelegramUpdate({
+			update_id: 84,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/usage", message_id: 104 },
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+		expect(fs.existsSync(daemonPaths(agentDir).seenUpdates)).toBe(false);
+		bot.call = originalCall;
+		bot.calls = [];
+		await daemon.handleTelegramUpdate({
+			update_id: 85,
+			message: {
+				chat: { id: 42 },
+				message_thread_id: threadId,
+				caption: "/usage",
+				photo: [{ file_id: "photo" }],
+				message_id: 105,
+			},
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+	});
+
+	test("non-open sockets publish once even when the unavailable notice send fails", async () => {
+		const { bot, daemon, threadId } = await unavailableControlHarness();
+		FakeWs.instances[0]!.setReadyState(3);
+		let sendAttempts = 0;
+		const originalCall = bot.call.bind(bot);
+		bot.call = async (method, body) => {
+			if (method === "sendMessage") {
+				sendAttempts += 1;
+				throw new Error("network failure");
+			}
+			return originalCall(method, body);
+		};
+		const update = {
+			update_id: 86,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/usage", message_id: 106 },
+		};
+		await daemon.handleTelegramUpdate(update);
+		await daemon.handleTelegramUpdate(update);
+		expect(sendAttempts).toBe(1);
+	});
+
+	test("session cleanup leaves its former topic unknown", async () => {
+		const { bot, daemon, threadId } = await unavailableControlHarness();
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "session_closed", sessionId: "S" });
+		bot.calls = [];
+		await daemon.handleTelegramUpdate({
+			update_id: 87,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/usage", message_id: 107 },
+		});
+		expect(bot.calls).toEqual([]);
+	});
 
 	test("invalid telegram control command does not answer pending ask", async () => {
 		FakeWs.instances = [];
@@ -1896,7 +2085,7 @@ describe("telegram daemon", () => {
 		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
 		expect(
 			bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).startsWith("Usage: /reasoning")),
-		).toBe(true);
+		).toBe(false);
 	});
 
 	test("wrong-suffix telegram control command is consumed, not injected or ask-answered", async () => {

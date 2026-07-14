@@ -13,17 +13,20 @@
 //! - [`ControlServerHandle::stop`] is idempotent.
 
 use std::{
-	collections::HashSet,
+	collections::{HashMap, HashSet},
 	net::{IpAddr, Ipv4Addr, SocketAddr},
 	path::PathBuf,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, AtomicUsize, Ordering},
+	},
 };
 
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use tokio::{
 	net::{TcpListener, TcpStream},
-	sync::broadcast,
+	sync::mpsc,
 };
 use tokio_tungstenite::tungstenite::{
 	Message,
@@ -72,11 +75,19 @@ impl ControlServerConfig {
 
 #[derive(Debug)]
 struct ControlState {
-	token:        String,
+	token:              String,
 	/// Valid, authorized lifecycle requests forwarded to the host daemon.
-	lifecycle_tx: tokio::sync::mpsc::UnboundedSender<LifecycleClientMessage>,
-	/// Host responses, broadcast to connection tasks for request-id routing.
-	resp_tx:      broadcast::Sender<LifecycleServerMessage>,
+	lifecycle_tx:       tokio::sync::mpsc::UnboundedSender<LifecycleClientMessage>,
+	/// One-shot routes from request ids to their originating connections.
+	routes:             Mutex<HashMap<String, RequestRoute>>,
+	next_connection_id: AtomicU64,
+	connected:          AtomicUsize,
+}
+
+#[derive(Debug)]
+struct RequestRoute {
+	connection_id: u64,
+	tx:            mpsc::UnboundedSender<LifecycleServerMessage>,
 }
 
 /// Handle to a running control server.
@@ -115,15 +126,22 @@ impl ControlServerHandle {
 	}
 
 	/// Send a host-produced lifecycle response. It is routed back to the
-	/// connection that originated the matching `requestId`.
+	/// connection that originated the matching `requestId` and consumes that
+	/// route, allowing request-id reuse after terminal delivery.
 	pub fn respond(&self, msg: LifecycleServerMessage) {
-		let _ = self.state.resp_tx.send(msg);
+		let Some(request_id) = response_request_id(&msg).filter(|id| !id.is_empty()) else {
+			return;
+		};
+		let route = self.state.routes.lock().remove(request_id);
+		if let Some(route) = route {
+			let _ = route.tx.send(msg);
+		}
 	}
 
-	/// Number of connections currently subscribed.
+	/// Number of currently connected clients.
 	#[must_use]
 	pub fn client_count(&self) -> usize {
-		self.state.resp_tx.receiver_count()
+		self.state.connected.load(Ordering::Relaxed)
 	}
 
 	/// Stop the server. Idempotent: cancels the accept loop and all connection
@@ -172,8 +190,13 @@ pub async fn start_control(config: ControlServerConfig) -> std::io::Result<Contr
 	}
 
 	let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
-	let (resp_tx, _resp_rx) = broadcast::channel(256);
-	let state = Arc::new(ControlState { token: config.token, lifecycle_tx, resp_tx });
+	let state = Arc::new(ControlState {
+		token: config.token,
+		lifecycle_tx,
+		routes: Mutex::new(HashMap::new()),
+		next_connection_id: AtomicU64::new(0),
+		connected: AtomicUsize::new(0),
+	});
 	let cancel = CancellationToken::new();
 	let accept_task = tokio::spawn(accept_loop(listener, Arc::clone(&state), cancel.clone()));
 
@@ -220,11 +243,11 @@ async fn handle_conn(stream: TcpStream, state: Arc<ControlState>, cancel: Cancel
 		return;
 	};
 
-	let mut resp_rx = state.resp_tx.subscribe();
+	let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
+	state.connected.fetch_add(1, Ordering::Relaxed);
+	let (route_tx, mut route_rx) = mpsc::unbounded_channel();
 	let (mut write, mut read) = ws.split();
-	// Request ids this connection originated, so it only forwards matching
-	// responses (plus pre-parse errors, which carry no request id).
-	let mut owned: HashSet<String> = HashSet::new();
+	let mut owned = HashSet::new();
 
 	loop {
 		tokio::select! {
@@ -232,7 +255,14 @@ async fn handle_conn(stream: TcpStream, state: Arc<ControlState>, cancel: Cancel
 			incoming = read.next() => {
 				match incoming {
 					Some(Ok(Message::Text(text))) => {
-						if !handle_text(text.as_str(), &state, &mut owned, &mut write).await {
+						if !handle_text(
+							text.as_str(),
+							&state,
+							connection_id,
+							&route_tx,
+							&mut owned,
+							&mut write,
+						).await {
 							break;
 						}
 					}
@@ -246,31 +276,19 @@ async fn handle_conn(stream: TcpStream, state: Arc<ControlState>, cancel: Cancel
 					Some(Err(_)) => break,
 				}
 			}
-			broadcasted = resp_rx.recv() => {
-				match broadcasted {
-					Ok(msg) => {
-						if should_route(&msg, &owned)
-							&& send_lifecycle(&mut write, &msg).await.is_err()
-						{
-							break;
-						}
-					}
-					Err(broadcast::error::RecvError::Lagged(_)) => {}
-					Err(broadcast::error::RecvError::Closed) => break,
+			response = route_rx.recv() => {
+				let Some(response) = response else { break };
+				if send_lifecycle(&mut write, &response).await.is_err() {
+					break;
 				}
 			}
 		}
 	}
-}
 
-/// Whether a host response should be written to this connection: responses for
-/// request ids this connection originated, plus pre-parse errors (empty id).
-fn should_route(msg: &LifecycleServerMessage, owned: &HashSet<String>) -> bool {
-	match response_request_id(msg) {
-		Some("") => true,
-		Some(id) => owned.contains(id),
-		None => false,
-	}
+	state.routes.lock().retain(|request_id, route| {
+		!owned.contains(request_id) || route.connection_id != connection_id
+	});
+	state.connected.fetch_sub(1, Ordering::Relaxed);
 }
 
 fn response_request_id(msg: &LifecycleServerMessage) -> Option<&str> {
@@ -287,6 +305,8 @@ fn response_request_id(msg: &LifecycleServerMessage) -> Option<&str> {
 async fn handle_text<S>(
 	text: &str,
 	state: &Arc<ControlState>,
+	connection_id: u64,
+	route_tx: &mpsc::UnboundedSender<LifecycleServerMessage>,
 	owned: &mut HashSet<String>,
 	write: &mut S,
 ) -> bool
@@ -297,6 +317,12 @@ where
 		// Ignore malformed frames without tearing down the connection.
 		return true;
 	};
+
+	// Unknown frame types are forward-compatible no-ops. They do not carry a
+	// token or request id and must not be mistaken for an authentication failure.
+	if matches!(msg, LifecycleClientMessage::Unknown) {
+		return true;
+	}
 
 	// Defense-in-depth: re-check the per-frame token even though the handshake
 	// already validated `?token=`. A forwarded/replayed frame without the right
@@ -314,6 +340,25 @@ where
 	}
 
 	if let Some(id) = msg.request_id() {
+		let collision = {
+			let mut routes = state.routes.lock();
+			if routes.contains_key(id) {
+				true
+			} else {
+				routes.insert(id.to_owned(), RequestRoute { connection_id, tx: route_tx.clone() });
+				false
+			}
+		};
+		if collision {
+			let err = LifecycleServerMessage::SessionLifecycleError(SessionLifecycleError {
+				request_id: id.to_owned(),
+				status:     LifecycleStatus::Error,
+				reason:     LifecycleErrorReason::DuplicateConflict,
+				message:    "lifecycle request id is already in use".to_owned(),
+				candidates: Vec::new(),
+			});
+			return send_lifecycle(write, &err).await.is_ok();
+		}
 		owned.insert(id.to_owned());
 	}
 	state.lifecycle_tx.send(msg).is_ok()
@@ -420,6 +465,45 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn unsupported_platform_lifecycle_response_routes_to_originating_client() {
+		let handle = start_control(ControlServerConfig::new("control-token", "daemon-1"))
+			.await
+			.expect("start");
+		let mut rx = handle.take_lifecycle_receiver().expect("receiver");
+
+		let url = format!("ws://{}/?token=control-token", handle.addr());
+		let (mut ws, _resp) = connect_async(url).await.expect("connect");
+		ws.send(Message::Text(close_frame("lc_psmux", "control-token")))
+			.await
+			.expect("send");
+		let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+			.await
+			.expect("timed out")
+			.expect("closed");
+		assert_eq!(forwarded.request_id(), Some("lc_psmux"));
+
+		handle.respond(LifecycleServerMessage::SessionLifecycleError(SessionLifecycleError {
+			request_id: "lc_psmux".into(),
+			status:     LifecycleStatus::Error,
+			reason:     LifecycleErrorReason::UnsupportedPlatform,
+			message:    "Remote session lifecycle is unavailable on this psmux host because GJC \
+			             cannot prove immutable session identity. No lifecycle action was performed. \
+			             Use a local GJC terminal with a supported tmux provider."
+				.into(),
+			candidates: Vec::new(),
+		}));
+		let got = next_lifecycle(&mut ws).await;
+		match got {
+			LifecycleServerMessage::SessionLifecycleError(error) => {
+				assert_eq!(error.request_id, "lc_psmux");
+				assert_eq!(error.reason, LifecycleErrorReason::UnsupportedPlatform);
+			},
+			other => panic!("expected unsupported platform error, got {other:?}"),
+		}
+		handle.stop();
+	}
+
+	#[tokio::test]
 	async fn per_frame_token_mismatch_is_rejected_without_forwarding() {
 		let handle = start_control(ControlServerConfig::new("control-token", "daemon-1"))
 			.await
@@ -446,6 +530,117 @@ mod tests {
 		handle.stop();
 	}
 
+	#[tokio::test]
+	async fn request_ids_are_isolated_rejected_on_collision_and_reusable_after_delivery() {
+		let handle = start_control(ControlServerConfig::new("control-token", "daemon-1"))
+			.await
+			.expect("start");
+		let mut rx = handle.take_lifecycle_receiver().expect("receiver");
+		let url = format!("ws://{}/?token=control-token", handle.addr());
+		let (mut first, _) = connect_async(&url).await.expect("connect first");
+		let (mut second, _) = connect_async(&url).await.expect("connect second");
+
+		first
+			.send(Message::Text(close_frame("first-id", "control-token")))
+			.await
+			.expect("send first");
+		second
+			.send(Message::Text(close_frame("second-id", "control-token")))
+			.await
+			.expect("send second");
+		assert_eq!(rx.recv().await.expect("first forwarded").request_id(), Some("first-id"));
+		assert_eq!(rx.recv().await.expect("second forwarded").request_id(), Some("second-id"));
+
+		handle.respond(close_response("second-id"));
+		assert_close_response(next_lifecycle(&mut second).await, "second-id");
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(50), first.next())
+				.await
+				.is_err(),
+			"responses must not cross client connections"
+		);
+
+		first
+			.send(Message::Text(close_frame("shared-id", "control-token")))
+			.await
+			.expect("send owner");
+		assert_eq!(rx.recv().await.expect("owner forwarded").request_id(), Some("shared-id"));
+		second
+			.send(Message::Text(close_frame("shared-id", "control-token")))
+			.await
+			.expect("send collision");
+		match next_lifecycle(&mut second).await {
+			LifecycleServerMessage::SessionLifecycleError(error) => {
+				assert_eq!(error.request_id, "shared-id");
+				assert_eq!(error.reason, LifecycleErrorReason::DuplicateConflict);
+			},
+			other => panic!("expected collision error, got {other:?}"),
+		}
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+				.await
+				.is_err(),
+			"colliding request must not reach the host"
+		);
+
+		handle.respond(close_response("shared-id"));
+		assert_close_response(next_lifecycle(&mut first).await, "shared-id");
+		second
+			.send(Message::Text(close_frame("shared-id", "control-token")))
+			.await
+			.expect("reuse request id");
+		assert_eq!(rx.recv().await.expect("reused forwarded").request_id(), Some("shared-id"));
+		handle.respond(close_response("shared-id"));
+		assert_close_response(next_lifecycle(&mut second).await, "shared-id");
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn unknown_frame_is_ignored_without_forwarding_or_error() {
+		let handle = start_control(ControlServerConfig::new("control-token", "daemon-1"))
+			.await
+			.expect("start");
+		let mut rx = handle.take_lifecycle_receiver().expect("receiver");
+		let url = format!("ws://{}/?token=control-token", handle.addr());
+		let (mut ws, _) = connect_async(url).await.expect("connect");
+
+		ws.send(Message::Text(r#"{"type":"future_lifecycle_frame"}"#.into()))
+			.await
+			.expect("send unknown frame");
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(50), ws.next())
+				.await
+				.is_err(),
+			"unknown frames must be ignored without an error response"
+		);
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+				.await
+				.is_err(),
+			"unknown frames must not reach the host"
+		);
+		handle.stop();
+	}
+
+	fn close_response(request_id: &str) -> LifecycleServerMessage {
+		LifecycleServerMessage::SessionCloseResponse(crate::lifecycle::SessionCloseResponse {
+			request_id:        request_id.into(),
+			status:            LifecycleStatus::Ok,
+			session_id:        "sess-1".into(),
+			process_gone:      true,
+			history_preserved: true,
+			endpoint_stale:    true,
+		})
+	}
+
+	fn assert_close_response(msg: LifecycleServerMessage, request_id: &str) {
+		match msg {
+			LifecycleServerMessage::SessionCloseResponse(response) => {
+				assert_eq!(response.request_id, request_id);
+			},
+			other => panic!("expected close response, got {other:?}"),
+		}
+	}
 	#[tokio::test]
 	async fn non_loopback_bind_is_refused() {
 		let mut config = ControlServerConfig::new("control-token", "daemon-1");

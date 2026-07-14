@@ -153,4 +153,41 @@ describe("lifecycle command routing (G009)", () => {
 		expect(text).not.toContain("/repo/helper");
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
+	test("a paired private lifecycle response uses unsupported-platform copy", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		try {
+			const { calls, api } = spyBot();
+			const daemon = makeDaemon(agentDir, api);
+			const control = daemon as unknown as {
+				lifecycleControlActive: boolean;
+				submitLifecycleFrame: () => Promise<{
+					type: "session_lifecycle_error";
+					requestId: string;
+					status: "error";
+					reason: "unsupported_platform";
+					message: string;
+				}>;
+			};
+			control.lifecycleControlActive = true;
+			control.submitLifecycleFrame = async () => ({
+				type: "session_lifecycle_error",
+				requestId: "request-1",
+				status: "error",
+				reason: "unsupported_platform",
+				message: "ignored",
+			});
+
+			await daemon.handleTelegramUpdate(msg("42", "/session_create path /repo", 6));
+
+			const sends = calls.filter(call => call.method === "sendMessage");
+			expect(sends).toHaveLength(1);
+			expect(sends[0]?.body?.text).toBe(
+				"Remote session lifecycle is unavailable on this psmux host because GJC cannot prove immutable session identity. No lifecycle action was performed. Use a local GJC terminal with a supported tmux provider.",
+			);
+			expect(String(sends[0]?.body?.text)).not.toContain("Launching");
+			expect(String(sends[0]?.body?.text)).not.toContain("in progress");
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
 });

@@ -422,6 +422,22 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 			detail: `${live} live, ${unknownEndpoints} unverified endpoint file(s)`,
 		});
 	}
+	if (
+		telegramConfigured &&
+		daemon.present &&
+		daemon.alive &&
+		daemon.heartbeatFresh &&
+		daemon.identityMatches &&
+		!daemon.stopped &&
+		endpoints.total === 0
+	) {
+		checks.push({
+			name: "local_endpoint",
+			level: "warn",
+			detail:
+				"No local notification endpoint for this working directory. In this GJC terminal run /notify on; if it does not report notifications enabled, start a new local GJC session. Do not re-pair Telegram.",
+		});
+	}
 
 	// Optional network reachability probe.
 	let reachability = { probed: false, ok: false, detail: "not probed" };

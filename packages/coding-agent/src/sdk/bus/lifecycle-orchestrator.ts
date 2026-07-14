@@ -37,6 +37,7 @@ export interface LedgerEntry {
 	/** Close effect outcome: whether the tmux process is confirmed gone. */
 	processGone?: boolean;
 	reason?: LifecycleErrorReason;
+	resumeMode?: ResumeEffectResult["mode"];
 }
 
 /** The full on-disk ledger document. */
@@ -52,8 +53,9 @@ export interface LedgerStore {
 	write(doc: LedgerDoc): Promise<void>;
 }
 
-/** One audit line. Tokens and raw prompts are NEVER included. */
+/** Redacted audit-v2 event. */
 export interface AuditEvent {
+	schemaVersion: 2;
 	ts: string;
 	event:
 		| "accepted"
@@ -65,19 +67,13 @@ export interface AuditEvent {
 		| "success"
 		| "failure"
 		| "terminal_uncertain";
-	chatId: string;
+	chatRef: string;
 	updateId: number;
-	requestId: string;
-	requestHash: string;
+	requestRef: string;
 	verb: SessionLifecycleRequest["type"];
-	targetSummary: Record<string, unknown>;
-	sessionId?: string;
-	tmuxSession?: string;
+	targetKind: CanonicalTargetKind;
+	targetRef: string;
 	reason?: LifecycleErrorReason;
-	/** Prompt byte length only (never the prompt text). */
-	promptBytes?: number;
-	/** Prompt content hash only (never the prompt text). */
-	promptHash?: string;
 }
 
 export interface CreateEffectResult {
@@ -96,9 +92,13 @@ export interface ResumeEffectResult extends CreateEffectResult {
 export interface OrchestratorDeps {
 	/** The single paired chat id. Anything else is rejected before parsing. */
 	pairedChatId: string;
+	/** In-memory, derived 32-byte audit-v2 HMAC key. */
+	auditRedactionKey: Uint8Array;
 	now: () => number;
 	store: LedgerStore;
 	audit: (event: AuditEvent) => Promise<void> | void;
+	/** Resolves the returned tmux provider once per request for psmux preflight. */
+	isPsmuxProvider: () => boolean;
 	/** Per-chat create rate limiter: returns true when allowed. */
 	allowCreate: (chatId: string, nowMs: number) => boolean;
 	/** Persist the once-consumed 0600 startup-prompt file; returns its ref. */
@@ -117,11 +117,73 @@ export interface OrchestratorDeps {
 		sessionIdOrPrefix: string;
 		path?: string;
 	}) => Promise<ResumeEffectResult | { ambiguous: ResumeCandidate[] } | { notFound: true }>;
-	newLifecycleRequestId: () => string;
-	newSessionId: () => string;
 }
 
-/** A redaction-safe summary of a request target (never includes the token). */
+export type CanonicalTargetKind = "existing_path" | "worktree" | "plain_dir" | "session_close" | "session_resume";
+
+function isUnicodeScalarString(value: string): boolean {
+	for (let index = 0; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			if (index + 1 >= value.length) return false;
+			const next = value.charCodeAt(++index);
+			if (next < 0xdc00 || next > 0xdfff) return false;
+		} else if (code >= 0xdc00 && code <= 0xdfff) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function jsonString(value: string): string {
+	if (!isUnicodeScalarString(value)) throw new Error("invalid_target");
+	return JSON.stringify(value);
+}
+
+export function canonicalTarget(frame: SessionLifecycleRequest): string {
+	switch (frame.type) {
+		case "session_create":
+			switch (frame.target.kind) {
+				case "existing_path":
+					return `{"kind":"existing_path","path":${jsonString(frame.target.path)}}`;
+				case "worktree":
+					return `{"kind":"worktree","repo":${jsonString(frame.target.repo)},"branch":${jsonString(frame.target.branch)}}`;
+				case "plain_dir":
+					return `{"kind":"plain_dir","path":${jsonString(frame.target.path)}}`;
+			}
+			throw new Error("invalid_target");
+		case "session_close":
+			return `{"kind":"session_close","sessionId":${jsonString(frame.target.sessionId)},"tmuxSession":${frame.target.tmuxSession === undefined ? "null" : jsonString(frame.target.tmuxSession)},"sessionStateFile":${frame.target.sessionStateFile === undefined ? "null" : jsonString(frame.target.sessionStateFile)}}`;
+		case "session_resume":
+			return `{"kind":"session_resume","sessionIdOrPrefix":${jsonString(frame.target.sessionIdOrPrefix)},"path":${frame.target.path === undefined ? "null" : jsonString(frame.target.path)}}`;
+	}
+}
+
+export function canonicalRequest(frame: SessionLifecycleRequest): string {
+	const target = canonicalTarget(frame);
+	const startupPromptRef =
+		frame.type === "session_create" && frame.startupPromptRef !== undefined
+			? jsonString(frame.startupPromptRef)
+			: "null";
+	const modelPreset =
+		frame.type === "session_create" && frame.modelPreset !== undefined ? jsonString(frame.modelPreset) : "null";
+	const force = frame.type === "session_close" ? (frame.force === true ? "true" : "false") : "null";
+	return `{"type":${jsonString(frame.type)},"target":${target},"startupPromptRef":${startupPromptRef},"modelPreset":${modelPreset},"force":${force}}`;
+}
+
+function requestHashFromCanonical(canonical: string): string {
+	return crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
+}
+
+export function requestHash(frame: SessionLifecycleRequest): string {
+	return requestHashFromCanonical(canonicalRequest(frame));
+}
+
+export function auditRedactionRef(key: Uint8Array, domain: string, value: string): string {
+	if (key.byteLength !== 32) throw new Error("invalid_audit_redaction_key");
+	return crypto.createHmac("sha256", key).update(domain, "utf8").update(value, "utf8").digest("hex");
+}
+
 export function summarizeTarget(frame: SessionLifecycleRequest): Record<string, unknown> {
 	switch (frame.type) {
 		case "session_create":
@@ -133,20 +195,6 @@ export function summarizeTarget(frame: SessionLifecycleRequest): Record<string, 
 		case "session_resume":
 			return { sessionIdOrPrefix: frame.target.sessionIdOrPrefix };
 	}
-}
-
-/**
- * Stable request hash over the meaningful (non-token) request content. Used to
- * detect a duplicate update id reused with a DIFFERENT body (conflict).
- */
-export function requestHash(frame: SessionLifecycleRequest): string {
-	const canonical = JSON.stringify({
-		type: frame.type,
-		target: summarizeTarget(frame),
-		startupPromptRef: "startupPromptRef" in frame ? frame.startupPromptRef : undefined,
-		force: frame.type === "session_close" ? frame.force === true : undefined,
-	});
-	return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
 export function ledgerKey(chatId: string, updateId: number): string {
@@ -193,18 +241,34 @@ export async function handleLifecycleRequest(
 	deps: OrchestratorDeps,
 ): Promise<LifecycleOutcome> {
 	const nowMs = deps.now();
-	const hash = requestHash(frame);
+	let hash: string;
+	let canonicalRequestBytes: string;
+	let canonicalTargetBytes: string;
+	try {
+		canonicalRequestBytes = canonicalRequest(frame);
+		canonicalTargetBytes = canonicalTarget(frame);
+		hash = requestHashFromCanonical(canonicalRequestBytes);
+	} catch {
+		return { status: "error", reason: "invalid_target", message: "invalid lifecycle target" };
+	}
+	if (deps.auditRedactionKey.byteLength !== 32) throw new Error("invalid_audit_redaction_key");
 	const key = ledgerKey(frame.chatId, frame.updateId);
 	const targetSummary = summarizeTarget(frame);
-
+	const targetKind: CanonicalTargetKind =
+		frame.type === "session_create"
+			? frame.target.kind
+			: frame.type === "session_close"
+				? "session_close"
+				: "session_resume";
 	const baseAudit = {
+		schemaVersion: 2 as const,
 		ts: new Date(nowMs).toISOString(),
-		chatId: frame.chatId,
+		chatRef: auditRedactionRef(deps.auditRedactionKey, "gjc.lifecycle.audit.v2.chat\0", frame.chatId),
 		updateId: frame.updateId,
-		requestId: frame.requestId,
-		requestHash: hash,
+		requestRef: auditRedactionRef(deps.auditRedactionKey, "gjc.lifecycle.audit.v2.request\0", canonicalRequestBytes),
 		verb: frame.type,
-		targetSummary,
+		targetKind,
+		targetRef: auditRedactionRef(deps.auditRedactionKey, "gjc.lifecycle.audit.v2.target\0", canonicalTargetBytes),
 	} as const;
 
 	// 1. Strict paired-chat gating — BEFORE touching paths/processes or the ledger.
@@ -212,8 +276,25 @@ export async function handleLifecycleRequest(
 		await deps.audit({ ...baseAudit, event: "rejected", reason: "unauthorized" });
 		return { status: "error", reason: "unauthorized", message: "chat not paired" };
 	}
+	if (frame.type === "session_close" && frame.force !== true) {
+		await deps.audit({ ...baseAudit, event: "rejected", reason: "invalid_target" });
+		return {
+			status: "error",
+			reason: "invalid_target",
+			message: "session_close requires force=true; graceful close is not supported",
+		};
+	}
+	if (deps.isPsmuxProvider()) {
+		await deps.audit({ ...baseAudit, event: "rejected", reason: "unsupported_platform" });
+		return {
+			status: "error",
+			reason: "unsupported_platform",
+			message:
+				"Remote session lifecycle is unavailable on this psmux host because GJC cannot prove immutable session identity. No lifecycle action was performed. Use a local GJC terminal with a supported tmux provider.",
+		};
+	}
 
-	// 2. Durable idempotency.
+	// 4. Durable idempotency.
 	const doc = await deps.store.read();
 	const dup = classifyDuplicate(doc.entries[key], hash);
 	switch (dup.kind) {
@@ -221,19 +302,20 @@ export async function handleLifecycleRequest(
 			await deps.audit({ ...baseAudit, event: "rejected", reason: "duplicate_conflict" });
 			return { status: "error", reason: "duplicate_conflict", message: "update id reused with different body" };
 		case "reack_success":
-			await deps.audit({ ...baseAudit, event: "duplicate_reack", sessionId: dup.entry.sessionId });
-			return { status: "ok", entry: dup.entry };
+			await deps.audit({ ...baseAudit, event: "duplicate_reack" });
+			return { status: "ok", entry: dup.entry, ...(dup.entry.resumeMode ? { mode: dup.entry.resumeMode } : {}) };
 		case "reack_failure":
+			if (dup.entry.reason === undefined) throw new Error("invalid lifecycle failure ledger entry");
 			await deps.audit({ ...baseAudit, event: "duplicate_reack", reason: dup.entry.reason });
 			return {
 				status: "error",
-				reason: dup.entry.reason ?? "terminal_uncertain",
+				reason: dup.entry.reason,
 				message: "previously failed; send a new update to retry",
 			};
 		case "in_progress":
 			// A retry arrived while the first attempt is still running: never
 			// respawn — report pending so the caller waits for the original.
-			await deps.audit({ ...baseAudit, event: "recovered_in_progress", sessionId: dup.entry.intendedSessionId });
+			await deps.audit({ ...baseAudit, event: "recovered_in_progress" });
 			return { status: "pending", entry: dup.entry };
 		case "terminal_uncertain":
 			await deps.audit({ ...baseAudit, event: "recovered_in_progress", reason: "terminal_uncertain" });
@@ -246,50 +328,41 @@ export async function handleLifecycleRequest(
 			break;
 	}
 
-	// 3. Per-chat create rate limit (create only).
+	// 5. Per-chat create rate limit (create only).
 	if (frame.type === "session_create" && !deps.allowCreate(frame.chatId, nowMs)) {
 		await deps.audit({ ...baseAudit, event: "rate_limited", reason: "rate_limited" });
 		return { status: "error", reason: "rate_limited", message: "create rate limit exceeded" };
 	}
 
-	// 4. Close is intentionally force-only until a graceful close contract exists.
-	if (frame.type === "session_close" && frame.force !== true) {
-		await deps.audit({ ...baseAudit, event: "rejected", reason: "invalid_target" });
-		return {
-			status: "error",
-			reason: "invalid_target",
-			message: "session_close requires force=true; graceful close is not supported",
-		};
-	}
-
-	// 5. Preallocate ids + write in_progress (fsynced) BEFORE any spawn.
-	const lifecycleRequestId = frame.type === "session_create" ? frame.lifecycleRequestId : deps.newLifecycleRequestId();
-	const intendedSessionId =
-		frame.type === "session_create" ? frame.intendedSessionId || deps.newSessionId() : deps.newSessionId();
+	// 6. Persist immutable create ids + write in_progress (fsynced) BEFORE any spawn.
+	if (frame.type === "session_create" && (!frame.lifecycleRequestId || !frame.intendedSessionId))
+		return { status: "error", reason: "invalid_target", message: "create lifecycle ids must be non-empty" };
 	let startupPromptRef: string | undefined;
-	let promptBytes: number | undefined;
-	let promptHash: string | undefined;
 
 	const entry: LedgerEntry = {
 		requestHash: hash,
 		state: "in_progress",
 		requestId: frame.requestId,
 		verb: frame.type,
-		intendedSessionId,
+		intendedSessionId: frame.type === "session_create" ? frame.intendedSessionId : undefined,
 		createdAt: nowMs,
 		updatedAt: nowMs,
 		targetSummary,
 	};
 	doc.entries[key] = entry;
 	await deps.store.write(doc);
-	await deps.audit({ ...baseAudit, event: "accepted", sessionId: intendedSessionId });
+	await deps.audit({ ...baseAudit, event: "accepted" });
 
 	try {
 		if (frame.type === "session_create") {
-			startupPromptRef = await deps.writeStartupPrompt(frame.requestId, undefined);
+			startupPromptRef = await deps.writeStartupPrompt(frame.requestId, frame.startupPromptRef);
 			entry.startupPromptRef = startupPromptRef;
-			await deps.audit({ ...baseAudit, event: "spawn_started", sessionId: intendedSessionId });
-			const result = await deps.spawnCreate(frame, { lifecycleRequestId, intendedSessionId, startupPromptRef });
+			await deps.audit({ ...baseAudit, event: "spawn_started" });
+			const result = await deps.spawnCreate(frame, {
+				lifecycleRequestId: frame.lifecycleRequestId,
+				intendedSessionId: frame.intendedSessionId,
+				startupPromptRef,
+			});
 			Object.assign(entry, {
 				state: "success",
 				updatedAt: deps.now(),
@@ -299,14 +372,7 @@ export async function handleLifecycleRequest(
 				endpointUrl: result.endpointUrl,
 			});
 			await deps.store.write(doc);
-			await deps.audit({
-				...baseAudit,
-				event: "success",
-				sessionId: result.sessionId,
-				tmuxSession: result.tmuxSession,
-				promptBytes,
-				promptHash,
-			});
+			await deps.audit({ ...baseAudit, event: "success" });
 			return { status: "ok", entry };
 		}
 
@@ -320,7 +386,7 @@ export async function handleLifecycleRequest(
 				processGone: closed.processGone,
 			});
 			await deps.store.write(doc);
-			await deps.audit({ ...baseAudit, event: "success", sessionId: frame.target.sessionId });
+			await deps.audit({ ...baseAudit, event: "success" });
 			return { status: "ok", entry };
 		}
 
@@ -349,9 +415,10 @@ export async function handleLifecycleRequest(
 			sessionId: resumed.sessionId,
 			tmuxSession: resumed.tmuxSession,
 			endpointUrl: resumed.endpointUrl,
+			resumeMode: resumed.mode,
 		});
 		await deps.store.write(doc);
-		await deps.audit({ ...baseAudit, event: "success", sessionId: resumed.sessionId });
+		await deps.audit({ ...baseAudit, event: "success" });
 		return { status: "ok", entry, mode: resumed.mode };
 	} catch (err) {
 		// A side effect may have occurred; do not repeat it automatically. Mark

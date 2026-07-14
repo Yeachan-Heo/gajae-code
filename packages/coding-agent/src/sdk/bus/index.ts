@@ -72,7 +72,7 @@ import {
 	sessionTag,
 } from "./config";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage } from "./helpers";
-import { ensureTelegramDaemonRunning } from "./telegram-daemon";
+import { type EnsureDaemonResult, ensureTelegramDaemonRunning } from "./telegram-daemon";
 
 // ===========================================================================
 // Session lifecycle control protocol (TypeScript mirror of the Rust wire
@@ -221,7 +221,8 @@ export type LifecycleErrorReason =
 	| "readiness_timeout"
 	| "close_refused"
 	| "not_found"
-	| "terminal_uncertain";
+	| "terminal_uncertain"
+	| "unsupported_platform";
 
 /** A candidate returned with an `ambiguous_target` resume error. */
 export interface ResumeCandidate {
@@ -1539,6 +1540,11 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
+		ensureTelegramDaemon?: (input: {
+			settings: Settings;
+			cwd: string;
+			sessionId: string;
+		}) => Promise<EnsureDaemonResult>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
@@ -1551,6 +1557,7 @@ export function createNotificationsExtension(
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
 	let deferredIdentityRotation: { event: { previousSessionFile?: string }; ctx: ExtensionContext } | undefined;
+	const ensureTelegramDaemon = options.ensureTelegramDaemon ?? ensureTelegramDaemonRunning;
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -2409,7 +2416,7 @@ export function createNotificationsExtension(
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
 					if (isTelegramConfigured(cfg))
-						await ensureTelegramDaemonRunning({ settings, cwd: ctx.cwd, sessionId: id });
+						await ensureTelegramDaemon({ settings, cwd: ctx.cwd, sessionId: id });
 					if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
 					if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
 				} catch (e) {

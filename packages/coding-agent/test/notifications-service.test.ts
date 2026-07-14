@@ -137,7 +137,13 @@ describe("notification-service health", () => {
 	});
 
 	test("healthy daemon with fresh heartbeat and matching identity is ok", async () => {
-		const { fs } = mockFs({ [statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }) });
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			[path.join("/tmp/gjc-none", "notifications", "session-a.json")]: JSON.stringify({
+				sessionId: "session-a",
+				pid: 1000,
+			}),
+		});
 		const report = await checkNotificationHealth({
 			settings,
 			stateRoot: "/tmp/gjc-none",
@@ -145,6 +151,69 @@ describe("notification-service health", () => {
 		});
 		expect(report.daemon.identityMatches).toBe(true);
 		expect(report.overall).toBe("ok");
+		expect(report.checks.some(check => check.name === "local_endpoint")).toBe(false);
+	});
+	test("reports a current-root unavailable endpoint hint only for an active matching daemon", async () => {
+		const { fs } = mockFs({ [statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }) });
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		const hint = report.checks.find(check => check.name === "local_endpoint");
+		expect(report.endpoints.total).toBe(0);
+		expect(report.overall).toBe("warn");
+		expect(hint).toEqual({
+			name: "local_endpoint",
+			level: "warn",
+			detail:
+				"No local notification endpoint for this working directory. In this GJC terminal run /notify on; if it does not report notifications enabled, start a new local GJC session. Do not re-pair Telegram.",
+		});
+		expect(report.checks.indexOf(hint!)).toBe(report.checks.findIndex(check => check.name === "endpoints") + 1);
+	});
+
+	test("suppresses the unavailable endpoint hint for a stopped daemon", async () => {
+		const { fs } = mockFs({ [statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, stoppedAt: 1_495 }) });
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.checks.some(check => check.name === "local_endpoint")).toBe(false);
+	});
+	test.each([
+		["absent", undefined, undefined, true],
+		["dead", daemonStateJson({ pid: 999, heartbeatAt: 1_490 }), undefined, true],
+		["stale", daemonStateJson({ pid: 1000, heartbeatAt: 0 }), undefined, true],
+		["mismatched", daemonStateJson({ pid: 1000, chatId: "other", heartbeatAt: 1_490 }), undefined, true],
+		["stopped", daemonStateJson({ pid: 1000, heartbeatAt: 1_490, stoppedAt: 1_495 }), undefined, true],
+		["unconfigured", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), undefined, false],
+		["live endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), { sessionId: "s", pid: 1000 }, true],
+		["dead endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), { sessionId: "s", pid: 999 }, true],
+		["unknown endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), { sessionId: "s" }, true],
+		["unreadable endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), "not-json", true],
+	])("suppresses the local endpoint hint for %s state", async (_name, state, endpoint, configured) => {
+		const rowSettings = Settings.isolated(
+			configured
+				? {
+						"notifications.enabled": true,
+						"notifications.telegram.botToken": TOKEN,
+						"notifications.telegram.chatId": "12345",
+					}
+				: { "notifications.enabled": false },
+		);
+		const rowStatePath = daemonPaths(rowSettings.getAgentDir()).state;
+		const endpointPath = path.join("/tmp/gjc-none", "notifications", "session-a.json");
+		const { fs } = mockFs({
+			...(state ? { [rowStatePath]: state } : {}),
+			...(endpoint ? { [endpointPath]: typeof endpoint === "string" ? endpoint : JSON.stringify(endpoint) } : {}),
+		});
+		const report = await checkNotificationHealth({
+			settings: rowSettings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => (_name === "stale" ? 1_000_000 : 1_500), pidAlive: pid => pid === 1000 },
+		});
+		expect(report.checks.some(check => check.name === "local_endpoint")).toBe(false);
 	});
 });
 

@@ -30,6 +30,8 @@ const closed: string[] = [];
 function deps(): OrchestratorDeps {
 	return {
 		pairedChatId: "42",
+		auditRedactionKey: new Uint8Array(32).fill(11),
+		isPsmuxProvider: () => false,
 		now: () => Date.now(),
 		store: fileLedgerStore(path.join(tmp, "idempotency.json")),
 		audit: fileAudit(path.join(tmp, "audit.jsonl")),
@@ -47,8 +49,6 @@ function deps(): OrchestratorDeps {
 			return { processGone: true };
 		},
 		resumeSession: async () => ({ ambiguous: [] }),
-		newLifecycleRequestId: () => `lc-${crypto.randomUUID()}`,
-		newSessionId: () => `s${crypto.randomUUID().slice(0, 8)}`,
 	};
 }
 

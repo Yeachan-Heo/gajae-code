@@ -41,6 +41,7 @@ import {
 	type LifecycleControlServer,
 	type LifecycleControlServerFactory,
 } from "./lifecycle-control-runtime";
+import type { OrchestratorDeps } from "./lifecycle-orchestrator";
 import { NotificationOperatorRuntime, OperatorBackoffPolicy, OperatorEventRouter } from "./operator-runtime";
 import { RateLimitPool } from "./rate-limit-pool";
 import { listRecentSessions } from "./recent-activity";
@@ -254,6 +255,9 @@ async function fetchWithRetry(
 }
 
 export { type DaemonPaths, daemonPaths } from "./daemon-paths";
+export function deriveLifecycleAuditRedactionKey(botToken: string): Uint8Array {
+	return crypto.createHmac("sha256", botToken).update("gjc.lifecycle.audit.v2.key", "utf8").digest();
+}
 
 /**
  * Attach session-lifecycle control (create/close/resume) to the running daemon.
@@ -265,19 +269,23 @@ export { type DaemonPaths, daemonPaths } from "./daemon-paths";
  * (NotificationControlServer) is owned/started by the daemon process; this
  * function only connects it to policy. Returns the orchestrator deps for tests.
  */
+
 export function startDaemonLifecycleControl(input: {
 	controlServer: ControlServerLike;
 	pairedChatId: string;
 	agentDir: string;
+	auditRedactionKey: Uint8Array;
 	env?: NodeJS.ProcessEnv;
-}): void {
+}): OrchestratorDeps {
 	const deps = buildOrchestratorDeps({
 		pairedChatId: input.pairedChatId,
 		agentNotificationsDir: daemonPaths(input.agentDir).dir,
 		sessionsRoot: path.join(input.agentDir, "sessions"),
+		auditRedactionKey: input.auditRedactionKey,
 		env: input.env,
 	});
 	attachLifecycleControl(input.controlServer, deps);
+	return deps;
 }
 
 async function ensureDir(fsImpl: TelegramDaemonFs, dir: string): Promise<void> {
@@ -955,6 +963,16 @@ export interface TelegramDaemonOptions {
 	 * default applies (e.g. lifecycle control disabled), no control server starts.
 	 */
 	createLifecycleControlServer?: LifecycleControlServerFactory | null;
+	/**
+	 * Test seam for observing the exact production lifecycle dependency input.
+	 * Production defaults to {@link buildOrchestratorDeps}.
+	 */
+	createLifecycleOrchestratorDeps?: (input: {
+		pairedChatId: string;
+		agentNotificationsDir: string;
+		sessionsRoot: string;
+		auditRedactionKey: Uint8Array;
+	}) => OrchestratorDeps;
 	/** Rich text promotion (enabled by default; see rich-render.ts). */
 	rich?: { enabled: boolean };
 	/** Opt-in rich-draft streaming of live turn previews (off by default; see rich-draft.ts). */
@@ -1145,10 +1163,11 @@ export class TelegramNotificationDaemon {
 			const token = crypto.randomBytes(32).toString("base64url");
 			const agentDir = this.opts.settings.getAgentDir();
 			server = factory({ token, ownerId: this.opts.ownerId, agentDir });
-			const deps = buildOrchestratorDeps({
+			const deps = (this.opts.createLifecycleOrchestratorDeps ?? buildOrchestratorDeps)({
 				pairedChatId: this.opts.chatId,
 				agentNotificationsDir: daemonPaths(agentDir).dir,
 				sessionsRoot: path.join(agentDir, "sessions"),
+				auditRedactionKey: deriveLifecycleAuditRedactionKey(this.opts.botToken),
 			});
 			// Register the lifecycle-request handler BEFORE start(): the native
 			// control server captures the callback at start time, so wiring must
@@ -1701,6 +1720,26 @@ export class TelegramNotificationDaemon {
 		} catch (err) {
 			logger.warn(`notifications: failed to persist Telegram update id ${updateId}: ${String(err)}`);
 		}
+	}
+	private async rememberSeenUpdateIdForUnavailableNotice(updateId: number): Promise<boolean> {
+		if (!Number.isSafeInteger(updateId) || updateId < 0) return false;
+		const candidate = new Set(this.dispatchState.seenUpdateIds);
+		candidate.add(updateId);
+		while (candidate.size > SEEN_UPDATE_ID_LIMIT) candidate.delete(candidate.values().next().value!);
+		try {
+			const paths = daemonPaths(this.opts.settings.getAgentDir());
+			await ensureDir(this.fsImpl, paths.dir);
+			await writeJsonAtomic(this.fsImpl, paths.seenUpdates, {
+				version: 1,
+				updateIds: [...candidate],
+			});
+		} catch {
+			logger.warn("notifications: unavailable-control notice state publication failed");
+			return false;
+		}
+		this.dispatchState.seenUpdateIds.clear();
+		for (const seenId of candidate) this.dispatchState.seenUpdateIds.add(seenId);
+		return true;
 	}
 
 	async scanRoots(): Promise<void> {
@@ -3136,6 +3175,28 @@ export class TelegramNotificationDaemon {
 			});
 			if (inbound.kind === "duplicate") return;
 			if (inbound.kind === "inject") {
+				if (!(await this.pairedChatIsPrivate())) return;
+				const unavailableControl = inbound.attachment
+					? { kind: "none" as const }
+					: parseTelegramControlCommand(inbound.text, this.botUsername);
+				if (unavailableControl.kind === "ignored" || unavailableControl.kind === "invalid") return;
+				if (
+					unavailableControl.kind === "command" &&
+					this.sessions.get(inbound.sessionId)?.ws.readyState !== WebSocket.OPEN
+				) {
+					if (await this.rememberSeenUpdateIdForUnavailableNotice(inbound.updateId)) {
+						try {
+							await this.botApi.call("sendMessage", {
+								chat_id: this.opts.chatId,
+								message_thread_id: Number(inbound.threadId),
+								text: "Session control unavailable: this local GJC session is disconnected.",
+							});
+						} catch {
+							logger.warn("notifications: unavailable-control notice delivery failed");
+						}
+					}
+					return;
+				}
 				const session = this.sessions.get(inbound.sessionId);
 				if (session?.ws.readyState === WebSocket.OPEN) {
 					const attachmentResult = inbound.attachment
