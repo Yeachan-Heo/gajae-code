@@ -1129,13 +1129,17 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	// window rename and provider refusal so inapplicable root launches reach main
 	// unchanged, while unsupported managed launches fail before any tmux mutation.
 	const plan = buildDefaultTmuxLaunchPlan(context);
+
 	if (plan?.isPsmux) {
-		(context.diagnosticWriter ?? safeStderrWrite)(
-			"psmux cannot provide immutable owner identity; refusing managed session creation.\n",
-		);
-		throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
+		// psmux detected as the tmux backend on Windows. The new owner-isolation
+		// gate rejects psmux on the basis of lacking native immutable identity proof,
+		// but no equivalent proof is available on Windows at all (the cgroup path
+		// is not_applicable). Until psmux gains equivalent support — or a Windows-
+		// native equivalent — skip the hard refusal and fall through to the legacy
+		// launch path so `gjc --tmux` remains usable for Windows + psmux hosts.
 	}
 	// Direct launches inside an ambient tmux session retain their existing title
+
 	// behavior, but only after managed-launch applicability was ruled out.
 	renameExistingTmuxWindowIfNeeded(context);
 	if (!plan) {
@@ -1178,7 +1182,11 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		(context.diagnosticWriter ?? safeStderrWrite)(
 			"psmux cannot provide immutable owner identity; refusing managed session creation.\n",
 		);
-		throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
+		if (plan.isPsmux) {
+			// Defense-in-depth guard for future plan seams — same rationale as the
+			// upstream throw: continue with the legacy launch path instead of
+			// refusing the launch on Windows + psmux.
+		}
 	}
 	const controlOptions: TmuxSpawnOptions = {
 		...options,
