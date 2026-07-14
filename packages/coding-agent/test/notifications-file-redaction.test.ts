@@ -2,10 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Settings } from "../src/config/settings";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
+import {
+	cleanupIsolatedNotificationRuntimes,
+	isolatedNotificationSettings,
+	type NotificationRuntimeShutdown,
+} from "./helpers/notification-settings";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Promise<void> {
@@ -22,9 +26,17 @@ type Frame = { type: string; redact?: boolean };
 
 const tempDirs: string[] = [];
 const openSockets: WebSocket[] = [];
+const agentDirs: string[] = [];
+const runtimeShutdowns: NotificationRuntimeShutdown[] = [];
+const requiredAgentDirs = new Set<string>();
 
-afterEach(() => {
-	for (const ws of openSockets.splice(0)) ws.close();
+afterEach(async () => {
+	for (const ws of openSockets.splice(0)) {
+		try {
+			ws.close();
+		} catch {}
+	}
+	await cleanupIsolatedNotificationRuntimes(runtimeShutdowns, agentDirs, requiredAgentDirs);
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -48,11 +60,12 @@ function createHarness(redact: boolean) {
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	const settings = Settings.isolated({ "notifications.redact": redact });
-	createNotificationsExtension(api, { settings });
-
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-file-redaction-"));
 	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
+	const settings = isolatedNotificationSettings(agentDir, { "notifications.redact": redact });
+	createNotificationsExtension(api, { settings });
 	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	let sid = `file-redaction-${suffix}`;
 	const ctx = {
@@ -64,12 +77,16 @@ function createHarness(redact: boolean) {
 			getCwd: () => cwd,
 		},
 	} as never;
+	runtimeShutdowns.push(async () => {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+	});
 	const endpoint = () => path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
 
 	return {
 		handlers,
 		ctx,
 		cwd,
+		agentDir,
 		get sid() {
 			return sid;
 		},
@@ -86,6 +103,7 @@ async function startAndConnect(harness: ReturnType<typeof createHarness>): Promi
 	token: string;
 }> {
 	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+	requiredAgentDirs.add(harness.agentDir);
 	await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "endpoint file");
 	const { url, token } = readEndpoint(harness.endpoint());
 	const frames: Frame[] = [];
@@ -129,6 +147,7 @@ test("session_switch keeps telegram_send file attachments blocked under redactio
 	await withNotifications(async () => {
 		const harness = createHarness(true);
 		await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+		requiredAgentDirs.add(harness.agentDir);
 		await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "endpoint file");
 
 		const previousId = harness.sid;

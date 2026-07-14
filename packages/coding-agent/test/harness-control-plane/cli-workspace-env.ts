@@ -135,13 +135,22 @@ export function createHarnessCliEnv(repoRoot: string, baseEnv: NodeJS.ProcessEnv
 	linkWorkspacePackages(path.join(nodePathRoot, "@gajae-code"), packages);
 	const cleanupRepoLinks = createRepoNodeModulesLinks(repoRoot, packages);
 
+	// Harness subprocesses need SDK endpoints, but their test-only session discovery
+	// must never spawn a detached broker or touch operator notification state.
+	const tempAgentDir = path.join(registryRoot, "agent");
+
 	const existingNodePath = baseEnv.NODE_PATH;
 	const env: NodeJS.ProcessEnv = {
 		...baseEnv,
 		[WORKSPACE_NODE_MODULES_ENV]: path.join(repoRoot, "node_modules"),
 		GJC_HARNESS_ROOT_REGISTRY_DIR: registryRoot,
+		GJC_HARNESS_TEST_DISABLE_BROKER: "1",
+		GJC_NOTIFICATIONS: "0",
+		GJC_CODING_AGENT_DIR: tempAgentDir,
+		PI_CODING_AGENT_DIR: tempAgentDir,
 		NODE_PATH: existingNodePath ? `${nodePathRoot}${path.delimiter}${existingNodePath}` : nodePathRoot,
 	};
+	delete env.GJC_NOTIFICATIONS_TOKEN;
 
 	return {
 		env,

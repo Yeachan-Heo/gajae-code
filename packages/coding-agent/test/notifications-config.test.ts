@@ -24,6 +24,11 @@ import {
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { daemonPaths } from "../src/sdk/bus/telegram-daemon";
 import { SessionManager } from "../src/session/session-manager";
+import {
+	cleanupIsolatedNotificationRuntimes,
+	isolatedNotificationSettings,
+	type NotificationRuntimeShutdown,
+} from "./helpers/notification-settings";
 
 const BASE_CFG: NotificationConfig = {
 	enabled: false,
@@ -68,8 +73,12 @@ const PRIMARY_GLOBAL_CFG: NotificationConfig = {
 	sessionScope: "primary",
 };
 const tempDirs: string[] = [];
+const brokerAgentDirs: string[] = [];
+const requiredBrokerAgentDirs = new Set<string>();
+const runtimeShutdowns: NotificationRuntimeShutdown[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+	await cleanupIsolatedNotificationRuntimes(runtimeShutdowns, brokerAgentDirs, requiredBrokerAgentDirs);
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -348,9 +357,10 @@ describe("notifications config", () => {
 	test("settings-enabled subagent sessions do not register the notifications extension", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-subagent-"));
 		tempDirs.push(cwd);
+		brokerAgentDirs.push(cwd);
 		const previous = process.env.GJC_NOTIFICATIONS;
 		delete process.env.GJC_NOTIFICATIONS;
-		const settings = Settings.isolated({
+		const settings = isolatedNotificationSettings(cwd, {
 			"notifications.enabled": true,
 			"notifications.telegram.botToken": " ",
 			"notifications.telegram.chatId": "\t",
@@ -359,8 +369,6 @@ describe("notifications config", () => {
 			"notifications.discord.guildId": "discord-guild",
 			"notifications.discord.parentChannelId": "discord-parent",
 		});
-
-		const disposers: Array<() => Promise<void>> = [];
 
 		try {
 			resetSettingsForTest();
@@ -380,7 +388,13 @@ describe("notifications config", () => {
 				enableMCP: false,
 				enableLsp: false,
 			});
-			disposers.push(() => topLevel.session.dispose());
+			runtimeShutdowns.push(async () => {
+				try {
+					await topLevel.session.extensionRunner?.emit({ type: "session_shutdown" });
+				} finally {
+					await topLevel.session.dispose();
+				}
+			});
 
 			const subagent = await createAgentSession({
 				cwd,
@@ -398,7 +412,13 @@ describe("notifications config", () => {
 				enableLsp: false,
 				taskDepth: 1,
 			});
-			disposers.push(() => subagent.session.dispose());
+			runtimeShutdowns.push(async () => {
+				try {
+					await subagent.session.extensionRunner?.emit({ type: "session_shutdown" });
+				} finally {
+					await subagent.session.dispose();
+				}
+			});
 			const parentPrefixSubagent = await createAgentSession({
 				cwd,
 				agentDir: cwd,
@@ -415,7 +435,13 @@ describe("notifications config", () => {
 				enableLsp: false,
 				parentTaskPrefix: "0-Sub",
 			});
-			disposers.push(() => parentPrefixSubagent.session.dispose());
+			runtimeShutdowns.push(async () => {
+				try {
+					await parentPrefixSubagent.session.extensionRunner?.emit({ type: "session_shutdown" });
+				} finally {
+					await parentPrefixSubagent.session.dispose();
+				}
+			});
 			const agentTypeOnlySubagent = await createAgentSession({
 				cwd,
 				agentDir: cwd,
@@ -432,7 +458,13 @@ describe("notifications config", () => {
 				enableLsp: false,
 				currentAgentType: "executor",
 			});
-			disposers.push(() => agentTypeOnlySubagent.session.dispose());
+			runtimeShutdowns.push(async () => {
+				try {
+					await agentTypeOnlySubagent.session.extensionRunner?.emit({ type: "session_shutdown" });
+				} finally {
+					await agentTypeOnlySubagent.session.dispose();
+				}
+			});
 			const explicitExtensionSubagent = await createAgentSession({
 				cwd,
 				agentDir: cwd,
@@ -449,8 +481,15 @@ describe("notifications config", () => {
 				enableLsp: false,
 				taskDepth: 1,
 			});
-			disposers.push(() => explicitExtensionSubagent.session.dispose());
+			runtimeShutdowns.push(async () => {
+				try {
+					await explicitExtensionSubagent.session.extensionRunner?.emit({ type: "session_shutdown" });
+				} finally {
+					await explicitExtensionSubagent.session.dispose();
+				}
+			});
 			await topLevel.session.extensionRunner?.emit({ type: "session_start" });
+			requiredBrokerAgentDirs.add(cwd);
 			await subagent.session.extensionRunner?.emit({ type: "session_start" });
 			await parentPrefixSubagent.session.extensionRunner?.emit({ type: "session_start" });
 			await agentTypeOnlySubagent.session.extensionRunner?.emit({ type: "session_start" });
@@ -485,7 +524,6 @@ describe("notifications config", () => {
 			expect(fs.existsSync(explicitExtensionSubagentEndpoint)).toBe(false);
 			expect(fs.existsSync(daemonPaths(cwd).roots)).toBe(false);
 		} finally {
-			await Promise.all(disposers.reverse().map(dispose => dispose()));
 			if (previous === undefined) {
 				delete process.env.GJC_NOTIFICATIONS;
 			} else {
@@ -498,12 +536,13 @@ describe("notifications config", () => {
 	test("sessionScope=primary keeps a canonical SDK endpoint while suppressing GJC-spawned child delivery", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-notif-spawned-"));
 		tempDirs.push(cwd);
+		brokerAgentDirs.push(cwd);
 		const previousNotif = process.env.GJC_NOTIFICATIONS;
 		const previousSpawn = process.env.GJC_SPAWNED_BY_SESSION;
 		delete process.env.GJC_NOTIFICATIONS;
 		delete process.env.GJC_SPAWNED_BY_SESSION;
 		const adapterSettings = (scope: "all" | "primary"): Settings =>
-			Settings.isolated({
+			isolatedNotificationSettings(cwd, {
 				"notifications.enabled": true,
 				"notifications.discord.botToken": "discord-token",
 				"notifications.discord.applicationId": "discord-application",
@@ -513,7 +552,6 @@ describe("notifications config", () => {
 			});
 		const primarySettings = adapterSettings("primary");
 		const allSettings = adapterSettings("all");
-		const disposers: Array<() => Promise<void>> = [];
 		const spawn = async (settings: Settings) =>
 			createAgentSession({
 				cwd,
@@ -539,22 +577,41 @@ describe("notifications config", () => {
 			// while the session-scoped delivery guard above suppresses notifications.
 			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
 			const suppressed = await spawn(primarySettings);
-			disposers.push(() => suppressed.session.dispose());
+			runtimeShutdowns.push(async () => {
+				try {
+					await suppressed.session.extensionRunner?.emit({ type: "session_shutdown" });
+				} finally {
+					await suppressed.session.dispose();
+				}
+			});
 			expect(process.env.GJC_SPAWNED_BY_SESSION).toBeUndefined();
 
 			// 2. Spawned child under the default "all" scope still registers.
 			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
 			const preserved = await spawn(allSettings);
-			disposers.push(() => preserved.session.dispose());
+			runtimeShutdowns.push(async () => {
+				try {
+					await preserved.session.extensionRunner?.emit({ type: "session_shutdown" });
+				} finally {
+					await preserved.session.dispose();
+				}
+			});
 
 			// 3. Spawned child under primary WITH explicit opt-in keeps its endpoint.
 			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
 			process.env.GJC_NOTIFICATIONS = "1";
 			const optedIn = await spawn(primarySettings);
-			disposers.push(() => optedIn.session.dispose());
+			runtimeShutdowns.push(async () => {
+				try {
+					await optedIn.session.extensionRunner?.emit({ type: "session_shutdown" });
+				} finally {
+					await optedIn.session.dispose();
+				}
+			});
 			delete process.env.GJC_NOTIFICATIONS;
 
 			await suppressed.session.extensionRunner?.emit({ type: "session_start" });
+			requiredBrokerAgentDirs.add(cwd);
 			await preserved.session.extensionRunner?.emit({ type: "session_start" });
 			await optedIn.session.extensionRunner?.emit({ type: "session_start" });
 
@@ -562,7 +619,6 @@ describe("notifications config", () => {
 			expect(fs.existsSync(endpointFor(preserved.session.sessionId))).toBe(true);
 			expect(fs.existsSync(endpointFor(optedIn.session.sessionId))).toBe(true);
 		} finally {
-			await Promise.all(disposers.reverse().map(dispose => dispose()));
 			if (previousNotif === undefined) delete process.env.GJC_NOTIFICATIONS;
 			else process.env.GJC_NOTIFICATIONS = previousNotif;
 			if (previousSpawn === undefined) delete process.env.GJC_SPAWNED_BY_SESSION;

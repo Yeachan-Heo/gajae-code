@@ -48,6 +48,8 @@ afterEach(() => {
 	delete process.env.GJC_SDK_DISABLE;
 	delete process.env.GJC_NOTIFICATIONS;
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
+	delete process.env.GJC_HARNESS_TEST_DISABLE_BROKER;
+	delete process.env.GJC_HARNESS_TEST_NODE_MODULES;
 	delete process.env.GJC_LIFECYCLE_TEST_SECRET;
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
 });
@@ -266,6 +268,7 @@ test("lifecycle teardown records failed host and server cleanup as false", async
 			brokerRegistrationReleased: false,
 		});
 	} finally {
+		await brokerOwnerForTest(cwd)?.stop();
 		stop.mockRestore();
 		(NotificationServer.prototype as unknown as { stop: () => void }).stop = nativeStop;
 	}
@@ -290,6 +293,7 @@ test("lifecycle session shutdown disposes the exact endpoint once", async () => 
 		expect(stop).toHaveBeenCalledTimes(1);
 		expect(tracker.result.fenced).toBe(true);
 	} finally {
+		await brokerOwnerForTest(cwd)?.stop();
 		stop.mockRestore();
 	}
 });
@@ -361,6 +365,26 @@ test("SDK broker registration records an absolute lifecycle scope", async () => 
 	} finally {
 		await brokerOwnerForTest(agentDir)?.stop();
 	}
+});
+
+test("harness test seam keeps the SDK endpoint but skips detached broker discovery", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-harness-no-broker-"));
+	const agentDir = path.join(cwd, ".agent");
+	const sessionId = "harness-no-broker";
+	dirs.push(cwd);
+	process.env.GJC_NOTIFICATIONS = "1";
+	process.env.GJC_HARNESS_TEST_DISABLE_BROKER = "1";
+	process.env.GJC_HARNESS_TEST_NODE_MODULES = path.join(cwd, "node_modules");
+
+	const handlers = start(context(cwd, sessionId), {
+		get: () => undefined,
+		getAgentDir: () => agentDir,
+	} as unknown as Settings);
+	await waitFor(() => fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`)), "SDK endpoint");
+
+	expect(brokerOwnerForTest(agentDir)).toBeUndefined();
+	expect(fs.existsSync(path.join(agentDir, "sdk", "broker.json"))).toBe(false);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
 });
 
 test("ExtensionRunner forwards SDK permission providers into its production context", () => {

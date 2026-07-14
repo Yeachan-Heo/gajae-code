@@ -7,6 +7,11 @@ import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { renderThreadedFrame } from "../src/sdk/bus/threaded-render";
+import {
+	cleanupIsolatedNotificationRuntimes,
+	isolatedNotificationSettings,
+	type NotificationRuntimeShutdown,
+} from "./helpers/notification-settings";
 
 // ---------------------------------------------------------------------------
 // 1) Pure render contract: streamed turn frames become editable, and live +
@@ -61,7 +66,10 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = { type: string; phase?: string; text?: string; messageRef?: string };
 
 const tempDirs: string[] = [];
+const agentDirs: string[] = [];
 const openSockets: WebSocket[] = [];
+const runtimeShutdowns: NotificationRuntimeShutdown[] = [];
+const requiredAgentDirs = new Set<string>();
 const envKeys = [
 	"GJC_NOTIFICATIONS",
 	"GJC_NOTIFICATIONS_STREAM",
@@ -70,22 +78,22 @@ const envKeys = [
 ] as const;
 let savedEnv: Record<string, string | undefined> = {};
 
-afterEach(() => {
-	for (const ws of openSockets.splice(0)) {
-		try {
-			ws.close();
-		} catch {}
+afterEach(async () => {
+	try {
+		for (const ws of openSockets.splice(0)) {
+			try {
+				ws.close();
+			} catch {}
+		}
+		await cleanupIsolatedNotificationRuntimes(runtimeShutdowns, agentDirs, requiredAgentDirs);
+		for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+	} finally {
+		for (const k of envKeys) {
+			if (savedEnv[k] === undefined) delete process.env[k];
+			else process.env[k] = savedEnv[k];
+		}
+		savedEnv = {};
 	}
-	for (const dir of tempDirs.splice(0)) {
-		try {
-			fs.rmSync(dir, { recursive: true, force: true });
-		} catch {}
-	}
-	for (const k of envKeys) {
-		if (savedEnv[k] === undefined) delete process.env[k];
-		else process.env[k] = savedEnv[k];
-	}
-	savedEnv = {};
 });
 
 function setEnv(over: Partial<Record<(typeof envKeys)[number], string>>): void {
@@ -95,16 +103,19 @@ function setEnv(over: Partial<Record<(typeof envKeys)[number], string>>): void {
 }
 
 async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unknown; frames: Frame[] }> {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-stream-"));
+	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api);
-
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-stream-"));
-	tempDirs.push(cwd);
+	createNotificationsExtension(api, {
+		settings: isolatedNotificationSettings(agentDir),
+	});
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -117,8 +128,12 @@ async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unk
 		getContextUsage: () => undefined,
 		getModel: () => undefined,
 	} as never;
+	runtimeShutdowns.push(async () => {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+	});
 
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
+	requiredAgentDirs.add(agentDir);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");
 	const { url, token } = readEndpoint(endpointFile);

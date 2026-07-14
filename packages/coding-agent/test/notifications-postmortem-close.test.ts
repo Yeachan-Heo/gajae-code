@@ -5,6 +5,11 @@ import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
+import {
+	cleanupIsolatedNotificationRuntimes,
+	isolatedNotificationSettings,
+	type NotificationRuntimeShutdown,
+} from "./helpers/notification-settings";
 
 /**
  * Regression for "hard terminal close orphans the Telegram topic": a native
@@ -31,14 +36,29 @@ type Frame = { type: string; sessionId?: string };
 type CleanupCallback = (reason: postmortem.Reason) => void | Promise<void>;
 
 const tempDirs: string[] = [];
+const agentDirs: string[] = [];
 const openSockets: WebSocket[] = [];
-afterEach(() => {
-	for (const ws of openSockets.splice(0)) ws.close();
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-	vi.restoreAllMocks();
+const runtimeShutdowns: NotificationRuntimeShutdown[] = [];
+const requiredAgentDirs = new Set<string>();
+afterEach(async () => {
+	try {
+		for (const ws of openSockets.splice(0)) {
+			try {
+				ws.close();
+			} catch {}
+		}
+		await cleanupIsolatedNotificationRuntimes(runtimeShutdowns, agentDirs, requiredAgentDirs);
+		for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+	} finally {
+		vi.restoreAllMocks();
+	}
 });
 
 function createHarness(prefix: string) {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".agent");
+	agentDirs.push(agentDir);
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => {
@@ -47,10 +67,9 @@ function createHarness(prefix: string) {
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api);
-
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-	tempDirs.push(cwd);
+	createNotificationsExtension(api, {
+		settings: isolatedNotificationSettings(agentDir),
+	});
 
 	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const sid = `${prefix}${suffix}`;
@@ -63,9 +82,12 @@ function createHarness(prefix: string) {
 			getCwd: () => cwd,
 		},
 	} as never;
+	runtimeShutdowns.push(async () => {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+	});
 
 	const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
-	return { handlers, ctx, sid, endpoint };
+	return { handlers, ctx, sid, endpoint, agentDir };
 }
 
 async function connectFrames(endpoint: string): Promise<Frame[]> {
@@ -105,6 +127,7 @@ test("postmortem teardown emits session_closed to connected clients", async () =
 
 		const harness = createHarness("gjc-notif-pm-");
 		await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+		requiredAgentDirs.add(harness.agentDir);
 		await waitFor(() => fs.existsSync(harness.endpoint), 4000, "endpoint file");
 		const frames = await connectFrames(harness.endpoint);
 
@@ -134,6 +157,7 @@ test("graceful session_shutdown cancels the postmortem registration", async () =
 
 		const harness = createHarness("gjc-notif-pm-cancel-");
 		await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+		requiredAgentDirs.add(harness.agentDir);
 		await waitFor(() => fs.existsSync(harness.endpoint), 4000, "endpoint file");
 		expect(registered.has(`notifications-session-closed:${harness.sid}`)).toBe(true);
 

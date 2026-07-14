@@ -1055,6 +1055,10 @@ export default class Harness extends Command {
 			envAssignments.push(`${RECEIPT_SPOOL_DIR_ENV}=${shellQuote(process.env[RECEIPT_SPOOL_DIR_ENV])}`);
 		if (process.env.GJC_HARNESS_TEST_NODE_MODULES)
 			envAssignments.push(`GJC_HARNESS_TEST_NODE_MODULES=${shellQuote(process.env.GJC_HARNESS_TEST_NODE_MODULES)}`);
+		if (process.env.GJC_HARNESS_TEST_DISABLE_BROKER)
+			envAssignments.push(
+				`GJC_HARNESS_TEST_DISABLE_BROKER=${shellQuote(process.env.GJC_HARNESS_TEST_DISABLE_BROKER)}`,
+			);
 		if (process.env.GJC_SDK_DISABLE)
 			envAssignments.push(`GJC_SDK_DISABLE=${shellQuote(process.env.GJC_SDK_DISABLE)}`);
 		const shellCommand = `exec env ${envAssignments.join(" ")} ${this.#buildOwnerCommand(sessionId).map(shellQuote).join(" ")}`;
@@ -1260,6 +1264,9 @@ export default class Harness extends Command {
 					: {}),
 				...(process.env.GJC_HARNESS_TEST_NODE_MODULES
 					? { GJC_HARNESS_TEST_NODE_MODULES: process.env.GJC_HARNESS_TEST_NODE_MODULES }
+					: {}),
+				...(process.env.GJC_HARNESS_TEST_DISABLE_BROKER
+					? { GJC_HARNESS_TEST_DISABLE_BROKER: process.env.GJC_HARNESS_TEST_DISABLE_BROKER }
 					: {}),
 				...(process.env.GJC_SDK_DISABLE ? { GJC_SDK_DISABLE: process.env.GJC_SDK_DISABLE } : {}),
 			},

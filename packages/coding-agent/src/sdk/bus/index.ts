@@ -2421,7 +2421,9 @@ export function createNotificationsExtension(
 			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
 
-			if (agentDir) {
+			const brokerDisabledForHarnessTest =
+				process.env.GJC_HARNESS_TEST_DISABLE_BROKER === "1" && Boolean(process.env.GJC_HARNESS_TEST_NODE_MODULES);
+			if (agentDir && !brokerDisabledForHarnessTest) {
 				try {
 					await ensureBroker({ agentDir });
 					throwIfLifecycleStopped();

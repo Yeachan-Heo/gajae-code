@@ -1,23 +1,44 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import type { Args } from "../src/cli/args";
 import { Settings } from "../src/config/settings";
 import { createSessionManager } from "../src/main";
 import { SessionManager } from "../src/session/session-manager";
 
 const LIFECYCLE_ENV = ["GJC_LIFECYCLE_REQUEST_ID", "GJC_SESSION_ID"] as const;
+const agentDirs: string[] = [];
+let previousAgentDir: string;
+let previousLifecycleEnv: Record<(typeof LIFECYCLE_ENV)[number], string | undefined>;
 
-afterEach(() => {
-	for (const k of LIFECYCLE_ENV) delete process.env[k];
+beforeEach(() => {
+	previousAgentDir = getAgentDir();
+	previousLifecycleEnv = {
+		GJC_LIFECYCLE_REQUEST_ID: process.env.GJC_LIFECYCLE_REQUEST_ID,
+		GJC_SESSION_ID: process.env.GJC_SESSION_ID,
+	};
+});
+
+afterEach(async () => {
+	try {
+		for (const agentDir of agentDirs.splice(0)) await fsp.rm(agentDir, { recursive: true, force: true });
+	} finally {
+		for (const key of LIFECYCLE_ENV) {
+			const value = previousLifecycleEnv[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		setAgentDir(previousAgentDir);
+	}
 });
 
 test("normal root launch creates a current SessionManager for root token logs", async () => {
 	const agentDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-root-token-session-"));
+	agentDirs.push(agentDir);
 	setAgentDir(agentDir);
 	const cwd = path.join(agentDir, "repo");
 	fs.mkdirSync(cwd, { recursive: true });
@@ -29,8 +50,6 @@ test("normal root launch creates a current SessionManager for root token logs", 
 	expect(created).toBeDefined();
 	expect(created?.getSessionId()).toBeTruthy();
 	expect(created?.getCwd()).toBe(cwd);
-
-	await fsp.rm(agentDir, { recursive: true, force: true });
 });
 
 // Regression for the PR #1148 stage-17 blocker: a `/session_create` child is a
@@ -40,6 +59,7 @@ test("normal root launch creates a current SessionManager for root token logs", 
 // create a fresh session that adopts the pre-allocated id.
 test("lifecycle /session_create bypasses autoResume; normal launch still resumes", async () => {
 	const agentDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-lc-autoresume-"));
+	agentDirs.push(agentDir);
 	setAgentDir(agentDir);
 	const cwd = path.join(agentDir, "repo");
 	fs.mkdirSync(cwd, { recursive: true });
@@ -69,6 +89,4 @@ test("lifecycle /session_create bypasses autoResume; normal launch still resumes
 	// The freshly created SDK session under the same env adopts the pre-allocated id.
 	const fresh = SessionManager.inMemory(cwd);
 	expect(fresh.getSessionId()).toBe("s-prealloc-autoresume-1");
-
-	await fsp.rm(agentDir, { recursive: true, force: true });
 });
