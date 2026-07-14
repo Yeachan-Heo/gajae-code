@@ -106,6 +106,17 @@ test("ACP fails closed for local-only startup flags while translating model and 
 		"--model could not be resolved to a canonical model ID",
 	);
 });
+test("ACP rejects --mcp-config instead of ignoring it", () => {
+	const parsed = parseArgs(["--mcp-config", "/tmp/gjc-mcp.json"]);
+	expect(() => resolveAcpStartupOptions(parsed, {})).toThrow("Unsupported under SDK-backed ACP: --mcp-config");
+});
+test("ACP preserves --models rejection alongside --mcp-config", () => {
+	const modelsOnly = parseArgs(["--models", "openai-codex/gpt-5.6"]);
+	expect(() => resolveAcpStartupOptions(modelsOnly, {})).toThrow("Unsupported under SDK-backed ACP: --models");
+
+	const both = parseArgs(["--models", "openai-codex/gpt-5.6", "--mcp-config", "/tmp/gjc-mcp.json"]);
+	expect(() => resolveAcpStartupOptions(both, {})).toThrow("Unsupported under SDK-backed ACP: --models, --mcp-config");
+});
 
 test("ACP forwards a model preset through session creation but rejects durable default mutation", () => {
 	const preset = parseArgs(["--mpreset", "codex-medium"]);

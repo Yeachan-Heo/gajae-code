@@ -20,11 +20,16 @@ describe("GJC MCP quarantine surface", () => {
 		expect(barrel).not.toContain("mcp-protocol");
 	});
 
-	it("does not discover or proxy MCP tools into agent or subagent sessions", async () => {
+	it("preserves default MCP quarantine without blocking exact SDK opt-in", async () => {
 		const sdk = await source("sdk", "session.ts");
 		const taskExecutor = await source("task", "executor.ts");
 		const taskIndex = await source("task", "index.ts");
 
+		expect(sdk).toContain("mcpConfigPath?: string");
+		expect(sdk).toContain("discoverAndConnect({ configPath: explicitMcpConfigPath })");
+		expect(sdk).not.toContain("StandaloneMcpStartupStatus");
+		expect(sdk).not.toContain("mcpStartupStatus");
+		expect(sdk).not.toContain("mcp-warning.json");
 		expect(sdk).not.toContain("discoverAndLoadMCPTools");
 		expect(sdk).not.toContain("discoverMCPServers");
 		expect(taskExecutor).not.toContain("createMCPProxyTools");

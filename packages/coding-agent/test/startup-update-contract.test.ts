@@ -13,7 +13,7 @@ import {
 	type StartupUpdateRoute,
 } from "../src/main";
 import type { InteractiveMode } from "../src/modes/interactive-mode";
-import type { CreateAgentSessionResult } from "../src/sdk";
+import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { EventBus } from "../src/utils/event-bus";
@@ -309,6 +309,46 @@ describe("startup update contract", () => {
 			authStorage.close();
 			if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
 			else Bun.env.PI_NO_TITLE = originalNoTitle;
+		}
+	});
+	it("forwards CLI --mcp-config as mcpConfigPath to local SDK session startup", async () => {
+		using tempDir = TempDir.createSync("@gjc-mcp-config-startup-options-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const configPath = path.join(tempDir.path(), "explicit-mcp.json");
+		let sessionOptions: CreateAgentSessionOptions | undefined;
+		try {
+			await runRootCommand(
+				parseArgs([
+					"--mode",
+					"text",
+					"--mcp-config",
+					configPath,
+					"--no-session",
+					"--no-skills",
+					"--no-rules",
+					"--no-tools",
+					"--no-lsp",
+				]),
+				[],
+				{
+					createAgentSession: async options => {
+						sessionOptions = options;
+						return fakeSessionResult();
+					},
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					suppressProcessExit: true,
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					runPrintMode: async () => {},
+				},
+			);
+
+			expect(sessionOptions?.mcpConfigPath).toBe(configPath);
+			expect(sessionOptions?.mcpManager).toBeUndefined();
+		} finally {
+			authStorage.close();
 		}
 	});
 
