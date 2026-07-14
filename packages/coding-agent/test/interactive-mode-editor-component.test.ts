@@ -631,4 +631,35 @@ describe("InteractiveMode.setEditorComponent", () => {
 			setTerminalImageProtocol(originalProtocol);
 		}
 	});
+
+	it("commits pet modes through the shared result-returning policy", () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		vi.spyOn(mode, "refreshSlashCommandState").mockResolvedValue();
+		try {
+			settings.set("pet.mode", "off");
+			const showStatus = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
+
+			// Capability is rechecked immediately before mutation: a rejected
+			// commit surfaces the warning and never persists.
+			setTerminalImageProtocol(null);
+			expect(mode.setPetMode("red")).toBe(false);
+			expect(settings.get("pet.mode")).toBe("off");
+			expect(mode.petWidget?.mode ?? "off").toBe("off");
+			expect(showStatus).toHaveBeenCalledTimes(1);
+
+			expect(mode.commitPetPreviewMode("red")).toBe(false);
+			expect(settings.get("pet.mode")).toBe("off");
+			expect(showStatus).toHaveBeenCalledTimes(2);
+
+			// An accepted commit persists only after the widget mutation applies.
+			setTerminalImageProtocol(ImageProtocol.Sixel);
+			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
+			expect(mode.setPetMode("red")).toBe(true);
+			expect(settings.get("pet.mode")).toBe("red");
+			expect(mode.commitPetPreviewMode("off")).toBe(true);
+			expect(settings.get("pet.mode")).toBe("off");
+		} finally {
+			setTerminalImageProtocol(originalProtocol);
+		}
+	});
 });

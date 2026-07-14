@@ -5,6 +5,7 @@
 ### Added
 
 - Added the additive SDK Q10 model-catalog DTO: `Q10`, `models.list/current`, `models.list`, and `models.current` now return the same paged registry rows with reasoning/thinking capability metadata and current-model readback. `thinking.validLevels` is an `off`-first canonical menu; sparse raw reasoning descriptors remain available for inspection. The public DTO types are exported from `@gajae-code/coding-agent/sdk`, while undocumented `/sdk/models` deep imports remain unavailable. `inherit` is readback-only and malformed descriptors fail with a safe internal SDK error (#2163).
+- Gajae Pet selection is now terminal-capability aware: unsupported terminals show an actionable warning (with multiplexer-specific guidance for tmux/screen/zellij, including the `PI_FORCE_IMAGE_PROTOCOL=sixel` expert opt-in), `/pet` and Settings disable the unavailable `RedGajae`/`BlueGajae` choices while `off` stays selectable, a saved-but-unavailable choice is identified as `(saved)`, and the public command names are consistent across execution, completion, and inline hints (`/pet RedGajae`, `/pet BlueGajae`, `/pet off`, case-insensitive).
 
 ### Changed
 

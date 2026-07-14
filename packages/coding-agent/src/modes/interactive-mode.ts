@@ -87,6 +87,7 @@ import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
 import { IrcSplitViewComponent } from "./components/irc-sidebar";
+import { getPetUnavailableWarning, isPetAvailable } from "./components/pet-capability";
 import { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import {
@@ -633,6 +634,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.petWidget.setMode(saved);
 			}
 		});
+		if (configuredPetMode !== "off" && !isPetAvailable()) {
+			this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+		}
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
@@ -1080,10 +1084,26 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.setTopBorder(undefined);
 	}
 
-	setPetMode(mode: PetMode): void {
-		this.petWidget?.setMode(mode);
+	/**
+	 * Single result-returning pet commit policy shared by every entry path
+	 * (`/pet`, the pet selector, and the Settings submenu). Capability is
+	 * rechecked immediately before mutation, and the preference persists only
+	 * after the commit is accepted.
+	 */
+	#commitPetMode(mode: PetMode, apply: (mode: PetMode) => void): boolean {
+		if (mode !== "off" && !isPetAvailable()) {
+			this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+			this.ui.requestRender();
+			return false;
+		}
+		apply(mode);
 		settings.set("pet.mode", mode);
 		this.ui.requestRender();
+		return true;
+	}
+
+	setPetMode(mode: PetMode): boolean {
+		return this.#commitPetMode(mode, next => this.petWidget?.setMode(next));
 	}
 
 	previewPetMode(mode: PetMode): void {
@@ -1091,9 +1111,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.requestRender();
 	}
 
-	commitPetPreviewMode(mode: PetMode): void {
-		this.petWidget?.commitPreviewMode(mode);
-		this.ui.requestRender();
+	commitPetPreviewMode(mode: PetMode): boolean {
+		return this.#commitPetMode(mode, next => this.petWidget?.commitPreviewMode(next));
 	}
 
 	restoreComposer(): void {

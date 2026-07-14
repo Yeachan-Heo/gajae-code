@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/extensibility/slash-commands";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
@@ -6,6 +8,18 @@ import {
 	executeBuiltinSlashCommand,
 	lookupBuiltinSlashCommand,
 } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
+import { ImageProtocol, TERMINAL } from "@gajae-code/tui";
+
+const mutableTerminal = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
+const originalImageProtocol = mutableTerminal.imageProtocol;
+
+beforeAll(async () => {
+	await initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+});
+
+afterEach(() => {
+	mutableTerminal.imageProtocol = originalImageProtocol;
+});
 
 function createTuiRuntime() {
 	const handleCopyCommand = vi.fn();
@@ -41,11 +55,77 @@ function createClearTuiRuntime() {
 }
 
 describe("builtin /pet slash command", () => {
-	it("exposes off plus the registry-driven skin choices", () => {
+	it("exposes the named Gajae choices", () => {
 		const petCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "pet");
 
-		expect(petCommand?.subcommands?.map(command => command.name)).toEqual(["off", "red", "blue"]);
-		expect(petCommand?.inlineHint).toBe("[off|red|blue]");
+		expect(petCommand?.subcommands?.map(command => command.name)).toEqual(["off", "RedGajae", "BlueGajae"]);
+		expect(petCommand?.inlineHint).toBe("[off|RedGajae|BlueGajae]");
+	});
+
+	it("maps named Gajae commands to their internal modes", async () => {
+		mutableTerminal.imageProtocol = ImageProtocol.Kitty;
+		const setPetMode = vi.fn((_mode: string) => true);
+		const setText = vi.fn();
+		const showStatus = vi.fn();
+		const ctx = { setPetMode, showStatus, editor: { setText } } as unknown as InteractiveModeContext;
+		const runtime = { ctx, handleBackgroundCommand: () => undefined };
+
+		expect(await executeBuiltinSlashCommand("/pet redgajae", runtime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/pet BlueGajae", runtime)).toBe(true);
+
+		expect(setPetMode.mock.calls.map(call => call[0])).toEqual(["red", "blue"]);
+	});
+
+	it("keeps deprecated on/red/blue inputs accepted while display stays canonical", async () => {
+		mutableTerminal.imageProtocol = ImageProtocol.Kitty;
+		const setPetMode = vi.fn((_mode: string) => true);
+		const showStatus = vi.fn();
+		const ctx = { setPetMode, showStatus, editor: { setText: vi.fn() } } as unknown as InteractiveModeContext;
+
+		for (const token of ["red", "blue", "on"]) {
+			expect(
+				await executeBuiltinSlashCommand(`/pet ${token}`, { ctx, handleBackgroundCommand: () => undefined }),
+			).toBe(true);
+		}
+
+		// Deprecated inputs still commit, mapped to their canonical modes.
+		expect(setPetMode.mock.calls.map(call => call[0])).toEqual(["red", "blue", "red"]);
+		// The public surface stays canonical: no deprecated names in subcommands.
+		const petCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "pet");
+		expect(petCommand?.subcommands?.map(command => command.name)).toEqual(["off", "RedGajae", "BlueGajae"]);
+
+		// Unknown tokens still fall through to usage guidance.
+		expect(await executeBuiltinSlashCommand("/pet purple", { ctx, handleBackgroundCommand: () => undefined })).toBe(
+			true,
+		);
+		expect(showStatus).toHaveBeenLastCalledWith("Usage: /pet [off|RedGajae|BlueGajae]", { dim: true });
+		expect(setPetMode).toHaveBeenCalledTimes(3);
+	});
+
+	it("suppresses the success status when the shared commit policy rejects", async () => {
+		mutableTerminal.imageProtocol = null;
+		const setPetMode = vi.fn((_mode: string) => false);
+		const showStatus = vi.fn();
+		const ctx = { setPetMode, showStatus, editor: { setText: vi.fn() } } as unknown as InteractiveModeContext;
+
+		expect(await executeBuiltinSlashCommand("/pet RedGajae", { ctx, handleBackgroundCommand: () => undefined })).toBe(
+			true,
+		);
+		// The commit policy owns the rejection warning; the handler must not
+		// claim success or bypass the policy with its own capability check.
+		expect(setPetMode).toHaveBeenCalledWith("red");
+		expect(showStatus).not.toHaveBeenCalled();
+	});
+
+	it("completes named pets case-insensitively", async () => {
+		const petCommand = BUILTIN_SLASH_COMMANDS.find(command => command.name === "pet");
+
+		for (const prefix of ["r", "R", "ReD"]) {
+			const completions = await petCommand?.getArgumentCompletions?.(prefix);
+			expect(completions?.map(item => item.label)).toEqual(["RedGajae"]);
+		}
+
+		expect(petCommand?.getInlineHint?.("ReD")).toBe("Gajae");
 	});
 });
 describe("builtin /copy slash command", () => {

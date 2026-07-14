@@ -176,11 +176,19 @@ export interface InteractiveModeContext {
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;
-	setPetMode(mode: PetMode): void;
+	/**
+	 * Commit a pet mode through the shared result-returning policy: capability
+	 * is rechecked immediately before mutation and the preference persists only
+	 * on acceptance. Returns whether the commit was accepted.
+	 */
+	setPetMode(mode: PetMode): boolean;
 	/** Live-preview a pet skin during a selector without persisting. */
 	previewPetMode(mode: PetMode): void;
-	/** Commit a settings-overlay pet preview without re-mounting the composer. */
-	commitPetPreviewMode(mode: PetMode): void;
+	/**
+	 * Commit a settings-overlay pet change without re-mounting the composer.
+	 * Same shared commit policy and result semantics as `setPetMode`.
+	 */
+	commitPetPreviewMode(mode: PetMode): boolean;
 	/** Re-mount the composer (pet-aware) after an overlay/selector closes. */
 	restoreComposer(): void;
 	startPendingSubmission(input: {

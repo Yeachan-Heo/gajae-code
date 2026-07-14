@@ -6,7 +6,6 @@ import {
 	type GajaePixelFrameName,
 	type GajaePixelFrames,
 	getCellDimensions,
-	ImageProtocol,
 	PARA_PARA_STEPS,
 	PET_SKINS,
 	type PetMode,
@@ -14,10 +13,10 @@ import {
 	petBurstDurationMs,
 	petBurstFrame,
 	registerAnimationCallback,
-	TERMINAL,
 	type TUI,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "./custom-editor";
+import { getPetPixelProtocol } from "./pet-capability";
 
 /** Re-exported from the tui skin registry so widget-relative imports stay valid. */
 export type { PetMode, PetSkinId };
@@ -197,9 +196,7 @@ export class GajaePetWidget {
 
 	/** Protocol available for the real-pixel pet, if any. */
 	static pixelProtocol(): "sixel" | "kitty" | null {
-		if (TERMINAL.imageProtocol === ImageProtocol.Kitty) return "kitty";
-		if (TERMINAL.imageProtocol === ImageProtocol.Sixel) return "sixel";
-		return null;
+		return getPetPixelProtocol();
 	}
 
 	get mode(): PetMode {
