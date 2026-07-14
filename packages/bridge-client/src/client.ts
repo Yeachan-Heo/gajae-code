@@ -359,7 +359,7 @@ export class SdkClient {
 		cycle.phase = "complete";
 		if (this.#opening === cycle) this.#opening = null;
 		const error = new SdkClientError("reconnect_exhausted", "SDK WebSocket reconnect attempts exhausted", lastError);
-		for (const handler of this.#reconnectFailedHandlers) handler(error);
+		this.#notifyReconnectFailedHandlers(error);
 		throw error;
 	}
 
@@ -508,7 +508,7 @@ export class SdkClient {
 			)
 				return;
 			this.connectionId = frame.connectionId;
-			for (const handler of this.#reconnectHandlers) handler();
+			this.#notifyReconnectHandlers();
 		}
 		if (!this.#isActive(incarnation)) return;
 		const id =
@@ -523,11 +523,31 @@ export class SdkClient {
 	}
 
 	#notifyFrameHandlers(frame: Frame): void {
-		for (const handler of this.#frameHandlers) {
+		for (const handler of [...this.#frameHandlers]) {
 			try {
 				handler(frame);
 			} catch {
 				// Observers cannot change transport settlement or prevent later observers.
+			}
+		}
+	}
+
+	#notifyReconnectHandlers(): void {
+		for (const handler of [...this.#reconnectHandlers]) {
+			try {
+				handler();
+			} catch {
+				// Reconnect observers cannot change transport state or prevent later observers.
+			}
+		}
+	}
+
+	#notifyReconnectFailedHandlers(error: SdkClientError): void {
+		for (const handler of [...this.#reconnectFailedHandlers]) {
+			try {
+				handler(error);
+			} catch {
+				// Failure observers cannot replace the typed transport error or prevent later observers.
 			}
 		}
 	}
@@ -550,7 +570,7 @@ export class SdkClient {
 		incarnation.resolveHello = undefined;
 		incarnation.rejectHello = undefined;
 		resolveHello?.();
-		if (reconnecting) for (const handler of this.#reconnectHandlers) handler();
+		if (reconnecting) this.#notifyReconnectHandlers();
 	}
 
 	#settlePending(id: string, pending: Pending, result: unknown): void {

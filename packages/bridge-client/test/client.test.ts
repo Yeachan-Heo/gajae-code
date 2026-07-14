@@ -265,6 +265,56 @@ test("SdkClient owns request timeout, reconnect backoff, and absolute deadline d
 	});
 });
 
+test("SdkClient isolates reconnect observers from transport settlement", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 1, reconnectBackoffMs: 10 });
+		const first = await connect(client, "first");
+		const notifications: string[] = [];
+		client.onReconnect(() => {
+			throw new Error("observer failure");
+		});
+		client.onReconnect(() => {
+			notifications.push("reconnected");
+		});
+
+		first.readyState = FakeWebSocket.CLOSED;
+		first.emit("close");
+		const request = client.control("after-reconnect-observer");
+		await flush();
+		clock.advanceBy(10);
+		await flush();
+		const replacement = FakeWebSocket.instances[1];
+		replacement.open();
+		replacement.message({ type: "hello", connectionId: "second" });
+		for (let index = 0; index < 4; index++) await flush();
+		const frame = sent(replacement);
+		replacement.message({ type: "control_response", id: frame.id, ok: true });
+
+		await expect(request).resolves.toMatchObject({ ok: true });
+		expect(notifications).toEqual(["reconnected"]);
+		await client.close();
+	});
+});
+
+test("SdkClient preserves typed reconnect exhaustion across hostile failure observers", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const notifications: string[] = [];
+		client.onReconnectFailed(() => {
+			throw new Error("observer failure");
+		});
+		client.onReconnectFailed(error => {
+			notifications.push(error.code);
+		});
+
+		const connecting = client.connect();
+		FakeWebSocket.instances[0].emit("error");
+		await expect(connecting).rejects.toMatchObject({ code: "reconnect_exhausted" });
+		expect(notifications).toEqual(["reconnect_exhausted"]);
+		await client.close();
+	});
+});
+
 test("SdkClient terminal close rejects opening, hello, and retry waiters", async () => {
 	await withFakeTransport(async () => {
 		const openingClient = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 1 });
