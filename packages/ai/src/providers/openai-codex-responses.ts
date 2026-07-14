@@ -43,6 +43,7 @@ import {
 	createOpenAIResponsesHistoryPayload,
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
+	neutralizeResponsesInputControlTokens,
 	normalizeSystemPrompts,
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
 } from "../utils";
@@ -633,7 +634,7 @@ async function buildTransformedCodexRequestBody(
 ): Promise<RequestBody> {
 	const params: RequestBody = {
 		model: model.id,
-		input: [...convertMessages(model, context)],
+		input: neutralizeResponsesInputControlTokens(convertMessages(model, context)),
 		stream: true,
 		prompt_cache_key: normalizeOpenAIResponsesPromptCacheKey(options?.sessionId),
 	};

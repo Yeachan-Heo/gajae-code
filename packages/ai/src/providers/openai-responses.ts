@@ -33,6 +33,7 @@ import {
 	createOpenAIResponsesHistoryPayload,
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
+	neutralizeResponsesInputControlTokens,
 	normalizeSystemPrompts,
 	resolveCacheRetention,
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
@@ -493,7 +494,7 @@ function buildParams(
 		strictResponsesPairing,
 		providerSessionState,
 	);
-	const messages: ResponseInput = [...conversationMessages];
+	const messages: ResponseInput = neutralizeResponsesInputControlTokens(conversationMessages);
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
 	if (isComposerHarnessModel(model.id)) {

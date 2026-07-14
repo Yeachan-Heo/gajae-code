@@ -136,6 +136,35 @@ function neutralizeReservedControlTokens(text: string): string {
 	return text.replace(RESERVED_CONTROL_TOKEN_RE, "<\u200b|");
 }
 
+/**
+ * Neutralize leaked reserved control tokens across every string in an outgoing
+ * Responses `input` array. This is the request-boundary complement to the
+ * replay-history sanitizer: leaked Harmony markers (`<|channel|>analysis`, ...)
+ * can enter the payload from assistant reasoning summaries, live-converted
+ * message/tool-output text, or user-authored content — not just replayed
+ * history — and every gpt-5.6 request that carries one is rejected with
+ * `Request blocked (code=invalid_prompt)`. Walking every string (rather than an
+ * item-type allowlist) guarantees no leak source is missed as item shapes
+ * evolve; the zero-width-space insertion is idempotent (`<\u200b|` no longer
+ * matches `<|`) and keeps the text human-readable.
+ */
+export function neutralizeResponsesInputControlTokens(items: ResponseInput): ResponseInput {
+	return items.map(item => deepNeutralizeReservedControlTokens(item)) as ResponseInput;
+}
+
+function deepNeutralizeReservedControlTokens(value: unknown): unknown {
+	if (typeof value === "string") return neutralizeReservedControlTokens(value);
+	if (Array.isArray(value)) return value.map(deepNeutralizeReservedControlTokens);
+	if (value && typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [key, nested] of Object.entries(value)) {
+			out[key] = deepNeutralizeReservedControlTokens(nested);
+		}
+		return out;
+	}
+	return value;
+}
+
 function stringifyResponsesStringParamForReplay(value: unknown): string {
 	if (typeof value === "string") return neutralizeReservedControlTokens(value.toWellFormed());
 	try {

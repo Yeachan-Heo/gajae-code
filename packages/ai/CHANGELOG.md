@@ -5,6 +5,10 @@
 
 - Exported the canonical thinking-control mode runtime vocabulary so packed SDK consumers can validate provider metadata against the same public `@gajae-code/ai` contract.
 
+### Fixed
+
+- Fixed frequent `Request blocked (code=invalid_prompt)` failures on gpt-5.6 (Sol/Terra/Luna) subagent, default-agent, and compaction turns (ref openai/codex#32028, oh-my-pi#5184). Leaked Harmony control-token markers (e.g. `<|channel|>analysis`) were only neutralized on the replayed-history payload path, so markers in assistant reasoning summaries, live-converted message/tool-output text, and user-authored content reached the OpenAI Responses and OpenAI-codex-responses transports verbatim and wedged the session (the poisoned item was re-sent every turn). Both transports now neutralize reserved control tokens across the entire outgoing `input` array at the request boundary via an idempotent zero-width-space insertion that keeps the text human-readable.
+
 ## [0.10.0] - 2026-07-12
 ### Fixed
 
