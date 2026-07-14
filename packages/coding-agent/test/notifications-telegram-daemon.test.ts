@@ -4350,7 +4350,7 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 	expect(daemon.sessions.size).toBe(0);
 });
 
-test("scanRoots reaps missing endpoint topics only when all roots are readable and grace has elapsed", async () => {
+test("scanRoots reaps missing endpoint topics when live roots are empty or registered roots vanished", async () => {
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
@@ -4376,15 +4376,30 @@ test("scanRoots reaps missing endpoint topics only when all roots are readable a
 
 	const blockedAgentDir = tempAgentDir();
 	const blockedSettings = setPrivateAgentDir(settings(blockedAgentDir), blockedAgentDir);
-	await registerNotificationRoot({
+	const vanishedRoot = await registerNotificationRoot({
 		settings: blockedSettings,
-		cwd: path.join(blockedAgentDir, "unreadable"),
+		cwd: path.join(blockedAgentDir, "vanished"),
 		sessionId: "kept",
 	});
+	const liveRoot = await registerNotificationRoot({
+		settings: blockedSettings,
+		cwd: path.join(blockedAgentDir, "live"),
+		sessionId: "live",
+	});
+	fs.mkdirSync(path.join(liveRoot, "sdk"), { recursive: true });
+	fs.writeFileSync(
+		path.join(liveRoot, "sdk", "live.json"),
+		JSON.stringify({ url: "ws://live", token: "live-token", pid: 4242 }),
+	);
 	fs.mkdirSync(daemonPaths(blockedAgentDir).dir, { recursive: true });
 	fs.writeFileSync(
 		path.join(daemonPaths(blockedAgentDir).dir, "telegram-topics.json"),
-		JSON.stringify({ topics: { kept: { topicId: "202", identitySent: true, createdAt: 0, name: "kept" } } }),
+		JSON.stringify({
+			topics: {
+				kept: { topicId: "202", identitySent: true, createdAt: 0, name: "kept" },
+				live: { topicId: "204", identitySent: true, createdAt: 0, name: "live" },
+			},
+		}),
 	);
 	const blockedBot = new FakeBotApi();
 	const blockedDaemon = new TelegramNotificationDaemon({
@@ -4393,11 +4408,129 @@ test("scanRoots reaps missing endpoint topics only when all roots are readable a
 		botToken: "tok",
 		chatId: "42",
 		botApi: blockedBot,
+		WebSocketImpl: FakeWs as any,
+		pidAlive: pid => pid === 4242,
 		now: () => 120_000,
 	});
 	await blockedDaemon.loadTopics();
 	await blockedDaemon.scanRoots();
-	expect(blockedBot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	expect(blockedDaemon.sessions.has("live")).toBe(true);
+	expect(blockedBot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([
+		202,
+	]);
+	const compacted = JSON.parse(fs.readFileSync(daemonPaths(blockedAgentDir).roots, "utf8")) as {
+		roots: string[];
+		sessions: Record<string, string>;
+	};
+	expect(compacted.roots).toEqual([liveRoot]);
+	expect(compacted.roots).not.toContain(vanishedRoot);
+	expect(compacted.sessions.live).toBe(liveRoot);
+	expect(compacted.sessions.kept).toBeUndefined();
+});
+test.each([
+	"restored",
+	"unreadable",
+	"live",
+	"root-unreadable",
+] as const)("scanRoots preserves a %s root and its topic when absence is not conclusive", async mode => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const root = await registerNotificationRoot({
+		settings: s,
+		cwd: path.join(agentDir, "workspace"),
+		sessionId: "kept",
+	});
+	if (mode === "live") fs.mkdirSync(root, { recursive: true });
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({ topics: { kept: { topicId: "203", identitySent: true, createdAt: 0, name: "kept" } } }),
+	);
+	const realFs = topicStateFs(async () => undefined);
+	let rootReads = 0;
+	const fsImpl: TelegramDaemonFs = {
+		...realFs,
+		readdir: async target => {
+			if (target === path.join(root, "sdk")) {
+				throw Object.assign(new Error(mode), { code: mode === "unreadable" ? "EACCES" : "ENOENT" });
+			}
+			if (mode === "root-unreadable" && target === root) {
+				throw Object.assign(new Error(mode), { code: "EACCES" });
+			}
+			if (mode === "restored" && target === root) {
+				rootReads += 1;
+				if (rootReads === 1) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+				fs.mkdirSync(root, { recursive: true });
+				return [];
+			}
+			return realFs.readdir(target);
+		},
+	};
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fs: fsImpl,
+		now: () => 120_000,
+	});
+	await daemon.loadTopics();
+	await daemon.scanRoots();
+
+	expect(bot.calls.some(call => call.method === "deleteForumTopic")).toBe(false);
+	const registry = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as {
+		roots: string[];
+		sessions: Record<string, string>;
+	};
+	expect(registry.roots).toEqual([root]);
+	expect(registry.sessions.kept).toBe(root);
+	if (mode === "restored") expect(rootReads).toBe(2);
+});
+test("scanRoots keeps topics and registry state when missing-root compaction cannot persist", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const root = await registerNotificationRoot({
+		settings: s,
+		cwd: path.join(agentDir, "vanished"),
+		sessionId: "kept",
+	});
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({ topics: { kept: { topicId: "205", identitySent: true, createdAt: 0, name: "kept" } } }),
+	);
+	const realFs = topicStateFs(async () => undefined);
+	const fsImpl: TelegramDaemonFs = {
+		...realFs,
+		rename: async (oldPath, newPath) => {
+			if (newPath === daemonPaths(agentDir).roots) {
+				throw Object.assign(new Error("persist failed"), { code: "EIO" });
+			}
+			await realFs.rename(oldPath, newPath);
+		},
+	};
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fs: fsImpl,
+		now: () => 120_000,
+	});
+	await daemon.loadTopics();
+	await daemon.scanRoots();
+
+	expect(bot.calls.some(call => call.method === "deleteForumTopic")).toBe(false);
+	const registry = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as {
+		roots: string[];
+		sessions: Record<string, string>;
+	};
+	expect(registry.roots).toEqual([root]);
+	expect(registry.sessions.kept).toBe(root);
 });
 
 test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {

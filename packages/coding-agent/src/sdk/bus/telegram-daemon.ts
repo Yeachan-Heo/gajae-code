@@ -1705,16 +1705,36 @@ export class TelegramNotificationDaemon {
 
 	async scanRoots(): Promise<void> {
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
-		const rootState = await readJson<{ roots?: string[] }>(this.fsImpl, paths.roots);
+		const rootState = await readJson<{ roots?: string[]; sessions?: Record<string, string> }>(
+			this.fsImpl,
+			paths.roots,
+		);
 		const endpointSessionIds = new Set<string>();
+		const missingRoots = new Set<string>();
 		let allRootsReadable = true;
 		for (const root of rootState?.roots ?? []) {
 			const dir = path.join(root, "sdk");
 			let files: string[];
 			try {
 				files = await this.fsImpl.readdir(dir);
-			} catch {
-				allRootsReadable = false;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+					allRootsReadable = false;
+					continue;
+				}
+				// A missing endpoint directory is conclusive only when its registered
+				// root is also gone. A live root may be between registration and
+				// endpoint publication, so keep it and block global orphan cleanup.
+				try {
+					await this.fsImpl.readdir(root);
+					allRootsReadable = false;
+				} catch (rootError) {
+					if ((rootError as NodeJS.ErrnoException).code === "ENOENT") {
+						missingRoots.add(root);
+					} else {
+						allRootsReadable = false;
+					}
+				}
 				continue;
 			}
 			for (const file of files.filter(item => item.endsWith(".json"))) {
@@ -1739,6 +1759,53 @@ export class TelegramNotificationDaemon {
 					this.connectSession(sessionId, endpoint.url, endpoint.token);
 				} catch {}
 			}
+		}
+		if (missingRoots.size > 0) {
+			await withFileLock(
+				paths.roots,
+				async () => {
+					const current = await readJson<{ roots?: string[]; sessions?: Record<string, string> }>(
+						this.fsImpl,
+						paths.roots,
+					);
+					// The registry vanished after the scan; stale in-memory roots are
+					// not authority to compact or delete topics in this cycle.
+					if (!current) {
+						allRootsReadable = false;
+						return;
+					}
+					const confirmedMissing = new Set<string>();
+					for (const root of current.roots ?? []) {
+						if (!missingRoots.has(root)) continue;
+						try {
+							await this.fsImpl.readdir(root);
+							// The root returned after the scan. Preserve its registration
+							// and suppress orphan deletion because its endpoints were missed.
+							allRootsReadable = false;
+						} catch (error) {
+							if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+								confirmedMissing.add(root);
+							} else {
+								allRootsReadable = false;
+							}
+						}
+					}
+					if (confirmedMissing.size === 0) return;
+					const sessions = Object.fromEntries(
+						Object.entries(current.sessions ?? {}).filter(([, root]) => !confirmedMissing.has(root)),
+					);
+					await writeJsonAtomic(this.fsImpl, paths.roots, {
+						...current,
+						version: 1,
+						roots: (current.roots ?? []).filter(root => !confirmedMissing.has(root)),
+						sessions,
+					});
+				},
+				{ staleMs: 10_000 },
+			).catch(error => {
+				allRootsReadable = false;
+				logger.warn(`notifications: failed to compact missing Telegram roots: ${String(error)}`);
+			});
 		}
 		if (allRootsReadable) {
 			for (const sessionId of this.topics.sessionIds()) {
