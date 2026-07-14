@@ -131,6 +131,13 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-lifecycle-native-control.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-lifecycle-orchestrator.test.ts"
 			]
 		},
