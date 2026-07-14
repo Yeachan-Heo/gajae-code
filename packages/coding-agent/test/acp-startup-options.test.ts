@@ -36,13 +36,17 @@ test("ACP maps non-prompt permission handling to the SDK allow policy", async ()
 	expect(modes).toEqual(["prompt", "allow", "allow"]);
 });
 
-test("ACP paginates after cwd filtering and terminates the filtered cursor", () => {
+test("ACP paginates after canonical cwd filtering and terminates the filtered cursor", () => {
 	const foreign = Array.from({ length: 50 }, (_, index) => ({
 		sessionId: `foreign-${index}`,
 		locator: { repo: "/other" },
 	}));
 	const sessions = [...foreign, { sessionId: "workspace", locator: { repo: "/workspace" } }];
 	expect(paginateAcpSessions(sessions, "/workspace", 0)).toEqual({
+		sessions: [{ sessionId: "workspace", cwd: "/workspace", title: "workspace" }],
+		nextCursor: undefined,
+	});
+	expect(paginateAcpSessions(sessions, "/workspace/.", 0)).toEqual({
 		sessions: [{ sessionId: "workspace", cwd: "/workspace", title: "workspace" }],
 		nextCursor: undefined,
 	});

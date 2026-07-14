@@ -141,7 +141,7 @@ export function paginateAcpSessions(listed: unknown[], cwd: string | undefined, 
 			(value): value is BrokerSession & { locator: { repo: string } } =>
 				typeof value?.sessionId === "string" && typeof value.locator?.repo === "string",
 		)
-		.filter(value => !cwd || value.locator.repo === cwd);
+		.filter(value => !cwd || path.resolve(value.locator.repo) === path.resolve(cwd));
 	const sessions = filtered
 		.slice(offset, offset + SESSION_PAGE_SIZE)
 		.map(
