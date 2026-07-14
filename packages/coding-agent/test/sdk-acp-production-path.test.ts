@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 
 type TestServer = {
 	port: number | undefined;
@@ -63,23 +64,19 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 		},
 	});
 	servers.push(server);
-	await mkdir(path.join(agentDir, "sdk"), { recursive: true });
-	await writeFile(
-		path.join(agentDir, "sdk", "broker.json"),
-		JSON.stringify({
-			version: 1,
-			protocolVersion: 3,
-			packageGeneration: "test",
-			ownerId: "test-owner",
-			pid: process.pid,
-			host: "127.0.0.1",
-			port: server.port!,
-			url: `ws://127.0.0.1:${server.port!}`,
-			token,
-			startedAt: Date.now(),
-			heartbeatAt: Date.now(),
-		}),
-	);
+	await writeBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test",
+		ownerId: "test-owner",
+		pid: process.pid,
+		host: "127.0.0.1",
+		port: server.port!,
+		url: `ws://127.0.0.1:${server.port!}`,
+		token,
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	});
 
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, { agentDir });
@@ -267,24 +264,20 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		},
 	});
 	servers.push(server);
-	await mkdir(path.join(agentDir, "sdk"), { recursive: true });
 	await mkdir(cwd, { recursive: true });
-	await writeFile(
-		path.join(agentDir, "sdk", "broker.json"),
-		JSON.stringify({
-			version: 1,
-			protocolVersion: 3,
-			packageGeneration: "test",
-			ownerId: "test-owner",
-			pid: process.pid,
-			host: "127.0.0.1",
-			port: server.port,
-			url: `ws://127.0.0.1:${server.port}`,
-			token,
-			startedAt: Date.now(),
-			heartbeatAt: Date.now(),
-		}),
-	);
+	await writeBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test",
+		ownerId: "test-owner",
+		pid: process.pid,
+		host: "127.0.0.1",
+		port: server.port!,
+		url: `ws://127.0.0.1:${server.port}`,
+		token,
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	});
 
 	const controller = new AbortController();
 	const agent = new AcpAgent(
