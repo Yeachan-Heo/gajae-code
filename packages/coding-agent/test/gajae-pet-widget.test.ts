@@ -26,6 +26,19 @@ function makeStubs(columns = 80, rows = 30) {
 	let emitter: (() => string | null) | undefined;
 	let available = true;
 	let failWrites = false;
+	const pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
+	const flushTerminalCleanup = () => {
+		while (available && pendingTerminalCleanup.length > 0) {
+			const pending = pendingTerminalCleanup[0];
+			try {
+				terminal.write(pending.payload);
+			} catch {
+				return;
+			}
+			pendingTerminalCleanup.shift();
+			pending.onDelivered?.();
+		}
+	};
 	const terminal = {
 		columns,
 		rows,
@@ -38,6 +51,10 @@ function makeStubs(columns = 80, rows = 30) {
 		requestRender: () => {},
 		setPostRenderEmitter: (fn?: () => string | null) => {
 			emitter = fn;
+		},
+		queueTerminalCleanup: (payload: string, onDelivered?: () => void) => {
+			pendingTerminalCleanup.push({ payload, onDelivered });
+			flushTerminalCleanup();
 		},
 		get terminalAvailable() {
 			return available;
@@ -65,6 +82,8 @@ function makeStubs(columns = 80, rows = 30) {
 		setWriteFailure: (value: boolean) => {
 			failWrites = value;
 		},
+		flushTerminalCleanup,
+		getPendingTerminalCleanupCount: () => pendingTerminalCleanup.length,
 	};
 }
 
@@ -216,6 +235,73 @@ describe("GajaePetWidget", () => {
 		} finally {
 			widget.dispose();
 		}
+	});
+
+	it("retries Sixel cleanup that fails during final disposal", () => {
+		const { flushTerminalCleanup, getEmitter, getPendingTerminalCleanupCount, setWriteFailure, widget, written } =
+			makeWidget();
+		widget.setMode("red");
+		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+		written.length = 0;
+
+		setWriteFailure(true);
+		widget.dispose();
+		expect(getPendingTerminalCleanupCount()).toBe(1);
+		expect(written).toHaveLength(0);
+
+		setWriteFailure(false);
+		flushTerminalCleanup();
+		expect(getPendingTerminalCleanupCount()).toBe(0);
+		expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+	});
+
+	it("reserves a Kitty image ID until failed final-disposal cleanup is delivered", () => {
+		const imageIds = [101, 101, 202, 101];
+		vi.spyOn(crypto, "getRandomValues").mockImplementation(values => {
+			if (!values) throw new Error("Expected a typed array");
+			const ids = new Uint32Array(
+				values.buffer,
+				values.byteOffset,
+				values.byteLength / Uint32Array.BYTES_PER_ELEMENT,
+			);
+			ids[0] = imageIds.shift() ?? 303;
+			return values;
+		});
+
+		const stubs = makeStubs();
+		const makeKitty = () =>
+			new GajaePetWidget({
+				ui: stubs.ui,
+				editor: stubs.editor,
+				editorContainer: stubs.editorContainer,
+				floorContainer: stubs.floorContainer,
+				isWorking: () => false,
+				getComposerBottomOffset: () => 0,
+				forcePixelProtocol: "kitty",
+				autoFlexGapMs: null,
+			});
+
+		const first = makeKitty();
+		first.setMode("red");
+		expect(stubs.getEmitter()?.()).toContain("i=101");
+		stubs.setWriteFailure(true);
+		first.dispose();
+		expect(stubs.getPendingTerminalCleanupCount()).toBe(1);
+
+		const second = makeKitty();
+		second.setMode("red");
+		expect(stubs.getEmitter()?.()).toContain("i=202");
+
+		stubs.setWriteFailure(false);
+		stubs.flushTerminalCleanup();
+		expect(stubs.getPendingTerminalCleanupCount()).toBe(0);
+		expect(stubs.written.some(chunk => chunk.includes("a=d,d=I,i=101"))).toBe(true);
+
+		const third = makeKitty();
+		third.setMode("red");
+		expect(stubs.getEmitter()?.()).toContain("i=101");
+		second.dispose();
+		third.dispose();
 	});
 
 	it("completes logical teardown when the cleanup write throws", () => {

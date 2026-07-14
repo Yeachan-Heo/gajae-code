@@ -290,14 +290,20 @@ export class GajaePetWidget {
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		const kittyImageId = this.#kittyImageId;
+		const cleanupPayload = this.#imageCleanupPayload();
 		try {
-			this.#writeImageCleanup();
-		} finally {
-			// Logical teardown must reach its final state even if terminal I/O fails.
-			if (this.#kittyImageId !== undefined) {
-				allocatedPetKittyImageIds.delete(this.#kittyImageId);
-				this.#kittyImageId = undefined;
+			if (cleanupPayload) {
+				this.#ui.queueTerminalCleanup(
+					`\x1b[?2026h\x1b7${cleanupPayload}\x1b8\x1b[?2026l`,
+					kittyImageId === undefined ? undefined : () => allocatedPetKittyImageIds.delete(kittyImageId),
+				);
+			} else if (kittyImageId !== undefined) {
+				allocatedPetKittyImageIds.delete(kittyImageId);
 			}
+			this.#consumeCleanupAuthority();
+			this.#kittyImageId = undefined;
+		} finally {
 			this.#animation?.unregister();
 			this.#animation = undefined;
 			this.#releaseOverlayEmitter();

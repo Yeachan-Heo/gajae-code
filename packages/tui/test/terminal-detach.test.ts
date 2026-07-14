@@ -44,6 +44,11 @@ class DetachingTerminal implements Terminal {
 		this.#hideCursorFails = fails;
 	}
 
+	setWriteFailureAt(writeFailureAt: number | undefined): void {
+		this.#writeFailureAt = writeFailureAt;
+		if (writeFailureAt === undefined) this.#available = true;
+	}
+
 	start(_onInput: (data: string) => void, _onResize: () => void): void {}
 
 	stop(): void {}
@@ -328,5 +333,21 @@ describe("terminal detach handling", () => {
 		expect(() => tui.requestRender(true)).not.toThrow();
 		await settle();
 		expect(terminal.writes.length).toBe(writesBeforeCursorFailure);
+	});
+	it("retries component cleanup after terminal recovery", async () => {
+		const terminal = new DetachingTerminal(1);
+		const tui = new TUI(terminal);
+		const delivered = vi.fn();
+
+		tui.queueTerminalCleanup("pet-cleanup", delivered);
+		expect(delivered).not.toHaveBeenCalled();
+		expect(terminal.writes).toEqual([]);
+
+		terminal.setWriteFailureAt(undefined);
+		tui.start();
+		await settle();
+		expect(delivered).toHaveBeenCalledTimes(1);
+		expect(terminal.writes).toContain("pet-cleanup");
+		tui.stop();
 	});
 });

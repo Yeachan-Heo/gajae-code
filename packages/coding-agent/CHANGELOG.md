@@ -16,6 +16,7 @@
 - Fenced SDK WebSocket lifecycle callbacks and request settlement to the owning retry cycle/socket incarnation, so stale open, close, error, message, and timeout delivery cannot reject or corrupt work on a replacement connection; sent mutations remain non-replayed and deterministic race regressions cover the reconnect boundary (#2164).
 
 - Gajae Pet overlays no longer leak images or stale pixels across lifecycle changes: each widget owns a randomized Kitty image ID (deleted on disable, replace, switch, and dispose), the previous Sixel footprint is tracked and erased on movement, resize, and narrow-terminal fallback, replaced pet widgets are disposed before their successors install, and a saved pet preference survives editor replacement while graphics are still unavailable (so a delayed Sixel capability probe can still activate it). Teardown is exception-safe and idempotent: a failed or unavailable terminal write never aborts logical disposal or steals a successor widget's overlay slot, and Sixel/Kitty cleanup authority is retained until the erase is actually delivered so a later mode switch or dispose retries it.
+- Gajae Pet cleanup that fails during final widget disposal is now retained by the TUI for retry, and Kitty image IDs remain reserved until their exact-ID delete is delivered.
 
 ## [0.10.1] - 2026-07-13
 

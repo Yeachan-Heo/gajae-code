@@ -4,6 +4,7 @@
 ### Fixed
 
 - Shared the temporary stdout error listener across terminal instances, preventing `MaxListenersExceededWarning` during repeated TUI start/stop cycles while retaining late detached-PTY error handling.
+- Added a TUI-lifetime terminal cleanup queue so component-owned escape cleanup can be retried after terminal recovery even when the originating component has already been disposed.
 
 ### Added
 

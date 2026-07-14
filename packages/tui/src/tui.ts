@@ -629,6 +629,7 @@ export class TUI extends Container {
 	#stopped = false;
 	#terminalUnavailable = false;
 	#bottomPinnedComponent: Component | null = null;
+	#pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -973,6 +974,7 @@ export class TUI extends Container {
 				this.requestResizeRender();
 			},
 		);
+		this.flushTerminalCleanup();
 		this.#hideCursor();
 		this.#querySixelSupport();
 		this.#queryCellSize();
@@ -1182,6 +1184,7 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		this.flushTerminalCleanup();
 		this.#clearSixelProbeState();
 		this.#stopped = true;
 		if (this.#renderTimer) {
@@ -2587,6 +2590,22 @@ export class TUI extends Container {
 		}
 
 		return { seq, toRow: targetRow };
+	}
+
+	/** Retain terminal cleanup until a write succeeds, even after its component is disposed. */
+	queueTerminalCleanup(payload: string, onDelivered?: () => void): void {
+		this.#pendingTerminalCleanup.push({ payload, onDelivered });
+		this.flushTerminalCleanup();
+	}
+
+	/** Retry queued terminal cleanup after terminal recovery or before shutdown. */
+	flushTerminalCleanup(): void {
+		while (this.#pendingTerminalCleanup.length > 0) {
+			const pending = this.#pendingTerminalCleanup[0];
+			if (!this.#writeTerminal(pending.payload)) return;
+			this.#pendingTerminalCleanup.shift();
+			pending.onDelivered?.();
+		}
 	}
 
 	/**
