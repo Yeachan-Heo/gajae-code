@@ -87,7 +87,12 @@ import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
 import { IrcSplitViewComponent } from "./components/irc-sidebar";
-import { getPetUnavailableWarning, isPetAvailable } from "./components/pet-capability";
+import {
+	getPetUnavailableWarning,
+	isPetAvailable,
+	isPetCapabilityProbePending,
+	warnWhenPetCapabilitySettled,
+} from "./components/pet-capability";
 import { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import {
@@ -390,6 +395,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#cleanupUnsubscribe?: () => void;
 	#subprocessTeardownUnsubscribe?: () => void;
 	#petProtocolUnsubscribe?: () => void;
+	/** Cancels a startup pet-unavailable warning still awaiting probe settlement. */
+	#petUnavailableWarningDisposer?: () => void;
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
 	#planModePreviousTools: string[] | undefined;
@@ -635,7 +642,17 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 		});
 		if (configuredPetMode !== "off" && !isPetAvailable()) {
-			this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+			// The async Sixel capability probe (started by TUI.start()) may still
+			// enable graphics; warn only once the capability question is settled
+			// so a supported terminal is never told it is incompatible.
+			this.#petUnavailableWarningDisposer?.();
+			this.#petUnavailableWarningDisposer = warnWhenPetCapabilitySettled({
+				probePending: isPetCapabilityProbePending(),
+				onUnavailable: () => {
+					this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+					this.ui.requestRender();
+				},
+			});
 		}
 
 		this.#inputController.setupKeyHandlers();
@@ -2116,6 +2133,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	stop(): void {
 		this.#petProtocolUnsubscribe?.();
 		this.#petProtocolUnsubscribe = undefined;
+		this.#petUnavailableWarningDisposer?.();
+		this.#petUnavailableWarningDisposer = undefined;
 		this.petWidget?.dispose();
 		this.petWidget = undefined;
 		if (this.loadingAnimation) {
