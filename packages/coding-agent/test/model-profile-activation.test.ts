@@ -234,8 +234,9 @@ describe("model profile activation", () => {
 				architect: "openai-codex/gpt-5.6-sol:xhigh",
 			},
 		],
-	] satisfies Array<[string, Record<string, string>]>)
-	("prepares the reconstructed five-role mapping for %s", async (profileName, expected) => {
+	] satisfies Array<
+		[string, Record<string, string>]
+	>)("prepares the reconstructed five-role mapping for %s", async (profileName, expected) => {
 		const prepared = await prepareModelProfileActivation({
 			session: fakeSession(),
 			modelRegistry: fakeRegistry({ profiles: [...BUILTIN_MODEL_PROFILES] }),

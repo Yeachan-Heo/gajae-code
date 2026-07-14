@@ -359,11 +359,7 @@ function builtinMapping(name: string): Record<Role, string> {
 	return profile.modelMapping as Record<Role, string>;
 }
 
-function substituteCodexFamily(
-	selector: string,
-	source: "sol" | "terra",
-	target: "terra" | "luna",
-): string {
+function substituteCodexFamily(selector: string, source: "sol" | "terra", target: "terra" | "luna"): string {
 	const match = /^openai-codex\/gpt-5\.6-(sol|terra|luna):(.+)$/.exec(selector);
 	if (!match) throw new Error(`Expected GPT-5.6 Codex selector, got: ${selector}`);
 	return match[1] === source ? `openai-codex/gpt-5.6-${target}:${match[2]}` : selector;
