@@ -260,6 +260,16 @@ function topicRegistrySnapshot(agentDir: string): {
 	if (!fs.existsSync(file)) return { topics: {} };
 	return JSON.parse(fs.readFileSync(file, "utf8"));
 }
+/** Seed a telegram topic record for deletion/reconciliation tests. */
+function seedTopic(agentDir: string, sessionId: string, topicId: string): void {
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	const file = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	const existing = fs.existsSync(file)
+		? (JSON.parse(fs.readFileSync(file, "utf8")) as { topics: Record<string, unknown> })
+		: { topics: {} };
+	existing.topics[sessionId] = { topicId, identitySent: true, createdAt: 1_000, name: sessionId };
+	fs.writeFileSync(file, JSON.stringify(existing));
+}
 
 /** Read the durable telegram deletion-claim effects for crash-replay/retry assertions. */
 async function telegramDeletionEffects(agentDir: string): Promise<ChatEffect[]> {
@@ -3786,25 +3796,16 @@ test("a fresh registration that wins before delete intent restores topic admissi
 	const agentDir = tempAgentDir();
 	const s = settings(agentDir);
 	const cwd = path.join(agentDir, "repo");
-	const reg = await registerNotificationRoot({
-		settings: s,
-		cwd,
-		sessionId: "S",
+	fs.mkdirSync(cwd, { recursive: true });
+	const identity = await publishIdentityEndpoint(s, cwd, "S", "ws://s", "tok", {
 		randomId: () => "lease-old",
 	});
-	const sendStarted = Promise.withResolvers<void>();
-	const releaseSend = Promise.withResolvers<void>();
 	const calls: Array<{ method: string; body: any }> = [];
 	const bot = {
 		async call(method: string, body: unknown): Promise<unknown> {
 			calls.push({ method, body });
-			const request = body as { text?: unknown };
 			if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
 			if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 903 } };
-			if (method === "sendMessage" && String(request.text).includes("hold-delete")) {
-				sendStarted.resolve();
-				await releaseSend.promise;
-			}
 			if (method === "sendMessage") return { ok: true, result: { message_id: calls.length } };
 			return { ok: true, result: true };
 		},
@@ -3818,41 +3819,35 @@ test("a fresh registration that wins before delete intent restores topic admissi
 		WebSocketImpl: FakeWs as any,
 		rich: { enabled: false },
 	});
-	const session = {
-		sessionId: "S",
-		token: "tok",
-		endpointKey: "ws://s\0tok",
-		canonicalRoot: reg.root,
-		leaseId: reg.leaseId,
-		ws: { readyState: 1, send() {} },
-		pending: new Map(),
-	};
+	daemon.connectSession("S", "ws://s", "tok", identity);
+	const session = daemon.sessions.get("S")!;
 	await daemon.handleSessionMessage(session as any, {
 		type: "identity_header",
 		sessionId: "S",
 		repo: "r",
 		branch: "b",
 	});
+	const internals = daemon as unknown as {
+		deleteTopic(sessionId: string, leaseId: string): Promise<void>;
+		fencedTopicGeneration: Map<string, number>;
+		liveTopicGeneration: Map<string, number>;
+	};
+	const liveGen = internals.liveTopicGeneration.get("S");
 
-	const heldSend = daemon.handleSessionMessage(session as any, {
-		type: "turn_stream",
-		sessionId: "S",
-		phase: "finalized",
-		text: "hold-delete",
-	});
-	await sendStarted.promise;
-	const close = daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
-	await Promise.resolve();
+	// The successor registers BEFORE the predecessor delete is attempted, so the
+	// predecessor's authority acquisition observes a positively SUPERSEDED registry
+	// (tri-state) and acquires NO authority — no fence, no provider call.
 	await registerNotificationRoot({
 		settings: s,
 		cwd,
 		sessionId: "S",
 		randomId: () => "lease-new",
 	});
-	releaseSend.resolve();
-	await Promise.all([heldSend, close]);
+	await internals.deleteTopic("S", "lease-old");
 
 	expect(calls.some(call => call.method === "deleteForumTopic")).toBe(false);
+	expect(internals.fencedTopicGeneration.has("S")).toBe(false);
+	expect(internals.liveTopicGeneration.get("S")).toBe(liveGen);
 	expect(rootsRegistrySnapshot(agentDir).sessionLeases.S.leaseId).toBe("lease-new");
 
 	await connectIdentitySession(daemon, "S", "ws://resumed", "tok2");
@@ -5120,7 +5115,7 @@ test("a terminal deletion record for the same session/topic under an old lease c
 	// Seed a terminal deletion record for an OLD lease (a prior completed delete
 	// that left a durable terminal marker for the same session/topic).
 	const seedJournal = new ChatEffectJournal({ agentDir, transport: "telegram", now: () => now });
-	const oldEffectId = "telegram.topic_delete:S:701:lease-old";
+	const oldEffectId = "telegram.topic_delete:42:S:701:lease-old";
 	const seeded = await seedJournal.enqueueAndClaim(
 		{
 			id: oldEffectId,
@@ -5173,7 +5168,7 @@ test("a terminal deletion record for the same session/topic under an old lease c
 	await daemon.scanRoots();
 	expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([701]);
 	const effects = await telegramDeletionEffects(agentDir);
-	expect(effects.find(e => e.id === "telegram.topic_delete:S:701:lease-new")?.state).toBe("terminal");
+	expect(effects.find(e => e.id === "telegram.topic_delete:42:S:701:lease-new")?.state).toBe("terminal");
 	expect(effects.find(e => e.id === oldEffectId)?.state).toBe("terminal");
 });
 
@@ -7463,5 +7458,685 @@ describe("telegram daemon immutable-head review (predecessor close, ambiguous re
 			effect => (effect.payload as { topicId?: string })?.topicId === topicId,
 		);
 		expect(reconciled?.receipt?.status).toBe("reconciled");
+	});
+});
+// ---------------------------------------------------------------------------
+describe("telegram daemon deletion authority (tri-state, quarantine, fail-closed provider)", () => {
+	type DeletionInternals = {
+		fencedTopicGeneration: Map<string, number>;
+		liveTopicGeneration: Map<string, number>;
+		deleteTopic(sessionId: string, leaseId: string): Promise<void>;
+		reconcileDeletionJournal(): Promise<void>;
+	};
+	const internals = (daemon: TelegramNotificationDaemon): DeletionInternals => daemon as unknown as DeletionInternals;
+
+	const CHAT = "42";
+
+	/** Seed a pending (nonterminal) telegram topic-delete effect directly in the journal. */
+	async function seedPendingDeleteEffect(
+		agentDir: string,
+		sessionId: string,
+		topicId: string,
+		leaseId: string,
+		chatId: string = CHAT,
+	): Promise<void> {
+		const journal = new ChatEffectJournal({ agentDir, transport: "telegram" });
+		await journal.enqueue({
+			id: `telegram.topic_delete:${chatId}:${sessionId}:${topicId}:${leaseId}`,
+			kind: "telegram.topic_delete",
+			transport: "telegram",
+			sessionId,
+			endpointGeneration: 0,
+			payload: { chatId, topicId, leaseId },
+		});
+	}
+
+	function deletionEffect(agentDir: string, sessionId: string, topicId: string, leaseId: string, chatId = CHAT) {
+		return (async () => {
+			const all = await telegramDeletionEffects(agentDir);
+			return all.find(
+				e =>
+					e.sessionId === sessionId &&
+					(e.payload as { topicId?: string; chatId?: string })?.topicId === topicId &&
+					(e.payload as { chatId?: string })?.chatId === chatId &&
+					(e.payload as { leaseId?: string })?.leaseId === leaseId,
+			);
+		})();
+	}
+
+	test("every non-OK deleteForumTopic response is uncertain (fail-closed, no description regex)", async () => {
+		const responses: Array<Record<string, unknown>> = [
+			{ ok: false, error_code: 400, description: "Bad Request: TOPIC_CLOSED" },
+			{ ok: false, error_code: 400, description: "Bad Request: message thread not found" },
+			{ ok: false, error_code: 400, description: "Bad Request: topic is already deleted" },
+			{ ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" },
+			{ ok: false, error_code: 500, description: "Internal Server Error" },
+			{ ok: false, error_code: 400, description: "Bad Request: chat not found" },
+		];
+		for (const resp of responses) {
+			const agentDir = tempAgentDir();
+			const s = settings(agentDir);
+			const identity = await publishIdentityEndpoint(s, path.join(agentDir, "repo"), "S", "ws://s", "tok");
+			const bot = new FakeBotApi();
+			(bot.call as (m: string, b: unknown) => Promise<unknown>) = ((method: string, body: unknown) => {
+				if (method === "deleteForumTopic") {
+					bot.calls.push({ method, body });
+					return Promise.resolve(structuredClone(resp));
+				}
+				return FakeBotApi.prototype.call.call(bot, method, body);
+			}) as never;
+			const daemon = new TelegramNotificationDaemon({
+				settings: s,
+				ownerId: "owner",
+				botToken: "tok",
+				chatId: CHAT,
+				botApi: bot,
+				WebSocketImpl: FakeWs as never,
+			});
+			daemon.connectSession("S", "ws://s", "tok", identity);
+			const session = daemon.sessions.get("S")!;
+			await daemon.handleSessionMessage(session as any, {
+				type: "identity_header",
+				sessionId: "S",
+				repo: "r",
+				branch: "b",
+			});
+			await daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
+
+			const deletes = bot.calls.filter(c => c.method === "deleteForumTopic");
+			expect(deletes).toHaveLength(1);
+			// Topic retained (uncertain); the receipt is NEVER "deleted"/"reconciled".
+			expect(topicRegistrySnapshot(agentDir).topics.S).toBeDefined();
+			const claim = await deletionEffect(
+				agentDir,
+				"S",
+				deletes[0]!.body.message_thread_id.toString(),
+				identity.leaseId,
+			);
+			expect(claim?.state).toBe("uncertain");
+			expect(claim?.receipt?.status).not.toBe("deleted");
+			expect(String(claim?.receipt?.status ?? "").startsWith("reconciled")).toBe(false);
+		}
+	});
+
+	test("a 429 deleteForumTopic preserves the exact retry_after in the uncertain receipt", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const identity = await publishIdentityEndpoint(s, path.join(agentDir, "repo"), "S", "ws://s", "tok");
+		const bot = new FakeBotApi();
+		(bot.call as (m: string, b: unknown) => Promise<unknown>) = ((method: string, body: unknown) => {
+			if (method === "deleteForumTopic") {
+				bot.calls.push({ method, body });
+				return Promise.resolve({
+					ok: false,
+					error_code: 429,
+					parameters: { retry_after: 17 },
+					description: "Too Many Requests",
+				});
+			}
+			return FakeBotApi.prototype.call.call(bot, method, body);
+		}) as never;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+		});
+		daemon.connectSession("S", "ws://s", "tok", identity);
+		const session = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(session as any, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		await daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
+		const deletes = bot.calls.filter(c => c.method === "deleteForumTopic");
+		const claim = await deletionEffect(
+			agentDir,
+			"S",
+			deletes[0]!.body.message_thread_id.toString(),
+			identity.leaseId,
+		);
+		expect(claim?.receipt?.status).toBe("retry_after:17");
+		expect(claim?.state).toBe("uncertain");
+	});
+
+	test("a deleted topic only reconciles on an explicit provider OK", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const identity = await publishIdentityEndpoint(s, path.join(agentDir, "repo"), "S", "ws://s", "tok");
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+		});
+		daemon.connectSession("S", "ws://s", "tok", identity);
+		const session = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(session as any, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		await daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
+		const deletes = bot.calls.filter(c => c.method === "deleteForumTopic");
+		expect(deletes).toHaveLength(1);
+		expect(topicRegistrySnapshot(agentDir).topics.S).toBeUndefined();
+		const claim = await deletionEffect(
+			agentDir,
+			"S",
+			deletes[0]!.body.message_thread_id.toString(),
+			identity.leaseId,
+		);
+		expect(claim?.state).toBe("terminal");
+		expect(claim?.receipt?.status).toBe("reconciled");
+	});
+
+	test("corrupt registry evidence rejects session-close authority without throwing or deleting", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const identity = await publishIdentityEndpoint(s, path.join(agentDir, "repo"), "S", "ws://s", "tok");
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+		});
+		daemon.connectSession("S", "ws://s", "tok", identity);
+		const session = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(session as any, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		fs.writeFileSync(daemonPaths(agentDir).roots, "{ corrupt registry");
+
+		await expect(
+			daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" }),
+		).resolves.toBeUndefined();
+		expect(bot.calls.some(call => call.method === "deleteForumTopic")).toBe(false);
+		expect(topicRegistrySnapshot(agentDir).topics.S).toBeDefined();
+		expect(await telegramDeletionEffects(agentDir)).toHaveLength(0);
+	});
+	test("UNKNOWN evidence (absent session entry) preserves the claim untouched with no provider call or mutation", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", { randomId: () => "lease-1", now: () => 1000 });
+		seedTopic(agentDir, "S", "601");
+		await seedPendingDeleteEffect(agentDir, "S", "601", "lease-1");
+		// Remove the session entry from an otherwise-valid registry (absent entry ⇒ UNKNOWN).
+		const registryPath = daemonPaths(agentDir).roots;
+		const reg = JSON.parse(fs.readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+		delete (reg.sessions as Record<string, unknown>).S;
+		delete (reg.sessionLeases as Record<string, unknown>).S;
+		fs.writeFileSync(registryPath, JSON.stringify(reg));
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await internals(daemon).reconcileDeletionJournal();
+
+		// No provider call, topic retained, claim still pending (preserved), registry unchanged.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(topicRegistrySnapshot(agentDir).topics.S?.topicId).toBe("601");
+		const claim = await deletionEffect(agentDir, "S", "601", "lease-1");
+		expect(claim?.state).toBe("pending");
+		const after = rootsRegistrySnapshot(agentDir);
+		expect(after.sessionLeases.S).toBeUndefined();
+		expect(after.sessions.S).toBeUndefined();
+	});
+
+	test("UNKNOWN evidence (corrupt JSON / unreadable I/O) preserves the claim with no provider call", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", { randomId: () => "lease-1", now: () => 1000 });
+		seedTopic(agentDir, "S", "601");
+		await seedPendingDeleteEffect(agentDir, "S", "601", "lease-1");
+		// Corrupt the roots registry JSON so the read throws (non-ENOENT) ⇒ UNKNOWN.
+		fs.writeFileSync(daemonPaths(agentDir).roots, "{ this is not valid json,,,");
+		// An fs whose roots-file read always fails with EACCES (unreadable I/O ⇒ UNKNOWN).
+		const rootsFile = daemonPaths(agentDir).roots;
+		const unreadable: TelegramDaemonFs = {
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: (file, encoding) =>
+				file === rootsFile
+					? Promise.reject(Object.assign(new Error("denied"), { code: "EACCES" }))
+					: fs.promises.readFile(file, encoding),
+			writeFile: (file, data, opts) => fs.promises.writeFile(file, data, opts),
+			rename: (a, b) => fs.promises.rename(a, b).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+			realpath: file => fs.promises.realpath(file),
+		};
+
+		for (const fsImpl of [undefined, unreadable]) {
+			const bot = new FakeBotApi();
+			const daemon = new TelegramNotificationDaemon({
+				settings: s,
+				ownerId: "owner",
+				botToken: "tok",
+				chatId: CHAT,
+				botApi: bot,
+				WebSocketImpl: FakeWs as never,
+				pidAlive: () => true,
+				...(fsImpl ? { fs: fsImpl } : {}),
+			});
+			await daemon.loadTopics();
+			await internals(daemon).reconcileDeletionJournal();
+			expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+			expect(topicRegistrySnapshot(agentDir).topics.S?.topicId).toBe("601");
+			const claim = await deletionEffect(agentDir, "S", "601", "lease-1");
+			expect(claim?.state).toBe("pending");
+		}
+	});
+
+	test("UNKNOWN evidence keeps blocking current-session registration", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", { randomId: () => "lease-1", now: () => 1000 });
+		seedTopic(agentDir, "S", "601");
+		await seedPendingDeleteEffect(agentDir, "S", "601", "lease-1");
+		// Absent session entry ⇒ UNKNOWN.
+		const registryPath = daemonPaths(agentDir).roots;
+		const reg = JSON.parse(fs.readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+		delete (reg.sessions as Record<string, unknown>).S;
+		delete (reg.sessionLeases as Record<string, unknown>).S;
+		fs.writeFileSync(registryPath, JSON.stringify(reg));
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await internals(daemon).reconcileDeletionJournal();
+		// A fresh registration is still blocked by the preserved unreconciled claim.
+		await expect(
+			registerNotificationRoot({ settings: s, cwd, sessionId: "S", randomId: () => "lease-2" }),
+		).rejects.toThrow();
+	});
+
+	test("positively proven SUPERSEDED terminalizes non-destructively with no provider call", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", { randomId: () => "lease-old", now: () => 1000 });
+		seedTopic(agentDir, "S", "601");
+		await seedPendingDeleteEffect(agentDir, "S", "601", "lease-old");
+		// Simulate the crash/race window where a successor registration became durable
+		// before this predecessor claim was observed by admission. The valid current
+		// registry lease positively proves supersession.
+		const registryPath = daemonPaths(agentDir).roots;
+		const registry = rootsRegistrySnapshot(agentDir);
+		registry.sessionLeases.S = { leaseId: "lease-new", refreshedAt: 2_000 };
+		fs.writeFileSync(registryPath, JSON.stringify(registry));
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await internals(daemon).reconcileDeletionJournal();
+
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		const claim = await deletionEffect(agentDir, "S", "601", "lease-old");
+		expect(claim?.state).toBe("terminal");
+		expect(claim?.receipt?.status).toBe("reconciled_superseded");
+		// Non-destructive: the successor lease/mapping survive untouched.
+		expect(rootsRegistrySnapshot(agentDir).sessionLeases.S.leaseId).toBe("lease-new");
+	});
+
+	test("EXACT-CURRENT nonterminal replays through the unified deletion flow", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", { randomId: () => "lease-1", now: () => 1000 });
+		seedTopic(agentDir, "S", "601");
+		await seedPendingDeleteEffect(agentDir, "S", "601", "lease-1");
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await internals(daemon).reconcileDeletionJournal();
+
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic")).toHaveLength(1);
+		expect(topicRegistrySnapshot(agentDir).topics.S).toBeUndefined();
+		const claim = await deletionEffect(agentDir, "S", "601", "lease-1");
+		expect(claim?.receipt?.status).toBe("reconciled");
+	});
+
+	test("a prior-chat deletion effect is quarantined non-destructively and no longer blocks registration", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", { randomId: () => "lease-1", now: () => 1000 });
+		seedTopic(agentDir, "S", "601");
+		// A deletion effect recorded under a PRIOR chat id (collision-safe id embeds chat).
+		await seedPendingDeleteEffect(agentDir, "S", "601", "lease-1", "999");
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await internals(daemon).reconcileDeletionJournal();
+
+		// Quarantined: no provider call, no topic removal, terminal reconciled_quarantine.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(topicRegistrySnapshot(agentDir).topics.S?.topicId).toBe("601");
+		const quarantined = (await telegramDeletionEffects(agentDir)).find(
+			e => (e.payload as { chatId?: string })?.chatId === "999",
+		);
+		expect(quarantined?.state).toBe("terminal");
+		expect(quarantined?.receipt?.status).toBe("reconciled_quarantine");
+		// No longer blocks current-session registration.
+		await expect(
+			registerNotificationRoot({ settings: s, cwd, sessionId: "S", randomId: () => "lease-2" }),
+		).resolves.toBeDefined();
+	});
+
+	test("a malformed deletion claim is quarantined without provider or topic/root mutation", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", {
+			randomId: () => "lease-1",
+			now: () => 1_000,
+		});
+		seedTopic(agentDir, "S", "601");
+		const journal = new ChatEffectJournal({ agentDir, transport: "telegram" });
+		const effectId = "telegram.topic_delete:malformed:S";
+		await journal.enqueue({
+			id: effectId,
+			kind: "telegram.topic_delete",
+			transport: "telegram",
+			sessionId: "S",
+			endpointGeneration: 0,
+			payload: { chatId: CHAT, topicId: "not-a-topic", leaseId: "" },
+		});
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await internals(daemon).reconcileDeletionJournal();
+
+		expect(bot.calls.some(call => call.method === "deleteForumTopic")).toBe(false);
+		expect(topicRegistrySnapshot(agentDir).topics.S?.topicId).toBe("601");
+		expect(rootsRegistrySnapshot(agentDir).sessionLeases.S.leaseId).toBe("lease-1");
+		const quarantined = await journal.read(effectId);
+		expect(quarantined?.state).toBe("terminal");
+		expect(quarantined?.receipt?.status).toBe("reconciled_quarantine");
+		await expect(
+			registerNotificationRoot({ settings: s, cwd, sessionId: "S", randomId: () => "lease-2" }),
+		).resolves.toBeDefined();
+	});
+
+	test("a current-chat deletion never collides with a prior-chat effect (chat-embedded effect id)", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts", { randomId: () => "lease-1", now: () => 1000 });
+		seedTopic(agentDir, "S", "601");
+		// Prior-chat terminal effect for the SAME session/topic/lease under chat 999.
+		const priorJournal = new ChatEffectJournal({ agentDir, transport: "telegram" });
+		const priorId = "telegram.topic_delete:999:S:601:lease-1";
+		const seeded = await priorJournal.enqueueAndClaim(
+			{
+				id: priorId,
+				kind: "telegram.topic_delete",
+				transport: "telegram",
+				sessionId: "S",
+				endpointGeneration: 0,
+				payload: { chatId: "999", topicId: "601", leaseId: "lease-1" },
+			},
+			"owner",
+			60_000,
+		);
+		await priorJournal.record(priorId, { owner: "owner", epoch: seeded!.epoch }, "terminal", {
+			provider: "telegram",
+			status: "deleted",
+		});
+		// A current-chat (42) nonterminal effect for the same session/topic/lease: it
+		// MUST replay under its own chat-embedded id without inheriting the prior record.
+		await seedPendingDeleteEffect(agentDir, "S", "601", "lease-1", CHAT);
+
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+			pidAlive: () => true,
+		});
+		await daemon.loadTopics();
+		await internals(daemon).reconcileDeletionJournal();
+
+		// The prior-chat effect is quarantined; the current-chat delete proceeds under its own id.
+		expect(bot.calls.filter(c => c.method === "deleteForumTopic")).toHaveLength(1);
+		const priorAfter = (await telegramDeletionEffects(agentDir)).find(e => e.id === priorId);
+		expect(priorAfter?.receipt?.status).toBe("reconciled_quarantine");
+		const current = await deletionEffect(agentDir, "S", "601", "lease-1", CHAT);
+		expect(current?.receipt?.status).toBe("reconciled");
+	});
+
+	test("a successor that wins before authority claim causes no fence, no provider call, and no live-generation mutation", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		const identity = await publishIdentityEndpoint(s, cwd, "S", "ws://s", "tok", { randomId: () => "lease-old" });
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			rich: { enabled: false },
+		});
+		daemon.connectSession("S", "ws://s", "tok", identity);
+		const session = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(session as any, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		const gen = internals(daemon).liveTopicGeneration.get("S")!;
+
+		// Successor registers before the predecessor delete attempts authority.
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "S", randomId: () => "lease-new" });
+		await internals(daemon).deleteTopic("S", "lease-old");
+
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(internals(daemon).fencedTopicGeneration.has("S")).toBe(false);
+		expect(internals(daemon).liveTopicGeneration.get("S")).toBe(gen);
+		expect(rootsRegistrySnapshot(agentDir).sessionLeases.S.leaseId).toBe("lease-new");
+	});
+
+	test("platform identity: injected case-folding realpath collapses case-variant workspaces to one root", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const upper = path.join(agentDir, "Repo-WS");
+		const lower = path.join(agentDir, "repo-ws");
+		fs.mkdirSync(upper, { recursive: true });
+		// A realpath seam that case-folds (mirrors macOS default case-insensitive resolution).
+		const caseFoldingFs: TelegramDaemonFs = {
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+			writeFile: (file, data, opts) => fs.promises.writeFile(file, data, opts),
+			rename: (a, b) => fs.promises.rename(a, b).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+			realpath: file => fs.promises.realpath(file === lower ? upper : file),
+		};
+		const fromUpper = await registerNotificationRoot({
+			settings: s,
+			fs: caseFoldingFs,
+			cwd: upper,
+			sessionId: "S",
+			randomId: () => "lease-1",
+		});
+		const fromLower = await registerNotificationRoot({
+			settings: s,
+			fs: caseFoldingFs,
+			cwd: lower,
+			sessionId: "S",
+			randomId: () => "lease-2",
+		});
+		expect(fromUpper.root).toBe(fromLower.root);
+		const registry = rootsRegistrySnapshot(agentDir);
+		expect(registry.roots).toEqual([fromUpper.root]);
+		expect(registry.sessionLeases.S.leaseId).toBe("lease-2");
+	});
+
+	test("platform identity: Unicode NFC/NFD-equivalent realpath collapse keeps one canonical identity", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		// "café" in composed (NFC) vs decomposed (NFD) form.
+		const composed = path.join(agentDir, "caf\u00e9-ws");
+		const decomposed = path.join(agentDir, "cafe\u0301-ws");
+		fs.mkdirSync(composed, { recursive: true });
+		const unicodeFs: TelegramDaemonFs = {
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+			writeFile: (file, data, opts) => fs.promises.writeFile(file, data, opts),
+			rename: (a, b) => fs.promises.rename(a, b).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+			realpath: file => fs.promises.realpath(file.normalize("NFC") === composed ? composed : file),
+		};
+		const a = await registerNotificationRoot({
+			settings: s,
+			fs: unicodeFs,
+			cwd: composed,
+			sessionId: "S",
+			randomId: () => "lease-1",
+		});
+		const b = await registerNotificationRoot({
+			settings: s,
+			fs: unicodeFs,
+			cwd: decomposed,
+			sessionId: "S",
+			randomId: () => "lease-2",
+		});
+		expect(a.root).toBe(b.root);
+		expect(rootsRegistrySnapshot(agentDir).roots).toEqual([a.root]);
+	});
+
+	test("platform identity: an ancestor symlink retargeted between scans does not falsely reap a live workspace", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const realA = path.join(agentDir, "real-a");
+		const realB = path.join(agentDir, "real-b");
+		const link = path.join(agentDir, "link");
+		fs.mkdirSync(realA, { recursive: true });
+		fs.mkdirSync(realB, { recursive: true });
+		fs.symlinkSync(realA, link);
+		// Register through the link (canonicalizes to realA's state dir).
+		const identity = await publishIdentityEndpoint(s, link, "S", "ws://s", "ts", {
+			randomId: () => "lease-1",
+			now: () => 70_000,
+		});
+		seedTopic(agentDir, "S", "501");
+
+		const bot = new FakeBotApi();
+		let now = 70_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			pidAlive: () => true,
+			now: () => now,
+		});
+		await daemon.loadTopics();
+		await daemon.scanRoots();
+		expect(daemon.sessions.has("S")).toBe(true);
+
+		// TOCTOU: retarget the ancestor symlink to a different target after registration.
+		fs.unlinkSync(link);
+		fs.symlinkSync(realB, link);
+
+		bot.calls = [];
+		now = 130_000;
+		await daemon.scanRoots();
+		// No false reap: the originally-registered canonical root is the durable identity.
+		expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+		expect(rootsRegistrySnapshot(agentDir).sessions.S).toBe(identity.canonicalRoot);
 	});
 });
