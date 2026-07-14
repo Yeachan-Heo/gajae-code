@@ -1558,6 +1558,16 @@ export function createNotificationsExtension(
 	let identityControlInFlight = false;
 	let deferredIdentityRotation: { event: { previousSessionFile?: string }; ctx: ExtensionContext } | undefined;
 	const ensureTelegramDaemon = options.ensureTelegramDaemon ?? ensureTelegramDaemonRunning;
+	async function ensureConfiguredDaemons(
+		settings: Settings,
+		cfg: NotificationConfig,
+		cwd: string,
+		id: string,
+	): Promise<void> {
+		if (isTelegramConfigured(cfg)) await ensureTelegramDaemon({ settings, cwd, sessionId: id });
+		if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
+		if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
+	}
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -2415,9 +2425,7 @@ export function createNotificationsExtension(
 			}
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
-					if (isTelegramConfigured(cfg)) await ensureTelegramDaemon({ settings, cwd: ctx.cwd, sessionId: id });
-					if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
-					if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
+					await ensureConfiguredDaemons(settings, cfg, ctx.cwd, id);
 				} catch (e) {
 					logger.warn(`notifications: failed to ensure notification daemon: ${String(e)}`);
 				}
@@ -2659,7 +2667,16 @@ export function createNotificationsExtension(
 					expectedRuntime?.host.started === true &&
 					expectedRuntime.host.generation === expectedGeneration &&
 					expectedRuntime.stopping === false;
-				if (enabled) expectedRuntime.enableNotifications();
+				if (enabled) {
+					expectedRuntime.enableNotifications();
+					if (resolved.settingsAvailable && resolved.settings) {
+						try {
+							await ensureConfiguredDaemons(resolved.settings, resolved.cfg, ctx.cwd, id);
+						} catch (error) {
+							logger.warn(`notifications: failed to ensure notification daemon: ${String(error)}`);
+						}
+					}
+				}
 				const startupWasFenced = result.status === "failed" && expectedRuntime?.stopping === true;
 				ctx.ui.notify(
 					enabled

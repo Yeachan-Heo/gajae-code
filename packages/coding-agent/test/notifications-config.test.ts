@@ -590,10 +590,10 @@ describe("notifications config", () => {
 		expect(extensionShouldRegister).toBe(false);
 		if (extensionShouldRegister) createNotificationsExtension(api);
 		expect(notify).toBeUndefined();
-		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "notifications", `${sessionId}.json`))).toBe(false);
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).toBe(false);
 		expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
 	});
-	test("captured /notify on uses the production daemon ensurer once and awaits endpoint shutdown", async () => {
+	test("captured /notify on uses the production daemon ensurer once and awaits SDK endpoint shutdown", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-command-"));
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-agent-"));
 		tempDirs.push(cwd, agentDir);
@@ -648,7 +648,7 @@ describe("notifications config", () => {
 				}),
 		});
 
-		const endpoint = path.join(cwd, ".gjc", "state", "notifications", `${sessionId}.json`);
+		const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		const roots = daemonPaths(agentDir).roots;
 		const sessionStart = handlers.get("session_start");
 		const sessionShutdown = handlers.get("session_shutdown");
@@ -657,7 +657,7 @@ describe("notifications config", () => {
 		let shutdownCompleted = false;
 		try {
 			await sessionStart({}, context);
-			expect(fs.existsSync(endpoint)).toBe(false);
+			expect(fs.existsSync(endpoint)).toBe(true);
 			expect(fs.existsSync(roots)).toBe(false);
 
 			settings.override("notifications.enabled", true);
