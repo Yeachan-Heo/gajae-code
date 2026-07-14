@@ -124,11 +124,14 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 				items: arrayItemsSchema(definition.default, "items" in definition ? definition.items : undefined),
 			};
 		case "record":
-			return { type: "object", additionalProperties: recordValueSchema(definition.valueSchema) };
+			return {
+				type: "object",
+				additionalProperties: recordValueSchema("valueSchema" in definition ? definition.valueSchema : undefined),
+			};
 	}
 }
 
-function recordValueSchema(valueSchema: Extract<SettingDefinition, { type: "record" }>["valueSchema"]): JsonSchema {
+function recordValueSchema(valueSchema?: { readonly type: "model-selector-value" }): JsonSchema {
 	if (valueSchema?.type !== "model-selector-value") return true;
 	const selector = { type: "string", minLength: 1, pattern: "\\S" };
 	return {
