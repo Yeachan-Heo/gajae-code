@@ -161,6 +161,56 @@ Threaded clients may also send optional client → server frames: `user_message`
 in-thread), `hello` (capability/version), and `ping`. A minimal client only
 needs `reply`.
 
+## Model catalog query (Q10)
+
+The SDK exposes the model catalog through the paged Q10 registry query. `Q10`,
+`models.list/current`, `models.list`, and `models.current` are exact aliases:
+each returns the same paged registry array, not a current-model singleton or a
+filtered list. Continue using the returned cursor until `page.complete` is
+true.
+
+Each row preserves the five legacy fields (`provider`, `id`, `name`,
+`contextWindow`, and `maxTokens`) and additively includes `reasoning`,
+`thinking`, and `current`. `currentThinkingLevel` appears only on the current
+row when the live session has a thinking level. The exported DTO types are
+`Q10Model`, `Q10ThinkingCapabilities`, `Q10ThinkingEffort`,
+`Q10SettableThinkingLevel`, `Q10CurrentThinkingLevel`, and
+`Q10ThinkingMode`, all from `@gajae-code/coding-agent/sdk`; there is no public
+`/sdk/models` subpath.
+
+```json
+{
+  "provider": "runtime-provider",
+  "id": "reasoning-model",
+  "name": "Reasoning Model",
+  "contextWindow": 128000,
+  "maxTokens": 8192,
+  "reasoning": true,
+  "thinking": {
+    "validLevels": ["off", "minimal", "low", "medium", "high"],
+    "minLevel": "minimal",
+    "maxLevel": "high",
+    "mode": "effort",
+    "defaultLevel": "low"
+  },
+  "current": true,
+  "currentThinkingLevel": "high"
+}
+```
+
+`thinking.validLevels` is always present and starts with `"off"`; it is the
+canonical menu for `model.set` and never contains `"inherit"`. For a
+non-reasoning model it is exactly `["off"]`. Successful reasoning rows always
+include `minLevel`, `maxLevel`, and `mode`; only `defaultLevel` and raw `levels`
+are optional. Raw `levels` deliberately keeps its descriptor order and
+duplicates, while `validLevels` is the canonical, deduplicated menu clients
+should render. `"inherit"` is a current-state readback value only and is rejected
+as a `model.set` input.
+
+Malformed reasoning descriptors are not client-recoverable catalog data. The
+query returns the SDK's safe `internal` error rather than exposing a partially
+formed row or descriptor details.
+
 ## Answer semantics
 
 A remote reply answers a pending ask in every session state:

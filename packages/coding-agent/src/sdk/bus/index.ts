@@ -52,6 +52,7 @@ import { SessionIndex } from "../broker/session-index";
 import { SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
+import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { registerTelegramFileSink } from "./attachment-registry";
 import { ensureDiscordDaemon, ensureSlackDaemon } from "./chat-daemon-control";
@@ -1105,6 +1106,7 @@ function installedOperations(ctx: ExtensionContext, kind: "control" | "query"): 
 function sdkQuerySurface(
 	ctx: ExtensionContext,
 	id: string,
+	api: ExtensionAPI,
 	getInstalledDefinitions: (capability: string) => unknown | undefined = () => undefined,
 	getLiveState: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number } = () => ({
 		isStreaming: false,
@@ -1161,14 +1163,12 @@ function sdkQuerySurface(
 			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
 		getDiff,
 		getUsage: () => ctx.sessionManager.getUsageStatistics(),
-		getModels: () =>
-			ctx.modelRegistry.getAll().map(model => ({
-				provider: model.provider,
-				id: model.id,
-				name: model.name,
-				contextWindow: model.contextWindow,
-				maxTokens: model.maxTokens,
-			})),
+		getModels: () => {
+			const models = ctx.modelRegistry.getAll();
+			const currentModel = ctx.model;
+			const currentThinkingLevel = api.getThinkingLevel();
+			return projectQ10Models({ models, currentModel, currentThinkingLevel });
+		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => ctx.workflowGate?.listPendingGates?.() ?? [],
 		getConfigItems: () => {
@@ -1792,6 +1792,7 @@ export function createNotificationsExtension(
 			sdkQuerySurface(
 				ctx,
 				id,
+				api,
 				capability => host?.reverse.getInstalledDefinitions(capability),
 				() => {
 					// Live session truth: the agent loop drives rt.busy on

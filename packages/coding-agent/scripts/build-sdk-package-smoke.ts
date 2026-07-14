@@ -6,6 +6,7 @@ import * as path from "node:path";
 
 const packageDir = path.resolve(import.meta.dir, "..");
 const packageName = "@gajae-code/coding-agent";
+const aiPackageDir = path.resolve(packageDir, "../ai");
 const manifestsDir = path.join(packageDir, "test/manifests");
 const baselinePath = path.join(manifestsDir, "sdk-public-surface-v1.json");
 const generatedPath = path.join(manifestsDir, "sdk-public-surface.generated.json");
@@ -27,15 +28,31 @@ function assertExport(module: Record<string, unknown>, name: string, subpath: st
 async function runSmoke(): Promise<Surface> {
 	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-package-smoke-"));
 	try {
-		const tarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], packageDir);
-		const tarballPath = path.isAbsolute(tarball) ? tarball : path.join(packageDir, tarball);
+		const aiTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], aiPackageDir);
+		const codingAgentTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], packageDir);
+		const aiTarballPath = path.isAbsolute(aiTarball) ? aiTarball : path.join(aiPackageDir, aiTarball);
+		const codingAgentTarballPath = path.isAbsolute(codingAgentTarball)
+			? codingAgentTarball
+			: path.join(packageDir, codingAgentTarball);
 		await fs.writeFile(
 			path.join(tempDir, "package.json"),
-			JSON.stringify({ name: "sdk-smoke", private: true }, null, 2),
+			JSON.stringify(
+				{
+					name: "sdk-smoke",
+					private: true,
+					dependencies: {
+						"@gajae-code/ai": `file:${aiTarballPath}`,
+						[packageName]: `file:${codingAgentTarballPath}`,
+					},
+					overrides: { "@gajae-code/ai": `file:${aiTarballPath}` },
+				},
+				null,
+				2,
+			),
 		);
-		// Install the packed artifact, rather than importing the workspace source, so exports/files
-		// omissions in the published tarball fail this gate.
-		run(["bun", "add", tarballPath, "--ignore-scripts"], tempDir);
+		// Install the matching packed workspace artifacts so the smoke test exercises the
+		// release dependency boundary without falling back to an older registry package.
+		run(["bun", "install", "--ignore-scripts"], tempDir);
 		const probePath = path.join(tempDir, "probe.ts");
 		await fs.writeFile(
 			probePath,

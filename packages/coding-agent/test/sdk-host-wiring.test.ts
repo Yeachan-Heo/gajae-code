@@ -59,6 +59,8 @@ function start(
 		{
 			on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
 			registerCommand: () => {},
+			getThinkingLevel: () =>
+				typeof ctx.getThinkingLevel === "function" ? (ctx.getThinkingLevel as () => unknown)() : undefined,
 			sendUserMessage: (
 				content: Parameters<ExtensionActions["sendUserMessage"]>[0],
 				options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
@@ -93,6 +95,35 @@ function context(
 			getUsageStatistics: () => ({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 }),
 		},
 		getContextUsage: () => ({ tokens: 3, contextWindow: 100, percent: 3 }),
+		model: { provider: "fixture-provider", id: "reasoning-model" },
+		getThinkingLevel: () => "low",
+		modelRegistry: {
+			getAll: () => [
+				{
+					provider: "fixture-provider",
+					id: "non-reasoning-model",
+					name: "Non-reasoning Model",
+					contextWindow: 64_000,
+					maxTokens: 4_096,
+					reasoning: false,
+				},
+				{
+					provider: "fixture-provider",
+					id: "reasoning-model",
+					name: "Reasoning Model",
+					contextWindow: 128_000,
+					maxTokens: 8_192,
+					reasoning: true,
+					thinking: {
+						minLevel: "minimal",
+						maxLevel: "high",
+						mode: "effort",
+						defaultLevel: "high",
+						levels: ["high", "minimal", "high"],
+					},
+				},
+			],
+		},
 		getSystemPrompt: () => ["test"],
 		isIdle: () => live.idle ?? true,
 		hasPendingMessages: () => {
@@ -949,6 +980,48 @@ test("SDK host binds session query and control seams and excludes uninstalled re
 	] as const) {
 		const response = await request(`query-${query}`, { type: "query_request", id: `query-${query}`, query });
 		expect(response).toMatchObject({ ok: true, page: { items: [expect.objectContaining(expected)] } });
+	}
+	for (const query of ["Q10", "models.list/current", "models.list", "models.current"]) {
+		const response = await request(`query-${query}`, {
+			type: "query_request",
+			id: `query-${query}`,
+			query,
+		});
+		expect(response).toMatchObject({
+			ok: true,
+			page: {
+				items: [
+					{
+						provider: "fixture-provider",
+						id: "non-reasoning-model",
+						name: "Non-reasoning Model",
+						contextWindow: 64_000,
+						maxTokens: 4_096,
+						reasoning: false,
+						thinking: { validLevels: ["off"] },
+						current: false,
+					},
+					{
+						provider: "fixture-provider",
+						id: "reasoning-model",
+						name: "Reasoning Model",
+						contextWindow: 128_000,
+						maxTokens: 8_192,
+						reasoning: true,
+						thinking: {
+							validLevels: ["off", "minimal", "high"],
+							minLevel: "minimal",
+							maxLevel: "high",
+							mode: "effort",
+							defaultLevel: "high",
+							levels: ["high", "minimal", "high"],
+						},
+						current: true,
+						currentThinkingLevel: "low",
+					},
+				],
+			},
+		});
 	}
 	for (const [operation, input, confirm] of [
 		["model.cycle", {}, false],

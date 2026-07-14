@@ -123,6 +123,8 @@
 			"types": "./src/sdk/index.ts",
 			"import": "./src/sdk/index.ts"
 		},
+		"./sdk/models": null,
+		"./sdk/models.js": null,
 		"./sdk/bus": {
 			"types": "./src/sdk/bus/index.ts",
 			"import": "./src/sdk/bus/index.ts"
