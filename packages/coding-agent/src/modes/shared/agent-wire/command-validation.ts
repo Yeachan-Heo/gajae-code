@@ -90,6 +90,24 @@ function unattendedDeclaration(value: unknown): boolean {
 		stringArray(value.action_allowlist)
 	);
 }
+const HANDOFF_LANES = new Set(["main", "self"]);
+const HANDOFF_AUTHORITY_KEYS = new Set(["incarnationDigest", "epochRevision", "leaseId", "deploymentGeneration"]);
+
+function positiveSafeInteger(value: unknown): boolean {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function handoffAuthority(value: unknown): boolean {
+	if (!isRecord(value) || Object.keys(value).length !== HANDOFF_AUTHORITY_KEYS.size) return false;
+	if (!Object.keys(value).every(key => HANDOFF_AUTHORITY_KEYS.has(key))) return false;
+	return (
+		typeof value.incarnationDigest === "string" &&
+		/^[0-9a-f]{64}$/.test(value.incarnationDigest) &&
+		positiveSafeInteger(value.epochRevision) &&
+		positiveSafeInteger(value.leaseId) &&
+		positiveSafeInteger(value.deploymentGeneration)
+	);
+}
 
 export function isRpcCommand(value: unknown): value is RpcCommand {
 	if (!isRecord(value) || !optionalString(value.id) || !isRpcCommandType(value.type)) return false;
@@ -171,6 +189,8 @@ export function isRpcCommand(value: unknown): value is RpcCommand {
 			return stringField(value, "name");
 		case "handoff":
 			return optionalString(value.customInstructions);
+		case "checkpoint_for_handoff":
+			return handoffAuthority(value.authority) && typeof value.lane === "string" && HANDOFF_LANES.has(value.lane);
 		case "login":
 			return stringField(value, "providerId");
 		case "negotiate_unattended":

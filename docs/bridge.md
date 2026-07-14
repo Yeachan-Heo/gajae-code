@@ -172,6 +172,7 @@ endpoint matrix, the default handshake advertises no accepted scopes.
 | `abort_and_prompt` | `prompt` |
 | `new_session` | `session` |
 | `get_state` | `message:read` |
+| `checkpoint_for_handoff` | `admin` |
 | `set_todos` | `control` |
 | `set_host_tools` | `host_tools` |
 | `set_host_uri_schemes` | `host_uri` |

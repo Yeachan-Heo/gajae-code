@@ -18,7 +18,13 @@ from .client import (
     WorkflowGateListener,
 )
 from .registry import SessionHandle, list_sessions
-from .host_tools import HostTool, HostToolContext, HostToolResultPayload, HostToolResultValue, host_tool
+from .host_tools import (
+    HostTool,
+    HostToolContext,
+    HostToolResultPayload,
+    HostToolResultValue,
+    host_tool,
+)
 from .host_uris import (
     HostUri,
     HostUriContentType,
@@ -44,6 +50,8 @@ from .protocol import (
     BranchResult,
     CancellationResult,
     CompactionResult,
+    CheckpointForHandoffResult,
+    ChildDispositionReceipt,
     CompactionSummaryMessage,
     CustomMessage,
     DeveloperMessage,
@@ -93,6 +101,9 @@ from .protocol import (
     WorkflowGate,
     ContextUsage,
     HandoffResult,
+    HandoffAuthority,
+    HandoffCheckpointReceipt,
+    HandoffLane,
     LoginProvider,
     UnattendedAccepted,
     UnattendedBudget,
@@ -110,6 +121,10 @@ from .protocol import (
     parse_todo_phases,
     parse_login_provider,
     parse_unattended_accepted,
+    parse_checkpoint_for_handoff_result,
+    parse_child_disposition_receipt,
+    parse_handoff_authority,
+    parse_handoff_checkpoint_receipt,
 )
 
 __all__ = [
@@ -120,7 +135,16 @@ __all__ = [
     "LoginProvider",
     "UnattendedAccepted",
     "UnattendedBudget",
+    "CheckpointForHandoffResult",
+    "ChildDispositionReceipt",
     "parse_login_provider",
+    "HandoffAuthority",
+    "HandoffCheckpointReceipt",
+    "HandoffLane",
+    "parse_checkpoint_for_handoff_result",
+    "parse_child_disposition_receipt",
+    "parse_handoff_authority",
+    "parse_handoff_checkpoint_receipt",
     "parse_unattended_accepted",
     "AgentEventListener",
     "AgentEndEvent",

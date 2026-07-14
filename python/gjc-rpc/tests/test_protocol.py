@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import unittest
 
 from gjc_rpc import (
@@ -22,6 +24,10 @@ from gjc_rpc import (
     TodoReminderEvent,
     TurnStartEvent,
     assistant_text,
+    parse_checkpoint_for_handoff_result,
+    parse_child_disposition_receipt,
+    parse_handoff_authority,
+    parse_handoff_checkpoint_receipt,
     assistant_text_with_thinking,
     parse_notification,
     parse_session_state,
@@ -40,6 +46,56 @@ def _wrapped_event(event: dict) -> dict:
         "payload": {"event_type": event["type"], "event": event},
     }
 
+
+def _handoff_authority() -> dict[str, object]:
+    return {
+        "incarnationDigest": "a" * 64,
+        "epochRevision": 2,
+        "leaseId": 3,
+        "deploymentGeneration": 4,
+    }
+
+
+def _handoff_receipt(
+    authority: dict[str, object] | None = None, lane: str = "main"
+) -> dict[str, object]:
+    authority = authority or _handoff_authority()
+    transcript_digest = "b" * 64
+    session_file = "/tmp/gjc-session.jsonl"
+    completed_marker = {
+        "domain": "gjc.checkpoint-for-handoff.completed-marker.v1",
+        "authority": authority,
+        "lane": lane,
+        "sessionId": "session-1",
+        "sessionFileDigest": hashlib.sha256(session_file.encode("utf-8")).hexdigest(),
+        "provider": "openai",
+        "model": "gpt-test",
+        "thinking": "medium",
+        "modelProfile": "default",
+        "transcriptDigest": transcript_digest,
+    }
+    return {
+        "protocolVersion": 1,
+        "authority": authority,
+        "lane": lane,
+        "cleanQuiesced": True,
+        "transcriptFsynced": True,
+        "completedMarkerDigest": hashlib.sha256(
+            json.dumps(
+                completed_marker,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "transcriptDigest": transcript_digest,
+        "sessionId": "session-1",
+        "sessionFile": session_file,
+        "provider": "openai",
+        "model": "gpt-test",
+        "thinking": "medium",
+        "modelProfile": "default",
+    }
 
 
 class ProtocolParsingTests(unittest.TestCase):
@@ -122,7 +178,10 @@ class ProtocolParsingTests(unittest.TestCase):
                 "session_id": "s",
                 "seq": 1,
                 "frame_id": "f",
-                "payload": {"event_type": "agent_start", "event": {"type": "agent_start"}},
+                "payload": {
+                    "event_type": "agent_start",
+                    "event": {"type": "agent_start"},
+                },
             }
         )
 
@@ -158,12 +217,21 @@ class ProtocolParsingTests(unittest.TestCase):
             ("turn_start", {"type": "turn_start"}, TurnStartEvent),
             (
                 "auto_compaction_start",
-                {"type": "auto_compaction_start", "reason": "threshold", "action": "context-full"},
+                {
+                    "type": "auto_compaction_start",
+                    "reason": "threshold",
+                    "action": "context-full",
+                },
                 AutoCompactionStartEvent,
             ),
             (
                 "tool_execution_start",
-                {"type": "tool_execution_start", "toolCallId": "tool-2", "toolName": "bash", "args": {}},
+                {
+                    "type": "tool_execution_start",
+                    "toolCallId": "tool-2",
+                    "toolName": "bash",
+                    "args": {},
+                },
                 ToolExecutionStartEvent,
             ),
         ]
@@ -190,7 +258,10 @@ class ProtocolParsingTests(unittest.TestCase):
             "session_id": "s",
             "seq": 3,
             "frame_id": "f-unknown",
-            "payload": {"event_type": "future_event", "event": {"type": "future_event", "extra": True}},
+            "payload": {
+                "event_type": "future_event",
+                "event": {"type": "future_event", "extra": True},
+            },
         }
         notification = parse_notification(payload)
 
@@ -199,7 +270,13 @@ class ProtocolParsingTests(unittest.TestCase):
 
     def test_parse_wrapped_event_missing_payload_event_as_unknown(self) -> None:
         for payload in (
-            {"type": "event", "protocol_version": 2, "session_id": "s", "seq": 4, "frame_id": "f-missing"},
+            {
+                "type": "event",
+                "protocol_version": 2,
+                "session_id": "s",
+                "seq": 4,
+                "frame_id": "f-missing",
+            },
             {
                 "type": "event",
                 "protocol_version": 2,
@@ -254,6 +331,7 @@ class ProtocolParsingTests(unittest.TestCase):
 
         self.assertIsInstance(notification, UnknownNotification)
         self.assertEqual(notification.payload, payload)
+
     def test_parse_wrapped_agent_end_notification(self) -> None:
         notification = parse_notification(
             {
@@ -317,7 +395,6 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertTrue(notification.is_interactive())
         self.assertTrue(notification.requires_response())
         self.assertFalse(notification.is_passive())
-
 
     def test_parse_workflow_gate_event(self) -> None:
         gate = parse_workflow_gate_event(
@@ -439,7 +516,9 @@ class ProtocolParsingTests(unittest.TestCase):
         )
         self.assertEqual(state.system_prompt, ())
 
-    def test_parse_session_state_rejects_non_string_in_system_prompt_array(self) -> None:
+    def test_parse_session_state_rejects_non_string_in_system_prompt_array(
+        self,
+    ) -> None:
         with self.assertRaises(ValueError):
             parse_session_state(
                 {
@@ -465,7 +544,9 @@ class ProtocolParsingTests(unittest.TestCase):
 
     def test_parse_extension_ui_request_rejects_invalid_method(self) -> None:
         with self.assertRaises(ValueError):
-            parse_notification({"type": "extension_ui_request", "id": "ui-1", "method": "launch"})
+            parse_notification(
+                {"type": "extension_ui_request", "id": "ui-1", "method": "launch"}
+            )
 
     def test_parse_message_update_rejects_invalid_assistant_done_reason(self) -> None:
         with self.assertRaises(ValueError):
@@ -599,7 +680,9 @@ class ServerDriftRegressionTests(unittest.TestCase):
         self.assertIsInstance(notification, ExtensionUiRequest)
         self.assertEqual(notification.method, "open_url")
         self.assertEqual(notification.url, "https://example.com/oauth")
-        self.assertEqual(notification.instructions, "Open this URL in a browser to continue login.")
+        self.assertEqual(
+            notification.instructions, "Open this URL in a browser to continue login."
+        )
         self.assertTrue(notification.is_passive())
         self.assertFalse(notification.requires_response())
 
@@ -614,10 +697,19 @@ class ServerDriftRegressionTests(unittest.TestCase):
                     "baseUrl": "https://api.anthropic.com",
                     "reasoning": True,
                     "input": ["text"],
-                    "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.1, "cacheWrite": 0.2},
+                    "cost": {
+                        "input": 1.0,
+                        "output": 2.0,
+                        "cacheRead": 0.1,
+                        "cacheWrite": 0.2,
+                    },
                     "contextWindow": 200000,
                     "maxTokens": 8192,
-                    "thinking": {"minLevel": "minimal", "maxLevel": "max", "mode": "effort"},
+                    "thinking": {
+                        "minLevel": "minimal",
+                        "maxLevel": "max",
+                        "mode": "effort",
+                    },
                 },
                 "thinkingLevel": "max",
                 "isStreaming": False,
@@ -688,11 +780,21 @@ class ServerDriftRegressionTests(unittest.TestCase):
         )
 
         self.assertIsInstance(notification, AutoCompactionEndEvent)
-        self.assertEqual(notification.continuation_skip_reason, "auto_continue_disabled_non_resumable_tail")
+        self.assertEqual(
+            notification.continuation_skip_reason,
+            "auto_continue_disabled_non_resumable_tail",
+        )
 
     def test_parse_notice_event(self) -> None:
         notification = parse_notification(
-            _wrapped_event({"type": "notice", "level": "error", "message": "provider unavailable", "source": "retry"})
+            _wrapped_event(
+                {
+                    "type": "notice",
+                    "level": "error",
+                    "message": "provider unavailable",
+                    "source": "retry",
+                }
+            )
         )
 
         self.assertIsInstance(notification, NoticeEvent)
@@ -701,7 +803,9 @@ class ServerDriftRegressionTests(unittest.TestCase):
         self.assertEqual(notification.source, "retry")
 
     def test_parse_thinking_level_changed_event(self) -> None:
-        notification = parse_notification(_wrapped_event({"type": "thinking_level_changed", "thinkingLevel": "max"}))
+        notification = parse_notification(
+            _wrapped_event({"type": "thinking_level_changed", "thinkingLevel": "max"})
+        )
 
         self.assertIsInstance(notification, ThinkingLevelChangedEvent)
         self.assertEqual(notification.thinking_level, "max")
@@ -722,7 +826,9 @@ class ServerDriftRegressionTests(unittest.TestCase):
         self.assertEqual(notification.state, {"phase": "executing"})
 
     def test_parse_goal_updated_event_with_cleared_goal(self) -> None:
-        notification = parse_notification(_wrapped_event({"type": "goal_updated", "goal": None}))
+        notification = parse_notification(
+            _wrapped_event({"type": "goal_updated", "goal": None})
+        )
 
         self.assertIsInstance(notification, GoalUpdatedEvent)
         self.assertIsNone(notification.goal)
@@ -737,13 +843,76 @@ class ServerDriftRegressionTests(unittest.TestCase):
             "timestamp": 1,
         }
 
-        irc = parse_notification(_wrapped_event({"type": "irc_message", "message": custom_message}))
-        steer = parse_notification(_wrapped_event({"type": "subagent_steer_message", "message": custom_message}))
+        irc = parse_notification(
+            _wrapped_event({"type": "irc_message", "message": custom_message})
+        )
+        steer = parse_notification(
+            _wrapped_event(
+                {"type": "subagent_steer_message", "message": custom_message}
+            )
+        )
 
         self.assertIsInstance(irc, IrcMessageEvent)
         self.assertEqual(irc.message["content"], "hello from irc")
         self.assertIsInstance(steer, SubagentSteerMessageEvent)
         self.assertEqual(steer.message["customType"], "irc")
+
+
+class CheckpointForHandoffProtocolTests(unittest.TestCase):
+    def test_parses_strict_handoff_receipt_and_final_result(self) -> None:
+        receipt_payload = _handoff_receipt()
+        receipt = parse_handoff_checkpoint_receipt(receipt_payload)
+        self.assertEqual(receipt.authority.epoch_revision, 2)
+        self.assertEqual(receipt.session_file, "/tmp/gjc-session.jsonl")
+
+        child_payload = {
+            "protocolVersion": 1,
+            "authority": _handoff_authority(),
+            "lane": "main",
+            "disposition": "EXITED",
+            "evidenceDigest": "c" * 64,
+        }
+        child = parse_child_disposition_receipt(child_payload)
+        self.assertEqual(child.disposition, "EXITED")
+
+        result_payload = dict(receipt_payload)
+        result_payload["childReceipt"] = child_payload
+        result = parse_checkpoint_for_handoff_result(result_payload)
+        self.assertEqual(result.child_receipt, child)
+        self.assertTrue(result.clean_quiesced)
+        self.assertTrue(result.transcript_fsynced)
+
+    def test_rejects_malformed_handoff_authority_and_receipt(self) -> None:
+        malformed_authority = _handoff_authority()
+        malformed_authority["epochRevision"] = True
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            parse_handoff_authority(malformed_authority)
+
+        receipt_payload = _handoff_receipt()
+        receipt_payload["lane"] = "other"
+        with self.assertRaisesRegex(ValueError, "one of"):
+            parse_handoff_checkpoint_receipt(receipt_payload)
+
+        receipt_payload = _handoff_receipt()
+        receipt_payload["completedMarkerDigest"] = "d" * 64
+        with self.assertRaisesRegex(ValueError, "completed marker"):
+            parse_handoff_checkpoint_receipt(receipt_payload)
+
+    def test_rejects_child_receipt_without_matching_server_authority(self) -> None:
+        receipt_payload = _handoff_receipt()
+        result_payload = dict(receipt_payload)
+        result_payload["childReceipt"] = {
+            "protocolVersion": 1,
+            "authority": {
+                **_handoff_authority(),
+                "leaseId": 99,
+            },
+            "lane": "main",
+            "disposition": "EXITED",
+            "evidenceDigest": "c" * 64,
+        }
+        with self.assertRaisesRegex(ValueError, "authority did not match"):
+            parse_checkpoint_for_handoff_result(result_payload)
 
 
 if __name__ == "__main__":

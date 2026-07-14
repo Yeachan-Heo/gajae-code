@@ -71,6 +71,7 @@ const RPC_COMMAND_SCOPE_REGISTRY: Record<RpcCommandType, BridgeCommandScope> = {
 	get_last_assistant_text: "message:read",
 	set_session_name: "session",
 	handoff: "admin",
+	checkpoint_for_handoff: "admin",
 	get_messages: "message:read",
 	get_login_providers: "admin",
 	login: "admin",

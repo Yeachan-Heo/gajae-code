@@ -6,6 +6,7 @@ export const BRIDGE_CLIENT_COMMAND_TYPES = [
 	"abort_and_prompt",
 	"new_session",
 	"get_state",
+	"checkpoint_for_handoff",
 	"set_todos",
 	"set_host_tools",
 	"set_host_uri_schemes",

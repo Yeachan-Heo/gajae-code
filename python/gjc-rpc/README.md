@@ -13,6 +13,8 @@ provides:
 - typed per-event listeners plus a typed catch-all notification hook
 - helpers for collecting prompt runs and handling extension UI requests in manual or headless mode
 - typed host-tool helpers so Python RPC owners can expose custom tools with JSON Schema metadata
+- authority-scoped checkpoint handoff receipts that prove server fsync before the
+  owning client terminates and observes the RPC child exit
 
 ## Basic Usage
 
@@ -97,6 +99,17 @@ with RpcClient(
 ) as client:
     print(client.get_state().session_id)
 ```
+
+## Exact Checkpoint Handoff
+
+HA orchestration hosts can request a token-free, fail-closed checkpoint boundary
+with `checkpoint_for_handoff(authority=..., lane=...)`. The server accepts the
+request only while the session is fully idle, fsyncs and hashes the exact session
+file, and returns a model/profile-bound receipt without transcript content. The
+Python process owner then terminates and waits for the RPC child before returning
+`CheckpointForHandoffResult`; `resolve_orphaned_child()` likewise returns evidence
+only after observed process exit. Invalid authority fields, a busy session,
+persistence failure, malformed receipt, or unverified exit raises an RPC error.
 
 ## Host-Owned Custom Tools
 

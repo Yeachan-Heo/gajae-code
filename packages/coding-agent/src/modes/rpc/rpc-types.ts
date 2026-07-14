@@ -18,7 +18,30 @@ export type RpcCapability = "compact_message_update";
 // ============================================================================
 // RPC Commands (stdin)
 // ============================================================================
+export type RpcHandoffLane = "main" | "self";
 
+export interface RpcCheckpointForHandoffAuthority {
+	incarnationDigest: string;
+	epochRevision: number;
+	leaseId: number;
+	deploymentGeneration: number;
+}
+
+export interface RpcCheckpointForHandoffData {
+	protocolVersion: 1;
+	authority: RpcCheckpointForHandoffAuthority;
+	lane: RpcHandoffLane;
+	cleanQuiesced: true;
+	transcriptFsynced: true;
+	completedMarkerDigest: string;
+	transcriptDigest: string;
+	sessionId: string;
+	sessionFile: string;
+	provider: string;
+	model: string;
+	thinking: string;
+	modelProfile: string;
+}
 export type RpcCommand =
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -78,6 +101,12 @@ export type RpcCommand =
 	| { id?: string; type: "get_last_assistant_text" }
 	| { id?: string; type: "set_session_name"; name: string }
 	| { id?: string; type: "handoff"; customInstructions?: string }
+	| {
+			id?: string;
+			type: "checkpoint_for_handoff";
+			authority: RpcCheckpointForHandoffAuthority;
+			lane: RpcHandoffLane;
+	  }
 
 	// Messages
 	| { id?: string; type: "get_messages" }
@@ -235,6 +264,13 @@ export type RpcResponse =
 	  }
 	| { id?: string; type: "response"; command: "set_session_name"; success: true }
 	| { id?: string; type: "response"; command: "handoff"; success: true; data: RpcHandoffResult | null }
+	| {
+			id?: string;
+			type: "response";
+			command: "checkpoint_for_handoff";
+			success: true;
+			data: RpcCheckpointForHandoffData;
+	  }
 
 	// Messages
 	| { id?: string; type: "response"; command: "get_messages"; success: true; data: { messages: AgentMessage[] } }

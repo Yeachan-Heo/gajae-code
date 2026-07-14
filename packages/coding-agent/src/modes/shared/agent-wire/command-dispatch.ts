@@ -1,3 +1,5 @@
+import * as crypto from "node:crypto";
+import * as path from "node:path";
 import type { AgentTool, ResolvedThinkingLevel } from "@gajae-code/agent-core";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
@@ -16,6 +18,7 @@ import type {
 	RpcWorkflowGateResolution,
 	RpcWorkflowGateResponse,
 } from "../../rpc/rpc-types";
+import { isRpcCommand } from "./command-validation";
 import { rpcError, rpcSuccess } from "./responses";
 import {
 	ActionDeniedError,
@@ -107,6 +110,114 @@ function isConcreteThinkingLevel(value: unknown): value is ResolvedThinkingLevel
 		typeof value === "string" &&
 		value !== ThinkingLevel.Inherit &&
 		(Object.values(ThinkingLevel) as string[]).includes(value)
+	);
+}
+const HANDOFF_COMPLETED_MARKER_DIGEST_DOMAIN = "gjc.checkpoint-for-handoff.completed-marker.v1";
+
+interface HandoffCheckpointState {
+	sessionId: string;
+	sessionFile: string;
+	provider: string;
+	model: string;
+	thinking: string;
+	modelProfile: string;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+function canonicalJsonPrimitive(value: string | number | boolean | null): string {
+	const encoded = JSON.stringify(value);
+	if (encoded === undefined) throw new Error("Checkpoint digest value is not JSON-serializable");
+	return encoded;
+}
+
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value === "boolean" || typeof value === "string") {
+		return canonicalJsonPrimitive(value);
+	}
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new Error("Checkpoint digest value must be finite");
+		return canonicalJsonPrimitive(value);
+	}
+	if (Array.isArray(value)) {
+		return `[${value.map(canonicalJson).join(",")}]`;
+	}
+	if (typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		return `{${Object.keys(record)
+			.sort()
+			.map(key => `${canonicalJsonPrimitive(key)}:${canonicalJson(record[key])}`)
+			.join(",")}}`;
+	}
+	throw new Error("Checkpoint digest value is not JSON-serializable");
+}
+
+function sha256(value: string | Uint8Array): string {
+	return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalCheckpointDigest(value: Record<string, unknown>): string {
+	return sha256(canonicalJson(value));
+}
+
+function handoffQuiesceFailure(session: AgentSession): string | undefined {
+	if (
+		session.isStreaming ||
+		session.isCompacting ||
+		session.queuedMessageCount > 0 ||
+		session.hasPostPromptWork ||
+		session.isTtsrAbortPending ||
+		session.isPlanCompactAbortPending ||
+		session.isGeneratingHandoff ||
+		session.isRetrying ||
+		session.isBashRunning ||
+		session.isEvalRunning ||
+		session.hasPendingBashMessages ||
+		session.hasPendingPythonMessages
+	) {
+		return "Session is not quiescent for handoff checkpoint";
+	}
+	return undefined;
+}
+
+function handoffCheckpointState(session: AgentSession): HandoffCheckpointState | undefined {
+	const sessionFile = session.sessionFile;
+	const sessionId = session.sessionId;
+	const model = session.model;
+	const thinking = session.thinkingLevel;
+	const profile = session.getActiveModelProfile() ?? session.settings.get("modelProfile.default");
+	if (
+		!isNonEmptyString(sessionFile) ||
+		!path.isAbsolute(sessionFile) ||
+		!isNonEmptyString(sessionId) ||
+		!model ||
+		!isNonEmptyString(model.provider) ||
+		!isNonEmptyString(model.id) ||
+		!isConcreteThinkingLevel(thinking) ||
+		!isNonEmptyString(profile)
+	) {
+		return undefined;
+	}
+	return {
+		sessionId,
+		sessionFile,
+		provider: model.provider,
+		model: model.id,
+		thinking,
+		modelProfile: profile,
+	};
+}
+
+function sameHandoffCheckpointState(left: HandoffCheckpointState, right: HandoffCheckpointState): boolean {
+	return (
+		left.sessionId === right.sessionId &&
+		left.sessionFile === right.sessionFile &&
+		left.provider === right.provider &&
+		left.model === right.model &&
+		left.thinking === right.thinking &&
+		left.modelProfile === right.modelProfile
 	);
 }
 
@@ -399,6 +510,67 @@ export async function dispatchRpcCommand(
 			case "handoff": {
 				const result = await session.handoff(command.customInstructions);
 				return rpcSuccess(id, "handoff", result ? { savedPath: result.savedPath } : null);
+			}
+			case "checkpoint_for_handoff": {
+				if (!isRpcCommand(command)) {
+					return rpcError(id, "checkpoint_for_handoff", "Invalid checkpoint_for_handoff command");
+				}
+				const authority = { ...command.authority };
+				const lane = command.lane;
+				const initialQuiesceFailure = handoffQuiesceFailure(session);
+				if (initialQuiesceFailure) {
+					return rpcError(id, "checkpoint_for_handoff", initialQuiesceFailure);
+				}
+				const initialState = handoffCheckpointState(session);
+				if (!initialState) {
+					return rpcError(
+						id,
+						"checkpoint_for_handoff",
+						"A persistent session and concrete model profile are required for handoff checkpoint",
+					);
+				}
+
+				await session.sessionManager.ensureOnDisk();
+				await session.sessionManager.flush();
+				const transcriptBytes = new Uint8Array(await Bun.file(initialState.sessionFile).arrayBuffer());
+
+				const finalQuiesceFailure = handoffQuiesceFailure(session);
+				if (finalQuiesceFailure) {
+					return rpcError(id, "checkpoint_for_handoff", finalQuiesceFailure);
+				}
+				const finalState = handoffCheckpointState(session);
+				if (!finalState || !sameHandoffCheckpointState(initialState, finalState)) {
+					return rpcError(id, "checkpoint_for_handoff", "Session state changed during handoff checkpoint");
+				}
+
+				const transcriptDigest = sha256(transcriptBytes);
+				const completedMarkerDigest = canonicalCheckpointDigest({
+					authority,
+					domain: HANDOFF_COMPLETED_MARKER_DIGEST_DOMAIN,
+					lane,
+					model: finalState.model,
+					modelProfile: finalState.modelProfile,
+					provider: finalState.provider,
+					sessionFileDigest: sha256(finalState.sessionFile),
+					sessionId: finalState.sessionId,
+					thinking: finalState.thinking,
+					transcriptDigest,
+				});
+				return rpcSuccess(id, "checkpoint_for_handoff", {
+					protocolVersion: 1,
+					authority,
+					lane,
+					cleanQuiesced: true,
+					transcriptFsynced: true,
+					completedMarkerDigest,
+					transcriptDigest,
+					sessionId: finalState.sessionId,
+					sessionFile: finalState.sessionFile,
+					provider: finalState.provider,
+					model: finalState.model,
+					thinking: finalState.thinking,
+					modelProfile: finalState.modelProfile,
+				});
 			}
 
 			case "get_messages": {

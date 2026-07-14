@@ -3,6 +3,8 @@
  *
  * Spawns the agent in RPC mode and provides a typed API for all operations.
  */
+
+import * as path from "node:path";
 import {
 	type AgentEvent,
 	type AgentMessage,
@@ -17,9 +19,12 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import { AGENT_WIRE_EVENT_TYPES, type AgentWireEventType } from "../shared/agent-wire/event-contract";
 import type {
+	RpcCheckpointForHandoffAuthority,
+	RpcCheckpointForHandoffData,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcGetStateInclude,
+	RpcHandoffLane,
 	RpcHandoffResult,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
@@ -140,6 +145,90 @@ function isDefaultModelSelection(value: unknown): value is RpcDefaultModelSelect
 		typeof value.modelId === "string" &&
 		value.modelId.trim().length > 0 &&
 		isResolvedThinkingLevel(value.thinkingLevel)
+	);
+}
+
+const LOWERCASE_HEX_DIGEST = /^[0-9a-f]{64}$/;
+const HANDOFF_AUTHORITY_KEYS = new Set(["incarnationDigest", "epochRevision", "leaseId", "deploymentGeneration"]);
+const CHECKPOINT_FOR_HANDOFF_RECEIPT_KEYS = new Set([
+	"protocolVersion",
+	"authority",
+	"lane",
+	"cleanQuiesced",
+	"transcriptFsynced",
+	"completedMarkerDigest",
+	"transcriptDigest",
+	"sessionId",
+	"sessionFile",
+	"provider",
+	"model",
+	"thinking",
+	"modelProfile",
+]);
+
+function hasExactKeys(value: Record<string, unknown>, keys: Set<string>): boolean {
+	const valueKeys = Object.keys(value);
+	return valueKeys.length === keys.size && valueKeys.every(key => keys.has(key));
+}
+
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isHandoffAuthority(value: unknown): value is RpcCheckpointForHandoffAuthority {
+	return (
+		isRecord(value) &&
+		hasExactKeys(value, HANDOFF_AUTHORITY_KEYS) &&
+		typeof value.incarnationDigest === "string" &&
+		LOWERCASE_HEX_DIGEST.test(value.incarnationDigest) &&
+		isPositiveInteger(value.epochRevision) &&
+		isPositiveInteger(value.leaseId) &&
+		isPositiveInteger(value.deploymentGeneration)
+	);
+}
+
+function hasMatchingHandoffAuthority(
+	receipt: RpcCheckpointForHandoffAuthority,
+	authority: RpcCheckpointForHandoffAuthority,
+): boolean {
+	return (
+		receipt.incarnationDigest === authority.incarnationDigest &&
+		receipt.epochRevision === authority.epochRevision &&
+		receipt.leaseId === authority.leaseId &&
+		receipt.deploymentGeneration === authority.deploymentGeneration
+	);
+}
+
+function isCheckpointForHandoffReceipt(
+	value: unknown,
+	authority: RpcCheckpointForHandoffAuthority,
+	lane: RpcHandoffLane,
+): value is RpcCheckpointForHandoffData {
+	return (
+		isRecord(value) &&
+		hasExactKeys(value, CHECKPOINT_FOR_HANDOFF_RECEIPT_KEYS) &&
+		value.protocolVersion === 1 &&
+		isHandoffAuthority(value.authority) &&
+		hasMatchingHandoffAuthority(value.authority, authority) &&
+		(value.lane === "main" || value.lane === "self") &&
+		value.lane === lane &&
+		value.cleanQuiesced === true &&
+		value.transcriptFsynced === true &&
+		typeof value.completedMarkerDigest === "string" &&
+		LOWERCASE_HEX_DIGEST.test(value.completedMarkerDigest) &&
+		typeof value.transcriptDigest === "string" &&
+		LOWERCASE_HEX_DIGEST.test(value.transcriptDigest) &&
+		isNonEmptyString(value.sessionId) &&
+		isNonEmptyString(value.sessionFile) &&
+		path.isAbsolute(value.sessionFile) &&
+		isNonEmptyString(value.provider) &&
+		isNonEmptyString(value.model) &&
+		isNonEmptyString(value.thinking) &&
+		isNonEmptyString(value.modelProfile)
 	);
 }
 
@@ -790,6 +879,31 @@ export class RpcClient {
 	async handoff(customInstructions?: string): Promise<RpcHandoffResult | null> {
 		const response = await this.#send({ type: "handoff", customInstructions });
 		return this.#getData(response);
+	}
+
+	/**
+	 * Quiesce and fsync this session before an external owner hands it off.
+	 * The receipt proves only the RPC server boundary; process termination remains external.
+	 */
+	async checkpointForHandoff(
+		authority: RpcCheckpointForHandoffAuthority,
+		lane: RpcHandoffLane,
+	): Promise<RpcCheckpointForHandoffData> {
+		if (!isHandoffAuthority(authority)) {
+			throw new Error("Invalid checkpoint_for_handoff authority");
+		}
+		if (lane !== "main" && lane !== "self") {
+			throw new Error("Invalid checkpoint_for_handoff lane");
+		}
+		const response = await this.#send({ type: "checkpoint_for_handoff", authority, lane });
+		if (!response.success) return this.#getData<RpcCheckpointForHandoffData>(response);
+		if (
+			response.command !== "checkpoint_for_handoff" ||
+			!isCheckpointForHandoffReceipt(response.data, authority, lane)
+		) {
+			throw new Error("Invalid checkpoint_for_handoff response");
+		}
+		return this.#getData<RpcCheckpointForHandoffData>(response);
 	}
 
 	/**

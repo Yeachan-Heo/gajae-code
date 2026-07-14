@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import textwrap
 import threading
 import time
 import unittest
+from unittest import mock
 
-from gjc_rpc import RpcClient, RpcCommandError, RpcConcurrencyError, RpcError, host_tool, host_uri
+from gjc_rpc import (
+    RpcClient,
+    RpcCommandError,
+    RpcConcurrencyError,
+    RpcError,
+    RpcProcessExitError,
+    host_tool,
+    host_uri,
+)
 
 
 FAKE_SERVER = textwrap.dedent(
@@ -447,6 +457,73 @@ FAKE_SERVER = textwrap.dedent(
             respond(request_id, command_type, success=False, error=f"unsupported: {command_type}")
     """
 )
+HANDOFF_SERVER = textwrap.dedent(
+    """
+    import hashlib
+    import json
+    import os
+    import sys
+    import time
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    def completed_marker(receipt):
+        preimage = {
+            "domain": "gjc.checkpoint-for-handoff.completed-marker.v1",
+            "authority": receipt["authority"],
+            "lane": receipt["lane"],
+            "sessionId": receipt["sessionId"],
+            "sessionFileDigest": hashlib.sha256(receipt["sessionFile"].encode("utf-8")).hexdigest(),
+            "provider": receipt["provider"],
+            "model": receipt["model"],
+            "thinking": receipt["thinking"],
+            "modelProfile": receipt["modelProfile"],
+            "transcriptDigest": receipt["transcriptDigest"],
+        }
+        return hashlib.sha256(
+            json.dumps(preimage, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    emit({"type": "ready"})
+    mode = os.environ.get("HANDOFF_MODE", "success")
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        if command.get("type") != "checkpoint_for_handoff":
+            continue
+        authority = dict(command["authority"])
+        if mode == "mismatched":
+            authority["leaseId"] += 1
+        receipt = {
+            "protocolVersion": 1,
+            "authority": authority,
+            "lane": command["lane"],
+            "cleanQuiesced": True,
+            "transcriptFsynced": True,
+            "transcriptDigest": "b" * 64,
+            "sessionId": "session-1",
+            "sessionFile": "/tmp/gjc-session.jsonl",
+            "provider": "openai",
+            "model": "gpt-test",
+            "thinking": "medium",
+            "modelProfile": "default",
+        }
+        receipt["completedMarkerDigest"] = completed_marker(receipt)
+        if mode == "malformed":
+            receipt["transcriptFsynced"] = False
+        emit(
+            {
+                "id": command["id"],
+                "type": "response",
+                "command": "checkpoint_for_handoff",
+                "success": True,
+                "data": receipt,
+            }
+        )
+    while True:
+        time.sleep(1)
+    """
+)
 
 # Echoes every extension_ui_response back as an extension_error frame so tests
 # can assert the exact wire command the headless UI handler sends (regression:
@@ -688,7 +765,12 @@ BROKEN_STARTUP_SERVER = textwrap.dedent(
 
 class RpcClientTests(unittest.TestCase):
     def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
-        return RpcClient(command=[sys.executable, "-u", "-c", server], startup_timeout=2.0, request_timeout=2.0, **kwargs)
+        return RpcClient(
+            command=[sys.executable, "-u", "-c", server],
+            startup_timeout=2.0,
+            request_timeout=2.0,
+            **kwargs,
+        )
 
     def test_command_builder_supports_common_rpc_options(self) -> None:
         client = RpcClient(
@@ -734,7 +816,9 @@ class RpcClientTests(unittest.TestCase):
         with self.make_client() as client:
             state = client.get_state()
             self.assertEqual(state.session_id, "fake-session")
-            self.assertEqual(state.model.id if state.model else None, "claude-sonnet-4-5")
+            self.assertEqual(
+                state.model.id if state.model else None, "claude-sonnet-4-5"
+            )
 
             result = client.bash("echo hello")
             self.assertEqual(result.output, "hello\n")
@@ -770,15 +854,27 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(state.dump_tools[-1].name, "echo_host")
 
             turn = client.prompt_and_wait("needs host tool", timeout=2.0)
-            update_events = [event for event in turn.events if getattr(event, "type", None) == "tool_execution_update"]
-            end_events = [event for event in turn.events if getattr(event, "type", None) == "tool_execution_end"]
+            update_events = [
+                event
+                for event in turn.events
+                if getattr(event, "type", None) == "tool_execution_update"
+            ]
+            end_events = [
+                event
+                for event in turn.events
+                if getattr(event, "type", None) == "tool_execution_end"
+            ]
 
             self.assertEqual(len(update_events), 1)
-            self.assertEqual(update_events[0].partial_result["content"][0]["text"], "working:hello")
+            self.assertEqual(
+                update_events[0].partial_result["content"][0]["text"], "working:hello"
+            )
             self.assertEqual(len(end_events), 1)
             self.assertEqual(end_events[0].result["content"][0]["text"], "host:hello")
 
-    def test_post_ready_setup_failure_stops_process_and_clears_client_state(self) -> None:
+    def test_post_ready_setup_failure_stops_process_and_clears_client_state(
+        self,
+    ) -> None:
         setups = (
             (
                 "custom_tools",
@@ -810,7 +906,9 @@ class RpcClientTests(unittest.TestCase):
 
         for setup, command, kwargs in setups:
             with self.subTest(setup=setup):
-                client = self.make_client(server=POST_READY_SETUP_FAILURE_SERVER, **kwargs)
+                client = self.make_client(
+                    server=POST_READY_SETUP_FAILURE_SERVER, **kwargs
+                )
                 stopped_processes = []
                 stop = client.stop
 
@@ -832,6 +930,7 @@ class RpcClientTests(unittest.TestCase):
                 self.assertIsNone(client._stdout_thread)
                 self.assertIsNone(client._stderr_thread)
                 self.assertEqual(client._pending, {})
+
     def test_extension_ui_round_trip(self) -> None:
         with self.make_client() as client:
             client.prompt("needs ui")
@@ -845,7 +944,9 @@ class RpcClientTests(unittest.TestCase):
         seen_methods: list[str] = []
 
         with self.make_client() as client:
-            client.install_headless_ui(on_request=lambda request: seen_methods.append(request.method))
+            client.install_headless_ui(
+                on_request=lambda request: seen_methods.append(request.method)
+            )
             client.prompt_and_wait("needs ui", timeout=2.0)
 
         self.assertEqual(seen_methods, ["input"])
@@ -855,7 +956,9 @@ class RpcClientTests(unittest.TestCase):
         done = threading.Event()
 
         with self.make_client(server=HEADLESS_UI_ECHO_SERVER) as client:
-            client.on_extension_error(lambda event: (echoes.append(json.loads(event.error)), done.set()))
+            client.on_extension_error(
+                lambda event: (echoes.append(json.loads(event.error)), done.set())
+            )
             client.install_headless_ui(input_value="approved")
             client.prompt_and_wait("needs ui", timeout=2.0)
             self.assertTrue(done.wait(timeout=2.0))
@@ -865,12 +968,16 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(frame["id"], "ui-input-1")
         self.assertEqual(frame["value"], "approved")
 
-    def test_install_headless_ui_answers_confirm_via_extension_ui_response(self) -> None:
+    def test_install_headless_ui_answers_confirm_via_extension_ui_response(
+        self,
+    ) -> None:
         echoes: list[dict] = []
         done = threading.Event()
 
         with self.make_client(server=HEADLESS_UI_ECHO_SERVER) as client:
-            client.on_extension_error(lambda event: (echoes.append(json.loads(event.error)), done.set()))
+            client.on_extension_error(
+                lambda event: (echoes.append(json.loads(event.error)), done.set())
+            )
             client.install_headless_ui(confirm=True)
             client.prompt_and_wait("needs confirm", timeout=2.0)
             self.assertTrue(done.wait(timeout=2.0))
@@ -884,7 +991,9 @@ class RpcClientTests(unittest.TestCase):
         seen_methods: list[str] = []
 
         with self.make_client() as client:
-            client.install_headless_ui(on_request=lambda request: seen_methods.append(request.method))
+            client.install_headless_ui(
+                on_request=lambda request: seen_methods.append(request.method)
+            )
             client.prompt_and_wait("needs open url", timeout=2.0)
             request = client.next_ui_request(timeout=2.0)
             self.assertEqual(request.method, "open_url")
@@ -915,7 +1024,9 @@ class RpcClientTests(unittest.TestCase):
         notification_types: list[str] = []
         client = self.make_client()
         client.on_ready(lambda event: ready_types.append(event.type))
-        client.on_notification(lambda notification: notification_types.append(notification.type))
+        client.on_notification(
+            lambda notification: notification_types.append(notification.type)
+        )
         client.on_turn_start(lambda event: event_types.append(event.type))
         client.on_message_update(lambda event: event_types.append(event.type))
         client.on_agent_end(lambda event: event_types.append(event.type))
@@ -954,7 +1065,10 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(cycled.model.id, "claude-sonnet-4-5")
 
             available = client.get_available_models()
-            self.assertEqual([item.id for item in available], ["claude-sonnet-4-5", "claude-sonnet-4-6"])
+            self.assertEqual(
+                [item.id for item in available],
+                ["claude-sonnet-4-5", "claude-sonnet-4-6"],
+            )
 
             client.set_thinking_level("high")
             self.assertEqual(client.get_state().thinking_level, "high")
@@ -1078,8 +1192,12 @@ class RpcClientTests(unittest.TestCase):
         seen_unknown: list[str] = []
 
         with self.make_client() as client:
-            client.on_extension_error(lambda event: seen_extension_errors.append(event.error))
-            client.on_unknown_notification(lambda event: seen_unknown.append(str(event.payload.get("type"))))
+            client.on_extension_error(
+                lambda event: seen_extension_errors.append(event.error)
+            )
+            client.on_unknown_notification(
+                lambda event: seen_unknown.append(str(event.payload.get("type")))
+            )
             client.prompt_and_wait("notifications", timeout=2.0)
 
         self.assertEqual(seen_extension_errors, ["boom"])
@@ -1088,7 +1206,9 @@ class RpcClientTests(unittest.TestCase):
     def test_workflow_gate_round_trip_and_validation(self) -> None:
         seen_gates: list[str] = []
         with self.make_client() as client:
-            client.on_workflow_gate(lambda gate: seen_gates.append(f"{gate.gate_id}:{gate.kind}"))
+            client.on_workflow_gate(
+                lambda gate: seen_gates.append(f"{gate.gate_id}:{gate.kind}")
+            )
             client.prompt("needs select")
             gate = client.next_workflow_gate(timeout=2.0)
             request = client.next_ui_request(timeout=2.0)
@@ -1097,8 +1217,12 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(gate.kind, "question")
             self.assertEqual(gate.schema, {"type": "string", "enum": ["alpha", "beta"]})
             assert gate.options is not None
-            self.assertEqual([option.value for option in gate.options], ["alpha", "beta"])
-            self.assertEqual([option.label for option in gate.options], ["Alpha", "Beta"])
+            self.assertEqual(
+                [option.value for option in gate.options], ["alpha", "beta"]
+            )
+            self.assertEqual(
+                [option.label for option in gate.options], ["Alpha", "Beta"]
+            )
             self.assertTrue(gate.required)
             with self.assertRaises(RpcCommandError) as invalid:
                 client.send_workflow_gate_response(gate.gate_id, "gamma")
@@ -1128,20 +1252,32 @@ class RpcClientTests(unittest.TestCase):
         errors: list[BaseException] = []
 
         with self.make_client() as client:
+
             def run_prompt() -> None:
                 try:
-                    results.append(client.prompt_and_wait("slow", timeout=2.0).require_assistant_text())
-                except BaseException as exc:  # pragma: no cover - defensive thread capture
+                    results.append(
+                        client.prompt_and_wait(
+                            "slow", timeout=2.0
+                        ).require_assistant_text()
+                    )
+                except (
+                    BaseException
+                ) as exc:  # pragma: no cover - defensive thread capture
                     errors.append(exc)
 
             thread = threading.Thread(target=run_prompt)
             thread.start()
 
             deadline = time.time() + 1.0
-            while client._prompt_lifecycle.active_operation != "prompt_and_wait" and time.time() < deadline:
+            while (
+                client._prompt_lifecycle.active_operation != "prompt_and_wait"
+                and time.time() < deadline
+            ):
                 time.sleep(0.01)
 
-            self.assertEqual(client._prompt_lifecycle.active_operation, "prompt_and_wait")
+            self.assertEqual(
+                client._prompt_lifecycle.active_operation, "prompt_and_wait"
+            )
             with self.assertRaises(RpcConcurrencyError):
                 client.collect_events(timeout=1.0)
 
@@ -1153,7 +1289,11 @@ class RpcClientTests(unittest.TestCase):
 
     def test_listener_mutation_does_not_change_retained_turn(self) -> None:
         with self.make_client() as client:
-            client.on_message_end(lambda event: event.message["content"].__setitem__(0, {"type": "text", "text": "mutated"}))
+            client.on_message_end(
+                lambda event: event.message["content"].__setitem__(
+                    0, {"type": "text", "text": "mutated"}
+                )
+            )
             turn = client.prompt_and_wait("say hello", timeout=2.0)
             messages = client.get_messages()
 
@@ -1190,12 +1330,16 @@ class RpcClientTests(unittest.TestCase):
         listener_errors: list[tuple[str, str | None, str]] = []
         client = self.make_client()
         client.on_notification(
-            lambda notification: (_ for _ in ()).throw(RuntimeError("boom"))
-            if notification.type == "turn_start"
-            else None
+            lambda notification: (
+                (_ for _ in ()).throw(RuntimeError("boom"))
+                if notification.type == "turn_start"
+                else None
+            )
         )
         client.on_listener_error(
-            lambda event: listener_errors.append((event.listener_kind, event.source_type, str(event.error)))
+            lambda event: listener_errors.append(
+                (event.listener_kind, event.source_type, str(event.error))
+            )
         )
 
         try:
@@ -1234,6 +1378,169 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertIn("max_event_history", str(ctx.exception))
 
+
+class CheckpointForHandoffClientTests(unittest.TestCase):
+    authority = {
+        "incarnation_digest": "a" * 64,
+        "epoch_revision": 2,
+        "lease_id": 3,
+        "deployment_generation": 4,
+    }
+
+    def make_client(self, **kwargs: object) -> RpcClient:
+        return RpcClient(
+            command=[sys.executable, "-u", "-c", HANDOFF_SERVER],
+            startup_timeout=2.0,
+            request_timeout=2.0,
+            **kwargs,
+        )
+
+    def test_checkpoint_for_handoff_returns_server_and_child_exit_evidence(
+        self,
+    ) -> None:
+        with self.make_client() as client:
+            result = client.checkpoint_for_handoff(
+                authority=self.authority, lane="main"
+            )
+
+        server_receipt = {
+            "protocolVersion": result.protocol_version,
+            "authority": {
+                "incarnationDigest": result.authority.incarnation_digest,
+                "epochRevision": result.authority.epoch_revision,
+                "leaseId": result.authority.lease_id,
+                "deploymentGeneration": result.authority.deployment_generation,
+            },
+            "lane": result.lane,
+            "cleanQuiesced": result.clean_quiesced,
+            "transcriptFsynced": result.transcript_fsynced,
+            "completedMarkerDigest": result.completed_marker_digest,
+            "transcriptDigest": result.transcript_digest,
+            "sessionId": result.session_id,
+            "sessionFile": result.session_file,
+            "provider": result.provider,
+            "model": result.model,
+            "thinking": result.thinking,
+            "modelProfile": result.model_profile,
+        }
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "domain": "gjc.checkpoint-for-handoff.child-exit.v1",
+                    "serverReceipt": server_receipt,
+                    "returnCode": -15,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(result.child_receipt.disposition, "EXITED")
+        self.assertEqual(result.child_receipt.evidence_digest, expected_digest)
+
+    def test_checkpoint_for_handoff_rejects_malformed_or_mismatched_receipts(
+        self,
+    ) -> None:
+        for mode in ("malformed", "mismatched"):
+            client = self.make_client(env={"HANDOFF_MODE": mode})
+            try:
+                client.start()
+                with self.assertRaises(RpcError):
+                    client.checkpoint_for_handoff(authority=self.authority, lane="main")
+                self.assertIsNotNone(client._process)
+            finally:
+                client.stop()
+
+    def test_checkpoint_for_handoff_does_not_return_receipt_when_stop_fails(
+        self,
+    ) -> None:
+        client = self.make_client()
+        process = None
+        try:
+            client.start()
+            process = client._process
+            self.assertIsNotNone(process)
+            with mock.patch.object(
+                process, "terminate", side_effect=OSError("blocked")
+            ):
+                with self.assertRaises(RpcProcessExitError):
+                    client.checkpoint_for_handoff(authority=self.authority, lane="main")
+                self.assertIs(client._process, process)
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=2.0)
+            client.stop()
+
+    def test_resolve_orphaned_child_rejects_missing_ownership(self) -> None:
+        client = self.make_client()
+        with self.assertRaisesRegex(RpcError, "not started"):
+            client.resolve_orphaned_child(authority=self.authority, lane="self")
+
+    def test_handoff_inputs_require_snake_case_authority_and_valid_lane(self) -> None:
+        client = self.make_client()
+        with self.assertRaises(RpcError):
+            client.checkpoint_for_handoff(
+                authority={
+                    "incarnationDigest": "a" * 64,
+                    "epochRevision": 2,
+                    "leaseId": 3,
+                    "deploymentGeneration": 4,
+                },
+                lane="main",
+            )
+        with self.assertRaises(RpcError):
+            client.resolve_orphaned_child(
+                authority={
+                    **self.authority,
+                    "incarnation_digest": "A" * 64,
+                },
+                lane="other",
+            )
+
+    def test_resolve_orphaned_child_returns_only_child_exit_evidence(self) -> None:
+        with self.make_client() as client:
+            receipt = client.resolve_orphaned_child(
+                authority=self.authority, lane="self"
+            )
+
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "domain": "gjc.checkpoint-for-handoff.child-exit.v1",
+                    "serverReceipt": None,
+                    "returnCode": -15,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(receipt.authority.lease_id, 3)
+        self.assertEqual(receipt.lane, "self")
+        self.assertEqual(receipt.evidence_digest, expected_digest)
+
+    def test_checkpoint_for_handoff_never_creates_child_receipt_before_exit(
+        self,
+    ) -> None:
+        client = self.make_client()
+        try:
+            client.start()
+            with mock.patch.object(
+                client,
+                "_terminate_and_wait_for_owned_process",
+                side_effect=RpcProcessExitError("exit was not verified"),
+            ):
+                with mock.patch(
+                    "gjc_rpc.client.create_child_disposition_receipt"
+                ) as create_child_receipt:
+                    with self.assertRaises(RpcProcessExitError):
+                        client.checkpoint_for_handoff(
+                            authority=self.authority, lane="main"
+                        )
+                create_child_receipt.assert_not_called()
+        finally:
+            client.stop()
 
 
 HANGING_SERVER = textwrap.dedent(
@@ -1300,22 +1607,32 @@ class StopUnblocksPromptAndWaitTests(unittest.TestCase):
 
             # Wait until the prompt is in flight.
             deadline = time.time() + 2.0
-            while client._prompt_lifecycle.active_operation != "prompt_and_wait" and time.time() < deadline:
+            while (
+                client._prompt_lifecycle.active_operation != "prompt_and_wait"
+                and time.time() < deadline
+            ):
                 time.sleep(0.01)
-            self.assertEqual(client._prompt_lifecycle.active_operation, "prompt_and_wait")
+            self.assertEqual(
+                client._prompt_lifecycle.active_operation, "prompt_and_wait"
+            )
 
             t0 = time.time()
             client.stop()
             thread.join(timeout=2.0)
             elapsed = time.time() - t0
 
-            self.assertFalse(thread.is_alive(), "prompt_and_wait did not return after stop()")
-            self.assertLess(elapsed, 2.0, f"stop() took {elapsed:.2f}s to unblock prompt_and_wait")
+            self.assertFalse(
+                thread.is_alive(), "prompt_and_wait did not return after stop()"
+            )
+            self.assertLess(
+                elapsed, 2.0, f"stop() took {elapsed:.2f}s to unblock prompt_and_wait"
+            )
             self.assertEqual(len(errors), 1)
             self.assertIsInstance(errors[0], RpcProcessExitError)
         finally:
             # stop() is idempotent; safe to call again on cleanup paths.
             client.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
