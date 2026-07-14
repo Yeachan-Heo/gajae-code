@@ -163,6 +163,13 @@ export class GajaePetWidget {
 	#lastSixelFootprint: SixelFootprint | undefined;
 	/** Terminal state: a disposed widget never touches the TUI or shared slots again. */
 	#disposed = false;
+	/**
+	 * True while the previous overlay frame carried the cleanup payload. The
+	 * TUI writes the frame after the emitter returns, so delivery is
+	 * acknowledged only on the next emitter pass — and only while the terminal
+	 * stayed available, since a failed render write drops availability.
+	 */
+	#frameCleanupAwaitingAck = false;
 
 	constructor(options: {
 		ui: TUI;
@@ -460,13 +467,23 @@ export class GajaePetWidget {
 		if (!pixel) return null;
 		const pos = this.#petPosition();
 		if (!pos) {
+			// Deferred delivery acknowledgement: the TUI writes the frame after
+			// this emitter returns, and that write can fail. Consume the cleanup
+			// authority only once a later pass observes the terminal survived
+			// the frame that carried the payload; otherwise retain it so a later
+			// lifecycle cleanup retries the erase/delete.
+			if (this.#frameCleanupAwaitingAck && this.#ui.terminalAvailable) {
+				this.#consumeCleanupAuthority();
+			}
+			this.#frameCleanupAwaitingAck = false;
+			if (!this.#ui.terminalAvailable) return null;
 			const cleanup = this.#imageCleanupPayload();
 			if (!cleanup) return null;
-			// The returned payload is written by the TUI as part of this frame;
-			// treat that delivery like our own successful write.
-			this.#consumeCleanupAuthority();
+			this.#frameCleanupAwaitingAck = true;
 			return cleanup;
 		}
+		// A full frame supersedes any cleanup-only frame still awaiting ack.
+		this.#frameCleanupAwaitingAck = false;
 		const { x, y } = pos;
 		let out = "";
 

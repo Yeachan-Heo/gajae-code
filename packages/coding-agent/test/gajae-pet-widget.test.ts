@@ -176,6 +176,48 @@ describe("GajaePetWidget", () => {
 		}
 	});
 
+	it("retains cleanup authority when the render write that carried it fails, and dispose retries", () => {
+		const { widget, written, getEmitter, setTerminalSize, setTerminalAvailable } = makeWidget();
+		widget.setMode("red");
+		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+		setTerminalSize(12, 30);
+
+		// The emitter hands the cleanup payload to the TUI, but the enclosing
+		// render write fails (availability drops), so delivery is never
+		// acknowledged and the authority must survive.
+		expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
+		setTerminalAvailable(false);
+		expect(getEmitter()?.()).toBeNull();
+
+		written.length = 0;
+		setTerminalAvailable(true);
+		widget.dispose();
+
+		expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+	});
+
+	it("re-emits the retained cleanup through the emitter once the terminal recovers", () => {
+		const { widget, getEmitter, setTerminalSize, setTerminalAvailable } = makeWidget();
+		try {
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+			setTerminalSize(12, 30);
+			expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
+
+			// Frame write fails; authority is retained.
+			setTerminalAvailable(false);
+			expect(getEmitter()?.()).toBeNull();
+
+			// Recovered terminal: the emitter carries the erase again, and the
+			// following pass acknowledges the successful delivery.
+			setTerminalAvailable(true);
+			expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
+			expect(getEmitter()?.()).toBeNull();
+		} finally {
+			widget.dispose();
+		}
+	});
+
 	it("completes logical teardown when the cleanup write throws", () => {
 		const { widget, editorContainer, getEmitter, getRenderedWidth, setWriteFailure } = makeWidget();
 		widget.setMode("red");
