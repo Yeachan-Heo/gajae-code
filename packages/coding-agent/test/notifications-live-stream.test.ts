@@ -7,6 +7,7 @@ import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { renderThreadedFrame } from "../src/sdk/bus/threaded-render";
+import { isolatedNotificationSettings } from "./helpers/notification-settings";
 
 // ---------------------------------------------------------------------------
 // 1) Pure render contract: streamed turn frames become editable, and live +
@@ -95,16 +96,17 @@ function setEnv(over: Partial<Record<(typeof envKeys)[number], string>>): void {
 }
 
 async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unknown; frames: Frame[] }> {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-stream-"));
+	tempDirs.push(cwd);
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api);
-
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-stream-"));
-	tempDirs.push(cwd);
+	createNotificationsExtension(api, {
+		settings: isolatedNotificationSettings(path.join(cwd, ".agent")),
+	});
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,

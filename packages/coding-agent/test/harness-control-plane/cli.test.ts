@@ -173,7 +173,7 @@ async function seedOwnerDiedBeforeFirstPrompt(sessionId: string): Promise<void> 
 }
 
 describe("gjc harness CLI (foundation)", () => {
-	it("test CLI env cleanup removes overlapping created links and preserves pre-existing links", async () => {
+	it("test CLI env isolates operator state, cleans created links, and preserves pre-existing links", async () => {
 		const fakeRepo = await mkdtemp(path.join(tmpdir(), "harness-cli-env-repo-"));
 		try {
 			const packageDir = path.join(fakeRepo, "packages", "ai");
@@ -181,8 +181,17 @@ describe("gjc harness CLI (foundation)", () => {
 			await writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name: "@gajae-code/ai" }), "utf8");
 			const linkPath = path.join(fakeRepo, "node_modules", "@gajae-code", "ai");
 
-			const first = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
+			const first = createHarnessCliEnv(fakeRepo, {
+				GJC_NOTIFICATIONS: "1",
+				GJC_NOTIFICATIONS_TOKEN: "live-token",
+				GJC_CODING_AGENT_DIR: "/production/gjc-agent",
+				PI_CODING_AGENT_DIR: "/production/pi-agent",
+			});
 			const second = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
+			expect(first.env.GJC_NOTIFICATIONS).toBe("0");
+			expect(first.env.GJC_NOTIFICATIONS_TOKEN).toBeUndefined();
+			expect(first.env.GJC_CODING_AGENT_DIR).toBe(path.join(first.env.GJC_HARNESS_ROOT_REGISTRY_DIR!, "agent"));
+			expect(first.env.PI_CODING_AGENT_DIR).toBe(first.env.GJC_CODING_AGENT_DIR);
 			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
 			first.cleanup();
 			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);

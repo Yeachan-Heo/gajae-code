@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
+import { isolatedNotificationSettings } from "./helpers/notification-settings";
 
 /**
  * Regression for "hard terminal close orphans the Telegram topic": a native
@@ -39,6 +40,8 @@ afterEach(() => {
 });
 
 function createHarness(prefix: string) {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	tempDirs.push(cwd);
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => {
@@ -47,10 +50,9 @@ function createHarness(prefix: string) {
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api);
-
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-	tempDirs.push(cwd);
+	createNotificationsExtension(api, {
+		settings: isolatedNotificationSettings(path.join(cwd, ".agent")),
+	});
 
 	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const sid = `${prefix}${suffix}`;
