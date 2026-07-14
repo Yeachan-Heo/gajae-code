@@ -1,17 +1,28 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
-import { createAgentSession } from "../sdk";
 import { Broker } from "../sdk/broker/broker";
 import {
+	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
 	type SessionLifecycleTranscriptIdentity,
+	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
+import { processIncarnation } from "../sdk/broker/process-incarnation";
+import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../sdk/lifecycle-session";
+import {
+	normalizeSdkStartupFailure,
+	type SdkStartupFailure,
+	type SdkStartupRollbackResult,
+	SdkStartupRollbackTracker,
+} from "../sdk/startup-capability";
+
 import {
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
@@ -165,11 +176,21 @@ export async function openLifecycleSessionManager(
 }
 
 /** Runs the same persisted AgentSession bootstrap used by the production CLI. */
-async function runSessionHost(): Promise<void> {
-	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST);
+export async function runSessionHost(
+	timing: {
+		now?: () => number;
+		sleep?: (ms: number) => Promise<void>;
+		cwd?: string;
+		processIncarnation?: (pid: number) => string | undefined;
+	} = {},
+): Promise<void> {
+	const now = timing.now ?? Date.now;
+	const sleep = timing.sleep ?? (async ms => await Bun.sleep(ms));
+	const readIncarnation = timing.processIncarnation ?? processIncarnation;
+	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
-	const cwd = process.cwd();
+	const cwd = timing.cwd ?? process.cwd();
 	if ((await fs.realpath(request.cwd)) !== (await fs.realpath(cwd)))
 		throw new Error(`Lifecycle worktree mismatch: expected ${request.cwd}, got ${cwd}.`);
 	if (
@@ -179,34 +200,203 @@ async function runSessionHost(): Promise<void> {
 		throw new Error("Lifecycle state root does not match the broker-issued request.");
 	if (request.effectMarker && process.env.GJC_LIFECYCLE_REQUEST_ID !== request.effectMarker)
 		throw new Error("Lifecycle effect marker does not match the broker-issued request.");
-	const { parsed, sessionManager } = await openLifecycleSessionManager(request, cwd, agentDir);
-	const { session } = await createAgentSession({ cwd, agentDir, sessionManager });
-	// Extension initialization publishes the SDK-ready event, so profile activation
-	// must finish before the broker can expose this lifecycle host.
-	await applyStartupModelProfiles({
-		session,
-		settings: session.settings,
-		modelRegistry: session.modelRegistry,
-		parsedArgs: parsed,
-	});
-	let stopping = false;
-	const stop = () => {
-		if (stopping) return;
-		stopping = true;
-		void session.dispose().finally(() => process.exit(0));
-	};
-	await initializeExtensions(session, {
-		reportSendError: () => {},
-		reportRuntimeError: () => {},
-		onShutdown: stop,
-	});
-	if (session.sessionManager.getSessionId() !== request.sessionId)
-		throw new Error(
-			`Lifecycle session id mismatch: expected ${request.sessionId}, got ${session.sessionManager.getSessionId()}.`,
+	if (!request.effectMarker) throw new Error("Lifecycle effect marker is required.");
+	const effectMarker = request.effectMarker;
+	const markerPath = path.join(request.stateRoot, "sdk", `${request.sessionId}.lifecycle.json`);
+	let marker: { pid?: unknown; effectMarker?: unknown; incarnation?: unknown } | undefined;
+	do {
+		try {
+			const candidate = JSON.parse(await fs.readFile(markerPath, "utf8")) as {
+				pid?: unknown;
+				effectMarker?: unknown;
+				incarnation?: unknown;
+			};
+			const incarnation = readIncarnation(process.pid);
+			if (
+				request.effectMarker &&
+				Number.isSafeInteger(candidate.pid) &&
+				candidate.pid === process.pid &&
+				typeof candidate.effectMarker === "string" &&
+				candidate.effectMarker === request.effectMarker &&
+				typeof candidate.incarnation === "string" &&
+				incarnation &&
+				candidate.incarnation === incarnation
+			)
+				marker = candidate;
+		} catch {
+			// Marker publication may be observed between write and rename; retry until cutoff.
+		}
+		if (!marker && now() < request.semanticReadyDeadlineAt)
+			await sleep(Math.min(10, Math.max(0, request.semanticReadyDeadlineAt - now())));
+	} while (!marker && now() < request.semanticReadyDeadlineAt);
+	if (!marker) throw new Error("Lifecycle owner-bound marker authority was not published before readiness cutoff.");
+	const incarnation = readIncarnation(process.pid);
+	if (!incarnation) throw new Error("Lifecycle owner-bound marker authority is invalid.");
+
+	const writeFailure = async (
+		failure: SdkStartupFailure,
+		rollback: SdkStartupRollbackResult,
+		transcript?: LifecycleTranscriptEvidence,
+	): Promise<void> => {
+		if (!request.effectMarker) return;
+		await writeSessionLifecycleFailure(
+			request.stateRoot,
+			request.sessionId,
+			effectMarker,
+			failure,
+			rollback,
+			transcript,
+			incarnation,
 		);
-	await session.sessionManager.ensureOnDisk();
-	if (request.effectMarker)
-		await writeSessionLifecycleReady(request.stateRoot, request.sessionId, request.effectMarker);
+	};
+
+	if (now() >= request.semanticReadyDeadlineAt) {
+		const absent = new SdkStartupRollbackTracker();
+		absent.recordAbsent();
+		await writeFailure(
+			{
+				phase: "startup",
+				reason: "pending",
+				message: "SDK startup did not complete before readiness cutoff.",
+			},
+			absent.result,
+		);
+
+		throw new Error("SDK startup did not complete before readiness cutoff.");
+	}
+
+	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined };
+	let created: CreateLifecycleAgentSessionResult;
+	try {
+		opened = await openLifecycleSessionManager(request, cwd, agentDir);
+		created = await createLifecycleAgentSession({ cwd, agentDir, sessionManager: opened.sessionManager });
+	} catch (error) {
+		const rollback = new SdkStartupRollbackTracker();
+		rollback.recordAbsent();
+		const failure = normalizeSdkStartupFailure("registration", "failed", error);
+		await writeFailure(failure, rollback.result);
+		throw new Error(failure.message);
+	}
+	const { parsed } = opened;
+	if ("failure" in created) {
+		created.rollback.recordAbsent();
+		await writeFailure(created.failure, created.rollback.result);
+
+		throw new Error(created.failure.message);
+	}
+	const { session, capability, rollback } = created;
+	let sessionDisposal: Promise<void> | undefined;
+	const disposeSession = (): Promise<void> => {
+		sessionDisposal ??= session.dispose().catch(() => {});
+		return sessionDisposal;
+	};
+	let disposal: Promise<LifecycleTranscriptEvidence | undefined> | undefined;
+	const disposeAndCapture = (): Promise<LifecycleTranscriptEvidence | undefined> => {
+		disposal ??= (async () => {
+			await disposeSession();
+			try {
+				await session.sessionManager.ensureOnDisk();
+				const transcriptPath = session.sessionManager.getSessionFile();
+				if (!transcriptPath) return undefined;
+				const [bytes, stat] = await Promise.all([
+					fs.readFile(transcriptPath),
+					fs.stat(transcriptPath, { bigint: true }),
+				]);
+				return {
+					digest: createHash("sha256").update(bytes).digest("hex"),
+					identity: {
+						dev: stat.dev.toString(),
+						ino: stat.ino.toString(),
+						size: Number(stat.size),
+						mtimeMs: Number(stat.mtimeMs),
+						mtimeNs: stat.mtimeNs.toString(),
+					},
+				};
+			} catch {
+				return undefined;
+			}
+		})();
+		return disposal;
+	};
+	let failureRollback: Promise<void> | undefined;
+	const failAfterRollback = (failure: SdkStartupFailure): Promise<void> => {
+		failureRollback ??= (async () => {
+			const transcript = await disposeAndCapture();
+			if (rollback.generation === undefined) rollback.recordAbsent();
+			await writeFailure(failure, rollback.result, transcript);
+		})();
+		return failureRollback;
+	};
+	const stop = () => {
+		if (capability.result?.status === "started") {
+			void disposeSession().finally(() => process.exit(0));
+			return;
+		}
+		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
+		capability.cancel();
+		void failAfterRollback(failure).finally(() => process.exit(0));
+	};
+	const cutoffFailure = (): SdkStartupFailure => capability.normalizeFailure("startup", "pending");
+	const throwIfCutoff = (): void => {
+		if (now() >= request.semanticReadyDeadlineAt) {
+			capability.cancel();
+			throw cutoffFailure();
+		}
+	};
+	const cutoff = sleep(Math.max(0, request.semanticReadyDeadlineAt - now())).then(() => ({ cutoff: true }) as const);
+	const beforeCutoff = async <T>(stage: Promise<T>): Promise<T> => {
+		const result = await Promise.race([stage.then(value => ({ cutoff: false, value }) as const), cutoff]);
+		if (result.cutoff) {
+			capability.cancel();
+			throw cutoffFailure();
+		}
+		return result.value;
+	};
+
+	try {
+		const modelProfileStartup =
+			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
+				? new Promise<void>(() => {})
+				: applyStartupModelProfiles({
+						session,
+						settings: session.settings,
+						modelRegistry: session.modelRegistry,
+						parsedArgs: parsed,
+					});
+		await beforeCutoff(modelProfileStartup);
+		throwIfCutoff();
+		await beforeCutoff(
+			initializeExtensions(session, {
+				reportSendError: () => {},
+				reportRuntimeError: () => {},
+				onShutdown: stop,
+			}),
+		);
+		throwIfCutoff();
+		if (session.sessionManager.getSessionId() !== request.sessionId)
+			throw new Error(
+				`Lifecycle session id mismatch: expected ${request.sessionId}, got ${session.sessionManager.getSessionId()}.`,
+			);
+		const startup = await beforeCutoff(capability.promise);
+		if (startup.status !== "started") throw startup.failure;
+		throwIfCutoff();
+		if (process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION === cwd)
+			throw new Error("Lifecycle test failure after SDK host registration.");
+
+		await session.sessionManager.ensureOnDisk();
+		throwIfCutoff();
+
+		await writeSessionLifecycleReady(request.stateRoot, request.sessionId, effectMarker);
+	} catch (error) {
+		const failure =
+			error && typeof error === "object" && "phase" in error && "reason" in error && "message" in error
+				? (error as SdkStartupFailure)
+				: capability.normalizeFailure("startup", "failed", error);
+		const settled = capability.settleFailure(failure);
+		const durableFailure = settled.status === "failed" ? settled.failure : failure;
+		await failAfterRollback(durableFailure);
+		throw error;
+	}
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);
 	await new Promise<void>(() => {});

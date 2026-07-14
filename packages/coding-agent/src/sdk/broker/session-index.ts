@@ -253,13 +253,66 @@ export class SessionIndex {
 		return { indexSeq: this.indexSeq, sessions, warnings: this.#warnings };
 	}
 
-	hasHostUnregistered(sessionId: string, endpointGeneration: number, pid: number): boolean {
+	hostUnregisteredAfter(
+		registration: Pick<
+			IndexedSession,
+			"sessionId" | "endpointGeneration" | "pid" | "indexSeq" | "lifecycleRequestId"
+		>,
+	): { indexSeq: number; lifecycleRequestId?: string } | undefined {
+		const lifecycleRequestId = registration.lifecycleRequestId;
+		const event = this.#events.findLast(
+			item =>
+				item.type === "host_unregistered" &&
+				item.indexSeq > registration.indexSeq &&
+				item.sessionId === registration.sessionId &&
+				item.endpointGeneration === registration.endpointGeneration &&
+				item.pid === registration.pid &&
+				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId),
+		);
+		return event
+			? {
+					indexSeq: event.indexSeq,
+					...(lifecycleRequestId ? { lifecycleRequestId } : {}),
+				}
+			: undefined;
+	}
+
+	findHostRegistration(
+		sessionId: string,
+		endpointGeneration: number,
+		pid: number,
+		lifecycleRequestId?: string,
+	): IndexedSession | undefined {
+		const event = this.#events.findLast(
+			item =>
+				item.type === "host_registered" &&
+				item.sessionId === sessionId &&
+				item.endpointGeneration === endpointGeneration &&
+				item.pid === pid &&
+				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId),
+		);
+		return event
+			? {
+					sessionId: event.sessionId,
+					locator: event.locator,
+					endpointGeneration: event.endpointGeneration,
+					pid: event.pid,
+					endpointMtimeMs: event.endpointMtimeMs,
+					lifecycleRequestId: event.lifecycleRequestId,
+					terminalUncertain: false,
+					indexSeq: event.indexSeq,
+					live: alive(event.pid),
+				}
+			: undefined;
+	}
+
+	hasHostRegistrationForLifecycle(sessionId: string, pid: number, lifecycleRequestId: string): boolean {
 		return this.#events.some(
 			event =>
-				event.type === "host_unregistered" &&
+				event.type === "host_registered" &&
 				event.sessionId === sessionId &&
-				event.endpointGeneration === endpointGeneration &&
-				event.pid === pid,
+				event.pid === pid &&
+				event.lifecycleRequestId === lifecycleRequestId,
 		);
 	}
 }

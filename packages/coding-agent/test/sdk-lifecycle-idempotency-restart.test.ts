@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
@@ -84,6 +85,7 @@ describe("SDK lifecycle ledger", () => {
 				requestHash: "a",
 				state: "terminal_ok",
 				response: { sessionId: "s" },
+				responseDigest: createHash("sha256").update('{"sessionId":"s"}').digest("hex"),
 				ts: Date.now(),
 			})}\n`,
 		);
@@ -104,4 +106,25 @@ describe("SDK lifecycle ledger", () => {
 		expect(lines.map(line => JSON.parse(line))).toHaveLength(2);
 		expect((await new LifecycleLedger(dir).open()).get("i")?.response).toEqual(response);
 	});
+});
+it("quarantines terminal-uncertain replay rows with corrupt response or durable-effect digests", async () => {
+	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-uncertain-digest-"));
+	const ledger = await new LifecycleLedger(dir).open();
+	const response = { ok: false, error: { code: "terminal_uncertain" } };
+	await ledger.begin("response", "request-response");
+	await ledger.transition("response", "terminal_uncertain", { response, responseDigest: "corrupt" });
+	await ledger.begin("effects", "request-effects");
+	await ledger.transition("effects", "terminal_uncertain", {
+		response,
+		responseDigest: createHash("sha256").update(JSON.stringify(response)).digest("hex"),
+		durableEffects: {
+			worktree: { cwdDigest: "worktree", created: true, reused: false },
+			digest: "corrupt",
+		},
+	});
+
+	const reopened = await new LifecycleLedger(dir).open();
+	expect((await reopened.begin("response", "request-response")).kind).toBe("terminal_uncertain");
+	expect((await reopened.begin("effects", "request-effects")).kind).toBe("terminal_uncertain");
+	expect(await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl.corrupt"), "utf8")).toContain("corrupt");
 });

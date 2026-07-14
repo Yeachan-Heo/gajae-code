@@ -54,6 +54,12 @@ import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
+import {
+	lifecycleStartupCapabilityForApi,
+	normalizeSdkStartupFailure,
+	type SdkStartupFailure,
+} from "../startup-capability";
+
 import { registerTelegramFileSink } from "./attachment-registry";
 import { ensureDiscordDaemon, ensureSlackDaemon } from "./chat-daemon-control";
 import {
@@ -516,6 +522,8 @@ interface SessionRuntime {
 	workflowGate?: WorkflowGateEmitter;
 	gatePresentations?: GatePresentationRegistry;
 	redact: boolean;
+	/** True only after the exact host generation was registered with the broker index. */
+	brokerRegistrationActive: boolean;
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
@@ -548,7 +556,11 @@ interface SessionRuntime {
 	stopBrokerHeartbeat: () => void;
 }
 type SessionStartStatus = "started" | "already" | "disabled" | "failed";
-type SessionStartResult = { status: SessionStartStatus; runtime?: SessionRuntime };
+type SessionStartResult = {
+	status: SessionStartStatus;
+	runtime?: SessionRuntime;
+	failure?: SdkStartupFailure;
+};
 
 function pushSessionFrame(
 	runtime: Pick<SessionRuntime, "server" | "host">,
@@ -1532,6 +1544,7 @@ export function createNotificationsExtension(
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 	} = {},
 ): void {
+	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
 	const runtimes = new Map<string, SessionRuntime>();
 	const disabledSessions = new Set<string>();
 	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
@@ -1556,10 +1569,23 @@ export function createNotificationsExtension(
 		const requestedRuntime = runtimes.get(id);
 		if (expectedRuntime && requestedRuntime !== expectedRuntime) return false;
 		if (reason === "session" && requestedRuntime) requestedRuntime.stopping = true;
+		if (reason === "session" && requestedRuntime) {
+			// Fence the exact runtime before awaiting its startup promise: a late start
+			// must observe removal and clean itself up rather than becoming reachable.
+			runtimes.delete(id);
+			if (activeRuntimeId === id) activeRuntimeId = undefined;
+		}
 		const pendingStart = sessionStartPromises.get(id);
-		if (pendingStart) await pendingStart;
-		const rt = runtimes.get(id);
+		if (pendingStart)
+			void pendingStart
+				.catch(() => {})
+				.then(() => {
+					if (runtimes.get(id) === requestedRuntime) void stopSession(id, reason, requestedRuntime);
+				});
+		const rt = requestedRuntime;
+
 		if (expectedRuntime && rt !== expectedRuntime) return false;
+
 		if (!rt) {
 			if (activeRuntimeId === id) activeRuntimeId = undefined;
 			return false;
@@ -1576,8 +1602,7 @@ export function createNotificationsExtension(
 			rt.pendingInteractive.clear();
 			return true;
 		}
-		runtimes.delete(id);
-		if (activeRuntimeId === id) activeRuntimeId = undefined;
+
 		try {
 			rt.cancelPostmortemCleanup();
 		} catch {}
@@ -1603,8 +1628,14 @@ export function createNotificationsExtension(
 			rt.disposeGateEmitterListener();
 		} catch {}
 		rt.gatePresentations?.dispose();
+		let hostStopped = false;
+		let brokerRegistrationReleased = false;
+
 		try {
-			await rt.host.stop();
+			const stopped = await rt.host.stop();
+			hostStopped = stopped === "stopped";
+			brokerRegistrationReleased = !rt.brokerRegistrationActive || stopped === "stopped";
+			if (rt.brokerRegistrationActive && stopped === "stopped") rt.brokerRegistrationActive = false;
 		} catch (e) {
 			logger.warn(`sdk host: stop failed: ${String(e)}`);
 		}
@@ -1626,11 +1657,18 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: session_closed failed: ${String(e)}`);
 		}
 		if (closeFrameSent) await sleep(100);
+		let serverStopped = false;
 		try {
 			rt.server.stop();
+			serverStopped = true;
 		} catch (e) {
 			logger.warn(`notifications: stop failed: ${String(e)}`);
 		}
+		lifecycleStartupCapability?.rollback?.recordStop(rt.host.generation, {
+			runtimeRemoved: true,
+			hostStopped: hostStopped && serverStopped,
+			brokerRegistrationReleased,
+		});
 		return true;
 	}
 
@@ -1653,17 +1691,45 @@ export function createNotificationsExtension(
 		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
 		const notificationsEnabledForSession = isEnabledForSession(id, cfg);
 		const sdkEnabledForSession = shouldHostSdk(settings, isNotificationEligibleContext(ctx));
-		if (!isNotificationEligibleContext(ctx) || (!notificationsEnabledForSession && !sdkEnabledForSession))
+		const lifecycleRequired = lifecycleStartupCapability !== undefined;
+		const failLifecycleStartup = (
+			reason: "disabled" | "ineligible" | "failed",
+			error?: unknown,
+		): SessionStartResult => {
+			const failure =
+				lifecycleStartupCapability?.normalizeFailure("startup", reason, error) ??
+				normalizeSdkStartupFailure("startup", reason, error);
+
+			lifecycleStartupCapability?.settleFailure(failure);
+			return { status: reason === "disabled" ? "disabled" : "failed", failure };
+		};
+		const throwIfLifecycleStopped = (): void => {
+			if (lifecycleStartupCapability?.cancelled || runtime?.stopping || runtimes.get(id) !== runtime)
+				throw new Error("Lifecycle SDK startup was cancelled.");
+		};
+
+		if (
+			!lifecycleRequired &&
+			(!isNotificationEligibleContext(ctx) || (!notificationsEnabledForSession && !sdkEnabledForSession))
+		)
 			return { status: "disabled" };
+		if (lifecycleRequired && !isNotificationEligibleContext(ctx)) return failLifecycleStartup("ineligible");
 		const pendingStart = sessionStartPromises.get(id);
 		if (pendingStart) return pendingStart;
 		const existingRuntime = runtimes.get(id);
 		if (existingRuntime) {
 			activeRuntimeId = id;
+			if (lifecycleRequired) {
+				if (existingRuntime.host.started) lifecycleStartupCapability?.settleStarted();
+				else return failLifecycleStartup("failed", "SDK host is not started.");
+			}
 			return { status: "already", runtime: existingRuntime };
 		}
 
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
+		const lifecycleAgentDir = lifecycleRequired ? settings?.getAgentDir?.() : undefined;
+		if (lifecycleRequired && !lifecycleAgentDir)
+			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
 
 		const gateOptions = new Map<string, string[]>();
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
@@ -1676,7 +1742,13 @@ export function createNotificationsExtension(
 		// The SDK can always answer now (interactive via the answer source, or the
 		// workflow gate), so the endpoint advertises a resolver.
 		const token = resolveToken();
-		const server = new NotificationServer(id, token, stateRoot, true);
+		let server: NotificationServer;
+		try {
+			server = new NotificationServer(id, token, stateRoot, true);
+		} catch (error) {
+			if (lifecycleRequired) return failLifecycleStartup("failed", error);
+			throw error;
+		}
 		const gatePresentations = new GatePresentationRegistry(server, () => runtime?.redact ?? redact, tag);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
 		let stopBrokerHeartbeat = () => {};
@@ -1973,6 +2045,7 @@ export function createNotificationsExtension(
 			id,
 			idleSeq: 0,
 			pendingInteractive,
+			brokerRegistrationActive: false,
 			disposeAnswerSource: () => {},
 			disposeFileSink: () => {},
 			disposeGateListener: () => {},
@@ -2002,6 +2075,18 @@ export function createNotificationsExtension(
 		const startSettled = Promise.withResolvers<SessionStartResult>();
 		sessionStartPromises.set(id, startSettled.promise);
 		const finishStartup = (result: SessionStartResult): void => {
+			if (lifecycleRequired) {
+				if (result.status === "started") lifecycleStartupCapability?.settleStarted();
+				else
+					lifecycleStartupCapability?.settleFailure(
+						result.failure ??
+							lifecycleStartupCapability?.normalizeFailure(
+								"startup",
+								result.status === "disabled" ? "disabled" : "failed",
+							) ??
+							normalizeSdkStartupFailure("startup", result.status === "disabled" ? "disabled" : "failed"),
+					);
+			}
 			if (sessionStartPromises.get(id) === startSettled.promise) sessionStartPromises.delete(id);
 			startSettled.resolve(result);
 		};
@@ -2019,271 +2104,285 @@ export function createNotificationsExtension(
 			} catch {}
 		};
 
-		server.onSdkFrame((err, inbound) => {
-			if (err || !inbound) return;
-			try {
-				inboundSdkFrame?.(inbound.connectionId, JSON.parse(inbound.json) as Record<string, unknown>);
-			} catch {}
-		});
-		server.onConnectionClose((err, connectionId) => {
-			if (!err && connectionId) host.handleDisconnect(connectionId);
-		});
-
-		server.onReply((err, reply) => {
-			if (err || !reply) return;
-			const native = server as unknown as {
-				resolveClaim(receiptId: string, answerJson?: string, idempotencyKey?: string): void;
-				closeClaimInvalid(receiptId: string, reason: string): void;
-				requestAskSelectedAck(
-					receiptId: string,
-					requestJson: string,
-				): Promise<{ status: string; messageId?: number; reason?: string }>;
-			};
-			const pending = pendingInteractive.get(reply.id);
-			if (pending) {
-				pendingInteractive.delete(reply.id);
-				let interaction: AskRemoteInteraction | undefined;
+		try {
+			server.onSdkFrame((err, inbound) => {
+				if (err || !inbound) return;
 				try {
-					const answer = JSON.parse(reply.answerJson) as unknown;
-					if (typeof answer === "object" && answer && "controlId" in answer) {
-						const controlId = (answer as { controlId?: unknown }).controlId;
-						if (
-							controlId === "navigation_forward" &&
-							pending.controls.some(control => control.id === controlId && control.enabled)
-						) {
-							interaction = { kind: "control", controlId };
-						}
-					} else {
-						const value = mapAnswerToLabel(reply.answerJson, pending.options);
-						if (value !== undefined) interaction = { kind: "value", value };
-					}
+					inboundSdkFrame?.(inbound.connectionId, JSON.parse(inbound.json) as Record<string, unknown>);
 				} catch {}
-				if (!interaction) {
+			});
+			server.onConnectionClose((err, connectionId) => {
+				if (!err && connectionId) host.handleDisconnect(connectionId);
+			});
+
+			server.onReply((err, reply) => {
+				if (err || !reply) return;
+				const native = server as unknown as {
+					resolveClaim(receiptId: string, answerJson?: string, idempotencyKey?: string): void;
+					closeClaimInvalid(receiptId: string, reason: string): void;
+					requestAskSelectedAck(
+						receiptId: string,
+						requestJson: string,
+					): Promise<{ status: string; messageId?: number; reason?: string }>;
+				};
+				const pending = pendingInteractive.get(reply.id);
+				if (pending) {
+					pendingInteractive.delete(reply.id);
+					let interaction: AskRemoteInteraction | undefined;
 					try {
-						native.closeClaimInvalid(reply.replyReceiptId, "invalid_answer");
+						const answer = JSON.parse(reply.answerJson) as unknown;
+						if (typeof answer === "object" && answer && "controlId" in answer) {
+							const controlId = (answer as { controlId?: unknown }).controlId;
+							if (
+								controlId === "navigation_forward" &&
+								pending.controls.some(control => control.id === controlId && control.enabled)
+							) {
+								interaction = { kind: "control", controlId };
+							}
+						} else {
+							const value = mapAnswerToLabel(reply.answerJson, pending.options);
+							if (value !== undefined) interaction = { kind: "value", value };
+						}
 					} catch {}
-					if (!pending.reissue()) pending.resolve(undefined);
-					return;
-				}
-				let settled: Promise<AskSettlementResult> | undefined;
-				const receipt: AskRemoteReceipt = {
-					source: "remote",
-					interaction,
-					settle(settlement: AskSettlement): Promise<AskSettlementResult> {
-						if (settled) return settled;
-						settled = Promise.resolve().then(async () => {
-							if (settlement.kind === "invalid") {
-								native.closeClaimInvalid(reply.replyReceiptId, settlement.reason);
-								return { kind: "invalid_closed" };
-							}
-							if (settlement.kind === "resolve_without_commit") {
-								native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
-								return { kind: "resolved_without_commit" };
-							}
-							const ack = await requestLiveSelectedAck(native, {
-								replyReceiptId: reply.replyReceiptId,
-								actionId: reply.id,
-								commitKey: `${reply.id}:${reply.idempotencyKey ?? reply.replyReceiptId}`,
-								deadlineAt: Date.now() + 8_000,
-							});
-							native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
-							return { kind: "committed", ack };
-						});
-						return settled;
-					},
-				};
-				pending.resolve(receipt);
-				return;
-			}
-			const gate = runtime?.workflowGate;
-			const workflowGateActive =
-				gate?.isUnattended?.() === true &&
-				typeof gate.onGateEmitted === "function" &&
-				typeof gate.resolveGateFromNotification === "function";
-			const gateId = gatePresentations.routeFor(reply.id);
-			if (gate && workflowGateActive && gateId && gate.resolveGateFromNotification) {
-				const presentation = gatePresentations.presentationFor(reply.id);
-				const rawAnswer = parseAnswer(reply.answerJson);
-				if (presentation?.multi) {
-					const option =
-						typeof rawAnswer === "number"
-							? presentation.options[rawAnswer]
-							: typeof rawAnswer === "string" && presentation.options.includes(rawAnswer)
-								? rawAnswer
-								: undefined;
-					if (option !== undefined) {
-						native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
-						if (!gatePresentations.toggle(reply.id, option)) gatePresentations.reissue(gateId);
-						return;
-					}
-				}
-				let answer: unknown;
-				if (
-					presentation?.multi &&
-					typeof rawAnswer === "object" &&
-					rawAnswer !== null &&
-					(rawAnswer as { controlId?: unknown }).controlId === "navigation_forward"
-				) {
-					if (!presentation.allowEmpty && presentation.selectedOptions.length === 0) {
-						native.closeClaimInvalid(reply.replyReceiptId, "invalid_control");
-						gatePresentations.closeInteraction(reply.id, "invalid_control");
-						gatePresentations.reissue(gateId);
-						return;
-					}
-					answer = { selected: presentation.selectedOptions };
-				} else if (
-					typeof rawAnswer === "object" &&
-					rawAnswer !== null &&
-					(rawAnswer as { action?: unknown }).action === "clarify"
-				) {
-					answer = rawAnswer;
-				} else if (presentation?.multi && typeof rawAnswer === "string") {
-					answer = { selected: presentation.selectedOptions, other: true, custom: rawAnswer };
-				} else {
-					const mapped = mapAnswerToGate(reply.answerJson, gateOptions.get(gateId) ?? []);
-					if (!mapped.ok) {
-						// A numeric selector outside options is invalid (issue #2030): close the
-						// exact claim/receipt and reissue the interaction — never a success ack.
-						native.closeClaimInvalid(reply.replyReceiptId, mapped.reason);
-						gatePresentations.closeInteraction(reply.id, mapped.reason);
-						gatePresentations.reissue(gateId);
-						return;
-					}
-					answer = mapped.answer;
-				}
-				void gate
-					.resolveGateFromNotification(
-						{ gate_id: gateId, answer, idempotency_key: reply.idempotencyKey ?? undefined },
-						{
-							interactionActionId: reply.id,
-							replyReceiptId: reply.replyReceiptId,
-							answerJson: reply.answerJson,
-							idempotencyKey: reply.idempotencyKey ?? undefined,
-							resolveClaim: () =>
-								native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined),
-							closeClaimInvalid: reason => {
-								native.closeClaimInvalid(reply.replyReceiptId, reason);
-								gatePresentations.closeInteraction(reply.id, reason);
-								gatePresentations.reissue(gateId);
-							},
-							requestSelectedAck: input =>
-								requestLiveSelectedAck(native, {
-									replyReceiptId: input.replyReceiptId,
-									actionId: input.actionId,
-									commitKey: input.commitKey,
-									deadlineAt: input.daemonDeadlineAt,
-								}),
-						},
-					)
-					.catch(error => logger.warn(`notifications: resolveGateFromNotification failed: ${String(error)}`));
-				return;
-			}
-			try {
-				server.closeClaimInvalid(reply.replyReceiptId, "unknown_action");
-			} catch (error) {
-				logger.warn(`notifications: closeClaimInvalid failed: ${String(error)}`);
-			}
-		});
-
-		// Inbound free-text injection / in-thread config command from a session
-		// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
-		server.onInbound((err, inbound) => {
-			if (err || !inbound) return;
-			if (inbound.kind === "control_command") {
-				const frame = sdkInboundFrame(inbound.commandJson);
-				if (frame) {
-					inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
-					return;
-				}
-			}
-
-			if (inbound.kind === "user_message") {
-				// Inject as a user turn (steers/continues the agent; the resulting
-				// turn streams back via the turn_end handler even when not idle).
-				// Record the update id so it can be acked as "consumed" on the next
-				// turn_start, and steer (vs start a fresh turn) when already busy.
-				const text = inbound.text ?? "";
-				const images = inbound.images ?? [];
-				if (!text && images.length === 0) return;
-				if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
-				const content: string | (TextContent | ImageContent)[] =
-					images.length > 0
-						? [
-								...(text ? [{ type: "text", text } as TextContent] : []),
-								...images.map(
-									img =>
-										({ type: "image", data: img.data, mimeType: img.mime ?? "image/jpeg" }) as ImageContent,
-								),
-							]
-						: text;
-				try {
-					api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
-				} catch (e) {
-					logger.warn(`notifications: sendUserMessage failed: ${String(e)}`);
-				}
-				return;
-			}
-			if (inbound.kind === "config_command") {
-				if (!runtime) return;
-				const update: {
-					type: "config_update";
-					sessionId: string;
-					verbosity?: "lean" | "verbose";
-					redact?: boolean;
-				} = {
-					type: "config_update",
-					sessionId: id,
-				};
-				if (inbound.verbosity === "lean" || inbound.verbosity === "verbose") {
-					runtime.verbosity = inbound.verbosity;
-					update.verbosity = inbound.verbosity;
-				}
-				if (typeof inbound.redact === "boolean") {
-					runtime.redact = inbound.redact;
-					update.redact = inbound.redact;
-				}
-				if (update.verbosity !== undefined || update.redact !== undefined) {
-					try {
-						pushSessionFrame(runtime, update);
-					} catch (e) {
-						logger.warn(`notifications: config_update failed: ${String(e)}`);
-					}
-				}
-			}
-			if (inbound.kind === "control_command") {
-				if (!runtime || !inbound.requestId) return;
-				void executeNotificationControlCommand(parseControlCommandPayload(inbound.commandJson), ctx, api)
-					.then(result => {
-						if (runtime)
-							pushSessionFrame(runtime, {
-								type: "control_command_result",
-								sessionId: runtime.id,
-								requestId: inbound.requestId,
-								updateId: inbound.updateId,
-								status: result.status,
-								message: result.message,
-							});
-					})
-					.catch(err => {
+					if (!interaction) {
 						try {
+							native.closeClaimInvalid(reply.replyReceiptId, "invalid_answer");
+						} catch {}
+						if (!pending.reissue()) pending.resolve(undefined);
+						return;
+					}
+					let settled: Promise<AskSettlementResult> | undefined;
+					const receipt: AskRemoteReceipt = {
+						source: "remote",
+						interaction,
+						settle(settlement: AskSettlement): Promise<AskSettlementResult> {
+							if (settled) return settled;
+							settled = Promise.resolve().then(async () => {
+								if (settlement.kind === "invalid") {
+									native.closeClaimInvalid(reply.replyReceiptId, settlement.reason);
+									return { kind: "invalid_closed" };
+								}
+								if (settlement.kind === "resolve_without_commit") {
+									native.resolveClaim(
+										reply.replyReceiptId,
+										reply.answerJson,
+										reply.idempotencyKey ?? undefined,
+									);
+									return { kind: "resolved_without_commit" };
+								}
+								const ack = await requestLiveSelectedAck(native, {
+									replyReceiptId: reply.replyReceiptId,
+									actionId: reply.id,
+									commitKey: `${reply.id}:${reply.idempotencyKey ?? reply.replyReceiptId}`,
+									deadlineAt: Date.now() + 8_000,
+								});
+								native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
+								return { kind: "committed", ack };
+							});
+							return settled;
+						},
+					};
+					pending.resolve(receipt);
+					return;
+				}
+				const gate = runtime?.workflowGate;
+				const workflowGateActive =
+					gate?.isUnattended?.() === true &&
+					typeof gate.onGateEmitted === "function" &&
+					typeof gate.resolveGateFromNotification === "function";
+				const gateId = gatePresentations.routeFor(reply.id);
+				if (gate && workflowGateActive && gateId && gate.resolveGateFromNotification) {
+					const presentation = gatePresentations.presentationFor(reply.id);
+					const rawAnswer = parseAnswer(reply.answerJson);
+					if (presentation?.multi) {
+						const option =
+							typeof rawAnswer === "number"
+								? presentation.options[rawAnswer]
+								: typeof rawAnswer === "string" && presentation.options.includes(rawAnswer)
+									? rawAnswer
+									: undefined;
+						if (option !== undefined) {
+							native.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
+							if (!gatePresentations.toggle(reply.id, option)) gatePresentations.reissue(gateId);
+							return;
+						}
+					}
+					let answer: unknown;
+					if (
+						presentation?.multi &&
+						typeof rawAnswer === "object" &&
+						rawAnswer !== null &&
+						(rawAnswer as { controlId?: unknown }).controlId === "navigation_forward"
+					) {
+						if (!presentation.allowEmpty && presentation.selectedOptions.length === 0) {
+							native.closeClaimInvalid(reply.replyReceiptId, "invalid_control");
+							gatePresentations.closeInteraction(reply.id, "invalid_control");
+							gatePresentations.reissue(gateId);
+							return;
+						}
+						answer = { selected: presentation.selectedOptions };
+					} else if (
+						typeof rawAnswer === "object" &&
+						rawAnswer !== null &&
+						(rawAnswer as { action?: unknown }).action === "clarify"
+					) {
+						answer = rawAnswer;
+					} else if (presentation?.multi && typeof rawAnswer === "string") {
+						answer = { selected: presentation.selectedOptions, other: true, custom: rawAnswer };
+					} else {
+						const mapped = mapAnswerToGate(reply.answerJson, gateOptions.get(gateId) ?? []);
+						if (!mapped.ok) {
+							// A numeric selector outside options is invalid (issue #2030): close the
+							// exact claim/receipt and reissue the interaction — never a success ack.
+							native.closeClaimInvalid(reply.replyReceiptId, mapped.reason);
+							gatePresentations.closeInteraction(reply.id, mapped.reason);
+							gatePresentations.reissue(gateId);
+							return;
+						}
+						answer = mapped.answer;
+					}
+					void gate
+						.resolveGateFromNotification(
+							{ gate_id: gateId, answer, idempotency_key: reply.idempotencyKey ?? undefined },
+							{
+								interactionActionId: reply.id,
+								replyReceiptId: reply.replyReceiptId,
+								answerJson: reply.answerJson,
+								idempotencyKey: reply.idempotencyKey ?? undefined,
+								resolveClaim: () =>
+									native.resolveClaim(
+										reply.replyReceiptId,
+										reply.answerJson,
+										reply.idempotencyKey ?? undefined,
+									),
+								closeClaimInvalid: reason => {
+									native.closeClaimInvalid(reply.replyReceiptId, reason);
+									gatePresentations.closeInteraction(reply.id, reason);
+									gatePresentations.reissue(gateId);
+								},
+								requestSelectedAck: input =>
+									requestLiveSelectedAck(native, {
+										replyReceiptId: input.replyReceiptId,
+										actionId: input.actionId,
+										commitKey: input.commitKey,
+										deadlineAt: input.daemonDeadlineAt,
+									}),
+							},
+						)
+						.catch(error => logger.warn(`notifications: resolveGateFromNotification failed: ${String(error)}`));
+					return;
+				}
+				try {
+					server.closeClaimInvalid(reply.replyReceiptId, "unknown_action");
+				} catch (error) {
+					logger.warn(`notifications: closeClaimInvalid failed: ${String(error)}`);
+				}
+			});
+
+			// Inbound free-text injection / in-thread config command from a session
+			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
+			server.onInbound((err, inbound) => {
+				if (err || !inbound) return;
+				if (inbound.kind === "control_command") {
+					const frame = sdkInboundFrame(inbound.commandJson);
+					if (frame) {
+						inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
+						return;
+					}
+				}
+
+				if (inbound.kind === "user_message") {
+					// Inject as a user turn (steers/continues the agent; the resulting
+					// turn streams back via the turn_end handler even when not idle).
+					// Record the update id so it can be acked as "consumed" on the next
+					// turn_start, and steer (vs start a fresh turn) when already busy.
+					const text = inbound.text ?? "";
+					const images = inbound.images ?? [];
+					if (!text && images.length === 0) return;
+					if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
+					const content: string | (TextContent | ImageContent)[] =
+						images.length > 0
+							? [
+									...(text ? [{ type: "text", text } as TextContent] : []),
+									...images.map(
+										img =>
+											({
+												type: "image",
+												data: img.data,
+												mimeType: img.mime ?? "image/jpeg",
+											}) as ImageContent,
+									),
+								]
+							: text;
+					try {
+						api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
+					} catch (e) {
+						logger.warn(`notifications: sendUserMessage failed: ${String(e)}`);
+					}
+					return;
+				}
+				if (inbound.kind === "config_command") {
+					if (!runtime) return;
+					const update: {
+						type: "config_update";
+						sessionId: string;
+						verbosity?: "lean" | "verbose";
+						redact?: boolean;
+					} = {
+						type: "config_update",
+						sessionId: id,
+					};
+					if (inbound.verbosity === "lean" || inbound.verbosity === "verbose") {
+						runtime.verbosity = inbound.verbosity;
+						update.verbosity = inbound.verbosity;
+					}
+					if (typeof inbound.redact === "boolean") {
+						runtime.redact = inbound.redact;
+						update.redact = inbound.redact;
+					}
+					if (update.verbosity !== undefined || update.redact !== undefined) {
+						try {
+							pushSessionFrame(runtime, update);
+						} catch (e) {
+							logger.warn(`notifications: config_update failed: ${String(e)}`);
+						}
+					}
+				}
+				if (inbound.kind === "control_command") {
+					if (!runtime || !inbound.requestId) return;
+					void executeNotificationControlCommand(parseControlCommandPayload(inbound.commandJson), ctx, api)
+						.then(result => {
 							if (runtime)
 								pushSessionFrame(runtime, {
 									type: "control_command_result",
 									sessionId: runtime.id,
 									requestId: inbound.requestId,
 									updateId: inbound.updateId,
-									status: "error",
-									message: `Control command failed: ${err instanceof Error ? err.message : String(err)}`,
+									status: result.status,
+									message: result.message,
 								});
-						} catch (pushErr) {
-							logger.warn(`notifications: control_command_result failed: ${String(pushErr)}`);
-						}
-					});
-			}
-		});
+						})
+						.catch(err => {
+							try {
+								if (runtime)
+									pushSessionFrame(runtime, {
+										type: "control_command_result",
+										sessionId: runtime.id,
+										requestId: inbound.requestId,
+										updateId: inbound.updateId,
+										status: "error",
+										message: `Control command failed: ${err instanceof Error ? err.message : String(err)}`,
+									});
+							} catch (pushErr) {
+								logger.warn(`notifications: control_command_result failed: ${String(pushErr)}`);
+							}
+						});
+				}
+			});
 
-		try {
 			await host.start();
+			lifecycleStartupCapability?.rollback?.recordGeneration(host.generation);
+			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
 				finishStartup({ status: "failed" });
 				await cleanupAbandonedStartup();
@@ -2301,6 +2400,7 @@ export function createNotificationsExtension(
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			const endpoint = await server.start();
+			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
 				finishStartup({ status: "failed" });
 				await cleanupAbandonedStartup();
@@ -2315,13 +2415,18 @@ export function createNotificationsExtension(
 				} catch (e) {
 					logger.warn(`notifications: failed to ensure notification daemon: ${String(e)}`);
 				}
+				throwIfLifecycleStopped();
 			}
 			server.pushFrame(JSON.stringify(identityHeader));
-			const agentDir = settings?.getAgentDir?.();
+			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
+			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
+
 			if (agentDir) {
 				try {
 					await ensureBroker({ agentDir });
+					throwIfLifecycleStopped();
 					const index = await new SessionIndex(agentDir).open();
+					throwIfLifecycleStopped();
 					const locator = { repo: path.resolve(ctx.cwd), stateRoot };
 					const endpointMtimeMs = fs.statSync(path.join(stateRoot, "sdk", `${id}.json`)).mtimeMs;
 					await host.registerWithBroker({
@@ -2338,9 +2443,17 @@ export function createNotificationsExtension(
 							});
 						},
 						unregister: async input => {
-							await index.append({ type: "host_unregistered", ...input, locator, pid: process.pid });
+							await index.append({
+								type: "host_unregistered",
+								...input,
+								locator,
+								pid: process.pid,
+								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
+							});
 						},
 					});
+					throwIfLifecycleStopped();
+					runtime.brokerRegistrationActive = true;
 					const timer = setInterval(() => {
 						void index
 							.append({
@@ -2354,6 +2467,7 @@ export function createNotificationsExtension(
 					}, 5_000);
 					stopBrokerHeartbeat = () => clearInterval(timer);
 				} catch (brokerError) {
+					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
 				}
 			}
@@ -2477,9 +2591,10 @@ export function createNotificationsExtension(
 			return { status: "started", runtime };
 		} catch (e) {
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
-			finishStartup({ status: "failed" });
+			const result = failLifecycleStartup("failed", e);
+			finishStartup(result);
 			if (!(await stopSession(id, "session", runtime))) await cleanupAbandonedStartup();
-			return { status: "failed" };
+			return { ...result, runtime };
 		}
 	}
 
@@ -2539,15 +2654,16 @@ export function createNotificationsExtension(
 					expectedRuntime.host.generation === expectedGeneration &&
 					expectedRuntime.stopping === false;
 				if (enabled) expectedRuntime.enableNotifications();
+				const startupWasFenced = result.status === "failed" && expectedRuntime?.stopping === true;
 				ctx.ui.notify(
 					enabled
 						? result.status === "started"
 							? "Notifications enabled for this session."
 							: "Notifications already enabled for this session."
-						: result.status === "failed"
+						: result.status === "failed" && !startupWasFenced
 							? "Notifications failed to start for this session."
 							: "Notifications were not enabled because the active session changed during startup.",
-					enabled ? "info" : result.status === "failed" ? "error" : "warning",
+					enabled ? "info" : result.status === "failed" && !startupWasFenced ? "error" : "warning",
 				);
 				return;
 			}

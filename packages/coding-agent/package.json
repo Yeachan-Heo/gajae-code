@@ -125,6 +125,10 @@
 		},
 		"./sdk/models": null,
 		"./sdk/models.js": null,
+		"./sdk/lifecycle-session": null,
+		"./sdk/lifecycle-session.js": null,
+		"./sdk/startup-capability": null,
+		"./sdk/startup-capability.js": null,
 		"./sdk/bus": {
 			"types": "./src/sdk/bus/index.ts",
 			"import": "./src/sdk/bus/index.ts"

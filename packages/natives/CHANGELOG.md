@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Prefer a source-workspace native addon over optional platform packages while validating the current version sentinel on every candidate, so stale local or optional binaries fall through with actionable diagnostics instead of shadowing the active loader (#2168).
+
 ## [0.10.0] - 2026-07-12
 ### Fixed
 

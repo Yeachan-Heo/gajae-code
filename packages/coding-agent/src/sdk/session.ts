@@ -166,6 +166,11 @@ import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
+import {
+	attachLifecycleStartupCapability,
+	lifecycleStartupCapabilityOption,
+	type SdkStartupCapability,
+} from "./startup-capability";
 
 type AsyncResultEntry = {
 	jobId: string;
@@ -306,6 +311,7 @@ export interface CreateAgentSessionOptions {
 	gjcSubskillToolContext?: { parent: string; phase: string; sessionId?: string; cwd?: string };
 	/** Inline extensions (merged with discovery). */
 	extensions?: ExtensionFactory[];
+
 	/** Additional extension paths to load (merged with discovery). */
 	additionalExtensionPaths?: string[];
 	/** Disable extension discovery (explicit paths still load). */
@@ -898,6 +904,9 @@ export function resolveIntentTracingEnabled(intentTracingSetting: boolean | unde
 }
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	const lifecycleStartupCapability = (
+		options as CreateAgentSessionOptions & { [lifecycleStartupCapabilityOption]?: SdkStartupCapability }
+	)[lifecycleStartupCapabilityOption];
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
@@ -1633,6 +1642,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const spawnedByGjc = typeof spawnProvenance === "string" && spawnProvenance.trim().length > 0;
 		delete process.env[SPAWN_PROVENANCE_ENV];
 		if (
+			lifecycleStartupCapability ||
 			shouldRegisterNotificationsExtension({
 				env: process.env,
 				cfg: notificationCfg,
@@ -1643,7 +1653,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}) ||
 			shouldHostSdk(notificationCfg, isTopLevelSdkSession)
 		) {
-			inlineExtensions.push(api => createNotificationsExtension(api, { settings, spawnedByGjc }));
+			inlineExtensions.push(async api => {
+				try {
+					if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
+					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
+						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
+					createNotificationsExtension(api, {
+						settings,
+						spawnedByGjc,
+					});
+				} catch (error) {
+					lifecycleStartupCapability?.settleFailure(
+						lifecycleStartupCapability.normalizeFailure("registration", "factory_absent", error),
+					);
+					throw error;
+				}
+			});
 		}
 
 		// Extension/module discovery is quarantined; retain only the private

@@ -47,6 +47,7 @@ export interface ResolveLoaderCandidatesInput {
 	addonFilenames: string[];
 	isCompiledBinary: boolean;
 	stageFromNodeModules?: boolean;
+	isWorkspaceLoad?: boolean;
 	optionalPackageNativeDirs?: string[];
 	nativeDir: string;
 	execDir: string;
@@ -55,5 +56,19 @@ export interface ResolveLoaderCandidatesInput {
 }
 
 export function resolveLoaderCandidates(input: ResolveLoaderCandidatesInput): string[];
+
+export interface LoadFromCandidatesInput<T> {
+	candidates: string[];
+	requireCandidate: (candidate: string) => T;
+	validateCandidate: (bindings: T, candidate: string) => void;
+	describeCandidate: (candidate: string) => string;
+}
+
+export interface LoadFromCandidatesResult<T> {
+	bindings: T | null;
+	errors: string[];
+}
+
+export function loadFromCandidates<T>(input: LoadFromCandidatesInput<T>): LoadFromCandidatesResult<T>;
 
 export function loadNative(): Record<string, unknown>;

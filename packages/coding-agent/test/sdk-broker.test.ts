@@ -22,7 +22,7 @@ import {
 	registerBrokerOwnerForTest,
 } from "../src/sdk/broker/ensure";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
-import { readSessionLifecycleLaunchRequest } from "../src/sdk/broker/lifecycle";
+import { deriveLifecycleDeadlines, readSessionLifecycleLaunchRequest } from "../src/sdk/broker/lifecycle";
 import { resolveSdkInternalSpawnCommand } from "../src/sdk/broker/runtime";
 import { SessionManager } from "../src/session/session-manager";
 import { FileSessionStorage } from "../src/session/session-storage";
@@ -58,6 +58,7 @@ it("SDK lifecycle model presets reach the session host parser", () => {
 
 			cwd: "/repo",
 			modelPreset: "codex-eco",
+			...deriveLifecycleDeadlines(Date.now(), 10_000),
 		}),
 	);
 	expect(lifecycleArgs(request, "/repo", "/agent").mpreset).toBe("codex-eco");

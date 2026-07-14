@@ -1,6 +1,9 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
+
 export type LifecycleState =
 	| "accepted"
 	| "effect_started"
@@ -18,7 +21,46 @@ export interface LifecycleWorktreeIntent {
 
 export interface LifecycleEffectIntent {
 	sessionId: string;
+	stateRoot: string;
+	childOwnershipEstablished?: boolean;
 	worktree?: LifecycleWorktreeIntent;
+}
+
+/** Durable lifecycle effects retained for exact replay; never implies rollback authority. */
+export interface LifecycleCleanupProof {
+	processExited: true;
+	endpointRemoved: true;
+	hostUnregistered:
+		| { state: "unregistered"; indexSeq: number; lifecycleRequestId?: string }
+		| { state: "not_registered" };
+	rollback: {
+		endpointGeneration: number | null;
+		fenced: true;
+		runtimeRemoved: true;
+		hostStopped: true;
+		brokerRegistrationReleased: true;
+	};
+}
+
+export interface LifecycleStartupFailureReceipt extends SdkStartupFailure {
+	artifactDigest: string;
+	rollback: SdkStartupRollbackResult;
+	cleanupProof?: LifecycleCleanupProof;
+}
+
+export interface LifecycleDurableEffectsReceipt {
+	worktree?: {
+		cwdDigest: string;
+		created: boolean;
+		reused: boolean;
+		branchDigest?: string;
+	};
+	transcript?: {
+		identityDigest: string;
+		contentDigest: string;
+	};
+	startup?: LifecycleStartupFailureReceipt;
+	digest?: string;
 }
 
 export interface LifecycleLedgerEntry {
@@ -30,6 +72,8 @@ export interface LifecycleLedgerEntry {
 	resultSessionId?: string;
 	effectMarker?: string;
 	effectIntent?: LifecycleEffectIntent;
+	durableEffects?: LifecycleDurableEffectsReceipt;
+	startupFailure?: LifecycleStartupFailureReceipt;
 
 	endpointGeneration?: number;
 	responseDigest?: string;
@@ -43,6 +87,29 @@ export type BeginResult =
 	| { kind: "terminal_uncertain"; entry: LifecycleLedgerEntry }
 	| { kind: "in_progress"; entry: LifecycleLedgerEntry };
 const terminal = (s: LifecycleState) => s === "terminal_ok" || s === "terminal_error";
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+}
+
+function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
+	if (!terminal(entry.state) && entry.state !== "terminal_uncertain") return true;
+	if (
+		(entry.state !== "terminal_uncertain" || entry.response !== undefined) &&
+		(entry.response === undefined ||
+			typeof entry.responseDigest !== "string" ||
+			entry.responseDigest !== createHash("sha256").update(canonicalJson(entry.response)).digest("hex"))
+	)
+		return false;
+	if (!entry.durableEffects) return true;
+	const { digest, ...body } = entry.durableEffects;
+	return typeof digest === "string" && digest === createHash("sha256").update(canonicalJson(body)).digest("hex");
+}
 export class LifecycleLedger {
 	#file: string;
 	#corruptFile: string;
@@ -57,6 +124,7 @@ export class LifecycleLedger {
 		await this.assertSupportedStateVersions();
 		await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
 		this.#entries = [];
+		const quarantinedTerminal = new Set<string>();
 		this.#byIdentity.clear();
 		this.#warnings = [];
 		const uncertainAfterCorruption = new Set<string>();
@@ -71,6 +139,20 @@ export class LifecycleLedger {
 					const e = JSON.parse(line) as LifecycleLedgerEntry;
 					assertSupportedStateVersion(this.#file, e);
 					if (!e.identity || !e.requestHash || !e.state) throw new Error("invalid ledger entry");
+					if (!hasValidTerminalDigests(e)) {
+						await this.#quarantine(line);
+						const {
+							response: _response,
+							responseDigest: _responseDigest,
+							durableEffects: _durableEffects,
+							...uncertain
+						} = e;
+						const quarantined = { ...uncertain, state: "terminal_uncertain" as const, ts: Date.now() };
+						this.#entries.push(quarantined);
+						this.#byIdentity.set(quarantined.identity, quarantined);
+						quarantinedTerminal.add(quarantined.identity);
+						continue;
+					}
 					this.#entries.push(e);
 					this.#byIdentity.set(e.identity, e);
 					uncertainAfterCorruption.delete(e.identity);
@@ -86,6 +168,10 @@ export class LifecycleLedger {
 			if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
 		}
 		if (tornTail) await this.#sealTornTail();
+		for (const identity of quarantinedTerminal) {
+			const entry = this.#byIdentity.get(identity);
+			if (entry) await this.#append(entry);
+		}
 		for (const identity of uncertainAfterCorruption) {
 			const entry = this.#byIdentity.get(identity);
 			if (entry && !terminal(entry.state) && entry.state !== "terminal_uncertain") {
@@ -160,7 +246,21 @@ export class LifecycleLedger {
 	): Promise<LifecycleLedgerEntry> {
 		const previous = this.#byIdentity.get(identity);
 		if (!previous) throw new Error("Unknown lifecycle identity");
-		return this.#append({ ...previous, ...fields, state, ts: Date.now() });
+		const next = { ...previous, ...fields, state, ts: Date.now() };
+		if (
+			(terminal(state) || state === "terminal_uncertain") &&
+			next.response !== undefined &&
+			next.responseDigest === undefined
+		)
+			next.responseDigest = createHash("sha256").update(canonicalJson(next.response)).digest("hex");
+		if (next.durableEffects && next.durableEffects.digest === undefined) {
+			const { digest: _digest, ...body } = next.durableEffects;
+			next.durableEffects = {
+				...body,
+				digest: createHash("sha256").update(canonicalJson(body)).digest("hex"),
+			};
+		}
+		return this.#append(next);
 	}
 	async assertSupportedStateVersions(): Promise<void> {
 		let source: string;

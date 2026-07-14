@@ -16,7 +16,11 @@ import {
 import { deriveIdempotencyIdentity } from "./identity";
 import { executeLifecycle, isCanonicalSessionId } from "./lifecycle";
 
-import { LifecycleLedger } from "./lifecycle-ledger";
+import {
+	type LifecycleDurableEffectsReceipt,
+	LifecycleLedger,
+	type LifecycleStartupFailureReceipt,
+} from "./lifecycle-ledger";
 import { type IndexedSession, SessionIndex } from "./session-index";
 import { BrokerTransport } from "./transport";
 
@@ -51,8 +55,15 @@ export type BrokerResponse =
 	| { ok: true; result?: unknown; indexSeq?: number }
 	| {
 			ok: false;
-			error: { code: BrokerErrorCode; message: string; cleanup?: BrokerCleanupEvidence };
+			error: {
+				code: BrokerErrorCode;
+				message: string;
+				endpoint?: "unavailable";
+				cleanup?: BrokerCleanupEvidence;
+			};
 			indexSeq?: number;
+			durableEffects?: LifecycleDurableEffectsReceipt;
+			startupFailure?: LifecycleStartupFailureReceipt;
 	  };
 const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({ ok: false, error: { code, message } });
 
@@ -257,6 +268,8 @@ type BrokerLockSnapshot = {
 	pid: number;
 	identity: string;
 };
+
+const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 
 export class Broker {
 	readonly settings: Required<BrokerSettings>;
@@ -567,21 +580,63 @@ export class Broker {
 			if (begun.kind === "idempotency_conflict")
 				return error("idempotency_conflict", "idempotency key was used with a different request");
 			if (begun.kind === "terminal_uncertain")
-				return error("terminal_uncertain", "prior lifecycle operation outcome is uncertain");
+				return begun.entry.response
+					? (begun.entry.response as BrokerResponse)
+					: error("terminal_uncertain", "prior lifecycle operation outcome is uncertain");
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
-			const response = await executeLifecycle(this, operation, input, identity);
-			await this.ledger.transition(identity, response.ok ? "terminal_ok" : "terminal_error", {
-				resultSessionId:
-					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
-						? (response.result as { sessionId: string }).sessionId
-						: undefined,
-				response: response,
-				responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
-			});
+			const outcome = await executeLifecycle(this, operation, input, identity);
+			const response = outcome.response;
+			await this.ledger.transition(
+				identity,
+				response.ok
+					? "terminal_ok"
+					: response.error.code === "terminal_uncertain"
+						? "terminal_uncertain"
+						: "terminal_error",
+				{
+					resultSessionId:
+						response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
+							? (response.result as { sessionId: string }).sessionId
+							: undefined,
+					response,
+					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
+					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
+				},
+			);
+			const reopenedLedger = await new LifecycleLedger(this.settings.agentDir).open();
+			const persisted = reopenedLedger.get(identity);
+			const expectedResponseDigest = createHash("sha256").update(canonicalJson(response)).digest("hex");
+			const persistenceVerified =
+				persisted?.responseDigest === expectedResponseDigest &&
+				canonicalJson(persisted.response) === canonicalJson(response) &&
+				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
+				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
+			if (!persistenceVerified) {
+				const uncertain = error(
+					"terminal_uncertain",
+					"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
+				);
+				await this.ledger.transition(identity, "terminal_uncertain", {
+					response: uncertain,
+					responseDigest: createHash("sha256").update(canonicalJson(uncertain)).digest("hex"),
+					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
+					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
+				});
+				return uncertain;
+			}
+			terminalPersistenceHooksForTest.get(this)?.();
+			await outcome.deferredArtifactCleanup?.();
 			return response;
 		} finally {
 			release();
 			if (this.#chains.get(target) === current) this.#chains.delete(target);
 		}
 	}
+}
+
+/** Test-only hook for simulating a process crash after terminal persistence verification. */
+export function setTerminalPersistenceHookForTest(broker: Broker, hook: (() => void) | undefined): void {
+	if (hook) terminalPersistenceHooksForTest.set(broker, hook);
+	else terminalPersistenceHooksForTest.delete(broker);
 }

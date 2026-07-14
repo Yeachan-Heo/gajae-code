@@ -42,6 +42,10 @@ describe("SDK package exports", () => {
 	it.each([
 		"@gajae-code/coding-agent/sdk/models",
 		"@gajae-code/coding-agent/sdk/models.js",
+		"@gajae-code/coding-agent/sdk/lifecycle-session",
+		"@gajae-code/coding-agent/sdk/lifecycle-session.js",
+		"@gajae-code/coding-agent/sdk/startup-capability",
+		"@gajae-code/coding-agent/sdk/startup-capability.js",
 	])("rejects resolution of the private %s subpath", async subpath => {
 		const child = Bun.spawn([process.execPath, "-e", `await import(${JSON.stringify(subpath)})`], {
 			cwd: import.meta.dir,
@@ -60,8 +64,15 @@ describe("SDK package exports", () => {
 		expect(output).toContain(subpath);
 	});
 
-	it("exports Q10 DTO types only from the SDK root", () => {
-		expect(packageJson.exports["./sdk/models"]).toBeNull();
-		expect(packageJson.exports["./sdk/models.js"]).toBeNull();
+	it("keeps internal SDK modules off the public package surface", () => {
+		for (const subpath of [
+			"./sdk/models",
+			"./sdk/models.js",
+			"./sdk/lifecycle-session",
+			"./sdk/lifecycle-session.js",
+			"./sdk/startup-capability",
+			"./sdk/startup-capability.js",
+		] as const)
+			expect(packageJson.exports[subpath]).toBeNull();
 	});
 });

@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,6 +21,14 @@ import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import { SessionSdkHost } from "../src/sdk/host";
+import {
+	attachLifecycleStartupCapability,
+	normalizeSdkStartupFailure,
+	SdkStartupCapability,
+	SdkStartupRollbackTracker,
+	sanitizeSdkStartupMessage,
+} from "../src/sdk/startup-capability";
+
 import type {
 	ClientBridgePermissionOption,
 	ClientBridgePermissionOutcome,
@@ -39,6 +47,9 @@ afterEach(() => {
 	for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 	delete process.env.GJC_SDK_DISABLE;
 	delete process.env.GJC_NOTIFICATIONS;
+	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
+	delete process.env.GJC_LIFECYCLE_TEST_SECRET;
+	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
 });
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
@@ -55,28 +66,31 @@ function start(
 	sendUserMessage: ExtensionActions["sendUserMessage"] = () => {},
 	forwardPreflightCallbacks = false,
 	commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>(),
+	lifecycle?: { startupCapability: SdkStartupCapability; lifecycleRequired: true },
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
-	createNotificationsExtension(
-		{
-			on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
-			registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
-				commands.set(name, command),
-			getThinkingLevel: () =>
-				typeof ctx.getThinkingLevel === "function" ? (ctx.getThinkingLevel as () => unknown)() : undefined,
-			sendUserMessage: (
-				content: Parameters<ExtensionActions["sendUserMessage"]>[0],
-				options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
-			) => {
-				if (forwardPreflightCallbacks) return Promise.resolve(sendUserMessage(content, options));
-				const { onPreflightAccepted, ...delivery } = options ?? {};
-				const submission = sendUserMessage(content, Object.keys(delivery).length > 0 ? delivery : undefined);
-				onPreflightAccepted?.();
-				return Promise.resolve(submission);
-			},
-		} as never,
-		settings ? { settings } : undefined,
-	);
+	const api = {
+		on: (event: string, handler: (event: unknown, context: unknown) => unknown) => handlers.set(event, handler),
+		registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
+			commands.set(name, command),
+		getThinkingLevel: () =>
+			typeof ctx.getThinkingLevel === "function" ? (ctx.getThinkingLevel as () => unknown)() : undefined,
+		sendUserMessage: (
+			content: Parameters<ExtensionActions["sendUserMessage"]>[0],
+			options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
+		) => {
+			if (forwardPreflightCallbacks) return Promise.resolve(sendUserMessage(content, options));
+			const { onPreflightAccepted, ...delivery } = options ?? {};
+			const submission = sendUserMessage(content, Object.keys(delivery).length > 0 ? delivery : undefined);
+			onPreflightAccepted?.();
+			return Promise.resolve(submission);
+		},
+	} as never;
+	if (lifecycle) attachLifecycleStartupCapability(api, lifecycle.startupCapability);
+	const effectiveSettings =
+		settings ??
+		(lifecycle ? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings) : undefined);
+	createNotificationsExtension(api, effectiveSettings ? { settings: effectiveSettings } : undefined);
 	void handlers.get("session_start")?.({ type: "session_start" }, ctx);
 	return handlers;
 }
@@ -171,6 +185,158 @@ function context(
 		clearContext: async () => true,
 	};
 }
+
+test("lifecycle startup production secret collection redacts before normalization and truncation", () => {
+	const bare = "bare-secret-value";
+	const overlap = "bare-secret-value-plus";
+	const nfkc = "secret０";
+	const names = ["GJC_LIFECYCLE_TEST_TOKEN", "GJC_LIFECYCLE_TEST_SECRET", "GJC_LIFECYCLE_TEST_API_KEY"] as const;
+	const previous = names.map(name => process.env[name]);
+	try {
+		process.env.GJC_LIFECYCLE_TEST_TOKEN = bare;
+		process.env.GJC_LIFECYCLE_TEST_SECRET = overlap;
+		process.env.GJC_LIFECYCLE_TEST_API_KEY = nfkc;
+		const failure = new SdkStartupCapability().normalizeFailure(
+			"startup",
+			"failed",
+			new Error(`${overlap} ${nfkc.normalize("NFKC")} ${"x".repeat(600)}`),
+		);
+		expect(failure.message).not.toContain(bare);
+		expect(failure.message).not.toContain(overlap);
+		expect(failure.message).not.toContain(nfkc.normalize("NFKC"));
+		expect(failure.message).toContain("[redacted-secret]");
+		expect(new TextEncoder().encode(failure.message).byteLength).toBeLessThanOrEqual(512);
+	} finally {
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+	}
+});
+
+test("lifecycle SDK startup capability settles once and sanitizes public failure details", async () => {
+	const capability = new SdkStartupCapability();
+	const secret = "token=top-secret";
+	const unsafe = new Error(`\u0000 https://example.test/bootstrap?${secret} bearer credential\n${"x".repeat(600)}`);
+	const failure = normalizeSdkStartupFailure("startup", "failed", unsafe);
+
+	expect(sanitizeSdkStartupMessage(unsafe)).toBe(failure.message);
+	expect(failure).toMatchObject({ phase: "startup", reason: "failed" });
+	expect(failure.message).toContain("[redacted-url]");
+	expect(failure.message).toContain("[redacted-secret]");
+	expect(failure.message).not.toContain("top-secret");
+	expect(failure.message).not.toContain("credential");
+	expect(new TextEncoder().encode(failure.message).byteLength).toBeLessThanOrEqual(512);
+
+	expect(capability.settleFailure(failure)).toEqual({ status: "failed", failure });
+	expect(capability.settleStarted()).toEqual({ status: "failed", failure });
+	expect(capability.result).toEqual({ status: "failed", failure });
+	expect(await capability.promise).toEqual({ status: "failed", failure });
+	const started = new SdkStartupCapability();
+	expect(started.settleStarted()).toEqual({ status: "started" });
+	expect(started.settleFailure(failure)).toEqual({ status: "started" });
+	expect(await started.promise).toEqual({ status: "started" });
+});
+
+test("lifecycle teardown records failed host and server cleanup as false", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-proof-"));
+	dirs.push(cwd);
+	const sessionId = `cleanup-proof-${Date.now()}`;
+	const tracker = new SdkStartupRollbackTracker();
+	const capability = new SdkStartupCapability(tracker);
+	const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
+	const nativeStop = (NotificationServer.prototype as unknown as { stop: () => void }).stop;
+	(NotificationServer.prototype as unknown as { stop: () => void }).stop = () => {
+		throw new Error("server stop failed");
+	};
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), {
+			startupCapability: capability,
+			lifecycleRequired: true,
+		});
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(tracker.result).toEqual({
+			endpointGeneration: 1,
+			fenced: false,
+			runtimeRemoved: true,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		});
+	} finally {
+		stop.mockRestore();
+		(NotificationServer.prototype as unknown as { stop: () => void }).stop = nativeStop;
+	}
+});
+
+test("lifecycle session shutdown disposes the exact endpoint once", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-once-"));
+	dirs.push(cwd);
+	const sessionId = `cleanup-once-${Date.now()}`;
+	const tracker = new SdkStartupRollbackTracker();
+	const capability = new SdkStartupCapability(tracker);
+	const stop = spyOn(SessionSdkHost.prototype, "stop");
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), {
+			startupCapability: capability,
+			lifecycleRequired: true,
+		});
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(stop).toHaveBeenCalledTimes(1);
+		expect(tracker.result.fenced).toBe(true);
+	} finally {
+		stop.mockRestore();
+	}
+});
+
+test("lifecycle rollback proof only fences the exact started endpoint generation", () => {
+	const tracker = new SdkStartupRollbackTracker();
+	tracker.recordGeneration(7);
+	tracker.recordStop(8, { runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true });
+	expect(tracker.result).toEqual({
+		endpointGeneration: 7,
+		fenced: false,
+		runtimeRemoved: false,
+		hostStopped: false,
+		brokerRegistrationReleased: false,
+	});
+	tracker.recordStop(7, { runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true });
+	expect(tracker.result).toEqual({
+		endpointGeneration: 7,
+		fenced: true,
+		runtimeRemoved: true,
+		hostStopped: true,
+		brokerRegistrationReleased: true,
+	});
+});
+
+test("lifecycle startup settles failure when native callback registration throws before host start", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prestart-failure-"));
+	dirs.push(cwd);
+	const sessionId = "prestart-failure";
+	const capability = new SdkStartupCapability();
+	const hook = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(() => {
+		throw new Error("token=prestart-secret");
+	});
+	try {
+		start(context(cwd, sessionId), undefined, () => {}, false, new Map(), {
+			startupCapability: capability,
+			lifecycleRequired: true,
+		});
+		const result = await capability.promise;
+		expect(result.status).toBe("failed");
+		if (result.status !== "failed") throw new Error("Expected lifecycle startup failure.");
+		expect(result.failure.message).toContain("[redacted-secret]");
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).toBe(false);
+	} finally {
+		hook.mockRestore();
+	}
+});
 
 test("SDK broker registration records an absolute lifecycle scope", async () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-locator-"));
@@ -456,12 +622,15 @@ test("/notify on fences teardown and permits a later same-ID replacement runtime
 		const enabling = commands.get("notify")!.handler("on", sessionContext);
 		await startReached.promise;
 		const shuttingDown = handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(
+			await Promise.race([Promise.resolve(shuttingDown).then(() => true), Bun.sleep(100).then(() => false)]),
+		).toBe(true);
 		allowStart.resolve();
-		await Promise.all([enabling, shuttingDown]);
+		await enabling;
 		expect(messages).toEqual([
 			{
-				message: "Notifications were not enabled because the active session changed during startup.",
-				level: "warning",
+				message: "Notifications failed to start for this session.",
+				level: "error",
 			},
 		]);
 		expect(getAskAnswerSource(sessionId)).toBeUndefined();

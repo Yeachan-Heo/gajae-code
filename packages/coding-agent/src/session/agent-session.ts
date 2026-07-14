@@ -442,6 +442,7 @@ export interface AgentSessionConfig {
 	slashCommands?: FileSlashCommand[];
 	/** Extension runner (created in main.ts with wrapped tools) */
 	extensionRunner?: ExtensionRunner;
+
 	/** Loaded skills (already discovered by SDK) */
 	skills?: Skill[];
 	/** Skill loading warnings (already captured by SDK) */
@@ -1390,6 +1391,7 @@ export class AgentSession {
 	#isDisposed = false;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
+
 	#turnIndex = 0;
 	#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(async () => {
 		await requestGjcWorkerIntegrationAttempt(this.sessionManager.getCwd(), process.env).catch(error => {

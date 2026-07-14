@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { getSessionsDir, resolveEquivalentPath } from "@gajae-code/utils";
@@ -18,9 +19,17 @@ import {
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
 import { SdkClient, SdkClientError } from "../client/client";
+import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
+
 import type { Broker, BrokerCleanupEvidence, BrokerResponse } from "./broker";
 
-import type { LifecycleEffectIntent, LifecycleWorktreeIntent } from "./lifecycle-ledger";
+import type {
+	LifecycleCleanupProof,
+	LifecycleDurableEffectsReceipt,
+	LifecycleEffectIntent,
+	LifecycleStartupFailureReceipt,
+	LifecycleWorktreeIntent,
+} from "./lifecycle-ledger";
 import {
 	type ProcessIncarnationCommandRunner,
 	type ProcessIncarnationOptions,
@@ -37,9 +46,97 @@ export {
 };
 
 const READY_TIMEOUT_MS = 10_000;
+const MIN_READY_TIMEOUT_MS = 4_000;
 const MAX_READY_TIMEOUT_MS = 60_000;
 const POLL_MS = 50;
 const CLOSE_TIMEOUT_MS = 2_000;
+const MAX_RECEIVED_AT_SKEW_MS = 5_000;
+
+export interface LifecycleDeadlines {
+	receivedAt: number;
+	requestedReadinessTimeoutMs: number;
+	semanticReadyDeadlineAt: number;
+	terminationStartDeadlineAt: number;
+	lifecycleCleanupDeadlineAt: number;
+}
+
+export function deriveLifecycleDeadlines(receivedAt: number, requestedReadinessTimeoutMs: number): LifecycleDeadlines {
+	if (
+		!Number.isSafeInteger(receivedAt) ||
+		!Number.isSafeInteger(requestedReadinessTimeoutMs) ||
+		requestedReadinessTimeoutMs < MIN_READY_TIMEOUT_MS ||
+		requestedReadinessTimeoutMs > MAX_READY_TIMEOUT_MS
+	)
+		throw new Error("Lifecycle timing values must be safe integers in the approved readiness range.");
+	const phaseWindowMs = Math.min(1_000, Math.max(500, Math.floor(requestedReadinessTimeoutMs / 4)));
+	const lifecycleCleanupDeadlineAt = receivedAt + requestedReadinessTimeoutMs;
+	const semanticReadyDeadlineAt = lifecycleCleanupDeadlineAt - phaseWindowMs * 2;
+	const terminationStartDeadlineAt = lifecycleCleanupDeadlineAt - phaseWindowMs;
+	if (
+		!Number.isSafeInteger(phaseWindowMs) ||
+		!Number.isSafeInteger(lifecycleCleanupDeadlineAt) ||
+		!Number.isSafeInteger(semanticReadyDeadlineAt) ||
+		!Number.isSafeInteger(terminationStartDeadlineAt)
+	)
+		throw new Error("Lifecycle timing values overflow the safe integer range.");
+	return {
+		receivedAt,
+		requestedReadinessTimeoutMs,
+		semanticReadyDeadlineAt,
+		terminationStartDeadlineAt,
+		lifecycleCleanupDeadlineAt,
+	};
+}
+
+export interface LifecycleTiming {
+	now(): number;
+	sleep(ms: number): Promise<void>;
+}
+
+const defaultLifecycleTiming: LifecycleTiming = {
+	now: Date.now,
+	sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+};
+const lifecycleTimingsForTest = new WeakMap<Broker, LifecycleTiming>();
+
+export function setLifecycleTimingForTest(broker: Broker, timing: LifecycleTiming | undefined): void {
+	if (timing) lifecycleTimingsForTest.set(broker, timing);
+	else lifecycleTimingsForTest.delete(broker);
+}
+
+function lifecycleTiming(broker: Broker): LifecycleTiming {
+	return lifecycleTimingsForTest.get(broker) ?? defaultLifecycleTiming;
+}
+
+export function hasValidLifecycleDeadlines(value: LifecycleDeadlines, now = Date.now()): boolean {
+	const {
+		receivedAt,
+		requestedReadinessTimeoutMs,
+		semanticReadyDeadlineAt,
+		terminationStartDeadlineAt,
+		lifecycleCleanupDeadlineAt,
+	} = value;
+	if (
+		!Number.isSafeInteger(receivedAt) ||
+		!Number.isSafeInteger(requestedReadinessTimeoutMs) ||
+		!Number.isSafeInteger(semanticReadyDeadlineAt) ||
+		!Number.isSafeInteger(terminationStartDeadlineAt) ||
+		!Number.isSafeInteger(lifecycleCleanupDeadlineAt) ||
+		!Number.isSafeInteger(now) ||
+		(receivedAt > now && receivedAt - now > MAX_RECEIVED_AT_SKEW_MS)
+	)
+		return false;
+	try {
+		const expected = deriveLifecycleDeadlines(receivedAt, requestedReadinessTimeoutMs);
+		return (
+			semanticReadyDeadlineAt === expected.semanticReadyDeadlineAt &&
+			terminationStartDeadlineAt === expected.terminationStartDeadlineAt &&
+			lifecycleCleanupDeadlineAt === expected.lifecycleCleanupDeadlineAt
+		);
+	} catch {
+		return false;
+	}
+}
 type Input = Record<string, unknown>;
 export const isCanonicalSessionId = (value: string): boolean => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 const defaultStateRoot = (cwd: string) => path.join(path.resolve(cwd), ".gjc", "state");
@@ -81,6 +178,11 @@ export interface SessionLifecycleLaunchRequest {
 	effectMarker?: string;
 	modelPreset?: string;
 	worktree?: SessionLifecycleWorktreeTarget;
+	receivedAt: number;
+	requestedReadinessTimeoutMs: number;
+	semanticReadyDeadlineAt: number;
+	terminationStartDeadlineAt: number;
+	lifecycleCleanupDeadlineAt: number;
 }
 
 function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionLifecycleTranscriptIdentity {
@@ -106,7 +208,10 @@ function hasValidTranscriptAuthority(path: unknown, identity: unknown): path is 
 	return typeof path === "string" && path.length > 0 && isSessionLifecycleTranscriptIdentity(identity);
 }
 
-export function readSessionLifecycleLaunchRequest(value: string | undefined): SessionLifecycleLaunchRequest {
+export function readSessionLifecycleLaunchRequest(
+	value: string | undefined,
+	now = Date.now(),
+): SessionLifecycleLaunchRequest {
 	if (!value) throw new Error("GJC_SDK_LIFECYCLE_REQUEST is required.");
 	const request = JSON.parse(value) as Partial<SessionLifecycleLaunchRequest>;
 	if (
@@ -133,6 +238,16 @@ export function readSessionLifecycleLaunchRequest(value: string | undefined): Se
 		(request.effectMarker !== undefined &&
 			(typeof request.effectMarker !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(request.effectMarker))) ||
 		(request.modelPreset !== undefined && (typeof request.modelPreset !== "string" || !request.modelPreset)) ||
+		!hasValidLifecycleDeadlines(
+			{
+				receivedAt: request.receivedAt as number,
+				requestedReadinessTimeoutMs: request.requestedReadinessTimeoutMs as number,
+				semanticReadyDeadlineAt: request.semanticReadyDeadlineAt as number,
+				terminationStartDeadlineAt: request.terminationStartDeadlineAt as number,
+				lifecycleCleanupDeadlineAt: request.lifecycleCleanupDeadlineAt as number,
+			},
+			now,
+		) ||
 		(request.worktree !== undefined && !isLifecycleWorktreeTarget(request.worktree)) ||
 		(request.operation === "session.resume" &&
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
@@ -172,9 +287,43 @@ function text(value: unknown): string | undefined {
 function readinessTimeout(input: Input): number | BrokerResponse {
 	const value = input.readinessTimeoutMs;
 	if (value === undefined) return READY_TIMEOUT_MS;
-	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > MAX_READY_TIMEOUT_MS)
-		return fail("invalid_input", `readinessTimeoutMs must be an integer between 1 and ${MAX_READY_TIMEOUT_MS}.`);
+	if (
+		typeof value !== "number" ||
+		!Number.isSafeInteger(value) ||
+		value < MIN_READY_TIMEOUT_MS ||
+		value > MAX_READY_TIMEOUT_MS
+	)
+		return fail(
+			"invalid_input",
+			`readinessTimeoutMs must be an integer between ${MIN_READY_TIMEOUT_MS} and ${MAX_READY_TIMEOUT_MS}.`,
+		);
 	return value;
+}
+
+function lifecycleDeadlines(input: Input, now: number): LifecycleDeadlines | BrokerResponse {
+	const supplied = [
+		input.receivedAt,
+		input.requestedReadinessTimeoutMs,
+		input.semanticReadyDeadlineAt,
+		input.terminationStartDeadlineAt,
+		input.lifecycleCleanupDeadlineAt,
+	];
+	if (supplied.some(value => value !== undefined)) {
+		if (!supplied.every(value => typeof value === "number" && Number.isSafeInteger(value)))
+			return fail("invalid_input", "Lifecycle deadline fields must be supplied together as safe integers.");
+		const value: LifecycleDeadlines = {
+			receivedAt: input.receivedAt as number,
+			requestedReadinessTimeoutMs: input.requestedReadinessTimeoutMs as number,
+			semanticReadyDeadlineAt: input.semanticReadyDeadlineAt as number,
+			terminationStartDeadlineAt: input.terminationStartDeadlineAt as number,
+			lifecycleCleanupDeadlineAt: input.lifecycleCleanupDeadlineAt as number,
+		};
+		return hasValidLifecycleDeadlines(value, now)
+			? value
+			: fail("invalid_input", "Lifecycle deadlines do not satisfy the exact approved timing contract.");
+	}
+	const timeout = readinessTimeout(input);
+	return typeof timeout === "number" ? deriveLifecycleDeadlines(now, timeout) : timeout;
 }
 function sessionId(input: Input): string | undefined {
 	return text(input.sessionId) ?? text(input.id);
@@ -385,9 +534,10 @@ function command(): { file: string; args: string[] } {
 	return resolveSdkInternalSpawnCommand("session-host-internal");
 }
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const lifecycleMarkerPath = (root: string, id: string) => path.join(root, "sdk", `${id}.lifecycle.json`);
 const lifecycleReadyPath = (root: string, id: string) => path.join(root, "sdk", `${id}.lifecycle.ready.json`);
+const lifecycleFailurePath = (root: string, id: string, effectMarker: string) =>
+	path.join(root, "sdk", `${id}.lifecycle.failure.${effectMarker}.json`);
 type EffectMarker = { pid: number; effectMarker: string; incarnation: string };
 type ReadyAuthority = {
 	endpoint: Record<string, unknown>;
@@ -395,7 +545,11 @@ type ReadyAuthority = {
 	endpointMtimeMs: number;
 	endpointGeneration: number;
 };
-type ReadinessResult = { kind: "ready"; authority: ReadyAuthority } | { kind: "child_exited" } | { kind: "timeout" };
+type ReadinessResult =
+	| { kind: "ready"; authority: ReadyAuthority }
+	| { kind: "startup_failed"; message: string }
+	| { kind: "child_exited" }
+	| { kind: "timeout" };
 const processIncarnationReadersForTest = new WeakMap<Broker, (pid: number) => string | undefined>();
 
 export function setProcessIncarnationForTest(
@@ -470,8 +624,26 @@ async function readEffectMarker(file: string): Promise<EffectMarker | undefined>
 }
 
 async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
-	await fs.mkdir(path.join(root, "sdk"), { recursive: true, mode: 0o700 });
-	await fs.writeFile(lifecycleMarkerPath(root, id), JSON.stringify(marker), { mode: 0o600 });
+	const directory = path.join(root, "sdk");
+	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const temporary = path.join(directory, `.${id}.lifecycle.${randomUUID()}.tmp`);
+	const handle = await fs.open(
+		temporary,
+		fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+		0o600,
+	);
+	try {
+		await handle.writeFile(canonicalJson(marker));
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	try {
+		await fs.rename(temporary, lifecycleMarkerPath(root, id));
+		await syncDirectory(directory);
+	} finally {
+		await fs.rm(temporary, { force: true });
+	}
 }
 
 /** The child writes this only after its endpoint and semantic ready event are both live. */
@@ -482,6 +654,187 @@ export async function writeSessionLifecycleReady(root: string, id: string, effec
 	await fs.writeFile(lifecycleReadyPath(root, id), JSON.stringify({ pid: process.pid, effectMarker, incarnation }), {
 		mode: 0o600,
 	});
+}
+
+export interface LifecycleTranscriptEvidence {
+	digest: string;
+	identity: SessionLifecycleTranscriptIdentity;
+}
+
+type LifecycleFailureArtifact = EffectMarker &
+	SdkStartupFailure & {
+		rollback: SdkStartupRollbackResult;
+		transcript?: LifecycleTranscriptEvidence;
+	};
+
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+}
+
+function isRollbackResult(value: unknown): value is SdkStartupRollbackResult {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	return (
+		Object.keys(record).length === 5 &&
+		(record.endpointGeneration === null ||
+			(typeof record.endpointGeneration === "number" &&
+				Number.isSafeInteger(record.endpointGeneration) &&
+				record.endpointGeneration > 0)) &&
+		typeof record.fenced === "boolean" &&
+		typeof record.runtimeRemoved === "boolean" &&
+		typeof record.hostStopped === "boolean" &&
+		typeof record.brokerRegistrationReleased === "boolean"
+	);
+}
+
+function isLifecycleTranscriptEvidence(value: unknown): value is LifecycleTranscriptEvidence {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	return (
+		Object.keys(record).length === 2 &&
+		typeof record.digest === "string" &&
+		/^[a-f0-9]{64}$/.test(record.digest) &&
+		isSessionLifecycleTranscriptIdentity(record.identity)
+	);
+}
+
+function isSdkStartupFailure(value: unknown): value is SdkStartupFailure {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const failure = value as Record<string, unknown>;
+	return (
+		Object.keys(failure).length === 3 &&
+		(failure.phase === "registration" || failure.phase === "startup") &&
+		(failure.reason === "disabled" ||
+			failure.reason === "ineligible" ||
+			failure.reason === "factory_absent" ||
+			failure.reason === "runner_absent" ||
+			failure.reason === "pending" ||
+			failure.reason === "failed") &&
+		typeof failure.message === "string" &&
+		Buffer.byteLength(failure.message) > 0 &&
+		Buffer.byteLength(failure.message) <= 512
+	);
+}
+
+function isLifecycleFailureArtifact(value: unknown): value is LifecycleFailureArtifact {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	if (!isEffectMarker(record)) return false;
+	const artifact = value as LifecycleFailureArtifact;
+	return (
+		Object.keys(record).length === (artifact.transcript === undefined ? 7 : 8) &&
+		isSdkStartupFailure({ phase: artifact.phase, reason: artifact.reason, message: artifact.message }) &&
+		isRollbackResult(artifact.rollback) &&
+		(artifact.transcript === undefined || isLifecycleTranscriptEvidence(artifact.transcript))
+	);
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+	const handle = await fs.open(directory, fsSync.constants.O_RDONLY);
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
+
+/** The child writes bounded startup diagnostics before exiting without readiness. */
+export async function writeSessionLifecycleFailure(
+	root: string,
+	id: string,
+	effectMarker: string,
+	failure: SdkStartupFailure,
+	rollback: SdkStartupRollbackResult,
+	transcript?: LifecycleTranscriptEvidence,
+	ownerIncarnation?: string,
+): Promise<void> {
+	if (!isSdkStartupFailure(failure))
+		throw new Error("Lifecycle startup failure does not satisfy the canonical failure contract.");
+
+	const incarnation = ownerIncarnation ?? processIncarnation(process.pid);
+	if (!incarnation) return;
+	const directory = path.join(root, "sdk");
+	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	await fs.chmod(directory, 0o700);
+	const artifact: LifecycleFailureArtifact = {
+		pid: process.pid,
+		effectMarker,
+		incarnation,
+		...failure,
+		rollback,
+		...(transcript ? { transcript } : {}),
+	};
+	const bytes = Buffer.from(canonicalJson(artifact), "utf8");
+	const target = lifecycleFailurePath(root, id, effectMarker);
+	const temporary = path.join(directory, `.${id}.lifecycle.failure.${effectMarker}.${randomUUID()}.tmp`);
+	let published = false;
+	try {
+		const handle = await fs.open(
+			temporary,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+			0o600,
+		);
+		try {
+			await handle.writeFile(bytes);
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		try {
+			await fs.link(temporary, target);
+			published = true;
+		} catch (writeError) {
+			if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") throw writeError;
+			const existing = await readLifecycleFailureArtifact(target, artifact);
+			if (!existing?.bytes.equals(bytes)) throw new Error("Lifecycle startup failure artifact collision.");
+		}
+	} finally {
+		await fs.rm(temporary, { force: true });
+		if (published) await syncDirectory(directory);
+	}
+}
+
+async function readLifecycleFailureArtifact(
+	file: string,
+	expected: EffectMarker,
+): Promise<{ artifact: LifecycleFailureArtifact; bytes: Buffer; digest: string } | undefined> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const stat = await handle.stat();
+		if (!stat.isFile() || stat.size > 4096) return undefined;
+		const bytes = Buffer.alloc(stat.size + 1);
+		const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+		if (bytesRead > 4096) return undefined;
+		const raw = bytes.subarray(0, bytesRead);
+		const value: unknown = JSON.parse(raw.toString("utf8"));
+		if (
+			!isLifecycleFailureArtifact(value) ||
+			!sameEffectMarker(value, expected) ||
+			canonicalJson(value) !== raw.toString("utf8")
+		)
+			return undefined;
+		return { artifact: value, bytes: raw, digest: createHash("sha256").update(raw).digest("hex") };
+	} catch {
+		return undefined;
+	} finally {
+		if (handle) await handle.close();
+	}
+}
+
+async function readSessionLifecycleFailure(
+	root: string,
+	id: string,
+	expected: EffectMarker,
+): Promise<LifecycleFailureArtifact | undefined> {
+	return (await readLifecycleFailureArtifact(lifecycleFailurePath(root, id, expected.effectMarker), expected))
+		?.artifact;
 }
 
 async function hasDurableProcessIdentity(
@@ -518,25 +871,26 @@ async function hasOwnedReadinessEvidence(
 	);
 }
 
-async function removeOwnedLifecycleArtifacts(root: string, id: string, expected: EffectMarker): Promise<void> {
-	if (
-		!(await readEffectMarker(lifecycleMarkerPath(root, id)).then(
-			marker => marker && sameEffectMarker(marker, expected),
-		))
-	)
-		return;
+async function removeOwnedLifecycleArtifacts(root: string, id: string, expected: EffectMarker): Promise<boolean> {
+	const marker = await readEffectMarker(lifecycleMarkerPath(root, id));
+	if (!marker || !sameEffectMarker(marker, expected)) return false;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
 	try {
 		const endpoint = JSON.parse(await fs.readFile(endpointPath, "utf8")) as { pid?: unknown };
-		if (endpoint.pid === expected.pid && hasObservedProcessExit(expected.pid))
-			await fs.rm(endpointPath, { force: true });
-	} catch {}
-	if (
-		await readEffectMarker(lifecycleMarkerPath(root, id)).then(marker => marker && sameEffectMarker(marker, expected))
-	) {
-		await fs.rm(lifecycleReadyPath(root, id), { force: true });
-		await fs.rm(lifecycleMarkerPath(root, id), { force: true });
+		if (endpoint.pid !== expected.pid || !hasObservedProcessExit(expected.pid)) return false;
+		await fs.rm(endpointPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
 	}
+	if (!(await endpointRemoved(root, id))) return false;
+	const currentMarker = await readEffectMarker(lifecycleMarkerPath(root, id));
+	if (!currentMarker || !sameEffectMarker(currentMarker, expected)) return false;
+	try {
+		await fs.rm(lifecycleReadyPath(root, id), { force: true });
+	} catch {
+		return false;
+	}
+	return true;
 }
 
 async function recordTerminalUncertain(broker: Broker, id: string, root: string, pid: number): Promise<void> {
@@ -562,31 +916,43 @@ async function recordTerminalUncertain(broker: Broker, id: string, root: string,
 		});
 }
 
+async function waitUntil(timing: LifecycleTiming, deadline: number): Promise<void> {
+	while (timing.now() < deadline) await timing.sleep(Math.max(0, Math.min(POLL_MS, deadline - timing.now())));
+}
+
 async function terminateSpawnedChild(
 	child: ChildProcess,
 	broker: Broker,
 	id: string,
 	root: string,
 	deadline: number,
-	expected?: EffectMarker,
+	terminationStartDeadlineAt: number,
+	expected: EffectMarker | undefined,
+	timing: LifecycleTiming,
 ): Promise<boolean> {
 	const pid = child.pid;
 	if (!pid || (expected && pid !== expected.pid)) return false;
 	const incarnation = expected?.incarnation ?? processIncarnationForBroker(broker, pid);
+	await broker.index.refresh();
 	const observe = (): ProcessObservation =>
 		child.exitCode !== null
 			? "exited"
 			: observeProcess(pid, incarnation, value => processIncarnationForBroker(broker, value));
 	const waitForExit = async (until: number): Promise<ProcessObservation> => {
 		let observation = observe();
-		while (observation !== "exited" && Date.now() < until) {
-			await sleep(Math.max(0, Math.min(POLL_MS, until - Date.now())));
+		while (observation !== "exited" && timing.now() < until) {
+			await timing.sleep(Math.max(0, Math.min(POLL_MS, until - timing.now())));
 			observation = observe();
 		}
+
 		return observation;
 	};
 
 	let observation = observe();
+	if (observation === "alive") {
+		await waitUntil(timing, terminationStartDeadlineAt);
+		observation = observe();
+	}
 	if (observation === "alive") {
 		if (!(await signalVerifiedSession({ locator: { stateRoot: root }, pid }, id, "SIGTERM", expected))) {
 			observation = observe();
@@ -595,8 +961,8 @@ async function terminateSpawnedChild(
 				return false;
 			}
 		} else {
-			const remaining = Math.max(0, deadline - Date.now());
-			const gracefulDeadline = Date.now() + Math.min(CLOSE_TIMEOUT_MS, Math.floor(remaining / 2));
+			const remaining = Math.max(0, deadline - timing.now());
+			const gracefulDeadline = timing.now() + Math.min(CLOSE_TIMEOUT_MS, Math.floor(remaining / 2));
 			observation = await waitForExit(gracefulDeadline);
 		}
 	}
@@ -615,18 +981,46 @@ async function terminateSpawnedChild(
 		await recordTerminalUncertain(broker, id, root, pid);
 		return false;
 	}
-	if (expected) await removeOwnedLifecycleArtifacts(root, id, expected);
+	let rollbackGeneration: number | null | undefined;
+	if (expected) {
+		const failure = await readLifecycleFailureArtifact(
+			lifecycleFailurePath(root, id, expected.effectMarker),
+			expected,
+		);
+		if (
+			!failure?.artifact.rollback.fenced ||
+			!failure.artifact.rollback.runtimeRemoved ||
+			!failure.artifact.rollback.hostStopped ||
+			!failure.artifact.rollback.brokerRegistrationReleased
+		) {
+			await recordTerminalUncertain(broker, id, root, pid);
+			return false;
+		}
+		rollbackGeneration = failure.artifact.rollback.endpointGeneration;
+	}
+	if (expected && !(await removeOwnedLifecycleArtifacts(root, id, expected))) {
+		await recordTerminalUncertain(broker, id, root, pid);
+		return false;
+	}
 	await broker.index.refresh();
-	const registered = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	if (registered?.pid === pid && hasObservedProcessExit(pid))
-		await broker.index.append({
-			type: "session_closed",
-			sessionId: id,
-			locator: registered.locator,
-			endpointGeneration: registered.endpointGeneration,
-			pid: registered.pid,
-		});
-	return true;
+	if (
+		rollbackGeneration === null &&
+		expected &&
+		!broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker)
+	)
+		return endpointRemoved(root, id);
+	const registeredBeforeTermination =
+		rollbackGeneration === undefined || rollbackGeneration === null
+			? undefined
+			: broker.index.findHostRegistration(id, rollbackGeneration, pid, expected?.effectMarker);
+	const unregistered = registeredBeforeTermination
+		? broker.index.hostUnregisteredAfter(registeredBeforeTermination)
+		: undefined;
+	if (!registeredBeforeTermination || !unregistered) {
+		await recordTerminalUncertain(broker, id, root, pid);
+		return false;
+	}
+	return endpointRemoved(root, id);
 }
 
 async function signalVerifiedSession(
@@ -657,19 +1051,27 @@ async function endpointRemoved(root: string, id: string): Promise<boolean> {
 async function waitForClose(
 	broker: Broker,
 	id: string,
-	record: { locator: { stateRoot: string }; endpointGeneration: number; pid: number },
+	record: { locator: { stateRoot: string }; endpointGeneration: number; pid: number; lifecycleRequestId?: string },
 	timeoutMs: number,
 ): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
+	const timing = lifecycleTiming(broker);
+	const deadline = timing.now() + timeoutMs;
+	while (timing.now() < deadline) {
 		await broker.index.refresh();
+		const registration = broker.index.findHostRegistration(
+			id,
+			record.endpointGeneration,
+			record.pid,
+			record.lifecycleRequestId,
+		);
 		if (
-			broker.index.hasHostUnregistered(id, record.endpointGeneration, record.pid) &&
+			registration &&
+			broker.index.hostUnregisteredAfter(registration) &&
 			(await endpointRemoved(record.locator.stateRoot, id)) &&
 			hasObservedProcessExit(record.pid)
 		)
 			return true;
-		await sleep(POLL_MS);
+		await timing.sleep(POLL_MS);
 	}
 	return false;
 }
@@ -731,21 +1133,30 @@ async function waitForReady(
 	root: string,
 	deadline: number,
 	expected: EffectMarker,
+	timing: LifecycleTiming,
 ): Promise<ReadinessResult> {
-	while (Date.now() < deadline) {
+	while (timing.now() < deadline) {
+		const startupFailure = await readSessionLifecycleFailure(root, id, expected);
+		if (startupFailure) return { kind: "startup_failed", message: startupFailure.message };
 		if (
 			observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
 			"exited"
-		)
-			return { kind: "child_exited" };
+		) {
+			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
+			return finalStartupFailure
+				? { kind: "startup_failed", message: finalStartupFailure.message }
+				: { kind: "child_exited" };
+		}
 		try {
 			const authority = await currentReadyAuthority(broker, id, root, expected);
 			if (!authority) {
-				const remaining = deadline - Date.now();
-				if (remaining > 0) await sleep(Math.min(POLL_MS, remaining));
+				const remaining = deadline - timing.now();
+				if (remaining > 0) await timing.sleep(Math.min(POLL_MS, remaining));
+
 				continue;
 			}
-			const connectionTimeoutMs = Math.min(2_000, deadline - Date.now());
+			const connectionTimeoutMs = Math.min(2_000, deadline - timing.now());
+
 			if (connectionTimeoutMs <= 0) break;
 			const endpoint = authority.endpoint as { url: string; token: string };
 			const client = await SdkClient.connect(endpoint.url, endpoint.token, {
@@ -754,7 +1165,8 @@ async function waitForReady(
 				reconnectAttempts: 0,
 			});
 			try {
-				const requestTimeoutMs = Math.min(2_000, deadline - Date.now());
+				const requestTimeoutMs = Math.min(2_000, deadline - timing.now());
+
 				if (requestTimeoutMs <= 0) break;
 				const replay = await client.request(
 					{
@@ -785,8 +1197,8 @@ async function waitForReady(
 		} catch {
 			// A partially initialized or unauthenticated endpoint is not ready yet.
 		}
-		const remaining = deadline - Date.now();
-		if (remaining > 0) await sleep(Math.min(POLL_MS, remaining));
+		const remaining = deadline - timing.now();
+		if (remaining > 0) await timing.sleep(Math.min(POLL_MS, remaining));
 	}
 	return { kind: "timeout" };
 }
@@ -806,7 +1218,6 @@ function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWo
 	const prepared = ensureLaunchWorktree(plan);
 	if (!prepared.enabled || path.resolve(prepared.worktreePath) !== path.resolve(plan.worktreePath))
 		throw new Error("Lifecycle worktree preparation did not preserve the durable worktree identity.");
-	ensureReusableNodeModules(prepared.repoRoot, prepared.worktreePath);
 	return {
 		enabled: true,
 		cwd: path.resolve(prepared.worktreePath),
@@ -1103,7 +1514,7 @@ function closeEndpoint(endpoint: unknown): { url: string; token: string } | unde
 }
 
 /** Executes broker-owned global lifecycle effects. */
-export async function executeLifecycle(
+async function executeLifecycleResponse(
 	broker: Broker,
 	operation: string,
 	input: Input,
@@ -1160,9 +1571,15 @@ export async function executeLifecycle(
 				};
 			}
 		}
-		const timeout = readinessTimeout(input);
-		if (typeof timeout !== "number") return timeout;
-		const lifecycleDeadline = Date.now() + timeout;
+		const timing = lifecycleTiming(broker);
+
+		const deadlines = lifecycleDeadlines(input, timing.now());
+
+		if ("ok" in deadlines) return deadlines;
+		const lifecycleDeadline = deadlines.lifecycleCleanupDeadlineAt;
+		const readinessDeadline = deadlines.semanticReadyDeadlineAt;
+		const terminationStartDeadline = deadlines.terminationStartDeadlineAt;
+
 		const launch = await launchInput(broker, operation, input);
 		if ("ok" in launch) return launch;
 		if (!hasProcessIncarnationAuthority())
@@ -1174,6 +1591,8 @@ export async function executeLifecycle(
 		const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
 		const effectIntent: LifecycleEffectIntent = {
 			sessionId: launch.id,
+			stateRoot: launch.root,
+			childOwnershipEstablished: false,
 			...(plannedWorktreeIntent ? { worktree: plannedWorktreeIntent } : {}),
 		};
 
@@ -1189,17 +1608,34 @@ export async function executeLifecycle(
 			);
 		let worktreeReceipt: SessionLifecycleWorktreeReceipt | undefined;
 		try {
-			if (launch.worktreePlan) worktreeReceipt = preparePlannedWorktree(launch.worktreePlan);
+			if (launch.worktreePlan) {
+				worktreeReceipt = preparePlannedWorktree(launch.worktreePlan);
+				const worktree = {
+					cwdDigest: createHash("sha256").update(worktreeReceipt.cwd, "utf8").digest("hex"),
+					created: worktreeReceipt.created,
+					reused: worktreeReceipt.reused,
+					...(worktreeReceipt.branch
+						? { branchDigest: createHash("sha256").update(worktreeReceipt.branch, "utf8").digest("hex") }
+						: {}),
+				};
+				const durableEffects: LifecycleDurableEffectsReceipt = {
+					worktree,
+					digest: createHash("sha256").update(canonicalJson({ worktree })).digest("hex"),
+				};
+				await broker.ledger.transition(identity, "effect_started", { durableEffects });
+				ensureReusableNodeModules(launch.worktreePlan.repoRoot, launch.worktreePlan.worktreePath);
+			}
 		} catch (error) {
 			return fail(
 				"spawn_failed",
 				`Unable to prepare lifecycle worktree: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
-		const cleanupReserveMs = Math.min(CLOSE_TIMEOUT_MS, Math.max(1, Math.floor(timeout / 4)));
-		const readinessDeadline = lifecycleDeadline - cleanupReserveMs;
-		if (Date.now() >= readinessDeadline)
-			return fail("readiness_timeout", "Lifecycle preparation exhausted the readiness deadline before spawning.");
+		if (timing.now() >= readinessDeadline)
+			return fail(
+				"readiness_timeout",
+				"Lifecycle preparation exhausted the semantic readiness deadline before spawning.",
+			);
 		if (!hasProcessIncarnationAuthority())
 			return fail(
 				"incarnation_unavailable",
@@ -1212,6 +1648,11 @@ export async function executeLifecycle(
 			cwd: launch.cwd,
 			stateRoot: launch.root,
 			effectMarker,
+			receivedAt: deadlines.receivedAt,
+			requestedReadinessTimeoutMs: deadlines.requestedReadinessTimeoutMs,
+			semanticReadyDeadlineAt: deadlines.semanticReadyDeadlineAt,
+			terminationStartDeadlineAt: deadlines.terminationStartDeadlineAt,
+			lifecycleCleanupDeadlineAt: deadlines.lifecycleCleanupDeadlineAt,
 			...(launch.sourceSessionId ? { sourceSessionId: launch.sourceSessionId } : {}),
 			...(launch.sourceSessionPath ? { sourceSessionPath: launch.sourceSessionPath } : {}),
 			...(launch.sourceSessionIdentity ? { sourceSessionIdentity: launch.sourceSessionIdentity } : {}),
@@ -1244,12 +1685,25 @@ export async function executeLifecycle(
 			const incarnation = processIncarnationForBroker(broker, pid);
 			if (!incarnation) throw new Error("spawned session has no readable OS incarnation");
 			spawnedAuthority = { pid, effectMarker, incarnation };
+			await broker.ledger.transition(identity, "effect_started", {
+				effectIntent: { ...effectIntent, childOwnershipEstablished: true },
+			});
 			await writeEffectMarker(launch.root, launch.id, spawnedAuthority);
 			spawned.unref();
 		} catch (error) {
 			const terminated = child
-				? await terminateSpawnedChild(child, broker, launch.id, launch.root, lifecycleDeadline, spawnedAuthority)
+				? await terminateSpawnedChild(
+						child,
+						broker,
+						launch.id,
+						launch.root,
+						lifecycleDeadline,
+						terminationStartDeadline,
+						spawnedAuthority,
+						timing,
+					)
 				: true;
+
 			return terminated
 				? fail("spawn_failed", `Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`)
 				: fail(
@@ -1260,7 +1714,8 @@ export async function executeLifecycle(
 		if (!child || !spawnedAuthority)
 			return fail("spawn_failed", "Unable to retain the spawned session process identity.");
 		await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
-		const readiness = await waitForReady(broker, launch.id, launch.root, readinessDeadline, spawnedAuthority);
+		const readiness = await waitForReady(broker, launch.id, launch.root, readinessDeadline, spawnedAuthority, timing);
+
 		if (readiness.kind !== "ready") {
 			const terminated = await terminateSpawnedChild(
 				child,
@@ -1268,19 +1723,24 @@ export async function executeLifecycle(
 				launch.id,
 				launch.root,
 				lifecycleDeadline,
+				terminationStartDeadline,
 				spawnedAuthority,
+				timing,
 			);
+
 			if (!terminated)
 				return fail(
 					"terminal_uncertain",
 					`Session ${launch.id} did not become ready and its spawned process could not be verified dead.`,
 				);
-			return readiness.kind === "child_exited"
-				? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
-				: fail(
-						"readiness_timeout",
-						`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
-					);
+			return readiness.kind === "startup_failed"
+				? fail("spawn_failed", readiness.message)
+				: readiness.kind === "child_exited"
+					? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
+					: fail(
+							"readiness_timeout",
+							`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
+						);
 		}
 		await reconcileReadyScope(broker, launch.id, launch.cwd);
 		const verified = await currentReadyAuthority(broker, launch.id, launch.root, spawnedAuthority);
@@ -1291,7 +1751,9 @@ export async function executeLifecycle(
 				launch.id,
 				launch.root,
 				lifecycleDeadline,
+				terminationStartDeadline,
 				spawnedAuthority,
+				timing,
 			);
 			return terminated
 				? fail("endpoint_stale", "Session endpoint changed while lifecycle readiness was being verified.")
@@ -1500,4 +1962,184 @@ export async function executeLifecycle(
 		return { ok: true, result: { sessionId: id } };
 	}
 	return fail("invalid_input", "Unknown lifecycle operation.");
+}
+
+async function exactCleanupProof(
+	broker: Broker,
+	root: string | undefined,
+	id: string | undefined,
+	expected: EffectMarker | undefined,
+	evidence: { artifact: LifecycleFailureArtifact } | undefined,
+): Promise<LifecycleCleanupProof | undefined> {
+	const rollback = evidence?.artifact.rollback;
+	if (
+		!root ||
+		!id ||
+		!expected ||
+		!rollback?.fenced ||
+		!rollback.runtimeRemoved ||
+		!rollback.hostStopped ||
+		!rollback.brokerRegistrationReleased ||
+		observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) !==
+			"exited" ||
+		!(await endpointRemoved(root, id))
+	)
+		return undefined;
+	await broker.index.refresh();
+	if (rollback.endpointGeneration === null) {
+		if (broker.index.hasHostRegistrationForLifecycle(id, expected.pid, expected.effectMarker)) return undefined;
+		return {
+			processExited: true,
+			endpointRemoved: true,
+			hostUnregistered: { state: "not_registered" },
+			rollback: {
+				endpointGeneration: null,
+				fenced: true,
+				runtimeRemoved: true,
+				hostStopped: true,
+				brokerRegistrationReleased: true,
+			},
+		};
+	}
+	const registration = broker.index.findHostRegistration(
+		id,
+		rollback.endpointGeneration,
+		expected.pid,
+		expected.effectMarker,
+	);
+	const hostUnregistered = registration ? broker.index.hostUnregisteredAfter(registration) : undefined;
+	return hostUnregistered
+		? {
+				processExited: true,
+				endpointRemoved: true,
+				hostUnregistered: { state: "unregistered", ...hostUnregistered },
+				rollback: {
+					endpointGeneration: rollback.endpointGeneration,
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+			}
+		: undefined;
+}
+
+export interface LifecycleExecutionOutcome {
+	response: BrokerResponse;
+	durableEffects?: LifecycleDurableEffectsReceipt;
+	startupFailure?: LifecycleStartupFailureReceipt;
+	deferredArtifactCleanup?: () => Promise<void>;
+}
+
+/** Returns the response together with every durable lifecycle fact needed for truthful replay. */
+export async function executeLifecycle(
+	broker: Broker,
+	operation: string,
+	input: Input,
+	identity: string,
+): Promise<LifecycleExecutionOutcome> {
+	const response = await executeLifecycleResponse(broker, operation, input, identity);
+	const entry = broker.ledger.get(identity);
+	const priorDurableEffects = entry?.durableEffects;
+	const evidenceCwd = entry?.effectIntent?.worktree?.worktreePath ?? lifecycleCwd(input);
+	const root = entry?.effectIntent?.stateRoot ?? stateRoot(input, evidenceCwd);
+	const marker =
+		entry?.effectMarker && entry.intendedSessionId && root
+			? await readEffectMarker(lifecycleMarkerPath(root, entry.intendedSessionId))
+			: undefined;
+	const expected = marker && marker.effectMarker === entry?.effectMarker ? marker : undefined;
+	const evidence =
+		root && entry?.intendedSessionId && expected
+			? await readLifecycleFailureArtifact(
+					lifecycleFailurePath(root, entry.intendedSessionId, expected.effectMarker),
+					expected,
+				)
+			: undefined;
+	const cleanupProof = await exactCleanupProof(broker, root, entry?.intendedSessionId, expected, evidence);
+	const startupFailure: LifecycleStartupFailureReceipt | undefined = evidence
+		? {
+				artifactDigest: evidence.digest,
+				phase: evidence.artifact.phase,
+				reason: evidence.artifact.reason,
+				message: evidence.artifact.message,
+				rollback: {
+					endpointGeneration: evidence.artifact.rollback.endpointGeneration,
+					fenced: evidence.artifact.rollback.fenced,
+					runtimeRemoved: evidence.artifact.rollback.runtimeRemoved,
+					hostStopped: evidence.artifact.rollback.hostStopped,
+					brokerRegistrationReleased: evidence.artifact.rollback.brokerRegistrationReleased,
+				},
+				...(cleanupProof ? { cleanupProof } : {}),
+			}
+		: undefined;
+	const durableEffectsBody: Omit<LifecycleDurableEffectsReceipt, "digest"> = {
+		...(priorDurableEffects?.worktree ? { worktree: priorDurableEffects.worktree } : {}),
+		...(evidence?.artifact.transcript
+			? {
+					transcript: {
+						identityDigest: createHash("sha256")
+							.update(canonicalJson(evidence.artifact.transcript.identity))
+							.digest("hex"),
+						contentDigest: evidence.artifact.transcript.digest,
+					},
+				}
+			: {}),
+		...(startupFailure ? { startup: startupFailure } : {}),
+	};
+	const durableEffects =
+		Object.keys(durableEffectsBody).length > 0
+			? {
+					...durableEffectsBody,
+					digest: createHash("sha256").update(canonicalJson(durableEffectsBody)).digest("hex"),
+				}
+			: undefined;
+	const terminalResponse: BrokerResponse =
+		!response.ok &&
+		entry?.effectMarker &&
+		(operation === "session.create" || operation === "session.fork" || operation === "session.resume")
+			? entry.effectIntent?.childOwnershipEstablished === false
+				? response
+				: startupFailure && cleanupProof
+					? {
+							ok: false,
+							error: {
+								code: "spawn_failed",
+								message: "No ready SDK endpoint remains available.",
+								endpoint: "unavailable",
+							},
+							...(durableEffects ? { durableEffects } : {}),
+							startupFailure,
+						}
+					: {
+							ok: false,
+							error: {
+								code: "terminal_uncertain",
+								message:
+									"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+							},
+							...(durableEffects ? { durableEffects } : {}),
+							...(startupFailure ? { startupFailure } : {}),
+						}
+			: response;
+	return {
+		response: terminalResponse,
+		...(durableEffects ? { durableEffects } : {}),
+		...(startupFailure ? { startupFailure } : {}),
+		...(evidence && root && entry?.intendedSessionId && cleanupProof
+			? {
+					deferredArtifactCleanup: async () => {
+						const current = await readLifecycleFailureArtifact(
+							lifecycleFailurePath(root, entry.intendedSessionId!, evidence.artifact.effectMarker),
+							evidence.artifact,
+						);
+						const marker = await readEffectMarker(lifecycleMarkerPath(root, entry.intendedSessionId!));
+						if (current?.digest !== evidence.digest || !marker || !sameEffectMarker(marker, evidence.artifact))
+							return;
+						await fs.rm(lifecycleFailurePath(root, entry.intendedSessionId!, evidence.artifact.effectMarker));
+						await fs.rm(lifecycleMarkerPath(root, entry.intendedSessionId!));
+						await syncDirectory(path.join(root, "sdk"));
+					},
+				}
+			: {}),
+	};
 }
