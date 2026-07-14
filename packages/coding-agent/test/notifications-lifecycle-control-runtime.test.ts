@@ -444,6 +444,30 @@ describe("lifecycle control runtime", () => {
 		expect(responses.join("\n")).not.toContain("control-token");
 	});
 
+	it("migrates legacy successful resume entries without resumeMode", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-legacy-resume-"));
+		const ledgerPath = path.join(root, "ledger.json");
+		const legacyEntry: LedgerEntry = {
+			requestHash: "legacy-hash",
+			state: "success",
+			requestId: "legacy-resume",
+			verb: "session_resume",
+			sessionId: "session-1",
+			tmuxSession: "gjc-session-1",
+			endpointUrl: "ws://127.0.0.1:1",
+			createdAt: 1,
+			updatedAt: 2,
+			targetSummary: { kind: "session_resume" },
+		};
+		delete legacyEntry.resumeMode;
+		fs.writeFileSync(ledgerPath, JSON.stringify({ version: 1, entries: { "42:7": legacyEntry } }), { mode: 0o600 });
+		try {
+			const doc = await fileLedgerStore(ledgerPath).read();
+			expect(doc.entries["42:7"]?.resumeMode).toBe("reattached");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 	it("distinguishes a missing ledger from corrupt or unreadable durable state", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-"));
 		const ledgerPath = path.join(root, "ledger.json");

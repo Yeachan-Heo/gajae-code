@@ -2415,8 +2415,7 @@ export function createNotificationsExtension(
 			}
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
-					if (isTelegramConfigured(cfg))
-						await ensureTelegramDaemon({ settings, cwd: ctx.cwd, sessionId: id });
+					if (isTelegramConfigured(cfg)) await ensureTelegramDaemon({ settings, cwd: ctx.cwd, sessionId: id });
 					if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
 					if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
 				} catch (e) {

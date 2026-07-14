@@ -163,11 +163,22 @@ function isLedgerDoc(value: unknown): value is LedgerDoc {
 					typeof candidate.sessionId === "string" &&
 					typeof candidate.tmuxSession === "string" &&
 					typeof candidate.endpointUrl === "string" &&
-					(candidate.resumeMode === "reattached" || candidate.resumeMode === "cold_restarted")
+					(candidate.resumeMode === undefined ||
+						candidate.resumeMode === "reattached" ||
+						candidate.resumeMode === "cold_restarted")
 				);
 		}
 		return false;
 	});
+}
+
+function migrateLegacyLedger(doc: LedgerDoc): LedgerDoc {
+	for (const entry of Object.values(doc.entries)) {
+		if (entry.state === "success" && entry.verb === "session_resume" && entry.resumeMode === undefined) {
+			entry.resumeMode = "reattached";
+		}
+	}
+	return doc;
 }
 
 function isUnsupportedDirectorySyncError(error: unknown): boolean {
@@ -219,7 +230,7 @@ export function fileLedgerStore(idempotencyFile: string): LedgerStore {
 			try {
 				const doc = JSON.parse(contents) as unknown;
 				if (!isLedgerDoc(doc)) throw new Error("invalid");
-				return doc;
+				return migrateLegacyLedger(doc);
 			} catch (error) {
 				throw ledgerReadError(error);
 			}

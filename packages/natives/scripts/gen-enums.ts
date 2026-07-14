@@ -34,6 +34,31 @@ const CLASS_RE = /^export declare class (\w+)/gm;
 // Match `export declare function name(...)`. Same shape rationale.
 const FUNCTION_RE = /^export declare function (\w+)/gm;
 
+const PLATFORM_SPECIFIC_DECLARATIONS = `export declare class ComputerController {
+  constructor()
+  screenshot(): ComputerScreenshot
+  click(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void
+  doubleClick(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void
+  move(expectedEpoch: number | undefined | null, x: number, y: number): void
+  drag(expectedEpoch: number | undefined | null, x: number, y: number, toX: number, toY: number, button?: string | undefined | null): void
+  scroll(expectedEpoch: number | undefined | null, x: number, y: number, scrollX: number, scrollY: number): void
+  type(expectedEpoch: number | undefined | null, text: string): void
+  keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
+  wait(expectedEpoch: number | undefined | null, ms: number): void
+}
+
+`;
+
+function preservePlatformSpecificDeclarations(dts: string): string {
+	if (dts.includes("export declare class ComputerController")) return dts;
+	const header = "/* eslint-disable */\n";
+	const insertion = dts.indexOf(header);
+	if (insertion === -1) throw new Error("gen-enums: index.d.ts is missing the generated eslint header");
+	return (
+		dts.slice(0, insertion + header.length) + PLATFORM_SPECIFIC_DECLARATIONS + dts.slice(insertion + header.length)
+	);
+}
+
 interface EnumExport {
 	name: string;
 	entries: string[];
@@ -109,9 +134,9 @@ function buildGeneratedBlock(dts: string): string {
 }
 
 export async function generateEnumExports(): Promise<void> {
-	const dts = await Bun.file(dtsPath).text();
+	const generatedDts = preservePlatformSpecificDeclarations(await Bun.file(dtsPath).text());
 	const existing = await Bun.file(jsPath).text();
-	const generatedBlock = buildGeneratedBlock(dts);
+	const generatedBlock = buildGeneratedBlock(generatedDts);
 
 	// Patch the generated block in place. `native/index.js` is the hand-edited
 	// loader; only the block between MARKER_START and MARKER_END is owned by
@@ -131,8 +156,8 @@ export async function generateEnumExports(): Promise<void> {
 
 	// Also fix the .d.ts: replace `const enum` with `enum` so TS allows
 	// assigning string literals to enum types without casts.
-	const constEnumCount = (dts.match(/export (?:declare )?const enum/g) ?? []).length;
-	const dtsContent = dts
+	const constEnumCount = (generatedDts.match(/export (?:declare )?const enum/g) ?? []).length;
+	const dtsContent = generatedDts
 		.replaceAll("export const enum", "export declare enum")
 		.replaceAll("export declare const enum", "export declare enum");
 	await Bun.write(dtsPath, dtsContent);
