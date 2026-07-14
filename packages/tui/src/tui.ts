@@ -2186,8 +2186,33 @@ export class TUI extends Container {
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			const nextViewportTop = Math.max(0, newLines.length - height);
-			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
+			let currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
 			let buffer = "\x1b[?2026h";
+			let departingRows =
+				!widthChanged && !heightChanged ? Math.min(height, Math.max(0, nextViewportTop - prevViewportTop)) : 0;
+			const previousLiveViewportTop = Math.max(0, this.#previousLines.length - height);
+			if (prevViewportTop !== previousLiveViewportTop) {
+				departingRows = 0;
+			}
+			for (let row = 0; row < departingRows; row++) {
+				const lineIndex = prevViewportTop + row;
+				if (this.#previousLines[lineIndex] !== newLines[lineIndex]) {
+					departingRows = 0;
+					break;
+				}
+			}
+			if (departingRows > 0) {
+				const moveToBottom = height - 1 - currentScreenRow;
+				if (moveToBottom > 0) {
+					buffer += `\x1b[${moveToBottom}B`;
+				}
+				// Commit rows leaving the live grid to terminal scrollback before
+				// repainting it. Without these newlines, tmux loses the top of any
+				// block spanning the viewport boundary when an offscreen edit and
+				// transcript growth arrive in the same frame.
+				buffer += "\r\n".repeat(departingRows);
+				currentScreenRow = height - 1;
+			}
 			if (currentScreenRow > 0) {
 				buffer += `\x1b[${currentScreenRow}A`;
 			}
@@ -2225,10 +2250,9 @@ export class TUI extends Container {
 				const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
 				this.#appendDebugRedrawLog(msg);
 			}
-			// Viewport repaint deliberately prioritizes the live viewport over
-			// historical scrollback repair. After offscreen changes, #previousLines
-			// tracks the desired logical transcript, not every byte emitted into the
-			// terminal scrollback.
+			// Repainting still avoids repairing arbitrary historical scrollback, but
+			// stable-dimension live advancement commits rows departing the previous
+			// viewport before overwriting the grid.
 			this.#cursorRow = Math.max(0, newLines.length - 1);
 			this.#maxLinesRendered = newLines.length;
 			this.#viewportTopRow = nextViewportTop;

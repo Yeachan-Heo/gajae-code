@@ -792,6 +792,85 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("commits departing tmux viewport rows before repainting after offscreen edits", async () => {
+			Bun.env.TMUX = "1";
+			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+
+			const term = new VirtualTerminal(32, 5);
+			const tui = new TUI(term);
+			const initialLines = rows("prefix-", 5);
+			const table = ["┌───────┐", "│ row-a │", "│ row-b │", "└───────┘"];
+			const component = new MutableLinesComponent(initialLines);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				const grownLines = [...initialLines, ...table, "tail-9"];
+				component.setLines(grownLines);
+				tui.requestRender();
+				await settle(term);
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(grownLines);
+
+				term.clearWriteLog();
+				component.setLines(["prefix-0 updated", ...grownLines.slice(1), "tail-10", "tail-11"]);
+				tui.requestRender();
+				await settle(term);
+
+				const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+				const tableStart = scrollback.indexOf(table[0]);
+				expect(tableStart).toBeGreaterThanOrEqual(0);
+				expect(scrollback.slice(tableStart, tableStart + table.length)).toEqual(table);
+				for (const row of table) {
+					expect(scrollback.filter(line => line === row)).toHaveLength(1);
+				}
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).not.toContain("\x1b[3J");
+				expect(writes).not.toContain("\x1b[2J");
+				expect(writes).not.toContain("prefix-0 updated");
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("does not commit stale manual viewport rows after transcript replacement", async () => {
+			Bun.env.TMUX = "1";
+			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+
+			const term = new VirtualTerminal(32, 5);
+			const tui = new TUI(term);
+			const initialLines = rows("old-", 5);
+			const component = new MutableLinesComponent(initialLines);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				component.setLines(rows("old-", 10));
+				tui.requestRender();
+				await settle(term);
+				expect(tui.scrollViewportPages(-1)).toBe(true);
+				await term.flush();
+
+				tui.resetViewportAnchorIntent();
+				term.clearWriteLog();
+				component.setLines(rows("new-", 12));
+				tui.requestRender();
+				await settle(term);
+
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual([
+					...initialLines,
+					...rows("new-", 12).slice(-5),
+				]);
+				expect(term.getWriteLog().join("")).not.toContain("\r\n".repeat(5));
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("keeps a legacy full-render kill switch for multiplexer viewport repaint", async () => {
 			Bun.env.TMUX = "1";
 			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = "1";
