@@ -5188,30 +5188,26 @@ test("a terminal deletion record for the same session/topic under an old lease c
 });
 
 test("a late frame after session_closed targets a fresh topic and never the deleted thread (F002 send fence)", async () => {
-	class StableFenceWs extends FakeWs {
-		override close() {
-			this.readyState = 3;
-		}
-		override dispatchEvent(event: Event): boolean {
-			if (event.type === "close") {
-				this.readyState = 3;
-				return true;
-			}
-			return super.dispatchEvent(event);
-		}
-	}
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	const cwd = path.join(agentDir, "repo");
 	const reg = await publishIdentityEndpoint(s, cwd, "S", "ws://s", "ts");
 	const bot = new FakeBotApi();
+	let now = 0;
+	const liveness: Array<() => void> = [];
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot,
-		WebSocketImpl: StableFenceWs as any,
+		WebSocketImpl: FakeWs as any,
+		now: () => now,
+		setIntervalImpl: ((cb: () => void) => {
+			liveness.push(cb);
+			return 1;
+		}) as any,
+		clearIntervalImpl: (() => {}) as any,
 	});
 	daemon.connectSession("S", "ws://s", "ts", { canonicalRoot: reg.canonicalRoot, leaseId: reg.leaseId });
 	const session = daemon.sessions.get("S")!;
@@ -5221,10 +5217,45 @@ test("a late frame after session_closed targets a fresh topic and never the dele
 		repo: "r",
 		branch: "b",
 	});
+	await daemon.handleSessionMessage(session, {
+		type: "hello",
+		protocolVersion: 2,
+		capabilities: ["client_ping_pong"],
+	});
+	expect(liveness).toHaveLength(1);
 	const deletedThreadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+	const originalAdmissionCheck = (
+		daemon as unknown as {
+			sessionAdmissionIsCurrent(target: typeof session): Promise<boolean>;
+		}
+	).sessionAdmissionIsCurrent.bind(daemon);
+	let socketClosedDuringAuthorization = false;
+	let livenessPreservedDuringAuthorization = false;
+	Object.assign(daemon, {
+		sessionAdmissionIsCurrent: async (target: typeof session) => {
+			const current = await originalAdmissionCheck(target);
+			if (!socketClosedDuringAuthorization) {
+				socketClosedDuringAuthorization = true;
+				now = 25_000;
+				for (const callback of liveness) callback();
+				livenessPreservedDuringAuthorization = daemon.sessions.get("S") === target;
+				target.ws.close();
+			}
+			return current;
+		},
+	});
 
-	// session_closed fences and deletes the topic; queued/in-flight sends cancel.
-	await daemon.handleSessionMessage(session, { type: "session_closed", sessionId: "S" });
+	// Drive the production WebSocket message listener. It must synchronously pin
+	// the terminal frame before the first authority await, so the close injected
+	// by sessionAdmissionIsCurrent cannot erase the exact socket map identity.
+	const socket = FakeWs.instances[0]!;
+	socket.emit({ type: "session_closed", sessionId: "S" });
+	for (let attempt = 0; attempt < 200 && daemon.sessions.has("S"); attempt++) {
+		await new Promise(resolve => setTimeout(resolve, 1));
+	}
+	expect(daemon.sessions.has("S")).toBe(false);
+	expect(socketClosedDuringAuthorization).toBe(true);
+	expect(livenessPreservedDuringAuthorization).toBe(true);
 	expect(bot.calls.some(c => c.method === "deleteForumTopic" && c.body.message_thread_id === deletedThreadId)).toBe(
 		true,
 	);
@@ -5250,6 +5281,48 @@ test("a late frame after session_closed targets a fresh topic and never the dele
 	const lateSends = bot.calls.slice(callsBeforeLate).filter(c => c.method === "sendMessage");
 	expect(lateSends.length).toBeGreaterThan(0);
 	expect(lateSends.some(c => c.body.message_thread_id === deletedThreadId)).toBe(false);
+});
+
+test("closing a session never deletes an unrelated user-managed topic", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = settings(agentDir);
+	const identity = await publishIdentityEndpoint(s, path.join(agentDir, "repo"), "S", "ws://s", "ts");
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("S", "ws://s", "ts", identity);
+	const session = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(session, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	const daemonTopicId = bot.calls.find(call => call.method === "sendMessage")!.body.message_thread_id;
+	const userManagedTopicId = 999;
+	await daemon.handleTelegramUpdate({
+		update_id: 999,
+		message: {
+			chat: { id: 42, type: "private" },
+			message_thread_id: userManagedTopicId,
+			forum_topic_edited: { name: "user-managed" },
+		},
+	});
+
+	await daemon.handleSessionMessage(session, { type: "session_closed", sessionId: "S" });
+
+	const deletedTopicIds = bot.calls
+		.filter(call => call.method === "deleteForumTopic")
+		.map(call => call.body.message_thread_id);
+	expect(deletedTopicIds).toEqual([daemonTopicId]);
+	expect(deletedTopicIds).not.toContain(userManagedTopicId);
 });
 
 test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {
@@ -7585,6 +7658,64 @@ describe("telegram daemon deletion authority (tri-state, quarantine, fail-closed
 			expect(claim?.receipt?.status).not.toBe("deleted");
 			expect(String(claim?.receipt?.status ?? "").startsWith("reconciled")).toBe(false);
 		}
+	});
+	test.each([
+		"throw",
+		"timeout",
+	] as const)("a deleteForumTopic provider %s remains uncertain and preserves the topic", async mode => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const identity = await publishIdentityEndpoint(s, path.join(agentDir, "repo"), "S", "ws://s", "tok");
+		const bot = new FakeBotApi();
+		(bot.call as (m: string, b: unknown, o?: { signal?: AbortSignal }) => Promise<unknown>) = ((
+			method: string,
+			body: unknown,
+			options?: { signal?: AbortSignal },
+		) => {
+			if (method !== "deleteForumTopic") {
+				return FakeBotApi.prototype.call.call(bot, method, body);
+			}
+			bot.calls.push({ method, body });
+			if (mode === "throw") throw new Error("provider transport failed");
+			return new Promise((_resolve, reject) => {
+				const abort = () => reject(new DOMException("aborted", "AbortError"));
+				if (options?.signal?.aborted) {
+					abort();
+				} else {
+					options?.signal?.addEventListener("abort", abort, { once: true });
+				}
+			});
+		}) as never;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: CHAT,
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+			topicDeleteTimeoutMs: 1,
+		});
+		daemon.connectSession("S", "ws://s", "tok", identity);
+		const session = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(session as any, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		await daemon.handleSessionMessage(session as any, { type: "session_closed", sessionId: "S" });
+
+		const deletes = bot.calls.filter(call => call.method === "deleteForumTopic");
+		expect(deletes).toHaveLength(1);
+		expect(topicRegistrySnapshot(agentDir).topics.S).toBeDefined();
+		const claim = await deletionEffect(
+			agentDir,
+			"S",
+			deletes[0]!.body.message_thread_id.toString(),
+			identity.leaseId,
+		);
+		expect(claim?.state).toBe("uncertain");
+		expect(claim?.receipt?.status).toBe("uncertain");
 	});
 
 	test("a 429 deleteForumTopic preserves the exact retry_after in the uncertain receipt", async () => {

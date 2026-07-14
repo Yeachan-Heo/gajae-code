@@ -1521,6 +1521,8 @@ interface SessionSocket {
 	 * predecessor socket cannot delete/compact under a successor lease.
 	 */
 	leaseId: string;
+	/** Pins this socket while an admitted session_closed frame is processed. */
+	closeRequested: boolean;
 	ws: WebSocket;
 	pending: Map<string, { sessionId: string; actionId: string }>;
 	/** True once the server advertised the `client_ping_pong` capability. */
@@ -2293,37 +2295,35 @@ export class TelegramNotificationDaemon {
 				name: "session_closed",
 				matches: msg => msg.type === "session_closed",
 				handle: async session => {
-					// Waiting for an already-started topic creation is not a close
-					// mutation. Do it before admission locking, then revalidate the exact
-					// socket/root/lease/endpoint tuple under the lock.
-					await this.topicCreations.get(session.sessionId)?.catch(() => undefined);
-					const closeLeaseId = session.leaseId;
-					const authorized = await this.withCurrentSessionAuthorization(session, async () => {
-						// Persist a session/topic/lease-scoped deletion intent before any
-						// session-global mutation. Once the admission lock is released, a
-						// successor registration observes this unreconciled intent and
-						// cannot interleave with the destructive close path.
-						if (isNonEmptyString(closeLeaseId)) {
-							await this.enqueueTopicDeletionIntent(session.sessionId, closeLeaseId);
-						}
-						this.closingSessions.add(session.sessionId);
-						this.busy.delete(session.sessionId);
-						this.closedEndpointKeys.set(session.sessionId, session.endpointKey);
-					});
-					if (!authorized) {
-						// A predecessor close arriving after successor publication is a
-						// no-op for successor/global state: only its own socket is closed.
-						this.dropSession(session, "session_closed_superseded");
-						return;
-					}
+					let authorized = false;
 					try {
+						// Waiting for an already-started topic creation is not a close
+						// mutation. Do it before admission locking, then revalidate the exact
+						// socket/root/lease/endpoint tuple under the lock.
+						await this.topicCreations.get(session.sessionId)?.catch(() => undefined);
+						const closeLeaseId = session.leaseId;
+						authorized = await this.withCurrentSessionAuthorization(session, async () => {
+							// Persist a session/topic/lease-scoped deletion intent before any
+							// session-global mutation. Once the admission lock is released, a
+							// successor registration observes this unreconciled intent and
+							// cannot interleave with the destructive close path.
+							if (isNonEmptyString(closeLeaseId)) {
+								await this.enqueueTopicDeletionIntent(session.sessionId, closeLeaseId);
+							}
+							this.closingSessions.add(session.sessionId);
+							this.busy.delete(session.sessionId);
+							this.closedEndpointKeys.set(session.sessionId, session.endpointKey);
+						});
+						if (!authorized) return;
 						if (isNonEmptyString(closeLeaseId)) {
 							await this.deleteTopic(session.sessionId, closeLeaseId);
 						}
 					} finally {
-						// Local durability failures stay observable, but the fenced
-						// predecessor socket must never remain attached in memory.
-						this.dropSession(session, "session_closed");
+						// The WebSocket can close while authority waits on the lock. Its
+						// close listener leaves a close-requested socket pinned until this
+						// identity-guarded teardown, so a legitimate close cannot lose its
+						// current-session authority. A successor map entry is never removed.
+						this.dropSession(session, authorized ? "session_closed" : "session_closed_superseded");
 					}
 				},
 			});
@@ -2734,6 +2734,7 @@ export class TelegramNotificationDaemon {
 			canonicalRoot: identity.canonicalRoot,
 			leaseId: identity.leaseId,
 			ws,
+			closeRequested: false,
 			pending: new Map(),
 			capable: false,
 			lastPongAt: 0,
@@ -2789,16 +2790,22 @@ export class TelegramNotificationDaemon {
 		});
 		ws.addEventListener("message", ev => {
 			void (async () => {
+				const frame = JSON.parse(String(ev.data));
+				// Pin synchronously before the first authority await. A normal socket
+				// close may race this terminal frame, but must not erase its map identity.
+				if (frame?.type === "session_closed") session.closeRequested = true;
 				if (this.sessions.get(sessionId) !== session || !(await this.sessionAdmissionIsCurrent(session))) {
 					this.dropSession(session, "admission_identity_mismatch");
 					return;
 				}
-				await this.handleSessionMessage(session, JSON.parse(String(ev.data)));
+				await this.handleSessionMessage(session, frame);
 			})().catch(err => {
 				logger.error("notifications daemon: handleSessionMessage failed", { error: String(err) });
+				if (session.closeRequested) this.dropSession(session, "session_close_failed");
 			});
 		});
 		ws.addEventListener("close", () => {
+			if (session.closeRequested) return;
 			this.dropSession(session, "socket_closed");
 		});
 	}
@@ -2817,6 +2824,7 @@ export class TelegramNotificationDaemon {
 		session.lastPongAt = now();
 		session.pingTimer = setIntervalImpl(() => {
 			if (this.sessions.get(session.sessionId) !== session) return;
+			if (session.closeRequested) return;
 			const t = now();
 			if (t - session.lastPongAt >= HEARTBEAT_TTL_MS) {
 				this.dropSession(session, "liveness_timeout");
@@ -4207,6 +4215,13 @@ export class TelegramNotificationDaemon {
 	}
 
 	async handleSessionMessage(session: SessionSocket, msg: any): Promise<void> {
+		if (msg?.type === "session_closed") {
+			// Terminal close bypasses startup replay: pinning and durable deletion
+			// authority must not depend on a replay response from a closing socket.
+			session.closeRequested = true;
+			await this.sessionRouter.dispatch(session, msg as Record<string, unknown>);
+			return;
+		}
 		if (session.replayPending) {
 			const matchingReplay = msg?.type === "event_replay_result" && msg.id === session.replayId;
 			if (!matchingReplay) {
