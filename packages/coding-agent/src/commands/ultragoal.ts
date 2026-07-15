@@ -26,15 +26,20 @@ export default class Ultragoal extends Command {
 		if (isReviewStart && !result.createdReviewPlan && (result.reviewBlockerGoalIds?.length ?? 0) === 0) return;
 
 		const cwd = process.cwd();
-		const { objective, goalsPath } = await readUltragoalGjcObjective(cwd);
+		const { objective, goalsPath, briefHash, planStatus, aliases } = await readUltragoalGjcObjective(cwd);
 		await writeCurrentSessionGoalModeState({
 			sessionFile: process.env[GJC_SESSION_FILE_ENV],
 			objective,
+			...(aliases ? { aliases } : {}),
 		});
 		await writePendingGoalModeRequest({
 			cwd,
 			objective,
 			goalsPath,
+			sourcePlanPath: goalsPath,
+			...(briefHash ? { sourceBriefHash: briefHash } : {}),
+			...(planStatus ? { planStatus } : {}),
+			...(aliases && aliases.length > 0 ? { gjcObjectiveAliases: aliases } : {}),
 			sessionId: process.env[GJC_SESSION_ID_ENV],
 		});
 	}

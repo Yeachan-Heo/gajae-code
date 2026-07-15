@@ -2,6 +2,8 @@ import type { UsageStatistics } from "../session/session-manager";
 
 export type GoalStatus = "active" | "paused" | "complete" | "dropped";
 
+export type GoalSource = "manual" | "ultragoal";
+
 export interface Goal {
 	id: string;
 	objective: string;
@@ -10,6 +12,9 @@ export interface Goal {
 	timeUsedSeconds: number;
 	createdAt: number;
 	updatedAt: number;
+	source?: GoalSource;
+	sourcePlanPath?: string;
+	sourceBriefHash?: string;
 }
 
 export interface GoalModeState {
@@ -55,6 +60,13 @@ export function normalizeGoal(candidate: unknown): Goal | null {
 		timeUsedSeconds: value.timeUsedSeconds,
 		createdAt: value.createdAt,
 		updatedAt: value.updatedAt,
+		...(value.source === "manual" || value.source === "ultragoal" ? { source: value.source } : {}),
+		...(typeof value.sourcePlanPath === "string" && value.sourcePlanPath !== ""
+			? { sourcePlanPath: value.sourcePlanPath }
+			: {}),
+		...(typeof value.sourceBriefHash === "string" && value.sourceBriefHash !== ""
+			? { sourceBriefHash: value.sourceBriefHash }
+			: {}),
 	};
 }
 

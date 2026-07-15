@@ -5,6 +5,7 @@ import {
 	type Goal,
 	type GoalModeState,
 	type GoalRuntimeEvent,
+	type GoalSource,
 	type GoalTokenUsage,
 	normalizeGoalModeState,
 } from "./state";
@@ -37,6 +38,12 @@ export interface GoalWallClockSnapshot {
 export interface GoalRuntimeSnapshot {
 	turnSnapshot?: GoalTurnSnapshot;
 	wallClock: GoalWallClockSnapshot;
+}
+
+export interface GoalProvenance {
+	source?: GoalSource;
+	sourcePlanPath?: string;
+	sourceBriefHash?: string;
 }
 
 export type GoalPromptKind = "active" | "continuation";
@@ -75,11 +82,67 @@ export function renderTrustedObjective(objective: string): string {
 	return `<objective>\n${escapeXmlText(objective)}\n</objective>`;
 }
 
+/**
+ * Slash command tokens that, when used as the sole objective, indicate the user
+ * typed a command name rather than a goal description. Case-insensitive.
+ */
+const RESERVED_COMMAND_TOKENS = new Set([
+	"/goal",
+	"/ultragoal",
+	"/ralplan",
+	"/deep-interview",
+	"/team",
+	"/skill:ultragoal",
+	"/skill:ralplan",
+	"/skill:deep-interview",
+	"/skill:team",
+	"/models",
+	"/bg",
+	"/quit",
+	"/exit",
+	"/help",
+	"/new",
+	"/compact",
+	"/settings",
+	"/login",
+	"/logout",
+	"/session",
+	"/model",
+	"/status",
+	"/clear",
+	"/resume",
+	"/branch",
+	"/diff",
+	"/commit",
+	"/pr",
+	"/issue",
+]);
+
+/**
+ * Returns true when the entire trimmed objective is command-shaped: a bare slash
+ * command token (e.g. `/goal`, `/skill:ultragoal`) or only-slash variants (`/`,
+ * `//`). Prose that merely mentions a command (e.g. "Document how /goal works")
+ * contains spaces and is not rejected.
+ */
+export function isCommandNameObjective(objective: string): boolean {
+	const trimmed = objective.trim();
+	if (!trimmed) return true;
+	if (/^\/+$/.test(trimmed)) return true;
+	const lower = trimmed.toLowerCase();
+	if (RESERVED_COMMAND_TOKENS.has(lower)) return true;
+	// Single slash-command token: one leading "/" plus a single path segment of
+	// word/colon/hyphen characters with no spaces (e.g. `/foo`, `/skill:bar`).
+	if (/^\/[\w:-]+$/.test(trimmed)) return true;
+	return false;
+}
+
 export function validateGoalObjective(objective: string, op: "create" | "replace"): string {
 	const trimmed = objective.trim();
 	if (!trimmed) throw new Error(`objective is required when op=${op}`);
-	if (trimmed === "/goal") {
-		throw new Error("objective must describe the goal; `/goal` is the command name, not a goal objective");
+	if (isCommandNameObjective(trimmed)) {
+		throw new Error(
+			`objective must describe the goal; \`${trimmed}\` is the command name, not a goal objective`,
+		);
 	}
 	return trimmed;
 }
@@ -294,7 +357,7 @@ export class GoalRuntime {
 		await this.#withAccounting(() => this.#flushUsageLocked(currentUsage));
 	}
 
-	#createGoalState(objective: string): GoalModeState {
+	#createGoalState(objective: string, provenance?: GoalProvenance): GoalModeState {
 		const now = this.#now();
 		const goal: Goal = {
 			id: String(Snowflake.next()),
@@ -304,25 +367,28 @@ export class GoalRuntime {
 			timeUsedSeconds: 0,
 			createdAt: now,
 			updatedAt: now,
+			...(provenance?.source ? { source: provenance.source } : {}),
+			...(provenance?.sourcePlanPath ? { sourcePlanPath: provenance.sourcePlanPath } : {}),
+			...(provenance?.sourceBriefHash ? { sourceBriefHash: provenance.sourceBriefHash } : {}),
 		};
 		return { enabled: true, mode: "active", goal };
 	}
 
-	async createGoal(input: { objective: string }): Promise<GoalModeState> {
+	async createGoal(input: { objective: string; provenance?: GoalProvenance }): Promise<GoalModeState> {
 		const objective = validateGoalObjective(input.objective, "create");
 		return await this.#withAccounting(async () => {
 			const existing = this.#getStateClone();
 			if (existing?.goal && existing.goal.status !== "dropped" && existing.goal.status !== "complete") {
 				throw new Error("cannot create a new goal because this session already has a goal");
 			}
-			const state = this.#createGoalState(objective);
+			const state = this.#createGoalState(objective, input.provenance);
 			this.#markActiveAccounting(state.goal);
 			await this.#commitState(state, { persist: "goal" });
 			return state;
 		});
 	}
 
-	async replaceGoal(input: { objective: string }): Promise<GoalModeState> {
+	async replaceGoal(input: { objective: string; provenance?: GoalProvenance }): Promise<GoalModeState> {
 		const objective = validateGoalObjective(input.objective, "replace");
 		return await this.#withAccounting(async () => {
 			const existing = this.#getStateClone();
@@ -330,10 +396,83 @@ export class GoalRuntime {
 				throw new Error("cannot replace goal because no goal is active");
 			}
 			await this.#flushUsageLocked();
-			const state = this.#createGoalState(objective);
+			const state = this.#createGoalState(objective, input.provenance);
 			this.#markActiveAccounting(state.goal);
 			await this.#commitState(state, { persist: "goal" });
 			return state;
+		});
+	}
+
+	/**
+	 * Trusted live replace API for ultragoal aggregate reconciliation. Decides
+	 * between create (no live non-terminal goal), keep (same objective + matching
+	 * provenance, backfilling missing provenance), or replace (mismatched
+	 * objective, flushing prior usage). Works for active and paused non-terminal
+	 * goals.
+	 */
+	async reconcileGoalFromSource(input: {
+		objective: string;
+		provenance?: GoalProvenance;
+		reason?: string;
+	}): Promise<{ action: "create" | "keep" | "replace"; state: GoalModeState; previousObjective?: string }> {
+		const objective = validateGoalObjective(input.objective, "create");
+		const provenance = input.provenance;
+		return await this.#withAccounting(async () => {
+			const existing = this.#getStateClone();
+			const hasNonTerminal = Boolean(
+				existing?.goal && existing.goal.status !== "complete" && existing.goal.status !== "dropped",
+			);
+
+			// No live non-terminal goal: create fresh with provenance.
+			if (!hasNonTerminal) {
+				const state = this.#createGoalState(objective, provenance);
+				this.#markActiveAccounting(state.goal);
+				await this.#commitState(state, { persist: "goal" });
+				return { action: "create" as const, state };
+			}
+
+			const existingGoal = existing!.goal;
+			const sameObjective = existingGoal.objective === objective;
+			// Only treat populated existing provenance fields as constraints:
+			// missing fields may be backfilled without replacing the goal.
+			const provenanceConflicts =
+				(existingGoal.source !== undefined &&
+					provenance?.source !== undefined &&
+					existingGoal.source !== provenance.source) ||
+				(existingGoal.sourcePlanPath !== undefined &&
+					provenance?.sourcePlanPath !== undefined &&
+					existingGoal.sourcePlanPath !== provenance.sourcePlanPath) ||
+				(existingGoal.sourceBriefHash !== undefined &&
+					provenance?.sourceBriefHash !== undefined &&
+					existingGoal.sourceBriefHash !== provenance.sourceBriefHash);
+			const provenanceMatches = sameObjective && !provenanceConflicts;
+
+			if (sameObjective && provenanceMatches) {
+				// Backfill missing provenance fields when provided.
+				if (
+					provenance &&
+					(existingGoal.source === undefined ||
+						existingGoal.sourcePlanPath === undefined ||
+						existingGoal.sourceBriefHash === undefined)
+				) {
+					existingGoal.source = existingGoal.source ?? provenance.source;
+					existingGoal.sourcePlanPath = existingGoal.sourcePlanPath ?? provenance.sourcePlanPath;
+					existingGoal.sourceBriefHash = existingGoal.sourceBriefHash ?? provenance.sourceBriefHash;
+					existingGoal.updatedAt = this.#now();
+					await this.#commitState(existing!, { persist: "goal" });
+				}
+				return { action: "keep" as const, state: existing! };
+			}
+
+			// Mismatch: flush usage (if active), then create a fresh state.
+			const previousObjective = existingGoal.objective;
+			if (isAccountingStatus(existingGoal)) {
+				await this.#flushUsageLocked();
+			}
+			const state = this.#createGoalState(objective, provenance);
+			this.#markActiveAccounting(state.goal);
+			await this.#commitState(state, { persist: "goal" });
+			return { action: "replace" as const, state, previousObjective };
 		});
 	}
 

@@ -6,8 +6,10 @@ import {
 	GoalRuntime,
 	type GoalRuntimeHost,
 	goalTokenDelta,
+	isCommandNameObjective,
 	renderGoalPrompt,
 	renderTrustedObjective,
+	validateGoalObjective,
 } from "@gajae-code/coding-agent/goals/runtime";
 import type { Goal, GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "@gajae-code/coding-agent/goals/state";
 
@@ -370,5 +372,258 @@ describe("goal runtime", () => {
 		expect(state?.enabled).toBe(false);
 		expect(state?.mode).toBe("exiting");
 		expect(state?.goal.status).toBe("complete");
+	});
+	it("validateGoalObjective rejects command-shaped sole objectives", () => {
+		expect(() => validateGoalObjective("/goal", "create")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("/ultragoal", "create")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("/skill:ultragoal", "create")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("/", "create")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("//", "create")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("/models", "create")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("/bg", "create")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("/quit", "create")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("/skill:ralplan", "replace")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("/ralplan", "replace")).toThrow("objective must describe the goal");
+		expect(() => validateGoalObjective("/team", "replace")).toThrow("objective must describe the goal");
+	});
+
+	it("validateGoalObjective rejects empty objectives with the op-specific message", () => {
+		expect(() => validateGoalObjective("   ", "create")).toThrow("objective is required when op=create");
+		expect(() => validateGoalObjective("\t\n", "replace")).toThrow("objective is required when op=replace");
+	});
+
+	it("validateGoalObjective accepts prose that mentions a slash command", () => {
+		expect(validateGoalObjective("Document how /goal works", "create")).toBe("Document how /goal works");
+		expect(validateGoalObjective("Use /skill:ultragoal to plan", "replace")).toBe("Use /skill:ultragoal to plan");
+	});
+
+	it("isCommandNameObjective flags command tokens and spares prose", () => {
+		expect(isCommandNameObjective("/goal")).toBe(true);
+		expect(isCommandNameObjective("/ultragoal")).toBe(true);
+		expect(isCommandNameObjective("/skill:ultragoal")).toBe(true);
+		expect(isCommandNameObjective("/")).toBe(true);
+		expect(isCommandNameObjective("//")).toBe(true);
+		expect(isCommandNameObjective("/models")).toBe(true);
+		expect(isCommandNameObjective("/bg")).toBe(true);
+		expect(isCommandNameObjective("/quit")).toBe(true);
+		expect(isCommandNameObjective("/unknown-cmd")).toBe(true);
+		expect(isCommandNameObjective("Document how /goal works")).toBe(false);
+		expect(isCommandNameObjective("Ship the release")).toBe(false);
+	});
+
+	it("createGoal rejects command-shaped objectives", async () => {
+		const harness = createHarness();
+		await expect(harness.runtime.createGoal({ objective: "/goal" })).rejects.toThrow(
+			"objective must describe the goal",
+		);
+		await expect(harness.runtime.createGoal({ objective: "/ultragoal" })).rejects.toThrow(
+			"objective must describe the goal",
+		);
+		expect(harness.getState()).toBeUndefined();
+	});
+
+	it("replaceGoal rejects command-shaped objectives", async () => {
+		const harness = createHarness({
+			state: { enabled: true, mode: "active", goal: createGoal({ objective: "Existing" }) },
+		});
+		await expect(harness.runtime.replaceGoal({ objective: "/goal" })).rejects.toThrow(
+			"objective must describe the goal",
+		);
+		expect(harness.getState()?.goal.objective).toBe("Existing");
+	});
+
+	it("reconcileGoalFromSource creates a fresh goal with provenance when none exists", async () => {
+		const harness = createHarness();
+		const result = await harness.runtime.reconcileGoalFromSource({
+			objective: "Ship verified ultragoal aggregate",
+			provenance: {
+				source: "ultragoal",
+				sourcePlanPath: ".gjc/plans/ralplan/p-1.md",
+				sourceBriefHash: "abc123",
+			},
+		});
+		expect(result.action).toBe("create");
+		expect(result.state.goal.objective).toBe("Ship verified ultragoal aggregate");
+		expect(result.state.goal.source).toBe("ultragoal");
+		expect(result.state.goal.sourcePlanPath).toBe(".gjc/plans/ralplan/p-1.md");
+		expect(result.state.goal.sourceBriefHash).toBe("abc123");
+		expect(result.previousObjective).toBeUndefined();
+		expect(harness.getState()?.goal.source).toBe("ultragoal");
+	});
+
+	it("reconcileGoalFromSource keeps a matching non-terminal goal and backfills missing provenance", async () => {
+		const harness = createHarness({
+			state: {
+				enabled: true,
+				mode: "active",
+				goal: createGoal({ objective: "Ship verified ultragoal aggregate" }),
+			},
+		});
+		const result = await harness.runtime.reconcileGoalFromSource({
+			objective: "Ship verified ultragoal aggregate",
+			provenance: {
+				source: "ultragoal",
+				sourcePlanPath: ".gjc/plans/ralplan/p-1.md",
+				sourceBriefHash: "abc123",
+			},
+		});
+		expect(result.action).toBe("keep");
+		expect(result.state.goal.objective).toBe("Ship verified ultragoal aggregate");
+		expect(result.state.goal.source).toBe("ultragoal");
+		expect(result.state.goal.sourcePlanPath).toBe(".gjc/plans/ralplan/p-1.md");
+		expect(result.state.goal.sourceBriefHash).toBe("abc123");
+		expect(result.previousObjective).toBeUndefined();
+		expect(harness.getState()?.goal.source).toBe("ultragoal");
+	});
+
+	it("reconcileGoalFromSource keeps a matching goal when provenance already matches", async () => {
+		const harness = createHarness({
+			state: {
+				enabled: true,
+				mode: "active",
+				goal: createGoal({
+					objective: "Ship verified ultragoal aggregate",
+					source: "ultragoal",
+					sourcePlanPath: ".gjc/plans/ralplan/p-1.md",
+					sourceBriefHash: "abc123",
+				}),
+			},
+		});
+		const result = await harness.runtime.reconcileGoalFromSource({
+			objective: "Ship verified ultragoal aggregate",
+			provenance: {
+				source: "ultragoal",
+				sourcePlanPath: ".gjc/plans/ralplan/p-1.md",
+				sourceBriefHash: "abc123",
+			},
+		});
+		expect(result.action).toBe("keep");
+		expect(result.state.goal.source).toBe("ultragoal");
+		expect(result.previousObjective).toBeUndefined();
+	});
+	it("reconcileGoalFromSource keeps same objective with partial provenance and backfills missing fields", async () => {
+		const harness = createHarness({
+			state: {
+				enabled: true,
+				mode: "active",
+				goal: createGoal({
+					objective: "Ship verified ultragoal aggregate",
+					source: "ultragoal",
+					// sourcePlanPath / sourceBriefHash intentionally missing
+				}),
+			},
+		});
+		const result = await harness.runtime.reconcileGoalFromSource({
+			objective: "Ship verified ultragoal aggregate",
+			provenance: {
+				source: "ultragoal",
+				sourcePlanPath: ".gjc/plans/ralplan/p-1.md",
+				sourceBriefHash: "abc123",
+			},
+		});
+		expect(result.action).toBe("keep");
+		expect(result.state.goal.id).toBe(harness.getState()?.goal.id);
+		expect(result.state.goal.source).toBe("ultragoal");
+		expect(result.state.goal.sourcePlanPath).toBe(".gjc/plans/ralplan/p-1.md");
+		expect(result.state.goal.sourceBriefHash).toBe("abc123");
+	});
+
+	it("reconcileGoalFromSource replaces a mismatched active goal and flushes usage", async () => {
+		const harness = createHarness({
+			state: {
+				enabled: true,
+				mode: "active",
+				goal: createGoal({ objective: "Old objective", tokensUsed: 0, timeUsedSeconds: 0 }),
+			},
+		});
+		harness.runtime.onTurnStart("turn-1", createUsage());
+		harness.advance(2_000);
+		harness.setUsage({ input: 20 });
+
+		const result = await harness.runtime.reconcileGoalFromSource({
+			objective: "New objective",
+			provenance: { source: "ultragoal", sourcePlanPath: ".gjc/plans/ralplan/p-2.md" },
+		});
+		expect(result.action).toBe("replace");
+		expect(result.state.goal.objective).toBe("New objective");
+		expect(result.state.goal.source).toBe("ultragoal");
+		expect(result.state.goal.sourcePlanPath).toBe(".gjc/plans/ralplan/p-2.md");
+		expect(result.state.goal.tokensUsed).toBe(0);
+		expect(result.previousObjective).toBe("Old objective");
+		expect(harness.getState()?.goal.objective).toBe("New objective");
+	});
+
+	it("reconcileGoalFromSource replaces a mismatched paused goal", async () => {
+		const harness = createHarness({
+			state: {
+				enabled: false,
+				mode: "active",
+				goal: createGoal({ objective: "Paused old", status: "paused" }),
+			},
+		});
+		const result = await harness.runtime.reconcileGoalFromSource({
+			objective: "Fresh objective",
+			provenance: { source: "ultragoal" },
+		});
+		expect(result.action).toBe("replace");
+		expect(result.state.goal.objective).toBe("Fresh objective");
+		expect(result.state.goal.status).toBe("active");
+		expect(result.previousObjective).toBe("Paused old");
+	});
+
+	it("reconcileGoalFromSource creates when the prior goal is complete", async () => {
+		const harness = createHarness({
+			state: {
+				enabled: false,
+				mode: "exiting",
+				reason: "completed",
+				goal: createGoal({ objective: "Done", status: "complete" }),
+			},
+		});
+		const result = await harness.runtime.reconcileGoalFromSource({
+			objective: "Next phase",
+			provenance: { source: "ultragoal" },
+		});
+		expect(result.action).toBe("create");
+		expect(result.state.goal.objective).toBe("Next phase");
+		expect(result.previousObjective).toBeUndefined();
+	});
+
+	it("reconcileGoalFromSource rejects command-shaped objectives", async () => {
+		const harness = createHarness();
+		await expect(
+			harness.runtime.reconcileGoalFromSource({ objective: "/goal", provenance: { source: "ultragoal" } }),
+		).rejects.toThrow("objective must describe the goal");
+	});
+
+	it("reconcileGoalFromSource accepts prose that mentions a slash command", async () => {
+		const harness = createHarness();
+		const result = await harness.runtime.reconcileGoalFromSource({
+			objective: "Document how /goal works",
+			provenance: { source: "manual" },
+		});
+		expect(result.action).toBe("create");
+		expect(result.state.goal.objective).toBe("Document how /goal works");
+		expect(result.state.goal.source).toBe("manual");
+	});
+
+	it("createGoal stores provenance when provided", async () => {
+		const harness = createHarness();
+		const state = await harness.runtime.createGoal({
+			objective: "Ship it",
+			provenance: { source: "ultragoal", sourcePlanPath: ".gjc/plans/ralplan/p-9.md", sourceBriefHash: "hash-x" },
+		});
+		expect(state.goal.source).toBe("ultragoal");
+		expect(state.goal.sourcePlanPath).toBe(".gjc/plans/ralplan/p-9.md");
+		expect(state.goal.sourceBriefHash).toBe("hash-x");
+		expect(harness.getState()?.goal.source).toBe("ultragoal");
+	});
+
+	it("createGoal omits provenance fields when not provided", async () => {
+		const harness = createHarness();
+		const state = await harness.runtime.createGoal({ objective: "Ship it" });
+		expect(state.goal.source).toBeUndefined();
+		expect(state.goal.sourcePlanPath).toBeUndefined();
+		expect(state.goal.sourceBriefHash).toBeUndefined();
 	});
 });

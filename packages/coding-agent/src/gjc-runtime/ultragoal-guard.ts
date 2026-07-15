@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
-import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
+import { createHash } from "node:crypto";
+import { aggregateObjectiveMatches, DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { resolveGjcSessionForRead, SessionResolutionError } from "./session-resolution";
 import { validateDeferredMemberReceiptFresh, validateReceiptFreshBase } from "./ultragoal-receipt-freshness";
 import {
@@ -849,4 +850,118 @@ export async function assertUltragoalDropAllowed(input: {
 		sessionId,
 	});
 	if (nudge.nudged) throw new Error(nudge.message);
+}
+
+export type UltragoalAggregateGoalInvariantState =
+	| "inactive"
+	| "missing_plan"
+	| "matching_aggregate"
+	| "mismatched_active_goal"
+	| "stale_completed_plan"
+	| "unreadable_fail_closed";
+
+export interface UltragoalAggregateGoalInvariantResult {
+	state: UltragoalAggregateGoalInvariantState;
+	message: string;
+}
+
+/**
+ * Continuation invariant for ultragoal aggregate reconciliation. Checks whether
+ * the current live goal is consistent with the durable aggregate plan:
+ *
+ * - no current goal → inactive
+ * - no plan → missing_plan if the objective looks ultragoal, else inactive
+ * - plan complete AND goal lacks matching briefHash provenance → stale_completed_plan
+ * - objective matches aggregate (including aliases) → matching_aggregate
+ * - otherwise → mismatched_active_goal
+ *
+ * Used by the goal continuation path to skip normal continuation and inject a
+ * reconciliation steer when the live goal has drifted from the durable plan.
+ */
+export async function readUltragoalAggregateGoalInvariant(input: {
+	cwd: string;
+	currentGoal?: { objective: string; status?: string; source?: string; sourcePlanPath?: string; sourceBriefHash?: string } | null;
+	sessionId?: string | null;
+}): Promise<UltragoalAggregateGoalInvariantResult> {
+	const currentObjective = input.currentGoal?.objective?.trim() ?? "";
+	if (!currentObjective || !input.currentGoal) {
+		return { state: "inactive", message: "No current goal is active." };
+	}
+
+	let paths: UltragoalPaths;
+	let sessionId: string | null;
+	try {
+		({ paths, sessionId } = await ultragoalReadPaths(input.cwd, { sessionId: input.sessionId }));
+	} catch (error) {
+		return {
+			state: "unreadable_fail_closed",
+			message: `Unable to resolve durable Ultragoal state: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+
+	let plan: UltragoalPlan | null;
+	try {
+		plan = await readUltragoalPlan(input.cwd, sessionId);
+	} catch (error) {
+		return {
+			state: "unreadable_fail_closed",
+			message: `Unable to read durable Ultragoal plan: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+
+	if (!plan) {
+		if (isKnownUltragoalObjective(currentObjective)) {
+			return {
+				state: "missing_plan",
+				message: "Current goal looks like an Ultragoal objective but no durable plan exists.",
+			};
+		}
+		return { state: "inactive", message: "No Ultragoal plan exists and the current goal is not an Ultragoal objective." };
+	}
+
+	// Compute current plan brief hash for stale detection.
+	let currentBriefHash: string | undefined;
+	try {
+		const briefContent = await Bun.file(paths.briefPath).text();
+		currentBriefHash = createHash("sha256").update(briefContent).digest("hex");
+	} catch (error) {
+		if (!isEnoent(error)) {
+			return {
+				state: "unreadable_fail_closed",
+				message: `Unable to read Ultragoal brief: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+
+	// Check if the plan is complete and the goal's provenance doesn't match the current brief.
+	const runState = getUltragoalRunCompletionState(plan);
+	if (runState.allComplete) {
+		const goalBriefHash = input.currentGoal.sourceBriefHash;
+		if (!goalBriefHash || goalBriefHash !== currentBriefHash) {
+			// Plan is complete but the goal lacks matching briefHash provenance —
+			// the goal is stale relative to a completed plan and needs a fresh create-goals.
+			if (!aggregateObjectiveMatches(currentObjective, plan.gjcObjective, plan.gjcObjectiveAliases)) {
+				return {
+					state: "mismatched_active_goal",
+					message: "Current goal does not match the completed aggregate plan objective.",
+				};
+			}
+			return {
+				state: "stale_completed_plan",
+				message: "The aggregate plan is complete but the active goal lacks matching brief provenance. Run `gjc ultragoal create-goals` to start a fresh plan.",
+			};
+		}
+	}
+
+	if (aggregateObjectiveMatches(currentObjective, plan.gjcObjective, plan.gjcObjectiveAliases)) {
+		return {
+			state: "matching_aggregate",
+			message: "Current goal matches the aggregate plan objective.",
+		};
+	}
+
+	return {
+		state: "mismatched_active_goal",
+		message: `Current goal "${currentObjective}" does not match the aggregate plan objective "${plan.gjcObjective}".`,
+	};
 }

@@ -214,6 +214,57 @@ describe("GoalTool", () => {
 		expect(harness.getState()).toBeUndefined();
 	});
 
+	it("rejects op=create for command-shaped sole objectives across slash tokens", async () => {
+		const harness = createRuntimeHarness();
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		const commandTokens = [
+			"/goal",
+			"/ultragoal",
+			"/skill:ultragoal",
+			"/",
+			"//",
+			"/models",
+			"/bg",
+			"/quit",
+			"/skill:ralplan",
+			"/ralplan",
+			"/deep-interview",
+			"/team",
+			"/exit",
+			"/help",
+			"/commit",
+		];
+		for (const token of commandTokens) {
+			await expect(tool.execute(`call-${token}`, { op: "create", objective: token })).rejects.toThrow(
+				"objective must describe the goal",
+			);
+		}
+		expect(harness.getState()).toBeUndefined();
+	});
+
+	it("accepts op=create for prose that merely mentions a slash command", async () => {
+		const harness = createRuntimeHarness();
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		const result = await tool.execute("call-prose", {
+			op: "create",
+			objective: "Document how /goal works",
+		});
+		expect(result.details?.goal?.objective).toBe("Document how /goal works");
+		expect(harness.getState()?.goal.objective).toBe("Document how /goal works");
+	});
+
 	it("flips state to exiting and clears enabled when op=complete succeeds (fix #1)", async () => {
 		const harness = createRuntimeHarness();
 		await harness.runtime.createGoal({ objective: "Ship the release" });

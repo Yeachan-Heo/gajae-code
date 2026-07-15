@@ -194,7 +194,13 @@ import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
-import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
+import {
+	ackPendingGoalModeRequest,
+	buildGjcRuntimeSessionEnv,
+	peekPendingGoalModeRequest,
+	shouldReconcileGoal,
+} from "../gjc-runtime/goal-mode-request";
+import { readUltragoalAggregateGoalInvariant } from "../gjc-runtime/ultragoal-guard";
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
@@ -5212,19 +5218,87 @@ export class AgentSession {
 
 	async #activatePendingGjcGoalModeRequest(): Promise<boolean> {
 		if (!this.settings.get("goal.enabled")) return false;
-		const pendingGoal = await consumePendingGoalModeRequest(
-			this.sessionManager.getCwd(),
-			this.sessionManager.getSessionId(),
-		);
+		const cwd = this.sessionManager.getCwd();
+		const sessionId = this.sessionManager.getSessionId();
+		// Peek without deleting so blocked/failed reconciliation remains retryable.
+		const pendingGoal = await peekPendingGoalModeRequest(cwd, sessionId);
 		if (!pendingGoal) return false;
+
 		const currentState = this.getGoalModeState();
-		if (currentState?.goal && currentState.goal.status !== "complete" && currentState.goal.status !== "dropped") {
+		const currentGoal = currentState?.goal ?? null;
+		const decision = shouldReconcileGoal(
+			currentGoal
+				? {
+						objective: currentGoal.objective,
+						status: currentGoal.status,
+						...(currentGoal.source ? { source: currentGoal.source } : {}),
+						...(currentGoal.sourcePlanPath ? { sourcePlanPath: currentGoal.sourcePlanPath } : {}),
+						...(currentGoal.sourceBriefHash ? { sourceBriefHash: currentGoal.sourceBriefHash } : {}),
+					}
+				: null,
+			{
+				objective: pendingGoal.objective,
+				...(pendingGoal.sourcePlanPath ? { sourcePlanPath: pendingGoal.sourcePlanPath } : {}),
+				...(pendingGoal.sourceBriefHash ? { sourceBriefHash: pendingGoal.sourceBriefHash } : {}),
+				...(pendingGoal.gjcObjectiveAliases ? { gjcObjectiveAliases: pendingGoal.gjcObjectiveAliases } : {}),
+			},
+		);
+
+		if (decision === "block") {
+			if (this.isStreaming) {
+				await this.sendCustomMessage(
+					{
+						customType: "goal-reconciliation",
+						content: `A pending ultragoal goal-mode request could not be reconciled with the current active goal due to a provenance conflict. The existing goal objective matches but source provenance differs. Resolve the conflict manually or run \`gjc ultragoal create-goals\` again after clearing the current goal.`,
+						display: false,
+					},
+					{ deliverAs: "steer" },
+				);
+			}
+			// Keep the pending request on disk for retry after the conflict is resolved.
 			return false;
 		}
 
 		const previousTools = this.getActiveToolNames();
 		const goalTools = [...new Set([...previousTools, "goal"])];
-		await this.#goalRuntime.createGoal({ objective: pendingGoal.objective });
+		const provenance = {
+			source: "ultragoal" as const,
+			...(pendingGoal.sourcePlanPath ?? pendingGoal.goalsPath
+				? { sourcePlanPath: pendingGoal.sourcePlanPath ?? pendingGoal.goalsPath }
+				: {}),
+			...(pendingGoal.sourceBriefHash ? { sourceBriefHash: pendingGoal.sourceBriefHash } : {}),
+		};
+
+		if (decision === "create" || decision === "replace") {
+			const result = await this.#goalRuntime.reconcileGoalFromSource({
+				objective: pendingGoal.objective,
+				provenance,
+			});
+			await ackPendingGoalModeRequest(cwd, sessionId);
+			await this.setActiveToolsByName(goalTools);
+			if (this.isStreaming) {
+				await this.sendGoalModeContext({ deliverAs: "steer" });
+				if (decision === "replace" && result.previousObjective) {
+					await this.sendCustomMessage(
+						{
+							customType: "goal-reconciliation",
+							content: `The previous active goal "${result.previousObjective}" has been replaced by the aggregate ultragoal objective "${pendingGoal.objective}" from ${pendingGoal.goalsPath ?? ".gjc/ultragoal/goals.json"}. Continue execution under the durable plan.`,
+							display: false,
+						},
+						{ deliverAs: "steer" },
+					);
+				}
+			}
+			return true;
+		}
+
+		// decision === "keep": backfill provenance under the already-matching objective
+		// (may be an alias of the pending aggregate objective).
+		await this.#goalRuntime.reconcileGoalFromSource({
+			objective: currentGoal?.objective ?? pendingGoal.objective,
+			provenance,
+		});
+		await ackPendingGoalModeRequest(cwd, sessionId);
 		await this.setActiveToolsByName(goalTools);
 		if (this.isStreaming) {
 			await this.sendGoalModeContext({ deliverAs: "steer" });
@@ -8255,6 +8329,41 @@ export class AgentSession {
 
 		const continuationPrompt = this.#goalRuntime.buildContinuationPrompt();
 		if (!continuationPrompt) return false;
+
+		// Ultragoal aggregate reconciliation invariant: when the ultragoal skill is
+		// active and the live goal has drifted from the durable plan (mismatched or
+		// stale completed plan), skip the normal continuation and inject a
+		// reconciliation steer instead so the agent reconciles before continuing.
+		if (this.#activeSkillState?.skill === "ultragoal") {
+			try {
+				const invariant = await readUltragoalAggregateGoalInvariant({
+					cwd: this.sessionManager.getCwd(),
+					currentGoal: state.goal,
+					sessionId: this.sessionManager.getSessionId(),
+				});
+				if (invariant.state === "mismatched_active_goal" || invariant.state === "stale_completed_plan") {
+					logger.debug("Goal completion: ultragoal invariant mismatch, sending reconciliation steer", {
+						goalId: state.goal.id,
+						invariantState: invariant.state,
+					});
+					await this.sendCustomMessage(
+						{
+							customType: "goal-reconciliation",
+							content: invariant.message,
+							display: false,
+						},
+						{ deliverAs: "steer" },
+					);
+					this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+					return true;
+				}
+			} catch (error) {
+				logger.warn("Ultragoal aggregate goal invariant check failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+
 		const reminder = [
 			"<system-reminder>",
 			"You stopped while a goal is still active and uncleared.",
