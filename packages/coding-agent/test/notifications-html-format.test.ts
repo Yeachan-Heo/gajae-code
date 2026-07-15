@@ -27,9 +27,10 @@ describe("escapeHtml (AC2)", () => {
 });
 
 describe("markdownToTelegramHtml (AC5)", () => {
-	test("bold and italic", () => {
+	test("bold, italic, and strikethrough", () => {
 		expect(markdownToTelegramHtml("**hi**")).toBe("<b>hi</b>");
 		expect(markdownToTelegramHtml("*hi*")).toBe("<i>hi</i>");
+		expect(markdownToTelegramHtml("~~hi~~")).toBe("<s>hi</s>");
 	});
 
 	test("inline and fenced code escape their contents and are not re-parsed", () => {

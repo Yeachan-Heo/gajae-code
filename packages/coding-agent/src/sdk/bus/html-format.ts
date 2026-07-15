@@ -172,8 +172,9 @@ function convertMarkdownTables(text: string, stash: (html: string) => string): s
 
 /**
  * Convert a bounded markdown subset into Telegram HTML. Supported: fenced code,
- * inline code, `**bold**`, `*italic*`, `[text](url)` (safe schemes only),
- * `#` headers, `>` blockquotes, and GFM tables (rendered as a monospace block).
+ * inline code, `**bold**`, `*italic*`, `~~strikethrough~~`, `[text](url)`
+ * (safe schemes only), `#` headers, `>` blockquotes, and GFM tables (rendered
+ * as a monospace block).
  * Unsupported or malformed markdown is left as escaped literal text — never
  * emitted as unbalanced tags.
  */
@@ -234,6 +235,7 @@ export function markdownToTelegramHtml(markdown: string): string {
 	// 6. Inline emphasis (bold before italic; unbalanced markers stay literal).
 	text = text.replace(/\*\*([^*\n]+)\*\*/g, (_m, body: string) => tag("b", body));
 	text = text.replace(/\*([^*\n]+)\*/g, (_m, body: string) => tag("i", body));
+	text = text.replace(/~~([^~\n]+)~~/g, (_m, body: string) => tag("s", body));
 
 	// 7. Restore protected placeholders.
 	text = text.replace(

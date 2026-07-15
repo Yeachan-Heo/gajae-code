@@ -3208,31 +3208,7 @@ export class TelegramNotificationDaemon {
 							throw new Error("Telegram rejected /btw reply");
 					}
 				};
-				if (this.opts.rich?.enabled !== false) {
-					const messageId = await deliverRichWithFallback(
-						this.botApi,
-						{ chat_id: this.opts.chatId, message_thread_id: Number(pending.threadId) },
-						{
-							method: "sendMessage",
-							lane: "finalized",
-							text: html,
-							editable: false,
-							richClass: "final",
-							richMarkdown: markdown,
-						},
-						fallback,
-						logger,
-					);
-					if (messageId !== undefined) {
-						await this.replyStore.record({
-							chatId: this.opts.chatId,
-							messageId,
-							text: markdown,
-						});
-					}
-				} else {
-					await fallback();
-				}
+				await fallback();
 			} catch {
 				logger.warn("notifications: /btw reply delivery failed");
 			}

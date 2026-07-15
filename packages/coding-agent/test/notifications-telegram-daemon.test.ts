@@ -2556,7 +2556,6 @@ describe("telegram daemon", () => {
 			botToken: "tok",
 			chatId: "42",
 			botApi: bot,
-			rich: { enabled: false },
 			WebSocketImpl: FakeWs as any,
 		});
 		daemon.connectSession("S", "ws://s", "ts");
@@ -2606,7 +2605,7 @@ describe("telegram daemon", () => {
 			requestId,
 			threadId: String(threadId),
 			updateId: 8,
-			text: "The <parser> changed.",
+			text: "**The** ~~parser~~ changed.",
 		});
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "ephemeral_turn_result",
@@ -2622,7 +2621,7 @@ describe("telegram daemon", () => {
 				method: "sendMessage",
 				body: expect.objectContaining({
 					message_thread_id: threadId,
-					text: "The &lt;parser&gt; changed.",
+					text: "<b>The</b> <s>parser</s> changed.",
 				}),
 			}),
 		);
