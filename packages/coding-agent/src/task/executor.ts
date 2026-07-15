@@ -43,7 +43,7 @@ import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
-import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
+import { taskTokenLogFromUsage, tryPersistTaskTokenLog } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
@@ -1296,6 +1296,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? { id, name: agent.name, description: agent.description }
 				: undefined;
 			let subagentTokenTurn = 0;
+			let tokenLogDisabled = false;
 			const tokenLogDir = options.parentSessionId
 				? path.join(sessionRoot(cwd, options.parentSessionId), "token-logs")
 				: undefined;
@@ -1312,21 +1313,25 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							// chaining it here would double-log every subagent turn under root.
 							// Subagent turns are attributed to this child's id instead.
 							onChatUsage: async event => {
-								if (!tokenLogDir) return;
+								if (!tokenLogDir || tokenLogDisabled) return;
 								subagentTokenTurn += 1;
-								await persistTaskTokenLog(
-									taskTokenLogFromUsage(event.usage, {
-										subagentId: id,
-										agent: agent.name,
-										// Monotonic 1-based sequence per subagent session
-										// (event.stepNumber is 0-based and -1 for oneshots).
-										turn: subagentTokenTurn,
-										at: new Date().toISOString(),
-										model: event.model,
-										cost: event.cost,
-									}),
-									{ dir: tokenLogDir },
-								);
+								if (
+									!(await tryPersistTaskTokenLog(
+										taskTokenLogFromUsage(event.usage, {
+											subagentId: id,
+											agent: agent.name,
+											// Monotonic 1-based sequence per subagent session
+											// (event.stepNumber is 0-based and -1 for oneshots).
+											turn: subagentTokenTurn,
+											at: new Date().toISOString(),
+											model: event.model,
+											cost: event.cost,
+										}),
+										{ dir: tokenLogDir },
+									))
+								) {
+									tokenLogDisabled = true;
+								}
 							},
 						}
 					: undefined;

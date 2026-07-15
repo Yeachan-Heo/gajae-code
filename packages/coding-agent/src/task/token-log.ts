@@ -76,6 +76,12 @@ export async function resolveTaskTokenLogDir(
 	sessionManager: TaskTokenLogSessionManager | undefined,
 	envSessionId: string | undefined = process.env.GJC_SESSION_ID,
 ): Promise<string | undefined> {
+	// The filesystem root is neither a project nor a safe owner for `/.gjc`.
+	// Token accounting is optional, so do not request privileged global state
+	// merely because GJC was launched from `/`.
+	const resolvedCwd = path.resolve(cwd);
+	if (resolvedCwd === path.parse(resolvedCwd).root) return undefined;
+
 	// Prefer the canonical SessionManager id so root turns land in the SAME
 	// `<session>/token-logs` dir the task executor uses for subagent turns and
 	// that `gjc --fixture <id>` reads from. Fall back to the env/latest-active
@@ -83,18 +89,29 @@ export async function resolveTaskTokenLogDir(
 	// the SDK adopts a pre-allocated id internally). Never let a best-effort
 	// telemetry side channel crash startup — swallow every SessionResolutionError.
 	const managerId = sessionManager?.getSessionId();
-	if (managerId) return path.join(sessionRoot(cwd, managerId), "token-logs");
+	if (managerId) return path.join(sessionRoot(resolvedCwd, managerId), "token-logs");
 	try {
-		const session = await resolveGjcSessionForRead(cwd, { envSessionId });
+		const session = await resolveGjcSessionForRead(resolvedCwd, { envSessionId });
 		return path.join(session.sessionRoot, "token-logs");
 	} catch (error) {
 		if (error instanceof SessionResolutionError) return undefined;
 		throw error;
 	}
 }
+
 export async function persistTaskTokenLog(entry: TaskTokenLog, opts: { dir: string }): Promise<void> {
 	await fs.mkdir(opts.dir, { recursive: true });
 	await fs.appendFile(path.join(opts.dir, TOKEN_LOG_FILE), `${JSON.stringify(entry)}\n`, "utf-8");
+}
+
+/** Token logs are telemetry: a failed write must not fail an agent turn. */
+export async function tryPersistTaskTokenLog(entry: TaskTokenLog, opts: { dir: string }): Promise<boolean> {
+	try {
+		await persistTaskTokenLog(entry, opts);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 export async function readTaskTokenLogs(dir: string): Promise<TaskTokenLog[]> {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { GJC_SESSION_ACTIVITY_FILE, sessionRoot } from "../gjc-runtime/session-layout";
 import {
 	computeCacheHitRate,
@@ -10,6 +10,7 @@ import {
 	resolveTaskTokenLogDir,
 	taskTokenLogFromChat,
 	taskTokenLogFromUsage,
+	tryPersistTaskTokenLog,
 } from "./token-log";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -93,6 +94,18 @@ describe("task token log", () => {
 			expect(await readTaskTokenLogs(dir)).toEqual([first, second]);
 		});
 	});
+	it("skips persistence errors because token logs are optional telemetry", async () => {
+		await withTempDir(async dir => {
+			const blockedParent = join(dir, "not-a-directory");
+			await writeFile(blockedParent, "", "utf-8");
+			const entry = taskTokenLogFromChat(
+				{ inputTokens: 1, outputTokens: 2, cachedInputTokens: 3, cacheWriteTokens: 4 },
+				{ subagentId: "root", turn: 1, at: "2026-01-01T00:00:00.000Z" },
+			);
+
+			await expect(tryPersistTaskTokenLog(entry, { dir: join(blockedParent, "token-logs") })).resolves.toBe(false);
+		});
+	});
 
 	it("prefers the current session manager over a stale latest-active session", async () => {
 		await withTempDir(async cwd => {
@@ -118,6 +131,10 @@ describe("task token log", () => {
 				join(sessionRoot(cwd, currentSessionId), "token-logs"),
 			);
 		});
+	});
+	it("does not create token logs under the filesystem root", async () => {
+		const root = parse(process.cwd()).root;
+		await expect(resolveTaskTokenLogDir(root, { getSessionId: () => "root-session" }, "")).resolves.toBeUndefined();
 	});
 
 	it("missing token-log file reads as empty", async () => {

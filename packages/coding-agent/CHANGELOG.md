@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Token-log telemetry now skips filesystem-root workspaces and disables itself after a failed write, so a non-writable `/.gjc` cannot surface as an `onChatUsage` callback failure.
 
 ## [0.10.2] - 2026-07-14
 

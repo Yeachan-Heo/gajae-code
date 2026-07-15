@@ -63,7 +63,7 @@ import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
-import { persistTaskTokenLog, resolveTaskTokenLogDir, taskTokenLogFromUsage } from "./task/token-log";
+import { resolveTaskTokenLogDir, taskTokenLogFromUsage, tryPersistTaskTokenLog } from "./task/token-log";
 import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
@@ -1198,19 +1198,23 @@ export async function runRootCommand(
 			}
 			if (!rootTokenLogDir) return;
 			rootTokenTurn += 1;
-			await persistTaskTokenLog(
-				taskTokenLogFromUsage(event.usage, {
-					subagentId: "root",
-					agent: event.agent?.name ?? "main",
-					// Monotonic 1-based sequence of persisted usage events for this
-					// session (event.stepNumber is 0-based and -1 for oneshot spans).
-					turn: rootTokenTurn,
-					at: new Date().toISOString(),
-					model: event.model,
-					cost: event.cost,
-				}),
-				{ dir: rootTokenLogDir },
-			);
+			if (
+				!(await tryPersistTaskTokenLog(
+					taskTokenLogFromUsage(event.usage, {
+						subagentId: "root",
+						agent: event.agent?.name ?? "main",
+						// Monotonic 1-based sequence of persisted usage events for this
+						// session (event.stepNumber is 0-based and -1 for oneshots).
+						turn: rootTokenTurn,
+						at: new Date().toISOString(),
+						model: event.model,
+						cost: event.cost,
+					}),
+					{ dir: rootTokenLogDir },
+				))
+			) {
+				rootTokenLogDir = undefined;
+			}
 		},
 	};
 	sessionOptions.authStorage = authStorage;
