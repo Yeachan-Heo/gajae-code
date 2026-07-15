@@ -2154,9 +2154,9 @@ mod tests {
 			.push_frame(ServerMessage::EphemeralTurnResult(EphemeralTurnResult {
 				session_id: "s".into(),
 				request_id: "btw-1".into(),
-				thread_id: "42".into(),
-				update_id: Some(7),
-				text: "side answer".into(),
+				thread_id:  "42".into(),
+				update_id:  Some(7),
+				text:       "side answer".into(),
 			}))
 			.unwrap();
 		match next_server_msg(&mut ws).await {

@@ -436,7 +436,8 @@ pub enum ServerMessage {
 	AskSelectedAckCancel(AskSelectedAckCancel),
 	/// A controlled action could not be presented to this connection.
 	ActionUnavailable(ActionUnavailable),
-	/// A completed ephemeral side-question result, correlated to the inbound request.
+	/// A completed ephemeral side-question result, correlated to the inbound
+	/// request.
 	EphemeralTurnResult(EphemeralTurnResult),
 
 	/// Forward-compat: an unrecognized frame type. Tolerated, never emitted.
@@ -454,7 +455,8 @@ pub enum ClientMessage {
 	Hello(ClientHello),
 	/// An inbound free-text user message that injects/steers a turn.
 	UserMessage(UserMessage),
-	/// An ephemeral side question that uses session context without injecting a turn.
+	/// An ephemeral side question that uses session context without injecting a
+	/// turn.
 	EphemeralTurn(EphemeralTurn),
 	/// An in-thread configuration command (verbosity/redact toggles).
 	ConfigCommand(ConfigCommand),
@@ -683,7 +685,8 @@ pub struct UserMessage {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub images:     Vec<InboundImage>,
 }
-/// An inbound ephemeral side question using current session context without persistence.
+/// An inbound ephemeral side question using current session context without
+/// persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EphemeralTurn {
@@ -712,7 +715,7 @@ pub struct EphemeralTurnResult {
 	/// Opaque request id from the corresponding [`EphemeralTurn`].
 	pub request_id: String,
 	/// Originating thread/topic id.
-	pub thread_id: String,
+	pub thread_id:  String,
 	/// Telegram update id from the corresponding request, when known.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub update_id:  Option<i64>,
@@ -1322,8 +1325,7 @@ mod tests {
 	}
 	#[test]
 	fn ephemeral_turn_parses_as_distinct_inbound_frame() {
-		let raw =
-			r#"{"type":"ephemeral_turn","sessionId":"s1","question":"what changed?","token":"t","requestId":"btw-1","updateId":42,"threadId":"topic-9"}"#;
+		let raw = r#"{"type":"ephemeral_turn","sessionId":"s1","question":"what changed?","token":"t","requestId":"btw-1","updateId":42,"threadId":"topic-9"}"#;
 		let msg: ClientMessage = serde_json::from_str(raw).unwrap();
 		match msg {
 			ClientMessage::EphemeralTurn(turn) => {

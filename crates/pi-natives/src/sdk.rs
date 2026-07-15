@@ -117,10 +117,12 @@ impl From<gjc_sdk::protocol::AskSelectedAckOutcome> for AskSelectedAckOutcomeEve
 }
 
 /// An inbound message forwarded to the TypeScript host: a free-text injection,
-/// ephemeral side question, in-thread config command, or deterministic control command.
+/// ephemeral side question, in-thread config command, or deterministic control
+/// command.
 #[napi(object)]
 pub struct InboundEvent {
-	/// Inbound kind (`user_message`, `ephemeral_turn`, `config_command`, or `control_command`).
+	/// Inbound kind (`user_message`, `ephemeral_turn`, `config_command`, or
+	/// `control_command`).
 	pub kind:         String,
 	/// The session this inbound belongs to.
 	pub session_id:   String,
@@ -507,8 +509,8 @@ impl NotificationServer {
 
 	/// Broadcast an ephemeral threaded-session frame. `frame_json` is a JSON
 	/// `ServerMessage` (e.g. `identity_header`, `context_update`, `turn_stream`,
-	/// `ephemeral_turn_result`, `image_attachment`, `session_closed`, `config_update`,
-	/// `hello`). Not buffered for replay.
+	/// `ephemeral_turn_result`, `image_attachment`, `session_closed`,
+	/// `config_update`, `hello`). Not buffered for replay.
 	///
 	/// # Errors
 	/// Fails if not started or `frame_json` is not a valid `ServerMessage`.
