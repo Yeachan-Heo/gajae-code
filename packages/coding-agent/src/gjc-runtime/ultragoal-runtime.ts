@@ -3974,13 +3974,21 @@ export async function checkpointUltragoalGoal(input: {
 	const evidence = input.evidence.trim();
 	if (!evidence) throw new Error("checkpoint evidence is required");
 	const ledgerBefore = await readUltragoalLedger(input.cwd);
-	const matchingIdempotentEvent = ledgerBefore.find(
+	const matchingIdempotentEvents = ledgerBefore.filter(
 		event =>
 			event.event === "goal_checkpointed" &&
 			event.goalId === goal.id &&
 			event.status === input.status &&
 			event.evidence === evidence,
 	);
+	// Re-verification replays legitimately append repeated same-status,
+	// same-evidence checkpoint events for one goal. The recorded receipt must
+	// be compared against ITS OWN checkpoint event — resolved by the receipt's
+	// checkpointLedgerEventId, falling back to the latest match — never the
+	// oldest duplicate, which would wrongly report the current receipt stale.
+	const matchingIdempotentEvent =
+		matchingIdempotentEvents.find(event => event.eventId === goal.completionVerification?.checkpointLedgerEventId) ??
+		matchingIdempotentEvents.at(-1);
 	const batchMetadata = input.status === "complete" ? requireFreshValidationBatchMetadata(goal) : undefined;
 	if (batchMetadata && goal.completionVerification?.validationBatch) {
 		const receiptBatch = goal.completionVerification.validationBatch;

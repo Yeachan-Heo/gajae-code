@@ -3082,6 +3082,22 @@ describe("native GJC ultragoal runtime", () => {
 		);
 		const durable = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });
 		expect(durable.state).toBe("active_verified_complete");
+
+		// A further identical-evidence replay of the now-fresh receipt is a
+		// pure no-op resolved against the receipt's own (latest) checkpoint
+		// event, never the oldest duplicate.
+		const receiptIdAfterRemint = replayed.goals[0]?.completionVerification?.receiptId;
+		const again = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		expect(again.goals[0]?.completionVerification?.receiptId).toBe(receiptIdAfterRemint);
+		expect((await readUltragoalLedger(root)).filter(event => event.event === "goal_checkpointed")).toHaveLength(
+			checkpointsBefore + 1,
+		);
 	});
 
 	it("rejects identical-evidence replay when the goal row changed after receipt verification", async () => {
@@ -3112,6 +3128,90 @@ describe("native GJC ultragoal runtime", () => {
 				qualityGateJson: await passingLiveQualityGate(root),
 			}),
 		).rejects.toThrow("changed after its completion receipt was verified");
+	});
+
+	async function completedValidationBatchPlan(root: string) {
+		await writeStructuralArtifacts(root);
+		let plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
+			validationBatches: [
+				{ schemaVersion: 1, batchId: "VB001", memberIds: ["G001", "G002", "G003"], finalGoalId: "G003" },
+			],
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "g001 deferred",
+			qualityGateJson: deferredBatchGate("G001", plan.goals[0]!.validationBatch!),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G002",
+			status: "complete",
+			evidence: "g002 deferred",
+			qualityGateJson: deferredBatchGate("G002", plan.goals[1]!.validationBatch!),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G003",
+			status: "complete",
+			evidence: "batch close",
+			qualityGateJson: batchCloseGate(plan),
+		});
+		expect(plan.goals[2]?.completionVerification?.receiptKind).toBe("final-aggregate");
+		return plan;
+	}
+
+	it("no-ops repeated identical-evidence batch close replays after a re-mint", async () => {
+		const root = await batchTempDir();
+		const plan = await completedValidationBatchPlan(root);
+		const classified = await runNativeUltragoalCommand(
+			[
+				"classify-blocker",
+				"--classification",
+				"resolvable",
+				"--evidence",
+				"post-completion audit note tagged to the batch final",
+				"--goal-id",
+				"G003",
+			],
+			root,
+		);
+		expect(classified.status).toBe(0);
+
+		// First replay re-verifies the staled close and appends a second
+		// same-status, same-evidence checkpoint event.
+		const reclosed = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G003",
+			status: "complete",
+			evidence: "batch close",
+			qualityGateJson: batchCloseGate(plan),
+		});
+		const recloseReceiptId = reclosed.goals[2]?.completionVerification?.receiptId;
+		const checkpointsAfterReclose = (await readUltragoalLedger(root)).filter(
+			event => event.event === "goal_checkpointed",
+		).length;
+
+		// The next replay must resolve the receipt against ITS OWN checkpoint
+		// event (the latest duplicate) and no-op, not compare against the
+		// oldest duplicate and throw.
+		const again = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G003",
+			status: "complete",
+			evidence: "batch close",
+			qualityGateJson: batchCloseGate(plan),
+		});
+		expect(again.goals[2]?.completionVerification?.receiptId).toBe(recloseReceiptId);
+		expect((await readUltragoalLedger(root)).filter(event => event.event === "goal_checkpointed")).toHaveLength(
+			checkpointsAfterReclose,
+		);
 	});
 
 	it("re-mints the final-aggregate receipt when repairing a non-final goal after aggregate completion (#1777)", async () => {
