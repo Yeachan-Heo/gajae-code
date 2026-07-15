@@ -32,7 +32,14 @@ function createGoal(overrides: Partial<Goal> = {}): Goal {
 }
 
 function cloneState(state: GoalModeState | undefined): GoalModeState | undefined {
-	return state ? { ...state, goal: { ...state.goal } } : undefined;
+	return state
+		? {
+				...state,
+				goal: state.goal.last_error
+					? { ...state.goal, last_error: { ...state.goal.last_error } }
+					: { ...state.goal },
+			}
+		: undefined;
 }
 
 function createToolSession(overrides: Partial<ToolSession>): ToolSession {
@@ -326,6 +333,38 @@ describe("GoalTool", () => {
 		const result = await tool.execute("call-get", { op: "get" });
 		expect(result.details?.goal?.status).toBe("paused");
 		expect(result.details?.goal?.objective).toBe("Ship it");
+	});
+	it("op=get surfaces the persisted last error for paused goal-continuation failures", async () => {
+		const harness = createRuntimeHarness({
+			enabled: false,
+			mode: "active",
+			goal: createGoal({
+				status: "paused",
+				last_error: {
+					source: "goal-continuation",
+					class: "config",
+					message: "invalid API key",
+					occurred_at: 123,
+					pause_cause: "provider_final_error",
+					retry_attempt: 1,
+					generation_id: "generation-1",
+				},
+			}),
+		});
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		const result = await tool.execute("call-get", { op: "get" });
+
+		expect(result.content[0]).toEqual({
+			type: "text",
+			text: "Goal: Ship it\nStatus: paused\nTokens used: 0\nLast error: [config] invalid API key",
+		});
+		expect(result.details?.goal?.last_error).toMatchObject({ class: "config", pause_cause: "provider_final_error" });
 	});
 
 	it("op=resume re-activates a paused goal", async () => {

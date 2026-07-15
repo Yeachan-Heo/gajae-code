@@ -10,6 +10,7 @@ import {
 	renderTrustedObjective,
 } from "@gajae-code/coding-agent/goals/runtime";
 import type { Goal, GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "@gajae-code/coding-agent/goals/state";
+import { normalizeGoal, normalizeGoalLastError } from "@gajae-code/coding-agent/goals/state";
 
 function createUsage(overrides: Partial<GoalTokenUsage> = {}): GoalTokenUsage {
 	return {
@@ -35,7 +36,7 @@ function createGoal(overrides: Partial<Goal> & Record<string, unknown> = {}): Go
 }
 
 function cloneGoal(goal: Goal): Goal {
-	return { ...goal };
+	return goal.last_error ? { ...goal, last_error: { ...goal.last_error } } : { ...goal };
 }
 
 function cloneState(state: GoalModeState | undefined): GoalModeState | undefined {
@@ -157,6 +158,24 @@ describe("goal runtime", () => {
 		expect(harness.hiddenMessages).toHaveLength(0);
 	});
 
+	it("normalizes persisted goal last_error and drops malformed entries", () => {
+		const lastError = {
+			source: "goal-continuation",
+			class: "config",
+			message: "invalid api key",
+			occurred_at: 123,
+			pause_cause: "provider_final_error",
+			retry_attempt: 2,
+			generation_id: "generation-1",
+		} as const;
+
+		expect(normalizeGoalLastError(lastError)).toEqual(lastError);
+		expect(normalizeGoal({ ...createGoal(), last_error: lastError })?.last_error).toEqual(lastError);
+		expect(
+			normalizeGoal({ ...createGoal(), last_error: { ...lastError, class: "bogus" } })?.last_error,
+		).toBeUndefined();
+	});
+
 	it("normalizes legacy budget-limited state on thread resume", async () => {
 		const harness = createHarness({
 			state: {
@@ -192,6 +211,40 @@ describe("goal runtime", () => {
 		expect(harness.persists.at(-1)?.mode).toBe("goal");
 	});
 
+	it("pauses a goal for continuation failure and resume clears the last error", async () => {
+		const harness = createHarness({
+			state: { enabled: true, mode: "active", goal: createGoal({ tokensUsed: 5 }) },
+		});
+		const lastError = {
+			source: "goal-continuation",
+			class: "connection_refused",
+			message: "ECONNREFUSED local model",
+			occurred_at: 500,
+			pause_cause: "provider_final_error",
+			retry_attempt: 1,
+			generation_id: "42:500",
+		} as const;
+
+		harness.runtime.onTurnStart("turn-1", createUsage());
+		harness.advance(1_000);
+		harness.setUsage({ input: 9 });
+		const paused = await harness.runtime.pauseGoalForFailure(lastError);
+
+		expect(paused.enabled).toBe(false);
+		expect(paused.mode).toBe("active");
+		expect(paused.goal.status).toBe("paused");
+		expect(paused.goal.last_error).toEqual(lastError);
+		expect(paused.goal.tokensUsed).toBe(14);
+		expect(harness.runtime.buildContinuationPrompt()).toBeUndefined();
+		expect(harness.persists.at(-1)?.mode).toBe("goal_paused");
+
+		const resumed = await harness.runtime.resumeGoal();
+
+		expect(resumed.enabled).toBe(true);
+		expect(resumed.goal.status).toBe("active");
+		expect(resumed.goal.last_error).toBeUndefined();
+		expect(harness.runtime.buildContinuationPrompt()).toBeTypeOf("string");
+	});
 	it("keeps active goals active when a thread resumes", async () => {
 		const harness = createHarness({
 			state: { enabled: true, mode: "active", goal: createGoal() },

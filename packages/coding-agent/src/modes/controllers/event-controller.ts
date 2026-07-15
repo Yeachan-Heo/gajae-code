@@ -887,7 +887,7 @@ export class EventController {
 				this.ctx.showStatus("Context overflow maintenance completed");
 			}
 		} else if (event.errorMessage) {
-			this.ctx.showWarning(event.errorMessage);
+			if (!event.goal_finalized) this.ctx.showWarning(event.errorMessage);
 		} else if (isHandoffAction) {
 			// Reset BEFORE rebuild so the new session's transcript is not replayed
 			// from the old ledger and then cleared out from under its timers.
@@ -978,6 +978,10 @@ export class EventController {
 			this.ctx.statusContainer.clear();
 		}
 		this.ctx.retryEscapePrimed = false;
+		if (!event.success && event.goal_finalized) {
+			this.ctx.ui.requestRender();
+			return;
+		}
 		if (!event.success) {
 			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 		}

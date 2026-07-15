@@ -13,7 +13,7 @@ import type { Theme, ThemeColor } from "../../modes/theme/theme";
 import goalDescription from "../../prompts/tools/goal.md" with { type: "text" };
 import { formatDuration } from "../../slash-commands/helpers/format";
 import type { ToolSession } from "../../tools";
-import { formatErrorMessage, TRUNCATE_LENGTHS } from "../../tools/render-utils";
+import { formatErrorMessage, replaceTabs, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { ToolError } from "../../tools/tool-errors";
 import { renderStatusLine, truncateToWidth } from "../../tui";
 import { validateGoalObjective } from "../runtime";
@@ -54,10 +54,22 @@ function validateCreateParams(params: { objective?: string }): { objective: stri
 	return { objective };
 }
 
+function formatGoalLastError(goal: Goal): string | undefined {
+	if (!goal.last_error) return undefined;
+	return `Last error: [${goal.last_error.class}] ${goal.last_error.message}`;
+}
+
 function renderGoalToolResponse(response: GoalToolResponse): string {
 	if (!response.goal) return "No active goal.";
 
-	return `Goal: ${response.goal.objective}\nStatus: ${response.goal.status}\nTokens used: ${response.goal.tokensUsed}`;
+	const lines = [
+		`Goal: ${response.goal.objective}`,
+		`Status: ${response.goal.status}`,
+		`Tokens used: ${response.goal.tokensUsed}`,
+	];
+	const lastError = formatGoalLastError(response.goal);
+	if (lastError) lines.push(lastError);
+	return lines.join("\n");
 }
 
 function buildGoalToolResult(op: GoalToolDetails["op"], response: GoalToolResponse): AgentToolResult<GoalToolDetails> {
@@ -247,6 +259,10 @@ export const goalToolRenderer = {
 		const objectiveText = truncateToWidth(goal.objective.trim(), TRUNCATE_LENGTHS.LONG);
 		lines.push(`  ${uiTheme.italic(uiTheme.fg("muted", `"${objectiveText}"`))}`);
 		lines.push(`  ${uiTheme.fg("dim", `${formatNumber(goal.tokensUsed)} tokens used`)}`);
+		const lastError = formatGoalLastError(goal);
+		if (lastError) {
+			lines.push(`  ${uiTheme.fg("dim", truncateToWidth(replaceTabs(lastError), TRUNCATE_LENGTHS.LONG))}`);
+		}
 
 		if (goal.timeUsedSeconds > 0) {
 			lines.push(`  ${uiTheme.fg("dim", `${formatDuration(goal.timeUsedSeconds * 1000)} elapsed`)}`);

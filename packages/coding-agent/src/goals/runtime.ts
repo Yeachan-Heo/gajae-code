@@ -3,6 +3,7 @@ import goalContinuationPrompt from "../prompts/goals/goal-continuation.md" with 
 import goalModeActivePrompt from "../prompts/goals/goal-mode-active.md" with { type: "text" };
 import {
 	type Goal,
+	type GoalLastError,
 	type GoalModeState,
 	type GoalRuntimeEvent,
 	type GoalTokenUsage,
@@ -42,7 +43,7 @@ export interface GoalRuntimeSnapshot {
 export type GoalPromptKind = "active" | "continuation";
 
 function cloneGoal(goal: Goal): Goal {
-	return { ...goal };
+	return goal.last_error ? { ...goal, last_error: { ...goal.last_error } } : { ...goal };
 }
 
 function cloneState(state: GoalModeState): GoalModeState {
@@ -347,6 +348,7 @@ export class GoalRuntime {
 			state.reason = undefined;
 			state.goal.status = "active";
 			state.goal.updatedAt = this.#now();
+			delete state.goal.last_error;
 			this.#markActiveAccounting(state.goal);
 			await this.#commitState(state, { persist: "goal" });
 			return state;
@@ -366,6 +368,28 @@ export class GoalRuntime {
 			state.reason = undefined;
 			state.goal.status = "paused";
 			state.goal.updatedAt = this.#now();
+			this.#clearActiveAccounting();
+			await this.#commitState(state, { persist: "goal_paused" });
+			return state;
+		});
+	}
+
+	async pauseGoalForFailure(lastError: GoalLastError): Promise<GoalModeState> {
+		return await this.#withAccounting(async () => {
+			await this.#flushUsageLocked();
+			const state = this.#getStateClone();
+			if (!state?.goal) {
+				throw new Error("cannot pause goal for failure because no goal is active");
+			}
+			if (state.goal.status !== "active") {
+				throw new Error(`cannot pause a goal that is not active (current status: ${state.goal.status})`);
+			}
+			state.enabled = false;
+			state.mode = "active";
+			state.reason = undefined;
+			state.goal.status = "paused";
+			state.goal.updatedAt = this.#now();
+			state.goal.last_error = { ...lastError };
 			this.#clearActiveAccounting();
 			await this.#commitState(state, { persist: "goal_paused" });
 			return state;

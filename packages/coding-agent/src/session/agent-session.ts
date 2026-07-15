@@ -225,7 +225,7 @@ import {
 import { writeArtifact } from "../gjc-runtime/state-writer";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
 import { GoalRuntime } from "../goals/runtime";
-import type { Goal, GoalModeState } from "../goals/state";
+import type { Goal, GoalLastError, GoalLastErrorClass, GoalLastErrorPauseCause, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { ensureWorkflowSkillActivationState } from "../hooks/skill-state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
@@ -374,6 +374,7 @@ export type AgentSessionEvent =
 			/** True when compaction was skipped for a benign reason (no model, no candidates, nothing to compact). */
 			skipped?: boolean;
 			continuationSkipReason?: AutoCompactionContinuationSkipReason;
+			goal_finalized?: boolean;
 	  }
 	| {
 			type: "auto_retry_start";
@@ -383,7 +384,14 @@ export type AgentSessionEvent =
 			errorMessage: string;
 			unbounded?: boolean;
 	  }
-	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| {
+			type: "auto_retry_end";
+			success: boolean;
+			attempt: number;
+			finalError?: string;
+			goal_finalized?: boolean;
+			goal_generation_id?: string;
+	  }
 	| {
 			type: "model_fallback_switched";
 			eventId: string;
@@ -1311,6 +1319,9 @@ export class AgentSession {
 	#lastInjectedGoalContextSig: string | undefined = undefined;
 	#lastInjectedPlanContextSig: string | undefined = undefined;
 	#goalTurnCounter = 0;
+	#activeGoalContinuationGenerationId: string | undefined = undefined;
+	#goalContinuationFailureFinalized = false;
+	#suppressNextGoalReminderAfterAbort = false;
 	#streamingEditParsedToolCallCache = new Map<string, StreamingEditParsedCacheEntry>();
 	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
@@ -1568,6 +1579,8 @@ export class AgentSession {
 
 	#pendingRewindReport: string | undefined = undefined;
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
+	#retryContinuationEpoch = 0;
+	#retryCancellationPending = false;
 	#promptGeneration = 0;
 	#promptPreflightAbortController = new AbortController();
 
@@ -2918,7 +2931,9 @@ export class AgentSession {
 						type: "auto_retry_end",
 						success: true,
 						attempt: this.#retryAttempt,
+						goal_generation_id: this.#activeGoalContinuationGenerationId,
 					});
+					this.#finishGoalContinuationGeneration();
 					this.#retryAttempt = 0;
 					// Settle the retry gate here, colocated with the success event, rather
 					// than relying on the generic #resolveRetry() at the end of the
@@ -2998,15 +3013,27 @@ export class AgentSession {
 			if (event.stopReason === "maintenance") {
 				this.#lastAssistantMessage = undefined;
 				const outcome = event.maintenanceOutcome;
-				if (
+				if (outcome === "aborted") {
+					this.#finishGoalContinuationGeneration();
+				} else if (outcome === "failed") {
+					await this.#finalizeGoalContinuationFailure("Mid-run context maintenance failed", {
+						pauseCause: "compaction_recovery_failed",
+						errorClass: "compaction_recovery_failed",
+					});
+					this.#finishGoalContinuationGeneration();
+				} else if (
 					outcome &&
-					outcome !== "aborted" &&
 					!maintenanceWasDisposed &&
 					!this.#isDisposed &&
 					maintenanceGeneration !== undefined &&
 					this.#promptGeneration === maintenanceGeneration
 				) {
-					this.#scheduleAgentContinue({ generation: maintenanceGeneration, skipCompactionCheck: true });
+					this.#scheduleAgentContinue({
+						generation: maintenanceGeneration,
+						skipCompactionCheck: true,
+						requireActiveGoal: this.#activeGoalContinuationGenerationId !== undefined,
+						...this.#goalContinuationScheduledFailureHandlers("mid-run maintenance resume"),
+					});
 				}
 				return;
 			}
@@ -3037,6 +3064,7 @@ export class AgentSession {
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				this.#resolveRetry();
+				this.#finishGoalContinuationGeneration();
 				return;
 			}
 
@@ -3053,6 +3081,7 @@ export class AgentSession {
 			if (this.#skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
 				this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
 				this.#lastSuccessfulYieldToolCallId = undefined;
+				this.#finishGoalContinuationGeneration();
 				return;
 			}
 
@@ -3061,14 +3090,44 @@ export class AgentSession {
 				if (msg.stopReason !== "error" && msg.stopReason !== "aborted" && (await this.#checkGoalCompletion(msg))) {
 					return;
 				}
+				this.#finishGoalContinuationGeneration();
 				return;
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
+			if (msg.stopReason === "aborted") {
+				if (this.#retryAttempt > 0) {
+					const attempt = this.#retryAttempt;
+					this.#retryAttempt = 0;
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError: "Retry cancelled",
+						goal_finalized: await this.#finalizeGoalContinuationFailure("Retry cancelled", {
+							attempt,
+							pauseCause: "retry_cancelled",
+							errorClass: "cancelled",
+						}),
+						goal_generation_id: this.#activeGoalContinuationGenerationId,
+					});
+					this.#resolveRetry();
+				}
+				this.#finishGoalContinuationGeneration();
+				return;
+			}
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			if (this.#isRetryableError(msg)) {
 				const didRetry = await this.#handleRetryableError(msg);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+			}
+			if (msg.stopReason === "error" && isContextOverflow(msg, this.model?.contextWindow ?? 0)) {
+				this.#resolveRetry();
+				const compactionTask = this.#checkCompaction(msg);
+				this.#trackPostPromptTask(compactionTask);
+				await compactionTask;
+				if (this.#goalContinuationFailureFinalized) this.#finishGoalContinuationGeneration();
+				return;
 			}
 			if (this.#retryAttempt > 0) {
 				// A prior retry ended on a non-retryable (terminal) message: emit
@@ -3080,19 +3139,39 @@ export class AgentSession {
 					success: false,
 					attempt,
 					finalError: msg.errorMessage,
+					goal_finalized: await this.#finalizeGoalContinuationFailure(
+						msg.errorMessage ?? "Provider retry failed",
+						{
+							attempt,
+							classification: this.#classifyErrorForRetry(msg),
+							pauseCause: "provider_final_error",
+						},
+					),
+					goal_generation_id: this.#activeGoalContinuationGenerationId,
 				});
+				this.#finishGoalContinuationGeneration();
+			} else if (msg.stopReason === "error" && this.#activeGoalContinuationGenerationId) {
+				await this.#finalizeGoalContinuationFailure(msg.errorMessage ?? "Provider retry failed", {
+					classification: this.#classifyErrorForRetry(msg),
+					pauseCause: "provider_final_error",
+				});
+				this.#finishGoalContinuationGeneration();
 			}
 			this.#resolveRetry();
 
 			const compactionTask = this.#checkCompaction(msg);
 			this.#trackPostPromptTask(compactionTask);
 			await compactionTask;
+			if (this.#goalContinuationFailureFinalized) {
+				this.#finishGoalContinuationGeneration();
+				return;
+			}
 			// Check for incomplete todos only after a final assistant stop, not intermediate tool-use turns.
 			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
 			if (hasToolCalls) {
 				return;
 			}
-			if (msg.stopReason !== "error" && msg.stopReason !== "aborted") {
+			if (msg.stopReason !== "error") {
 				if (this.#enforceRewindBeforeYield()) {
 					return;
 				}
@@ -3100,6 +3179,7 @@ export class AgentSession {
 					return;
 				}
 				await this.#checkTodoCompletion();
+				this.#finishGoalContinuationGeneration();
 			}
 		}
 	};
@@ -3190,6 +3270,7 @@ export class AgentSession {
 		generation?: number;
 		skipCompactionCheck?: boolean;
 		suppressPredecessorAgentEnd?: boolean;
+		requireActiveGoal?: boolean;
 		shouldContinue?: () => boolean;
 		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
 		onError?: (error: unknown) => void;
@@ -3218,6 +3299,7 @@ export class AgentSession {
 		return this.#schedulePostPromptTask(
 			async () => {
 				const canContinue = (): boolean => {
+					if (terminalized) return false;
 					if (signal.aborted || this.#isDisposed) {
 						skip("aborted_signal");
 						return false;
@@ -3225,6 +3307,13 @@ export class AgentSession {
 					if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
 						skip("generation_changed");
 						return false;
+					}
+					if (options?.requireActiveGoal) {
+						const state = this.getGoalModeState();
+						if (this.#goalContinuationFailureFinalized || !state?.enabled || state.goal.status !== "active") {
+							skip("queue_drained");
+							return false;
+						}
 					}
 					if (options?.shouldContinue && !options.shouldContinue()) {
 						skip("queue_drained");
@@ -3236,6 +3325,16 @@ export class AgentSession {
 				try {
 					if (!options?.skipCompactionCheck) {
 						await this.#checkEstimatedContextBeforePrompt();
+						if (this.#goalContinuationFailureFinalized) {
+							if (options?.onSkip) {
+								skip("queue_drained");
+							} else {
+								terminalized = true;
+								this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+								this.#finishGoalContinuationGeneration();
+							}
+							return;
+						}
 						if (!canContinue()) return;
 					}
 					if (signal.aborted) {
@@ -3266,6 +3365,35 @@ export class AgentSession {
 				onSkip: () => skip("aborted_signal"),
 			},
 		);
+	}
+
+	async #finalizeGoalContinuationScheduledFailure(source: string, error: unknown): Promise<void> {
+		const message = error instanceof Error ? error.message : String(error);
+		const finalError = `${source} failed: ${message}`;
+		await this.#finalizeGoalContinuationFailure(finalError, {
+			pauseCause: "retry_recovery_failed",
+			errorClass: "retry_recovery_failed",
+		});
+		this.#finishGoalContinuationGeneration();
+	}
+
+	#goalContinuationScheduledFailureHandlers(source: string): {
+		onSkip: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
+		onError: (error: unknown) => void;
+	} {
+		return {
+			onSkip: reason => void this.#finalizeGoalContinuationScheduledFailure(source, reason),
+			onError: error => void this.#finalizeGoalContinuationScheduledFailure(source, error),
+		};
+	}
+
+	#ensureGoalContinuationGenerationForActiveGoal(source: string): boolean {
+		if (this.#activeGoalContinuationGenerationId) return true;
+		const state = this.getGoalModeState();
+		if (!state?.enabled || state.goal.status !== "active") return false;
+		this.#activeGoalContinuationGenerationId = `${this.#promptGeneration}:${source}:${Date.now()}`;
+		this.#goalContinuationFailureFinalized = false;
+		return true;
 	}
 
 	#logCompactionContinuationSkipped(
@@ -3313,9 +3441,8 @@ export class AgentSession {
 				delayMs: 100,
 				generation,
 				suppressPredecessorAgentEnd: true,
-
-				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
-				onError: error => this.#logCompactionContinuationError("overflow_retry", error),
+				requireActiveGoal: this.#activeGoalContinuationGenerationId !== undefined,
+				...this.#goalContinuationScheduledFailureHandlers("overflow retry"),
 			});
 			return;
 		}
@@ -3327,6 +3454,10 @@ export class AgentSession {
 		}
 
 		this.#logCompactionContinuationSkipped("overflow_retry", "auto_continue_disabled_non_resumable_tail");
+		void this.#finalizeGoalContinuationScheduledFailure(
+			"overflow retry",
+			"auto_continue_disabled_non_resumable_tail",
+		);
 	}
 
 	#scheduleAutoContinuePrompt(generation: number): void {
@@ -3355,15 +3486,31 @@ export class AgentSession {
 					await Promise.resolve();
 					if (signal.aborted) {
 						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+						void this.#finalizeGoalContinuationScheduledFailure(
+							"auto-compaction continuation prompt",
+							"aborted_signal",
+						);
 						return;
 					}
 					if (this.#promptGeneration !== scheduledGeneration) {
 						this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+						void this.#finalizeGoalContinuationScheduledFailure(
+							"auto-compaction continuation prompt",
+							"generation_changed",
+						);
 						return;
+					}
+					if (this.#activeGoalContinuationGenerationId) {
+						const state = this.getGoalModeState();
+						if (this.#goalContinuationFailureFinalized || !state?.enabled || state.goal.status !== "active") {
+							this.#finishGoalContinuationGeneration();
+							return;
+						}
 					}
 					await continuePrompt();
 				} catch (error) {
 					this.#logCompactionContinuationError("auto_continue_prompt", error);
+					void this.#finalizeGoalContinuationScheduledFailure("auto-compaction continuation prompt", error);
 				} finally {
 					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 				}
@@ -4172,6 +4319,7 @@ export class AgentSession {
 				errorMessage: event.errorMessage,
 				skipped: event.skipped,
 				continuationSkipReason: event.continuationSkipReason,
+				goal_finalized: event.goal_finalized,
 			});
 		} else if (event.type === "auto_retry_start") {
 			await this.#extensionRunner.emit({
@@ -4188,6 +4336,8 @@ export class AgentSession {
 				success: event.success,
 				attempt: event.attempt,
 				finalError: event.finalError,
+				goal_finalized: event.goal_finalized,
+				goal_generation_id: event.goal_generation_id,
 			});
 		} else if (event.type === "ttsr_triggered") {
 			await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules });
@@ -6426,6 +6576,13 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		const preflightSignal = this.#promptPreflightAbortController.signal;
 		const rosterClaim = this.#claimIrcRosterCandidate();
+		const previousGoalContinuationGenerationId = this.#activeGoalContinuationGenerationId;
+		const wasGoalContinuationPrompt = message.role === "custom" && message.customType === "goal-continuation";
+		let goalContinuationPromptAccepted = false;
+		if (wasGoalContinuationPrompt) {
+			this.#activeGoalContinuationGenerationId = `${generation}:${Date.now()}`;
+			this.#goalContinuationFailureFinalized = false;
+		}
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			if (message.role === "user") {
@@ -6457,6 +6614,10 @@ export class AgentSession {
 			const lastAssistant = this.#findLastAssistantMessage();
 			if (lastAssistant && !options?.skipCompactionCheck) {
 				await this.#checkCompaction(lastAssistant, false);
+				if (this.#goalContinuationFailureFinalized) {
+					this.#finishGoalContinuationGeneration();
+					return;
+				}
 			}
 			if (!options?.skipCompactionCheck) {
 				await this.#checkEstimatedContextBeforePrompt([
@@ -6464,6 +6625,10 @@ export class AgentSession {
 					message,
 					...this.#pendingNextTurnMessages,
 				]);
+				if (this.#goalContinuationFailureFinalized) {
+					this.#finishGoalContinuationGeneration();
+					return;
+				}
 			}
 
 			// Build messages array (session context, eager todo prelude, then active prompt message)
@@ -6608,6 +6773,7 @@ export class AgentSession {
 			};
 			options?.onPreflightAccepted?.();
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+			goalContinuationPromptAccepted = true;
 			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
@@ -6622,6 +6788,13 @@ export class AgentSession {
 				await this.#waitForPostPromptRecovery();
 			}
 		} catch (error) {
+			if (wasGoalContinuationPrompt && !goalContinuationPromptAccepted && !isPromptPreflightCancelledError(error)) {
+				const message = error instanceof Error ? error.message : String(error);
+				await this.#finalizeGoalContinuationFailure(message, {
+					pauseCause: "terminal_error",
+					errorClass: this.#goalFailureClassForRetryError(message, "terminal"),
+				});
+			}
 			// Session identity changes historically cancel local setup silently. Only SDK
 			// submissions provide an acceptance callback and require an explicit terminal
 			// preflight failure for their remote request authority.
@@ -6635,6 +6808,14 @@ export class AgentSession {
 					),
 				);
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
+			}
+			if (
+				wasGoalContinuationPrompt &&
+				!goalContinuationPromptAccepted &&
+				this.#activeGoalContinuationGenerationId !== previousGoalContinuationGenerationId
+			) {
+				this.#activeGoalContinuationGenerationId = previousGoalContinuationGenerationId;
+				this.#goalContinuationFailureFinalized = false;
 			}
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 			this.#endInFlight();
@@ -7512,7 +7693,28 @@ export class AgentSession {
 		} else {
 			this.#silentAbortPending = false;
 		}
+		const retryAttemptAtAbort = this.#retryAttempt;
 		this.abortRetry();
+		if (this.#activeGoalContinuationGenerationId) {
+			if (retryAttemptAtAbort > 0) {
+				this.#retryAttempt = 0;
+				await this.#emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt: retryAttemptAtAbort,
+					finalError: "Retry cancelled",
+					goal_finalized: await this.#finalizeGoalContinuationFailure("Retry cancelled", {
+						attempt: retryAttemptAtAbort,
+						pauseCause: "retry_cancelled",
+						errorClass: "cancelled",
+					}),
+					goal_generation_id: this.#activeGoalContinuationGenerationId,
+				});
+				this.#resolveRetry();
+			}
+			this.#finishGoalContinuationGeneration();
+		}
+		this.#suppressNextGoalReminderAfterAbort = true;
 		this.#promptGeneration++;
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
@@ -8949,6 +9151,7 @@ export class AgentSession {
 	async runIdleCompaction(): Promise<void> {
 		if (this.isStreaming || this.isCompacting) return;
 		await this.#runAutoCompaction("idle", false, true);
+		if (this.#goalContinuationFailureFinalized) this.#finishGoalContinuationGeneration();
 	}
 
 	/**
@@ -9185,7 +9388,13 @@ export class AgentSession {
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (promoted) {
 				// Retry on the promoted (larger) model without compacting
-				this.#scheduleAgentContinue({ delayMs: 100, generation, suppressPredecessorAgentEnd: true });
+				this.#scheduleAgentContinue({
+					delayMs: 100,
+					generation,
+					suppressPredecessorAgentEnd: true,
+					requireActiveGoal: this.#activeGoalContinuationGenerationId !== undefined,
+					...this.#goalContinuationScheduledFailureHandlers("overflow promotion retry"),
+				});
 
 				return;
 			}
@@ -9668,6 +9877,10 @@ export class AgentSession {
 			"</system-reminder>",
 		].join("\n");
 
+		if (this.#suppressNextGoalReminderAfterAbort) {
+			this.#suppressNextGoalReminderAfterAbort = false;
+			return false;
+		}
 		logger.debug("Goal completion: sending active-goal reminder", { goalId: state.goal.id });
 		this.agent.appendMessage({
 			role: "developer",
@@ -9675,7 +9888,12 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+		this.#ensureGoalContinuationGenerationForActiveGoal("goal-reminder");
+		this.#scheduleAgentContinue({
+			generation: this.#promptGeneration,
+			requireActiveGoal: true,
+			...this.#goalContinuationScheduledFailureHandlers("goal completion reminder"),
+		});
 		return true;
 	}
 	/**
@@ -10524,8 +10742,8 @@ export class AgentSession {
 						suppressPredecessorAgentEnd: true,
 
 						shouldContinue: () => this.agent.hasQueuedMessages(),
-						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
-						onError: error => this.#logCompactionContinuationError("queued_continue", error),
+						requireActiveGoal: this.#activeGoalContinuationGenerationId !== undefined,
+						...this.#goalContinuationScheduledFailureHandlers("queued continuation"),
 					});
 				} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
 					this.#scheduleAutoContinuePrompt(generation);
@@ -10590,6 +10808,13 @@ export class AgentSession {
 					candidates,
 				);
 				if (this.#lastOversizedAutoMaintenanceAttemptSignature === maintenanceAttemptSignature) {
+					const finalError =
+						"Auto-compaction skipped: previous unchanged maintenance request exceeded the model context window; change or reduce the conversation before retrying maintenance.";
+					this.#ensureGoalContinuationGenerationForActiveGoal("auto-compaction-oversized");
+					await this.#finalizeGoalContinuationFailure(finalError, {
+						pauseCause: "compaction_recovery_failed",
+						errorClass: "compaction_recovery_failed",
+					});
 					await this.#emitSessionEvent({
 						type: "auto_compaction_end",
 						action,
@@ -10597,8 +10822,8 @@ export class AgentSession {
 						aborted: false,
 						willRetry: false,
 						skipped: true,
-						errorMessage:
-							"Auto-compaction skipped: previous unchanged maintenance request exceeded the model context window; change or reduce the conversation before retrying maintenance.",
+						errorMessage: finalError,
+						goal_finalized: this.#goalContinuationFailureFinalized,
 					});
 					return { kind: "skipped" };
 				}
@@ -10747,6 +10972,7 @@ export class AgentSession {
 				aborted: false,
 				willRetry: willRetry && !continuationSkipReason,
 				continuationSkipReason,
+				goal_finalized: this.#goalContinuationFailureFinalized,
 			});
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 
@@ -10760,8 +10986,8 @@ export class AgentSession {
 					generation,
 					suppressPredecessorAgentEnd: true,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
-					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
-					onError: error => this.#logCompactionContinuationError("queued_continue", error),
+					requireActiveGoal: this.#activeGoalContinuationGenerationId !== undefined,
+					...this.#goalContinuationScheduledFailureHandlers("queued continuation"),
 				});
 			} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
 				this.#scheduleAutoContinuePrompt(generation);
@@ -10782,6 +11008,11 @@ export class AgentSession {
 			if (maintenanceAttemptSignature && this.#isOversizedMaintenanceError(errorMessage)) {
 				this.#lastOversizedAutoMaintenanceAttemptSignature = maintenanceAttemptSignature;
 			}
+			this.#ensureGoalContinuationGenerationForActiveGoal("auto-compaction-failure");
+			await this.#finalizeGoalContinuationFailure(errorMessage, {
+				pauseCause: "compaction_recovery_failed",
+				errorClass: "compaction_recovery_failed",
+			});
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
 				action,
@@ -10792,6 +11023,7 @@ export class AgentSession {
 					reason === "overflow"
 						? `Context overflow recovery failed: ${errorMessage}`
 						: `Auto-compaction failed: ${errorMessage}`,
+				goal_finalized: this.#goalContinuationFailureFinalized,
 			});
 			return { kind: "failed" };
 		} finally {
@@ -10982,6 +11214,60 @@ export class AgentSession {
 		}
 		if (this.#isTransientErrorMessage(err)) return "transient";
 		return "unknown";
+	}
+
+	#goalFailureClassForRetryError(message: string, classification?: RetryErrorClassification): GoalLastErrorClass {
+		if (/econnrefused|connection.?refused|typo in the url or port/i.test(message)) return "connection_refused";
+		if (/\bdns\b|enotfound|getaddrinfo/i.test(message)) return "dns";
+		if (/invalid api key|unauthorized|forbidden|authentication|permission|config/i.test(message)) return "config";
+		if (/stream stall|stalled while waiting/i.test(message)) return "stream_stall";
+		if (/timed?\s*out|timeout/i.test(message))
+			return classification === "first_event_timeout" ? "first_event_timeout" : "timeout";
+		switch (classification) {
+			case "first_event_timeout":
+				return "first_event_timeout";
+			case "usage_limit":
+				return "usage_limit";
+			case "local_unavailable":
+				return "local_unavailable";
+			case "terminal":
+				return "terminal";
+			default:
+				return "unknown";
+		}
+	}
+
+	async #finalizeGoalContinuationFailure(
+		message: string,
+		options: {
+			attempt?: number;
+			classification?: RetryErrorClassification;
+			pauseCause: GoalLastErrorPauseCause;
+			errorClass?: GoalLastErrorClass;
+		},
+	): Promise<boolean> {
+		if (!this.#activeGoalContinuationGenerationId || this.#goalContinuationFailureFinalized) return false;
+		const state = this.getGoalModeState();
+		if (!state?.enabled || state.goal.status !== "active") return false;
+		const lastError: GoalLastError = {
+			source: "goal-continuation",
+			class: options.errorClass ?? this.#goalFailureClassForRetryError(message, options.classification),
+			message,
+			occurred_at: Date.now(),
+			pause_cause: options.pauseCause,
+			...(options.attempt !== undefined ? { retry_attempt: options.attempt } : {}),
+			generation_id: this.#activeGoalContinuationGenerationId,
+		};
+		await this.#goalRuntime.pauseGoalForFailure(lastError);
+		this.#goalContinuationFailureFinalized = true;
+		this.emitNotice("error", `Goal paused after provider failure: ${message}. Run goal resume to continue.`, "goal");
+		return true;
+	}
+
+	#finishGoalContinuationGeneration(): void {
+		if (!this.#activeGoalContinuationGenerationId) return;
+		this.#activeGoalContinuationGenerationId = undefined;
+		this.#goalContinuationFailureFinalized = false;
 	}
 
 	#parseRetryAfterMsFromError(errorMessage: string): number | undefined {
@@ -11332,12 +11618,20 @@ export class AgentSession {
 						: retrySettings.baseDelayMs * 2 ** Math.max(0, attemptsUsed - 1);
 		if (!managedFallback && !legacyUnbounded && retrySettings.maxDelayMs > 0 && delayMs > retrySettings.maxDelayMs) {
 			this.#retryAttempt = 0;
+			const finalError = `Provider requested ${delayMs}ms wait, exceeds retry.maxDelayMs (${retrySettings.maxDelayMs}ms). Original error: ${errorMessage}`;
 			await this.#emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
 				attempt: attemptsUsed,
-				finalError: `Provider requested ${delayMs}ms wait, exceeds retry.maxDelayMs (${retrySettings.maxDelayMs}ms). Original error: ${errorMessage}`,
+				finalError,
+				goal_finalized: await this.#finalizeGoalContinuationFailure(finalError, {
+					attempt: attemptsUsed,
+					classification: legacyClassification,
+					pauseCause: "retry_cap_exceeded",
+				}),
+				goal_generation_id: this.#activeGoalContinuationGenerationId,
 			});
+			this.#finishGoalContinuationGeneration();
 			this.#resolveRetry();
 			return false;
 		}
@@ -11405,13 +11699,24 @@ export class AgentSession {
 					// Fall through below so the retry continues immediately.
 				} else {
 					const attempt = this.#retryAttempt;
+					if (attempt <= 0) {
+						this.#resolveRetry();
+						return;
+					}
 					this.#retryAttempt = 0;
 					await this.#emitSessionEvent({
 						type: "auto_retry_end",
 						success: false,
 						attempt,
 						finalError: "Retry cancelled",
+						goal_finalized: await this.#finalizeGoalContinuationFailure("Retry cancelled", {
+							attempt,
+							pauseCause: "retry_cancelled",
+							errorClass: "cancelled",
+						}),
+						goal_generation_id: this.#activeGoalContinuationGenerationId,
 					});
+					this.#finishGoalContinuationGeneration();
 					this.#resolveRetry();
 					return;
 				}
@@ -11420,22 +11725,42 @@ export class AgentSession {
 				if (this.#retryAbortController !== retryAbortController) return;
 				this.#retryAbortController = undefined;
 				const attempt = this.#retryAttempt;
+				if (attempt <= 0) {
+					this.#resolveRetry();
+					return;
+				}
 				this.#retryAttempt = 0;
 				await this.#emitSessionEvent({
 					type: "auto_retry_end",
 					success: false,
 					attempt,
 					finalError: "Retry cancelled",
+					goal_finalized: await this.#finalizeGoalContinuationFailure("Retry cancelled", {
+						attempt,
+						pauseCause: "retry_cancelled",
+						errorClass: "cancelled",
+					}),
+					goal_generation_id: this.#activeGoalContinuationGenerationId,
 				});
+				this.#finishGoalContinuationGeneration();
 				this.#resolveRetry();
 				return;
 			}
 			if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
 			this.#retryNowRequested = false;
+			this.#retryCancellationPending = false;
+			const retryContinuationEpoch = this.#retryContinuationEpoch;
 
 			if (managedOutcome) {
 				try {
 					await this.#checkEstimatedContextBeforePrompt();
+					if (this.#retryCancellationPending || this.#retryContinuationEpoch !== retryContinuationEpoch) {
+						await this.#failRetryRecovery("Retry cancelled", {
+							pauseCause: "retry_cancelled",
+							errorClass: "cancelled",
+						});
+						return;
+					}
 					if (!ownership?.isCurrent()) {
 						const attempt = this.#retryAttempt;
 						this.#retryAttempt = 0;
@@ -11444,7 +11769,14 @@ export class AgentSession {
 							success: false,
 							attempt,
 							finalError: "Retry continuation was superseded",
+							goal_finalized: await this.#finalizeGoalContinuationFailure("Retry continuation was superseded", {
+								attempt,
+								pauseCause: "retry_recovery_failed",
+								errorClass: "retry_recovery_failed",
+							}),
+							goal_generation_id: this.#activeGoalContinuationGenerationId,
 						});
+						this.#finishGoalContinuationGeneration();
 						this.#resolveRetry();
 						return;
 					}
@@ -11453,16 +11785,21 @@ export class AgentSession {
 				} catch (error) {
 					const attempt = this.#retryAttempt;
 					this.#retryAttempt = 0;
-					try {
-						await this.#emitSessionEvent({
-							type: "auto_retry_end",
-							success: false,
+					const finalError = error instanceof Error ? error.message : String(error);
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError,
+						goal_finalized: await this.#finalizeGoalContinuationFailure(finalError, {
 							attempt,
-							finalError: error instanceof Error ? error.message : String(error),
-						});
-					} finally {
-						this.#resolveRetry();
-					}
+							pauseCause: "retry_recovery_failed",
+							errorClass: "retry_recovery_failed",
+						}),
+						goal_generation_id: this.#activeGoalContinuationGenerationId,
+					});
+					this.#finishGoalContinuationGeneration();
+					this.#resolveRetry();
 					throw error;
 				}
 			}
@@ -11470,8 +11807,17 @@ export class AgentSession {
 			this.#scheduleAgentContinue({
 				delayMs: 1,
 				generation,
-				onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
-				onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
+				shouldContinue: () => this.#retryContinuationEpoch === retryContinuationEpoch,
+				requireActiveGoal: this.#activeGoalContinuationGenerationId !== undefined,
+				onError: () => void this.#failRetryRecovery("Retry continuation failed to start"),
+				onSkip: () => {
+					const retryCancelled =
+						this.#retryCancellationPending || this.#retryContinuationEpoch !== retryContinuationEpoch;
+					void this.#failRetryRecovery(
+						retryCancelled ? "Retry cancelled" : "Retry continuation was superseded",
+						retryCancelled ? { pauseCause: "retry_cancelled", errorClass: "cancelled" } : undefined,
+					);
+				},
 			});
 		};
 
@@ -11485,8 +11831,14 @@ export class AgentSession {
 	 */
 	abortRetry(): void {
 		this.#retryNowRequested = false;
+		const hadBackoffController = this.#retryAbortController !== undefined;
 		this.#retryAbortController?.abort();
-		// Note: #retryAttempt is reset in the catch block of #handleRetryableError
+		this.#retryContinuationEpoch++;
+		if (!hadBackoffController && this.#retryAttempt > 0) {
+			this.#retryCancellationPending = true;
+			return;
+		}
+		// Note: #retryAttempt is reset in the catch block of #handleRetryableError.
 		this.#resolveRetry();
 	}
 
@@ -11509,16 +11861,27 @@ export class AgentSession {
 	 * `isStreaming === true` forever — turning every later prompt() into a
 	 * non-recoverable AgentBusyError. No-op once the retry has already settled.
 	 */
-	#failRetryRecovery(reason: string): void {
-		if (!this.#retryPromise) return;
+	async #failRetryRecovery(
+		reason: string,
+		options?: { pauseCause?: GoalLastErrorPauseCause; errorClass?: GoalLastErrorClass },
+	): Promise<void> {
+		if (!this.#retryPromise && !this.#activeGoalContinuationGenerationId && this.#retryAttempt <= 0) return;
 		const attempt = this.#retryAttempt;
+		this.#retryCancellationPending = false;
 		this.#retryAttempt = 0;
-		void this.#emitSessionEvent({
+		await this.#emitSessionEvent({
 			type: "auto_retry_end",
 			success: false,
 			attempt,
 			finalError: reason,
+			goal_finalized: await this.#finalizeGoalContinuationFailure(reason, {
+				attempt,
+				pauseCause: options?.pauseCause ?? "retry_recovery_failed",
+				errorClass: options?.errorClass ?? "retry_recovery_failed",
+			}),
+			goal_generation_id: this.#activeGoalContinuationGenerationId,
 		});
+		this.#finishGoalContinuationGeneration();
 		this.#resolveRetry();
 	}
 
