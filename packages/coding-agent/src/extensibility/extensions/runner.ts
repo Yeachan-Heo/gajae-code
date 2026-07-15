@@ -566,9 +566,10 @@ export class ExtensionRunner {
 
 			setPlanMode: on => this.#setPlanModeFn?.(on),
 			operateGoal: async (op, objective) => await this.#operateGoalFn?.(op, objective),
-			...(this.#runEphemeralTurnFn
-				? { runEphemeralTurn: async (promptText: string) => await this.#runEphemeralTurnFn!(promptText) }
-				: {}),
+			runEphemeralTurn: async (promptText: string) => {
+				if (!this.#runEphemeralTurnFn) throw new Error("Ephemeral turns are unavailable.");
+				return await this.#runEphemeralTurnFn(promptText);
+			},
 
 			getSkillState: () => this.#getSkillStateFn?.(),
 			getConfigItems: () => this.#getConfigItemsFn?.(),

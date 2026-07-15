@@ -910,11 +910,14 @@ describe("ExtensionRunner", () => {
 				sessionManager,
 				modelRegistry,
 			);
+			const earlyContext = wired.createContext();
 			wired.initialize(runtimeActions, {
 				...baseContextActions,
 				getPendingMessageCounts: () => ({ steering: 2, followUp: 1, nextTurn: 3 }),
+				runEphemeralTurn: async promptText => ({ replyText: `reply:${promptText}` }),
 			});
 			expect(wired.createContext().getPendingMessageCounts()).toEqual({ steering: 2, followUp: 1, nextTurn: 3 });
+			await expect(earlyContext.runEphemeralTurn?.("question")).resolves.toEqual({ replyText: "reply:question" });
 
 			// Omitted: every initialize applies the explicit zero fallback, never a stale provider.
 			wired.initialize(runtimeActions, baseContextActions);
