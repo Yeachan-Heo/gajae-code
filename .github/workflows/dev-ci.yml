@@ -224,14 +224,93 @@ jobs:
           GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: bun scripts/ci-dev-affected.ts --task="$AFFECTED_TASK_KEY"
 
+
+  # Windows' replacement semantics differ from POSIX and are covered separately
+  # from the Linux affected-path shards. This job deliberately runs on every dev
+  # push and PR; the stable aggregate below makes it a required validation gate.
+  notification-atomic-windows:
+    name: Notification atomicity / Windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - name: Prepend rustup toolchain bin to PATH
+        shell: bash
+        run: |
+          toolchain_bin="$(dirname "$(rustup which cargo)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: notification-atomicity-win32-x64
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - name: Build native addon (win32-x64 baseline)
+        env:
+          TARGET_PLATFORM: win32
+          TARGET_ARCH: x64
+          TARGET_VARIANTS: baseline
+        run: bun run ci:build:native
+      - name: Stage and prove win32-x64 baseline native addon
+        shell: pwsh
+        run: |
+          $addonPath = "packages/natives/native/pi_natives.win32-x64-baseline.node"
+          if (-not (Test-Path -LiteralPath $addonPath -PathType Leaf)) {
+            throw "Required staged native addon is missing: $addonPath"
+          }
+          $hash = Get-FileHash -LiteralPath $addonPath -Algorithm SHA256
+          Write-Host "SHA-256 $($hash.Hash)  $addonPath"
+          $env:PI_NATIVE_VARIANT = "baseline"
+          $proof = & bun -e 'import { h06FormatHashLines } from "./packages/natives/native/index.js"; const output = h06FormatHashLines("native load proof", 1); if (!/^1[a-z]{2}\|native load proof$/.test(output)) throw new Error(`Unexpected native load proof: ${output}`); console.log(`Native load proof: ${output}`);' 2>&1
+          $exitCode = $LASTEXITCODE
+          $proof | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 0) { exit $exitCode }
+      - name: Verify notification atomicity CI topology
+        run: bun test scripts/dev-ci-notification-atomicity.test.ts
+      - name: Verify Windows rename-exhaustion atomic replacement (1 test)
+        shell: pwsh
+        run: |
+          $output = & bun test packages/coding-agent/test/config/atomic-yaml-patch.test.ts --test-name-pattern "keeps the old complete file and removes the temp file when rename exhausts" 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 0) { exit $exitCode }
+          $summary = $output -join "`n"
+          if ($summary -notmatch [regex]::Escape("Ran 1 test across 1 file.")) {
+            throw "Expected the rename-exhaustion selector to run exactly one test."
+          }
+      - name: Verify Windows causal atomic persistence (6 tests)
+        shell: pwsh
+        run: |
+          $output = & bun test packages/coding-agent/test/settings-manager.test.ts --test-name-pattern "causally ordered atomic persistence" 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 0) { exit $exitCode }
+          $summary = $output -join "`n"
+          if ($summary -notmatch [regex]::Escape("Ran 6 tests across 1 file.")) {
+            throw "Expected the causal-persistence selector to run exactly six tests."
+          }
+
   # Branch protection must keep requiring this stable aggregate status. It runs
-  # no validation itself; it passes iff the planner succeeded and no shard or the
-  # native build failed (skipped shards/native are fine for no-op or docs-only
-  # changes). The job name must stay exactly "Affected path validation".
+  # no validation itself; it passes iff the planner, native build, every affected
+  # shard, and the Windows atomicity regression gate succeeded (skipped native
+  # and affected shards are fine for no-op or docs-only changes). The job name
+  # must stay exactly "Affected path validation".
   affected:
     name: Affected path validation
     if: ${{ always() }}
-    needs: [affected-plan, affected-native, affected-shards, windows-dev-doctor]
+    needs: [affected-plan, affected-native, affected-shards, windows-dev-doctor, notification-atomic-windows]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
@@ -240,15 +319,18 @@ jobs:
           plan='${{ needs.affected-plan.result }}'
           native='${{ needs.affected-native.result }}'
           shards='${{ needs.affected-shards.result }}'
-          windows='${{ needs.windows-dev-doctor.result }}'
+          windows_doctor='${{ needs.windows-dev-doctor.result }}'
+          windows_atomic='${{ needs.notification-atomic-windows.result }}'
           echo "affected-plan: $plan"
           echo "affected-native: $native"
           echo "affected-shards: $shards"
-          echo "windows-dev-doctor: $windows"
+          echo "windows-dev-doctor: $windows_doctor"
+          echo "notification-atomic-windows: $windows_atomic"
           test "$plan" = success || { echo "planner did not succeed"; exit 1; }
           case "$native" in success|skipped) ;; *) echo "native build did not pass"; exit 1 ;; esac
           case "$shards" in success|skipped) ;; *) echo "one or more affected shards did not pass"; exit 1 ;; esac
-          case "$windows" in success|skipped) ;; *) echo "Windows dev:doctor did not pass"; exit 1 ;; esac
+          case "$windows_doctor" in success|skipped) ;; *) echo "Windows dev:doctor did not pass"; exit 1 ;; esac
+          test "$windows_atomic" = success || { echo "Windows atomicity gate did not pass"; exit 1; }
           echo "Affected path validation: all required shards passed"
 
   gjc-state-gates-matrix:

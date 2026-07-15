@@ -118,32 +118,38 @@ JSON text frames. Field names are `camelCase`; the `type` discriminator is
 `action_needed` — something needs attention:
 
 ```json
-{ "type": "action_needed", "id": "wg_run_stage_1", "kind": "ask",
-  "sessionId": "sess-1", "question": "Proceed?", "options": ["Yes", "No"] }
+{ "type": "action_needed", "id": "act_9e31", "kind": "ask",
+  "sessionId": "sess-1", "workflowGateId": "wg_run_stage_1",
+  "question": "Proceed?", "options": ["Yes", "No"] }
+```
+
+```json
+{ "type": "action_needed", "id": "act_a42f", "kind": "ask",
+  "sessionId": "sess-1", "question": "Choose a target", "options": ["A", "B"] }
 ```
 
 ```json
 { "type": "action_needed", "id": "idle-sess-1-7", "kind": "idle",
   "sessionId": "sess-1", "summary": "finished refactor; awaiting next step" }
 ```
-- `kind: "ask"` is answerable in interactive/TUI and SDK workflow-gate sessions.
-  The `id` is the real workflow-gate id.
-- `kind: "idle"` is notify-only and ephemeral (not replayed to clients that
-  connect later).
+
+- `id` is an opaque, transient presentation/action ID. It is the **only** authority accepted by generic `reply.id`; use it only with the current authenticated endpoint. It is not a durable workflow ID.
+- `workflowGateId?: string` is optional, additive SDK v3 correlation metadata, present only for the active presentation of a durable workflow gate. When present, it equals that gate's Q12 `gate_id`. Its public correlation key is `(sessionId, workflowGateId)` at the current authenticated endpoint; it never authorizes generic `reply`.
+- `kind: "ask"` is answerable in interactive/TUI and SDK workflow-gate sessions. `kind: "idle"` is notify-only and ephemeral (not replayed to clients that connect later). Ordinary asks and idle frames omit `workflowGateId`.
+- This corrects the pre-v3 documentation invariant that `action_needed.id == gate_id`: they are deliberately different values. Clients must not preserve that invariant, infer a relationship from question/options/order, or retain private route, claim, receipt, epoch, token, or endpoint-generation maps.
 
 `action_resolved` — a pending action is now terminal and **non-repliable**:
 
 ```json
-{ "type": "action_resolved", "id": "wg_run_stage_1", "resolvedBy": "local" }
+{ "type": "action_resolved", "id": "act_9e31", "resolvedBy": "local" }
 ```
 
-`resolvedBy` is `local` (answered in the CLI/TUI), `client` (a remote reply won),
-or `timeout`.
+`resolvedBy` is `local` (a local/direct control retired the presentation), `client` (a remote generic reply won), or `timeout`.
 
 `reply_rejected` — sent only to the client whose reply failed:
 
 ```json
-{ "type": "reply_rejected", "id": "wg_run_stage_1", "reason": "already_answered" }
+{ "type": "reply_rejected", "id": "act_9e31", "reason": "already_answered" }
 ```
 
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
@@ -166,7 +172,7 @@ remote conversation), `config_update` (current verbosity/redact), `hello`
 `reply` — answer a pending `ask`:
 
 ```json
-{ "type": "reply", "id": "wg_run_stage_1", "answer": 0, "token": "<token>" }
+{ "type": "reply", "id": "act_9e31", "answer": 0, "token": "<token>" }
 ```
 
 `answer` accepts:
@@ -238,14 +244,52 @@ formed row or descriptor details.
 A remote reply answers a pending ask in every session state:
 
 - **Interactive / TUI mode:** the ask tool races the local selector against the
-  remote reply (first valid answer wins). If you tap a button in the client, the
-  ask resolves with that option; if you answer locally, the client receives
-  `action_resolved` (`resolvedBy: "local"`) and the action becomes non-repliable.
-- **SDK workflow gate:** the reply resolves the real workflow-gate, driving the
-  session the same way a local answer would.
+  remote reply (first valid answer wins). A client submits generic `reply` using
+  the active presentation `id`; a local answer emits `action_resolved`
+  (`resolvedBy: "local"`) and that presentation becomes non-repliable.
+- **SDK workflow gate:** generic `reply` still uses the active presentation
+  `id`, never `workflowGateId`. The resolved gate drives the session the same
+  way a local answer would.
 
-In both modes the first valid reply wins; later replies get `already_answered`.
-Idle pings are notify-only.
+A session has at most one active answerable presentation. Interactive asks and durable workflow gates are serialized; further Q12 gates wait in a durable queue. A same-server reconnect replays the active `action_needed` with the same presentation ID. After a process restart, previously pending or accepted-but-unadvanced records are quarantined diagnostics and a reconstructed workflow remints fresh durable gate and presentation IDs. Terminal, stale, and reissued action IDs never regain authority.
+
+Generic and direct controls may race. Once the native generic claim is acquired, it wins; a direct control that atomically retires the exact unclaimed active presentation first wins instead. Losing direct controls fail without advancing the gate, and losing generic replies are stale/non-repliable. Clients must not retry by matching text, durable IDs, or presentation history; they must fail closed rather than guess when session or action identity is unsafe or ambiguous.
+
+### Durable workflow controls and Q12
+
+`workflow.gate_answer` and `workflow.plan_approve` operate on the durable
+Q12 `gate_id`, not `action_needed.id`. Both accept optional
+`expectedSessionId`; clients should always send the `sessionId` observed from
+the current authenticated endpoint:
+
+```json
+{ "type": "control_request", "operation": "workflow.gate_answer",
+  "input": { "id": "wg_run_stage_1", "response": "approve", "expectedSessionId": "sess-1" } }
+```
+
+```json
+{ "type": "control_request", "operation": "workflow.plan_approve",
+  "input": { "id": "wg_run_stage_1", "choice": "approve", "expectedSessionId": "sess-1" } }
+```
+
+`expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 control clients continue to work; new clients must send it now. It cannot become mandatory, or be removed from the controls, before SDK v4 and at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before the gate resolver runs. Neither control accepts a presentation ID, remaps an old ID to a reminted gate, or uses heuristic matching.
+
+Q12 (`workflow.gates.list`) exposes durable query records and additive SDK v3 diagnostics. A pending record preserves its workflow fields including `gate_id` and adds `id: "pending:<gate_id>"` and `tag: "pending"`. A restart quarantine diagnostic uses `id: "diagnostic:<gate_id>"`, `tag: "quarantined"`, and optional `lifecycle` containing `state: "quarantined"`, its restart reason, `quarantinedAt`, and an optional `supersededByGateId` after a remint. Diagnostics are query-only: they cannot be routed, answered, or promoted. Treat Q12 as the durable status surface, not as generic-reply authority.
+
+### Rust and N-API compatibility
+
+The Rust `ActionNeeded`, `ServerMessage`, and `register_ask` APIs remain
+legacy-compatible and uncorrelated. Correlation is available through additive
+Rust workflow-frame decoding/current-reader APIs and the workflow registration
+path; consumers that need correlation must opt in explicitly. N-API likewise
+retains `registerAsk`, and adds `registerWorkflowGateAsk` for a correlated wire
+frame plus `registerArbitratedAsk` and `retireIfUnclaimed` for in-process
+presentation arbitration. The arbitration lease and all claim/receipt/epoch
+state remain private: these APIs do not create a public authority value.
+
+### Runtime and native addon release pairing
+
+The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions (currently `0.10.2`). The native loader requires the matching version sentinel; mixed native/runtime versions are unsupported and must not claim SDK compatibility.
 
 ## Minimal client example
 
@@ -286,6 +330,19 @@ Model-role selectors may be ordered fallback chains; see [Fallback chains](./mod
 GJC ships managed SDK-client adapters for Telegram, Discord, and Slack. They use
 one local SDK endpoint per session; the adapters do not change the wire protocol,
 keep endpoint credentials in provider state, or expose a remote shell.
+
+The recommended interactive path is `/settings` → **Notifications**. It owns
+setup, health, test, recovery, reconnect, local enablement, and Telegram
+removal without exposing stored credentials.
+`gjc notify setup` remains the authoritative CLI fallback for headless and
+automated environments.
+
+Notification credentials and `notifications.*` settings are global-only.
+Project notification keys are
+ignored and runtime notification overrides are rejected. Telegram pairing
+revalidates the complete bot-token/chat identity immediately before polling and
+again before activation. A foreign or unknown owner is never killed, reloaded, or taken over;
+setup fails closed without saving or exposing the raw token.
 
 - [Telegram notification onboarding](./telegram-onboarding.md) documents
   `gjc notify setup` and private-chat pairing.

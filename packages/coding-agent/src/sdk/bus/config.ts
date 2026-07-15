@@ -2,7 +2,6 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as z from "zod/v4";
 import { ConfigFile, type LoadResult } from "../../config/config-file";
-import type { Settings } from "../../config/settings";
 
 /**
  * Env marker set by GJC's own programmatic separate-process child spawn sites
@@ -15,9 +14,90 @@ import type { Settings } from "../../config/settings";
  */
 export const SPAWN_PROVENANCE_ENV = "GJC_SPAWNED_BY_SESSION";
 
+export type TelegramActivationState = "inactive" | "blocked";
+export type TelegramActivationReason = "saved_inactive" | "identity_mismatch";
+
+/** Non-secret, identity-specific durable Telegram activation state. */
+export interface TelegramActivationMarker {
+	identity: string;
+	state: TelegramActivationState;
+	updatedAt: string;
+	reason?: TelegramActivationReason;
+}
+
+export type TelegramActivationMarkers = Record<string, TelegramActivationMarker>;
+
+function isTelegramActivationMarker(value: unknown): value is TelegramActivationMarker {
+	if (!value || typeof value !== "object") return false;
+	const marker = value as Partial<TelegramActivationMarker>;
+	return (
+		(marker.state === "inactive" || marker.state === "blocked") &&
+		typeof marker.identity === "string" &&
+		marker.identity.length > 0 &&
+		typeof marker.updatedAt === "string" &&
+		(marker.reason === undefined || marker.reason === "saved_inactive" || marker.reason === "identity_mismatch")
+	);
+}
+
+/** Validate and clone activation markers crossing the settings boundary. */
+export function readTelegramActivationMarkers(value?: unknown): TelegramActivationMarkers {
+	const markers: TelegramActivationMarkers = {};
+	if (!value || typeof value !== "object" || Array.isArray(value)) return markers;
+	for (const [identity, marker] of Object.entries(value)) {
+		if (isTelegramActivationMarker(marker) && identity === marker.identity) markers[identity] = { ...marker };
+	}
+	return markers;
+}
+
+export interface NotificationSettingsSnapshot {
+	enabled: boolean;
+	telegram: {
+		botToken?: string;
+		chatId?: string;
+		activation?: Record<string, unknown>;
+		rich: {
+			enabled: boolean;
+		};
+		richDraft: {
+			enabled: boolean;
+		};
+		topics: {
+			nameTemplate?: string;
+		};
+	};
+	discord: {
+		botToken?: string;
+		applicationId?: string;
+		guildId?: string;
+		parentChannelId?: string;
+	};
+	slack: {
+		botToken?: string;
+		appToken?: string;
+		workspaceId?: string;
+		channelId?: string;
+		authorizedUserId?: string;
+	};
+	redact: boolean;
+	verbosity: "lean" | "verbose";
+	sessionScope: "all" | "primary";
+	idleTimeoutMs: number;
+}
+
+/**
+ * Narrow settings boundary for remote notification identity and behavior.
+ * Implementations must return only user-global values, with schema defaults
+ * applied; project settings and runtime overrides are intentionally excluded.
+ */
+export interface NotificationSettingsReader {
+	getNotificationSettingsSnapshot(): NotificationSettingsSnapshot;
+	getAgentDir(): string;
+}
+
 export interface NotificationConfig {
 	enabled: boolean;
 	botToken?: string;
+	activation?: TelegramActivationMarkers;
 	chatId?: string;
 	discord: {
 		botToken?: string;
@@ -58,38 +138,24 @@ export interface NotificationConfig {
 	};
 }
 
-/** Read typed config from Settings. */
-export function getNotificationConfig(settings: Settings): NotificationConfig {
+/** Read typed global-only notification config from a narrow settings reader. */
+export function getNotificationConfig(settings: NotificationSettingsReader): NotificationConfig {
+	const snapshot = settings.getNotificationSettingsSnapshot();
+	const activation = readTelegramActivationMarkers(snapshot.telegram.activation);
 	return {
-		enabled: settings.get("notifications.enabled"),
-		botToken: settings.get("notifications.telegram.botToken"),
-		chatId: settings.get("notifications.telegram.chatId"),
-		discord: {
-			botToken: settings.get("notifications.discord.botToken"),
-			applicationId: settings.get("notifications.discord.applicationId"),
-			guildId: settings.get("notifications.discord.guildId"),
-			parentChannelId: settings.get("notifications.discord.parentChannelId"),
-		},
-		slack: {
-			botToken: settings.get("notifications.slack.botToken"),
-			appToken: settings.get("notifications.slack.appToken"),
-			workspaceId: settings.get("notifications.slack.workspaceId"),
-			channelId: settings.get("notifications.slack.channelId"),
-			authorizedUserId: settings.get("notifications.slack.authorizedUserId"),
-		},
-		redact: settings.get("notifications.redact"),
-		verbosity: settings.get("notifications.verbosity") === "verbose" ? "verbose" : "lean",
-		sessionScope: settings.get("notifications.sessionScope") === "primary" ? "primary" : "all",
-		idleTimeoutMs: settings.get("notifications.daemon.idleTimeoutMs"),
-		rich: {
-			enabled: settings.get("notifications.telegram.rich.enabled"),
-		},
-		richDraft: {
-			enabled: settings.get("notifications.telegram.richDraft.enabled"),
-		},
-		topics: {
-			nameTemplate: settings.get("notifications.telegram.topics.nameTemplate"),
-		},
+		enabled: snapshot.enabled,
+		botToken: snapshot.telegram.botToken,
+		...(Object.keys(activation).length === 0 ? {} : { activation }),
+		chatId: snapshot.telegram.chatId,
+		discord: snapshot.discord,
+		slack: snapshot.slack,
+		redact: snapshot.redact,
+		verbosity: snapshot.verbosity,
+		sessionScope: snapshot.sessionScope,
+		idleTimeoutMs: snapshot.idleTimeoutMs,
+		rich: snapshot.telegram.rich,
+		richDraft: snapshot.telegram.richDraft,
+		topics: snapshot.telegram.topics,
 	};
 }
 
@@ -201,7 +267,42 @@ export function completionNotifyDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
 	return v === "off" || v === "0" || v === "false";
 }
 
-/** Resolve whether the notifications extension should be registered at SDK startup. */
+/** Canonical host eligibility for the dormant notification session surface. */
+export interface NotificationHostEligibilityInput {
+	env: NodeJS.ProcessEnv;
+	/** False for host modes that cannot own a notification session endpoint. */
+	hostModeSupported?: boolean;
+	/** Task recursion depth; helper/subagent sessions must not own remote surfaces. */
+	taskDepth?: number;
+	/** Parent subagent id/prefix; present for helper/subagent sessions even when depth is omitted. */
+	parentTaskPrefix?: string;
+	/** Role-agent type/name; present for task sessions even if depth metadata is lost. */
+	currentAgentType?: string;
+	/** Canonical global session scope; absent preserves the default `all` behavior. */
+	sessionScope?: NotificationConfig["sessionScope"];
+	/** Whether this process was spawned by one of GJC's marked child spawn sites. */
+	spawnedByGjc?: boolean;
+}
+
+/**
+ * Resolve whether this host may receive the dormant notification controller.
+ * This intentionally says nothing about whether an adapter is configured: an
+ * eligible unconfigured host still gets a zero-side-effect control surface.
+ */
+export function isNotificationHostEligible(input: NotificationHostEligibilityInput): boolean {
+	if (completionNotifyDisabledByEnv(input.env)) return false;
+	if (input.hostModeSupported === false) return false;
+	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix || input.currentAgentType) return false;
+	if (input.env.GJC_NOTIFICATIONS === "0") return false;
+	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
+	if (input.spawnedByGjc && input.sessionScope === "primary") return false;
+	return true;
+}
+
+/**
+ * Legacy compatibility helper for callers that require both host eligibility
+ * and a currently configured or explicit notification runtime.
+ */
 export function shouldRegisterNotificationsExtension(input: {
 	env: NodeJS.ProcessEnv;
 	cfg?: NotificationConfig;
@@ -221,16 +322,23 @@ export function shouldRegisterNotificationsExtension(input: {
 	 */
 	spawnedByGjc?: boolean;
 }): boolean {
-	if ((input.taskDepth ?? 0) > 0 || input.parentTaskPrefix || input.currentAgentType) return false;
-	if (completionNotifyDisabledByEnv(input.env)) return false;
-	if (input.env.GJC_NOTIFICATIONS === "0") return false;
-	if (input.env.GJC_NOTIFICATIONS === "1" || input.env.GJC_NOTIFICATIONS_TOKEN) return true;
-	// Spawned-child suppression sits below explicit opt-in (so Telegram
-	// `/session_create` and cold `/session_resume`, which launch with
-	// GJC_NOTIFICATIONS=1, keep their fully bidirectional topic) and above global
-	// auto-on (so their children stay silent under `primary`).
-	if (input.spawnedByGjc && input.cfg?.sessionScope === "primary") return false;
-	return input.cfg ? isGloballyConfigured(input.cfg) : false;
+	if (
+		!isNotificationHostEligible({
+			env: input.env,
+			taskDepth: input.taskDepth,
+			parentTaskPrefix: input.parentTaskPrefix,
+			currentAgentType: input.currentAgentType,
+			sessionScope: input.cfg?.sessionScope,
+			spawnedByGjc: input.spawnedByGjc,
+		})
+	) {
+		return false;
+	}
+	return (
+		input.env.GJC_NOTIFICATIONS === "1" ||
+		Boolean(input.env.GJC_NOTIFICATIONS_TOKEN) ||
+		Boolean(input.cfg && isGloballyConfigured(input.cfg))
+	);
 }
 
 /**
@@ -269,6 +377,20 @@ export function tokenFingerprint(token: string): string {
 	return crypto.createHash("sha256").update(token).digest("hex").slice(0, 12);
 }
 
+/** Deterministic non-secret key for one Telegram token/chat identity. */
+export function telegramActivationIdentity(botToken: string, chatId: string): string {
+	return `${tokenFingerprint(botToken)}:${tokenFingerprint(chatId)}`;
+}
+
+/** Return the durable marker for the currently configured Telegram identity, if any. */
+export function getCurrentTelegramActivationMarker(cfg: NotificationConfig): TelegramActivationMarker | undefined {
+	const botToken = cfg.botToken;
+	const chatId = cfg.chatId;
+	if (typeof botToken !== "string" || botToken.trim().length === 0) return undefined;
+	if (typeof chatId !== "string" || chatId.trim().length === 0) return undefined;
+	return cfg.activation?.[telegramActivationIdentity(botToken, chatId)];
+}
+
 /** Short session tag for display, e.g. last 6 chars of sessionId. */
 export function sessionTag(sessionId: string): string {
 	return sessionId.slice(-6);
@@ -278,6 +400,8 @@ export interface RedactableAction {
 	id: string;
 	kind: string;
 	sessionId: string;
+	/** Durable workflow-gate correlation metadata; never generic reply authority. */
+	workflowGateId?: string;
 	question?: string;
 	options?: string[];
 	summary?: string;

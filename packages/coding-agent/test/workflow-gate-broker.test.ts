@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import type { GateContinuation } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import {
 	FileGateStore,
 	type GateAuditEvent,
@@ -11,6 +12,17 @@ import {
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
 
+function liveContinuation(): GateContinuation {
+	let live = true;
+	return {
+		activate: () => {},
+		isLive: () => live,
+		release: () => {
+			live = false;
+		},
+	};
+}
+
 function makeBroker(
 	extra: { audit?: (e: GateAuditEvent) => void; advance?: (g: WorkflowGate, a: unknown) => void } = {},
 ) {
@@ -19,6 +31,7 @@ function makeBroker(
 	const advanced: Array<{ gate: WorkflowGate; answer: unknown }> = [];
 	const broker = new WorkflowGateBroker("2026-06-05-0449-4845", new MemoryGateStore(), {
 		emit: g => emitted.push(g),
+		terminalizeAccepted: () => "not_published",
 		advance: (g, a) => {
 			advanced.push({ gate: g, answer: a });
 			extra.advance?.(g, a);
@@ -34,8 +47,14 @@ function makeBroker(
 describe("WorkflowGateBroker", () => {
 	it("emits run-scoped monotonic gate ids per stage", () => {
 		const { broker, emitted } = makeBroker();
-		const g1 = broker.openGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["a", "b"] } });
-		const g2 = broker.openGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["a", "b"] } });
+		const g1 = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["a", "b"] } },
+			liveContinuation(),
+		);
+		const g2 = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["a", "b"] } },
+			liveContinuation(),
+		);
 		expect(g1.gate_id).toBe("wg_04494845_ralplan_000001");
 		expect(g2.gate_id).toBe("wg_04494845_ralplan_000002");
 		expect(emitted).toHaveLength(2);
@@ -52,15 +71,35 @@ describe("WorkflowGateBroker", () => {
 
 	it("accepts a valid answer, persists before advancing exactly once", async () => {
 		const { broker, advanced, audit } = makeBroker();
-		const gate = broker.openGate({
-			stage: "ralplan",
-			kind: "approval",
-			schema: { type: "string", enum: ["approve"] },
-		});
+		const gate = broker.openGate(
+			{
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string", enum: ["approve"] },
+			},
+			liveContinuation(),
+		);
 		const res = await broker.resolve({ gate_id: gate.gate_id, answer: "approve" });
 		expect(res.status).toBe("accepted");
 		expect(advanced).toHaveLength(1);
 		expect(audit.some(e => e.event === "gate_response_accepted")).toBe(true);
+	});
+
+	it("does not mark an accepted gate terminalized without a terminalization proof", async () => {
+		const advanced: unknown[] = [];
+		const broker = new WorkflowGateBroker("run-no-terminal-proof", new MemoryGateStore(), {
+			advance: () => {
+				advanced.push(true);
+			},
+		});
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } },
+			liveContinuation(),
+		);
+		await expect(broker.resolve({ gate_id: gate.gate_id, answer: "approve" })).rejects.toThrow(
+			"no terminalization proof",
+		);
+		expect(advanced).toEqual([]);
 	});
 
 	it("preserves acknowledgement policy updates made before advance", async () => {
@@ -69,6 +108,8 @@ describe("WorkflowGateBroker", () => {
 		const store = new FileGateStore(file);
 		let broker: WorkflowGateBroker;
 		broker = new WorkflowGateBroker("run-ack-policy", store, {
+			advance: () => {},
+			terminalizeAccepted: () => "not_published",
 			finalizeAccepted: async record => {
 				if (record.ackPolicy?.kind !== "telegram_selected_v1") throw new Error("missing Telegram policy");
 				broker.updateAckPolicy(record.gate.gate_id, {
@@ -79,7 +120,10 @@ describe("WorkflowGateBroker", () => {
 				});
 			},
 		});
-		const gate = broker.openGate({ stage: "deep-interview", kind: "question", schema: { type: "string" } });
+		const gate = broker.openGate(
+			{ stage: "deep-interview", kind: "question", schema: { type: "string" } },
+			liveContinuation(),
+		);
 		await broker.resolve(
 			{ gate_id: gate.gate_id, answer: "yes" },
 			{
@@ -122,11 +166,14 @@ describe("WorkflowGateBroker", () => {
 
 	it("leaves the gate pending on an invalid answer", async () => {
 		const { broker, advanced } = makeBroker();
-		const gate = broker.openGate({
-			stage: "ralplan",
-			kind: "approval",
-			schema: { type: "string", enum: ["approve"] },
-		});
+		const gate = broker.openGate(
+			{
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string", enum: ["approve"] },
+			},
+			liveContinuation(),
+		);
 		const res = await broker.resolve({ gate_id: gate.gate_id, answer: "nope" });
 		expect(res.status).toBe("rejected");
 		expect(res.error?.code).toBe("invalid_workflow_gate_answer");
@@ -138,7 +185,10 @@ describe("WorkflowGateBroker", () => {
 
 	it("is idempotent on replay and detects conflicts", async () => {
 		const { broker, advanced } = makeBroker();
-		const gate = broker.openGate({ stage: "ultragoal", kind: "execution", schema: { type: "boolean" } });
+		const gate = broker.openGate(
+			{ stage: "ultragoal", kind: "execution", schema: { type: "boolean" } },
+			liveContinuation(),
+		);
 		const first = await broker.resolve({ gate_id: gate.gate_id, answer: true, idempotency_key: "k1" });
 		const replay = await broker.resolve({ gate_id: gate.gate_id, answer: true, idempotency_key: "k1" });
 		expect(replay).toEqual(first);
@@ -158,15 +208,58 @@ describe("WorkflowGateBroker", () => {
 		);
 	});
 
-	it("persists durably across broker instances with FileGateStore", async () => {
+	it("quarantines prior-process pending gates so they cannot be answered", async () => {
 		const dir = mkdtempSync(path.join(tmpdir(), "gate-store-"));
 		const file = path.join(dir, "gates.json");
 		const b1 = new WorkflowGateBroker("run-xyz", new FileGateStore(file));
-		const gate = b1.openGate({ stage: "deep-interview", kind: "question", schema: { type: "string" } });
-		// New broker instance, same backing file → sees the pending gate.
+		const gate = b1.openGate(
+			{ stage: "deep-interview", kind: "question", schema: { type: "string" } },
+			liveContinuation(),
+		);
 		const b2 = new WorkflowGateBroker("run-xyz", new FileGateStore(file));
-		const res = await b2.resolve({ gate_id: gate.gate_id, answer: "an answer" });
-		expect(res.status).toBe("accepted");
+		expect(b2.listPendingGates()).toEqual([]);
+		expect(b2.listGateDiagnostics()).toMatchObject([
+			{
+				gate_id: gate.gate_id,
+				id: `diagnostic:${gate.gate_id}`,
+				tag: "quarantined",
+				lifecycle: { reason: "orphaned_after_process_restart" },
+			},
+		]);
+		await expect(b2.resolve({ gate_id: gate.gate_id, answer: "an answer" })).rejects.toThrow(/no live pending gate/);
+	});
+
+	it("projects durable Q12 metadata and links a reminted gate after persistence", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "gate-query-"));
+		const file = path.join(dir, "gates.json");
+		const first = new WorkflowGateBroker("run-query", new FileGateStore(file), { advance: () => {} });
+		const stale = first.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string" } },
+			liveContinuation(),
+		);
+		const restarted = new WorkflowGateBroker("run-query", new FileGateStore(file), { advance: () => {} });
+		const reminted = restarted.openGate(
+			{
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string" },
+				supersedesGateId: stale.gate_id,
+			},
+			liveContinuation(),
+		);
+		expect(restarted.listWorkflowGateQueryRecords()).toMatchObject([
+			{ gate_id: reminted.gate_id, id: `pending:${reminted.gate_id}`, tag: "pending" },
+			{
+				gate_id: stale.gate_id,
+				id: `diagnostic:${stale.gate_id}`,
+				tag: "quarantined",
+				lifecycle: {
+					state: "quarantined",
+					reason: "orphaned_after_process_restart",
+					supersededByGateId: reminted.gate_id,
+				},
+			},
+		]);
 	});
 
 	it("serializes live resolution with recovery so advance runs after finalization exactly once", async () => {
@@ -175,6 +268,7 @@ describe("WorkflowGateBroker", () => {
 		const releaseFinalization = Promise.withResolvers<void>();
 		let advances = 0;
 		const broker = new WorkflowGateBroker("run-concurrent-recovery", store, {
+			terminalizeAccepted: () => "not_published",
 			finalizeAccepted: async () => {
 				finalizationStarted.resolve();
 				await releaseFinalization.promise;
@@ -183,7 +277,10 @@ describe("WorkflowGateBroker", () => {
 				advances++;
 			},
 		});
-		const gate = broker.openGate({ stage: "ralplan", kind: "approval", schema: { type: "string" } });
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string" } },
+			liveContinuation(),
+		);
 		const resolving = broker.resolve({ gate_id: gate.gate_id, answer: "approve" });
 		await finalizationStarted.promise;
 		const recovering = broker.recover();
@@ -195,33 +292,97 @@ describe("WorkflowGateBroker", () => {
 		expect(advances).toBe(1);
 	});
 
-	it("recover() advances accepted-but-not-advanced gates exactly once", async () => {
+	it("quarantines an accepted-unadvanced gate at the process boundary without replaying it", async () => {
 		const dir = mkdtempSync(path.join(tmpdir(), "gate-recover-"));
 		const file = path.join(dir, "gates.json");
-		// First broker: advance throws AFTER the durable accept write, simulating a
-		// crash between accept and the advanced:true commit.
-		const store1 = new FileGateStore(file);
-		const b1 = new WorkflowGateBroker("run-rec", store1, {
+		const b1 = new WorkflowGateBroker("run-rec", new FileGateStore(file), {
+			terminalizeAccepted: () => "not_published",
 			advance: () => {
 				throw new Error("simulated crash during advance");
 			},
 		});
-		const gate = b1.openGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["go"] } });
+		const gate = b1.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["go"] } },
+			liveContinuation(),
+		);
 		await expect(b1.resolve({ gate_id: gate.gate_id, answer: "go" })).rejects.toThrow(/crash/);
 
-		// Fresh broker over the same file recovers exactly once.
 		let advances = 0;
 		const b2 = new WorkflowGateBroker("run-rec", new FileGateStore(file), {
 			advance: () => {
-				advances += 1;
+				advances++;
 			},
 		});
-		const recovered = await b2.recover();
-		expect(recovered).toEqual([gate.gate_id]);
-		expect(advances).toBe(1);
-		// A second recover() is a no-op (already advanced).
 		expect(await b2.recover()).toEqual([]);
-		expect(advances).toBe(1);
+		expect(advances).toBe(0);
+		expect(b2.listGateDiagnostics()).toMatchObject([
+			{ gate_id: gate.gate_id, lifecycle: { reason: "accepted_unadvanced_after_process_restart" } },
+		]);
+	});
+
+	it("retains a same-process accepted advance failure for idempotent recovery", async () => {
+		const store = new MemoryGateStore();
+		let failAdvance = true;
+		let advances = 0;
+		const broker = new WorkflowGateBroker("run-live-recovery", store, {
+			terminalizeAccepted: () => "not_published",
+			advance: () => {
+				advances++;
+				if (failAdvance) throw new Error("temporary advance failure");
+			},
+		});
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["go"] } },
+			liveContinuation(),
+		);
+		await expect(broker.resolve({ gate_id: gate.gate_id, answer: "go", idempotency_key: "retry" })).rejects.toThrow(
+			"temporary advance failure",
+		);
+		expect(store.get(gate.gate_id)).toMatchObject({ status: "accepted", advanced: false, answer: "go" });
+		expect(await broker.resolve({ gate_id: gate.gate_id, answer: "go", idempotency_key: "retry" })).toMatchObject({
+			status: "accepted",
+		});
+		failAdvance = false;
+		expect(await broker.recover()).toEqual([gate.gate_id]);
+		expect(advances).toBe(2);
+		expect(store.get(gate.gate_id)).toMatchObject({ status: "accepted", advanced: true });
+	});
+
+	it("fails closed on a malformed but valid FileGateStore document before exposure", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "gate-invalid-document-"));
+		const file = path.join(dir, "gates.json");
+		const first = new WorkflowGateBroker("run-invalid-document", new FileGateStore(file), { advance: () => {} });
+		const gate = first.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string" } },
+			liveContinuation(),
+		);
+		const document = JSON.parse(readFileSync(file, "utf8")) as { gates: Record<string, { advanced: boolean }> };
+		document.gates[gate.gate_id]!.advanced = true;
+		writeFileSync(file, JSON.stringify(document));
+		expect(() => new FileGateStore(file)).toThrow(/corrupt gate store/);
+	});
+
+	it("keeps ownerless gates diagnostic-only rather than fabricating hook ownership", async () => {
+		const noHook = new WorkflowGateBroker("run-no-hook", new MemoryGateStore());
+		const noHookGate = noHook.openGate({ stage: "ralplan", kind: "approval", schema: { type: "string" } });
+		expect(noHook.listPendingGates()).toEqual([]);
+		await expect(noHook.resolve({ gate_id: noHookGate.gate_id, answer: "approve" })).rejects.toThrow(
+			/no live pending gate/,
+		);
+		expect(noHook.listGateDiagnostics()).toMatchObject([
+			{ gate_id: noHookGate.gate_id, lifecycle: { reason: "opened_without_continuation" } },
+		]);
+
+		const { broker } = makeBroker();
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string" } },
+			liveContinuation(),
+		);
+		broker.loseContinuation(gate.gate_id);
+		expect(broker.listPendingGates()).toEqual([]);
+		await expect(broker.resolve({ gate_id: gate.gate_id, answer: "approve" })).rejects.toThrow(
+			/no live pending gate/,
+		);
 	});
 
 	it("fails closed on a corrupt FileGateStore instead of silently resetting", () => {
@@ -229,5 +390,44 @@ describe("WorkflowGateBroker", () => {
 		const file = path.join(dir, "gates.json");
 		writeFileSync(file, "{ not valid json");
 		expect(() => new FileGateStore(file)).toThrow(/corrupt gate store/);
+	});
+
+	it("fails closed when the startup quarantine directory fsync fails", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "gate-fsync-"));
+		const file = path.join(dir, "gates.json");
+		const first = new WorkflowGateBroker("run-fsync", new FileGateStore(file));
+		first.openGate({ stage: "deep-interview", kind: "question", schema: { type: "string" } }, liveContinuation());
+		let syncs = 0;
+		expect(
+			() =>
+				new WorkflowGateBroker(
+					"run-fsync",
+					new FileGateStore(file, () => {
+						syncs++;
+						if (syncs === 2) throw new Error("directory fsync failed");
+					}),
+				),
+		).toThrow(/directory fsync failed/);
+	});
+	it("quarantines a disk-accepted record after post-rename fsync uncertainty instead of reissuing it", async () => {
+		const file = path.join(mkdtempSync(path.join(tmpdir(), "gate-uncertain-accepted-")), "gates.json");
+		let syncs = 0;
+		const store = new FileGateStore(file, () => {
+			syncs++;
+			if (syncs === 8) throw new Error("parent fsync failed after accepted rename");
+		});
+		const broker = new WorkflowGateBroker("run-uncertain-accepted", store, { advance: () => {} });
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } },
+			liveContinuation(),
+		);
+		await expect(broker.resolve({ gate_id: gate.gate_id, answer: "approve" })).rejects.toMatchObject({
+			certainty: "uncertain",
+		});
+		expect(broker.listPendingGates()).toEqual([]);
+		expect(new FileGateStore(file).get(gate.gate_id)).toMatchObject({
+			status: "quarantined",
+			lifecycle: { reason: "continuation_owner_lost" },
+		});
 	});
 });

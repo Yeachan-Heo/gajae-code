@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
-import type { Settings } from "../src/config/settings";
 import {
 	getNotificationConfig,
 	isDiscordConfigured,
@@ -18,7 +17,7 @@ import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-
 // path end-to-end (raw YAML object -> getNotificationConfig.rich).
 function cfgFromRaw(rawConfig: unknown) {
 	const settings = createLightweightDaemonSettings({ agentDir: "/tmp/gjc-rich-config", rawConfig });
-	return getNotificationConfig(settings as Settings);
+	return getNotificationConfig(settings);
 }
 
 describe("notifications daemon config reachability (rich)", () => {
@@ -128,12 +127,15 @@ describe("lightweight daemon settings set() persists via lock + partial merge", 
 		);
 		// The daemon loaded this snapshot at startup...
 		const rawConfig = YAML.parse(fs.readFileSync(configPath, "utf8"));
-		const s = createLightweightDaemonSettings({ agentDir, rawConfig }) as unknown as {
-			set(k: string, v: unknown): Promise<void>;
-			get(k: string): unknown;
-		};
+		const s = createLightweightDaemonSettings({ agentDir, rawConfig });
 		// ...then a concurrent main-process save adds an unrelated key to config.yml.
-		const concurrent = YAML.parse(fs.readFileSync(configPath, "utf8")) as Record<string, any>;
+		const concurrent = YAML.parse(fs.readFileSync(configPath, "utf8")) as {
+			notifications: {
+				telegram: { botToken: string; chatId: string; rich: { enabled: boolean } };
+				discord?: { botToken: string };
+			};
+			model: string;
+		};
 		concurrent.notifications.discord = { botToken: "d" };
 		fs.writeFileSync(configPath, YAML.stringify(concurrent));
 
@@ -141,9 +143,15 @@ describe("lightweight daemon settings set() persists via lock + partial merge", 
 
 		// set() re-reads under the lock and patches only its key: the flip lands AND
 		// the concurrently-written key survives (no whole-file last-writer-wins clobber).
-		const onDisk = YAML.parse(fs.readFileSync(configPath, "utf8")) as Record<string, any>;
+		const onDisk = YAML.parse(fs.readFileSync(configPath, "utf8")) as {
+			notifications: {
+				telegram: { botToken: string; chatId: string; rich: { enabled: boolean } };
+				discord?: { botToken: string };
+			};
+			model: string;
+		};
 		expect(onDisk.notifications.telegram.rich.enabled).toBe(false);
-		expect(onDisk.notifications.discord.botToken).toBe("d");
+		expect(onDisk.notifications.discord?.botToken).toBe("d");
 		expect(onDisk.notifications.telegram.botToken).toBe("tok");
 		expect(onDisk.model).toBe("keep-me");
 		// In-memory view reflects the write.

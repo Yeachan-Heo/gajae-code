@@ -31,4 +31,31 @@ describe("Telegram onboarding docs", () => {
 		expect(sdk).toContain("Do not pair a group, supergroup, or channel to work around a missing BotFather\nmenu");
 		expect(sdk.toLowerCase()).not.toContain("mini" + "app");
 	});
+
+	it("documents Settings and CLI parity without weakening notification safety", async () => {
+		const onboarding = await readRepoFile("docs", "telegram-onboarding.md");
+		const sdk = await readRepoFile("docs", "sdk.md");
+
+		expect(onboarding).toContain("open `/settings` and select the\n**Notifications** tab");
+		expect(onboarding).toContain(
+			"refresh or probe health, send a test notification, recover dead-owner\n  artifacts, and reconnect the Telegram runtime",
+		);
+		expect(onboarding).toContain("Telegram credentials and all `notifications.*` values are **global-only**");
+		expect(onboarding).toContain(
+			"project config files are ignored, and runtime notification overrides\nare rejected",
+		);
+		expect(onboarding).toContain("`GJC_NOTIFY=off`, `0`, or `false`");
+		expect(onboarding).toContain("`GJC_NOTIFICATIONS=1` or `GJC_NOTIFICATIONS_TOKEN`");
+		expect(onboarding).toContain("GJC performs zero `getUpdates` discovery polls");
+		expect(onboarding).toContain("does not poll, kill, reload, or take over the\nowner");
+		expect(onboarding).toContain("The raw token is never printed by GJC status/setup output after it is stored");
+		expect(onboarding).toContain(
+			"`gjc notify setup`, `gjc notify status`, `gjc notify health`, `gjc notify\ntest`, and `gjc notify recovery`",
+		);
+
+		expect(sdk).toContain("The recommended interactive path is `/settings` → **Notifications**");
+		expect(sdk).toContain("`gjc notify setup` remains the authoritative CLI fallback for headless and");
+		expect(sdk).toContain("Project notification keys are\nignored and runtime notification overrides are rejected");
+		expect(sdk).toContain("A foreign or unknown owner is never killed, reloaded, or taken over");
+	});
 });

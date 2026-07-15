@@ -23,7 +23,7 @@ import {
 	tokenFingerprint,
 } from "./config";
 import { type DaemonPaths, daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
-import type { DaemonState } from "./telegram-daemon";
+import { DAEMON_GENERATION } from "./telegram-daemon-contract";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
 
@@ -216,7 +216,36 @@ async function readEndpointView(fs: NotificationServiceFs, file: string): Promis
 	};
 }
 
-function parseDaemonState(raw: string): DaemonState | undefined {
+interface NormalizedDaemonState {
+	pid: number;
+	ownerId: string;
+	tokenFingerprint: string | undefined;
+	chatId: string | undefined;
+	startedAt: number | undefined;
+	heartbeatAt: number | undefined;
+	stoppedAt: number | undefined;
+	roots: string[] | undefined;
+	generation: number | undefined;
+	generationStatus: "missing" | "valid" | "invalid";
+}
+
+function finiteNonNegativeNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function safePositiveInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function safeNonNegativeInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function stringArray(value: unknown): string[] | undefined {
+	return Array.isArray(value) && value.every(item => typeof item === "string") ? value : undefined;
+}
+
+function parseDaemonState(raw: string): NormalizedDaemonState | undefined {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
@@ -225,11 +254,33 @@ function parseDaemonState(raw: string): DaemonState | undefined {
 	}
 	if (!parsed || typeof parsed !== "object") return undefined;
 	const rec = parsed as Record<string, unknown>;
-	if (typeof rec.pid !== "number" || typeof rec.ownerId !== "string") return undefined;
-	return parsed as DaemonState;
+	const pid = safePositiveInteger(rec.pid);
+	if (pid === undefined || typeof rec.ownerId !== "string" || rec.ownerId.length === 0) return undefined;
+
+	const generation = safeNonNegativeInteger(rec.generation);
+	const generationStatus = !Object.hasOwn(rec, "generation")
+		? "missing"
+		: generation === undefined
+			? "invalid"
+			: "valid";
+	return {
+		pid,
+		ownerId: rec.ownerId,
+		tokenFingerprint: typeof rec.tokenFingerprint === "string" ? rec.tokenFingerprint : undefined,
+		chatId: typeof rec.chatId === "string" ? rec.chatId : undefined,
+		startedAt: finiteNonNegativeNumber(rec.startedAt),
+		heartbeatAt: finiteNonNegativeNumber(rec.heartbeatAt),
+		stoppedAt: finiteNonNegativeNumber(rec.stoppedAt),
+		roots: stringArray(rec.roots),
+		generation,
+		generationStatus,
+	};
 }
 
-async function readDaemonStateFile(fs: NotificationServiceFs, file: string): Promise<DaemonState | undefined> {
+async function readDaemonStateFile(
+	fs: NotificationServiceFs,
+	file: string,
+): Promise<NormalizedDaemonState | undefined> {
 	try {
 		return parseDaemonState(await fs.readFile(file, "utf8"));
 	} catch {
@@ -263,8 +314,28 @@ export interface DaemonHealth {
 	heartbeatFresh: boolean;
 	identityMatches: boolean;
 	stopped: boolean;
+	heartbeatAt: number | undefined;
+	heartbeatAgeMs: number | undefined;
+	generation: number | undefined;
+	currentGeneration: number;
+	generationRelation: DaemonGenerationRelation;
 }
 
+export type DaemonGenerationRelation = "pre_generation" | "older" | "current" | "newer" | "unknown";
+
+function daemonGenerationRelation(state: NormalizedDaemonState | undefined): DaemonGenerationRelation {
+	if (!state) return "unknown";
+	if (state.generationStatus === "missing") return "pre_generation";
+	if (state.generation === undefined) return "unknown";
+	if (state.generation < DAEMON_GENERATION) return "older";
+	if (state.generation === DAEMON_GENERATION) return "current";
+	return "newer";
+}
+
+function displayHeartbeatAgeMs(now: number, heartbeatAt: number): number | undefined {
+	const age = now - heartbeatAt;
+	return Number.isFinite(age) ? Math.max(0, age) : undefined;
+}
 export interface EndpointHealth {
 	total: number;
 	live: number;
@@ -350,18 +421,24 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 	// Daemon ownership state (offline; read the persisted state file directly).
 	const paths = daemonPaths(opts.settings.getAgentDir());
 	const state = await readDaemonStateFile(fs, paths.state);
+	const heartbeatAt = state?.heartbeatAt;
 	const daemon: DaemonHealth = {
 		present: Boolean(state),
 		ownerId: state?.ownerId,
 		pid: state?.pid,
 		alive: state ? pidAlive(state.pid) : false,
-		heartbeatFresh: state ? now - state.heartbeatAt <= HEARTBEAT_TTL_MS : false,
+		heartbeatFresh: heartbeatAt !== undefined ? now - heartbeatAt <= HEARTBEAT_TTL_MS : false,
 		identityMatches:
 			Boolean(state) &&
 			telegramConfigured &&
 			state?.tokenFingerprint === tokenFingerprint(cfg.botToken) &&
 			state?.chatId === cfg.chatId,
-		stopped: typeof state?.stoppedAt === "number",
+		stopped: state?.stoppedAt !== undefined,
+		heartbeatAt,
+		heartbeatAgeMs: heartbeatAt === undefined ? undefined : displayHeartbeatAgeMs(now, heartbeatAt),
+		generation: state?.generation,
+		currentGeneration: DAEMON_GENERATION,
+		generationRelation: daemonGenerationRelation(state),
 	};
 	if (!state) {
 		checks.push({ name: "daemon", level: "ok", detail: "no daemon ownership record (none running)" });
@@ -583,7 +660,7 @@ async function removeDeadOwnerLock(
 	fs: NotificationServiceFs,
 	paths: DaemonPaths,
 	pidAlive: (pid: number) => boolean,
-	expected: DaemonState,
+	expected: NormalizedDaemonState,
 ): Promise<"cleared" | "contended" | "superseded" | "now-alive" | "unlink-failed"> {
 	if (!(await fs.createExclusive(paths.steal))) return "contended";
 	try {

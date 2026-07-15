@@ -6,7 +6,23 @@ import {
 	questionsToGates,
 	questionToGate,
 } from "../src/modes/shared/agent-wire/deep-interview-gate";
-import { MemoryGateStore, WorkflowGateBroker } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import {
+	type GateContinuation,
+	MemoryGateStore,
+	WorkflowGateBroker,
+} from "../src/modes/shared/agent-wire/workflow-gate-broker";
+
+function activeContinuation(): GateContinuation {
+	let active = true;
+	return {
+		activate: () => {},
+		terminalProof: "not_published",
+		isLive: () => active,
+		release: () => {
+			active = false;
+		},
+	};
+}
 
 const singleQ: AskGateQuestion = {
 	id: "q1",
@@ -96,8 +112,15 @@ describe("gateAnswerToResult (human-path parity)", () => {
 
 describe("end-to-end via the broker", () => {
 	it("emits the question gate and validates the answer against the advertised schema", async () => {
-		const broker = new WorkflowGateBroker("run-di", new MemoryGateStore());
-		const gate = broker.openGate(questionToGate(singleQ));
+		const advanced: unknown[] = [];
+		const broker = new WorkflowGateBroker("run-di", new MemoryGateStore(), {
+			advance: (_gate, answer) => {
+				advanced.push(answer);
+			},
+		});
+		const gate = broker.openGate(questionToGate(singleQ), activeContinuation());
+		expect(broker.listPendingGates()).toEqual([gate]);
+
 		// A schema-invalid answer (selected not an array) is rejected, gate stays pending.
 		const bad = await broker.resolve({ gate_id: gate.gate_id, answer: { selected: "OAuth2" } });
 		expect(bad.status).toBe("rejected");
@@ -123,28 +146,43 @@ describe("end-to-end via the broker", () => {
 		// A schema-valid answer is accepted and decodes to the human-path result.
 		const good = await broker.resolve({ gate_id: gate.gate_id, answer: { selected: ["JWT"] } });
 		expect(good.status).toBe("accepted");
+		expect(advanced).toEqual([{ selected: ["JWT"] }]);
 		expect(gateAnswerToResult(singleQ, { selected: ["JWT"] }).selectedOptions).toEqual(["JWT"]);
 	});
 
 	it("accepts single-select normal selection, Other-only, and clarification paths", async () => {
-		const broker = new WorkflowGateBroker("run-di-valid", new MemoryGateStore());
-		const selectionGate = broker.openGate(questionToGate(singleQ));
+		const advanced: unknown[] = [];
+		const broker = new WorkflowGateBroker("run-di-valid", new MemoryGateStore(), {
+			advance: (_gate, answer) => {
+				advanced.push(answer);
+			},
+		});
+		const selectionGate = broker.openGate(questionToGate(singleQ), activeContinuation());
+		expect(broker.listPendingGates()).toEqual([selectionGate]);
+
 		const selection = await broker.resolve({ gate_id: selectionGate.gate_id, answer: { selected: ["JWT"] } });
 		expect(selection.status).toBe("accepted");
 
-		const otherGate = broker.openGate(questionToGate(singleQ));
+		const otherGate = broker.openGate(questionToGate(singleQ), activeContinuation());
+
 		const other = await broker.resolve({
 			gate_id: otherGate.gate_id,
 			answer: { selected: [], other: true, custom: "Passkeys" },
 		});
 		expect(other.status).toBe("accepted");
 
-		const clarifyGate = broker.openGate(questionToGate(singleQ));
+		const clarifyGate = broker.openGate(questionToGate(singleQ), activeContinuation());
+
 		const clarify = await broker.resolve({
 			gate_id: clarifyGate.gate_id,
 			answer: { action: "clarify", question: "What does OAuth2 imply here?" },
 		});
 		expect(clarify.status).toBe("accepted");
+		expect(advanced).toEqual([
+			{ selected: ["JWT"] },
+			{ selected: [], other: true, custom: "Passkeys" },
+			{ action: "clarify", question: "What does OAuth2 imply here?" },
+		]);
 	});
 });
 

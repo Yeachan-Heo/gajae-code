@@ -13,7 +13,7 @@ import {
 	type StartupUpdateRoute,
 } from "../src/main";
 import type { InteractiveMode } from "../src/modes/interactive-mode";
-import type { CreateAgentSessionResult } from "../src/sdk";
+import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { EventBus } from "../src/utils/event-bus";
@@ -311,6 +311,46 @@ describe("startup update contract", () => {
 			else Bun.env.PI_NO_TITLE = originalNoTitle;
 		}
 	});
+	it("forwards CLI --mcp-config as mcpConfigPath to local SDK session startup", async () => {
+		using tempDir = TempDir.createSync("@gjc-mcp-config-startup-options-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const configPath = path.join(tempDir.path(), "explicit-mcp.json");
+		let sessionOptions: CreateAgentSessionOptions | undefined;
+		try {
+			await runRootCommand(
+				parseArgs([
+					"--mode",
+					"text",
+					"--mcp-config",
+					configPath,
+					"--no-session",
+					"--no-skills",
+					"--no-rules",
+					"--no-tools",
+					"--no-lsp",
+				]),
+				[],
+				{
+					createAgentSession: async options => {
+						sessionOptions = options;
+						return fakeSessionResult();
+					},
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					suppressProcessExit: true,
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					runPrintMode: async () => {},
+				},
+			);
+
+			expect(sessionOptions?.mcpConfigPath).toBe(configPath);
+			expect(sessionOptions?.mcpManager).toBeUndefined();
+		} finally {
+			authStorage.close();
+		}
+	});
 
 	it("preserves print-mode status and does not dispose the session twice", async () => {
 		using tempDir = TempDir.createSync("@gjc-print-exit-");
@@ -347,6 +387,121 @@ describe("startup update contract", () => {
 			authStorage.close();
 			if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
 			else Bun.env.PI_NO_TITLE = originalNoTitle;
+		}
+	});
+	it("disposes the interactive session before rethrowing a startup failure", async () => {
+		using tempDir = TempDir.createSync("@gjc-interactive-startup-failure-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const startupFailure = new Error("interactive startup failed");
+		const sessionResult = fakeSessionResult();
+		let disposeCalls = 0;
+		sessionResult.session.dispose = async () => {
+			await Promise.resolve();
+			disposeCalls += 1;
+		};
+
+		try {
+			await expect(
+				runRootCommand(rootArgs(), [], {
+					createAgentSession: async () => sessionResult,
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					getChangelogForDisplay: async () => {
+						throw startupFailure;
+					},
+				}),
+			).rejects.toBe(startupFailure);
+			expect(disposeCalls).toBe(1);
+		} finally {
+			authStorage.close();
+		}
+	});
+	it("disposes the session before propagating an RLM post-create error", async () => {
+		using tempDir = TempDir.createSync("@gjc-rlm-post-create-failure-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const hookFailure = new Error("RLM post-create failed");
+		const sessionResult = fakeSessionResult();
+		const events: string[] = [];
+		let disposeCalls = 0;
+		sessionResult.session.dispose = async () => {
+			events.push("dispose");
+			disposeCalls += 1;
+			throw new Error("cleanup failure");
+		};
+
+		try {
+			await runRootCommand(rootArgs({ mode: "text" }), [], {
+				createAgentSession: async () => sessionResult,
+				discoverAuthStorage: async () => authStorage,
+				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+				initTheme: async () => {},
+				readPipedInput: async () => undefined,
+				runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				rlmPreset: {
+					applyOptions: () => {},
+					onSessionCreated: async () => {
+						events.push("hook");
+						throw hookFailure;
+					},
+				},
+			}).then(
+				() => {
+					throw new Error("Expected RLM post-create hook to reject");
+				},
+				error => {
+					events.push("observed");
+					expect(error).toBe(hookFailure);
+				},
+			);
+
+			expect(events).toEqual(["hook", "dispose", "observed"]);
+			expect(disposeCalls).toBe(1);
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	it("disposes the interactive session before PI_TIMING=x exits", async () => {
+		using tempDir = TempDir.createSync("@gjc-interactive-timing-exit-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const originalTiming = Bun.env.PI_TIMING;
+		const timingExit = new Error("timing exit");
+		const sessionResult = fakeSessionResult();
+		let disposed = false;
+		let disposeCalls = 0;
+		sessionResult.session.dispose = async () => {
+			await Promise.resolve();
+			disposed = true;
+			disposeCalls += 1;
+		};
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((): never => {
+			if (!disposed) throw new Error("PI_TIMING=x exited before session disposal");
+			throw timingExit;
+		});
+
+		try {
+			Bun.env.PI_TIMING = "x";
+			await expect(
+				runRootCommand(rootArgs(), [], {
+					createAgentSession: async () => sessionResult,
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					getChangelogForDisplay: async () => undefined,
+				}),
+			).rejects.toBe(timingExit);
+			expect(exitSpy).toHaveBeenCalledWith(0);
+			expect(disposeCalls).toBe(1);
+		} finally {
+			exitSpy.mockRestore();
+			if (originalTiming === undefined) delete Bun.env.PI_TIMING;
+			else Bun.env.PI_TIMING = originalTiming;
+			authStorage.close();
 		}
 	});
 

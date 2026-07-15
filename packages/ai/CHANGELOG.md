@@ -9,6 +9,8 @@
 
 - Fixed frequent `Request blocked (code=invalid_prompt)` failures on gpt-5.6 (Sol/Terra/Luna) subagent, default-agent, and compaction turns (ref openai/codex#32028, oh-my-pi#5184). Leaked Harmony control-token markers (e.g. `<|channel|>analysis`) were only neutralized on the replayed-history payload path, so markers in assistant reasoning summaries, live-converted message/tool-output text, and user-authored content reached the OpenAI Responses and OpenAI-codex-responses transports verbatim and wedged the session (the poisoned item was re-sent every turn). Both transports now neutralize reserved control tokens across the entire outgoing `input` array at the request boundary via an idempotent zero-width-space insertion that keeps the text human-readable.
 
+- Closed the remaining `Request blocked (code=invalid_prompt)` wedge on gpt-5.6 caused by header-form leaked Harmony markers. The reserved-control-token sanitizer only matched the simple `<|ident|>` shape, so a header-form marker carrying a recipient (e.g. `<|assistant to=functions.bash|>`) survived every sanitizer path (replay, request boundary, compaction) and kept re-poisoning history even after the earlier fixes. The pattern now also matches the scoped header grammar — a known Harmony role (`system`/`developer`/`user`/`assistant`/`tool`) plus a `to=<recipient>` assignment with unbounded recipient length — while leaving ordinary delimiter/pipe text untouched (arbitrary `<|foo bar=baz|>`, F# `value <| f |> g`, compact `sum<|a+b|>c`, and multi-line bodies never match). The simple branch remains a strict superset of the prior identifier-only pattern (#2267).
+
 ## [0.10.2] - 2026-07-14
 
 ### Fixed

@@ -14,6 +14,7 @@ import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { MCPManager } from "../runtime-mcp";
+import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
@@ -96,6 +97,10 @@ export interface InteractiveModeContext {
 	mcpManager?: MCPManager;
 	lspServers?: LspStartupServerInfo[];
 
+	/** Shared controller query; absent in ACP/lightweight test contexts. */
+	getCurrentSessionNotificationStatus?(): NotificationSessionStatus | undefined;
+	/** Toggle only the current session; absent in ACP/lightweight test contexts. */
+	setCurrentSessionNotificationsEnabled?(enabled: boolean): Promise<NotificationSessionReconcileResult | undefined>;
 	readonly ircLedger: IrcObservationLedger;
 	// State
 	isInitialized: boolean;

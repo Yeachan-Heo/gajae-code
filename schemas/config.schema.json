@@ -42,11 +42,17 @@
 						"chatId": {
 							"type": "string"
 						},
+						"activation": {
+							"type": "object",
+							"additionalProperties": true,
+							"default": {}
+						},
 						"rich": {
 							"type": "object",
 							"properties": {
 								"enabled": {
 									"type": "boolean",
+									"description": "Format Telegram notifications with rich message content.",
 									"default": true
 								}
 							},
@@ -57,6 +63,7 @@
 							"properties": {
 								"enabled": {
 									"type": "boolean",
+									"description": "Include rich draft updates in Telegram notifications.",
 									"default": false
 								}
 							},
@@ -115,14 +122,17 @@
 				},
 				"redact": {
 					"type": "boolean",
+					"description": "Redact sensitive content before notifications are delivered.",
 					"default": false
 				},
 				"verbosity": {
 					"type": "string",
+					"description": "Choose concise or detailed notification messages.",
 					"default": "lean"
 				},
 				"sessionScope": {
 					"type": "string",
+					"description": "Send notifications from all sessions or only the primary session.",
 					"default": "all"
 				},
 				"daemon": {
@@ -825,6 +835,20 @@
 					"type": "number",
 					"description": "Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
 					"default": 5
+				},
+				"fallbackChains": {
+					"type": "object",
+					"additionalProperties": true,
+					"default": {}
+				},
+				"fallbackRevertPolicy": {
+					"type": "string",
+					"enum": [
+						"cooldown-expiry",
+						"never"
+					],
+					"description": "When to return to the primary model after a fallback",
+					"default": "cooldown-expiry"
 				}
 			},
 			"additionalProperties": false
@@ -1932,6 +1956,25 @@
 				"screenshotDir": {
 					"type": "string",
 					"description": "Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)"
+				},
+				"profileReuse": {
+					"type": "string",
+					"description": "'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+					"default": "auto"
+				},
+				"geo": {
+					"type": "object",
+					"properties": {
+						"timezone": {
+							"type": "string",
+							"description": "Optional IANA timezone (e.g. 'America/New_York') for headless sessions. Default unset preserves the real timezone. Only set this to a value coherent with your egress (e.g. a proxy region); an incoherent timezone increases bot detection."
+						},
+						"locale": {
+							"type": "string",
+							"description": "Optional UI locale (e.g. 'en-US') for headless sessions. Default unset preserves the real locale. Only set this coherently with your egress region."
+						}
+					},
+					"additionalProperties": false
 				},
 				"gc": {
 					"type": "object",

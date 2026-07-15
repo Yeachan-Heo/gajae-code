@@ -23,7 +23,7 @@ function createControllerContext() {
 	const settings = Settings.isolated();
 	settings.set("modelRoles", { default: "provider-a/original-default:medium" });
 	settings.set("task.agentModelOverrides", { executor: "provider-a/original-executor:low" });
-	settings.set("modelProfile.default", undefined);
+	settings.unset("modelProfile.default");
 	const setModelCalls: Array<{
 		model: Model;
 		role: string;

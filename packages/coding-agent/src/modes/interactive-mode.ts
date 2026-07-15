@@ -62,6 +62,7 @@ import {
 	scheduleLaunchStarReminderAfterFirstRender,
 	starReminderLaunchGate,
 } from "../reminders/star-reminder";
+import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
 import type { AgentSession, AgentSessionEvent, TemporaryProviderSessionScope } from "../session/agent-session";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
@@ -542,6 +543,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController = new SelectorController(this);
 		this.#inputController = new InputController(this);
 		this.#observerRegistry = new SessionObserverRegistry();
+	}
+
+	getCurrentSessionNotificationStatus(): NotificationSessionStatus | undefined {
+		return this.session.notificationSessionController?.query({ sessionManager: this.sessionManager });
+	}
+
+	async setCurrentSessionNotificationsEnabled(
+		enabled: boolean,
+	): Promise<NotificationSessionReconcileResult | undefined> {
+		return await this.session.notificationSessionController?.setLocalEnabled(
+			{ sessionManager: this.sessionManager },
+			enabled,
+		);
 	}
 
 	async init(): Promise<void> {

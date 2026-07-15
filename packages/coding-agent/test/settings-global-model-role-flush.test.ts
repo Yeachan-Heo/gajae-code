@@ -69,25 +69,25 @@ describe("Settings global model role durability", () => {
 			YAML.stringify({ modelRoles: { default: "provider/original:low", planner: "planner/original:medium" } }),
 		);
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
-		const originalWrite = Bun.write.bind(Bun);
-		const firstConfigWrite = Promise.withResolvers<void>();
-		const continueFirstConfigWrite = Promise.withResolvers<void>();
-		let configWrite = 0;
-		vi.spyOn(Bun, "write").mockImplementation(async (destination, input) => {
-			if (typeof destination !== "string" || typeof input !== "string") {
-				throw new Error("unexpected non-string settings write");
+		const originalRename = fs.rename.bind(fs);
+		const firstConfigRename = Promise.withResolvers<void>();
+		const continueFirstConfigRename = Promise.withResolvers<void>();
+		let configRename = 0;
+		vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (to !== configPath) {
+				await originalRename(from, to);
+				return;
 			}
-			if (destination !== configPath) return originalWrite(destination, input);
-			configWrite += 1;
-			if (configWrite === 1) {
-				firstConfigWrite.resolve();
-				await continueFirstConfigWrite.promise;
+			configRename += 1;
+			if (configRename === 1) {
+				firstConfigRename.resolve();
+				await continueFirstConfigRename.promise;
 			}
-			return originalWrite(destination, input);
+			await originalRename(from, to);
 		});
 
 		const selection = settings.setGlobalModelRoleAndFlush("default", "provider/selection-b:high");
-		await firstConfigWrite.promise;
+		await firstConfigRename.promise;
 
 		// When: direct writer C commits while B's durable flush remains pending.
 		const newerRoles = {
@@ -96,7 +96,7 @@ describe("Settings global model role durability", () => {
 			reviewer: "reviewer/newer:low",
 		};
 		settings.set("modelRoles", newerRoles);
-		continueFirstConfigWrite.resolve();
+		continueFirstConfigRename.resolve();
 		const commit = await selection;
 		const restored = await settings.restoreGlobalDefaultModelRoleIfCurrent(commit);
 		await settings.flush();
@@ -163,13 +163,10 @@ describe("Settings global model role durability", () => {
 		settings.setGlobalModelRole("default", "provider/pending-b:high");
 		settings.set("theme.dark", "amber-claw");
 		await Bun.write(configPath, YAML.stringify({ modelRoles: { default: "provider/external-c:medium" } }));
-		const originalWrite = Bun.write.bind(Bun);
-		const write = vi.spyOn(Bun, "write").mockImplementation(async (destination, input) => {
-			if (typeof destination !== "string" || typeof input !== "string") {
-				throw new Error("unexpected non-string settings write");
-			}
-			if (destination === configPath) throw new Error("injected unrelated save failure");
-			return originalWrite(destination, input);
+		const originalRename = fs.rename.bind(fs);
+		const write = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (to === configPath) throw new Error("injected unrelated save failure");
+			await originalRename(from, to);
 		});
 
 		await settings.flush();
@@ -210,17 +207,14 @@ describe("Settings global model role durability", () => {
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
 		const clone = await settings.cloneForCwd(projectDir);
 		const commit = await settings.setGlobalModelRoleAndFlush("default", "provider/selection-b:high");
-		const originalWrite = Bun.write.bind(Bun);
-		let rejectConfigWrite = true;
-		vi.spyOn(Bun, "write").mockImplementation(async (destination, input) => {
-			if (typeof destination !== "string" || typeof input !== "string") {
-				throw new Error("unexpected non-string settings write");
-			}
-			if (destination === configPath && rejectConfigWrite) {
-				rejectConfigWrite = false;
+		const originalRename = fs.rename.bind(fs);
+		let rejectConfigRename = true;
+		vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (to === configPath && rejectConfigRename) {
+				rejectConfigRename = false;
 				throw new Error("clone durable write failed");
 			}
-			return originalWrite(destination, input);
+			await originalRename(from, to);
 		});
 
 		await expect(clone.setGlobalModelRoleAndFlush("default", "provider/selection-c:medium")).rejects.toThrow(
@@ -429,17 +423,14 @@ describe("Settings global model role durability", () => {
 		// Given
 		await Bun.write(configPath, YAML.stringify({ modelRoles: { default: "provider/original:low" } }));
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
-		const originalWrite = Bun.write.bind(Bun);
-		let rejectConfigWrite = true;
-		vi.spyOn(Bun, "write").mockImplementation(async (destination, input) => {
-			if (typeof destination === "string" && destination === configPath && rejectConfigWrite) {
-				rejectConfigWrite = false;
+		const originalRename = fs.rename.bind(fs);
+		let rejectConfigRename = true;
+		vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (to === configPath && rejectConfigRename) {
+				rejectConfigRename = false;
 				throw new Error("injected config write failure");
 			}
-			if (typeof destination !== "string" || typeof input !== "string") {
-				throw new Error("unexpected non-string settings write");
-			}
-			return originalWrite(destination, input);
+			await originalRename(from, to);
 		});
 
 		// When
@@ -449,6 +440,9 @@ describe("Settings global model role durability", () => {
 		await expect(rejected).rejects.toThrow("injected config write failure");
 		expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider/original:low" });
 		expect(settings.getModelRole("default")).toBe("provider/original:low");
+		expect(YAML.parse(await Bun.file(configPath).text())).toEqual({
+			modelRoles: { default: "provider/original:low" },
+		});
 
 		settings.set("theme.dark", "amber-claw");
 		await settings.flush();
@@ -462,21 +456,23 @@ describe("Settings global model role durability", () => {
 		// Given
 		await Bun.write(configPath, YAML.stringify({ modelRoles: { default: "provider/original:low" } }));
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
-		const originalWrite = Bun.write.bind(Bun);
-		const predecessorWrite = Promise.withResolvers<void>();
-		let configWrite = 0;
-		vi.spyOn(Bun, "write").mockImplementation(async (destination, input) => {
-			if (typeof destination !== "string" || typeof input !== "string") {
-				throw new Error("unexpected non-string settings write");
+		const originalRename = fs.rename.bind(fs);
+		const predecessorRename = Promise.withResolvers<void>();
+		let waitedForPredecessor = false;
+		vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (to !== configPath) {
+				await originalRename(from, to);
+				return;
 			}
-			if (destination !== configPath) return originalWrite(destination, input);
-			configWrite += 1;
-			if (configWrite === 1) {
-				await predecessorWrite.promise;
-			} else if (configWrite === 2) {
+			if (!waitedForPredecessor) {
+				waitedForPredecessor = true;
+				await predecessorRename.promise;
+			}
+			const candidate = YAML.parse(await fs.readFile(from, "utf8")) as { modelRoles?: { default?: string } };
+			if (candidate.modelRoles?.default === "provider/rejected:high") {
 				throw new Error("injected older selector failure");
 			}
-			return originalWrite(destination, input);
+			await originalRename(from, to);
 		});
 
 		settings.set("theme.dark", "predecessor-claw");
@@ -485,7 +481,7 @@ describe("Settings global model role durability", () => {
 		const newer = settings.setGlobalModelRoleAndFlush("default", "provider/newer:medium");
 
 		// When
-		predecessorWrite.resolve();
+		predecessorRename.resolve();
 
 		// Then
 		await predecessor;
@@ -503,20 +499,26 @@ describe("Settings global model role durability", () => {
 		await Bun.write(configPath, YAML.stringify({ modelRoles: { default: "provider/original:low" } }));
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
 		settings.overrideModelRoles({ planner: "profile/planner:high" });
-		const originalWrite = Bun.write.bind(Bun);
-		const predecessorWrite = Promise.withResolvers<void>();
-		let configWrite = 0;
-		vi.spyOn(Bun, "write").mockImplementation(async (destination, input) => {
-			if (typeof destination !== "string" || typeof input !== "string") {
-				throw new Error("unexpected non-string settings write");
+		const originalRename = fs.rename.bind(fs);
+		const predecessorRename = Promise.withResolvers<void>();
+		let waitedForPredecessor = false;
+		vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (to !== configPath) {
+				await originalRename(from, to);
+				return;
 			}
-			if (destination !== configPath) return originalWrite(destination, input);
-			configWrite += 1;
-			if (configWrite === 1) await predecessorWrite.promise;
-			if (configWrite === 2 || configWrite === 3) {
-				throw new Error(`injected selector failure ${configWrite}`);
+			if (!waitedForPredecessor) {
+				waitedForPredecessor = true;
+				await predecessorRename.promise;
 			}
-			return originalWrite(destination, input);
+			const candidate = YAML.parse(await fs.readFile(from, "utf8")) as { modelRoles?: { default?: string } };
+			if (candidate.modelRoles?.default === "provider/older-rejected:high") {
+				throw new Error("injected selector failure 2");
+			}
+			if (candidate.modelRoles?.default === "provider/newer-rejected:medium") {
+				throw new Error("injected selector failure 3");
+			}
+			await originalRename(from, to);
 		});
 
 		settings.set("theme.dark", "predecessor-claw");
@@ -526,7 +528,7 @@ describe("Settings global model role durability", () => {
 		const selections = Promise.allSettled([older, newer]);
 
 		// When
-		predecessorWrite.resolve();
+		predecessorRename.resolve();
 
 		// Then
 		await predecessor;
@@ -547,18 +549,18 @@ describe("Settings global model role durability", () => {
 	it("does not re-dirty a patch after an earlier duplicate save has persisted it", async () => {
 		// Given: two queued saves that snapshot the same patch before the first write settles.
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
-		const originalWrite = Bun.write.bind(Bun);
-		const firstWrite = Promise.withResolvers<void>();
-		let configWrite = 0;
-		vi.spyOn(Bun, "write").mockImplementation(async (destination, input) => {
-			if (typeof destination !== "string" || typeof input !== "string") {
-				throw new Error("unexpected non-string settings write");
+		const originalRename = fs.rename.bind(fs);
+		const firstRename = Promise.withResolvers<void>();
+		let configRename = 0;
+		vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (to !== configPath) {
+				await originalRename(from, to);
+				return;
 			}
-			if (destination !== configPath) return originalWrite(destination, input);
-			configWrite += 1;
-			if (configWrite === 1) await firstWrite.promise;
-			if (configWrite === 2) throw new Error("injected duplicate save failure");
-			return originalWrite(destination, input);
+			configRename += 1;
+			if (configRename === 1) await firstRename.promise;
+			if (configRename === 2) throw new Error("injected duplicate save failure");
+			await originalRename(from, to);
 		});
 
 		settings.set("theme.dark", "red-claw");
@@ -566,7 +568,7 @@ describe("Settings global model role durability", () => {
 		const duplicate = settings.flush();
 
 		// When: the first snapshot persists, then the obsolete duplicate snapshot fails.
-		firstWrite.resolve();
+		firstRename.resolve();
 		await first;
 		await duplicate;
 		await Bun.write(configPath, YAML.stringify({}));

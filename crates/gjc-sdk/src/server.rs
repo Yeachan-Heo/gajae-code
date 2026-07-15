@@ -38,14 +38,18 @@ use tokio_tungstenite::tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	actions::{ActionIdentity, ActionRegistry, ClaimOutcome, ReplyOutcome},
+	actions::{
+		ActionIdentity, ActionRegistrationError, ActionRegistry, ClaimOutcome, ReplyOutcome,
+		RetireIfUnclaimed,
+	},
 	discovery::EndpointRecord,
 	protocol::{
 		ActionKind, ActionNeeded, ActionUnavailable, ActionUnavailableReason, AskSelectedAckCancel,
 		AskSelectedAckCancelReason, AskSelectedAckFailedReason, AskSelectedAckOutcome,
 		AskSelectedAckRequest, AskSelectedAckUnknownReason, ClientMessage, PROTOCOL_VERSION, Pong,
 		RejectReason, ReplyAnswer, ReplyRejected, ServerHello, ServerMessage, SessionReady,
-		capabilities,
+		WorkflowGateActionNeeded, WorkflowGateWireDiscriminator, capabilities,
+		serialize_workflow_gate_action_needed,
 	},
 	query::REQUEST_FRAME_BYTES,
 };
@@ -137,8 +141,36 @@ struct Connection {
 	tx:           mpsc::UnboundedSender<DirectCommand>,
 }
 
+/// A rejected workflow-gate registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowGateRegistrationError {
+	/// Durable workflow-gate correlation cannot be empty.
+	EmptyWorkflowGateId,
+	/// The generic action id was already registered during this server's
+	/// lifetime.
+	ActionIdAlreadyRegistered,
+	/// The generic action id is already bound to a distinct correlated wire
+	/// presentation.
+	CorrelatedPresentationCollision,
+}
+
+impl std::fmt::Display for WorkflowGateRegistrationError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::EmptyWorkflowGateId => formatter.write_str("workflow gate id must be nonempty"),
+			Self::ActionIdAlreadyRegistered => formatter.write_str("action id is already registered"),
+			Self::CorrelatedPresentationCollision => {
+				formatter.write_str("action id is bound to a distinct correlated wire presentation")
+			},
+		}
+	}
+}
+
+impl std::error::Error for WorkflowGateRegistrationError {}
+
 /// Error returned when a caller attempts to broadcast an action through the
 /// generic frame API instead of the action lifecycle APIs.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushFrameError {
 	ActionNeededProhibited,
@@ -327,12 +359,84 @@ impl ServerHandle {
 	}
 
 	/// Register an `ask` action and queue a connection-local reevaluation for
-	/// every client. All asks use this path; only idle pings use broadcast.
+	/// every client. Duplicate ids fail closed without reevaluating clients; use
+	/// [`Self::try_register_ask`] to observe the typed failure.
 	///
 	/// `repliable` should be `true` only when the SDK workflow-gate resolver can
 	/// actually answer the ask.
 	pub fn register_ask(&self, needed: ActionNeeded, repliable: bool) {
-		self.state.registry.lock().register_ask(needed, repliable);
+		let _ = self.try_register_ask(needed, repliable);
+	}
+
+	/// Register an `ask`, returning an error when its id was used previously.
+	pub fn try_register_ask(
+		&self,
+		needed: ActionNeeded,
+		repliable: bool,
+	) -> Result<(), ActionRegistrationError> {
+		self
+			.state
+			.registry
+			.lock()
+			.try_register_ask(needed, repliable)?;
+		self.reevaluate_asks();
+		Ok(())
+	}
+
+	/// Register a correlated workflow-gate ask. The correlation is emitted only
+	/// by the connection-local action presentation path and is replayable while
+	/// this server remains live.
+	///
+	/// # Errors
+	/// Returns a typed error without mutating the action registry when the
+	/// workflow-gate id is empty or the action id has already been registered.
+	pub fn register_workflow_gate_ask(
+		&self,
+		needed: ActionNeeded,
+		workflow_gate_id: String,
+		repliable: bool,
+	) -> Result<(), WorkflowGateRegistrationError> {
+		self.register_workflow_gate_ask_with_discriminator(
+			needed,
+			workflow_gate_id,
+			WorkflowGateWireDiscriminator::ActionNeeded,
+			repliable,
+		)
+	}
+
+	pub(crate) fn register_workflow_gate_ask_with_discriminator(
+		&self,
+		needed: ActionNeeded,
+		workflow_gate_id: String,
+		wire_discriminator: WorkflowGateWireDiscriminator,
+		repliable: bool,
+	) -> Result<(), WorkflowGateRegistrationError> {
+		if workflow_gate_id.is_empty() {
+			return Err(WorkflowGateRegistrationError::EmptyWorkflowGateId);
+		}
+		self
+			.state
+			.registry
+			.lock()
+			.try_register_workflow_gate_ask_with_discriminator(
+				needed,
+				workflow_gate_id,
+				wire_discriminator,
+				repliable,
+			)
+			.map_err(|error| match error {
+				ActionRegistrationError::ActionIdAlreadyRegistered => {
+					WorkflowGateRegistrationError::ActionIdAlreadyRegistered
+				},
+				ActionRegistrationError::CorrelatedPresentationCollision => {
+					WorkflowGateRegistrationError::CorrelatedPresentationCollision
+				},
+			})?;
+		self.reevaluate_asks();
+		Ok(())
+	}
+
+	fn reevaluate_asks(&self) {
 		let connections = self
 			.state
 			.connections
@@ -343,6 +447,45 @@ impl ServerHandle {
 		for connection in connections {
 			let _ = connection.send(DirectCommand::ReevaluateAsk);
 		}
+	}
+
+	/// Read the current workflow correlation without exposing presentation
+	/// delivery state, claims, receipts, or its private registration epoch.
+	#[must_use]
+	pub fn current_workflow_gate_ask(&self) -> Option<WorkflowGateActionNeeded> {
+		self
+			.state
+			.registry
+			.lock()
+			.current_workflow_gate_ask()
+			.map(|(workflow, _)| workflow)
+	}
+
+	/// Return the current exact presentation identity for in-process
+	/// arbitration.
+	#[must_use]
+	pub fn current_identity(&self) -> Option<ActionIdentity> {
+		self.state.registry.lock().current_identity()
+	}
+
+	/// Atomically terminalize an exact current presentation. The status proves
+	/// whether the supplied private lease retired, was already terminal, was
+	/// claimed, or is stale; only retirement broadcasts a local terminal frame.
+	pub fn terminalize_if_current(&self, expected: &ActionIdentity) -> RetireIfUnclaimed {
+		let outcome = self.state.registry.lock().retire_if_unclaimed(expected);
+		if let RetireIfUnclaimed::Retired(resolved) = &outcome {
+			let _ = self
+				.state
+				.tx
+				.send(ServerMessage::ActionResolved(resolved.clone()));
+		}
+		outcome
+	}
+
+	/// Atomically retire an exact unclaimed presentation. Prefer
+	/// [`Self::terminalize_if_current`] for typed terminal proof.
+	pub fn retire_if_unclaimed(&self, expected: &ActionIdentity) -> RetireIfUnclaimed {
+		self.terminalize_if_current(expected)
 	}
 
 	/// Broadcast an ephemeral idle ping (not buffered, not repliable).
@@ -1131,9 +1274,11 @@ async fn reevaluate_ask<S>(state: &Arc<ServerState>, write: &mut S, connection_i
 where
 	S: SinkExt<Message> + Unpin,
 {
-	let Some((needed, identity)) = state.registry.lock().current_ask_snapshot() else {
+	let Some((needed, workflow_gate_id, identity)) = state.registry.lock().current_wire_snapshot()
+	else {
 		return true;
 	};
+
 	let Some((negotiation, client_capabilities, delivered)) = state
 		.connections
 		.lock()
@@ -1175,16 +1320,30 @@ where
 	if state.registry.lock().current_identity().as_ref() != Some(&identity) {
 		return true;
 	}
-	let message = match presentation {
-		Presentation::Full => ServerMessage::ActionNeeded(needed),
-		Presentation::Unavailable => ServerMessage::ActionUnavailable(ActionUnavailable {
-			id:                    needed.id,
-			session_id:            needed.session_id,
-			reason:                ActionUnavailableReason::MissingCapability,
-			required_capabilities: vec![capabilities::ASK_CONTROLS_V1.into()],
-		}),
+	let sent = match presentation {
+		Presentation::Full => match workflow_gate_id {
+			Some(workflow_gate_id) => {
+				let Ok(json) = serialize_workflow_gate_action_needed(&needed, &workflow_gate_id) else {
+					return false;
+				};
+				write.send(Message::Text(json)).await.map_err(|_| ())
+			},
+			None => send_msg(write, &ServerMessage::ActionNeeded(needed)).await,
+		},
+		Presentation::Unavailable => {
+			send_msg(
+				write,
+				&ServerMessage::ActionUnavailable(ActionUnavailable {
+					id:                    needed.id,
+					session_id:            needed.session_id,
+					reason:                ActionUnavailableReason::MissingCapability,
+					required_capabilities: vec![capabilities::ASK_CONTROLS_V1.into()],
+				}),
+			)
+			.await
+		},
 	};
-	if send_msg(write, &message).await.is_err() {
+	if sent.is_err() {
 		return false;
 	}
 	if let Some(connection) = state.connections.lock().get_mut(connection_id) {
@@ -1570,6 +1729,62 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn workflow_gate_correlation_survives_same_server_replay() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		handle
+			.register_workflow_gate_ask(ask("presentation-1"), "gate-1".into(), true)
+			.unwrap();
+
+		let mut first = connect(&handle, "secret").await;
+		let _ = next_server_hello(&mut first).await;
+		let first_raw = first
+			.next()
+			.await
+			.expect("workflow frame")
+			.expect("websocket frame");
+		let Message::Text(first_raw) = first_raw else {
+			panic!("expected workflow text frame")
+		};
+		let first_workflow = crate::protocol::decode_workflow_gate_action_needed(first_raw.as_str())
+			.unwrap()
+			.expect("workflow correlation");
+		assert_eq!(first_workflow.action.id, "presentation-1");
+		assert_eq!(first_workflow.workflow_gate_id, "gate-1");
+
+		let mut replay = connect(&handle, "secret").await;
+		let _ = next_server_hello(&mut replay).await;
+		let replay_raw = replay
+			.next()
+			.await
+			.expect("replayed workflow frame")
+			.expect("websocket frame");
+		let Message::Text(replay_raw) = replay_raw else {
+			panic!("expected replay text frame")
+		};
+		let replay_workflow =
+			crate::protocol::decode_workflow_gate_action_needed(replay_raw.as_str())
+				.unwrap()
+				.expect("replayed workflow correlation");
+		assert_eq!(replay_workflow, first_workflow);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn empty_workflow_gate_correlation_is_rejected_without_registry_mutation() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		handle.register_ask(ask("existing"), true);
+		let identity = handle.current_identity();
+
+		assert_eq!(
+			handle.register_workflow_gate_ask(ask("replacement"), String::new(), true),
+			Err(WorkflowGateRegistrationError::EmptyWorkflowGateId)
+		);
+		assert_eq!(handle.current_identity(), identity);
+		assert!(handle.current_workflow_gate_ask().is_none());
+		handle.stop();
+	}
+
+	#[tokio::test]
 	async fn ask_broadcast_then_reply_resolves() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut ws = connect(&handle, "secret").await;
@@ -1749,55 +1964,16 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn same_id_replacement_rejects_stale_full_delivery_epoch() {
-		let mut config = ServerConfig::new("s", "secret");
-		config.forward_replies = true;
-		let handle = start(config).await.unwrap();
-		let mut ws = connect(&handle, "secret").await;
-		next_server_hello(&mut ws).await;
-		send_hello(&mut ws, vec![capabilities::ASK_CONTROLS_V1.into()]).await;
+	async fn pending_same_id_registration_is_rejected_without_replacing_delivery_identity() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		handle.register_ask(controlled_ask("a1"), true);
-		let _ = next_server_msg(&mut ws).await;
-		let delivered = handle
-			.state
-			.connections
-			.lock()
-			.values()
-			.next()
-			.and_then(|connection| connection.delivered.clone())
-			.expect("full delivery record");
-		handle
-			.state
-			.registry
-			.lock()
-			.register_ask(controlled_ask("a1"), true);
-		assert_ne!(
-			delivered.identity,
-			handle
-				.state
-				.registry
-				.lock()
-				.current_identity()
-				.expect("replacement identity")
-		);
+		let original = handle.current_identity().expect("original identity");
 
-		ws.send(Message::Text(
-			serde_json::to_string(&ClientMessage::Reply(Reply {
-				id:              "a1".into(),
-				answer:          ReplyAnswer::Index(0),
-				token:           "secret".into(),
-				idempotency_key: None,
-			}))
-			.unwrap(),
-		))
-		.await
-		.unwrap();
-		assert!(matches!(
-			next_server_msg(&mut ws).await,
-			ServerMessage::ReplyRejected(ReplyRejected { reason: RejectReason::InvalidAnswer, .. })
-		));
-		assert!(!handle.state.registry.lock().has_claim_for_action("a1"));
-		assert!(handle.state.registry.lock().is_pending("a1"));
+		assert_eq!(
+			handle.try_register_ask(controlled_ask("a1"), true),
+			Err(ActionRegistrationError::ActionIdAlreadyRegistered)
+		);
+		assert_eq!(handle.current_identity(), Some(original));
 		handle.stop();
 	}
 

@@ -46,6 +46,7 @@ export type WorkerInitPayload =
 			browserWSEndpoint: string;
 			safeDir: string;
 			viewport?: { width: number; height: number; deviceScaleFactor?: number };
+			geo?: { readonly timezone?: string; readonly locale?: string };
 			dialogs?: "accept" | "dismiss";
 			url?: string;
 			waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";

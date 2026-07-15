@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
-import { resetSettingsForTest, Settings } from "../src/config/settings";
+import { logger } from "@gajae-code/utils";
+import { NotificationSettingsOverrideError, resetSettingsForTest, Settings } from "../src/config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../src/extensibility/extensions";
 import { createAgentSession } from "../src/sdk";
 import {
@@ -12,6 +13,7 @@ import {
 	getNotificationConfig,
 	isDiscordConfigured,
 	isGloballyConfigured,
+	isNotificationHostEligible,
 	isSessionNotificationsEnabled,
 	isSlackConfigured,
 	isTelegramConfigured,
@@ -20,10 +22,12 @@ import {
 	type RedactableAction,
 	sessionTag,
 	shouldRegisterNotificationsExtension,
+	telegramActivationIdentity,
 	tokenFingerprint,
 } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { daemonPaths, ensureTelegramDaemonRunning } from "../src/sdk/bus/telegram-daemon";
+import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 import { SessionManager } from "../src/session/session-manager";
 
 const BASE_CFG: NotificationConfig = {
@@ -130,13 +134,194 @@ describe("notifications config", () => {
 		});
 	});
 
-	test("chat adapter guards require every non-blank credential and routing identifier", () => {
+	test("getNotificationConfig validates and projects durable Telegram activation markers", () => {
+		const identity = telegramActivationIdentity("token-1", "chat-1");
+		const settings = Settings.isolated({
+			"notifications.telegram.botToken": "token-1",
+			"notifications.telegram.chatId": "chat-1",
+			"notifications.telegram.activation": {
+				[identity]: {
+					identity,
+					state: "inactive",
+					reason: "saved_inactive",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				},
+				malformed: { identity: "different", state: "inactive" },
+			},
+		});
+
+		expect(getNotificationConfig(settings).activation).toEqual({
+			[identity]: {
+				identity,
+				state: "inactive",
+				reason: "saved_inactive",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			},
+		});
+	});
+
+	test("full Settings and the lightweight daemon resolve the same global notification snapshot", () => {
+		const globalSettings = {
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": "telegram-token",
+			"notifications.telegram.chatId": "telegram-chat",
+			"notifications.telegram.rich.enabled": false,
+			"notifications.telegram.richDraft.enabled": true,
+			"notifications.telegram.topics.nameTemplate": "{repo}/{branch}",
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.applicationId": "discord-application",
+			"notifications.discord.guildId": "discord-guild",
+			"notifications.discord.parentChannelId": "discord-parent",
+			"notifications.slack.botToken": "slack-token",
+			"notifications.slack.appToken": "slack-app-token",
+			"notifications.slack.workspaceId": "slack-workspace",
+			"notifications.slack.channelId": "slack-channel",
+			"notifications.slack.authorizedUserId": "slack-user",
+			"notifications.redact": true,
+			"notifications.verbosity": "verbose" as const,
+			"notifications.sessionScope": "primary" as const,
+			"notifications.daemon.idleTimeoutMs": 1234,
+		};
+		const settings = Settings.isolated(globalSettings);
+		const lightweight = createLightweightDaemonSettings({
+			agentDir: "/tmp/gjc-notification-snapshot",
+			rawConfig: {
+				notifications: {
+					enabled: true,
+					telegram: {
+						botToken: "telegram-token",
+						chatId: "telegram-chat",
+						rich: { enabled: false },
+						richDraft: { enabled: true },
+						topics: { nameTemplate: "{repo}/{branch}" },
+					},
+					discord: {
+						botToken: "discord-token",
+						applicationId: "discord-application",
+						guildId: "discord-guild",
+						parentChannelId: "discord-parent",
+					},
+					slack: {
+						botToken: "slack-token",
+						appToken: "slack-app-token",
+						workspaceId: "slack-workspace",
+						channelId: "slack-channel",
+						authorizedUserId: "slack-user",
+					},
+					redact: true,
+					verbosity: "verbose",
+					sessionScope: "primary",
+					daemon: { idleTimeoutMs: 1234 },
+				},
+			},
+		});
+
+		expect(settings.getNotificationSettingsSnapshot()).toEqual(lightweight.getNotificationSettingsSnapshot());
+		expect(getNotificationConfig(settings)).toEqual(getNotificationConfig(lightweight));
+	});
+
+	test("project notification settings are ignored without leaking credentials", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-project-boundary-"));
+		tempDirs.push(root);
+		const agentDir = path.join(root, "agent");
+		const projectDir = path.join(root, "project");
+		const projectSettingsPath = path.join(projectDir, ".gjc", "settings.json");
+		const projectToken = "project-secret-token";
+		fs.mkdirSync(path.dirname(projectSettingsPath), { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			`notifications:\n  enabled: true\n  telegram:\n    botToken: global-token\n    chatId: global-chat\n`,
+		);
+		fs.writeFileSync(
+			projectSettingsPath,
+			JSON.stringify({
+				notifications: {
+					enabled: false,
+					telegram: { botToken: projectToken, chatId: "project-chat" },
+					terminalBell: true,
+					bellOnComplete: false,
+				},
+			}),
+		);
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		try {
+			resetSettingsForTest();
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(getNotificationConfig(settings)).toMatchObject({
+				enabled: true,
+				botToken: "global-token",
+				chatId: "global-chat",
+			});
+			expect(settings.get("notifications.terminalBell")).toBe(true);
+			expect(settings.get("notifications.bellOnComplete")).toBe(false);
+
+			const warnings = warnSpy.mock.calls.filter(
+				call => call[0] === "Settings: ignoring project notification settings",
+			);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]?.[1]).toEqual({ path: projectSettingsPath });
+			expect(JSON.stringify(warnings)).not.toContain(projectToken);
+		} finally {
+			warnSpy.mockRestore();
+			resetSettingsForTest();
+		}
+	});
+
+	test("runtime notification overrides are rejected without exposing their value", () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": "global-token",
+			"notifications.telegram.chatId": "global-chat",
+		});
+		const runtimeToken = "runtime-secret-token";
+		let thrown: unknown;
+
+		try {
+			settings.override("notifications.telegram.botToken", runtimeToken);
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(NotificationSettingsOverrideError);
+		expect(String(thrown)).not.toContain(runtimeToken);
+		expect(JSON.stringify(thrown)).not.toContain(runtimeToken);
+		expect(getNotificationConfig(settings)).toMatchObject({ botToken: "global-token", chatId: "global-chat" });
+	});
+
+	test("runtime terminal bell overrides remain session-local", () => {
+		const settings = Settings.isolated();
+		settings.override("notifications.terminalBell", true);
+		settings.override("notifications.bellOnAsk", false);
+		expect(settings.get("notifications.terminalBell")).toBe(true);
+		expect(settings.get("notifications.bellOnAsk")).toBe(false);
+	});
+
+	test("isGloballyConfigured requires a complete non-blank adapter", () => {
+		expect(isGloballyConfigured(GLOBAL_CFG)).toBe(true);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, enabled: false })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, botToken: undefined })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, botToken: "" })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: undefined })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: "" })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, botToken: " " })).toBe(false);
+		expect(isGloballyConfigured({ ...GLOBAL_CFG, chatId: "\t" })).toBe(false);
+		expect(
+			isGloballyConfigured({
+				...BASE_CFG,
+				enabled: true,
+				botToken: " ",
+				chatId: "\t",
+			}),
+		).toBe(false);
+
 		const discord: NotificationConfig = {
 			...BASE_CFG,
 			enabled: true,
 			discord: {
 				botToken: "discord-token",
-				applicationId: "discord-app",
+				applicationId: "discord-application",
 				guildId: "discord-guild",
 				parentChannelId: "discord-parent",
 			},
@@ -147,8 +332,8 @@ describe("notifications config", () => {
 			slack: {
 				botToken: "slack-token",
 				appToken: "slack-app-token",
-				workspaceId: "workspace",
-				channelId: "channel",
+				workspaceId: "slack-workspace",
+				channelId: "slack-channel",
 				authorizedUserId: "slack-user",
 			},
 		};
@@ -160,9 +345,14 @@ describe("notifications config", () => {
 		);
 		expect(isSlackConfigured(slack)).toBe(true);
 		expect(isSlackConfigured({ ...slack, slack: { ...slack.slack, appToken: "\t" } })).toBe(false);
+		expect(isSlackConfigured({ ...slack, slack: { ...slack.slack, workspaceId: undefined } })).toBe(false);
 		expect(isGloballyConfigured(discord)).toBe(true);
 		expect(isGloballyConfigured(slack)).toBe(true);
 		expect(isGloballyConfigured({ ...discord, enabled: false })).toBe(false);
+		expect(isGloballyConfigured({ ...discord, discord: { botToken: "discord-token" } })).toBe(false);
+		expect(isGloballyConfigured({ ...slack, slack: { botToken: "slack-token", appToken: "slack-app-token" } })).toBe(
+			false,
+		);
 	});
 
 	test("isTelegramConfigured rejects blank Telegram credentials even when another adapter is configured", () => {
@@ -274,6 +464,32 @@ describe("notifications config", () => {
 				currentAgentType: "executor",
 			}),
 		).toBe(false);
+	});
+
+	test("isNotificationHostEligible preserves hard-off, subagent, and primary-scope precedence", () => {
+		const primary = { ...PRIMARY_GLOBAL_CFG, sessionScope: "primary" as const };
+		expect(isNotificationHostEligible({ env: { GJC_NOTIFY: "off", GJC_NOTIFICATIONS: "1" } })).toBe(false);
+		expect(isNotificationHostEligible({ env: { GJC_NOTIFICATIONS: "1" }, taskDepth: 1 })).toBe(false);
+		expect(isNotificationHostEligible({ env: { GJC_NOTIFICATIONS: "0" } })).toBe(false);
+		expect(isNotificationHostEligible({ env: {}, hostModeSupported: false })).toBe(false);
+		expect(isNotificationHostEligible({ env: {}, sessionScope: primary.sessionScope, spawnedByGjc: true })).toBe(
+			false,
+		);
+		expect(
+			isNotificationHostEligible({
+				env: { GJC_NOTIFICATIONS: "1" },
+				sessionScope: primary.sessionScope,
+				spawnedByGjc: true,
+			}),
+		).toBe(true);
+		expect(
+			isNotificationHostEligible({
+				env: { GJC_NOTIFICATIONS_TOKEN: "explicit-token" },
+				sessionScope: primary.sessionScope,
+				spawnedByGjc: true,
+			}),
+		).toBe(true);
+		expect(isNotificationHostEligible({ env: {} })).toBe(true);
 	});
 
 	test("getNotificationConfig reads sessionScope", () => {
@@ -501,8 +717,12 @@ describe("notifications config", () => {
 		tempDirs.push(cwd);
 		const previousNotif = process.env.GJC_NOTIFICATIONS;
 		const previousSpawn = process.env.GJC_SPAWNED_BY_SESSION;
+		const previousToken = process.env.GJC_NOTIFICATIONS_TOKEN;
+		const previousCompletionNotify = process.env.GJC_NOTIFY;
 		delete process.env.GJC_NOTIFICATIONS;
 		delete process.env.GJC_SPAWNED_BY_SESSION;
+		delete process.env.GJC_NOTIFICATIONS_TOKEN;
+		delete process.env.GJC_NOTIFY;
 		const adapterSettings = (scope: "all" | "primary"): Settings =>
 			Settings.isolated({
 				"notifications.enabled": true,
@@ -555,25 +775,52 @@ describe("notifications config", () => {
 			disposers.push(() => optedIn.session.dispose());
 			delete process.env.GJC_NOTIFICATIONS;
 
+			// 4. The legacy explicit token has the same primary-scope override.
+			process.env.GJC_SPAWNED_BY_SESSION = "parent-abc";
+			process.env.GJC_NOTIFICATIONS_TOKEN = "legacy-token";
+			const tokenOptedIn = await spawn(primarySettings);
+			disposers.push(() => tokenOptedIn.session.dispose());
+			delete process.env.GJC_NOTIFICATIONS_TOKEN;
+
+			// 5. Notification hard-offs suppress delivery but keep the canonical SDK endpoint.
+			process.env.GJC_NOTIFY = "off";
+			const completionOptedOut = await spawn(allSettings);
+			disposers.push(() => completionOptedOut.session.dispose());
+			delete process.env.GJC_NOTIFY;
+			process.env.GJC_NOTIFICATIONS = "0";
+			const notificationsOptedOut = await spawn(allSettings);
+			disposers.push(() => notificationsOptedOut.session.dispose());
+			delete process.env.GJC_NOTIFICATIONS;
+
 			await suppressed.session.extensionRunner?.emit({ type: "session_start" });
 			await preserved.session.extensionRunner?.emit({ type: "session_start" });
 			await optedIn.session.extensionRunner?.emit({ type: "session_start" });
+			await tokenOptedIn.session.extensionRunner?.emit({ type: "session_start" });
+			await completionOptedOut.session.extensionRunner?.emit({ type: "session_start" });
+			await notificationsOptedOut.session.extensionRunner?.emit({ type: "session_start" });
 
 			expect(fs.existsSync(endpointFor(suppressed.session.sessionId))).toBe(true);
 			expect(fs.existsSync(endpointFor(preserved.session.sessionId))).toBe(true);
 			expect(fs.existsSync(endpointFor(optedIn.session.sessionId))).toBe(true);
+			expect(fs.existsSync(endpointFor(tokenOptedIn.session.sessionId))).toBe(true);
+			expect(fs.existsSync(endpointFor(completionOptedOut.session.sessionId))).toBe(true);
+			expect(fs.existsSync(endpointFor(notificationsOptedOut.session.sessionId))).toBe(true);
 		} finally {
 			await Promise.all(disposers.reverse().map(dispose => dispose()));
 			if (previousNotif === undefined) delete process.env.GJC_NOTIFICATIONS;
 			else process.env.GJC_NOTIFICATIONS = previousNotif;
 			if (previousSpawn === undefined) delete process.env.GJC_SPAWNED_BY_SESSION;
 			else process.env.GJC_SPAWNED_BY_SESSION = previousSpawn;
+			if (previousToken === undefined) delete process.env.GJC_NOTIFICATIONS_TOKEN;
+			else process.env.GJC_NOTIFICATIONS_TOKEN = previousToken;
+			if (previousCompletionNotify === undefined) delete process.env.GJC_NOTIFY;
+			else process.env.GJC_NOTIFY = previousCompletionNotify;
 			resetSettingsForTest();
 		}
-	}, 30000);
+	}, 60000);
 	test("never-registered notifications extension captures no command or daemon artifacts", () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-unregistered-"));
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-agent-"));
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-unregistered-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-agent-"));
 		tempDirs.push(cwd, agentDir);
 		const sessionId = "session-unregistered";
 		let notify: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void } | undefined;
@@ -594,8 +841,8 @@ describe("notifications config", () => {
 		expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
 	});
 	test("captured /notify on uses the production daemon ensurer once and awaits SDK endpoint shutdown", async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-command-"));
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notifications-agent-"));
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-command-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-agent-"));
 		tempDirs.push(cwd, agentDir);
 		const sessionId = "session-command";
 		const settings = new Proxy(
@@ -660,7 +907,7 @@ describe("notifications config", () => {
 			expect(fs.existsSync(endpoint)).toBe(true);
 			expect(fs.existsSync(roots)).toBe(false);
 
-			settings.override("notifications.enabled", true);
+			settings.set("notifications.enabled", true);
 			await notify.handler("on", context);
 			expect(fs.existsSync(endpoint)).toBe(true);
 			expect(fs.existsSync(roots)).toBe(true);

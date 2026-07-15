@@ -148,9 +148,9 @@ function invoke(
 		case "ask.answer":
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
-			return surface.answerGate(text(input, "id"), input.response);
+			return surface.answerGate(text(input, "id"), input.response, input.expectedSessionId as string | undefined);
 		case "workflow.plan_approve":
-			return surface.approvePlan(text(input, "id"), input.choice);
+			return surface.approvePlan(text(input, "id"), input.choice, input.expectedSessionId as string | undefined);
 		case "skill.invoke":
 			return surface.invokeSkill(text(input, "name"), input.args);
 		case "mode.plan.set":

@@ -9,6 +9,7 @@ import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
+import { loadMCPJsonFile } from "../discovery/mcp-json";
 import { readDisabledServers } from "./config-writer";
 import type { MCPServerConfig } from "./types";
 
@@ -20,8 +21,10 @@ export interface LoadMCPConfigsOptions {
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
-	/** Only include servers eligible for startup connection, i.e. autoload !== false (default: false) */
+	/** Only include startup-eligible servers; exact-config sessions always enforce autoload !== false. */
 	autoloadOnly?: boolean;
+	/** Load only this explicit MCP config file. */
+	configPath?: string;
 }
 
 /** Result of loading MCP configs */
@@ -32,6 +35,8 @@ export interface LoadMCPConfigsResult {
 	exaApiKeys: string[];
 	/** Source metadata for each server */
 	sources: Record<string, SourceMeta>;
+	/** Whether the explicit configuration was unavailable or contained invalid entries. */
+	configurationWarning: boolean;
 }
 
 /**
@@ -97,21 +102,28 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
  * @param options Load options
  */
 export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOptions): Promise<LoadMCPConfigsResult> {
+	const exactConfig = options?.configPath !== undefined;
 	const enableProjectConfig = options?.enableProjectConfig ?? true;
-	const filterExa = options?.filterExa ?? true;
-	const filterBrowser = options?.filterBrowser ?? false;
-	const autoloadOnly = options?.autoloadOnly ?? false;
+	const filterExa = exactConfig ? false : (options?.filterExa ?? true);
+	const filterBrowser = exactConfig ? false : (options?.filterBrowser ?? false);
+	const autoloadOnly = exactConfig || (options?.autoloadOnly ?? false);
 
-	// Load MCP servers via capability system
-	const result = await loadCapability<MCPServer>(mcpCapability.id, { cwd });
+	let servers: MCPServer[];
+	let disabledServers: Set<string>;
+	let configurationWarning = false;
+	if (exactConfig) {
+		const result = await loadMCPJsonFile(options.configPath!, "project", { quiet: true });
+		servers = result.items;
+		disabledServers = new Set(result.disabledServers);
+		configurationWarning = (result.warnings?.length ?? 0) > 0;
+	} else {
+		// Load MCP servers via capability system
+		const result = await loadCapability<MCPServer>(mcpCapability.id, { cwd });
+		// Filter out project-level configs if disabled
+		servers = enableProjectConfig ? result.items : result.items.filter(server => server._source.level !== "project");
+		disabledServers = new Set(await readDisabledServers(getMCPConfigPath("user", cwd)));
+	}
 
-	// Filter out project-level configs if disabled
-	const servers = enableProjectConfig
-		? result.items
-		: result.items.filter(server => server._source.level !== "project");
-
-	// Load user-level disabled servers list
-	const disabledServers = new Set(await readDisabledServers(getMCPConfigPath("user", cwd)));
 	// Convert to legacy format and preserve source metadata
 	let configs: Record<string, MCPServerConfig> = {};
 	let sources: Record<string, SourceMeta> = {};
@@ -142,7 +154,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		sources = browserResult.sources;
 	}
 
-	return { configs, exaApiKeys, sources };
+	return { configs, exaApiKeys, sources, configurationWarning };
 }
 
 /** Pattern to match Exa MCP servers */

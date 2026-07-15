@@ -61,7 +61,7 @@ export interface ApplyModelProfileActivationOptions {
 export interface PreparedModelProfileActivation {
 	profileName: string;
 	session: ModelProfileActivationSession & { setModelTemporary: AgentSession["setModelTemporary"] };
-	settings: Pick<Settings, "clearOverride" | "get" | "getGlobal" | "override" | "set" | "flush">;
+	settings: Pick<Settings, "clearOverride" | "get" | "getGlobal" | "override" | "set" | "unset" | "flush">;
 	previousModel: Model<Api> | undefined;
 	previousThinkingLevel: ThinkingLevel | undefined;
 	previousAgentModelOverrides: Record<string, ModelSelectorValue>;
@@ -92,7 +92,7 @@ export interface MaterializeModelProfileAssignmentOptions {
 		ModelProfileActivationSession,
 		"model" | "thinkingLevel" | "getConfiguredModelChain" | "setActiveModelProfile" | "getActiveModelProfile"
 	>;
-	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set">;
+	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set" | "unset">;
 	role: GjcModelAssignmentTargetId;
 	selector: string;
 }
@@ -102,7 +102,7 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		ModelProfileActivationSession,
 		"model" | "thinkingLevel" | "getConfiguredModelChain" | "setActiveModelProfile" | "getActiveModelProfile"
 	>;
-	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set">;
+	settings: Pick<Settings, "clearOverride" | "get" | "override" | "set" | "unset">;
 	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string> | Partial<Record<GjcModelAssignmentTargetId, string>>;
 }
 
@@ -177,7 +177,7 @@ export function materializeActiveModelProfileAssignment(options: MaterializeMode
 
 	options.settings.set("modelRoles", nextModelRoles);
 	options.settings.set("task.agentModelOverrides", nextAgentModelOverrides);
-	options.settings.set("modelProfile.default", undefined);
+	options.settings.unset("modelProfile.default");
 	options.settings.clearOverride("modelProfile.default");
 	options.settings.override("modelRoles", nextModelRoles);
 	options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
@@ -212,12 +212,24 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 
 	options.settings.set("modelRoles", nextModelRoles);
 	options.settings.set("task.agentModelOverrides", nextAgentModelOverrides);
-	options.settings.set("modelProfile.default", undefined);
+	options.settings.unset("modelProfile.default");
 	options.settings.clearOverride("modelProfile.default");
 	options.settings.override("modelRoles", nextModelRoles);
 	options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
 	options.session.setActiveModelProfile?.(undefined);
 	return true;
+}
+
+export class ModelProfileCredentialError extends Error {
+	readonly profileLabel: string;
+	readonly providers: readonly string[];
+
+	constructor(profileLabel: string, providers: readonly string[]) {
+		super(formatModelProfileCredentialError(profileLabel, providers));
+		this.name = "ModelProfileCredentialError";
+		this.profileLabel = profileLabel;
+		this.providers = [...providers];
+	}
 }
 
 export function formatModelProfileCredentialError(profileLabel: string, providers: readonly string[]): string {
@@ -363,12 +375,12 @@ export async function prepareModelProfileActivation(
 	// providers are resolution-time candidates and intentionally do not gate here.
 	const strictMissing = missingProviders.filter(provider => !alternativeSet.has(provider));
 	if (strictMissing.length > 0) {
-		throw new Error(formatModelProfileCredentialError(profileLabel, strictMissing));
+		throw new ModelProfileCredentialError(profileLabel, strictMissing);
 	}
 	for (const group of alternativeGroups) {
 		const groupAuthenticated = group.some(provider => authenticatedProviders.includes(provider));
 		if (!groupAuthenticated) {
-			throw new Error(formatModelProfileCredentialError(profileLabel, [...group]));
+			throw new ModelProfileCredentialError(profileLabel, [...group]);
 		}
 	}
 
@@ -592,7 +604,7 @@ export interface MaterializeModelProfileForDeletionResult {
 
 export async function materializeModelProfileForDeletion(
 	options: PrepareModelProfileActivationOptions & {
-		settings: Pick<Settings, "clearOverride" | "flush" | "get" | "getGlobal" | "override" | "set">;
+		settings: Pick<Settings, "clearOverride" | "flush" | "get" | "getGlobal" | "override" | "set" | "unset">;
 	},
 ): Promise<MaterializeModelProfileForDeletionResult> {
 	const prepared = await prepareModelProfileActivation(options);
@@ -615,7 +627,7 @@ export async function materializeModelProfileForDeletion(
 	try {
 		prepared.settings.set("modelRoles", nextModelRoles);
 		prepared.settings.set("task.agentModelOverrides", nextAgentModelOverrides);
-		prepared.settings.set("modelProfile.default", undefined);
+		prepared.settings.unset("modelProfile.default");
 		prepared.settings.clearOverride("modelProfile.default");
 		prepared.settings.override("modelRoles", nextModelRoles);
 		prepared.settings.override("task.agentModelOverrides", nextAgentModelOverrides);

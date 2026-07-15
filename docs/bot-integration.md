@@ -280,13 +280,26 @@ Artifact paths are canonicalized, symlink escapes are rejected, and output is by
 
 Use the SDK when your bot owns a single live session rather than an MCP coordinator. Each running session exposes a loopback WebSocket endpoint discovered via `.gjc/state/sdk/<sessionId>.json`; the wire protocol (state queries, control operations, event subscription and replay, workflow-gate replies, reverse host-tool leases) is documented in [`docs/sdk.md`](./sdk.md).
 
-Key SDK lifecycle facts:
+Key SDK workflow-gate facts:
+- The discovery file carries the endpoint URL and per-session token; a wrong
+  token is rejected at the WebSocket handshake. `server_hello` marks a
+  connection ready, and `gjc daemon session control|query|global` uses the same
+  protocol for shell scripts.
 
-- The discovery file carries the endpoint URL and per-session token; a wrong token is rejected at the WebSocket handshake.
-- `server_hello` marks the connection ready; queries and controls are correlated JSON frames.
-- Workflow gates surface as `action_needed` frames and are answered with `reply` frames.
-- Host-owned tools and URI schemes are registered through the directed reverse-RPC provider lease (`register_provider`); registration is acquisition.
-- `gjc daemon session control|query|global` wraps the same protocol for shell scripts, printing one JSON result per invocation.
+- `action_needed.id` is an opaque, transient presentation ID. It is the only
+  generic `reply.id` authority. Do not equate it with a durable workflow gate.
+- A durable workflow-gate presentation optionally includes additive SDK v3 `workflowGateId`. It correlates to Q12's durable `gate_id` only within `(sessionId, workflowGateId)` on the current authenticated endpoint; it never authorizes generic reply.
+- `workflow.gate_answer` and `workflow.plan_approve` use the durable `gate_id`. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 clients continue to work, but new clients must send it. Mandatory enforcement or removal may occur no earlier than SDK v4 and only after at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before resolution.
+- One session has one active answerable presentation. Additional Q12 gates stay queued while Q12 exposes durable pending records and additive SDK v3 diagnostics. A same-server reconnect replays the active action ID; a process restart quarantines old records and a rebuilt workflow remints fresh gate and presentation IDs.
+- A native generic reply claim wins a direct-control race once acquired; a direct control wins only by atomically retiring the exact unclaimed active presentation. Terminal, stale, and reissued action IDs never regain authority. Do not use text, option/order, durable-ID, or history heuristics, and fail closed rather than guess when identity is unsafe or ambiguous. Do not persist private route/claim/receipt/epoch/generation state.
+- Rust/N-API compatibility is additive: legacy `ActionNeeded`, `register_ask`,
+  and `registerAsk` stay uncorrelated; explicit workflow reader/registration
+  APIs preserve correlation without exposing private arbitration state.
+- The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions (currently `0.10.2`); the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+
+The prior documented invariant `action_needed.id == gate_id` is incorrect for
+v3 and must not be implemented by controllers. See [`docs/sdk.md`](./sdk.md)
+for exact wire examples, Q12 tags/lifecycle diagnostics, and control payloads.
 
 `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed along with their JSONL/HTTPS protocols and the former Python RPC client. There are no compatibility shims; migrate controllers to the SDK endpoint or Coordinator MCP.
 

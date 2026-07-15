@@ -14,6 +14,13 @@ declare module "@gajae-code/natives" {
 		connectionId: string;
 		json: string;
 	}
+	interface PresentationLease {
+		actionId: string;
+		registrationEpoch: number;
+	}
+	interface RetireIfUnclaimedResult {
+		status: "retired" | "already_terminal" | "claimed" | "stale";
+	}
 	interface NotificationServer {
 		/** Register the raw v3 SDK frame callback. Must be called before start. */
 		onSdkFrame(callback: (err: null | Error, frame: SdkFrameEvent) => void): void;
@@ -21,5 +28,11 @@ declare module "@gajae-code/natives" {
 		onConnectionClose(callback: (err: null | Error, connectionId: string) => void): void;
 		/** Directed send of a JSON text frame to one connection. */
 		sendTo(connectionId: string, json: string): void;
+		/** Register a correlated workflow-gate action_needed frame. */
+		registerWorkflowGateAsk(workflowJson: string, repliable: boolean): void;
+		/** Atomically register the single active arbitrated action and return its private lease. */
+		registerArbitratedAsk(actionJson: string, repliable: boolean): PresentationLease;
+		/** Retire an exact private lease unless a generic reply has already claimed it. */
+		retireIfUnclaimed(lease: PresentationLease): RetireIfUnclaimedResult;
 	}
 }

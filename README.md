@@ -32,9 +32,23 @@
   <img src="assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
 </p>
 
-**Mobile answers for coding agents** — Gajae-Code now ships a configure-once [Gajae-Code SDK](docs/sdk.md) and managed Telegram reference daemon. Each session exposes a loopback WebSocket discovery file and a generic `action_needed`/`reply` protocol so Telegram, Discord, Slack, mobile apps, or local tools can surface pending asks and route answers back without terminal scraping.
+**Mobile answers for coding agents** — Gajae-Code ships a configure-once
+[Gajae-Code SDK](docs/sdk.md) and managed Telegram reference daemon. In a running
+GJC session, open `/settings` → **Notifications** to configure or reconfigure
+Telegram, manage health/test/recovery/reconnect, toggle global or current-session
+delivery, and remove Telegram without disturbing Discord or Slack. Telegram tokens
+are masked on entry and never displayed afterward.
 
-The bundled Telegram flow adds a threaded per-session surface with context updates, live/finalized output, image attachments, inline buttons, free-text replies, typing indicators, and double-check acknowledgements. `gjc daemon` keeps one safe long-poll owner per bot token so new sessions attach cleanly instead of tripping Telegram 409 conflicts.
+For headless setup and automation, `gjc notify setup|status|health|test|recovery`
+remains authoritative. Each session exposes a loopback WebSocket discovery file
+and a generic `action_needed`/`reply` protocol so Telegram, Discord, Slack, mobile
+apps, or local tools can surface pending asks and route answers back without
+terminal scraping. The bundled Telegram flow adds a Threaded Mode per-session
+surface with context updates, live/finalized output, image attachments, inline
+buttons, free-text replies, typing indicators, and double-check acknowledgements.
+`gjc daemon` keeps one safe long-poll owner per bot token so new sessions attach
+cleanly instead of tripping Telegram 409 conflicts; a foreign owner is never taken
+over.
 
 ## Research and desktop-control highlights
 

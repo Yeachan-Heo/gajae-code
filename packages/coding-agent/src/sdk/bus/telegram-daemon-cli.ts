@@ -1,11 +1,23 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { YAML } from "bun";
-import { withFileLock } from "../../config/file-lock";
+import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patch";
 import type { Settings } from "../../config/settings";
-import { getNotificationConfig, isTelegramConfigured } from "./config";
+import {
+	getNotificationConfig,
+	isTelegramConfigured,
+	type NotificationSettingsReader,
+	type NotificationSettingsSnapshot,
+	readTelegramActivationMarkers,
+} from "./config";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
-import type { DaemonState, TelegramDaemonOptions } from "./telegram-daemon";
+import {
+	type DaemonState,
+	readDaemonState,
+	type TelegramDaemonOptions,
+	TelegramNotificationDaemon,
+} from "./telegram-daemon";
+import { clearTelegramControlRequest, readTelegramControlRequest } from "./telegram-daemon-control";
 
 type TelegramDaemonRunner = {
 	run(): Promise<void>;
@@ -14,23 +26,26 @@ type TelegramDaemonRunner = {
 
 type TelegramDaemonConstructor = new (opts: TelegramDaemonOptions) => TelegramDaemonRunner;
 
+export type LightweightDaemonSettings = Pick<Settings, "get" | "getAgentDir" | "set" | "flush"> &
+	NotificationSettingsReader;
+
 export interface RunDaemonInternalDeps {
 	SettingsImpl?: {
-		init: (options?: { agentDir?: string }) => Promise<Pick<Settings, "get" | "getAgentDir" | "set" | "flush">>;
+		init: (options?: { agentDir?: string }) => Promise<LightweightDaemonSettings>;
 	};
 	DaemonImpl?: TelegramDaemonConstructor;
 	processPid?: number;
 	pidAlive?: (pid: number) => boolean;
 	/** Clock used by the ownership-progress watchdog; defaults to `Date.now`. */
 	now?: () => number;
-	/** Timer pair backing the ownership-progress watchdog; defaults to the globals. */
+	/** Timer pair backing the ownership-progress watchdog; defaults to globals. */
 	setInterval?: (callback: () => void, ms: number) => Timer;
 	clearInterval?: (timer: Timer) => void;
 	/** Reads persisted daemon ownership state; defaults to the real reader. */
 	readDaemonState?: (settings: Settings) => Promise<DaemonState | undefined>;
 }
 
-/** Ownership-watchdog cadence: re-check daemon state this often while running. */
+/** Ownership-watchdog cadence while the daemon process is running. */
 const OWNER_WATCHDOG_INTERVAL_MS = 5_000;
 const OWNER_STALL_MS = 3 * HEARTBEAT_TTL_MS;
 
@@ -48,17 +63,6 @@ function getByPath(obj: unknown, pathSegments: string[]): unknown {
 	return current;
 }
 
-function setByPath(obj: Record<string, unknown>, pathSegments: string[], value: unknown): void {
-	let current = obj;
-	for (let i = 0; i < pathSegments.length - 1; i++) {
-		const segment = pathSegments[i]!;
-		const next = current[segment];
-		if (!next || typeof next !== "object" || Array.isArray(next)) current[segment] = {};
-		current = current[segment] as Record<string, unknown>;
-	}
-	current[pathSegments[pathSegments.length - 1]!] = value;
-}
-
 function asString(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -74,70 +78,101 @@ function asIdleTimeoutMs(value: unknown): number {
 export function createLightweightDaemonSettings(input: {
 	agentDir: string;
 	rawConfig?: unknown;
-}): Pick<Settings, "get" | "getAgentDir" | "set" | "flush"> {
+}): LightweightDaemonSettings {
 	const rawConfig = input.rawConfig && typeof input.rawConfig === "object" ? input.rawConfig : {};
+	const activation = readTelegramActivationMarkers(getByPath(rawConfig, ["notifications", "telegram", "activation"]));
+	const getNotificationSettingsSnapshot = (): NotificationSettingsSnapshot => ({
+		enabled: asBoolean(getByPath(rawConfig, ["notifications", "enabled"]), false),
+		telegram: {
+			botToken: asString(getByPath(rawConfig, ["notifications", "telegram", "botToken"])),
+			chatId: asString(getByPath(rawConfig, ["notifications", "telegram", "chatId"])),
+			...(Object.keys(activation).length === 0 ? {} : { activation }),
+			rich: {
+				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "rich", "enabled"]), true),
+			},
+			richDraft: {
+				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "richDraft", "enabled"]), false),
+			},
+			topics: {
+				nameTemplate: asString(getByPath(rawConfig, ["notifications", "telegram", "topics", "nameTemplate"])),
+			},
+		},
+		discord: {
+			botToken: asString(getByPath(rawConfig, ["notifications", "discord", "botToken"])),
+			applicationId: asString(getByPath(rawConfig, ["notifications", "discord", "applicationId"])),
+			guildId: asString(getByPath(rawConfig, ["notifications", "discord", "guildId"])),
+			parentChannelId: asString(getByPath(rawConfig, ["notifications", "discord", "parentChannelId"])),
+		},
+		slack: {
+			botToken: asString(getByPath(rawConfig, ["notifications", "slack", "botToken"])),
+			appToken: asString(getByPath(rawConfig, ["notifications", "slack", "appToken"])),
+			workspaceId: asString(getByPath(rawConfig, ["notifications", "slack", "workspaceId"])),
+			channelId: asString(getByPath(rawConfig, ["notifications", "slack", "channelId"])),
+			authorizedUserId: asString(getByPath(rawConfig, ["notifications", "slack", "authorizedUserId"])),
+		},
+		redact: asBoolean(getByPath(rawConfig, ["notifications", "redact"]), false),
+		verbosity: getByPath(rawConfig, ["notifications", "verbosity"]) === "verbose" ? "verbose" : "lean",
+		sessionScope: getByPath(rawConfig, ["notifications", "sessionScope"]) === "primary" ? "primary" : "all",
+		idleTimeoutMs: asIdleTimeoutMs(getByPath(rawConfig, ["notifications", "daemon", "idleTimeoutMs"])),
+	});
+
 	return {
 		get(pathName: string): unknown {
-			const value = getByPath(rawConfig, pathName.split("."));
+			const snapshot = getNotificationSettingsSnapshot();
 			switch (pathName) {
 				case "notifications.enabled":
-					return asBoolean(value, false);
+					return snapshot.enabled;
 				case "notifications.telegram.botToken":
+					return snapshot.telegram.botToken;
 				case "notifications.telegram.chatId":
+					return snapshot.telegram.chatId;
 				case "notifications.discord.botToken":
+					return snapshot.discord.botToken;
 				case "notifications.discord.applicationId":
+					return snapshot.discord.applicationId;
 				case "notifications.discord.guildId":
+					return snapshot.discord.guildId;
 				case "notifications.discord.parentChannelId":
+					return snapshot.discord.parentChannelId;
 				case "notifications.slack.botToken":
+					return snapshot.slack.botToken;
 				case "notifications.slack.appToken":
+					return snapshot.slack.appToken;
 				case "notifications.slack.workspaceId":
+					return snapshot.slack.workspaceId;
 				case "notifications.slack.channelId":
+					return snapshot.slack.channelId;
 				case "notifications.slack.authorizedUserId":
+					return snapshot.slack.authorizedUserId;
 				case "notifications.telegram.topics.nameTemplate":
-					return asString(value);
+					return snapshot.telegram.topics.nameTemplate;
 				case "notifications.telegram.rich.enabled":
-					return asBoolean(value, true);
+					return snapshot.telegram.rich.enabled;
 				case "notifications.telegram.richDraft.enabled":
-					return asBoolean(value, false);
+					return snapshot.telegram.richDraft.enabled;
 				case "notifications.redact":
-					return asBoolean(value, false);
+					return snapshot.redact;
 				case "notifications.verbosity":
-					return value === "verbose" ? "verbose" : "lean";
+					return snapshot.verbosity;
+				case "notifications.sessionScope":
+					return snapshot.sessionScope;
 				case "notifications.daemon.idleTimeoutMs":
-					return asIdleTimeoutMs(value);
+					return snapshot.idleTimeoutMs;
 				default:
 					return undefined;
 			}
 		},
+		getNotificationSettingsSnapshot,
 		getAgentDir(): string {
 			return input.agentDir;
 		},
 		async set(pathName: string, value: unknown): Promise<void> {
-			// Back onto config.yml directly (the full Settings class is not loaded in
-			// the spawned daemon process). Contend on the SAME per-file lock as
-			// Settings.#saveNow and re-read UNDER the lock, patching only this key, so
-			// a concurrent main-process save can never drop unrelated settings (no
-			// whole-file last-writer-wins). The write is atomic (tmp + rename) so a
-			// crash mid-write can never truncate config.yml, and any failure propagates
-			// so the `/rich` handler leaves runtime state unchanged. The in-memory view
-			// is updated only after the durable write succeeds.
-			const segments = pathName.split(".");
+			// The daemon process never loads full Settings, but writes through the exact
+			// same in-process queue, cross-process lock, and atomic replacement helper.
+			// Its local snapshot changes only after the durable rename succeeds.
 			const configPath = path.join(input.agentDir, "config.yml");
-			await withFileLock(configPath, async () => {
-				let onDisk: Record<string, unknown> = {};
-				try {
-					const parsed = YAML.parse(await fs.promises.readFile(configPath, "utf8"));
-					if (parsed && typeof parsed === "object") onDisk = parsed as Record<string, unknown>;
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				}
-				setByPath(onDisk, segments, value);
-				await fs.promises.mkdir(path.dirname(configPath), { recursive: true });
-				const tmpPath = `${configPath}.tmp.${process.pid}.${Date.now()}`;
-				await fs.promises.writeFile(tmpPath, YAML.stringify(onDisk), { mode: 0o600 });
-				await fs.promises.rename(tmpPath, configPath);
-			});
-			setByPath(rawConfig as Record<string, unknown>, segments, value);
+			await applyAtomicYamlPatches(configPath, [{ path: pathName, op: "set", value }]);
+			setByPath(rawConfig as Record<string, unknown>, pathName.split("."), value);
 		},
 		async flush(): Promise<void> {
 			// The set() above is synchronously durable (it awaits the atomic tmp+rename
@@ -145,12 +180,10 @@ export function createLightweightDaemonSettings(input: {
 			// flush. Present so the daemon can await flush() uniformly regardless of
 			// which Settings implementation is injected.
 		},
-	} as Pick<Settings, "get" | "getAgentDir" | "set" | "flush">;
+	} as LightweightDaemonSettings;
 }
 
-export async function loadLightweightDaemonSettings(
-	agentDir: string,
-): Promise<Pick<Settings, "get" | "getAgentDir" | "set" | "flush">> {
+export async function loadLightweightDaemonSettings(agentDir: string): Promise<LightweightDaemonSettings> {
 	const configPath = path.join(agentDir, "config.yml");
 	let rawConfig: unknown = {};
 	try {
@@ -164,7 +197,7 @@ export async function loadLightweightDaemonSettings(
 async function resolveDaemonSettings(
 	agentDir: string,
 	deps: RunDaemonInternalDeps,
-): Promise<Pick<Settings, "get" | "getAgentDir" | "set" | "flush">> {
+): Promise<LightweightDaemonSettings> {
 	if (deps.SettingsImpl) return await deps.SettingsImpl.init({ agentDir });
 	return await loadLightweightDaemonSettings(agentDir);
 }
@@ -215,13 +248,10 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	}
 	const resolvedAgentDir = agentDir ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
-	const cfg = getNotificationConfig(settings as Settings);
+	const cfg = getNotificationConfig(settings);
 	if (!isTelegramConfigured(cfg)) return;
-	const { clearTelegramControlRequest, readTelegramControlRequest } = await import("./telegram-daemon-control");
-	const telegramDaemonModule =
-		!deps.DaemonImpl || !deps.readDaemonState ? await import("./telegram-daemon") : undefined;
-	const Daemon: TelegramDaemonConstructor = deps.DaemonImpl ?? telegramDaemonModule!.TelegramNotificationDaemon;
-	const readState = deps.readDaemonState ?? telegramDaemonModule!.readDaemonState;
+	const Daemon: TelegramDaemonConstructor = deps.DaemonImpl ?? TelegramNotificationDaemon;
+	const readState = deps.readDaemonState ?? readDaemonState;
 	const daemon = new Daemon({
 		settings: settings as Settings,
 		ownerId,
@@ -247,8 +277,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 			},
 		},
 	});
-	// Signals and the ownership watchdog are process concerns: keep them at the
-	// daemon-internal boundary rather than in the shared embeddable daemon.
+	// Signals are a process concern: install them at the daemon-internal boundary,
+	// not inside the embeddable daemon class. SIGTERM is the reload wakeup path.
 	const onSignal = (): void => daemon.requestStop("signal");
 	const now = deps.now ?? Date.now;
 	const schedule = deps.setInterval ?? setInterval;
@@ -280,8 +310,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 				daemon.requestStop("stop");
 			}
 		} catch {
-			// Missing, malformed, or temporarily unreadable state is ambiguous. Only
-			// positive supersession or observed heartbeat non-progress can stop.
+			// Missing, malformed, or temporarily unreadable state is ambiguous.
+			// Stop only on positive supersession or observed non-progress.
 		} finally {
 			watchdogTickInFlight = false;
 		}

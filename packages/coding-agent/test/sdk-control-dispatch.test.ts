@@ -114,6 +114,36 @@ test("dispatches every control registry operation to its ControlSurface method",
 	expect(calls).toEqual(rows.map(row => methodByOperation[row.sdkId]));
 });
 
+test("forwards expectedSessionId only to durable workflow controls", async () => {
+	const calls: unknown[][] = [];
+	const surface = {
+		answerGate: (...args: unknown[]) => {
+			calls.push(args);
+			return { resolved: true };
+		},
+		approvePlan: (...args: unknown[]) => {
+			calls.push(args);
+			return { resolved: true };
+		},
+	} as unknown as ControlSurface;
+	for (const operation of ["workflow.gate_answer", "workflow.plan_approve"]) {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		const response = await dispatchControl(surface, row, {
+			...request(row),
+			input: {
+				id: "gate",
+				...(operation === "workflow.gate_answer" ? { response: "approve" } : { choice: "approve" }),
+				expectedSessionId: "session",
+			},
+		});
+		expect(response.ok).toBe(true);
+	}
+	expect(calls).toEqual([
+		["gate", "approve", "session"],
+		["gate", "approve", "session"],
+	]);
+});
+
 test("forwards an optional thinking level with model.set without changing legacy calls", async () => {
 	const model = OPERATIONS.find(row => row.sdkId === "model.set")!;
 	const calls: unknown[][] = [];
@@ -285,6 +315,42 @@ test("preserves typed registry errors and maps unknown failures to internal", as
 		request(tools),
 	);
 	expect(internal.error).toEqual({ code: "internal", message: "Control operation failed." });
+});
+
+test("preserves action_claimed workflow fences through control dispatch", async () => {
+	const gate = OPERATIONS.find(row => row.sdkId === "workflow.gate_answer")!;
+	const response = await dispatchControl(
+		{
+			answerGate: () => {
+				throw { code: "action_claimed", message: "The active action is already being answered." };
+			},
+		} as unknown as ControlSurface,
+		gate,
+		{ ...request(gate), input: { id: "gate", response: "approve", expectedSessionId: "session" } },
+	);
+	expect(response.error).toEqual({ code: "action_claimed", message: "The active action is already being answered." });
+});
+
+test("preserves terminal uncertainty through C07 and C08 control dispatch", async () => {
+	for (const [operation, method, input] of [
+		["workflow.gate_answer", "answerGate", { id: "gate", response: "approve", expectedSessionId: "session" }],
+		["workflow.plan_approve", "approvePlan", { id: "plan", choice: "approve", expectedSessionId: "session" }],
+	] as const) {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		const response = await dispatchControl(
+			{
+				[method]: () => {
+					throw { code: "terminal_uncertain", message: "Durable workflow resolution is uncertain." };
+				},
+			} as unknown as ControlSurface,
+			row,
+			{ ...request(row), input },
+		);
+		expect(response.error).toEqual({
+			code: "terminal_uncertain",
+			message: "Durable workflow resolution is uncertain.",
+		});
+	}
 });
 
 test("bounds default model selection recovery details on the SDK error", async () => {

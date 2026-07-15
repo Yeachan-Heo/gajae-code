@@ -12,6 +12,7 @@ use std::{
 
 use crate::protocol::{
 	ActionKind, ActionNeeded, ActionResolved, RejectReason, Reply, ReplyAnswer, ResolvedBy,
+	WorkflowGateActionNeeded, WorkflowGateWireDiscriminator,
 };
 
 /// Outcome of feeding an inbound [`Reply`] to the registry.
@@ -37,6 +38,29 @@ pub enum ReplyClassification {
 	/// Reject immediately with this reason (no host involvement).
 	Reject(RejectReason),
 }
+
+/// Registration failed because generic replies cannot distinguish action
+/// epochs or correlated wire presentations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionRegistrationError {
+	/// This action id has already been registered during this server's lifetime.
+	ActionIdAlreadyRegistered,
+	/// The action id is bound to a distinct correlated wire presentation.
+	CorrelatedPresentationCollision,
+}
+
+impl std::fmt::Display for ActionRegistrationError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::ActionIdAlreadyRegistered => formatter.write_str("action id is already registered"),
+			Self::CorrelatedPresentationCollision => {
+				formatter.write_str("action id is bound to a distinct correlated wire presentation")
+			},
+		}
+	}
+}
+
+impl std::error::Error for ActionRegistrationError {}
 
 /// A pending action that may still be resolved.
 #[derive(Debug, Clone)]
@@ -87,27 +111,68 @@ pub struct ActionIdentity {
 	pub epoch: u64,
 }
 
+/// Typed terminal proof for an exact in-process presentation lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetireIfUnclaimed {
+	Retired(ActionResolved),
+	AlreadyTerminal,
+	Claimed,
+	Stale,
+}
+
 /// Record of a resolved action, retained for idempotency and late-reply
 /// rejection.
 #[derive(Debug, Clone)]
 struct ResolvedRecord {
-	answer:          Option<ReplyAnswer>,
-	idempotency_key: Option<String>,
+	answer:             Option<ReplyAnswer>,
+	idempotency_key:    Option<String>,
+	registration_epoch: u64,
 }
 
 /// Tracks action lifecycle for a single session.
 #[derive(Debug, Default)]
 pub struct ActionRegistry {
-	pending:      HashMap<String, PendingAction>,
-	resolved:     HashMap<String, ResolvedRecord>,
-	receipts:     HashMap<String, String>,
-	origins:      HashMap<String, ReplyOrigin>,
+	pending: HashMap<String, PendingAction>,
+	resolved: HashMap<String, ResolvedRecord>,
+	receipts: HashMap<String, String>,
+	origins: HashMap<String, ReplyOrigin>,
 	next_receipt: AtomicU64,
 	/// The single currently-pending `ask`, replayed to clients that connect
 	/// late. Idle pings are intentionally ephemeral and never buffered.
 	buffered_ask: Option<ActionNeeded>,
 	/// Monotonic registration epoch for the canonical buffered ask.
-	epoch:        u64,
+	epoch: u64,
+	/// Private durable correlation for the canonical presentation.
+	workflow_gate_id: Option<String>,
+	/// Complete private identity for the canonical correlated presentation.
+	workflow_gate_registration: Option<WorkflowGateRegistrationIdentity>,
+}
+
+/// Correlated authority includes both the outer wire discriminator and the
+/// action kind, so identifiers cannot cross-bind distinct wire presentations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkflowGateRegistrationIdentity {
+	wire_discriminator: WorkflowGateWireDiscriminator,
+	action_kind:        ActionKind,
+	action_id:          String,
+	session_id:         String,
+	workflow_gate_id:   String,
+}
+
+impl WorkflowGateRegistrationIdentity {
+	fn new(
+		wire_discriminator: WorkflowGateWireDiscriminator,
+		needed: &ActionNeeded,
+		workflow_gate_id: &str,
+	) -> Self {
+		Self {
+			wire_discriminator,
+			action_kind: needed.kind,
+			action_id: needed.id.clone(),
+			session_id: needed.session_id.clone(),
+			workflow_gate_id: workflow_gate_id.to_owned(),
+		}
+	}
 }
 
 impl ActionRegistry {
@@ -118,26 +183,106 @@ impl ActionRegistry {
 	}
 
 	/// Register an `ask` action. It becomes the canonical buffered ask used by
-	/// tailored connection delivery. Every registration receives a fresh epoch.
+	/// tailored connection delivery. Duplicate action ids are rejected without
+	/// mutation; use [`Self::try_register_ask`] to observe the typed failure.
 	///
 	/// `repliable` is `false` when the session has no SDK workflow-gate
 	/// resolver, so the ask is broadcast as notify-only and any reply is
 	/// rejected with [`RejectReason::ResolverUnavailable`].
 	pub fn register_ask(&mut self, needed: ActionNeeded, repliable: bool) {
+		let _ = self.try_register_ask(needed, repliable);
+	}
+
+	/// Register an `ask`, returning an error rather than reusing an action id.
+	pub fn try_register_ask(
+		&mut self,
+		needed: ActionNeeded,
+		repliable: bool,
+	) -> Result<(), ActionRegistrationError> {
+		self.register(needed, None, repliable)
+	}
+
+	/// Register an ask whose wire presentation carries durable workflow-gate
+	/// correlation. Generic reply authority remains the action id.
+	pub fn register_workflow_gate_ask(
+		&mut self,
+		needed: ActionNeeded,
+		workflow_gate_id: String,
+		repliable: bool,
+	) {
+		let _ = self.try_register_workflow_gate_ask(needed, workflow_gate_id, repliable);
+	}
+
+	/// Register a correlated workflow-gate ask, rejecting reused action ids.
+	pub fn try_register_workflow_gate_ask(
+		&mut self,
+		needed: ActionNeeded,
+		workflow_gate_id: String,
+		repliable: bool,
+	) -> Result<(), ActionRegistrationError> {
+		self.try_register_workflow_gate_ask_with_discriminator(
+			needed,
+			workflow_gate_id,
+			WorkflowGateWireDiscriminator::ActionNeeded,
+			repliable,
+		)
+	}
+
+	pub(crate) fn try_register_workflow_gate_ask_with_discriminator(
+		&mut self,
+		needed: ActionNeeded,
+		workflow_gate_id: String,
+		wire_discriminator: WorkflowGateWireDiscriminator,
+		repliable: bool,
+	) -> Result<(), ActionRegistrationError> {
+		let identity =
+			WorkflowGateRegistrationIdentity::new(wire_discriminator, &needed, &workflow_gate_id);
+		if let Some(current) = &self.workflow_gate_registration {
+			if current == &identity {
+				if self.buffered_ask.as_ref() == Some(&needed)
+					&& self
+						.pending
+						.get(&needed.id)
+						.is_some_and(|pending| pending.repliable == repliable)
+				{
+					return Ok(());
+				}
+			} else if current.action_id == needed.id {
+				return Err(ActionRegistrationError::CorrelatedPresentationCollision);
+			}
+		}
+		self.register(needed, Some((workflow_gate_id, identity)), repliable)
+	}
+
+	fn register(
+		&mut self,
+		needed: ActionNeeded,
+		workflow_gate: Option<(String, WorkflowGateRegistrationIdentity)>,
+		repliable: bool,
+	) -> Result<(), ActionRegistrationError> {
 		debug_assert_eq!(needed.kind, ActionKind::Ask);
+		// Generic wire replies carry only the action id, not an epoch. Reusing an
+		// id while it is pending or terminal would let a delayed reply authorize a
+		// different action, so every registered id is a server-lifetime tombstone.
+		if self.pending.contains_key(&needed.id) || self.resolved.contains_key(&needed.id) {
+			return Err(ActionRegistrationError::ActionIdAlreadyRegistered);
+		}
+		if let Some(previous_id) = self.buffered_ask.as_ref().map(|ask| ask.id.clone()) {
+			self.retire_pending(&previous_id);
+		}
 		self.epoch = self
 			.epoch
 			.checked_add(1)
 			.expect("action registry epoch exhausted");
-		if let Some(previous_id) = self.buffered_ask.as_ref().map(|ask| ask.id.clone()) {
-			self.retire_pending(&previous_id);
-		}
-		self.retire_pending(&needed.id);
-		self.resolved.remove(&needed.id);
 		self.buffered_ask = Some(needed.clone());
+		let (workflow_gate_id, workflow_gate_registration) =
+			workflow_gate.map_or((None, None), |(id, identity)| (Some(id), Some(identity)));
+		self.workflow_gate_id = workflow_gate_id;
+		self.workflow_gate_registration = workflow_gate_registration;
 		self
 			.pending
 			.insert(needed.id, PendingAction { repliable, claim: None });
+		Ok(())
 	}
 
 	fn retire_pending(&mut self, id: &str) {
@@ -148,6 +293,13 @@ impl ActionRegistry {
 			self.receipts.remove(&claim.receipt_id);
 			self.origins.remove(&claim.receipt_id);
 		}
+		// Supersession does not emit an action_resolved frame, but the old id must
+		// remain terminal so its delayed generic replies cannot authorize a reissue.
+		self.resolved.insert(id.to_owned(), ResolvedRecord {
+			answer:             None,
+			idempotency_key:    None,
+			registration_epoch: self.epoch,
+		});
 	}
 
 	/// Record an idle ping. Ephemeral: not stored, not buffered, never
@@ -176,6 +328,53 @@ impl ActionRegistry {
 			let identity = ActionIdentity { id: ask.id.clone(), epoch: self.epoch };
 			(ask, identity)
 		})
+	}
+
+	/// Clone the canonical ask, private correlation metadata, and registration
+	/// identity for connection-specific wire presentation.
+	#[must_use]
+	pub(crate) fn current_wire_snapshot(
+		&self,
+	) -> Option<(ActionNeeded, Option<String>, ActionIdentity)> {
+		self.buffered_ask.clone().map(|action| {
+			let identity = ActionIdentity { id: action.id.clone(), epoch: self.epoch };
+			(action, self.workflow_gate_id.clone(), identity)
+		})
+	}
+
+	/// Clone the current correlated workflow presentation, if one is active.
+	#[must_use]
+	pub fn current_workflow_gate_ask(&self) -> Option<(WorkflowGateActionNeeded, ActionIdentity)> {
+		let action = self.buffered_ask.clone()?;
+		let workflow_gate_id = self.workflow_gate_id.clone()?;
+		let identity = ActionIdentity { id: action.id.clone(), epoch: self.epoch };
+		Some((WorkflowGateActionNeeded { action, workflow_gate_id }, identity))
+	}
+
+	/// Atomically terminalize an exact unclaimed presentation. Claims win once
+	/// acquired, and a stale lease never mutates registry state.
+	pub fn retire_if_unclaimed(&mut self, expected: &ActionIdentity) -> RetireIfUnclaimed {
+		let Some(current) = self.current_identity() else {
+			return if self
+				.resolved
+				.get(&expected.id)
+				.is_some_and(|resolved| resolved.registration_epoch == expected.epoch)
+			{
+				RetireIfUnclaimed::AlreadyTerminal
+			} else {
+				RetireIfUnclaimed::Stale
+			};
+		};
+		if &current != expected {
+			return RetireIfUnclaimed::Stale;
+		}
+		if self.has_claim_for_action(&expected.id) {
+			return RetireIfUnclaimed::Claimed;
+		}
+		match self.resolve_internal(&expected.id, ResolvedBy::Local, None, None) {
+			Ok(resolved) => RetireIfUnclaimed::Retired(resolved),
+			Err(_) => RetireIfUnclaimed::Stale,
+		}
 	}
 
 	fn controlled_identity_for(&self, id: &str) -> Option<ActionIdentity> {
@@ -503,10 +702,14 @@ impl ActionRegistry {
 		}
 		if self.buffered_ask.as_ref().is_some_and(|a| a.id == id) {
 			self.buffered_ask = None;
+			self.workflow_gate_id = None;
+			self.workflow_gate_registration = None;
 		}
-		self
-			.resolved
-			.insert(id.to_owned(), ResolvedRecord { answer: answer.clone(), idempotency_key });
+		self.resolved.insert(id.to_owned(), ResolvedRecord {
+			answer: answer.clone(),
+			idempotency_key,
+			registration_epoch: self.epoch,
+		});
 		Ok(ActionResolved { id: id.to_owned(), resolved_by, answer })
 	}
 }
@@ -712,27 +915,41 @@ mod tests {
 	}
 
 	#[test]
-	fn same_id_reregistration_clears_terminal_record_for_apply_and_claim() {
+	fn resolved_same_id_reregistration_preserves_terminal_tombstone() {
+		let mut reg = ActionRegistry::new();
+		reg.register_ask(ask("a1"), true);
+		let terminal = reg.resolve_local("a1", None).expect("local resolution");
+
+		assert_eq!(
+			reg.try_register_ask(ask("a1"), true),
+			Err(ActionRegistrationError::ActionIdAlreadyRegistered)
+		);
+
+		assert!(!reg.is_pending("a1"));
+		assert!(reg.current_ask_snapshot().is_none());
+		assert!(reg.resolved.contains_key(&terminal.id));
+	}
+
+	#[test]
+	fn stale_delayed_reply_cannot_authorize_rejected_same_id_reregistration() {
 		let mut reg = ActionRegistry::new();
 		reg.register_ask(ask("a1"), true);
 		assert!(reg.resolve_local("a1", None).is_some());
-		reg.register_ask(ask("a1"), true);
-
-		assert!(matches!(
-			reg.apply_reply(&reply("a1", ReplyAnswer::Index(0)), true, true),
-			ReplyOutcome::Resolved(ActionResolved { resolved_by: ResolvedBy::Client, .. })
-		));
-
-		reg.register_ask(ask("a1"), true);
-		let claim = match reg.claim_reply(&reply("a1", ReplyAnswer::Index(1)), "c1", "g1", true, true)
-		{
-			ClaimOutcome::Forward(claim) => claim,
-			other => panic!("expected forwarded claim after reregistration, got {other:?}"),
-		};
-		assert!(
-			reg.resolve_claim(&claim.reply_receipt_id, Some(ReplyAnswer::Index(1)), None)
-				.is_some()
+		assert_eq!(
+			reg.try_register_ask(ask("a1"), true),
+			Err(ActionRegistrationError::ActionIdAlreadyRegistered)
 		);
+
+		let delayed = reply("a1", ReplyAnswer::Index(0));
+		assert_eq!(
+			reg.apply_reply(&delayed, true, true),
+			ReplyOutcome::Rejected(RejectReason::AlreadyAnswered)
+		);
+		assert_eq!(
+			reg.claim_reply(&delayed, "c1", "g1", true, true),
+			ClaimOutcome::Reject(RejectReason::AlreadyAnswered)
+		);
+		assert!(!reg.is_pending("a1"));
 	}
 
 	#[test]
@@ -746,11 +963,11 @@ mod tests {
 
 		assert_eq!(
 			reg.apply_reply_if_delivered(Some(&delivered), &incoming, true, true),
-			ReplyOutcome::Rejected(RejectReason::UnknownAction),
+			ReplyOutcome::Rejected(RejectReason::AlreadyAnswered),
 		);
 		assert_eq!(
 			reg.claim_reply_if_delivered(Some(&delivered), &incoming, "c1", "g1", true, true),
-			ClaimOutcome::Reject(RejectReason::UnknownAction),
+			ClaimOutcome::Reject(RejectReason::AlreadyAnswered),
 		);
 		assert!(!reg.is_pending("a1"));
 		assert!(!reg.has_claim_for_action("a1"));
@@ -758,6 +975,10 @@ mod tests {
 		assert!(reg.origins.is_empty());
 		assert_eq!(reg.current_identity(), Some(current));
 		assert!(reg.is_pending("a2"));
+		assert_eq!(
+			reg.try_register_ask(ask("a1"), true),
+			Err(ActionRegistrationError::ActionIdAlreadyRegistered)
+		);
 		assert!(matches!(
 			reg.apply_reply(&reply("a2", ReplyAnswer::Index(1)), true, true),
 			ReplyOutcome::Resolved(ActionResolved { resolved_by: ResolvedBy::Client, .. })
@@ -787,37 +1008,35 @@ mod tests {
 	}
 
 	#[test]
-	fn registration_epochs_change_on_replacement_and_reregistration() {
+	fn pending_same_id_registration_is_rejected_without_mutating_original_action() {
 		let mut reg = ActionRegistry::new();
 		reg.register_ask(ask("a1"), true);
-		let first = reg.current_identity().expect("first identity");
-		reg.register_ask(ask("a1"), true);
-		let replacement = reg.current_identity().expect("replacement identity");
-		assert_eq!(first.id, replacement.id);
-		assert!(replacement.epoch > first.epoch);
+		let original = reg.current_identity().expect("original identity");
 
-		assert!(reg.resolve_local("a1", None).is_some());
-		assert!(reg.current_identity().is_none(), "resolution clears the buffered ask");
-		reg.register_ask(ask("a1"), true);
-		assert!(reg.current_identity().expect("reregistered identity").epoch > replacement.epoch);
+		assert_eq!(
+			reg.try_register_ask(ask("a1"), true),
+			Err(ActionRegistrationError::ActionIdAlreadyRegistered)
+		);
+		assert_eq!(reg.current_identity(), Some(original));
+		assert!(reg.is_pending("a1"));
 	}
 
 	#[test]
-	fn stale_identity_does_not_confirm_controlled_reply_or_mutate() {
+	fn delayed_reply_after_rejected_pending_reregistration_resolves_only_original_action() {
 		let mut reg = ActionRegistry::new();
 		reg.register_ask(controlled_ask("a1"), true);
-		let stale = reg.current_identity().expect("initial identity");
-		reg.register_ask(controlled_ask("a1"), true);
-		let current = reg.current_identity().expect("replacement identity");
-		assert_ne!(stale, current);
+		let original = reg.current_identity().expect("original identity");
+		assert_eq!(
+			reg.try_register_ask(controlled_ask("a1"), true),
+			Err(ActionRegistrationError::ActionIdAlreadyRegistered)
+		);
 
 		let incoming = reply("a1", ReplyAnswer::Index(0));
-		assert_eq!(
-			reg.apply_reply_if_delivered(Some(&stale), &incoming, true, true),
-			ReplyOutcome::Rejected(RejectReason::InvalidAnswer),
-		);
-		assert!(reg.is_pending("a1"));
-		assert_eq!(reg.current_identity(), Some(current));
+		assert!(matches!(
+			reg.apply_reply_if_delivered(Some(&original), &incoming, true, true),
+			ReplyOutcome::Resolved(ActionResolved { resolved_by: ResolvedBy::Client, .. })
+		));
+		assert!(!reg.is_pending("a1"));
 	}
 
 	#[test]
@@ -848,5 +1067,106 @@ mod tests {
 				.len(),
 			1
 		);
+	}
+
+	#[test]
+	fn retire_if_unclaimed_is_exact_and_claim_wins() {
+		let mut reg = ActionRegistry::new();
+		reg.register_workflow_gate_ask(ask("a1"), "gate-1".into(), true);
+		let identity = reg.current_identity().expect("identity");
+		let (workflow, _) = reg.current_workflow_gate_ask().expect("workflow metadata");
+		assert_eq!(workflow.workflow_gate_id, "gate-1");
+
+		let stale = ActionIdentity { id: "a1".into(), epoch: identity.epoch - 1 };
+		assert_eq!(reg.retire_if_unclaimed(&stale), RetireIfUnclaimed::Stale);
+		assert!(reg.is_pending("a1"));
+
+		let claim = reg.claim_reply(&reply("a1", ReplyAnswer::Index(0)), "c1", "g1", true, true);
+		assert!(matches!(claim, ClaimOutcome::Forward(_)));
+		assert_eq!(reg.retire_if_unclaimed(&identity), RetireIfUnclaimed::Claimed);
+		assert!(reg.has_claim_for_action("a1"));
+		assert_eq!(reg.current_identity(), Some(identity));
+	}
+
+	#[test]
+	fn retire_if_unclaimed_terminalizes_once_without_receipt() {
+		let mut reg = ActionRegistry::new();
+		reg.register_ask(ask("a1"), true);
+		let identity = reg.current_identity().expect("identity");
+		assert!(matches!(reg.retire_if_unclaimed(&identity), RetireIfUnclaimed::Retired(_)));
+		assert_eq!(reg.retire_if_unclaimed(&identity), RetireIfUnclaimed::AlreadyTerminal);
+		assert!(reg.current_identity().is_none());
+	}
+
+	#[test]
+	fn correlated_wire_kind_identity_rejects_cross_wire_collision_and_settles_once() {
+		let mut reg = ActionRegistry::new();
+		let first = ask("presentation-1");
+		reg.try_register_workflow_gate_ask_with_discriminator(
+			first.clone(),
+			"gate-1".into(),
+			WorkflowGateWireDiscriminator::ActionNeeded,
+			true,
+		)
+		.unwrap();
+		let identity = reg.current_identity().expect("first identity");
+
+		assert_eq!(
+			reg.try_register_workflow_gate_ask_with_discriminator(
+				first.clone(),
+				"gate-1".into(),
+				WorkflowGateWireDiscriminator::ActionUnavailable,
+				true,
+			),
+			Err(ActionRegistrationError::CorrelatedPresentationCollision)
+		);
+		assert_eq!(
+			reg.try_register_workflow_gate_ask_with_discriminator(
+				idle("presentation-1"),
+				"gate-1".into(),
+				WorkflowGateWireDiscriminator::ActionNeeded,
+				true,
+			),
+			Err(ActionRegistrationError::CorrelatedPresentationCollision)
+		);
+		assert_eq!(reg.current_identity(), Some(identity.clone()));
+		assert_eq!(
+			reg.current_workflow_gate_ask()
+				.expect("first workflow")
+				.0
+				.action,
+			first
+		);
+
+		// Retrying the exact presentation is idempotent and does not issue a new lease.
+		assert!(
+			reg.try_register_workflow_gate_ask_with_discriminator(
+				ask("presentation-1"),
+				"gate-1".into(),
+				WorkflowGateWireDiscriminator::ActionNeeded,
+				true,
+			)
+			.is_ok()
+		);
+		assert_eq!(reg.current_identity(), Some(identity.clone()));
+
+		assert!(matches!(
+			reg.apply_reply_if_delivered(
+				Some(&identity),
+				&reply("presentation-1", ReplyAnswer::Index(0)),
+				true,
+				true,
+			),
+			ReplyOutcome::Resolved(_)
+		));
+		assert!(matches!(
+			reg.apply_reply_if_delivered(
+				Some(&identity),
+				&reply("presentation-1", ReplyAnswer::Index(0)),
+				true,
+				true,
+			),
+			ReplyOutcome::Rejected(RejectReason::AlreadyAnswered)
+		));
 	}
 }

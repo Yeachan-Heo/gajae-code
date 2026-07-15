@@ -57,4 +57,6 @@ pub use reverse::{
 	ReverseCapability, ReverseClientFrame, ReverseError, ReverseRequest, ReverseResponse,
 	ReverseServerFrame,
 };
-pub use server::{PushFrameError, ServerConfig, ServerHandle, start};
+pub use server::{
+	PushFrameError, ServerConfig, ServerHandle, WorkflowGateRegistrationError, start,
+};

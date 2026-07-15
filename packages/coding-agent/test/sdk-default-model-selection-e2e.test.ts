@@ -222,4 +222,4 @@ test("model.set executes every Q10-advertised selection and persists the public 
 	} finally {
 		await freshSession.dispose();
 	}
-});
+}, 30000);

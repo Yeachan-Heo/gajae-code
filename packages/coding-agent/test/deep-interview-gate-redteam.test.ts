@@ -6,8 +6,22 @@ import {
 	gateAnswerToResult,
 	questionToGate,
 } from "../src/modes/shared/agent-wire/deep-interview-gate";
-import { MemoryGateStore, WorkflowGateBroker } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import {
+	type GateContinuation,
+	MemoryGateStore,
+	WorkflowGateBroker,
+} from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
+
+function activeContinuation(): GateContinuation {
+	const activeGateIds = new Set<string>();
+	return {
+		activate: gate => activeGateIds.add(gate.gate_id),
+		terminalProof: "not_published",
+		isLive: gateId => activeGateIds.has(gateId),
+		release: gateId => activeGateIds.delete(gateId),
+	};
+}
 
 const singleQ: AskGateQuestion = {
 	id: "single-auth",
@@ -30,16 +44,22 @@ const freeTextQ: AskGateQuestion = {
 };
 
 async function resolveQuestion(question: AskGateQuestion, answer: unknown) {
-	const broker = new WorkflowGateBroker(`run-${question.id}`, new MemoryGateStore());
-	const gate = broker.openGate(questionToGate(question));
+	const advanced: unknown[] = [];
+	const broker = new WorkflowGateBroker(`run-${question.id}`, new MemoryGateStore(), {
+		advance: (_gate, acceptedAnswer) => {
+			advanced.push(acceptedAnswer);
+		},
+	});
+	const gate = broker.openGate(questionToGate(question), activeContinuation());
 	const resolution = await broker.resolve({ gate_id: gate.gate_id, answer });
-	return { gate, resolution };
+	return { advanced, gate, resolution };
 }
 
 describe("deep-interview question gates red-team", () => {
 	it("round-trips single, multi, and Other free-text answers through the broker to the human-path QuestionResult", async () => {
 		const single = await resolveQuestion(singleQ, { selected: ["JWT"] });
 		expect(single.resolution.status).toBe("accepted");
+		expect(single.advanced).toEqual([{ selected: ["JWT"] }]);
 		expect(gateAnswerToResult(singleQ, { selected: ["JWT"] })).toEqual({
 			id: "single-auth",
 			question: "Which auth method should we use?",
@@ -51,6 +71,7 @@ describe("deep-interview question gates red-team", () => {
 
 		const multi = await resolveQuestion(multiQ, { selected: ["SQLite", "S3"] });
 		expect(multi.resolution.status).toBe("accepted");
+		expect(multi.advanced).toEqual([{ selected: ["SQLite", "S3"] }]);
 		expect(gateAnswerToResult(multiQ, { selected: ["SQLite", "S3"] })).toEqual({
 			id: "multi-storage",
 			question: "Which storage backends should be supported?",
@@ -63,6 +84,7 @@ describe("deep-interview question gates red-team", () => {
 		const otherAnswer = { selected: [], other: true, custom: "Bare metal" };
 		const other = await resolveQuestion(freeTextQ, otherAnswer);
 		expect(other.resolution.status).toBe("accepted");
+		expect(other.advanced).toEqual([otherAnswer]);
 		expect(gateAnswerToResult(freeTextQ, otherAnswer)).toEqual({
 			id: "free-text",
 			question: "Which deployment target did we miss?",
@@ -75,6 +97,7 @@ describe("deep-interview question gates red-team", () => {
 		const multiOtherAnswer = { selected: ["SQLite"], other: true, custom: "S3-compatible" };
 		const multiOther = await resolveQuestion(multiQ, multiOtherAnswer);
 		expect(multiOther.resolution.status).toBe("accepted");
+		expect(multiOther.advanced).toEqual([multiOtherAnswer]);
 		expect(gateAnswerToResult(multiQ, multiOtherAnswer)).toEqual({
 			id: "multi-storage",
 			question: "Which storage backends should be supported?",
@@ -86,6 +109,7 @@ describe("deep-interview question gates red-team", () => {
 		const clarificationAnswer = { action: "clarify", question: "What is the difference between JWT and OAuth2?" };
 		const clarification = await resolveQuestion(singleQ, clarificationAnswer);
 		expect(clarification.resolution.status).toBe("accepted");
+		expect(clarification.advanced).toEqual([clarificationAnswer]);
 		expect(gateAnswerToResult(singleQ, clarificationAnswer)).toEqual({
 			id: "single-auth",
 			question: "Which auth method should we use?",
@@ -125,8 +149,9 @@ describe("deep-interview question gates red-team", () => {
 		];
 
 		for (const c of cases) {
-			const { gate, resolution } = await resolveQuestion(singleQ, c.answer);
+			const { advanced, gate, resolution } = await resolveQuestion(singleQ, c.answer);
 			expect(resolution.status, c.name).toBe("rejected");
+			expect(advanced, c.name).toEqual([]);
 			expect(resolution.error?.code, c.name).toBe("invalid_workflow_gate_answer");
 			expect(resolution.error?.schema_hash, c.name).toBe(gate.schema_hash);
 			expect(
@@ -194,10 +219,16 @@ describe("deep-interview question gates red-team", () => {
 		expect(gate.schema.properties?.selected?.items?.enum).toEqual([]);
 
 		const answer = { selected: [], other: true, custom: "No cloud dependencies" };
-		const broker = new WorkflowGateBroker("run-zero-options", new MemoryGateStore());
-		const emitted = broker.openGate(questionToGate(zeroQ));
+		const advanced: unknown[] = [];
+		const broker = new WorkflowGateBroker("run-zero-options", new MemoryGateStore(), {
+			advance: (_gate, acceptedAnswer) => {
+				advanced.push(acceptedAnswer);
+			},
+		});
+		const emitted = broker.openGate(questionToGate(zeroQ), activeContinuation());
 		const resolution = await broker.resolve({ gate_id: emitted.gate_id, answer });
 		expect(resolution.status).toBe("accepted");
+		expect(advanced).toEqual([answer]);
 		expect(gateAnswerToResult(zeroQ, answer)).toEqual({
 			id: "zero-options",
 			question: "What constraint is missing?",
@@ -223,20 +254,32 @@ describe("deep-interview question gates red-team", () => {
 			first !== undefined
 				? { selected: [first], other: false }
 				: { selected: [], other: true, custom: "memory-derived answer" };
-		const broker = new WorkflowGateBroker("run-zero-options-generic", new MemoryGateStore());
-		const emitted = broker.openGate(gate);
+		const advanced: unknown[] = [];
+		const broker = new WorkflowGateBroker("run-zero-options-generic", new MemoryGateStore(), {
+			advance: (_gate, acceptedAnswer) => {
+				advanced.push(acceptedAnswer);
+			},
+		});
+		const emitted = broker.openGate(gate, activeContinuation());
 		const resolution = await broker.resolve({ gate_id: emitted.gate_id, answer: genericAnswer });
 		expect(resolution.status).toBe("accepted");
+		expect(advanced).toEqual([genericAnswer]);
 		expect(gateAnswerToResult(zeroQ, genericAnswer).customInput).toBe("memory-derived answer");
 	});
 
 	it("advertises the same schema_hash the broker uses for validation", async () => {
-		const broker = new WorkflowGateBroker("run-schema-agreement", new MemoryGateStore());
-		const gate = broker.openGate(questionToGate(singleQ));
+		const advanced: unknown[] = [];
+		const broker = new WorkflowGateBroker("run-schema-agreement", new MemoryGateStore(), {
+			advance: (_gate, acceptedAnswer) => {
+				advanced.push(acceptedAnswer);
+			},
+		});
+		const gate = broker.openGate(questionToGate(singleQ), activeContinuation());
 		expect(gate.schema_hash).toBe(schemaHash(gate.schema));
 
 		const rejected = await broker.resolve({ gate_id: gate.gate_id, answer: { selected: ["Password"] } });
 		expect(rejected.status).toBe("rejected");
+		expect(advanced).toEqual([]);
 		expect(rejected.error?.schema_hash).toBe(gate.schema_hash);
 	});
 });

@@ -191,6 +191,9 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 
 function controlErrors(id: string): string[] {
 	const errors: Record<string, string[]> = {
+		C06: ["action_claimed"],
+		C07: ["action_claimed", "terminal_uncertain"],
+		C08: ["action_claimed", "terminal_uncertain"],
 		C13: ["invalid_request", "busy", "default_model_selection_recovery"],
 		C36: ["revision_conflict", "secret_input_forbidden"],
 		C38: ["authentication_failed", "provider_required"],

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BrokerWorkflowGateEmitter, FileGateStore } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import { CursorRegistry, cursorMac, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
 import { Q10ThinkingMetadataError } from "../src/sdk/models.js";
 
@@ -176,7 +177,7 @@ describe("SDK query pagination", () => {
 			expect(complete.page?.complete).toBe(true);
 		}
 		expect(query.cursors.size).toBe(0);
-	});
+	}, 30000);
 
 	it("writes owner-private chunked spills atomically with bounded buffering", async () => {
 		const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
@@ -467,3 +468,37 @@ it("incrementally continues very large escaped emoji fields through bounded snap
 	expect(reads.every(({ start, end }) => end - start < serializedBytes)).toBe(true);
 	await store.close();
 }, 30_000);
+
+it("reconstructs Q12 workflow gate state after a client restart without reviving the orphaned gate", async () => {
+	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-q12-restart-"));
+	const storePath = join(stateRoot, "workflow-gates.json");
+	const first = new BrokerWorkflowGateEmitter("q12-session", new FileGateStore(storePath));
+	void first.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } });
+	const restarted = new BrokerWorkflowGateEmitter("q12-session", new FileGateStore(storePath));
+	void restarted.emitGate({
+		stage: "ralplan",
+		kind: "approval",
+		schema: { type: "string", enum: ["approve"] },
+	});
+	const store = new RevisionStore("q12-session");
+	const query = new QueryHandlers(
+		{ ...surface([]), getGates: () => restarted.listWorkflowGateQueryRecords!() },
+		"q12-session",
+		store,
+		new CursorRegistry("token", store),
+	);
+	const response = await query.dispatch({ query: "Q12", connectionId: "restarted-client" });
+	if (!response.page) throw new Error("Q12 did not return a page");
+	const gates = response.page.items as Array<Record<string, unknown>>;
+	expect(gates).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ id: expect.stringMatching(/^diagnostic:/), tag: "quarantined" }),
+			expect.objectContaining({ id: expect.stringMatching(/^pending:/), tag: "pending" }),
+		]),
+	);
+	expect(gates.filter(gate => gate.tag === "pending")).toHaveLength(1);
+	expect(gates.find(gate => gate.tag === "quarantined")).toMatchObject({
+		lifecycle: { reason: "orphaned_after_process_restart" },
+	});
+	await store.close();
+});

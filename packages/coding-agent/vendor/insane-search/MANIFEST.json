@@ -20,7 +20,8 @@
   ],
   "exclusionRationale": "Excludes upstream install hooks (SessionStart settings.json mutation), GitHub star-baiting (gh api user/starred), the update-notifier, and the past-session transcript-language scanner. Only the runtime Phase 0-3 engine and its Playwright/stealth templates are vendored.",
   "localPatches": [
-    "engine/content_safety.py + FetchResult trust/risk metadata (content_trust, prompt_injection_risk, prompt_injection_signals, untrusted_content_boundary) and to_untrusted_text(): cherry-picked from insane-search a16f7c1 (upstream PR #5, v0.9.0). Adds prompt-injection labelling to the JSON surface (to_dict); the default CLI text output is intentionally left unchanged (plain content preserved, no envelope)."
+    "engine/content_safety.py + FetchResult trust/risk metadata (content_trust, prompt_injection_risk, prompt_injection_signals, untrusted_content_boundary) and to_untrusted_text(): cherry-picked from insane-search a16f7c1 (upstream PR #5, v0.9.0). Adds prompt-injection labelling to the JSON surface (to_dict); the default CLI text output is intentionally left unchanged (plain content preserved, no envelope).",
+    "engine/phase0.py _ytdlp_argv() console-script→module fallback + engine/bias_check.py rel.as_posix() Windows exemption + engine/tests/test_u9.py: cherry-picked from insane-search 33f898d (upstream PR #6, released v0.9.2). Cross-platform yt-dlp resolution; no capability or site logic added."
   ],
   "notes": "Runtime engine is invoked via `python3 -m engine \"<url>\" --json` with cwd=this directory and PYTHONPATH pointed at this directory. Phase 0-2 require python3 + curl_cffi; Phase 3 requires node + playwright/playwright-extra/puppeteer-extra-plugin-stealth installed under engine/templates. GJC never auto-installs these dependencies."
 }

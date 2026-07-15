@@ -285,13 +285,9 @@ describe("AgentSession durable default model selection", () => {
 			getApiKey: () => "test-key",
 			initialState: { model: INITIAL_MODEL, systemPrompt: ["Test"], tools: [] },
 			streamFn: () => {
-				const stream = new AssistantMessageEventStream();
-				activeStream = stream;
-				queueMicrotask(() => {
-					stream.push({ type: "start", partial: createAssistantMessage("") });
-					streamCreated.resolve();
-				});
-				return stream;
+				activeStream = new AssistantMessageEventStream();
+				streamCreated.resolve();
+				return activeStream;
 			},
 		});
 		sessionManager = SessionManager.inMemory(tempRoot);
@@ -322,30 +318,48 @@ describe("AgentSession durable default model selection", () => {
 	it("waits for an in-flight response before any durable or session mutation", async () => {
 		// Given
 		const model = targetModel({ minLevel: Effort.Medium, maxLevel: Effort.High });
-		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("target-key");
+		const preflightComplete = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
+			const apiKey = await originalGetApiKey(...args);
+			if (args[0] === model) preflightComplete.resolve();
+			return apiKey;
+		});
+		settings.set("compaction.enabled", false);
 		const prompt = session.prompt("in flight");
 		await streamCreated.promise;
 		const entriesBeforeSelection = sessionManager.getEntries();
+		const idleBarrierEntered = Promise.withResolvers<"idle">();
+		const originalWaitForIdle = session.waitForIdle.bind(session);
+		vi.spyOn(session, "waitForIdle").mockImplementation(async () => {
+			idleBarrierEntered.resolve("idle");
+			await originalWaitForIdle();
+		});
+		const durableAttempted = Promise.withResolvers<"durable">();
 		const originalDurableCommit = settings.setGlobalModelRoleAndFlush.bind(settings);
 		const durableCommit = vi.spyOn(settings, "setGlobalModelRoleAndFlush").mockImplementation(async (...args) => {
+			durableAttempted.resolve("durable");
 			return originalDurableCommit(...args);
 		});
 
 		// When
 		const selection = session.setDefaultModelSelection(model, Effort.XHigh);
-		await Promise.resolve();
-		await Promise.resolve();
-		const durableCallsWhileStreaming = durableCommit.mock.calls.length;
-		const modelWhileStreaming = session.model;
+		await preflightComplete.promise;
+		const firstMutationBoundary = await Promise.race([idleBarrierEntered.promise, durableAttempted.promise]);
+		const durableCallsBeforeIdle = durableCommit.mock.calls.length;
+		const modelBeforeIdle = session.model;
 		const entriesWhileStreaming = sessionManager.getEntries();
 
 		// Then
-		await session.abort();
-		await prompt.catch(() => {});
+		const message = createAssistantMessage("complete");
+		activeStream?.push({ type: "done", reason: "stop", message });
+		activeStream?.end(message);
 		activeStream = undefined;
+		await prompt;
 		const result = await selection;
-		expect(durableCallsWhileStreaming).toBe(0);
-		expect(modelWhileStreaming).toBe(INITIAL_MODEL);
+		expect(firstMutationBoundary).toBe("idle");
+		expect(durableCallsBeforeIdle).toBe(0);
+		expect(modelBeforeIdle).toBe(INITIAL_MODEL);
 		expect(entriesWhileStreaming).toEqual(entriesBeforeSelection);
 		expect(result).toEqual({
 			provider: "target-provider",

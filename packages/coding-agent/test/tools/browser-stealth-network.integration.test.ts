@@ -4,26 +4,36 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { applyStealthPatches, launchHeadlessBrowser } from "../../src/tools/browser/launch";
+import {
+	acquireBrowser,
+	type BrowserHandle,
+	browserKeyForTest,
+	releaseBrowser,
+} from "../../src/tools/browser/registry";
 
 // These integration tests launch a real (cached) Chromium and no-op skip when
 // none is resolvable, so they never fail Chromium-less CI environments.
 function chromiumAvailable(): boolean {
 	if (process.env.PUPPETEER_EXECUTABLE_PATH) return true;
 	const cache = path.join(os.homedir(), ".gjc", "puppeteer", "chrome");
+	let available = false;
 	try {
-		return fs.existsSync(cache) && fs.readdirSync(cache).length > 0;
-	} catch {
-		return false;
+		available = fs.existsSync(cache) && fs.readdirSync(cache).length > 0;
+	} catch {}
+	if (!available && process.env.GJC_REQUIRE_CHROMIUM === "1") {
+		throw new Error("GJC_REQUIRE_CHROMIUM=1 requires a resolvable Chromium executable");
 	}
+	return available;
 }
 
 async function withStealthPage<T>(
 	fn: (page: import("puppeteer-core").Page, browser: Browser) => Promise<T>,
+	geo?: { timezone?: string; locale?: string },
 ): Promise<T> {
-	const browser = await launchHeadlessBrowser({ headless: true });
+	const browser = await launchHeadlessBrowser({ headless: true, ...(geo ? { geo } : {}) });
 	try {
 		const page = await browser.newPage();
-		await applyStealthPatches(browser, page, { browserSession: null as CDPSession | null, override: null });
+		await applyStealthPatches(browser, page, { browserSession: null as CDPSession | null, override: null }, geo);
 		return await fn(page, browser);
 	} finally {
 		await browser.close();
@@ -127,31 +137,135 @@ describe("stealth network posture (integration)", () => {
 		expect(result.apiWorks).toBe(true);
 	}, 120_000);
 
-	it("B2: geo unset is a no-op; geo set overrides the timezone", async () => {
+	it("B2: configured geo keeps request headers, navigator, and Intl coherent", async () => {
 		if (!chromiumAvailable()) {
 			expect(true).toBe(true);
 			return;
 		}
-		// Default (no geo): the browser's natural timezone with NO override applied.
-		const defaultTz = await withStealthPage(async page => {
-			await page.goto("about:blank");
-			return page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone);
+		const headers: Record<string, string> = {};
+		const server = Bun.serve({
+			port: 0,
+			fetch(req) {
+				headers["accept-language"] = req.headers.get("accept-language") ?? "";
+				return new Response("ok");
+			},
 		});
-		expect(defaultTz).toBeTruthy();
+		try {
+			const probe = await withStealthPage(
+				async page => {
+					await page.goto(`http://127.0.0.1:${server.port}/`, { waitUntil: "load" });
+					return page.evaluate(() => ({
+						language: navigator.language,
+						languages: [...navigator.languages],
+						locale: Intl.DateTimeFormat().resolvedOptions().locale,
+						timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+						explicitUtc: Intl.DateTimeFormat(undefined, { timeZone: "UTC" }).resolvedOptions().timeZone,
+					}));
+				},
+				{ timezone: "Asia/Tokyo", locale: "fr-FR" },
+			);
 
-		// geo set: timezone reflects the override (via TZ env at launch) and differs
-		// from the untouched default, proving the override actually took effect.
-		const target = defaultTz === "America/New_York" ? "Asia/Tokyo" : "America/New_York";
-		const browser = await launchHeadlessBrowser({ headless: true, geo: { timezone: target } });
+			expect(headers["accept-language"]).toMatch(/^fr-FR,fr(?:;q=0\.9)?$/i);
+			expect(probe.language).toBe("fr-FR");
+			expect(probe.languages).toEqual(["fr-FR", "fr"]);
+			expect(probe.locale).toBe("fr-FR");
+			expect(probe.timezone).toBe("Asia/Tokyo");
+			expect(probe.explicitUtc).toBe("UTC");
+		} finally {
+			server.stop(true);
+		}
+	}, 120_000);
+
+	it("B3: unset geo retains the existing default stealth profile", async () => {
+		if (!chromiumAvailable()) {
+			expect(true).toBe(true);
+			return;
+		}
+		const browser = await launchHeadlessBrowser({ headless: true });
 		try {
 			const page = await browser.newPage();
-			await applyStealthPatches(browser, page, { browserSession: null as CDPSession | null, override: null });
+			const readLocale = () =>
+				page.evaluate(() => ({
+					language: navigator.language,
+					languages: [...navigator.languages],
+					locale: Intl.DateTimeFormat().resolvedOptions().locale,
+					timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+				}));
+			const before = await readLocale();
+			await applyStealthPatches(browser, page, { browserSession: null, override: null });
 			await page.goto("about:blank");
-			const overriddenTz = await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone);
-			expect(overriddenTz).toBe(target);
-			expect(overriddenTz).not.toBe(defaultTz);
+			expect(await readLocale()).toEqual(before);
 		} finally {
 			await browser.close();
+		}
+	}, 120_000);
+
+	it("B4: timezone-only geo does not apply the hard-coded locale/timezone script", async () => {
+		if (!chromiumAvailable()) {
+			expect(true).toBe(true);
+			return;
+		}
+		const probe = await withStealthPage(
+			async page => {
+				await page.goto("about:blank");
+				return page.evaluate(() => ({
+					timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+					explicitUtc: Intl.DateTimeFormat(undefined, { timeZone: "UTC" }).resolvedOptions().timeZone,
+				}));
+			},
+			{ timezone: "Asia/Tokyo" },
+		);
+		expect(probe.timezone).toBe("Asia/Tokyo");
+		expect(probe.explicitUtc).toBe("UTC");
+	}, 120_000);
+
+	it("B5: managed cache identity includes geo and profile posture but external modes ignore geo", () => {
+		const kind = { kind: "headless", headless: true } as const;
+		const base = browserKeyForTest(kind, { geo: { timezone: "Asia/Tokyo", locale: "fr-FR" } });
+		expect(browserKeyForTest(kind, { geo: { timezone: "Asia/Tokyo", locale: "de-DE" } })).not.toBe(base);
+		expect(
+			browserKeyForTest(kind, {
+				geo: { timezone: "Asia/Tokyo", locale: "fr-FR" },
+				profileReuse: "auto",
+			}),
+		).not.toBe(base);
+		expect(
+			browserKeyForTest({ kind: "connected", cdpUrl: "http://127.0.0.1:9222" }, { geo: { timezone: "invalid" } }),
+		).toBe("connected:http://127.0.0.1:9222");
+	});
+	it("B6: headless browser cache serializes identical geo and separates different geo", async () => {
+		if (!chromiumAvailable()) {
+			expect(true).toBe(true);
+			return;
+		}
+		const handles: BrowserHandle[] = [];
+		try {
+			const [french, frenchConcurrent] = await Promise.all([
+				acquireBrowser(
+					{ kind: "headless", headless: true },
+					{ cwd: process.cwd(), geo: { timezone: "Asia/Tokyo", locale: "fr-FR" } },
+				),
+				acquireBrowser(
+					{ kind: "headless", headless: true },
+					{ cwd: process.cwd(), geo: { timezone: "Asia/Tokyo", locale: "fr-FR" } },
+				),
+			]);
+			handles.push(french);
+			const german = await acquireBrowser(
+				{ kind: "headless", headless: true },
+				{ cwd: process.cwd(), geo: { timezone: "Asia/Tokyo", locale: "de-DE" } },
+			);
+			handles.push(german);
+
+			expect(frenchConcurrent).toBe(french);
+			expect(german).not.toBe(french);
+			expect(german.key).not.toBe(french.key);
+			expect(french.geo).toEqual({ timezone: "Asia/Tokyo", locale: "fr-FR" });
+			expect(german.geo).toEqual({ timezone: "Asia/Tokyo", locale: "de-DE" });
+		} finally {
+			for (const handle of new Set(handles)) {
+				await releaseBrowser(handle, { kill: false });
+			}
 		}
 	}, 120_000);
 });

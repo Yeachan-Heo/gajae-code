@@ -1,11 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
-import { applyStartupModelProfiles } from "../src/main";
+import {
+	applyStartupModelProfiles,
+	applyStartupModelProfilesForRoot,
+	applyStartupModelProfilesOrExit,
+	isStartupModelProfileCredentialRecoveryEligible,
+} from "../src/main";
 import { parseCliCredentialSelector } from "../src/runtime-credential-selector";
 import type { AgentSession } from "../src/session/agent-session";
 
@@ -69,6 +74,7 @@ function fakeSession(initial = model("initial-provider", "initial")) {
 		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
 			session.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
 		},
+		async dispose() {},
 	};
 	return session as unknown as AgentSession & {
 		setModelTemporaryCalls: typeof session.setModelTemporaryCalls;
@@ -126,6 +132,54 @@ describe("CLI credential selector args", () => {
 	});
 });
 
+describe("MCP config CLI args", () => {
+	test("parses absolute config paths in both supported syntaxes", () => {
+		expect(parseArgs(["--mcp-config", "/tmp/gjc-mcp.json"]).mcpConfig).toBe("/tmp/gjc-mcp.json");
+		expect(parseArgs(["--mcp-config=/tmp/gjc-mcp.json"]).mcpConfig).toBe("/tmp/gjc-mcp.json");
+	});
+
+	test("rejects missing or non-absolute config paths", () => {
+		for (const args of [
+			["--mcp-config"],
+			["--mcp-config", "relative/mcp.json"],
+			["--mcp-config="],
+			["--mcp-config=relative/mcp.json"],
+		]) {
+			expect(() => parseArgs(args)).toThrow(CliParseError);
+			expect(() => parseArgs(args)).toThrow("--mcp-config requires <absolute-path>");
+		}
+	});
+	test("rejects repeated config paths in every supported syntax", () => {
+		for (const argv of [
+			["--mcp-config", "/tmp/gjc-mcp.json", "--mcp-config", "/tmp/gjc-mcp.json"],
+			["--mcp-config", "/tmp/gjc-mcp.json", "--mcp-config", "/tmp/other-mcp.json"],
+			["--mcp-config", "/tmp/gjc-mcp.json", "--mcp-config=/tmp/other-mcp.json"],
+			["--mcp-config=/tmp/gjc-mcp.json", "--mcp-config", "/tmp/other-mcp.json"],
+		]) {
+			let thrown: unknown;
+			try {
+				parseArgs(argv);
+			} catch (error) {
+				thrown = error;
+			}
+
+			expect(thrown).toBeInstanceOf(CliParseError);
+			expect(thrown).toHaveProperty("message", "--mcp-config can only be specified once");
+		}
+	});
+
+	test("rejects non-standalone config routes during parsing", () => {
+		const rejectedArgs = [
+			["--mcp-config", "/tmp/gjc-mcp.json", "--mode", "acp"],
+			["--mcp-config", "/tmp/gjc-mcp.json", "--export", "/tmp/session.jsonl"],
+			["--mcp-config", "/tmp/gjc-mcp.json", "--list-models"],
+		];
+		for (const args of rejectedArgs) {
+			expect(() => parseArgs(args)).toThrow(CliParseError);
+		}
+	});
+});
+
 test("explicit CLI --model/--thinking are reapplied after --mpreset activation", async () => {
 	const session = fakeSession(model("cli-provider", "explicit"));
 	const settings = Settings.isolated();
@@ -179,6 +233,34 @@ test("deferred explicit CLI --model is reapplied after --mpreset activation", as
 	).toEqual(["profile-provider/default:high", "cli-provider/explicit:undefined"]);
 	expect(session.setModelTemporaryCalls.at(-1)?.model).toBe(explicitModel);
 	expect(session.model).toBe(explicitModel);
+});
+
+test("startup profile activation failure disposes the session before exit", async () => {
+	const session = fakeSession();
+	let disposed = false;
+	session.dispose = async () => {
+		await Promise.resolve();
+		disposed = true;
+	};
+	const exitSpy = vi.spyOn(process, "exit").mockImplementation((code?: string | number | null | undefined): never => {
+		if (!disposed) throw new Error("process exited before session cleanup");
+		throw new Error(`exit ${code}`);
+	});
+	const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+	try {
+		await expect(
+			applyStartupModelProfilesOrExit({
+				session,
+				settings: Settings.isolated(),
+				modelRegistry: fakeRegistry([]) as never,
+				parsedArgs: { mpreset: "missing-profile" },
+			}),
+		).rejects.toThrow("exit 1");
+		expect(exitSpy).toHaveBeenCalledWith(1);
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
 });
 
 test("explicit CLI --model rebases the resumed session default chain", async () => {
@@ -264,4 +346,284 @@ test("persisted default thinking overrides startup default profile effort", asyn
 	expect(
 		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:xhigh"]);
+});
+
+test("noninteractive startup keeps the exit-on-missing-credential contract", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "codex-medium" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "codex-medium",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { default: "openai-codex/default:high" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async () => undefined,
+	} as never;
+
+	const exit = new Error("exit 1");
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => {
+		throw exit;
+	}) as never);
+	const stderr: string[] = [];
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as never);
+	try {
+		await expect(
+			applyStartupModelProfilesOrExit({
+				session,
+				settings,
+				modelRegistry: registry,
+				parsedArgs: {},
+				startupModel: undefined,
+				startupThinkingLevel: undefined,
+			}),
+		).rejects.toBe(exit);
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(stderr.join("")).toContain('Model profile "codex-medium" requires credentials for: openai-codex');
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
+
+test("credential recovery does not mask unrelated model-profile activation errors", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "missing-profile" });
+	const exit = new Error("exit 1");
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => {
+		throw exit;
+	}) as never);
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as never);
+	try {
+		await expect(
+			applyStartupModelProfilesOrExit({
+				session,
+				settings,
+				modelRegistry: fakeRegistry([]) as never,
+				parsedArgs: {},
+				startupModel: undefined,
+				startupThinkingLevel: undefined,
+			}),
+		).rejects.toBe(exit);
+		expect(exitSpy).toHaveBeenCalledWith(1);
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
+
+describe("startup model-profile credential recovery eligibility", () => {
+	test.each([
+		["ordinary input-free interactive startup", true, true, undefined, [], undefined, true],
+		["redirected stdin or stdout", true, false, undefined, [], undefined, false],
+		["print or text startup", false, true, undefined, [], undefined, false],
+		["explicit startup prompt", true, true, "hello", [], undefined, false],
+		["slash or positional startup message", true, true, undefined, ["/login"], undefined, false],
+		["image-only startup", true, true, "", [], undefined, false],
+		["automatic resume continuation", true, true, undefined, [], "continue-tail", false],
+		["idle resume picker selection", true, true, undefined, [], "open-idle", true],
+	] as const)("%s", (_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction, expected) => {
+		expect(
+			isStartupModelProfileCredentialRecoveryEligible({
+				isInteractive,
+				hasInteractiveTerminal,
+				initialMessage,
+				initialMessages,
+				resumeAction,
+			}),
+		).toBe(expected);
+	});
+});
+
+test("root startup recovers a missing credential only for an input-free interactive route", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "codex-medium" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "codex-medium",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { default: "openai-codex/default:high" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async () => undefined,
+	} as never;
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry,
+		parsedArgs: {},
+		startupModel: undefined,
+		startupThinkingLevel: undefined,
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(result.recoverableErrors).toEqual([
+		expect.stringContaining('Model profile "codex-medium" requires credentials for: openai-codex'),
+	]);
+});
+
+test.each([
+	["redirected terminal", true, false, undefined, [], undefined],
+	["print or text", false, true, undefined, [], undefined],
+	["explicit prompt", true, true, "hello", [], undefined],
+	["positional or slash input", true, true, undefined, ["do work"], undefined],
+	["image-only input", true, true, "", [], undefined],
+	["automatic resume continuation", true, true, undefined, [], "continue-tail"],
+] as const)("root startup keeps %s credential failures fatal", async (_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction) => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "codex-medium" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "codex-medium",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { default: "openai-codex/default:high" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async () => undefined,
+	} as never;
+	const exit = new Error("exit 1");
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => {
+		throw exit;
+	}) as never);
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as never);
+	try {
+		await expect(
+			applyStartupModelProfilesForRoot({
+				session,
+				settings,
+				modelRegistry: registry,
+				parsedArgs: {},
+				startupModel: undefined,
+				startupThinkingLevel: undefined,
+				isInteractive,
+				hasInteractiveTerminal,
+				initialMessage,
+				initialMessages,
+				resumeAction,
+			}),
+		).rejects.toBe(exit);
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
+
+test("recoverable blocked default still applies healthy --mpreset and explicit CLI override", async () => {
+	const explicitModel = model("cli-provider", "explicit");
+	const session = fakeSession(explicitModel);
+	const settings = Settings.isolated({ "modelProfile.default": "blocked-default" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "blocked-default",
+				requiredProviders: ["blocked-provider"],
+				modelMapping: { default: "blocked-provider/default:medium" },
+				source: "user",
+			},
+			{
+				name: "healthy-session",
+				requiredProviders: ["profile-provider"],
+				modelMapping: { default: "profile-provider/default:high" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async (provider: string) => (provider === "blocked-provider" ? undefined : "key"),
+	} as never;
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry,
+		parsedArgs: { mpreset: "healthy-session", model: "cli-provider/explicit", thinking: ThinkingLevel.Low },
+		startupModel: explicitModel,
+		startupThinkingLevel: ThinkingLevel.Low,
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(result.recoverableErrors).toHaveLength(1);
+	expect(
+		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+	).toEqual(["profile-provider/default:high", "cli-provider/explicit:low"]);
+});
+
+test("recoverable blocked --mpreset still reapplies explicit CLI override after a healthy default", async () => {
+	const explicitModel = model("cli-provider", "explicit");
+	const session = fakeSession(explicitModel);
+	const settings = Settings.isolated({ "modelProfile.default": "healthy-default" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "healthy-default",
+				requiredProviders: ["profile-provider"],
+				modelMapping: { default: "profile-provider/default:medium" },
+				source: "user",
+			},
+			{
+				name: "blocked-session",
+				requiredProviders: ["blocked-provider"],
+				modelMapping: { default: "blocked-provider/default:high" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async (provider: string) => (provider === "blocked-provider" ? undefined : "key"),
+	} as never;
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry,
+		parsedArgs: { mpreset: "blocked-session", model: "cli-provider/explicit", thinking: ThinkingLevel.XHigh },
+		startupModel: explicitModel,
+		startupThinkingLevel: ThinkingLevel.XHigh,
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(result.recoverableErrors).toHaveLength(1);
+	expect(
+		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
+	).toEqual(["profile-provider/default:medium", "cli-provider/explicit:xhigh"]);
+});
+
+test("thinking-only startup uses authoritative override semantics", async () => {
+	const settings = Settings.isolated();
+	const session = fakeSession();
+
+	await applyStartupModelProfiles({
+		session,
+		settings,
+		modelRegistry: fakeRegistry([]) as never,
+		parsedArgs: { thinking: ThinkingLevel.High },
+		startupModel: undefined,
+		startupThinkingLevel: undefined,
+	});
+
+	expect(session.setModelTemporaryCalls).toEqual([
+		expect.objectContaining({
+			model: session.model,
+			thinkingLevel: ThinkingLevel.High,
+			options: { cause: "startup-override" },
+		}),
+	]);
 });

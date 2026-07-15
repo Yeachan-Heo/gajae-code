@@ -120,8 +120,9 @@ pub enum AnswerSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionNeeded {
-	/// Stable action id. For an answerable `ask`, this is the durable broker
-	/// `gate_id`.
+	/// Ephemeral presentation/action id and the sole generic reply authority.
+	/// Durable workflow correlation, when present, is carried separately on the
+	/// correlated wire envelope.
 	pub id:         String,
 	/// Whether this is an answerable ask or a notify-only idle ping.
 	pub kind:       ActionKind,
@@ -141,6 +142,86 @@ pub struct ActionNeeded {
 	/// A short summary (e.g. truncated last assistant message for `idle`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub summary:    Option<String>,
+}
+
+/// A correlated workflow-gate presentation. The embedded action retains the
+/// generic reply authority; `workflow_gate_id` is correlation metadata only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowGateActionNeeded {
+	pub action:           ActionNeeded,
+	pub workflow_gate_id: String,
+}
+
+/// The outer wire discriminator that scopes correlated workflow-gate
+/// registration. This is internal registration metadata; it does not add a wire
+/// field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkflowGateWireDiscriminator {
+	ActionNeeded,
+	#[allow(
+		dead_code,
+		reason = "reserved to fence future correlated action_unavailable registrations"
+	)]
+	ActionUnavailable,
+}
+
+impl WorkflowGateWireDiscriminator {
+	#[must_use]
+	pub(crate) const fn as_str(self) -> &'static str {
+		match self {
+			Self::ActionNeeded => "action_needed",
+			Self::ActionUnavailable => "action_unavailable",
+		}
+	}
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireActionNeeded<'a> {
+	#[serde(rename = "type")]
+	kind:             &'static str,
+	#[serde(flatten)]
+	action:           &'a ActionNeeded,
+	workflow_gate_id: &'a str,
+}
+
+/// Decode correlated workflow metadata from an `action_needed` wire frame.
+/// Legacy [`ServerMessage`] decoding remains intentionally correlation-blind.
+pub fn decode_workflow_gate_action_needed(
+	json: &str,
+) -> Result<Option<WorkflowGateActionNeeded>, serde_json::Error> {
+	let value: serde_json::Value = serde_json::from_str(json)?;
+	if value.get("type").and_then(serde_json::Value::as_str)
+		!= Some(WorkflowGateWireDiscriminator::ActionNeeded.as_str())
+	{
+		return Ok(None);
+	}
+	let Some(workflow_gate_value) = value.get("workflowGateId") else {
+		return Ok(None);
+	};
+	let workflow_gate_id = workflow_gate_value
+		.as_str()
+		.filter(|id| !id.is_empty())
+		.map(str::to_owned)
+		.ok_or_else(|| {
+			serde_json::Error::io(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"workflowGateId must be a nonempty string",
+			))
+		})?;
+	let action = serde_json::from_value(value)?;
+	Ok(Some(WorkflowGateActionNeeded { action, workflow_gate_id }))
+}
+
+pub(crate) fn serialize_workflow_gate_action_needed(
+	action: &ActionNeeded,
+	workflow_gate_id: &str,
+) -> Result<String, serde_json::Error> {
+	serde_json::to_string(&WireActionNeeded {
+		kind: WorkflowGateWireDiscriminator::ActionNeeded.as_str(),
+		action,
+		workflow_gate_id,
+	})
 }
 
 /// Sent when a controlled action cannot be presented to this connection.
@@ -786,6 +867,34 @@ pub mod capabilities {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn correlated_action_needed_roundtrips_without_changing_legacy_reader() {
+		let action = ActionNeeded {
+			id:         "presentation-1".into(),
+			kind:       ActionKind::Ask,
+			session_id: "session-1".into(),
+			question:   Some("Proceed?".into()),
+			options:    Some(vec!["Yes".into(), "No".into()]),
+			controls:   vec![],
+			summary:    None,
+		};
+		let raw = serialize_workflow_gate_action_needed(&action, "gate-1").unwrap();
+		let correlated = decode_workflow_gate_action_needed(&raw)
+			.unwrap()
+			.expect("correlation");
+		assert_eq!(correlated.action, action);
+		assert_eq!(correlated.workflow_gate_id, "gate-1");
+		let legacy: ServerMessage = serde_json::from_str(&raw).unwrap();
+		assert_eq!(legacy, ServerMessage::ActionNeeded(action));
+		assert!(
+			decode_workflow_gate_action_needed(
+				r#"{"type":"action_needed","id":"a","kind":"ask","sessionId":"s"}"#
+			)
+			.unwrap()
+			.is_none()
+		);
+	}
 
 	#[test]
 	fn action_needed_ask_serializes_camelcase_with_snake_type() {

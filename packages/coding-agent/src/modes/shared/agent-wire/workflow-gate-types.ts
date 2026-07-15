@@ -62,6 +62,32 @@ export interface WorkflowGate {
 	required: true;
 }
 
+/** Non-actionable durable-gate state retained for restart diagnostics. */
+export interface WorkflowGateLifecycle {
+	state: "quarantined";
+	reason:
+		| "orphaned_after_process_restart"
+		| "accepted_unadvanced_after_process_restart"
+		| "continuation_owner_lost"
+		| "opened_without_continuation"
+		| "finalization_failed"
+		| "advance_failed";
+	quarantinedAt: string;
+	supersededByGateId?: string;
+}
+
+/** A quarantined gate is diagnostic-only and must never be presented or answered. */
+export interface WorkflowGateDiagnostic extends WorkflowGate {
+	id: string;
+	tag: "quarantined";
+	lifecycle: WorkflowGateLifecycle;
+}
+
+/** Stable Q12 row preserving the root WorkflowGate shape. */
+export type WorkflowGateQueryRecord =
+	| (WorkflowGate & { id: string; tag: "pending"; lifecycle?: undefined })
+	| WorkflowGateDiagnostic;
+
 /** Inbound: the agent's answer to a workflow gate. */
 export interface WorkflowGateResponse {
 	gate_id: string;

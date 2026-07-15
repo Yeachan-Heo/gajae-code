@@ -14,7 +14,6 @@ import stealthWebglScript from "../puppeteer/05_stealth_webgl.txt" with { type: 
 import stealthScreenScript from "../puppeteer/06_stealth_screen.txt" with { type: "text" };
 import stealthFontsScript from "../puppeteer/07_stealth_fonts.txt" with { type: "text" };
 import stealthAudioScript from "../puppeteer/08_stealth_audio.txt" with { type: "text" };
-import stealthLocaleScript from "../puppeteer/09_stealth_locale.txt" with { type: "text" };
 import stealthPluginsScript from "../puppeteer/10_stealth_plugins.txt" with { type: "text" };
 import stealthHardwareScript from "../puppeteer/11_stealth_hardware.txt" with { type: "text" };
 import stealthCodecsScript from "../puppeteer/12_stealth_codecs.txt" with { type: "text" };
@@ -37,7 +36,6 @@ const STEALTH_IGNORE_DEFAULT_ARGS = [
 	"--disable-default-apps",
 	"--disable-component-extensions-with-background-pages",
 ];
-const STEALTH_ACCEPT_LANGUAGE = "en-US,en";
 
 const USER_AGENT_TARGET_TIMEOUT_MS = 5_000;
 const USER_AGENT_TARGET_TYPES = new Set(["page", "webview", "background_page"]);
@@ -341,6 +339,20 @@ export interface UserAgentOverride {
 	};
 }
 
+function acceptLanguageForLocale(locale: string): string {
+	const canonicalLocale = Intl.getCanonicalLocales(locale)[0]!;
+	const baseLanguage = canonicalLocale.split("-")[0]!;
+	return canonicalLocale === baseLanguage ? canonicalLocale : `${canonicalLocale},${baseLanguage}`;
+}
+
+async function resolveAcceptLanguage(page: Page, locale?: string): Promise<string> {
+	if (locale) return acceptLanguageForLocale(locale);
+	const languages = await page.evaluate(() => [...navigator.languages]);
+	const acceptLanguage = languages.filter(Boolean).join(",");
+	if (!acceptLanguage) throw new ToolError("Chromium reported no native navigator languages");
+	return acceptLanguage;
+}
+
 function resolvePageClient(page: Page): PuppeteerCdpClient | null {
 	const pageWithClient = page as Page & {
 		_client?: (() => PuppeteerCdpClient) | PuppeteerCdpClient;
@@ -395,7 +407,7 @@ function patchSourceUrl(page: Page): void {
 	};
 }
 
-async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> {
+async function resolveUserAgentOverride(page: Page, locale?: string): Promise<UserAgentOverride> {
 	const rawUserAgent = await page.browser().userAgent();
 	let userAgent = rawUserAgent.replace("HeadlessChrome/", "Chrome/");
 	if (userAgent.includes("Linux") && !userAgent.includes("Android")) {
@@ -446,11 +458,13 @@ async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> 
 	brands[order[0]!] = { brand: greaseyBrand, version: "99" };
 	brands[order[1]!] = { brand: "Chromium", version: String(majorVersion) };
 	brands[order[2]!] = { brand: "Google Chrome", version: String(majorVersion) };
+	const acceptLanguage = await resolveAcceptLanguage(page, locale);
 
 	return {
 		userAgent,
 		platform,
-		acceptLanguage: STEALTH_ACCEPT_LANGUAGE,
+		acceptLanguage,
+
 		userAgentMetadata: {
 			brands,
 			fullVersion: uaVersion,
@@ -469,7 +483,17 @@ function wrapSession(session: CDPSession): PuppeteerCdpClient {
 	};
 }
 
-async function sendUserAgentOverride(client: PuppeteerCdpClient, override: UserAgentOverride): Promise<void> {
+async function sendUserAgentOverride(
+	client: PuppeteerCdpClient,
+	override: UserAgentOverride,
+	strict = false,
+): Promise<void> {
+	if (strict) {
+		await client.send("Network.enable");
+		await client.send("Network.setUserAgentOverride", override as unknown as Record<string, unknown>);
+		await client.send("Emulation.setUserAgentOverride", override as unknown as Record<string, unknown>);
+		return;
+	}
 	try {
 		await client.send("Network.enable");
 	} catch {}
@@ -497,28 +521,52 @@ export interface UserAgentSession {
 /** Configure UA override on the browser + auto-attach to new targets. */
 async function configureUserAgentTargets(
 	browser: Browser,
-	state: { browserSession: CDPSession | null; override: UserAgentOverride },
+	state: { browserSession: CDPSession | null; override: UserAgentOverride; locale?: string },
+
 	targetTimeoutMs = USER_AGENT_TARGET_TIMEOUT_MS,
 ): Promise<void> {
 	if (!state.browserSession) {
 		state.browserSession = await browser.target().createCDPSession();
 		await state.browserSession.send("Target.setAutoAttach", {
 			autoAttach: true,
-			waitForDebuggerOnStart: false,
+			waitForDebuggerOnStart: true,
 			flatten: true,
 		});
 		state.browserSession.on(
 			"Target.attachedToTarget",
-			async (event: { sessionId: string; targetInfo?: { type?: string } }) => {
-				if (!targetInfoSupportsUserAgentOverride(event.targetInfo)) return;
+			async (event: { sessionId: string; targetInfo?: { targetId?: string; type?: string } }) => {
+				if (!targetInfoSupportsUserAgentOverride(event.targetInfo)) {
+					const connection = state.browserSession?.connection();
+					await connection
+						?.session(event.sessionId)
+						?.send("Runtime.runIfWaitingForDebugger")
+						.catch(() => undefined);
+					return;
+				}
 				const connection = state.browserSession?.connection();
 				const session = connection?.session(event.sessionId);
 				if (!session) return;
-				await withSoftTimeout(
-					sendUserAgentOverride(wrapSession(session), state.override),
-					targetTimeoutMs,
-					"new target user-agent override",
-				);
+				try {
+					if (state.locale) {
+						await applyClientOverrides(wrapSession(session), state.override, state.locale, true);
+					} else {
+						await withSoftTimeout(
+							sendUserAgentOverride(wrapSession(session), state.override),
+							targetTimeoutMs,
+							"new target user-agent override",
+						);
+					}
+					await session.send("Runtime.runIfWaitingForDebugger");
+				} catch (error) {
+					if (event.targetInfo?.targetId) {
+						await state.browserSession
+							?.send("Target.closeTarget", { targetId: event.targetInfo.targetId })
+							.catch(() => undefined);
+					}
+					logger.debug("Closed target after geo override failure", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 			},
 		);
 	}
@@ -544,12 +592,31 @@ function targetInfoSupportsUserAgentOverride(targetInfo: { type?: string } | und
 }
 
 async function applyTargetUserAgentOverride(target: Target, override: UserAgentOverride): Promise<void> {
+	await applyTargetOverrides(target, override);
+}
+
+async function applyTargetOverrides(
+	target: Target,
+	override: UserAgentOverride,
+	locale?: string,
+	strict = false,
+): Promise<void> {
 	const session = await target.createCDPSession();
 	try {
-		await sendUserAgentOverride(wrapSession(session), override);
+		await applyClientOverrides(wrapSession(session), override, locale, strict);
 	} finally {
 		await session.detach().catch(() => undefined);
 	}
+}
+
+async function applyClientOverrides(
+	client: PuppeteerCdpClient,
+	override: UserAgentOverride,
+	locale?: string,
+	strict = false,
+): Promise<void> {
+	await sendUserAgentOverride(client, override, strict);
+	if (locale) await client.send("Emulation.setLocaleOverride", { locale });
 }
 
 async function withSoftTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T | undefined> {
@@ -583,7 +650,6 @@ const STEALTH_PATCH_SCRIPTS = [
 	stealthScreenScript,
 	stealthFontsScript,
 	stealthAudioScript,
-	stealthLocaleScript,
 	stealthPluginsScript,
 	stealthHardwareScript,
 	stealthCodecsScript,
@@ -659,17 +725,21 @@ export async function applyStealthPatches(
 	browser: Browser,
 	page: Page,
 	state: { browserSession: CDPSession | null; override: UserAgentOverride | null },
+	geo?: { readonly timezone?: string; readonly locale?: string },
 ): Promise<void> {
 	patchSourceUrl(page);
 	if (!state.override) {
-		state.override = await resolveUserAgentOverride(page);
+		state.override = await resolveUserAgentOverride(page, geo?.locale);
 	}
 	const client = resolvePageClient(page);
 	if (client) {
-		await sendUserAgentOverride(client, state.override);
+		await sendUserAgentOverride(client, state.override, Boolean(geo?.locale));
 	}
-	const targetState = { browserSession: state.browserSession, override: state.override };
+	const targetState = { browserSession: state.browserSession, override: state.override, locale: geo?.locale };
 	await configureUserAgentTargets(browser, targetState);
+	if (client && geo?.locale) {
+		await client.send("Emulation.setLocaleOverride", { locale: geo.locale });
+	}
 	state.browserSession = targetState.browserSession;
 	await injectStealthScripts(page);
 }

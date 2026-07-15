@@ -260,3 +260,77 @@ test("ask frames are exempt from redaction so they stay readable and answerable"
 	ws.close();
 	srv.stop();
 }, 30000);
+
+test("arbitrated native ask lets a generic claim win exactly once over a direct retirement and ignores stale replies", async () => {
+	const sessionId = `arbitrated-${process.pid}-${Date.now()}`;
+	const token = "tok";
+	const srv = new NotificationServer(sessionId, token, `/tmp/${sessionId}`, true);
+	let forwarded: { receiptId: string; answerJson: string } | undefined;
+	let forwardedCount = 0;
+	srv.onReply((_error, reply) => {
+		if (!reply) return;
+		forwardedCount++;
+		forwarded = { receiptId: reply.replyReceiptId, answerJson: reply.answerJson };
+	});
+	const endpoint = await srv.start();
+	const ws = new WebSocket(`${endpoint.url}/?token=${token}`);
+	let actionsSeen = 0;
+	let terminals = 0;
+	ws.addEventListener("message", event => {
+		const frame = JSON.parse(String(event.data)) as { type?: string; id?: string; kind?: string };
+		if (frame.type === "action_needed" && frame.kind === "ask") actionsSeen++;
+		if (frame.type === "action_resolved") terminals++;
+	});
+	await new Promise<void>((resolve, reject) => {
+		ws.addEventListener("open", () => resolve(), { once: true });
+		ws.addEventListener("error", () => reject(new Error("ws error")), { once: true });
+	});
+	try {
+		const lease = srv.registerArbitratedAsk(
+			JSON.stringify({
+				id: "arbitrated-ask",
+				kind: "ask",
+				sessionId,
+				question: "Which path wins?",
+				options: ["generic", "direct"],
+			}),
+			true,
+		);
+		await waitFor(() => actionsSeen === 1, 4_000, "arbitrated ask action");
+		ws.send(JSON.stringify({ type: "reply", id: "arbitrated-ask", answer: 0, token }));
+		await waitFor(() => forwarded !== undefined, 4_000, "generic reply claim");
+
+		// The native generic claim owns this exact lease, so direct workflow control
+		// cannot retire it and create a second terminal path.
+		expect(srv.retireIfUnclaimed(lease)).toEqual({ status: "claimed" });
+		srv.resolveClaim(forwarded!.receiptId, forwarded!.answerJson);
+		await waitFor(() => terminals === 1, 4_000, "single action terminal");
+
+		// A delayed duplicate of the old generic action cannot create an orphan receipt
+		// or emit another terminal after the receipt-bound resolution above.
+		ws.send(JSON.stringify({ type: "reply", id: "arbitrated-ask", answer: 1, token }));
+		await sleep(100);
+		expect(forwardedCount).toBe(1);
+		expect(terminals).toBe(1);
+
+		const directLease = srv.registerArbitratedAsk(
+			JSON.stringify({
+				id: "direct-retired-ask",
+				kind: "ask",
+				sessionId,
+				question: "Can a stale reply revive this?",
+				options: ["no"],
+			}),
+			true,
+		);
+		await waitFor(() => actionsSeen === 2, 4_000, "direct-retired ask action");
+		expect(srv.retireIfUnclaimed(directLease)).toEqual({ status: "retired" });
+		ws.send(JSON.stringify({ type: "reply", id: "direct-retired-ask", answer: 0, token }));
+		await sleep(100);
+		expect(forwardedCount).toBe(1);
+		expect(terminals).toBe(2);
+	} finally {
+		ws.close();
+		srv.stop();
+	}
+}, 30_000);

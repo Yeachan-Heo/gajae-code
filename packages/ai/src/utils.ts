@@ -119,7 +119,8 @@ export function sanitizeOpenAIResponsesHistoryItemsForReplay(items: Array<Record
 		return sanitized ? [sanitized] : [];
 	});
 }
-const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[A-Za-z0-9_]{1,32}\|>)/g;
+const RESERVED_CONTROL_TOKEN_RE =
+	/<\|(?=(?:[A-Za-z0-9_]+|(?:system|developer|user|assistant|tool)[ \t]+to=[^\s<>|]+)\|>)/g;
 /**
  * Neutralize leaked OpenAI Harmony / control tokens (`<|channel|>`, `<|message|>`,
  * `<|call|>`, `<|constrain|>`, `<|recipient|>`, `<|content|>`, ...) in replayed
@@ -130,6 +131,23 @@ const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[A-Za-z0-9_]{1,32}\|>)/g;
  * the offending item is re-sent on each turn. Insert a zero-width space after `<`
  * so the delimiter can no longer be tokenized as a reserved control token while the
  * text stays human-readable.
+ *
+ * The pattern matches the two control-token shapes only, so ordinary text and pipe
+ * syntax is left untouched:
+ *   - simple form `<|ident|>` — a leading run of identifier chars then `|>`; and
+ *   - header form `<|role to=recipient|>` — a known Harmony role
+ *     (`system`/`developer`/`user`/`assistant`/`tool`) followed by a single
+ *     recipient assignment `to=<recipient>` whose value is an unbounded run of
+ *     non-delimiter, non-whitespace chars (so long MCP/custom tool recipients like
+ *     `to=functions.<long.name>` are covered).
+ * The header branch is deliberately scoped to the known role + `to=` recipient
+ * grammar rather than an arbitrary `key=value`, so request-boundary sanitization
+ * never rewrites non-control delimiter text such as `<|foo bar=baz|>`. A single-line
+ * body (no `\n`) and the required leading identifier char also leave compact
+ * pipe/operator syntax alone — e.g. F# `value <| f |> g` (space after `<|`),
+ * `sum<|a+b|>c` (punctuation body), and `<|foo bar|>` (no assignment) never match.
+ * The simple branch is a strict superset of the original identifier-only pattern:
+ * every marker the old regex caught still matches.
  */
 export function neutralizeReservedControlTokens(text: string): string {
 	if (!text.includes("<|")) return text;

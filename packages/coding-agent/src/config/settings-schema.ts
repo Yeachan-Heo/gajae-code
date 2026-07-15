@@ -39,7 +39,8 @@ export type SettingTab =
 	| "editing"
 	| "tools"
 	| "tasks"
-	| "providers";
+	| "providers"
+	| "notifications";
 
 /** Tab display metadata - icon is resolved via theme.symbol() */
 export type TabMetadata = { label: string; icon: `tab.${string}` };
@@ -55,6 +56,7 @@ export const SETTING_TABS: SettingTab[] = [
 	"tools",
 	"tasks",
 	"providers",
+	"notifications",
 ];
 
 /** Tab display metadata - icon is a symbol key from theme.ts (tab.*) */
@@ -68,6 +70,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
 	tools: { label: "Tools", icon: "tab.tools" },
 	tasks: { label: "Tasks", icon: "tab.tasks" },
 	providers: { label: "Providers", icon: "tab.providers" },
+	notifications: { label: "Notifications", icon: "tab.providers" },
 };
 
 /** Status line segment identifiers */
@@ -110,6 +113,11 @@ interface UiBase {
 	description: string;
 	/** Condition function name - setting only shown when true */
 	condition?: string;
+	/**
+	 * Persistence owner for settings which must not use the generic immediate
+	 * settings-list write path.
+	 */
+	editing?: "notification-atomic";
 }
 
 interface UiBoolean extends UiBase {}
@@ -267,8 +275,27 @@ export const SETTINGS_SCHEMA = {
 	"notifications.enabled": { type: "boolean", default: false },
 	"notifications.telegram.botToken": { type: "string", default: undefined },
 	"notifications.telegram.chatId": { type: "string", default: undefined },
-	"notifications.telegram.rich.enabled": { type: "boolean", default: true },
-	"notifications.telegram.richDraft.enabled": { type: "boolean", default: false },
+	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
+	"notifications.telegram.rich.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Rich Messages",
+			description: "Format Telegram notifications with rich message content.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.richDraft.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Rich Drafts",
+			description: "Include rich draft updates in Telegram notifications.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.telegram.topics.nameTemplate": { type: "string", default: undefined },
 	"notifications.discord.botToken": { type: "string", default: undefined },
 	"notifications.discord.applicationId": { type: "string", default: undefined },
@@ -279,16 +306,49 @@ export const SETTINGS_SCHEMA = {
 	"notifications.slack.workspaceId": { type: "string", default: undefined },
 	"notifications.slack.channelId": { type: "string", default: undefined },
 	"notifications.slack.authorizedUserId": { type: "string", default: undefined },
-	"notifications.redact": { type: "boolean", default: false },
+	"notifications.redact": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Redact Notification Content",
+			description: "Redact sensitive content before notifications are delivered.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.verbosity": {
 		type: "string",
 		default: "lean",
 		validate: (value: string) => value === "lean" || value === "verbose",
+		ui: {
+			tab: "notifications",
+			label: "Notification Verbosity",
+			description: "Choose concise or detailed notification messages.",
+			options: [
+				{ value: "lean", label: "Lean", description: "Send concise notification messages" },
+				{ value: "verbose", label: "Verbose", description: "Send detailed notification messages" },
+			],
+			editing: "notification-atomic",
+		},
 	},
 	"notifications.sessionScope": {
 		type: "string",
 		default: "all",
 		validate: (value: string) => value === "all" || value === "primary",
+		ui: {
+			tab: "notifications",
+			label: "Notification Session Scope",
+			description: "Send notifications from all sessions or only the primary session.",
+			options: [
+				{ value: "all", label: "All Sessions", description: "Allow eligible sessions" },
+				{
+					value: "primary",
+					label: "Primary Session",
+					description: "Limit automatic notifications to the primary session",
+				},
+			],
+			editing: "notification-atomic",
+		},
 	},
 	"notifications.daemon.idleTimeoutMs": {
 		type: "number",
@@ -1112,6 +1172,25 @@ export const SETTINGS_SCHEMA = {
 			label: "Provider Stream Retries",
 			description:
 				"Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
+		},
+	},
+	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
+	"retry.fallbackRevertPolicy": {
+		type: "enum",
+		values: ["cooldown-expiry", "never"] as const,
+		default: "cooldown-expiry",
+		ui: {
+			tab: "model",
+			label: "Fallback Revert Policy",
+			description: "When to return to the primary model after a fallback",
+			options: [
+				{
+					value: "cooldown-expiry",
+					label: "Cooldown expiry",
+					description: "Return to the primary model after its suppression window ends",
+				},
+				{ value: "never", label: "Never", description: "Stay on the fallback model until manually changed" },
+			],
 		},
 	},
 
@@ -3504,6 +3583,8 @@ export interface NotificationsSettings {
 		channelId: string | undefined;
 	};
 	redact: boolean;
+	verbosity: "lean" | "verbose";
+	sessionScope: "all" | "primary";
 	daemon: {
 		idleTimeoutMs: number;
 	};

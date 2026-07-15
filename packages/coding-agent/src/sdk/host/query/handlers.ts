@@ -21,6 +21,7 @@ export interface SessionSurface {
 	getUsage(): unknown | Promise<unknown>;
 	getModels(): unknown | Promise<unknown>;
 	getSkillState(): unknown | Promise<unknown>;
+	/** Q12 rows preserve workflow gate fields and include stable durable gate metadata. */
 	getGates(): unknown | Promise<unknown>;
 	getConfigItems(): unknown | Promise<unknown>;
 	getSessionMetadata(): unknown | Promise<unknown>;

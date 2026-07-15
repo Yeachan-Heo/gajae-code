@@ -427,6 +427,7 @@ async function buildInitPayload(browser: BrowserHandle, opts: AcquireTabOptions)
 			browserWSEndpoint,
 			safeDir,
 			viewport: opts.viewport,
+			...(browser.geo ? { geo: browser.geo } : {}),
 			dialogs: opts.dialogs,
 			url: opts.url,
 			waitUntil: opts.waitUntil,

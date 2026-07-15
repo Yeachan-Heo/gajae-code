@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { callEndpoint } from "../../src/harness-control-plane/control-endpoint";
+import { ControlServer, callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
+import { releaseLease } from "../../src/harness-control-plane/session-lease";
 import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
 import { readEvents, writeSessionState } from "../../src/harness-control-plane/storage";
 import {
@@ -17,6 +18,10 @@ import {
 class FrameTransport implements HarnessSessionTransport {
 	cursor = 0;
 	live = true;
+	closeCalls = 0;
+	closeFailures = 0;
+	closeFailure: (() => unknown) | null = null;
+	closed = false;
 	#cb: ((frame: Record<string, unknown>) => void) | null = null;
 	#lastAt: string | null = null;
 	async getState(): Promise<SessionStateSnapshot> {
@@ -31,7 +36,14 @@ class FrameTransport implements HarnessSessionTransport {
 	async waitForAgentStart(): Promise<{ cursor: number } | null> {
 		return null;
 	}
-	async close(): Promise<void> {}
+	async close(): Promise<void> {
+		this.closeCalls += 1;
+		if (this.closeFailures > 0) {
+			this.closeFailures -= 1;
+			throw this.closeFailure?.() ?? new Error("injected transport cleanup failure");
+		}
+		this.closed = true;
+	}
 	onEventFrame(cb: (frame: Record<string, unknown>) => void): () => void {
 		this.#cb = cb;
 		return () => {
@@ -202,46 +214,236 @@ describe("owner frame -> observability", () => {
 		expect(obsJson).not.toContain("SECRET_PARTIAL");
 		expect(obsJson).not.toContain("SECRET_OUTPUT");
 	});
-	it("AC-6: a message_update storm cannot starve agent_end (completed) or bloat the event log", async () => {
+	it("AC-6: repeated message_update storms cannot starve terminal observation or bloat the event log", async () => {
 		const transport = new FrameTransport();
 		owner = new RuntimeOwner({ root, sessionId: SID, transport });
 		const info = await owner.start();
-		transport.emit({ type: "agent_start" });
-		for (let i = 0; i < 500; i++) transport.emit({ type: "message_update", messageId: "m1", delta: "noise" });
-		transport.emit({ type: "agent_end" });
-		await flush();
+		for (let turn = 0; turn < 8; turn++) {
+			transport.emit({ type: "agent_start" });
+			for (let i = 0; i < 500; i++)
+				transport.emit({ type: "message_update", messageId: `m${turn}`, delta: "noise" });
+			transport.emit({ type: "agent_end" });
+			const obs = obsOf(
+				(await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, unknown>,
+			);
+			expect(obs.observedSignals).toContain("completed");
+		}
 
 		const events = await readEvents(root, SID, 0);
-		expect(events.map(e => e.kind)).toContain("rpc_agent_completed");
-		// 500 message_update frames are coalesced, not emitted 1:1.
+		expect(events.filter(event => event.kind === "rpc_agent_completed")).toHaveLength(8);
+		// Four thousand message_update frames are coalesced instead of emitted 1:1.
 		expect(events.length).toBeLessThan(60);
-		const obs = obsOf(
-			(await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, unknown>,
-		);
-		expect(obs.observedSignals).toContain("completed");
 	});
 
-	it("AC-7: transient tool-call/completed survive polling gaps (sticky from the event log)", async () => {
+	it("AC-7: repeated poll gaps retain sticky tool-call/completed signals without settlement sleeps", async () => {
 		const transport = new FrameTransport();
 		owner = new RuntimeOwner({ root, sessionId: SID, transport });
 		const info = await owner.start();
-		// frames happen BETWEEN observe polls
-		transport.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "read", args: { path: "x" } });
-		transport.emit({
-			type: "tool_execution_end",
-			toolCallId: "t1",
-			toolName: "read",
-			result: { details: { status: "ok" } },
+		for (let turn = 0; turn < 8; turn++) {
+			// Every frame sequence lands between observe polls.
+			transport.emit({
+				type: "tool_execution_start",
+				toolCallId: `t${turn}`,
+				toolName: "read",
+				args: { path: "x" },
+			});
+			transport.emit({
+				type: "tool_execution_end",
+				toolCallId: `t${turn}`,
+				toolName: "read",
+				result: { details: { status: "ok" } },
+			});
+			transport.emit({ type: "agent_end" });
+			const obs = obsOf(
+				(await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, unknown>,
+			);
+			expect(obs.observedSignals).toContain("tool-call");
+			expect(obs.observedSignals).toContain("completed");
+			expect(obs.observedSignals).toContain("idle");
+		}
+	});
+
+	it("latches append failure as blocking observation evidence and rejects shutdown", async () => {
+		const transport = new FrameTransport();
+		const runtime = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			framePersistence: {
+				async appendEvent() {
+					throw new Error("injected frame append failure");
+				},
+			},
 		});
-		transport.emit({ type: "agent_end" });
-		await flush();
-		// getState reports idle now, but the later observe still shows the transient signals.
-		const obs = obsOf(
-			(await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, unknown>,
+		owner = runtime;
+		const info = await runtime.start();
+		transport.emit({ type: "agent_start" });
+
+		const response = (await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, any>;
+		expect(response.ok).toBe(false);
+		expect(response.state.lifecycle).toBe("blocked");
+		expect(response.state.blockers).toContain("frame-persistence-failed");
+		expect(obsOf(response).observedSignals).toEqual(["frame-persistence-failed"]);
+		expect(response.evidence.framePumpFailure.error).toContain("injected frame append failure");
+		expect(response.evidence.framePumpFailure.severity).toBe("critical");
+		const repeated = (await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, any>;
+		expect(repeated.ok).toBe(false);
+		expect(repeated.state.blockers).toContain("frame-persistence-failed");
+		await expect(runtime.stop()).rejects.toThrow("injected frame append failure");
+		owner = null;
+	});
+
+	it("retries all cleanup stages before surfacing a latched frame-pump failure", async () => {
+		const transport = new FrameTransport();
+		transport.closeFailures = 1;
+		let serverCloseCalls = 0;
+		let serverClosed = false;
+		let leaseReleaseCalls = 0;
+		let leaseReleased = false;
+		const runtime = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			cleanupRetryMs: 0,
+			cleanupRetryLimit: 4,
+			controlServerFactory(socketPath, handler) {
+				const server = new ControlServer(socketPath, handler);
+				const close = server.close.bind(server);
+				server.close = async () => {
+					serverCloseCalls += 1;
+					await close();
+					serverClosed = true;
+					if (serverCloseCalls === 1) throw new Error("injected server cleanup failure");
+				};
+				return server;
+			},
+			leaseRelease: async (...args) => {
+				leaseReleaseCalls += 1;
+				if (leaseReleaseCalls === 1) throw new Error("injected lease cleanup failure");
+				await releaseLease(...args);
+				leaseReleased = true;
+			},
+			framePersistence: {
+				async appendEvent() {
+					throw new Error("injected frame pump failure");
+				},
+			},
+		});
+		owner = runtime;
+		const info = await runtime.start();
+		transport.emit({ type: "agent_start" });
+		const blocked = (await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, any>;
+		expect(blocked.state.blockers).toContain("frame-persistence-failed");
+
+		const failure = await runtime.stop().then(
+			() => null,
+			error => error,
 		);
-		expect(obs.observedSignals).toContain("tool-call");
-		expect(obs.observedSignals).toContain("completed");
-		expect(obs.observedSignals).toContain("idle"); // overlay present, did not evict semantic signals
+		expect(failure).toBeInstanceOf(AggregateError);
+		const causes = (failure as AggregateError).errors.map(String).join("\n");
+		expect(causes).toContain("injected frame pump failure");
+		expect(causes).toContain("injected transport cleanup failure");
+		expect(causes).toContain("injected server cleanup failure");
+		expect(causes).toContain("injected lease cleanup failure");
+		expect(transport.closed).toBe(true);
+		expect(serverClosed).toBe(true);
+		expect(leaseReleased).toBe(true);
+		expect(transport.closeCalls).toBe(2);
+		expect(serverCloseCalls).toBe(2);
+		expect(leaseReleaseCalls).toBe(2);
+		owner = null;
+	});
+
+	it("retries a lookalike frame-pump cleanup aggregate before surfacing the latched failure", async () => {
+		const transport = new FrameTransport();
+		transport.closeFailures = 1;
+		transport.closeFailure = () =>
+			new AggregateError(
+				[new Error("injected lookalike transport cleanup failure")],
+				"Runtime owner frame pump failed after verified cleanup: lookalike",
+			);
+		let serverCloseCalls = 0;
+		let serverClosed = false;
+		let leaseReleaseCalls = 0;
+		let leaseReleased = false;
+		const runtime = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			cleanupRetryMs: 0,
+			cleanupRetryLimit: 4,
+			controlServerFactory(socketPath, handler) {
+				const server = new ControlServer(socketPath, handler);
+				const close = server.close.bind(server);
+				server.close = async () => {
+					serverCloseCalls += 1;
+					await close();
+					serverClosed = true;
+				};
+				return server;
+			},
+			leaseRelease: async (...args) => {
+				leaseReleaseCalls += 1;
+				await releaseLease(...args);
+				leaseReleased = true;
+			},
+			framePersistence: {
+				async appendEvent() {
+					throw new Error("injected latched frame pump failure");
+				},
+			},
+		});
+		owner = runtime;
+		await runtime.start();
+		transport.emit({ type: "agent_start" });
+		await flush();
+
+		const failure = await runtime.stop().then(
+			() => null,
+			error => error,
+		);
+		expect(failure).toBeInstanceOf(AggregateError);
+		expect((failure as Error).message).toContain("Runtime owner frame pump failed after verified cleanup:");
+		const causes = (failure as AggregateError).errors.map(String).join("\n");
+		expect(causes).toContain("injected latched frame pump failure");
+		expect(causes).toContain("injected lookalike transport cleanup failure");
+		expect(transport.closed).toBe(true);
+		expect(serverClosed).toBe(true);
+		expect(leaseReleased).toBe(true);
+		expect(transport.closeCalls).toBe(2);
+		expect(serverCloseCalls).toBe(1);
+		expect(leaseReleaseCalls).toBe(1);
+		owner = null;
+	});
+
+	it("latches terminal state-write failure before emitting completion", async () => {
+		const transport = new FrameTransport();
+		const runtime = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			framePersistence: {
+				async writeSessionState() {
+					throw new Error("injected terminal state write failure");
+				},
+			},
+		});
+		owner = runtime;
+		const info = await runtime.start();
+		transport.emit({ type: "agent_end" });
+
+		const response = (await callEndpoint(info.socketPath, { verb: "observe", input: {} })) as Record<string, any>;
+		expect(response.ok).toBe(false);
+		expect(response.state.lifecycle).toBe("blocked");
+		expect(response.state.blockers).toContain("frame-persistence-failed");
+		expect(obsOf(response).observedSignals).toEqual(["frame-persistence-failed"]);
+		expect(response.evidence.framePumpFailure.error).toContain("injected terminal state write failure");
+		expect(response.evidence.framePumpFailure.severity).toBe("critical");
+		expect(await readEvents(root, SID, 0)).not.toContainEqual(
+			expect.objectContaining({ kind: "rpc_agent_completed" }),
+		);
+		await expect(runtime.stop()).rejects.toThrow("injected terminal state write failure");
+		owner = null;
 	});
 
 	it("rpcLive is distinct from ownerLive (RPC death does not imply dead owner)", async () => {

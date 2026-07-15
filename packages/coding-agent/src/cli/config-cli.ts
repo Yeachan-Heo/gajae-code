@@ -429,7 +429,8 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 
 	const path = def.path as SettingPath;
 	const defaultValue = getDefault(path);
-	settings.set(path, defaultValue as SettingValue<typeof path>);
+	if (defaultValue === undefined) settings.unset(path);
+	else settings.set(path, defaultValue as SettingValue<typeof path>);
 
 	if (flags.json) {
 		console.log(JSON.stringify({ key: def.path, value: defaultValue }));

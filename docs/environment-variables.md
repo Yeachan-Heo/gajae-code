@@ -514,8 +514,9 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 
 | Variable                  | Behavior                                                                              |
 | ------------------------- | ------------------------------------------------------------------------------------- |
-| `GJC_NOTIFICATIONS`        | `off` / `0` / `false` suppress desktop notifications                                  |
-| `GJC_NOTIFY`               | `off` / `0` / `false` suppress the per-turn completion notification (terminal bell, backgrounded desktop toast, and `completion.notifyCommand`) for this process only; `config.yml` is untouched and child processes inherit it. Use for non-interactive runs (`gjc -p --no-session`) so an inherited global `completion.notify=on` does not fire per run. |
+| `GJC_NOTIFICATIONS`       | `0` is a hard notification runtime opt-out; `1` explicitly enables the generic current-session path even without a globally configured adapter. |
+| `GJC_NOTIFICATIONS_TOKEN` | An explicit generic current-session opt-in token. It has the same runtime precedence as `GJC_NOTIFICATIONS=1`; it does not supply or override global Telegram credentials. |
+| `GJC_NOTIFY`              | `off` / `0` / `false` suppresses the notification control surface for this process, including completion notifications; global config is untouched and child processes inherit it. It wins over explicit notification opt-in. Use it for non-interactive runs (`gjc -p --no-session`) that must remain silent. |
 | `GJC_TUI_WRITE_LOG`        | If set, logs TUI writes to file                                                       |
 | `GJC_HARDWARE_CURSOR`      | If `1`, enables hardware cursor mode                                                  |
 | `GJC_CLEAR_ON_SHRINK`      | If `1`, clears empty rows when content shrinks                                        |

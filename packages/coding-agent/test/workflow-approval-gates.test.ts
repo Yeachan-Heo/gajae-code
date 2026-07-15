@@ -6,8 +6,23 @@ import {
 	decodeExecution,
 	executionGate,
 } from "../src/modes/shared/agent-wire/approval-gate";
-import { MemoryGateStore, WorkflowGateBroker } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import {
+	type GateContinuation,
+	MemoryGateStore,
+	WorkflowGateBroker,
+} from "../src/modes/shared/agent-wire/workflow-gate-broker";
 
+function activeContinuation(): GateContinuation {
+	let active = true;
+	return {
+		activate: () => {},
+		terminalProof: "not_published",
+		isLive: () => active,
+		release: () => {
+			active = false;
+		},
+	};
+}
 describe("approvalGate (ralplan #317)", () => {
 	it("emits a ralplan approval gate with stable schema", () => {
 		const gate = approvalGate({ summary: "plan v2" });
@@ -63,7 +78,9 @@ describe("end-to-end via the broker", () => {
 				advanced.push(a);
 			},
 		});
-		const gate = broker.openGate(approvalGate({ summary: "PRD" }));
+		const gate = broker.openGate(approvalGate({ summary: "PRD" }), activeContinuation());
+		expect(broker.listPendingGates()).toEqual([gate]);
+
 		// schema-invalid (decision not in enum) -> rejected, gate pending
 		const bad = await broker.resolve({ gate_id: gate.gate_id, answer: { decision: "maybe" } });
 		expect(bad.status).toBe("rejected");
@@ -79,10 +96,17 @@ describe("end-to-end via the broker", () => {
 	});
 
 	it("validates execution answers and honors decline", async () => {
-		const broker = new WorkflowGateBroker("run-exec", new MemoryGateStore());
-		const gate = broker.openGate(executionGate());
+		const advanced: unknown[] = [];
+		const broker = new WorkflowGateBroker("run-exec", new MemoryGateStore(), {
+			advance: (_g, answer) => {
+				advanced.push(answer);
+			},
+		});
+		const gate = broker.openGate(executionGate(), activeContinuation());
+		expect(broker.listPendingGates()).toEqual([gate]);
 		const ok = await broker.resolve({ gate_id: gate.gate_id, answer: { decision: "decline", reason: "later" } });
 		expect(ok.status).toBe("accepted");
+		expect(advanced).toEqual([{ decision: "decline", reason: "later" }]);
 		expect(decodeExecution({ decision: "decline", reason: "later" }).approved).toBe(false);
 	});
 });

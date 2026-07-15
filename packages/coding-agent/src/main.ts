@@ -26,7 +26,7 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
-import { activateModelProfile } from "./config/model-profile-activation";
+import { activateModelProfile, ModelProfileCredentialError } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
@@ -193,6 +193,7 @@ export function resolveAcpStartupOptions(
 		| "hooks"
 		| "messages"
 		| "mpreset"
+		| "mcpConfig"
 		| "model"
 		| "models"
 		| "noLsp"
@@ -234,6 +235,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.hooks?.length ? ["--hook"] : []),
 		...(parsed.messages.length > 0 ? ["initial prompt"] : []),
 		...(parsed.models?.length ? ["--models"] : []),
+		...(parsed.mcpConfig !== undefined ? ["--mcp-config"] : []),
 		...(parsed.noLsp ? ["--no-lsp"] : []),
 		...(parsed.noPty ? ["--no-pty"] : []),
 		...(parsed.noRules ? ["--no-rules"] : []),
@@ -366,23 +368,36 @@ type CreateSessionForMain = (
 	context?: { skipPostCreateModelRefresh?: boolean },
 ) => Promise<CreateAgentSessionResult>;
 
-export async function applyStartupModelProfiles(args: {
+type StartupModelProfileArgs = {
 	session: AgentSession;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
 	parsedArgs: Pick<Args, "default" | "model" | "mpreset" | "thinking">;
 	startupModel?: CreateAgentSessionOptions["model"];
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
-}): Promise<void> {
+};
+
+async function applyStartupModelProfilesWithPolicy(
+	args: StartupModelProfileArgs,
+	onCredentialError?: (error: ModelProfileCredentialError) => void,
+): Promise<void> {
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
 		options: { thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"] } = {},
 	): Promise<void> => {
-		await activateModelProfile(
-			{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-			{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
-		);
+		try {
+			await activateModelProfile(
+				{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
+				{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+			);
+		} catch (error) {
+			if (onCredentialError && error instanceof ModelProfileCredentialError) {
+				onCredentialError(error);
+				return;
+			}
+			throw error;
+		}
 	};
 
 	// Capture the explicitly-selected startup model BEFORE profile activation can
@@ -405,7 +420,7 @@ export async function applyStartupModelProfiles(args: {
 		await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true);
 	}
 
-	// Explicit CLI --model/--thinking must win over any activated profile.
+	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
 	if (explicitModel) {
 		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking, {
 			persistAsSessionDefault: true,
@@ -419,16 +434,62 @@ export async function applyStartupModelProfiles(args: {
 	}
 }
 
-export async function applyStartupModelProfilesOrExit(
-	args: Parameters<typeof applyStartupModelProfiles>[0],
-): Promise<void> {
+export async function applyStartupModelProfiles(args: StartupModelProfileArgs): Promise<void> {
+	await applyStartupModelProfilesWithPolicy(args);
+}
+
+async function exitForStartupModelProfileError(args: StartupModelProfileArgs, error: unknown): Promise<never> {
+	const message = error instanceof Error ? error.message : String(error);
+	process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+	await args.session.dispose();
+	process.exit(1);
+}
+
+export async function applyStartupModelProfilesOrExit(args: StartupModelProfileArgs): Promise<void> {
 	try {
 		await applyStartupModelProfiles(args);
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
-		process.exit(1);
+		await exitForStartupModelProfileError(args, error);
 	}
+}
+
+export function isStartupModelProfileCredentialRecoveryEligible(options: {
+	isInteractive: boolean;
+	hasInteractiveTerminal: boolean;
+	initialMessage: string | undefined;
+	initialMessages: readonly string[];
+	resumeAction: "continue-tail" | "open-idle" | undefined;
+}): boolean {
+	return (
+		options.isInteractive &&
+		options.hasInteractiveTerminal &&
+		options.initialMessage === undefined &&
+		options.initialMessages.length === 0 &&
+		options.resumeAction !== "continue-tail"
+	);
+}
+
+export async function applyStartupModelProfilesForRoot(
+	args: StartupModelProfileArgs & {
+		isInteractive: boolean;
+		hasInteractiveTerminal: boolean;
+		initialMessage: string | undefined;
+		initialMessages: readonly string[];
+		resumeAction: "continue-tail" | "open-idle" | undefined;
+	},
+): Promise<{ recoverableErrors: string[] }> {
+	if (!isStartupModelProfileCredentialRecoveryEligible(args)) {
+		await applyStartupModelProfilesOrExit(args);
+		return { recoverableErrors: [] };
+	}
+
+	const recoverableErrors: string[] = [];
+	try {
+		await applyStartupModelProfilesWithPolicy(args, error => recoverableErrors.push(error.message));
+	} catch (error) {
+		await exitForStartupModelProfileError(args, error);
+	}
+	return { recoverableErrors };
 }
 
 interface InteractiveModeFactoryOptions {
@@ -783,6 +844,7 @@ async function buildSessionOptions(
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
 	};
+	if (parsed.mcpConfig !== undefined) options.mcpConfigPath = parsed.mcpConfig;
 
 	const systemPromptSource = parsed.systemPrompt;
 	const resolvedSystemPrompt = await resolvePromptInput(systemPromptSource, "system prompt");
@@ -1236,6 +1298,7 @@ export async function runRootCommand(
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive;
+	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.settings = settingsInstance;
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
 
@@ -1295,18 +1358,35 @@ export async function runRootCommand(
 
 		// Research-mode (RLM) preset: hard tool-boundary assertion after the registry is assembled.
 		if (deps.rlmPreset?.onSessionCreated) {
-			await deps.rlmPreset.onSessionCreated(session);
+			try {
+				await deps.rlmPreset.onSessionCreated(session);
+			} catch (error) {
+				try {
+					await session.dispose();
+				} catch {
+					logger.warn("Failed to dispose session after RLM post-create error");
+				}
+				throw error;
+			}
 		}
 
 		if (!(parsedArgs.authBootstrap === true && isInteractive)) {
-			await applyStartupModelProfilesOrExit({
+			const { recoverableErrors } = await applyStartupModelProfilesForRoot({
 				session,
 				settings: settingsInstance,
 				modelRegistry,
 				parsedArgs,
 				startupModel: sessionOptions.model,
 				startupThinkingLevel: sessionOptions.thinkingLevel,
+				isInteractive,
+				hasInteractiveTerminal: hasResumePickerTerminal(),
+				initialMessage,
+				initialMessages: parsedArgs.messages,
+				resumeAction: bareResumeAction,
 			});
+			for (const recoverableError of recoverableErrors) {
+				notifs.push({ kind: "error", message: recoverableError });
+			}
 		}
 
 		if (modelFallbackMessage) {
@@ -1337,52 +1417,70 @@ export async function runRootCommand(
 			process.stderr.write(
 				`${chalk.yellow(`\nAdvanced manual config remains available at ${ModelsConfigFile.path()}`)}\n`,
 			);
+			await session.dispose();
+			stopThemeWatcher();
+			await postmortem.quit(1);
 			process.exit(1);
 		}
 
 		if (isInteractive) {
-			startupUpdate.startBeforeInteractiveInitialization();
-			const changelogMarkdown = await logger.time(
-				"main:getChangelogForDisplay",
-				deps.getChangelogForDisplay ?? getChangelogForDisplay,
-				parsedArgs,
-			);
+			let exitForTiming = false;
+			try {
+				startupUpdate.startBeforeInteractiveInitialization();
+				const changelogMarkdown = await logger.time(
+					"main:getChangelogForDisplay",
+					deps.getChangelogForDisplay ?? getChangelogForDisplay,
+					parsedArgs,
+				);
 
-			const scopedModelsForDisplay = sessionOptions.scopedModels ?? scopedModels;
-			if (scopedModelsForDisplay.length > 0) {
-				const modelList = scopedModelsForDisplay
-					.map(scopedModel => {
-						const thinkingStr = !scopedModel.thinkingLevel ? `:${scopedModel.thinkingLevel}` : "";
-						return `${scopedModel.model.id}${thinkingStr}`;
-					})
-					.join(", ");
-				process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
-			}
-
-			if ($env.PI_TIMING) {
-				logger.printTimings();
-				if ($env.PI_TIMING === "x") {
-					process.exit(0);
+				const scopedModelsForDisplay = sessionOptions.scopedModels ?? scopedModels;
+				if (scopedModelsForDisplay.length > 0) {
+					const modelList = scopedModelsForDisplay
+						.map(scopedModel => {
+							const thinkingStr = !scopedModel.thinkingLevel ? `:${scopedModel.thinkingLevel}` : "";
+							return `${scopedModel.model.id}${thinkingStr}`;
+						})
+						.join(", ");
+					process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
 				}
+
+				if ($env.PI_TIMING) {
+					logger.printTimings();
+					exitForTiming = $env.PI_TIMING === "x";
+				}
+
+				if (!exitForTiming) {
+					logger.endTiming();
+					await runInteractiveMode(
+						session,
+						VERSION,
+						changelogMarkdown,
+						notifs,
+						startupUpdate,
+						parsedArgs.messages,
+						setToolUIContext,
+						lspServers,
+						mcpManager,
+						eventBus,
+						initialMessage,
+						initialImages,
+						deps.createInteractiveMode,
+						bareResumeAction,
+					);
+				}
+			} catch (error) {
+				try {
+					await session.dispose();
+				} catch {
+					logger.warn("Failed to dispose session after interactive error");
+				}
+				throw error;
 			}
 
-			logger.endTiming();
-			await runInteractiveMode(
-				session,
-				VERSION,
-				changelogMarkdown,
-				notifs,
-				startupUpdate,
-				parsedArgs.messages,
-				setToolUIContext,
-				lspServers,
-				mcpManager,
-				eventBus,
-				initialMessage,
-				initialImages,
-				deps.createInteractiveMode,
-				bareResumeAction,
-			);
+			if (exitForTiming) {
+				await session.dispose();
+				process.exit(0);
+			}
 		} else {
 			const runPrint = deps.runPrintMode ?? (await import("./modes/print-mode")).runPrintMode;
 			await runPrint(session, {

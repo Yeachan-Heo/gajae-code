@@ -13,10 +13,12 @@ import {
 import { deliverRichWithFallback } from "../src/sdk/bus/rich-render";
 import {
 	acquireDaemonOwnership,
+	type BotApi,
 	DAEMON_GENERATION,
 	DAEMON_VERSION,
 	daemonPaths,
 	ensureTelegramDaemonRunning,
+	ensureTelegramDaemonRunningDetailed,
 	registerNotificationRoot,
 	releaseDaemonOwnership,
 	renewDaemonHeartbeat,
@@ -26,6 +28,7 @@ import {
 	TelegramEventDispatchState,
 	TelegramNotificationDaemon,
 	TelegramUpdatePoller,
+	unregisterNotificationRoot,
 } from "../src/sdk/bus/telegram-daemon";
 import { runDaemonInternal, runDaemonSmoke } from "../src/sdk/bus/telegram-daemon-cli";
 
@@ -342,6 +345,30 @@ describe("telegram daemon", () => {
 		}
 	});
 
+	test("unregistering a session removes only its unreferenced root", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const sharedCwd = path.join(agentDir, "shared");
+		const otherCwd = path.join(agentDir, "other");
+		await registerNotificationRoot({ settings: s, cwd: sharedCwd, sessionId: "shared-a" });
+		await registerNotificationRoot({ settings: s, cwd: sharedCwd, sessionId: "shared-b" });
+		await registerNotificationRoot({ settings: s, cwd: otherCwd, sessionId: "other" });
+
+		expect(await unregisterNotificationRoot({ settings: s, cwd: sharedCwd, sessionId: "shared-a" })).toMatchObject({
+			remainingRoots: 2,
+		});
+		expect(await unregisterNotificationRoot({ settings: s, cwd: sharedCwd, sessionId: "shared-b" })).toMatchObject({
+			remainingRoots: 1,
+		});
+
+		const registry = JSON.parse(fs.readFileSync(daemonPaths(agentDir).roots, "utf8")) as {
+			roots: string[];
+			sessions: Record<string, string>;
+		};
+		expect(registry.roots).toEqual([path.join(otherCwd, ".gjc", "state")]);
+		expect(registry.sessions).toEqual({ other: path.join(otherCwd, ".gjc", "state") });
+	});
+
 	test("fake Bot API observes one getUpdates loop", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -527,6 +554,17 @@ describe("telegram daemon", () => {
 				version: DAEMON_VERSION,
 			}),
 		);
+		const beforeState = fs.readFileSync(paths.state, "utf8");
+		const signals: Array<[number, string]> = [];
+		const unlinked: string[] = [];
+		const baseFs = topicStateFs(async () => undefined);
+		const recordingFs: TelegramDaemonFs = {
+			...baseFs,
+			unlink: async file => {
+				unlinked.push(file);
+				await fs.promises.unlink(file);
+			},
+		};
 
 		let spawns = 0;
 		const result = await ensureTelegramDaemonRunning(
@@ -534,6 +572,8 @@ describe("telegram daemon", () => {
 			{
 				now: () => 101,
 				pidAlive: pid => pid === 999,
+				sendSignal: (pid, signal) => signals.push([pid, signal]),
+				fs: recordingFs,
 				spawn: () => {
 					spawns++;
 					return { unref() {} };
@@ -543,6 +583,10 @@ describe("telegram daemon", () => {
 
 		expect(result).toBe("blocked");
 		expect(spawns).toBe(0);
+		expect(signals).toEqual([]);
+		expect(unlinked).toEqual([]);
+		expect(fs.existsSync(paths.lock)).toBe(true);
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(beforeState);
 		expect(fs.existsSync(paths.roots)).toBe(false);
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
 			ownerId: "old",
@@ -680,6 +724,53 @@ describe("telegram daemon", () => {
 		expect(after.roots).toContain(path.join(cwd, ".gjc", "state"));
 	});
 
+	test("detailed ensure reports reloaded only for the existing fresh-owner reloadRequired handoff", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, { heartbeatAt: Date.now() }); // Missing generation requests #2028 reload.
+		const alive = new Set<number>([999, 4242]);
+		const signals: Array<[number, string]> = [];
+		const result = await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				pidAlive: pid => alive.has(pid),
+				sendSignal: (pid, signal) => {
+					signals.push([pid, signal]);
+					if (signal === "SIGTERM") alive.delete(999);
+				},
+				sleep: async () => undefined,
+				spawn: () => ({ unref() {} }),
+			},
+		);
+		expect(result).toBe("reloaded");
+		expect(signals).toContainEqual([999, "SIGTERM"]);
+	});
+
+	test("detailed ensure keeps a stale-heartbeat live PID attached even when generation is older", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, { heartbeatAt: 100 }); // Missing generation, but stale heartbeat is fail-closed.
+		const signals: Array<[number, string]> = [];
+		let spawns = 0;
+		const result = await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				now: () => 100_000,
+				pidAlive: () => true,
+				sendSignal: (pid, signal) => signals.push([pid, signal]),
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			},
+		);
+		expect(result).toBe("attached");
+		expect(signals).toEqual([]);
+		expect(spawns).toBe(0);
+	});
+
 	test("#2028 ensureTelegramDaemonRunning reuses a current-generation live owner without a reload", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -774,6 +865,79 @@ describe("telegram daemon", () => {
 		};
 		expect(state.pid).toBe(222);
 		expect(state.ownerId).toBe("owner");
+	});
+
+	test("runDaemonInternal stops when persisted ownership moves to another owner", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		let tick: (() => void) | undefined;
+		let stopReason: string | undefined;
+		let resolveRun!: () => void;
+		class StubDaemon {
+			requestStop(reason?: string): void {
+				stopReason = reason;
+				resolveRun();
+			}
+			run(): Promise<void> {
+				return new Promise<void>(resolve => {
+					resolveRun = resolve;
+				});
+			}
+		}
+		const run = runDaemonInternal(["--agent-dir", agentDir, "--owner-id", "owner"], {
+			SettingsImpl: { init: async () => s },
+			DaemonImpl: StubDaemon,
+			readDaemonState: async () => ({ ownerId: "replacement", heartbeatAt: 1 }) as never,
+			setInterval: callback => {
+				tick = callback;
+				return 1 as unknown as Timer;
+			},
+			clearInterval: () => {},
+		});
+		for (let attempt = 0; attempt < 100 && !tick; attempt++) await Bun.sleep(1);
+		expect(tick).toBeDefined();
+		tick!();
+		await run;
+		expect(stopReason).toBe("stop");
+	});
+
+	test("runDaemonInternal stops after persisted heartbeat remains stalled", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		let tick: (() => void) | undefined;
+		let now = 0;
+		let stopReason: string | undefined;
+		let resolveRun!: () => void;
+		class StubDaemon {
+			requestStop(reason?: string): void {
+				stopReason = reason;
+				resolveRun();
+			}
+			run(): Promise<void> {
+				return new Promise<void>(resolve => {
+					resolveRun = resolve;
+				});
+			}
+		}
+		const run = runDaemonInternal(["--agent-dir", agentDir, "--owner-id", "owner"], {
+			SettingsImpl: { init: async () => s },
+			DaemonImpl: StubDaemon,
+			now: () => now,
+			readDaemonState: async () => ({ ownerId: "owner", heartbeatAt: 1 }) as never,
+			setInterval: callback => {
+				tick = callback;
+				return 1 as unknown as Timer;
+			},
+			clearInterval: () => {},
+		});
+		for (let attempt = 0; attempt < 100 && !tick; attempt++) await Bun.sleep(1);
+		expect(tick).toBeDefined();
+		tick!();
+		await Bun.sleep(0);
+		now = Number.MAX_SAFE_INTEGER;
+		tick!();
+		await run;
+		expect(stopReason).toBe("stop");
 	});
 
 	test("runDaemonInternal exits before constructing daemon for blank Telegram credentials with another adapter configured", async () => {
@@ -4341,6 +4505,82 @@ test("inbound photo is downloaded and forwarded as an image in the user_message"
 	expect(Buffer.from(frame.images[0].data, "base64")).toEqual(Buffer.from([1, 2, 3, 4]));
 	// The largest photo size is the one resolved/downloaded.
 	expect(bot.calls.some(c => c.method === "getFile" && c.body.file_id === "large")).toBe(true);
+});
+
+test("redacts token-shaped download URLs from attachment failure logs", async () => {
+	const botToken = "123456789:ABCDEF_ghijklmnopqrstuvwxyz012345";
+	let downloadedUrl = "";
+	const fetchImpl = (async (url: string | URL | Request) => {
+		downloadedUrl = String(url);
+		throw new Error(`fetch failed: ${downloadedUrl}`);
+	}) as unknown as typeof fetch;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken,
+		chatId: "42",
+		fetchImpl,
+	});
+	const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+	try {
+		await expect(
+			(
+				daemon as unknown as { downloadTelegramFile(filePath: string): Promise<Buffer | undefined> }
+			).downloadTelegramFile("photos/file.jpg"),
+		).resolves.toBeUndefined();
+
+		const logged = JSON.stringify([...warnSpy.mock.calls, ...errorSpy.mock.calls]);
+		expect(downloadedUrl).toBe(`https://api.telegram.org/file/bot${botToken}/photos/file.jpg`);
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+		expect(errorSpy).not.toHaveBeenCalled();
+		expect(logged).toContain("<redacted>");
+		expect(logged).not.toContain(botToken);
+		expect(logged).not.toMatch(/\d{6,}:[A-Za-z0-9_-]{20,}/);
+	} finally {
+		warnSpy.mockRestore();
+		errorSpy.mockRestore();
+	}
+});
+
+test("redacts token-shaped URLs from getUpdates poll failure logs", async () => {
+	const botToken = "123456789:ABCDEF_ghijklmnopqrstuvwxyz012345";
+	const botApi: BotApi = {
+		async call(method: string): Promise<unknown> {
+			if (method === "getUpdates") {
+				throw new Error(`fetch failed: https://api.telegram.org/bot${botToken}/getUpdates`);
+			}
+			return { ok: true, result: [] };
+		},
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken,
+		chatId: "42",
+		botApi,
+		setTimeoutImpl: ((callback: () => void) => {
+			callback();
+			return 0;
+		}) as unknown as typeof setTimeout,
+	});
+	const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+	try {
+		await expect(daemon.pollOnce()).resolves.toBe(0);
+
+		const logged = JSON.stringify([...warnSpy.mock.calls, ...errorSpy.mock.calls]);
+		expect(warnSpy).not.toHaveBeenCalled();
+		expect(errorSpy).toHaveBeenCalledTimes(1);
+		expect(logged).toContain("<redacted>");
+		expect(logged).not.toContain(botToken);
+		expect(logged).not.toMatch(/\d{6,}:[A-Za-z0-9_-]{20,}/);
+	} finally {
+		warnSpy.mockRestore();
+		errorSpy.mockRestore();
+	}
 });
 
 test("inbound document is saved to a tmp file and its path injected into the text", async () => {
