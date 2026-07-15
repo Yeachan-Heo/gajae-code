@@ -1,7 +1,11 @@
 import * as fs from "node:fs/promises";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { resolveGjcSessionForRead, SessionResolutionError } from "./session-resolution";
-import { validateDeferredMemberReceiptFresh, validateReceiptFreshBase } from "./ultragoal-receipt-freshness";
+import {
+	validateDeferredMemberReceiptFresh,
+	validateReceiptFreshBase,
+	validateSupersededFinalAggregateReceipt,
+} from "./ultragoal-receipt-freshness";
 import {
 	getUltragoalPaths,
 	getUltragoalRunCompletionState,
@@ -156,8 +160,33 @@ function requiredGoals(plan: UltragoalPlan): UltragoalGoal[] {
 	return plan.goals.filter(goal => goal.status !== "superseded");
 }
 
+/**
+ * Select the goal whose final-aggregate receipt should represent the run.
+ * Prefer a receipt that still validates fresh; several goals can hold
+ * final-aggregate receipts once plan growth (e.g. `steer add_subgoal`) stales
+ * an earlier one and a later checkpoint re-mints. Fall back to the newest
+ * holder (array-last) purely for diagnostics when none validates.
+ */
+function findFinalAggregateReceiptGoal(
+	plan: UltragoalPlan,
+	ledger: readonly UltragoalLedgerEvent[],
+): UltragoalGoal | null {
+	const candidates = [...requiredGoals(plan)]
+		.reverse()
+		.filter(goal => goal.completionVerification?.receiptKind === "final-aggregate");
+	if (candidates.length === 0) return null;
+	return (
+		candidates.find(
+			goal =>
+				validateCompletionReceipt({ plan, ledger, goal, receiptKind: "final-aggregate" }).state ===
+				"active_verified_complete",
+		) ?? candidates[0]!
+	);
+}
+
 function findReceiptGoal(
 	plan: UltragoalPlan,
+	ledger: readonly UltragoalLedgerEvent[],
 	currentObjective: string,
 ): { goal: UltragoalGoal; receiptKind: UltragoalReceiptKind } | null {
 	if (
@@ -165,9 +194,7 @@ function findReceiptGoal(
 		currentObjective === DEFAULT_ULTRAGOAL_OBJECTIVE ||
 		plan.gjcObjectiveAliases?.some(alias => alias === currentObjective)
 	) {
-		const finalGoal = [...requiredGoals(plan)]
-			.reverse()
-			.find(goal => goal.completionVerification?.receiptKind === "final-aggregate");
+		const finalGoal = findFinalAggregateReceiptGoal(plan, ledger);
 		return finalGoal ? { goal: finalGoal, receiptKind: "final-aggregate" } : null;
 	}
 	const storyGoal = plan.goals.find(goal => goal.objective === currentObjective);
@@ -300,6 +327,28 @@ export function validateCompletionReceipt(input: {
 					goalId: input.goal.id,
 				};
 			}
+			if (
+				priorGoal.completionVerification.validationBatch?.role !== "deferred-member" &&
+				priorGoal.completionVerification.receiptKind === "final-aggregate"
+			) {
+				// A prior goal may hold the run's previous final-aggregate receipt
+				// when plan growth staled it and a later checkpoint re-minted the
+				// aggregate receipt. Accept it as historical evidence for its own
+				// goal instead of demanding an impossible per-goal receipt.
+				const supersededDiagnostic = validateSupersededFinalAggregateReceipt({
+					ledger: input.ledger,
+					goal: priorGoal,
+					receipt: priorGoal.completionVerification,
+				});
+				if (supersededDiagnostic) {
+					return {
+						state: supersededDiagnostic.state,
+						message: `Ultragoal final receipt requires valid historical evidence for ${priorGoal.id}: ${supersededDiagnostic.message}`,
+						goalId: input.goal.id,
+					};
+				}
+				continue;
+			}
 			const priorDiagnostic =
 				priorGoal.completionVerification.validationBatch?.role === "deferred-member"
 					? validateDeferredMemberReceiptFresh({
@@ -381,7 +430,7 @@ export async function readUltragoalVerificationState(input: {
 			message: "Ultragoal has blocked or failed goals; record blockers or rerun verification.",
 		};
 	}
-	const receiptTarget = findReceiptGoal(plan, currentObjective);
+	const receiptTarget = findReceiptGoal(plan, ledger, currentObjective);
 	if (!receiptTarget) {
 		// When earlier required goals are already complete but later ones remain, name the
 		// specific blocking goals (a final-aggregate receipt cannot exist yet anyway). Only
@@ -623,9 +672,7 @@ export async function isUltragoalAskBlocked(
 		});
 	}
 
-	const finalReceiptGoal = [...requiredGoals(plan)]
-		.reverse()
-		.find(goal => goal.completionVerification?.receiptKind === "final-aggregate");
+	const finalReceiptGoal = findFinalAggregateReceiptGoal(plan, ledger);
 	if (!finalReceiptGoal) {
 		return activeAskDiagnostic({
 			reason: "Ultragoal aggregate completion is missing a final aggregate receipt.",
