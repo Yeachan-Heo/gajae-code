@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { evaluateSuiteGate, renderReport } from "../../src/tools/browser/benchmark/detector-report";
-import { runOfflineSuite } from "../../src/tools/browser/benchmark/run-suite";
+import { runOfflineSuite, type SuitePage } from "../../src/tools/browser/benchmark/run-suite";
 import { applyStealthPatches, launchHeadlessBrowser } from "../../src/tools/browser/launch";
 
 const FIXTURE = path.join(import.meta.dir, "..", "fixtures", "stealth-detectors", "sannysoft-probe.html");
@@ -40,7 +40,9 @@ describe("offline stealth benchmark (integration)", () => {
 				override: null,
 			});
 
-			const results = await runOfflineSuite(page, [{ url: FIXTURE_URL }]);
+			// runOfflineSuite is decoupled from puppeteer's concrete Page type for unit
+			// testability; adapt the real Page to the minimal SuitePage surface here.
+			const results = await runOfflineSuite(page as unknown as SuitePage, [{ url: FIXTURE_URL }]);
 			expect(results.length).toBe(1);
 			const detector = results[0]!;
 			expect(detector.detector).toBe("sannysoft-offline");
