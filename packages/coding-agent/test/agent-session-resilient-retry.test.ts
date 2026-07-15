@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { Agent } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import { type AssistantMessage, getBundledModel, type Model, type ToolCall } from "@gajae-code/ai";
+import { createMockModel, type MockResponse } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -12,6 +12,7 @@ import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/s
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import * as z from "zod/v4";
 
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
@@ -56,9 +57,10 @@ describe("AgentSession resilient retry", () => {
 	});
 
 	function buildSession(options: {
-		responses: Array<{ throw: string } | { content: string[] }>;
+		responses: MockResponse[];
 		settingsOverrides?: Record<string, unknown>;
 		requestedModels?: string[];
+		tools?: AgentTool[];
 	}): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
@@ -66,7 +68,7 @@ describe("AgentSession resilient retry", () => {
 		const requestedModels = options.requestedModels ?? [];
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model, systemPrompt: ["Test"], tools: options.tools ?? [], messages: [] },
 			streamFn: (requestedModel, context, opts) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				return mock.stream(requestedModel, context, opts);
@@ -658,6 +660,87 @@ describe("AgentSession resilient retry", () => {
 		});
 		expect(session.getGoalModeState()?.enabled).toBe(false);
 		expect(notices.filter(message => message.includes("Goal paused after provider failure"))).toHaveLength(1);
+		expect(session.isRetrying).toBe(false);
+	});
+
+	it("keeps goal retry ownership through tool-call recovery until a later terminal error", async () => {
+		const terminalAfterToolTool: AgentTool = {
+			name: "terminal_after_tool",
+			label: "Terminal After Tool",
+			description: "Completes before the follow-up provider call fails.",
+			parameters: z.object({}),
+			execute: async () => ({ content: [{ type: "text" as const, text: "tool completed" }] }),
+		};
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call_terminal_after_tool",
+			name: "terminal_after_tool",
+			arguments: {},
+		};
+		session = buildSession({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error" },
+				{ content: [toolCall] },
+				{ throw: "401 unauthorized: invalid api key" },
+			],
+			tools: [terminalAfterToolTool],
+		});
+		session.setGoalModeState(activeGoalState());
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.promptCustomMessage({
+			customType: "goal-continuation",
+			content: "continue the active goal through a tool",
+			display: false,
+		});
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: false, goal_finalized: true });
+		expect(retryEndEvents[0].goal_generation_id).toBeTypeOf("string");
+		expect(session.getGoalModeState()?.goal).toMatchObject({
+			status: "paused",
+			last_error: {
+				source: "goal-continuation",
+				class: "config",
+				message: "401 unauthorized: invalid api key",
+				pause_cause: "provider_final_error",
+				retry_attempt: 1,
+				generation_id: retryEndEvents[0].goal_generation_id,
+			},
+		});
+		expect(session.getGoalModeState()?.enabled).toBe(false);
+		expect(session.isRetrying).toBe(false);
+	});
+
+	it("ends retry lifecycle before context-overflow compaction recovery", async () => {
+		session = buildSession({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error" },
+				{ throw: "prompt is too long: 213462 tokens > 200000 maximum" },
+				{ content: ["recovered after overflow maintenance"] },
+			],
+			settingsOverrides: {
+				"compaction.enabled": true,
+				"compaction.strategy": "context-full",
+				"contextPromotion.enabled": false,
+			},
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("transient then context overflow");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({
+			success: false,
+			attempt: 1,
+			finalError: "prompt is too long: 213462 tokens > 200000 maximum",
+		});
 		expect(session.isRetrying).toBe(false);
 	});
 
