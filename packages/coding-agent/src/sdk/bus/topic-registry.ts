@@ -21,6 +21,8 @@ export interface TopicRecord {
 	identitySent: boolean;
 	/** Creation timestamp (ms epoch). */
 	createdAt: number;
+	/** First positive observation that the owning endpoint is stale, dead, or missing. */
+	orphanedAt?: number;
 	/** Last applied or observed Telegram topic title. */
 	name?: string;
 	/** Naming authority. Missing values are legacy daemon-owned records. */
@@ -87,6 +89,9 @@ export class TopicRegistry {
 				identitySent: raw.identitySent === true,
 				createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
 				...(typeof raw.name === "string" ? { name: raw.name } : {}),
+				...(typeof raw.orphanedAt === "number" && Number.isFinite(raw.orphanedAt) && raw.orphanedAt >= 0
+					? { orphanedAt: raw.orphanedAt }
+					: {}),
 				...(hasValidUserAuthority ? { nameOwner: "user" as const } : {}),
 				...(hasValidUserAuthority && raw.nameReconcilePending === true ? { nameReconcilePending: true } : {}),
 				...(hasValidUserAuthority ? { userNameUpdateId: raw.userNameUpdateId } : {}),
@@ -163,6 +168,21 @@ export class TopicRegistry {
 		const record = this.topics.get(sessionId);
 		if (!record || record.identityKey === identityKey) return false;
 		record.identityKey = identityKey;
+		return true;
+	}
+	/** Start the orphan grace clock on the first positive liveness-loss observation. */
+	markOrphaned(sessionId: string, now: number): boolean {
+		const record = this.topics.get(sessionId);
+		if (!record || record.orphanedAt !== undefined) return false;
+		record.orphanedAt = now;
+		return true;
+	}
+
+	/** Clear a prior orphan observation after the endpoint is positively live again. */
+	clearOrphaned(sessionId: string): boolean {
+		const record = this.topics.get(sessionId);
+		if (!record || record.orphanedAt === undefined) return false;
+		delete record.orphanedAt;
 		return true;
 	}
 

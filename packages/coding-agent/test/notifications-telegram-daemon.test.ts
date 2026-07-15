@@ -5676,6 +5676,15 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 		}),
 	);
 	const bot = new FakeBotApi();
+	const originalBotCall = bot.call.bind(bot);
+	bot.call = async (method: string, body: unknown): Promise<unknown> => {
+		if (method === "deleteForumTopic" && (body as { message_thread_id?: unknown }).message_thread_id === 101) {
+			bot.calls.push({ method, body });
+			return { ok: false, description: "Bad Request: TOPIC_ID_INVALID" };
+		}
+		return await originalBotCall(method, body);
+	};
+	let now = 120_000;
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
@@ -5684,9 +5693,19 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 		pidAlive: () => false,
-		now: () => 120_000,
+		now: () => now,
 	});
 	await daemon.loadTopics();
+	daemon.connectSession("stale", "ws://stale", "t");
+	daemon.connectSession("dead", "ws://dead", "t");
+	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	expect(daemon.sessions.size).toBe(0);
+	let persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics.stale.orphanedAt).toBe(120_000);
+	expect(persisted.topics.dead.orphanedAt).toBe(120_000);
+
+	now += 60_000;
 	await daemon.scanRoots();
 	expect(
 		bot.calls
@@ -5694,7 +5713,8 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 			.map(c => c.body.message_thread_id)
 			.sort(),
 	).toEqual([101, 102]);
-	expect(daemon.sessions.size).toBe(0);
+	persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics).toEqual({});
 });
 
 test("scanRoots reaps missing endpoint topics only when all roots are readable and grace has elapsed", async () => {
@@ -5709,17 +5729,26 @@ test("scanRoots reaps missing endpoint topics only when all roots are readable a
 		JSON.stringify({ topics: { missing: { topicId: "201", identitySent: true, createdAt: 0, name: "missing" } } }),
 	);
 	const bot = new FakeBotApi();
+	let now = 120_000;
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot,
-		now: () => 120_000,
+		now: () => now,
 	});
 	await daemon.loadTopics();
 	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	let persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics.missing.orphanedAt).toBe(120_000);
+
+	now += 60_000;
+	await daemon.scanRoots();
 	expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([201]);
+	persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics).toEqual({});
 
 	const blockedAgentDir = tempAgentDir();
 	const blockedSettings = setPrivateAgentDir(settings(blockedAgentDir), blockedAgentDir);

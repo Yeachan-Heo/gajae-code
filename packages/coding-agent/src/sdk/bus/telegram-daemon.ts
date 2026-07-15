@@ -238,6 +238,13 @@ function endpointGenerationKey(url: string, token: string): string {
 function topicRenameApplied(response: unknown): boolean {
 	return !!response && typeof response === "object" && (response as { ok?: unknown }).ok === true;
 }
+function topicDeleteSettled(response: unknown): boolean {
+	if (!response || typeof response !== "object") return false;
+	const result = response as { ok?: unknown; description?: unknown };
+	if (result.ok === true) return true;
+	if (typeof result.description !== "string") return false;
+	return /(?:TOPIC_ID_INVALID|message thread not found)/i.test(result.description);
+}
 
 /**
  * Whether `err` is a transient network failure worth retrying. Telegram API
@@ -1980,19 +1987,21 @@ export class TelegramNotificationDaemon {
 			for (const file of files.filter(item => item.endsWith(".json"))) {
 				const sessionId = path.basename(file, ".json");
 				endpointSessionIds.add(sessionId);
-				if (this.sessions.has(sessionId)) continue;
 				try {
 					const endpoint = readEndpoint(path.join(dir, file));
-					// Skip endpoint files whose owning process is gone or that are
-					// explicitly stale (e.g. a hard-closed session): reconnecting
-					// would chase a dead, token-bearing record forever. Once the
-					// associated topic is past the grace window, reap it through the
-					// same best-effort delete path as graceful session shutdown.
+					// Validate endpoint ownership even for an already-connected socket.
+					// A hard-killed owner can leave both its endpoint file and socket map
+					// entry behind; skipping the read in that case permanently preserves
+					// the stale Telegram topic.
 					const pidAlive = this.opts.pidAlive ?? defaultPidAlive;
 					if (endpoint.stale || (endpoint.pid !== undefined && !pidAlive(endpoint.pid))) {
-						await this.deleteOrphanedTopic(sessionId);
+						const connected = this.sessions.get(sessionId);
+						if (connected) this.dropSession(connected, "endpoint_owner_dead");
+						await this.observeOrphanedTopic(sessionId);
 						continue;
 					}
+					if (this.topics.clearOrphaned(sessionId)) await this.persistTopics();
+					if (this.sessions.has(sessionId)) continue;
 					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
 					if (this.closedEndpointKeys.get(sessionId) === endpointKey) continue;
 					this.closedEndpointKeys.delete(sessionId);
@@ -2003,7 +2012,7 @@ export class TelegramNotificationDaemon {
 		if (allRootsReadable) {
 			for (const sessionId of this.topics.sessionIds()) {
 				if (!this.sessions.has(sessionId) && !endpointSessionIds.has(sessionId))
-					await this.deleteOrphanedTopic(sessionId);
+					await this.observeOrphanedTopic(sessionId);
 			}
 		}
 	}
@@ -2395,11 +2404,12 @@ export class TelegramNotificationDaemon {
 	}
 
 	private topicPastOrphanGrace(sessionId: string): boolean {
-		const record = this.topics.get(sessionId);
-		return record !== undefined && this.runtime.now() - record.createdAt >= ORPHAN_TOPIC_GRACE_MS;
+		const orphanedAt = this.topics.get(sessionId)?.orphanedAt;
+		return orphanedAt !== undefined && this.runtime.now() - orphanedAt >= ORPHAN_TOPIC_GRACE_MS;
 	}
 
-	private async deleteOrphanedTopic(sessionId: string): Promise<void> {
+	private async observeOrphanedTopic(sessionId: string): Promise<void> {
+		if (this.topics.markOrphaned(sessionId, this.runtime.now())) await this.persistTopics();
 		if (!this.topicPastOrphanGrace(sessionId)) return;
 		await this.deleteTopic(sessionId);
 	}
@@ -2421,7 +2431,7 @@ export class TelegramNotificationDaemon {
 				chat_id: this.opts.chatId,
 				message_thread_id: Number(record.topicId),
 			})) as { ok?: boolean };
-			if (res?.ok === false) return;
+			if (!topicDeleteSettled(res)) return;
 			this.topics.delete(sessionId);
 			for (const k of [...this.liveMessages.keys()]) {
 				if (k.startsWith(`${sessionId}:`)) this.liveMessages.delete(k);
