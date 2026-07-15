@@ -134,7 +134,7 @@ pub struct InboundEvent {
 	pub verbosity:    Option<String>,
 	/// Requested redaction state (`config_command` only).
 	pub redact:       Option<bool>,
-	/// Client-generated request id (`control_command` only).
+	/// Client-generated request id (`ephemeral_turn` or `control_command` only).
 	pub request_id:   Option<String>,
 	/// JSON-encoded command payload (`control_command` only).
 	pub command_json: Option<String>,
@@ -318,7 +318,7 @@ impl NotificationServer {
 							thread_id:    turn.thread_id,
 							verbosity:    None,
 							redact:       None,
-							request_id:   None,
+							request_id:   Some(turn.request_id),
 							command_json: None,
 							images:       None,
 						},
@@ -507,8 +507,8 @@ impl NotificationServer {
 
 	/// Broadcast an ephemeral threaded-session frame. `frame_json` is a JSON
 	/// `ServerMessage` (e.g. `identity_header`, `context_update`, `turn_stream`,
-	/// `image_attachment`, `session_closed`, `config_update`, `hello`). Not
-	/// buffered for replay.
+	/// `ephemeral_turn_result`, `image_attachment`, `session_closed`, `config_update`,
+	/// `hello`). Not buffered for replay.
 	///
 	/// # Errors
 	/// Fails if not started or `frame_json` is not a valid `ServerMessage`.

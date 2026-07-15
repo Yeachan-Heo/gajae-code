@@ -19,6 +19,7 @@ import {
 	daemonPaths,
 	ensureTelegramDaemonRunning,
 	ensureTelegramDaemonRunningDetailed,
+	readDaemonState,
 	registerNotificationRoot,
 	releaseDaemonOwnership,
 	renewDaemonHeartbeat,
@@ -2575,28 +2576,53 @@ describe("telegram daemon", () => {
 		});
 
 		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
-		expect(sent).toContainEqual({
-			type: "ephemeral_turn",
-			sessionId: "S",
-			question: "what changed?",
-			token: "ts",
-			updateId: 8,
-			threadId: String(threadId),
-		});
+		expect(sent).toContainEqual(
+			expect.objectContaining({
+				type: "ephemeral_turn",
+				sessionId: "S",
+				question: "what changed?",
+				token: "ts",
+				updateId: 8,
+				threadId: String(threadId),
+				requestId: expect.stringMatching(/^btw:/),
+			}),
+		);
 		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
 
+		const requestId = sent.find(frame => frame.type === "ephemeral_turn")!.requestId;
+		const replyCountBefore = bot.calls.filter(call => call.method === "sendMessage").length;
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "ephemeral_turn_result",
 			sessionId: "S",
+			requestId: "btw:stale",
 			threadId: String(threadId),
-			text: "The parser changed.",
+			updateId: 8,
+			text: "Stale answer",
 		});
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(replyCountBefore);
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "ephemeral_turn_result",
+			sessionId: "S",
+			requestId,
+			threadId: String(threadId),
+			updateId: 8,
+			text: "The <parser> changed.",
+		});
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "ephemeral_turn_result",
+			sessionId: "S",
+			requestId,
+			threadId: String(threadId),
+			updateId: 8,
+			text: "Duplicate answer",
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(replyCountBefore + 1);
 		expect(bot.calls).toContainEqual(
 			expect.objectContaining({
 				method: "sendMessage",
 				body: expect.objectContaining({
 					message_thread_id: threadId,
-					text: "The parser changed.",
+					text: "The &lt;parser&gt; changed.",
 				}),
 			}),
 		);
@@ -3010,6 +3036,71 @@ describe("telegram daemon", () => {
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
 	});
 
+	test("ownership heartbeat remains fresh during a pending long poll and is cleaned up on exit", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		let now = 0;
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: process.pid,
+			now: () => now,
+			randomId: () => "owner",
+		});
+
+		const timers = new Map<number, { ms: number; callback: () => void }>();
+		let nextTimerId = 1;
+		let pollStarted!: () => void;
+		const pollStartedPromise = new Promise<void>(resolve => {
+			pollStarted = resolve;
+		});
+		let releasePoll!: () => void;
+		const pollGate = new Promise<void>(resolve => {
+			releasePoll = resolve;
+		});
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			now: () => now,
+			idleTimeoutMs: 60_000,
+			createLifecycleControlServer: null,
+			botApi: {
+				async call(method: string): Promise<unknown> {
+					if (method === "getUpdates") {
+						pollStarted();
+						await pollGate;
+					}
+					return { ok: true, result: [] };
+				},
+			},
+			setIntervalImpl: ((callback: () => void, ms: number) => {
+				const id = nextTimerId++;
+				timers.set(id, { ms, callback });
+				return id as unknown as ReturnType<typeof setInterval>;
+			}) as typeof setInterval,
+			clearIntervalImpl: ((id: number) => {
+				timers.delete(id);
+			}) as unknown as typeof clearInterval,
+		});
+
+		const runPromise = daemon.run();
+		await pollStartedPromise;
+		now = 10_000;
+		[...timers.values()].find(timer => timer.ms === 5_000)?.callback();
+		for (let attempts = 0; attempts < 20; attempts++) {
+			if ((await readDaemonState(s))?.heartbeatAt === now) break;
+			await Bun.sleep(5);
+		}
+		expect((await readDaemonState(s))?.heartbeatAt).toBe(now);
+
+		daemon.requestStop();
+		releasePoll();
+		await runPromise;
+		expect(timers.size).toBe(0);
+	});
 	test("scan timer connects new sessions while a getUpdates long-poll is in flight", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();

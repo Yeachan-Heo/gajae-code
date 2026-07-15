@@ -21,6 +21,7 @@ import {
 	buildButtonGrid,
 	buildCompactChoiceGrid,
 	code,
+	escapeHtml,
 	splitTelegramHtml,
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
@@ -177,6 +178,8 @@ const ORPHAN_TOPIC_GRACE_MS = 60_000;
 const CONSUMED_REACTION = "✅";
 const MODEL_CALLBACK_PREFIX = "m:";
 const MODEL_CHOICE_TTL_MS = 10 * 60 * 1_000;
+const BTW_PENDING_TTL_MS = 2 * 60 * 1_000;
+const BTW_MAX_PENDING_PER_SESSION = 2;
 function parseBtwQuestion(text: string, botUsername?: string): string | undefined {
 	const trimmed = text.trim();
 	const [rawCommand] = trimmed.split(/\s+/, 1);
@@ -1241,6 +1244,13 @@ interface TelegramQueuePayload {
 	selectedAck?: SelectedAckQueueItem;
 }
 
+interface PendingBtwTurn {
+	sessionId: string;
+	threadId: string;
+	updateId: number;
+	expiresAt: number;
+}
+
 export class TelegramNotificationDaemon {
 	readonly aliasTable: AliasTable;
 	readonly messageRoutes = new Map<string | number, CallbackRoute | Omit<CallbackRoute, "answer">>();
@@ -1263,6 +1273,7 @@ export class TelegramNotificationDaemon {
 	/** Daemon edit attempts that can race an accepted user service message. */
 	private readonly daemonRenameAttempts = new Map<string, number>();
 	private readonly selectedAckPending = new Map<string, SelectedAckQueueItem>();
+	private readonly pendingBtwTurns = new Map<string, PendingBtwTurn>();
 	private readonly pool: RateLimitPool<TelegramQueuePayload>;
 	private readonly poller: TelegramUpdatePoller;
 	private readonly dispatchState = new TelegramEventDispatchState();
@@ -2932,6 +2943,36 @@ export class TelegramNotificationDaemon {
 	private stopFlushTimer(): void {
 		this.runtime.stopInterval("telegram-flush");
 	}
+	private async renewOwnershipHeartbeat(): Promise<boolean> {
+		return renewDaemonHeartbeat({
+			settings: this.opts.settings,
+			ownerId: this.opts.ownerId,
+			fs: this.fsImpl,
+			now: this.opts.now,
+			pid: this.opts.pid ?? process.pid,
+		});
+	}
+
+	/**
+	 * Ownership must be renewed independently of Telegram's 25-second long poll:
+	 * the ownership TTL is shorter than a single poll request.
+	 */
+	private startOwnershipHeartbeatTimer(): void {
+		this.runtime.startInterval("telegram-owner-heartbeat", HEARTBEAT_INTERVAL_MS, () => {
+			if (!this.running) return;
+			void this.runtime
+				.runExclusive("telegram-owner-heartbeat", async () => {
+					if (!(await this.renewOwnershipHeartbeat())) this.runtime.requestStop();
+				})
+				.catch(err => {
+					logger.warn(`notifications: ownership heartbeat failed: ${sanitizeDiagnostic(String(err))}`);
+				});
+		});
+	}
+
+	private stopOwnershipHeartbeatTimer(): void {
+		this.runtime.stopInterval("telegram-owner-heartbeat");
+	}
 
 	/** Run a root scan, guarding against overlapping scans from the timer + loop. */
 	private async runScan(): Promise<void> {
@@ -3115,23 +3156,36 @@ export class TelegramNotificationDaemon {
 		if (await this.#renderModelChoices(session, msg as Record<string, unknown>)) return;
 
 		if (msg?.type === "ephemeral_turn_result") {
+			const requestId = typeof msg.requestId === "string" ? msg.requestId : undefined;
+			if (!requestId) return;
+			const pending = this.pendingBtwTurns.get(requestId);
+			if (!pending || pending.expiresAt <= (this.opts.now?.() ?? Date.now())) {
+				this.pendingBtwTurns.delete(requestId);
+				return;
+			}
 			const logicalSessionId = this.#logicalSessionId(session);
 			if (
-				typeof msg.sessionId !== "string" ||
 				msg.sessionId !== logicalSessionId ||
-				typeof msg.threadId !== "string" ||
-				!Number.isSafeInteger(Number(msg.threadId)) ||
-				this.topics.sessionForTopic(msg.threadId) !== logicalSessionId ||
-				typeof msg.text !== "string"
+				pending.sessionId !== logicalSessionId ||
+				msg.threadId !== pending.threadId ||
+				msg.updateId !== pending.updateId ||
+				typeof msg.text !== "string" ||
+				this.topics.sessionForTopic(pending.threadId) !== logicalSessionId
 			)
 				return;
+			// Consume before delivery so duplicate frames cannot produce duplicate replies.
+			this.pendingBtwTurns.delete(requestId);
 			try {
-				await this.botApi.call("sendMessage", {
-					chat_id: this.opts.chatId,
-					message_thread_id: Number(msg.threadId),
-					text: msg.text,
-					parse_mode: TELEGRAM_PARSE_MODE,
-				});
+				for (const text of splitTelegramHtml(escapeHtml(msg.text))) {
+					const response = await this.botApi.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						message_thread_id: Number(pending.threadId),
+						text,
+						parse_mode: TELEGRAM_PARSE_MODE,
+					});
+					if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true)
+						throw new Error("Telegram rejected /btw reply");
+				}
 			} catch {
 				logger.warn("notifications: /btw reply delivery failed");
 			}
@@ -3647,25 +3701,56 @@ export class TelegramNotificationDaemon {
 						: baseInjectedText;
 					const btwQuestion = hasMedia ? undefined : parseBtwQuestion(inbound.text, this.botUsername);
 					if (btwQuestion !== undefined) {
-						await this.rememberSeenUpdateId(inbound.updateId);
 						if (!btwQuestion) {
 							await this.botApi.call("sendMessage", {
 								chat_id: this.opts.chatId,
 								message_thread_id: Number(inbound.threadId),
 								text: "Usage: /btw <question>",
 							});
+							await this.rememberSeenUpdateId(inbound.updateId);
 							return;
 						}
-						session.ws.send(
-							JSON.stringify({
-								type: "ephemeral_turn",
-								sessionId: inbound.sessionId,
-								question: btwQuestion,
-								token: session.token,
-								updateId: inbound.updateId,
-								threadId: inbound.threadId,
-							}),
-						);
+						for (const [id, pending] of this.pendingBtwTurns) {
+							if (pending.expiresAt <= (this.opts.now?.() ?? Date.now())) this.pendingBtwTurns.delete(id);
+						}
+						const logicalSessionId = this.#logicalSessionId(session);
+						const pendingCount = [...this.pendingBtwTurns.values()].filter(
+							pending => pending.sessionId === logicalSessionId,
+						).length;
+						if (pendingCount >= BTW_MAX_PENDING_PER_SESSION) {
+							await this.botApi.call("sendMessage", {
+								chat_id: this.opts.chatId,
+								message_thread_id: Number(inbound.threadId),
+								text: "Too many /btw questions are in progress. Please wait for a reply.",
+							});
+							await this.rememberSeenUpdateId(inbound.updateId);
+							return;
+						}
+						if (session.ws.readyState !== WebSocket.OPEN) return;
+						const requestId = `btw:${crypto.randomUUID()}`;
+						this.pendingBtwTurns.set(requestId, {
+							sessionId: logicalSessionId,
+							threadId: inbound.threadId,
+							updateId: inbound.updateId,
+							expiresAt: (this.opts.now?.() ?? Date.now()) + BTW_PENDING_TTL_MS,
+						});
+						try {
+							session.ws.send(
+								JSON.stringify({
+									type: "ephemeral_turn",
+									sessionId: logicalSessionId,
+									question: btwQuestion,
+									token: session.token,
+									requestId,
+									updateId: inbound.updateId,
+									threadId: inbound.threadId,
+								}),
+							);
+						} catch {
+							this.pendingBtwTurns.delete(requestId);
+							return;
+						}
+						await this.rememberSeenUpdateId(inbound.updateId);
 						return;
 					}
 					const control = hasMedia ? { kind: "none" as const } : preliminaryControl;
@@ -3812,6 +3897,7 @@ export class TelegramNotificationDaemon {
 		});
 		if (!this.running) return;
 		this.runtime.start();
+		this.startOwnershipHeartbeatTimer();
 		this.startFlushTimer();
 		this.startScanTimer();
 		this.startTypingTimer();
@@ -3829,16 +3915,7 @@ export class TelegramNotificationDaemon {
 			let idleSince = this.runtime.now();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
-				if (
-					!(await renewDaemonHeartbeat({
-						settings: this.opts.settings,
-						ownerId: this.opts.ownerId,
-						fs: this.fsImpl,
-						now: this.opts.now,
-						pid: this.opts.pid ?? process.pid,
-					}))
-				)
-					break;
+				if (!(await this.renewOwnershipHeartbeat())) break;
 				await this.runScan();
 				if (await this.controlStopRequested()) break;
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
@@ -3874,6 +3951,7 @@ export class TelegramNotificationDaemon {
 			}
 		} finally {
 			this.runtime.stop();
+			this.stopOwnershipHeartbeatTimer();
 			this.stopFlushTimer();
 			this.stopScanTimer();
 			this.stopTypingTimer();

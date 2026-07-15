@@ -2114,7 +2114,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn push_frame_broadcasts_threaded_frames_and_preserves_ask() {
-		use crate::protocol::{IdentityHeader, TurnPhase, TurnStream};
+		use crate::protocol::{EphemeralTurnResult, IdentityHeader, TurnPhase, TurnStream};
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut ws = connect(&handle, "secret").await;
 		next_server_hello(&mut ws).await;
@@ -2149,6 +2149,22 @@ mod tests {
 				assert_eq!(t.text, "done");
 			},
 			other => panic!("expected turn_stream, got {other:?}"),
+		}
+		handle
+			.push_frame(ServerMessage::EphemeralTurnResult(EphemeralTurnResult {
+				session_id: "s".into(),
+				request_id: "btw-1".into(),
+				thread_id: "42".into(),
+				update_id: Some(7),
+				text: "side answer".into(),
+			}))
+			.unwrap();
+		match next_server_msg(&mut ws).await {
+			ServerMessage::EphemeralTurnResult(result) => {
+				assert_eq!(result.request_id, "btw-1");
+				assert_eq!(result.update_id, Some(7));
+			},
+			other => panic!("expected ephemeral_turn_result, got {other:?}"),
 		}
 
 		// Asks share the connection-local reevaluation path alongside streaming frames.

@@ -3271,7 +3271,8 @@ export function createNotificationsExtension(
 				if (inbound.kind === "ephemeral_turn") {
 					const question = inbound.text?.trim() ?? "";
 					const threadId = inbound.threadId;
-					if (!runtime || !question || !threadId) return;
+					const requestId = inbound.requestId;
+					if (!runtime || !question || !threadId || !requestId) return;
 					void (async () => {
 						try {
 							const result = ctx.runEphemeralTurn
@@ -3281,6 +3282,7 @@ export function createNotificationsExtension(
 								JSON.stringify({
 									type: "ephemeral_turn_result",
 									sessionId: runtime.id,
+									requestId,
 									threadId,
 									updateId: inbound.updateId,
 									text: result?.replyText ?? "Unable to answer /btw: session support is unavailable.",
@@ -3292,6 +3294,7 @@ export function createNotificationsExtension(
 								JSON.stringify({
 									type: "ephemeral_turn_result",
 									sessionId: runtime.id,
+									requestId,
 									threadId,
 									updateId: inbound.updateId,
 									text: "Unable to answer /btw.",

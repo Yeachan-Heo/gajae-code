@@ -4,7 +4,7 @@
  */
 
 /** Protocol version the daemon advertises in its ClientHello. */
-export const NOTIFICATION_PROTOCOL_VERSION = 3;
+export const NOTIFICATION_PROTOCOL_VERSION = 4;
 
 /**
  * Operational generation the current daemon build speaks. It is tied to the
