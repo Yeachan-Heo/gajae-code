@@ -2628,7 +2628,7 @@ describe("telegram daemon", () => {
 		);
 	});
 
-	test("rejects an empty /btw question without injecting a user turn", async () => {
+	test("shows /btw help for an empty question without injecting a user turn", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -2663,7 +2663,12 @@ describe("telegram daemon", () => {
 		expect(bot.calls).toContainEqual(
 			expect.objectContaining({
 				method: "sendMessage",
-				body: expect.objectContaining({ message_thread_id: threadId, text: "Usage: /btw <question>" }),
+				body: expect.objectContaining({
+					message_thread_id: threadId,
+					text: expect.stringContaining(
+						"Asks a temporary side question about this GJC session without adding it to the main conversation.",
+					),
+				}),
 			}),
 		);
 	});

@@ -21,7 +21,7 @@ import {
 	buildButtonGrid,
 	buildCompactChoiceGrid,
 	code,
-	escapeHtml,
+	markdownToTelegramHtml,
 	splitTelegramHtml,
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
@@ -180,6 +180,14 @@ const MODEL_CALLBACK_PREFIX = "m:";
 const MODEL_CHOICE_TTL_MS = 10 * 60 * 1_000;
 const BTW_PENDING_TTL_MS = 2 * 60 * 1_000;
 const BTW_MAX_PENDING_PER_SESSION = 2;
+const BTW_HELP_TEXT = [
+	"Usage: /btw <question>",
+	"",
+	"Asks a temporary side question about this GJC session without adding it to the main conversation.",
+	"Example: /btw What files changed?",
+	"",
+	"Text only. Up to 2 questions can be in progress per session.",
+].join("\n");
 function parseBtwQuestion(text: string, botUsername?: string): string | undefined {
 	const trimmed = text.trim();
 	const [rawCommand] = trimmed.split(/\s+/, 1);
@@ -3186,15 +3194,44 @@ export class TelegramNotificationDaemon {
 			// Consume before delivery so duplicate frames cannot produce duplicate replies.
 			this.pendingBtwTurns.delete(requestId);
 			try {
-				for (const text of splitTelegramHtml(escapeHtml(msg.text))) {
-					const response = await this.botApi.call("sendMessage", {
-						chat_id: this.opts.chatId,
-						message_thread_id: Number(pending.threadId),
-						text,
-						parse_mode: TELEGRAM_PARSE_MODE,
-					});
-					if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true)
-						throw new Error("Telegram rejected /btw reply");
+				const markdown = msg.text;
+				const html = markdownToTelegramHtml(markdown);
+				const fallback = async (): Promise<void> => {
+					for (const text of splitTelegramHtml(html)) {
+						const response = await this.botApi.call("sendMessage", {
+							chat_id: this.opts.chatId,
+							message_thread_id: Number(pending.threadId),
+							text,
+							parse_mode: TELEGRAM_PARSE_MODE,
+						});
+						if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true)
+							throw new Error("Telegram rejected /btw reply");
+					}
+				};
+				if (this.opts.rich?.enabled !== false) {
+					const messageId = await deliverRichWithFallback(
+						this.botApi,
+						{ chat_id: this.opts.chatId, message_thread_id: Number(pending.threadId) },
+						{
+							method: "sendMessage",
+							lane: "finalized",
+							text: html,
+							editable: false,
+							richClass: "final",
+							richMarkdown: markdown,
+						},
+						fallback,
+						logger,
+					);
+					if (messageId !== undefined) {
+						await this.replyStore.record({
+							chatId: this.opts.chatId,
+							messageId,
+							text: markdown,
+						});
+					}
+				} else {
+					await fallback();
 				}
 			} catch {
 				logger.warn("notifications: /btw reply delivery failed");
@@ -3709,13 +3746,13 @@ export class TelegramNotificationDaemon {
 					const injectedText = repliedOriginal
 						? `> replied-to message:\n${repliedOriginal}\n\n${baseInjectedText}`
 						: baseInjectedText;
-					const btwQuestion = hasMedia ? undefined : parseBtwQuestion(inbound.text, this.botUsername);
+					const btwQuestion = parseBtwQuestion(inbound.text, this.botUsername);
 					if (btwQuestion !== undefined) {
-						if (!btwQuestion) {
+						if (!btwQuestion || hasMedia) {
 							await this.botApi.call("sendMessage", {
 								chat_id: this.opts.chatId,
 								message_thread_id: Number(inbound.threadId),
-								text: "Usage: /btw <question>",
+								text: hasMedia ? `${BTW_HELP_TEXT}\n\nAttachments are not supported by /btw.` : BTW_HELP_TEXT,
 							});
 							await this.rememberSeenUpdateId(inbound.updateId);
 							return;
@@ -3758,6 +3795,12 @@ export class TelegramNotificationDaemon {
 							);
 						} catch {
 							this.pendingBtwTurns.delete(requestId);
+							await this.botApi.call("sendMessage", {
+								chat_id: this.opts.chatId,
+								message_thread_id: Number(inbound.threadId),
+								text: "Unable to start /btw because this GJC session disconnected. Reopen the session and try again.",
+							});
+							await this.rememberSeenUpdateId(inbound.updateId);
 							return;
 						}
 						await this.rememberSeenUpdateId(inbound.updateId);
