@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Added a bounded, neutralize-only `invalid_prompt` circuit breaker to the agent loop (#2282). A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is a deterministic content fault: re-sending the same history re-triggers it, so uncontrolled session auto-retry would burn its budget re-poisoning the model. On the first `invalid_prompt` of a run, leaked reserved control tokens are neutralized in place across history (no item is ever dropped). If that changes the outgoing bytes, the turn is resent exactly once with the repaired history; if neutralization cannot change anything, the run fails fast immediately with no resend. The repaired history is persisted for a clean resume, the breaker fires at most once per run (budget = one repaired resend), and it is scoped to the non-managed session path since managed fallback owns its own retry policy.
+
 ## [0.10.2] - 2026-07-14
 
 ### Fixed

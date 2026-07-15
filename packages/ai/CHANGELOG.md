@@ -11,6 +11,8 @@
 
 - Closed the remaining `Request blocked (code=invalid_prompt)` wedge on gpt-5.6 caused by header-form leaked Harmony markers. The reserved-control-token sanitizer only matched the simple `<|ident|>` shape, so a header-form marker carrying a recipient (e.g. `<|assistant to=functions.bash|>`) survived every sanitizer path (replay, request boundary, compaction) and kept re-poisoning history even after the earlier fixes. The pattern now also matches the scoped header grammar — a known Harmony role (`system`/`developer`/`user`/`assistant`/`tool`) plus a `to=<recipient>` assignment with unbounded recipient length — while leaving ordinary delimiter/pipe text untouched (arbitrary `<|foo bar=baz|>`, F# `value <| f |> g`, compact `sum<|a+b|>c`, and multi-line bodies never match). The simple branch remains a strict superset of the prior identifier-only pattern (#2267).
 
+- Made the `Request blocked (code=invalid_prompt)` classification explicit and shared across transports (#2282). `invalid_prompt` was only non-retryable by omission — it appeared in neither the codex retryable nor non-retryable event set, and the plain OpenAI Responses transport surfaced it as a generic error with no durable marker. It is now in the codex `CODEX_NON_RETRYABLE_EVENT_CODES` set (code and message forms), the Responses error path tags `transportFailure.providerCode = "invalid_prompt"`, and a new exported `isInvalidPromptError` predicate is the single contract both transports and the session-level circuit breaker key on. Ordinary control-token / pipe text (F# `value <| f |> g`, `sum<|a+b|>c`, `<|foo bar=baz|>`) is unaffected; genuinely transient errors (`server_error`, `model_error`) stay retryable.
+
 ## [0.10.2] - 2026-07-14
 
 ### Fixed

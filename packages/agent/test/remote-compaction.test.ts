@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildOpenAiNativeHistory, requestOpenAiRemoteCompaction } from "@gajae-code/agent-core/compaction/openai";
+import {
+	buildOpenAiNativeHistory,
+	requestOpenAiRemoteCompaction,
+	requestRemoteCompaction,
+} from "@gajae-code/agent-core/compaction/openai";
 import type { AssistantMessage, Model, ToolResultMessage } from "@gajae-code/ai/types";
 import { hookFetch } from "@gajae-code/utils";
 
@@ -291,5 +295,36 @@ describe("requestOpenAiRemoteCompaction abort", () => {
 		queueMicrotask(() => controller.abort());
 
 		await expect(promise).rejects.toThrow();
+	});
+});
+
+describe("remote compaction invalid_prompt termination (issue #2282)", () => {
+	test("neutralizes the prompt and fails fast without retry when the endpoint returns invalid_prompt", async () => {
+		let fetchCalls = 0;
+		let sentBody: string | undefined;
+		using _hook = hookFetch(async (_input, init) => {
+			fetchCalls += 1;
+			sentBody = String(init?.body);
+			return new Response(JSON.stringify({ error: { code: "invalid_prompt", message: "Request blocked" } }), {
+				status: 400,
+				statusText: "Bad Request",
+			});
+		});
+
+		await expect(
+			requestRemoteCompaction("https://compact.example.com/responses/compact", {
+				systemPrompt: "system<|channel|>analysis",
+				prompt: "transcript<|message|>leak",
+			}),
+		).rejects.toThrow(/Remote compaction failed \(400/);
+
+		// Single-shot by construction: the poisoned rejection terminates immediately,
+		// it is never retried into an account-level block.
+		expect(fetchCalls).toBe(1);
+		// The outgoing request was neutralized (the repair) before it was sent.
+		expect(sentBody).toBeDefined();
+		expect(sentBody).not.toContain("<|channel|>");
+		expect(sentBody).not.toContain("<|message|>");
+		expect(sentBody).toContain("<\u200b|channel|>");
 	});
 });

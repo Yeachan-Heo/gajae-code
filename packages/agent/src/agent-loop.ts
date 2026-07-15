@@ -17,6 +17,7 @@ import {
 	validateToolArguments,
 	zodToWireSchema,
 } from "@gajae-code/ai";
+import { isInvalidPromptError, neutralizeReservedControlTokens } from "@gajae-code/ai/utils";
 import { sanitizeText } from "@gajae-code/utils";
 import {
 	createHarmonyAuditEvent,
@@ -107,6 +108,39 @@ function managedRetryableFailure(failure: unknown): boolean {
 		trigger.class === "auth" ||
 		trigger.class === "server"
 	);
+}
+
+/**
+ * Neutralize leaked reserved control tokens in-place across the outgoing
+ * history so a re-send no longer carries the poison that triggered
+ * `Request blocked (code=invalid_prompt)`. Only string text fields are
+ * rewritten; no history item is ever dropped or reordered. Returns whether any
+ * byte actually changed — the circuit breaker uses this to decide between a
+ * single repaired resend (changed) and immediate fail-fast (unchanged).
+ */
+function repairInvalidPromptHistory(messages: AgentMessage[]): boolean {
+	let changed = false;
+	const repairString = (value: string): string => {
+		const next = neutralizeReservedControlTokens(value);
+		if (next !== value) changed = true;
+		return next;
+	};
+	for (const message of messages) {
+		const content = (message as { content?: unknown }).content;
+		if (typeof content === "string") {
+			(message as { content: string }).content = repairString(content);
+		} else if (Array.isArray(content)) {
+			for (const block of content) {
+				if (!block || typeof block !== "object") continue;
+				const record = block as Record<string, unknown>;
+				for (const key of ["text", "thinking"]) {
+					const value = record[key];
+					if (typeof value === "string") record[key] = repairString(value);
+				}
+			}
+		}
+	}
+	return changed;
 }
 
 function managedFailureOutcome(message: AssistantMessage): ManagedAttemptOutcome {
@@ -789,6 +823,9 @@ async function runLoopBody(
 	// first iteration is skipped to avoid duplicating/racing it.
 	let modelHasResponded = false;
 	let harmonyTruncateResumeCount = 0;
+	// Fires at most one repaired resend per run for the poisoned-history
+	// `invalid_prompt` circuit breaker below.
+	let invalidPromptRepairAttempted = false;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -946,6 +983,29 @@ async function runLoopBody(
 							currentContext.messages.splice(idx, 1);
 						}
 					}
+					continue;
+				}
+			}
+			// Session-level invalid_prompt circuit breaker (bounded, neutralize-only).
+			// A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is
+			// a deterministic content fault: re-sending the same history re-triggers it,
+			// so naive session auto-retry would burn its whole budget re-poisoning the
+			// model. On the first invalid_prompt of this run, neutralize leaked control
+			// tokens in history IN PLACE (never dropping items). If that changed the
+			// outgoing bytes, resend exactly once with the repaired history; if
+			// neutralization cannot change anything (nothing left to repair), fall
+			// through to terminal handling and fail fast. Budget = one repaired resend.
+			// Runs before the response is committed so the resend is a clean retry;
+			// managed fallback owns its own retry policy, so this is scoped to the
+			// non-managed session path where uncontrolled auto-retry would recur.
+			if (
+				!config.fallbackManaged &&
+				message.stopReason === "error" &&
+				!invalidPromptRepairAttempted &&
+				isInvalidPromptError(message)
+			) {
+				invalidPromptRepairAttempted = true;
+				if (repairInvalidPromptHistory(currentContext.messages)) {
 					continue;
 				}
 			}

@@ -155,6 +155,51 @@ export function neutralizeReservedControlTokens(text: string): string {
 }
 
 /**
+ * Shape-tolerant classifier for the poisoned-history rejection that wedges
+ * gpt-5.6 sessions: `Request blocked (code=invalid_prompt)`. Accepts a raw
+ * provider error, an assistant message, or any object carrying a
+ * `providerCode` / `transportFailure` / `errorMessage` field, and returns true
+ * when the failure is the deterministic `invalid_prompt` content fault rather
+ * than a transient upstream error. This is the single shared contract the
+ * provider transports and the session-level circuit breaker key on so the
+ * classification is explicit (not inferred from a catch-all bucket) and
+ * uniformly testable across transports.
+ */
+export function isInvalidPromptError(input: unknown): boolean {
+	if (!input) return false;
+	if (typeof input === "string") return INVALID_PROMPT_MESSAGE_RE.test(input);
+	if (typeof input !== "object") return false;
+	const value = input as {
+		providerCode?: unknown;
+		code?: unknown;
+		errorMessage?: unknown;
+		message?: unknown;
+		transportFailure?: { providerCode?: unknown; code?: unknown };
+		error?: { code?: unknown };
+	};
+	const code =
+		asLowerString(value.providerCode) ??
+		asLowerString(value.code) ??
+		asLowerString(value.transportFailure?.providerCode) ??
+		asLowerString(value.transportFailure?.code) ??
+		asLowerString(value.error?.code);
+	if (code === "invalid_prompt") return true;
+	const message =
+		typeof value.errorMessage === "string"
+			? value.errorMessage
+			: typeof value.message === "string"
+				? value.message
+				: undefined;
+	return message !== undefined && INVALID_PROMPT_MESSAGE_RE.test(message);
+}
+
+const INVALID_PROMPT_MESSAGE_RE = /code=invalid[_ -]prompt|request blocked[^\n]*invalid[_ -]prompt/i;
+
+function asLowerString(value: unknown): string | undefined {
+	return typeof value === "string" ? value.toLowerCase() : undefined;
+}
+
+/**
  * Neutralize leaked reserved control tokens across every string in an outgoing
  * Responses `input` array. This is the request-boundary complement to the
  * replay-history sanitizer: leaked Harmony markers (`<|channel|>analysis`, ...)
