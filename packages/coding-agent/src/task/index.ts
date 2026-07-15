@@ -19,7 +19,7 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@gajae
 import type { Model, Usage } from "@gajae-code/ai";
 import { $env, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
-import { AsyncJobManager, OwnerSubagentShutdownError } from "../async";
+import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner } from "../async";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
@@ -547,8 +547,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
+		let resumeRunner: ResumeRunner | undefined;
 		if (typeof manager.setResumeRunner === "function") {
-			manager.setResumeRunner((_subagentId, message, resumeDescriptor) => {
+			resumeRunner = (_subagentId, message, resumeDescriptor) => {
 				const descriptor = isTaskResumeDescriptor(resumeDescriptor?.data) ? resumeDescriptor.data : undefined;
 				if (!descriptor) return undefined;
 				const forkSeeds = descriptor.forkContextSeed
@@ -590,7 +591,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 					},
 				);
-			});
+			};
+			manager.setResumeRunner(resumeRunner);
 		}
 		const semaphore = new Semaphore(maxConcurrency);
 		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
@@ -770,18 +772,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				);
 				startedJobs.push({ jobId, taskId: taskItem.id });
 				if (typeof manager.registerResumeDescriptor === "function") {
-					manager.registerResumeDescriptor({
-						subagentId: uniqueId,
-						ownerId: this.session.getAgentId?.() ?? undefined,
-						data: {
-							toolCallId: _toolCallId,
-							params,
-							task: { ...taskItem, id: uniqueId },
-							sessionFile: subtaskSessionFile,
-							forkContextSeed: frozenForkSeed,
-							agentSource: fallbackAgentSource,
-						} satisfies TaskResumeDescriptor,
-					});
+					manager.registerResumeDescriptor(
+						{
+							subagentId: uniqueId,
+							ownerId: this.session.getAgentId?.() ?? undefined,
+							data: {
+								toolCallId: _toolCallId,
+								params,
+								task: { ...taskItem, id: uniqueId },
+								sessionFile: subtaskSessionFile,
+								forkContextSeed: frozenForkSeed,
+								agentSource: fallbackAgentSource,
+							} satisfies TaskResumeDescriptor,
+						},
+						resumeRunner,
+					);
 				}
 				if (typeof manager.registerSubagentRecord === "function") {
 					manager.registerSubagentRecord({
