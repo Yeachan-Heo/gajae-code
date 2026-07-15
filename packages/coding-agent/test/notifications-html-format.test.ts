@@ -69,7 +69,7 @@ describe("markdownToTelegramHtml (AC5)", () => {
 		const md =
 			"| 공식 | 표현 |\n| --- | --- |\n| 이차방정식 근의 공식 | \\\\(x=\\\\frac{-b\\\\pm\\\\sqrt{b^2-4ac}}{2a}\\\\) |";
 		expect(markdownToTelegramHtml(md)).toBe(
-			"<pre>공식: 이차방정식 근의 공식\n표현: \\\\(x=\\\\frac{-b\\\\pm\\\\sqrt{b^2-4ac}}{2a}\\\\)</pre>",
+			"<b>공식</b>: 이차방정식 근의 공식\n<b>표현</b>: \\\\(x=\\\\frac{-b\\\\pm\\\\sqrt{b^2-4ac}}{2a}\\\\)",
 		);
 	});
 

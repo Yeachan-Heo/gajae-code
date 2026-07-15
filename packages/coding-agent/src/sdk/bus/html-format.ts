@@ -139,12 +139,19 @@ function renderTableText(header: string[], aligns: ColumnAlign[], body: string[]
 	const divider = widths.map(w => "-".repeat(w)).join("-|-");
 	return [renderRow(header), divider, ...body.map(renderRow)].join("\n");
 }
-/** Render wide tables as stacked records so Telegram clients do not wrap columns into ambiguity. */
+/** Render compact tables as a grid and wide tables as readable Telegram-native records. */
 function renderTelegramTable(header: string[], aligns: ColumnAlign[], body: string[][]): string {
 	const grid = renderTableText(header, aligns, body);
-	if (grid.split("\n").every(line => Bun.stringWidth(line) <= 42)) return grid;
+	if (grid.split("\n").every(line => Bun.stringWidth(line) <= 42)) return pre(grid);
 	return body
-		.map(row => header.map((label, column) => `${label || `Column ${column + 1}`}: ${row[column] ?? ""}`).join("\n"))
+		.map(row =>
+			header
+				.map(
+					(label, column) =>
+						`${tag("b", escapeHtml(label || `Column ${column + 1}`))}: ${escapeHtml(row[column] ?? "")}`,
+				)
+				.join("\n"),
+		)
 		.join("\n\n");
 }
 
@@ -169,7 +176,7 @@ function convertMarkdownTables(text: string, stash: (html: string) => string): s
 				if (!looksLikeTableRow(row) || isTableSeparator(row)) break;
 				body.push(splitTableRow(row));
 			}
-			out.push(stash(pre(renderTelegramTable(header, aligns, body))));
+			out.push(stash(renderTelegramTable(header, aligns, body)));
 			i = j - 1;
 			continue;
 		}
