@@ -1,6 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import { Marked, type Token, type TokensList } from "marked";
 import {
+	buildBtwRichBlocks,
 	buildRichMessage,
+	deliverBtwRichWithFallback,
 	deliverRichActionWithFallback,
 	deliverRichWithFallback,
 	shouldPromoteRich,
@@ -365,5 +368,166 @@ describe("deliverRichActionWithFallback", () => {
 		expect(res).toEqual({ messageId: 654, usedRich: false, usedFallback: true });
 		expect(fallbacks).toBe(1);
 		expect(warns).toHaveLength(1);
+	});
+});
+describe("/btw native table rich rendering", () => {
+	const table = "| Name | Score |\n| :--- | ---: |\n| Ada | 10 |";
+
+	test("promotes tables in source order while allowing root spaces and preserving table cell metadata", () => {
+		const blocks = buildBtwRichBlocks(
+			`\n\n# Results\n\n${table}\n\nBetween tables.\n\n| Key |\n| --- |\n| value |\n\n`,
+		);
+		expect(blocks).toEqual([
+			{ type: "heading", size: 1, text: ["Results"] },
+			{
+				type: "table",
+				cells: [
+					[
+						{ text: ["Name"], is_header: true, align: "left", valign: "top" },
+						{ text: ["Score"], is_header: true, align: "right", valign: "top" },
+					],
+					[
+						{ text: ["Ada"], align: "left", valign: "top" },
+						{ text: ["10"], align: "right", valign: "top" },
+					],
+				],
+			},
+			{ type: "paragraph", text: ["Between tables."] },
+			{
+				type: "table",
+				cells: [[{ text: ["Key"], is_header: true, valign: "top" }], [{ text: ["value"], valign: "top" }]],
+			},
+		]);
+	});
+
+	test("keeps unsupported, no-table, unsupported-token, over-unit, and over-column input on markdown rich delivery", () => {
+		const exactly500 = `| h |\n| --- |\n${Array.from({ length: 498 }, (_, index) => `| ${index} |`).join("\n")}`;
+		const oneOver500 = `| h |\n| --- |\n${Array.from({ length: 499 }, (_, index) => `| ${index} |`).join("\n")}`;
+		const exactly20 = `| ${Array.from({ length: 20 }, (_, index) => `h${index}`).join(" | ")} |\n| ${Array.from({ length: 20 }, () => "---").join(" | ")} |\n| ${Array.from({ length: 20 }, () => "v").join(" |")} |`;
+		const oneOver20 = `| ${Array.from({ length: 21 }, (_, index) => `h${index}`).join(" | ")} |\n| ${Array.from({ length: 21 }, () => "---").join(" | ")} |\n| ${Array.from({ length: 21 }, () => "v").join(" |")} |`;
+		const supportedNesting = `***supported***\n\n${table}`;
+
+		expect(buildBtwRichBlocks("plain paragraph")).toBeUndefined();
+		expect(buildBtwRichBlocks(`[link](https://example.com)\n\n${table}`)).toBeUndefined();
+		expect(buildBtwRichBlocks(`<details>unsupported</details>\n\n${table}`)).toBeUndefined();
+		expect(buildBtwRichBlocks(exactly500)).toBeDefined();
+		expect(buildBtwRichBlocks(oneOver500)).toBeUndefined();
+		expect(buildBtwRichBlocks(exactly20)).toBeDefined();
+		expect(buildBtwRichBlocks(oneOver20)).toBeUndefined();
+		expect(buildBtwRichBlocks(supportedNesting)).toBeDefined();
+	});
+	test("accepts tokens reaching depth 16 and rejects tokens reaching depth 17", () => {
+		const tableAtDepth = (formattingTokens: number): TokensList => {
+			let cell: Token = { type: "text", raw: "value", text: "value" } as Token;
+			for (let index = 0; index < formattingTokens; index++) {
+				cell = { type: "strong", raw: `**${cell.raw}**`, text: `**${cell.raw}**`, tokens: [cell] } as Token;
+			}
+			const tokens: Token[] = [
+				{
+					type: "table",
+					raw: "",
+					header: [{ text: "Header", tokens: [{ type: "text", raw: "Header", text: "Header" }] }],
+					align: [null],
+					rows: [[{ text: "value", tokens: [cell] }]],
+				} as Token,
+			];
+			return Object.assign(tokens, { links: {} });
+		};
+
+		const lexerSpy = vi.spyOn(Marked.prototype, "lexer");
+		try {
+			// Table cells enter inline compilation at depth 2; 14 wrappers reach the accepted depth 16.
+			lexerSpy.mockImplementation(() => tableAtDepth(14));
+			expect(buildBtwRichBlocks(table)).toBeDefined();
+
+			lexerSpy.mockImplementation(() => tableAtDepth(15));
+			expect(buildBtwRichBlocks(table)).toBeUndefined();
+		} finally {
+			lexerSpy.mockRestore();
+		}
+	});
+
+	test("uses blocks only for an eligible table and falls back once for rejected rich responses or throws", async () => {
+		const markdown = table;
+		for (const response of [
+			() => ({ ok: false, description: "unsupported" }),
+			() => {
+				throw new Error("transport down");
+			},
+		]) {
+			const { bot, calls } = makeBot(response);
+			let fallbacks = 0;
+			await deliverBtwRichWithFallback(bot, { chat_id: 42, message_thread_id: 7 }, markdown, async () => {
+				fallbacks++;
+			});
+			expect(calls).toHaveLength(1);
+			expect(calls[0]).toEqual({
+				method: "sendRichMessage",
+				body: {
+					chat_id: 42,
+					message_thread_id: 7,
+					rich_message: { blocks: buildBtwRichBlocks(markdown), skip_entity_detection: true },
+				},
+			});
+			expect(fallbacks).toBe(1);
+		}
+	});
+
+	test("uses the exact original markdown rich request when block compilation throws", async () => {
+		const markdown = "# Original\n\n| a | b |\n| --- | --- |\n| 1 | 2 |";
+		const { bot, calls } = makeBot(() => ({ ok: true }));
+		const lexerSpy = vi.spyOn(Marked.prototype, "lexer").mockImplementation(() => {
+			throw new Error("lexer unavailable");
+		});
+		let fallbacks = 0;
+		try {
+			await deliverBtwRichWithFallback(bot, { chat_id: 42, message_thread_id: 7 }, markdown, async () => {
+				fallbacks++;
+			});
+			expect(lexerSpy).toHaveBeenCalledTimes(1);
+			expect(lexerSpy).toHaveBeenCalledWith(markdown);
+			expect(calls).toEqual([
+				{
+					method: "sendRichMessage",
+					body: { chat_id: 42, message_thread_id: 7, rich_message: { markdown } },
+				},
+			]);
+			expect(fallbacks).toBe(0);
+		} finally {
+			lexerSpy.mockRestore();
+		}
+	});
+	test("uses one unchanged markdown rich request, fallback, and warning when compilation is unsupported", async () => {
+		const markdown = "plain **markdown**";
+		for (const [response, warning] of [
+			[() => ({ ok: false, description: "unsupported" }), "unsupported"],
+			[
+				() => {
+					throw new Error("transport down");
+				},
+				"transport down",
+			],
+		] as const) {
+			const { bot, calls } = makeBot(response);
+			const fallbacks: string[] = [];
+			const warnings: string[] = [];
+			await deliverBtwRichWithFallback(
+				bot,
+				{ chat_id: 42, message_thread_id: 7 },
+				markdown,
+				async () => {
+					fallbacks.push(markdown);
+				},
+				{ warn: message => warnings.push(message) },
+			);
+			expect(calls).toEqual([
+				{
+					method: "sendRichMessage",
+					body: { chat_id: 42, message_thread_id: 7, rich_message: { markdown } },
+				},
+			]);
+			expect(fallbacks).toEqual([markdown]);
+			expect(warnings).toEqual([`notifications: sendRichMessage(/btw) failed (${warning}); falling back to HTML`]);
+		}
 	});
 });

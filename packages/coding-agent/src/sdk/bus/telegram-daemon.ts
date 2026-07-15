@@ -55,7 +55,12 @@ import { RateLimitPool } from "./rate-limit-pool";
 import { listRecentSessions } from "./recent-activity";
 import { ReplySentStore } from "./reply-sent-store";
 import { DraftStreamState, deliverDraft, shouldStreamDraft } from "./rich-draft";
-import { deliverRichActionWithFallback, deliverRichWithFallback, shouldPromoteRich } from "./rich-render";
+import {
+	deliverBtwRichWithFallback,
+	deliverRichActionWithFallback,
+	deliverRichWithFallback,
+	shouldPromoteRich,
+} from "./rich-render";
 import {
 	type AliasTable,
 	buildActionMarkdown,
@@ -3208,7 +3213,15 @@ export class TelegramNotificationDaemon {
 							throw new Error("Telegram rejected /btw reply");
 					}
 				};
-				await fallback();
+				if (this.opts.rich?.enabled === false || markdown.length > 32_768) await fallback();
+				else
+					await deliverBtwRichWithFallback(
+						this.botApi,
+						{ chat_id: this.opts.chatId, message_thread_id: Number(pending.threadId) },
+						markdown,
+						fallback,
+						logger,
+					);
 			} catch {
 				logger.warn("notifications: /btw reply delivery failed");
 			}

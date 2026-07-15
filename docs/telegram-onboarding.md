@@ -325,6 +325,7 @@ Reply paths:
   - `/verbosity <lean|verbose>`
   - `/redact <on|off>`
   - `/btw <question>` (asks an ephemeral side question without adding it to session history)
+  Finalized `/btw` replies promote supported Markdown tables to native Telegram rich-table blocks by default. Unsupported or malformed Markdown, table limits (20 columns, 500 blocks, and 16 nesting levels), rich-delivery failures, and replies over 32,768 characters retain the original Markdown or existing HTML fallback; `/rich off` keeps the HTML-only path.
 - send paired-chat lifecycle commands from the Telegram command menu or by typing:
   - `/session_create path <dir>`
   - `/session_create worktree <repo> <branch>`

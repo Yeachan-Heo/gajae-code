@@ -7,23 +7,15 @@
  * off-state request bodies are byte-identical.
  */
 
+import { Marked, type Token, type Tokens } from "marked";
 import type { BotApi } from "./telegram-daemon";
 import type { ThreadedSend } from "./threaded-render";
 
 /**
- * Telegram's hard per-message character ceiling (4096). Surfaced here purely as
- * documentation and a marker for a future native rich-message splitter — it is
- * intentionally NON-BEHAVIORAL and MUST stay that way: nothing in the rich path
- * branches on this value.
- *
- * Overflow is already safe without it. The production final-answer text is capped
- * at 3500 chars upstream (`summaryFromMessage(..., 3500)`), so a promoted
- * `sendRichMessage` never approaches this ceiling; and if the Bot API ever rejects
- * an oversized rich payload it returns `{ ok: false }`, which
- * `deliverRichWithFallback` (below) turns into the chunked HTML `splitTelegramHtml`
- * fallback (each chunk ≤ TELEGRAM_MESSAGE_LIMIT). This constant only marks where a
- * future rich splitter would read its ceiling; wiring it into a branch would change
- * byte-for-byte behavior and is out of scope.
+ * Telegram's hard per-message character ceiling (4096). Final-answer promotion
+ * uses this value to keep oversized Markdown on the existing chunked HTML path.
+ * `/btw` delivery has its own 32,768-character route guard and otherwise lets
+ * `sendRichMessage` fall back to HTML when Telegram rejects a rich payload.
  */
 export const RICH_MESSAGE_LIMIT = 4096;
 
@@ -33,6 +25,180 @@ export function buildRichMessage(
 	extras: { reply_markup?: unknown } = {},
 ): { rich_message: { markdown: string }; reply_markup?: unknown } {
 	return { rich_message: { markdown: raw }, ...extras };
+}
+type BtwRichText = string | BtwRichText[] | { type: "bold" | "italic" | "strikethrough" | "code"; text: BtwRichText };
+
+type BtwRichCell = {
+	text: BtwRichText;
+	align?: "left" | "center" | "right";
+	valign: "top";
+	is_header?: true;
+};
+
+type BtwRichTableBlock = { type: "table"; cells: BtwRichCell[][] };
+
+type BtwRichBlock =
+	| { type: "heading"; text: BtwRichText; size: number }
+	| { type: "paragraph"; text: BtwRichText }
+	| BtwRichTableBlock;
+
+const btwMarked = new Marked({ async: false, breaks: false, gfm: true, pedantic: false, silent: false });
+
+function buildBtwRichText(tokens: Token[], depth: number): BtwRichText[] | undefined {
+	if (depth > 16) return undefined;
+	const text: BtwRichText[] = [];
+	for (const token of tokens) {
+		switch (token.type) {
+			case "text":
+				text.push(token.text);
+				break;
+			case "br":
+				text.push("\n");
+				break;
+			case "codespan":
+				text.push({ type: "code", text: token.text });
+				break;
+			case "strong":
+				{
+					if (token.tokens === undefined) return undefined;
+					const nested = buildBtwRichText(token.tokens, depth + 1);
+					if (nested === undefined) return undefined;
+					text.push({ type: "bold", text: nested });
+				}
+				break;
+			case "em":
+				{
+					if (token.tokens === undefined) return undefined;
+					const nested = buildBtwRichText(token.tokens, depth + 1);
+					if (nested === undefined) return undefined;
+					text.push({ type: "italic", text: nested });
+				}
+				break;
+			case "del":
+				{
+					if (token.tokens === undefined) return undefined;
+					const nested = buildBtwRichText(token.tokens, depth + 1);
+					if (nested === undefined) return undefined;
+					text.push({ type: "strikethrough", text: nested });
+				}
+				break;
+			default:
+				return undefined;
+		}
+	}
+	return text;
+}
+
+function buildBtwTable(token: Tokens.Table, depth: number): BtwRichTableBlock | undefined {
+	const columns = token.header.length;
+	if (
+		columns < 1 ||
+		columns > 20 ||
+		token.align.length !== columns ||
+		token.rows.some(row => row.length !== columns) ||
+		token.align.some(align => align !== "left" && align !== "center" && align !== "right" && align !== null)
+	)
+		return undefined;
+
+	const buildRow = (row: Tokens.TableCell[], isHeader: boolean): BtwRichCell[] | undefined => {
+		const cells: BtwRichCell[] = [];
+		for (let column = 0; column < columns; column++) {
+			const text = buildBtwRichText(row[column].tokens, depth + 1);
+			const align = token.align[column];
+			if (text === undefined) return undefined;
+			cells.push({
+				text,
+				...(align === null ? {} : { align }),
+				valign: "top",
+				...(isHeader ? { is_header: true } : {}),
+			});
+		}
+		return cells;
+	};
+
+	const header = buildRow(token.header, true);
+	if (header === undefined) return undefined;
+	const cells = [header];
+	for (const row of token.rows) {
+		const cellsRow = buildRow(row, false);
+		if (cellsRow === undefined) return undefined;
+		cells.push(cellsRow);
+	}
+	return { type: "table", cells };
+}
+
+/** Compile conservative complete `/btw` documents to native Telegram rich blocks. */
+export function buildBtwRichBlocks(markdown: string): BtwRichBlock[] | undefined {
+	let tokens: Token[];
+	try {
+		tokens = btwMarked.lexer(markdown);
+	} catch {
+		return undefined;
+	}
+
+	const blocks: BtwRichBlock[] = [];
+	let units = 0;
+	let hasTable = false;
+	for (const token of tokens) {
+		if (token.type === "space") continue;
+		if (token.type === "heading") {
+			if (token.tokens === undefined) return undefined;
+			const text = buildBtwRichText(token.tokens, 2);
+			if (text === undefined || token.depth < 1 || token.depth > 6) return undefined;
+			blocks.push({ type: "heading", text, size: token.depth });
+			units++;
+			continue;
+		}
+		if (token.type === "paragraph" || token.type === "text") {
+			let inlineTokens: Token[];
+			if (token.type === "paragraph") {
+				if (token.tokens === undefined) return undefined;
+				inlineTokens = token.tokens;
+			} else {
+				inlineTokens = [token];
+			}
+			const text = buildBtwRichText(inlineTokens, 2);
+			if (text === undefined) return undefined;
+			blocks.push({ type: "paragraph", text });
+			units++;
+			continue;
+		}
+		if (token.type !== "table") return undefined;
+		const table = buildBtwTable(token as Tokens.Table, 1);
+		if (table === undefined) return undefined;
+		units += 1 + table.cells.length;
+		if (units > 500) return undefined;
+		blocks.push(table);
+		hasTable = true;
+	}
+	return hasTable && units <= 500 ? blocks : undefined;
+}
+
+/** Deliver `/btw` rich blocks or original Markdown, with one unchanged HTML fallback on failure. */
+export async function deliverBtwRichWithFallback(
+	botApi: BotApi,
+	base: { chat_id: string | number; message_thread_id?: number },
+	markdown: string,
+	fallbackDeliver: () => Promise<void>,
+	log?: { warn(msg: string): void },
+): Promise<void> {
+	const blocks = buildBtwRichBlocks(markdown);
+	let failure: string | undefined;
+	try {
+		const res = await botApi.call("sendRichMessage", {
+			...base,
+			rich_message: blocks === undefined ? { markdown } : { blocks, skip_entity_detection: true },
+		});
+		if (res !== null && typeof res === "object" && (res as { ok?: unknown }).ok === false) {
+			const description = (res as { description?: unknown }).description;
+			failure = typeof description === "string" && description.length > 0 ? description : "ok:false";
+		}
+	} catch (err) {
+		failure = err instanceof Error ? err.message : String(err);
+	}
+	if (failure === undefined) return;
+	log?.warn(`notifications: sendRichMessage(/btw) failed (${failure}); falling back to HTML`);
+	await fallbackDeliver();
 }
 
 /**

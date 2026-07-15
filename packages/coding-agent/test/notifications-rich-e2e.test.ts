@@ -114,6 +114,7 @@ interface Harness {
 	srv: InstanceType<typeof NotificationServer>;
 	bot: CapturingBotApi;
 	daemon: TelegramNotificationDaemon;
+	ephemeralTurns: Array<{ sessionId: string; requestId: string; threadId: string; updateId: number }>;
 	stop: () => Promise<void>;
 }
 
@@ -121,7 +122,7 @@ interface Harness {
  * Boot the real napi server, register its endpoint as a notification root, then
  * connect the real daemon to it over a REAL WebSocket via `scanRoots()`.
  */
-async function connectRealPipeline(rich?: { enabled: boolean }): Promise<Harness> {
+async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemeralTurns = true): Promise<Harness> {
 	const agentDir = tempAgentDir();
 	const s = settings(agentDir);
 	const cwd = path.join(agentDir, "repo");
@@ -135,23 +136,47 @@ async function connectRealPipeline(rich?: { enabled: boolean }): Promise<Harness
 	const srv = new NotificationServer(sessionId, "tok", stateRoot, true);
 	srv.onSdkFrame((error, inbound) => {
 		if (error || !inbound) return;
-		const frame = JSON.parse(inbound.json) as Record<string, unknown>;
-		if (frame.type !== "event_replay") return;
-		srv.sendTo(
-			inbound.connectionId,
+		const frame = JSON.parse(inbound.json);
+		if (frame.type === "event_replay") {
+			srv.sendTo(
+				inbound.connectionId,
+				JSON.stringify({
+					type: "event_replay_result",
+					id: frame.id,
+					ok: true,
+					generation: 1,
+					lastSeq: 1,
+					events: [
+						{
+							type: "event",
+							name: "identity_header",
+							payload: { type: "identity_header", sessionId, repo: "rich-e2e", branch: "test" },
+						},
+					],
+				}),
+			);
+			return;
+		}
+	});
+	const ephemeralTurns: Array<{ sessionId: string; requestId: string; threadId: string; updateId: number }> = [];
+	srv.onInbound((error, inbound) => {
+		if (error || !inbound || inbound.kind !== "ephemeral_turn") return;
+		if (inbound.requestId === undefined || inbound.threadId === undefined || inbound.updateId === undefined) return;
+		ephemeralTurns.push({
+			sessionId: inbound.sessionId,
+			requestId: inbound.requestId,
+			threadId: inbound.threadId,
+			updateId: inbound.updateId,
+		});
+		if (!respondToEphemeralTurns) return;
+		srv.pushFrame(
 			JSON.stringify({
-				type: "event_replay_result",
-				id: frame.id,
-				ok: true,
-				generation: 1,
-				lastSeq: 1,
-				events: [
-					{
-						type: "event",
-						name: "identity_header",
-						payload: { type: "identity_header", sessionId, repo: "rich-e2e", branch: "test" },
-					},
-				],
+				type: "ephemeral_turn_result",
+				sessionId: inbound.sessionId,
+				requestId: inbound.requestId,
+				threadId: inbound.threadId,
+				updateId: inbound.updateId,
+				text: RICH_TEXT,
 			}),
 		);
 	});
@@ -192,7 +217,7 @@ async function connectRealPipeline(rich?: { enabled: boolean }): Promise<Harness
 		throw err;
 	}
 
-	return { sessionId, srv, bot, daemon, stop };
+	return { sessionId, srv, bot, daemon, ephemeralTurns, stop };
 }
 
 /** Drive the identity_header over the wire and wait until its topic + HTML header are sent. */
@@ -237,6 +262,56 @@ test("rich e2e: NotificationServer + real WS + daemon scanRoots -> finalAnswer p
 		expect(rich.body.chat_id).toBe("42");
 
 		// The final answer did NOT also leak out on the HTML sendMessage path.
+		expect(count(h.bot, "sendMessage")).toBe(htmlBefore);
+	} finally {
+		await h.stop();
+	}
+}, 30000);
+test("rich e2e: /btw ignores mismatched and duplicate results before delivering the matching real-WebSocket result once", async () => {
+	const h = await connectRealPipeline(undefined, false);
+	try {
+		await driveIdentity(h, "Rich BTW E2E");
+		const htmlBefore = count(h.bot, "sendMessage");
+		await h.daemon.handleTelegramUpdate({
+			update_id: 77,
+			message: { chat: { id: 42 }, message_thread_id: THREAD_ID, text: "/btw table?" },
+		});
+		await waitFor(() => h.ephemeralTurns.length === 1, 8000, "/btw ephemeral turn received by NotificationServer");
+		const inbound = h.ephemeralTurns[0]!;
+		const result = {
+			type: "ephemeral_turn_result",
+			sessionId: inbound.sessionId,
+			requestId: inbound.requestId,
+			threadId: inbound.threadId,
+			updateId: inbound.updateId,
+			text: RICH_TEXT,
+		};
+		for (const mismatch of [
+			{ ...result, requestId: "btw:duplicate" },
+			{ ...result, sessionId: `${inbound.sessionId}-other` },
+			{ ...result, threadId: String(THREAD_ID + 1) }, // Wrong Telegram topic/thread.
+			{ ...result, updateId: inbound.updateId + 1 },
+		]) {
+			h.srv.pushFrame(JSON.stringify(mismatch));
+		}
+		await sleep(100);
+		expect(count(h.bot, "sendRichMessage")).toBe(0);
+		expect(count(h.bot, "sendMessage")).toBe(htmlBefore);
+
+		h.srv.pushFrame(JSON.stringify(result));
+		await waitFor(() => count(h.bot, "sendRichMessage") === 1, 8000, "matching /btw rich table delivery");
+		h.srv.pushFrame(JSON.stringify(result));
+		await sleep(100);
+		const rich = find(h.bot, "sendRichMessage")!;
+		expect(rich.body).toEqual({
+			chat_id: "42",
+			message_thread_id: THREAD_ID,
+			rich_message: expect.objectContaining({
+				skip_entity_detection: true,
+				blocks: expect.any(Array),
+			}),
+		});
+		expect(count(h.bot, "sendRichMessage")).toBe(1);
 		expect(count(h.bot, "sendMessage")).toBe(htmlBefore);
 	} finally {
 		await h.stop();

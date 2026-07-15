@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { Marked } from "marked";
 import { Settings } from "../src/config/settings";
 import {
 	markdownToTelegramHtml,
@@ -2590,6 +2591,7 @@ describe("telegram daemon", () => {
 
 		const requestId = sent.find(frame => frame.type === "ephemeral_turn")!.requestId;
 		const replyCountBefore = bot.calls.filter(call => call.method === "sendMessage").length;
+		const richCountBefore = bot.calls.filter(call => call.method === "sendRichMessage").length;
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "ephemeral_turn_result",
 			sessionId: "S",
@@ -2605,8 +2607,10 @@ describe("telegram daemon", () => {
 			requestId,
 			threadId: String(threadId),
 			updateId: 8,
-			text: "**The** ~~parser~~ changed.",
+			text: "# Reply\n\n| Name | Score |\n| --- | ---: |\n| Ada | 10 |",
 		});
+		const richCountAfterResult = bot.calls.filter(call => call.method === "sendRichMessage").length;
+		expect(richCountAfterResult).toBe(richCountBefore + 1);
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "ephemeral_turn_result",
 			sessionId: "S",
@@ -2615,16 +2619,97 @@ describe("telegram daemon", () => {
 			updateId: 8,
 			text: "Duplicate answer",
 		});
-		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(replyCountBefore + 1);
+		expect(bot.calls.filter(call => call.method === "sendRichMessage")).toHaveLength(richCountAfterResult);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(replyCountBefore);
 		expect(bot.calls).toContainEqual(
 			expect.objectContaining({
-				method: "sendMessage",
+				method: "sendRichMessage",
 				body: expect.objectContaining({
 					message_thread_id: threadId,
-					text: "<b>The</b> <s>parser</s> changed.",
+					rich_message: expect.objectContaining({
+						skip_entity_detection: true,
+						blocks: expect.any(Array),
+					}),
 				}),
 			}),
 		);
+	});
+	test("routes /btw rich delivery at exact 32,768 boundary and preserves HTML when bypassed or disabled", async () => {
+		const tablePrefix = "| Value |\n| --- |\n| ";
+		const tableSuffix = " |";
+		const lexerSpy = vi.spyOn(Marked.prototype, "lexer");
+		try {
+			for (const { label, rich, length, richCalls, lexerCalls } of [
+				{ label: "default omitted at 32,768", rich: undefined, length: 32_768, richCalls: 1, lexerCalls: 1 },
+				{ label: "explicit on at 32,768", rich: { enabled: true }, length: 32_768, richCalls: 1, lexerCalls: 1 },
+				{ label: "explicit off at 32,768", rich: { enabled: false }, length: 32_768, richCalls: 0, lexerCalls: 0 },
+				{ label: "explicit on at 32,769", rich: { enabled: true }, length: 32_769, richCalls: 0, lexerCalls: 0 },
+			] as const) {
+				FakeWs.instances = [];
+				const bot = new RichFakeBotApi();
+				const agentDir = tempAgentDir();
+				const daemon = new TelegramNotificationDaemon({
+					settings: setPrivateAgentDir(settings(agentDir), agentDir),
+					ownerId: "owner",
+					botToken: "tok",
+					chatId: "42",
+					botApi: bot as any,
+					WebSocketImpl: FakeWs as any,
+					...(rich ? { rich } : {}),
+				});
+				daemon.connectSession("S", "ws://s", "ts");
+				await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+					type: "action_needed",
+					kind: "ask",
+					id: "ask1",
+					question: "Name it?",
+					options: ["a", "b"],
+				});
+				const threadId = bot.richThreadId;
+				await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "action_resolved", id: "ask1" });
+				bot.calls.length = 0;
+				lexerSpy.mockClear();
+
+				await daemon.handleTelegramUpdate({
+					update_id: 80,
+					message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw boundary", message_id: 180 },
+				});
+				const requestId = JSON.parse(FakeWs.instances[0]!.sent.at(-1)!).requestId;
+				const markdown = `${tablePrefix}${"x".repeat(length - tablePrefix.length - tableSuffix.length)}${tableSuffix}`;
+				await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+					type: "ephemeral_turn_result",
+					sessionId: "S",
+					requestId,
+					threadId: String(threadId),
+					updateId: 80,
+					text: markdown,
+				});
+
+				expect(countMethod(bot, "sendRichMessage"), label).toBe(richCalls);
+				expect(lexerSpy, label).toHaveBeenCalledTimes(lexerCalls);
+				const html = bot.calls.filter(call => call.method === "sendMessage");
+				if (richCalls === 1) {
+					expect(html, label).toHaveLength(0);
+					expect(findMethod(bot, "sendRichMessage")!.body).toEqual({
+						chat_id: "42",
+						message_thread_id: threadId,
+						rich_message: expect.objectContaining({ blocks: expect.any(Array), skip_entity_detection: true }),
+					});
+				} else {
+					expect(html, label).toHaveLength(splitTelegramHtml(markdownToTelegramHtml(markdown)).length);
+					expect(
+						html.map(call => call.body.text),
+						label,
+					).toEqual(splitTelegramHtml(markdownToTelegramHtml(markdown)));
+					expect(
+						html.every(call => call.body.parse_mode === TELEGRAM_PARSE_MODE),
+						label,
+					).toBe(true);
+				}
+			}
+		} finally {
+			lexerSpy.mockRestore();
+		}
 	});
 
 	test("shows /btw help for an empty question without injecting a user turn", async () => {
