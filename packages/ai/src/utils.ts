@@ -119,7 +119,7 @@ export function sanitizeOpenAIResponsesHistoryItemsForReplay(items: Array<Record
 		return sanitized ? [sanitized] : [];
 	});
 }
-const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[A-Za-z0-9_]{1,32}\|>)/g;
+const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[A-Za-z0-9_]+(?:[ \t]+[A-Za-z_][A-Za-z0-9_]*=[^\s<>|]+)*\|>)/g;
 /**
  * Neutralize leaked OpenAI Harmony / control tokens (`<|channel|>`, `<|message|>`,
  * `<|call|>`, `<|constrain|>`, `<|recipient|>`, `<|content|>`, ...) in replayed
@@ -130,6 +130,19 @@ const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[A-Za-z0-9_]{1,32}\|>)/g;
  * the offending item is re-sent on each turn. Insert a zero-width space after `<`
  * so the delimiter can no longer be tokenized as a reserved control token while the
  * text stays human-readable.
+ *
+ * The pattern matches the two control-token shapes only, so ordinary pipe syntax is
+ * left untouched:
+ *   - simple form `<|ident|>` — a leading run of identifier chars then `|>`; and
+ *   - header form `<|role key=value ...|>` — a role identifier followed by one or
+ *     more space/tab-separated `key=value` assignments whose values are unbounded
+ *     runs of non-delimiter, non-whitespace chars (so long MCP/custom tool
+ *     recipients like `to=functions.<long.name>` are covered).
+ * Requiring a leading identifier char immediately after `<|` and a single-line body
+ * (no `\n`) leaves compact pipe/operator syntax alone — e.g. F# `value <| f |> g`
+ * (space after `<|`), `sum<|a+b|>c` (punctuation body), and `<|foo bar|>` (no
+ * `key=value`) never match. This is a strict superset of the original
+ * identifier-only pattern: every marker the old regex caught still matches.
  */
 export function neutralizeReservedControlTokens(text: string): string {
 	if (!text.includes("<|")) return text;
