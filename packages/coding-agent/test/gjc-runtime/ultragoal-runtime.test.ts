@@ -3130,6 +3130,66 @@ describe("native GJC ultragoal runtime", () => {
 		).rejects.toThrow("changed after its completion receipt was verified");
 	});
 
+	it("rejects a superseded final-aggregate receipt whose forged basis is mirrored onto the ledger event generation", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		await addUltragoalSubgoal({
+			cwd: root,
+			title: "Appended stage",
+			objective: "Complete the appended stage.",
+			evidence: "The run gained a new required goal after aggregate completion.",
+			rationale: "Red-team: forged superseded receipt provenance must be rejected.",
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G002",
+			status: "complete",
+			evidence: "appended goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		// Coordinated tamper: forge the goals-row basis and generation of
+		// G001's superseded final-aggregate receipt, and mirror ONLY the
+		// generation onto its ledger checkpoint event. Field-selective ledger
+		// matching would accept this as verified provenance.
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const saved = JSON.parse(await Bun.file(goalsPath).text());
+		const forgedReceipt = saved.goals[0].completionVerification;
+		forgedReceipt.basis.planHashBeforeCheckpoint = "forged";
+		forgedReceipt.planGeneration = hashStructuredValue(forgedReceipt.basis);
+		await fs.writeFile(goalsPath, `${JSON.stringify(saved, null, 2)}\n`);
+		const ledgerPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl");
+		const rewritten = (await Bun.file(ledgerPath).text())
+			.split("\n")
+			.filter(line => line.trim())
+			.map(line => {
+				const event = JSON.parse(line);
+				if (event.eventId === forgedReceipt.checkpointLedgerEventId) {
+					event.completionVerification.planGeneration = forgedReceipt.planGeneration;
+				}
+				return JSON.stringify(event);
+			});
+		await fs.writeFile(ledgerPath, `${rewritten.join("\n")}\n`);
+
+		const plan = await readUltragoalPlan(root);
+		if (!plan) throw new Error("missing ultragoal plan");
+		const ledger = await readUltragoalLedger(root);
+		expect(
+			validateCompletionReceipt({ plan, ledger, goal: plan.goals[1]!, receiptKind: "final-aggregate" }).state,
+		).not.toBe("active_verified_complete");
+		const durable = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });
+		expect(durable.state).not.toBe("active_verified_complete");
+	});
+
 	async function completedValidationBatchPlan(root: string) {
 		await writeStructuralArtifacts(root);
 		let plan = await createUltragoalPlan({

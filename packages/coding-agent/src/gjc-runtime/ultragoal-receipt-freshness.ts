@@ -245,31 +245,31 @@ export function validateReceiptFreshBase(input: {
 }
 
 /**
- * Validate a final-aggregate receipt that was legitimately superseded — its
- * aggregate claim staled by later plan growth (e.g. `steer add_subgoal`
- * appending goals after a terminal run) — as a historical attestation for its
- * own goal: ledger-anchored, quality gate untampered, goal untouched since
- * verification, and internally consistent. Plan-generation freshness against
- * the CURRENT plan is intentionally not required; that is exactly what later
- * plan growth invalidates by design. Returns null when the receipt stands as
- * valid historical evidence.
+ * Validate a receipt whose plan-generation freshness was legitimately staled
+ * by later plan growth as a historical attestation for its own goal:
+ * internally consistent, anchored to a ledger checkpoint event that carries a
+ * byte-identical receipt, quality gate untampered, and the goal row untouched
+ * since verification. Plan-generation freshness against the CURRENT plan is
+ * intentionally not required; that is exactly what later plan growth
+ * invalidates by design. Returns null when the receipt stands as valid
+ * historical evidence.
  */
-export function validateSupersededFinalAggregateReceipt(input: {
+function validateLedgerAnchoredHistoricalReceipt(input: {
 	ledger: readonly UltragoalLedgerEvent[];
 	goal: UltragoalGoal;
 	receipt: UltragoalCompletionVerification;
+	label: string;
 }): UltragoalReceiptFreshnessDiagnostic | null {
 	if (
 		input.receipt.schemaVersion !== 1 ||
 		input.receipt.goalId !== input.goal.id ||
-		input.receipt.receiptKind !== "final-aggregate" ||
 		!input.receipt.planGeneration ||
 		!input.receipt.checkpointLedgerEventId ||
 		hashStructuredValue(input.receipt.basis) !== input.receipt.planGeneration
 	) {
 		return {
 			state: "active_stale_receipt",
-			message: `Ultragoal ${input.goal.id} superseded final-aggregate receipt is malformed.`,
+			message: `Ultragoal ${input.goal.id} ${input.label} is malformed.`,
 			goalId: input.goal.id,
 		};
 	}
@@ -277,22 +277,58 @@ export function validateSupersededFinalAggregateReceipt(input: {
 	if (!event)
 		return {
 			state: "active_stale_receipt",
-			message: `Ultragoal ${input.goal.id} superseded final-aggregate receipt ledger event is missing.`,
+			message: `Ultragoal ${input.goal.id} ${input.label} ledger event is missing.`,
+			goalId: input.goal.id,
+		};
+	// Bind the goals.json receipt to the FULL receipt recorded on the ledger
+	// event. Field-selective matching would accept a coordinated edit of the
+	// goals-row basis/generation paired with only the event generation.
+	const eventReceipt = event.completionVerification as UltragoalCompletionVerification | undefined;
+	if (!eventReceipt || hashStructuredValue(eventReceipt) !== hashStructuredValue(input.receipt))
+		return {
+			state: "active_stale_receipt",
+			message: `Ultragoal ${input.goal.id} ${input.label} does not match its ledger event receipt.`,
 			goalId: input.goal.id,
 		};
 	if (hashStructuredValue(event.qualityGateJson) !== input.receipt.qualityGateHash)
 		return {
 			state: "active_dirty_quality_gate",
-			message: `Ultragoal ${input.goal.id} superseded final-aggregate receipt quality-gate hash does not match ledger.`,
+			message: `Ultragoal ${input.goal.id} ${input.label} quality-gate hash does not match ledger.`,
 			goalId: input.goal.id,
 		};
 	if (input.goal.updatedAt !== input.receipt.verifiedAt)
 		return {
 			state: "active_stale_receipt",
-			message: `Ultragoal ${input.goal.id} changed after its superseded final-aggregate receipt was verified.`,
+			message: `Ultragoal ${input.goal.id} changed after its ${input.label} was verified.`,
 			goalId: input.goal.id,
 		};
 	return null;
+}
+
+/**
+ * Validate a final-aggregate receipt that was legitimately superseded — its
+ * aggregate claim staled by later plan growth (e.g. `steer add_subgoal`
+ * appending goals after a terminal run) — as historical evidence for its own
+ * goal. Returns null when the receipt stands.
+ */
+export function validateSupersededFinalAggregateReceipt(input: {
+	ledger: readonly UltragoalLedgerEvent[];
+	goal: UltragoalGoal;
+	receipt: UltragoalCompletionVerification;
+}): UltragoalReceiptFreshnessDiagnostic | null {
+	if (input.receipt.receiptKind !== "final-aggregate") {
+		return {
+			state: "active_stale_receipt",
+			message: `Ultragoal ${input.goal.id} superseded final-aggregate receipt is malformed.`,
+			goalId: input.goal.id,
+		};
+	}
+	return validateLedgerAnchoredHistoricalReceipt({
+		ledger: input.ledger,
+		goal: input.goal,
+		receipt: input.receipt,
+		label: "superseded final-aggregate receipt",
+	});
 }
 
 export function findFreshBatchCloseReceipt(input: {
