@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
@@ -12,6 +13,9 @@ import {
 	waitForCdp,
 } from "./attach";
 import { BROWSER_PROTOCOL_TIMEOUT_MS, launchHeadlessBrowser, loadPuppeteer, type UserAgentOverride } from "./launch";
+import { defaultDiscoveryEnv } from "./profile-discovery";
+import type { ProfileReusePosture } from "./profile-posture";
+import { resolveProfileReuse } from "./profile-reuse";
 
 export type BrowserKind =
 	| { kind: "headless"; headless: boolean }
@@ -69,6 +73,13 @@ export interface AcquireBrowserOptions {
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	appArgs?: string[];
 	signal?: AbortSignal;
+	/**
+	 * Profile-reuse posture for the default headless path (from settings
+	 * `browser.profileReuse`, resolved by the settings-aware caller). When set,
+	 * the headless browser may warm up from an isolated copy of the user's real
+	 * Chrome profile (see profile-reuse.ts). Omitted = synthetic session.
+	 */
+	profileReuse?: ProfileReusePosture;
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
@@ -87,7 +98,18 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 
 async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
 	if (kind.kind === "headless") {
-		const browser = await launchHeadlessBrowser({ headless: kind.headless, viewport: opts.viewport });
+		let profileWarmupDir: string | undefined;
+		if (opts.profileReuse) {
+			const reuse = resolveProfileReuse({
+				posture: opts.profileReuse,
+				discoveryEnv: defaultDiscoveryEnv(fs.existsSync),
+			});
+			if (reuse.mode === "real" && reuse.warmupDir) {
+				profileWarmupDir = reuse.warmupDir;
+				if (reuse.warning) logger.warn(reuse.warning);
+			}
+		}
+		const browser = await launchHeadlessBrowser({ headless: kind.headless, viewport: opts.viewport, profileWarmupDir });
 		return {
 			key: browserKey(kind),
 			kind,

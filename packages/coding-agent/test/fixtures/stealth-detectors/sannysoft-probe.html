@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>Stealth probe (offline)</title>
+	</head>
+	<body style="margin:0;font-family:monospace;background:#101820;color:#eee">
+		<h1 style="background:#1f6feb;color:#fff;margin:0;padding:12px 16px">Offline stealth detector probe</h1>
+		<canvas id="bg" width="1365" height="768" style="position:fixed;inset:0;z-index:-1"></canvas>
+		<div id="grid" style="display:flex;flex-wrap:wrap;gap:8px;padding:16px"></div>
+		<pre id="out" style="padding:16px;color:#9ad"></pre>
+		<script>
+			// Self-contained, offline fingerprint probe modeled on the public
+			// bot.sannysoft / CreepJS boolean signal set. No network access.
+			// Emits window.__stealthProbe as the RawProbe shape consumed by
+			// src/tools/browser/benchmark/detector-report.ts.
+			(function () {
+				function signal(id, label, pass, detail) {
+					return { id: id, label: label, pass: !!pass, detail: detail };
+				}
+
+				var signals = [];
+
+				// webdriver flag must be undefined/false for a human browser.
+				signals.push(
+					signal(
+						"webdriver",
+						"navigator.webdriver undefined",
+						navigator.webdriver === undefined || navigator.webdriver === false,
+						String(navigator.webdriver),
+					),
+				);
+
+				// Real browsers expose >=1 plugin (or a plausible shim).
+				var pluginCount = navigator.plugins ? navigator.plugins.length : 0;
+				signals.push(signal("plugins", "navigator.plugins non-empty", pluginCount > 0, "count=" + pluginCount));
+
+				// languages should be a non-empty array.
+				var langs = navigator.languages || [];
+				signals.push(signal("languages", "navigator.languages non-empty", langs.length > 0, langs.join(",")));
+
+				// window.chrome runtime object present in Chrome.
+				signals.push(signal("chrome", "window.chrome present", typeof window.chrome === "object" && window.chrome !== null));
+
+				// Notification permission must not be "denied" while state is default.
+				var permsOk = true;
+				var permDetail = "n/a";
+				try {
+					permDetail = Notification && Notification.permission;
+					permsOk = permDetail !== undefined;
+				} catch (e) {
+					permsOk = false;
+					permDetail = "error";
+				}
+				signals.push(signal("permissions", "Notification.permission readable", permsOk, String(permDetail)));
+
+				// WebGL vendor/renderer should not be blank or SwiftShader-only.
+				var glOk = false;
+				var glDetail = "no-webgl";
+				try {
+					var canvas = document.createElement("canvas");
+					var gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+					if (gl) {
+						var dbg = gl.getExtension("WEBGL_debug_renderer_info");
+						var renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+						glDetail = String(renderer || "");
+						glOk = glDetail.length > 0 && !/swiftshader/i.test(glDetail);
+					}
+				} catch (e) {
+					glDetail = "error";
+				}
+				signals.push(signal("webgl", "WebGL renderer plausible", glOk, glDetail));
+
+				var failing = signals.filter(function (s) {
+					return !s.pass;
+				}).length;
+
+				window.__stealthProbe = {
+					detector: "sannysoft-offline",
+					signals: signals,
+					automatedVerdict: failing === 0 ? "human" : "bot",
+					trustScore: null,
+				};
+
+				document.getElementById("out").textContent = JSON.stringify(window.__stealthProbe, null, 2);
+
+				var grid = document.getElementById("grid");
+				signals.forEach(function (s) {
+					var cell = document.createElement("div");
+					cell.style.cssText =
+						"width:150px;height:70px;border-radius:6px;padding:8px;color:#000;font-size:12px;" +
+						"background:" + (s.pass ? "#3fb950" : "#f85149");
+					cell.textContent = s.label + " = " + (s.pass ? "PASS" : "FAIL");
+					grid.appendChild(cell);
+				});
+
+				// Deterministic high-variance backdrop so a captured screenshot is
+				// unambiguously non-uniform (varied colors across the whole viewport).
+				try {
+					var cv = document.getElementById("bg");
+					var cx = cv.getContext("2d");
+					var img = cx.createImageData(cv.width, cv.height);
+					var d = img.data;
+					var seed = 0x9e3779b9;
+					for (var i = 0; i < d.length; i += 4) {
+						// xorshift PRNG -> deterministic per-pixel noise (defeats PNG
+						// filter compression, guaranteeing a high-entropy image).
+						seed ^= seed << 13;
+						seed ^= seed >>> 17;
+						seed ^= seed << 5;
+						var r = seed >>> 0;
+						d[i] = r & 0xff;
+						d[i + 1] = (r >>> 8) & 0xff;
+						d[i + 2] = (r >>> 16) & 0xff;
+						d[i + 3] = 255;
+					}
+					cx.putImageData(img, 0, 0);
+				} catch (e) {}
+			})();
+		</script>
+	</body>
+</html>

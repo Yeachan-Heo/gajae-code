@@ -2386,6 +2386,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"browser.profileReuse": {
+		type: "string",
+		default: "auto",
+		validate: (value: string) => value === "auto" || value === "opt-in",
+		ui: {
+			tab: "tools",
+			label: "Profile reuse posture",
+			description:
+				"'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+		},
+	},
+
 	"browser.gc.enabled": {
 		type: "boolean",
 		default: true,

@@ -230,6 +230,14 @@ function resolveSystemChromium(): string | undefined {
 export interface LaunchHeadlessOptions {
 	headless: boolean;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
+	/**
+	 * Optional isolated warm-up profile directory (see profile-reuse.ts). When
+	 * set, the headless browser launches against this isolated copy of the user's
+	 * real Chrome profile so sessions inherit real cookies/storage/cache for
+	 * stronger stealth. Callers resolve this via resolveProfileReuse and MUST
+	 * pass an isolated copy, never a live profile dir.
+	 */
+	profileWarmupDir?: string;
 }
 
 export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<Browser> {
@@ -246,6 +254,10 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		"--disable-blink-features=AutomationControlled",
 		`--window-size=${initialViewport.width},${initialViewport.height}`,
 	];
+	if (opts.profileWarmupDir) {
+		// Isolated copy only (caller guarantees). Never point this at a live profile.
+		launchArgs.push(`--user-data-dir=${opts.profileWarmupDir}`);
+	}
 	const proxy = process.env.PUPPETEER_PROXY;
 	if (proxy) {
 		launchArgs.push(`--proxy-server=${proxy}`);

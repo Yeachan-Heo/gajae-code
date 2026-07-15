@@ -233,6 +233,8 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 						}
 					: undefined,
 				appArgs: params.app?.args,
+				profileReuse:
+					(this.session.settings.get("browser.profileReuse") as "auto" | "opt-in" | undefined) ?? "auto",
 				signal,
 			}),
 		);
