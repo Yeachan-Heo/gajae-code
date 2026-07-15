@@ -2398,6 +2398,27 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"browser.geo.timezone": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			label: "Geo timezone override",
+			description:
+				"Optional IANA timezone (e.g. 'America/New_York') for headless sessions. Default unset preserves the real timezone. Only set this to a value coherent with your egress (e.g. a proxy region); an incoherent timezone increases bot detection.",
+		},
+	},
+	"browser.geo.locale": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			label: "Geo locale override",
+			description:
+				"Optional UI locale (e.g. 'en-US') for headless sessions. Default unset preserves the real locale. Only set this coherently with your egress region.",
+		},
+	},
+
 	"browser.gc.enabled": {
 		type: "boolean",
 		default: true,

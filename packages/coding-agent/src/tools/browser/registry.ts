@@ -80,6 +80,11 @@ export interface AcquireBrowserOptions {
 	 * Chrome profile (see profile-reuse.ts). Omitted = synthetic session.
 	 */
 	profileReuse?: ProfileReusePosture;
+	/**
+	 * Opt-in geo alignment for the default headless path (from settings
+	 * `browser.geo.*`). Default unset = no-op (real timezone/locale preserved).
+	 */
+	geo?: { timezone?: string; locale?: string };
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
@@ -113,6 +118,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			headless: kind.headless,
 			viewport: opts.viewport,
 			profileWarmupDir,
+			...(opts.geo ? { geo: opts.geo } : {}),
 		});
 		return {
 			key: browserKey(kind),

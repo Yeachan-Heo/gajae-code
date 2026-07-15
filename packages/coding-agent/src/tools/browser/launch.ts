@@ -20,6 +20,7 @@ import stealthHardwareScript from "../puppeteer/11_stealth_hardware.txt" with { 
 import stealthCodecsScript from "../puppeteer/12_stealth_codecs.txt" with { type: "text" };
 import stealthWorkerScript from "../puppeteer/13_stealth_worker.txt" with { type: "text" };
 import stealthPermissionsScript from "../puppeteer/14_stealth_permissions.txt" with { type: "text" };
+import stealthWebrtcScript from "../puppeteer/15_stealth_webrtc.txt" with { type: "text" };
 import { ToolError } from "../tool-errors";
 
 export const DEFAULT_VIEWPORT = { width: 1365, height: 768, deviceScaleFactor: 1.25 };
@@ -239,6 +240,14 @@ export interface LaunchHeadlessOptions {
 	 * pass an isolated copy, never a live profile dir.
 	 */
 	profileWarmupDir?: string;
+	/**
+	 * Optional opt-in geo alignment (see settings browser.geo.*). When set, the
+	 * browser is launched with a matching timezone (TZ env) and/or UI language
+	 * (--lang) at the source. Default unset = strict no-op: the real environment
+	 * timezone/locale are preserved (never half-spoof). Only align these to a
+	 * coherent value (e.g. one matching a configured proxy egress).
+	 */
+	geo?: { timezone?: string; locale?: string };
 }
 
 export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<Browser> {
@@ -253,6 +262,10 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
 		"--disable-blink-features=AutomationControlled",
+		// Suppress WebRTC leaking the real local/public IP via ICE candidates
+		// (a common bot tell). Keeps WebRTC functional over the default public
+		// interface only; 15_stealth_webrtc.txt adds a candidate-level guard.
+		"--force-webrtc-ip-handling-policy=default_public_interface_only",
 		`--window-size=${initialViewport.width},${initialViewport.height}`,
 	];
 	if (opts.profileWarmupDir) {
@@ -269,15 +282,22 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 			launchArgs.push("--proxy-bypass-list=<-loopback>");
 		}
 	}
+	// Opt-in geo alignment (default no-op). Locale via --lang at the source;
+	// timezone via the TZ env passed to the Chrome subprocess.
+	if (opts.geo?.locale) {
+		launchArgs.push(`--lang=${opts.geo.locale}`);
+	}
 	const ignoreCert = process.env.PUPPETEER_PROXY_IGNORE_CERT_ERRORS?.toLowerCase();
 	if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
 		launchArgs.push("--ignore-certificate-errors");
 	}
+	const launchEnv = opts.geo?.timezone ? { ...process.env, TZ: opts.geo.timezone } : undefined;
 	return await puppeteer.launch({
 		headless: opts.headless,
 		defaultViewport: opts.headless ? initialViewport : null,
 		executablePath: await ensureChromiumExecutable(),
 		args: launchArgs,
+		...(launchEnv ? { env: launchEnv } : {}),
 		ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
 		protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 	});
@@ -569,6 +589,7 @@ const STEALTH_PATCH_SCRIPTS = [
 	stealthCodecsScript,
 	stealthWorkerScript,
 	stealthPermissionsScript,
+	stealthWebrtcScript,
 ];
 
 function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_SCRIPTS): string {

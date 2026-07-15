@@ -9,7 +9,7 @@ carries an attributing header comment.
 | Source project | License | Techniques referenced |
 |----------------|---------|-----------------------|
 | rebrowser-patches | MIT | CDP `Runtime.enable` leak mitigation (data-driven; landed only if the offline baseline shows a runtime/CDP leak signal) |
-| puppeteer-extra-plugin-stealth | MIT | Fingerprint evasion signal set (navigator/webgl/plugins/permissions surfaces) overlapping and complementing the existing 14 injection scripts |
+| puppeteer-extra-plugin-stealth | MIT | Fingerprint evasion signal set (navigator/webgl/plugins/permissions/webrtc surfaces) overlapping and complementing the existing injection scripts |
 | fingerprint-suite (fingerprint-injector / generator) | Apache-2.0 | Coherent fingerprint attribute generation ideas |
 
 No source files from these projects are copied into this repository. Only the
