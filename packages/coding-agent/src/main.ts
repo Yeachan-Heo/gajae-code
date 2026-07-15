@@ -65,7 +65,7 @@ import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
-import { persistTaskTokenLog, resolveTaskTokenLogDir, taskTokenLogFromUsage } from "./task/token-log";
+import { resolveTaskTokenLogDir, taskTokenLogFromUsage, tryPersistTaskTokenLog } from "./task/token-log";
 import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
@@ -1218,7 +1218,7 @@ export async function runRootCommand(
 			}
 			if (!rootTokenLogDir) return;
 			rootTokenTurn += 1;
-			await persistTaskTokenLog(
+			await tryPersistTaskTokenLog(
 				taskTokenLogFromUsage(event.usage, {
 					subagentId: "root",
 					agent: event.agent?.name ?? "main",

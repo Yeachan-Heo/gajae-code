@@ -43,7 +43,7 @@ import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
-import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
+import { taskTokenLogFromUsage, tryPersistTaskTokenLog } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
@@ -1323,7 +1323,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							onChatUsage: async event => {
 								if (!tokenLogDir) return;
 								subagentTokenTurn += 1;
-								await persistTaskTokenLog(
+								await tryPersistTaskTokenLog(
 									taskTokenLogFromUsage(event.usage, {
 										subagentId: id,
 										agent: agent.name,

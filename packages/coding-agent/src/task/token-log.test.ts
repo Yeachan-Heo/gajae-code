@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GJC_SESSION_ACTIVITY_FILE, sessionRoot } from "../gjc-runtime/session-layout";
@@ -10,6 +10,7 @@ import {
 	resolveTaskTokenLogDir,
 	taskTokenLogFromChat,
 	taskTokenLogFromUsage,
+	tryPersistTaskTokenLog,
 } from "./token-log";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -91,6 +92,38 @@ describe("task token log", () => {
 			await persistTaskTokenLog(second, { dir });
 
 			expect(await readTaskTokenLogs(dir)).toEqual([first, second]);
+		});
+	});
+
+	it("contains a best-effort persistence failure without throwing or writing", async () => {
+		await withTempDir(async dir => {
+			// A regular file where a session-root directory is expected makes the
+			// recursive mkdir in persistTaskTokenLog fail (ENOTDIR), standing in for
+			// an unwritable session root such as `/.gjc` on a filesystem-root launch.
+			const blocker = join(dir, "not-a-directory");
+			await writeFile(blocker, "", "utf-8");
+			const unwritable = join(blocker, "token-logs");
+			const entry = taskTokenLogFromChat(
+				{ inputTokens: 1, outputTokens: 2, cachedInputTokens: 3, cacheWriteTokens: 4 },
+				{ subagentId: "root", turn: 1, at: "2026-01-01T00:00:00.000Z" },
+			);
+
+			await expect(tryPersistTaskTokenLog(entry, { dir: unwritable })).resolves.toBeUndefined();
+			// Nothing was created: the blocking file is untouched and no token-logs dir appeared.
+			expect(await readdir(dir)).toEqual(["not-a-directory"]);
+		});
+	});
+
+	it("persists best-effort when the directory is writable", async () => {
+		await withTempDir(async dir => {
+			const entry = taskTokenLogFromChat(
+				{ inputTokens: 9, outputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0 },
+				{ subagentId: "root", turn: 1, at: "2026-01-01T00:00:00.000Z" },
+			);
+
+			await tryPersistTaskTokenLog(entry, { dir });
+
+			expect(await readTaskTokenLogs(dir)).toEqual([entry]);
 		});
 	});
 

@@ -6,6 +6,7 @@
 
 - Cooperative mid-run context maintenance now waits at a cancellation-aware FIFO consumer-drain checkpoint before flushing or rewriting session history. Materialized tool results and steering messages are synchronously canonicalized first; aborted barriers and hook/signal-cancelled compactions settle without rewriting or scheduling a continuation. Promotion, pruning, and compaction each start a clean provider/prompt-cache epoch. Script-aware #2067 unsent-delta accounting remains cache-free and distinct from the lifecycle checkpoint.
 - Classified the cooperative mid-run maintenance driver and token estimator test seams as locked non-public SDK exclusions, restoring deterministic operation-inventory generation and post-merge dev CI coverage.
+- Contained best-effort token-log telemetry persistence so it can no longer surface as an `onChatUsage` callback failure. When the per-session token-log directory cannot be created — for example a launch from a filesystem root, where the session root resolves to `/.gjc/...` a normal user cannot create — the write is now attempted and its failure is swallowed locally instead of raising `EACCES` on every chat-usage event. The caller's working directory and project identity are left untouched; mandatory session-state writes are unaffected and continue to fail loudly.
 
 ### Added
 

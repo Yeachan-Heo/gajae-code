@@ -97,6 +97,23 @@ export async function persistTaskTokenLog(entry: TaskTokenLog, opts: { dir: stri
 	await fs.appendFile(path.join(opts.dir, TOKEN_LOG_FILE), `${JSON.stringify(entry)}\n`, "utf-8");
 }
 
+/**
+ * Best-effort variant of {@link persistTaskTokenLog}. Token-log persistence is a
+ * telemetry side channel, so a session directory the caller cannot create (for
+ * example a launch from a filesystem root, where the session root would be
+ * `/.gjc/...`) must never surface as an `onChatUsage` callback failure. The
+ * write is attempted and any failure is contained locally; the caller's working
+ * directory and project identity are left untouched. Mandatory state writes must
+ * NOT use this path — they need an explicit storage policy that can report failure.
+ */
+export async function tryPersistTaskTokenLog(entry: TaskTokenLog, opts: { dir: string }): Promise<void> {
+	try {
+		await persistTaskTokenLog(entry, opts);
+	} catch {
+		// Contained: token-log telemetry is best-effort and must not fail a turn.
+	}
+}
+
 export async function readTaskTokenLogs(dir: string): Promise<TaskTokenLog[]> {
 	let raw: string;
 	try {
