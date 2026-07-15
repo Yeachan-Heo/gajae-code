@@ -573,16 +573,26 @@ async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: string | 
 
 function chooseReceiptKind(
 	plan: UltragoalPlan,
+	ledger: readonly UltragoalLedgerEvent[],
 	goal: UltragoalGoal,
 	status: UltragoalGoalStatus,
 ): UltragoalReceiptKind {
 	if (plan.gjcGoalMode === "per-story") return "per-goal";
 	if (status !== "complete") return "per-goal";
 	const requiredGoals = requiredUltragoalGoals(plan);
-	const existingFinalAggregateGoal = requiredGoals.find(
-		item => item.id !== goal.id && item.completionVerification?.receiptKind === "final-aggregate",
-	);
-	if (existingFinalAggregateGoal) return "per-goal";
+	// Only a still-fresh final-aggregate receipt on another goal defers this
+	// checkpoint to per-goal. A stale one (e.g. staled by `steer add_subgoal`
+	// appending goals after a terminal run) must not suppress re-minting,
+	// otherwise the run can never regain a verifiable final-aggregate receipt:
+	// the completion guard demands a fresh final-aggregate receipt while this
+	// gate would keep answering per-goal forever.
+	const existingFreshFinalAggregateGoal = requiredGoals.find(item => {
+		if (item.id === goal.id) return false;
+		const receipt = item.completionVerification;
+		if (receipt?.receiptKind !== "final-aggregate") return false;
+		return validateReceiptFreshBase({ plan, ledger, goal: item, receipt, receiptKind: "final-aggregate" }) === null;
+	});
+	if (existingFreshFinalAggregateGoal) return "per-goal";
 	const unfinishedRequiredGoals = requiredGoals.filter(
 		item => item.id !== goal.id && !TERMINAL_OR_SKIPPED_STATUSES.has(item.status),
 	);
@@ -4047,7 +4057,7 @@ export async function checkpointUltragoalGoal(input: {
 			blockedGoal.updatedAt = now;
 		}
 	}
-	const receiptKind = input.status === "complete" ? chooseReceiptKind(plan, goal, input.status) : null;
+	const receiptKind = input.status === "complete" ? chooseReceiptKind(plan, ledgerBefore, goal, input.status) : null;
 	const pendingCheckpointEventId = crypto.randomUUID();
 	if (input.status === "complete" && receiptKind && qualityGateJson && !Array.isArray(qualityGateJson)) {
 		goal.completionVerification = buildCompletionReceipt({
