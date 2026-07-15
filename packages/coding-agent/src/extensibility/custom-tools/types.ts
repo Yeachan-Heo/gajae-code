@@ -102,6 +102,7 @@ export type CustomToolSessionEvent =
 			aborted: boolean;
 			willRetry: boolean;
 			errorMessage?: string;
+			goal_finalized?: boolean;
 	  }
 	| {
 			reason: "auto_retry_start";
@@ -116,6 +117,8 @@ export type CustomToolSessionEvent =
 			success: boolean;
 			attempt: number;
 			finalError?: string;
+			goal_finalized?: boolean;
+			goal_generation_id?: string;
 	  }
 	| {
 			reason: "ttsr_triggered";

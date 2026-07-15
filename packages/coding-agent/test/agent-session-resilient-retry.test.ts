@@ -7,6 +7,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { GoalModeState } from "@gajae-code/coding-agent/goals/state";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -181,6 +182,22 @@ describe("AgentSession resilient retry", () => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
 		return { retryStartEvents, retryEndEvents };
+	}
+
+	function activeGoalState(): GoalModeState {
+		return {
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "Complete the durable ultragoal plan",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		};
 	}
 
 	it("retries transient errors past retry.maxRetries (unbounded)", async () => {
@@ -599,6 +616,133 @@ describe("AgentSession resilient retry", () => {
 		expect(retryEndEvents[0]).toMatchObject({ success: false });
 		expect(session.isRetrying).toBe(false);
 		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("pauses active goal continuations when retry recovery ends on a terminal provider error", async () => {
+		session = buildSession({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error" },
+				{ throw: "401 unauthorized: invalid api key" },
+			],
+		});
+		session.setGoalModeState(activeGoalState());
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const notices: string[] = [];
+		const { retryStartEvents, retryEndEvents } = track(session);
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+
+		await session.promptCustomMessage({
+			customType: "goal-continuation",
+			content: "continue the active goal",
+			display: false,
+		});
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: false, goal_finalized: true });
+		expect(retryEndEvents[0].goal_generation_id).toBeTypeOf("string");
+		const goal = session.getGoalModeState()?.goal;
+		expect(goal).toMatchObject({
+			status: "paused",
+			last_error: {
+				source: "goal-continuation",
+				class: "config",
+				message: "401 unauthorized: invalid api key",
+				pause_cause: "provider_final_error",
+				retry_attempt: 1,
+				generation_id: retryEndEvents[0].goal_generation_id,
+			},
+		});
+		expect(session.getGoalModeState()?.enabled).toBe(false);
+		expect(notices.filter(message => message.includes("Goal paused after provider failure"))).toHaveLength(1);
+		expect(session.isRetrying).toBe(false);
+	});
+
+	it("pauses active goal continuations on immediate terminal provider errors", async () => {
+		session = buildSession({
+			responses: [{ throw: "401 unauthorized: invalid api key" }],
+		});
+		session.setGoalModeState(activeGoalState());
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.promptCustomMessage({
+			customType: "goal-continuation",
+			content: "continue the active goal",
+			display: false,
+		});
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(retryEndEvents).toHaveLength(0);
+		expect(session.getGoalModeState()?.goal).toMatchObject({
+			status: "paused",
+			last_error: {
+				class: "config",
+				message: "401 unauthorized: invalid api key",
+				pause_cause: "provider_final_error",
+			},
+		});
+		expect(session.getGoalModeState()?.enabled).toBe(false);
+	});
+
+	it("pauses reminder-driven goal continuations on terminal provider errors", async () => {
+		session = buildSession({
+			responses: [{ content: ["still working"] }, { throw: "401 unauthorized: invalid api key" }],
+		});
+		session.setGoalModeState(activeGoalState());
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+
+		await session.prompt("start the active goal");
+		await session.waitForIdle();
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		await session.waitForIdle();
+
+		expect(session.getGoalModeState()?.goal).toMatchObject({
+			status: "paused",
+			last_error: {
+				class: "config",
+				message: "401 unauthorized: invalid api key",
+				pause_cause: "provider_final_error",
+			},
+		});
+		expect(session.getGoalModeState()?.enabled).toBe(false);
+		expect(notices.filter(message => message.includes("Goal paused after provider failure"))).toHaveLength(1);
+	});
+
+	it("pauses active goal continuations on preflight credential failures", async () => {
+		session = buildSession({
+			responses: [{ content: ["should not run"] }],
+		});
+		session.setGoalModeState(activeGoalState());
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue(undefined);
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+
+		await expect(
+			session.promptCustomMessage({
+				customType: "goal-continuation",
+				content: "continue the active goal",
+				display: false,
+			}),
+		).rejects.toThrow();
+
+		expect(session.getGoalModeState()?.goal).toMatchObject({
+			status: "paused",
+			last_error: {
+				class: "config",
+				pause_cause: "terminal_error",
+			},
+		});
+		expect(session.getGoalModeState()?.enabled).toBe(false);
+		expect(notices.filter(message => message.includes("Goal paused after provider failure"))).toHaveLength(1);
 	});
 
 	it("honors retryNow() invoked synchronously from the auto_retry_start subscriber", async () => {

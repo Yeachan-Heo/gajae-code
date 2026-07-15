@@ -218,6 +218,7 @@ export interface AutoCompactionEndEvent {
 	/** True when compaction was skipped for a benign reason (no model, no candidates, nothing to compact). */
 	skipped?: boolean;
 	continuationSkipReason?: "auto_continue_disabled_non_resumable_tail";
+	goal_finalized?: boolean;
 }
 
 /** Fired when auto-retry starts */
@@ -236,6 +237,8 @@ export interface AutoRetryEndEvent {
 	success: boolean;
 	attempt: number;
 	finalError?: string;
+	goal_finalized?: boolean;
+	goal_generation_id?: string;
 }
 
 // ============================================================================
