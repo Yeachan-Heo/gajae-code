@@ -3034,6 +3034,86 @@ describe("native GJC ultragoal runtime", () => {
 		expect(durable.state).toBe("active_verified_complete");
 	});
 
+	it("re-mints the receipt on identical-evidence replay after a goal-tagged ledger event staled it", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		const classified = await runNativeUltragoalCommand(
+			[
+				"classify-blocker",
+				"--classification",
+				"resolvable",
+				"--evidence",
+				"post-completion audit note tagged to the completed goal",
+				"--goal-id",
+				"G001",
+			],
+			root,
+		);
+		expect(classified.status).toBe(0);
+
+		// The goal-tagged blocker_classified event stales the recorded receipt.
+		const staleDurable = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });
+		expect(staleDurable.state).not.toBe("active_verified_complete");
+		const checkpointsBefore = (await readUltragoalLedger(root)).filter(
+			event => event.event === "goal_checkpointed",
+		).length;
+
+		// Different evidence stays rejected on complete goals; the identical
+		// evidence replay must re-verify and mint a fresh receipt instead of
+		// no-opping on the stale one (which would be unrepairable forever).
+		const replayed = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		expect(replayed.goals[0]?.completionVerification?.receiptKind).toBe("final-aggregate");
+		expect((await readUltragoalLedger(root)).filter(event => event.event === "goal_checkpointed")).toHaveLength(
+			checkpointsBefore + 1,
+		);
+		const durable = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });
+		expect(durable.state).toBe("active_verified_complete");
+	});
+
+	it("rejects identical-evidence replay when the goal row changed after receipt verification", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		const goalsPath = path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json");
+		const saved = JSON.parse(await Bun.file(goalsPath).text());
+		saved.goals[0].updatedAt = new Date(Date.now() + 1000).toISOString();
+		await fs.writeFile(goalsPath, `${JSON.stringify(saved, null, 2)}\n`);
+
+		// A mutated complete row is neither a clean no-op nor a repairable
+		// context-stale replay; it must fail loud instead of silently
+		// laundering the inconsistency.
+		await expect(
+			checkpointUltragoalGoal({
+				cwd: root,
+				goalId: "G001",
+				status: "complete",
+				evidence: "first goal verified",
+				qualityGateJson: await passingLiveQualityGate(root),
+			}),
+		).rejects.toThrow("changed after its completion receipt was verified");
+	});
+
 	it("re-mints the final-aggregate receipt when repairing a non-final goal after aggregate completion (#1777)", async () => {
 		for (const repairStatus of ["active", "failed"] as const) {
 			const root = await tempDir();
