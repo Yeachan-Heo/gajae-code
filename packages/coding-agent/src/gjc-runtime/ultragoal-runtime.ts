@@ -579,6 +579,12 @@ function chooseReceiptKind(
 ): UltragoalReceiptKind {
 	if (plan.gjcGoalMode === "per-story") return "per-goal";
 	if (status !== "complete") return "per-goal";
+	// A non-final validation-batch member must always carry a per-goal
+	// deferred receipt; only the batch's final goal may close the batch and
+	// (in aggregate mode) carry the final-aggregate receipt. Without this, a
+	// context-stale re-verification replay of a member could mint an invalid
+	// final-aggregate receipt with validationBatch.role "deferred-member".
+	if (goal.validationBatch && goal.validationBatch.finalGoalId !== goal.id) return "per-goal";
 	const requiredGoals = requiredUltragoalGoals(plan);
 	// Only a still-fresh final-aggregate receipt on another goal defers this
 	// checkpoint to per-goal. A stale one (e.g. staled by `steer add_subgoal`

@@ -3167,6 +3167,40 @@ describe("native GJC ultragoal runtime", () => {
 		return plan;
 	}
 
+	it("keeps per-goal deferred receipts when replaying a context-staled validation batch member", async () => {
+		const root = await batchTempDir();
+		const plan = await completedValidationBatchPlan(root);
+
+		const classified = await runNativeUltragoalCommand(
+			[
+				"classify-blocker",
+				"--classification",
+				"resolvable",
+				"--evidence",
+				"post-completion audit note tagged to the completed member",
+				"--goal-id",
+				"G001",
+			],
+			root,
+		);
+		expect(classified.status).toBe(0);
+
+		// The goal-tagged event stales G001's deferred receipt AND the batch
+		// aggregate close. The member's re-verification replay must stay a
+		// per-goal deferred receipt; minting final-aggregate on a non-final
+		// batch member would poison subsequent batch-close repair.
+		const replayed = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "g001 deferred",
+			qualityGateJson: deferredBatchGate("G001", plan.goals[0]!.validationBatch!),
+		});
+		const memberReceipt = replayed.goals[0]?.completionVerification;
+		expect(memberReceipt?.receiptKind).toBe("per-goal");
+		expect(memberReceipt?.validationBatch?.role).toBe("deferred-member");
+	});
+
 	it("no-ops repeated identical-evidence batch close replays after a re-mint", async () => {
 		const root = await batchTempDir();
 		const plan = await completedValidationBatchPlan(root);
