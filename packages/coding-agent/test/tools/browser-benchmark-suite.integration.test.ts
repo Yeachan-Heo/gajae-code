@@ -50,6 +50,11 @@ describe("offline stealth benchmark (integration)", () => {
 			const webdriver = detector.signals.find(s => s.id === "webdriver");
 			expect(webdriver?.status).toBe("pass");
 
+			// The permissions patch must normalize the headless Notification.permission
+			// tell ("denied" -> "default") that CreepJS keys on.
+			const notification = detector.signals.find(s => s.id === "notification");
+			expect(notification?.status).toBe("pass");
+
 			// Persist a baseline + report artifact (observability).
 			const artifactsDir = path.join(import.meta.dir, "..", "..", "artifacts", "stealth-benchmark");
 			fs.mkdirSync(artifactsDir, { recursive: true });

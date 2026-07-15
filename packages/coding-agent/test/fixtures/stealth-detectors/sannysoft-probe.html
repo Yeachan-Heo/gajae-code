@@ -42,17 +42,18 @@
 				// window.chrome runtime object present in Chrome.
 				signals.push(signal("chrome", "window.chrome present", typeof window.chrome === "object" && window.chrome !== null));
 
-				// Notification permission must not be "denied" while state is default.
+				// Notification.permission must be readable AND not "denied": headless
+				// Chrome defaults to "denied", a real user browser to "default".
 				var permsOk = true;
 				var permDetail = "n/a";
 				try {
 					permDetail = Notification && Notification.permission;
-					permsOk = permDetail !== undefined;
+					permsOk = permDetail !== undefined && permDetail !== "denied";
 				} catch (e) {
 					permsOk = false;
 					permDetail = "error";
 				}
-				signals.push(signal("permissions", "Notification.permission readable", permsOk, String(permDetail)));
+				signals.push(signal("notification", "Notification.permission not headless-denied", permsOk, String(permDetail)));
 
 				// WebGL vendor/renderer should not be blank or SwiftShader-only.
 				var glOk = false;

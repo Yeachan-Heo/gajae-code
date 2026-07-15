@@ -19,6 +19,7 @@ import stealthPluginsScript from "../puppeteer/10_stealth_plugins.txt" with { ty
 import stealthHardwareScript from "../puppeteer/11_stealth_hardware.txt" with { type: "text" };
 import stealthCodecsScript from "../puppeteer/12_stealth_codecs.txt" with { type: "text" };
 import stealthWorkerScript from "../puppeteer/13_stealth_worker.txt" with { type: "text" };
+import stealthPermissionsScript from "../puppeteer/14_stealth_permissions.txt" with { type: "text" };
 import { ToolError } from "../tool-errors";
 
 export const DEFAULT_VIEWPORT = { width: 1365, height: 768, deviceScaleFactor: 1.25 };
@@ -567,6 +568,7 @@ const STEALTH_PATCH_SCRIPTS = [
 	stealthHardwareScript,
 	stealthCodecsScript,
 	stealthWorkerScript,
+	stealthPermissionsScript,
 ];
 
 function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_SCRIPTS): string {
