@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { Browser } from "puppeteer-core";
+import { DEAD_TAB_RECOVERY_TTL_MS } from "../../src/tools/browser/dead-tab-recovery";
 import type { BrowserHandle, BrowserKindTag } from "../../src/tools/browser/registry";
 import {
 	clearTabsForTest,
 	getTab,
 	listTabsForGc,
+	markTabDeadForTest,
 	releaseTab,
 	releaseTabIfGcEligible,
 	setTabForTest,
@@ -124,7 +126,6 @@ describe("tab-supervisor GC primitives", () => {
 		{ label: "in-flight", opts: { name: "a", kindTag: "headless", lastUsedAt: NOW - 5000, pendingCount: 1 } },
 		{ label: "recently used", opts: { name: "a", kindTag: "headless", lastUsedAt: NOW } },
 		{ label: "idle exactly at threshold", opts: { name: "a", kindTag: "headless", lastUsedAt: NOW - IDLE_MS } },
-		{ label: "dead", opts: { name: "a", kindTag: "headless", lastUsedAt: NOW - 5000, state: "dead" } },
 	];
 
 	for (const { label, opts } of protectedCases) {
@@ -144,6 +145,45 @@ describe("tab-supervisor GC primitives", () => {
 		getTab("a")?.pending.set("run", { reject: () => {}, resolve: () => {}, toolCalls: new Map() } as never);
 		expect(await releaseTabIfGcEligible("a", policy)).toBe(false);
 		expect(getTab("a")).toBeDefined();
+	});
+
+	it("holds a dead tab during the recovery window and evicts it after the descriptor expires", async () => {
+		const { close, terminate } = installTab({ name: "a", kindTag: "headless", lastUsedAt: NOW - 5000 });
+		markTabDeadForTest("a", "worker-closed");
+		const deadAt = getTab("a")?.lastUsedAt;
+		expect(deadAt).toBeDefined();
+
+		expect(
+			await releaseTabIfGcEligible("a", {
+				now: () => deadAt! + DEAD_TAB_RECOVERY_TTL_MS - 1,
+				idleMs: 0,
+			}),
+		).toBe(false);
+		expect(getTab("a")).toBeDefined();
+
+		expect(
+			await releaseTabIfGcEligible("a", {
+				now: () => deadAt! + DEAD_TAB_RECOVERY_TTL_MS + 1,
+				idleMs: 0,
+			}),
+		).toBe(true);
+		expect(terminate).toHaveBeenCalled();
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(getTab("a")).toBeUndefined();
+	});
+
+	it("evicts an idle dead tab with no recovery descriptor", async () => {
+		const { close, terminate } = installTab({
+			name: "a",
+			kindTag: "headless",
+			lastUsedAt: NOW - 5000,
+			state: "dead",
+		});
+
+		expect(await releaseTabIfGcEligible("a", policy)).toBe(true);
+		expect(terminate).toHaveBeenCalledTimes(1);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(getTab("a")).toBeUndefined();
 	});
 
 	it("decrements browser refCount exactly once under concurrent double release", async () => {

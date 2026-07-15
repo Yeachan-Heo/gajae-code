@@ -78,6 +78,29 @@ describe("resource GC controller", () => {
 		expect(releaseTab.mock.calls.map(c => c[0])).toEqual(["old", "mid"]);
 	});
 
+	it("idle sweep sends expired dead tabs to the authoritative release recheck", async () => {
+		const settings = Settings.isolated({
+			"browser.gc.enabled": true,
+			"browser.gc.idleMs": 1000,
+			"browser.gc.rssLimitMb": 1_000_000,
+			"computer.screenshotGc.enabled": false,
+		});
+		registerResourceGcSession({ sessionId: "s1", settings });
+		const releaseTab = vi.fn(async (_name: string) => true);
+
+		await sweepOnce(
+			baseDeps({
+				releaseTab,
+				listTabs: () => [
+					snapshot("dead", "s1", NOW - 5000, { state: "dead", kindTag: "connected" }),
+					snapshot("live-connected", "s1", NOW - 5000, { kindTag: "connected" }),
+				],
+			}),
+		);
+
+		expect(releaseTab.mock.calls.map(c => c[0])).toEqual(["dead"]);
+	});
+
 	it("skips tabs owned by no registered session", async () => {
 		const settings = Settings.isolated({ "browser.gc.idleMs": 1000, "browser.gc.rssLimitMb": 1_000_000 });
 		registerResourceGcSession({ sessionId: "s1", settings });

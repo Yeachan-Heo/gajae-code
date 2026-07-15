@@ -5,6 +5,7 @@ import type { ToolSession } from "../../sdk";
 import { expandPath } from "../path-utils";
 import { ToolAbortError, ToolError } from "../tool-errors";
 import { pickElectronTarget } from "./attach";
+import { type DeadTabRecoveryDescriptor, DeadTabRecoveryDescriptorRegistry } from "./dead-tab-recovery";
 import { type BrowserHandle, type BrowserKindTag, holdBrowser, releaseBrowser } from "./registry";
 import type {
 	ReadyInfo,
@@ -98,6 +99,8 @@ export interface ReleaseTabOptions {
 }
 
 const tabs = new Map<string, TabSession>();
+const deadTabRecovery = new DeadTabRecoveryDescriptorRegistry();
+const recoveryByName = new Map<string, Promise<TabSession | undefined>>();
 const GRACE_MS = 750;
 
 /**
@@ -195,10 +198,14 @@ export async function releaseTabIfGcEligible(name: string, policy: BrowserGcElig
 	const tab = tabs.get(name);
 	if (!tab) return false;
 	if (tab.releasing) return false;
-	if (tab.state !== "alive") return false;
 	if (tab.pending.size !== 0) return false;
-	if (tab.kindTag !== "headless" && tab.kindTag !== "spawned") return false;
 	if (policy.now() - tab.lastUsedAt <= policy.idleMs) return false;
+	if (tab.state === "dead") {
+		if (recoveryByName.has(name)) return false;
+		if (deadTabRecovery.peekByName(name, policy.now())) return false;
+		return await releaseTab(name, { kill: false });
+	}
+	if (tab.kindTag !== "headless" && tab.kindTag !== "spawned") return false;
 	// All predicates passed synchronously; releaseTab applies the shared begin-release guard
 	// on the same microtask, so no other code runs between the check and the state transition.
 	return await releaseTab(name, { kill: false });
@@ -212,6 +219,14 @@ export function setTabForTest(tab: TabSession): void {
 /** Test-only: clear the tab registry between cases. */
 export function clearTabsForTest(): void {
 	tabs.clear();
+	deadTabRecovery.clear();
+	recoveryByName.clear();
+}
+
+/** Test-only: mark a fabricated tab dead through the production death path. */
+export function markTabDeadForTest(name: string, reason = "test"): void {
+	const tab = tabs.get(name);
+	if (tab) markTabDead(tab, reason);
 }
 
 export async function acquireTab(
@@ -290,6 +305,7 @@ export async function acquireTab(
 		lastUsedAt: Date.now(),
 	};
 	worker.onMessage(msg => handleTabMessage(tab, msg));
+	worker.onError(error => markTabDead(tab, "worker-error", error));
 	tabs.set(name, tab);
 	return { tab, created: true };
 }
@@ -307,7 +323,10 @@ async function runInTabWithSnapshot(
 	opts: { code: string; timeoutMs: number; signal?: AbortSignal; session?: ToolSession },
 	snapshot: SessionSnapshot,
 ): Promise<RunResultOk> {
-	const tab = tabs.get(name);
+	let tab = tabs.get(name);
+	if (tab?.state === "dead") {
+		tab = (await recoverDeadTabSession(name, tab, opts)) ?? tab;
+	}
 	if (!tab || tab.state === "dead") throw new ToolError(`Tab ${JSON.stringify(name)} is not alive. Reopen it.`);
 	if (tab.pending.size > 0) throw new ToolError(`Tab ${JSON.stringify(name)} is busy`);
 	tab.lastUsedAt = Date.now();
@@ -341,7 +360,127 @@ async function runInTabWithSnapshot(
 	}
 }
 
+async function recoverDeadTabSession(
+	name: string,
+	tab: TabSession,
+	opts: { code: string; timeoutMs: number; signal?: AbortSignal; session?: ToolSession },
+): Promise<TabSession | undefined> {
+	if (tab.releasing) return undefined;
+	const ownerId = tab.ownerId;
+	const callerOwnerId = opts.session?.getSessionId?.() ?? undefined;
+	if (ownerId !== callerOwnerId) return undefined;
+	const activeRecovery = recoveryByName.get(name);
+	if (activeRecovery) return await activeRecovery;
+	const recovery = recoverDeadTabSessionOnce(name, tab, opts, ownerId).finally(() => {
+		if (recoveryByName.get(name) === recovery) recoveryByName.delete(name);
+	});
+	recoveryByName.set(name, recovery);
+	return await recovery;
+}
+
+async function recoverDeadTabSessionOnce(
+	name: string,
+	tab: TabSession,
+	opts: { code: string; timeoutMs: number; signal?: AbortSignal; session?: ToolSession },
+	ownerId: string | undefined,
+): Promise<TabSession | undefined> {
+	if (opts.signal?.aborted) return undefined;
+	const descriptor = deadTabRecovery.peekByName(name);
+	if (!descriptor) {
+		await releaseDeadTabIfCurrent(name, tab);
+		return undefined;
+	}
+	const consumed = deadTabRecovery.consume(descriptor.token, ownerId);
+	if (!consumed) return undefined;
+	const targetId = await resolveRecoveryTargetId(consumed);
+	if (!targetId) {
+		await releaseDeadTabIfCurrent(name, tab);
+		return undefined;
+	}
+	const browserWSEndpoint = consumed.browser.browser.wsEndpoint();
+	if (!browserWSEndpoint) {
+		await releaseDeadTabIfCurrent(name, tab);
+		return undefined;
+	}
+
+	await tab.worker.terminate().catch(() => undefined);
+	const worker = await spawnTabWorker();
+	let info: ReadyInfo;
+	try {
+		info = await initializeTabWorker(
+			worker,
+			{
+				mode: "attach",
+				browserWSEndpoint,
+				safeDir: getPuppeteerDir(),
+				targetId,
+				dialogs: consumed.dialogPolicy,
+			},
+			opts.timeoutMs + GRACE_MS,
+		);
+	} catch (error) {
+		await worker.terminate().catch(() => undefined);
+		await releaseDeadTabIfCurrent(name, tab);
+		logger.debug("dead tab recovery failed during worker initialization", {
+			name,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return undefined;
+	}
+
+	if (tabs.get(name) !== tab || tab.releasing) {
+		await worker.terminate().catch(() => undefined);
+		return undefined;
+	}
+	const recovered: TabSession = {
+		...tab,
+		targetId,
+		worker,
+		state: "alive",
+		info,
+		pending: new Map(),
+		releasing: false,
+		lastUsedAt: Date.now(),
+	};
+	worker.onMessage(msg => handleTabMessage(recovered, msg));
+	worker.onError(error => markTabDead(recovered, "worker-error", error));
+	tabs.set(name, recovered);
+	logger.debug("Recovered dead browser tab", { name, targetId });
+	return recovered;
+}
+
+async function releaseDeadTabIfCurrent(name: string, tab: TabSession): Promise<void> {
+	if (tabs.get(name) !== tab || tab.releasing || tab.state !== "dead") return;
+	await releaseTab(name, { kill: false });
+}
+
+async function resolveRecoveryTargetId(descriptor: DeadTabRecoveryDescriptor): Promise<string | undefined> {
+	const matches: string[] = [];
+	for (const target of descriptor.browser.browser.targets()) {
+		const targetId = await targetIdForTarget(target).catch(() => undefined);
+		const page = await target.page().catch(() => null);
+		if (!targetId || !page) continue;
+		if (targetId === descriptor.targetId) return targetId;
+		const targetUrl =
+			typeof (target as { url?: () => string }).url === "function" ? (target as { url: () => string }).url() : "";
+		const pageUrl = targetUrl || page.url();
+		if (pageUrl !== descriptor.info.url) continue;
+		if (descriptor.info.title) {
+			const title = await page.title().catch(() => undefined);
+			if (title !== descriptor.info.title) continue;
+		}
+		matches.push(targetId);
+	}
+	return matches.length === 1 ? matches[0] : undefined;
+}
+
+export async function resolveDeadTabRecoveryTargetIdForTest(
+	descriptor: DeadTabRecoveryDescriptor,
+): Promise<string | undefined> {
+	return await resolveRecoveryTargetId(descriptor);
+}
 export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Promise<boolean> {
+	deadTabRecovery.invalidateName(name);
 	const tab = tabs.get(name);
 	if (!tab) {
 		logger.debug("releaseTab: unknown tab", { name });
@@ -404,6 +543,7 @@ export async function releaseTabsForOwner(
 	opts: ReleaseTabOptions = {},
 ): Promise<number> {
 	if (!ownerId) return 0;
+	deadTabRecovery.invalidateOwner(ownerId);
 	const names = [...tabs.entries()].filter(([, tab]) => tab.ownerId === ownerId).map(([name]) => name);
 	let count = 0;
 	for (const name of names) {
@@ -462,6 +602,10 @@ function handleTabMessage(tab: TabSession, msg: WorkerOutbound): void {
 	}
 	if (msg.type === "tool-call") {
 		void dispatchToolCall(tab, msg);
+		return;
+	}
+	if (msg.type === "closed") {
+		markTabDead(tab, "worker-closed");
 		return;
 	}
 	if (msg.type === "log") logWorkerMessage(msg);
@@ -537,6 +681,36 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 	if (tab.kindTag === "headless") await closeOrphanTarget(tab);
 	await releaseBrowser(tab.browser, { kill: false });
 	if (tabs.get(name) === tab) tabs.delete(name);
+}
+
+function markTabDead(tab: TabSession, reason: string, error?: Error): void {
+	if (tab.state === "dead" || tab.releasing) return;
+	tab.state = "dead";
+	const deadAt = Date.now();
+	tab.lastUsedAt = deadAt;
+	deadTabRecovery.register(
+		{
+			name: tab.name,
+			ownerId: tab.ownerId,
+			browser: tab.browser,
+			kindTag: tab.kindTag,
+			targetId: tab.targetId,
+			info: tab.info,
+			dialogPolicy: tab.dialogPolicy,
+		},
+		deadAt,
+	);
+	const failure = new ToolError(`Tab ${JSON.stringify(tab.name)} is not alive. Reopen it.`);
+	if (error) (failure as { cause?: unknown }).cause = error;
+	for (const [id, pending] of tab.pending) {
+		try {
+			tab.worker.send({ type: "abort", id });
+		} catch {}
+		pending.reject(failure);
+	}
+	tab.pending.clear();
+	void tab.worker.terminate().catch(() => undefined);
+	logger.debug("Marked browser tab dead", { name: tab.name, reason, error: error?.message });
 }
 
 async function closeOrphanTarget(tab: TabSession): Promise<void> {

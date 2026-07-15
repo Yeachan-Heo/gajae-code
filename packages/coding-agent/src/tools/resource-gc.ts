@@ -11,10 +11,11 @@ import { cleanupStaleScreenshotFallbackDirs, hasCreatedScreenshotFallbackDir } f
  *    processes) via an idle sweep and an opportunistic RSS-pressure sweep, and
  *  - stale computer-use screenshot fallback directories on disk (lazy-armed + throttled).
  *
- * Eviction targets ONLY alive, non-in-flight, GJC-managed headless/spawned tabs owned by a
- * registered session; connected/real-Chrome/held/in-flight tabs and ownerless tabs are never
- * touched. RSS is the GJC parent-process RSS only (`process.memoryUsage().rss`); pressure
- * eviction is best-effort and never force-evicts.
+ * Eviction targets idle, non-in-flight, GJC-managed tabs owned by a registered session: live
+ * headless/spawned tabs, plus dead tabs whose recovery descriptor has expired. Connected/real
+ * Chrome live tabs, held/in-flight tabs, and ownerless tabs are never touched. RSS is the GJC
+ * parent-process RSS only (`process.memoryUsage().rss`); pressure eviction is best-effort and
+ * never force-evicts.
  */
 
 const DEFAULT_SWEEP_INTERVAL_MS = 30_000;
@@ -176,11 +177,9 @@ function ownerBrowserPolicy(snapshot: TabGcSnapshot): BrowserGcPolicy | null {
 
 /** Coarse, ordering-only eligibility; the live recheck in releaseTabIfGcEligible is authoritative. */
 function isCoarselyEligible(snapshot: TabGcSnapshot): boolean {
-	return (
-		snapshot.state === "alive" &&
-		snapshot.pendingCount === 0 &&
-		(snapshot.kindTag === "headless" || snapshot.kindTag === "spawned")
-	);
+	if (snapshot.pendingCount !== 0) return false;
+	if (snapshot.state === "dead") return true;
+	return snapshot.state === "alive" && (snapshot.kindTag === "headless" || snapshot.kindTag === "spawned");
 }
 
 /** Collect idle, non-in-flight, GJC-managed, owned-and-enabled tabs, sorted LRU (oldest first). */
