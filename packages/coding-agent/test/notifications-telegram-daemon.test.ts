@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, spyOn, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -5155,6 +5155,54 @@ test("TelegramUpdatePoller treats malformed update items as unhealthy and does n
 		expect(recoveries[0]?.[1]).toMatchObject({ from: "api_failure", suppressedCount: 1, updateCount: 0 });
 		expect(calls.map(call => call.offset)).toEqual([0, 0, 0]);
 		expect(sleeps).toEqual([1_000, 1_000]);
+	} finally {
+		errorSpy.mockRestore();
+		infoSpy.mockRestore();
+	}
+});
+
+test("TelegramUpdatePoller skips a poisoned update but still advances past valid updates in the same batch", async () => {
+	const calls: Array<{ offset: unknown }> = [];
+	const sleeps: number[] = [];
+	const processed: number[] = [];
+	let attempt = 0;
+	const bot = {
+		async call(_method: string, body: { offset?: unknown }) {
+			calls.push({ offset: body.offset });
+			attempt += 1;
+			if (attempt === 1) {
+				return { ok: true, result: [{ update_id: 5 }, {}, { update_id: 7 }] };
+			}
+			return { ok: true, result: [] };
+		},
+	};
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	const infoSpy = spyOn(logger, "info").mockImplementation(() => {});
+	try {
+		const poller = new TelegramUpdatePoller({
+			botApi: bot,
+			runtime: { sleep: async (ms: number) => void sleeps.push(ms) } as any,
+			backoff: { next: () => 500, reset() {} } as any,
+			processUpdate: async (update: any) => {
+				processed.push(update.update_id);
+				return "consumed";
+			},
+		});
+
+		// A poisoned middle entry must not wedge the offset: the valid updates on
+		// either side are still processed and the offset advances past them.
+		expect(await poller.pollOnce()).toBe(0);
+		// The second poll resumes AFTER the highest valid update_id (7 -> offset 8),
+		// proving the poison did not stall the stream.
+		expect(await poller.pollOnce()).toBe(0);
+
+		expect(processed).toEqual([5, 7]);
+		expect(calls.map(call => call.offset)).toEqual([0, 8]);
+		const apiFailures = errorSpy.mock.calls.filter(
+			call => call[0] === "notifications daemon: Telegram getUpdates API failed",
+		);
+		expect(apiFailures).toHaveLength(1);
+		expect(apiFailures[0]?.[1]).toMatchObject({ description: "Malformed getUpdates response" });
 	} finally {
 		errorSpy.mockRestore();
 		infoSpy.mockRestore();

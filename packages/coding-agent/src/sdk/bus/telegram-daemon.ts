@@ -1048,32 +1048,34 @@ export class TelegramUpdatePoller {
 			if (isAbortError(err)) return { kind: "aborted" };
 			// A transient Telegram API failure must never crash the daemon.
 			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
-			return { kind: "getUpdates_failed", error: String(err) };
+			return { kind: "getUpdates_failed", error: sanitizeDiagnostic(String(err)) };
 		}
 		// Telegram allows only one active getUpdates poller per bot. A 409 means
 		// another poller is live; back off boundedly instead of hot-looping.
 		if (body && body.ok === false && (body.error_code === 409 || /409|conflict/i.test(body.description ?? ""))) {
 			const backoffMs = this.#opts.backoff.next();
 			await this.#opts.runtime.sleep(backoffMs, signal);
-			return { kind: "conflict", description: body.description ?? "no description", backoffMs };
+			return { kind: "conflict", description: sanitizeDiagnostic(body.description ?? "no description"), backoffMs };
 		}
 		if (body?.ok !== true || !Array.isArray(body.result)) {
 			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
 			return {
 				kind: "api_failure",
 				errorCode: typeof body?.error_code === "number" ? body.error_code : undefined,
-				description: body?.description ?? "Malformed getUpdates response",
-			};
-		}
-		if (body.result.some(update => !Number.isSafeInteger(update?.update_id))) {
-			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
-			return {
-				kind: "api_failure",
-				description: "Malformed getUpdates response",
+				description: sanitizeDiagnostic(body?.description ?? "Malformed getUpdates response"),
 			};
 		}
 		this.#opts.backoff.reset();
-		for (const update of body.result ?? []) {
+		let malformedSeen = false;
+		for (const update of body.result) {
+			// A single malformed update_id must not wedge the poller. Skip the
+			// bad entry (surfaced below as an api_failure health signal) while
+			// still processing valid updates and advancing the offset past them,
+			// so one poisoned item cannot stall an otherwise-valid stream.
+			if (!Number.isSafeInteger(update?.update_id)) {
+				malformedSeen = true;
+				continue;
+			}
 			try {
 				const outcome = await this.#opts.processUpdate(update);
 				if (outcome === "retry") {
@@ -1082,11 +1084,17 @@ export class TelegramUpdatePoller {
 				}
 				this.#offset = update.update_id + 1;
 			} catch (err) {
-				logger.error("notifications daemon: handleTelegramUpdate failed", { error: String(err) });
+				logger.error("notifications daemon: handleTelegramUpdate failed", {
+					error: sanitizeDiagnostic(String(err)),
+				});
 				this.#offset = update.update_id + 1;
 			}
 		}
-		return { kind: "success", updateCount: body.result?.length ?? 0 };
+		if (malformedSeen) {
+			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
+			return { kind: "api_failure", description: "Malformed getUpdates response" };
+		}
+		return { kind: "success", updateCount: body.result.length };
 	}
 }
 
