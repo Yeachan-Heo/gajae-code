@@ -2332,6 +2332,32 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		});
 	});
 
+	test("does not scan conversation mappings below the terminal prune threshold", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-prune-bound-"));
+		try {
+			const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+			await journal.enqueue({
+				id: "terminal-below-threshold",
+				kind: "post-message",
+				transport: "discord",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: { threadId: "thread", content: "bounded" },
+			});
+			const lease = await journal.claim("terminal-below-threshold", "owner", 60_000);
+			expect(lease).toBeDefined();
+			const load = vi.spyOn(ConversationStore.prototype, "load");
+			load.mockClear();
+			try {
+				await journal.record("terminal-below-threshold", { owner: "owner", epoch: lease!.epoch }, "terminal");
+				expect(load).toHaveBeenCalledTimes(1);
+			} finally {
+				load.mockRestore();
+			}
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
 	test("keeps a terminal effect referenced by a crash-window receipt through terminal pruning", async () => {
 		await withDaemon(async (daemon, provider, agentDir) => {
 			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
@@ -2377,7 +2403,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			});
 			const lease = await journal.claim(effectId, "owner", 60_000);
 			await journal.record(effectId, { owner: "owner", epoch: lease!.epoch }, "terminal");
-			for (let index = 0; index < 129; index++) {
+			for (let index = 0; index < 127; index++) {
 				const id = `terminal-prune-${index}`;
 				await journal.enqueue({
 					id,
@@ -2389,6 +2415,25 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 				const terminalLease = await journal.claim(id, "owner", 60_000);
 				await journal.record(id, { owner: "owner", epoch: terminalLease!.epoch }, "terminal");
+			}
+			const overflowId = "terminal-prune-overflow";
+			await journal.enqueue({
+				id: overflowId,
+				kind: "post-message",
+				transport: "discord",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: { threadId: conversation.threadId!, content: "overflow" },
+			});
+			const overflowLease = await journal.claim(overflowId, "owner", 60_000);
+			expect(overflowLease).toBeDefined();
+			const load = vi.spyOn(ConversationStore.prototype, "load");
+			load.mockClear();
+			try {
+				await journal.record(overflowId, { owner: "owner", epoch: overflowLease!.epoch }, "terminal");
+				expect(load).toHaveBeenCalledTimes(2);
+			} finally {
+				load.mockRestore();
 			}
 			expect(await journal.read(effectId)).toMatchObject({ state: "terminal" });
 

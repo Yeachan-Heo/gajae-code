@@ -340,13 +340,15 @@ export class ChatEffectJournal {
 	}
 
 	async #pruneTerminal(): Promise<void> {
-		const referenced = new Set<string>();
-		for (const mapping of Object.values((await this.#mappings.load()).conversations))
-			collectEffectReferences(mapping, referenced);
 		const terminal = (await this.list())
 			.filter(effect => effect.state === "terminal")
 			.sort((left, right) => left.updatedAt - right.updatedAt);
-		for (const effect of terminal.slice(0, Math.max(0, terminal.length - MAX_TERMINAL_CHAT_EFFECTS))) {
+		if (terminal.length <= MAX_TERMINAL_CHAT_EFFECTS) return;
+
+		const referenced = new Set<string>();
+		for (const mapping of Object.values((await this.#mappings.load()).conversations))
+			collectEffectReferences(mapping, referenced);
+		for (const effect of terminal.slice(0, terminal.length - MAX_TERMINAL_CHAT_EFFECTS)) {
 			if (!referenced.has(effect.id)) await this.#store.delete(effect.id, effect.generation);
 		}
 	}
