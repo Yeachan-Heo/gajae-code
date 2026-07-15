@@ -2958,7 +2958,9 @@ export class AgentSession {
 				if (this.#handoffAbortController) {
 					this.#skipPostTurnMaintenanceAssistantTimestamp = assistantMsg.timestamp;
 				}
+				const assistantHasToolCalls = assistantMsg.content.some(content => content.type === "toolCall");
 				if (
+					!assistantHasToolCalls &&
 					assistantMsg.stopReason !== "error" &&
 					assistantMsg.stopReason !== "aborted" &&
 					this.#retryAttempt > 0
@@ -3158,11 +3160,26 @@ export class AgentSession {
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
 			}
 			if (msg.stopReason === "error" && isContextOverflow(msg, this.model?.contextWindow ?? 0)) {
+				if (this.#retryAttempt > 0) {
+					const attempt = this.#retryAttempt;
+					this.#retryAttempt = 0;
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError: msg.errorMessage,
+						goal_generation_id: this.#activeGoalContinuationGenerationId,
+					});
+				}
 				this.#resolveRetry();
 				const compactionTask = this.#checkCompaction(msg);
 				this.#trackPostPromptTask(compactionTask);
 				await compactionTask;
 				if (this.#goalContinuationFailureFinalized) this.#finishGoalContinuationGeneration();
+				return;
+			}
+			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
+			if (hasToolCalls) {
 				return;
 			}
 			if (this.#retryAttempt > 0) {
@@ -3203,10 +3220,6 @@ export class AgentSession {
 				return;
 			}
 			// Check for incomplete todos only after a final assistant stop, not intermediate tool-use turns.
-			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
-			if (hasToolCalls) {
-				return;
-			}
 			if (msg.stopReason !== "error") {
 				if (this.#enforceRewindBeforeYield()) {
 					return;
