@@ -3308,6 +3308,40 @@ describe("native GJC ultragoal runtime", () => {
 		);
 	});
 
+	it("verifies completion of a goal appended after a closed validation batch", async () => {
+		const root = await batchTempDir();
+		await completedValidationBatchPlan(root);
+
+		// Appending a goal stales the batch aggregate close by design. The
+		// appended goal's completion must still be able to close the run: the
+		// old batch close stands as ledger-anchored historical evidence for
+		// the deferred members.
+		await addUltragoalSubgoal({
+			cwd: root,
+			title: "Appended stage",
+			objective: "Complete the appended stage.",
+			evidence: "The batch run gained a new required goal after closing.",
+			rationale: "Cover post-close appends regaining a fresh final-aggregate receipt.",
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const appended = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G004",
+			status: "complete",
+			evidence: "appended goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		expect(appended.goals[3]?.completionVerification?.receiptKind).toBe("final-aggregate");
+
+		const plan = await readUltragoalPlan(root);
+		if (!plan) throw new Error("missing ultragoal plan");
+		const ledger = await readUltragoalLedger(root);
+		expect(
+			validateCompletionReceipt({ plan, ledger, goal: plan.goals[3]!, receiptKind: "final-aggregate" }).state,
+		).toBe("active_verified_complete");
+		const durable = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });
+		expect(durable.state).toBe("active_verified_complete");
+	});
 	it("re-mints the final-aggregate receipt when repairing a non-final goal after aggregate completion (#1777)", async () => {
 		for (const repairStatus of ["active", "failed"] as const) {
 			const root = await tempDir();

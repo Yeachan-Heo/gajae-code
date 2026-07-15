@@ -354,7 +354,21 @@ export function findFreshBatchCloseReceipt(input: {
 		receipt: finalReceipt,
 		receiptKind: finalReceipt.receiptKind,
 	});
-	return diagnostic ? null : finalReceipt;
+	if (!diagnostic) return finalReceipt;
+	// A batch close staled only by later plan growth (e.g. `steer add_subgoal`
+	// after the batch completed) still proves the batch was validly closed:
+	// the member receipts are freshness-checked separately, the close is
+	// anchored to its ledger event, and the final goal's row is untouched.
+	// Without this, completing a goal appended after a closed batch can never
+	// validate, because the old close can never be fresh against the grown
+	// plan and identical-evidence replays of fresh receipts are no-ops.
+	const historicalDiagnostic = validateLedgerAnchoredHistoricalReceipt({
+		ledger: input.ledger,
+		goal: finalGoal,
+		receipt: finalReceipt,
+		label: "superseded batch-close receipt",
+	});
+	return historicalDiagnostic ? null : finalReceipt;
 }
 
 export function validateDeferredMemberReceiptFresh(input: {
