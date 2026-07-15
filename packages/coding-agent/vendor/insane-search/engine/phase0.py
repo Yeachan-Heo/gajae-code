@@ -24,8 +24,11 @@ Each attempt dict: {"route","platform","ok","status","bytes","note"}.
 """
 from __future__ import annotations
 
+import importlib.util
 import re
+import shutil
 import subprocess
+import sys
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -182,11 +185,33 @@ def _x(url: str, timeout: int) -> dict:
 
 
 # --- youtube -----------------------------------------------------------------
+def _ytdlp_argv() -> Optional[list[str]]:
+    """Best yt-dlp invocation for this environment, or None if unavailable.
+
+    Prefers the ``yt-dlp`` console script on PATH; falls back to
+    ``<python> -m yt_dlp`` when the script dir is not on PATH but the module is
+    importable — the common case for ``pip install --user`` and Windows / venv
+    installs, where the Scripts/bin dir is frequently absent from PATH. Mirrors
+    the ``which yt-dlp || python3 -m yt_dlp`` fallback already documented in
+    references/media.md."""
+    exe = shutil.which("yt-dlp")
+    if exe:
+        return [exe]
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
+    return None
+
+
 def _youtube(url: str, timeout: int) -> dict:
     attempts: list[dict] = []
+    argv = _ytdlp_argv()
+    if argv is None:
+        attempts.append(_attempt("youtube", "yt-dlp", False, 0, "", "yt-dlp not installed"))
+        return {"platform": "youtube", "ok": False, "route": None, "content": "",
+                "final_url": url, "attempts": attempts}
     try:
         p = subprocess.run(
-            ["yt-dlp", "--dump-json", "--skip-download", url],
+            argv + ["--dump-json", "--skip-download", url],
             capture_output=True, text=True, timeout=max(timeout, 60),
         )
         ok = p.returncode == 0 and p.stdout.strip().startswith("{")

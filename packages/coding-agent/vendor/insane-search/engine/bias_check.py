@@ -98,7 +98,10 @@ def _line_is_exempt(line: str, ext: str) -> bool:
 def _scan_file(path: Path, root: Path) -> list[str]:
     """Return list of violation strings for this file."""
     rel = path.relative_to(root.parent)
-    if str(rel) in EXPLICIT_ALLOW_FILES:
+    # Compare with forward slashes so the exemption matches on Windows too —
+    # `str(rel)` yields backslashes there, silently defeating the phase0.py
+    # exemption (EXPLICIT_ALLOW_FILES uses POSIX-style paths).
+    if rel.as_posix() in EXPLICIT_ALLOW_FILES:
         return []
 
     ext = path.suffix.lower()
