@@ -6,6 +6,7 @@ import type { GateContinuation } from "../src/modes/shared/agent-wire/workflow-g
 import {
 	FileGateStore,
 	type GateAuditEvent,
+	isUnsupportedWindowsDirectorySyncError,
 	MemoryGateStore,
 	WorkflowGateBroker,
 	WorkflowGateBrokerError,
@@ -383,6 +384,13 @@ describe("WorkflowGateBroker", () => {
 		await expect(broker.resolve({ gate_id: gate.gate_id, answer: "approve" })).rejects.toThrow(
 			/no live pending gate/,
 		);
+	});
+
+	it("classifies only unsupported Windows directory sync errors", () => {
+		expect(isUnsupportedWindowsDirectorySyncError({ code: "EPERM" }, "win32")).toBe(true);
+		expect(isUnsupportedWindowsDirectorySyncError({ code: "EINVAL" }, "win32")).toBe(true);
+		expect(isUnsupportedWindowsDirectorySyncError({ code: "EACCES" }, "win32")).toBe(false);
+		expect(isUnsupportedWindowsDirectorySyncError({ code: "EPERM" }, "darwin")).toBe(false);
 	});
 
 	it("fails closed on a corrupt FileGateStore instead of silently resetting", () => {
