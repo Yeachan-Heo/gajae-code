@@ -11,7 +11,10 @@ import {
 	sessionUltragoalDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { reconcileWorkflowSkillState } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
-import { validateCompletionReceipt } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
+import {
+	validateCompletionReceipt,
+	verifyUltragoalDurableCompletionState,
+} from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 
 import {
 	addUltragoalSubgoal,
@@ -2986,7 +2989,52 @@ describe("native GJC ultragoal runtime", () => {
 		expect(await Bun.file(goalsPath).text()).toBe(goalsAfterFinal);
 	});
 
-	it("uses per-goal receipts when repairing a non-final goal after aggregate completion (#1777)", async () => {
+	it("re-mints a final-aggregate receipt when goals are appended after aggregate completion", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		const afterFirst = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "first goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+		expect(afterFirst.goals[0]?.completionVerification?.receiptKind).toBe("final-aggregate");
+
+		await addUltragoalSubgoal({
+			cwd: root,
+			title: "Appended stage",
+			objective: "Complete the appended stage.",
+			evidence: "The run gained a new required goal after aggregate completion.",
+			rationale: "Cover final-aggregate re-minting after an append staled the prior receipt.",
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const afterAppended = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G002",
+			status: "complete",
+			evidence: "appended goal verified",
+			qualityGateJson: await passingLiveQualityGate(root),
+		});
+
+		// Appending G002 staled G001's final-aggregate receipt by design. The
+		// closing checkpoint must mint a fresh final-aggregate receipt instead of
+		// deferring to the stale one, which would leave the run permanently
+		// unable to satisfy the final-aggregate completion guard.
+		expect(afterAppended.goals[1]?.completionVerification?.receiptKind).toBe("final-aggregate");
+
+		const plan = await readUltragoalPlan(root);
+		if (!plan) throw new Error("missing ultragoal plan");
+		const ledger = await readUltragoalLedger(root);
+		expect(
+			validateCompletionReceipt({ plan, ledger, goal: plan.goals[1]!, receiptKind: "final-aggregate" }).state,
+		).toBe("active_verified_complete");
+		const durable = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });
+		expect(durable.state).toBe("active_verified_complete");
+	});
+
+	it("re-mints the final-aggregate receipt when repairing a non-final goal after aggregate completion (#1777)", async () => {
 		for (const repairStatus of ["active", "failed"] as const) {
 			const root = await tempDir();
 			await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
@@ -3032,15 +3080,22 @@ describe("native GJC ultragoal runtime", () => {
 				qualityGateJson: await passingLiveQualityGate(root),
 			});
 
-			expect(repaired.goals[0]?.completionVerification?.receiptKind).toBe("per-goal");
+			// The hand-edited repair staled G002's final-aggregate receipt (its
+			// plan generation covers every required goal). The repair checkpoint
+			// closes the run again, so it must re-mint the final-aggregate
+			// receipt; a per-goal receipt would leave the run with no fresh
+			// final-aggregate receipt forever.
+			expect(repaired.goals[0]?.completionVerification?.receiptKind).toBe("final-aggregate");
 			expect(
 				validateCompletionReceipt({
 					plan: repaired,
 					ledger: await readUltragoalLedger(root),
 					goal: repaired.goals[0]!,
-					receiptKind: "per-goal",
+					receiptKind: "final-aggregate",
 				}).state,
 			).toBe("active_verified_complete");
+			const durable = await verifyUltragoalDurableCompletionState({ cwd: root, sessionId: TEST_SESSION_ID });
+			expect(durable.state).toBe("active_verified_complete");
 		}
 	});
 
