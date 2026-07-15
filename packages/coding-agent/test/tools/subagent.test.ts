@@ -139,13 +139,14 @@ describe("SubagentTool", () => {
 		});
 		const guidance = result.details?.subagents[0]?.guidance ?? "";
 
-		expect(result.details?.subagents[0]?.status).toBe("running");
-		expect(guidance).toContain("Still running");
+		expect(result.details?.subagents[0]?.status).toBe("initializing");
+		expect(guidance).toContain("Still initializing");
 		expect(guidance).toContain("not a failure");
 		expect(guidance).toContain("never cancel just because an await timed out");
 		expect(guidance).toContain("cancel only if the subagent has actually failed");
 		expect(guidance).not.toContain("steer");
 		expect(guidance).not.toContain("shutdown");
+		expect(manager.isDeliverySuppressed("job-slow")).toBe(false);
 
 		await Bun.sleep(80);
 		const completed = await tool.execute("subagent-await-completed", {
@@ -240,7 +241,7 @@ describe("SubagentTool", () => {
 
 		const result = await tool.execute("subagent-resume", { action: "resume", ids: ["0-Resume"] });
 
-		expect(result.details?.subagents[0]?.status).toBe("running");
+		expect(result.details?.subagents[0]?.status).toBe("initializing");
 		expect(result.details?.subagents[0]?.jobId).toBe("job-resumed");
 		await manager.dispose({ timeoutMs: 100 });
 	});
@@ -281,7 +282,7 @@ describe("SubagentTool", () => {
 		const result = await tool.execute("subagent-resume-id", { action: "resume", id: "0-ResumeA" });
 
 		expect(resumed).toEqual(["0-ResumeA"]);
-		expect(result.details?.subagents[0]?.status).toBe("running");
+		expect(result.details?.subagents[0]?.status).toBe("initializing");
 		expect(result.details?.subagents[0]?.jobId).toBe("job-0-ResumeA");
 		await manager.dispose({ timeoutMs: 100 });
 	});
@@ -331,6 +332,29 @@ describe("SubagentTool", () => {
 		expect(steerText).toContain("queued");
 		expect(steerText).not.toContain("consumed");
 		expect(steerText).not.toContain("acted on");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("rejects live steering while the subagent session is still initializing", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		manager.registerSubagentRecord({
+			subagentId: "0-Starting",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-Starting.jsonl",
+			resumable: true,
+		});
+
+		await expect(
+			tool.execute("subagent-steer-starting", {
+				action: "steer",
+				id: "0-Starting",
+				message: "change direction",
+			}),
+		).rejects.toThrow("still initializing; live steering is not available yet");
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
@@ -438,7 +462,7 @@ describe("SubagentTool", () => {
 		});
 
 		expect(resumedMessage).toBe("follow up");
-		expect(result.details?.subagents[0]?.status).toBe("running");
+		expect(result.details?.subagents[0]?.status).toBe("initializing");
 		expect(result.details?.subagents[0]?.jobId).toBe("job-auto-resumed");
 		expect(result.details?.subagents[0]?.steerMessage).toBe("follow up");
 		expect(result.details?.subagents[0]?.steerState).toBe("resume_started");

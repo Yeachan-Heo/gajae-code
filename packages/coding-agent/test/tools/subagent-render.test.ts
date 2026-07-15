@@ -173,6 +173,21 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("running, no activity yet");
 	});
 
+	it("keeps the awaiting header active while a subagent initializes", () => {
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-Starting",
+					status: "initializing",
+					phase: "initializing",
+					liveProgressAvailable: false,
+				}),
+			],
+		});
+		expect(out).toContain("awaiting 1 of 1");
+		expect(out).toContain("initializing session; live control unavailable");
+	});
+
 	it("renders static status without a no-activity claim when no live producer", () => {
 		const out = render({
 			subagents: [snapshot({ id: "0-Static", status: "running", liveProgressAvailable: false })],

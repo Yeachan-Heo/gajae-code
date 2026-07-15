@@ -673,17 +673,14 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * True only when a live, in-session progress producer exists for this id: a
-	 * canonical registered record with a live handle or an in-memory running job.
-	 * False for `SubagentTool` backward-compat job synthesis and resumed-from-disk
-	 * records, which have no live producer to stream from.
+	 * True only when an executor-owned live session handle exists for this
+	 * subagent. A registered job can remain `running` while its AgentSession is
+	 * still being initialized; that state has no progress producer or control
+	 * channel yet.
 	 */
 	hasLiveSubagent(subagentId: string, filter?: AsyncJobFilter): boolean {
 		const rec = this.getSubagentRecord(subagentId, filter);
-		if (!rec) return false;
-		if (this.#liveHandles.has(rec.subagentId)) return true;
-		const job = rec.currentJobId ? this.#jobs.get(rec.currentJobId) : undefined;
-		return job?.status === "running";
+		return rec ? this.#liveHandles.has(rec.subagentId) : false;
 	}
 
 	/** Install the TaskTool-owned resume runner. Returns the new job id, or undefined on failure. */

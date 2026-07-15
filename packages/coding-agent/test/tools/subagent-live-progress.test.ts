@@ -50,6 +50,12 @@ function runningRecord(subagentId: string, jobId: string): SubagentRecord {
 		resumable: false,
 	};
 }
+function registerLiveHandle(manager: AsyncJobManager, subagentId: string): void {
+	manager.registerLiveHandle(subagentId, {
+		requestPause: () => {},
+		injectMessage: async () => {},
+	});
+}
 
 describe("subagent await live progress", () => {
 	afterEach(() => {
@@ -73,6 +79,7 @@ describe("subagent await live progress", () => {
 			},
 		);
 		manager.registerSubagentRecord(runningRecord("0-Live", jobId));
+		registerLiveHandle(manager, "0-Live");
 		// Record progress BEFORE await; no further progress event will fire.
 		manager.recordSubagentProgress(
 			"0-Live",
@@ -122,6 +129,8 @@ describe("subagent await live progress", () => {
 		);
 		manager.registerSubagentRecord(runningRecord("0-A", jobA));
 		manager.registerSubagentRecord(runningRecord("0-B", jobB));
+		registerLiveHandle(manager, "0-A");
+		registerLiveHandle(manager, "0-B");
 		manager.recordSubagentProgress("0-A", makeProgress({ id: "0-A", currentTool: "read" }));
 		manager.recordSubagentProgress("0-B", makeProgress({ id: "0-B", currentTool: "bash" }));
 
@@ -158,9 +167,13 @@ describe("subagent await live progress", () => {
 		const result = await tool.execute("await", { action: "await", ids: ["0-Synth"], timeout_ms: 5 });
 		const snap = result.details?.subagents.find(s => s.id === "0-Synth");
 
-		expect(snap?.status).toBe("running");
+		expect(snap?.status).toBe("initializing");
+		expect(snap?.phase).toBe("initializing");
 		expect(snap?.progress).toBeUndefined();
 		expect(snap?.liveProgressAvailable).toBe(false);
+		expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain(
+			"initializing session (live control unavailable)",
+		);
 
 		manager.cancel("job-synth", { ownerId: "0-Main" });
 		await manager.dispose({ timeoutMs: 100 });
@@ -202,7 +215,7 @@ describe("AsyncJobManager subagent progress retention", () => {
 		AsyncJobManager.resetForTests();
 	});
 
-	it("hasLiveSubagent is true for a canonical running record and false for synthesized/absent ids", () => {
+	it("hasLiveSubagent requires an executor live handle", () => {
 		const manager = createManager();
 		const jobId = manager.register(
 			"task",
@@ -218,6 +231,7 @@ describe("AsyncJobManager subagent progress retention", () => {
 			},
 		);
 		manager.registerSubagentRecord(runningRecord("0-Live", jobId));
+		registerLiveHandle(manager, "0-Live");
 
 		expect(manager.hasLiveSubagent("0-Live")).toBe(true);
 		expect(manager.hasLiveSubagent("0-Absent")).toBe(false);
@@ -506,6 +520,7 @@ describe("subagent await emit gating", () => {
 				},
 			);
 			manager.registerSubagentRecord(runningRecord(id, jobId));
+			registerLiveHandle(manager, id);
 			manager.recordSubagentProgress(id, makeProgress({ id, currentTool: "read", recentOutput: ["scan"] }));
 		});
 

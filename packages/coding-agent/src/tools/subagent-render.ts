@@ -113,6 +113,7 @@ function statusIconKind(status: SubagentSnapshot["status"]): ToolUIStatus {
 		case "not_found":
 			return "warning";
 		case "queued":
+		case "initializing":
 			return "pending";
 		default:
 			return "info";
@@ -177,6 +178,8 @@ function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolea
 		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, true)) {
 			lines.push(`  ${pl}`);
 		}
+	} else if (snapshot.phase === "initializing") {
+		lines.push(`  ${theme.fg("dim", "initializing session; live control unavailable")}`);
 	} else if (snapshot.liveProgressAvailable && (snapshot.status === "running" || snapshot.status === "queued")) {
 		lines.push(`  ${theme.fg("dim", "running, no activity yet")}`);
 	}
@@ -217,7 +220,9 @@ export const subagentToolRenderer = {
 			return new Text(theme.fg("dim", truncateToWidth(fallback, 100)), 0, 0);
 		}
 
-		const runningCount = subagents.filter(s => s.status === "running").length;
+		const runningCount = subagents.filter(
+			snapshot => snapshot.status === "running" || snapshot.status === "initializing",
+		).length;
 
 		// Each snapshot's rendered-state signature is constant for this component
 		// instance, so compute them at most once; the heavy per-subagent bodies are

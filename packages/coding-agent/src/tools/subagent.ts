@@ -41,6 +41,7 @@ const subagentSchema = z.object({
 type SubagentParams = z.infer<typeof subagentSchema>;
 type SubagentStatus =
 	| "running"
+	| "initializing"
 	| "paused"
 	| "queued"
 	| "completed"
@@ -72,6 +73,8 @@ export interface SubagentSnapshot {
 	progress?: AgentProgress;
 	/** True when a live in-session progress producer exists for this subagent. */
 	liveProgressAvailable?: boolean;
+	/** Startup phase derived from the absence/presence of an executor live handle. */
+	phase?: "initializing" | "active";
 	/** Model the subagent actually runs on (after any auth fallback). */
 	effectiveModel?: string;
 	/** Model originally requested via role/preset mapping; differs from effective on fallback. */
@@ -254,7 +257,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				if (!record.sessionFile) throw new ToolError(`Subagent ${record.subagentId} has no session file.`);
 				if (record.status === "running") {
 					const handle = manager.getLiveHandle(record.subagentId);
-					if (!handle) throw new ToolError(`Subagent ${record.subagentId} has no live handle.`);
+					if (!handle) {
+						throw new ToolError(
+							`Subagent ${record.subagentId} is still initializing; live steering is not available yet.`,
+						);
+					}
 					const fromAgentId = this.session.getAgentId?.() ?? undefined;
 					await handle.injectMessage(message, "steer", { fromAgentId });
 					if (params.pause === true) manager.pauseSubagent(record.subagentId, ownerFilter);
@@ -534,7 +541,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			snapshots
 				.filter(
 					s =>
-						s.status !== "running" && s.status !== "paused" && s.status !== "queued" && s.status !== "not_found",
+						s.status !== "running" &&
+						s.status !== "initializing" &&
+						s.status !== "paused" &&
+						s.status !== "queued" &&
+						s.status !== "not_found",
 				)
 				.map(s => s.jobId),
 		);
@@ -545,6 +556,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const lines = [`## ${title} (${snapshots.length})`, ""];
 		for (const snapshot of snapshots) {
 			lines.push(`### ${snapshot.id} — ${snapshot.status}`);
+			if (snapshot.phase === "initializing") lines.push("Phase: initializing session (live control unavailable)");
 			if (snapshot.jobId !== snapshot.id) lines.push(`Job: ${snapshot.jobId}`);
 			if (snapshot.agent) lines.push(`Agent: ${snapshot.agent} (${snapshot.agentSource})`);
 			if (snapshot.effectiveModel) {
@@ -614,20 +626,34 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		attachLiveProgress = false,
 	): SubagentSnapshot {
 		const liveFields = this.#liveProgressFields(manager, record, attachLiveProgress);
+		const phase =
+			record.status === "running"
+				? manager.getLiveHandle(record.subagentId)
+					? "active"
+					: "initializing"
+				: undefined;
 		const job = record.currentJobId ? manager.getJob(record.currentJobId) : undefined;
 		if (job) {
 			return {
 				...this.#snapshot(job, timedOut, verbosity, verifiedOutputIds, record),
 				id: record.subagentId,
 				jobId: record.currentJobId ?? job.id,
-				status: record.status,
+				status: phase === "initializing" ? "initializing" : record.status,
+				...(phase ? { phase } : {}),
+				...(phase === "initializing" && timedOut
+					? {
+							guidance:
+								"Still initializing after the await timeout; no live session or control channel exists yet. The timeout only bounded this wait and is not a failure. Continue observing, and never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong.",
+						}
+					: {}),
 				...liveFields,
 			};
 		}
 		return {
 			id: record.subagentId,
 			jobId: record.currentJobId ?? record.subagentId,
-			status: record.status,
+			status: phase === "initializing" ? "initializing" : record.status,
+			...(phase ? { phase } : {}),
 			label: "subagent",
 			agent: "unknown",
 			agentSource: "bundled",

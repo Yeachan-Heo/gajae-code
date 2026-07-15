@@ -6,6 +6,7 @@
 
 - Cooperative mid-run context maintenance now waits at a cancellation-aware FIFO consumer-drain checkpoint before flushing or rewriting session history. Materialized tool results and steering messages are synchronously canonicalized first; aborted barriers and hook/signal-cancelled compactions settle without rewriting or scheduling a continuation. Promotion, pruning, and compaction each start a clean provider/prompt-cache epoch. Script-aware #2067 unsent-delta accounting remains cache-free and distinct from the lifecycle checkpoint.
 - Classified the cooperative mid-run maintenance driver and token estimator test seams as locked non-public SDK exclusions, restoring deterministic operation-inventory generation and post-merge dev CI coverage.
+- Subagent snapshots now distinguish session initialization from active execution, suppress stale live-progress claims before an executor control handle exists, and return an actionable initialization error when steering is attempted too early.
 
 ### Added
 
