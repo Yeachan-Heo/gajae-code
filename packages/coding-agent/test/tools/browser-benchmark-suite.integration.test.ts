@@ -4,8 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Browser, CDPSession } from "puppeteer-core";
-import { runOfflineSuite } from "../../src/tools/browser/benchmark/run-suite";
 import { evaluateSuiteGate, renderReport } from "../../src/tools/browser/benchmark/detector-report";
+import { runOfflineSuite } from "../../src/tools/browser/benchmark/run-suite";
 import { applyStealthPatches, launchHeadlessBrowser } from "../../src/tools/browser/launch";
 
 const FIXTURE = path.join(import.meta.dir, "..", "fixtures", "stealth-detectors", "sannysoft-probe.html");
@@ -67,13 +67,29 @@ describe("offline stealth benchmark (integration)", () => {
 				startedAt: ts(0),
 				actions: [
 					{ type: "launch", timestamp: ts(0), detail: "launchHeadlessBrowser({ headless: true })" },
-					{ type: "custom", target: "applyStealthPatches", timestamp: ts(1), detail: "stealth injection + UA override applied" },
+					{
+						type: "custom",
+						target: "applyStealthPatches",
+						timestamp: ts(1),
+						detail: "stealth injection + UA override applied",
+					},
 					{ type: "goto", url: FIXTURE_URL, timestamp: ts(2) },
-					{ type: "evaluate", selector: "#out", timestamp: ts(3), detail: "read window.__stealthProbe rendered into #out" },
+					{
+						type: "evaluate",
+						selector: "#out",
+						timestamp: ts(3),
+						detail: "read window.__stealthProbe rendered into #out",
+					},
 					{ type: "screenshot", selector: "body", timestamp: ts(4), detail: "detector.png" },
 				],
 				assertions: [
-					{ type: "assert", selector: "#out", status: "passed", timestamp: ts(5), detail: `verdict=${detector.automatedVerdict}` },
+					{
+						type: "assert",
+						selector: "#out",
+						status: "passed",
+						timestamp: ts(5),
+						detail: `verdict=${detector.automatedVerdict}`,
+					},
 				],
 				result: {
 					detector: detector.detector,

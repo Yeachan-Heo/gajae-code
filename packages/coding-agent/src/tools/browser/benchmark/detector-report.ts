@@ -87,7 +87,9 @@ export function evaluateGate(baseline: DetectorResult, current: DetectorResult):
 	const reasons: string[] = [];
 	const currentFail = failingSignalIds(current);
 	if (currentFail.size > 0) {
-		reasons.push(`${current.detector}: ${currentFail.size} signal(s) still leak automation: ${[...currentFail].join(", ")}`);
+		reasons.push(
+			`${current.detector}: ${currentFail.size} signal(s) still leak automation: ${[...currentFail].join(", ")}`,
+		);
 	}
 
 	const baselinePass = passCount(baseline);

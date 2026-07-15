@@ -30,10 +30,7 @@ export function chromeUserDataRoots(env: DiscoveryEnv): string[] {
 			return [path.join(localAppData, "Google", "Chrome", "User Data")];
 		}
 		default:
-			return [
-				path.join(env.home, ".config", "google-chrome"),
-				path.join(env.home, ".config", "chromium"),
-			];
+			return [path.join(env.home, ".config", "google-chrome"), path.join(env.home, ".config", "chromium")];
 	}
 }
 
@@ -47,7 +44,10 @@ export interface DiscoveredProfile {
  * Discover the default Chrome profile, or null when none is present.
  * Only returns a profile whose directory actually exists.
  */
-export function discoverDefaultChromeProfile(env: DiscoveryEnv, profileDirectory = "Default"): DiscoveredProfile | null {
+export function discoverDefaultChromeProfile(
+	env: DiscoveryEnv,
+	profileDirectory = "Default",
+): DiscoveredProfile | null {
 	for (const userDataDir of chromeUserDataRoots(env)) {
 		const profileDir = path.join(userDataDir, profileDirectory);
 		if (env.exists(profileDir)) {

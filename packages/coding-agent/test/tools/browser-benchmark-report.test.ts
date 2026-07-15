@@ -28,7 +28,12 @@ describe("detector-report parseProbe", () => {
 			trustScore: 0.4,
 		});
 		expect(parsed.detector).toBe("sannysoft-offline");
-		expect(parsed.signals[0]).toEqual({ id: "webdriver", label: "navigator.webdriver undefined", status: "pass", detail: "undefined" });
+		expect(parsed.signals[0]).toEqual({
+			id: "webdriver",
+			label: "navigator.webdriver undefined",
+			status: "pass",
+			detail: "undefined",
+		});
 		expect(parsed.signals[1]?.status).toBe("fail");
 		expect(parsed.automatedVerdict).toBe("bot");
 		expect(parsed.trustScore).toBe(0.4);
@@ -42,8 +47,14 @@ describe("detector-report parseProbe", () => {
 
 describe("detector-report evaluateGate", () => {
 	it("passes when a baseline-failing signal is fixed and nothing regresses", () => {
-		const baseline = result("d", [["webdriver", false], ["plugins", true]]);
-		const current = result("d", [["webdriver", true], ["plugins", true]]);
+		const baseline = result("d", [
+			["webdriver", false],
+			["plugins", true],
+		]);
+		const current = result("d", [
+			["webdriver", true],
+			["plugins", true],
+		]);
 		expect(evaluateGate(baseline, current).pass).toBe(true);
 	});
 
@@ -56,21 +67,39 @@ describe("detector-report evaluateGate", () => {
 	});
 
 	it("fails on pass-count regression", () => {
-		const baseline = result("d", [["a", true], ["b", true]]);
-		const current = result("d", [["a", true], ["b", false]]);
+		const baseline = result("d", [
+			["a", true],
+			["b", true],
+		]);
+		const current = result("d", [
+			["a", true],
+			["b", false],
+		]);
 		const out = evaluateGate(baseline, current);
 		expect(out.pass).toBe(false);
 	});
 
 	it("empty-gap lock: passes when baseline was already all-green and stays green", () => {
-		const baseline = result("d", [["a", true], ["b", true]]);
-		const current = result("d", [["a", true], ["b", true]]);
+		const baseline = result("d", [
+			["a", true],
+			["b", true],
+		]);
+		const current = result("d", [
+			["a", true],
+			["b", true],
+		]);
 		expect(evaluateGate(baseline, current).pass).toBe(true);
 	});
 
 	it("requires improvement when baseline had failing signals", () => {
-		const baseline = result("d", [["a", false], ["b", true]]);
-		const current = result("d", [["a", false], ["b", true]]);
+		const baseline = result("d", [
+			["a", false],
+			["b", true],
+		]);
+		const current = result("d", [
+			["a", false],
+			["b", true],
+		]);
 		const out = evaluateGate(baseline, current);
 		expect(out.pass).toBe(false);
 		expect(out.reasons.join(" ")).toContain("still leak");

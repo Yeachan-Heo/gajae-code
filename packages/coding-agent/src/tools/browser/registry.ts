@@ -109,7 +109,11 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 				if (reuse.warning) logger.warn(reuse.warning);
 			}
 		}
-		const browser = await launchHeadlessBrowser({ headless: kind.headless, viewport: opts.viewport, profileWarmupDir });
+		const browser = await launchHeadlessBrowser({
+			headless: kind.headless,
+			viewport: opts.viewport,
+			profileWarmupDir,
+		});
 		return {
 			key: browserKey(kind),
 			kind,
