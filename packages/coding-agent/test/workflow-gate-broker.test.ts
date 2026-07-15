@@ -409,6 +409,17 @@ describe("WorkflowGateBroker", () => {
 				),
 		).toThrow(/directory fsync failed/);
 	});
+	it.skipIf(process.platform !== "win32")("ignores EPERM from a Windows directory fsync", () => {
+		const file = path.join(mkdtempSync(path.join(tmpdir(), "gate-windows-fsync-")), "gates.json");
+		let syncs = 0;
+		const store = new FileGateStore(file, () => {
+			syncs++;
+			if (syncs === 2) throw Object.assign(new Error("directory fsync is unsupported"), { code: "EPERM" });
+		});
+
+		expect(store.nextSeq("ralplan")).toBe(1);
+		expect(new FileGateStore(file).nextSeq("ralplan")).toBe(2);
+	});
 	it("quarantines a disk-accepted record after post-rename fsync uncertainty instead of reissuing it", async () => {
 		const file = path.join(mkdtempSync(path.join(tmpdir(), "gate-uncertain-accepted-")), "gates.json");
 		let syncs = 0;
