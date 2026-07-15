@@ -2140,8 +2140,11 @@ export class DiscordNotificationDaemon {
 	}
 	async #scheduleLeaseRecovery(recoveryFailed = false): Promise<void> {
 		if (!this.#started) return;
+		const lifecycleGeneration = this.#lifecycleGeneration;
+		const effects = await this.#effects.list();
+		if (!this.#started || lifecycleGeneration !== this.#lifecycleGeneration) return;
 		const now = this.#now();
-		const recoveryAt = (await this.#effects.list())
+		const recoveryAt = effects
 			.filter(effect => effect.transport === "discord")
 			.reduce<number | undefined>(
 				(earliest, effect) => {
@@ -2172,7 +2175,6 @@ export class DiscordNotificationDaemon {
 			recoveryAt <= now
 				? Math.min(1_000, 25 * 2 ** Math.min(this.#leaseRecoveryFailures, 5))
 				: Math.min(recoveryAt - now, 2_147_483_647);
-		const lifecycleGeneration = this.#lifecycleGeneration;
 		this.#leaseRecoveryTimer = this.#leaseRecoveryScheduler.setTimeout(() => {
 			if (lifecycleGeneration !== this.#lifecycleGeneration) return;
 			this.#leaseRecoveryTimer = undefined;
