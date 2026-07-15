@@ -139,6 +139,14 @@ function renderTableText(header: string[], aligns: ColumnAlign[], body: string[]
 	const divider = widths.map(w => "-".repeat(w)).join("-|-");
 	return [renderRow(header), divider, ...body.map(renderRow)].join("\n");
 }
+/** Render wide tables as stacked records so Telegram clients do not wrap columns into ambiguity. */
+function renderTelegramTable(header: string[], aligns: ColumnAlign[], body: string[][]): string {
+	const grid = renderTableText(header, aligns, body);
+	if (grid.split("\n").every(line => Bun.stringWidth(line) <= 42)) return grid;
+	return body
+		.map(row => header.map((label, column) => `${label || `Column ${column + 1}`}: ${row[column] ?? ""}`).join("\n"))
+		.join("\n\n");
+}
 
 /**
  * Replace GFM tables with stashed monospace `<pre>` blocks. Telegram HTML has no
@@ -161,7 +169,7 @@ function convertMarkdownTables(text: string, stash: (html: string) => string): s
 				if (!looksLikeTableRow(row) || isTableSeparator(row)) break;
 				body.push(splitTableRow(row));
 			}
-			out.push(stash(pre(renderTableText(header, aligns, body))));
+			out.push(stash(pre(renderTelegramTable(header, aligns, body))));
 			i = j - 1;
 			continue;
 		}

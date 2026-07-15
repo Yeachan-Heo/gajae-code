@@ -65,6 +65,14 @@ describe("markdownToTelegramHtml (AC5)", () => {
 		expect(markdownToTelegramHtml(md)).toBe("<pre>Name  | Age\n------|----\nAlice |  30\nBob   |   1</pre>");
 	});
 
+	test("wide GFM tables render as stacked records for narrow Telegram clients", () => {
+		const md =
+			"| 공식 | 표현 |\n| --- | --- |\n| 이차방정식 근의 공식 | \\\\(x=\\\\frac{-b\\\\pm\\\\sqrt{b^2-4ac}}{2a}\\\\) |";
+		expect(markdownToTelegramHtml(md)).toBe(
+			"<pre>공식: 이차방정식 근의 공식\n표현: \\\\(x=\\\\frac{-b\\\\pm\\\\sqrt{b^2-4ac}}{2a}\\\\)</pre>",
+		);
+	});
+
 	test("table cell content is escaped and not re-parsed as markup", () => {
 		const md = "| h |\n| --- |\n| <b>**x**</b> |";
 		expect(markdownToTelegramHtml(md)).toBe("<pre>h           \n------------\n&lt;b&gt;**x**&lt;/b&gt;</pre>");
