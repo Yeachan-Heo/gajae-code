@@ -103,6 +103,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			shutdown,
 			getContextUsage: () => session.getContextUsage(),
 			getSystemPrompt: () => session.systemPrompt,
+			runEphemeralTurn: async promptText => {
+				const { replyText } = await session.runEphemeralTurn({ promptText });
+				return { replyText };
+			},
 			getWorkflowGate: () => session.getWorkflowGateEmitter(),
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 			clearContext: () => session.clearContext(),

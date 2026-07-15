@@ -2544,6 +2544,103 @@ describe("telegram daemon", () => {
 		expect(sent.some(frame => frame.type === "user_message" && frame.text === "start a new task")).toBe(true);
 		expect(sent.some(frame => frame.type === "reply")).toBe(false);
 	});
+	test("routes /btw as an ephemeral frame and returns its reply to the original topic", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "action_resolved", id: "ask1" });
+
+		await daemon.handleTelegramUpdate({
+			update_id: 8,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw what changed?", message_id: 101 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent).toContainEqual({
+			type: "ephemeral_turn",
+			sessionId: "S",
+			question: "what changed?",
+			token: "ts",
+			updateId: 8,
+			threadId: String(threadId),
+		});
+		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
+
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "ephemeral_turn_result",
+			sessionId: "S",
+			threadId: String(threadId),
+			text: "The parser changed.",
+		});
+		expect(bot.calls).toContainEqual(
+			expect.objectContaining({
+				method: "sendMessage",
+				body: expect.objectContaining({
+					message_thread_id: threadId,
+					text: "The parser changed.",
+				}),
+			}),
+		);
+	});
+
+	test("rejects an empty /btw question without injecting a user turn", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "action_resolved", id: "ask1" });
+
+		await daemon.handleTelegramUpdate({
+			update_id: 9,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw", message_id: 102 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent.some(frame => frame.type === "ephemeral_turn" || frame.type === "user_message")).toBe(false);
+		expect(bot.calls).toContainEqual(
+			expect.objectContaining({
+				method: "sendMessage",
+				body: expect.objectContaining({ message_thread_id: threadId, text: "Usage: /btw <question>" }),
+			}),
+		);
+	});
 
 	test("telegram control command forwards control_command instead of user_message", async () => {
 		FakeWs.instances = [];
@@ -3192,6 +3289,7 @@ test("daemon registers in-thread config and lifecycle commands and drops stale r
 	expect(cmds).toContain("verbose");
 	expect(cmds).toContain("lean");
 	expect(cmds).toContain("redact");
+	expect(cmds).toContain("btw");
 	expect(cmds).toContain("session_create");
 	expect(cmds).toContain("session_recent");
 	expect(cmds).toContain("session_close");

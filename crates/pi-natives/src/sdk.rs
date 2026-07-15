@@ -117,18 +117,18 @@ impl From<gjc_sdk::protocol::AskSelectedAckOutcome> for AskSelectedAckOutcomeEve
 }
 
 /// An inbound message forwarded to the TypeScript host: a free-text injection,
-/// in-thread config command, or deterministic control command.
+/// ephemeral side question, in-thread config command, or deterministic control command.
 #[napi(object)]
 pub struct InboundEvent {
-	/// Inbound kind (`user_message`, `config_command`, or `control_command`).
+	/// Inbound kind (`user_message`, `ephemeral_turn`, `config_command`, or `control_command`).
 	pub kind:         String,
 	/// The session this inbound belongs to.
 	pub session_id:   String,
-	/// Free-text body (`user_message` only).
+	/// Free-text body (`user_message` or `ephemeral_turn` only).
 	pub text:         Option<String>,
-	/// Telegram update id for dedupe (`user_message` only).
+	/// Telegram update id for dedupe (`user_message` or `ephemeral_turn` only).
 	pub update_id:    Option<i64>,
-	/// Originating thread/topic id (`user_message` only).
+	/// Originating thread/topic id (`user_message` or `ephemeral_turn` only).
 	pub thread_id:    Option<String>,
 	/// Requested verbosity `"lean"|"verbose"` (`config_command` only).
 	pub verbosity:    Option<String>,
@@ -309,6 +309,18 @@ impl NotificationServer {
 							redact:       None,
 							request_id:   None,
 							command_json: None,
+						},
+						ClientMessage::EphemeralTurn(turn) => InboundEvent {
+							kind:         "ephemeral_turn".to_owned(),
+							session_id:   turn.session_id,
+							text:         Some(turn.question),
+							update_id:    turn.update_id,
+							thread_id:    turn.thread_id,
+							verbosity:    None,
+							redact:       None,
+							request_id:   None,
+							command_json: None,
+							images:       None,
 						},
 						ClientMessage::ConfigCommand(c) => InboundEvent {
 							kind:         "config_command".to_owned(),

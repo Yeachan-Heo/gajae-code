@@ -324,6 +324,7 @@ Reply paths:
   - `/lean`
   - `/verbosity <lean|verbose>`
   - `/redact <on|off>`
+  - `/btw <question>` (asks an ephemeral side question without adding it to session history)
 - send paired-chat lifecycle commands from the Telegram command menu or by typing:
   - `/session_create path <dir>`
   - `/session_create worktree <repo> <branch>`

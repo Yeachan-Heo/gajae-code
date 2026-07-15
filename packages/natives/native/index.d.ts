@@ -1046,18 +1046,18 @@ export interface HtmlToMarkdownOptions {
 
 /**
  * An inbound message forwarded to the TypeScript host: a free-text injection,
- * in-thread config command, or deterministic control command.
+ * ephemeral side question, in-thread config command, or deterministic control command.
  */
 export interface InboundEvent {
-  /** Inbound kind (`user_message`, `config_command`, or `control_command`). */
+  /** Inbound kind (`user_message`, `ephemeral_turn`, `config_command`, or `control_command`). */
   kind: string
   /** The session this inbound belongs to. */
   sessionId: string
-  /** Free-text body (`user_message` only). */
+  /** Free-text body (`user_message` or `ephemeral_turn` only). */
   text?: string
-  /** Telegram update id for dedupe (`user_message` only). */
+  /** Telegram update id for dedupe (`user_message` or `ephemeral_turn` only). */
   updateId?: number
-  /** Originating thread/topic id (`user_message` only). */
+  /** Originating thread/topic id (`user_message` or `ephemeral_turn` only). */
   threadId?: string
   /** Requested verbosity `"lean"|"verbose"` (`config_command` only). */
   verbosity?: string

@@ -177,6 +177,14 @@ const ORPHAN_TOPIC_GRACE_MS = 60_000;
 const CONSUMED_REACTION = "✅";
 const MODEL_CALLBACK_PREFIX = "m:";
 const MODEL_CHOICE_TTL_MS = 10 * 60 * 1_000;
+function parseBtwQuestion(text: string, botUsername?: string): string | undefined {
+	const trimmed = text.trim();
+	const [rawCommand] = trimmed.split(/\s+/, 1);
+	if (!rawCommand) return undefined;
+	const [name, suffix] = rawCommand.toLowerCase().split("@", 2);
+	if (name !== "/btw" || (suffix && (!botUsername || suffix !== botUsername.toLowerCase()))) return undefined;
+	return trimmed.slice(rawCommand.length).trim();
+}
 
 const MODEL_BUTTON_LABEL_MAX_BYTES = 48;
 const SENSITIVE_MODEL_LABEL =
@@ -3106,6 +3114,29 @@ export class TelegramNotificationDaemon {
 		if (await this.sessionRouter.dispatch(session, msg as Record<string, unknown>)) return;
 		if (await this.#renderModelChoices(session, msg as Record<string, unknown>)) return;
 
+		if (msg?.type === "ephemeral_turn_result") {
+			const logicalSessionId = this.#logicalSessionId(session);
+			if (
+				typeof msg.sessionId !== "string" ||
+				msg.sessionId !== logicalSessionId ||
+				typeof msg.threadId !== "string" ||
+				!Number.isSafeInteger(Number(msg.threadId)) ||
+				this.topics.sessionForTopic(msg.threadId) !== logicalSessionId ||
+				typeof msg.text !== "string"
+			)
+				return;
+			try {
+				await this.botApi.call("sendMessage", {
+					chat_id: this.opts.chatId,
+					message_thread_id: Number(msg.threadId),
+					text: msg.text,
+					parse_mode: TELEGRAM_PARSE_MODE,
+				});
+			} catch {
+				logger.warn("notifications: /btw reply delivery failed");
+			}
+			return;
+		}
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
 			const send = renderThreadedFrame(msg);
 			if (!send) return;
@@ -3614,6 +3645,29 @@ export class TelegramNotificationDaemon {
 					const injectedText = repliedOriginal
 						? `> replied-to message:\n${repliedOriginal}\n\n${baseInjectedText}`
 						: baseInjectedText;
+					const btwQuestion = hasMedia ? undefined : parseBtwQuestion(inbound.text, this.botUsername);
+					if (btwQuestion !== undefined) {
+						await this.rememberSeenUpdateId(inbound.updateId);
+						if (!btwQuestion) {
+							await this.botApi.call("sendMessage", {
+								chat_id: this.opts.chatId,
+								message_thread_id: Number(inbound.threadId),
+								text: "Usage: /btw <question>",
+							});
+							return;
+						}
+						session.ws.send(
+							JSON.stringify({
+								type: "ephemeral_turn",
+								sessionId: inbound.sessionId,
+								question: btwQuestion,
+								token: session.token,
+								updateId: inbound.updateId,
+								threadId: inbound.threadId,
+							}),
+						);
+						return;
+					}
 					const control = hasMedia ? { kind: "none" as const } : preliminaryControl;
 					if (control.kind !== "none") {
 						await this.rememberSeenUpdateId(inbound.updateId);
@@ -3736,6 +3790,7 @@ export class TelegramNotificationDaemon {
 					{ command: "model", description: "Select a model for this session" },
 					{ command: "context", description: "Show current context usage for this session" },
 					{ command: "compact", description: "Compact this session: /compact [instructions]" },
+					{ command: "btw", description: "Ask an ephemeral side question in this session" },
 					{ command: "session_create", description: "Create a GJC session: path, worktree, or dir [--mpreset]" },
 					{ command: "session_recent", description: "List recent GJC sessions" },
 					{ command: "session_close", description: "Close a GJC-managed session" },

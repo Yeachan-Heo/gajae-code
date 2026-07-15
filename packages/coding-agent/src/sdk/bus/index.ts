@@ -30,7 +30,7 @@ import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
-import { logger, postmortem, VERSION } from "@gajae-code/utils";
+import { logger, postmortem, prompt, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type {
@@ -38,6 +38,7 @@ import type {
 	WorkflowGateTerminalController,
 	WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
+import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -3267,6 +3268,39 @@ export function createNotificationsExtension(
 					}
 				}
 
+				if (inbound.kind === "ephemeral_turn") {
+					const question = inbound.text?.trim() ?? "";
+					const threadId = inbound.threadId;
+					if (!runtime || !question || !threadId) return;
+					void (async () => {
+						try {
+							const result = ctx.runEphemeralTurn
+								? await ctx.runEphemeralTurn(prompt.render(btwUserPrompt, { question }))
+								: undefined;
+							server.pushFrame(
+								JSON.stringify({
+									type: "ephemeral_turn_result",
+									sessionId: runtime.id,
+									threadId,
+									updateId: inbound.updateId,
+									text: result?.replyText ?? "Unable to answer /btw: session support is unavailable.",
+								}),
+							);
+						} catch (error) {
+							logger.warn(`notifications: ephemeral turn failed: ${String(error)}`);
+							server.pushFrame(
+								JSON.stringify({
+									type: "ephemeral_turn_result",
+									sessionId: runtime.id,
+									threadId,
+									updateId: inbound.updateId,
+									text: "Unable to answer /btw.",
+								}),
+							);
+						}
+					})();
+					return;
+				}
 				if (inbound.kind === "user_message") {
 					// Inject as a user turn (steers/continues the agent; the resulting
 					// turn streams back via the turn_end handler even when not idle).

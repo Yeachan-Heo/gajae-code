@@ -374,6 +374,8 @@ export interface ExtensionContext {
 	/** Typed skill and mode controls exposed to the SDK host. */
 	invokeSkill?(name: string, args?: string): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
+	/** Run a non-persistent side question using the current session context. */
+	runEphemeralTurn?(promptText: string): Promise<{ replyText: string }>;
 	operateGoal?(op: "create" | "get" | "resume" | "pause" | "complete" | "drop", objective?: string): Promise<unknown>;
 
 	/** Typed nonvisual session controls exposed to the SDK host. */
@@ -1419,6 +1421,8 @@ export interface ExtensionContextActions {
 	sdkControl?: (operation: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
 	invokeSkill?: (name: string, args?: string) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;
+	/** Run a non-persistent side question using the current session context. */
+	runEphemeralTurn?: (promptText: string) => Promise<{ replyText: string }>;
 	operateGoal?: (
 		op: "create" | "get" | "resume" | "pause" | "complete" | "drop",
 		objective?: string,

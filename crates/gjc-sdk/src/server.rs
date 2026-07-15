@@ -1413,11 +1413,18 @@ where
 	};
 	let reply = match msg {
 		ClientMessage::Reply(reply) => reply,
-		// Inbound free-text injection / in-thread config command: forward to the
-		// host (token-authorized) and stop. These are not action replies.
+		// Inbound free-text injection / ephemeral side question / in-thread config
+		// command: forward to the host (token-authorized) and stop. These are not
+		// action replies.
 		ClientMessage::UserMessage(u) => {
 			if tokens_match(&u.token, &state.token) {
 				let _ = state.inbound_tx.send(ClientMessage::UserMessage(u));
+			}
+			return true;
+		},
+		ClientMessage::EphemeralTurn(turn) => {
+			if tokens_match(&turn.token, &state.token) {
+				let _ = state.inbound_tx.send(ClientMessage::EphemeralTurn(turn));
 			}
 			return true;
 		},

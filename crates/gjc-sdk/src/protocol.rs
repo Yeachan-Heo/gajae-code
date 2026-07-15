@@ -452,6 +452,8 @@ pub enum ClientMessage {
 	Hello(ClientHello),
 	/// An inbound free-text user message that injects/steers a turn.
 	UserMessage(UserMessage),
+	/// An ephemeral side question that uses session context without injecting a turn.
+	EphemeralTurn(EphemeralTurn),
 	/// An in-thread configuration command (verbosity/redact toggles).
 	ConfigCommand(ConfigCommand),
 	/// A deterministic transport control command from a client.
@@ -678,6 +680,23 @@ pub struct UserMessage {
 	/// Inline image attachments to forward as image content blocks.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub images:     Vec<InboundImage>,
+}
+/// An inbound ephemeral side question using current session context without persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EphemeralTurn {
+	/// The session to query.
+	pub session_id: String,
+	/// The side question body.
+	pub question:   String,
+	/// The per-session token authorizing this client.
+	pub token:      String,
+	/// Telegram update id for inbound dedupe/idempotency.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub update_id:  Option<i64>,
+	/// Originating thread/topic id, where the reply must be delivered.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub thread_id:  Option<String>,
 }
 
 /// An in-thread configuration command (verbosity/redact toggles).
@@ -1278,6 +1297,21 @@ mod tests {
 				assert_eq!(u.thread_id.as_deref(), Some("topic-9"));
 			},
 			other => panic!("expected user_message, got {other:?}"),
+		}
+	}
+	#[test]
+	fn ephemeral_turn_parses_as_distinct_inbound_frame() {
+		let raw =
+			r#"{"type":"ephemeral_turn","sessionId":"s1","question":"what changed?","token":"t","updateId":42,"threadId":"topic-9"}"#;
+		let msg: ClientMessage = serde_json::from_str(raw).unwrap();
+		match msg {
+			ClientMessage::EphemeralTurn(turn) => {
+				assert_eq!(turn.session_id, "s1");
+				assert_eq!(turn.question, "what changed?");
+				assert_eq!(turn.update_id, Some(42));
+				assert_eq!(turn.thread_id.as_deref(), Some("topic-9"));
+			},
+			other => panic!("expected ephemeral_turn, got {other:?}"),
 		}
 	}
 

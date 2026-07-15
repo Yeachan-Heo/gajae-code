@@ -267,6 +267,18 @@ describe("AgentSession respondAsBackground failure visibility", () => {
 		expect(ircHistory(harness).map(message => message.customType)).toEqual(["irc:incoming", "irc:autoreply"]);
 	});
 
+	it("does not add ephemeral turns to session history", async () => {
+		const harness = createHarness();
+		const before = [...harness.session.agent.state.messages];
+
+		await expect(harness.session.runEphemeralTurn({ promptText: "<btw>side question</btw>" })).resolves.toMatchObject(
+			{
+				replyText: "pong",
+			},
+		);
+
+		expect(harness.session.agent.state.messages).toEqual(before);
+	});
 	it("commits a successful IRC roster claim after accepting its exchange", async () => {
 		const harness = createHarness();
 		addPeer(harness.registry);
