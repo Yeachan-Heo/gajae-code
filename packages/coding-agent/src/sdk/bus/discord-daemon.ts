@@ -78,6 +78,11 @@ export interface DiscordEndpointBinding {
 	send(frame: Record<string, unknown>): void | Promise<void>;
 }
 
+export interface DiscordLeaseRecoveryScheduler {
+	setTimeout(callback: () => void | Promise<void>, delayMs: number): unknown;
+	clearTimeout(handle: unknown): void;
+}
+
 export interface DiscordNotificationDaemonOptions {
 	agentDir: string;
 	repo: string;
@@ -85,6 +90,7 @@ export interface DiscordNotificationDaemonOptions {
 	parentChannelId: string;
 	provider: DiscordProvider;
 	now?: () => number;
+	leaseRecoveryScheduler?: DiscordLeaseRecoveryScheduler;
 	resolveEndpoint: (sessionId: string, expectedGeneration?: number) => Promise<DiscordEndpointBinding | null>;
 	onCommand?: (
 		sessionId: string,
@@ -151,6 +157,7 @@ type DiscordInboundClaim = {
 export class DiscordNotificationDaemon {
 	readonly #store: ConversationStore<DiscordConversation>;
 	readonly #now: () => number;
+	readonly #leaseRecoveryScheduler: DiscordLeaseRecoveryScheduler;
 	readonly #creates = new Map<string, Promise<DiscordConversation>>();
 	readonly #resumes = new Map<string, Promise<DiscordConversation | undefined>>();
 	readonly #archives = new Map<string, Promise<void>>();
@@ -167,7 +174,7 @@ export class DiscordNotificationDaemon {
 	#stopTask: Promise<void> | undefined;
 	#providerStarting = false;
 
-	#leaseRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
+	#leaseRecoveryTimer: unknown;
 	#leaseRecoveryAt: number | undefined;
 	#leaseRecoveryFailures = 0;
 
@@ -179,6 +186,10 @@ export class DiscordNotificationDaemon {
 		this.#store = new ConversationStore({ agentDir: options.agentDir, kind: "discord", now: options.now });
 		this.#effects = new ChatEffectJournal({ agentDir: options.agentDir, transport: "discord", now: options.now });
 		this.#now = options.now ?? Date.now;
+		this.#leaseRecoveryScheduler = options.leaseRecoveryScheduler ?? {
+			setTimeout: (callback, delayMs) => setTimeout(() => void callback(), delayMs),
+			clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+		};
 		this.#resolveEndpoint = options.resolveEndpoint;
 	}
 
@@ -240,7 +251,7 @@ export class DiscordNotificationDaemon {
 		} catch (error) {
 			if (lifecycleGeneration === this.#lifecycleGeneration) {
 				this.#started = false;
-				if (this.#leaseRecoveryTimer) clearTimeout(this.#leaseRecoveryTimer);
+				if (this.#leaseRecoveryTimer) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
 				this.#leaseRecoveryTimer = undefined;
 				this.#leaseRecoveryAt = undefined;
 			}
@@ -255,7 +266,7 @@ export class DiscordNotificationDaemon {
 		const stopProvider = this.#started || this.#providerStarting;
 		++this.#lifecycleGeneration;
 		this.#started = false;
-		if (this.#leaseRecoveryTimer) clearTimeout(this.#leaseRecoveryTimer);
+		if (this.#leaseRecoveryTimer) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
 		this.#leaseRecoveryTimer = undefined;
 		this.#leaseRecoveryAt = undefined;
 
@@ -2146,23 +2157,23 @@ export class DiscordNotificationDaemon {
 				recoveryFailed ? now : undefined,
 			);
 		if (recoveryAt === undefined) {
-			if (this.#leaseRecoveryTimer) clearTimeout(this.#leaseRecoveryTimer);
+			if (this.#leaseRecoveryTimer) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
 			this.#leaseRecoveryTimer = undefined;
 			this.#leaseRecoveryAt = undefined;
 			this.#leaseRecoveryFailures = 0;
 			return;
 		}
 		if (this.#leaseRecoveryAt !== undefined && this.#leaseRecoveryAt <= recoveryAt) return;
-		if (this.#leaseRecoveryTimer) clearTimeout(this.#leaseRecoveryTimer);
+		if (this.#leaseRecoveryTimer) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
 		this.#leaseRecoveryAt = recoveryAt;
 		const delay =
 			recoveryAt <= now
 				? Math.min(1_000, 25 * 2 ** Math.min(this.#leaseRecoveryFailures, 5))
 				: Math.min(recoveryAt - now, 2_147_483_647);
-		this.#leaseRecoveryTimer = setTimeout(() => {
+		this.#leaseRecoveryTimer = this.#leaseRecoveryScheduler.setTimeout(() => {
 			this.#leaseRecoveryTimer = undefined;
 			this.#leaseRecoveryAt = undefined;
-			void this.#track(this.#recoverLeasedEffects());
+			return this.#track(this.#recoverLeasedEffects());
 		}, delay);
 	}
 	async #recoverLeasedEffects(): Promise<void> {
