@@ -32,12 +32,13 @@ import { SdkClientError } from "../src/sdk/client/client";
 const actionCustomIds = new Map<string, string>();
 
 class ManualLeaseRecoveryScheduler implements DiscordLeaseRecoveryScheduler {
-	#next: { handle: object; callback: () => void | Promise<void>; delayMs: number } | undefined;
+	#next: { handle: unknown; callback: () => void | Promise<void>; delayMs: number } | undefined;
+
+	constructor(private readonly handle: unknown = {}) {}
 
 	setTimeout(callback: () => void | Promise<void>, delayMs: number): unknown {
-		const handle = {};
-		this.#next = { handle, callback, delayMs };
-		return handle;
+		this.#next = { handle: this.handle, callback, delayMs };
+		return this.handle;
 	}
 
 	clearTimeout(handle: unknown): void {
@@ -52,11 +53,15 @@ class ManualLeaseRecoveryScheduler implements DiscordLeaseRecoveryScheduler {
 		return this.#next !== undefined;
 	}
 
-	async runNext(): Promise<void> {
+	takeNext(): () => void | Promise<void> {
 		const next = this.#next;
 		if (!next) throw new Error("Expected a scheduled Discord lease recovery.");
 		this.#next = undefined;
-		await next.callback();
+		return next.callback;
+	}
+
+	async runNext(): Promise<void> {
+		await this.takeNext()();
 	}
 }
 
@@ -2169,7 +2174,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			now = 20;
 			await journal.claim(stoppedEffectId, "dead-worker", 10);
 			const stoppedCommands: string[] = [];
-			const stoppedRecoveryScheduler = new ManualLeaseRecoveryScheduler();
+			const stoppedRecoveryScheduler = new ManualLeaseRecoveryScheduler(0);
 			restarted = new DiscordNotificationDaemon({
 				agentDir,
 				repo: agentDir,
@@ -2187,10 +2192,18 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			await restarted.start();
 			expect(stoppedRecoveryScheduler.pending).toBe(true);
 			await restarted.stop();
-			restarted = undefined;
 			expect(stoppedRecoveryScheduler.pending).toBe(false);
+
+			await restarted.start();
+			const staleRecovery = stoppedRecoveryScheduler.takeNext();
+			await restarted.stop();
+			await restarted.start();
+			expect(stoppedRecoveryScheduler.pending).toBe(true);
 			now = 31;
+			await staleRecovery();
 			expect(stoppedCommands).toEqual([]);
+			await restarted.stop();
+			restarted = undefined;
 		} finally {
 			await restarted?.stop();
 			await fs.rm(agentDir, { recursive: true, force: true });

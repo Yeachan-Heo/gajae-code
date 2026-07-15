@@ -251,7 +251,8 @@ export class DiscordNotificationDaemon {
 		} catch (error) {
 			if (lifecycleGeneration === this.#lifecycleGeneration) {
 				this.#started = false;
-				if (this.#leaseRecoveryTimer) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
+				if (this.#leaseRecoveryTimer !== undefined)
+					this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
 				this.#leaseRecoveryTimer = undefined;
 				this.#leaseRecoveryAt = undefined;
 			}
@@ -266,7 +267,7 @@ export class DiscordNotificationDaemon {
 		const stopProvider = this.#started || this.#providerStarting;
 		++this.#lifecycleGeneration;
 		this.#started = false;
-		if (this.#leaseRecoveryTimer) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
+		if (this.#leaseRecoveryTimer !== undefined) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
 		this.#leaseRecoveryTimer = undefined;
 		this.#leaseRecoveryAt = undefined;
 
@@ -2157,23 +2158,26 @@ export class DiscordNotificationDaemon {
 				recoveryFailed ? now : undefined,
 			);
 		if (recoveryAt === undefined) {
-			if (this.#leaseRecoveryTimer) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
+			if (this.#leaseRecoveryTimer !== undefined)
+				this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
 			this.#leaseRecoveryTimer = undefined;
 			this.#leaseRecoveryAt = undefined;
 			this.#leaseRecoveryFailures = 0;
 			return;
 		}
 		if (this.#leaseRecoveryAt !== undefined && this.#leaseRecoveryAt <= recoveryAt) return;
-		if (this.#leaseRecoveryTimer) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
+		if (this.#leaseRecoveryTimer !== undefined) this.#leaseRecoveryScheduler.clearTimeout(this.#leaseRecoveryTimer);
 		this.#leaseRecoveryAt = recoveryAt;
 		const delay =
 			recoveryAt <= now
 				? Math.min(1_000, 25 * 2 ** Math.min(this.#leaseRecoveryFailures, 5))
 				: Math.min(recoveryAt - now, 2_147_483_647);
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		this.#leaseRecoveryTimer = this.#leaseRecoveryScheduler.setTimeout(() => {
+			if (lifecycleGeneration !== this.#lifecycleGeneration) return;
 			this.#leaseRecoveryTimer = undefined;
 			this.#leaseRecoveryAt = undefined;
-			return this.#track(this.#recoverLeasedEffects());
+			return this.#track(this.#recoverLeasedEffects()).catch(() => {});
 		}, delay);
 	}
 	async #recoverLeasedEffects(): Promise<void> {
