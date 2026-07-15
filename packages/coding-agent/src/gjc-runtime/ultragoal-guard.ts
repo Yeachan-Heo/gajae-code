@@ -7,6 +7,7 @@ import {
 	validateSupersededFinalAggregateReceipt,
 } from "./ultragoal-receipt-freshness";
 import {
+	computeUltragoalSourceSnapshotHash,
 	getUltragoalPaths,
 	getUltragoalRunCompletionState,
 	readUltragoalLedger,
@@ -199,6 +200,33 @@ function findReceiptGoal(
 	}
 	const storyGoal = plan.goals.find(goal => goal.objective === currentObjective);
 	return storyGoal ? { goal: storyGoal, receiptKind: "per-goal" } : null;
+}
+
+export function validateUltragoalCompletionSourceSnapshotFresh(input: {
+	goal: UltragoalGoal;
+	currentSourceSnapshotHash: string | null;
+}): UltragoalGuardDiagnostic | null {
+	const receipt = input.goal.completionVerification;
+	const frozen = receipt?.sourceSnapshotHashBeforeCheckpoint;
+	if (!frozen) return null;
+	if (!input.currentSourceSnapshotHash || input.currentSourceSnapshotHash !== frozen) {
+		return {
+			state: "active_stale_receipt",
+			message: `Ultragoal ${input.goal.id} completion receipt was verified against source snapshot ${frozen}, but the current implementation snapshot is ${input.currentSourceSnapshotHash ?? "unavailable"}. Re-run review/QA before reusing prior CLEAR/pass evidence.`,
+			goalId: input.goal.id,
+		};
+	}
+	return null;
+}
+
+async function validateCurrentSourceSnapshotFresh(
+	cwd: string,
+	goal: UltragoalGoal,
+): Promise<UltragoalGuardDiagnostic | null> {
+	return validateUltragoalCompletionSourceSnapshotFresh({
+		goal,
+		currentSourceSnapshotHash: await computeUltragoalSourceSnapshotHash(cwd),
+	});
 }
 
 /**
@@ -456,6 +484,8 @@ export async function readUltragoalVerificationState(input: {
 		receiptKind: receiptTarget.receiptKind,
 	});
 	if (receiptDiagnostic.state !== "active_verified_complete") return receiptDiagnostic;
+	const sourceSnapshotDiagnostic = await validateCurrentSourceSnapshotFresh(input.cwd, receiptTarget.goal);
+	if (sourceSnapshotDiagnostic) return sourceSnapshotDiagnostic;
 	if (runState.incompleteGoals.length > 0) {
 		return {
 			state: "active_missing_final_receipt",
@@ -537,6 +567,8 @@ export async function verifyUltragoalDurableCompletionState(input: {
 				receiptKind: "per-goal",
 			});
 			if (diagnostic.state !== "active_verified_complete") return diagnostic;
+			const sourceSnapshotDiagnostic = await validateCurrentSourceSnapshotFresh(input.cwd, goal);
+			if (sourceSnapshotDiagnostic) return sourceSnapshotDiagnostic;
 		}
 		return {
 			state: "active_verified_complete",
@@ -546,6 +578,11 @@ export async function verifyUltragoalDurableCompletionState(input: {
 
 	const ask = await isUltragoalAskBlocked(input.cwd, { sessionId });
 	if (!ask.active) {
+		const finalGoal = findFinalAggregateReceiptGoal(plan, ledger);
+		if (finalGoal) {
+			const sourceSnapshotDiagnostic = await validateCurrentSourceSnapshotFresh(input.cwd, finalGoal);
+			if (sourceSnapshotDiagnostic) return sourceSnapshotDiagnostic;
+		}
 		return {
 			state: "active_verified_complete",
 			message: ask.reason,

@@ -183,6 +183,7 @@ export interface UltragoalCompletionVerification {
 		requiredGoalSetHashBeforeCheckpoint: string;
 	};
 	checkpointLedgerEventId: string;
+	sourceSnapshotHashBeforeCheckpoint?: string | null;
 	validationBatch?:
 		| {
 				schemaVersion: 1;
@@ -295,6 +296,41 @@ interface JsonObject {
 	[key: string]: unknown;
 }
 
+export type UltragoalTimeoutCause =
+	| "WORK_UNIT_TOO_LARGE"
+	| "RUNNER_RPC_TIMEOUT"
+	| "NO_OUTPUT_STALL"
+	| "PROVIDER_TIMEOUT"
+	| "TOOL_TIMEOUT"
+	| "UNKNOWN_TIMEOUT";
+
+export type UltragoalTimeoutEscalationReason = "repeated_timeout" | "retry_budget_exceeded";
+
+export interface UltragoalTimeoutStrategySignature extends JsonObject {
+	command?: string[];
+	testName?: string;
+	workUnit?: string;
+	strategy?: string;
+	sourceSnapshotHash: string;
+}
+
+export interface UltragoalTimeoutReportResult {
+	plan: UltragoalPlan;
+	goal: UltragoalGoal;
+	event: UltragoalLedgerEvent;
+	cause: UltragoalTimeoutCause;
+	signatureHash: string;
+	sourceSnapshotHash: string;
+	timeoutCountForSignature: number;
+	timeoutCountForGoal: number;
+	retryBudget: number;
+	repeatedTimeoutThreshold: number;
+	retryAllowed: boolean;
+	escalated: boolean;
+	escalationReason?: UltragoalTimeoutEscalationReason;
+	message: string;
+}
+
 function currentUltragoalSessionId(cwd: string): string {
 	return resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 }
@@ -405,6 +441,8 @@ export async function readUltragoalLedger(cwd: string, sessionId?: string | null
 }
 
 export const DEFAULT_ULTRAGOAL_NUDGE_BUDGET = 10;
+export const DEFAULT_ULTRAGOAL_TIMEOUT_RETRY_BUDGET = 4;
+export const ULTRAGOAL_REPEATED_TIMEOUT_THRESHOLD = 2;
 
 /** Pure: count ledger `nudge` rows for an exact goalId. */
 export function countUltragoalNudges(ledger: readonly UltragoalLedgerEvent[], goalId: string): number {
@@ -449,6 +487,41 @@ export async function resolveUltragoalNudgeBudget(cwd: string): Promise<{ budget
 	const user = await readSettingsNudgeBudget(userPath);
 	if (user !== null) return { budget: user, source: userPath };
 	return { budget: DEFAULT_ULTRAGOAL_NUDGE_BUDGET, source: "default" };
+}
+
+function parsePositiveIntegerValue(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+async function readSettingsTimeoutRetryBudget(settingsPath: string): Promise<number | null> {
+	try {
+		const raw = await Bun.file(settingsPath).text();
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		const flat = parsePositiveIntegerValue(parsed["gjc.ultragoal.timeoutRetryBudget"]);
+		if (flat !== null) return flat;
+		const gjc = parsed.gjc;
+		if (gjc && typeof gjc === "object") {
+			const ultragoal = (gjc as Record<string, unknown>).ultragoal;
+			if (ultragoal && typeof ultragoal === "object") {
+				return parsePositiveIntegerValue((ultragoal as Record<string, unknown>).timeoutRetryBudget);
+			}
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+/** Resolve the total timeout retry budget per ultragoal story before escalation blocks same-loop retrying. */
+export async function resolveUltragoalTimeoutRetryBudget(cwd: string): Promise<{ budget: number; source: string }> {
+	const projectPath = path.join(gjcRoot(cwd), "settings.json");
+	const project = await readSettingsTimeoutRetryBudget(projectPath);
+	if (project !== null) return { budget: project, source: projectPath };
+	const userDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
+	const userPath = path.join(userDir, "settings.json");
+	const user = await readSettingsTimeoutRetryBudget(userPath);
+	if (user !== null) return { budget: user, source: userPath };
+	return { budget: DEFAULT_ULTRAGOAL_TIMEOUT_RETRY_BUDGET, source: "default" };
 }
 
 /**
@@ -614,6 +687,7 @@ function buildCompletionReceipt(input: {
 	qualityGateJson: JsonObject;
 	now: string;
 	checkpointLedgerEventId: string;
+	sourceSnapshotHash?: string | null;
 }): UltragoalCompletionVerification {
 	const generation = computeUltragoalPlanGeneration({
 		plan: input.plan,
@@ -685,6 +759,7 @@ function buildCompletionReceipt(input: {
 		planGeneration: generation.planGeneration,
 		basis: generation.basis,
 		checkpointLedgerEventId: input.checkpointLedgerEventId,
+		sourceSnapshotHashBeforeCheckpoint: input.sourceSnapshotHash ?? null,
 		validationBatch,
 	};
 }
@@ -1889,6 +1964,285 @@ export async function startNextUltragoalGoal(input: {
 		await appendLedger(input.cwd, { event: "goal_started", goalId: goal.id }, input.sessionId);
 	}
 	return { plan, goal, allComplete: false };
+}
+
+function normalizeTimeoutCause(value: unknown): UltragoalTimeoutCause | null {
+	switch (value) {
+		case "WORK_UNIT_TOO_LARGE":
+		case "RUNNER_RPC_TIMEOUT":
+		case "NO_OUTPUT_STALL":
+		case "PROVIDER_TIMEOUT":
+		case "TOOL_TIMEOUT":
+		case "UNKNOWN_TIMEOUT":
+			return value;
+		default:
+			return null;
+	}
+}
+
+function normalizedTimeoutText(input: {
+	evidence?: string;
+	stdout?: string;
+	stderr?: string;
+	command?: string | string[];
+}): string {
+	return [
+		input.evidence ?? "",
+		input.stdout ?? "",
+		input.stderr ?? "",
+		Array.isArray(input.command) ? input.command.join(" ") : (input.command ?? ""),
+	]
+		.join("\n")
+		.toLowerCase();
+}
+
+export function classifyUltragoalTimeoutCause(input: {
+	cause?: UltragoalTimeoutCause | string | null;
+	evidence?: string;
+	stdout?: string;
+	stderr?: string;
+	command?: string | string[];
+	elapsedMs?: number;
+	timeoutMs?: number;
+	expectedRuntimeMs?: number;
+	noOutputMs?: number;
+}): UltragoalTimeoutCause {
+	const explicit = normalizeTimeoutCause(input.cause);
+	if (explicit) return explicit;
+	const text = normalizedTimeoutText(input);
+	const timeoutMs = typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) ? input.timeoutMs : 0;
+	const elapsedMs = typeof input.elapsedMs === "number" && Number.isFinite(input.elapsedMs) ? input.elapsedMs : 0;
+	const expectedRuntimeMs =
+		typeof input.expectedRuntimeMs === "number" && Number.isFinite(input.expectedRuntimeMs)
+			? input.expectedRuntimeMs
+			: 0;
+	const noOutputMs = typeof input.noOutputMs === "number" && Number.isFinite(input.noOutputMs) ? input.noOutputMs : 0;
+	if (/no[-\s]?output|stall|silent|heartbeat/.test(text) || (timeoutMs > 0 && noOutputMs >= timeoutMs * 0.8))
+		return "NO_OUTPUT_STALL";
+	if (/provider|model|llm|openai|anthropic|claude|gemini|upstream/.test(text)) return "PROVIDER_TIMEOUT";
+	if (/tool[^\n]{0,40}timeout|timeout[^\n]{0,40}tool|tool call/.test(text)) return "TOOL_TIMEOUT";
+	if (
+		/runner|rpc|transport|bridge/.test(text) ||
+		(timeoutMs >= 55_000 && timeoutMs <= 65_000 && elapsedMs >= timeoutMs)
+	)
+		return "RUNNER_RPC_TIMEOUT";
+	if (
+		/work[-\s]?unit too large|oversized|too large|monolith|shard|split/.test(text) ||
+		(timeoutMs > 0 && expectedRuntimeMs > timeoutMs) ||
+		(timeoutMs > 0 && elapsedMs >= timeoutMs * 1.25)
+	)
+		return "WORK_UNIT_TOO_LARGE";
+	return "UNKNOWN_TIMEOUT";
+}
+
+function normalizeTimeoutCommand(command: string | string[] | undefined): string[] | undefined {
+	if (Array.isArray(command)) {
+		const parts = command.map(part => part.trim()).filter(Boolean);
+		return parts.length > 0 ? parts : undefined;
+	}
+	const trimmed = command?.trim();
+	return trimmed ? [trimmed] : undefined;
+}
+
+function timeoutStrategySignature(input: {
+	command?: string | string[];
+	testName?: string;
+	workUnit?: string;
+	strategy?: string;
+	sourceSnapshotHash: string;
+}): UltragoalTimeoutStrategySignature {
+	const command = normalizeTimeoutCommand(input.command);
+	const testName = input.testName?.trim();
+	const workUnit = input.workUnit?.trim();
+	const strategy = input.strategy?.trim();
+	if (!command && !testName && !workUnit) {
+		throw new Error("report-timeout requires --command, --command-json, --test, or --work-unit");
+	}
+	return {
+		...(command ? { command } : {}),
+		...(testName ? { testName } : {}),
+		...(workUnit ? { workUnit } : {}),
+		...(strategy ? { strategy } : {}),
+		sourceSnapshotHash: input.sourceSnapshotHash,
+	};
+}
+
+async function resolveTimeoutSourceSnapshotHash(cwd: string, sourceSnapshot: unknown): Promise<string> {
+	if (sourceSnapshot !== undefined) return hashStructuredValue(sourceSnapshot);
+	return (await computeUltragoalSourceSnapshotHash(cwd)) ?? hashStructuredValue({ source: "unavailable" });
+}
+
+function timeoutLedgerFieldString(event: UltragoalLedgerEvent, key: string): string | null {
+	const value = event[key];
+	return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function timeoutGuidance(cause: UltragoalTimeoutCause): string {
+	const base =
+		"Use a different recovery strategy before retrying: shard or checkpoint the work into smaller pools, split runner/RPC timeout-sensitive tests, or split out-of-scope failures into blocker/follow-up stories.";
+	if (cause === "RUNNER_RPC_TIMEOUT")
+		return `${base} The last timeout looks runner/RPC bounded; keep individual test bodies below the runner window instead of rerunning the same oversized command.`;
+	if (cause === "WORK_UNIT_TOO_LARGE")
+		return `${base} The last timeout looks like an oversized work unit; reduce scope before resuming.`;
+	if (cause === "NO_OUTPUT_STALL")
+		return `${base} The last timeout looks like a no-output stall; add checkpoints/heartbeats or split the command before resuming.`;
+	return base;
+}
+
+function buildTimeoutEscalationEvidence(input: {
+	goalId: string;
+	cause: UltragoalTimeoutCause;
+	reason: UltragoalTimeoutEscalationReason;
+	signatureAttempt: number;
+	goalAttempt: number;
+	retryBudget: number;
+	evidence: string;
+}): string {
+	const reasonText =
+		input.reason === "repeated_timeout"
+			? `same strategy/source snapshot timed out ${input.signatureAttempt} times`
+			: `timeout retry budget exhausted (${input.goalAttempt}/${input.retryBudget})`;
+	return [
+		`Timeout escalation for ${input.goalId}: ${reasonText}; cause=${input.cause}.`,
+		input.evidence.trim(),
+		timeoutGuidance(input.cause),
+	]
+		.filter(Boolean)
+		.join(" ");
+}
+
+function parsePositiveMs(value: number | undefined, fieldName: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isFinite(value) || value < 0) throw new Error(`${fieldName} must be a finite non-negative number`);
+	return Math.round(value);
+}
+
+export async function recordUltragoalTimeout(input: {
+	cwd: string;
+	goalId: string;
+	evidence: string;
+	command?: string | string[];
+	testName?: string;
+	workUnit?: string;
+	strategy?: string;
+	sourceSnapshot?: unknown;
+	cause?: UltragoalTimeoutCause | string | null;
+	stdout?: string;
+	stderr?: string;
+	elapsedMs?: number;
+	timeoutMs?: number;
+	expectedRuntimeMs?: number;
+	noOutputMs?: number;
+	retryBudget?: number;
+	sessionId?: string | null;
+}): Promise<UltragoalTimeoutReportResult> {
+	const plan = await readUltragoalPlan(input.cwd, input.sessionId);
+	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
+	const goal = plan.goals.find(item => item.id === input.goalId.trim());
+	if (!goal) throw new Error(`No ultragoal goal found for ${input.goalId}.`);
+	if (goal.status === "complete" || goal.status === "superseded") {
+		throw new Error(`Cannot record timeout for ${goal.id} because its status is ${goal.status}.`);
+	}
+	const evidence = input.evidence.trim();
+	if (!evidence) throw new Error("report-timeout --evidence is required");
+	const sourceSnapshotHash = await resolveTimeoutSourceSnapshotHash(input.cwd, input.sourceSnapshot);
+	const signature = timeoutStrategySignature({
+		command: input.command,
+		testName: input.testName,
+		workUnit: input.workUnit,
+		strategy: input.strategy,
+		sourceSnapshotHash,
+	});
+	const signatureHash = hashStructuredValue(signature);
+	const cause = classifyUltragoalTimeoutCause(input);
+	const configuredBudget = input.retryBudget ?? (await resolveUltragoalTimeoutRetryBudget(input.cwd)).budget;
+	const retryBudget = Math.max(1, Math.trunc(configuredBudget));
+	const ledger = await readUltragoalLedger(input.cwd, input.sessionId);
+	const timeoutEvents = ledger.filter(event => event.event === "timeout_observed" && event.goalId === goal.id);
+	const signatureAttempt =
+		timeoutEvents.filter(event => timeoutLedgerFieldString(event, "signatureHash") === signatureHash).length + 1;
+	const goalAttempt = timeoutEvents.length + 1;
+	const repeatedTimeout = signatureAttempt >= ULTRAGOAL_REPEATED_TIMEOUT_THRESHOLD;
+	const budgetExceeded = goalAttempt >= retryBudget;
+	const escalated = repeatedTimeout || budgetExceeded;
+	const elapsedMs = parsePositiveMs(input.elapsedMs, "elapsedMs");
+	const timeoutMs = parsePositiveMs(input.timeoutMs, "timeoutMs");
+	const expectedRuntimeMs = parsePositiveMs(input.expectedRuntimeMs, "expectedRuntimeMs");
+	const noOutputMs = parsePositiveMs(input.noOutputMs, "noOutputMs");
+	const escalationReason: UltragoalTimeoutEscalationReason | undefined = repeatedTimeout
+		? "repeated_timeout"
+		: budgetExceeded
+			? "retry_budget_exceeded"
+			: undefined;
+	const now = new Date().toISOString();
+	const nextStatus: UltragoalGoalStatus = escalated ? "blocked" : "failed";
+	goal.status = nextStatus;
+	goal.evidence = escalated
+		? buildTimeoutEscalationEvidence({
+				goalId: goal.id,
+				cause,
+				reason: escalationReason!,
+				signatureAttempt,
+				goalAttempt,
+				retryBudget,
+				evidence,
+			})
+		: `Timeout observed for ${goal.id}; cause=${cause}. ${evidence} ${timeoutGuidance(cause)}`;
+	goal.updatedAt = now;
+	plan.updatedAt = now;
+	await writePlan(input.cwd, plan, input.sessionId);
+	const event = await appendLedger(
+		input.cwd,
+		{
+			event: "timeout_observed",
+			goalId: goal.id,
+			status: nextStatus,
+			cause,
+			evidence,
+			signature,
+			signatureHash,
+			sourceSnapshotHash,
+			signatureAttempt,
+			goalAttempt,
+			retryBudget,
+			repeatedTimeoutThreshold: ULTRAGOAL_REPEATED_TIMEOUT_THRESHOLD,
+			retryAllowed: !escalated,
+			escalated,
+			escalationReason,
+			elapsedMs,
+			timeoutMs,
+			expectedRuntimeMs,
+			noOutputMs,
+		},
+		input.sessionId,
+	);
+	const message = escalated
+		? buildTimeoutEscalationEvidence({
+				goalId: goal.id,
+				cause,
+				reason: escalationReason!,
+				signatureAttempt,
+				goalAttempt,
+				retryBudget,
+				evidence,
+			})
+		: `Recorded timeout ${goalAttempt}/${retryBudget} for ${goal.id}; one changed-strategy retry remains allowed unless the same signature reaches ${ULTRAGOAL_REPEATED_TIMEOUT_THRESHOLD}. ${timeoutGuidance(cause)}`;
+	return {
+		plan,
+		goal,
+		event,
+		cause,
+		signatureHash,
+		sourceSnapshotHash,
+		timeoutCountForSignature: signatureAttempt,
+		timeoutCountForGoal: goalAttempt,
+		retryBudget,
+		repeatedTimeoutThreshold: ULTRAGOAL_REPEATED_TIMEOUT_THRESHOLD,
+		retryAllowed: !escalated,
+		escalated,
+		...(escalationReason ? { escalationReason } : {}),
+		message,
+	};
 }
 
 async function readStructuredValue(cwd: string, value: string): Promise<unknown> {
@@ -4082,6 +4436,7 @@ export async function checkpointUltragoalGoal(input: {
 		return plan;
 	}
 	const changeSet = input.status === "complete" ? await computeCheckpointChangeSet(input.cwd) : undefined;
+	const sourceSnapshotHash = changeSet ? sourceSnapshotHashFromChangeSet(changeSet) : null;
 	if (input.status === "complete") {
 		validatePipelineCheckpointSafety(plan, goal, changeSet);
 		if (!staleCompleteReceiptReplay) validateCompleteCheckpointTargetGoal(goal);
@@ -4123,6 +4478,7 @@ export async function checkpointUltragoalGoal(input: {
 			qualityGateJson: qualityGateJson as JsonObject,
 			now,
 			checkpointLedgerEventId: pendingCheckpointEventId,
+			sourceSnapshotHash,
 		});
 	}
 	goal.status = input.status;
@@ -4827,6 +5183,31 @@ async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeS
 	};
 }
 
+function sourceSnapshotBasisFromChangeSet(changeSet: UltragoalChangeSet): JsonObject {
+	return {
+		source: changeSet.source,
+		baseRef: changeSet.baseRef,
+		mergeBase: changeSet.mergeBase,
+		headRef: changeSet.headRef,
+		paths: changeSet.paths.map(row => ({
+			path: row.path,
+			oldPath: row.oldPath,
+			status: row.status,
+			category: row.category,
+		})),
+		rawDiff: changeSet.rawDiff ?? "",
+	};
+}
+
+function sourceSnapshotHashFromChangeSet(changeSet: UltragoalChangeSet): string {
+	return hashStructuredValue(sourceSnapshotBasisFromChangeSet(changeSet));
+}
+
+export async function computeUltragoalSourceSnapshotHash(cwd: string): Promise<string | null> {
+	const changeSet = await computeCheckpointChangeSet(cwd);
+	return changeSet ? sourceSnapshotHashFromChangeSet(changeSet) : null;
+}
+
 function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {
 	const paths: UltragoalChangeSetPath[] = [];
 	for (const line of diff.split("\n")) {
@@ -5067,6 +5448,25 @@ function flagValue(args: readonly string[], flag: string): string | undefined {
 	return args[index + 1];
 }
 
+function optionalNumericFlag(args: readonly string[], flag: string): number | undefined {
+	const value = flagValue(args, flag);
+	if (value === undefined) return undefined;
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed)) throw new Error(`${flag} must be a finite number`);
+	return parsed;
+}
+
+function commandJsonValue(value: unknown): string[] {
+	if (!Array.isArray(value) || value.length === 0)
+		throw new Error("--command-json must be a non-empty JSON argv array");
+	return value.map((item, index) => {
+		if (typeof item !== "string" || item.trim().length === 0) {
+			throw new Error(`--command-json[${index}] must be a non-empty string`);
+		}
+		return item.trim();
+	});
+}
+
 function hasFlag(args: readonly string[], flag: string): boolean {
 	return args.includes(flag);
 }
@@ -5105,6 +5505,18 @@ const FLAGS_WITH_VALUES = new Set([
 	"--review-result-json",
 	"--qa-result-json",
 	"--target-state-json",
+	"--command",
+	"--command-json",
+	"--test",
+	"--work-unit",
+	"--strategy",
+	"--source-snapshot-json",
+	"--cause",
+	"--elapsed-ms",
+	"--timeout-ms",
+	"--expected-runtime-ms",
+	"--no-output-ms",
+	"--retry-budget",
 ]);
 
 function isHelpArg(arg: string): boolean {
@@ -5196,6 +5608,35 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 			"",
 		].join("\n");
 	}
+	if (subject === "report-timeout" || subject === "record-timeout") {
+		return [
+			"Run native GJC Ultragoal workflow commands",
+			"",
+			"USAGE",
+			"  $ gjc ultragoal report-timeout --goal-id <id> (--command <cmd> | --command-json <argv> | --test <name> | --work-unit <id>) --evidence <text> [FLAGS]",
+			"",
+			"FLAGS",
+			"      --goal-id=<value>             Durable .gjc/ultragoal goal id, e.g. G001",
+			"      --command=<value>             Shell command/test command summary for retry signature",
+			"      --command-json=<value>        JSON argv array for retry signature",
+			"      --test=<value>                Test name/pattern for retry signature",
+			"      --work-unit=<value>           Work-unit/story/test shard identifier",
+			"      --strategy=<value>            Optional strategy label; changing it permits a different retry strategy",
+			"      --source-snapshot-json=<value> JSON snapshot/hash; defaults to current git change snapshot",
+			"      --cause=<value>               WORK_UNIT_TOO_LARGE|RUNNER_RPC_TIMEOUT|NO_OUTPUT_STALL|PROVIDER_TIMEOUT|TOOL_TIMEOUT|UNKNOWN_TIMEOUT",
+			"      --elapsed-ms=<value>          Observed elapsed milliseconds",
+			"      --timeout-ms=<value>          Timeout ceiling milliseconds",
+			"      --expected-runtime-ms=<value> Expected body runtime when known",
+			"      --no-output-ms=<value>        No-output stall duration when known",
+			"      --retry-budget=<value>        Override per-story timeout retry budget for this report",
+			"      --json                        Output a machine-readable receipt",
+			"",
+			"ESCALATION",
+			"  The same command/test/work-unit plus source snapshot timing out twice blocks same-strategy retry.",
+			"  Exhausting the per-story timeout retry budget also blocks the story until work is split, sharded, or rebaselined.",
+			"",
+		].join("\n");
+	}
 	return [
 		"Run native GJC Ultragoal workflow commands",
 		"",
@@ -5208,6 +5649,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		"  complete-goals",
 		"  checkpoint",
 		"  review",
+		"  report-timeout",
 		"  steer",
 		"  record-review-blockers",
 		"  classify-blocker",
@@ -5303,6 +5745,40 @@ function renderCheckpointContinuation(
 	}
 	lines.push("");
 	return lines.join("\n");
+}
+
+function renderTimeoutReport(result: UltragoalTimeoutReportResult, json: boolean, cwd: string): string {
+	if (json)
+		return renderCliWriteReceipt({
+			ok: true,
+			event: "timeout_observed",
+			goal_id: result.goal.id,
+			goal_status: result.goal.status,
+			cause: result.cause,
+			signature_hash: result.signatureHash,
+			source_snapshot_hash: result.sourceSnapshotHash,
+			timeout_count_for_signature: result.timeoutCountForSignature,
+			timeout_count_for_goal: result.timeoutCountForGoal,
+			retry_budget: result.retryBudget,
+			repeated_timeout_threshold: result.repeatedTimeoutThreshold,
+			retry_allowed: result.retryAllowed,
+			escalated: result.escalated,
+			escalation_reason: result.escalationReason,
+			next_action: result.retryAllowed ? "retry-with-changed-observation" : "split-or-rebaseline-before-retry",
+			message: result.message,
+			goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
+			ledger_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).ledgerPath,
+		});
+	return [
+		result.escalated
+			? `Timeout escalation recorded for ${result.goal.id}; same-strategy retry is blocked.`
+			: `Timeout recorded for ${result.goal.id}; retry remains allowed only with a changed strategy.`,
+		`Cause: ${result.cause}`,
+		`Signature attempts: ${result.timeoutCountForSignature}/${result.repeatedTimeoutThreshold}`,
+		`Story timeout attempts: ${result.timeoutCountForGoal}/${result.retryBudget}`,
+		result.message,
+		"",
+	].join("\n");
 }
 
 async function executeUltragoalSteeringCommand(args: readonly string[], cwd: string): Promise<SteeringCommandResult> {
@@ -5500,6 +5976,30 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 						cwd,
 					),
 				};
+			case "report-timeout":
+			case "record-timeout": {
+				const commandJson = flagValue(args, "--command-json");
+				const sourceSnapshotJson = flagValue(args, "--source-snapshot-json");
+				const result = await recordUltragoalTimeout({
+					cwd,
+					goalId: flagValue(args, "--goal-id") ?? "",
+					evidence: flagValue(args, "--evidence") ?? "",
+					command: commandJson
+						? commandJsonValue(await readStructuredValue(cwd, commandJson))
+						: flagValue(args, "--command"),
+					testName: flagValue(args, "--test"),
+					workUnit: flagValue(args, "--work-unit"),
+					strategy: flagValue(args, "--strategy"),
+					sourceSnapshot: sourceSnapshotJson ? await readStructuredValue(cwd, sourceSnapshotJson) : undefined,
+					cause: flagValue(args, "--cause"),
+					elapsedMs: optionalNumericFlag(args, "--elapsed-ms"),
+					timeoutMs: optionalNumericFlag(args, "--timeout-ms"),
+					expectedRuntimeMs: optionalNumericFlag(args, "--expected-runtime-ms"),
+					noOutputMs: optionalNumericFlag(args, "--no-output-ms"),
+					retryBudget: optionalNumericFlag(args, "--retry-budget"),
+				});
+				return { status: 0, stdout: renderTimeoutReport(result, json, cwd) };
+			}
 			case "checkpoint": {
 				const goalId = flagValue(args, "--goal-id") ?? "";
 				const status = parseGoalStatus(flagValue(args, "--status"));
@@ -5644,6 +6144,8 @@ const RECONCILE_COMMANDS = new Set([
 	"create-goals",
 	"complete-goals",
 	"checkpoint",
+	"report-timeout",
+	"record-timeout",
 	"steer",
 	"record-review-blockers",
 	"review",
