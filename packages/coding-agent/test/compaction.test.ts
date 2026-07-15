@@ -9,6 +9,8 @@ import {
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
+	type RemoteCompactionFallbackHealthEvent,
+	type RemoteCompactionFallbackHealthHooks,
 	resolveThresholdTokens,
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction/compaction";
@@ -511,6 +513,129 @@ describe("remote compaction setting", () => {
 				compactionItem: { type: "compaction", encrypted_content: "new_encrypted" },
 			},
 		});
+	});
+
+	it("reports OpenAI remote compaction fallback and recovery through the session-owned health hook", async () => {
+		const model = getBundledModel("openai", "gpt-5.1");
+		if (!model) throw new Error("Expected openai/gpt-5.1 model to exist");
+
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(
+				createOpenAiAssistantMessage("Answer 1", model, createMockUsage(0, 100, 9000, 0), "encrypted_reasoning"),
+			),
+			createMessageEntry(createUserMessage("Turn 2")),
+		];
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1,
+			remoteEnabled: true,
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const fetchSpy = vi
+			.fn()
+			.mockReturnValueOnce(new Response("remote down", { status: 500, statusText: "Bad Gateway" }))
+			.mockReturnValueOnce(
+				new Response(JSON.stringify({ output: { type: "compaction" } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			)
+			.mockReturnValueOnce(
+				new Response(JSON.stringify({ output: [{ type: "message", role: "assistant" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			)
+			.mockReturnValueOnce(
+				new Response(JSON.stringify({ output: [{ type: "compaction", encrypted_content: "new_encrypted" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+		using _hook = hookFetch(fetchSpy);
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("Local summary"));
+		const events: RemoteCompactionFallbackHealthEvent[] = [];
+		const health: RemoteCompactionFallbackHealthHooks = {
+			recordRemoteCompactionFallback(event) {
+				events.push(event);
+			},
+		};
+
+		await compact(preparation, model, "test-api-key", undefined, undefined, {
+			remoteCompactionFallbackHealth: health,
+		});
+		await compact(preparation, model, "test-api-key", undefined, undefined, {
+			remoteCompactionFallbackHealth: health,
+		});
+		await compact(preparation, model, "test-api-key", undefined, undefined, {
+			remoteCompactionFallbackHealth: health,
+		});
+		await compact(preparation, model, "test-api-key", undefined, undefined, {
+			remoteCompactionFallbackHealth: health,
+		});
+
+		expect(events).toEqual([
+			{
+				kind: "fallback",
+				error: "Remote compaction failed (500 Bad Gateway)",
+				model: model.id,
+				provider: model.provider,
+			},
+			{
+				kind: "fallback",
+				error: "Remote compaction response malformed output (outputType=object)",
+				model: model.id,
+				provider: model.provider,
+			},
+			{
+				kind: "fallback",
+				error: "Remote compaction response missing compaction item (rawOutputLength=1, outputTypes=message, replacementHistoryLength=1)",
+				model: model.id,
+				provider: model.provider,
+			},
+			{ kind: "success", model: model.id, provider: model.provider },
+		]);
+	});
+
+	it("does not report remote compaction cancellation as fallback health", async () => {
+		const model = getBundledModel("openai", "gpt-5.1");
+		if (!model) throw new Error("Expected openai/gpt-5.1 model to exist");
+
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(
+				createOpenAiAssistantMessage("Answer 1", model, createMockUsage(0, 100, 9000, 0), "encrypted_reasoning"),
+			),
+			createMessageEntry(createUserMessage("Turn 2")),
+		];
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1,
+			remoteEnabled: true,
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const abortError = Object.assign(new Error("operation aborted"), { name: "AbortError" });
+		const fetchSpy = vi.fn().mockRejectedValueOnce(abortError);
+		using _hook = hookFetch(fetchSpy);
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("Local summary"));
+		const events: RemoteCompactionFallbackHealthEvent[] = [];
+		const health: RemoteCompactionFallbackHealthHooks = {
+			recordRemoteCompactionFallback(event) {
+				events.push(event);
+			},
+		};
+
+		await expect(
+			compact(preparation, model, "test-api-key", undefined, undefined, {
+				remoteCompactionFallbackHealth: health,
+			}),
+		).rejects.toThrow("operation aborted");
+
+		expect(events).toEqual([]);
+		expect(completeSpy).not.toHaveBeenCalled();
 	});
 	it("prefers persisted assistant native history snapshots for OpenAI remote compaction", async () => {
 		const model = getBundledModel("openai", "gpt-5.1");

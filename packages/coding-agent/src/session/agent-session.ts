@@ -57,6 +57,8 @@ import {
 	generateHandoff,
 	IMAGE_TOKEN_ESTIMATE,
 	prepareCompaction,
+	type RemoteCompactionFallbackHealthEvent,
+	type RemoteCompactionFallbackHealthHooks,
 	type SummaryOptions,
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction";
@@ -635,6 +637,40 @@ interface TemporaryProviderSessionScopeRecord {
 	thinkingLevel: ThinkingLevel | undefined;
 	fallbackController: FallbackChainController | undefined;
 	providerSessionState: Map<string, ProviderSessionState>;
+}
+
+class RemoteCompactionFallbackHealth implements RemoteCompactionFallbackHealthHooks {
+	#status: "healthy" | "fallback" = "healthy";
+	#suppressedCount = 0;
+
+	recordRemoteCompactionFallback(event: RemoteCompactionFallbackHealthEvent): void {
+		if (event.kind === "success") {
+			if (this.#status === "fallback") {
+				logger.info("OpenAI remote compaction recovered", {
+					model: event.model,
+					provider: event.provider,
+					suppressedCount: this.#suppressedCount,
+				});
+			}
+			this.#status = "healthy";
+			this.#suppressedCount = 0;
+			return;
+		}
+
+		if (this.#status === "fallback") {
+			this.#suppressedCount += 1;
+			return;
+		}
+
+		this.#status = "fallback";
+		this.#suppressedCount = 0;
+		logger.warn("OpenAI remote compaction failed, falling back to local summarization", {
+			error: event.error,
+			model: event.model,
+			provider: event.provider,
+			suppressedCount: 0,
+		});
+	}
 }
 
 /** Result from cycleRoleModels() */
@@ -1539,6 +1575,7 @@ export class AgentSession {
 		}
 	>();
 
+	#remoteCompactionFallbackHealth = new RemoteCompactionFallbackHealth();
 	#streamingEditPrecheckedToolCallIds = new Set<string>();
 
 	#streamingEditFileCache = new StreamingEditFileCache();
@@ -10259,11 +10296,13 @@ export class AgentSession {
 		sessionId: string | undefined;
 		providerSessionState: Map<string, ProviderSessionState>;
 		preferWebsockets: boolean | undefined;
+		remoteCompactionFallbackHealth: RemoteCompactionFallbackHealthHooks;
 	} {
 		return {
 			sessionId: this.agent.providerSessionId ?? this.agent.sessionId,
 			providerSessionState: this.#providerSessionState,
 			preferWebsockets: this.agent.preferWebsockets,
+			remoteCompactionFallbackHealth: this.#remoteCompactionFallbackHealth,
 		};
 	}
 

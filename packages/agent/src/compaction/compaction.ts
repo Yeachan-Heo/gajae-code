@@ -144,6 +144,18 @@ export interface CompactionSettings {
 	remoteEndpoint?: string;
 }
 
+export type RemoteCompactionFallbackHealthEvent =
+	| { kind: "success"; model: string; provider: string }
+	| { kind: "fallback"; model: string; provider: string; error: string };
+
+export interface RemoteCompactionFallbackHealthHooks {
+	recordRemoteCompactionFallback(event: RemoteCompactionFallbackHealthEvent): void;
+}
+
+function isAbortError(error: unknown): boolean {
+	return error instanceof Error && error.name === "AbortError";
+}
+
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	strategy: "context-full",
@@ -799,6 +811,8 @@ export interface SummaryOptions {
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
+	/** Session-owned health sink for remote-compaction fallback transition logging. */
+	remoteCompactionFallbackHealth?: RemoteCompactionFallbackHealthHooks;
 }
 
 /**
@@ -1305,6 +1319,7 @@ export async function compact(
 		sessionId: options?.sessionId,
 		providerSessionState: options?.providerSessionState,
 		preferWebsockets: options?.preferWebsockets,
+		remoteCompactionFallbackHealth: options?.remoteCompactionFallbackHealth,
 	};
 
 	let preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined);
@@ -1331,12 +1346,28 @@ export async function compact(
 					{ authCredentialType: options?.authCredentialType },
 				);
 				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
-			} catch (err) {
-				logger.warn("OpenAI remote compaction failed, falling back to local summarization", {
-					error: err instanceof Error ? err.message : String(err),
+				summaryOptions.remoteCompactionFallbackHealth?.recordRemoteCompactionFallback({
+					kind: "success",
 					model: model.id,
 					provider: model.provider,
 				});
+			} catch (err) {
+				if (signal?.aborted || isAbortError(err)) throw err;
+				const error = err instanceof Error ? err.message : String(err);
+				if (summaryOptions.remoteCompactionFallbackHealth) {
+					summaryOptions.remoteCompactionFallbackHealth.recordRemoteCompactionFallback({
+						kind: "fallback",
+						error,
+						model: model.id,
+						provider: model.provider,
+					});
+				} else {
+					logger.warn("OpenAI remote compaction failed, falling back to local summarization", {
+						error,
+						model: model.id,
+						provider: model.provider,
+					});
+				}
 			}
 		}
 	}

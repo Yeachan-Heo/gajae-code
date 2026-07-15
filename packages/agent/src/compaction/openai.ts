@@ -514,18 +514,14 @@ export async function requestOpenAiRemoteCompaction(
 	});
 
 	if (!response.ok) {
-		const errorText = await response.text().catch(() => "");
-		logger.warn("OpenAI remote compaction failed", {
-			endpoint,
-			status: response.status,
-			statusText: response.statusText,
-			errorText,
-		});
 		throw new Error(`Remote compaction failed (${response.status} ${response.statusText})`);
 	}
 
-	const data = (await response.json()) as { output?: unknown[] } | undefined;
-	const rawOutput = data?.output ?? [];
+	const data = (await response.json()) as { output?: unknown } | undefined;
+	if (!Array.isArray(data?.output)) {
+		throw new Error(`Remote compaction response malformed output (outputType=${typeof data?.output})`);
+	}
+	const rawOutput = data.output;
 	const replacementHistory = rawOutput.filter(
 		(item): item is Record<string, unknown> =>
 			!!item && typeof item === "object" && shouldKeepOpenAiCompactOutputItem(item as Record<string, unknown>),
@@ -539,15 +535,9 @@ export async function requestOpenAiRemoteCompaction(
 		const outputTypes = rawOutput.map(item =>
 			typeof item === "object" && item !== null ? (item as Record<string, unknown>).type : typeof item,
 		);
-		logger.warn("Remote compaction response missing compaction item", {
-			endpoint,
-			model: model.id,
-			provider: model.provider,
-			rawOutputLength: rawOutput.length,
-			outputTypes,
-			replacementHistoryLength: replacementHistory.length,
-		});
-		throw new Error("Remote compaction response missing compaction item");
+		throw new Error(
+			`Remote compaction response missing compaction item (rawOutputLength=${rawOutput.length}, outputTypes=${outputTypes.join(",")}, replacementHistoryLength=${replacementHistory.length})`,
+		);
 	}
 	return { provider: model.provider, replacementHistory, compactionItem };
 }
@@ -572,13 +562,6 @@ export async function requestRemoteCompaction(
 	});
 
 	if (!response.ok) {
-		const errorText = await response.text().catch(() => "");
-		logger.warn("Remote compaction failed", {
-			endpoint,
-			status: response.status,
-			statusText: response.statusText,
-			errorText,
-		});
 		throw new Error(`Remote compaction failed (${response.status} ${response.statusText})`);
 	}
 
