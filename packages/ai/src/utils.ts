@@ -119,7 +119,7 @@ export function sanitizeOpenAIResponsesHistoryItemsForReplay(items: Array<Record
 		return sanitized ? [sanitized] : [];
 	});
 }
-const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[^<>|\n]{1,64}\|>)/g;
+const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[A-Za-z0-9_]+[^<>|\n]*\|>)/g;
 /**
  * Neutralize leaked OpenAI Harmony / control tokens (`<|channel|>`, `<|message|>`,
  * `<|call|>`, `<|constrain|>`, `<|recipient|>`, `<|content|>`, ...) in replayed
@@ -132,10 +132,14 @@ const RESERVED_CONTROL_TOKEN_RE = /<\|(?=[^<>|\n]{1,64}\|>)/g;
  * text stays human-readable.
  *
  * The match covers both the simple `<|ident|>` form and the header form whose body
- * carries a recipient/space/dot (e.g. `<|assistant to=functions.bash|>`); the latter
- * survived the earlier `[A-Za-z0-9_]`-only pattern and kept bricking sessions. Any
- * `<|…|>` run of up to 64 non-`<>|`/non-newline chars is neutralized; the inserted
- * zero-width space makes the rewrite idempotent (`<\u200b|` no longer matches `<|`).
+ * starts with a role/token identifier and carries a recipient (e.g.
+ * `<|assistant to=functions.some.long.tool.name|>`); the latter survived the earlier
+ * `[A-Za-z0-9_]{1,32}`-only pattern and kept bricking sessions. Requiring an
+ * identifier char immediately after `<|` (rather than any char) is a strict superset
+ * of the old pattern that still leaves non-control pipe syntax untouched — e.g. F#
+ * `value <| f |> g` has a space after `<|`, so it never matches — and dropping the
+ * length cap keeps arbitrarily long tool recipients covered. The inserted zero-width
+ * space makes the rewrite idempotent (`<\u200b|` no longer matches `<|`).
  */
 export function neutralizeReservedControlTokens(text: string): string {
 	if (!text.includes("<|")) return text;

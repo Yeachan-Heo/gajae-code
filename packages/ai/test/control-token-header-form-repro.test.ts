@@ -48,4 +48,21 @@ describe("neutralizeReservedControlTokens header-form markers", () => {
 		const plain = "a < b and c > d, ratio a|b";
 		expect(neutralizeReservedControlTokens(plain)).toBe(plain);
 	});
+
+	it("neutralizes header-form markers with recipients longer than the old cap (#2268 review)", () => {
+		// A leaked marker naming a long MCP/custom tool wire name must still be caught;
+		// a fixed length cap would let `assistant to=functions.<long-name>` slip through.
+		const longTool = "functions.some_really_long_mcp_custom_tool_wire_name_exceeding_sixty_four_chars";
+		const marker = `<|assistant to=${longTool}|>`;
+		expect(marker.length).toBeGreaterThan(64);
+		expect(hasRawControlToken(neutralizeReservedControlTokens(`x ${marker} y`))).toBe(false);
+	});
+
+	it("preserves non-control pipe syntax like F# operators (#2268 review)", () => {
+		// `<|` / `|>` are ordinary F# operators; a space follows `<|`, so it is not a
+		// role/token header and must be left byte-identical (no zero-width space).
+		for (const src of ["let r = value <| f |> g", "xs |> List.map f <| seed", "a <| b |> c"]) {
+			expect(neutralizeReservedControlTokens(src)).toBe(src);
+		}
+	});
 });
