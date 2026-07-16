@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@gajae-code/ai";
+import { KeybindingsManager } from "@gajae-code/coding-agent/config/keybindings";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AssistantMessageComponent } from "@gajae-code/coding-agent/modes/components/assistant-message";
 import { BashExecutionComponent } from "@gajae-code/coding-agent/modes/components/bash-execution";
@@ -12,7 +13,7 @@ import { WelcomeComponent } from "@gajae-code/coding-agent/modes/components/welc
 import { resolveWelcomeLogoMode } from "@gajae-code/coding-agent/modes/interactive-mode";
 import { getEditorTheme, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
-import { type TUI, visibleWidth } from "@gajae-code/tui";
+import { setKeybindings, type TUI, visibleWidth } from "@gajae-code/tui";
 import { StatusLineComponent } from "../../../src/modes/components/status-line";
 
 function createFooterSession(): AgentSession {
@@ -232,16 +233,32 @@ describe("redesigned interactive shell chrome", () => {
 
 	it("renders execution rails without breaking output caps", () => {
 		const ui = { requestRender: () => {} } as unknown as TUI;
+		// Interactive fixture: the composer owns focus and the expand action is
+		// bound, so the collapsed footer must advertise the configured key.
+		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "ctrl+o" }));
+		try {
+			const bash = new BashExecutionComponent("printf ready", ui, false, () => true);
+			bash.setComplete(0, false, { output: Array.from({ length: 160 }, (_, i) => `line-${i}`).join("\n") });
+			const bashRendered = Bun.stripANSI(bash.render(80).join("\n"));
+
+			expect(bashRendered).toContain("shell · $ printf");
+			expect(bashRendered).toContain("Ctrl+O to expand");
+			expect(bashRendered).not.toContain("line-0\n");
+			for (const line of bash.render(80)) {
+				expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+			}
+		} finally {
+			setKeybindings(KeybindingsManager.inMemory());
+		}
+	});
+	it("omits the expansion hint while unfocused or unbound", () => {
+		const ui = { requestRender: () => {} } as unknown as TUI;
 		const bash = new BashExecutionComponent("printf ready", ui, false, () => false);
 		bash.setComplete(0, false, { output: Array.from({ length: 160 }, (_, i) => `line-${i}`).join("\n") });
-		const bashRendered = Bun.stripANSI(bash.render(80).join("\n"));
+		const rendered = Bun.stripANSI(bash.render(80).join("\n"));
 
-		expect(bashRendered).toContain("shell · $ printf");
-		expect(bashRendered).toContain("ctrl+o to expand");
-		expect(bashRendered).not.toContain("line-0\n");
-		for (const line of bash.render(80)) {
-			expect(visibleWidth(line)).toBeLessThanOrEqual(80);
-		}
+		expect(rendered).toContain("more lines");
+		expect(rendered).not.toContain("to expand");
 	});
 
 	it("keeps eval execution headers compact and mode-labeled", () => {
