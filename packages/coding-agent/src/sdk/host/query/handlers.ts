@@ -380,7 +380,7 @@ export class QueryHandlers {
 		const start = Math.max(0, Number(input.offset ?? 0));
 		const emptyResult = { artifactId, offset: start, bytes: "", complete: false };
 		const baseBytes = Buffer.byteLength(JSON.stringify({ id: request.id, ok: true, result: emptyResult }));
-		const maxRawBytes = Math.floor(((RESPONSE_CEILING_BYTES - baseBytes) * 3) / 4);
+		const maxRawBytes = Math.floor((RESPONSE_CEILING_BYTES - baseBytes) / 4) * 3;
 		const requested = Math.max(0, Math.min(Number(input.length ?? TARGET_PAGE_BYTES), maxRawBytes));
 		const artifact = await this.surface.getArtifactRange?.(artifactId, start, requested);
 		if (!artifact) return this.#error(request, "resource_gone");
