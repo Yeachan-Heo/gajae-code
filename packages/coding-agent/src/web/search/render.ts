@@ -16,6 +16,7 @@ import {
 	formatStatusIcon,
 	getDomain,
 	getPreviewLines,
+	noExpandHintCapability,
 	PREVIEW_LIMITS,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
@@ -35,14 +36,19 @@ const MAX_QUERY_PREVIEW = 2;
 const MAX_QUERY_LEN = 90;
 const MAX_REQUEST_ID_LEN = 36;
 
-function renderFallbackText(contentText: string, expanded: boolean, theme: Theme): Component {
+function renderFallbackText(
+	contentText: string,
+	expanded: boolean,
+	theme: Theme,
+	expandHintCapability: import("../../tools/render-utils").ExpandHintCapability,
+): Component {
 	const lines = contentText.split("\n").filter(line => line.trim());
 	const maxLines = expanded ? lines.length : 6;
 	const displayLines = lines.slice(0, maxLines).map(line => truncateToWidth(line.trim(), 110));
 	const remaining = lines.length - displayLines.length;
 
 	const headerIcon = formatStatusIcon("warning", theme);
-	const expandHint = formatExpandHint(theme, expanded, remaining > 0);
+	const expandHint = formatExpandHint(theme, expanded, remaining > 0, expandHintCapability);
 	let text = `${headerIcon} ${theme.fg("dim", "Response")}${expandHint}`;
 
 	if (displayLines.length === 0) {
@@ -90,7 +96,12 @@ export function renderSearchResult(
 	const rawText = result.content?.find(block => block.type === "text")?.text?.trim() ?? "";
 	const response = details?.response;
 	if (!response) {
-		return renderFallbackText(rawText, options.expanded, theme);
+		return renderFallbackText(
+			rawText,
+			options.expanded,
+			theme,
+			options.expandHintCapability ?? noExpandHintCapability,
+		);
 	}
 
 	const sources = Array.isArray(response.sources) ? response.sources : [];

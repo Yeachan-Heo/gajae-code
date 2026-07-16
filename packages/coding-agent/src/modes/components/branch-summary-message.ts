@@ -46,7 +46,7 @@ export class BranchSummaryMessageComponent extends Box {
 		} else {
 			this.addChild({
 				render: () => [
-					theme.fg("customMessageText", `Branch summary${expandHintSuffix(theme, this.expandHintCapability)}`),
+					theme.fg("customMessageText", `Branch summary${expandHintSuffix(theme, this.expandHintCapability!)}`),
 				],
 				invalidate: () => {},
 			});

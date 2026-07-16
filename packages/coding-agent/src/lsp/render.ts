@@ -137,6 +137,9 @@ export function renderResult(
 	if (request?.apply !== undefined) requestLines.push(theme.fg("dim", `apply: ${request.apply ? "true" : "false"}`));
 
 	const outputBlock = new CachedOutputBlock();
+	const expandHintCapability = (
+		options as RenderResultOptions & { expandHintCapability: import("../tools/render-utils").ExpandHintCapability }
+	).expandHintCapability;
 
 	return {
 		render(width: number): string[] {
@@ -150,26 +153,26 @@ export function renderResult(
 
 			if (codeBlockMatch) {
 				label = "Hover";
-				bodyLines = renderHover(codeBlockMatch, text, lines, expanded, theme);
+				bodyLines = renderHover(codeBlockMatch, text, lines, expanded, theme, expandHintCapability);
 			} else if (errorMatch || warningMatch || hasStatusError) {
 				label = "Diagnostics";
 				const errorCount = errorMatch ? Number.parseInt(errorMatch[1], 10) : 0;
 				const warnCount = warningMatch ? Number.parseInt(warningMatch[1], 10) : 0;
 				state = errorCount > 0 ? "error" : warnCount > 0 ? "warning" : "success";
-				bodyLines = renderDiagnostics(errorMatch, warningMatch, lines, expanded, theme);
+				bodyLines = renderDiagnostics(errorMatch, warningMatch, lines, expanded, theme, expandHintCapability);
 			} else if (refMatch) {
 				label = "References";
-				bodyLines = renderReferences(refMatch, lines, expanded, theme);
+				bodyLines = renderReferences(refMatch, lines, expanded, theme, expandHintCapability);
 			} else if (symbolsMatch) {
 				label = "Symbols";
-				bodyLines = renderSymbols(symbolsMatch, lines, expanded, theme);
+				bodyLines = renderSymbols(symbolsMatch, lines, expanded, theme, expandHintCapability);
 			} else if (result.details?.action === "diagnostics" && text === "OK") {
 				label = "Diagnostics";
 				state = "success";
 				bodyLines = [`${theme.styledSymbol("status.success", "success")} ${theme.fg("dim", "OK")}`];
 			} else {
 				label = "Response";
-				bodyLines = renderGeneric(text, lines, expanded, theme);
+				bodyLines = renderGeneric(text, lines, expanded, theme, expandHintCapability);
 			}
 
 			const actionLabel = (request?.action ?? result.details?.action ?? label.toLowerCase()).replace(/_/g, " ");
@@ -210,6 +213,7 @@ function renderHover(
 	_lines: string[],
 	expanded: boolean,
 	theme: Theme,
+	expandHintCapability: import("../tools/render-utils").ExpandHintCapability,
 ): string[] {
 	const lang = codeBlockMatch[1] || "";
 	const code = codeBlockMatch[2].trim();
@@ -246,7 +250,7 @@ function renderHover(
 	// Collapsed view
 	const firstCodeLine = codeLines[0] || "";
 	const hasMore = codeLines.length > 1 || Boolean(afterCode) || Boolean(beforeCode);
-	const expandHint = formatExpandHint(theme, expanded, hasMore);
+	const expandHint = formatExpandHint(theme, expanded, hasMore, expandHintCapability);
 
 	let output = `${icon}${langLabel}${expandHint}`;
 	if (beforeCode) {
@@ -316,6 +320,7 @@ function renderDiagnostics(
 	lines: string[],
 	expanded: boolean,
 	theme: Theme,
+	expandHintCapability: import("../tools/render-utils").ExpandHintCapability,
 ): string[] {
 	const errorCount = errorMatch ? Number.parseInt(errorMatch[1], 10) : 0;
 	const warnCount = warningMatch ? Number.parseInt(warningMatch[1], 10) : 0;
@@ -373,7 +378,7 @@ function renderDiagnostics(
 		parsedDiagnostics.length > 0 ? parsedDiagnostics.slice(0, 3) : fallbackDiagnostics.slice(0, 3);
 	const remaining =
 		(parsedDiagnostics.length > 0 ? parsedDiagnostics.length : fallbackDiagnostics.length) - previewItems.length;
-	const expandHint = formatExpandHint(theme, expanded, remaining > 0);
+	const expandHint = formatExpandHint(theme, expanded, remaining > 0, expandHintCapability);
 	let output = `${icon} ${theme.fg("dim", meta.join(theme.sep.dot))}${expandHint}`;
 	for (let i = 0; i < previewItems.length; i++) {
 		const item = previewItems[i];
@@ -404,7 +409,13 @@ function renderDiagnostics(
 /**
  * Render references grouped by file.
  */
-function renderReferences(refMatch: RegExpMatchArray, lines: string[], expanded: boolean, theme: Theme): string[] {
+function renderReferences(
+	refMatch: RegExpMatchArray,
+	lines: string[],
+	expanded: boolean,
+	theme: Theme,
+	expandHintCapability: import("../tools/render-utils").ExpandHintCapability,
+): string[] {
 	const refCount = Number.parseInt(refMatch[1], 10);
 	const icon =
 		refCount > 0 ? theme.styledSymbol("status.success", "success") : theme.styledSymbol("status.warning", "warning");
@@ -425,7 +436,7 @@ function renderReferences(refMatch: RegExpMatchArray, lines: string[], expanded:
 	const files = Array.from(byFile.keys());
 
 	const renderGrouped = (maxFiles: number, maxLocsPerFile: number, showHint: boolean): string => {
-		const expandHint = formatExpandHint(theme, undefined, showHint);
+		const expandHint = formatExpandHint(theme, undefined, showHint, expandHintCapability);
 		let output = `${icon} ${theme.fg("dim", `${refCount} found`)}${expandHint}`;
 
 		const filesToShow = files.slice(0, maxFiles);
@@ -491,7 +502,13 @@ function renderReferences(refMatch: RegExpMatchArray, lines: string[], expanded:
 /**
  * Render document symbols in a hierarchical tree.
  */
-function renderSymbols(symbolsMatch: RegExpMatchArray, lines: string[], expanded: boolean, theme: Theme): string[] {
+function renderSymbols(
+	symbolsMatch: RegExpMatchArray,
+	lines: string[],
+	expanded: boolean,
+	theme: Theme,
+	expandHintCapability: import("../tools/render-utils").ExpandHintCapability,
+): string[] {
 	const fileName = symbolsMatch[1];
 	const icon = theme.styledSymbol("status.info", "accent");
 
@@ -565,7 +582,7 @@ function renderSymbols(symbolsMatch: RegExpMatchArray, lines: string[], expanded
 	// Collapsed: show first 3 top-level symbols
 	const topLevel = symbols.filter(s => s.indent === 0).slice(0, 3);
 	const hasMoreSymbols = symbols.length > topLevel.length;
-	const expandHint = formatExpandHint(theme, expanded, hasMoreSymbols);
+	const expandHint = formatExpandHint(theme, expanded, hasMoreSymbols, expandHintCapability);
 	let output = `${icon} ${theme.fg("dim", `in ${fileName}`)}${expandHint}`;
 	for (let i = 0; i < topLevel.length; i++) {
 		const sym = topLevel[i];
@@ -590,7 +607,13 @@ function renderSymbols(symbolsMatch: RegExpMatchArray, lines: string[], expanded
 /**
  * Generic fallback rendering for unknown result types.
  */
-function renderGeneric(text: string, lines: string[], expanded: boolean, theme: Theme): string[] {
+function renderGeneric(
+	text: string,
+	lines: string[],
+	expanded: boolean,
+	theme: Theme,
+	expandHintCapability: import("../tools/render-utils").ExpandHintCapability,
+): string[] {
 	const hasError = text.includes("Error:") || text.includes(theme.status.error);
 	const hasSuccess = text.includes(theme.status.success) || text.includes("Applied");
 
@@ -612,7 +635,7 @@ function renderGeneric(text: string, lines: string[], expanded: boolean, theme: 
 	}
 
 	const firstLine = lines[0] || "No output";
-	const expandHint = formatExpandHint(theme, expanded, lines.length > 1);
+	const expandHint = formatExpandHint(theme, expanded, lines.length > 1, expandHintCapability);
 	let output = `${icon} ${theme.fg("dim", truncateToWidth(firstLine, TRUNCATE_LENGTHS.TITLE))}${expandHint}`;
 
 	if (lines.length > 1) {

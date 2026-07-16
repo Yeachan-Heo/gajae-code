@@ -147,9 +147,11 @@ export function formatStatusIcon(status: ToolUIStatus, theme: Theme, spinnerFram
  * hints may be displayed for that mode's composer.
  */
 export type ExpandHintCapability = () => boolean;
+/** Capability for non-interactive render contexts where expansion cannot open an overlay. */
+export const noExpandHintCapability: ExpandHintCapability = () => false;
 
-function formatExpandKey(capability: ExpandHintCapability | undefined): string {
-	return capability?.() ? formatKeyHints(getKeybindings().getKeys("app.tools.expand")) : "";
+function formatExpandKey(capability: ExpandHintCapability): string {
+	return capability() ? formatKeyHints(getKeybindings().getKeys("app.tools.expand")) : "";
 }
 
 /**
@@ -159,9 +161,9 @@ function formatExpandKey(capability: ExpandHintCapability | undefined): string {
  */
 export function formatExpandHint(
 	theme: Theme,
-	expanded?: boolean,
-	hasMore?: boolean,
-	capability?: ExpandHintCapability,
+	expanded: boolean | undefined,
+	hasMore: boolean | undefined,
+	capability: ExpandHintCapability,
 ): string {
 	if (expanded || hasMore === false) return "";
 	const key = formatExpandKey(capability);
@@ -169,7 +171,7 @@ export function formatExpandHint(
 }
 
 /** Format a suffix for collapsed tool output that can be expanded. */
-export function expandHintSuffix(_theme: Theme, capability?: ExpandHintCapability): string {
+export function expandHintSuffix(_theme: Theme, capability: ExpandHintCapability): string {
 	const key = formatExpandKey(capability);
 	return key ? ` (${key} to expand)` : "";
 }
@@ -289,6 +291,7 @@ export function formatDiagnostics(
 	expanded: boolean,
 	theme: Theme,
 	getLangIcon: (filePath: string) => string,
+	capability: ExpandHintCapability,
 ): string {
 	if (diag.messages.length === 0) return "";
 
@@ -405,7 +408,7 @@ export function formatDiagnostics(
 		output += `\n ${theme.fg("dim", theme.tree.last)} ${theme.fg(
 			"muted",
 			`… ${remaining} more`,
-		)} ${formatExpandHint(theme)}`;
+		)} ${formatExpandHint(theme, false, true, capability)}`;
 	}
 
 	return output;

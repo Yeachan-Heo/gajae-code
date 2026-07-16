@@ -49,7 +49,7 @@ export class CompactionSummaryMessageComponent extends Box {
 				render: () => [
 					theme.fg(
 						"customMessageText",
-						`Compacted from ${tokenStr} tokens${expandHintSuffix(theme, this.expandHintCapability)}`,
+						`Compacted from ${tokenStr} tokens${expandHintSuffix(theme, this.expandHintCapability!)}`,
 					),
 				],
 				invalidate: () => {},

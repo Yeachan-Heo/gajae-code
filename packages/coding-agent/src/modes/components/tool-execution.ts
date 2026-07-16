@@ -34,6 +34,7 @@ import {
 import {
 	type ExpandHintCapability,
 	formatExpandHint,
+	noExpandHintCapability,
 	replaceTabs,
 	resolveImageOptions,
 	truncateToWidth,
@@ -914,7 +915,14 @@ export class ToolExecutionComponent extends Container {
 				if (tree.lines.length > 0) {
 					lines.push(...tree.lines);
 					if (!this.#expanded) {
-						lines.push(formatExpandHint(theme, this.#expanded, true));
+						lines.push(
+							formatExpandHint(
+								theme,
+								this.#expanded,
+								true,
+								this.#renderState.expandHintCapability ?? noExpandHintCapability,
+							),
+						);
 					} else if (tree.truncated) {
 						lines.push(theme.fg("dim", "…"));
 					}
@@ -935,9 +943,18 @@ export class ToolExecutionComponent extends Container {
 
 		if (outputLines.length > maxOutputLines) {
 			const remaining = outputLines.length - maxOutputLines;
-			lines.push(`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, this.#expanded, true)}`);
+			lines.push(
+				`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, this.#expanded, true, this.#renderState.expandHintCapability ?? noExpandHintCapability)}`,
+			);
 		} else if (!this.#expanded) {
-			lines.push(formatExpandHint(theme, this.#expanded, true));
+			lines.push(
+				formatExpandHint(
+					theme,
+					this.#expanded,
+					true,
+					this.#renderState.expandHintCapability ?? noExpandHintCapability,
+				),
+			);
 		}
 
 		return lines.join("\n");
