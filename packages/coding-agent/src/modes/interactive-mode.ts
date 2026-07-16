@@ -2853,6 +2853,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	// Selector handling
+	showCommandPalette(
+		commands: SlashCommand[],
+		executeAction: (action: string) => void,
+		executeSlashCommand: (name: string) => void,
+	): void {
+		this.#selectorController.showCommandPalette(commands, executeAction, executeSlashCommand);
+	}
+
 	showSettingsSelector(): void {
 		this.#selectorController.showSettingsSelector();
 	}
