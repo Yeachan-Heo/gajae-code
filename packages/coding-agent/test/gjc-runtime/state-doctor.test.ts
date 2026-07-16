@@ -112,6 +112,7 @@ describe("gjc state doctor", () => {
 		expect(parsed).toMatchObject({ ok: true, problems: [] });
 		expect(parsed.summary.by_kind).toEqual({
 			orphan_journal: 0,
+			pending_transaction: 0,
 			checksum_mismatch: 0,
 			schema_violation: 0,
 			stale_active_state: 0,

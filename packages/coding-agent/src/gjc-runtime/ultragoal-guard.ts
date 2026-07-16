@@ -1,12 +1,28 @@
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { CanonicalGjcWorkflowSkill } from "../skill-state/canonical-skills";
+import {
+	WORKFLOW_STATE_VERSION,
+	workflowActiveStatePath,
+	workflowStateStoragePath,
+} from "../skill-state/workflow-state-contract";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
+import {
+	activeEntryPath,
+	activeStateDir,
+	modeStatePath,
+	transactionJournalPath,
+	ultragoalAskHandoffCommitPath,
+} from "./session-layout";
 import { resolveGjcSessionForRead, SessionResolutionError } from "./session-resolution";
+import { detectWorkflowEnvelopeIntegrityMismatch } from "./state-writer";
 import {
 	validateDeferredMemberReceiptFresh,
 	validateReceiptFreshBase,
 	validateSupersededFinalAggregateReceipt,
 } from "./ultragoal-receipt-freshness";
 import {
+	deriveUltragoalAskAuthorityPlanBinding,
 	getUltragoalPaths,
 	getUltragoalRunCompletionState,
 	readUltragoalLedger,
@@ -14,6 +30,7 @@ import {
 	recordUltragoalNudgeIfBudgetRemaining,
 	resolveUltragoalNudgeBudget,
 	selectUltragoalNudgeTarget,
+	type UltragoalAskAuthorityPlanBinding,
 	type UltragoalGoal,
 	type UltragoalLedgerEvent,
 	type UltragoalNudgeSurface,
@@ -119,7 +136,370 @@ function isEnoent(error: unknown): boolean {
 		typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "ENOENT"
 	);
 }
+const ASK_HANDOFF_CALLEES = new Set(["deep-interview", "ralplan"]);
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+async function readAuthoritativeActiveEntriesStrict(
+	cwd: string,
+	sessionId: string,
+): Promise<Record<string, unknown>[]> {
+	const dir = activeStateDir(cwd, sessionId);
+	let names: string[];
+	try {
+		names = await fs.readdir(dir);
+	} catch (error) {
+		if (isEnoent(error)) return [];
+		throw new Error(
+			`Unable to enumerate authoritative active entries: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	const entries: Record<string, unknown>[] = [];
+	for (const name of names.sort()) {
+		if (!name.endsWith(".json")) throw new Error(`Unexpected authoritative active entry: ${name}`);
+		const filePath = path.join(dir, name);
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await fs.readFile(filePath, "utf-8"));
+		} catch (error) {
+			throw new Error(
+				`Unable to read authoritative active entry ${name}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		if (!isPlainObject(parsed)) throw new Error(`Authoritative active entry ${name} must be a JSON object`);
+		if (typeof parsed.skill !== "string" || parsed.skill.trim() === "") {
+			throw new Error(`Authoritative active entry ${name} must name a skill`);
+		}
+		if (activeEntryPath(cwd, sessionId, parsed.skill) !== filePath) {
+			throw new Error(`Authoritative active entry filename/skill mismatch for ${name}`);
+		}
+		if (typeof parsed.active !== "boolean") {
+			throw new Error(`Authoritative ${parsed.skill} active entry must have a boolean active field`);
+		}
+		if (parsed.session_id !== sessionId) {
+			throw new Error(`Authoritative ${parsed.skill} active entry has a mismatched session_id`);
+		}
+		entries.push(parsed);
+	}
+	return entries;
+}
+
+const ULTRAGOAL_PLAN_RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const COMMITTED_ASK_HANDOFF_KEYS = [
+	"version",
+	"commitment",
+	"caller",
+	"callee",
+	"session_id",
+	"plan_run_id",
+	"plan_generation",
+	"plan_content_sha256",
+	"plan_state_revision",
+	"plan_created_event_id",
+	"ledger_generation",
+	"ledger_head_sha256",
+	"ledger_head_event_id",
+	"caller_state_revision",
+	"callee_state_revision",
+	"handoff_at",
+	"mutation_id",
+	"caller_receipt",
+	"callee_receipt",
+] as const;
+const HANDOFF_RECEIPT_KEYS = [
+	"version",
+	"skill",
+	"owner",
+	"command",
+	"state_path",
+	"storage_path",
+	"mutated_at",
+	"fresh_until",
+	"status",
+	"mutation_id",
+] as const;
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	return Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+
+function nonEmptyStringValue(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function validPastTimestamp(value: unknown): value is string {
+	const timestamp = typeof value === "string" ? Date.parse(value) : Number.NaN;
+	return Number.isFinite(timestamp) && timestamp <= Date.now();
+}
+
+function hasDurablyIssuedHandoffReceipt(input: {
+	value: unknown;
+	skill: string;
+	callee: string;
+	sessionId: string;
+	handoffAt: string;
+	mutationId: string;
+	cwd: string;
+}): boolean {
+	if (!isPlainObject(input.value) || !hasExactKeys(input.value, HANDOFF_RECEIPT_KEYS)) return false;
+	const freshUntil = Date.parse(nonEmptyStringValue(input.value.fresh_until) ?? "");
+	const handoffTime = Date.parse(input.handoffAt);
+	// A committed handoff is durable proof, not a renewable receipt lease: its
+	// receipt must have been issued fresh for the handoff, but later passage of
+	// the HUD freshness window does not revoke the immutable proof. Explicitly
+	// persisted stale receipts are never accepted as handoff proof.
+	return (
+		input.value.version === 1 &&
+		input.value.skill === input.skill &&
+		input.value.owner === "gjc-state-cli" &&
+		input.value.command === `gjc state ultragoal handoff --to ${input.callee}` &&
+		input.value.state_path === workflowActiveStatePath(input.cwd, input.sessionId) &&
+		input.value.storage_path ===
+			workflowStateStoragePath(input.cwd, input.skill as CanonicalGjcWorkflowSkill, input.sessionId) &&
+		input.value.mutated_at === input.handoffAt &&
+		Number.isFinite(handoffTime) &&
+		Number.isFinite(freshUntil) &&
+		freshUntil >= handoffTime &&
+		input.value.status === "fresh" &&
+		input.value.mutation_id === input.mutationId
+	);
+}
+
+function hasBoundCurrentModeReceipt(input: {
+	value: unknown;
+	skill: string;
+	sessionId: string;
+	cwd: string;
+	expectedReceipt: unknown;
+	expectedStateRevision: unknown;
+}): boolean {
+	if (!isPlainObject(input.value) || input.value.state_revision !== input.expectedStateRevision) return false;
+	const receipt = input.value.receipt;
+	const expectedReceipt = input.expectedReceipt;
+	if (!isPlainObject(receipt) || !isPlainObject(expectedReceipt)) return false;
+	const checksum = receipt.content_sha256;
+	const mutatedAt = nonEmptyStringValue(receipt.mutated_at);
+	const freshUntil = nonEmptyStringValue(receipt.fresh_until);
+	const checksumComputedAt = isPlainObject(checksum) ? nonEmptyStringValue(checksum.computed_at) : undefined;
+	return (
+		HANDOFF_RECEIPT_KEYS.every(key => receipt[key] === expectedReceipt[key]) &&
+		receipt.skill === input.skill &&
+		receipt.status === "fresh" &&
+		Boolean(mutatedAt && validPastTimestamp(mutatedAt)) &&
+		Boolean(
+			freshUntil && Number.isFinite(Date.parse(freshUntil)) && Date.parse(freshUntil) >= Date.parse(mutatedAt ?? ""),
+		) &&
+		isPlainObject(checksum) &&
+		checksum.algorithm === "sha256" &&
+		typeof checksum.value === "string" &&
+		/^[a-f0-9]{64}$/i.test(checksum.value) &&
+		checksum.covered_path === modeStatePath(input.cwd, input.sessionId, input.skill) &&
+		Boolean(checksumComputedAt && validPastTimestamp(checksumComputedAt))
+	);
+}
+
+function hasCommittedAskHandoffAuthority(input: {
+	value: unknown;
+	callee: string;
+	planBinding: UltragoalAskAuthorityPlanBinding;
+	sessionId: string;
+	cwd: string;
+}): boolean {
+	if (!isPlainObject(input.value) || !hasExactKeys(input.value, COMMITTED_ASK_HANDOFF_KEYS)) return false;
+	const handoffAt = input.value.handoff_at;
+	const mutationId = input.value.mutation_id;
+	if (
+		input.value.version !== 1 ||
+		input.value.commitment !== "committed" ||
+		input.value.caller !== "ultragoal" ||
+		input.value.callee !== input.callee ||
+		input.value.session_id !== input.sessionId ||
+		input.value.plan_run_id !== input.planBinding.planRunId ||
+		input.value.plan_generation !== input.planBinding.planGeneration ||
+		input.value.plan_content_sha256 !== input.planBinding.planContentSha256 ||
+		input.value.plan_state_revision !== input.planBinding.planStateRevision ||
+		input.value.plan_created_event_id !== input.planBinding.planCreatedEventId ||
+		input.value.ledger_generation !== input.planBinding.ledgerGeneration ||
+		input.value.ledger_head_sha256 !== input.planBinding.ledgerHeadSha256 ||
+		input.value.ledger_head_event_id !== input.planBinding.ledgerHeadEventId ||
+		typeof input.value.caller_state_revision !== "number" ||
+		typeof input.value.callee_state_revision !== "number" ||
+		!validPastTimestamp(handoffAt) ||
+		typeof mutationId !== "string" ||
+		mutationId !== `ultragoal:handoff:${input.callee}:${handoffAt}`
+	) {
+		return false;
+	}
+	return (
+		hasDurablyIssuedHandoffReceipt({
+			value: input.value.caller_receipt,
+			skill: "ultragoal",
+			callee: input.callee,
+			sessionId: input.sessionId,
+			handoffAt,
+			mutationId,
+			cwd: input.cwd,
+		}) &&
+		hasDurablyIssuedHandoffReceipt({
+			value: input.value.callee_receipt,
+			skill: input.callee,
+			callee: input.callee,
+			sessionId: input.sessionId,
+			handoffAt,
+			mutationId,
+			cwd: input.cwd,
+		})
+	);
+}
+
+async function readModeStateForHandoff(
+	cwd: string,
+	sessionId: string,
+	skill: string,
+): Promise<{ value: Record<string, unknown>; path: string } | undefined> {
+	const filePath = modeStatePath(cwd, sessionId, skill);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await fs.readFile(filePath, "utf-8"));
+	} catch (error) {
+		if (isEnoent(error)) return undefined;
+		throw new Error(
+			`Unable to read authoritative ${skill} mode state: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (!isPlainObject(parsed)) return undefined;
+	return { value: parsed, path: filePath };
+}
+async function hasCommittedHandoffTransaction(input: {
+	cwd: string;
+	sessionId: string;
+	mutationId: string;
+	authority: unknown;
+}): Promise<boolean> {
+	try {
+		await fs.access(transactionJournalPath(input.cwd, input.sessionId, input.mutationId));
+		return false;
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(
+			await fs.readFile(ultragoalAskHandoffCommitPath(input.cwd, input.sessionId, input.mutationId), "utf-8"),
+		);
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+	return JSON.stringify(parsed) === JSON.stringify(input.authority);
+}
+
+function samePlanAuthorityBinding(
+	left: UltragoalAskAuthorityPlanBinding,
+	right: UltragoalAskAuthorityPlanBinding,
+): boolean {
+	return (
+		left.planRunId === right.planRunId &&
+		left.planGeneration === right.planGeneration &&
+		left.planContentSha256 === right.planContentSha256 &&
+		left.planStateRevision === right.planStateRevision &&
+		left.planCreatedEventId === right.planCreatedEventId &&
+		left.ledgerGeneration === right.ledgerGeneration &&
+		left.ledgerHeadSha256 === right.ledgerHeadSha256 &&
+		left.ledgerHeadEventId === right.ledgerHeadEventId
+	);
+}
+
+async function committedAskHandoffCallee(
+	cwd: string,
+	sessionId: string,
+	entries: readonly Record<string, unknown>[],
+	plan: UltragoalPlan,
+	ledger: readonly UltragoalLedgerEvent[],
+): Promise<string | undefined> {
+	const planBinding = deriveUltragoalAskAuthorityPlanBinding(plan, ledger);
+	if (!planBinding) return undefined;
+	const activeEntries = entries.filter(entry => entry.active === true);
+	if (activeEntries.length !== 1) return undefined;
+	const [entry] = activeEntries;
+	const callee = typeof entry.skill === "string" ? entry.skill : "";
+	if (!ASK_HANDOFF_CALLEES.has(callee) || typeof entry.phase !== "string" || entry.phase.trim() === "")
+		return undefined;
+	const callerEntry = entries.find(candidate => candidate.skill === "ultragoal");
+	if (callerEntry?.active !== false) return undefined;
+
+	const [callerState, calleeState] = await Promise.all([
+		readModeStateForHandoff(cwd, sessionId, "ultragoal"),
+		readModeStateForHandoff(cwd, sessionId, callee),
+	]);
+	if (!callerState || !calleeState) return undefined;
+	const callerAuthority = callerState.value.ultragoal_ask_handoff;
+	const calleeAuthority = calleeState.value.ultragoal_ask_handoff;
+	if (
+		JSON.stringify(callerAuthority) !== JSON.stringify(calleeAuthority) ||
+		!isPlainObject(callerAuthority) ||
+		!hasCommittedAskHandoffAuthority({
+			value: callerAuthority,
+			callee,
+			planBinding,
+			sessionId,
+			cwd,
+		}) ||
+		typeof callerAuthority.mutation_id !== "string" ||
+		!(await hasCommittedHandoffTransaction({
+			cwd,
+			sessionId,
+			mutationId: callerAuthority.mutation_id,
+			authority: callerAuthority,
+		}))
+	) {
+		return undefined;
+	}
+	if (
+		callerState.value.skill !== "ultragoal" ||
+		callerState.value.version !== WORKFLOW_STATE_VERSION ||
+		callerState.value.active !== false ||
+		callerState.value.current_phase !== "handoff" ||
+		callerState.value.session_id !== sessionId ||
+		callerState.value.handoff_to !== callee ||
+		callerState.value.handoff_at !== callerAuthority.handoff_at ||
+		calleeState.value.skill !== callee ||
+		calleeState.value.version !== WORKFLOW_STATE_VERSION ||
+		calleeState.value.active !== true ||
+		calleeState.value.session_id !== sessionId ||
+		calleeState.value.handoff_from !== "ultragoal" ||
+		calleeState.value.handoff_at !== callerAuthority.handoff_at ||
+		!hasBoundCurrentModeReceipt({
+			value: callerState.value,
+			skill: "ultragoal",
+			sessionId,
+			cwd,
+			expectedReceipt: callerAuthority.caller_receipt,
+			expectedStateRevision: callerAuthority.caller_state_revision,
+		}) ||
+		!hasBoundCurrentModeReceipt({
+			value: calleeState.value,
+			skill: callee,
+			sessionId,
+			cwd,
+			expectedReceipt: callerAuthority.callee_receipt,
+			expectedStateRevision: callerAuthority.callee_state_revision,
+		}) ||
+		(await detectWorkflowEnvelopeIntegrityMismatch(callerState.path)) !== undefined ||
+		(await detectWorkflowEnvelopeIntegrityMismatch(calleeState.path)) !== undefined
+	) {
+		return undefined;
+	}
+	return callee;
+}
+
+async function hasStablePlanRunIdentity(cwd: string, sessionId: string, plan: UltragoalPlan): Promise<boolean> {
+	if (!plan.planRunId || !ULTRAGOAL_PLAN_RUN_ID_PATTERN.test(plan.planRunId)) return false;
+	const rechecked = await readUltragoalPlan(cwd, sessionId);
+	return rechecked?.planRunId === plan.planRunId;
+}
 function activeAskDiagnostic(input: {
 	reason: string;
 	source: UltragoalAskBlockDiagnostic["source"];
@@ -648,7 +1028,71 @@ export async function isUltragoalAskBlocked(
 			ledgerPath: paths.ledgerPath,
 		});
 	}
-
+	let handoffCallee: string | undefined;
+	try {
+		handoffCallee = await committedAskHandoffCallee(
+			cwd,
+			sessionId,
+			await readAuthoritativeActiveEntriesStrict(cwd, sessionId),
+			plan,
+			ledger,
+		);
+	} catch (error) {
+		return activeAskDiagnostic({
+			reason: `Unable to validate authoritative workflow handoff state: ${error instanceof Error ? error.message : String(error)}`,
+			source: "durable_state_unreadable",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
+		});
+	}
+	if (handoffCallee) {
+		try {
+			const [recheckedPlan, recheckedLedger] = await Promise.all([
+				readUltragoalPlan(cwd, sessionId),
+				readUltragoalLedger(cwd, sessionId),
+			]);
+			const originalBinding = deriveUltragoalAskAuthorityPlanBinding(plan, ledger);
+			const recheckedBinding = recheckedPlan
+				? deriveUltragoalAskAuthorityPlanBinding(recheckedPlan, recheckedLedger)
+				: undefined;
+			const recheckedCallee =
+				recheckedPlan &&
+				recheckedBinding &&
+				(await committedAskHandoffCallee(
+					cwd,
+					sessionId,
+					await readAuthoritativeActiveEntriesStrict(cwd, sessionId),
+					recheckedPlan,
+					recheckedLedger,
+				));
+			if (
+				!originalBinding ||
+				!recheckedBinding ||
+				!samePlanAuthorityBinding(originalBinding, recheckedBinding) ||
+				recheckedCallee !== handoffCallee
+			) {
+				return activeAskDiagnostic({
+					reason: "Workflow handoff authority changed while authorizing ask.",
+					source: "durable_state",
+					goalsPath: paths.goalsPath,
+					ledgerPath: paths.ledgerPath,
+				});
+			}
+		} catch (error) {
+			return activeAskDiagnostic({
+				reason: `Unable to recheck workflow handoff authority: ${error instanceof Error ? error.message : String(error)}`,
+				source: "durable_state_unreadable",
+				goalsPath: paths.goalsPath,
+				ledgerPath: paths.ledgerPath,
+			});
+		}
+		return inactiveAskDiagnostic({
+			reason: `Ultragoal is inactive after a committed workflow handoff to ${handoffCallee}.`,
+			source: "durable_state",
+			goalsPath: paths.goalsPath,
+			ledgerPath: paths.ledgerPath,
+		});
+	}
 	if (plan.goals.some(goal => goal.status === "review_blocked")) {
 		const goalIds = plan.goals.filter(goal => goal.status === "review_blocked").map(goal => goal.id);
 		return activeAskDiagnostic({
@@ -697,6 +1141,25 @@ export async function isUltragoalAskBlocked(
 			ledgerPath: paths.ledgerPath,
 			goalIds: diagnostic.goalId ? [diagnostic.goalId] : undefined,
 		});
+	}
+	if (plan.planRunId) {
+		try {
+			if (!(await hasStablePlanRunIdentity(cwd, sessionId, plan))) {
+				return activeAskDiagnostic({
+					reason: "Ultragoal plan changed while validating completion.",
+					source: "durable_state",
+					goalsPath: paths.goalsPath,
+					ledgerPath: paths.ledgerPath,
+				});
+			}
+		} catch (error) {
+			return activeAskDiagnostic({
+				reason: `Unable to recheck Ultragoal plan identity: ${error instanceof Error ? error.message : String(error)}`,
+				source: "durable_state_unreadable",
+				goalsPath: paths.goalsPath,
+				ledgerPath: paths.ledgerPath,
+			});
+		}
 	}
 	return inactiveAskDiagnostic({
 		reason: "Ultragoal run is verified complete.",

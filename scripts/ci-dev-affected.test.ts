@@ -48,10 +48,10 @@ describe("planTasks command shape (issue #622)", () => {
 describe("dev-ci canonical-plan workflow contract", () => {
 	test("binds the canonical plan to its checked-out source and validates it before aggregate decisions", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
-		expect(workflow.match(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/g)).toHaveLength(5);
-		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(5);
+		expect(workflow.match(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/g)).toHaveLength(6);
+		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(6);
 		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}");
-		expect(workflow.match(/\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g)).toHaveLength(8);
+		expect(workflow.match(/\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g)).toHaveLength(9);
 		expect(workflow).toContain("include-hidden-files: true");
 		expect(workflow.match(/include-hidden-files: true/g)).toHaveLength(2);
 		expect(workflow).toContain("CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}");
@@ -74,6 +74,25 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("--validate-shard-receipts");
 		expect(workflow).toContain("pi_natives.linux-x64-baseline.node");
 		expect(workflow).toContain("pi_natives.linux-x64-modern.node");
+		expect(workflow).toContain("needs: [affected-plan, affected-native]");
+		expect(workflow).toContain("name: Download native addon(s) for state gates");
+		expect(workflow).toContain("if: ${{ needs.affected-plan.outputs.has_native == 'true' }}");
+		const stateMatrixStart = workflow.indexOf("  gjc-state-gates-matrix:");
+		const stateAggregateStart = workflow.indexOf("  gjc-state-gates:", stateMatrixStart);
+		expect(stateMatrixStart).toBeGreaterThan(-1);
+		expect(stateAggregateStart).toBeGreaterThan(stateMatrixStart);
+		const stateMatrix = workflow.slice(stateMatrixStart, stateAggregateStart);
+		const stateAggregate = workflow.slice(stateAggregateStart);
+		expect(stateMatrix).toContain("needs: [affected-plan, affected-native]");
+		expect(stateMatrix).toContain("always() && needs.affected-plan.result == 'success'");
+		expect(stateMatrix).toContain("needs.affected-plan.outputs.has_native == 'true' && needs.affected-native.result == 'success'");
+		expect(stateMatrix).toContain("needs.affected-plan.outputs.has_native == 'false' && needs.affected-native.result == 'skipped'");
+		expect(stateMatrix).toContain("ref: ${{ github.event.pull_request.head.sha || github.sha }}");
+		expect(stateMatrix).toContain('test "$head" = "$CI_DEV_SOURCE_SHA"');
+		expect(stateMatrix).toContain("name: Download native addon(s) for state gates");
+		expect(stateMatrix).toContain("name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}");
+		expect(stateAggregate).toContain("needs: [gjc-state-gates-matrix]");
+		expect(stateAggregate).toContain('test "$result" = success');
 		expect(workflow).not.toContain("native-cache");
 		expect(workflow).not.toContain("pull_request_target");
 		expect(workflow).not.toContain("uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830");

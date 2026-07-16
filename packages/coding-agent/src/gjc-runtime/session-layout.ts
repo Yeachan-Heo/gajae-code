@@ -153,6 +153,12 @@ export function auditPath(cwd: string, gjcSessionId: string): string {
 export function transactionJournalPath(cwd: string, gjcSessionId: string, mutationId: string): string {
 	return path.join(sessionStateDir(cwd, gjcSessionId), "transactions", `${encodeSessionSegment(mutationId)}.json`);
 }
+export function workflowTransactionLockPath(cwd: string, gjcSessionId: string): string {
+	return path.join(sessionStateDir(cwd, gjcSessionId), "workflow-transaction");
+}
+export function ultragoalAskHandoffCommitPath(cwd: string, gjcSessionId: string, mutationId: string): string {
+	return path.join(sessionStateDir(cwd, gjcSessionId), "handoff-commits", `${encodeSessionSegment(mutationId)}.json`);
+}
 export function teamStateRoot(cwd: string, gjcSessionId: string): string {
 	return path.join(sessionStateDir(cwd, gjcSessionId), "team");
 }

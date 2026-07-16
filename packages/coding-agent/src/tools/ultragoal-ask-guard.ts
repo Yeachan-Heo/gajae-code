@@ -1,4 +1,6 @@
 import type { AgentTool } from "@gajae-code/agent-core";
+import { workflowTransactionLockPath } from "../gjc-runtime/session-layout";
+import { withWorkflowStateLock } from "../gjc-runtime/state-writer";
 import {
 	consumeUltragoalAskNudge,
 	isUltragoalAskBlocked,
@@ -26,9 +28,10 @@ function sessionScopedAskGuardId(
 	context: UltragoalAskGuardContext,
 	activeSkill: string | undefined,
 ): string | undefined {
-	if (activeSkill !== "ultragoal" && !UPSTREAM_PLANNING_ASK_SKILLS.has(activeSkill ?? "")) return undefined;
 	const activeSessionId = context.activeSkillState?.session_id?.trim();
-	if (activeSessionId) return activeSessionId;
+	if (activeSessionId && (activeSkill === "ultragoal" || UPSTREAM_PLANNING_ASK_SKILLS.has(activeSkill ?? ""))) {
+		return activeSessionId;
+	}
 	const sessionId = context.sessionId?.trim();
 	return sessionId || undefined;
 }
@@ -41,6 +44,16 @@ export function formatUltragoalAskBlockMessage(diagnostic: UltragoalAskBlockDiag
 	].join("\n");
 }
 
+async function throwUltragoalAskBlocked(
+	cwd: string,
+	sessionId: string | undefined,
+	diagnostic: UltragoalAskBlockDiagnostic,
+): Promise<never> {
+	const nudge = await consumeUltragoalAskNudge(cwd, sessionId);
+	if (nudge.nudged) throw new ToolError(nudge.message);
+	throw new ToolError(formatUltragoalAskBlockMessage(diagnostic));
+}
+
 export async function assertUltragoalAskAllowed(cwd: string, context: UltragoalAskGuardContext = {}): Promise<void> {
 	const activeSkill = normalizedActiveSkill(context);
 	// Deep-interview and ralplan are upstream planning workflows whose core gates
@@ -49,11 +62,15 @@ export async function assertUltragoalAskAllowed(cwd: string, context: UltragoalA
 	// prompts; same-session active Ultragoal state still falls through to the
 	// blocker/nudge checks below.
 	const sessionId = sessionScopedAskGuardId(context, activeSkill);
-	const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+	const diagnostic = sessionId
+		? await withWorkflowStateLock(
+				workflowTransactionLockPath(cwd, sessionId),
+				() => isUltragoalAskBlocked(cwd, { sessionId }),
+				{ cwd },
+			)
+		: await isUltragoalAskBlocked(cwd, { sessionId });
 	if (!diagnostic.active) return;
-	const nudge = await consumeUltragoalAskNudge(cwd, sessionId);
-	if (nudge.nudged) throw new ToolError(nudge.message);
-	throw new ToolError(formatUltragoalAskBlockMessage(diagnostic));
+	await throwUltragoalAskBlocked(cwd, sessionId, diagnostic);
 }
 
 export function guardToolForUltragoalAsk<T extends AgentTool>(
@@ -69,8 +86,33 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 			if (prop === ULTRAGOAL_ASK_GUARD) return true;
 			if (prop !== "execute") return Reflect.get(target, prop, receiver);
 			return async (...args: unknown[]): Promise<unknown> => {
-				await assertUltragoalAskAllowed(getCwd(), getContext());
-				return Reflect.apply(target.execute, target, args);
+				const cwd = getCwd();
+				const context = getContext();
+				const sessionId = sessionScopedAskGuardId(context, normalizedActiveSkill(context));
+				if (!sessionId) {
+					await assertUltragoalAskAllowed(cwd, context);
+					return Reflect.apply(target.execute, target, args);
+				}
+
+				let execution: unknown;
+				let started = false;
+				const diagnostic = await withWorkflowStateLock(
+					workflowTransactionLockPath(cwd, sessionId),
+					async () => {
+						const result = await isUltragoalAskBlocked(cwd, { sessionId });
+						if (!result.active) {
+							// Start the tool synchronously while the exact authorization
+							// snapshot is still protected. Store its returned promise
+							// without awaiting it so the interactive lifetime is unlocked.
+							execution = Reflect.apply(target.execute, target, args);
+							started = true;
+						}
+						return result;
+					},
+					{ cwd },
+				);
+				if (started) return execution;
+				await throwUltragoalAskBlocked(cwd, sessionId, diagnostic);
 			};
 		},
 	}) as T & GuardedTool;

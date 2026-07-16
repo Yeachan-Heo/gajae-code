@@ -17,7 +17,7 @@ import {
 
 export { computeUltragoalPlanGeneration, receiptRelevantGoals } from "./ultragoal-receipt-freshness";
 
-import { gjcRoot, sessionUltragoalDir } from "./session-layout";
+import { gjcRoot, sessionUltragoalDir, workflowTransactionLockPath } from "./session-layout";
 import {
 	resolveGjcSessionForRead,
 	resolveGjcSessionForWrite,
@@ -152,6 +152,12 @@ export interface UltragoalGoal {
 
 export interface UltragoalPlan {
 	version: 1;
+	/**
+	 * Cryptographically random identity for this durable plan instance. It is
+	 * intentionally distinct from timestamps and mutable completion generations.
+	 * Legacy plans do not have this field and must not gain handoff authority.
+	 */
+	planRunId?: string;
 	brief: string;
 	gjcGoalMode: UltragoalGjcGoalMode;
 	gjcObjective: string;
@@ -160,6 +166,16 @@ export interface UltragoalPlan {
 	createdAt: string;
 	updatedAt: string;
 	[key: string]: unknown;
+}
+export interface UltragoalAskAuthorityPlanBinding {
+	planRunId: string;
+	planGeneration: string;
+	planContentSha256: string;
+	planStateRevision: number;
+	planCreatedEventId: string;
+	ledgerGeneration: number;
+	ledgerHeadSha256: string;
+	ledgerHeadEventId: string;
 }
 
 export type UltragoalReceiptKind = "per-goal" | "final-aggregate";
@@ -309,6 +325,7 @@ const ACCEPTED_PROOF_STATUSES = new Set([COVERED_STATUS, "passed", "verified"]);
 const MIN_SUBSTANTIVE_EVIDENCE_WORDS = 5;
 const MIN_SUBSTANTIVE_EVIDENCE_CHARS = 32;
 
+const ULTRAGOAL_PLAN_RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SCHEDULABLE_STATUSES = new Set<UltragoalGoalStatus>(["pending", "active", "failed"]);
 const COMPLETE_CHECKPOINT_ALLOWED_PRE_STATUSES = new Set<UltragoalGoalStatus>(["active", "failed"]);
 
@@ -352,6 +369,40 @@ export function hashStructuredValue(value: unknown): string {
 		.update(JSON.stringify(stableStructuredValue(value)))
 		.digest("hex");
 }
+export function deriveUltragoalAskAuthorityPlanBinding(
+	plan: UltragoalPlan,
+	ledger: readonly UltragoalLedgerEvent[],
+): UltragoalAskAuthorityPlanBinding | undefined {
+	if (!plan.planRunId || !ULTRAGOAL_PLAN_RUN_ID_PATTERN.test(plan.planRunId)) return undefined;
+	const planCreatedEvents = ledger.filter(event => event.event === "plan_created");
+	const genesis = planCreatedEvents.at(-1);
+	const ledgerHead = ledger.at(-1);
+	if (
+		!genesis ||
+		genesis.planRunId !== plan.planRunId ||
+		typeof genesis.eventId !== "string" ||
+		genesis.eventId.trim() === "" ||
+		!ledgerHead ||
+		typeof ledgerHead.eventId !== "string" ||
+		ledgerHead.eventId.trim() === ""
+	) {
+		// A handoff proof relies on the immutable plan-creation ledger row and
+		// canonical ledger head as well as the exact current plan content.
+		return undefined;
+	}
+	const planContentSha256 = hashStructuredValue(plan);
+	const planStateRevision = persistedStateRevision(plan);
+	return {
+		planRunId: plan.planRunId,
+		planGeneration: `${planStateRevision}:${planContentSha256}`,
+		planContentSha256,
+		planStateRevision,
+		planCreatedEventId: genesis.eventId,
+		ledgerGeneration: ledger.length,
+		ledgerHeadSha256: hashStructuredValue(ledger),
+		ledgerHeadEventId: ledgerHead.eventId,
+	};
+}
 
 export function getUltragoalPaths(cwd: string, sessionId?: string | null): UltragoalPaths {
 	const explicitSessionId = sessionId?.trim() || process.env.GJC_SESSION_ID?.trim();
@@ -370,21 +421,36 @@ function isEnoent(error: unknown): boolean {
 	);
 }
 
+/**
+ * All ordinary Ultragoal ledger appends acquire the session transaction lock.
+ * The only nested case is nudge consumption, which already owns the ledger-path
+ * lock and then acquires this session lock. No session-locked path acquires the
+ * ledger-path lock, so the sole lock order is ledger → session.
+ */
 async function appendLedger(cwd: string, event: JsonObject, sessionId?: string | null): Promise<UltragoalLedgerEvent> {
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getUltragoalPaths(cwd, resolvedSessionId);
-	const entry: UltragoalLedgerEvent = {
-		eventId: typeof event.eventId === "string" ? event.eventId : crypto.randomUUID(),
-		...event,
-		timestamp: new Date().toISOString(),
-	};
-	await appendJsonl(paths.ledgerPath, entry, {
-		cwd,
-		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
-	});
-	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
-	return entry;
+	return await withWorkflowStateLock(
+		workflowTransactionLockPath(cwd, resolvedSessionId),
+		async () => {
+			const entry: UltragoalLedgerEvent = {
+				eventId: typeof event.eventId === "string" ? event.eventId : crypto.randomUUID(),
+				...event,
+				timestamp: new Date().toISOString(),
+			};
+			await appendJsonl(paths.ledgerPath, entry, {
+				cwd,
+				audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
+			});
+			await writeSessionActivityMarker(cwd, resolvedSessionId, {
+				writer: "ultragoal-runtime",
+				path: paths.ledgerPath,
+			});
+			return entry;
+		},
+		{ cwd },
+	);
 }
 
 export async function readUltragoalLedger(cwd: string, sessionId?: string | null): Promise<UltragoalLedgerEvent[]> {
@@ -482,11 +548,10 @@ export function selectUltragoalNudgeTarget(
 }
 
 /**
- * Atomic consuming writer. Locks the ledger path, rereads + counts nudge rows for the
- * target story, and appends exactly one `nudge` row inside the same critical section
- * only while budget remains. Reuses the lockless `appendLedger` inside the lock (it
- * does not acquire a conflicting lock), so concurrent guarded attempts cannot both
- * observe `count = budget - 1` and overshoot the budget.
+ * Atomic consuming writer. It holds the ledger-path lock while it counts and
+ * appends, then `appendLedger` acquires the session transaction lock. This is
+ * the documented ledger → session order; session-locked writers never acquire
+ * the ledger-path lock, so no reverse-order cycle exists.
  */
 export async function recordUltragoalNudgeIfBudgetRemaining(input: {
 	cwd: string;
@@ -558,17 +623,26 @@ async function writePlan(cwd: string, plan: UltragoalPlan, sessionId?: string | 
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getUltragoalPaths(cwd, resolvedSessionId);
-	await writeArtifact(paths.briefPath, `${plan.brief.trim()}\n`, {
-		cwd,
-		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
-	});
-	await writeGuardedJsonAtomic(paths.goalsPath, plan, {
-		cwd,
-		policy: "source",
-		expectedRevision: typeof plan.state_revision === "number" ? persistedStateRevision(plan) : undefined,
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
-	});
-	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.goalsPath });
+	await withWorkflowStateLock(
+		workflowTransactionLockPath(cwd, resolvedSessionId),
+		async () => {
+			await writeArtifact(paths.briefPath, `${plan.brief.trim()}\n`, {
+				cwd,
+				audit: { category: "artifact", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
+			});
+			await writeGuardedJsonAtomic(paths.goalsPath, plan, {
+				cwd,
+				policy: "source",
+				expectedRevision: typeof plan.state_revision === "number" ? persistedStateRevision(plan) : undefined,
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", sessionId: resolvedSessionId },
+			});
+			await writeSessionActivityMarker(cwd, resolvedSessionId, {
+				writer: "ultragoal-runtime",
+				path: paths.goalsPath,
+			});
+		},
+		{ cwd },
+	);
 }
 
 function chooseReceiptKind(
@@ -1311,8 +1385,13 @@ function normalizePlan(raw: unknown): UltragoalPlan {
 				(value): value is string => typeof value === "string" && value.trim().length > 0,
 			)
 		: undefined;
+	const planRunId =
+		typeof record.planRunId === "string" && ULTRAGOAL_PLAN_RUN_ID_PATTERN.test(record.planRunId)
+			? record.planRunId
+			: undefined;
 	return {
 		version: 1,
+		...(planRunId ? { planRunId } : {}),
 		brief,
 		gjcGoalMode,
 		gjcObjective,
@@ -1522,6 +1601,7 @@ export async function createUltragoalPlan(input: {
 	}
 	const plan: UltragoalPlan = {
 		version: 1,
+		planRunId: crypto.randomUUID(),
 		brief,
 		gjcGoalMode: input.gjcGoalMode ?? "aggregate",
 		gjcObjective: DEFAULT_ULTRAGOAL_OBJECTIVE,
@@ -1530,7 +1610,11 @@ export async function createUltragoalPlan(input: {
 		updatedAt: now,
 	};
 	await writePlan(input.cwd, plan, input.sessionId);
-	await appendLedger(input.cwd, { event: "plan_created", goalIds: plan.goals.map(goal => goal.id) }, input.sessionId);
+	await appendLedger(
+		input.cwd,
+		{ event: "plan_created", goalIds: plan.goals.map(goal => goal.id), planRunId: plan.planRunId },
+		input.sessionId,
+	);
 	return plan;
 }
 

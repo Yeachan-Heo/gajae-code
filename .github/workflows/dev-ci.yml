@@ -350,6 +350,8 @@ jobs:
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}
+    needs: [affected-plan, affected-native]
+    if: ${{ always() && needs.affected-plan.result == 'success' && ((needs.affected-plan.outputs.has_native == 'true' && needs.affected-native.result == 'success') || (needs.affected-plan.outputs.has_native == 'false' && needs.affected-native.result == 'skipped')) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     strategy:
@@ -359,10 +361,17 @@ jobs:
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
@@ -377,6 +386,12 @@ jobs:
           restore-keys: |
             bun-${{ runner.os }}-
       - run: bun install --frozen-lockfile
+      - name: Download native addon(s) for state gates
+        if: ${{ needs.affected-plan.outputs.has_native == 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: packages/natives/native
       - name: Run GJC state gate shard
         run: bun scripts/ci-gjc-state-gates.ts --group=${{ matrix.group }}
 
