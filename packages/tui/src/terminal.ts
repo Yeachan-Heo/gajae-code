@@ -125,6 +125,14 @@ export interface Terminal {
 
 	/** The last detected terminal appearance, or undefined if not yet known. */
 	get appearance(): TerminalAppearance | undefined;
+
+	/**
+	 * Resolve once the initial appearance detection settles: the first OSC 11
+	 * reply is parsed, the DA1 sentinel proves OSC 11 unsupported, or
+	 * `timeoutMs` elapses. Resolves with the detected appearance, if any.
+	 * Optional: virtual/test terminals without appearance detection omit it.
+	 */
+	waitForInitialAppearance?(timeoutMs?: number): Promise<TerminalAppearance | undefined>;
 }
 
 interface TerminalSizeStream {
@@ -212,6 +220,8 @@ export class ProcessTerminal implements Terminal {
 	#stdoutErrorHandlerCleanupTimer?: Timer;
 	#appearanceCallbacks: Array<(appearance: TerminalAppearance) => void> = [];
 	#appearance: TerminalAppearance | undefined;
+	#initialAppearanceSettled = false;
+	#initialAppearanceWaiters: Array<() => void> = [];
 	#osc11Pending = false;
 	#osc11QueryQueued = false;
 	#osc11ResponseBuffer = "";
@@ -235,6 +245,39 @@ export class ProcessTerminal implements Terminal {
 
 	onAppearanceChange(callback: (appearance: TerminalAppearance) => void): void {
 		this.#appearanceCallbacks.push(callback);
+	}
+
+	waitForInitialAppearance(timeoutMs = 200): Promise<TerminalAppearance | undefined> {
+		if (this.#initialAppearanceSettled || this.#dead) {
+			return Promise.resolve(this.#appearance);
+		}
+		return new Promise(resolve => {
+			let timer: Timer | undefined;
+			const finish = () => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				const index = this.#initialAppearanceWaiters.indexOf(finish);
+				if (index !== -1) this.#initialAppearanceWaiters.splice(index, 1);
+				resolve(this.#appearance);
+			};
+			timer = setTimeout(finish, timeoutMs);
+			timer.unref?.();
+			this.#initialAppearanceWaiters.push(finish);
+		});
+	}
+
+	/**
+	 * Mark the initial appearance detection as settled and release any
+	 * `waitForInitialAppearance` callers. Runs after appearance callbacks so
+	 * subscribers observe the detection before deferred first paints resume.
+	 */
+	#settleInitialAppearance(): void {
+		this.#initialAppearanceSettled = true;
+		if (this.#initialAppearanceWaiters.length === 0) return;
+		const waiters = this.#initialAppearanceWaiters.splice(0);
+		for (const waiter of waiters) waiter();
 	}
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
@@ -460,6 +503,9 @@ export class ProcessTerminal implements Terminal {
 					// (queued query is started below, after sentinel is consumed).
 					this.#osc11Pending = false;
 					this.#osc11ResponseBuffer = "";
+					// The initial detection has settled: this terminal will not
+					// answer OSC 11, so deferred first paints should proceed.
+					this.#settleInitialAppearance();
 				}
 				// Now that this DA1 cycle is complete, start any queued query.
 				if (this.#osc11QueryQueued && !this.#dead) {
@@ -558,7 +604,10 @@ export class ProcessTerminal implements Terminal {
 		};
 		const luminance = 0.299 * normalize(rHex) + 0.587 * normalize(gHex) + 0.114 * normalize(bHex);
 		const mode: TerminalAppearance = luminance < 0.5 ? "dark" : "light";
-		if (mode === this.#appearance) return;
+		if (mode === this.#appearance) {
+			this.#settleInitialAppearance();
+			return;
+		}
 		this.#appearance = mode;
 		for (const cb of this.#appearanceCallbacks) {
 			try {
@@ -567,6 +616,7 @@ export class ProcessTerminal implements Terminal {
 				/* ignore callback errors */
 			}
 		}
+		this.#settleInitialAppearance();
 	}
 
 	/**
@@ -684,6 +734,9 @@ export class ProcessTerminal implements Terminal {
 		if (activeTerminal === this) {
 			activeTerminal = null;
 		}
+
+		// Release any deferred-first-paint waiters so callers never hang on stop.
+		this.#settleInitialAppearance();
 
 		if (this.#clearProgressTimer()) {
 			this.#safeWrite(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
@@ -816,6 +869,7 @@ export class ProcessTerminal implements Terminal {
 			clearTimeout(this.#modifyOtherKeysTimeout);
 			this.#modifyOtherKeysTimeout = undefined;
 		}
+		this.#settleInitialAppearance();
 		this.#appendDetachDebugEvent(operation, err);
 	}
 

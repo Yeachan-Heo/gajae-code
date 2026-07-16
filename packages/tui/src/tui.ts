@@ -590,6 +590,10 @@ export class TUI extends Container {
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	onDebug?: () => void;
 	#renderRequested = false;
+	// First-paint hold: set by start({ deferFirstRender: true }) and released by
+	// the next forced render. While held, non-forced renders are dropped so the
+	// very first paint happens only after startup theme detection settles.
+	#renderHeld = false;
 	#renderTimer: NodeJS.Timeout | undefined;
 	#lastRenderAt = 0;
 	static readonly #MIN_RENDER_INTERVAL_MS = 16;
@@ -964,9 +968,10 @@ export class TUI extends Container {
 		for (const overlay of this.overlayStack) overlay.component.invalidate?.();
 	}
 
-	start(): void {
+	start(options?: { deferFirstRender?: boolean }): void {
 		this.#stopped = false;
 		this.#terminalUnavailable = false;
+		this.#renderHeld = options?.deferFirstRender === true;
 		this.terminal.start(
 			data => this.#handleInput(data),
 			() => {
@@ -978,7 +983,7 @@ export class TUI extends Container {
 		this.#hideCursor();
 		this.#querySixelSupport();
 		this.#queryCellSize();
-		this.requestRender(true);
+		if (!this.#renderHeld) this.requestRender(true);
 	}
 
 	get terminalAvailable(): boolean {
@@ -1187,6 +1192,7 @@ export class TUI extends Container {
 		this.flushTerminalCleanup();
 		this.#clearSixelProbeState();
 		this.#stopped = true;
+		this.#renderHeld = false;
 		if (this.#renderTimer) {
 			clearTimeout(this.#renderTimer);
 			this.#renderTimer = undefined;
@@ -1250,6 +1256,12 @@ export class TUI extends Container {
 		if (!this.terminalAvailable) {
 			this.#markTerminalUnavailable();
 			return;
+		}
+		// While the first paint is deferred, drop non-forced renders. The releasing
+		// requestRender(true) is a full redraw, so no dropped frame is ever lost.
+		if (this.#renderHeld) {
+			if (!force) return;
+			this.#renderHeld = false;
 		}
 		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {

@@ -200,4 +200,17 @@ describe("theme auto-detection", () => {
 		expect(themeModule.getCurrentThemeName()).toBe("blue-crab");
 		expect(detectSpy).not.toHaveBeenCalled();
 	});
+
+	it("whenAutoThemeSettled resolves only after the appearance-triggered theme load lands", async () => {
+		using _globals = withThemeTestGlobals({ colorfgbg: "15;0" });
+		themeModule.onTerminalAppearanceChange("dark");
+		await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+		const darkAccent = themeModule.theme.getFgAnsi("accent");
+
+		themeModule.onTerminalAppearanceChange("light");
+		await themeModule.whenAutoThemeSettled();
+
+		expect(themeModule.getCurrentThemeName()).toBe("blue-crab");
+		expect(themeModule.theme.getFgAnsi("accent")).not.toBe(darkAccent);
+	});
 });

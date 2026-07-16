@@ -1786,6 +1786,8 @@ var autoLightTheme: string = "blue-crab";
 var onThemeChangeCallback: (() => void) | undefined;
 var themeLoadRequestId: number = 0;
 var previewThemeActive: boolean = false;
+/** Most recent auto-theme reevaluation chain; always resolves (never rejects). */
+var autoThemeSettled: Promise<void> = Promise.resolve();
 
 function getCurrentThemeOptions(): CreateThemeOptions {
 	return {
@@ -1936,6 +1938,16 @@ export function onTerminalAppearanceChange(mode: "dark" | "light"): void {
 	if (terminalReportedAppearance === mode) return;
 	terminalReportedAppearance = mode;
 	reevaluateAutoTheme("terminal appearance");
+}
+
+/**
+ * Resolve once the most recent auto-theme reevaluation (e.g. from the initial
+ * terminal appearance detection) finishes loading. Used to hold the first
+ * interactive paint until the auto theme is decided, avoiding a whole-screen
+ * theme flip right after startup.
+ */
+export function whenAutoThemeSettled(): Promise<void> {
+	return autoThemeSettled;
 }
 
 export function setThemeInstance(themeInstance: Theme): void {
@@ -2096,7 +2108,7 @@ function reevaluateAutoTheme(debugLabel: string): void {
 	const requestId = ++themeLoadRequestId;
 	if (resolved === currentThemeName && !previewThemeActive) return;
 	currentThemeName = resolved;
-	loadTheme(resolved, getCurrentThemeOptions())
+	autoThemeSettled = loadTheme(resolved, getCurrentThemeOptions())
 		.then(loadedTheme => {
 			if (requestId !== themeLoadRequestId) return;
 			theme = loadedTheme;

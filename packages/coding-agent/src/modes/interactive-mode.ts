@@ -124,6 +124,7 @@ import {
 	onTerminalAppearanceChange,
 	onThemeChange,
 	theme,
+	whenAutoThemeSettled,
 } from "./theme/theme";
 import type {
 	CompactionQueuedMessage,
@@ -138,6 +139,11 @@ import type { ParsedIrcMessage } from "./utils/irc-message";
 import { addChatChild, prepareTranscriptRebuild, UiHelpers } from "./utils/ui-helpers";
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+// Cap on how long the first paint waits for the terminal's initial OSC 11
+// dark/light answer. Local terminals answer in single-digit milliseconds;
+// remote/tmux round-trips stay well under this. Terminals that never answer
+// settle earlier via the DA1 sentinel, so the cap is rarely reached.
+const INITIAL_APPEARANCE_TIMEOUT_MS = 200;
 const COMPOSER_NEWLINE_HINT = process.platform === "win32" ? "Alt+Enter/Ctrl+J" : "Shift+Enter/Ctrl+J";
 export const DEFAULT_COMPOSER_PLACEHOLDER = `Type your message... ${COMPOSER_NEWLINE_HINT}: New line · Ctrl+C: Clear · Ctrl+R: Search history · Shift+Tab: Reasoning`;
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
@@ -699,14 +705,33 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Load initial todos
 		await this.#loadTodoList();
 
-		// Start the UI
-		this.ui.start();
+		// Set up the theme file watcher and the terminal dark/light appearance
+		// subscription BEFORE the terminal starts, so the initial OSC 11 detection
+		// (queried by ProcessTerminal.start()) is never missed and its resulting
+		// theme swap lands before the first paint instead of flashing after it.
+		onThemeChange(() => {
+			clearRenderCache();
+			configureDefaultComposerChrome(this.editor);
+			this.ui.invalidate();
+			this.updateEditorChrome();
+			this.ui.requestRender();
+		});
+		this.ui.terminal.onAppearanceChange(mode => {
+			onTerminalAppearanceChange(mode);
+		});
+
+		// Start the UI with the first paint deferred until the initial dark/light
+		// detection settles, so the auto theme is decided before anything is drawn
+		// (avoids the whole-screen theme flip that used to flicker right after
+		// startup). The wait is bounded; see #settleInitialTheme().
+		this.ui.start({ deferFirstRender: true });
 		pushTerminalTitle();
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.updateEditorChrome();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
 		this.#syncIrcSidebarAvailabilityFromSettings();
+		await this.#settleInitialTheme();
 		this.ui.requestRender(true);
 
 		// GitHub star reminder (interactive-only). Register the decline-driven
@@ -758,21 +783,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				void this.#handleGoalSessionEvent(event);
 			}),
 		);
-		// Set up theme file watcher
-		onThemeChange(() => {
-			clearRenderCache();
-			configureDefaultComposerChrome(this.editor);
-			this.ui.invalidate();
-			this.updateEditorChrome();
-			this.ui.requestRender();
-		});
-
-		// Subscribe to terminal dark/light appearance changes.
-		// The terminal queries background color via OSC 11 at startup and on
-		// Mode 2031 notifications, computing luminance to detect dark/light.
-		this.ui.terminal.onAppearanceChange(mode => {
-			onTerminalAppearanceChange(mode);
-		});
+		// Theme file watcher and terminal appearance subscriptions are registered
+		// above, before this.ui.start(), so the initial detection precedes the
+		// first paint.
 
 		// Set up git branch watcher
 		this.statusLine.watchBranch(() => {
@@ -782,6 +795,21 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Initial top border update
 		this.updateEditorChrome();
+	}
+
+	/**
+	 * Bounded wait for the initial OSC 11 dark/light detection and the
+	 * auto-theme load it triggers. The first paint must never hang on a
+	 * terminal that answers slowly (or not at all), so the terminal-side wait
+	 * is capped and any failure falls through to painting immediately.
+	 */
+	async #settleInitialTheme(): Promise<void> {
+		try {
+			await this.ui.terminal.waitForInitialAppearance?.(INITIAL_APPEARANCE_TIMEOUT_MS);
+			await whenAutoThemeSettled();
+		} catch {
+			// Never block startup on appearance detection failures.
+		}
 	}
 
 	/** Reload slash commands and autocomplete for the provided working directory. */

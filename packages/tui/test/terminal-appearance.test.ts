@@ -401,4 +401,66 @@ describe("ProcessTerminal raw-Buffer stdin (issue #454)", () => {
 
 		terminal.stop();
 	});
+
+	it("waitForInitialAppearance resolves with the detected appearance once OSC 11 replies", async () => {
+		const { terminal } = setupTerminal();
+		const wait = terminal.waitForInitialAppearance(60_000);
+
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+
+		expect(await wait).toBe("dark");
+		terminal.stop();
+	});
+
+	it("appearance callbacks observe the detection before waitForInitialAppearance resolves", async () => {
+		const { terminal } = setupTerminal();
+		const order: string[] = [];
+		terminal.onAppearanceChange(a => order.push(`callback:${a}`));
+		const wait = terminal.waitForInitialAppearance(60_000).then(a => order.push(`wait:${a}`));
+
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		await wait;
+
+		expect(order).toEqual(["callback:light", "wait:light"]);
+		terminal.stop();
+	});
+
+	it("waitForInitialAppearance resolves undefined when DA1 proves OSC 11 unsupported", async () => {
+		const { terminal } = setupTerminal();
+		const wait = terminal.waitForInitialAppearance(60_000);
+
+		// DA1 sentinel arrives without any OSC 11 reply: unsupported terminal.
+		process.stdin.emit("data", "\x1b[?1;2c");
+
+		expect(await wait).toBeUndefined();
+		terminal.stop();
+	});
+
+	it("waitForInitialAppearance resolves immediately when detection already settled", async () => {
+		const { terminal } = setupTerminal();
+
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+
+		expect(await terminal.waitForInitialAppearance(0)).toBe("light");
+		terminal.stop();
+	});
+
+	it("waitForInitialAppearance times out when the terminal never answers", async () => {
+		const { terminal } = setupTerminal();
+
+		expect(await terminal.waitForInitialAppearance(10)).toBeUndefined();
+		terminal.stop();
+	});
+
+	it("stop() releases pending waitForInitialAppearance callers", async () => {
+		const { terminal } = setupTerminal();
+		const wait = terminal.waitForInitialAppearance(60_000);
+
+		terminal.stop();
+
+		expect(await wait).toBeUndefined();
+	});
 });

@@ -35,7 +35,8 @@ Boundary rule: the TUI engine is message-agnostic. It only knows `Component.rend
 - `editorContainer` (holds `CustomEditor`)
 - `hookWidgetContainerBelow`
 
-`init()` wires the tree in that order, focuses the editor, registers input handlers via `InputController`, subscribes terminal appearance changes into theme auto-detection, starts TUI, and requests a forced render.
+`init()` wires the tree in that order, focuses the editor, registers input handlers via `InputController`, subscribes terminal appearance changes into theme auto-detection, and starts TUI with the first paint deferred (`start({ deferFirstRender: true })`).
+While deferred, non-forced renders are dropped; `init()` waits (bounded, 200ms cap) for the initial OSC 11 dark/light detection and the auto-theme load it triggers (`waitForInitialAppearance` + `whenAutoThemeSettled`), then releases the hold with a forced render. This makes the first frame paint with the settled theme instead of flashing a whole-screen theme flip right after startup.
 A forced render (`requestRender(true)`) resets previous-line caches and cursor bookkeeping before repainting.
 
 ## Terminal lifecycle and stdin normalization
