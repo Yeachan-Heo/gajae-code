@@ -68,6 +68,7 @@
 - Post-durable default-model-selection failures now expose a stable SDK error with bounded `restored`, `partial`, or `unknown` rollback state; preflight and validation errors remain unchanged.
 ### Fixed
 - Made SDK host startup publish its runtime and initial identity frame before exposing direct-v3 transport endpoints, preventing early replay/control frames from being dropped or dereferencing uninitialized session state under concurrent test and process load.
+- Workflow state receipts now point to the canonical `.gjc/_session-{sessionid}/state` files, and `gjc state` write results agree with the receipt's `state_path`.
 
 - IRC deliveries now accept their exchange batch in the recipient's volatile current-session queue before recipient/main UI observations or sender success. Awaited deliveries generate the reply first, then accept the ordered incoming + auto-reply pair and commit the IRC roster claim before observation; provider failures and sender aborts before acceptance leave no ghost exchange, while observer failures after acceptance are isolated. This is not a durability guarantee: durable history injection remains a later flush and no fsync, recovery, persistent IDs, or deduplication was added.
 - `/model` role-agent assignments now replace active model-profile overrides immediately, so changing architect, critic, planner, or executor models and reasoning levels takes effect in the current session and remains persisted afterward.

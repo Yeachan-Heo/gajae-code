@@ -1449,7 +1449,7 @@ async function handleWrite(
 		stdout: renderCliWriteReceipt({
 			ok: true,
 			skill: mode,
-			state_path: filePath,
+			state_path: activeStateFile(cwd, sessionId),
 			current_phase: phase,
 			active,
 			mutation_id: typeof stampedReceipt.mutation_id === "string" ? stampedReceipt.mutation_id : mutationId,
@@ -1535,7 +1535,7 @@ async function handleClear(
 		stdout: renderCliWriteReceipt({
 			ok: true,
 			skill: mode,
-			state_path: filePath,
+			state_path: activeStateFile(cwd, sessionId),
 			active: false,
 			current_phase: typeof cleared.current_phase === "string" ? cleared.current_phase : undefined,
 			mutation_id: typeof stampedReceipt.mutation_id === "string" ? stampedReceipt.mutation_id : mutationId,

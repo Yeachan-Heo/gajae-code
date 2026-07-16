@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { auditPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { activeSnapshotPath, auditPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
 
 const TEST_SESSION_ID = "test-session";
@@ -33,7 +33,7 @@ async function readAuditEntries(cwd: string): Promise<Array<Record<string, unkno
 		.map(line => JSON.parse(line) as Record<string, unknown>);
 }
 
-function expectValidReceipt(state: Record<string, unknown>, skill: string): void {
+function expectValidReceipt(state: Record<string, unknown>, skill: string): Record<string, unknown> {
 	const receipt = state.receipt as Record<string, unknown> | undefined;
 	expect(receipt).toMatchObject({
 		version: 1,
@@ -43,6 +43,7 @@ function expectValidReceipt(state: Record<string, unknown>, skill: string): void
 	expect(["gjc-state-cli", "gjc-runtime", "gjc-hook"]).toContain(receipt?.owner as string);
 	expect(typeof receipt?.mutated_at).toBe("string");
 	expect(Number.isNaN(Date.parse(receipt?.mutated_at as string))).toBe(false);
+	return receipt ?? {};
 }
 
 function expectCliChecksum(payload: Record<string, unknown>): void {
@@ -81,7 +82,14 @@ describe("G5 gjc state receipts", () => {
 			expect(writePayload.state).toBeUndefined();
 			expectCliChecksum(writePayload);
 			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
-			expectValidReceipt(await readJson(statePath), "ralplan");
+			const activePath = activeSnapshotPath(cwd, TEST_SESSION_ID);
+			const writeReceipt = expectValidReceipt(await readJson(statePath), "ralplan");
+			expect(writeReceipt.state_path).toBe(activePath);
+			expect(writeReceipt.storage_path).toBe(statePath);
+			expect(writePayload.state_path).toBe(activePath);
+			await expect(fs.stat(writeReceipt.state_path as string)).resolves.toBeDefined();
+			await expect(fs.stat(writeReceipt.storage_path as string)).resolves.toBeDefined();
+
 			expectAuditEntry(findAuditEntry(await readAuditEntries(cwd), "write"), "write");
 
 			const clear = await runNativeStateCommand(["clear", "--mode", "ralplan"], cwd);
