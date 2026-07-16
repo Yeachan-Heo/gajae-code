@@ -1126,6 +1126,13 @@ function cloneSessionContext(context: SessionContext): SessionContext {
 	};
 }
 
+function freezeInternalReadSnapshot<T>(value: T): T {
+	if (process.env.NODE_ENV !== "test" && process.env.NODE_ENV !== "development") return value;
+	if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value as Record<string, unknown>)) freezeInternalReadSnapshot(child);
+	return Object.freeze(value);
+}
+
 /**
  * Compute the default session directory for a cwd.
  * Classifies cwd by canonical location so symlink/alias paths resolve to the
@@ -3293,7 +3300,7 @@ export class SessionManager {
 	#replayMetadataRevision = 0;
 	#materializedEntriesRevision = -1;
 	#materializedEntriesCache: SessionEntry[] | undefined;
-	#sessionContextCache: WeakRef<SessionContext> | undefined;
+	#sessionContextCache: SessionContext | undefined;
 	#sessionContextEntryRevision = -1;
 	#sessionContextLeafRevision = -1;
 	#sessionContextReplayMetadataRevision = -1;
@@ -3481,14 +3488,15 @@ export class SessionManager {
 	}
 
 	async #hydrateExistingSession(sessionFile: string, entries: FileEntry[], migrationApplied: boolean): Promise<void> {
-		const header = entries[0] as SessionHeader;
+		const ownedEntries = structuredClone(entries) as FileEntry[];
+		const header = ownedEntries[0] as SessionHeader;
 		this.#sessionFile = path.resolve(sessionFile);
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
-		await resolveBlobRefsInEntries(entries, this.#blobStore);
-		this.#fileEntries = entries;
+		await resolveBlobRefsInEntries(ownedEntries, this.#blobStore);
+		this.#fileEntries = ownedEntries;
 		this.#resetResidentTextBlobStore();
 		this.#fileEntries = this.#fileEntries.map(entry =>
 			prepareEntryForResidentSync(entry, this.#residentBlobStores()),
@@ -5309,15 +5317,26 @@ export class SessionManager {
 	 * Build the session context (what gets sent to the LLM).
 	 * Uses tree traversal from current leaf.
 	 */
+	/**
+	 * Return a defensive context snapshot for public consumers.
+	 */
 	buildSessionContext(): SessionContext {
-		const cached = this.#sessionContextCache?.deref();
+		return cloneSessionContext(this.getSessionContextForRead());
+	}
+
+	/**
+	 * Return the revision-keyed context cache for internal read-only consumers.
+	 * The strong reference avoids GC-driven rebuilds during a session.
+	 */
+	getSessionContextForRead(): Readonly<SessionContext> {
+		const cached = this.#sessionContextCache;
 		if (
 			cached &&
 			this.#sessionContextEntryRevision === this.#entryRevision &&
 			this.#sessionContextLeafRevision === this.#leafRevision &&
 			this.#sessionContextReplayMetadataRevision === this.#replayMetadataRevision
 		) {
-			return cloneSessionContext(cached);
+			return cached;
 		}
 		this.#pathOnlyContextBuildCount++;
 		const context = buildSessionContext(
@@ -5326,11 +5345,11 @@ export class SessionManager {
 			undefined,
 			this.#sessionId,
 		);
-		this.#sessionContextCache = new WeakRef(context);
+		this.#sessionContextCache = freezeInternalReadSnapshot(context);
 		this.#sessionContextEntryRevision = this.#entryRevision;
 		this.#sessionContextLeafRevision = this.#leafRevision;
 		this.#sessionContextReplayMetadataRevision = this.#replayMetadataRevision;
-		return cloneSessionContext(context);
+		return this.#sessionContextCache;
 	}
 
 	#getActivePathEntriesForProviderContext(fromId?: string | null): SessionEntry[] {
@@ -5439,6 +5458,14 @@ export class SessionManager {
 		return materializedEntries;
 	}
 
+	/**
+	 * Return the materialized entries for internal read-only consumers.
+	 * Public SDK callers must use getEntries(), which preserves the defensive-copy boundary.
+	 */
+	getEntriesForRead(): readonly SessionEntry[] {
+		return freezeInternalReadSnapshot(this.#getMaterializedEntriesInternal());
+	}
+
 	getEntries(): SessionEntry[] {
 		this.#publicMaterializerCallCount++;
 		this.#getEntriesMaterializerCallCount++;
@@ -5451,7 +5478,7 @@ export class SessionManager {
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getTree(): SessionTreeNode[] {
-		const entries = this.getEntries();
+		const entries = this.getEntriesForRead();
 		const nodeMap = new Map<string, SessionTreeNode>();
 		const roots: SessionTreeNode[] = [];
 
@@ -5727,7 +5754,7 @@ export class SessionManager {
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
-		const forkEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
+		const forkEntries = (await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 		manager.#fileEntries = forkEntries;
@@ -5974,7 +6001,7 @@ export class SessionManager {
 		if (!sameResumeIdentity(identity, inspected.identity)) {
 			return { kind: "error", reason: "identity-mismatch" };
 		}
-		const entries = structuredClone(inspected.entries) as FileEntry[];
+		const entries = inspected.entries;
 		const header = entries[0] as SessionHeader;
 		const dir = sessionDir ?? path.resolve(identity.canonicalPath, "..");
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage);

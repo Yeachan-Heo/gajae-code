@@ -1140,11 +1140,9 @@ export type StreamingEditParsedCacheEntry = {
 function stableStreamingEditArgsVersion(args: unknown): string | undefined {
 	if (typeof args === "string") return args;
 	if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
-	try {
-		return JSON.stringify(args);
-	} catch {
-		return undefined;
-	}
+	const { diff, op, path } = args as Record<string, unknown>;
+	if (typeof diff !== "string") return undefined;
+	return `${path ?? ""}\u0000${op ?? ""}\u0000${diff.length}`;
 }
 
 export function getStreamingEditToolCallForEvent(
@@ -1168,7 +1166,13 @@ export function getStreamingEditToolCallForEvent(
 	if (version === undefined) return undefined;
 	const cacheKey = String(contentIndex);
 	const cached = cache.get(cacheKey);
-	if (cached?.version === version) return cached.parsed;
+	if (
+		cached?.version === version &&
+		(typeof toolCall.arguments === "string" ||
+			cached.parsed?.diff === (toolCall.arguments as Record<string, unknown>).diff)
+	) {
+		return cached.parsed;
+	}
 
 	let args: unknown = toolCall.arguments;
 	if (typeof args === "string") {
@@ -3001,7 +3005,7 @@ export class AgentSession {
 					);
 				}
 				if (toolName === "checkpoint" && !isError) {
-					const checkpointEntryId = this.sessionManager.getEntries().at(-1)?.id ?? null;
+					const checkpointEntryId = this.sessionManager.getLeafId();
 					this.#checkpointState = {
 						checkpointMessageCount: this.agent.state.messages.length,
 						checkpointEntryId,
@@ -5841,7 +5845,7 @@ export class AgentSession {
 	}
 
 	getTranscript(): Array<{ id: string; role: string; textSummary: string; ts: string; body: string }> {
-		return this.sessionManager.getEntries().flatMap(entry => {
+		return this.sessionManager.getEntriesForRead().flatMap(entry => {
 			if (entry.type !== "message") return [];
 			const message = entry.message as unknown as { role?: unknown; content?: unknown };
 			const body =
@@ -8032,7 +8036,7 @@ export class AgentSession {
 
 	/** Return the persisted configured fallback selectors for a model role. */
 	getConfiguredModelChain(role: string): readonly string[] | undefined {
-		return this.sessionManager.buildSessionContext().configuredModelChains[role]?.entries;
+		return this.sessionManager.getSessionContextForRead().configuredModelChains[role]?.entries;
 	}
 
 	/** Persist the configured fallback selectors for a model role. */
@@ -8084,7 +8088,7 @@ export class AgentSession {
 	 * instead of promoting a transient runtime model to the resume default.
 	 */
 	getSessionDefaultModelSelector(): string | undefined {
-		return this.sessionManager.buildSessionContext().models.default;
+		return this.sessionManager.getSessionContextForRead().models.default;
 	}
 
 	/**
@@ -11273,7 +11277,7 @@ export class AgentSession {
 	 * intrinsic to controller construction and are never inferred at runtime.
 	 */
 	#defaultFallbackChain(): FallbackChainController {
-		const configuredChain = this.sessionManager.buildSessionContext().configuredModelChains.default;
+		const configuredChain = this.sessionManager.getSessionContextForRead().configuredModelChains.default;
 		const settingsEntries = normalizeModelSelectorValue(
 			this.settings.getModelRole("default") ?? (this.model ? formatModelString(this.model) : undefined),
 		);
@@ -13101,7 +13105,7 @@ export class AgentSession {
 	 * Get all user messages from session for branch selector.
 	 */
 	getUserMessagesForBranching(): Array<{ entryId: string; text: string }> {
-		const entries = this.sessionManager.getEntries();
+		const entries = this.sessionManager.getEntriesForRead();
 		const result: Array<{ entryId: string; text: string }> = [];
 
 		for (const entry of entries) {
@@ -13805,5 +13809,5 @@ export class AgentSession {
 }
 
 function cloneJsonValueForForkSeed<T>(value: T): T {
-	return JSON.parse(JSON.stringify(value)) as T;
+	return structuredClone(value);
 }
