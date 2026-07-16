@@ -26,6 +26,7 @@ import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from 
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
+	setManuallyExpanded?(expanded: boolean): void;
 }
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
@@ -1507,7 +1508,11 @@ export class InputController {
 		this.ctx.toolOutputExpanded = expanded;
 		for (const child of this.ctx.chatContainer.children) {
 			if (isExpandable(child)) {
-				child.setExpanded(expanded);
+				if (child.setManuallyExpanded) {
+					child.setManuallyExpanded(expanded);
+				} else {
+					child.setExpanded(expanded);
+				}
 			}
 		}
 		this.ctx.ui.requestRender();

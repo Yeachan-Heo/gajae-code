@@ -159,6 +159,11 @@ export interface ToolExecutionHandle {
 	): void;
 	setArgsComplete(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
+	/**
+	 * Applies an explicit fold choice for this renderer instance. The pin lasts
+	 * only for this instance; transcript rebuilds recreate it from global state.
+	 */
+	setManuallyExpanded(expanded: boolean): void;
 }
 
 /**
@@ -174,6 +179,7 @@ export class ToolExecutionComponent extends Container {
 	#toolLabel: string;
 	#args: any;
 	#expanded = false;
+	#manuallyExpanded: boolean | undefined;
 	#showImages: boolean;
 	#editFuzzyThreshold: number | undefined;
 	#editAllowFuzzy: boolean | undefined;
@@ -450,7 +456,19 @@ export class ToolExecutionComponent extends Container {
 		super.dispose();
 	}
 
+	/** Applies automatic expansion unless this renderer instance has an explicit fold choice. */
 	setExpanded(expanded: boolean): void {
+		if (this.#manuallyExpanded !== undefined) return;
+		this.#expanded = expanded;
+		this.#updateDisplay();
+	}
+
+	/**
+	 * Applies and pins an explicit fold choice for this renderer instance only.
+	 * Transcript rebuilds recreate components from global state and drop this pin.
+	 */
+	setManuallyExpanded(expanded: boolean): void {
+		this.#manuallyExpanded = expanded;
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}

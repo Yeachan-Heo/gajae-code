@@ -271,7 +271,11 @@ export interface ExtensionUIContext {
 	/** Get current tool output expansion state. */
 	getToolsExpanded(): boolean;
 
-	/** Set tool output expansion state. */
+	/**
+	 * Set tool output expansion state. This is an explicit fold choice, pinning
+	 * existing tool and read components for their renderer instance lifetime,
+	 * the same as the user shortcut.
+	 */
 	setToolsExpanded(expanded: boolean): void;
 }
 

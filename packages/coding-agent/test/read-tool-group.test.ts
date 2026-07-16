@@ -1,7 +1,9 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { getDefault } from "../src/config/settings-schema";
 import { ReadToolGroupComponent, readArgsTargetInternalUrl } from "../src/modes/components/read-tool-group";
+import { InputController } from "../src/modes/controllers/input-controller";
 import * as themeModule from "../src/modes/theme/theme";
+import type { InteractiveModeContext } from "../src/modes/types";
 
 describe("ReadToolGroupComponent", () => {
 	beforeAll(async () => {
@@ -92,6 +94,51 @@ describe("ReadToolGroupComponent", () => {
 		const matches = rendered.match(/Read \/tmp\/example\.ts:L10-L20/g) ?? [];
 
 		expect(matches).toHaveLength(1);
+	});
+	it("preserves manual fold choices through automatic and entry updates", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		component.updateArgs({ path: "/tmp/one.ts" }, "read-1");
+		component.updateResult({ content: [{ type: "text", text: "one\ntwo\nthree\nfour\nfive" }] }, false, "read-1");
+		component.setManuallyExpanded(true);
+		component.setExpanded(false);
+		component.updateArgs({ path: "/tmp/two.ts" }, "read-2");
+		component.updateResult(
+			{ content: [{ type: "text", text: "warning" }], details: { suffixResolution: { from: "a", to: "b" } } },
+			false,
+			"read-2",
+		);
+		component.updateArgs({ path: "/tmp/three.ts" }, "read-3");
+		component.updateResult({ content: [{ type: "text", text: "error" }], isError: true }, false, "read-3");
+
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("four");
+
+		component.setManuallyExpanded(false);
+		component.setExpanded(true);
+		expect(Bun.stripANSI(component.render(120).join("\n"))).not.toContain("four");
+	});
+
+	it("lets unpinned read groups follow automatic expansion", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		component.updateArgs({ path: "/tmp/example.ts" }, "read-1");
+		component.updateResult({ content: [{ type: "text", text: "one\ntwo\nthree\nfour" }] }, false, "read-1");
+		component.setExpanded(true);
+
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("four");
+	});
+	it("accepts a controller override as a fresh explicit pin", () => {
+		const manuallyExpandable = { setExpanded: vi.fn(), setManuallyExpanded: vi.fn() };
+		const automaticallyExpandable = { setExpanded: vi.fn() };
+		const ctx = {
+			toolOutputExpanded: false,
+			chatContainer: { children: [manuallyExpandable, automaticallyExpandable] },
+			ui: { requestRender: vi.fn() },
+		} as unknown as InteractiveModeContext;
+
+		new InputController(ctx).setToolsExpanded(true);
+
+		expect(manuallyExpandable.setManuallyExpanded).toHaveBeenCalledWith(true);
+		expect(manuallyExpandable.setExpanded).not.toHaveBeenCalled();
+		expect(automaticallyExpandable.setExpanded).toHaveBeenCalledWith(true);
 	});
 });
 

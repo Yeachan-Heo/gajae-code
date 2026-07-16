@@ -39,6 +39,7 @@
 - Added the versioned, readonly managed session-directory SDK: `SESSION_DIRECTORY_API_VERSION`, `resolveManagedSessionScope`, and `listManagedSessionCandidates` are exported from `@gajae-code/coding-agent/sdk`. The package boundary continues to reject private `session/internal/*` imports. Managed writes use v2 workspace scopes with validated opt-in legacy copy-retain migration (#2177).
 
 ### Changed
+- Explicit fold choices from the user shortcut or extension `setToolsExpanded` now pin a block for its component lifetime, so automatic stamping no longer overwrites them; sessions that never toggle are unchanged.
 
 - Renamed the notifications SDK to the Gajae-Code SDK: `docs/notifications-sdk.md` is now `docs/sdk.md`, `src/notifications/` is now `src/sdk/bus/`, and `src/sdk.ts` is now the `src/sdk/` module directory. Old deep-import specifiers no longer resolve.
 - Moved SDK discovery from `.gjc/state/notifications/` to `.gjc/state/sdk/`. Restart sessions and daemons together when upgrading; the runtime does not dual-scan the old and new directories.
