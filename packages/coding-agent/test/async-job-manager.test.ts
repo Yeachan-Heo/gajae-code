@@ -406,7 +406,10 @@ describe("AsyncJobManager", () => {
 			expect(manager.getMonitorTombstone(expiredJobId)?.expiresAt).toBe(5 * 60_000);
 
 			clock.mockReturnValue(5 * 60_000 + 1);
-			manager.register("bash", "new monitor", async () => "done", { id: "new-monitor", metadata: { monitor: true } });
+			manager.register("bash", "new monitor", async () => "done", {
+				id: "new-monitor",
+				metadata: { monitor: true },
+			});
 			await manager.waitForAll();
 
 			expect(manager.getMonitorTombstone(expiredJobId)).toBeUndefined();

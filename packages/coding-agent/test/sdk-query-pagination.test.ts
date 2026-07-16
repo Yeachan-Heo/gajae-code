@@ -378,9 +378,17 @@ it("keeps random-sized paginated responses below the one MiB ceiling", async () 
 			state = (state * 16_807) % 2_147_483_647;
 			return state;
 		};
-		const diff = Array.from({ length: 32 }, (_, index) => ({ id: String(index), body: "x".repeat(next() % 180_000) }));
+		const diff = Array.from({ length: 32 }, (_, index) => ({
+			id: String(index),
+			body: "x".repeat(next() % 180_000),
+		}));
 		const store = new RevisionStore(`page-${seed}`);
-		const query = new QueryHandlers({ ...surface([]), getDiff: () => diff }, `page-${seed}`, store, new CursorRegistry("token", store));
+		const query = new QueryHandlers(
+			{ ...surface([]), getDiff: () => diff },
+			`page-${seed}`,
+			store,
+			new CursorRegistry("token", store),
+		);
 		let response = await query.dispatch({ query: "Q06", connectionId: "c" });
 		while (response.page) {
 			expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(1024 * 1024);

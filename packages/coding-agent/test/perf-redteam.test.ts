@@ -59,7 +59,7 @@ describe("perf change-set adversarial probes", () => {
 		manager.appendMessage({ role: "user", content: "canonical", timestamp: 0 });
 		const tree = manager.getTree();
 		const message = tree[0]?.entry;
-		if (!message || message.type !== "message" || message.message.role !== "user") throw new Error("missing tree message");
+		if (message?.type !== "message" || message.message.role !== "user") throw new Error("missing tree message");
 		message.message.content = "poisoned";
 		const reread = manager.getTree()[0]?.entry;
 		expect(reread).toMatchObject({ type: "message", message: { role: "user", content: "canonical" } });
@@ -97,7 +97,12 @@ describe("perf change-set adversarial probes", () => {
 	});
 
 	it("retention zero cannot retain dead letters and tombstone sweeping is safe without registrations", async () => {
-		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: () => { throw new Error("delivery failure"); } });
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			onJobComplete: () => {
+				throw new Error("delivery failure");
+			},
+		});
 		manager.register("task", "terminal", async () => "done", { id: "zero-retention" });
 		await manager.waitForAll();
 		await manager.drainDeliveries({ timeoutMs: 5_000 });

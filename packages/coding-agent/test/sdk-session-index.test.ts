@@ -83,7 +83,9 @@ describe("SDK session index", () => {
 		expect(readers.map(reader => reader.indexSeq)).toEqual([16, 16, 16, 16]);
 		expect(readers[0]!.listSessions().sessions).toHaveLength(16);
 		expect((await fs.stat(path.join(dir, "sdk", "sessions", "index.jsonl"))).size).toBeLessThan(4 * 1024 * 1024);
-		expect(JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"))).toMatchObject({
+		expect(
+			JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8")),
+		).toMatchObject({
 			indexSeq: expect.any(Number),
 		});
 	});

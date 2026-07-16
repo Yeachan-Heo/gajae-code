@@ -14,7 +14,6 @@ const DELIVERY_PREVIEW_TAIL_BYTES = 32 * 1024;
 const DELIVERY_MAX_ATTEMPTS = 3;
 const MAX_DEAD_LETTERED_DELIVERIES = 50;
 
-
 export interface AsyncJob {
 	id: string;
 	type: "bash" | "task";
@@ -214,7 +213,6 @@ interface DeadLetteredDelivery {
 	attempt: number;
 	lastError?: string;
 }
-
 
 export interface AsyncJobDeliveryState {
 	queued: number;
@@ -1350,8 +1348,8 @@ export class AsyncJobManager {
 		const ownerId = filter?.ownerId;
 		const deadLettered = ownerId
 			? Array.from(this.#deadLetteredDeliveries.keys()).filter(
-				jobId => this.#deadLetteredDeliveryOwners.get(jobId) === ownerId,
-			).length
+					jobId => this.#deadLetteredDeliveryOwners.get(jobId) === ownerId,
+				).length
 			: this.#deadLetteredDeliveries.size;
 		const nextRetryAt = deliveries.reduce<number | undefined>((next, delivery) => {
 			if (next === undefined) return delivery.nextAttemptAt;
@@ -1744,7 +1742,6 @@ export class AsyncJobManager {
 			this.#deadLetteredDeliveryOwners.delete(oldestJobId);
 		}
 	}
-
 
 	#enqueueDelivery(jobId: string, text: string): void {
 		// Skip delivery if already acknowledged

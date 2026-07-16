@@ -213,9 +213,13 @@ export class SessionIndex {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 		const tmp = `${file}.${process.pid}.tmp`;
-		await fs.writeFile(tmp, JSON.stringify({ version: SDK_STATE_VERSION, indexSeq: this.indexSeq, events: this.#events }), {
-			mode: 0o600,
-		});
+		await fs.writeFile(
+			tmp,
+			JSON.stringify({ version: SDK_STATE_VERSION, indexSeq: this.indexSeq, events: this.#events }),
+			{
+				mode: 0o600,
+			},
+		);
 		const h = await fs.open(tmp, "r");
 		try {
 			await h.sync();

@@ -10,7 +10,6 @@ import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gaja
 import { runFixtureReport } from "./cli/fixture-report";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 
-
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
 		formatBunRuntimeError({

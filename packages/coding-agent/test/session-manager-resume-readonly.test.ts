@@ -150,7 +150,6 @@ class ReplaceAfterSnapshotStorage extends FileSessionStorage {
 	}
 }
 class ReplaceDuringFinalAuthorityInspectionStorage extends FileSessionStorage {
-
 	constructor(
 		private readonly replacementPath: string,
 		private readonly sourcePath: string,

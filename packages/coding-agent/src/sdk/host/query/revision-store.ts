@@ -1084,7 +1084,6 @@ function isPlainJsonString(value: unknown): value is string {
 	return typeof value === "string" && !/["\\\u0000-\u001f\ud800-\udfff]/.test(value);
 }
 
-
 /** Finds the furthest UTF-16 boundary whose UTF-8 encoding fits in maxBytes. */
 function utf8ChunkEnd(text: string, start: number, maxBytes: number): number {
 	let low = start;
