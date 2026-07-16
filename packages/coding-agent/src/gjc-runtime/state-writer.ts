@@ -22,7 +22,7 @@ import {
 	modeStatePath as layoutModeStatePath,
 	transactionJournalPath as layoutTransactionJournalPath,
 } from "./session-layout";
-import { RequiredOnWriteEnvelopeSchema, SkillActiveStateSchema } from "./state-schema";
+import { CanonicalActiveSnapshotSchema, RequiredOnWriteEnvelopeSchema } from "./state-schema";
 
 /**
  * Sole sanctioned project `.gjc/**` writer module (gate G1).
@@ -461,36 +461,48 @@ async function establishReceiptActiveSnapshot(
 	if (!isPlainObject(value) || !Object.hasOwn(value, "receipt") || !isCanonicalWorkflowModeStatePath(filePath)) return;
 
 	const receipt = assertWorkflowEnvelopeReceiptBinding(value, filePath, options);
-	const existing = await readExistingStateForMutation(receipt.snapshotPath);
-	if (existing.kind === "corrupt") {
-		throw new Error(`canonical active snapshot is corrupt: ${receipt.snapshotPath}: ${existing.error}`);
-	}
-	if (existing.kind === "valid") {
-		const parsed = SkillActiveStateSchema.safeParse(existing.value);
-		if (!parsed.success) {
-			throw new Error(`canonical active snapshot is malformed: ${receipt.snapshotPath}`);
-		}
-		const snapshot = await fs.stat(receipt.snapshotPath);
-		if (!snapshot.isFile()) {
-			throw new Error(`canonical active snapshot is not a file: ${receipt.snapshotPath}`);
-		}
-		return;
-	}
+	await lockResolvedWorkflowTarget(
+		receipt.snapshotPath,
+		async () => {
+			let snapshotExists = false;
+			try {
+				const snapshot = await fs.lstat(receipt.snapshotPath);
+				if (!snapshot.isFile() || snapshot.isSymbolicLink()) {
+					throw new Error(`canonical active snapshot is not a regular file: ${receipt.snapshotPath}`);
+				}
+				snapshotExists = true;
+			} catch (error) {
+				if (!isErrno(error, "ENOENT")) throw error;
+			}
 
-	// Only an ENOENT snapshot may be initialized. In particular, do not let the
-	// guarded cache writer's tolerant revision read replace corrupt state.
-	await rebuildActiveSnapshot(
-		receipt.cwd,
-		{ sessionId: receipt.sessionId },
-		{
-			cwd: receipt.cwd,
-			lock: options?.lock,
+			if (snapshotExists) {
+				const existing = await readExistingStateForMutation(receipt.snapshotPath);
+				if (existing.kind === "corrupt") {
+					throw new Error(`canonical active snapshot is corrupt: ${receipt.snapshotPath}: ${existing.error}`);
+				}
+				if (existing.kind !== "valid") {
+					throw new Error(`canonical active snapshot disappeared during validation: ${receipt.snapshotPath}`);
+				}
+				const parsed = CanonicalActiveSnapshotSchema.safeParse(existing.value);
+				if (!parsed.success) {
+					throw new Error(`canonical active snapshot is malformed: ${receipt.snapshotPath}`);
+				}
+				return;
+			}
+
+			// Only a genuinely absent entry may be initialized. `lstat` above deliberately
+			// distinguishes dangling links and every other non-regular directory entry from
+			// ENOENT, so no existing filesystem object is replaced by this derived cache write.
+			const entries = await readActiveEntries(receipt.cwd, { sessionId: receipt.sessionId });
+			const sourceRevision = Math.max(1, ...entries.map(entry => persistedSourceRevision(entry)));
+			await atomicWrite(
+				receipt.snapshotPath,
+				jsonText(stampStateRevision(buildActiveSnapshot(entries), 1, sourceRevision)),
+			);
+			invalidateActiveStateCacheForScope(receipt.cwd, { sessionId: receipt.sessionId });
 		},
+		options?.lock,
 	);
-	const snapshot = await fs.stat(receipt.snapshotPath);
-	if (!snapshot.isFile()) {
-		throw new Error(`canonical active snapshot is not a file: ${receipt.snapshotPath}`);
-	}
 }
 
 function safeString(value: unknown): string {
@@ -901,14 +913,11 @@ async function recordInvalidWorkflowTransition(args: {
 	}
 }
 
-export async function writeWorkflowEnvelopeAtomic(
-	targetPath: string,
-	value: unknown,
-	options?: StateWriterOptions,
-): Promise<string> {
-	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const withReceipt = withWorkflowReceipt(value, buildReceipt(options));
-	const stamped = stampWorkflowEnvelopeChecksum(withReceipt, filePath);
+async function assertWorkflowEnvelopeTransition(
+	stamped: unknown,
+	filePath: string,
+	options: StateWriterOptions | undefined,
+): Promise<void> {
 	const parsed = RequiredOnWriteEnvelopeSchema.safeParse(stamped);
 	if (!parsed.success) {
 		throw new Error(
@@ -917,54 +926,94 @@ export async function writeWorkflowEnvelopeAtomic(
 				.join("; ")}`,
 		);
 	}
-	// #658: internal runtime writers (ralplan/ultragoal/deep-interview/team) persist
-	// envelopes directly, bypassing the `gjc state` CLI transition gate (`isValidTransition`,
-	// historically the sole call site in state-runtime.ts). Re-assert that gate on every
-	// sanctioned envelope write so internal writes cannot persist invalid state-machine phase
-	// transitions silently. Forced writes (`gjc state ... --force`, reconcile repairs) carry
-	// `audit.forced` and bypass, mirroring the CLI's `use --force to bypass`.
-	//
-	// The gate governs ACTIVE workflow progression only. Deactivation/teardown writes
-	// (`active: false`, e.g. `gjc state clear`, which persists the universal `complete`
-	// sentinel that is not a per-skill manifest state) leave the transition graph and are
-	// intentionally exempt.
-	if (options?.audit?.forced !== true && parsed.data.active === true) {
-		const toPhase = parsed.data.current_phase.trim();
-		if (toPhase) {
-			// Lazy import: workflow-manifest dereferences CANONICAL_GJC_WORKFLOW_SKILLS at
-			// module load, and active-state -> state-writer -> workflow-manifest -> active-state
-			// is a load-time cycle. Importing at call time (after init) avoids the TDZ.
-			const { isKnownWorkflowState, isValidTransition } = await import("./workflow-manifest");
-			const skill = parsed.data.skill;
-			// Structural invariant (hard): a `current_phase` absent from the skill's manifest is
-			// never a legitimate internal write, matching the CLI/reconcile unknown-phase gate.
-			if (!isKnownWorkflowState(skill, toPhase)) {
-				throw new Error(
-					`Refusing to write unknown ${skill} phase "${toPhase}" to ${filePath}: not a known ${skill} manifest state (forced writes bypass via audit.forced)`,
-				);
-			}
-			// Transition invariant (#658, diagnostic-only safety net): resolve the prior phase
-			// (caller-supplied `audit.fromPhase`, else the active persisted envelope on disk) and
-			// flag edges the manifest does not define. Intentionally NON-blocking and audit-only
-			// — the CLI path already hard-fails invalid edges before reaching here, and legitimate
-			// internal repairs / ralplan short-mode stage skips move between valid states without a
-			// direct manifest edge. It records an `invalid_transition_detected` audit entry (no
-			// stderr) so such transitions are non-silent without breaking those flows.
-			const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
-			if (
-				fromPhase &&
-				fromPhase !== toPhase &&
-				isKnownWorkflowState(skill, fromPhase) &&
-				!isValidTransition(skill, fromPhase, toPhase)
-			) {
-				await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
-			}
-		}
+	if (options?.audit?.forced === true || parsed.data.active !== true) return;
+
+	const toPhase = parsed.data.current_phase.trim();
+	if (!toPhase) return;
+	// Lazy import avoids the active-state -> state-writer -> workflow-manifest
+	// load-time cycle.
+	const { isKnownWorkflowState, isValidTransition } = await import("./workflow-manifest");
+	const skill = parsed.data.skill;
+	if (!isKnownWorkflowState(skill, toPhase)) {
+		throw new Error(
+			`Refusing to write unknown ${skill} phase "${toPhase}" to ${filePath}: not a known ${skill} manifest state (forced writes bypass via audit.forced)`,
+		);
 	}
+	const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
+	if (
+		fromPhase &&
+		fromPhase !== toPhase &&
+		isKnownWorkflowState(skill, fromPhase) &&
+		!isValidTransition(skill, fromPhase, toPhase)
+	) {
+		await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
+	}
+}
+
+async function writeWorkflowEnvelopeAtomicLocked(
+	filePath: string,
+	value: unknown,
+	options: StateWriterOptions | undefined,
+): Promise<string> {
+	const existing = await readExistingStateForMutation(filePath);
+	if (existing.kind === "corrupt") {
+		throw new Error(`Refusing to overwrite corrupt workflow state envelope at ${filePath}: ${existing.error}`);
+	}
+	const stamped = stampWorkflowEnvelopeRevisionAndChecksum(
+		value,
+		filePath,
+		(existing.kind === "valid" ? persistedStateRevision(existing.value) : 0) + 1,
+		undefined,
+		options,
+	);
+	await assertWorkflowEnvelopeTransition(stamped, filePath, options);
 	await establishReceiptActiveSnapshot(stamped, filePath, options);
 	await atomicWrite(filePath, jsonText(stamped));
 	await maybeAudit(filePath, options);
 	return filePath;
+}
+
+/**
+ * Publish a complete canonical workflow envelope under its target lock. Each
+ * publication receives a monotonically increasing revision and checksum; use
+ * `updateWorkflowEnvelopeAtomic` for read-modify-write changes.
+ */
+export async function writeWorkflowEnvelopeAtomic(
+	targetPath: string,
+	value: unknown,
+	options?: StateWriterOptions,
+): Promise<string> {
+	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	return lockResolvedWorkflowTarget(
+		filePath,
+		() => writeWorkflowEnvelopeAtomicLocked(filePath, value, options),
+		options?.lock,
+	);
+}
+
+/**
+ * Lock-owned canonical envelope read-modify-write. The mutator observes the
+ * latest valid envelope, so independent field updates cannot overwrite each
+ * other; publication still applies receipt, revision, and checksum stamping.
+ */
+export async function updateWorkflowEnvelopeAtomic<T extends Record<string, unknown> = Record<string, unknown>>(
+	targetPath: string,
+	mutator: (current: T | undefined) => T | Promise<T>,
+	options?: StateWriterOptions,
+): Promise<string> {
+	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const existing = await readExistingStateForMutation(filePath);
+			if (existing.kind === "corrupt") {
+				throw new Error(`Refusing to overwrite corrupt workflow state envelope at ${filePath}: ${existing.error}`);
+			}
+			const next = await mutator(existing.kind === "valid" ? (existing.value as T) : undefined);
+			return writeWorkflowEnvelopeAtomicLocked(filePath, next, options);
+		},
+		options?.lock,
+	);
 }
 
 export async function writeTextAtomic(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {

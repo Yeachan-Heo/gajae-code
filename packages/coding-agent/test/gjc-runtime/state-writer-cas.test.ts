@@ -2,11 +2,14 @@ import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { activeSnapshotPath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
+	detectWorkflowEnvelopeIntegrityMismatch,
 	updateJsonAtomic,
+	updateWorkflowEnvelopeAtomic,
 	withWorkflowStateLock,
 	writeGuardedWorkflowEnvelopeAtomic,
+	writeWorkflowEnvelopeAtomic,
 } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "@gajae-code/coding-agent/skill-state/workflow-state-contract";
 
@@ -28,6 +31,27 @@ async function readJson(filePath: string): Promise<Record<string, unknown>> {
 
 function sleep(ms: number): Promise<void> {
 	return new Promise(resolve => setTimeout(resolve, ms));
+}
+function workflowEnvelope(marker: string, updatedAt = "2026-01-01T00:00:00.000Z"): Record<string, unknown> {
+	return {
+		skill: "ralplan",
+		version: WORKFLOW_STATE_VERSION,
+		active: true,
+		current_phase: "planner",
+		updated_at: updatedAt,
+		marker,
+	};
+}
+
+function workflowReceipt(cwd: string, mutationId: string) {
+	return {
+		cwd,
+		skill: "ralplan" as const,
+		owner: "gjc-state-cli" as const,
+		command: "state-writer hardening test",
+		sessionId: "test-session",
+		mutationId,
+	};
 }
 
 describe("state-writer concurrency (issue #646)", () => {
@@ -148,5 +172,83 @@ describe("state-writer concurrency (issue #646)", () => {
 		const final = await readJson(filePath);
 		expect(final.marker).toBe("second");
 		expect(final.state_revision).toBe(2);
+	});
+	it.each([
+		["dangling symlink", async (snapshotPath: string) => fs.symlink("missing-snapshot.json", snapshotPath)],
+		[
+			"symlink to file",
+			async (snapshotPath: string) => {
+				const target = `${snapshotPath}.target`;
+				await fs.writeFile(target, "sentinel", "utf-8");
+				await fs.symlink(target, snapshotPath);
+			},
+		],
+	])("refuses to initialize an active snapshot through a %s", async (_label, createSnapshot) => {
+		const root = await tempDir();
+		const statePath = path.join(sessionStateDir(root, "test-session"), "ralplan-state.json");
+		const snapshotPath = activeSnapshotPath(root, "test-session");
+		await fs.mkdir(path.dirname(snapshotPath), { recursive: true });
+		await createSnapshot(snapshotPath);
+		const before = await fs.lstat(snapshotPath);
+
+		await expect(
+			writeWorkflowEnvelopeAtomic(path.relative(root, statePath), workflowEnvelope("symlink"), {
+				cwd: root,
+				receipt: workflowReceipt(root, "symlink"),
+			}),
+		).rejects.toThrow("not a regular file");
+
+		const after = await fs.lstat(snapshotPath);
+		expect(after.isSymbolicLink()).toBe(true);
+		expect(after.ino).toBe(before.ino);
+	});
+
+	it.each([
+		{},
+		{ version: 1, active: false, skill: "", phase: "", active_skills: [], active_subskills: [] },
+	])("refuses to publish over a malformed canonical active snapshot", async snapshot => {
+		const root = await tempDir();
+		const statePath = path.join(sessionStateDir(root, "test-session"), "ralplan-state.json");
+		const snapshotPath = activeSnapshotPath(root, "test-session");
+		await fs.mkdir(path.dirname(snapshotPath), { recursive: true });
+		const before = `${JSON.stringify(snapshot)}\n`;
+		await fs.writeFile(snapshotPath, before, "utf-8");
+
+		await expect(
+			writeWorkflowEnvelopeAtomic(path.relative(root, statePath), workflowEnvelope("malformed"), {
+				cwd: root,
+				receipt: workflowReceipt(root, "malformed"),
+			}),
+		).rejects.toThrow("canonical active snapshot is malformed");
+		expect(await fs.readFile(snapshotPath, "utf-8")).toBe(before);
+	});
+
+	it("serializes direct canonical envelope updates without losing fields or receipt integrity", async () => {
+		const root = await tempDir();
+		const statePath = path.join(sessionStateDir(root, "test-session"), "ralplan-state.json");
+		const target = path.relative(root, statePath);
+		const fields = Array.from({ length: 12 }, (_, index) => `field_${index}`);
+
+		await Promise.all(
+			fields.map(field =>
+				updateWorkflowEnvelopeAtomic(
+					target,
+					async current => {
+						await sleep(2);
+						return {
+							...(current ?? workflowEnvelope("initial")),
+							[field]: true,
+							updated_at: "2026-01-01T00:00:01.000Z",
+						};
+					},
+					{ cwd: root, receipt: workflowReceipt(root, `direct-${field}`) },
+				),
+			),
+		);
+
+		const final = await readJson(statePath);
+		for (const field of fields) expect(final[field]).toBe(true);
+		expect(final.state_revision).toBe(fields.length);
+		expect(await detectWorkflowEnvelopeIntegrityMismatch(statePath)).toBeUndefined();
 	});
 });

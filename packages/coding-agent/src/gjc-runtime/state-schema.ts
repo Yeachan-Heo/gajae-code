@@ -133,6 +133,82 @@ export const SkillActiveEntrySchema = z
 		receipt: WorkflowStateReceiptSchema.optional(),
 	})
 	.passthrough();
+const ActiveSubskillEntrySchema = z
+	.object({
+		plugin: z.string(),
+		subskillName: z.string(),
+		parent: z.string(),
+		bindsTo: z.string(),
+		phase: z.string(),
+		activationArg: z.string(),
+		filePath: z.string(),
+		toolPaths: z.array(z.string()),
+	})
+	.passthrough();
+
+const WorkflowHudChipSchema = z
+	.object({
+		label: z.string(),
+		value: z.string().optional(),
+		priority: z.number().optional(),
+		severity: z.enum(["info", "warning", "blocked", "error", "success"]).optional(),
+	})
+	.passthrough();
+
+const WorkflowHudSummarySchema = z
+	.object({
+		version: z.literal(1),
+		summary: z.string().optional(),
+		chips: z.array(WorkflowHudChipSchema).optional(),
+		details: z.array(WorkflowHudChipSchema).optional(),
+		severity: z.enum(["info", "warning", "blocked", "error", "success"]).optional(),
+		updated_at: z.string().optional(),
+	})
+	.passthrough();
+
+const CanonicalSkillActiveEntrySchema = z
+	.object({
+		skill: z.string(),
+		phase: z.string().optional(),
+		active: z.boolean().optional(),
+		activated_at: z.string().optional(),
+		updated_at: z.string().optional(),
+		session_id: z.string().optional(),
+		thread_id: z.string().optional(),
+		turn_id: z.string().optional(),
+		hud: WorkflowHudSummarySchema.optional(),
+		stale: z.boolean().optional(),
+		receipt: WorkflowStateReceiptSchema.optional(),
+		handoff_from: z.string().optional(),
+		handoff_to: z.string().optional(),
+		handoff_at: z.string().optional(),
+		active_subskills: z.array(ActiveSubskillEntrySchema).optional(),
+		source_state_revision: z.number().optional(),
+		state_revision: z.number().optional(),
+	})
+	.passthrough();
+
+/**
+ * Strict write-side schema for the derived canonical active snapshot. Read
+ * consumers intentionally retain the lenient `SkillActiveStateSchema`; writers
+ * must not mistake a partial or malformed snapshot for an initialized cache.
+ */
+export const CanonicalActiveSnapshotSchema = z
+	.object({
+		version: z.literal(1),
+		active: z.boolean(),
+		skill: z.string(),
+		phase: z.string(),
+		updated_at: z.string(),
+		session_id: z.string().optional(),
+		thread_id: z.string().optional(),
+		turn_id: z.string().optional(),
+		active_skills: z.array(CanonicalSkillActiveEntrySchema),
+		active_subskills: z.array(ActiveSubskillEntrySchema),
+		source_state_revision: z.number().optional(),
+		state_revision: z.number().optional(),
+	})
+	.strict();
 
 export const SkillActiveStateSchema = z
 	.object({
@@ -155,6 +231,7 @@ export type WorkflowStateEnvelope = z.infer<typeof WorkflowStateEnvelopeSchema>;
 export type RequiredOnWriteEnvelope = z.infer<typeof RequiredOnWriteEnvelopeSchema>;
 export type ModeStateParsed = z.infer<typeof ModeStateSchema>;
 export type SkillActiveStateParsed = z.infer<typeof SkillActiveStateSchema>;
+export type CanonicalActiveSnapshot = z.infer<typeof CanonicalActiveSnapshotSchema>;
 
 /**
  * Validated read result.
