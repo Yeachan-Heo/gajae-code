@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+- Native POSIX path-identity builds now use the current `libc::stat` nanosecond fields on Apple and BSD targets, restoring macOS workspace builds.
+- Closed owner-only path-security and session-writer TOCTOU gaps by opening, applying, verifying, and writing through retained descriptors rooted at an identity-bound lexical storage anchor; POSIX symlinks and Windows reparse points remain fail-closed.
+
 ## [0.11.0] - 2026-07-15
 
 ### Fixed

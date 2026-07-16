@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-
+import * as native from "../native/index.js";
 import {
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
@@ -15,6 +16,38 @@ import {
 } from "../native/index.js";
 
 const temporaryDirectories: string[] = [];
+type NativeOwnerOnlyWriteDescriptorResult = { ok: true; fd: number } | { ok: false; code: string; fd?: undefined };
+type NativeOwnerOnlyWriteDescriptorApi = {
+	openOwnerOnlyFileForWrite(
+		anchorPath: string,
+		anchorDev: bigint,
+		anchorIno: bigint,
+		fileName: string,
+		append: boolean,
+	): NativeOwnerOnlyWriteDescriptorResult;
+};
+
+function openOwnerOnlyFileForWrite(
+	anchorPath: string,
+	anchorDev: bigint,
+	anchorIno: bigint,
+	fileName: string,
+	append: boolean,
+): NativeOwnerOnlyWriteDescriptorResult {
+	return (native as unknown as NativeOwnerOnlyWriteDescriptorApi).openOwnerOnlyFileForWrite(
+		anchorPath,
+		anchorDev,
+		anchorIno,
+		fileName,
+		append,
+	);
+}
+async function temporaryDirectory(): Promise<string> {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+	const canonical = await fs.realpath(directory);
+	temporaryDirectories.push(canonical);
+	return canonical;
+}
 
 function sha256(contents: string): string {
 	return createHash("sha256").update(contents).digest("hex");
@@ -38,18 +71,19 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("POSIX native path identity", () => {
-	it("rejects an existing directory whose canonical byte path is not UTF-8", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-		temporaryDirectories.push(root);
-		const nonUtf8Path = Buffer.concat([Buffer.from(`${root}${path.sep}`), Buffer.from([0x66, 0x80])]);
-		await fs.mkdir(nonUtf8Path);
+	it.skipIf(process.platform === "darwin")(
+		"rejects an existing directory whose canonical byte path is not UTF-8",
+		async () => {
+			const root = await temporaryDirectory();
+			const nonUtf8Path = Buffer.concat([Buffer.from(`${root}${path.sep}`), Buffer.from([0x66, 0x80])]);
+			await fs.mkdir(nonUtf8Path);
 
-		expect(canonicalExistingDirectoryIdentity(nonUtf8Path)).toEqual({ ok: false, code: "not_utf8" });
-	});
+			expect(canonicalExistingDirectoryIdentity(nonUtf8Path)).toEqual({ ok: false, code: "not_utf8" });
+		},
+	);
 
 	it("classifies group-readable files as failing owner-only verification", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-		temporaryDirectories.push(root);
+		const root = await temporaryDirectory();
 		const file = path.join(root, "state.json");
 		await fs.writeFile(file, "{}", { mode: 0o644 });
 		await fs.chmod(file, 0o640);
@@ -58,8 +92,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	});
 
 	it("applies and verifies exact owner-only modes without changing regular-file bytes", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-		temporaryDirectories.push(root);
+		const root = await temporaryDirectory();
 		const directory = path.join(root, "managed");
 		const file = path.join(directory, "state.json");
 		const contents = '{"preserve":"payload"}';
@@ -74,10 +107,83 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
 	});
+	it("repairs a broad existing file and retains its exact write descriptor after pathname replacement", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "state.jsonl");
+		const retained = path.join(root, "state-retained.jsonl");
+		await fs.writeFile(file, "authorized", { mode: 0o644 });
+		await fs.chmod(file, 0o644);
+		const anchor = canonicalExistingDirectoryIdentity(root);
+		if (!anchor.ok) throw new Error("missing canonical storage anchor");
+		const anchorStat = await fs.lstat(anchor.canonicalPath, { bigint: true });
+		const opened = openOwnerOnlyFileForWrite(
+			anchor.canonicalPath,
+			anchorStat.dev,
+			anchorStat.ino,
+			path.basename(file),
+			true,
+		);
+		if (!opened.ok) throw new Error(`secure open rejected: ${opened.code}`);
+		try {
+			await fs.rename(file, retained);
+			await fs.writeFile(file, "replacement");
+			nodeFs.writeSync(opened.fd, "-written");
+		} finally {
+			nodeFs.closeSync(opened.fd);
+		}
+		expect(await fs.readFile(retained, "utf8")).toBe("authorized-written");
+		expect((await fs.stat(retained)).mode & 0o777).toBe(0o600);
+		expect(await fs.readFile(file, "utf8")).toBe("replacement");
+	});
+
+	it("rejects a storage-anchor replacement before opening a write descriptor", async () => {
+		const root = await temporaryDirectory();
+		const retained = `${root}-retained`;
+		const anchor = canonicalExistingDirectoryIdentity(root);
+		if (!anchor.ok) throw new Error("missing canonical storage anchor");
+		const anchorStat = await fs.lstat(anchor.canonicalPath, { bigint: true });
+		await fs.rename(root, retained);
+		temporaryDirectories.push(retained);
+		await fs.mkdir(root);
+		const replacement = path.join(root, "state.jsonl");
+		await fs.writeFile(replacement, "replacement");
+		expect(
+			openOwnerOnlyFileForWrite(anchor.canonicalPath, anchorStat.dev, anchorStat.ino, "state.jsonl", true),
+		).toEqual({ ok: false, code: "identity_mismatch" });
+		expect(await fs.readFile(replacement, "utf8")).toBe("replacement");
+		expect(
+			await fs.stat(path.join(retained, "state.jsonl")).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+	});
+	it("rejects symlinked storage anchors and final write targets", async () => {
+		const root = await temporaryDirectory();
+		const anchorStat = await fs.lstat(root, { bigint: true });
+		const target = path.join(root, "target.jsonl");
+		const alias = path.join(root, "state.jsonl");
+		await fs.writeFile(target, "unchanged");
+		await fs.symlink(target, alias);
+
+		expect(openOwnerOnlyFileForWrite(root, anchorStat.dev, anchorStat.ino, "state.jsonl", true)).toEqual({
+			ok: false,
+			code: "reparse_point",
+		});
+		expect(await fs.readFile(target, "utf8")).toBe("unchanged");
+
+		const external = await temporaryDirectory();
+		const anchorAlias = path.join(root, "anchor-alias");
+		await fs.symlink(external, anchorAlias);
+		const externalStat = await fs.lstat(external, { bigint: true });
+		expect(openOwnerOnlyFileForWrite(anchorAlias, externalStat.dev, externalStat.ino, "state.jsonl", true)).toEqual({
+			ok: false,
+			code: "reparse_point",
+		});
+	});
 
 	it.skipIf(process.platform !== "darwin")("uses native ACL APIs for owner-only access", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-		temporaryDirectories.push(root);
+		const root = await temporaryDirectory();
 		const file = path.join(root, "state.json");
 		await fs.writeFile(file, "{}", { mode: 0o644 });
 
@@ -86,8 +192,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	});
 
 	it("rejects an unauthorized exact-unlink identity without deleting a replacement", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-		temporaryDirectories.push(root);
+		const root = await temporaryDirectory();
 		const file = path.join(root, "replacement.jsonl");
 		await fs.writeFile(file, "replacement");
 		const stat = await fs.stat(file, { bigint: true });
@@ -105,8 +210,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	});
 
 	it("retains a same-object content mutation when its authorized digest is stale", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-		temporaryDirectories.push(root);
+		const root = await temporaryDirectory();
 		const file = path.join(root, "state.jsonl");
 		await fs.writeFile(file, "original");
 		const authorizedDigest = sha256("original");
@@ -128,8 +232,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"detaches an identity-bound directory to the preauthorized durable destination",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const directory = path.join(root, "artifact");
 			const child = path.join(directory, "state.json");
 			const quarantineName = ".gjc-delete-preauthorized";
@@ -158,8 +261,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"keeps the detached authority when post-detach full-file digest verification succeeds",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const original = path.join(root, "state.jsonl");
 			const detached = path.join(root, ".gjc-delete-state");
 			const contents = "x".repeat(128 * 1024);
@@ -184,8 +286,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"refuses a preauthorized quarantine collision without replacing either directory",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const directory = path.join(root, "artifact");
 			const quarantine = path.join(root, ".gjc-delete-preauthorized");
 			await fs.mkdir(directory);
@@ -210,8 +311,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"restores a detached regular file only when its full identity remains authorized",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const original = path.join(root, "state.jsonl");
 			const detached = path.join(root, ".gjc-delete-state");
 			await fs.writeFile(original, "authorized");
@@ -235,8 +335,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"refuses exact restore collisions without clobbering the retained detached file",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const original = path.join(root, "state.jsonl");
 			const detached = path.join(root, ".gjc-delete-state");
 			await fs.writeFile(original, "authorized");
@@ -262,8 +361,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"refuses restoring a detached regular-file replacement with a stale digest",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const original = path.join(root, "state.jsonl");
 			const detached = path.join(root, ".gjc-delete-state");
 			await fs.writeFile(original, "authorized");
@@ -292,8 +390,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	);
 
 	it("rejects an ancestor replaced by a symlink after authorization", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-		temporaryDirectories.push(root);
+		const root = await temporaryDirectory();
 		const parent = path.join(root, "managed");
 		const target = path.join(root, "target");
 		const file = path.join(parent, "state.jsonl");
@@ -317,8 +414,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	});
 
 	it("rejects final and ancestor symlinks without changing their targets", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-		temporaryDirectories.push(root);
+		const root = await temporaryDirectory();
 		const target = path.join(root, "target");
 		const alias = path.join(root, "alias");
 		const state = path.join(target, "state.json");
@@ -344,12 +440,37 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		expect(applyOwnerOnlyPathSecurity(stateAlias, "file")).toEqual({ ok: false, code: "reparse_point" });
 		expect((await fs.stat(target)).mode & 0o777).toBe(0o755);
 		expect((await fs.stat(state)).mode & 0o777).toBe(0o644);
+		expect(await fs.readFile(state, "utf8")).toBe("{}");
 	});
+	it.skipIf(process.platform !== "darwin")(
+		"rejects lexical /tmp and /var aliases while canonical temporary roots remain usable",
+		async () => {
+			const roots = ["/tmp", os.tmpdir()];
+			for (const lexicalRoot of roots) {
+				const canonicalRoot = await fs.realpath(lexicalRoot);
+				const root = await fs.mkdtemp(path.join(canonicalRoot, "pi-path-identity-alias-"));
+				temporaryDirectories.push(root);
+				const file = path.join(root, "state.json");
+				await fs.writeFile(file, "unchanged", { mode: 0o644 });
+				await fs.chmod(file, 0o644);
+				const lexicalFile = path.join(lexicalRoot, path.relative(canonicalRoot, file));
+				expect(verifyOwnerOnlyPathSecurity(lexicalFile, "file")).toEqual({
+					ok: false,
+					code: "reparse_point",
+				});
+				expect(applyOwnerOnlyPathSecurity(lexicalFile, "file")).toEqual({
+					ok: false,
+					code: "reparse_point",
+				});
+				expect(await fs.readFile(file, "utf8")).toBe("unchanged");
+				expect((await fs.stat(file)).mode & 0o777).toBe(0o644);
+			}
+		},
+	);
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"retains the caller-planned root after a tree snapshot failure",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const detached = path.join(root, ".gjc-delete-planned");
 			const originalFile = path.join(detached, "nested", "state.json");
 			const preservedFile = path.join(detached, "nested", "authorized-before-swap.json");
@@ -386,8 +507,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"validates all nested siblings before quarantining an earlier sibling",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const detached = path.join(root, ".gjc-delete-planned");
 			const earlier = path.join(detached, "a-earlier.jsonl");
 			const later = path.join(detached, "nested", "z-later.jsonl");
@@ -414,8 +534,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"replays a prior child-removal prefix against the original durable snapshot",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const detached = path.join(root, ".gjc-delete-planned");
 			const nested = path.join(detached, "nested");
 			const first = path.join(nested, "a-first.jsonl");
@@ -441,8 +560,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"rejects a child that collides with a persisted quarantine hash",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const detached = path.join(root, ".gjc-delete-planned");
 			const child = path.join(detached, "state.jsonl");
 			await fs.mkdir(detached);
@@ -466,8 +584,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"replays a near-NAME_MAX child through its bounded deterministic quarantine name",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const detached = path.join(root, ".gjc-delete-planned");
 			const childName = "x".repeat(255);
 			const child = path.join(detached, childName);
@@ -487,11 +604,10 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 	it.skipIf(process.platform !== "darwin")(
 		"detects and repairs an adversarial extended ACL without changing bytes",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-			temporaryDirectories.push(root);
+			const root = await temporaryDirectory();
 			const file = path.join(root, "state.json");
 			await fs.writeFile(file, '{"preserve":true}', { mode: 0o600 });
-			const acl = Bun.spawnSync(["chmod", "+a", "everyone deny read", file]);
+			const acl = Bun.spawnSync(["chmod", "+a", "everyone allow read", file]);
 			if (acl.exitCode !== 0) throw new Error("failed to install Darwin ACL fixture");
 			expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
 			expect(applyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });

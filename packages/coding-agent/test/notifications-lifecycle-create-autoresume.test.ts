@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 test("normal root launch creates a current SessionManager for root token logs", async () => {
-	const agentDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-root-token-session-"));
+	const agentDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-root-token-session-")));
 	setAgentDir(agentDir);
 	const cwd = path.join(agentDir, "repo");
 	fs.mkdirSync(cwd, { recursive: true });
@@ -39,7 +39,7 @@ test("normal root launch creates a current SessionManager for root token logs", 
 // session (which would diverge the daemon/tmux id from the header id); it must
 // create a fresh session that adopts the pre-allocated id.
 test("lifecycle /session_create bypasses autoResume; normal launch still resumes", async () => {
-	const agentDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-lc-autoresume-"));
+	const agentDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-lc-autoresume-")));
 	setAgentDir(agentDir);
 	const cwd = path.join(agentDir, "repo");
 	fs.mkdirSync(cwd, { recursive: true });

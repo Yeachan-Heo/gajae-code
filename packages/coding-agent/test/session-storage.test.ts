@@ -22,7 +22,7 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 	let storage: { deleteSessionWithArtifacts(sessionPath: string): Promise<void> };
 
 	beforeEach(async () => {
-		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-session-storage-"));
+		tempDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-session-storage-")));
 		const { FileSessionStorage } = await import("../src/session/session-storage");
 		storage = new FileSessionStorage();
 	});
@@ -73,7 +73,7 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 	let storage: FileSessionStorage;
 
 	beforeEach(async () => {
-		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-writer-close-"));
+		tempDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-writer-close-")));
 		storage = new FileSessionStorage();
 	});
 
@@ -187,7 +187,7 @@ describe("FileSessionStorageWriter path security", () => {
 	let storage: FileSessionStorage;
 
 	beforeEach(async () => {
-		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-writer-security-"));
+		tempDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-writer-security-")));
 		storage = new FileSessionStorage();
 	});
 
@@ -226,7 +226,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 	let storage: FileSessionStorage;
 
 	beforeEach(async () => {
-		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-verified-delete-"));
+		tempDir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-verified-delete-")));
 		storage = new FileSessionStorage();
 		const deleteSessionVerified = storage.deleteSessionVerified.bind(storage);
 		let plannedAttempt = 0;
