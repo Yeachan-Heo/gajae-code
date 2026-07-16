@@ -843,6 +843,7 @@ function renderContentPreview(
 	expanded: boolean,
 	language: string | undefined,
 	uiTheme: Theme,
+	expandHintCapability: import("./render-utils").ExpandHintCapability,
 ): string {
 	if (!content) return "";
 	const rawLines = normalizeDisplayText(content).split("\n");
@@ -861,7 +862,7 @@ function renderContentPreview(
 		text += ` ${gutter}${body}\n`;
 	}
 	if (!expanded && hidden > 0) {
-		const hint = formatExpandHint(uiTheme, expanded, hidden > 0);
+		const hint = formatExpandHint(uiTheme, expanded, hidden > 0, expandHintCapability);
 		const moreLine = `${formatMoreItems(hidden, "line")}${hint ? ` ${hint}` : ""}`;
 		text += uiTheme.fg("dim", moreLine);
 	}
@@ -921,15 +922,19 @@ export const writeToolRenderer = {
 		return {
 			render(width: number) {
 				const { expanded } = options;
-				const key = new Hasher().bool(expanded).u32(width).digest();
+				const key = new Hasher().bool(expanded).bool(options.expandHintCapability!()).u32(width).digest();
 				if (cached?.key === key) return cached.lines;
 
 				let text = header;
-				text += renderContentPreview(fileContent, expanded, lang, uiTheme);
+				text += renderContentPreview(fileContent, expanded, lang, uiTheme, options.expandHintCapability!);
 
 				if (diagnostics) {
-					const diagText = formatDiagnostics(diagnostics, expanded, uiTheme, fp =>
-						uiTheme.getLangIcon(getLanguageFromPath(fp)),
+					const diagText = formatDiagnostics(
+						diagnostics,
+						expanded,
+						uiTheme,
+						fp => uiTheme.getLangIcon(getLanguageFromPath(fp)),
+						options.expandHintCapability!,
 					);
 					if (diagText.trim()) {
 						const diagLines = diagText.split("\n");

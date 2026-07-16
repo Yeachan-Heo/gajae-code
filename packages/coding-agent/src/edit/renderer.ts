@@ -403,6 +403,7 @@ function renderDiffSection(
 	expanded: boolean,
 	uiTheme: Theme,
 	renderDiffFn: (t: string, o?: { filePath?: string }) => string,
+	expandHintCapability: import("../tools/render-utils").ExpandHintCapability,
 ): string {
 	let text = "";
 	const diffStats = getDiffStats(diff);
@@ -426,7 +427,10 @@ function renderDiffSection(
 		const remainder: string[] = [];
 		if (hiddenHunks > 0) remainder.push(`${hiddenHunks} more hunks`);
 		if (hiddenLines > 0) remainder.push(`${hiddenLines} more lines`);
-		text += uiTheme.fg("toolOutput", `\n… (${remainder.join(", ")}) ${formatExpandHint(uiTheme)}`);
+		text += uiTheme.fg(
+			"toolOutput",
+			`\n… (${remainder.join(", ")}) ${formatExpandHint(uiTheme, false, true, expandHintCapability)}`,
+		);
 	}
 	return text;
 }
@@ -599,18 +603,36 @@ function renderSingleFileResult(
 					text += `\n\n${uiTheme.fg("error", replaceTabs(errorText, rawPath))}`;
 				}
 			} else if (details?.diff) {
-				text += renderDiffSection(details.diff, rawPath, expanded, uiTheme, renderDiffFn);
+				text += renderDiffSection(
+					details.diff,
+					rawPath,
+					expanded,
+					uiTheme,
+					renderDiffFn,
+					options.expandHintCapability!,
+				);
 			} else if (editDiffPreview) {
 				if ("error" in editDiffPreview) {
 					text += `\n\n${uiTheme.fg("error", replaceTabs(editDiffPreview.error, rawPath))}`;
 				} else if (editDiffPreview.diff) {
-					text += renderDiffSection(editDiffPreview.diff, rawPath, expanded, uiTheme, renderDiffFn);
+					text += renderDiffSection(
+						editDiffPreview.diff,
+						rawPath,
+						expanded,
+						uiTheme,
+						renderDiffFn,
+						options.expandHintCapability!,
+					);
 				}
 			}
 
 			if (details?.diagnostics) {
-				text += formatDiagnostics(details.diagnostics, expanded, uiTheme, (fp: string) =>
-					uiTheme.getLangIcon(getLanguageFromPath(fp)),
+				text += formatDiagnostics(
+					details.diagnostics,
+					expanded,
+					uiTheme,
+					(fp: string) => uiTheme.getLangIcon(getLanguageFromPath(fp)),
+					options.expandHintCapability!,
 				);
 			}
 

@@ -579,7 +579,10 @@ export const debugToolRenderer = {
 				const remaining = rawLines.length - displayedLines.length;
 				if (remaining > 0) {
 					displayedLines.push(
-						theme.fg("muted", `… ${remaining} more lines ${formatExpandHint(theme, options.expanded, true)}`),
+						theme.fg(
+							"muted",
+							`… ${remaining} more lines ${formatExpandHint(theme, options.expanded, true, (options as RenderResultOptions & { expandHintCapability: import("./render-utils").ExpandHintCapability }).expandHintCapability)}`,
+						),
 					);
 				}
 				return outputBlock.render(

@@ -43,13 +43,13 @@ export function renderMCPCall(args: Record<string, unknown>, theme: Theme, label
 /**
  * Render MCP tool result.
  */
-export function renderMCPResult(
+function renderMCPResultStatic(
 	result: { content: Array<{ type: string; text?: string }>; details?: MCPToolDetails; isError?: boolean },
 	options: RenderResultOptions,
 	theme: Theme,
 	args?: Record<string, unknown>,
 ): Component {
-	const { expanded } = options;
+	const { expanded, expandHintCapability } = options;
 	const lines: string[] = [];
 
 	// Args section (when expanded)
@@ -91,7 +91,7 @@ export function renderMCPResult(
 				}
 				// Always show expand hint when collapsed (expanded view shows longer values and deeper nesting)
 				if (!expanded) {
-					lines.push(formatExpandHint(theme, expanded, true));
+					lines.push(formatExpandHint(theme, expanded, true, expandHintCapability!));
 				} else if (tree.truncated) {
 					lines.push(theme.fg("dim", "…"));
 				}
@@ -113,11 +113,28 @@ export function renderMCPResult(
 
 	if (outputLines.length > maxOutputLines) {
 		const remaining = outputLines.length - maxOutputLines;
-		lines.push(`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, expanded, true)}`);
+		lines.push(
+			`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, expanded, true, expandHintCapability!)}`,
+		);
 	} else if (!expanded) {
 		// Show expand hint when collapsed even if all lines shown (lines may be truncated)
-		lines.push(formatExpandHint(theme, expanded, true));
+		lines.push(formatExpandHint(theme, expanded, true, expandHintCapability!));
 	}
 
 	return new Text(lines.join("\n"), 0, 0);
+}
+/**
+ * Render MCP results dynamically so focus changes are reflected without
+ * reconstructing the owning tool component.
+ */
+export function renderMCPResult(
+	result: { content: Array<{ type: string; text?: string }>; details?: MCPToolDetails; isError?: boolean },
+	options: RenderResultOptions,
+	theme: Theme,
+	args?: Record<string, unknown>,
+): Component {
+	return {
+		render: width => renderMCPResultStatic(result, options, theme, args).render(width),
+		invalidate: () => {},
+	};
 }
