@@ -3,7 +3,7 @@ import { Container, Text } from "@gajae-code/tui";
 import { InternalUrlRouter } from "../../internal-urls";
 import { getLanguageFromPath, theme } from "../../modes/theme/theme";
 import { splitPathAndSel } from "../../tools/path-utils";
-import { PREVIEW_LIMITS, shortenPath } from "../../tools/render-utils";
+import { type ExpandHintCapability, PREVIEW_LIMITS, shortenPath } from "../../tools/render-utils";
 import { renderCodeCell } from "../../tui";
 import type { ToolExecutionHandle } from "./tool-execution";
 
@@ -55,6 +55,7 @@ type ReadToolResultDetails = {
 
 type ReadToolGroupOptions = {
 	showContentPreview?: boolean;
+	expandHintCapability?: ExpandHintCapability;
 };
 
 function getSuffixResolution(details: ReadToolResultDetails | undefined): ReadToolSuffixResolution | undefined {
@@ -82,10 +83,12 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	#expanded = false;
 	#manuallyExpanded: boolean | undefined;
 	#showContentPreview: boolean;
+	#expandHintCapability?: ExpandHintCapability;
 
 	constructor(options: ReadToolGroupOptions = {}) {
 		super();
 		this.#showContentPreview = options.showContentPreview ?? false;
+		this.#expandHintCapability = options.expandHintCapability;
 		this.#text = new Text("", 0, 0);
 		this.addChild(this.#text);
 		this.#updateDisplay();
@@ -220,11 +223,13 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		const correctionSuffix = entry.correctedFrom ? ` (corrected from ${shortenPath(entry.correctedFrom)})` : "";
 		const title = filePath ? `Read ${filePath}${correctionSuffix}` : "Read";
 		let cachedWidth: number | undefined;
+		let cachedCanExpand: boolean | undefined;
 		let cachedLines: string[] | undefined;
 		const expanded = this.#expanded;
 		const component: Component = {
 			render: (width: number) => {
-				if (cachedLines && cachedWidth === width) return cachedLines;
+				const canExpand = this.#expandHintCapability?.();
+				if (cachedLines && cachedWidth === width && cachedCanExpand === canExpand) return cachedLines;
 				cachedLines = renderCodeCell(
 					{
 						code: entry.contentText ?? "",
@@ -233,15 +238,18 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 						status: entry.status === "success" ? "complete" : entry.status,
 						expanded,
 						codeMaxLines: expanded ? undefined : COLLAPSED_PREVIEW_LINES,
+						expandHintCapability: this.#expandHintCapability,
 						width,
 					},
 					theme,
 				);
 				cachedWidth = width;
+				cachedCanExpand = canExpand;
 				return cachedLines;
 			},
 			invalidate: () => {
 				cachedWidth = undefined;
+				cachedCanExpand = undefined;
 				cachedLines = undefined;
 			},
 		};

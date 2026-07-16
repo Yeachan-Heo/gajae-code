@@ -3,6 +3,7 @@
  */
 import { Markdown } from "@gajae-code/tui";
 import { getMarkdownTheme, highlightCode, type Theme } from "../modes/theme/theme";
+import type { ExpandHintCapability } from "../tools/render-utils";
 import {
 	formatDuration,
 	formatExpandHint,
@@ -26,6 +27,7 @@ export interface CodeCellOptions {
 	outputMaxLines?: number;
 	codeMaxLines?: number;
 	expanded?: boolean;
+	expandHintCapability?: ExpandHintCapability;
 	width: number;
 }
 
@@ -104,7 +106,7 @@ export function renderCodeCell(options: CodeCellOptions, theme: Theme): string[]
 	const codeLines = highlightCode(visibleCode, language);
 	const hiddenCodeLines = rawCodeLines.length - maxCodeLines;
 	if (hiddenCodeLines > 0) {
-		const hint = formatExpandHint(theme, expanded, hiddenCodeLines > 0);
+		const hint = formatExpandHint(theme, expanded, hiddenCodeLines > 0, options.expandHintCapability);
 		const moreLine = `${formatMoreItems(hiddenCodeLines, "line")}${hint ? ` ${hint}` : ""}`;
 		codeLines.push(theme.fg("dim", moreLine));
 	}
