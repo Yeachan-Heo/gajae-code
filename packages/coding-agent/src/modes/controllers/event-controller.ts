@@ -585,6 +585,7 @@ export class EventController {
 						this.ctx.ui,
 						this.ctx.sessionManager.getCwd(),
 						content.id,
+						this.ctx.expandHintCapability,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
 					this.ctx.pendingTools.set(content.id, component);
@@ -701,6 +702,7 @@ export class EventController {
 				this.ctx.ui,
 				this.ctx.sessionManager.getCwd(),
 				event.toolCallId,
+				this.ctx.expandHintCapability,
 			);
 			component.setExpanded(this.ctx.toolOutputExpanded);
 			this.ctx.pendingTools.set(event.toolCallId, component);
@@ -985,7 +987,7 @@ export class EventController {
 	}
 
 	async #handleTtsrTriggered(event: Extract<AgentSessionEvent, { type: "ttsr_triggered" }>): Promise<void> {
-		const component = new TtsrNotificationComponent(event.rules);
+		const component = new TtsrNotificationComponent(event.rules, this.ctx.expandHintCapability);
 		component.setExpanded(this.ctx.toolOutputExpanded);
 		addChatChild(this.ctx, component);
 		this.ctx.ui.requestRender();

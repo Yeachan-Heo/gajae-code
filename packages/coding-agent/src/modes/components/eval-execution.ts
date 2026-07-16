@@ -7,6 +7,7 @@ import { Container, type Loader, padding, Text, type TUI, visibleWidth } from "@
 import { sanitizeText } from "@gajae-code/utils";
 import { highlightCode, theme } from "../../modes/theme/theme";
 import type { TruncationMeta } from "../../tools/output-meta";
+import type { ExpandHintCapability } from "../../tools/render-utils";
 import {
 	buildExecutionFrame,
 	buildStatusFooter,
@@ -55,6 +56,7 @@ export class EvalExecutionComponent extends Container {
 		ui: TUI,
 		private readonly excludeFromContext = false,
 		private readonly language: EvalExecutionLanguage = "python",
+		private readonly expandHintCapability?: ExpandHintCapability,
 	) {
 		super();
 
@@ -140,6 +142,7 @@ export class EvalExecutionComponent extends Container {
 				exitCode: this.#exitCode,
 				truncation: this.#truncation,
 				hiddenLineCount,
+				expandHintCapability: this.expandHintCapability,
 			});
 			if (footer) this.#contentContainer.addChild(footer);
 		}

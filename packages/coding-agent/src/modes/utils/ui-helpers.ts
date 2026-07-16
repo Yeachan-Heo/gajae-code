@@ -400,7 +400,12 @@ export class UiHelpers {
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): Component[] {
 		switch (message.role) {
 			case "bashExecution": {
-				const component = new BashExecutionComponent(message.command, this.ctx.ui, message.excludeFromContext);
+				const component = new BashExecutionComponent(
+					message.command,
+					this.ctx.ui,
+					message.excludeFromContext,
+					this.ctx.expandHintCapability,
+				);
 				if (message.output) {
 					component.appendOutput(message.output);
 				}
@@ -411,7 +416,13 @@ export class UiHelpers {
 				break;
 			}
 			case "pythonExecution": {
-				const component = new EvalExecutionComponent(message.code, this.ctx.ui, message.excludeFromContext);
+				const component = new EvalExecutionComponent(
+					message.code,
+					this.ctx.ui,
+					message.excludeFromContext,
+					"python",
+					this.ctx.expandHintCapability,
+				);
 				if (message.output) {
 					component.appendOutput(message.output);
 				}
@@ -509,14 +520,14 @@ export class UiHelpers {
 			}
 			case "compactionSummary": {
 				addChatChild(this.ctx, new Spacer(1));
-				const component = new CompactionSummaryMessageComponent(message);
+				const component = new CompactionSummaryMessageComponent(message, this.ctx.expandHintCapability);
 				component.setExpanded(this.ctx.toolOutputExpanded);
 				addChatChild(this.ctx, component);
 				break;
 			}
 			case "branchSummary": {
 				addChatChild(this.ctx, new Spacer(1));
-				const component = new BranchSummaryMessageComponent(message);
+				const component = new BranchSummaryMessageComponent(message, this.ctx.expandHintCapability);
 				component.setExpanded(this.ctx.toolOutputExpanded);
 				addChatChild(this.ctx, component);
 				break;
@@ -710,6 +721,7 @@ export class UiHelpers {
 						this.ctx.ui,
 						this.ctx.sessionManager.getCwd(),
 						content.id,
+						this.ctx.expandHintCapability,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
 					addChatChild(this.ctx, component);

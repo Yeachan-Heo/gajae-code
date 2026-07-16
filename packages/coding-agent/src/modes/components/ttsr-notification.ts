@@ -1,6 +1,7 @@
 import { Box, Container, Spacer, Text } from "@gajae-code/tui";
 import type { Rule } from "../../capability/rule";
 import { theme } from "../../modes/theme/theme";
+import type { ExpandHintCapability } from "../../tools/render-utils";
 import { expandHintSuffix } from "../../tools/render-utils";
 
 /**
@@ -11,7 +12,10 @@ export class TtsrNotificationComponent extends Container {
 	#box: Box;
 	#expanded = false;
 
-	constructor(private readonly rules: Rule[]) {
+	constructor(
+		private readonly rules: Rule[],
+		private readonly expandHintCapability?: ExpandHintCapability,
+	) {
 		super();
 
 		this.addChild(new Spacer(1));
@@ -74,7 +78,10 @@ export class TtsrNotificationComponent extends Container {
 				return desc && desc.split("\n").length > 2;
 			});
 			if (hasMoreContent) {
-				this.#box.addChild(new Text(theme.italic(expandHintSuffix(theme)), 0, 0));
+				this.#box.addChild({
+					render: () => [theme.italic(expandHintSuffix(theme, this.expandHintCapability))],
+					invalidate: () => {},
+				});
 			}
 		}
 	}

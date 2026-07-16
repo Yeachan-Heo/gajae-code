@@ -31,7 +31,13 @@ import {
 	JSON_TREE_SCALAR_LEN_EXPANDED,
 	renderJsonTreeLines,
 } from "../../tools/json-tree";
-import { formatExpandHint, replaceTabs, resolveImageOptions, truncateToWidth } from "../../tools/render-utils";
+import {
+	type ExpandHintCapability,
+	formatExpandHint,
+	replaceTabs,
+	resolveImageOptions,
+	truncateToWidth,
+} from "../../tools/render-utils";
 import { toolRenderers } from "../../tools/renderers";
 import { renderStatusLine } from "../../tui";
 import { containsSixelSequence, getSixelLineMask, sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
@@ -216,6 +222,7 @@ export class ToolExecutionComponent extends Container {
 		expanded: boolean;
 		isPartial: boolean;
 		renderContext?: Record<string, unknown>;
+		expandHintCapability?: ExpandHintCapability;
 	} = {
 		expanded: false,
 		isPartial: true,
@@ -229,6 +236,7 @@ export class ToolExecutionComponent extends Container {
 		ui: TUI,
 		cwd: string = getProjectDir(),
 		_toolCallId?: string,
+		expandHintCapability?: ExpandHintCapability,
 	) {
 		super();
 		this.#toolName = toolName;
@@ -243,6 +251,7 @@ export class ToolExecutionComponent extends Container {
 		this.#shareArgsWithRenderer = argsCanBeSharedWithRenderer(toolName, tool);
 		this.#lastArgsReference = args;
 		this.#args = this.#shareArgsWithRenderer ? args : cloneToolArgs(args);
+		this.#renderState.expandHintCapability = expandHintCapability;
 
 		this.addChild(new Spacer(1));
 
@@ -530,7 +539,12 @@ export class ToolExecutionComponent extends Container {
 				try {
 					const renderResult = tool.renderResult as (
 						result: { content: Array<{ type: string; text?: string }>; details?: unknown; isError?: boolean },
-						options: { expanded: boolean; isPartial: boolean; spinnerFrame?: number },
+						options: {
+							expanded: boolean;
+							isPartial: boolean;
+							spinnerFrame?: number;
+							expandHintCapability?: ExpandHintCapability;
+						},
 						theme: Theme,
 						args?: unknown,
 					) => Component;

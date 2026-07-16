@@ -105,7 +105,6 @@ import {
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
 } from "../../tools";
-import { setExpandHintOwnerFocused } from "../../tools/render-utils";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
@@ -719,11 +718,9 @@ export class SelectorController {
 				this.ctx.editorContainer.addChild(this.ctx.editor);
 				this.ctx.ui.setFocus(this.ctx.editor);
 			}
-			setExpandHintOwnerFocused(true);
 			this.ctx.ui.requestRender();
 		};
 		const { component, focus } = create(done);
-		setExpandHintOwnerFocused(false);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(component);
 		this.ctx.ui.setFocus(focus);
@@ -2380,7 +2377,6 @@ export class SelectorController {
 		const done = () => {
 			cleanup?.();
 			overlayHandle?.hide();
-			setExpandHintOwnerFocused(true);
 			this.ctx.ui.requestRender();
 		};
 
@@ -2391,7 +2387,6 @@ export class SelectorController {
 			this.ctx.ui.requestRender();
 		});
 
-		setExpandHintOwnerFocused(false);
 		overlayHandle = this.ctx.ui.showOverlay(selector, {
 			anchor: "bottom-center",
 			width: "100%",
@@ -2414,7 +2409,6 @@ export class SelectorController {
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(this.ctx.editor);
 			this.ctx.ui.setFocus(this.ctx.editor);
-			setExpandHintOwnerFocused(true);
 			this.ctx.ui.requestRender();
 		};
 		overlay = new JobsOverlayComponent(observer, {
@@ -2424,7 +2418,6 @@ export class SelectorController {
 				this.ctx.ui.requestRender();
 			},
 		});
-		setExpandHintOwnerFocused(false);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(overlay);
 		this.ctx.ui.setFocus(overlay.getFocus());

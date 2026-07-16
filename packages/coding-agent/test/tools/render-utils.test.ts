@@ -16,7 +16,6 @@ import {
 	formatParseErrors,
 	formatScreenshot,
 	getPreviewLines,
-	setExpandHintOwnerFocused,
 	shortenPath,
 } from "@gajae-code/coding-agent/tools/render-utils";
 import { setKeybindings } from "@gajae-code/tui";
@@ -29,10 +28,10 @@ beforeAll(async () => {
 
 afterEach(() => {
 	setKeybindings(KeybindingsManager.inMemory());
-	setExpandHintOwnerFocused(true);
 });
 
 describe("tool-output expansion hints", () => {
+	const focused = () => true;
 	it("uses the configured binding in execution, eval, and summary surfaces", () => {
 		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "alt+x" }));
 
@@ -41,14 +40,19 @@ describe("tool-output expansion hints", () => {
 			exitCode: 0,
 			truncation: undefined,
 			hiddenLineCount: 3,
+			expandHintCapability: focused,
 		});
-		const summary = new BranchSummaryMessageComponent({ summary: "Summary" } as BranchSummaryMessage);
+		const summary = new BranchSummaryMessageComponent({ summary: "Summary" } as BranchSummaryMessage, focused);
 
 		expect(Bun.stripANSI(footer!.render(120).join("\n"))).toContain("3 more lines (Alt+X to expand)");
 		expect(Bun.stripANSI(summary.render(120).join("\n"))).toContain("Branch summary (Alt+X to expand)");
 		const evalOutput = evalToolRenderer.renderResult(
 			{ content: [{ type: "text", text: Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n") }] },
-			{ expanded: false, renderContext: { expanded: false, previewLines: 1 } } as never,
+			{
+				expanded: false,
+				renderContext: { expanded: false, previewLines: 1 },
+				expandHintCapability: focused,
+			} as never,
 			theme,
 		);
 
@@ -58,7 +62,7 @@ describe("tool-output expansion hints", () => {
 	it("preserves surrounding output when the action is unbound", () => {
 		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": [] }));
 
-		expect(expandHintSuffix(theme)).toBe("");
+		expect(expandHintSuffix(theme, focused)).toBe("");
 		expect(
 			Bun.stripANSI(
 				buildStatusFooter({
@@ -66,6 +70,7 @@ describe("tool-output expansion hints", () => {
 					exitCode: 0,
 					truncation: undefined,
 					hiddenLineCount: 3,
+					expandHintCapability: focused,
 				})!
 					.render(120)
 					.join("\n"),
@@ -78,6 +83,7 @@ describe("tool-output expansion hints", () => {
 					exitCode: 0,
 					truncation: undefined,
 					hiddenLineCount: 3,
+					expandHintCapability: focused,
 				})!
 					.render(120)
 					.join("\n"),
@@ -88,13 +94,14 @@ describe("tool-output expansion hints", () => {
 	it("suppresses hints while the composer does not own focus", () => {
 		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "alt+x" }));
 
-		setExpandHintOwnerFocused(false);
-		expect(expandHintSuffix(theme)).toBe("");
-		expect(formatExpandHint(theme)).toBe("");
+		let composerFocused = false;
+		const capability = () => composerFocused;
+		expect(expandHintSuffix(theme, capability)).toBe("");
+		expect(formatExpandHint(theme, undefined, undefined, capability)).toBe("");
 
-		setExpandHintOwnerFocused(true);
-		expect(expandHintSuffix(theme)).toContain("Alt+X to expand");
-		expect(Bun.stripANSI(formatExpandHint(theme))).toContain("Alt+X for more");
+		composerFocused = true;
+		expect(expandHintSuffix(theme, capability)).toContain("Alt+X to expand");
+		expect(Bun.stripANSI(formatExpandHint(theme, undefined, undefined, capability))).toContain("Alt+X for more");
 	});
 });
 

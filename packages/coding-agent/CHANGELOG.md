@@ -6,7 +6,7 @@
 
 ### Changed
 - The tool-output expand shortcut now stamps an explicit fold choice for each live component, so automatic expansion stamping cannot overwrite it. Transcript rebuilds/remounts create components from the global tool-output setting and reset that provenance.
-- Tool-output expansion hints now use the configured shortcut consistently and remain hidden while selectors or overlays own input focus.
+- Tool-output expansion hints now use each interactive mode's current TUI focus and overlay state at render time, keeping configured shortcuts isolated across concurrent modes and fresh through overlay lifecycle changes.
 
 ## [0.11.0] - 2026-07-15
 
