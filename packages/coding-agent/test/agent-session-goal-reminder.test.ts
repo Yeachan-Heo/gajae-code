@@ -147,6 +147,17 @@ describe("AgentSession active goal reminders", () => {
 		expect(JSON.stringify(reminder?.content)).toContain('goal({op:\\"complete\\"})');
 	});
 
+	it("does not let an abort without an active goal suppress a later goal reminder", async () => {
+		await session.abort();
+		setActiveGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+	});
+
 	it("continues after a successful yield when an active goal remains uncleared", async () => {
 		setActiveGoal();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();

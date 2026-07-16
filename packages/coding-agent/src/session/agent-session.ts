@@ -7798,7 +7798,9 @@ export class AgentSession {
 			}
 			this.#finishGoalContinuationGeneration();
 		}
-		this.#suppressNextGoalReminderAfterAbort = true;
+		const abortGoalState = this.getGoalModeState();
+		this.#suppressNextGoalReminderAfterAbort =
+			abortGoalState?.enabled === true && abortGoalState.goal.status === "active";
 		this.#promptGeneration++;
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
@@ -10054,6 +10056,7 @@ export class AgentSession {
 		const state = this.getGoalModeState();
 		if (!state?.enabled || state.goal.status !== "active") {
 			this.#lastGoalReminderAssistantTimestamp = undefined;
+			this.#suppressNextGoalReminderAfterAbort = false;
 			return false;
 		}
 		if (this.#lastGoalReminderAssistantTimestamp === assistantMessage.timestamp) {
