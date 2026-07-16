@@ -5922,6 +5922,15 @@ export class SessionManager {
 				throw new Error("Captured fork source authority changed before destination write.");
 			}
 			await manager.#rewriteFile();
+			const afterWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
+			if ("kind" in afterWrite) {
+				authorityFailure = afterWrite;
+				throw new Error("Captured fork source authority changed during destination write.");
+			}
+			if (!sameResumeIdentity(snapshot.identity, afterWrite.identity)) {
+				authorityFailure = { kind: "error", reason: "identity-mismatch" };
+				throw new Error("Captured fork source authority changed during destination write.");
+			}
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
 			return { kind: "forked", manager };
 		} catch (error) {

@@ -149,7 +149,7 @@ class ReplaceAfterSnapshotStorage extends FileSessionStorage {
 		return snapshot;
 	}
 }
-class ReplaceBeforeThirdInspectionStorage extends FileSessionStorage {
+class ReplaceDuringFinalAuthorityInspectionStorage extends FileSessionStorage {
 	#stats = 0;
 
 	constructor(
@@ -162,7 +162,7 @@ class ReplaceBeforeThirdInspectionStorage extends FileSessionStorage {
 	override statSync(filePath: string): SessionStorageStat {
 		if (path.resolve(filePath) === path.resolve(this.sourcePath)) {
 			this.#stats++;
-			if (this.#stats === 5) fs.renameSync(this.replacementPath, filePath);
+			if (this.#stats === 7) fs.renameSync(this.replacementPath, filePath);
 		}
 		return super.statSync(filePath);
 	}
@@ -260,7 +260,7 @@ describe("SessionManager read-only resume", () => {
 		fs.mkdirSync(targetCwd);
 		fs.writeFileSync(sourcePath, sessionText("session-a"));
 		fs.writeFileSync(replacementPath, sessionText("session-b"));
-		const storage = new ReplaceBeforeThirdInspectionStorage(replacementPath, sourcePath);
+		const storage = new ReplaceDuringFinalAuthorityInspectionStorage(replacementPath, sourcePath);
 		const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
 		if (captured.kind !== "captured") throw new Error("Expected strict transcript capture");
 

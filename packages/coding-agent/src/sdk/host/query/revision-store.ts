@@ -703,8 +703,8 @@ export class RevisionStore {
 			}
 			output += encoded;
 			if (stringIndex) {
-				serializedOffset += utf8ByteLength(encoded);
-				stringIndex.byteLength += utf8ByteLength(decoded);
+				serializedOffset += Buffer.byteLength(encoded);
+				stringIndex.byteLength += Buffer.byteLength(decoded);
 				const last = stringIndex.checkpoints[stringIndex.checkpoints.length - 1]!;
 				if (stringIndex.byteLength - last.decodedOffset >= STRING_INDEX_BYTES)
 					stringIndex.checkpoints.push({
@@ -1084,22 +1084,6 @@ function isPlainJsonString(value: unknown): value is string {
 	return typeof value === "string" && !/["\\\u0000-\u001f\ud800-\udfff]/.test(value);
 }
 
-function utf8ByteLength(text: string): number {
-	let bytes = 0;
-	for (let index = 0; index < text.length; index++) {
-		const code = text.charCodeAt(index);
-		if (code < 0x80) bytes++;
-		else if (code < 0x800) bytes += 2;
-		else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length) {
-			const next = text.charCodeAt(index + 1);
-			if (next >= 0xdc00 && next <= 0xdfff) {
-				bytes += 4;
-				index++;
-			} else bytes += 3;
-		} else bytes += 3;
-	}
-	return bytes;
-}
 
 /** Finds the furthest UTF-16 boundary whose UTF-8 encoding fits in maxBytes. */
 function utf8ChunkEnd(text: string, start: number, maxBytes: number): number {
