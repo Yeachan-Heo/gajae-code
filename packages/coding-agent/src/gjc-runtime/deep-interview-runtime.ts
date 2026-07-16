@@ -11,7 +11,13 @@ import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { modeStatePath, sessionSpecsDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { runNativeStateCommand } from "./state-runtime";
-import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
+import {
+	appendJsonl,
+	readExistingStateForMutation,
+	updateWorkflowEnvelopeAtomic,
+	writeArtifact,
+	writeWorkflowEnvelopeAtomic,
+} from "./state-writer";
 
 export * from "./deep-interview-recorder";
 
@@ -597,8 +603,6 @@ export async function persistDeepInterviewSpec(
 			`existing deep-interview state is corrupt or tampered (${existingRead.error}); use --force to overwrite ${statePath}`,
 		);
 	}
-	const existing = existingRead.kind === "valid" ? existingRead.value : {};
-
 	const specPath = path.join(sessionSpecsDir(cwd, resolved.sessionId), `deep-interview-${resolved.slug}.md`);
 	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
 	await writeArtifact(specPath, content, {
@@ -629,39 +633,56 @@ export async function persistDeepInterviewSpec(
 		},
 	);
 
-	const payload = normalizeDeepInterviewEnvelope({
-		...existing,
-		active: true,
-		current_phase: "handoff",
-		skill: "deep-interview",
-		version: WORKFLOW_STATE_VERSION,
-		spec_slug: resolved.slug,
-		spec_path: specPath,
-		spec_sha256: sha256,
-		spec_stage: resolved.stage,
-		spec_persisted_at: createdAt,
-		updated_at: createdAt,
-	}) as Record<string, unknown>;
-	if (resolved.sessionId) payload.session_id = resolved.sessionId;
-	await writeWorkflowEnvelopeAtomic(statePath, payload, {
+	let payload: Record<string, unknown> = {};
+	const buildPayload = (existing: Record<string, unknown>): Record<string, unknown> => {
+		const merged = normalizeDeepInterviewEnvelope({
+			...existing,
+			active: true,
+			current_phase: "handoff",
+			skill: "deep-interview",
+			version: WORKFLOW_STATE_VERSION,
+			spec_slug: resolved.slug,
+			spec_path: specPath,
+			spec_sha256: sha256,
+			spec_stage: resolved.stage,
+			spec_persisted_at: createdAt,
+			updated_at: createdAt,
+		}) as Record<string, unknown>;
+		if (resolved.sessionId) merged.session_id = resolved.sessionId;
+		return merged;
+	};
+	const writerOptions = {
 		cwd,
 		receipt: {
 			cwd,
-			skill: "deep-interview",
-			owner: "gjc-runtime",
+			skill: "deep-interview" as const,
+			owner: "gjc-runtime" as const,
 			command: "gjc deep-interview persist-spec-state",
 			sessionId: resolved.sessionId,
 			nowIso: createdAt,
 		},
 		audit: {
-			category: "state",
+			category: "state" as const,
 			verb: "write",
-			owner: "gjc-runtime",
-			skill: "deep-interview",
+			owner: "gjc-runtime" as const,
+			skill: "deep-interview" as const,
 			sessionId: resolved.sessionId,
 			forced: resolved.force,
 		},
-	});
+	};
+	if (existingRead.kind === "corrupt") {
+		payload = buildPayload({});
+		await writeWorkflowEnvelopeAtomic(statePath, payload, writerOptions);
+	} else {
+		await updateWorkflowEnvelopeAtomic(
+			statePath,
+			current => {
+				payload = buildPayload(current ?? {});
+				return payload;
+			},
+			writerOptions,
+		);
+	}
 	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "deep-interview-runtime", path: statePath });
 	await syncDeepInterviewHud({
 		cwd,

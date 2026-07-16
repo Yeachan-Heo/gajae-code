@@ -2,7 +2,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
-import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import {
+	persistDeepInterviewSpec,
+	runNativeDeepInterviewCommand,
+} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import {
 	activeSnapshotPath,
@@ -11,7 +14,7 @@ import {
 	sessionPlansDir,
 	sessionSpecsDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-
+import { withWorkflowStateLock } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { resetSettingsForTest } from "../../src/config/settings";
 
@@ -129,6 +132,51 @@ describe("native gjc deep-interview runtime", () => {
 		expect(
 			audit.some(entry => entry.skill === "deep-interview" && entry.verb === "write" && entry.forced === true),
 		).toBe(true);
+	});
+	it("merges spec persistence with fields written after its pre-publish work", async () => {
+		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const seeded = await runNativeDeepInterviewCommand(["seed the interview state"], root);
+		expect(seeded.status).toBe(0);
+
+		const specPath = path.join(sessionSpecsDir(root, TEST_SESSION_ID), "deep-interview-concurrent-state.md");
+		let persistence: Promise<unknown> | undefined;
+		await withWorkflowStateLock(
+			statePath,
+			async () => {
+				persistence = persistDeepInterviewSpec(root, {
+					stage: "final",
+					slug: "concurrent-state",
+					spec: "# Concurrent spec",
+					sessionId: TEST_SESSION_ID,
+					json: true,
+					deliberate: false,
+					force: false,
+				});
+
+				let artifactWritten = false;
+				for (let attempt = 0; attempt < 100; attempt++) {
+					try {
+						await fs.access(specPath);
+						artifactWritten = true;
+						break;
+					} catch {
+						await Bun.sleep(1);
+					}
+				}
+				expect(artifactWritten).toBe(true);
+
+				const current = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+				current.concurrent_state_field = "retained";
+				await fs.writeFile(statePath, `${JSON.stringify(current)}\n`, "utf-8");
+			},
+			{ cwd: root },
+		);
+
+		await persistence;
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		expect(persisted.concurrent_state_field).toBe("retained");
+		expect(persisted.spec_slug).toBe("concurrent-state");
 	});
 
 	it("persists a final spec under .gjc/specs through the native CLI/API", async () => {

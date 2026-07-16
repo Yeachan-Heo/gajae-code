@@ -6,7 +6,7 @@ import {
 	modeStatePath,
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { reconcileWorkflowSkillState, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -142,6 +142,34 @@ describe("native gjc state runtime", () => {
 		expect(merged.state.current_ambiguity).toBe(0.5);
 		expect(merged.state.threshold_source).toBe("user");
 		expect(merged.state.interview_id).toBe("abc");
+	});
+	it("merges concurrent reconcile payloads from the lock-owned current envelope", async () => {
+		const root = await tempDir();
+
+		await Promise.all([
+			reconcileWorkflowSkillState({
+				cwd: root,
+				mode: "ralplan",
+				sessionId: TEST_SESSION_ID,
+				active: true,
+				phase: "planner",
+				payload: { first_reconcile_field: "first" },
+			}),
+			reconcileWorkflowSkillState({
+				cwd: root,
+				mode: "ralplan",
+				sessionId: TEST_SESSION_ID,
+				active: true,
+				phase: "planner",
+				payload: { second_reconcile_field: "second" },
+			}),
+		]);
+
+		const persisted = JSON.parse(
+			await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "ralplan"), "utf-8"),
+		) as Record<string, unknown>;
+		expect(persisted.first_reconcile_field).toBe("first");
+		expect(persisted.second_reconcile_field).toBe("second");
 	});
 
 	it("deletes a key when the payload value is null", async () => {

@@ -57,8 +57,10 @@ import {
 	type GenericHardPruneTarget,
 	hardPrune,
 	readExistingStateForMutation,
+	StateWriteConflictError,
 	type StateWriterAuditContext,
 	softDelete,
+	updateWorkflowEnvelopeAtomic,
 	updateWorkflowTransactionJournal,
 	type WorkflowEnvelopeIntegrityMismatch,
 	writeGuardedWorkflowEnvelopeAtomic,
@@ -1136,7 +1138,6 @@ export async function reconcileWorkflowSkillState(options: {
 	});
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const existingRead = await readExistingStateForMutation(filePath);
-	const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
 	const nowIsoStr = nowIso();
 	const mutationId = `${mode}:reconcile:${nowIsoStr}`;
 
@@ -1146,47 +1147,39 @@ export async function reconcileWorkflowSkillState(options: {
 		throw new StateCommandError(2, `unknown ${mode} phase "${trimmedPhase}" for reconciliation`);
 	}
 
-	const fromPhase =
-		typeof existingPayload.current_phase === "string" ? existingPayload.current_phase.trim() : undefined;
-	const receipt = buildWorkflowStateReceipt({
+	const writerOptions = {
 		cwd,
-		skill: mode,
-		owner: "gjc-runtime",
-		command: `gjc ${mode} (reconcile)`,
-		sessionId,
-		nowIso: nowIsoStr,
-		mutationId,
-	});
-	receipt.verb = "reconcile";
-	receipt.forced = true;
-	receipt.from_phase = fromPhase;
-	receipt.to_phase = trimmedPhase;
-
-	const merged =
-		mode === "deep-interview"
-			? // Enforce the deterministic ambiguity floor on every reconcile so a
-				// self-reported score can never undercut persisted contradiction evidence.
-				(applyAmbiguityFloorToEnvelope(mergeDeepInterviewEnvelope(existingPayload, payload)).envelope as Record<
-					string,
-					unknown
-				>)
-			: mergeWithNullDelete(existingPayload, payload);
-	merged.skill = mode;
-	merged.current_phase = trimmedPhase;
-	merged.active = active;
-	merged.version = WORKFLOW_STATE_VERSION;
-	merged.updated_at = nowIsoStr;
-	merged.receipt = receipt;
-	if (sessionId && typeof merged.session_id !== "string") merged.session_id = sessionId;
-
-	const validation = validateWorkflowStateEnvelope(mode, merged);
-	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
-
-	if (existingRead.kind === "corrupt") await fs.rm(filePath, { force: true });
-	await writeGuardedWorkflowEnvelopeAtomic(filePath, merged, {
-		cwd,
-		policy: "source",
 		receipt: {
+			cwd,
+			skill: mode,
+			owner: "gjc-runtime" as const,
+			command: `gjc ${mode} (reconcile)`,
+			sessionId,
+			nowIso: nowIsoStr,
+			mutationId,
+			verb: "reconcile",
+			forced: true,
+			fromPhase: undefined as string | undefined,
+			toPhase: trimmedPhase,
+		},
+		audit: {
+			category: "state" as const,
+			verb: "reconcile",
+			owner: "gjc-runtime" as const,
+			sessionId,
+			skill: mode,
+			mutationId,
+			forced: true,
+			fromPhase: undefined as string | undefined,
+			toPhase: trimmedPhase,
+		},
+	};
+	let reconciledPayload: Record<string, unknown> = {};
+	let reconciledReceipt: WorkflowStateReceipt | undefined;
+	const buildMergedEnvelope = (existingPayload: Record<string, unknown>): Record<string, unknown> => {
+		const fromPhase =
+			typeof existingPayload.current_phase === "string" ? existingPayload.current_phase.trim() : undefined;
+		const receipt = buildWorkflowStateReceipt({
 			cwd,
 			skill: mode,
 			owner: "gjc-runtime",
@@ -1194,23 +1187,53 @@ export async function reconcileWorkflowSkillState(options: {
 			sessionId,
 			nowIso: nowIsoStr,
 			mutationId,
-			verb: "reconcile",
-			forced: true,
-			fromPhase,
-			toPhase: trimmedPhase,
-		},
-		audit: {
-			category: "state",
-			verb: "reconcile",
-			owner: "gjc-runtime",
-			sessionId,
-			skill: mode,
-			mutationId,
-			forced: true,
-			fromPhase,
-			toPhase: trimmedPhase,
-		},
-	});
+		});
+		receipt.verb = "reconcile";
+		receipt.forced = true;
+		receipt.from_phase = fromPhase;
+		receipt.to_phase = trimmedPhase;
+
+		const merged =
+			mode === "deep-interview"
+				? // Enforce the deterministic ambiguity floor on every reconcile so a
+					// self-reported score can never undercut persisted contradiction evidence.
+					(applyAmbiguityFloorToEnvelope(mergeDeepInterviewEnvelope(existingPayload, payload)).envelope as Record<
+						string,
+						unknown
+					>)
+				: mergeWithNullDelete(existingPayload, payload);
+		merged.skill = mode;
+		merged.current_phase = trimmedPhase;
+		merged.active = active;
+		merged.version = WORKFLOW_STATE_VERSION;
+		merged.updated_at = nowIsoStr;
+		merged.receipt = receipt;
+		if (sessionId && typeof merged.session_id !== "string") merged.session_id = sessionId;
+
+		const validation = validateWorkflowStateEnvelope(mode, merged);
+		if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
+
+		reconciledPayload = merged;
+		reconciledReceipt = receipt;
+		writerOptions.receipt.fromPhase = fromPhase;
+		writerOptions.audit.fromPhase = fromPhase;
+		return merged;
+	};
+
+	if (existingRead.kind === "corrupt") {
+		try {
+			await writeGuardedWorkflowEnvelopeAtomic(filePath, buildMergedEnvelope({}), {
+				...writerOptions,
+				policy: "source",
+				expectedRevision: 0,
+			});
+		} catch (error) {
+			if (!(error instanceof StateWriteConflictError)) throw error;
+			await updateWorkflowEnvelopeAtomic(filePath, current => buildMergedEnvelope(current ?? {}), writerOptions);
+		}
+	} else {
+		await updateWorkflowEnvelopeAtomic(filePath, current => buildMergedEnvelope(current ?? {}), writerOptions);
+	}
 	const persisted = (await readJsonFile(filePath)) ?? {};
 	const sourceRevision = options.sourceRevision ?? existingStateRevision(persisted);
 
@@ -1227,8 +1250,8 @@ export async function reconcileWorkflowSkillState(options: {
 		threadId,
 		turnId,
 		source: "gjc-runtime-reconcile",
-		hud: buildHudForMode(mode, merged),
-		receipt,
+		hud: buildHudForMode(mode, reconciledPayload),
+		receipt: reconciledReceipt,
 		sourceRevision,
 	});
 	await touchStateActivityMarker(cwd, sessionId, filePath);
