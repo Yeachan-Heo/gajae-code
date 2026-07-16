@@ -24,7 +24,7 @@ export interface CommandPaletteEntry {
 	description: string;
 	keybinding?: string;
 	searchText?: string;
-	handler?: () => void;
+	handler?: () => void | Promise<void>;
 }
 
 class CommandPaletteList implements Component {

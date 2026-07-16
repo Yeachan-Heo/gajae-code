@@ -290,7 +290,7 @@ export interface InteractiveModeContext {
 	showCommandPalette(
 		commands: SlashCommand[],
 		actions: CommandPaletteAction[],
-		executeSlashCommand: (name: string) => void,
+		executeSlashCommand: (name: string) => Promise<void>,
 	): void;
 	showSettingsSelector(): void;
 	showThemeSelector(): void;

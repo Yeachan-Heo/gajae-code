@@ -2857,7 +2857,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	showCommandPalette(
 		commands: SlashCommand[],
 		actions: CommandPaletteAction[],
-		executeSlashCommand: (name: string) => void,
+		executeSlashCommand: (name: string) => Promise<void>,
 	): void {
 		this.#selectorController.showCommandPalette(commands, actions, executeSlashCommand);
 	}
