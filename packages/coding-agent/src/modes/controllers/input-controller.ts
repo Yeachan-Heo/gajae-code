@@ -4,6 +4,7 @@ import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@gajae-code/tui";
 import { $env, sanitizeText } from "@gajae-code/utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
+import { normalizeBusyPromptMode } from "../../config/settings-schema";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
@@ -422,6 +423,14 @@ export class InputController {
 				return true;
 			});
 		}
+		for (const key of this.ctx.keybindings.getKeys("app.message.oppositeBusyMode")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				if (!this.ctx.session.isStreaming || this.ctx.session.isCompacting) return false;
+				if (!this.ctx.editor.getText().trim()) return false;
+				void this.handleOppositeBusyPromptSubmit();
+				return true;
+			});
+		}
 		for (const key of this.ctx.keybindings.getKeys("app.stt.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleSTTToggle());
 		}
@@ -522,15 +531,6 @@ export class InputController {
 				text = slashResult;
 			}
 
-			// Handle skill commands (/skill:name [args]). While streaming, Enter
-			// honors `busyPromptMode`: "steer" interrupts the active turn, "queue"
-			// runs after it completes (matches the free-text Enter semantics applied
-			// a few lines below at the streaming branch). Explicit queue shortcuts
-			// route through `handleFollowUp` and dispatch as `followUp`.
-			if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior())) {
-				return;
-			}
-
 			// Handle bash command (! for normal, !! for excluded from context)
 			if (text.startsWith("!")) {
 				const isExcluded = text.startsWith("!!");
@@ -566,6 +566,27 @@ export class InputController {
 					this.ctx.updateEditorBorderColor();
 					return;
 				}
+			}
+			// Keep skill invocations queued during compaction so they retain their
+			// custom-message dispatch path when the compaction queue flushes.
+			if (
+				this.ctx.session.isCompacting &&
+				parseSkillInvocations(text, this.ctx.skillCommands ?? new Map()).length > 0
+			) {
+				if ((inputImages?.length ?? 0) > 0) {
+					this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
+					return;
+				}
+				this.ctx.queueCompactionMessage(text, "steer");
+				return;
+			}
+
+			// Handle skill commands (/skill:name [args]). While streaming, Enter
+			// honors `busyPromptMode`: "steer" interrupts the active turn, "queue"
+			// runs after it completes. Explicit queue shortcuts route through
+			// `handleFollowUp` and dispatch as `followUp`.
+			if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior())) {
+				return;
 			}
 
 			// Queue input during compaction
@@ -867,7 +888,7 @@ export class InputController {
 	 * completes (in submission order). Only consulted while streaming.
 	 */
 	#busyStreamingBehavior(): "steer" | "followUp" {
-		return this.ctx.settings.get("busyPromptMode") === "steer" ? "steer" : "followUp";
+		return normalizeBusyPromptMode(this.ctx.settings.get("busyPromptMode")) === "steer" ? "steer" : "followUp";
 	}
 
 	#isFollowUpShortcutActive(): boolean {
@@ -1006,6 +1027,34 @@ export class InputController {
 	/** Send editor text explicitly as a queued next-turn message. */
 	async handleQueueSubmit(): Promise<void> {
 		return this.handleFollowUp();
+	}
+
+	/** Submit once using the opposite of the configured busy prompt mode. */
+	async handleOppositeBusyPromptSubmit(): Promise<void> {
+		const text = this.ctx.editor.getText().trim();
+		if (!text || !this.ctx.session.isStreaming || this.ctx.session.isCompacting) return;
+
+		const streamingBehavior =
+			normalizeBusyPromptMode(this.ctx.settings.get("busyPromptMode")) === "steer" ? "followUp" : "steer";
+		if (await this.#invokeSkillCommand(text, streamingBehavior)) return;
+
+		const pendingImages = this.ctx.pendingImages;
+		const images = this.#visiblePendingImagesForText(text) ?? [];
+		this.ctx.editor.addToHistory(text);
+		this.ctx.editor.setText("");
+		this.#clearPendingImagesIfOwnedBy(pendingImages);
+		await this.ctx.withLocalSubmission(
+			text,
+			() =>
+				this.ctx.session.prompt(text, {
+					streamingBehavior,
+					images: images.length > 0 ? images : undefined,
+					...(streamingBehavior === "followUp" ? { followUpQueuePolicy: "sequential" as const } : {}),
+				}),
+			{ imageCount: images.length },
+		);
+		this.ctx.updatePendingMessagesDisplay();
+		this.ctx.ui.requestRender();
 	}
 
 	restoreLatestQueuedMessageToEditor(): number {
