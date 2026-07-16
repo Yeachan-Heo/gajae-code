@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
-import { setKeybindings } from "@gajae-code/tui";
+import { Input, setKeybindings, TUI } from "@gajae-code/tui";
+import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { KeybindingsManager } from "../src/config/keybindings";
 import { getDefault } from "../src/config/settings-schema";
 import { ReadToolGroupComponent, readArgsTargetInternalUrl } from "../src/modes/components/read-tool-group";
@@ -16,6 +17,13 @@ describe("ReadToolGroupComponent", () => {
 	beforeEach(() => {
 		setKeybindings(KeybindingsManager.inMemory());
 	});
+	function expandHintCapability(): () => boolean {
+		const ui = new TUI(new VirtualTerminal());
+		const editor = new Input();
+		ui.addChild(editor);
+		ui.setFocus(editor);
+		return () => !ui.hasOverlay() && (ui.focusedComponent === null || ui.focusedComponent === editor);
+	}
 
 	it("keeps inline read previews disabled by default", () => {
 		expect(getDefault("read.toolResultPreview")).toBe(false);
@@ -58,7 +66,10 @@ describe("ReadToolGroupComponent", () => {
 
 	it("highlights only the collapsed preview lines", () => {
 		const highlightSpy = vi.spyOn(themeModule, "highlightCode");
-		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const component = new ReadToolGroupComponent({
+			showContentPreview: true,
+			expandHintCapability: expandHintCapability(),
+		});
 		component.updateArgs({ path: "/tmp/example.ts" }, "read-2");
 		component.updateResult(
 			{
@@ -150,7 +161,10 @@ describe("ReadToolGroupComponent", () => {
 	});
 
 	it("uses the configured expansion key hint and omits it when unbound", () => {
-		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const component = new ReadToolGroupComponent({
+			showContentPreview: true,
+			expandHintCapability: expandHintCapability(),
+		});
 		component.updateArgs({ path: "/tmp/example.ts" }, "read");
 		component.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "read");
 

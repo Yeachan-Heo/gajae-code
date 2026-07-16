@@ -171,6 +171,7 @@ export class EventController {
 			addChatChild(this.ctx, new Text("", 0, 0));
 			const group = new ReadToolGroupComponent({
 				showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+				expandHintCapability: this.ctx.expandHintCapability,
 			});
 			group.setExpanded(this.ctx.toolOutputExpanded);
 			addChatChild(this.ctx, group);

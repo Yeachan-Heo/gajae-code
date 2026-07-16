@@ -679,6 +679,7 @@ export class UiHelpers {
 							if (!readGroup) {
 								readGroup = new ReadToolGroupComponent({
 									showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+									expandHintCapability: this.ctx.expandHintCapability,
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
 								addChatChild(this.ctx, readGroup);
@@ -760,6 +761,7 @@ export class UiHelpers {
 						if (!readGroup) {
 							readGroup = new ReadToolGroupComponent({
 								showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
+								expandHintCapability: this.ctx.expandHintCapability,
 							});
 							readGroup.setExpanded(this.ctx.toolOutputExpanded);
 							addChatChild(this.ctx, readGroup);
