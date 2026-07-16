@@ -58,6 +58,16 @@ async function appendSync(file: string, value: string): Promise<void> {
 		await h.close();
 	}
 }
+
+async function syncDirectory(file: string): Promise<void> {
+	const handle = await fs.open(path.dirname(file), "r");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
+
 function alive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
@@ -110,16 +120,19 @@ export class SessionIndex {
 			if (e instanceof UnsupportedStateVersionError) throw e;
 			if ((e as NodeJS.ErrnoException).code !== "ENOENT") this.#warnings.push("Invalid session index snapshot");
 		}
-		await this.#tail(snapshotSeq);
+		await this.#tail(snapshotSeq, false);
 	}
-	async #tail(snapshotSeq = this.indexSeq): Promise<void> {
+	async #tail(snapshotSeq = this.indexSeq, allowResync = true): Promise<void> {
 		let data: Buffer;
 		try {
 			const handle = await fs.open(logFor(this.#agentDir), "r");
 			try {
 				const stat = await handle.stat();
 				if (stat.size < this.#logOffset) {
-					this.#warnings.push("Session index log was truncated");
+					if (allowResync) {
+						await this.replay();
+						this.#warn("Session index log was truncated");
+					} else this.#warn("Session index log was truncated");
 					return;
 				}
 				data = Buffer.alloc(stat.size - this.#logOffset);
@@ -135,6 +148,7 @@ export class SessionIndex {
 		if (lastNewline < 0) return;
 		const consumed = data.subarray(0, lastNewline + 1);
 		this.#logOffset += consumed.length;
+		let corrupt = false;
 		for (const line of consumed.toString("utf8").split("\n")) {
 			if (!line) continue;
 			let event: SessionIndexEvent;
@@ -143,18 +157,23 @@ export class SessionIndex {
 				assertSupportedStateVersion(logFor(this.#agentDir), event);
 			} catch (error) {
 				if (error instanceof UnsupportedStateVersionError) throw error;
-				this.#warnings.push("Corrupt session index entry; replay truncated");
-				return;
+				corrupt = true;
+				continue;
 			}
-			if (event.indexSeq <= snapshotSeq) continue;
+			if (corrupt || event.indexSeq <= snapshotSeq) continue;
 			const { checksum, ...unsigned } = event;
-			if (checksum !== sessionIndexChecksum(unsigned) || event.indexSeq !== this.indexSeq + 1) {
-				this.#warnings.push("Corrupt session index entry; replay truncated");
-				return;
-			}
-			this.#events.push(event);
+			if (checksum !== sessionIndexChecksum(unsigned) || event.indexSeq !== this.indexSeq + 1) corrupt = true;
+			else this.#events.push(event);
+		}
+		if (corrupt) {
+			this.#warn("Corrupt session index entry; replay truncated");
+			if (allowResync) await this.replay();
 		}
 	}
+	#warn(message: string): void {
+		if (!this.#warnings.includes(message)) this.#warnings.push(message);
+	}
+
 	async refresh(): Promise<void> {
 		await this.#tail();
 	}
@@ -182,13 +201,21 @@ export class SessionIndex {
 		});
 	}
 	async snapshot(): Promise<void> {
+		await withFileLock(logFor(this.#agentDir), () => this.#snapshotUnderLock());
+	}
+	async #snapshotUnderLock(): Promise<void> {
+		await this.replay();
 		const file = snapshotFor(this.#agentDir);
+		try {
+			const current = JSON.parse(await fs.readFile(file, "utf8")) as { indexSeq?: unknown };
+			if (typeof current.indexSeq === "number" && current.indexSeq > this.indexSeq) return;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 		const tmp = `${file}.${process.pid}.tmp`;
-		await fs.writeFile(
-			tmp,
-			JSON.stringify({ version: SDK_STATE_VERSION, indexSeq: this.indexSeq, events: this.#events }),
-			{ mode: 0o600 },
-		);
+		await fs.writeFile(tmp, JSON.stringify({ version: SDK_STATE_VERSION, indexSeq: this.indexSeq, events: this.#events }), {
+			mode: 0o600,
+		});
 		const h = await fs.open(tmp, "r");
 		try {
 			await h.sync();
@@ -196,13 +223,15 @@ export class SessionIndex {
 			await h.close();
 		}
 		await fs.rename(tmp, file);
+		await syncDirectory(file);
 	}
 	async #rotate(): Promise<void> {
-		await this.snapshot();
+		await this.#snapshotUnderLock();
 		const file = logFor(this.#agentDir);
 		const temporary = `${file}.${process.pid}.tmp`;
 		await fs.writeFile(temporary, "", { mode: 0o600 });
 		await fs.rename(temporary, file);
+		await syncDirectory(file);
 		this.#logOffset = 0;
 	}
 

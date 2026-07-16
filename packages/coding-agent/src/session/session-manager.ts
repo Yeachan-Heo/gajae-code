@@ -1128,9 +1128,14 @@ function cloneSessionContext(context: SessionContext): SessionContext {
 
 function freezeInternalReadSnapshot<T>(value: T): T {
 	if (process.env.NODE_ENV !== "test" && process.env.NODE_ENV !== "development") return value;
-	if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
-	for (const child of Object.values(value as Record<string, unknown>)) freezeInternalReadSnapshot(child);
-	return Object.freeze(value);
+	const copy = cloneJsonSemantic(value);
+	const freeze = (item: unknown): void => {
+		if (!item || typeof item !== "object" || Object.isFrozen(item)) return;
+		for (const child of Object.values(item as Record<string, unknown>)) freeze(child);
+		Object.freeze(item);
+	};
+	freeze(copy);
+	return copy;
 }
 
 /**
@@ -5473,12 +5478,14 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get the session as a tree structure. Returns a shallow defensive copy of all entries.
+	 * Get the session as a tree structure. Returns defensive copies of all entries.
 	 * A well-formed session has exactly one root (first entry with parentId === null).
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getTree(): SessionTreeNode[] {
-		const entries = this.getEntriesForRead();
+		return this.#getTree(this.getEntries());
+	}
+	#getTree(entries: readonly SessionEntry[]): SessionTreeNode[] {
 		const nodeMap = new Map<string, SessionTreeNode>();
 		const roots: SessionTreeNode[] = [];
 
@@ -5549,6 +5556,10 @@ export class SessionManager {
 		}
 
 		return roots;
+	}
+	/** Internal read-only tree access. */
+	getTreeForRead(): SessionTreeNode[] {
+		return this.#getTree(this.getEntriesForRead());
 	}
 
 	// =========================================================================

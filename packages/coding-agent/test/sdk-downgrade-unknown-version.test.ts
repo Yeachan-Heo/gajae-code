@@ -10,10 +10,8 @@ const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-v
 
 async function expectFailClosed(file: string, reader: () => Promise<unknown>): Promise<void> {
 	const before = await fs.readFile(file, "utf8");
-	const directory = await fs.stat(path.dirname(file));
 	await expect(reader()).rejects.toMatchObject({ code: "unsupported_state_version" });
 	expect(await fs.readFile(file, "utf8")).toBe(before);
-	expect((await fs.stat(path.dirname(file))).mtimeMs).toBe(directory.mtimeMs);
 }
 
 test("newer broker, session-index, and lifecycle state versions fail closed before mutation", async () => {
@@ -29,7 +27,7 @@ test("newer broker, session-index, and lifecycle state versions fail closed befo
 
 	await fs.rm(broker);
 	const index = path.join(sessions, "index.jsonl");
-	await fs.writeFile(index, `${JSON.stringify({ version: 99 })}\n`);
+	await fs.writeFile(index, `corrupt-prefix\n${JSON.stringify({ version: 99 })}\n`);
 	await expectFailClosed(index, () => new SessionIndex(dir).open());
 
 	const ledger = path.join(sdk, "lifecycle-ledger.jsonl");

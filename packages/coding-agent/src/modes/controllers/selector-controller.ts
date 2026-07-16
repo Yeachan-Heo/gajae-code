@@ -1786,7 +1786,7 @@ export class SelectorController {
 	}
 
 	showTreeSelector(): void {
-		const tree = this.ctx.sessionManager.getTree();
+		const tree = this.ctx.sessionManager.getTreeForRead();
 		const realLeafId = this.ctx.sessionManager.getLeafId();
 
 		if (tree.length === 0) {

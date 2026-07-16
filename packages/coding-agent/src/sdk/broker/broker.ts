@@ -379,6 +379,17 @@ export class Broker {
 			throw e;
 		}
 	}
+	async #releaseOwnedLock(): Promise<void> {
+		try {
+			const lock = await this.#readLock();
+			if (lock?.ownerId !== this.#owner) return;
+			await fs.unlink(this.#lockRecordPath());
+			await fs.rmdir(this.#lock);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+
 	async start(): Promise<BrokerDiscovery> {
 		this.#stopping = false;
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
@@ -411,34 +422,42 @@ export class Broker {
 			}
 			await this.#reclaimStaleLock(snapshot);
 		}
-		await this.index.open();
-		await this.ledger.open();
-		const now = Date.now();
-		const incarnation = brokerProcessIncarnation(process.pid);
-		if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
-		const token = newBrokerToken();
-		this.#transport = new BrokerTransport(this, token, this.settings.port);
-		const port = await this.#transport.start();
-		this.discovery = {
-			version: 1,
-			protocolVersion: 3,
-			packageGeneration: this.settings.packageGeneration,
-			ownerId: this.#owner,
-			pid: process.pid,
-			incarnation,
-			host: "127.0.0.1",
-			port,
-			url: `ws://127.0.0.1:${port}`,
-			token,
-			startedAt: now,
-			heartbeatAt: now,
-		};
-		await writeBrokerDiscovery(this.settings.agentDir, this.discovery);
-		this.#heartbeatTimer = setInterval(
-			() => void this.heartbeat(),
-			Math.max(1, Math.floor(this.settings.heartbeatTtlMs / 3)),
-		);
-		return this.discovery;
+		try {
+			await this.index.open();
+			await this.ledger.open();
+			const now = Date.now();
+			const incarnation = brokerProcessIncarnation(process.pid);
+			if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
+			const token = newBrokerToken();
+			this.#transport = new BrokerTransport(this, token, this.settings.port);
+			const port = await this.#transport.start();
+			this.discovery = {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: this.settings.packageGeneration,
+				ownerId: this.#owner,
+				pid: process.pid,
+				incarnation,
+				host: "127.0.0.1",
+				port,
+				url: `ws://127.0.0.1:${port}`,
+				token,
+				startedAt: now,
+				heartbeatAt: now,
+			};
+			await writeBrokerDiscovery(this.settings.agentDir, this.discovery);
+			this.#heartbeatTimer = setInterval(
+				() => void this.heartbeat(),
+				Math.max(1, Math.floor(this.settings.heartbeatTtlMs / 3)),
+			);
+			return this.discovery;
+		} catch (error) {
+			await this.#transport?.stop();
+			this.#transport = null;
+			this.discovery = null;
+			await this.#releaseOwnedLock();
+			throw error;
+		}
 	}
 	get ownsDiscovery(): boolean {
 		return this.discovery?.ownerId === this.#owner;
@@ -472,15 +491,7 @@ export class Broker {
 			} catch (e) {
 				if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
 			}
-			try {
-				const lock = await this.#readLock();
-				if (lock?.ownerId === this.#owner) {
-					await fs.unlink(this.#lockRecordPath());
-					await fs.rmdir(this.#lock);
-				}
-			} catch (e) {
-				if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-			}
+			await this.#releaseOwnedLock();
 		}
 		this.discovery = null;
 	}

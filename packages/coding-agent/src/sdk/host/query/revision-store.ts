@@ -531,12 +531,13 @@ export class RevisionStore {
 		const chunkLengths: number[] = [];
 		const hash = createHash("sha256");
 		let bytes = 0;
-		let buffer = Buffer.allocUnsafe(CHUNK_BYTES);
+		// Reuse one staging chunk across flushes. Nested large strings therefore retain
+		// one chunk-sized buffer rather than allocating one buffer per emitted chunk.
+		const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
 		let bufferBytes = 0;
 		const flush = async () => {
 			if (bufferBytes === 0) return;
 			const data = buffer.subarray(0, bufferBytes);
-			buffer = Buffer.allocUnsafe(CHUNK_BYTES);
 			bufferBytes = 0;
 			const chunkHash = createHash("sha256").update(data).digest("hex");
 			const file = join(directory, "objects", chunkHash);

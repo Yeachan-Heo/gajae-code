@@ -30,6 +30,32 @@ describe("SDK session index", () => {
 		expect(replay.listSessions().indexSeq).toBe(1);
 		expect(replay.listSessions().warnings).not.toHaveLength(0);
 	});
+	it("resyncs a stale reader after another index rotates the log", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const writer = await new SessionIndex(dir).open();
+		const reader = await new SessionIndex(dir).open();
+		await writer.append(event("before"));
+		await reader.refresh();
+		await writer.snapshot();
+		const log = path.join(dir, "sdk", "sessions", "index.jsonl");
+		await fs.rename(`${log}.rotating`, log).catch(() => undefined);
+		await fs.writeFile(log, "");
+		await writer.append(event("after"));
+		await reader.refresh();
+		expect(reader.listSessions().sessions.map(session => session.sessionId)).toEqual(["before", "after"]);
+	});
+	it("does not let a stale snapshot overwrite a newer snapshot", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const stale = await new SessionIndex(dir).open();
+		const writer = await new SessionIndex(dir).open();
+		await writer.append(event("one"));
+		await writer.snapshot();
+		await writer.append(event("two"));
+		await writer.snapshot();
+		await stale.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		expect(snapshot.indexSeq).toBe(2);
+	});
 	it("serializes concurrent writers and replays a strictly monotonic log", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const one = await new SessionIndex(dir).open();

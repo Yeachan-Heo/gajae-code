@@ -414,7 +414,7 @@ export class QueryHandlers {
 		let index = offset;
 		while (index < values.length) {
 			const item = values[index]!;
-			const itemBytes = Buffer.byteLength(JSON.stringify(item));
+			const itemBytes = Buffer.byteLength(JSON.stringify(item) ?? "null");
 			const candidateBytes = itemsBytes + itemBytes + (items.length ? 1 : 0);
 			if (candidateBytes > TARGET_PAGE_BYTES && items.length) break;
 			if (candidateBytes > RESPONSE_CEILING_BYTES) break;

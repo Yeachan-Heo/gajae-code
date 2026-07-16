@@ -920,8 +920,6 @@ interface SessionRuntime {
 	turnClosed?: boolean;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
-	/** Stops optional broker presence heartbeats. */
-	stopBrokerHeartbeat: () => void;
 }
 
 /** Request-local requester authority for stable ControlSurface dispatches. */
@@ -2396,9 +2394,6 @@ export function createNotificationsExtension(
 			rt.cancelPostmortemCleanup();
 		} catch {}
 		try {
-			rt.stopBrokerHeartbeat();
-		} catch {}
-		try {
 			rt.disposeAnswerSource();
 		} catch {}
 		try {
@@ -2559,7 +2554,6 @@ export function createNotificationsExtension(
 		}
 		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? redact, tag);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
-		let stopBrokerHeartbeat = () => {};
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
 			const quiesced = resolution.then(
@@ -2981,7 +2975,6 @@ export function createNotificationsExtension(
 			gatePresentations,
 			stopping: false,
 			cancelPostmortemCleanup: () => {},
-			stopBrokerHeartbeat,
 
 			redact,
 			verbosity,
@@ -3446,7 +3439,6 @@ export function createNotificationsExtension(
 				}
 			}
 
-			runtime.stopBrokerHeartbeat = stopBrokerHeartbeat;
 			const startedRuntime = runtime;
 			runtime.enableNotifications = () => {
 				const runtime = startedRuntime;
