@@ -20,7 +20,15 @@ import {
 	resolveOutputSinkHeadBytes,
 	stripOutputNotice,
 } from "./output-meta";
-import { expandHintSuffix, formatTitle, replaceTabs, shortenPath, truncateToWidth, wrapBrackets } from "./render-utils";
+import {
+	expandHintSuffix,
+	formatTitle,
+	replaceTabs,
+	resolveRenderCapability,
+	shortenPath,
+	truncateToWidth,
+	wrapBrackets,
+} from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -877,7 +885,7 @@ export const evalToolRenderer = {
 							width,
 							codeMaxLines: EVAL_DEFAULT_PREVIEW_LINES,
 							expanded: true,
-							expandHintCapability: _options.expandHintCapability,
+							expandHintCapability: resolveRenderCapability(_options),
 						},
 						uiTheme,
 					);
@@ -950,7 +958,7 @@ export const evalToolRenderer = {
 							outputLines.push(
 								uiTheme.fg(
 									"dim",
-									`… ${outputContent.hiddenCount} more lines${expandHintSuffix(uiTheme, options.expandHintCapability)}`,
+									`… ${outputContent.hiddenCount} more lines${expandHintSuffix(uiTheme, resolveRenderCapability(options))}`,
 								),
 							);
 						}
@@ -974,7 +982,7 @@ export const evalToolRenderer = {
 								outputMaxLines: outputLines.length,
 								codeMaxLines: expanded ? Number.POSITIVE_INFINITY : EVAL_DEFAULT_PREVIEW_LINES,
 								expanded,
-								expandHintCapability: options.expandHintCapability,
+								expandHintCapability: resolveRenderCapability(options),
 								width,
 							},
 							uiTheme,
@@ -1071,7 +1079,7 @@ export const evalToolRenderer = {
 					outputLines.push("");
 					const skippedLine = uiTheme.fg(
 						"dim",
-						`… (${cachedSkipped} earlier lines, showing ${cachedLines.length} of ${cachedSkipped + cachedLines.length})${expandHintSuffix(uiTheme, options.expandHintCapability)}`,
+						`… (${cachedSkipped} earlier lines, showing ${cachedLines.length} of ${cachedSkipped + cachedLines.length})${expandHintSuffix(uiTheme, resolveRenderCapability(options))}`,
 					);
 					outputLines.push(truncateToWidth(skippedLine, width));
 				}

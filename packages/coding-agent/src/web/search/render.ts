@@ -1,3 +1,4 @@
+import { resolveRenderCapability } from "../../tools/render-utils";
 /**
  * Web Search TUI Rendering
  *
@@ -95,7 +96,7 @@ export function renderSearchResult(
 	const rawText = result.content?.find(block => block.type === "text")?.text?.trim() ?? "";
 	const response = details?.response;
 	if (!response) {
-		return renderFallbackText(rawText, options.expanded, theme, options.expandHintCapability);
+		return renderFallbackText(rawText, options.expanded, theme, resolveRenderCapability(options));
 	}
 
 	const sources = Array.isArray(response.sources) ? response.sources : [];

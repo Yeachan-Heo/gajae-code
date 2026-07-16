@@ -25,7 +25,7 @@ import { finalizeOutput, loadPage, looksLikeHtml, MAX_OUTPUT_CHARS } from "../we
 import { convertWithMarkit, fetchBinary } from "../web/scrapers/utils";
 import { applyListLimit } from "./list-limit";
 import { formatStyledArtifactReference, type OutputMeta } from "./output-meta";
-import { formatExpandHint, getDomain, replaceTabs } from "./render-utils";
+import { formatExpandHint, getDomain, replaceTabs, resolveRenderCapability } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -1545,7 +1545,7 @@ export function renderReadUrlResult(
 						? previewLines.map(line => uiTheme.fg("dim", line))
 						: [uiTheme.fg("dim", "(no content)")];
 				if (remaining > 0) {
-					const hint = formatExpandHint(uiTheme, expanded, true, options.expandHintCapability);
+					const hint = formatExpandHint(uiTheme, expanded, true, resolveRenderCapability(options));
 					contentPreviewLines.push(uiTheme.fg("muted", `… ${remaining} more lines${hint ? ` ${hint}` : ""}`));
 				}
 				lastExpanded = expanded;

@@ -4,6 +4,7 @@
 import type { AgentTool, AgentToolContext, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { ImageContent, Static, TextContent, TSchema } from "@gajae-code/ai";
 import type { Theme } from "../../modes/theme/theme";
+import { resolveRenderCapability } from "../../tools/render-utils";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
 import type { RegisteredTool, ToolCallEventResult } from "./types";
@@ -44,7 +45,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 						expanded: options.expanded,
 						isPartial: options.isPartial,
 						spinnerFrame: options.spinnerFrame,
-						expandHintCapability: options.expandHintCapability,
+						expandHintCapability: resolveRenderCapability(options),
 					},
 					theme as Theme,
 					args,

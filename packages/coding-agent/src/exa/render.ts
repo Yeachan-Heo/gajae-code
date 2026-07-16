@@ -16,6 +16,7 @@ import {
 	getDomain,
 	getPreviewLines,
 	PREVIEW_LIMITS,
+	resolveRenderCapability,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
 } from "../tools/render-utils";
@@ -63,7 +64,7 @@ export function renderExaResult(
 			const maxLines = expanded ? rawLines.length : Math.min(rawLines.length, COLLAPSED_PREVIEW_LINES);
 			const displayLines = rawLines.slice(0, maxLines);
 			const remaining = rawLines.length - maxLines;
-			const expandHint = formatExpandHint(uiTheme, expanded, remaining > 0, options.expandHintCapability);
+			const expandHint = formatExpandHint(uiTheme, expanded, remaining > 0, resolveRenderCapability(options));
 
 			let text = `${formatStatusIcon("info", uiTheme)} ${uiTheme.fg("dim", "Raw response")}${expandHint}`;
 
@@ -106,7 +107,7 @@ export function renderExaResult(
 		const totalLines = previewText.split("\n").filter(l => l.trim()).length;
 		hasMorePreview = totalLines > COLLAPSED_PREVIEW_LINES || resultCount > 1;
 	}
-	const expandHint = formatExpandHint(uiTheme, expanded, hasMorePreview, options.expandHintCapability);
+	const expandHint = formatExpandHint(uiTheme, expanded, hasMorePreview, resolveRenderCapability(options));
 
 	let text = `${icon} ${uiTheme.fg("dim", summaryText)}${expandHint}`;
 

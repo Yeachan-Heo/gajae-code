@@ -16,6 +16,7 @@ import {
 	formatMoreItems,
 	formatStatusIcon,
 	replaceTabs,
+	resolveRenderCapability,
 	shortenPath,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
@@ -137,7 +138,7 @@ export function renderResult(
 	if (request?.apply !== undefined) requestLines.push(theme.fg("dim", `apply: ${request.apply ? "true" : "false"}`));
 
 	const outputBlock = new CachedOutputBlock();
-	const expandHintCapability = options.expandHintCapability;
+	const expandHintCapability = resolveRenderCapability(options);
 
 	return {
 		render(width: number): string[] {

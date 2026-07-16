@@ -69,7 +69,7 @@ import {
 	splitInternalUrlSel,
 	splitPathAndSel,
 } from "./path-utils";
-import { formatBytes, replaceTabs, shortenPath, wrapBrackets } from "./render-utils";
+import { formatBytes, replaceTabs, resolveRenderCapability, shortenPath, wrapBrackets } from "./render-utils";
 import {
 	executeReadQuery,
 	getRowByKey,
@@ -2270,7 +2270,7 @@ export const readToolRenderer = {
 								title,
 								status: "complete",
 								output: warningLines.length > 0 ? warningLines.join("\n") : undefined,
-								expandHintCapability: options.expandHintCapability,
+								expandHintCapability: resolveRenderCapability(options),
 								expanded,
 								width,
 							},
@@ -2283,7 +2283,7 @@ export const readToolRenderer = {
 								title,
 								status: "complete",
 								output: warningLines.length > 0 ? warningLines.join("\n") : undefined,
-								expandHintCapability: options.expandHintCapability,
+								expandHintCapability: resolveRenderCapability(options),
 								expanded,
 								width,
 							},

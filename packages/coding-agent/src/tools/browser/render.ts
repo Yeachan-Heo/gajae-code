@@ -12,7 +12,7 @@ import type { Theme } from "../../modes/theme/theme";
 import { Hasher, renderCodeCell, renderStatusLine } from "../../tui";
 import type { BrowserToolDetails } from "../browser";
 import { formatStyledTruncationWarning, stripOutputNotice } from "../output-meta";
-import { replaceTabs, shortenPath } from "../render-utils";
+import { replaceTabs, resolveRenderCapability, shortenPath } from "../render-utils";
 
 const BROWSER_DEFAULT_PREVIEW_LINES = 10;
 
@@ -129,7 +129,7 @@ function renderRunCell(
 					outputMaxLines: expanded ? Number.POSITIVE_INFINITY : previewLines,
 					codeMaxLines: expanded ? Number.POSITIVE_INFINITY : previewLines,
 					expanded,
-					expandHintCapability: options.expandHintCapability,
+					expandHintCapability: resolveRenderCapability(options),
 					width,
 				},
 				theme,

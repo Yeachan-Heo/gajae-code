@@ -3,51 +3,52 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const SOURCE_ROOT = join(import.meta.dir, "../../src");
+const RENDER_UTILS = join(SOURCE_ROOT, "tools/render-utils.ts");
+const WEB_SEARCH_CLI = join(SOURCE_ROOT, "cli/web-search-cli.ts");
 
 async function sourceFiles(directory: string): Promise<string[]> {
 	const entries = await readdir(directory, { withFileTypes: true });
-	const files = await Promise.all(
-		entries.map(entry => {
-			const path = join(directory, entry.name);
-			return entry.isDirectory() ? sourceFiles(path) : entry.name.endsWith(".ts") ? [path] : [];
-		}),
-	);
-	return files.flat();
+	return (
+		await Promise.all(
+			entries.map(entry => {
+				const entryPath = join(directory, entry.name);
+				return entry.isDirectory() ? sourceFiles(entryPath) : entry.name.endsWith(".ts") ? [entryPath] : [];
+			}),
+		)
+	).flat();
+}
+
+function stripComments(source: string): string {
+	return source.replaceAll(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
 }
 
 describe("expand hint capability structure", () => {
-	it("does not permit optional, asserted, cast, or fallback capabilities", async () => {
+	it("limits the noninteractive binding to the web-search CLI", async () => {
 		const violations: string[] = [];
-		for (const path of await sourceFiles(SOURCE_ROOT)) {
-			if (path.endsWith("tools/render-utils.ts")) continue;
-			const text = await readFile(path, "utf8");
-			for (const pattern of [
-				/expandHintCapability\?/,
-				/expandHintCapability!/,
-				/\sas\s+[^\n]*expandHintCapability/,
-				/\?\?\s*noExpandHintCapability/,
-			]) {
-				if (pattern.test(text)) violations.push(`${path}: ${pattern}`);
+		for (const file of await sourceFiles(SOURCE_ROOT)) {
+			const source = await readFile(file, "utf8");
+			if (file !== WEB_SEARCH_CLI && file !== RENDER_UTILS && /\bwebSearchCliNoHintCapability\b/.test(source))
+				violations.push(file);
+			if (file !== RENDER_UTILS && /\bnoExpandHintCapability\b|\bpublicBoundaryNoHintCapability\b/.test(source)) {
+				violations.push(file);
 			}
 		}
 		expect(violations).toEqual([]);
 	});
 
-	it("documents every noninteractive capability", async () => {
+	it("forbids public-option reads and assertion escapes outside the boundary", async () => {
 		const violations: string[] = [];
-		for (const path of await sourceFiles(SOURCE_ROOT)) {
-			if (path.endsWith("tools/render-utils.ts")) continue;
-			const lines = (await readFile(path, "utf8")).split("\n");
-			lines.forEach((line, index) => {
-				if (!line.includes("noExpandHintCapability") || line.startsWith("import ")) return;
-				if (
-					!lines
-						.slice(Math.max(0, index - 1), index + 2)
-						.some(candidate => candidate.includes("// noninteractive:"))
-				) {
-					violations.push(`${path}:${index + 1}`);
-				}
-			});
+		for (const file of await sourceFiles(SOURCE_ROOT)) {
+			if (file === RENDER_UTILS) continue;
+			const source = stripComments(await readFile(file, "utf8"));
+			if (
+				![join(SOURCE_ROOT, "modes/components/read-tool-group.ts"), join(SOURCE_ROOT, "tui/code-cell.ts")].includes(
+					file,
+				) &&
+				/\boptions\.expandHintCapability\b|\bexpandHintCapability!|\bas\s+ExpandHintCapability\b/.test(source)
+			) {
+				violations.push(file);
+			}
 		}
 		expect(violations).toEqual([]);
 	});

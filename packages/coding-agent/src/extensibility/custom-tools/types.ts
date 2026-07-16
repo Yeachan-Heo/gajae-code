@@ -136,8 +136,8 @@ export interface RenderResultOptions {
 	isPartial: boolean;
 	/** Current spinner frame index for animated elements (0-9, only provided during partial results) */
 	spinnerFrame?: number;
-	/** Interactive-mode focus capability for render-time expansion hints. */
-	expandHintCapability: import("../../tools/render-utils").ExpandHintCapability;
+	/** Interactive hosts inject a focus capability; absent means noninteractive rendering (no expansion hints). */
+	expandHintCapability?: import("../../tools/render-utils").ExpandHintCapability;
 }
 
 export type CustomToolResult<TDetails = any> = AgentToolResult<TDetails>;

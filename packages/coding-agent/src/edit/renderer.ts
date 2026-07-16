@@ -1,3 +1,4 @@
+import { resolveRenderCapability } from "../tools/render-utils";
 /**
  * Edit tool renderer and LSP batching helpers.
  */
@@ -609,7 +610,7 @@ function renderSingleFileResult(
 					expanded,
 					uiTheme,
 					renderDiffFn,
-					options.expandHintCapability,
+					resolveRenderCapability(options),
 				);
 			} else if (editDiffPreview) {
 				if ("error" in editDiffPreview) {
@@ -621,7 +622,7 @@ function renderSingleFileResult(
 						expanded,
 						uiTheme,
 						renderDiffFn,
-						options.expandHintCapability,
+						resolveRenderCapability(options),
 					);
 				}
 			}
@@ -632,7 +633,7 @@ function renderSingleFileResult(
 					expanded,
 					uiTheme,
 					(fp: string) => uiTheme.getLangIcon(getLanguageFromPath(fp)),
-					options.expandHintCapability,
+					resolveRenderCapability(options),
 				);
 			}
 

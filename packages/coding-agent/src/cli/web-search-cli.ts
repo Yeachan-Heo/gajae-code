@@ -8,7 +8,7 @@ import { APP_NAME } from "@gajae-code/utils";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
 import { initTheme, theme } from "../modes/theme/theme";
-import { noExpandHintCapability } from "../tools/render-utils";
+import { webSearchCliNoHintCapability } from "../tools/render-utils";
 import {
 	getConfiguredSearchProviderPreference,
 	isConfigurableSearchProviderId,
@@ -209,7 +209,7 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 			expanded: cmd.expanded,
 			isPartial: false,
 			// noninteractive: CLI output has no TUI focus or overlay.
-			expandHintCapability: noExpandHintCapability,
+			expandHintCapability: webSearchCliNoHintCapability,
 		},
 		theme,
 		{

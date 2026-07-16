@@ -44,6 +44,7 @@ import {
 	formatStatusIcon,
 	PREVIEW_LIMITS,
 	replaceTabs,
+	resolveRenderCapability,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
 } from "./render-utils";
@@ -581,7 +582,7 @@ export const debugToolRenderer = {
 					displayedLines.push(
 						theme.fg(
 							"muted",
-							`… ${remaining} more lines ${formatExpandHint(theme, options.expanded, true, options.expandHintCapability)}`,
+							`… ${remaining} more lines ${formatExpandHint(theme, options.expanded, true, resolveRenderCapability(options))}`,
 						),
 					);
 				}

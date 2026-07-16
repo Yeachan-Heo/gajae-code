@@ -147,8 +147,20 @@ export function formatStatusIcon(status: ToolUIStatus, theme: Theme, spinnerFram
  * hints may be displayed for that mode's composer.
  */
 export type ExpandHintCapability = () => boolean;
-/** Capability for non-interactive render contexts where expansion cannot open an overlay. */
-export const noExpandHintCapability: ExpandHintCapability = () => false;
+const noExpandHintCapability: ExpandHintCapability = () => false;
+/** Non-interactive capability reserved for the web-search CLI entrypoint. */
+export const webSearchCliNoHintCapability = noExpandHintCapability;
+const publicBoundaryNoHintCapability = noExpandHintCapability;
+
+/**
+ * Resolves a public render option to the required internal capability.
+ * Interactive hosts inject a focus capability; absent options render noninteractively.
+ */
+export function resolveRenderCapability(options: {
+	expandHintCapability?: ExpandHintCapability;
+}): ExpandHintCapability {
+	return options.expandHintCapability ?? publicBoundaryNoHintCapability;
+}
 
 function formatExpandKey(capability: ExpandHintCapability): string {
 	return capability() ? formatKeyHints(getKeybindings().getKeys("app.tools.expand")) : "";

@@ -16,6 +16,7 @@ import {
 	formatStatusIcon,
 	PREVIEW_LIMITS,
 	replaceTabs,
+	resolveRenderCapability,
 	type ToolUIColor,
 	type ToolUIStatus,
 	TRUNCATE_LENGTHS,
@@ -303,7 +304,7 @@ function buildWatchLines(
 	}
 
 	lines.push(
-		...renderFailedLogs(watch.failedLogs ?? [], width, theme, options.expanded, options.expandHintCapability),
+		...renderFailedLogs(watch.failedLogs ?? [], width, theme, options.expanded, resolveRenderCapability(options)),
 	);
 	return lines;
 }
@@ -358,7 +359,7 @@ function renderFallbackComponent(
 				out.push(truncateVisualWidth(colored, lineWidth));
 			}
 			if (!expanded && remaining > 0) {
-				const hint = formatExpandHint(theme, expanded, true, options.expandHintCapability);
+				const hint = formatExpandHint(theme, expanded, true, resolveRenderCapability(options));
 				const more = `${formatMoreItems(remaining, "line")}${hint ? ` ${hint}` : ""}`;
 				out.push(theme.fg("dim", more));
 			}

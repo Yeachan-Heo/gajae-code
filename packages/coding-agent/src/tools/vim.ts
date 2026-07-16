@@ -28,7 +28,7 @@ import { assertEditableFile } from "./auto-generated-guard";
 import { isReadableUrlPath } from "./fetch";
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
 import { enforcePlanModeWrite } from "./plan-mode-guard";
-import { formatDiagnostics, replaceTabs } from "./render-utils";
+import { formatDiagnostics, replaceTabs, resolveRenderCapability } from "./render-utils";
 import { isSqliteFile, parseSqlitePathCandidates } from "./sqlite-reader";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
@@ -881,7 +881,7 @@ export const vimToolRenderer = {
 				options.expanded,
 				uiTheme,
 				(filePath: string) => uiTheme.getLangIcon(getLanguageFromPath(filePath)),
-				options.expandHintCapability,
+				resolveRenderCapability(options),
 			);
 			if (diagText) {
 				sections.push({ lines: [diagText] });

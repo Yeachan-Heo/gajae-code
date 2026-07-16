@@ -18,7 +18,7 @@ import {
 	JSON_TREE_SCALAR_LEN_EXPANDED,
 	renderJsonTreeLines,
 } from "../tools/json-tree";
-import { formatExpandHint, truncateToWidth } from "../tools/render-utils";
+import { formatExpandHint, resolveRenderCapability, truncateToWidth } from "../tools/render-utils";
 import { renderStatusLine } from "../tui";
 import type { MCPToolDetails } from "./tool-bridge";
 
@@ -49,7 +49,8 @@ function renderMCPResultStatic(
 	theme: Theme,
 	args?: Record<string, unknown>,
 ): Component {
-	const { expanded, expandHintCapability } = options;
+	const { expanded } = options;
+	const expandHintCapability = resolveRenderCapability(options);
 	const lines: string[] = [];
 
 	// Args section (when expanded)

@@ -54,6 +54,7 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { Settings, type SkillsSettings } from "../config/settings";
 import { CursorExecHandlers } from "../cursor";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
+import { resolveRenderCapability } from "../tools/render-utils";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
@@ -695,7 +696,7 @@ function customToolToDefinition(tool: CustomTool): ToolDefinition {
 							expanded: options.expanded,
 							isPartial: options.isPartial,
 							spinnerFrame: options.spinnerFrame,
-							expandHintCapability: options.expandHintCapability,
+							expandHintCapability: resolveRenderCapability(options),
 						},
 						theme,
 					);
