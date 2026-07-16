@@ -143,13 +143,34 @@ export function formatStatusIcon(status: ToolUIStatus, theme: Theme, spinnerFram
 }
 
 /**
+ * Tool-output expansion hints advertise `app.tools.expand` only while the
+ * composer owns input focus.
+ */
+let expandHintOwnerFocused = true;
+
+export function setExpandHintOwnerFocused(focused: boolean): void {
+	expandHintOwnerFocused = focused;
+}
+
+function formatExpandKey(): string {
+	return expandHintOwnerFocused ? formatKeyHints(getKeybindings().getKeys("app.tools.expand")) : "";
+}
+
+/**
  * Format the expand hint with proper theming.
- * Returns empty string if already expanded or there is nothing more to show.
+ * Returns empty string if already expanded, there is nothing more to show, or
+ * the composer does not own input focus.
  */
 export function formatExpandHint(theme: Theme, expanded?: boolean, hasMore?: boolean): string {
 	if (expanded || hasMore === false) return "";
-	const key = formatKeyHints(getKeybindings().getKeys("app.tools.expand"));
+	const key = formatExpandKey();
 	return key ? theme.fg("dim", wrapBrackets(`(${key} for more)`, theme)) : "";
+}
+
+/** Format a suffix for collapsed tool output that can be expanded. */
+export function expandHintSuffix(_theme: Theme): string {
+	const key = formatExpandKey();
+	return key ? ` (${key} to expand)` : "";
 }
 
 /**
