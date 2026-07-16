@@ -1174,7 +1174,6 @@ export async function reconcileWorkflowSkillState(options: {
 			toPhase: trimmedPhase,
 		},
 	};
-	let reconciledPayload: Record<string, unknown> = {};
 	let reconciledReceipt: WorkflowStateReceipt | undefined;
 	const buildMergedEnvelope = (existingPayload: Record<string, unknown>): Record<string, unknown> => {
 		const fromPhase =
@@ -1213,29 +1212,41 @@ export async function reconcileWorkflowSkillState(options: {
 		const validation = validateWorkflowStateEnvelope(mode, merged);
 		if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
 
-		reconciledPayload = merged;
 		reconciledReceipt = receipt;
 		writerOptions.receipt.fromPhase = fromPhase;
 		writerOptions.audit.fromPhase = fromPhase;
 		return merged;
 	};
 
+	let published: { revision: number; stamped: Record<string, unknown> };
 	if (existingRead.kind === "corrupt") {
 		try {
-			await writeGuardedWorkflowEnvelopeAtomic(filePath, buildMergedEnvelope({}), {
+			const result = await writeGuardedWorkflowEnvelopeAtomic(filePath, buildMergedEnvelope({}), {
 				...writerOptions,
 				policy: "source",
 				expectedRevision: 0,
 			});
+			if (!result.written || !isPlainObject(result.stamped)) {
+				throw new Error(`Reconciliation did not publish a workflow envelope at ${filePath}`);
+			}
+			published = { revision: result.revision, stamped: result.stamped };
 		} catch (error) {
 			if (!(error instanceof StateWriteConflictError)) throw error;
-			await updateWorkflowEnvelopeAtomic(filePath, current => buildMergedEnvelope(current ?? {}), writerOptions);
+			published = await updateWorkflowEnvelopeAtomic(
+				filePath,
+				current => buildMergedEnvelope(current ?? {}),
+				writerOptions,
+			);
 		}
 	} else {
-		await updateWorkflowEnvelopeAtomic(filePath, current => buildMergedEnvelope(current ?? {}), writerOptions);
+		published = await updateWorkflowEnvelopeAtomic(
+			filePath,
+			current => buildMergedEnvelope(current ?? {}),
+			writerOptions,
+		);
 	}
-	const persisted = (await readJsonFile(filePath)) ?? {};
-	const sourceRevision = options.sourceRevision ?? existingStateRevision(persisted);
+	const reconciledPayload = published.stamped;
+	const sourceRevision = options.sourceRevision ?? published.revision;
 
 	// Reconciliation drives the active-state/HUD update directly (not via the
 	// best-effort syncWorkflowSkillState wrapper) so a failed HUD/active-state write

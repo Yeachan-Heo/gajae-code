@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -7,9 +7,14 @@ import {
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { reconcileWorkflowSkillState, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import {
+	updateWorkflowEnvelopeAtomic,
+	type WorkflowEnvelopeUpdateResult,
+} from "@gajae-code/coding-agent/gjc-runtime/state-writer";
+
+type Utf8ReadFile = (filePath: string, encoding: "utf-8") => Promise<string>;
 
 const TEST_SESSION_ID = "test-session";
-
 const tempRoots: string[] = [];
 
 async function tempDir(): Promise<string> {
@@ -170,6 +175,82 @@ describe("native gjc state runtime", () => {
 		) as Record<string, unknown>;
 		expect(persisted.first_reconcile_field).toBe("first");
 		expect(persisted.second_reconcile_field).toBe("second");
+	});
+	it("keeps reconciliation HUD and source revision bound to its lock-owned envelope during an interleaving write", async () => {
+		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "ralplan");
+		const originalRename = fs.rename;
+		const originalReadFile = fs.readFile as Utf8ReadFile;
+		let published = false;
+		let competingWrite: Promise<WorkflowEnvelopeUpdateResult> | undefined;
+		let readAfterPublicationStartedWriter = false;
+		const renameSpy = spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
+			const result = await originalRename(oldPath, newPath);
+			if (newPath === statePath) published = true;
+			return result;
+		});
+		const readFileSpy = spyOn(fs, "readFile");
+		readFileSpy.mockImplementation(((filePath: string, encoding: "utf-8") => {
+			if (published && competingWrite === undefined && filePath === statePath) {
+				readAfterPublicationStartedWriter = true;
+				competingWrite = updateWorkflowEnvelopeAtomic(
+					statePath,
+					current => ({
+						...current,
+						iteration: 2,
+						verdict: "ITERATE",
+						updated_at: "2026-01-01T00:00:01.000Z",
+					}),
+					{ cwd: root },
+				);
+				return competingWrite.then(() => originalReadFile(filePath, encoding));
+			}
+			return originalReadFile(filePath, encoding);
+		}) as typeof fs.readFile);
+
+		try {
+			await reconcileWorkflowSkillState({
+				cwd: root,
+				mode: "ralplan",
+				sessionId: TEST_SESSION_ID,
+				active: true,
+				phase: "planner",
+				payload: { iteration: 1, verdict: "PASS" },
+			});
+			if (!competingWrite) {
+				competingWrite = updateWorkflowEnvelopeAtomic(
+					statePath,
+					current => ({
+						...current,
+						iteration: 2,
+						verdict: "ITERATE",
+						updated_at: "2026-01-01T00:00:01.000Z",
+					}),
+					{ cwd: root },
+				);
+			}
+			const competingResult = await competingWrite;
+			const persisted = JSON.parse(await originalReadFile(statePath, "utf-8")) as Record<string, unknown>;
+			const active = JSON.parse(await originalReadFile(activeSnapshotPath(root, TEST_SESSION_ID), "utf-8")) as {
+				active_skills?: Array<{
+					skill: string;
+					source_state_revision?: number;
+					hud?: { chips?: Array<{ label: string; value?: string }> };
+				}>;
+			};
+			const activeEntry = active.active_skills?.find(entry => entry.skill === "ralplan");
+			const verdict = activeEntry?.hud?.chips?.find(chip => chip.label === "verdict");
+
+			expect(readAfterPublicationStartedWriter).toBe(false);
+			expect(competingResult.revision).toBe(2);
+			expect(persisted.state_revision).toBe(competingResult.revision);
+			expect(persisted.verdict).toBe("ITERATE");
+			expect(activeEntry?.source_state_revision).toBe(competingResult.revision - 1);
+			expect(verdict?.value).toBe("PASS");
+		} finally {
+			readFileSpy.mockRestore();
+			renameSpy.mockRestore();
+		}
 	});
 
 	it("deletes a key when the payload value is null", async () => {

@@ -8,7 +8,6 @@ import {
 	updateJsonAtomic,
 	updateWorkflowEnvelopeAtomic,
 	withWorkflowStateLock,
-	writeGuardedWorkflowEnvelopeAtomic,
 	writeWorkflowEnvelopeAtomic,
 } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "@gajae-code/coding-agent/skill-state/workflow-state-contract";
@@ -151,23 +150,24 @@ describe("state-writer concurrency (issue #646)", () => {
 			mutationId: `state-writer-cas:${marker}`,
 		});
 
-		const first = await writeGuardedWorkflowEnvelopeAtomic(target, envelope("first", "2026-01-01T00:00:00.000Z"), {
+		const first = await updateWorkflowEnvelopeAtomic(target, () => envelope("first", "2026-01-01T00:00:00.000Z"), {
 			cwd: root,
-			policy: "source",
 			receipt: receipt("first"),
 		});
-		const second = await writeGuardedWorkflowEnvelopeAtomic(target, envelope("second", "2026-01-01T00:00:01.000Z"), {
-			cwd: root,
-			policy: "source",
-			receipt: receipt("second"),
-		});
+		const second = await updateWorkflowEnvelopeAtomic(
+			target,
+			current => ({ ...current, marker: "second", updated_at: "2026-01-01T00:00:01.000Z" }),
+			{
+				cwd: root,
+				receipt: receipt("second"),
+			},
+		);
 
-		if (!first.written) throw new Error("first write unexpectedly stale-skipped");
-		if (!second.written) throw new Error("second write unexpectedly stale-skipped");
-		const firstStamped = first.stamped as Record<string, unknown>;
-		expect(firstStamped.marker).toBe("first");
-		expect(firstStamped.state_revision).toBe(1);
-		expect((firstStamped.receipt as Record<string, unknown>).mutation_id).toBe("state-writer-cas:first");
+		expect(first.stamped.marker).toBe("first");
+		expect(first.revision).toBe(1);
+		expect((first.stamped.receipt as Record<string, unknown>).mutation_id).toBe("state-writer-cas:first");
+		expect(second.stamped.marker).toBe("second");
+		expect(second.revision).toBe(2);
 
 		const final = await readJson(filePath);
 		expect(final.marker).toBe("second");

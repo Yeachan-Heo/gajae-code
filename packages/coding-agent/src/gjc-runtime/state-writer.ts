@@ -106,6 +106,11 @@ export interface GuardedStateWriterOptions extends StateWriterOptions {
 export type GuardedWriteResult =
 	| { path: string; written: true; revision: number; stamped: unknown }
 	| { path: string; written: false; reason: "stale-skip"; revision: number };
+export interface WorkflowEnvelopeUpdateResult {
+	path: string;
+	revision: number;
+	stamped: Record<string, unknown>;
+}
 
 export interface StateWriterOptions {
 	cwd?: string;
@@ -954,23 +959,18 @@ async function writeWorkflowEnvelopeAtomicLocked(
 	filePath: string,
 	value: unknown,
 	options: StateWriterOptions | undefined,
-): Promise<string> {
+): Promise<WorkflowEnvelopeUpdateResult> {
 	const existing = await readExistingStateForMutation(filePath);
 	if (existing.kind === "corrupt" && options?.audit?.forced !== true) {
 		throw new Error(`Refusing to overwrite corrupt workflow state envelope at ${filePath}: ${existing.error}`);
 	}
-	const stamped = stampWorkflowEnvelopeRevisionAndChecksum(
-		value,
-		filePath,
-		(existing.kind === "valid" ? persistedStateRevision(existing.value) : 0) + 1,
-		undefined,
-		options,
-	);
+	const revision = (existing.kind === "valid" ? persistedStateRevision(existing.value) : 0) + 1;
+	const stamped = stampWorkflowEnvelopeRevisionAndChecksum(value, filePath, revision, undefined, options);
 	await assertWorkflowEnvelopeTransition(stamped, filePath, options);
 	await establishReceiptActiveSnapshot(stamped, filePath, options);
 	await atomicWrite(filePath, jsonText(stamped));
 	await maybeAudit(filePath, options);
-	return filePath;
+	return { path: filePath, revision, stamped: stamped as Record<string, unknown> };
 }
 
 /**
@@ -984,11 +984,12 @@ export async function writeWorkflowEnvelopeAtomic(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	return lockResolvedWorkflowTarget(
+	const result = await lockResolvedWorkflowTarget(
 		filePath,
 		() => writeWorkflowEnvelopeAtomicLocked(filePath, value, options),
 		options?.lock,
 	);
+	return result.path;
 }
 
 /**
@@ -1000,7 +1001,7 @@ export async function updateWorkflowEnvelopeAtomic<T extends Record<string, unkn
 	targetPath: string,
 	mutator: (current: T | undefined) => T | Promise<T>,
 	options?: StateWriterOptions,
-): Promise<string> {
+): Promise<WorkflowEnvelopeUpdateResult> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
 	return lockResolvedWorkflowTarget(
 		filePath,
