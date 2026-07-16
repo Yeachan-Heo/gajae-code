@@ -5,6 +5,7 @@ import * as compactionModule from "@gajae-code/agent-core/compaction";
 import { getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { GoalModeState } from "@gajae-code/coding-agent/goals/state";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -66,6 +67,22 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 		}
 	}
 
+	function activeGoalState(): GoalModeState {
+		return {
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "Keep working",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		};
+	}
+
 	it("skips an unchanged oversized auto-maintenance retry after a context-length failure", async () => {
 		appendConversation();
 		const events: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>[] = [];
@@ -93,6 +110,29 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 			willRetry: false,
 			errorMessage: expect.stringContaining("previous unchanged maintenance request exceeded"),
 		});
+	});
+	it("keeps active goals running after unrelated idle maintenance failures", async () => {
+		appendConversation();
+		session.setGoalModeState(activeGoalState());
+		const events: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") events.push(event);
+		});
+		vi.spyOn(compactionModule, "compact").mockRejectedValue(
+			new Error("prompt is too long: 213462 tokens > 200000 maximum"),
+		);
+
+		await session.runIdleCompaction();
+		await session.runIdleCompaction();
+
+		expect(events).toHaveLength(2);
+		expect(events[0].goal_finalized).toBe(false);
+		expect(events[0].skipped).toBeUndefined();
+		expect(events[1]).toMatchObject({ goal_finalized: false, skipped: true });
+		const goalState = session.getGoalModeState();
+		expect(goalState?.enabled).toBe(true);
+		expect(goalState?.goal.status).toBe("active");
+		expect(goalState?.goal.last_error).toBeUndefined();
 	});
 
 	it("allows a new oversized maintenance attempt after the conversation changes", async () => {

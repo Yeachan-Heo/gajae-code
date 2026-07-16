@@ -3445,6 +3445,10 @@ export class AgentSession {
 		return true;
 	}
 
+	#shouldFinalizeAutoCompactionGoalFailure(reason: "overflow" | "threshold" | "idle"): boolean {
+		return reason === "overflow" || this.#activeGoalContinuationGenerationId !== undefined;
+	}
+
 	#logCompactionContinuationSkipped(
 		source: "auto_continue_prompt" | "queued_continue" | "overflow_retry",
 		reason: string,
@@ -11003,11 +11007,13 @@ export class AgentSession {
 				if (this.#lastOversizedAutoMaintenanceAttemptSignature === maintenanceAttemptSignature) {
 					const finalError =
 						"Auto-compaction skipped: previous unchanged maintenance request exceeded the model context window; change or reduce the conversation before retrying maintenance.";
-					this.#ensureGoalContinuationGenerationForActiveGoal("auto-compaction-oversized");
-					await this.#finalizeGoalContinuationFailure(finalError, {
-						pauseCause: "compaction_recovery_failed",
-						errorClass: "compaction_recovery_failed",
-					});
+					if (this.#shouldFinalizeAutoCompactionGoalFailure(reason)) {
+						this.#ensureGoalContinuationGenerationForActiveGoal("auto-compaction-oversized");
+						await this.#finalizeGoalContinuationFailure(finalError, {
+							pauseCause: "compaction_recovery_failed",
+							errorClass: "compaction_recovery_failed",
+						});
+					}
 					await this.#emitSessionEvent({
 						type: "auto_compaction_end",
 						action,
@@ -11201,11 +11207,13 @@ export class AgentSession {
 			if (maintenanceAttemptSignature && this.#isOversizedMaintenanceError(errorMessage)) {
 				this.#lastOversizedAutoMaintenanceAttemptSignature = maintenanceAttemptSignature;
 			}
-			this.#ensureGoalContinuationGenerationForActiveGoal("auto-compaction-failure");
-			await this.#finalizeGoalContinuationFailure(errorMessage, {
-				pauseCause: "compaction_recovery_failed",
-				errorClass: "compaction_recovery_failed",
-			});
+			if (this.#shouldFinalizeAutoCompactionGoalFailure(reason)) {
+				this.#ensureGoalContinuationGenerationForActiveGoal("auto-compaction-failure");
+				await this.#finalizeGoalContinuationFailure(errorMessage, {
+					pauseCause: "compaction_recovery_failed",
+					errorClass: "compaction_recovery_failed",
+				});
+			}
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
 				action,
