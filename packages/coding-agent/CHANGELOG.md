@@ -7,6 +7,8 @@
 ### Fixed
 
 - Sessions running a managed model fallback chain no longer wedge with repeated `Retry failed after N attempts: The object can not be cloned.` after a provider HTTP error whose response carried headers. The live `Headers` instance attached to the provider error was not structured-cloneable, so the managed attempt snapshot replaced the real provider failure with a local `DataCloneError` on every model in the chain — misreporting `Model fallback chain exhausted` and permanently failing every subsequent prompt while the provider kept erroring. Transport facts now retain only plain-record retry signals, and the attempt snapshot degrades gracefully instead of failing the attempt.
+### Changed
+- The tool-output expand shortcut now stamps an explicit per-block fold choice, and automatic expansion stamping can no longer overwrite a block whose state came from an explicit user action. All current automatic stamping happens at component creation, so behavior is unchanged today; this locks the invariant for future per-block folds.
 
 ## [0.11.0] - 2026-07-15
 
