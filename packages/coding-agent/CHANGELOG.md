@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- Added configurable Ctrl+Enter send-now behavior for queued and draft prompts during active turns.
 
 ## [0.11.0] - 2026-07-15
 

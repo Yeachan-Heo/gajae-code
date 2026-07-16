@@ -368,6 +368,13 @@ export class InputController {
 				return true;
 			});
 		}
+		for (const key of this.ctx.keybindings.getKeys("app.message.sendNow")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				if (!this.ctx.session.isStreaming || !this.ctx.editor.getText().trim()) return false;
+				void this.#sendNow(this.ctx.editor.getText());
+				return true;
+			});
+		}
 		for (const key of this.ctx.keybindings.getKeys("app.stt.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleSTTToggle());
 		}
@@ -414,10 +421,11 @@ export class InputController {
 			text = text.trim();
 			if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 
-			// Empty submit while streaming with queued messages: flush queues immediately
-			if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
-				// Abort current stream and let queued messages be processed
-				await this.#abortInteractive();
+			// Empty submit while streaming with queued messages sends the next queued
+			// message immediately. Compaction-local messages intentionally stay queued
+			// until compaction completes.
+			if (!text && this.ctx.session.isStreaming) {
+				await this.#sendNextQueuedMessageNow();
 				return;
 			}
 
@@ -544,6 +552,9 @@ export class InputController {
 				await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, promptOptions), {
 					imageCount: images?.length ?? 0,
 				});
+				if (streamingBehavior === "followUp") {
+					this.#showQueuedMessageHint();
+				}
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
 				return;
@@ -937,6 +948,7 @@ export class InputController {
 					followUpQueuePolicy: "sequential",
 				}),
 			);
+			this.#showQueuedMessageHint();
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.ui.requestRender();
 			return;
@@ -951,6 +963,27 @@ export class InputController {
 	/** Send editor text explicitly as a queued next-turn message. */
 	async handleQueueSubmit(): Promise<void> {
 		return this.handleFollowUp();
+	}
+	#showQueuedMessageHint(): void {
+		const sendNowKey = this.ctx.keybindings.getDisplayString?.("app.message.sendNow") || "Ctrl+Enter";
+		this.ctx.showStatus(`Queued — Enter again to send now, ${sendNowKey} to cancel & send`, { dim: true });
+	}
+
+	async #sendNextQueuedMessageNow(): Promise<void> {
+		const queuedMessage = this.ctx.session.getQueuedMessageEntries()[0];
+		if (!queuedMessage) return;
+
+		const text = this.ctx.session.removeQueuedMessageForEditing(queuedMessage.id);
+		this.ctx.updatePendingMessagesDisplay();
+		if (!text) return;
+
+		await this.#sendNow(text);
+	}
+
+	async #sendNow(text: string): Promise<void> {
+		await this.#abortInteractive();
+		this.ctx.editor.setText("");
+		await this.ctx.editor.onSubmit?.(text);
 	}
 
 	restoreLatestQueuedMessageToEditor(): number {

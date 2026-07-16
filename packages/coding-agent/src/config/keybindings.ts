@@ -31,6 +31,7 @@ interface AppKeybindings {
 	"app.tool.backgroundFold": true;
 	"app.editor.external": true;
 	"app.message.followUp": true;
+	"app.message.sendNow": true;
 	"app.message.queue": true;
 	"app.message.dequeue": true;
 	"app.clipboard.pasteImage": true;
@@ -129,6 +130,10 @@ export const KEYBINDINGS = {
 	"app.message.followUp": {
 		defaultKeys: [],
 		description: "Send follow-up message (no default; Ctrl+Enter submits)",
+	},
+	"app.message.sendNow": {
+		defaultKeys: "ctrl+enter",
+		description: "Cancel current turn and send message now",
 	},
 	"app.message.queue": {
 		defaultKeys: defaultMessageQueueKeysForPlatform(),
