@@ -119,7 +119,7 @@ it("renders a highlighted apply summary", async () => {
 				label: "AST Edit: 2 replacements in 1 file",
 			},
 		},
-		{ expanded: false, isPartial: false },
+		{ expanded: false, isPartial: false, expandHintCapability: () => false },
 		uiTheme,
 	);
 

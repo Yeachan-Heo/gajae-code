@@ -303,7 +303,7 @@ function buildWatchLines(
 	}
 
 	lines.push(
-		...renderFailedLogs(watch.failedLogs ?? [], width, theme, options.expanded, options.expandHintCapability!),
+		...renderFailedLogs(watch.failedLogs ?? [], width, theme, options.expanded, options.expandHintCapability),
 	);
 	return lines;
 }
@@ -358,7 +358,7 @@ function renderFallbackComponent(
 				out.push(truncateVisualWidth(colored, lineWidth));
 			}
 			if (!expanded && remaining > 0) {
-				const hint = formatExpandHint(theme, expanded, true, options.expandHintCapability!);
+				const hint = formatExpandHint(theme, expanded, true, options.expandHintCapability);
 				const more = `${formatMoreItems(remaining, "line")}${hint ? ` ${hint}` : ""}`;
 				out.push(theme.fg("dim", more));
 			}

@@ -34,7 +34,7 @@ describe("bashToolRenderer", () => {
 		const uiTheme = theme!;
 		const component = bashToolRenderer.renderCall(
 			{ command: "printf '%s' \"$MERMAID\"", env: { MERMAID: 'line "one"\ntwo' } },
-			{ expanded: false, isPartial: false },
+			{ expanded: false, isPartial: false, expandHintCapability: () => false },
 			uiTheme,
 		);
 		const rendered = sanitizeText(component.render(120).join("\n"));
@@ -51,7 +51,7 @@ describe("bashToolRenderer", () => {
 				command: "printf '%s' \"$MERMAID\"",
 				__partialJson: '{"command":"printf \'%s\' "$MERMAID"","env":{"MERMAID":"line 1\\nline 2',
 			},
-			{ expanded: false, isPartial: true },
+			{ expanded: false, isPartial: true, expandHintCapability: () => false },
 			uiTheme,
 		);
 		const rendered = sanitizeText(component.render(120).join("\n"));
@@ -68,7 +68,7 @@ describe("bashToolRenderer", () => {
 				command: "printf\t'%s'",
 				cwd: path.join(os.homedir(), "projects", "demo"),
 			},
-			{ expanded: false, isPartial: false },
+			{ expanded: false, isPartial: false, expandHintCapability: () => false },
 			uiTheme,
 		);
 		const rendered = sanitizeText(component.render(120).join("\n"));
@@ -83,7 +83,7 @@ describe("bashToolRenderer", () => {
 		const uiTheme = theme!;
 		const component = bashToolRenderer.renderResult(
 			{ content: [{ type: "text", text: "" }], details: { timeoutSeconds: 120 }, isError: false },
-			{ expanded: false, isPartial: false, renderContext: { timeout: 1200 } },
+			{ expanded: false, isPartial: false, renderContext: { timeout: 1200 }, expandHintCapability: () => false },
 			uiTheme,
 			{ command: "sleep 1200", timeout: 1200 },
 		);
@@ -112,6 +112,7 @@ describe("bashToolRenderer", () => {
 				expanded: false,
 				previewLines: 1,
 			},
+			expandHintCapability: () => false,
 		};
 
 		const component = bashToolRenderer.renderResult(
@@ -132,7 +133,7 @@ describe("bashToolRenderer", () => {
 		const sixel = "\x1bPqabc\x1b\\";
 		const component = bashToolRenderer.renderResult(
 			{ content: [{ type: "text", text: sixel }], details: {}, isError: false },
-			{ expanded: true, isPartial: false },
+			{ expanded: true, isPartial: false, expandHintCapability: () => false },
 			theme!,
 			{ command: "echo sixel" },
 		);
@@ -154,7 +155,7 @@ describe("bashToolRenderer", () => {
 		const command = 'for f in a b; do\n\techo "$f"\ndone';
 		const component = bashToolRenderer.renderResult(
 			{ content: [{ type: "text", text: "" }], details: {}, isError: false },
-			{ expanded: false, isPartial: false },
+			{ expanded: false, isPartial: false, expandHintCapability: () => false },
 			uiTheme!,
 			{ command },
 		);

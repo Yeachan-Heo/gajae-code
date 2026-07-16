@@ -91,7 +91,7 @@ function renderMCPResultStatic(
 				}
 				// Always show expand hint when collapsed (expanded view shows longer values and deeper nesting)
 				if (!expanded) {
-					lines.push(formatExpandHint(theme, expanded, true, expandHintCapability!));
+					lines.push(formatExpandHint(theme, expanded, true, expandHintCapability));
 				} else if (tree.truncated) {
 					lines.push(theme.fg("dim", "…"));
 				}
@@ -114,11 +114,11 @@ function renderMCPResultStatic(
 	if (outputLines.length > maxOutputLines) {
 		const remaining = outputLines.length - maxOutputLines;
 		lines.push(
-			`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, expanded, true, expandHintCapability!)}`,
+			`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, expanded, true, expandHintCapability)}`,
 		);
 	} else if (!expanded) {
 		// Show expand hint when collapsed even if all lines shown (lines may be truncated)
-		lines.push(formatExpandHint(theme, expanded, true, expandHintCapability!));
+		lines.push(formatExpandHint(theme, expanded, true, expandHintCapability));
 	}
 
 	return new Text(lines.join("\n"), 0, 0);

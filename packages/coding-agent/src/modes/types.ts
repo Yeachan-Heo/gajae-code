@@ -85,7 +85,7 @@ export interface InteractiveModeContext {
 	btwContainer: Container;
 	editor: CustomEditor;
 	editorContainer: Container;
-	expandHintCapability?: ExpandHintCapability;
+	expandHintCapability: ExpandHintCapability;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;

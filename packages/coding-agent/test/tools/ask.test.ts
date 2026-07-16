@@ -1234,7 +1234,11 @@ describe("AskTool custom input", () => {
 
 		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
-		const rendered = askToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme!);
+		const rendered = askToolRenderer.renderResult(
+			result,
+			{ expanded: true, isPartial: false, expandHintCapability: () => false },
+			theme!,
+		);
 		const renderedText = stripAnsi(rendered.render(120).join("\n"));
 		expect(renderedText).toContain("alpha");
 		expect(renderedText).toContain("custom detail");
@@ -1326,7 +1330,7 @@ describe("AskTool option rendering", () => {
 				question: "Choose one",
 				options: [{ label: longLabel }, { label: "short" }],
 			},
-			{ expanded: true, isPartial: false },
+			{ expanded: true, isPartial: false, expandHintCapability: () => false },
 			theme!,
 		);
 		const lines = stripAnsi(rendered.render(44).join("\n")).split("\n");
@@ -1353,7 +1357,7 @@ describe("AskTool option rendering", () => {
 					},
 				],
 			},
-			{ expanded: true, isPartial: false },
+			{ expanded: true, isPartial: false, expandHintCapability: () => false },
 			theme!,
 		);
 		const lines = stripAnsi(rendered.render(48).join("\n")).split("\n");
@@ -1396,7 +1400,11 @@ describe("AskTool multiline custom input rendering", () => {
 
 		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
-		const rendered = askToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme!);
+		const rendered = askToolRenderer.renderResult(
+			result,
+			{ expanded: true, isPartial: false, expandHintCapability: () => false },
+			theme!,
+		);
 		const renderedText = stripAnsi(rendered.render(120).join("\n"));
 
 		// All three lines should appear
@@ -1451,7 +1459,11 @@ describe("AskTool multiline custom input rendering", () => {
 
 		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
-		const rendered = askToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme!);
+		const rendered = askToolRenderer.renderResult(
+			result,
+			{ expanded: true, isPartial: false, expandHintCapability: () => false },
+			theme!,
+		);
 		const renderedText = stripAnsi(rendered.render(120).join("\n"));
 
 		expect(renderedText).toContain("second line");
@@ -2251,7 +2263,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 				question: rawQuestion,
 				options: [{ label: "CSV" }, { label: "PDF" }],
 			},
-			{ expanded: true, isPartial: false },
+			{ expanded: true, isPartial: false, expandHintCapability: () => false },
 			theme!,
 		);
 		const renderedText = stripAnsi(rendered.render(100).join("\n"));

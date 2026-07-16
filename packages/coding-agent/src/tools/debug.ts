@@ -581,7 +581,7 @@ export const debugToolRenderer = {
 					displayedLines.push(
 						theme.fg(
 							"muted",
-							`… ${remaining} more lines ${formatExpandHint(theme, options.expanded, true, (options as RenderResultOptions & { expandHintCapability: import("./render-utils").ExpandHintCapability }).expandHintCapability)}`,
+							`… ${remaining} more lines ${formatExpandHint(theme, options.expanded, true, options.expandHintCapability)}`,
 						),
 					);
 				}

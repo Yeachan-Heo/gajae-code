@@ -13,7 +13,7 @@ export class BranchSummaryMessageComponent extends Box {
 
 	constructor(
 		private readonly message: BranchSummaryMessage,
-		private readonly expandHintCapability?: ExpandHintCapability,
+		private readonly expandHintCapability: ExpandHintCapability,
 	) {
 		super(1, 1, t => theme.bg("customMessageBg", t));
 		this.#updateDisplay();
@@ -46,7 +46,7 @@ export class BranchSummaryMessageComponent extends Box {
 		} else {
 			this.addChild({
 				render: () => [
-					theme.fg("customMessageText", `Branch summary${expandHintSuffix(theme, this.expandHintCapability!)}`),
+					theme.fg("customMessageText", `Branch summary${expandHintSuffix(theme, this.expandHintCapability)}`),
 				],
 				invalidate: () => {},
 			});

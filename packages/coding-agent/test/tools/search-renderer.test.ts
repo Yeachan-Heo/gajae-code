@@ -25,7 +25,7 @@ describe("searchToolRenderer", () => {
 
 		const collapsed = searchToolRenderer.renderResult(
 			result as never,
-			{ expanded: false, isPartial: false },
+			{ expanded: false, isPartial: false, expandHintCapability: () => false },
 			uiTheme,
 			{
 				pattern: "needle",

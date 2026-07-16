@@ -877,6 +877,7 @@ export const evalToolRenderer = {
 							width,
 							codeMaxLines: EVAL_DEFAULT_PREVIEW_LINES,
 							expanded: true,
+							expandHintCapability: _options.expandHintCapability,
 						},
 						uiTheme,
 					);
@@ -949,7 +950,7 @@ export const evalToolRenderer = {
 							outputLines.push(
 								uiTheme.fg(
 									"dim",
-									`… ${outputContent.hiddenCount} more lines${expandHintSuffix(uiTheme, options.expandHintCapability!)}`,
+									`… ${outputContent.hiddenCount} more lines${expandHintSuffix(uiTheme, options.expandHintCapability)}`,
 								),
 							);
 						}
@@ -973,6 +974,7 @@ export const evalToolRenderer = {
 								outputMaxLines: outputLines.length,
 								codeMaxLines: expanded ? Number.POSITIVE_INFINITY : EVAL_DEFAULT_PREVIEW_LINES,
 								expanded,
+								expandHintCapability: options.expandHintCapability,
 								width,
 							},
 							uiTheme,
@@ -1069,7 +1071,7 @@ export const evalToolRenderer = {
 					outputLines.push("");
 					const skippedLine = uiTheme.fg(
 						"dim",
-						`… (${cachedSkipped} earlier lines, showing ${cachedLines.length} of ${cachedSkipped + cachedLines.length})${expandHintSuffix(uiTheme, options.expandHintCapability!)}`,
+						`… (${cachedSkipped} earlier lines, showing ${cachedLines.length} of ${cachedSkipped + cachedLines.length})${expandHintSuffix(uiTheme, options.expandHintCapability)}`,
 					);
 					outputLines.push(truncateToWidth(skippedLine, width));
 				}

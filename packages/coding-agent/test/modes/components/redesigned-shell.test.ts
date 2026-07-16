@@ -232,7 +232,7 @@ describe("redesigned interactive shell chrome", () => {
 
 	it("renders execution rails without breaking output caps", () => {
 		const ui = { requestRender: () => {} } as unknown as TUI;
-		const bash = new BashExecutionComponent("printf ready", ui, false);
+		const bash = new BashExecutionComponent("printf ready", ui, false, () => false);
 		bash.setComplete(0, false, { output: Array.from({ length: 160 }, (_, i) => `line-${i}`).join("\n") });
 		const bashRendered = Bun.stripANSI(bash.render(80).join("\n"));
 
@@ -246,8 +246,8 @@ describe("redesigned interactive shell chrome", () => {
 
 	it("keeps eval execution headers compact and mode-labeled", () => {
 		const ui = { requestRender: () => {} } as unknown as TUI;
-		const py = new EvalExecutionComponent("print('ready')", ui, false, "python");
-		const js = new EvalExecutionComponent("1 + 1", ui, false, "js");
+		const py = new EvalExecutionComponent("print('ready')", ui, false, "python", () => false);
+		const js = new EvalExecutionComponent("1 + 1", ui, false, "js", () => false);
 
 		expect(Bun.stripANSI(py.render(80).join("\n"))).toContain("python · >>>");
 		expect(Bun.stripANSI(js.render(80).join("\n"))).toContain("node · >>>");
@@ -255,7 +255,7 @@ describe("redesigned interactive shell chrome", () => {
 
 	it("keeps eval continuation aligned for multiline code", () => {
 		const ui = { requestRender: () => {} } as unknown as TUI;
-		const py = new EvalExecutionComponent("print('a')\nprint('b')", ui, false, "python");
+		const py = new EvalExecutionComponent("print('a')\nprint('b')", ui, false, "python", () => false);
 		const stripped = Bun.stripANSI(py.render(80).join("\n"));
 
 		expect(stripped).toContain("python · >>> print('a')");

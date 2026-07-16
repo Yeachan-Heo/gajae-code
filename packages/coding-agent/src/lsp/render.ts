@@ -137,9 +137,7 @@ export function renderResult(
 	if (request?.apply !== undefined) requestLines.push(theme.fg("dim", `apply: ${request.apply ? "true" : "false"}`));
 
 	const outputBlock = new CachedOutputBlock();
-	const expandHintCapability = (
-		options as RenderResultOptions & { expandHintCapability: import("../tools/render-utils").ExpandHintCapability }
-	).expandHintCapability;
+	const expandHintCapability = options.expandHintCapability;
 
 	return {
 		render(width: number): string[] {

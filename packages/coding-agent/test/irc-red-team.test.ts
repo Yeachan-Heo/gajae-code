@@ -148,7 +148,7 @@ describe("IRC visualization red-team", () => {
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
 		const ui = { requestRender: () => {} } as unknown as TUI;
-		const component = new BashExecutionComponent("emit sixel", ui, false);
+		const component = new BashExecutionComponent("emit sixel", ui, false, () => false);
 		const output = [
 			...Array.from({ length: 18 }, (_, index) => `ordinary ${index}`),
 			`${SIXEL_START}payload-begins`,
@@ -171,7 +171,7 @@ describe("IRC visualization red-team", () => {
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
 		const ui = { requestRender: () => {} } as unknown as TUI;
-		const component = new BashExecutionComponent("emit sixel", ui, false);
+		const component = new BashExecutionComponent("emit sixel", ui, false, () => false);
 		component.setComplete(0, false, { output: `${SIXEL_START}cached${SIXEL_END}` });
 		const split = new IrcSplitViewComponent(component, new IrcObservationLedger(), theme);
 		const frames: string[] = [];

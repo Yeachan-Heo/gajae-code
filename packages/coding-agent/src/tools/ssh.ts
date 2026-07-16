@@ -267,7 +267,7 @@ export const sshToolRenderer = {
 							outputLines.push(
 								uiTheme.fg(
 									"dim",
-									`… (${skippedCount} earlier lines, showing ${visualLines.length} of ${totalVisualLines})${expandHintSuffix(uiTheme, options.expandHintCapability!)}`,
+									`… (${skippedCount} earlier lines, showing ${visualLines.length} of ${totalVisualLines})${expandHintSuffix(uiTheme, options.expandHintCapability)}`,
 								),
 							);
 						}
@@ -285,7 +285,7 @@ export const sshToolRenderer = {
 							outputLines.push(
 								uiTheme.fg(
 									"dim",
-									`… (${remaining} more lines)${expandHintSuffix(uiTheme, options.expandHintCapability!)}`,
+									`… (${remaining} more lines)${expandHintSuffix(uiTheme, options.expandHintCapability)}`,
 								),
 							);
 						}

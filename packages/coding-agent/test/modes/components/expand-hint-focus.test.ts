@@ -159,8 +159,8 @@ describe("instance-scoped expansion hints", () => {
 			undefined,
 			fixture.ui,
 			"/tmp",
-			undefined,
 			canExpand,
+			undefined,
 		);
 		generic.updateResult({ content: [{ type: "text", text: manyLines() }] });
 		const theme = await getThemeByName("red-claw");

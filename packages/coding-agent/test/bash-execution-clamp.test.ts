@@ -16,7 +16,7 @@ describe("BashExecutionComponent #clampDisplayLine", () => {
 	});
 
 	function createComponentWithOutput(output: string): BashExecutionComponent {
-		const component = new BashExecutionComponent("test", ui, false);
+		const component = new BashExecutionComponent("test", ui, false, () => false);
 		component.appendOutput(output);
 		component.setComplete(0, false);
 		return component;

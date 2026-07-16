@@ -56,7 +56,15 @@ describe("manual output folds", () => {
 	});
 
 	it("retains a manually expanded tool result when its automatic completion state changes", () => {
-		const component = new ToolExecutionComponent("bash", { command: "echo output" }, {}, undefined, uiStub);
+		const component = new ToolExecutionComponent(
+			"bash",
+			{ command: "echo output" },
+			{},
+			undefined,
+			uiStub,
+			undefined,
+			() => false,
+		);
 		component.setManuallyExpanded(true);
 		component.updateResult(toolResult(30), false);
 		component.setExpanded(false);
@@ -65,7 +73,15 @@ describe("manual output folds", () => {
 	});
 
 	it("keeps automatic folding behavior for untouched tool results", () => {
-		const component = new ToolExecutionComponent("bash", { command: "echo output" }, {}, undefined, uiStub);
+		const component = new ToolExecutionComponent(
+			"bash",
+			{ command: "echo output" },
+			{},
+			undefined,
+			uiStub,
+			undefined,
+			() => false,
+		);
 		component.updateResult(toolResult(30), false);
 		component.setExpanded(false);
 
@@ -73,7 +89,15 @@ describe("manual output folds", () => {
 	});
 
 	it("lets the global fold toggle override an earlier pin", () => {
-		const component = new ToolExecutionComponent("bash", { command: "echo output" }, {}, undefined, uiStub);
+		const component = new ToolExecutionComponent(
+			"bash",
+			{ command: "echo output" },
+			{},
+			undefined,
+			uiStub,
+			undefined,
+			() => false,
+		);
 		const chatContainer = new Container();
 		chatContainer.addChild(component);
 		const ctx = { chatContainer, toolOutputExpanded: false, ui: uiStub } as unknown as InteractiveModeContext;
@@ -86,7 +110,7 @@ describe("manual output folds", () => {
 		expect(render(component)).not.toContain("fold-start-marker");
 	});
 	it("lets the global fold toggle override an earlier read-group pin", () => {
-		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const component = new ReadToolGroupComponent({ showContentPreview: true, expandHintCapability: () => false });
 		const chatContainer = new Container();
 		chatContainer.addChild(component);
 		const ctx = { chatContainer, toolOutputExpanded: false, ui: uiStub } as unknown as InteractiveModeContext;

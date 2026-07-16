@@ -13,7 +13,7 @@ export class CompactionSummaryMessageComponent extends Box {
 
 	constructor(
 		private readonly message: CompactionSummaryMessage,
-		private readonly expandHintCapability?: ExpandHintCapability,
+		private readonly expandHintCapability: ExpandHintCapability,
 	) {
 		super(1, 1, t => theme.bg("customMessageBg", t));
 		this.#updateDisplay();
@@ -49,7 +49,7 @@ export class CompactionSummaryMessageComponent extends Box {
 				render: () => [
 					theme.fg(
 						"customMessageText",
-						`Compacted from ${tokenStr} tokens${expandHintSuffix(theme, this.expandHintCapability!)}`,
+						`Compacted from ${tokenStr} tokens${expandHintSuffix(theme, this.expandHintCapability)}`,
 					),
 				],
 				invalidate: () => {},

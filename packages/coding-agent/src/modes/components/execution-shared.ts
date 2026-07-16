@@ -73,7 +73,7 @@ export function buildStatusFooter(opts: {
 	hiddenLineCount: number;
 	/** Suppress the "… N more lines" hint (used when sixel passthrough renders the full output). */
 	suppressHiddenCount?: boolean;
-	expandHintCapability?: ExpandHintCapability;
+	expandHintCapability: ExpandHintCapability;
 }): Component | undefined {
 	const parts: string[] = [];
 
@@ -82,7 +82,7 @@ export function buildStatusFooter(opts: {
 			? () =>
 					theme.fg(
 						"dim",
-						`… ${opts.hiddenLineCount} more lines${expandHintSuffix(theme, opts.expandHintCapability!)}`,
+						`… ${opts.hiddenLineCount} more lines${expandHintSuffix(theme, opts.expandHintCapability)}`,
 					)
 			: undefined;
 	if (opts.status === "cancelled") {

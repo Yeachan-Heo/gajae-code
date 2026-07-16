@@ -628,7 +628,7 @@ describe("vim renderer", () => {
 
 		const component = vimToolRenderer.renderCall(
 			{ file: "preview.ts", steps: [step(["643G"])] },
-			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			{ expanded: false, isPartial: true, spinnerFrame: 0, expandHintCapability: () => false },
 			uiTheme,
 		);
 
@@ -649,7 +649,7 @@ describe("vim renderer", () => {
 				steps: [step(["ggdGi"])],
 				__partialJson: '{"file":"preview.txt","steps":[{"kbd":["ggdGi"],"insert":"replacement',
 			},
-			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			{ expanded: false, isPartial: true, spinnerFrame: 0, expandHintCapability: () => false },
 			uiTheme,
 		);
 
@@ -677,6 +677,7 @@ describe("vim renderer", () => {
 			undefined,
 			uiStub,
 			previewDir,
+			() => false,
 			"growing-first-call-component",
 		);
 
@@ -718,7 +719,7 @@ describe("vim renderer", () => {
 					],
 				},
 			},
-			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			{ expanded: false, isPartial: true, spinnerFrame: 0, expandHintCapability: () => false },
 			uiTheme,
 		);
 
@@ -739,7 +740,11 @@ describe("vim renderer", () => {
 
 		const opened = await tool.execute("open", { file: "cursor.txt" });
 		const rendered = vimToolRenderer
-			.renderResult(opened, { expanded: false, isPartial: false, spinnerFrame: 0 }, uiTheme)
+			.renderResult(
+				opened,
+				{ expanded: false, isPartial: false, spinnerFrame: 0, expandHintCapability: () => false },
+				uiTheme,
+			)
 			.render(160)
 			.join("\n");
 
@@ -760,7 +765,11 @@ describe("vim renderer", () => {
 		expect(moved.details?.viewportLines?.[0]?.text.startsWith("…")).toBe(true);
 
 		const rendered = vimToolRenderer
-			.renderResult(moved, { expanded: false, isPartial: false, spinnerFrame: 0 }, uiTheme)
+			.renderResult(
+				moved,
+				{ expanded: false, isPartial: false, spinnerFrame: 0, expandHintCapability: () => false },
+				uiTheme,
+			)
 			.render(200)
 			.join("\n");
 

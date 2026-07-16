@@ -84,7 +84,7 @@ describe("task renderer: nested live rendering", () => {
 		};
 		const component = taskToolRenderer.renderResult(
 			{ content: [{ type: "text", text: "Running 1 agents..." }], details },
-			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			{ expanded: false, isPartial: true, spinnerFrame: 0, expandHintCapability: () => false },
 			theme,
 		);
 		return Bun.stripANSI(component.render(160).join("\n"));
@@ -99,7 +99,7 @@ describe("task renderer: nested live rendering", () => {
 		};
 		const component = taskToolRenderer.renderResult(
 			{ content: [{ type: "text", text: "Task complete" }], details },
-			{ expanded: false, isPartial: false, spinnerFrame: 0 },
+			{ expanded: false, isPartial: false, spinnerFrame: 0, expandHintCapability: () => false },
 			theme,
 		);
 		return Bun.stripANSI(component.render(160).join("\n"));

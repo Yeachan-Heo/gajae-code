@@ -8,6 +8,7 @@ import { APP_NAME } from "@gajae-code/utils";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
 import { initTheme, theme } from "../modes/theme/theme";
+import { noExpandHintCapability } from "../tools/render-utils";
 import {
 	getConfiguredSearchProviderPreference,
 	isConfigurableSearchProviderId,
@@ -202,11 +203,21 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 	};
 
 	const result = await runSearchQuery(params);
-	const component = renderSearchResult(result, { expanded: cmd.expanded, isPartial: false }, theme, {
-		query: cmd.query,
-		allowLongAnswer: true,
-		maxAnswerLines: cmd.expanded ? undefined : 6,
-	});
+	const component = renderSearchResult(
+		result,
+		{
+			expanded: cmd.expanded,
+			isPartial: false,
+			// noninteractive: CLI output has no TUI focus or overlay.
+			expandHintCapability: noExpandHintCapability,
+		},
+		theme,
+		{
+			query: cmd.query,
+			allowLongAnswer: true,
+			maxAnswerLines: cmd.expanded ? undefined : 6,
+		},
+	);
 
 	const width = Math.max(60, process.stdout.columns ?? 100);
 	process.stdout.write(`${component.render(width).join("\n")}\n`);

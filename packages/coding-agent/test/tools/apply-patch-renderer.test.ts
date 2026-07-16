@@ -41,6 +41,8 @@ describe("apply_patch rendering", () => {
 			{},
 			undefined,
 			uiStub,
+			undefined,
+			() => false,
 		);
 
 		component.updateResult(
@@ -74,7 +76,11 @@ describe("apply_patch rendering", () => {
 			"*** End Patch",
 		].join("\n");
 
-		const component = toolRenderers.apply_patch.renderCall({ input }, { expanded: false, isPartial: true }, uiTheme);
+		const component = toolRenderers.apply_patch.renderCall(
+			{ input },
+			{ expanded: false, isPartial: true, expandHintCapability: () => false },
+			uiTheme,
+		);
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 
 		expect(rendered).toContain("src/first.ts");
@@ -86,7 +92,11 @@ describe("apply_patch rendering", () => {
 		const uiTheme = await getUiTheme();
 		const input = ["*** Begin Patch", "*** Update File: src/streaming.ts", "@@", "-before", "+after"].join("\n");
 
-		const component = toolRenderers.apply_patch.renderCall({ input }, { expanded: false, isPartial: true }, uiTheme);
+		const component = toolRenderers.apply_patch.renderCall(
+			{ input },
+			{ expanded: false, isPartial: true, expandHintCapability: () => false },
+			uiTheme,
+		);
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 
 		expect(rendered).toContain("src/streaming.ts");
@@ -99,7 +109,7 @@ describe("apply_patch rendering", () => {
 
 		const component = toolRenderers.apply_patch.renderCall(
 			{ input: malformedInput },
-			{ expanded: false, isPartial: true },
+			{ expanded: false, isPartial: true, expandHintCapability: () => false },
 			uiTheme,
 		);
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
@@ -123,7 +133,15 @@ describe("apply_patch rendering", () => {
 				"*** End Patch",
 			].join("\n");
 
-			const component = new ToolExecutionComponent("apply_patch", { input }, {}, undefined, uiStub, tmpDir);
+			const component = new ToolExecutionComponent(
+				"apply_patch",
+				{ input },
+				{},
+				undefined,
+				uiStub,
+				tmpDir,
+				() => false,
+			);
 			const before = Bun.stripANSI(component.render(160).join("\n"));
 			expect(before).not.toContain("(preview)");
 
@@ -145,7 +163,15 @@ describe("apply_patch rendering", () => {
 		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
 		try {
 			await Bun.write(path.join(tmpDir, "preview.ts"), "const value = 1;\n");
-			const component = new ToolExecutionComponent("apply_patch", { input: "" }, {}, undefined, uiStub, tmpDir);
+			const component = new ToolExecutionComponent(
+				"apply_patch",
+				{ input: "" },
+				{},
+				undefined,
+				uiStub,
+				tmpDir,
+				() => false,
+			);
 
 			setTimeoutSpy.mockClear();
 			component.updateArgs({
@@ -175,6 +201,8 @@ describe("apply_patch rendering", () => {
 			{},
 			undefined,
 			uiStub,
+			undefined,
+			() => false,
 		);
 
 		component.updateResult(

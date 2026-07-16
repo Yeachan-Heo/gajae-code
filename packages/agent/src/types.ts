@@ -486,6 +486,8 @@ export interface RenderResultOptions {
 	isPartial: boolean;
 	/** Current spinner frame index for animated elements (optional) */
 	spinnerFrame?: number;
+	/** Interactive-mode focus capability for render-time expansion hints. */
+	expandHintCapability: () => boolean;
 }
 
 /**

@@ -57,7 +57,7 @@ export class BashExecutionComponent extends Container {
 		private readonly command: string,
 		ui: TUI,
 		excludeFromContext = false,
-		private readonly expandHintCapability?: ExpandHintCapability,
+		private readonly expandHintCapability: ExpandHintCapability,
 	) {
 		super();
 

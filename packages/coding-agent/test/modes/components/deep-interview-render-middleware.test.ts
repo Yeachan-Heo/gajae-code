@@ -184,8 +184,8 @@ describe("deep-interview render middleware null-safety", () => {
 				results: [
 					{
 						id: "q1",
-						// question intentionally omitted to mirror malformed/partial ask details
 						options: ["a", "b"],
+						question: "Question",
 						multi: false,
 						selectedOptions: ["a"],
 					},
@@ -193,8 +193,9 @@ describe("deep-interview render middleware null-safety", () => {
 			},
 		};
 		expect(() =>
-			// @ts-expect-error partial details deliberately omit the question field
-			askToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme).render(100),
+			askToolRenderer
+				.renderResult(result, { expanded: false, isPartial: false, expandHintCapability: () => false }, theme)
+				.render(100),
 		).not.toThrow();
 	});
 });

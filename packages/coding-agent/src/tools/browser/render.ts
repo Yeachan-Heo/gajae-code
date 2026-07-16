@@ -129,6 +129,7 @@ function renderRunCell(
 					outputMaxLines: expanded ? Number.POSITIVE_INFINITY : previewLines,
 					codeMaxLines: expanded ? Number.POSITIVE_INFINITY : previewLines,
 					expanded,
+					expandHintCapability: options.expandHintCapability,
 					width,
 				},
 				theme,

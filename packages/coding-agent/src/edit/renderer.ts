@@ -609,7 +609,7 @@ function renderSingleFileResult(
 					expanded,
 					uiTheme,
 					renderDiffFn,
-					options.expandHintCapability!,
+					options.expandHintCapability,
 				);
 			} else if (editDiffPreview) {
 				if ("error" in editDiffPreview) {
@@ -621,7 +621,7 @@ function renderSingleFileResult(
 						expanded,
 						uiTheme,
 						renderDiffFn,
-						options.expandHintCapability!,
+						options.expandHintCapability,
 					);
 				}
 			}
@@ -632,7 +632,7 @@ function renderSingleFileResult(
 					expanded,
 					uiTheme,
 					(fp: string) => uiTheme.getLangIcon(getLanguageFromPath(fp)),
-					options.expandHintCapability!,
+					options.expandHintCapability,
 				);
 			}
 

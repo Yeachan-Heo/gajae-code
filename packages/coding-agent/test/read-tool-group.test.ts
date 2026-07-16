@@ -28,7 +28,7 @@ describe("ReadToolGroupComponent", () => {
 	it("keeps inline read previews disabled by default", () => {
 		expect(getDefault("read.toolResultPreview")).toBe(false);
 
-		const component = new ReadToolGroupComponent();
+		const component = new ReadToolGroupComponent({ expandHintCapability: () => false });
 		component.updateArgs({ path: "/tmp/example.ts" }, "read-0");
 		component.updateResult(
 			{
@@ -46,7 +46,7 @@ describe("ReadToolGroupComponent", () => {
 	});
 
 	it("renders warning previews with warning styling instead of success styling", () => {
-		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const component = new ReadToolGroupComponent({ showContentPreview: true, expandHintCapability: () => false });
 		component.updateArgs({ path: "/tmp/example.ts" }, "read-1");
 		component.updateResult(
 			{
@@ -94,7 +94,7 @@ describe("ReadToolGroupComponent", () => {
 	});
 
 	it("does not render a duplicate summary row when inline previews are enabled", () => {
-		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const component = new ReadToolGroupComponent({ showContentPreview: true, expandHintCapability: () => false });
 		component.updateArgs({ path: "/tmp/example.ts:L10-L20" }, "read-3");
 		component.updateResult(
 			{
@@ -110,7 +110,7 @@ describe("ReadToolGroupComponent", () => {
 		expect(matches).toHaveLength(1);
 	});
 	it("retains a manual collapse through automatic updates across mixed read entries", () => {
-		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const component = new ReadToolGroupComponent({ showContentPreview: true, expandHintCapability: () => false });
 		component.updateArgs({ path: "/tmp/success.ts" }, "success");
 		component.updateArgs({ path: "/tmp/error.ts" }, "error");
 		component.updateArgs({ path: "/tmp/warning.ts" }, "warning");
@@ -135,7 +135,7 @@ describe("ReadToolGroupComponent", () => {
 	});
 
 	it("retains a manual expansion through automatic updates", () => {
-		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const component = new ReadToolGroupComponent({ showContentPreview: true, expandHintCapability: () => false });
 		component.updateArgs({ path: "/tmp/example.ts" }, "read");
 		component.setManuallyExpanded(true);
 		component.updateArgs({ path: "/tmp/example-renamed.ts" }, "read");
@@ -146,7 +146,7 @@ describe("ReadToolGroupComponent", () => {
 	});
 
 	it("follows automatic expansion until explicitly pinned, then applies the new pin", () => {
-		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const component = new ReadToolGroupComponent({ showContentPreview: true, expandHintCapability: () => false });
 		component.updateArgs({ path: "/tmp/example.ts" }, "read");
 		component.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "read");
 		component.setExpanded(true);
@@ -177,12 +177,12 @@ describe("ReadToolGroupComponent", () => {
 	});
 
 	it("resets manual fold provenance when a transcript rebuild creates a new component", () => {
-		const original = new ReadToolGroupComponent({ showContentPreview: true });
+		const original = new ReadToolGroupComponent({ showContentPreview: true, expandHintCapability: () => false });
 		original.updateArgs({ path: "/tmp/example.ts" }, "read");
 		original.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "read");
 		original.setManuallyExpanded(true);
 
-		const rebuilt = new ReadToolGroupComponent({ showContentPreview: true });
+		const rebuilt = new ReadToolGroupComponent({ showContentPreview: true, expandHintCapability: () => false });
 		rebuilt.setExpanded(false);
 		rebuilt.updateArgs({ path: "/tmp/example.ts" }, "read");
 		rebuilt.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "read");

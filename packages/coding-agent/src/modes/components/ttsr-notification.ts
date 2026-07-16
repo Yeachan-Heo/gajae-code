@@ -14,7 +14,7 @@ export class TtsrNotificationComponent extends Container {
 
 	constructor(
 		private readonly rules: Rule[],
-		private readonly expandHintCapability?: ExpandHintCapability,
+		private readonly expandHintCapability: ExpandHintCapability,
 	) {
 		super();
 
@@ -79,7 +79,7 @@ export class TtsrNotificationComponent extends Container {
 			});
 			if (hasMoreContent) {
 				this.#box.addChild({
-					render: () => [theme.italic(expandHintSuffix(theme, this.expandHintCapability!))],
+					render: () => [theme.italic(expandHintSuffix(theme, this.expandHintCapability))],
 					invalidate: () => {},
 				});
 			}
