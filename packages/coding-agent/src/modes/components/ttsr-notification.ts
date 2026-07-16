@@ -1,6 +1,7 @@
 import { Box, Container, Spacer, Text } from "@gajae-code/tui";
 import type { Rule } from "../../capability/rule";
 import { theme } from "../../modes/theme/theme";
+import { expandHintSuffix } from "../../tools/render-utils";
 
 /**
  * Component that renders a TTSR (Time Traveling Stream Rules) notification.
@@ -73,7 +74,7 @@ export class TtsrNotificationComponent extends Container {
 				return desc && desc.split("\n").length > 2;
 			});
 			if (hasMoreContent) {
-				this.#box.addChild(new Text(theme.italic(" (ctrl+o to expand)"), 0, 0));
+				this.#box.addChild(new Text(theme.italic(expandHintSuffix(theme)), 0, 0));
 			}
 		}
 	}
