@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { SessionIndex } from "../src/sdk/broker/session-index";
@@ -43,6 +43,7 @@ describe("SDK session index", () => {
 		await writer.append(event("after"));
 		await reader.refresh();
 		expect(reader.listSessions().sessions.map(session => session.sessionId)).toEqual(["before", "after"]);
+		expect(reader.listSessions().warnings).toEqual([]);
 	});
 	it("does not let a stale snapshot overwrite a newer snapshot", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
@@ -55,6 +56,81 @@ describe("SDK session index", () => {
 		await stale.snapshot();
 		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
 		expect(snapshot.indexSeq).toBe(2);
+	});
+	it("replaces a corrupt snapshot while rotating the log", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("before"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.writeFile(path.join(sessionsDir, "index.snapshot.json"), "{");
+		await index.append({
+			...event("after"),
+			locator: { repo: "r".repeat(4 * 1024 * 1024), stateRoot: "q" },
+		});
+		const snapshot = JSON.parse(await fs.readFile(path.join(sessionsDir, "index.snapshot.json"), "utf8"));
+		expect(snapshot.indexSeq).toBe(2);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.indexSeq).toBe(2);
+		expect(replay.listSessions().warnings).toEqual([]);
+	});
+	it("tolerates Windows permission errors while opening and syncing the snapshot directory", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("snapshot"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		try {
+			for (const [stage, code] of [
+				["open", "EPERM"],
+				["sync", "EACCES"],
+			] as const) {
+				const open = fs.open.bind(fs);
+				const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+					if (path.resolve(file) === path.resolve(sessionsDir) && stage === "open")
+						throw Object.assign(new Error(code), { code });
+					const handle = await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(
+						file,
+						...rest,
+					);
+					if (path.resolve(file) === path.resolve(sessionsDir) && stage === "sync")
+						(handle as unknown as { sync: () => Promise<void> }).sync = async () => {
+							throw Object.assign(new Error(code), { code });
+						};
+					return handle;
+				}) as typeof fs.open);
+				try {
+					await index.snapshot();
+				} finally {
+					spy.mockRestore();
+				}
+			}
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+	});
+	it("propagates non-permission Windows directory fsync errors", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		const open = fs.open.bind(fs);
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		const error = Object.assign(new Error("EIO"), { code: "EIO" });
+		const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			const handle = await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
+			if (path.resolve(file) === path.resolve(sessionsDir))
+				(handle as unknown as { sync: () => Promise<void> }).sync = async () => {
+					throw error;
+				};
+			return handle;
+		}) as typeof fs.open);
+		try {
+			await expect(index.snapshot()).rejects.toBe(error);
+		} finally {
+			spy.mockRestore();
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
 	});
 	it("serializes concurrent writers and replays a strictly monotonic log", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));

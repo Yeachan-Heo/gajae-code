@@ -60,9 +60,19 @@ async function appendSync(file: string, value: string): Promise<void> {
 }
 
 async function syncDirectory(file: string): Promise<void> {
-	const handle = await fs.open(path.dirname(file), "r");
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(path.dirname(file), "r");
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) return;
+		throw error;
+	}
 	try {
 		await handle.sync();
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES")) throw error;
 	} finally {
 		await handle.close();
 	}
@@ -129,10 +139,8 @@ export class SessionIndex {
 			try {
 				const stat = await handle.stat();
 				if (stat.size < this.#logOffset) {
-					if (allowResync) {
-						await this.replay();
-						this.#warn("Session index log was truncated");
-					} else this.#warn("Session index log was truncated");
+					if (allowResync) await this.replay();
+					else this.#warn("Session index log was truncated");
 					return;
 				}
 				data = Buffer.alloc(stat.size - this.#logOffset);
@@ -206,12 +214,19 @@ export class SessionIndex {
 	async #snapshotUnderLock(): Promise<void> {
 		await this.replay();
 		const file = snapshotFor(this.#agentDir);
+		let current: unknown;
 		try {
-			const current = JSON.parse(await fs.readFile(file, "utf8")) as { indexSeq?: unknown };
-			if (typeof current.indexSeq === "number" && current.indexSeq > this.indexSeq) return;
+			current = JSON.parse(await fs.readFile(file, "utf8"));
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
 		}
+		if (
+			current &&
+			typeof current === "object" &&
+			typeof (current as { indexSeq?: unknown }).indexSeq === "number" &&
+			(current as { indexSeq: number }).indexSeq > this.indexSeq
+		)
+			return;
 		const tmp = `${file}.${process.pid}.tmp`;
 		await fs.writeFile(
 			tmp,
