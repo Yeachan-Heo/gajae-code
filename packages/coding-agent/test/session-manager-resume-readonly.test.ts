@@ -150,7 +150,6 @@ class ReplaceAfterSnapshotStorage extends FileSessionStorage {
 	}
 }
 class ReplaceDuringFinalAuthorityInspectionStorage extends FileSessionStorage {
-	#stats = 0;
 
 	constructor(
 		private readonly replacementPath: string,
@@ -159,12 +158,10 @@ class ReplaceDuringFinalAuthorityInspectionStorage extends FileSessionStorage {
 		super();
 	}
 
-	override statSync(filePath: string): SessionStorageStat {
-		if (path.resolve(filePath) === path.resolve(this.sourcePath)) {
-			this.#stats++;
-			if (this.#stats === 7) fs.renameSync(this.replacementPath, filePath);
-		}
-		return super.statSync(filePath);
+	override async rename(filePath: string, nextPath: string): Promise<void> {
+		await super.rename(filePath, nextPath);
+		if (path.resolve(nextPath) !== path.resolve(this.sourcePath) && nextPath.endsWith(".jsonl"))
+			fs.renameSync(this.replacementPath, this.sourcePath);
 	}
 }
 
