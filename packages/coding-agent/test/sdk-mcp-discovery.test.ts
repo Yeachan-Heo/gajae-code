@@ -180,6 +180,32 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await session.dispose();
 		}
 	});
+
+	it("keeps exact-config MCP tools discoverable when toolNames is omitted", async () => {
+		const configPath = path.join(tempDir, "explicit-mcp.json");
+		const discoverAndConnect = vi
+			.spyOn(MCPManager.prototype, "discoverAndConnect")
+			.mockResolvedValue(createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]));
+
+		const { session } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			toolNames: undefined,
+			mcpConfigPath: configPath,
+		});
+		try {
+			expect(discoverAndConnect).toHaveBeenCalledWith({ configPath });
+			expect(session.getAllToolNames()).toContain("mcp__exact_lookup");
+			expect(session.getDiscoverableMCPTools().map(tool => tool.name)).toContain("mcp__exact_lookup");
+			expect(session.getSelectedMCPToolNames()).toEqual([]);
+			expect(session.getActiveToolNames()).toEqual(
+				expect.arrayContaining(["read", "bash", "edit", "write", "search", "find", "search_tool_bm25"]),
+			);
+			expect(session.getActiveToolNames()).not.toContain("mcp__exact_lookup");
+		} finally {
+			await session.dispose();
+		}
+	});
 	it("rejects mcpConfigPath with a caller-owned MCP manager before MCP startup", async () => {
 		const callerMcpManager = new MCPManager(tempDir);
 		const discoverAndConnect = vi.spyOn(MCPManager.prototype, "discoverAndConnect");

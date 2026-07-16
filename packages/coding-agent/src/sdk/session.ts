@@ -2143,13 +2143,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
+		const explicitlyRequestedToolNames = new Set(options.toolNames?.map(name => name.toLowerCase()) ?? []);
 		const requestedToolNames = options.toolNames
-			? [
-					...new Set([
-						...options.toolNames.map(name => name.toLowerCase()),
-						...(settings.get("goal.enabled") ? ["goal"] : []),
-					]),
-				]
+			? [...new Set([...explicitlyRequestedToolNames, ...(settings.get("goal.enabled") ? ["goal"] : [])])]
 			: toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
 		const requestedToolNameSet = new Set(normalizedRequested);
@@ -2176,7 +2172,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			for (const tool of toolRegistry.values()) {
 				if (!isMCPBridgeTool(tool)) continue;
 				discoverableMCPToolNames.add(tool.name);
-				if (initialRequestedActiveToolNames.includes(tool.name)) {
+				if (explicitlyRequestedToolNames.has(tool.name)) {
 					explicitlyRequestedMCPToolNames.push(tool.name);
 				}
 				const serverName = (tool as AgentTool & { mcpServerName?: string }).mcpServerName;
@@ -2223,7 +2219,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// The model finds them via search_tool_bm25 and activates them on demand.
 		if (effectiveDiscoveryMode === "all") {
 			const essentialBuiltinNames = new Set(computeEssentialBuiltinNames(settings));
-			const explicitlyRequestedToolNames = new Set(options.toolNames?.map(name => name.toLowerCase()) ?? []);
 			// Back-compat: persisted activations live under selectedMCPToolNames today (built-in
 			// activation persistence is a follow-up). MCP names won't collide with built-in names.
 			const restoredDiscoveredNames = new Set(existingSession.selectedMCPToolNames);
