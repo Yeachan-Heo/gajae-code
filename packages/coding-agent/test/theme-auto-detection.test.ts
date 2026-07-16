@@ -213,4 +213,23 @@ describe("theme auto-detection", () => {
 		expect(themeModule.getCurrentThemeName()).toBe("blue-crab");
 		expect(themeModule.theme.getFgAnsi("accent")).not.toBe(darkAccent);
 	});
+
+	it("whenAutoThemeSettled follows a reevaluation started by the observed theme callback", async () => {
+		using _globals = withThemeTestGlobals({ colorfgbg: "15;0" });
+		themeModule.onTerminalAppearanceChange("dark");
+		await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+		const darkAccent = themeModule.theme.getFgAnsi("accent");
+		let changes = 0;
+		themeModule.onThemeChange(() => {
+			changes += 1;
+			if (changes === 1) themeModule.onTerminalAppearanceChange("light");
+		});
+
+		themeModule.setAutoThemeMapping("dark", "codex");
+		await themeModule.whenAutoThemeSettled();
+
+		expect(changes).toBe(2);
+		expect(themeModule.getCurrentThemeName()).toBe("blue-crab");
+		expect(themeModule.theme.getFgAnsi("accent")).not.toBe(darkAccent);
+	});
 });

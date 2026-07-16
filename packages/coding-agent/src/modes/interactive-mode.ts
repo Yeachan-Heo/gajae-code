@@ -144,6 +144,27 @@ const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
 // remote/tmux round-trips stay well under this. Terminals that never answer
 // settle earlier via the DA1 sentinel, so the cap is rarely reached.
 const INITIAL_APPEARANCE_TIMEOUT_MS = 200;
+
+export async function settleInitialThemeStartup(
+	waitForAppearance: () => Promise<unknown> | undefined,
+	waitForTheme: () => Promise<void>,
+	releaseRenderHold: () => void,
+	timeoutMs = INITIAL_APPEARANCE_TIMEOUT_MS,
+): Promise<void> {
+	try {
+		await Promise.race([
+			(async () => {
+				await waitForAppearance();
+				await waitForTheme();
+			})(),
+			Bun.sleep(timeoutMs),
+		]);
+	} catch {
+		// Never block startup on appearance detection failures.
+	} finally {
+		releaseRenderHold();
+	}
+}
 const COMPOSER_NEWLINE_HINT = process.platform === "win32" ? "Alt+Enter/Ctrl+J" : "Shift+Enter/Ctrl+J";
 export const DEFAULT_COMPOSER_PLACEHOLDER = `Type your message... ${COMPOSER_NEWLINE_HINT}: New line · Ctrl+C: Clear · Ctrl+R: Search history · Shift+Tab: Reasoning`;
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
@@ -732,7 +753,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.isInitialized = true;
 		this.#syncIrcSidebarAvailabilityFromSettings();
 		await this.#settleInitialTheme();
-		this.ui.requestRender(true);
 
 		// GitHub star reminder (interactive-only). Register the decline-driven
 		// injection contributor and schedule the launch nudge after the first
@@ -798,18 +818,16 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/**
-	 * Bounded wait for the initial OSC 11 dark/light detection and the
-	 * auto-theme load it triggers. The first paint must never hang on a
-	 * terminal that answers slowly (or not at all), so the terminal-side wait
-	 * is capped and any failure falls through to painting immediately.
+	 * Give initial OSC 11 detection and every auto-theme load it triggers one
+	 * shared startup deadline. The render hold is always released, including
+	 * terminal errors and custom-theme loads that never settle.
 	 */
 	async #settleInitialTheme(): Promise<void> {
-		try {
-			await this.ui.terminal.waitForInitialAppearance?.(INITIAL_APPEARANCE_TIMEOUT_MS);
-			await whenAutoThemeSettled();
-		} catch {
-			// Never block startup on appearance detection failures.
-		}
+		await settleInitialThemeStartup(
+			() => this.ui.terminal.waitForInitialAppearance?.(INITIAL_APPEARANCE_TIMEOUT_MS),
+			whenAutoThemeSettled,
+			() => this.ui.releaseRenderHold(),
+		);
 	}
 
 	/** Reload slash commands and autocomplete for the provided working directory. */

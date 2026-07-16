@@ -1941,13 +1941,16 @@ export function onTerminalAppearanceChange(mode: "dark" | "light"): void {
 }
 
 /**
- * Resolve once the most recent auto-theme reevaluation (e.g. from the initial
- * terminal appearance detection) finishes loading. Used to hold the first
- * interactive paint until the auto theme is decided, avoiding a whole-screen
- * theme flip right after startup.
+ * Resolve after the latest auto-theme reevaluation finishes loading. If a new
+ * reevaluation replaces the observed promise while it is settling, follow the
+ * replacement instead of releasing startup on stale theme work.
  */
-export function whenAutoThemeSettled(): Promise<void> {
-	return autoThemeSettled;
+export async function whenAutoThemeSettled(): Promise<void> {
+	while (true) {
+		const observed = autoThemeSettled;
+		await observed;
+		if (observed === autoThemeSettled) return;
+	}
 }
 
 export function setThemeInstance(themeInstance: Theme): void {

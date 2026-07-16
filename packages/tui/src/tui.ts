@@ -590,9 +590,9 @@ export class TUI extends Container {
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	onDebug?: () => void;
 	#renderRequested = false;
-	// First-paint hold: set by start({ deferFirstRender: true }) and released by
-	// the next forced render. While held, non-forced renders are dropped so the
-	// very first paint happens only after startup theme detection settles.
+	// First-paint hold: set by start({ deferFirstRender: true }) and released only
+	// through releaseRenderHold(). Forced renders remain ordinary redraw requests
+	// and cannot accidentally cross the startup appearance/theme boundary.
 	#renderHeld = false;
 	#renderTimer: NodeJS.Timeout | undefined;
 	#lastRenderAt = 0;
@@ -986,6 +986,13 @@ export class TUI extends Container {
 		if (!this.#renderHeld) this.requestRender(true);
 	}
 
+	/** Release a deferred first paint and schedule the authoritative full redraw. */
+	releaseRenderHold(): void {
+		if (!this.#renderHeld) return;
+		this.#renderHeld = false;
+		this.requestRender(true, "render-hold-release");
+	}
+
 	get terminalAvailable(): boolean {
 		return !this.#terminalUnavailable && this.terminal.available;
 	}
@@ -1257,12 +1264,10 @@ export class TUI extends Container {
 			this.#markTerminalUnavailable();
 			return;
 		}
-		// While the first paint is deferred, drop non-forced renders. The releasing
-		// requestRender(true) is a full redraw, so no dropped frame is ever lost.
-		if (this.#renderHeld) {
-			if (!force) return;
-			this.#renderHeld = false;
-		}
+		// A deferred first paint has an explicit release boundary. In particular,
+		// capability probes and resize paths may legitimately force redraws while
+		// startup appearance/theme detection is still settling.
+		if (this.#renderHeld) return;
 		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {
 			const preserveViewportCursor = useViewportRepaintPath(this.terminal);

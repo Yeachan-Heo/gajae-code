@@ -45,7 +45,7 @@ describe("TUI deferred first render", () => {
 		}
 	});
 
-	it("deferFirstRender holds all painting until the releasing forced render", async () => {
+	it("deferFirstRender requires an explicit release even after a forced redraw request", async () => {
 		const term = new VirtualTerminal(40, 8);
 		const tui = new TUI(term);
 		tui.addChild(new FixedLines(["themed-content"]));
@@ -54,14 +54,14 @@ describe("TUI deferred first render", () => {
 			await settle(term);
 			expect(paintedOutput(term)).not.toContain("themed-content");
 
-			// Non-forced renders (e.g. theme-change invalidations while the initial
-			// appearance detection is still settling) must stay held.
+			// Non-forced theme invalidations and unrelated forced redraws, including
+			// the successful SIXEL probe path, must not cross the startup hold.
 			tui.requestRender();
+			tui.requestRender(true, "sixel-probe");
 			await settle(term);
 			expect(paintedOutput(term)).not.toContain("themed-content");
 
-			// The releasing forced render paints the full frame.
-			tui.requestRender(true);
+			tui.releaseRenderHold();
 			await settle(term);
 			expect(paintedOutput(term)).toContain("themed-content");
 		} finally {
@@ -75,7 +75,7 @@ describe("TUI deferred first render", () => {
 		tui.addChild(new FixedLines(["first"]));
 		try {
 			tui.start({ deferFirstRender: true });
-			tui.requestRender(true);
+			tui.releaseRenderHold();
 			await settle(term);
 			expect(paintedOutput(term)).toContain("first");
 
