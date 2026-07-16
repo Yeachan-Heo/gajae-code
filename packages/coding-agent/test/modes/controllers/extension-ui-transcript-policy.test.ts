@@ -14,6 +14,7 @@ type Fixture = {
 	ctx: InteractiveModeContext;
 	getActions: () => ExtensionActions;
 	getCommandActions: () => ExtensionCommandContextActions;
+	getUiContext: () => ExtensionUIContext;
 	setNextSessionId: (id: string) => void;
 	rebuildInitialMessages: Mock<(policy: TranscriptRebuildPolicy) => void>;
 	rebuildChatFromMessages: Mock<(policy: TranscriptRebuildPolicy) => void>;
@@ -23,6 +24,7 @@ type Fixture = {
 function createFixture(initialSessionId = "session-a"): Fixture {
 	let actions: ExtensionActions | undefined;
 	let commandActions: ExtensionCommandContextActions | undefined;
+	let uiContext: ExtensionUIContext | undefined;
 	let sessionId = initialSessionId;
 	let nextSessionId = initialSessionId;
 	const rebuildInitialMessages = vi.fn<(policy: TranscriptRebuildPolicy) => void>();
@@ -33,10 +35,11 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 			capturedActions: ExtensionActions,
 			_contextActions: ExtensionContextActions,
 			capturedCommandActions?: ExtensionCommandContextActions,
-			_uiContext?: ExtensionUIContext,
+			capturedUiContext?: ExtensionUIContext,
 		): void {
 			actions = capturedActions;
 			commandActions = capturedCommandActions;
+			uiContext = capturedUiContext;
 		},
 		onError: vi.fn(),
 		emit: vi.fn(async () => undefined),
@@ -88,6 +91,10 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 			if (!commandActions) throw new Error("Extension command actions were not initialized");
 			return commandActions;
 		},
+		getUiContext: () => {
+			if (!uiContext) throw new Error("Extension UI context was not initialized");
+			return uiContext;
+		},
 		setNextSessionId: id => {
 			nextSessionId = id;
 		},
@@ -98,6 +105,14 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 }
 
 describe("ExtensionUiController transcript rebuild policy", () => {
+	it("routes extension fold choices through the same explicit pinning action as the user shortcut", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+
+		fixture.getUiContext().setToolsExpanded(true);
+
+		expect(fixture.ctx.setToolsExpanded).toHaveBeenCalledWith(true);
+	});
 	it("resets identity when a hook-runner switch loads a different session id from the same path", async () => {
 		const fixture = createFixture();
 		fixture.setNextSessionId("session-b");

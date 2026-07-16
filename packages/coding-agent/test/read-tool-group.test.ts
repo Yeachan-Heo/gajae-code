@@ -1,4 +1,6 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { setKeybindings } from "@gajae-code/tui";
+import { KeybindingsManager } from "../src/config/keybindings";
 import { getDefault } from "../src/config/settings-schema";
 import { ReadToolGroupComponent, readArgsTargetInternalUrl } from "../src/modes/components/read-tool-group";
 import * as themeModule from "../src/modes/theme/theme";
@@ -10,6 +12,9 @@ describe("ReadToolGroupComponent", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+	beforeEach(() => {
+		setKeybindings(KeybindingsManager.inMemory());
 	});
 
 	it("keeps inline read previews disabled by default", () => {
@@ -92,6 +97,84 @@ describe("ReadToolGroupComponent", () => {
 		const matches = rendered.match(/Read \/tmp\/example\.ts:L10-L20/g) ?? [];
 
 		expect(matches).toHaveLength(1);
+	});
+	it("retains a manual collapse through automatic updates across mixed read entries", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		component.updateArgs({ path: "/tmp/success.ts" }, "success");
+		component.updateArgs({ path: "/tmp/error.ts" }, "error");
+		component.updateArgs({ path: "/tmp/warning.ts" }, "warning");
+		component.setManuallyExpanded(false);
+		component.updateArgs({ path: "/tmp/success-renamed.ts" }, "success");
+		component.setExpanded(true);
+		component.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "success");
+		component.updateResult({ content: [{ type: "text", text: "e\nf\ng\nh" }], isError: true }, false, "error");
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "i\nj\nk\nl" }],
+				details: { suffixResolution: { from: "/tmp/warn.ts", to: "/tmp/warning.ts" } },
+			},
+			false,
+			"warning",
+		);
+
+		const rendered = Bun.stripANSI(component.render(120).join("\n"));
+		expect(rendered).not.toContain("\nd");
+		expect(rendered).not.toContain("\nh");
+		expect(rendered).not.toContain("\nl");
+	});
+
+	it("retains a manual expansion through automatic updates", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		component.updateArgs({ path: "/tmp/example.ts" }, "read");
+		component.setManuallyExpanded(true);
+		component.updateArgs({ path: "/tmp/example-renamed.ts" }, "read");
+		component.setExpanded(false);
+		component.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "read");
+
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("d");
+	});
+
+	it("follows automatic expansion until explicitly pinned, then applies the new pin", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		component.updateArgs({ path: "/tmp/example.ts" }, "read");
+		component.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "read");
+		component.setExpanded(true);
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("d");
+
+		component.setManuallyExpanded(false);
+		expect(Bun.stripANSI(component.render(120).join("\n"))).not.toContain("\nd");
+
+		component.setManuallyExpanded(true);
+		component.setExpanded(false);
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("d");
+	});
+
+	it("uses the configured expansion key hint and omits it when unbound", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		component.updateArgs({ path: "/tmp/example.ts" }, "read");
+		component.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "read");
+
+		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": "alt+x" }));
+		expect(Bun.stripANSI(component.render(120).join("\n"))).toContain("Alt+X for more");
+
+		setKeybindings(KeybindingsManager.inMemory({ "app.tools.expand": [] }));
+		component.invalidate();
+		expect(Bun.stripANSI(component.render(120).join("\n"))).not.toContain("for more");
+	});
+
+	it("resets manual fold provenance when a transcript rebuild creates a new component", () => {
+		const original = new ReadToolGroupComponent({ showContentPreview: true });
+		original.updateArgs({ path: "/tmp/example.ts" }, "read");
+		original.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "read");
+		original.setManuallyExpanded(true);
+
+		const rebuilt = new ReadToolGroupComponent({ showContentPreview: true });
+		rebuilt.setExpanded(false);
+		rebuilt.updateArgs({ path: "/tmp/example.ts" }, "read");
+		rebuilt.updateResult({ content: [{ type: "text", text: "a\nb\nc\nd" }] }, false, "read");
+
+		expect(Bun.stripANSI(original.render(120).join("\n"))).toContain("d");
+		expect(Bun.stripANSI(rebuilt.render(120).join("\n"))).not.toContain("\nd");
 	});
 });
 

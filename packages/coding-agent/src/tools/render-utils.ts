@@ -10,8 +10,9 @@ import * as path from "node:path";
 import type { ToolCallContext } from "@gajae-code/agent-core";
 import type { Ellipsis } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
-import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
+import { getKeybindings, replaceTabs, truncateToWidth } from "@gajae-code/tui";
 import { pluralize } from "@gajae-code/utils";
+import { formatKeyHints } from "../config/keybindings";
 import { settings } from "../config/settings";
 import type { Theme } from "../modes/theme/theme";
 import { Hasher } from "../tui/utils";
@@ -74,9 +75,6 @@ export const TRUNCATE_LENGTHS = {
 	/** Very short (task previews, badges) */
 	SHORT: 40,
 } as const;
-
-/** Standard expand hint text */
-export const EXPAND_HINT = "(Ctrl+O for more)";
 
 // =============================================================================
 // Text Truncation Utilities
@@ -149,9 +147,9 @@ export function formatStatusIcon(status: ToolUIStatus, theme: Theme, spinnerFram
  * Returns empty string if already expanded or there is nothing more to show.
  */
 export function formatExpandHint(theme: Theme, expanded?: boolean, hasMore?: boolean): string {
-	if (expanded) return "";
-	if (hasMore === false) return "";
-	return theme.fg("dim", wrapBrackets(EXPAND_HINT, theme));
+	if (expanded || hasMore === false) return "";
+	const key = formatKeyHints(getKeybindings().getKeys("app.tools.expand"));
+	return key ? theme.fg("dim", wrapBrackets(`(${key} for more)`, theme)) : "";
 }
 
 /**
