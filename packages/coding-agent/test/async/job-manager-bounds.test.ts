@@ -137,7 +137,7 @@ describe("AsyncJobManager bounded dispose and delivery", () => {
 		}
 		const state = manager.getDeliveryState();
 		expect(state.queued).toBe(0);
-		expect(state.deadLettered).toBe(120);
+		expect(state.deadLettered).toBe(50);
 		expect(attempts).toBeLessThanOrEqual(120 * 3);
 	});
 

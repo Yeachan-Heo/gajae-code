@@ -12,6 +12,8 @@ const DELIVERY_MAX_TEXT_BYTES = 64 * 1024;
 const DELIVERY_PREVIEW_HEAD_BYTES = 32 * 1024;
 const DELIVERY_PREVIEW_TAIL_BYTES = 32 * 1024;
 const DELIVERY_MAX_ATTEMPTS = 3;
+const MAX_DEAD_LETTERED_DELIVERIES = 50;
+
 
 export interface AsyncJob {
 	id: string;
@@ -207,6 +209,13 @@ interface AsyncJobDelivery {
 	promise?: Promise<void>;
 }
 
+interface DeadLetteredDelivery {
+	jobId: string;
+	attempt: number;
+	lastError?: string;
+}
+
+
 export interface AsyncJobDeliveryState {
 	queued: number;
 	delivering: boolean;
@@ -381,7 +390,8 @@ export class AsyncJobManager {
 	 * resume fails closed with reason "no_runner".
 	 */
 	readonly #descriptorResumeRunners = new Map<string, ResumeRunner>();
-	readonly #deadLetteredDeliveries = new Map<string, AsyncJobDelivery>();
+	readonly #deadLetteredDeliveries = new Map<string, DeadLetteredDelivery>();
+	readonly #deadLetteredDeliveryOwners = new Map<string, string | undefined>();
 	readonly #ownerSubagentShutdownLeases = new Map<string, OwnerSubagentShutdownLeaseState>();
 	#ownerSubagentShutdownSeq = 0;
 	#lastDisposeDiagnostics: AsyncJobDisposeDiagnostics = { stuckJobIds: [], deliveriesDrained: true };
@@ -1333,12 +1343,15 @@ export class AsyncJobManager {
 	}
 
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {
+		this.#expireMonitorTombstones();
 		const deliveries = this.#filterDeliveries(filter);
 		const inFlightDeliveries = this.#filterInFlightDeliveries(filter);
 		const ownerId = filter?.ownerId;
-		const deadLettered = Array.from(this.#deadLetteredDeliveries.values()).filter(
-			delivery => !ownerId || delivery.ownerId === ownerId,
-		).length;
+		const deadLettered = ownerId
+			? Array.from(this.#deadLetteredDeliveries.keys()).filter(
+				jobId => this.#deadLetteredDeliveryOwners.get(jobId) === ownerId,
+			).length
+			: this.#deadLetteredDeliveries.size;
 		const nextRetryAt = deliveries.reduce<number | undefined>((next, delivery) => {
 			if (next === undefined) return delivery.nextAttemptAt;
 			return Math.min(next, delivery.nextAttemptAt);
@@ -1553,6 +1566,7 @@ export class AsyncJobManager {
 		this.#deliveries.length = 0;
 		this.#inFlightDeliveries.length = 0;
 		this.#deadLetteredDeliveries.clear();
+		this.#deadLetteredDeliveryOwners.clear();
 		this.#suppressedDeliveries.clear();
 		this.#watchedJobs.clear();
 		this.#outputState.clear();
@@ -1615,12 +1629,15 @@ export class AsyncJobManager {
 	}
 
 	#evictJob(jobId: string): void {
+		this.#expireMonitorTombstones();
 		this.#recordMonitorTombstone(jobId);
 		this.#runLifecycle(jobId, "evict");
 		this.#purgeTerminalSubagentStateForJob(jobId);
 		this.#jobs.delete(jobId);
 		this.#lifecycles.delete(jobId);
 		this.#lifecyclePhases.delete(jobId);
+		this.#deadLetteredDeliveries.delete(jobId);
+		this.#deadLetteredDeliveryOwners.delete(jobId);
 		this.#suppressedDeliveries.delete(jobId);
 		this.#watchedJobs.delete(jobId);
 		this.#outputState.delete(jobId);
@@ -1700,6 +1717,24 @@ export class AsyncJobManager {
 		return this.#isDeliveryAcknowledged(jobId) || this.#watchedJobs.has(jobId);
 	}
 
+	#recordDeadLetter(delivery: AsyncJobDelivery): void {
+		this.#deadLetteredDeliveries.delete(delivery.jobId);
+		this.#deadLetteredDeliveryOwners.delete(delivery.jobId);
+		this.#deadLetteredDeliveries.set(delivery.jobId, {
+			jobId: delivery.jobId,
+			attempt: delivery.attempt,
+			lastError: delivery.lastError,
+		});
+		this.#deadLetteredDeliveryOwners.set(delivery.jobId, delivery.ownerId);
+		while (this.#deadLetteredDeliveries.size > MAX_DEAD_LETTERED_DELIVERIES) {
+			const oldestJobId = this.#deadLetteredDeliveries.keys().next().value;
+			if (oldestJobId === undefined) return;
+			this.#deadLetteredDeliveries.delete(oldestJobId);
+			this.#deadLetteredDeliveryOwners.delete(oldestJobId);
+		}
+	}
+
+
 	#enqueueDelivery(jobId: string, text: string): void {
 		// Skip delivery if already acknowledged
 		if (this.#isDeliveryAcknowledged(jobId)) {
@@ -1717,7 +1752,7 @@ export class AsyncJobManager {
 		});
 		while (this.#deliveries.length > DEFAULT_MAX_DELIVERY_QUEUE) {
 			const dropped = this.#deliveries.shift();
-			if (dropped) this.#deadLetteredDeliveries.set(dropped.jobId, dropped);
+			if (dropped) this.#recordDeadLetter(dropped);
 		}
 		this.#ensureDeliveryLoop();
 	}
@@ -1781,7 +1816,7 @@ export class AsyncJobManager {
 				delivery.attempt += 1;
 				delivery.lastError = error instanceof Error ? error.message : String(error);
 				if (delivery.attempt >= DELIVERY_MAX_ATTEMPTS) {
-					this.#deadLetteredDeliveries.set(delivery.jobId, delivery);
+					this.#recordDeadLetter(delivery);
 					logger.warn("Async job completion delivery reached retry cap", {
 						jobId: delivery.jobId,
 						attempt: delivery.attempt,
