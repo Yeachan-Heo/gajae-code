@@ -250,7 +250,19 @@ describe("GJC state writer revision policy", () => {
 		const root = await cwd();
 		const target = ".gjc/_session-sess/state/deep-interview-state.json";
 		const snapshotPath = path.join(root, ".gjc/_session-sess/state/skill-active-state.json");
-		const snapshot = JSON.stringify({ version: 1, active: false, active_skills: [] }, null, 2);
+		const snapshot = JSON.stringify(
+			{
+				version: 1,
+				active: false,
+				skill: "",
+				phase: "",
+				updated_at: "",
+				active_skills: [],
+				active_subskills: [],
+			},
+			null,
+			2,
+		);
 		await fs.mkdir(path.dirname(snapshotPath), { recursive: true });
 		await fs.writeFile(snapshotPath, snapshot);
 
