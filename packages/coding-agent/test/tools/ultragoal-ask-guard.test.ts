@@ -4,18 +4,25 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
+	activeEntryPath,
 	activeSnapshotPath,
 	modeStatePath,
 	sessionActivityPath,
+	transactionJournalPath,
+	ultragoalAskHandoffCommitPath,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { reconcileWorkflowSkillState, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { stampWorkflowEnvelopeChecksum } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { isUltragoalAskBlocked } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
+	addUltragoalSubgoal,
 	computeUltragoalPlanGeneration,
 	createUltragoalPlan,
 	getUltragoalPaths,
 	hashStructuredValue,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { syncSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
@@ -38,7 +45,9 @@ beforeAll(async () => {
 afterEach(async () => {
 	if (ORIGINAL_GJC_SESSION_ID === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = ORIGINAL_GJC_SESSION_ID;
+	delete process.env.GJC_STATE_HANDOFF_FAIL_BEFORE_ASK_COMMIT;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+	delete process.env.GJC_STATE_HANDOFF_FAIL_AFTER_ASK_COMMIT;
 });
 
 function createSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolSession {
@@ -71,29 +80,43 @@ async function writeActivityMarker(cwd: string, sessionId: string, updatedAt: st
 }
 
 async function writeActiveDeepInterviewState(cwd: string, sessionId: string): Promise<void> {
-	const now = new Date().toISOString();
-	const activeState = {
-		version: 1,
-		active: true,
+	await syncSkillActiveState({
+		cwd,
+		sessionId,
 		skill: "deep-interview",
+		active: true,
 		phase: "interviewing",
-		updated_at: now,
-		session_id: sessionId,
-		active_skills: [
-			{
-				skill: "deep-interview",
-				phase: "interviewing",
-				active: true,
-				updated_at: now,
-				session_id: sessionId,
-			},
+	});
+}
+async function prepareUltragoalCaller(cwd: string, sessionId: string, active = true, phase = "handoff"): Promise<void> {
+	const prepared = await runNativeStateCommand(
+		[
+			"write",
+			"--mode",
+			"ultragoal",
+			"--session-id",
+			sessionId,
+			"--input",
+			JSON.stringify({ active, current_phase: phase }),
+			"--json",
 		],
-	};
-	await Bun.write(activeSnapshotPath(cwd, sessionId), `${JSON.stringify(activeState, null, 2)}\n`);
-	await Bun.write(
-		modeStatePath(cwd, sessionId, "deep-interview"),
-		`${JSON.stringify({ active: true, current_phase: "interviewing", session_id: sessionId }, null, 2)}\n`,
+		cwd,
 	);
+	expect(prepared.status, prepared.stderr).toBe(0);
+}
+
+async function handoffUltragoal(
+	cwd: string,
+	sessionId: string,
+	callee: "deep-interview" | "ralplan",
+	expectedStatus = 0,
+): Promise<void> {
+	await prepareUltragoalCaller(cwd, sessionId);
+	const result = await runNativeStateCommand(
+		["handoff", "--mode", "ultragoal", "--to", callee, "--session-id", sessionId, "--json"],
+		cwd,
+	);
+	expect(result.status, result.stderr).toBe(expectedStatus);
 }
 
 function stubAskTool(execute: () => Promise<void>): AgentTool {
@@ -241,14 +264,13 @@ describe("ultragoal ask guard", () => {
 		expect(result.content[0]).toMatchObject({ type: "text" });
 	});
 
-	it("blocks active deep-interview ask when the same session has active ultragoal state", async () => {
+	it("allows active deep-interview ask after same-session ultragoal handoff", async () => {
 		const cwd = await tempDir();
-		const sessionId = "deep-interview-with-ultragoal-state";
+		const sessionId = "deep-interview-after-ultragoal-handoff";
 
 		process.env.GJC_SESSION_ID = sessionId;
 		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
-		delete process.env.GJC_SESSION_ID;
-		await writeActiveDeepInterviewState(cwd, sessionId);
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
 
 		const select = vi.fn(async () => "Continue");
 		const tool = new AskTool(
@@ -258,16 +280,576 @@ describe("ultragoal ask guard", () => {
 			}),
 		);
 
+		const result = await tool.execute(
+			"call",
+			{ questions: [{ id: "q", question: "Continue interview?", options: [{ label: "Continue" }] }] },
+			undefined,
+			undefined,
+			createContext(select),
+		);
+
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(result.content[0]).toMatchObject({ type: "text" });
+	});
+	it("allows ask after a committed same-session ultragoal to ralplan handoff", async () => {
+		const cwd = await tempDir();
+		const sessionId = "ralplan-after-ultragoal-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "ralplan");
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(false);
+		expect(diagnostic.reason).toContain("committed workflow handoff to ralplan");
+	});
+	it("rejects an inactive ultragoal caller before mutating a handoff", async () => {
+		const cwd = await tempDir();
+		const sessionId = "inactive-ultragoal-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await prepareUltragoalCaller(cwd, sessionId, false);
+		const result = await runNativeStateCommand(
+			["handoff", "--mode", "ultragoal", "--to", "deep-interview", "--session-id", sessionId, "--json"],
+			cwd,
+		);
+
+		expect(result.status).toBe(2);
+		await expect(fs.access(modeStatePath(cwd, sessionId, "deep-interview"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 		await expect(
-			tool.execute(
-				"call",
-				{ questions: [{ id: "q", question: "Continue interview?", options: [{ label: "Continue" }] }] },
-				undefined,
-				undefined,
-				createContext(select),
-			),
-		).rejects.toThrow(/try-harder nudge/);
-		expect(select).not.toHaveBeenCalled();
+			fs.access(path.dirname(ultragoalAskHandoffCommitPath(cwd, sessionId, "inactive-handoff"))),
+		).rejects.toMatchObject({ code: "ENOENT" });
+	});
+	it("rejects an ultragoal caller outside the explicit handoff phase", async () => {
+		const cwd = await tempDir();
+		const sessionId = "wrong-phase-ultragoal-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await prepareUltragoalCaller(cwd, sessionId, true, "pending");
+		const result = await runNativeStateCommand(
+			["handoff", "--mode", "ultragoal", "--to", "ralplan", "--session-id", sessionId, "--json"],
+			cwd,
+		);
+
+		expect(result.status).toBe(2);
+		await expect(fs.access(modeStatePath(cwd, sessionId, "ralplan"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+	it("rejects a replacement plan that reuses the authorized run ID", async () => {
+		const cwd = await tempDir();
+		const sessionId = "reused-plan-run-id-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		const originalPlan = await createUltragoalPlan({ cwd, brief: "Implement the original story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		await createUltragoalPlan({ cwd, brief: "Implement the replacement story" });
+		const paths = getUltragoalPaths(cwd, sessionId);
+		const replacement = JSON.parse(await fs.readFile(paths.goalsPath, "utf8"));
+		replacement.planRunId = originalPlan.planRunId;
+		await fs.writeFile(paths.goalsPath, JSON.stringify(replacement, null, 2));
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("rejects a restored same-run plan after sanctioned ledger advancement", async () => {
+		const cwd = await tempDir();
+		const sessionId = "restored-plan-ledger-generation-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		const paths = getUltragoalPaths(cwd, sessionId);
+		const authorizedPlan = await fs.readFile(paths.goalsPath, "utf8");
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		await addUltragoalSubgoal({
+			cwd,
+			title: "Later required work",
+			objective: "Implement the later required work",
+			evidence: "The original plan needs this required follow-up implementation task.",
+			rationale: "The sanctioned steering mutation advances the authoritative ledger.",
+		});
+		await fs.writeFile(paths.goalsPath, authorizedPlan);
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("strips handoff authority during sanctioned migration", async () => {
+		const cwd = await tempDir();
+		const sessionId = "migrate-handoff-authority";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "ralplan");
+		const migration = await runNativeStateCommand(
+			["migrate", "--mode", "ralplan", "--session-id", sessionId, "--json"],
+			cwd,
+		);
+
+		expect(migration.status, migration.stderr).toBe(0);
+		const calleeState = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ralplan"), "utf8"));
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+		expect(calleeState.ultragoal_ask_handoff).toBeUndefined();
+		expect(diagnostic.active).toBe(true);
+	});
+	it("cannot revive handoff authority through clear then reconciliation", async () => {
+		const cwd = await tempDir();
+		const sessionId = "clear-reconcile-handoff-replay";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		const cleared = await runNativeStateCommand(
+			["clear", "--mode", "deep-interview", "--session-id", sessionId, "--json"],
+			cwd,
+		);
+		expect(cleared.status, cleared.stderr).toBe(0);
+		await reconcileWorkflowSkillState({
+			cwd,
+			mode: "deep-interview",
+			sessionId,
+			active: true,
+			phase: "interviewing",
+			payload: {},
+		});
+
+		const calleeState = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "deep-interview"), "utf8"));
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+		expect(calleeState.ultragoal_ask_handoff).toBeUndefined();
+		expect(diagnostic.active).toBe(true);
+	});
+	it("rejects matching mode states without a durable handleHandoff commit", async () => {
+		const cwd = await tempDir();
+		const sessionId = "missing-handoff-commit";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		const callerState = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ultragoal"), "utf8"));
+		await fs.rm(ultragoalAskHandoffCommitPath(cwd, sessionId, callerState.ultragoal_ask_handoff.mutation_id));
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("invalidates handoff ask authority on a later sanctioned state write", async () => {
+		const cwd = await tempDir();
+		const sessionId = "state-write-after-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		const write = await runNativeStateCommand(
+			[
+				"write",
+				"--mode",
+				"deep-interview",
+				"--session-id",
+				sessionId,
+				"--input",
+				JSON.stringify({ active: true, current_phase: "interviewing" }),
+				"--json",
+			],
+			cwd,
+		);
+		expect(write.status, write.stderr).toBe(0);
+		const calleeState = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "deep-interview"), "utf8"));
+		expect(calleeState.ultragoal_ask_handoff).toBeUndefined();
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("strips captured handoff authority from sanctioned merge and replace writes", async () => {
+		for (const replace of [false, true]) {
+			const cwd = await tempDir();
+			const sessionId = `replayed-handoff-${replace ? "replace" : "merge"}`;
+
+			process.env.GJC_SESSION_ID = sessionId;
+			await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+			await handoffUltragoal(cwd, sessionId, "ralplan");
+			const calleePath = modeStatePath(cwd, sessionId, "ralplan");
+			const calleeState = JSON.parse(await fs.readFile(calleePath, "utf8"));
+			const write = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"ralplan",
+					"--session-id",
+					sessionId,
+					"--input",
+					JSON.stringify(calleeState),
+					...(replace ? ["--replace"] : []),
+					"--json",
+				],
+				cwd,
+			);
+			expect(write.status, write.stderr).toBe(0);
+			const persisted = JSON.parse(await fs.readFile(calleePath, "utf8"));
+			expect(persisted.ultragoal_ask_handoff).toBeUndefined();
+
+			const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+			expect(diagnostic.active).toBe(true);
+		}
+	});
+	it("fails closed when handoff crashes after active-state commit but before ask proof", async () => {
+		const cwd = await tempDir();
+		const sessionId = "handoff-crash-before-proof";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		process.env.GJC_STATE_HANDOFF_FAIL_BEFORE_ASK_COMMIT = "1";
+		await handoffUltragoal(cwd, sessionId, "deep-interview", 1);
+		delete process.env.GJC_STATE_HANDOFF_FAIL_BEFORE_ASK_COMMIT;
+		const callerState = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ultragoal"), "utf8"));
+		const mutationId = callerState.ultragoal_ask_handoff.mutation_id;
+		const journal = JSON.parse(await fs.readFile(transactionJournalPath(cwd, sessionId, mutationId), "utf8"));
+		expect(journal).toMatchObject({
+			status: "pending",
+			steps: ["callee-mode-state", "caller-mode-state", "active-state"],
+		});
+		await expect(fs.access(ultragoalAskHandoffCommitPath(cwd, sessionId, mutationId))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("fails closed while a crash leaves the durable ask proof journal pending", async () => {
+		const cwd = await tempDir();
+		const sessionId = "handoff-crash-after-proof";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		process.env.GJC_STATE_HANDOFF_FAIL_AFTER_ASK_COMMIT = "1";
+		await handoffUltragoal(cwd, sessionId, "ralplan", 1);
+		delete process.env.GJC_STATE_HANDOFF_FAIL_AFTER_ASK_COMMIT;
+
+		const callerState = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ultragoal"), "utf8"));
+		const mutationId = callerState.ultragoal_ask_handoff.mutation_id;
+		const journal = JSON.parse(await fs.readFile(transactionJournalPath(cwd, sessionId, mutationId), "utf8"));
+		expect(journal).toMatchObject({
+			status: "pending",
+			steps: ["callee-mode-state", "caller-mode-state", "active-state", "ask-commit"],
+		});
+		await fs.access(ultragoalAskHandoffCommitPath(cwd, sessionId, mutationId));
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+		expect(diagnostic.active).toBe(true);
+	});
+	it("doctor cleans a verified committed-before-delete handoff journal", async () => {
+		const cwd = await tempDir();
+		const sessionId = "committed-handoff-journal-recovery";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		const callerState = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ultragoal"), "utf8"));
+		const mutationId = callerState.ultragoal_ask_handoff.mutation_id;
+		const journalPath = transactionJournalPath(cwd, sessionId, mutationId);
+		await fs.mkdir(path.dirname(journalPath), { recursive: true });
+		await fs.writeFile(
+			journalPath,
+			JSON.stringify({
+				version: 1,
+				mutation_id: mutationId,
+				status: "committed",
+				created_at: callerState.handoff_at,
+				updated_at: callerState.handoff_at,
+				caller: "ultragoal",
+				callee: "deep-interview",
+				paths: [
+					modeStatePath(cwd, sessionId, "deep-interview"),
+					modeStatePath(cwd, sessionId, "ultragoal"),
+					activeSnapshotPath(cwd, sessionId),
+					ultragoalAskHandoffCommitPath(cwd, sessionId, mutationId),
+				],
+				steps: ["callee-mode-state", "caller-mode-state", "active-state", "ask-commit"],
+			}),
+		);
+
+		const doctor = await runNativeStateCommand(["doctor", "--session-id", sessionId, "--json"], cwd);
+
+		expect(doctor.status, doctor.stdout).toBe(0);
+		await expect(fs.access(journalPath)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+	it("retains and reports tampered committed handoff journals", async () => {
+		for (const tamper of [
+			"active-entry",
+			"ledger-head",
+			"checksum",
+			"wrong-filename",
+			"paths",
+			"embedded-removed",
+			"embedded-replaced",
+			"receipt-extra",
+			"receipt-future",
+			"snapshot-missing",
+			"snapshot-tampered",
+			"extra-active-entry",
+			"string-revisions",
+		] as const) {
+			const cwd = await tempDir();
+			const sessionId = `committed-handoff-journal-${tamper}`;
+
+			process.env.GJC_SESSION_ID = sessionId;
+			await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+			await handoffUltragoal(cwd, sessionId, "deep-interview");
+			const callerState = JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ultragoal"), "utf8"));
+			const mutationId = callerState.ultragoal_ask_handoff.mutation_id;
+			const callerPath = modeStatePath(cwd, sessionId, "ultragoal");
+			const calleePath = modeStatePath(cwd, sessionId, "deep-interview");
+			const commitPath = ultragoalAskHandoffCommitPath(cwd, sessionId, mutationId);
+			const writeStamped = async (statePath: string, state: Record<string, unknown>, computedAt?: string) =>
+				await fs.writeFile(statePath, JSON.stringify(stampWorkflowEnvelopeChecksum(state, statePath, computedAt)));
+			const journalPath = transactionJournalPath(
+				cwd,
+				sessionId,
+				tamper === "wrong-filename" ? `${mutationId}:wrong-file` : mutationId,
+			);
+			if (tamper === "active-entry") {
+				const entryPath = activeEntryPath(cwd, sessionId, "deep-interview");
+				const entry = JSON.parse(await fs.readFile(entryPath, "utf8"));
+				entry.active = false;
+				await fs.writeFile(entryPath, JSON.stringify(entry));
+			}
+			if (tamper === "ledger-head") {
+				await fs.appendFile(
+					getUltragoalPaths(cwd, sessionId).ledgerPath,
+					`${JSON.stringify({ eventId: "tampered-ledger-head", event: "tampered", timestamp: new Date().toISOString() })}\n`,
+				);
+			}
+			if (tamper === "checksum") {
+				const statePath = modeStatePath(cwd, sessionId, "deep-interview");
+				const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+				state.current_phase = "complete";
+				await fs.writeFile(statePath, JSON.stringify(state));
+			}
+			if (tamper === "embedded-removed" || tamper === "embedded-replaced") {
+				const state = JSON.parse(await fs.readFile(calleePath, "utf8"));
+				if (tamper === "embedded-removed") delete state.ultragoal_ask_handoff;
+				else state.ultragoal_ask_handoff = { ...state.ultragoal_ask_handoff, mutation_id: "replaced" };
+				await writeStamped(calleePath, state);
+			}
+			if (tamper === "receipt-extra") {
+				const authority = JSON.parse(await fs.readFile(commitPath, "utf8"));
+				authority.caller_receipt.extra = "recovery must reject unknown receipt fields";
+				await fs.writeFile(commitPath, JSON.stringify(authority));
+				for (const statePath of [callerPath, calleePath]) {
+					const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+					state.ultragoal_ask_handoff = authority;
+					state.receipt.extra = "recovery must reject unknown receipt fields";
+					await writeStamped(statePath, state);
+				}
+			}
+			if (tamper === "receipt-future") {
+				const state = JSON.parse(await fs.readFile(calleePath, "utf8"));
+				await writeStamped(calleePath, state, new Date(Date.now() + 60_000).toISOString());
+			}
+			if (tamper === "snapshot-missing") {
+				await fs.rm(activeSnapshotPath(cwd, sessionId));
+			}
+			if (tamper === "snapshot-tampered") {
+				const snapshotPath = activeSnapshotPath(cwd, sessionId);
+				const snapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8"));
+				snapshot.phase = "tampered";
+				await fs.writeFile(snapshotPath, JSON.stringify(snapshot));
+			}
+			if (tamper === "extra-active-entry") {
+				await fs.writeFile(
+					activeEntryPath(cwd, sessionId, "custom-review"),
+					JSON.stringify({ skill: "custom-review", session_id: sessionId, active: true, phase: "running" }),
+				);
+			}
+			if (tamper === "string-revisions") {
+				const authority = JSON.parse(await fs.readFile(commitPath, "utf8"));
+				authority.caller_state_revision = String(authority.caller_state_revision);
+				authority.callee_state_revision = String(authority.callee_state_revision);
+				await fs.writeFile(commitPath, JSON.stringify(authority));
+				for (const statePath of [callerPath, calleePath]) {
+					const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+					state.state_revision = String(state.state_revision);
+					state.ultragoal_ask_handoff = authority;
+					await writeStamped(statePath, state);
+				}
+			}
+			await fs.mkdir(path.dirname(journalPath), { recursive: true });
+			await fs.writeFile(
+				journalPath,
+				JSON.stringify({
+					version: 1,
+					mutation_id: mutationId,
+					status: "committed",
+					created_at: callerState.handoff_at,
+					updated_at: callerState.handoff_at,
+					caller: "ultragoal",
+					callee: "deep-interview",
+					paths:
+						tamper === "paths"
+							? []
+							: [
+									modeStatePath(cwd, sessionId, "deep-interview"),
+									modeStatePath(cwd, sessionId, "ultragoal"),
+									activeSnapshotPath(cwd, sessionId),
+									ultragoalAskHandoffCommitPath(cwd, sessionId, mutationId),
+								],
+					steps: ["callee-mode-state", "caller-mode-state", "active-state", "ask-commit"],
+				}),
+			);
+
+			const doctor = await runNativeStateCommand(["doctor", "--session-id", sessionId, "--json"], cwd);
+
+			expect(doctor.status, `${tamper}: ${doctor.stdout}`).toBe(1);
+			await fs.access(journalPath);
+		}
+	});
+	it("keeps durable handoff proof valid after transient receipt freshness expires", async () => {
+		const cwd = await tempDir();
+		const sessionId = "durable-handoff-receipt-expiry";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		const now = Date.now();
+		const spy = vi.spyOn(Date, "now").mockReturnValue(now + 31 * 60_000);
+		try {
+			const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+			expect(diagnostic.active).toBe(false);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+	it("blocks a committed handoff when a custom workflow is also active", async () => {
+		const cwd = await tempDir();
+		const sessionId = "custom-overlapping-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		await syncSkillActiveState({
+			cwd,
+			sessionId,
+			skill: "custom-review",
+			active: true,
+			phase: "running",
+		});
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("fails closed on a malformed custom entry after committed handoff", async () => {
+		const cwd = await tempDir();
+		const sessionId = "malformed-custom-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "ralplan");
+		await Bun.write(activeEntryPath(cwd, sessionId, "custom-review"), "{}\n");
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("durable_state_unreadable");
+	});
+	it("does not accept callee activation without committed handoff provenance", async () => {
+		const cwd = await tempDir();
+		const sessionId = "forged-deep-interview-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await writeActiveDeepInterviewState(cwd, sessionId);
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("does not treat active team state as a backward handoff", async () => {
+		const cwd = await tempDir();
+		const sessionId = "team-with-incomplete-ultragoal";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await syncSkillActiveState({
+			cwd,
+			sessionId,
+			skill: "team",
+			active: true,
+			phase: "running",
+		});
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("fails closed on structurally invalid canonical active entries", async () => {
+		const cwd = await tempDir();
+		const sessionId = "malformed-handoff-entry";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await Bun.write(
+			activeEntryPath(cwd, sessionId, "deep-interview"),
+			`${JSON.stringify({ skill: "deep-interview", session_id: sessionId })}\n`,
+		);
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("durable_state_unreadable");
+		expect(diagnostic.reason).toContain("boolean active field");
+	});
+	it("rejects a stale handoff entry from an earlier ultragoal run", async () => {
+		const cwd = await tempDir();
+		const sessionId = "stale-ultragoal-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		const originalPlan = await createUltragoalPlan({ cwd, brief: "Implement the earlier story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		const replacementPlan = await createUltragoalPlan({ cwd, brief: "Implement the replacement story" });
+		const paths = getUltragoalPaths(cwd, sessionId);
+		const persistedReplacement = JSON.parse(await fs.readFile(paths.goalsPath, "utf8"));
+		persistedReplacement.createdAt = originalPlan.createdAt;
+		await fs.writeFile(paths.goalsPath, JSON.stringify(persistedReplacement, null, 2));
+		expect(persistedReplacement.createdAt).toBe(originalPlan.createdAt);
+		expect(replacementPlan.planRunId).not.toBe(originalPlan.planRunId);
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("keeps ask blocked when ultragoal remains active during an overlapping handoff", async () => {
+		const cwd = await tempDir();
+		const sessionId = "overlapping-ultragoal-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await writeActiveDeepInterviewState(cwd, sessionId);
+		await syncSkillActiveState({
+			cwd,
+			sessionId,
+			skill: "ultragoal",
+			active: true,
+			phase: "handoff",
+		});
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
 	});
 
 	it("allows ask when the ultragoal run is verified complete", async () => {
@@ -310,7 +892,7 @@ describe("ultragoal ask guard", () => {
 			`${JSON.stringify({ eventId, event: "goal_checkpointed", goalId: plan.goals[0].id, status: "complete", completionVerification: plan.goals[0].completionVerification, qualityGateJson })}\n`,
 		);
 		const diagnostic = await isUltragoalAskBlocked(cwd);
-		expect(diagnostic.active).toBe(false);
+		expect(diagnostic.active, diagnostic.reason).toBe(false);
 		expect(diagnostic.source).toBe("durable_state");
 	});
 

@@ -18,6 +18,9 @@
 ### Fixed
 - Active deep-interview sessions now resume automatically after a normal assistant stop while ordinary active interviewing remains eligible, using bounded workflow-state continuation; recovery, leak, stale-state, handoff, and crystallization blocks remain Stop-gate handled.
 
+### Fixed
+- Ultragoal ask guards now release only after a receipt-backed same-session handoff to deep-interview or ralplan, while malformed, stale, ambiguous, forged, or still-active Ultragoal state remains fail-closed.
+
 ## [0.11.0] - 2026-07-15
 
 ### Fixed
