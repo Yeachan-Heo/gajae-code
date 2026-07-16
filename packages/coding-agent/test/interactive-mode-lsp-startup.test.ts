@@ -18,7 +18,9 @@ describe("InteractiveMode LSP startup events", () => {
 	it("delivers startup completion events through the shared channel", () => {
 		const eventBus = new EventBus();
 		const received: LspStartupEvent[] = [];
-		eventBus.on(LSP_STARTUP_EVENT_CHANNEL, event => received.push(event as LspStartupEvent));
+		eventBus.on(LSP_STARTUP_EVENT_CHANNEL, event => {
+			received.push(event as LspStartupEvent);
+		});
 
 		const event: LspStartupEvent = {
 			type: "completed",

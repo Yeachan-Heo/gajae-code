@@ -652,7 +652,10 @@ export class RevisionStore {
 		append: (text: string) => Promise<void>,
 		indexEscapedString = false,
 	): Promise<EscapedStringIndex | undefined> {
-		if (!indexEscapedString) return append(JSON.stringify(value));
+		if (!indexEscapedString) {
+			await append(JSON.stringify(value));
+			return undefined;
+		}
 		await append('"');
 		let output = "";
 		let serializedOffset = 1;
