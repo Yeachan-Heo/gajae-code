@@ -5,7 +5,7 @@
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 
 ### Changed
-- The tool-output expand shortcut now stamps an explicit per-block fold choice, and automatic expansion stamping can no longer overwrite a block whose state came from an explicit user action. All current automatic stamping happens at component creation, so behavior is unchanged today; this locks the invariant for future per-block folds.
+- The tool-output expand shortcut now stamps an explicit fold choice for each live component, so automatic expansion stamping cannot overwrite it. Transcript rebuilds/remounts create components from the global tool-output setting and reset that provenance.
 
 ## [0.11.0] - 2026-07-15
 

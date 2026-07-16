@@ -3,6 +3,7 @@ import type { AssistantMessage } from "@gajae-code/ai";
 import { Container, type TUI } from "@gajae-code/tui";
 import { resetSettingsForTest, Settings } from "../../../src/config/settings.js";
 import { AssistantMessageComponent } from "../../../src/modes/components/assistant-message.js";
+import { ReadToolGroupComponent } from "../../../src/modes/components/read-tool-group.js";
 import { ToolExecutionComponent } from "../../../src/modes/components/tool-execution.js";
 import { InputController } from "../../../src/modes/controllers/input-controller.js";
 import { initTheme } from "../../../src/modes/theme/theme.js";
@@ -10,7 +11,7 @@ import type { InteractiveModeContext } from "../../../src/modes/types.js";
 
 const uiStub = { requestRender() {} } as unknown as TUI;
 
-function render(component: ToolExecutionComponent | AssistantMessageComponent): string {
+function render(component: ToolExecutionComponent | ReadToolGroupComponent | AssistantMessageComponent): string {
 	return Bun.stripANSI(component.render(100).join("\n"));
 }
 
@@ -83,6 +84,20 @@ describe("manual output folds", () => {
 		component.updateResult(toolResult(30), false);
 
 		expect(render(component)).not.toContain("fold-start-marker");
+	});
+	it("lets the global fold toggle override an earlier read-group pin", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const chatContainer = new Container();
+		chatContainer.addChild(component);
+		const ctx = { chatContainer, toolOutputExpanded: false, ui: uiStub } as unknown as InteractiveModeContext;
+		const controller = new InputController(ctx);
+
+		component.updateArgs({ path: "/tmp/example.ts" }, "read");
+		component.setManuallyExpanded(true);
+		controller.setToolsExpanded(false);
+		component.updateResult(toolResult(4), false, "read");
+
+		expect(render(component)).not.toContain("line 4");
 	});
 
 	it("keeps hidden thinking hidden through streaming updates", () => {
