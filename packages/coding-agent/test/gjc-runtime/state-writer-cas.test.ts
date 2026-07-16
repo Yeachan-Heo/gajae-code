@@ -205,7 +205,7 @@ describe("state-writer concurrency (issue #646)", () => {
 
 	it.each([
 		{},
-		{ version: 1, active: false, skill: "", phase: "", active_skills: [], active_subskills: [] },
+		{ version: 1, active: false, skill: "", phase: "" },
 	])("refuses to publish over a malformed canonical active snapshot", async snapshot => {
 		const root = await tempDir();
 		const statePath = path.join(sessionStateDir(root, "test-session"), "ralplan-state.json");
