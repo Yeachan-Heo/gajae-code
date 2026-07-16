@@ -19,14 +19,25 @@ const policy = { now: () => NOW, idleMs: IDLE_MS };
 
 let counter = 0;
 
-function makeFakeBrowser(refCount: number): { handle: BrowserHandle; close: ReturnType<typeof vi.fn> } {
+function makeFakeBrowser(
+	refCount: number,
+	targetClose?: ReturnType<typeof vi.fn>,
+): { handle: BrowserHandle; close: ReturnType<typeof vi.fn> } {
 	const close = vi.fn(async () => {});
 	const browser = {
 		connected: true,
 		close,
 		disconnect: vi.fn(() => {}),
 		process: () => null,
-		targets: () => [],
+		targets: () =>
+			targetClose
+				? [
+						{
+							_targetId: "target-1",
+							page: async () => ({ close: targetClose }),
+						},
+					]
+				: [],
 	} as unknown as Browser;
 	const handle = {
 		key: `headless:test-${counter++}`,
@@ -68,6 +79,8 @@ interface InstallOpts {
 	state?: "alive" | "dead";
 	pendingCount?: number;
 	refCount?: number;
+	recoveredFromDead?: boolean;
+	targetClose?: ReturnType<typeof vi.fn>;
 }
 
 function installTab(opts: InstallOpts): {
@@ -75,7 +88,7 @@ function installTab(opts: InstallOpts): {
 	terminate: ReturnType<typeof vi.fn>;
 	handle: BrowserHandle;
 } {
-	const { handle, close } = makeFakeBrowser(opts.refCount ?? 1);
+	const { handle, close } = makeFakeBrowser(opts.refCount ?? 1, opts.targetClose);
 	const { worker, terminate } = makeFakeWorker();
 	const pending = new Map<string, unknown>();
 	for (let i = 0; i < (opts.pendingCount ?? 0); i++) {
@@ -91,6 +104,7 @@ function installTab(opts: InstallOpts): {
 		pending,
 		kindTag: opts.kindTag,
 		lastUsedAt: opts.lastUsedAt,
+		recoveredFromDead: opts.recoveredFromDead,
 	} as unknown as TabSession;
 	setTabForTest(tab);
 	return { close, terminate, handle };
@@ -192,6 +206,25 @@ describe("tab-supervisor GC primitives", () => {
 		expect([r1, r2].filter(Boolean)).toHaveLength(1);
 		expect(close).toHaveBeenCalledTimes(1);
 		expect(handle.refCount).toBe(0);
+		expect(getTab("a")).toBeUndefined();
+	});
+	it("closes recovered headless page targets on graceful release while the shared browser stays open", async () => {
+		const targetClose = vi.fn(async () => {});
+		const { close, handle, terminate } = installTab({
+			name: "a",
+			kindTag: "headless",
+			lastUsedAt: NOW - 5000,
+			refCount: 2,
+			recoveredFromDead: true,
+			targetClose,
+		});
+
+		expect(await releaseTab("a", { kill: false })).toBe(true);
+
+		expect(terminate).toHaveBeenCalledTimes(1);
+		expect(targetClose).toHaveBeenCalledTimes(1);
+		expect(close).not.toHaveBeenCalled();
+		expect(handle.refCount).toBe(1);
 		expect(getTab("a")).toBeUndefined();
 	});
 

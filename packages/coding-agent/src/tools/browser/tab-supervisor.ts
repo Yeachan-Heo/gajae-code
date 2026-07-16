@@ -62,6 +62,8 @@ export interface TabSession {
 	lastUsedAt: number;
 	/** Set synchronously by the shared begin-release guard so concurrent release is a no-op. */
 	releasing?: boolean;
+	/** Recovered headless tabs run in attach mode, so graceful worker close only disconnects. */
+	recoveredFromDead?: boolean;
 }
 
 export interface AcquireTabOptions {
@@ -441,6 +443,7 @@ async function recoverDeadTabSessionOnce(
 		pending: new Map(),
 		releasing: false,
 		lastUsedAt: Date.now(),
+		recoveredFromDead: true,
 	};
 	worker.onMessage(msg => handleTabMessage(recovered, msg));
 	worker.onError(error => markTabDead(recovered, "worker-error", error));
@@ -511,7 +514,7 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 		}
 	}
 	await awaitWithinBudget(tab.worker.terminate(), remainingBudget(deadlineAt), "worker.terminate");
-	if (forced && tab.kindTag === "headless") {
+	if (tab.kindTag === "headless" && (forced || tab.recoveredFromDead)) {
 		await awaitWithinBudget(closeOrphanTarget(tab), remainingBudget(deadlineAt), "closeOrphanTarget");
 	}
 	await awaitWithinBudget(
@@ -671,6 +674,7 @@ function toErrorPayload(error: unknown): RunErrorPayload {
 }
 
 async function forceKillTab(name: string, reason: string): Promise<void> {
+	deadTabRecovery.invalidateName(name);
 	const tab = tabs.get(name);
 	if (!tab) return;
 	if (!beginRelease(tab)) return;
