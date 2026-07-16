@@ -1344,6 +1344,7 @@ export class AsyncJobManager {
 
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {
 		this.#expireMonitorTombstones();
+		this.#pruneEvictedDeadLetters();
 		const deliveries = this.#filterDeliveries(filter);
 		const inFlightDeliveries = this.#filterInFlightDeliveries(filter);
 		const ownerId = filter?.ownerId;
@@ -1717,7 +1718,17 @@ export class AsyncJobManager {
 		return this.#isDeliveryAcknowledged(jobId) || this.#watchedJobs.has(jobId);
 	}
 
+	#pruneEvictedDeadLetters(): void {
+		for (const jobId of this.#deadLetteredDeliveries.keys()) {
+			if (this.#jobs.has(jobId)) continue;
+			this.#deadLetteredDeliveries.delete(jobId);
+			this.#deadLetteredDeliveryOwners.delete(jobId);
+		}
+	}
+
 	#recordDeadLetter(delivery: AsyncJobDelivery): void {
+		this.#pruneEvictedDeadLetters();
+		if (!this.#jobs.has(delivery.jobId)) return;
 		this.#deadLetteredDeliveries.delete(delivery.jobId);
 		this.#deadLetteredDeliveryOwners.delete(delivery.jobId);
 		this.#deadLetteredDeliveries.set(delivery.jobId, {
