@@ -45,6 +45,7 @@ type FakeEditor = {
 async function createContext(options?: {
 	busyPromptMode?: "steer" | "queue";
 	followUpKeys?: string[];
+	sendNowKeys?: string[];
 	ircSidebarToggleKeys?: string[];
 }) {
 	let editorText = "";
@@ -53,6 +54,7 @@ async function createContext(options?: {
 		"app.model.select": ["ctrl+l"],
 		"app.message.queue": ["alt+enter"],
 		"app.message.followUp": options?.followUpKeys ?? [],
+		"app.message.sendNow": options?.sendNowKeys ?? ["ctrl+enter"],
 		"app.message.dequeue": ["alt+up", "alt+down"],
 		"app.irc.sidebar.toggle": options?.ircSidebarToggleKeys ?? ["alt+i"],
 	};
@@ -61,6 +63,9 @@ async function createContext(options?: {
 	const showModelSelector = vi.fn();
 	const prompt = vi.fn(async () => {});
 	const updatePendingMessagesDisplay = vi.fn();
+	const abort = vi.fn(async () => {
+		(session as unknown as { isStreaming: boolean }).isStreaming = false;
+	});
 	const handleBashCommand = vi.fn(async () => {});
 	const showStatus = vi.fn();
 	const onInputCallback = vi.fn();
@@ -147,6 +152,24 @@ async function createContext(options?: {
 			editorContainerChildren.push(child);
 		}),
 	};
+	const session = {
+		isStreaming: false,
+		isCompacting: false,
+		isGeneratingHandoff: false,
+		isBashRunning: false,
+		isEvalRunning: false,
+		messages: [],
+		abort,
+		abortBash: vi.fn(),
+		extensionRunner: undefined,
+		prompt,
+		popLastQueuedMessage,
+		clearQueue,
+		getQueuedMessages: () => ({ steering: [], followUp: [...sessionQueuedMessages] }),
+		getQueuedMessageEntries,
+		removeQueuedMessageForEditing,
+		moveQueuedMessageForEditing,
+	} as unknown as InteractiveModeContext["session"];
 	const ctx = {
 		editor: editor as unknown as InteractiveModeContext["editor"],
 		ui: { requestRender: vi.fn(), setFocus: vi.fn() } as unknown as InteractiveModeContext["ui"],
@@ -156,23 +179,7 @@ async function createContext(options?: {
 		retryLoader: undefined,
 		autoCompactionEscapeHandler: undefined,
 		retryEscapeHandler: undefined,
-		session: {
-			isStreaming: false,
-			isCompacting: false,
-			isGeneratingHandoff: false,
-			isBashRunning: false,
-			isEvalRunning: false,
-			messages: [],
-			abortBash: vi.fn(),
-			extensionRunner: undefined,
-			prompt,
-			popLastQueuedMessage,
-			clearQueue,
-			getQueuedMessages: () => ({ steering: [], followUp: [...sessionQueuedMessages] }),
-			getQueuedMessageEntries,
-			removeQueuedMessageForEditing,
-			moveQueuedMessageForEditing,
-		} as unknown as InteractiveModeContext["session"],
+		session,
 		keybindings: {
 			getKeys(action: string) {
 				return keyMap[action] ? [...keyMap[action]] : [];
@@ -263,6 +270,7 @@ async function createContext(options?: {
 			handleBashCommand,
 			showStatus,
 			queueCompactionMessage,
+			abort,
 			popLastQueuedMessage,
 			clearQueue,
 			getQueuedMessageEntries,
@@ -356,17 +364,20 @@ describe("InputController keybinding setup", () => {
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not register a default Ctrl+Enter follow-up handler", async () => {
+	it("registers the default Ctrl+Enter send-now handler", async () => {
 		const { InputController, ctx, editor } = await createContext();
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
 
-		expect(editor.setCustomKeyHandler).not.toHaveBeenCalledWith("ctrl+enter", expect.any(Function));
+		expect(editor.setCustomKeyHandler).toHaveBeenCalledWith("ctrl+enter", expect.any(Function));
 	});
 
 	it("lets an explicit Ctrl+Enter follow-up remap fall through while idle", async () => {
-		const { InputController, ctx, editor, spies } = await createContext({ followUpKeys: ["ctrl+enter"] });
+		const { InputController, ctx, editor, spies } = await createContext({
+			followUpKeys: ["ctrl+enter"],
+			sendNowKeys: [],
+		});
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
@@ -380,8 +391,11 @@ describe("InputController keybinding setup", () => {
 		expect(spies.prompt).not.toHaveBeenCalled();
 	});
 
-	it("consumes Ctrl+Enter as follow-up while streaming", async () => {
-		const { InputController, ctx, editor, spies } = await createContext({ followUpKeys: ["ctrl+enter"] });
+	it("consumes an explicit Ctrl+Enter follow-up remap while streaming", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({
+			followUpKeys: ["ctrl+enter"],
+			sendNowKeys: [],
+		});
 		const session = ctx.session as unknown as { isStreaming: boolean };
 		session.isStreaming = true;
 		editor.setText("follow up from shortcut");
@@ -399,6 +413,80 @@ describe("InputController keybinding setup", () => {
 			streamingBehavior: "followUp",
 			followUpQueuePolicy: "sequential",
 		});
+	});
+	it("cancels and submits the next queued message on empty streaming Enter", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		queues.sessionQueuedMessages.push("send this next");
+		const controller = new InputController(ctx);
+
+		controller.setupEditorSubmitHandler();
+		await editor.onSubmit?.("");
+
+		expect(spies.abort).toHaveBeenCalledWith({
+			timeoutMs: 5_000,
+			cause: "user_interrupt",
+			silent: undefined,
+		});
+		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("followUp:0");
+		expect(spies.onInputCallback).toHaveBeenCalledWith(
+			expect.objectContaining({ text: "send this next", cancelled: false, started: true }),
+		);
+		expect(queues.sessionQueuedMessages).toEqual([]);
+	});
+
+	it("cancels and submits a streaming draft from the send-now chord", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("send this draft");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+			([key]) => key === "ctrl+enter",
+		);
+		const handler = registration?.[1] as () => boolean;
+
+		expect(handler()).toBe(true);
+		await Bun.sleep(0);
+
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.onInputCallback).toHaveBeenCalledWith(
+			expect.objectContaining({ text: "send this draft", cancelled: false, started: true }),
+		);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("leaves the send-now chord to plain submission while idle", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		editor.setText("idle draft");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+			([key]) => key === "ctrl+enter",
+		);
+		const handler = registration?.[1] as () => boolean | undefined;
+
+		expect(handler()).toBe(false);
+		expect(spies.abort).not.toHaveBeenCalled();
+		expect(spies.onInputCallback).not.toHaveBeenCalled();
+	});
+
+	it("keeps empty streaming Enter as a no-op when no session messages are queued", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		const controller = new InputController(ctx);
+
+		controller.setupEditorSubmitHandler();
+		await editor.onSubmit?.("");
+
+		expect(spies.abort).not.toHaveBeenCalled();
+		expect(spies.onInputCallback).not.toHaveBeenCalled();
 	});
 
 	it("leaves streaming Tab available for editor autocomplete", async () => {

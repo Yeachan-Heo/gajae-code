@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Added
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
+- Added configurable Ctrl+Enter send-now behavior for queued and draft prompts during active turns.
 
 ## [0.11.0] - 2026-07-15
 
