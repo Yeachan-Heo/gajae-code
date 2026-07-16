@@ -458,7 +458,8 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	/**
-	 * Apply an explicit user fold choice. Automatic updates must retain this choice.
+	 * Apply an explicit fold choice for this component instance. Automatic updates
+	 * retain this choice; transcript rebuilds create a new instance from the global state.
 	 */
 	setManuallyExpanded(expanded: boolean): void {
 		this.#manuallyExpanded = expanded;
