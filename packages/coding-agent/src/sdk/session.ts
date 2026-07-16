@@ -114,7 +114,7 @@ import { AgentSession, type ForkContextSeed } from "../session/agent-session";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
-import { SessionManager } from "../session/session-manager";
+import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
 import { closeAllConnections } from "../ssh/connection-manager";
 import { unmountAll } from "../ssh/sshfs-mount";
@@ -1065,9 +1065,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const sessionManager =
 		options.sessionManager ??
-		logger.time("sessionManager", () =>
-			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
-		);
+		(await logger.time("sessionManager", async () => {
+			const sessionDir = SessionManager.getDefaultSessionDir(cwd, agentDir);
+			return SessionManager.create(cwd, sessionDir);
+		}));
 	const logicalSessionId = sessionManager.getSessionId();
 	const providerSessionId = options.providerSessionId ?? options.forkContextSeed?.cacheIdentity ?? logicalSessionId;
 	const modelApiKeyAvailability = new Map<string, boolean>();
@@ -1909,7 +1910,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		const getSessionContext = () => ({
-			sessionManager,
+			sessionManager: createReadonlySessionManager(sessionManager),
 			modelRegistry,
 			model: agent.state.model,
 			isIdle: () => !session.isStreaming,
@@ -1938,7 +1939,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// Without extension runner: wrap CustomTools directly with CustomToolAdapter
 			// ToolDefinition items require ExtensionContext and cannot be used without a runner
 			const customToolContext = (): CustomToolContext => ({
-				sessionManager,
+				sessionManager: createReadonlySessionManager(sessionManager),
 				modelRegistry,
 				model: agent?.state.model,
 				isIdle: () => !session?.isStreaming,

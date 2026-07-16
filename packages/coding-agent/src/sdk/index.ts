@@ -11,3 +11,4 @@ export type {
 	Q10ThinkingMode,
 } from "./models";
 export * from "./session";
+export * from "./session-directory";

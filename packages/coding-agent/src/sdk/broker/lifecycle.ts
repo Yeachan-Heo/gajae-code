@@ -3,7 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { getSessionsDir, resolveEquivalentPath } from "@gajae-code/utils";
+import * as native from "@gajae-code/natives";
+import { resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
 	ensureLaunchWorktree,
@@ -11,17 +12,24 @@ import {
 	type GjcLaunchWorktreePlan,
 	planLaunchWorktree,
 } from "../../gjc-runtime/launch-worktree";
-
-import { SessionManager } from "../../session/session-manager";
+import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
+	type SessionStorageFileIdentity,
+	type SessionStorageSnapshot,
+	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
 import { SdkClient, SdkClientError } from "../client/client";
+import {
+	type LogicalSessionCandidate,
+	listManagedSessionCandidates,
+	type ManagedSessionScope,
+	resolveManagedSessionScope,
+} from "../session-directory";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
-
-import type { Broker, BrokerCleanupEvidence, BrokerResponse } from "./broker";
+import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
 
 import type {
 	LifecycleCleanupProof,
@@ -101,6 +109,13 @@ const lifecycleTimingsForTest = new WeakMap<Broker, LifecycleTiming>();
 type LifecycleCommand = SdkInternalSpawnCommand | { file: string; args: string[] };
 type LifecycleCommandResolver = () => LifecycleCommand;
 const lifecycleCommandResolversForTest = new WeakMap<Broker, LifecycleCommandResolver>();
+const lifecycleCleanupHooksForTest = new WeakMap<Broker, () => void>();
+
+/** Test-only hook for simulating a crash immediately after one exact lifecycle detach. */
+export function setLifecycleCleanupHookForTest(broker: Broker, hook: (() => void) | undefined): void {
+	if (hook) lifecycleCleanupHooksForTest.set(broker, hook);
+	else lifecycleCleanupHooksForTest.delete(broker);
+}
 
 export function setLifecycleCommandResolverForTest(
 	broker: Broker,
@@ -172,6 +187,7 @@ export interface SessionLifecycleTranscriptIdentity {
 	size: number;
 	mtimeMs: number;
 	mtimeNs: string;
+	sha256: string;
 }
 
 export interface SessionLifecycleLaunchRequest {
@@ -211,7 +227,9 @@ function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionL
 		Number.isFinite(identity.mtimeMs) &&
 		identity.mtimeMs >= 0 &&
 		typeof identity.mtimeNs === "string" &&
-		/^\d+$/.test(identity.mtimeNs)
+		/^\d+$/.test(identity.mtimeNs) &&
+		typeof identity.sha256 === "string" &&
+		/^[a-f0-9]{64}$/.test(identity.sha256)
 	);
 }
 
@@ -286,6 +304,23 @@ type SessionLaunch = {
 };
 
 type CleanupEvidence = BrokerCleanupEvidence;
+type CleanupIdentity = {
+	dev: bigint;
+	ino: bigint;
+	size: number;
+	mtimeNs: bigint;
+	sha256: string;
+};
+
+function serializeCleanupIdentity(identity: CleanupIdentity): BrokerCleanupIdentity {
+	return {
+		dev: identity.dev.toString(),
+		ino: identity.ino.toString(),
+		size: identity.size,
+		mtimeNs: identity.mtimeNs.toString(),
+		sha256: identity.sha256,
+	};
+}
 
 const fail = (code: string, message: string, cleanup?: CleanupEvidence): BrokerResponse => ({
 	ok: false,
@@ -384,6 +419,7 @@ type ResumeScope = {
 		size: number;
 		mtimeMs: number;
 		mtimeNs: bigint;
+		sha256: string;
 	};
 };
 function sameResumeLocator(record: LiveResumeRecord, cwd: string, root: string): boolean {
@@ -399,7 +435,8 @@ function sameResumeSessionIdentity(left: ResumeScope, right: ResumeScope): boole
 		left.sessionIdentity.ino === right.sessionIdentity.ino &&
 		left.sessionIdentity.size === right.sessionIdentity.size &&
 		left.sessionIdentity.mtimeMs === right.sessionIdentity.mtimeMs &&
-		left.sessionIdentity.mtimeNs === right.sessionIdentity.mtimeNs
+		left.sessionIdentity.mtimeNs === right.sessionIdentity.mtimeNs &&
+		left.sessionIdentity.sha256 === right.sessionIdentity.sha256
 	);
 }
 function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRecord): boolean {
@@ -424,6 +461,7 @@ function serializeTranscriptIdentity(identity: {
 	size: number;
 	mtimeMs: number;
 	mtimeNs: bigint;
+	sha256: string;
 }): SessionLifecycleTranscriptIdentity {
 	return {
 		dev: identity.dev.toString(),
@@ -431,32 +469,56 @@ function serializeTranscriptIdentity(identity: {
 		size: identity.size,
 		mtimeMs: identity.mtimeMs,
 		mtimeNs: identity.mtimeNs.toString(),
+		sha256: identity.sha256,
 	};
 }
+async function managedCandidates(
+	broker: Broker,
+	cwd: string,
+	label: "Saved" | "Source",
+): Promise<
+	| {
+			candidates: readonly LogicalSessionCandidate[];
+			migrationPolicy: "copy-retain" | "disabled";
+			scope: ManagedSessionScope;
+	  }
+	| BrokerResponse
+> {
+	const resolved = await resolveManagedSessionScope({ cwd, agentDir: broker.settings.agentDir });
+	if (resolved.kind !== "resolved")
+		return fail("invalid_input", `${label} session scope is invalid: ${resolved.message}`);
+	const migration = await broker.settings.resolveDirectoryMigration(cwd);
+	if (migration !== "copy-retain" && migration !== "disabled")
+		return fail("invalid_input", "Broker directory migration policy is invalid.");
+	const listed = await listManagedSessionCandidates({ scope: resolved.scope });
+	if (listed.kind !== "complete")
+		return fail("invalid_input", `${label} session storage could not be verified for the requested workspace.`);
+	return { candidates: listed.owned, migrationPolicy: migration, scope: resolved.scope };
+}
 
-function validateSavedTranscript(
+async function validateSavedTranscript(
 	broker: Broker,
 	cwd: string,
 	suppliedPath: string | undefined,
 	expectedSessionId: string | undefined,
 	label: "Saved" | "Source",
-): ValidatedTranscript | BrokerResponse {
-	const inventory = SessionManager.inventorySessionsStrict(cwd, {
-		sessionDir: SessionManager.getDefaultSessionDir(cwd, broker.settings.agentDir),
-	});
-	if (inventory.kind !== "complete")
-		return fail("invalid_input", `${label} session storage could not be verified for the requested workspace.`);
+): Promise<ValidatedTranscript | BrokerResponse> {
+	const inventory = await managedCandidates(broker, cwd, label);
+	if ("ok" in inventory) return inventory;
 	const canonicalPath = suppliedPath ? path.resolve(suppliedPath) : undefined;
 	const matches = inventory.candidates.filter(
 		candidate =>
 			(canonicalPath === undefined || candidate.path === canonicalPath) &&
-			(expectedSessionId === undefined || candidate.id === expectedSessionId),
+			(expectedSessionId === undefined || candidate.sessionId === expectedSessionId),
 	);
-	if (matches.length !== 1 || !isCanonicalSessionId(matches[0]!.id))
+	if (matches.length !== 1 || !isCanonicalSessionId(matches[0]!.sessionId))
 		return fail("invalid_input", `${label} saved session does not match the requested workspace and session id.`);
 	const match = matches[0]!;
-	return { path: match.path, id: match.id, identity: serializeTranscriptIdentity(match.identity) };
+	if (inventory.migrationPolicy === "disabled" && match.provenance === "legacy")
+		return fail("legacy_migration_disabled", `${label} legacy session migration is disabled for this workspace.`);
+	return { path: match.path, id: match.sessionId, identity: serializeTranscriptIdentity(match.identity) };
 }
+
 async function validateLiveResumeScope(
 	broker: Broker,
 	input: Input,
@@ -499,18 +561,18 @@ async function validateLiveResumeScope(
 		return fail("endpoint_stale", "Live session does not match the requested resume scope.");
 	const sessionPath = text(input.sessionPath);
 	if (!sessionPath) return fail("invalid_input", "sessionPath is required to resume a saved session.");
-	const inventory = SessionManager.inventorySessionsStrict(cwd, {
-		sessionDir: SessionManager.getDefaultSessionDir(cwd, broker.settings.agentDir),
-	});
-	if (inventory.kind !== "complete")
+	const inventory = await managedCandidates(broker, cwd, "Saved");
+	if ("ok" in inventory)
 		return fail("endpoint_stale", "Requested saved session could not be verified for the requested workspace.");
 	const canonicalSessionPath = path.resolve(sessionPath);
 	const matches = inventory.candidates.filter(
-		candidate => candidate.id === requestedSessionId && candidate.path === canonicalSessionPath,
+		candidate => candidate.sessionId === requestedSessionId && candidate.path === canonicalSessionPath,
 	);
 	if (matches.length !== 1)
 		return fail("endpoint_stale", "Requested saved session does not match the live session scope.");
 	const session = matches[0]!;
+	if (inventory.migrationPolicy === "disabled" && matches[0]!.provenance === "legacy")
+		return fail("legacy_migration_disabled", "Saved legacy session migration is disabled for this workspace.");
 	return {
 		cwd,
 		stateRoot: root,
@@ -711,7 +773,8 @@ function isLifecycleTranscriptEvidence(value: unknown): value is LifecycleTransc
 		Object.keys(record).length === 2 &&
 		typeof record.digest === "string" &&
 		/^[a-f0-9]{64}$/.test(record.digest) &&
-		isSessionLifecycleTranscriptIdentity(record.identity)
+		isSessionLifecycleTranscriptIdentity(record.identity) &&
+		record.digest === record.identity.sha256
 	);
 }
 
@@ -767,6 +830,10 @@ export async function writeSessionLifecycleFailure(
 ): Promise<void> {
 	if (!isSdkStartupFailure(failure))
 		throw new Error("Lifecycle startup failure does not satisfy the canonical failure contract.");
+	if (transcript && !isLifecycleTranscriptEvidence(transcript))
+		throw new Error(
+			"Lifecycle startup failure transcript evidence does not bind its content digest to its identity.",
+		);
 
 	const incarnation = ownerIncarnation ?? processIncarnation(process.pid);
 	if (!incarnation) return;
@@ -814,13 +881,21 @@ export async function writeSessionLifecycleFailure(
 async function readLifecycleFailureArtifact(
 	file: string,
 	expected: EffectMarker,
-): Promise<{ artifact: LifecycleFailureArtifact; bytes: Buffer; digest: string } | undefined> {
+): Promise<
+	| {
+			artifact: LifecycleFailureArtifact;
+			bytes: Buffer;
+			digest: string;
+			identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string };
+	  }
+	| undefined
+> {
 	let handle: fs.FileHandle | undefined;
 	try {
 		handle = await fs.open(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
-		const stat = await handle.stat();
-		if (!stat.isFile() || stat.size > 4096) return undefined;
-		const bytes = Buffer.alloc(stat.size + 1);
+		const stat = await handle.stat({ bigint: true });
+		if (!stat.isFile() || stat.size > 4096n) return undefined;
+		const bytes = Buffer.alloc(Number(stat.size) + 1);
 		const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
 		if (bytesRead > 4096) return undefined;
 		const raw = bytes.subarray(0, bytesRead);
@@ -831,12 +906,271 @@ async function readLifecycleFailureArtifact(
 			canonicalJson(value) !== raw.toString("utf8")
 		)
 			return undefined;
-		return { artifact: value, bytes: raw, digest: createHash("sha256").update(raw).digest("hex") };
+		return {
+			artifact: value,
+			bytes: raw,
+			digest: createHash("sha256").update(raw).digest("hex"),
+			identity: {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: createHash("sha256").update(raw).digest("hex"),
+			},
+		};
 	} catch {
 		return undefined;
 	} finally {
 		if (handle) await handle.close();
 	}
+}
+
+function exactUnlinkLifecycleFile(
+	file: string,
+	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string },
+	plannedPath: string,
+): ReturnType<typeof native.exactUnlink> {
+	return native.exactUnlink(file, { ...identity, quarantineName: path.basename(plannedPath) });
+}
+
+type LifecycleCleanupFile = NonNullable<BrokerCleanupEvidence["lifecycleFiles"]>[number];
+
+function sameLifecycleCleanupIdentity(
+	left: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string },
+	right: BrokerCleanupIdentity,
+): boolean {
+	return (
+		left.dev.toString() === right.dev &&
+		left.ino.toString() === right.ino &&
+		left.size === BigInt(right.size) &&
+		left.mtimeNs.toString() === right.mtimeNs &&
+		left.sha256 === right.sha256
+	);
+}
+
+function lifecycleCleanupPlan(
+	root: string,
+	id: string,
+	expected: EffectMarker,
+	evidence: { identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string } },
+): CleanupEvidence {
+	const directory = path.join(root, "sdk");
+	const candidates = [
+		lifecycleFailurePath(root, id, expected.effectMarker),
+		path.join(directory, `${id}.json`),
+		lifecycleReadyPath(root, id),
+		lifecycleMarkerPath(root, id),
+	];
+	const files: LifecycleCleanupFile[] = candidates.flatMap(file => {
+		const captured = captureLifecycleFile(file, true);
+		if (!captured) return [];
+		if (file === lifecycleMarkerPath(root, id) || file === lifecycleReadyPath(root, id)) {
+			let marker: unknown;
+			try {
+				marker = JSON.parse(captured.bytes.toString("utf8"));
+			} catch {
+				throw new Error("Lifecycle marker changed before cleanup intent persistence.");
+			}
+			if (!isEffectMarker(marker) || !sameEffectMarker(marker, expected))
+				throw new Error("Lifecycle marker changed before cleanup intent persistence.");
+		}
+		if (file.endsWith(`${id}.json`)) {
+			let endpoint: { pid?: unknown };
+			try {
+				endpoint = JSON.parse(captured.bytes.toString("utf8")) as { pid?: unknown };
+			} catch {
+				throw new Error("Lifecycle endpoint changed before cleanup intent persistence.");
+			}
+			if (endpoint.pid !== expected.pid)
+				throw new Error("Lifecycle endpoint changed before cleanup intent persistence.");
+		}
+		const identity = file === candidates[0] ? evidence.identity : captured.identity;
+		if (
+			file === candidates[0] &&
+			!sameLifecycleCleanupIdentity(
+				captured.identity,
+				serializeCleanupIdentity({ ...identity, size: Number(identity.size) }),
+			)
+		)
+			throw new Error("Lifecycle failure artifact changed before cleanup intent persistence.");
+		const attempt = 1;
+		const suffix = randomUUID();
+		return [
+			{
+				path: file,
+				identity: serializeCleanupIdentity({ ...identity, size: Number(identity.size) }),
+				attempt,
+				plannedPath: path.join(directory, `.gjc-delete-${suffix}-${path.basename(file)}`),
+			},
+		];
+	});
+	return { phase: "lifecycle", sessionId: id, metadataRoot: root, lifecycleFiles: files };
+}
+
+function validateLifecycleCleanupFile(root: string, id: string, file: LifecycleCleanupFile): boolean {
+	const directory = path.join(path.resolve(root), "sdk");
+	const original = path.resolve(file.path);
+	const planned = path.resolve(file.plannedPath);
+	if (
+		path.dirname(original) !== directory ||
+		path.dirname(planned) !== directory ||
+		!path.basename(planned).startsWith(".gjc-delete-") ||
+		(file.attempt !== undefined && (!Number.isSafeInteger(file.attempt) || file.attempt < 1)) ||
+		(![`${id}.json`, `${id}.lifecycle.json`, `${id}.lifecycle.ready.json`].includes(path.basename(original)) &&
+			!path.basename(original).startsWith(`${id}.lifecycle.failure.`)) ||
+		(file.detachedPath !== undefined && path.dirname(path.resolve(file.detachedPath)) !== directory)
+	)
+		return false;
+	return cleanupIdentity(file.identity) !== undefined;
+}
+
+function metadataCleanupPlan(
+	metadataRoot: string,
+	id: string,
+	metadataPath: string,
+	identity: BrokerCleanupIdentity,
+): CleanupEvidence {
+	return {
+		phase: "metadata",
+		sessionId: id,
+		metadataRoot,
+		metadataPath,
+		metadataIdentity: identity,
+		metadataAttempt: 1,
+		plannedMetadataPath: path.join(
+			path.dirname(metadataPath),
+			`.gjc-delete-${randomUUID()}-${path.basename(metadataPath)}`,
+		),
+	};
+}
+
+function validateMetadataCleanupPlan(cleanup: CleanupEvidence, id: string): boolean {
+	return (
+		cleanup.phase === "metadata" &&
+		typeof cleanup.metadataRoot === "string" &&
+		typeof cleanup.metadataPath === "string" &&
+		(cleanup.metadataAttempt === undefined ||
+			(Number.isSafeInteger(cleanup.metadataAttempt) && cleanup.metadataAttempt >= 1)) &&
+		typeof cleanup.plannedMetadataPath === "string" &&
+		path.resolve(cleanup.metadataPath) === path.resolve(lifecycleMarkerPath(cleanup.metadataRoot, id)) &&
+		path.dirname(path.resolve(cleanup.plannedMetadataPath)) === path.dirname(path.resolve(cleanup.metadataPath)) &&
+		path.basename(cleanup.plannedMetadataPath).startsWith(".gjc-delete-") &&
+		(cleanup.detachedMetadataPath === undefined ||
+			path.dirname(path.resolve(cleanup.detachedMetadataPath)) === path.dirname(path.resolve(cleanup.metadataPath)))
+	);
+}
+
+async function reconcileLifecycleCleanup(
+	broker: Broker,
+	identity: string,
+	cleanup: CleanupEvidence,
+): Promise<BrokerResponse> {
+	if (
+		cleanup.phase !== "lifecycle" ||
+		!cleanup.sessionId ||
+		!isCanonicalSessionId(cleanup.sessionId) ||
+		!cleanup.metadataRoot ||
+		!Array.isArray(cleanup.lifecycleFiles) ||
+		cleanup.lifecycleFiles.length === 0
+	)
+		return fail("terminal_uncertain", "Lifecycle cleanup replay lacks immutable identity-bound intent.");
+	let activeCleanup = cleanup;
+	for (let index = 0; index < activeCleanup.lifecycleFiles!.length; index++) {
+		const file = activeCleanup.lifecycleFiles![index];
+		if (!validateLifecycleCleanupFile(activeCleanup.metadataRoot!, activeCleanup.sessionId!, file))
+			return fail("terminal_uncertain", "Lifecycle cleanup replay contains an invalid path authority.");
+		if (file.completed) continue;
+
+		const candidates = [file.path, file.detachedPath, file.plannedPath].filter(
+			(value, candidateIndex, values): value is string =>
+				typeof value === "string" && values.indexOf(value) === candidateIndex,
+		);
+		let activePath: string | undefined;
+		let captured: ReturnType<typeof captureLifecycleFile>;
+		let foundUnauthorized = false;
+		for (const candidate of candidates) {
+			try {
+				const stat = fsSync.lstatSync(candidate);
+				if (stat.isSymbolicLink() || !stat.isFile()) {
+					foundUnauthorized = true;
+					continue;
+				}
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				foundUnauthorized = true;
+				continue;
+			}
+			const current = captureLifecycleFile(candidate);
+			if (!current) {
+				foundUnauthorized = true;
+				continue;
+			}
+			if (sameLifecycleCleanupIdentity(current.identity, file.identity) && !activePath) {
+				activePath = candidate;
+				captured = current;
+			} else {
+				foundUnauthorized = true;
+			}
+		}
+		if (foundUnauthorized)
+			return fail("terminal_uncertain", "Lifecycle cleanup target identity changed before reconciliation.");
+		if (!captured || !activePath) {
+			const lifecycleFiles = activeCleanup.lifecycleFiles!.map((candidate, candidateIndex) =>
+				candidateIndex === index ? { ...candidate, completed: true as const } : candidate,
+			);
+			activeCleanup = { ...activeCleanup, lifecycleFiles };
+			await broker.ledger.transition(identity, "effect_started", {
+				response: fail("cleanup_pending", "Lifecycle cleanup completion was durably reconciled.", activeCleanup),
+			});
+			continue;
+		}
+
+		if (file.detachedPath || activePath === file.plannedPath) {
+			const nextFile: LifecycleCleanupFile = {
+				...file,
+				detachedPath: activePath,
+				attempt: (file.attempt ?? 1) + 1,
+				plannedPath: path.join(path.dirname(file.path), `.gjc-delete-${randomUUID()}-${path.basename(file.path)}`),
+			};
+			const lifecycleFiles = activeCleanup.lifecycleFiles!.map((candidate, candidateIndex) =>
+				candidateIndex === index ? nextFile : candidate,
+			);
+			activeCleanup = { ...activeCleanup, lifecycleFiles };
+			await broker.ledger.transition(identity, "effect_started", {
+				response: fail(
+					"cleanup_pending",
+					"Lifecycle retry cleanup is preauthorized for durable reconciliation.",
+					activeCleanup,
+				),
+			});
+		}
+		const currentFile = activeCleanup.lifecycleFiles![index];
+		const result = native.exactUnlink(activePath, {
+			...captured.identity,
+			quarantineName: path.basename(currentFile.plannedPath),
+		});
+		if (!result.ok) {
+			const lifecycleFiles = activeCleanup.lifecycleFiles!.map((candidate, candidateIndex) =>
+				candidateIndex === index && result.detachedPath
+					? { ...candidate, detachedPath: result.detachedPath }
+					: candidate,
+			);
+			return fail("cleanup_pending", `Lifecycle cleanup remains pending: ${result.code ?? "unknown"}`, {
+				...activeCleanup,
+				lifecycleFiles,
+			});
+		}
+		const lifecycleFiles = activeCleanup.lifecycleFiles!.map((candidate, candidateIndex) =>
+			candidateIndex === index ? { ...candidate, completed: true as const } : candidate,
+		);
+		activeCleanup = { ...activeCleanup, lifecycleFiles };
+		await broker.ledger.transition(identity, "effect_started", {
+			response: fail("cleanup_pending", "Lifecycle cleanup completion was durably reconciled.", activeCleanup),
+		});
+		lifecycleCleanupHooksForTest.get(broker)?.();
+	}
+	await syncDirectory(path.join(activeCleanup.metadataRoot!, "sdk"));
+	return fail("spawn_failed", "No ready SDK endpoint remains available.");
 }
 
 async function readSessionLifecycleFailure(
@@ -882,25 +1216,103 @@ async function hasOwnedReadinessEvidence(
 	);
 }
 
+function captureLifecycleFile(
+	file: string,
+	requireRegular = false,
+):
+	| {
+			bytes: Buffer;
+			identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string };
+			digest: string;
+	  }
+	| undefined {
+	let descriptor: number | undefined;
+	try {
+		descriptor = fsSync.openSync(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const stat = fsSync.fstatSync(descriptor, { bigint: true });
+		if (!stat.isFile()) {
+			if (requireRegular) throw new Error("Lifecycle cleanup candidate is not an exact regular file.");
+			return undefined;
+		}
+		const bytes = fsSync.readFileSync(descriptor);
+		const current = fsSync.fstatSync(descriptor, { bigint: true });
+		if (
+			!current.isFile() ||
+			current.dev !== stat.dev ||
+			current.ino !== stat.ino ||
+			current.size !== stat.size ||
+			current.mtimeNs !== stat.mtimeNs
+		)
+			return undefined;
+		return {
+			bytes,
+			identity: {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+			},
+			digest: createHash("sha256").update(bytes).digest("hex"),
+		};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	} finally {
+		if (descriptor !== undefined) fsSync.closeSync(descriptor);
+	}
+}
+
 async function removeOwnedLifecycleArtifacts(root: string, id: string, expected: EffectMarker): Promise<boolean> {
 	const marker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!marker || !sameEffectMarker(marker, expected)) return false;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
-	try {
-		const endpoint = JSON.parse(await fs.readFile(endpointPath, "utf8")) as { pid?: unknown };
-		if (endpoint.pid !== expected.pid || !hasObservedProcessExit(expected.pid)) return false;
-		await fs.rm(endpointPath);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+	const plannedEndpointPath = path.join(
+		path.dirname(endpointPath),
+		`.gjc-delete-endpoint-${expected.effectMarker}-${path.basename(endpointPath)}`,
+	);
+	const retryEndpointPath = path.join(
+		path.dirname(endpointPath),
+		`.gjc-delete-endpoint-retry-${expected.effectMarker}-${path.basename(endpointPath)}`,
+	);
+	const finalEndpointPath = path.join(
+		path.dirname(endpointPath),
+		`.gjc-delete-endpoint-final-${expected.effectMarker}-${path.basename(endpointPath)}`,
+	);
+	const endpointSource = [endpointPath, plannedEndpointPath, retryEndpointPath, finalEndpointPath].find(candidate => {
+		try {
+			return fsSync.lstatSync(candidate).isFile();
+		} catch {
+			return false;
+		}
+	});
+	const endpoint = endpointSource ? captureLifecycleFile(endpointSource) : undefined;
+	if (endpoint && endpointSource) {
+		let parsed: { pid?: unknown };
+		try {
+			parsed = JSON.parse(endpoint.bytes.toString("utf8")) as { pid?: unknown };
+		} catch {
+			return false;
+		}
+		if (parsed.pid !== expected.pid || !hasObservedProcessExit(expected.pid)) return false;
+		if (createHash("sha256").update(endpoint.bytes).digest("hex") !== endpoint.digest) return false;
+		const endpointRemoval = exactUnlinkLifecycleFile(
+			endpointSource,
+			endpoint.identity,
+			endpointSource === endpointPath
+				? plannedEndpointPath
+				: endpointSource === plannedEndpointPath
+					? retryEndpointPath
+					: finalEndpointPath,
+		);
+		if (!endpointRemoval.ok) return false;
 	}
-	if (!(await endpointRemoved(root, id))) return false;
 	const currentMarker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!currentMarker || !sameEffectMarker(currentMarker, expected)) return false;
-	try {
-		await fs.rm(lifecycleReadyPath(root, id), { force: true });
-	} catch {
-		return false;
-	}
+	const readyPath = lifecycleReadyPath(root, id);
+	const ready = captureLifecycleFile(readyPath);
+	if (ready && createHash("sha256").update(ready.bytes).digest("hex") !== ready.digest) return false;
+	// Readiness mutation is deferred to the same ledger-backed cleanup transaction.
 	return true;
 }
 
@@ -1019,7 +1431,7 @@ async function terminateSpawnedChild(
 		expected &&
 		!broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker)
 	)
-		return endpointRemoved(root, id);
+		return true;
 	const registeredBeforeTermination =
 		rollbackGeneration === undefined || rollbackGeneration === null
 			? undefined
@@ -1291,7 +1703,7 @@ async function launchInput(
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
 		const savedPath = text(input.sessionPath);
 		if (!savedPath) return fail("invalid_input", "sessionPath is required to resume a saved session.");
-		const saved = validateSavedTranscript(broker, cwd, savedPath, requested, "Saved");
+		const saved = await validateSavedTranscript(broker, cwd, savedPath, requested, "Saved");
 		if ("ok" in saved) return saved;
 		return {
 			id: requested,
@@ -1310,7 +1722,7 @@ async function launchInput(
 	const sourceSessionPath = text(input.sourceSessionPath) ?? text(input.sourcePath) ?? text(input.sessionPath);
 	if (!sourceSessionId && !sourceSessionPath)
 		return fail("invalid_input", "sourceSessionId or sourceSessionPath is required to fork a session.");
-	const source = validateSavedTranscript(broker, sourceCwd, sourceSessionPath, sourceSessionId, "Source");
+	const source = await validateSavedTranscript(broker, sourceCwd, sourceSessionPath, sourceSessionId, "Source");
 	if ("ok" in source) return source;
 	return {
 		id: randomUUID(),
@@ -1326,22 +1738,149 @@ async function launchInput(
 	};
 }
 
-function within(root: string, candidate: string): boolean {
-	const relative = path.relative(root, candidate);
-	return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
-}
 type ValidatedDelete = {
 	storage: FileSessionStorage;
 	target: VerifiedSessionDeleteTarget;
 	metadataRoot: string;
 };
+function cleanupIdentity(
+	identity: BrokerCleanupEvidence["transcriptIdentity"],
+	allowEmptySha256 = false,
+): SessionStorageFileIdentity | undefined {
+	if (
+		!identity ||
+		!/^[0-9]+$/.test(identity.dev) ||
+		!/^[0-9]+$/.test(identity.ino) ||
+		!Number.isSafeInteger(identity.size) ||
+		identity.size < 0 ||
+		!/^[0-9]+$/.test(identity.mtimeNs) ||
+		(!allowEmptySha256 && !/^[a-f0-9]{64}$/.test(identity.sha256)) ||
+		(allowEmptySha256 && identity.sha256 !== "" && !/^[a-f0-9]{64}$/.test(identity.sha256))
+	)
+		return undefined;
+	return {
+		dev: BigInt(identity.dev),
+		ino: BigInt(identity.ino),
+		size: identity.size,
+		mtimeNs: BigInt(identity.mtimeNs),
+		sha256: identity.sha256,
+	};
+}
+
+function replayDeleteTarget(cleanup: CleanupEvidence): ValidatedDelete | BrokerResponse {
+	const transcriptIdentity = cleanupIdentity(cleanup.transcriptIdentity);
+	if (
+		(cleanup.phase !== "artifacts" && cleanup.phase !== "transcript") ||
+		!cleanup.sessionId ||
+		!isCanonicalSessionId(cleanup.sessionId) ||
+		!cleanup.sessionsRoot ||
+		!cleanup.transcriptPath ||
+		!cleanup.cwd ||
+		!cleanup.metadataRoot ||
+		!transcriptIdentity
+	) {
+		return fail("terminal_uncertain", "Cleanup replay lacks a complete ledger-bound deletion target.");
+	}
+	const artifactsIdentity = cleanupIdentity(cleanup.artifactsIdentity, true);
+	const artifactTreeIdentity =
+		cleanup.artifactsRemoved === true || !cleanup.artifactTree
+			? undefined
+			: cleanupIdentity(cleanup.artifactTree.identity, true);
+	if (cleanup.artifactsRemoved !== true && cleanup.artifactTree && !artifactTreeIdentity)
+		return fail("terminal_uncertain", "Artifact tree cleanup lacks its ledger-bound identity.");
+
+	if (cleanup.detachedArtifactsPath && !artifactsIdentity)
+		return fail("terminal_uncertain", "Detached artifact cleanup lacks its ledger-bound identity.");
+	const plannedArtifactsPath = cleanup.plannedArtifactsPath;
+	const plannedTranscriptPath = cleanup.plannedTranscriptPath;
+	if (
+		(plannedArtifactsPath &&
+			(path.dirname(plannedArtifactsPath) !== path.dirname(cleanup.transcriptPath) ||
+				!path.basename(plannedArtifactsPath).startsWith(".gjc-delete-"))) ||
+		(plannedTranscriptPath &&
+			(path.dirname(plannedTranscriptPath) !== path.dirname(cleanup.transcriptPath) ||
+				!path.basename(plannedTranscriptPath).startsWith(".gjc-delete-"))) ||
+		(cleanup.artifactsRemoved !== true &&
+			cleanup.artifactTree &&
+			(path.dirname(cleanup.artifactTree.plannedPath) !== path.dirname(cleanup.transcriptPath) ||
+				!path.basename(cleanup.artifactTree.plannedPath).startsWith(".gjc-delete-") ||
+				(cleanup.artifactTree.detachedPath !== undefined &&
+					path.dirname(cleanup.artifactTree.detachedPath) !== path.dirname(cleanup.transcriptPath))))
+	)
+		return fail("terminal_uncertain", "Cleanup replay has invalid preauthorized quarantine paths.");
+	if (
+		cleanup.phase === "transcript" &&
+		cleanup.artifactsRemoved === true &&
+		![cleanup.transcriptPath, cleanup.detachedTranscriptPath, plannedTranscriptPath].some(
+			candidate => typeof candidate === "string" && fsSync.existsSync(candidate),
+		)
+	)
+		return { ok: true, result: { sessionId: cleanup.sessionId } };
+	const artifactRemovingPath =
+		cleanup.artifactsRemoved === true
+			? undefined
+			: cleanup.artifactTree
+				? `${cleanup.artifactTree.plannedPath}.removing`
+				: plannedArtifactsPath
+					? `${plannedArtifactsPath}.removing`
+					: undefined;
+	const recoveredDetachedArtifactsPath =
+		cleanup.detachedArtifactsPath && fsSync.existsSync(cleanup.detachedArtifactsPath)
+			? cleanup.detachedArtifactsPath
+			: artifactRemovingPath && fsSync.existsSync(artifactRemovingPath)
+				? artifactRemovingPath
+				: plannedArtifactsPath &&
+						!fsSync.existsSync(cleanup.transcriptPath.slice(0, -6)) &&
+						fsSync.existsSync(plannedArtifactsPath)
+					? plannedArtifactsPath
+					: undefined;
+	const recoveredDetachedTranscriptPath =
+		cleanup.detachedTranscriptPath && fsSync.existsSync(cleanup.detachedTranscriptPath)
+			? cleanup.detachedTranscriptPath
+			: plannedTranscriptPath &&
+					!fsSync.existsSync(cleanup.transcriptPath) &&
+					fsSync.existsSync(plannedTranscriptPath)
+				? plannedTranscriptPath
+				: undefined;
+	return {
+		storage: new FileSessionStorage(),
+		target: {
+			sessionsRoot: cleanup.sessionsRoot,
+			transcriptPath: cleanup.transcriptPath,
+			sessionId: cleanup.sessionId,
+			cwd: cleanup.cwd,
+			transcriptIdentity,
+			...(cleanup.artifactsRemoved === true ? { artifactsRemoved: true } : {}),
+			...(cleanup.artifactsRemoved !== true && artifactsIdentity
+				? { expectedArtifactsIdentity: artifactsIdentity }
+				: {}),
+			...(cleanup.artifactsRemoved !== true && recoveredDetachedArtifactsPath
+				? { detachedArtifactsPath: recoveredDetachedArtifactsPath }
+				: {}),
+			...(recoveredDetachedTranscriptPath ? { detachedTranscriptPath: recoveredDetachedTranscriptPath } : {}),
+			...(plannedArtifactsPath ? { plannedArtifactsPath } : {}),
+			...(plannedTranscriptPath ? { plannedTranscriptPath } : {}),
+			...(cleanup.artifactsRemoved !== true && cleanup.artifactTree && artifactTreeIdentity
+				? {
+						expectedArtifactsIdentity: artifactTreeIdentity,
+						expectedArtifactsTree: cleanup.artifactTree.snapshot,
+						detachedArtifactsPath: cleanup.artifactTree.detachedPath ?? recoveredDetachedArtifactsPath,
+						plannedArtifactsPath: cleanup.artifactTree.plannedPath,
+					}
+				: {}),
+		},
+		metadataRoot: cleanup.metadataRoot,
+	};
+}
 
 async function validateDeletePath(
 	broker: Broker,
 	input: Input,
 	id: string,
 	record: { locator: { repo: string; stateRoot: string } } | undefined,
+	cleanup?: CleanupEvidence,
 ): Promise<ValidatedDelete | BrokerResponse> {
+	if (cleanup) return replayDeleteTarget(cleanup);
 	const sessionPath = text(input.sessionPath);
 	const cwd = lifecycleCwd(input);
 	if (!sessionPath || !cwd)
@@ -1355,62 +1894,48 @@ async function validateDeletePath(
 	)
 		return fail("invalid_input", "session.delete locator does not match the indexed session.");
 
-	const unresolved = path.resolve(sessionPath);
-	const storageRoot = await fs
-		.realpath(getSessionsDir(broker.settings.agentDir))
-		.catch(() => path.resolve(getSessionsDir(broker.settings.agentDir)));
-	const canonicalParent = await fs.realpath(path.dirname(unresolved)).catch(() => path.dirname(unresolved));
-	const candidate = path.join(canonicalParent, path.basename(unresolved));
-	if (!candidate.endsWith(".jsonl") || !within(storageRoot, candidate))
-		return fail("invalid_input", "session.delete path is outside the configured session storage root.");
-	try {
-		if ((await fs.lstat(candidate)).isSymbolicLink())
-			return fail("invalid_input", "session.delete path is a symlink.");
-	} catch {
-		return fail("not_found", "Requested saved session does not exist.");
-	}
-	let resolved: string;
-	try {
-		resolved = await fs.realpath(candidate);
-	} catch {
-		return fail("not_found", "Requested saved session does not exist.");
-	}
-	if (!within(storageRoot, resolved))
-		return fail("invalid_input", "session.delete path resolves outside the configured session storage root.");
+	const inventory = await managedCandidates(broker, cwd, "Saved");
+	if ("ok" in inventory) return inventory;
+	const candidatePath = path.resolve(sessionPath);
+	const matches = inventory.candidates.filter(
+		candidate => candidate.path === candidatePath && candidate.sessionId === id,
+	);
+	if (matches.length !== 1)
+		return fail("invalid_input", "session.delete path is not an owned managed session for the configured cwd.");
+	const match = matches[0]!;
+	if (inventory.migrationPolicy === "disabled" && match.provenance === "legacy")
+		return fail("legacy_migration_disabled", "Saved legacy session migration is disabled for this workspace.");
 
 	const storage = new FileSessionStorage();
-	let snapshot: ReturnType<FileSessionStorage["readSnapshotSync"]>;
+	let snapshot: SessionStorageSnapshot;
 	try {
-		snapshot = storage.readSnapshotSync(resolved);
+		snapshot = storage.readSnapshotSync(candidatePath);
 	} catch {
 		return fail("not_found", "Requested saved session does not exist or cannot be read.");
 	}
-	try {
-		const newline = snapshot.bytes.indexOf(0x0a);
-		const firstLine = Buffer.from(
-			snapshot.bytes.subarray(0, newline === -1 ? snapshot.bytes.length : newline),
-		).toString("utf8");
-		const header = JSON.parse(firstLine) as { type?: unknown; id?: unknown; cwd?: unknown };
-		if (header.type !== "session" || header.id !== id)
-			return fail("invalid_input", "session.delete path does not contain the requested session.");
-		if (typeof header.cwd !== "string")
-			return fail("invalid_input", "session.delete transcript cwd does not match the configured cwd.");
-		const transcriptCwd = header.cwd;
-		const headerCwd = await fs.realpath(transcriptCwd).catch(() => path.resolve(transcriptCwd));
-		const requestedCwd = await fs.realpath(cwd).catch(() => cwd);
-		if (headerCwd !== requestedCwd)
-			return fail("invalid_input", "session.delete transcript cwd does not match the configured cwd.");
-	} catch {
-		return fail("invalid_input", "Requested saved session has an invalid header.");
-	}
+	const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
+	if (
+		snapshot.stat.dev !== match.identity.dev ||
+		snapshot.stat.ino !== match.identity.ino ||
+		snapshot.stat.size !== match.identity.size ||
+		snapshot.stat.mtimeNs !== match.identity.mtimeNs ||
+		digest !== match.identity.sha256
+	)
+		return fail("invalid_input", "session.delete session changed after managed ownership was verified.");
 	return {
 		storage,
 		target: {
-			sessionsRoot: storageRoot,
-			transcriptPath: resolved,
+			sessionsRoot: inventory.scope.sessionsRoot,
+			transcriptPath: candidatePath,
 			sessionId: id,
 			cwd,
-			transcriptIdentity: { dev: snapshot.stat.dev, ino: snapshot.stat.ino },
+			transcriptIdentity: {
+				dev: snapshot.stat.dev,
+				ino: snapshot.stat.ino,
+				size: snapshot.stat.size,
+				mtimeNs: snapshot.stat.mtimeNs,
+				sha256: digest,
+			},
 		},
 		metadataRoot: requestedRoot,
 	};
@@ -1530,8 +2055,9 @@ async function executeLifecycleResponse(
 	operation: string,
 	input: Input,
 	identity: string,
+	cleanup?: CleanupEvidence,
 ): Promise<BrokerResponse> {
-	const requestedSessionId = sessionId(input);
+	const requestedSessionId = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (requestedSessionId !== undefined && !isCanonicalSessionId(requestedSessionId))
 		return fail("invalid_input", "sessionId must be a canonical safe identifier.");
 	const requestedSourceSessionId = text(input.sourceSessionId) ?? text(input.sourceId);
@@ -1785,7 +2311,7 @@ async function executeLifecycleResponse(
 		};
 	}
 
-	const id = sessionId(input);
+	const id = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (!id) return fail("invalid_input", "sessionId is required.");
 	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
 	await broker.index.refresh();
@@ -1914,12 +2440,181 @@ async function executeLifecycleResponse(
 		if (record?.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be deleted safely.");
 		if (record?.live) return fail("live_session", "Refusing to delete a live session; close it first.");
-		const validated = await validateDeletePath(broker, input, id, record);
+		if (cleanup?.phase === "metadata") {
+			const metadataIdentity = cleanupIdentity(cleanup.metadataIdentity);
+			if (!metadataIdentity || !validateMetadataCleanupPlan(cleanup, id))
+				return fail("terminal_uncertain", "Metadata cleanup replay lacks an exact lifecycle marker authority.");
+			const metadataCandidates = [
+				cleanup.metadataPath!,
+				cleanup.detachedMetadataPath,
+				cleanup.plannedMetadataPath!,
+			].filter(
+				(value, index, values): value is string => typeof value === "string" && values.indexOf(value) === index,
+			);
+			let activePath: string | undefined;
+			let marker: ReturnType<typeof captureLifecycleFile>;
+			let foundUnauthorized = false;
+			for (const candidate of metadataCandidates) {
+				try {
+					const stat = fsSync.lstatSync(candidate);
+					if (stat.isSymbolicLink() || !stat.isFile()) {
+						foundUnauthorized = true;
+						continue;
+					}
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					foundUnauthorized = true;
+					continue;
+				}
+				const current = captureLifecycleFile(candidate);
+				if (!current) {
+					foundUnauthorized = true;
+					continue;
+				}
+				if (
+					current.identity.dev === metadataIdentity.dev &&
+					current.identity.ino === metadataIdentity.ino &&
+					current.identity.size === BigInt(metadataIdentity.size) &&
+					current.identity.mtimeNs === metadataIdentity.mtimeNs &&
+					current.identity.sha256 === metadataIdentity.sha256 &&
+					!activePath
+				) {
+					activePath = candidate;
+					marker = current;
+				} else {
+					foundUnauthorized = true;
+				}
+			}
+			if (foundUnauthorized)
+				return fail("terminal_uncertain", "Lifecycle metadata marker changed before deferred cleanup.");
+			if (!marker || !activePath) {
+				const completedCleanup = { ...cleanup, metadataCompleted: true as const };
+				await broker.ledger.transition(identity, "effect_started", {
+					response: fail(
+						"cleanup_pending",
+						"Lifecycle metadata cleanup completion was durably reconciled.",
+						completedCleanup,
+					),
+				});
+				return { ok: true, result: { sessionId: id } };
+			}
+			let activeCleanup = cleanup;
+			if (cleanup.detachedMetadataPath || activePath === cleanup.plannedMetadataPath) {
+				activeCleanup = {
+					...cleanup,
+					detachedMetadataPath: activePath,
+					metadataAttempt: (cleanup.metadataAttempt ?? 1) + 1,
+					plannedMetadataPath: path.join(
+						path.dirname(cleanup.metadataPath!),
+						`.gjc-delete-${randomUUID()}-${path.basename(cleanup.metadataPath!)}`,
+					),
+				};
+				await broker.ledger.transition(identity, "effect_started", {
+					response: fail(
+						"cleanup_pending",
+						"Lifecycle metadata retry cleanup is preauthorized for durable reconciliation.",
+						activeCleanup,
+					),
+				});
+			}
+			const result = exactUnlinkLifecycleFile(activePath, marker.identity, activeCleanup.plannedMetadataPath!);
+			if (result.ok) return { ok: true, result: { sessionId: id } };
+			return fail("cleanup_pending", `Lifecycle metadata cleanup remains pending: ${result.code ?? "unknown"}`, {
+				...activeCleanup,
+				...(result.detachedPath ? { detachedMetadataPath: result.detachedPath } : {}),
+			});
+		}
+		const validated = await validateDeletePath(broker, input, id, record, cleanup);
 		if ("ok" in validated) return validated;
-		await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, effectMarker: randomUUID() });
-		let deleted: Awaited<ReturnType<FileSessionStorage["deleteSessionVerified"]>>;
+		let cleanupTarget: VerifiedSessionDeleteTarget = {
+			...validated.target,
+			...(validated.target.plannedArtifactsPath &&
+			validated.target.detachedArtifactsPath !== validated.target.plannedArtifactsPath
+				? {}
+				: {
+						plannedArtifactsPath: path.join(
+							path.dirname(validated.target.transcriptPath),
+							`.gjc-delete-${randomUUID()}-artifacts`,
+						),
+					}),
+			...(validated.target.plannedTranscriptPath &&
+			validated.target.detachedTranscriptPath !== validated.target.plannedTranscriptPath
+				? {}
+				: {
+						plannedTranscriptPath: path.join(
+							path.dirname(validated.target.transcriptPath),
+							`.gjc-delete-${randomUUID()}-transcript`,
+						),
+					}),
+		};
+		if (!cleanupTarget.artifactsRemoved && !cleanupTarget.expectedArtifactsIdentity) {
+			const artifactsPath = cleanupTarget.transcriptPath.slice(0, -6);
+			try {
+				const stat = fsSync.lstatSync(artifactsPath, { bigint: true });
+				if (stat.isSymbolicLink() || !stat.isDirectory())
+					return fail("terminal_uncertain", "Artifact cleanup target is not an exact directory.");
+				validateManagedArtifactTree(artifactsPath);
+				const tree = native.snapshotDirectoryTree(artifactsPath);
+				if (!tree.ok || !tree.snapshot)
+					return fail(
+						"terminal_uncertain",
+						`Artifact tree authority could not be captured: ${tree.code ?? "unknown"}`,
+					);
+				cleanupTarget = {
+					...cleanupTarget,
+					expectedArtifactsIdentity: {
+						dev: stat.dev,
+						ino: stat.ino,
+						size: Number(stat.size),
+						mtimeNs: stat.mtimeNs,
+						sha256: "",
+					},
+					expectedArtifactsTree: tree.snapshot,
+				};
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+		const preauthorizedCleanup: CleanupEvidence = {
+			phase: cleanupTarget.artifactsRemoved ? "transcript" : "artifacts",
+			sessionId: cleanupTarget.sessionId,
+			sessionsRoot: cleanupTarget.sessionsRoot,
+			transcriptPath: cleanupTarget.transcriptPath,
+			cwd: cleanupTarget.cwd,
+			...(cleanupTarget.artifactsRemoved ? { artifactsRemoved: true } : {}),
+			metadataRoot: validated.metadataRoot,
+			transcriptIdentity: serializeCleanupIdentity(cleanupTarget.transcriptIdentity),
+			...(cleanupTarget.expectedArtifactsIdentity
+				? { artifactsIdentity: serializeCleanupIdentity(cleanupTarget.expectedArtifactsIdentity) }
+				: {}),
+			...(cleanupTarget.expectedArtifactsIdentity && cleanupTarget.plannedArtifactsPath
+				? {
+						artifactTree: {
+							identity: serializeCleanupIdentity(cleanupTarget.expectedArtifactsIdentity),
+							snapshot: cleanupTarget.expectedArtifactsTree!,
+							plannedPath: cleanupTarget.plannedArtifactsPath,
+							...(cleanupTarget.detachedArtifactsPath
+								? { detachedPath: cleanupTarget.detachedArtifactsPath }
+								: {}),
+						},
+					}
+				: {}),
+
+			...(cleanupTarget.plannedArtifactsPath ? { plannedArtifactsPath: cleanupTarget.plannedArtifactsPath } : {}),
+			...(cleanupTarget.plannedTranscriptPath ? { plannedTranscriptPath: cleanupTarget.plannedTranscriptPath } : {}),
+		};
+		await broker.ledger.transition(identity, "effect_started", {
+			intendedSessionId: id,
+			effectMarker: randomUUID(),
+			response: fail(
+				"cleanup_pending",
+				"Saved session cleanup is preauthorized for durable reconciliation.",
+				preauthorizedCleanup,
+			),
+		});
+		let deleted: VerifiedSessionDeleteResult;
 		try {
-			deleted = await validated.storage.deleteSessionVerified(validated.target);
+			deleted = await validated.storage.deleteSessionVerified(cleanupTarget);
 		} catch (error) {
 			if (error instanceof SessionDeleteVerificationError)
 				return fail(
@@ -1931,23 +2626,78 @@ async function executeLifecycleResponse(
 				`Unable to delete saved session artifacts: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
+		if (deleted.kind === "artifacts_removed") {
+			const transcriptPhaseCleanup = {
+				...preauthorizedCleanup,
+				phase: "transcript" as const,
+				artifactsRemoved: true,
+				...(preauthorizedCleanup.artifactTree
+					? { artifactTree: { ...preauthorizedCleanup.artifactTree, completed: true as const } }
+					: {}),
+			};
+
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: fail(
+					"cleanup_pending",
+					"Saved session artifacts were removed; transcript cleanup is preauthorized.",
+					transcriptPhaseCleanup,
+				),
+			});
+			deleted = await validated.storage.deleteSessionVerified({
+				...cleanupTarget,
+				expectedArtifactsIdentity: undefined,
+				detachedArtifactsPath: undefined,
+				artifactsRemoved: true,
+			});
+		}
 		if (deleted.kind === "cleanup_pending")
 			return fail(
 				"cleanup_pending",
 				`Saved session cleanup is pending in ${deleted.phase}: ${deleted.error.message}`,
 				{
 					phase: deleted.phase,
-					transcriptIdentity: {
-						dev: deleted.transcriptIdentity.dev.toString(),
-						ino: deleted.transcriptIdentity.ino.toString(),
-					},
+					sessionId: validated.target.sessionId,
+					sessionsRoot: validated.target.sessionsRoot,
+					transcriptPath: validated.target.transcriptPath,
+					cwd: validated.target.cwd,
+					metadataRoot: validated.metadataRoot,
+					transcriptIdentity: serializeCleanupIdentity(deleted.transcriptIdentity),
 					...(deleted.phase === "artifacts" && deleted.artifactsIdentity
+						? { artifactsIdentity: serializeCleanupIdentity(deleted.artifactsIdentity) }
+						: {}),
+					...(deleted.phase === "artifacts" && deleted.artifactsIdentity && cleanupTarget.plannedArtifactsPath
 						? {
-								artifactsIdentity: {
-									dev: deleted.artifactsIdentity.dev.toString(),
-									ino: deleted.artifactsIdentity.ino.toString(),
+								artifactTree: {
+									identity: serializeCleanupIdentity(deleted.artifactsIdentity),
+									snapshot: deleted.artifactsTree,
+									plannedPath: cleanupTarget.plannedArtifactsPath,
+									...(deleted.detachedArtifactsPath ? { detachedPath: deleted.detachedArtifactsPath } : {}),
 								},
 							}
+						: {}),
+					...(deleted.phase === "artifacts" ? { detachedArtifactsPath: deleted.detachedArtifactsPath } : {}),
+					...(deleted.phase === "transcript" && deleted.detachedTranscriptPath
+						? { detachedTranscriptPath: deleted.detachedTranscriptPath }
+						: {}),
+					...(deleted.phase === "transcript" ? { artifactsRemoved: true } : {}),
+					...(deleted.phase === "transcript" &&
+					cleanupTarget.plannedArtifactsPath &&
+					cleanupTarget.expectedArtifactsIdentity
+						? {
+								artifactTree: {
+									identity: serializeCleanupIdentity(cleanupTarget.expectedArtifactsIdentity),
+									snapshot: cleanupTarget.expectedArtifactsTree!,
+									plannedPath: cleanupTarget.plannedArtifactsPath,
+									completed: true as const,
+								},
+							}
+						: {}),
+					...(cleanupTarget.plannedArtifactsPath
+						? { plannedArtifactsPath: cleanupTarget.plannedArtifactsPath }
+						: {}),
+					...(cleanupTarget.plannedTranscriptPath
+						? { plannedTranscriptPath: cleanupTarget.plannedTranscriptPath }
 						: {}),
 				},
 			);
@@ -1960,16 +2710,52 @@ async function executeLifecycleResponse(
 				endpointGeneration: record.endpointGeneration,
 				pid: record.pid,
 			});
-		try {
-			await fs.rm(lifecycleMarkerPath(validated.metadataRoot, id), { force: true });
-		} catch (error) {
-			return fail(
-				"cleanup_pending",
-				`Saved session was deleted but lifecycle metadata cleanup is pending: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-				{ phase: "metadata" },
+		const metadataPath = lifecycleMarkerPath(validated.metadataRoot, id);
+		if (fsSync.existsSync(metadataPath)) {
+			const stat = fsSync.lstatSync(metadataPath);
+			if (stat.isSymbolicLink() || !stat.isFile())
+				return fail("terminal_uncertain", "Lifecycle metadata path is occupied by an unsafe object.");
+		}
+		const metadata = captureLifecycleFile(metadataPath);
+		if (metadata) {
+			let marker: unknown;
+			try {
+				marker = JSON.parse(metadata.bytes.toString("utf8"));
+			} catch {
+				return fail("terminal_uncertain", "Lifecycle metadata ownership could not be verified.");
+			}
+			if (!isEffectMarker(marker) || (record && marker.pid !== record.pid) || !hasObservedProcessExit(marker.pid))
+				return fail("terminal_uncertain", "Lifecycle metadata ownership could not be verified.");
+			const metadataCleanup = metadataCleanupPlan(
+				validated.metadataRoot,
+				id,
+				metadataPath,
+				serializeCleanupIdentity({
+					dev: metadata.identity.dev,
+					ino: metadata.identity.ino,
+					size: Number(metadata.identity.size),
+					mtimeNs: metadata.identity.mtimeNs,
+					sha256: metadata.identity.sha256,
+				}),
 			);
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: fail(
+					"cleanup_pending",
+					"Lifecycle metadata cleanup is preauthorized for durable reconciliation.",
+					metadataCleanup,
+				),
+			});
+			const result = exactUnlinkLifecycleFile(metadataPath, metadata.identity, metadataCleanup.plannedMetadataPath!);
+			if (!result.ok)
+				return fail(
+					"cleanup_pending",
+					`Saved session was deleted but lifecycle metadata cleanup is pending: ${result.code ?? "unknown"}`,
+					{
+						...metadataCleanup,
+						...(result.detachedPath ? { detachedMetadataPath: result.detachedPath } : {}),
+					},
+				);
 		}
 		return { ok: true, result: { sessionId: id } };
 	}
@@ -2049,8 +2835,10 @@ export async function executeLifecycle(
 	operation: string,
 	input: Input,
 	identity: string,
+	cleanup?: CleanupEvidence,
 ): Promise<LifecycleExecutionOutcome> {
-	const response = await executeLifecycleResponse(broker, operation, input, identity);
+	if (cleanup?.phase === "lifecycle") return { response: await reconcileLifecycleCleanup(broker, identity, cleanup) };
+	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup);
 	const entry = broker.ledger.get(identity);
 	const priorDurableEffects = entry?.durableEffects;
 	const evidenceCwd = entry?.effectIntent?.worktree?.worktreePath ?? lifecycleCwd(input);
@@ -2105,6 +2893,30 @@ export async function executeLifecycle(
 					digest: createHash("sha256").update(canonicalJson(durableEffectsBody)).digest("hex"),
 				}
 			: undefined;
+	const lifecycleCleanupResponse =
+		evidence && root && entry?.intendedSessionId && expected && cleanupProof
+			? await (async () => {
+					const cleanupIntent = lifecycleCleanupPlan(root, entry.intendedSessionId!, expected, evidence);
+					await broker.ledger.transition(identity, "effect_started", {
+						response: fail(
+							"cleanup_pending",
+							"Lifecycle failure cleanup is preauthorized for durable reconciliation.",
+							cleanupIntent,
+						),
+					});
+					return reconcileLifecycleCleanup(broker, identity, cleanupIntent);
+				})()
+			: undefined;
+	if (
+		lifecycleCleanupResponse &&
+		!lifecycleCleanupResponse.ok &&
+		lifecycleCleanupResponse.error.code !== "spawn_failed"
+	)
+		return {
+			response: lifecycleCleanupResponse,
+			...(durableEffects ? { durableEffects } : {}),
+			...(startupFailure ? { startupFailure } : {}),
+		};
 	const terminalResponse: BrokerResponse =
 		!response.ok &&
 		entry?.effectMarker &&
@@ -2137,21 +2949,5 @@ export async function executeLifecycle(
 		response: terminalResponse,
 		...(durableEffects ? { durableEffects } : {}),
 		...(startupFailure ? { startupFailure } : {}),
-		...(evidence && root && entry?.intendedSessionId && cleanupProof
-			? {
-					deferredArtifactCleanup: async () => {
-						const current = await readLifecycleFailureArtifact(
-							lifecycleFailurePath(root, entry.intendedSessionId!, evidence.artifact.effectMarker),
-							evidence.artifact,
-						);
-						const marker = await readEffectMarker(lifecycleMarkerPath(root, entry.intendedSessionId!));
-						if (current?.digest !== evidence.digest || !marker || !sameEffectMarker(marker, evidence.artifact))
-							return;
-						await fs.rm(lifecycleFailurePath(root, entry.intendedSessionId!, evidence.artifact.effectMarker));
-						await fs.rm(lifecycleMarkerPath(root, entry.intendedSessionId!));
-						await syncDirectory(path.join(root, "sdk"));
-					},
-				}
-			: {}),
 	};
 }

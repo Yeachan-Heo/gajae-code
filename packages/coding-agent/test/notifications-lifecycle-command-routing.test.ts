@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,6 +6,10 @@ import * as path from "node:path";
 import { Settings } from "../src/config/settings";
 import { TELEGRAM_PARSE_MODE } from "../src/sdk/bus/html-format";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import {
+	prepareManagedSessionScopeForWriteSync,
+	resolveManagedScope,
+} from "../src/session/internal/managed-session-scope";
 
 function settings(agentDir: string): Settings {
 	const base = Settings.isolated({
@@ -55,17 +59,21 @@ function msg(chatId: string, text: string, updateId: number): unknown {
 
 function writeSession(
 	agentDir: string,
-	project: string,
+	cwd: string,
 	id: string,
 	header: object,
 	mtimeMs: number,
 	entries: object[] = [],
 ): void {
-	const dir = path.join(agentDir, "sessions", project);
-	fs.mkdirSync(dir, { recursive: true });
-	const file = path.join(dir, `${id}.jsonl`);
+	const sessionsRoot = path.join(agentDir, "sessions");
+	const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+	if (resolved.kind !== "resolved") throw new Error(resolved.message);
+	const prepared = prepareManagedSessionScopeForWriteSync(resolved.scope);
+	if (prepared.kind !== "resolved") throw new Error(prepared.message);
+	const file = path.join(prepared.scope.directoryPath, `${id}.jsonl`);
 	const suffix = entries.length > 0 ? `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n` : "";
-	fs.writeFileSync(file, `${JSON.stringify(header)}\n${suffix}`);
+	fs.writeFileSync(file, `${JSON.stringify({ ...header, type: "session", id, cwd })}\n${suffix}`, { mode: 0o600 });
+	fs.chmodSync(file, 0o600);
 	fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
 }
 
@@ -108,14 +116,11 @@ describe("lifecycle command routing (G009)", () => {
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
 		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
+		const cwd = path.join(agentDir, "repo-<tag>&branch", "x".repeat(100));
+		fs.mkdirSync(cwd, { recursive: true });
+		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
 		for (let i = 0; i < 20; i++) {
-			writeSession(
-				agentDir,
-				"repo",
-				`s-${String(i).padStart(3, "0")}`,
-				{ cwd: `/repo/<tag>&branch/${"x".repeat(100)}` },
-				1000 + i,
-			);
+			writeSession(agentDir, cwd, `s-${String(i).padStart(3, "0")}`, {}, 1000 + i);
 		}
 
 		await daemon.handleTelegramUpdate(msg("42", "/session_recent", 4));
@@ -127,10 +132,11 @@ describe("lifecycle command routing (G009)", () => {
 		const text = sends.map(c => String(c.body?.text)).join("");
 		expect(text).not.toContain("<pre>");
 		expect(text).toContain("<code>s-019</code>");
-		expect(text).toContain("<code>/repo/&lt;tag&gt;&amp;branch/");
-		expect(
-			Array.from(text.matchAll(/^• <code>s-\d{3}<\/code> \(<code>\/repo\/&lt;tag&gt;&amp;branch\/x+<\/code>\)$/gm)),
-		).toHaveLength(10);
+		expect(text).toContain(
+			`<code>${cwd.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}</code>`,
+		);
+		expect(Array.from(text.matchAll(/^• <code>s-\d{3}<\/code> \(<code>.*<\/code>\)$/gm))).toHaveLength(10);
+		cwdSpy.mockRestore();
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 	test("/session_recent hides internal helper sessions by default", async () => {
@@ -138,8 +144,11 @@ describe("lifecycle command routing (G009)", () => {
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
 		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
-		writeSession(agentDir, "repo", "user-session", { cwd: "/repo/user" }, 1000);
-		writeSession(agentDir, "repo", "helper-session", { cwd: "/repo/helper" }, 2000, [{ type: "session_init" }]);
+		const cwd = path.join(agentDir, "repo-user");
+		fs.mkdirSync(cwd, { recursive: true });
+		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
+		writeSession(agentDir, cwd, "user-session", {}, 1000);
+		writeSession(agentDir, cwd, "helper-session", {}, 2000, [{ type: "session_init" }]);
 
 		await daemon.handleTelegramUpdate(msg("42", "/session_recent", 5));
 
@@ -148,9 +157,9 @@ describe("lifecycle command routing (G009)", () => {
 			.map(c => String(c.body?.text))
 			.join("");
 		expect(text).toContain("user-session");
-		expect(text).toContain("/repo/user");
+		expect(text).toContain(cwd);
 		expect(text).not.toContain("helper-session");
-		expect(text).not.toContain("/repo/helper");
+		cwdSpy.mockRestore();
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 	test("a paired private lifecycle response uses unsupported-platform copy", async () => {

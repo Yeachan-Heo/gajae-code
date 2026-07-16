@@ -2484,6 +2484,7 @@ dependencies = [
  "toml",
  "unicode-segmentation",
  "unicode-width",
+ "windows-sys 0.61.2",
  "winreg 0.56.0",
  "xxhash-rust",
 ]

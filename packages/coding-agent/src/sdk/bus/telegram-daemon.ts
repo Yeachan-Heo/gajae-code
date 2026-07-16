@@ -307,6 +307,7 @@ export function startDaemonLifecycleControl(input: {
 	const deps = buildOrchestratorDeps({
 		pairedChatId: input.pairedChatId,
 		agentNotificationsDir: daemonPaths(input.agentDir).dir,
+		agentDir: input.agentDir,
 		sessionsRoot: path.join(input.agentDir, "sessions"),
 		auditRedactionKey: input.auditRedactionKey,
 		env: input.env,
@@ -1368,6 +1369,7 @@ export class TelegramNotificationDaemon {
 			const deps = (this.opts.createLifecycleOrchestratorDeps ?? buildOrchestratorDeps)({
 				pairedChatId: this.opts.chatId,
 				agentNotificationsDir: daemonPaths(agentDir).dir,
+				agentDir,
 				sessionsRoot: path.join(agentDir, "sessions"),
 				auditRedactionKey: deriveLifecycleAuditRedactionKey(this.opts.botToken),
 			});
@@ -1610,15 +1612,22 @@ export class TelegramNotificationDaemon {
 			return true;
 		}
 		if (parsed.kind === "recent") {
-			const recent = listRecentSessions({
-				sessionsRoot: path.join(this.opts.settings.getAgentDir(), "sessions"),
+			const recent = await listRecentSessions({
+				cwd: process.cwd(),
+				agentDir: this.opts.settings.getAgentDir(),
 				limit: 10,
 				includeInternal: false,
+				allWorkspaces: true,
 			});
-			const body = recent.length
-				? recent.map(e => `• ${code(e.sessionId)}${e.path ? ` (${code(e.path)})` : ""}`).join("\n")
-				: "No recent sessions.";
-			await replyHtml(body);
+			const body =
+				recent.kind === "error"
+					? `Recent sessions could not be verified: ${recent.message}`
+					: recent.entries.length
+						? recent.entries.map(e => `• ${code(e.sessionId)}${e.path ? ` (${code(e.path)})` : ""}`).join("\n")
+						: "No recent sessions.";
+			await replyHtml(
+				recent.kind === "complete" && recent.warnings.length ? `${body}\n\n${recent.warnings.join("\n")}` : body,
+			);
 			return true;
 		}
 

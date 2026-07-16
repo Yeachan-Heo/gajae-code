@@ -1912,7 +1912,7 @@ export class SelectorController {
 	}
 
 	async showSessionSelector(): Promise<void> {
-		const sessions = await SessionManager.list(
+		const sessions = await SessionManager.listForResumePickerReadOnly(
 			this.ctx.sessionManager.getCwd(),
 			this.ctx.sessionManager.getSessionDir(),
 		);
@@ -1934,9 +1934,9 @@ export class SelectorController {
 					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
 						return false;
 					}
-					const storage = new FileSessionStorage();
 					try {
-						await storage.deleteSessionWithArtifacts(session.path);
+						await this.#deleteSession(session.path);
+
 						return true;
 					} catch (err) {
 						throw new Error(`Failed to delete session: ${err instanceof Error ? err.message : String(err)}`, {
@@ -1972,6 +1972,15 @@ export class SelectorController {
 		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
 	}
 
+	async #deleteSession(sessionPath: string): Promise<void> {
+		const sessionManager = this.ctx.sessionManager as { dropSession?: (path: string) => Promise<void> };
+		if (sessionManager.dropSession) {
+			await sessionManager.dropSession(sessionPath);
+			return;
+		}
+		await new FileSessionStorage().deleteSessionWithArtifacts(sessionPath);
+	}
+
 	async #detachActiveSessionBeforeDeletion(sessionPath: string): Promise<boolean> {
 		const currentSessionFile = this.ctx.sessionManager.getSessionFile();
 		if (currentSessionFile !== sessionPath) {
@@ -2000,9 +2009,12 @@ export class SelectorController {
 	async handleResumeSession(sessionPath: string): Promise<void> {
 		const previousSessionId = this.ctx.sessionManager.getSessionId();
 		this.#clearTransientSessionUi();
+		const migrationPolicy =
+			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		const writableSessionPath = await SessionManager.prepareManagedCandidateForWrite(sessionPath, migrationPolicy);
 
 		// Switch session via AgentSession (emits hook and tool session events)
-		if (!(await this.ctx.session.switchSession(sessionPath))) return;
+		if (!(await this.ctx.session.switchSession(writableSessionPath))) return;
 		const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
 		if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
 		this.#refreshSessionTerminalTitle();
@@ -2047,8 +2059,7 @@ export class SelectorController {
 			return;
 		}
 
-		// Delete the session file and artifacts directory
-		await storage.deleteSessionWithArtifacts(sessionFile);
+		await this.#deleteSession(sessionFile);
 
 		// Show session selector
 		this.ctx.showStatus("Current session transcript and artifacts deleted");
