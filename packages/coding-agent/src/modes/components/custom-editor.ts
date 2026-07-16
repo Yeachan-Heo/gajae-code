@@ -21,6 +21,7 @@ type ConfigurableEditorAction = Extract<
 	| "app.message.dequeue"
 	| "app.message.followUp"
 	| "app.message.queue"
+	| "app.message.oppositeBusyMode"
 	| "app.clipboard.pasteImage"
 	| "app.clipboard.copyPrompt"
 >;
@@ -45,6 +46,7 @@ const CONFIGURABLE_EDITOR_ACTIONS = [
 	"app.history.search",
 	"app.message.followUp",
 	"app.message.queue",
+	"app.message.oppositeBusyMode",
 	"app.message.dequeue",
 	"app.clipboard.pasteImage",
 	"app.clipboard.copyPrompt",
@@ -101,6 +103,11 @@ export class CustomEditor extends Editor {
 	onDequeue?: () => void;
 	/** Called when the configured queue shortcut is pressed. */
 	onQueue?: () => void;
+	/**
+	 * Called when the configured opposite-busy-mode shortcut is pressed.
+	 * Return true to consume the key, or false to continue normal action dispatch.
+	 */
+	onOppositeBusyMode?: () => boolean;
 	/** Called when Caps Lock is pressed. */
 	onCapsLock?: () => void;
 	/** Called when PageUp/PageDown should scroll the transcript viewport instead of prompt history. */
@@ -267,6 +274,12 @@ export class CustomEditor extends Editor {
 
 		if (!matchesKey(data, "pageUp") && !matchesKey(data, "pageDown")) {
 			this.onViewportFollowLive?.();
+		}
+
+		// Opposite-busy mode has conditional priority over colliding application
+		// actions while streaming, but falls through to them while inactive.
+		if (this.#matchesAction(data, "app.message.oppositeBusyMode") && this.onOppositeBusyMode?.()) {
+			return;
 		}
 		// Intercept configured image paste (async - fires and handles result)
 		if (this.#matchesAction(data, "app.clipboard.pasteImage") && this.onPasteImage) {

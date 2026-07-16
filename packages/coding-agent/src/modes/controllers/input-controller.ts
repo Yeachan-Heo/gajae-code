@@ -376,6 +376,16 @@ export class InputController {
 		this.ctx.editor.onDequeue = () => this.handleDequeue();
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
 		this.ctx.editor.onQueue = () => void this.handleQueueSubmit();
+		this.ctx.editor.setActionKeys(
+			"app.message.oppositeBusyMode",
+			this.ctx.keybindings.getKeys("app.message.oppositeBusyMode"),
+		);
+		this.ctx.editor.onOppositeBusyMode = () => {
+			if (!this.ctx.session.isStreaming || this.ctx.session.isCompacting) return false;
+			if (!this.ctx.editor.getText().trim()) return false;
+			void this.handleOppositeBusyPromptSubmit();
+			return true;
+		};
 
 		this.ctx.editor.onViewportPageScroll = direction => this.ctx.ui.scrollViewportPages(direction);
 		this.ctx.editor.onViewportFollowLive = () => {
@@ -420,14 +430,6 @@ export class InputController {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
 				if (!this.#isFollowUpShortcutActive()) return false;
 				void this.handleFollowUp();
-				return true;
-			});
-		}
-		for (const key of this.ctx.keybindings.getKeys("app.message.oppositeBusyMode")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => {
-				if (!this.ctx.session.isStreaming || this.ctx.session.isCompacting) return false;
-				if (!this.ctx.editor.getText().trim()) return false;
-				void this.handleOppositeBusyPromptSubmit();
 				return true;
 			});
 		}
@@ -1034,14 +1036,17 @@ export class InputController {
 		const text = this.ctx.editor.getText().trim();
 		if (!text || !this.ctx.session.isStreaming || this.ctx.session.isCompacting) return;
 
+		// Claim the draft before the first await so rapid repeated shortcuts cannot
+		// snapshot and submit the same text twice.
+		const pendingImages = this.ctx.pendingImages;
+		const images = this.#visiblePendingImagesForText(text) ?? [];
+		this.ctx.editor.setText("");
+
 		const streamingBehavior =
 			normalizeBusyPromptMode(this.ctx.settings.get("busyPromptMode")) === "steer" ? "followUp" : "steer";
 		if (await this.#invokeSkillCommand(text, streamingBehavior)) return;
 
-		const pendingImages = this.ctx.pendingImages;
-		const images = this.#visiblePendingImagesForText(text) ?? [];
 		this.ctx.editor.addToHistory(text);
-		this.ctx.editor.setText("");
 		this.#clearPendingImagesIfOwnedBy(pendingImages);
 		await this.ctx.withLocalSubmission(
 			text,

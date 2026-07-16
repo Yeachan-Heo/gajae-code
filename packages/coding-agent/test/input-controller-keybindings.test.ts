@@ -29,6 +29,7 @@ type FakeEditor = {
 	onExternalEditor?: () => void;
 	onDequeue?: () => void;
 	onQueue?: () => void | Promise<void>;
+	onOppositeBusyMode?: () => boolean;
 	onChange?: (text: string) => void;
 	onSubmit?: (text: string) => void | Promise<void>;
 	onTabDeclined?: (text: string) => void;
@@ -371,11 +372,8 @@ describe("InputController keybinding setup", () => {
 		const controller = new InputController(ctx);
 		controller.setupKeyHandlers();
 
-		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
-			([key]) => key === "super+enter",
-		);
-		expect(registration).toBeDefined();
-		expect(registration?.[1]()).toBe(true);
+		expect(spies.setActionKeys).toHaveBeenCalledWith("app.message.oppositeBusyMode", ["super+enter"]);
+		expect(editor.onOppositeBusyMode?.()).toBe(true);
 		await Bun.sleep(0);
 
 		expect(spies.prompt).toHaveBeenCalledWith(`opposite from ${busyPromptMode}`, {
@@ -391,17 +389,31 @@ describe("InputController keybinding setup", () => {
 		const controller = new InputController(ctx);
 		controller.setupKeyHandlers();
 
-		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
-			([key]) => key === "super+enter",
-		);
-		expect(registration).toBeDefined();
-		expect(registration?.[1]()).toBe(false);
+		expect(editor.onOppositeBusyMode?.()).toBe(false);
 
 		(ctx.session as unknown as { isStreaming: boolean; isCompacting: boolean }).isStreaming = true;
 		(ctx.session as unknown as { isStreaming: boolean; isCompacting: boolean }).isCompacting = true;
-		expect(registration?.[1]()).toBe(false);
+		expect(editor.onOppositeBusyMode?.()).toBe(false);
 		await Bun.sleep(0);
 		expect(spies.prompt).not.toHaveBeenCalled();
+	});
+
+	it("claims the draft before rapid repeated opposite-mode submissions", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		(ctx.session as unknown as { isStreaming: boolean }).isStreaming = true;
+		editor.setText("submit exactly once");
+		new InputController(ctx).setupKeyHandlers();
+
+		expect(editor.onOppositeBusyMode?.()).toBe(true);
+		expect(editor.onOppositeBusyMode?.()).toBe(false);
+		await Bun.sleep(0);
+
+		expect(spies.prompt).toHaveBeenCalledTimes(1);
+		expect(spies.prompt).toHaveBeenCalledWith("submit exactly once", {
+			streamingBehavior: "followUp",
+			images: undefined,
+			followUpQueuePolicy: "sequential",
+		});
 	});
 
 	it("queues direct free text while streaming when busyPromptMode is queue", async () => {
