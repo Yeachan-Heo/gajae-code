@@ -268,7 +268,16 @@ const defaultCloseAdapter: SessionStorageWriterCloseAdapter = {
 	},
 };
 
-type NativeSecurity = { ok: true } | { ok: false; code: string };
+type NativeOwnerOnlyWriteDescriptorResult = { ok: true; fd: number } | { ok: false; code: string; fd?: undefined };
+type NativeOwnerOnlyWriteDescriptorApi = {
+	openOwnerOnlyFileForWrite(
+		anchorPath: string,
+		anchorDev: bigint,
+		anchorIno: bigint,
+		fileName: string,
+		append: boolean,
+	): NativeOwnerOnlyWriteDescriptorResult;
+};
 
 type NativeExactUnlinkResult = { ok: true; detachedPath?: string } | { ok: false; code: string; detachedPath?: string };
 type NativeExactUnlink = (
@@ -349,11 +358,20 @@ function exactUnlinkFailure(result: NativeExactUnlinkResult): SessionDeleteVerif
 				: "stat";
 	return new SessionDeleteVerificationError(kind, `Exact transcript deletion rejected: ${result.code}`);
 }
-function secureOwnerOnlyFile(pathname: string): void {
-	const applied = native.applyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
-	if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
-	const verified = native.verifyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
-	if (!verified.ok) throw new Error(`Owner-only security rejected ${pathname}: ${verified.code}`);
+function openOwnerOnlyFileForWrite(
+	anchorPath: string,
+	anchorDev: bigint,
+	anchorIno: bigint,
+	fileName: string,
+	append: boolean,
+): NativeOwnerOnlyWriteDescriptorResult {
+	return (native as unknown as NativeOwnerOnlyWriteDescriptorApi).openOwnerOnlyFileForWrite(
+		anchorPath,
+		anchorDev,
+		anchorIno,
+		fileName,
+		append,
+	);
 }
 
 /** Reject a symlink/junction/reparse component before a storage path is created or opened. */
@@ -397,21 +415,21 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		assertNoReparsePath(dir);
 		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		assertNoReparsePath(dir);
-		assertNoReparsePath(fpath);
-		// The creation mode prevents a POSIX exposure before the native verifier runs.
-		const openFlags =
-			(flags === "w"
-				? fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC
-				: fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND) | (fs.constants.O_NOFOLLOW ?? 0);
-		const fd = fs.openSync(fpath, openFlags, 0o600);
-		try {
-			// Do not rely on directory inheritance: secure and verify every file independently.
-			secureOwnerOnlyFile(fpath);
-		} catch (error) {
-			fs.closeSync(fd);
-			throw error;
+		const anchorStat = fs.lstatSync(dir, { bigint: true });
+		if (anchorStat.isSymbolicLink() || !anchorStat.isDirectory()) {
+			throw new Error(`Unsafe storage anchor: ${dir}`);
 		}
-		this.#fd = fd;
+		const opened = openOwnerOnlyFileForWrite(
+			dir,
+			anchorStat.dev,
+			anchorStat.ino,
+			path.basename(fpath),
+			flags === "a",
+		);
+		if (!opened.ok || opened.fd === undefined) {
+			throw new Error(`Owner-only security rejected ${fpath}: ${opened.ok ? "missing_descriptor" : opened.code}`);
+		}
+		this.#fd = opened.fd;
 		writerRegistry.register(this, this.#fd, this);
 	}
 

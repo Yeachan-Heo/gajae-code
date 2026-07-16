@@ -20,8 +20,8 @@ afterEach(async () => {
 
 describe("managed session directory SDK", () => {
 	it("uses the configured agent layout for the default sessions root", async () => {
-		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-layout-"));
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-layout-cwd-"));
+		const agentDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-layout-")));
+		const cwd = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-layout-cwd-")));
 		temporaryDirectories.push(agentDir, cwd);
 
 		const resolved = await resolveManagedSessionScope({ cwd, agentDir });
@@ -32,7 +32,7 @@ describe("managed session directory SDK", () => {
 	it.skipIf(process.platform !== "linux")(
 		"honors XDG data layout for the configured default agent directory",
 		async () => {
-			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-xdg-"));
+			const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-xdg-")));
 			const xdgData = path.join(root, "data");
 			const agentDir = path.join(os.homedir(), ".gjc", "agent");
 			const cwd = path.join(root, "workspace");
@@ -62,7 +62,7 @@ describe("managed session directory SDK", () => {
 		);
 	});
 	it("uses distinct fixed-width v2 components for legacy collision vectors", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-"));
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-")));
 		temporaryDirectories.push(root);
 		const agentDir = path.join(root, "agent");
 		const first = path.join(root, "a-b", "c");
@@ -102,7 +102,7 @@ describe("managed session directory SDK", () => {
 	});
 
 	it("fails closed when an existing v2 binding identifies another workspace", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-"));
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-")));
 		temporaryDirectories.push(root);
 		const agentDir = path.join(root, "agent");
 		const cwd = path.join(root, "workspace");
@@ -131,7 +131,7 @@ describe("managed session directory SDK", () => {
 	});
 
 	it("lists readonly candidates without creating the absent managed root", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-"));
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-")));
 		temporaryDirectories.push(root);
 		const agentDir = path.join(root, "agent");
 		const sessionsRoot = path.join(agentDir, "sessions");
@@ -147,7 +147,7 @@ describe("managed session directory SDK", () => {
 	});
 
 	it("maps an alias to the same v2 component while preserving its legacy lexical encoding", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-"));
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-")));
 		temporaryDirectories.push(root);
 		const workspace = path.join(root, "workspace", "nested");
 		const alias = path.join(root, "workspace-alias");
@@ -189,7 +189,7 @@ describe("managed session directory SDK", () => {
 	});
 
 	it("returns validated legacy candidates without exposing mutable internal identities", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-"));
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-")));
 		temporaryDirectories.push(root);
 		const agentDir = path.join(root, "agent");
 		const sessionsRoot = path.join(agentDir, "sessions");

@@ -68,6 +68,7 @@ export const matchesKey = nativeBindings.matchesKey;
 export const matchesKittySequence = nativeBindings.matchesKittySequence;
 export const matchesLegacySequence = nativeBindings.matchesLegacySequence;
 export const nativeBuildInfo = nativeBindings.nativeBuildInfo;
+export const openOwnerOnlyFileForWrite = nativeBindings.openOwnerOnlyFileForWrite;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
 export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;

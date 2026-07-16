@@ -137,7 +137,7 @@ it("forwards the supplied 32-byte audit key unchanged and rejects invalid or mis
 	}
 });
 it("fails closed without creating files when startup prompt capability transport is unavailable", async () => {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-startup-prompt-unsupported-"));
+	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-startup-prompt-unsupported-")));
 	const deps = buildOrchestratorDeps({
 		pairedChatId: PAIRED,
 		agentNotificationsDir: root,
@@ -187,7 +187,7 @@ async function startAsOwner(settings: Settings, ownerId: string): Promise<void> 
 }
 
 it("passes the daemon-derived audit key through real lifecycle startup without a fallback", async () => {
-	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-audit-key-"));
+	const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-audit-key-")));
 	const settings = daemonSettings(agentDir);
 	await startAsOwner(settings, "audit-key-owner");
 
@@ -230,7 +230,7 @@ it("passes the daemon-derived audit key through real lifecycle startup without a
 });
 
 it("does not attach lifecycle audit dependencies or fall back when daemon key derivation has no token", async () => {
-	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-missing-audit-key-"));
+	const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-missing-audit-key-")));
 	const settings = daemonSettings(agentDir);
 	await startAsOwner(settings, "missing-audit-key-owner");
 
@@ -476,7 +476,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("migrates legacy successful resume entries without resumeMode", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-legacy-resume-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-legacy-resume-")));
 		const ledgerPath = path.join(root, "ledger.json");
 		const legacyEntry: LedgerEntry = {
 			requestHash: "legacy-hash",
@@ -500,7 +500,7 @@ describe("lifecycle control runtime", () => {
 		}
 	});
 	it("distinguishes a missing ledger from corrupt or unreadable durable state", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-")));
 		const ledgerPath = path.join(root, "ledger.json");
 		const store = fileLedgerStore(ledgerPath);
 		try {
@@ -534,7 +534,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("ignores unsupported directory fsync only, and propagates directory open and close failures", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-sync-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-sync-")));
 		const ledgerPath = path.join(root, "ledger.json");
 		const originalFsync = fs.fsyncSync;
 		const originalOpen = fs.openSync;
@@ -631,7 +631,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("closes and never publishes a ledger temporary file after write or fsync failure", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-temp-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-temp-")));
 		const ledgerPath = path.join(root, "ledger.json");
 		const originalWrite = fs.writeSync;
 		const originalFsync = fs.fsyncSync;
@@ -678,7 +678,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("persists complete ledger JSON across short writes", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-short-write-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-short-write-")));
 		const ledgerPath = path.join(root, "ledger.json");
 		const originalWrite = fs.writeSync as (
 			fd: number,
@@ -709,7 +709,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("preserves the prior ledger and removes the temporary file when a write makes no progress", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-zero-write-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-zero-write-")));
 		const ledgerPath = path.join(root, "ledger.json");
 		const prior = JSON.stringify({ version: 1, entries: {} });
 		fs.writeFileSync(ledgerPath, prior, { mode: 0o600 });
@@ -1097,7 +1097,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("daemonResumeSession fails closed against saved history (notFound / ambiguous)", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-")));
 		const proj = path.join(root, "proj");
 		fs.mkdirSync(proj, { recursive: true });
 		await writeManagedSession(root, proj, "abc111");
@@ -1127,7 +1127,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("daemonResumeSession cold-restarts saved sessions from their recorded cwd", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-cwd-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-cwd-")));
 		const proj = path.join(root, "saved-project");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const serverState = path.join(root, "tmux-server-started");
@@ -1214,7 +1214,7 @@ describe("lifecycle control runtime", () => {
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 	it("daemonResumeSession rejects a live session when its tmux server cannot be proven safe", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-live-unverifiable-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-live-unverifiable-")));
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
 		fs.writeFileSync(
@@ -1291,7 +1291,7 @@ describe("lifecycle control runtime", () => {
 		expect(findCalls).toBe(0);
 	});
 	it("daemon create propagates one generation into canonical lifecycle state and the resident child", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-create-owner-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-create-owner-")));
 		const proj = path.join(root, "project");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
@@ -1357,7 +1357,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("cleans the immutable spawned session after post-spawn generation proof fails", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-stale-generation-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-stale-generation-")));
 		const project = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");
 		const callsFile = path.join(root, "tmux-calls.log");
@@ -1438,7 +1438,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("fails create when required tmux owner metadata cannot be written", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-create-metadata-failure-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-create-metadata-failure-")));
 		const proj = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");
 		fs.mkdirSync(proj, { recursive: true });
@@ -1484,7 +1484,7 @@ describe("lifecycle control runtime", () => {
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 	it("refuses unsafe or unverifiable servers before daemon create or cold-resume can mutate tmux", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pre-mutation-refusal-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pre-mutation-refusal-")));
 		const project = path.join(root, "project");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
@@ -1532,7 +1532,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("writes no create ownership tags when a replacement server reuses the native session before the guarded metadata queue", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-required-metadata-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-required-metadata-")));
 		const project = path.join(root, "project");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
@@ -1589,7 +1589,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("writes no cold-resume ownership tags when a replacement server reuses the native session before metadata", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cold-resume-metadata-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cold-resume-metadata-")));
 		const project = path.join(root, "project");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
@@ -1647,7 +1647,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("refuses psmux before create or cold-resume can mutate lifecycle state", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-psmux-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-psmux-")));
 		const project = path.join(root, "project");
 		const psmux = path.join(root, "psmux");
 		const plain = path.join(root, "plain");
@@ -1697,7 +1697,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("rejects missing or noisy native receipts with cleanup uncertainty and no generation publication", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-receipt-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-receipt-")));
 		const project = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");
 		const calls = path.join(root, "calls.log");
@@ -1750,7 +1750,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("combines required metadata failure with cleanup preproof or guarded-mutation uncertainty", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-cleanup-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-cleanup-")));
 		const project = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");
 		const calls = path.join(root, "calls.log");
@@ -1817,7 +1817,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("refuses cleanup when a replacement arrives between external preproof and the guarded mutation", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-cleanup-replacement-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-cleanup-replacement-")));
 		const project = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");
 		const calls = path.join(root, "calls.log");
@@ -1873,7 +1873,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("does not publish generation when the tmux server changes during metadata writes", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-metadata-race-"));
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-metadata-race-")));
 		const project = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");
 		fs.mkdirSync(project, { recursive: true });

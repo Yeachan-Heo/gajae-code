@@ -79,7 +79,7 @@ function writeSession(
 
 describe("lifecycle command routing (G009)", () => {
 	test("a paired-chat /session_* command is detected and answered (no injection fallthrough)", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-")));
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
 		// Control is not started in this unit (lifecycleControlActive=false), so the
@@ -93,7 +93,7 @@ describe("lifecycle command routing (G009)", () => {
 	});
 
 	test("a non-paired chat /session_* command is ignored by the lifecycle path", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-")));
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
 		await daemon.handleTelegramUpdate(msg("999", "/session_create path /repo", 2));
@@ -103,7 +103,7 @@ describe("lifecycle command routing (G009)", () => {
 	});
 
 	test("a plain (non-command) paired-chat message is not treated as a lifecycle command", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-")));
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
 		await daemon.handleTelegramUpdate(msg("42", "hello there", 3));
@@ -112,7 +112,7 @@ describe("lifecycle command routing (G009)", () => {
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 	test("/session_recent is sent as escaped bullet rows with inline code", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-")));
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
 		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
@@ -140,7 +140,7 @@ describe("lifecycle command routing (G009)", () => {
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 	test("/session_recent hides internal helper sessions by default", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-")));
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
 		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
@@ -163,7 +163,7 @@ describe("lifecycle command routing (G009)", () => {
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 	test("a paired private lifecycle response uses unsupported-platform copy", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
+		const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-")));
 		try {
 			const { calls, api } = spyBot();
 			const daemon = makeDaemon(agentDir, api);

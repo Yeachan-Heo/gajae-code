@@ -2145,7 +2145,7 @@ test("SDK host replay gaps are generation-scoped and sequence gaps remain cohere
 });
 
 test("Q17 returns resource_gone without an assistant and reads a completed persisted turn after reopen", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-last-assistant-"));
+	const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-last-assistant-")));
 	dirs.push(cwd);
 	const original = SessionManager.create(cwd, cwd);
 	await original.flush();

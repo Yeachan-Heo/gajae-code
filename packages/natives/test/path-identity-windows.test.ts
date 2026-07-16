@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +11,7 @@ import {
 	exactRemoveDirectoryTree,
 	exactRestore,
 	exactUnlink,
+	openOwnerOnlyFileForWrite,
 	renameNoReplacePath,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
@@ -45,6 +47,35 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "win32")("Windows native path identity", () => {
+	it("opens append and truncate writers on the exact secured handle", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "state.json");
+		await fs.writeFile(file, "old");
+		const anchor = await fs.stat(root, { bigint: true });
+
+		const appended = openOwnerOnlyFileForWrite(root, anchor.dev, anchor.ino, "state.json", true);
+		if (!appended.ok || appended.fd === undefined) throw new Error(`append open failed: ${appended.code}`);
+		nodeFs.writeSync(appended.fd, "+");
+		nodeFs.closeSync(appended.fd);
+		expect(await fs.readFile(file, "utf8")).toBe("old+");
+
+		const truncated = openOwnerOnlyFileForWrite(root, anchor.dev, anchor.ino, "state.json", false);
+		if (!truncated.ok || truncated.fd === undefined) throw new Error(`truncate open failed: ${truncated.code}`);
+		nodeFs.writeSync(truncated.fd, "new");
+		nodeFs.closeSync(truncated.fd);
+		expect(await fs.readFile(file, "utf8")).toBe("new");
+		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
+	});
+	it("rejects alternate data stream write targets", async () => {
+		const root = await temporaryDirectory();
+		const anchor = await fs.stat(root, { bigint: true });
+
+		expect(openOwnerOnlyFileForWrite(root, anchor.dev, anchor.ino, "state.json:secret", true)).toEqual({
+			ok: false,
+			code: "io_error",
+		});
+		await expect(fs.stat(path.join(root, "state.json"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
 	it("rejects final and ancestor reparse points for every owner-only ACL operation", async () => {
 		const root = await temporaryDirectory();
 		const target = path.join(root, "target");

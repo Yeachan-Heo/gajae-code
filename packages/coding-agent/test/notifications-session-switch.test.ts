@@ -73,7 +73,7 @@ function createHarness(prefix: string, initialName: string | undefined = "Origin
 	} as never;
 	createNotificationsExtension(api);
 
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 	tempDirs.push(cwd);
 
 	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -138,7 +138,7 @@ async function startAndConnect(harness: ReturnType<typeof createHarness>): Promi
 }
 
 test("session_switch publishes successor SDK authority only after AgentSession restore commits", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-post-commit-switch-"));
+	const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-post-commit-switch-")));
 	const agentDir = path.join(cwd, ".gjc", "agent");
 	const authStorage = await AuthStorage.create(path.join(cwd, "testauth.db"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -222,7 +222,7 @@ test("session_switch publishes successor SDK authority only after AgentSession r
 }, 30000);
 
 test("turn.prompt preflight rejection returns a correlated failure without an accepted lifecycle", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-preflight-"));
+	const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-preflight-")));
 	tempDirs.push(cwd);
 	const handlers = new Map<string, Handler>();
 	createNotificationsExtension({
@@ -285,7 +285,7 @@ test("turn.prompt preflight rejection returns a correlated failure without an ac
 }, 30000);
 
 test("accepted turn.prompt submission failures emit a correlated terminal event", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-terminal-failure-"));
+	const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-terminal-failure-")));
 	tempDirs.push(cwd);
 	const handlers = new Map<string, Handler>();
 	createNotificationsExtension({
@@ -371,7 +371,7 @@ test("session_switch rotates SDK authority while preserving topic identity", asy
 		} as never;
 		createNotificationsExtension(api);
 
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-switch-"));
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-switch-")));
 		tempDirs.push(cwd);
 
 		const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;

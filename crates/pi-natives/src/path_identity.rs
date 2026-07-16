@@ -26,6 +26,14 @@ pub struct NativeOwnerOnlySecurityResult {
 	pub ok:   bool,
 	pub code: Option<String>,
 }
+/// Descriptor returned only after owner-only security has been applied and
+/// verified on that exact regular-file object.
+#[napi(object)]
+pub struct NativeOwnerOnlyWriteDescriptorResult {
+	pub ok:   bool,
+	pub code: Option<String>,
+	pub fd:   Option<i32>,
+}
 
 /// Caller-supplied identity and preauthorized quarantine evidence for exact
 /// deletion.
@@ -301,6 +309,15 @@ impl NativeOwnerOnlySecurityResult {
 		Self { ok: false, code: Some(code.to_owned()) }
 	}
 }
+impl NativeOwnerOnlyWriteDescriptorResult {
+	const fn success(fd: i32) -> Self {
+		Self { ok: true, code: None, fd: Some(fd) }
+	}
+
+	fn failure(code: &str) -> Self {
+		Self { ok: false, code: Some(code.to_owned()), fd: None }
+	}
+}
 
 fn io_code(error: &io::Error) -> &'static str {
 	match error.kind() {
@@ -360,6 +377,38 @@ pub fn verify_owner_only_path_security(
 		return NativeOwnerOnlySecurityResult::failure("io_error");
 	}
 	platform::verify_owner_only_path_security(Path::new(&path), &kind)
+}
+
+/// Open or create one direct child of an identity-bound storage directory.
+///
+/// Apply and verify owner-only security on the descriptor returned for writing.
+/// The caller owns and must close the returned descriptor.
+#[napi]
+pub fn open_owner_only_file_for_write(
+	anchor_path: String,
+	anchor_dev: BigInt,
+	anchor_ino: BigInt,
+	file_name: String,
+	append: bool,
+) -> NativeOwnerOnlyWriteDescriptorResult {
+	if anchor_path.contains('\0') || file_name.contains('\0') {
+		return NativeOwnerOnlyWriteDescriptorResult::failure("io_error");
+	}
+	let (dev_negative, dev, dev_lossless) = anchor_dev.get_u64();
+	let (ino_negative, ino, ino_lossless) = anchor_ino.get_u64();
+	if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+		return NativeOwnerOnlyWriteDescriptorResult::failure("io_error");
+	}
+	#[cfg(windows)]
+	if file_name.contains(':') {
+		return NativeOwnerOnlyWriteDescriptorResult::failure("io_error");
+	}
+	let component = Path::new(&file_name);
+	match component.components().next() {
+		Some(Component::Normal(_)) if component.components().count() == 1 => {},
+		_ => return NativeOwnerOnlyWriteDescriptorResult::failure("io_error"),
+	}
+	platform::open_owner_only_file_for_write(Path::new(&anchor_path), dev, ino, component, append)
 }
 
 /// Delete only the regular file that still has the supplied platform identity.
@@ -454,7 +503,7 @@ mod platform {
 		fs::{self, File},
 		io::Read,
 		os::{
-			fd::{AsRawFd, FromRawFd},
+			fd::{AsRawFd, FromRawFd, IntoRawFd},
 			unix::{
 				ffi::OsStrExt,
 				fs::{MetadataExt, PermissionsExt},
@@ -466,7 +515,8 @@ mod platform {
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, io_code, security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, NativeOwnerOnlyWriteDescriptorResult, io_code,
+		security_io_code, sha256,
 	};
 
 	pub(super) fn canonical_existing_directory_identity(
@@ -497,24 +547,12 @@ mod platform {
 		}
 	}
 
-	#[cfg(any(
-		target_os = "macos",
-		target_os = "ios",
-		target_os = "freebsd",
-		target_os = "openbsd",
-		target_os = "netbsd"
-	))]
+	#[cfg(target_os = "netbsd")]
 	fn stat_mtime_ns(stat: &libc::stat) -> i128 {
-		i128::from(stat.st_mtimespec.tv_sec) * 1_000_000_000 + i128::from(stat.st_mtimespec.tv_nsec)
+		i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtimensec)
 	}
 
-	#[cfg(not(any(
-		target_os = "macos",
-		target_os = "ios",
-		target_os = "freebsd",
-		target_os = "openbsd",
-		target_os = "netbsd"
-	)))]
+	#[cfg(not(target_os = "netbsd"))]
 	fn stat_mtime_ns(stat: &libc::stat) -> i128 {
 		i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtime_nsec)
 	}
@@ -638,27 +676,28 @@ mod platform {
 	#[cfg(target_os = "macos")]
 	// SAFETY: these declarations match the platform C ABI.
 	unsafe extern "C" {
-		fn acl_get_fd(fd: libc::c_int) -> *mut libc::c_void;
+		fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
 		fn acl_init(count: libc::c_int) -> *mut libc::c_void;
-		fn acl_set_fd(fd: libc::c_int, acl: *mut libc::c_void) -> libc::c_int;
-		fn acl_get_entry(
+		fn acl_set_fd_np(
+			fd: libc::c_int,
 			acl: *mut libc::c_void,
-			entry_id: libc::c_int,
-			entry: *mut *mut libc::c_void,
+			acl_type: libc::c_int,
 		) -> libc::c_int;
 		fn acl_free(object: *mut libc::c_void) -> libc::c_int;
 	}
+	#[cfg(target_os = "macos")]
+	const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
 
 	#[cfg(target_os = "macos")]
 	fn clear_extended_acl(file: &File) -> Result<(), NativeOwnerOnlySecurityResult> {
 		// SAFETY: this creates an owned ACL allocation for the requested entry count.
-		let acl = unsafe { acl_init(1) };
+		let acl = unsafe { acl_init(0) };
 		if acl.is_null() {
 			return Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"));
 		}
 		// SAFETY: the file descriptor and owned ACL allocation remain live for this
 		// call.
-		let result = unsafe { acl_set_fd(file.as_raw_fd(), acl) };
+		let result = unsafe { acl_set_fd_np(file.as_raw_fd(), acl, ACL_TYPE_EXTENDED) };
 		// SAFETY: this owns the ACL allocation from the preceding ACL API and frees it
 		// once.
 		unsafe { acl_free(acl) };
@@ -672,21 +711,18 @@ mod platform {
 	#[cfg(target_os = "macos")]
 	fn has_extended_acl(file: &File) -> Result<bool, NativeOwnerOnlySecurityResult> {
 		// SAFETY: the file descriptor is live; the returned ACL is freed exactly once.
-		let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
+		let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
 		if acl.is_null() {
-			return Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"));
+			return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+				Ok(false)
+			} else {
+				Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"))
+			};
 		}
-		let mut entry = std::ptr::null_mut();
-		// SAFETY: the ACL allocation is live and `entry` is a writable output pointer.
-		let result = unsafe { acl_get_entry(acl, 0, &mut entry) };
 		// SAFETY: this owns the ACL allocation from the preceding ACL API and frees it
 		// once.
 		unsafe { acl_free(acl) };
-		match result {
-			0 => Ok(false),
-			1 => Ok(true),
-			_ => Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable")),
-		}
+		Ok(true)
 	}
 
 	pub(super) fn apply_owner_only_path_security(
@@ -706,20 +742,20 @@ mod platform {
 				if let Err(result) = clear_extended_acl(&file) {
 					return result;
 				}
-				verify_owner_only_path_security(path, kind)
+				verify_owner_only_file_security(&file, kind)
 			},
 			Err(error) => NativeOwnerOnlySecurityResult::failure(security_code(&error)),
 		}
 	}
 
-	pub(super) fn verify_owner_only_path_security(
-		path: &Path,
-		kind: &str,
-	) -> NativeOwnerOnlySecurityResult {
-		let (file, metadata) = match checked_file(path, kind) {
-			Ok(result) => result,
-			Err(result) => return result,
+	fn verify_owner_only_file_security(file: &File, kind: &str) -> NativeOwnerOnlySecurityResult {
+		let metadata = match file.metadata() {
+			Ok(metadata) => metadata,
+			Err(error) => return NativeOwnerOnlySecurityResult::failure(security_code(&error)),
 		};
+		if (kind == "directory" && !metadata.is_dir()) || (kind == "file" && !metadata.is_file()) {
+			return NativeOwnerOnlySecurityResult::failure("not_directory");
+		}
 		let expected = if metadata.is_dir() { 0o700 } else { 0o600 };
 		// SAFETY: geteuid has no pointer, lifetime, or ownership requirements.
 		if metadata.uid() != unsafe { libc::geteuid() }
@@ -728,13 +764,102 @@ mod platform {
 			return NativeOwnerOnlySecurityResult::failure("acl_verify_failed");
 		}
 		#[cfg(any(target_os = "linux", target_os = "macos"))]
-		match has_extended_acl(&file) {
+		match has_extended_acl(file) {
 			Ok(false) => NativeOwnerOnlySecurityResult::success(),
 			Ok(true) => NativeOwnerOnlySecurityResult::failure("acl_verify_failed"),
 			Err(result) => result,
 		}
 		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+	pub(super) fn verify_owner_only_path_security(
+		path: &Path,
+		kind: &str,
+	) -> NativeOwnerOnlySecurityResult {
+		let (file, _) = match checked_file(path, kind) {
+			Ok(result) => result,
+			Err(result) => return result,
+		};
+		verify_owner_only_file_security(&file, kind)
+	}
+
+	pub(super) fn open_owner_only_file_for_write(
+		anchor_path: &Path,
+		anchor_dev: u64,
+		anchor_ino: u64,
+		file_name: &Path,
+		append: bool,
+	) -> NativeOwnerOnlyWriteDescriptorResult {
+		let (anchor, metadata) = match checked_file(anchor_path, "directory") {
+			Ok(result) => result,
+			Err(result) => {
+				return NativeOwnerOnlyWriteDescriptorResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		if metadata.dev() != anchor_dev || metadata.ino() != anchor_ino {
+			return NativeOwnerOnlyWriteDescriptorResult::failure("identity_mismatch");
+		}
+		let Some(file_name) = file_name.as_os_str().to_str() else {
+			return NativeOwnerOnlyWriteDescriptorResult::failure("io_error");
+		};
+		let Ok(file_name) = CString::new(file_name) else {
+			return NativeOwnerOnlyWriteDescriptorResult::failure("io_error");
+		};
+		let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+		if append {
+			flags |= libc::O_APPEND;
+		}
+		// SAFETY: `anchor` owns the retained directory descriptor and `file_name` is a
+		// NUL-terminated single component validated by the public entry point.
+		let fd = unsafe { libc::openat(anchor.as_raw_fd(), file_name.as_ptr(), flags, 0o600) };
+		if fd < 0 {
+			return NativeOwnerOnlyWriteDescriptorResult::failure(security_code(
+				&std::io::Error::last_os_error(),
+			));
+		}
+		// SAFETY: this transfers exactly one newly opened descriptor to `File`.
+		let file = unsafe { File::from_raw_fd(fd) };
+		let metadata = match file.metadata() {
+			Ok(metadata) if metadata.is_file() => metadata,
+			Ok(_) => return NativeOwnerOnlyWriteDescriptorResult::failure("not_directory"),
+			Err(error) => {
+				return NativeOwnerOnlyWriteDescriptorResult::failure(security_code(&error));
+			},
+		};
+		if let Err(result) = apply_owner_only_file_security(&file, &metadata) {
+			return NativeOwnerOnlyWriteDescriptorResult::failure(
+				result.code.as_deref().unwrap_or("io_error"),
+			);
+		}
+		if !append {
+			// SAFETY: `file` owns the open regular-file descriptor that was just
+			// security-verified; no pathname is consulted for truncation.
+			if unsafe { libc::ftruncate(file.as_raw_fd(), 0) } != 0 {
+				return NativeOwnerOnlyWriteDescriptorResult::failure(security_code(
+					&std::io::Error::last_os_error(),
+				));
+			}
+		}
+		NativeOwnerOnlyWriteDescriptorResult::success(file.into_raw_fd())
+	}
+
+	fn apply_owner_only_file_security(
+		file: &File,
+		metadata: &fs::Metadata,
+	) -> Result<(), NativeOwnerOnlySecurityResult> {
+		let mut permissions = metadata.permissions();
+		permissions.set_mode(0o600);
+		file
+			.set_permissions(permissions)
+			.map_err(|error| NativeOwnerOnlySecurityResult::failure(security_code(&error)))?;
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		clear_extended_acl(file)?;
+		match verify_owner_only_file_security(file, "file") {
+			NativeOwnerOnlySecurityResult { ok: true, .. } => Ok(()),
+			result => Err(result),
+		}
 	}
 	#[cfg(target_os = "linux")]
 	fn rename_no_replace(
@@ -1862,18 +1987,20 @@ mod platform {
 			AclSizeInformation, AddAccessAllowedAceEx,
 			Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo},
 			DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-			GetTokenInformation, InitializeAcl, IsValidSid, OWNER_SECURITY_INFORMATION,
-			PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+			GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, IsValidSid,
+			OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_DESCRIPTOR,
+			SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+			TOKEN_QUERY, TOKEN_USER,
 		},
 		Storage::FileSystem::{
-			BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-			FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_BEGIN,
-			FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-			FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
-			FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileBasicInfo, FileDispositionInfo,
-			GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL,
-			ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID, WRITE_DAC,
-			WRITE_OWNER,
+			BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
+			FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+			FILE_BASIC_INFO, FILE_BEGIN, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+			FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileBasicInfo,
+			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
+			READ_CONTROL, ReadFile, SetEndOfFile, SetFileInformationByHandle, SetFilePointerEx,
+			VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
 		},
 		System::Threading::{GetCurrentProcess, OpenProcessToken},
 	};
@@ -1881,12 +2008,18 @@ mod platform {
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, sha256,
+		NativeOwnerOnlySecurityResult, NativeOwnerOnlyWriteDescriptorResult, sha256,
 	};
 
 	const SECURITY_OWNER_DACL: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
 	const SECURITY_OWNER_DACL_PROTECTED: u32 =
 		SECURITY_OWNER_DACL | PROTECTED_DACL_SECURITY_INFORMATION;
+	#[link(name = "msvcrt")]
+	unsafe extern "C" {
+		fn _open_osfhandle(osfhandle: isize, flags: libc::c_int) -> libc::c_int;
+	}
+	const O_APPEND: libc::c_int = 0x0008;
+	const O_BINARY: libc::c_int = 0x8000;
 
 	const FILE_RENAME_INFO_CLASS: i32 = 3;
 
@@ -2097,6 +2230,7 @@ mod platform {
 	}
 
 	const FILE_OPEN: u32 = 1;
+	const FILE_OPEN_IF: u32 = 3;
 	const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 	const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 	const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -2120,7 +2254,9 @@ mod platform {
 	impl Drop for HeldExact {
 		fn drop(&mut self) {
 			unsafe {
-				CloseHandle(self.target);
+				if self.target != INVALID_HANDLE_VALUE {
+					CloseHandle(self.target);
+				}
 				for handle in self.ancestors.drain(..).rev() {
 					CloseHandle(handle);
 				}
@@ -2222,6 +2358,59 @@ mod platform {
 				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 				FILE_OPEN,
 				options,
+				null_mut(),
+				0,
+			)
+		};
+		if create_status < 0 {
+			return Err(ntstatus_code(create_status));
+		}
+		Ok(handle)
+	}
+	fn open_relative_file_for_write(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+		security_descriptor: *mut c_void,
+	) -> Result<HANDLE, &'static str> {
+		let mut name: Vec<u16> = name.encode_wide().collect();
+		if name.is_empty()
+			|| name.iter().any(|unit| *unit == 0)
+			|| name.len() > (u16::MAX as usize / 2)
+		{
+			return Err("io_error");
+		}
+		let mut object_name = UnicodeString {
+			length:         (name.len() * size_of::<u16>()) as u16,
+			maximum_length: (name.len() * size_of::<u16>()) as u16,
+			buffer:         name.as_mut_ptr(),
+		};
+		let mut attributes = ObjectAttributes {
+			length: size_of::<ObjectAttributes>() as u32,
+			root_directory: parent,
+			object_name: &mut object_name,
+			attributes: 0,
+			security_descriptor,
+			security_quality_of_service: null_mut(),
+		};
+		let mut status: IoStatusBlock = unsafe { std::mem::zeroed() };
+		let mut handle = INVALID_HANDLE_VALUE;
+		let create_status = unsafe {
+			NtCreateFile(
+				&mut handle,
+				FILE_WRITE_DATA
+					| FILE_APPEND_DATA
+					| FILE_READ_ATTRIBUTES
+					| WRITE_OWNER
+					| WRITE_DAC
+					| READ_CONTROL
+					| SYNCHRONIZE,
+				&mut attributes,
+				&mut status,
+				null_mut(),
+				FILE_ATTRIBUTE_NORMAL,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				FILE_OPEN_IF,
+				FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
 				null_mut(),
 				0,
 			)
@@ -2807,6 +2996,24 @@ mod platform {
 		}
 		Ok(buffer)
 	}
+	fn owner_only_security_descriptor(
+		sid: &[u8],
+		dacl: &[usize],
+	) -> Result<SECURITY_DESCRIPTOR, ()> {
+		let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+		let descriptor_ptr = (&raw mut descriptor).cast::<c_void>();
+		if unsafe { InitializeSecurityDescriptor(descriptor_ptr, 1) } == 0
+			|| unsafe { SetSecurityDescriptorOwner(descriptor_ptr, sid.as_ptr().cast_mut().cast(), 0) }
+				== 0 || unsafe {
+			SetSecurityDescriptorDacl(descriptor_ptr, 1, dacl.as_ptr().cast::<ACL>(), 0)
+		} == 0 || unsafe {
+			SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+		} == 0
+		{
+			return Err(());
+		}
+		Ok(descriptor)
+	}
 
 	pub(super) fn apply_owner_only_path_security(
 		path: &Path,
@@ -2841,17 +3048,13 @@ mod platform {
 		if status != 0 {
 			return NativeOwnerOnlySecurityResult::failure("acl_apply_failed");
 		}
-		verify_owner_only_path_security(path, kind)
+		verify_owner_only_handle_security(&handle, kind)
 	}
 
-	pub(super) fn verify_owner_only_path_security(
-		path: &Path,
+	fn verify_owner_only_handle_security(
+		handle: &HeldExact,
 		kind: &str,
 	) -> NativeOwnerOnlySecurityResult {
-		let handle = match open_exact(path, kind, READ_CONTROL) {
-			Ok(handle) => handle,
-			Err(result) => return result,
-		};
 		let sid = match current_user_sid() {
 			Ok(sid) => sid,
 			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_unavailable"),
@@ -2982,6 +3185,117 @@ mod platform {
 		} else {
 			NativeOwnerOnlySecurityResult::failure("acl_verify_failed")
 		}
+	}
+	pub(super) fn verify_owner_only_path_security(
+		path: &Path,
+		kind: &str,
+	) -> NativeOwnerOnlySecurityResult {
+		let handle = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		verify_owner_only_handle_security(&handle, kind)
+	}
+
+	pub(super) fn open_owner_only_file_for_write(
+		anchor_path: &Path,
+		anchor_dev: u64,
+		anchor_ino: u64,
+		file_name: &Path,
+		append: bool,
+	) -> NativeOwnerOnlyWriteDescriptorResult {
+		let anchor = match open_exact(anchor_path, "directory", FILE_READ_ATTRIBUTES) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeOwnerOnlyWriteDescriptorResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		let mut anchor_info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(anchor.target, &mut anchor_info) } == 0 {
+			return NativeOwnerOnlyWriteDescriptorResult::failure(last_error_code());
+		}
+		let actual_ino =
+			(u64::from(anchor_info.nFileIndexHigh) << 32) | u64::from(anchor_info.nFileIndexLow);
+		if u64::from(anchor_info.dwVolumeSerialNumber) != anchor_dev || actual_ino != anchor_ino {
+			return NativeOwnerOnlyWriteDescriptorResult::failure("identity_mismatch");
+		}
+		let sid = match current_user_sid() {
+			Ok(sid) => sid,
+			Err(()) => return NativeOwnerOnlyWriteDescriptorResult::failure("acl_unavailable"),
+		};
+		let dacl = match owner_only_dacl(&sid, "file") {
+			Ok(dacl) => dacl,
+			Err(()) => return NativeOwnerOnlyWriteDescriptorResult::failure("acl_apply_failed"),
+		};
+		let mut creation_security = match owner_only_security_descriptor(&sid, &dacl) {
+			Ok(descriptor) => descriptor,
+			Err(()) => return NativeOwnerOnlyWriteDescriptorResult::failure("acl_apply_failed"),
+		};
+		let handle = match open_relative_file_for_write(
+			anchor.target,
+			file_name.as_os_str(),
+			(&raw mut creation_security).cast(),
+		) {
+			Ok(handle) => handle,
+			Err(code) => return NativeOwnerOnlyWriteDescriptorResult::failure(code),
+		};
+		let attributes = match handle_attributes(handle) {
+			Ok(attributes) => attributes,
+			Err(code) => {
+				unsafe { CloseHandle(handle) };
+				return NativeOwnerOnlyWriteDescriptorResult::failure(code);
+			},
+		};
+		if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+			|| attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+		{
+			unsafe { CloseHandle(handle) };
+			return NativeOwnerOnlyWriteDescriptorResult::failure(
+				if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+					"reparse_point"
+				} else {
+					"not_directory"
+				},
+			);
+		}
+		let mut file = HeldExact { target: handle, ancestors: Vec::new() };
+		let status = unsafe {
+			SetSecurityInfo(
+				file.target,
+				SE_FILE_OBJECT,
+				SECURITY_OWNER_DACL_PROTECTED,
+				sid.as_ptr().cast_mut().cast(),
+				null_mut(),
+				dacl.as_ptr().cast(),
+				null_mut(),
+			)
+		};
+		if status != 0 {
+			return NativeOwnerOnlyWriteDescriptorResult::failure("acl_apply_failed");
+		}
+		let verified = verify_owner_only_handle_security(&file, "file");
+		if !verified.ok {
+			return NativeOwnerOnlyWriteDescriptorResult::failure(
+				verified.code.as_deref().unwrap_or("acl_verify_failed"),
+			);
+		}
+		if !append
+			&& (unsafe { SetFilePointerEx(file.target, 0, null_mut(), FILE_BEGIN) } == 0
+				|| unsafe { SetEndOfFile(file.target) } == 0)
+		{
+			return NativeOwnerOnlyWriteDescriptorResult::failure(last_error_code());
+		}
+		let handle = file.target;
+		file.target = INVALID_HANDLE_VALUE;
+		let flags = O_BINARY | if append { O_APPEND } else { 0 };
+		let fd = unsafe { _open_osfhandle(handle as isize, flags) };
+		if fd < 0 {
+			unsafe { CloseHandle(handle) };
+			return NativeOwnerOnlyWriteDescriptorResult::failure("io_error");
+		}
+		NativeOwnerOnlyWriteDescriptorResult::success(fd)
 	}
 	fn hex_digest(digest: [u8; 32]) -> String {
 		digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -3489,6 +3803,7 @@ mod platform {
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeResult,
 		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		NativeOwnerOnlyWriteDescriptorResult,
 	};
 
 	pub(super) fn canonical_existing_directory_identity(
@@ -3529,5 +3844,14 @@ mod platform {
 		_: &str,
 	) -> NativeOwnerOnlySecurityResult {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+	pub(super) fn open_owner_only_file_for_write(
+		_: &Path,
+		_: u64,
+		_: u64,
+		_: &Path,
+		_: bool,
+	) -> NativeOwnerOnlyWriteDescriptorResult {
+		NativeOwnerOnlyWriteDescriptorResult::failure("identity_unavailable")
 	}
 }

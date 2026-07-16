@@ -12,8 +12,9 @@ const temporaryPaths: string[] = [];
 
 async function temporaryDirectory(): Promise<string> {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-"));
-	temporaryPaths.push(directory);
-	return directory;
+	const canonical = await fs.realpath(directory);
+	temporaryPaths.push(canonical);
+	return canonical;
 }
 
 afterEach(async () => {
