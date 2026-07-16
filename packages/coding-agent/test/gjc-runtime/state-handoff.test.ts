@@ -444,7 +444,7 @@ describe("gjc state handoff", () => {
 				cwd,
 			);
 			expect(result.status).toBe(1);
-			expect(result.stderr).toMatch(/director(?:y|ies)|EISDIR/i);
+			expect(result.stderr).toMatch(/canonical active snapshot is not a regular file|director(?:y|ies)|EISDIR/i);
 			const caller = parseRequiredJson(await fs.readFile(callerPath, "utf-8"), "caller mode state");
 			expect(caller.current_phase).toBe("interviewing");
 			expect(caller.active).toBe(true);

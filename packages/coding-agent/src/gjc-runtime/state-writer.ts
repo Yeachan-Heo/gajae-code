@@ -956,7 +956,7 @@ async function writeWorkflowEnvelopeAtomicLocked(
 	options: StateWriterOptions | undefined,
 ): Promise<string> {
 	const existing = await readExistingStateForMutation(filePath);
-	if (existing.kind === "corrupt") {
+	if (existing.kind === "corrupt" && options?.audit?.forced !== true) {
 		throw new Error(`Refusing to overwrite corrupt workflow state envelope at ${filePath}: ${existing.error}`);
 	}
 	const stamped = stampWorkflowEnvelopeRevisionAndChecksum(

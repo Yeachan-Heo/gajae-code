@@ -189,22 +189,27 @@ const CanonicalSkillActiveEntrySchema = z
 	.passthrough();
 
 /**
- * Strict write-side schema for the derived canonical active snapshot. Read
- * consumers intentionally retain the lenient `SkillActiveStateSchema`; writers
- * must not mistake a partial or malformed snapshot for an initialized cache.
+ * Strict write-side schema for the derived canonical active snapshot. Legacy
+ * snapshots may omit derived display metadata, but must retain the core shape;
+ * known legacy fields are type-checked and unknown top-level fields fail closed.
  */
 export const CanonicalActiveSnapshotSchema = z
 	.object({
 		version: z.literal(1),
 		active: z.boolean(),
-		skill: z.string(),
-		phase: z.string(),
-		updated_at: z.string(),
+		skill: z.string().optional(),
+		keyword: z.string().optional(),
+		phase: z.string().optional(),
+		activated_at: z.string().optional(),
+		updated_at: z.string().optional(),
+		source: z.string().optional(),
 		session_id: z.string().optional(),
 		thread_id: z.string().optional(),
 		turn_id: z.string().optional(),
+		initialized_mode: skillEnum.optional(),
+		initialized_state_path: z.string().optional(),
 		active_skills: z.array(CanonicalSkillActiveEntrySchema),
-		active_subskills: z.array(ActiveSubskillEntrySchema),
+		active_subskills: z.array(ActiveSubskillEntrySchema).optional(),
 		source_state_revision: z.number().optional(),
 		state_revision: z.number().optional(),
 	})
