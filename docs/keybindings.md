@@ -53,7 +53,7 @@ Set an action to an empty array to disable it:
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
 
 On macOS and native Windows terminals, GJC defaults `app.message.queue` to `Alt+Q`; other platforms use `Alt+Enter`. Windows Terminal and PowerShell commonly reserve `Alt+Enter` for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
-While the agent is streaming on macOS, `Command+Enter` submits the current message once using the opposite of `busyPromptMode`: configured `steer` queues that message, while configured `queue` steers it into the active turn. The shortcut is inactive while idle or compacting and is remappable through `app.message.oppositeBusyMode`.
+While the agent is streaming, `Super+Enter` submits the current message once using the opposite of `busyPromptMode`: configured `steer` queues that message, while configured `queue` steers it into the active turn. The shortcut is inactive while idle or compacting and is remappable through `app.message.oppositeBusyMode`. This portable default depends on the terminal forwarding the Super modifier, not the host operating system.
 
 In the main GJC composer, plain `PageUp` / `PageDown` page the visible transcript viewport instead of browsing prompt history; use `Up` / `Down` or `Ctrl+R` for prompt history. Autocomplete and selector surfaces still use `PageUp` / `PageDown` for list paging while they have focus.
 

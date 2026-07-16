@@ -27,6 +27,18 @@ describe("SessionManager draft", () => {
 		expect(await session.consumeDraft()).toBeNull();
 	});
 
+	it("reads a draft without consuming the sidecar", async () => {
+		using tempDir = TempDir.createSync("@pi-session-draft-read-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.flush();
+		await session.saveDraft("staged text");
+
+		expect(await session.readDraft()).toBe("staged text");
+		expect(await session.readDraft()).toBe("staged text");
+		expect(await session.consumeDraft()).toBe("staged text");
+	});
+
 	it("places the draft inside the artifacts directory so dropSession cleans it", async () => {
 		using tempDir = TempDir.createSync("@pi-session-draft-location-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());

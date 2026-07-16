@@ -917,13 +917,31 @@ export class CommandController {
 	}
 
 	async #runNewSessionFlow(options?: NewSessionOptions, label: string = "New session started"): Promise<boolean> {
-		if (!(await this.ctx.session.newSession(options))) return false;
-
+		const stagedDraft = await this.#stageCompactionQueueDraft();
+		if (!stagedDraft) return false;
+		let switched: boolean;
+		try {
+			switched = await this.ctx.session.newSession(options);
+		} catch (error) {
+			await this.#restoreStagedDraft(stagedDraft);
+			throw error;
+		}
+		if (!switched) {
+			await this.#restoreStagedDraft(stagedDraft);
+			return false;
+		}
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
 		}
 		this.ctx.statusContainer.clear();
+
+		if (this.ctx.session.isCompacting) {
+			this.ctx.session.abortCompaction();
+			while (this.ctx.session.isCompacting) {
+				await Bun.sleep(10);
+			}
+		}
 		this.ctx.resetIrcSidebarSession();
 		this.ctx.resetObserverRegistry();
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
@@ -947,6 +965,41 @@ export class CommandController {
 		this.ctx.ui.requestRender();
 		return true;
 	}
+	#mergeCompactionQueueWithEditorDraft(): string {
+		const queuedText = this.ctx.compactionQueuedMessages
+			.map(message => message.text)
+			.filter(text => text.length > 0)
+			.join("\n\n");
+		const editorText = this.ctx.editor.getText();
+		return queuedText && editorText ? `${queuedText}\n\n${editorText}` : queuedText || editorText;
+	}
+
+	async #stageCompactionQueueDraft(): Promise<{ staged: boolean; previousDraft: string | null } | undefined> {
+		if (this.ctx.compactionQueuedMessages.length === 0) {
+			return { staged: false, previousDraft: null };
+		}
+		try {
+			const previousDraft = await this.ctx.sessionManager.readDraft();
+			await this.ctx.sessionManager.saveDraft(this.#mergeCompactionQueueWithEditorDraft());
+			return { staged: true, previousDraft };
+		} catch (error) {
+			this.ctx.showError(`Failed to save queued draft: ${error instanceof Error ? error.message : String(error)}`);
+			return undefined;
+		}
+	}
+
+	async #restoreStagedDraft(stage: { staged: boolean; previousDraft: string | null }): Promise<boolean> {
+		if (!stage.staged) return true;
+		try {
+			await this.ctx.sessionManager.saveDraft(stage.previousDraft ?? "");
+			return true;
+		} catch (error) {
+			this.ctx.showError(
+				`Failed to restore queued draft: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return false;
+		}
+	}
 
 	async handleClearCommand(): Promise<boolean> {
 		return this.#runNewSessionFlow();
@@ -965,7 +1018,16 @@ export class CommandController {
 				await Bun.sleep(10);
 			}
 		}
-		if (!(await this.ctx.session.clearContext())) return;
+		const stagedDraft = await this.#stageCompactionQueueDraft();
+		if (!stagedDraft) return;
+		let cleared: boolean;
+		try {
+			cleared = await this.ctx.session.clearContext();
+		} catch (error) {
+			await this.#restoreStagedDraft(stagedDraft);
+			throw error;
+		}
+		if (!(await this.#restoreStagedDraft(stagedDraft)) || !cleared) return;
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 
 		this.ctx.statusLine.invalidate();
@@ -977,7 +1039,8 @@ export class CommandController {
 		prepareTranscriptRebuild(this.ctx.ui, "replace-identity");
 		this.ctx.chatContainer.clear();
 		this.ctx.pendingMessagesContainer.clear();
-		this.ctx.compactionQueuedMessages = [];
+		// Keep compaction-local messages available to be replayed after the
+		// same-session context reset.
 		this.ctx.streamingComponent = undefined;
 		this.ctx.streamingMessage = undefined;
 		this.ctx.pendingTools.clear();

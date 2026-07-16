@@ -1,5 +1,5 @@
 import type { Settings } from "../config/settings";
-import type { InteractiveModeContext } from "../modes/types";
+import type { ComposerSubmissionOptions, InteractiveModeContext } from "../modes/types";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
 
@@ -77,6 +77,7 @@ export interface SlashCommandRuntime {
 export interface TuiSlashCommandRuntime {
 	ctx: InteractiveModeContext;
 	handleBackgroundCommand: () => void;
+	composer?: ComposerSubmissionOptions;
 }
 
 /** Unified slash-command spec consumed by both TUI and ACP dispatchers. */

@@ -791,8 +791,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		// resume does not re-restore the same text.
 		try {
 			const draft = await this.sessionManager.consumeDraft();
-			if (draft && !this.editor.getText()) {
-				this.editor.setText(draft);
+			if (draft) {
+				const editorText = this.editor.getText();
+				this.editor.setText(editorText ? `${draft}\n\n${editorText}` : draft);
 				this.updateEditorChrome();
 				this.ui.requestRender();
 			}
@@ -2402,6 +2403,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.isInitialized = false;
 		}
 	}
+	#mergeCompactionQueueWithDraft(editorText: string): string {
+		const queuedText = this.compactionQueuedMessages
+			.map(message => message.text)
+			.filter(text => text.length > 0)
+			.join("\n\n");
+		return queuedText && editorText ? `${queuedText}\n\n${editorText}` : queuedText || editorText;
+	}
 
 	async shutdown(): Promise<void> {
 		if (this.#isShuttingDown) return;
@@ -2410,7 +2418,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Snapshot the editor before any teardown empties it. Persisting the draft
 		// here covers Ctrl+D shutdown with non-empty text; for /exit the editor is
 		// already cleared so saveDraft("") just removes any stale sidecar.
-		const draftText = this.editor.getText();
+		const draftText = this.#mergeCompactionQueueWithDraft(this.editor.getText());
 
 		// Flush pending session writes before shutdown
 		await this.sessionManager.flush();

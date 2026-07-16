@@ -78,8 +78,8 @@ export function defaultClipboardPasteImageKeysForPlatform(platform: NodeJS.Platf
 	return platform === "win32" ? "alt+v" : "ctrl+v";
 }
 
-export function defaultOppositeBusyModeKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId[] {
-	return platform === "darwin" ? ["super+enter"] : [];
+export function defaultOppositeBusyModeKeysForPlatform(_platform: NodeJS.Platform = process.platform): KeyId[] {
+	return ["super+enter"];
 }
 
 /**

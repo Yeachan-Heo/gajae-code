@@ -441,7 +441,8 @@ describe("InteractiveMode.setEditorComponent", () => {
 	}
 
 	function expectedOppositeBusyModeHint(action: "Steer" | "Queue"): string {
-		return process.platform === "darwin" ? ` · Command+Enter: ${action} once` : "";
+		const shortcut = process.platform === "darwin" ? "Command+Enter" : "Super+Enter";
+		return ` · ${shortcut}: ${action} once`;
 	}
 
 	function renderedPlaceholder(): string {
