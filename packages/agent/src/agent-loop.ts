@@ -561,36 +561,54 @@ class ManagedAttemptTransaction {
 		this.#discarded = true;
 	}
 
-	#stage(event: AgentEvent): void {
-		let snapshot = managedAttemptSnapshot(event);
-		let bytes: number | undefined;
-		try {
-			bytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
-		} catch {
-			// Cyclic (structured-cloneable) or otherwise JSON-hostile snapshot:
-			// sanitize so byte accounting stays cycle-safe instead of mislabeling
-			// the event as a retryable over-limit attempt failure.
-			try {
-				snapshot = sanitizedDetachedClone(snapshot);
-				bytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
-			} catch {
-				bytes = undefined;
-			}
-		}
-		if (bytes === undefined) {
-			// The sanitizer's output is total (detached, JSON-safe), so this is
-			// unreachable unless the sanitizer itself regresses. Fail as a
-			// dedicated local error: it carries no transport facts, so it is
-			// non-retryable and can never be misattributed to the provider.
-			this.discard();
-			throw new ManagedAttemptSnapshotError();
-		}
-		if (
+	#wouldOverflow(bytes: number): boolean {
+		return (
 			this.#stagedEventCount + 1 > MANAGED_ATTEMPT_MAX_STAGED_EVENTS ||
 			this.#stagedBytes + bytes > MANAGED_ATTEMPT_MAX_STAGED_BYTES
-		) {
+		);
+	}
+
+	#stage(event: AgentEvent): void {
+		// Measure the raw event FIRST so an oversized payload is rejected
+		// before the snapshot duplicates it — the staged-byte cap exists to
+		// bound memory, so cloning ahead of the check would defeat it.
+		// Cyclic/JSON-hostile events cannot be pre-measured; only those fall
+		// through to snapshot-then-measure, where the sanitized detached form
+		// is the cycle-safe estimator.
+		let bytes: number | undefined;
+		try {
+			bytes = managedAttemptTextEncoder.encode(JSON.stringify(event)).byteLength;
+		} catch {
+			bytes = undefined;
+		}
+		if (bytes !== undefined && this.#wouldOverflow(bytes)) {
 			this.discard();
 			throw new ManagedAttemptBufferOverflowError();
+		}
+		let snapshot = managedAttemptSnapshot(event);
+		if (bytes === undefined) {
+			try {
+				bytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
+			} catch {
+				try {
+					snapshot = sanitizedDetachedClone(snapshot);
+					bytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
+				} catch {
+					bytes = undefined;
+				}
+			}
+			if (bytes === undefined) {
+				// The sanitizer's output is total (detached, JSON-safe), so this
+				// is unreachable unless the sanitizer itself regresses. Fail as a
+				// dedicated local error: it carries no transport facts, so it is
+				// non-retryable and can never be misattributed to the provider.
+				this.discard();
+				throw new ManagedAttemptSnapshotError();
+			}
+			if (this.#wouldOverflow(bytes)) {
+				this.discard();
+				throw new ManagedAttemptBufferOverflowError();
+			}
 		}
 		this.#batch.push({ type: "event", event: snapshot });
 		this.#stagedEventCount += 1;
