@@ -3190,7 +3190,7 @@ describe("telegram daemon", () => {
 		expect(fs.readdirSync(daemonPaths(agentDir).dir).join("\n")).not.toContain("secret-token");
 	});
 
-	test("heartbeat renew and release helpers honor owner id", async () => {
+	test("release requires the owner identity as well as its opaque owner id", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
@@ -3202,9 +3202,41 @@ describe("telegram daemon", () => {
 		});
 		expect(await renewDaemonHeartbeat({ settings: s, ownerId: "other" })).toBe(false);
 		expect(await renewDaemonHeartbeat({ settings: s, ownerId: "owner" })).toBe(true);
-		await releaseDaemonOwnership({ settings: s, ownerId: "other" });
+
+		await releaseDaemonOwnership({
+			settings: s,
+			ownerId: "owner",
+			tokenFingerprint: "foreign-fp",
+			chatId: "42",
+			pid: process.pid,
+		});
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
-		await releaseDaemonOwnership({ settings: s, ownerId: "owner" });
+		expect(
+			await acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "foreign-fp",
+				chatId: "42",
+				pid: process.pid,
+				randomId: () => "owner",
+			}),
+		).toMatchObject({ acquired: false, blocked: true });
+
+		await releaseDaemonOwnership({
+			settings: s,
+			ownerId: "owner",
+			tokenFingerprint: "fp",
+			chatId: "99",
+			pid: process.pid,
+		});
+		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
+
+		await releaseDaemonOwnership({
+			settings: s,
+			ownerId: "owner",
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: process.pid,
+		});
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
 	});
 
@@ -3272,6 +3304,7 @@ describe("telegram daemon", () => {
 		releasePoll();
 		await runPromise;
 		expect(timers.size).toBe(0);
+		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
 	});
 	test("scan timer connects new sessions while a getUpdates long-poll is in flight", async () => {
 		FakeWs.instances = [];

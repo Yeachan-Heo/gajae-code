@@ -646,13 +646,24 @@ export async function renewDaemonHeartbeat(input: {
 export async function releaseDaemonOwnership(input: {
 	settings: Settings;
 	ownerId: string;
+	/** Bind release to the Telegram identity that acquired the lock. */
+	tokenFingerprint: string;
+	chatId: string;
+	/** Require the current daemon PID after the launcher-to-daemon PID rebind. */
+	pid: number;
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 }): Promise<void> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	const state = await readJson<DaemonState>(fsImpl, paths.state);
-	if (state?.ownerId !== input.ownerId) return;
+	if (
+		!state ||
+		state.ownerId !== input.ownerId ||
+		!ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) ||
+		state.pid !== input.pid
+	)
+		return;
 	await writeJsonAtomic(fsImpl, paths.state, { ...state, stoppedAt: (input.now ?? Date.now)() });
 	await fsImpl.unlink(paths.lock).catch(() => undefined);
 }
@@ -4036,6 +4047,9 @@ export class TelegramNotificationDaemon {
 			await releaseDaemonOwnership({
 				settings: this.opts.settings,
 				ownerId: this.opts.ownerId,
+				tokenFingerprint: tokenFingerprint(this.opts.botToken),
+				chatId: this.opts.chatId,
+				pid: this.opts.pid ?? process.pid,
 				fs: this.fsImpl,
 				now: this.opts.now,
 			});
