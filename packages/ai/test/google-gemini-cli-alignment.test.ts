@@ -281,11 +281,7 @@ describe("Google Gemini CLI alignment", () => {
 				status: 503,
 				providerCode: "server_error",
 			});
-			expect(
-				result.transportFailure?.headers instanceof Headers
-					? result.transportFailure.headers.get("retry-after")
-					: undefined,
-			).toBe("120");
+			expect(result.transportFailure?.headers).toEqual({ "retry-after": "120" });
 			expect(classifyFallbackTrigger(result.transportFailure)).toEqual({ class: "server", retryAfterMs: 120_000 });
 		});
 

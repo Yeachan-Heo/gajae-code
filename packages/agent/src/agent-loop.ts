@@ -2,6 +2,8 @@
  * Agent loop that works with AgentMessage throughout.
  * Transforms to Message[] only at the LLM call boundary.
  */
+
+import { types as nodeUtilTypes } from "node:util";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -73,6 +75,20 @@ class ManagedAttemptBufferOverflowError extends Error {
 	constructor() {
 		super("Managed fallback attempt exceeded the provisional event buffer limit");
 		this.name = "ManagedAttemptBufferOverflowError";
+	}
+}
+
+/**
+ * Local snapshot-machinery failure. Deliberately carries no transport facts
+ * or status, so managed fallback classification never treats it as a provider
+ * retry trigger — it fails fast instead of burning the fallback chain.
+ */
+class ManagedAttemptSnapshotError extends Error {
+	constructor() {
+		super(
+			"Managed fallback attempt could not produce a serializable event snapshot (local snapshot bug, not a provider failure)",
+		);
+		this.name = "ManagedAttemptSnapshotError";
 	}
 }
 
@@ -331,9 +347,156 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
-/** Capture an event-time value because providers commonly mutate partial messages in place. */
+/**
+ * Hard work budget for one degraded snapshot: every visited node AND every
+ * enumerated own key is debited against this budget before it is processed
+ * (accessor keys and re-visits of shared objects included), and any remainder
+ * collapses to the deterministic `"[truncated]"` placeholder. Well above
+ * ordinary streamed events; it only bounds hostile graphs.
+ */
+export const MANAGED_SNAPSHOT_MAX_NODES = 100_000;
+
+/**
+ * Cycle-aware deep clone that always returns a detached, JSON-serializable
+ * value. Used whenever a detached snapshot cannot be safely obtained or
+ * measured: after `structuredClone` fails, and again when a (successfully
+ * cloned) snapshot cannot be serialized for byte accounting.
+ *
+ * Totality rules — the walk must never dispatch through payload-controlled
+ * code, throw, or do unbounded work:
+ * - proxies (revoked or live) are collapsed to `"[unserializable]"` BEFORE
+ *   any reflective operation, so `ownKeys`/descriptor traps are never
+ *   dispatched (`util.types.isProxy` identifies proxies without touching
+ *   their handlers);
+ * - only intrinsics are used on the remaining ordinary objects (no
+ *   `input.map`, no `input.getTime()`, no `input.length` reads);
+ * - arrays are enumerated through their own present keys, never their
+ *   declared length, so a sparse array cannot force a dense allocation
+ *   proportional to `length`; sparse/exotic arrays degrade to a null-proto
+ *   record of their present indices, and the dense-shape decision verifies
+ *   every index against its ordinal;
+ * - the walk debits `maxNodes` budget per visited node and per enumerated
+ *   key before processing it; anything beyond the budget becomes
+ *   `"[truncated]"` (the one linear primitive per visited node is a single
+ *   `Object.keys` call on a non-proxy object the process already holds);
+ * - property values are read via own-property descriptors, so accessors are
+ *   never invoked (a snapshot must not cause observable side effects) and are
+ *   replaced with `"[accessor]"`;
+ * - functions/symbols and any property that cannot be read safely become
+ *   short placeholders, `bigint` becomes its decimal string, and references
+ *   back into the current path collapse to `"[Circular]"`;
+ * - records are built on a null prototype so a `__proto__` key cannot mutate
+ *   the clone's prototype chain.
+ *
+ * Exported for direct regression coverage of the budget accounting; runtime
+ * callers use the default budget via {@link managedAttemptSnapshot}.
+ */
+export function sanitizedDetachedClone<T>(value: T, maxNodes: number = MANAGED_SNAPSHOT_MAX_NODES): T {
+	const path = new Set<object>();
+	let budget = maxNodes;
+	const takeBudget = (units: number): boolean => {
+		if (budget < units) {
+			budget = 0;
+			return false;
+		}
+		budget -= units;
+		return true;
+	};
+	const walk = (input: unknown): unknown => {
+		if (!takeBudget(1)) return "[truncated]";
+		if (typeof input === "bigint") return String(input);
+		if (typeof input === "function" || typeof input === "symbol") return "[unserializable]";
+		if (input === null || typeof input !== "object") return input;
+		if (nodeUtilTypes.isProxy(input)) return "[unserializable]";
+		if (path.has(input)) return "[Circular]";
+		path.add(input);
+		const readOwnValue = (key: string): unknown => {
+			try {
+				const descriptor = Object.getOwnPropertyDescriptor(input, key);
+				return descriptor === undefined
+					? "[unserializable]"
+					: "value" in descriptor
+						? walk(descriptor.value)
+						: "[accessor]";
+			} catch {
+				return "[unserializable]";
+			}
+		};
+		try {
+			if (Array.isArray(input)) {
+				// Own present keys only: iterating the declared length would
+				// densify holes, and `Object.keys` is proportional to the
+				// elements that actually exist.
+				const keys = Object.keys(input);
+				if (!takeBudget(keys.length)) return "[truncated]";
+				const indexKeys: string[] = [];
+				let hasExtraProps = false;
+				for (const key of keys) {
+					const index = Number(key);
+					if (String(index) === key && index >= 0) indexKeys.push(key);
+					else hasExtraProps = true;
+				}
+				let dense = !hasExtraProps;
+				if (dense) {
+					for (let ordinal = 0; ordinal < indexKeys.length; ordinal++) {
+						if (Number(indexKeys[ordinal]) !== ordinal) {
+							dense = false;
+							break;
+						}
+					}
+				}
+				if (dense) {
+					const out: unknown[] = [];
+					for (const key of indexKeys) out.push(readOwnValue(key));
+					return out;
+				}
+				const sparse: Record<string, unknown> = Object.create(null);
+				for (const key of indexKeys) sparse[key] = readOwnValue(key);
+				return sparse;
+			}
+			let dateTime: number | undefined;
+			try {
+				// `isDate` checks the [[DateValue]] internal slot without walking
+				// the prototype chain — `instanceof Date` would dispatch a proxy
+				// prototype's getPrototypeOf trap and do unbudgeted linear work
+				// on deep ordinary chains.
+				dateTime = nodeUtilTypes.isDate(input) ? Date.prototype.getTime.call(input) : undefined;
+			} catch {
+				dateTime = undefined;
+			}
+			if (dateTime !== undefined) return new Date(dateTime);
+			const keys = Object.keys(input);
+			if (!takeBudget(keys.length)) return "[truncated]";
+			const record: Record<string, unknown> = Object.create(null);
+			for (const key of keys) record[key] = readOwnValue(key);
+			return record;
+		} catch {
+			// Brand checks / key enumeration on exotic objects can throw;
+			// collapse only this node, not its ancestors.
+			return "[unserializable]";
+		} finally {
+			path.delete(input);
+		}
+	};
+	return walk(value) as T;
+}
+
+/**
+ * Capture an event-time value because providers commonly mutate partial
+ * messages in place. The snapshot MUST always be detached from the caller's
+ * object graph — replaying a live reference would surface the final mutation
+ * instead of the event-time value. It must also never throw: staged payloads
+ * can carry non-cloneable objects during provisional assistant streaming
+ * (e.g. a live `Headers` inside a provider error's `transportFailure` from a
+ * legacy payload), and a thrown `DataCloneError` here would mask the real
+ * provider outcome and burn the whole fallback chain.
+ */
 function managedAttemptSnapshot<T>(value: T): T {
-	return structuredClone(value);
+	try {
+		return structuredClone(value);
+	} catch {
+		return sanitizedDetachedClone(value);
+	}
 }
 
 /**
@@ -399,11 +562,28 @@ class ManagedAttemptTransaction {
 	}
 
 	#stage(event: AgentEvent): void {
-		let bytes: number;
+		let snapshot = managedAttemptSnapshot(event);
+		let bytes: number | undefined;
 		try {
-			bytes = managedAttemptTextEncoder.encode(JSON.stringify(event)).byteLength;
+			bytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
 		} catch {
-			bytes = MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1;
+			// Cyclic (structured-cloneable) or otherwise JSON-hostile snapshot:
+			// sanitize so byte accounting stays cycle-safe instead of mislabeling
+			// the event as a retryable over-limit attempt failure.
+			try {
+				snapshot = sanitizedDetachedClone(snapshot);
+				bytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
+			} catch {
+				bytes = undefined;
+			}
+		}
+		if (bytes === undefined) {
+			// The sanitizer's output is total (detached, JSON-safe), so this is
+			// unreachable unless the sanitizer itself regresses. Fail as a
+			// dedicated local error: it carries no transport facts, so it is
+			// non-retryable and can never be misattributed to the provider.
+			this.discard();
+			throw new ManagedAttemptSnapshotError();
 		}
 		if (
 			this.#stagedEventCount + 1 > MANAGED_ATTEMPT_MAX_STAGED_EVENTS ||
@@ -412,7 +592,7 @@ class ManagedAttemptTransaction {
 			this.discard();
 			throw new ManagedAttemptBufferOverflowError();
 		}
-		this.#batch.push({ type: "event", event: managedAttemptSnapshot(event) });
+		this.#batch.push({ type: "event", event: snapshot });
 		this.#stagedEventCount += 1;
 
 		this.#stagedBytes += bytes;
