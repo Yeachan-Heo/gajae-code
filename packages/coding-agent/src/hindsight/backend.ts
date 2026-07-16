@@ -48,23 +48,23 @@ export const hindsightBackend: MemoryBackend = {
 		if (options.taskDepth > 0) {
 			const parent = options.parentHindsightSessionState;
 			if (!parent) return;
-			const previous = session.setHindsightSessionState(
-				new HindsightSessionState({
-					sessionId,
-					client: parent.client,
-					bankId: parent.bankId,
-					retainTags: parent.retainTags,
-					recallTags: parent.recallTags,
-					recallTagsMatch: parent.recallTagsMatch,
-					config: parent.config,
-					session,
-					missionsSet: parent.missionsSet,
-					lastRetainedTurn: 0,
-					hasRecalledForFirstTurn: true,
-					aliasOf: parent,
-				}),
-			);
+			const replacement = new HindsightSessionState({
+				sessionId,
+				client: parent.client,
+				bankId: parent.bankId,
+				retainTags: parent.retainTags,
+				recallTags: parent.recallTags,
+				recallTagsMatch: parent.recallTagsMatch,
+				config: parent.config,
+				session,
+				missionsSet: parent.missionsSet,
+				lastRetainedTurn: 0,
+				hasRecalledForFirstTurn: true,
+				aliasOf: parent,
+			});
+			const previous = session.getHindsightSessionState();
 			await previous?.dispose();
+			session.setHindsightSessionState(replacement);
 			return;
 		}
 
@@ -91,10 +91,12 @@ export const hindsightBackend: MemoryBackend = {
 			hasRecalledForFirstTurn: false,
 		});
 
-		// Cleanup any stale state for this session (defensive — prevents leaks
-		// when a session is reused without going through dispose).
-		const previous = session.setHindsightSessionState(state);
+		// Close and drain the old queue while it still owns this session. Closing
+		// rejects concurrent enqueues, so no retain can land between the final flush
+		// and replacement.
+		const previous = session.getHindsightSessionState();
 		await previous?.dispose();
+		session.setHindsightSessionState(state);
 		state.attachSessionListeners();
 
 		// Kick off mental-model bootstrap. Resolves asynchronously; the first

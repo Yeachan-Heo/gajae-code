@@ -78,9 +78,12 @@ describe("ctx-cache adversarial hindsight and reminder behavior", () => {
 		});
 		state.lastRecallSnippet = "A";
 		expect(state.getRecallSnippetForInjection()).toBe("A");
+		expect(state.getRecallSnippetForInjection()).toBe("A");
+		expect(state.markRecallSnippetInjected("A")).toBe(true);
 		expect(state.getRecallSnippetForInjection()).toBeUndefined();
 		state.lastRecallSnippet = "B";
 		expect(state.getRecallSnippetForInjection()).toBe("B");
+		expect(state.markRecallSnippetInjected("B")).toBe(true);
 		state.lastRecallSnippet = "A";
 		expect(state.getRecallSnippetForInjection()).toBe("A");
 

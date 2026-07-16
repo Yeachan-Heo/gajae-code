@@ -269,17 +269,28 @@ function readBasePath(path: string): string {
 
 type ReadLineRange = { start: number; end: number };
 
-/** Parse trailing numeric read selectors; mode selectors do not select lines. */
+const DEFAULT_READ_LINE_LIMIT = 500;
+
+/** Parse trailing read selectors using the read tool's actual bounded default. */
 function readLineRanges(path: string): ReadLineRange[] {
 	let target = path;
-	while (/:(?:raw|conflicts)$/.test(target)) target = target.replace(/:(?:raw|conflicts)$/, "");
+	let raw = false;
+	while (/:(?:raw|conflicts)$/.test(target)) {
+		raw ||= target.endsWith(":raw");
+		target = target.replace(/:(?:raw|conflicts)$/, "");
+	}
 	const match = target.match(/:(\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/);
-	if (!match) return [];
+	if (!match) return raw ? [{ start: 1, end: Number.POSITIVE_INFINITY }] : [];
 	return match[1].split(",").flatMap(part => {
 		const range = part.match(/^(\d+)(?:([-+])(\d+))?$/);
 		if (!range) return [];
 		const start = Number(range[1]);
-		const end = range[2] === "+" ? start + Number(range[3]) - 1 : Number(range[3] ?? Number.POSITIVE_INFINITY);
+		const end =
+			range[2] === "+"
+				? start + Number(range[3]) - 1
+				: range[2] === "-"
+					? Number(range[3])
+					: start + DEFAULT_READ_LINE_LIMIT - 1;
 		return start > 0 && end >= start ? [{ start, end }] : [];
 	});
 }

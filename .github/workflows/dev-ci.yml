@@ -324,6 +324,9 @@ jobs:
         with:
           name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: .
+      - name: Validate canonical affected plan
+        if: ${{ needs.affected-plan.result == 'success' }}
+        run: bun scripts/ci-dev-affected.ts --validate-plan
       - name: Download shard completion receipts
         if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4

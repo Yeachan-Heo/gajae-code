@@ -113,6 +113,17 @@ describe("prepareCompaction scaled keep window", () => {
 		expect(prep?.recentMessages.length ?? 0).toBeGreaterThanOrEqual(5_000);
 	});
 
+	test("caps scaled retention below an explicit threshold with reserve headroom", () => {
+		const configured = {
+			...settings(40_000),
+			thresholdTokens: 50_000,
+			reserveTokens: 16_384,
+		};
+		const prep = prepareCompaction(buildEntries(500, 8_000), configured, { contextWindow: 200_000 });
+		expect(prep).toBeDefined();
+		expect(prep?.tokenCorrection.keepRecentTokensCorrected).toBe(20_000);
+	});
+
 	test("a context window below 66k uses the legacy fixed keepRecentTokens value", () => {
 		const prep = prepareCompaction(buildEntries(), settings(100), { contextWindow: 65_000 });
 		expect(prep?.tokenCorrection.keepRecentTokensCorrected).toBe(100);

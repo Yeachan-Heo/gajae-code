@@ -1138,29 +1138,41 @@ export function prepareCompaction(
 	// counts system+tools+full history while estimatedTokens counted only the
 	// post-boundary slice, so it was confounded and only ever shrank the window.
 	// Here the correction is bidirectional and clamped to [0.5, 2].
-	const keepRecentTokens = settings.keepRecentTokens;
+	const configuredKeepRecentTokens = settings.keepRecentTokens;
+	const contextWindow = options.contextWindow;
+	const thresholdSafeKeepRecentTokens =
+		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 1
+			? Math.max(
+					1,
+					resolveThresholdTokens(contextWindow, settings) - effectiveReserveTokens(contextWindow, settings, 0),
+				)
+			: configuredKeepRecentTokens;
+	const keepRecentTokens = Math.min(configuredKeepRecentTokens, thresholdSafeKeepRecentTokens);
 	// Preserve the legacy fixed window for smaller models. At 66k and above,
-	// retain 30% of the model context (while the explicit setting remains a floor).
+	// retain up to 30% of the model context, but never enough to leave the
+	// post-compaction prompt immediately above its configured threshold.
 	const scaledKeepRecentTokens =
-		options.contextWindow !== undefined && Number.isFinite(options.contextWindow) && options.contextWindow >= 66_000
-			? Math.max(keepRecentTokens, Math.floor(options.contextWindow * 0.3))
+		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow >= 66_000
+			? Math.min(thresholdSafeKeepRecentTokens, Math.max(keepRecentTokens, Math.floor(contextWindow * 0.3)))
 			: keepRecentTokens;
 	const rawRatio = options.tokenCorrectionRatio;
 	const appliedRatio =
 		rawRatio !== undefined && Number.isFinite(rawRatio) && rawRatio > 0
 			? Math.min(TOKEN_CORRECTION_MAX_RATIO, Math.max(TOKEN_CORRECTION_MIN_RATIO, rawRatio))
 			: 1;
-	// A scaled window can exceed a short session entirely, especially for a manual
-	// compaction on a large-context model. Fall back to the explicit floor in that
-	// case so an otherwise-valid manual/idle/overflow compaction can still reduce
-	// history; normal threshold compaction is already well above the scaled window.
+	// Preserve an explicit keep floor that already covers the whole history: manual
+	// and emergency callers rely on prepareCompaction returning undefined rather
+	// than manufacturing a summary with no useful reduction. Otherwise, a scaled
+	// window that exceeds a short history falls back to the threshold-safe floor.
 	const historyTokens = pathEntries
 		.slice(boundaryStart, boundaryEnd)
 		.reduce((tokens, entry) => tokens + estimateEntryTokens(entry), 0);
 	const effectiveKeepRecentTokens =
-		scaledKeepRecentTokens > keepRecentTokens && scaledKeepRecentTokens > historyTokens
-			? keepRecentTokens
-			: scaledKeepRecentTokens;
+		configuredKeepRecentTokens > historyTokens
+			? configuredKeepRecentTokens
+			: scaledKeepRecentTokens > keepRecentTokens && scaledKeepRecentTokens > historyTokens
+				? keepRecentTokens
+				: scaledKeepRecentTokens;
 	const keepRecentTokensCorrected = Math.max(1, Math.round(effectiveKeepRecentTokens / appliedRatio));
 
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokensCorrected);

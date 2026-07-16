@@ -151,6 +151,24 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(containing.id);
 	});
 
+	it("does not let a bounded bare selector supersede an unseen distant range", () => {
+		const entries: SessionEntry[] = [];
+		const distant = pair(entries, "c1", "read", { path: "src/a.ts:10000-10050" });
+		const bounded = pair(entries, "c2", "read", { path: "src/a.ts:1" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(distant.id);
+		expect(ids).not.toContain(bounded.id);
+	});
+
+	it("lets a raw read supersede an earlier contained range", () => {
+		const entries: SessionEntry[] = [];
+		const ranged = pair(entries, "c1", "read", { path: "src/a.ts:10000-10050" });
+		const raw = pair(entries, "c2", "read", { path: "src/a.ts:raw" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(ranged.id);
+		expect(ids).not.toContain(raw.id);
+	});
+
 	it("partially overlapping read ranges do not supersede each other", () => {
 		const entries: SessionEntry[] = [];
 		const first = pair(entries, "c1", "read", { path: "src/a.ts:50-100" });

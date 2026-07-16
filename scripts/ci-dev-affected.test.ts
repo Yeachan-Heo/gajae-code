@@ -80,6 +80,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("pi_natives.linux-x64-baseline.node");
 		expect(workflow).toContain("pi_natives.linux-x64-modern.node");
 		expect(workflow).toContain("dev-affected-native-v2-baseline-modern-");
+		const aggregateWorkflow = workflow.slice(workflow.indexOf("  affected:\n"));
+		expect(aggregateWorkflow).toContain("name: Validate canonical affected plan");
+		expect(aggregateWorkflow).toContain("run: bun scripts/ci-dev-affected.ts --validate-plan");
 	});
 });
 
@@ -330,6 +333,29 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(missingHead.exitCode).toBe(1);
 		expect(missingHead.stderr).toContain("source head");
 		expect(missingHead.stderr).toContain("is not available");
+	});
+
+	test("PR planning uses the event base SHA when the mutable base ref has moved", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-pr-base-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
+		const base = Bun.spawnSync(["git", "rev-parse", "HEAD^"], { cwd: repoRoot }).stdout.toString().trim();
+		const result = await runScript(["--matrix-json"], "", {
+			GITHUB_EVENT_NAME: "pull_request",
+			GITHUB_BASE_REF: "ci-dev-affected-base-ref-moved",
+			GITHUB_BASE_SHA: base,
+			GITHUB_SHA: "f".repeat(40),
+			CI_DEV_SOURCE_SHA: head,
+			GITHUB_OUTPUT: outputFile,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(JSON.parse(result.stdout.trim())).toBeInstanceOf(Array);
+		const output = await Bun.file(outputFile).text();
+		expect(output).toContain(`plan_source_sha=${head}`);
+		expect(output).toContain("plan_digest=");
+		expect(await Bun.file(path.join(repoRoot, ".ci-dev-affected-plan.json")).exists()).toBe(true);
 	});
 
 	test("Cargo selection includes transitive dependents and never emits vendored shards", async () => {

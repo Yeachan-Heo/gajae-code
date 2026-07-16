@@ -251,15 +251,23 @@ export class HindsightSessionState {
 	getRecallSnippet(): string | undefined {
 		return this.aliasOf ? this.aliasOf.getRecallSnippet() : this.lastRecallSnippet;
 	}
-	/** Return the recall payload once per distinct content value for transcript injection. */
+	/** Return the current recall payload without consuming its one-shot injection eligibility. */
 	getRecallSnippetForInjection(): string | undefined {
 		if (this.aliasOf) return this.aliasOf.getRecallSnippetForInjection();
 		const snippet = this.lastRecallSnippet;
 		if (!snippet) return undefined;
 		const hash = createHash("sha256").update(snippet).digest("hex");
-		if (hash === this.lastInjectedRecallSnippetHash) return undefined;
+		return hash === this.lastInjectedRecallSnippetHash ? undefined : snippet;
+	}
+
+	/** Mark a recall payload consumed only after it has been accepted for provider injection. */
+	markRecallSnippetInjected(snippet: string): boolean {
+		if (this.aliasOf) return this.aliasOf.markRecallSnippetInjected(snippet);
+		if (snippet !== this.lastRecallSnippet) return false;
+		const hash = createHash("sha256").update(snippet).digest("hex");
+		if (hash === this.lastInjectedRecallSnippetHash) return false;
 		this.lastInjectedRecallSnippetHash = hash;
-		return snippet;
+		return true;
 	}
 
 	enqueueRetain(content: string, context?: string): void {

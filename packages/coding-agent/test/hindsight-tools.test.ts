@@ -132,11 +132,14 @@ describe("Hindsight recall injection", () => {
 		registeredState = undefined;
 	});
 
-	it("injects an unchanged recall snippet only once", () => {
+	it("keeps recall eligible until the provider injection is accepted", () => {
 		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
 		registerState(client);
 		registeredState!.lastRecallSnippet = "<memories>fact</memories>";
 		expect(registeredState!.getRecallSnippetForInjection()).toBe("<memories>fact</memories>");
+		// A cancelled preflight only reads the snippet; a retry must still receive it.
+		expect(registeredState!.getRecallSnippetForInjection()).toBe("<memories>fact</memories>");
+		expect(registeredState!.markRecallSnippetInjected("<memories>fact</memories>")).toBe(true);
 		expect(registeredState!.getRecallSnippetForInjection()).toBeUndefined();
 		registeredState!.lastRecallSnippet = "<memories>updated fact</memories>";
 		expect(registeredState!.getRecallSnippetForInjection()).toBe("<memories>updated fact</memories>");

@@ -293,23 +293,30 @@ function requestsForkContext(
 	return FORK_CONTEXT_REQUEST_MODE_SET.has(task.inheritContext);
 }
 
+function normalizeForkContextCap(value: number | undefined, fallback: number, maximum: number): number {
+	if (value === undefined || !Number.isFinite(value) || value <= 0) return fallback;
+	return Math.min(maximum, Math.max(1, Math.trunc(value)));
+}
+
 function resolveForkSeedParamsForMode(
 	mode: ForkContextMode,
 	configuredMaxMessages: number | undefined,
 	configuredMaxTokens: number,
 	model: Model | undefined,
-): { maxMessages: number; maxTokens: number } | undefined {
+): { maxMessages: number; maxTokens: number; preserveLatestUser?: boolean } | undefined {
 	const capMessages = (defaultMaxMessages: number): number =>
-		configuredMaxMessages === undefined
-			? defaultMaxMessages
-			: Math.min(defaultMaxMessages, Math.max(0, Math.trunc(configuredMaxMessages)));
+		normalizeForkContextCap(configuredMaxMessages, defaultMaxMessages, defaultMaxMessages);
 	switch (mode) {
 		case "none":
 			return undefined;
 		case "receipt":
 			return { maxMessages: 1, maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.receipt };
 		case "last-turn":
-			return { maxMessages: 2, maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE["last-turn"] };
+			return {
+				maxMessages: 2,
+				maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE["last-turn"],
+				preserveLatestUser: true,
+			};
 		case "bounded":
 			return { maxMessages: capMessages(50), maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.bounded };
 		case "full":
@@ -343,9 +350,12 @@ function validateForkContextRequests(
 }
 
 export function resolveForkContextMaxTokens(configured: number, model: Model | undefined): number {
-	if (configured > 0) return Math.trunc(configured);
-	const contextWindow = model?.contextWindow ?? 0;
-	return contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.15)) : 15_000;
+	const contextWindow = model?.contextWindow;
+	const fallback =
+		contextWindow && Number.isFinite(contextWindow) && contextWindow > 0
+			? Math.max(1, Math.floor(contextWindow * 0.15))
+			: 15_000;
+	return normalizeForkContextCap(configured, fallback, Number.MAX_SAFE_INTEGER);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -633,6 +643,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const uniqueId = validateAllocatedTaskId(uniqueIds[i] ?? "");
 			const frozenForkSeed = await buildForkContextSeedForTask(taskItem);
+			if (signal?.aborted) {
+				for (let skippedIndex = i; skippedIndex < taskItems.length; skippedIndex++) {
+					const skippedTask = taskItems[skippedIndex]!;
+					failedSchedules.push(`${skippedTask.id}: cancelled before scheduling`);
+					const skippedProgress = progressByTaskId.get(skippedTask.id);
+					if (skippedProgress) skippedProgress.status = "aborted";
+				}
+				break;
+			}
 			if (frozenForkSeed) frozenForkSeeds.set(uniqueId, frozenForkSeed);
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
 			const label = uniqueId;

@@ -117,6 +117,39 @@ describe("hindsightBackend.start", () => {
 		expect(session.getHindsightSessionState()?.bankId).toBeTruthy();
 	});
 
+	it("flushes queued retains before replacing the state that owns the session", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+		});
+		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockResolvedValue({} as never);
+		const session = makeFakeSession({ sessionId: "s-replace" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		const previous = session.getHindsightSessionState()!;
+		previous.enqueueRetain("must flush before state replacement");
+
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+
+		expect(retainBatchSpy).toHaveBeenCalledWith(
+			previous.bankId,
+			expect.arrayContaining([expect.objectContaining({ content: "must flush before state replacement" })]),
+			expect.objectContaining({ async: true }),
+		);
+		expect(session.getHindsightSessionState()).not.toBe(previous);
+	});
+
 	it("rekeys state when the same AgentSession gets a new session id (resume/switch)", async () => {
 		const settings = Settings.isolated({
 			"memory.backend": "hindsight",

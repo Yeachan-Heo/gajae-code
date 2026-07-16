@@ -129,6 +129,7 @@ export interface ForkContextSeed {
 export interface ForkContextSeedOptions {
 	maxMessages: number;
 	maxTokens: number;
+	preserveLatestUser?: boolean;
 	cacheIdentity?: string;
 	signal?: AbortSignal;
 }
@@ -2206,25 +2207,12 @@ export class AgentSession {
 	}
 
 	async buildForkContextSeed(options: ForkContextSeedOptions): Promise<ForkContextSeed> {
-		const maxMessages = Math.min(500, Math.max(0, Math.trunc(options.maxMessages)));
-		const maxTokens = Math.max(0, Math.trunc(options.maxTokens));
-		if (maxMessages <= 0 || maxTokens <= 0) {
-			return {
-				messages: [],
-				agentMessages: [],
-				metadata: {
-					sourceSessionId: this.sessionId,
-					parentMessageCount: this.messages.length,
-					includedMessages: 0,
-					skippedMessages: 0,
-					approximateTokens: 0,
-					maxMessages,
-					maxTokens,
-					skippedReasons: {},
-				},
-				cacheIdentity: options.cacheIdentity ?? this.sessionId,
-			};
-		}
+		const normalizeCap = (value: number, maximum: number): number => {
+			if (!Number.isFinite(value)) return 1;
+			return Math.min(maximum, Math.max(1, Math.trunc(value)));
+		};
+		const maxMessages = normalizeCap(options.maxMessages, 500);
+		const maxTokens = normalizeCap(options.maxTokens, Number.MAX_SAFE_INTEGER);
 		const transformedMessages = await this.#transformContext([...this.messages], options.signal);
 		const convertedMessages = await this.#convertToLlm(transformedMessages);
 		const providerMessages = this.model
@@ -2237,6 +2225,10 @@ export class AgentSession {
 
 		const recordSkip = (reason: string) => {
 			skippedMessages++;
+			skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
+		};
+
+		const recordReason = (reason: string) => {
 			skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
 		};
 
@@ -2272,7 +2264,7 @@ export class AgentSession {
 					} else if (block.type === "image") {
 						sanitizedContent.push({ type: "text", text: "[Image omitted from fork-context seed]" });
 					} else if (block.type !== "thinking") {
-						recordSkip(`unsupported-content-${block.type}`);
+						recordReason(`unsupported-content-${block.type}`);
 					}
 				}
 				if (sanitizedContent.length === 0) {
@@ -2284,8 +2276,11 @@ export class AgentSession {
 			return cloned;
 		};
 
-		const truncateMessageToTokenBudget = (message: Message): { message: Message; tokens: number } => {
-			const notice = `\n\n[fork-context seed: newest message truncated to fit the ${maxTokens}-token budget]`;
+		const truncateMessageToTokenBudget = (
+			message: Message,
+			tokenBudget = maxTokens,
+		): { message: Message; tokens: number } => {
+			const notice = `\n\n[fork-context seed: newest message truncated to fit the ${tokenBudget}-token budget]`;
 			const contentText = Array.isArray(message.content)
 				? message.content.map(block => (block.type === "text" ? block.text : "")).join("\n\n")
 				: String(message.content ?? "");
@@ -2300,7 +2295,7 @@ export class AgentSession {
 					content: [{ type: "text", text: `${contentText.slice(0, mid)}${notice}` }],
 				};
 				const candidateTokens = estimateMessageTokensHeuristic(candidate);
-				if (candidateTokens <= maxTokens) {
+				if (candidateTokens <= tokenBudget) {
 					bestMessage = candidate;
 					bestTokens = candidateTokens;
 					low = mid + 1;
@@ -2311,33 +2306,82 @@ export class AgentSession {
 			return { message: bestMessage, tokens: bestTokens };
 		};
 
-		for (let i = providerMessages.length - 1; i >= 0; i--) {
-			if (selected.length >= maxMessages) {
-				recordSkip("message-limit");
-				continue;
-			}
-			const sanitized = sanitizeMessage(providerMessages[i]!);
-			if (!sanitized) continue;
-			const messageTokens = estimateMessageTokensHeuristic(sanitized);
-			// Stop at the first message that overflows the token budget. The loop walks
-			// newest→oldest, so `break` keeps the seed a CONTIGUOUS run of the most recent
-			// messages. `continue` here would skip the oversized recent message and scavenge
-			// smaller OLDER ones, yielding a non-contiguous seed that misrepresents the
-			// conversation and violates the recency contract of the receipt/last-turn/bounded modes.
-			if (approximateTokens + messageTokens > maxTokens) {
-				recordSkip("token-limit");
-				if (selected.length === 0) {
-					const truncated = truncateMessageToTokenBudget(sanitized);
-					if (truncated.tokens <= maxTokens) {
-						selected.unshift(truncated.message);
-						approximateTokens = truncated.tokens;
+		if (options.preserveLatestUser) {
+			const userIndex = providerMessages.findLastIndex(message => message.role === "user");
+			if (userIndex >= 0) {
+				const userMessage = sanitizeMessage(providerMessages[userIndex]!);
+				if (userMessage) {
+					let reservedUser = userMessage;
+					let reservedUserTokens = estimateMessageTokensHeuristic(reservedUser);
+					if (reservedUserTokens > maxTokens) {
+						const truncated = truncateMessageToTokenBudget(reservedUser);
+						reservedUser = truncated.message;
+						reservedUserTokens = truncated.tokens;
 						skippedReasons["newest-message-truncated"] = (skippedReasons["newest-message-truncated"] ?? 0) + 1;
 					}
+					selected.push(reservedUser);
+					approximateTokens = reservedUserTokens;
+					for (let i = userIndex + 1; i < providerMessages.length; i++) {
+						const sanitized = sanitizeMessage(providerMessages[i]!);
+						if (!sanitized) continue;
+						if (selected.length >= maxMessages) {
+							recordSkip("message-limit");
+							continue;
+						}
+						const messageTokens = estimateMessageTokensHeuristic(sanitized);
+						if (approximateTokens + messageTokens > maxTokens) {
+							const remainingTokens = maxTokens - approximateTokens;
+							const truncated = truncateMessageToTokenBudget(sanitized, remainingTokens);
+							if (truncated.tokens <= remainingTokens) {
+								selected.push(truncated.message);
+								approximateTokens += truncated.tokens;
+								recordReason("token-limit");
+								recordReason("newest-message-truncated");
+							} else {
+								recordSkip("token-limit");
+							}
+							continue;
+						}
+						selected.push(sanitized);
+						approximateTokens += messageTokens;
+					}
+					for (let i = 0; i < userIndex; i++) recordSkip("semantic-turn");
+				} else {
+					for (const message of providerMessages) sanitizeMessage(message);
 				}
-				break;
+			} else {
+				for (const message of providerMessages) sanitizeMessage(message);
 			}
-			selected.unshift(sanitized);
-			approximateTokens += messageTokens;
+		} else {
+			let tokenBudgetExhausted = false;
+			for (let i = providerMessages.length - 1; i >= 0; i--) {
+				const sanitized = sanitizeMessage(providerMessages[i]!);
+				if (!sanitized) continue;
+				if (selected.length >= maxMessages) {
+					recordSkip("message-limit");
+					continue;
+				}
+				const messageTokens = estimateMessageTokensHeuristic(sanitized);
+				if (tokenBudgetExhausted || approximateTokens + messageTokens > maxTokens) {
+					if (selected.length === 0) {
+						const truncated = truncateMessageToTokenBudget(sanitized);
+						if (truncated.tokens <= maxTokens) {
+							selected.unshift(truncated.message);
+							approximateTokens = truncated.tokens;
+							recordReason("token-limit");
+							recordReason("newest-message-truncated");
+						} else {
+							recordSkip("token-limit");
+						}
+					} else {
+						recordSkip("token-limit");
+					}
+					tokenBudgetExhausted = true;
+					continue;
+				}
+				selected.unshift(sanitized);
+				approximateTokens += messageTokens;
+			}
 		}
 
 		const messages = selected;
@@ -2694,7 +2738,10 @@ export class AgentSession {
 		// await: the EventStream FIFO drain then guarantees tool results and every
 		// steering message are in the branch before a maintenance rewrite starts.
 		if (event.type === "message_end") {
-			if (event.message.role === "hookMessage" || event.message.role === "custom") {
+			if (
+				(event.message.role === "hookMessage" || event.message.role === "custom") &&
+				!(event.message.role === "custom" && event.message.customType === "hindsight-recall")
+			) {
 				const isRosterReminder = event.message.role === "custom" && event.message.customType === "irc-peer-roster";
 				if (!isRosterReminder) {
 					this.sessionManager.appendCustomMessageEntry(
@@ -4444,9 +4491,9 @@ export class AgentSession {
 		this.#disconnectFromAgent();
 		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
-		const hindsightState = this.setHindsightSessionState(undefined);
-		await hindsightState?.flushRetainQueue();
+		const hindsightState = this.getHindsightSessionState();
 		await hindsightState?.dispose();
+		this.setHindsightSessionState(undefined);
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
 			this.#unsubscribeAppendOnly = undefined;
@@ -5638,10 +5685,51 @@ export class AgentSession {
 			throw new Error("Cannot continue from persisted message history");
 		}
 		this.#beginInFlight();
+		let hindsightRecall: string | undefined;
 		try {
-			await this.agent.continue(this.#managedFallbackPromptOptions());
+			const hindsightState = this.getHindsightSessionState();
+			await hindsightState?.maybeRecallOnAgentStart();
+			hindsightRecall = hindsightState?.getRecallSnippetForInjection();
+			if (hindsightRecall) {
+				const messages = this.agent.state.messages;
+				const lastUserIndex = messages.findLastIndex(message => message.role === "user");
+				if (lastUserIndex !== -1) {
+					this.agent.replaceMessages([
+						...messages.slice(0, lastUserIndex),
+						{
+							role: "custom",
+							customType: "hindsight-recall",
+							content: hindsightRecall,
+							display: false,
+							attribution: "agent",
+							timestamp: Date.now(),
+						},
+						...messages.slice(lastUserIndex),
+					]);
+				} else {
+					hindsightRecall = undefined;
+				}
+			}
+			await this.agent.continue({
+				...this.#managedFallbackPromptOptions(),
+				onRunAccepted: () => {
+					if (hindsightRecall) hindsightState?.markRecallSnippetInjected(hindsightRecall);
+				},
+			});
 			await this.#waitForPostPromptRecovery();
 		} finally {
+			if (hindsightRecall) {
+				this.agent.replaceMessages(
+					this.agent.state.messages.filter(
+						message =>
+							!(
+								message.role === "custom" &&
+								message.customType === "hindsight-recall" &&
+								message.content === hindsightRecall
+							),
+					),
+				);
+			}
 			this.#endInFlight();
 		}
 	}
@@ -6502,6 +6590,7 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		const preflightSignal = this.#promptPreflightAbortController.signal;
 		const rosterClaim = this.#claimIrcRosterCandidate();
+		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			if (message.role === "user") {
@@ -6616,9 +6705,12 @@ export class AgentSession {
 			}
 
 			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
-			const hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
+			hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
 			if (hindsightRecall) {
-				messages.push({
+				// Recall is provider-only context for this request. It must precede the
+				// actual prompt but never become part of durable session history.
+				const promptIndex = messages.lastIndexOf(message);
+				messages.splice(promptIndex, 0, {
 					role: "custom",
 					customType: "hindsight-recall",
 					content: hindsightRecall,
@@ -6691,7 +6783,10 @@ export class AgentSession {
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
 				...this.#managedFallbackPromptOptions(),
-				...(options?.admissionLease ? { onRunAccepted: options.admissionLease.release } : undefined),
+				onRunAccepted: () => {
+					options?.admissionLease?.release();
+					if (hindsightRecall) this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
+				},
 			};
 			options?.onPreflightAccepted?.();
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -6715,6 +6810,18 @@ export class AgentSession {
 			if (isPromptPreflightCancelledError(error) && !options?.onPreflightAccepted) return;
 			throw error;
 		} finally {
+			if (hindsightRecall) {
+				this.agent.replaceMessages(
+					this.agent.state.messages.filter(
+						candidate =>
+							!(
+								candidate.role === "custom" &&
+								candidate.customType === "hindsight-recall" &&
+								candidate.content === hindsightRecall
+							),
+					),
+				);
+			}
 			if (rosterClaim) {
 				this.agent.replaceMessages(
 					this.agent.state.messages.filter(
