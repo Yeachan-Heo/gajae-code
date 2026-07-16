@@ -2,9 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
 import type { ActiveSubskillEntry, SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import {
 	type AuditEntry,
 	buildWorkflowStateReceipt,
@@ -22,7 +22,7 @@ import {
 	modeStatePath as layoutModeStatePath,
 	transactionJournalPath as layoutTransactionJournalPath,
 } from "./session-layout";
-import { RequiredOnWriteEnvelopeSchema } from "./state-schema";
+import { RequiredOnWriteEnvelopeSchema, SkillActiveStateSchema } from "./state-schema";
 
 /**
  * Sole sanctioned project `.gjc/**` writer module (gate G1).
@@ -461,6 +461,24 @@ async function establishReceiptActiveSnapshot(
 	if (!isPlainObject(value) || !Object.hasOwn(value, "receipt") || !isCanonicalWorkflowModeStatePath(filePath)) return;
 
 	const receipt = assertWorkflowEnvelopeReceiptBinding(value, filePath, options);
+	const existing = await readExistingStateForMutation(receipt.snapshotPath);
+	if (existing.kind === "corrupt") {
+		throw new Error(`canonical active snapshot is corrupt: ${receipt.snapshotPath}: ${existing.error}`);
+	}
+	if (existing.kind === "valid") {
+		const parsed = SkillActiveStateSchema.safeParse(existing.value);
+		if (!parsed.success) {
+			throw new Error(`canonical active snapshot is malformed: ${receipt.snapshotPath}`);
+		}
+		const snapshot = await fs.stat(receipt.snapshotPath);
+		if (!snapshot.isFile()) {
+			throw new Error(`canonical active snapshot is not a file: ${receipt.snapshotPath}`);
+		}
+		return;
+	}
+
+	// Only an ENOENT snapshot may be initialized. In particular, do not let the
+	// guarded cache writer's tolerant revision read replace corrupt state.
 	await rebuildActiveSnapshot(
 		receipt.cwd,
 		{ sessionId: receipt.sessionId },
@@ -628,6 +646,20 @@ function withWorkflowReceipt(value: unknown, receipt: WorkflowStateReceipt | und
 	if (!receipt || !value || typeof value !== "object" || Array.isArray(value)) return value;
 	return { ...(value as Record<string, unknown>), receipt };
 }
+function assertGenericJsonWriterDoesNotPublishReceipt(
+	filePath: string,
+	value: unknown,
+	options?: StateWriterOptions,
+): void {
+	if (
+		isCanonicalWorkflowModeStatePath(filePath) &&
+		(options?.receipt || (isPlainObject(value) && Object.hasOwn(value, "receipt")))
+	) {
+		throw new Error(
+			`Refusing to publish a receipt-bearing canonical workflow mode-state with a generic JSON writer: ${filePath}. Use writeWorkflowEnvelopeAtomic or writeGuardedWorkflowEnvelopeAtomic.`,
+		);
+	}
+}
 
 function stampWorkflowEnvelopeRevisionAndChecksum(
 	value: unknown,
@@ -736,6 +768,7 @@ export async function writeGuardedJsonAtomic(
 	options: GuardedStateWriterOptions,
 ): Promise<GuardedWriteResult> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	assertGenericJsonWriterDoesNotPublishReceipt(filePath, value, options);
 	return writeGuardedResolvedJsonAtomic(filePath, value, options);
 }
 
@@ -811,6 +844,7 @@ export async function writeJsonAtomic(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	assertGenericJsonWriterDoesNotPublishReceipt(filePath, value, options);
 	await atomicWrite(filePath, jsonText(withWorkflowReceipt(value, buildReceipt(options))));
 	await maybeAudit(filePath, options);
 	return filePath;
@@ -978,11 +1012,13 @@ export async function updateJsonAtomic<T = unknown>(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	assertGenericJsonWriterDoesNotPublishReceipt(filePath, undefined, options);
 	return lockResolvedWorkflowTarget(
 		filePath,
 		async () => {
 			const current = (await readJsonIfPresent(filePath)) as T | undefined;
 			const next = await mutator(current);
+			assertGenericJsonWriterDoesNotPublishReceipt(filePath, next, options);
 			await atomicWrite(filePath, jsonText(withWorkflowReceipt(next, buildReceipt(options))));
 			await maybeAudit(filePath, options);
 			return filePath;
@@ -1119,6 +1155,7 @@ export async function createJsonNoClobber(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	assertGenericJsonWriterDoesNotPublishReceipt(filePath, value, options);
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	let handle: fs.FileHandle | undefined;
 	try {
@@ -1384,6 +1421,7 @@ export async function forceOverwrite(
 	};
 	if (options?.raw === true) {
 		const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+		assertGenericJsonWriterDoesNotPublishReceipt(filePath, rawValue, options);
 		await atomicWrite(filePath, jsonText(rawValue));
 		await maybeAudit(filePath, auditOptions);
 		return filePath;

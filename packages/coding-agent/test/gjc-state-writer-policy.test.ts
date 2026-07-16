@@ -3,13 +3,17 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	createJsonNoClobber,
 	detectWorkflowEnvelopeIntegrityMismatch,
+	forceOverwrite,
 	removeActiveEntry,
 	StateWriteConflictError,
+	updateJsonAtomic,
 	workflowEnvelopeContentSha256,
 	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
+	writeJsonAtomic,
 } from "../src/gjc-runtime/state-writer";
 
 describe("GJC state writer revision policy", () => {
@@ -188,6 +192,75 @@ describe("GJC state writer revision policy", () => {
 			expected: statePath,
 			actual: "missing",
 		});
+	});
+	it("fails closed and preserves corrupt or malformed active snapshots before mode-state publication", async () => {
+		const root = await cwd();
+		const target = ".gjc/_session-sess/state/deep-interview-state.json";
+		const snapshotPath = path.join(root, ".gjc/_session-sess/state/skill-active-state.json");
+		await fs.mkdir(path.dirname(snapshotPath), { recursive: true });
+
+		for (const [snapshot, error] of [
+			["{ not valid json", /canonical active snapshot is corrupt/i],
+			[JSON.stringify({ active: "not a boolean" }), /canonical active snapshot is malformed/i],
+		] as const) {
+			await fs.writeFile(snapshotPath, snapshot);
+			await expect(
+				writeGuardedWorkflowEnvelopeAtomic(target, modeEnvelope("interviewing"), {
+					cwd: root,
+					policy: "source",
+					receipt: receipt(root),
+				}),
+			).rejects.toThrow(error);
+			expect(await fs.readFile(snapshotPath, "utf-8")).toBe(snapshot);
+			await expect(fs.access(path.join(root, target))).rejects.toThrow();
+		}
+	});
+
+	it("rejects generic receipt-bearing canonical mode-state writers without breaking non-canonical guarded writes", async () => {
+		const root = await cwd();
+		const target = ".gjc/_session-sess/state/deep-interview-state.json";
+		const options = { cwd: root, receipt: receipt(root) };
+
+		await expect(
+			writeGuardedJsonAtomic(target, modeEnvelope("interviewing"), { ...options, policy: "source" }),
+		).rejects.toThrow(/writeWorkflowEnvelopeAtomic or writeGuardedWorkflowEnvelopeAtomic/i);
+		await expect(writeJsonAtomic(target, modeEnvelope("interviewing"), options)).rejects.toThrow(
+			/writeWorkflowEnvelopeAtomic or writeGuardedWorkflowEnvelopeAtomic/i,
+		);
+		await expect(updateJsonAtomic(target, () => modeEnvelope("interviewing"), options)).rejects.toThrow(
+			/writeWorkflowEnvelopeAtomic or writeGuardedWorkflowEnvelopeAtomic/i,
+		);
+		await expect(createJsonNoClobber(target, modeEnvelope("interviewing"), options)).rejects.toThrow(
+			/writeWorkflowEnvelopeAtomic or writeGuardedWorkflowEnvelopeAtomic/i,
+		);
+		await expect(fs.access(path.join(root, target))).rejects.toThrow();
+		await expect(forceOverwrite(target, { receipt: {} }, { ...options, raw: true })).rejects.toThrow(
+			/writeWorkflowEnvelopeAtomic or writeGuardedWorkflowEnvelopeAtomic/i,
+		);
+
+		const probe = ".gjc/_session-sess/state/cas-probe.json";
+		await writeGuardedJsonAtomic(probe, { value: "compatible" }, { ...options, policy: "source" });
+		await expect(readJson(root, probe)).resolves.toMatchObject({
+			value: "compatible",
+			receipt: { skill: "deep-interview" },
+			state_revision: 1,
+		});
+	});
+	it("accepts a valid pre-existing active snapshot without replacing it", async () => {
+		const root = await cwd();
+		const target = ".gjc/_session-sess/state/deep-interview-state.json";
+		const snapshotPath = path.join(root, ".gjc/_session-sess/state/skill-active-state.json");
+		const snapshot = JSON.stringify({ version: 1, active: false, active_skills: [] }, null, 2);
+		await fs.mkdir(path.dirname(snapshotPath), { recursive: true });
+		await fs.writeFile(snapshotPath, snapshot);
+
+		await writeGuardedWorkflowEnvelopeAtomic(target, modeEnvelope("interviewing"), {
+			cwd: root,
+			policy: "source",
+			receipt: receipt(root),
+		});
+
+		expect(await fs.readFile(snapshotPath, "utf-8")).toBe(snapshot);
 	});
 
 	it("detects covered_path-only checksum metadata tampering", async () => {
