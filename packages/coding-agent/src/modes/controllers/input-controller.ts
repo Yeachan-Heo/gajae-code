@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@gajae-code/tui";
 import { $env, sanitizeText } from "@gajae-code/utils";
-import type { AppKeybinding } from "../../config/keybindings";
+import { type AppKeybinding, KEYBINDINGS } from "../../config/keybindings";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
@@ -21,6 +21,7 @@ import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } fr
 import { resizeImage } from "../../utils/image-resize";
 import { formatPastedImageReference, resolvePastedImagePath } from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
+import type { CommandPaletteAction } from "../components/command-palette";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
 
 interface Expandable {
@@ -47,6 +48,15 @@ export class InputController {
 	 *  queued steer is either cancelled by a second Esc or drained by continuation,
 	 *  so abort cleanup going idle cannot turn the second Esc into an idle action. */
 	#steerConsumePending = false;
+	#commandPaletteActions = new Map<AppKeybinding, CommandPaletteAction>();
+
+	#registerCommandPaletteAction(action: AppKeybinding, handler: () => void): void {
+		this.#commandPaletteActions.set(action, {
+			id: action,
+			label: KEYBINDINGS[action].description,
+			handler,
+		});
+	}
 
 	#globalInterruptUnsubscribe: (() => void) | undefined;
 	#draftClearEscapeText: string | undefined;
@@ -323,47 +333,73 @@ export class InputController {
 			}
 		};
 
+		const clear = () => this.handleCtrlC();
 		this.ctx.editor.setActionKeys("app.clear", this.ctx.keybindings.getKeys("app.clear"));
-		this.ctx.editor.onClear = () => this.handleCtrlC();
+		this.ctx.editor.onClear = clear;
+		this.#registerCommandPaletteAction("app.clear", clear);
+		const exit = () => this.handleCtrlD();
 		this.ctx.editor.setActionKeys("app.exit", this.ctx.keybindings.getKeys("app.exit"));
-		this.ctx.editor.onExit = () => this.handleCtrlD();
+		this.ctx.editor.onExit = exit;
+		this.#registerCommandPaletteAction("app.exit", exit);
+		const suspend = () => this.handleCtrlZ();
 		this.ctx.editor.setActionKeys("app.suspend", this.ctx.keybindings.getKeys("app.suspend"));
-		this.ctx.editor.onSuspend = () => this.handleCtrlZ();
+		this.ctx.editor.onSuspend = suspend;
+		this.#registerCommandPaletteAction("app.suspend", suspend);
+		const cycleThinking = () => this.cycleThinkingLevel();
 		this.ctx.editor.setActionKeys("app.thinking.cycle", this.ctx.keybindings.getKeys("app.thinking.cycle"));
-		this.ctx.editor.onCycleThinkingLevel = () => this.cycleThinkingLevel();
+		this.ctx.editor.onCycleThinkingLevel = cycleThinking;
+		this.#registerCommandPaletteAction("app.thinking.cycle", cycleThinking);
 		this.ctx.editor.setActionKeys("app.commandPalette.open", this.ctx.keybindings.getKeys("app.commandPalette.open"));
 		this.ctx.editor.onOpenCommandPalette = () => this.openCommandPalette();
+		const cycleModelForward = () => this.cycleRoleModel();
 		this.ctx.editor.setActionKeys("app.model.cycleForward", this.ctx.keybindings.getKeys("app.model.cycleForward"));
-		this.ctx.editor.onCycleModelForward = () => this.cycleRoleModel();
+		this.ctx.editor.onCycleModelForward = cycleModelForward;
+		this.#registerCommandPaletteAction("app.model.cycleForward", cycleModelForward);
+		const cycleModelBackward = () => this.cycleRoleModel({ temporary: true });
 		this.ctx.editor.setActionKeys("app.model.cycleBackward", this.ctx.keybindings.getKeys("app.model.cycleBackward"));
-		this.ctx.editor.onCycleModelBackward = () => this.cycleRoleModel({ temporary: true });
+		this.ctx.editor.onCycleModelBackward = cycleModelBackward;
+		this.#registerCommandPaletteAction("app.model.cycleBackward", cycleModelBackward);
+		const selectTemporaryModel = () => this.ctx.showModelSelector({ temporaryOnly: true });
 		this.ctx.editor.setActionKeys(
 			"app.model.selectTemporary",
 			this.ctx.keybindings.getKeys("app.model.selectTemporary"),
 		);
-		this.ctx.editor.onSelectModelTemporary = () => this.ctx.showModelSelector({ temporaryOnly: true });
+		this.ctx.editor.onSelectModelTemporary = selectTemporaryModel;
+		this.#registerCommandPaletteAction("app.model.selectTemporary", selectTemporaryModel);
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ctx.ui.onDebug = () => this.ctx.showDebugSelector();
+		const selectModel = () => this.ctx.showModelSelector();
 		this.ctx.editor.setActionKeys("app.model.select", this.ctx.keybindings.getKeys("app.model.select"));
-		this.ctx.editor.onSelectModel = () => this.ctx.showModelSelector();
+		this.ctx.editor.onSelectModel = selectModel;
+		this.#registerCommandPaletteAction("app.model.select", selectModel);
+		const searchHistory = () => this.ctx.showHistorySearch();
 		this.ctx.editor.setActionKeys("app.history.search", this.ctx.keybindings.getKeys("app.history.search"));
-		this.ctx.editor.onHistorySearch = () => this.ctx.showHistorySearch();
+		this.ctx.editor.onHistorySearch = searchHistory;
+		this.#registerCommandPaletteAction("app.history.search", searchHistory);
+		const toggleThinking = () => this.ctx.toggleThinkingBlockVisibility();
 		this.ctx.editor.setActionKeys("app.thinking.toggle", this.ctx.keybindings.getKeys("app.thinking.toggle"));
-		this.ctx.editor.onToggleThinking = () => this.ctx.toggleThinkingBlockVisibility();
+		this.ctx.editor.onToggleThinking = toggleThinking;
+		this.#registerCommandPaletteAction("app.thinking.toggle", toggleThinking);
+		const externalEditor = () => void this.openExternalEditor();
 		this.ctx.editor.setActionKeys("app.editor.external", this.ctx.keybindings.getKeys("app.editor.external"));
-		this.ctx.editor.onExternalEditor = () => void this.openExternalEditor();
+		this.ctx.editor.onExternalEditor = externalEditor;
+		this.#registerCommandPaletteAction("app.editor.external", externalEditor);
 		this.ctx.editor.onShowHotkeys = () => this.ctx.handleHotkeysCommand();
+		const pasteImage = () => this.handleImagePaste();
 		this.ctx.editor.setActionKeys(
 			"app.clipboard.pasteImage",
 			this.ctx.keybindings.getKeys("app.clipboard.pasteImage"),
 		);
-		this.ctx.editor.onPasteImage = () => this.handleImagePaste();
+		this.ctx.editor.onPasteImage = pasteImage;
+		this.#registerCommandPaletteAction("app.clipboard.pasteImage", pasteImage);
+		const copyPrompt = () => this.handleCopyPrompt();
 		this.ctx.editor.setActionKeys(
 			"app.clipboard.copyPrompt",
 			this.ctx.keybindings.getKeys("app.clipboard.copyPrompt"),
 		);
-		this.ctx.editor.onCopyPrompt = () => this.handleCopyPrompt();
+		this.ctx.editor.onCopyPrompt = copyPrompt;
+		this.#registerCommandPaletteAction("app.clipboard.copyPrompt", copyPrompt);
 		this.ctx.editor.onPasteText = text => this.handleTextPaste(text);
 		this.ctx.editor.onPastePendingInputCleared = (reason, droppedInputCount) => {
 			const reasonText = reason === "timeout" ? "timed out" : "exceeded the input queue limit";
@@ -371,12 +407,18 @@ export class InputController {
 				`Paste handling ${reasonText}; discarded ${droppedInputCount} buffered input event${droppedInputCount === 1 ? "" : "s"}.`,
 			);
 		};
+		const expandTools = () => this.toggleToolOutputExpansion();
 		this.ctx.editor.setActionKeys("app.tools.expand", this.ctx.keybindings.getKeys("app.tools.expand"));
-		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
+		this.ctx.editor.onExpandTools = expandTools;
+		this.#registerCommandPaletteAction("app.tools.expand", expandTools);
+		const dequeue = () => this.handleDequeue();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
-		this.ctx.editor.onDequeue = () => this.handleDequeue();
+		this.ctx.editor.onDequeue = dequeue;
+		this.#registerCommandPaletteAction("app.message.dequeue", dequeue);
+		const queue = () => void this.handleQueueSubmit();
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
-		this.ctx.editor.onQueue = () => void this.handleQueueSubmit();
+		this.ctx.editor.onQueue = queue;
+		this.#registerCommandPaletteAction("app.message.queue", queue);
 
 		this.ctx.editor.onViewportPageScroll = direction => this.ctx.ui.scrollViewportPages(direction);
 		this.ctx.editor.onViewportFollowLive = () => {
@@ -394,28 +436,39 @@ export class InputController {
 			});
 		}
 
-		const planModeKeys = this.ctx.keybindings.getKeys("app.plan.toggle");
-		for (const key of planModeKeys) {
-			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handlePlanModeCommand());
+		const togglePlanMode = () => void this.ctx.handlePlanModeCommand();
+		this.#registerCommandPaletteAction("app.plan.toggle", togglePlanMode);
+		for (const key of this.ctx.keybindings.getKeys("app.plan.toggle")) {
+			this.ctx.editor.setCustomKeyHandler(key, togglePlanMode);
 		}
-
+		const newSession = () => void this.ctx.handleClearCommand();
+		this.#registerCommandPaletteAction("app.session.new", newSession);
 		for (const key of this.ctx.keybindings.getKeys("app.session.new")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleClearCommand());
+			this.ctx.editor.setCustomKeyHandler(key, newSession);
 		}
+		const showTree = () => {
+			this.ctx.showTreeSelector();
+			return undefined;
+		};
+		this.#registerCommandPaletteAction("app.session.tree", showTree);
 		for (const key of this.ctx.keybindings.getKeys("app.session.tree")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => {
-				this.ctx.showTreeSelector();
-			});
+			this.ctx.editor.setCustomKeyHandler(key, showTree);
 		}
+		const forkSession = () => {
+			this.ctx.showUserMessageSelector();
+			return undefined;
+		};
+		this.#registerCommandPaletteAction("app.session.fork", forkSession);
 		for (const key of this.ctx.keybindings.getKeys("app.session.fork")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => {
-				this.ctx.showUserMessageSelector();
-			});
+			this.ctx.editor.setCustomKeyHandler(key, forkSession);
 		}
+		const resumeSession = () => {
+			this.ctx.showSessionSelector();
+			return undefined;
+		};
+		this.#registerCommandPaletteAction("app.session.resume", resumeSession);
 		for (const key of this.ctx.keybindings.getKeys("app.session.resume")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => {
-				this.ctx.showSessionSelector();
-			});
+			this.ctx.editor.setCustomKeyHandler(key, resumeSession);
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.message.followUp")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
@@ -1347,17 +1400,16 @@ export class InputController {
 	}
 
 	openCommandPalette(): void {
-		this.ctx.showCommandPalette(
-			this.#slashCommands,
-			action => {
-				const key = this.ctx.keybindings.getKeys(action as AppKeybinding)[0];
-				if (key) this.ctx.editor.handleInput(key);
-			},
-			name => {
-				this.ctx.editor.setText(`/${name}`);
-				this.ctx.editor.handleInput("\n");
-			},
-		);
+		this.ctx.showCommandPalette(this.#slashCommands, [...this.#commandPaletteActions.values()], name => {
+			const text = this.ctx.editor.getText();
+			const pendingImages = [...this.ctx.pendingImages];
+			this.ctx.editor.setText(`/${name}`);
+			this.ctx.editor.handleInput("\n");
+			// Slash commands run through submit synchronously; restore afterward so command-side
+			// composer mutations do not replace the draft that was present before opening the palette.
+			this.ctx.editor.setText(text);
+			this.ctx.pendingImages = pendingImages;
+		});
 	}
 
 	cycleThinkingLevel(): void {
