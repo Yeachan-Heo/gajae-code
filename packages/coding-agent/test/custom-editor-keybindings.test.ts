@@ -124,38 +124,6 @@ describe("CustomEditor queue keybinding", () => {
 		expect(editor.getText()).toBe("");
 	});
 
-describe("CustomEditor opposite busy mode keybinding", () => {
-	it("takes priority over a colliding built-in action while active", () => {
-		const editor = createEditor();
-		const onOppositeBusyMode = vi.fn(() => true);
-		const onQueue = vi.fn();
-		editor.onOppositeBusyMode = onOppositeBusyMode;
-		editor.onQueue = onQueue;
-		editor.setActionKeys("app.message.oppositeBusyMode", ["alt+enter"]);
-		editor.setActionKeys("app.message.queue", ["alt+enter"]);
-
-		editor.handleInput("\x1b\r");
-
-		expect(onOppositeBusyMode).toHaveBeenCalledTimes(1);
-		expect(onQueue).not.toHaveBeenCalled();
-	});
-
-	it("falls through to a colliding built-in action while inactive", () => {
-		const editor = createEditor();
-		const onOppositeBusyMode = vi.fn(() => false);
-		const onQueue = vi.fn();
-		editor.onOppositeBusyMode = onOppositeBusyMode;
-		editor.onQueue = onQueue;
-		editor.setActionKeys("app.message.oppositeBusyMode", ["alt+enter"]);
-		editor.setActionKeys("app.message.queue", ["alt+enter"]);
-
-		editor.handleInput("\x1b\r");
-
-		expect(onOppositeBusyMode).toHaveBeenCalledTimes(1);
-		expect(onQueue).toHaveBeenCalledTimes(1);
-	});
-});
-
 	it("keeps Ctrl+Enter as a multiline newline chord", () => {
 		const editor = createEditor();
 		const onQueue = vi.fn();
@@ -246,6 +214,38 @@ describe("CustomEditor opposite busy mode keybinding", () => {
 		expect(onQueue).not.toHaveBeenCalled();
 
 		editor.handleInput("\x1bq");
+		expect(onQueue).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("CustomEditor opposite busy mode keybinding", () => {
+	it("takes priority over a colliding built-in action while active", () => {
+		const editor = createEditor();
+		const onOppositeBusyMode = vi.fn(() => true);
+		const onQueue = vi.fn();
+		editor.onOppositeBusyMode = onOppositeBusyMode;
+		editor.onQueue = onQueue;
+		editor.setActionKeys("app.message.oppositeBusyMode", ["alt+enter"]);
+		editor.setActionKeys("app.message.queue", ["alt+enter"]);
+
+		editor.handleInput("\x1b\r");
+
+		expect(onOppositeBusyMode).toHaveBeenCalledTimes(1);
+		expect(onQueue).not.toHaveBeenCalled();
+	});
+
+	it("falls through to a colliding built-in action while inactive", () => {
+		const editor = createEditor();
+		const onOppositeBusyMode = vi.fn(() => false);
+		const onQueue = vi.fn();
+		editor.onOppositeBusyMode = onOppositeBusyMode;
+		editor.onQueue = onQueue;
+		editor.setActionKeys("app.message.oppositeBusyMode", ["alt+enter"]);
+		editor.setActionKeys("app.message.queue", ["alt+enter"]);
+
+		editor.handleInput("\x1b\r");
+
+		expect(onOppositeBusyMode).toHaveBeenCalledTimes(1);
 		expect(onQueue).toHaveBeenCalledTimes(1);
 	});
 });
