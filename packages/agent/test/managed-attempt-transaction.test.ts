@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import type { ManagedAttemptOutcome } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
-import { sanitizedDetachedClone } from "@gajae-code/agent-core/agent-loop";
-import type { AssistantMessage } from "@gajae-code/ai";
+import { publishableAssistantMessageSnapshot, sanitizedDetachedClone } from "@gajae-code/agent-core/agent-loop";
+import type { AssistantMessage, AssistantMessageEvent } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 
@@ -112,6 +112,78 @@ describe("managed attempt transaction", () => {
 				order.indexOf(`event:${index === 0 ? "text_start" : "text_delta"}:${text}`),
 			);
 		}
+	});
+	it("repairs degraded toolcall events with a valid detached toolCall", async () => {
+		const mock = createMockModel();
+		const partial = assistantMessage(mock.model) as AssistantMessage & { probe?: () => void };
+		partial.probe = () => undefined;
+		const toolCall = { type: "toolCall" as const, id: "call-1", name: "inspect", arguments: { path: "src" } };
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			void (async () => {
+				stream.push({ type: "start", partial });
+				stream.push(
+					new Proxy(
+						{ type: "toolcall_end", contentIndex: 0, toolCall, partial } satisfies AssistantMessageEvent,
+						{},
+					),
+				);
+				stream.push({ type: "done", reason: "stop", message: partial });
+			})();
+			return stream;
+		};
+		const callbackEvents: AssistantMessageEvent[] = [];
+		const publishedEvents: AssistantMessageEvent[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+			onAssistantMessageEvent: (_message, event) => callbackEvents.push(event),
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_update") publishedEvents.push(event.assistantMessageEvent);
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		const published = publishedEvents.find(event => event.type === "toolcall_end");
+		const callback = callbackEvents.find(event => event.type === "toolcall_end");
+		expect(published?.toolCall).toEqual(toolCall);
+		expect(callback?.toolCall).toEqual(toolCall);
+		expect(published?.toolCall).not.toBe(toolCall);
+	});
+
+	it("repairs a toolCall proxy that collapsed without degrading its partial", async () => {
+		const mock = createMockModel();
+		const partial = assistantMessage(mock.model);
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			void (async () => {
+				stream.push({ type: "start", partial });
+				stream.push({
+					type: "toolcall_end",
+					contentIndex: 0,
+					toolCall: new Proxy({ type: "toolCall", id: "call-2", name: "inspect", arguments: { path: "src" } }, {}),
+					partial,
+				});
+				stream.push({ type: "done", reason: "stop", message: partial });
+			})();
+			return stream;
+		};
+		const events: AssistantMessageEvent[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_update") events.push(event.assistantMessageEvent);
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		const published = events.find(event => event.type === "toolcall_end");
+		expect(typeof published?.toolCall).toBe("object");
+		expect(published?.toolCall).not.toBeNull();
+		expect(typeof published?.toolCall).not.toBe("string");
 	});
 
 	it("discards a cancelled provisional assistant lifecycle and settles once", async () => {
@@ -294,6 +366,326 @@ describe("managed attempt transaction", () => {
 
 		expect(eventContents).toEqual(["", "a", "ab"]);
 		expect(callbackContents).toEqual(["", "a", "ab"]);
+	});
+	it("keeps final lifecycle frames detached when an accepted payload is not structured-cloneable", async () => {
+		const mock = createMockModel();
+		let partial!: AssistantMessage;
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			void (async () => {
+				partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).probe = () => {};
+				stream.push({ type: "start", partial });
+				await Bun.sleep(0);
+				partial.content.push({ type: "text", text: "accepted" });
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				await Bun.sleep(0);
+				stream.push({ type: "done", reason: "stop", message: partial });
+			})();
+			return stream;
+		};
+		let agentEndMessage: AssistantMessage | undefined;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		agent.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			agentEndMessage = event.messages.find(message => message.role === "assistant") as AssistantMessage | undefined;
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		const stateMessage = agent.state.messages.find(message => message.role === "assistant") as
+			| AssistantMessage
+			| undefined;
+		expect((stateMessage as unknown as Record<string, unknown>).probe).toBe("[unserializable]");
+		expect((agentEndMessage as unknown as Record<string, unknown>).probe).toBe("[unserializable]");
+
+		(partial.content[0] as { type: "text"; text: string }).text = "mutated";
+		expect((stateMessage?.content[0] as { type: "text"; text: string }).text).toBe("accepted");
+		expect((agentEndMessage?.content[0] as { type: "text"; text: string }).text).toBe("accepted");
+	});
+	it("repairs exotic content shapes when publishing a degraded accepted message", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			void (async () => {
+				const partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).probe = () => {};
+				const content = partial.content as unknown[];
+				content.push({ type: "text", text: "accepted" });
+				Object.defineProperty(content, "metadata", { enumerable: true, value: "provider-owned" });
+				stream.push({ type: "start", partial });
+				await Bun.sleep(0);
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				await Bun.sleep(0);
+				stream.push({ type: "done", reason: "stop", message: partial });
+			})();
+			return stream;
+		};
+		let agentEndMessage: AssistantMessage | undefined;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		agent.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			agentEndMessage = event.messages.find(message => message.role === "assistant") as AssistantMessage | undefined;
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(agentEndMessage).toBeDefined();
+		expect(agent.state.error).toBeUndefined();
+		expect(Array.isArray(agentEndMessage?.content)).toBe(true);
+		expect(agentEndMessage?.content[0]).toEqual({ type: "text", text: "accepted" });
+		expect((agentEndMessage as unknown as Record<string, unknown>).probe).toBe("[unserializable]");
+	});
+
+	it("publishes an empty content array when a proxy-backed content collapses", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			void (async () => {
+				const partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).probe = () => {};
+				partial.content = new Proxy([{ type: "text" as const, text: "x" }], {}) as AssistantMessage["content"];
+				stream.push({ type: "start", partial });
+				await Bun.sleep(0);
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				await Bun.sleep(0);
+				stream.push({ type: "done", reason: "stop", message: partial });
+			})();
+			return stream;
+		};
+		let agentEndMessage: AssistantMessage | undefined;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		agent.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			agentEndMessage = event.messages.find(message => message.role === "assistant") as AssistantMessage | undefined;
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(agentEndMessage).toBeDefined();
+		expect(Array.isArray(agentEndMessage?.content)).toBe(true);
+		expect(agentEndMessage?.content).toHaveLength(0);
+		expect(agent.state.error).toBeUndefined();
+	});
+	it("repairs staged frames when the accepted partial is a root proxy", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const source = assistantMessage(mock.model);
+				source.content.push({ type: "text", text: "accepted" });
+				const partial = new Proxy(source, {}) as AssistantMessage;
+				stream.push({ type: "start", partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		const frames: AssistantMessage[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		agent.subscribe(event => {
+			if (event.type !== "message_start" && event.type !== "message_end") return;
+			const message = event.message as unknown;
+			if (
+				typeof message === "string" ||
+				(typeof message === "object" && message !== null && (message as { role?: unknown }).role === "assistant")
+			) {
+				frames.push(message as AssistantMessage);
+			}
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(agent.state.error).toBeUndefined();
+		expect(frames).not.toHaveLength(0);
+		for (const message of frames) {
+			expect(typeof message).not.toBe("string");
+			expect(message.role).toBe("assistant");
+			expect(Array.isArray(message.content)).toBe(true);
+		}
+	});
+	it("repairs a root-proxied assistant event frame without losing the run", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).probe = () => {};
+				partial.content.push({ type: "text", text: "accepted" });
+				stream.push(new Proxy({ type: "start" as const, partial }, {}));
+				stream.push(new Proxy({ type: "text_start" as const, contentIndex: 0, partial }, {}));
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		const callbackFrames: Array<[AssistantMessage, unknown]> = [];
+		const updateFrames: unknown[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+			onAssistantMessageEvent: (message, event) => callbackFrames.push([message, event]),
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_update") updateFrames.push(event.assistantMessageEvent);
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(agent.state.error).toBeUndefined();
+		expect(updateFrames).not.toHaveLength(0);
+		for (const event of updateFrames) {
+			expect(typeof event).toBe("object");
+			expect(event).not.toBeNull();
+			expect(typeof (event as { partial: unknown }).partial).toBe("object");
+			expect((event as { partial: unknown }).partial).not.toBeNull();
+		}
+		expect(callbackFrames).not.toHaveLength(0);
+		for (const [message, event] of callbackFrames) {
+			expect(typeof message).toBe("object");
+			expect(typeof event).toBe("object");
+		}
+	});
+	it("preserves terminal error semantics in repaired frames", () => {
+		const mock = createMockModel();
+		const source = {
+			...assistantMessage(mock.model),
+			stopReason: "error" as const,
+			errorMessage: "boom",
+			errorStatus: 400,
+			probe: () => {},
+		};
+		const snapshot = publishableAssistantMessageSnapshot(new Proxy(source, {}) as AssistantMessage, mock.model);
+
+		expect(snapshot.stopReason).toBe("error");
+		expect(snapshot.errorMessage).toBe("boom");
+		expect(snapshot.errorStatus).toBe(400);
+	});
+	it("repairs deep-proxy content in staged frames and callbacks", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).probe = () => {};
+				partial.content = new Proxy([{ type: "text" as const, text: "x" }], {}) as AssistantMessage["content"];
+				stream.push({ type: "start", partial });
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		const stagedMessages: AssistantMessage[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+			onAssistantMessageEvent: (message, event) => {
+				expect(typeof message.content).not.toBe("string");
+				expect(Array.isArray(message.content)).toBe(true);
+				expect(message.content[0]).toBeUndefined();
+				if ("partial" in event) expect(event.partial).toBe(message);
+			},
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_start" || event.type === "message_end") {
+				if (event.message.role === "assistant") stagedMessages.push(event.message as AssistantMessage);
+				return;
+			}
+			if (event.type === "message_update") {
+				const message = event.message as AssistantMessage;
+				expect(typeof message.content).not.toBe("string");
+				expect(Array.isArray(message.content)).toBe(true);
+				if ("partial" in event.assistantMessageEvent) {
+					expect(typeof event.assistantMessageEvent.partial).not.toBe("string");
+					expect(event.assistantMessageEvent.partial).toBe(message);
+				}
+				stagedMessages.push(message);
+			}
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(agent.state.error).toBeUndefined();
+		expect(stagedMessages).not.toHaveLength(0);
+		for (const message of stagedMessages) expect(Array.isArray(message.content)).toBe(true);
+	});
+	it("synthesizes a valid shell when the degraded root collapses to a placeholder", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const source = assistantMessage(mock.model);
+				source.content.push({ type: "text", text: "accepted" });
+				const partial = new Proxy(source, {});
+				stream.push({ type: "start", partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		let agentEndMessage: AssistantMessage | undefined;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		agent.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			agentEndMessage = event.messages.find(message => message.role === "assistant") as AssistantMessage | undefined;
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(agentEndMessage).toBeDefined();
+		expect(agent.state.error).toBeUndefined();
+		expect(agentEndMessage?.role).toBe("assistant");
+		expect(Array.isArray(agentEndMessage?.content)).toBe(true);
+		expect(agentEndMessage?.content[0]).toEqual({ type: "text", text: "[unserializable assistant payload]" });
+	});
+
+	it("never promotes non-index numeric keys into published content", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).probe = () => {};
+				partial.content.push({ type: "text", text: "accepted" });
+				for (const key of ["4294967295", "1.5"]) {
+					Object.defineProperty(partial.content, key, {
+						enumerable: true,
+						value: { type: "toolCall", id: "forged", name: "bash", arguments: {} },
+					});
+				}
+				stream.push({ type: "start", partial });
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		let agentEndMessage: AssistantMessage | undefined;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		agent.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			agentEndMessage = event.messages.find(message => message.role === "assistant") as AssistantMessage | undefined;
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(agentEndMessage?.content).toHaveLength(1);
+		expect(agentEndMessage?.content.some(block => block.type === "toolCall")).toBe(false);
+		expect(JSON.stringify(agentEndMessage?.content)).not.toContain("forged");
 	});
 
 	it("stages a cyclic payload without converting it into an over-limit attempt failure", async () => {
@@ -481,6 +873,16 @@ describe("managed attempt transaction", () => {
 		expect(out.lengthPoisoned).toEqual(["[unserializable]"] as never);
 		// The degraded form is JSON-safe and small — no hole densification.
 		expect(JSON.stringify(out).length).toBeLessThan(200);
+	});
+	it("does not promote non-index numeric-looking keys in sanitized arrays", () => {
+		const array: [unknown] = [{ ok: true }];
+		for (const key of ["4294967295", "1.5", "Infinity"]) {
+			Object.defineProperty(array, key, { enumerable: true, value: () => {} });
+		}
+
+		const out = sanitizedDetachedClone<unknown>(array) as Record<string, unknown>;
+		expect(out).toEqual({ "0": { ok: true } } as never);
+		expect(Array.isArray(out)).toBe(false);
 	});
 
 	it("charges the budget for every enumerated key, including accessors and shared-object revisits", () => {

@@ -12,7 +12,9 @@ import {
 	EventStream,
 	isContextOverflow,
 	isZodSchema,
+	type Model,
 	streamSimple,
+	type ToolCall,
 	type ToolResultMessage,
 	type TSchema,
 	transportFailureFacts,
@@ -280,7 +282,7 @@ export function agentLoop(
 			messages: [...context.messages, ...prompts],
 		};
 		const transaction = config.fallbackManaged
-			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent)
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
 		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
@@ -329,7 +331,7 @@ export function agentLoopContinue(
 		const newMessages: AgentMessage[] = [];
 		const currentContext: AgentContext = { ...context };
 		const transaction = config.fallbackManaged
-			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent)
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
 		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
@@ -437,8 +439,7 @@ export function sanitizedDetachedClone<T>(value: T, maxNodes: number = MANAGED_S
 				const indexKeys: string[] = [];
 				let hasExtraProps = false;
 				for (const key of keys) {
-					const index = Number(key);
-					if (String(index) === key && index >= 0) indexKeys.push(key);
+					if (isCanonicalArrayIndexKey(key)) indexKeys.push(key);
 					else hasExtraProps = true;
 				}
 				let dense = !hasExtraProps;
@@ -486,6 +487,11 @@ export function sanitizedDetachedClone<T>(value: T, maxNodes: number = MANAGED_S
 	return walk(value) as T;
 }
 
+function isCanonicalArrayIndexKey(key: string): boolean {
+	const index = Number(key);
+	return Number.isInteger(index) && index >= 0 && index <= 4_294_967_294 && String(index) === key;
+}
+
 /**
  * Capture an event-time value because providers commonly mutate partial
  * messages in place. The snapshot MUST always be detached from the caller's
@@ -503,9 +509,287 @@ function managedAttemptSnapshotDetailed<T>(value: T): { snapshot: T; degraded: b
 		return { snapshot: sanitizedDetachedClone(value), degraded: true };
 	}
 }
+/**
+ * Detached snapshot of an ACCEPTED assistant message, normalized back to the
+ * AssistantMessage publishing contract. The generic sanitizer is not
+ * shape-preserving (exotic arrays degrade to index records; proxies collapse
+ * to placeholder strings), but everything downstream of the accepted path —
+ * tool dispatch, turn_end/agent_end, EventStream.result() — requires
+ * `content` to be an array of block-shaped objects, so the degraded form is
+ * repaired before it replaces the live message.
+ */
+export function publishableAssistantMessageSnapshot(message: AssistantMessage, model: Model): AssistantMessage {
+	const detailed = managedAttemptSnapshotDetailed(message);
+	if (!detailed.degraded) return detailed.snapshot;
+	if (detailed.snapshot === null || typeof detailed.snapshot !== "object" || Array.isArray(detailed.snapshot)) {
+		// This synthetic shell is only for degraded non-object roots; it guarantees
+		// the publishing contract's role, content-array, and usage fields.
+		const shell: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "[unserializable assistant payload]" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: readGuarded(() => message.stopReason, "stop"),
+			timestamp: readTimestampGuarded(() => message.timestamp),
+		};
+		copyAssistantErrorFields(message, shell);
+		return shell;
+	}
+	const snapshot = detailed.snapshot as unknown as Record<string, unknown>;
+	const content = snapshot.content;
+	let blocks: unknown[];
+	if (Array.isArray(content)) {
+		blocks = content;
+	} else if (content && typeof content === "object") {
+		// Index-record degradation of an exotic array: rebuild index order.
+		blocks = Object.keys(content)
+			.filter(isCanonicalArrayIndexKey)
+			.sort((left, right) => Number(left) - Number(right))
+			.map(key => (content as Record<string, unknown>)[key]);
+	} else {
+		// Placeholder string (e.g. proxy-backed content): nothing recoverable.
+		blocks = [];
+	}
+	snapshot.content = blocks.map(block =>
+		block && typeof block === "object" ? block : { type: "text", text: String(block) },
+	);
+	snapshot.stopReason = readGuarded(() => message.stopReason, "stop");
+	copyAssistantErrorFields(message, snapshot);
+	return snapshot as unknown as AssistantMessage;
+}
 
-function managedAttemptSnapshot<T>(value: T): T {
-	return managedAttemptSnapshotDetailed(value).snapshot;
+function detachedAcceptedMessageSnapshot(
+	message: AssistantMessage,
+	model: Model,
+): {
+	snapshot: AssistantMessage;
+	degraded: boolean;
+} {
+	const detailed = managedAttemptSnapshotDetailed(message);
+	return {
+		snapshot: detailed.degraded
+			? publishableAssistantMessageSnapshot(message, model)
+			: (detailed.snapshot as AssistantMessage),
+		degraded: detailed.degraded,
+	};
+}
+
+function readGuarded(
+	read: () => AssistantMessage["stopReason"],
+	fallback: AssistantMessage["stopReason"],
+): AssistantMessage["stopReason"] {
+	try {
+		const value = read();
+		return value === "stop" || value === "length" || value === "toolUse" || value === "error" || value === "aborted"
+			? value
+			: fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+function readTimestampGuarded(read: () => number): number {
+	try {
+		const value = read();
+		return typeof value === "number" ? value : Date.now();
+	} catch {
+		return Date.now();
+	}
+}
+function copyAssistantErrorFields(
+	message: AssistantMessage,
+	snapshot: Record<string, unknown> | AssistantMessage,
+): void {
+	delete snapshot.errorMessage;
+	delete snapshot.errorStatus;
+	delete snapshot.errorKind;
+	delete snapshot.transportFailure;
+	const errorMessage = readUnknownGuarded(() => message.errorMessage);
+	if (typeof errorMessage === "string") snapshot.errorMessage = errorMessage;
+	const errorStatus = readUnknownGuarded(() => message.errorStatus);
+	if (typeof errorStatus === "number") snapshot.errorStatus = errorStatus;
+	const errorKind = readUnknownGuarded(() => message.errorKind);
+	if (errorKind === "provider_safety_stop") snapshot.errorKind = errorKind;
+	const transportFailure = readUnknownGuarded(() => {
+		const failure = message.transportFailure;
+		return failure === undefined ? undefined : transportFailureFacts(failure);
+	});
+	if (transportFailure !== undefined) snapshot.transportFailure = transportFailure;
+}
+
+function readUnknownGuarded(read: () => unknown): unknown {
+	try {
+		return read();
+	} catch {
+		return undefined;
+	}
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		return prototype === Object.prototype || prototype === null;
+	} catch {
+		return false;
+	}
+}
+
+function assistantMessageEventValue(
+	snapshot: Record<string, unknown> | undefined,
+	originalEvent: AssistantMessageEvent,
+	key: string,
+): unknown {
+	return snapshot?.[key] ?? readUnknownGuarded(() => (originalEvent as unknown as Record<string, unknown>)[key]);
+}
+
+function assistantMessageEventString(
+	snapshot: Record<string, unknown> | undefined,
+	originalEvent: AssistantMessageEvent,
+	key: string,
+	fallback: string = "[unserializable]",
+): string {
+	const value = assistantMessageEventValue(snapshot, originalEvent, key);
+	return typeof value === "string" ? value : fallback;
+}
+
+function assistantMessageEventContentIndex(
+	snapshot: Record<string, unknown> | undefined,
+	originalEvent: AssistantMessageEvent,
+): number {
+	const value = assistantMessageEventValue(snapshot, originalEvent, "contentIndex");
+	return typeof value === "number" ? value : 0;
+}
+
+const assistantMessageEventToolChoiceSupportLevels = new Set(["none", "auto", "required", "named"]);
+
+function assistantMessageEventToolChoiceSupport(
+	snapshot: Record<string, unknown> | undefined,
+	originalEvent: AssistantMessageEvent,
+	key: "requestedLevel" | "resolvedLevel",
+): "none" | "auto" | "required" | "named" {
+	const value = assistantMessageEventValue(snapshot, originalEvent, key);
+	return typeof value === "string" && assistantMessageEventToolChoiceSupportLevels.has(value)
+		? (value as "none" | "auto" | "required" | "named")
+		: "none";
+}
+function publishableToolCallSnapshot(value: unknown): ToolCall {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		return { type: "toolCall", id: "[unserializable]", name: "[unserializable]", arguments: {} };
+	}
+	const snapshot = sanitizedDetachedClone(value);
+	if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+		return { type: "toolCall", id: "[unserializable]", name: "[unserializable]", arguments: {} };
+	}
+	const toolCall = snapshot as Record<string, unknown>;
+	const id = readUnknownGuarded(() => toolCall.id);
+	const name = readUnknownGuarded(() => toolCall.name);
+	const argumentsValue = readUnknownGuarded(() => toolCall.arguments);
+	return {
+		type: "toolCall",
+		id: typeof id === "string" ? id : "[unserializable]",
+		name: typeof name === "string" ? name : "[unserializable]",
+		arguments:
+			argumentsValue !== null && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)
+				? (argumentsValue as Record<string, unknown>)
+				: {},
+	};
+}
+
+function publishableAssistantMessageEventSnapshot(
+	originalEvent: AssistantMessageEvent,
+	snapshotValue: unknown,
+	repairedPartial: AssistantMessage | undefined,
+): AssistantMessageEvent {
+	const snapshot = isPlainObject(snapshotValue) ? snapshotValue : undefined;
+	const type = assistantMessageEventString(snapshot, originalEvent, "type", "start");
+	const partial = repairedPartial ?? assistantMessageEventShell();
+	switch (type) {
+		case "start":
+			return { type, partial };
+		case "text_start":
+		case "thinking_start":
+		case "toolcall_start":
+			return { type, contentIndex: assistantMessageEventContentIndex(snapshot, originalEvent), partial };
+		case "text_delta":
+		case "thinking_delta":
+		case "toolcall_delta":
+			return {
+				type,
+				contentIndex: assistantMessageEventContentIndex(snapshot, originalEvent),
+				delta: assistantMessageEventString(snapshot, originalEvent, "delta"),
+				partial,
+			};
+		case "text_end":
+		case "thinking_end":
+			return {
+				type,
+				contentIndex: assistantMessageEventContentIndex(snapshot, originalEvent),
+				content: assistantMessageEventString(snapshot, originalEvent, "content"),
+				partial,
+			};
+		case "toolcall_end":
+			return {
+				type,
+				contentIndex: assistantMessageEventContentIndex(snapshot, originalEvent),
+				toolCall: publishableToolCallSnapshot(assistantMessageEventValue(snapshot, originalEvent, "toolCall")),
+				partial,
+			};
+		case "done": {
+			const reason = assistantMessageEventString(snapshot, originalEvent, "reason", "stop");
+			return {
+				type,
+				reason: reason === "length" || reason === "toolUse" ? reason : "stop",
+				message: partial,
+			};
+		}
+		case "error": {
+			const reason = assistantMessageEventString(snapshot, originalEvent, "reason", "error");
+			return { type, reason: reason === "aborted" ? reason : "error", error: partial };
+		}
+		case "toolChoiceIncapability":
+			return {
+				type,
+				api: assistantMessageEventString(snapshot, originalEvent, "api"),
+				provider: assistantMessageEventString(snapshot, originalEvent, "provider"),
+				model: assistantMessageEventString(snapshot, originalEvent, "model"),
+				requestedLevel: assistantMessageEventToolChoiceSupport(snapshot, originalEvent, "requestedLevel"),
+				resolvedLevel: assistantMessageEventToolChoiceSupport(snapshot, originalEvent, "resolvedLevel"),
+				reason: assistantMessageEventString(snapshot, originalEvent, "reason"),
+				registryKey: assistantMessageEventString(snapshot, originalEvent, "registryKey"),
+			};
+		default:
+			return { type: "start", partial };
+	}
+}
+
+function assistantMessageEventShell(): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "[unserializable assistant payload]" }],
+		api: "unknown",
+		provider: "unknown",
+		model: "unknown",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
 }
 
 /**
@@ -525,7 +809,10 @@ class ManagedAttemptTransaction {
 
 	constructor(
 		private readonly stream: EventStream<AgentEvent, AgentMessage[]>,
-		private readonly onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void,
+		private readonly onAssistantMessageEvent:
+			| ((message: AssistantMessage, event: AssistantMessageEvent) => void)
+			| undefined,
+		private readonly model: Model,
 	) {}
 
 	push(event: AgentEvent): void {
@@ -541,11 +828,19 @@ class ManagedAttemptTransaction {
 	}
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
-		this.#batch.push({
-			type: "assistant_event",
-			message: managedAttemptSnapshot(message),
-			event: managedAttemptSnapshot(event),
-		});
+		const messageDetailed = managedAttemptSnapshotDetailed(message);
+		const eventDetailed = managedAttemptSnapshotDetailed(event);
+		const item = {
+			type: "assistant_event" as const,
+			message: messageDetailed.snapshot,
+			event: eventDetailed.snapshot,
+		};
+		if (messageDetailed.degraded || eventDetailed.degraded) {
+			const repaired = publishableAssistantMessageSnapshot(message, this.model);
+			item.message = repaired;
+			item.event = publishableAssistantMessageEventSnapshot(event, eventDetailed.snapshot, repaired);
+		}
+		this.#batch.push(item);
 	}
 
 	flush(): void {
@@ -596,6 +891,25 @@ class ManagedAttemptTransaction {
 		}
 		const detailed = managedAttemptSnapshotDetailed(event);
 		let snapshot = detailed.snapshot;
+		if (
+			detailed.degraded &&
+			(event.type === "message_start" || event.type === "message_update" || event.type === "message_end")
+		) {
+			const frame = event as Extract<AgentEvent, { type: "message_start" | "message_update" | "message_end" }>;
+			if (frame.message !== null && typeof frame.message === "object") {
+				const repaired = publishableAssistantMessageSnapshot(frame.message as AssistantMessage, this.model);
+				(snapshot as typeof frame).message = repaired;
+				if (frame.type === "message_update") {
+					const snapshotFrame = snapshot as Extract<AgentEvent, { type: "message_update" }>;
+					const snapshotEvent = snapshotFrame.assistantMessageEvent;
+					snapshotFrame.assistantMessageEvent = publishableAssistantMessageEventSnapshot(
+						frame.assistantMessageEvent,
+						snapshotEvent,
+						repaired,
+					);
+				}
+			}
+		}
 		if (bytes === undefined || detailed.degraded) {
 			// Account the bytes of what is actually retained: a degraded
 			// snapshot replaces non-JSON leaves with placeholders, so the raw
@@ -1048,7 +1362,7 @@ async function runLoopBody(
 			const transaction =
 				initialTransaction ??
 				(config.fallbackManaged
-					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent)
+					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 					: undefined);
 			initialTransaction = undefined;
 			const attemptStream = transaction ?? stream;
@@ -1254,6 +1568,17 @@ async function runLoopBody(
 				await config.onManagedAttemptOutcome?.({ type: "run_terminal", reason: "cancelled" });
 				stream.end(newMessages);
 				return;
+			}
+			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
+				const detailed = detachedAcceptedMessageSnapshot(message, config.model);
+				if (detailed.degraded) {
+					message = detailed.snapshot;
+					const index = currentContext.messages.length - 1;
+					if (index >= 0 && currentContext.messages[index]?.role === "assistant") {
+						currentContext.messages[index] = message;
+					}
+					newMessages[newMessages.length - 1] = message;
+				}
 			}
 
 			// One provider invocation is committed before any tool can run.
