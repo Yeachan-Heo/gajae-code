@@ -46,6 +46,47 @@ describe("compiled daemon smoke coverage", () => {
 		]);
 		return { exitCode, stdout, stderr, timedOut };
 	}
+	const cliEntrypoint = path.join(repoRoot, "packages/coding-agent/src/cli.ts");
+
+	function rootCliStaticImports(source: string): string[] {
+		const importsFrom = Array.from(source.matchAll(/^import[\s\S]*?from\s+["']([^"']+)["'];?$/gm), match => match[1]);
+		const sideEffectImports = Array.from(source.matchAll(/^import\s+["']([^"']+)["'];?$/gm), match => match[1]);
+		return [...importsFrom, ...sideEffectImports];
+	}
+
+	test("root CLI defers the chat daemon bus graph while the hidden daemon child still spawns", async () => {
+		const agentDir = tempDir("gjc-chat-daemon-root-entry-");
+		const cwd = tempDir("gjc-chat-daemon-root-cwd-");
+		const configPath = path.join(agentDir, "config.yml");
+		const config = "notifications:\n  enabled: false\n";
+		fs.writeFileSync(configPath, config);
+		try {
+			const staticImports = rootCliStaticImports(fs.readFileSync(cliEntrypoint, "utf8"));
+			expect(staticImports).not.toContain("./sdk/bus/chat-daemon-cli");
+
+			const result = await runWithTimeout(
+				[
+					"bun",
+					"run",
+					cliEntrypoint,
+					"daemon",
+					"discord-internal",
+					"--owner-id",
+					`${process.pid}-root-entry-test`,
+					"--agent-dir",
+					agentDir,
+				],
+				{ cwd },
+				10_000,
+			);
+			expect(result.timedOut).toBe(false);
+			expect(`${result.exitCode}\n${result.stdout}\n${result.stderr}`).toStartWith("0\n");
+			expect(fs.readFileSync(configPath, "utf8")).toBe(config);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
 
 	async function buildCompiledDaemonSmokeBinary(outPath: string): Promise<void> {
 		const proc = Bun.spawn(["bun", "run", "build"], {
