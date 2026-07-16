@@ -743,6 +743,9 @@ function buildHandoffModeStateRecoveryMessage(skill: GjcWorkflowSkill, phase: st
 }
 
 function buildHandoffForceAskMessage(skill: GjcWorkflowSkill, phase: string, statePath: string): string {
+	if (skill === "deep-interview" && phase.trim().toLowerCase() === "interviewing") {
+		return `GJC deep-interview is still interviewing and must not stop (${statePath}). Continue the active round immediately: score and persist an answered round, then report progress. Use the ask tool for the next question. Only stop after crystallizing, recording a handoff, or explicitly cancelling the workflow. ${buildHandoffStopReleaseGuidance(skill)}`;
+	}
 	return `GJC handoff skill "${skill}" must not stop without offering a next step (phase: ${phase}; state: ${statePath}). ${buildHandoffStopReleaseGuidance(skill)}`;
 }
 

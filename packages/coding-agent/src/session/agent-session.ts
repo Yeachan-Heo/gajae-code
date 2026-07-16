@@ -72,6 +72,7 @@ import {
 import type {
 	AssistantMessage,
 	Context,
+	DeveloperMessage,
 	Effort,
 	ImageContent,
 	Message,
@@ -229,7 +230,7 @@ import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime"
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
-import { ensureWorkflowSkillActivationState } from "../hooks/skill-state";
+import { buildSkillStopOutput, ensureWorkflowSkillActivationState } from "../hooks/skill-state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { resolveMemoryBackend } from "../memory-backend";
@@ -1417,6 +1418,8 @@ export class AgentSession {
 	#fallbackInvocationId = 0;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
+	#deepInterviewStopReminderCount = 0;
+	#lastDeepInterviewReminderAssistantTimestamp: number | undefined = undefined;
 	#lastGoalReminderAssistantTimestamp: number | undefined = undefined;
 	#todoPhases: TodoPhase[] = [];
 	#toolChoiceQueue = new ToolChoiceQueue();
@@ -2617,6 +2620,10 @@ export class AgentSession {
 		// a later raw listener cannot revive a cancelled/replaced continuation.
 		const maintenanceGeneration =
 			event.type === "agent_end" && event.stopReason === "maintenance" ? this.#promptGeneration : undefined;
+		// Same pre-yield capture for ordinary agent_end stops: the deep-interview
+		// continuation check reads durable stop-state asynchronously and must stay
+		// bound to the generation that produced this stop.
+		const agentEndGeneration = event.type === "agent_end" ? this.#promptGeneration : undefined;
 		const maintenanceWasDisposed = this.#isDisposed;
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
@@ -3130,6 +3137,9 @@ export class AgentSession {
 			}
 			if (msg.stopReason !== "error" && msg.stopReason !== "aborted") {
 				if (this.#enforceRewindBeforeYield()) {
+					return;
+				}
+				if (await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration)) {
 					return;
 				}
 				if (await this.#checkGoalCompletion(msg)) {
@@ -6508,6 +6518,10 @@ export class AgentSession {
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
+			if (message.role === "user") {
+				this.#deepInterviewStopReminderCount = 0;
+				this.#lastDeepInterviewReminderAssistantTimestamp = undefined;
+			}
 
 			// Validate model
 			if (!this.model) {
@@ -9854,6 +9868,65 @@ export class AgentSession {
 			timestamp: Date.now(),
 		});
 		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+		return true;
+	}
+	async #checkActiveDeepInterviewCompletion(
+		assistantMessage: AssistantMessage,
+		agentEndGeneration: number | undefined,
+	): Promise<boolean> {
+		if (agentEndGeneration === undefined || agentEndGeneration !== this.#promptGeneration) return false;
+		// One continuation decision per assistant stop: a duplicated agent_end for
+		// the same assistant message must not append a second reminder, consume a
+		// second attempt, or schedule a second successor turn. Recorded before the
+		// async stop-state read so concurrent duplicate deliveries collapse too.
+		if (this.#lastDeepInterviewReminderAssistantTimestamp === assistantMessage.timestamp) return false;
+		if (this.#deepInterviewStopReminderCount >= 2) return false;
+		this.#lastDeepInterviewReminderAssistantTimestamp = assistantMessage.timestamp;
+
+		const output = await buildSkillStopOutput({
+			cwd: this.sessionManager.getCwd(),
+			sessionId: this.sessionManager.getSessionId(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		});
+		// The stop-state read yielded: an abort or a newer prompt may own the
+		// session now. A stale handler must not revive cancelled work.
+		if (this.#isDisposed || agentEndGeneration !== this.#promptGeneration) return false;
+		if (output?.decision !== "block") return false;
+		const stopReason = typeof output.stopReason === "string" ? output.stopReason : "";
+		// Deep-interview gates only. Re-validate the schema-sanitized token here
+		// because it is about to appear inside developer-authority text.
+		if (!/^gjc_skill_deep_interview_[a-z0-9_]{1,80}$/.test(stopReason)) return false;
+
+		this.#deepInterviewStopReminderCount++;
+		// Code-owned reminder only: output.systemMessage embeds schema-permitted
+		// workflow-state/path strings (mode-state phase, statePath, diagnostics).
+		// Promoting those verbatim would hand repository-controlled content
+		// developer authority, so none of them are included here.
+		const reminder = [
+			"<system-reminder>",
+			`You stopped while the GJC deep-interview workflow is still active (stop gate: ${stopReason}).`,
+			"Continue the active round immediately: score and persist the answered round, report progress, then use the ask tool for the next question.",
+			"Only stop after crystallizing the spec, recording a handoff, or explicitly cancelling the workflow.",
+			`(Continuation ${this.#deepInterviewStopReminderCount}/2 for this prompt)`,
+			"</system-reminder>",
+		].join("\n");
+		const reminderMessage: DeveloperMessage = {
+			role: "developer",
+			content: [{ type: "text", text: reminder }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+		logger.debug("Deep-interview continuation: sending stop reminder", {
+			stopReason,
+			attempt: this.#deepInterviewStopReminderCount,
+		});
+		this.agent.appendMessage(reminderMessage);
+		// Persist to the canonical transcript as well: agent.appendMessage alone
+		// keeps the reminder in in-memory agent state, losing the causal
+		// assistant stop → developer reminder → continuation ordering on
+		// reload/export.
+		this.sessionManager.appendMessage(reminderMessage);
+		this.#scheduleAgentContinue({ generation: agentEndGeneration, skipCompactionCheck: true });
 		return true;
 	}
 	/**
