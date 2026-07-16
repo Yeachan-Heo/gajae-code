@@ -10,12 +10,18 @@ export type TransportHeaders = Headers | Record<string, string | undefined>;
 /**
  * Structured facts from an upstream HTTP or transport failure. Retry decisions
  * must use these facts rather than provider- or application-owned error text.
+ *
+ * `headers` is always a plain record limited to the retained retry-signal
+ * entries: facts travel on persisted `AssistantMessage`s and through
+ * `structuredClone` snapshots (managed fallback attempt staging), so they must
+ * never carry a live `Headers` instance — cloning one throws `DataCloneError`
+ * ("The object can not be cloned.") and masks the real provider failure.
  */
 export interface TransportFailureFacts {
 	kind: "transport";
 	status?: number;
 	providerCode?: string;
-	headers?: TransportHeaders;
+	headers?: Record<string, string>;
 }
 
 /** Opaque per-invocation marker required by managed fallback transport calls. */
@@ -68,6 +74,47 @@ function isTransportHeaders(value: unknown): value is TransportHeaders {
 	return value instanceof Headers || (!!value && typeof value === "object");
 }
 
+/** Retry-signal headers retained on transport facts; everything else is dropped. */
+const RETAINED_TRANSPORT_HEADERS = ["retry-after", "retry-after-ms"] as const;
+
+const RETAINED_TRANSPORT_HEADER_SET: ReadonlySet<string> = new Set(RETAINED_TRANSPORT_HEADERS);
+
+/**
+ * Reduce transport headers to the retained retry-signal entries in a plain
+ * record, so facts stay structured-cloneable and JSON-serializable and never
+ * persist arbitrary response headers into session files.
+ *
+ * Exception-safe by contract: header inspection runs in a single enumeration
+ * inside a catch (record getters are read at most once), and any failure
+ * omits headers instead of throwing — status/providerCode facts extracted by
+ * the caller must survive a hostile headers object.
+ */
+function retainedHeaderRecord(headers: TransportHeaders | undefined): Record<string, string> | undefined {
+	if (headers === undefined) return undefined;
+	let record: Record<string, string> | undefined;
+	try {
+		if (headers instanceof Headers) {
+			for (const name of RETAINED_TRANSPORT_HEADERS) {
+				const value = headers.get(name);
+				if (value === null) continue;
+				record ??= {};
+				record[name] = value;
+			}
+			return record;
+		}
+		for (const [key, value] of Object.entries(headers)) {
+			if (typeof value !== "string") continue;
+			const name = key.toLowerCase();
+			if (!RETAINED_TRANSPORT_HEADER_SET.has(name)) continue;
+			record ??= {};
+			record[name] = value;
+		}
+		return record;
+	} catch {
+		return undefined;
+	}
+}
+
 /** Extracts only explicit HTTP/transport metadata; it never parses error text. */
 export function transportFailureFacts(
 	error: unknown,
@@ -93,11 +140,16 @@ export function transportFailureFacts(
 						: typeof value.error?.type === "string"
 							? value.error.type
 							: undefined;
-	const headers = isTransportHeaders(value.headers)
+	const rawHeaders = isTransportHeaders(value.headers)
 		? value.headers
 		: isTransportHeaders(value.response?.headers)
 			? value.response.headers
 			: capturedResponse?.headers;
+	// Normalize BEFORE the existence gate so normalization is idempotent:
+	// facts built from an error whose headers carry no retained retry signal
+	// must not exist on the first pass and then vanish when re-normalized
+	// (consumers deliberately re-run transportFailureFacts on embedded facts).
+	const headers = retainedHeaderRecord(rawHeaders);
 	const normalizedCode = providerCode?.toLowerCase();
 	if (
 		status === undefined &&

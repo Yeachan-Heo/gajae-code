@@ -856,11 +856,7 @@ describe("openai-codex streaming", () => {
 			status: 429,
 			providerCode: "rate_limit_exceeded",
 		});
-		expect(
-			result.transportFailure?.headers instanceof Headers
-				? result.transportFailure.headers.get("retry-after")
-				: undefined,
-		).toBe("600");
+		expect(result.transportFailure?.headers).toEqual({ "retry-after": "600" });
 		expect(classifyFallbackTrigger(result.transportFailure)).toEqual({ class: "rate_limit", retryAfterMs: 600_000 });
 	});
 
