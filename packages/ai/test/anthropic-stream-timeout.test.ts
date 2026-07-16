@@ -206,6 +206,93 @@ describe("anthropic first-event timeout retries", () => {
 		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
 	});
 
+	it("keeps retrying unified-limit 429s that still advertise fallback capacity", async () => {
+		// Field incident (2026-07-16): unified-5h-status=rejected with
+		// fallback-percentage=0.5 and overage merely org-disabled. Requests
+		// succeeded again within minutes (the unified window is rolling and a
+		// fraction of requests keeps being accepted), but the exhaustion
+		// fast-path saw retry-after=13262s (> cap) plus the "request would
+		// exceed" body text and declared the session terminally exhausted
+		// after a single attempt. With fallback capacity advertised, the
+		// wrapper must strip the worst-case retry-after hint (the SDK obeys
+		// retry-after verbatim, so passthrough would sleep for hours) and let
+		// the SDK spend its bounded default backoff budget instead.
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: {
+						type: "rate_limit_error",
+						message: "This request would exceed your account's rate limit. Please try again later.",
+					},
+				}),
+				{
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						"retry-after": "13262",
+						"anthropic-ratelimit-unified-status": "rejected",
+						"anthropic-ratelimit-unified-5h-status": "rejected",
+						"anthropic-ratelimit-unified-fallback-percentage": "0.5",
+						"anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+					},
+				},
+			);
+		}) as FetchImpl;
+
+		const result = await streamAnthropic(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			requestMaxRetries: 1,
+		}).result();
+
+		// Bounded retry happened (initial + 1) instead of a single-shot
+		// terminal failure; the final error stays an honest 429.
+		expect(attempts).toBe(2);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(429);
+		expect(result.errorMessage).toContain("rate_limit_error");
+	});
+
+	it("still fails fast when fallback is advertised but credits are out", async () => {
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: {
+						type: "rate_limit_error",
+						message: "This request would exceed your account's rate limit. Please try again later.",
+					},
+				}),
+				{
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						"retry-after": "62291",
+						"anthropic-ratelimit-unified-status": "rejected",
+						"anthropic-ratelimit-unified-fallback-percentage": "0.5",
+						"anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
+					},
+				},
+			);
+		}) as FetchImpl;
+
+		const result = await streamAnthropic(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			requestMaxRetries: 1,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(429);
+		expect(result.errorMessage).toContain("out_of_credits");
+	});
+
 	it("does not arm the Anthropic first-event watchdog before the stream connects", async () => {
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
 			return createAnthropicMockStream({

@@ -932,6 +932,22 @@ function isAnthropicUsageExhaustionResponse(
 ): boolean {
 	const overageReason = headers.get("anthropic-ratelimit-unified-overage-disabled-reason")?.toLowerCase();
 	if (overageReason === "out_of_credits") return true;
+	// A unified-limit rejection that still advertises fallback capacity is a
+	// rolling/probabilistic rejection, not exhaustion-until-reset: Anthropic
+	// keeps accepting a fraction of requests (fallback-percentage) while the
+	// window drains. Observed in the field: unified-5h-status=rejected,
+	// retry-after=13262s, fallback-percentage=0.5,
+	// overage-disabled-reason=org_level_disabled -- requests succeeded again
+	// within minutes, while this function declared the session terminally
+	// exhausted (both via the retry-after cap below and the "request would
+	// exceed" body match). Such responses get a bounded retry instead (the
+	// wrapper below strips the worst-case retry-after hint so the SDK's
+	// default exponential backoff applies). out_of_credits stays terminal
+	// above: no fallback fraction saves missing credits.
+	const fallbackPercentage = Number.parseFloat(
+		headers.get("anthropic-ratelimit-unified-fallback-percentage") ?? "",
+	);
+	if (Number.isFinite(fallbackPercentage) && fallbackPercentage > 0) return false;
 	if (retryAfterMs !== undefined && retryAfterMs > retryDelayCapMs) return true;
 
 	try {
@@ -961,7 +977,24 @@ function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDe
 				.clone()
 				.text()
 				.catch(() => "");
-			if (!isAnthropicUsageExhaustionResponse(bodyText, headers, retryAfterMs, retryDelayCapMs)) return response;
+			if (!isAnthropicUsageExhaustionResponse(bodyText, headers, retryAfterMs, retryDelayCapMs)) {
+				// Non-exhaustion 429 with an oversized retry-after (today that is
+				// exactly the fallback-capacity case): the SDK obeys retry-after
+				// VERBATIM ("If the API asks us to wait ..., just do what it
+				// says"), so passing it through would trade the old fail-fast for
+				// a silent multi-hour sleep. Drop the worst-case hint and let the
+				// SDK spend its bounded default backoff (0.5s..8s exponential).
+				if (retryAfterMs !== undefined && retryAfterMs > retryDelayCapMs) {
+					headers.delete("retry-after");
+					headers.delete("retry-after-ms");
+					return new Response(bodyText, {
+						status: response.status,
+						statusText: response.statusText,
+						headers,
+					});
+				}
+				return response;
+			}
 
 			headers.set("x-should-retry", "false");
 			return new Response(appendAnthropicRateLimitEvidence(bodyText, headers), {
