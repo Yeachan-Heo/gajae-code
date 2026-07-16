@@ -122,6 +122,7 @@ function createContext(): {
 	const editor: FakeEditor = {
 		setText(text: string) {
 			editorText = text;
+			editor.onChange?.(text);
 		},
 		getText() {
 			return editorText;
@@ -871,10 +872,9 @@ describe("InputController escape behavior", () => {
 });
 describe("InputController command palette", () => {
 	it("runs registered actions directly and excludes unsupported actions and self-reentry", () => {
-		const { ctx, editor } = createContext();
+		const { ctx } = createContext();
 		const showCommandPalette = vi.fn();
 		ctx.showCommandPalette = showCommandPalette;
-		(editor as unknown as { handleInput: ReturnType<typeof vi.fn> }).handleInput = vi.fn();
 		(ctx.keybindings as unknown as { getKeys(action: string): string[] }).getKeys = action =>
 			action === "app.session.tree" ? ["ctrl+d"] : [];
 		const controller = new InputController(ctx);
@@ -894,32 +894,45 @@ describe("InputController command palette", () => {
 		expect(ctx.showTreeSelector).toHaveBeenCalledTimes(1);
 		fork?.handler();
 		expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
-		expect((editor as unknown as { handleInput: ReturnType<typeof vi.fn> }).handleInput).not.toHaveBeenCalled();
 		expect(actions.some(action => action.id === "app.session.delete")).toBe(false);
 		expect(actions.some(action => action.id === "app.commandPalette.open")).toBe(false);
 	});
 
-	it("restores the draft and pending images after executing a slash command", () => {
+	it("restores the draft and pending images after delayed slash command cleanup", async () => {
 		const { ctx, editor } = createContext();
 		const showCommandPalette = vi.fn();
 		ctx.showCommandPalette = showCommandPalette;
 		const attachment = { type: "image", data: "attachment" } as InteractiveModeContext["pendingImages"][number];
 		ctx.pendingImages = [attachment];
-		editor.setText("existing draft");
-		const input = editor as unknown as {
-			handleInput: ReturnType<typeof vi.fn>;
-		};
-		input.handleInput = vi.fn();
+		let resolveChangelog!: () => void;
+		const changelog = new Promise<void>(resolve => {
+			resolveChangelog = resolve;
+		});
+		ctx.handleChangelogCommand = vi.fn(() => changelog);
 		const controller = new InputController(ctx);
-		controller.createAutocompleteProvider([{ name: "help" }] as SlashCommand[], "");
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		const onChange = editor.onChange;
+		const emptyChanges = vi.fn();
+		editor.onChange = text => {
+			onChange?.(text);
+			if (!text) emptyChanges();
+		};
+		editor.setText("existing draft [image 1]");
+		controller.createAutocompleteProvider([{ name: "changelog" }] as SlashCommand[], "");
 
 		controller.openCommandPalette();
 
-		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => void;
-		executeSlashCommand("help");
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+		const execution = executeSlashCommand("changelog");
+		await Promise.resolve();
+		expect(ctx.handleChangelogCommand).toHaveBeenCalledTimes(1);
 
-		expect(input.handleInput).toHaveBeenCalledWith("\n");
-		expect(editor.getText()).toBe("existing draft");
+		resolveChangelog();
+		await execution;
+
+		expect(editor.getText()).toBe("existing draft [image 1]");
+		expect(emptyChanges).toHaveBeenCalledTimes(1);
 		expect(ctx.pendingImages).toEqual([attachment]);
 	});
 });

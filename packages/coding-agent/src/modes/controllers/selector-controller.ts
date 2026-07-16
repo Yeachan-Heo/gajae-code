@@ -735,7 +735,7 @@ export class SelectorController {
 	showCommandPalette(
 		commands: SlashCommand[],
 		actions: CommandPaletteAction[],
-		executeSlashCommand: (name: string) => void,
+		executeSlashCommand: (name: string) => Promise<void>,
 	): void {
 		const seenCommands = new Set<string>();
 		const entries: CommandPaletteEntry[] = [
@@ -767,7 +767,7 @@ export class SelectorController {
 				entries,
 				entry => {
 					done();
-					entry.handler?.();
+					void entry.handler?.();
 				},
 				done,
 			);
