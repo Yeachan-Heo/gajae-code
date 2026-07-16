@@ -230,7 +230,11 @@ describe("lsp regressions", () => {
 		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
-		const renderOptions: RenderResultOptions = { expanded: false, isPartial: false };
+		const renderOptions: RenderResultOptions = {
+			expanded: false,
+			isPartial: false,
+			expandHintCapability: () => false,
+		};
 
 		const call = renderCall(
 			{ action: "definition", file: "src/example.ts", line: 10, symbol: "foo\tbar\nbaz" },
@@ -268,7 +272,11 @@ describe("lsp regressions", () => {
 		const theme = await getThemeByName("red-claw");
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
-		const renderOptions: RenderResultOptions = { expanded: false, isPartial: false };
+		const renderOptions: RenderResultOptions = {
+			expanded: false,
+			isPartial: false,
+			expandHintCapability: () => false,
+		};
 
 		const result = renderResult(
 			{

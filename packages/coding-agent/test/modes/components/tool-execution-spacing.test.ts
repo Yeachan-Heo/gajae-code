@@ -34,7 +34,7 @@ afterEach(() => {
 });
 
 function renderTool(command: string): string[] {
-	const component = new ToolExecutionComponent("bash", { command }, {}, undefined, uiStub);
+	const component = new ToolExecutionComponent("bash", { command }, {}, undefined, uiStub, undefined, () => false);
 	component.updateResult({ content: [{ type: "text", text: `output of ${command}` }], isError: false }, false);
 	return component.render(80).map(line => Bun.stripANSI(line));
 }
@@ -72,7 +72,7 @@ it("replaces generic SIXEL output while the IRC sidebar is visible and restores 
 	Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 	Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
 	const sixel = "\x1bPqcustom-image\x1b\\";
-	const component = new ToolExecutionComponent("custom", {}, {}, undefined, uiStub);
+	const component = new ToolExecutionComponent("custom", {}, {}, undefined, uiStub, undefined, () => false);
 	component.updateResult({ content: [{ type: "text", text: `before\n${sixel}\nafter` }], isError: false }, false);
 	const split = new IrcSplitViewComponent(component, new IrcObservationLedger(), sidebarTheme);
 

@@ -922,11 +922,11 @@ export const writeToolRenderer = {
 		return {
 			render(width: number) {
 				const { expanded } = options;
-				const key = new Hasher().bool(expanded).bool(options.expandHintCapability!()).u32(width).digest();
+				const key = new Hasher().bool(expanded).bool(options.expandHintCapability()).u32(width).digest();
 				if (cached?.key === key) return cached.lines;
 
 				let text = header;
-				text += renderContentPreview(fileContent, expanded, lang, uiTheme, options.expandHintCapability!);
+				text += renderContentPreview(fileContent, expanded, lang, uiTheme, options.expandHintCapability);
 
 				if (diagnostics) {
 					const diagText = formatDiagnostics(
@@ -934,7 +934,7 @@ export const writeToolRenderer = {
 						expanded,
 						uiTheme,
 						fp => uiTheme.getLangIcon(getLanguageFromPath(fp)),
-						options.expandHintCapability!,
+						options.expandHintCapability,
 					);
 					if (diagText.trim()) {
 						const diagLines = diagText.split("\n");

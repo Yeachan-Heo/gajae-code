@@ -135,6 +135,7 @@ describe("advisory performance baselines", () => {
 				undefined,
 				{ requestRender: () => {} } as any,
 				tempDir,
+				() => false,
 			);
 			const deltas = Array.from({ length: 16 }, (_, index) => ({
 				path: "sample.txt",
@@ -176,6 +177,7 @@ describe("advisory performance baselines", () => {
 			customTool as any,
 			{ requestRender: () => {} } as any,
 			os.tmpdir(),
+			() => false,
 		);
 		expect(received.length).toBeGreaterThan(0);
 		expect(received[0]).not.toBe(sourceArgs);

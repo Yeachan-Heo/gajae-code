@@ -26,7 +26,13 @@ describe("editToolRenderer", () => {
 				edits: [{}],
 				__partialJson: '{"edits":[{"path":"packages/coding-agent/src/edit/renderer.ts","old_text":"before',
 			},
-			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "replace" } },
+			{
+				expanded: false,
+				isPartial: true,
+				spinnerFrame: 0,
+				renderContext: { editMode: "replace" },
+				expandHintCapability: () => false,
+			},
 			uiTheme,
 		);
 
@@ -40,7 +46,13 @@ describe("editToolRenderer", () => {
 			{
 				input: "§packages/coding-agent/src/edit/renderer.ts\n»EOF\n// preview",
 			},
-			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
+			{
+				expanded: false,
+				isPartial: true,
+				spinnerFrame: 0,
+				renderContext: { editMode: "hashline" },
+				expandHintCapability: () => false,
+			},
 			uiTheme,
 		);
 
@@ -63,6 +75,8 @@ describe("editToolRenderer", () => {
 			{},
 			hashlineTool,
 			uiStub,
+			undefined,
+			() => false,
 		);
 
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
@@ -78,7 +92,13 @@ describe("editToolRenderer", () => {
 			{
 				input: "§foo bar.ts\n»BOF\n// preview",
 			},
-			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
+			{
+				expanded: true,
+				isPartial: true,
+				spinnerFrame: 0,
+				renderContext: { editMode: "hashline" },
+				expandHintCapability: () => false,
+			},
 			uiTheme,
 		);
 
@@ -86,7 +106,13 @@ describe("editToolRenderer", () => {
 			{
 				input: "§'baz qux.ts'\n»BOF\n// preview",
 			},
-			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
+			{
+				expanded: false,
+				isPartial: true,
+				spinnerFrame: 0,
+				renderContext: { editMode: "hashline" },
+				expandHintCapability: () => false,
+			},
 			uiTheme,
 		);
 
@@ -105,14 +131,26 @@ describe("editToolRenderer", () => {
 			{
 				input: "§packages/coding-agent/src/slash-commands/builtin-registry.ts\n»BOF\n// preview",
 			},
-			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
+			{
+				expanded: true,
+				isPartial: true,
+				spinnerFrame: 0,
+				renderContext: { editMode: "hashline" },
+				expandHintCapability: () => false,
+			},
 			uiTheme,
 		);
 
 		// Even longer runs should still produce the clean path.
 		const triple = editToolRenderer.renderCall(
 			{ input: "§§§a/b/c.ts\n»BOF\n// preview" },
-			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
+			{
+				expanded: true,
+				isPartial: true,
+				spinnerFrame: 0,
+				renderContext: { editMode: "hashline" },
+				expandHintCapability: () => false,
+			},
 			uiTheme,
 		);
 
@@ -135,7 +173,12 @@ describe("editToolRenderer", () => {
 					op: "update",
 				},
 			},
-			{ expanded: false, isPartial: false, renderContext: { editMode: "hashline" } },
+			{
+				expanded: false,
+				isPartial: false,
+				renderContext: { editMode: "hashline" },
+				expandHintCapability: () => false,
+			},
 			uiTheme,
 			{
 				input: "§packages/coding-agent/src/edit/renderer.ts\n»EOF\n// preview",

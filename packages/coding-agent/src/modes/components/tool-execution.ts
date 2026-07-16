@@ -34,7 +34,6 @@ import {
 import {
 	type ExpandHintCapability,
 	formatExpandHint,
-	noExpandHintCapability,
 	replaceTabs,
 	resolveImageOptions,
 	truncateToWidth,
@@ -223,10 +222,7 @@ export class ToolExecutionComponent extends Container {
 		expanded: boolean;
 		isPartial: boolean;
 		renderContext?: Record<string, unknown>;
-		expandHintCapability?: ExpandHintCapability;
-	} = {
-		expanded: false,
-		isPartial: true,
+		expandHintCapability: ExpandHintCapability;
 	};
 
 	constructor(
@@ -236,8 +232,8 @@ export class ToolExecutionComponent extends Container {
 		tool: AgentTool | undefined,
 		ui: TUI,
 		cwd: string = getProjectDir(),
+		expandHintCapability: ExpandHintCapability,
 		_toolCallId?: string,
-		expandHintCapability?: ExpandHintCapability,
 	) {
 		super();
 		this.#toolName = toolName;
@@ -252,7 +248,11 @@ export class ToolExecutionComponent extends Container {
 		this.#shareArgsWithRenderer = argsCanBeSharedWithRenderer(toolName, tool);
 		this.#lastArgsReference = args;
 		this.#args = this.#shareArgsWithRenderer ? args : cloneToolArgs(args);
-		this.#renderState.expandHintCapability = expandHintCapability;
+		this.#renderState = {
+			expanded: false,
+			isPartial: true,
+			expandHintCapability,
+		};
 
 		this.addChild(new Spacer(1));
 
@@ -544,7 +544,7 @@ export class ToolExecutionComponent extends Container {
 							expanded: boolean;
 							isPartial: boolean;
 							spinnerFrame?: number;
-							expandHintCapability?: ExpandHintCapability;
+							expandHintCapability: ExpandHintCapability;
 						},
 						theme: Theme,
 						args?: unknown,
@@ -915,14 +915,7 @@ export class ToolExecutionComponent extends Container {
 				if (tree.lines.length > 0) {
 					lines.push(...tree.lines);
 					if (!this.#expanded) {
-						lines.push(
-							formatExpandHint(
-								theme,
-								this.#expanded,
-								true,
-								this.#renderState.expandHintCapability ?? noExpandHintCapability,
-							),
-						);
+						lines.push(formatExpandHint(theme, this.#expanded, true, this.#renderState.expandHintCapability));
 					} else if (tree.truncated) {
 						lines.push(theme.fg("dim", "…"));
 					}
@@ -944,17 +937,10 @@ export class ToolExecutionComponent extends Container {
 		if (outputLines.length > maxOutputLines) {
 			const remaining = outputLines.length - maxOutputLines;
 			lines.push(
-				`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, this.#expanded, true, this.#renderState.expandHintCapability ?? noExpandHintCapability)}`,
+				`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, this.#expanded, true, this.#renderState.expandHintCapability)}`,
 			);
 		} else if (!this.#expanded) {
-			lines.push(
-				formatExpandHint(
-					theme,
-					this.#expanded,
-					true,
-					this.#renderState.expandHintCapability ?? noExpandHintCapability,
-				),
-			);
+			lines.push(formatExpandHint(theme, this.#expanded, true, this.#renderState.expandHintCapability));
 		}
 
 		return lines.join("\n");

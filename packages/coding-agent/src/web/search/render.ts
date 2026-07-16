@@ -16,7 +16,6 @@ import {
 	formatStatusIcon,
 	getDomain,
 	getPreviewLines,
-	noExpandHintCapability,
 	PREVIEW_LIMITS,
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
@@ -96,12 +95,7 @@ export function renderSearchResult(
 	const rawText = result.content?.find(block => block.type === "text")?.text?.trim() ?? "";
 	const response = details?.response;
 	if (!response) {
-		return renderFallbackText(
-			rawText,
-			options.expanded,
-			theme,
-			options.expandHintCapability ?? noExpandHintCapability,
-		);
+		return renderFallbackText(rawText, options.expanded, theme, options.expandHintCapability);
 	}
 
 	const sources = Array.isArray(response.sources) ? response.sources : [];

@@ -721,8 +721,8 @@ export class UiHelpers {
 						tool,
 						this.ctx.ui,
 						this.ctx.sessionManager.getCwd(),
-						content.id,
 						this.ctx.expandHintCapability,
+						content.id,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
 					addChatChild(this.ctx, component);

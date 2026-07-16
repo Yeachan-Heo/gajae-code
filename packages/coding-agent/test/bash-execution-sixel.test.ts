@@ -33,7 +33,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
 
-		const component = new BashExecutionComponent("echo sixel", ui, false);
+		const component = new BashExecutionComponent("echo sixel", ui, false, () => false);
 		component.appendOutput(SIXEL);
 		component.setComplete(0, false);
 
@@ -45,7 +45,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
 		const output = [`before ${SIXEL}`, ...Array.from({ length: 25 }, (_, index) => `line ${index}`)].join("\n");
-		const component = new BashExecutionComponent("emit sixel", ui, false);
+		const component = new BashExecutionComponent("emit sixel", ui, false, () => false);
 		component.setComplete(0, false, { output });
 
 		const rendered = component.render(160).join("\n");
@@ -60,7 +60,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
 
 		const payload = `\x1bPq${"A".repeat(5000)}\x1b\\`;
-		const component = new BashExecutionComponent("echo sixel", ui, false);
+		const component = new BashExecutionComponent("echo sixel", ui, false, () => false);
 		component.appendOutput(payload);
 		component.setComplete(0, false);
 
@@ -75,7 +75,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
 
 		const longText = "x".repeat(5000);
-		const component = new BashExecutionComponent("echo text", ui, false);
+		const component = new BashExecutionComponent("echo text", ui, false, () => false);
 		component.appendOutput(longText);
 		component.setComplete(0, false);
 
@@ -91,7 +91,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		// appendOutput receives pre-sanitized chunks from OutputSink.
 		// Simulate that: sanitize before passing to the component.
 		const sanitized = sanitizeWithOptionalSixelPassthrough(SIXEL, sanitizeText);
-		const component = new BashExecutionComponent("test sixel", ui, false);
+		const component = new BashExecutionComponent("test sixel", ui, false, () => false);
 		component.appendOutput(sanitized);
 		component.setComplete(0, false);
 
@@ -103,7 +103,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		terminal.imageProtocol = ImageProtocol.Sixel;
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
-		const component = new BashExecutionComponent("echo sixel", ui, false);
+		const component = new BashExecutionComponent("echo sixel", ui, false, () => false);
 		const split = new IrcSplitViewComponent(component, new IrcObservationLedger(), theme);
 		component.setComplete(0, false, { output: `before\n${SIXEL}\nafter` });
 
@@ -120,7 +120,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		terminal.imageProtocol = ImageProtocol.Sixel;
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
-		const component = new BashExecutionComponent("echo sixel", ui, false);
+		const component = new BashExecutionComponent("echo sixel", ui, false, () => false);
 		const split = new IrcSplitViewComponent(component, new IrcObservationLedger(), theme);
 		split.setVisible(true);
 		component.setComplete(0, false, { output: SIXEL });
@@ -137,7 +137,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		terminal.imageProtocol = ImageProtocol.Sixel;
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
-		const component = new BashExecutionComponent("echo sixel", ui, false);
+		const component = new BashExecutionComponent("echo sixel", ui, false, () => false);
 		const split = new IrcSplitViewComponent(component, new IrcObservationLedger(), theme);
 		component.setComplete(0, false, { output: SIXEL });
 		split.setVisible(true);
@@ -152,7 +152,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		terminal.imageProtocol = ImageProtocol.Sixel;
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
-		const component = new BashExecutionComponent("echo sixel", ui, false);
+		const component = new BashExecutionComponent("echo sixel", ui, false, () => false);
 		const split = new IrcSplitViewComponent(component, new IrcObservationLedger(), theme);
 		split.setVisible(true);
 		component.setComplete(0, false, { output: `before\n${SIXEL}\nafter` });
@@ -168,7 +168,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		terminal.imageProtocol = ImageProtocol.Sixel;
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
-		const component = new BashExecutionComponent("echo sixel", ui, false);
+		const component = new BashExecutionComponent("echo sixel", ui, false, () => false);
 		const split = new IrcSplitViewComponent(component, new IrcObservationLedger(), theme);
 		component.setComplete(0, false, {
 			output: `${Array.from({ length: 25 }, (_, index) => `line ${index}`).join("\n")}\n${SIXEL}`,
@@ -188,7 +188,7 @@ describe("BashExecutionComponent SIXEL sanitization", () => {
 		terminal.imageProtocol = ImageProtocol.Sixel;
 		Bun.env.PI_FORCE_IMAGE_PROTOCOL = "sixel";
 		Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = "1";
-		const component = new BashExecutionComponent("echo sixel", ui, false);
+		const component = new BashExecutionComponent("echo sixel", ui, false, () => false);
 		const split = new IrcSplitViewComponent(component, new IrcObservationLedger(), theme);
 		component.setComplete(0, false, {
 			output: `${Array.from({ length: 25 }, (_, index) => `line ${index}`).join("\n")}\n${SIXEL}`,
@@ -214,7 +214,7 @@ describe("BashExecutionComponent streaming throttle", () => {
 	});
 
 	it("caps stored lines during streaming", () => {
-		const component = new BashExecutionComponent("test", ui, false);
+		const component = new BashExecutionComponent("test", ui, false, () => false);
 
 		// Flood with 500 lines in one chunk (exceeds STREAMING_LINE_CAP of 100)
 		const lines = Array.from({ length: 500 }, (_, i) => `line${i}`).join("\n");
@@ -231,7 +231,7 @@ describe("BashExecutionComponent streaming throttle", () => {
 	});
 
 	it("gate drops rapid chunks", async () => {
-		const component = new BashExecutionComponent("test", ui, false);
+		const component = new BashExecutionComponent("test", ui, false, () => false);
 
 		// Send 100 chunks rapidly (all in same tick, before setTimeout fires)
 		for (let i = 0; i < 100; i++) {
@@ -250,7 +250,7 @@ describe("BashExecutionComponent streaming throttle", () => {
 	});
 
 	it("setComplete replaces streaming output with final output", () => {
-		const component = new BashExecutionComponent("test", ui, false);
+		const component = new BashExecutionComponent("test", ui, false, () => false);
 
 		// Stream some partial output
 		component.appendOutput("streaming_line\n");

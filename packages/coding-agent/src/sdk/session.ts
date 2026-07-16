@@ -691,7 +691,12 @@ function customToolToDefinition(tool: CustomTool): ToolDefinition {
 			? (result, options, theme): Component => {
 					const component = tool.renderResult?.(
 						result,
-						{ expanded: options.expanded, isPartial: options.isPartial, spinnerFrame: options.spinnerFrame },
+						{
+							expanded: options.expanded,
+							isPartial: options.isPartial,
+							spinnerFrame: options.spinnerFrame,
+							expandHintCapability: options.expandHintCapability,
+						},
 						theme,
 					);
 					// Return empty component if undefined to match Component type requirement

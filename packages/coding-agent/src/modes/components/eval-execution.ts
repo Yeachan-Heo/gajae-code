@@ -56,7 +56,7 @@ export class EvalExecutionComponent extends Container {
 		ui: TUI,
 		private readonly excludeFromContext = false,
 		private readonly language: EvalExecutionLanguage = "python",
-		private readonly expandHintCapability?: ExpandHintCapability,
+		private readonly expandHintCapability: ExpandHintCapability,
 	) {
 		super();
 

@@ -585,8 +585,8 @@ export class EventController {
 						tool,
 						this.ctx.ui,
 						this.ctx.sessionManager.getCwd(),
-						content.id,
 						this.ctx.expandHintCapability,
+						content.id,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
 					this.ctx.pendingTools.set(content.id, component);
@@ -702,8 +702,8 @@ export class EventController {
 				tool,
 				this.ctx.ui,
 				this.ctx.sessionManager.getCwd(),
-				event.toolCallId,
 				this.ctx.expandHintCapability,
+				event.toolCallId,
 			);
 			component.setExpanded(this.ctx.toolOutputExpanded);
 			this.ctx.pendingTools.set(event.toolCallId, component);

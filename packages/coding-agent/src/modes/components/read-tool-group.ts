@@ -55,7 +55,7 @@ type ReadToolResultDetails = {
 
 type ReadToolGroupOptions = {
 	showContentPreview?: boolean;
-	expandHintCapability?: ExpandHintCapability;
+	expandHintCapability: ExpandHintCapability;
 };
 
 function getSuffixResolution(details: ReadToolResultDetails | undefined): ReadToolSuffixResolution | undefined {
@@ -83,9 +83,9 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	#expanded = false;
 	#manuallyExpanded: boolean | undefined;
 	#showContentPreview: boolean;
-	#expandHintCapability?: ExpandHintCapability;
+	#expandHintCapability: ExpandHintCapability;
 
-	constructor(options: ReadToolGroupOptions = {}) {
+	constructor(options: ReadToolGroupOptions) {
 		super();
 		this.#showContentPreview = options.showContentPreview ?? false;
 		this.#expandHintCapability = options.expandHintCapability;
@@ -228,7 +228,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		const expanded = this.#expanded;
 		const component: Component = {
 			render: (width: number) => {
-				const canExpand = this.#expandHintCapability?.();
+				const canExpand = this.#expandHintCapability();
 				if (cachedLines && cachedWidth === width && cachedCanExpand === canExpand) return cachedLines;
 				cachedLines = renderCodeCell(
 					{

@@ -49,7 +49,7 @@ function snapshot(overrides: Partial<SubagentSnapshot> & Pick<SubagentSnapshot, 
 function render(details: SubagentToolDetails, expanded = true): string {
 	const component = subagentToolRenderer.renderResult(
 		{ content: [{ type: "text", text: "" }], details },
-		{ expanded, isPartial: true, spinnerFrame: 0 },
+		{ expanded, isPartial: true, spinnerFrame: 0, expandHintCapability: () => false },
 		theme,
 	);
 	return Bun.stripANSI(component.render(160).join("\n"));
@@ -326,7 +326,7 @@ describe("subagent await renderer body cache (PR2)", () => {
 		// result component on every partial update.
 		const component = subagentToolRenderer.renderResult(
 			{ content: [{ type: "text", text: "" }], details },
-			{ expanded, isPartial: true, spinnerFrame },
+			{ expanded, isPartial: true, spinnerFrame, expandHintCapability: () => false },
 			theme,
 		);
 		return component.render(width);
@@ -412,7 +412,7 @@ describe("subagent await renderer body cache (PR2)", () => {
 			subagentToolRenderer
 				.renderResult(
 					{ content: [{ type: "text", text: "" }], details },
-					{ expanded: true, isPartial: true, spinnerFrame: 0 },
+					{ expanded: true, isPartial: true, spinnerFrame: 0, expandHintCapability: () => false },
 					t,
 				)
 				.render(160);

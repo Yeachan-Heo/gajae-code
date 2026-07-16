@@ -156,7 +156,15 @@ describe("G004 streamed tool args QA", () => {
 		for (const tool of ["edit", "bash", "eval", "recipe"] as const) {
 			cloneCount = 0;
 			stringifyCount = 0;
-			const component = new ToolExecutionComponent(tool, makeArgs(tool, 0), {}, undefined, ui);
+			const component = new ToolExecutionComponent(
+				tool,
+				makeArgs(tool, 0),
+				{},
+				undefined,
+				ui,
+				undefined,
+				() => false,
+			);
 			for (let i = 1; i <= 32; i++) component.updateArgs(makeArgs(tool, i));
 			rendered(component);
 			observed[tool] = { cloneCount, stringifyCount };
@@ -180,7 +188,7 @@ describe("G004 streamed tool args QA", () => {
 				return { render: () => ["custom"], invalidate() {} };
 			},
 		} as unknown as AgentTool;
-		const component = new ToolExecutionComponent("custom", sourceArgs, {}, customTool, ui);
+		const component = new ToolExecutionComponent("custom", sourceArgs, {}, customTool, ui, undefined, () => false);
 		rendered(component);
 		expect(sourceArgs).toEqual({ nested: { keep: "original" }, list: ["a"] });
 		component.dispose();
@@ -267,6 +275,8 @@ describe("G004 streamed tool args QA", () => {
 			{},
 			{ name: "edit", label: "Edit", mode: "hashline" } as any,
 			ui,
+			undefined,
+			() => false,
 		);
 		try {
 			await new Promise(resolve => setTimeout(resolve, 20));
@@ -282,7 +292,7 @@ describe("G004 streamed tool args QA", () => {
 
 	it("RESTORE-PARITY renders restored partial tool calls the same as live-path state", () => {
 		const args = { command: "echo restored", __partialJson: '{"command":"echo restored' };
-		const live = new ToolExecutionComponent("bash", args, {}, undefined, ui);
+		const live = new ToolExecutionComponent("bash", args, {}, undefined, ui, undefined, () => false);
 		const restoredContent = {
 			type: "toolCall",
 			id: "r",
@@ -295,7 +305,7 @@ describe("G004 streamed tool args QA", () => {
 		expect(JSON.stringify(restoredContent)).not.toContain("__partialJson");
 		expect((restoredContent.arguments as any).__partialJson).toBeUndefined();
 		expect((renderArgs as any).__partialJson).toBe(restoredContent.partialJson);
-		const restore = new ToolExecutionComponent("bash", renderArgs, {}, undefined, ui);
+		const restore = new ToolExecutionComponent("bash", renderArgs, {}, undefined, ui, undefined, () => false);
 		expect(rendered(restore)).toBe(rendered(live));
 		live.dispose();
 		restore.dispose();
