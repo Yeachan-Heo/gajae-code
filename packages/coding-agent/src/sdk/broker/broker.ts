@@ -381,11 +381,7 @@ export class Broker {
 	}
 	async start(): Promise<BrokerDiscovery> {
 		this.#stopping = false;
-		await Promise.all([
-			this.index.assertSupportedStateVersions(),
-			this.ledger.assertSupportedStateVersions(),
-			readBrokerDiscovery(this.settings.agentDir),
-		]);
+		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
 		for (;;) {
 			try {
