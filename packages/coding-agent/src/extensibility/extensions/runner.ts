@@ -8,7 +8,7 @@ import { logger } from "@gajae-code/utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { SessionManager } from "../../session/session-manager";
+import { createReadonlySessionManager, type SessionManager } from "../../session/session-manager";
 import type {
 	AfterProviderResponseEvent,
 	BeforeAgentStartEvent,
@@ -199,6 +199,7 @@ export class ExtensionRunner {
 	#getQueuedMessagesFn: ExtensionContext["getQueuedMessages"] = () => [];
 	#getActiveToolsFn: ExtensionContext["getActiveTools"] = () => [];
 	#getAllToolsFn: ExtensionContext["getAllTools"] = () => [];
+	#getResolveToolFn: ExtensionContext["resolveTool"] = () => undefined;
 	#cycleModelFn: ExtensionContextActions["cycleModel"] = undefined;
 	#cycleThinkingLevelFn: ExtensionContextActions["cycleThinkingLevel"] = undefined;
 	#setQueueModeFn: ExtensionContextActions["setQueueMode"] = undefined;
@@ -275,6 +276,7 @@ export class ExtensionRunner {
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.getActiveTools = actions.getActiveTools;
 		this.runtime.getAllTools = actions.getAllTools;
+		this.runtime.resolveTool = actions.resolveTool ?? (() => undefined);
 		this.runtime.setActiveTools = actions.setActiveTools;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
@@ -309,6 +311,7 @@ export class ExtensionRunner {
 		this.#getQueuedMessagesFn = contextActions.getQueuedMessages ?? (() => []);
 		this.#getActiveToolsFn = contextActions.getActiveTools ?? (() => []);
 		this.#getAllToolsFn = contextActions.getAllTools ?? (() => []);
+		this.#getResolveToolFn = contextActions.resolveTool ?? (() => undefined);
 		this.#cycleModelFn = contextActions.cycleModel;
 		this.#cycleThinkingLevelFn = contextActions.cycleThinkingLevel;
 		this.#setQueueModeFn = contextActions.setQueueMode;
@@ -540,7 +543,7 @@ export class ExtensionRunner {
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
-			sessionManager: this.sessionManager,
+			sessionManager: createReadonlySessionManager(this.sessionManager),
 			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
 			get model() {
@@ -557,6 +560,7 @@ export class ExtensionRunner {
 			getQueuedMessages: () => this.#getQueuedMessagesFn(),
 			getActiveTools: () => this.#getActiveToolsFn(),
 			getAllTools: () => this.#getAllToolsFn(),
+			resolveTool: name => this.#getResolveToolFn(name),
 			cycleModel: async () => await this.#cycleModelFn?.(),
 			cycleThinkingLevel: () => this.#cycleThinkingLevelFn?.(),
 			setQueueMode: (kind, mode) => this.#setQueueModeFn?.(kind, mode) ?? false,
@@ -678,7 +682,10 @@ export class ExtensionRunner {
 		}
 	}
 
-	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+	async emit<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		continueWhile?: () => boolean,
+	): Promise<RunnerEmitResult<TEvent>> {
 		const handlers = this.#handlersByEvent.get(event.type) ?? [];
 		if (handlers.length === 0) return undefined as RunnerEmitResult<TEvent>;
 
@@ -686,7 +693,9 @@ export class ExtensionRunner {
 		let result: SessionBeforeEventResult | SessionCompactingResult | undefined;
 
 		for (const { ext, handler } of handlers) {
+			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
 			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
 
 			if (this.#isSessionBeforeEvent(event) && handlerResult) {
 				result = handlerResult as SessionBeforeEventResult;

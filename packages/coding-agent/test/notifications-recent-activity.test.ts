@@ -2,106 +2,253 @@ import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
 import { listRecentSessions } from "@gajae-code/coding-agent/sdk/bus/recent-activity";
+import {
+	prepareManagedSessionScopeForWriteSync,
+	resolveManagedScope,
+} from "../src/session/internal/managed-session-scope";
+import { FileSessionStorage } from "../src/session/session-storage";
 
 const roots: string[] = [];
-function tempSessionsRoot(): string {
+function tempRoot(): string {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-recent-"));
 	roots.push(root);
 	return root;
 }
 afterAll(() => {
-	for (const r of roots) fs.rmSync(r, { recursive: true, force: true });
+	for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
 });
 
+async function managedDirectory(root: string, cwd: string): Promise<string> {
+	fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
+	const resolved = resolveManagedScope({ cwd, agentDir: root, sessionsRoot: root });
+	if (resolved.kind !== "resolved") throw new Error(resolved.message);
+	const prepared = prepareManagedSessionScopeForWriteSync(resolved.scope);
+	if (prepared.kind !== "resolved") throw new Error(prepared.message);
+	return prepared.scope.directoryPath;
+}
+
 function writeSession(
-	root: string,
-	project: string,
-	id: string,
+	directory: string,
+	filename: string,
+	cwd: string,
 	header: object,
 	mtimeMs: number,
 	entries: object[] = [{ type: "message" }],
 ): string {
-	const dir = path.join(root, project);
-	fs.mkdirSync(dir, { recursive: true });
-	const file = path.join(dir, `${id}.jsonl`);
-	fs.writeFileSync(file, `${JSON.stringify(header)}\n${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+	const file = path.join(directory, `${filename}.jsonl`);
+	fs.writeFileSync(
+		file,
+		`${JSON.stringify({ type: "session", id: filename, cwd, ...header })}\n${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`,
+		{ mode: 0o600 },
+	);
+	fs.chmodSync(file, 0o600);
 	fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
 	return file;
 }
 
 describe("recent-activity picker", () => {
-	it("ranks sessions by history mtime, newest first", () => {
-		const root = tempSessionsRoot();
-		writeSession(root, "repoA", "old", { cwd: "/repoA" }, 1_000_000);
-		writeSession(root, "repoB", "newer", { cwd: "/repoB", branch: "feat/x" }, 3_000_000);
-		writeSession(root, "repoA", "mid", { cwd: "/repoA", title: "fix bug" }, 2_000_000);
+	it("ranks validated workspace sessions by history mtime, newest first", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const directory = await managedDirectory(root, cwd);
+		writeSession(directory, "old", cwd, {}, 1_000_000);
+		writeSession(directory, "newer", cwd, { branch: "feat/x" }, 3_000_000);
+		writeSession(directory, "mid", cwd, { title: "fix bug" }, 2_000_000);
 
-		const out = listRecentSessions({ sessionsRoot: root });
-		expect(out.map(e => e.sessionId)).toEqual(["newer", "mid", "old"]);
-		expect(out[0]?.path).toBe("/repoB");
+		const result = await listRecentSessions({ cwd, sessionsRoot: root });
+		expect(result.kind).toBe("complete");
+		if (result.kind !== "complete") throw new Error(result.message);
+		const out = result.entries;
+		expect(out.map(entry => entry.sessionId)).toEqual(["newer", "mid", "old"]);
+		expect(out[0]?.path).toBe(cwd);
 		expect(out[0]?.branch).toBe("feat/x");
 		expect(out[1]?.title).toBe("fix bug");
-		expect(out[0]?.sessionStateFile.endsWith("newer.jsonl")).toBe(true);
 	});
 
-	it("respects the limit", () => {
-		const root = tempSessionsRoot();
-		for (let i = 0; i < 5; i++) writeSession(root, "r", `s${i}`, { cwd: "/r" }, 1000 * (i + 1));
-		expect(listRecentSessions({ sessionsRoot: root, limit: 2 })).toHaveLength(2);
+	it("lists validated v2 sessions across workspaces when requested", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace-a");
+		const otherCwd = path.join(root, "workspace-b");
+		const directory = await managedDirectory(root, cwd);
+		const otherDirectory = await managedDirectory(root, otherCwd);
+		writeSession(directory, "current", cwd, {}, 1_000);
+		writeSession(otherDirectory, "other", otherCwd, {}, 2_000);
+
+		const result = await listRecentSessions({ cwd, sessionsRoot: root, allWorkspaces: true });
+		expect(result).toMatchObject({ kind: "complete" });
+		if (result.kind !== "complete") throw new Error(result.message);
+		expect(result.entries.map(entry => entry.sessionId)).toEqual(["other", "current"]);
 	});
 
-	it("flags breadcrumb-referenced sessions as currentTerminal", () => {
-		const root = tempSessionsRoot();
-		const file = writeSession(root, "r", "live", { cwd: "/r" }, 5000);
-		writeSession(root, "r", "other", { cwd: "/r" }, 4000);
-		const out = listRecentSessions({ sessionsRoot: root, breadcrumbPaths: [file] });
-		expect(out.find(e => e.sessionId === "live")?.currentTerminal).toBe(true);
-		expect(out.find(e => e.sessionId === "other")?.currentTerminal).toBeUndefined();
+	it("scans saved sessions when the current workspace is unavailable", async () => {
+		const root = tempRoot();
+		const savedCwd = path.join(root, "saved-workspace");
+		const directory = await managedDirectory(root, savedCwd);
+		writeSession(directory, "saved-elsewhere", savedCwd, {}, 2_000);
+
+		const result = await listRecentSessions({
+			cwd: path.join(root, "gone-launch-workspace"),
+			sessionsRoot: root,
+			allWorkspaces: true,
+		});
+
+		expect(result).toMatchObject({ kind: "complete" });
+		if (result.kind !== "complete") throw new Error(result.message);
+		expect(result.entries.map(entry => entry.sessionId)).toEqual(["saved-elsewhere"]);
 	});
 
-	it("returns empty for a missing root and tolerates bad headers", () => {
-		expect(listRecentSessions({ sessionsRoot: "/no/such/dir" })).toEqual([]);
-		const root = tempSessionsRoot();
-		writeSession(root, "r", "bad", "not json" as unknown as object, 1000);
-		const out = listRecentSessions({ sessionsRoot: root });
-		expect(out).toHaveLength(1);
-		expect(out[0]?.path).toBeUndefined();
+	it("fails closed for an unsafe all-workspace sessions root", async () => {
+		if (process.platform === "win32") return;
+		const root = tempRoot();
+		const safeRoot = path.join(root, "safe-sessions");
+		const unsafeRoot = path.join(root, "unsafe-sessions");
+		fs.mkdirSync(safeRoot, { mode: 0o700 });
+		fs.symlinkSync(safeRoot, unsafeRoot);
+
+		const result = await listRecentSessions({
+			cwd: path.join(root, "gone-launch-workspace"),
+			sessionsRoot: unsafeRoot,
+			allWorkspaces: true,
+		});
+
+		expect(result).toMatchObject({ kind: "error", code: "scope_unavailable" });
 	});
 
-	it("marks internal helper sessions and can exclude them", () => {
-		const root = tempSessionsRoot();
-		writeSession(root, "r", "user", { cwd: "/r" }, 2000);
-		writeSession(root, "r", "helper", { cwd: "/r" }, 3000, [
-			{ type: "session_init", systemPrompt: "subagent", initialTask: "help" },
-		]);
+	it("lists legacy-only workspaces before any v2 binding exists", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace-a");
+		const legacyOnlyCwd = path.join(root, "workspace-b");
+		const directory = await managedDirectory(root, cwd);
+		fs.mkdirSync(legacyOnlyCwd, { recursive: true, mode: 0o700 });
+		const legacyDirectory = path.join(root, `--${legacyOnlyCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
+		fs.mkdirSync(legacyDirectory, { mode: 0o700 });
+		writeSession(directory, "current", cwd, {}, 1_000);
+		writeSession(legacyDirectory, "legacy-only", legacyOnlyCwd, {}, 2_000);
 
-		const defaultOut = listRecentSessions({ sessionsRoot: root });
-		expect(defaultOut.map(e => e.sessionId)).toEqual(["helper", "user"]);
-		expect(defaultOut.find(e => e.sessionId === "helper")?.internal).toBe(true);
-		expect(defaultOut.find(e => e.sessionId === "user")?.internal).toBeUndefined();
+		const result = await listRecentSessions({ cwd, sessionsRoot: root, allWorkspaces: true });
 
-		const visibleOnly = listRecentSessions({ sessionsRoot: root, includeInternal: false });
-		expect(visibleOnly.map(e => e.sessionId)).toEqual(["user"]);
+		expect(result).toMatchObject({ kind: "complete" });
+		if (result.kind !== "complete") throw new Error(result.message);
+		expect(result.entries.map(entry => entry.sessionId)).toEqual(["legacy-only", "current"]);
 	});
 
-	it("filters internal sessions before applying the limit", () => {
-		const root = tempSessionsRoot();
-		writeSession(root, "r", "older-visible", { cwd: "/r" }, 1000);
-		writeSession(root, "r", "newer-visible", { cwd: "/r" }, 2000);
-		writeSession(root, "r", "newest-helper", { cwd: "/r" }, 3000, [{ type: "session_init" }]);
+	it("treats an absent all-workspace sessions root as an empty scan", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd, { recursive: true });
+		const sessionsRoot = path.join(root, "missing-sessions");
 
-		const out = listRecentSessions({ sessionsRoot: root, limit: 2, includeInternal: false });
-		expect(out.map(e => e.sessionId)).toEqual(["newer-visible", "older-visible"]);
+		const result = await listRecentSessions({ cwd, sessionsRoot, allWorkspaces: true });
+
+		expect(result).toMatchObject({ kind: "complete", entries: [] });
+		expect(fs.existsSync(sessionsRoot)).toBe(false);
 	});
-	it("surfaces the authoritative header id (not the timestamped filename stem)", () => {
-		const root = tempSessionsRoot();
-		// SessionManager writes <isoTimestamp>_<id>.jsonl with the id in the header.
-		writeSession(root, "r", "2024-01-02T03-04-05-678Z_s-lifecycle-1", { id: "s-lifecycle-1", cwd: "/r" }, 9000);
-		// A timestamped file with no header id falls back to the stripped stem.
-		writeSession(root, "r", "2024-01-02T03-04-05-999Z_s-fallback-2", { cwd: "/r" }, 8000);
-		const out = listRecentSessions({ sessionsRoot: root });
-		expect(out.map(e => e.sessionId)).toEqual(["s-lifecycle-1", "s-fallback-2"]);
+	it("uses only validated candidates across corrupt, foreign, and mixed-id collisions", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const foreignCwd = path.join(root, "foreign-workspace");
+		const directory = await managedDirectory(root, cwd);
+		fs.mkdirSync(foreignCwd);
+		writeSession(directory, "shared", cwd, {}, 3_000);
+		writeSession(directory, "foreign-copy", foreignCwd, { id: "shared" }, 2_000);
+		fs.writeFileSync(path.join(directory, "corrupt.jsonl"), "not JSON\n", { mode: 0o600 });
+
+		const result = await listRecentSessions({ cwd, sessionsRoot: root });
+		expect(result.kind).toBe("complete");
+		if (result.kind !== "complete") throw new Error(result.message);
+		const out = result.entries;
+		expect(out.map(entry => entry.sessionId)).toEqual(["shared"]);
+		expect(out[0]?.path).toBe(cwd);
+	});
+
+	it("accepts validated legacy candidates with their historical 0644 mode", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
+		const legacyDirectory = path.join(root, `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
+		fs.mkdirSync(legacyDirectory, { mode: 0o700 });
+		const legacy = writeSession(legacyDirectory, "legacy", cwd, {}, 1_000);
+		fs.chmodSync(legacy, 0o644);
+
+		const result = await listRecentSessions({ cwd, sessionsRoot: root });
+		expect(result).toMatchObject({ kind: "complete" });
+		if (result.kind !== "complete") throw new Error(result.message);
+		expect(result.entries.map(entry => entry.sessionId)).toEqual(["legacy"]);
+	});
+
+	it("flags breadcrumb-referenced candidates and filters internal sessions before the limit", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const directory = await managedDirectory(root, cwd);
+		const live = writeSession(directory, "live", cwd, {}, 5_000);
+		writeSession(directory, "visible", cwd, {}, 4_000);
+		writeSession(directory, "helper", cwd, {}, 6_000, [{ type: "session_init" }]);
+
+		const allResult = await listRecentSessions({ cwd, sessionsRoot: root, breadcrumbPaths: [live] });
+		expect(allResult.kind).toBe("complete");
+		if (allResult.kind !== "complete") throw new Error(allResult.message);
+		const all = allResult.entries;
+		expect(all.find(entry => entry.sessionId === "live")?.currentTerminal).toBe(true);
+		expect(all.find(entry => entry.sessionId === "helper")?.internal).toBe(true);
+		const visibleResult = await listRecentSessions({ cwd, sessionsRoot: root, includeInternal: false, limit: 2 });
+		expect(visibleResult.kind).toBe("complete");
+		if (visibleResult.kind !== "complete") throw new Error(visibleResult.message);
+		expect(visibleResult.entries.map(entry => entry.sessionId)).toEqual(["live", "visible"]);
+	});
+
+	it("does not treat raw child names as session authority", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const directory = await managedDirectory(root, cwd);
+		writeSession(directory, "timestamped-child-name", cwd, { id: "authoritative-id" }, 9_000);
+		fs.writeFileSync(path.join(directory, "raw-name-only.jsonl"), `${JSON.stringify({ cwd })}\n`, { mode: 0o600 });
+
+		const result = await listRecentSessions({ cwd, sessionsRoot: root });
+		expect(result.kind).toBe("complete");
+		if (result.kind !== "complete") throw new Error(result.message);
+		expect(result.entries.map(entry => entry.sessionId)).toEqual(["authoritative-id"]);
+	});
+
+	it("rejects a transcript replaced after the readonly managed inventory is captured", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const directory = await managedDirectory(root, cwd);
+		const session = writeSession(directory, "stable", cwd, { title: "original" }, 9_000);
+		const originalReadSnapshot = FileSessionStorage.prototype.readSnapshotSync;
+		FileSessionStorage.prototype.readSnapshotSync = function (file: string) {
+			fs.writeFileSync(
+				session,
+				`${JSON.stringify({ type: "session", id: "stable", cwd, title: "replacement" })}\n`,
+				{ mode: 0o600 },
+			);
+			return originalReadSnapshot.call(this, file);
+		};
+		try {
+			await expect(listRecentSessions({ cwd, sessionsRoot: root })).resolves.toMatchObject({
+				kind: "error",
+				code: "managed_scan_failed",
+			});
+		} finally {
+			FileSessionStorage.prototype.readSnapshotSync = originalReadSnapshot;
+		}
+	});
+
+	it("rejects managed session metadata reached through a symlink", async () => {
+		if (process.platform === "win32") return;
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const directory = await managedDirectory(root, cwd);
+		const target = path.join(root, "target.jsonl");
+		fs.writeFileSync(target, `${JSON.stringify({ type: "session", id: "linked", cwd })}\n`, { mode: 0o600 });
+		fs.symlinkSync(target, path.join(directory, "linked.jsonl"));
+		const result = await listRecentSessions({ cwd, sessionsRoot: root });
+		expect(result).toMatchObject({ kind: "complete", entries: [] });
+	});
+
+	it("returns a diagnostic instead of treating an invalid workspace as no sessions", async () => {
+		const root = tempRoot();
+		const result = await listRecentSessions({ cwd: path.join(root, "missing"), sessionsRoot: root });
+		expect(result).toMatchObject({ kind: "error", code: "scope_unavailable" });
 	});
 });

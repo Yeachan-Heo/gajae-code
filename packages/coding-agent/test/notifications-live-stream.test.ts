@@ -128,6 +128,7 @@ async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unk
 		},
 	});
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
+	await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");
 	const { url, token } = readEndpoint(endpointFile);

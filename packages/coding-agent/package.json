@@ -138,6 +138,7 @@
 			"types": "./src/sdk/bus/*.ts",
 			"import": "./src/sdk/bus/*.ts"
 		},
+		"./session/internal/*": null,
 		"./*": {
 			"types": "./src/*.ts",
 			"import": "./src/*.ts"

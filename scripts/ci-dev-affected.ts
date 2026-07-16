@@ -138,6 +138,10 @@ async function main(): Promise<void> {
 		await validateShardReceipts();
 		return;
 	}
+	if (process.argv.includes("--validate-aggregate")) {
+		await validateAggregate();
+		return;
+	}
 	if (process.argv.includes("--native-build")) {
 		await runNativeBuild();
 		return;
@@ -290,11 +294,13 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 // downstream job reuses the planner's exact diff via CI_DEV_CHANGED_PATHS
 // instead of re-resolving the base ref on each runner.
 async function emitMatrix(): Promise<void> {
+	const sourceSha = await resolveSourceSha();
+	await requireCommitObject(sourceSha, "source head");
+	await assertCheckedOutSourceHead(sourceSha);
 	const paths = normalizeChangedPaths(await getChangedPaths());
 	const mode = resolvePlanMode();
 	const tasks = await resolvePlannedTasks(paths);
 	const entries = describeTasks(tasks);
-	const sourceSha = Bun.env.CI_DEV_SOURCE_SHA?.trim() || (Bun.env.GITHUB_SHA ?? "HEAD");
 	const canonical = JSON.stringify({ schemaVersion: 1, sourceSha, mode, paths, tasks: serializeTasks(tasks) });
 	const digest = new Bun.CryptoHasher("sha256").update(canonical).digest("hex");
 	await Bun.write(path.join(repoRoot, ".ci-dev-affected-plan.json"), canonical);
@@ -391,10 +397,10 @@ async function getChangedPaths(): Promise<string[]> {
 	}
 
 	const base = await resolveBaseRef();
-	const head = Bun.env.CI_DEV_SOURCE_SHA?.trim() || Bun.env.GITHUB_SHA?.trim() || "HEAD";
+	const head = await resolveSourceSha();
 	await requireCommitObject(base, "base");
 	await requireCommitObject(head, "source head");
-	const range = `${base}...${head}`;
+	const range = `${base}..${head}`;
 	const diff = await $`git diff --name-only -z ${range}`.cwd(repoRoot).quiet().nothrow();
 	if (diff.exitCode !== 0) {
 		const stderr = diff.stderr.toString().trim();
@@ -408,31 +414,35 @@ async function requireCommitObject(ref: string, label: string): Promise<void> {
 	if (result.exitCode !== 0) throw new Error(`Failed to compute changed paths: ${label} '${ref}' is not available`);
 }
 
+async function resolveSourceSha(): Promise<string> {
+	const configured = Bun.env.CI_DEV_SOURCE_SHA?.trim() || Bun.env.GITHUB_SHA?.trim();
+	if (configured) return configured;
+	const checkedOut = await $`git rev-parse HEAD`.cwd(repoRoot).quiet().nothrow();
+	if (checkedOut.exitCode !== 0) throw new Error("Failed to resolve source head");
+	return checkedOut.stdout.toString().trim();
+}
+
+async function assertCheckedOutSourceHead(sourceSha: string): Promise<void> {
+	const checkedOut = await $`git rev-parse HEAD`.cwd(repoRoot).quiet().nothrow();
+	if (checkedOut.exitCode !== 0 || checkedOut.stdout.toString().trim() !== sourceSha) {
+		throw new Error(`Failed to publish affected plan: checked-out SHA does not match source head '${sourceSha}'`);
+	}
+}
+
 async function resolveBaseRef(): Promise<string> {
 	const eventName = Bun.env.GITHUB_EVENT_NAME?.trim();
 	const before = Bun.env.GITHUB_EVENT_BEFORE?.trim();
 	const baseSha = Bun.env.GITHUB_BASE_SHA?.trim();
 	const baseRef = Bun.env.GITHUB_BASE_REF?.trim();
 
-	if (eventName === "pull_request" && baseRef) {
-		const mergeBase = await $`git merge-base HEAD ${`origin/${baseRef}`}`.cwd(repoRoot).quiet().nothrow();
-		if (mergeBase.exitCode === 0) {
-			const value = mergeBase.stdout.toString().trim();
-			if (value !== "") return value;
-		}
-		return `origin/${baseRef}`;
-	}
 	if (baseSha && !ZERO_SHA.test(baseSha)) {
 		return baseSha;
 	}
+	if (eventName === "pull_request" && baseRef) {
+		return `origin/${baseRef}`;
+	}
 	if (before && !ZERO_SHA.test(before)) {
 		return before;
-	}
-
-	const mergeBase = await $`git merge-base HEAD origin/dev`.cwd(repoRoot).quiet().nothrow();
-	if (mergeBase.exitCode === 0) {
-		const value = mergeBase.stdout.toString().trim();
-		if (value !== "") return value;
 	}
 	return "origin/dev";
 }
@@ -1240,6 +1250,54 @@ function serializeTasks(tasks: readonly Task[]): Task[] {
 function canonicalTaskIdentity(task: Task): string {
 	const cwd = task.cwd ? path.relative(repoRoot, task.cwd) || "." : ".";
 	return task.identity ?? `legacy:${toBase64Url(task.key)}:${toBase64Url(cwd)}`;
+}
+
+export interface AffectedAggregateResults {
+	plan: string;
+	native: string;
+	shards: string;
+	windowsDoctor: string;
+	windowsDoctorRequired: string;
+	hasNative: string;
+	hasTasks: string;
+}
+
+export function validateAffectedAggregate(results: AffectedAggregateResults): void {
+	if (results.plan !== "success") throw new Error("planner did not succeed");
+	if (results.hasNative !== "true" && results.hasNative !== "false") throw new Error(`planner emitted invalid has_native=${results.hasNative}`);
+	if (results.hasTasks !== "true" && results.hasTasks !== "false") throw new Error(`planner emitted invalid has_tasks=${results.hasTasks}`);
+	if (results.native !== (results.hasNative === "true" ? "success" : "skipped")) throw new Error(results.hasNative === "true" ? "required native build did not succeed" : "unplanned native build was not skipped");
+	if (results.shards !== (results.hasTasks === "true" ? "success" : "skipped")) throw new Error(results.hasTasks === "true" ? "required affected shards did not succeed" : "unplanned affected shards were not skipped");
+	if (results.windowsDoctorRequired !== "true" && results.windowsDoctorRequired !== "false") throw new Error(`planner emitted invalid windows_doctor_required=${results.windowsDoctorRequired}`);
+	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
+}
+
+async function validateAggregate(): Promise<void> {
+	const results: AffectedAggregateResults = {
+		plan: Bun.env.CI_DEV_PLAN_RESULT?.trim() || "",
+		native: Bun.env.CI_DEV_NATIVE_RESULT?.trim() || "",
+		shards: Bun.env.CI_DEV_SHARDS_RESULT?.trim() || "",
+		windowsDoctor: Bun.env.CI_DEV_WINDOWS_DOCTOR_RESULT?.trim() || "",
+		windowsDoctorRequired: Bun.env.CI_DEV_WINDOWS_DOCTOR_REQUIRED?.trim() || "",
+		hasNative: Bun.env.CI_DEV_HAS_NATIVE?.trim() || "",
+		hasTasks: Bun.env.CI_DEV_HAS_TASKS?.trim() || "",
+	};
+	console.log(`affected-plan: ${results.plan}`);
+	console.log(`affected-native: ${results.native}`);
+	console.log(`affected-shards: ${results.shards}`);
+	console.log(`planned native work: ${results.hasNative}`);
+	console.log(`planned shard work: ${results.hasTasks}`);
+	console.log(`windows-dev-doctor: ${results.windowsDoctor}`);
+	console.log(`planned Windows dev:doctor: ${results.windowsDoctorRequired}`);
+	validateAffectedAggregate(results);
+	const tasks = await loadCanonicalPlan();
+	if (!tasks) throw new Error("affected-plan-invalid: aggregate requires a canonical plan");
+	const expectedHasNative = String(tasks.some(task => task.capabilities?.nativeProducer === true));
+	const expectedHasTasks = String(tasks.some(task => task.capabilities?.nativeProducer !== true));
+	if (results.hasNative !== expectedHasNative || results.hasTasks !== expectedHasTasks) {
+		throw new Error("affected-plan-invalid: planner flags do not match canonical plan");
+	}
+	console.log("Affected path validation: all required shards passed");
 }
 
 async function validateShardReceipts(): Promise<void> {

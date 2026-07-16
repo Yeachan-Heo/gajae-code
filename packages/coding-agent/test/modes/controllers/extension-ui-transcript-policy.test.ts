@@ -148,4 +148,16 @@ describe("ExtensionUiController transcript rebuild policy", () => {
 
 		expect(fixture.rebuildChatFromMessages).toHaveBeenCalledWith("reconcile-same-transcript");
 	});
+	it("routes extension fold choices through the interactive context", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+
+		const setToolUIContext = fixture.ctx.setToolUIContext as Mock<
+			(context: ExtensionUIContext, interactive: boolean) => void
+		>;
+		const uiContext = setToolUIContext.mock.calls[0]?.[0] as ExtensionUIContext;
+		uiContext.setToolsExpanded(true);
+
+		expect(fixture.ctx.setToolsExpanded).toHaveBeenCalledWith(true);
+	});
 });

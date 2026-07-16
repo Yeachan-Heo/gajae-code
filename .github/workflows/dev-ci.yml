@@ -38,6 +38,11 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
@@ -91,9 +96,10 @@ jobs:
         with:
           shared-key: windows-dev-doctor-win32-x64
           cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -112,12 +118,9 @@ jobs:
           bun run dev:doctor
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-  # Native addon build runs at most once per run and publishes the built `.node`
-  # files as an artifact the runtime-dependent shards download. A content-hash
-  # cache of the native sources lets PRs that don't touch crates/natives restore
-  # the prebuilt addon and skip the Rust/native source build entirely; only a
-  # cache miss (native source actually changed) recompiles. Skipped when the plan
-  # needs no native build at all.
+  # Native addon build runs once per run and publishes the built `.node` files as
+  # an artifact the runtime-dependent shards download. It is skipped when the
+  # plan needs no native build at all.
   affected-native:
     name: Affected path validation / native-build
     needs: [affected-plan]
@@ -130,10 +133,16 @@ jobs:
       CI_DEV_AFFECTED_PLAN: .ci-dev-affected-plan.json
       CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
       CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
@@ -146,42 +155,24 @@ jobs:
           name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: .
       - run: bun scripts/ci-dev-affected.ts --validate-plan
-      - name: Detect native host ABI
-        id: native-host
-        shell: bash
-        run: |
-          glibc="$(getconf GNU_LIBC_VERSION | tr ' ' '-')"
-          echo "glibc=$glibc" >> "$GITHUB_OUTPUT"
-      - name: Restore cached native addon
-        id: native-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-        with:
-          path: packages/natives/native/pi_natives.*.node
-          key: dev-affected-native-v2-baseline-modern-${{ runner.os }}-${{ steps.native-host.outputs.glibc }}-${{ hashFiles('crates/**/*.rs', 'crates/**/Cargo.toml', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'packages/natives/scripts/**', 'packages/natives/package.json', 'scripts/ci-build-native.ts', 'scripts/host-detect.ts') }}
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
-        if: steps.native-cache.outputs.cache-hit != 'true'
         with:
           toolchain: nightly-2026-04-29
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-        if: steps.native-cache.outputs.cache-hit != 'true'
         with:
           shared-key: dev-affected-native-linux-x64
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
-        if: steps.native-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - name: Install system deps
-        if: steps.native-cache.outputs.cache-hit != 'true'
         run: bash scripts/ci-install-system-deps.sh
-      - if: steps.native-cache.outputs.cache-hit != 'true'
-        run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
       - name: Build affected native addon(s)
-        if: steps.native-cache.outputs.cache-hit != 'true'
         run: bun scripts/ci-dev-affected.ts --native-build
       - name: Verify required native addon variants
         run: |
@@ -225,10 +216,16 @@ jobs:
       CI_DEV_MATRIX_RUST: ${{ matrix.rust }}
       CI_DEV_MATRIX_NEXTEST: ${{ matrix.nextest }}
       CI_DEV_MATRIX_NATIVE: ${{ matrix.native }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
@@ -261,7 +258,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -295,11 +292,10 @@ jobs:
           retention-days: 1
 
 
-  # Branch protection must keep requiring this stable aggregate status. It runs
-  # no validation itself; it passes iff the planner, native build, every affected
-  # shard, and every affected shard succeeded (skipped native
-  # and affected shards are fine for no-op or docs-only changes). The job name
-  # must stay exactly "Affected path validation".
+  # Branch protection must keep requiring this stable aggregate status. It validates
+  # the canonical plan and receipts, then passes iff the planner, native build,
+  # every affected shard, and Windows doctor satisfy their planned contracts. The
+  # job name must stay exactly "Affected path validation".
   affected:
     name: Affected path validation
     if: ${{ always() }}
@@ -311,19 +307,26 @@ jobs:
       CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
       CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
       CI_DEV_SHARD_RECEIPTS: .ci-dev-shard-receipts
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
       - name: Download canonical affected plan
-        if: ${{ needs.affected-plan.result == 'success' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: .
+      - name: Validate canonical affected plan
+        run: bun scripts/ci-dev-affected.ts --validate-plan
       - name: Download shard completion receipts
         if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
@@ -335,34 +338,15 @@ jobs:
         if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
         run: bun scripts/ci-dev-affected.ts --validate-shard-receipts
       - name: Aggregate affected path validation shards
-        run: |
-          plan='${{ needs.affected-plan.result }}'
-          native='${{ needs.affected-native.result }}'
-          shards='${{ needs.affected-shards.result }}'
-          has_native='${{ needs.affected-plan.outputs.has_native }}'
-          has_tasks='${{ needs.affected-plan.outputs.has_tasks }}'
-          windows_doctor='${{ needs.windows-dev-doctor.result }}'
-          echo "affected-plan: $plan"
-          echo "affected-native: $native"
-          echo "affected-shards: $shards"
-          echo "planned native work: $has_native"
-          echo "planned shard work: $has_tasks"
-          echo "windows-dev-doctor: $windows_doctor"
-          test "$plan" = success || { echo "planner did not succeed"; exit 1; }
-          case "$has_native" in true|false) ;; *) echo "planner emitted invalid has_native=$has_native"; exit 1 ;; esac
-          case "$has_tasks" in true|false) ;; *) echo "planner emitted invalid has_tasks=$has_tasks"; exit 1 ;; esac
-          if [ "$has_native" = true ]; then
-            test "$native" = success || { echo "required native build did not succeed"; exit 1; }
-          else
-            test "$native" = skipped || { echo "unplanned native build was not skipped"; exit 1; }
-          fi
-          if [ "$has_tasks" = true ]; then
-            test "$shards" = success || { echo "required affected shards did not succeed"; exit 1; }
-          else
-            test "$shards" = skipped || { echo "unplanned affected shards were not skipped"; exit 1; }
-          fi
-          case "$windows_doctor" in success|skipped) ;; *) echo "Windows dev:doctor did not pass"; exit 1 ;; esac
-          echo "Affected path validation: all required shards passed"
+        env:
+          CI_DEV_PLAN_RESULT: ${{ needs.affected-plan.result }}
+          CI_DEV_NATIVE_RESULT: ${{ needs.affected-native.result }}
+          CI_DEV_SHARDS_RESULT: ${{ needs.affected-shards.result }}
+          CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}
+          CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
+          CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
+          CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+        run: bun scripts/ci-dev-affected.ts --validate-aggregate
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}

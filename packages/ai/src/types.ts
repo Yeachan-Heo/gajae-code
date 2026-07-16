@@ -488,6 +488,9 @@ export interface ThinkingContent {
 	thinking: string;
 	thinkingSignature?: string; // e.g., for OpenAI responses, the reasoning item ID
 	itemId?: string; // item.id from output_item.added, used to match output_item.done
+	readonly provenance?: "summary" | "raw" | "mixed";
+	readonly summaryText?: string;
+	readonly rawText?: string;
 }
 
 export interface RedactedThinkingContent {
@@ -729,6 +732,13 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	 * calls route correctly. Absent for regular JSON function tools.
 	 */
 	customWireName?: string;
+	/**
+	 * Optional safe projection for tool arguments or results. Extensions use this
+	 * only for explicitly opt-in, display-safe summaries.
+	 */
+	safeSummary?: (kind: "args" | "result", value: unknown) => string | undefined;
+	/** Allowlisted argument/result field names for a safe fallback summary. */
+	safeSummaryFields?: { args?: string[]; result?: string[] };
 }
 
 export interface Context {
@@ -745,6 +755,9 @@ export type AssistantMessageEvent =
 	| { type: "thinking_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "thinking_end"; contentIndex: number; content: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "reasoning_summary_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_end"; contentIndex: number; content: string; partial: AssistantMessage }
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }

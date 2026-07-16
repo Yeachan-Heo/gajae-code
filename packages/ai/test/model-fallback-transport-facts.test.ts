@@ -35,12 +35,8 @@ describe("fallback transport facts", () => {
 			status: 429,
 			providerCode: "rate_limit_error",
 		});
-		expect(result.transportFailure?.headers).toBeInstanceOf(Headers);
-		expect(
-			result.transportFailure?.headers instanceof Headers
-				? result.transportFailure.headers.get("retry-after")
-				: undefined,
-		).toBe("7");
+		expect(result.transportFailure?.headers).toEqual({ "retry-after": "7" });
+		expect(() => structuredClone(result.transportFailure)).not.toThrow();
 	});
 
 	it("emits transport facts captured from fetch error responses", async () => {
@@ -59,12 +55,8 @@ describe("fallback transport facts", () => {
 			status: 429,
 			providerCode: "insufficient_quota",
 		});
-		expect(result.transportFailure?.headers).toBeInstanceOf(Headers);
-		expect(
-			result.transportFailure?.headers instanceof Headers
-				? result.transportFailure.headers.get("retry-after")
-				: undefined,
-		).toBe("11");
+		expect(result.transportFailure?.headers).toEqual({ "retry-after": "11" });
+		expect(() => structuredClone(result.transportFailure)).not.toThrow();
 	});
 	it("classifies typed provider failures and Retry-After headers", () => {
 		expect(
@@ -94,7 +86,7 @@ describe("fallback transport facts", () => {
 		});
 		const quotaFacts = transportFailureFacts(quotaError);
 		expect(quotaFacts).toMatchObject({ kind: "transport", status: 429, providerCode: "insufficient_quota" });
-		expect(quotaFacts?.headers).toBeInstanceOf(Headers);
+		expect(quotaFacts?.headers).toEqual({ "retry-after-ms": "125" });
 		expect(classifyFallbackTrigger(quotaFacts)).toEqual({ class: "quota", retryAfterMs: 125 });
 
 		expect(classifyFallbackTrigger(transportFailureFacts({ status: 401 }))).toEqual({ class: "auth" });
@@ -103,6 +95,131 @@ describe("fallback transport facts", () => {
 			kind: "transport",
 			providerCode: "invalid_api_key",
 		});
+	});
+
+	it("retains only retry-signal headers as a structured-cloneable plain record", () => {
+		const facts = transportFailureFacts({
+			status: 429,
+			headers: new Headers({ "retry-after": "2", "set-cookie": "secret=1", "x-request-id": "abc" }),
+		});
+		expect(facts?.headers).toEqual({ "retry-after": "2" });
+		expect(() => structuredClone(facts)).not.toThrow();
+		expect(classifyFallbackTrigger(facts)).toEqual({ class: "rate_limit", retryAfterMs: 2000 });
+
+		const recordFacts = transportFailureFacts({ status: 429, headers: { "Retry-After-Ms": "125", other: "x" } });
+		expect(recordFacts?.headers).toEqual({ "retry-after-ms": "125" });
+		expect(classifyFallbackTrigger(recordFacts)).toEqual({ class: "rate_limit", retryAfterMs: 125 });
+	});
+
+	it("normalizes idempotently: re-running facts on facts is structurally stable", () => {
+		// Headers without any retained retry signal (and no status/code) must not
+		// yield facts on the first pass and then vanish on re-normalization.
+		expect(transportFailureFacts({ headers: new Headers({ "x-request-id": "abc" }) })).toBeUndefined();
+
+		// Facts that do exist survive re-normalization byte-for-byte; consumers
+		// deliberately re-run transportFailureFacts on embedded facts.
+		const facts = transportFailureFacts({
+			status: 429,
+			code: "rate_limit_error",
+			headers: new Headers({ "retry-after": "2", "set-cookie": "secret=1" }),
+		});
+		expect(facts).toBeDefined();
+		expect(transportFailureFacts(facts)).toEqual(facts!);
+
+		const headerOnly = transportFailureFacts({ headers: { "retry-after": "3" } });
+		expect(headerOnly).toEqual({
+			kind: "transport",
+			status: undefined,
+			providerCode: undefined,
+			headers: { "retry-after": "3" },
+		});
+		expect(transportFailureFacts(headerOnly)).toEqual(headerOnly!);
+	});
+
+	it("survives hostile outer wrappers without masking provider facts", () => {
+		for (const property of ["status", "response", "providerCode", "code", "error", "type", "headers"]) {
+			const hostile: Record<string, unknown> = {
+				status: 429,
+				code: "rate_limit_error",
+				headers: { "retry-after": "2" },
+			};
+			Object.defineProperty(hostile, property, {
+				configurable: true,
+				get() {
+					throw new Error(`${property} accessor failed`);
+				},
+			});
+			expect(() => transportFailureFacts(hostile)).not.toThrow();
+			const trigger = classifyFallbackTrigger(transportFailureFacts(hostile));
+			expect(trigger.class).toBe("rate_limit");
+			expect(trigger.retryAfterMs).toBe(property === "headers" ? undefined : 2000);
+		}
+
+		const liveProxy = new Proxy(
+			{ status: 429, code: "rate_limit_error", headers: { "retry-after": "2" } },
+			{
+				get(target, property, receiver) {
+					if (property === "headers") throw new Error("headers trap failed");
+					return Reflect.get(target, property, receiver);
+				},
+			},
+		);
+		expect(transportFailureFacts(liveProxy)).toMatchObject({
+			kind: "transport",
+			status: 429,
+			providerCode: "rate_limit_error",
+		});
+
+		const { proxy, revoke } = Proxy.revocable({}, {});
+		revoke();
+		expect(() => transportFailureFacts(proxy, { status: 503 })).not.toThrow();
+		expect(transportFailureFacts(proxy, { status: 503 })).toMatchObject({ kind: "transport", status: 503 });
+	});
+
+	it("omits unsafe header values while retaining finite transport facts", () => {
+		const accessorHeaders: Record<string, string> = {};
+		let reads = 0;
+		Object.defineProperty(accessorHeaders, "retry-after", {
+			enumerable: true,
+			get() {
+				reads += 1;
+				throw new Error("getter must not be read");
+			},
+		});
+		const accessorFacts = transportFailureFacts({ status: 429, headers: accessorHeaders });
+		expect(accessorFacts).toMatchObject({ kind: "transport", status: 429 });
+		expect(accessorFacts?.headers).toBeUndefined();
+		expect(reads).toBe(0);
+
+		const throwingHeaders = new Headers();
+		Object.defineProperty(throwingHeaders, "get", {
+			value: () => {
+				throw new Error("get failed");
+			},
+		});
+		const throwingFacts = transportFailureFacts({ status: 503, code: "rate_limit_error", headers: throwingHeaders });
+		expect(throwingFacts).toMatchObject({ kind: "transport", status: 503, providerCode: "rate_limit_error" });
+		expect(throwingFacts?.headers).toBeUndefined();
+
+		const nonStringHeaders = new Headers();
+		Object.defineProperty(nonStringHeaders, "get", { value: () => new String("2") });
+		const nonStringFacts = transportFailureFacts({ status: 429, headers: nonStringHeaders });
+		expect(nonStringFacts).toMatchObject({ kind: "transport", status: 429 });
+		expect(nonStringFacts?.headers).toBeUndefined();
+	});
+
+	it("round-trips normalized facts through JSON and structuredClone without changing classification", () => {
+		const facts = transportFailureFacts({
+			status: 429,
+			code: "insufficient_quota",
+			headers: new Headers({ "retry-after-ms": "125", "x-request-id": "secret" }),
+		});
+		const jsonRoundTrip = JSON.parse(JSON.stringify(facts));
+		const cloneRoundTrip = structuredClone(facts);
+		expect(jsonRoundTrip).toEqual(facts);
+		expect(cloneRoundTrip).toEqual(facts);
+		expect(classifyFallbackTrigger(jsonRoundTrip)).toEqual({ class: "quota", retryAfterMs: 125 });
+		expect(classifyFallbackTrigger(cloneRoundTrip)).toEqual({ class: "quota", retryAfterMs: 125 });
 	});
 
 	it("does not attach transport facts to non-transport provider errors", () => {

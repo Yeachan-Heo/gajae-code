@@ -1324,6 +1324,13 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			) & { index: number };
 			const blocks = output.content as Block[];
 			const blocksByAnthropicIndex = new Map<number, Block>();
+			// Derive from the ACTUAL request shape, not the option default: the request
+			// only sends `display: "summarized"` on specific paths (adaptive display is
+			// omitted for models where supportsAdaptiveThinkingDisplay is false). Defaulting
+			// to summarized would mislabel raw thinking as a provider-displayable summary.
+			const summarizedThinking =
+				(params.thinking as { display?: AnthropicThinkingDisplay } | undefined)?.display === "summarized";
+			const reasoningBuffers = new WeakMap<object, string>();
 			const getBlockByAnthropicIndex = (anthropicIndex: number) => {
 				const block = blocksByAnthropicIndex.get(anthropicIndex);
 				if (!block) return { block: undefined, contentIndex: -1 };
@@ -1455,11 +1462,24 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								};
 								output.content.push(block);
 								trackBlockByAnthropicIndex(event.index, block);
+								// Emit thinking_start FIRST so a reasoning item is open before any
+								// summary-start: the Responses SSE encoder only accepts a summary
+								// start when state.open.kind === "reasoning", otherwise the
+								// reasoning_summary_part.added frame is dropped and deltas arrive
+								// out of order.
 								stream.push({
 									type: "thinking_start",
 									contentIndex: output.content.length - 1,
 									partial: output,
 								});
+								if (summarizedThinking) {
+									reasoningBuffers.set(block, "");
+									stream.push({
+										type: "reasoning_summary_start",
+										contentIndex: output.content.length - 1,
+										partial: output,
+									});
+								}
 							} else if (event.content_block.type === "redacted_thinking") {
 								const block: Block = {
 									type: "redactedThinking",
@@ -1504,12 +1524,23 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
 									block.thinking += event.delta.thinking;
-									stream.push({
-										type: "thinking_delta",
-										contentIndex: index,
-										delta: event.delta.thinking,
-										partial: output,
-									});
+									if (summarizedThinking) {
+										const summary = (reasoningBuffers.get(block) ?? "") + event.delta.thinking;
+										reasoningBuffers.set(block, summary);
+										stream.push({
+											type: "reasoning_summary_delta",
+											contentIndex: index,
+											delta: event.delta.thinking,
+											partial: output,
+										});
+									} else {
+										stream.push({
+											type: "thinking_delta",
+											contentIndex: index,
+											delta: event.delta.thinking,
+											partial: output,
+										});
+									}
 								}
 							} else if (event.delta.type === "input_json_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
@@ -1543,6 +1574,21 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "thinking") {
+									if (summarizedThinking) {
+										const summaryText = reasoningBuffers.get(block) ?? "";
+										const mutable = block as {
+											provenance?: "summary" | "raw" | "mixed";
+											summaryText?: string;
+										};
+										if (mutable.summaryText === undefined) mutable.summaryText = summaryText;
+										if (mutable.provenance === undefined) mutable.provenance = "summary";
+										stream.push({
+											type: "reasoning_summary_end",
+											contentIndex: index,
+											content: summaryText,
+											partial: output,
+										});
+									}
 									stream.push({
 										type: "thinking_end",
 										contentIndex: index,

@@ -123,12 +123,16 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 
 	push(event: T): void {
 		if (this.done) return;
-
-		if (this.isComplete(event)) {
-			this.done = true;
-			this.resolveFinalResult(this.extractResult(event));
+		try {
+			if (this.isComplete(event)) {
+				const result = this.extractResult(event);
+				this.done = true;
+				this.resolveFinalResult(result);
+			}
+		} catch (error) {
+			this.fail(error);
+			return;
 		}
-
 		this.deliver(event);
 	}
 

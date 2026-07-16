@@ -437,6 +437,11 @@ pub enum ServerMessage {
 	/// A controlled action could not be presented to this connection.
 	ActionUnavailable(ActionUnavailable),
 
+	/// A projected tool execution activity update.
+	ToolActivity(ToolActivity),
+	/// A finalized, provider-supplied reasoning summary.
+	ReasoningSummary(ReasoningSummary),
+
 	/// Forward-compat: an unrecognized frame type. Tolerated, never emitted.
 	#[serde(other)]
 	Unknown,
@@ -484,6 +489,17 @@ pub enum TurnPhase {
 	Live,
 	/// The clean, finalized turn output.
 	Finalized,
+}
+
+/// Phase of a projected tool execution activity update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActivityPhase {
+	Started,
+	Completed,
+	Failed,
+	Cancelled,
+	Unknown,
 }
 
 /// One-time per-session identity header, pinned at thread creation.
@@ -550,6 +566,32 @@ pub struct TurnStream {
 	/// Opaque ref to coalesce live edits onto one rendered message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub message_ref:  Option<String>,
+}
+
+/// A projected tool execution activity update for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolActivity {
+	pub session_id:     String,
+	pub tool_call_id:   String,
+	pub tool_name:      String,
+	pub phase:          ToolActivityPhase,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub args_summary:   Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub result_summary: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub is_error:       Option<bool>,
+}
+
+/// A finalized, provider-supplied reasoning summary for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningSummary {
+	pub session_id: String,
+	pub text:       String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub turn_ref:   Option<String>,
 }
 
 /// An agent-produced image artifact for a session thread.
@@ -862,6 +904,8 @@ pub mod capabilities {
 	pub const ASK_CONTROLS_V1: &str = "ask_controls_v1";
 	/// Correlated, origin-bound `Selected!` acknowledgement requests.
 	pub const ASK_SELECTED_ACK_V1: &str = "ask_selected_ack_v1";
+	/// Projected tool activity and finalized reasoning summary frames.
+	pub const TOOL_ACTIVITY_V1: &str = "tool_activity_v1";
 }
 
 #[cfg(test)]
@@ -1116,6 +1160,94 @@ mod tests {
 		assert_eq!(v["phase"], "finalized");
 		assert_eq!(v["finalAnswer"], true);
 		assert_eq!(v["messageRef"], "m-7");
+	}
+
+	#[test]
+	fn tool_activity_serializes_camelcase_snake_tag() {
+		let msg = ServerMessage::ToolActivity(ToolActivity {
+			session_id:     "sess-1".into(),
+			tool_call_id:   "call-1".into(),
+			tool_name:      "functions.read".into(),
+			phase:          ToolActivityPhase::Completed,
+			args_summary:   Some("path: protocol.rs".into()),
+			result_summary: Some("1488 lines".into()),
+			is_error:       Some(false),
+		});
+		let value = serde_json::to_value(&msg).unwrap();
+		assert_eq!(value["type"], "tool_activity");
+		assert_eq!(value["sessionId"], "sess-1");
+		assert_eq!(value["toolCallId"], "call-1");
+		assert_eq!(value["toolName"], "functions.read");
+		assert_eq!(value["phase"], "completed");
+		assert_eq!(value["argsSummary"], "path: protocol.rs");
+		assert_eq!(value["resultSummary"], "1488 lines");
+		assert_eq!(value["isError"], false);
+		assert_eq!(serde_json::from_value::<ServerMessage>(value).unwrap(), msg);
+	}
+
+	#[test]
+	fn reasoning_summary_round_trips() {
+		let msg = ServerMessage::ReasoningSummary(ReasoningSummary {
+			session_id: "sess-1".into(),
+			text:       "Provider summary".into(),
+			turn_ref:   Some("turn-1".into()),
+		});
+		let value = serde_json::to_value(&msg).unwrap();
+		assert_eq!(value["type"], "reasoning_summary");
+		assert_eq!(value["sessionId"], "sess-1");
+		assert_eq!(value["turnRef"], "turn-1");
+		assert_eq!(serde_json::from_value::<ServerMessage>(value).unwrap(), msg);
+	}
+
+	#[test]
+	fn tool_activity_phase_snake_case() {
+		for (phase, expected) in [
+			(ToolActivityPhase::Started, "started"),
+			(ToolActivityPhase::Completed, "completed"),
+			(ToolActivityPhase::Failed, "failed"),
+			(ToolActivityPhase::Cancelled, "cancelled"),
+			(ToolActivityPhase::Unknown, "unknown"),
+		] {
+			assert_eq!(serde_json::to_string(&phase).unwrap(), format!("\"{expected}\""));
+		}
+	}
+
+	#[test]
+	fn unknown_variant_remains_final_serde_other() {
+		let msg: ServerMessage =
+			serde_json::from_str(r#"{"type":"totally_unknown","payload":true}"#).unwrap();
+		assert_eq!(msg, ServerMessage::Unknown);
+	}
+
+	#[test]
+	fn server_message_variant_enumeration() {
+		// TODO(#2299 rebase): extend to include ephemeral_turn/ephemeral_turn_result.
+		let raw = r#"[
+			{"type":"tool_activity","sessionId":"sess-1","toolCallId":"call-1","toolName":"functions.read","phase":"started"},
+			{"type":"reasoning_summary","sessionId":"sess-1","text":"Provider summary","turnRef":"turn-1"},
+			{"type":"future_server_variant","payload":true}
+		]"#;
+		let messages: Vec<ServerMessage> = serde_json::from_str(raw).unwrap();
+		assert_eq!(messages, vec![
+			ServerMessage::ToolActivity(ToolActivity {
+				session_id:     "sess-1".into(),
+				tool_call_id:   "call-1".into(),
+				tool_name:      "functions.read".into(),
+				phase:          ToolActivityPhase::Started,
+				args_summary:   None,
+				result_summary: None,
+				is_error:       None,
+			}),
+			ServerMessage::ReasoningSummary(ReasoningSummary {
+				session_id: "sess-1".into(),
+				text:       "Provider summary".into(),
+				turn_ref:   Some("turn-1".into()),
+			}),
+			ServerMessage::Unknown,
+		],);
+		let round_tripped: Vec<ServerMessage> =
+			serde_json::from_str(&serde_json::to_string(&messages).unwrap()).unwrap();
+		assert_eq!(round_tripped, messages);
 	}
 
 	#[test]

@@ -73,6 +73,34 @@ const baseContext: Context = {
 	messages: [{ role: "user", content: "hi", timestamp: 0 }],
 };
 
+const RAW_SENTINEL = "RAW_SERIALIZED_RESPONSES_REASONING";
+const SUMMARY_SENTINEL = "SUMMARY_SAFE_DISPLAY_TEXT";
+const OPAQUE_SIGNATURE = "opaque-provider-signature";
+
+function responsesReasoningSignature(id: string): string {
+	return JSON.stringify({
+		type: "reasoning",
+		id,
+		content: [{ type: "reasoning_text", text: RAW_SENTINEL }],
+	});
+}
+
+function reasoningMessage(provenance: "mixed" | "raw", displayText: string, id: string): AssistantMessage {
+	const rawThinking = {
+		type: "thinking" as const,
+		thinking: displayText,
+		thinkingSignature: responsesReasoningSignature(id),
+		provenance,
+		rawText: RAW_SENTINEL,
+		...(provenance === "mixed" ? { summaryText: displayText } : {}),
+	};
+	return baseAssistant({
+		content:
+			provenance === "mixed"
+				? [rawThinking, { type: "thinking", thinking: SUMMARY_SENTINEL, thinkingSignature: OPAQUE_SIGNATURE }]
+				: [rawThinking],
+	});
+}
 const SYNC_THROW_SOURCE = "auth-gateway-sync-throw-test";
 const SYNC_THROW_API = "auth-gateway-sync-throw-test" as Api;
 
@@ -272,6 +300,204 @@ describe("pi-native encodeStream", () => {
 		const parsed = (await collectSse(encodeStream(makeEventStream(events, errored)))).map(parseSseLine);
 		expect(parsed[0]).toEqual({ type: "error", reason: "error", error: JSON.parse(JSON.stringify(errored)) });
 		expect(parsed[1]).toBe("[DONE]");
+	});
+
+	it("replays mixed Responses reasoning safely across start, partial, done, and error envelopes", async () => {
+		const startPartial = reasoningMessage("mixed", `${SUMMARY_SENTINEL} start`, "rs-start");
+		const deltaPartial = reasoningMessage("mixed", `${SUMMARY_SENTINEL} delta`, "rs-delta");
+		const endPartial = reasoningMessage("mixed", `${SUMMARY_SENTINEL} end`, "rs-end");
+		const completed = reasoningMessage("mixed", `${SUMMARY_SENTINEL} done`, "rs-done");
+		const errored = reasoningMessage("mixed", `${SUMMARY_SENTINEL} error`, "rs-error");
+		const completedEvents: AssistantMessageEvent[] = [
+			{ type: "start", partial: startPartial },
+			{ type: "thinking_start", contentIndex: 0, partial: startPartial },
+			{ type: "thinking_delta", contentIndex: 0, delta: RAW_SENTINEL, partial: deltaPartial },
+			{ type: "reasoning_summary_start", contentIndex: 0, partial: deltaPartial },
+			{
+				type: "reasoning_summary_delta",
+				contentIndex: 0,
+				delta: `${SUMMARY_SENTINEL} delta`,
+				partial: deltaPartial,
+			},
+			{ type: "thinking_end", contentIndex: 0, content: RAW_SENTINEL, partial: endPartial },
+			{ type: "reasoning_summary_end", contentIndex: 0, content: `${SUMMARY_SENTINEL} end`, partial: endPartial },
+			{ type: "done", reason: "stop", message: completed },
+		];
+		const errorEvents: AssistantMessageEvent[] = [{ type: "error", reason: "error", error: errored }];
+		const completedSource = JSON.stringify(completedEvents);
+		const errorSource = JSON.stringify(errorEvents);
+		const completedFrames = (await collectSse(encodeStream(makeEventStream(completedEvents, completed)))).map(
+			parseSseLine,
+		) as Array<Record<string, unknown>>;
+		const errorFrames = (await collectSse(encodeStream(makeEventStream(errorEvents, errored)))).map(
+			parseSseLine,
+		) as Array<Record<string, unknown>>;
+
+		for (const bytes of [JSON.stringify(completedFrames), JSON.stringify(errorFrames)]) {
+			expect(bytes).not.toContain(RAW_SENTINEL);
+			expect(bytes).toContain(SUMMARY_SENTINEL);
+			expect(bytes).toContain(OPAQUE_SIGNATURE);
+		}
+		const summaryDelta = completedFrames.find(frame => frame.type === "reasoning_summary_delta");
+		const summaryEnd = completedFrames.find(frame => frame.type === "reasoning_summary_end");
+		expect((summaryDelta as { delta: string }).delta).toBe(`${SUMMARY_SENTINEL} delta`);
+		expect((summaryEnd as { content: string }).content).toBe(`${SUMMARY_SENTINEL} end`);
+
+		const projectedMessages = completedFrames.flatMap(frame => {
+			if (frame.type === "done") return [frame.message as AssistantMessage];
+			if (frame.type === "[DONE]") return [];
+			return frame.partial ? [frame.partial as AssistantMessage] : [];
+		});
+		projectedMessages.push(errorFrames[0]!.error as AssistantMessage);
+		for (const message of projectedMessages) {
+			expect(message.content[0]).toMatchObject({ type: "thinking" });
+			expect(message.content[0]).not.toHaveProperty("rawText");
+			expect(message.content[0]).not.toHaveProperty("thinkingSignature");
+			if ((message.content[0] as { provenance?: string }).provenance === "summary") continue;
+			expect(message.content[0]).toMatchObject({ provenance: "mixed" });
+			expect(message.content[1]).toMatchObject({ type: "thinking", thinkingSignature: OPAQUE_SIGNATURE });
+		}
+
+		expect(JSON.stringify(completedEvents)).toBe(completedSource);
+		expect(JSON.stringify(errorEvents)).toBe(errorSource);
+	});
+
+	it("drops raw-only Responses reasoning projections without mutating replay sources", async () => {
+		const startPartial = reasoningMessage("raw", RAW_SENTINEL, "rs-raw-start");
+		const deltaPartial = reasoningMessage("raw", RAW_SENTINEL, "rs-raw-delta");
+		const endPartial = reasoningMessage("raw", RAW_SENTINEL, "rs-raw-end");
+		const completed = reasoningMessage("raw", RAW_SENTINEL, "rs-raw-done");
+		const errored = reasoningMessage("raw", RAW_SENTINEL, "rs-raw-error");
+		const completedEvents: AssistantMessageEvent[] = [
+			{ type: "start", partial: startPartial },
+			{ type: "thinking_start", contentIndex: 0, partial: startPartial },
+			{ type: "thinking_delta", contentIndex: 0, delta: RAW_SENTINEL, partial: deltaPartial },
+			{ type: "thinking_end", contentIndex: 0, content: RAW_SENTINEL, partial: endPartial },
+			{ type: "done", reason: "stop", message: completed },
+		];
+		const errorEvents: AssistantMessageEvent[] = [{ type: "error", reason: "error", error: errored }];
+		const completedSource = JSON.stringify(completedEvents);
+		const errorSource = JSON.stringify(errorEvents);
+		const completedFrames = (await collectSse(encodeStream(makeEventStream(completedEvents, completed)))).map(
+			parseSseLine,
+		) as Array<Record<string, unknown>>;
+		const errorFrames = (await collectSse(encodeStream(makeEventStream(errorEvents, errored)))).map(
+			parseSseLine,
+		) as Array<Record<string, unknown>>;
+
+		for (const bytes of [JSON.stringify(completedFrames), JSON.stringify(errorFrames)]) {
+			expect(bytes).not.toContain(RAW_SENTINEL);
+		}
+		expect([completedFrames[0]!.type, completedFrames[1]!.type, completedFrames[2]]).toEqual([
+			"start",
+			"done",
+			"[DONE]",
+		]);
+		expect((completedFrames[0]!.partial as AssistantMessage).content).toEqual([]);
+		expect((completedFrames[1]!.message as AssistantMessage).content).toEqual([]);
+		expect((errorFrames[0]!.error as AssistantMessage).content).toEqual([]);
+
+		expect(JSON.stringify(completedEvents)).toBe(completedSource);
+		expect(JSON.stringify(errorEvents)).toBe(errorSource);
+	});
+
+	it("withholds interrupted unprovenanced Codex Responses thinking", async () => {
+		const partial = baseAssistant({
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			content: [{ type: "thinking", thinking: RAW_SENTINEL }],
+		});
+		const events: AssistantMessageEvent[] = [
+			{ type: "start", partial: baseAssistant() },
+			{ type: "thinking_start", contentIndex: 0, partial },
+			{ type: "thinking_delta", contentIndex: 0, delta: RAW_SENTINEL, partial },
+			{ type: "error", reason: "error", error: partial },
+		];
+		const lines = await collectSse(encodeStream(makeEventStream(events, partial)));
+		const frames = lines.slice(0, -1).map(parseSseLine) as Array<Record<string, unknown>>;
+
+		expect(lines.join("\n")).not.toContain(RAW_SENTINEL);
+		expect(frames.map(frame => frame.type)).toEqual(["start", "error"]);
+		expect((frames[1]!.error as AssistantMessage).content).toEqual([]);
+	});
+
+	it.each([
+		"raw",
+		"mixed",
+	] as const)("withholds unclassified thinking until a terminal $provenance partial classifies it", async provenance => {
+		const earlyPartial = baseAssistant({ content: [{ type: "thinking", thinking: RAW_SENTINEL }] });
+		const final = reasoningMessage(provenance, `${SUMMARY_SENTINEL} terminal`, `rs-terminal-${provenance}`);
+		const events: AssistantMessageEvent[] = [
+			{ type: "start", partial: baseAssistant() },
+			{ type: "thinking_start", contentIndex: 0, partial: earlyPartial },
+			{ type: "thinking_delta", contentIndex: 0, delta: RAW_SENTINEL, partial: earlyPartial },
+			{ type: "reasoning_summary_start", contentIndex: 0, partial: earlyPartial },
+			{
+				type: "reasoning_summary_delta",
+				contentIndex: 0,
+				delta: SUMMARY_SENTINEL,
+				partial: earlyPartial,
+			},
+			{ type: "reasoning_summary_end", contentIndex: 0, content: SUMMARY_SENTINEL, partial: earlyPartial },
+			{ type: "thinking_end", contentIndex: 0, content: RAW_SENTINEL, partial: final },
+			{ type: "done", reason: "stop", message: final },
+		];
+		const source = JSON.stringify(events);
+		const lines = await collectSse(encodeStream(makeEventStream(events, final)));
+		const frames = lines.slice(0, -1).map(parseSseLine) as Array<Record<string, unknown>>;
+
+		expect(lines.join("\n")).not.toContain(RAW_SENTINEL);
+		expect(lines.join("\n")).toContain(SUMMARY_SENTINEL);
+		expect(frames.map(frame => frame.type)).toEqual([
+			"start",
+			"reasoning_summary_start",
+			"reasoning_summary_delta",
+			"reasoning_summary_end",
+			"done",
+		]);
+		const summaryFrames = frames.slice(1, 4) as Array<{ partial: AssistantMessage }>;
+		for (const frame of summaryFrames) {
+			expect(frame.partial.content[0]).toMatchObject({
+				type: "thinking",
+				provenance: "summary",
+			});
+			expect(frame.partial.content).toHaveLength(1);
+		}
+		expect(summaryFrames[1]!.partial.content[0]).toMatchObject({ summaryText: SUMMARY_SENTINEL });
+		expect(summaryFrames[2]!.partial.content[0]).toMatchObject({ summaryText: SUMMARY_SENTINEL });
+		expect(lines.at(-1)).toBe("data: [DONE]");
+		expect(JSON.stringify(events)).toBe(source);
+	});
+
+	it("flushes an opaque provider-native thinking block only after its safe final partial", async () => {
+		const opaqueThinking = {
+			type: "thinking" as const,
+			thinking: "OPAQUE_PROVIDER_NATIVE_THINKING",
+			thinkingSignature: OPAQUE_SIGNATURE,
+		};
+
+		const partial = baseAssistant({ content: [opaqueThinking] });
+		const events: AssistantMessageEvent[] = [
+			{ type: "start", partial: baseAssistant() },
+			{ type: "thinking_start", contentIndex: 0, partial },
+			{ type: "thinking_delta", contentIndex: 0, delta: "OPAQUE_DELTA", partial },
+			{ type: "thinking_end", contentIndex: 0, content: "OPAQUE_PROVIDER_NATIVE_THINKING", partial },
+			{ type: "done", reason: "stop", message: partial },
+		];
+		const source = JSON.stringify(events);
+		const lines = await collectSse(encodeStream(makeEventStream(events, partial)));
+		const frames = lines.slice(0, -1).map(parseSseLine) as Array<Record<string, unknown>>;
+
+		expect(frames.map(frame => frame.type)).toEqual([
+			"start",
+			"thinking_start",
+			"thinking_delta",
+			"thinking_end",
+			"done",
+		]);
+		expect(lines.at(-1)).toBe("data: [DONE]");
+		expect((frames[2] as { delta: string }).delta).toBe("OPAQUE_DELTA");
+		expect(JSON.stringify(events)).toBe(source);
 	});
 
 	it("emits a synthetic error envelope when the source iterator throws", async () => {

@@ -139,6 +139,7 @@ const CODEX_PROGRESS_EVENT_TYPES = new Set([
 	"response.reasoning_summary_part.added",
 	"response.reasoning_summary_text.delta",
 	"response.reasoning_summary_part.done",
+	"response.reasoning_text.delta",
 	"response.content_part.added",
 	"response.output_text.delta",
 	"response.refusal.delta",
@@ -161,8 +162,8 @@ function isCodexStreamProgressEvent(event: unknown): boolean {
 }
 type CodexTransport = "sse" | "websocket";
 type CodexEventItem = ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | ResponseCustomToolCall;
-type CodexOutputBlock = ThinkingContent | TextContent | (ToolCall & { partialJson: string });
-
+type CodexThinkingBlock = ThinkingContent & { summaryBuffer: string; rawBuffer: string; summaryStarted: boolean };
+type CodexOutputBlock = CodexThinkingBlock | TextContent | (ToolCall & { partialJson: string });
 export interface OpenAICodexWebSocketDebugStats {
 	fullContextRequests: number;
 	deltaRequests: number;
@@ -1001,6 +1002,11 @@ function handleCodexStreamEvent(args: {
 		return firstTokenTime;
 	}
 
+	if (eventType === "response.reasoning_text.delta") {
+		handleReasoningTextDelta(runtime.currentItem, runtime.currentBlock, rawEvent, stream, output, blockIndex);
+		return firstTokenTime;
+	}
+
 	if (eventType === "response.content_part.added") {
 		handleContentPartAdded(runtime.currentItem, rawEvent);
 		return firstTokenTime;
@@ -1075,7 +1081,7 @@ function handleCodexStreamEvent(args: {
 
 function createOutputBlockForItem(item: CodexEventItem): CodexOutputBlock | null {
 	if (item.type === "reasoning") {
-		return { type: "thinking", thinking: "" };
+		return { type: "thinking", thinking: "", summaryBuffer: "", rawBuffer: "", summaryStarted: false };
 	}
 	if (item.type === "message") {
 		return { type: "text", text: "" };
@@ -1126,13 +1132,18 @@ function handleReasoningSummaryTextDelta(
 	blockIndex: () => number,
 ): void {
 	if (currentItem?.type !== "reasoning" || currentBlock?.type !== "thinking") return;
+	if (!currentBlock.summaryStarted) {
+		currentBlock.summaryStarted = true;
+		stream.push({ type: "reasoning_summary_start", contentIndex: blockIndex(), partial: output });
+	}
 	currentItem.summary = currentItem.summary || [];
 	const lastPart = currentItem.summary[currentItem.summary.length - 1];
 	if (!lastPart) return;
 	const delta = (rawEvent as { delta?: string }).delta || "";
 	currentBlock.thinking += delta;
+	currentBlock.summaryBuffer += delta;
 	lastPart.text += delta;
-	stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta, partial: output });
+	stream.push({ type: "reasoning_summary_delta", contentIndex: blockIndex(), delta, partial: output });
 }
 
 function handleReasoningSummaryPartDone(
@@ -1147,8 +1158,24 @@ function handleReasoningSummaryPartDone(
 	const lastPart = currentItem.summary[currentItem.summary.length - 1];
 	if (!lastPart) return;
 	currentBlock.thinking += "\n\n";
+	currentBlock.summaryBuffer += "\n\n";
 	lastPart.text += "\n\n";
-	stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta: "\n\n", partial: output });
+	stream.push({ type: "reasoning_summary_delta", contentIndex: blockIndex(), delta: "\n\n", partial: output });
+}
+
+function handleReasoningTextDelta(
+	currentItem: CodexEventItem | null,
+	currentBlock: CodexOutputBlock | null,
+	rawEvent: Record<string, unknown>,
+	stream: AssistantMessageEventStream,
+	output: AssistantMessage,
+	blockIndex: () => number,
+): void {
+	if (currentItem?.type !== "reasoning" || currentBlock?.type !== "thinking") return;
+	const delta = (rawEvent as { delta?: string }).delta || "";
+	currentBlock.thinking += delta;
+	currentBlock.rawBuffer += delta;
+	stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta, partial: output });
 }
 
 function handleContentPartAdded(currentItem: CodexEventItem | null, rawEvent: Record<string, unknown>): void {
@@ -1251,14 +1278,50 @@ function handleOutputItemDone(
 	runtime.nativeOutputItems.push(item as unknown as Record<string, unknown>);
 
 	if (item.type === "reasoning" && runtime.currentBlock?.type === "thinking") {
-		runtime.currentBlock.thinking = item.summary?.map(summary => summary.text).join("\n\n") || "";
-		runtime.currentBlock.thinkingSignature = JSON.stringify(item);
-		stream.push({
-			type: "thinking_end",
-			contentIndex: blockIndex(),
-			content: runtime.currentBlock.thinking,
-			partial: output,
-		});
+		const block = runtime.currentBlock;
+		// Prefer the streamed summary buffer only when it carries real text; a
+		// part.done before/without any summary_text delta leaves only separators, so
+		// fall back to the canonical item.summary from output_item.done (matches the
+		// shared Responses decoder).
+		const bufferSummary = block.summaryBuffer ?? "";
+		const itemSummary = item.summary?.map(summary => summary.text).join("\n\n") ?? "";
+		const summaryText = bufferSummary.trim() ? bufferSummary : itemSummary;
+		const rawText = block.rawBuffer;
+		const mutable = block as { provenance?: "summary" | "raw" | "mixed"; summaryText?: string; rawText?: string };
+		if (mutable.provenance === undefined) {
+			if (mutable.summaryText === undefined && summaryText) mutable.summaryText = summaryText;
+			if (mutable.rawText === undefined && rawText) mutable.rawText = rawText;
+			mutable.provenance = summaryText && rawText ? "mixed" : summaryText ? "summary" : rawText ? "raw" : undefined;
+		}
+		// Finalized display string must exclude raw CoT when a summary exists (parity
+		// with openai-responses-shared). Derive from STORED write-once provenance fields
+		// so a later/duplicate raw-only finalization cannot overwrite a summary/mixed
+		// block's safe display with raw CoT; raw-only stays raw.
+		{
+			const effSummary = mutable.summaryText ?? summaryText;
+			const effRaw = mutable.rawText ?? rawText;
+			block.thinking = mutable.provenance === "raw" ? effRaw : effSummary || effRaw;
+		}
+		block.thinkingSignature = JSON.stringify(item);
+		delete (block as { summaryBuffer?: string }).summaryBuffer;
+		delete (block as { rawBuffer?: string }).rawBuffer;
+		const wasSummaryStarted = block.summaryStarted;
+		delete (block as { summaryStarted?: boolean }).summaryStarted;
+		if (summaryText) {
+			// Emit a summary start first when none was streamed (part.added/done or
+			// canonical done-item summary with no summary_text delta), so consumers that
+			// open a summary on start don't receive an orphaned reasoning_summary_end.
+			if (!wasSummaryStarted) {
+				stream.push({ type: "reasoning_summary_start", contentIndex: blockIndex(), partial: output });
+			}
+			stream.push({
+				type: "reasoning_summary_end",
+				contentIndex: blockIndex(),
+				content: summaryText,
+				partial: output,
+			});
+		}
+		stream.push({ type: "thinking_end", contentIndex: blockIndex(), content: block.thinking, partial: output });
 		runtime.currentBlock = null;
 		return;
 	}

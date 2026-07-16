@@ -146,6 +146,47 @@ describe("renderThreadedFrame", () => {
 		expect(send?.text).toContain("✅ Context: &lt;25&gt;/100 (25.0%)");
 	});
 
+	test("tool_activity edits a started bubble with its terminal result", () => {
+		const started = renderThreadedFrame({
+			type: "tool_activity",
+			sessionId: "s",
+			toolCallId: "call-7",
+			toolName: "shell",
+			phase: "started",
+			argsSummary: "bun test",
+		});
+		const completed = renderThreadedFrame({
+			type: "tool_activity",
+			sessionId: "s",
+			toolCallId: "call-7",
+			toolName: "shell",
+			phase: "completed",
+			resultSummary: "passed",
+		});
+		expect(started).toMatchObject({ lane: "live", coalesceKey: "tool:call-7", editable: true });
+		expect(completed).toMatchObject({ lane: "finalized", coalesceKey: "tool:call-7", editable: true });
+		expect(started?.text).toContain("⚙ shell — started");
+		expect(completed?.text).toContain("⚙ shell — ok");
+		expect(completed?.richMarkdown).toBeUndefined();
+	});
+
+	test("reasoning_summary converts markdown once and remains editable", () => {
+		const send = renderThreadedFrame({
+			type: "reasoning_summary",
+			sessionId: "s",
+			turnRef: "turn-9",
+			text: "<unsafe> & **bold**",
+		});
+		expect(send).toMatchObject({ lane: "finalized", coalesceKey: "reason:turn-9", editable: true });
+		expect(send?.text).toBe("&lt;unsafe&gt; &amp; <b>bold</b>");
+		expect(send?.text).not.toContain("&amp;lt;");
+		expect(send?.richMarkdown).toBeUndefined();
+	});
+	test("reasoning_summary without a turnRef sends a fresh finalized message", () => {
+		const send = renderThreadedFrame({ type: "reasoning_summary", sessionId: "s", text: "safe summary" });
+		expect(send).toMatchObject({ lane: "finalized", editable: false });
+		expect(send?.coalesceKey).toBeUndefined();
+	});
 	test("unknown frame types render nothing", () => {
 		expect(renderThreadedFrame({ type: "some_future_frame", sessionId: "s" })).toBeUndefined();
 		expect(renderThreadedFrame({ sessionId: "s" })).toBeUndefined();

@@ -14,6 +14,15 @@ function emptyUsage(): AssistantMessage["usage"] {
 	};
 }
 
+const RAW_SENTINEL = "RAW_SERIALIZED_RESPONSES_REASONING";
+const SUMMARY_SENTINEL = "SUMMARY_SAFE_DISPLAY_TEXT";
+const RESPONSES_REASONING_SIGNATURE = JSON.stringify({
+	type: "reasoning",
+	id: "rs_raw",
+	content: [{ type: "reasoning_text", text: RAW_SENTINEL }],
+});
+const OPAQUE_SIGNATURE = "opaque-provider-signature";
+
 function makeStream(events: AssistantMessageEvent[]): AssistantMessageEventStream {
 	const s = new AssistantMessageEventStream();
 	queueMicrotask(() => {
@@ -274,6 +283,51 @@ describe("anthropic-messages encodeResponse", () => {
 		expect((encoded.id as string).startsWith("msg_")).toBe(true);
 	});
 
+	it("surfaces only the finalized summary for mixed reasoning", () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{
+					type: "thinking",
+					thinking: "SUMMARY_ONLY",
+					provenance: "mixed",
+					summaryText: "SUMMARY_ONLY",
+					rawText: "RAW_DO_NOT_SURFACE",
+					thinkingSignature: "opaque-signature",
+				},
+				{ type: "text", text: "visible answer" },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-opus-4-7",
+			usage: emptyUsage(),
+			stopReason: "stop",
+			timestamp: 0,
+		};
+
+		const encoded = encodeResponse(message, "claude-opus-4-7");
+		const content = encoded.content as Array<{ type: string; thinking?: string }>;
+		expect(content[0]).toMatchObject({ type: "thinking", thinking: "SUMMARY_ONLY" });
+		expect(JSON.stringify(encoded)).not.toContain("RAW_DO_NOT_SURFACE");
+	});
+
+	it("omits raw-only Codex Responses reasoning from non-streaming egress", () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: RAW_SENTINEL, provenance: "raw", rawText: RAW_SENTINEL }],
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-5",
+			usage: emptyUsage(),
+			stopReason: "stop",
+			timestamp: 0,
+		};
+
+		const encoded = encodeResponse(message, "claude-opus-4-7");
+		expect(JSON.stringify(encoded)).not.toContain(RAW_SENTINEL);
+		expect(encoded.content).toEqual([]);
+	});
+
 	it("maps stop reasons and rejects upstream terminal errors", () => {
 		const base: AssistantMessage = {
 			role: "assistant",
@@ -295,6 +349,158 @@ describe("anthropic-messages encodeResponse", () => {
 			/request aborted/,
 		);
 	});
+});
+
+describe("anthropic-messages serialized Responses signature privacy", () => {
+	it("omits raw-bearing signatures from non-streaming and streaming egress", async () => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{
+					type: "thinking",
+					thinking: SUMMARY_SENTINEL,
+					provenance: "mixed",
+					summaryText: SUMMARY_SENTINEL,
+					rawText: RAW_SENTINEL,
+					thinkingSignature: RESPONSES_REASONING_SIGNATURE,
+				},
+				{ type: "thinking", thinking: "provider thought", thinkingSignature: OPAQUE_SIGNATURE },
+			],
+			api: "openai-responses",
+			provider: "openai",
+			model: "gpt-5",
+			usage: emptyUsage(),
+			stopReason: "stop",
+			timestamp: 0,
+		};
+		const encoded = encodeResponse(message, "claude-opus-4-7");
+		const encodedBytes = JSON.stringify(encoded);
+		expect(encodedBytes).not.toContain(RAW_SENTINEL);
+		expect(encodedBytes).not.toContain(RESPONSES_REASONING_SIGNATURE);
+		expect(encodedBytes).toContain(SUMMARY_SENTINEL);
+		expect(encodedBytes).not.toContain(OPAQUE_SIGNATURE);
+		expect(encoded.content).toEqual([{ type: "thinking", thinking: SUMMARY_SENTINEL }]);
+		const providerMessage: AssistantMessage = {
+			...message,
+			content: [{ type: "thinking", thinking: "provider thought", thinkingSignature: OPAQUE_SIGNATURE }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+		};
+
+		const events: AssistantMessageEvent[] = [
+			{ type: "thinking_start", contentIndex: 0, partial: message },
+			{ type: "reasoning_summary_start", contentIndex: 0, partial: message },
+			{ type: "reasoning_summary_delta", contentIndex: 0, delta: SUMMARY_SENTINEL, partial: message },
+			{ type: "reasoning_summary_end", contentIndex: 0, content: SUMMARY_SENTINEL, partial: message },
+			{ type: "thinking_delta", contentIndex: 0, delta: RAW_SENTINEL, partial: message },
+			{ type: "thinking_end", contentIndex: 0, content: RAW_SENTINEL, partial: message },
+			{ type: "thinking_start", contentIndex: 0, partial: providerMessage },
+			{ type: "thinking_delta", contentIndex: 0, delta: "provider thought", partial: providerMessage },
+			{ type: "thinking_end", contentIndex: 0, content: "provider thought", partial: providerMessage },
+			{ type: "done", reason: "stop", message },
+		];
+		const stream = await collectSse(encodeStream(makeStream(events), "claude-opus-4-7"));
+		const streamBytes = JSON.stringify(stream);
+		expect(streamBytes).not.toContain(RAW_SENTINEL);
+		expect(streamBytes).not.toContain(RESPONSES_REASONING_SIGNATURE);
+		expect(streamBytes).toContain(SUMMARY_SENTINEL);
+		expect(streamBytes).toContain(OPAQUE_SIGNATURE);
+		const signatureDeltas = stream.filter(
+			event => (event.data.delta as { type?: string; signature?: string } | undefined)?.type === "signature_delta",
+		);
+		expect(signatureDeltas).toEqual([
+			{
+				event: "content_block_delta",
+				data: {
+					type: "content_block_delta",
+					index: 0,
+					delta: { type: "signature_delta", signature: OPAQUE_SIGNATURE },
+				},
+			},
+		]);
+		expect(message.content[0]).toMatchObject({ thinkingSignature: RESPONSES_REASONING_SIGNATURE });
+	});
+});
+
+it("drops unprovenanced Codex thinking when the stream is interrupted", async () => {
+	const partial: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "thinking", thinking: RAW_SENTINEL }],
+		api: "openai-codex-responses",
+		provider: "openai-codex",
+		model: "gpt-5",
+		usage: emptyUsage(),
+		stopReason: "error",
+		timestamp: 0,
+	};
+	const error: AssistantMessage = { ...partial, errorMessage: "upstream went away" };
+	const events: AssistantMessageEvent[] = [
+		{ type: "thinking_start", contentIndex: 0, partial },
+		{ type: "thinking_delta", contentIndex: 0, delta: RAW_SENTINEL, partial },
+		{ type: "error", reason: "error", error },
+	];
+
+	const sse = await collectSse(encodeStream(makeStream(events), "claude-opus-4-7"));
+	const bytes = JSON.stringify(sse);
+
+	expect(bytes).not.toContain(RAW_SENTINEL);
+	expect(sse.at(-1)).toEqual({
+		event: "error",
+		data: { type: "error", error: { type: "api_error", message: "upstream went away" } },
+	});
+});
+
+it("buffers unclassified Responses thinking and flushes finalized provider-native thinking with its opaque signature", async () => {
+	const unclassified: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "thinking", thinking: RAW_SENTINEL }],
+		api: "openai-responses",
+		provider: "openai",
+		model: "gpt-5",
+		usage: emptyUsage(),
+		stopReason: "stop",
+		timestamp: 0,
+	};
+	const mixed: AssistantMessage = {
+		...unclassified,
+		content: [
+			{
+				type: "thinking",
+				thinking: SUMMARY_SENTINEL,
+				provenance: "mixed",
+				summaryText: SUMMARY_SENTINEL,
+				rawText: RAW_SENTINEL,
+			},
+		],
+	};
+	const native: AssistantMessage = {
+		...unclassified,
+		api: "anthropic-messages",
+		provider: "anthropic",
+		content: [
+			{ type: "text", text: "" },
+			{ type: "thinking", thinking: "provider thought", thinkingSignature: OPAQUE_SIGNATURE },
+		],
+	};
+	const events: AssistantMessageEvent[] = [
+		{ type: "thinking_start", contentIndex: 0, partial: unclassified },
+		{ type: "thinking_delta", contentIndex: 0, delta: RAW_SENTINEL, partial: unclassified },
+		{ type: "reasoning_summary_start", contentIndex: 0, partial: unclassified },
+		{ type: "reasoning_summary_delta", contentIndex: 0, delta: SUMMARY_SENTINEL, partial: unclassified },
+		{ type: "thinking_end", contentIndex: 0, content: RAW_SENTINEL, partial: mixed },
+		{ type: "thinking_start", contentIndex: 1, partial: native },
+		{ type: "thinking_delta", contentIndex: 1, delta: "provider thought", partial: native },
+		{ type: "thinking_end", contentIndex: 1, content: "provider thought", partial: native },
+		{ type: "done", reason: "stop", message: native },
+	];
+
+	const sse = await collectSse(encodeStream(makeStream(events), "claude-opus-4-7"));
+	const bytes = JSON.stringify(sse);
+	expect(bytes).not.toContain(RAW_SENTINEL);
+	expect(bytes).toContain(SUMMARY_SENTINEL);
+	expect(bytes).toContain(OPAQUE_SIGNATURE);
+	expect(sse.filter(event => event.event === "content_block_start").map(event => event.data.index)).toEqual([0, 1]);
+	expect(sse.filter(event => event.event === "content_block_stop").map(event => event.data.index)).toEqual([0, 1]);
 });
 
 describe("anthropic-messages encodeStream", () => {
@@ -441,6 +647,194 @@ describe("anthropic-messages encodeStream", () => {
 		});
 
 		expect(sse[14]!.data).toEqual({ type: "message_stop" });
+	});
+
+	it("surfaces summary-only reasoning as a thinking block before its delta", async () => {
+		const finalMessage: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "SUMMARY REASONING" },
+				{ type: "text", text: "final text" },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-opus-4-7",
+			usage: emptyUsage(),
+			stopReason: "stop",
+			timestamp: 0,
+		};
+		const partialAfterThinking: AssistantMessage = {
+			...finalMessage,
+			content: [{ type: "thinking", thinking: "SUMMARY REASONING" }],
+		};
+		const events: AssistantMessageEvent[] = [
+			{ type: "reasoning_summary_start", contentIndex: 0, partial: finalMessage },
+			{ type: "reasoning_summary_delta", contentIndex: 0, delta: "SUMMARY REASONING", partial: finalMessage },
+			{ type: "reasoning_summary_end", contentIndex: 0, content: "SUMMARY REASONING", partial: finalMessage },
+			{ type: "thinking_end", contentIndex: 0, content: "SUMMARY REASONING", partial: partialAfterThinking },
+			{ type: "text_start", contentIndex: 1, partial: finalMessage },
+			{ type: "text_delta", contentIndex: 1, delta: "final text", partial: finalMessage },
+			{ type: "text_end", contentIndex: 1, content: "final text", partial: finalMessage },
+			{ type: "done", reason: "stop", message: finalMessage },
+		];
+
+		const sse = await collectSse(encodeStream(makeStream(events), "claude-opus-4-7"));
+		expect(sse).toContainEqual({
+			event: "content_block_start",
+			data: {
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "thinking", thinking: "" },
+			},
+		});
+		expect(sse).toContainEqual({
+			event: "content_block_delta",
+			data: {
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "thinking_delta", thinking: "SUMMARY REASONING" },
+			},
+		});
+		const thinkingStart = sse.findIndex(event => event.event === "content_block_start" && event.data.index === 0);
+		const summaryDelta = sse.findIndex(event => event.event === "content_block_delta" && event.data.index === 0);
+		expect(summaryDelta).toBeGreaterThan(thinkingStart);
+		expect(sse).toContainEqual({
+			event: "content_block_delta",
+			data: {
+				type: "content_block_delta",
+				index: 1,
+				delta: { type: "text_delta", text: "final text" },
+			},
+		});
+	});
+
+	it("surfaces final-only summary reasoning once and closes it before text", async () => {
+		const finalMessage: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "FINAL SUMMARY" },
+				{ type: "text", text: "final text" },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-opus-4-7",
+			usage: emptyUsage(),
+			stopReason: "stop",
+			timestamp: 0,
+		};
+		const partialAfterThinking: AssistantMessage = {
+			...finalMessage,
+			content: [{ type: "thinking", thinking: "FINAL SUMMARY" }],
+		};
+		const events: AssistantMessageEvent[] = [
+			{ type: "reasoning_summary_start", contentIndex: 0, partial: finalMessage },
+			{ type: "reasoning_summary_end", contentIndex: 0, content: "FINAL SUMMARY", partial: finalMessage },
+			{ type: "thinking_end", contentIndex: 0, content: "FINAL SUMMARY", partial: partialAfterThinking },
+			{ type: "text_start", contentIndex: 1, partial: finalMessage },
+			{ type: "text_delta", contentIndex: 1, delta: "final text", partial: finalMessage },
+			{ type: "text_end", contentIndex: 1, content: "final text", partial: finalMessage },
+			{ type: "done", reason: "stop", message: finalMessage },
+		];
+
+		const sse = await collectSse(encodeStream(makeStream(events), "claude-opus-4-7"));
+		const summaryDeltas = sse.filter(
+			event =>
+				event.event === "content_block_delta" &&
+				event.data.index === 0 &&
+				(event.data.delta as { type?: string; thinking?: string }).type === "thinking_delta",
+		);
+		expect(sse.filter(event => event.event === "content_block_start" && event.data.index === 0)).toHaveLength(1);
+		expect(summaryDeltas).toEqual([
+			{
+				event: "content_block_delta",
+				data: {
+					type: "content_block_delta",
+					index: 0,
+					delta: { type: "thinking_delta", thinking: "FINAL SUMMARY" },
+				},
+			},
+		]);
+		const summaryDeltaIndex = sse.indexOf(summaryDeltas[0]!);
+		const thinkingStopIndex = sse.findIndex(event => event.event === "content_block_stop" && event.data.index === 0);
+		expect(thinkingStopIndex).toBeGreaterThan(summaryDeltaIndex);
+		expect(sse).toContainEqual({
+			event: "content_block_delta",
+			data: {
+				type: "content_block_delta",
+				index: 1,
+				delta: { type: "text_delta", text: "final text" },
+			},
+		});
+	});
+
+	it("emits final summary content after a separator-only summary delta", async () => {
+		const finalMessage: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "REAL SUMMARY" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-opus-4-7",
+			usage: emptyUsage(),
+			stopReason: "stop",
+			timestamp: 0,
+		};
+		const events: AssistantMessageEvent[] = [
+			{ type: "reasoning_summary_start", contentIndex: 0, partial: finalMessage },
+			{ type: "reasoning_summary_delta", contentIndex: 0, delta: "\n\n", partial: finalMessage },
+			{ type: "reasoning_summary_end", contentIndex: 0, content: "REAL SUMMARY", partial: finalMessage },
+			{ type: "thinking_end", contentIndex: 0, content: "REAL SUMMARY", partial: finalMessage },
+			{ type: "done", reason: "stop", message: finalMessage },
+		];
+
+		const sse = await collectSse(encodeStream(makeStream(events), "claude-opus-4-7"));
+		const thinkingDeltas = sse.filter(
+			event =>
+				event.event === "content_block_delta" &&
+				(event.data.delta as { type?: string; thinking?: string }).type === "thinking_delta",
+		);
+
+		expect(thinkingDeltas).toContainEqual({
+			event: "content_block_delta",
+			data: {
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "thinking_delta", thinking: "REAL SUMMARY" },
+			},
+		});
+	});
+
+	it("does not repeat streamed summary reasoning at summary end", async () => {
+		const finalMessage: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "X" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-opus-4-7",
+			usage: emptyUsage(),
+			stopReason: "stop",
+			timestamp: 0,
+		};
+		const events: AssistantMessageEvent[] = [
+			{ type: "reasoning_summary_start", contentIndex: 0, partial: finalMessage },
+			{ type: "reasoning_summary_delta", contentIndex: 0, delta: "X", partial: finalMessage },
+			{ type: "reasoning_summary_end", contentIndex: 0, content: "X", partial: finalMessage },
+			{ type: "thinking_end", contentIndex: 0, content: "X", partial: finalMessage },
+			{ type: "done", reason: "stop", message: finalMessage },
+		];
+
+		const sse = await collectSse(encodeStream(makeStream(events), "claude-opus-4-7"));
+		const thinkingDeltas = sse.filter(
+			event =>
+				event.event === "content_block_delta" &&
+				event.data.index === 0 &&
+				(event.data.delta as { type?: string }).type === "thinking_delta",
+		);
+		expect(thinkingDeltas).toHaveLength(1);
+		expect(thinkingDeltas[0]!.data).toEqual({
+			type: "content_block_delta",
+			index: 0,
+			delta: { type: "thinking_delta", thinking: "X" },
+		});
 	});
 
 	it("emits an error event when the upstream stream errors", async () => {

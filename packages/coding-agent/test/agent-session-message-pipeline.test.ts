@@ -195,6 +195,107 @@ describe("AgentSession message pipeline", () => {
 		await Bun.sleep(0);
 	});
 
+	it("forwards stop reasons and reasoning summaries to extension handlers", async () => {
+		const extensionEmit = vi.fn(async () => {});
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+			extensionRunner: {
+				emit: extensionEmit,
+				hasHandlers: (eventType: string) => eventType === "reasoning_summary_end",
+			} as never,
+		});
+		sessions.push(session);
+
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [], stopReason: "cancelled" } as never);
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("summary") as never,
+			assistantMessageEvent: {
+				type: "reasoning_summary_end",
+				contentIndex: 0,
+				content: "safe summary",
+				partial: createAssistantMessage("summary"),
+			},
+		} as never);
+		await Bun.sleep(0);
+		await Bun.sleep(0);
+
+		expect(extensionEmit).toHaveBeenCalledWith({ type: "agent_end", messages: [], stopReason: "cancelled" });
+		expect(extensionEmit).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "reasoning_summary_end",
+				contentIndex: 0,
+				content: "safe summary",
+			}),
+			expect.any(Function),
+		);
+	});
+
+	it("drains pre-terminal reasoning summaries through slow extension handlers and drops post-terminal updates", async () => {
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const secondDelivered = Promise.withResolvers<void>();
+		const delivered: string[] = [];
+		const extensionEmit = vi.fn(async (event: { type: string; content?: string }) => {
+			if (event.type !== "reasoning_summary_end") return;
+			delivered.push(event.content ?? "");
+			if (event.content === "first") {
+				firstStarted.resolve();
+				await releaseFirst.promise;
+			} else if (event.content === "second") {
+				secondDelivered.resolve();
+			}
+		});
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+			extensionRunner: {
+				emit: extensionEmit,
+				hasHandlers: (eventType: string) => eventType === "reasoning_summary_end",
+			} as never,
+		});
+		sessions.push(session);
+		const terminalObserved = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "turn_end") terminalObserved.resolve();
+		});
+
+		const emitSummaryEnd = (content: string) =>
+			session.agent.emitExternalEvent({
+				type: "message_update",
+				message: createAssistantMessage(content) as never,
+				assistantMessageEvent: {
+					type: "reasoning_summary_end",
+					contentIndex: 0,
+					content,
+					partial: createAssistantMessage(content),
+				},
+			} as never);
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		emitSummaryEnd("first");
+		await firstStarted.promise;
+		emitSummaryEnd("second");
+		session.agent.emitExternalEvent({
+			type: "turn_end",
+			message: createAssistantMessage("final"),
+			toolResults: [],
+		} as never);
+		await terminalObserved.promise;
+		releaseFirst.resolve();
+		await secondDelivered.promise;
+
+		emitSummaryEnd("after-terminal");
+		await Promise.resolve();
+
+		expect(delivered).toEqual(["first", "second"]);
+	});
+
 	it("caches listener snapshots and preserves mutation-during-emit safety", async () => {
 		const session = new AgentSession({
 			agent: createAgent(),
@@ -289,6 +390,66 @@ describe("AgentSession message pipeline", () => {
 		expect(extensionEmit).toHaveBeenCalledTimes(1);
 		expect(__agentSessionPerfCounters.messageUpdateExtensionQueues).toBe(1);
 		expect(__sessionStateSidecarPerfCounters.persistFromEventCalls).toBe(0);
+	});
+
+	it("stops in-flight message_update dispatch between handlers after the turn changes", async () => {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		let blockedFirstUpdate = true;
+		const started: string[] = [];
+		const notificationsDelivered: string[] = [];
+		const extensionEmit = vi.fn(
+			async (event: { type: string; message?: { content?: unknown } }, continueWhile?: () => boolean) => {
+				if (event.type !== "message_update") return;
+				const content = JSON.stringify(event.message);
+				started.push(content);
+				if (blockedFirstUpdate) {
+					blockedFirstUpdate = false;
+					await promise;
+				}
+				if (continueWhile && !continueWhile()) return;
+				notificationsDelivered.push(content);
+			},
+		);
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+			extensionRunner: {
+				emit: extensionEmit,
+				hasHandlers: (eventType: string) => eventType === "message_update",
+			} as never,
+		});
+		sessions.push(session);
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		await Bun.sleep(0);
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("turn-one-started") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "turn-one-started" },
+		} as never);
+		for (let i = 0; i < 20 && started.length === 0; i++) await Bun.sleep(1);
+		expect(started).toHaveLength(1);
+		expect(started[0]).toContain("turn-one-started");
+
+		session.agent.emitExternalEvent({
+			type: "message_update",
+			message: createAssistantMessage("turn-one-stale") as never,
+			assistantMessageEvent: { type: "text_delta", delta: "turn-one-stale" },
+		} as never);
+		session.agent.emitExternalEvent({
+			type: "turn_end",
+			message: createAssistantMessage("turn-one-final"),
+			toolResults: [],
+		} as never);
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		await Bun.sleep(10);
+		resolve();
+		await Bun.sleep(10);
+
+		expect(started).toHaveLength(1);
+		expect(notificationsDelivered).toEqual([]);
 	});
 
 	it("red-team: listener snapshot rebuilds only on subscription mutations, not emits", async () => {

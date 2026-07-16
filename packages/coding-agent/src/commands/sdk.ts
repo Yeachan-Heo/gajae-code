@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
+import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
 import { Broker } from "../sdk/broker/broker";
@@ -16,20 +17,28 @@ import {
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../sdk/lifecycle-session";
+import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
 import {
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 	type SdkStartupRollbackResult,
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
-
 import {
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
 	SessionManager,
 } from "../session/session-manager";
 
-export function lifecycleArgs(request: SessionLifecycleLaunchRequest, cwd: string, agentDir: string): ParsedArgs {
+export async function lifecycleArgs(
+	request: SessionLifecycleLaunchRequest,
+	cwd: string,
+	agentDir: string,
+): Promise<ParsedArgs> {
+	const targetScope = await resolveManagedSessionScope({ cwd, agentDir });
+	if (targetScope.kind !== "resolved") throw new Error(`Lifecycle session scope is invalid: ${targetScope.message}`);
+	const forkSessionDir =
+		request.operation === "session.fork" ? SessionManager.getDefaultSessionDir(cwd, agentDir) : undefined;
 	return {
 		messages: [],
 		fileArgs: [],
@@ -39,7 +48,7 @@ export function lifecycleArgs(request: SessionLifecycleLaunchRequest, cwd: strin
 		...(request.operation === "session.fork"
 			? {
 					fork: request.sourceSessionPath ?? request.sourceSessionId,
-					sessionDir: SessionManager.getDefaultSessionDirReadOnly(cwd, agentDir),
+					sessionDir: forkSessionDir,
 				}
 			: {}),
 	};
@@ -53,7 +62,7 @@ type LifecycleTranscriptSource = {
 };
 
 function sameTranscriptIdentity(
-	actual: { dev: bigint; ino: bigint; size: number; mtimeMs: number; mtimeNs: bigint },
+	actual: { dev: bigint; ino: bigint; size: number; mtimeMs: number; mtimeNs: bigint; sha256: string },
 	expected: SessionLifecycleTranscriptIdentity,
 ): boolean {
 	return (
@@ -61,7 +70,8 @@ function sameTranscriptIdentity(
 		actual.ino.toString() === expected.ino &&
 		actual.size === expected.size &&
 		actual.mtimeMs === expected.mtimeMs &&
-		actual.mtimeNs.toString() === expected.mtimeNs
+		actual.mtimeNs.toString() === expected.mtimeNs &&
+		actual.sha256 === expected.sha256
 	);
 }
 
@@ -85,26 +95,38 @@ function lifecycleTranscriptSource(request: SessionLifecycleLaunchRequest, cwd: 
 	throw new Error("A new lifecycle session has no persisted transcript authority.");
 }
 
-function verifyLifecycleTranscript(
+async function captureLifecycleTranscript(
 	request: SessionLifecycleLaunchRequest,
 	cwd: string,
 	agentDir: string,
-): LifecycleTranscriptSource {
+	migrationPolicy: "copy-retain" | "disabled",
+): Promise<CapturedSessionTranscriptSnapshot> {
 	const source = lifecycleTranscriptSource(request, cwd);
-	const inventory = SessionManager.inventorySessionsStrict(source.cwd, {
-		sessionDir: SessionManager.getDefaultSessionDir(source.cwd, agentDir),
-	});
+	const scope = await resolveManagedSessionScope({ cwd: source.cwd, agentDir });
+	if (scope.kind !== "resolved")
+		throw new Error("Lifecycle saved session storage could not be verified for the requested workspace.");
+	const inventory = await listManagedSessionCandidates({ scope: scope.scope });
 	if (inventory.kind !== "complete")
 		throw new Error("Lifecycle saved session storage could not be verified for the requested workspace.");
-	const matches = inventory.candidates.filter(
+	const captured = SessionManager.captureTranscriptStrict(source.path);
+	if (
+		captured.kind !== "captured" ||
+		captured.snapshot.sourcePath !== path.resolve(source.path) ||
+		captured.snapshot.identity.sessionId !== source.id ||
+		!sameTranscriptIdentity(captured.snapshot.identity, source.identity)
+	)
+		throw new Error("Lifecycle saved session authority changed before the session host consumed it.");
+	const matches = inventory.owned.filter(
 		candidate =>
-			candidate.path === path.resolve(source.path) &&
-			candidate.id === source.id &&
-			sameTranscriptIdentity(candidate.identity, source.identity),
+			candidate.path === captured.snapshot.sourcePath &&
+			candidate.sessionId === source.id &&
+			sameLifecycleTranscriptSnapshot(candidate.identity, captured.snapshot.identity),
 	);
 	if (matches.length !== 1)
 		throw new Error("Lifecycle saved session authority changed before the session host started.");
-	return source;
+	if (matches[0]!.provenance === "legacy" && migrationPolicy === "disabled")
+		throw new Error("Lifecycle legacy session migration is disabled by policy.");
+	return captured.snapshot;
 }
 
 function sameLifecycleTranscriptSnapshot(left: ResumeSessionIdentity, right: ResumeSessionIdentity): boolean {
@@ -120,23 +142,6 @@ function sameLifecycleTranscriptSnapshot(left: ResumeSessionIdentity, right: Res
 	);
 }
 
-function captureLifecycleTranscript(
-	request: SessionLifecycleLaunchRequest,
-	cwd: string,
-	agentDir: string,
-): CapturedSessionTranscriptSnapshot {
-	const source = verifyLifecycleTranscript(request, cwd, agentDir);
-	const captured = SessionManager.captureTranscriptStrict(source.path);
-	if (
-		captured.kind !== "captured" ||
-		captured.snapshot.sourcePath !== path.resolve(source.path) ||
-		captured.snapshot.identity.sessionId !== source.id ||
-		!sameTranscriptIdentity(captured.snapshot.identity, source.identity)
-	)
-		throw new Error("Lifecycle saved session authority changed before the session host consumed it.");
-	return captured.snapshot;
-}
-
 async function revalidateLifecycleTranscript(snapshot: ResumeSessionIdentity): Promise<void> {
 	const inspected = await SessionManager.inspectSessionTailReadOnly(snapshot.canonicalPath);
 	if (inspected.kind === "error" || !sameLifecycleTranscriptSnapshot(snapshot, inspected.identity))
@@ -149,14 +154,22 @@ export async function openLifecycleSessionManager(
 	cwd: string,
 	agentDir: string,
 ): Promise<{ parsed: ParsedArgs; sessionManager: SessionManager | undefined }> {
-	const parsed = lifecycleArgs(request, cwd, agentDir);
+	const parsed = await lifecycleArgs(request, cwd, agentDir);
+	const lifecycleSettings = await Settings.loadForScope({ cwd, agentDir });
+	const migrationPolicy =
+		lifecycleSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 	if (request.operation === "session.create") {
-		return { parsed, sessionManager: await createSessionManager(parsed, cwd) };
+		return { parsed, sessionManager: await createSessionManager(parsed, cwd, lifecycleSettings) };
 	}
-	const snapshot = captureLifecycleTranscript(request, cwd, agentDir);
+	const snapshot = await captureLifecycleTranscript(request, cwd, agentDir, migrationPolicy);
 	let sessionManager: SessionManager | undefined;
 	if (request.operation === "session.resume") {
-		const opened = await SessionManager.openExistingStrict(snapshot.identity, parsed.sessionDir);
+		const opened = await SessionManager.openExistingStrict(
+			snapshot.identity,
+			parsed.sessionDir,
+			undefined,
+			migrationPolicy,
+		);
 		if (opened.kind === "error")
 			throw new Error("Lifecycle saved session authority changed while the session host opened it.");
 		sessionManager = opened.manager;
@@ -167,7 +180,7 @@ export async function openLifecycleSessionManager(
 			throw error;
 		}
 	} else {
-		const forked = await SessionManager.forkFromCaptured(snapshot, cwd, parsed.sessionDir);
+		const forked = await SessionManager.forkFromCaptured(snapshot, cwd, parsed.sessionDir, migrationPolicy);
 		if (forked.kind === "error")
 			throw new Error("Lifecycle saved session authority changed while the session host forked it.");
 		sessionManager = forked.manager;
@@ -302,21 +315,23 @@ export async function runSessionHost(
 					fs.readFile(transcriptPath),
 					fs.stat(transcriptPath, { bigint: true }),
 				]);
+				const digest = createHash("sha256").update(bytes).digest("hex");
 				return {
-					digest: createHash("sha256").update(bytes).digest("hex"),
+					digest,
 					identity: {
 						dev: stat.dev.toString(),
 						ino: stat.ino.toString(),
 						size: Number(stat.size),
 						mtimeMs: Number(stat.mtimeMs),
 						mtimeNs: stat.mtimeNs.toString(),
+						sha256: digest,
 					},
 				};
 			} catch {
 				return undefined;
 			}
 		})();
-		return disposal;
+		return disposal ?? Promise.resolve(undefined);
 	};
 	let failureRollback: Promise<void> | undefined;
 	const failAfterRollback = (failure: SdkStartupFailure): Promise<void> => {
@@ -415,7 +430,13 @@ export default class Sdk extends Command {
 		}
 		const agentDir = flags["agent-dir"] as string | undefined;
 		if (!agentDir) throw new Error("--agent-dir is required for sdk broker-internal.");
-		const broker = new Broker({ agentDir });
+		const broker = new Broker({
+			agentDir,
+			resolveDirectoryMigration: async cwd => {
+				const policy = (await Settings.loadForScope({ cwd, agentDir })).get("session.directoryMigration");
+				return policy === "disabled" ? "disabled" : "copy-retain";
+			},
+		});
 		await broker.start();
 		if (!broker.ownsDiscovery) return;
 		const stop = () => void broker.stop().finally(() => process.exit(0));

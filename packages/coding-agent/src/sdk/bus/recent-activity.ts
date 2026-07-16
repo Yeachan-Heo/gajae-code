@@ -6,14 +6,24 @@
  * pick a repo to create in or a recent session to resume without typing raw
  * paths. Dependency-light + injectable so it is unit-testable over a temp dir.
  */
-import * as fs from "node:fs";
+import { createHash } from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
+import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
+import { FileSessionStorage } from "../../session/session-storage";
+import {
+	type LogicalSessionCandidate,
+	listManagedSessionCandidates,
+	type ManagedSessionScope,
+	resolveManagedSessionScope,
+} from "../session-directory";
 
 /** One ranked recent-session entry surfaced to the picker. */
 export interface RecentSessionEntry {
-	/** Session id (the `.jsonl` file stem). */
+	/** Session id from the validated managed candidate header. */
 	sessionId: string;
-	/** Working directory / repo path, when recoverable from the header. */
+	/** Validated workspace path recorded by the managed candidate. */
 	path?: string;
 	/** Branch, when recoverable from the header. */
 	branch?: string;
@@ -30,39 +40,54 @@ export interface RecentSessionEntry {
 }
 
 export interface RecentActivityDeps {
-	/** Root holding `<encoded-cwd>/<sessionId>.jsonl` history files. */
-	sessionsRoot: string;
+	/** Workspace whose managed sessions will be listed readonly. */
+	cwd: string;
+	/** Agent directory used to resolve the managed session scope. */
+	agentDir?: string;
+	/** Explicit managed root for isolated tests. */
+	sessionsRoot?: string;
 	/** Optional breadcrumb session-file paths (current terminals). */
 	breadcrumbPaths?: string[];
 	/** Max entries to return (default 20). */
 	limit?: number;
 	/** Include internal helper/sub-agent sessions (default true). */
 	includeInternal?: boolean;
+	/** Search every validated v2 workspace scope below the session root (default false). */
+	allWorkspaces?: boolean;
 	/** Injection seam for tests. */
 	readInitialLines?: (file: string, maxLines: number) => string[];
 }
 
-function defaultReadInitialLines(file: string, maxLines: number): string[] {
-	try {
-		const lines = fs.readFileSync(file, "utf8").split("\n");
-		return lines.slice(0, maxLines);
-	} catch {
-		return [];
+function readCandidateInitialLines(
+	candidate: LogicalSessionCandidate,
+	readInitialLines: ((file: string, maxLines: number) => string[]) | undefined,
+): string[] {
+	if (readInitialLines) return readInitialLines(candidate.path, 8);
+	if (candidate.provenance !== "legacy") {
+		const security = verifyOwnerOnlyPathSecurity(candidate.path, "file");
+		if (!security.ok) throw new Error(`Managed session metadata path is unsafe: ${security.code}`);
 	}
+	const snapshot = new FileSessionStorage().readSnapshotSync(candidate.path);
+	const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
+	if (
+		snapshot.stat.dev !== candidate.identity.dev ||
+		snapshot.stat.ino !== candidate.identity.ino ||
+		snapshot.stat.size !== candidate.identity.size ||
+		snapshot.stat.mtimeNs !== candidate.identity.mtimeNs ||
+		digest !== candidate.identity.sha256
+	)
+		throw new Error("Managed session changed after ownership was verified.");
+	return Buffer.from(snapshot.bytes).toString("utf8").split("\n").slice(0, 8);
 }
 
 /** Best-effort header metadata extraction from a session file's first line. */
-function headerMeta(line: string | undefined): { id?: string; path?: string; branch?: string; title?: string } {
+function headerMeta(line: string | undefined): { branch?: string; title?: string } {
 	if (!line) return {};
 	try {
 		const obj = JSON.parse(line) as Record<string, unknown>;
-		// Session headers vary; pull common fields defensively.
-		const id = typeof obj.id === "string" ? obj.id : undefined;
-		const cwd =
-			typeof obj.cwd === "string" ? obj.cwd : typeof obj.projectDir === "string" ? obj.projectDir : undefined;
 		const branch = typeof obj.branch === "string" ? obj.branch : undefined;
 		const title = typeof obj.title === "string" ? obj.title : undefined;
-		return { id, path: cwd, branch, title };
+		return { branch, title };
 	} catch {
 		return {};
 	}
@@ -84,73 +109,162 @@ function isInternalSession(lines: readonly string[]): boolean {
 	return false;
 }
 
-/**
- * The authoritative session id for a history file: the header `id` when present,
- * else the filename stem with a leading `<timestamp>_` prefix stripped (matching
- * SessionManager's `<isoTimestamp>_<id>.jsonl` naming), else the bare stem.
- */
-function sessionIdForFile(stem: string, headerId: string | undefined): string {
-	if (headerId) return headerId;
-	const m = stem.match(/^\d{4}-\d{2}-\d{2}T[\d:.-]+Z?_(.+)$/);
-	return m?.[1] ?? stem;
+/** Lists readonly managed candidates, optionally across every validated v2 workspace scope, ranked by history-file mtime. */
+export type ListRecentSessionsResult =
+	| { kind: "complete"; entries: RecentSessionEntry[]; warnings: readonly string[] }
+	| { kind: "error"; code: "scope_unavailable" | "managed_scan_failed"; message: string };
+
+async function resolveRecentScopes(
+	deps: RecentActivityDeps,
+): Promise<
+	| { kind: "complete"; scopes: ManagedSessionScope[]; warnings: string[] }
+	| { kind: "error"; code: "scope_unavailable"; message: string }
+> {
+	const agentDir = deps.agentDir ?? getAgentDir();
+	const sessionsRoot = deps.sessionsRoot ?? getSessionsDir(agentDir);
+	const current = await resolveManagedSessionScope({
+		cwd: deps.cwd,
+		agentDir,
+		sessionsRoot,
+	});
+	if (!deps.allWorkspaces) {
+		if (current.kind !== "resolved") return { kind: "error", code: "scope_unavailable", message: current.message };
+		return { kind: "complete", scopes: [current.scope], warnings: [] };
+	}
+	try {
+		const root = await fs.lstat(sessionsRoot);
+		if (!root.isDirectory() || root.isSymbolicLink() || !verifyOwnerOnlyPathSecurity(sessionsRoot, "directory").ok) {
+			return {
+				kind: "error",
+				code: "scope_unavailable",
+				message: "The managed sessions root is not a safe directory.",
+			};
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "complete", scopes: [], warnings: [] };
+		return { kind: "error", code: "scope_unavailable", message: "The managed sessions root could not be inspected." };
+	}
+	const warnings: string[] = [];
+	const scopes = current.kind === "resolved" ? [current.scope] : [];
+	const seen = new Set(scopes.map(scope => scope.directoryPath));
+
+	const addResolvedScope = async (cwd: string, expectedDirectory?: string): Promise<void> => {
+		const resolved = await resolveManagedSessionScope({
+			cwd,
+			agentDir,
+			sessionsRoot,
+		});
+		if (
+			resolved.kind !== "resolved" ||
+			(expectedDirectory !== undefined && resolved.scope.directoryPath !== expectedDirectory)
+		) {
+			warnings.push("Ignored invalid managed session scope binding.");
+			return;
+		}
+		if (!seen.has(resolved.scope.directoryPath)) {
+			seen.add(resolved.scope.directoryPath);
+			scopes.push(resolved.scope);
+		}
+	};
+	try {
+		const directories = await fs.readdir(sessionsRoot, { withFileTypes: true });
+		for (const directory of directories) {
+			if (!directory.isDirectory() || directory.isSymbolicLink() || !directory.name.startsWith("v2-")) continue;
+			try {
+				const binding = JSON.parse(
+					await fs.readFile(path.join(sessionsRoot, directory.name, ".gjc-managed-session-scope.v2.json"), "utf8"),
+				) as { canonicalPath?: unknown };
+				if (typeof binding.canonicalPath !== "string") {
+					warnings.push("Ignored invalid managed session scope binding.");
+					continue;
+				}
+				await addResolvedScope(binding.canonicalPath, path.join(sessionsRoot, directory.name));
+			} catch {
+				warnings.push("Ignored unreadable managed session scope binding.");
+			}
+		}
+		for (const directory of directories) {
+			if (!directory.isDirectory() || directory.isSymbolicLink() || directory.name.startsWith("v2-")) continue;
+			try {
+				const files = await fs.readdir(path.join(sessionsRoot, directory.name), {
+					withFileTypes: true,
+				});
+				for (const file of files) {
+					if (!file.isFile() || file.isSymbolicLink() || !file.name.endsWith(".jsonl")) continue;
+					try {
+						const snapshot = new FileSessionStorage().readSnapshotSync(
+							path.join(sessionsRoot, directory.name, file.name),
+						);
+						const newline = snapshot.bytes.indexOf(0x0a);
+						if (newline < 0) continue;
+						const header = JSON.parse(Buffer.from(snapshot.bytes.subarray(0, newline)).toString("utf8")) as {
+							cwd?: unknown;
+							type?: unknown;
+						};
+						if (header.type === "session" && typeof header.cwd === "string") await addResolvedScope(header.cwd);
+					} catch {
+						warnings.push("Ignored unreadable legacy managed session candidate.");
+					}
+				}
+			} catch {
+				warnings.push("Ignored unreadable legacy managed session directory.");
+			}
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "complete", scopes, warnings };
+		return { kind: "error", code: "scope_unavailable", message: "The managed sessions root could not be read." };
+	}
+	return { kind: "complete", scopes, warnings };
 }
 
-/**
- * List recent sessions ranked by history-file mtime (newest first).
- *
- * Scans `<sessionsRoot>/<encoded-cwd>/<sessionId>.jsonl`, stats each file, and
- * returns up to `limit` entries enriched with header metadata and a
- * `currentTerminal` flag for any breadcrumb-referenced session file.
- */
-export function listRecentSessions(deps: RecentActivityDeps): RecentSessionEntry[] {
+export async function listRecentSessions(deps: RecentActivityDeps): Promise<ListRecentSessionsResult> {
 	const limit = deps.limit ?? 20;
 	const includeInternal = deps.includeInternal ?? true;
-	const readInitialLines = deps.readInitialLines ?? defaultReadInitialLines;
-	const breadcrumbs = new Set((deps.breadcrumbPaths ?? []).map(p => path.resolve(p)));
-
-	let projectDirs: string[];
-	try {
-		projectDirs = fs
-			.readdirSync(deps.sessionsRoot, { withFileTypes: true })
-			.filter(d => d.isDirectory())
-			.map(d => path.join(deps.sessionsRoot, d.name));
-	} catch {
-		return [];
+	const readInitialLines = deps.readInitialLines;
+	const breadcrumbs = new Set((deps.breadcrumbPaths ?? []).map(candidate => path.resolve(candidate)));
+	const resolved = await resolveRecentScopes(deps);
+	if (resolved.kind === "error") return resolved;
+	const warnings = [...resolved.warnings];
+	const candidates: LogicalSessionCandidate[] = [];
+	for (const scope of resolved.scopes) {
+		const listed = await listManagedSessionCandidates({ scope });
+		if (listed.kind !== "complete") {
+			return { kind: "error", code: "managed_scan_failed", message: listed.message };
+		}
+		candidates.push(...listed.owned);
+		warnings.push(...listed.invalid.map(invalid => `Ignored invalid managed session candidate: ${invalid.code}`));
 	}
 
 	const entries: RecentSessionEntry[] = [];
-	for (const dir of projectDirs) {
-		let files: string[];
+	for (const candidate of candidates) {
+		let initialLines: string[];
 		try {
-			files = fs.readdirSync(dir).filter(name => name.endsWith(".jsonl"));
-		} catch {
-			continue;
+			initialLines = readCandidateInitialLines(candidate, readInitialLines);
+		} catch (error) {
+			return {
+				kind: "error",
+				code: "managed_scan_failed",
+				message: `Could not read managed session metadata: ${error instanceof Error ? error.message : String(error)}`,
+			};
 		}
-		for (const name of files) {
-			const file = path.join(dir, name);
-			let mtimeMs: number;
-			try {
-				mtimeMs = fs.statSync(file).mtimeMs;
-			} catch {
-				continue;
-			}
-			const initialLines = readInitialLines(file, 8);
-			const meta = headerMeta(initialLines[0]);
-			const internal = isInternalSession(initialLines);
-			if (internal && !includeInternal) continue;
-			entries.push({
-				sessionId: sessionIdForFile(name.slice(0, -".jsonl".length), meta.id),
-				path: meta.path,
-				branch: meta.branch,
-				title: meta.title,
-				sessionStateFile: file,
-				mtimeMs,
-				currentTerminal: breadcrumbs.has(path.resolve(file)) || undefined,
-				internal: internal || undefined,
-			});
-		}
+		const meta = headerMeta(initialLines[0]);
+		const internal = isInternalSession(initialLines);
+		if (internal && !includeInternal) continue;
+		entries.push({
+			sessionId: candidate.sessionId,
+			path: candidate.cwd,
+			branch: meta.branch,
+			title: meta.title,
+			sessionStateFile: candidate.path,
+			mtimeMs: candidate.identity.mtimeMs,
+			currentTerminal: breadcrumbs.has(path.resolve(candidate.path)) || undefined,
+			internal: internal || undefined,
+		});
 	}
-
 	entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
-	return entries.slice(0, limit);
+	return {
+		kind: "complete",
+		entries: entries.slice(0, limit),
+		warnings,
+	};
 }

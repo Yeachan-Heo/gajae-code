@@ -14,6 +14,7 @@ import type {
 	ResolvedServiceTier,
 	StopReason,
 	TextContent,
+	ThinkingContent,
 	Tool,
 	ToolCall,
 	ToolResultMessage,
@@ -416,6 +417,29 @@ function buildUsage(message: AssistantMessage): Record<string, unknown> {
 	return usage;
 }
 
+function isResponsesFamilyApi(api: AssistantMessage["api"]): boolean {
+	return api === "openai-responses" || api === "openai-codex-responses";
+}
+
+function safeThinkingText(content: ThinkingContent, api: AssistantMessage["api"]): string | undefined {
+	if (isResponsesFamilyApi(api) && content.provenance === undefined) return undefined;
+	if (content.provenance === "raw") return undefined;
+	if (content.provenance === "mixed") return content.summaryText;
+	if (content.provenance === "summary") return content.summaryText ?? content.thinking;
+	return content.thinking;
+}
+
+function hasRawOrMixedThinking(partial: AssistantMessage, contentIndex: number): boolean {
+	const content = partial.content[contentIndex];
+	return content?.type === "thinking" && (content.provenance === "raw" || content.provenance === "mixed");
+}
+
+/** Responses-family reasoning is untrusted until output_item.done assigns provenance. */
+function hasUnfinalizedResponsesThinking(partial: AssistantMessage, contentIndex: number): boolean {
+	const content = partial.content[contentIndex];
+	return content?.type !== "thinking" || (isResponsesFamilyApi(partial.api) && content.provenance === undefined);
+}
+
 function flattenAssistant(message: AssistantMessage): {
 	text: string;
 	reasoning: string;
@@ -429,9 +453,11 @@ function flattenAssistant(message: AssistantMessage): {
 			case "text":
 				text += part.text;
 				break;
-			case "thinking":
-				reasoning += part.thinking;
+			case "thinking": {
+				const thinking = safeThinkingText(part, message.api);
+				if (thinking !== undefined) reasoning += thinking;
 				break;
+			}
 			case "redactedThinking":
 				// Opaque blob — surface verbatim on the reasoning channel so the
 				// concatenation round-trips through clients that just echo it.
@@ -521,6 +547,18 @@ export function encodeStream(
 			let nextToolIndex = 0;
 			let hasToolCalls = false;
 			let finishReason: string = "stop";
+			// contentIndexes that already streamed a reasoning summary delta, so a
+			// final-only reasoning_summary_end does not duplicate streamed summary text.
+			const summaryDeltaSeen = new Set<number>();
+			// Responses assigns reasoning provenance only at output_item.done. Keep its
+			// pre-classification bytes out of this public compatibility stream.
+			const pendingThinkingDeltas = new Map<number, string[]>();
+
+			const writeThinkingDelta = (thinking: string) => {
+				// DeepSeek-style / o-series reasoning channel. Clients that don't
+				// understand it ignore the unknown delta key.
+				if (thinking.length > 0) writeSse(controller, baseChunk({ reasoning_content: thinking }, null));
+			};
 
 			try {
 				// Initial role chunk.
@@ -534,11 +572,57 @@ export function encodeStream(
 							}
 							break;
 
-						case "thinking_delta":
-							// DeepSeek-style / o-series reasoning channel. Clients that don't
-							// understand it ignore the unknown delta key.
+						case "thinking_delta": {
+							if (hasRawOrMixedThinking(event.partial, event.contentIndex)) break;
+							if (hasUnfinalizedResponsesThinking(event.partial, event.contentIndex)) {
+								const deltas = pendingThinkingDeltas.get(event.contentIndex) ?? [];
+								deltas.push(event.delta);
+								pendingThinkingDeltas.set(event.contentIndex, deltas);
+								break;
+							}
+							writeThinkingDelta(event.delta);
+							break;
+						}
+						case "thinking_start":
+							if (
+								!hasRawOrMixedThinking(event.partial, event.contentIndex) &&
+								hasUnfinalizedResponsesThinking(event.partial, event.contentIndex)
+							) {
+								pendingThinkingDeltas.set(event.contentIndex, []);
+							}
+							break;
+						case "thinking_end": {
+							const pending = pendingThinkingDeltas.get(event.contentIndex);
+							pendingThinkingDeltas.delete(event.contentIndex);
+							if (
+								hasRawOrMixedThinking(event.partial, event.contentIndex) ||
+								hasUnfinalizedResponsesThinking(event.partial, event.contentIndex)
+							)
+								break;
+							if (pending) for (const delta of pending) writeThinkingDelta(delta);
+							break;
+						}
+						case "reasoning_summary_start":
+							// Chat format has no explicit reasoning open frame.
+							break;
+
+						case "reasoning_summary_delta":
+							// Provider-displayable summary reasoning surfaces on the same
+							// reasoning_content channel as raw thinking for this legacy format.
 							if (event.delta.length > 0) {
+								// Only a non-whitespace delta counts as a delivered summary; a bare
+								// separator ("\n\n") must not suppress a later final-only end content.
+								if (event.delta.trim().length > 0) summaryDeltaSeen.add(event.contentIndex);
 								writeSse(controller, baseChunk({ reasoning_content: event.delta }, null));
+							}
+							break;
+
+						case "reasoning_summary_end":
+							// Final-only summary: text arrives only on the end event with no prior
+							// deltas, so surface it now (skip when deltas already streamed to avoid
+							// duplicating the summary).
+							if (event.content.length > 0 && !summaryDeltaSeen.has(event.contentIndex)) {
+								writeSse(controller, baseChunk({ reasoning_content: event.content }, null));
 							}
 							break;
 
@@ -578,6 +662,7 @@ export function encodeStream(
 						}
 
 						case "done":
+							pendingThinkingDeltas.clear();
 							finishReason =
 								event.reason === "toolUse"
 									? "tool_calls"
@@ -593,6 +678,7 @@ export function encodeStream(
 							return;
 
 						case "error": {
+							pendingThinkingDeltas.clear();
 							const msg = event.error.errorMessage ?? "stream error";
 							writeSse(controller, { error: { message: msg, type: "upstream_error" } });
 							controller.close();
@@ -607,10 +693,12 @@ export function encodeStream(
 				}
 
 				// Stream ended without a terminal `done` (defensive). Close gracefully.
+				pendingThinkingDeltas.clear();
 				writeSse(controller, baseChunk({}, hasToolCalls ? "tool_calls" : "stop"));
 				controller.enqueue(encoder.encode("data: [DONE]\n\n"));
 				controller.close();
 			} catch (err) {
+				pendingThinkingDeltas.clear();
 				const msg = err instanceof Error ? err.message : String(err);
 				writeSse(controller, { error: { message: msg, type: "upstream_error" } });
 				controller.close();

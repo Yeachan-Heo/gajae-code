@@ -402,7 +402,7 @@ export class CustomEditor extends Editor {
 			}
 		}
 
-		// Pass to parent for normal handling
+		// Pass to parent for normal handling.
 		super.handleInput(data);
 	}
 }

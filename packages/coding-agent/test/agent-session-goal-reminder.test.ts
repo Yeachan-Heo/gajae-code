@@ -54,13 +54,13 @@ describe("AgentSession active goal reminders", () => {
 		tempDir.removeSync();
 	});
 
-	function setActiveGoal(): void {
+	function setActiveGoal(id = "goal-1", objective = "Ship the idle reminder fix"): void {
 		session.setGoalModeState({
 			enabled: true,
 			mode: "active",
 			goal: {
-				id: "goal-1",
-				objective: "Ship the idle reminder fix",
+				id,
+				objective,
 				status: "active",
 				tokensUsed: 0,
 				timeUsedSeconds: 0,
@@ -74,6 +74,7 @@ describe("AgentSession active goal reminders", () => {
 		const assistantMessage = { ...createAssistantMessage("I stopped."), timestamp };
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+		await Bun.sleep(50);
 		for (let i = 0; i < 20; i++) await Promise.resolve();
 		await session.waitForIdle();
 	}
@@ -145,6 +146,87 @@ describe("AgentSession active goal reminders", () => {
 		const reminder = session.agent.state.messages.find(message => message.role === "developer");
 		expect(JSON.stringify(reminder?.content)).toContain("Ship the idle reminder fix");
 		expect(JSON.stringify(reminder?.content)).toContain('goal({op:\\"complete\\"})');
+	});
+
+	it("does not let an abort without an active goal suppress a later goal reminder", async () => {
+		await session.abort();
+		setActiveGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+	});
+
+	it("suppresses only the first reminder after aborting an active goal", async () => {
+		setActiveGoal();
+		await session.abort();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(developerReminderCount()).toBe(0);
+
+		await emitAssistantStop(126);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+	});
+
+	it("clears active-goal abort suppression after an inactive reminder evaluation", async () => {
+		setActiveGoal();
+		await session.abort();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		session.setGoalModeState(undefined);
+		await emitAssistantStop(125);
+		setActiveGoal();
+		await emitAssistantStop(126);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+	});
+
+	it("lets a later inactive abort clear suppression from an earlier active-goal abort", async () => {
+		setActiveGoal();
+		await session.abort();
+		session.setGoalModeState(undefined);
+		await session.abort();
+		setActiveGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+	});
+
+	it("does not transfer abort suppression to a replacement goal", async () => {
+		setActiveGoal("goal-1", "First goal");
+		await session.abort();
+		setActiveGoal("goal-2", "Replacement goal");
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+		expect(JSON.stringify(session.agent.state.messages.find(message => message.role === "developer"))).toContain(
+			"Replacement goal",
+		);
+	});
+
+	it("clears abort suppression when the aborted goal is paused and re-enabled", async () => {
+		setActiveGoal();
+		await session.abort();
+		await session.goalRuntime.pauseGoal();
+		await session.goalRuntime.resumeGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
 	});
 
 	it("continues after a successful yield when an active goal remains uncleared", async () => {

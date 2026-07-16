@@ -10,13 +10,12 @@
  * translations impose on first-class pi-ai fields (service tier, cache
  * markers, thinking budgets, tool-choice variants, …).
  *
- * The streaming wire is {@link AssistantMessageEvent} serialized verbatim and
- * SSE-framed. Same type pi-ai already produces internally; the client feeds
- * each parsed event straight into `AssistantMessageEventStream.push()` with
- * no translation. Including `partial: AssistantMessage` on every delta is
- * O(N²) in turn length on the wire — acceptable for the loopback / sidecar
- * topology this transport is designed for; provider latency dominates the
- * actual cost.
+ * The streaming wire is {@link AssistantMessageEvent} serialized as SSE. Public
+ * projections omit private raw reasoning and serialized Responses reasoning
+ * signatures while preserving provider-displayable summaries and genuine opaque
+ * signatures. Including `partial: AssistantMessage` on every delta is O(N²) in
+ * turn length on the wire — acceptable for the loopback / sidecar topology this
+ * transport is designed for; provider latency dominates the actual cost.
  *
  * Endpoint contract:
  *   POST /v1/pi/stream
@@ -25,7 +24,14 @@
  *   200 JSON (stream=false): { message: AssistantMessage }
  *   4xx/5xx: { error: { type, message } }
  */
-import type { AssistantMessageEventStream, Context, SimpleStreamOptions } from "../types";
+import type {
+	AssistantMessage,
+	AssistantMessageEvent,
+	AssistantMessageEventStream,
+	Context,
+	SimpleStreamOptions,
+	ThinkingContent,
+} from "../types";
 
 export interface PiNativeParsedRequest {
 	modelId: string;
@@ -148,25 +154,272 @@ export function parseRequest(body: unknown, _headers?: Headers): PiNativeParsedR
 const SSE_ENCODER = new TextEncoder();
 const SSE_DONE = SSE_ENCODER.encode("data: [DONE]\n\n");
 
+function isSerializedResponsesReasoningItem(signature: string): boolean {
+	try {
+		const parsed: unknown = JSON.parse(signature);
+		return (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			!Array.isArray(parsed) &&
+			(parsed as { type?: unknown }).type === "reasoning"
+		);
+	} catch {
+		return false;
+	}
+}
+
 /**
- * Ship every {@link AssistantMessageEvent} verbatim, SSE-framed.
- *
- * No per-event re-shaping: the pi-native client is pi-ai itself, so the
- * canonical event type IS the wire type. Including the rolling
- * `partial: AssistantMessage` on every delta is quadratic in turn length
- * on the wire, but for the loopback / sidecar topology this transport
- * targets (containerized GJC → host gateway) the bandwidth cost is negligible
- * compared to provider latency —
- * and the client gets to feed the events straight into its existing
- * `AssistantMessageEventStream.push()` plumbing with zero translation.
+ * Clone a thinking block for public transport. Raw reasoning is private: omit
+ * raw-only blocks, retain only the displayable summary for mixed blocks, and
+ * never forward a serialized Responses reasoning item as a signature.
+ */
+function isResponsesFamilyApi(api: AssistantMessage["api"]): boolean {
+	return api === "openai-responses" || api === "openai-codex-responses";
+}
+
+function sanitizeThinking(content: ThinkingContent, api: AssistantMessage["api"]): ThinkingContent | undefined {
+	if (isResponsesFamilyApi(api) && content.provenance === undefined) return undefined;
+	if (content.provenance === "raw") return undefined;
+
+	let thinking: string;
+	if (content.provenance === "mixed") {
+		if (content.summaryText === undefined) return undefined;
+		thinking = content.summaryText;
+	} else {
+		thinking = content.provenance === "summary" ? (content.summaryText ?? content.thinking) : content.thinking;
+	}
+	const signature =
+		content.thinkingSignature && isSerializedResponsesReasoningItem(content.thinkingSignature)
+			? undefined
+			: content.thinkingSignature;
+	const { rawText: _rawText, thinkingSignature: _thinkingSignature, ...rest } = content;
+	return signature === undefined ? { ...rest, thinking } : { ...rest, thinking, thinkingSignature: signature };
+}
+
+function sanitizeMessage(message: AssistantMessage): AssistantMessage {
+	let changed = false;
+	const content: AssistantMessage["content"] = [];
+	for (const part of message.content) {
+		if (part.type !== "thinking") {
+			content.push(part);
+			continue;
+		}
+		const needsSanitizing =
+			(isResponsesFamilyApi(message.api) && part.provenance === undefined) ||
+			part.provenance !== undefined ||
+			part.rawText !== undefined ||
+			(part.thinkingSignature !== undefined && isSerializedResponsesReasoningItem(part.thinkingSignature));
+		if (!needsSanitizing) {
+			content.push(part);
+			continue;
+		}
+		const sanitized = sanitizeThinking(part, message.api);
+		changed = true;
+		if (sanitized !== undefined) content.push(sanitized);
+	}
+	return changed ? { ...message, content } : message;
+}
+
+function hasRawOrMixedThinking(partial: AssistantMessage, contentIndex: number): boolean {
+	const content = partial.content[contentIndex];
+	return content?.type === "thinking" && (content.provenance === "raw" || content.provenance === "mixed");
+}
+
+type ThinkingEvent = Extract<AssistantMessageEvent, { type: "thinking_start" | "thinking_delta" | "thinking_end" }>;
+
+interface BufferedThinkingEvent {
+	event: ThinkingEvent;
+	sequence: number;
+}
+
+function isFinalSafeThinking(partial: AssistantMessage, contentIndex: number): boolean {
+	const content = partial.content[contentIndex];
+	return (
+		content?.type === "thinking" &&
+		(!isResponsesFamilyApi(partial.api) || content.provenance !== undefined) &&
+		!hasRawOrMixedThinking(partial, contentIndex)
+	);
+}
+
+function maskBufferedThinking(message: AssistantMessage, contentIndexes: ReadonlySet<number>): AssistantMessage {
+	let changed = false;
+	const content = message.content.map((part, contentIndex) => {
+		if (!contentIndexes.has(contentIndex) || part.type !== "thinking") return part;
+		changed = true;
+		return { type: "thinking" as const, thinking: "", ...(part.itemId ? { itemId: part.itemId } : {}) };
+	});
+	return changed ? { ...message, content } : message;
+}
+
+function maskBufferedThinkingInEvent(
+	event: AssistantMessageEvent,
+	contentIndexes: ReadonlySet<number>,
+): AssistantMessageEvent {
+	if (contentIndexes.size === 0) return event;
+	switch (event.type) {
+		case "done":
+		case "error":
+		case "toolChoiceIncapability":
+			return event;
+		case "start":
+		case "text_start":
+		case "text_delta":
+		case "text_end":
+		case "thinking_start":
+		case "thinking_delta":
+		case "thinking_end":
+		case "reasoning_summary_start":
+		case "reasoning_summary_delta":
+		case "reasoning_summary_end":
+		case "toolcall_start":
+		case "toolcall_delta":
+		case "toolcall_end":
+			return { ...event, partial: maskBufferedThinking(event.partial, contentIndexes) };
+	}
+}
+
+function withSummaryPartial<
+	T extends Extract<
+		AssistantMessageEvent,
+		{ type: "reasoning_summary_start" | "reasoning_summary_delta" | "reasoning_summary_end" }
+	>,
+>(event: T, contentIndexes: ReadonlySet<number>, summaryText: string): T {
+	const partial = maskBufferedThinking(event.partial, contentIndexes);
+	const content = [...partial.content];
+	const original = event.partial.content[event.contentIndex];
+	content[event.contentIndex] = {
+		type: "thinking",
+		thinking: summaryText,
+		provenance: "summary",
+		summaryText,
+		...(original?.type === "thinking" && original.itemId ? { itemId: original.itemId } : {}),
+	};
+	return { ...event, partial: { ...partial, content } };
+}
+
+function sanitizeEvent(event: AssistantMessageEvent): AssistantMessageEvent | undefined {
+	switch (event.type) {
+		case "done":
+			return { ...event, message: sanitizeMessage(event.message) };
+		case "error":
+			return { ...event, error: sanitizeMessage(event.error) };
+		case "toolChoiceIncapability":
+			return event;
+		case "thinking_start":
+		case "thinking_delta":
+		case "thinking_end":
+			return hasRawOrMixedThinking(event.partial, event.contentIndex)
+				? undefined
+				: { ...event, partial: sanitizeMessage(event.partial) };
+		case "start":
+		case "text_start":
+		case "text_delta":
+		case "text_end":
+		case "reasoning_summary_start":
+		case "reasoning_summary_delta":
+		case "reasoning_summary_end":
+		case "toolcall_start":
+		case "toolcall_delta":
+		case "toolcall_end":
+			return { ...event, partial: sanitizeMessage(event.partial) };
+	}
+}
+
+/**
+ * Ship only public-safe {@link AssistantMessageEvent} projections. Unknown
+ * thinking blocks remain buffered until their terminal partial establishes that
+ * the provider-native block is safe; raw and mixed blocks never reach SSE.
  */
 export function encodeStream(events: AssistantMessageEventStream): ReadableStream<Uint8Array> {
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
+			const bufferedThinking = new Map<number, BufferedThinkingEvent[]>();
+			const summaryTextByIndex = new Map<number, string>();
+			let sequence = 0;
+			const write = (event: AssistantMessageEvent): void => {
+				const sanitized = sanitizeEvent(event);
+				if (sanitized !== undefined) {
+					controller.enqueue(SSE_ENCODER.encode(`data: ${JSON.stringify(sanitized)}\n\n`));
+				}
+			};
+			const emit = (event: AssistantMessageEvent): void => {
+				write(maskBufferedThinkingInEvent(event, new Set(bufferedThinking.keys())));
+			};
+			const flush = (buffered: BufferedThinkingEvent[]): void => {
+				for (const { event } of buffered.sort((a, b) => a.sequence - b.sequence)) emit(event);
+			};
+			const resolveBufferedThinking = (final: AssistantMessage): void => {
+				const ready: BufferedThinkingEvent[] = [];
+				for (const [contentIndex, buffered] of bufferedThinking) {
+					if (isFinalSafeThinking(final, contentIndex)) ready.push(...buffered);
+				}
+				bufferedThinking.clear();
+				flush(ready);
+			};
 			try {
 				for await (const event of events) {
-					controller.enqueue(SSE_ENCODER.encode(`data: ${JSON.stringify(event)}\n\n`));
-					if (event.type === "done" || event.type === "error") break;
+					switch (event.type) {
+						case "thinking_start":
+						case "thinking_delta": {
+							if (hasRawOrMixedThinking(event.partial, event.contentIndex)) {
+								bufferedThinking.delete(event.contentIndex);
+								break;
+							}
+							const buffered = bufferedThinking.get(event.contentIndex) ?? [];
+							buffered.push({ event, sequence: sequence++ });
+							bufferedThinking.set(event.contentIndex, buffered);
+							break;
+						}
+						case "thinking_end": {
+							const buffered = bufferedThinking.get(event.contentIndex) ?? [];
+							bufferedThinking.delete(event.contentIndex);
+							if (!isFinalSafeThinking(event.partial, event.contentIndex)) break;
+							buffered.push({ event, sequence: sequence++ });
+							flush(buffered);
+							break;
+						}
+						case "done":
+							resolveBufferedThinking(event.message);
+							summaryTextByIndex.clear();
+							emit(event);
+							controller.enqueue(SSE_DONE);
+							controller.close();
+							return;
+						case "error":
+							resolveBufferedThinking(event.error);
+							summaryTextByIndex.clear();
+							emit(event);
+							controller.enqueue(SSE_DONE);
+							controller.close();
+							return;
+						case "reasoning_summary_start": {
+							summaryTextByIndex.set(event.contentIndex, "");
+							write(withSummaryPartial(event, new Set(bufferedThinking.keys()), ""));
+							break;
+						}
+						case "reasoning_summary_delta": {
+							const summaryText = `${summaryTextByIndex.get(event.contentIndex) ?? ""}${event.delta}`;
+							summaryTextByIndex.set(event.contentIndex, summaryText);
+							write(withSummaryPartial(event, new Set(bufferedThinking.keys()), summaryText));
+							break;
+						}
+						case "reasoning_summary_end": {
+							const summaryText = event.content || summaryTextByIndex.get(event.contentIndex) || "";
+							summaryTextByIndex.delete(event.contentIndex);
+							write(withSummaryPartial(event, new Set(bufferedThinking.keys()), summaryText));
+							break;
+						}
+						case "start":
+						case "text_start":
+						case "text_delta":
+						case "text_end":
+						case "toolcall_start":
+						case "toolcall_delta":
+						case "toolcall_end":
+						case "toolChoiceIncapability":
+							emit(event);
+							break;
+					}
 				}
 				controller.enqueue(SSE_DONE);
 				controller.close();

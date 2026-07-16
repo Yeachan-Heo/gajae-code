@@ -78,6 +78,21 @@ describe("resource GC controller", () => {
 		expect(releaseTab.mock.calls.map(c => c[0])).toEqual(["old", "mid"]);
 	});
 
+	it("forwards expired dead managed tabs to the authoritative supervisor recheck", async () => {
+		const settings = Settings.isolated({
+			"browser.gc.enabled": true,
+			"browser.gc.idleMs": 1000,
+			"browser.gc.rssLimitMb": 1_000_000,
+			"computer.screenshotGc.enabled": false,
+		});
+		registerResourceGcSession({ sessionId: "s1", settings });
+		const releaseTab = vi.fn(async () => true);
+		await sweepOnce(
+			baseDeps({ releaseTab, listTabs: () => [snapshot("dead", "s1", NOW - 5000, { state: "dead" })] }),
+		);
+		expect(releaseTab).toHaveBeenCalledWith("dead", expect.objectContaining({ idleMs: 1000 }));
+	});
+
 	it("skips tabs owned by no registered session", async () => {
 		const settings = Settings.isolated({ "browser.gc.idleMs": 1000, "browser.gc.rssLimitMb": 1_000_000 });
 		registerResourceGcSession({ sessionId: "s1", settings });
@@ -89,6 +104,25 @@ describe("resource GC controller", () => {
 			}),
 		);
 		expect(releaseTab.mock.calls.map(c => c[0])).toEqual(["mine"]);
+	});
+
+	it("warns under RSS pressure when only a recovery-held dead tab remains", async () => {
+		const settings = Settings.isolated({
+			"browser.gc.enabled": true,
+			"browser.gc.idleMs": 1000,
+			"browser.gc.rssLimitMb": 100,
+			"computer.screenshotGc.enabled": false,
+		});
+		registerResourceGcSession({ sessionId: "s1", settings });
+		const logWarn = vi.fn();
+		await sweepOnce(
+			baseDeps({
+				logWarn,
+				rssBytes: () => 200 * MB,
+				listTabs: () => [snapshot("recovering", "s1", NOW - 5000, { state: "dead" })],
+			}),
+		);
+		expect(logWarn).toHaveBeenCalledTimes(1);
 	});
 
 	it("never evicts non-idle tabs under RSS pressure (IR-1) and warns once instead", async () => {

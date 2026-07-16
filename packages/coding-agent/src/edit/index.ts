@@ -57,6 +57,69 @@ type VimParams = z.infer<typeof vimSchema>;
 type EditParams = ReplaceParams | PatchParams | HashlineParams | VimParams | ApplyPatchParams;
 type EditToolResultDetails = EditToolDetails | VimToolDetails;
 
+const UNSAFE_EDIT_SUMMARY_PATH =
+	/(?:\b(?:https?|wss?):\/\/|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,})/i;
+
+const MAX_APPLY_PATCH_ACTIVITY_FILES = 2;
+
+function isSafeEditSummaryPath(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= 100 && !UNSAFE_EDIT_SUMMARY_PATH.test(value);
+}
+
+/** Summarize only apply_patch file-operation headers, never its patch body. */
+function summarizeApplyPatchActivity(input: string): string | undefined {
+	if (!input.trimStart().startsWith("*** Begin Patch")) return undefined;
+
+	const paths: string[] = [];
+	const marker = /^\*\*\* (?:Add|Delete|Update) File: ([^\r\n]+)\r?$/gm;
+	let count = 0;
+	let match = marker.exec(input);
+	while (match !== null) {
+		const editPath = match[1]!.trim();
+		if (!isSafeEditSummaryPath(editPath)) return undefined;
+		count++;
+		if (paths.length < MAX_APPLY_PATCH_ACTIVITY_FILES) paths.push(editPath);
+		match = marker.exec(input);
+	}
+	if (count === 0) return undefined;
+
+	const displayedPaths =
+		count > MAX_APPLY_PATCH_ACTIVITY_FILES ? `${paths.join(", ")}, +${count - paths.length} more` : paths.join(", ");
+	return `${displayedPaths}, ${count} edit${count === 1 ? "" : "s"}`;
+}
+
+/** Project edit targets and operation counts without exposing patches, diffs, or file contents. */
+export function summarizeEditToolActivity(kind: "args" | "result", value: unknown): string | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (kind === "args") {
+		const applyPatchInput = record.input;
+		if (typeof applyPatchInput === "string") return summarizeApplyPatchActivity(applyPatchInput);
+
+		const editPath = record.path;
+		if (!isSafeEditSummaryPath(editPath)) return undefined;
+		const edits = record.edits;
+		const count = Array.isArray(edits) ? edits.length : 1;
+		return `${editPath}, ${count} edit${count === 1 ? "" : "s"}`;
+	}
+
+	const details = record.details;
+	if (!details || typeof details !== "object" || Array.isArray(details)) return undefined;
+	const perFileResults = (details as Record<string, unknown>).perFileResults;
+	const count = Array.isArray(perFileResults)
+		? perFileResults.length
+		: "path" in (details as Record<string, unknown>)
+			? 1
+			: 0;
+	if (count === 0) return undefined;
+	const failed =
+		record.isError === true ||
+		(Array.isArray(perFileResults) &&
+			perFileResults.some(
+				entry => typeof entry === "object" && entry !== null && (entry as Record<string, unknown>).isError === true,
+			));
+	return `${failed ? "failed" : "applied"}, ${count} file${count === 1 ? "" : "s"}`;
+}
 type EditModeDefinition = {
 	description: (session: ToolSession) => string;
 	parameters: TInput;
@@ -279,6 +342,7 @@ export class EditTool implements AgentTool<TInput> {
 	readonly nonAbortable = true;
 	readonly concurrency = "exclusive";
 	readonly strict = true;
+	readonly safeSummary = summarizeEditToolActivity;
 
 	readonly #allowFuzzy: boolean;
 	readonly #fuzzyThreshold: number;
