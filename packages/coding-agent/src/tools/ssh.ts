@@ -17,6 +17,7 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import type { ToolSession } from ".";
 import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } from "./output-meta";
+import { expandHintSuffix } from "./render-utils";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -266,7 +267,7 @@ export const sshToolRenderer = {
 							outputLines.push(
 								uiTheme.fg(
 									"dim",
-									`… (${skippedCount} earlier lines, showing ${visualLines.length} of ${totalVisualLines}) (ctrl+o to expand)`,
+									`… (${skippedCount} earlier lines, showing ${visualLines.length} of ${totalVisualLines})${expandHintSuffix(uiTheme)}`,
 								),
 							);
 						}
@@ -281,7 +282,7 @@ export const sshToolRenderer = {
 						const remaining = outputLinesRaw.length - maxLines;
 						outputLines.push(...displayLines.map(line => uiTheme.fg("toolOutput", line)));
 						if (remaining > 0) {
-							outputLines.push(uiTheme.fg("dim", `… (${remaining} more lines) (ctrl+o to expand)`));
+							outputLines.push(uiTheme.fg("dim", `… (${remaining} more lines)${expandHintSuffix(uiTheme)}`));
 						}
 					}
 				}
