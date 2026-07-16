@@ -152,6 +152,12 @@ export interface UltragoalGoal {
 
 export interface UltragoalPlan {
 	version: 1;
+	/**
+	 * Cryptographically random identity for this durable plan instance. It is
+	 * intentionally distinct from timestamps and mutable completion generations.
+	 * Legacy plans do not have this field and must not gain handoff authority.
+	 */
+	planRunId?: string;
 	brief: string;
 	gjcGoalMode: UltragoalGjcGoalMode;
 	gjcObjective: string;
@@ -309,6 +315,7 @@ const ACCEPTED_PROOF_STATUSES = new Set([COVERED_STATUS, "passed", "verified"]);
 const MIN_SUBSTANTIVE_EVIDENCE_WORDS = 5;
 const MIN_SUBSTANTIVE_EVIDENCE_CHARS = 32;
 
+const ULTRAGOAL_PLAN_RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SCHEDULABLE_STATUSES = new Set<UltragoalGoalStatus>(["pending", "active", "failed"]);
 const COMPLETE_CHECKPOINT_ALLOWED_PRE_STATUSES = new Set<UltragoalGoalStatus>(["active", "failed"]);
 
@@ -1311,8 +1318,13 @@ function normalizePlan(raw: unknown): UltragoalPlan {
 				(value): value is string => typeof value === "string" && value.trim().length > 0,
 			)
 		: undefined;
+	const planRunId =
+		typeof record.planRunId === "string" && ULTRAGOAL_PLAN_RUN_ID_PATTERN.test(record.planRunId)
+			? record.planRunId
+			: undefined;
 	return {
 		version: 1,
+		...(planRunId ? { planRunId } : {}),
 		brief,
 		gjcGoalMode,
 		gjcObjective,
@@ -1522,6 +1534,7 @@ export async function createUltragoalPlan(input: {
 	}
 	const plan: UltragoalPlan = {
 		version: 1,
+		planRunId: crypto.randomUUID(),
 		brief,
 		gjcGoalMode: input.gjcGoalMode ?? "aggregate",
 		gjcObjective: DEFAULT_ULTRAGOAL_OBJECTIVE,
@@ -1530,7 +1543,11 @@ export async function createUltragoalPlan(input: {
 		updatedAt: now,
 	};
 	await writePlan(input.cwd, plan, input.sessionId);
-	await appendLedger(input.cwd, { event: "plan_created", goalIds: plan.goals.map(goal => goal.id) }, input.sessionId);
+	await appendLedger(
+		input.cwd,
+		{ event: "plan_created", goalIds: plan.goals.map(goal => goal.id), planRunId: plan.planRunId },
+		input.sessionId,
+	);
 	return plan;
 }
 

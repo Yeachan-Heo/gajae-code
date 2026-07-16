@@ -4,10 +4,11 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
-	activeSnapshotPath,
+	activeEntryPath,
 	modeStatePath,
 	sessionActivityPath,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { isUltragoalAskBlocked } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
 	computeUltragoalPlanGeneration,
@@ -16,6 +17,7 @@ import {
 	hashStructuredValue,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { syncSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
@@ -71,29 +73,42 @@ async function writeActivityMarker(cwd: string, sessionId: string, updatedAt: st
 }
 
 async function writeActiveDeepInterviewState(cwd: string, sessionId: string): Promise<void> {
-	const now = new Date().toISOString();
-	const activeState = {
-		version: 1,
-		active: true,
+	await syncSkillActiveState({
+		cwd,
+		sessionId,
 		skill: "deep-interview",
+		active: true,
 		phase: "interviewing",
-		updated_at: now,
-		session_id: sessionId,
-		active_skills: [
-			{
-				skill: "deep-interview",
-				phase: "interviewing",
-				active: true,
-				updated_at: now,
-				session_id: sessionId,
-			},
-		],
-	};
-	await Bun.write(activeSnapshotPath(cwd, sessionId), `${JSON.stringify(activeState, null, 2)}\n`);
+	});
+}
+async function handoffUltragoal(cwd: string, sessionId: string, callee: "deep-interview" | "ralplan"): Promise<void> {
 	await Bun.write(
-		modeStatePath(cwd, sessionId, "deep-interview"),
-		`${JSON.stringify({ active: true, current_phase: "interviewing", session_id: sessionId }, null, 2)}\n`,
+		modeStatePath(cwd, sessionId, "ultragoal"),
+		`${JSON.stringify(
+			{
+				skill: "ultragoal",
+				version: 1,
+				active: true,
+				current_phase: "handoff",
+				session_id: sessionId,
+				updated_at: new Date().toISOString(),
+			},
+			null,
+			2,
+		)}\n`,
 	);
+	await syncSkillActiveState({
+		cwd,
+		sessionId,
+		skill: "ultragoal",
+		active: true,
+		phase: "handoff",
+	});
+	const result = await runNativeStateCommand(
+		["handoff", "--mode", "ultragoal", "--to", callee, "--session-id", sessionId, "--json"],
+		cwd,
+	);
+	expect(result.status, result.stderr).toBe(0);
 }
 
 function stubAskTool(execute: () => Promise<void>): AgentTool {
@@ -241,14 +256,13 @@ describe("ultragoal ask guard", () => {
 		expect(result.content[0]).toMatchObject({ type: "text" });
 	});
 
-	it("blocks active deep-interview ask when the same session has active ultragoal state", async () => {
+	it("allows active deep-interview ask after same-session ultragoal handoff", async () => {
 		const cwd = await tempDir();
-		const sessionId = "deep-interview-with-ultragoal-state";
+		const sessionId = "deep-interview-after-ultragoal-handoff";
 
 		process.env.GJC_SESSION_ID = sessionId;
 		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
-		delete process.env.GJC_SESSION_ID;
-		await writeActiveDeepInterviewState(cwd, sessionId);
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
 
 		const select = vi.fn(async () => "Continue");
 		const tool = new AskTool(
@@ -258,16 +272,152 @@ describe("ultragoal ask guard", () => {
 			}),
 		);
 
-		await expect(
-			tool.execute(
-				"call",
-				{ questions: [{ id: "q", question: "Continue interview?", options: [{ label: "Continue" }] }] },
-				undefined,
-				undefined,
-				createContext(select),
-			),
-		).rejects.toThrow(/try-harder nudge/);
-		expect(select).not.toHaveBeenCalled();
+		const result = await tool.execute(
+			"call",
+			{ questions: [{ id: "q", question: "Continue interview?", options: [{ label: "Continue" }] }] },
+			undefined,
+			undefined,
+			createContext(select),
+		);
+
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(result.content[0]).toMatchObject({ type: "text" });
+	});
+	it("allows ask after a committed same-session ultragoal to ralplan handoff", async () => {
+		const cwd = await tempDir();
+		const sessionId = "ralplan-after-ultragoal-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "ralplan");
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(false);
+		expect(diagnostic.reason).toContain("committed workflow handoff to ralplan");
+	});
+	it("blocks a committed handoff when a custom workflow is also active", async () => {
+		const cwd = await tempDir();
+		const sessionId = "custom-overlapping-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		await syncSkillActiveState({
+			cwd,
+			sessionId,
+			skill: "custom-review",
+			active: true,
+			phase: "running",
+		});
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("fails closed on a malformed custom entry after committed handoff", async () => {
+		const cwd = await tempDir();
+		const sessionId = "malformed-custom-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await handoffUltragoal(cwd, sessionId, "ralplan");
+		await Bun.write(activeEntryPath(cwd, sessionId, "custom-review"), "{}\n");
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("durable_state_unreadable");
+	});
+	it("does not accept callee activation without committed handoff provenance", async () => {
+		const cwd = await tempDir();
+		const sessionId = "forged-deep-interview-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await writeActiveDeepInterviewState(cwd, sessionId);
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("does not treat active team state as a backward handoff", async () => {
+		const cwd = await tempDir();
+		const sessionId = "team-with-incomplete-ultragoal";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await syncSkillActiveState({
+			cwd,
+			sessionId,
+			skill: "team",
+			active: true,
+			phase: "running",
+		});
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("fails closed on structurally invalid canonical active entries", async () => {
+		const cwd = await tempDir();
+		const sessionId = "malformed-handoff-entry";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await Bun.write(
+			activeEntryPath(cwd, sessionId, "deep-interview"),
+			`${JSON.stringify({ skill: "deep-interview", session_id: sessionId })}\n`,
+		);
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("durable_state_unreadable");
+		expect(diagnostic.reason).toContain("boolean active field");
+	});
+	it("rejects a stale handoff entry from an earlier ultragoal run", async () => {
+		const cwd = await tempDir();
+		const sessionId = "stale-ultragoal-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		const originalPlan = await createUltragoalPlan({ cwd, brief: "Implement the earlier story" });
+		await handoffUltragoal(cwd, sessionId, "deep-interview");
+		const replacementPlan = await createUltragoalPlan({ cwd, brief: "Implement the replacement story" });
+		const paths = getUltragoalPaths(cwd, sessionId);
+		const persistedReplacement = JSON.parse(await fs.readFile(paths.goalsPath, "utf8"));
+		persistedReplacement.createdAt = originalPlan.createdAt;
+		await fs.writeFile(paths.goalsPath, JSON.stringify(persistedReplacement, null, 2));
+		expect(persistedReplacement.createdAt).toBe(originalPlan.createdAt);
+		expect(replacementPlan.planRunId).not.toBe(originalPlan.planRunId);
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
+	});
+	it("keeps ask blocked when ultragoal remains active during an overlapping handoff", async () => {
+		const cwd = await tempDir();
+		const sessionId = "overlapping-ultragoal-handoff";
+
+		process.env.GJC_SESSION_ID = sessionId;
+		await createUltragoalPlan({ cwd, brief: "Implement the same-session story" });
+		await writeActiveDeepInterviewState(cwd, sessionId);
+		await syncSkillActiveState({
+			cwd,
+			sessionId,
+			skill: "ultragoal",
+			active: true,
+			phase: "handoff",
+		});
+
+		const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
+
+		expect(diagnostic.active).toBe(true);
+		expect(diagnostic.source).toBe("goals_json");
 	});
 
 	it("allows ask when the ultragoal run is verified complete", async () => {

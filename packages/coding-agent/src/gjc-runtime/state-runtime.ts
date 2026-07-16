@@ -28,7 +28,7 @@ import {
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
 import { mergeDeepInterviewEnvelope, normalizeDeepInterviewEnvelope } from "./deep-interview-state";
-import { activeSnapshotPath, auditPath, modeStatePath, sessionStateDir } from "./session-layout";
+import { activeSnapshotPath, auditPath, modeStatePath, sessionStateDir, sessionUltragoalDir } from "./session-layout";
 import {
 	resolveGjcSessionForRead,
 	resolveGjcSessionForWrite,
@@ -941,6 +941,67 @@ async function readAuditWindow(
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
+const ULTRAGOAL_ASK_HANDOFF_CALLEES = new Set(["deep-interview", "ralplan"]);
+const ULTRAGOAL_PLAN_RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+interface UltragoalAskHandoffAuthority {
+	version: 1;
+	commitment: "committed";
+	caller: "ultragoal";
+	callee: "deep-interview" | "ralplan";
+	session_id: string;
+	plan_run_id: string;
+	handoff_at: string;
+	mutation_id: string;
+	caller_receipt: WorkflowStateReceipt;
+	callee_receipt: WorkflowStateReceipt;
+}
+
+function isUltragoalAskHandoffCallee(value: string): value is UltragoalAskHandoffAuthority["callee"] {
+	return ULTRAGOAL_ASK_HANDOFF_CALLEES.has(value);
+}
+
+function withoutUltragoalAskHandoffAuthority(state: Record<string, unknown>): Record<string, unknown> {
+	const { ultragoal_ask_handoff: _discarded, ...remaining } = state;
+	return remaining;
+}
+
+async function readUltragoalPlanRunId(cwd: string, sessionId: string): Promise<string | undefined> {
+	const goalsPath = path.join(sessionUltragoalDir(cwd, sessionId), "goals.json");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await fs.readFile(goalsPath, "utf8"));
+	} catch {
+		// A legacy, incomplete, or malformed plan remains handoff-compatible but
+		// receives no ask authorization. The guard will fail closed.
+		return undefined;
+	}
+	if (!isPlainObject(parsed) || typeof parsed.planRunId !== "string") return undefined;
+	return ULTRAGOAL_PLAN_RUN_ID_PATTERN.test(parsed.planRunId) ? parsed.planRunId : undefined;
+}
+
+function buildUltragoalAskHandoffAuthority(input: {
+	callee: UltragoalAskHandoffAuthority["callee"];
+	sessionId: string;
+	planRunId: string;
+	handoffAt: string;
+	mutationId: string;
+	callerReceipt: WorkflowStateReceipt;
+	calleeReceipt: WorkflowStateReceipt;
+}): UltragoalAskHandoffAuthority {
+	return {
+		version: 1,
+		commitment: "committed",
+		caller: "ultragoal",
+		callee: input.callee,
+		session_id: input.sessionId,
+		plan_run_id: input.planRunId,
+		handoff_at: input.handoffAt,
+		mutation_id: input.mutationId,
+		caller_receipt: input.callerReceipt,
+		callee_receipt: input.calleeReceipt,
+	};
+}
 
 /**
  * Shallow-merge `source` into `target`, with the convention that a `source` key whose value is
@@ -1589,6 +1650,10 @@ async function handleHandoff(
 	if (callee === caller) {
 		throw new StateCommandError(2, `gjc state handoff: --to must differ from caller (both are "${caller}")`);
 	}
+	const ultragoalPlanRunId =
+		caller === "ultragoal" && isUltragoalAskHandoffCallee(callee)
+			? await readUltragoalPlanRunId(cwd, sessionId)
+			: undefined;
 
 	const callerPath = modeStateFile(cwd, caller, sessionId);
 	const calleePath = calleeIsWorkflow ? modeStateFile(cwd, callee, sessionId) : undefined;
@@ -1624,13 +1689,14 @@ async function handleHandoff(
 	// persist them as active-state entries; the prompt observer tracks them
 	// in memory the same way direct `/skill:<runtime>` invocation does.
 	if (!calleeIsWorkflow) {
-		const normalizedCaller =
+		const normalizedCaller = withoutUltragoalAskHandoffAuthority(
 			caller === "deep-interview"
 				? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
 						string,
 						unknown
 					>)
-				: migrateWorkflowState(existingCaller, caller).state;
+				: migrateWorkflowState(existingCaller, caller).state,
+		);
 		const mergedCallerState: Record<string, unknown> = {
 			...normalizedCaller,
 			skill: caller,
@@ -1725,22 +1791,36 @@ async function handleHandoff(
 		nowIso: handoffAt,
 		mutationId,
 	});
+	const ultragoalAskHandoff =
+		ultragoalPlanRunId && isUltragoalAskHandoffCallee(callee)
+			? buildUltragoalAskHandoffAuthority({
+					callee,
+					sessionId,
+					planRunId: ultragoalPlanRunId,
+					handoffAt,
+					mutationId,
+					callerReceipt,
+					calleeReceipt,
+				})
+			: undefined;
 
 	const calleeInitial = initialPhaseForSkill(callee);
-	const normalizedCaller =
+	const normalizedCaller = withoutUltragoalAskHandoffAuthority(
 		caller === "deep-interview"
 			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
 					string,
 					unknown
 				>)
-			: migrateWorkflowState(existingCaller, caller).state;
-	const normalizedCallee =
+			: migrateWorkflowState(existingCaller, caller).state,
+	);
+	const normalizedCallee = withoutUltragoalAskHandoffAuthority(
 		callee === "deep-interview"
 			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCallee, callee).state) as Record<
 					string,
 					unknown
 				>)
-			: migrateWorkflowState(existingCallee, callee).state;
+			: migrateWorkflowState(existingCallee, callee).state,
+	);
 	const mergedCalleeState: Record<string, unknown> = {
 		...normalizedCallee,
 		skill: callee,
@@ -1751,6 +1831,7 @@ async function handleHandoff(
 		handoff_at: handoffAt,
 		updated_at: handoffAt,
 		receipt: calleeReceipt,
+		...(ultragoalAskHandoff ? { ultragoal_ask_handoff: ultragoalAskHandoff } : {}),
 	};
 	if (sessionId && typeof mergedCalleeState.session_id !== "string") {
 		mergedCalleeState.session_id = sessionId;
@@ -1765,6 +1846,7 @@ async function handleHandoff(
 		handoff_at: handoffAt,
 		updated_at: handoffAt,
 		receipt: callerReceipt,
+		...(ultragoalAskHandoff ? { ultragoal_ask_handoff: ultragoalAskHandoff } : {}),
 	};
 
 	await beginWorkflowTransactionJournal({

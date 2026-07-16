@@ -4,6 +4,9 @@
 ### Added
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 
+### Fixed
+- Ultragoal ask guards now release only after a receipt-backed same-session handoff to deep-interview or ralplan, while malformed, stale, ambiguous, forged, or still-active Ultragoal state remains fail-closed.
+
 ## [0.11.0] - 2026-07-15
 
 ### Fixed
