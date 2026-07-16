@@ -145,7 +145,8 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	}
 
 	/**
-	 * Apply an explicit user fold choice. Automatic updates must retain this choice.
+	 * Apply an explicit fold choice for this component instance. Automatic updates
+	 * retain this choice; transcript rebuilds create a new instance from the global state.
 	 */
 	setManuallyExpanded(expanded: boolean): void {
 		this.#manuallyExpanded = expanded;
@@ -209,7 +210,8 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 
 	/**
 	 * Add a code-cell content preview below the entry summary.
-	 * When collapsed: shows first COLLAPSED_PREVIEW_LINES lines with "… N more lines (Ctrl+O for more)" hint.
+	 * When collapsed: shows first COLLAPSED_PREVIEW_LINES lines with the configured
+	 * app.tools.expand keybinding hint, when available.
 	 * When expanded: shows full content.
 	 */
 	#addContentPreview(entry: ReadEntry): void {
