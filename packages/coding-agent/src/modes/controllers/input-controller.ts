@@ -38,6 +38,11 @@ function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
 
+interface PaletteComposerState {
+	snapshotText: string;
+	successorText: string | undefined;
+	successorImages: InteractiveModeContext["pendingImages"] | undefined;
+}
 export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
@@ -49,6 +54,8 @@ export class InputController {
 	 *  so abort cleanup going idle cannot turn the second Esc into an idle action. */
 	#steerConsumePending = false;
 	#commandPaletteActions = new Map<AppKeybinding, CommandPaletteAction>();
+	#paletteCommandInFlight = false;
+	#paletteComposerState: PaletteComposerState | undefined;
 
 	#registerCommandPaletteAction(action: AppKeybinding, handler: () => void): void {
 		this.#commandPaletteActions.set(action, {
@@ -509,6 +516,11 @@ export class InputController {
 			this.ctx.isBashNoContext = trimmed.startsWith("!!");
 			this.ctx.isPythonMode = trimmed.startsWith("$") && !trimmed.startsWith("${");
 			this.#clearPendingImagesIfPlaceholdersRemoved(text);
+			const paletteComposerState = this.#paletteComposerState;
+			if (paletteComposerState && text !== "" && text !== paletteComposerState.snapshotText) {
+				paletteComposerState.successorText = text;
+				paletteComposerState.successorImages = [...this.ctx.pendingImages];
+			}
 			if (
 				wasBashMode !== this.ctx.isBashMode ||
 				wasBashNoContext !== this.ctx.isBashNoContext ||
@@ -643,6 +655,7 @@ export class InputController {
 		if (this.ctx.session.isStreaming) {
 			this.ctx.editor.addToHistory(text);
 			this.ctx.editor.setText("");
+			this.#consumePaletteSuccessor(text);
 			const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 			this.#clearPendingImagesIfOwnedBy(pendingImages);
 			// Record the signature so the queued message's eventual delivery
@@ -704,6 +717,22 @@ export class InputController {
 			this.ctx.onInputCallback(submission);
 		}
 		this.ctx.editor.addToHistory(text);
+		this.#consumePaletteSuccessor(text);
+	}
+
+	/**
+	 * A submission that consumes composer text during a pending palette command
+	 * also consumes the recorded successor draft: restoring text the user has
+	 * already sent would resurrect a delivered message into the composer. The
+	 * pre-palette snapshot (never-sent state) remains the restore target.
+	 */
+	#consumePaletteSuccessor(submittedText: string): void {
+		const state = this.#paletteComposerState;
+		if (!state) return;
+		if (state.successorText !== undefined && state.successorText === submittedText) {
+			state.successorText = undefined;
+			state.successorImages = undefined;
+		}
 	}
 
 	handleCtrlC(): void {
@@ -1403,13 +1432,35 @@ export class InputController {
 
 	openCommandPalette(): void {
 		this.ctx.showCommandPalette(this.#slashCommands, [...this.#commandPaletteActions.values()], async name => {
+			if (this.#paletteCommandInFlight) {
+				this.ctx.showStatus("A palette command is still running.");
+				return;
+			}
+
+			this.#paletteCommandInFlight = true;
 			const text = this.ctx.editor.getText();
 			const pendingImages = [...this.ctx.pendingImages];
+			this.#paletteComposerState = { snapshotText: text, successorText: undefined, successorImages: undefined };
 			try {
 				await this.submitText(`/${name}`);
 			} finally {
-				this.ctx.editor.setText(text);
-				this.ctx.pendingImages = pendingImages;
+				// The palette command owns its cleanup only until newer composer input arrives.
+				// A draft or attachment added after the palette closes always wins over this snapshot.
+				const successorText = this.#paletteComposerState?.successorText;
+				const successorImages = this.#paletteComposerState?.successorImages;
+				const hasNewImages = this.ctx.pendingImages.some(image => !pendingImages.includes(image));
+				if (successorText !== undefined) {
+					this.ctx.editor.setText(successorText);
+				} else if (this.ctx.editor.getText() === "" || this.ctx.editor.getText() === text) {
+					this.ctx.editor.setText(text);
+				}
+				if (successorImages !== undefined) {
+					this.ctx.pendingImages = successorImages;
+				} else if (!hasNewImages) {
+					this.ctx.pendingImages = pendingImages;
+				}
+				this.#paletteComposerState = undefined;
+				this.#paletteCommandInFlight = false;
 			}
 		});
 	}

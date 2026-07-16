@@ -767,7 +767,11 @@ export class SelectorController {
 				entries,
 				entry => {
 					done();
-					void entry.handler?.();
+					void Promise.resolve()
+						.then(() => entry.handler?.())
+						.catch(error => {
+							this.ctx.showError(error instanceof Error ? error.message : String(error));
+						});
 				},
 				done,
 			);

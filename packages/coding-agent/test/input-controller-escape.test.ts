@@ -935,4 +935,126 @@ describe("InputController command palette", () => {
 		expect(emptyChanges).toHaveBeenCalledTimes(1);
 		expect(ctx.pendingImages).toEqual([attachment]);
 	});
+	it("keeps a successor draft after delayed slash command cleanup", async () => {
+		const { ctx, editor } = createContext();
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		let resolveChangelog!: () => void;
+		ctx.handleChangelogCommand = vi.fn(
+			() =>
+				new Promise<void>(resolve => {
+					resolveChangelog = resolve;
+				}),
+		);
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "changelog" }] as SlashCommand[], "");
+
+		editor.setText("old draft");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+		const execution = executeSlashCommand("changelog");
+		await Promise.resolve();
+
+		editor.setText("new draft");
+		resolveChangelog();
+		await execution;
+
+		expect(editor.getText()).toBe("new draft");
+	});
+	it("does not resurrect a successor draft that was submitted during a palette command", async () => {
+		const { ctx, editor, spies } = createContext();
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		let resolveChangelog!: () => void;
+		ctx.handleChangelogCommand = vi.fn(
+			() =>
+				new Promise<void>(resolve => {
+					resolveChangelog = resolve;
+				}),
+		);
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "changelog" }] as SlashCommand[], "");
+
+		editor.setText("old draft");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+		const execution = executeSlashCommand("changelog");
+		await Promise.resolve();
+
+		// The user types a successor draft and SENDS it while the palette command
+		// is still pending; the submission consumer then clears the composer.
+		editor.setText("new draft");
+		await controller.submitText("new draft");
+		editor.setText("");
+		resolveChangelog();
+		await execution;
+
+		// The sent text must not be resurrected into the composer; the never-sent
+		// pre-palette snapshot is the restore target.
+		expect(spies.onInputCallback).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("old draft");
+	});
+
+	it("keeps attachments added while a palette command is running", async () => {
+		const { ctx, editor } = createContext();
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		const original = { type: "image", data: "original" } as InteractiveModeContext["pendingImages"][number];
+		const successor = { type: "image", data: "successor" } as InteractiveModeContext["pendingImages"][number];
+		ctx.pendingImages = [original];
+		let resolveChangelog!: () => void;
+		ctx.handleChangelogCommand = vi.fn(
+			() =>
+				new Promise<void>(resolve => {
+					resolveChangelog = resolve;
+				}),
+		);
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "changelog" }] as SlashCommand[], "");
+
+		editor.setText("old draft [image 1]");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+		const execution = executeSlashCommand("changelog");
+		await Promise.resolve();
+
+		ctx.pendingImages = [...ctx.pendingImages, successor];
+		editor.setText("old draft [image 1] [image 2]");
+		resolveChangelog();
+		await execution;
+
+		expect(ctx.pendingImages).toEqual([original, successor]);
+	});
+
+	it("refuses a second palette command while the first is pending", async () => {
+		const { ctx, editor, spies } = createContext();
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		let resolveChangelog!: () => void;
+		ctx.handleChangelogCommand = vi.fn(
+			() =>
+				new Promise<void>(resolve => {
+					resolveChangelog = resolve;
+				}),
+		);
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "changelog" }] as SlashCommand[], "");
+
+		editor.setText("draft");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+		const first = executeSlashCommand("changelog");
+		await Promise.resolve();
+		await executeSlashCommand("changelog");
+
+		expect(ctx.handleChangelogCommand).toHaveBeenCalledTimes(1);
+		expect(spies.showStatus).toHaveBeenCalledWith("A palette command is still running.");
+
+		resolveChangelog();
+		await first;
+	});
 });
