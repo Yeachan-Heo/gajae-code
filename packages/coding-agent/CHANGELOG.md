@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- Double-Esc now clears an idle draft after a confirmation hint or opens the rewind picker from an empty editor.
 
 ## [0.11.0] - 2026-07-15
 

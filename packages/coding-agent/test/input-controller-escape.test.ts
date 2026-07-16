@@ -82,6 +82,7 @@ function createContext(): {
 		abortHandoff: ReturnType<typeof vi.fn>;
 		abortRetry: ReturnType<typeof vi.fn>;
 		retryNow: ReturnType<typeof vi.fn>;
+		showStatus: ReturnType<typeof vi.fn>;
 	};
 } {
 	let editorText = "";
@@ -98,6 +99,7 @@ function createContext(): {
 	const onInputCallback = vi.fn();
 	const prompt = vi.fn();
 	const requestRender = vi.fn();
+	const showStatus = vi.fn();
 	const handleBtwCommand = vi.fn(async () => {});
 	const handleBtwEscape = vi.fn(() => true);
 	const hasActiveBtw = vi.fn(() => false);
@@ -199,6 +201,7 @@ function createContext(): {
 		hasActiveBtw,
 		showTreeSelector: vi.fn(),
 		showUserMessageSelector: vi.fn(),
+		showStatus,
 		showSessionSelector: vi.fn(),
 	} as unknown as InteractiveModeContext;
 
@@ -226,6 +229,7 @@ function createContext(): {
 			requestRender,
 			startPendingSubmission,
 			clearEditor,
+			showStatus,
 		},
 	};
 }
@@ -561,7 +565,7 @@ describe("InputController escape behavior", () => {
 		expect(editor.getText()).toBe("stop after this");
 		expect(editor.shouldBypassAutocompleteOnEscape?.()).toBe(false);
 	});
-	it("double Esc clears a composed draft without aborting an active stream", () => {
+	it("interrupts an active stream even when the composer contains a draft", () => {
 		const { ctx, editor, spies } = createContext();
 		(ctx.session as { isStreaming: boolean }).isStreaming = true;
 		const controller = new InputController(ctx);
@@ -569,14 +573,12 @@ describe("InputController escape behavior", () => {
 		controller.setupKeyHandlers();
 		editor.setText("draft message");
 		editor.onEscape?.();
-		editor.onEscape?.();
 
-		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
-		expect(spies.abort).not.toHaveBeenCalled();
-		expect(editor.getText()).toBe("");
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.clearEditor).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("draft message");
 	});
-
-	it("single Esc with a composed draft neither clears nor aborts", () => {
+	it("hints on a single Esc with a composed draft", () => {
 		const { ctx, editor, spies } = createContext();
 		const controller = new InputController(ctx);
 
@@ -585,11 +587,35 @@ describe("InputController escape behavior", () => {
 		editor.onEscape?.();
 
 		expect(spies.clearEditor).not.toHaveBeenCalled();
-		expect(spies.abort).not.toHaveBeenCalled();
+		expect(editor.addToHistory).not.toHaveBeenCalled();
+		expect(spies.showStatus).toHaveBeenCalledWith("press Esc again to clear");
 		expect(editor.getText()).toBe("draft message");
 	});
+	it("clears an idle draft and saves it to prompt history on double Esc", () => {
+		const { ctx, editor, spies } = createContext();
+		const controller = new InputController(ctx);
 
-	it("double Esc clears a composed draft without aborting a running bash command", () => {
+		controller.setupKeyHandlers();
+		editor.setText("draft message");
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(editor.addToHistory).toHaveBeenCalledWith("draft message");
+		expect(editor.getText()).toBe("");
+	});
+	it("opens the rewind picker on double Esc with an empty editor", () => {
+		const { ctx, editor } = createContext();
+		(ctx.session as { messages: Array<{ role: string }> }).messages = [{ role: "user" }];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
+	});
+	it("interrupts a running bash command even when the composer contains a draft", () => {
 		const { ctx, editor, spies } = createContext();
 		(ctx.session as { isBashRunning: boolean }).isBashRunning = true;
 		const controller = new InputController(ctx);
@@ -597,13 +623,11 @@ describe("InputController escape behavior", () => {
 		controller.setupKeyHandlers();
 		editor.setText("draft");
 		editor.onEscape?.();
-		editor.onEscape?.();
 
-		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
-		expect(spies.abortBash).not.toHaveBeenCalled();
+		expect(spies.abortBash).toHaveBeenCalledTimes(1);
+		expect(spies.clearEditor).not.toHaveBeenCalled();
 	});
-
-	it("double Esc clears a composed draft without aborting a running eval", () => {
+	it("interrupts a running eval even when the composer contains a draft", () => {
 		const { ctx, editor, spies } = createContext();
 		(ctx.session as { isEvalRunning: boolean }).isEvalRunning = true;
 		const controller = new InputController(ctx);
@@ -611,10 +635,9 @@ describe("InputController escape behavior", () => {
 		controller.setupKeyHandlers();
 		editor.setText("draft");
 		editor.onEscape?.();
-		editor.onEscape?.();
 
-		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
-		expect(spies.abortEval).not.toHaveBeenCalled();
+		expect(spies.abortEval).toHaveBeenCalledTimes(1);
+		expect(spies.clearEditor).not.toHaveBeenCalled();
 	});
 
 	it("clears pending images along with the composed text on double Esc", () => {
@@ -657,18 +680,24 @@ describe("InputController escape behavior", () => {
 		expect(ctx.isBashMode).toBe(false);
 	});
 
-	it("re-arms instead of clearing when the second Esc falls outside the 500ms window", () => {
-		const { ctx, editor, spies } = createContext();
-		const controller = new InputController(ctx);
+	it("resets the double-Esc state after 800ms", () => {
+		const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
+		try {
+			const { ctx, editor, spies } = createContext();
+			const controller = new InputController(ctx);
 
-		controller.setupKeyHandlers();
-		editor.setText("draft");
-		editor.onEscape?.();
-		ctx.lastComposerClearEscapeTime = Date.now() - 1000;
-		editor.onEscape?.();
+			controller.setupKeyHandlers();
+			editor.setText("draft");
+			editor.onEscape?.();
+			now.mockReturnValue(10_801);
+			editor.onEscape?.();
 
-		expect(spies.clearEditor).not.toHaveBeenCalled();
-		expect(editor.getText()).toBe("draft");
+			expect(spies.clearEditor).not.toHaveBeenCalled();
+			expect(spies.showStatus).toHaveBeenCalledTimes(2);
+			expect(editor.getText()).toBe("draft");
+		} finally {
+			now.mockRestore();
+		}
 	});
 	it("treats a whitespace-only composer as empty and still aborts an active stream", () => {
 		const { ctx, editor, spies } = createContext();

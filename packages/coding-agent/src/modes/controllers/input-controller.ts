@@ -27,6 +27,7 @@ interface Expandable {
 }
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+const DOUBLE_ESCAPE_WINDOW_MS = 800;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
 const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
 
@@ -178,6 +179,13 @@ export class InputController {
 			silent: options?.silent,
 		});
 	}
+	#clearComposer(): void {
+		const text = this.ctx.editor.getText();
+		if (text.trim()) {
+			this.ctx.editor.addToHistory(text);
+		}
+		this.ctx.clearEditor();
+	}
 
 	setupKeyHandlers(): void {
 		this.ctx.editor.setActionKeys("app.interrupt", this.ctx.keybindings.getKeys("app.interrupt"));
@@ -222,20 +230,6 @@ export class InputController {
 			if (this.#handleCancellableWorkEscape({ maintenance: true, retry: true })) {
 				return;
 			}
-			// Normal input state with user-typed text: Esc must not interrupt a
-			// running task (streaming turn, bash/eval). A double Esc within the
-			// 500ms window clears the composer instead. Bash/Python input modes
-			// keep their own Esc handling in the chain below.
-			if (!this.ctx.isBashMode && !this.ctx.isPythonMode && this.ctx.editor.getText().trim()) {
-				const now = Date.now();
-				if (now - this.ctx.lastComposerClearEscapeTime < 500) {
-					this.ctx.clearEditor();
-					this.ctx.lastComposerClearEscapeTime = 0;
-				} else {
-					this.ctx.lastComposerClearEscapeTime = now;
-				}
-				return;
-			}
 			if (
 				this.#handleCancellableWorkEscape({
 					loading: true,
@@ -248,21 +242,26 @@ export class InputController {
 			) {
 				return;
 			}
+			if (!this.ctx.isBashMode && !this.ctx.isPythonMode && this.ctx.editor.getText().trim()) {
+				this.ctx.lastEscapeTime = 0;
+				const now = Date.now();
+				if (now - this.ctx.lastComposerClearEscapeTime < DOUBLE_ESCAPE_WINDOW_MS) {
+					this.#clearComposer();
+					this.ctx.lastComposerClearEscapeTime = 0;
+				} else {
+					this.ctx.lastComposerClearEscapeTime = now;
+					this.ctx.showStatus("press Esc again to clear");
+				}
+				return;
+			}
 			if (!this.ctx.editor.getText().trim()) {
-				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
-				const action = settings.get("doubleEscapeAction");
-				if (action !== "none") {
-					const now = Date.now();
-					if (now - this.ctx.lastEscapeTime < 500) {
-						if (action === "tree") {
-							this.ctx.showTreeSelector();
-						} else {
-							this.ctx.showUserMessageSelector();
-						}
-						this.ctx.lastEscapeTime = 0;
-					} else {
-						this.ctx.lastEscapeTime = now;
-					}
+				this.ctx.lastComposerClearEscapeTime = 0;
+				const now = Date.now();
+				if (now - this.ctx.lastEscapeTime < DOUBLE_ESCAPE_WINDOW_MS) {
+					this.ctx.showUserMessageSelector();
+					this.ctx.lastEscapeTime = 0;
+				} else {
+					this.ctx.lastEscapeTime = now;
 				}
 			}
 		};
@@ -599,7 +598,7 @@ export class InputController {
 		if (now - this.ctx.lastSigintTime < 500) {
 			void this.ctx.shutdown();
 		} else {
-			this.ctx.clearEditor();
+			this.#clearComposer();
 			this.ctx.lastSigintTime = now;
 		}
 	}
