@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@gajae-code/tui";
 import { $env, sanitizeText } from "@gajae-code/utils";
+import type { AppKeybinding } from "../../config/keybindings";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
@@ -40,6 +41,7 @@ export class InputController {
 	constructor(private ctx: InteractiveModeContext) {}
 
 	#lastBackgroundFoldKeyTime = 0;
+	#slashCommands: SlashCommand[] = [];
 
 	/** Set after a first Esc silently consumes a queued steer. Kept until the
 	 *  queued steer is either cancelled by a second Esc or drained by continuation,
@@ -1290,6 +1292,7 @@ export class InputController {
 	}
 
 	createAutocompleteProvider(commands: SlashCommand[], basePath: string): AutocompleteProvider {
+		this.#slashCommands = commands;
 		return createPromptActionAutocompleteProvider({
 			commands,
 			basePath,
@@ -1344,11 +1347,17 @@ export class InputController {
 	}
 
 	openCommandPalette(): void {
-		if (this.ctx.editor.getText().trim().length > 0) {
-			this.ctx.showStatus("Command palette opens from an empty prompt. Type / for inline commands.");
-			return;
-		}
-		this.ctx.editor.handleInput("/");
+		this.ctx.showCommandPalette(
+			this.#slashCommands,
+			action => {
+				const key = this.ctx.keybindings.getKeys(action as AppKeybinding)[0];
+				if (key) this.ctx.editor.handleInput(key);
+			},
+			name => {
+				this.ctx.editor.setText(`/${name}`);
+				this.ctx.editor.handleInput("\n");
+			},
+		);
 	}
 
 	cycleThinkingLevel(): void {
