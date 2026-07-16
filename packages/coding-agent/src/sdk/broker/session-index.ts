@@ -77,7 +77,7 @@ export class SessionIndex {
 	async open(): Promise<this> {
 		await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
 		await fs.chmod(dirFor(this.#agentDir), 0o700);
-		await this.replay();
+		await withFileLock(logFor(this.#agentDir), () => this.replay());
 		return this;
 	}
 	async replay(): Promise<void> {

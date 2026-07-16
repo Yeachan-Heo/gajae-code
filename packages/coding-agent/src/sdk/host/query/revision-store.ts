@@ -359,14 +359,18 @@ export class RevisionStore {
 		revision.lastAccessed = this.now();
 		if (!revision.index?.items) return undefined;
 		const items: unknown[] = [];
+		let itemsBytes = 2; // []
 		for (const range of revision.index.items.slice(offset)) {
 			// The manifest records the canonical item length, so reject an oversized
 			// item before reading or parsing its complete range.
 			if (range.end - range.start > targetBytes) break;
 			const value = JSON.parse(await this.#readRange(revision, range));
-			if (Buffer.byteLength(JSON.stringify([...items, value])) > targetBytes && items.length) break;
-			if (Buffer.byteLength(JSON.stringify([...items, value])) > 1024 * 1024) break;
+			const itemBytes = Buffer.byteLength(JSON.stringify(value));
+			const candidateBytes = itemsBytes + itemBytes + (items.length ? 1 : 0);
+			if (candidateBytes > targetBytes && items.length) break;
+			if (candidateBytes > 1024 * 1024) break;
 			items.push(value);
+			itemsBytes = candidateBytes;
 		}
 		return { items, complete: offset + items.length >= revision.index.items.length };
 	}
@@ -527,12 +531,12 @@ export class RevisionStore {
 		const chunkLengths: number[] = [];
 		const hash = createHash("sha256");
 		let bytes = 0;
-		let buffer = "";
+		let buffer = Buffer.allocUnsafe(CHUNK_BYTES);
 		let bufferBytes = 0;
 		const flush = async () => {
-			if (buffer.length === 0) return;
-			const data = Buffer.from(buffer);
-			buffer = "";
+			if (bufferBytes === 0) return;
+			const data = buffer.subarray(0, bufferBytes);
+			buffer = Buffer.allocUnsafe(CHUNK_BYTES);
 			bufferBytes = 0;
 			const chunkHash = createHash("sha256").update(data).digest("hex");
 			const file = join(directory, "objects", chunkHash);
@@ -548,17 +552,15 @@ export class RevisionStore {
 					remaining = CHUNK_BYTES;
 				}
 				const end = utf8ChunkEnd(text, offset, remaining);
-
 				if (end === offset) {
 					await flush();
 					continue;
 				}
-				const part = text.slice(offset, end);
-				buffer += part;
-				hash.update(part);
-				const partBytes = Buffer.byteLength(part);
-				bytes += partBytes;
-				bufferBytes += partBytes;
+				const data = Buffer.from(text.slice(offset, end));
+				data.copy(buffer, bufferBytes);
+				hash.update(data);
+				bytes += data.length;
+				bufferBytes += data.length;
 				this.#peakBufferedBytes = Math.max(this.#peakBufferedBytes, bufferBytes);
 				offset = end;
 				if (bufferBytes === CHUNK_BYTES) await flush();
@@ -612,16 +614,12 @@ export class RevisionStore {
 	}
 
 	async #encode(value: unknown, append: (text: string) => Promise<void>, inArray: boolean): Promise<void> {
-		if (value === null) return append("null");
-		if (typeof value === "string") {
-			await this.#encodeString(value, append);
-			return;
+		if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+			const serialised = JSON.stringify(value);
+			return append(serialised ?? "null");
 		}
-		if (typeof value === "number") return append(Number.isFinite(value) ? String(value) : "null");
-		if (typeof value === "boolean") return append(value ? "true" : "false");
 		if (typeof value === "bigint") throw new TypeError("Do not know how to serialize a BigInt");
-		if (value === undefined || typeof value === "function" || typeof value === "symbol")
-			return append(inArray ? "null" : "null");
+		if (value === undefined || typeof value === "function" || typeof value === "symbol") return append("null");
 		if (typeof value === "object" && typeof (value as { toJSON?: unknown }).toJSON === "function")
 			return this.#encode((value as { toJSON: (key: string) => unknown }).toJSON(""), append, inArray);
 		if (Array.isArray(value)) {
@@ -653,6 +651,7 @@ export class RevisionStore {
 		append: (text: string) => Promise<void>,
 		indexEscapedString = false,
 	): Promise<EscapedStringIndex | undefined> {
+		if (!indexEscapedString) return append(JSON.stringify(value));
 		await append('"');
 		let output = "";
 		let serializedOffset = 1;
