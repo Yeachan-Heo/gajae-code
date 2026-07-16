@@ -1094,7 +1094,12 @@ export class CommandController {
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		this.ctx.bashComponent = new BashExecutionComponent(
+			command,
+			this.ctx.ui,
+			excludeFromContext,
+			this.ctx.expandHintCapability,
+		);
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.bashComponent);
@@ -1135,7 +1140,13 @@ export class CommandController {
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.pythonComponent = new EvalExecutionComponent(code, this.ctx.ui, excludeFromContext);
+		this.ctx.pythonComponent = new EvalExecutionComponent(
+			code,
+			this.ctx.ui,
+			excludeFromContext,
+			"python",
+			this.ctx.expandHintCapability,
+		);
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.pythonComponent);

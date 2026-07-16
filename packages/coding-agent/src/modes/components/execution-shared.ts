@@ -10,7 +10,7 @@
 import { type Component, Container, Loader, Spacer, Text, type TUI } from "@gajae-code/tui";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import { formatTruncationMetaNotice, type TruncationMeta } from "../../tools/output-meta";
-import { expandHintSuffix } from "../../tools/render-utils";
+import { type ExpandHintCapability, expandHintSuffix } from "../../tools/render-utils";
 import { DynamicBorder } from "./dynamic-border";
 import { truncateToVisualLines } from "./visual-truncate";
 
@@ -73,12 +73,18 @@ export function buildStatusFooter(opts: {
 	hiddenLineCount: number;
 	/** Suppress the "… N more lines" hint (used when sixel passthrough renders the full output). */
 	suppressHiddenCount?: boolean;
-}): Text | undefined {
+	expandHintCapability?: ExpandHintCapability;
+}): Component | undefined {
 	const parts: string[] = [];
 
-	if (opts.hiddenLineCount > 0 && !opts.suppressHiddenCount) {
-		parts.push(theme.fg("dim", `… ${opts.hiddenLineCount} more lines${expandHintSuffix(theme)}`));
-	}
+	const hiddenLine =
+		opts.hiddenLineCount > 0 && !opts.suppressHiddenCount
+			? () =>
+					theme.fg(
+						"dim",
+						`… ${opts.hiddenLineCount} more lines${expandHintSuffix(theme, opts.expandHintCapability)}`,
+					)
+			: undefined;
 	if (opts.status === "cancelled") {
 		parts.push(theme.fg("warning", "(cancelled)"));
 	} else if (opts.status === "error") {
@@ -88,8 +94,11 @@ export function buildStatusFooter(opts: {
 		parts.push(theme.fg("warning", formatTruncationMetaNotice(opts.truncation)));
 	}
 
-	if (parts.length === 0) return undefined;
-	return new Text(`\n${parts.join("\n")}`, 1, 0);
+	if (!hiddenLine && parts.length === 0) return undefined;
+	return {
+		render: width => new Text(`\n${[hiddenLine?.(), ...parts].filter(Boolean).join("\n")}`, 1, 0).render(width),
+		invalidate: () => {},
+	};
 }
 
 /**

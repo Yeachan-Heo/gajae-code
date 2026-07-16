@@ -740,6 +740,9 @@ export class TUI extends Container {
 			component.focused = true;
 		}
 	}
+	get focusedComponent(): Component | null {
+		return this.#focusedComponent;
+	}
 
 	setBottomPinnedComponent(component: Component | null): void {
 		this.#bottomPinnedComponent = component;

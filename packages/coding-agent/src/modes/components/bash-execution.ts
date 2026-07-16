@@ -17,6 +17,7 @@ import {
 import { sanitizeText } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
 import type { TruncationMeta } from "../../tools/output-meta";
+import type { ExpandHintCapability } from "../../tools/render-utils";
 import {
 	containsSixelSequence,
 	getSixelLineMask,
@@ -56,6 +57,7 @@ export class BashExecutionComponent extends Container {
 		private readonly command: string,
 		ui: TUI,
 		excludeFromContext = false,
+		private readonly expandHintCapability?: ExpandHintCapability,
 	) {
 		super();
 
@@ -217,6 +219,7 @@ export class BashExecutionComponent extends Container {
 				truncation: this.#truncation,
 				hiddenLineCount,
 				suppressHiddenCount: hasSixelOutput && !fallbackActive,
+				expandHintCapability: this.expandHintCapability,
 			});
 			if (footer) this.#contentContainer.addChild(footer);
 		}
