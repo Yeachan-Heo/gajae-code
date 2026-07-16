@@ -9,6 +9,7 @@ import {
 	markTabDeadForTest,
 	releaseTab,
 	releaseTabIfGcEligible,
+	runInTab,
 	setTabForTest,
 	type TabSession,
 } from "../../src/tools/browser/tab-supervisor";
@@ -81,6 +82,7 @@ interface InstallOpts {
 	refCount?: number;
 	recoveredFromDead?: boolean;
 	targetClose?: ReturnType<typeof vi.fn>;
+	ownerId?: string;
 }
 
 function installTab(opts: InstallOpts): {
@@ -105,6 +107,7 @@ function installTab(opts: InstallOpts): {
 		kindTag: opts.kindTag,
 		lastUsedAt: opts.lastUsedAt,
 		recoveredFromDead: opts.recoveredFromDead,
+		ownerId: opts.ownerId,
 	} as unknown as TabSession;
 	setTabForTest(tab);
 	return { close, terminate, handle };
@@ -197,6 +200,35 @@ describe("tab-supervisor GC primitives", () => {
 		expect(await releaseTabIfGcEligible("a", policy)).toBe(true);
 		expect(terminate).toHaveBeenCalledTimes(1);
 		expect(close).toHaveBeenCalledTimes(1);
+		expect(getTab("a")).toBeUndefined();
+	});
+
+	it("releases a dead tab when its recovery descriptor expires during consume", async () => {
+		const { close, handle, terminate } = installTab({
+			name: "a",
+			kindTag: "headless",
+			lastUsedAt: NOW - 5000,
+			ownerId: "session-1",
+		});
+		const nowValues = [NOW, NOW + DEAD_TAB_RECOVERY_TTL_MS - 1, NOW + DEAD_TAB_RECOVERY_TTL_MS + 1];
+		vi.spyOn(Date, "now").mockImplementation(() => nowValues.shift() ?? NOW + DEAD_TAB_RECOVERY_TTL_MS + 1);
+		markTabDeadForTest("a", "worker-closed");
+
+		await expect(
+			runInTab("a", {
+				code: "return 1",
+				timeoutMs: 10,
+				session: {
+					cwd: "/tmp",
+					getSessionId: () => "session-1",
+					settings: { get: () => undefined },
+				} as never,
+			}),
+		).rejects.toThrow('Tab "a" is not alive. Reopen it.');
+
+		expect(terminate).toHaveBeenCalled();
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(handle.refCount).toBe(0);
 		expect(getTab("a")).toBeUndefined();
 	});
 

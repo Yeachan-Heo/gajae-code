@@ -393,7 +393,10 @@ async function recoverDeadTabSessionOnce(
 		return undefined;
 	}
 	const consumed = deadTabRecovery.consume(descriptor.token, ownerId);
-	if (!consumed) return undefined;
+	if (!consumed) {
+		await releaseDeadTabIfCurrent(name, tab);
+		return undefined;
+	}
 	const targetId = await resolveRecoveryTargetId(consumed);
 	if (!targetId) {
 		await releaseDeadTabIfCurrent(name, tab);
