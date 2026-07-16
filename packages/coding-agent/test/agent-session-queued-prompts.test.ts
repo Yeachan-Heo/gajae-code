@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel, type TextContent } from "@gajae-code/ai";
+import { getBundledModel, type ImageContent, type TextContent } from "@gajae-code/ai";
 import { createMockModel, type MockHandler } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -228,6 +228,40 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		await session.waitForIdle();
 
 		expect(userTexts(session)).toEqual(["p1", "steer me", "queue newest"]);
+	});
+
+	it("preserves image attachments when removing a queued prompt for editing", async () => {
+		const gate = Promise.withResolvers<void>();
+		session = buildSession([
+			async () => {
+				await gate.promise;
+				return { content: ["turn 1"] };
+			},
+			{ content: ["after queue"] },
+		]);
+
+		const first = session.prompt("p1");
+		await waitUntil(() => session!.isStreaming);
+		const image: ImageContent = {
+			type: "image",
+			data: "aW1hZ2U=",
+			mimeType: "image/png",
+		};
+		await session.prompt("inspect [image 1]", {
+			streamingBehavior: "followUp",
+			images: [image],
+		});
+
+		const entry = session.getQueuedMessageEntries()[0];
+		const removed = session.removeQueuedMessagePayloadForEditing(entry?.id ?? "");
+
+		expect(removed).toEqual({ text: "inspect [image 1]", images: [image] });
+		expect(session.getQueuedMessages().followUp).toEqual([]);
+
+		gate.resolve();
+		await first;
+		await session.waitForIdle();
+		expect(userTexts(session)).toEqual(["p1"]);
 	});
 
 	it("reorders queued follow-up prompts selected for editing", async () => {

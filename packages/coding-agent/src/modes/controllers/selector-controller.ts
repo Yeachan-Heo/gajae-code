@@ -2002,14 +2002,14 @@ export class SelectorController {
 		});
 	}
 
-	#clearTransientSessionUi(): void {
+	#clearTransientSessionUi(options?: { preserveCompactionQueue?: boolean }): void {
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
 		}
 		this.ctx.statusContainer.clear();
 		this.ctx.pendingMessagesContainer.clear();
-		this.ctx.compactionQueuedMessages = [];
+		if (!options?.preserveCompactionQueue) this.ctx.compactionQueuedMessages = [];
 		this.ctx.streamingComponent = undefined;
 		this.ctx.streamingMessage = undefined;
 		this.ctx.pendingTools.clear();
@@ -2022,6 +2022,41 @@ export class SelectorController {
 			titleSource?: "auto" | "user" | undefined;
 		};
 		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
+	}
+	#mergeCompactionQueueWithEditorDraft(): string {
+		const queuedText = this.ctx.compactionQueuedMessages
+			.map(message => message.text)
+			.filter(text => text.length > 0)
+			.join("\n\n");
+		const editorText = this.ctx.editor.getText();
+		return queuedText && editorText ? `${queuedText}\n\n${editorText}` : queuedText || editorText;
+	}
+
+	async #stageCompactionQueueDraft(): Promise<{ staged: boolean; previousDraft: string | null } | undefined> {
+		if (this.ctx.compactionQueuedMessages.length === 0) {
+			return { staged: false, previousDraft: null };
+		}
+		try {
+			const previousDraft = await this.ctx.sessionManager.readDraft();
+			await this.ctx.sessionManager.saveDraft(this.#mergeCompactionQueueWithEditorDraft());
+			return { staged: true, previousDraft };
+		} catch (error) {
+			this.ctx.showError(`Failed to save queued draft: ${error instanceof Error ? error.message : String(error)}`);
+			return undefined;
+		}
+	}
+
+	async #restoreStagedDraft(stage: { staged: boolean; previousDraft: string | null }): Promise<boolean> {
+		if (!stage.staged) return true;
+		try {
+			await this.ctx.sessionManager.saveDraft(stage.previousDraft ?? "");
+			return true;
+		} catch (error) {
+			this.ctx.showError(
+				`Failed to restore queued draft: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return false;
+		}
 	}
 
 	async #deleteSession(sessionPath: string): Promise<void> {
@@ -2039,8 +2074,17 @@ export class SelectorController {
 			return true;
 		}
 
-		const detached = await this.ctx.session.newSession();
+		const stagedDraft = await this.#stageCompactionQueueDraft();
+		if (!stagedDraft) return false;
+		let detached: boolean;
+		try {
+			detached = await this.ctx.session.newSession();
+		} catch (error) {
+			await this.#restoreStagedDraft(stagedDraft);
+			throw error;
+		}
 		if (!detached) {
+			await this.#restoreStagedDraft(stagedDraft);
 			return false;
 		}
 		this.ctx.resetIrcSidebarSession();
@@ -2060,14 +2104,25 @@ export class SelectorController {
 
 	async handleResumeSession(sessionPath: string): Promise<void> {
 		const previousSessionId = this.ctx.sessionManager.getSessionId();
-		this.#clearTransientSessionUi();
+		const stagedDraft = await this.#stageCompactionQueueDraft();
+		if (!stagedDraft) return;
 		const migrationPolicy =
 			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
-		const writableSessionPath = await SessionManager.prepareManagedCandidateForWrite(sessionPath, migrationPolicy);
-
-		// Switch session via AgentSession (emits hook and tool session events)
-		if (!(await this.ctx.session.switchSession(writableSessionPath))) return;
+		let switched: boolean;
+		try {
+			const writableSessionPath = await SessionManager.prepareManagedCandidateForWrite(sessionPath, migrationPolicy);
+			switched = await this.ctx.session.switchSession(writableSessionPath);
+		} catch (error) {
+			await this.#restoreStagedDraft(stagedDraft);
+			throw error;
+		}
+		if (!switched) {
+			await this.#restoreStagedDraft(stagedDraft);
+			return;
+		}
 		const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
+		if (!switchingToDifferentSession && !(await this.#restoreStagedDraft(stagedDraft))) return;
+		this.#clearTransientSessionUi({ preserveCompactionQueue: !switchingToDifferentSession });
 		if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
 		this.#refreshSessionTerminalTitle();
 		this.ctx.updateEditorBorderColor();

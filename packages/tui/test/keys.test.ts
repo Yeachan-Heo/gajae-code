@@ -80,6 +80,12 @@ describe("matchesKey", () => {
 		expect(matchesKey("\x1b[13;9u", "enter")).toBe(false);
 		setKittyProtocolActive(false);
 	});
+	it("rejects unsupported modifiers and malformed key ordering", () => {
+		setKittyProtocolActive(true);
+		expect(matchesKey("\r", "meta+enter")).toBe(false);
+		expect(matchesKey("\x1b[13;5u", "enter+ctrl")).toBe(false);
+		setKittyProtocolActive(false);
+	});
 
 	it("preserves keypad navigation matches when NumLock is on but modifiers are held", () => {
 		setKittyProtocolActive(true);

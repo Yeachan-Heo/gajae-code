@@ -67,6 +67,7 @@ async function createContext(options?: {
 	const handleBashCommand = vi.fn(async () => {});
 	const handlePythonCommand = vi.fn(async () => {});
 	const showStatus = vi.fn();
+	const showError = vi.fn();
 	const onInputCallback = vi.fn();
 	const toggleIrcSidebar = vi.fn();
 	const startPendingSubmission = vi.fn(
@@ -130,6 +131,21 @@ async function createContext(options?: {
 		sessionQueuedMessages.length = 0;
 		return { steering: [], followUp };
 	});
+	const popLastQueuedMessagePayload = vi.fn(() => {
+		const text = popLastQueuedMessage();
+		return text === undefined ? undefined : { text, images: [] };
+	});
+	const removeQueuedMessagePayloadForEditing = vi.fn((id: string) => {
+		const text = removeQueuedMessageForEditing(id);
+		return text === undefined ? undefined : { text, images: [] };
+	});
+	const clearQueuedMessagePayloads = vi.fn(() => {
+		const { steering, followUp } = clearQueue();
+		return {
+			steering: steering.map(text => ({ text, images: [] })),
+			followUp: followUp.map(text => ({ text, images: [] })),
+		};
+	});
 	const editor: FakeEditor = {
 		setText(text: string) {
 			editorText = text;
@@ -179,6 +195,9 @@ async function createContext(options?: {
 			getQueuedMessageEntries,
 			removeQueuedMessageForEditing,
 			moveQueuedMessageForEditing,
+			popLastQueuedMessagePayload,
+			clearQueuedMessagePayloads,
+			removeQueuedMessagePayloadForEditing,
 		} as unknown as InteractiveModeContext["session"],
 		keybindings: {
 			getKeys(action: string) {
@@ -253,6 +272,7 @@ async function createContext(options?: {
 		handleBashCommand,
 		handlePythonCommand,
 		showWarning: vi.fn(),
+		showError,
 		showStatus,
 		hasActiveBtw: vi.fn(() => false),
 	} as unknown as InteractiveModeContext;
@@ -271,6 +291,7 @@ async function createContext(options?: {
 			handleBashCommand,
 			handlePythonCommand,
 			showStatus,
+			showError,
 			queueCompactionMessage,
 			popLastQueuedMessage,
 			clearQueue,
@@ -417,6 +438,73 @@ describe("InputController keybinding setup", () => {
 			images: undefined,
 			followUpQueuePolicy: "sequential",
 		});
+	});
+
+	it("claims the draft before rapid repeated explicit queue submissions", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		(ctx.session as unknown as { isStreaming: boolean }).isStreaming = true;
+		editor.setText("queue exactly once");
+		new InputController(ctx).setupKeyHandlers();
+
+		editor.onQueue?.();
+		editor.onQueue?.();
+		await Bun.sleep(0);
+
+		expect(spies.prompt).toHaveBeenCalledTimes(1);
+		expect(spies.prompt).toHaveBeenCalledWith("queue exactly once", {
+			streamingBehavior: "followUp",
+			images: undefined,
+			followUpQueuePolicy: "sequential",
+		});
+	});
+
+	it("runs explicit queue through extension transforms", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const emitInput = vi.fn(async () => ({ text: "transformed queue" }));
+		(
+			ctx.session as unknown as {
+				isStreaming: boolean;
+				extensionRunner: { hasHandlers(name: string): boolean; emitInput: typeof emitInput };
+			}
+		).isStreaming = true;
+		(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = {
+			hasHandlers: (name: string) => name === "input",
+			emitInput,
+			getShortcuts: () => new Map(),
+		};
+		editor.setText("original queue");
+		new InputController(ctx).setupKeyHandlers();
+
+		await editor.onQueue?.();
+		await Bun.sleep(0);
+
+		expect(emitInput).toHaveBeenCalledWith("original queue", undefined, "interactive");
+		expect(spies.prompt).toHaveBeenCalledWith("transformed queue", {
+			streamingBehavior: "followUp",
+			images: undefined,
+			followUpQueuePolicy: "sequential",
+		});
+	});
+
+	it.each([
+		["! echo queued", "echo queued", "bash"],
+		["$ print('queued')", "print('queued')", "python"],
+	] as const)("keeps %s on its local command boundary for explicit queue", async (draft, command, kind) => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		(ctx.session as unknown as { isStreaming: boolean }).isStreaming = true;
+		editor.setText(draft);
+		new InputController(ctx).setupKeyHandlers();
+
+		await editor.onQueue?.();
+
+		if (kind === "bash") {
+			expect(spies.handleBashCommand).toHaveBeenCalledWith(command, false);
+			expect(spies.handlePythonCommand).not.toHaveBeenCalled();
+		} else {
+			expect(spies.handlePythonCommand).toHaveBeenCalledWith(command, false);
+			expect(spies.handleBashCommand).not.toHaveBeenCalled();
+		}
+		expect(spies.prompt).not.toHaveBeenCalled();
 	});
 
 	it("queues direct free text while streaming when busyPromptMode is queue", async () => {
@@ -577,7 +665,11 @@ describe("InputController keybinding setup", () => {
 		await editor.onQueue?.();
 		await Bun.sleep(0);
 
-		expect(spies.queueCompactionMessage).toHaveBeenCalledWith("queue while compacting via shortcut", "followUp");
+		expect(spies.queueCompactionMessage).toHaveBeenCalledWith(
+			"queue while compacting via shortcut",
+			"followUp",
+			expect.objectContaining({ ownsComposer: true, editor }),
+		);
 		expect(spies.prompt).not.toHaveBeenCalled();
 		expect(editor.getText()).toBe("");
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
@@ -591,7 +683,7 @@ describe("InputController keybinding setup", () => {
 
 		controller.handleDequeue();
 
-		expect(editor.getText()).toBe("single compaction queue");
+		expect(editor.getText()).toBe("single compaction queue\n\ncurrent draft");
 		expect(queues.compactionQueuedMessages).toEqual([]);
 		expect(spies.popLastQueuedMessage).not.toHaveBeenCalled();
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
@@ -605,11 +697,31 @@ describe("InputController keybinding setup", () => {
 
 		controller.handleDequeue();
 
-		expect(editor.getText()).toBe("single session queue");
+		expect(editor.getText()).toBe("single session queue\n\ncurrent draft");
 		expect(queues.sessionQueuedMessages).toEqual([]);
 		expect(spies.clearQueue).not.toHaveBeenCalled();
 		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("followUp:0");
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("restores queued image payloads and rebases the current draft placeholders", async () => {
+		const { InputController, ctx, editor, queues } = await createContext();
+		const queuedImage = { type: "image" as const, data: "queued", mimeType: "image/png" };
+		const currentImage = { type: "image" as const, data: "current", mimeType: "image/png" };
+		queues.sessionQueuedMessages.push("queued [image 1]");
+		(
+			ctx.session as unknown as { removeQueuedMessagePayloadForEditing(id: string): unknown }
+		).removeQueuedMessagePayloadForEditing = () => ({
+			text: "queued [image 1]",
+			images: [queuedImage],
+		});
+		ctx.pendingImages = [currentImage];
+		editor.setText("current [image 1]");
+
+		new InputController(ctx).handleDequeue();
+
+		expect(editor.getText()).toBe("queued [image 1]\n\ncurrent [image 2]");
+		expect(ctx.pendingImages).toEqual([queuedImage, currentImage]);
 	});
 
 	it("opens a selector so older queued messages can be restored", async () => {
@@ -628,7 +740,7 @@ describe("InputController keybinding setup", () => {
 		selector.getSelectList().setSelectedIndex(0);
 		selector.getSelectList().handleInput("\n");
 
-		expect(editor.getText()).toBe("older session queue");
+		expect(editor.getText()).toBe("older session queue\n\ncurrent draft");
 		expect(queues.sessionQueuedMessages).toEqual(["newest session queue"]);
 		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("followUp:0");
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
@@ -688,7 +800,7 @@ describe("InputController keybinding setup", () => {
 		}
 		selector.getSelectList().handleInput("\n");
 
-		expect(editor.getText()).toBe("newer steer");
+		expect(editor.getText()).toBe("newer steer\n\ncurrent draft");
 		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("steer:2");
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
@@ -949,33 +1061,55 @@ describe("InputController keybinding setup", () => {
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 
-	it("marks idle follow-up submissions as local", async () => {
+	it("routes idle explicit queue through the canonical idle submission pipeline", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
-		// Default fake session is idle.
 		editor.setText("plain idle submit");
 		const controller = new InputController(ctx);
 
 		await controller.handleFollowUp();
 
-		expect(ctx.locallySubmittedUserSignatures.has("plain idle submit\u00000")).toBe(true);
-		// Idle submit calls prompt() with no streamingBehavior.
-		expect(spies.prompt).toHaveBeenCalledWith("plain idle submit");
+		expect(spies.onInputCallback).toHaveBeenCalledWith(
+			expect.objectContaining({ text: "plain idle submit", cancelled: false }),
+		);
+		expect(spies.prompt).not.toHaveBeenCalled();
 	});
 
-	it("removes the signature when an idle follow-up submission rejects", async () => {
+	it("restores a plain Enter draft when prompt delivery rejects", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
-		spies.prompt.mockImplementationOnce(async () => {
-			throw new Error("boom");
-		});
-		editor.setText("doomed submit");
+		const delivery = Promise.withResolvers<void>();
+		spies.prompt.mockImplementationOnce(async () => delivery.promise);
+		const oldImage = { type: "image" as const, data: "old", mimeType: "image/png" };
+		const newImage = { type: "image" as const, data: "new", mimeType: "image/png" };
+		ctx.pendingImages = [oldImage];
+		(ctx.session as unknown as { isStreaming: boolean }).isStreaming = true;
 		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
 
-		await expect(controller.handleFollowUp()).rejects.toThrow("boom");
+		const submit = editor.onSubmit?.("doomed submit [image 1]");
+		editor.setText("new draft [image 1]");
+		ctx.pendingImages = [newImage];
+		delivery.reject(new Error("boom"));
+		await submit;
 
-		// Contract: a thrown delivery error must not leave a stale signature
-		// behind, otherwise the next attempt with the same text would silently
-		// suppress the editor-clear protection that was meant for the failed call.
-		expect(ctx.locallySubmittedUserSignatures.has("doomed submit\u00000")).toBe(false);
+		expect(editor.getText()).toBe("new draft [image 1]\ndoomed submit [image 2]");
+		expect(ctx.pendingImages).toEqual([newImage, oldImage]);
+		expect(spies.showError).toHaveBeenCalledWith("Failed to submit input: boom");
+		expect(ctx.locallySubmittedUserSignatures.has("doomed submit [image 1]\u00001")).toBe(false);
+	});
+
+	it("rolls back an image draft without duplicating its claimed attachment", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const image = { type: "image" as const, data: "old", mimeType: "image/png" };
+		ctx.pendingImages = [image];
+		(ctx.session as unknown as { isStreaming: boolean }).isStreaming = true;
+		spies.prompt.mockRejectedValueOnce(new Error("boom"));
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("doomed [image 1]");
+
+		expect(editor.getText()).toBe("doomed [image 1]");
+		expect(ctx.pendingImages).toEqual([image]);
 	});
 
 	it("removes the signature when a streaming follow-up rejects", async () => {
@@ -988,7 +1122,7 @@ describe("InputController keybinding setup", () => {
 		editor.setText("queued during stream");
 		const controller = new InputController(ctx);
 
-		await expect(controller.handleFollowUp()).rejects.toThrow("queue full");
+		await controller.handleFollowUp();
 
 		expect(ctx.locallySubmittedUserSignatures.has("queued during stream\u00000")).toBe(false);
 	});

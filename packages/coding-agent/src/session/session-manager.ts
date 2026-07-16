@@ -4738,6 +4738,17 @@ export class SessionManager {
 		await this.storage.writeText(draftPath, text);
 	}
 
+	/** Read the saved draft without consuming it. */
+	async readDraft(): Promise<string | null> {
+		const draftPath = this.#getDraftPath();
+		if (!draftPath) return null;
+		try {
+			return await this.storage.readText(draftPath);
+		} catch (err) {
+			if (isEnoent(err)) return null;
+			throw err;
+		}
+	}
 	/**
 	 * Read and remove the saved draft. Returns the previously-saved text, or
 	 * null when no draft is pending. Single-shot: a successful read removes the

@@ -26,8 +26,8 @@ describe("docs/keybindings.md current-surface audit", () => {
 		expect(defaultMessageQueueKeysForPlatform("win32")).toBe("alt+q");
 		expect(defaultMessageQueueKeysForPlatform("linux")).toBe("alt+enter");
 		expect(defaultOppositeBusyModeKeysForPlatform("darwin")).toEqual(["super+enter"]);
-		expect(defaultOppositeBusyModeKeysForPlatform("win32")).toEqual([]);
-		expect(defaultOppositeBusyModeKeysForPlatform("linux")).toEqual([]);
+		expect(defaultOppositeBusyModeKeysForPlatform("win32")).toEqual(["super+enter"]);
+		expect(defaultOppositeBusyModeKeysForPlatform("linux")).toEqual(["super+enter"]);
 		expect(KEYBINDINGS["app.message.oppositeBusyMode"].description).toBe(
 			"Submit once using the opposite busy prompt mode",
 		);
@@ -43,7 +43,7 @@ describe("docs/keybindings.md current-surface audit", () => {
 			"| `app.message.followUp` | _(none)_ | `Ctrl+Enter` remains editor newline unless the user explicitly remaps this action; while idle the chord still falls through to newline |",
 		);
 		expect(doc).toContain(
-			"| `app.message.oppositeBusyMode` | `Command+Enter` (macOS) | Submit one message using the opposite of `busyPromptMode` |",
+			"| `app.message.oppositeBusyMode` | `Super+Enter` | Submit one message using the opposite of `busyPromptMode` |",
 		);
 		expect(doc).toContain(
 			"configured `steer` queues that message, while configured `queue` steers it into the active turn.",

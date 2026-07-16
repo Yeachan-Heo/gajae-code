@@ -98,6 +98,7 @@ function createStubInputControllerContext(opts: {
 		addToHistory: vi.fn(),
 	};
 	const enqueueCustomMessageDisplay = vi.fn((_text: string, _mode: "steer" | "followUp") => "sk-test-0");
+	const removeQueuedCustomMessageByDisplayTag = vi.fn();
 	// Annotate parameters so `mock.calls[N]` is typed as a tuple (not `[]`) and
 	// `message` carries required skill prompt details for assertion below.
 	const promptCustomMessage = vi.fn(
@@ -123,6 +124,7 @@ function createStubInputControllerContext(opts: {
 			isEvalRunning: false,
 			extensionRunner: undefined,
 			enqueueCustomMessageDisplay,
+			removeQueuedCustomMessageByDisplayTag,
 			sendCustomMessage,
 			promptCustomMessage,
 			prompt,
@@ -152,6 +154,7 @@ function createStubInputControllerContext(opts: {
 		editor,
 		enqueueCustomMessageDisplay,
 		promptCustomMessage,
+		removeQueuedCustomMessageByDisplayTag,
 		sendCustomMessage,
 		prompt,
 		queueCompactionMessage,
@@ -234,6 +237,25 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		}
 		const messageArg = firstCall[0];
 		expect(messageArg.details.__pendingDisplayTag).toBe("sk-test-0");
+	});
+
+	it("removes the exact pending display tag when skill dispatch fails", async () => {
+		const { ctx, editor, promptCustomMessage, removeQueuedCustomMessageByDisplayTag } =
+			createStubInputControllerContext({
+				skillCommands,
+				isStreaming: true,
+				busyPromptMode: "steer",
+			});
+		promptCustomMessage.mockRejectedValueOnce(new Error("dispatch failed"));
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("/skill:test-skill failure");
+
+		await controller.handleFollowUp();
+
+		expect(removeQueuedCustomMessageByDisplayTag).toHaveBeenCalledWith("sk-test-0");
+		expect(ctx.updatePendingMessagesDisplay).toHaveBeenCalled();
+		expect(ctx.ui.requestRender).toHaveBeenCalled();
 	});
 
 	it("E3b: embedded default skill command does not require .gjc on disk", async () => {
@@ -346,6 +368,31 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("Do the second thing.");
 		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("User: beta gamma");
 	});
+
+	it("restores only the undispatched suffix when a chained skill dispatch fails", async () => {
+		const secondSkillPath = writeSkillFile(tempDir.path(), "second-skill", "Do the second thing.");
+		skillCommands.set("skill:second-skill", {
+			name: "second-skill",
+			description: "Second skill",
+			filePath: secondSkillPath,
+			baseDir: tempDir.path(),
+			source: "test",
+		});
+		const { ctx, editor, sendCustomMessage, promptCustomMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+		promptCustomMessage.mockRejectedValueOnce(new Error("second dispatch failed"));
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		const submit = editor.onSubmit?.("/skill:test-skill alpha /skill:second-skill beta");
+		editor.setText("");
+		await submit;
+
+		expect(sendCustomMessage).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("/skill:second-skill beta");
+	});
 });
 
 describe("InputController busyPromptMode + skill commands (issue #434)", () => {
@@ -404,7 +451,11 @@ describe("InputController busyPromptMode + skill commands (issue #434)", () => {
 
 		await editor.onSubmit?.("/skill:test-skill compact");
 
-		expect(queueCompactionMessage).toHaveBeenCalledWith("/skill:test-skill compact", "steer");
+		expect(queueCompactionMessage).toHaveBeenCalledWith(
+			"/skill:test-skill compact",
+			"followUp",
+			expect.objectContaining({ ownsComposer: true, editor }),
+		);
 		expect(enqueueCustomMessageDisplay).not.toHaveBeenCalled();
 		expect(promptCustomMessage).not.toHaveBeenCalled();
 	});

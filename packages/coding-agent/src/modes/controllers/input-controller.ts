@@ -7,7 +7,11 @@ import { type AppKeybinding, KEYBINDINGS } from "../../config/keybindings";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { normalizeBusyPromptMode } from "../../config/settings-schema";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
-import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
+import {
+	type BuiltSkillPromptMessage,
+	buildSkillPromptMessage,
+	parseSkillInvocations,
+} from "../../extensibility/skills";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import { theme } from "../../modes/theme/theme";
@@ -17,7 +21,7 @@ import {
 	canApplyComposerSubmission,
 	type InteractiveModeContext,
 } from "../../modes/types";
-import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
+import type { AgentSessionEvent, QueuedMessageEditEntry, QueuedMessagePayload } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
@@ -49,6 +53,14 @@ export class InputController {
 
 	#lastBackgroundFoldKeyTime = 0;
 	#slashCommands: SlashCommand[] = [];
+	#claimedSubmission:
+		| {
+				text: string;
+				images: InteractiveModeContext["pendingImages"];
+				streamingBehavior: "steer" | "followUp";
+		  }
+		| undefined;
+	#submittedImageOwners = new Set<InteractiveModeContext["pendingImages"]>();
 
 	/** Set after a first Esc silently consumes a queued steer. Kept until the
 	 *  queued steer is either cancelled by a second Esc or drained by continuation,
@@ -552,8 +564,39 @@ export class InputController {
 	}
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
+		const claimedSubmission = this.#claimedSubmission;
+		const pendingImages = claimedSubmission?.images ?? this.ctx.pendingImages;
+		this.#submittedImageOwners.add(pendingImages);
+		return this.#submitEditorInput(text, pendingImages, composer)
+			.catch(error => {
+				this.#restoreClaimedSubmission(
+					claimedSubmission ?? {
+						text,
+						images: pendingImages,
+						streamingBehavior: this.#busyStreamingBehavior(),
+					},
+					composer,
+				);
+				this.ctx.showError(`Failed to submit input: ${error instanceof Error ? error.message : String(error)}`);
+			})
+			.finally(() => {
+				this.#submittedImageOwners.delete(pendingImages);
+			});
+	}
+
+	async #submitEditorInput(
+		text: string,
+		submittedImages: InteractiveModeContext["pendingImages"],
+		composer: ComposerSubmissionOptions,
+	): Promise<void> {
+		const claimedSubmission = this.#claimedSubmission;
+		this.#claimedSubmission = undefined;
+		const wasClaimed = claimedSubmission !== undefined;
+		const streamingBehavior = claimedSubmission?.streamingBehavior ?? this.#busyStreamingBehavior();
+		const submittedText = text;
 		text = text.trim();
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
+		const pendingImages = claimedSubmission?.images ?? submittedImages;
 
 		// Empty submit while streaming with queued messages: flush queues immediately
 		if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
@@ -567,21 +610,19 @@ export class InputController {
 		// Continue shortcuts: "." or "c" sends empty message (agent continues, no visible message)
 		if (text === "." || text === "c") {
 			if (this.ctx.onInputCallback) {
-				this.ctx.editor.setText("");
-				this.ctx.pendingImages = [];
+				this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
 				this.ctx.onInputCallback({ text: "", cancelled: false, started: true });
 			}
 			return;
 		}
 
 		const runner = this.ctx.session.extensionRunner;
-		const pendingImages = this.ctx.pendingImages;
-		let inputImages = this.#visiblePendingImagesForText(text);
+		let inputImages = this.#visiblePendingImagesForText(text, pendingImages);
 
 		if (runner?.hasHandlers("input")) {
 			const result = await runner.emitInput(text, inputImages, "interactive");
 			if (result?.handled) {
-				if (this.#canModifyComposer(composer)) {
+				if (this.#canModifyComposer(composer) && this.ctx.editor.getText() === submittedText) {
 					this.ctx.editor.setText("");
 				}
 				this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
@@ -611,15 +652,6 @@ export class InputController {
 			text = slashResult;
 		}
 
-		// Handle skill commands (/skill:name [args]). While streaming, Enter
-		// honors `busyPromptMode`: "steer" interrupts the active turn, "queue"
-		// runs after it completes (matches the free-text Enter semantics applied
-		// a few lines below at the streaming branch). Explicit queue shortcuts
-		// route through `handleFollowUp` and dispatch as `followUp`.
-		if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior(), composer)) {
-			return;
-		}
-
 		// Handle bash command (! for normal, !! for excluded from context)
 		if (text.startsWith("!")) {
 			const isExcluded = text.startsWith("!!");
@@ -627,9 +659,10 @@ export class InputController {
 			if (command) {
 				if (this.ctx.session.isBashRunning) {
 					this.ctx.showWarning("A bash command is already running. Press Esc to cancel it first.");
-					if (this.#canModifyComposer(composer)) {
-						this.ctx.editor.setText(text);
-					}
+					this.#restoreClaimedSubmission(
+						{ text: submittedText, images: pendingImages, streamingBehavior },
+						composer,
+					);
 					return;
 				}
 				if (this.#canModifyComposer(composer)) {
@@ -650,9 +683,10 @@ export class InputController {
 			if (code) {
 				if (this.ctx.session.isEvalRunning) {
 					this.ctx.showWarning("A Python execution is already running. Press Esc to cancel it first.");
-					if (this.#canModifyComposer(composer)) {
-						this.ctx.editor.setText(text);
-					}
+					this.#restoreClaimedSubmission(
+						{ text: submittedText, images: pendingImages, streamingBehavior },
+						composer,
+					);
 					return;
 				}
 				if (this.#canModifyComposer(composer)) {
@@ -664,14 +698,49 @@ export class InputController {
 				return;
 			}
 		}
+		// Keep skill invocations queued during compaction so they retain their
+		// custom-message dispatch path when the compaction queue flushes.
+		if (
+			this.ctx.session.isCompacting &&
+			parseSkillInvocations(text, this.ctx.skillCommands ?? new Map()).length > 0
+		) {
+			if ((inputImages?.length ?? 0) > 0) {
+				this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
+				this.#restoreClaimedSubmission({ text: submittedText, images: pendingImages, streamingBehavior }, composer);
+				return;
+			}
+			const successorText =
+				this.#canModifyComposer(composer) && this.ctx.editor.getText() !== submittedText
+					? this.ctx.editor.getText()
+					: undefined;
+			this.ctx.queueCompactionMessage(text, streamingBehavior, composer);
+			if (successorText) this.ctx.editor.setText(successorText);
+			return;
+		}
+
+		// Handle skill commands (/skill:name [args]). While streaming, Enter
+		// honors `busyPromptMode`: "steer" interrupts the active turn, "queue"
+		// runs after it completes. Explicit queue shortcuts route through
+		// `handleFollowUp` and dispatch as `followUp`.
+		if (
+			await this.#invokeSkillCommand(text, streamingBehavior, composer, this.ctx.editor.getText() !== submittedText)
+		) {
+			return;
+		}
 
 		// Queue input during compaction
 		if (this.ctx.session.isCompacting) {
 			if ((inputImages?.length ?? 0) > 0) {
 				this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
+				this.#restoreClaimedSubmission({ text: submittedText, images: pendingImages, streamingBehavior }, composer);
 				return;
 			}
-			this.ctx.queueCompactionMessage(text, "steer", composer);
+			const successorText =
+				this.#canModifyComposer(composer) && this.ctx.editor.getText() !== submittedText
+					? this.ctx.editor.getText()
+					: undefined;
+			this.ctx.queueCompactionMessage(text, streamingBehavior, composer);
+			if (successorText) this.ctx.editor.setText(successorText);
 			return;
 		}
 
@@ -682,7 +751,7 @@ export class InputController {
 		if (this.ctx.session.isStreaming) {
 			if (this.#canModifyComposer(composer)) {
 				this.ctx.editor.addToHistory(text);
-				this.ctx.editor.setText("");
+				if (this.ctx.editor.getText() === submittedText) this.ctx.editor.setText("");
 			}
 			const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 			this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
@@ -690,7 +759,7 @@ export class InputController {
 			// (a user-role `message_start` event) leaves any draft the user has
 			// typed since queuing intact. Same protection as #783, applied to
 			// the streaming/queue path.
-			const streamingBehavior = this.#busyStreamingBehavior();
+
 			const promptOptions =
 				streamingBehavior === "followUp"
 					? { streamingBehavior, images, followUpQueuePolicy: "sequential" as const }
@@ -740,7 +809,14 @@ export class InputController {
 			this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
 
 			// Render user message immediately, then let session events catch up
+			const preserveSuccessor = this.#canModifyComposer(composer) && this.ctx.editor.getText() !== submittedText;
+			const successorText = preserveSuccessor ? this.ctx.editor.getText() : undefined;
+			const successorImages = preserveSuccessor ? this.ctx.pendingImages : undefined;
 			const submission = this.ctx.startPendingSubmission({ text, images }, composer);
+			if (successorText || successorImages?.length) {
+				this.ctx.editor.setText(successorText ?? "");
+				this.ctx.pendingImages = successorImages ?? [];
+			}
 
 			this.ctx.onInputCallback(submission);
 		}
@@ -892,15 +968,15 @@ export class InputController {
 		this.ctx.ui.requestRender();
 	}
 
-	#removeQueuedMessageForEditing(id: string): string | undefined {
+	#removeQueuedMessageForEditing(id: string): QueuedMessagePayload | undefined {
 		const compactionPrefix = "compaction:";
 		if (id.startsWith(compactionPrefix)) {
 			const index = Number(id.slice(compactionPrefix.length));
 			if (!Number.isInteger(index)) return undefined;
 			const [entry] = this.ctx.compactionQueuedMessages.splice(index, 1);
-			return entry?.text;
+			return entry ? { text: entry.text, images: [] } : undefined;
 		}
-		return this.ctx.session.removeQueuedMessageForEditing(id);
+		return this.ctx.session.removeQueuedMessagePayloadForEditing(id);
 	}
 	#parseCompactionQueuedMessageId(id: string): number | undefined {
 		const compactionPrefix = "compaction:";
@@ -935,11 +1011,33 @@ export class InputController {
 	}
 
 	#deleteQueuedMessage(entry: QueuedMessageEditEntry): boolean {
-		const queuedText = this.#removeQueuedMessageForEditing(entry.id);
+		const queued = this.#removeQueuedMessageForEditing(entry.id);
 		this.ctx.updatePendingMessagesDisplay();
-		if (!queuedText) return false;
-		this.ctx.locallySubmittedUserSignatures.delete(`${queuedText}\u00000`);
+		if (!queued) return false;
+		this.ctx.locallySubmittedUserSignatures.delete(`${queued.text}\u0000${queued.images.length}`);
 		return true;
+	}
+
+	#shiftImagePlaceholders(text: string, offset: number): string {
+		if (offset === 0) return text;
+		return text.replace(IMAGE_PLACEHOLDER_PATTERN, (placeholder, imageNumberText: string) => {
+			const imageNumber = Number.parseInt(imageNumberText, 10);
+			return Number.isInteger(imageNumber) ? `[image ${imageNumber + offset}]` : placeholder;
+		});
+	}
+
+	#restoreQueuedPayloadsToEditor(payloads: QueuedMessagePayload[], currentText: string): void {
+		const images: InteractiveModeContext["pendingImages"] = [];
+		const textParts: string[] = [];
+		for (const payload of payloads) {
+			textParts.push(this.#shiftImagePlaceholders(payload.text, images.length));
+			images.push(...payload.images);
+			this.ctx.locallySubmittedUserSignatures.delete(`${payload.text}\u0000${payload.images.length}`);
+		}
+		const shiftedCurrentText = this.#shiftImagePlaceholders(currentText, images.length);
+		if (shiftedCurrentText.trim()) textParts.push(shiftedCurrentText);
+		this.ctx.editor.setText(textParts.filter(text => text.trim()).join("\n\n"));
+		this.ctx.pendingImages = [...images, ...(this.ctx.pendingImages ?? [])];
 	}
 
 	#restoreQueuedMessageToEditor(entry: QueuedMessageEditEntry | undefined): number {
@@ -947,14 +1045,13 @@ export class InputController {
 			this.ctx.updatePendingMessagesDisplay();
 			return 0;
 		}
-		const queuedText = this.#removeQueuedMessageForEditing(entry.id);
-		if (!queuedText) {
+		const queued = this.#removeQueuedMessageForEditing(entry.id);
+		if (!queued) {
 			this.ctx.updatePendingMessagesDisplay();
 			return 0;
 		}
 
-		this.ctx.locallySubmittedUserSignatures.delete(`${queuedText}\u00000`);
-		this.ctx.editor.setText(queuedText);
+		this.#restoreQueuedPayloadsToEditor([queued], this.ctx.editor.getText());
 		this.ctx.updatePendingMessagesDisplay();
 		return 1;
 	}
@@ -996,17 +1093,18 @@ export class InputController {
 		text: string,
 		streamingBehavior: "steer" | "followUp",
 		options?: ComposerSubmissionOptions,
+		preserveComposer = false,
 	): Promise<boolean> {
 		const invocations = parseSkillInvocations(text, this.ctx.skillCommands ?? new Map());
 		if (invocations.length === 0) return false;
 		if (!options || this.#canModifyComposer(options)) {
 			this.ctx.editor.addToHistory(text);
-			this.ctx.editor.setText("");
+			if (!preserveComposer) this.ctx.editor.setText("");
 		}
+
+		const prepared: Array<BuiltSkillPromptMessage & { displayText: string; retryText: string; tag?: string }> = [];
 		try {
-			for (let index = 0; index < invocations.length; index += 1) {
-				const invocation = invocations[index];
-				if (!invocation) continue;
+			for (const invocation of invocations) {
 				const activationResult = await resolveSubskillActivationForSkillInvocation({
 					cwd: this.ctx.sessionManager.getCwd(),
 					sessionId: this.ctx.session.sessionId,
@@ -1019,32 +1117,44 @@ export class InputController {
 					cwd: this.ctx.sessionManager.getCwd(),
 					sessionId: this.ctx.session.sessionId,
 				});
-				const details: SkillPromptDetails = built.details;
-				const displayText = `/${invocation.commandName}${activationResult.cleanedArgs ? ` ${activationResult.cleanedArgs}` : ""}`;
-				// When the agent is streaming, register a compact slash-form text as
-				// the pending-display twin BEFORE dispatching the CustomMessage. The
-				// returned tag is embedded in details so AgentSession.#handleAgentEvent
-				// can remove the matching display entry when the agent consumes this
-				// message (mirrors the user-message dequeue path).
+				prepared.push({
+					...built,
+					displayText: `/${invocation.commandName}${activationResult.cleanedArgs ? ` ${activationResult.cleanedArgs}` : ""}`,
+					retryText: `/${invocation.commandName}${invocation.args ? ` ${invocation.args}` : ""}`,
+				});
+			}
+		} catch (err) {
+			this.ctx.showError(`Failed to load skill: ${err instanceof Error ? err.message : String(err)}`);
+			throw err;
+		}
+
+		let dispatchedCount = 0;
+		try {
+			for (let index = 0; index < prepared.length; index += 1) {
+				const item = prepared[index];
+				if (!item) continue;
+				const details: SkillPromptDetails = item.details;
 				if (this.ctx.session.isStreaming) {
-					const tag = this.ctx.session.enqueueCustomMessageDisplay(displayText, streamingBehavior);
+					const tag = this.ctx.session.enqueueCustomMessageDisplay(item.displayText, streamingBehavior);
 					details.__pendingDisplayTag = tag;
+					item.tag = tag;
 				}
-				const isLast = index === invocations.length - 1;
+				const isLast = index === prepared.length - 1;
 				if (!this.ctx.session.isStreaming && !isLast) {
 					await this.ctx.session.sendCustomMessage({
 						customType: SKILL_PROMPT_MESSAGE_TYPE,
-						content: built.message,
+						content: item.message,
 						display: true,
 						details,
 						attribution: "user",
 					});
+					dispatchedCount = index + 1;
 					continue;
 				}
 				await this.ctx.session.promptCustomMessage(
 					{
 						customType: SKILL_PROMPT_MESSAGE_TYPE,
-						content: built.message,
+						content: item.message,
 						display: true,
 						details,
 						attribution: "user",
@@ -1053,116 +1163,117 @@ export class InputController {
 						? { streamingBehavior, followUpQueuePolicy: "sequential" }
 						: { streamingBehavior },
 				);
-			}
-			if (this.ctx.session.isStreaming) {
-				this.ctx.updatePendingMessagesDisplay();
-				this.ctx.ui.requestRender();
+				dispatchedCount = index + 1;
 			}
 		} catch (err) {
-			this.ctx.showError(`Failed to load skill: ${err instanceof Error ? err.message : String(err)}`);
+			const undispatched = prepared.slice(dispatchedCount);
+			for (const item of undispatched) {
+				if (item.tag) this.ctx.session.removeQueuedCustomMessageByDisplayTag(item.tag);
+			}
+			const remainingText = undispatched.map(item => item.retryText).join("\n");
+			if (remainingText && (!options || this.#canModifyComposer(options))) {
+				const currentText = this.ctx.editor.getText();
+				this.ctx.editor.setText(currentText ? `${currentText}\n${remainingText}` : remainingText);
+			}
+			this.ctx.updatePendingMessagesDisplay();
+			this.ctx.ui.requestRender();
+			this.ctx.showError(`Failed to dispatch skill: ${err instanceof Error ? err.message : String(err)}`);
+			return true;
+		}
+
+		if (this.ctx.session.isStreaming) {
+			this.ctx.updatePendingMessagesDisplay();
+			this.ctx.ui.requestRender();
 		}
 		return true;
 	}
 
 	/** Send editor text as a follow-up message (queued behind current stream). */
 	async handleFollowUp(): Promise<void> {
-		const text = this.ctx.editor.getText().trim();
-		if (!text) return;
-
-		// Compaction first: while compacting, queue free text and `/skill:*`
-		// commands in the compaction-local queue. `flushCompactionQueue`
-		// replays skill entries through the custom-message skill path after
-		// compaction finishes so they are not degraded into plain prompts.
-		if (this.ctx.session.isCompacting) {
-			if (this.ctx.pendingImages.length > 0) {
-				this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
-				return;
-			}
-			this.ctx.queueCompactionMessage(text, "followUp");
-			return;
-		}
-
-		// Skill commands invoke through the custom-message path regardless of
-		// which keybinding submitted them. Enter routes them as `steer`;
-		// explicit queue shortcuts route them as `followUp`.
-		if (await this.#invokeSkillCommand(text, "followUp")) {
-			return;
-		}
-
-		if (this.ctx.session.isStreaming) {
-			this.ctx.editor.addToHistory(text);
-			this.ctx.editor.setText("");
-			await this.ctx.withLocalSubmission(text, () =>
-				this.ctx.session.prompt(text, {
-					streamingBehavior: "followUp",
-					followUpQueuePolicy: "sequential",
-				}),
-			);
-			this.ctx.updatePendingMessagesDisplay();
-			this.ctx.ui.requestRender();
-			return;
-		}
-
-		// Not streaming — just submit normally
-		this.ctx.editor.addToHistory(text);
-		this.ctx.editor.setText("");
-		await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text));
+		await this.#claimAndSubmit("followUp");
 	}
 
 	/** Send editor text explicitly as a queued next-turn message. */
 	async handleQueueSubmit(): Promise<void> {
-		return this.handleFollowUp();
+		await this.#claimAndSubmit("followUp");
 	}
 
 	/** Submit once using the opposite of the configured busy prompt mode. */
 	async handleOppositeBusyPromptSubmit(): Promise<void> {
-		const text = this.ctx.editor.getText().trim();
-		if (!text || !this.ctx.session.isStreaming || this.ctx.session.isCompacting) return;
+		if (!this.ctx.session.isStreaming || this.ctx.session.isCompacting) return;
+		const streamingBehavior = this.#busyStreamingBehavior() === "steer" ? "followUp" : "steer";
+		await this.#claimAndSubmit(streamingBehavior);
+	}
 
-		// Claim the draft before the first await so rapid repeated shortcuts cannot
-		// snapshot and submit the same text twice.
-		const pendingImages = this.ctx.pendingImages;
-		const images = this.#visiblePendingImagesForText(text) ?? [];
+	#restoreClaimedSubmission(
+		claimed: {
+			text: string;
+			images: InteractiveModeContext["pendingImages"];
+			streamingBehavior: "steer" | "followUp";
+		},
+		composer: ComposerSubmissionOptions,
+	): void {
+		if (!this.#canModifyComposer(composer)) return;
+		const currentText = this.ctx.editor.getText();
+		const currentImages = this.ctx.pendingImages;
+		const mergedImages = [...currentImages];
+		const claimedImageNumbers = claimed.images.map(image => {
+			const existingIndex = currentImages.indexOf(image);
+			if (existingIndex !== -1) return existingIndex + 1;
+			mergedImages.push(image);
+			return mergedImages.length;
+		});
+		const restoredClaimedText = claimed.text.replace(
+			IMAGE_PLACEHOLDER_PATTERN,
+			(placeholder, imageNumberText: string) => {
+				const claimedIndex = Number.parseInt(imageNumberText, 10) - 1;
+				const mergedImageNumber = claimedImageNumbers[claimedIndex];
+				return mergedImageNumber === undefined ? placeholder : `[image ${mergedImageNumber}]`;
+			},
+		);
+		this.ctx.editor.setText(currentText ? `${currentText}\n${restoredClaimedText}` : restoredClaimedText);
+		this.ctx.pendingImages = mergedImages;
+	}
+
+	async #claimAndSubmit(streamingBehavior: "steer" | "followUp"): Promise<void> {
+		const text = this.ctx.editor.getText().trim();
+		if (!text) return;
+		if (this.ctx.session.isCompacting && (this.#visiblePendingImagesForText(text)?.length ?? 0) > 0) {
+			this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
+			return;
+		}
+
+		// Claim synchronously in the key callback's call stack. Subsequent rapid
+		// key events observe an empty draft instead of submitting this one again.
+		const images = this.ctx.pendingImages;
+		this.#claimedSubmission = { text, images, streamingBehavior };
 		this.ctx.editor.setText("");
 
-		const streamingBehavior =
-			normalizeBusyPromptMode(this.ctx.settings.get("busyPromptMode")) === "steer" ? "followUp" : "steer";
-		if (await this.#invokeSkillCommand(text, streamingBehavior)) return;
-
-		this.ctx.editor.addToHistory(text);
-		this.#clearPendingImagesIfOwnedBy(pendingImages);
-		await this.ctx.withLocalSubmission(
-			text,
-			() =>
-				this.ctx.session.prompt(text, {
-					streamingBehavior,
-					images: images.length > 0 ? images : undefined,
-					...(streamingBehavior === "followUp" ? { followUpQueuePolicy: "sequential" as const } : {}),
-				}),
-			{ imageCount: images.length },
-		);
-		this.ctx.updatePendingMessagesDisplay();
-		this.ctx.ui.requestRender();
+		if (!this.ctx.editor.onSubmit) this.setupEditorSubmitHandler();
+		await this.ctx.editor.onSubmit?.(text);
 	}
 
 	restoreLatestQueuedMessageToEditor(): number {
 		const compactionQueued = this.ctx.compactionQueuedMessages.pop();
-		const queuedText = compactionQueued?.text ?? this.ctx.session.popLastQueuedMessage();
-		if (!queuedText) {
+		const queued =
+			compactionQueued !== undefined
+				? { text: compactionQueued.text, images: [] }
+				: this.ctx.session.popLastQueuedMessagePayload();
+		if (!queued) {
 			this.ctx.updatePendingMessagesDisplay();
 			return 0;
 		}
 
-		this.ctx.locallySubmittedUserSignatures.delete(`${queuedText}\u00000`);
-		this.ctx.editor.setText(queuedText);
+		this.#restoreQueuedPayloadsToEditor([queued], this.ctx.editor.getText());
 		this.ctx.updatePendingMessagesDisplay();
 		return 1;
 	}
 
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
-		this.ctx.locallySubmittedUserSignatures.clear();
-		const { steering, followUp } = this.ctx.session.clearQueue();
-		const compactionQueued = (this.ctx.compactionQueuedMessages ?? []).map(entry => entry.text);
+		const { steering, followUp } = this.ctx.session.clearQueuedMessagePayloads();
+		const compactionQueued = (this.ctx.compactionQueuedMessages ?? []).map(
+			(entry): QueuedMessagePayload => ({ text: entry.text, images: [] }),
+		);
 		this.ctx.compactionQueuedMessages = [];
 		const allQueued = [...steering, ...followUp, ...compactionQueued];
 		if (allQueued.length === 0) {
@@ -1172,10 +1283,7 @@ export class InputController {
 			}
 			return 0;
 		}
-		const queuedText = allQueued.join("\n\n");
-		const currentText = options?.currentText ?? this.ctx.editor.getText();
-		const combinedText = [queuedText, currentText].filter(t => t.trim()).join("\n\n");
-		this.ctx.editor.setText(combinedText);
+		this.#restoreQueuedPayloadsToEditor(allQueued, options?.currentText ?? this.ctx.editor.getText());
 		this.ctx.updatePendingMessagesDisplay();
 		if (options?.abort) {
 			void this.#abortInteractive();
@@ -1323,8 +1431,11 @@ export class InputController {
 		return `[image ${this.ctx.pendingImages.length}]`;
 	}
 
-	#visiblePendingImagesForText(text: string): InteractiveModeContext["pendingImages"] | undefined {
-		if (this.ctx.pendingImages.length === 0) {
+	#visiblePendingImagesForText(
+		text: string,
+		pendingImages = this.ctx.pendingImages,
+	): InteractiveModeContext["pendingImages"] | undefined {
+		if (pendingImages.length === 0) {
 			return undefined;
 		}
 
@@ -1335,10 +1446,10 @@ export class InputController {
 			if (!placeholderNumberText) continue;
 			const placeholderNumber = Number.parseInt(placeholderNumberText, 10);
 			const imageIndex = placeholderNumber - 1;
-			if (imageIndex < 0 || imageIndex >= this.ctx.pendingImages.length || seenImageIndexes.has(imageIndex)) {
+			if (imageIndex < 0 || imageIndex >= pendingImages.length || seenImageIndexes.has(imageIndex)) {
 				continue;
 			}
-			const image = this.ctx.pendingImages[imageIndex];
+			const image = pendingImages[imageIndex];
 			if (!image) continue;
 			images.push(image);
 			seenImageIndexes.add(imageIndex);
@@ -1374,6 +1485,7 @@ export class InputController {
 				if (
 					this.ctx.pendingImages === pendingImages &&
 					pendingImages.length === pendingImageCount &&
+					!this.#submittedImageOwners.has(pendingImages) &&
 					this.ctx.editor.getText().length === 0
 				) {
 					this.ctx.pendingImages = [];

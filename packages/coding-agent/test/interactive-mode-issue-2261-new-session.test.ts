@@ -4,7 +4,7 @@ import { Agent } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { resolveLocalUrlToPath } from "@gajae-code/coding-agent/internal-urls";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { TempDir } from "@gajae-code/utils";
+import { postmortem, TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import type { ExtensionCommandContextActions } from "../src/extensibility/extensions";
 import { BtwController } from "../src/modes/controllers/btw-controller";
@@ -128,6 +128,19 @@ describe("Issue #2261 InteractiveMode session-switch preparation", () => {
 		expect(disposeBtw).toHaveBeenCalledTimes(1);
 		expect(clearExtensionListeners).toHaveBeenCalledTimes(1);
 	});
+	it("saves compaction-local queue entries before the editor draft on shutdown", async () => {
+		mode.compactionQueuedMessages = [
+			{ text: "first queued", mode: "followUp" },
+			{ text: "second queued", mode: "steer" },
+		];
+		mode.editor.setText("editor draft");
+		const saveDraft = vi.spyOn(session.sessionManager, "saveDraft");
+		vi.spyOn(postmortem, "quit").mockResolvedValue(undefined);
+
+		await mode.shutdown();
+
+		expect(saveDraft).toHaveBeenCalledWith("first queued\n\nsecond queued\n\neditor draft");
+	});
 });
 
 let commandActions: ExtensionCommandContextActions | undefined;
@@ -153,8 +166,11 @@ function createExtensionContext(success: boolean): {
 		loadingAnimation: { stop: vi.fn() },
 		statusContainer: { clear: vi.fn() },
 		resetIrcSidebarSession: vi.fn(),
+		resetObserverRegistry: vi.fn(),
 		statusLine: { invalidate: vi.fn(), setSessionStartTime: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
+		updateEditorBorderColor: vi.fn(),
+		editor: { getText: () => "editor draft" },
 		ui: {
 			requestRender: vi.fn(),
 			resetViewportAnchorIntent: vi.fn(),
@@ -168,7 +184,13 @@ function createExtensionContext(success: boolean): {
 		compactionQueuedMessages: [{ text: "queued", mode: "followUp" }],
 		pendingTools: new Map([["old-tool", {}]]),
 		reloadTodos: vi.fn(),
-		sessionManager: { getSessionName: () => "old", getCwd: () => "/old" },
+		showError: vi.fn(),
+		sessionManager: {
+			getSessionName: () => "old",
+			getCwd: () => "/old",
+			saveDraft: vi.fn(async () => {}),
+			readDraft: vi.fn(async () => "prior draft"),
+		},
 	} as unknown as InteractiveModeContext;
 	return { context, unsubscribePreviousListener, unsubscribeSuccessorListener };
 }
@@ -204,6 +226,24 @@ describe("Issue #2261 extension session.new", () => {
 			expect(context.compactionQueuedMessages).toEqual(success ? [] : [{ text: "queued", mode: "followUp" }]);
 			expect(context.pendingTools.has("old-tool")).toBe(!success);
 			expect(context.reloadTodos).toHaveBeenCalledTimes(success ? 1 : 0);
+		});
+	}
+});
+describe("Issue #2261 compaction queue draft persistence", () => {
+	for (const success of [false, true]) {
+		it(`${success ? "clears only after" : "retains after"} a ${success ? "successful" : "failed"} new-session transition`, async () => {
+			const { context } = createExtensionContext(success);
+			const controller = new CommandController(context);
+
+			const result = await controller.handleClearCommand();
+
+			expect(result).toBe(success);
+			expect(context.sessionManager.saveDraft).toHaveBeenCalledWith("queued\n\neditor draft");
+			expect(context.compactionQueuedMessages).toEqual(success ? [] : [{ text: "queued", mode: "followUp" }]);
+			if (!success) {
+				expect(context.sessionManager.saveDraft).toHaveBeenLastCalledWith("prior draft");
+			}
+			expect(context.editor.getText()).toBe("editor draft");
 		});
 	}
 });

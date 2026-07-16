@@ -66,8 +66,8 @@ export function defaultMessageQueueKeysForPlatform(platform: NodeJS.Platform = p
 	return platform === "win32" || platform === "darwin" ? "alt+q" : "alt+enter";
 }
 
-export function defaultOppositeBusyModeKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId[] {
-	return platform === "darwin" ? ["super+enter"] : [];
+export function defaultOppositeBusyModeKeysForPlatform(_platform: NodeJS.Platform = process.platform): KeyId[] {
+	return ["super+enter"];
 }
 
 /**

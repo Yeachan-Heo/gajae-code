@@ -14,6 +14,8 @@ function createContext(success: boolean): InteractiveModeContext {
 			getSessionFile: () => "/old/session.jsonl",
 			getSessionName: () => "old",
 			getCwd: () => "/old",
+			readDraft: vi.fn(async () => null),
+			saveDraft: vi.fn(async () => {}),
 		},
 		statusLine: { invalidate: vi.fn(), setSessionStartTime: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
@@ -25,6 +27,7 @@ function createContext(success: boolean): InteractiveModeContext {
 		pendingTools: new Map([["old", {}]]),
 		reloadTodos: vi.fn(),
 		showError: vi.fn(),
+		editor: { getText: () => "" },
 	} as unknown as InteractiveModeContext;
 }
 
@@ -77,6 +80,7 @@ describe("Issue #2261 CommandController fail-closed session replacement", () => 
 			session: { clearContext, newSession: vi.fn(), isCompacting: false },
 			loadingAnimation: undefined,
 			statusContainer: { clear: vi.fn() },
+			compactionQueuedMessages: [],
 		} as unknown as InteractiveModeContext;
 		const controller = new CommandController(context);
 

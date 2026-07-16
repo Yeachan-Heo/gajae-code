@@ -1076,6 +1076,11 @@ export interface QueuedMessageEditEntry {
 	label: string;
 }
 
+export interface QueuedMessagePayload {
+	text: string;
+	images: ImageContent[];
+}
+
 /** A custom message contributed at the before-agent-start point. */
 export type BeforeAgentStartInternalMessage = Pick<
 	CustomMessage,
@@ -2425,6 +2430,16 @@ export class AgentSession {
 	#queuedMessageEditId(mode: QueuedMessageEditMode, sequence: number): string {
 		return `${mode}:${sequence}`;
 	}
+
+	#queuedMessagePayload(entry: QueuedDisplayEntry, message: AgentMessage | undefined): QueuedMessagePayload {
+		const images: ImageContent[] = [];
+		if (message?.role === "user" && Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (block.type === "image") images.push(block);
+			}
+		}
+		return { text: entry.text, images };
+	}
 	/** Register a compact display string for a custom message that the caller is
 	 *  about to dispatch via `promptCustomMessage` / `sendCustomMessage`.
 	 *  Returns a stable tag the caller MUST embed in
@@ -2445,6 +2460,12 @@ export class AgentSession {
 			this.#followUpMessages.push(entry);
 		}
 		return tag;
+	}
+
+	removeQueuedCustomMessageByDisplayTag(tag: string): void {
+		this.purgeQueuedCustomMessages(message => readPendingDisplayTag(message.details) === tag);
+		this.#steeringMessages = this.#steeringMessages.filter(entry => entry.tag !== tag);
+		this.#followUpMessages = this.#followUpMessages.filter(entry => entry.tag !== tag);
 	}
 
 	getAgentId(): string | undefined {
@@ -7442,16 +7463,37 @@ export class AgentSession {
 	}
 
 	/**
-	 * Clear queued messages and return them.
-	 * Useful for restoring to editor when user aborts.
+	 * Clear queued messages and return their complete user payloads.
+	 * Custom-message display entries have no image payload.
 	 */
-	clearQueue(): { steering: string[]; followUp: string[] } {
-		const steering = this.#steeringMessages.map(e => e.text);
-		const followUp = this.#followUpMessages.map(e => e.text);
+	clearQueuedMessagePayloads(): {
+		steering: QueuedMessagePayload[];
+		followUp: QueuedMessagePayload[];
+	} {
+		const steeringMessages = this.agent.snapshotSteering();
+		const followUpMessages = this.agent.snapshotFollowUp();
+		const steering = this.#steeringMessages.map((entry, index) =>
+			this.#queuedMessagePayload(entry, steeringMessages[index]),
+		);
+		const followUp = this.#followUpMessages.map((entry, index) =>
+			this.#queuedMessagePayload(entry, followUpMessages[index]),
+		);
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
 		this.agent.clearAllQueues();
 		return { steering, followUp };
+	}
+
+	/**
+	 * Clear queued messages and return the historical text-only view.
+	 * Prefer clearQueuedMessagePayloads() when restoring editable drafts.
+	 */
+	clearQueue(): { steering: string[]; followUp: string[] } {
+		const { steering, followUp } = this.clearQueuedMessagePayloads();
+		return {
+			steering: steering.map(entry => entry.text),
+			followUp: followUp.map(entry => entry.text),
+		};
 	}
 
 	/** Number of pending messages (includes steering, follow-up, and next-turn messages) */
@@ -7506,7 +7548,7 @@ export class AgentSession {
 		return entries;
 	}
 
-	removeQueuedMessageForEditing(id: string): string | undefined {
+	removeQueuedMessagePayloadForEditing(id: string): QueuedMessagePayload | undefined {
 		const [mode, sequenceText] = id.split(":");
 		if ((mode !== "steer" && mode !== "followUp") || sequenceText === undefined) return undefined;
 		const sequence = Number(sequenceText);
@@ -7517,12 +7559,13 @@ export class AgentSession {
 		if (index === -1) return undefined;
 
 		const [entry] = queue.splice(index, 1);
-		if (mode === "steer") {
-			this.agent.removeSteerAt(index);
-		} else {
-			this.agent.removeFollowUpAt(index);
-		}
-		return entry?.text;
+		if (!entry) return undefined;
+		const message = mode === "steer" ? this.agent.removeSteerAt(index) : this.agent.removeFollowUpAt(index);
+		return this.#queuedMessagePayload(entry, message);
+	}
+
+	removeQueuedMessageForEditing(id: string): string | undefined {
+		return this.removeQueuedMessagePayloadForEditing(id)?.text;
 	}
 
 	moveQueuedMessageForEditing(id: string, direction: "up" | "down"): boolean {
@@ -7552,24 +7595,29 @@ export class AgentSession {
 	}
 
 	/**
-	 * Pop the newest queued message across steering and follow-up queues.
-	 * Used by dequeue keybinding to restore messages to editor one at a time.
-	 * Returns the popped entry's `.text`; the tag (if any) dies with the
-	 * record — no orphan state can outlive the queue entry.
+	 * Pop the newest queued payload across steering and follow-up queues.
+	 * The tag (if any) dies with the display record.
 	 */
-	popLastQueuedMessage(): string | undefined {
+	popLastQueuedMessagePayload(): QueuedMessagePayload | undefined {
 		const steeringEntry = this.#steeringMessages.at(-1);
 		const followUpEntry = this.#followUpMessages.at(-1);
 
 		if (steeringEntry && (!followUpEntry || steeringEntry.sequence > followUpEntry.sequence)) {
-			return this.removeQueuedMessageForEditing(this.#queuedMessageEditId("steer", steeringEntry.sequence));
+			return this.removeQueuedMessagePayloadForEditing(this.#queuedMessageEditId("steer", steeringEntry.sequence));
 		}
 
 		if (followUpEntry) {
-			return this.removeQueuedMessageForEditing(this.#queuedMessageEditId("followUp", followUpEntry.sequence));
+			return this.removeQueuedMessagePayloadForEditing(
+				this.#queuedMessageEditId("followUp", followUpEntry.sequence),
+			);
 		}
 
 		return undefined;
+	}
+
+	/** Pop the newest queued message using the historical text-only view. */
+	popLastQueuedMessage(): string | undefined {
+		return this.popLastQueuedMessagePayload()?.text;
 	}
 
 	get skillsSettings(): SkillsSettings | undefined {

@@ -445,34 +445,33 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 	let mut modifier = 0;
 	let mut key: Option<&str> = if forced_key_plus { Some("+") } else { None };
 
-	for part in prefix.split('+') {
-		let p = part.trim();
-		let [c0, ..] = p.as_bytes() else {
-			continue;
-		};
+	if !prefix.is_empty() {
+		for part in prefix.split('+') {
+			let p = part.trim();
+			if p.is_empty() {
+				return None;
+			}
 
-		match c0 {
-			b'c' | b'C' if p.eq_ignore_ascii_case("ctrl") => {
-				modifier |= MOD_CTRL;
+			let modifier_bit = match p {
+				p if p.eq_ignore_ascii_case("ctrl") => MOD_CTRL,
+				p if p.eq_ignore_ascii_case("shift") => MOD_SHIFT,
+				p if p.eq_ignore_ascii_case("alt") => MOD_ALT,
+				p if p.eq_ignore_ascii_case("super") => MOD_SUPER,
+				_ => 0,
+			};
+			if modifier_bit != 0 {
+				if (!forced_key_plus && key.is_some()) || modifier & modifier_bit != 0 {
+					return None;
+				}
+				modifier |= modifier_bit;
 				continue;
-			},
-			b's' | b'S' if p.eq_ignore_ascii_case("shift") => {
-				modifier |= MOD_SHIFT;
-				continue;
-			},
-			b'a' | b'A' if p.eq_ignore_ascii_case("alt") => {
-				modifier |= MOD_ALT;
-				continue;
-			},
-			b's' | b'S' if p.eq_ignore_ascii_case("super") => {
-				modifier |= MOD_SUPER;
-				continue;
-			},
-			_ => {},
+			}
+
+			if key.is_some() {
+				return None;
+			}
+			key = Some(p);
 		}
-
-		// Treat this as the key token (last non-modifier wins)
-		key = Some(p);
 	}
 
 	let mut key = key?;
