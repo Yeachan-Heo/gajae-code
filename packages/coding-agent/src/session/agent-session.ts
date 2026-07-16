@@ -229,7 +229,7 @@ import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime"
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
-import { ensureWorkflowSkillActivationState } from "../hooks/skill-state";
+import { buildSkillStopOutput, ensureWorkflowSkillActivationState } from "../hooks/skill-state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { resolveMemoryBackend } from "../memory-backend";
@@ -1417,6 +1417,7 @@ export class AgentSession {
 	#fallbackInvocationId = 0;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
+	#deepInterviewStopReminderCount = 0;
 	#lastGoalReminderAssistantTimestamp: number | undefined = undefined;
 	#todoPhases: TodoPhase[] = [];
 	#toolChoiceQueue = new ToolChoiceQueue();
@@ -3130,6 +3131,9 @@ export class AgentSession {
 			}
 			if (msg.stopReason !== "error" && msg.stopReason !== "aborted") {
 				if (this.#enforceRewindBeforeYield()) {
+					return;
+				}
+				if (await this.#checkActiveDeepInterviewCompletion()) {
 					return;
 				}
 				if (await this.#checkGoalCompletion(msg)) {
@@ -6508,6 +6512,9 @@ export class AgentSession {
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
+			if (message.role === "user") {
+				this.#deepInterviewStopReminderCount = 0;
+			}
 
 			// Validate model
 			if (!this.model) {
@@ -9854,6 +9861,29 @@ export class AgentSession {
 			timestamp: Date.now(),
 		});
 		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+		return true;
+	}
+	async #checkActiveDeepInterviewCompletion(): Promise<boolean> {
+		const output = await buildSkillStopOutput({
+			cwd: this.sessionManager.getCwd(),
+			sessionId: this.sessionManager.getSessionId(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		});
+		if (output?.decision !== "block") return false;
+		const stopReason = typeof output.stopReason === "string" ? output.stopReason : "";
+		if (!stopReason.startsWith("gjc_skill_deep_interview_")) return false;
+		if (this.#deepInterviewStopReminderCount >= 2) return false;
+
+		const systemMessage = typeof output.systemMessage === "string" ? output.systemMessage : "";
+		if (!systemMessage) return false;
+		this.#deepInterviewStopReminderCount++;
+		this.agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: systemMessage }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		this.#scheduleAgentContinue({ generation: this.#promptGeneration, skipCompactionCheck: true });
 		return true;
 	}
 	/**
