@@ -4,11 +4,10 @@
  */
 
 /** Protocol version the daemon advertises in its ClientHello. */
-export const NOTIFICATION_PROTOCOL_VERSION = 4;
+export const NOTIFICATION_PROTOCOL_VERSION = 3;
 
 /**
- * Operational generation the current daemon build speaks. It is tied to the
- * wire protocol version so a freshly-upgraded host can identify an older,
- * still-live daemon without coupling status readers to the daemon runtime.
+ * Operational generation for daemon ownership reloads. It changes independently
+ * from the stable wire protocol so upgraded hosts replace older live daemons.
  */
-export const DAEMON_GENERATION = NOTIFICATION_PROTOCOL_VERSION;
+export const DAEMON_GENERATION = 4;

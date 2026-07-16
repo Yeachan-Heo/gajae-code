@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
+import { logger } from "@gajae-code/utils";
 import { Marked, type Token, type TokensList } from "marked";
 import {
 	buildBtwRichBlocks,
@@ -479,6 +480,7 @@ describe("/btw native table rich rendering", () => {
 		const lexerSpy = vi.spyOn(Marked.prototype, "lexer").mockImplementation(() => {
 			throw new Error("lexer unavailable");
 		});
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		let fallbacks = 0;
 		try {
 			await deliverBtwRichWithFallback(bot, { chat_id: 42, message_thread_id: 7 }, markdown, async () => {
@@ -486,6 +488,10 @@ describe("/btw native table rich rendering", () => {
 			});
 			expect(lexerSpy).toHaveBeenCalledTimes(1);
 			expect(lexerSpy).toHaveBeenCalledWith(markdown);
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			expect(warnSpy).toHaveBeenCalledWith(
+				"notifications: unable to compile /btw rich blocks; using Markdown fallback",
+			);
 			expect(calls).toEqual([
 				{
 					method: "sendRichMessage",
@@ -494,6 +500,7 @@ describe("/btw native table rich rendering", () => {
 			]);
 			expect(fallbacks).toBe(0);
 		} finally {
+			warnSpy.mockRestore();
 			lexerSpy.mockRestore();
 		}
 	});
@@ -529,5 +536,129 @@ describe("/btw native table rich rendering", () => {
 			expect(fallbacks).toEqual([markdown]);
 			expect(warnings).toEqual([`notifications: sendRichMessage(/btw) failed (${warning}); falling back to HTML`]);
 		}
+	});
+});
+describe("/btw mathematical-expression rich rendering", () => {
+	const tableWith = (cell: string): string => `| Formula |\n| --- |\n| ${cell} |`;
+
+	test("renders dollar and parenthesized inline math inside table cells in source order", () => {
+		expect(buildBtwRichBlocks(tableWith("before $x^2$ middle \\(y + 1\\) after"))).toEqual([
+			{
+				type: "table",
+				cells: [
+					[{ text: ["Formula"], valign: "top", is_header: true }],
+					[
+						{
+							text: [
+								"before ",
+								{ type: "mathematical_expression", expression: "x^2" },
+								" middle ",
+								{ type: "mathematical_expression", expression: "y + 1" },
+								" after",
+							],
+							valign: "top",
+						},
+					],
+				],
+			},
+		]);
+	});
+
+	test("renders standalone dollar and bracket math as blocks while preserving mixed source order", () => {
+		expect(
+			buildBtwRichBlocks(
+				"Lead $a$.\n\n$$x^2 + y^2$$\n\n| Value |\n| --- |\n| \\(z\\) |\n\n\\[\\frac{1}{n}\\]\n\nTail",
+			),
+		).toEqual([
+			{
+				type: "paragraph",
+				text: ["Lead ", { type: "mathematical_expression", expression: "a" }, "."],
+			},
+			{ type: "mathematical_expression", expression: "x^2 + y^2" },
+			{
+				type: "table",
+				cells: [
+					[{ text: ["Value"], valign: "top", is_header: true }],
+					[{ text: [{ type: "mathematical_expression", expression: "z" }], valign: "top" }],
+				],
+			},
+			{ type: "mathematical_expression", expression: "\\frac{1}{n}" },
+			{ type: "paragraph", text: ["Tail"] },
+		]);
+	});
+	test("requires an unescaped display-math closing delimiter with odd/even backslash parity", async () => {
+		expect(buildBtwRichBlocks(String.raw`$$x\\$$`)).toEqual([
+			{ type: "mathematical_expression", expression: String.raw`x\\` },
+		]);
+		expect(buildBtwRichBlocks(String.raw`\[x\\\]`)).toEqual([
+			{ type: "mathematical_expression", expression: String.raw`x\\` },
+		]);
+
+		for (const markdown of [String.raw`$$x\$$`, String.raw`\[x\\]`]) {
+			expect(buildBtwRichBlocks(markdown)).toBeUndefined();
+
+			const { bot, calls } = makeBot(() => ({ ok: true }));
+			await deliverBtwRichWithFallback(bot, { chat_id: 42 }, markdown, async () => {});
+			expect(calls).toEqual([{ method: "sendRichMessage", body: { chat_id: 42, rich_message: { markdown } } }]);
+		}
+	});
+
+	test("keeps escaped dollars literal and fails closed to the exact original markdown for ambiguous math delimiters", async () => {
+		const escaped = tableWith(String.raw`cost \$5 and $x$`);
+		expect(buildBtwRichBlocks(escaped)).toEqual([
+			{
+				type: "table",
+				cells: [
+					[{ text: ["Formula"], valign: "top", is_header: true }],
+					[
+						{
+							text: ["cost $5 and ", { type: "mathematical_expression", expression: "x" }],
+							valign: "top",
+						},
+					],
+				],
+			},
+		]);
+
+		for (const markdown of [
+			tableWith("$"),
+			tableWith("$unclosed"),
+			tableWith("$$"),
+			tableWith("$outer $inner$ tail$"),
+			"| Formula |\n| --- |\n| \\(unclosed |",
+			"| Formula |\n| --- |\n| \\[inline\\] |",
+		]) {
+			const { bot, calls } = makeBot(() => ({ ok: true }));
+			await deliverBtwRichWithFallback(bot, { chat_id: 42 }, markdown, async () => {});
+			expect(calls).toEqual([{ method: "sendRichMessage", body: { chat_id: 42, rich_message: { markdown } } }]);
+		}
+	});
+	test("rejects nested or mixed unescaped dollar delimiters in paragraphs, displays, and table cells", async () => {
+		const markdowns = [
+			"$outer $inner$ tail$",
+			String.raw`\(\alpha $x$ \beta\)`,
+			"$$outer $inner$ tail$$",
+			tableWith("$outer $inner$ tail$"),
+			tableWith(String.raw`\(\alpha $x$ \beta\)`),
+			String.raw`$x\\$y$`,
+		];
+
+		for (const markdown of markdowns) {
+			expect(buildBtwRichBlocks(markdown)).toBeUndefined();
+			const { bot, calls } = makeBot(() => ({ ok: true }));
+			await deliverBtwRichWithFallback(bot, { chat_id: 42 }, markdown, async () => {});
+			expect(calls).toEqual([{ method: "sendRichMessage", body: { chat_id: 42, rich_message: { markdown } } }]);
+		}
+
+		expect(buildBtwRichBlocks(String.raw`$x\$y$`)).toEqual([
+			{ type: "paragraph", text: [{ type: "mathematical_expression", expression: String.raw`x\$y` }] },
+		]);
+	});
+
+	test("counts mathematical-expression blocks toward the 500-unit document limit", () => {
+		const mathBlocks = (count: number) => Array.from({ length: count }, () => "$$x$$").join("\n\n");
+		const table = "| h |\n| --- |\n| v |";
+		expect(buildBtwRichBlocks(`${mathBlocks(497)}\n\n${table}`)).toBeDefined();
+		expect(buildBtwRichBlocks(`${mathBlocks(498)}\n\n${table}`)).toBeUndefined();
 	});
 });

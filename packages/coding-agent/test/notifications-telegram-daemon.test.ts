@@ -33,6 +33,7 @@ import {
 	unregisterNotificationRoot,
 } from "../src/sdk/bus/telegram-daemon";
 import { runDaemonInternal, runDaemonSmoke } from "../src/sdk/bus/telegram-daemon-cli";
+import { NOTIFICATION_PROTOCOL_VERSION } from "../src/sdk/bus/telegram-daemon-contract";
 
 const THREADED_FALLBACK_NOTICE =
 	"Flat Telegram private chat supports outbound notifications and inline ask buttons only. Enable Threaded Mode in @BotFather > Bot Settings > Threads Settings for free-text replies and session commands.";
@@ -625,6 +626,10 @@ describe("telegram daemon", () => {
 		fs.writeFileSync(paths.state, JSON.stringify(liveOwnerState(extra)));
 		fs.writeFileSync(paths.lock, "");
 	}
+	test("keeps the wire protocol at 3 while reload ownership uses generation 4", () => {
+		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
+		expect(DAEMON_GENERATION).toBe(4);
+	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
 		const agentDir = tempAgentDir();
@@ -636,6 +641,19 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			pidAlive: () => true,
 			now: () => 101,
+		});
+		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
+	});
+	test("#2028 acquire flags a reload for a live daemon from the immediately preceding generation", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, heartbeatAt: Date.now() });
+		const result = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			pidAlive: () => true,
+			now: () => Date.now(),
 		});
 		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
 	});
@@ -3376,6 +3394,12 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 		expect(FakeWs.instances).toHaveLength(1);
 		expect(daemon.sessions.has("S")).toBe(true);
 
+		FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+		expect(FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).find(frame => frame.type === "hello")).toEqual({
+			type: "hello",
+			protocolVersion: 3,
+			capabilities: ["client_ping_pong", "ask_controls", "ask_selected_ack"],
+		});
 		// The native server advertises the ping/pong capability so ack-based
 		// liveness can start; then the link goes half-open (no further frames,
 		// socket never closes, no pong will arrive).

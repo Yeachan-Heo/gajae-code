@@ -115,6 +115,7 @@ interface Harness {
 	bot: CapturingBotApi;
 	daemon: TelegramNotificationDaemon;
 	ephemeralTurns: Array<{ sessionId: string; requestId: string; threadId: string; updateId: number }>;
+	inboundKinds: string[];
 	stop: () => Promise<void>;
 }
 
@@ -159,8 +160,11 @@ async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemer
 		}
 	});
 	const ephemeralTurns: Array<{ sessionId: string; requestId: string; threadId: string; updateId: number }> = [];
+	const inboundKinds: string[] = [];
 	srv.onInbound((error, inbound) => {
-		if (error || !inbound || inbound.kind !== "ephemeral_turn") return;
+		if (error || !inbound) return;
+		inboundKinds.push(inbound.kind);
+		if (inbound.kind !== "ephemeral_turn") return;
 		if (inbound.requestId === undefined || inbound.threadId === undefined || inbound.updateId === undefined) return;
 		ephemeralTurns.push({
 			sessionId: inbound.sessionId,
@@ -217,7 +221,7 @@ async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemer
 		throw err;
 	}
 
-	return { sessionId, srv, bot, daemon, ephemeralTurns, stop };
+	return { sessionId, srv, bot, daemon, ephemeralTurns, inboundKinds, stop };
 }
 
 /** Drive the identity_header over the wire and wait until its topic + HTML header are sent. */
@@ -277,6 +281,7 @@ test("rich e2e: /btw ignores mismatched and duplicate results before delivering 
 			message: { chat: { id: 42 }, message_thread_id: THREAD_ID, text: "/btw table?" },
 		});
 		await waitFor(() => h.ephemeralTurns.length === 1, 8000, "/btw ephemeral turn received by NotificationServer");
+		expect(h.inboundKinds).toEqual(["ephemeral_turn"]);
 		const inbound = h.ephemeralTurns[0]!;
 		const result = {
 			type: "ephemeral_turn_result",
