@@ -22,6 +22,7 @@ import type { CredentialAutoImportOptions } from "../setup/credential-auto-impor
 import type { LspStartupServerInfo } from "../tools";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
+import type { CommandPaletteAction } from "./components/command-palette";
 import type { CustomEditor } from "./components/custom-editor";
 import type { EvalExecutionComponent } from "./components/eval-execution";
 import type { PetMode } from "./components/gajae-pet-widget";
@@ -288,7 +289,7 @@ export interface InteractiveModeContext {
 	// Selector handling
 	showCommandPalette(
 		commands: SlashCommand[],
-		executeAction: (action: string) => void,
+		actions: CommandPaletteAction[],
 		executeSlashCommand: (name: string) => void,
 	): void;
 	showSettingsSelector(): void;

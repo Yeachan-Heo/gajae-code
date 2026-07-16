@@ -5,7 +5,7 @@ import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, isPetMode, Loader, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
-import { formatKeyHints, KEYBINDINGS } from "../../config/keybindings";
+import { type AppKeybinding, formatKeyHints } from "../../config/keybindings";
 import {
 	activateModelProfile,
 	type MaterializeModelProfileForDeletionResult,
@@ -109,7 +109,11 @@ import {
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
-import { CommandPaletteComponent, type CommandPaletteEntry } from "../components/command-palette";
+import {
+	type CommandPaletteAction,
+	CommandPaletteComponent,
+	type CommandPaletteEntry,
+} from "../components/command-palette";
 import {
 	CustomModelPresetWizardComponent,
 	type CustomModelPresetWizardSubmit,
@@ -730,21 +734,19 @@ export class SelectorController {
 
 	showCommandPalette(
 		commands: SlashCommand[],
-		executeAction: (action: string) => void,
+		actions: CommandPaletteAction[],
 		executeSlashCommand: (name: string) => void,
 	): void {
 		const seenCommands = new Set<string>();
 		const entries: CommandPaletteEntry[] = [
-			...Object.entries(KEYBINDINGS)
-				.filter(([action]) => action.startsWith("app."))
-				.map(([action, definition]) => ({
-					id: `action:${action}`,
-					label: definition.description,
-					description: action,
-					keybinding:
-						formatKeyHints(this.ctx.keybindings.getKeys(action as keyof typeof KEYBINDINGS)) || undefined,
-					searchText: action,
-				})),
+			...actions.map(action => ({
+				id: `action:${action.id}`,
+				label: action.label,
+				description: action.id,
+				keybinding: formatKeyHints(this.ctx.keybindings.getKeys(action.id as AppKeybinding)) || undefined,
+				searchText: action.id,
+				handler: action.handler,
+			})),
 			...commands
 				.filter(command => {
 					if (seenCommands.has(command.name)) return false;
@@ -756,6 +758,7 @@ export class SelectorController {
 					label: `/${command.name}`,
 					description: command.description ?? "Slash command",
 					searchText: command.name,
+					handler: () => executeSlashCommand(command.name),
 				})),
 		];
 
@@ -764,11 +767,7 @@ export class SelectorController {
 				entries,
 				entry => {
 					done();
-					if (entry.id.startsWith("action:")) {
-						executeAction(entry.id.slice("action:".length));
-					} else {
-						executeSlashCommand(entry.id.slice("command:".length));
-					}
+					entry.handler?.();
 				},
 				done,
 			);

@@ -12,12 +12,19 @@ import {
 import { theme } from "../../modes/theme/theme";
 import { DynamicBorder } from "./dynamic-border";
 
+export interface CommandPaletteAction {
+	id: string;
+	label: string;
+	handler: () => void;
+}
+
 export interface CommandPaletteEntry {
 	id: string;
 	label: string;
 	description: string;
 	keybinding?: string;
 	searchText?: string;
+	handler?: () => void;
 }
 
 class CommandPaletteList implements Component {

@@ -4,6 +4,7 @@ import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-age
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext, SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
 import { SubagentTool, type ToolSession } from "@gajae-code/coding-agent/tools";
+import type { SlashCommand } from "@gajae-code/tui";
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -866,5 +867,59 @@ describe("InputController escape behavior", () => {
 		// The empty-composer double-Esc action must not fire on this single empty Esc.
 		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
 		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
+	});
+});
+describe("InputController command palette", () => {
+	it("runs registered actions directly and excludes unsupported actions and self-reentry", () => {
+		const { ctx, editor } = createContext();
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		(editor as unknown as { handleInput: ReturnType<typeof vi.fn> }).handleInput = vi.fn();
+		(ctx.keybindings as unknown as { getKeys(action: string): string[] }).getKeys = action =>
+			action === "app.session.tree" ? ["ctrl+d"] : [];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.openCommandPalette();
+
+		const actions = showCommandPalette.mock.calls[0]?.[1] as Array<{
+			id: string;
+			handler: () => void;
+		}>;
+		const tree = actions.find(action => action.id === "app.session.tree");
+		const fork = actions.find(action => action.id === "app.session.fork");
+
+		expect(tree).toBeDefined();
+		tree?.handler();
+		expect(ctx.showTreeSelector).toHaveBeenCalledTimes(1);
+		fork?.handler();
+		expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
+		expect((editor as unknown as { handleInput: ReturnType<typeof vi.fn> }).handleInput).not.toHaveBeenCalled();
+		expect(actions.some(action => action.id === "app.session.delete")).toBe(false);
+		expect(actions.some(action => action.id === "app.commandPalette.open")).toBe(false);
+	});
+
+	it("restores the draft and pending images after executing a slash command", () => {
+		const { ctx, editor } = createContext();
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		const attachment = { type: "image", data: "attachment" } as InteractiveModeContext["pendingImages"][number];
+		ctx.pendingImages = [attachment];
+		editor.setText("existing draft");
+		const input = editor as unknown as {
+			handleInput: ReturnType<typeof vi.fn>;
+		};
+		input.handleInput = vi.fn();
+		const controller = new InputController(ctx);
+		controller.createAutocompleteProvider([{ name: "help" }] as SlashCommand[], "");
+
+		controller.openCommandPalette();
+
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => void;
+		executeSlashCommand("help");
+
+		expect(input.handleInput).toHaveBeenCalledWith("\n");
+		expect(editor.getText()).toBe("existing draft");
+		expect(ctx.pendingImages).toEqual([attachment]);
 	});
 });
