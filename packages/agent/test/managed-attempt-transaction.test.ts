@@ -457,58 +457,30 @@ describe("managed attempt transaction", () => {
 		expect(agent.state.error).toBeUndefined();
 	});
 
-	it("bounds sparse and length-poisoned arrays without densifying holes", async () => {
+	it("bounds sparse and length-poisoned arrays without densifying holes", () => {
 		// A sparse array (or a huge `length` with one element) must not force
 		// an allocation proportional to its declared length: the degraded
-		// snapshot enumerates only present entries and degrades sparse arrays
-		// to a record of their indices. A densifying sanitizer would blow past
-		// this test's timeout allocating millions of slots per staged event.
-		// (Lengths are kept at 10M: the primary structuredClone attempt itself
-		// walks sparse ranges linearly in JSC, which is outside our control.)
-		const mock = createMockModel();
-		const streamFn = () => {
-			const stream = new AssistantMessageEventStream();
-			void (async () => {
-				const partial = assistantMessage(mock.model);
-				const sparse: unknown[] = [];
-				sparse[9_999_999] = { note: "sparse-x" };
-				const lengthPoisoned: unknown[] = [];
-				lengthPoisoned.length = 10_000_000;
-				lengthPoisoned[0] = () => {};
-				(partial as unknown as Record<string, unknown>).probe = {
-					sparse,
-					lengthPoisoned,
-					forceFallback: () => {},
-				};
-				stream.push({ type: "start", partial });
-				await Bun.sleep(0);
-				partial.content.push({ type: "text", text: "accepted" });
-				stream.push({ type: "text_start", contentIndex: 0, partial });
-				await Bun.sleep(0);
-				stream.push({ type: "done", reason: "stop", message: partial });
-			})();
-			return stream;
-		};
-		const replayedProbes: Array<Record<string, unknown>> = [];
-		const agent = new Agent({
-			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
-			streamFn,
-		});
-		agent.subscribe(event => {
-			if (event.type !== "message_update") return;
-			replayedProbes.push((event.message as unknown as Record<string, unknown>).probe as Record<string, unknown>);
-		});
+		// clone enumerates only present entries and degrades sparse arrays to
+		// a record of their indices. A densifying implementation would blow
+		// past this test's timeout allocating millions of slots.
+		// (Direct unit test: at the transaction level a measurable sparse
+		// event is rejected by the byte cap from its JSON size alone — the
+		// same pre-clone measurement upstream always used — so the sanitizer's
+		// shape guarantees are asserted on the exported function.)
+		const sparse: unknown[] = [];
+		sparse[9_999_999] = { note: "sparse-x" };
+		const lengthPoisoned: unknown[] = [];
+		lengthPoisoned.length = 10_000_000;
+		lengthPoisoned[0] = () => {};
 
-		await agent.prompt("run", { fallbackManaged: true });
+		const out = sanitizedDetachedClone({ sparse, lengthPoisoned }) as Record<string, unknown>;
 
-		expect(replayedProbes.length).toBeGreaterThan(0);
-		for (const probe of replayedProbes) {
-			// Sparse array degrades to a record of present indices only.
-			expect(probe.sparse).toEqual({ "9999999": { note: "sparse-x" } } as never);
-			// Length-poisoned array keeps only its single present element.
-			expect(probe.lengthPoisoned).toEqual(["[unserializable]"] as never);
-		}
-		expect(agent.state.error).toBeUndefined();
+		// Sparse array degrades to a record of present indices only.
+		expect(out.sparse).toEqual({ "9999999": { note: "sparse-x" } } as never);
+		// Length-poisoned array keeps only its single present element.
+		expect(out.lengthPoisoned).toEqual(["[unserializable]"] as never);
+		// The degraded form is JSON-safe and small — no hole densification.
+		expect(JSON.stringify(out).length).toBeLessThan(200);
 	});
 
 	it("charges the budget for every enumerated key, including accessors and shared-object revisits", () => {
@@ -594,6 +566,51 @@ describe("managed attempt transaction", () => {
 		expect(out.ordinary).toEqual({ ok: true } as never);
 		expect(out.when).toEqual(new Date(1234567890));
 		expect(getPrototypeDispatches).toBe(0);
+	});
+
+	it("rejects an oversized event before duplicating it with a snapshot", async () => {
+		// The staged-byte cap exists to bound memory: an over-limit event must
+		// be rejected from its measurement pass alone, WITHOUT first being
+		// duplicated by structuredClone. The nested witness getter counts deep
+		// reads: measurement reads it exactly once; a snapshot taken before
+		// the cap check would read it a second time.
+		const mock = createMockModel();
+		let witnessReads = 0;
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				partial.content.push({ type: "text", text: "x".repeat(16 * 1024 * 1024 + 1) });
+				const witness: Record<string, unknown> = {};
+				Object.defineProperty(witness, "read", {
+					enumerable: true,
+					get() {
+						witnessReads += 1;
+						return true;
+					},
+				});
+				(partial as unknown as Record<string, unknown>).witness = witness;
+				stream.push({ type: "start", partial });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		const outcomes: AssistantMessage[] = [];
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
+				if (outcome.type === "retryable_discarded") outcomes.push(outcome.failure.message);
+				return { type: "terminal", terminal: { stopReason: "exhausted" } };
+			},
+		} as any);
+
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0]?.errorMessage).toContain("provisional event buffer limit");
+		expect(witnessReads).toBe(1);
 	});
 
 	it("discards an over-limit provisional batch and reports a retryable private outcome", async () => {
