@@ -9,6 +9,7 @@ import {
 	formatExpandHint,
 	formatMoreItems,
 	formatStatusIcon,
+	noExpandHintCapability,
 	replaceTabs,
 } from "../tools/render-utils";
 import { renderOutputBlock } from "./output-block";
@@ -106,7 +107,12 @@ export function renderCodeCell(options: CodeCellOptions, theme: Theme): string[]
 	const codeLines = highlightCode(visibleCode, language);
 	const hiddenCodeLines = rawCodeLines.length - maxCodeLines;
 	if (hiddenCodeLines > 0) {
-		const hint = formatExpandHint(theme, expanded, hiddenCodeLines > 0, options.expandHintCapability);
+		const hint = formatExpandHint(
+			theme,
+			expanded,
+			hiddenCodeLines > 0,
+			options.expandHintCapability ?? noExpandHintCapability,
+		);
 		const moreLine = `${formatMoreItems(hiddenCodeLines, "line")}${hint ? ` ${hint}` : ""}`;
 		codeLines.push(theme.fg("dim", moreLine));
 	}
@@ -121,7 +127,12 @@ export function renderCodeCell(options: CodeCellOptions, theme: Theme): string[]
 		outputLines.push(...displayLines);
 		const remaining = rawLines.length - maxLines;
 		if (remaining > 0) {
-			const hint = formatExpandHint(theme, expanded, remaining > 0);
+			const hint = formatExpandHint(
+				theme,
+				expanded,
+				remaining > 0,
+				options.expandHintCapability ?? noExpandHintCapability,
+			);
 			const moreLine = `${formatMoreItems(remaining, "line")}${hint ? ` ${hint}` : ""}`;
 			outputLines.push(theme.fg("dim", moreLine));
 		}
@@ -147,6 +158,7 @@ export interface MarkdownCellOptions {
 	outputMaxLines?: number;
 	contentMaxLines?: number;
 	expanded?: boolean;
+	expandHintCapability?: ExpandHintCapability;
 	width: number;
 }
 
@@ -173,7 +185,12 @@ export function renderMarkdownCell(options: MarkdownCellOptions, theme: Theme): 
 	const contentLines = allLines.slice(0, maxContentLines);
 	const hiddenContentLines = allLines.length - maxContentLines;
 	if (hiddenContentLines > 0) {
-		const hint = formatExpandHint(theme, expanded, hiddenContentLines > 0);
+		const hint = formatExpandHint(
+			theme,
+			expanded,
+			hiddenContentLines > 0,
+			options.expandHintCapability ?? noExpandHintCapability,
+		);
 		const moreLine = `${formatMoreItems(hiddenContentLines, "line")}${hint ? ` ${hint}` : ""}`;
 		contentLines.push(theme.fg("dim", moreLine));
 	}
@@ -188,7 +205,12 @@ export function renderMarkdownCell(options: MarkdownCellOptions, theme: Theme): 
 		outputLines.push(...displayLines);
 		const remaining = rawLines.length - maxLines;
 		if (remaining > 0) {
-			const hint = formatExpandHint(theme, expanded, remaining > 0);
+			const hint = formatExpandHint(
+				theme,
+				expanded,
+				remaining > 0,
+				options.expandHintCapability ?? noExpandHintCapability,
+			);
 			const moreLine = `${formatMoreItems(remaining, "line")}${hint ? ` ${hint}` : ""}`;
 			outputLines.push(theme.fg("dim", moreLine));
 		}

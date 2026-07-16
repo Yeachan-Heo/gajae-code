@@ -82,7 +82,7 @@ export function buildStatusFooter(opts: {
 			? () =>
 					theme.fg(
 						"dim",
-						`… ${opts.hiddenLineCount} more lines${expandHintSuffix(theme, opts.expandHintCapability)}`,
+						`… ${opts.hiddenLineCount} more lines${expandHintSuffix(theme, opts.expandHintCapability!)}`,
 					)
 			: undefined;
 	if (opts.status === "cancelled") {

@@ -881,6 +881,8 @@ export const vimToolRenderer = {
 				options.expanded,
 				uiTheme,
 				(filePath: string) => uiTheme.getLangIcon(getLanguageFromPath(filePath)),
+				(options as RenderResultOptions & { expandHintCapability: import("./render-utils").ExpandHintCapability })
+					.expandHintCapability,
 			);
 			if (diagText) {
 				sections.push({ lines: [diagText] });

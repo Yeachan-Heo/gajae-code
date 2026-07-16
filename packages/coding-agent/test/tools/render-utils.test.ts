@@ -262,6 +262,7 @@ describe("formatDiagnostics", () => {
 			true,
 			theme!,
 			() => "go",
+			() => false,
 		);
 
 		expect(formatted).not.toContain("\t");

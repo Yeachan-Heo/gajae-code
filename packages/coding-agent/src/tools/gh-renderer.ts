@@ -234,6 +234,7 @@ function renderFailedLogs(
 	width: number,
 	theme: Theme,
 	expanded: boolean,
+	expandHintCapability: import("./render-utils").ExpandHintCapability,
 ): string[] {
 	if (failedLogs.length === 0) {
 		return [];
@@ -261,7 +262,12 @@ function renderFailedLogs(
 
 		if (!expanded && tailLines.length > previewLimit) {
 			const remaining = tailLines.length - previewLimit;
-			lines.push(theme.fg("dim", `  … ${remaining} more log lines ${formatExpandHint(theme, false, true)}`));
+			lines.push(
+				theme.fg(
+					"dim",
+					`  … ${remaining} more log lines ${formatExpandHint(theme, false, true, expandHintCapability)}`,
+				),
+			);
 		}
 	}
 
@@ -296,7 +302,9 @@ function buildWatchLines(
 		}
 	}
 
-	lines.push(...renderFailedLogs(watch.failedLogs ?? [], width, theme, options.expanded));
+	lines.push(
+		...renderFailedLogs(watch.failedLogs ?? [], width, theme, options.expanded, options.expandHintCapability!),
+	);
 	return lines;
 }
 
@@ -350,7 +358,7 @@ function renderFallbackComponent(
 				out.push(truncateVisualWidth(colored, lineWidth));
 			}
 			if (!expanded && remaining > 0) {
-				const hint = formatExpandHint(theme, expanded, true);
+				const hint = formatExpandHint(theme, expanded, true, options.expandHintCapability!);
 				const more = `${formatMoreItems(remaining, "line")}${hint ? ` ${hint}` : ""}`;
 				out.push(theme.fg("dim", more));
 			}

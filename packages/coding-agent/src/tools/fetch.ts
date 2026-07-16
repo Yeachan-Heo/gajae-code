@@ -1545,7 +1545,7 @@ export function renderReadUrlResult(
 						? previewLines.map(line => uiTheme.fg("dim", line))
 						: [uiTheme.fg("dim", "(no content)")];
 				if (remaining > 0) {
-					const hint = formatExpandHint(uiTheme, expanded, true);
+					const hint = formatExpandHint(uiTheme, expanded, true, options.expandHintCapability!);
 					contentPreviewLines.push(uiTheme.fg("muted", `… ${remaining} more lines${hint ? ` ${hint}` : ""}`));
 				}
 				lastExpanded = expanded;

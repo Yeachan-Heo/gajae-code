@@ -8,10 +8,14 @@ import { BranchSummaryMessageComponent } from "../../../src/modes/components/bra
 import { CompactionSummaryMessageComponent } from "../../../src/modes/components/compaction-summary-message";
 import { EvalExecutionComponent } from "../../../src/modes/components/eval-execution";
 import { ReadToolGroupComponent } from "../../../src/modes/components/read-tool-group";
+import { ToolExecutionComponent } from "../../../src/modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../../src/modes/components/ttsr-notification";
 import { ExtensionUiController } from "../../../src/modes/controllers/extension-ui-controller";
-import { initTheme } from "../../../src/modes/theme/theme";
+import { getThemeByName, initTheme } from "../../../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../../../src/modes/types";
+import { renderMCPResult } from "../../../src/runtime-mcp/render";
+import { writeToolRenderer } from "../../../src/tools/write";
+import { renderCodeCell, renderMarkdownCell } from "../../../src/tui/code-cell";
 
 const HINT = "Ctrl+O";
 
@@ -143,6 +147,73 @@ describe("instance-scoped expansion hints", () => {
 		close?.(undefined);
 		await result;
 		expect(fixture.ui.hasOverlay()).toBe(false);
+		expect(render(component)).toContain(HINT);
+	});
+	it("refreshes generic fallback, runtime MCP, and secondary code-cell hints across overlays", async () => {
+		const fixture = createUi();
+		const canExpand = capability(fixture);
+		const generic = new ToolExecutionComponent(
+			"unknown",
+			{},
+			{},
+			undefined,
+			fixture.ui,
+			"/tmp",
+			undefined,
+			canExpand,
+		);
+		generic.updateResult({ content: [{ type: "text", text: manyLines() }] });
+		const theme = await getThemeByName("red-claw");
+		expect(theme).toBeDefined();
+		const mcp = renderMCPResult(
+			{ content: [{ type: "text", text: manyLines() }] },
+			{ expanded: false, isPartial: false, expandHintCapability: canExpand },
+			theme!,
+		);
+		const code = () =>
+			renderCodeCell(
+				{ code: manyLines(), expanded: false, codeMaxLines: 1, width: 100, expandHintCapability: canExpand },
+				theme!,
+			);
+		const markdown = () =>
+			renderMarkdownCell(
+				{ content: manyLines(), expanded: false, contentMaxLines: 1, width: 100, expandHintCapability: canExpand },
+				theme!,
+			);
+
+		expect(render(generic)).toContain(HINT);
+		expect(render(mcp)).toContain(HINT);
+		expect(Bun.stripANSI(code().join("\n"))).toContain(HINT);
+		expect(Bun.stripANSI(markdown().join("\n"))).toContain(HINT);
+		const overlay = fixture.ui.showOverlay(new Text("overlay"));
+		generic.setExpanded(false);
+		expect(render(generic)).not.toContain(HINT);
+		expect(render(mcp)).not.toContain(HINT);
+		expect(Bun.stripANSI(code().join("\n"))).not.toContain(HINT);
+		expect(Bun.stripANSI(markdown().join("\n"))).not.toContain(HINT);
+		overlay.hide();
+		generic.setExpanded(false);
+		expect(render(generic)).toContain(HINT);
+		expect(render(mcp)).toContain(HINT);
+		expect(Bun.stripANSI(code().join("\n"))).toContain(HINT);
+		expect(Bun.stripANSI(markdown().join("\n"))).toContain(HINT);
+	});
+
+	it("threads write preview hints through render options", async () => {
+		const fixture = createUi();
+		const canExpand = capability(fixture);
+		const theme = await getThemeByName("red-claw");
+		expect(theme).toBeDefined();
+		const component = writeToolRenderer.renderResult(
+			{ content: [], details: undefined },
+			{ expanded: false, isPartial: false, expandHintCapability: canExpand },
+			theme!,
+			{ path: "/tmp/output.ts", content: manyLines() },
+		);
+		expect(render(component)).toContain(HINT);
+		const overlay = fixture.ui.showOverlay(new Text("overlay"));
+		expect(render(component)).not.toContain(HINT);
+		overlay.hide();
 		expect(render(component)).toContain(HINT);
 	});
 });
