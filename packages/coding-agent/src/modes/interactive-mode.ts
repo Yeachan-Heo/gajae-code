@@ -339,6 +339,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	btwContainer: Container;
 	editor: CustomEditor;
 	editorContainer: Container;
+	expandHintCapability = () =>
+		!this.ui.hasOverlay() && (this.ui.focusedComponent === null || this.ui.focusedComponent === this.editor);
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	petFloorContainer: Container = new Container();

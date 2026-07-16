@@ -1,6 +1,7 @@
 import { Box, Markdown, Spacer, Text } from "@gajae-code/tui";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import type { BranchSummaryMessage } from "../../session/messages";
+import type { ExpandHintCapability } from "../../tools/render-utils";
 import { expandHintSuffix } from "../../tools/render-utils";
 
 /**
@@ -10,7 +11,10 @@ import { expandHintSuffix } from "../../tools/render-utils";
 export class BranchSummaryMessageComponent extends Box {
 	#expanded = false;
 
-	constructor(private readonly message: BranchSummaryMessage) {
+	constructor(
+		private readonly message: BranchSummaryMessage,
+		private readonly expandHintCapability?: ExpandHintCapability,
+	) {
 		super(1, 1, t => theme.bg("customMessageBg", t));
 		this.#updateDisplay();
 	}
@@ -40,7 +44,12 @@ export class BranchSummaryMessageComponent extends Box {
 				}),
 			);
 		} else {
-			this.addChild(new Text(theme.fg("customMessageText", `Branch summary${expandHintSuffix(theme)}`), 0, 0));
+			this.addChild({
+				render: () => [
+					theme.fg("customMessageText", `Branch summary${expandHintSuffix(theme, this.expandHintCapability)}`),
+				],
+				invalidate: () => {},
+			});
 		}
 	}
 }

@@ -20,6 +20,7 @@ import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import type { CredentialAutoImportOptions } from "../setup/credential-auto-import";
 import type { LspStartupServerInfo } from "../tools";
+import type { ExpandHintCapability } from "../tools/render-utils";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import type { CommandPaletteAction } from "./components/command-palette";
@@ -84,6 +85,7 @@ export interface InteractiveModeContext {
 	btwContainer: Container;
 	editor: CustomEditor;
 	editorContainer: Container;
+	expandHintCapability?: ExpandHintCapability;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;

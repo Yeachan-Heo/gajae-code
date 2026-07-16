@@ -143,17 +143,13 @@ export function formatStatusIcon(status: ToolUIStatus, theme: Theme, spinnerFram
 }
 
 /**
- * Tool-output expansion hints advertise `app.tools.expand` only while the
- * composer owns input focus.
+ * Capability supplied by an interactive mode to determine whether expansion
+ * hints may be displayed for that mode's composer.
  */
-let expandHintOwnerFocused = true;
+export type ExpandHintCapability = () => boolean;
 
-export function setExpandHintOwnerFocused(focused: boolean): void {
-	expandHintOwnerFocused = focused;
-}
-
-function formatExpandKey(): string {
-	return expandHintOwnerFocused ? formatKeyHints(getKeybindings().getKeys("app.tools.expand")) : "";
+function formatExpandKey(capability: ExpandHintCapability | undefined): string {
+	return capability?.() ? formatKeyHints(getKeybindings().getKeys("app.tools.expand")) : "";
 }
 
 /**
@@ -161,15 +157,20 @@ function formatExpandKey(): string {
  * Returns empty string if already expanded, there is nothing more to show, or
  * the composer does not own input focus.
  */
-export function formatExpandHint(theme: Theme, expanded?: boolean, hasMore?: boolean): string {
+export function formatExpandHint(
+	theme: Theme,
+	expanded?: boolean,
+	hasMore?: boolean,
+	capability?: ExpandHintCapability,
+): string {
 	if (expanded || hasMore === false) return "";
-	const key = formatExpandKey();
+	const key = formatExpandKey(capability);
 	return key ? theme.fg("dim", wrapBrackets(`(${key} for more)`, theme)) : "";
 }
 
 /** Format a suffix for collapsed tool output that can be expanded. */
-export function expandHintSuffix(_theme: Theme): string {
-	const key = formatExpandKey();
+export function expandHintSuffix(_theme: Theme, capability?: ExpandHintCapability): string {
+	const key = formatExpandKey(capability);
 	return key ? ` (${key} to expand)` : "";
 }
 

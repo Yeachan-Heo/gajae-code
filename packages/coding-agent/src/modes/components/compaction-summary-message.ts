@@ -1,6 +1,7 @@
 import { Box, Markdown, Spacer, Text } from "@gajae-code/tui";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import type { CompactionSummaryMessage } from "../../session/messages";
+import type { ExpandHintCapability } from "../../tools/render-utils";
 import { expandHintSuffix } from "../../tools/render-utils";
 
 /**
@@ -10,7 +11,10 @@ import { expandHintSuffix } from "../../tools/render-utils";
 export class CompactionSummaryMessageComponent extends Box {
 	#expanded = false;
 
-	constructor(private readonly message: CompactionSummaryMessage) {
+	constructor(
+		private readonly message: CompactionSummaryMessage,
+		private readonly expandHintCapability?: ExpandHintCapability,
+	) {
 		super(1, 1, t => theme.bg("customMessageBg", t));
 		this.#updateDisplay();
 	}
@@ -41,13 +45,15 @@ export class CompactionSummaryMessageComponent extends Box {
 				}),
 			);
 		} else {
-			this.addChild(
-				new Text(
-					theme.fg("customMessageText", `Compacted from ${tokenStr} tokens${expandHintSuffix(theme)}`),
-					0,
-					0,
-				),
-			);
+			this.addChild({
+				render: () => [
+					theme.fg(
+						"customMessageText",
+						`Compacted from ${tokenStr} tokens${expandHintSuffix(theme, this.expandHintCapability)}`,
+					),
+				],
+				invalidate: () => {},
+			});
 			if (this.message.shortSummary) {
 				this.addChild(new Text(theme.fg("customMessageText", this.message.shortSummary), 0, 1));
 			}
