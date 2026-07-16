@@ -80,6 +80,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	#entries = new Map<string, ReadEntry>();
 	#text: Text;
 	#expanded = false;
+	#manuallyExpanded: boolean | undefined;
 	#showContentPreview: boolean;
 
 	constructor(options: ReadToolGroupOptions = {}) {
@@ -138,6 +139,16 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	}
 
 	setExpanded(expanded: boolean): void {
+		if (this.#manuallyExpanded !== undefined) return;
+		this.#expanded = expanded;
+		this.#updateDisplay();
+	}
+
+	/**
+	 * Apply an explicit user fold choice. Automatic updates must retain this choice.
+	 */
+	setManuallyExpanded(expanded: boolean): void {
+		this.#manuallyExpanded = expanded;
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}

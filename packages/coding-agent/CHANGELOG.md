@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- The tool-output expand shortcut now stamps an explicit per-block fold choice, and automatic expansion stamping can no longer overwrite a block whose state came from an explicit user action. All current automatic stamping happens at component creation, so behavior is unchanged today; this locks the invariant for future per-block folds.
+
 ## [0.11.0] - 2026-07-15
 
 ### Fixed

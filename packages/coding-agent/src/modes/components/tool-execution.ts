@@ -174,6 +174,7 @@ export class ToolExecutionComponent extends Container {
 	#toolLabel: string;
 	#args: any;
 	#expanded = false;
+	#manuallyExpanded: boolean | undefined;
 	#showImages: boolean;
 	#editFuzzyThreshold: number | undefined;
 	#editAllowFuzzy: boolean | undefined;
@@ -451,6 +452,16 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	setExpanded(expanded: boolean): void {
+		if (this.#manuallyExpanded !== undefined) return;
+		this.#expanded = expanded;
+		this.#updateDisplay();
+	}
+
+	/**
+	 * Apply an explicit user fold choice. Automatic updates must retain this choice.
+	 */
+	setManuallyExpanded(expanded: boolean): void {
+		this.#manuallyExpanded = expanded;
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}

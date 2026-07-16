@@ -26,6 +26,17 @@ interface Expandable {
 	setExpanded(expanded: boolean): void;
 }
 
+interface ManuallyExpandable extends Expandable {
+	setManuallyExpanded(expanded: boolean): void;
+}
+
+function isManuallyExpandable(obj: unknown): obj is ManuallyExpandable {
+	return (
+		isExpandable(obj) &&
+		"setManuallyExpanded" in obj &&
+		typeof obj.setManuallyExpanded === "function"
+	);
+}
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
 const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
@@ -1363,7 +1374,9 @@ export class InputController {
 	setToolsExpanded(expanded: boolean): void {
 		this.ctx.toolOutputExpanded = expanded;
 		for (const child of this.ctx.chatContainer.children) {
-			if (isExpandable(child)) {
+			if (isManuallyExpandable(child)) {
+				child.setManuallyExpanded(expanded);
+			} else if (isExpandable(child)) {
 				child.setExpanded(expanded);
 			}
 		}
