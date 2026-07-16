@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
 import type { ActiveSubskillEntry, SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
 import {
@@ -12,10 +13,13 @@ import {
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
 import {
+	decodeSessionSegment,
+	GJC_SESSION_PREFIX,
 	activeEntryPath as layoutActiveEntryPath,
 	activeSnapshotPath as layoutActiveSnapshotPath,
 	activeStateDir as layoutActiveStateDir,
 	auditPath as layoutAuditPath,
+	modeStatePath as layoutModeStatePath,
 	transactionJournalPath as layoutTransactionJournalPath,
 } from "./session-layout";
 import { RequiredOnWriteEnvelopeSchema } from "./state-schema";
@@ -76,6 +80,7 @@ export interface WorkflowEnvelopeIntegrityMismatch {
 	path: string;
 	expected: string;
 	actual: string;
+	reason: "checksum" | "covered_path" | "storage_path" | "state_path" | "missing_active_snapshot";
 }
 
 export interface WorkflowTransactionJournal {
@@ -274,6 +279,83 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 	return envelope as T;
 }
 
+function pathsResolveEqual(left: string, right: string): boolean {
+	return path.resolve(left) === path.resolve(right);
+}
+
+function receiptPathMismatch(
+	filePath: string,
+	receipt: Record<string, unknown>,
+	checksum: Record<string, unknown>,
+): WorkflowEnvelopeIntegrityMismatch | undefined {
+	const resolvedFilePath = path.resolve(filePath);
+	const skill = safeString(receipt.skill).trim();
+	const stateDir = path.dirname(resolvedFilePath);
+	const expectedStoragePath = path.join(stateDir, `${skill}-state.json`);
+	const expectedSnapshotPath = path.join(stateDir, "skill-active-state.json");
+
+	if (
+		!skill ||
+		path.basename(stateDir) !== "state" ||
+		!path.basename(path.dirname(stateDir)).startsWith("_session-") ||
+		path.basename(path.dirname(path.dirname(stateDir))) !== ".gjc" ||
+		!pathsResolveEqual(resolvedFilePath, expectedStoragePath)
+	) {
+		return {
+			path: resolvedFilePath,
+			expected: expectedStoragePath,
+			actual: resolvedFilePath,
+			reason: "storage_path",
+		};
+	}
+
+	const storagePath = safeString(receipt.storage_path).trim();
+	if (!storagePath || !pathsResolveEqual(storagePath, resolvedFilePath)) {
+		return {
+			path: resolvedFilePath,
+			expected: resolvedFilePath,
+			actual: storagePath,
+			reason: "storage_path",
+		};
+	}
+
+	const statePath = safeString(receipt.state_path).trim();
+	if (!statePath || !pathsResolveEqual(statePath, expectedSnapshotPath)) {
+		return {
+			path: resolvedFilePath,
+			expected: expectedSnapshotPath,
+			actual: statePath,
+			reason: "state_path",
+		};
+	}
+
+	const coveredPath = safeString(checksum.covered_path).trim();
+	if (!coveredPath || !pathsResolveEqual(coveredPath, resolvedFilePath)) {
+		return {
+			path: resolvedFilePath,
+			expected: resolvedFilePath,
+			actual: coveredPath,
+			reason: "covered_path",
+		};
+	}
+
+	return undefined;
+}
+
+function isCanonicalWorkflowModeStatePath(filePath: string): boolean {
+	const resolvedPath = path.resolve(filePath);
+	const stateDir = path.dirname(resolvedPath);
+	const sessionDir = path.basename(path.dirname(stateDir));
+	const skill = path.basename(resolvedPath).replace(/-state\.json$/, "");
+	return (
+		path.basename(stateDir) === "state" &&
+		sessionDir.startsWith(GJC_SESSION_PREFIX) &&
+		path.basename(path.dirname(path.dirname(stateDir))) === ".gjc" &&
+		CANONICAL_GJC_WORKFLOW_SKILLS.includes(skill as CanonicalGjcWorkflowSkill) &&
+		path.basename(resolvedPath) === `${skill}-state.json`
+	);
+}
+
 export async function detectWorkflowEnvelopeIntegrityMismatch(
 	filePath: string,
 ): Promise<WorkflowEnvelopeIntegrityMismatch | undefined> {
@@ -285,8 +367,112 @@ export async function detectWorkflowEnvelopeIntegrityMismatch(
 	if (!checksum || typeof checksum !== "object" || Array.isArray(checksum)) return undefined;
 	const expected = (checksum as Record<string, unknown>).value;
 	if (typeof expected !== "string" || !expected) return undefined;
+
+	const pathMismatch = receiptPathMismatch(
+		filePath,
+		receipt as Record<string, unknown>,
+		checksum as Record<string, unknown>,
+	);
+	if (pathMismatch) return pathMismatch;
+
+	const receiptRecord = receipt as Record<string, unknown>;
+	const snapshotPath = path.resolve(safeString(receiptRecord.state_path));
+	try {
+		const snapshot = await fs.stat(snapshotPath);
+		if (!snapshot.isFile()) {
+			return {
+				path: path.resolve(filePath),
+				expected: snapshotPath,
+				actual: "not a file",
+				reason: "missing_active_snapshot",
+			};
+		}
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) {
+			return {
+				path: path.resolve(filePath),
+				expected: snapshotPath,
+				actual: "missing",
+				reason: "missing_active_snapshot",
+			};
+		}
+		throw error;
+	}
+
 	const actual = workflowEnvelopeContentSha256(current);
-	return actual === expected ? undefined : { path: filePath, expected, actual };
+	return actual === expected ? undefined : { path: filePath, expected, actual, reason: "checksum" };
+}
+
+function assertWorkflowEnvelopeReceiptBinding(
+	value: unknown,
+	filePath: string,
+	options: StateWriterOptions | undefined,
+): { cwd: string; sessionId: string; snapshotPath: string } {
+	if (!isPlainObject(value) || !isPlainObject(value.receipt) || !isPlainObject(value.receipt.content_sha256)) {
+		throw new Error(`workflow envelope is missing a receipt checksum: ${filePath}`);
+	}
+
+	const receipt = value.receipt as Record<string, unknown>;
+	const checksum = receipt.content_sha256 as Record<string, unknown>;
+	const pathMismatch = receiptPathMismatch(filePath, receipt, checksum);
+	if (pathMismatch || safeString(value.skill).trim() !== safeString(receipt.skill).trim()) {
+		throw new Error(`workflow receipt paths must bind to the canonical mode-state and active snapshot: ${filePath}`);
+	}
+
+	const stateDir = path.dirname(path.resolve(filePath));
+	const sessionDir = path.basename(path.dirname(stateDir));
+	if (!sessionDir.startsWith(GJC_SESSION_PREFIX)) {
+		throw new Error(`workflow receipt does not reference a canonical session state directory: ${filePath}`);
+	}
+	const sessionId = requireSessionId(
+		decodeSessionSegment(sessionDir.slice(GJC_SESSION_PREFIX.length)),
+		"workflow envelope receipt",
+	);
+	const cwd = path.dirname(path.dirname(path.dirname(stateDir)));
+	const snapshotPath = layoutActiveSnapshotPath(cwd, sessionId);
+
+	if (options?.receipt) {
+		const receiptContext = options.receipt;
+		const expectedCwd = path.resolve(receiptContext.cwd ?? options.cwd ?? process.cwd());
+		const expectedStoragePath = layoutModeStatePath(expectedCwd, sessionId, receiptContext.skill);
+		const expectedSnapshotPath = layoutActiveSnapshotPath(expectedCwd, sessionId);
+		if (
+			safeString(value.skill).trim() !== receiptContext.skill ||
+			safeString(receipt.skill).trim() !== receiptContext.skill ||
+			!pathsResolveEqual(filePath, expectedStoragePath) ||
+			!pathsResolveEqual(safeString(receipt.storage_path), expectedStoragePath) ||
+			!pathsResolveEqual(safeString(receipt.state_path), expectedSnapshotPath) ||
+			!pathsResolveEqual(safeString(checksum.covered_path), expectedStoragePath)
+		) {
+			throw new Error(
+				`workflow receipt context does not match the canonical mode-state and active snapshot: ${filePath}`,
+			);
+		}
+	}
+
+	return { cwd, sessionId, snapshotPath };
+}
+
+async function establishReceiptActiveSnapshot(
+	value: unknown,
+	filePath: string,
+	options: StateWriterOptions | undefined,
+): Promise<void> {
+	if (!isPlainObject(value) || !Object.hasOwn(value, "receipt") || !isCanonicalWorkflowModeStatePath(filePath)) return;
+
+	const receipt = assertWorkflowEnvelopeReceiptBinding(value, filePath, options);
+	await rebuildActiveSnapshot(
+		receipt.cwd,
+		{ sessionId: receipt.sessionId },
+		{
+			cwd: receipt.cwd,
+			lock: options?.lock,
+		},
+	);
+	const snapshot = await fs.stat(receipt.snapshotPath);
+	if (!snapshot.isFile()) {
+		throw new Error(`canonical active snapshot is not a file: ${receipt.snapshotPath}`);
+	}
 }
 
 function safeString(value: unknown): string {
@@ -584,6 +770,7 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 							.join("; ")}`,
 					);
 				}
+				await establishReceiptActiveSnapshot(next, filePath, options);
 				await atomicWrite(filePath, jsonText(next));
 				await maybeAudit(filePath, options);
 				return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
@@ -609,6 +796,7 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 						.join("; ")}`,
 				);
 			}
+			await establishReceiptActiveSnapshot(next, filePath, options);
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
 			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
@@ -739,6 +927,7 @@ export async function writeWorkflowEnvelopeAtomic(
 			}
 		}
 	}
+	await establishReceiptActiveSnapshot(stamped, filePath, options);
 	await atomicWrite(filePath, jsonText(stamped));
 	await maybeAudit(filePath, options);
 	return filePath;

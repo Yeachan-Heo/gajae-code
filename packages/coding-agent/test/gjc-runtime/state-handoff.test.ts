@@ -266,7 +266,8 @@ describe("gjc state handoff", () => {
 			expect(callee?.handoff_from).toBe("deep-interview");
 			expect(caller?.active).toBe(false);
 			expect(caller?.handoff_to).toBe("ralplan");
-			expect(await readJson(activeSnapshotPath(cwd, TEST_SESSION_ID))).toBeNull();
+			const activeSnapshot = await readJson(activeSnapshotPath(cwd, TEST_SESSION_ID));
+			expect(activeSnapshot).toMatchObject({ active: false, active_skills: [] });
 		});
 	});
 
@@ -425,7 +426,7 @@ describe("gjc state handoff", () => {
 			expect(typeof ralplanEntry?.handoff_at).toBe("string");
 		});
 	});
-	it("propagates strict sync failure when active-state write fails after mode-state writes succeed", async () => {
+	it("fails before mode-state publication when the required active snapshot path is a directory", async () => {
 		await withTempCwd(async cwd => {
 			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
 			await writeJson(callerPath, {
@@ -434,31 +435,20 @@ describe("gjc state handoff", () => {
 				active: true,
 				current_phase: "interviewing",
 			});
-			// Pre-create the root active-state path AS A DIRECTORY so writing it
-			// fails *after* both mode-state writes have already succeeded. This
-			// exercises the strict active-state path, not the pre-sync mode-state
-			// path, and proves the CLI returns non-zero status when the atomic
-			// transaction cannot complete.
+			// A receipt-bearing mode-state write must establish the canonical active
+			// snapshot before publication. A directory at that path therefore blocks the
+			// handoff before either caller or callee mode-state can be mutated.
 			await fs.mkdir(activeSnapshotPath(cwd, TEST_SESSION_ID), { recursive: true });
-
 			const result = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
 				cwd,
 			);
 			expect(result.status).toBe(1);
 			expect(result.stderr).toMatch(/director(?:y|ies)|EISDIR/i);
-			// Mode-state writes precede strict active-state synchronization. Removing
-			// the transient obstruction and retrying the same documented handoff command
-			// must rebuild the active lineage without overwriting either mode-state.
 			const caller = parseRequiredJson(await fs.readFile(callerPath, "utf-8"), "caller mode state");
-			expect(caller.current_phase).toBe("handoff");
-			expect(caller.active).toBe(false);
-			const callee = parseRequiredJson(
-				await fs.readFile(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"), "utf-8"),
-				"callee mode state",
-			);
-			expect(callee.active).toBe(true);
-			expect(callee.handoff_from).toBe("deep-interview");
+			expect(caller.current_phase).toBe("interviewing");
+			expect(caller.active).toBe(true);
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"))).rejects.toThrow();
 
 			await fs.rm(activeSnapshotPath(cwd, TEST_SESSION_ID), { recursive: true, force: true });
 			const retried = await runNativeStateCommand(

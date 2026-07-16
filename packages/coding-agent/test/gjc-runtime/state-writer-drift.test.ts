@@ -4,7 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
-import { auditPath, modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import {
+	activeSnapshotPath,
+	auditPath,
+	modeStatePath,
+	sessionStateDir,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { migrateAndPersistLegacyState } from "@gajae-code/coding-agent/gjc-runtime/state-migrations";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { RequiredOnWriteEnvelopeSchema } from "@gajae-code/coding-agent/gjc-runtime/state-schema";
@@ -148,6 +153,9 @@ describe("workflow state writer drift guard", () => {
 			},
 		);
 		await expectPersistedEnvelope(statePath);
+		await expect(fs.stat(activeSnapshotPath(root, TEST_SESSION_ID))).resolves.toMatchObject({
+			isFile: expect.any(Function),
+		});
 	});
 
 	it("persists required-on-write v2 envelope for ralplan persist-run-id from legacy v1 state", async () => {

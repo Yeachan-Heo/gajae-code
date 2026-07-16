@@ -6,6 +6,7 @@ import {
 	detectWorkflowEnvelopeIntegrityMismatch,
 	removeActiveEntry,
 	StateWriteConflictError,
+	workflowEnvelopeContentSha256,
 	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
@@ -130,7 +131,7 @@ describe("GJC state writer revision policy", () => {
 
 	it("authoritative mode-state write conflict fails visibly and preserves newer state", async () => {
 		const root = await cwd();
-		const target = ".gjc/_session-sess/state/mode-state/deep-interview.json";
+		const target = ".gjc/_session-sess/state/deep-interview-state.json";
 		const base = modeEnvelope("interviewing");
 		await writeGuardedWorkflowEnvelopeAtomic(target, base, { cwd: root, policy: "source", receipt: receipt(root) });
 		await writeGuardedWorkflowEnvelopeAtomic(
@@ -152,7 +153,7 @@ describe("GJC state writer revision policy", () => {
 
 	it("guarded workflow envelope checksum covers final receipt and state_revision", async () => {
 		const root = await cwd();
-		const target = ".gjc/_session-sess/state/mode-state/deep-interview.json";
+		const target = ".gjc/_session-sess/state/deep-interview-state.json";
 
 		await writeGuardedWorkflowEnvelopeAtomic(target, modeEnvelope("interviewing"), {
 			cwd: root,
@@ -166,10 +167,56 @@ describe("GJC state writer revision policy", () => {
 			receipt: { content_sha256: {} },
 		});
 	});
+	it("creates the canonical active snapshot before accepting a receipt-bearing envelope", async () => {
+		const root = await cwd();
+		const target = ".gjc/_session-sess/state/deep-interview-state.json";
+		const filePath = path.join(root, target);
+
+		await writeGuardedWorkflowEnvelopeAtomic(target, modeEnvelope("interviewing"), {
+			cwd: root,
+			policy: "source",
+			receipt: receipt(root),
+		});
+
+		const persisted = await readJson(root, target);
+		const statePath = (persisted.receipt as Record<string, unknown>).state_path as string;
+		await expect(fs.stat(statePath)).resolves.toMatchObject({ isFile: expect.any(Function) });
+
+		await fs.rm(statePath);
+		await expect(detectWorkflowEnvelopeIntegrityMismatch(filePath)).resolves.toMatchObject({
+			reason: "missing_active_snapshot",
+			expected: statePath,
+			actual: "missing",
+		});
+	});
+
+	it("detects covered_path-only checksum metadata tampering", async () => {
+		const root = await cwd();
+		const target = ".gjc/_session-sess/state/deep-interview-state.json";
+		const filePath = path.join(root, target);
+
+		await writeGuardedWorkflowEnvelopeAtomic(target, modeEnvelope("interviewing"), {
+			cwd: root,
+			policy: "source",
+			receipt: receipt(root),
+		});
+
+		const persisted = await readJson(root, target);
+		const checksum = (persisted.receipt as Record<string, unknown>).content_sha256 as Record<string, unknown>;
+		checksum.covered_path = path.join(root, ".gjc", "_session-sess", "state", "ralplan-state.json");
+		checksum.value = workflowEnvelopeContentSha256(persisted);
+		await fs.writeFile(filePath, JSON.stringify(persisted, null, 2));
+
+		await expect(detectWorkflowEnvelopeIntegrityMismatch(filePath)).resolves.toMatchObject({
+			reason: "covered_path",
+			expected: filePath,
+			actual: path.join(root, ".gjc", "_session-sess", "state", "ralplan-state.json"),
+		});
+	});
 
 	it("deep-interview recorder conflict fails visibly for direct recorder writes", async () => {
 		const root = await cwd();
-		const target = ".gjc/_session-sess/state/mode-state/deep-interview.json";
+		const target = ".gjc/_session-sess/state/deep-interview-state.json";
 		const base = {
 			...modeEnvelope("interviewing"),
 			state: { rounds: [{ round_key: "r1", round: 1 }] },

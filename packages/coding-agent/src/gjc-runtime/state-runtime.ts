@@ -593,7 +593,7 @@ async function collectDoctorSummary(
 				doctorProblem(
 					"checksum_mismatch",
 					filePath,
-					`expected sha256 ${mismatch.expected} but found ${mismatch.actual}`,
+					`workflow integrity mismatch (${mismatch.reason}): expected ${mismatch.expected} but found ${mismatch.actual}`,
 					`gjc state ${currentSkill} migrate`,
 					currentSkill,
 				),
@@ -780,13 +780,15 @@ async function warnAndAuditOutOfBandIfNeeded(
 	let mismatch: WorkflowEnvelopeIntegrityMismatch | undefined;
 	try {
 		mismatch = await detectWorkflowEnvelopeIntegrityMismatch(filePath);
-	} catch {
-		// Unparseable/corrupt state has no recoverable checksum to compare; the strict
-		// mutation reader already gates unforced overwrites, so fail-open here.
-		return undefined;
+	} catch (error) {
+		// A malformed prior envelope has no checksum to compare; the strict mutation
+		// reader already gates unforced overwrites. Filesystem failures remain fatal so
+		// receipt validation never silently bypasses inaccessible state.
+		if (error instanceof SyntaxError) return undefined;
+		throw error;
 	}
 	if (!mismatch) return undefined;
-	const message = `WARNING: workflow mode-state out-of-band edit detected for ${skill}: ${filePath} expected sha256 ${mismatch.expected} but found ${mismatch.actual}`;
+	const message = `WARNING: workflow mode-state out-of-band edit detected (${mismatch.reason}) for ${skill}: ${filePath} expected ${mismatch.expected} but found ${mismatch.actual}`;
 	await appendAuditEntry(cwd, sessionId, {
 		ts: new Date().toISOString(),
 		skill,
