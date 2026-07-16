@@ -378,31 +378,24 @@ export class QueryHandlers {
 		const input = request.input ?? {};
 		const artifactId = String(input.artifactId ?? "");
 		const start = Math.max(0, Number(input.offset ?? 0));
-		const maxRawBytes = Math.floor(((RESPONSE_CEILING_BYTES - 4096) * 3) / 4);
+		const emptyResult = { artifactId, offset: start, bytes: "", complete: false };
+		const baseBytes = Buffer.byteLength(JSON.stringify({ id: request.id, ok: true, result: emptyResult }));
+		const maxRawBytes = Math.floor(((RESPONSE_CEILING_BYTES - baseBytes) * 3) / 4);
 		const requested = Math.max(0, Math.min(Number(input.length ?? TARGET_PAGE_BYTES), maxRawBytes));
 		const artifact = await this.surface.getArtifactRange?.(artifactId, start, requested);
 		if (!artifact) return this.#error(request, "resource_gone");
-		let bytes = Buffer.from(artifact.bytes);
-		let result = {
-			artifactId,
-			offset: start,
-			bytes: bytes.toString("base64"),
-			complete: start + bytes.length >= artifact.totalBytes,
-		};
-		while (
-			Buffer.byteLength(JSON.stringify({ id: request.id, ok: true, result })) >= RESPONSE_CEILING_BYTES &&
-			bytes.length > 0
-		) {
-			bytes = bytes.subarray(0, bytes.length - Math.max(1, Math.ceil(bytes.length / 128)));
-			result = {
+		const bytes = Buffer.from(artifact.bytes);
+		if (bytes.length === 0 && start < artifact.totalBytes) return this.#error(request, "item_too_large");
+		return {
+			id: request.id,
+			ok: true,
+			result: {
 				artifactId,
 				offset: start,
 				bytes: bytes.toString("base64"),
 				complete: start + bytes.length >= artifact.totalBytes,
-			};
-		}
-		if (bytes.length === 0 && start < artifact.totalBytes) return this.#error(request, "item_too_large");
-		return { id: request.id, ok: true, result };
+			},
+		};
 	}
 
 	async #paginate(
@@ -417,12 +410,17 @@ export class QueryHandlers {
 	): Promise<QueryResponse> {
 		const values = Array.isArray(snapshot) ? snapshot : [snapshot];
 		const items: unknown[] = [];
+		let itemsBytes = 2; // []
 		let index = offset;
 		while (index < values.length) {
-			const candidate = [...items, values[index]];
-			if (Buffer.byteLength(JSON.stringify(candidate)) > TARGET_PAGE_BYTES && items.length) break;
-			if (Buffer.byteLength(JSON.stringify(candidate)) > RESPONSE_CEILING_BYTES) break;
-			items.push(values[index++]);
+			const item = values[index]!;
+			const itemBytes = Buffer.byteLength(JSON.stringify(item));
+			const candidateBytes = itemsBytes + itemBytes + (items.length ? 1 : 0);
+			if (candidateBytes > TARGET_PAGE_BYTES && items.length) break;
+			if (candidateBytes > RESPONSE_CEILING_BYTES) break;
+			items.push(item);
+			itemsBytes = candidateBytes;
+			index++;
 		}
 		const complete = index >= values.length;
 		const page: QueryPage = { items, complete, revision };
