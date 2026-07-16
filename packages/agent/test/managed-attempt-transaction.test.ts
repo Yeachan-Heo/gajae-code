@@ -598,22 +598,25 @@ describe("managed attempt transaction", () => {
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 			streamFn,
 		});
-		const outcomes: AssistantMessage[] = [];
+		let outcomeCalls = 0;
 
 		await agent.prompt("run", {
 			fallbackManaged: true,
-			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
-				if (outcome.type === "retryable_discarded") outcomes.push(outcome.failure.message);
+			onManagedAttemptOutcome: () => {
+				outcomeCalls += 1;
 				return { type: "terminal", terminal: { stopReason: "exhausted" } };
 			},
 		} as any);
+		await agent.waitForIdle();
 
-		expect(outcomes).toHaveLength(1);
-		expect(outcomes[0]?.errorMessage).toContain("provisional event buffer limit");
+		// Local overflow is not provider evidence: the fallback chain must not
+		// be consumed, and the failure surfaces as an explicit local error.
+		expect(outcomeCalls).toBe(0);
+		expect(agent.state.error).toContain("provisional event buffer limit");
 		expect(witnessReads).toBe(1);
 	});
 
-	it("discards an over-limit provisional batch and reports a retryable private outcome", async () => {
+	it("fails an over-limit provisional batch as a local error without consuming the chain", async () => {
 		const mock = createMockModel();
 		const streamFn = () => {
 			const stream = new AssistantMessageEventStream();
@@ -644,7 +647,8 @@ describe("managed attempt transaction", () => {
 			streamFn,
 		});
 		const events: string[] = [];
-		const outcomes: AssistantMessage[] = [];
+		let outcomeCalls = 0;
+		const surfaced: AssistantMessage[] = [];
 		agent.subscribe(event => {
 			if (
 				event.type === "agent_end" ||
@@ -653,25 +657,32 @@ describe("managed attempt transaction", () => {
 			) {
 				events.push(event.type);
 			}
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				surfaced.push(event.message as AssistantMessage);
+			}
 		});
 
 		await agent.prompt("run", {
 			fallbackManaged: true,
-			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
-				if (outcome.type === "retryable_discarded") outcomes.push(outcome.failure.message);
+			onManagedAttemptOutcome: () => {
+				outcomeCalls += 1;
 				return { type: "retry", continuation: () => {} };
 			},
 		} as any);
+		await agent.waitForIdle();
 
-		expect(outcomes).toHaveLength(1);
-		expect(outcomes[0]).toMatchObject({ stopReason: "error", errorStatus: 503 });
-		expect(outcomes[0]?.errorMessage).toContain("provisional event buffer limit");
-		expect(events).not.toContain("message_start");
+		// Only original typed provider transport facts may authorize provider
+		// fallback: the local buffer-limit error must not synthesize a
+		// provider-like 503 and must not rotate/consume the chain. It surfaces
+		// as an explicit local error message carrying no provider evidence,
+		// and no provisional streamed content leaks (no message_update).
+		expect(outcomeCalls).toBe(0);
+		expect(agent.state.error).toContain("provisional event buffer limit");
 		expect(events).not.toContain("message_update");
-		expect(events).not.toContain("message_end");
-		expect(events).not.toContain("turn_end");
-		expect(events).not.toContain("agent_end");
-		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
+		expect(surfaced).toHaveLength(1);
+		expect(surfaced[0]?.errorMessage).toContain("provisional event buffer limit");
+		expect(surfaced[0]?.errorStatus).toBeUndefined();
+		expect(surfaced[0]?.transportFailure).toBeUndefined();
 	});
 
 	it("retains queued follow-up input when its managed attempt is discarded for retry", async () => {

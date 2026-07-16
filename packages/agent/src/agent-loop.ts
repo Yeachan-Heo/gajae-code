@@ -69,9 +69,14 @@ import type {
 export const MANAGED_ATTEMPT_MAX_STAGED_EVENTS = 10_000;
 export const MANAGED_ATTEMPT_MAX_STAGED_BYTES = 16 * 1024 * 1024;
 
+/**
+ * Local staging failure: the provisional buffer limit was exceeded. Carries
+ * NO transport facts or status by design — only original typed provider
+ * transport facts may authorize provider fallback, so local buffer machinery
+ * must never masquerade as provider evidence or consume the fallback chain.
+ * It is therefore non-retryable and surfaces as an explicit local error.
+ */
 class ManagedAttemptBufferOverflowError extends Error {
-	readonly status = 503;
-
 	constructor() {
 		super("Managed fallback attempt exceeded the provisional event buffer limit");
 		this.name = "ManagedAttemptBufferOverflowError";
@@ -491,12 +496,16 @@ export function sanitizedDetachedClone<T>(value: T, maxNodes: number = MANAGED_S
  * legacy payload), and a thrown `DataCloneError` here would mask the real
  * provider outcome and burn the whole fallback chain.
  */
-function managedAttemptSnapshot<T>(value: T): T {
+function managedAttemptSnapshotDetailed<T>(value: T): { snapshot: T; degraded: boolean } {
 	try {
-		return structuredClone(value);
+		return { snapshot: structuredClone(value), degraded: false };
 	} catch {
-		return sanitizedDetachedClone(value);
+		return { snapshot: sanitizedDetachedClone(value), degraded: true };
 	}
+}
+
+function managedAttemptSnapshot<T>(value: T): T {
+	return managedAttemptSnapshotDetailed(value).snapshot;
 }
 
 /**
@@ -585,8 +594,13 @@ class ManagedAttemptTransaction {
 			this.discard();
 			throw new ManagedAttemptBufferOverflowError();
 		}
-		let snapshot = managedAttemptSnapshot(event);
-		if (bytes === undefined) {
+		const detailed = managedAttemptSnapshotDetailed(event);
+		let snapshot = detailed.snapshot;
+		if (bytes === undefined || detailed.degraded) {
+			// Account the bytes of what is actually retained: a degraded
+			// snapshot replaces non-JSON leaves with placeholders, so the raw
+			// pre-measure (which omits e.g. function-valued properties) can
+			// undercount the staged form.
 			try {
 				bytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
 			} catch {
