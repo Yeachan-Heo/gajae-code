@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Added a searchable command palette for keybound actions and slash commands.
 
 ## [0.11.0] - 2026-07-15
 
