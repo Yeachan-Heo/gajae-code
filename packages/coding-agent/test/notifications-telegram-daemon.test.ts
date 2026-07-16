@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { Marked } from "marked";
 import { Settings } from "../src/config/settings";
+import { tokenFingerprint } from "../src/sdk/bus/config";
 import {
 	markdownToTelegramHtml,
 	splitTelegramHtml,
@@ -24,6 +25,7 @@ import {
 	registerNotificationRoot,
 	releaseDaemonOwnership,
 	renewDaemonHeartbeat,
+	spawnTelegramDaemonOwner,
 	TelegramBotTransport,
 	type TelegramDaemonFs,
 	type TelegramDaemonOptions,
@@ -824,7 +826,7 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
 			settings: s,
-			tokenFingerprint: "fp",
+			tokenFingerprint: tokenFingerprint("tok"),
 			chatId: "42",
 			pid: process.pid,
 			randomId: () => "owner",
@@ -887,6 +889,69 @@ describe("telegram daemon", () => {
 		expect(state.ownerId).toBe("owner");
 	});
 
+	test("Windows source-linked spawn uses an opaque owner id and the daemon rebinds its PID", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		let spawnArgs: string[] | undefined;
+		const spawned = await spawnTelegramDaemonOwner(
+			{ settings: s, tokenFingerprint: "fp", chatId: "42" },
+			{
+				execPath: "/usr/local/bin/bun",
+				platform: "win32",
+				pid: 7132,
+				randomId: () => "launch-token",
+				spawn: (_command, args) => {
+					spawnArgs = args;
+					return { unref() {} };
+				},
+			},
+		);
+
+		expect(spawned).toMatchObject({ result: "owner_spawned", ownerId: "daemon-launch-token" });
+		expect(spawnArgs).toEqual(expect.arrayContaining(["--owner-id", "daemon-launch-token"]));
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 8123,
+			}),
+		).toBe(true);
+		expect((await readDaemonState(s))?.pid).toBe(8123);
+	});
+
+	test("daemon heartbeat rejects a foreign Telegram identity even with the owner id", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 7132,
+			ownerId: "daemon-launch-token",
+		});
+
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "foreign-fp",
+				chatId: "42",
+				pid: 8123,
+			}),
+		).toBe(false);
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "fp",
+				chatId: "foreign-chat",
+				pid: 8123,
+			}),
+		).toBe(false);
+		expect((await readDaemonState(s))?.pid).toBe(7132);
+	});
 	test("runDaemonInternal stops when persisted ownership moves to another owner", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -3149,7 +3214,7 @@ describe("telegram daemon", () => {
 		let now = 0;
 		await acquireDaemonOwnership({
 			settings: s,
-			tokenFingerprint: "fp",
+			tokenFingerprint: tokenFingerprint("tok"),
 			chatId: "42",
 			pid: process.pid,
 			now: () => now,
@@ -3214,7 +3279,7 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
 			settings: s,
-			tokenFingerprint: "fp",
+			tokenFingerprint: tokenFingerprint("tok"),
 			chatId: "42",
 			pid: process.pid,
 			randomId: () => "owner",
@@ -3427,7 +3492,7 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
 			settings: s,
-			tokenFingerprint: "fp",
+			tokenFingerprint: tokenFingerprint("tok"),
 			chatId: "42",
 			pid: process.pid,
 			randomId: () => "owner",
@@ -5516,7 +5581,7 @@ test("requestStop aborts the active long poll and run() exits, releasing ownersh
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	await acquireDaemonOwnership({
 		settings: s,
-		tokenFingerprint: "e60b05c186ca",
+		tokenFingerprint: tokenFingerprint("tok"),
 		chatId: "42",
 		pid: process.pid,
 		randomId: () => "owner",
@@ -5566,7 +5631,7 @@ test("run() loop exits when an owner-scoped control request asks it to stop", as
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	await acquireDaemonOwnership({
 		settings: s,
-		tokenFingerprint: "e60b05c186ca",
+		tokenFingerprint: tokenFingerprint("tok"),
 		chatId: "42",
 		pid: process.pid,
 		randomId: () => "owner",
@@ -5602,7 +5667,7 @@ test("run() persists aliases before releasing ownership on exit", async () => {
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	await acquireDaemonOwnership({
 		settings: s,
-		tokenFingerprint: "e60b05c186ca",
+		tokenFingerprint: tokenFingerprint("tok"),
 		chatId: "42",
 		pid: process.pid,
 		randomId: () => "owner",
