@@ -4,8 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type PlanRequest, planTmuxOwnerIsolationSync } from "../../src/gjc-runtime/tmux-owner-isolation";
 import { resolveOwner } from "../../src/harness-control-plane/owner";
-import { readLease } from "../../src/harness-control-plane/session-lease";
-import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
+import { createHarnessCliEnvWithFixtureBroker, type HarnessCliBrokerFixture } from "./cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -26,7 +25,8 @@ let root: string;
 let workspace: string;
 let tmuxCommand: string;
 
-let cliEnv: HarnessCliEnv;
+let cliEnv: HarnessCliBrokerFixture;
+
 let sdkServer: ReturnType<typeof Bun.serve>;
 let disableSdkHost = false;
 
@@ -132,7 +132,8 @@ async function createFakeTmuxBin(rootDir: string, options: { skipOwnerLaunch?: b
 	      fi
 	    done
 	    cmd="${"$"}{@: -1}"
-	    ${options.skipOwnerLaunch ? "sleep 120 >/dev/null 2>&1 &" : '(cd "$cwd" && bash -lc "$cmd") >/dev/null 2>&1 &'}
+    ${options.skipOwnerLaunch ? "sleep 2 >/dev/null 2>&1 &" : '(cd "$cwd" && bash -lc "$cmd") >/dev/null 2>&1 &'}
+
     printf '%s\n' "${"$"}!" > "$state"
     printf '%s\n' "${"$"}!" > ${JSON.stringify(lastServerStatePath)}
 	    native_receipt='$1'; printf '%s\n' "\${GJC_HARNESS_TEST_NATIVE_RECEIPT-$native_receipt}"
@@ -192,11 +193,24 @@ async function runHarness(
 
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
+async function retireLiveFixtureOwner(): Promise<void> {
+	let owner = await resolveOwner(root, SID);
+	if (!owner.live) return;
+	const retired = await runHarness(["retire", "--session", SID]);
+	if (retired.code !== 0 || (retired.json?.evidence as Record<string, unknown>).retired !== true)
+		throw new Error("Fixture owner retirement failed; preserving fixture roots for retry.");
+	for (let i = 0; i < 80 && owner.live; i++) {
+		await sleep(50);
+		owner = await resolveOwner(root, SID);
+	}
+	if (owner.live) throw new Error("Fixture owner remained live after retirement; preserving fixture roots for retry.");
+}
+
 beforeEach(async () => {
 	// Short paths keep the AF_UNIX socket path under the sun_path limit.
 	root = await mkdtemp(path.join(tmpdir(), "h"));
 	workspace = await mkdtemp(path.join(tmpdir(), "hw"));
-	cliEnv = createHarnessCliEnv(repoRoot);
+	cliEnv = await createHarnessCliEnvWithFixtureBroker(repoRoot, root);
 	tmuxCommand = await createFakeTmuxBin(root);
 
 	disableSdkHost = false;
@@ -204,34 +218,15 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	sdkServer.stop(true);
-	cliEnv.cleanup();
-	const serverPid = await readFile(path.join(root, "tmux-server.pid"), "utf8")
-		.then(value => Number(value.trim()))
-		.catch(error => {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-			throw error;
-		});
-	if (serverPid !== null && Number.isSafeInteger(serverPid) && serverPid > 0) {
-		try {
-			process.kill(serverPid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-		}
-	}
-	const lease = await readLease(root, SID).catch(error => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+	try {
+		await retireLiveFixtureOwner();
+		sdkServer.stop(true);
+		await cliEnv.cleanup();
+		await rm(workspace, { recursive: true, force: true });
+	} catch (error) {
+		sdkServer.stop(true);
 		throw error;
-	});
-	if (lease?.pid) {
-		try {
-			process.kill(lease.pid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-		}
 	}
-	await rm(root, { recursive: true, force: true });
-	await rm(workspace, { recursive: true, force: true });
 });
 
 describe.skipIf(process.platform !== "linux")("gjc harness start --detach (detached owner lifecycle, B1)", () => {
@@ -315,19 +310,16 @@ describe.skipIf(process.platform !== "linux")("gjc harness start --detach (detac
 		const evidence = started.json?.evidence as Record<string, unknown>;
 		expect(evidence.ownerRuntime).toBe("manual");
 		expect(evidence.ownerFallbackReason).toBe(
-			"tmux new-session exited 0 but owner endpoint did not become routable; owner cleaned",
+			"tmux new-session owner endpoint not routable; exact cleanup or reconciliation uncertain",
 		);
-		expect(evidence.reason).toBe("tmux-owner-endpoint-not-routable");
+		expect(evidence.reason).toBe("tmux-owner-endpoint-cleanup-uncertain");
 		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(false);
-		expect((started.json?.state as Record<string, unknown>).blockers).toContain("tmux-owner-endpoint-not-routable");
+		expect((started.json?.state as Record<string, unknown>).blockers).toContain(
+			"tmux-owner-endpoint-cleanup-uncertain",
+		);
 		const lifecycle = path.join(root, SID, "owner-lifecycle");
 		const generation = (await Bun.file(path.join(lifecycle, "generation.json")).json()) as { generation: string };
-		expect(await Bun.file(path.join(lifecycle, `verdict-${generation.generation}.json`)).json()).toMatchObject({
-			generation: generation.generation,
-			session_id: SID,
-			classification: "unexpected_owner_loss",
-			reason: "terminal_observation",
-		});
+		expect(await Bun.file(path.join(lifecycle, `verdict-${generation.generation}.json`)).exists()).toBe(false);
 	}, 60_000);
 
 	it("reports blocked only after detached owner endpoint remains unavailable", async () => {

@@ -8,7 +8,7 @@ import { logger } from "@gajae-code/utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { SessionManager } from "../../session/session-manager";
+import { createReadonlySessionManager, type SessionManager } from "../../session/session-manager";
 import type {
 	AfterProviderResponseEvent,
 	BeforeAgentStartEvent,
@@ -540,7 +540,7 @@ export class ExtensionRunner {
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
-			sessionManager: this.sessionManager,
+			sessionManager: createReadonlySessionManager(this.sessionManager),
 			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
 			get model() {

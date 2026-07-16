@@ -2,10 +2,13 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { deleteSessionPickerCandidate } from "@gajae-code/coding-agent/cli/session-picker";
 import {
+	createReadonlySessionManager,
 	type ResumeSessionIdentity,
 	SessionManager,
 	type StrictSessionOpenResult,
+	sessionArtifactCapability,
 } from "@gajae-code/coding-agent/session/session-manager";
 import {
 	FileSessionStorage,
@@ -536,22 +539,80 @@ describe("SessionManager read-only resume", () => {
 		await opened.manager.close();
 	});
 
-	it("finds legacy default inventory without writes and excludes it for explicit directories", async () => {
+	it("requires explicit directories for custom-storage resume inventory without writes", async () => {
 		const storage = new WriteTrackingStorage();
-		const cwd = path.join(os.tmpdir(), "gjc-resume-readonly-legacy");
+		const cwd = makeTempDir();
 		const legacyName = `--${path
 			.resolve(cwd)
 			.replace(/^[/\\]/, "")
 			.replace(/[/\\:]/g, "-")}--`;
 		const legacyPath = path.join(getSessionsDir(), legacyName, "legacy.jsonl");
 		const explicitPath = "/explicit/current.jsonl";
-		storage.writeTextSync(legacyPath, sessionText("legacy"));
+		storage.writeTextSync(legacyPath, sessionText("legacy").replace('"cwd":"/cwd"', `"cwd":${JSON.stringify(cwd)}`));
 		storage.writeTextSync(explicitPath, sessionText("explicit"));
 		storage.writes = 0;
 
 		const defaults = await SessionManager.listForResumePickerReadOnly(cwd, undefined, storage);
-		expect(defaults.map(session => session.id)).toEqual(["legacy"]);
+		expect(defaults).toEqual([]);
 		expect(await SessionManager.listForResumePickerReadOnly(cwd, "/explicit", storage)).toHaveLength(1);
 		expect(storage.writes).toBe(0);
+	});
+});
+
+describe("readonly session artifact authority", () => {
+	it("preserves hidden artifact spill authority without exposing mutation methods", async () => {
+		const root = makeTempDir();
+		const manager = SessionManager.create(root, path.join(root, "sessions"));
+		const readonly = createReadonlySessionManager(manager);
+
+		expect("saveArtifact" in readonly).toBe(false);
+		const capability = sessionArtifactCapability(readonly);
+		expect(capability).toBeDefined();
+		const artifactId = await capability?.saveArtifact("full SDK tool output", "sdk-tool");
+		expect(artifactId).toBeDefined();
+		if (artifactId) {
+			const artifactPath = await manager.getArtifactPath(artifactId);
+			if (!artifactPath) throw new Error("Expected persisted artifact path");
+			expect(await Bun.file(artifactPath).text()).toBe("full SDK tool output");
+		}
+		expect(sessionArtifactCapability({ ...readonly })).toBeUndefined();
+	});
+});
+
+describe("CLI session picker deletion scope", () => {
+	it("deletes candidates from an explicit session directory without managed authorization", async () => {
+		const root = makeTempDir();
+		const explicitDir = path.join(root, "explicit");
+		const sessionFile = path.join(explicitDir, "picked.jsonl");
+		const artifactsDir = sessionFile.slice(0, -6);
+		await fs.promises.mkdir(artifactsDir, { recursive: true });
+		await Bun.write(sessionFile, "session\n");
+		await Bun.write(path.join(artifactsDir, "artifact.txt"), "artifact");
+
+		await deleteSessionPickerCandidate(sessionFile, explicitDir);
+
+		expect(fs.existsSync(sessionFile)).toBe(false);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+		await expect(deleteSessionPickerCandidate(path.join(root, "outside.jsonl"), explicitDir)).rejects.toThrow(
+			"escaped",
+		);
+	});
+});
+
+describe("active managed picker root", () => {
+	it("lists from a custom agent root instead of the process-global root", async () => {
+		const root = makeTempDir();
+		const agentDir = path.join(root, "custom-agent");
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd, { recursive: true });
+		const sessionDir = SessionManager.getDefaultSessionDir(cwd, agentDir);
+		const manager = SessionManager.create(cwd, sessionDir);
+		manager.appendMessage({ role: "user", content: "custom root", timestamp: 1 });
+		await manager.ensureOnDisk();
+		await manager.flush();
+
+		const listed = await SessionManager.listForResumePickerReadOnly(cwd, sessionDir);
+
+		expect(listed.map(session => session.id)).toContain(manager.getSessionId());
 	});
 });

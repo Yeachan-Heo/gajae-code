@@ -17,6 +17,7 @@ import type { DiscordConversation } from "../src/sdk/bus/discord-conversation";
 import {
 	type DiscordEndpointBinding,
 	DiscordEndpointBindingError,
+	type DiscordLeaseRecoveryScheduler,
 	DiscordNotificationDaemon,
 	type DiscordNotificationDaemonOptions,
 } from "../src/sdk/bus/discord-daemon";
@@ -29,6 +30,40 @@ import type {
 import { SdkClientError } from "../src/sdk/client/client";
 
 const actionCustomIds = new Map<string, string>();
+
+class ManualLeaseRecoveryScheduler implements DiscordLeaseRecoveryScheduler {
+	#next: { handle: unknown; callback: () => void | Promise<void>; delayMs: number } | undefined;
+
+	constructor(private readonly handle: unknown = {}) {}
+
+	setTimeout(callback: () => void | Promise<void>, delayMs: number): unknown {
+		this.#next = { handle: this.handle, callback, delayMs };
+		return this.handle;
+	}
+
+	clearTimeout(handle: unknown): void {
+		if (this.#next?.handle === handle) this.#next = undefined;
+	}
+
+	get delayMs(): number | undefined {
+		return this.#next?.delayMs;
+	}
+
+	get pending(): boolean {
+		return this.#next !== undefined;
+	}
+
+	takeNext(): () => void | Promise<void> {
+		const next = this.#next;
+		if (!next) throw new Error("Expected a scheduled Discord lease recovery.");
+		this.#next = undefined;
+		return next.callback;
+	}
+
+	async runNext(): Promise<void> {
+		await this.takeNext()();
+	}
+}
 
 class FakeDiscordProvider implements DiscordProvider {
 	readonly applicationId = "app";
@@ -2089,6 +2124,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			});
 			await journal.claim(leasedEffectId, "dead-worker", 10);
 			const commands: string[] = [];
+			const recoveryScheduler = new ManualLeaseRecoveryScheduler();
 			restarted = new DiscordNotificationDaemon({
 				agentDir,
 				repo: agentDir,
@@ -2096,6 +2132,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				parentChannelId: "parent",
 				provider,
 				now: () => now,
+				leaseRecoveryScheduler: recoveryScheduler,
 				resolveEndpoint: endpoint,
 				onCommand: async (_sessionId, command) => {
 					commands.push(command);
@@ -2103,12 +2140,14 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				},
 			});
 			await restarted.start();
+			expect(recoveryScheduler.delayMs).toBe(10);
 			failScheduledDrain = true;
 			now = 11;
-			await Bun.sleep(30);
+			await recoveryScheduler.runNext();
 			expect(failedScheduledDrains).toBe(1);
+			expect(recoveryScheduler.delayMs).toBe(50);
 			failScheduledDrain = false;
-			await Bun.sleep(100);
+			await recoveryScheduler.runNext();
 			expect(commands).toEqual(["/sdk query recovered"]);
 			await restarted.stop();
 			restarted = undefined;
@@ -2135,6 +2174,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			now = 20;
 			await journal.claim(stoppedEffectId, "dead-worker", 10);
 			const stoppedCommands: string[] = [];
+			const stoppedRecoveryScheduler = new ManualLeaseRecoveryScheduler(0);
 			restarted = new DiscordNotificationDaemon({
 				agentDir,
 				repo: agentDir,
@@ -2142,6 +2182,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				parentChannelId: "parent",
 				provider,
 				now: () => now,
+				leaseRecoveryScheduler: stoppedRecoveryScheduler,
 				resolveEndpoint: endpoint,
 				onCommand: async (_sessionId, command) => {
 					stoppedCommands.push(command);
@@ -2149,11 +2190,20 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				},
 			});
 			await restarted.start();
+			expect(stoppedRecoveryScheduler.pending).toBe(true);
+			await restarted.stop();
+			expect(stoppedRecoveryScheduler.pending).toBe(false);
+
+			await restarted.start();
+			const staleRecovery = stoppedRecoveryScheduler.takeNext();
+			await restarted.stop();
+			await restarted.start();
+			expect(stoppedRecoveryScheduler.pending).toBe(true);
+			now = 31;
+			await staleRecovery();
+			expect(stoppedCommands).toEqual([]);
 			await restarted.stop();
 			restarted = undefined;
-			now = 31;
-			await Bun.sleep(20);
-			expect(stoppedCommands).toEqual([]);
 		} finally {
 			await restarted?.stop();
 			await fs.rm(agentDir, { recursive: true, force: true });
@@ -2282,6 +2332,32 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		});
 	});
 
+	test("does not scan conversation mappings below the terminal prune threshold", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-prune-bound-"));
+		try {
+			const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+			await journal.enqueue({
+				id: "terminal-below-threshold",
+				kind: "post-message",
+				transport: "discord",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: { threadId: "thread", content: "bounded" },
+			});
+			const lease = await journal.claim("terminal-below-threshold", "owner", 60_000);
+			expect(lease).toBeDefined();
+			const load = vi.spyOn(ConversationStore.prototype, "load");
+			load.mockClear();
+			try {
+				await journal.record("terminal-below-threshold", { owner: "owner", epoch: lease!.epoch }, "terminal");
+				expect(load).toHaveBeenCalledTimes(1);
+			} finally {
+				load.mockRestore();
+			}
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
 	test("keeps a terminal effect referenced by a crash-window receipt through terminal pruning", async () => {
 		await withDaemon(async (daemon, provider, agentDir) => {
 			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
@@ -2327,7 +2403,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			});
 			const lease = await journal.claim(effectId, "owner", 60_000);
 			await journal.record(effectId, { owner: "owner", epoch: lease!.epoch }, "terminal");
-			for (let index = 0; index < 129; index++) {
+			for (let index = 0; index < 127; index++) {
 				const id = `terminal-prune-${index}`;
 				await journal.enqueue({
 					id,
@@ -2339,6 +2415,25 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 				const terminalLease = await journal.claim(id, "owner", 60_000);
 				await journal.record(id, { owner: "owner", epoch: terminalLease!.epoch }, "terminal");
+			}
+			const overflowId = "terminal-prune-overflow";
+			await journal.enqueue({
+				id: overflowId,
+				kind: "post-message",
+				transport: "discord",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: { threadId: conversation.threadId!, content: "overflow" },
+			});
+			const overflowLease = await journal.claim(overflowId, "owner", 60_000);
+			expect(overflowLease).toBeDefined();
+			const load = vi.spyOn(ConversationStore.prototype, "load");
+			load.mockClear();
+			try {
+				await journal.record(overflowId, { owner: "owner", epoch: overflowLease!.epoch }, "terminal");
+				expect(load).toHaveBeenCalledTimes(2);
+			} finally {
+				load.mockRestore();
 			}
 			expect(await journal.read(effectId)).toMatchObject({ state: "terminal" });
 

@@ -74,7 +74,7 @@ section "Tarball install smoke"
 TARBALL_DIR="$WORK_DIR/tarballs"
 mkdir -p "$TARBALL_DIR"
 stage_linux_x64_optional_package
-for pkg in utils natives-linux-x64 natives ai agent tui stats coding-agent gajae-code; do
+for pkg in utils natives-linux-x64 natives ai agent bridge-client tui stats coding-agent gajae-code; do
 	(
 		cd "$ROOT_DIR/packages/$pkg"
 		bun pm pack --destination "$TARBALL_DIR" --quiet >/dev/null
@@ -82,6 +82,7 @@ for pkg in utils natives-linux-x64 natives ai agent tui stats coding-agent gajae
 done
 
 utils_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-utils-*.tgz)"
+bridge_client_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-bridge-client-*.tgz)"
 natives_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-natives-[0-9]*.tgz)"
 natives_linux_x64_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-natives-linux-x64-*.tgz)"
 ai_tgz="$(find_tarball "$TARBALL_DIR"/gajae-code-ai-*.tgz)"
@@ -107,6 +108,7 @@ mkdir -p "$TARBALL_APP_DIR"
 			'@gajae-code/natives-linux-x64': '$natives_linux_x64_tgz',
 			'@gajae-code/ai': '$ai_tgz',
 			'@gajae-code/agent-core': '$agent_tgz',
+			'@gajae-code/bridge-client': '$bridge_client_tgz',
 			'@gajae-code/tui': '$tui_tgz',
 			'@gajae-code/stats': '$stats_tgz',
 			'@gajae-code/coding-agent': '$coding_agent_tgz'
@@ -114,7 +116,7 @@ mkdir -p "$TARBALL_APP_DIR"
 		require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 	"
 
-	bun add "$utils_tgz" "$natives_linux_x64_tgz" "$natives_tgz" "$ai_tgz" "$agent_tgz" "$tui_tgz" "$stats_tgz" "$coding_agent_tgz" "$wrapper_tgz"
+	bun add "$utils_tgz" "$natives_linux_x64_tgz" "$natives_tgz" "$ai_tgz" "$agent_tgz" "$bridge_client_tgz" "$tui_tgz" "$stats_tgz" "$coding_agent_tgz" "$wrapper_tgz"
 	smoke_cli ./node_modules/.bin/gjc
 )
 

@@ -57,6 +57,7 @@ import type { AgentSession } from "./session/agent-session";
 import {
 	type ResumeSessionIdentity,
 	resolveResumableSession,
+	type SessionDirectoryMigrationPolicy,
 	type SessionInfo,
 	SessionManager,
 	type StrictSessionOpenResult,
@@ -510,6 +511,7 @@ type SelectResumeSession = (sessions: SessionInfo[]) => Promise<SessionSelection
 type OpenExistingSessionStrict = (
 	identity: ResumeSessionIdentity,
 	sessionDir?: string,
+	migrationPolicy?: SessionDirectoryMigrationPolicy,
 ) => Promise<StrictSessionOpenResult>;
 
 export const BARE_RESUME_CONFLICT_ERROR =
@@ -694,6 +696,7 @@ export async function createSessionManager(
 	cwd: string,
 	activeSettings: Settings = settings,
 ): Promise<SessionManager | undefined> {
+	const migrationPolicy = activeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 	if (parsed.resume === true) {
 		return undefined;
 	}
@@ -703,13 +706,13 @@ export async function createSessionManager(
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir);
+			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir, undefined, migrationPolicy);
 		}
 		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir);
 		if (!match) {
 			throw new Error(`Session "${forkSource}" not found.`);
 		}
-		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir, undefined, migrationPolicy);
 	}
 
 	if (parsed.noSession) {
@@ -718,7 +721,7 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			return await SessionManager.open(sessionArg, parsed.sessionDir);
+			return await SessionManager.open(sessionArg, parsed.sessionDir, undefined, migrationPolicy);
 		}
 		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
 		if (!match) {
@@ -732,13 +735,19 @@ export async function createSessionManager(
 				if (!shouldFork) {
 					throw new Error(`Session "${sessionArg}" is in another project (${match.session.cwd}).`);
 				}
-				return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+				return await SessionManager.forkFrom(
+					match.session.path,
+					cwd,
+					parsed.sessionDir,
+					undefined,
+					migrationPolicy,
+				);
 			}
 		}
-		return await SessionManager.open(match.session.path, parsed.sessionDir);
+		return await SessionManager.open(match.session.path, parsed.sessionDir, undefined, migrationPolicy);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		return await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, migrationPolicy);
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
@@ -761,7 +770,7 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, migrationPolicy);
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}
@@ -1046,6 +1055,10 @@ export async function runRootCommand(
 		await logger.time("maybeAutoChdir", maybeAutoChdir, parsedArgs);
 		autoChdirApplied = true;
 		const resumeCwd = getProjectDir();
+		const resumeMigrationPolicy =
+			(await Settings.loadForScope({ cwd: resumeCwd })).get("session.directoryMigration") === "disabled"
+				? "disabled"
+				: "copy-retain";
 		const sessions = await (deps.listForResumePickerReadOnly ?? SessionManager.listForResumePickerReadOnly)(
 			resumeCwd,
 			parsedArgs.sessionDir,
@@ -1054,7 +1067,9 @@ export async function runRootCommand(
 			process.stdout.write(`${chalk.dim("No sessions found")}\n`);
 			return;
 		}
-		const selection = await (deps.selectResumeSession ?? selectSession)(sessions);
+		const selection = deps.selectResumeSession
+			? await deps.selectResumeSession(sessions)
+			: await selectSession(sessions, parsedArgs.sessionDir);
 		if (selection.kind === "cancelled") {
 			return;
 		}
@@ -1063,6 +1078,8 @@ export async function runRootCommand(
 			opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
 				selection.identity,
 				parsedArgs.sessionDir,
+				undefined,
+				resumeMigrationPolicy,
 			);
 		} catch {
 			process.stderr.write(`${BARE_RESUME_OPEN_ERROR}\n`);

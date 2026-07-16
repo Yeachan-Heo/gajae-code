@@ -66,6 +66,16 @@ function getDb(dbPath?: string): Database {
 	return db;
 }
 
+/** Close the shared cache only when it owns the exact requested database path. */
+export function closeModelCache(dbPath?: string): boolean {
+	const resolvedPath = dbPath ?? getModelDbPath();
+	if (!sharedDb || sharedDbPath !== resolvedPath) return false;
+	sharedDb.close();
+	sharedDb = null;
+	sharedDbPath = null;
+	return true;
+}
+
 function migrateCacheSchema(db: Database): void {
 	const columns = db.prepare("PRAGMA table_info(model_cache)").all() as TableInfoRow[];
 	if (!columns.some(column => column.name === "static_fingerprint")) {

@@ -15,6 +15,7 @@ import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { getDefault, type Settings } from "../config/settings";
 import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
+import { sessionArtifactCapability } from "../session/session-manager";
 import { type OutputSummary, type TruncationResult, truncateMiddle, truncateTail } from "../session/streaming-output";
 import { formatBytes, wrapBrackets } from "./render-utils";
 import { renderError } from "./tool-errors";
@@ -593,13 +594,17 @@ export function resolveOutputMaxColumns(s: Settings | undefined): number {
  * is 0, falls back to tail-only truncation. Skips when the tool already
  * saved its own artifact (e.g. bash/python via OutputSink).
  */
+function artifactCapabilityForContext(context: AgentToolContext | undefined) {
+	return sessionArtifactCapability(context?.sessionManager);
+}
+
 async function spillLargeResultToArtifact(
 	result: AgentToolResult,
 	toolName: string,
 	context: AgentToolContext | undefined,
 ): Promise<AgentToolResult> {
-	const sessionManager = context?.sessionManager;
-	if (!sessionManager) return result;
+	const artifactCapability = artifactCapabilityForContext(context);
+	if (!artifactCapability) return result;
 	const { threshold, readThreshold, tailBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
 	// `read` manages its own per-range truncation, but the combined multi-range
 	// output has no cap — enforce a read-specific (higher) combined threshold
@@ -625,7 +630,7 @@ async function spillLargeResultToArtifact(
 	if (totalBytes <= effectiveThreshold) return result;
 
 	// Save full output as artifact
-	const artifactId = await sessionManager.saveArtifact(fullText, toolName);
+	const artifactId = await artifactCapability.saveArtifact(fullText, toolName);
 	if (!artifactId) return result;
 
 	// Truncate: middle elision when a head budget is configured, otherwise tail-only.
@@ -735,8 +740,9 @@ async function enforceInlineResultBackstop(
 	// full output so the truncated view keeps a reference to the complete text.
 	const existingMeta: OutputMeta | undefined = result.details?.meta;
 	let artifactId = existingMeta?.truncation?.artifactId;
-	if (!artifactId) {
-		artifactId = (await context?.sessionManager?.saveArtifact(fullText, toolName)) ?? undefined;
+	const artifactCapability = artifactCapabilityForContext(context);
+	if (!artifactId && artifactCapability) {
+		artifactId = (await artifactCapability.saveArtifact(fullText, toolName)) ?? undefined;
 	}
 
 	// Budget head+tail below the cap, reserving room for the elision marker so the

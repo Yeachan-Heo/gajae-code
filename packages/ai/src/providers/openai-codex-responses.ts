@@ -113,9 +113,15 @@ const CODEX_NON_RETRYABLE_EVENT_CODES = new Set([
 	"invalid_request_error",
 	"invalid_schema",
 	"invalid_tool_schema",
+	// A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is a
+	// deterministic content fault, not a transient upstream failure: retrying the
+	// same request re-sends the same offending item and re-triggers the block, so
+	// classify it as explicitly non-retryable instead of relying on omission
+	// (the request-boundary sanitizer, not a provider retry, is the recovery path).
+	"invalid_prompt",
 ]);
 const CODEX_NON_RETRYABLE_EVENT_MESSAGE =
-	/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must have type ["']?object["']?/i;
+	/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must have type ["']?object["']?|request blocked[^\n]*invalid[_ -]prompt|code=invalid[_ -]prompt/i;
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
@@ -2650,8 +2656,11 @@ function normalizeInputMessageContent(
 	return convertResponsesInputContent(content, model.input.includes("image")) ?? [];
 }
 
-/** @internal Exported for tests. */
-export { convertMessages as convertCodexResponsesMessages };
+/** @internal Exported for tests. `classifyCodexFailureEventRetryable` is the retry classification of a Codex failure event. */
+export {
+	convertMessages as convertCodexResponsesMessages,
+	isRetryableCodexFailureEvent as classifyCodexFailureEventRetryable,
+};
 
 /**
  * Whether this OpenAI code backend-backend model should get the custom-tool grammar

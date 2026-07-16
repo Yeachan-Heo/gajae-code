@@ -101,6 +101,46 @@ function collectMatches(dts: string, re: RegExp): string[] {
 	return names;
 }
 
+function applyPathIdentityTypes(dts: string): string {
+	const identity = `export type NativeCanonicalDirectoryIdentity =
+	| { ok: true; platform: "posix" | "win32"; canonicalPath: string; code?: never }
+	| {
+			ok: false;
+			platform?: never;
+			canonicalPath?: never;
+			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
+	  }`;
+	const security = `export type NativeOwnerOnlySecurityResult =
+	| { ok: true; code?: never }
+	| {
+			ok: false;
+			code:
+				| "not_found"
+				| "not_directory"
+				| "network_unsupported"
+				| "reparse_point"
+				| "acl_unavailable"
+				| "acl_apply_failed"
+				| "acl_verify_failed"
+				| "io_error";
+	  }`;
+	return dts
+		.replace(
+			/^export declare function canonicalExistingDirectoryIdentity\([^\n]*$/m,
+			"export declare function canonicalExistingDirectoryIdentity(path: string | Uint8Array): NativeCanonicalDirectoryIdentity",
+		)
+		.replace(
+			/^export declare function applyOwnerOnlyPathSecurity\([^\n]*$/m,
+			'export declare function applyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult',
+		)
+		.replace(
+			/^export declare function verifyOwnerOnlyPathSecurity\([^\n]*$/m,
+			'export declare function verifyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult',
+		)
+		.replace(/export interface NativeCanonicalDirectoryIdentity \{[\s\S]*?\n\}/, identity)
+		.replace(/export interface NativeOwnerOnlySecurityResult \{[\s\S]*?\n\}/, security);
+}
+
 function buildGeneratedBlock(dts: string): string {
 	const classes = [...new Set([...COMPATIBILITY_CLASSES, ...collectMatches(dts, CLASS_RE)])];
 	const functions = collectMatches(dts, FUNCTION_RE);
@@ -192,9 +232,11 @@ export async function generateEnumExports(): Promise<void> {
 	// assigning string literals to enum types without casts.
 	const constEnumCount = (generatedDts.match(/export (?:declare )?const enum/g) ?? []).length;
 	const dtsContent = patchCompatibilityDeclarations(
-		generatedDts
-			.replaceAll("export const enum", "export declare enum")
-			.replaceAll("export declare const enum", "export declare enum"),
+		applyPathIdentityTypes(
+			generatedDts
+				.replaceAll("export const enum", "export declare enum")
+				.replaceAll("export declare const enum", "export declare enum"),
+		),
 	);
 	await Bun.write(dtsPath, dtsContent);
 

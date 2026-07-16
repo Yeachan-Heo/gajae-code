@@ -33,6 +33,7 @@ import {
 	createOpenAIResponsesHistoryPayload,
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
+	isInvalidPromptError,
 	neutralizeResponsesInputControlTokens,
 	normalizeSystemPrompts,
 	resolveCacheRetention,
@@ -387,6 +388,22 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			output.transportFailure = transportFailureFacts(error);
 			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
+			// Explicitly mark the poisoned-history rejection so the shared
+			// `invalid_prompt` contract is present even when the SDK error surfaces
+			// only a message (no structured code). This keeps the responses
+			// transport's classification uniform with the codex transport's
+			// non-retryable event set and lets the session-level circuit breaker
+			// key on one durable marker instead of per-transport string matching.
+			if (
+				output.stopReason === "error" &&
+				!output.transportFailure?.providerCode &&
+				(isInvalidPromptError(error) || isInvalidPromptError(output.errorMessage))
+			) {
+				output.transportFailure = {
+					...(output.transportFailure ?? { kind: "transport" }),
+					providerCode: "invalid_prompt",
+				};
+			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });

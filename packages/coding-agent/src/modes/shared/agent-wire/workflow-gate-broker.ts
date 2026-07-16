@@ -936,10 +936,14 @@ function assertPersistedGate(
 		invalidFileState(filePath);
 }
 
-function isUnsupportedWindowsDirectorySyncError(error: unknown): boolean {
-	if (process.platform !== "win32") return false;
+export function isUnsupportedWindowsDirectorySyncError(
+	error: unknown,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	if (platform !== "win32") return false;
 	const code = (error as NodeJS.ErrnoException | undefined)?.code;
-	return code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP";
+	// Bun reports EPERM when fsyncSync is applied to a Windows directory handle.
+	return code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "EPERM";
 }
 
 /** A write may have reached `rename` but not the directory fsync durability barrier. */

@@ -42,6 +42,7 @@ import type {
 } from "../src/session/client-bridge";
 import { SessionManager } from "../src/session/session-manager";
 import { getAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SdkPermissionProvider =
 	NonNullable<ExtensionContextActions["setSdkPermissionProvider"]> extends (provider: infer T) => void ? T : never;
@@ -247,16 +248,80 @@ test("lifecycle SDK startup capability settles once and sanitizes public failure
 	expect(await started.promise).toEqual({ status: "started" });
 });
 
-test("lifecycle teardown records failed host and server cleanup as false", async () => {
+test("lifecycle teardown rejects dual owner failures and retains exact retry authority", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-proof-"));
 	dirs.push(cwd);
 	const sessionId = `cleanup-proof-${Date.now()}`;
 	const tracker = new SdkStartupRollbackTracker();
 	const capability = new SdkStartupCapability(tracker);
 	const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
-	const nativeStop = (NotificationServer.prototype as unknown as { stop: () => void }).stop;
-	(NotificationServer.prototype as unknown as { stop: () => void }).stop = () => {
+	const nativeStop = (NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait;
+	(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = async () => {
 		throw new Error("server stop failed");
+	};
+	let restored = false;
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), {
+			startupCapability: capability,
+			lifecycleRequired: true,
+		});
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		let failure: unknown;
+		try {
+			await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		expect((failure as AggregateError).errors).toEqual([
+			expect.objectContaining({ message: "host stop failed" }),
+			expect.objectContaining({ message: "server stop failed" }),
+		]);
+		expect(tracker.result).toEqual({
+			endpointGeneration: 1,
+			fenced: false,
+			runtimeRemoved: true,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		});
+
+		stop.mockRestore();
+		(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = nativeStop;
+		restored = true;
+		await expect(
+			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
+		).resolves.toBeUndefined();
+		expect(tracker.result).toEqual({
+			endpointGeneration: 1,
+			fenced: true,
+			runtimeRemoved: true,
+			hostStopped: true,
+			brokerRegistrationReleased: true,
+		});
+	} finally {
+		if (!restored) {
+			stop.mockRestore();
+			(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = nativeStop;
+		}
+	}
+});
+test("lifecycle cleanup fences same-id startup and preserves proven owner release across retry", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-retry-"));
+	dirs.push(cwd);
+	const sessionId = `cleanup-retry-${Date.now()}`;
+	const tracker = new SdkStartupRollbackTracker();
+	const capability = new SdkStartupCapability(tracker);
+	const hostStop = spyOn(SessionSdkHost.prototype, "stop");
+	const serverStart = spyOn(NotificationServer.prototype, "start");
+	const nativeStop = (NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait;
+	let serverStopAttempts = 0;
+	(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = async function (
+		this: NotificationServer,
+	): Promise<void> {
+		serverStopAttempts++;
+		if (serverStopAttempts === 1) throw new Error("server stop failed");
+		await nativeStop.call(this);
 	};
 	try {
 		const sessionContext = context(cwd, sessionId);
@@ -265,17 +330,46 @@ test("lifecycle teardown records failed host and server cleanup as false", async
 			lifecycleRequired: true,
 		});
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		await expect(
+			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
+		).rejects.toBeInstanceOf(AggregateError);
+		expect(hostStop).toHaveBeenCalledTimes(1);
+		expect(tracker.result).toMatchObject({ fenced: false, hostStopped: false, brokerRegistrationReleased: true });
+
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+		expect(hostStop).toHaveBeenCalledTimes(1);
+		expect(serverStart).toHaveBeenCalledTimes(1);
+		expect(serverStopAttempts).toBe(1);
+
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
-			fenced: false,
-			runtimeRemoved: true,
-			hostStopped: false,
-			brokerRegistrationReleased: false,
-		});
+		expect(hostStop).toHaveBeenCalledTimes(1);
+		expect(serverStopAttempts).toBe(2);
+		expect(tracker.result).toMatchObject({ fenced: true, hostStopped: true, brokerRegistrationReleased: true });
 	} finally {
-		stop.mockRestore();
-		(NotificationServer.prototype as unknown as { stop: () => void }).stop = nativeStop;
+		hostStop.mockRestore();
+		serverStart.mockRestore();
+		(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = nativeStop;
+	}
+});
+
+test("production SDK host starts exactly one instrumented server (no duplicate auto-host)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-single-host-"));
+	dirs.push(cwd);
+	const serverStart = spyOn(NotificationServer.prototype, "start");
+	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
+	try {
+		host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+		// Exactly one SDK server is started: the fixture's explicit instrumented
+		// notifications extension. The session must NOT auto-add a second host that
+		// could race and overwrite the endpoint (dropping onSdkRequest).
+		expect(serverStart).toHaveBeenCalledTimes(1);
+		// And exactly one endpoint file exists for the session.
+		const sdkDir = path.join(cwd, ".gjc", "state", "sdk");
+		const endpointFiles = fs.readdirSync(sdkDir).filter(name => name.endsWith(".json"));
+		expect(endpointFiles).toEqual([`${host.sessionId}.json`]);
+	} finally {
+		serverStart.mockRestore();
+		await host?.stop();
 	}
 });
 

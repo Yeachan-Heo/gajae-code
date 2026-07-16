@@ -163,6 +163,12 @@ export interface ResumeDescriptor {
 	data: unknown;
 }
 
+/**
+ * In-memory resume runner bound to the session that originally launched a
+ * subagent. Never serialized: process restart drops it so resume fails closed.
+ */
+export type ResumeRunner = (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined;
+
 function sessionFileFromResumeDescriptorData(data: unknown): string | null {
 	if (typeof data !== "object" || data === null) return null;
 	const sessionFile = (data as { sessionFile?: unknown }).sessionFile;
@@ -365,8 +371,16 @@ export class AsyncJobManager {
 	readonly #subagentProgress = new Map<string, AgentProgress>();
 	readonly #resumeQueue: ResumeQueueEntry[] = [];
 	#resumeSeq = 0;
-	#resumeRunner?: (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined;
+	#resumeRunner?: ResumeRunner;
 	readonly #resumeDescriptors = new Map<string, ResumeDescriptor>();
+	/**
+	 * Per-descriptor in-memory resume runners, keyed by subagentId, captured at
+	 * registerResumeDescriptor time so each resume executes under the authority of
+	 * the session that originally launched that subagent. Fixes #2303's global
+	 * last-writer-wins slot. In-memory only: a process restart drops these and
+	 * resume fails closed with reason "no_runner".
+	 */
+	readonly #descriptorResumeRunners = new Map<string, ResumeRunner>();
 	readonly #deadLetteredDeliveries = new Map<string, AsyncJobDelivery>();
 	readonly #ownerSubagentShutdownLeases = new Map<string, OwnerSubagentShutdownLeaseState>();
 	#ownerSubagentShutdownSeq = 0;
@@ -733,14 +747,23 @@ export class AsyncJobManager {
 	}
 
 	/** Install the TaskTool-owned resume runner. Returns the new job id, or undefined on failure. */
-	setResumeRunner(
-		runner: (subagentId: string, message?: string, descriptor?: ResumeDescriptor) => string | undefined,
-	): void {
+	setResumeRunner(runner: ResumeRunner): void {
 		this.#resumeRunner = runner;
 	}
 
-	registerResumeDescriptor(descriptor: ResumeDescriptor): void {
+	registerResumeDescriptor(descriptor: ResumeDescriptor, runner?: ResumeRunner): void {
 		this.#resumeDescriptors.set(descriptor.subagentId, descriptor);
+		if (runner) this.#descriptorResumeRunners.set(descriptor.subagentId, runner);
+	}
+
+	/**
+	 * Resolve the resume runner for a subagent: prefer the per-descriptor runner
+	 * captured at registration time (the originating parent's execution authority),
+	 * falling back to the process-global runner only for descriptors registered
+	 * without one.
+	 */
+	#resolveResumeRunner(subagentId: string): ResumeRunner | undefined {
+		return this.#descriptorResumeRunners.get(subagentId) ?? this.#resumeRunner;
 	}
 
 	getResumeDescriptor(subagentId: string, filter?: AsyncJobFilter): ResumeDescriptor | undefined {
@@ -1036,7 +1059,7 @@ export class AsyncJobManager {
 			return { ok: false, status: "queued", reason: "already_queued" };
 		}
 		if (!rec.resumable || !rec.sessionFile) return { ok: false, reason: "context_unavailable" };
-		if (!this.#resumeRunner) return { ok: false, reason: "no_runner" };
+		if (!this.#resolveResumeRunner(rec.subagentId)) return { ok: false, reason: "no_runner" };
 		if (this.getRunningJobs().length >= this.#maxRunningJobs) {
 			const seq = ++this.#resumeSeq;
 			rec.status = "queued";
@@ -1064,7 +1087,8 @@ export class AsyncJobManager {
 		// Clear any retained progress from the previous run so a resumed subagent
 		// never renders the prior run's tool/output as live before it emits again.
 		this.#subagentProgress.delete(rec.subagentId);
-		const newJobId = this.#resumeRunner?.(rec.subagentId, message, this.#resumeDescriptors.get(rec.subagentId));
+		const runner = this.#resolveResumeRunner(rec.subagentId);
+		const newJobId = runner?.(rec.subagentId, message, this.#resumeDescriptors.get(rec.subagentId));
 		if (!newJobId) return { ok: false, reason: "resume_failed" };
 		if (prevJobId && prevJobId !== newJobId) rec.historicalJobIds.push(prevJobId);
 		rec.currentJobId = newJobId;
@@ -1144,6 +1168,7 @@ export class AsyncJobManager {
 			if (!ownerId || rec.ownerId === ownerId) {
 				this.#liveHandles.delete(sid);
 				this.#resumeDescriptors.delete(sid);
+				this.#descriptorResumeRunners.delete(sid);
 				this.#subagentRecords.delete(sid);
 				this.#subagentProgress.delete(sid);
 			}
@@ -1536,6 +1561,7 @@ export class AsyncJobManager {
 		this.#liveHandles.clear();
 		this.#subagentProgress.clear();
 		this.#resumeDescriptors.clear();
+		this.#descriptorResumeRunners.clear();
 		this.#resumeQueue.length = 0;
 		this.#ownerSubagentShutdownLeases.clear();
 		this.#notifyChange();

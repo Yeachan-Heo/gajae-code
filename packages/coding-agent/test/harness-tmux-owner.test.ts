@@ -3,8 +3,11 @@ import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { planTmuxOwnerIsolation } from "../src/gjc-runtime/tmux-owner-isolation";
-import { readLease } from "../src/harness-control-plane/session-lease";
-import { createHarnessCliEnv, type HarnessCliEnv } from "./harness-control-plane/cli-workspace-env";
+import { resolveOwner } from "../src/harness-control-plane/owner";
+import {
+	createHarnessCliEnvWithFixtureBroker,
+	type HarnessCliBrokerFixture,
+} from "./harness-control-plane/cli-workspace-env";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -12,7 +15,7 @@ const sessionId = "tmux-owner-test";
 
 let root: string;
 let workspace: string;
-let cliEnv: HarnessCliEnv;
+let cliEnv: HarnessCliBrokerFixture;
 
 async function createUnverifiableTmux(): Promise<{ command: string; log: string }> {
 	const bin = path.join(root, "bin");
@@ -62,10 +65,12 @@ async function createScopedHarnessSeam(): Promise<{
 	state=${JSON.stringify(serverStateDir)}/"$socket.pid"
 	case "${"$"}{1:-}" in
 	  display-message)
-	    if [ ! -f "$state" ] && [ "\${GJC_HARNESS_TEST_SWAP_SERVER:-}" = "1" ]; then sleep 1000 & printf '%s\n' "$!" > "$state"; fi
+    if [ ! -f "$state" ] && [ "\${GJC_HARNESS_TEST_SWAP_SERVER:-}" = "1" ]; then sleep 2 & printf '%s\n' "$!" > "$state"; fi
+
 	    if [ "\${GJC_HARNESS_TEST_SCOPED_REPLACE:-}" = "1" ] && [[ "${"$"}{!#}" == *'#{session_id}'*'#{session_name}'* ]] && [ ! -f "$state.swap" ]; then
 	      [ -f "$state" ] && kill "$(cat "$state")" 2>/dev/null || true
-	      sleep 1000 & printf '%s\n' "$!" > "$state"
+	      sleep 2 & printf '%s\n' "$!" > "$state"
+
 	      : > "$state.swap"
 	    fi
 	    if [ -f "$state" ]; then
@@ -157,57 +162,49 @@ async function runHarness(
 	return JSON.parse(output) as Record<string, unknown>;
 }
 
-const LEASE_EXIT_TIMEOUT_MS = 5_000;
+const OWNER_EXIT_TIMEOUT_MS = 5_000;
 
-/**
- * Bounded, exact-PID exit wait for a lease owner the test signalled. Returns true once `pid`
- * is confirmed gone (ESRCH on signal-0), false on timeout. The pid is not a child of this
- * process (the owner was detached and reparented), so there is no local zombie to reap — the
- * kernel/init reaps it on exit and signal-0 then reports ESRCH.
- */
-async function waitForExactExit(pid: number, timeoutMs: number): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		try {
-			process.kill(pid, 0);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
-			throw error;
-		}
-		await Bun.sleep(25);
+async function retireLiveFixtureOwner(): Promise<void> {
+	let owner = await resolveOwner(root, sessionId);
+	if (!owner.live) return;
+	const proc = Bun.spawn(["bun", cliEntry, "harness", "retire", "--session", sessionId], {
+		cwd: workspace,
+		env: {
+			...cliEnv.env,
+			GJC_HARNESS_STATE_ROOT: root,
+			GJC_HARNESS_TEST_ASSUME_LINUX_OWNER_ISOLATION: "1",
+			TMUX: "",
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [output, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	const retired = output.trim() ? (JSON.parse(output) as { evidence?: { retired?: unknown } }) : undefined;
+	if (exitCode !== 0 || retired?.evidence?.retired !== true)
+		throw new Error(`Fixture owner retirement failed: ${stderr || output}`);
+	for (let i = 0; i < 100 && owner.live; i++) {
+		await Bun.sleep(50);
+		owner = await resolveOwner(root, sessionId);
 	}
-	return false;
+	if (owner.live)
+		throw new Error(
+			`Fixture owner remained live after ${OWNER_EXIT_TIMEOUT_MS}ms; preserving fixture roots for retry.`,
+		);
 }
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "harness-tmux-owner-"));
 	workspace = await mkdtemp(path.join(tmpdir(), "harness-tmux-workspace-"));
-	cliEnv = createHarnessCliEnv(repoRoot);
+	cliEnv = await createHarnessCliEnvWithFixtureBroker(repoRoot, root);
 });
 
 afterEach(async () => {
-	const lease = await readLease(root, sessionId).catch(error => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	});
-	let leaseExitFailed: number | null = null;
-	if (lease?.pid) {
-		try {
-			process.kill(lease.pid, "SIGTERM");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-		}
-		// Bounded exact lease-PID exit wait: a live detached owner must tear down (and signal its
-		// descendants) before we delete the roots. A timeout is a real leak — fail loudly and
-		// PRESERVE the roots for inspection instead of silently rm-ing an orphaned tree.
-		if (!(await waitForExactExit(lease.pid, LEASE_EXIT_TIMEOUT_MS))) leaseExitFailed = lease.pid;
-	}
-	cliEnv.cleanup();
-	if (leaseExitFailed !== null)
-		throw new Error(
-			`detached owner lease pid ${leaseExitFailed} did not exit within ${LEASE_EXIT_TIMEOUT_MS}ms; preserving roots for inspection`,
-		);
-	await rm(root, { recursive: true, force: true });
+	await retireLiveFixtureOwner();
+	await cliEnv.cleanup();
 	await rm(workspace, { recursive: true, force: true });
 });
 
@@ -365,24 +362,11 @@ describe("HarnessCommand tmux-resident owner startup", () => {
 			PATH: `${seam.path}:${process.env.PATH ?? ""}`,
 		});
 		const evidence = result.evidence as Record<string, unknown>;
-		const calls = (await readFile(seam.log, "utf8")).trim().split("\n").filter(Boolean);
-		const socket = calls
-			.map(call => call.match(/(?:^|\s)-L\s+(\S+)/)?.[1])
-			.find((value): value is string => Boolean(value));
 
+		const calls = (await readFile(seam.log, "utf8")).trim().split("\n").filter(Boolean);
 		expect(evidence.ownerRuntime).toBe("manual");
 		expect(evidence.ownerFallbackReason).toBe("tmux-owner-server_race:tmux-owner-cleanup_uncertain");
 		expect(calls.some(call => call.includes("kill-session"))).toBe(false);
-		if (socket) {
-			const pid = Number((await readFile(path.join(seam.serverStateDir, `${socket}.pid`), "utf8")).trim());
-			if (Number.isSafeInteger(pid) && pid > 0) {
-				try {
-					process.kill(pid, "SIGTERM");
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-				}
-			}
-		}
 	});
 
 	it("fails a scoped same-name replacement race without name-based cleanup", async () => {
@@ -399,11 +383,6 @@ describe("HarnessCommand tmux-resident owner startup", () => {
 			reason: "tmux-owner-server_race:tmux-owner-cleanup_uncertain",
 		});
 		expect(calls.some(call => call.includes("kill-session"))).toBe(false);
-		const socket = calls.map(call => call.match(/(?:^|\s)-L\s+(\S+)/)?.[1]).find(Boolean);
-		if (socket) {
-			const pid = Number((await readFile(path.join(seam.serverStateDir, `${socket}.pid`), "utf8")).trim());
-			if (Number.isSafeInteger(pid) && pid > 0) process.kill(pid, "SIGTERM");
-		}
 	});
 
 	it("rejects a scoped receipt whose server identity differs from the post-spawn proof", async () => {

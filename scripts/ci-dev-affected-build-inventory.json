@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "typescript": [
+    { "id": "coding-agent", "name": "@gajae-code/coding-agent", "dir": "packages/coding-agent", "nativeConsumer": true, "nativeProducer": false },
+    { "id": "stats", "name": "@gajae-code/stats", "dir": "packages/stats", "nativeConsumer": false, "nativeProducer": false }
+  ],
+  "cargo": [
+    { "id": "gjc-sdk", "name": "gjc-sdk", "manifestPath": "crates/gjc-sdk/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "pi-ast", "name": "pi-ast", "manifestPath": "crates/pi-ast/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "pi-iso", "name": "pi-iso", "manifestPath": "crates/pi-iso/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "pi-natives", "name": "pi-natives", "manifestPath": "crates/pi-natives/Cargo.toml", "supported": true, "nativeAddonSource": true },
+    { "id": "pi-shell", "name": "pi-shell", "manifestPath": "crates/pi-shell/Cargo.toml", "supported": true, "nativeAddonSource": false }
+  ],
+  "emergency": {
+    "cargoWorkspaceBuild": {
+      "id": "cargo-workspace-emergency",
+      "key": "cargo-build:emergency:workspace",
+      "identity": "emergency:cargo-workspace:root",
+      "command": ["cargo", "build", "--workspace"],
+      "cwd": ".",
+      "capabilities": { "rust": true, "nextest": false, "nativeConsumer": false, "nativeProducer": false },
+      "allowedReasons": ["cargo-name-ambiguity"]
+    }
+  }
+}

@@ -2,9 +2,10 @@ import { expect } from "bun:test";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { brokerOwnerForTest } from "../../src/sdk/broker/ensure";
+import { startFixtureBrokerWithLeaseForTest } from "../../src/sdk/broker/ensure";
 import { SdkClient } from "../../src/sdk/client";
 import { SessionManager } from "../../src/session/session-manager";
+import { cleanupFixtureRoot, createFixtureBrokerEnvironment, createFixtureRootCleanup } from "./fixture-broker-cleanup";
 
 type BrokerResult = { ok: boolean; result?: Record<string, unknown>; error?: { code?: string } };
 export type LifecycleGlobal = (
@@ -119,6 +120,10 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 	const repo = await fs.mkdtemp(path.join(tmpdir(), "gjc-sdk-machine-lifecycle-"));
 	const agentDir = path.join(repo, ".gjc", "agent");
 	const stateRoot = path.join(repo, ".gjc", "state");
+	const environment = createFixtureBrokerEnvironment(repo, agentDir);
+	const fixtureSessionDir = path.join(agentDir, "sessions", "-");
+	const started = await startFixtureBrokerWithLeaseForTest({ agentDir, env: environment });
+	const cleanup = createFixtureRootCleanup(repo, agentDir, started.lease);
 	return {
 		repo,
 		agentDir,
@@ -159,7 +164,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 				createdClosed,
 			);
 
-			const savedSession = SessionManager.create(repo, SessionManager.getDefaultSessionDir(repo, agentDir));
+			const savedSession = SessionManager.create(repo, fixtureSessionDir);
 			await savedSession.ensureOnDisk();
 			const sourceId = savedSession.getSessionId();
 			const sourcePath = savedSession.getSessionFile();
@@ -246,12 +251,10 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 			const forkPath = await eventually(
 				async () =>
-					(await SessionManager.list(repo, SessionManager.getDefaultSessionDir(repo, agentDir))).find(
-						session => session.id === forkId,
-					)?.path,
+					(await SessionManager.list(repo, fixtureSessionDir)).find(session => session.id === forkId)?.path,
 				`saved fork session ${forkId}`,
 			);
-			const expectedSessionRoot = path.resolve(path.dirname(SessionManager.getDefaultSessionDir(repo, agentDir)));
+			const expectedSessionRoot = path.resolve(path.dirname(fixtureSessionDir));
 			if (!path.resolve(forkPath).startsWith(`${expectedSessionRoot}${path.sep}`))
 				throw new Error(`Fork persisted outside agent session root: ${forkPath}`);
 			success(await global("session.close", { sessionId: forkId }, "close-fork-key"));
@@ -289,14 +292,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 		},
 		async cleanup() {
-			await brokerOwnerForTest(agentDir)?.stop();
-			try {
-				const broker = JSON.parse(await fs.readFile(path.join(agentDir, "sdk", "broker.json"), "utf8")) as {
-					pid?: number;
-				};
-				if (typeof broker.pid === "number" && broker.pid !== process.pid) process.kill(broker.pid, "SIGTERM");
-			} catch {}
-			await fs.rm(repo, { recursive: true, force: true });
+			await cleanupFixtureRoot(cleanup);
 		},
 	};
 }

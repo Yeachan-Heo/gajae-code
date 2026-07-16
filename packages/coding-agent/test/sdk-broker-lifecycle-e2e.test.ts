@@ -7,13 +7,14 @@ import { NotificationServer } from "@gajae-code/natives";
 import { openLifecycleSessionManager, runSessionHost } from "../src/commands/sdk";
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
-import { Broker, type BrokerResponse, setTerminalPersistenceHookForTest } from "../src/sdk/broker/broker";
+import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import {
 	deriveLifecycleDeadlines,
 	hasValidLifecycleDeadlines,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
+	setLifecycleCleanupHookForTest,
 	setLifecycleCommandResolverForTest,
 	setProcessIncarnationForTest,
 	writeSessionLifecycleFailure,
@@ -209,17 +210,20 @@ test("lifecycle host rejects a transcript replaced after strict authorization be
 		if (!candidate) throw new Error("Expected strict session candidate.");
 		const replacementPath = `${sessionPath}.replacement`;
 		await fs.writeFile(replacementPath, `${await fs.readFile(sessionPath, "utf8")}\n`);
-		const originalInventory = SessionManager.inventorySessionsStrict;
+		const originalCapture = SessionManager.captureTranscriptStrict;
 		let replaced = false;
-		const replaceAfterAuthorization: typeof SessionManager.inventorySessionsStrict = (cwd, options) => {
-			const result = originalInventory(cwd, options);
+		const replaceAfterAuthorization: typeof SessionManager.captureTranscriptStrict = (filePath, storage) => {
+			const result = originalCapture(filePath, storage);
 			if (!replaced) {
 				replaced = true;
 				renameSync(replacementPath, sessionPath);
 			}
 			return result;
 		};
-		SessionManager.inventorySessionsStrict = replaceAfterAuthorization;
+		SessionManager.captureTranscriptStrict = replaceAfterAuthorization;
+		const authorizedDigest = createHash("sha256")
+			.update(await fs.readFile(sessionPath))
+			.digest("hex");
 		try {
 			await expect(
 				openLifecycleSessionManager(
@@ -236,15 +240,16 @@ test("lifecycle host rejects a transcript replaced after strict authorization be
 							size: candidate.identity.size,
 							mtimeMs: candidate.identity.mtimeMs,
 							mtimeNs: candidate.identity.mtimeNs.toString(),
+							sha256: authorizedDigest,
 						},
 					},
 					root,
 					agentDir,
 				),
-			).rejects.toThrow("Lifecycle saved session authority changed before the session host consumed it.");
+			).rejects.toThrow("Lifecycle saved session authority changed while the session host opened it.");
 			expect(replaced).toBe(true);
 		} finally {
-			SessionManager.inventorySessionsStrict = originalInventory;
+			SessionManager.captureTranscriptStrict = originalCapture;
 		}
 	} finally {
 		await session.close();
@@ -284,6 +289,9 @@ test("lifecycle fork rejects a source replaced after capture without destination
 			return captured;
 		};
 		SessionManager.captureTranscriptStrict = replaceAfterCapture;
+		const sourceDigest = createHash("sha256")
+			.update(await fs.readFile(sourcePath))
+			.digest("hex");
 		try {
 			await expect(
 				openLifecycleSessionManager(
@@ -302,6 +310,7 @@ test("lifecycle fork rejects a source replaced after capture without destination
 							size: candidate.identity.size,
 							mtimeMs: candidate.identity.mtimeMs,
 							mtimeNs: candidate.identity.mtimeNs.toString(),
+							sha256: sourceDigest,
 						},
 					},
 					targetCwd,
@@ -309,7 +318,9 @@ test("lifecycle fork rejects a source replaced after capture without destination
 				),
 			).rejects.toThrow("Lifecycle saved session authority changed while the session host forked it.");
 			expect(replaced).toBe(true);
-			await expect(fs.lstat(destinationSessionDir)).rejects.toThrow();
+			const initializedEntries = await fs.readdir(destinationSessionDir);
+			expect(initializedEntries).toContain(".gjc-managed-session-scope.v2.json");
+			expect(initializedEntries.filter(entry => entry.endsWith(".jsonl"))).toEqual([]);
 		} finally {
 			SessionManager.captureTranscriptStrict = originalCapture;
 		}
@@ -843,7 +854,7 @@ test("broker propagates an owned lifecycle startup failure without semantic read
 	}
 });
 
-test("broker retains verified startup evidence across a post-ledger-fsync crash and cleans it only on the normal path", async () => {
+test("broker replays immutable lifecycle cleanup after a crash immediately after an exact detach", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ledger-crash-"));
 	const agentDir = path.join(root, "agent");
 	const fixture = path.join(root, "owned-startup-failure.ts");
@@ -868,7 +879,7 @@ const endpointGeneration = 1;
 await index.append({ type: "host_registered", sessionId: request.sessionId, locator: { repo: request.cwd, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, endpointMtimeMs: (await fs.stat(endpoint)).mtimeMs, lifecycleRequestId: request.effectMarker });
 const source = await fs.readFile(request.sessionPath);
 const stat = await fs.stat(request.sessionPath, { bigint: true });
-await writeSessionLifecycleFailure(request.stateRoot, request.sessionId, request.effectMarker, { phase: "startup", reason: "failed", message: "owned synthetic startup failure" }, { endpointGeneration, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true }, { digest: createHash("sha256").update(source).digest("hex"), identity: { dev: stat.dev.toString(), ino: stat.ino.toString(), size: Number(stat.size), mtimeMs: Number(stat.mtimeMs), mtimeNs: stat.mtimeNs.toString() } });
+await writeSessionLifecycleFailure(request.stateRoot, request.sessionId, request.effectMarker, { phase: "startup", reason: "failed", message: "owned synthetic startup failure" }, { endpointGeneration, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true }, { digest: createHash("sha256").update(source).digest("hex"), identity: { dev: stat.dev.toString(), ino: stat.ino.toString(), size: Number(stat.size), mtimeMs: Number(stat.mtimeMs), mtimeNs: stat.mtimeNs.toString(), sha256: createHash("sha256").update(source).digest("hex") } });
 
 await index.append({ type: "host_unregistered", sessionId: request.sessionId, locator: { repo: request.cwd, stateRoot: request.stateRoot }, endpointGeneration, pid: process.pid, lifecycleRequestId: request.effectMarker });
 await fs.rm(endpoint);
@@ -885,89 +896,59 @@ await fs.rm(endpoint);
 
 		crashing = new Broker({ agentDir });
 		await crashing.start();
-		setTerminalPersistenceHookForTest(crashing, () => {
-			throw new Error("simulated crash after terminal ledger fsync verification");
+		setLifecycleCleanupHookForTest(crashing, () => {
+			throw new Error("simulated crash after lifecycle exact detach");
 		});
 		await expect(crashing.handleRequest("session.resume", request, "post-fsync-crash")).rejects.toThrow(
-			"simulated crash after terminal ledger fsync verification",
+			"simulated crash after lifecycle exact detach",
 		);
 		const crashRows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
 			.split("\n")
 			.filter(Boolean)
 			.map(line => JSON.parse(line) as Record<string, unknown>);
-		const persisted = crashRows.findLast(row => row.state === "terminal_error");
+		const persisted = crashRows.findLast(row => row.state === "effect_started");
 		if (!persisted?.response || typeof persisted.effectMarker !== "string")
-			throw new Error("Expected persisted terminal startup failure response.");
+			throw new Error("Expected persisted lifecycle cleanup intent.");
 		const persistedResponse = persisted.response as BrokerResponse;
-		expect(persisted.responseDigest).toBe(
-			createHash("sha256").update(canonicalJson(persistedResponse)).digest("hex"),
-		);
 		expect(persistedResponse).toMatchObject({
 			ok: false,
 			error: {
-				code: "spawn_failed",
-				message: "No ready SDK endpoint remains available.",
-				endpoint: "unavailable",
-			},
-			durableEffects: {
-				transcript: { identityDigest: expect.any(String), contentDigest: expect.any(String) },
-				startup: {
-					phase: "startup",
-					reason: "failed",
-
-					message: "owned synthetic startup failure",
-					rollback: {
-						endpointGeneration: 1,
-						fenced: true,
-						runtimeRemoved: true,
-						hostStopped: true,
-						brokerRegistrationReleased: true,
-					},
-					cleanupProof: {
-						processExited: true,
-						endpointRemoved: true,
-						hostUnregistered: {
-							lifecycleRequestId: expect.any(String),
-							indexSeq: expect.any(Number),
-						},
-					},
-				},
-				digest: expect.any(String),
-			},
-			startupFailure: {
-				phase: "startup",
-				reason: "failed",
-				message: "owned synthetic startup failure",
-				rollback: {
-					endpointGeneration: 1,
-					fenced: true,
-					runtimeRemoved: true,
-					hostStopped: true,
-					brokerRegistrationReleased: true,
-				},
-				cleanupProof: {
-					processExited: true,
-					endpointRemoved: true,
-					hostUnregistered: {
-						lifecycleRequestId: expect.any(String),
-						indexSeq: expect.any(Number),
-					},
+				code: "cleanup_pending",
+				cleanup: {
+					phase: "lifecycle",
+					lifecycleFiles: expect.arrayContaining([
+						expect.objectContaining({
+							path: expect.stringContaining(`${sessionId}.lifecycle.failure.`),
+							identity: expect.objectContaining({ sha256: expect.any(String) }),
+							plannedPath: expect.stringContaining(".gjc-delete-"),
+						}),
+					]),
 				},
 			},
 		});
 		const stateRoot = path.join(root, ".gjc", "state", "sdk");
 		const artifact = path.join(stateRoot, `${sessionId}.lifecycle.failure.${persisted.effectMarker}.json`);
 		const marker = path.join(stateRoot, `${sessionId}.lifecycle.json`);
-		await expect(fs.stat(artifact)).resolves.toBeDefined();
+		await expect(fs.stat(artifact)).rejects.toThrow();
 		await expect(fs.stat(marker)).resolves.toBeDefined();
 
 		await crashing.stop();
 		crashing = undefined;
 		reopened = new Broker({ agentDir });
 		await reopened.start();
-		expect(await reopened.handleRequest("session.resume", request, "post-fsync-crash")).toEqual(persistedResponse);
-		await expect(fs.stat(artifact)).resolves.toBeDefined();
-		await expect(fs.stat(marker)).resolves.toBeDefined();
+		setLifecycleCleanupHookForTest(reopened, () => {
+			throw new Error("simulated repeated lifecycle cleanup failure");
+		});
+		await expect(reopened.handleRequest("session.resume", request, "post-fsync-crash")).rejects.toThrow(
+			"simulated repeated lifecycle cleanup failure",
+		);
+		await reopened.stop();
+		reopened = new Broker({ agentDir });
+		await reopened.start();
+		const replayed = await reopened.handleRequest("session.resume", request, "post-fsync-crash");
+		expect(replayed).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+		await expect(fs.stat(artifact)).rejects.toThrow();
+		await expect(fs.stat(marker)).rejects.toThrow();
 		await reopened.stop();
 		reopened = undefined;
 
@@ -1018,6 +999,33 @@ await fs.rm(endpoint);
 			await expect(
 				fs.stat(path.join(normalRoot, ".gjc", "state", "sdk", `${normalSessionId}.lifecycle.json`)),
 			).rejects.toThrow();
+			expect({
+				crashAfterDetachRecovered: await Promise.all([
+					fs.stat(artifact).then(
+						() => false,
+						() => true,
+					),
+					fs.stat(marker).then(
+						() => false,
+						() => true,
+					),
+				]).then(values => values.every(Boolean)),
+				normalPathEvidenceCleaned: await Promise.all([
+					fs.stat(
+						path.join(
+							normalRoot,
+							".gjc",
+							"state",
+							"sdk",
+							`${normalSessionId}.lifecycle.failure.${normalTerminal.effectMarker}.json`,
+						),
+					),
+					fs.stat(path.join(normalRoot, ".gjc", "state", "sdk", `${normalSessionId}.lifecycle.json`)),
+				]).then(
+					() => false,
+					() => true,
+				),
+			}).toEqual({ crashAfterDetachRecovered: true, normalPathEvidenceCleaned: true });
 		} finally {
 			await normal?.stop();
 			await normalSaved.close();

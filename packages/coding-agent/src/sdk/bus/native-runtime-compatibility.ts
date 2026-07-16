@@ -1,4 +1,4 @@
-const REQUIRED_WORKFLOW_ARBITRATION_METHODS = ["registerArbitratedAsk", "retireIfUnclaimed"] as const;
+const REQUIRED_WORKFLOW_ARBITRATION_METHODS = ["registerArbitratedAsk", "retireIfUnclaimed", "stopAndWait"] as const;
 
 export class NativeRuntimeCompatibilityError extends Error {
 	readonly code = "native_runtime_incompatible";

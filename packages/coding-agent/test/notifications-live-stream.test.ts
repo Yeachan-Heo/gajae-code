@@ -2,11 +2,17 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Settings } from "../src/config/settings";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { renderThreadedFrame } from "../src/sdk/bus/threaded-render";
+import {
+	cleanupFixtureRoots,
+	createNotificationFixtureRoot,
+	type FixtureRootCleanup,
+	isolatedNotificationSettings,
+	registerNotificationRuntime,
+} from "./helpers/notification-settings";
 
 // ---------------------------------------------------------------------------
 // 1) Pure render contract: streamed turn frames become editable, and live +
@@ -60,7 +66,7 @@ async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Pro
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = { type: string; phase?: string; text?: string; messageRef?: string };
 
-const tempDirs: string[] = [];
+const cleanupRoots: FixtureRootCleanup[] = [];
 const openSockets: WebSocket[] = [];
 const envKeys = [
 	"GJC_NOTIFICATIONS",
@@ -70,17 +76,13 @@ const envKeys = [
 ] as const;
 let savedEnv: Record<string, string | undefined> = {};
 
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openSockets.splice(0)) {
 		try {
 			ws.close();
 		} catch {}
 	}
-	for (const dir of tempDirs.splice(0)) {
-		try {
-			fs.rmSync(dir, { recursive: true, force: true });
-		} catch {}
-	}
+	await cleanupFixtureRoots(cleanupRoots);
 	for (const k of envKeys) {
 		if (savedEnv[k] === undefined) delete process.env[k];
 		else process.env[k] = savedEnv[k];
@@ -101,10 +103,11 @@ async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unk
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api);
-
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-stream-"));
-	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".gjc", "agent");
+	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+	cleanupRoots.push(cleanup);
+	createNotificationsExtension(api, { settings: isolatedNotificationSettings(agentDir) });
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -118,6 +121,12 @@ async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unk
 		getModel: () => undefined,
 	} as never;
 
+	registerNotificationRuntime(cleanup, {
+		key: `notification-session:${sid}`,
+		shutdown: async () => {
+			await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+		},
+	});
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");
@@ -193,20 +202,13 @@ test("no live frames are emitted when streaming is disabled, and finalized carri
 //    finalized frame still posts a fresh message (no regression when off).
 // ---------------------------------------------------------------------------
 
-function daemonSettings(agentDir: string): Settings {
-	const s = Settings.isolated({
+function daemonSettings(agentDir: string) {
+	return isolatedNotificationSettings(agentDir, {
 		"notifications.enabled": true,
 		"notifications.telegram.botToken": "123456:secret-token",
 		"notifications.telegram.chatId": "42",
 		"notifications.daemon.idleTimeoutMs": 20,
-	}) as Settings;
-	return new Proxy(s, {
-		get(target, prop) {
-			if (prop === "getAgentDir") return () => agentDir;
-			const value = Reflect.get(target, prop, target);
-			return typeof value === "function" ? value.bind(target) : value;
-		},
-	}) as Settings;
+	});
 }
 
 class FakeBotApi {
@@ -222,8 +224,9 @@ class FakeBotApi {
 }
 
 async function bootDaemon() {
-	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-stream-daemon-"));
-	tempDirs.push(agentDir);
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-stream-daemon-"));
+	const agentDir = path.join(root, ".gjc", "agent");
+	cleanupRoots.push(await createNotificationFixtureRoot(root, agentDir));
 	const bot = new FakeBotApi();
 	const daemon = new TelegramNotificationDaemon({
 		settings: daemonSettings(agentDir),

@@ -12,6 +12,7 @@ test("accepts matching generated native build versions with workflow arbitration
 			notificationServer: {
 				registerArbitratedAsk: () => {},
 				retireIfUnclaimed: () => {},
+				stopAndWait: () => {},
 			},
 		}),
 	).not.toThrow();
@@ -46,7 +47,18 @@ test("rejects a matching native build missing a required workflow arbitration ca
 		});
 	}
 });
-
+test("rejects a matching native build missing stopAndWait", () => {
+	expect(() =>
+		assertNativeRuntimeCompatibility({
+			runtimeVersion: "0.10.2",
+			nativeVersion: "0.10.2",
+			notificationServer: {
+				registerArbitratedAsk: () => {},
+				retireIfUnclaimed: () => {},
+			},
+		}),
+	).toThrow(NativeRuntimeCompatibilityError);
+});
 test("rejects mismatched generated native build versions as non-retryable compatibility errors", () => {
 	expect(() =>
 		assertNativeRuntimeCompatibility({
@@ -55,6 +67,7 @@ test("rejects mismatched generated native build versions as non-retryable compat
 			notificationServer: {
 				registerArbitratedAsk: () => {},
 				retireIfUnclaimed: () => {},
+				stopAndWait: () => {},
 			},
 		}),
 	).toThrow(NativeRuntimeCompatibilityError);

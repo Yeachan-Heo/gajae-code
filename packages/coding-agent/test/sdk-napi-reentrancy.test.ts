@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { NotificationServer } from "../../natives/native/index.js";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -117,6 +120,29 @@ test("napi NotificationServer stops cleanly when an inbound callback is in fligh
 		expect(callbackEntered).toBe(true);
 	} finally {
 		ws.close();
-		server.stop();
+		await server.stopAndWait();
 	}
 }, 30_000);
+
+test("napi NotificationServer awaited stop releases connected-client state roots", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stop-wait-"));
+	const sessionId = `stop-wait-${process.pid}-${Date.now()}`;
+	const token = "stop-wait-token";
+	const server = new NotificationServer(sessionId, token, root, true);
+	let ws: WebSocket | undefined;
+	try {
+		const endpoint = await server.start();
+		ws = await open(endpoint.url, token);
+		await waitFor(() => server.clientCount() === 1, "connected client");
+
+		await Promise.all([server.stopAndWait(), server.stopAndWait()]);
+
+		expect(server.clientCount()).toBe(0);
+		await expect(fs.rm(root, { recursive: true, force: true })).resolves.toBeUndefined();
+		await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		ws?.close();
+		await server.stopAndWait();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

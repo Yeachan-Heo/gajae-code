@@ -40,6 +40,25 @@ async function syncFile(file: string): Promise<void> {
 		await handle.close();
 	}
 }
+
+async function syncDirectory(directory: string): Promise<void> {
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(directory, "r");
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) return;
+		throw error;
+	}
+	try {
+		await handle.sync();
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES")) throw error;
+	} finally {
+		await handle.close();
+	}
+}
 export async function writeBrokerDiscovery(agentDir: string, discovery: BrokerDiscoveryWrite): Promise<void> {
 	const incarnation = discovery.incarnation ?? brokerProcessIncarnation(discovery.pid);
 	if (!incarnation) throw new Error(`Broker process incarnation is unavailable for pid ${discovery.pid}.`);
@@ -54,7 +73,7 @@ export async function writeBrokerDiscovery(agentDir: string, discovery: BrokerDi
 		await fs.chmod(temp, 0o600);
 		await syncFile(temp);
 		await fs.rename(temp, file);
-		await syncFile(dir);
+		await syncDirectory(dir);
 	} finally {
 		await fs.rm(temp, { force: true });
 	}

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readModelCache, writeModelCache } from "../src/model-cache";
+import { closeModelCache, readModelCache, writeModelCache } from "../src/model-cache";
 import type { Model } from "../src/types";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
@@ -37,6 +37,9 @@ describe("model cache migrations", () => {
 		dbPath = path.join(tempDir, "models.db");
 	});
 
+	afterEach(() => {
+		closeModelCache(dbPath);
+	});
 	afterEach(async () => {
 		if (tempDir) {
 			await fs.rm(tempDir, { recursive: true, force: true });
@@ -73,5 +76,15 @@ describe("model cache migrations", () => {
 		const overwritten = readModelCache<"openai-completions">("ollama-cloud", TTL_MS, Date.now, dbPath);
 		expect(overwritten?.models.map(model => model.id)).toEqual(["fresh-cloud-model"]);
 		expect(overwritten?.staticFingerprint).toBe("static-v3");
+	});
+
+	it("closes only the exact shared database owner before root removal", async () => {
+		writeModelCache("ollama-cloud", Date.now(), [createModel("owned", "Owned")], true, "static", dbPath);
+		expect(closeModelCache(path.join(tempDir, "other.db"))).toBe(false);
+		expect(closeModelCache(dbPath)).toBe(true);
+		expect(closeModelCache(dbPath)).toBe(false);
+		await fs.rm(tempDir, { recursive: true, force: true });
+		tempDir = "";
+		dbPath = "";
 	});
 });

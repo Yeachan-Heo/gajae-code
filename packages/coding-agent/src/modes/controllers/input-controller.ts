@@ -27,6 +27,8 @@ interface Expandable {
 }
 
 const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
+const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
 const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
 
@@ -45,6 +47,29 @@ export class InputController {
 	#steerConsumePending = false;
 
 	#globalInterruptUnsubscribe: (() => void) | undefined;
+	#draftClearEscapeText: string | undefined;
+
+	#resetEscapeGestures(): void {
+		this.ctx.lastEscapeTime = 0;
+		this.ctx.lastComposerClearEscapeTime = 0;
+		this.#draftClearEscapeText = undefined;
+	}
+
+	#armDraftClearEscape(text: string, now: number): void {
+		this.ctx.lastEscapeTime = 0;
+		this.ctx.lastComposerClearEscapeTime = now;
+		this.#draftClearEscapeText = text;
+		this.ctx.showStatus("press Esc again to clear");
+	}
+
+	#resetDraftClearEscape(): void {
+		this.ctx.lastComposerClearEscapeTime = 0;
+		this.#draftClearEscapeText = undefined;
+	}
+
+	#resetEmptyEditorEscape(): void {
+		this.ctx.lastEscapeTime = 0;
+	}
 
 	#matchesInterruptKey(data: string): boolean {
 		return this.ctx.keybindings.getKeys("app.interrupt").some(key => matchesKey(data, key));
@@ -146,6 +171,7 @@ export class InputController {
 				return undefined;
 			}
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
+				this.#resetEscapeGestures();
 				return { consume: true };
 			}
 			const hookDialogActive = this.#hasHookDialog();
@@ -153,6 +179,7 @@ export class InputController {
 				// Inline ask/custom-input editors use Esc to return to the option list.
 				// Let the focused selector see the key instead of converting a typo
 				// into a full workflow/session abort while the agent is streaming.
+				this.#resetEscapeGestures();
 				return undefined;
 			}
 			if (
@@ -165,6 +192,7 @@ export class InputController {
 					streaming: hookDialogActive,
 				})
 			) {
+				this.#resetEscapeGestures();
 				return { consume: true };
 			}
 			return undefined;
@@ -178,11 +206,18 @@ export class InputController {
 			silent: options?.silent,
 		});
 	}
+	#clearComposer(): void {
+		const text = this.ctx.editor.getText();
+		if (text.trim()) {
+			this.ctx.editor.addToHistory(text);
+		}
+		this.ctx.clearEditor();
+	}
 
 	setupKeyHandlers(): void {
 		this.ctx.editor.setActionKeys("app.interrupt", this.ctx.keybindings.getKeys("app.interrupt"));
-		this.ctx.editor.shouldBypassAutocompleteOnEscape = () =>
-			Boolean(
+		this.ctx.editor.shouldBypassAutocompleteOnEscape = () => {
+			const bypassAutocomplete = Boolean(
 				this.ctx.loadingAnimation ||
 					this.ctx.hasActiveBtw() ||
 					(this.#steerConsumePending && this.ctx.session.hasQueuedSteering) ||
@@ -197,18 +232,28 @@ export class InputController {
 					this.ctx.autoCompactionEscapeHandler ||
 					this.ctx.retryEscapeHandler,
 			);
+			if (!bypassAutocomplete) this.#resetEscapeGestures();
+			return bypassAutocomplete;
+		};
 		this.#installGlobalInterruptListener();
 
 		// An open btw panel must stay dismissable with Esc even while another
 		// controller (auto-compaction, auto-retry, manual compaction, etc.) has
 		// temporarily replaced editor.onEscape. This priority hook is never
 		// swapped out, so it always wins for the interrupt key.
-		this.ctx.editor.onInterruptPriority = () => (this.ctx.hasActiveBtw() ? this.ctx.handleBtwEscape() : false);
+		this.ctx.editor.onInterruptPriority = () => {
+			if (!this.ctx.hasActiveBtw()) return false;
+			const consumed = this.ctx.handleBtwEscape();
+			if (consumed) this.#resetEscapeGestures();
+			return consumed;
+		};
 		this.ctx.editor.onEscape = () => {
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
+				this.#resetEscapeGestures();
 				return;
 			}
 			if (this.#steerConsumePending) {
+				this.#resetEscapeGestures();
 				if (this.ctx.session.hasQueuedSteering) {
 					// Second Esc before the scheduled steer continuation drains the
 					// queue: restore/drop the queued steer and perform a real abort,
@@ -220,20 +265,7 @@ export class InputController {
 				this.#steerConsumePending = false;
 			}
 			if (this.#handleCancellableWorkEscape({ maintenance: true, retry: true })) {
-				return;
-			}
-			// Normal input state with user-typed text: Esc must not interrupt a
-			// running task (streaming turn, bash/eval). A double Esc within the
-			// 500ms window clears the composer instead. Bash/Python input modes
-			// keep their own Esc handling in the chain below.
-			if (!this.ctx.isBashMode && !this.ctx.isPythonMode && this.ctx.editor.getText().trim()) {
-				const now = Date.now();
-				if (now - this.ctx.lastComposerClearEscapeTime < 500) {
-					this.ctx.clearEditor();
-					this.ctx.lastComposerClearEscapeTime = 0;
-				} else {
-					this.ctx.lastComposerClearEscapeTime = now;
-				}
+				this.#resetEscapeGestures();
 				return;
 			}
 			if (
@@ -246,23 +278,45 @@ export class InputController {
 					streaming: true,
 				})
 			) {
+				this.#resetEscapeGestures();
 				return;
 			}
-			if (!this.ctx.editor.getText().trim()) {
+
+			const text = this.ctx.editor.getText();
+			if (!this.ctx.isBashMode && !this.ctx.isPythonMode && text.trim()) {
+				this.#resetEmptyEditorEscape();
+				const now = Date.now();
+				if (
+					now - this.ctx.lastComposerClearEscapeTime < DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS &&
+					this.#draftClearEscapeText === text
+				) {
+					this.#clearComposer();
+					this.#resetDraftClearEscape();
+				} else {
+					this.#armDraftClearEscape(text, now);
+				}
+				return;
+			}
+
+			if (!text.trim()) {
+				this.#resetDraftClearEscape();
 				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
 				const action = settings.get("doubleEscapeAction");
-				if (action !== "none") {
-					const now = Date.now();
-					if (now - this.ctx.lastEscapeTime < 500) {
-						if (action === "tree") {
-							this.ctx.showTreeSelector();
-						} else {
-							this.ctx.showUserMessageSelector();
-						}
-						this.ctx.lastEscapeTime = 0;
+				if (action === "none") {
+					this.#resetEmptyEditorEscape();
+					return;
+				}
+
+				const now = Date.now();
+				if (now - this.ctx.lastEscapeTime < EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS) {
+					if (action === "tree") {
+						this.ctx.showTreeSelector();
 					} else {
-						this.ctx.lastEscapeTime = now;
+						this.ctx.showUserMessageSelector();
 					}
+					this.#resetEmptyEditorEscape();
+				} else {
+					this.ctx.lastEscapeTime = now;
 				}
 			}
 		};
@@ -391,6 +445,7 @@ export class InputController {
 		}
 
 		this.ctx.editor.onChange = (text: string) => {
+			this.#resetEscapeGestures();
 			const wasBashMode = this.ctx.isBashMode;
 			const wasBashNoContext = this.ctx.isBashNoContext;
 			const wasPythonMode = this.ctx.isPythonMode;

@@ -171,6 +171,8 @@ pub struct NotificationServer {
 	on_inbound:              Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
 	on_frame:                Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
 	on_connection_close:     Mutex<Option<ThreadsafeFunction<String>>>,
+	pump_tasks:              Mutex<Vec<tokio::task::JoinHandle<()>>>,
+	stop_wait:               tokio::sync::Mutex<()>,
 }
 
 #[napi]
@@ -200,6 +202,8 @@ impl NotificationServer {
 			on_inbound:              Mutex::new(None),
 			on_frame:                Mutex::new(None),
 			on_connection_close:     Mutex::new(None),
+			pump_tasks:              Mutex::new(Vec::new()),
+			stop_wait:               tokio::sync::Mutex::new(()),
 		}
 	}
 
@@ -263,7 +267,7 @@ impl NotificationServer {
 			let mut rx = handle
 				.take_reply_receiver()
 				.ok_or_else(|| Error::from_reason("notification reply receiver unavailable"))?;
-			napi::tokio::spawn(async move {
+			let task = napi::tokio::spawn(async move {
 				while let Some(reply) = rx.recv().await {
 					let event = ReplyEvent {
 						id:               reply.reply.id,
@@ -275,13 +279,14 @@ impl NotificationServer {
 					tsfn.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
 				}
 			});
+			self.pump_tasks.lock().push(task);
 		}
 
 		// Pump forwarded inbound messages (injections / config commands) to TS.
 		let inbound_tsfn = self.on_inbound.lock().take();
 		let inbound_rx = handle.take_inbound_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (inbound_tsfn, inbound_rx) {
-			napi::tokio::spawn(async move {
+			let task = napi::tokio::spawn(async move {
 				while let Some(msg) = rx.recv().await {
 					let event = match msg {
 						ClientMessage::UserMessage(u) => InboundEvent {
@@ -339,12 +344,13 @@ impl NotificationServer {
 					tsfn.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
 				}
 			});
+			self.pump_tasks.lock().push(task);
 		}
 
 		let frame_tsfn = self.on_frame.lock().take();
 		let frame_rx = handle.take_frame_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (frame_tsfn, frame_rx) {
-			napi::tokio::spawn(async move {
+			let task = napi::tokio::spawn(async move {
 				while let Some((connection_id, json)) = rx.recv().await {
 					tsfn.call(
 						Ok(SdkFrameEvent { connection_id, json }),
@@ -352,16 +358,18 @@ impl NotificationServer {
 					);
 				}
 			});
+			self.pump_tasks.lock().push(task);
 		}
 
 		let close_tsfn = self.on_connection_close.lock().take();
 		let close_rx = handle.take_close_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (close_tsfn, close_rx) {
-			napi::tokio::spawn(async move {
+			let task = napi::tokio::spawn(async move {
 				while let Some(connection_id) = rx.recv().await {
 					tsfn.call(Ok(connection_id), ThreadsafeFunctionCallMode::NonBlocking);
 				}
 			});
+			self.pump_tasks.lock().push(task);
 		}
 
 		*self.handle.lock() = Some(handle);
@@ -705,6 +713,22 @@ impl NotificationServer {
 		if let Ok(handle) = self.handle() {
 			handle.stop();
 		}
+	}
+
+	/// Stop the server and resolve only after all native socket owners exit.
+	#[napi]
+	pub async fn stop_and_wait(&self) -> Result<()> {
+		let _stop = self.stop_wait.lock().await;
+		let handle = self.handle.lock().take();
+		if let Some(handle) = handle {
+			handle.stop_and_wait().await;
+			drop(handle);
+		}
+		let tasks = std::mem::take(&mut *self.pump_tasks.lock());
+		for task in tasks {
+			let _ = task.await;
+		}
+		Ok(())
 	}
 
 	fn with_handle<T, F: FnOnce(&ServerHandle) -> T>(&self, f: F) -> Result<T> {

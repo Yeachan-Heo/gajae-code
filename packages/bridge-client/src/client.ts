@@ -102,6 +102,12 @@ export class SdkClient {
 	readonly #timeoutMs: number;
 	readonly #reconnectAttempts: number;
 	readonly #reconnectBackoffMs: number;
+	/**
+	 * Bounded grace for best-effort transport close, independent of the request
+	 * deadline. Close teardown must never be gated by an already-elapsed operation
+	 * deadline, or the socket leaks.
+	 */
+	readonly #closeGraceMs: number;
 	readonly #deadline?: number;
 	#currentSocketRecord: Incarnation | null = null;
 	#opening: Cycle | null = null;
@@ -111,6 +117,7 @@ export class SdkClient {
 	#frameHandlers = new Set<SdkFrameHandler>();
 	#reconnectHandlers = new Set<SdkReconnectHandler>();
 	#reconnectFailedHandlers = new Set<SdkReconnectFailedHandler>();
+	#closePromise: Promise<void> | undefined;
 
 	#closed = false;
 	connectionId?: string;
@@ -119,6 +126,7 @@ export class SdkClient {
 		this.#url = url;
 		this.#token = token;
 		this.#timeoutMs = options.timeoutMs ?? 10_000;
+		this.#closeGraceMs = Math.max(1, Math.min(this.#timeoutMs, 1_000));
 		this.#deadline =
 			typeof options.deadline === "number" && Number.isFinite(options.deadline) ? options.deadline : undefined;
 
@@ -177,23 +185,33 @@ export class SdkClient {
 		return this.#request(frame, options) as Promise<SdkFrame>;
 	}
 
-	async close(): Promise<void> {
-		if (this.#closed) return;
+	close(): Promise<void> {
+		this.#closePromise ??= this.#close();
+		return this.#closePromise;
+	}
+	async #close(): Promise<void> {
 		this.#closed = true;
+		const transports = new Set<Incarnation>();
 		const cycle = this.#opening;
 		if (cycle) {
 			cycle.phase = "aborted";
 			if (cycle.backoffTimer) clearTimeout(cycle.backoffTimer);
-			if (cycle.candidate)
-				this.#retire(cycle.candidate, new SdkClientError("connection_closed", "SDK client closed"), true);
+			if (cycle.candidate) {
+				transports.add(cycle.candidate);
+				this.#retire(cycle.candidate, new SdkClientError("connection_closed", "SDK client closed"), false);
+			}
 			cycle.rejectBackoff?.(new SdkClientError("connection_closed", "SDK client closed"));
 			cycle.rejectBackoff = undefined;
 			if (this.#opening === cycle) this.#opening = null;
 		}
 		const current = this.#currentSocketRecord;
-		if (current) this.#retire(current, new SdkClientError("connection_closed", "SDK client closed"), true);
+		if (current) {
+			transports.add(current);
+			this.#retire(current, new SdkClientError("connection_closed", "SDK client closed"), false);
+		}
 		for (const [id, pending] of this.#pending)
 			this.#settlePending(id, pending, new SdkClientError("connection_closed", "SDK client closed"));
+		await Promise.all([...transports].map(incarnation => this.#closeTransport(incarnation)));
 	}
 
 	async control(
@@ -611,6 +629,34 @@ export class SdkClient {
 			try {
 				incarnation.socket.close();
 			} catch {}
+	}
+	async #closeTransport(incarnation: Incarnation): Promise<void> {
+		const socket = incarnation.socket;
+		if (socket.readyState === WebSocket.CLOSED) return;
+		// Close teardown must always issue socket.close() and be bounded by a
+		// dedicated close grace, never by the (possibly elapsed) request deadline —
+		// gating on an expired deadline would throw before close and leak the socket.
+		const timeoutMs = this.#closeGraceMs;
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const onClose = (): void => resolve();
+		socket.addEventListener("close", onClose, { once: true });
+		const timer = setTimeout(
+			() => reject(new SdkClientError("timeout", `SDK WebSocket close timed out after ${timeoutMs}ms`)),
+			timeoutMs,
+		);
+		timer.unref?.();
+		try {
+			socket.close();
+			if (Number(socket.readyState) === WebSocket.CLOSED) resolve();
+			await promise;
+		} catch (error) {
+			if (error instanceof SdkClientError) throw error;
+			if (Number(socket.readyState) !== WebSocket.CLOSED)
+				throw new SdkClientError("connection_closed", "SDK WebSocket close failed", error);
+		} finally {
+			clearTimeout(timer);
+			socket.removeEventListener("close", onClose);
+		}
 	}
 	#isCandidate(cycle: Cycle, incarnation: Incarnation): boolean {
 		return (

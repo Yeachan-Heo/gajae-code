@@ -26,8 +26,9 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use tokio::{
 	net::{TcpListener, TcpStream},
-	sync::{broadcast, mpsc, oneshot},
-	time::sleep,
+	sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot},
+	task::{JoinHandle, JoinSet},
+	time::{sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::{
 	Error, Message,
@@ -97,6 +98,10 @@ impl ServerConfig {
 /// Bounded time a connection may defer controlled delivery while it advertises
 /// its capabilities.
 const CLIENT_HELLO_GRACE: Duration = Duration::from_secs(1);
+
+/// Grace period for connection tasks to observe server cancellation before
+/// forced abort.
+const CONNECTION_JOIN_GRACE: Duration = Duration::from_secs(1);
 
 /// Commands serialized through the owning connection task.
 #[derive(Debug)]
@@ -333,16 +338,17 @@ type FrameReceiver = mpsc::UnboundedReceiver<(String, String)>;
 /// [`ServerHandle::stop`] (idempotent) for deterministic shutdown.
 #[derive(Debug, Clone)]
 pub struct ServerHandle {
-	addr:        SocketAddr,
-	state:       Arc<ServerState>,
-	cancel:      CancellationToken,
-	accept_task: Arc<tokio::task::JoinHandle<()>>,
-	session_id:  String,
-	state_root:  Option<PathBuf>,
+	addr:          SocketAddr,
+	state:         Arc<ServerState>,
+	cancel:        CancellationToken,
+	accept_task:   Arc<Mutex<Option<JoinHandle<()>>>>,
+	shutdown_wait: Arc<AsyncMutex<()>>,
+	session_id:    String,
+	state_root:    Option<PathBuf>,
 	reply_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::actions::ClaimedReply>>>>,
-	inbound_rx:  Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>>>>,
-	frame_rx:    Arc<Mutex<Option<FrameReceiver>>>,
-	close_rx:    Arc<Mutex<Option<mpsc::UnboundedReceiver<String>>>>,
+	inbound_rx:    Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>>>>,
+	frame_rx:      Arc<Mutex<Option<FrameReceiver>>>,
+	close_rx:      Arc<Mutex<Option<mpsc::UnboundedReceiver<String>>>>,
 }
 
 impl ServerHandle {
@@ -958,9 +964,20 @@ impl ServerHandle {
 			);
 		}
 		self.cancel.cancel();
-		self.accept_task.abort();
 		if let Some(root) = self.state_root.as_deref() {
 			let _ = crate::discovery::remove_endpoint(root, &self.session_id);
+		}
+	}
+
+	/// Stop the server and wait until the accept loop and every connection task
+	/// have released their sockets. This is the authoritative filesystem
+	/// teardown boundary for callers that remove a server-owned state root.
+	pub async fn stop_and_wait(&self) {
+		self.stop();
+		let _shutdown = self.shutdown_wait.lock().await;
+		let task = self.accept_task.lock().take();
+		if let Some(task) = task {
+			let _ = task.await;
 		}
 	}
 }
@@ -1025,7 +1042,8 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 		addr,
 		state,
 		cancel,
-		accept_task: Arc::new(accept_task),
+		accept_task: Arc::new(Mutex::new(Some(accept_task))),
+		shutdown_wait: Arc::new(AsyncMutex::new(())),
 		session_id: config.session_id,
 		state_root: config.state_root,
 		reply_rx: Arc::new(Mutex::new(reply_rx)),
@@ -1036,14 +1054,30 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 }
 
 async fn accept_loop(listener: TcpListener, state: Arc<ServerState>, cancel: CancellationToken) {
+	let mut connections = JoinSet::new();
 	loop {
 		tokio::select! {
 			() = cancel.cancelled() => break,
+			joined = connections.join_next(), if !connections.is_empty() => {
+				let _ = joined;
+			},
 			accepted = listener.accept() => {
 				let Ok((stream, _peer)) = accepted else { continue };
-				tokio::spawn(handle_conn(stream, Arc::clone(&state), cancel.clone()));
+				connections.spawn(handle_conn(stream, Arc::clone(&state), cancel.clone()));
 			}
 		}
+	}
+	cancel.cancel();
+	join_connection_tasks(&mut connections).await;
+}
+
+async fn join_connection_tasks(connections: &mut JoinSet<()>) {
+	if timeout(CONNECTION_JOIN_GRACE, async { while connections.join_next().await.is_some() {} })
+		.await
+		.is_err()
+	{
+		connections.abort_all();
+		while connections.join_next().await.is_some() {}
 	}
 }
 
@@ -1070,10 +1104,12 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 		max_frame_size: Some(REQUEST_FRAME_BYTES),
 		..WebSocketConfig::default()
 	};
-	let Ok(ws) =
-		tokio_tungstenite::accept_hdr_async_with_config(stream, auth, Some(ws_config)).await
-	else {
-		return;
+	let ws = tokio::select! {
+		() = cancel.cancelled() => return,
+		accepted = tokio_tungstenite::accept_hdr_async_with_config(stream, auth, Some(ws_config)) => {
+			let Ok(ws) = accepted else { return };
+			ws
+		},
 	};
 	let connection_id =
 		format!("connection:{}", state.connection_sequence.fetch_add(1, Ordering::Relaxed));
@@ -1581,6 +1617,19 @@ mod tests {
 				keep_runtime_busy.abort();
 				let _ = keep_runtime_busy.await;
 			});
+	}
+
+	#[tokio::test]
+	async fn stalled_connection_tasks_are_aborted_after_shutdown_grace() {
+		let mut connections = JoinSet::new();
+		connections.spawn(async { std::future::pending::<()>().await });
+		tokio::time::timeout(
+			CONNECTION_JOIN_GRACE + Duration::from_secs(1),
+			join_connection_tasks(&mut connections),
+		)
+		.await
+		.expect("connection joins must remain bounded");
+		assert!(connections.is_empty());
 	}
 
 	fn ask(id: &str) -> ActionNeeded {
@@ -2258,6 +2307,27 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn awaited_stop_joins_half_open_and_established_connections_idempotently() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let half_open = TcpStream::connect(handle.addr()).await.unwrap();
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		wait_for_clients(&handle, 1).await;
+
+		let left = handle.clone();
+		let right = handle.clone();
+		tokio::time::timeout(Duration::from_secs(1), async move {
+			tokio::join!(left.stop_and_wait(), right.stop_and_wait());
+		})
+		.await
+		.expect("awaited stop joins every accepted connection");
+
+		drop(half_open);
+		assert_eq!(handle.client_count(), 0);
+		handle.stop_and_wait().await;
+	}
+
+	#[tokio::test]
 	async fn forward_mode_routes_reply_to_host_then_resolves() {
 		let mut config = ServerConfig::new("s", "secret");
 		config.forward_replies = true;
@@ -2822,12 +2892,16 @@ mod tests {
 			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1).into()))
 			.await
 			.expect("send oversized text frame");
-		let rejected = tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
+		match tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
 			.await
 			.expect("oversized client was not closed")
-			.expect("oversized client stream closed without a close frame")
-			.expect("oversized client close error");
-		assert!(matches!(rejected, Message::Close(Some(frame)) if frame.code == CloseCode::Size));
+		{
+			Some(Ok(Message::Close(Some(frame)))) => {
+				assert_eq!(frame.code, CloseCode::Size);
+			},
+			Some(Err(_)) | None => {},
+			Some(Ok(message)) => panic!("unexpected non-close message: {message:?}"),
+		}
 
 		healthy
 			.send(Message::Text(

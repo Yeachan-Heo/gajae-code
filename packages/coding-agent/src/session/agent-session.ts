@@ -355,6 +355,7 @@ import type {
 	SessionManagerCloseOutcome,
 } from "./session-manager";
 import {
+	createReadonlySessionManager,
 	getLatestCompactionEntry,
 	getSessionMessageObservationId,
 	transferSessionMessageIdentity,
@@ -5448,7 +5449,7 @@ export class AgentSession {
 		}
 
 		const getCustomToolContext = (): CustomToolContext => ({
-			sessionManager: this.sessionManager,
+			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
 			model: this.model,
 			isIdle: () => !this.isStreaming,
@@ -5493,7 +5494,7 @@ export class AgentSession {
 
 	#getCustomToolContext(): CustomToolContext {
 		return {
-			sessionManager: this.sessionManager,
+			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
 			model: this.model,
 			isIdle: () => !this.isStreaming,
@@ -6747,7 +6748,7 @@ export class AgentSession {
 			ui: noOpUIContext,
 			hasUI: false,
 			cwd: this.sessionManager.getCwd(),
-			sessionManager: this.sessionManager,
+			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
 			model: this.model ?? undefined,
 			isIdle: () => !this.isStreaming,

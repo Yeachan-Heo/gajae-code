@@ -15,6 +15,7 @@ class FakeWebSocket {
 	readonly closeCalls: unknown[][] = [];
 	readyState = FakeWebSocket.CONNECTING;
 	throwOnSend: Error | undefined;
+	deferClose = false;
 
 	constructor(readonly url: string | URL) {
 		FakeWebSocket.instances.push(this);
@@ -32,7 +33,7 @@ class FakeWebSocket {
 
 	close(...args: unknown[]): void {
 		this.closeCalls.push(args);
-		this.readyState = FakeWebSocket.CLOSED;
+		this.readyState = this.deferClose ? FakeWebSocket.CLOSING : FakeWebSocket.CLOSED;
 	}
 
 	send(value: string): void {
@@ -179,6 +180,71 @@ test("SdkClient gates requests on hello and correlates success and typed errors"
 		await expect(failed).rejects.toBeInstanceOf(SdkClientError);
 		await expect(failed).rejects.toMatchObject({ code: "unknown_operation", message: "missing" });
 		await client.close();
+	});
+});
+
+test("SdkClient close resolves only after the owned transport closes", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const socket = await connect(client);
+		socket.deferClose = true;
+		let settled = false;
+		const closing = client.close().then(() => {
+			settled = true;
+		});
+		await flush();
+		expect(settled).toBe(false);
+		expect(socket.readyState).toBe(FakeWebSocket.CLOSING);
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		await closing;
+		expect(settled).toBe(true);
+	});
+});
+
+test("SdkClient concurrent close callers await the same transport close", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const socket = await connect(client);
+		socket.deferClose = true;
+		const first = client.close();
+		const second = client.close();
+		expect(second).toBe(first);
+		await flush();
+		expect(socket.closeCalls).toHaveLength(1);
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+	});
+});
+
+test("SdkClient close rejects with a typed timeout when transport close stalls", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { timeoutMs: 50 });
+		const socket = await connect(client);
+		socket.deferClose = true;
+		const closing = client.close();
+		clock.advanceBy(50);
+		await expect(closing).rejects.toMatchObject({
+			code: "timeout",
+			message: "SDK WebSocket close timed out after 50ms",
+		});
+		expect(socket.snapshot("close")).toHaveLength(0);
+	});
+});
+
+test("SdkClient close still issues socket close after the operation deadline elapses (no transport leak)", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { timeoutMs: 50, deadline: clock.now + 10 });
+		const socket = await connect(client);
+		clock.advanceBy(100); // operation deadline (now + 10) is now in the past
+		const closing = client.close();
+		await flush();
+		// Regression: close must always issue socket.close() bounded by its own close
+		// grace, never gate on the expired request deadline and throw before closing.
+		expect(socket.closeCalls.length).toBeGreaterThanOrEqual(1);
+		await closing;
+		expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
 	});
 });
 

@@ -1,10 +1,16 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
+
+## [0.11.0] - 2026-07-15
 
 ### Fixed
+- Discord inbound lease recovery now exposes a deterministic scheduler seam, preserves exponential retry wakeups after transient endpoint lookup failures, and cancels pending recovery exactly on daemon stop instead of relying on wall-clock sleeps in regression coverage.
 - Input-free interactive TTY startup now keeps the TUI reachable when configured model profiles are missing required provider credentials, skips only the blocked profiles, and preserves later `--mpreset` and explicit model/thinking precedence; redirected terminals, input-bearing, resume-continuation, image-only, print/text, and unrelated activation failures remain fail-closed (#2277).
 - Receipt-bearing workflow writes now establish and validate the canonical active snapshot, rejecting storage-path and checksum covered-path drift (#2393).
+- Windows Bun runtimes no longer crash while committing the durable workflow-gate store when directory `fsync` reports the unsupported-operation code `EPERM`; unexpected directory-sync failures remain fail-closed.
 - Browser geo settings now propagate coherently across request `Accept-Language`, navigator languages, and `Intl` locale/timezone surfaces; configured managed browsers are isolated by geo/profile posture, concurrent acquisition is serialized, and unset geo preserves Chromium's native locale/timezone instead of injecting a fixed New York profile.
 
 - Cooperative mid-run context maintenance now waits at a cancellation-aware FIFO consumer-drain checkpoint before flushing or rewriting session history. Materialized tool results and steering messages are synchronously canonicalized first; aborted barriers and hook/signal-cancelled compactions settle without rewriting or scheduling a continuation. Promotion, pruning, and compaction each start a clean provider/prompt-cache epoch. Script-aware #2067 unsent-delta accounting remains cache-free and distinct from the lifecycle checkpoint.
@@ -19,6 +25,7 @@
 - Added the standalone `@gajae-code/bridge-client` transport-only v3 SDK package. It exports `SdkClient` and its associated types; `@gajae-code/coding-agent/sdk` remains a compatibility re-export with the exact same class identity. Historical BridgeClient backend protocol, handshake, commands, SSE, and host-control bypass surfaces remain unavailable.
 - Added explicit `--mcp-config <absolute-path>` support for one trusted, tools-only MCP config in top-level standalone sessions without enabling automatic user or project MCP discovery; exact reads reject links and identity changes, and MCP tool-name collisions fail closed.
 - Added additive v3 workflow-gate correlation compatibility surfaces (#2171): explicit Rust workflow-frame readers/registration preserve `workflowGateId` without changing legacy `ActionNeeded`, `ServerMessage`, or `register_ask`; N-API retains `registerAsk` and adds correlated/arbitrated registration and exact unclaimed-retirement APIs. Private presentation leases, routes, claims, receipts, epochs, and endpoint generations remain non-public.
+- Added the versioned, readonly managed session-directory SDK: `SESSION_DIRECTORY_API_VERSION`, `resolveManagedSessionScope`, and `listManagedSessionCandidates` are exported from `@gajae-code/coding-agent/sdk`. The package boundary continues to reject private `session/internal/*` imports. Managed writes use v2 workspace scopes with validated opt-in legacy copy-retain migration (#2177).
 
 ### Changed
 
@@ -27,7 +34,7 @@
 - Removed the `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` external ingress modes. Machine clients must use the SDK WebSocket interfaces documented in `docs/sdk.md`; no RPC or Bridge compatibility path remains.
 - Documented the current GPT-5.6 Codex and combo profile mappings as product judgments, including the durable `opus-codex` `anthropic/claude-sonnet-5` planner override and `fable-opus-codex` `anthropic/claude-opus-4-8:medium` planner.
 - Resolved the SDK v3 workflow-gate shipping classification (#2171): `workflowGateId` and Q12 diagnostics are additive SDK v3 surfaces, while `action_needed.id` remains the transient, generic `reply.id` authority. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line; new clients must send it, and mandatory enforcement or removal can occur no earlier than SDK v4 only after at least one full published deprecation release/window with deployed-client notice. Explicit session mismatches fail closed before resolution; mismatched sessions, stale/reissued actions, and unsafe ambiguity never regain authority.
-- Documented release pairing: the `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions (currently `0.10.2`), with the native loader version sentinel enforcing the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+- Documented release pairing: the `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions, with the native loader version sentinel enforcing the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
 ### Fixed
 - Startup continuation now participates in the existing managed fallback and in-flight recovery envelope, preventing a retryable resumed turn from publishing `agent_end`/idle before retry success, exhaustion, cancellation, or startup failure has settled (#2092).
 

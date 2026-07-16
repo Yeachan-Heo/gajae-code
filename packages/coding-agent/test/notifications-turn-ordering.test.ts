@@ -4,6 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
+import {
+	cleanupFixtureRoots,
+	createNotificationFixtureRoot,
+	type FixtureRootCleanup,
+	isolatedNotificationSettings,
+	registerNotificationRuntime,
+} from "./helpers/notification-settings";
 
 /**
  * Regression for the text-before-ask ordering bug: the assistant text that
@@ -40,11 +47,11 @@ type TestContextUsage = {
 };
 type TestModel = { id?: string };
 
-const tempDirs: string[] = [];
+const cleanupRoots: FixtureRootCleanup[] = [];
 const openSockets: WebSocket[] = [];
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openSockets.splice(0)) ws.close();
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+	await cleanupFixtureRoots(cleanupRoots);
 });
 
 /** Boot the notifications extension against a real NotificationServer + WS client. */
@@ -64,10 +71,12 @@ async function setup(options: { contextUsage?: TestContextUsage | false; model?:
 		registerCommand: () => {},
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api);
 
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-order-"));
-	tempDirs.push(cwd);
+	const agentDir = path.join(cwd, ".gjc", "agent");
+	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+	cleanupRoots.push(cleanup);
+	createNotificationsExtension(api, { settings: isolatedNotificationSettings(agentDir) });
 	const sid = `order-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -83,6 +92,12 @@ async function setup(options: { contextUsage?: TestContextUsage | false; model?:
 				: (options.contextUsage ?? { tokens: 12, contextWindow: 100, percent: 12, source: "provider_anchor" }),
 		getModel: () => (options.model === false ? undefined : (options.model ?? { id: "test-model" })),
 	} as never;
+	registerNotificationRuntime(cleanup, {
+		key: `notification-session:${sid}`,
+		shutdown: async () => {
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		},
+	});
 
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
 

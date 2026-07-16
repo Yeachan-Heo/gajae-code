@@ -175,13 +175,20 @@ export class LifecycleLedger {
 		for (const identity of uncertainAfterCorruption) {
 			const entry = this.#byIdentity.get(identity);
 			if (entry && !terminal(entry.state) && entry.state !== "terminal_uncertain") {
-				await this.#append({ ...entry, state: "terminal_uncertain", ts: Date.now() });
+				const uncertain = { ...entry, state: "terminal_uncertain" as const, ts: Date.now() };
+				if (uncertain.response !== undefined)
+					uncertain.responseDigest = createHash("sha256").update(canonicalJson(uncertain.response)).digest("hex");
+				await this.#append(uncertain);
 			}
 		}
 		// Effects may have completed after the last durable marker; do not retry them after a restart.
 		for (const entry of [...this.#byIdentity.values()]) {
-			if (entry.state === "effect_started" || entry.state === "awaiting_ready")
-				await this.#append({ ...entry, state: "terminal_uncertain", ts: Date.now() });
+			if (entry.state === "effect_started" || entry.state === "awaiting_ready") {
+				const uncertain = { ...entry, state: "terminal_uncertain" as const, ts: Date.now() };
+				if (uncertain.response !== undefined)
+					uncertain.responseDigest = createHash("sha256").update(canonicalJson(uncertain.response)).digest("hex");
+				await this.#append(uncertain);
+			}
 		}
 		return this;
 	}

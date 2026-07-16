@@ -17,13 +17,33 @@ const DISCOVERY_TIMEOUT_MS = 10_000;
 // owned-process teardown convention (SIGTERM -> grace -> SIGKILL -> hard cap).
 const REAP_GRACEFUL_MS = 2_000;
 const REAP_SIGKILL_CAP_MS = 2_000;
+export interface FixtureBrokerLease {
+	close(): Promise<void>;
+}
+
+export interface StartedFixtureBroker {
+	discovery: BrokerDiscovery;
+	lease: FixtureBrokerLease;
+}
+
 interface BrokerOwner {
 	stop(): Promise<void>;
 	canReuse(discovery: BrokerDiscovery | null): boolean;
 	markReady(discovery: BrokerDiscovery): boolean;
 }
+type EnsureInitiator = "discovery" | "fixture-lease";
+type EnsureOutcome =
+	| { kind: "external-discovery"; discovery: BrokerDiscovery }
+	| { kind: "prior-local-owner"; discovery: BrokerDiscovery; owner: BrokerOwner }
+	| { kind: "local-started-discovery"; discovery: BrokerDiscovery }
+	| { kind: "local-started-fixture"; discovery: BrokerDiscovery; owner: BrokerOwner };
+interface EnsureInFlight {
+	initiator: EnsureInitiator;
+	promise: Promise<EnsureOutcome>;
+	discovery: Promise<BrokerDiscovery>;
+}
 const owners = new Map<string, BrokerOwner>();
-const ensureInFlight = new Map<string, Promise<BrokerDiscovery>>();
+const ensureInFlight = new Map<string, EnsureInFlight>();
 const reapErrorGuards = new WeakSet<ChildProcess>();
 interface ReapTiming {
 	gracefulMs: number;
@@ -142,18 +162,44 @@ function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: Nod
 	return environment;
 }
 
-async function ensureBrokerOnce(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
+function fixtureLeaseUnavailable(): Error {
+	return new Error("fixture_broker_lease_unavailable");
+}
+
+function createFixtureLease(owner: BrokerOwner): FixtureBrokerLease {
+	let closeAttempt: Promise<void> | undefined;
+	let closed = false;
+	return {
+		close(): Promise<void> {
+			if (closed) return Promise.resolve();
+			if (closeAttempt) return closeAttempt;
+			closeAttempt = owner.stop().then(
+				() => {
+					closed = true;
+				},
+				(error: unknown) => {
+					closeAttempt = undefined;
+					throw error;
+				},
+			);
+			return closeAttempt;
+		},
+	};
+}
+
+async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: EnsureInitiator): Promise<EnsureOutcome> {
 	const priorOwner = owners.get(settings.agentDir);
 	const existing = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	if (initiator === "fixture-lease" && (priorOwner || existing)) throw fixtureLeaseUnavailable();
 	if (priorOwner) {
 		// A retained cleanup failure fences every discovery record. Only a ready
 		// record bound to this exact child incarnation may be reused.
-		if (priorOwner.canReuse(existing)) return existing!;
+		if (priorOwner.canReuse(existing)) return { kind: "prior-local-owner", discovery: existing!, owner: priorOwner };
 		await priorOwner.stop();
 		const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		if (discoveredAfterCleanup) return discoveredAfterCleanup;
+		if (discoveredAfterCleanup) return { kind: "external-discovery", discovery: discoveredAfterCleanup };
 	} else if (existing) {
-		return existing;
+		return { kind: "external-discovery", discovery: existing };
 	}
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
@@ -172,27 +218,23 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings): Promise<BrokerD
 	const deadline = Date.now() + DISCOVERY_TIMEOUT_MS;
 	let discoveryError: unknown;
 	while (Date.now() < deadline) {
-		// Fail fast: if the spawn failed or the child already exited, discovery can
-		// never succeed — stop (a no-op once dead) and surface the failure instead
-		// of running out the discovery timeout with an orphaned child.
 		if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
 		try {
 			const discovered = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 			if (discovered) {
-				if (owner.markReady(discovered)) return discovered;
+				if (owner.markReady(discovered)) {
+					return initiator === "fixture-lease"
+						? { kind: "local-started-fixture", discovery: discovered, owner }
+						: { kind: "local-started-discovery", discovery: discovered };
+				}
 				await owner.stop();
-				return discovered;
+				return { kind: "external-discovery", discovery: discovered };
 			}
 		} catch (error) {
-			// A transient read failure (e.g. a half-written record) must not orphan the
-			// child; remember it and keep polling. It is surfaced if discovery fails.
 			discoveryError = error;
 		}
 		await sleep(50);
 	}
-	// Discovery failed (timeout, early child exit, spawn error, or unreadable
-	// discovery): the spawned broker never became reachable. Terminate and reap it
-	// so the failure cannot leave a detached orphan behind, then surface why.
 	const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
 	const failure = spawnError
 		? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
@@ -211,17 +253,33 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings): Promise<BrokerD
 	throw failure;
 }
 
+function startEnsure(settings: EnsureBrokerSettings, initiator: EnsureInitiator): EnsureInFlight {
+	const promise = ensureBrokerOnce(settings, initiator);
+	const discovery = promise.then(outcome => outcome.discovery);
+	void discovery.catch(() => {});
+	const entry = { initiator, promise, discovery };
+	ensureInFlight.set(settings.agentDir, entry);
+	const clear = (): void => {
+		if (ensureInFlight.get(settings.agentDir) === entry) ensureInFlight.delete(settings.agentDir);
+	};
+	void promise.then(clear, clear);
+	return entry;
+}
+
 /** Starts the detached broker entrypoint when discovery has no live owner. */
 export function ensureBroker(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
-	const existing = ensureInFlight.get(settings.agentDir);
-	if (existing) return existing;
-	const pending = ensureBrokerOnce(settings);
-	ensureInFlight.set(settings.agentDir, pending);
-	const clear = (): void => {
-		if (ensureInFlight.get(settings.agentDir) === pending) ensureInFlight.delete(settings.agentDir);
-	};
-	void pending.then(clear, clear);
-	return pending;
+	const inFlight = ensureInFlight.get(settings.agentDir) ?? startEnsure(settings, "discovery");
+	return inFlight.discovery;
+}
+
+/** Starts one fresh fixture broker and returns its sole exact-child close lease. */
+export function startFixtureBrokerWithLeaseForTest(settings: EnsureBrokerSettings): Promise<StartedFixtureBroker> {
+	if (ensureInFlight.has(settings.agentDir)) return Promise.reject(fixtureLeaseUnavailable());
+	const inFlight = startEnsure(settings, "fixture-lease");
+	return inFlight.promise.then(outcome => {
+		if (outcome.kind !== "local-started-fixture") throw fixtureLeaseUnavailable();
+		return { discovery: outcome.discovery, lease: createFixtureLease(outcome.owner) };
+	});
 }
 
 /** Test hook: returns a stop handle for the detached broker this process spawned. */

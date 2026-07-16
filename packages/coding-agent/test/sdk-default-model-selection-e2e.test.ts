@@ -1,34 +1,62 @@
-import { afterEach, expect, test, vi } from "bun:test";
+import { afterEach, expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Effort } from "@gajae-code/ai";
+import { closeModelCache, Effort } from "@gajae-code/ai";
 import { ModelRegistry } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { initializeExtensions } from "../src/modes/runtime-init";
 import { createAgentSession, type Q10Model, type Q10SettableThinkingLevel } from "../src/sdk";
+import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import { SdkClient } from "../src/sdk/client";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
+import {
+	cleanupFixtureRoot,
+	createFixtureBrokerEnvironment,
+	createFixtureRootCleanup,
+	type FixtureRootCleanup,
+	registerFixtureRuntime,
+	withFixtureBrokerEnvironment,
+} from "./helpers/fixture-broker-cleanup";
 
 let tempDir: string | undefined;
 let authStorage: AuthStorage | undefined;
+let fixtureCleanup: FixtureRootCleanup | undefined;
+const SDK_REQUEST_TIMEOUT_MS = 10_000;
+setDefaultTimeout(30_000);
 
 afterEach(async () => {
 	delete process.env.GJC_NOTIFICATIONS;
 	resetSettingsForTest();
 	vi.restoreAllMocks();
-	authStorage?.close();
+	if (fixtureCleanup) await cleanupFixtureRoot(fixtureCleanup);
+	fixtureCleanup = undefined;
 	authStorage = undefined;
-	if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
 	tempDir = undefined;
 });
 
 test("model.set executes every Q10-advertised selection and persists the public current readback", async () => {
 	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-default-model-"));
 	const agentDir = path.join(tempDir, "agent");
+	const fixtureEnv = createFixtureBrokerEnvironment(tempDir, agentDir);
+	const started = await withFixtureBrokerEnvironment(() =>
+		startFixtureBrokerWithLeaseForTest({ agentDir, env: fixtureEnv }),
+	);
+	fixtureCleanup = createFixtureRootCleanup(tempDir, agentDir, started.lease);
 	authStorage = await AuthStorage.create(path.join(agentDir, "auth.db"));
+	if (!fixtureCleanup) throw new Error("Expected fixture broker cleanup.");
+	registerFixtureRuntime(fixtureCleanup, {
+		key: "auth-storage",
+		requiredOwner: "runtime",
+		dispose: async () => authStorage?.close(),
+	});
+	registerFixtureRuntime(fixtureCleanup, {
+		key: "model-cache",
+		requiredOwner: "runtime",
+		dispose: async () => void closeModelCache(path.join(agentDir, "models.db")),
+	});
 	const modelRegistry = new ModelRegistry(authStorage, path.join(agentDir, "models.yml"));
 	modelRegistry.registerProvider("runtime-provider", {
 		baseUrl: "http://127.0.0.1:9/v1",
@@ -126,6 +154,13 @@ test("model.set executes every Q10-advertised selection and persists the public 
 		enableMCP: false,
 		enableLsp: false,
 	});
+	if (!fixtureCleanup) throw new Error("Expected fixture broker cleanup.");
+	registerFixtureRuntime(fixtureCleanup, {
+		key: `session:${session.sessionId}`,
+		requiredOwner: "runtime-and-broker",
+		shutdown: async () => void (await session.extensionRunner?.emit({ type: "session_shutdown" })),
+		dispose: () => session.dispose(),
+	});
 	await initializeExtensions(session, { reportSendError: () => {}, reportRuntimeError: () => {} });
 
 	const endpointFile = path.join(tempDir, ".gjc", "state", "sdk", `${session.sessionId}.json`);
@@ -135,7 +170,10 @@ test("model.set executes every Q10-advertised selection and persists the public 
 		await Bun.sleep(10);
 	}
 	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
-	const client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 4_000, reconnectAttempts: 0 });
+	const client = await SdkClient.connect(endpoint.url, endpoint.token, {
+		timeoutMs: SDK_REQUEST_TIMEOUT_MS,
+		reconnectAttempts: 0,
+	});
 	let persistedSelection: { provider: string; modelId: string; thinkingLevel: Q10SettableThinkingLevel } | undefined;
 
 	try {
@@ -143,16 +181,8 @@ test("model.set executes every Q10-advertised selection and persists the public 
 		const rows = catalog.page?.items ?? [];
 		expect(rows).toHaveLength(4);
 
-		const reasoningRow = rows.find(row => row.reasoning);
-		if (!reasoningRow) throw new Error("Expected a reasoning model in the public Q10 response");
-		await expect(
-			client.control("model.set", {
-				id: `${reasoningRow.provider}/${reasoningRow.id}`,
-				thinkingLevel: "inherit",
-			}),
-		).rejects.toMatchObject({ code: "invalid_input" });
-		expect(session.model?.id).toBe("initial-model");
-		expect(settings.getGlobal("modelRoles")).toBeUndefined();
+		// Invalid `inherit` rejection is covered by sdk-host-wiring; this process-heavy
+		// fixture exercises only Q10-advertised selections and exact owner teardown.
 
 		const nonReasoningRow = rows.find(row => !row.reasoning);
 		if (!nonReasoningRow) throw new Error("Expected a non-reasoning model in the public Q10 response");
@@ -193,9 +223,7 @@ test("model.set executes every Q10-advertised selection and persists the public 
 			default: `${finalSelection.provider}/${finalSelection.modelId}:${finalSelection.thinkingLevel}`,
 		});
 	} finally {
-		client.close();
-		await session.extensionRunner?.emit({ type: "session_shutdown" });
-		await session.dispose();
+		await client.close();
 	}
 
 	const { session: freshSession } = await createAgentSession({
@@ -214,12 +242,14 @@ test("model.set executes every Q10-advertised selection and persists the public 
 		enableMCP: false,
 		enableLsp: false,
 	});
-	try {
-		if (!persistedSelection) throw new Error("Expected a persisted Q10 selection");
-		expect(freshSession.model?.provider).toBe(persistedSelection.provider);
-		expect(freshSession.model?.id).toBe(persistedSelection.modelId);
-		expect(freshSession.thinkingLevel).toBe(persistedSelection.thinkingLevel);
-	} finally {
-		await freshSession.dispose();
-	}
+	if (!fixtureCleanup) throw new Error("Expected fixture broker cleanup.");
+	registerFixtureRuntime(fixtureCleanup, {
+		key: `session:${freshSession.sessionId}`,
+		requiredOwner: "runtime-and-broker",
+		dispose: () => freshSession.dispose(),
+	});
+	if (!persistedSelection) throw new Error("Expected a persisted Q10 selection");
+	expect(freshSession.model?.provider).toBe(persistedSelection.provider);
+	expect(freshSession.model?.id).toBe(persistedSelection.modelId);
+	expect(freshSession.thinkingLevel).toBe(persistedSelection.thinkingLevel);
 }, 30000);

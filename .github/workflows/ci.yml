@@ -142,11 +142,11 @@ jobs:
          - name: Run GJC state gates
            run: bun scripts/ci-gjc-state-gates.ts
 
-   # Fast lint + type check (no Rust, no native build needed)
+   # Bounded TypeScript/tooling check; exhaustive SDK closure remains in local check:ts.
    check:
       timeout-minutes: 30
       needs: [relevance]
-      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      if: ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
       runs-on: ubuntu-22.04
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -166,28 +166,6 @@ jobs:
          - name: Type check workspace
            if: needs.relevance.outputs.relevant == 'true'
            run: bun run ci:check:full
-
-   sdk_closure:
-      name: sdk-closure
-      timeout-minutes: 90
-      if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() }}
-      runs-on: ubuntu-22.04
-      steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
-           with:
-              node-version: "24"
-         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-           with:
-              bun-version: "1.3"
-         - name: Cache bun dependencies
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-           with:
-              path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - run: bun install --frozen-lockfile
-         - name: Run SDK closure
-           run: bun run check:sdk-closure
 
    # Linux x64 baseline + modern: required by `test`, so it runs on every PR
    # unless rust-hash found a cached run. Tags always rebuild for fresh artifacts.
@@ -263,6 +241,10 @@ jobs:
               TARGET_ARCH: x64
               TARGET_VARIANTS: baseline
            run: bun run ci:build:native
+         - name: Verify dedicated Windows native identity and managed session-directory contracts
+           if: needs.relevance.outputs.relevant == 'true'
+           shell: pwsh
+           run: bun test packages/natives/test/path-identity.test.ts packages/natives/test/path-identity-windows.test.ts packages/coding-agent/test/sdk-session-directory.test.ts packages/coding-agent/test/sdk-session-directory.windows.test.ts packages/coding-agent/test/session-storage.test.ts
          - name: Smoke bun + gjc CLI (source runtime)
            if: needs.relevance.outputs.relevant == 'true'
            shell: pwsh
@@ -341,6 +323,9 @@ jobs:
               merge-multiple: true
               run-id: ${{ steps.source.outputs.run-id }}
               github-token: ${{ secrets.GITHUB_TOKEN }}
+         - name: Verify dedicated POSIX native path identity contracts
+           if: needs.relevance.outputs.relevant == 'true'
+           run: bun test packages/natives/test/path-identity.test.ts packages/natives/test/path-identity-posix.test.ts
          - name: Test workspace (TS)
            if: needs.relevance.outputs.relevant == 'true'
            env:
@@ -511,9 +496,8 @@ jobs:
       timeout-minutes: 60
       if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.native_linux.result == 'success' && needs.native_release.result ==
-         'success' && (needs.check.result == 'success' || needs.check.result == 'skipped') &&
-         needs.sdk_closure.result == 'success' }}
-      needs: [check, sdk_closure, native_linux, native_release, rust-hash]
+         'success' && (needs.check.result == 'success' || needs.check.result == 'skipped') }}
+      needs: [check, native_linux, native_release, rust-hash]
       strategy:
          fail-fast: false
          matrix:
@@ -641,14 +625,34 @@ jobs:
            shell: bash
            run: |
               set -euo pipefail
-              release="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,assets)"
-              jq -e '.isDraft == true and .isPrerelease == false' <<<"$release" >/dev/null
+              releases="$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -s 'add')"
+              release="$(jq -ce --arg tag "$RELEASE_TAG" '
+                 [.[] | select(.tag_name == $tag)] as $matches
+                 | if ($matches | length) == 1 then $matches[0] else error("expected exactly one draft release for tag") end
+              ' <<<"$releases")"
+              RELEASE_ID="$(jq -r '.id' <<<"$release")"
+              if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+                 echo "Draft release has an invalid numeric id."
+                 exit 1
+              fi
+              jq -e --arg tag "$RELEASE_TAG" '.draft == true and .prerelease == false and .tag_name == $tag' <<<"$release" >/dev/null
               for asset in gjc-linux-x64 gjc-linux-arm64 gjc-darwin-arm64 gjc-darwin-x64 gjc-windows-x64.exe gajae-release-packages-expected-v1.json gajae-release-packages-v1.json; do
-                 jq -e --arg asset "$asset" '[.assets[].name] | index($asset) != null' <<<"$release" >/dev/null
+                 jq -e --arg asset "$asset" 'any(.assets[]; .name == $asset)' <<<"$release" >/dev/null
               done
               evidence_dir="$RUNNER_TEMP/gajae-release-evidence"
               mkdir -p "$evidence_dir"
-              gh release download "$RELEASE_TAG" --pattern gajae-release-packages-expected-v1.json --pattern gajae-release-packages-v1.json --dir "$evidence_dir"
+              for asset in gajae-release-packages-expected-v1.json gajae-release-packages-v1.json; do
+                 asset_id="$(jq -r --arg asset "$asset" '.assets[] | select(.name == $asset) | .id' <<<"$release")"
+                 if [[ ! "$asset_id" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "Draft asset $asset has an invalid numeric id."
+                    exit 1
+                 fi
+                 curl --fail --location --silent --show-error \
+                    --header "Accept: application/octet-stream" \
+                    --header "Authorization: Bearer $GH_TOKEN" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id" \
+                    --output "$evidence_dir/$asset"
+              done
               bun scripts/release-evidence.ts --verify-stable-finalization \
                  --expected-evidence "$evidence_dir/gajae-release-packages-expected-v1.json" \
                  --final-evidence "$evidence_dir/gajae-release-packages-v1.json" \
@@ -660,6 +664,8 @@ jobs:
       timeout-minutes: 30
       if: ${{ always() && !cancelled() && needs.release_context.outputs.mode == 'production' && needs.release_context.outputs.production-enabled == 'true' && needs.release_context.outputs.stable == 'true' && needs.release_binary.result == 'success' && needs.release_source_verify.result == 'success' }}
       needs: [release_binary, release_context, release_source_verify]
+      outputs:
+         release-id: ${{ steps.capture-release-id.outputs.release-id }}
       runs-on: ubuntu-22.04
       permissions:
          actions: read
@@ -681,16 +687,15 @@ jobs:
            shell: bash
            run: |
               set -euo pipefail
-              release_status="$(curl --silent --show-error --output release.json --write-out '%{http_code}' \
-                 --header "Accept: application/vnd.github+json" \
-                 --header "Authorization: Bearer $GH_TOKEN" \
-                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
-              case "$release_status" in
-                 200) jq -e '.draft == true and .prerelease == false' release.json >/dev/null ;;
-                 404) echo "No release exists yet; creating the immutable draft." ;;
-                 *) echo "Release lookup failed with HTTP $release_status; refusing to create or mutate a release."; exit 1 ;;
+              releases="$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -s 'add')"
+              matches="$(jq -c --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag)]' <<<"$releases")"
+              case "$(jq 'length' <<<"$matches")" in
+                 0) echo "No release exists yet; creating the immutable draft." ;;
+                 1) jq -e '.[0].draft == true and .[0].prerelease == false' <<<"$matches" >/dev/null ;;
+                 *) echo "Multiple releases share the release tag; refusing to create or mutate a release."; exit 1 ;;
               esac
          - name: Create or retain draft GitHub Release
+           id: draft
            uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
            with:
               tag_name: ${{ needs.release_context.outputs.tag }}
@@ -699,7 +704,18 @@ jobs:
               files: |
                  packages/coding-agent/binaries/gjc-*
               generate_release_notes: true
-
+         - name: Capture immutable draft release id
+           id: capture-release-id
+           env:
+              RELEASE_ID: ${{ steps.draft.outputs.id }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+                 echo "Draft action returned an invalid numeric release id."
+                 exit 1
+              fi
+              echo "release-id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
    release_npm_expected:
       timeout-minutes: 45
       if: ${{ !cancelled() && needs.release_github_draft.result == 'success' && needs.release_source_verify.result == 'success' && needs.release_context.outputs.skip-npm != 'true' }}
@@ -737,6 +753,7 @@ jobs:
               RELEASE_TAG: ${{ needs.release_context.outputs.tag }}
               SOURCE_SHA: ${{ needs.release_context.outputs.source-sha }}
               VERIFIED_MAIN_RUN_ID: ${{ needs.release_source_verify.outputs.verified-main-run-id }}
+              RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}
            shell: bash
            run: |
               set -euo pipefail
@@ -744,8 +761,12 @@ jobs:
               existing_dir="$RUNNER_TEMP/gajae-release-existing"
               expected_asset="gajae-release-packages-expected-v1.json"
               mkdir -p "$evidence_dir" "$existing_dir"
-              release="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,assets)"
-              jq -e '.isDraft == true and .isPrerelease == false' <<<"$release" >/dev/null
+              if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+                 echo "Draft release has an invalid numeric id."
+                 exit 1
+              fi
+              release="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID")"
+              jq -e --arg tag "$RELEASE_TAG" --argjson release_id "$RELEASE_ID" '.id == $release_id and .draft == true and .prerelease == false and .tag_name == $tag' <<<"$release" >/dev/null
               expected_asset_present="$(jq -r --arg asset "$expected_asset" 'any(.assets[]; .name == $asset)' <<<"$release")"
               artifact_name="gajae-release-evidence-$RELEASE_TAG-$SOURCE_SHA"
               artifacts="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=$artifact_name&per_page=100")"
@@ -787,11 +808,30 @@ jobs:
                     | jq -S . > "$evidence_dir/evidence-provenance.json"
               fi
               if [ "$expected_asset_present" = true ]; then
-                 gh release download "$RELEASE_TAG" --pattern "$expected_asset" --dir "$existing_dir"
+                 expected_asset_id="$(jq -r --arg asset "$expected_asset" '.assets[] | select(.name == $asset) | .id' <<<"$release")"
+                 if [[ ! "$expected_asset_id" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "Draft expected evidence asset has an invalid numeric id."
+                    exit 1
+                 fi
+                 curl --fail --location --silent --show-error \
+                    --header "Accept: application/octet-stream" \
+                    --header "Authorization: Bearer $GH_TOKEN" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/$expected_asset_id" \
+                    --output "$existing_dir/$expected_asset"
                  cmp "$existing_dir/$expected_asset" "$evidence_dir/$expected_asset"
               else
                  echo "Draft release has no expected evidence asset; uploading the reproduced immutable asset."
-                 gh release upload "$RELEASE_TAG" "$evidence_dir/$expected_asset"
+                 upload_url="$(jq -r '.upload_url | sub("\\{.*$"; "")' <<<"$release")"
+                 if [ "$upload_url" != "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets" ]; then
+                    echo "Draft release returned an unexpected asset upload URL."
+                    exit 1
+                 fi
+                 curl --fail --silent --show-error \
+                    --header "Accept: application/vnd.github+json" \
+                    --header "Authorization: Bearer $GH_TOKEN" \
+                    --header "Content-Type: application/octet-stream" \
+                    --data-binary @"$evidence_dir/$expected_asset" \
+                    "$upload_url?name=$expected_asset" >/dev/null
               fi
          - name: Retain exact source-bound expected evidence and tarballs for resume
            uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -852,7 +892,7 @@ jobs:
    release_github_final_evidence:
       timeout-minutes: 15
       if: ${{ !cancelled() && needs.release_npm_publish.result == 'success' && needs.release_source_verify.result == 'success' }}
-      needs: [release_npm_publish, release_context, release_source_verify]
+      needs: [release_npm_publish, release_github_draft, release_context, release_source_verify]
       runs-on: ubuntu-22.04
       permissions:
          actions: read
@@ -876,6 +916,7 @@ jobs:
               RELEASE_TAG: ${{ needs.release_context.outputs.tag }}
               RELEASE_VERSION: ${{ needs.release_context.outputs.version }}
               SOURCE_SHA: ${{ needs.release_context.outputs.source-sha }}
+              RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}
            shell: bash
            run: |
               set -euo pipefail
@@ -884,15 +925,28 @@ jobs:
               expected_asset="gajae-release-packages-expected-v1.json"
               final_asset="gajae-release-packages-v1.json"
               mkdir -p "$existing_dir"
-              release="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,assets)"
-              jq -e '.isDraft == true and .isPrerelease == false' <<<"$release" >/dev/null
+              if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+                 echo "Draft release has an invalid numeric id."
+                 exit 1
+              fi
+              release="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID")"
+              jq -e --arg tag "$RELEASE_TAG" --argjson release_id "$RELEASE_ID" '.id == $release_id and .draft == true and .prerelease == false and .tag_name == $tag' <<<"$release" >/dev/null
               expected_asset_present="$(jq -r --arg asset "$expected_asset" 'any(.assets[]; .name == $asset)' <<<"$release")"
               final_asset_present="$(jq -r --arg asset "$final_asset" 'any(.assets[]; .name == $asset)' <<<"$release")"
               if [ "$expected_asset_present" != true ]; then
                  echo "Draft release is confirmed missing required expected evidence."
                  exit 1
               fi
-              gh release download "$RELEASE_TAG" --pattern "$expected_asset" --dir "$evidence_dir"
+              expected_asset_id="$(jq -r --arg asset "$expected_asset" '.assets[] | select(.name == $asset) | .id' <<<"$release")"
+              if [[ ! "$expected_asset_id" =~ ^[1-9][0-9]*$ ]]; then
+                 echo "Draft expected evidence asset has an invalid numeric id."
+                 exit 1
+              fi
+              curl --fail --location --silent --show-error \
+                 --header "Accept: application/octet-stream" \
+                 --header "Authorization: Bearer $GH_TOKEN" \
+                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/$expected_asset_id" \
+                 --output "$evidence_dir/$expected_asset"
               bun scripts/release-evidence.ts --verify-stable-finalization \
                  --expected-evidence "$evidence_dir/$expected_asset" \
                  --final-evidence "$evidence_dir/$final_asset" \
@@ -900,17 +954,36 @@ jobs:
                  --version "$RELEASE_VERSION" \
                  --source-commit "$SOURCE_SHA"
               if [ "$final_asset_present" = true ]; then
-                 gh release download "$RELEASE_TAG" --pattern "$final_asset" --dir "$existing_dir"
+                 final_asset_id="$(jq -r --arg asset "$final_asset" '.assets[] | select(.name == $asset) | .id' <<<"$release")"
+                 if [[ ! "$final_asset_id" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "Draft final evidence asset has an invalid numeric id."
+                    exit 1
+                 fi
+                 curl --fail --location --silent --show-error \
+                    --header "Accept: application/octet-stream" \
+                    --header "Authorization: Bearer $GH_TOKEN" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/$final_asset_id" \
+                    --output "$existing_dir/$final_asset"
                  cmp "$existing_dir/$final_asset" "$evidence_dir/$final_asset"
               else
                  echo "Draft release has no final evidence asset; uploading the verified immutable asset."
-                 gh release upload "$RELEASE_TAG" "$evidence_dir/$final_asset"
+                 upload_url="$(jq -r '.upload_url | sub("\\{.*$"; "")' <<<"$release")"
+                 if [ "$upload_url" != "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets" ]; then
+                    echo "Draft release returned an unexpected asset upload URL."
+                    exit 1
+                 fi
+                 curl --fail --silent --show-error \
+                    --header "Accept: application/vnd.github+json" \
+                    --header "Authorization: Bearer $GH_TOKEN" \
+                    --header "Content-Type: application/octet-stream" \
+                    --data-binary @"$evidence_dir/$final_asset" \
+                    "$upload_url?name=$final_asset" >/dev/null
               fi
 
    release_github_verify:
       timeout-minutes: 15
       if: ${{ !cancelled() && needs.release_github_final_evidence.result == 'success' && needs.release_source_verify.result == 'success' }}
-      needs: [release_github_final_evidence, release_context, release_source_verify]
+      needs: [release_github_final_evidence, release_github_draft, release_context, release_source_verify]
       runs-on: macos-14
       permissions:
          contents: read
@@ -918,23 +991,48 @@ jobs:
          - name: Verify the draft holds every required binary and final evidence asset
            env:
               GH_TOKEN: ${{ github.token }}
+              RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}
               RELEASE_TAG: ${{ needs.release_context.outputs.tag }}
            shell: bash
            run: |
               set -euo pipefail
-              release="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,assets)"
-              jq -e '.isDraft == true and .isPrerelease == false' <<<"$release" >/dev/null
+              if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+                 echo "Draft release has an invalid numeric id."
+                 exit 1
+              fi
+              release="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID")"
+              jq -e --arg tag "$RELEASE_TAG" --argjson release_id "$RELEASE_ID" '.id == $release_id and .draft == true and .prerelease == false and .tag_name == $tag' <<<"$release" >/dev/null
               for asset in gjc-linux-x64 gjc-linux-arm64 gjc-darwin-arm64 gjc-darwin-x64 gjc-windows-x64.exe gajae-release-packages-expected-v1.json gajae-release-packages-v1.json; do
-                 jq -e --arg asset "$asset" '[.assets[].name] | index($asset) != null' <<<"$release" >/dev/null
+                 asset_id="$(jq -r --arg asset "$asset" '.assets[] | select(.name == $asset) | .id' <<<"$release")"
+                 if [[ ! "$asset_id" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "Draft asset $asset has an invalid numeric id."
+                    exit 1
+                 fi
               done
          - name: Download and verify the published macOS arm64 binary from the draft
            env:
               GH_TOKEN: ${{ github.token }}
+              RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}
               RELEASE_TAG: ${{ needs.release_context.outputs.tag }}
            shell: bash
            run: |
               set -euo pipefail
-              gh release download "$RELEASE_TAG" --pattern gjc-darwin-arm64 --dir .
+              if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+                 echo "Draft release has an invalid numeric id."
+                 exit 1
+              fi
+              release="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID")"
+              jq -e --arg tag "$RELEASE_TAG" --argjson release_id "$RELEASE_ID" '.id == $release_id and .draft == true and .prerelease == false and .tag_name == $tag' <<<"$release" >/dev/null
+              asset_id="$(jq -r '.assets[] | select(.name == "gjc-darwin-arm64") | .id' <<<"$release")"
+              if [[ ! "$asset_id" =~ ^[1-9][0-9]*$ ]]; then
+                 echo "Draft macOS arm64 binary asset has an invalid numeric id."
+                 exit 1
+              fi
+              curl --fail --location --silent --show-error \
+                 --header "Accept: application/octet-stream" \
+                 --header "Authorization: Bearer $GH_TOKEN" \
+                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id" \
+                 --output gjc-darwin-arm64
               chmod +x gjc-darwin-arm64
               codesign -dv ./gjc-darwin-arm64
               runtime_dir="$(mktemp -d)"
@@ -944,7 +1042,7 @@ jobs:
       name: Finalize stable GitHub Release
       timeout-minutes: 15
       if: ${{ !cancelled() && needs.release_npm_publish.result == 'success' && needs.release_github_final_evidence.result == 'success' && needs.release_github_verify.result == 'success' && needs.release_source_verify.result == 'success' && needs.release_context.outputs.skip-npm != 'true' }}
-      needs: [release_npm_publish, release_github_final_evidence, release_github_verify, release_context, release_source_verify]
+      needs: [release_npm_publish, release_github_final_evidence, release_github_verify, release_github_draft, release_context, release_source_verify]
       runs-on: ubuntu-22.04
       outputs:
          release-id: ${{ steps.finalize.outputs.release-id }}
@@ -965,6 +1063,7 @@ jobs:
               RELEASE_TAG: ${{ needs.release_context.outputs.tag }}
               RELEASE_VERSION: ${{ needs.release_context.outputs.version }}
               SOURCE_SHA: ${{ needs.release_context.outputs.source-sha }}
+              RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}
            shell: bash
            run: |
               set -euo pipefail
@@ -972,20 +1071,41 @@ jobs:
               expected_asset="gajae-release-packages-expected-v1.json"
               final_asset="gajae-release-packages-v1.json"
               mkdir -p "$evidence_dir"
-              release="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,databaseId,assets)"
-              jq -e '.isDraft == true and .isPrerelease == false' <<<"$release" >/dev/null
+              if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+                 echo "Draft release has an invalid numeric id."
+                 exit 1
+              fi
+              release="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID")"
+              jq -e --arg tag "$RELEASE_TAG" --argjson release_id "$RELEASE_ID" '.id == $release_id and .draft == true and .prerelease == false and .tag_name == $tag' <<<"$release" >/dev/null
               for asset in "$expected_asset" "$final_asset"; do
-                 jq -e --arg asset "$asset" 'any(.assets[]; .name == $asset)' <<<"$release" >/dev/null
+                 asset_id="$(jq -r --arg asset "$asset" '.assets[] | select(.name == $asset) | .id' <<<"$release")"
+                 if [[ ! "$asset_id" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "Draft asset $asset has an invalid numeric id."
+                    exit 1
+                 fi
+                 curl --fail --location --silent --show-error \
+                    --header "Accept: application/octet-stream" \
+                    --header "Authorization: Bearer $GH_TOKEN" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id" \
+                    --output "$evidence_dir/$asset"
               done
-              gh release download "$RELEASE_TAG" --pattern "$expected_asset" --pattern "$final_asset" --dir "$evidence_dir"
               bun scripts/release-evidence.ts --verify-stable-finalization \
                  --expected-evidence "$evidence_dir/$expected_asset" \
                  --final-evidence "$evidence_dir/$final_asset" \
                  --tag "$RELEASE_TAG" \
                  --version "$RELEASE_VERSION" \
                  --source-commit "$SOURCE_SHA"
-              gh release edit "$RELEASE_TAG" --draft=false --prerelease=false
-              echo "release-id=$(jq -r '.databaseId' <<<"$release")" >> "$GITHUB_OUTPUT"
+              gh api --method PATCH \
+                 "/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID" \
+                 -F draft=false \
+                 -F prerelease=false \
+                 --jq '.id' > "$RUNNER_TEMP/final-release-id"
+              final_release_id="$(<"$RUNNER_TEMP/final-release-id")"
+              if [[ ! "$final_release_id" =~ ^[1-9][0-9]*$ ]] || [ "$final_release_id" != "$RELEASE_ID" ]; then
+                 echo "Stable finalization did not preserve the immutable draft release id."
+                 exit 1
+              fi
+              echo "release-id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
    release_website_hint:
       name: warning-only website release sync hint

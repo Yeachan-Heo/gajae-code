@@ -26,6 +26,20 @@
 			},
 			"additionalProperties": false
 		},
+		"session": {
+			"type": "object",
+			"properties": {
+				"directoryMigration": {
+					"type": "string",
+					"enum": [
+						"copy-retain",
+						"disabled"
+					],
+					"default": "copy-retain"
+				}
+			},
+			"additionalProperties": false
+		},
 		"notifications": {
 			"type": "object",
 			"properties": {

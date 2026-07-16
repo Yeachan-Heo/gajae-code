@@ -27,22 +27,42 @@ jobs:
       has_native: ${{ steps.plan.outputs.has_native }}
       changed_paths: ${{ steps.plan.outputs.changed_paths }}
       plan_mode: ${{ steps.plan.outputs.plan_mode }}
+      plan_digest: ${{ steps.plan.outputs.plan_digest }}
+      plan_source_sha: ${{ steps.plan.outputs.plan_source_sha }}
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
       - name: Compute changed-path relevance
         id: relevance
         run: bun scripts/ci-job-relevance.ts
       - name: Compute affected task matrix
         id: plan
         run: bun scripts/ci-dev-affected.ts --matrix-json
+      - name: Upload canonical affected plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-dev-affected-plan.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
 
   windows-dev-doctor:
     name: Windows dev:doctor
@@ -50,8 +70,17 @@ jobs:
     if: ${{ needs.affected-plan.outputs.relevant == 'true' && contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
     runs-on: windows-latest
     timeout-minutes: 60
+    env:
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: pwsh
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $env:CI_DEV_SOURCE_SHA) { throw "Checked-out SHA $head does not match $env:CI_DEV_SOURCE_SHA" }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
@@ -67,9 +96,10 @@ jobs:
         with:
           shared-key: windows-dev-doctor-win32-x64
           cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -88,71 +118,73 @@ jobs:
           bun run dev:doctor
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-  # Native addon build runs at most once per run and publishes the built `.node`
-  # files as an artifact the runtime-dependent shards download. A content-hash
-  # cache of the native sources lets PRs that don't touch crates/natives restore
-  # the prebuilt addon and skip the Rust/native source build entirely; only a
-  # cache miss (native source actually changed) recompiles. Skipped when the plan
-  # needs no native build at all.
+  # Native addon build runs once per run and publishes the built `.node` files as
+  # an artifact the runtime-dependent shards download. It is skipped when the
+  # plan needs no native build at all.
   affected-native:
     name: Affected path validation / native-build
     needs: [affected-plan]
-    if: ${{ needs.affected-plan.outputs.relevant == 'true' && needs.affected-plan.outputs.has_native == 'true' }}
+    if: ${{ needs.affected-plan.outputs.has_native == 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
       CI_DEV_CHANGED_PATHS: ${{ needs.affected-plan.outputs.changed_paths }}
       CI_DEV_PLAN_MODE: ${{ needs.affected-plan.outputs.plan_mode }}
+      CI_DEV_AFFECTED_PLAN: .ci-dev-affected-plan.json
+      CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
+      CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
-      - name: Detect native host ABI
-        id: native-host
-        shell: bash
-        run: |
-          glibc="$(getconf GNU_LIBC_VERSION | tr ' ' '-')"
-          echo "glibc=$glibc" >> "$GITHUB_OUTPUT"
-      - name: Restore cached native addon
-        id: native-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+      - name: Download and validate canonical affected plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          path: packages/natives/native/pi_natives.*.node
-          key: dev-affected-native-${{ runner.os }}-${{ steps.native-host.outputs.glibc }}-${{ hashFiles('crates/**/*.rs', 'crates/**/Cargo.toml', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'packages/natives/scripts/**', 'packages/natives/package.json', 'scripts/ci-build-native.ts', 'scripts/host-detect.ts') }}
+          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .
+      - run: bun scripts/ci-dev-affected.ts --validate-plan
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
-        if: steps.native-cache.outputs.cache-hit != 'true'
         with:
           toolchain: nightly-2026-04-29
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-        if: steps.native-cache.outputs.cache-hit != 'true'
         with:
           shared-key: dev-affected-native-linux-x64
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
-        if: steps.native-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - name: Install system deps
-        if: steps.native-cache.outputs.cache-hit != 'true'
         run: bash scripts/ci-install-system-deps.sh
-      - if: steps.native-cache.outputs.cache-hit != 'true'
-        run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
       - name: Build affected native addon(s)
-        if: steps.native-cache.outputs.cache-hit != 'true'
         run: bun scripts/ci-dev-affected.ts --native-build
+      - name: Verify required native addon variants
+        run: |
+          test -f packages/natives/native/pi_natives.linux-x64-baseline.node
+          test -f packages/natives/native/pi_natives.linux-x64-modern.node
       - name: Upload native addon(s)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-native-${{ github.run_id }}
-          path: packages/natives/native/pi_natives.*.node
+          name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            packages/natives/native/pi_natives.linux-x64-baseline.node
+            packages/natives/native/pi_natives.linux-x64-modern.node
           if-no-files-found: error
           retention-days: 1
 
@@ -162,28 +194,50 @@ jobs:
   affected-shards:
     name: Affected path validation / ${{ matrix.key }}
     needs: [affected-plan, affected-native]
-    if: ${{ always() && needs.affected-plan.outputs.relevant == 'true' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-native.result != 'failure' && needs.affected-native.result != 'cancelled' }}
+    if: ${{ always() && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-native.result != 'failure' && needs.affected-native.result != 'cancelled' }}
     runs-on: ubuntu-22.04
-    # Broad push-mode coding-agent/root test shards have repeatedly reached the
-    # previous 30m cap, and root-test can exceed 60m on large affected sets
-    # without assertion failures. Give the affected shard runner enough room to
-    # finish those known-heavy shards while preserving a bounded timeout for
-    # genuine hangs.
-    timeout-minutes: 90
+    # Broad push-mode coding-agent/root test shards can need up to 90 minutes, but
+    # the bounded root-check must retain the same 30-minute fail-fast contract as
+    # Main CI. SDK closure remains outside that CI command.
+    timeout-minutes: ${{ matrix.key == 'root-check' && 30 || 90 }}
     strategy:
       fail-fast: false
+      max-parallel: 8
       matrix: ${{ fromJSON(needs.affected-plan.outputs.matrix) }}
     env:
       CI_DEV_CHANGED_PATHS: ${{ needs.affected-plan.outputs.changed_paths }}
       CI_DEV_PLAN_MODE: ${{ needs.affected-plan.outputs.plan_mode }}
+      CI_DEV_AFFECTED_PLAN: .ci-dev-affected-plan.json
+      CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
+      CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
+      CI_DEV_MATRIX_KEY: ${{ matrix.key }}
+      CI_DEV_MATRIX_IDENTITY: ${{ matrix.identity }}
+      CI_DEV_SHARD_INDEX: ${{ strategy.job-index }}
+      CI_DEV_MATRIX_RUST: ${{ matrix.rust }}
+      CI_DEV_MATRIX_NEXTEST: ${{ matrix.nextest }}
+      CI_DEV_MATRIX_NATIVE: ${{ matrix.native }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
+      - name: Download and validate canonical affected plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .
+      - run: bun scripts/ci-dev-affected.ts --validate-plan
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         if: ${{ startsWith(matrix.key, 'python-') }}
         with:
@@ -193,7 +247,7 @@ jobs:
         with:
           toolchain: nightly-2026-04-29
       - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e  # v2
-        if: ${{ matrix.rust }}
+        if: ${{ matrix.nextest }}
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
@@ -204,7 +258,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           cache-workspace-crates: true
       - name: Cache bun dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -215,7 +269,7 @@ jobs:
         if: ${{ matrix.native }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-native-${{ github.run_id }}
+          name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}
           path: packages/natives/native
       - name: Run affected task shard
         env:
@@ -223,115 +277,76 @@ jobs:
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
           GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: bun scripts/ci-dev-affected.ts --task="$AFFECTED_TASK_KEY"
-
-
-  # Windows' replacement semantics differ from POSIX and are covered separately
-  # from the Linux affected-path shards. This job deliberately runs on every dev
-  # push and PR; the stable aggregate below makes it a required validation gate.
-  notification-atomic-windows:
-    name: Notification atomicity / Windows
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-        with:
-          bun-version: "1.3"
-      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
-        with:
-          toolchain: nightly-2026-04-29
-      - name: Prepend rustup toolchain bin to PATH
-        shell: bash
+      - name: Write shard completion receipt
         run: |
-          toolchain_bin="$(dirname "$(rustup which cargo)")"
-          echo "$toolchain_bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-        with:
-          shared-key: notification-atomicity-win32-x64
-          cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
-          cache-workspace-crates: true
-      - name: Cache bun dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-        with:
-          path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-      - run: bun install --frozen-lockfile
-      - name: Build native addon (win32-x64 baseline)
+          bun -e 'await Bun.write(`.ci-dev-shard-receipts/${process.env.CI_DEV_SHARD_INDEX}.json`, JSON.stringify({ key: process.env.AFFECTED_TASK_KEY, identity: process.env.CI_DEV_MATRIX_IDENTITY }))'
         env:
-          TARGET_PLATFORM: win32
-          TARGET_ARCH: x64
-          TARGET_VARIANTS: baseline
-        run: bun run ci:build:native
-      - name: Stage and prove win32-x64 baseline native addon
-        shell: pwsh
-        run: |
-          $addonPath = "packages/natives/native/pi_natives.win32-x64-baseline.node"
-          if (-not (Test-Path -LiteralPath $addonPath -PathType Leaf)) {
-            throw "Required staged native addon is missing: $addonPath"
-          }
-          $hash = Get-FileHash -LiteralPath $addonPath -Algorithm SHA256
-          Write-Host "SHA-256 $($hash.Hash)  $addonPath"
-          $env:PI_NATIVE_VARIANT = "baseline"
-          $proof = & bun -e 'import { h06FormatHashLines } from "./packages/natives/native/index.js"; const output = h06FormatHashLines("native load proof", 1); if (!/^1[a-z]{2}\|native load proof$/.test(output)) throw new Error(`Unexpected native load proof: ${output}`); console.log(`Native load proof: ${output}`);' 2>&1
-          $exitCode = $LASTEXITCODE
-          $proof | ForEach-Object { Write-Host $_ }
-          if ($exitCode -ne 0) { exit $exitCode }
-      - name: Verify notification atomicity CI topology
-        run: bun test scripts/dev-ci-notification-atomicity.test.ts
-      - name: Verify Windows rename-exhaustion atomic replacement (1 test)
-        shell: pwsh
-        run: |
-          $output = & bun test packages/coding-agent/test/config/atomic-yaml-patch.test.ts --test-name-pattern "keeps the old complete file and removes the temp file when rename exhausts" 2>&1
-          $exitCode = $LASTEXITCODE
-          $output | ForEach-Object { Write-Host $_ }
-          if ($exitCode -ne 0) { exit $exitCode }
-          $summary = $output -join "`n"
-          if ($summary -notmatch [regex]::Escape("Ran 1 test across 1 file.")) {
-            throw "Expected the rename-exhaustion selector to run exactly one test."
-          }
-      - name: Verify Windows causal atomic persistence (6 tests)
-        shell: pwsh
-        run: |
-          $output = & bun test packages/coding-agent/test/settings-manager.test.ts --test-name-pattern "causally ordered atomic persistence" 2>&1
-          $exitCode = $LASTEXITCODE
-          $output | ForEach-Object { Write-Host $_ }
-          if ($exitCode -ne 0) { exit $exitCode }
-          $summary = $output -join "`n"
-          if ($summary -notmatch [regex]::Escape("Ran 6 tests across 1 file.")) {
-            throw "Expected the causal-persistence selector to run exactly six tests."
-          }
+          AFFECTED_TASK_KEY: ${{ matrix.key }}
+      - name: Upload shard completion receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-affected-shard-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          path: .ci-dev-shard-receipts/${{ strategy.job-index }}.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
 
-  # Branch protection must keep requiring this stable aggregate status. It runs
-  # no validation itself; it passes iff the planner, native build, every affected
-  # shard, and the Windows atomicity regression gate succeeded (skipped native
-  # and affected shards are fine for no-op or docs-only changes). The job name
-  # must stay exactly "Affected path validation".
+
+  # Branch protection must keep requiring this stable aggregate status. It validates
+  # the canonical plan and receipts, then passes iff the planner, native build,
+  # every affected shard, and Windows doctor satisfy their planned contracts. The
+  # job name must stay exactly "Affected path validation".
   affected:
     name: Affected path validation
     if: ${{ always() }}
-    needs: [affected-plan, affected-native, affected-shards, windows-dev-doctor, notification-atomic-windows]
+    needs: [affected-plan, affected-native, affected-shards, windows-dev-doctor]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    env:
+      CI_DEV_AFFECTED_PLAN: .ci-dev-affected-plan.json
+      CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
+      CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
+      CI_DEV_SHARD_RECEIPTS: .ci-dev-shard-receipts
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
-      - name: Aggregate affected path validation shards
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
         run: |
-          plan='${{ needs.affected-plan.result }}'
-          native='${{ needs.affected-native.result }}'
-          shards='${{ needs.affected-shards.result }}'
-          windows_doctor='${{ needs.windows-dev-doctor.result }}'
-          windows_atomic='${{ needs.notification-atomic-windows.result }}'
-          echo "affected-plan: $plan"
-          echo "affected-native: $native"
-          echo "affected-shards: $shards"
-          echo "windows-dev-doctor: $windows_doctor"
-          echo "notification-atomic-windows: $windows_atomic"
-          test "$plan" = success || { echo "planner did not succeed"; exit 1; }
-          case "$native" in success|skipped) ;; *) echo "native build did not pass"; exit 1 ;; esac
-          case "$shards" in success|skipped) ;; *) echo "one or more affected shards did not pass"; exit 1 ;; esac
-          case "$windows_doctor" in success|skipped) ;; *) echo "Windows dev:doctor did not pass"; exit 1 ;; esac
-          test "$windows_atomic" = success || { echo "Windows atomicity gate did not pass"; exit 1; }
-          echo "Affected path validation: all required shards passed"
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - name: Download canonical affected plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .
+      - name: Validate canonical affected plan
+        run: bun scripts/ci-dev-affected.ts --validate-plan
+      - name: Download shard completion receipts
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: dev-affected-shard-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: .ci-dev-shard-receipts
+          merge-multiple: true
+      - name: Validate canonical shard completion
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
+        run: bun scripts/ci-dev-affected.ts --validate-shard-receipts
+      - name: Aggregate affected path validation shards
+        env:
+          CI_DEV_PLAN_RESULT: ${{ needs.affected-plan.result }}
+          CI_DEV_NATIVE_RESULT: ${{ needs.affected-native.result }}
+          CI_DEV_SHARDS_RESULT: ${{ needs.affected-shards.result }}
+          CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}
+          CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
+          CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
+          CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+        run: bun scripts/ci-dev-affected.ts --validate-aggregate
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}

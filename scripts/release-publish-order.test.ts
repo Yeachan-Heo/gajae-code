@@ -432,46 +432,83 @@ describe("native release binary coverage", () => {
 		expect(workflow).toContain("pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*-h${{ needs.rust-hash.outputs.hash }}");
 	});
 
-	test("tag publication uses the fail-closed named-job evidence chain and SDK closure", async () => {
+	test("tag publication uses the fail-closed named-job evidence chain", async () => {
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
-		const sdkClosure = workflowJob(workflow, "sdk_closure");
 		const releaseBinary = workflowJob(workflow, "release_binary");
+		const draft = workflowJob(workflow, "release_github_draft");
+		const verifyOnly = workflowJob(workflow, "release_verify_only");
 		const expectedEvidence = workflowJob(workflow, "release_npm_expected");
 		const npmPublish = workflowJob(workflow, "release_npm_publish");
 		const finalEvidence = workflowJob(workflow, "release_github_final_evidence");
 		const githubVerify = workflowJob(workflow, "release_github_verify");
 		const finalize = workflowJob(workflow, "release_github_finalize");
 
-		expect(sdkClosure).toContain("run: bun run check:sdk-closure");
-		expect(sdkClosure).toContain("startsWith(github.ref, 'refs/tags/v') && !cancelled()");
-		expect(releaseBinary).toContain("needs: [check, sdk_closure, native_linux, native_release, rust-hash]");
-		expect(releaseBinary).toContain("needs.sdk_closure.result == 'success'");
+		// The SDK closure suite is deliberately NOT a release gate: it runs in
+		// Dev CI / main `check` (relevance-gated). Release tags gate on the
+		// build, test, and evidence chain below (maintainer decision, 0.11.0).
+		expect(workflow).not.toContain("sdk_closure:");
+		expect(releaseBinary).toContain("needs: [check, native_linux, native_release, rust-hash]");
+
+		expect(draft).toContain("release-id: ${{ steps.capture-release-id.outputs.release-id }}");
+		expect(draft).toContain("id: draft");
+		expect(draft).toContain("RELEASE_ID: ${{ steps.draft.outputs.id }}");
+		expect(draft).toContain('gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100"');
+		expect(draft).toContain("select(.tag_name == $tag)");
+		expect(draft).toContain(".[0].draft == true and .[0].prerelease == false");
+		expect(draft).not.toContain("/releases/tags/");
 
 		expect(expectedEvidence).toContain("needs: [release_github_draft, release_context, release_source_verify, rust-hash]");
+		expect(expectedEvidence).toContain("RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}");
+		expect(expectedEvidence).toContain('"/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID"');
+		expect(expectedEvidence).toContain('"$upload_url?name=$expected_asset"');
+		expect(expectedEvidence).toContain("releases/assets/$expected_asset_id");
+		expect(expectedEvidence).toContain('https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets');
+		expect(expectedEvidence).toContain(".tag_name == $tag");
 		expect(expectedEvidence).toContain("needs.release_source_verify.result == 'success'");
 		expect(expectedEvidence).toContain("needs.release_context.outputs.skip-npm != 'true'");
 		expect(npmPublish).toContain("needs: [release_npm_expected, release_context, release_source_verify]");
 		expect(npmPublish).toContain("needs.release_npm_expected.result == 'success'");
 		expect(npmPublish).toContain("needs.release_source_verify.result == 'success'");
 		expect(npmPublish).toContain("needs.release_context.outputs.skip-npm != 'true'");
-		expect(finalEvidence).toContain("needs: [release_npm_publish, release_context, release_source_verify]");
+		expect(finalEvidence).toContain("needs: [release_npm_publish, release_github_draft, release_context, release_source_verify]");
+		expect(finalEvidence).toContain("RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}");
+		expect(finalEvidence).toContain('"$upload_url?name=$final_asset"');
+		expect(finalEvidence).toContain("releases/assets/$final_asset_id");
+		expect(finalEvidence).toContain('https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets');
 		expect(finalEvidence).toContain("needs.release_npm_publish.result == 'success'");
 		expect(finalEvidence).toContain("needs.release_source_verify.result == 'success'");
-		expect(githubVerify).toContain("needs: [release_github_final_evidence, release_context, release_source_verify]");
+		expect(githubVerify).toContain("needs: [release_github_final_evidence, release_github_draft, release_context, release_source_verify]");
+		expect(githubVerify).toContain("RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}");
+		expect(githubVerify).toContain("releases/assets/$asset_id");
 		expect(githubVerify).toContain("needs.release_github_final_evidence.result == 'success'");
 		expect(githubVerify).toContain("needs.release_source_verify.result == 'success'");
-		expect(finalize).toContain("needs: [release_npm_publish, release_github_final_evidence, release_github_verify, release_context, release_source_verify]");
+		expect(finalize).toContain("needs: [release_npm_publish, release_github_final_evidence, release_github_verify, release_github_draft, release_context, release_source_verify]");
+		expect(finalize).toContain("RELEASE_ID: ${{ needs.release_github_draft.outputs.release-id }}");
+		expect(finalize).toContain('gh api --method PATCH \\\n                 "/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID"');
+		expect(finalize).toContain("-F draft=false");
+		expect(finalize).toContain("-F prerelease=false");
+		expect(finalize).toContain('echo "release-id=$RELEASE_ID" >> "$GITHUB_OUTPUT"');
 		expect(finalize).toContain("needs.release_npm_publish.result == 'success'");
 		expect(finalize).toContain("needs.release_github_final_evidence.result == 'success'");
 		expect(finalize).toContain("needs.release_github_verify.result == 'success'");
 		expect(finalize).toContain("needs.release_source_verify.result == 'success'");
 		expect(finalize).toContain("needs.release_context.outputs.skip-npm != 'true'");
 
+		expect(verifyOnly).toContain('gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases?per_page=100"');
+		expect(verifyOnly).toContain("select(.tag_name == $tag)");
+		expect(verifyOnly).toContain("releases/assets/$asset_id");
 		expect(finalEvidence).toContain('cmp "$existing_dir/$final_asset" "$evidence_dir/$final_asset"');
 		expect(finalize).toContain('for asset in "$expected_asset" "$final_asset"; do');
-		expect(finalize.indexOf("for asset in")).toBeLessThan(finalize.indexOf("gh release edit"));
-		expect(finalize.indexOf("--verify-stable-finalization")).toBeLessThan(finalize.indexOf("gh release edit"));
-		expect(finalize).not.toContain("needs: [release_npm_publish, release_context]");
+		expect(finalize.indexOf("for asset in")).toBeLessThan(finalize.indexOf("gh api --method PATCH"));
+		expect(finalize.indexOf("--verify-stable-finalization")).toBeLessThan(finalize.indexOf("gh api --method PATCH"));
+
+		for (const job of [draft, verifyOnly, expectedEvidence, finalEvidence, githubVerify, finalize]) {
+			expect(job).not.toContain('gh release view "$RELEASE_TAG"');
+			expect(job).not.toContain('gh release download "$RELEASE_TAG"');
+			expect(job).not.toContain('gh release upload "$RELEASE_TAG"');
+			expect(job).not.toContain('gh release edit "$RELEASE_TAG"');
+		}
+		expect(finalEvidence).not.toContain("needs: [release_npm_publish, release_context]");
 		expect(workflow).not.toContain("needs: [release_binary, release_github_verify, rust-hash, sdk_closure]");
 	});
 
@@ -503,7 +540,9 @@ describe("native release binary coverage", () => {
 	test("install tarball smoke includes linux x64 optional natives package", async () => {
 		const installer = await Bun.file(path.join(repoRoot, "scripts/install-tests/run-ci.sh")).text();
 		expect(installer).toContain("stage_linux_x64_optional_package");
-		expect(installer).toContain("for pkg in utils natives-linux-x64 natives ai agent tui stats coding-agent gajae-code");
+		expect(installer).toContain(
+			"for pkg in utils natives-linux-x64 natives ai agent bridge-client tui stats coding-agent gajae-code",
+		);
 		expect(installer).toContain("@gajae-code/natives-linux-x64");
 		expect(installer).toContain("gajae-code-natives-[0-9]*.tgz");
 	});

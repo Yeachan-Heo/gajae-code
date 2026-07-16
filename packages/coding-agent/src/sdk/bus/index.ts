@@ -874,6 +874,10 @@ interface SessionRuntime {
 	redact: boolean;
 	/** True only after the exact host generation was registered with the broker index. */
 	brokerRegistrationActive: boolean;
+	/** Terminal cleanup proof retained across retries; each owner is released at most once after proof. */
+	hostStopped: boolean;
+	serverStopped: boolean;
+	brokerRegistrationReleased: boolean;
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
@@ -2294,6 +2298,9 @@ export function createNotificationsExtension(
 			getConfig: () => resolveSettings(options.settings).cfg,
 		});
 
+	// Failed terminal teardown remains fenced from normal runtime lookup while the
+	// exact runtime object retains authority for an explicit idempotent retry.
+	const cleanupRetries = new Map<string, SessionRuntime>();
 	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
@@ -2341,13 +2348,15 @@ export function createNotificationsExtension(
 		reason: "session" | "notifications" = "session",
 		expectedRuntime?: SessionRuntime,
 	): Promise<boolean> {
-		const requestedRuntime = runtimes.get(id);
+		const retryRuntime = cleanupRetries.get(id);
+		const activeRuntime = runtimes.get(id);
+		const requestedRuntime = retryRuntime ?? activeRuntime;
 		if (expectedRuntime && requestedRuntime !== expectedRuntime) return false;
 		if (reason === "session" && requestedRuntime) requestedRuntime.stopping = true;
 		if (reason === "session" && requestedRuntime) {
 			// Fence the exact runtime before awaiting its startup promise: a late start
 			// must observe removal and clean itself up rather than becoming reachable.
-			runtimes.delete(id);
+			if (runtimes.get(id) === requestedRuntime) runtimes.delete(id);
 			if (activeRuntimeId === id) activeRuntimeId = undefined;
 		}
 		const pendingStart = sessionStartPromises.get(id);
@@ -2355,7 +2364,8 @@ export function createNotificationsExtension(
 			void pendingStart
 				.catch(() => {})
 				.then(() => {
-					if (runtimes.get(id) === requestedRuntime) void stopSession(id, reason, requestedRuntime);
+					if (runtimes.get(id) === requestedRuntime || cleanupRetries.get(id) === requestedRuntime)
+						void stopSession(id, reason, requestedRuntime);
 				});
 		const rt = requestedRuntime;
 
@@ -2378,6 +2388,9 @@ export function createNotificationsExtension(
 			rt.pendingInteractive.clear();
 			return true;
 		}
+		// Keep this exact object authoritative for the full terminal release, including
+		// the interval before a failed owner can be recorded for a later retry.
+		cleanupRetries.set(id, rt);
 
 		try {
 			rt.cancelPostmortemCleanup();
@@ -2405,16 +2418,24 @@ export function createNotificationsExtension(
 		try {
 			rt.disposeGateTerminalController();
 		} catch {}
-		let hostStopped = false;
-		let brokerRegistrationReleased = false;
+		let hostStopped = rt.hostStopped;
+		let brokerRegistrationReleased = rt.brokerRegistrationReleased;
+		const ownerReleaseFailures: unknown[] = [];
 
-		try {
-			const stopped = await rt.host.stop();
-			hostStopped = stopped === "stopped";
-			brokerRegistrationReleased = !rt.brokerRegistrationActive || stopped === "stopped";
-			if (rt.brokerRegistrationActive && stopped === "stopped") rt.brokerRegistrationActive = false;
-		} catch (e) {
-			logger.warn(`sdk host: stop failed: ${String(e)}`);
+		if (!hostStopped) {
+			try {
+				const stopped = await rt.host.stop();
+				hostStopped = stopped === "stopped";
+				brokerRegistrationReleased = !rt.brokerRegistrationActive || hostStopped;
+				if (rt.brokerRegistrationActive && hostStopped) rt.brokerRegistrationActive = false;
+				if (hostStopped) {
+					rt.hostStopped = true;
+					rt.brokerRegistrationReleased = brokerRegistrationReleased;
+				}
+			} catch (e) {
+				ownerReleaseFailures.push(e);
+				logger.warn(`sdk host: stop failed: ${String(e)}`);
+			}
 		}
 		rt.host.reverse.dispose();
 		// Resolve any still-pending interactive asks so the ask tool is not left hanging.
@@ -2424,6 +2445,7 @@ export function createNotificationsExtension(
 			rt.cursors.close();
 			await rt.revisions.close();
 		} catch (e) {
+			ownerReleaseFailures.push(e);
 			logger.warn(`sdk query snapshots: close failed: ${String(e)}`);
 		}
 		let closeFrameSent = false;
@@ -2434,18 +2456,27 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: session_closed failed: ${String(e)}`);
 		}
 		if (closeFrameSent) await sleep(100);
-		let serverStopped = false;
-		try {
-			rt.server.stop();
-			serverStopped = true;
-		} catch (e) {
-			logger.warn(`notifications: stop failed: ${String(e)}`);
+		let serverStopped = rt.serverStopped;
+		if (!serverStopped) {
+			try {
+				await rt.server.stopAndWait();
+				serverStopped = true;
+				rt.serverStopped = true;
+			} catch (e) {
+				ownerReleaseFailures.push(e);
+				logger.warn(`notifications: stop failed: ${String(e)}`);
+			}
 		}
 		lifecycleStartupCapability?.rollback?.recordStop(rt.host.generation, {
 			runtimeRemoved: true,
-			hostStopped: hostStopped && serverStopped,
-			brokerRegistrationReleased,
+			hostStopped: rt.hostStopped && rt.serverStopped,
+			brokerRegistrationReleased: rt.brokerRegistrationReleased,
 		});
+		if (ownerReleaseFailures.length > 0) {
+			cleanupRetries.set(id, rt);
+			throw new AggregateError(ownerReleaseFailures, `SDK notification runtime ${id} owner release failed.`);
+		}
+		if (cleanupRetries.get(id) === rt) cleanupRetries.delete(id);
 		return true;
 	}
 
@@ -2484,6 +2515,8 @@ export function createNotificationsExtension(
 		if (lifecycleRequired && !isNotificationEligibleContext(ctx)) return failLifecycleStartup("ineligible");
 		const pendingStart = sessionStartPromises.get(id);
 		if (pendingStart) return pendingStart;
+		const retainedCleanup = cleanupRetries.get(id);
+		if (retainedCleanup) return failLifecycleStartup("failed", "SDK notification runtime cleanup is still pending.");
 		const existingRuntime = runtimes.get(id);
 		if (existingRuntime) {
 			activeRuntimeId = id;
@@ -2930,6 +2963,9 @@ export function createNotificationsExtension(
 			idleSeq: 0,
 			pendingInteractive,
 			brokerRegistrationActive: false,
+			hostStopped: false,
+			serverStopped: false,
+			brokerRegistrationReleased: false,
 			disposeAnswerSource: () => {},
 			disposeFileSink: () => {},
 			disposeGateListener: () => {},
@@ -2980,7 +3016,7 @@ export function createNotificationsExtension(
 		};
 		const cleanupAbandonedStartup = async (): Promise<void> => {
 			try {
-				server.stop();
+				await server.stopAndWait();
 			} catch {}
 			try {
 				await host.stop();

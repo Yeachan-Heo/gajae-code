@@ -295,7 +295,7 @@ Key SDK workflow-gate facts:
 - Rust/N-API compatibility is additive: legacy `ActionNeeded`, `register_ask`,
   and `registerAsk` stay uncorrelated; explicit workflow reader/registration
   APIs preserve correlation without exposing private arbitration state.
-- The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions (currently `0.10.2`); the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+- The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
 
 The prior documented invariant `action_needed.id == gate_id` is incorrect for
 v3 and must not be implemented by controllers. See [`docs/sdk.md`](./sdk.md)

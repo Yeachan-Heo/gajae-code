@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createReadonlySessionManager, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
 
 const HEAD_MARKER = "HEAD_MARKER_START";
@@ -32,15 +33,15 @@ function makeTool(name: string, result: AgentToolResult): AgentTool {
 }
 
 function makeContext(settings: Settings, saved: Array<{ content: string; toolType: string }>): AgentToolContext {
+	const manager = SessionManager.inMemory();
+	vi.spyOn(manager, "saveArtifact").mockImplementation(async (content: string, toolType: string) => {
+		saved.push({ content, toolType });
+		return `art-${saved.length}`;
+	});
 	return {
 		settings,
-		sessionManager: {
-			saveArtifact: async (content: string, toolType: string) => {
-				saved.push({ content, toolType });
-				return `art-${saved.length}`;
-			},
-		},
-	} as unknown as AgentToolContext;
+		sessionManager: createReadonlySessionManager(manager),
+	} as AgentToolContext;
 }
 
 function inlineText(result: AgentToolResult): string {

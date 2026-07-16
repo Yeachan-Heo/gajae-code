@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-15
+
 ### Added
 
 - Introduced `@gajae-code/bridge-client`, the standalone SDK v3 transport-only WebSocket client. It provides hello-gated request correlation, typed transport errors, bounded reconnect/deadline handling, stale-socket fencing, and a strict no-replay guarantee for sent requests.

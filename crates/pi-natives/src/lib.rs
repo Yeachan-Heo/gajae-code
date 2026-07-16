@@ -45,6 +45,7 @@ pub use pi_ast::language;
 pub mod power;
 
 pub mod iso;
+pub mod path_identity;
 pub mod prof;
 pub mod ps;
 pub mod pty;
@@ -73,5 +74,5 @@ use napi_derive::napi;
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_10_2")]
+#[napi(js_name = "__piNativesV0_11_0")]
 pub const fn pi_natives_version_sentinel() {}
