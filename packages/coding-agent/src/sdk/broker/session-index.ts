@@ -48,6 +48,7 @@ export const sessionIndexChecksum = (event: Omit<SessionIndexEvent, "checksum">)
 const dirFor = (agentDir: string) => path.join(agentDir, "sdk", "sessions");
 const logFor = (agentDir: string) => path.join(dirFor(agentDir), "index.jsonl");
 const snapshotFor = (agentDir: string) => path.join(dirFor(agentDir), "index.snapshot.json");
+const ROTATE_BYTES = 4 * 1024 * 1024;
 async function appendSync(file: string, value: string): Promise<void> {
 	const h = await fs.open(file, "a", 0o600);
 	try {
@@ -74,7 +75,6 @@ export class SessionIndex {
 		this.#agentDir = agentDir;
 	}
 	async open(): Promise<this> {
-		await this.assertSupportedStateVersions();
 		await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
 		await fs.chmod(dirFor(this.#agentDir), 0o700);
 		await this.replay();
@@ -167,7 +167,7 @@ export class SessionIndex {
 	): Promise<SessionIndexEvent> {
 		await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
 		return withFileLock(logFor(this.#agentDir), async () => {
-			await this.refresh();
+			await this.replay();
 			const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 				...input,
 				version: SDK_STATE_VERSION,
@@ -177,6 +177,7 @@ export class SessionIndex {
 			const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 			await appendSync(logFor(this.#agentDir), JSON.stringify(event));
 			await this.refresh();
+			if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
 			return event;
 		});
 	}
@@ -196,29 +197,13 @@ export class SessionIndex {
 		}
 		await fs.rename(tmp, file);
 	}
-	async assertSupportedStateVersions(): Promise<void> {
-		const files = [snapshotFor(this.#agentDir), logFor(this.#agentDir)];
-		for (const file of files) {
-			let source: string;
-			try {
-				source = await fs.readFile(file, "utf8");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-				throw error;
-			}
-			if (file.endsWith(".json")) {
-				assertSupportedStateVersion(file, JSON.parse(source));
-				continue;
-			}
-			for (const line of source.split("\n")) {
-				if (!line) continue;
-				try {
-					assertSupportedStateVersion(file, JSON.parse(line));
-				} catch (error) {
-					if (error instanceof UnsupportedStateVersionError) throw error;
-				}
-			}
-		}
+	async #rotate(): Promise<void> {
+		await this.snapshot();
+		const file = logFor(this.#agentDir);
+		const temporary = `${file}.${process.pid}.tmp`;
+		await fs.writeFile(temporary, "", { mode: 0o600 });
+		await fs.rename(temporary, file);
+		this.#logOffset = 0;
 	}
 
 	listSessions(): SessionList {

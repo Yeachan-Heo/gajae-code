@@ -3438,18 +3438,8 @@ export function createNotificationsExtension(
 					});
 					throwIfLifecycleStopped();
 					runtime.brokerRegistrationActive = true;
-					const timer = setInterval(() => {
-						void index
-							.append({
-								type: "host_heartbeat",
-								sessionId: id,
-								locator,
-								endpointGeneration: host.generation,
-								pid: process.pid,
-							})
-							.catch(error => logger.warn(`sdk broker heartbeat failed: ${String(error)}`));
-					}, 5_000);
-					stopBrokerHeartbeat = () => clearInterval(timer);
+					// Host liveness is derived from alive(pid) when the index is read; heartbeats
+					// are deliberately not appended to the durable session index.
 				} catch (brokerError) {
 					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
