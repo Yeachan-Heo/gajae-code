@@ -95,6 +95,34 @@ describe("config CLI schema coverage", () => {
 			value: 0.2,
 		});
 	});
+	it("accepts steer and queue busy prompt modes and rejects invalid values", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitSpy = vi
+			.spyOn(process, "exit")
+			.mockImplementation((code?: string | number | null | undefined): never => {
+				throw new Error(`exit ${code}`);
+			});
+
+		await runConfigCommand({ action: "set", key: "busyPromptMode", value: "steer", flags: { json: true } });
+		await runConfigCommand({ action: "get", key: "busyPromptMode", flags: { json: true } });
+		expect(JSON.parse(String(logSpy.mock.calls.at(-1)?.[0]))).toMatchObject({
+			key: "busyPromptMode",
+			value: "steer",
+		});
+
+		await runConfigCommand({ action: "set", key: "busyPromptMode", value: "queue", flags: { json: true } });
+		await runConfigCommand({ action: "get", key: "busyPromptMode", flags: { json: true } });
+		expect(JSON.parse(String(logSpy.mock.calls.at(-1)?.[0]))).toMatchObject({
+			key: "busyPromptMode",
+			value: "queue",
+		});
+		await expect(
+			runConfigCommand({ action: "set", key: "busyPromptMode", value: "later", flags: { json: true } }),
+		).rejects.toThrow("exit 1");
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Valid values: steer, queue"));
+	});
 	it("sets numeric idle compaction settings from CLI values", async () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		await runConfigCommand({

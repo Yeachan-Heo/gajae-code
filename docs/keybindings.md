@@ -40,8 +40,9 @@ Set an action to an empty array to disable it:
 | `app.thinking.toggle` | `Ctrl+T` | Toggle thinking-block visibility |
 | `app.thinking.cycle` | `Shift+Tab` | Cycle thinking level |
 | `app.editor.external` | `Ctrl+G` | Edit the draft in `$VISUAL` / `$EDITOR` |
-| `app.message.followUp` | _(none)_ | Optional remap for a follow-up message; `Ctrl+Enter` is reserved for editor newline |
-| `app.message.queue` | `Alt+Enter` (`Alt+Q` on win32) | Explicitly queue a message for the next turn |
+| `app.message.followUp` | _(none)_ | Optional remap for a follow-up message; `Ctrl+Enter` remains editor newline unless remapped |
+| `app.message.queue` | `Alt+Q` (macOS/Windows), `Alt+Enter` (otherwise) | Explicitly queue a message for the next turn |
+| `app.message.oppositeBusyMode` | `Command+Enter` (macOS) | Submit one message using the opposite of `busyPromptMode` |
 | `app.message.dequeue` | `Alt+Up` | Dequeue a queued message back into the editor |
 
 | `app.clipboard.copyLine` | `Alt+Shift+L` | Copy the current line |
@@ -51,7 +52,8 @@ Set an action to an empty array to disable it:
 
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
 
-On native Windows terminals, GJC defaults `app.message.queue` to `Alt+Q` because Windows Terminal and PowerShell commonly reserve `Alt+Enter` for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
+On macOS and native Windows terminals, GJC defaults `app.message.queue` to `Alt+Q`; other platforms use `Alt+Enter`. Windows Terminal and PowerShell commonly reserve `Alt+Enter` for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
+While the agent is streaming on macOS, `Command+Enter` submits the current message once using the opposite of `busyPromptMode`: configured `steer` queues that message, while configured `queue` steers it into the active turn. The shortcut is inactive while idle or compacting and is remappable through `app.message.oppositeBusyMode`.
 
 In the main GJC composer, plain `PageUp` / `PageDown` page the visible transcript viewport instead of browsing prompt history; use `Up` / `Down` or `Ctrl+R` for prompt history. Autocomplete and selector surfaces still use `PageUp` / `PageDown` for list paging while they have focus.
 
@@ -137,8 +139,9 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.tools.expand` | `ctrl+o` | |
 | `app.tool.backgroundFold` | `ctrl+b` | |
 | `app.editor.external` | `ctrl+g` | |
-| `app.message.followUp` | _(none)_ | `Ctrl+Enter` remains newline unless the user explicitly remaps this action; while idle the chord still falls through to newline |
-| `app.message.queue` | `alt+enter` (`alt+q` on win32) | platform-aware; avoids the Windows Terminal fullscreen shortcut |
+| `app.message.followUp` | _(none)_ | `Ctrl+Enter` remains editor newline unless the user explicitly remaps this action; while idle the chord still falls through to newline |
+| `app.message.queue` | `alt+q` (macOS/Windows), `alt+enter` (otherwise) | platform-aware; avoids the Windows Terminal fullscreen shortcut |
+| `app.message.oppositeBusyMode` | `super+enter` (macOS only) | one-message inversion of `busyPromptMode`; inactive while idle or compacting |
 | `app.message.dequeue` | `alt+up` | |
 | `app.clipboard.pasteImage` | `ctrl+v` (`alt+v` on win32) | platform-aware; single source of truth in `KEYBINDINGS` |
 | `app.clipboard.copyLine` | `alt+shift+l` | registry-backed via input-controller custom handler |

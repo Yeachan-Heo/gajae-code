@@ -70,6 +70,7 @@ const CP_KP_EQUALS: i32 = 57415;
 const MOD_SHIFT: u32 = 1;
 const MOD_ALT: u32 = 2;
 const MOD_CTRL: u32 = 4;
+const MOD_SUPER: u32 = 8;
 const MOD_NUM_LOCK: u32 = 128;
 
 /// Event types from Kitty keyboard protocol (flag 2).
@@ -461,6 +462,10 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 			},
 			b'a' | b'A' if p.eq_ignore_ascii_case("alt") => {
 				modifier |= MOD_ALT;
+				continue;
+			},
+			b's' | b'S' if p.eq_ignore_ascii_case("super") => {
+				modifier |= MOD_SUPER;
 				continue;
 			},
 			_ => {},
@@ -1325,7 +1330,7 @@ fn parse_functional(bytes: &[u8]) -> Option<ParsedKittySequence> {
 
 fn format_kitty_key(parsed: &ParsedKittySequence) -> Option<Cow<'static, str>> {
 	let effective_mod = parsed.modifier & !LOCK_MASK;
-	if effective_mod & !(MOD_SHIFT | MOD_CTRL | MOD_ALT) != 0 {
+	if effective_mod & !(MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_SUPER) != 0 {
 		return None;
 	}
 	let effective_codepoint =
@@ -1427,6 +1432,9 @@ fn format_with_mods(mods: u32, key_name: &str) -> String {
 	if mods & MOD_ALT != 0 {
 		result.push_str("alt+");
 	}
+	if mods & MOD_SUPER != 0 {
+		result.push_str("super+");
+	}
 	result.push_str(key_name);
 	result
 }
@@ -1472,8 +1480,9 @@ mod tests {
 	}
 
 	#[test]
-	fn parse_key_ignores_kitty_sequences_with_unsupported_modifiers() {
-		assert_eq!(parse_key_inner(b"\x1b[99;9u", true).as_deref(), None);
+	fn parse_key_supports_kitty_super_modifier() {
+		assert_eq!(parse_key_inner(b"\x1b[99;9u", true).as_deref(), Some("super+c"));
+		assert!(matches_key_inner(b"\x1b[13;9u", "super+enter", true));
 	}
 
 	#[test]

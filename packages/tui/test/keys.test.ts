@@ -74,6 +74,13 @@ describe("matchesKey", () => {
 		setKittyProtocolActive(false);
 	});
 
+	it("matches Command+Enter through the Kitty super modifier", () => {
+		setKittyProtocolActive(true);
+		expect(matchesKey("\x1b[13;9u", "super+enter")).toBe(true);
+		expect(matchesKey("\x1b[13;9u", "enter")).toBe(false);
+		setKittyProtocolActive(false);
+	});
+
 	it("preserves keypad navigation matches when NumLock is on but modifiers are held", () => {
 		setKittyProtocolActive(true);
 		expect(matchesKey("\x1b[57400;133u", "ctrl+end")).toBe(true);
@@ -142,7 +149,7 @@ describe("parseKey", () => {
 
 	it("ignores Kitty sequences with unsupported modifiers", () => {
 		setKittyProtocolActive(true);
-		expect(parseKey("\x1b[99;9u")).toBeUndefined();
+		expect(parseKey("\x1b[99;17u")).toBeUndefined();
 		setKittyProtocolActive(false);
 	});
 });
