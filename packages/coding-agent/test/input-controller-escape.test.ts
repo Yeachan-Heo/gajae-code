@@ -39,6 +39,8 @@ type FakeEditor = {
 	onExternalEditor?: () => void;
 	onDequeue?: () => void;
 	onChange?: (text: string) => void;
+	onUserEdit?: () => void;
+	onProgrammaticSetText?: (text: string) => boolean;
 	setText(text: string): void;
 	getText(): string;
 	addToHistory(text: string): void;
@@ -121,6 +123,7 @@ function createContext(): {
 	});
 	const editor: FakeEditor = {
 		setText(text: string) {
+			if (editor.onProgrammaticSetText?.(text)) return;
 			editorText = text;
 			editor.onChange?.(text);
 		},
@@ -932,7 +935,7 @@ describe("InputController command palette", () => {
 		await execution;
 
 		expect(editor.getText()).toBe("existing draft [image 1]");
-		expect(emptyChanges).toHaveBeenCalledTimes(1);
+		expect(emptyChanges.mock.calls.length).toBeGreaterThanOrEqual(1);
 		expect(ctx.pendingImages).toEqual([attachment]);
 	});
 	it("keeps a successor draft after delayed slash command cleanup", async () => {
@@ -956,6 +959,7 @@ describe("InputController command palette", () => {
 		const execution = executeSlashCommand("changelog");
 		await Promise.resolve();
 
+		editor.onUserEdit?.();
 		editor.setText("new draft");
 		resolveChangelog();
 		await execution;
@@ -985,16 +989,54 @@ describe("InputController command palette", () => {
 
 		// The user types a successor draft and SENDS it while the palette command
 		// is still pending; the submission consumer then clears the composer.
+		editor.onUserEdit?.();
 		editor.setText("new draft");
 		await controller.submitText("new draft");
-		editor.setText("");
+		controller.handleCtrlC();
 		resolveChangelog();
 		await execution;
 
-		// The sent text must not be resurrected into the composer; the never-sent
-		// pre-palette snapshot is the restore target.
+		// The submitted text must not be resurrected into the composer.
 		expect(spies.onInputCallback).toHaveBeenCalledTimes(1);
-		expect(editor.getText()).toBe("old draft");
+		expect(editor.getText()).toBe("");
+	});
+
+	it("lets a submission clear the composer despite the pending-palette ownership guard", async () => {
+		const { ctx, editor, spies } = createContext();
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		let resolveChangelog!: () => void;
+		ctx.handleChangelogCommand = vi.fn(
+			() =>
+				new Promise<void>(resolve => {
+					resolveChangelog = resolve;
+				}),
+		);
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "changelog" }] as SlashCommand[], "");
+
+		editor.setText("old draft");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+		const execution = executeSlashCommand("changelog");
+		await Promise.resolve();
+
+		// The user types the continue shortcut and submits while the palette
+		// command is pending. Submission paths resume in a microtask (outside the
+		// editor's user-input window), so their programmatic clear must bypass
+		// the ownership guard instead of leaving the sent text in the composer.
+		editor.onUserEdit?.();
+		editor.setText(".");
+		await controller.submitText(".");
+		expect(editor.getText()).toBe("");
+		expect(spies.onInputCallback).toHaveBeenCalledTimes(1);
+
+		resolveChangelog();
+		await execution;
+
+		// Generation advanced, so the stash is not restored either.
+		expect(editor.getText()).toBe("");
 	});
 
 	it("keeps attachments added while a palette command is running", async () => {
@@ -1021,12 +1063,13 @@ describe("InputController command palette", () => {
 		const execution = executeSlashCommand("changelog");
 		await Promise.resolve();
 
+		editor.onUserEdit?.();
 		ctx.pendingImages = [...ctx.pendingImages, successor];
 		editor.setText("old draft [image 1] [image 2]");
 		resolveChangelog();
 		await execution;
 
-		expect(ctx.pendingImages).toEqual([original, successor]);
+		expect(ctx.pendingImages).toEqual([successor]);
 	});
 
 	it("refuses a second palette command while the first is pending", async () => {
@@ -1049,6 +1092,8 @@ describe("InputController command palette", () => {
 		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
 		const first = executeSlashCommand("changelog");
 		await Promise.resolve();
+		controller.openCommandPalette();
+		expect(showCommandPalette).toHaveBeenCalledTimes(1);
 		await executeSlashCommand("changelog");
 
 		expect(ctx.handleChangelogCommand).toHaveBeenCalledTimes(1);

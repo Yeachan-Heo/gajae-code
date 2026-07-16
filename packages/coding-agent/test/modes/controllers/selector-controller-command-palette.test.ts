@@ -30,4 +30,36 @@ describe("SelectorController command palette", () => {
 		expect(showError).toHaveBeenCalledWith("palette command failed");
 		expect(unhandled).not.toHaveBeenCalled();
 	});
+	it("surfaces rejected action handlers", async () => {
+		const component = { clear: vi.fn(), addChild: vi.fn() };
+		const showError = vi.fn();
+		const ctx = {
+			editorContainer: component,
+			editor: {},
+			restoreComposer: vi.fn(),
+			keybindings: { getKeys: () => [] },
+			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+			showError,
+		} as unknown as InteractiveModeContext;
+		const controller = new SelectorController(ctx);
+
+		controller.showCommandPalette(
+			[],
+			[
+				{
+					id: "app.editor.external",
+					label: "External editor",
+					handler: async () => {
+						throw new Error("external editor failed");
+					},
+				},
+			],
+			async () => {},
+		);
+		const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
+		palette.handleInput("\r");
+		await Bun.sleep(0);
+
+		expect(showError).toHaveBeenCalledWith("external editor failed");
+	});
 });

@@ -15,7 +15,7 @@ import { DynamicBorder } from "./dynamic-border";
 export interface CommandPaletteAction {
 	id: string;
 	label: string;
-	handler: () => void;
+	handler: () => void | Promise<void>;
 }
 
 export interface CommandPaletteEntry {

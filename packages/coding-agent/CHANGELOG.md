@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+- Palette command dispatch now stashes and clears the composer before command cleanup, restores only unchanged same-session editors, and records non-empty stashes in prompt history so cleared, submitted, or switched-session drafts are never resurrected or lost.
+
 ### Added
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 - Added a searchable command palette for available composer actions and slash commands; palette slash commands run one at a time and preserve newer drafts and attachments while command cleanup settles.

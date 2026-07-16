@@ -107,6 +107,10 @@ export class CustomEditor extends Editor {
 	onViewportPageScroll?: (direction: -1 | 1) => void;
 	/** Called before regular composer input should return the transcript viewport to the live bottom. */
 	onViewportFollowLive?: () => void;
+	/** Called after keyboard or bracketed-paste input changes composer text. */
+	onUserEdit?: () => void;
+	/** Return true to consume a programmatic composer update. */
+	onProgrammaticSetText?: (text: string) => boolean;
 
 	/** Custom key handlers from extensions and non-built-in app actions. */
 	#customKeyHandlers = new Map<KeyId, () => boolean | undefined>();
@@ -118,6 +122,12 @@ export class CustomEditor extends Editor {
 	#pasteDecisionToken = 0;
 	#pasteDecisionTimeout: NodeJS.Timeout | undefined;
 	#pendingPasteInput: string[] = [];
+	#handlingUserInput = false;
+
+	override setText(text: string): void {
+		if (!this.#handlingUserInput && this.onProgrammaticSetText?.(text)) return;
+		super.setText(text);
+	}
 
 	setActionKeys(action: ConfigurableEditorAction, keys: KeyId[]): void {
 		this.#actionKeys.set(action, [...keys]);
@@ -206,7 +216,11 @@ export class CustomEditor extends Editor {
 			if (token !== this.#pasteDecisionToken) return;
 			this.#clearPasteDecisionTimeout();
 			if (!handled) {
+				const textBeforeInput = this.getText();
+				this.#handlingUserInput = true;
 				super.handleInput(`\x1b[200~${pasteContent}\x1b[201~`);
+				this.#handlingUserInput = false;
+				if (this.getText() !== textBeforeInput) this.onUserEdit?.();
 			}
 			this.#pasteDecisionPending = false;
 			this.#drainPendingPasteInput(remaining);
@@ -402,7 +416,11 @@ export class CustomEditor extends Editor {
 			}
 		}
 
-		// Pass to parent for normal handling
+		// Pass to parent for normal handling.
+		const textBeforeInput = this.getText();
+		this.#handlingUserInput = true;
 		super.handleInput(data);
+		this.#handlingUserInput = false;
+		if (this.getText() !== textBeforeInput) this.onUserEdit?.();
 	}
 }
