@@ -45,6 +45,7 @@ type FakeEditor = {
 async function createContext(options?: {
 	busyPromptMode?: "steer" | "queue";
 	followUpKeys?: string[];
+	oppositeBusyModeKeys?: string[];
 	ircSidebarToggleKeys?: string[];
 }) {
 	let editorText = "";
@@ -53,6 +54,7 @@ async function createContext(options?: {
 		"app.model.select": ["ctrl+l"],
 		"app.message.queue": ["alt+enter"],
 		"app.message.followUp": options?.followUpKeys ?? [],
+		"app.message.oppositeBusyMode": options?.oppositeBusyModeKeys ?? ["super+enter"],
 		"app.message.dequeue": ["alt+up", "alt+down"],
 		"app.irc.sidebar.toggle": options?.ircSidebarToggleKeys ?? ["alt+i"],
 	};
@@ -62,6 +64,7 @@ async function createContext(options?: {
 	const prompt = vi.fn(async () => {});
 	const updatePendingMessagesDisplay = vi.fn();
 	const handleBashCommand = vi.fn(async () => {});
+	const handlePythonCommand = vi.fn(async () => {});
 	const showStatus = vi.fn();
 	const onInputCallback = vi.fn();
 	const toggleIrcSidebar = vi.fn();
@@ -247,6 +250,7 @@ async function createContext(options?: {
 		showModelSelector,
 		updateEditorBorderColor: vi.fn(),
 		handleBashCommand,
+		handlePythonCommand,
 		showWarning: vi.fn(),
 		showStatus,
 		hasActiveBtw: vi.fn(() => false),
@@ -264,6 +268,7 @@ async function createContext(options?: {
 			startPendingSubmission,
 			updatePendingMessagesDisplay,
 			handleBashCommand,
+			handlePythonCommand,
 			showStatus,
 			queueCompactionMessage,
 			popLastQueuedMessage,
@@ -357,6 +362,117 @@ describe("InputController keybinding setup", () => {
 			followUpQueuePolicy: "sequential",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([
+		["steer", "followUp", "sequential"],
+		["queue", "steer", undefined],
+	] as const)("Command+Enter submits once as %s mode's opposite", async (busyPromptMode, streamingBehavior, followUpQueuePolicy) => {
+		const { InputController, ctx, editor, spies } = await createContext({ busyPromptMode });
+		(ctx.session as unknown as { isStreaming: boolean }).isStreaming = true;
+		editor.setText(`opposite from ${busyPromptMode}`);
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+			([key]) => key === "super+enter",
+		);
+		expect(registration).toBeDefined();
+		expect(registration?.[1]()).toBe(true);
+		await Bun.sleep(0);
+
+		expect(spies.prompt).toHaveBeenCalledWith(`opposite from ${busyPromptMode}`, {
+			streamingBehavior,
+			images: undefined,
+			...(followUpQueuePolicy ? { followUpQueuePolicy } : {}),
+		});
+	});
+
+	it("lets Command+Enter fall through while idle or compacting", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		editor.setText("do not invert");
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+			([key]) => key === "super+enter",
+		);
+		expect(registration).toBeDefined();
+		expect(registration?.[1]()).toBe(false);
+
+		(ctx.session as unknown as { isStreaming: boolean; isCompacting: boolean }).isStreaming = true;
+		(ctx.session as unknown as { isStreaming: boolean; isCompacting: boolean }).isCompacting = true;
+		expect(registration?.[1]()).toBe(false);
+		await Bun.sleep(0);
+		expect(spies.prompt).not.toHaveBeenCalled();
+	});
+
+	it("queues direct free text while streaming when busyPromptMode is queue", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ busyPromptMode: "queue" });
+		(ctx.session as unknown as { isStreaming: boolean }).isStreaming = true;
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("queue this message");
+
+		expect(spies.prompt).toHaveBeenCalledWith("queue this message", {
+			streamingBehavior: "followUp",
+			images: undefined,
+			followUpQueuePolicy: "sequential",
+		});
+		expect(spies.onInputCallback).not.toHaveBeenCalled();
+	});
+
+	it("queues direct images while streaming when busyPromptMode is queue", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ busyPromptMode: "queue" });
+		(ctx.session as unknown as { isStreaming: boolean }).isStreaming = true;
+		const image = { type: "image", data: "image-data" } as unknown as InteractiveModeContext["pendingImages"][number];
+		ctx.pendingImages = [image];
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("queue image [image 1]");
+
+		expect(spies.prompt).toHaveBeenCalledWith("queue image [image 1]", {
+			streamingBehavior: "followUp",
+			images: [image],
+			followUpQueuePolicy: "sequential",
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("submits direct text normally while idle when busyPromptMode is queue", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ busyPromptMode: "queue" });
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("idle message");
+
+		expect(spies.prompt).not.toHaveBeenCalled();
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "idle message",
+			images: undefined,
+			cancelled: false,
+			started: true,
+		});
+	});
+
+	it.each([
+		["!echo normal", "echo normal", false, "handleBashCommand"],
+		["!!echo excluded", "echo excluded", true, "handleBashCommand"],
+		["$print('normal')", "print('normal')", false, "handlePythonCommand"],
+		["$$print('excluded')", "print('excluded')", true, "handlePythonCommand"],
+	] as const)("runs %s directly during compaction", async (input, command, excluded, handler) => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		(ctx.session as unknown as { isCompacting: boolean }).isCompacting = true;
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.(input);
+
+		expect(spies[handler]).toHaveBeenCalledWith(command, excluded);
+		expect(spies.queueCompactionMessage).not.toHaveBeenCalled();
+		expect(spies.prompt).not.toHaveBeenCalled();
 	});
 
 	it("does not register a default Ctrl+Enter follow-up handler", async () => {

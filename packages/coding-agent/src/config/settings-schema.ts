@@ -5,15 +5,20 @@ import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 import type { ModelSelectorValue } from "./model-selector-value";
-
-const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
-const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
-
 import {
 	DEFAULT_DISABLED_EXTENSIONS,
 	DEFAULT_SKILL_DISCOVERY_SETTINGS,
 	type SkillDiscoverySettings,
 } from "./skill-settings-defaults";
+
+const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
+const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
+
+export type BusyPromptMode = "steer" | "queue";
+
+export function normalizeBusyPromptMode(value: unknown): BusyPromptMode {
+	return value === "queue" ? "queue" : "steer";
+}
 
 /** Unified settings schema - single source of truth for all settings.
  *

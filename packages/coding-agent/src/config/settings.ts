@@ -47,6 +47,7 @@ import {
 	type GroupPrefix,
 	type GroupTypeMap,
 	getDefault,
+	normalizeBusyPromptMode,
 	SETTINGS_SCHEMA,
 	type SettingPath,
 	type SettingValue,
@@ -369,6 +370,8 @@ export class Settings implements NotificationSettingsReader {
 	/** Legacy fallback migration warnings emitted once per settings instance. */
 	#legacyFallbackMigrationWarnings = 0;
 	#legacyFallbackMigrationGlobalFingerprint: string | undefined;
+	/** Invalid persisted busy prompt mode warning emitted once per settings instance. */
+	#busyPromptModeInvalidWarningEmitted = false;
 
 	/** Whether to persist changes */
 	#persist: boolean;
@@ -465,6 +468,9 @@ export class Settings implements NotificationSettingsReader {
 	get<P extends SettingPath>(path: P): SettingValue<P> {
 		const segments = path.split(".");
 		const value = getByPath(this.#merged, segments);
+		if (path === "busyPromptMode") {
+			return this.#normalizeBusyPromptMode(value) as SettingValue<P>;
+		}
 		if (value !== undefined) {
 			const pathScopedValue = resolvePathScopedStringArray(path, value, this.#cwd);
 			return (pathScopedValue ?? value) as SettingValue<P>;
@@ -472,6 +478,25 @@ export class Settings implements NotificationSettingsReader {
 		return getDefault(path);
 	}
 
+	#normalizeBusyPromptMode(value: unknown): "steer" | "queue" {
+		const persistedValue = Object.hasOwn(this.#overrides, "busyPromptMode")
+			? undefined
+			: Object.hasOwn(this.#project, "busyPromptMode")
+				? this.#project.busyPromptMode
+				: this.#global.busyPromptMode;
+		if (
+			value !== "queue" &&
+			value !== "steer" &&
+			persistedValue !== undefined &&
+			this.#persist &&
+			!this.#busyPromptModeInvalidWarningEmitted
+		) {
+			this.#busyPromptModeInvalidWarningEmitted = true;
+			logger.warn("Settings: invalid busyPromptMode; using steer", { value: persistedValue });
+		}
+
+		return normalizeBusyPromptMode(value);
+	}
 	/**
 	 * Get a setting value from the user/global config only.
 	 *

@@ -68,6 +68,13 @@ describe("generated JSON Schemas", () => {
 		})).toBe(false);
 	});
 
+	it("emits busy prompt mode enum and default", () => {
+		const schema = configSchema() as any;
+		expect(schema.properties.busyPromptMode).toMatchObject({
+			enum: ["steer", "queue"],
+			default: "steer",
+		});
+	});
 	it("emits web search fallback item enum and provider webSearch enum", () => {
 		const configSchema = JSON_SCHEMA_OUTPUTS.find(output => output.path === "schemas/config.schema.json")?.schema as any;
 		const fallbackItems = configSchema.properties.web_search.properties.fallback.items;
