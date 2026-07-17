@@ -165,7 +165,10 @@ describe("BtwController", () => {
 		const runEphemeralTurn = vi
 			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
 			.mockResolvedValueOnce({ replyText: "First answer", assistantMessage: firstAssistant })
-			.mockResolvedValueOnce({ replyText: "Second answer", assistantMessage: createAssistantMessage("Second answer") });
+			.mockResolvedValueOnce({
+				replyText: "Second answer",
+				assistantMessage: createAssistantMessage("Second answer"),
+			});
 		const ctx = makeCtx(makeFakeSession(runEphemeralTurn));
 		const controller = new BtwController(ctx);
 
@@ -237,6 +240,41 @@ describe("BtwController", () => {
 
 		expect(controller.handleEscape()).toBe(true);
 		expect(controller.hasOpenRetainedThread()).toBe(false);
+	});
+
+	it("records failed retained turns into context so later follow-ups can see the failed question", async () => {
+		const runEphemeralTurn = vi
+			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
+			.mockRejectedValueOnce(new Error("provider unavailable"))
+			.mockResolvedValueOnce({
+				replyText: "Recovered answer",
+				assistantMessage: createAssistantMessage("Recovered answer"),
+			});
+		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn)));
+
+		await controller.startRetained("Failed question?");
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(controller.hasOpenRetainedThread()).toBe(true);
+		expect(controller.isRetainedTurnInFlight()).toBe(false);
+
+		expect(await controller.submitRetainedFollowUp("try again")).toBe("accepted");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const retryCall = runEphemeralTurn.mock.calls[1]?.[0];
+		expect(retryCall?.contextMessages).toHaveLength(2);
+		expect(retryCall?.contextMessages?.[0]).toMatchObject({
+			role: "user",
+			content: [{ type: "text", text: "Failed question?" }],
+			attribution: "user",
+		});
+		expect(retryCall?.contextMessages?.[1]).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: "provider unavailable",
+			content: [{ type: "text", text: "Error: provider unavailable" }],
+		});
 	});
 	it("lets /btw-r replace an open one-shot /btw panel", async () => {
 		const signals: AbortSignal[] = [];

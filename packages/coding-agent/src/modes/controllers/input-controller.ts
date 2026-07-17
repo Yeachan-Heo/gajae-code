@@ -553,7 +553,6 @@ export class InputController {
 			}
 		}
 
-
 		// Empty submit while streaming with queued messages: flush queues immediately
 		if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
 			// Abort current stream and let queued messages be processed
@@ -596,7 +595,6 @@ export class InputController {
 
 		if (!text) return;
 		const wasSlashOrigin = text.startsWith("/");
-
 
 		// Handle built-in slash commands
 		const slashResult = await executeBuiltinSlashCommand(text, {

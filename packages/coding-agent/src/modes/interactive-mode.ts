@@ -2975,7 +2975,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#btwController.startRetained(question);
 	}
 
-
 	hasActiveBtw(): boolean {
 		return this.#btwController.hasOpenPanel();
 	}

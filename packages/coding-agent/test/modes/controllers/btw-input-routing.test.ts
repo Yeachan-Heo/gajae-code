@@ -10,8 +10,8 @@ beforeAll(async () => {
 function createHarness(options: { retainedOpen?: boolean; accepted?: boolean; streaming?: boolean } = {}) {
 	let editorText = "";
 	const hasActiveBtwR = vi.fn(() => options.retainedOpen ?? false);
-	const handleBtwRFollowUp = vi.fn<(question: string) => Promise<"accepted" | "busy" | "closed">>(
-		async () => ((options.accepted ?? true) ? "accepted" : "busy"),
+	const handleBtwRFollowUp = vi.fn<(question: string) => Promise<"accepted" | "busy" | "closed">>(async () =>
+		(options.accepted ?? true) ? "accepted" : "busy",
 	);
 	const onInputCallback = vi.fn();
 	const abort = vi.fn(async () => {});
@@ -89,7 +89,13 @@ describe("InputController retained /btw-r routing", () => {
 		expect(open.handleBtwRFollowUp).not.toHaveBeenCalled();
 
 		for (const text of [".", "c", "plain follow-up", "!pwd", "$1 + 1"]) await submit(open, text);
-		expect(open.handleBtwRFollowUp.mock.calls.map(call => call[0])).toEqual([".", "c", "plain follow-up", "!pwd", "$1 + 1"]);
+		expect(open.handleBtwRFollowUp.mock.calls.map(call => call[0])).toEqual([
+			".",
+			"c",
+			"plain follow-up",
+			"!pwd",
+			"$1 + 1",
+		]);
 		expect(open.onInputCallback).not.toHaveBeenCalled();
 		expect(open.editor.addToHistory).not.toHaveBeenCalled();
 		expect(open.editor.getText()).toBe("");
@@ -133,7 +139,11 @@ describe("InputController retained /btw-r routing", () => {
 	it("returns to the main input path after Esc closes the retained thread", async () => {
 		const harness = createHarness({ retainedOpen: false });
 		await submit(harness, "main prompt after Esc");
-		expect(harness.onInputCallback).toHaveBeenCalledWith({ text: "main prompt after Esc", cancelled: false, started: true });
+		expect(harness.onInputCallback).toHaveBeenCalledWith({
+			text: "main prompt after Esc",
+			cancelled: false,
+			started: true,
+		});
 		expect(harness.handleBtwRFollowUp).not.toHaveBeenCalled();
 	});
 	it("routes explicit follow-up keybinding into the retained thread instead of the main session", async () => {

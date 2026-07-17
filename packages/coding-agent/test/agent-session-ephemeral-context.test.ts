@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Agent, type AgentMessage } from "@gajae-code/agent-core";
-import { type AssistantMessage, type Usage } from "@gajae-code/ai";
-import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
+import type { AssistantMessage, Usage } from "@gajae-code/ai";
+import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { createMockModel, registerMockApi, type MockModel } from "@gajae-code/ai/providers/mock";
 
 registerMockApi();
 
@@ -32,10 +32,7 @@ function user(text: string): AgentMessage {
 function assistant(text: string, thinking?: string): AssistantMessage {
 	return {
 		role: "assistant",
-		content: [
-			...(thinking ? [{ type: "thinking" as const, thinking }] : []),
-			{ type: "text", text },
-		],
+		content: [...(thinking ? [{ type: "thinking" as const, thinking }] : []), { type: "text", text }],
 		api: "mock",
 		provider: "mock",
 		model: "mock-model",
@@ -106,7 +103,12 @@ function addPeer(registry: AgentRegistry): void {
 describe("AgentSession ephemeral context", () => {
 	it("replays main messages, caller context, and the virtual prompt in order without mutation or tools", async () => {
 		const { session, model, snapshots } = createHarness();
-		const context = [user("first question"), assistant("first answer"), user("second question"), assistant("second answer", "private reasoning")];
+		const context = [
+			user("first question"),
+			assistant("first answer"),
+			user("second question"),
+			assistant("second answer", "private reasoning"),
+		];
 		const contextBefore = structuredClone(context);
 		const sessionBefore = structuredClone(session.messages);
 
@@ -123,7 +125,10 @@ describe("AgentSession ephemeral context", () => {
 			"user:current prompt",
 		]);
 		expect(snapshots[0]?.[5]).toBe(context[3]);
-		expect((snapshots[0]?.[5] as AssistantMessage).content).toContainEqual({ type: "thinking", thinking: "private reasoning" });
+		expect((snapshots[0]?.[5] as AssistantMessage).content).toContainEqual({
+			type: "thinking",
+			thinking: "private reasoning",
+		});
 		expect(context).toEqual(contextBefore);
 		expect(session.messages).toEqual(sessionBefore);
 		expect(model.calls[0]?.context.tools).toEqual([]);
