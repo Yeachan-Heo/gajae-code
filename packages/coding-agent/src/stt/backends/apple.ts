@@ -51,6 +51,73 @@ export function appleLocaleForLanguage(language: string | undefined): string | u
 export type AppleAuthorization = "authorized" | "denied" | "restricted" | "notDetermined";
 
 /**
+ * Extract the `.app` bundle root from an executable path inside it.
+ * Returns null for non-bundle executables (plain CLI chains).
+ */
+export function bundlePathFromExecutablePath(execPath: string): string | null {
+	const marker = ".app/Contents/MacOS/";
+	const index = execPath.indexOf(marker);
+	if (index === -1) return null;
+	return execPath.slice(0, index + ".app".length);
+}
+
+let hostAppCheckCache: { usable: boolean } | null = null;
+
+/**
+ * TCC crash preflight. macOS attributes speech/microphone permission to the
+ * **responsible app** (the terminal hosting this process) and ABORTS the
+ * requesting process when that app's Info.plist lacks the matching usage
+ * description — observed in the field as a SIGABRT with
+ * "must contain an NSSpeechRecognitionUsageDescription key". Walk the parent
+ * chain to the hosting .app bundle and verify both keys BEFORE touching any
+ * Speech API. Fail-open for non-bundle chains (plain CLI/ssh/tmux servers),
+ * where macOS prompts normally instead of aborting.
+ */
+function hostAppAllowsSpeech(): boolean {
+	if (hostAppCheckCache) return hostAppCheckCache.usable;
+	let usable = true;
+	try {
+		let pid = process.pid;
+		let bundle: string | null = null;
+		for (let depth = 0; depth < 15 && pid > 1; depth++) {
+			const out = Bun.spawnSync(["ps", "-o", "ppid=,comm=", "-p", String(pid)], { stdout: "pipe" });
+			const line = out.stdout.toString().trim();
+			if (!line) break;
+			const match = line.match(/^(\d+)\s+(.*)$/);
+			if (!match) break;
+			pid = Number(match[1]);
+			bundle = bundlePathFromExecutablePath(match[2] ?? "");
+			if (bundle) break;
+		}
+		if (bundle) {
+			for (const key of ["NSSpeechRecognitionUsageDescription", "NSMicrophoneUsageDescription"]) {
+				const read = Bun.spawnSync(["defaults", "read", `${bundle}/Contents/Info`, key], {
+					stdout: "ignore",
+					stderr: "ignore",
+				});
+				if (read.exitCode !== 0) {
+					logger.warn("Apple speech disabled: hosting terminal app lacks usage description", {
+						bundle,
+						key,
+					});
+					usable = false;
+					break;
+				}
+			}
+		}
+	} catch {
+		usable = true; // fail-open: absence of evidence is not a crash risk signal
+	}
+	hostAppCheckCache = { usable };
+	return usable;
+}
+
+/** Test hook — reset the host-app preflight cache. */
+export function resetHostAppSpeechCheckCache(): void {
+	hostAppCheckCache = null;
+}
+
+/**
  * Some recognizer failures are only observable at runtime (e.g. Dictation
  * disabled in System Settings while `isAvailable` still reports true). Once
  * seen, auto-selection degrades to whisper for the rest of the process.
@@ -72,12 +139,15 @@ export function describeAppleSpeechError(message: string): string {
 export interface AppleAvailability {
 	usable: boolean;
 	/** Machine-readable reason when unusable (for fallback notes). */
-	reason?: "platform" | "locale" | "assets" | "on-device" | "permission";
+	reason?: "platform" | "locale" | "assets" | "on-device" | "permission" | "host-app";
 	authorization: AppleAuthorization;
 }
 
 /** Capability probe — cheap, no permission prompt. */
 export function appleBackendAvailability(language?: string): AppleAvailability {
+	if (process.platform === "darwin" && !hostAppAllowsSpeech()) {
+		return { usable: false, reason: "host-app", authorization: "notDetermined" };
+	}
 	const support = macSpeechSupport(appleLocaleForLanguage(language));
 	const authorization = (macSpeechAuthorizationStatus() ?? "notDetermined") as AppleAuthorization;
 	if (!support.platform) return { usable: false, reason: "platform", authorization };
