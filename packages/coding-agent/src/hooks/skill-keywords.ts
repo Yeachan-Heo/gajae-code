@@ -66,12 +66,6 @@ export const GJC_SKILL_KEYWORD_DEFINITIONS: readonly SkillKeywordDefinition[] = 
 		priority: 8,
 		guidance: "Activate GJC team workflow",
 	},
-	{
-		keyword: "coordinated team",
-		skill: "team",
-		priority: 8,
-		guidance: "Activate GJC team workflow",
-	},
 ] as const;
 
 export function isGjcWorkflowSkill(value: string): value is GjcWorkflowSkill {

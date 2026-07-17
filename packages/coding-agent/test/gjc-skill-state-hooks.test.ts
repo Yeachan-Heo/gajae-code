@@ -206,6 +206,12 @@ describe("GJC native skill-state hooks", () => {
 		expect(detectSkillKeywords("$autopilot deep interview")).toEqual([]);
 		expect(detectSkillKeywords("please run a consensus plan")[0]?.skill).toBe("ralplan");
 	});
+	it("requires explicit Team workflow invocations", () => {
+		expect(detectSkillKeywords("coordinated team")).toEqual([]);
+		expect(detectSkillKeywords("team")).toEqual([]);
+		expect(detectSkillKeywords("$team")).toEqual([{ keyword: "$team", skill: "team", priority: 8 }]);
+		expect(detectSkillKeywords("$gjc:team")).toEqual([{ keyword: "$gjc:team", skill: "team", priority: 8 }]);
+	});
 
 	it("UserPromptSubmit adds advisory answer-only context for question-only prompts", async () => {
 		const root = await cwd();
