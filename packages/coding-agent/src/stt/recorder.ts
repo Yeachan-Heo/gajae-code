@@ -74,6 +74,8 @@ async function startFFmpegRecording(outputPath: string, macosAudioDevice = ":def
 			"1",
 			"-sample_fmt",
 			"s16",
+			"-flush_packets",
+			"1",
 			"-y",
 			outputPath,
 		];
@@ -94,6 +96,8 @@ async function startFFmpegRecording(outputPath: string, macosAudioDevice = ":def
 			"1",
 			"-sample_fmt",
 			"s16",
+			"-flush_packets",
+			"1",
 			"-y",
 			outputPath,
 		];
@@ -110,6 +114,8 @@ async function startFFmpegRecording(outputPath: string, macosAudioDevice = ":def
 			"1",
 			"-sample_fmt",
 			"s16",
+			"-flush_packets",
+			"1",
 			"-y",
 			outputPath,
 		];
