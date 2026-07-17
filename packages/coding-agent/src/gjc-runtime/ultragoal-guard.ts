@@ -71,12 +71,12 @@ function objectiveMatches(currentGoal: CurrentGoalLike, plan: UltragoalPlan, ses
 	return plan.goals.some(goal => goal.objective === normalized);
 }
 
-function isKnownUltragoalObjective(currentObjective: string): boolean {
+export function isKnownUltragoalObjective(currentObjective: string): boolean {
 	const normalized = currentObjective.trim();
-	return (
-		normalized === DEFAULT_ULTRAGOAL_OBJECTIVE ||
-		(normalized.includes(".gjc/ultragoal/goals.json") && normalized.includes(".gjc/ultragoal/ledger.jsonl"))
-	);
+	// Exact default aggregate objective only. Substring path sniffing previously
+	// treated arbitrary objectives that merely mentioned goals.json/ledger paths
+	// as Ultragoal-owned, which could mis-arm guards. Prefer fail-closed.
+	return normalized === DEFAULT_ULTRAGOAL_OBJECTIVE;
 }
 
 async function ultragoalReadPaths(
