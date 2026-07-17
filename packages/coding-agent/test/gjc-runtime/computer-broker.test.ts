@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type * as childProcess from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -159,12 +160,15 @@ function fakeBrokerChild(pid: number, onKill: (signal: NodeJS.Signals) => boolea
 	return child;
 }
 
+const testHelperExecutable = fs.realpathSync(process.execPath);
+const testHelperExecutableSha256 = crypto.createHash("sha256").update(testHelperExecutable, "utf8").digest("hex");
+
 function staticProcessIdentity(pid: number): ComputerBrokerProcessIdentity {
 	return {
 		pid,
 		start: "100:200",
-		executable: "/tmp/gjc-test-helper",
-		executableSha256: "a".repeat(64),
+		executable: testHelperExecutable,
+		executableSha256: testHelperExecutableSha256,
 		pgid: pid,
 	};
 }
@@ -253,6 +257,40 @@ describe("computer broker", () => {
 		fs.rmSync(base, { recursive: true, force: true });
 	});
 
+	it("never accepts or signals a replacement process on the first identity read", () => {
+		const pid = 42_423;
+		const replacementIdentity = {
+			...staticProcessIdentity(pid),
+			executable: "/tmp/gjc-replacement-process",
+			executableSha256: "b".repeat(64),
+		};
+		const signals: NodeJS.Signals[] = [];
+		let runtimeDirectory: string | undefined;
+		const child = fakeBrokerChild(pid, signal => {
+			signals.push(signal);
+			return true;
+		});
+		const spawn = ((_command: string, _args: readonly string[], options: childProcess.SpawnOptions) => {
+			runtimeDirectory = options.env?.[GJC_COMPUTER_BROKER_DIR_ENV];
+			return child;
+		}) as typeof childProcess.spawn;
+		try {
+			expect(() =>
+				startComputerBrokerForTmux({
+					isCompiledBinary: () => true,
+					spawn,
+					startupTimeoutMs: 1,
+					readProcessIdentity: () => replacementIdentity,
+					isProcessAlive: () => true,
+					termTimeoutMs: 1,
+					killTimeoutMs: 1,
+				}),
+			).toThrow("Computer broker cleanup could not be confirmed");
+			expect(signals).toEqual([]);
+		} finally {
+			if (runtimeDirectory) fs.rmSync(runtimeDirectory, { recursive: true, force: true });
+		}
+	});
 	it("never signals a reused broker PID", () => {
 		const pid = 42_424;
 		const originalIdentity = staticProcessIdentity(pid);

@@ -423,12 +423,16 @@ async function execute(controller: ComputerControllerLike, frame: RequestFrame):
 	return null;
 }
 
+function executablePathSha256(executable: string): string {
+	return crypto.createHash("sha256").update(executable, "utf8").digest("hex");
+}
+
 function processIdentity(pid: number): ComputerBrokerProcessIdentity | null {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return null;
 	try {
 		const identity = loadNative<ComputerNativeBindings>().darwinProcessIdentity(pid);
 		const executable = fs.realpathSync(identity.executable);
-		const executableSha256 = crypto.createHash("sha256").update(executable, "utf8").digest("hex");
+		const executableSha256 = executablePathSha256(executable);
 		if (!/^\d+:\d+$/.test(identity.startToken) || !Number.isSafeInteger(identity.pgid) || identity.pgid <= 0)
 			return null;
 		return { pid, start: identity.startToken, executable, executableSha256, pgid: identity.pgid };
@@ -448,6 +452,20 @@ function sameProcessIdentity(
 		actual.executable === expected.executable &&
 		actual.executableSha256 === expected.executableSha256 &&
 		actual.pgid === expected.pgid
+	);
+}
+
+function isSpawnedHelperIdentity(
+	identity: ComputerBrokerProcessIdentity,
+	pid: number,
+	helper: string,
+	helperSha256: string,
+): boolean {
+	return (
+		identity.pid === pid &&
+		identity.executable === helper &&
+		identity.executableSha256 === helperSha256 &&
+		identity.pgid === pid
 	);
 }
 
@@ -1194,7 +1212,14 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 	const env = options.env ?? process.env;
 	const cwd = options.cwd ?? process.cwd();
 	if (!(options.isCompiledBinary ?? isCompiledBinary)()) return null;
-	const helper = options.helperExecutable ?? process.execPath;
+	const helperCandidate = options.helperExecutable ?? process.execPath;
+	let helper: string;
+	try {
+		helper = fs.realpathSync(helperCandidate);
+	} catch {
+		return null;
+	}
+	const helperSha256 = executablePathSha256(helper);
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-"));
 	const socket = path.join(directory, "broker.sock");
 	const token = crypto.randomBytes(32).toString("hex");
@@ -1228,7 +1253,10 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 			Date.now() + Math.max(1, Math.min(options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS));
 		while (!childIdentity && Date.now() < deadline) {
 			if (spawnFailed || spawnedChild.exitCode !== null || spawnedChild.pid === undefined) break;
-			childIdentity = readIdentity(spawnedChild.pid);
+			const observed = readIdentity(spawnedChild.pid);
+			if (observed && !isSpawnedHelperIdentity(observed, spawnedChild.pid, helper, helperSha256))
+				throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker identity was unavailable.");
+			childIdentity = observed;
 			if (!childIdentity) sleepSynchronously(10);
 		}
 		if (!childIdentity)
