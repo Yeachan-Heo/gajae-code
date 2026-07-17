@@ -99,6 +99,43 @@ export interface BashToolDetails {
 	};
 }
 
+/** Project only a bare executable name; commands and their output are never notification-safe. */
+export function summarizeBashToolActivity(kind: "args" | "result", value: unknown): string | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (kind === "args") {
+		const command = record.command;
+		if (typeof command !== "string") return undefined;
+		const program = command.trim().match(/^([A-Za-z][A-Za-z0-9_.+-]*)\b/)?.[1];
+		if (
+			!program ||
+			program.length > 80 ||
+			/(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|\b(?:sk|pk|rk)-)/i.test(program)
+		) {
+			return undefined;
+		}
+		return program;
+	}
+
+	const output =
+		typeof record.output === "string"
+			? record.output
+			: Array.isArray(record.content)
+				? record.content
+						.filter(
+							(block): block is { type: unknown; text: unknown } =>
+								typeof block === "object" && block !== null && "type" in block && "text" in block,
+						)
+						.filter(block => block.type === "text" && typeof block.text === "string")
+						.map(block => block.text as string)
+						.join("\n")
+				: undefined;
+	if (output === undefined) return undefined;
+	const exitCode = typeof record.exitCode === "number" ? `exit=${record.exitCode}` : "completed";
+	const lines = output.length === 0 ? 0 : output.split("\n").length;
+	return `${exitCode}, ${lines} lines, ${Buffer.byteLength(output, "utf-8")} bytes`;
+}
+
 export interface BashToolOptions {}
 
 type ManagedBashJobCompletion =
@@ -248,6 +285,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly parameters: BashToolSchema;
 	readonly concurrency = "exclusive";
 	readonly strict = true;
+	readonly safeSummary = summarizeBashToolActivity;
 	readonly #asyncEnabled: boolean;
 	readonly #autoBackgroundEnabled: boolean;
 	readonly #autoBackgroundThresholdMs: number;

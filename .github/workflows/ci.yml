@@ -241,6 +241,10 @@ jobs:
               TARGET_ARCH: x64
               TARGET_VARIANTS: baseline
            run: bun run ci:build:native
+         - name: Verify dedicated Windows native identity and managed session-directory contracts
+           if: needs.relevance.outputs.relevant == 'true'
+           shell: pwsh
+           run: bun test packages/natives/test/path-identity.test.ts packages/natives/test/path-identity-windows.test.ts packages/coding-agent/test/sdk-session-directory.test.ts packages/coding-agent/test/sdk-session-directory.windows.test.ts packages/coding-agent/test/session-storage.test.ts
          - name: Smoke bun + gjc CLI (source runtime)
            if: needs.relevance.outputs.relevant == 'true'
            shell: pwsh
@@ -319,6 +323,9 @@ jobs:
               merge-multiple: true
               run-id: ${{ steps.source.outputs.run-id }}
               github-token: ${{ secrets.GITHUB_TOKEN }}
+         - name: Verify dedicated POSIX native path identity contracts
+           if: needs.relevance.outputs.relevant == 'true'
+           run: bun test packages/natives/test/path-identity.test.ts packages/natives/test/path-identity-posix.test.ts
          - name: Test workspace (TS)
            if: needs.relevance.outputs.relevant == 'true'
            env:

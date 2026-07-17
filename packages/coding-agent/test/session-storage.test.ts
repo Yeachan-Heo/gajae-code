@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
+import { publishManagedFileNoReplace } from "../src/session/internal/managed-session-storage";
 import { SessionManager } from "../src/session/session-manager";
 import {
 	FileSessionStorage,
@@ -38,33 +41,30 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 		return sessionPath;
 	}
 
-	it("succeeds when the artifact directory is already absent", async () => {
-		const sessionPath = await createSessionFile("missing-artifacts");
-		const artifactsDir = sessionPath.slice(0, -6);
-
-		expect(fs.existsSync(sessionPath)).toBe(true);
-		expect(fs.existsSync(artifactsDir)).toBe(false);
-
-		await expect(storage.deleteSessionWithArtifacts(sessionPath)).resolves.toBeUndefined();
-		expect(fs.existsSync(sessionPath)).toBe(false);
-		expect(fs.existsSync(artifactsDir)).toBe(false);
-	});
-
-	it("throws when artifact cleanup fails after the session file is deleted", async () => {
-		const sessionPath = await createSessionFile("cleanup-failure");
+	it("deletes sessions and artifacts in an explicit operator-selected directory", async () => {
+		const sessionPath = await createSessionFile("direct-delete");
 		const artifactsDir = sessionPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "artifact payload");
 
-		const rmError = new Error("permission denied");
-		const rmSpy = vi.spyOn(fsp, "rm").mockRejectedValueOnce(rmError);
+		await storage.deleteSessionWithArtifacts(sessionPath);
 
-		await expect(storage.deleteSessionWithArtifacts(sessionPath)).rejects.toThrow(
-			`Session file deleted but failed to remove artifacts directory ${artifactsDir}: permission denied`,
-		);
-		expect(rmSpy).toHaveBeenCalledWith(artifactsDir, { recursive: true, force: true });
 		expect(fs.existsSync(sessionPath)).toBe(false);
-		expect(fs.existsSync(artifactsDir)).toBe(true);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+	});
+
+	describe("fenced managed publication", () => {
+		it("rejects an expired lease immediately before no-replace publication", async () => {
+			const destination = path.join(tempDir, "fenced-receipt.json");
+			let assertions = 0;
+			await expect(
+				publishManagedFileNoReplace(destination, new TextEncoder().encode("receipt"), () => {
+					assertions++;
+					if (assertions === 2) throw new Error("migration_busy");
+				}),
+			).rejects.toThrow("migration_busy");
+			expect(fs.existsSync(destination)).toBe(false);
+		});
 	});
 });
 
@@ -182,6 +182,45 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 	});
 });
 
+describe("FileSessionStorageWriter path security", () => {
+	let tempDir: string;
+	let storage: FileSessionStorage;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-writer-security-"));
+		storage = new FileSessionStorage();
+	});
+
+	afterEach(async () => {
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("applies owner-only security to every independently-created writer file", async () => {
+		const first = path.join(tempDir, "first.jsonl");
+		const second = path.join(tempDir, "second.jsonl");
+		const firstWriter = storage.openWriter(first, { flags: "w" });
+		const secondWriter = storage.openWriter(second, { flags: "w" });
+		firstWriter.writeLineSync("first\n");
+		secondWriter.writeLineSync("second\n");
+		await firstWriter.close();
+		await secondWriter.close();
+
+		if (process.platform !== "win32") {
+			expect(fs.statSync(first).mode & 0o777).toBe(0o600);
+			expect(fs.statSync(second).mode & 0o777).toBe(0o600);
+		}
+	});
+
+	it("rejects a symlinked or junctioned storage parent before opening the writer", async () => {
+		const target = path.join(tempDir, "target");
+		const alias = path.join(tempDir, "alias");
+		await fsp.mkdir(target);
+		await fsp.symlink(target, alias, process.platform === "win32" ? "junction" : "dir");
+		expect(() => storage.openWriter(path.join(alias, "session.jsonl"))).toThrow("Unsafe reparse storage path");
+		expect(fs.existsSync(path.join(target, "session.jsonl"))).toBe(false);
+	});
+});
+
 describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 	let tempDir: string;
 	let storage: FileSessionStorage;
@@ -189,6 +228,20 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 	beforeEach(async () => {
 		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-verified-delete-"));
 		storage = new FileSessionStorage();
+		const deleteSessionVerified = storage.deleteSessionVerified.bind(storage);
+		let plannedAttempt = 0;
+		storage.deleteSessionVerified = target => {
+			const attempt = ++plannedAttempt;
+			return deleteSessionVerified({
+				...target,
+				plannedArtifactsPath:
+					target.plannedArtifactsPath ??
+					path.join(path.dirname(target.transcriptPath), `.gjc-delete-test-artifacts-${attempt}`),
+				plannedTranscriptPath:
+					target.plannedTranscriptPath ??
+					path.join(path.dirname(target.transcriptPath), `.gjc-delete-test-transcript-${attempt}`),
+			});
+		};
 	});
 
 	afterEach(async () => {
@@ -205,26 +258,71 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		return transcriptPath;
 	}
 
+	function verifiedIdentity(transcriptPath: string) {
+		const snapshot = storage.readSnapshotSync(transcriptPath);
+		return {
+			dev: snapshot.stat.dev,
+			ino: snapshot.stat.ino,
+			size: snapshot.stat.size,
+			mtimeNs: snapshot.stat.mtimeNs,
+			sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+		};
+	}
+
 	it("removes the verified artifact directory first, then the transcript last", async () => {
 		const transcriptPath = await createTranscript("happy");
 		const artifactsDir = transcriptPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
 
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const target: VerifiedSessionDeleteTarget = {
 			sessionsRoot: tempDir,
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
+			plannedArtifactsPath: path.join(tempDir, ".gjc-delete-happy-artifacts"),
+			plannedTranscriptPath: path.join(tempDir, ".gjc-delete-happy-transcript"),
 		};
-
-		const result = await storage.deleteSessionVerified(target);
+		const artifacts = await storage.deleteSessionVerified(target);
+		expect(artifacts).toMatchObject({ kind: "artifacts_removed", phase: "artifacts" });
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect(fs.existsSync(transcriptPath)).toBe(true);
+		const result = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true });
 		expect(result).toEqual({ kind: "deleted" });
 		expect(fs.existsSync(artifactsDir)).toBe(false);
 		expect(fs.existsSync(transcriptPath)).toBe(false);
 	});
+
+	it.skipIf(process.platform !== "linux")(
+		"does not report artifacts removed before the session parent is durable",
+		async () => {
+			const transcriptPath = await createTranscript("artifact-parent-fsync");
+			const artifactsDir = transcriptPath.slice(0, -6);
+			await fsp.mkdir(artifactsDir, { recursive: true });
+			await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
+			const target: VerifiedSessionDeleteTarget = {
+				sessionsRoot: tempDir,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: tempDir,
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+			};
+			const expectedParent = fs.realpathSync(tempDir);
+			const fsync = fs.fsyncSync;
+			vi.spyOn(fs, "fsyncSync").mockImplementation(descriptor => {
+				if (fs.readlinkSync(`/proc/self/fd/${descriptor}`) === expectedParent) throw new Error("fsync failed");
+				return fsync(descriptor);
+			});
+
+			const error = await storage.deleteSessionVerified(target).catch(value => value);
+
+			expect(error).toBeInstanceOf(SessionDeleteVerificationError);
+			expect((error as SessionDeleteVerificationError).kind).toBe("artifacts");
+			expect(fs.existsSync(transcriptPath)).toBe(true);
+			expect(fs.existsSync(artifactsDir)).toBe(false);
+		},
+	);
 
 	it("artifact rm failure returns cleanup_pending and leaves the transcript intact for retry", async () => {
 		const transcriptPath = await createTranscript("partial");
@@ -232,7 +330,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
 
-		vi.spyOn(fsp, "rm").mockRejectedValueOnce(new Error("artifact rm denied"));
+		vi.spyOn(native, "exactRemoveDirectoryTree").mockReturnValueOnce({ ok: false, code: "io_error" });
 
 		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const target: VerifiedSessionDeleteTarget = {
@@ -240,17 +338,93 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
 		const result = await storage.deleteSessionVerified(target);
 		expect(result.kind).toBe("cleanup_pending");
-		if (result.kind !== "cleanup_pending") throw new Error("unreachable");
+		if (result.kind !== "cleanup_pending" || result.phase !== "artifacts") throw new Error("unreachable");
 		expect(result.phase).toBe("artifacts");
-		// Artifact-first: the transcript is untouched so fresh discovery/retry can proceed.
+		// Atomic detach keeps the transcript authoritative while quarantining artifacts for retry.
 		expect(fs.existsSync(transcriptPath)).toBe(true);
-		expect(fs.existsSync(artifactsDir)).toBe(true);
-		expect(result.transcriptIdentity).toEqual({ dev: stat.dev, ino: stat.ino });
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect(fs.existsSync(result.detachedArtifactsPath)).toBe(true);
+		expect(result.transcriptIdentity).toMatchObject({ dev: stat.dev, ino: stat.ino });
+	});
+
+	it("retains the persisted POSIX tree authority path when recursive removal fails", async () => {
+		if (process.platform === "win32") return;
+		const transcriptPath = await createTranscript("tree-root-retained");
+		const artifactsDir = transcriptPath.slice(0, -6);
+		const plannedArtifactsPath = path.join(tempDir, ".gjc-delete-tree-root-q1");
+		await fsp.mkdir(artifactsDir, { recursive: true });
+		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
+		let removalRoot: string | undefined;
+		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation(pathname => {
+			removalRoot = pathname;
+			return { ok: false, code: "io_error", detachedPath: pathname };
+		});
+		try {
+			const result = await storage.deleteSessionVerified({
+				sessionsRoot: tempDir,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: tempDir,
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+				plannedArtifactsPath,
+				plannedTranscriptPath: path.join(tempDir, ".gjc-delete-tree-root-transcript"),
+			});
+			if (result.kind !== "cleanup_pending" || result.phase !== "artifacts")
+				throw new Error("Expected pending tree cleanup");
+			expect(removalRoot).toBe(plannedArtifactsPath);
+			expect(result.detachedArtifactsPath).toBe(plannedArtifactsPath);
+			expect(await fsp.stat(artifactsDir).catch(() => undefined)).toBeUndefined();
+			expect(await fsp.stat(plannedArtifactsPath)).toBeDefined();
+		} finally {
+			remove.mockRestore();
+		}
+	});
+	it("retries a partial tree removal from its deterministic .removing authority", async () => {
+		const transcriptPath = await createTranscript("tree-removing-retry");
+		const artifactsDir = transcriptPath.slice(0, -6);
+		const plannedArtifactsPath = path.join(tempDir, ".gjc-delete-tree-root-q1");
+		const removalRoot = `${plannedArtifactsPath}.removing`;
+		await fsp.mkdir(artifactsDir, { recursive: true });
+		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
+		let restored = false;
+		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation(pathname => {
+			fs.renameSync(pathname, removalRoot);
+			return { ok: false, code: "io_error", detachedPath: removalRoot };
+		});
+
+		try {
+			const target: VerifiedSessionDeleteTarget = {
+				sessionsRoot: tempDir,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: tempDir,
+				transcriptIdentity: verifiedIdentity(transcriptPath),
+				plannedArtifactsPath,
+				plannedTranscriptPath: path.join(tempDir, ".gjc-delete-tree-root-transcript"),
+			};
+			const pending = await storage.deleteSessionVerified(target);
+			if (pending.kind !== "cleanup_pending" || pending.phase !== "artifacts")
+				throw new Error("Expected pending tree cleanup");
+			expect(pending.detachedArtifactsPath).toBe(removalRoot);
+			expect(await fsp.stat(removalRoot)).toBeDefined();
+			remove.mockRestore();
+			restored = true;
+
+			const retried = await storage.deleteSessionVerified({
+				...target,
+				expectedArtifactsIdentity: pending.artifactsIdentity,
+				expectedArtifactsTree: pending.artifactsTree,
+				detachedArtifactsPath: removalRoot,
+			});
+			expect(retried.kind).toBe("artifacts_removed");
+		} finally {
+			if (!restored) remove.mockRestore();
+		}
 	});
 
 	it("identity mismatch throws without mutating transcript or artifacts", async () => {
@@ -263,10 +437,37 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: 1n, ino: 2n },
+			transcriptIdentity: { dev: 1n, ino: 2n, size: 0, mtimeNs: 0n, sha256: "0".repeat(64) },
 		};
 
 		await expect(storage.deleteSessionVerified(target)).rejects.toBeInstanceOf(SessionDeleteVerificationError);
+		expect(fs.existsSync(transcriptPath)).toBe(true);
+		expect(fs.existsSync(artifactsDir)).toBe(true);
+	});
+
+	it("rejects a transcript whose authorization hash differs before artifact mutation", async () => {
+		const transcriptPath = await createTranscript("authorization-hash");
+		const artifactsDir = transcriptPath.slice(0, -6);
+		await fsp.mkdir(artifactsDir, { recursive: true });
+		const snapshot = storage.readSnapshotSync(transcriptPath);
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot: tempDir,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: tempDir,
+				transcriptIdentity: {
+					dev: snapshot.stat.dev,
+					ino: snapshot.stat.ino,
+					size: snapshot.stat.size,
+					mtimeNs: snapshot.stat.mtimeNs,
+					sha256: "0".repeat(64),
+				},
+			})
+			.catch(error => error);
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("identity");
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 		expect(fs.existsSync(artifactsDir)).toBe(true);
 	});
@@ -286,11 +487,11 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
 		// First attempt: artifact removal fails (the once-mock affects only this call).
-		const rmSpy = vi.spyOn(fsp, "rm").mockRejectedValueOnce(new Error("artifact rm denied"));
+		const rmSpy = vi.spyOn(native, "exactRemoveDirectoryTree").mockReturnValueOnce({ ok: false, code: "io_error" });
 
 		const partial = await storage.deleteSessionVerified(target);
 		// No false success: this is a typed partial cleanup, never "deleted".
@@ -298,25 +499,36 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		if (partial.kind !== "cleanup_pending") throw new Error("unreachable");
 		expect(partial.phase).toBe("artifacts");
 		expect(partial.error).toBeInstanceOf(Error);
-		expect(partial.error.message).toBe("artifact rm denied");
-		// Exact retry evidence: transcript identity unchanged, artifact identity recorded.
-		expect(partial.transcriptIdentity).toEqual({ dev: stat.dev, ino: stat.ino });
-		const recordedArtifactsIdentity = (
-			partial as Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending"; phase: "artifacts" }>
-		).artifactsIdentity;
+		expect(partial.error.message).toBe("Exact detached artifact removal rejected: io_error");
+		// Exact retry evidence includes the full transcript snapshot and detached artifact path.
+		expect(partial.transcriptIdentity).toMatchObject({ dev: stat.dev, ino: stat.ino });
+		const artifactCleanup = partial as Extract<
+			VerifiedSessionDeleteResult,
+			{ kind: "cleanup_pending"; phase: "artifacts" }
+		>;
+		const recordedArtifactsIdentity = artifactCleanup.artifactsIdentity;
 		expect(recordedArtifactsIdentity).toBeDefined();
-		// No data loss: transcript and artifacts still on disk.
 		expect(fs.existsSync(transcriptPath)).toBe(true);
-		expect(fs.existsSync(artifactsDir)).toBe(true);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect(fs.existsSync(artifactCleanup.detachedArtifactsPath)).toBe(true);
 
 		// Restore the rm spy so the real cleanup runs on retry.
 		rmSpy.mockRestore();
 
 		// Retry bound to the recorded artifact identity: same directory matches and the
 		// verified hard delete completes.
-		const retried = await storage.deleteSessionVerified({
+		const retriedArtifacts = await storage.deleteSessionVerified({
 			...target,
 			expectedArtifactsIdentity: recordedArtifactsIdentity,
+			expectedArtifactsTree: artifactCleanup.artifactsTree,
+			detachedArtifactsPath: artifactCleanup.detachedArtifactsPath,
+		});
+		expect(retriedArtifacts.kind).toBe("artifacts_removed");
+		const retried = await storage.deleteSessionVerified({
+			...target,
+			expectedArtifactsIdentity: undefined,
+			detachedArtifactsPath: undefined,
+			artifactsRemoved: true,
 		});
 		expect(retried).toEqual({ kind: "deleted" });
 		expect(fs.existsSync(transcriptPath)).toBe(false);
@@ -335,21 +547,51 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
-		// Inject a non-ENOENT unlink failure (EACCES, not the ENOENT that maps to deleted).
-		const unlinkErr = Object.assign(new Error("transcript unlink denied"), { code: "EACCES" });
-		vi.spyOn(storage, "unlink").mockRejectedValueOnce(unlinkErr);
+		const exactUnlink = native.exactUnlink;
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) =>
+			identity.directory ? exactUnlink(pathname, identity) : { ok: false, code: "io_error" },
+		);
 
-		const result = await storage.deleteSessionVerified(target);
+		const artifactsRemoved = await storage.deleteSessionVerified(target);
+		expect(artifactsRemoved.kind).toBe("artifacts_removed");
+		const result = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true });
 		expect(result.kind).toBe("cleanup_pending");
 		if (result.kind !== "cleanup_pending") throw new Error("unreachable");
 		expect(result.phase).toBe("transcript");
 		expect(result.error).toBeInstanceOf(Error);
-		expect(result.transcriptIdentity).toEqual({ dev: stat.dev, ino: stat.ino });
+		expect(result.transcriptIdentity).toMatchObject({ dev: stat.dev, ino: stat.ino });
 		// Artifacts were removed first (intended); the transcript survives (no data loss).
 		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect(fs.existsSync(transcriptPath)).toBe(true);
+	});
+
+	it("returns the native detached transcript path after a post-detach failure", async () => {
+		const transcriptPath = await createTranscript("detached-transcript-evidence");
+		const plannedTranscriptPath = path.join(tempDir, ".gjc-delete-transcript-planned");
+		const expectedIdentity = verifiedIdentity(transcriptPath);
+		const exactUnlink = native.exactUnlink;
+		let nativeTranscriptSha256: string | undefined;
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (identity.directory) return exactUnlink(pathname, identity);
+			nativeTranscriptSha256 = (identity as { sha256?: string }).sha256;
+			return { ok: false, code: "io_error", detachedPath: plannedTranscriptPath };
+		});
+		const target: VerifiedSessionDeleteTarget = {
+			sessionsRoot: tempDir,
+			transcriptPath,
+			sessionId: "session-id",
+			cwd: tempDir,
+			transcriptIdentity: expectedIdentity,
+			plannedTranscriptPath,
+		};
+		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
+		const result = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true });
+		if (result.kind !== "cleanup_pending" || result.phase !== "transcript") throw new Error("unreachable");
+		expect(result.detachedTranscriptPath).toBe(plannedTranscriptPath);
+		expect(nativeTranscriptSha256).toBe(expectedIdentity.sha256);
 		expect(fs.existsSync(transcriptPath)).toBe(true);
 	});
 
@@ -362,13 +604,12 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		await Bun.write(path.join(realArtifactsDir, "artifact.txt"), "payload");
 		await fsp.symlink(realArtifactsDir, artifactsDir);
 
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const target: VerifiedSessionDeleteTarget = {
 			sessionsRoot: tempDir,
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
 		const err = await storage.deleteSessionVerified(target).catch(e => e);
@@ -394,7 +635,7 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			cwd: tempDir,
 			// Identity is irrelevant: the symlink is rejected at the initial read, before
 			// the identity comparison runs. Dummy values keep the contract shape explicit.
-			transcriptIdentity: { dev: 0n, ino: 0n },
+			transcriptIdentity: { dev: 0n, ino: 0n, size: 0, mtimeNs: 0n, sha256: "0".repeat(64) },
 		};
 
 		const err = await storage.deleteSessionVerified(target).catch(e => e);
@@ -402,6 +643,66 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		expect((err as SessionDeleteVerificationError).kind).toBe("symlink");
 		// No mutation: the symlink and its target are intact.
 		expect(fs.lstatSync(transcriptPath).isSymbolicLink()).toBe(true);
+		expect(fs.existsSync(realTranscript)).toBe(true);
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"rejects a hardlink replacement whose identity was not authorized",
+		async () => {
+			const transcriptPath = await createTranscript("hardlink-authorized");
+			const foreignTranscript = path.join(tempDir, "hardlink-foreign.jsonl");
+			await Bun.write(
+				foreignTranscript,
+				`${JSON.stringify({ type: "session", version: 3, id: "session-id", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+			);
+			const authorized = storage.readSnapshotSync(transcriptPath).stat;
+			await fsp.unlink(transcriptPath);
+			await fsp.link(foreignTranscript, transcriptPath);
+
+			const err = await storage
+				.deleteSessionVerified({
+					sessionsRoot: tempDir,
+					transcriptPath,
+					sessionId: "session-id",
+					cwd: tempDir,
+					transcriptIdentity: {
+						dev: authorized.dev,
+						ino: authorized.ino,
+						size: authorized.size,
+						mtimeNs: authorized.mtimeNs,
+						sha256: createHash("sha256").update(storage.readSnapshotSync(transcriptPath).bytes).digest("hex"),
+					},
+				})
+				.catch(error => error);
+			expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+			expect((err as SessionDeleteVerificationError).kind).toBe("identity");
+			expect(fs.existsSync(transcriptPath)).toBe(true);
+			expect(fs.existsSync(foreignTranscript)).toBe(true);
+		},
+	);
+
+	it("rejects a symlinked sessions-root component before verified deletion", async () => {
+		if (process.platform === "win32") return;
+		const realRoot = path.join(tempDir, "real-sessions");
+		const aliasRoot = path.join(tempDir, "sessions-alias");
+		await fsp.mkdir(realRoot);
+		const realTranscript = path.join(realRoot, "aliased.jsonl");
+		await Bun.write(
+			realTranscript,
+			`${JSON.stringify({ type: "session", version: 3, id: "session-id", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+		await fsp.symlink(realRoot, aliasRoot);
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot: aliasRoot,
+				transcriptPath: path.join(aliasRoot, "aliased.jsonl"),
+				sessionId: "session-id",
+				cwd: tempDir,
+				transcriptIdentity: verifiedIdentity(realTranscript),
+			})
+			.catch(error => error);
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("symlink");
 		expect(fs.existsSync(realTranscript)).toBe(true);
 	});
 
@@ -418,7 +719,13 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: realSnapshot.stat.dev, ino: realSnapshot.stat.ino },
+			transcriptIdentity: {
+				dev: realSnapshot.stat.dev,
+				ino: realSnapshot.stat.ino,
+				size: realSnapshot.stat.size,
+				mtimeNs: realSnapshot.stat.mtimeNs,
+				sha256: createHash("sha256").update(realSnapshot.bytes).digest("hex"),
+			},
 		};
 
 		// On the post-artifact revalidation read (2nd call) return a replaced (dev, ino):
@@ -435,10 +742,11 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 			return realSnapshot;
 		});
 
-		const err = await storage.deleteSessionVerified(target).catch(e => e);
+		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
+		const err = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true }).catch(e => e);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
 		expect((err as SessionDeleteVerificationError).kind).toBe("identity");
-		expect((err as Error).message).toContain("replacement detected");
+		expect((err as Error).message).toContain("identity does not match authorization");
 		// Artifacts were removed (intended); the transcript was never unlinked (no data loss).
 		expect(fs.existsSync(artifactsDir)).toBe(false);
 		expect(fs.existsSync(transcriptPath)).toBe(true);
@@ -450,33 +758,23 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "payload");
 
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
-
 		// First attempt: artifact rm fails and records the real artifact identity.
-		const rmSpy = vi.spyOn(fsp, "rm").mockRejectedValueOnce(new Error("artifact rm denied"));
+		const rmSpy = vi.spyOn(native, "exactRemoveDirectoryTree").mockReturnValueOnce({ ok: false, code: "io_error" });
 		const partial = await storage.deleteSessionVerified({
 			sessionsRoot: tempDir,
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		});
 		if (partial.kind !== "cleanup_pending" || partial.phase !== "artifacts") throw new Error("unreachable");
-		const recordedArtifactsIdentity = (
-			partial as Extract<VerifiedSessionDeleteResult, { kind: "cleanup_pending"; phase: "artifacts" }>
-		).artifactsIdentity;
+		const recordedArtifactsIdentity = partial.artifactsIdentity;
 		expect(recordedArtifactsIdentity).toBeDefined();
+		expect(fs.existsSync(partial.detachedArtifactsPath)).toBe(true);
 		rmSpy.mockRestore();
 
-		// Replace the artifact directory with a fresh one whose inode is guaranteed to
-		// differ from the recorded one. Rename the original directory to a retained
-		// sibling so its inode stays allocated — Linux may otherwise reuse the same
-		// inode when the path is removed and immediately recreated, collapsing the
-		// expected identity mismatch — then create a new directory at the original
-		// path and write the replacement payload. The retained sibling lives under
-		// tempDir, so the existing afterEach cleanup removes it.
-		const retainedOriginal = path.join(tempDir, "replaced-retry-original");
-		await fsp.rename(artifactsDir, retainedOriginal);
+		// Install a replacement at the original artifact pathname while the authorized
+		// directory remains quarantined under the detached cleanup path.
 		await fsp.mkdir(artifactsDir, { recursive: true });
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "replacement payload");
 
@@ -488,8 +786,9 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 				transcriptPath,
 				sessionId: "session-id",
 				cwd: tempDir,
-				transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+				transcriptIdentity: verifiedIdentity(transcriptPath),
 				expectedArtifactsIdentity: recordedArtifactsIdentity,
+				detachedArtifactsPath: partial.detachedArtifactsPath,
 			})
 			.catch(e => e);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
@@ -504,13 +803,12 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		// Create a REGULAR FILE at the artifact path (not a directory, not a symlink).
 		await Bun.write(artifactsDir, "foreign artifact sibling");
 
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const target: VerifiedSessionDeleteTarget = {
 			sessionsRoot: tempDir,
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
 		const err = await storage.deleteSessionVerified(target).catch(e => e);
@@ -526,13 +824,12 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		// Header with a non-session type — must not be accepted as a deletable transcript.
 		await Bun.write(transcriptPath, `${JSON.stringify({ type: "artifact", id: "session-id", cwd: tempDir })}\n`);
 
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const target: VerifiedSessionDeleteTarget = {
 			sessionsRoot: tempDir,
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
 		const err = await storage.deleteSessionVerified(target).catch(e => e);
@@ -546,13 +843,12 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		const outsideRoot = path.join(tempDir, "outside");
 		await fsp.mkdir(outsideRoot, { recursive: true });
 
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const target: VerifiedSessionDeleteTarget = {
 			sessionsRoot: outsideRoot, // root that does NOT contain the transcript
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: tempDir,
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
 		const err = await storage.deleteSessionVerified(target).catch(e => e);
@@ -564,19 +860,108 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 	it("a header cwd mismatch is rejected as a cwd failure before mutation", async () => {
 		const transcriptPath = await createTranscript("cwd-mismatch");
 
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const target: VerifiedSessionDeleteTarget = {
 			sessionsRoot: tempDir,
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: "/totally/different/cwd",
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		};
 
 		const err = await storage.deleteSessionVerified(target).catch(e => e);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
 		expect((err as SessionDeleteVerificationError).kind).toBe("cwd");
 		expect(fs.existsSync(transcriptPath)).toBe(true);
+	});
+	it("rejects an in-place transcript append after authorization without unlinking the changed transcript", async () => {
+		const transcriptPath = await createTranscript("append-after-authorization");
+		const artifactsDir = transcriptPath.slice(0, -6);
+		await fsp.mkdir(artifactsDir, { recursive: true });
+		const authorizedIdentity = verifiedIdentity(transcriptPath);
+		const readSnapshot = storage.readSnapshotSync.bind(storage);
+		let reads = 0;
+		vi.spyOn(storage, "readSnapshotSync").mockImplementation(pathname => {
+			reads++;
+			if (reads === 2) fs.appendFileSync(pathname, `${JSON.stringify({ type: "message", detail: "raced" })}\n`);
+			return readSnapshot(pathname);
+		});
+
+		const target: VerifiedSessionDeleteTarget = {
+			sessionsRoot: tempDir,
+			transcriptPath,
+			sessionId: "session-id",
+			cwd: tempDir,
+			transcriptIdentity: authorizedIdentity,
+		};
+		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
+		const err = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true }).catch(error => error);
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("identity");
+		expect(await fsp.readFile(transcriptPath, "utf8")).toContain('"raced"');
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+	});
+
+	it("does not unlink a final-name replacement introduced at the exact-unlink boundary", async () => {
+		const transcriptPath = await createTranscript("exact-final-name-replacement");
+		const authorizedIdentity = verifiedIdentity(transcriptPath);
+		const replacement = path.join(tempDir, "exact-final-name-replacement-foreign.jsonl");
+		await Bun.write(
+			replacement,
+			`${JSON.stringify({ type: "session", version: 3, id: "session-id", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir, foreign: true })}\n`,
+		);
+		const exactUnlink = native.exactUnlink;
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			fs.renameSync(pathname, `${pathname}.authorized`);
+			fs.renameSync(replacement, pathname);
+			return exactUnlink(pathname, identity);
+		});
+
+		const target: VerifiedSessionDeleteTarget = {
+			sessionsRoot: tempDir,
+			transcriptPath,
+			sessionId: "session-id",
+			cwd: tempDir,
+			transcriptIdentity: authorizedIdentity,
+		};
+		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
+		const err = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true }).catch(error => error);
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("identity");
+		expect(await fsp.readFile(transcriptPath, "utf8")).toContain('"foreign":true');
+		expect(fs.existsSync(`${transcriptPath}.authorized`)).toBe(true);
+	});
+
+	it("fails closed when the artifact directory is replaced between authorization and removal", async () => {
+		const transcriptPath = await createTranscript("artifact-final-name-replacement");
+		const artifactsDir = transcriptPath.slice(0, -6);
+		const retained = `${artifactsDir}.authorized`;
+		await fsp.mkdir(artifactsDir, { recursive: true });
+		await Bun.write(path.join(artifactsDir, "authorized.txt"), "authorized");
+		const authorizedIdentity = verifiedIdentity(transcriptPath);
+		const exactUnlink = native.exactUnlink;
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (pathname === artifactsDir && identity.directory) {
+				fs.renameSync(artifactsDir, retained);
+				fs.mkdirSync(artifactsDir);
+				fs.writeFileSync(path.join(artifactsDir, "replacement.txt"), "foreign");
+			}
+			return exactUnlink(pathname, identity);
+		});
+
+		const err = await storage
+			.deleteSessionVerified({
+				sessionsRoot: tempDir,
+				transcriptPath,
+				sessionId: "session-id",
+				cwd: tempDir,
+				transcriptIdentity: authorizedIdentity,
+			})
+			.catch(error => error);
+		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
+		expect((err as SessionDeleteVerificationError).kind).toBe("artifacts");
+		expect(fs.existsSync(transcriptPath)).toBe(true);
+		expect(await fsp.readFile(path.join(artifactsDir, "replacement.txt"), "utf8")).toBe("foreign");
+		expect(await fsp.readFile(path.join(retained, "authorized.txt"), "utf8")).toBe("authorized");
 	});
 });
 
@@ -595,16 +980,26 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 		storage.writeTextSync(transcriptPath, `${JSON.stringify(header)}\n`);
 	}
 
+	function verifiedIdentity(transcriptPath: string) {
+		const snapshot = storage.readSnapshotSync(transcriptPath);
+		return {
+			dev: snapshot.stat.dev,
+			ino: snapshot.stat.ino,
+			size: snapshot.stat.size,
+			mtimeNs: snapshot.stat.mtimeNs,
+			sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+		};
+	}
+
 	it("deletes a verified matching transcript", async () => {
 		const transcriptPath = path.join(sessionsRoot, "s.jsonl");
 		seedTranscript(transcriptPath);
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const result = await storage.deleteSessionVerified({
 			sessionsRoot,
 			transcriptPath,
 			sessionId: "session-id",
 			cwd: "/cwd",
-			transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+			transcriptIdentity: verifiedIdentity(transcriptPath),
 		});
 		expect(result).toEqual({ kind: "deleted" });
 		expect(storage.existsSync(transcriptPath)).toBe(false);
@@ -613,14 +1008,13 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	it("rejects a transcript outside the sessions root (containment parity)", async () => {
 		const transcriptPath = "/elsewhere/s.jsonl";
 		seedTranscript(transcriptPath);
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const err = await storage
 			.deleteSessionVerified({
 				sessionsRoot,
 				transcriptPath,
 				sessionId: "session-id",
 				cwd: "/cwd",
-				transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+				transcriptIdentity: verifiedIdentity(transcriptPath),
 			})
 			.catch(e => e);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
@@ -631,14 +1025,13 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	it("requires header type:'session' (header parity)", async () => {
 		const transcriptPath = path.join(sessionsRoot, "artifact.jsonl");
 		seedTranscript(transcriptPath, { type: "artifact", id: "session-id", cwd: "/cwd" });
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const err = await storage
 			.deleteSessionVerified({
 				sessionsRoot,
 				transcriptPath,
 				sessionId: "session-id",
 				cwd: "/cwd",
-				transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+				transcriptIdentity: verifiedIdentity(transcriptPath),
 			})
 			.catch(e => e);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
@@ -649,14 +1042,13 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	it("rejects an exact id/cwd mismatch without mutation", async () => {
 		const transcriptPath = path.join(sessionsRoot, "id.jsonl");
 		seedTranscript(transcriptPath, { type: "session", id: "real-id", cwd: "/cwd" });
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const err = await storage
 			.deleteSessionVerified({
 				sessionsRoot,
 				transcriptPath,
 				sessionId: "wrong-id",
 				cwd: "/cwd",
-				transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+				transcriptIdentity: verifiedIdentity(transcriptPath),
 			})
 			.catch(e => e);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
@@ -667,14 +1059,13 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 	it("rejects a header cwd mismatch without mutation (cwd parity)", async () => {
 		const transcriptPath = path.join(sessionsRoot, "cwd.jsonl");
 		seedTranscript(transcriptPath, { type: "session", id: "session-id", cwd: "/cwd" });
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const err = await storage
 			.deleteSessionVerified({
 				sessionsRoot,
 				transcriptPath,
 				sessionId: "session-id",
 				cwd: "/totally/different/cwd",
-				transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+				transcriptIdentity: verifiedIdentity(transcriptPath),
 			})
 			.catch(e => e);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);
@@ -688,14 +1079,13 @@ describe("MemorySessionStorage.deleteSessionVerified parity", () => {
 		seedTranscript(transcriptPath);
 		// A file key at the artifact path is a non-directory sibling in memory.
 		storage.writeTextSync(artifactsPath, "foreign");
-		const stat = storage.readSnapshotSync(transcriptPath).stat;
 		const err = await storage
 			.deleteSessionVerified({
 				sessionsRoot,
 				transcriptPath,
 				sessionId: "session-id",
 				cwd: "/cwd",
-				transcriptIdentity: { dev: stat.dev, ino: stat.ino },
+				transcriptIdentity: verifiedIdentity(transcriptPath),
 			})
 			.catch(e => e);
 		expect(err).toBeInstanceOf(SessionDeleteVerificationError);

@@ -23,6 +23,20 @@ import type { LedgerEntry, OrchestratorDeps } from "@gajae-code/coding-agent/sdk
 import { startDaemonLifecycleControl } from "@gajae-code/coding-agent/sdk/bus/telegram-daemon";
 import { Settings } from "../src/config/settings";
 import { acquireDaemonOwnership, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import {
+	prepareManagedSessionScopeForWriteSync,
+	resolveManagedScope,
+} from "../src/session/internal/managed-session-scope";
+
+function writeManagedSession(sessionsRoot: string, cwd: string, sessionId: string): void {
+	const resolved = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+	if (resolved.kind !== "resolved") throw new Error(resolved.message);
+	const prepared = prepareManagedSessionScopeForWriteSync(resolved.scope);
+	if (prepared.kind !== "resolved") throw new Error(prepared.message);
+	const file = path.join(prepared.scope.directoryPath, `${sessionId}.jsonl`);
+	fs.writeFileSync(file, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`, { mode: 0o600 });
+	fs.chmodSync(file, 0o600);
+}
 
 const PAIRED = "42";
 
@@ -1086,17 +1100,24 @@ describe("lifecycle control runtime", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-"));
 		const proj = path.join(root, "proj");
 		fs.mkdirSync(proj, { recursive: true });
-		// Two saved histories sharing the prefix "abc".
-		fs.writeFileSync(path.join(proj, "abc111.jsonl"), `${JSON.stringify({ type: "session" })}\n`);
-		fs.writeFileSync(path.join(proj, "abc222.jsonl"), `${JSON.stringify({ type: "session" })}\n`);
+		await writeManagedSession(root, proj, "abc111");
+		await writeManagedSession(root, proj, "abc222");
+		fs.writeFileSync(
+			path.join(root, "raw-legacy.jsonl"),
+			`${JSON.stringify({ type: "session", id: "abc333", cwd: proj })}\n`,
+			{ mode: 0o600 },
+		);
 
 		// No live tmux match for these unique ids, so resolution falls to history.
 		const resume = daemonResumeSession(process.env, { sessionsRoot: root });
 
-		const missing = await resume({ sessionIdOrPrefix: "zzz-no-such" });
+		const missing = await resume({ sessionIdOrPrefix: "zzz-no-such", path: proj });
 		expect(missing).toEqual({ notFound: true });
 
-		const ambiguous = await resume({ sessionIdOrPrefix: "abc" });
+		const rawDirectoryCandidate = await resume({ sessionIdOrPrefix: "abc333", path: proj });
+		expect(rawDirectoryCandidate).toEqual({ notFound: true });
+
+		const ambiguous = await resume({ sessionIdOrPrefix: "abc", path: proj });
 		expect("ambiguous" in ambiguous).toBe(true);
 		if ("ambiguous" in ambiguous) {
 			expect(ambiguous.ambiguous.map(c => c.sessionId).sort()).toEqual(["abc111", "abc222"]);
@@ -1108,13 +1129,11 @@ describe("lifecycle control runtime", () => {
 	it("daemonResumeSession cold-restarts saved sessions from their recorded cwd", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-cwd-"));
 		const proj = path.join(root, "saved-project");
-		const sessionsDir = path.join(root, "encoded-project");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const serverState = path.join(root, "tmux-server-started");
 		const tmux = path.join(root, "fake-tmux.sh");
 		fs.mkdirSync(proj, { recursive: true });
-		fs.mkdirSync(sessionsDir, { recursive: true });
-		fs.writeFileSync(path.join(sessionsDir, "abc123.jsonl"), `${JSON.stringify({ id: "abc123", cwd: proj })}\n`);
+		await writeManagedSession(root, proj, "abc123");
 		fs.writeFileSync(
 			tmux,
 			[
@@ -1467,15 +1486,10 @@ describe("lifecycle control runtime", () => {
 	it("refuses unsafe or unverifiable servers before daemon create or cold-resume can mutate tmux", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pre-mutation-refusal-"));
 		const project = path.join(root, "project");
-		const sessions = path.join(root, "sessions");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
 		fs.mkdirSync(project, { recursive: true });
-		fs.mkdirSync(sessions, { recursive: true });
-		fs.writeFileSync(
-			path.join(sessions, "resume-123.jsonl"),
-			`${JSON.stringify({ id: "resume-123", cwd: project })}\n`,
-		);
+		await writeManagedSession(root, project, "resume-123");
 		fs.writeFileSync(tmux, ["#!/usr/bin/env bash", 'printf "%s\\n" "$*" >> "$TMUX_CALLS"', "exit 0", ""].join("\n"));
 		fs.chmodSync(tmux, 0o755);
 		try {
@@ -1508,7 +1522,7 @@ describe("lifecycle control runtime", () => {
 					daemonResumeSession(
 						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
 						{ sessionsRoot: root, listSessions: () => [], ownerIsolationProbe: probe },
-					)({ sessionIdOrPrefix: "resume-123" }),
+					)({ sessionIdOrPrefix: "resume-123", path: project }),
 				).rejects.toThrow(`gjc_lifecycle_owner_server_${state}`);
 			}
 			expect(fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8") : "").toBe("");
@@ -1577,15 +1591,10 @@ describe("lifecycle control runtime", () => {
 	it("writes no cold-resume ownership tags when a replacement server reuses the native session before metadata", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cold-resume-metadata-"));
 		const project = path.join(root, "project");
-		const history = path.join(root, "history");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
 		fs.mkdirSync(project, { recursive: true });
-		fs.mkdirSync(history, { recursive: true });
-		fs.writeFileSync(
-			path.join(history, "resume-replacement.jsonl"),
-			`${JSON.stringify({ id: "resume-replacement", cwd: project })}\n`,
-		);
+		await writeManagedSession(root, project, "resume-replacement");
 		fs.writeFileSync(
 			tmux,
 			[
@@ -1622,7 +1631,7 @@ describe("lifecycle control runtime", () => {
 							},
 						},
 					},
-				)({ sessionIdOrPrefix: "resume-replacement" }),
+				)({ sessionIdOrPrefix: "resume-replacement", path: project }),
 			).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
 			const calls = fs.readFileSync(callsFile, "utf8").trim().split("\n");
 			const guarded = calls.filter(call => call.startsWith("-L default if-shell "));
@@ -1640,15 +1649,10 @@ describe("lifecycle control runtime", () => {
 	it("refuses psmux before create or cold-resume can mutate lifecycle state", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-psmux-"));
 		const project = path.join(root, "project");
-		const sessions = path.join(root, "sessions");
 		const psmux = path.join(root, "psmux");
 		const plain = path.join(root, "plain");
 		fs.mkdirSync(project, { recursive: true });
-		fs.mkdirSync(sessions, { recursive: true });
-		fs.writeFileSync(
-			path.join(sessions, "resume-123.jsonl"),
-			`${JSON.stringify({ id: "resume-123", cwd: project })}\n`,
-		);
+		await writeManagedSession(root, project, "resume-123");
 		fs.writeFileSync(psmux, "#!/usr/bin/env bash\nexit 99\n");
 		fs.chmodSync(psmux, 0o755);
 		const env = { ...process.env, GJC_TMUX_COMMAND: psmux, GJC_PSMUX_COMMAND: psmux };
@@ -1669,6 +1673,7 @@ describe("lifecycle control runtime", () => {
 					},
 				})({
 					sessionIdOrPrefix: "resume-123",
+					path: project,
 				}),
 			).rejects.toThrow("gjc_lifecycle_psmux_unsupported");
 			expect(listSessionsCalled).toBe(false);

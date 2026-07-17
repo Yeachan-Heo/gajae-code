@@ -326,7 +326,7 @@ describe("openai-responses encodeResponse", () => {
 });
 
 describe("openai-responses encodeStream", () => {
-	it("emits response.created, reasoning_summary_text.delta, output_text.delta, function_call_arguments.delta, response.completed, [DONE]", async () => {
+	it("emits response.created, suppresses raw reasoning deltas, and emits text/tool/completion frames", async () => {
 		const stream = new AssistantMessageEventStream();
 
 		const partial: AssistantMessage = {
@@ -414,8 +414,8 @@ describe("openai-responses encodeStream", () => {
 
 		// Spot-check critical events appear in the expected order.
 		const idxCreated = names.indexOf("response.created");
-		const idxReasoningDelta = names.indexOf("response.reasoning_summary_text.delta");
-		const idxReasoningDone = names.indexOf("response.reasoning_summary_text.done");
+		const idxReasoningDelta = names.indexOf("response.reasoning_text.delta");
+		const idxReasoningDone = names.indexOf("response.output_item.done");
 		const idxTextDelta = names.indexOf("response.output_text.delta");
 		const idxTextDone = names.indexOf("response.output_text.done");
 		const idxArgsDelta = names.indexOf("response.function_call_arguments.delta");
@@ -429,19 +429,16 @@ describe("openai-responses encodeStream", () => {
 		const idxCompleted = names.indexOf("response.completed");
 
 		expect(idxCreated).toBeGreaterThanOrEqual(0);
-		expect(idxReasoningDelta).toBeGreaterThan(idxCreated);
-		expect(idxReasoningDone).toBeGreaterThan(idxReasoningDelta);
+		expect(idxReasoningDelta).toBe(-1);
+		expect(idxReasoningDone).toBeGreaterThan(idxCreated);
 		expect(idxTextDelta).toBeGreaterThan(idxReasoningDone);
 		expect(idxTextDone).toBeGreaterThan(idxTextDelta);
 		expect(idxArgsDelta).toBeGreaterThan(idxTextDone);
 		expect(idxArgsDone).toBeGreaterThan(idxArgsDelta);
 		expect(idxCompleted).toBeGreaterThan(idxArgsDone);
 
-		// reasoning_summary_text.delta must carry item_id matching the signature, and output_index 0.
-		const reasoningDelta = frames[idxReasoningDelta]!.data as Record<string, unknown>;
-		expect(reasoningDelta.item_id).toBe("rs_s1");
-		expect(reasoningDelta.output_index).toBe(0);
-		expect(reasoningDelta.delta).toBe("step ");
+		// Raw reasoning deltas are private and must not enter the public gateway stream.
+		expect(raw).not.toContain("step 1");
 
 		// output_text.delta's item_id is a new msg_*, output_index moved on past the reasoning item.
 		const textDelta = frames[idxTextDelta]!.data as Record<string, unknown>;

@@ -177,7 +177,7 @@ function ownerBrowserPolicy(snapshot: TabGcSnapshot): BrowserGcPolicy | null {
 /** Coarse, ordering-only eligibility; the live recheck in releaseTabIfGcEligible is authoritative. */
 function isCoarselyEligible(snapshot: TabGcSnapshot): boolean {
 	return (
-		snapshot.state === "alive" &&
+		(snapshot.state === "alive" || snapshot.state === "dead") &&
 		snapshot.pendingCount === 0 &&
 		(snapshot.kindTag === "headless" || snapshot.kindTag === "spawned")
 	);
@@ -230,7 +230,7 @@ function evaluateRssPressureWarning(d: ResourceGcDeps): void {
 		return;
 	}
 	const reclaimableRemains = collectIdleCandidates(d).some(
-		c => c.snapshot.ownerId !== undefined && pressured.has(c.snapshot.ownerId),
+		c => c.snapshot.state === "alive" && c.snapshot.ownerId !== undefined && pressured.has(c.snapshot.ownerId),
 	);
 	if (reclaimableRemains) {
 		rssWarningActive = false;

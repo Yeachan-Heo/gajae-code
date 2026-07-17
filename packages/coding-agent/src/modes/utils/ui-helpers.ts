@@ -20,11 +20,13 @@ import { SkillMessageComponent } from "../../modes/components/skill-message";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { UserMessageComponent } from "../../modes/components/user-message";
 import { theme } from "../../modes/theme/theme";
-import type {
-	CompactionQueuedMessage,
-	InteractiveModeContext,
-	IrcArrivalSnapshot,
-	TranscriptRebuildPolicy,
+import {
+	type CompactionQueuedMessage,
+	type ComposerSubmissionOptions,
+	canApplyComposerSubmission,
+	type InteractiveModeContext,
+	type IrcArrivalSnapshot,
+	type TranscriptRebuildPolicy,
 } from "../../modes/types";
 import {
 	type CustomMessage,
@@ -916,14 +918,16 @@ export class UiHelpers {
 		}
 	}
 
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void {
 		const entry: CompactionQueuedMessage = { text, mode };
 		if (mode === "followUp") {
 			entry.followUpQueuePolicy = "sequential";
 		}
 		this.ctx.compactionQueuedMessages.push(entry);
-		this.ctx.editor.addToHistory(text);
-		this.ctx.editor.setText("");
+		if (canApplyComposerSubmission(options, this.ctx.editor)) {
+			this.ctx.editor.addToHistory(text);
+			this.ctx.editor.setText("");
+		}
 		this.ctx.updatePendingMessagesDisplay();
 		this.ctx.showStatus("Queued message for after compaction");
 	}

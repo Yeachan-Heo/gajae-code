@@ -10,6 +10,9 @@ import type { Context, Model, ProviderSessionState } from "@gajae-code/ai/types"
 import { getAgentDir, setAgentDir, TempDir } from "@gajae-code/utils";
 import { classifyFallbackTrigger } from "../src/utils/fallback-transport";
 
+const RAW_SENTINEL = "RAW_SENTINEL_DO_NOT_SURFACE";
+const SUMMARY_SENTINEL = "SUMMARY_SENTINEL_SAFE_TO_SURFACE";
+
 const originalFetch = global.fetch;
 const originalAgentDir = getAgentDir();
 const originalWebSocket = global.WebSocket;
@@ -631,6 +634,220 @@ describe("openai-codex streaming", () => {
 		expect(sawDone).toBe(true);
 	});
 
+	describe("Codex reasoning summary fallback", () => {
+		const token = createCodexTestToken();
+		const run = async (streamedDelta: string | undefined) => {
+			const events = [
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "reasoning", id: "reasoning_1", summary: [] },
+				},
+				{
+					type: "response.reasoning_summary_part.added",
+					item_id: "reasoning_1",
+					output_index: 0,
+					part: { type: "summary_text", text: "" },
+				},
+				...(streamedDelta
+					? [
+							{
+								type: "response.reasoning_summary_text.delta",
+								item_id: "reasoning_1",
+								output_index: 0,
+								delta: streamedDelta,
+							},
+						]
+					: []),
+				{ type: "response.reasoning_summary_part.done", item_id: "reasoning_1", output_index: 0 },
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: {
+						type: "reasoning",
+						id: "reasoning_1",
+						summary: [{ type: "summary_text", text: "FINAL CODEX SUMMARY" }],
+						content: [],
+					},
+				},
+				{
+					type: "response.completed",
+					response: {
+						status: "completed",
+						usage: {
+							input_tokens: 0,
+							output_tokens: 0,
+							total_tokens: 0,
+							input_tokens_details: { cached_tokens: 0 },
+						},
+					},
+				},
+			];
+			const sse = `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
+			global.fetch = vi.fn(async (input: string | URL) => {
+				if (String(input) === "https://chatgpt.com/backend-api/codex/responses") {
+					return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+				}
+				return new Response("not found", { status: 404 });
+			}) as unknown as typeof fetch;
+
+			const streamResult = streamOpenAICodexResponses(
+				{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+				createCodexTestContext(),
+				{ apiKey: token },
+			);
+			const emitted: Array<Record<string, unknown>> = [];
+			for await (const event of streamResult) emitted.push(event as Record<string, unknown>);
+			return emitted;
+		};
+
+		it("emits a summary start before the canonical summary end when no summary text delta streams", async () => {
+			const fallbackEvents = await run(undefined);
+			const summaryEvents = fallbackEvents.filter(
+				event => event.type === "reasoning_summary_start" || event.type === "reasoning_summary_end",
+			);
+			expect(summaryEvents).toEqual([
+				expect.objectContaining({ type: "reasoning_summary_start", contentIndex: 0 }),
+				expect.objectContaining({ type: "reasoning_summary_end", contentIndex: 0, content: "FINAL CODEX SUMMARY" }),
+			]);
+			const fallbackDone = fallbackEvents.find(event => event.type === "done");
+			expect(
+				(fallbackDone?.message as { content: Array<{ type: string; summaryText?: string; provenance?: string }> })
+					.content,
+			).toContainEqual(
+				expect.objectContaining({ type: "thinking", summaryText: "FINAL CODEX SUMMARY", provenance: "summary" }),
+			);
+		});
+
+		it("emits one summary start and keeps streamed summary text when a summary text delta streams", async () => {
+			const streamedEvents = await run("STREAMED CODEX SUMMARY");
+			expect(streamedEvents.filter(event => event.type === "reasoning_summary_start")).toHaveLength(1);
+			const summaryEnd = streamedEvents.find(event => event.type === "reasoning_summary_end");
+			expect(summaryEnd).toEqual(
+				expect.objectContaining({ contentIndex: 0, content: expect.stringContaining("STREAMED CODEX SUMMARY") }),
+			);
+			expect(summaryEnd?.content).not.toContain("FINAL CODEX SUMMARY");
+		});
+		it("keeps finalized thinking monotonic across reasoning finalization permutations", async () => {
+			const run = async (events: Array<Record<string, unknown>>) => {
+				const sse = `${[
+					...events,
+					{
+						type: "response.completed",
+						response: {
+							status: "completed",
+							usage: {
+								input_tokens: 0,
+								output_tokens: 0,
+								total_tokens: 0,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					},
+				]
+					.map(event => `data: ${JSON.stringify(event)}`)
+					.join("\n\n")}\n\n`;
+				global.fetch = vi.fn(
+					async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+				) as unknown as typeof fetch;
+				return streamOpenAICodexResponses(
+					{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+					createCodexTestContext(),
+					{ apiKey: token },
+				).result();
+			};
+			const added = {
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "reasoning", id: "reasoning_monotonic", summary: [] },
+			};
+			const summaryPart = {
+				type: "response.reasoning_summary_part.added",
+				item_id: "reasoning_monotonic",
+				output_index: 0,
+				part: { type: "summary_text", text: "" },
+			};
+			const summaryDelta = {
+				type: "response.reasoning_summary_text.delta",
+				item_id: "reasoning_monotonic",
+				output_index: 0,
+				delta: SUMMARY_SENTINEL,
+			};
+			const rawDelta = {
+				type: "response.reasoning_text.delta",
+				item_id: "reasoning_monotonic",
+				output_index: 0,
+				delta: RAW_SENTINEL,
+			};
+			const done = (summary: string[] = [], raw = "") => ({
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "reasoning",
+					id: "reasoning_monotonic",
+					summary: summary.map(text => ({ type: "summary_text", text })),
+					content: raw ? [{ type: "reasoning_text", text: raw }] : [],
+				},
+			});
+			const cases = [
+				{
+					name: "summary-first then raw duplicate output_item.done",
+					events: [added, summaryPart, summaryDelta, done([SUMMARY_SENTINEL]), done([], RAW_SENTINEL)],
+					provenance: "summary",
+					summaryText: SUMMARY_SENTINEL,
+					rawText: undefined,
+				},
+				{
+					name: "raw-first then summary",
+					events: [added, rawDelta, summaryPart, summaryDelta, done([SUMMARY_SENTINEL], RAW_SENTINEL)],
+					provenance: "mixed",
+					summaryText: SUMMARY_SENTINEL,
+					rawText: RAW_SENTINEL,
+				},
+				{
+					name: "duplicate summary finalizations",
+					events: [added, summaryPart, summaryDelta, done([SUMMARY_SENTINEL]), done([SUMMARY_SENTINEL])],
+					provenance: "summary",
+					summaryText: SUMMARY_SENTINEL,
+					rawText: undefined,
+				},
+				{
+					name: "final-only summary",
+					events: [added, done([SUMMARY_SENTINEL])],
+					provenance: "summary",
+					summaryText: SUMMARY_SENTINEL,
+					rawText: undefined,
+				},
+				{
+					name: "raw-only control",
+					events: [added, rawDelta, done([], RAW_SENTINEL)],
+					provenance: "raw",
+					summaryText: undefined,
+					rawText: RAW_SENTINEL,
+				},
+			] as const;
+
+			for (const scenario of cases) {
+				const result = await run([...scenario.events]);
+				const block = result.content[0] as {
+					thinking: string;
+					provenance?: string;
+					summaryText?: string;
+					rawText?: string;
+				};
+				expect(block, scenario.name).toMatchObject({ provenance: scenario.provenance });
+				expect(block.summaryText, scenario.name).toBe(scenario.summaryText);
+				expect(block.rawText, scenario.name).toBe(scenario.rawText);
+				if (scenario.provenance === "raw") {
+					expect(block.thinking, scenario.name).toBe(RAW_SENTINEL);
+				} else {
+					expect(block.thinking, scenario.name).toBe(SUMMARY_SENTINEL);
+					expect(block.thinking, scenario.name).not.toContain(RAW_SENTINEL);
+				}
+			}
+		});
+	});
+
 	it("includes service_tier in SSE payloads when requested", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -856,11 +1073,7 @@ describe("openai-codex streaming", () => {
 			status: 429,
 			providerCode: "rate_limit_exceeded",
 		});
-		expect(
-			result.transportFailure?.headers instanceof Headers
-				? result.transportFailure.headers.get("retry-after")
-				: undefined,
-		).toBe("600");
+		expect(result.transportFailure?.headers).toEqual({ "retry-after": "600" });
 		expect(classifyFallbackTrigger(result.transportFailure)).toEqual({ class: "rate_limit", retryAfterMs: 600_000 });
 	});
 

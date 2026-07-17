@@ -66,6 +66,24 @@ describe("ToolExecutionComponent spacing", () => {
 		expect(trailing + leading).toBe(1);
 	});
 });
+it("preserves manual expansion through automatic updates and drops it on remount", () => {
+	const component = new ToolExecutionComponent("custom", { path: "/tmp/example.ts" }, {}, undefined, uiStub);
+	component.setManuallyExpanded(true);
+	component.setExpanded(false);
+
+	expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("Args");
+
+	const remounted = new ToolExecutionComponent("custom", { path: "/tmp/example.ts" }, {}, undefined, uiStub);
+	remounted.setExpanded(false);
+	expect(Bun.stripANSI(remounted.render(80).join("\n"))).not.toContain("Args");
+});
+
+it("lets untouched components follow automatic expansion", () => {
+	const component = new ToolExecutionComponent("custom", { path: "/tmp/example.ts" }, {}, undefined, uiStub);
+	component.setExpanded(true);
+
+	expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("Args");
+});
 
 it("replaces generic SIXEL output while the IRC sidebar is visible and restores passthrough when hidden", () => {
 	terminal.imageProtocol = ImageProtocol.Sixel;

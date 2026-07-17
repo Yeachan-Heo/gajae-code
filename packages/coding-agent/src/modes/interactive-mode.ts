@@ -44,6 +44,14 @@ import type { CompactOptions } from "../extensibility/extensions/types";
 import { resolveSkillSlashCommands, type Skill } from "../extensibility/skills";
 import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
 import { consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
+import {
+	canonicalArgsKey,
+	classifyToolOutcome,
+	decideTimeoutHold,
+	type TimeoutToolOutcome,
+	toResultText,
+	turnTimeoutFingerprint,
+} from "../goals/continuation-timeout-guard";
 import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
@@ -80,6 +88,7 @@ import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-colo
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
+import type { CommandPaletteAction } from "./components/command-palette";
 import { CustomEditor } from "./components/custom-editor";
 import { DynamicBorder } from "./components/dynamic-border";
 import type { EvalExecutionComponent } from "./components/eval-execution";
@@ -125,14 +134,16 @@ import {
 	onThemeChange,
 	theme,
 } from "./theme/theme";
-import type {
-	CompactionQueuedMessage,
-	InteractiveModeContext,
-	IrcArrivalSnapshot,
-	SubmittedUserInput,
-	TodoItem,
-	TodoPhase,
-	TranscriptRebuildPolicy,
+import {
+	type CompactionQueuedMessage,
+	type ComposerSubmissionOptions,
+	canApplyComposerSubmission,
+	type InteractiveModeContext,
+	type IrcArrivalSnapshot,
+	type SubmittedUserInput,
+	type TodoItem,
+	type TodoPhase,
+	type TranscriptRebuildPolicy,
 } from "./types";
 import type { ParsedIrcMessage } from "./utils/irc-message";
 import { addChatChild, prepareTranscriptRebuild, UiHelpers } from "./utils/ui-helpers";
@@ -406,6 +417,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	#goalTurnHadToolCalls = false;
 	#goalContinuationTurnInFlight = false;
 	#goalSuppressNextContinuation = false;
+	#goalTurnToolStarts = new Map<string, { toolName: string; argsKey: string }>();
+	#goalTurnOutcomes: TimeoutToolOutcome[] = [];
+	#goalTurnUnpaired = false;
+	#goalTurnSnapshotKey: string | undefined;
+	#goalHeldSnapshotKey: string | undefined;
+	#goalTimeoutFingerprint: string | undefined;
+	#goalIdenticalTimeoutStreak = 0;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
 	#planModeProviderSessionScope: TemporaryProviderSessionScope | undefined;
@@ -914,12 +932,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	startPendingSubmission(input: {
-		text: string;
-		images?: ImageContent[];
-		customType?: string;
-		display?: boolean;
-	}): SubmittedUserInput {
+	startPendingSubmission(
+		input: {
+			text: string;
+			images?: ImageContent[];
+			customType?: string;
+			display?: boolean;
+		},
+		options?: ComposerSubmissionOptions,
+	): SubmittedUserInput {
 		const submission: SubmittedUserInput = {
 			text: input.text,
 			images: input.images,
@@ -944,7 +965,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.optimisticUserMessageSignature = undefined;
 			this.#pendingSubmissionDispose = undefined;
 		}
-		this.editor.setText("");
+		if (canApplyComposerSubmission(options, this.editor)) {
+			this.editor.setText("");
+		}
 		this.ensureLoadingAnimation();
 		this.ui.requestRender();
 		return submission;
@@ -1285,8 +1308,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.requestRender();
 	}
 
+	#resetGoalTimeoutHold(): void {
+		this.#goalTurnToolStarts.clear();
+		this.#goalTurnOutcomes = [];
+		this.#goalTurnUnpaired = false;
+		this.#goalTurnSnapshotKey = undefined;
+		this.#goalHeldSnapshotKey = undefined;
+		this.#goalTimeoutFingerprint = undefined;
+		this.#goalIdenticalTimeoutStreak = 0;
+	}
+
 	#resetGoalContinuationSuppression(): void {
 		this.#goalSuppressNextContinuation = false;
+		this.#resetGoalTimeoutHold();
 	}
 
 	#getPausedGoalState(): GoalModeState | undefined {
@@ -1304,13 +1338,36 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #handleGoalSessionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "agent_start") {
 			this.#goalTurnHadToolCalls = false;
+			this.#goalTurnToolStarts.clear();
+			this.#goalTurnOutcomes = [];
+			this.#goalTurnUnpaired = false;
+			const goal = this.session.getGoalModeState()?.goal;
+			this.#goalTurnSnapshotKey = goal ? `${goal.id}\u0000${goal.objective}` : undefined;
 			this.#cancelGoalContinuation();
 			return;
 		}
 		if (event.type === "tool_execution_start") {
 			this.#goalTurnHadToolCalls = true;
+			this.#goalTurnToolStarts.set(event.toolCallId, {
+				toolName: event.toolName,
+				argsKey: canonicalArgsKey(event.args),
+			});
 			if (!this.#goalContinuationTurnInFlight) {
 				this.#resetGoalContinuationSuppression();
+			}
+			return;
+		}
+		if (event.type === "tool_execution_end") {
+			const start = this.#goalTurnToolStarts.get(event.toolCallId);
+			if (!start) {
+				this.#goalTurnHadToolCalls = true;
+				this.#goalTurnUnpaired = true;
+			} else {
+				this.#goalTurnOutcomes.push({
+					...start,
+					kind: classifyToolOutcome(event.isError, toResultText(event.result)),
+				});
+				this.#goalTurnToolStarts.delete(event.toolCallId);
 			}
 			return;
 		}
@@ -1325,12 +1382,18 @@ export class InteractiveMode implements InteractiveModeContext {
 				await this.#exitGoalMode({ reason: "dropped", silent: true });
 				return;
 			}
+			const goal = event.state?.goal;
+			const snapshotKey = goal ? `${goal.id}\u0000${goal.objective}` : undefined;
+			if (this.#goalHeldSnapshotKey !== undefined && this.#goalHeldSnapshotKey !== snapshotKey) {
+				this.#resetGoalContinuationSuppression();
+			}
 			if (event.state?.enabled === true && !this.#goalModePreviousTools) {
 				this.#goalModePreviousTools = this.session.getActiveToolNames();
 			}
 			this.goalModeEnabled = event.state?.enabled === true;
 			this.goalModePaused = event.state?.enabled !== true && event.state?.goal?.status === "paused";
 			if (!event.state?.enabled) {
+				this.#resetGoalContinuationSuppression();
 				this.#cancelGoalContinuation();
 			}
 			this.#updateGoalModeStatus();
@@ -1341,7 +1404,34 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		if (this.#goalContinuationTurnInFlight) {
 			this.#goalSuppressNextContinuation = !this.#goalTurnHadToolCalls;
+			const fingerprint =
+				this.#goalTurnToolStarts.size > 0 || this.#goalTurnUnpaired
+					? null
+					: turnTimeoutFingerprint(this.#goalTurnOutcomes);
+			const decision = decideTimeoutHold(
+				{
+					heldSnapshotKey: this.#goalHeldSnapshotKey,
+					fingerprint: this.#goalTimeoutFingerprint,
+					streak: this.#goalIdenticalTimeoutStreak,
+				},
+				{ snapshotKey: this.#goalTurnSnapshotKey ?? "", fingerprint },
+			);
+			if (fingerprint === null) {
+				this.#resetGoalTimeoutHold();
+			} else {
+				this.#goalHeldSnapshotKey = decision.next.heldSnapshotKey;
+				this.#goalTimeoutFingerprint = decision.next.fingerprint;
+				this.#goalIdenticalTimeoutStreak = decision.next.streak;
+			}
+			if (decision.hold) {
+				this.#goalSuppressNextContinuation = true;
+				this.showStatus(
+					`Goal paused for attention: repeated identical timeout from ${this.#goalTurnOutcomes[0]?.toolName ?? "tool"}. Send a message to continue.`,
+				);
+			}
 			this.#goalContinuationTurnInFlight = false;
+		} else {
+			this.#resetGoalTimeoutHold();
 		}
 		if (this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#exitGoalMode({ reason: "completed", silent: true });
@@ -1668,6 +1758,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.goalModePaused = options?.paused ?? false;
 		this.#goalModePreviousTools = undefined;
 		this.#goalContinuationTurnInFlight = false;
+		this.#resetGoalContinuationSuppression();
 		this.#cancelGoalContinuation();
 		this.#updateGoalModeStatus();
 		if (!options?.silent) {
@@ -2461,8 +2552,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#uiHelpers.updatePendingMessagesDisplay();
 	}
 
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.#uiHelpers.queueCompactionMessage(text, mode);
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void {
+		this.#uiHelpers.queueCompactionMessage(text, mode, options);
 	}
 
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
@@ -2770,6 +2861,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	// Selector handling
+	showCommandPalette(
+		commands: SlashCommand[],
+		actions: CommandPaletteAction[],
+		executeSlashCommand: (name: string) => Promise<void>,
+	): void {
+		this.#selectorController.showCommandPalette(commands, actions, executeSlashCommand);
+	}
+
 	showSettingsSelector(): void {
 		this.#selectorController.showSettingsSelector();
 	}

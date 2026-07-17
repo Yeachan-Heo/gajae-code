@@ -136,6 +136,8 @@ export const CLIENT_PING_PONG_CAPABILITY = "client_ping_pong";
 /** Capability required for typed controls and semantic Selected acknowledgement frames. */
 export const ASK_SELECTED_ACK_CAPABILITY = "ask_selected_ack_v1";
 export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
+/** Capability required for tool lifecycle and reasoning-summary frames. */
+export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
 
 const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
 
@@ -307,6 +309,7 @@ export function startDaemonLifecycleControl(input: {
 	const deps = buildOrchestratorDeps({
 		pairedChatId: input.pairedChatId,
 		agentNotificationsDir: daemonPaths(input.agentDir).dir,
+		agentDir: input.agentDir,
 		sessionsRoot: path.join(input.agentDir, "sessions"),
 		auditRedactionKey: input.auditRedactionKey,
 		env: input.env,
@@ -1368,6 +1371,7 @@ export class TelegramNotificationDaemon {
 			const deps = (this.opts.createLifecycleOrchestratorDeps ?? buildOrchestratorDeps)({
 				pairedChatId: this.opts.chatId,
 				agentNotificationsDir: daemonPaths(agentDir).dir,
+				agentDir,
 				sessionsRoot: path.join(agentDir, "sessions"),
 				auditRedactionKey: deriveLifecycleAuditRedactionKey(this.opts.botToken),
 			});
@@ -1610,15 +1614,22 @@ export class TelegramNotificationDaemon {
 			return true;
 		}
 		if (parsed.kind === "recent") {
-			const recent = listRecentSessions({
-				sessionsRoot: path.join(this.opts.settings.getAgentDir(), "sessions"),
+			const recent = await listRecentSessions({
+				cwd: process.cwd(),
+				agentDir: this.opts.settings.getAgentDir(),
 				limit: 10,
 				includeInternal: false,
+				allWorkspaces: true,
 			});
-			const body = recent.length
-				? recent.map(e => `• ${code(e.sessionId)}${e.path ? ` (${code(e.path)})` : ""}`).join("\n")
-				: "No recent sessions.";
-			await replyHtml(body);
+			const body =
+				recent.kind === "error"
+					? `Recent sessions could not be verified: ${recent.message}`
+					: recent.entries.length
+						? recent.entries.map(e => `• ${code(e.sessionId)}${e.path ? ` (${code(e.path)})` : ""}`).join("\n")
+						: "No recent sessions.";
+			await replyHtml(
+				recent.kind === "complete" && recent.warnings.length ? `${body}\n\n${recent.warnings.join("\n")}` : body,
+			);
 			return true;
 		}
 
@@ -2028,7 +2039,12 @@ export class TelegramNotificationDaemon {
 						JSON.stringify({
 							type: "hello",
 							protocolVersion: NOTIFICATION_PROTOCOL_VERSION,
-							capabilities: [CLIENT_PING_PONG_CAPABILITY, ASK_CONTROLS_CAPABILITY, ASK_SELECTED_ACK_CAPABILITY],
+							capabilities: [
+								CLIENT_PING_PONG_CAPABILITY,
+								ASK_CONTROLS_CAPABILITY,
+								ASK_SELECTED_ACK_CAPABILITY,
+								TOOL_ACTIVITY_CAPABILITY,
+							],
 						}),
 					);
 				} catch {}
@@ -2169,6 +2185,14 @@ export class TelegramNotificationDaemon {
 		return alias;
 	}
 
+	/**
+	 * Coalesce-key categories whose entries are concurrent and independently keyed
+	 * (one live message per key), so {@link recordLiveMessage} must NOT evict
+	 * same-category siblings. `tool:<toolCallId>` bubbles from parallel tools each
+	 * own their own message and finalize independently.
+	 */
+	static readonly #CONCURRENT_LIVE_CATEGORIES = new Set(["tool"]);
+
 	private static readonly THREADED_FRAMES = new Set([
 		"identity_header",
 		"context_update",
@@ -2177,6 +2201,8 @@ export class TelegramNotificationDaemon {
 		"file_attachment",
 		"config_update",
 		"control_command_result",
+		"tool_activity",
+		"reasoning_summary",
 	]);
 
 	/** Rekey model controls before a valid threaded frame can render or a silent config update can route output. */
@@ -2817,13 +2843,18 @@ export class TelegramNotificationDaemon {
 								});
 							}
 						}
-						if (editKey && ckey !== undefined && firstMessageId !== undefined) {
+						if (editKey && ckey !== undefined && firstMessageId !== undefined && !send.terminal) {
 							this.recordLiveMessage(item.sessionId, ckey, firstMessageId);
 						}
 					}
 				}
 			} catch {
 				// Best-effort: a failed send/edit must never stop the daemon.
+			} finally {
+				// A terminal tool frame owns the end of this coalescing key even when both
+				// edit and fallback delivery fail. Retaining the old message id would leak
+				// one entry per failure and let a later reused key edit stale Telegram state.
+				if (send.terminal && editKey) this.liveMessages.delete(editKey);
 			}
 		}
 	}
@@ -2836,9 +2867,17 @@ export class TelegramNotificationDaemon {
 	private recordLiveMessage(sessionId: string, coalesceKey: string, messageId: number): void {
 		const mapKey = `${sessionId}:${coalesceKey}`;
 		const category = coalesceKey.split(":")[0] ?? "";
-		const prefix = `${sessionId}:${category}:`;
-		for (const k of [...this.liveMessages.keys()]) {
-			if (k !== mapKey && k.startsWith(prefix)) this.liveMessages.delete(k);
+		// Single-slot categories (rolling turn/context/reasoning previews) evict prior
+		// same-category entries to stay bounded. Concurrent categories such as
+		// `tool:<toolCallId>` key each in-flight item independently: parallel tools each
+		// own a distinct bubble, so evicting same-category siblings would orphan a
+		// still-open tool's message id and leave a stale "started" bubble that its
+		// terminal frame can no longer edit in place.
+		if (!TelegramNotificationDaemon.#CONCURRENT_LIVE_CATEGORIES.has(category)) {
+			const prefix = `${sessionId}:${category}:`;
+			for (const k of [...this.liveMessages.keys()]) {
+				if (k !== mapKey && k.startsWith(prefix)) this.liveMessages.delete(k);
+			}
 		}
 		this.liveMessages.set(mapKey, messageId);
 	}
@@ -3727,7 +3766,10 @@ export class TelegramNotificationDaemon {
 		try {
 			await this.botApi.call("setMyCommands", {
 				commands: [
-					{ command: "verbose", description: "Mirror full tool output + reasoning in this thread" },
+					{
+						command: "verbose",
+						description: "Mirror bounded tool-owned summaries + provider-displayable reasoning summaries",
+					},
 					{ command: "lean", description: "Mirror assistant text + tool names only (default)" },
 					{ command: "redact", description: "Toggle redaction of streamed content: /redact <on|off>" },
 					{ command: "rich", description: "Toggle rich Telegram delivery: /rich <on|off>" },

@@ -187,7 +187,7 @@ function inputFor(operation: Operation, secret = false): Record<string, unknown>
 		case "extension.set_enabled":
 			return { id: "missing-extension", on: true };
 		case "session.cwd.move":
-			return { path: "/missing" };
+			return { path: process.cwd() };
 		case "session.get_endpoint":
 			return { sessionId: "missing-session" };
 		case "transcript.body":

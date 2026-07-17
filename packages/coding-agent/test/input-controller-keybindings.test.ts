@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
 import { InputController } from "../src/modes/controllers/input-controller";
 import { initTheme } from "../src/modes/theme/theme";
-import type { CompactionQueuedMessage, InteractiveModeContext } from "../src/modes/types";
+import type { CompactionQueuedMessage, ComposerSubmissionOptions, InteractiveModeContext } from "../src/modes/types";
 import type { QueuedMessageEditEntry } from "../src/session/agent-session";
 
 type FakeEditor = {
@@ -66,12 +66,15 @@ async function createContext(options?: {
 	const onInputCallback = vi.fn();
 	const toggleIrcSidebar = vi.fn();
 	const startPendingSubmission = vi.fn(
-		(input: {
-			text: string;
-			images?: InteractiveModeContext["pendingImages"];
-			customType?: string;
-			display?: boolean;
-		}) => ({
+		(
+			input: {
+				text: string;
+				images?: InteractiveModeContext["pendingImages"];
+				customType?: string;
+				display?: boolean;
+			},
+			_options?: ComposerSubmissionOptions,
+		) => ({
 			...input,
 			cancelled: false,
 			started: true,
@@ -650,10 +653,11 @@ describe("InputController keybinding setup", () => {
 
 		await editor.onSubmit?.("send text after deleting the pasted image");
 
-		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
 			text: "send text after deleting the pasted image",
 			images: undefined,
 		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(spies.onInputCallback).toHaveBeenCalledWith({
 			text: "send text after deleting the pasted image",
 			images: undefined,
@@ -681,10 +685,11 @@ describe("InputController keybinding setup", () => {
 
 		await editor.onSubmit?.("describe only [image 2]");
 
-		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
 			text: "describe only [image 2]",
 			images: [secondImage],
 		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(spies.onInputCallback).toHaveBeenCalledWith({
 			text: "describe only [image 2]",
 			images: [secondImage],
@@ -710,10 +715,11 @@ describe("InputController keybinding setup", () => {
 		editor.onChange?.("");
 		await editor.onSubmit?.("describe [image 1]");
 
-		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
 			text: "describe [image 1]",
 			images: [image],
 		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(spies.onInputCallback).toHaveBeenCalledWith({
 			text: "describe [image 1]",
 			images: [image],
@@ -762,17 +768,19 @@ describe("InputController keybinding setup", () => {
 
 		extension.resolve();
 		await firstSubmit;
-		expect(spies.startPendingSubmission).toHaveBeenNthCalledWith(1, {
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
 			text: "describe [image 1]",
 			images: [firstImage],
 		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(ctx.pendingImages).toEqual([firstImage, secondImage]);
 
 		await editor.onSubmit?.("follow up [image 2]");
-		expect(spies.startPendingSubmission).toHaveBeenNthCalledWith(2, {
+		expect(spies.startPendingSubmission.mock.calls[1]?.[0]).toEqual({
 			text: "follow up [image 2]",
 			images: [secondImage],
 		});
+		expect(spies.startPendingSubmission.mock.calls[1]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
 		expect(ctx.pendingImages).toEqual([]);
 	});
 

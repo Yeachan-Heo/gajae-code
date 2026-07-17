@@ -5,7 +5,7 @@ import type * as fs1 from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { ImageContent, Model, TextContent, UsageReport } from "@gajae-code/ai";
+import type { ImageContent, Model, TextContent, Tool, UsageReport } from "@gajae-code/ai";
 import type { KeyId } from "@gajae-code/tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@gajae-code/utils";
 import * as Zod from "zod/v4";
@@ -79,6 +79,10 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	}
 
 	getAllTools(): string[] {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	resolveTool(): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -255,6 +259,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	getAllTools(): string[] {
 		return this.runtime.getAllTools();
+	}
+
+	resolveTool(name: string): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined {
+		return this.runtime.resolveTool(name);
 	}
 
 	setActiveTools(toolNames: string[]): Promise<void> {

@@ -191,6 +191,14 @@ function stringArrayFromUnknown(value: unknown): string[] {
 	return [];
 }
 
+function normalizeSessionDirectoryMigration(raw: RawSettings): void {
+	const session = rawSettingsRecord(raw.session);
+	if (!session) return;
+	if (session.directoryMigration !== "copy-retain" && session.directoryMigration !== "disabled") {
+		delete session.directoryMigration;
+	}
+}
+
 function rawSettingsRecord(value: unknown): RawSettings | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	return value as RawSettings;
@@ -377,6 +385,7 @@ export class Settings implements NotificationSettingsReader {
 				setByPath(this.#overrides, key.split("."), structuredClone(value));
 			}
 		}
+		normalizeSessionDirectoryMigration(this.#overrides);
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -408,6 +417,15 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	/**
+	 * Load settings for an explicit workspace without changing the global singleton.
+	 * Managed-session policy resolution must be bound to the workspace being opened.
+	 */
+	static loadForScope(options: { cwd: string; agentDir?: string }): Promise<Settings> {
+		const instance = new Settings(options);
+		return instance.#load();
+	}
+
+	/**
 	 * Create an isolated instance for testing with explicit user/global settings.
 	 * Does not affect the global singleton.
 	 */
@@ -419,6 +437,7 @@ export class Settings implements NotificationSettingsReader {
 		for (const [key, value] of Object.entries(globalSettings)) {
 			setByPath(instance.#global, key.split("."), structuredClone(value));
 		}
+		normalizeSessionDirectoryMigration(instance.#global);
 
 		instance.#rebuildMerged();
 		return instance;
@@ -1452,6 +1471,7 @@ export class Settings implements NotificationSettingsReader {
 	/** Apply schema migrations to raw settings */
 	#migrateRawSettings(raw: RawSettings): RawSettings {
 		// queueMode -> steeringMode
+		normalizeSessionDirectoryMigration(raw);
 		if ("queueMode" in raw && !("steeringMode" in raw)) {
 			raw.steeringMode = raw.queueMode;
 			delete raw.queueMode;

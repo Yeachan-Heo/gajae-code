@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { AssistantMessage } from "../src/types";
+import type { AssistantMessage, AssistantMessageEvent } from "../src/types";
 import { AssistantMessageEventStream, EventStream } from "../src/utils/event-stream";
 
 function createPartial(text = ""): AssistantMessage {
@@ -32,6 +32,20 @@ describe("AssistantMessageEventStream", () => {
 		expect(stream.queue).toHaveLength(2);
 		expect(stream.queue[0]).toMatchObject({ type: "text_delta", delta: "a" });
 		expect(stream.queue[1]).toMatchObject({ type: "text_delta", delta: "b" });
+	});
+
+	it("fails consumers and result when a final event proxy throws during discriminant access", async () => {
+		const stream = new AssistantMessageEventStream();
+		const error = new Error("hostile event proxy");
+		const hostile = new Proxy({} as object, {
+			get() {
+				throw error;
+			},
+		}) as AssistantMessageEvent;
+		stream.push(hostile);
+		await expect(stream.result()).rejects.toBe(error);
+		const iterator = stream[Symbol.asyncIterator]();
+		await expect(iterator.next()).rejects.toBe(error);
 	});
 });
 

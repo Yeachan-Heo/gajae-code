@@ -440,6 +440,33 @@ test("lifecycle startup settles failure when native callback registration throws
 	}
 });
 
+test("lifecycle startup reports an actionable error when native capability registration is missing", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-missing-capability-callback-"));
+	dirs.push(cwd);
+	const capability = new SdkStartupCapability();
+	const prototype = NotificationServer.prototype as unknown as { onNegotiatedCapabilities?: unknown };
+	const original = prototype.onNegotiatedCapabilities;
+	try {
+		prototype.onNegotiatedCapabilities = undefined;
+		start(context(cwd, "missing-capability-callback"), undefined, () => {}, false, new Map(), {
+			startupCapability: capability,
+			lifecycleRequired: true,
+		});
+		const result = await capability.promise;
+		expect(result).toMatchObject({
+			status: "failed",
+			failure: { phase: "startup", reason: "failed" },
+		});
+		if (result.status === "failed") {
+			expect(result.failure.message).toContain("onNegotiatedCapabilities");
+			expect(result.failure.message).toContain("out of date");
+		}
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", "missing-capability-callback.json"))).toBe(false);
+	} finally {
+		prototype.onNegotiatedCapabilities = original;
+	}
+});
+
 test("lifecycle startup settles native capability incompatibility before constructing the host", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-native-incompatible-"));
 	dirs.push(cwd);

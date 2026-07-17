@@ -44,7 +44,7 @@ describe("agentLoop: truncated tool-call guard", () => {
 				{ content: ["recovered"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, fallbackManaged: true };
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
 		const stream = agentLoop([createUserMessage("write the file")], context, config, undefined, mock.stream);

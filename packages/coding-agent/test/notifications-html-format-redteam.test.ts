@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { finalizeTelegramHtml, markdownToTelegramHtml, truncateTelegramHtml } from "../src/sdk/bus/html-format";
+import { renderThreadedFrame } from "../src/sdk/bus/threaded-render";
 
 const allowedTags = new Set(["b", "i", "u", "s", "code", "pre", "a", "blockquote", "tg-spoiler"]);
 const allowedTagPattern = /<\/?(?:b|i|u|s|code|pre|blockquote|tg-spoiler)>|<a\s+href="[^"]*">|<\/a>/gi;
@@ -171,5 +172,31 @@ describe("red-team huge turn_stream-like input", () => {
 		assertNoTrailingEntityOrTagFragment(finalized!);
 		assertNoStrayAngles(finalized!);
 		assertBalancedAllowedTags(finalized!);
+	});
+});
+
+describe("red-team tool activity and reasoning summary rendering", () => {
+	test("escapes tool metadata and summary HTML without allowing tag injection", () => {
+		const send = renderThreadedFrame({
+			type: "tool_activity",
+			sessionId: "s",
+			toolCallId: "call-1",
+			toolName: "<b>shell</b> & \u0000",
+			phase: "failed",
+			argsSummary: "<script>run</script> & \u0001",
+		});
+		expect(send?.text).toContain("&lt;b&gt;shell&lt;/b&gt; &amp; \u0000");
+		expect(send?.text).toContain("<pre>&lt;script&gt;run&lt;/script&gt; &amp; \u0001</pre>");
+		expect(send?.text).not.toContain("<script>");
+	});
+
+	test("escapes reasoning HTML once without double-escaping", () => {
+		const send = renderThreadedFrame({
+			type: "reasoning_summary",
+			sessionId: "s",
+			text: "<img src=x> & \u0002",
+		});
+		expect(send?.text).toBe("&lt;img src=x&gt; &amp; \u0002");
+		expect(send?.text).not.toContain("&amp;lt;");
 	});
 });

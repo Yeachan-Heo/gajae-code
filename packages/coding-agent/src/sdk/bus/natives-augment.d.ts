@@ -26,7 +26,11 @@ declare module "@gajae-code/natives" {
 		onSdkFrame(callback: (err: null | Error, frame: SdkFrameEvent) => void): void;
 		/** Register the connection-close callback. Must be called before start. */
 		onConnectionClose(callback: (err: null | Error, connectionId: string) => void): void;
-		/** Directed send of a JSON text frame to one connection. */
+		/** Register negotiated v3 client capabilities. Must be called before start. */
+		onNegotiatedCapabilities(
+			callback: (err: null | Error, connectionId: string, capabilities: string[]) => void,
+		): void;
+		/** Directed delivery of a validated, bounded JSON v3 envelope to one connection. */
 		sendTo(connectionId: string, json: string): void;
 		/** Register a correlated workflow-gate action_needed frame. */
 		registerWorkflowGateAsk(workflowJson: string, repliable: boolean): void;

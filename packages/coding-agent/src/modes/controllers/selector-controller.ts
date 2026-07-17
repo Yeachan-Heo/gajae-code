@@ -2,9 +2,10 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
-import type { Component, OverlayHandle } from "@gajae-code/tui";
+import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, isPetMode, Loader, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
+import { type AppKeybinding, formatKeyHints } from "../../config/keybindings";
 import {
 	activateModelProfile,
 	type MaterializeModelProfileForDeletionResult,
@@ -108,6 +109,11 @@ import {
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
+import {
+	type CommandPaletteAction,
+	CommandPaletteComponent,
+	type CommandPaletteEntry,
+} from "../components/command-palette";
 import {
 	CustomModelPresetWizardComponent,
 	type CustomModelPresetWizardSubmit,
@@ -726,6 +732,52 @@ export class SelectorController {
 		this.ctx.ui.requestRender();
 	}
 
+	showCommandPalette(
+		commands: SlashCommand[],
+		actions: CommandPaletteAction[],
+		executeSlashCommand: (name: string) => Promise<void>,
+	): void {
+		const seenCommands = new Set<string>();
+		const entries: CommandPaletteEntry[] = [
+			...actions.map(action => ({
+				id: `action:${action.id}`,
+				label: action.label,
+				description: action.id,
+				keybinding: formatKeyHints(this.ctx.keybindings.getKeys(action.id as AppKeybinding)) || undefined,
+				searchText: action.id,
+				handler: action.handler,
+			})),
+			...commands
+				.filter(command => {
+					if (seenCommands.has(command.name)) return false;
+					seenCommands.add(command.name);
+					return true;
+				})
+				.map(command => ({
+					id: `command:${command.name}`,
+					label: `/${command.name}`,
+					description: command.description ?? "Slash command",
+					searchText: command.name,
+					handler: () => executeSlashCommand(command.name),
+				})),
+		];
+
+		this.showSelector(done => {
+			const selector = new CommandPaletteComponent(
+				entries,
+				entry => {
+					done();
+					void Promise.resolve()
+						.then(() => entry.handler?.())
+						.catch(error => {
+							this.ctx.showError(error instanceof Error ? error.message : String(error));
+						});
+				},
+				done,
+			);
+			return { component: selector, focus: selector };
+		});
+	}
 	showProviderOnboarding(): void {
 		this.showSelector(done => {
 			const selector = new ProviderOnboardingSelectorComponent(
@@ -1912,7 +1964,7 @@ export class SelectorController {
 	}
 
 	async showSessionSelector(): Promise<void> {
-		const sessions = await SessionManager.list(
+		const sessions = await SessionManager.listForResumePickerReadOnly(
 			this.ctx.sessionManager.getCwd(),
 			this.ctx.sessionManager.getSessionDir(),
 		);
@@ -1934,9 +1986,9 @@ export class SelectorController {
 					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
 						return false;
 					}
-					const storage = new FileSessionStorage();
 					try {
-						await storage.deleteSessionWithArtifacts(session.path);
+						await this.#deleteSession(session.path);
+
 						return true;
 					} catch (err) {
 						throw new Error(`Failed to delete session: ${err instanceof Error ? err.message : String(err)}`, {
@@ -1972,6 +2024,15 @@ export class SelectorController {
 		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
 	}
 
+	async #deleteSession(sessionPath: string): Promise<void> {
+		const sessionManager = this.ctx.sessionManager as { dropSession?: (path: string) => Promise<void> };
+		if (sessionManager.dropSession) {
+			await sessionManager.dropSession(sessionPath);
+			return;
+		}
+		await new FileSessionStorage().deleteSessionWithArtifacts(sessionPath);
+	}
+
 	async #detachActiveSessionBeforeDeletion(sessionPath: string): Promise<boolean> {
 		const currentSessionFile = this.ctx.sessionManager.getSessionFile();
 		if (currentSessionFile !== sessionPath) {
@@ -2000,9 +2061,12 @@ export class SelectorController {
 	async handleResumeSession(sessionPath: string): Promise<void> {
 		const previousSessionId = this.ctx.sessionManager.getSessionId();
 		this.#clearTransientSessionUi();
+		const migrationPolicy =
+			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		const writableSessionPath = await SessionManager.prepareManagedCandidateForWrite(sessionPath, migrationPolicy);
 
 		// Switch session via AgentSession (emits hook and tool session events)
-		if (!(await this.ctx.session.switchSession(sessionPath))) return;
+		if (!(await this.ctx.session.switchSession(writableSessionPath))) return;
 		const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
 		if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
 		this.#refreshSessionTerminalTitle();
@@ -2047,8 +2111,7 @@ export class SelectorController {
 			return;
 		}
 
-		// Delete the session file and artifacts directory
-		await storage.deleteSessionWithArtifacts(sessionFile);
+		await this.#deleteSession(sessionFile);
 
 		// Show session selector
 		this.ctx.showStatus("Current session transcript and artifacts deleted");

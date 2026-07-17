@@ -1604,6 +1604,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						},
 						getActiveTools: () => session.getActiveToolNames(),
 						getAllTools: () => session.getAllToolNames(),
+						resolveTool: name => {
+							const tool = session.getToolByName(name);
+							return tool
+								? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields }
+								: undefined;
+						},
 						setActiveTools: (toolNames: string[]) =>
 							session.setActiveToolsByName(toolNames.filter(name => !parentOwnedToolNames.has(name))),
 						getCommands: () => getSessionSlashCommands(session),
@@ -1638,6 +1644,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						getQueuedMessages: () => session.getQueuedMessageEntries(),
 						getActiveTools: () => session.getActiveToolNames(),
 						getAllTools: () => session.getAllToolNames(),
+						resolveTool: name => {
+							const tool = session.getToolByName(name);
+							return tool
+								? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields }
+								: undefined;
+						},
 						shutdown: () => {},
 						getContextUsage: () => session.getContextUsage(),
 						getSystemPrompt: () => session.systemPrompt,

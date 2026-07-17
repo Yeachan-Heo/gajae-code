@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import { Messages } from "@anthropic-ai/sdk/resources/messages/messages";
+import { Effort } from "../src/model-thinking";
 import { applyClaudeToolPrefix, streamAnthropic, stripClaudeToolPrefix } from "../src/providers/anthropic";
 import type { AssistantMessageEvent, Context, Model, ProviderSessionState } from "../src/types";
 
@@ -227,6 +228,78 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("msg_text_success");
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+	});
+
+	it("opens thinking before summarized reasoning for a summarized adaptive stream", async () => {
+		const summarizedModel: Model<"anthropic-messages"> = {
+			...model,
+			id: "claude-opus-4-7",
+			thinking: { mode: "anthropic-adaptive", minLevel: Effort.Minimal, maxLevel: Effort.Max },
+		};
+		let requestedThinking: unknown;
+		vi.spyOn(Messages.prototype, "create").mockImplementation(params => {
+			requestedThinking = (params as { thinking?: unknown }).thinking;
+			return createMockRequest([
+				{
+					type: "message_start",
+					message: { id: "msg_summary", usage: { input_tokens: 0, output_tokens: 0 } },
+				},
+				{ type: "content_block_start", index: 3, content_block: { type: "thinking", thinking: "" } },
+				{ type: "content_block_delta", index: 3, delta: { type: "thinking_delta", thinking: "summary" } },
+				{ type: "content_block_stop", index: 3 },
+				{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+				{ type: "message_stop" },
+			]) as never;
+		});
+
+		const stream = streamAnthropic(summarizedModel, context, { apiKey: "sk-ant-test", thinkingEnabled: true });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+
+		expect(requestedThinking).toEqual({ type: "adaptive", display: "summarized" });
+		const starts = events.filter(
+			event => event.type === "thinking_start" || event.type === "reasoning_summary_start",
+		);
+		expect(starts.map(event => [event.type, event.contentIndex])).toEqual([
+			["thinking_start", 0],
+			["reasoning_summary_start", 0],
+		]);
+	});
+
+	it("keeps unsupported adaptive thinking raw when summarized display is omitted", async () => {
+		const unsupportedAdaptiveModel: Model<"anthropic-messages"> = {
+			...model,
+			id: "claude-sonnet-4-6",
+			thinking: { mode: "anthropic-adaptive", minLevel: Effort.Minimal, maxLevel: Effort.Max },
+		};
+		let requestedThinking: unknown;
+		vi.spyOn(Messages.prototype, "create").mockImplementation(params => {
+			requestedThinking = (params as { thinking?: unknown }).thinking;
+			return createMockRequest([
+				{
+					type: "message_start",
+					message: { id: "msg_raw", usage: { input_tokens: 0, output_tokens: 0 } },
+				},
+				{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+				{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "raw" } },
+				{ type: "content_block_stop", index: 0 },
+				{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+				{ type: "message_stop" },
+			]) as never;
+		});
+
+		const stream = streamAnthropic(unsupportedAdaptiveModel, context, {
+			apiKey: "sk-ant-test",
+			thinkingEnabled: true,
+		});
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(requestedThinking).toEqual({ type: "adaptive" });
+		expect(events.filter(event => event.type === "thinking_delta")).toHaveLength(1);
+		expect(events.filter(event => event.type.startsWith("reasoning_summary_"))).toHaveLength(0);
+		expect(result.content[0]).not.toMatchObject({ provenance: "summary" });
 	});
 
 	it("preserves streamed tool-call arguments through Anthropic partial JSON deltas", async () => {

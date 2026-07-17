@@ -45,6 +45,13 @@ export interface ThreadedSend {
 	richMarkdown?: string;
 	/** Live-turn raw markdown for opt-in draft streaming (set ONLY on non-finalized turn frames; never triggers rich-final promotion, which requires `lane === "finalized"`). */
 	richDraftMarkdown?: string;
+	/**
+	 * True for a terminal tool_activity frame (phase completed/failed/cancelled/
+	 * unknown). The daemon evicts the tool's `tool:<toolCallId>` live-message entry
+	 * after delivering it, so completed tools do not accumulate unbounded across a
+	 * long session (concurrent in-flight `started` entries are retained).
+	 */
+	terminal?: boolean;
 }
 
 interface ThreadedFrame {
@@ -63,11 +70,18 @@ interface ThreadedFrame {
 	model?: unknown;
 	diff?: unknown;
 	cwd?: unknown;
-	// turn_stream
+	// turn_stream / reasoning_summary
 	phase?: unknown;
 	finalAnswer?: boolean;
 	text?: unknown;
 	messageRef?: unknown;
+	turnRef?: unknown;
+	// tool_activity
+	toolCallId?: unknown;
+	toolName?: unknown;
+	argsSummary?: unknown;
+	resultSummary?: unknown;
+	isError?: unknown;
 	// image_attachment / file_attachment
 	source?: unknown;
 	data?: unknown;
@@ -182,6 +196,48 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 				// frames so the opt-in draft gate has the source. It never arms rich-final
 				// promotion (shouldPromoteRich requires lane === "finalized").
 				richDraftMarkdown: finalized ? undefined : raw,
+			};
+		}
+		case "tool_activity": {
+			const toolCallId = str(frame.toolCallId);
+			if (!toolCallId) return undefined;
+			const phase = str(frame.phase);
+			const status =
+				phase === "started"
+					? "started"
+					: phase === "completed" && frame.isError !== true
+						? "ok"
+						: phase === "completed" || phase === "failed"
+							? "error"
+							: phase === "cancelled"
+								? "cancelled"
+								: "unknown";
+			const argsSummary = str(frame.argsSummary);
+			const resultSummary = str(frame.resultSummary);
+			const lines = [`⚙ ${escapeHtml(truncate(str(frame.toolName) ?? "tool", 300))} — ${status}`];
+			if (argsSummary) lines.push(`args:\n${pre(truncate(argsSummary, 1200))}`);
+			if (resultSummary) lines.push(`result:\n${pre(truncate(resultSummary, 1200))}`);
+			return {
+				method: "sendMessage",
+				lane: phase === "started" ? "live" : "finalized",
+				text: finalizeTelegramHtml(lines.join("\n")),
+				coalesceKey: `tool:${toolCallId}`,
+				editable: true,
+				terminal: phase !== "started",
+			};
+		}
+		case "reasoning_summary": {
+			const text = str(frame.text);
+			if (!text) return undefined;
+			const turnRef = str(frame.turnRef);
+			return {
+				method: "sendMessage",
+				lane: "finalized",
+				// markdownToTelegramHtml escapes raw markdown itself; pre-escaping here
+				// would turn entities such as < into visible &amp;lt; text.
+				text: finalizeTelegramHtml(markdownToTelegramHtml(text)),
+				coalesceKey: turnRef ? `reason:${turnRef}` : undefined,
+				editable: turnRef !== undefined,
 			};
 		}
 		case "image_attachment": {

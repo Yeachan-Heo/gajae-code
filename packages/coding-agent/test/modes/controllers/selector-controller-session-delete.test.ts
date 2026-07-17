@@ -176,7 +176,7 @@ beforeAll(() => {
 
 describe("SelectorController session deletion", () => {
 	beforeEach(() => {
-		vi.spyOn(SessionManager, "list").mockResolvedValue([]);
+		vi.spyOn(SessionManager, "listForResumePickerReadOnly").mockResolvedValue([]);
 	});
 
 	afterEach(() => {
@@ -222,15 +222,36 @@ describe("SelectorController session deletion", () => {
 		expect(calls).not.toContain("rebuildInitialMessages:reconcile-same-transcript");
 	});
 
+	it("prepares a legacy managed candidate before switching", async () => {
+		const legacyPath = "/tmp/project/legacy/session.jsonl";
+		const migratedPath = "/tmp/project/v2/session.jsonl";
+		const { ctx, switchSession } = createContext("/tmp/project/sessions/a.jsonl");
+		vi.spyOn(SessionManager, "prepareManagedCandidateForWrite").mockResolvedValue(migratedPath);
+		const controller = new SelectorController(ctx);
+
+		await controller.handleResumeSession(legacyPath);
+
+		expect(SessionManager.prepareManagedCandidateForWrite).toHaveBeenCalledWith(legacyPath, "copy-retain");
+		expect(switchSession).toHaveBeenCalledWith(migratedPath);
+	});
+
+	it("lists sessions from the active explicit session directory", async () => {
+		const { ctx } = createContext("/tmp/project/sessions/a.jsonl");
+		const controller = new SelectorController(ctx);
+
+		await controller.showSessionSelector();
+
+		expect(SessionManager.listForResumePickerReadOnly).toHaveBeenCalledWith("/tmp/project", "/tmp/project/sessions");
+	});
+
 	it("detaches the active session before selector deletion removes it", async () => {
 		const activeSession = makeSessionInfo("/tmp/project/sessions/active.jsonl");
 		const { ctx, calls } = createContext(activeSession.path);
-		vi.spyOn(SessionManager, "list").mockResolvedValue([activeSession]);
-		const deleteSessionWithArtifacts = vi
-			.spyOn(FileSessionStorage.prototype, "deleteSessionWithArtifacts")
-			.mockImplementation(async sessionPath => {
-				calls.push(`delete:${sessionPath}`);
-			});
+		vi.spyOn(SessionManager, "listForResumePickerReadOnly").mockResolvedValue([activeSession]);
+		const dropSession = vi.fn(async (sessionPath: string) => {
+			calls.push(`deleteManaged:${sessionPath}`);
+		});
+		Object.assign(ctx.sessionManager, { dropSession });
 		const controller = new SelectorController(ctx);
 
 		await controller.showSessionSelector();
@@ -246,7 +267,7 @@ describe("SelectorController session deletion", () => {
 		selector.handleInput("\n");
 		await Bun.sleep(0);
 
-		expect(deleteSessionWithArtifacts).toHaveBeenCalledWith(activeSession.path);
+		expect(dropSession).toHaveBeenCalledWith(activeSession.path);
 		expect(calls).toEqual([
 			"editorContainer.clear",
 			"editorContainer.addChild",
@@ -266,7 +287,7 @@ describe("SelectorController session deletion", () => {
 			"renderInitialMessages",
 			"reloadTodos",
 			"ui.requestRender",
-			`delete:${activeSession.path}`,
+			`deleteManaged:${activeSession.path}`,
 			"ui.requestRender",
 		]);
 		expect(ctx.sessionManager.getSessionFile()).toBe("/tmp/project/sessions/detached.jsonl");
@@ -275,7 +296,7 @@ describe("SelectorController session deletion", () => {
 	it("shows inline selector errors when session deletion fails after detach", async () => {
 		const activeSession = makeSessionInfo("/tmp/project/sessions/active.jsonl");
 		const { ctx, newSession } = createContext(activeSession.path);
-		vi.spyOn(SessionManager, "list").mockResolvedValue([activeSession]);
+		vi.spyOn(SessionManager, "listForResumePickerReadOnly").mockResolvedValue([activeSession]);
 		const deleteSessionWithArtifacts = vi
 			.spyOn(FileSessionStorage.prototype, "deleteSessionWithArtifacts")
 			.mockRejectedValue(new Error("disk failed"));

@@ -28,6 +28,7 @@ import {
 	TelegramEventDispatchState,
 	TelegramNotificationDaemon,
 	TelegramUpdatePoller,
+	TOOL_ACTIVITY_CAPABILITY,
 	unregisterNotificationRoot,
 } from "../src/sdk/bus/telegram-daemon";
 import { runDaemonInternal, runDaemonSmoke } from "../src/sdk/bus/telegram-daemon-cli";
@@ -3192,6 +3193,10 @@ test("daemon registers in-thread config and lifecycle commands and drops stale r
 	expect(cmds).toContain("verbose");
 	expect(cmds).toContain("lean");
 	expect(cmds).toContain("redact");
+	const verbose = (call!.body.commands as Array<{ command: string; description: string }>).find(
+		command => command.command === "verbose",
+	);
+	expect(verbose?.description).toBe("Mirror bounded tool-owned summaries + provider-displayable reasoning summaries");
 	expect(cmds).toContain("session_create");
 	expect(cmds).toContain("session_recent");
 	expect(cmds).toContain("session_close");
@@ -6593,5 +6598,139 @@ describe("telegram daemon /rich toggle (G005)", () => {
 			),
 		).toBe(true);
 		expect(bot.calls.some(c => c.method === "sendMessage" && c.body.text === "Rich messages: off")).toBe(false);
+	});
+});
+
+describe("Telegram tool activity capability and routing", () => {
+	test("advertises tool_activity_v1 and routes new threaded frame kinds", () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: new FakeBotApi(),
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+		const hello = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).find(frame => frame.type === "hello");
+		expect(hello.capabilities).toContain(TOOL_ACTIVITY_CAPABILITY);
+		const threadedFrames = (TelegramNotificationDaemon as any).THREADED_FRAMES as Set<string>;
+		expect(threadedFrames.has("tool_activity")).toBe(true);
+		expect(threadedFrames.has("reasoning_summary")).toBe(true);
+	});
+	test("parallel tool bubbles retain in-flight entries and evict completed entries", async () => {
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+		const sendToolActivity = async (toolCallId: "A" | "B", phase: "started" | "completed") =>
+			daemon.handleSessionMessage(session as never, {
+				type: "tool_activity",
+				sessionId: "S",
+				toolCallId,
+				toolName: `tool-${toolCallId}`,
+				phase,
+			});
+		await daemon.handleSessionMessage(session as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+
+		const liveMessages = (daemon as unknown as { liveMessages: Map<string, number> }).liveMessages;
+		await sendToolActivity("A", "started");
+		await sendToolActivity("B", "started");
+		expect(liveMessages.get("S:tool:A")).toBe(1);
+		expect(liveMessages.get("S:tool:B")).toBe(2);
+
+		await sendToolActivity("A", "completed");
+		expect(bot.calls.filter(call => call.method === "editMessageText")).toEqual([
+			expect.objectContaining({
+				body: expect.objectContaining({ message_id: 1, text: expect.stringContaining("tool-A — ok") }),
+			}),
+		]);
+		expect(liveMessages.has("S:tool:A")).toBe(false);
+		expect(liveMessages.get("S:tool:B")).toBe(2);
+
+		await sendToolActivity("B", "completed");
+		const sends = bot.calls.filter(call => call.method === "sendMessage");
+		const edits = bot.calls.filter(call => call.method === "editMessageText");
+		expect(sends).toHaveLength(2);
+		expect(edits).toHaveLength(2);
+		expect(edits.map(call => call.body.message_id)).toEqual([1, 2]);
+		expect(edits.map(call => call.body.text)).toEqual([
+			expect.stringContaining("tool-A — ok"),
+			expect.stringContaining("tool-B — ok"),
+		]);
+		expect(liveMessages.has("S:tool:A")).toBe(false);
+		expect(liveMessages.has("S:tool:B")).toBe(false);
+		(
+			daemon as unknown as { recordLiveMessage(sessionId: string, coalesceKey: string, messageId: number): void }
+		).recordLiveMessage("S", "turn:one", 101);
+		(
+			daemon as unknown as { recordLiveMessage(sessionId: string, coalesceKey: string, messageId: number): void }
+		).recordLiveMessage("S", "turn:two", 102);
+		expect(liveMessages.has("S:turn:one")).toBe(false);
+		expect(liveMessages.get("S:turn:two")).toBe(102);
+	});
+
+	test("failed terminal tool delivery evicts its key before a later reuse", async () => {
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+		const sendToolActivity = async (phase: "started" | "completed") =>
+			daemon.handleSessionMessage(session as never, {
+				type: "tool_activity",
+				sessionId: "S",
+				toolCallId: "A",
+				toolName: "tool-A",
+				phase,
+			});
+		await daemon.handleSessionMessage(session as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+		await sendToolActivity("started");
+		const liveMessages = (daemon as unknown as { liveMessages: Map<string, number> }).liveMessages;
+		expect(liveMessages.get("S:tool:A")).toBe(1);
+
+		const normalCall = bot.call.bind(bot);
+		bot.call = (async (method: string, body: unknown) => {
+			bot.calls.push({ method, body });
+			if (method === "editMessageText" || method === "sendMessage") throw new Error("terminal delivery failed");
+			return normalCall(method, body);
+		}) as typeof bot.call;
+		await sendToolActivity("completed");
+		expect(liveMessages.has("S:tool:A")).toBe(false);
+
+		bot.call = normalCall;
+		bot.calls = [];
+		await sendToolActivity("started");
+		expect(bot.calls.some(call => call.method === "editMessageText")).toBe(false);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
+		expect(liveMessages.has("S:tool:A")).toBe(true);
 	});
 });

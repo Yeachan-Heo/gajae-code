@@ -1,6 +1,7 @@
 # Gajae-Code SDK
 
 For embedding GJC in-process, see [the embedding SDK guide](./sdk-embedding.md).
+For a beginner-friendly application development guide (recipes, customization, and surface selection), see [Building applications on the SDK](./sdk-app-guide.md).
 
 <p align="center">
   <img src="../assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
@@ -325,6 +326,29 @@ Model-role selectors may be ordered fallback chains; see [Fallback chains](./mod
 
 `model_fallback_switched { eventId, from, to, reason, role, scope, activeIndex, chainLength, attemptsUsed }` is the canonical session lifecycle event for every real fallback-model switch. It replaces the legacy `retry_fallback_applied` / `retry_fallback_succeeded` event names. Embedding clients can subscribe to this session event; generic WebSocket clients should use only the protocol frames documented above and any adapter-specific status updates they support.
 
+
+## Managed session-directory adapter guidance
+
+SDK adapters that need to inspect saved sessions must import only the supported public surface from `@gajae-code/coding-agent/sdk`:
+
+```ts
+import {
+  SESSION_DIRECTORY_API_VERSION,
+  listManagedSessionCandidates,
+  resolveManagedSessionScope,
+} from "@gajae-code/coding-agent/sdk";
+
+if (SESSION_DIRECTORY_API_VERSION !== 1) throw new Error("Unsupported session-directory API");
+const resolved = await resolveManagedSessionScope({ cwd: process.cwd() });
+if (resolved.kind === "resolved") {
+  const listing = await listManagedSessionCandidates({ scope: resolved.scope });
+  // Consume only listing.kind === "complete" and its owned candidates.
+}
+```
+
+This is a readonly resolver/listing contract. Do not import `@gajae-code/coding-agent/session/internal/*`, derive `v2-…` names, write bindings, or implement migration/cleanup in an adapter; private internal subpaths are intentionally unavailable from the packaged module. Treat `network_unsupported`, binding/security errors, incomplete listings, invalid candidates, and foreign candidates as non-authoritative results rather than retrying with a guessed path.
+
+The resolver uses canonical native identity: supported POSIX and Windows local aliases can designate one scope, while UNC/network workspaces are unsupported. Scope digests are collision-resistant identifiers, not injective aliases, credentials, or authentication. The owner-only checks protect managed local storage paths but do not authenticate an adapter or make hostile concurrent filesystem races safe. Adapters that need mutations must use the higher-level lifecycle/session APIs rather than the readonly directory API.
 ## Managed notification adapters
 
 GJC ships managed SDK-client adapters for Telegram, Discord, and Slack. They use

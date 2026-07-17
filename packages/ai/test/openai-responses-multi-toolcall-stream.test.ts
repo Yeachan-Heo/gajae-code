@@ -52,13 +52,6 @@ interface ToolCallEndEvent {
 	contentIndex: number;
 	toolCall: ToolCall;
 }
-
-interface ThinkingEndEvent {
-	type: "thinking_end";
-	contentIndex: number;
-	content: string;
-}
-
 function makeCapture() {
 	const emitted: Array<Record<string, unknown>> = [];
 	const stream = {
@@ -366,15 +359,20 @@ describe("Responses multi-tool-call stream correlation", () => {
 		const { emitted, stream } = makeCapture();
 		await processResponsesStream(makeStream(events), output, stream, makeModel());
 
-		// The reasoning delta and end must reference content index 0, not the tool block at index 1.
-		const thinkingDeltas = emitted.filter(e => e.type === "thinking_delta");
-		expect(thinkingDeltas.length).toBeGreaterThan(0);
-		for (const d of thinkingDeltas) {
-			expect(d.contentIndex).toBe(0);
+		// The reasoning summary delta and end must reference content index 0, not the tool block at index 1.
+		// Under the #2304 provenance contract, `reasoning_summary_text.delta` routes to the
+		// dedicated reasoning_summary_* channel (not thinking_delta), while still landing display
+		// text on the reasoning block.
+		const summaryDeltas = emitted.filter(e => e.type === "reasoning_summary_delta");
+		expect(summaryDeltas.length).toBeGreaterThan(0);
+		for (const d of summaryDeltas) {
+			expect((d as { contentIndex: number }).contentIndex).toBe(0);
 		}
-		const thinkingEnd = emitted.find(e => e.type === "thinking_end") as ThinkingEndEvent | undefined;
-		expect(thinkingEnd?.contentIndex).toBe(0);
-		expect(thinkingEnd?.content).toBe("thinking...");
+		const summaryEnd = emitted.find(e => e.type === "reasoning_summary_end") as
+			| { contentIndex: number; content: string }
+			| undefined;
+		expect(summaryEnd?.contentIndex).toBe(0);
+		expect(summaryEnd?.content).toBe("thinking...");
 
 		// output.content agrees: reasoning content landed on the reasoning block, tool args on the tool block.
 		expect(output.content[0]?.type).toBe("thinking");

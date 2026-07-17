@@ -95,12 +95,20 @@ let warnedReasoningSummaryLevel = false;
 
 // ─── inbound parser helpers ─────────────────────────────────────────────────
 
-function extractReasoningTextFromItem(item: OpenAIResponsesReasoningItem): string {
-	// Prefer `summary[]` — mirrors real OpenAI and the openai-responses provider
-	// which writes the surfaced reasoning summary into `summary[].text`.
-	const fromSummary = (item.summary ?? []).map(c => c.text).join("");
-	if (fromSummary) return fromSummary;
-	return (item.content ?? []).map(c => c.text).join("");
+function reasoningContentFromItem(
+	item: OpenAIResponsesReasoningItem,
+): Pick<ThinkingContent, "thinking" | "provenance" | "summaryText" | "rawText"> {
+	// `summary[]` is provider-displayable; `content[]` is raw reasoning. Keep
+	// these channels distinct so a Responses gateway round-trip cannot relabel
+	// raw CoT as a summary merely because summary text is absent.
+	const summaryText = (item.summary ?? []).map(part => part.text).join("");
+	const rawText = (item.content ?? []).map(part => part.text).join("");
+	if (summaryText && rawText) {
+		return { thinking: summaryText, provenance: "mixed", summaryText, rawText };
+	}
+	if (summaryText) return { thinking: summaryText, provenance: "summary", summaryText };
+	if (rawText) return { thinking: rawText, provenance: "raw", rawText };
+	return { thinking: "" };
 }
 
 type InputBlockUnion =
@@ -335,10 +343,10 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 			}
 			if (effectiveType === "reasoning") {
 				const reasoning = item as OpenAIResponsesReasoningItem;
-				const text = extractReasoningTextFromItem(reasoning);
+				const content = reasoningContentFromItem(reasoning);
 				const thinking: ThinkingContent = {
 					type: "thinking",
-					thinking: text,
+					...content,
 					thinkingSignature: JSON.stringify(reasoning),
 					...(reasoning.id ? { itemId: reasoning.id } : {}),
 				};
@@ -538,6 +546,41 @@ function responseStatusForStopReason(message: AssistantMessage): ResponseStatus 
 	return "completed";
 }
 
+/**
+ * Privacy boundary for the public Responses envelope: a reasoning item's
+ * `summary_text` must carry ONLY provider-displayable summary text, never raw
+ * chain-of-thought. A summary is published ONLY for blocks explicitly marked
+ * `provenance: "summary" | "mixed"` (the #2304 provenance path), sourced from
+ * `summaryText`. Raw-provenance AND unmarked blocks are omitted: unmarked
+ * `thinking` can be raw CoT from providers that stream unmarked reasoning (e.g.
+ * openai-completions / ollama) which the auth gateway re-encodes into the
+ * Responses wire format, so falling open to `part.thinking` would leak raw CoT.
+ */
+function envelopeSummaryText(part: ThinkingContent): string | undefined {
+	if (part.provenance === "summary" || part.provenance === "mixed") return part.summaryText;
+	return undefined;
+}
+
+function envelopeSummaryParts(part: ThinkingContent): Array<{ type: "summary_text"; text: string }> {
+	const text = envelopeSummaryText(part);
+	return text ? [{ type: "summary_text", text }] : [];
+}
+
+function normalizeSummaryParts(value: unknown): Array<{ type: "summary_text"; text: string }> {
+	// A serialized signature's `summary` is, by the Responses protocol, provider-
+	// displayable summary text (raw reasoning lives in content[]/encrypted_content,
+	// which is stripped). Coerce to the canonical shape, keeping only well-formed
+	// summary_text entries. This is NOT the unsafe `part.thinking` fallback.
+	if (!Array.isArray(value)) return [];
+	const out: Array<{ type: "summary_text"; text: string }> = [];
+	for (const entry of value) {
+		if (isObj(entry) && entry.type === "summary_text" && typeof entry.text === "string") {
+			out.push({ type: "summary_text", text: entry.text });
+		}
+	}
+	return out;
+}
+
 function buildReasoningItem(part: ThinkingContent): ReasoningOutputItem {
 	const baseId = part.itemId ?? makeReasoningId();
 	if (part.thinkingSignature) {
@@ -548,10 +591,15 @@ function buildReasoningItem(part: ThinkingContent): ReasoningOutputItem {
 				// Preserve any extra fields (encrypted_content, …) the original carried,
 				// but normalize the summary into the canonical `{type, text}[]` shape.
 				const merged: Record<string, unknown> = { ...sigParsed, type: "reasoning", id };
-				merged.summary = [{ type: "summary_text", text: part.thinking }];
-				// `content[]` is the encrypted/raw side-channel; leave whatever was
-				// already there. If absent, omit — real OpenAI only emits `content[]`
-				// when `include=['reasoning.encrypted_content']` is set.
+				merged.summary =
+					part.provenance === "summary" || part.provenance === "mixed"
+						? envelopeSummaryParts(part)
+						: normalizeSummaryParts(sigParsed.summary);
+				// Strip any `content[]` (raw `reasoning_text`) the serialized signature
+				// carried: raw chain-of-thought must never surface in the public final
+				// envelope (#2304 CoT boundary). Opaque top-level `encrypted_content`
+				// (when present) is a separate field and is preserved by the spread above.
+				delete merged.content;
 				return merged as ReasoningOutputItem;
 			}
 		} catch {
@@ -561,7 +609,7 @@ function buildReasoningItem(part: ThinkingContent): ReasoningOutputItem {
 	return {
 		type: "reasoning",
 		id: baseId,
-		summary: [{ type: "summary_text", text: part.thinking }],
+		summary: envelopeSummaryParts(part),
 	};
 }
 
@@ -701,7 +749,8 @@ interface OpenReasoning {
 	kind: "reasoning";
 	itemId: string;
 	outputIndex: number;
-	reasoningText: string;
+	summaryText: string;
+	summaryPartText: string;
 }
 interface OpenFunctionCall {
 	kind: "function_call";
@@ -781,16 +830,13 @@ export function encodeStream(
 					summary: [] as Array<{ type: "summary_text"; text: string }>,
 				};
 				emit("response.output_item.added", { output_index: outputIndex, item });
-				// Open the summary part. Real OpenAI streams summary text in the
-				// canonical `reasoning_summary_*` lifecycle; pi-ai's own decoder
-				// reads `summary[].text` from the eventual `output_item.done`.
-				emit("response.reasoning_summary_part.added", {
-					item_id: itemId,
-					output_index: outputIndex,
-					summary_index: 0,
-					part: { type: "summary_text", text: "" },
-				});
-				const next: OpenReasoning = { kind: "reasoning", itemId, outputIndex, reasoningText: "" };
+				const next: OpenReasoning = {
+					kind: "reasoning",
+					itemId,
+					outputIndex,
+					summaryText: "",
+					summaryPartText: "",
+				};
 				state.open = next;
 				return next;
 			};
@@ -856,18 +902,21 @@ export function encodeStream(
 						content: state.open.content,
 					});
 				} else if (state.open.kind === "reasoning") {
-					const summary = [{ type: "summary_text" as const, text: state.open.reasoningText ?? "" }];
-					const item = {
+					const summary = state.open.summaryText
+						? [{ type: "summary_text" as const, text: state.open.summaryText }]
+						: [];
+					// Final reasoning envelope carries the displayable summary ONLY. Raw
+					// chain-of-thought is streamed live via response.reasoning_text.delta
+					// (the internal raw channel) and is deliberately NOT persisted into the
+					// terminal item's content[] — the public final envelope must never carry
+					// raw CoT (#2304 CoT boundary).
+					const item: ReasoningOutputItem = {
 						type: "reasoning",
 						id: state.open.itemId,
 						summary,
 					};
 					emit("response.output_item.done", { output_index: state.open.outputIndex, item });
-					finishedItems.push({
-						type: "reasoning",
-						id: state.open.itemId,
-						summary,
-					});
+					finishedItems.push(item);
 				} else {
 					const text = state.open.argsText ?? "";
 					if (state.open.customWireName) {
@@ -1006,9 +1055,34 @@ export function encodeStream(
 							break;
 						}
 						case "thinking_delta": {
+							// Raw reasoning is private. The public Responses gateway emits only
+							// provider-displayable reasoning_summary_* events.
+							break;
+						}
+						case "thinking_end": {
+							if (state.open?.kind !== "reasoning") break;
+							// Raw reasoning is intentionally omitted from every public gateway
+							// frame. Only reasoning_summary_* events populate the terminal item.
+							closeOpen();
+							break;
+						}
+						case "reasoning_summary_start": {
 							if (state.open?.kind !== "reasoning") break;
 							const cur: OpenReasoning = state.open;
-							cur.reasoningText += ev.delta;
+							cur.summaryPartText = "";
+							emit("response.reasoning_summary_part.added", {
+								item_id: cur.itemId,
+								output_index: cur.outputIndex,
+								summary_index: 0,
+								part: { type: "summary_text", text: "" },
+							});
+							break;
+						}
+						case "reasoning_summary_delta": {
+							if (state.open?.kind !== "reasoning") break;
+							const cur: OpenReasoning = state.open;
+							cur.summaryPartText += ev.delta;
+							cur.summaryText += ev.delta;
 							emit("response.reasoning_summary_text.delta", {
 								item_id: cur.itemId,
 								output_index: cur.outputIndex,
@@ -1017,11 +1091,13 @@ export function encodeStream(
 							});
 							break;
 						}
-						case "thinking_end": {
+						case "reasoning_summary_end": {
 							if (state.open?.kind !== "reasoning") break;
 							const cur: OpenReasoning = state.open;
-							const text = ev.content ?? cur.reasoningText;
-							cur.reasoningText = text;
+							const text = ev.content ?? cur.summaryPartText;
+							// A separator-only accumulated summary (e.g. a part.done "\n\n" before any
+							// real text) is treated as empty so the real end content wins.
+							if (!cur.summaryText.trim()) cur.summaryText = text;
 							emit("response.reasoning_summary_text.done", {
 								item_id: cur.itemId,
 								output_index: cur.outputIndex,
@@ -1034,7 +1110,6 @@ export function encodeStream(
 								summary_index: 0,
 								part: { type: "summary_text", text },
 							});
-							closeOpen();
 							break;
 						}
 						case "toolcall_start": {

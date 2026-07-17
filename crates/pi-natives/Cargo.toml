@@ -56,6 +56,7 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true
+windows-sys.workspace = true
 
 [build-dependencies]
 napi-build.workspace = true

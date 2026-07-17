@@ -30,6 +30,33 @@ class ProxyMessageEventStream extends EventStream<AssistantMessageEvent, Assista
 	}
 }
 
+interface ReasoningBuffers {
+	summary: string;
+	raw: string;
+}
+
+const reasoningBuffers = new WeakMap<object, ReasoningBuffers>();
+
+function materializeReasoningProvenance(
+	content: Extract<AssistantMessage["content"][number], { type: "thinking" }>,
+): void {
+	const buffers = reasoningBuffers.get(content);
+	if (!buffers) return;
+	const mutable = content as { provenance?: "summary" | "raw" | "mixed"; summaryText?: string; rawText?: string };
+	if (mutable.provenance === undefined) {
+		if (mutable.summaryText === undefined && buffers.summary) mutable.summaryText = buffers.summary;
+		if (mutable.rawText === undefined && buffers.raw) mutable.rawText = buffers.raw;
+		mutable.provenance =
+			buffers.summary && buffers.raw ? "mixed" : buffers.summary ? "summary" : buffers.raw ? "raw" : undefined;
+	}
+	// Finalized display string must exclude raw CoT when a summary exists (parity with
+	// the Responses/Codex decoders): summary/mixed -> summary only; raw-only -> raw. The
+	// raw text stays available separately via rawText for explicit consumers.
+	const effSummary = mutable.summaryText ?? buffers.summary;
+	const effRaw = mutable.rawText ?? buffers.raw;
+	content.thinking = mutable.provenance === "raw" ? effRaw : effSummary || effRaw;
+}
+
 /**
  * Proxy event types - server sends these with partial field stripped to reduce bandwidth.
  */
@@ -41,6 +68,9 @@ export type ProxyAssistantMessageEvent =
 	| { type: "thinking_start"; contentIndex: number }
 	| { type: "thinking_delta"; contentIndex: number; delta: string }
 	| { type: "thinking_end"; contentIndex: number; contentSignature?: string }
+	| { type: "reasoning_summary_start"; contentIndex: number }
+	| { type: "reasoning_summary_delta"; contentIndex: number; delta: string }
+	| { type: "reasoning_summary_end"; contentIndex: number; content?: string }
 	| { type: "toolcall_start"; contentIndex: number; id: string; toolName: string }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string }
 	| { type: "toolcall_end"; contentIndex: number }
@@ -238,14 +268,22 @@ function processProxyEvent(
 			throw new Error("Received text_end for non-text content");
 		}
 
-		case "thinking_start":
-			partial.content[proxyEvent.contentIndex] = { type: "thinking", thinking: "" };
+		case "thinking_start": {
+			const content = { type: "thinking", thinking: "" } as Extract<
+				AssistantMessage["content"][number],
+				{ type: "thinking" }
+			>;
+			partial.content[proxyEvent.contentIndex] = content;
+			reasoningBuffers.set(content, { summary: "", raw: "" });
 			return { type: "thinking_start", contentIndex: proxyEvent.contentIndex, partial };
+		}
 
 		case "thinking_delta": {
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "thinking") {
 				content.thinking += proxyEvent.delta;
+				const buffers = reasoningBuffers.get(content);
+				if (buffers) buffers.raw += proxyEvent.delta;
 				return {
 					type: "thinking_delta",
 					contentIndex: proxyEvent.contentIndex,
@@ -256,10 +294,52 @@ function processProxyEvent(
 			throw new Error("Received thinking_delta for non-thinking content");
 		}
 
+		case "reasoning_summary_start":
+			return { type: "reasoning_summary_start", contentIndex: proxyEvent.contentIndex, partial };
+
+		case "reasoning_summary_delta": {
+			const content = partial.content[proxyEvent.contentIndex];
+			if (content?.type === "thinking") {
+				content.thinking += proxyEvent.delta;
+				const buffers = reasoningBuffers.get(content);
+				if (buffers) buffers.summary += proxyEvent.delta;
+				return {
+					type: "reasoning_summary_delta",
+					contentIndex: proxyEvent.contentIndex,
+					delta: proxyEvent.delta,
+					partial,
+				};
+			}
+			throw new Error("Received reasoning_summary_delta for non-thinking content");
+		}
+
+		case "reasoning_summary_end": {
+			const content = partial.content[proxyEvent.contentIndex];
+			if (content?.type === "thinking") {
+				const buffers = reasoningBuffers.get(content);
+				// Final-only summaries arrive with the text on the end event and no summary
+				// deltas, so the accumulated buffer is empty. Prefer the end event's content
+				// so the summary survives the proxy and materializes as provenance "summary".
+				if (buffers && !buffers.summary.trim() && proxyEvent.content) {
+					buffers.summary = proxyEvent.content;
+					if (!content.thinking.trim()) content.thinking = proxyEvent.content;
+				}
+				materializeReasoningProvenance(content);
+				return {
+					type: "reasoning_summary_end",
+					contentIndex: proxyEvent.contentIndex,
+					content: buffers?.summary || proxyEvent.content || "",
+					partial,
+				};
+			}
+			throw new Error("Received reasoning_summary_end for non-thinking content");
+		}
+
 		case "thinking_end": {
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "thinking") {
 				content.thinkingSignature = proxyEvent.contentSignature;
+				materializeReasoningProvenance(content);
 				return {
 					type: "thinking_end",
 					contentIndex: proxyEvent.contentIndex,

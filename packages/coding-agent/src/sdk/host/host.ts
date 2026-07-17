@@ -14,7 +14,13 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	installProviderDefinitions?: (capability: string, definitions: unknown) => void;
 	onProviderDefinitionsRemoved?: (capability: string) => void;
 	onReverseCancel?: (requestId: string, reason: "provider_disconnected" | "lease_released") => void;
+	/** Best-effort capabilities mirrored from the native transport for out-of-band consumers. */
+	connectionCapabilities?: (connectionId: string) => ReadonlySet<string>;
 }
+
+const TOOL_ACTIVITY_V1 = "tool_activity_v1";
+const CAP_GATED_FRAME_KINDS = new Set(["tool_activity", "reasoning_summary"]);
+const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 
 /** SDK hosting is independent of notification configuration. Only root sessions host an endpoint. */
 export function shouldHostSdk(_settings: unknown, isTopLevel: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
@@ -200,11 +206,20 @@ export class SessionSdkHost {
 					const sinceGeneration = rawGeneration;
 					const sinceSeq = rawSeq;
 					const replay = this.events.replay(sinceSeq, sinceGeneration);
+					const capabilities = Array.isArray(frame.capabilities)
+						? new Set(
+								frame.capabilities.filter((capability): capability is string => typeof capability === "string"),
+							)
+						: (this.#options.connectionCapabilities?.(connectionId) ?? EMPTY_CAPABILITIES);
+					const events = replay.events.filter(
+						event => !CAP_GATED_FRAME_KINDS.has(String(event.kind)) || capabilities.has(TOOL_ACTIVITY_V1),
+					);
 					await this.#send(connectionId, {
 						type: "event_replay_result",
 						id,
 						ok: true,
 						...replay,
+						events,
 						generation: this.events.generation,
 						lastSeq: this.events.sequence,
 					});

@@ -21,6 +21,7 @@ import type {
 	SimpleStreamOptions,
 	Static,
 	TextContent,
+	Tool,
 	TSchema,
 	UsageReport,
 } from "@gajae-code/ai";
@@ -271,7 +272,11 @@ export interface ExtensionUIContext {
 	/** Get current tool output expansion state. */
 	getToolsExpanded(): boolean;
 
-	/** Set tool output expansion state. */
+	/**
+	 * Set tool output expansion state. This is an explicit fold choice, pinning
+	 * existing tool and read components for their renderer instance lifetime,
+	 * the same as the user shortcut.
+	 */
 	setToolsExpanded(expanded: boolean): void;
 }
 
@@ -352,6 +357,8 @@ export interface ExtensionContext {
 	getQueuedMessages(): unknown[];
 	getActiveTools(): string[];
 	getAllTools(): string[];
+	/** Resolve display-safe metadata for a configured tool without exposing its implementation. */
+	resolveTool(name: string): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 	/** Session control seams used by the SDK host. */
 	cycleModel(): Promise<{ model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined>;
 	cycleThinkingLevel(): ThinkingLevel | undefined;
@@ -587,6 +594,26 @@ export interface MessageUpdateEvent {
 	type: "message_update";
 	message: AgentMessage;
 	assistantMessageEvent: AssistantMessageEvent;
+}
+
+export interface ReasoningSummaryStartEvent {
+	type: "reasoning_summary_start";
+	message: AgentMessage;
+	contentIndex: number;
+}
+
+export interface ReasoningSummaryDeltaEvent {
+	type: "reasoning_summary_delta";
+	message: AgentMessage;
+	contentIndex: number;
+	delta: string;
+}
+
+export interface ReasoningSummaryEndEvent {
+	type: "reasoning_summary_end";
+	message: AgentMessage;
+	contentIndex: number;
+	content: string;
 }
 
 /** Fired when a message ends */
@@ -838,6 +865,9 @@ export type ExtensionEvent =
 	| MessageStartEvent
 	| MessageUpdateEvent
 	| MessageEndEvent
+	| ReasoningSummaryStartEvent
+	| ReasoningSummaryDeltaEvent
+	| ReasoningSummaryEndEvent
 	| ToolExecutionStartEvent
 	| ToolExecutionUpdateEvent
 	| ToolExecutionEndEvent
@@ -999,6 +1029,9 @@ export interface ExtensionAPI {
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;
 	on(event: "message_update", handler: ExtensionHandler<MessageUpdateEvent>): void;
+	on(event: "reasoning_summary_start", handler: ExtensionHandler<ReasoningSummaryStartEvent>): void;
+	on(event: "reasoning_summary_delta", handler: ExtensionHandler<ReasoningSummaryDeltaEvent>): void;
+	on(event: "reasoning_summary_end", handler: ExtensionHandler<ReasoningSummaryEndEvent>): void;
 	on(event: "message_end", handler: ExtensionHandler<MessageEndEvent>): void;
 	on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): void;
 	on(event: "tool_execution_update", handler: ExtensionHandler<ToolExecutionUpdateEvent>): void;
@@ -1103,6 +1136,8 @@ export interface ExtensionAPI {
 
 	/** Get all configured tools (built-in + extension tools). */
 	getAllTools(): string[];
+	/** Resolve display-safe metadata for a configured tool without exposing its implementation. */
+	resolveTool(name: string): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 
 	/** Set the active tools by name. */
 	setActiveTools(toolNames: string[]): Promise<void>;
@@ -1304,6 +1339,7 @@ export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => 
 export type GetActiveToolsHandler = () => string[];
 
 export type GetAllToolsHandler = () => string[];
+export type ResolveToolHandler = (name: string) => Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 
 export type GetCommandsHandler = () => SlashCommandInfo[];
 
@@ -1349,6 +1385,7 @@ export interface ExtensionActions {
 	setLabel: (targetId: string, label: string | undefined) => void;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
+	resolveTool: ResolveToolHandler;
 	setActiveTools: SetActiveToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
@@ -1381,6 +1418,7 @@ export interface ExtensionContextActions {
 	getQueuedMessages?: () => unknown[];
 	getActiveTools?: () => string[];
 	getAllTools?: () => string[];
+	resolveTool?: (name: string) => Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;

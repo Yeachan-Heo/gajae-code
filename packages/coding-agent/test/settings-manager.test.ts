@@ -512,4 +512,23 @@ describe("Settings", () => {
 			});
 		});
 	});
+
+	it("loads the managed session migration policy from scoped settings", async () => {
+		await writeSettings({ session: { directoryMigration: "disabled" } });
+		const scoped = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		expect(scoped.get("session.directoryMigration")).toBe("disabled");
+		expect(Settings.isolated().get("session.directoryMigration")).toBe("copy-retain");
+	});
+
+	it("rejects invalid managed session migration overrides", () => {
+		const invalid = Settings.isolated({ "session.directoryMigration": "merge" });
+		expect(invalid.get("session.directoryMigration")).toBe("copy-retain");
+	});
+
+	it("keeps the generated schema migration enum and default in sync", async () => {
+		const schema = JSON.parse(await Bun.file(new URL("../../../schemas/config.schema.json", import.meta.url)).text());
+		const migration = schema?.properties?.session?.properties?.directoryMigration;
+		expect(migration?.default).toBe("copy-retain");
+		expect(migration?.enum).toEqual(["copy-retain", "disabled"]);
+	});
 });

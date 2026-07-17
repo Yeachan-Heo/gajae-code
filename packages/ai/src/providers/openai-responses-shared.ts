@@ -376,6 +376,9 @@ export async function processResponsesStream<TApi extends Api>(
 		item: StreamItem;
 		block: StreamBlock;
 		blockContentIndex: number;
+		summaryBuffer: string;
+		rawBuffer: string;
+		summaryStarted: boolean;
 	}
 	// Per-item argument buffer keyed on stable item identity. Multiple tool-call
 	// items can stream interleaved argument deltas in one response, so a single
@@ -412,7 +415,14 @@ export async function processResponsesStream<TApi extends Api>(
 	};
 	const registerEntry = (item: StreamItem, block: StreamBlock, outputIndex: number | undefined): ItemEntry => {
 		output.content.push(block);
-		const entry: ItemEntry = { item, block, blockContentIndex: output.content.length - 1 };
+		const entry: ItemEntry = {
+			item,
+			block,
+			blockContentIndex: output.content.length - 1,
+			summaryBuffer: "",
+			rawBuffer: "",
+			summaryStarted: false,
+		};
 		// Primary key prefers the stable item id; if the wire omits it, fall back to
 		// the positional index. A synthetic key keeps the entry addressable as lastKey
 		// for continuation-style non-tool events even when neither is present.
@@ -480,9 +490,13 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.reasoning_summary_part.added") {
 			const entry = resolveEntry(event.item_id, event.output_index, "always");
-			if (entry?.item.type === "reasoning") {
+			if (entry?.item.type === "reasoning" && entry.block.type === "thinking") {
 				entry.item.summary = entry.item.summary || [];
 				entry.item.summary.push(event.part);
+				if (!entry.summaryStarted) {
+					entry.summaryStarted = true;
+					stream.push({ type: "reasoning_summary_start", contentIndex: entry.blockContentIndex, partial: output });
+				}
 			}
 		} else if (event.type === "response.reasoning_summary_text.delta") {
 			const entry = resolveEntry(event.item_id, event.output_index, "always");
@@ -491,9 +505,10 @@ export async function processResponsesStream<TApi extends Api>(
 				const lastPart = entry.item.summary[entry.item.summary.length - 1];
 				if (lastPart) {
 					entry.block.thinking += event.delta;
+					entry.summaryBuffer += event.delta;
 					lastPart.text += event.delta;
 					stream.push({
-						type: "thinking_delta",
+						type: "reasoning_summary_delta",
 						contentIndex: entry.blockContentIndex,
 						delta: event.delta,
 						partial: output,
@@ -507,9 +522,10 @@ export async function processResponsesStream<TApi extends Api>(
 				const lastPart = entry.item.summary[entry.item.summary.length - 1];
 				if (lastPart) {
 					entry.block.thinking += "\n\n";
+					entry.summaryBuffer += "\n\n";
 					lastPart.text += "\n\n";
 					stream.push({
-						type: "thinking_delta",
+						type: "reasoning_summary_delta",
 						contentIndex: entry.blockContentIndex,
 						delta: "\n\n",
 						partial: output,
@@ -522,6 +538,7 @@ export async function processResponsesStream<TApi extends Api>(
 			const entry = resolveEntry(event.item_id, event.output_index, "always");
 			if (entry?.item.type === "reasoning" && entry.block.type === "thinking") {
 				entry.block.thinking += event.delta;
+				entry.rawBuffer += event.delta;
 				stream.push({
 					type: "thinking_delta",
 					contentIndex: entry.blockContentIndex,
@@ -608,12 +625,15 @@ export async function processResponsesStream<TApi extends Api>(
 			options?.onOutputItemDone?.(item);
 			const entry = resolveEntry(item.id, event.output_index, "never");
 			if (item.type === "reasoning") {
-				const thinking =
-					item.summary?.length > 0
-						? item.summary.map(part => part.text).join("\n\n")
-						: item.content?.[0]?.type === "reasoning_text"
-							? (item.content[0].text ?? "")
-							: "";
+				// Prefer the streamed summary buffer only when it carries real text. When it
+				// holds only synthetic separators (e.g. a part.done arrived before/without any
+				// summary_text delta), fall back to the canonical `item.summary` from
+				// output_item.done so the materialized summaryText is not blank/separator-only.
+				const bufferSummary = entry?.summaryBuffer ?? "";
+				const itemSummary = item.summary?.map(part => part.text).join("\n\n") ?? "";
+				const summaryText = bufferSummary.trim() ? bufferSummary : itemSummary;
+				const rawText =
+					entry?.rawBuffer || (item.content?.[0]?.type === "reasoning_text" ? (item.content[0].text ?? "") : "");
 				const reasoningBlock =
 					entry?.block.type === "thinking"
 						? entry.block
@@ -621,14 +641,53 @@ export async function processResponsesStream<TApi extends Api>(
 								| ThinkingContent
 								| undefined);
 				if (reasoningBlock) {
-					reasoningBlock.thinking = thinking;
+					const mutable = reasoningBlock as {
+						provenance?: "summary" | "raw" | "mixed";
+						summaryText?: string;
+						rawText?: string;
+					};
+					if (mutable.provenance === undefined) {
+						if (mutable.summaryText === undefined && summaryText) mutable.summaryText = summaryText;
+						if (mutable.rawText === undefined && rawText) mutable.rawText = rawText;
+						mutable.provenance =
+							summaryText && rawText ? "mixed" : summaryText ? "summary" : rawText ? "raw" : undefined;
+					}
+					// Finalized display string must exclude raw CoT when a summary exists.
+					// Derive it from the STORED write-once provenance fields (falling back to
+					// this event's locals only for a first classification) so a later or
+					// duplicate finalization carrying only raw can never overwrite a summary/
+					// mixed block's safe display with raw CoT. Raw-only stays raw.
+					{
+						const effSummary = mutable.summaryText ?? summaryText;
+						const effRaw = mutable.rawText ?? rawText;
+						reasoningBlock.thinking = mutable.provenance === "raw" ? effRaw : effSummary || effRaw;
+					}
 					reasoningBlock.thinkingSignature = JSON.stringify(item);
 					const reasoningBlockIndex =
 						entry?.block === reasoningBlock ? entry.blockContentIndex : output.content.indexOf(reasoningBlock);
+					if (summaryText) {
+						// If the summary text came only from the canonical item.summary (no
+						// streamed summary deltas/part.added), no reasoning_summary_start was
+						// emitted. Emit one now so consumers that open a summary on start
+						// (e.g. the Responses SSE encoder) don't receive an orphaned end.
+						if (!entry?.summaryStarted) {
+							stream.push({
+								type: "reasoning_summary_start",
+								contentIndex: reasoningBlockIndex,
+								partial: output,
+							});
+						}
+						stream.push({
+							type: "reasoning_summary_end",
+							contentIndex: reasoningBlockIndex,
+							content: summaryText,
+							partial: output,
+						});
+					}
 					stream.push({
 						type: "thinking_end",
 						contentIndex: reasoningBlockIndex,
-						content: thinking,
+						content: reasoningBlock.thinking,
 						partial: output,
 					});
 				}
