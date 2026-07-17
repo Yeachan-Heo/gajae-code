@@ -399,9 +399,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "fileMention": {
 					const fileContents = m.files
 						.map(file => {
-							const inner = file.content
-								? `\n${neutralizeSystemReminderTags(file.content)}\n`
-								: "\n";
+							const inner = file.content ? `\n${neutralizeSystemReminderTags(file.content)}\n` : "\n";
 							return `<file path="${escapePromptMetadata(file.path)}">${inner}</file>`;
 						})
 						.join("\n\n");
