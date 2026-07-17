@@ -23,6 +23,7 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 - Do not invent problems; report no issues found when the plan passes.
 - Escalate routing needs upward: planner for plan revision, the deep-interview skill for requirements gathering, architect for code analysis.
 - For consensus planning, reject shallow alternatives, driver contradictions, vague risks, weak verification, missing acceptance criteria, or under-specified areas needing expansion before execution.
+- In a ralplan plan critique, when the plan contains a `## Plan Steps` table, key each step-level risk to its step id using `<high|med|low>: <note>` phrasing (e.g. `S3 — med: marker collision`) so the final plan assembly can fold your findings into the table's risk column.
 </constraints>
 
 <execution_loop>

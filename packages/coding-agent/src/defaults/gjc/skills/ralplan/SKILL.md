@@ -87,7 +87,7 @@ The consensus workflow:
       - If the plan is crystal clear (no open assumptions or prior-context conflicts), skip straight to the step 8 final-options `ask` instead of inventing filler questions.
       - For every confirmed open item, embed the resolved outcome into the final plan under an **## Intent Reconciliation** section so the `pending approval` artifact records each decision; record any item the user explicitly defers as an open confirmation under that same section.
    d. Persist the reconciliation with `gjc ralplan --write --stage post-interview --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return the receipt/path plus a compact status (reconciled-clean / reconciled-with-revision / open-confirmations-pending) instead of pasting the full body.
-7. On reconciliation completion, re-check the review join gate (Critic `OKAY` plus Architect `CLEAR`/`APPROVE` for the same Planner artifact/pass), mark the plan `pending approval` unless explicit execution approval has already been captured, persist the ADR/final plan via `gjc ralplan --write --stage final --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT`, and do not directly edit `.gjc/_session-{sessionid}/plans`. Final plan must include ADR (Decision, Drivers, Alternatives considered, Why chosen, Consequences, Follow-ups) and, when present, the **## Intent Reconciliation** section.
+7. On reconciliation completion, re-check the review join gate (Critic `OKAY` plus Architect `CLEAR`/`APPROVE` for the same Planner artifact/pass), mark the plan `pending approval` unless explicit execution approval has already been captured, persist the ADR/final plan via `gjc ralplan --write --stage final --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT`, and do not directly edit `.gjc/_session-{sessionid}/plans`. Final plan must include ADR (Decision, Drivers, Alternatives considered, Why chosen, Consequences, Follow-ups), the **## Plan Steps** table for multi-step plans (see **Plan Steps contract** below — run `gjc plan-graph` on the assembled markdown **before** this final write), and, when present, the **## Intent Reconciliation** section.
 8. **Always** present the finalized plan via the `ask` tool (regardless of `--interactive`) with `workflowGate: { stage: "ralplan", kind: "approval" }` on the final question so RPC/headless clients receive a `ralplan`/`approval` workflow gate, not a deep-interview question gate. Use these options:
    - **Refine further** — re-run the consensus loop / request changes, then return here
    - **Approve execution via ultragoal (Recommended)** — goal-tracked autonomous execution
@@ -136,6 +136,27 @@ gjc ralplan --write --stage revision --stage_n <N> --artifact-env GJC_RALPLAN_AR
 ```
 
 Set `--planner-resumable true` only when the parent session is provably persistent; set/record `false` after an observed `context_unavailable`; otherwise omit it (unknown). Fallback flags are recorded only when a fresh-spawn fallback actually occurs: a fallback record requires `--fallback-reason` **together with** `--fallback-attempted-id` and `--fallback-stage-n` (the failed id and the pass it failed on), while `--fallback-receipt-path` (the fresh Planner's stage artifact) is optional.
+
+## Plan Steps contract (structured graph)
+
+Every **multi-step** final plan (the `final` stage / `pending-approval.md`; two or more steps with real dependencies) must include a `## Plan Steps` section with exactly this markdown table shape so the plan's dependency structure stays machine-derivable without any LLM parsing. Trivial single-step plans may omit the section.
+
+```markdown
+## Plan Steps
+
+| id | title | depends_on | role | risk | acceptance |
+|----|-------|------------|------|------|------------|
+| S1 | one-line step title | - | executor | - | executable acceptance check |
+| S2 | next step | S1 | executor | med: reviewer concern | focused test passes |
+```
+
+- `id`: `S<number>`, unique per document; `depends_on`: comma-separated step ids or `-`.
+- `role`: owning role (`executor`/`architect`/`planner`/`critic`); `acceptance`: a check that can actually be executed.
+- `risk`: `-` or `<high|med|low>: <note>`. When assembling the final plan, fold step-level risks reported by the Critic (read them from the persisted critic stage artifacts) into this column: strip the Critic's `S<id> — ` prefix, let the **highest severity** finding set the cell level (and node color), and append additional findings to the note separated by `; ` (e.g. `high: X; med: Y`). Steps without a critic finding keep `-`.
+
+**Ordering matters for artifact integrity**: generate the graph **before** the final write. Assemble the final plan markdown (with the Plan Steps table) as a temp artifact outside `.gjc`, run `gjc plan-graph <assembled-file>` on it, and only then persist via the `final` stage write — so the persisted stage artifact and `pending-approval.md` are byte-identical, already contain the generated diagram, and their receipt/ledger hashes stay truthful. Never mutate an already-persisted final stage artifact.
+
+The command deterministically derives a mermaid dependency DAG (risk-colored) and idempotently inserts it below the table. It fails closed on cycles, dangling `depends_on` references, duplicate ids, malformed rows, and duplicate sections/markers — treat such a failure as a plan defect: fix the Plan Steps table (never the generated block), re-run `gjc plan-graph`, and only present the finalized plan for approval once it passes. If it still fails after bounded repair attempts, present the plan with the parse error quoted as an open defect instead of silently skipping the graph. `--check` validates without writing; `--format ascii` previews the graph in the terminal.
 
 ## Pre-Execution Gate
 

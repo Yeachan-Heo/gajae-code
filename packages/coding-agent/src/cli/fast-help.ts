@@ -12,6 +12,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} team                 - Run tmux-backed coordinated execution
   ${APP_NAME} ultragoal            - Run durable goal execution workflow
   ${APP_NAME} ralplan              - Run consensus planning workflow
+  ${APP_NAME} plan-graph           - Insert a mermaid dependency DAG derived from a plan's Plan Steps table
   ${APP_NAME} deep-interview       - Run requirements interview workflow
   ${APP_NAME} skills               - List/read embedded workflow skills
   ${APP_NAME} config               - List, get, and set configuration values

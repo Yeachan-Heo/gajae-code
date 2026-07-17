@@ -10,6 +10,7 @@
 ### Added
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 - Added a searchable command palette with direct action dispatch; slash commands run only from an empty composer, and drafts are never touched.
+- Added `gjc plan-graph <file>`: deterministically derives a mermaid dependency DAG (with critic risk-level coloring) from a plan document's `## Plan Steps` table and idempotently inserts it between auto-generated markers; fails closed on cycles, dangling `depends_on` references, duplicate ids, and malformed rows. Supports `--check`, `--json`, and `--format mermaid|ascii` (terminal preview reuses the bundled mermaid ASCII renderer). The bundled ralplan skill now requires a `## Plan Steps` table in final plans, and the critic prompt keys step-level risks to step ids.
 
 ### Fixed
 
