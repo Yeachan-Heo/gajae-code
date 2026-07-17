@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { TextDecoder } from "node:util";
 import { loadNative } from "@gajae-code/natives/loader-state";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 
@@ -17,7 +18,7 @@ const PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 48 * 1024 * 1024;
 const MAX_PNG_BYTES = 32 * 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 65_000;
+const MAX_REQUEST_DEADLINE_MS = 65_000;
 const STARTUP_TIMEOUT_MS = 5_000;
 const LEASE_TIMEOUT_MS = 5_000;
 const TERM_TIMEOUT_MS = 1_000;
@@ -125,6 +126,40 @@ class BrokerError extends Error {
 		message = "Computer broker request failed.",
 	) {
 		super(message);
+	}
+}
+
+/** Bounded newline-delimited UTF-8 framing without decoding arbitrary socket chunks. */
+class FrameReader {
+	private parts: Buffer[] = [];
+	private size = 0;
+
+	constructor(private readonly limit: number) {}
+
+	push(chunk: Buffer): string[] {
+		const frames: string[] = [];
+		let start = 0;
+		for (let index = 0; index < chunk.length; index++) {
+			if (chunk[index] !== 0x0a) continue;
+			this.append(chunk.subarray(start, index));
+			try {
+				frames.push(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(this.parts, this.size)));
+			} catch {
+				throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker frame.");
+			}
+			this.parts = [];
+			this.size = 0;
+			start = index + 1;
+		}
+		this.append(chunk.subarray(start));
+		return frames;
+	}
+
+	private append(part: Buffer): void {
+		if (part.length === 0) return;
+		this.size += part.length;
+		if (this.size > this.limit) throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker frame.");
+		this.parts.push(part);
 	}
 }
 
@@ -305,7 +340,7 @@ function writeFrame(socket: net.Socket, frame: ResponseFrame): void {
 		socket.destroy();
 		return;
 	}
-	socket.end(`${json}\n`);
+	socket.write(`${json}\n`);
 }
 
 function errorFrame(id: string, error: unknown): ResponseFrame {
@@ -414,29 +449,52 @@ function secureRuntimeDirectory(config: { socket: string; directory: string }, r
 	}
 }
 
+const MAX_PENDING_REQUESTS = 128;
+type PendingRequest = {
+	resolve(value: unknown): void;
+	reject(error: BrokerError): void;
+};
 let leaseSocket: net.Socket | undefined;
 let leaseConfiguration: string | undefined;
 let leaseReadyPromise: Promise<void> | undefined;
+const pendingRequests = new Map<string, PendingRequest>();
+
+function clearLease(socket: net.Socket, error: BrokerError): void {
+	if (leaseSocket !== socket) return;
+	leaseSocket = undefined;
+	leaseConfiguration = undefined;
+	leaseReadyPromise = undefined;
+	for (const pending of pendingRequests.values()) pending.reject(error);
+	pendingRequests.clear();
+}
 
 function ensureComputerBrokerLease(config: { socket: string; token: string }): Promise<void> {
 	secureRuntimeDirectory({ socket: config.socket, directory: path.dirname(config.socket) }, true);
 	const identity = `${config.socket}\u0000${config.token}`;
 	if (leaseSocket && leaseConfiguration === identity && !leaseSocket.destroyed && leaseReadyPromise)
 		return leaseReadyPromise;
-	leaseSocket?.destroy();
+	if (leaseSocket) {
+		clearLease(
+			leaseSocket,
+			new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was replaced."),
+		);
+		leaseSocket.destroy();
+	}
 	const { promise, resolve, reject } = Promise.withResolvers<void>();
 	const socket = net.createConnection(config.socket);
+	const reader = new FrameReader(MAX_RESPONSE_BYTES);
+	let acknowledged = false;
 	let settled = false;
-	let buffer = "";
-	let timeout: NodeJS.Timeout | undefined;
 	const fail = (error: BrokerError): void => {
-		if (settled) return;
-		settled = true;
-		if (timeout) clearTimeout(timeout);
-		socket.destroy();
-		reject(error);
+		if (!settled) {
+			settled = true;
+			clearTimeout(timeout);
+			reject(error);
+		}
+		clearLease(socket, error);
+		if (!socket.destroyed) socket.destroy();
 	};
-	timeout = setTimeout(
+	const timeout = setTimeout(
 		() => fail(new BrokerError("COMPUTER_BROKER_TIMEOUT", "Computer broker lease timed out.")),
 		LEASE_TIMEOUT_MS,
 	);
@@ -448,42 +506,48 @@ function ensureComputerBrokerLease(config: { socket: string; token: string }): P
 		socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, type: "lease", token: config.token })}\n`),
 	);
 	socket.on("data", (chunk: Buffer) => {
-		if (settled) return;
-		buffer += chunk.toString("utf8");
-		if (Buffer.byteLength(buffer) > 1024) {
-			fail(new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker lease response."));
-			return;
-		}
-		const newline = buffer.indexOf("\n");
-		if (newline === -1) return;
-		if (buffer.slice(newline + 1).length !== 0) {
-			fail(new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker lease response."));
-			return;
-		}
+		let frames: string[];
 		try {
-			if (!leaseAckFrame(parseFrame(buffer.slice(0, newline), 1024)))
-				throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker lease response.");
-			settled = true;
-			if (timeout) clearTimeout(timeout);
-			resolve();
-		} catch (error) {
-			fail(
-				error instanceof BrokerError
-					? error
-					: new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker lease response."),
-			);
+			frames = reader.push(chunk);
+		} catch {
+			fail(new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response."));
+			return;
+		}
+		for (const line of frames) {
+			try {
+				if (!acknowledged) {
+					if (Buffer.byteLength(line) > 1024 || !leaseAckFrame(parseFrame(line, 1024)))
+						throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker lease response.");
+					acknowledged = true;
+					settled = true;
+					clearTimeout(timeout);
+					socket.unref();
+					resolve();
+					continue;
+				}
+				const frame = responseFrame(parseFrame(line, MAX_RESPONSE_BYTES));
+				if (!frame) throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response.");
+				const pending = pendingRequests.get(frame.id);
+				if (!pending) throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response.");
+				pendingRequests.delete(frame.id);
+				if (frame.ok) pending.resolve(frame.result);
+				else pending.reject(new BrokerError(frame.error.code, frame.error.message));
+			} catch (error) {
+				fail(
+					error instanceof BrokerError
+						? error
+						: new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response."),
+				);
+				return;
+			}
 		}
 	});
 	socket.once("error", () =>
 		fail(new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost.")),
 	);
 	socket.once("close", () => {
-		if (!settled) fail(new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost."));
-		if (leaseSocket === socket) {
-			leaseSocket = undefined;
-			leaseConfiguration = undefined;
-			leaseReadyPromise = undefined;
-		}
+		if (!acknowledged) fail(new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost."));
+		else clearLease(socket, new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost."));
 	});
 	return promise;
 }
@@ -518,9 +582,8 @@ export async function acquireComputerBrokerLeaseFromEnvironment(): Promise<void>
 
 export function disposeComputerBrokerLease(): void {
 	const socket = leaseSocket;
-	leaseSocket = undefined;
-	leaseConfiguration = undefined;
-	leaseReadyPromise = undefined;
+	if (socket)
+		clearLease(socket, new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was closed."));
 	socket?.destroy();
 }
 
@@ -533,78 +596,27 @@ async function request(
 	if (options.signal?.aborted) throw new BrokerError("COMPUTER_CANCELLED", "Computer broker request was cancelled.");
 	await ensureComputerBrokerLease(config);
 	if (options.signal?.aborted) throw new BrokerError("COMPUTER_CANCELLED", "Computer broker request was cancelled.");
-	const pending = Promise.withResolvers<unknown>();
-	const id = crypto.randomBytes(16).toString("hex");
+	const socket = leaseSocket;
+	if (!socket || socket.destroyed || pendingRequests.size >= MAX_PENDING_REQUESTS)
+		throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost.");
+	let id = crypto.randomBytes(16).toString("hex");
+	while (pendingRequests.has(id)) id = crypto.randomBytes(16).toString("hex");
 	const requestedTimeoutMs = options.timeoutMs;
 	const timeoutMs =
 		requestedTimeoutMs === undefined
-			? REQUEST_TIMEOUT_MS
-			: Math.max(1, Math.min(Math.ceil(requestedTimeoutMs), REQUEST_TIMEOUT_MS));
+			? MAX_REQUEST_DEADLINE_MS
+			: Math.max(1, Math.min(Math.ceil(requestedTimeoutMs), MAX_REQUEST_DEADLINE_MS));
 	const deadlineAtMs = requestedTimeoutMs === undefined ? null : Date.now() + timeoutMs;
-	let settled = false;
-	let buffer = "";
-	const socket = net.createConnection(config.socket);
-	let removeAbortListener: (() => void) | undefined;
-	const finish = (): void => {
-		clearTimeout(timeout);
-		removeAbortListener?.();
-		socket.destroy();
-	};
-	const fail = (error: BrokerError): void => {
-		if (settled) return;
-		settled = true;
-		finish();
-		pending.reject(error);
-	};
-	const timeout = setTimeout(
-		() => fail(new BrokerError("COMPUTER_BROKER_TIMEOUT", "Computer broker request timed out.")),
-		timeoutMs,
-	);
-	if (options.signal) {
-		const onAbort = (): void => fail(new BrokerError("COMPUTER_CANCELLED", "Computer broker request was cancelled."));
-		options.signal.addEventListener("abort", onAbort, { once: true });
-		removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
-		if (options.signal.aborted) onAbort();
-	}
-	socket.once("connect", () =>
+	const pending = Promise.withResolvers<unknown>();
+	pendingRequests.set(id, pending);
+	try {
 		socket.write(
 			`${JSON.stringify({ version: PROTOCOL_VERSION, type: "request", token: config.token, id, method, args, deadlineAtMs })}\n`,
-		),
-	);
-	socket.on("data", (chunk: Buffer) => {
-		buffer += chunk.toString("utf8");
-		if (Buffer.byteLength(buffer) > MAX_RESPONSE_BYTES + 1) {
-			fail(new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response."));
-			return;
-		}
-		const newline = buffer.indexOf("\n");
-		if (newline === -1) return;
-		if (buffer.slice(newline + 1).length !== 0) {
-			fail(new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response."));
-			return;
-		}
-		try {
-			const frame = responseFrame(parseFrame(buffer.slice(0, newline), MAX_RESPONSE_BYTES));
-			if (!frame || frame.id !== id)
-				throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response.");
-			settled = true;
-			finish();
-			if (frame.ok) pending.resolve(frame.result);
-			else pending.reject(new BrokerError(frame.error.code, frame.error.message));
-		} catch (error) {
-			fail(
-				error instanceof BrokerError
-					? error
-					: new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response."),
-			);
-		}
-	});
-	socket.once("error", () =>
-		fail(new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost.")),
-	);
-	socket.once("close", () => {
-		if (!settled) fail(new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost."));
-	});
+		);
+	} catch {
+		pendingRequests.delete(id);
+		throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost.");
+	}
 	return pending.promise;
 }
 
@@ -708,21 +720,20 @@ export async function runComputerBrokerServerFromEnvironment(
 		closed = true;
 		if (startupTimer) clearTimeout(startupTimer);
 		for (const client of clients) client.destroy();
-		server.close(() => removeRuntimeDirectory(config));
-		removeRuntimeDirectory(config);
-		done.resolve();
+		void actionTail
+			.catch(() => undefined)
+			.then(() => {
+				server.close(() => removeRuntimeDirectory(config));
+				removeRuntimeDirectory(config);
+				done.resolve();
+			});
 	};
 	const server = net.createServer(socket => {
 		clients.add(socket);
-		let buffer = "";
-		let received = false;
-		let requestAccepted = false;
-		let responseStarted = false;
-		const respond = (frame: ResponseFrame): void => {
-			responseStarted = true;
-			writeFrame(socket, frame);
-		};
-		const reject = (code: "COMPUTER_BROKER_AUTH" | "COMPUTER_BROKER_PROTOCOL"): void => {
+		const reader = new FrameReader(MAX_REQUEST_BYTES);
+		let firstFrame = true;
+		const respond = (frame: ResponseFrame): void => writeFrame(socket, frame);
+		const reject = (code: "COMPUTER_BROKER_AUTH" | "COMPUTER_BROKER_PROTOCOL", closeSocket = false): void => {
 			if (!socket.destroyed)
 				respond(
 					errorFrame(
@@ -735,36 +746,9 @@ export async function runComputerBrokerServerFromEnvironment(
 						),
 					),
 				);
+			if (closeSocket && !socket.destroyed) socket.end();
 		};
-		socket.on("data", (chunk: Buffer) => {
-			if (received) return socket.destroy();
-			buffer += chunk.toString("utf8");
-			if (Buffer.byteLength(buffer) > MAX_REQUEST_BYTES + 1) return socket.destroy();
-			const newline = buffer.indexOf("\n");
-			if (newline === -1) return;
-			received = true;
-			if (buffer.slice(newline + 1).length !== 0) return socket.destroy();
-			let parsed: unknown;
-			try {
-				parsed = parseFrame(buffer.slice(0, newline), MAX_REQUEST_BYTES);
-			} catch {
-				return reject("COMPUTER_BROKER_AUTH");
-			}
-			const leaseRequest = leaseFrame(parsed);
-			if (leaseRequest) {
-				if (lease || leaseRequest.token !== config.token) return reject("COMPUTER_BROKER_AUTH");
-				lease = socket;
-				if (startupTimer) clearTimeout(startupTimer);
-				socket.once("close", closeAll);
-				socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, type: "lease_ack", ok: true })}\n`);
-				return;
-			}
-			const request = requestFrame(parsed);
-			if (!request || request.token !== config.token || !lease)
-				return reject(
-					record(parsed)?.token === config.token && lease ? "COMPUTER_BROKER_PROTOCOL" : "COMPUTER_BROKER_AUTH",
-				);
-			requestAccepted = true;
+		const enqueue = (request: RequestFrame): void => {
 			if (request.deadlineAtMs !== null && request.deadlineAtMs <= Date.now()) {
 				respond(
 					errorFrame(
@@ -774,33 +758,85 @@ export async function runComputerBrokerServerFromEnvironment(
 				);
 				return;
 			}
-			actionTail = actionTail.then(async () => {
-				if (socket.destroyed) return;
-				if (request.deadlineAtMs !== null && request.deadlineAtMs <= Date.now()) {
-					respond(
-						errorFrame(
-							request.id,
-							new BrokerError("COMPUTER_CANCELLED", "Computer broker request expired before dispatch."),
-						),
+			actionTail = actionTail
+				.catch(() => undefined)
+				.then(async () => {
+					if (socket.destroyed || socket !== lease) return;
+					if (request.deadlineAtMs !== null && request.deadlineAtMs <= Date.now()) {
+						respond(
+							errorFrame(
+								request.id,
+								new BrokerError("COMPUTER_CANCELLED", "Computer broker request expired before dispatch."),
+							),
+						);
+						return;
+					}
+					try {
+						respond({
+							version: PROTOCOL_VERSION,
+							type: "response",
+							id: request.id,
+							ok: true,
+							result: await execute(controller, request),
+						});
+					} catch (error) {
+						respond(errorFrame(request.id, error));
+					}
+				});
+		};
+		socket.on("data", (chunk: Buffer) => {
+			let frames: string[];
+			try {
+				frames = reader.push(chunk);
+			} catch {
+				reject(
+					firstFrame || socket !== lease ? "COMPUTER_BROKER_AUTH" : "COMPUTER_BROKER_PROTOCOL",
+					socket !== lease,
+				);
+				return;
+			}
+			for (const line of frames) {
+				let parsed: unknown;
+				try {
+					parsed = parseFrame(line, MAX_REQUEST_BYTES);
+				} catch {
+					reject(
+						firstFrame || socket !== lease ? "COMPUTER_BROKER_AUTH" : "COMPUTER_BROKER_PROTOCOL",
+						socket !== lease,
 					);
 					return;
 				}
-				try {
-					respond({
-						version: 1,
-						type: "response",
-						id: request.id,
-						ok: true,
-						result: await execute(controller, request),
-					});
-				} catch (error) {
-					respond(errorFrame(request.id, error));
+				if (firstFrame) {
+					firstFrame = false;
+					const leaseRequest = leaseFrame(parsed);
+					if (!leaseRequest || lease || leaseRequest.token !== config.token) {
+						reject("COMPUTER_BROKER_AUTH", true);
+						return;
+					}
+					lease = socket;
+					if (startupTimer) clearTimeout(startupTimer);
+					socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, type: "lease_ack", ok: true })}\n`);
+					continue;
 				}
-			});
+				if (socket !== lease) {
+					reject("COMPUTER_BROKER_AUTH", true);
+					return;
+				}
+				const request = requestFrame(parsed);
+				if (!request || request.token !== config.token) {
+					reject(
+						!request || record(parsed)?.token === config.token
+							? "COMPUTER_BROKER_PROTOCOL"
+							: "COMPUTER_BROKER_AUTH",
+					);
+					continue;
+				}
+				enqueue(request);
+			}
 		});
 		socket.once("close", () => {
 			clients.delete(socket);
-			if (requestAccepted && !responseStarted) closeAll();
+			if (socket === lease) closeAll();
 		});
 		socket.once("error", () => socket.destroy());
 	});

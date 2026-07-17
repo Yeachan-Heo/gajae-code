@@ -439,6 +439,12 @@ describe("computer tool dispatch", () => {
 			scroll: (...args) => {
 				calls.push({ method: "scroll", args });
 			},
+			type: (...args) => {
+				calls.push({ method: "type", args });
+			},
+			keypress: (...args) => {
+				calls.push({ method: "keypress", args });
+			},
 		}));
 		const tool = new ComputerTool(
 			createSession(Settings.isolated({ "computer.enabled": true, "computer.screenshotMaxBytes": 500 * 1024 })),
@@ -447,6 +453,8 @@ describe("computer tool dispatch", () => {
 		await tool.execute("dbl", { action: "double_click", x: 1, y: 2, button: "right" });
 		await tool.execute("drag", { action: "drag", x: 1, y: 2, to_x: 3, to_y: 4 });
 		await tool.execute("scroll", { action: "scroll", x: 1, y: 2, scroll_x: 5, scroll_y: -6 });
+		await tool.execute("type", { action: "type", text: "hello" });
+		await tool.execute("keypress", { action: "keypress", keys: ["Meta", "K"] });
 
 		expect(shot.details?.screenshot).toMatchObject({
 			widthPx: 20,
@@ -460,11 +468,20 @@ describe("computer tool dispatch", () => {
 		expect(image).toMatchObject({ type: "image", mimeType: "image/png", data: "AQID" });
 		expect(shot.details?.screenshot?.path).toBeTruthy();
 		expect(await fs.stat(shot.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
-		expect(calls.map(call => call.method)).toEqual(["screenshot", "doubleClick", "drag", "scroll"]);
+		expect(calls.map(call => call.method)).toEqual([
+			"screenshot",
+			"doubleClick",
+			"drag",
+			"scroll",
+			"type",
+			"keypress",
+		]);
 		// Positional native ABI: (expectedEpoch, x, y, ...rest)
 		expect(calls[1].args).toEqual([42, 1, 2, "right"]);
 		expect(calls[2].args).toEqual([42, 1, 2, 3, 4, "left"]);
 		expect(calls[3].args).toEqual([42, 1, 2, 5, -6]);
+		expect(calls[4].args).toEqual([42, "hello"]);
+		expect(calls[5].args).toEqual([42, ["Meta", "K"]]);
 	});
 
 	it("does not invent a display epoch before any screenshot context exists", async () => {
@@ -830,6 +847,80 @@ describe("computer tool dispatch", () => {
 		expect(result.content.find(block => block.type === "image")).toMatchObject({ data: "Ag==" });
 	});
 
+	it("serializes complete transactions for one session, including post-action screenshots", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		let releaseClick: (() => void) | undefined;
+		let markClickStarted: (() => void) | undefined;
+		const clickStarted = new Promise<void>(resolve => {
+			markClickStarted = resolve;
+		});
+		setComputerControllerFactoryForTests(() => ({
+			click: async () => {
+				calls.push("click-start");
+				markClickStarted?.();
+				await new Promise<void>(resolve => {
+					releaseClick = resolve;
+				});
+				calls.push("click-end");
+			},
+			type: () => {
+				calls.push("type");
+			},
+			screenshot: () => {
+				calls.push("screenshot");
+				return { widthPx: 10, heightPx: 10, png: new Uint8Array([1]) };
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const first = tool.execute("first", {
+			action: "batch",
+			actions: [{ action: "click", x: 1, y: 2 }],
+			include_screenshot: true,
+		});
+		await clickStarted;
+		const second = tool.execute("second", { action: "type", text: "must-follow-capture" });
+		await sleep(10);
+		expect(calls).toEqual(["click-start"]);
+		releaseClick?.();
+		await Promise.all([first, second]);
+		expect(calls).toEqual(["click-start", "click-end", "screenshot", "type"]);
+	});
+
+	it("allows complete transactions from different sessions to proceed independently", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		let started = 0;
+		const releaseScreenshots: Array<() => void> = [];
+		let markBothStarted: (() => void) | undefined;
+		const bothStarted = new Promise<void>(resolve => {
+			markBothStarted = resolve;
+		});
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: async () => {
+				started += 1;
+				if (started === 2) markBothStarted?.();
+				await new Promise<void>(resolve => {
+					releaseScreenshots.push(resolve);
+				});
+				return { widthPx: 10, heightPx: 10, png: new Uint8Array([1]) };
+			},
+		}));
+		const first = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const second = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const firstExecution = first.execute("first", { action: "screenshot" });
+		const secondExecution = second.execute("second", { action: "screenshot" });
+		await bothStarted;
+		expect(started).toBe(2);
+		releaseScreenshots.forEach(resolve => {
+			resolve();
+		});
+		await Promise.all([firstExecution, secondExecution]);
+	});
+
 	it("honors nested per-step timeout values inside batches", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
@@ -877,6 +968,33 @@ describe("computer tool dispatch", () => {
 		expect(calls).toEqual(["screenshot-start"]);
 	});
 
+	it("waits for timed-out input to settle before reporting cancellation", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			type: async () => {
+				calls.push("type-start");
+				await sleep(1_100);
+				calls.push("type-end");
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		let settled = false;
+		const execution = tool.execute("slow-type", { action: "type", text: "secret", timeout: 1 }).then(result => {
+			settled = true;
+			return result;
+		});
+
+		await sleep(1_020);
+		expect(settled).toBe(false);
+		expect(calls).toEqual(["type-start"]);
+		const result = await execution;
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_CANCELLED");
+		expect(calls).toEqual(["type-start", "type-end"]);
+	});
+
 	it("honors abort signals between batch steps", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
@@ -895,20 +1013,21 @@ describe("computer tool dispatch", () => {
 		const controller = new AbortController();
 		setTimeout(() => controller.abort(), 20);
 
-		await expect(
-			tool.execute(
-				"abort-batch",
-				{
-					action: "batch",
-					actions: [
-						{ action: "click", x: 1, y: 2 },
-						{ action: "type", text: "skipped" },
-					],
-				},
-				controller.signal,
-			),
-		).rejects.toThrow("Operation aborted");
+		const execution = tool.execute(
+			"abort-batch",
+			{
+				action: "batch",
+				actions: [
+					{ action: "click", x: 1, y: 2 },
+					{ action: "type", text: "skipped" },
+				],
+			},
+			controller.signal,
+		);
+		await sleep(30);
 		expect(calls).toEqual(["click-start"]);
+		await expect(execution).rejects.toThrow("Operation aborted");
+		expect(calls).toEqual(["click-start", "click-end"]);
 	});
 
 	it("executes batch actions sequentially and reports per-step results", async () => {
@@ -946,7 +1065,7 @@ describe("computer tool dispatch", () => {
 		expect(await fs.stat(result.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
 		expect(calls.map(call => call.method)).toEqual(["screenshot", "click", "type"]);
 		expect(calls[1].args).toEqual([99, 10, 20, "left"]);
-		expect(calls[2].args).toEqual([undefined, "hello"]);
+		expect(calls[2].args).toEqual([99, "hello"]);
 	});
 
 	it("stops batch when native reports a stale display", async () => {
@@ -1044,7 +1163,7 @@ describe("computer tool dispatch", () => {
 		expect(calls.map(call => call.method)).toEqual(["screenshot"]);
 	});
 
-	it("writes an audit log record when computer.auditLog.enabled is true", async () => {
+	it("redacts optional computer audit records", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "computer-audit-"));
@@ -1052,8 +1171,13 @@ describe("computer tool dispatch", () => {
 		const auditPath = path.join(tmpDir, ".computer-audit.jsonl");
 		try {
 			setComputerControllerFactoryForTests(() => ({
-				screenshot: () => ({ widthPx: 10, heightPx: 10, png: new Uint8Array([1, 2, 3]) }),
+				screenshot: () => ({ widthPx: 10, heightPx: 20, png: new Uint8Array([1, 2, 3]) }),
 				click: () => undefined,
+				drag: () => undefined,
+				scroll: () => undefined,
+				type: () => undefined,
+				keypress: () => undefined,
+				wait: () => undefined,
 			}));
 			const tool = new ComputerTool(
 				createSession(
@@ -1061,16 +1185,73 @@ describe("computer tool dispatch", () => {
 					sessionFile,
 				),
 			);
-			await tool.execute("audit", { action: "click", x: 1, y: 2 });
-			const lines = (await fs.readFile(auditPath, "utf8")).trim().split("\n");
-			expect(lines.length).toBe(1);
-			const record = JSON.parse(lines[0]!);
-			expect(record.action).toBe("click");
-			expect(record.status).toBe("success");
-			expect(record.x).toBe(1);
-			expect(record.y).toBe(2);
-			expect(record.timestamp).toBeTruthy();
-			expect(record).not.toHaveProperty("screenshotPng");
+			await fs.writeFile(auditPath, "", { mode: 0o700 });
+			await fs.chmod(auditPath, 0o700);
+			await tool.execute("audit", {
+				action: "batch",
+				actions: [
+					{ action: "screenshot" },
+					{ action: "click", x: 1, y: 2, button: "right" },
+					{ action: "drag", x: 1, y: 2, to_x: 3, to_y: 4, button: "middle" },
+					{ action: "scroll", x: 1, y: 2, scroll_x: 3, scroll_y: -4 },
+					{ action: "type", text: "secret text" },
+					{ action: "keypress", keys: ["Meta", "S"] },
+					{ action: "wait", ms: 7 },
+				],
+			});
+			const records = (await fs.readFile(auditPath, "utf8"))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+			const allowedFields = new Set([
+				"timestamp",
+				"action",
+				"status",
+				"code",
+				"ms",
+				"screenshotWidthPx",
+				"screenshotHeightPx",
+			]);
+			for (const record of records) {
+				expect(Object.keys(record).every(key => allowedFields.has(key))).toBe(true);
+				expect(record).not.toHaveProperty("message");
+				expect(record).not.toHaveProperty("text");
+				expect(record).not.toHaveProperty("keys");
+				expect(record).not.toHaveProperty("button");
+				expect(record).not.toHaveProperty("x");
+				expect(record).not.toHaveProperty("y");
+				expect(record).not.toHaveProperty("toX");
+				expect(record).not.toHaveProperty("toY");
+				expect(record).not.toHaveProperty("scrollX");
+				expect(record).not.toHaveProperty("scrollY");
+			}
+			expect(records.find(record => record.action === "wait")?.ms).toBe(7);
+			expect(records.find(record => record.action === "screenshot")).toMatchObject({
+				screenshotWidthPx: 10,
+				screenshotHeightPx: 20,
+			});
+			const auditStat = await fs.stat(auditPath);
+			expect(auditStat.mode & 0o777).toBe(0o600);
+
+			const redirectedPath = path.join(tmpDir, "redirected.jsonl");
+			await fs.writeFile(redirectedPath, "sentinel\n", "utf8");
+			await fs.rm(auditPath);
+			await fs.symlink(redirectedPath, auditPath);
+			await tool.execute("audit-symlink", { action: "wait", ms: 1 });
+			expect(await fs.readFile(redirectedPath, "utf8")).toBe("sentinel\n");
+
+			const redirectedDirectory = path.join(tmpDir, "redirected-directory");
+			const linkedDirectory = path.join(tmpDir, "linked-directory");
+			await fs.mkdir(redirectedDirectory, { mode: 0o700 });
+			await fs.symlink(redirectedDirectory, linkedDirectory);
+			const linkedTool = new ComputerTool(
+				createSession(
+					Settings.isolated({ "computer.enabled": true, "computer.auditLog.enabled": true }),
+					path.join(linkedDirectory, "session.jsonl"),
+				),
+			);
+			await linkedTool.execute("audit-parent-symlink", { action: "wait", ms: 1 });
+			await expect(fs.stat(path.join(redirectedDirectory, ".computer-audit.jsonl"))).rejects.toThrow();
 		} finally {
 			await fs.rm(tmpDir, { recursive: true, force: true });
 		}

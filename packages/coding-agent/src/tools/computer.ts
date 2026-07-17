@@ -1,3 +1,4 @@
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -172,6 +173,21 @@ let controllerFactory: ComputerControllerFactory = createNativeComputerControlle
 let platformOverrideForTests: NodeJS.Platform | undefined;
 let archOverrideForTests: NodeJS.Architecture | undefined;
 const screenshotFallbackDirs = new WeakMap<ToolSession, Promise<string>>();
+const computerTransactionQueues = new WeakMap<ToolSession, Promise<void>>();
+
+async function serializeComputerTransaction<T>(session: ToolSession, operation: () => Promise<T>): Promise<T> {
+	const previous = computerTransactionQueues.get(session) ?? Promise.resolve();
+	const run = previous.catch(() => undefined).then(operation);
+	const tail = run.then(
+		() => undefined,
+		() => undefined,
+	);
+	computerTransactionQueues.set(session, tail);
+	return run.finally(() => {
+		if (computerTransactionQueues.get(session) === tail) computerTransactionQueues.delete(session);
+	});
+}
+
 const latestScreenshotContexts = new WeakMap<ToolSession, ScreenshotContext>();
 
 const COMPUTER_INLINE_SCREENSHOT_MAX_WIDTH = 1568;
@@ -258,6 +274,13 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<ComputerToolDetails>,
 		_ctx?: AgentToolContext,
+	): Promise<AgentToolResult<ComputerToolDetails>> {
+		return serializeComputerTransaction(this.session, () => this.#executeTransaction(params, signal));
+	}
+
+	async #executeTransaction(
+		params: ComputerParams,
+		signal?: AbortSignal,
 	): Promise<AgentToolResult<ComputerToolDetails>> {
 		const details = detailsFromParams(params);
 		const hotkey = this.session.settings.get("computer.killSwitchHotkey") as string | undefined;
@@ -488,6 +511,7 @@ async function runComputerOperation<T>(
 	operation: () => Promise<T> | T,
 	deadline: ComputerDeadline | undefined,
 	signal?: AbortSignal,
+	settleBeforeCancellation = false,
 ): Promise<T> {
 	throwIfAborted(signal);
 	const timeoutMs = remainingComputerTimeoutMs(deadline);
@@ -495,28 +519,37 @@ async function runComputerOperation<T>(
 	let removeAbortListener: (() => void) | undefined;
 	const operationPromise = Promise.resolve().then(operation);
 	operationPromise.catch(() => undefined);
-	const guards: Array<Promise<never>> = [];
+	const operationOutcome = operationPromise.then(
+		value => ({ kind: "success" as const, value }),
+		error => ({ kind: "error" as const, error }),
+	);
+	const guards: Array<Promise<{ kind: "guard"; error: Error }>> = [];
 	if (timeoutMs !== undefined) {
 		guards.push(
-			new Promise((_, reject) => {
-				timeout = setTimeout(() => reject(new ComputerTimeoutError()), timeoutMs);
+			new Promise(resolve => {
+				timeout = setTimeout(() => resolve({ kind: "guard", error: new ComputerTimeoutError() }), timeoutMs);
 			}),
 		);
 	}
 	if (signal) {
 		guards.push(
-			new Promise((_, reject) => {
-				const onAbort = () => reject(new ToolAbortError());
+			new Promise(resolve => {
+				const onAbort = () => resolve({ kind: "guard", error: new ToolAbortError() });
 				signal.addEventListener("abort", onAbort, { once: true });
 				removeAbortListener = () => signal.removeEventListener("abort", onAbort);
 			}),
 		);
 	}
 	try {
-		const result = await (guards.length > 0 ? Promise.race([operationPromise, ...guards]) : operationPromise);
+		const outcome = await (guards.length > 0 ? Promise.race([operationOutcome, ...guards]) : operationOutcome);
+		if (outcome.kind === "error") throw outcome.error;
+		if (outcome.kind === "guard") {
+			if (settleBeforeCancellation) await operationPromise;
+			throw outcome.error;
+		}
 		throwIfAborted(signal);
 		assertComputerDeadline(deadline);
-		return result;
+		return outcome.value;
 	} finally {
 		if (timeout) clearTimeout(timeout);
 		removeAbortListener?.();
@@ -588,13 +621,20 @@ function dispatchComputerAction(
 						signal,
 					);
 				case "type":
-					return invokeComputerController(controller, "type", "type", [undefined, params.text], deadline, signal);
+					return invokeComputerController(
+						controller,
+						"type",
+						"type",
+						[expectedEpoch, params.text],
+						deadline,
+						signal,
+					);
 				case "keypress":
 					return invokeComputerController(
 						controller,
 						"keypress",
 						"keypress",
-						[undefined, params.keys],
+						[expectedEpoch, params.keys],
 						deadline,
 						signal,
 					);
@@ -611,6 +651,7 @@ function dispatchComputerAction(
 		},
 		deadline,
 		signal,
+		params.action !== "screenshot" && params.action !== "wait",
 	);
 }
 
@@ -879,18 +920,9 @@ interface ComputerAuditRecord {
 	action: ComputerActionName;
 	status: "success" | "error" | "disabled";
 	code?: string;
-	x?: number;
-	y?: number;
-	toX?: number;
-	toY?: number;
-	scrollX?: number;
-	scrollY?: number;
-	button?: string;
-	keys?: string[];
 	ms?: number;
 	screenshotWidthPx?: number;
 	screenshotHeightPx?: number;
-	message?: string;
 }
 
 function auditRecordFromDetails(details: ComputerToolDetails): ComputerAuditRecord {
@@ -900,28 +932,60 @@ function auditRecordFromDetails(details: ComputerToolDetails): ComputerAuditReco
 		status: details.status,
 	};
 	if (details.code) record.code = details.code;
-	if (details.x !== undefined) record.x = details.x;
-	if (details.y !== undefined) record.y = details.y;
-	if (details.toX !== undefined) record.toX = details.toX;
-	if (details.toY !== undefined) record.toY = details.toY;
-	if (details.scrollX !== undefined) record.scrollX = details.scrollX;
-	if (details.scrollY !== undefined) record.scrollY = details.scrollY;
-	if (details.button) record.button = details.button;
-	if (details.keys) record.keys = details.keys;
 	if (details.ms !== undefined) record.ms = details.ms;
 	if (details.screenshot) {
 		record.screenshotWidthPx = details.screenshot.widthPx;
 		record.screenshotHeightPx = details.screenshot.heightPx;
 	}
-	if (details.message) record.message = details.message;
 	return record;
+}
+
+async function isSecureComputerAuditDirectory(directory: string): Promise<boolean> {
+	const resolved = path.resolve(directory);
+	const root = path.parse(resolved).root;
+	const segments = path.relative(root, resolved).split(path.sep).filter(Boolean);
+	if (segments.length === 0) return false;
+	let current = root;
+	for (const [index, segment] of segments.entries()) {
+		current = path.join(current, segment);
+		const stat = await fs.lstat(current);
+		if (stat.isSymbolicLink()) {
+			if (index === segments.length - 1 || stat.uid !== 0 || (stat.mode & 0o022) !== 0) return false;
+			continue;
+		}
+		if (!stat.isDirectory()) return false;
+		if (
+			index === segments.length - 1 &&
+			((stat.mode & 0o022) !== 0 || (typeof process.getuid === "function" && stat.uid !== process.getuid()))
+		)
+			return false;
+	}
+	return true;
+}
+
+async function appendComputerAuditRecord(auditPath: string, record: ComputerAuditRecord): Promise<void> {
+	const handle = await fs.open(
+		auditPath,
+		nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_WRONLY | nodeFs.constants.O_NOFOLLOW,
+		0o600,
+	);
+	try {
+		const stat = await handle.stat();
+		if (!stat.isFile() || (typeof process.getuid === "function" && stat.uid !== process.getuid())) return;
+		if ((stat.mode & 0o777) !== 0o600) await handle.chmod(0o600);
+		await handle.appendFile(`${JSON.stringify(record)}\n`, "utf8");
+	} finally {
+		await handle.close();
+	}
 }
 
 async function writeComputerAuditLog(session: ToolSession, details: ComputerToolDetails): Promise<void> {
 	if (!session.settings.get("computer.auditLog.enabled")) return;
 	const sessionFile = session.getSessionFile();
 	if (!sessionFile) return;
-	const auditPath = path.join(path.dirname(sessionFile), ".computer-audit.jsonl");
+	const auditDirectory = path.dirname(sessionFile);
+	if (!(await isSecureComputerAuditDirectory(auditDirectory))) return;
+	const auditPath = path.join(auditDirectory, ".computer-audit.jsonl");
 	const record = auditRecordFromDetails(details);
 	if (details.steps) {
 		for (const step of details.steps) {
@@ -929,7 +993,7 @@ async function writeComputerAuditLog(session: ToolSession, details: ComputerTool
 		}
 	}
 	try {
-		await fs.appendFile(auditPath, `${JSON.stringify(record)}\n`, "utf8");
+		await appendComputerAuditRecord(auditPath, record);
 	} catch {
 		// Audit logging is best-effort; do not let it fail the action.
 	}

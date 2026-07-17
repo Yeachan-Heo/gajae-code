@@ -35,18 +35,60 @@ afterEach(() => {
 
 function line(socketPath: string, frame: unknown): Promise<unknown> {
 	const pending = Promise.withResolvers<unknown>();
-	let buffer = "";
+	let buffer = Buffer.alloc(0);
 	const socket = net.createConnection(socketPath);
 	socket.once("connect", () => socket.write(`${JSON.stringify(frame)}\n`));
 	socket.once("error", pending.reject);
 	socket.on("data", chunk => {
-		buffer += chunk.toString();
-		const newline = buffer.indexOf("\n");
+		buffer = Buffer.concat([buffer, typeof chunk === "string" ? Buffer.from(chunk) : chunk]);
+		const newline = buffer.indexOf(0x0a);
 		if (newline === -1) return;
 		socket.destroy();
-		pending.resolve(JSON.parse(buffer.slice(0, newline)));
+		pending.resolve(JSON.parse(buffer.subarray(0, newline).toString("utf8")));
 	});
 	return pending.promise;
+}
+
+interface TestFrameWaiter {
+	promise: Promise<unknown>;
+	resolve(value: unknown): void;
+	reject(reason?: unknown): void;
+}
+
+function socketFrames(socket: net.Socket): { next(): Promise<unknown> } {
+	let buffer = Buffer.alloc(0);
+	const queued: unknown[] = [];
+	const waiters: TestFrameWaiter[] = [];
+	const fail = (error: unknown): void => {
+		for (const waiter of waiters.splice(0)) waiter.reject(error);
+	};
+	socket.on("data", chunk => {
+		buffer = Buffer.concat([buffer, typeof chunk === "string" ? Buffer.from(chunk) : chunk]);
+		while (true) {
+			const newline = buffer.indexOf(0x0a);
+			if (newline === -1) return;
+			const line = buffer.subarray(0, newline);
+			buffer = buffer.subarray(newline + 1);
+			try {
+				const frame: unknown = JSON.parse(line.toString("utf8"));
+				const waiter = waiters.shift();
+				if (waiter) waiter.resolve(frame);
+				else queued.push(frame);
+			} catch (error) {
+				fail(error);
+			}
+		}
+	});
+	socket.once("error", fail);
+	socket.once("close", () => fail(new Error("socket closed before frame")));
+	return {
+		next: () => {
+			if (queued.length > 0) return Promise.resolve(queued.shift());
+			const waiter = Promise.withResolvers<unknown>();
+			waiters.push(waiter);
+			return waiter.promise;
+		},
+	};
 }
 
 async function waitForSocket(socketPath: string): Promise<void> {
@@ -55,6 +97,23 @@ async function waitForSocket(socketPath: string): Promise<void> {
 		await Bun.sleep(5);
 	}
 	throw new Error("broker socket did not start");
+}
+
+async function listen(server: net.Server, socketPath: string): Promise<void> {
+	const listening = Promise.withResolvers<void>();
+	server.once("error", listening.reject);
+	server.listen(socketPath, listening.resolve);
+	await listening.promise;
+	fs.chmodSync(socketPath, 0o600);
+}
+
+async function closeServer(server: net.Server): Promise<void> {
+	const closed = Promise.withResolvers<void>();
+	server.close(error => {
+		if (error) closed.reject(error);
+		else closed.resolve();
+	});
+	await closed.promise;
 }
 
 describe("computer broker", () => {
@@ -185,6 +244,16 @@ describe("computer broker", () => {
 			await leaseConnected.promise;
 			const competingLease = await line(socket, { version: 1, type: "lease", token });
 			expect(competingLease).toMatchObject({ ok: false, error: { code: "COMPUTER_BROKER_AUTH" } });
+			const tokenBearingRequest = await line(socket, {
+				version: 1,
+				type: "request",
+				token,
+				id: "stolen-token",
+				method: "screenshot",
+				args: [],
+				deadlineAtMs: Date.now() + 1_000,
+			});
+			expect(tokenBearingRequest).toMatchObject({ ok: false, error: { code: "COMPUTER_BROKER_AUTH" } });
 			const malformed = await line(socket, {
 				version: 1,
 				type: "request",
@@ -193,7 +262,7 @@ describe("computer broker", () => {
 				method: "click",
 				args: [null, 1],
 			});
-			expect(malformed).toMatchObject({ ok: false, error: { code: "COMPUTER_BROKER_PROTOCOL" } });
+			expect(malformed).toMatchObject({ ok: false, error: { code: "COMPUTER_BROKER_AUTH" } });
 			lease.destroy();
 			await server;
 			expect(fs.existsSync(socket)).toBe(false);
@@ -202,6 +271,160 @@ describe("computer broker", () => {
 			} catch {}
 		},
 	);
+
+	it.if(process.platform === "darwin")(
+		"reassembles fragmented multibyte request frames on the owner lease",
+		async () => {
+			const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-unicode-"));
+			const socketPath = path.join(directory, "broker.sock");
+			const token = "7".repeat(64);
+			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			const typed: string[] = [];
+			const server = runComputerBrokerServerFromEnvironment({
+				controller: {
+					type: (_epoch, text) => {
+						typed.push(text);
+					},
+				},
+				startupTimeoutMs: 1_000,
+			});
+			await waitForSocket(socketPath);
+			const lease = net.createConnection(socketPath);
+			const frames = socketFrames(lease);
+			await new Promise<void>((resolve, reject) => {
+				lease.once("connect", resolve);
+				lease.once("error", reject);
+			});
+			lease.write(`${JSON.stringify({ version: 1, type: "lease", token })}\n`);
+			expect(await frames.next()).toMatchObject({ version: 1, type: "lease_ack", ok: true });
+			const text = "한글🙂";
+			const request = Buffer.from(
+				`${JSON.stringify({
+					version: 1,
+					type: "request",
+					token,
+					id: "unicode",
+					method: "type",
+					args: [null, text],
+					deadlineAtMs: Date.now() + 1_000,
+				})}\n`,
+				"utf8",
+			);
+			const multibyteStart = request.indexOf(Buffer.from("한", "utf8"));
+			expect(multibyteStart).toBeGreaterThan(0);
+			lease.write(request.subarray(0, multibyteStart + 1));
+			await Bun.sleep(1);
+			lease.write(request.subarray(multibyteStart + 1));
+			expect(await frames.next()).toMatchObject({ version: 1, type: "response", id: "unicode", ok: true });
+			expect(typed).toEqual([text]);
+			lease.destroy();
+			await server;
+			expect(fs.existsSync(socketPath)).toBe(false);
+			expect(fs.existsSync(directory)).toBe(false);
+		},
+	);
+
+	it.if(process.platform === "darwin")(
+		"reassembles fragmented multibyte responses on the persistent lease",
+		async () => {
+			const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-response-unicode-"));
+			const socketPath = path.join(directory, "broker.sock");
+			const token = "8".repeat(64);
+			const server = net.createServer(socket => {
+				const frames = socketFrames(socket);
+				void (async () => {
+					expect(await frames.next()).toEqual({ version: 1, type: "lease", token });
+					socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
+					const request = (await frames.next()) as { id: string };
+					const response = Buffer.from(
+						`${JSON.stringify({ version: 1, type: "response", id: request.id, ok: true, result: "응답🙂" })}\n`,
+						"utf8",
+					);
+					const multibyteStart = response.indexOf(Buffer.from("응", "utf8"));
+					socket.write(response.subarray(0, multibyteStart + 1));
+					await Bun.sleep(1);
+					socket.write(response.subarray(multibyteStart + 1));
+				})().catch(() => socket.destroy());
+			});
+			await listen(server, socketPath);
+			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			const controller = createComputerBrokerControllerFromEnvironment();
+			if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
+			expect(await controller.brokerInvoke("wait", [null, 1])).toBe("응답🙂");
+			disposeComputerBrokerLease();
+			await closeServer(server);
+			fs.rmSync(directory, { recursive: true, force: true });
+		},
+	);
+
+	it.if(process.platform === "darwin")("fails the lease and pending request on an unknown response id", async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-response-id-"));
+		const socketPath = path.join(directory, "broker.sock");
+		const token = "9".repeat(64);
+		const server = net.createServer(socket => {
+			const frames = socketFrames(socket);
+			void (async () => {
+				await frames.next();
+				socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
+				await frames.next();
+				socket.write(
+					`${JSON.stringify({ version: 1, type: "response", id: "unknown", ok: true, result: null })}\n`,
+				);
+			})().catch(() => socket.destroy());
+		});
+		await listen(server, socketPath);
+		process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+		process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+		process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+		const controller = createComputerBrokerControllerFromEnvironment();
+		if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
+		try {
+			await controller.brokerInvoke("wait", [null, 1]);
+			throw new Error("expected response-id rejection");
+		} catch (error) {
+			expect((error as { code?: string }).code).toBe("COMPUTER_BROKER_PROTOCOL");
+		}
+		disposeComputerBrokerLease();
+		await closeServer(server);
+		fs.rmSync(directory, { recursive: true, force: true });
+	});
+
+	it.if(process.platform === "darwin")("rejects all pending requests when the owner lease is lost", async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-lease-loss-"));
+		const socketPath = path.join(directory, "broker.sock");
+		const token = "a".repeat(64);
+		const server = net.createServer(socket => {
+			const frames = socketFrames(socket);
+			void (async () => {
+				await frames.next();
+				socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
+				await Promise.all([frames.next(), frames.next()]);
+				socket.destroy();
+			})().catch(() => socket.destroy());
+		});
+		await listen(server, socketPath);
+		process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+		process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+		process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+		const controller = createComputerBrokerControllerFromEnvironment();
+		if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
+		const outcomes = await Promise.allSettled([
+			controller.brokerInvoke("wait", [null, 1]),
+			controller.brokerInvoke("move", [null, 1, 2]),
+		]);
+		for (const outcome of outcomes) {
+			expect(outcome.status).toBe("rejected");
+			if (outcome.status === "rejected")
+				expect((outcome.reason as { code?: string }).code).toBe("COMPUTER_BROKER_UNAVAILABLE");
+		}
+		disposeComputerBrokerLease();
+		await closeServer(server);
+		fs.rmSync(directory, { recursive: true, force: true });
+	});
 
 	it.if(process.platform === "darwin")(
 		"roundtrips screenshots and input while preserving redacted native errors",
@@ -287,19 +510,17 @@ describe("computer broker", () => {
 			if (!controller.brokerInvoke) throw new Error("expected context-aware broker invocation");
 			const blockingWait = controller.brokerInvoke("wait", [null, 50], { timeoutMs: 500 });
 			await waitStarted.promise;
+			const queuedAt = Date.now();
 			try {
 				await controller.brokerInvoke("move", [null, 3, 4], { timeoutMs: 5 });
-				throw new Error("expected broker timeout");
+				throw new Error("expected expired queued request");
 			} catch (error) {
-				expect((error as { code?: string }).code).toBe("COMPUTER_BROKER_TIMEOUT");
+				expect((error as { code?: string }).code).toBe("COMPUTER_CANCELLED");
+				expect(Date.now() - queuedAt).toBeGreaterThanOrEqual(40);
 			}
-			try {
-				await blockingWait;
-				throw new Error("expected broker shutdown");
-			} catch (error) {
-				expect((error as { code?: string }).code).toBe("COMPUTER_BROKER_UNAVAILABLE");
-			}
+			await blockingWait;
 			expect(moveCalls).toBe(0);
+
 			const abort = new AbortController();
 			abort.abort();
 			try {
@@ -316,7 +537,7 @@ describe("computer broker", () => {
 		},
 	);
 
-	it.if(process.platform === "darwin")("aborts a queued action and shuts down the leased broker", async () => {
+	it.if(process.platform === "darwin")("settles a dispatched action despite later cancellation", async () => {
 		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-abort-"));
 		const socket = path.join(directory, "broker.sock");
 		const token = "2".repeat(64);
@@ -346,23 +567,59 @@ describe("computer broker", () => {
 		const queued = controller.brokerInvoke("move", [null, 1, 1], { timeoutMs: 500, signal: abort.signal });
 		await Bun.sleep(10);
 		abort.abort();
-		try {
-			await queued;
-			throw new Error("expected queued cancellation");
-		} catch (error) {
-			expect((error as { code?: string }).code).toBe("COMPUTER_CANCELLED");
-		}
-		try {
-			await active;
-			throw new Error("expected active request shutdown");
-		} catch (error) {
-			expect((error as { code?: string }).code).toBe("COMPUTER_BROKER_UNAVAILABLE");
-		}
-		expect(moveCalls).toBe(0);
+		await queued;
+		await active;
+		expect(moveCalls).toBe(1);
+		disposeComputerBrokerLease();
 		await server;
 		expect(fs.existsSync(socket)).toBe(false);
 		expect(fs.existsSync(directory)).toBe(false);
 	});
+
+	it.if(process.platform === "darwin")(
+		"does not complete broker shutdown before an active action settles",
+		async () => {
+			const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-drain-"));
+			const socket = path.join(directory, "broker.sock");
+			const token = "3".repeat(64);
+			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socket;
+			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			const actionStarted = Promise.withResolvers<void>();
+			const releaseAction = Promise.withResolvers<void>();
+			const server = runComputerBrokerServerFromEnvironment({
+				controller: {
+					move: async () => {
+						actionStarted.resolve();
+						await releaseAction.promise;
+					},
+				},
+				startupTimeoutMs: 1_000,
+			});
+			await waitForSocket(socket);
+			const controller = createComputerBrokerControllerFromEnvironment();
+			if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
+			const invocation = controller.brokerInvoke("move", [null, 1, 2]).then(
+				() => null,
+				error => error,
+			);
+			await actionStarted.promise;
+			let serverSettled = false;
+			const serverCompletion = server.then(() => {
+				serverSettled = true;
+			});
+			disposeComputerBrokerLease();
+			await Bun.sleep(10);
+			expect(serverSettled).toBe(false);
+			releaseAction.resolve();
+			const invocationError = await invocation;
+			expect((invocationError as { code?: string }).code).toBe("COMPUTER_BROKER_UNAVAILABLE");
+			await serverCompletion;
+			expect(serverSettled).toBe(true);
+			expect(fs.existsSync(socket)).toBe(false);
+			expect(fs.existsSync(directory)).toBe(false);
+		},
+	);
 
 	it("lease initialization is a synchronous no-op without broker configuration", () => {
 		for (const key of brokerEnv) delete process.env[key];
