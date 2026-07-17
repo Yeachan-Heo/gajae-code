@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Coordinated same-scope model recovery after terminal rate limits: healthy streams remain unrestricted, while recovery waits for the provider retry deadline and admits one generation-guarded probe before releasing queued streams.
 
 ## [0.11.1] - 2026-07-16
 

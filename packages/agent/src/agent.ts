@@ -164,6 +164,8 @@ export interface AgentOptions {
 	sessionId?: string;
 	/** Provider-facing cache/session affinity identifier. */
 	providerSessionId?: string;
+	/** @internal Opaque task-subagent identity used for logical-stream 429 recovery. */
+	providerRateLimitScope?: object;
 	/**
 	 * Shared provider state map for session-scoped transport/session caches.
 	 */
@@ -339,6 +341,7 @@ export class Agent {
 	#interruptMode: "immediate" | "wait";
 	#sessionId?: string;
 	#providerSessionId?: string;
+	#providerRateLimitScope?: object;
 	#metadata?: Record<string, unknown>;
 	#metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	#providerSessionState?: Map<string, ProviderSessionState>;
@@ -414,6 +417,7 @@ export class Agent {
 		this.#sessionId = opts.sessionId;
 		this.#providerSessionId = opts.providerSessionId;
 		this.#providerSessionState = opts.providerSessionState;
+		this.#providerRateLimitScope = opts.providerRateLimitScope;
 		this.#thinkingBudgets = opts.thinkingBudgets;
 		this.#temperature = opts.temperature;
 		this.#topP = opts.topP;
@@ -1409,6 +1413,7 @@ export class Agent {
 
 		const config: AgentLoopConfig = {
 			model,
+			providerRateLimitScope: this.#providerRateLimitScope,
 			reasoning,
 			temperature: this.#temperature,
 			topP: this.#topP,

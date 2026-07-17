@@ -93,6 +93,8 @@ export type MidRunMaintenanceOutcome = "not-needed" | "pruned" | "compacted" | "
  */
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
+	/** @internal Opaque task-subagent identity used for logical-stream 429 recovery. */
+	providerRateLimitScope?: object;
 	/**
 	 * Supplies a fresh opaque token at each concrete managed transport invocation.
 	 * The callback runs at the stream boundary so controller accounting matches
