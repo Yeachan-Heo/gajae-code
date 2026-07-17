@@ -180,6 +180,14 @@ export class SessionSdkHost {
 	async #send(connectionId: string, frame: SdkFrame): Promise<void> {
 		await this.#options.sendFrame(connectionId, frame);
 	}
+	async #sendError(connectionId: string, frame: SdkFrame, error: unknown): Promise<void> {
+		try {
+			await this.#send(connectionId, errorFrame(connectionId, frame, error));
+		} catch {
+			// The original failure may be a closed transport. A second response
+			// cannot be delivered and must not escape the connection boundary.
+		}
+	}
 
 	async #onFrame(connectionId: string, frame: SdkFrame): Promise<void> {
 		try {
@@ -298,7 +306,7 @@ export class SessionSdkHost {
 					return;
 			}
 		} catch (error) {
-			await this.#send(connectionId, errorFrame(connectionId, frame, error));
+			await this.#sendError(connectionId, frame, error);
 		}
 	}
 	#observeRequest(kind: "control" | "query", connectionId: string, frame: SdkFrame): void {

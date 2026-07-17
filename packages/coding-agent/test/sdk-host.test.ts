@@ -135,4 +135,51 @@ describe("SessionSdkHost", () => {
 		});
 		await host.stop();
 	});
+	test("contains response delivery failures at the disconnected client", async () => {
+		const hostModule = new URL("../src/sdk/host/host.ts", import.meta.url).href;
+		const script = `
+			import { SessionSdkHost } from ${JSON.stringify(hostModule)};
+
+			let receive;
+			let liveDelivered = false;
+			const host = new SessionSdkHost({
+				sessionId: "s",
+				stateRoot: "/tmp/s",
+				token: "t",
+				sendFrame: (connectionId, frame) => {
+					if (connectionId === "closed") throw new Error("SDK connection is not available");
+					if (connectionId === "live" && frame.id === "live-replay") liveDelivered = true;
+				},
+				onFrame: handler => {
+					receive = handler;
+					return () => {};
+				},
+			});
+
+			await host.start();
+			receive("closed", {
+				type: "event_replay",
+				id: "closed-replay",
+				sinceGeneration: host.generation,
+				sinceSeq: 0,
+			});
+			await Bun.sleep(10);
+			receive("live", {
+				type: "event_replay",
+				id: "live-replay",
+				sinceGeneration: host.generation,
+				sinceSeq: 0,
+			});
+			await Bun.sleep(10);
+			if (!liveDelivered) throw new Error("live SDK client did not receive its response");
+			await host.stop();
+		`;
+		const child = Bun.spawn([process.execPath, "-e", script], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect(exitCode).toBe(0);
+		expect(stderr).toBe("");
+	});
 });
