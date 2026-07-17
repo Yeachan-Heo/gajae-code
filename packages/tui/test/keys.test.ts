@@ -82,8 +82,9 @@ describe("matchesKey", () => {
 	});
 	it("rejects unsupported modifiers and malformed key ordering", () => {
 		setKittyProtocolActive(true);
-		expect(matchesKey("\r", "meta+enter")).toBe(false);
-		expect(matchesKey("\x1b[13;5u", "enter+ctrl")).toBe(false);
+		const matchesKeyLoose = matchesKey as (input: string, key: string) => boolean;
+		expect(matchesKeyLoose("\r", "meta+enter")).toBe(false);
+		expect(matchesKeyLoose("\x1b[13;5u", "enter+ctrl")).toBe(false);
 		setKittyProtocolActive(false);
 	});
 

@@ -377,9 +377,6 @@ export class Settings implements NotificationSettingsReader {
 	#savePromise?: Promise<void>;
 	#pendingSaveSlot?: PendingSaveSlot;
 	#globalModelRoleTail: Promise<void> = Promise.resolve();
-	/** Legacy fallback migration warnings emitted once per settings instance. */
-	#legacyFallbackMigrationWarnings = 0;
-	#legacyFallbackMigrationGlobalFingerprint: string | undefined;
 	/** Invalid persisted busy prompt mode warning emitted once per settings instance. */
 	#busyPromptModeInvalidWarningEmitted = false;
 

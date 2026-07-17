@@ -277,7 +277,6 @@ async function createContext(options?: {
 		showWarning: vi.fn(),
 		showError,
 		showStatus,
-		showError: vi.fn(),
 
 		hasActiveBtw: vi.fn(() => false),
 	} as unknown as InteractiveModeContext;

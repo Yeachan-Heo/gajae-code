@@ -141,7 +141,6 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.editor.external` | ctrl+g | composer |
 | `app.message.followUp` | _(none)_ | composer |
 | `app.message.queue` | alt+q (darwin/win32) / alt+enter (linux) | composer |
-| `app.message.oppositeBusyMode` | super+enter (darwin) | composer |
 | `app.message.dequeue` | alt+up, alt+down | composer |
 | `app.clipboard.pasteImage` | ctrl+v (darwin/linux) / alt+v (win32) | composer |
 | `app.clipboard.copyLine` | alt+shift+l | composer |

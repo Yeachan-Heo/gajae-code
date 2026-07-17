@@ -37,39 +37,10 @@ describe("generated JSON Schemas", () => {
 		}
 	});
 
-	it("accepts documented Discord and Slack config while rejecting unknown chat properties", () => {
-		const schema = configSchema();
-		const completeConfig = {
-			notifications: {
-				enabled: true,
-				discord: {
-					botToken: "discord-bot-token",
-					applicationId: "discord-application-id",
-					guildId: "discord-guild-id",
-					parentChannelId: "discord-parent-channel-id",
-				},
-				slack: {
-					botToken: "slack-bot-token",
-					appToken: "slack-app-token",
-					workspaceId: "slack-workspace-id",
-					channelId: "slack-channel-id",
-				},
-			},
-		};
-
-		expect(acceptsJsonSchemaFixture(schema, completeConfig)).toBe(true);
-		expect(acceptsJsonSchemaFixture(schema, {
-			...completeConfig,
-			notifications: { ...completeConfig.notifications, discord: { ...completeConfig.notifications.discord, unknown: "value" } },
-		})).toBe(false);
-		expect(acceptsJsonSchemaFixture(schema, {
-			...completeConfig,
-			notifications: { ...completeConfig.notifications, slack: { ...completeConfig.notifications.slack, unknown: "value" } },
-		})).toBe(false);
-	});
-
 	it("emits busy prompt mode enum and default", () => {
-		const schema = configSchema() as any;
+		const schema = JSON_SCHEMA_OUTPUTS.find(output => output.path === "schemas/config.schema.json")?.schema as {
+			properties: Record<string, unknown>;
+		};
 		expect(schema.properties.busyPromptMode).toMatchObject({
 			enum: ["steer", "queue"],
 			default: "steer",

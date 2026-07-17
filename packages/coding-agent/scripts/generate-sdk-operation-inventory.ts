@@ -48,6 +48,14 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:markPlanCompactAbortPending": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:clearPlanCompactAbortPending": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:enqueueCustomMessageDisplay": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:removeQueuedCustomMessageByDisplayTag":
+		"interactive queue editing plumbing, not a public SDK control seam",
+	"agent_session:clearQueuedMessagePayloads":
+		"interactive queued-prompt editor restoration plumbing, not a public SDK control seam",
+	"agent_session:removeQueuedMessagePayloadForEditing":
+		"interactive queued-prompt editor restoration plumbing, not a public SDK control seam",
+	"agent_session:popLastQueuedMessagePayload":
+		"interactive queued-prompt editor restoration plumbing, not a public SDK control seam",
 	"agent_session:runMidRunMaintenanceForTests": "test-only maintenance seam, not a user-facing SDK control seam",
 	"agent_session:estimateMidRunContextTokensForTests": "test-only estimator seam, not a user-facing SDK control seam",
 	"agent_session:activeMidRunBarrierCountForTests": "read-only test seam, not a user-facing SDK control seam",

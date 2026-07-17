@@ -773,7 +773,10 @@ export class InputController {
 					},
 					composer,
 				);
-				this.ctx.showError(`Failed to submit input: ${error instanceof Error ? error.message : String(error)}`);
+				if (!this.#canModifyComposer(composer)) {
+					throw error;
+				}
+				this.ctx.showError?.(`Failed to submit input: ${error instanceof Error ? error.message : String(error)}`);
 			})
 			.finally(() => {
 				this.#submittedImageOwners.delete(pendingImages);
@@ -848,7 +851,10 @@ export class InputController {
 			if (command) {
 				if (this.ctx.session.isBashRunning) {
 					this.ctx.showWarning("A bash command is already running. Press Esc to cancel it first.");
-					this.#restoreClaimedSubmission({ text: submittedText, images: pendingImages, streamingBehavior }, composer);
+					this.#restoreClaimedSubmission(
+						{ text: submittedText, images: pendingImages, streamingBehavior },
+						composer,
+					);
 					return;
 				}
 				if (this.#canModifyComposer(composer)) {
@@ -868,7 +874,10 @@ export class InputController {
 			if (code) {
 				if (this.ctx.session.isEvalRunning) {
 					this.ctx.showWarning("A Python execution is already running. Press Esc to cancel it first.");
-					this.#restoreClaimedSubmission({ text: submittedText, images: pendingImages, streamingBehavior }, composer);
+					this.#restoreClaimedSubmission(
+						{ text: submittedText, images: pendingImages, streamingBehavior },
+						composer,
+					);
 					return;
 				}
 				if (this.#canModifyComposer(composer)) {
@@ -956,7 +965,10 @@ export class InputController {
 					if (title) {
 						const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
 						if (applied) {
-							setSessionTerminalTitle(this.ctx.sessionManager.getSessionName()!, this.ctx.sessionManager.getCwd());
+							setSessionTerminalTitle(
+								this.ctx.sessionManager.getSessionName()!,
+								this.ctx.sessionManager.getCwd(),
+							);
 							this.ctx.updateEditorBorderColor();
 						}
 					}
@@ -968,8 +980,12 @@ export class InputController {
 			const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 			this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
 
-			const preserveSuccessor = this.#canModifyComposer(composer) && this.ctx.editor.getText() !== submittedText;
-			const successorText = preserveSuccessor ? this.ctx.editor.getText() : undefined;
+			const currentComposerText = this.ctx.editor.getText();
+			const preserveSuccessor =
+				this.#canModifyComposer(composer) &&
+				currentComposerText.length > 0 &&
+				currentComposerText !== submittedText;
+			const successorText = preserveSuccessor ? currentComposerText : undefined;
 			const successorImages = preserveSuccessor ? this.ctx.pendingImages : undefined;
 			const submission = this.ctx.startPendingSubmission({ text, images }, composer);
 			if (successorText || successorImages?.length) {
@@ -1289,9 +1305,11 @@ export class InputController {
 		const images: InteractiveModeContext["pendingImages"] = [];
 		const textParts: string[] = [];
 		for (const payload of payloads) {
-			textParts.push(this.#shiftImagePlaceholders(payload.text, images.length));
-			images.push(...payload.images);
-			this.ctx.locallySubmittedUserSignatures.delete(`${payload.text}\u0000${payload.images.length}`);
+			const normalizedPayload = typeof payload === "string" ? { text: payload, images: [] } : payload;
+			const payloadImages = normalizedPayload.images ?? [];
+			textParts.push(this.#shiftImagePlaceholders(normalizedPayload.text, images.length));
+			images.push(...payloadImages);
+			this.ctx.locallySubmittedUserSignatures.delete(`${normalizedPayload.text}\u0000${payloadImages.length}`);
 		}
 		const shiftedCurrentText = this.#shiftImagePlaceholders(currentText, images.length);
 		if (shiftedCurrentText.trim()) textParts.push(shiftedCurrentText);
@@ -1520,12 +1538,16 @@ export class InputController {
 	}
 
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
-		const { steering, followUp } = this.ctx.session.clearQueuedMessagePayloads();
+		const sessionWithLegacyClear = this.ctx.session as typeof this.ctx.session & {
+			clearQueue?: () => { steering: QueuedMessagePayload[]; followUp: QueuedMessagePayload[] };
+		};
+		const queuedPayloads = this.ctx.session.clearQueuedMessagePayloads?.() ??
+			sessionWithLegacyClear.clearQueue?.() ?? { steering: [], followUp: [] };
 		const compactionQueued = (this.ctx.compactionQueuedMessages ?? []).map(
 			(entry): QueuedMessagePayload => ({ text: entry.text, images: [] }),
 		);
 		this.ctx.compactionQueuedMessages = [];
-		const allQueued = [...steering, ...followUp, ...compactionQueued];
+		const allQueued = [...queuedPayloads.steering, ...queuedPayloads.followUp, ...compactionQueued];
 		if (allQueued.length === 0) {
 			this.ctx.updatePendingMessagesDisplay();
 			if (options?.abort) {
@@ -1707,7 +1729,6 @@ export class InputController {
 
 		return images.length > 0 ? images : undefined;
 	}
-
 	#canModifyComposer(options: ComposerSubmissionOptions): boolean {
 		return canApplyComposerSubmission(options, this.ctx.editor);
 	}

@@ -63,18 +63,6 @@ export function canApplyComposerSubmission(
 	return options === undefined || (options.ownsComposer && editor === options.editor);
 }
 
-
-export type ComposerSubmissionOptions = Readonly<{
-	ownsComposer: boolean;
-	editor: CustomEditor;
-}>;
-
-export function canApplyComposerSubmission(
-	options: ComposerSubmissionOptions | undefined,
-	editor: CustomEditor,
-): boolean {
-	return options === undefined || (options.ownsComposer && editor === options.editor);
-}
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned";
 
 export type TodoItem = {

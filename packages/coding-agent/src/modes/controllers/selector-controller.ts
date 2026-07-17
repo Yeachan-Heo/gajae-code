@@ -2137,12 +2137,9 @@ export class SelectorController {
 		const previousSessionId = this.ctx.sessionManager.getSessionId();
 		const stagedDraft = await this.#stageCompactionQueueDraft();
 		if (!stagedDraft) return;
-		const migrationPolicy =
-			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 		let switched: boolean;
 		try {
-			const writableSessionPath = await SessionManager.prepareManagedCandidateForWrite(sessionPath, migrationPolicy);
-			switched = await this.ctx.session.switchSession(writableSessionPath);
+			switched = await this.ctx.session.switchSession(sessionPath);
 		} catch (error) {
 			await this.#restoreStagedDraft(stagedDraft);
 			throw error;
