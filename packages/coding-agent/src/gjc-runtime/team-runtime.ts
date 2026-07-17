@@ -530,6 +530,10 @@ export interface GjcWorkerIntegrationAttemptRequestResult {
 	status?: GjcWorkerCheckpointClassification["kind"];
 }
 
+export interface GjcWorkerIntegrationAttemptOptions {
+	signal?: AbortSignal;
+}
+
 function isGjcTeamTaskStatus(value: string): value is GjcTeamTaskStatus {
 	return ["pending", "blocked", "in_progress", "completed", "failed"].includes(value);
 }
@@ -1757,21 +1761,32 @@ function runGitResult(cwd: string, args: string[]): GitResult {
 		stderr: result.stderr.toString().trim(),
 	};
 }
-async function runGitResultAsync(cwd: string, args: string[]): Promise<GitResult> {
+async function runGitResultAsync(cwd: string, args: string[], signal?: AbortSignal): Promise<GitResult> {
 	const result = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-	const [exitCode, stdout, stderr] = await Promise.all([
-		result.exited,
-		new Response(result.stdout).text(),
-		new Response(result.stderr).text(),
-	]);
-	return {
-		ok: exitCode === 0,
-		stdout: stdout.trim(),
-		stderr: stderr.trim(),
+	const kill = () => {
+		try {
+			result.kill("SIGKILL");
+		} catch {}
 	};
+	if (signal?.aborted) kill();
+	else signal?.addEventListener("abort", kill, { once: true });
+	try {
+		const [exitCode, stdout, stderr] = await Promise.all([
+			result.exited,
+			new Response(result.stdout).text(),
+			new Response(result.stderr).text(),
+		]);
+		return {
+			ok: exitCode === 0 && !signal?.aborted,
+			stdout: stdout.trim(),
+			stderr: signal?.aborted ? "worker integration request aborted" : stderr.trim(),
+		};
+	} finally {
+		signal?.removeEventListener("abort", kill);
+	}
 }
-async function tryRunGitAsync(cwd: string, args: string[]): Promise<string | null> {
-	const result = await runGitResultAsync(cwd, args);
+async function tryRunGitAsync(cwd: string, args: string[], signal?: AbortSignal): Promise<string | null> {
+	const result = await runGitResultAsync(cwd, args, signal);
 	return result.ok ? result.stdout : null;
 }
 function runGit(cwd: string, args: string[]): string {
@@ -2441,8 +2456,8 @@ async function appendCommitHygieneEntries(config: GjcTeamConfig, entries: GjcTea
 function resolveHead(cwd: string): string | null {
 	return tryRunGit(cwd, ["rev-parse", "HEAD"]);
 }
-async function resolveHeadAsync(cwd: string): Promise<string | null> {
-	return tryRunGitAsync(cwd, ["rev-parse", "HEAD"]);
+async function resolveHeadAsync(cwd: string, signal?: AbortSignal): Promise<string | null> {
+	return tryRunGitAsync(cwd, ["rev-parse", "HEAD"], signal);
 }
 function isAncestor(cwd: string, ancestor: string, descendant: string): boolean {
 	return runGitResult(cwd, ["merge-base", "--is-ancestor", ancestor, descendant]).ok;
@@ -2463,8 +2478,8 @@ function listConflictFiles(cwd: string): string[] {
 		.map(line => line.trim())
 		.filter(Boolean);
 }
-async function listConflictFilesAsync(cwd: string): Promise<string[]> {
-	const result = await runGitResultAsync(cwd, ["diff", "--name-only", "--diff-filter=U"]);
+async function listConflictFilesAsync(cwd: string, signal?: AbortSignal): Promise<string[]> {
+	const result = await runGitResultAsync(cwd, ["diff", "--name-only", "--diff-filter=U"], signal);
 	if (!result.ok || !result.stdout) return [];
 	return result.stdout
 		.split(/\r?\n/)
@@ -2538,8 +2553,11 @@ export function classifyWorkerCheckpointStatus(cwd: string): GjcWorkerCheckpoint
 		return { kind: "protected_only", files: classified.protected };
 	return { kind: "eligible", files: classified.eligible };
 }
-export async function classifyWorkerCheckpointStatusAsync(cwd: string): Promise<GjcWorkerCheckpointClassification> {
-	const status = await runGitResultAsync(cwd, ["status", "--porcelain", "-uall"]);
+export async function classifyWorkerCheckpointStatusAsync(
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<GjcWorkerCheckpointClassification> {
+	const status = await runGitResultAsync(cwd, ["status", "--porcelain", "-uall"], signal);
 	if (!status.ok) {
 		return { kind: "git_error", files: [], detail: status.stderr || status.stdout || "git status failed" };
 	}
@@ -2549,7 +2567,7 @@ export async function classifyWorkerCheckpointStatusAsync(cwd: string): Promise<
 		.split(/\r?\n/)
 		.filter(Boolean)
 		.some(line => UNMERGED_GIT_STATUS_CODES.has(line.slice(0, 2)));
-	const conflictFiles = await listConflictFilesAsync(cwd);
+	const conflictFiles = await listConflictFilesAsync(cwd, signal);
 	if (hasUnmergedStatus || conflictFiles.length > 0) {
 		return { kind: "conflicted", files: conflictFiles.length > 0 ? conflictFiles : files };
 	}
@@ -3218,6 +3236,7 @@ function workerIntegrationFingerprint(head: string | null, classification: GjcWo
 export async function requestGjcWorkerIntegrationAttempt(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
+	options: GjcWorkerIntegrationAttemptOptions = {},
 ): Promise<GjcWorkerIntegrationAttemptRequestResult> {
 	const teamName = env.GJC_TEAM_NAME?.trim();
 	const worker = env.GJC_TEAM_WORKER_ID?.trim() || env.GJC_TEAM_INTERNAL_WORKER?.split("/").pop()?.trim();
@@ -3229,10 +3248,35 @@ export async function requestGjcWorkerIntegrationAttempt(
 	if (!worktreePath || !(await pathExists(worktreePath)))
 		return { requested: false, reason: "missing_worktree", worker, team_name: teamName };
 	const [classification, head] = await Promise.all([
-		classifyWorkerCheckpointStatusAsync(worktreePath),
-		resolveHeadAsync(worktreePath),
+		classifyWorkerCheckpointStatusAsync(worktreePath, options.signal),
+		resolveHeadAsync(worktreePath, options.signal),
 	]);
 	if (classification.kind === "git_error") {
+		const reportWorker = configuredWorker ?? {
+			id: worker,
+			name: worker,
+			index: 0,
+			agent_type: "unknown",
+			role: "unknown",
+			status: "idle",
+			last_heartbeat: now(),
+			assigned_tasks: [],
+		};
+		const detail = classification.detail;
+		await appendIntegrationEvent(dir, "worker_integration_attempt_failed", reportWorker, {
+			worker_name: worker,
+			worktree_path: worktreePath,
+			detail,
+			retryable: true,
+			summary: `retryable worker integration request failure for ${worker}: ${detail}`,
+		});
+		await notifyLeader(
+			config,
+			reportWorker,
+			`INTEGRATION RETRYABLE FAILURE: ${worker} git inspection failed (${detail}). A later turn can retry.`,
+			cwd,
+			env,
+		);
 		return { requested: false, reason: "git_error", worker, team_name: teamName, head, status: classification.kind };
 	}
 	if (classification.kind === "protected_only") {

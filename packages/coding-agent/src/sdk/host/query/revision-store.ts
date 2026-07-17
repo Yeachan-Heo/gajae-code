@@ -615,9 +615,13 @@ export class RevisionStore {
 	}
 
 	async #encode(value: unknown, append: (text: string) => Promise<void>, inArray: boolean): Promise<void> {
-		if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+		if (value === null || typeof value === "number" || typeof value === "boolean") {
 			const serialised = JSON.stringify(value);
 			return append(serialised ?? "null");
+		}
+		if (typeof value === "string") {
+			await this.#encodeString(value, append);
+			return;
 		}
 		if (typeof value === "bigint") throw new TypeError("Do not know how to serialize a BigInt");
 		if (value === undefined || typeof value === "function" || typeof value === "symbol") return append("null");
@@ -652,10 +656,6 @@ export class RevisionStore {
 		append: (text: string) => Promise<void>,
 		indexEscapedString = false,
 	): Promise<EscapedStringIndex | undefined> {
-		if (!indexEscapedString) {
-			await append(JSON.stringify(value));
-			return undefined;
-		}
 		await append('"');
 		let output = "";
 		let serializedOffset = 1;

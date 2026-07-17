@@ -946,6 +946,8 @@ describe("AgentSession message pipeline", () => {
 		const releaseIntegration = Promise.withResolvers<void>();
 		let integrationRequests = 0;
 		let failIntegration = false;
+		let neverSettle = false;
+		let integrationAborted = false;
 		const model: Model = {
 			id: "worker-integration-model",
 			name: "worker-integration-model",
@@ -975,12 +977,21 @@ describe("AgentSession message pipeline", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: { getApiKey: async () => "test-key" } as never,
-			workerIntegrationRequest: () => {
+			workerIntegrationRequest: signal => {
 				integrationRequests++;
 				if (failIntegration) throw new Error("worker integration failed");
 				integrationStarted.resolve();
+				if (neverSettle) {
+					return new Promise<void>(resolve => {
+						signal.addEventListener("abort", () => {
+							integrationAborted = true;
+							resolve();
+						});
+					});
+				}
 				return releaseIntegration.promise;
 			},
+			workerIntegrationTimeoutMs: 10,
 		});
 		sessions.push(session);
 		const events: AgentSessionEvent[] = [];
@@ -1011,6 +1022,17 @@ describe("AgentSession message pipeline", () => {
 		await session.waitForIdle();
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(3);
 		expect(integrationRequests).toBe(3);
+
+		neverSettle = true;
+		await session.prompt("hung integration");
+		await session.waitForIdle();
+		expect(integrationAborted).toBe(true);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(4);
+
+		neverSettle = false;
+		await session.prompt("available after integration timeout");
+		await session.waitForIdle();
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(5);
 	});
 	it("drains deferred agent_end extension delivery before session shutdown", async () => {
 		const extensionStarted = Promise.withResolvers<void>();

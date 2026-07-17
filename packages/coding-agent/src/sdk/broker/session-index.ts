@@ -91,6 +91,7 @@ export class SessionIndex {
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
 	#logOffset = 0;
+	#corruptSuffix = false;
 	constructor(agentDir: string) {
 		this.#agentDir = agentDir;
 	}
@@ -104,6 +105,7 @@ export class SessionIndex {
 		this.#events = [];
 		this.#warnings = [];
 		this.#logOffset = 0;
+		this.#corruptSuffix = false;
 		let snapshotSeq = 0;
 		try {
 			const snapshot = JSON.parse(await fs.readFile(snapshotFor(this.#agentDir), "utf8")) as {
@@ -174,6 +176,7 @@ export class SessionIndex {
 			else this.#events.push(event);
 		}
 		if (corrupt) {
+			this.#corruptSuffix = true;
 			this.#warn("Corrupt session index entry; replay truncated");
 			if (allowResync) await this.replay();
 		}
@@ -195,6 +198,7 @@ export class SessionIndex {
 		await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
 		return withFileLock(logFor(this.#agentDir), async () => {
 			await this.replay();
+			if (this.#corruptSuffix) throw new Error("Cannot append to corrupt session index log");
 			const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 				...input,
 				version: SDK_STATE_VERSION,

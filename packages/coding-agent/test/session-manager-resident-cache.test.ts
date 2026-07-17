@@ -62,3 +62,30 @@ describe("SessionManager resident image materialized-entry cache", () => {
 		}
 	});
 });
+
+describe("SessionManager public read snapshots", () => {
+	it("does not let production-mode public reads poison canonical session state", () => {
+		const previousNodeEnv = process.env.NODE_ENV;
+		process.env.NODE_ENV = "production";
+		try {
+			const session = SessionManager.inMemory();
+			session.appendMessage({ role: "user", content: "original", timestamp: 1 });
+
+			const entry = session.getEntries()[0];
+			const contextMessage = session.buildSessionContext().messages[0];
+			const treeEntry = session.getTree()[0]?.entry;
+			if (entry?.type !== "message" || contextMessage?.role !== "user" || treeEntry?.type !== "message") {
+				throw new Error("Expected public session message snapshots");
+			}
+			(entry.message as { content: unknown }).content = "entries poison";
+			(contextMessage as { content: unknown }).content = "context poison";
+			(treeEntry.message as { content: unknown }).content = "tree poison";
+
+			expect(session.getEntries()[0]).toMatchObject({ message: { content: "original" } });
+			expect(session.buildSessionContext().messages[0]).toMatchObject({ content: "original" });
+			expect(session.getTree()[0]?.entry).toMatchObject({ message: { content: "original" } });
+		} finally {
+			process.env.NODE_ENV = previousNodeEnv;
+		}
+	});
+});

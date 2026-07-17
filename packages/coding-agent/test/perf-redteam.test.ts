@@ -38,14 +38,16 @@ describe("perf change-set adversarial probes", () => {
 		}
 	});
 
-	it("does not apply a newer valid suffix after a corrupt line", async () => {
+	it("rejects an append after a corrupt suffix so durable events remain replayable", async () => {
 		const dir = await tempDir("gjc-perf-corrupt-");
 		try {
 			const index = await new SessionIndex(dir).open();
 			await index.append(event("prefix"));
 			await fs.appendFile(path.join(dir, "sdk", "sessions", "index.jsonl"), "{broken}\n");
 			const suffix = await new SessionIndex(dir).open();
-			await suffix.append(event("would-be-hidden"));
+			await expect(suffix.append(event("would-be-hidden"))).rejects.toThrow(
+				"Cannot append to corrupt session index log",
+			);
 			const replay = await new SessionIndex(dir).open();
 			expect(replay.listSessions().sessions.map(item => item.sessionId)).toEqual(["prefix"]);
 			expect(replay.listSessions().warnings).toContain("Corrupt session index entry; replay truncated");
@@ -84,6 +86,28 @@ describe("perf change-set adversarial probes", () => {
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
+	}, 30_000);
+
+	it("streams exact JSON escaping for large primitive, array, and object strings", async () => {
+		const text = `quote " slash \\ control \u0000 emoji 🙂 lone \ud800 ${"x".repeat(5 * 1024 * 1024)}`;
+		const values = [text, [text], { body: text }];
+		const store = new RevisionStore("s");
+		for (const [index, value] of values.entries()) {
+			const revision = await store.createRevision("resource", String(index), value);
+			let offset = 0;
+			let serialised = "";
+			for (;;) {
+				const page = await store.readRootRange("resource", String(index), revision, offset, 256 * 1024);
+				if (!page) throw new Error("missing serialized snapshot page");
+				serialised += page.body;
+				if (page.complete) break;
+				offset = page.offset + Buffer.byteLength(page.body);
+			}
+			expect(serialised).toBe(JSON.stringify(value));
+			expect(await store.readRevision("resource", String(index), revision)).toEqual(value);
+		}
+		expect(store.peakBufferedBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+		await store.close();
 	}, 30_000);
 
 	it("serializes undefined array values and rejects a one-MiB page item without over-reading", async () => {

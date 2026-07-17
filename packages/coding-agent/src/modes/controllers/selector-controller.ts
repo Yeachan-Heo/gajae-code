@@ -70,6 +70,8 @@ import {
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
+import { getTreeForInternalRead } from "../../session/session-manager-internal";
+
 import { FileSessionStorage } from "../../session/session-storage";
 import {
 	CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING,
@@ -1838,7 +1840,7 @@ export class SelectorController {
 	}
 
 	showTreeSelector(): void {
-		const tree = this.ctx.sessionManager.getTreeForRead();
+		const tree = getTreeForInternalRead(this.ctx.sessionManager);
 		const realLeafId = this.ctx.sessionManager.getLeafId();
 
 		if (tree.length === 0) {

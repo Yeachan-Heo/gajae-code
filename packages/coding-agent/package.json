@@ -120,6 +120,8 @@
 		"./modes/components/runtime-mcp-add-wizard": null,
 		"./modes/controllers/runtime-mcp-command-controller": null,
 		"./slash-commands/helpers/mcp": null,
+		"./session/session-manager-internal": null,
+		"./session/session-manager-internal.js": null,
 		"./sdk": {
 			"types": "./src/sdk/index.ts",
 			"import": "./src/sdk/index.ts"

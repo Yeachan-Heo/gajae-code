@@ -74,6 +74,7 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
+import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./session-manager-internal";
 import type {
 	SessionStorage,
 	SessionStorageSnapshot,
@@ -3533,6 +3534,11 @@ export class SessionManager {
 	#getEntriesMaterializerCallCount = 0;
 	#materializedEntriesCachePopulateCount = 0;
 	#pathOnlyContextBuildCount = 0;
+	#internalReadAccess: SessionManagerReadAccess = {
+		getEntries: () => freezeInternalReadSnapshot(this.#getMaterializedEntriesInternal()),
+		getSessionContext: () => this.#getSessionContextForRead(),
+		getTree: () => this.#getTree(freezeInternalReadSnapshot(this.#getMaterializedEntriesInternal())),
+	};
 
 	private constructor(
 		private cwd: string,
@@ -5581,14 +5587,14 @@ export class SessionManager {
 	 * Return a defensive context snapshot for public consumers.
 	 */
 	buildSessionContext(): SessionContext {
-		return cloneSessionContext(this.getSessionContextForRead());
+		return cloneSessionContext(this.#getSessionContextForRead());
 	}
 
 	/**
 	 * Return the revision-keyed context cache for internal read-only consumers.
 	 * The strong reference avoids GC-driven rebuilds during a session.
 	 */
-	getSessionContextForRead(): Readonly<SessionContext> {
+	#getSessionContextForRead(): Readonly<SessionContext> {
 		const cached = this.#sessionContextCache;
 		if (
 			cached &&
@@ -5718,14 +5724,6 @@ export class SessionManager {
 		return materializedEntries;
 	}
 
-	/**
-	 * Return the materialized entries for internal read-only consumers.
-	 * Public SDK callers must use getEntries(), which preserves the defensive-copy boundary.
-	 */
-	getEntriesForRead(): readonly SessionEntry[] {
-		return freezeInternalReadSnapshot(this.#getMaterializedEntriesInternal());
-	}
-
 	getEntries(): SessionEntry[] {
 		this.#publicMaterializerCallCount++;
 		this.#getEntriesMaterializerCallCount++;
@@ -5812,11 +5810,9 @@ export class SessionManager {
 
 		return roots;
 	}
-	/** Internal read-only tree access. */
-	getTreeForRead(): SessionTreeNode[] {
-		return this.#getTree(this.getEntriesForRead());
+	[sessionManagerReadCapability](): SessionManagerReadAccess {
+		return this.#internalReadAccess;
 	}
-
 	// =========================================================================
 	// Branching
 	// =========================================================================

@@ -7,7 +7,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, WorkerIntegrationRequestScheduler } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
@@ -66,6 +66,24 @@ describe("AgentSession abort timeout", () => {
 		expect(forcedAbort).toHaveBeenCalledTimes(1);
 		expect(session.isStreaming).toBe(false);
 		expect(notices.some(message => message.includes("Abort cleanup timed out"))).toBe(true);
+	});
+
+	it("settles a never-resolving worker integration request after aborting it", async () => {
+		let aborted = false;
+		const scheduler = new WorkerIntegrationRequestScheduler(
+			signal =>
+				new Promise<void>(() => {
+					signal.addEventListener("abort", () => {
+						aborted = true;
+					});
+				}),
+			10,
+		);
+
+		scheduler.enqueue();
+		await scheduler.flush();
+
+		expect(aborted).toBe(true);
 	});
 
 	it("bounds dispose, force-invalidates an abort-ignoring run, and drops its late events", async () => {
