@@ -5,6 +5,7 @@
 ### Fixed
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
 - Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
+- SDK session index snapshots now prune superseded per-session `host_heartbeat` rows during snapshot/rotation, so `~/.gjc/agent/sdk/sessions/` state stays bounded. Previously every live host appended a heartbeat every 5 seconds and rotation carried all of them forward into the snapshot, growing state without bound (observed >100 MB) until concurrent hosts failed with `Failed to acquire lock for .../sessions/index.jsonl after 50 attempts`. Snapshot validation now accepts the resulting sparse (strictly increasing) sequence while remaining checksum-strict; dense legacy snapshots stay valid.
 
 
 ### Fixed

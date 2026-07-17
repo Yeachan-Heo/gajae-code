@@ -52,18 +52,46 @@ const ROTATE_BYTES = 4 * 1024 * 1024;
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
 	if (!snapshot || typeof snapshot !== "object") return false;
 	const { indexSeq, events } = snapshot as { indexSeq?: unknown; events?: unknown };
-	return (
-		typeof indexSeq === "number" &&
-		Number.isSafeInteger(indexSeq) &&
-		indexSeq >= 0 &&
-		Array.isArray(events) &&
-		events.length === indexSeq &&
-		events.every((event, index) => {
-			if (!event || typeof event !== "object") return false;
-			const { checksum, ...unsigned } = event as SessionIndexEvent;
-			return event.indexSeq === index + 1 && checksum === sessionIndexChecksum(unsigned);
-		})
-	);
+	if (typeof indexSeq !== "number" || !Number.isSafeInteger(indexSeq) || indexSeq < 0 || !Array.isArray(events))
+		return false;
+	// The sequence may be sparse: snapshots prune superseded heartbeat rows, so
+	// require strictly increasing checksummed rows ending at `indexSeq` instead
+	// of a dense 1..indexSeq run. Dense legacy snapshots remain valid.
+	if (events.length === 0) return indexSeq === 0;
+	let previousSeq = 0;
+	for (const event of events) {
+		if (!event || typeof event !== "object") return false;
+		const { checksum, ...unsigned } = event as SessionIndexEvent;
+		if (
+			typeof event.indexSeq !== "number" ||
+			event.indexSeq <= previousSeq ||
+			checksum !== sessionIndexChecksum(unsigned)
+		)
+			return false;
+		previousSeq = event.indexSeq;
+	}
+	return previousSeq === indexSeq;
+}
+/**
+ * Drop `host_heartbeat` events superseded by a newer heartbeat for the same
+ * session. Only the latest heartbeat per session is observable: `listSessions`
+ * keeps the last event per session and merges heartbeat rows with the fields
+ * of the previous non-heartbeat event, and the registration lookups filter on
+ * `host_registered`/`host_unregistered`. Pruning preserves relative order and
+ * the global newest event, so `indexSeq` stays the sequence high-water mark.
+ */
+function pruneSupersededHeartbeats(events: SessionIndexEvent[]): SessionIndexEvent[] {
+	const newestHeartbeatSeen = new Set<string>();
+	const kept: SessionIndexEvent[] = [];
+	for (let i = events.length - 1; i >= 0; i--) {
+		const event = events[i]!;
+		if (event.type === "host_heartbeat") {
+			if (newestHeartbeatSeen.has(event.sessionId)) continue;
+			newestHeartbeatSeen.add(event.sessionId);
+		}
+		kept.push(event);
+	}
+	return kept.reverse();
 }
 
 async function appendSync(file: string, value: string): Promise<void> {
@@ -237,6 +265,12 @@ export class SessionIndex {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
 		}
 		if (isValidSnapshot(current) && current.indexSeq > this.indexSeq) return;
+		// Prune superseded heartbeat rows so the snapshot cannot grow without
+		// bound: every live host appends a heartbeat every few seconds, and
+		// carrying all of them forward across rotations made the state grow
+		// forever (observed >100 MB) until concurrent hosts starved on the
+		// append lock.
+		this.#events = pruneSupersededHeartbeats(this.#events);
 		const tmp = `${file}.${process.pid}.tmp`;
 		await fs.writeFile(
 			tmp,

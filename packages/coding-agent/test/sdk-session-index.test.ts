@@ -10,6 +10,7 @@ const event = (sessionId: string) => ({
 	endpointGeneration: 1,
 	pid: process.pid,
 });
+const heartbeat = (sessionId: string) => ({ ...event(sessionId), type: "host_heartbeat" as const });
 describe("SDK session index", () => {
 	it("replays only rows after the snapshotted prefix", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
@@ -218,5 +219,62 @@ describe("SDK session index", () => {
 		).toMatchObject({
 			indexSeq: expect.any(Number),
 		});
+	}, 30_000);
+	it("prunes superseded heartbeats from the snapshot so state stays bounded", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("s"));
+		for (let i = 0; i < 5; i++) await index.append(heartbeat("s"));
+		await index.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		// Only the registration and the newest heartbeat survive; the sequence
+		// high-water mark is retained.
+		expect(snapshot.events.map((e: { indexSeq: number }) => e.indexSeq)).toEqual([1, 6]);
+		expect(snapshot.indexSeq).toBe(6);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.indexSeq).toBe(6);
+		const sessions = replay.listSessions().sessions;
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0]?.sessionId).toBe("s");
+		expect(sessions[0]?.locator).toEqual({ repo: "r", stateRoot: "q" });
+		expect(replay.listSessions().warnings).toEqual([]);
+	});
+	it("keeps appending and replaying correctly from a sparse pruned snapshot", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("a"));
+		await index.append(heartbeat("a"));
+		await index.append(heartbeat("a"));
+		await index.snapshot();
+		const other = await new SessionIndex(dir).open();
+		await other.append(event("b"));
+		expect(other.indexSeq).toBe(4);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.indexSeq).toBe(4);
+		expect(
+			replay
+				.listSessions()
+				.sessions.map(session => session.sessionId)
+				.sort(),
+		).toEqual(["a", "b"]);
+		expect(replay.listSessions().warnings).toEqual([]);
+	});
+	it("bounds heartbeat-driven state across repeated rotations", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		const largeHeartbeat = () => ({
+			...heartbeat("s"),
+			locator: { repo: "r".repeat(600_000), stateRoot: "q" },
+		});
+		await index.append({ ...event("s"), locator: { repo: "r".repeat(600_000), stateRoot: "q" } });
+		// Enough oversized heartbeats to force several rotations.
+		for (let i = 0; i < 24; i++) await index.append(largeHeartbeat());
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		// Snapshot carries at most the registration plus the latest heartbeat
+		// per session instead of every heartbeat ever appended.
+		expect(snapshot.events.length).toBeLessThanOrEqual(3);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.indexSeq).toBe(25);
+		expect(replay.listSessions().sessions).toHaveLength(1);
 	}, 30_000);
 });
