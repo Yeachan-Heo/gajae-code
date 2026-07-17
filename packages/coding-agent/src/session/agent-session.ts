@@ -6058,7 +6058,11 @@ export class AgentSession {
 		if (typeof args !== "string")
 			throw Object.assign(new Error("skill.invoke args must be a string."), { code: "invalid_input" });
 		const skill = this.skills.find(candidate => candidate.name === skillName);
-		if (!skill) throw Object.assign(new Error(`Skill ${skillName} was not found.`), { code: "invalid_input" });
+		if (!skill) {
+			const available = this.skills.map(candidate => candidate.name).sort();
+			const availableHint = available.length > 0 ? ` Available: ${available.join(", ")}.` : "";
+			throw Object.assign(new Error(`Skill ${skillName} was not found.${availableHint}`), { code: "invalid_input" });
+		}
 		const deepInterviewUserIntentEpoch = this.#claimDeepInterviewUserIntent();
 		const activation = await resolveSubskillActivationForSkillInvocation({
 			cwd: this.sessionManager.getCwd(),
