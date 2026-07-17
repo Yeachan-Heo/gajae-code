@@ -109,8 +109,16 @@ function applyRpcDefaultSettingOverrides(targetSettings: Settings = settings): v
 	}
 }
 
-async function readPipedInput(): Promise<string | undefined> {
-	if (process.stdin.isTTY !== false) return undefined;
+export function shouldReadPipedInput(mode: Args["mode"], stdinIsTTY: boolean): boolean {
+	if (stdinIsTTY) return false;
+	return mode !== "rpc" && mode !== "rpc-ui" && mode !== "acp" && mode !== "bridge";
+}
+
+async function readPipedInput(mode: Args["mode"]): Promise<string | undefined> {
+	// Protocol modes own stdin and must receive the stream untouched. Bun reports
+	// non-TTY stdin as `undefined`, not `false`, so only an explicit TTY means
+	// there is no piped input to read.
+	if (!shouldReadPipedInput(mode, process.stdin.isTTY === true)) return undefined;
 	try {
 		const text = await Bun.stdin.text();
 		if (text.trim().length === 0) return undefined;
@@ -118,6 +126,37 @@ async function readPipedInput(): Promise<string | undefined> {
 	} catch {
 		return undefined;
 	}
+}
+
+export interface LaunchDisposition {
+	autoPrint: boolean;
+	isInteractive: boolean;
+	error?: string;
+}
+
+export function resolveLaunchDisposition(input: {
+	print: boolean;
+	mode: Args["mode"];
+	stdinIsTTY: boolean;
+	hasPreparedInput: boolean;
+	hasPipedInput: boolean;
+}): LaunchDisposition {
+	if (input.print || input.mode !== undefined) {
+		return { autoPrint: false, isInteractive: false };
+	}
+
+	const autoPrint = input.hasPipedInput || (!input.stdinIsTTY && input.hasPreparedInput);
+	if (autoPrint) {
+		return { autoPrint: true, isInteractive: false };
+	}
+	if (!input.stdinIsTTY) {
+		return {
+			autoPrint: false,
+			isInteractive: false,
+			error: "stdin is not a TTY and no prompt was provided; use -p/--print with a prompt",
+		};
+	}
+	return { autoPrint: false, isInteractive: true };
 }
 
 export interface InteractiveModeNotify {
@@ -843,7 +882,7 @@ export async function runRootCommand(
 		Bun.env.PI_NO_TITLE = "1";
 	}
 	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
-		const pipedInput = await readPipedInput();
+		const pipedInput = await readPipedInput(parsedArgs.mode);
 		if (parsedArgs.fileArgs.length === 0) {
 			return { pipedInput, fileText: undefined, fileImages: undefined };
 		}
@@ -858,8 +897,18 @@ export async function runRootCommand(
 		fileImages,
 		stdinContent: pipedInput,
 	});
-	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
-	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
+	const disposition = resolveLaunchDisposition({
+		print: parsedArgs.print === true,
+		mode: parsedArgs.mode,
+		stdinIsTTY: process.stdin.isTTY === true,
+		hasPreparedInput: initialMessage !== undefined || initialImages !== undefined || parsedArgs.messages.length > 0,
+		hasPipedInput: pipedInput !== undefined,
+	});
+	if (disposition.error) {
+		process.stderr.write(`${chalk.red(`Error: ${disposition.error}`)}\n`);
+		process.exit(1);
+	}
+	const { isInteractive } = disposition;
 	const mode = parsedArgs.mode || "text";
 
 	// Initialize discovery system with settings for provider persistence

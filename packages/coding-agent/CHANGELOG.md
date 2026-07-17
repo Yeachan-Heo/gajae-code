@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Non-TTY launches with empty stdin now fail fast instead of entering an unreachable interactive TUI, while positional prompts, piped content, and `@file` text or images route to print mode and protocol modes retain ownership of stdin.
+
 ## [0.9.3] - 2026-07-09
 
 ### Fixed
