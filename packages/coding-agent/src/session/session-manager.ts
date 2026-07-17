@@ -2318,19 +2318,12 @@ function cloneJsonSemantic<T>(value: T): T {
 	return cloned as T;
 }
 
-function cloneAgentMessage<T extends AgentMessage>(message: T): T {
-	const cloned = {
-		...message,
-		...("content" in message ? { content: cloneJsonSemantic(message.content) } : {}),
-		...("providerPayload" in message ? { providerPayload: cloneJsonSemantic(message.providerPayload) } : {}),
-	} as T;
-	transferSessionMessageIdentity([message], [cloned]);
-	return cloned;
-}
-
 function cloneSessionEntry(entry: SessionEntry): SessionEntry {
-	if (entry.type !== "message") return { ...entry };
-	return { ...entry, message: cloneAgentMessage(entry.message) } as SessionEntry;
+	const cloned = cloneJsonSemantic(entry);
+	if (entry.type === "message" && cloned.type === "message") {
+		transferSessionMessageIdentity([entry.message], [cloned.message]);
+	}
+	return cloned;
 }
 
 function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: ResidentBlobStores): SessionEntry {
@@ -5252,7 +5245,9 @@ export class SessionManager {
 	getLeafEntry(): SessionEntry | undefined {
 		if (!this.#leafId) return undefined;
 		const entry = this.#byId.get(this.#leafId);
-		return entry ? materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()) : undefined;
+		return entry
+			? cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()))
+			: undefined;
 	}
 
 	getResidentImageBytes(): number {
@@ -5437,10 +5432,12 @@ export class SessionManager {
 	getEntryForFidelity(id: string): SessionEntry | undefined {
 		const entry = this.#byId.get(id);
 		return entry
-			? rehydrateColdSpillEntry(
-					materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()),
-					this.#blobStore,
-					this.#residentBlobStoresForColdRehydrate(),
+			? cloneSessionEntry(
+					rehydrateColdSpillEntry(
+						materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()),
+						this.#blobStore,
+						this.#residentBlobStoresForColdRehydrate(),
+					),
 				)
 			: undefined;
 	}
@@ -5454,10 +5451,12 @@ export class SessionManager {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
 			path.push(
-				rehydrateColdSpillEntry(
-					materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache),
-					this.#blobStore,
-					this.#residentBlobStoresForColdRehydrate(),
+				cloneSessionEntry(
+					rehydrateColdSpillEntry(
+						materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache),
+						this.#blobStore,
+						this.#residentBlobStoresForColdRehydrate(),
+					),
 				),
 			);
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
@@ -5494,10 +5493,12 @@ export class SessionManager {
 		return this.#fileEntries
 			.filter((entry): entry is SessionEntry => entry.type !== "session")
 			.map(entry =>
-				rehydrateColdSpillEntry(
-					materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache),
-					this.#blobStore,
-					this.#residentBlobStoresForColdRehydrate(),
+				cloneSessionEntry(
+					rehydrateColdSpillEntry(
+						materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache),
+						this.#blobStore,
+						this.#residentBlobStoresForColdRehydrate(),
+					),
 				),
 			);
 	}
@@ -5506,7 +5507,9 @@ export class SessionManager {
 		this.#publicMaterializerCallCount++;
 		this.#getEntryMaterializerCallCount++;
 		const entry = this.#byId.get(id);
-		return entry ? materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()) : undefined;
+		return entry
+			? cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()))
+			: undefined;
 	}
 
 	/**
@@ -5517,7 +5520,9 @@ export class SessionManager {
 		const children: SessionEntry[] = [];
 		for (const entry of this.#byId.values()) {
 			if (entry.parentId === parentId) {
-				children.push(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache));
+				children.push(
+					cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache)),
+				);
 			}
 		}
 		return children;
@@ -5572,7 +5577,7 @@ export class SessionManager {
 		while (current) {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
-			path.push(materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache));
+			path.push(cloneSessionEntry(materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache)));
 			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
 		path.reverse();
@@ -5612,6 +5617,7 @@ export class SessionManager {
 			this.#sessionId,
 		);
 		this.#sessionContextCache = freezeInternalReadSnapshot(context);
+		transferSessionMessageIdentity(context.messages, this.#sessionContextCache.messages);
 		this.#sessionContextEntryRevision = this.#entryRevision;
 		this.#sessionContextLeafRevision = this.#leafRevision;
 		this.#sessionContextReplayMetadataRevision = this.#replayMetadataRevision;
@@ -5703,9 +5709,7 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get all session entries (excludes header). Returns a shallow copy.
-	 * The session is append-only: use appendXXX() to add entries, branch() to
-	 * change the leaf pointer. Entries cannot be modified or deleted.
+	 * Internal materialized entry cache. Public getters clone this snapshot before returning it.
 	 */
 	#getMaterializedEntriesInternal(): SessionEntry[] {
 		if (this.#materializedEntriesRevision === this.#entryRevision && this.#materializedEntriesCache) {

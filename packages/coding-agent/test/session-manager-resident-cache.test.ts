@@ -88,4 +88,70 @@ describe("SessionManager public read snapshots", () => {
 			process.env.NODE_ENV = previousNodeEnv;
 		}
 	});
+
+	it("clones nested custom payloads for production collection and direct entry getters", () => {
+		const previousNodeEnv = process.env.NODE_ENV;
+		process.env.NODE_ENV = "production";
+		try {
+			const session = SessionManager.inMemory();
+			session.appendMessage({ role: "user", content: "root", timestamp: 1 });
+			const customId = session.appendCustomEntry("extension", { nested: { value: "original" } });
+			const customMessageId = session.appendCustomMessageEntry("extension", "custom message", true, {
+				nested: { value: "original" },
+			});
+
+			const customFromEntries = session.getEntries().find(entry => entry.id === customId);
+			if (customFromEntries?.type !== "custom") throw new Error("Expected custom entry snapshot");
+			(customFromEntries.data as { nested: { value: string } }).nested.value = "entries poison";
+
+			const tree = session.getTree();
+			const customMessageFromTree = tree[0]?.children[0]?.children[0]?.entry;
+			if (customMessageFromTree?.type !== "custom_message") throw new Error("Expected custom message tree snapshot");
+			(customMessageFromTree.details as { nested: { value: string } }).nested.value = "tree poison";
+
+			const customFromEntry = session.getEntry(customId);
+			if (customFromEntry?.type !== "custom") throw new Error("Expected direct custom entry snapshot");
+			(customFromEntry.data as { nested: { value: string } }).nested.value = "entry poison";
+
+			const customMessageFromLeaf = session.getLeafEntry();
+			if (customMessageFromLeaf?.type !== "custom_message") throw new Error("Expected leaf custom message snapshot");
+			(customMessageFromLeaf.details as { nested: { value: string } }).nested.value = "leaf poison";
+
+			const customMessageFromChildren = session.getChildren(customId)[0];
+			if (customMessageFromChildren?.type !== "custom_message")
+				throw new Error("Expected child custom message snapshot");
+			(customMessageFromChildren.details as { nested: { value: string } }).nested.value = "children poison";
+
+			const customMessageFromBranch = session.getBranch().find(entry => entry.id === customMessageId);
+			if (customMessageFromBranch?.type !== "custom_message")
+				throw new Error("Expected branch custom message snapshot");
+			(customMessageFromBranch.details as { nested: { value: string } }).nested.value = "branch poison";
+
+			const compactionSession = SessionManager.inMemory();
+			const firstKeptEntryId = compactionSession.appendMessage({ role: "user", content: "root", timestamp: 1 });
+			const compactionId = compactionSession.appendCompaction(
+				"summary",
+				undefined,
+				firstKeptEntryId,
+				1,
+				{ nested: { value: "original" } },
+				false,
+				{ nested: { value: "original" } },
+			);
+			const compaction = compactionSession.getEntries().find(entry => entry.id === compactionId);
+			if (compaction?.type !== "compaction") throw new Error("Expected compaction snapshot");
+			(compaction.details as { nested: { value: string } }).nested.value = "details poison";
+			(compaction.preserveData as { nested: { value: string } }).nested.value = "preserve data poison";
+
+			expect(compactionSession.getEntry(compactionId)).toMatchObject({
+				details: { nested: { value: "original" } },
+				preserveData: { nested: { value: "original" } },
+			});
+
+			expect(session.getEntry(customId)).toMatchObject({ data: { nested: { value: "original" } } });
+			expect(session.getLeafEntry()).toMatchObject({ details: { nested: { value: "original" } } });
+		} finally {
+			process.env.NODE_ENV = previousNodeEnv;
+		}
+	});
 });

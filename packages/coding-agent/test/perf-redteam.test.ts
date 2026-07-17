@@ -43,11 +43,14 @@ describe("perf change-set adversarial probes", () => {
 		try {
 			const index = await new SessionIndex(dir).open();
 			await index.append(event("prefix"));
-			await fs.appendFile(path.join(dir, "sdk", "sessions", "index.jsonl"), "{broken}\n");
+			const log = path.join(dir, "sdk", "sessions", "index.jsonl");
+			await fs.appendFile(log, "{broken}");
 			const suffix = await new SessionIndex(dir).open();
+			const beforeAppend = await fs.readFile(log, "utf8");
 			await expect(suffix.append(event("would-be-hidden"))).rejects.toThrow(
 				"Cannot append to corrupt session index log",
 			);
+			expect(await fs.readFile(log, "utf8")).toBe(beforeAppend);
 			const replay = await new SessionIndex(dir).open();
 			expect(replay.listSessions().sessions.map(item => item.sessionId)).toEqual(["prefix"]);
 			expect(replay.listSessions().warnings).toContain("Corrupt session index entry; replay truncated");

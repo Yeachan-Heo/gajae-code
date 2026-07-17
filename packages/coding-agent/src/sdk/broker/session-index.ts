@@ -52,7 +52,12 @@ const ROTATE_BYTES = 4 * 1024 * 1024;
 async function appendSync(file: string, value: string): Promise<void> {
 	const h = await fs.open(file, "a", 0o600);
 	try {
-		await h.write(`${value}\n`);
+		const data = Buffer.from(`${value}\n`);
+		for (let offset = 0; offset < data.length; ) {
+			const { bytesWritten } = await h.write(data, offset, data.length - offset);
+			if (bytesWritten <= 0) throw new Error("Unable to append session index entry");
+			offset += bytesWritten;
+		}
 		await h.sync();
 	} finally {
 		await h.close();
@@ -155,9 +160,9 @@ export class SessionIndex {
 			throw e;
 		}
 		const lastNewline = data.lastIndexOf(0x0a);
-		if (lastNewline < 0) return;
 		const consumed = data.subarray(0, lastNewline + 1);
 		this.#logOffset += consumed.length;
+		const hasUnterminatedSuffix = data.length > consumed.length;
 		let corrupt = false;
 		for (const line of consumed.toString("utf8").split("\n")) {
 			if (!line) continue;
@@ -175,6 +180,7 @@ export class SessionIndex {
 			if (checksum !== sessionIndexChecksum(unsigned) || event.indexSeq !== this.indexSeq + 1) corrupt = true;
 			else this.#events.push(event);
 		}
+		if (hasUnterminatedSuffix) corrupt = true;
 		if (corrupt) {
 			this.#corruptSuffix = true;
 			this.#warn("Corrupt session index entry; replay truncated");

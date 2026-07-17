@@ -147,24 +147,41 @@ describe("SDK session index", () => {
 				.map(line => JSON.parse(line).indexSeq),
 		).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
 	});
-	it("rotates a large log while concurrent writers preserve every event", async () => {
+	it("refuses to append after an unterminated suffix while retaining the valid prefix", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("prefix"));
+		const log = path.join(dir, "sdk", "sessions", "index.jsonl");
+		await fs.appendFile(log, '{"partial":');
+		const corrupt = await new SessionIndex(dir).open();
+		expect(corrupt.listSessions().sessions.map(session => session.sessionId)).toEqual(["prefix"]);
+		expect(corrupt.listSessions().warnings).toContain("Corrupt session index entry; replay truncated");
+		await expect(corrupt.append(event("not-durable"))).rejects.toThrow("Cannot append to corrupt session index log");
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().sessions.map(session => session.sessionId)).toEqual(["prefix"]);
+	});
+	it("rotates repeatedly while concurrent writers and readers preserve every event", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const writers = await Promise.all([new SessionIndex(dir).open(), new SessionIndex(dir).open()]);
 		const largeEvent = (sessionId: string) => ({
 			...event(sessionId),
 			locator: { repo: "r".repeat(300_000), stateRoot: "q" },
 		});
-		await Promise.all(
-			Array.from({ length: 16 }, (_, index) => writers[index % writers.length]!.append(largeEvent(`s-${index}`))),
-		);
-		const readers = await Promise.all(Array.from({ length: 4 }, () => new SessionIndex(dir).open()));
-		expect(readers.map(reader => reader.indexSeq)).toEqual([16, 16, 16, 16]);
-		expect(readers[0]!.listSessions().sessions).toHaveLength(16);
-		expect((await fs.stat(path.join(dir, "sdk", "sessions", "index.jsonl"))).size).toBeLessThan(4 * 1024 * 1024);
+		for (let round = 0; round < 3; round++) {
+			await Promise.all(
+				Array.from({ length: 16 }, (_, index) =>
+					writers[index % writers.length]!.append(largeEvent(`r-${round}-${index}`)),
+				),
+			);
+			const readers = await Promise.all(Array.from({ length: 4 }, () => new SessionIndex(dir).open()));
+			expect(readers.map(reader => reader.indexSeq)).toEqual(Array(4).fill((round + 1) * 16));
+			expect(readers[0]!.listSessions().sessions).toHaveLength((round + 1) * 16);
+			expect((await fs.stat(path.join(dir, "sdk", "sessions", "index.jsonl"))).size).toBeLessThan(4 * 1024 * 1024);
+		}
 		expect(
 			JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8")),
 		).toMatchObject({
 			indexSeq: expect.any(Number),
 		});
-	});
+	}, 30_000);
 });
