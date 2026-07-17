@@ -70,7 +70,6 @@ function dedupePromptSource(source: string | null | undefined, otherSources: Arr
 	return otherSources.some(otherSource => promptSourceContainsRule(otherSource, resolvedSource)) ? "" : resolvedSource;
 }
 
-
 /** Neutralize tag-like sequences in embedded project context so file bodies cannot escape framing. */
 function sanitizeEmbeddedPromptContent(content: string): string {
 	return escapePromptMetadata(content, { preserveNewlines: true });

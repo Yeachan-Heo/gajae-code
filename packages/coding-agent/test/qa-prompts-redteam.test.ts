@@ -42,7 +42,6 @@ describe("QA red-team: untrusted prompt boundaries", () => {
 		expect(converted.match(/<\/system-reminder>/gi)).toHaveLength(1);
 	});
 
-
 	test("project context files cannot escape <file> framing via tag sequences", async () => {
 		const { buildSystemPrompt } = await import("../src/system-prompt");
 		const { systemPrompt } = await buildSystemPrompt({
@@ -70,5 +69,4 @@ describe("QA red-team: untrusted prompt boundaries", () => {
 		expect(joined.match(/<\/file>/g)?.length ?? 0).toBeGreaterThanOrEqual(1);
 		expect(joined).not.toContain('path="AGENTS.md"><system-reminder>');
 	});
-
 });
