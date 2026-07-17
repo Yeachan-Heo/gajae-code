@@ -235,6 +235,13 @@ describe("computer broker", () => {
 		computerBrokerTestSeams.abandonServerAfterListenFailure(server, false);
 		expect(calls).toEqual(["unref"]);
 	});
+	it("normalizes raw filesystem cleanup errors without leaking paths", () => {
+		const error = computerBrokerTestSeams.computerBrokerCleanupFailure(new Error("EACCES: /tmp/private-owner"));
+		expect(error.code).toBe("COMPUTER_BROKER_CLEANUP_FAILED");
+		expect(error.message).toBe("Computer broker cleanup could not be confirmed.");
+		expect(error.message).not.toContain("/tmp/private-owner");
+	});
+
 	it("refuses source-mode managed tmux ownership", () => {
 		expect(startComputerBrokerForTmux({ env: {}, isCompiledBinary: () => false })).toBeNull();
 	});
@@ -748,52 +755,56 @@ describe("computer broker", () => {
 		fs.rmSync(directory, { recursive: true, force: true });
 	});
 
-	it.if(process.platform === "darwin")(
-		"evicts timed-out screenshots without exhausting pending requests",
-		async () => {
-			const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-timeout-eviction-"));
-			const socketPath = path.join(directory, "broker.sock");
-			const token = "b".repeat(64);
-			const server = net.createServer(socket => {
-				const frames = socketFrames(socket);
-				void (async () => {
-					await frames.next();
-					socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
-					const abandonedIds: string[] = [];
-					for (let index = 0; index < 130; index++) {
-						const request = (await frames.next()) as { id: string };
-						abandonedIds.push(request.id);
-					}
-					await Bun.sleep(10);
-					for (const id of abandonedIds)
-						socket.write(`${JSON.stringify({ version: 1, type: "response", id, ok: true, result: null })}\n`);
-					const finalRequest = (await frames.next()) as { id: string };
-					socket.write(
-						`${JSON.stringify({ version: 1, type: "response", id: finalRequest.id, ok: true, result: null })}\n`,
-					);
-				})().catch(() => socket.destroy());
-			});
-			await listen(server, socketPath);
-			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
-			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
-			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
-			setBrokerIdentityEnvironment();
-			const controller = createComputerBrokerControllerFromEnvironment();
-			if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
-			for (let index = 0; index < 130; index++) {
-				try {
-					await controller.brokerInvoke("screenshot", [], { timeoutMs: 1 });
-					throw new Error("expected screenshot timeout");
-				} catch (error) {
-					expect((error as { code?: string }).code).toBe("COMPUTER_CANCELLED");
+	it.if(process.platform === "darwin")("bounds timed-out screenshots without evicting late response IDs", async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-timeout-eviction-"));
+		const socketPath = path.join(directory, "broker.sock");
+		const token = "b".repeat(64);
+		const server = net.createServer(socket => {
+			const frames = socketFrames(socket);
+			void (async () => {
+				await frames.next();
+				socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
+				const abandonedIds: string[] = [];
+				for (let index = 0; index < 256; index++) {
+					const request = (await frames.next()) as { id: string };
+					abandonedIds.push(request.id);
 				}
+				await Bun.sleep(10);
+				for (const id of abandonedIds)
+					socket.write(`${JSON.stringify({ version: 1, type: "response", id, ok: true, result: null })}\n`);
+				const finalRequest = (await frames.next()) as { id: string; method: string };
+				expect(finalRequest.method).toBe("move");
+				socket.write(
+					`${JSON.stringify({ version: 1, type: "response", id: finalRequest.id, ok: true, result: null })}\n`,
+				);
+			})().catch(() => socket.destroy());
+		});
+		await listen(server, socketPath);
+		process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+		process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+		process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+		setBrokerIdentityEnvironment();
+		const controller = createComputerBrokerControllerFromEnvironment();
+		if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
+		for (let index = 0; index < 256; index++) {
+			try {
+				await controller.brokerInvoke("screenshot", [], { timeoutMs: 1 });
+				throw new Error("expected screenshot timeout");
+			} catch (error) {
+				expect((error as { code?: string }).code).toBe("COMPUTER_CANCELLED");
 			}
-			expect(await controller.brokerInvoke("wait", [null, 1], { timeoutMs: 500 })).toBeNull();
-			disposeComputerBrokerLease();
-			await closeServer(server);
-			fs.rmSync(directory, { recursive: true, force: true });
-		},
-	);
+		}
+		try {
+			await controller.brokerInvoke("screenshot", [], { timeoutMs: 1 });
+			throw new Error("expected tombstone-capacity rejection");
+		} catch (error) {
+			expect((error as { code?: string }).code).toBe("COMPUTER_BROKER_UNAVAILABLE");
+		}
+		expect(await controller.brokerInvoke("move", [null, 1, 1], { timeoutMs: 500 })).toBeNull();
+		disposeComputerBrokerLease();
+		await closeServer(server);
+		fs.rmSync(directory, { recursive: true, force: true });
+	});
 
 	it.if(process.platform === "darwin")(
 		"roundtrips screenshots and input while preserving redacted native errors",

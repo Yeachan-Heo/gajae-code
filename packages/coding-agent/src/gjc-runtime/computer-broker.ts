@@ -158,6 +158,11 @@ class BrokerError extends Error {
 	}
 }
 
+function computerBrokerCleanupFailure(error: unknown): BrokerError {
+	if (error instanceof BrokerError && error.code === "COMPUTER_BROKER_CLEANUP_FAILED") return error;
+	return new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+}
+
 /** Bounded newline-delimited UTF-8 framing without decoding arbitrary socket chunks. */
 class FrameReader {
 	private parts: Buffer[] = [];
@@ -595,7 +600,7 @@ function secureRuntimeDirectory(config: { socket: string; directory: string }, r
 }
 
 const MAX_PENDING_REQUESTS = 128;
-const MAX_ABANDONED_REQUESTS = 256;
+const MAX_ABANDONABLE_REQUESTS = 256;
 type PendingRequest = {
 	resolve(value: unknown): void;
 	reject(error: BrokerError): void;
@@ -604,15 +609,7 @@ let leaseSocket: net.Socket | undefined;
 let leaseConfiguration: string | undefined;
 let leaseReadyPromise: Promise<void> | undefined;
 const pendingRequests = new Map<string, PendingRequest>();
-const abandonedRequestIds = new Set<string>();
-
-function rememberAbandonedRequest(id: string): void {
-	if (abandonedRequestIds.size >= MAX_ABANDONED_REQUESTS) {
-		const oldest = abandonedRequestIds.values().next().value;
-		if (oldest !== undefined) abandonedRequestIds.delete(oldest);
-	}
-	abandonedRequestIds.add(id);
-}
+const abandonableRequestIds = new Set<string>();
 
 function clearLease(socket: net.Socket, error: BrokerError): void {
 	if (leaseSocket !== socket) return;
@@ -621,7 +618,7 @@ function clearLease(socket: net.Socket, error: BrokerError): void {
 	leaseReadyPromise = undefined;
 	for (const pending of pendingRequests.values()) pending.reject(error);
 	pendingRequests.clear();
-	abandonedRequestIds.clear();
+	abandonableRequestIds.clear();
 }
 
 function ensureComputerBrokerLease(config: {
@@ -706,10 +703,11 @@ function ensureComputerBrokerLease(config: {
 				if (!frame) throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response.");
 				const pending = pendingRequests.get(frame.id);
 				if (!pending) {
-					if (abandonedRequestIds.delete(frame.id)) continue;
+					if (abandonableRequestIds.delete(frame.id)) continue;
 					throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response.");
 				}
 				pendingRequests.delete(frame.id);
+				abandonableRequestIds.delete(frame.id);
 				if (frame.ok) pending.resolve(frame.result);
 				else pending.reject(new BrokerError(frame.error.code, frame.error.message));
 			} catch (error) {
@@ -781,10 +779,16 @@ async function request(
 	await ensureComputerBrokerLease(config);
 	if (options.signal?.aborted) throw new BrokerError("COMPUTER_CANCELLED", "Computer broker request was cancelled.");
 	const socket = leaseSocket;
-	if (!socket || socket.destroyed || pendingRequests.size >= MAX_PENDING_REQUESTS)
+	const abandonable = method === "screenshot" || method === "wait";
+	if (
+		!socket ||
+		socket.destroyed ||
+		pendingRequests.size >= MAX_PENDING_REQUESTS ||
+		(abandonable && abandonableRequestIds.size >= MAX_ABANDONABLE_REQUESTS)
+	)
 		throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost.");
 	let id = crypto.randomBytes(16).toString("hex");
-	while (pendingRequests.has(id)) id = crypto.randomBytes(16).toString("hex");
+	while (pendingRequests.has(id) || abandonableRequestIds.has(id)) id = crypto.randomBytes(16).toString("hex");
 	const requestedTimeoutMs = options.timeoutMs;
 	const timeoutMs =
 		requestedTimeoutMs === undefined
@@ -809,11 +813,9 @@ async function request(
 		},
 	};
 	pendingRequests.set(id, pending);
-	const abandonable = method === "screenshot" || method === "wait";
 	const abandon = (): void => {
 		if (pendingRequests.get(id) !== pending) return;
 		pendingRequests.delete(id);
-		rememberAbandonedRequest(id);
 		pending.reject(new BrokerError("COMPUTER_CANCELLED", "Computer broker request was cancelled."));
 	};
 	if (abandonable && requestedTimeoutMs !== undefined) {
@@ -833,10 +835,12 @@ async function request(
 		pending.reject(new BrokerError("COMPUTER_BROKER_FRAME_TOO_LARGE", "Computer broker request was too large."));
 		return result.promise;
 	}
+	if (abandonable) abandonableRequestIds.add(id);
 	try {
 		socket.write(requestLine);
 	} catch {
 		if (pendingRequests.get(id) === pending) pendingRequests.delete(id);
+		abandonableRequestIds.delete(id);
 		pending.reject(new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost."));
 	}
 	return result.promise;
@@ -989,8 +993,12 @@ function removeQuarantinedRuntime(runtime: QuarantinedRuntimePath): void {
 }
 
 function removeRuntimeDirectory(config: { socket: string; directory: string }, identity: RuntimePathIdentity): void {
-	const quarantined = quarantineRuntimeDirectory(config, identity);
-	if (quarantined) removeQuarantinedRuntime(quarantined);
+	try {
+		const quarantined = quarantineRuntimeDirectory(config, identity);
+		if (quarantined) removeQuarantinedRuntime(quarantined);
+	} catch (error) {
+		throw computerBrokerCleanupFailure(error);
+	}
 }
 
 export const computerBrokerTestSeams = {
@@ -998,6 +1006,7 @@ export const computerBrokerTestSeams = {
 	removeRuntimeDirectory,
 	processIdentity,
 	abandonServerAfterListenFailure,
+	computerBrokerCleanupFailure,
 };
 
 export interface RunComputerBrokerServerOptions {
@@ -1052,12 +1061,12 @@ export async function runComputerBrokerServerFromEnvironment(
 							if (quarantined) removeQuarantinedRuntime(quarantined);
 							done.resolve();
 						} catch (error) {
-							done.reject(error);
+							done.reject(computerBrokerCleanupFailure(error));
 						}
 					});
 				} catch (error) {
 					server.unref();
-					done.reject(error);
+					done.reject(computerBrokerCleanupFailure(error));
 				}
 			});
 	};
@@ -1423,7 +1432,7 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 		} catch (caught) {
 			cleanupError = caught;
 		}
-		if (cleanupError instanceof BrokerError) throw cleanupError;
+		if (cleanupError !== undefined) throw computerBrokerCleanupFailure(cleanupError);
 		if (error instanceof BrokerError && error.code === "COMPUTER_BROKER_CLEANUP_FAILED") throw error;
 		return null;
 	}
