@@ -493,12 +493,24 @@ async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Pr
 
 async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
 	const { checkDependencies, formatDependencyStatus } = await import("../stt/setup");
+	const { appleBackendAvailability } = await import("../stt/backends/apple");
+	const apple = appleBackendAvailability();
 	const status = await checkDependencies();
 
 	if (flags.json) {
-		console.log(JSON.stringify(status, null, 2));
-		if (!status.recorder.available || !status.python.available || !status.whisper.available) process.exit(1);
+		console.log(JSON.stringify({ ...status, apple }, null, 2));
+		const whisperReady = status.recorder.available && status.python.available && status.whisper.available;
+		if (!whisperReady && !apple.usable) process.exit(1);
 		return;
+	}
+
+	if (apple.usable) {
+		console.log(
+			chalk.green(
+				`${theme.status.success} Apple on-device speech is available (backend "auto"/"apple") — no setup required`,
+			),
+		);
+		console.log(chalk.dim("The whisper backend below is an optional cross-platform fallback.\n"));
 	}
 
 	console.log(formatDependencyStatus(status));

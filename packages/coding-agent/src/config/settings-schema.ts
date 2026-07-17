@@ -1407,6 +1407,22 @@ export const SETTINGS_SCHEMA = {
 		ui: { tab: "interaction", label: "Speech-to-Text", description: "Enable speech-to-text input via microphone" },
 	},
 
+	"stt.backend": {
+		type: "enum",
+		values: ["auto", "apple", "whisper"] as const,
+		default: "auto",
+		ui: {
+			tab: "interaction",
+			label: "Speech Backend",
+			description: "Speech recognition engine (apple = on-device macOS, no setup)",
+			options: [
+				{ value: "auto", label: "auto", description: "Apple on-device when available, whisper otherwise" },
+				{ value: "apple", label: "apple", description: "macOS on-device recognition; streaming, zero setup" },
+				{ value: "whisper", label: "whisper", description: "Python openai-whisper; all platforms" },
+			],
+		},
+	},
+
 	"stt.language": {
 		type: "string",
 		default: "en",
@@ -3542,6 +3558,7 @@ export interface ThinkingBudgetsSettings {
 
 export interface SttSettings {
 	enabled: boolean;
+	backend: "auto" | "apple" | "whisper";
 	language: string | undefined;
 	modelName: string;
 	whisperPath: string | undefined;
