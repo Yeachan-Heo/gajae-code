@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows AVX2 variant detection now uses an in-process `kernel32!IsProcessorFeaturePresent` probe under Bun, with a Windows PowerShell 5.1-compatible P/Invoke fallback. The previous `System.Runtime.Intrinsics` probe does not exist on stock Windows PowerShell, so detection always chose the baseline addon on AVX2-capable CPUs, and the per-process `powershell.exe` spawn flashed a console window from every detached, console-less parent (e.g. the SDK broker).
+
 ## [0.11.0] - 2026-07-15
 
 ### Fixed
