@@ -7,10 +7,12 @@ import {
 	acquireExperimentLock,
 	aggregate as aggregateEvidence,
 	canonicalJson,
+	captureHostProcess,
 	codesignSummary,
 	detectedHost,
 	type ExperimentResult,
 	type Gate0Receipt,
+	type HostProcessIdentity,
 	invokeExperiment,
 	loadReceiptSigner,
 	loadRestartProof,
@@ -19,6 +21,9 @@ import {
 	readSourceRevision,
 	releaseArtifact,
 	removeRestartProof,
+	requireRestartedHostProcess,
+	requireRestartProofContinuity,
+	requireStableHostProcess,
 	restartProofFile,
 	restartProofPayload,
 	restartRequestCode,
@@ -117,6 +122,13 @@ function restartProof(overrides: Partial<RestartProof> = {}): RestartProof {
 		codesign: { verified: true, signing: "adhoc" },
 		requestedAt: new Date().toISOString(),
 		request: { attempted: true, code: "permission_pending" },
+		hostProcess: {
+			host: "ghostty",
+			pid: 42,
+			executableSha256: "c".repeat(64),
+			startTokenSha256: "d".repeat(64),
+		},
+
 		...overrides,
 	};
 }
@@ -1046,6 +1058,9 @@ describe("computer broker Gate-0 receipt runner", () => {
 		const proof = restartProof();
 		expect(validRestartProof(proof)).toBe(true);
 		expect(validRestartProof({ ...proof, extra: true })).toBe(false);
+		expect(validRestartProof({ ...proof, hostProcess: { ...proof.hostProcess, rawPath: "/secret" } })).toBe(false);
+		expect(validRestartProof({ ...proof, hostProcess: { host: "ghostty" } })).toBe(false);
+
 		await writeRestartProof(root, proof);
 		expect(await loadRestartProof(root, COLLECTION_ID, proof.cell)).toEqual(proof);
 		await expect(writeRestartProof(root, proof)).rejects.toMatchObject({ code: "EEXIST" });
@@ -1057,7 +1072,7 @@ describe("computer broker Gate-0 receipt runner", () => {
 		await writeRestartProof(tamperedRoot, proof);
 		const file = path.join(tamperedRoot, "request-proofs", restartProofFile(COLLECTION_ID, proof.cell));
 		const tampered = JSON.parse(await fs.readFile(file, "utf8"));
-		tampered.proof.request.code = "ok";
+		tampered.proof.hostProcess.pid = 43;
 		await fs.writeFile(file, `${canonicalJson(tampered)}\n`, { mode: 0o600 });
 		await expect(loadRestartProof(tamperedRoot, COLLECTION_ID, proof.cell)).rejects.toThrow("signature is invalid");
 
@@ -1098,6 +1113,7 @@ describe("computer broker Gate-0 receipt runner", () => {
 		const mismatch = restartProof({
 			collectionId: "gate0-other-collection",
 			cell: { ...expected, host: "terminal" },
+			hostProcess: { ...restartProof().hostProcess, host: "terminal" },
 		});
 		await writeSignedRestartProofAt(mismatchRoot, expected, mismatch);
 		await expect(loadRestartProof(mismatchRoot, COLLECTION_ID, expected)).rejects.toThrow(
@@ -1187,6 +1203,105 @@ describe("computer broker Gate-0 receipt runner", () => {
 				false,
 			),
 		).rejects.toThrow("does not match the run-cell contract");
+	});
+
+	it("captures only hashed direct terminal-host ancestry through an injected ps seam", async () => {
+		const executeFor =
+			(records: Record<number, { ppid: number; executable: string; start: string }>) =>
+			async (command: string[]) => {
+				const record = records[Number(command.at(-1))];
+				if (!record) return { exitCode: 1, stdout: "", stderr: "", timedOut: false };
+				const field = command[2];
+				const stdout =
+					field === "ppid="
+						? `${record.ppid}\n`
+						: field === "comm="
+							? `${record.executable}\n`
+							: field === "lstart="
+								? `${record.start}\n`
+								: "";
+				return { exitCode: stdout ? 0 : 1, stdout, stderr: "", timedOut: false };
+			};
+
+		for (const [host, executable] of [
+			["terminal", `/Applications/${"TerminalBundlePath".repeat(24)}/Terminal.app/Contents/MacOS/Terminal`],
+			["ghostty", "/Applications/Ghostty.app/Contents/MacOS/Ghostty"],
+			["cmux", "/Applications/cmux.app/Contents/MacOS/cmux"],
+		] as const) {
+			const identity = await captureHostProcess(host, {
+				ppid: 100,
+				execute: executeFor({
+					100: { ppid: 50, executable: "/bin/zsh", start: "Tue Jul 17 10:00:00 2026" },
+					50: { ppid: 1, executable, start: "Tue Jul 17 09:00:00 2026" },
+				}),
+			});
+			expect(identity).toEqual({
+				host,
+				pid: 50,
+				executableSha256: createHash("sha256").update(executable).digest("hex"),
+				startTokenSha256: createHash("sha256").update("Tue Jul 17 09:00:00 2026").digest("hex"),
+			});
+		}
+		await expect(
+			captureHostProcess("terminal", {
+				ppid: 100,
+				execute: executeFor({
+					100: { ppid: 1, executable: "/usr/bin/tmux", start: "Tue Jul 17 10:00:00 2026" },
+					1: { ppid: 0, executable: "/sbin/launchd", start: "Tue Jul 17 00:00:00 2026" },
+				}),
+			}),
+		).rejects.toThrow("declared terminal host is not a direct process ancestor");
+	});
+
+	it("requires a stable changed terminal-host process generation for staged continuation", () => {
+		const requested: HostProcessIdentity = {
+			host: "ghostty",
+			pid: 42,
+			executableSha256: "c".repeat(64),
+			startTokenSha256: "d".repeat(64),
+		};
+		expect(() => requireRestartedHostProcess(requested, requested)).toThrow(
+			"does not prove a terminal host process restart",
+		);
+		expect(() =>
+			requireRestartedHostProcess(requested, { ...requested, startTokenSha256: "e".repeat(64) }),
+		).not.toThrow();
+		expect(() => requireRestartedHostProcess(requested, { ...requested, executableSha256: "f".repeat(64) })).toThrow(
+			"does not match the current terminal host executable",
+		);
+		expect(() => requireStableHostProcess(requested, { ...requested, pid: 43 }, "restart request")).toThrow(
+			"terminal host process changed during restart request",
+		);
+		expect(() =>
+			requireStableHostProcess(
+				requested,
+				{ ...requested, startTokenSha256: "e".repeat(64) },
+				"post-restart continuity",
+			),
+		).toThrow("terminal host process changed during post-restart continuity");
+	});
+
+	it("binds a staged proof to the executed baseline continuity snapshot", () => {
+		const proof = restartProof();
+		const continuity = {
+			sourceRevision: REVISION,
+			baseline: { path: "baseline", sha256: BASELINE_SHA },
+			updated: { path: "updated", sha256: UPDATED_SHA },
+			baselineCodesign: { verified: true, signing: "adhoc" as const },
+			updatedCodesign: { verified: true, signing: "adhoc" as const },
+			baselinePair: successfulPair("A1"),
+			updatedPair: successfulPair("A1"),
+		};
+		expect(() => requireRestartProofContinuity(proof, continuity)).not.toThrow();
+		expect(() => requireRestartProofContinuity(proof, { ...continuity, sourceRevision: "f".repeat(40) })).toThrow(
+			"does not match the executed baseline continuity",
+		);
+		expect(() =>
+			requireRestartProofContinuity(proof, {
+				...continuity,
+				baseline: { ...continuity.baseline, sha256: "f".repeat(64) },
+			}),
+		).toThrow("does not match the executed baseline continuity");
 	});
 
 	it("detects the originating terminal through managed tmux markers", () => {
