@@ -1303,6 +1303,16 @@ export const SETTINGS_SCHEMA = {
 			description: "Suggest emojis from `:name:` shortcodes and expand text emoticons like `:D` or `:-)`",
 		},
 	},
+	promptSuggestions: {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Prompt Suggestions",
+			description:
+				"Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+		},
+	},
 
 	"startup.quiet": {
 		type: "boolean",

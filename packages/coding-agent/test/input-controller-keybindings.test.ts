@@ -414,7 +414,9 @@ describe("InputController keybinding setup", () => {
 		controller.setupKeyHandlers();
 		await Bun.sleep(0);
 
-		expect(editor.onTab).toBeUndefined();
+		// The prompt-suggestion onTab handler must not consume Tab while the
+		// composer has text, so editor autocomplete still sees the key.
+		expect(editor.onTab?.(editor.getText())).toBeFalsy();
 		expect(editor.onTabDeclined).toBeUndefined();
 		expect(spies.prompt).not.toHaveBeenCalled();
 		expect(spies.updatePendingMessagesDisplay).not.toHaveBeenCalled();
@@ -431,7 +433,9 @@ describe("InputController keybinding setup", () => {
 		controller.setupKeyHandlers();
 		await Bun.sleep(0);
 
-		expect(editor.onTab).toBeUndefined();
+		// The prompt-suggestion onTab handler must not consume Tab while the
+		// composer has text, so editor autocomplete still sees the key.
+		expect(editor.onTab?.(editor.getText())).toBeFalsy();
 		expect(editor.onTabDeclined).toBeUndefined();
 		expect(spies.queueCompactionMessage).not.toHaveBeenCalled();
 		expect(spies.prompt).not.toHaveBeenCalled();
