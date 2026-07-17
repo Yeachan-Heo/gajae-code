@@ -114,7 +114,7 @@ export class STTController {
 	#maybeAutoStop(generation: number): void {
 		if (!this.#autoStopArmed || !this.#hasSpoken || this.#state !== "recording") return;
 		if (generation !== this.#generation || this.#toggling) return;
-		const seconds = (settings.get("stt.autoStopSeconds") as number | undefined) ?? 2.5;
+		const seconds = (settings.get("stt.autoStopSeconds") as number | undefined) ?? 2;
 		if (seconds <= 0) return;
 		if (this.#now() - this.#lastVoiceActivityAt < seconds * 1000) return;
 		const editor = this.#activeEditor;
@@ -189,7 +189,7 @@ export class STTController {
 			this.#sawInputSignal = false;
 			this.#silentHintShown = false;
 			this.#hasSpoken = false;
-			this.#autoStopArmed = ((settings.get("stt.autoStopSeconds") as number | undefined) ?? 2.5) > 0;
+			this.#autoStopArmed = ((settings.get("stt.autoStopSeconds") as number | undefined) ?? 2) > 0;
 			this.#activeEditor = editorForSession;
 			this.#activeOptions = options;
 			this.#setState("recording", options);
