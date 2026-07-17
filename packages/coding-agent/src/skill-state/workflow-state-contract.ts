@@ -56,7 +56,6 @@ function safeString(value: unknown): string {
 	return typeof value === "string" ? value : "";
 }
 
-
 export function workflowModeStateFileName(skill: CanonicalGjcWorkflowSkill): string {
 	return `${skill}-state.json`;
 }
