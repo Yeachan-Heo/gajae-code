@@ -1,11 +1,10 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
 import { resolveEquivalentPath } from "@gajae-code/utils";
-
 import {
 	ensureLaunchWorktree,
 	ensureReusableNodeModules,
@@ -21,6 +20,7 @@ import {
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
+import { spawnDetachedChild } from "../../utils/detached-spawn";
 import { SdkClient, SdkClientError } from "../client/client";
 import {
 	type LogicalSessionCandidate,
@@ -825,6 +825,10 @@ function isLifecycleFailureArtifact(value: unknown): value is LifecycleFailureAr
 }
 
 async function syncDirectory(directory: string): Promise<void> {
+	// Windows cannot flush directory handles (FlushFileBuffers fails with
+	// EPERM), so the directory durability barrier is best-effort there. The
+	// rename-based publish stays atomic for readers either way.
+	if (process.platform === "win32") return;
 	const handle = await fs.open(directory, fsSync.constants.O_RDONLY);
 	try {
 		await handle.sync();
@@ -2698,10 +2702,10 @@ async function executeLifecycleResponse(
 		let spawnedAuthority: EffectMarker | undefined;
 		try {
 			const cmd = command(broker);
-			const spawned = spawn(cmd.file, cmd.args, {
+			// spawnDetachedChild keeps detached session hosts console-less on Windows
+			// (Bun's node:child_process ignores windowsHide for detached children).
+			const spawned = spawnDetachedChild(cmd.file, cmd.args, {
 				cwd: launch.cwd,
-				detached: true,
-				stdio: "ignore",
 				env: {
 					...("kind" in cmd ? cmd.env : process.env),
 					GJC_AGENT_DIR: broker.settings.agentDir,

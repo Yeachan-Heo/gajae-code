@@ -245,7 +245,8 @@ export class SessionIndex {
 				mode: 0o600,
 			},
 		);
-		const h = await fs.open(tmp, "r");
+		// FlushFileBuffers requires a writable file handle on Windows.
+		const h = await fs.open(tmp, process.platform === "win32" ? "r+" : "r");
 		try {
 			await h.sync();
 		} finally {

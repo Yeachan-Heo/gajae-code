@@ -423,6 +423,9 @@ export class LifecycleLedger {
 		this.#warnings.push("Malformed lifecycle ledger entry quarantined");
 	}
 	async #syncDirectory(): Promise<void> {
+		// Windows cannot flush directory handles. The file was already synced
+		// before its atomic rename, so directory-entry durability is best-effort.
+		if (process.platform === "win32") return;
 		const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
 		try {
 			await directory.sync();

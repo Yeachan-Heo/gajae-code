@@ -1,4 +1,3 @@
-import { spawn as childProcessSpawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -8,6 +7,7 @@ import { withFileLock } from "../../config/file-lock";
 import type { Settings } from "../../config/settings";
 import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
+import { spawnDetachedChild } from "../../utils/detached-spawn";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { parseInThreadConfigCommand, parseRichToggleCommand, parseTelegramControlCommand } from "./config-commands";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
@@ -653,17 +653,18 @@ function defaultDaemonSpawn(
 ): SpawnResult {
 	// Redirect the detached daemon's stdout/stderr to a log file so failures
 	// (e.g. a rejected sendMessage) are diagnosable instead of vanishing.
-	let stdio: "ignore" | ["ignore", number, number] = opts.stdio;
+	let outputFd: number | undefined;
 	if (opts.logPath) {
 		try {
 			fs.mkdirSync(path.dirname(opts.logPath), { recursive: true, mode: 0o700 });
-			const fd = fs.openSync(opts.logPath, "a", 0o600);
-			stdio = ["ignore", fd, fd];
+			outputFd = fs.openSync(opts.logPath, "a", 0o600);
 		} catch {
 			// Fall back to ignoring output if the log file cannot be opened.
 		}
 	}
-	const child = childProcessSpawn(command, args, { detached: opts.detached, stdio });
+	// spawnDetachedChild keeps the detached daemon console-less on Windows
+	// (Bun's node:child_process ignores windowsHide for detached children).
+	const child = spawnDetachedChild(command, args, outputFd === undefined ? {} : { outputFd });
 	// Best-effort autostart: a spawn failure must never crash the host session.
 	child.on("error", () => undefined);
 	return { unref: () => child.unref() };

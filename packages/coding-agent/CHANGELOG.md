@@ -36,6 +36,8 @@
 - Connected MCP server instructions now remain untrusted user-role data instead of entering the cached system prompt; hostile file paths, working directories, and workspace-tree metadata are structurally encoded, and volatile project context is removed from durable session history between requests.
 - Restored the strict G002 public-surface quarantine by removing the default README advertisement for the private coordinator MCP runtime.
 
+- Windows: detached SDK broker, session-host, and chat/Telegram daemon spawns now route through a `Bun.spawn`-backed console-less facade (Bun's `node:child_process` ignores `windowsHide` for detached children, flashing a console window per spawn). Discovery, conversation-store, and session-index file syncs use writable handles while lifecycle directory flushes are best-effort instead of failing with `EPERM`; legacy regular-file broker locks that Windows reports as `ENOENT` are also recovered.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

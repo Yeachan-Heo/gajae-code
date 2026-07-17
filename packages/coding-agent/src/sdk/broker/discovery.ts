@@ -33,7 +33,9 @@ export function isPidAlive(pid: number): boolean {
 	}
 }
 async function syncFile(file: string): Promise<void> {
-	const handle = await fs.open(file, "r");
+	// Windows FlushFileBuffers requires a writable file handle; opening the
+	// discovery snapshot read-only makes the durability barrier fail with EPERM.
+	const handle = await fs.open(file, process.platform === "win32" ? "r+" : "r");
 	try {
 		await handle.sync();
 	} finally {

@@ -319,18 +319,24 @@ export class ConversationStore<T extends ConversationRecord> {
 		try {
 			await this.#fs.writeFile(temporary, `${JSON.stringify(document)}\n`, { mode: 0o600 });
 			await this.#fs.chmod(temporary, 0o600);
-			const handle = await this.#fs.open(temporary, "r");
+			// Windows FlushFileBuffers requires a writable handle (a read-only
+			// open fails the flush with EPERM) and cannot flush directory handles
+			// at all; the directory durability barrier is best-effort there.
+			const win32 = process.platform === "win32";
+			const handle = await this.#fs.open(temporary, win32 ? "r+" : "r");
 			try {
 				await handle.sync();
 			} finally {
 				await handle.close();
 			}
 			await this.#fs.rename(temporary, this.#file);
-			const directory = await this.#fs.open(this.#directory, "r");
-			try {
-				await directory.sync();
-			} finally {
-				await directory.close();
+			if (!win32) {
+				const directory = await this.#fs.open(this.#directory, "r");
+				try {
+					await directory.sync();
+				} finally {
+					await directory.close();
+				}
 			}
 		} catch (error) {
 			await this.#fs.unlink(temporary).catch(() => undefined);
