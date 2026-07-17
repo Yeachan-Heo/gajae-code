@@ -116,6 +116,8 @@ pub struct DarwinProcessIdentity {
 	pub executable:  String,
 	/// Process group identifier.
 	pub pgid:        i32,
+	/// Parent process identifier.
+	pub parent_pid:  i32,
 }
 
 /// Return the kernel-backed incarnation identity for a macOS process.
@@ -145,7 +147,7 @@ pub fn darwin_process_identity(pid: i32) -> napi::Result<DarwinProcessIdentity> 
 		let info = unsafe { info.assume_init() };
 		let expected_pid = u32::try_from(pid)
 			.map_err(|_| napi::Error::from_reason("unable to read process identity"))?;
-		if info.pbi_pid != expected_pid || info.pbi_pgid == 0 {
+		if info.pbi_pid != expected_pid || info.pbi_pgid == 0 || info.pbi_ppid == 0 {
 			return Err(napi::Error::from_reason("unable to read process identity"));
 		}
 
@@ -182,6 +184,8 @@ pub fn darwin_process_identity(pid: i32) -> napi::Result<DarwinProcessIdentity> 
 			start_token: format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
 			executable,
 			pgid: i32::try_from(info.pbi_pgid)
+				.map_err(|_| napi::Error::from_reason("unable to read process identity"))?,
+			parent_pid: i32::try_from(info.pbi_ppid)
 				.map_err(|_| napi::Error::from_reason("unable to read process identity"))?,
 		})
 	}

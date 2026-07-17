@@ -170,6 +170,7 @@ function staticProcessIdentity(pid: number): ComputerBrokerProcessIdentity {
 		executable: testHelperExecutable,
 		executableSha256: testHelperExecutableSha256,
 		pgid: pid,
+		parentPid: process.pid,
 	};
 }
 
@@ -261,8 +262,7 @@ describe("computer broker", () => {
 		const pid = 42_423;
 		const replacementIdentity = {
 			...staticProcessIdentity(pid),
-			executable: "/tmp/gjc-replacement-process",
-			executableSha256: "b".repeat(64),
+			parentPid: process.pid + 1,
 		};
 		const signals: NodeJS.Signals[] = [];
 		let runtimeDirectory: string | undefined;

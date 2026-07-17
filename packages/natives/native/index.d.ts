@@ -670,6 +670,8 @@ export interface DarwinProcessIdentity {
   executable: string
   /** Process group identifier. */
   pgid: number
+  /** Parent process identifier. */
+  parentPid: number
 }
 
 /**

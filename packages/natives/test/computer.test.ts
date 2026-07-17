@@ -20,7 +20,7 @@ type NativeComputerModule = {
 	ComputerController: new () => Record<string, unknown>;
 	computerScreenshot: () => ComputerScreenshot;
 	unixSocketPeerPid: (fd: number) => number;
-	darwinProcessIdentity: (pid: number) => { startToken: string; executable: string; pgid: number };
+	darwinProcessIdentity: (pid: number) => { startToken: string; executable: string; pgid: number; parentPid: number };
 };
 
 type SocketWithInternalHandle = {
@@ -152,6 +152,7 @@ describe.if(isMacOS)("Unix socket peer PID napi binding", () => {
 		expect(identity.startToken).toMatch(/^\d+:\d+$/);
 		expect(path.isAbsolute(identity.executable)).toBe(true);
 		expect(identity.pgid).toBeGreaterThan(0);
+		expect(identity.parentPid).toBeGreaterThan(0);
 		expect(() => darwinProcessIdentity(-1)).toThrow();
 	});
 });

@@ -91,7 +91,7 @@ export type ComputerControllerLike = {
 type ComputerNativeBindings = Record<string, unknown> & {
 	ComputerController: new () => ComputerControllerLike;
 	unixSocketPeerPid(fd: number): number;
-	darwinProcessIdentity(pid: number): { startToken: string; executable: string; pgid: number };
+	darwinProcessIdentity(pid: number): { startToken: string; executable: string; pgid: number; parentPid: number };
 };
 
 function createNativeComputerController(): ComputerControllerLike {
@@ -111,6 +111,8 @@ export type ComputerBrokerProcessIdentity = {
 	/** SHA-256 of the canonical executable path; bounded and stable across identity checks. */
 	executableSha256: string;
 	pgid: number;
+	/** Kernel parent PID is retained internally to bind the initial read to this spawn. */
+	parentPid?: number;
 };
 
 type ProcessIdentityReader = (pid: number) => ComputerBrokerProcessIdentity | null;
@@ -433,9 +435,22 @@ function processIdentity(pid: number): ComputerBrokerProcessIdentity | null {
 		const identity = loadNative<ComputerNativeBindings>().darwinProcessIdentity(pid);
 		const executable = fs.realpathSync(identity.executable);
 		const executableSha256 = executablePathSha256(executable);
-		if (!/^\d+:\d+$/.test(identity.startToken) || !Number.isSafeInteger(identity.pgid) || identity.pgid <= 0)
+		if (
+			!/^\d+:\d+$/.test(identity.startToken) ||
+			!Number.isSafeInteger(identity.pgid) ||
+			identity.pgid <= 0 ||
+			!Number.isSafeInteger(identity.parentPid) ||
+			identity.parentPid <= 0
+		)
 			return null;
-		return { pid, start: identity.startToken, executable, executableSha256, pgid: identity.pgid };
+		return {
+			pid,
+			start: identity.startToken,
+			executable,
+			executableSha256,
+			pgid: identity.pgid,
+			parentPid: identity.parentPid,
+		};
 	} catch {
 		return null;
 	}
@@ -451,7 +466,8 @@ function sameProcessIdentity(
 		actual.start === expected.start &&
 		actual.executable === expected.executable &&
 		actual.executableSha256 === expected.executableSha256 &&
-		actual.pgid === expected.pgid
+		actual.pgid === expected.pgid &&
+		(expected.parentPid === undefined || actual.parentPid === expected.parentPid)
 	);
 }
 
@@ -465,7 +481,8 @@ function isSpawnedHelperIdentity(
 		identity.pid === pid &&
 		identity.executable === helper &&
 		identity.executableSha256 === helperSha256 &&
-		identity.pgid === pid
+		identity.pgid === pid &&
+		identity.parentPid === process.pid
 	);
 }
 
