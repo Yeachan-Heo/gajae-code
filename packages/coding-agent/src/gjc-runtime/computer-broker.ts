@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ComputerController } from "@gajae-code/natives";
+import { loadNative } from "@gajae-code/natives/loader-state";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 
 export const COMPUTER_BROKER_CLI_FLAG = "--internal-computer-broker";
@@ -81,6 +81,15 @@ export type ComputerControllerLike = {
 	keypress?: (expectedEpoch: number | undefined, keys: string[]) => void | Promise<void>;
 	wait?: (expectedEpoch: number | undefined, ms: number) => void | Promise<void>;
 };
+
+type ComputerNativeBindings = Record<string, unknown> & {
+	ComputerController: new () => ComputerControllerLike;
+};
+
+function createNativeComputerController(): ComputerControllerLike {
+	const { ComputerController } = loadNative<ComputerNativeBindings>();
+	return new ComputerController();
+}
 
 export interface ComputerBrokerLaunch {
 	environment: Record<string, string>;
@@ -687,7 +696,7 @@ export async function runComputerBrokerServerFromEnvironment(
 	const config = validBrokerEnvironment(options.env ?? process.env);
 	if (!config) throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker configuration is unavailable.");
 	secureRuntimeDirectory(config, false);
-	const controller = options.controller ?? (new ComputerController() as unknown as ComputerControllerLike);
+	const controller = options.controller ?? createNativeComputerController();
 	let lease: net.Socket | undefined;
 	let actionTail = Promise.resolve();
 	const clients = new Set<net.Socket>();
