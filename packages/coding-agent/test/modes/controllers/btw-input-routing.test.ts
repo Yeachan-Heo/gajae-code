@@ -157,6 +157,38 @@ describe("InputController retained /btw-r routing", () => {
 		expect(harness.editor.addToHistory).not.toHaveBeenCalled();
 	});
 
+	it("captures non-slash text with an embedded skill command in the retained thread", async () => {
+		const harness = createHarness({ retainedOpen: true });
+		const skill = {
+			name: "demo",
+			description: "demo skill",
+			filePath: "demo.md",
+			baseDir: process.cwd(),
+			source: "user" as const,
+			disableModelInvocation: false,
+			content: "Demo skill body",
+		};
+		const ctxMut = harness.ctx as unknown as {
+			skillCommands: Map<string, typeof skill>;
+			session: {
+				promptCustomMessage: (
+					message: unknown,
+					options?: { streamingBehavior?: string; followUpQueuePolicy?: string },
+				) => Promise<void>;
+			};
+		};
+		ctxMut.skillCommands = new Map([["skill:demo", skill]]);
+		const promptCustomMessage = vi.fn(
+			async (_message: unknown, _options?: { streamingBehavior?: string; followUpQueuePolicy?: string }) => {},
+		);
+		ctxMut.session.promptCustomMessage = promptCustomMessage;
+
+		await submit(harness, "what does /skill:demo do?");
+
+		expect(harness.handleBtwRFollowUp).toHaveBeenCalledWith("what does /skill:demo do?");
+		expect(promptCustomMessage).not.toHaveBeenCalled();
+		expect(harness.onInputCallback).not.toHaveBeenCalled();
+	});
 	it("keeps slash-origin follow-up keybinding off the retained path so /skill:* can dispatch normally", async () => {
 		const harness = createHarness({ retainedOpen: true, streaming: true });
 		const skill = {

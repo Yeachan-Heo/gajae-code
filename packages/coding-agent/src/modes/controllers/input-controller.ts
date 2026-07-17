@@ -610,18 +610,19 @@ export class InputController {
 			text = slashResult;
 		}
 
+		if (this.ctx.hasActiveBtwR() && !wasSlashOrigin) {
+			if ((await this.ctx.handleBtwRFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
+				this.ctx.editor.setText("");
+			}
+			return;
+		}
+
 		// Handle skill commands (/skill:name [args]). While streaming, Enter
 		// honors `busyPromptMode`: "steer" interrupts the active turn, "queue"
 		// runs after it completes (matches the free-text Enter semantics applied
 		// a few lines below at the streaming branch). Explicit queue shortcuts
 		// route through `handleFollowUp` and dispatch as `followUp`.
 		if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior(), composer)) {
-			return;
-		}
-		if (this.ctx.hasActiveBtwR() && !wasSlashOrigin) {
-			if ((await this.ctx.handleBtwRFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
-				this.ctx.editor.setText("");
-			}
 			return;
 		}
 
