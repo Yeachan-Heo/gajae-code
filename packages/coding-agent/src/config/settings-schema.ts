@@ -1434,7 +1434,11 @@ export const SETTINGS_SCHEMA = {
 
 	"stt.autoStopSeconds": {
 		type: "number",
-		default: 2.5,
+		// Conversational endpointing defaults are 0.5–0.7s (OpenAI Realtime,
+		// Azure, AssemblyAI) and utterance-end floors are ~1s (Deepgram);
+		// dictating a coding prompt includes thinking pauses, so double the
+		// utterance floor instead of matching turn-taking latencies.
+		default: 2,
 		ui: {
 			tab: "interaction",
 			label: "Voice Auto-Stop (seconds)",
