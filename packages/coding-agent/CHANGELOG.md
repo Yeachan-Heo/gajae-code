@@ -9,8 +9,11 @@
 
 ### Fixed
 - SDK host response delivery to a disconnected client no longer escalates a second structured-error send failure into a process-level unhandled rejection; failures stay local to that connection.
+### Added
+- Native macOS on-device speech recognition backend for voice input (`stt.backend`: `auto`/`apple`/`whisper`). The Apple backend needs no Python, pip, or model download, keeps audio on-device, streams live partial transcripts into the composer as dim ghost text, and biases recognition with repo-aware vocabulary (file names via `contextualStrings`; the whisper path gains the same bias via `initial_prompt`). While listening, the status line shows a live input-level meter, `Esc` cancels the voice session without touching agent work, and `Alt+H` finalizes instantly instead of waiting on a batch transcription.
 
 ### Fixed
+- Fresh macOS/BSD builds of `pi-natives` no longer fail on `libc` 0.2.186's unified `stat` field names (`st_mtimespec` → `st_mtime`/`st_mtime_nsec`).
 - Palette slash commands now run only from an empty composer; drafts are never touched.
 - Aborting a session without an enabled active goal no longer suppresses the first reminder when a goal is activated later; active-goal abort suppression is one-shot, goal-owned, and clears across inactive or replacement-goal transitions (#2436).
 - Palette slash submissions no longer clear or rewrite composer text, cursor state, history, or pending images created while an asynchronous input hook is awaiting; canonical keyboard submission cleanup remains unchanged (#2441).
