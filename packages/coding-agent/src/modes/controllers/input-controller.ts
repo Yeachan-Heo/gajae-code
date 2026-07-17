@@ -1373,7 +1373,9 @@ export class InputController {
 	async handleFollowUp(): Promise<void> {
 		const text = this.ctx.editor.getText().trim();
 		if (!text) return;
-		if (this.ctx.hasActiveBtwR()) {
+		// Mirror Enter: plain retained capture only. Slash-origin stays on normal
+		// dispatch so /skill:* and other slash commands keep working.
+		if (this.ctx.hasActiveBtwR() && !text.startsWith("/")) {
 			if ((await this.ctx.handleBtwRFollowUp(text)) === "accepted") {
 				this.ctx.editor.setText("");
 			}

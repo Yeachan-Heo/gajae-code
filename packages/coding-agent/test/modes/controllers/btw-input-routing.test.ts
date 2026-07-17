@@ -156,4 +156,39 @@ describe("InputController retained /btw-r routing", () => {
 		expect(harness.prompt).not.toHaveBeenCalled();
 		expect(harness.editor.addToHistory).not.toHaveBeenCalled();
 	});
+
+	it("keeps slash-origin follow-up keybinding off the retained path so /skill:* can dispatch normally", async () => {
+		const harness = createHarness({ retainedOpen: true, streaming: true });
+		const skill = {
+			name: "demo",
+			description: "demo skill",
+			filePath: "demo.md",
+			baseDir: process.cwd(),
+			source: "user" as const,
+			disableModelInvocation: false,
+			content: "Demo skill body",
+		};
+		(harness.ctx as { skillCommands?: Map<string, typeof skill> }).skillCommands = new Map([["skill:demo", skill]]);
+		const promptCustomMessage = vi.fn(async () => {});
+		(harness.ctx.session as { promptCustomMessage?: typeof promptCustomMessage }).promptCustomMessage =
+			promptCustomMessage;
+		(harness.ctx.session as { sessionId?: string }).sessionId = "test-session";
+		(
+			harness.ctx.session as {
+				enqueueCustomMessageDisplay?: (text: string, behavior: string) => string;
+			}
+		).enqueueCustomMessageDisplay = vi.fn(() => "tag");
+
+		harness.editor.setText("/skill:demo args");
+		const controller = new InputController(harness.ctx);
+		await controller.handleFollowUp();
+
+		// Slash-origin must never enter retained capture.
+		expect(harness.handleBtwRFollowUp).not.toHaveBeenCalled();
+		expect(promptCustomMessage).toHaveBeenCalled();
+		expect(promptCustomMessage.mock.calls[0]?.[1]).toMatchObject({
+			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
+		});
+	});
 });
