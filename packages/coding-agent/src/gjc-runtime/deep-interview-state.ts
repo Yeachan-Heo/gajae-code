@@ -364,3 +364,96 @@ export function mergeDeepInterviewEnvelope(
 	merged.state = mergedState;
 	return merged as DeepInterviewStateEnvelope;
 }
+
+export const DEEP_INTERVIEW_INTENT_CATEGORIES = ["artifact", "surface", "integration", "constraint"] as const;
+export type DeepInterviewIntentCategory = (typeof DEEP_INTERVIEW_INTENT_CATEGORIES)[number];
+
+export interface DeepInterviewIntentItem {
+	id: string;
+	category: DeepInterviewIntentCategory;
+	statement: string;
+}
+
+export interface DeepInterviewIntentManifest {
+	version: 1;
+	items: DeepInterviewIntentItem[];
+	digest: string;
+}
+
+export interface DeepInterviewIntentSubstitution {
+	removed_id: string;
+	replacement_ids: string[];
+	rationale: string;
+}
+
+export interface DeepInterviewIntentReview {
+	version: 1;
+	status: "not_required" | "pending" | "approved";
+	locked_digest: string;
+	observed_digest: string;
+	removed_locked_ids: string[];
+	supporting_substitutions: DeepInterviewIntentSubstitution[];
+	approval_round?: number;
+	answer_hash?: string;
+	user_answer_evidence?: string;
+}
+
+function canonicalIntentItems(items: readonly DeepInterviewIntentItem[]): DeepInterviewIntentItem[] {
+	return [...items]
+		.map(item => ({ id: item.id.trim(), category: item.category, statement: item.statement.trim() }))
+		.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+export function deepInterviewIntentManifestDigest(items: readonly DeepInterviewIntentItem[]): string {
+	return createHash("sha256").update(JSON.stringify(canonicalIntentItems(items))).digest("hex");
+}
+
+export function createDeepInterviewIntentManifest(items: readonly DeepInterviewIntentItem[]): DeepInterviewIntentManifest {
+	const canonical = canonicalIntentItems(items);
+	const ids = new Set<string>();
+	for (const item of canonical) {
+		if (!DEEP_INTERVIEW_INTENT_CATEGORIES.includes(item.category))
+			throw new Error(`invalid intent category: ${item.category}`);
+		if (!item.id.startsWith(`${item.category}:`) || item.id === `${item.category}:`)
+			throw new Error(`intent id must use ${item.category}: prefix`);
+		if (!item.statement) throw new Error(`intent item ${item.id} requires a statement`);
+		if (ids.has(item.id)) throw new Error(`duplicate intent id: ${item.id}`);
+		ids.add(item.id);
+	}
+	return { version: 1, items: canonical, digest: deepInterviewIntentManifestDigest(canonical) };
+}
+
+export function reviewDeepInterviewIntent(
+	locked: DeepInterviewIntentManifest,
+	observedItems: readonly DeepInterviewIntentItem[],
+	input: Omit<DeepInterviewIntentReview, "version" | "locked_digest" | "observed_digest" | "removed_locked_ids">,
+): DeepInterviewIntentReview {
+	const verifiedLocked = createDeepInterviewIntentManifest(locked.items);
+	if (locked.version !== 1 || locked.digest !== verifiedLocked.digest) throw new Error("locked intent manifest digest mismatch");
+	const observed = createDeepInterviewIntentManifest(observedItems);
+	const observedIds = new Set(observed.items.map(item => item.id));
+	const removed = locked.items.map(item => item.id).filter(id => !observedIds.has(id)).sort();
+	const substitutions = input.supporting_substitutions;
+	const substitutionIds = new Set(substitutions.map(item => item.removed_id));
+	if (substitutionIds.size !== substitutions.length) throw new Error("duplicate intent substitution");
+	for (const substitution of substitutions) {
+		if (!removed.includes(substitution.removed_id)) throw new Error(`substitution does not bind removed intent: ${substitution.removed_id}`);
+		if (!substitution.rationale.trim() || substitution.replacement_ids.length === 0)
+			throw new Error(`substitution for ${substitution.removed_id} requires replacements and rationale`);
+		if (substitution.replacement_ids.some(id => !observedIds.has(id)))
+			throw new Error(`substitution for ${substitution.removed_id} references missing observed intent`);
+	}
+	if (input.status === "not_required" && removed.length > 0) throw new Error("removed locked intent requires review");
+	if (input.status === "approved") {
+		if (removed.some(id => !substitutionIds.has(id))) throw new Error("approved intent reduction requires every substitution");
+		if (input.approval_round === undefined || !input.answer_hash || !input.user_answer_evidence?.trim())
+			throw new Error("approved intent reduction requires durable answer evidence");
+	}
+	return {
+		...input,
+		version: 1,
+		locked_digest: locked.digest,
+		observed_digest: observed.digest,
+		removed_locked_ids: removed,
+	};
+}
