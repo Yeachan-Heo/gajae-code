@@ -1,13 +1,48 @@
+import { dlopen } from "bun:ffi";
 import * as fs from "node:fs";
+
+const WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE = 40;
 
 function runCommand(command: string, args: string[]): string | null {
 	try {
-		const result = Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "pipe" });
+		const result = Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "pipe", windowsHide: true });
 		if (result.exitCode !== 0) return null;
 		return result.stdout.toString("utf-8").trim();
 	} catch {
 		return null;
 	}
+}
+
+function probeWin32Avx2Support(): boolean | undefined {
+	try {
+		const kernel32 = dlopen("kernel32.dll", {
+			IsProcessorFeaturePresent: { args: ["i32"], returns: "bool" },
+		});
+		return Boolean(kernel32.symbols.IsProcessorFeaturePresent(WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE));
+	} catch {
+		return undefined;
+	}
+}
+
+export function detectWin32Avx2Support(
+	probe: () => boolean | undefined = probeWin32Avx2Support,
+	command: (file: string, args: string[]) => string | null = runCommand,
+): boolean {
+	// In-process kernel32 probe: no subprocess and no console window.
+	const probed = probe();
+	if (probed !== undefined) return probed;
+
+	// P/Invoke works on both Windows PowerShell 5.1 and pwsh 7+. A
+	// System.Runtime.Intrinsics type probe would always read false on 5.1
+	// (.NET Framework has no such type), silently forcing baseline.
+	const output = command("powershell.exe", [
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		"Add-Type -Namespace GjcNative -Name Cpu -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern bool IsProcessorFeaturePresent(int feature);'; " +
+			`[GjcNative.Cpu]::IsProcessorFeaturePresent(${WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE})`,
+	]);
+	return output?.toLowerCase() === "true";
 }
 
 export function detectHostAvx2Support(): boolean {
@@ -30,13 +65,7 @@ export function detectHostAvx2Support(): boolean {
 	}
 
 	if (process.platform === "win32") {
-		const output = runCommand("powershell.exe", [
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			"[System.Runtime.Intrinsics.X86.Avx2]::IsSupported",
-		]);
-		return output?.toLowerCase() === "true";
+		return detectWin32Avx2Support();
 	}
 
 	return false;

@@ -231,7 +231,10 @@ export function loadFromCandidates({ candidates, requireCandidate, validateCandi
 
 function runCommand(command, args) {
 	try {
-		const result = childProcess.spawnSync(command, args, { encoding: "utf-8" });
+		// windowsHide keeps the probe console-less: inside a detached, console-less
+		// parent (e.g. the SDK broker) spawning a console app like powershell.exe
+		// would otherwise allocate and flash a new console window per invocation.
+		const result = childProcess.spawnSync(command, args, { encoding: "utf-8", windowsHide: true });
 		if (result.error) return null;
 		if (result.status !== 0) return null;
 		return (result.stdout || "").trim();
@@ -246,6 +249,8 @@ function getVariantOverride() {
 	if (value === "modern" || value === "baseline") return value;
 	return null;
 }
+
+const WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE = 40;
 
 function detectAvx2Support() {
 	if (process.arch !== "x64") {
@@ -271,11 +276,30 @@ function detectAvx2Support() {
 	}
 
 	if (process.platform === "win32") {
+		// PF_AVX2_INSTRUCTIONS_AVAILABLE: in-process kernel32 probe, no subprocess
+		// and no console window. Preferred because a detached, console-less parent
+		// (e.g. the SDK broker) spawning powershell.exe would flash a new console
+		// window per process start.
+		if (typeof Bun !== "undefined") {
+			try {
+				const { dlopen } = createRequire(import.meta.url)("bun:ffi");
+				const kernel32 = dlopen("kernel32.dll", {
+					IsProcessorFeaturePresent: { args: ["i32"], returns: "bool" },
+				});
+				return Boolean(kernel32.symbols.IsProcessorFeaturePresent(WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE));
+			} catch {
+				// Fall through to the PowerShell probe (ffi unavailable/failed).
+			}
+		}
+		// P/Invoke works on both Windows PowerShell 5.1 and pwsh 7+. A
+		// System.Runtime.Intrinsics type probe would always read false on 5.1
+		// (.NET Framework has no such type), silently forcing baseline.
 		const output = runCommand("powershell.exe", [
 			"-NoProfile",
 			"-NonInteractive",
 			"-Command",
-			"[System.Runtime.Intrinsics.X86.Avx2]::IsSupported",
+			"Add-Type -Namespace GjcNative -Name Cpu -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern bool IsProcessorFeaturePresent(int feature);'; " +
+				`[GjcNative.Cpu]::IsProcessorFeaturePresent(${WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE})`,
 		]);
 		return output && output.toLowerCase() === "true";
 	}
