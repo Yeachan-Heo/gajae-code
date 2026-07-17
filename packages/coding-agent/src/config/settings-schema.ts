@@ -3034,25 +3034,6 @@ export const SETTINGS_SCHEMA = {
 		valueSchema: MODEL_SELECTOR_VALUE_SCHEMA,
 	},
 
-	"tasks.todoClearDelay": {
-		type: "number",
-		default: 60,
-		ui: {
-			tab: "tasks",
-			label: "Todo auto-clear delay",
-			description: "How long to wait before removing completed/abandoned tasks from the list",
-			options: [
-				{ value: "0", label: "Instant" },
-				{ value: "60", label: "1 minute", description: "Default" },
-				{ value: "300", label: "5 minutes" },
-				{ value: "900", label: "15 minutes" },
-				{ value: "1800", label: "30 minutes" },
-				{ value: "3600", label: "1 hour" },
-				{ value: "-1", label: "Never" },
-			],
-		},
-	},
-
 	// Skills
 	"skills.enabled": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enabled },
 

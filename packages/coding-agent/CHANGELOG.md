@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Removed
+- Removed the inert `tasks.todoClearDelay` setting from the settings schema, settings UI, and generated `config.schema.json`. The timer-driven auto-clear of completed/abandoned tasks was already deleted from `agent-session.ts` because it mutated canonical `#todoPhases` between tool calls, so the setting had zero runtime effect and misled users who changed it. A leftover `tasks.todoClearDelay` key in an existing `config.yml` is silently ignored (unknown keys are preserved, never read); completed tasks now survive until the next explicit `todo_write` removes them via `rm`/`drop`.
+
 ### Fixed
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
 

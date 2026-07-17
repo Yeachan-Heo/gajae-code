@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
-import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { onAppendOnlyModeChanged, resetSettingsForTest, SETTINGS_SCHEMA, Settings } from "@gajae-code/coding-agent/config/settings";
 import { getCustomThemesDir, getProjectAgentDir, logger, Snowflake } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { withFileLock } from "../src/config/file-lock";
@@ -555,5 +555,30 @@ describe("Settings", () => {
 		const migration = schema?.properties?.session?.properties?.directoryMigration;
 		expect(migration?.default).toBe("copy-retain");
 		expect(migration?.enum).toEqual(["copy-retain", "disabled"]);
+	});
+
+	describe("removed inert tasks.todoClearDelay setting", () => {
+		it("does not expose tasks.todoClearDelay in the settings schema", () => {
+			expect(Object.hasOwn(SETTINGS_SCHEMA, "tasks.todoClearDelay")).toBe(false);
+		});
+
+		it("does not expose tasks.todoClearDelay in the generated config schema", async () => {
+			const schema = JSON.parse(
+				await Bun.file(new URL("../../../schemas/config.schema.json", import.meta.url)).text(),
+			);
+			const tasksProperties = schema?.properties?.tasks?.properties;
+			expect(tasksProperties?.todoClearDelay).toBeUndefined();
+		});
+
+		it("silently ignores a legacy tasks.todoClearDelay key in config.yml", async () => {
+			await writeSettings({ tasks: { todoClearDelay: 60 } });
+
+			// Loading must not throw; the orphan key is preserved but never read.
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// The orphan key survives in the raw config but has no runtime effect.
+			const raw = await readSettings();
+			expect((raw.tasks as { todoClearDelay?: unknown } | undefined)?.todoClearDelay).toBe(60);
+		});
 	});
 });

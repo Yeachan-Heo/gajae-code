@@ -8,7 +8,7 @@
 - Key collaborators:
   - `packages/coding-agent/src/tools/index.ts` — registers tool, exposes session hooks, gates availability.
   - `packages/coding-agent/src/modes/controllers/event-controller.ts` — updates the visible todo UI on tool completion.
-  - `packages/coding-agent/src/session/agent-session.ts` — stores cached phases, auto-clears done/dropped tasks, emits failure reminders.
+  - `packages/coding-agent/src/session/agent-session.ts` — stores cached phases, emits failure reminders.
   - `packages/coding-agent/src/modes/controllers/todo-command-controller.ts` — `/todo` command path, custom-entry persistence, transcript reminder injection.
   - `packages/coding-agent/src/tools/render-utils.ts` — collapsed-preview cap for renderer trees.
 
@@ -116,15 +116,12 @@ The same file also exposes non-tool helpers used by `/todo`:
   - Transcript block is rendered by `todoWriteToolRenderer` and merged with the call line.
   - `event-controller` updates the visible todo panel from successful results.
   - On error, `event-controller` shows `Todo update failed...`; the visible panel may stay stale until a later successful call.
-- Background work / cancellation
-  - `AgentSession.setTodoPhases(...)` schedules auto-clear timers for `completed` / `abandoned` tasks via `tasks.todoClearDelay`.
 
 ## Limits & Caps
 - `ops` array: `minItems: 1` (`todoWriteSchema`).
 - `init.list[*].items`: `minItems: 1`.
 - `append.items`: `minItems: 1`.
 - Renderer collapsed preview: `PREVIEW_LIMITS.COLLAPSED_ITEMS = 8` (`packages/coding-agent/src/tools/render-utils.ts`).
-- Auto-clear delay: `tasks.todoClearDelay` default `60` seconds; `< 0` disables auto-clear, `0` clears on the next microtask (`packages/coding-agent/src/session/agent-session.ts`).
 - Tool execution mode: `concurrency = "exclusive"`, `strict = true`, `loadMode = "discoverable"`.
 
 ## Errors

@@ -2179,17 +2179,6 @@
 			},
 			"additionalProperties": false
 		},
-		"tasks": {
-			"type": "object",
-			"properties": {
-				"todoClearDelay": {
-					"type": "number",
-					"description": "How long to wait before removing completed/abandoned tasks from the list",
-					"default": 60
-				}
-			},
-			"additionalProperties": false
-		},
 		"skills": {
 			"type": "object",
 			"properties": {
