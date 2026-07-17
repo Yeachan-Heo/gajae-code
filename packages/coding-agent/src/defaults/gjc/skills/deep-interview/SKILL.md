@@ -248,7 +248,13 @@ I'm reading this as {N} top-level component(s):
 1. {component_name}: {one_sentence_description}
 2. ...
 
-Is that topology right? Should any component be added, removed, merged, split, or explicitly deferred?
+Locked intent:
+- Artifacts: {category-prefixed IDs and concrete outputs}
+- Surfaces: {category-prefixed IDs and user-visible surfaces}
+- Integrations: {category-prefixed IDs and external/system boundaries}
+- Constraints: {category-prefixed IDs and user-locked constraints}
+
+Is that topology and locked intent right? Should any component or intent be added, removed, merged, split, or explicitly deferred?
 ```
 
 Options should include contextually relevant choices such as **Looks right**, **Add/remove/merge components**, **Defer one or more components**, plus free-text, translated/localized according to `language.instruction` when present. This is the only pre-scoring question and preserves the one-question-per-round rule.
@@ -287,6 +293,10 @@ Options should include contextually relevant choices such as **Looks right**, **
   }
 }
 ```
+
+In the same Round 0 answer, persist `state.intent_contract` version 1. It contains the four exact categories `artifact`, `surface`, `integration`, and `constraint`; every item has a unique category-prefixed ID (for example `surface:review`) and a non-empty statement. Canonically sort items by ID and persist the full SHA-256 manifest digest. The confirmation answer locks this manifest before Round 1; later prose, inferred implementation detail, or a regenerated digest cannot replace it.
+
+Before spec persistence, derive the observed final intent manifest from the actual spec contents and compare it with the locked manifest. Additions and clarifications do not require reduction approval. For every missing locked ID, persist an explicit supporting substitution that names existing observed replacement IDs and a rationale, then ask one intent-review question. Persist version-1 `intent_review` with locked/observed digests, all removed IDs, substitutions, approval round, immutable answer hash, and bounded user-answer evidence. A `not_required` review is valid only when no locked ID was removed; an approved review is valid only when every removed ID has a substitution and durable answer evidence. Intent review approves only that output reduction and never authorizes execution or ralplan handoff.
 
 4. **Legacy state migration:** When resuming an existing `deep-interview` state file that lacks `topology`, treat it as `"status": "legacy_missing"`. If no final `spec_path` exists yet, run Round 0 before the next ambiguity scoring pass and then continue with the existing transcript. If a final spec already exists, do not rewrite history; note in any handoff that topology was not captured for that legacy interview.
 
