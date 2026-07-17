@@ -9,9 +9,12 @@
 
 ### Fixed
 - SDK host response delivery to a disconnected client no longer escalates a second structured-error send failure into a process-level unhandled rejection; failures stay local to that connection.
+### Changed
+- In-process Apple speech eligibility is now fail-closed: only provable host classes (Apple system apps under /System, or bundles carrying both speech/microphone usage descriptions) can select the Apple backend; unknown or ambiguous hosts (tmux, ssh, unparseable ancestry) use whisper, and forced `apple` fails with guidance instead of risking a TCC process abort.
+
 ### Added
+- Pressing Enter during an active voice session finalizes the transcript and submits it (plus any already-typed text) in one stroke: dictate → Enter → sent.
 - Voice input now auto-finalizes after you stop talking: once speech is detected, sustained silence for `stt.autoStopSeconds` (default 2s, 0 disables) commits the transcript exactly like the toggle key — and it never fires before you have spoken, so ambient noise cannot cut off an idle session. Works on both the Apple and whisper backends via the shared level stream.
-- Launchd speech helper ("GJC Speech") that owns its own TCC responsibility, making Apple on-device voice streaming work identically under any terminal — including hosts whose bundles cannot run Speech APIs in-process (missing usage descriptions) or whose hardened runtime lacks the audio-input entitlement (silent microphone). Auto-selected when the hosting terminal blocks in-process recognition; forceable via `stt.appleTransport=helper`. Verified live: streaming partials from a terminal whose own microphone path delivers only zeros.
 - Native macOS on-device speech recognition backend for voice input (`stt.backend`: `auto`/`apple`/`whisper`). The Apple backend needs no Python, pip, or model download, keeps audio on-device, streams live partial transcripts into the composer as dim ghost text, and biases recognition with repo-aware vocabulary (file names via `contextualStrings`; the whisper path gains the same bias via `initial_prompt`). While listening, the status line shows a live input-level meter, `Esc` cancels the voice session without touching agent work, `Alt+H` finalizes instantly instead of waiting on a batch transcription, and a `/voice` slash command starts listening without a keychord (macOS terminals often type `˙` for Option+H unless the terminal sends Option as Meta).
 
 ### Fixed

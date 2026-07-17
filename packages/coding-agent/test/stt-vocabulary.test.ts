@@ -65,3 +65,21 @@ describe("bundlePathFromExecutablePath", () => {
 		expect(bundlePathFromExecutablePath("")).toBeNull();
 	});
 });
+
+describe("host speech eligibility (fail-closed)", () => {
+	test("classifies system, app, and unknown hosts", async () => {
+		const { classifyHostBundle } = await import("../src/stt/backends/apple");
+		expect(classifyHostBundle("/System/Applications/Utilities/Terminal.app")).toBe("system");
+		expect(classifyHostBundle("/Applications/Orca.app")).toBe("app");
+		expect(classifyHostBundle(null)).toBe("none");
+	});
+
+	test("only provable hosts are eligible; unknown is never eligible", async () => {
+		const { hostClassAllowsInProcessSpeech } = await import("../src/stt/backends/apple");
+		expect(hostClassAllowsInProcessSpeech("system", false)).toBe(true);
+		expect(hostClassAllowsInProcessSpeech("app", true)).toBe(true);
+		expect(hostClassAllowsInProcessSpeech("app", false)).toBe(false);
+		expect(hostClassAllowsInProcessSpeech("none", true)).toBe(false);
+		expect(hostClassAllowsInProcessSpeech("none", false)).toBe(false);
+	});
+});

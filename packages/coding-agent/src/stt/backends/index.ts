@@ -25,7 +25,7 @@ export interface ResolvedSttBackend {
 }
 
 const FALLBACK_NOTES: Record<string, string> = {
-	"host-app": "This terminal app lacks speech usage descriptions (macOS would abort the process) — using whisper.",
+	"host-app": "In-process Apple speech is not verified safe under this terminal (fail-closed) — using whisper.",
 	locale: "Apple speech does not support this language — using whisper.",
 	assets: "Apple speech assets are unavailable — using whisper.",
 	"on-device": "Apple speech has no on-device model for this language — using whisper.",
