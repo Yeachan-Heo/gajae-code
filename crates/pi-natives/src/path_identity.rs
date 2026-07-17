@@ -662,6 +662,11 @@ mod platform {
 		// SAFETY: the file descriptor is live; the returned ACL is freed exactly once.
 		let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
 		if acl.is_null() {
+			// macOS `acl_get_fd` reports "no ACL present" as NULL + ENOENT — the
+			// common case for freshly created paths, not an API failure.
+			if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+				return Ok(false);
+			}
 			return Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"));
 		}
 		let mut entry = std::ptr::null_mut();
