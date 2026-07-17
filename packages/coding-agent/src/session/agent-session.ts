@@ -1613,6 +1613,8 @@ export class AgentSession {
 	};
 	#promptInFlightCount = 0;
 	#agentEventHandlersInFlight = 0;
+	#agentEventHandlersIdlePromise: Promise<void> | undefined;
+	#resolveAgentEventHandlersIdle: (() => void) | undefined;
 	#queuedExtensionEventCount = 0;
 	#extensionTurnGeneration = 0;
 	#closedExtensionTurnGeneration: number | undefined;
@@ -2561,14 +2563,29 @@ export class AgentSession {
 		return queued;
 	}
 
+	async #waitForAgentEventHandlers(): Promise<void> {
+		while (this.#agentEventHandlersIdlePromise) {
+			await this.#agentEventHandlersIdlePromise;
+		}
+	}
+
 	#trackAgentEvent = async (event: AgentEvent): Promise<void> => {
-		this.#agentEventHandlersInFlight++;
+		if (this.#agentEventHandlersInFlight++ === 0) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			this.#agentEventHandlersIdlePromise = promise;
+			this.#resolveAgentEventHandlersIdle = resolve;
+		}
 		try {
 			await this.#handleAgentEvent(event);
 		} catch (error) {
 			logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
 		} finally {
 			this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
+			if (this.#agentEventHandlersInFlight === 0) {
+				this.#resolveAgentEventHandlersIdle?.();
+				this.#resolveAgentEventHandlersIdle = undefined;
+				this.#agentEventHandlersIdlePromise = undefined;
+			}
 			this.#flushPendingAgentEnd();
 		}
 	};
@@ -4629,6 +4646,7 @@ export class AgentSession {
 	/** Wait until streaming and deferred recovery work are fully settled. */
 	async waitForIdle(): Promise<void> {
 		await this.agent.waitForIdle();
+		await this.#waitForAgentEventHandlers();
 		await this.#waitForPostPromptRecovery();
 	}
 
