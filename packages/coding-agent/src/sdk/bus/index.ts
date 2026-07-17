@@ -3801,9 +3801,11 @@ export function createNotificationsExtension(
 		rt.activePromptCorrelation = correlation;
 		// Register the active prompt identity so the runtime-state sidecar can stamp
 		// terminal writes with the exact runtime turn (consumed out-of-process by
-		// the coordinator MCP bridge). Not cleared on agent_end: the terminal write
-		// captures it at scheduling time, and the next agent_start re-registers.
-		if (correlation) setActiveRuntimeTurnCorrelation(id, correlation);
+		// the coordinator MCP bridge). Not cleared on agent_end — the terminal write
+		// captures it at scheduling time — but a correlation-less start (e.g. a
+		// local TUI prompt on the same session) must clear it so its terminal state
+		// can never inherit the previous SDK turn's identity.
+		setActiveRuntimeTurnCorrelation(id, correlation ?? null);
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {
 			// `activity` is the native live-host lifecycle surface. The separately

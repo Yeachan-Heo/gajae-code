@@ -236,6 +236,23 @@ describe("coordinator runtime state sidecar", () => {
 				runtime_turn_id: "runtime-turn-a",
 				runtime_command_id: "command-a",
 			});
+
+			// A correlation-less turn (e.g. a local TUI prompt) clears the registry,
+			// so its terminal state never inherits a previous SDK turn's identity.
+			setActiveRuntimeTurnCorrelation("correlation-session", null);
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_end", messages: [] },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			expect(await readJson(stateFile)).toMatchObject({
+				state: "completed",
+				runtime_turn_id: null,
+				runtime_command_id: null,
+			});
 		} finally {
 			setActiveRuntimeTurnCorrelation("correlation-session", null);
 		}
