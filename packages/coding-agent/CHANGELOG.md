@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+
+### Fixed
+- Subagent await/cancel doctrine now has a single source of truth shared by task handoff text, the subagent tool, and prompt/skill docs, so timeout-vs-cancel guidance cannot drift.
+
 ### Fixed
 - Palette slash commands now run only from an empty composer; drafts are never touched.
 - Aborting a session without an enabled active goal no longer suppresses the first reminder when a goal is activated later; active-goal abort suppression is one-shot, goal-owned, and clears across inactive or replacement-goal transitions (#2436).

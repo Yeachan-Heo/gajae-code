@@ -15,8 +15,8 @@ Inspect selected subagents by `ids`; omit `ids` to inspect current running subag
 ## `action: "await"`
 Wait for selected subagents by `ids`; omit `ids` to wait for current running subagents.
 - Always set `timeout_ms` when the result is not immediately required forever.
-- Await timeout only bounds this tool call's wait; it does not stop the subagent and is not a failure reason.
-- On timeout, inspect progress and keep doing independent work. Never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong.
+- An await timeout only bounds the wait. It is not subagent failure evidence and must not be used as a cancellation reason; inspect or continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
+- On timeout, inspect progress and keep doing independent work.
 - Completed results are receipt-first by default: bounded preview plus `agent://<id>` output ref when available, not full retained output.
 
 ## `action: "pause"`
@@ -42,7 +42,7 @@ Send a non-empty `message` to one subagent by `id` (preferred) or a single-item 
 
 ## `action: "cancel"`
 Stop selected subagents by `ids`, including running, paused, or queued subagents.
-- Use only when the subagent has actually failed, gone off-track, or become unrecoverably wrong; an await timeout alone is never a cancellation reason.
+- Cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong; an await timeout alone is never a cancellation reason.
 - Cancellation keeps the subagent session file for possible later context recovery.
 
 # Statuses

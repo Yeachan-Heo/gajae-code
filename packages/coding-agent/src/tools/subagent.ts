@@ -1,3 +1,4 @@
+import { SUBAGENT_AWAIT_TIMEOUT_DOCTRINE } from "../task/subagent-await-doctrine";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt } from "@gajae-code/utils";
@@ -702,7 +703,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const subagent = job.metadata?.subagent;
 		const runningTimeoutGuidance =
 			timedOut && job.status === "running"
-				? "Still running after the await timeout; timeout only bounded this wait and is not a failure. Inspect progress, continue independent work, and never cancel just because an await timed out; cancel only if the subagent has actually failed, gone off-track, or become unrecoverably wrong."
+				? `Still running after the await timeout. ${SUBAGENT_AWAIT_TIMEOUT_DOCTRINE}`
 				: undefined;
 		const output = previewJobOutput(job, verbosity);
 		const outputRef = record && verifiedOutputIds.has(record.subagentId) ? `agent://${record.subagentId}` : undefined;

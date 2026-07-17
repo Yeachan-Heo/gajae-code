@@ -19,6 +19,9 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@gajae
 import type { Model, Usage } from "@gajae-code/ai";
 import { $env, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
+import {
+	SUBAGENT_AWAIT_TIMEOUT_DOCTRINE,
+} from "./subagent-await-doctrine";
 import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner } from "../async";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
@@ -861,8 +864,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			})
 			.join("\n");
 		const coordinationHint = ircEnabled
-			? ` DM these ids via \`irc\` to coordinate while they run. Use \`subagent\` to list, inspect, or await with a timeout; a timeout only bounds your wait and is never a cancellation reason. Cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong; \`job\` remains available for generic background jobs.`
-			: ` Use \`subagent\` to list, inspect, or await with a timeout; a timeout only bounds your wait and is never a cancellation reason. Cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong; \`job\` remains available for generic background jobs.`;
+			? ` DM these ids via \`irc\` to coordinate while they run. Use \`subagent\` to list, inspect, or await with a timeout. ${SUBAGENT_AWAIT_TIMEOUT_DOCTRINE} \`job\` remains available for generic background jobs.`
+			: ` Use \`subagent\` to list, inspect, or await with a timeout. ${SUBAGENT_AWAIT_TIMEOUT_DOCTRINE} \`job\` remains available for generic background jobs.`;
 
 		return {
 			content: [
