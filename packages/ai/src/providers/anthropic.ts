@@ -82,6 +82,7 @@ import {
 	type ResolveToolChoiceResult,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { SlidingWindowBudget } from "./anthropic-fallback-budget";
 import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
@@ -933,31 +934,40 @@ function appendAnthropicRateLimitEvidence(bodyText: string, headers: Headers): s
 // non-abortable SDK sleep, no Response reconstruction, and no interaction
 // with the SDK retry budget.
 //
-// Budget scope, stated honestly: PROCESS-WIDE. Every streamAnthropic call
-// builds a fresh client+wrapper, so any per-wrapper state would silently be
-// per-call; a module-level sliding window is the smallest scope that
-// actually bounds aggregate amplification. Worst case across the whole
-// process: ANTHROPIC_FALLBACK_MAX_RETRIES extra requests per
-// ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS, regardless of concurrency.
+// Budget scope (#2464 third review): KEYED by policy identity -- origin plus
+// a non-secret hash of the credential header -- so one credential/endpoint
+// can never consume another's fallback allowance. Every streamAnthropic call
+// builds a fresh client+wrapper, so the store lives at module level; the
+// SlidingWindowBudget unit owns lifecycle (empty keys pruned) and monotonic
+// clock semantics (performance.now). Worst case per identity:
+// ANTHROPIC_FALLBACK_MAX_RETRIES extra requests per
+// ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS, sequential or concurrent.
 const ANTHROPIC_FALLBACK_MAX_RETRIES = 2;
 const ANTHROPIC_FALLBACK_RETRY_DELAY_MS = 2_000;
 const ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS = 60_000;
 
-let anthropicFallbackDowngradeTimes: number[] = [];
+const anthropicFallbackBudget = new SlidingWindowBudget(
+	ANTHROPIC_FALLBACK_MAX_RETRIES,
+	ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS,
+);
 
-// Consume one downgrade slot from the process-wide window; false = budget
-// spent (caller falls through to the exhaustion fast-path).
-function takeAnthropicFallbackBudget(now: number): boolean {
-	anthropicFallbackDowngradeTimes = anthropicFallbackDowngradeTimes.filter(
-		time => now - time < ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS,
-	);
-	if (anthropicFallbackDowngradeTimes.length >= ANTHROPIC_FALLBACK_MAX_RETRIES) return false;
-	anthropicFallbackDowngradeTimes.push(now);
-	return true;
-}
-
-export function resetAnthropicFallbackRetryBudgetForTests(): void {
-	anthropicFallbackDowngradeTimes = [];
+// Policy identity for the budget: request origin + a truncated sha256 of the
+// credential header. The hash never leaves process memory and cannot be
+// reversed to the secret; distinct api keys / OAuth tokens / gateways get
+// distinct budgets, while retries of the same request share one.
+function anthropicFallbackBudgetKey(input: string | URL | Request, init?: RequestInit): string {
+	let origin = "unknown-origin";
+	try {
+		const url = typeof input === "string" ? new URL(input) : input instanceof URL ? input : new URL(input.url);
+		origin = url.origin;
+	} catch {
+		// Keep the sentinel origin: an unparseable target still gets a budget,
+		// just a shared conservative one.
+	}
+	const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+	const credential = headers.get("authorization") ?? headers.get("x-api-key") ?? "";
+	const credentialHash = nodeCrypto.createHash("sha256").update(credential).digest("hex").slice(0, 16);
+	return `${origin}#${credentialHash}`;
 }
 
 type Anthropic429Class = "ordinary" | "usage_exhaustion" | "fallback_retryable";
@@ -1081,12 +1091,15 @@ function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDe
 		const classification = classifyAnthropic429(bodyText, headers, retryAfterMs, retryDelayCapMs);
 		if (classification === "ordinary") return response;
 
-		if (classification === "fallback_retryable" && takeAnthropicFallbackBudget(Date.now())) {
+		if (
+			classification === "fallback_retryable" &&
+			anthropicFallbackBudget.take(anthropicFallbackBudgetKey(input, init))
+		) {
 			// The wrapper waits and re-fetches itself: scheduler.wait is
 			// signal-aware (rejects promptly on abort), the SDK never sees
 			// the downgraded 429 (its retry budget and non-abortable sleep
 			// stay untouched), and no Response is reconstructed. Recursion
-			// is bounded by the process-wide budget above.
+			// is bounded by the keyed budget above.
 			const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
 			await scheduler.wait(ANTHROPIC_FALLBACK_RETRY_DELAY_MS, { signal: signal ?? undefined });
 			return wrapped(input, init);

@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
-import { resetAnthropicFallbackRetryBudgetForTests, streamAnthropic } from "../src/providers/anthropic";
+import { streamAnthropic } from "../src/providers/anthropic";
 import type { Context, FetchImpl, Model } from "../src/types";
 import { waitForDelayOrAbort } from "./helpers";
 
@@ -132,12 +132,6 @@ function createAnthropicMockStream({
 	};
 }
 
-beforeEach(() => {
-	// The fallback downgrade budget is process-wide by design (see the policy
-	// comment in providers/anthropic.ts); isolate tests from each other.
-	resetAnthropicFallbackRetryBudgetForTests();
-});
-
 afterEach(() => {
 	// No shared globals to restore; keep hook so the suite stays explicit.
 });
@@ -251,9 +245,14 @@ describe("anthropic first-event timeout retries", () => {
 		);
 	};
 
+	// The downgrade budget is keyed by origin + credential hash, so a unique
+	// apiKey per invocation gives natural test isolation (no reset hook on
+	// the product surface). Tests that PROVE budget sharing pass an explicit
+	// shared key.
 	const runUnifiedRejection = async (
 		overrides: Record<string, string | null> = {},
 		body?: { text: string; contentType?: string },
+		apiKey: string = `test-key-${crypto.randomUUID()}`,
 	) => {
 		let attempts = 0;
 		const fetchMock = (async () => {
@@ -261,7 +260,7 @@ describe("anthropic first-event timeout retries", () => {
 			return unifiedRejection429(overrides, body);
 		}) as FetchImpl;
 		const result = await streamAnthropic(model, context, {
-			apiKey: "test-key",
+			apiKey,
 			fetch: fetchMock,
 			requestMaxRetries: 1,
 		}).result();
@@ -364,17 +363,32 @@ describe("anthropic first-event timeout retries", () => {
 		expect(result.errorStatus).toBe(429);
 	}, 15_000);
 
-	it("shares the sliding downgrade budget across sequential calls", async () => {
-		// #2464 finding 4: the budget is PROCESS-WIDE (every streamAnthropic
-		// call builds a fresh wrapper, so any narrower scope silently becomes
-		// per-call). A second call inside the same 60s window must fail fast
-		// with zero extra downgrades -- 3 + 1 attempts total, never 6.
-		const first = await runUnifiedRejection();
+	it("keys the downgrade budget by credential -- sequential same key shares, other keys do not starve", async () => {
+		// #2464 third review: the budget must be keyed to a policy identity.
+		// Same credential inside one 60s window: 3 + 1 attempts (shared
+		// allowance, never 6). A DIFFERENT credential right after: its own
+		// full 3 attempts -- no cross-tenant starvation.
+		const sharedKey = `shared-${crypto.randomUUID()}`;
+		const first = await runUnifiedRejection({}, undefined, sharedKey);
 		expect(first.attempts()).toBe(3);
-		const second = await runUnifiedRejection();
+		const second = await runUnifiedRejection({}, undefined, sharedKey);
 		expect(second.attempts()).toBe(1);
+		const unrelated = await runUnifiedRejection({}, undefined, `other-${crypto.randomUUID()}`);
+		expect(unrelated.attempts()).toBe(3);
+	}, 25_000);
+
+	it("bounds concurrent requests sharing one credential to the same allowance", async () => {
+		// Two concurrent calls on ONE key split the 2-slot window: exactly
+		// 2 initial + 2 downgraded attempts in total, regardless of ordering.
+		const sharedKey = `concurrent-${crypto.randomUUID()}`;
+		const [first, second] = await Promise.all([
+			runUnifiedRejection({}, undefined, sharedKey),
+			runUnifiedRejection({}, undefined, sharedKey),
+		]);
+		expect(first.attempts() + second.attempts()).toBe(4);
+		expect(first.result.errorStatus).toBe(429);
 		expect(second.result.errorStatus).toBe(429);
-	}, 20_000);
+	}, 25_000);
 
 	it("does not let fallback headers change unrelated 429 error classes", async () => {
 		// An arbitrary 429 (small retry-after, non-unified error class) with
