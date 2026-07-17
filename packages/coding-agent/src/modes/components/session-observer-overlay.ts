@@ -66,6 +66,8 @@ export class SessionObserverOverlayComponent extends Container {
 	#onDone: () => void;
 	#selectedSessionId?: string;
 	#observeKeys: KeyId[];
+	#mode: "picker" | "viewer" = "picker";
+	#pickerIndex = 0;
 	#transcriptCache?: { path: string; bytesRead: number; entries: SessionMessageEntry[]; model?: string };
 
 	// Scroll state
@@ -94,14 +96,18 @@ export class SessionObserverOverlayComponent extends Container {
 		this.#onDone = onDone;
 		this.#observeKeys = observeKeys;
 
-		// Jump directly to the most recently active sub-agent
+		// Open the picker listing main + subagent sessions. Pre-select the most
+		// recently active sub-agent so Enter dives straight into the busy one.
+		const subagents = this.#registry.getSessions().filter(s => s.kind === "subagent");
+		if (subagents.length === 0) {
+			// Nothing to observe — close immediately.
+			queueMicrotask(() => this.#onDone());
+			return;
+		}
 		const mostRecent = this.#getMostRecentSubagent();
 		if (mostRecent) {
-			this.#selectedSessionId = mostRecent.id;
-			this.#setupViewer();
-		} else {
-			// No sub-agents — close immediately
-			queueMicrotask(() => this.#onDone());
+			const idx = this.#getPickerSessions().findIndex(s => s.id === mostRecent.id);
+			this.#pickerIndex = idx >= 0 ? idx : 0;
 		}
 	}
 
@@ -116,7 +122,117 @@ export class SessionObserverOverlayComponent extends Container {
 	}
 
 	override render(width: number): string[] {
-		return this.#renderViewer(width);
+		return this.#mode === "picker" ? this.#renderPicker(width) : this.#renderViewer(width);
+	}
+
+	#getPickerSessions(): ObservableSession[] {
+		return this.#registry.getSessions();
+	}
+
+	#enterViewer(sessionId: string): void {
+		this.#mode = "viewer";
+		this.#selectedSessionId = sessionId;
+		this.#transcriptCache = undefined;
+		this.#navigationStack = [];
+		this.#setupViewer();
+	}
+
+	#returnToPicker(): void {
+		this.#mode = "picker";
+		this.#transcriptCache = undefined;
+		this.#navigationStack = [];
+		if (this.#selectedSessionId) {
+			const idx = this.#getPickerSessions().findIndex(s => s.id === this.#selectedSessionId);
+			if (idx >= 0) this.#pickerIndex = idx;
+		}
+	}
+
+	#handlePickerInput(keyData: string): void {
+		const sessions = this.#getPickerSessions();
+		const count = sessions.length;
+
+		if (matchesKey(keyData, "escape")) {
+			this.#onDone();
+			return;
+		}
+		if (keyData === "j" || matchesKey(keyData, "down")) {
+			if (count > 0) this.#pickerIndex = Math.min(this.#pickerIndex + 1, count - 1);
+			return;
+		}
+		if (keyData === "k" || matchesKey(keyData, "up")) {
+			if (count > 0) this.#pickerIndex = Math.max(this.#pickerIndex - 1, 0);
+			return;
+		}
+		if (keyData === "g") {
+			this.#pickerIndex = 0;
+			return;
+		}
+		if (keyData === "G") {
+			if (count > 0) this.#pickerIndex = count - 1;
+			return;
+		}
+		if (matchesKey(keyData, "enter") || keyData === "\r" || keyData === "\n") {
+			const target = sessions[this.#pickerIndex];
+			if (!target) return;
+			// Main session has no observable transcript here — Enter jumps back out.
+			if (target.kind === "main") {
+				this.#onDone();
+				return;
+			}
+			this.#enterViewer(target.id);
+			return;
+		}
+	}
+
+	#renderPicker(width: number): string[] {
+		const termHeight = process.stdout.rows || 40;
+		const sessions = this.#getPickerSessions();
+		const subagentCount = sessions.filter(s => s.kind === "subagent").length;
+
+		// Header chrome: border + title + count + border = 4 lines.
+		// Footer chrome: spacer + hints + border = 3 lines.
+		const viewport = Math.max(3, termHeight - 7);
+
+		if (this.#pickerIndex >= sessions.length) this.#pickerIndex = Math.max(0, sessions.length - 1);
+
+		let start = 0;
+		if (sessions.length > viewport) {
+			start = Math.max(0, Math.min(this.#pickerIndex - Math.floor(viewport / 2), sessions.length - viewport));
+		}
+		const visible = sessions.slice(start, start + viewport);
+
+		const lines: string[] = [];
+		lines.push(...new DynamicBorder().render(width));
+		lines.push(` ${theme.fg("accent", "Session Observer")}`);
+		lines.push(` ${theme.fg("dim", `${sessions.length} session(s) · ${subagentCount} subagent(s)`)}`);
+		lines.push(...new DynamicBorder().render(width));
+
+		for (let i = 0; i < visible.length; i++) {
+			const session = visible[i];
+			const selected = start + i === this.#pickerIndex;
+			lines.push(` ${this.#buildPickerRow(session, selected, width - 2)}`);
+		}
+		const pad = viewport - visible.length;
+		for (let i = 0; i < pad; i++) lines.push("");
+
+		lines.push("");
+		lines.push(` ${theme.fg("dim", "j/k:navigate  Enter:open  g/G:top/bottom  Esc/Ctrl+S:close")}`);
+		lines.push(...new DynamicBorder().render(width));
+		return lines;
+	}
+
+	#buildPickerRow(session: ObservableSession, selected: boolean, width: number): string {
+		const cursor = selected ? theme.fg("accent", "▶") : " ";
+		const statusColor = session.status === "active" ? "success" : session.status === "failed" ? "error" : "dim";
+		const status = theme.fg(statusColor, `[${session.status}]`);
+		// The subagent label already carries its description, so show the agent
+		// role once (not a duplicated description) alongside the label.
+		const agentPart = session.agent ? `${theme.fg("dim", session.agent)}  ` : "";
+		const rawLabel = sanitizeLine(session.label, TRUNCATE_LENGTHS.TITLE);
+		const label = selected ? theme.bold(rawLabel) : rawLabel;
+		const stats = session.kind === "subagent" ? this.#buildStatsLine(session) : "";
+		const statsPart = stats ? `  ${stats}` : "";
+		return truncateToWidth(`${cursor} ${status} ${agentPart}${label}${statsPart}`, width);
 	}
 
 	#setupViewer(): void {
@@ -136,6 +252,12 @@ export class SessionObserverOverlayComponent extends Container {
 
 	/** Rebuild content from live registry data */
 	refreshFromRegistry(): void {
+		if (this.#mode === "picker") {
+			// Picker reads the registry live on render; just keep the cursor in range.
+			const count = this.#getPickerSessions().length;
+			if (this.#pickerIndex >= count) this.#pickerIndex = Math.max(0, count - 1);
+			return;
+		}
 		if (this.#selectedSessionId) {
 			// Keep auto-scrolling to bottom unless the user navigated away from the last entry
 			this.#wasAtBottom = this.#selectedEntryIndex >= this.#viewerEntries.length - 1;
@@ -628,24 +750,33 @@ export class SessionObserverOverlayComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
-		// Ctrl+S (observe key) always closes the overlay
+		// Observe key (Ctrl+S): in the viewer it steps back to the picker;
+		// in the picker it toggles the overlay closed.
 		for (const key of this.#observeKeys) {
 			if (matchesKey(keyData, key)) {
-				this.#onDone();
+				if (this.#mode === "viewer") {
+					this.#returnToPicker();
+				} else {
+					this.#onDone();
+				}
 				return;
 			}
 		}
 
-		this.#handleViewerInput(keyData);
+		if (this.#mode === "picker") {
+			this.#handlePickerInput(keyData);
+		} else {
+			this.#handleViewerInput(keyData);
+		}
 	}
 
 	#handleViewerInput(keyData: string): void {
 		const entryCount = this.#viewerEntries.length;
 
-		// Escape — pop breadcrumb navigation or close overlay
+		// Escape — pop breadcrumb navigation, or return to the picker
 		if (matchesKey(keyData, "escape")) {
 			if (!this.#navigateBack()) {
-				this.#onDone();
+				this.#returnToPicker();
 			}
 			return;
 		}

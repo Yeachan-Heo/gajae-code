@@ -19,6 +19,7 @@
 ### Added
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 - Added a searchable command palette with direct action dispatch; slash commands run only from an empty composer, and drafts are never touched.
+- The subagent session observer (Ctrl+S) now opens a session picker that lists the main session and every subagent with live status, agent, and progress; Enter opens a subagent's transcript, `[`/`]` cycles agents, and Esc/Ctrl+S steps back to the list. Previously Ctrl+S jumped straight into the most recently active subagent's transcript with no way to browse the others.
 
 ### Fixed
 

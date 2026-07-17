@@ -96,8 +96,9 @@ describe("Observer overlay silent-abort regression", () => {
 
 		const overlay = new SessionObserverOverlayComponent(registry, () => {}, ["ctrl+s"]);
 
-		// Render with a reasonable width — the overlay reads the session file
-		// and calls #buildTranscriptLines internally.
+		// The overlay opens in picker mode; Enter dives into the transcript viewer,
+		// which reads the session file and calls #buildTranscriptLines internally.
+		overlay.handleInput("\r");
 		const rendered = overlay.render(120);
 		const renderedText = rendered.join("\n");
 
@@ -156,6 +157,7 @@ describe("Observer overlay silent-abort regression", () => {
 
 		const overlay = new SessionObserverOverlayComponent(registry, () => {}, ["ctrl+s"]);
 
+		overlay.handleInput("\r"); // enter the transcript viewer for the subagent
 		const rendered = overlay.render(120);
 		const renderedText = rendered.join("\n");
 
