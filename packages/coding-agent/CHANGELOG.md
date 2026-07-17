@@ -27,6 +27,7 @@
 - Added the standalone `@gajae-code/bridge-client` transport-only v3 SDK package. It exports `SdkClient` and its associated types; `@gajae-code/coding-agent/sdk` remains a compatibility re-export with the exact same class identity. Historical BridgeClient backend protocol, handshake, commands, SSE, and host-control bypass surfaces remain unavailable.
 - Added explicit `--mcp-config <absolute-path>` support for one trusted, tools-only MCP config in top-level standalone sessions without enabling automatic user or project MCP discovery; exact reads reject links and identity changes, and MCP tool-name collisions fail closed.
 - Added additive v3 workflow-gate correlation compatibility surfaces (#2171): explicit Rust workflow-frame readers/registration preserve `workflowGateId` without changing legacy `ActionNeeded`, `ServerMessage`, or `register_ask`; N-API retains `registerAsk` and adds correlated/arbitrated registration and exact unclaimed-retirement APIs. Private presentation leases, routes, claims, receipts, epochs, and endpoint generations remain non-public.
+- Added an opt-in mood-reactive `pet` status line segment: a tiny text-mode gajae companion that wiggles its claws while the agent streams, gets tired under heavy context pressure, and turns alarmed on unacknowledged background-job failures. Faces are fixed-width across all moods and symbol presets (including a pure-ASCII set), so it never causes status-line layout jitter — a zero-dependency complement to the pixel Gajae Pet on terminals without sixel/kitty image support.
 
 ### Changed
 

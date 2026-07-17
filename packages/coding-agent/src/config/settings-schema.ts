@@ -77,6 +77,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
 export type StatusLineSegmentId =
 	| "gajae"
 	| "pi" // legacy custom alias; public presets use gajae
+	| "pet" // mood-reactive gajae pet
 	| "model"
 	| "mode"
 	| "path"
