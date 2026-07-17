@@ -40,6 +40,16 @@ function persistentOutput(nonce: string, sequences: Array<"preflight" | "postfli
 	);
 }
 
+function acceleratedA1TimeoutClock(): () => number {
+	let calls = 0;
+	return () => {
+		calls++;
+		if (calls <= 3) return 0;
+		if (calls <= 6) return 599;
+		return 824;
+	};
+}
+
 describe("computer broker Gate-0", () => {
 	it("keeps the hidden selector out of actual public help", async () => {
 		expect(commands.map(command => command.name)).not.toContain("--internal-computer-gate0");
@@ -127,6 +137,7 @@ describe("computer broker Gate-0", () => {
 	});
 
 	it("awaits A2 lifecycle cleanup after its deadline expires", async () => {
+		const clock = [0, 0, 599, 599];
 		let observeAbort = () => {};
 		const abortedSignal = new Promise<void>(resolve => {
 			observeAbort = resolve;
@@ -134,7 +145,8 @@ describe("computer broker Gate-0", () => {
 		let releaseCleanup = () => {};
 		const output = runComputerBrokerGate0(JSON.stringify({ operation: "lifecycle", phase: "A2" }), {
 			controllerFactory: () => controller(),
-			timeoutMs: 30,
+			timeoutMs: 900,
+			now: () => clock.shift() ?? 599,
 			lifecycleRunner: ({ signal }) =>
 				new Promise<Gate0LifecycleMarker[]>(resolve => {
 					signal?.addEventListener("abort", () => {
@@ -168,7 +180,8 @@ describe("computer broker Gate-0", () => {
 		});
 		const output = runComputerBrokerGate0(JSON.stringify({ operation: "lifecycle", phase: "A1" }), {
 			isCompiledBinary: () => true,
-			timeoutMs: 30,
+			timeoutMs: 900,
+			now: acceleratedA1TimeoutClock(),
 			persistentChildSpawner: ({ nonce }) => ({
 				stdin: { write: () => {}, flush: async () => {}, end: async () => {} },
 				stdout: new ReadableStream({
@@ -349,7 +362,8 @@ describe("computer broker Gate-0", () => {
 		const signals: string[] = [];
 		const output = await runComputerBrokerGate0(JSON.stringify({ operation: "lifecycle", phase: "A1" }), {
 			isCompiledBinary: () => true,
-			timeoutMs: 100,
+			timeoutMs: 900,
+			now: acceleratedA1TimeoutClock(),
 			persistentChildSpawner: ({ nonce }) => ({
 				stdin: { write: () => {}, flush: async () => {}, end: async () => {} },
 				stdout: new ReadableStream({ start: stream => stream.enqueue(persistentOutput(nonce, ["preflight"])) }),
@@ -748,7 +762,8 @@ describe("computer broker Gate-0", () => {
 		const signals: string[] = [];
 		const output = await runComputerBrokerGate0(JSON.stringify({ operation: "lifecycle", phase: "A1" }), {
 			isCompiledBinary: () => true,
-			timeoutMs: 30,
+			timeoutMs: 900,
+			now: acceleratedA1TimeoutClock(),
 			persistentChildSpawner: ({ nonce }) => ({
 				stdin: { write: () => {}, flush: async () => {}, end: async () => {} },
 				stdout: new ReadableStream({ start: stream => stream.enqueue(persistentOutput(nonce, ["preflight"])) }),
@@ -775,7 +790,8 @@ describe("computer broker Gate-0", () => {
 		const signals: string[] = [];
 		const output = await runComputerBrokerGate0(JSON.stringify({ operation: "lifecycle", phase: "A1" }), {
 			isCompiledBinary: () => true,
-			timeoutMs: 30,
+			timeoutMs: 900,
+			now: acceleratedA1TimeoutClock(),
 			persistentChildSpawner: ({ nonce }) => ({
 				stdin: { write: () => {}, flush: async () => {}, end: () => new Promise<void>(() => {}) },
 				stdout: new ReadableStream({

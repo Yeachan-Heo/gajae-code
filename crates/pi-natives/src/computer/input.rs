@@ -16,9 +16,12 @@
 
 use super::coords::{CoordError, LogicalPoint, NormalizedDisplay};
 
+#[cfg(any(target_os = "macos", test))]
 const CURSOR_TOLERANCE: f64 = 0.49;
+#[cfg(any(target_os = "macos", test))]
 const CURSOR_COMPARISON_EPSILON: f64 = 1e-9;
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CursorBounds {
 	min_x: f64,
@@ -27,6 +30,7 @@ struct CursorBounds {
 	max_y: f64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl CursorBounds {
 	fn move_target(self, original: LogicalPoint) -> Option<LogicalPoint> {
 		if !self.min_x.is_finite()
@@ -58,9 +62,12 @@ impl CursorBounds {
 	}
 }
 
+#[cfg(any(target_os = "macos", test))]
 const PROBE_DEADLINE_MS: u64 = 100;
+#[cfg(any(target_os = "macos", test))]
 const PROBE_POLL_MS: u64 = 1;
 
+#[cfg(any(target_os = "macos", test))]
 trait HarmlessMoveBackend {
 	type Error;
 
@@ -72,6 +79,7 @@ trait HarmlessMoveBackend {
 	fn sleep_millis(&mut self, millis: u64);
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CleanupConfirmation {
 	NotRequired,
@@ -80,25 +88,30 @@ enum CleanupConfirmation {
 	Unconfirmed,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, PartialEq)]
 struct HarmlessMoveVerification<E> {
 	primary: Result<bool, E>,
 	cleanup: CleanupConfirmation,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_near(actual: LogicalPoint, expected: LogicalPoint) -> bool {
 	(actual.x - expected.x).abs() <= CURSOR_TOLERANCE + CURSOR_COMPARISON_EPSILON
 		&& (actual.y - expected.y).abs() <= CURSOR_TOLERANCE + CURSOR_COMPARISON_EPSILON
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_distinct_from(actual: LogicalPoint, opposite: LogicalPoint) -> bool {
 	!is_near(actual, opposite)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn before_deadline<B: HarmlessMoveBackend>(backend: &mut B, deadline: u64) -> bool {
 	backend.monotonic_millis() < deadline
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn poll<B: HarmlessMoveBackend>(backend: &mut B, deadline: u64) -> bool {
 	let now = backend.monotonic_millis();
 	if now >= deadline {
@@ -108,6 +121,7 @@ fn poll<B: HarmlessMoveBackend>(backend: &mut B, deadline: u64) -> bool {
 	before_deadline(backend, deadline)
 }
 
+#[cfg(any(target_os = "macos", test))]
 enum Observation<E> {
 	Stable,
 	Unsafe,
@@ -118,6 +132,7 @@ enum Observation<E> {
 /// Observe `expected` twice, separated by a bounded poll. `pending` is safe to
 /// wait through (for example, the original point while a target event arrives),
 /// but it is never accepted as confirmation.
+#[cfg(any(target_os = "macos", test))]
 fn observe_stable<B: HarmlessMoveBackend>(
 	backend: &mut B,
 	expected: LogicalPoint,
@@ -153,6 +168,7 @@ fn observe_stable<B: HarmlessMoveBackend>(
 
 /// The only restoration path. It never warps unless target was observed
 /// stably, and it confirms original twice under the single probe deadline.
+#[cfg(any(target_os = "macos", test))]
 fn restore_cursor<B: HarmlessMoveBackend>(
 	backend: &mut B,
 	original: LogicalPoint,
@@ -163,9 +179,8 @@ fn restore_cursor<B: HarmlessMoveBackend>(
 		if !before_deadline(backend, deadline) {
 			return CleanupConfirmation::Unconfirmed;
 		}
-		let current = match backend.current_cursor_position() {
-			Ok(current) => current,
-			Err(_) => return CleanupConfirmation::Unconfirmed,
+		let Ok(current) = backend.current_cursor_position() else {
+			return CleanupConfirmation::Unconfirmed;
 		};
 		if !before_deadline(backend, deadline) {
 			return CleanupConfirmation::Unconfirmed;
@@ -199,6 +214,7 @@ fn restore_cursor<B: HarmlessMoveBackend>(
 	CleanupConfirmation::Unconfirmed
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn verify_harmless_move_restore<B: HarmlessMoveBackend>(
 	backend: &mut B,
 ) -> HarmlessMoveVerification<B::Error> {
@@ -692,7 +708,7 @@ mod mac {
 			Self { source, started: std::time::Instant::now() }
 		}
 
-		fn checked_mouse_event(event: CgEventRef) -> Result<CgEventRef, HarmlessMoveError> {
+		const fn checked_mouse_event(event: CgEventRef) -> Result<CgEventRef, HarmlessMoveError> {
 			if event.is_null() {
 				Err(HarmlessMoveError::MouseEventCreateFailed)
 			} else {
@@ -724,19 +740,6 @@ mod mac {
 
 		fn post_mouse(&self, at: LogicalPoint, event_type: u32, button: u32) {
 			let _ = self.post_mouse_checked(at, event_type, button);
-		}
-	}
-
-	#[cfg(test)]
-	mod tests {
-		use super::{HarmlessMoveError, MacEventSink};
-
-		#[test]
-		fn null_mouse_event_is_rejected_before_post_or_release() {
-			assert_eq!(
-				MacEventSink::checked_mouse_event(std::ptr::null_mut()),
-				Err(HarmlessMoveError::MouseEventCreateFailed)
-			);
 		}
 	}
 
@@ -906,6 +909,19 @@ mod mac {
 		verification
 			.primary
 			.map(|moved| moved && verification.cleanup == super::CleanupConfirmation::Confirmed)
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::{HarmlessMoveError, MacEventSink};
+
+		#[test]
+		fn null_mouse_event_is_rejected_before_post_or_release() {
+			assert_eq!(
+				MacEventSink::checked_mouse_event(std::ptr::null_mut()),
+				Err(HarmlessMoveError::MouseEventCreateFailed)
+			);
+		}
 	}
 }
 
@@ -1423,7 +1439,7 @@ mod live_tests {
 	use crate::computer::capture::capture_primary_display;
 
 	/// Fires a real cursor move (no clicks/keys) and reads the position back to
-	/// prove the CGEvent input pipeline works end to end. Ignored by default;
+	/// prove the `CGEvent` input pipeline works end to end. Ignored by default;
 	/// run with `--ignored` on a macOS host with Accessibility granted.
 	#[test]
 	#[ignore = "moves the real cursor; needs macOS + Accessibility granted"]
@@ -1472,7 +1488,7 @@ mod live_tests {
 	}
 
 	/// G005 acceptance drill: drives all nine primitives through the gated
-	/// execute_input path against the focused frontmost app, then waits for a
+	/// `execute_input` path against the focused frontmost app, then waits for a
 	/// human kill-switch press and proves input is blocked afterward.
 	#[test]
 	#[ignore = "live G005: drives the focused app + needs a human hotkey press"]
