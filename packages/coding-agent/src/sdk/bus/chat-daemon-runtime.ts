@@ -10,6 +10,11 @@ import { type DiscordEndpointBinding, DiscordEndpointBindingError, DiscordNotifi
 import { DiscordLiveProvider } from "./discord-live-provider";
 import type { DiscordProvider } from "./discord-provider";
 import { type NotificationEvent, NotificationPresentationEngine } from "./engine";
+import {
+	type NotificationVerbosity,
+	coerceNotificationVerbosity,
+	parseNotificationVerbosityStrict,
+} from "./notification-verbosity";
 import { type SlackEndpoint, SlackEndpointBindingError, SlackNotificationDaemon } from "./slack-daemon";
 import { SlackLiveProvider } from "./slack-live-provider";
 import { SlackProvider, type SlackProviderClient } from "./slack-provider";
@@ -20,7 +25,7 @@ export interface ChatDaemonRuntimeConfig {
 		discord?: { botToken: string; applicationId: string; guildId: string; parentChannelId: string };
 		slack?: { botToken: string; appToken: string; workspaceId: string; channelId: string; authorizedUserId?: string };
 	};
-	presentation?: { redact: boolean; verbosity: "lean" | "verbose" };
+	presentation?: { redact: boolean; verbosity: NotificationVerbosity };
 }
 
 export interface ChatDaemonSdkClient {
@@ -99,6 +104,27 @@ function generationFrom(frame: Record<string, unknown>): number | undefined {
 		? frame.generation
 		: undefined;
 }
+/**
+ * Resolve the per-session seed verbosity from the global daemon config. The
+ * runtime always passes this to {@link NotificationPresentationEngine.connectSession}
+ * so every attached session has an explicit policy; unknown config values
+ * coerce to `"lean"` (fail-open for non-quiet), matching the settings boundary.
+ */
+function seedVerbosityFrom(config: ChatDaemonRuntimeConfig): NotificationVerbosity {
+	return coerceNotificationVerbosity(config.presentation?.verbosity);
+}
+
+/** Minimal root body posted on session_ready under quiet; never the residual "GJC session ready." text. */
+const QUIET_RESUME_BODY = "GJC session ready (quiet).";
+
+/**
+ * Strictly parse a config_update frame's verbosity. Only exact lowercase
+ * `quiet`|`lean`|`verbose` is accepted; any other shape returns `undefined`
+ * so the runtime ignores the malformed update without changing policy.
+ */
+function verbosityFromConfigUpdate(frame: Record<string, unknown>): NotificationVerbosity | undefined {
+	return parseNotificationVerbosityStrict(frame.verbosity);
+}
 
 /**
  * Worker-owned session discovery and event fanout. It connects only through the
@@ -117,12 +143,15 @@ export class ChatDaemonRuntime {
 	#presentation: NotificationPresentationEngine | undefined;
 	#transportHealthy: (() => boolean) | undefined;
 	#reconcileReady = false;
+	/** Per-session seed verbosity derived from the global daemon config. */
+	readonly #seedVerbosity: NotificationVerbosity;
 
 	constructor(
 		private readonly input: { kind: ChatDaemonKind; agentDir: string; config: ChatDaemonRuntimeConfig },
 		private readonly deps: ChatDaemonRuntimeDeps = {},
 	) {
 		this.#index = deps.createIndex?.(input.agentDir) ?? new SessionIndex(input.agentDir);
+		this.#seedVerbosity = seedVerbosityFrom(input.config);
 	}
 
 	async start(): Promise<void> {
@@ -140,6 +169,7 @@ export class ChatDaemonRuntime {
 				{
 					redact: this.input.config.presentation?.redact ?? true,
 					sessionTag: sessionId => sessionId.slice(-6),
+					defaultVerbosity: this.#seedVerbosity,
 				},
 			);
 			this.#discord = new DiscordNotificationDaemon({
@@ -169,6 +199,7 @@ export class ChatDaemonRuntime {
 				{
 					redact: this.input.config.presentation?.redact ?? true,
 					sessionTag: sessionId => sessionId.slice(-6),
+					defaultVerbosity: this.#seedVerbosity,
 				},
 			);
 			this.#slack = new SlackNotificationDaemon({
@@ -238,6 +269,7 @@ export class ChatDaemonRuntime {
 		await Promise.allSettled([...this.#pending]);
 		for (const [sessionId, attached] of this.#sessions) {
 			this.#sessions.delete(sessionId);
+			this.#presentation?.dropSession(sessionId);
 			attached.dispose();
 			await attached.client.close();
 		}
@@ -268,6 +300,7 @@ export class ChatDaemonRuntime {
 		for (const [sessionId, attached] of this.#sessions) {
 			if (ids.has(sessionId)) continue;
 			this.#sessions.delete(sessionId);
+			this.#presentation?.dropSession(sessionId);
 			attached.dispose();
 			await attached.client.close();
 			await this.close(sessionId);
@@ -287,6 +320,7 @@ export class ChatDaemonRuntime {
 			return;
 		if (existing) {
 			this.#sessions.delete(indexed.sessionId);
+			this.#presentation?.dropSession(indexed.sessionId);
 			existing.dispose();
 			await existing.client.close();
 		}
@@ -306,13 +340,17 @@ export class ChatDaemonRuntime {
 			dispose,
 		});
 		this.#sessions.set(indexed.sessionId, attached);
-		this.#presentation?.connectSession(indexed.sessionId, {
-			sendReply: route => {
-				if (this.#sessions.get(indexed.sessionId) !== attached)
-					throw new Error("Session endpoint changed before reply.");
-				attached.client.send({ type: "reply", id: route.actionId, answer: route.answer });
+		this.#presentation?.connectSession(
+			indexed.sessionId,
+			{
+				sendReply: route => {
+					if (this.#sessions.get(indexed.sessionId) !== attached)
+						throw new Error("Session endpoint changed before reply.");
+					attached.client.send({ type: "reply", id: route.actionId, answer: route.answer });
+				},
 			},
-		});
+			this.#seedVerbosity,
+		);
 		const replay = await client.request({
 			type: "event_replay",
 			sinceGeneration: indexed.endpointGeneration,
@@ -375,8 +413,15 @@ export class ChatDaemonRuntime {
 		}
 		if (name === "session_ready") {
 			if (generationFrom(frame) !== attached.generation) return;
-			await this.resume(sessionId, attached.generation, "GJC session ready.");
+			const quiet = this.#isSessionQuiet(sessionId);
+			await this.resume(sessionId, attached.generation, quiet ? QUIET_RESUME_BODY : "GJC session ready.", quiet);
 			return;
+		}
+		if (name === "config_update") {
+			// Strict per-session policy update: only the addressed session's
+			// verbosity changes, parsed strictly so malformed frames are ignored.
+			const next = verbosityFromConfigUpdate(normalizedFrame);
+			if (next) this.#presentation?.setSessionVerbosity(sessionId, next);
 		}
 		const notification = this.#notificationEvent(sessionId, normalizedFrame);
 		if (notification?.type === "action_resolved") {
@@ -419,10 +464,12 @@ export class ChatDaemonRuntime {
 		await this.#slack?.close(sessionId);
 	}
 
-	private async resume(sessionId: string, generation: number, content: string): Promise<void> {
+	private async resume(sessionId: string, generation: number, content: string, quiet = false): Promise<void> {
 		if (this.#discord) {
 			await this.#discord.resume(sessionId, generation);
-			await this.#discord.notify({ sessionId, endpointGeneration: generation, content });
+			// Under quiet the session_ready residual body is silent: the thread
+			// mapping still runs, but the "GJC session ready." content is not posted.
+			if (!quiet) await this.#discord.notify({ sessionId, endpointGeneration: generation, content });
 		}
 		if (this.#slack) await this.#slack.resume(sessionId, content, generation);
 	}
@@ -504,6 +551,10 @@ export class ChatDaemonRuntime {
 		const content = JSON.stringify(projectChatCommandOutcome(request, outcome));
 		if (transport === "discord") await this.#discord?.postCommandResult(sessionId, content);
 		else await this.#slack?.postCommandResult(sessionId, content);
+	}
+	/** Whether a session is currently under quiet verbosity (fail-closed: unknown → false, since quiet is opt-in). */
+	#isSessionQuiet(sessionId: string): boolean {
+		return this.#presentation?.getSessionPolicy(sessionId)?.verbosity === "quiet";
 	}
 	#notificationEvent(sessionId: string, frame: Record<string, unknown>): NotificationEvent {
 		if (frame.type === "action_needed" && typeof frame.id === "string" && typeof frame.kind === "string") {

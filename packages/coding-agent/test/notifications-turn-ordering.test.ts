@@ -33,10 +33,12 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = {
 	type: string;
 	text?: string;
-	verbosity?: "lean" | "verbose";
+	verbosity?: "quiet" | "lean" | "verbose";
 	tokenUsage?: string;
 	model?: string;
 	cwd?: string;
+	kind?: string;
+	id?: string;
 };
 
 type TestContextUsage = {
@@ -55,7 +57,9 @@ afterEach(async () => {
 });
 
 /** Boot the notifications extension against a real NotificationServer + WS client. */
-async function setup(options: { contextUsage?: TestContextUsage | false; model?: TestModel | false } = {}): Promise<{
+async function setup(
+	options: { contextUsage?: TestContextUsage | false; model?: TestModel | false; startVerbosity?: "quiet" | "lean" | "verbose" } = {},
+): Promise<{
 	handlers: Map<string, Handler>;
 	ctx: unknown;
 	frames: Frame[];
@@ -76,7 +80,12 @@ async function setup(options: { contextUsage?: TestContextUsage | false; model?:
 	const agentDir = path.join(cwd, ".gjc", "agent");
 	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 	cleanupRoots.push(cleanup);
-	createNotificationsExtension(api, { settings: isolatedNotificationSettings(agentDir) });
+	createNotificationsExtension(api, {
+		settings: isolatedNotificationSettings(
+			agentDir,
+			options.startVerbosity ? { "notifications.verbosity": options.startVerbosity } : {},
+		),
+	});
 	const sid = `order-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -450,5 +459,250 @@ test("stream-enabled final always carries a messageRef and a late message_update
 		else process.env.GJC_NOTIFICATIONS = prevN;
 		if (prevS === undefined) delete process.env.GJC_NOTIFICATIONS_STREAM;
 		else process.env.GJC_NOTIFICATIONS_STREAM = prevS;
+	}
+}, 30000);
+
+// --- Quiet emit-side suppression -------------------------------------------
+// Quiet is a global action-only allowlist on the emit side: under quiet the SDK
+// must NOT emit automatic content mirrors (turn_stream live + finalized + pre-ask
+// flush, auto image_attachment, context_update, tool_activity, reasoning_summary).
+// Only action-needed / control / explicit-attachment content is mirrored. The
+// daemon-side allowlist is unit-tested in notification-verbosity; these tests
+// assert the SDK emit boundary suppresses automatic frames while retaining
+// lifecycle/identity/config frames and re-enables on quiet -> lean/verbose.
+
+test("quiet suppresses finalized turn_stream (turn_end) and live turn_stream previews", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	const prevStream = process.env.GJC_NOTIFICATIONS_STREAM;
+	process.env.GJC_NOTIFICATIONS = "1";
+	process.env.GJC_NOTIFICATIONS_STREAM = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		// Switch the session to quiet via the inbound config_command seam.
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "quiet" }));
+		await waitFor(() => frames.some(f => f.type === "config_update" && f.verbosity === "quiet"), 3000, "quiet config_update");
+
+		// A live preview and a finalized turn under quiet must NOT emit any turn_stream.
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_update")!(
+			{ type: "message_update", message: { role: "assistant", content: "streaming under quiet" } },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "final under quiet" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "final under quiet" } },
+			ctx,
+		);
+		await sleep(250);
+		expect(turnStreams().length).toBe(0);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+		if (prevStream === undefined) delete process.env.GJC_NOTIFICATIONS_STREAM;
+		else process.env.GJC_NOTIFICATIONS_STREAM = prevStream;
+	}
+}, 30000);
+
+test("quiet suppresses tool_activity (start + end) and context_update, but keeps activity + identity_header", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
+		const toolActivity = () => frames.filter(f => f.type === "tool_activity");
+		const contextUpdates = () => frames.filter(f => f.type === "context_update");
+		const activity = () => frames.filter(f => f.type === "activity");
+		const identityHeaders = () => frames.filter(f => f.type === "identity_header");
+
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "quiet" }));
+		await waitFor(() => frames.some(f => f.type === "config_update" && f.verbosity === "quiet"), 3000, "quiet config_update");
+
+		// A tool run under quiet emits no tool_activity.
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "bash", toolCallId: "tc1", args: {} },
+			ctx,
+		);
+		await handlers.get("tool_execution_end")!(
+			{ type: "tool_execution_end", toolName: "bash", toolCallId: "tc1", isError: false, result: {} },
+			ctx,
+		);
+		await sleep(150);
+		expect(toolActivity().length).toBe(0);
+
+		// agent_end under quiet: no context_update (even though verbose-only), but
+		// the lifecycle activity (idle) and identity_header frames are retained.
+		const beforeIdle = activity().length;
+		const beforeIdentity = identityHeaders().length;
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await waitFor(() => activity().length > beforeIdle, 3000, "activity (idle) under quiet");
+		await waitFor(() => identityHeaders().length > beforeIdentity, 3000, "identity_header under quiet");
+		await sleep(200);
+		expect(contextUpdates().length).toBe(0);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("quiet suppresses the pre-ask lead-in flush (no turn_stream before an ask)", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "quiet" }));
+		await waitFor(() => frames.some(f => f.type === "config_update" && f.verbosity === "quiet"), 3000, "quiet config_update");
+
+		// Assistant lead-in completes, then the ask tool starts. Under lean this
+		// flushes the lead-in as a finalized turn_stream before the ask; under quiet
+		// the flush is suppressed.
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "Pick a branch:" } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "t1", args: {} },
+			ctx,
+		);
+		await sleep(250);
+		expect(turnStreams().length).toBe(0);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("quiet -> lean switch re-enables turn_stream emission", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const configUpdates = () => frames.filter(f => f.type === "config_update");
+
+		// Enter quiet, confirm suppression.
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "quiet" }));
+		await waitFor(() => configUpdates().some(f => f.verbosity === "quiet"), 3000, "quiet config_update");
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "silenced under quiet" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "silenced under quiet" } },
+			ctx,
+		);
+		await sleep(200);
+		expect(turnStreams().length).toBe(0);
+
+		// Switch back to lean: the next turn streams again.
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "lean" }));
+		await waitFor(() => configUpdates().some(f => f.verbosity === "lean"), 3000, "lean config_update");
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "visible under lean" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: "visible under lean" } },
+			ctx,
+		);
+		await waitFor(() => turnStreams().some(f => f.text === "visible under lean"), 3000, "lean turn_stream");
+		expect(turnStreams().length).toBe(1);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("quiet -> verbose switch re-enables context_update on idle", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
+		const contextUpdates = () => frames.filter(f => f.type === "context_update");
+		const configUpdates = () => frames.filter(f => f.type === "config_update");
+
+		// Start quiet, confirm no context_update on idle.
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "quiet" }));
+		await waitFor(() => configUpdates().some(f => f.verbosity === "quiet"), 3000, "quiet config_update");
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await sleep(250);
+		expect(contextUpdates().length).toBe(0);
+
+		// Switch to verbose: the next idle emits a context_update.
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "verbose" }));
+		await waitFor(() => configUpdates().some(f => f.verbosity === "verbose"), 3000, "verbose config_update");
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await waitFor(
+			() => contextUpdates().some(f => f.tokenUsage === "12/100" && f.model === "test-model"),
+			3000,
+			"verbose context_update after quiet",
+		);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("startup quiet (seed verbosity from settings) suppresses the first turn_stream", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup({ startVerbosity: "quiet" });
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		// Booted directly into quiet: the very first turn emits no turn_stream.
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "first turn under startup quiet" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "first turn under startup quiet" } },
+			ctx,
+		);
+		await sleep(250);
+		expect(turnStreams().length).toBe(0);
+
+		// Sanity: the session still emits lifecycle activity (not suppressed).
+		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
+		await waitFor(() => frames.some(f => f.type === "activity"), 3000, "activity under startup quiet");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("an invalid verbosity value is ignored (no config_update, runtime unchanged)", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
+		const configUpdates = () => frames.filter(f => f.type === "config_update");
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		// Send a bogus verbosity: it must be ignored (strict parse), so no
+		// config_update is emitted and the runtime stays at the lean default.
+		const before = configUpdates().length;
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "loud" }));
+		await sleep(250);
+		expect(configUpdates().length).toBe(before);
+
+		// The runtime is still lean: a turn streams normally.
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "still lean" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "still lean" } },
+			ctx,
+		);
+		await waitFor(() => turnStreams().some(f => f.text === "still lean"), 3000, "lean turn_stream after invalid");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
 	}
 }, 30000);

@@ -1,6 +1,10 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as z from "zod/v4";
+import {
+	coerceNotificationVerbosity,
+	type NotificationVerbosity,
+} from "./notification-verbosity";
 import { ConfigFile, type LoadResult } from "../../config/config-file";
 
 /**
@@ -79,7 +83,7 @@ export interface NotificationSettingsSnapshot {
 		authorizedUserId?: string;
 	};
 	redact: boolean;
-	verbosity: "lean" | "verbose";
+	verbosity: NotificationVerbosity;
 	sessionScope: "all" | "primary";
 	idleTimeoutMs: number;
 }
@@ -113,7 +117,7 @@ export interface NotificationConfig {
 		authorizedUserId?: string;
 	};
 	redact: boolean;
-	verbosity: "lean" | "verbose";
+	verbosity: NotificationVerbosity;
 	/**
 	 * Which sessions may register a notification endpoint. `all` (default)
 	 * preserves historical behavior; `primary` suppresses GJC-spawned children
@@ -184,7 +188,7 @@ const notificationConfigSchema = z
 					.passthrough()
 					.optional(),
 				redact: z.boolean().optional(),
-				verbosity: z.enum(["lean", "verbose"]).optional(),
+				verbosity: z.enum(["quiet", "lean", "verbose"]).catch("lean").optional(),
 			})
 			.passthrough()
 			.optional(),
@@ -207,7 +211,7 @@ export function notificationConfigFromFile(
 		discord: notifications?.discord ?? {},
 		slack: notifications?.slack ?? {},
 		redact: notifications?.redact ?? false,
-		verbosity: notifications?.verbosity ?? "lean",
+		verbosity: coerceNotificationVerbosity(notifications?.verbosity),
 	};
 }
 

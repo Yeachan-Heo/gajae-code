@@ -14,6 +14,13 @@ import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import { sanitizeDiagnostic } from "./notification-service";
 import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
 import { withTelegramSetupLease } from "./telegram-setup";
+import {
+	type NotificationVerbosity,
+	parseNotificationVerbosityStrict,
+	type VisibleDeliveryClass,
+	classifyVisibleDelivery,
+	mayCreateVisiblePayload,
+} from "./notification-verbosity";
 
 export { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
 
@@ -1211,6 +1218,8 @@ interface RenderedModelChoice {
 interface PendingThreadedFrame {
 	send: ThreadedSend;
 	msg: Record<string, unknown>;
+	/** Quiet-mode delivery class captured when the frame was first held. */
+	deliveryClass: VisibleDeliveryClass;
 }
 
 type SelectedAckOutcome =
@@ -1234,6 +1243,18 @@ interface TelegramQueuePayload {
 	send: ThreadedSend;
 	topicId?: string;
 	selectedAck?: SelectedAckQueueItem;
+	/**
+	 * Quiet-mode delivery classification for this payload, computed at submit
+	 * time from the originating frame so the drain can re-gate it fail-closed
+	 * immediately before every visible Bot API call.
+	 */
+	deliveryClass: VisibleDeliveryClass;
+	/**
+	 * Per-session quiet policy generation captured at submit time. The drain
+	 * rechecks the live generation before each visible call; a generation bump
+	 * (quiet entry / purge) invalidates already-drained batches.
+	 */
+	policyGeneration: number;
 }
 
 export class TelegramNotificationDaemon {
@@ -1277,6 +1298,22 @@ export class TelegramNotificationDaemon {
 	private readonly flatIdentitySent = new Set<string>();
 	/** Cached result of whether the paired chat is a private chat (flat-fallback gate). */
 	private pairedChatPrivate: boolean | undefined;
+	/**
+	 * Initial per-session verbosity inherited from the global notification config at
+	 * daemon startup. Each session's quiet policy starts here and is updated by
+	 * `config_update` frames (and the wire/`/quiet` command path they reflect).
+	 */
+	private initialVerbosity: NotificationVerbosity = "lean";
+	/**
+	 * Per-session quiet delivery policy: the current verbosity plus a monotonic
+	 * generation that is bumped every time a session enters quiet (or its quiet
+	 * policy is otherwise reset). Queue payloads capture the generation at submit
+	 * time; the drain rechecks the live generation immediately before every visible
+	 * Bot API call so a quiet entry mid-drain invalidates already-granted batches.
+	 */
+	private readonly quietPolicy = new Map<string, { verbosity: NotificationVerbosity; generation: number }>();
+	/** Monotonic counter backing {@link quietPolicy} generation bumps. */
+	private quietGenerationCounter = 0;
 	/** Bot username from getMe, cached once at owner startup for group/forum command targeting. */
 	private botUsername: string | undefined;
 	/** Sessions whose agent loop is currently busy (drives the typing indicator). */
@@ -1684,7 +1721,8 @@ export class TelegramNotificationDaemon {
 			clearIntervalImpl: opts.clearIntervalImpl,
 		});
 		this.sessionRouter = this.createSessionRouter();
-		this.pool = new RateLimitPool<{ send: ThreadedSend; topicId?: string }>({ now: opts.now });
+		this.pool = new RateLimitPool<TelegramQueuePayload>({ now: opts.now });
+		this.initialVerbosity = getNotificationConfig(opts.settings).verbosity;
 		this.poller = new TelegramUpdatePoller({
 			botApi: this.botApi,
 			runtime: this.runtime,
@@ -1778,6 +1816,10 @@ export class TelegramNotificationDaemon {
 							send: { method: "sendMessage", lane: "ask", text: "Selected!" },
 							topicId,
 							selectedAck: item,
+							// The "Selected!" confirmation is part of the ask flow, so it rides the
+							// ask allowlist class and survives quiet.
+							deliveryClass: "action_ask",
+							policyGeneration: this.quietPolicyFor(session.sessionId).generation,
 						},
 					});
 					await this.flushPool();
@@ -2305,12 +2347,133 @@ export class TelegramNotificationDaemon {
 		return !ownerId || ownerId === session.sessionId;
 	}
 
-	private async submitThreadedFrame(sessionId: string, send: ThreadedSend, topicId: string): Promise<void> {
+	/**
+	 * Resolve (lazily seeding from the daemon-wide initial verbosity) the per-session
+	 * quiet delivery policy. Runtime policy state is per-session so one session
+	 * entering quiet never suppresses another session's automatic content.
+	 */
+	private quietPolicyFor(sessionId: string): { verbosity: NotificationVerbosity; generation: number } {
+		let policy = this.quietPolicy.get(sessionId);
+		if (!policy) {
+			policy = { verbosity: this.initialVerbosity, generation: 0 };
+			this.quietPolicy.set(sessionId, policy);
+		}
+		return policy;
+	}
+
+	/**
+	 * Classify an originating frame into a {@link VisibleDeliveryClass} for quiet
+	 * gating. The frame `type` and `action_needed` `kind` drive the allowlisted
+	 * classes; `control_command_result` is a user-initiated control result, and an
+	 * authorized explicit attachment (`image_attachment` / `file_attachment` when
+	 * the daemon is not redacting) maps to `explicit_attachment`. Every other frame
+	 * (identity headers, context/turn/tool/reasoning streams, config updates) is
+	 * automatic content and resolves to `silent`, which is fail-closed under quiet.
+	 */
+	private classifyFrame(msg: Record<string, unknown>): VisibleDeliveryClass {
+		const frameType = typeof msg.type === "string" ? (msg.type as string) : undefined;
+		if (frameType === "control_command_result") return "user_control_result";
+		if (frameType === "image_attachment" || frameType === "file_attachment") {
+			// Authorized explicit attachments are allowed under quiet only when the daemon
+			// is not redacting remote content. The redact flag is read from the live
+			// notification config so a later `/redact off` is honored for subsequent frames.
+			const redact = getNotificationConfig(this.opts.settings).redact;
+			return redact ? "silent" : "explicit_attachment";
+		}
+		if (frameType === "action_needed") {
+			const actionKind = typeof msg.kind === "string" ? (msg.kind as string) : undefined;
+			return classifyVisibleDelivery({ frameType, actionKind });
+		}
+		return classifyVisibleDelivery({ frameType });
+	}
+
+	/**
+	 * Apply a `config_update` verbosity change to a session's quiet policy. Entering
+	 * quiet bumps the policy generation, purges pending/queued automatic sends for
+	 * the session, and resets the session's live-message edit tracking so a stale
+	 * live preview can never be edited after quiet is in effect. The config update's
+	 * own visible body is classified `silent`, so under quiet the state changes with
+	 * no confirmation body. Leaving quiet (quiet -> lean/verbose) only updates the
+	 * verbosity without a generation bump or purge.
+	 */
+	private applyVerbosityUpdate(sessionId: string, next: NotificationVerbosity): void {
+		const policy = this.quietPolicyFor(sessionId);
+		const wasQuiet = policy.verbosity === "quiet";
+		policy.verbosity = next;
+		if (next === "quiet" && !wasQuiet) {
+			this.quietGenerationCounter += 1;
+			policy.generation = this.quietGenerationCounter;
+			this.purgeAutomaticQueuedSends(sessionId);
+			this.resetAutomaticLiveState(sessionId);
+		}
+	}
+
+	/**
+	 * Purge every still-queued automatic send for `sessionId`: a send whose delivery
+	 * class is not on the quiet visible allowlist is removed from the rate-limit pool
+	 * without consuming a token, and any selected-ack items it carried are failed
+	 * closed. Already-drained (granted) batches are guarded separately by the
+	 * generation recheck immediately before each visible Bot API call.
+	 */
+	private purgeAutomaticQueuedSends(sessionId: string): void {
+		const policy = this.quietPolicyFor(sessionId);
+		const removed = this.pool.removeWhere(item => {
+			if (item.sessionId !== sessionId) return false;
+			return !mayCreateVisiblePayload(policy.verbosity, item.payload.deliveryClass);
+		});
+		for (const item of removed) {
+			if (item.payload.selectedAck)
+				this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
+		}
+	}
+
+	/**
+	 * Reset live-message edit tracking for a session's automatic streams so a later
+	 * (non-quiet) frame cannot edit a stale live preview that quiet suppressed.
+	 * Allowlisted ask/idle/control messages own no coalesced live entry, so this
+	 * only clears the automatic `${sessionId}:` keys (turn/context/tool/reasoning).
+	 */
+	private resetAutomaticLiveState(sessionId: string): void {
+		const prefix = `${sessionId}:`;
+		for (const key of [...this.liveMessages.keys()]) {
+			if (key.startsWith(prefix)) this.liveMessages.delete(key);
+		}
+	}
+
+	/**
+	 * Fail-closed visible-send gate checked immediately before every visible Bot API
+	 * call. It re-reads the live per-session policy and rejects the send when either
+	 * (a) the payload's delivery class is not on the quiet visible allowlist under the
+	 * current verbosity, or (b) the payload is an automatic (`silent`) item whose
+	 * captured generation has advanced past the live generation (a quiet entry / purge
+	 * invalidated this already-granted batch). Allowlisted classes (ask/idle/control/
+	 * attachment) survive a quiet entry regardless of generation, so they are retained
+	 * under quiet; only stale automatic sends are dropped.
+	 */
+	private maySendVisible(sessionId: string, payload: TelegramQueuePayload): boolean {
+		const policy = this.quietPolicyFor(sessionId);
+		if (!mayCreateVisiblePayload(policy.verbosity, payload.deliveryClass)) return false;
+		// Allowlisted classes (ask/idle/control/attachment) survive a quiet entry regardless
+		// of generation: they are retained under quiet, so a generation bump never cancels
+		// them. Only automatic (`silent`) items are invalidated when the generation advanced
+		// past the one captured at submit time — that is the paused-drain race guard that
+		// drops an already-granted stale automatic send before any visible Bot API call.
+		if (payload.deliveryClass === "silent" && payload.policyGeneration !== policy.generation) return false;
+		return true;
+	}
+
+	private async submitThreadedFrame(
+		sessionId: string,
+		send: ThreadedSend,
+		topicId: string,
+		deliveryClass: VisibleDeliveryClass,
+	): Promise<void> {
+		const policy = this.quietPolicyFor(sessionId);
 		this.pool.submit({
 			sessionId,
 			lane: send.lane,
 			coalesceKey: send.coalesceKey,
-			payload: { send, topicId },
+			payload: { send, topicId, deliveryClass, policyGeneration: policy.generation },
 		});
 		await this.flushPool();
 	}
@@ -2351,9 +2514,14 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
-	private rememberPendingThreadedFrame(sessionId: string, send: ThreadedSend, msg: Record<string, unknown>): void {
+	private rememberPendingThreadedFrame(
+		sessionId: string,
+		send: ThreadedSend,
+		msg: Record<string, unknown>,
+		deliveryClass: VisibleDeliveryClass,
+	): void {
 		const frames = this.pendingThreadedFrames.get(sessionId) ?? [];
-		frames.push({ send, msg });
+		frames.push({ send, msg, deliveryClass });
 		if (frames.length > PENDING_TOPIC_FRAME_LIMIT) frames.shift();
 		this.pendingThreadedFrames.set(sessionId, frames);
 	}
@@ -2362,7 +2530,7 @@ export class TelegramNotificationDaemon {
 		const frames = this.pendingThreadedFrames.get(sessionId);
 		if (!frames || frames.length === 0) return;
 		this.pendingThreadedFrames.delete(sessionId);
-		for (const frame of frames) await this.submitThreadedFrame(sessionId, frame.send, topicId);
+		for (const frame of frames) await this.submitThreadedFrame(sessionId, frame.send, topicId, frame.deliveryClass);
 	}
 
 	/**
@@ -2609,6 +2777,16 @@ export class TelegramNotificationDaemon {
 			);
 		}
 		for (const item of batch) {
+			// Quiet visible-send gate: recheck the live per-session policy generation and
+			// allowlist IMMEDIATELY before processing this (already-drained) item. A quiet
+			// entry mid-drain bumps the generation and purges queued sends, but an item
+			// already granted in this batch is invalidated here — so no stale automatic send
+			// can leak after quiet. Allowlisted ask/idle/control/attachment classes pass.
+			if (!this.maySendVisible(item.sessionId, item.payload)) {
+				if (item.payload.selectedAck)
+					this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
+				continue;
+			}
 			const selectedAck = item.payload.selectedAck;
 			if (selectedAck) {
 				const { topicId } = item.payload;
@@ -2661,6 +2839,11 @@ export class TelegramNotificationDaemon {
 			const ckey = send.editable ? item.coalesceKey : undefined;
 			const editKey = ckey !== undefined ? `${item.sessionId}:${ckey}` : undefined;
 			if (item.lane === "live" && editKey && finalizedKeys.has(editKey)) continue;
+			// Paused-drain race guard: recheck the live policy generation IMMEDIATELY before
+			// the visible send, after the topic/paired-chat awaits above. A quiet entry that
+			// landed during those awaits bumps the generation past the one captured at submit
+			// time, so this already-granted item is dropped before any visible Bot API call.
+			if (!this.maySendVisible(item.sessionId, item.payload)) continue;
 			try {
 				// Draft streaming (opt-in, off by default): stream a live turn frame as a
 				// best-effort rich-draft preview, debounced to >=1.5s per session through
@@ -2749,6 +2932,10 @@ export class TelegramNotificationDaemon {
 											richClass: undefined,
 										},
 										topicId,
+										// A continuation chunk inherits the parent item's quiet delivery class and
+										// generation so it is gated identically to the first chunk under quiet.
+										deliveryClass: item.payload.deliveryClass,
+										policyGeneration: item.payload.policyGeneration,
 									},
 								});
 							}
@@ -2839,6 +3026,10 @@ export class TelegramNotificationDaemon {
 											richClass: undefined,
 										},
 										topicId,
+										// A continuation chunk inherits the parent item's quiet delivery class and
+										// generation so it is gated identically to the first chunk under quiet.
+										deliveryClass: item.payload.deliveryClass,
+										policyGeneration: item.payload.policyGeneration,
 									},
 								});
 							}
@@ -2891,11 +3082,21 @@ export class TelegramNotificationDaemon {
 	 * content never lands in a shared chat. Identity headers are sent at most once per
 	 * session in flat mode.
 	 */
-	private async deliverFlatFallback(sessionId: string, send: ThreadedSend): Promise<void> {
+	private async deliverFlatFallback(
+		sessionId: string,
+		send: ThreadedSend,
+		deliveryClass: VisibleDeliveryClass,
+	): Promise<void> {
 		if (!(await this.pairedChatIsPrivate())) return;
 		await this.notifyThreadedFallback();
 		if (send.identity && this.flatIdentitySent.has(sessionId)) return;
-		this.pool.submit({ sessionId, lane: send.lane, coalesceKey: send.coalesceKey, payload: { send } });
+		const policy = this.quietPolicyFor(sessionId);
+		this.pool.submit({
+			sessionId,
+			lane: send.lane,
+			coalesceKey: send.coalesceKey,
+			payload: { send, deliveryClass, policyGeneration: policy.generation },
+		});
 		await this.flushPool();
 		if (send.identity) this.flatIdentitySent.add(sessionId);
 	}
@@ -3043,6 +3244,11 @@ export class TelegramNotificationDaemon {
 			choices.push({ selector, label: safeLabel });
 		}
 		if (choices.length === 0) return false;
+		// Quiet gate: a /model control-command result is user-initiated, so it rides the
+		// user_control_result allowlist and is retained under quiet. Gate fail-closed for
+		// any future non-allowlisted control shape before the visible sendMessage.
+		if (!mayCreateVisiblePayload(this.quietPolicyFor(session.sessionId).verbosity, this.classifyFrame(msg)))
+			return false;
 
 		const rendered = renderThreadedFrame({ ...msg, type: "control_command_result" });
 		if (!rendered?.text) return false;
@@ -3148,9 +3354,19 @@ export class TelegramNotificationDaemon {
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
 			const send = renderThreadedFrame(msg);
 			if (!send) return;
+			const deliveryClass = this.classifyFrame(msg as Record<string, unknown>);
+			// A config_update frame carries a new verbosity (and optionally redact). Apply it
+			// to this session's quiet policy BEFORE the frame's own visible body is queued, so
+			// entering quiet bumps the generation and purges stale automatic sends (including
+			// this frame's `⚙ verbosity quiet` body, which classifies as silent and is
+			// suppressed under quiet). The state therefore changes with no confirmation body.
+			if (msg.type === "config_update" && typeof msg.verbosity === "string") {
+				const parsed = parseNotificationVerbosityStrict(msg.verbosity);
+				if (parsed) this.applyVerbosityUpdate(session.sessionId, parsed);
+			}
 			const existingTopic = await this.existingTopicForPrivateChat(session.sessionId);
 			if (!send.identity && !existingTopic && !this.flatIdentitySent.has(session.sessionId)) {
-				this.rememberPendingThreadedFrame(session.sessionId, send, msg as Record<string, unknown>);
+				this.rememberPendingThreadedFrame(session.sessionId, send, msg as Record<string, unknown>, deliveryClass);
 				return;
 			}
 			if (send.identity && !this.sessionCanClaimIdentity(session, msg)) {
@@ -3164,7 +3380,7 @@ export class TelegramNotificationDaemon {
 			const topicId =
 				existingTopic ?? (await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, msg)));
 			if (!topicId) {
-				await this.deliverFlatFallback(session.sessionId, send);
+				await this.deliverFlatFallback(session.sessionId, send, deliveryClass);
 				return;
 			}
 			if (send.identity) {
@@ -3202,16 +3418,18 @@ export class TelegramNotificationDaemon {
 						}
 					}
 				}
-				// Send the full bulleted identity header EXACTLY ONCE per topic.
+				// Send the full bulleted identity header EXACTLY ONCE per topic. Under quiet the
+				// identity body is suppressed (it classifies as silent), but the `editForumTopic`
+				// rename above still runs — a silent topic operation that is always retained.
 				if (this.topics.needsIdentity(session.sessionId)) {
-					await this.submitThreadedFrame(session.sessionId, send, topicId);
+					await this.submitThreadedFrame(session.sessionId, send, topicId, deliveryClass);
 					this.topics.markIdentitySent(session.sessionId);
 				}
 				await this.flushPendingThreadedFrames(session.sessionId, topicId);
 				await this.persistTopics();
 				return;
 			}
-			await this.submitThreadedFrame(session.sessionId, send, topicId);
+			await this.submitThreadedFrame(session.sessionId, send, topicId, deliveryClass);
 			return;
 		}
 		if (msg.type === "action_needed" && msg.id) {
@@ -3288,6 +3506,10 @@ export class TelegramNotificationDaemon {
 				return result.result?.message_id;
 			};
 			const kind = msg.kind === "idle" ? "idle" : "ask";
+			// Quiet gate for the direct (non-queued) action send. ask/idle are on the
+			// quiet visible allowlist, so they are retained under quiet; any future
+			// non-allowlisted action kind is fail-closed here before any visible call.
+			if (!mayCreateVisiblePayload(this.quietPolicyFor(session.sessionId).verbosity, this.classifyFrame(msg as Record<string, unknown>))) return;
 			if (this.opts.rich?.enabled !== false) {
 				// Rich (default on): promote to sendRichMessage with a top-level
 				// reply_markup (probe-confirmed). Any miss falls back to the HTML loop.
@@ -3689,7 +3911,24 @@ export class TelegramNotificationDaemon {
 						);
 						return;
 					}
-					const cfg = hasMedia ? undefined : parseInThreadConfigCommand(inbound.text);
+					const cfgResult = hasMedia
+						? ({ kind: "none" } as const)
+						: parseInThreadConfigCommand(inbound.text);
+					if (cfgResult.kind === "invalid") {
+						await this.rememberSeenUpdateId(inbound.updateId);
+						try {
+							await this.botApi.call("sendMessage", {
+								chat_id: this.opts.chatId,
+								message_thread_id: Number(inbound.threadId),
+								text: cfgResult.usage,
+								parse_mode: TELEGRAM_PARSE_MODE,
+							});
+						} catch {
+							// Best-effort config feedback; never convert to user input.
+						}
+						return;
+					}
+					const cfg = cfgResult.kind === "change" ? cfgResult.change : undefined;
 					// A plain (non-config) message while an ask is pending for this session
 					// answers that ask as free-input — instead of starting a new user turn.
 					// Telegram asks always accept custom text (the SDK maps a string answer

@@ -1,3 +1,5 @@
+import { type NotificationVerbosity, parseNotificationVerbosityStrict } from "./notification-verbosity";
+
 /**
  * In-thread configuration slash commands for the threaded session surface.
  *
@@ -5,20 +7,39 @@
  * removed), but the user can still adjust per-surface behaviour from inside a
  * session thread with small slash commands:
  *
+ * - `/quiet`              switch to action-only remote pings (asks/idles + user-initiated results)
  * - `/verbose`            switch the mirror to bounded tool-owned summaries + provider-displayable reasoning summaries
  * - `/lean`               switch back to lean (assistant text + tool names)
- * - `/verbosity lean|verbose`
+ * - `/verbosity quiet|lean|verbose`
  * - `/redact on|off`      toggle redaction of streamed content
  *
  * This parser is pure so the command grammar is unit-testable; the daemon maps
- * the returned change onto a `config_command` frame / settings update.
+ * a `change` result onto a `config_command` frame / settings update. Recognised
+ * roots with invalid arguments resolve to `invalid` so the daemon replies with
+ * a usage error and **never** falls through to free-text injection; only
+ * unrecognised commands and plain text resolve to `none`.
  */
 
 /** A parsed in-thread configuration change. */
 export interface ConfigCommandChange {
-	verbosity?: "lean" | "verbose";
+	verbosity?: NotificationVerbosity;
 	redact?: boolean;
 }
+
+/**
+ * Discriminated parse result for in-thread config commands.
+ *
+ * - `none`    — not a recognised config command (plain text or an unknown
+ *   slash command); the daemon falls through to free-text / pending-ask handling.
+ * - `invalid` — a *recognised* root with missing/invalid arguments; the daemon
+ *   replies with `usage` and **never** treats it as free text.
+ * - `change`  — a valid config command; the daemon forwards `change` as a
+ *   `config_command` frame.
+ */
+export type InThreadConfigCommandResult =
+	| { kind: "none" }
+	| { kind: "invalid"; usage: string }
+	| { kind: "change"; change: ConfigCommandChange };
 
 export type TelegramControlCommandName = "reasoning" | "usage" | "context" | "compact" | "model";
 
@@ -120,32 +141,53 @@ export function parseTelegramControlCommand(text: string, botUsername?: string):
 }
 
 /**
- * Parse an in-thread config command. Returns the requested change, or
- * `undefined` when the text is not a recognised config command (so the daemon
- * can fall through to treating it as a free-text injection).
+ * Parse an in-thread config command into a discriminated result.
+ *
+ * - `none`    — plain text or an unrecognised slash command; the daemon falls
+ *   through to free-text / pending-ask handling.
+ * - `invalid` — a recognised root with missing/invalid arguments; the daemon
+ *   replies with `usage` and never treats the input as free text.
+ * - `change`  — a valid config command to forward as a `config_command` frame.
+ *
+ * Verbosity arguments are parsed strictly ({@link parseNotificationVerbosityStrict}):
+ * only exact `quiet` / `lean` / `verbose` is accepted, so a recognised
+ * `/verbosity` root with a bad argument resolves to `invalid` rather than
+ * coercing to `lean` or becoming free text.
  */
-export function parseInThreadConfigCommand(text: string): ConfigCommandChange | undefined {
+export function parseInThreadConfigCommand(text: string): InThreadConfigCommandResult {
 	const trimmed = text.trim();
-	if (!trimmed.startsWith("/")) return undefined;
+	if (!trimmed.startsWith("/")) return { kind: "none" };
 	const [rawCommand, ...rest] = trimmed.slice(1).split(/\s+/);
 	const command = rawCommand?.toLowerCase();
 	const arg = rest[0]?.toLowerCase();
 
 	switch (command) {
+		case "quiet":
+			return rest.length === 0
+				? { kind: "change", change: { verbosity: "quiet" } }
+				: { kind: "invalid", usage: "Usage: /quiet" };
 		case "verbose":
-			return rest.length === 0 ? { verbosity: "verbose" } : undefined;
+			return rest.length === 0
+				? { kind: "change", change: { verbosity: "verbose" } }
+				: { kind: "invalid", usage: "Usage: /verbose" };
 		case "lean":
-			return rest.length === 0 ? { verbosity: "lean" } : undefined;
-		case "verbosity":
-			if (rest.length === 1 && (arg === "lean" || arg === "verbose")) return { verbosity: arg };
-			return undefined;
+			return rest.length === 0
+				? { kind: "change", change: { verbosity: "lean" } }
+				: { kind: "invalid", usage: "Usage: /lean" };
+		case "verbosity": {
+			if (rest.length === 1) {
+				const verbosity = parseNotificationVerbosityStrict(arg);
+				if (verbosity) return { kind: "change", change: { verbosity } };
+			}
+			return { kind: "invalid", usage: "Usage: /verbosity quiet|lean|verbose" };
+		}
 		case "redact":
-			if (rest.length !== 1) return undefined;
-			if (arg === "on" || arg === "true" || arg === "1") return { redact: true };
-			if (arg === "off" || arg === "false" || arg === "0") return { redact: false };
-			return undefined;
+			if (rest.length !== 1) return { kind: "invalid", usage: "Usage: /redact on|off" };
+			if (arg === "on" || arg === "true" || arg === "1") return { kind: "change", change: { redact: true } };
+			if (arg === "off" || arg === "false" || arg === "0") return { kind: "change", change: { redact: false } };
+			return { kind: "invalid", usage: "Usage: /redact on|off" };
 		default:
-			return undefined;
+			return { kind: "none" };
 	}
 }
 

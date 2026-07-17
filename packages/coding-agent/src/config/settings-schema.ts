@@ -326,14 +326,15 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"notifications.verbosity": {
-		type: "string",
+		type: "enum",
+		values: ["quiet", "lean", "verbose"] as const,
 		default: "lean",
-		validate: (value: string) => value === "lean" || value === "verbose",
 		ui: {
 			tab: "notifications",
 			label: "Notification Verbosity",
-			description: "Choose concise or detailed notification messages.",
+			description: "Choose quiet (action-only pings), concise, or detailed notification messages.",
 			options: [
+				{ value: "quiet", label: "Quiet", description: "Send only action-needed asks/idles and user-initiated results" },
 				{ value: "lean", label: "Lean", description: "Send concise notification messages" },
 				{ value: "verbose", label: "Verbose", description: "Send detailed notification messages" },
 			],
@@ -3592,7 +3593,7 @@ export interface NotificationsSettings {
 		channelId: string | undefined;
 	};
 	redact: boolean;
-	verbosity: "lean" | "verbose";
+	verbosity: "quiet" | "lean" | "verbose";
 	sessionScope: "all" | "primary";
 	daemon: {
 		idleTimeoutMs: number;

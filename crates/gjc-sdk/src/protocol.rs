@@ -479,6 +479,8 @@ pub enum Verbosity {
 	Lean,
 	/// Full tool outputs + reasoning.
 	Verbose,
+	/// Suppress all non-action streaming notifications (action-only quiet mode).
+	Quiet,
 }
 
 /// Phase of a streamed turn output chunk.
@@ -1279,6 +1281,21 @@ mod tests {
 	}
 
 	#[test]
+	fn config_update_serializes_verbosity_quiet() {
+		let msg = ServerMessage::ConfigUpdate(ConfigUpdate {
+			session_id: "sess-1".into(),
+			verbosity:  Some(Verbosity::Quiet),
+			redact:     Some(true),
+		});
+		let v = serde_json::to_value(&msg).unwrap();
+		assert_eq!(v["type"], "config_update");
+		assert_eq!(v["verbosity"], "quiet");
+		assert_eq!(v["redact"], true);
+		let back: ServerMessage = serde_json::from_value(v).unwrap();
+		assert_eq!(back, msg);
+	}
+
+	#[test]
 	fn server_hello_roundtrips_with_capabilities() {
 		let hello = ServerMessage::Hello(ServerHello {
 			protocol_version: PROTOCOL_VERSION,
@@ -1421,6 +1438,19 @@ mod tests {
 			ClientMessage::ConfigCommand(c) => {
 				assert_eq!(c.verbosity, Some(Verbosity::Lean));
 				assert_eq!(c.redact, Some(true));
+			},
+			other => panic!("expected config_command, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn config_command_parses_verbosity_quiet() {
+		let raw = r#"{"type":"config_command","sessionId":"s1","token":"t","verbosity":"quiet","redact":false}"#;
+		let msg: ClientMessage = serde_json::from_str(raw).unwrap();
+		match msg {
+			ClientMessage::ConfigCommand(c) => {
+				assert_eq!(c.verbosity, Some(Verbosity::Quiet));
+				assert_eq!(c.redact, Some(false));
 			},
 			other => panic!("expected config_command, got {other:?}"),
 		}

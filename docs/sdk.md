@@ -456,13 +456,13 @@ Supported reply paths:
   topic identifies the session, so no session tag is needed).
 
 In threaded mode the user can also adjust per-session behaviour with in-thread
-config commands: `/verbose`, `/lean`, `/verbosity <lean|verbose>`, and
-`/redact <on|off>`. The legacy `/answer <session-tag> <answer>` command is
+config commands: `/quiet`, `/verbose`, `/lean`, `/verbosity <quiet|lean|verbose>`,
+and `/redact <on|off>`. The legacy `/answer <session-tag> <answer>` command is
 removed — replies are routed by the topic they arrive in.
 
 Flat fallback keeps outbound notifications and inline-button answers working, but
 plain free-text never guesses from the global pending-ask set. Free-text replies
-and `/verbose`/`/lean`/`/verbosity`/`/redact` commands are thread-native and
+and `/quiet`/`/verbose`/`/lean`/`/verbosity`/`/redact` commands are thread-native and
 require Threaded Mode/topic routing. Enable Threaded Mode in @BotFather > Bot
 Settings > Threads Settings when you need free-text replies or session commands.
 Do not pair a group, supergroup, or channel to work around a missing BotFather
@@ -513,6 +513,35 @@ answer remotely, so its `question` and `options` are always sent unredacted
 summaries are removed and streamed content frames (`turn_stream`,
 `context_update`, `image_attachment`) are suppressed at their emit sites. When
 redaction is disabled, all content is delivered unchanged.
+
+### Quiet verbosity (global action-only allowlist)
+
+`notifications.verbosity` selects a delivery posture shared by every managed
+adapter (Telegram, Discord, Slack). The three values are `lean` (default),
+`verbose`, and `quiet`. Set it from `/settings` → **Notifications** →
+Notification preferences, from the in-thread `/verbosity <quiet|lean|verbose>`
+command (Threaded Mode/topic routing required), or with `/quiet` / `/lean` /
+`/verbose` shortcuts. `gjc notify status` prints the current value, including
+`quiet` when set.
+
+`quiet` is a **global, fail-closed, action-only allowlist**. Under quiet the only
+frames that may produce a user-visible adapter payload are:
+
+- **`action_needed` asks** (ordinary and workflow-gate) — an ask must be readable
+  to be answerable, so its `question`/`options` are always delivered.
+- **`action_needed` idle** — the notify-only "awaiting next step" signal.
+- **User-initiated control results** — the direct result of a command you sent
+  (e.g. a `/session_*` lifecycle reply, a config-command acknowledgement).
+- **Explicit attachments** — an authorized explicit `telegram_send` attachment.
+
+Everything else is suppressed under quiet, including streamed assistant output
+(`turn_stream`), agent-produced images (`image_attachment`), context updates
+(`context_update`), identity headers (`identity_header`), and the body/config
+confirmations those frames carry. Classification is fail-closed: any frame that
+does not positively match an allowlisted class resolves to `silent` and creates
+no visible payload, so unknown or future frame types can never leak under quiet.
+`lean` and `verbose` preserve the broader delivery surface (existing redact gates
+still apply upstream); only `quiet` narrows it to the allowlist above.
 
 ### Local `/notify`
 

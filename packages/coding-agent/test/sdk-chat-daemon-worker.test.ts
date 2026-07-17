@@ -176,6 +176,7 @@ class FakeDiscordProvider implements DiscordProvider {
 
 class FakeSdkClient implements ChatDaemonSdkClient {
 	closed = false;
+	replaySessionId = "session";
 	sent: Record<string, unknown>[] = [];
 	requests: Record<string, unknown>[] = [];
 	handler: ((frame: Record<string, unknown>) => void) | undefined;
@@ -217,7 +218,7 @@ class FakeSdkClient implements ChatDaemonSdkClient {
 		this.requests.push(frame);
 		this.#resolveRequestWaiters();
 		if (frame.type === "event_replay")
-			return { events: [{ type: "event", name: "session_ready", sessionId: "session", generation: 1 }] };
+			return { events: [{ type: "event", name: "session_ready", sessionId: this.replaySessionId, generation: 1 }] };
 		return { ok: true, result: { source: "sdk", body: "daemon-result-secret" } };
 	}
 	send(frame: Record<string, unknown>): void {
@@ -1249,5 +1250,147 @@ describe("chat daemon worker", () => {
 		} finally {
 			await host.stop();
 		}
+	}, 20_000);
+	it("isolates per-session quiet verbosity: session A quiet cannot silence session B lean", async () => {
+		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-quiet-isolation-"));
+		const agentDir = path.join(root, "agent");
+		const stateRoot = path.join(root, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fs.mkdir(endpointDir, { recursive: true });
+		await fs.writeFile(
+			path.join(endpointDir, "session-a.json"),
+			JSON.stringify({ sessionId: "session-a", url: "ws://127.0.0.1:1", token: "token-a" }),
+		);
+		await fs.writeFile(
+			path.join(endpointDir, "session-b.json"),
+			JSON.stringify({ sessionId: "session-b", url: "ws://127.0.0.1:1", token: "token-b" }),
+		);
+		const index = await new SessionIndex(agentDir).open();
+		for (const sessionId of ["session-a", "session-b"]) {
+			await index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: root, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: (await fs.stat(path.join(endpointDir, `${sessionId}.json`))).mtimeMs,
+			});
+		}
+		const provider = new FakeDiscordProvider();
+		const clientA = new FakeSdkClient();
+		const clientB = new FakeSdkClient();
+		clientA.replaySessionId = "session-a";
+		clientB.replaySessionId = "session-b";
+		const runtime = new ChatDaemonRuntime(
+			{
+				kind: "discord",
+				agentDir,
+				config: {
+					identity: "fingerprint-only",
+					notifications: {
+						discord: { botToken: "bot-token", applicationId: "app", guildId: "guild", parentChannelId: "parent" },
+					},
+					presentation: { redact: false, verbosity: "lean" },
+				},
+			},
+			{
+				createDiscordProvider: () => provider,
+				createClient: async endpoint => (endpoint.token === "token-a" ? clientA : clientB),
+				createIndex: () => index,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
+			},
+		);
+		await runtime.start();
+		await provider.waitForThreadCount(2);
+		expect(provider.threads).toHaveLength(2);
+		// Put session A into quiet via a strict per-session config_update frame.
+		clientA.handler?.({
+			type: "event",
+			name: "config_update",
+			payload: { type: "config_update", sessionId: "session-a", verbosity: "quiet" },
+		});
+		await Bun.sleep(20);
+		// Session A quiet: a replayed session_ready residual body is silent (no "GJC session ready." posted).
+		const messagesBeforeReady = provider.messages.length;
+		clientA.handler?.({ type: "event", name: "session_ready", sessionId: "session-a", generation: 1 });
+		await Bun.sleep(30);
+		expect(provider.messages.slice(messagesBeforeReady).some(m => m.content.includes("GJC session ready."))).toBe(false);
+		// Session A quiet: identity_header residual is silent (not posted).
+		clientA.handler?.({
+			type: "event",
+			name: "identity_header",
+			payload: {
+				type: "identity_header",
+				sessionId: "session-a",
+				title: "A identity",
+				repo: "a-identity-repo",
+				branch: "a-identity-branch",
+			},
+		});
+		await Bun.sleep(30);
+		expect(provider.messages.some(m => m.content.includes("a-identity-repo"))).toBe(false);
+		// Session B lean: identity_header residual IS posted.
+		const bIdentityPosted = provider.waitForMessage(m => m.content.includes("b-identity-repo"));
+		clientB.handler?.({
+			type: "event",
+			name: "identity_header",
+			payload: {
+				type: "identity_header",
+				sessionId: "session-b",
+				title: "B identity",
+				repo: "b-identity-repo",
+				branch: "b-identity-branch",
+			},
+		});
+		await bIdentityPosted;
+		expect(provider.messages.some(m => m.content.includes("b-identity-repo"))).toBe(true);
+		// Session A quiet: turn_stream automatic frame is silent.
+		clientA.handler?.({ type: "turn_stream", sessionId: "session-a", text: "a-stream-content" });
+		await Bun.sleep(30);
+		expect(provider.messages.some(m => m.content.includes("a-stream-content"))).toBe(false);
+		// Session B lean: turn_stream automatic frame IS posted.
+		const bStreamPosted = provider.waitForMessage(m => m.content.includes("b-stream-content"));
+		clientB.handler?.({ type: "turn_stream", sessionId: "session-b", text: "b-stream-content" });
+		await bStreamPosted;
+		expect(provider.messages.some(m => m.content.includes("b-stream-content"))).toBe(true);
+		// Session A quiet: ask remains visible (allowlist).
+		const componentCountBefore = provider.messages.filter(m => m.components !== undefined).length;
+		const aAskPosted = provider.waitForMessage(m => m.components !== undefined);
+		clientA.handler?.({
+			type: "action_needed",
+			sessionId: "session-a",
+			id: "a-ask",
+			kind: "ask",
+			question: "A proceed?",
+			options: ["yes"],
+		});
+		await aAskPosted;
+		expect(provider.messages.filter(m => m.components !== undefined).length).toBe(componentCountBefore + 1);
+		// Session B lean: ask remains visible.
+		const bAskPosted = provider.waitForMessage(m => m.components !== undefined && JSON.stringify(m.components).includes("b-ask"));
+		clientB.handler?.({
+			type: "action_needed",
+			sessionId: "session-b",
+			id: "b-ask",
+			kind: "ask",
+			question: "B proceed?",
+			options: ["yes"],
+		});
+		await bAskPosted;
+		expect(provider.messages.filter(m => m.components !== undefined && JSON.stringify(m.components).includes("b-ask")).length).toBe(1);
+		// Session A quiet: unknown/automatic frame is silent.
+		clientA.handler?.({ type: "unknown_frame", sessionId: "session-a", text: "a-unknown-content" });
+		await Bun.sleep(30);
+		expect(provider.messages.some(m => m.content.includes("a-unknown-content"))).toBe(false);
+		// Session A quiet: config_update residual is silent while quiet stays in effect.
+		clientA.handler?.({
+			type: "event",
+			name: "config_update",
+			payload: { type: "config_update", sessionId: "session-a", verbosity: "quiet" },
+		});
+		await Bun.sleep(30);
+		expect(provider.messages.some(m => m.content.includes("GJC config update"))).toBe(false);
+		await runtime.stop();
 	}, 20_000);
 });

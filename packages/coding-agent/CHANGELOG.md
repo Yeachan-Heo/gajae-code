@@ -10,6 +10,10 @@
 ### Added
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 - Added a searchable command palette with direct action dispatch; slash commands run only from an empty composer, and drafts are never touched.
+- Added a `quiet` notification verbosity. `notifications.verbosity` now cycles `quiet → lean → verbose → quiet` in the Notifications settings tab and accepts `quiet` from the in-thread `/quiet` and `/verbosity <quiet|lean|verbose>` commands; `gjc notify status` prints `quiet` when set. Quiet is a global, fail-closed, action-only allowlist: `action_needed` asks and idle, user-initiated control results, and authorized explicit `telegram_send` attachments are delivered, while streamed output, images, context updates, identity headers, and their body/config confirmations are suppressed. The default remains `lean` and the existing `lean`/`verbose` delivery surface is unchanged.
+
+### Changed
+- The Notifications settings editor verbosity control now cycles three ways (quiet → lean → verbose → quiet) instead of toggling lean ↔ verbose only, and its label/description honestly describe the quiet action-only allowlist.
 
 ### Fixed
 

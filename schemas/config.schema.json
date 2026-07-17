@@ -141,7 +141,12 @@
 				},
 				"verbosity": {
 					"type": "string",
-					"description": "Choose concise or detailed notification messages.",
+					"enum": [
+						"quiet",
+						"lean",
+						"verbose"
+					],
+					"description": "Choose quiet (action-only pings), concise, or detailed notification messages.",
 					"default": "lean"
 				},
 				"sessionScope": {

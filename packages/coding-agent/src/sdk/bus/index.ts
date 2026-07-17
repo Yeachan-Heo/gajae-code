@@ -77,6 +77,11 @@ import {
 } from "./config";
 import { telegramControlCommandUsage } from "./config-commands";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
+import {
+	mayCreateVisiblePayload,
+	type NotificationVerbosity,
+	parseNotificationVerbosityStrict,
+} from "./notification-verbosity";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import { type EnsureDaemonResult, ensureTelegramDaemonRunningDetailed } from "./telegram-daemon";
@@ -878,7 +883,8 @@ interface SessionRuntime {
 	hostStopped: boolean;
 	serverStopped: boolean;
 	brokerRegistrationReleased: boolean;
-	verbosity: "lean" | "verbose";
+	/** Current per-session delivery verbosity (quiet / lean / verbose). */
+	verbosity: NotificationVerbosity;
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
 	busy: boolean;
@@ -3355,15 +3361,24 @@ export function createNotificationsExtension(
 					const update: {
 						type: "config_update";
 						sessionId: string;
-						verbosity?: "lean" | "verbose";
+						verbosity?: NotificationVerbosity;
 						redact?: boolean;
 					} = {
 						type: "config_update",
 						sessionId: runtime.id,
 					};
-					if (inbound.verbosity === "lean" || inbound.verbosity === "verbose") {
-						runtime.verbosity = inbound.verbosity;
-						update.verbosity = inbound.verbosity;
+					// Strict wire-boundary parse: only exact `quiet`|`lean`|`verbose` is
+					// accepted; any other value is ignored so a recognized root surfaces a
+					// usage error instead of coercing or free-texting.
+					const nextVerbosity = parseNotificationVerbosityStrict(inbound.verbosity);
+					if (nextVerbosity && nextVerbosity !== runtime.verbosity) {
+						runtime.verbosity = nextVerbosity;
+						update.verbosity = nextVerbosity;
+						// Entering quiet (or any verbosity switch) clears this session's
+						// stream staging so a stale in-progress turn preview never leaks
+						// past the new policy boundary. Session-scoped; other runtimes are
+						// untouched.
+						resetStreamStaging(runtime);
 					}
 					if (typeof inbound.redact === "boolean") {
 						// Redact turning ON: terminalize any already-visible in-flight tool
@@ -3773,8 +3788,33 @@ export function createNotificationsExtension(
 		await rotateSessionAuthority(event, ctx);
 	});
 
+	/**
+	 * Whether automatic (non-allowlisted) content may be mirrored to adapters.
+	 * Under `quiet` only the action-needed / control / explicit-attachment
+	 * allowlist is visible, so all automatic content (turn_stream, tool_activity,
+	 * context_update, reasoning_summary, auto image_attachment) classifies as
+	 * `silent` and is denied. `lean` and `verbose` preserve the full surface.
+	 */
+	const shouldMirrorContent = (verbosity: NotificationVerbosity): boolean =>
+		mayCreateVisiblePayload(verbosity, "silent");
+
+	/**
+	 * Clear per-turn stream staging for a session after a verbosity switch
+	 * (notably entering quiet) so no stale in-progress assistant text or live
+	 * edit ref leaks past the policy boundary. The monotonic turnSeq counter is
+	 * intentionally preserved. Session-scoped: only the addressed runtime is
+	 * reset, so one session entering quiet never disturbs another.
+	 */
+	const resetStreamStaging = (rt: SessionRuntime): void => {
+		rt.currentTurnText = undefined;
+		rt.preAskFlushedText = undefined;
+		rt.liveRef = undefined;
+		rt.lastLiveAt = undefined;
+		rt.lastLiveText = undefined;
+	};
+
 	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "unknown"): void => {
-		if (rt.notificationsActive && !rt.redact) {
+		if (rt.notificationsActive && !rt.redact && shouldMirrorContent(rt.verbosity)) {
 			for (const [toolCallId, { toolName }] of rt.inFlightTools) {
 				try {
 					pushSessionFrame(rt, { type: "tool_activity", sessionId: id, toolCallId, toolName, phase });
@@ -3887,7 +3927,7 @@ export function createNotificationsExtension(
 		// On idle, stream a context update with metadata (token/model usage +
 		// working-tree diff) unless redaction is on. The agent's last message is
 		// NOT repeated here — it is already streamed once via `turn_stream`.
-		if (!rt.redact && rt.verbosity === "verbose") {
+		if (!rt.redact && rt.verbosity === "verbose" && shouldMirrorContent(rt.verbosity)) {
 			const usage = (
 				ctx as { getContextUsage?: () => { tokens: number | null; contextWindow: number } | undefined }
 			).getContextUsage?.();
@@ -3923,6 +3963,10 @@ export function createNotificationsExtension(
 	// against what was already flushed for this turn (the pre-ask lead-in).
 	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): void => {
 		if (!text || text === rt.preAskFlushedText || !rt.notificationsActive) return;
+		// Quiet suppresses all automatic turn output (live + finalized, including
+		// the pre-ask lead-in); only action-needed / control / explicit attachment
+		// content is mirrored under quiet.
+		if (!shouldMirrorContent(rt.verbosity)) return;
 		rt.preAskFlushedText = text;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
@@ -3963,6 +4007,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive || rt.redact) return;
 		rt.inFlightTools.set(event.toolCallId, { toolName: event.toolName, args: event.args });
+		if (!shouldMirrorContent(rt.verbosity)) return;
 		try {
 			pushSessionFrame(rt, {
 				type: "tool_activity",
@@ -3982,6 +4027,11 @@ export function createNotificationsExtension(
 		if (!rt) return;
 		const inFlight = rt.inFlightTools.get(event.toolCallId);
 		if (!rt.notificationsActive || rt.redact) {
+			rt.inFlightTools.delete(event.toolCallId);
+			return;
+		}
+		// Quiet suppresses automatic tool activity; still clear the in-flight map.
+		if (!shouldMirrorContent(rt.verbosity)) {
 			rt.inFlightTools.delete(event.toolCallId);
 			return;
 		}
@@ -4021,7 +4071,7 @@ export function createNotificationsExtension(
 	api.on("reasoning_summary_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (!rt?.notificationsActive || rt.redact || rt.verbosity !== "verbose") return;
+		if (!rt?.notificationsActive || rt.redact || rt.verbosity !== "verbose" || !shouldMirrorContent(rt.verbosity)) return;
 		if (!event.message || typeof event.message !== "object" || !("content" in event.message)) return;
 		const content = event.message.content;
 		if (!Array.isArray(content)) return;
@@ -4074,6 +4124,8 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt?.notificationsActive || !rt.stream || rt.redact || rt.turnClosed) return;
+		// Quiet suppresses live (non-finalized) turn_stream previews.
+		if (!shouldMirrorContent(rt.verbosity)) return;
 		if ((event.message as { role?: unknown }).role !== "assistant") return;
 		if (rt.liveRef === undefined && rt.turnSeq !== undefined) {
 			rt.liveRef = String(rt.turnSeq);
@@ -4105,6 +4157,9 @@ export function createNotificationsExtension(
 			const turnText = summaryFromMessage(event.message, turnTextMax());
 			if (turnText) rt.currentTurnText = turnText;
 		}
+		// Quiet suppresses automatic (agent-produced) image attachments; explicit
+		// telegram_send file attachments travel a separate sink and are retained.
+		if (!shouldMirrorContent(rt.verbosity)) return;
 		for (const img of imageAttachmentsFromMessage(event.message)) {
 			try {
 				pushSessionFrame(rt, {

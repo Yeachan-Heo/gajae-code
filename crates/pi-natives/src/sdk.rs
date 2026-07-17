@@ -130,7 +130,7 @@ pub struct InboundEvent {
 	pub update_id:    Option<i64>,
 	/// Originating thread/topic id (`user_message` only).
 	pub thread_id:    Option<String>,
-	/// Requested verbosity `"lean"|"verbose"` (`config_command` only).
+	/// Requested verbosity `"lean"|"verbose"|"quiet"` (`config_command` only).
 	pub verbosity:    Option<String>,
 	/// Requested redaction state (`config_command` only).
 	pub redact:       Option<bool>,
@@ -335,6 +335,7 @@ impl NotificationServer {
 							verbosity:    c.verbosity.map(|v| match v {
 								Verbosity::Lean => "lean".to_owned(),
 								Verbosity::Verbose => "verbose".to_owned(),
+								Verbosity::Quiet => "quiet".to_owned(),
 							}),
 							redact:       c.redact,
 							request_id:   None,

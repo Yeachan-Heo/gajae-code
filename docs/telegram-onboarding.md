@@ -290,7 +290,7 @@ with stripped option buttons, so it cannot be left with unusable controls.
 
 Flat private chat is notification-only plus inline ask buttons. It is not a
 free-text chat surface: replies typed as normal messages and session commands such
-as `/verbose`, `/lean`, `/verbosity`, and `/redact` require Threaded Mode/topic
+as `/quiet`, `/verbose`, `/lean`, `/verbosity`, and `/redact` require Threaded Mode/topic
 routing.
 
 Flat private-chat fallback preserves outbound notifications and inline-button
@@ -320,9 +320,10 @@ Reply paths:
 - reply in the session topic with free text when forum-topic routing is
   available;
 - send in-topic config commands:
+  - `/quiet`
   - `/verbose`
   - `/lean`
-  - `/verbosity <lean|verbose>`
+  - `/verbosity <quiet|lean|verbose>`
   - `/redact <on|off>`
 - send paired-chat lifecycle commands from the Telegram command menu or by typing:
   - `/session_create path <dir>`
@@ -335,6 +336,38 @@ Reply paths:
 The removed legacy `/answer <session-tag> <answer>` flow is not the primary UX;
 Telegram topic routing identifies the target session when the configured chat
 supports it.
+
+### Quiet verbosity (global action-only allowlist)
+
+`/verbosity` selects a delivery posture shared by every managed adapter. The
+three values are `lean` (default), `verbose`, and `quiet`; set it with
+`/verbosity <quiet|lean|verbose>` or the `/quiet`, `/lean`, `/verbose` shortcuts
+(in-topic, Threaded Mode/topic routing required), or from `/settings` →
+**Notifications** → Notification preferences. `gjc notify status` prints the
+current value, including `quiet` when set.
+
+`quiet` is a **global, fail-closed, action-only allowlist**. Under quiet the
+managed Telegram daemon delivers only:
+
+- **`action_needed` asks** (ordinary and workflow-gate) — `question`/`options`
+  are always sent so the ask stays answerable; inline answer buttons are kept.
+- **`action_needed` idle** — the notify-only "awaiting next step" signal.
+- **User-initiated control results** — the direct result of a command you sent
+  (a `/session_*` lifecycle reply, a config-command acknowledgement, etc.).
+- **Explicit attachments** — an authorized explicit `telegram_send` attachment.
+
+Everything else is suppressed under quiet: streamed assistant output
+(`turn_stream`), agent-produced images (`image_attachment`), context updates
+(`context_update`), session identity headers (`identity_header`), and the
+body/config confirmations those frames carry. Classification is fail-closed —
+any frame that does not positively match an allowlisted class resolves to
+`silent` and creates no Telegram payload, so unknown or future frame types can
+never leak under quiet. `lean` and `verbose` keep the broader delivery surface
+(existing redact gates still apply upstream); only `quiet` narrows it to the
+allowlist above. Flat private-chat fallback still delivers allowlisted asks and
+inline-button answers under quiet; free-text replies and the `/quiet`,
+`/verbose`, `/lean`, `/verbosity`, `/redact` commands remain thread-native and
+require Threaded Mode/topic routing.
 
 ## 8. Local `/notify` inside a session
 

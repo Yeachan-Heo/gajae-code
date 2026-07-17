@@ -6734,3 +6734,386 @@ describe("Telegram tool activity capability and routing", () => {
 		expect(liveMessages.has("S:tool:A")).toBe(true);
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Quiet Telegram policy (action-only notification quiet mode). A session that
+// enters quiet (via a config_update frame or an initial quiet verbosity) keeps
+// only the four allowlisted visible classes — ask, idle, user-initiated control
+// results, and authorized explicit attachments — and suppresses every automatic
+// body (identity headers, context/turn/tool/reasoning streams, config-update
+// confirmations). Entering quiet bumps a per-session generation, purges queued
+// automatic sends, resets live edit state, and the drain rechecks generation +
+// the allowlist immediately before every visible Bot API call so an
+// already-granted stale automatic send cannot leak (paused-drain race). Silent
+// topic/typing/reaction operations are retained.
+// ---------------------------------------------------------------------------
+
+/** Wrap the standard test settings so the daemon boots with an initial verbosity. */
+function settingsWithVerbosity(agentDir: string, verbosity: "quiet" | "lean" | "verbose"): Settings {
+	const base = settings(agentDir);
+	const snapshot = base.getNotificationSettingsSnapshot();
+	return new Proxy(base, {
+		get(target, prop) {
+			if (prop === "getAgentDir") return () => agentDir;
+			if (prop === "getNotificationSettingsSnapshot")
+				return () => ({ ...snapshot, verbosity });
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
+}
+
+/**
+ * A botApi whose sendMessage/sendRichMessage calls block only while armed, until
+ * releaseGate() resolves. Setup sends (before armGate()) complete normally so the
+ * topic exists before the paused-drain race begins.
+ */
+class GatedBotApi extends FakeBotApi {
+	armed = false;
+	gateReleased = false;
+	private resolveGate: (() => void) | undefined;
+	private gatePromise: Promise<void> = new Promise(r => {
+		this.resolveGate = r;
+	});
+	armGate(): void {
+		this.armed = true;
+		this.gateReleased = false;
+		this.gatePromise = new Promise(r => {
+			this.resolveGate = r;
+		});
+	}
+	releaseGate(): void {
+		this.gateReleased = true;
+		this.armed = false;
+		this.resolveGate?.();
+	}
+	override async call(method: string, body: unknown): Promise<unknown> {
+		if (this.armed && !this.gateReleased && (method === "sendMessage" || method === "sendRichMessage")) {
+			await this.gatePromise;
+		}
+		return super.call(method, body);
+	}
+}
+
+function sessionObject(id = "S"): any {
+	return { sessionId: id, token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+}
+
+const sendText = (bot: FakeBotApi): string[] =>
+	bot.calls
+		.filter(c => c.method === "sendMessage" || c.method === "sendRichMessage")
+		.map(c => String((c.body as { text?: unknown }).text ?? ""))
+		.filter(Boolean);
+
+describe("telegram daemon quiet policy", () => {
+	test("entering quiet suppresses automatic bodies while retaining ask and silent topic ops", async () => {
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+		});
+		const session = sessionObject("S");
+
+		// identity_header creates the topic AND sends the bulleted identity body once.
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		expect(bot.calls.some(c => c.method === "createForumTopic")).toBe(true);
+		expect(bot.calls.some(c => c.method === "sendMessage")).toBe(true);
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id as number;
+
+		// An automatic finalized turn delivers under the default lean verbosity.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "automatic-final-before-quiet",
+		});
+		expect(sendText(bot)).toContain("automatic-final-before-quiet");
+
+		// Enter quiet via a config_update frame. The state changes with NO confirmation body.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, { type: "config_update", sessionId: "S", verbosity: "quiet" });
+		expect(bot.calls.some(c => c.method === "sendMessage")).toBe(false);
+		expect(bot.calls.some(c => c.method === "sendRichMessage")).toBe(false);
+
+		// After quiet, automatic bodies are suppressed.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "automatic-final-after-quiet",
+		});
+		expect(sendText(bot)).not.toContain("automatic-final-after-quiet");
+		expect(bot.calls.some(c => c.method === "sendMessage")).toBe(false);
+
+		// A context_update (automatic) is also suppressed.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "context_update",
+			sessionId: "S",
+			cwd: "/x",
+			task: "t",
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage")).toBe(false);
+
+		// An ask (allowlisted) is still delivered under quiet.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "action_needed",
+			sessionId: "S",
+			id: "ask-1",
+			kind: "ask",
+			question: "Pick one",
+			options: ["A"],
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" || c.method === "sendRichMessage")).toBe(true);
+
+		// An idle ping (allowlisted) is still delivered under quiet.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "action_needed",
+			sessionId: "S",
+			id: "idle-1",
+			kind: "idle",
+			question: "Next input ready",
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" || c.method === "sendRichMessage")).toBe(true);
+
+		// Silent topic operation retained: a fresh identity_header renames the topic via
+		// editForumTopic even under quiet. (The identity body is sent only once per topic,
+		// so the body suppression under quiet is covered by the initial-quiet test below.)
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b2",
+			title: "renamed",
+		});
+		const rename = bot.calls.find(c => c.method === "editForumTopic");
+		expect(rename).toBeTruthy();
+		expect(Number(rename!.body.message_thread_id)).toBe(threadId);
+
+		// A typing chat action (silent operation) is retained under quiet.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, { type: "activity", sessionId: "S", state: "busy" });
+		expect(bot.calls.some(c => c.method === "sendChatAction")).toBe(true);
+
+		// Leaving quiet (config_update to verbose) restores automatic delivery.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, { type: "config_update", sessionId: "S", verbosity: "verbose" });
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "automatic-after-exit",
+		});
+		expect(sendText(bot)).toContain("automatic-after-exit");
+	});
+
+	test("a stale automatic send already drained cannot leak after a paused-drain quiet entry", async () => {
+		const agentDir = tempAgentDir();
+		const bot = new GatedBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+		});
+		const session = sessionObject("S");
+
+		// Create the topic under lean so the topic exists before the race.
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		bot.calls = [];
+		bot.armGate();
+
+		// Queue an automatic finalized turn. flushPoolInner drains it and reaches the
+		// visible sendMessage call, which GatedBotApi blocks ON until releaseGate().
+		const inFlight = daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "stale-automatic-race",
+		});
+		// Yield once so the drain starts and blocks at the gated sendMessage.
+		await Promise.resolve();
+		await Promise.resolve();
+
+		// While the automatic send is paused at the Bot API call, enter quiet. The
+		// applyVerbosityUpdate() call (generation bump + purge) runs synchronously inside
+		// handleSessionMessage BEFORE its first await, so we deliberately do NOT await the
+		// config_update handle: its own flushPool is serialized behind the blocked first
+		// flush and would otherwise stall until releaseGate(). The generation bump is what
+		// matters, and it is already in effect when we queue the second send below.
+		const enterQuiet = daemon.handleSessionMessage(session, {
+			type: "config_update",
+			sessionId: "S",
+			verbosity: "quiet",
+		});
+		// Let the synchronous prefix (policy update) of enterQuiet run.
+		await Promise.resolve();
+		await Promise.resolve();
+
+		// Queue a second automatic send AFTER quiet; it must never reach a visible call.
+		bot.calls = [];
+		const afterQuiet = daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "must-not-leak",
+		});
+
+		// Release the gated first call so all queued flushes can complete in order.
+		bot.releaseGate();
+		await inFlight;
+		await enterQuiet;
+		await afterQuiet;
+
+		// The post-quiet automatic send must not leak any visible body.
+		expect(sendText(bot)).not.toContain("must-not-leak");
+		// And an ask queued after quiet is still delivered (allowlisted survives).
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "action_needed",
+			sessionId: "S",
+			id: "ask-race",
+			kind: "ask",
+			question: "Pick one",
+			options: ["A"],
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" || c.method === "sendRichMessage")).toBe(true);
+	});
+
+	test("initial quiet verbosity suppresses automatic bodies from the first frame", async () => {
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settingsWithVerbosity(agentDir, "quiet"),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+		});
+		const session = sessionObject("S");
+
+		// Under initial quiet the topic is still created (silent topic op) but the
+		// bulleted identity body is suppressed.
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		expect(bot.calls.some(c => c.method === "createForumTopic")).toBe(true);
+		expect(bot.calls.some(c => c.method === "sendMessage")).toBe(false);
+
+		// Automatic finalized turn is suppressed from the start.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "suppressed-from-start",
+		});
+		expect(sendText(bot)).not.toContain("suppressed-from-start");
+
+		// An ask is delivered even under initial quiet.
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "action_needed",
+			sessionId: "S",
+			id: "ask-init",
+			kind: "ask",
+			question: "Pick one",
+			options: ["A"],
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" || c.method === "sendRichMessage")).toBe(true);
+	});
+
+	test("two-session isolation: one quiet session never suppresses another session's automatic sends", async () => {
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+		});
+		const quietSession = sessionObject("Q");
+		const loudSession = sessionObject("L");
+
+		await daemon.handleSessionMessage(quietSession, {
+			type: "identity_header",
+			sessionId: "Q",
+			repo: "r",
+			branch: "q",
+		});
+		await daemon.handleSessionMessage(loudSession, {
+			type: "identity_header",
+			sessionId: "L",
+			repo: "r",
+			branch: "l",
+		});
+		const loudThread = bot.calls
+			.filter(c => c.method === "sendMessage")
+			.map(c => c.body.message_thread_id as number)
+			.pop()!;
+
+		// Enter quiet on Q only.
+		bot.calls = [];
+		await daemon.handleSessionMessage(quietSession, { type: "config_update", sessionId: "Q", verbosity: "quiet" });
+		expect(bot.calls.some(c => c.method === "sendMessage")).toBe(false);
+
+		// Q's automatic body is suppressed under quiet...
+		bot.calls = [];
+		await daemon.handleSessionMessage(quietSession, {
+			type: "turn_stream",
+			sessionId: "Q",
+			phase: "finalized",
+			text: "quiet-session-suppressed",
+		});
+		expect(sendText(bot)).not.toContain("quiet-session-suppressed");
+
+		// ...while L's automatic body is delivered into L's own topic, untouched.
+		bot.calls = [];
+		await daemon.handleSessionMessage(loudSession, {
+			type: "turn_stream",
+			sessionId: "L",
+			phase: "finalized",
+			text: "loud-session-delivered",
+		});
+		expect(sendText(bot)).toContain("loud-session-delivered");
+		const loudSend = bot.calls.find(c => c.method === "sendMessage");
+		expect(loudSend).toBeTruthy();
+		expect(Number(loudSend!.body.message_thread_id)).toBe(loudThread);
+
+		// Q's ask is still delivered under quiet (allowlisted), into Q's topic.
+		bot.calls = [];
+		await daemon.handleSessionMessage(quietSession, {
+			type: "action_needed",
+			sessionId: "Q",
+			id: "ask-q",
+			kind: "ask",
+			question: "Pick one",
+			options: ["A"],
+		});
+		expect(bot.calls.some(c => c.method === "sendMessage" || c.method === "sendRichMessage")).toBe(true);
+	});
+});

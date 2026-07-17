@@ -23,6 +23,7 @@ import {
 	tokenFingerprint,
 } from "./config";
 import { type DaemonPaths, daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import type { NotificationVerbosity } from "./notification-verbosity";
 import { DAEMON_GENERATION } from "./telegram-daemon-contract";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
@@ -113,7 +114,7 @@ export interface AdapterConfigView {
 export interface NotificationStatusReport {
 	enabled: boolean;
 	redact: boolean;
-	verbosity: "lean" | "verbose";
+	verbosity: NotificationVerbosity;
 	globallyConfigured: boolean;
 	telegram: AdapterConfigView & { tokenFingerprint: string | undefined };
 	discord: AdapterConfigView;

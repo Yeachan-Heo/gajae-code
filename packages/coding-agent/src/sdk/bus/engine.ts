@@ -1,3 +1,10 @@
+import {
+	type NotificationVerbosity,
+	type VisibleDeliveryClass,
+	type VisibleDeliveryInput,
+	classifyVisibleDelivery,
+	mayCreateVisiblePayload,
+} from "./notification-verbosity";
 import { buildRedactedAction, type RedactableAction } from "./config";
 
 export type NotificationEvent =
@@ -31,6 +38,44 @@ export interface EngineSessionSink {
 export interface NotificationEngineOptions {
 	redact: boolean;
 	sessionTag: (sessionId: string) => string;
+	/**
+	 * Default verbosity applied to a session when {@link connectSession} is
+	 * called without an explicit seed. Defaults to `"lean"`. Sessions with no
+	 * registered policy at {@link NotificationPresentationEngine.fanout} time
+	 * fail closed under `"quiet"`.
+	 */
+	defaultVerbosity?: NotificationVerbosity;
+}
+
+/**
+ * Per-session notification policy. `policyGeneration` is monotonic: each
+ * successful {@link NotificationPresentationEngine.setSessionVerbosity} call
+ * increments it, so callers can reject stale config_update frames by comparing
+ * generations.
+ */
+export interface SessionNotificationPolicy {
+	verbosity: NotificationVerbosity;
+	policyGeneration: number;
+}
+
+/** Fail-closed default for a session with no registered policy. */
+const FAIL_CLOSED_VERBOSITY: NotificationVerbosity = "quiet";
+
+function frameTypeOf(event: NotificationEvent): string | undefined {
+	return event.type === "frame" && typeof event.frame.type === "string" ? event.frame.type : undefined;
+}
+
+function deliveryInputFor(event: NotificationEvent): VisibleDeliveryInput {
+	if (event.type === "action_needed") return { frameType: "action_needed", actionKind: event.kind };
+	if (event.type === "frame") {
+		const frameType = frameTypeOf(event);
+		return {
+			frameType,
+			userInitiated: frameType === "control_command_result",
+			explicitAttachment: frameType === "file_attachment" || frameType === "image_attachment",
+		};
+	}
+	return {};
 }
 
 /**
@@ -45,6 +90,13 @@ export class NotificationPresentationEngine {
 	readonly adapters: readonly NotificationPresentationAdapter[];
 	private readonly sessions = new Map<string, EngineSessionSink>();
 	private readonly pending = new Map<string, { sessionId: string; actionId: string }>();
+	/**
+	 * Per-session notification policy, keyed by sessionId (never process-global).
+	 * A session with no entry at fanout time fails closed under quiet.
+	 */
+	private readonly policies = new Map<string, SessionNotificationPolicy>();
+	/** Monotonic global counter seeding each session's policy generation. */
+	private policyGenerationCounter = 0;
 
 	constructor(
 		adapters: readonly NotificationPresentationAdapter[],
@@ -53,15 +105,37 @@ export class NotificationPresentationEngine {
 		this.adapters = adapters;
 	}
 
-	connectSession(sessionId: string, sink: EngineSessionSink): void {
+	connectSession(sessionId: string, sink: EngineSessionSink, seedVerbosity?: NotificationVerbosity): void {
 		this.sessions.set(sessionId, sink);
+		const verbosity = seedVerbosity ?? this.opts.defaultVerbosity ?? "lean";
+		if (!this.policies.has(sessionId)) this.policies.set(sessionId, { verbosity, policyGeneration: ++this.policyGenerationCounter });
 	}
 
 	dropSession(sessionId: string): void {
 		this.sessions.delete(sessionId);
+		this.policies.delete(sessionId);
 		for (const [key, route] of this.pending) {
 			if (route.sessionId === sessionId) this.pending.delete(key);
 		}
+	}
+
+	/**
+	 * Strictly update one session's verbosity. Returns the new monotonic policy
+	 * generation, or `undefined` when the session is not connected. Stale
+	 * callers compare the returned generation against a captured baseline to
+	 * reject regressive updates.
+	 */
+	setSessionVerbosity(sessionId: string, verbosity: NotificationVerbosity): number | undefined {
+		if (!this.sessions.has(sessionId)) return undefined;
+		const next = ++this.policyGenerationCounter;
+		this.policies.set(sessionId, { verbosity, policyGeneration: next });
+		return next;
+	}
+
+	/** Read-only snapshot of a session's policy; undefined when not connected. */
+	getSessionPolicy(sessionId: string): SessionNotificationPolicy | undefined {
+		const policy = this.policies.get(sessionId);
+		return policy ? { verbosity: policy.verbosity, policyGeneration: policy.policyGeneration } : undefined;
 	}
 
 	fanout(event: NotificationEvent): NotificationAdapterPayload[] {
@@ -72,6 +146,10 @@ export class NotificationPresentationEngine {
 		if (safeEvent.type === "action_resolved") {
 			this.pending.delete(safeEvent.id);
 		}
+		const policy = this.policies.get(safeEvent.sessionId);
+		const verbosity = policy?.verbosity ?? FAIL_CLOSED_VERBOSITY;
+		const deliveryClass: VisibleDeliveryClass = classifyVisibleDelivery(deliveryInputFor(safeEvent));
+		if (!mayCreateVisiblePayload(verbosity, deliveryClass)) return [];
 		return this.adapters.flatMap(adapter => adapter.render(safeEvent));
 	}
 

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { logger } from "@gajae-code/utils";
-import { NotificationSettingsOverrideError, resetSettingsForTest, Settings } from "../src/config/settings";
+import { getDefault, NotificationSettingsOverrideError, resetSettingsForTest, Settings } from "../src/config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../src/extensibility/extensions";
 import { createAgentSession } from "../src/sdk";
 import {
@@ -25,6 +25,14 @@ import {
 	telegramActivationIdentity,
 	tokenFingerprint,
 } from "../src/sdk/bus/config";
+import {
+	classifyVisibleDelivery,
+	coerceNotificationVerbosity,
+	type NotificationVerbosity,
+	NOTIFICATION_VERBOSITY_VALUES,
+	mayCreateVisiblePayload,
+	parseNotificationVerbosityStrict,
+} from "../src/sdk/bus/notification-verbosity";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { daemonPaths, ensureTelegramDaemonRunning } from "../src/sdk/bus/telegram-daemon";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
@@ -82,6 +90,112 @@ const tempDirs: string[] = [];
 
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe("notification verbosity helpers and schema", () => {
+	test("NOTIFICATION_VERBOSITY_VALUES exposes quiet|lean|verbose", () => {
+		expect([...NOTIFICATION_VERBOSITY_VALUES]).toEqual(["quiet", "lean", "verbose"]);
+	});
+
+	test("enum schema accepts quiet|lean|verbose (default lean)", () => {
+		const def = getDefault("notifications.verbosity");
+		// The enum default remains lean (the historical default is preserved).
+		expect(def).toBe("lean");
+		// The schema-typed value is the widened union; quiet is now a valid value.
+		const settings = Settings.isolated({ "notifications.verbosity": "quiet" });
+		expect(settings.get("notifications.verbosity")).toBe("quiet");
+		expect(settings.getNotificationSettingsSnapshot().verbosity).toBe("quiet");
+		// lean/verbose still accepted.
+		for (const v of ["lean", "verbose"] as const) {
+			expect(Settings.isolated({ "notifications.verbosity": v }).get("notifications.verbosity")).toBe(v);
+		}
+	});
+
+	test("coerceNotificationVerbosity: garbage -> lean; quiet exact; case-sensitive", () => {
+		expect(coerceNotificationVerbosity("quiet")).toBe("quiet");
+		expect(coerceNotificationVerbosity("lean")).toBe("lean");
+		expect(coerceNotificationVerbosity("verbose")).toBe("verbose");
+		expect(coerceNotificationVerbosity("loud")).toBe("lean");
+		expect(coerceNotificationVerbosity("QUIET")).toBe("lean");
+		expect(coerceNotificationVerbosity(undefined)).toBe("lean");
+		expect(coerceNotificationVerbosity(null)).toBe("lean");
+		expect(coerceNotificationVerbosity(123)).toBe("lean");
+		expect(coerceNotificationVerbosity({})).toBe("lean");
+		expect(coerceNotificationVerbosity("")).toBe("lean");
+	});
+
+	test("parseNotificationVerbosityStrict: only exact quiet|lean|verbose; else undefined", () => {
+		expect(parseNotificationVerbosityStrict("quiet")).toBe("quiet");
+		expect(parseNotificationVerbosityStrict("lean")).toBe("lean");
+		expect(parseNotificationVerbosityStrict("verbose")).toBe("verbose");
+		expect(parseNotificationVerbosityStrict("silent")).toBeUndefined();
+		expect(parseNotificationVerbosityStrict("QUIET")).toBeUndefined();
+		expect(parseNotificationVerbosityStrict(undefined)).toBeUndefined();
+		expect(parseNotificationVerbosityStrict(null)).toBeUndefined();
+		expect(parseNotificationVerbosityStrict(123)).toBeUndefined();
+		expect(parseNotificationVerbosityStrict("")).toBeUndefined();
+	});
+
+	test("default verbosity remains lean in the snapshot", () => {
+		expect(getNotificationConfig(Settings.isolated()).verbosity).toBe("lean");
+		expect(getDefault("notifications.verbosity")).toBe("lean");
+	});
+
+	test("snapshot quiet round-trips through full Settings", () => {
+		const settings = Settings.isolated({ "notifications.verbosity": "quiet" });
+		expect(settings.getNotificationSettingsSnapshot().verbosity).toBe("quiet");
+		expect(getNotificationConfig(settings).verbosity).toBe("quiet");
+	});
+
+	test("snapshot coerces an unknown settings value to lean (file-boundary forgive)", () => {
+		// An unknown value stored under the key is forgiven to lean at the snapshot boundary.
+		const settings = Settings.isolated({ "notifications.verbosity": "loud" as NotificationVerbosity });
+		expect(settings.getNotificationSettingsSnapshot().verbosity).toBe("lean");
+		expect(getNotificationConfig(settings).verbosity).toBe("lean");
+	});
+});
+
+describe("classifyVisibleDelivery + mayCreateVisiblePayload (quiet allowlist)", () => {
+	test("action_needed ask/idle classify to their allowlist classes", () => {
+		expect(classifyVisibleDelivery({ frameType: "action_needed", actionKind: "ask" })).toBe("action_ask");
+		expect(classifyVisibleDelivery({ frameType: "action_needed", actionKind: "idle" })).toBe("action_idle");
+		// case-insensitive action kind.
+		expect(classifyVisibleDelivery({ frameType: "action_needed", actionKind: "ASK" })).toBe("action_ask");
+	});
+
+	test("user-initiated and explicit attachments classify to their allowlist classes", () => {
+		expect(classifyVisibleDelivery({ frameType: "control_command_result", userInitiated: true })).toBe(
+			"user_control_result",
+		);
+		expect(classifyVisibleDelivery({ frameType: "file_attachment", explicitAttachment: true })).toBe(
+			"explicit_attachment",
+		);
+	});
+
+	test("unknown / automatic frames fail closed to silent", () => {
+		expect(classifyVisibleDelivery({ frameType: "turn_stream" })).toBe("silent");
+		expect(classifyVisibleDelivery({ frameType: "config_update" })).toBe("silent");
+		expect(classifyVisibleDelivery({ frameType: "session_ready" })).toBe("silent");
+		expect(classifyVisibleDelivery({ frameType: "identity_header" })).toBe("silent");
+		expect(classifyVisibleDelivery({ frameType: "action_needed", actionKind: "progress" })).toBe("silent");
+		expect(classifyVisibleDelivery({})).toBe("silent");
+		expect(classifyVisibleDelivery({ frameType: "some_future_frame" })).toBe("silent");
+	});
+
+	test("quiet allows only the four visible classes; everything else is denied", () => {
+		expect(mayCreateVisiblePayload("quiet", "action_ask")).toBe(true);
+		expect(mayCreateVisiblePayload("quiet", "action_idle")).toBe(true);
+		expect(mayCreateVisiblePayload("quiet", "user_control_result")).toBe(true);
+		expect(mayCreateVisiblePayload("quiet", "explicit_attachment")).toBe(true);
+		expect(mayCreateVisiblePayload("quiet", "silent")).toBe(false);
+	});
+
+	test("lean and verbose allow every class (broader surface preserved)", () => {
+		for (const cls of ["action_ask", "action_idle", "user_control_result", "explicit_attachment", "silent"] as const) {
+			expect(mayCreateVisiblePayload("lean", cls)).toBe(true);
+			expect(mayCreateVisiblePayload("verbose", cls)).toBe(true);
+		}
+	});
 });
 
 describe("notifications config", () => {

@@ -9,34 +9,75 @@ import {
 
 describe("parseInThreadConfigCommand", () => {
 	test("/verbose and /lean toggle verbosity", () => {
-		expect(parseInThreadConfigCommand("/verbose")).toEqual({ verbosity: "verbose" });
-		expect(parseInThreadConfigCommand("/lean")).toEqual({ verbosity: "lean" });
+		expect(parseInThreadConfigCommand("/verbose")).toEqual({ kind: "change", change: { verbosity: "verbose" } });
+		expect(parseInThreadConfigCommand("/lean")).toEqual({ kind: "change", change: { verbosity: "lean" } });
 	});
 
-	test("/verbosity <arg> sets verbosity, rejects bad args", () => {
-		expect(parseInThreadConfigCommand("/verbosity verbose")).toEqual({ verbosity: "verbose" });
-		expect(parseInThreadConfigCommand("/verbosity lean")).toEqual({ verbosity: "lean" });
-		expect(parseInThreadConfigCommand("/verbosity loud")).toBeUndefined();
+	test("/quiet sets verbosity quiet", () => {
+		expect(parseInThreadConfigCommand("/quiet")).toEqual({ kind: "change", change: { verbosity: "quiet" } });
 	});
 
-	test("/redact on|off|true|false|1|0 toggles redaction", () => {
-		expect(parseInThreadConfigCommand("/redact on")).toEqual({ redact: true });
-		expect(parseInThreadConfigCommand("/redact off")).toEqual({ redact: false });
-		expect(parseInThreadConfigCommand("/redact true")).toEqual({ redact: true });
-		expect(parseInThreadConfigCommand("/redact 0")).toEqual({ redact: false });
-		expect(parseInThreadConfigCommand("/redact maybe")).toBeUndefined();
+	test("/verbosity quiet sets quiet", () => {
+		expect(parseInThreadConfigCommand("/verbosity quiet")).toEqual({
+			kind: "change",
+			change: { verbosity: "quiet" },
+		});
 	});
 
-	test("non-commands and free text return undefined (treated as injection)", () => {
-		expect(parseInThreadConfigCommand("keep going")).toBeUndefined();
-		expect(parseInThreadConfigCommand("/answer s1 yes")).toBeUndefined();
-		expect(parseInThreadConfigCommand("/unknown")).toBeUndefined();
-		expect(parseInThreadConfigCommand("")).toBeUndefined();
+	test("/verbosity <arg> sets verbosity, rejects bad args as invalid (never free text)", () => {
+		expect(parseInThreadConfigCommand("/verbosity verbose")).toEqual({
+			kind: "change",
+			change: { verbosity: "verbose" },
+		});
+		expect(parseInThreadConfigCommand("/verbosity lean")).toEqual({ kind: "change", change: { verbosity: "lean" } });
+		// Recognized root + bad arg -> invalid, not none/free-text.
+		expect(parseInThreadConfigCommand("/verbosity loud")).toEqual({
+			kind: "invalid",
+			usage: "Usage: /verbosity quiet|lean|verbose",
+		});
+		expect(parseInThreadConfigCommand("/verbosity silent")).toEqual({
+			kind: "invalid",
+			usage: "Usage: /verbosity quiet|lean|verbose",
+		});
+		expect(parseInThreadConfigCommand("/verbosity")).toEqual({
+			kind: "invalid",
+			usage: "Usage: /verbosity quiet|lean|verbose",
+		});
+	});
+
+	test("/quiet with extra args is rejected as invalid, not free text", () => {
+		expect(parseInThreadConfigCommand("/quiet extra")).toEqual({ kind: "invalid", usage: "Usage: /quiet" });
+		expect(parseInThreadConfigCommand("/quiet now")).toEqual({ kind: "invalid", usage: "Usage: /quiet" });
+	});
+
+	test("/verbose and /lean with extra args are invalid, not free text", () => {
+		expect(parseInThreadConfigCommand("/verbose now")).toEqual({ kind: "invalid", usage: "Usage: /verbose" });
+		expect(parseInThreadConfigCommand("/lean please")).toEqual({ kind: "invalid", usage: "Usage: /lean" });
+	});
+
+	test("/redact on|off|true|false|1|0 toggles redaction; bad args invalid", () => {
+		expect(parseInThreadConfigCommand("/redact on")).toEqual({ kind: "change", change: { redact: true } });
+		expect(parseInThreadConfigCommand("/redact off")).toEqual({ kind: "change", change: { redact: false } });
+		expect(parseInThreadConfigCommand("/redact true")).toEqual({ kind: "change", change: { redact: true } });
+		expect(parseInThreadConfigCommand("/redact 0")).toEqual({ kind: "change", change: { redact: false } });
+		expect(parseInThreadConfigCommand("/redact maybe")).toEqual({ kind: "invalid", usage: "Usage: /redact on|off" });
+		expect(parseInThreadConfigCommand("/redact")).toEqual({ kind: "invalid", usage: "Usage: /redact on|off" });
+	});
+
+	test("non-commands and unknown slash roots return none (treated as free-text injection)", () => {
+		expect(parseInThreadConfigCommand("keep going")).toEqual({ kind: "none" });
+		expect(parseInThreadConfigCommand("/answer s1 yes")).toEqual({ kind: "none" });
+		expect(parseInThreadConfigCommand("/unknown")).toEqual({ kind: "none" });
+		expect(parseInThreadConfigCommand("")).toEqual({ kind: "none" });
 	});
 
 	test("is case-insensitive and tolerant of extra whitespace", () => {
-		expect(parseInThreadConfigCommand("  /VERBOSE  ")).toEqual({ verbosity: "verbose" });
-		expect(parseInThreadConfigCommand("/Redact   ON")).toEqual({ redact: true });
+		expect(parseInThreadConfigCommand("  /VERBOSE  ")).toEqual({
+			kind: "change",
+			change: { verbosity: "verbose" },
+		});
+		expect(parseInThreadConfigCommand("/Redact   ON")).toEqual({ kind: "change", change: { redact: true } });
+		expect(parseInThreadConfigCommand("  /QUIET  ")).toEqual({ kind: "change", change: { verbosity: "quiet" } });
 	});
 });
 

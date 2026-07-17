@@ -29,6 +29,7 @@ import type { ModelRole } from "../config/model-registry";
 import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import type { NotificationSettingsReader, NotificationSettingsSnapshot } from "../sdk/bus/config";
+import { coerceNotificationVerbosity } from "../sdk/bus/notification-verbosity";
 import { AgentStorage } from "../session/agent-storage";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import {
@@ -600,7 +601,7 @@ export class Settings implements NotificationSettingsReader {
 						: getDefault("notifications.slack.authorizedUserId"),
 			},
 			redact: typeof redact === "boolean" ? redact : getDefault("notifications.redact"),
-			verbosity: verbosity === "verbose" || getDefault("notifications.verbosity") === "verbose" ? "verbose" : "lean",
+			verbosity: coerceNotificationVerbosity(verbosity ?? getDefault("notifications.verbosity")),
 			sessionScope:
 				sessionScope === "primary" || getDefault("notifications.sessionScope") === "primary" ? "primary" : "all",
 			idleTimeoutMs:

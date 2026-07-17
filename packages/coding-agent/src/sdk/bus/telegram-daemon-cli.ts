@@ -10,6 +10,7 @@ import {
 	type NotificationSettingsSnapshot,
 	readTelegramActivationMarkers,
 } from "./config";
+import { coerceNotificationVerbosity } from "./notification-verbosity";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import {
 	type DaemonState,
@@ -111,7 +112,7 @@ export function createLightweightDaemonSettings(input: {
 			authorizedUserId: asString(getByPath(rawConfig, ["notifications", "slack", "authorizedUserId"])),
 		},
 		redact: asBoolean(getByPath(rawConfig, ["notifications", "redact"]), false),
-		verbosity: getByPath(rawConfig, ["notifications", "verbosity"]) === "verbose" ? "verbose" : "lean",
+		verbosity: coerceNotificationVerbosity(getByPath(rawConfig, ["notifications", "verbosity"])),
 		sessionScope: getByPath(rawConfig, ["notifications", "sessionScope"]) === "primary" ? "primary" : "all",
 		idleTimeoutMs: asIdleTimeoutMs(getByPath(rawConfig, ["notifications", "daemon", "idleTimeoutMs"])),
 	});
