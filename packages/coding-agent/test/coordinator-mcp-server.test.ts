@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../src/coordinator-mcp/server";
+import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
 
@@ -1496,5 +1497,98 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		]);
 		expect(await Bun.file(idleFile).exists()).toBe(false);
 		expect(await Bun.file(path.join(sessionsDir, "registered-session.json")).exists()).toBe(true);
+	});
+});
+
+describe("Coordinator MCP session-local runtime state fallback", () => {
+	function sessionLocalRuntimeState(root: string, state: "completed" | "errored", updatedAt: string) {
+		return {
+			schema_version: 1,
+			session_id: "visible-session",
+			state,
+			ready_for_input: state === "completed",
+			current_turn_id: null,
+			last_turn_id: null,
+			updated_at: updatedAt,
+			source: "agent_session_event",
+			event: "agent_end",
+			live: false,
+			reason: null,
+			cwd: root,
+			workdir: root,
+			session_file: null,
+			final_response: {
+				text: "DONE",
+				format: "markdown",
+				source: "runtime_state",
+				artifact_path: null,
+				truncated: false,
+			},
+		};
+	}
+
+	it("resolves terminal turns from the session-local runtime state when the coordinator store was never runtime-updated", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "prompt-1",
+			allow_mutation: true,
+		});
+		const turnId = sent.turn_id;
+		if (typeof turnId !== "string") throw new Error("missing coordinator turn id");
+		const runtimeDir = sessionRuntimeDir(root, "visible-session");
+		await fs.mkdir(runtimeDir, { recursive: true });
+		const runtimeStateFile = path.join(runtimeDir, "runtime-state.json");
+
+		// A terminal state written before this turn started (e.g. a previous turn's
+		// completion) carries no turn correlation and must not resolve the new turn.
+		await Bun.write(
+			runtimeStateFile,
+			JSON.stringify(sessionLocalRuntimeState(root, "completed", new Date(Date.now() - 60_000).toISOString())),
+		);
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: turnId })).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "active" },
+		});
+
+		// A terminal transition recorded while the turn was running resolves it and
+		// carries the sidecar's final_response into the durable turn record.
+		await Bun.write(
+			runtimeStateFile,
+			JSON.stringify(sessionLocalRuntimeState(root, "completed", new Date(Date.now() + 60_000).toISOString())),
+		);
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: turnId })).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "completed", final_response: { text: "DONE" } },
+			session_state: { state: "completed" },
+		});
+	});
+
+	it("marks turns failed from a session-local errored runtime state", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "prompt-1",
+			allow_mutation: true,
+		});
+		const turnId = sent.turn_id;
+		if (typeof turnId !== "string") throw new Error("missing coordinator turn id");
+		const runtimeDir = sessionRuntimeDir(root, "visible-session");
+		await fs.mkdir(runtimeDir, { recursive: true });
+		await Bun.write(
+			path.join(runtimeDir, "runtime-state.json"),
+			JSON.stringify(sessionLocalRuntimeState(root, "errored", new Date(Date.now() + 60_000).toISOString())),
+		);
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: turnId })).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "failed" },
+			session_state: { state: "errored" },
+		});
 	});
 });

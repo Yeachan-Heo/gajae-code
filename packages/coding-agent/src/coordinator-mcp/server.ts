@@ -11,6 +11,7 @@ import {
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
+import { sessionRuntimeDir } from "../gjc-runtime/session-layout";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
 import {
@@ -1232,6 +1233,46 @@ async function readSessionState(namespaceDir: string, sessionId: string): Promis
 	return (await readJsonFile(sessionStateFile(namespaceDir, sessionId))) as CoordinatorSessionState | null;
 }
 
+function isRuntimeSourcedSessionState(value: unknown, sessionId: string): value is CoordinatorSessionState {
+	const record = asRecord(value);
+	if (!record) return false;
+	if (record.schema_version !== 1) return false;
+	if (record.session_id !== sessionId) return false;
+	if (record.source !== "agent_session_event") return false;
+	if (typeof record.updated_at !== "string") return false;
+	return (
+		record.state === "ready_for_input" ||
+		record.state === "running" ||
+		record.state === "needs_user_input" ||
+		record.state === "completed" ||
+		record.state === "errored"
+	);
+}
+
+// Broker-spawned sessions never receive GJC_COORDINATOR_SESSION_STATE_FILE (only
+// the tmux/lifecycle launch paths wire it), so their runtime sidecar writes
+// transitions to the session-local default file instead of the coordinator
+// session-states store. Read that file directly so terminal transitions are
+// still observable through the coordinator.
+async function readSessionLocalRuntimeState(
+	session: Record<string, unknown>,
+	sessionId: string,
+): Promise<CoordinatorSessionState | null> {
+	const cwd = typeof session.cwd === "string" && session.cwd.trim().length > 0 ? session.cwd : null;
+	if (!cwd) return null;
+	const payload = await readJsonFile(path.join(sessionRuntimeDir(cwd, sessionId), "runtime-state.json"));
+	return isRuntimeSourcedSessionState(payload, sessionId) ? payload : null;
+}
+
+// A session-local runtime state carries no turn correlation (current_turn_id is
+// never populated on this path), so only trust it for a turn that was already
+// running when the state was written.
+function runtimeStateCoversTurn(state: CoordinatorSessionState, turn: TurnRecord): boolean {
+	const stateMs = Date.parse(state.updated_at);
+	const turnMs = Date.parse(turn.started_at ?? turn.created_at);
+	return Number.isFinite(stateMs) && Number.isFinite(turnMs) && stateMs >= turnMs;
+}
+
 async function writeSessionStateUnlocked(
 	namespaceDir: string,
 	sessionId: string,
@@ -2379,6 +2420,26 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			resolvedTurn = { ...resolvedTurn, status: "waiting_for_answer", updated_at: timestamp };
 			await writeTurnRecord(namespaceDir, resolvedTurn);
 			await writeActiveTurn(namespaceDir, resolvedTurn);
+		}
+		if (
+			session &&
+			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
+			sessionState?.source !== "agent_session_event" &&
+			sessionState?.state !== "completed" &&
+			sessionState?.state !== "errored"
+		) {
+			const runtimeState = await readSessionLocalRuntimeState(session, resolvedTurn.session_id);
+			if (
+				runtimeState &&
+				(runtimeState.state === "completed" || runtimeState.state === "errored") &&
+				runtimeStateCoversTurn(runtimeState, resolvedTurn)
+			) {
+				sessionState = {
+					...runtimeState,
+					current_turn_id: sessionState?.current_turn_id ?? resolvedTurn.turn_id,
+					last_turn_id: sessionState?.last_turn_id ?? runtimeState.last_turn_id,
+				};
+			}
 		}
 		if (
 			sessionState &&
