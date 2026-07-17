@@ -100,6 +100,10 @@ function generationFrom(frame: Record<string, unknown>): number | undefined {
 		: undefined;
 }
 
+function isLiveTurnStream(frame: Record<string, unknown>): boolean {
+	return frame.type === "turn_stream" && frame.phase === "live";
+}
+
 /**
  * Worker-owned session discovery and event fanout. It connects only through the
  * public SDK transport and retains endpoint tokens solely in live client objects.
@@ -378,6 +382,10 @@ export class ChatDaemonRuntime {
 			await this.resume(sessionId, attached.generation, "GJC session ready.");
 			return;
 		}
+		// Telegram owns live in-place message edits. Discord/Slack deliberately keep
+		// their historical finalized-turn behavior even when Telegram streaming is
+		// enabled at the shared SDK producer.
+		if (isLiveTurnStream(normalizedFrame)) return;
 		const notification = this.#notificationEvent(sessionId, normalizedFrame);
 		if (notification?.type === "action_resolved") {
 			await Promise.all([

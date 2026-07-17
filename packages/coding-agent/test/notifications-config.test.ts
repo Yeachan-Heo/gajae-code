@@ -62,6 +62,9 @@ const BASE_CFG: NotificationConfig = {
 	richDraft: {
 		enabled: false,
 	},
+	streaming: {
+		enabled: false,
+	},
 	topics: {
 		nameTemplate: undefined,
 	},
@@ -133,6 +136,9 @@ describe("notifications config", () => {
 			richDraft: {
 				enabled: false,
 			},
+			streaming: {
+				enabled: false,
+			},
 			topics: {
 				nameTemplate: undefined,
 			},
@@ -173,6 +179,7 @@ describe("notifications config", () => {
 			"notifications.telegram.chatId": "telegram-chat",
 			"notifications.telegram.rich.enabled": false,
 			"notifications.telegram.richDraft.enabled": true,
+			"notifications.telegram.streaming.enabled": true,
 			"notifications.telegram.topics.nameTemplate": "{repo}/{branch}",
 			"notifications.discord.botToken": "discord-token",
 			"notifications.discord.applicationId": "discord-application",
@@ -199,6 +206,7 @@ describe("notifications config", () => {
 						chatId: "telegram-chat",
 						rich: { enabled: false },
 						richDraft: { enabled: true },
+						streaming: { enabled: true },
 						topics: { nameTemplate: "{repo}/{branch}" },
 					},
 					discord: {

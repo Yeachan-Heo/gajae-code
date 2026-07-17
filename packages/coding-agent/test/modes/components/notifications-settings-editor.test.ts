@@ -77,6 +77,7 @@ function state(): NotificationsEditorState {
 			sessionScope: "all",
 			richEnabled: true,
 			richDraftEnabled: false,
+			streamingEnabled: false,
 		},
 		health: health(),
 	};
@@ -151,6 +152,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 				tokenFingerprint: "telegram:cafefeed",
 				richEnabled: input.richEnabled,
 				richDraftEnabled: input.richDraftEnabled,
+				streamingEnabled: input.streamingEnabled,
 			},
 		};
 	}
@@ -293,11 +295,18 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(render(component)).toContain("unsaved draft");
 		component.handleInput("\n"); // redact on in the editor-only preference draft
 		expect(operations.committedPreferences).toEqual([]);
-		select(component, 5);
+		select(component, 6);
 		component.handleInput("\n");
 		await flush();
 		expect(operations.committedPreferences).toEqual([
-			{ redact: true, verbosity: "lean", sessionScope: "all", richEnabled: true, richDraftEnabled: false },
+			{
+				redact: true,
+				verbosity: "lean",
+				sessionScope: "all",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: false,
+			},
 		]);
 	});
 
@@ -465,7 +474,13 @@ describe("NotificationsSettingsEditorComponent", () => {
 			status: "ready",
 			identity: { status: "foreign" },
 			message: "late foreign result",
-			draft: { chatId: "1001", tokenMask: "••••", richEnabled: true, richDraftEnabled: false },
+			draft: {
+				chatId: "1001",
+				tokenMask: "••••",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: false,
+			},
 		});
 		await flush();
 		expect(pairing.mode).toBe("home");

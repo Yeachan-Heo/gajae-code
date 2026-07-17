@@ -72,6 +72,17 @@
 							},
 							"additionalProperties": false
 						},
+						"streaming": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Stream in-progress assistant output to Telegram by editing one live message.",
+									"default": false
+								}
+							},
+							"additionalProperties": false
+						},
 						"richDraft": {
 							"type": "object",
 							"properties": {

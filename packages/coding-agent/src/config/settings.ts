@@ -517,6 +517,7 @@ export class Settings implements NotificationSettingsReader {
 			activation && Object.keys(activation).length > 0 ? structuredClone(activation) : undefined;
 		const richEnabled = this.#getGlobalResolved("notifications.telegram.rich.enabled");
 		const richDraftEnabled = this.#getGlobalResolved("notifications.telegram.richDraft.enabled");
+		const streamingEnabled = this.#getGlobalResolved("notifications.telegram.streaming.enabled");
 		const nameTemplate = this.#getGlobalResolved("notifications.telegram.topics.nameTemplate");
 		const discordBotToken = this.#getGlobalResolved("notifications.discord.botToken");
 		const discordApplicationId = this.#getGlobalResolved("notifications.discord.applicationId");
@@ -551,6 +552,12 @@ export class Settings implements NotificationSettingsReader {
 						typeof richDraftEnabled === "boolean"
 							? richDraftEnabled
 							: getDefault("notifications.telegram.richDraft.enabled"),
+				},
+				streaming: {
+					enabled:
+						typeof streamingEnabled === "boolean"
+							? streamingEnabled
+							: getDefault("notifications.telegram.streaming.enabled"),
 				},
 				topics: {
 					nameTemplate:

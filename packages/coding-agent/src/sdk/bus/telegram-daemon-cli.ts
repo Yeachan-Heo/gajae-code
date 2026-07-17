@@ -93,6 +93,9 @@ export function createLightweightDaemonSettings(input: {
 			richDraft: {
 				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "richDraft", "enabled"]), false),
 			},
+			streaming: {
+				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "streaming", "enabled"]), false),
+			},
 			topics: {
 				nameTemplate: asString(getByPath(rawConfig, ["notifications", "telegram", "topics", "nameTemplate"])),
 			},
@@ -150,6 +153,8 @@ export function createLightweightDaemonSettings(input: {
 					return snapshot.telegram.rich.enabled;
 				case "notifications.telegram.richDraft.enabled":
 					return snapshot.telegram.richDraft.enabled;
+				case "notifications.telegram.streaming.enabled":
+					return snapshot.telegram.streaming.enabled;
 				case "notifications.redact":
 					return snapshot.redact;
 				case "notifications.verbosity":

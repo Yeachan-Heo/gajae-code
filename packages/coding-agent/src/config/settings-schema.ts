@@ -295,6 +295,16 @@ export const SETTINGS_SCHEMA = {
 			editing: "notification-atomic",
 		},
 	},
+	"notifications.telegram.streaming.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Message Streaming",
+			description: "Stream in-progress assistant output to Telegram by editing one live message.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.telegram.richDraft.enabled": {
 		type: "boolean",
 		default: false,
@@ -3591,6 +3601,9 @@ export interface NotificationsSettings {
 			enabled: boolean;
 		};
 		richDraft: {
+			enabled: boolean;
+		};
+		streaming: {
 			enabled: boolean;
 		};
 		topics: {
