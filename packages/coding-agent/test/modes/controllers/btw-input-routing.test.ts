@@ -168,16 +168,24 @@ describe("InputController retained /btw-r routing", () => {
 			disableModelInvocation: false,
 			content: "Demo skill body",
 		};
-		(harness.ctx as { skillCommands?: Map<string, typeof skill> }).skillCommands = new Map([["skill:demo", skill]]);
-		const promptCustomMessage = vi.fn(async () => {});
-		(harness.ctx.session as { promptCustomMessage?: typeof promptCustomMessage }).promptCustomMessage =
-			promptCustomMessage;
-		(harness.ctx.session as { sessionId?: string }).sessionId = "test-session";
-		(
-			harness.ctx.session as {
+		const ctxMut = harness.ctx as unknown as {
+			skillCommands: Map<string, typeof skill>;
+			session: {
+				promptCustomMessage: (
+					message: unknown,
+					options?: { streamingBehavior?: string; followUpQueuePolicy?: string },
+				) => Promise<void>;
+				sessionId?: string;
 				enqueueCustomMessageDisplay?: (text: string, behavior: string) => string;
-			}
-		).enqueueCustomMessageDisplay = vi.fn(() => "tag");
+			};
+		};
+		ctxMut.skillCommands = new Map([["skill:demo", skill]]);
+		const promptCustomMessage = vi.fn(
+			async (_message: unknown, _options?: { streamingBehavior?: string; followUpQueuePolicy?: string }) => {},
+		);
+		ctxMut.session.promptCustomMessage = promptCustomMessage;
+		ctxMut.session.sessionId = "test-session";
+		ctxMut.session.enqueueCustomMessageDisplay = vi.fn(() => "tag");
 
 		harness.editor.setText("/skill:demo args");
 		const controller = new InputController(harness.ctx);
