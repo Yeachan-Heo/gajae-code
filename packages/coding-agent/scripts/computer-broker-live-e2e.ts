@@ -55,6 +55,13 @@ interface SignedReceipt {
 	signature: { algorithm: "ed25519"; keyId: string; value: string };
 }
 
+export interface HostProcessIdentity {
+	host: Host;
+	pid: number;
+	executableSha256: string;
+	startTokenSha256: string;
+}
+
 export interface RestartProof {
 	schemaVersion: 1;
 	kind: "screen-recording-restart-request";
@@ -63,6 +70,7 @@ export interface RestartProof {
 	cell: Gate0Receipt["cell"];
 	artifact: { identity: "packages/coding-agent/dist/gjc"; sourceRevision: string; sha256: string };
 	codesign: CodeSignSummary;
+	hostProcess: HostProcessIdentity;
 	requestedAt: string;
 	request: { attempted: true; code: "permission_pending" | "ok" };
 }
@@ -426,6 +434,101 @@ export async function runBoundedCommand(
 	);
 	return settled.promise;
 }
+
+const HOST_PROCESS_ANCESTRY_LIMIT = 32;
+const HOST_PROCESS_TIMEOUT_MS = 1_000;
+
+export interface HostProcessDependencies {
+	execute?: CommandRunner;
+	ppid?: number;
+}
+
+function hostExecutableMatches(host: Host, executable: string): boolean {
+	const normalized = executable.toLowerCase();
+	if (host === "terminal") return normalized === "terminal.app" || normalized.includes("/terminal.app/");
+	if (host === "ghostty")
+		return normalized === "ghostty" || normalized.endsWith("/ghostty") || normalized.includes("/ghostty.app/");
+	return normalized === "cmux" || normalized.endsWith("/cmux") || normalized.includes("/cmux.app/");
+}
+
+function psField(value: string, maximumLength: number): string | null {
+	const trimmed = value.trim();
+	return trimmed && trimmed.length <= maximumLength && !/[\r\n]/.test(trimmed) ? trimmed : null;
+}
+
+export async function captureHostProcess(
+	host: Host,
+	dependencies: HostProcessDependencies = {},
+): Promise<HostProcessIdentity> {
+	const execute = dependencies.execute ?? runBoundedCommand;
+	let pid = dependencies.ppid ?? process.ppid;
+	const visited = new Set<number>();
+	const deadline = Date.now() + HOST_PROCESS_TIMEOUT_MS;
+	for (let depth = 0; depth < HOST_PROCESS_ANCESTRY_LIMIT; depth++) {
+		if (!Number.isSafeInteger(pid) || pid <= 0 || visited.has(pid)) break;
+		visited.add(pid);
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) fail("terminal host process ancestry is unavailable");
+		const [ppidResult, executableResult, startResult] = await Promise.all([
+			execute(["/bin/ps", "-o", "ppid=", "-p", String(pid)], undefined, remaining),
+			execute(["/bin/ps", "-o", "comm=", "-p", String(pid)], undefined, remaining),
+			execute(["/bin/ps", "-o", "lstart=", "-p", String(pid)], undefined, remaining),
+		]);
+		const ppidText = !ppidResult.timedOut && ppidResult.exitCode === 0 ? psField(ppidResult.stdout, 16) : null;
+		const executable =
+			!executableResult.timedOut && executableResult.exitCode === 0 ? psField(executableResult.stdout, 1_024) : null;
+		const startToken = !startResult.timedOut && startResult.exitCode === 0 ? psField(startResult.stdout, 128) : null;
+		const ppid = ppidText && /^\d+$/.test(ppidText) ? Number(ppidText) : NaN;
+		if (!Number.isSafeInteger(ppid) || ppid < 0 || !executable || !startToken)
+			fail("terminal host process ancestry is unavailable");
+		const record = { ppid, executable, startToken };
+		if (hostExecutableMatches(host, record.executable)) {
+			return {
+				host,
+				pid,
+				executableSha256: createHash("sha256").update(record.executable).digest("hex"),
+				startTokenSha256: createHash("sha256").update(record.startToken).digest("hex"),
+			};
+		}
+		pid = record.ppid;
+	}
+	fail("declared terminal host is not a direct process ancestor");
+}
+
+function sameHostProcess(left: HostProcessIdentity, right: HostProcessIdentity): boolean {
+	return (
+		left.host === right.host &&
+		left.pid === right.pid &&
+		left.executableSha256 === right.executableSha256 &&
+		left.startTokenSha256 === right.startTokenSha256
+	);
+}
+
+export function requireStableHostProcess(
+	before: HostProcessIdentity,
+	after: HostProcessIdentity,
+	phase: "restart request" | "post-restart continuity",
+): void {
+	if (!sameHostProcess(before, after)) fail(`terminal host process changed during ${phase}`);
+}
+
+export function requireRestartedHostProcess(proof: HostProcessIdentity, current: HostProcessIdentity): void {
+	if (proof.host !== current.host || proof.executableSha256 !== current.executableSha256)
+		fail("restart proof does not match the current terminal host executable");
+	if (proof.pid === current.pid && proof.startTokenSha256 === current.startTokenSha256)
+		fail("restart proof does not prove a terminal host process restart");
+}
+
+export function requireRestartProofContinuity(proof: RestartProof, continuity: RunCellContinuityResult): void {
+	if (
+		continuity.sourceRevision !== proof.artifact.sourceRevision ||
+		continuity.baseline.sha256 !== proof.artifact.sha256 ||
+		!continuity.baselineCodesign.verified ||
+		continuity.baselineCodesign.signing !== proof.codesign.signing ||
+		continuity.baselineCodesign.verified !== proof.codesign.verified
+	)
+		fail("restart proof does not match the executed baseline continuity");
+}
 export async function codesignSummary(
 	artifact: string,
 	execute: CommandRunner = runBoundedCommand,
@@ -691,6 +794,7 @@ export function validRestartProof(value: unknown): value is RestartProof {
 			"codesign",
 			"collectionId",
 			"gate",
+			"hostProcess",
 			"kind",
 			"request",
 			"requestedAt",
@@ -698,7 +802,8 @@ export function validRestartProof(value: unknown): value is RestartProof {
 		])
 	)
 		return false;
-	const { artifact, cell, codesign, request } = value;
+	const { artifact, cell, codesign, hostProcess, request } = value;
+
 	return (
 		value.schemaVersion === 1 &&
 		value.kind === "screen-recording-restart-request" &&
@@ -719,6 +824,8 @@ export function validRestartProof(value: unknown): value is RestartProof {
 		typeof artifact.sha256 === "string" &&
 		/^[a-f0-9]{64}$/.test(artifact.sha256) &&
 		validCodeSign(codesign) &&
+		validHostProcess(hostProcess) &&
+		hostProcess.host === cell.host &&
 		typeof value.requestedAt === "string" &&
 		!Number.isNaN(Date.parse(value.requestedAt)) &&
 		isRecord(request) &&
@@ -845,6 +952,8 @@ async function requestCell(args: string[]): Promise<void> {
 			fail("release artifact must have a verified ad-hoc signature");
 		const existing = await loadRestartProof(root, collection, cell);
 		if (existing) fail("restart proof already exists for this cell");
+		const requestHost = await captureHostProcess(cell.host);
+
 		const result = experimentResult(await invokeExperiment(artifact.path, { operation: "probe", request: true }));
 		const requestCode = restartRequestCode(result);
 		const currentArtifact = await releaseArtifact(artifact.path);
@@ -859,6 +968,9 @@ async function requestCell(args: string[]): Promise<void> {
 			currentCodesign.verified !== codesign.verified
 		)
 			fail("artifact, source, or codesign state changed during restart request collection");
+		const postRequestHost = await captureHostProcess(cell.host);
+		requireStableHostProcess(requestHost, postRequestHost, "restart request");
+
 		const proof: RestartProof = {
 			schemaVersion: 1,
 			kind: "screen-recording-restart-request",
@@ -867,6 +979,8 @@ async function requestCell(args: string[]): Promise<void> {
 			cell,
 			artifact: { identity: "packages/coding-agent/dist/gjc", sourceRevision, sha256: artifact.sha256 },
 			codesign,
+			hostProcess: requestHost,
+
 			requestedAt: new Date().toISOString(),
 			request: { attempted: true, code: requestCode },
 		};
@@ -888,7 +1002,11 @@ async function runCell(args: string[]): Promise<void> {
 		const startedAt = new Date().toISOString(),
 			artifact = await releaseArtifact(requireFlag(args, "artifact"));
 		const proof = await loadRestartProof(root, collection, cell);
+		let restartHost: HostProcessIdentity | null = null;
 		if (proof) {
+			restartHost = await captureHostProcess(cell.host);
+			requireRestartedHostProcess(proof.hostProcess, restartHost);
+
 			const sourceRevision = await readSourceRevision();
 			const codesign = await codesignSummary(artifact.path);
 			if (
@@ -901,6 +1019,7 @@ async function runCell(args: string[]): Promise<void> {
 				fail("restart proof does not match the current artifact, source, or codesign state");
 		}
 		const continuity = await runCellContinuity(artifact, cell.topology, {}, !proof);
+		if (proof) requireRestartProofContinuity(proof, continuity);
 		if (!proof && !continuity.baselinePair.probe.requestAttempted)
 			fail("baseline did not exercise the explicit Screen Recording request");
 		const receipt: Gate0Receipt = {
@@ -926,6 +1045,10 @@ async function runCell(args: string[]): Promise<void> {
 			lifecycle: { markers: continuity.updatedPair.lifecycle.lifecycle },
 			result: { success: true, code: "ok" },
 		};
+		if (proof && restartHost) {
+			requireStableHostProcess(restartHost, await captureHostProcess(cell.host), "post-restart continuity");
+		}
+
 		await persistReceiptAndConsumeProof(root, receipt, proof);
 		process.stdout.write(`${canonicalJson({ gate: 0, cell, result: receipt.result } as JsonValue)}\n`);
 	} finally {
@@ -939,6 +1062,21 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 	const actual = Object.keys(value).sort();
 	return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
 }
+function validHostProcess(value: unknown): value is HostProcessIdentity {
+	return (
+		isRecord(value) &&
+		hasExactKeys(value, ["executableSha256", "host", "pid", "startTokenSha256"]) &&
+		HOST_VALUES.has(value.host as Host) &&
+		typeof value.pid === "number" &&
+		Number.isSafeInteger(value.pid) &&
+		value.pid > 0 &&
+		typeof value.executableSha256 === "string" &&
+		/^[a-f0-9]{64}$/.test(value.executableSha256) &&
+		typeof value.startTokenSha256 === "string" &&
+		/^[a-f0-9]{64}$/.test(value.startTokenSha256)
+	);
+}
+
 function validCodeSign(value: unknown): value is CodeSignSummary {
 	return (
 		isRecord(value) &&
