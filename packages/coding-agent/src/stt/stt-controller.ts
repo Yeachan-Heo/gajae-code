@@ -6,6 +6,11 @@ import { collectRepoVocabulary } from "./vocabulary";
 
 export type SttState = "idle" | "recording" | "transcribing";
 
+/** All-zero input for this long while recording triggers the dead-mic hint. */
+const SILENT_INPUT_HINT_AFTER_MS = 3_000;
+export const SILENT_INPUT_HINT =
+	"No microphone signal — your terminal may lack microphone permission (System Settings → Privacy & Security → Microphone).";
+
 interface ToggleOptions {
 	showWarning(msg: string): void;
 	showStatus(msg: string): void;
@@ -30,6 +35,9 @@ export class STTController {
 	#disposed = false;
 	/** Guards late async events after cancel/dispose. */
 	#generation = 0;
+	#listeningStartedAt = 0;
+	#sawInputSignal = false;
+	#silentHintShown = false;
 
 	get state(): SttState {
 		return this.#state;
@@ -108,6 +116,15 @@ export class STTController {
 				},
 				onLevel: level => {
 					if (generation === this.#generation && this.#state === "recording") {
+						if (level > 0) this.#sawInputSignal = true;
+						else if (
+							!this.#sawInputSignal &&
+							!this.#silentHintShown &&
+							Date.now() - this.#listeningStartedAt >= SILENT_INPUT_HINT_AFTER_MS
+						) {
+							this.#silentHintShown = true;
+							options.showStatus(SILENT_INPUT_HINT);
+						}
 						options.onLevel?.(level);
 					}
 				},
@@ -124,6 +141,9 @@ export class STTController {
 				return;
 			}
 			this.#session = session;
+			this.#listeningStartedAt = Date.now();
+			this.#sawInputSignal = false;
+			this.#silentHintShown = false;
 			this.#setState("recording", options);
 			logger.debug("STT listening", { backend: backend.id });
 		} catch (err) {
