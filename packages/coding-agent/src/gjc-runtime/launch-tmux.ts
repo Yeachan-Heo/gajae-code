@@ -43,6 +43,7 @@ import {
 	replaceOwnerGenerationSync,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
+import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
 	findGjcTmuxSessionByName,
 	findGjcTmuxSessionByScope,
@@ -1108,11 +1109,7 @@ function defaultOwnerIsolationProbe(
 		let startTime: string | undefined;
 		let cgroupText: string | null = null;
 		try {
-			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-			startTime = stat
-				.slice(stat.lastIndexOf(")") + 2)
-				.trim()
-				.split(/\s+/)[19];
+			startTime = readLinuxProcStartTimeSync(pid) ?? undefined;
 			cgroupText = fs.readFileSync(`/proc/${pid}/cgroup`, "utf8");
 		} catch {}
 		if (!startTime) return { state: "unverifiable" };

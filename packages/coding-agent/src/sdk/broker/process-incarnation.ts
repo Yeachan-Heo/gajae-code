@@ -1,6 +1,6 @@
 import { dlopen, ptr } from "bun:ffi";
-import * as fs from "node:fs";
 import { Process } from "@gajae-code/natives";
+import { readLinuxProcStartTimeSync } from "../../gjc-runtime/linux-proc";
 
 const DARWIN_PROC_PIDTBSDINFO = 3;
 const DARWIN_PROC_BSDINFO_SIZE = 136;
@@ -116,17 +116,8 @@ export function processIncarnation(pid: number, options: ProcessIncarnationOptio
 		}
 	}
 	if (platform === "linux") {
-		try {
-			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-			const close = stat.lastIndexOf(")");
-			const startTicks = stat
-				.slice(close + 2)
-				.trim()
-				.split(/\s+/)[19];
-			return startTicks ? `linux:${startTicks}` : undefined;
-		} catch {
-			return undefined;
-		}
+		const startTicks = readLinuxProcStartTimeSync(pid);
+		return startTicks ? `linux:${startTicks}` : undefined;
 	}
 	if (platform === "darwin") {
 		const info = new Uint8Array(DARWIN_PROC_BSDINFO_SIZE);

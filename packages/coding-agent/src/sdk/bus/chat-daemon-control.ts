@@ -13,6 +13,7 @@ import type {
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
+import { readLinuxProcStartTimeSync } from "../../gjc-runtime/linux-proc";
 
 export type ChatDaemonKind = "discord" | "slack";
 export type ChatDaemonAction = "stop" | "reload";
@@ -124,17 +125,8 @@ function defaultSignal(pid: number, signal: NodeJS.Signals): void {
 function defaultPidIncarnation(pid: number): string | undefined {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
 	if (process.platform === "linux") {
-		try {
-			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-			return `linux:${
-				stat
-					.slice(stat.lastIndexOf(")") + 2)
-					.trim()
-					.split(/\s+/)[19]
-			}`;
-		} catch {
-			return undefined;
-		}
+		const startTicks = readLinuxProcStartTimeSync(pid);
+		return startTicks ? `linux:${startTicks}` : undefined;
 	}
 	if (process.platform === "darwin") {
 		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });

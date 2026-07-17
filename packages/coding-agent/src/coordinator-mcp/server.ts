@@ -27,6 +27,7 @@ import {
 	requireCoordinatorMutation,
 } from "./policy";
 import { createSessionReaper, type ReapableSession, type SessionReaper } from "./session-reaper";
+import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
 
 export type { CoordinatorToolName };
 export { COORDINATOR_MCP_PROTOCOL_VERSION, COORDINATOR_MCP_SERVER_NAME, COORDINATOR_MCP_TOOL_NAMES };
@@ -1290,17 +1291,7 @@ interface SessionStateLockOwner {
 }
 
 function processStartTime(pid: number): string | null {
-	try {
-		const stat = nodeFs.readFileSync(`/proc/${pid}/stat`, "utf8");
-		const close = stat.lastIndexOf(")");
-		const fields = stat
-			.slice(close + 1)
-			.trim()
-			.split(/\s+/);
-		return fields[19] ?? null;
-	} catch {
-		return null;
-	}
+	return readLinuxProcStartTimeSync(pid);
 }
 
 function validLockOwner(value: unknown): value is SessionStateLockOwner {

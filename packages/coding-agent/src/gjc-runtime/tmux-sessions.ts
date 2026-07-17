@@ -49,6 +49,7 @@ import {
 	type TmuxOwnerIsolationExecutionResult,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
+import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import { buildWindowsPowerShellInnerCommand } from "./windows-powershell-command";
 
 export interface GjcTmuxSessionStatus {
@@ -420,11 +421,7 @@ export function createGjcTmuxSession(
 		const pid = Number(result.stdout.toString().trim());
 		if (!Number.isSafeInteger(pid) || pid <= 0) return { state: "unverifiable" };
 		try {
-			const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
-			const startTime = stat
-				.slice(stat.lastIndexOf(")") + 2)
-				.trim()
-				.split(/\s+/)[19];
+			const startTime = readLinuxProcStartTimeSync(pid);
 			if (!startTime) return { state: "unverifiable" };
 			const cgroup = classifyCgroup({
 				platform,
@@ -750,11 +747,7 @@ function requireSafeTmuxServerForMutation(
 	const pid = Number(result.stdout.toString().trim());
 	if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("gjc_tmux_owner_isolation_server_unverifiable");
 	try {
-		const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
-		const startTime = stat
-			.slice(stat.lastIndexOf(")") + 2)
-			.trim()
-			.split(/\s+/)[19];
+		const startTime = readLinuxProcStartTimeSync(pid);
 		const cgroup = classifyCgroup({
 			platform: process.platform,
 			cgroupText: fsSync.readFileSync(`/proc/${pid}/cgroup`, "utf8"),
@@ -967,17 +960,7 @@ export function removeGjcTmuxSession(
 }
 
 async function readProcessStartTime(pid: number): Promise<string | null> {
-	try {
-		const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
-		const close = stat.lastIndexOf(")");
-		const fields = stat
-			.slice(close + 2)
-			.trim()
-			.split(/\s+/);
-		return fields[19] ?? null;
-	} catch {
-		return null;
-	}
+	return readLinuxProcStartTime(pid);
 }
 
 async function readCurrentGeneration(stateDir: string, sessionId: string): Promise<string | null> {

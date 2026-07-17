@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { readLinuxProcStartTimeSync } from "../../gjc-runtime/linux-proc";
 
 export const CONVERSATION_STORE_VERSION = 1;
 export const MAX_DEDUPE_IDS = 128;
@@ -359,17 +359,8 @@ function defaultPidAlive(pid: number): boolean {
 function defaultPidIncarnation(pid: number): string | undefined {
 	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
 	if (process.platform === "linux") {
-		try {
-			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-			return `linux:${
-				stat
-					.slice(stat.lastIndexOf(")") + 2)
-					.trim()
-					.split(/\s+/)[19]
-			}`;
-		} catch {
-			return undefined;
-		}
+		const startTicks = readLinuxProcStartTimeSync(pid);
+		return startTicks ? `linux:${startTicks}` : undefined;
 	}
 	if (process.platform === "darwin") {
 		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });

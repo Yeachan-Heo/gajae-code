@@ -35,6 +35,7 @@ import {
 	replaceOwnerGeneration,
 	type TmuxServerProof,
 } from "../../gjc-runtime/tmux-owner-isolation";
+import { readLinuxProcStartTime } from "../../gjc-runtime/linux-proc";
 import {
 	findGjcTmuxSessionByName,
 	forceCloseGjcTmuxSession,
@@ -373,15 +374,11 @@ function lifecycleOwnerIsolationProbe(tmux: string, env: NodeJS.ProcessEnv): Own
 					cgroup: { classification: "not_applicable" },
 					sessionNames,
 				};
-			const [cgroupText, stat] = await Promise.all([
+			const [cgroupText, startTime] = await Promise.all([
 				fsPromises.readFile(`/proc/${pid}/cgroup`, "utf8").catch(() => null),
-				fsPromises.readFile(`/proc/${pid}/stat`, "utf8").catch(() => null),
+				readLinuxProcStartTime(pid),
 			]);
 			const cgroup = classifyCgroup({ platform: process.platform, cgroupText });
-			const startTime = stat
-				?.slice(stat.lastIndexOf(")") + 2)
-				.trim()
-				.split(/\s+/)[19];
 			if (!startTime) return { state: "unverifiable", pid, cgroup, sessionNames };
 			return {
 				state:

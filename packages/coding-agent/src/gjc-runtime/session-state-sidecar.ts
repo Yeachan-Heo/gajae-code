@@ -14,6 +14,7 @@ import {
 	observeOwnerTerminal,
 	type TerminalSignal,
 } from "./tmux-owner-isolation";
+import { readLinuxProcStartTimeSync } from "./linux-proc";
 
 /** Managed tmux owner provenance propagated only to the launched child process. */
 export const GJC_TMUX_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
@@ -741,17 +742,7 @@ interface StateFileLockOwner {
 }
 
 function processStartTime(pid: number): string | null {
-	try {
-		const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
-		const close = stat.lastIndexOf(")");
-		const fields = stat
-			.slice(close + 1)
-			.trim()
-			.split(/\s+/);
-		return fields[19] ?? null;
-	} catch {
-		return null;
-	}
+	return readLinuxProcStartTimeSync(pid);
 }
 
 function validLockOwner(value: unknown): value is StateFileLockOwner {

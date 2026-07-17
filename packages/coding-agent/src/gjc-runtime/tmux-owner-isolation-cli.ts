@@ -16,6 +16,7 @@ import {
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
+import { readLinuxProcStartTime } from "./linux-proc";
 
 /** Matches the sole argv shape allowed to enter the owner-isolation JSON-line protocol. */
 export function isTmuxOwnerIsolationCliArgv(argv: readonly string[]): boolean {
@@ -31,17 +32,7 @@ async function readCgroup(pid = "self"): Promise<string | null> {
 }
 
 async function readProcessStartTime(pid: number): Promise<string | null> {
-	try {
-		const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
-		return (
-			stat
-				.slice(stat.lastIndexOf(")") + 2)
-				.trim()
-				.split(/\s+/)[19] ?? null
-		);
-	} catch {
-		return null;
-	}
+	return readLinuxProcStartTime(pid);
 }
 
 function isKnownNoServerDiagnostic(stderr: string): boolean {
