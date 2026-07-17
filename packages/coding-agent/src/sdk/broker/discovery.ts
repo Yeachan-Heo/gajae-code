@@ -33,7 +33,19 @@ export function isPidAlive(pid: number): boolean {
 	}
 }
 async function syncFile(file: string): Promise<void> {
-	const handle = await fs.open(file, "r");
+	// Windows FlushFileBuffers requires a writable handle (a read-only open
+	// fails the flush with EPERM) and cannot flush directory handles at all.
+	// Open writable there and treat unsyncable targets (directories) as a
+	// best-effort no-op: the rename-based publish stays atomic for readers
+	// even where the durability barrier is unavailable.
+	const win32 = process.platform === "win32";
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(file, win32 ? "r+" : "r");
+	} catch (error) {
+		if (win32) return;
+		throw error;
+	}
 	try {
 		await handle.sync();
 	} finally {

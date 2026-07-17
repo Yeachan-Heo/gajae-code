@@ -1,4 +1,4 @@
-import { spawn as childProcessSpawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -12,6 +12,7 @@ import type {
 	DaemonStatus,
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
+import { spawnDetachedChild } from "../../utils/detached-spawn";
 import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
 
 export type ChatDaemonKind = "discord" | "slack";
@@ -495,7 +496,9 @@ export class ChatDaemonController implements BuiltInDaemonController {
 			agentDir: this.settings.getAgentDir(),
 			execPath: this.deps.execPath,
 		});
-		(this.deps.spawn ?? ((command, args, opts) => childProcessSpawn(command, args, opts)))(command, args, {
+		// spawnDetachedChild keeps the detached chat daemon console-less on Windows
+		// (Bun's node:child_process ignores windowsHide for detached children).
+		(this.deps.spawn ?? ((cmd, cmdArgs) => spawnDetachedChild(cmd, cmdArgs)))(command, args, {
 			detached: true,
 			stdio: "ignore",
 		}).unref?.();

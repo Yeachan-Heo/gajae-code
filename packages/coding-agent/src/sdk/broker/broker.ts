@@ -311,22 +311,27 @@ export class Broker {
 			return this.#lockSnapshot(await fs.readFile(this.#lockRecordPath(), "utf8"));
 		} catch (e) {
 			const code = (e as NodeJS.ErrnoException).code;
-			if (code === "ENOTDIR") {
-				try {
-					return this.#lockSnapshot(await fs.readFile(this.#lock, "utf8"));
-				} catch (legacyError) {
-					if ((legacyError as NodeJS.ErrnoException).code === "ENOENT") return null;
-					throw legacyError;
-				}
-			}
+			if (code === "ENOTDIR") return this.#readLegacyLock();
+			// Windows reports ENOENT (not ENOTDIR) when the lock path itself is a
+			// legacy regular file, so ENOENT falls through to the stat probe below
+			// instead of concluding the lock is absent.
 			if (code !== "ENOENT") throw e;
 		}
 		try {
 			const lock = await fs.stat(this.#lock);
-			return lock.isDirectory() ? { pid: 0, identity: `directory:${lock.dev}:${lock.ino}` } : null;
+			if (lock.isDirectory()) return { pid: 0, identity: `directory:${lock.dev}:${lock.ino}` };
+			return this.#readLegacyLock();
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
 			throw e;
+		}
+	}
+	async #readLegacyLock(): Promise<BrokerLockSnapshot | null> {
+		try {
+			return this.#lockSnapshot(await fs.readFile(this.#lock, "utf8"));
+		} catch (legacyError) {
+			if ((legacyError as NodeJS.ErrnoException).code === "ENOENT") return null;
+			throw legacyError;
 		}
 	}
 	async #createLock(): Promise<void> {

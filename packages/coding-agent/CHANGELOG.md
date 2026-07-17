@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: detached SDK broker, session-host, and chat/Telegram daemon spawns now route through a `Bun.spawn`-backed console-less facade (Bun's `node:child_process` ignores `windowsHide` for detached children, flashing a console window per spawn). Discovery/store fsync opens writable handles and treats unsupported directory flushes as best-effort instead of failing broker startup with `EPERM`, and legacy regular-file broker locks that Windows reports as `ENOENT` are recovered.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed
