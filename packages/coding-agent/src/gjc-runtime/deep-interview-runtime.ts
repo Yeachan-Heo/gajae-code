@@ -694,6 +694,11 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		threshold_source: resolved.thresholdSource,
 		state: {
 			initial_idea: resolved.idea,
+			fact_provenance: {
+				version: 1,
+				activated_at: now,
+				migration: "new",
+			},
 			rounds: [],
 			established_facts: [],
 			current_ambiguity: 1.0,

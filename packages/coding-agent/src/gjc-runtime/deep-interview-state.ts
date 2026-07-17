@@ -23,6 +23,26 @@ export type DeepInterviewTriggerKind = "A" | "B" | "C" | "D";
 /** `active` triggers must satisfy the bidirectional invariant; disputed/unresolved are exempt with rationale. */
 export type DeepInterviewTriggerStatus = "active" | "disputed" | "unresolved";
 
+export interface DeepInterviewFactProvenanceMeta {
+	version: 1;
+	activated_at: string;
+	migration: "new" | "legacy_migrated";
+}
+
+export type DeepInterviewFactSource =
+	| "user_confirmed"
+	| "repository_verified"
+	| "agent_assisted"
+	| "blocked"
+	| "legacy";
+
+export type DeepInterviewFactResolution =
+	| "unknown"
+	| "unresolved"
+	| "user_confirmed"
+	| "repository_verified"
+	| "superseded";
+
 export interface DeepInterviewEstablishedFact {
 	id: string;
 	statement: string;
@@ -30,6 +50,9 @@ export interface DeepInterviewEstablishedFact {
 	component?: string;
 	dimension?: string;
 	evidence?: string;
+	source?: DeepInterviewFactSource;
+	resolution?: DeepInterviewFactResolution;
+	provenance_error?: string;
 	disputed: boolean;
 	/**
 	 * Resolution pointer for a disputed fact: the id of the fact that replaced it
@@ -128,6 +151,72 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function isValidProvenanceMeta(value: unknown): value is DeepInterviewFactProvenanceMeta {
+	if (!isPlainObject(value)) return false;
+	return (
+		value.version === 1 &&
+		typeof value.activated_at === "string" &&
+		!Number.isNaN(Date.parse(value.activated_at)) &&
+		(value.migration === "new" || value.migration === "legacy_migrated")
+	);
+}
+
+function hasPostContractFact(value: unknown): boolean {
+	return (
+		Array.isArray(value) &&
+		value.some(
+			fact =>
+				isPlainObject(fact) &&
+				(Object.hasOwn(fact, "source") ||
+					Object.hasOwn(fact, "resolution") ||
+					Object.hasOwn(fact, "provenance_error")),
+		)
+	);
+}
+
+function normalizeFactProvenance(inner: Record<string, unknown>, originalMarker: unknown): void {
+	const facts = Array.isArray(inner.established_facts)
+		? inner.established_facts.filter(isPlainObject).map(fact => ({ ...fact }))
+		: [];
+	const validMarker = isValidProvenanceMeta(originalMarker);
+	const markerlessLegacy = originalMarker === undefined && !hasPostContractFact(facts);
+
+	if (validMarker) {
+		inner.fact_provenance = { ...originalMarker };
+	} else if (markerlessLegacy) {
+		inner.fact_provenance = {
+			version: 1,
+			activated_at: new Date(0).toISOString(),
+			migration: "legacy_migrated",
+		} satisfies DeepInterviewFactProvenanceMeta;
+	} else {
+		delete inner.fact_provenance;
+		inner.provenance_error =
+			originalMarker === undefined ? "post_contract_marker_missing" : "invalid_fact_provenance_marker";
+	}
+
+	const migration = isValidProvenanceMeta(inner.fact_provenance) ? inner.fact_provenance.migration : undefined;
+	inner.established_facts = facts.map(fact => {
+		if (migration === "legacy_migrated") {
+			return {
+				...fact,
+				source: fact.source ?? "legacy",
+				resolution: fact.resolution ?? (fact.superseded_by ? "superseded" : "unresolved"),
+			};
+		}
+		const source = fact.source;
+		const resolution = fact.resolution;
+		const terminal =
+			resolution === "user_confirmed" ||
+			resolution === "repository_verified" ||
+			(resolution === "superseded" && nonEmptyString(fact.superseded_by));
+		if (migration === "new" && (!source || !resolution || !terminal)) {
+			return { ...fact, provenance_error: "fact_provenance_unresolved" };
+		}
+		return fact;
+	});
+}
+
 /**
  * Interview transcript/scoring fields that are canonical under `state`. When a
  * legacy flattened envelope carries them at the top level they are hoisted into
@@ -199,7 +288,9 @@ const ENVELOPE_RESERVED_STATE_KEYS = [
  */
 export function normalizeDeepInterviewEnvelope(value: unknown): DeepInterviewStateEnvelope {
 	const envelope: DeepInterviewStateEnvelope = isPlainObject(value) ? { ...value } : {};
-	const inner: Record<string, unknown> = isPlainObject(envelope.state) ? { ...envelope.state } : {};
+	const originalInner = isPlainObject(envelope.state) ? envelope.state : {};
+	const originalMarker = originalInner.fact_provenance;
+	const inner: Record<string, unknown> = { ...originalInner };
 
 	for (const field of TRANSCRIPT_STATE_FIELDS) {
 		if (inner[field] === undefined && envelope[field] !== undefined) inner[field] = envelope[field];
@@ -214,6 +305,7 @@ export function normalizeDeepInterviewEnvelope(value: unknown): DeepInterviewSta
 
 	if (!Array.isArray(inner.rounds)) inner.rounds = [];
 	if (!Array.isArray(inner.established_facts)) inner.established_facts = [];
+	normalizeFactProvenance(inner, originalMarker);
 	envelope.state = inner;
 	return envelope;
 }
@@ -335,9 +427,17 @@ export function mergeDeepInterviewEnvelope(
 	const incomingHasEstablishedFacts =
 		Object.hasOwn(incomingNestedState, "established_facts") || Object.hasOwn(incomingEnvelope, "established_facts");
 	const normalizedIncoming = normalizeDeepInterviewEnvelope(incoming);
-	if (options.replace) return normalizedIncoming;
-
 	const normalizedExisting = normalizeDeepInterviewEnvelope(existing);
+	const existingStateBeforeReplace = isPlainObject(normalizedExisting.state) ? normalizedExisting.state : {};
+	if (options.replace) {
+		const replacementState = isPlainObject(normalizedIncoming.state) ? { ...normalizedIncoming.state } : {};
+		if (isValidProvenanceMeta(existingStateBeforeReplace.fact_provenance)) {
+			replacementState.fact_provenance = existingStateBeforeReplace.fact_provenance;
+			delete replacementState.provenance_error;
+		}
+		return normalizeDeepInterviewEnvelope({ ...normalizedIncoming, state: replacementState });
+	}
+
 	const merged: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(normalizedExisting)) {
 		if (key !== "state") merged[key] = value;
@@ -352,6 +452,7 @@ export function mergeDeepInterviewEnvelope(
 	const incomingState = isPlainObject(normalizedIncoming.state) ? normalizedIncoming.state : {};
 	const mergedState: Record<string, unknown> = { ...existingState };
 	for (const [key, value] of Object.entries(incomingState)) {
+		if (key === "fact_provenance" || key === "provenance_error") continue;
 		if (key === "rounds") continue;
 		if (key === "established_facts" && !incomingHasEstablishedFacts) continue;
 		if (value === null) delete mergedState[key];
@@ -362,5 +463,5 @@ export function mergeDeepInterviewEnvelope(
 		asRecordArray(incomingState.rounds),
 	);
 	merged.state = mergedState;
-	return merged as DeepInterviewStateEnvelope;
+	return normalizeDeepInterviewEnvelope(merged);
 }

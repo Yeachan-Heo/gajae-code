@@ -51,6 +51,44 @@ describe("deep-interview-state: normalizeDeepInterviewEnvelope", () => {
 		expect(inner(normalized).initial_idea).toBe("x");
 		expect(normalized.custom_unknown).toEqual({ keep: true });
 	});
+
+	it("migrates only genuinely markerless facts and blocks post-contract marker loss", () => {
+		const legacy = normalizeDeepInterviewEnvelope({
+			state: { established_facts: [{ id: "f1", statement: "legacy", round: 1, disputed: false }] },
+		});
+		expect(inner(legacy).fact_provenance).toEqual({
+			version: 1,
+			activated_at: "1970-01-01T00:00:00.000Z",
+			migration: "legacy_migrated",
+		});
+		expect(inner(legacy).established_facts).toEqual([
+			{
+				id: "f1",
+				statement: "legacy",
+				round: 1,
+				disputed: false,
+				source: "legacy",
+				resolution: "unresolved",
+			},
+		]);
+
+		const missing = normalizeDeepInterviewEnvelope({
+			state: {
+				established_facts: [
+					{
+						id: "f2",
+						statement: "post-contract",
+						round: 2,
+						disputed: false,
+						source: "user_confirmed",
+						resolution: "user_confirmed",
+					},
+				],
+			},
+		});
+		expect(inner(missing).fact_provenance).toBeUndefined();
+		expect(inner(missing).provenance_error).toBe("post_contract_marker_missing");
+	});
 });
 
 describe("deep-interview-state: mergeDeepInterviewRounds", () => {
@@ -121,13 +159,20 @@ describe("deep-interview-state: mergeDeepInterviewEnvelope", () => {
 			},
 		};
 
+		const expectedFacts = [
+			{
+				...facts[0],
+				source: "legacy",
+				resolution: "unresolved",
+			},
+		];
 		const nestedPartial = mergeDeepInterviewEnvelope(existing, { state: { current_ambiguity: 0.3 } });
-		expect(inner(nestedPartial).established_facts).toEqual(facts);
+		expect(inner(nestedPartial).established_facts).toEqual(expectedFacts);
 		expect(inner(nestedPartial).current_ambiguity).toBe(0.3);
 		expect(inner(nestedPartial).rounds).toHaveLength(1);
 
 		const topLevelPartial = mergeDeepInterviewEnvelope(existing, { current_phase: "handoff" });
-		expect(inner(topLevelPartial).established_facts).toEqual(facts);
+		expect(inner(topLevelPartial).established_facts).toEqual(expectedFacts);
 		expect(topLevelPartial.current_phase).toBe("handoff");
 	});
 
@@ -151,6 +196,34 @@ describe("deep-interview-state: mergeDeepInterviewEnvelope", () => {
 		);
 		expect(inner(merged).rounds).toEqual([]);
 		expect(merged.active).toBe(false);
+	});
+	it("does not allow merge or replace writes to downgrade a trusted new marker", () => {
+		const existing = {
+			state: {
+				fact_provenance: {
+					version: 1,
+					activated_at: "2026-07-17T00:00:00.000Z",
+					migration: "new",
+				},
+				rounds: [],
+				established_facts: [],
+			},
+		};
+		const forged = {
+			state: {
+				fact_provenance: {
+					version: 1,
+					activated_at: "1970-01-01T00:00:00.000Z",
+					migration: "legacy_migrated",
+				},
+			},
+		};
+		expect(inner(mergeDeepInterviewEnvelope(existing, forged)).fact_provenance).toEqual(
+			inner(existing).fact_provenance,
+		);
+		expect(inner(mergeDeepInterviewEnvelope(existing, forged, { replace: true })).fact_provenance).toEqual(
+			inner(existing).fact_provenance,
+		);
 	});
 });
 
