@@ -210,6 +210,17 @@ describe("SDK query pagination", () => {
 		await store.close();
 	});
 
+	it("settles in-progress spill writes before terminal cleanup", async () => {
+		for (let index = 0; index < 3; index++) {
+			const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-close-race-"));
+			const store = new RevisionStore(`close-race-${index}`, Date.now, { storageDir: stateRoot });
+			const write = store.createRevision("large", "id", { body: "x".repeat(8 * 1024 * 1024) });
+			const close = store.close();
+			await expect(write).resolves.toBe("1");
+			await expect(close).resolves.toBeUndefined();
+		}
+	});
+
 	it("splits large CJK and emoji snapshots at UTF-8 boundaries", async () => {
 		const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
 		const snapshotDir = join(stateRoot, "sdk", "snapshots", "s1");

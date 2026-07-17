@@ -284,6 +284,10 @@ export class RevisionStore {
 	#peakBufferedBytes = 0;
 	#peakReadBufferedBytes = 0;
 	readonly #onReadRange?: (start: number, end: number) => void;
+	#closing = false;
+	#closePromise: Promise<void> | undefined;
+	#writesInFlight = 0;
+	#writesDrained: PromiseWithResolvers<void> | undefined;
 
 	constructor(
 		readonly sessionId: string,
@@ -295,40 +299,47 @@ export class RevisionStore {
 	}
 
 	async createRevision(resourceKind: string, resourceId: string, payload: unknown): Promise<string> {
-		if (payload === undefined) throw new RevisionStoreError("resource_gone", "snapshot payload is unavailable");
-		const serialised = await this.#serialise(payload);
-		const key = `${resourceKind}:${resourceId}`;
-		const revisions = this.#resources.get(key) ?? [];
-		const previous = revisions.length === 0 ? undefined : revisions[revisions.length - 1];
-		if (previous?.hash === serialised.hash) {
-			await this.#discardUnreferenced(serialised.chunks, serialised.manifest);
-			return previous.id;
+		if (this.#closing) throw new RevisionStoreError("resource_gone", "snapshot store is closing");
+		this.#writesInFlight++;
+		try {
+			if (payload === undefined) throw new RevisionStoreError("resource_gone", "snapshot payload is unavailable");
+			const serialised = await this.#serialise(payload);
+			const key = `${resourceKind}:${resourceId}`;
+			const revisions = this.#resources.get(key) ?? [];
+			const previous = revisions.length === 0 ? undefined : revisions[revisions.length - 1];
+			if (previous?.hash === serialised.hash) {
+				await this.#discardUnreferenced(serialised.chunks, serialised.manifest);
+				return previous.id;
+			}
+			const revision: Revision = {
+				id: String(previous ? Number(previous.id) + 1 : 1),
+				hash: serialised.hash,
+				bytes: serialised.bytes,
+				payload: serialised.payload,
+				manifest: serialised.manifest,
+				chunks: serialised.chunks,
+				chunkLengths: serialised.chunkLengths,
+				index: serialised.index,
+				pins: new Set(),
+				lastAccessed: this.now(),
+				createdAt: this.now(),
+			};
+			revisions.push(revision);
+			this.#resources.set(key, revisions);
+			this.#retainSpill(revision);
+			if (revision.payload) this.#memoryBytes += revision.bytes;
+			await this.#enforceMemory();
+			while (revisions.length > MAX_REVISIONS_PER_RESOURCE) {
+				const candidate = revisions.find(item => item.pins.size === 0);
+				if (!candidate) break;
+				revisions.splice(revisions.indexOf(candidate), 1);
+				this.#drop(candidate);
+			}
+			return revision.id;
+		} finally {
+			this.#writesInFlight--;
+			if (this.#writesInFlight === 0) this.#writesDrained?.resolve();
 		}
-		const revision: Revision = {
-			id: String(previous ? Number(previous.id) + 1 : 1),
-			hash: serialised.hash,
-			bytes: serialised.bytes,
-			payload: serialised.payload,
-			manifest: serialised.manifest,
-			chunks: serialised.chunks,
-			chunkLengths: serialised.chunkLengths,
-			index: serialised.index,
-			pins: new Set(),
-			lastAccessed: this.now(),
-			createdAt: this.now(),
-		};
-		revisions.push(revision);
-		this.#resources.set(key, revisions);
-		this.#retainSpill(revision);
-		if (revision.payload) this.#memoryBytes += revision.bytes;
-		await this.#enforceMemory();
-		while (revisions.length > MAX_REVISIONS_PER_RESOURCE) {
-			const candidate = revisions.find(item => item.pins.size === 0);
-			if (!candidate) break;
-			revisions.splice(revisions.indexOf(candidate), 1);
-			this.#drop(candidate);
-		}
-		return revision.id;
 	}
 
 	async readRevision(resourceKind: string, resourceId: string, id: string): Promise<unknown> {
@@ -489,12 +500,21 @@ export class RevisionStore {
 	}
 
 	async close(): Promise<void> {
-		this.#resources.clear();
-		this.#pinIndex.clear();
-		this.#memoryBytes = 0;
-		this.#chunkRefs.clear();
-		this.#manifestRefs.clear();
-		if (this.#directory) await rm(this.#directory, { recursive: true, force: true });
+		if (this.#closePromise) return this.#closePromise;
+		this.#closing = true;
+		this.#closePromise = (async () => {
+			if (this.#writesInFlight > 0) {
+				this.#writesDrained ??= Promise.withResolvers<void>();
+				await this.#writesDrained.promise;
+			}
+			this.#resources.clear();
+			this.#pinIndex.clear();
+			this.#memoryBytes = 0;
+			this.#chunkRefs.clear();
+			this.#manifestRefs.clear();
+			if (this.#directory) await rm(this.#directory, { recursive: true, force: true });
+		})();
+		return this.#closePromise;
 	}
 
 	get pinnedCount(): number {
