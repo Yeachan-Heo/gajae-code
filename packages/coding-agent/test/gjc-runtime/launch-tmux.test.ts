@@ -3113,6 +3113,178 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
+	it("starts one macOS arm64 broker, preserves its lease, and injects its environment into the managed owner", () => {
+		const calls: string[][] = [];
+		const dispose = vi.fn();
+		const start = vi.fn(() => ({
+			environment: { GJC_COMPUTER_BROKER_SOCKET: "/tmp/broker.sock", GJC_COMPUTER_BROKER_TOKEN: "secret" },
+			dispose,
+		}));
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello"], tmux: true }),
+			rawArgs: ["--tmux", "hello"],
+			cwd: launchTestRoot,
+			env: {},
+			argv: ["bun", "cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			architecture: "arm64",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			computerBrokerStarter: start,
+			spawnSync: (_command, spawnArgs) => {
+				calls.push(spawnArgs);
+				return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+			},
+		});
+		expect(handled).toBe(true);
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(dispose).not.toHaveBeenCalled();
+		const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
+		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_SOCKET='/tmp/broker.sock'");
+		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_TOKEN='secret'");
+		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_REQUIRED='1'");
+	});
+
+	it("does not start the broker for existing attaches, unsupported platforms, unsupported architectures, or direct launch", () => {
+		const start = vi.fn(() => ({ environment: {}, dispose: vi.fn() }));
+		const base = {
+			parsed: args({ messages: ["hello"], tmux: true }),
+			rawArgs: ["--tmux", "hello"],
+			cwd: launchTestRoot,
+			argv: ["bun", "cli.ts"],
+			execPath: "/bin/bun",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			computerBrokerStarter: start,
+			spawnSync: () => ({ exitCode: 0, stdout: NATIVE_SESSION_ID }),
+		};
+		launchDefaultTmuxIfNeeded({
+			...base,
+			parsed: args({ messages: ["hello"], tmux: true, continue: true }),
+			rawArgs: ["--tmux", "--continue", "hello"],
+			env: {},
+			platform: "darwin",
+			architecture: "arm64",
+			existingBranchSessionName: "existing",
+		});
+		launchDefaultTmuxIfNeeded({
+			...base,
+			env: {},
+			platform: "linux",
+			architecture: "arm64",
+			existingBranchSessionName: null,
+		});
+		launchDefaultTmuxIfNeeded({
+			...base,
+			env: {},
+			platform: "darwin",
+			architecture: "x64",
+			existingBranchSessionName: null,
+		});
+		launchDefaultTmuxIfNeeded({
+			...base,
+			env: { GJC_LAUNCH_POLICY: "direct" },
+			platform: "darwin",
+			architecture: "arm64",
+			existingBranchSessionName: null,
+		});
+		expect(start).not.toHaveBeenCalled();
+	});
+
+	it("marks managed tmux computer use unavailable when the broker cannot start", () => {
+		const calls: string[][] = [];
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello"], tmux: true }),
+			rawArgs: ["--tmux", "hello"],
+			cwd: launchTestRoot,
+			env: {},
+			argv: ["bun", "cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			architecture: "arm64",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			computerBrokerStarter: () => null,
+			spawnSync: (_command, spawnArgs) => {
+				calls.push(spawnArgs);
+				return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+			},
+		});
+		expect(handled).toBe(true);
+		expect(calls.some(call => call[0] === "new-session")).toBe(true);
+		const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
+		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_REQUIRED='1'");
+		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_SOCKET");
+		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_TOKEN");
+	});
+
+	it("starts a fresh broker after an existing-session attach fails", () => {
+		const events: string[] = [];
+		const start = vi.fn(() => {
+			events.push("broker");
+			return {
+				environment: {
+					GJC_COMPUTER_BROKER_SOCKET: "/tmp/broker.sock",
+					GJC_COMPUTER_BROKER_TOKEN: "secret",
+				},
+				dispose: vi.fn(),
+			};
+		});
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello"], tmux: true, continue: true }),
+			rawArgs: ["--tmux", "--continue", "hello"],
+			cwd: launchTestRoot,
+			env: {},
+			argv: ["bun", "cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			architecture: "arm64",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: "existing",
+			computerBrokerStarter: start,
+			spawnSync: (_command, spawnArgs) => {
+				if (spawnArgs[0] === "attach-session") {
+					events.push("attach");
+					return { exitCode: 1, stderr: "missing existing session" };
+				}
+				if (spawnArgs[0] === "new-session") {
+					events.push("new-session");
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				}
+				return { exitCode: 0 };
+			},
+		});
+		expect(handled).toBe(true);
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(events.indexOf("attach")).toBeLessThan(events.indexOf("broker"));
+		expect(events.indexOf("broker")).toBeLessThan(events.indexOf("new-session"));
+	});
+
+	it("disposes a macOS broker when tmux creation fails before preserving an inner process", () => {
+		const dispose = vi.fn();
+		const handled = launchDefaultTmuxIfNeeded({
+			parsed: args({ messages: ["hello"], tmux: true }),
+			rawArgs: ["--tmux", "hello"],
+			cwd: launchTestRoot,
+			env: {},
+			argv: ["bun", "cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			architecture: "arm64",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			existingBranchSessionName: null,
+			computerBrokerStarter: () => ({ environment: { GJC_COMPUTER_BROKER_TOKEN: "secret" }, dispose }),
+			spawnSync: () => ({ exitCode: 1, stderr: "creation refused" }),
+		});
+		expect(handled).toBe(true);
+		expect(dispose).toHaveBeenCalledTimes(1);
+	});
+
 	it("persists a fail-closed portable owner terminal verdict on Darwin", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-darwin-owner-finalization-"));
 		const previousPlatform = Object.getOwnPropertyDescriptor(process, "platform");

@@ -8,6 +8,7 @@ import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
+import { COMPUTER_BROKER_CLI_FLAG, runComputerBrokerServerFromEnvironment } from "./gjc-runtime/computer-broker";
 import {
 	gate0InternalErrorResult,
 	runComputerBrokerGate0,
@@ -304,6 +305,7 @@ export function routeRootArgv(argv: readonly string[]): string[] {
 
 export interface RunCliDependencies {
 	reexecWithScrubbedMallocEnv?: () => Promise<number | null>;
+	runComputerBrokerFromEnvironment?: typeof runComputerBrokerServerFromEnvironment;
 	runGate0FromEnvironment?: typeof runComputerBrokerGate0FromEnvironment;
 	writeGate0Output?: (value: string) => void;
 }
@@ -338,6 +340,10 @@ export async function runCli(argv: string[], dependencies: RunCliDependencies = 
 			process.exitCode = 1;
 			return;
 		}
+		if (argv[0] === COMPUTER_BROKER_CLI_FLAG) {
+			process.exitCode = 1;
+			return;
+		}
 	}
 	if (argv[0] === "--internal-computer-gate0") {
 		if (argv.length !== 1) {
@@ -348,6 +354,14 @@ export async function runCli(argv: string[], dependencies: RunCliDependencies = 
 			return;
 		}
 		await (dependencies.runGate0FromEnvironment ?? runComputerBrokerGate0FromEnvironment)();
+		return;
+	}
+	if (argv[0] === COMPUTER_BROKER_CLI_FLAG) {
+		if (argv.length !== 1) {
+			process.exitCode = 1;
+			return;
+		}
+		await (dependencies.runComputerBrokerFromEnvironment ?? runComputerBrokerServerFromEnvironment)();
 		return;
 	}
 	if (isTmuxOwnerIsolationCliArgv(argv)) {

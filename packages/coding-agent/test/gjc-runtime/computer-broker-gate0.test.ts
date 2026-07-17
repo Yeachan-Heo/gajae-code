@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { commands, runCli } from "@gajae-code/coding-agent/cli";
+import { COMPUTER_BROKER_CLI_FLAG } from "@gajae-code/coding-agent/gjc-runtime/computer-broker";
 import {
 	type Gate0NativeController,
 	isGate0Result,
@@ -51,8 +52,9 @@ function acceleratedA1TimeoutClock(): () => number {
 }
 
 describe("computer broker Gate-0", () => {
-	it("keeps the hidden selector out of actual public help", async () => {
+	it("keeps hidden computer broker selectors out of actual public help", async () => {
 		expect(commands.map(command => command.name)).not.toContain("--internal-computer-gate0");
+		expect(commands.map(command => command.name)).not.toContain(COMPUTER_BROKER_CLI_FLAG);
 		const cli = new URL("../../src/cli.ts", import.meta.url).pathname;
 		const child = Bun.spawn([process.execPath, cli, "--help"], { stdout: "pipe", stderr: "pipe" });
 		const [stdout, stderr, exitCode] = await Promise.all([
@@ -62,6 +64,41 @@ describe("computer broker Gate-0", () => {
 		]);
 		expect(exitCode).toBe(0);
 		expect(`${stdout}\n${stderr}`).not.toContain("--internal-computer-gate0");
+		expect(`${stdout}\n${stderr}`).not.toContain(COMPUTER_BROKER_CLI_FLAG);
+	});
+
+	it("dispatches the exact hidden computer broker selector", async () => {
+		const previousExitCode = process.exitCode;
+		let invocations = 0;
+		try {
+			process.exitCode = 0;
+			await runCli([COMPUTER_BROKER_CLI_FLAG], {
+				runComputerBrokerFromEnvironment: async () => {
+					invocations++;
+				},
+			});
+			expect(invocations).toBe(1);
+			expect(process.exitCode).toBe(0);
+		} finally {
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+
+	it("refuses extra argv for the hidden computer broker selector", async () => {
+		const previousExitCode = process.exitCode;
+		let invocations = 0;
+		try {
+			process.exitCode = 0;
+			await runCli([COMPUTER_BROKER_CLI_FLAG, "unexpected"], {
+				runComputerBrokerFromEnvironment: async () => {
+					invocations++;
+				},
+			});
+			expect(invocations).toBe(0);
+			expect(process.exitCode).toBe(1);
+		} finally {
+			process.exitCode = previousExitCode ?? 0;
+		}
 	});
 
 	it.if(process.platform === "darwin")("fails closed when hidden malloc re-exec cannot start", async () => {
@@ -87,6 +124,31 @@ describe("computer broker Gate-0", () => {
 			const output = JSON.parse(stdout);
 			expect(output).toMatchObject({ success: false, code: "internal_error" });
 			expect(isGate0Result(output)).toBe(true);
+		} finally {
+			if (previousMalloc === undefined) delete process.env.MallocStackLogging;
+			else process.env.MallocStackLogging = previousMalloc;
+			if (previousGuard === undefined) delete process.env.GJC_MALLOC_ENV_REEXEC;
+			else process.env.GJC_MALLOC_ENV_REEXEC = previousGuard;
+			process.exitCode = previousExitCode ?? 0;
+		}
+	});
+
+	it.if(process.platform === "darwin")("fails closed when broker malloc re-exec cannot start", async () => {
+		const previousMalloc = process.env.MallocStackLogging;
+		const previousGuard = process.env.GJC_MALLOC_ENV_REEXEC;
+		const previousExitCode = process.exitCode;
+		let invoked = false;
+		try {
+			process.env.MallocStackLogging = "1";
+			delete process.env.GJC_MALLOC_ENV_REEXEC;
+			await runCli([COMPUTER_BROKER_CLI_FLAG], {
+				reexecWithScrubbedMallocEnv: async () => null,
+				runComputerBrokerFromEnvironment: async () => {
+					invoked = true;
+				},
+			});
+			expect(invoked).toBe(false);
+			expect(process.exitCode).toBe(1);
 		} finally {
 			if (previousMalloc === undefined) delete process.env.MallocStackLogging;
 			else process.env.MallocStackLogging = previousMalloc;
