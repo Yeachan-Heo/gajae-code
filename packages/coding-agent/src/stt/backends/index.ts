@@ -38,7 +38,7 @@ export async function resolveSttBackend(
 ): Promise<ResolvedSttBackend> {
 	if (preference === "whisper") return { backend: new WhisperSttBackend() };
 
-	const availability = appleBackendAvailability(language);
+	const availability = await appleBackendAvailability(language);
 	if (preference === "apple") {
 		if (!availability.usable) {
 			throw new Error(

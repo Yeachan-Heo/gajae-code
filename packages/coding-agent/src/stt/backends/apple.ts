@@ -14,6 +14,7 @@ import {
 	macSpeechSupport,
 } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
+import { probeInProcessSpeechSafety } from "./apple-probe";
 import type { SttBackend, SttSession, SttStartOptions } from "./types";
 
 /** Final-result grace period after `stop()` before giving up on the recognizer. */
@@ -61,7 +62,7 @@ export function bundlePathFromExecutablePath(execPath: string): string | null {
 	return execPath.slice(0, index + ".app".length);
 }
 
-let hostAppCheckCache: { usable: boolean } | null = null;
+let hostAppCheckCache: { fastNegative: boolean } | null = null;
 
 /**
  * TCC crash preflight. macOS attributes speech/microphone permission to the
@@ -106,9 +107,18 @@ export function hostClassAllowsInProcessSpeech(hostClass: HostBundleClass, hasUs
 	return false; // unknown/ambiguous hosts never auto-select in-process Apple
 }
 
-function hostAppAllowsSpeech(): boolean {
-	if (hostAppCheckCache) return hostAppCheckCache.usable;
-	let usable = false;
+/**
+ * Fast negative pre-filter: when the ancestry walk finds a third-party
+ * bundle that provably lacks the usage descriptions, skip the sacrificial
+ * probe entirely — probing there would only crash the probe child and, in
+ * the microphone-permission case, flash a doomed prompt. This is an
+ * optimization only; the authoritative gate is the probe
+ * (`probeInProcessSpeechSafety`), which mechanically exercises the real
+ * crash surfaces in a child sharing this process's TCC responsibility.
+ */
+function hostFastNegative(): boolean {
+	if (hostAppCheckCache) return hostAppCheckCache.fastNegative;
+	let fastNegative = false;
 	try {
 		let pid = process.pid;
 		let bundle: string | null = null;
@@ -122,10 +132,8 @@ function hostAppAllowsSpeech(): boolean {
 			bundle = bundlePathFromExecutablePath(match[2] ?? "");
 			if (bundle) break;
 		}
-		const hostClass = classifyHostBundle(bundle);
-		let hasUsageKeys = false;
-		if (hostClass === "app" && bundle) {
-			hasUsageKeys = ["NSSpeechRecognitionUsageDescription", "NSMicrophoneUsageDescription"].every(
+		if (classifyHostBundle(bundle) === "app" && bundle) {
+			const hasUsageKeys = ["NSSpeechRecognitionUsageDescription", "NSMicrophoneUsageDescription"].every(
 				key =>
 					Bun.spawnSync(["defaults", "read", `${bundle}/Contents/Info`, key], {
 						stdout: "ignore",
@@ -133,18 +141,15 @@ function hostAppAllowsSpeech(): boolean {
 					}).exitCode === 0,
 			);
 			if (!hasUsageKeys) {
+				fastNegative = true;
 				logger.warn("Apple speech disabled: hosting terminal app lacks usage descriptions", { bundle });
 			}
 		}
-		usable = hostClassAllowsInProcessSpeech(hostClass, hasUsageKeys);
-		if (!usable && hostClass === "none") {
-			logger.warn("Apple speech disabled: hosting terminal could not be verified (fail-closed)");
-		}
 	} catch {
-		usable = false; // fail-closed: eligibility must be provable
+		fastNegative = false; // unknown — the probe decides
 	}
-	hostAppCheckCache = { usable };
-	return usable;
+	hostAppCheckCache = { fastNegative };
+	return fastNegative;
 }
 
 /** Test hook — reset the host-app preflight cache. */
@@ -178,10 +183,31 @@ export interface AppleAvailability {
 	authorization: AppleAuthorization;
 }
 
-/** Capability probe — cheap, no permission prompt. */
-export function appleBackendAvailability(language?: string): AppleAvailability {
-	if (process.platform === "darwin" && !hostAppAllowsSpeech()) {
+/**
+ * Availability check for the in-process Apple backend.
+ *
+ * Eligibility is probe-gated, never assumed: after a cheap fast-negative
+ * pre-filter, a sacrificial child process exercises the real Speech crash
+ * surfaces (see `apple-probe.ts`). Unknown or ambiguous hosts therefore
+ * never reach in-process Speech APIs — including via forced
+ * `stt.backend=apple`, which uses this same path. May trigger the one-time
+ * speech/microphone permission prompts (they are prerequisites for any real
+ * session).
+ */
+export async function appleBackendAvailability(language?: string): Promise<AppleAvailability> {
+	if (process.platform !== "darwin") {
+		return { usable: false, reason: "platform", authorization: "notDetermined" };
+	}
+	if (hostFastNegative()) {
 		return { usable: false, reason: "host-app", authorization: "notDetermined" };
+	}
+	const probe = await probeInProcessSpeechSafety();
+	if (!probe.safe) {
+		const authorization = (macSpeechAuthorizationStatus() ?? "notDetermined") as AppleAuthorization;
+		if (probe.reason?.startsWith("permission:")) {
+			return { usable: false, reason: "permission", authorization };
+		}
+		return { usable: false, reason: "host-app", authorization };
 	}
 	const support = macSpeechSupport(appleLocaleForLanguage(language));
 	const authorization = (macSpeechAuthorizationStatus() ?? "notDetermined") as AppleAuthorization;

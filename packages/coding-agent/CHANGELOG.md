@@ -10,7 +10,7 @@
 ### Fixed
 - SDK host response delivery to a disconnected client no longer escalates a second structured-error send failure into a process-level unhandled rejection; failures stay local to that connection.
 ### Changed
-- In-process Apple speech eligibility is now fail-closed: only provable host classes (Apple system apps under /System, or bundles carrying both speech/microphone usage descriptions) can select the Apple backend; unknown or ambiguous hosts (tmux, ssh, unparseable ancestry) use whisper, and forced `apple` fails with guidance instead of risking a TCC process abort.
+- In-process Apple speech eligibility is probe-gated, never assumed: a sacrificial child process exercises the real Speech/microphone TCC crash surfaces before the Apple backend can be selected (the child shares the process's TCC responsibility, so its outcome mechanically predicts the in-process outcome — a TCC abort kills the probe child, not the TUI). A fast-negative pre-filter skips probing hosts that provably lack usage descriptions. Unknown or ambiguous hosts never reach in-process Speech APIs, including via forced `stt.backend=apple`, which uses the same gate.
 
 ### Added
 - Pressing Enter during an active voice session finalizes the transcript and submits it (plus any already-typed text) in one stroke: dictate → Enter → sent.
