@@ -279,6 +279,8 @@ export interface CreateAgentSessionOptions {
 	authStorage?: AuthStorage;
 	/** Model registry. Default: discoverModels(authStorage, agentDir) */
 	modelRegistry?: ModelRegistry;
+	/** @internal Opaque task-subagent identity used for logical-stream 429 recovery. */
+	providerRateLimitScope?: object;
 
 	/** Model to use. Default: from settings, else first available */
 	model?: Model;
@@ -2330,6 +2332,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					? { messages: options.forkContextSeed.agentMessages }
 					: {}),
 			},
+			providerRateLimitScope: options.providerRateLimitScope,
 			convertToLlm: convertToLlmFinal,
 			onPayload,
 			onResponse,

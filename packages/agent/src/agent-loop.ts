@@ -32,6 +32,7 @@ import {
 	shouldMitigateHarmonyLeak,
 	signalListLabel,
 } from "./harmony-leak";
+import { ProviderRateLimitRecoveryGate } from "./provider-rate-limit-recovery";
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
 	type AgentTelemetry,
@@ -60,7 +61,8 @@ import type {
 	StreamFn,
 } from "./types";
 
-/** Sentinel returned by the abort race in `streamAssistantResponse`. */
+const providerRateLimitRecoveryGate = new ProviderRateLimitRecoveryGate();
+
 /**
  * Defensive caps for a provisional managed attempt. These are intentionally
  * well above ordinary streamed responses; they only bound memory when an
@@ -99,7 +101,32 @@ class ManagedAttemptSnapshotError extends Error {
 
 const managedAttemptTextEncoder = new TextEncoder();
 
+/** Sentinel returned by abort races in `streamAssistantResponse`. */
 const ABORTED: unique symbol = Symbol("agent-loop-aborted");
+async function resolveApiKeyAfterAdmission(
+	config: AgentLoopConfig,
+	requestSignal: AbortSignal | undefined,
+): Promise<string | undefined | typeof ABORTED> {
+	if (!config.getApiKey) return config.apiKey;
+	if (!requestSignal) return (await config.getApiKey(config.model.provider)) || config.apiKey;
+	if (requestSignal.aborted) return ABORTED;
+
+	let onAbort: (() => void) | undefined;
+	const abortPromise = new Promise<typeof ABORTED>(resolve => {
+		onAbort = () => resolve(ABORTED);
+		requestSignal.addEventListener("abort", onAbort, { once: true });
+	});
+	try {
+		const apiKey = await Promise.race([
+			Promise.resolve().then(() => config.getApiKey?.(config.model.provider)),
+			abortPromise,
+		]);
+		return apiKey === ABORTED ? ABORTED : apiKey || config.apiKey;
+	} finally {
+		if (onAbort) requestSignal.removeEventListener("abort", onAbort);
+	}
+}
+
 function managedContextOverflow(message: AssistantMessage, config: AgentLoopConfig): boolean {
 	const transportFailure = managedTransportFailure(message);
 	// Managed empty-stop responses may be repaired by the managed shell below; only
@@ -1632,18 +1659,6 @@ async function streamAssistantResponse(
 
 	const streamFunction = streamFn || streamSimple;
 
-	// Resolve API key (important for expiring tokens) — do this before resolving
-	// metadata so that the session-sticky credential recorded by getApiKey is
-	// visible to metadataResolver (e.g. for the correct account_uuid in metadata.user_id).
-	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
-
-	// Re-resolve metadata after credential selection so the per-request value
-	// reflects the credential actually used, not the snapshot from AgentLoopConfig construction.
-	const authCredentialType = config.getAuthCredentialType?.(config.model.provider);
-
-	const resolvedMetadata = config.metadataResolver ? config.metadataResolver(config.model.provider) : config.metadata;
-
 	const dynamicToolChoice = config.getToolChoice?.();
 	const dynamicReasoning = config.getReasoning?.();
 	const harmonyMitigationEnabled = isHarmonyLeakMitigationTarget(config.model);
@@ -1657,51 +1672,100 @@ async function streamAssistantResponse(
 		harmonyRetryAttempt > 0 && config.temperature !== undefined ? config.temperature + 0.05 : config.temperature;
 	const effectiveToolChoice = dynamicToolChoice ?? config.toolChoice;
 	const effectiveReasoning = dynamicReasoning ?? config.reasoning;
+	const rateLimitScope = config.providerRateLimitScope;
+	const rateLimitTicket = rateLimitScope
+		? await providerRateLimitRecoveryGate.acquire(rateLimitScope, config.model, requestSignal).catch(error => {
+				if (requestSignal?.aborted) return undefined;
+				throw error;
+			})
+		: undefined;
+	if (rateLimitScope && requestSignal?.aborted) {
+		if (rateLimitTicket) providerRateLimitRecoveryGate.settle(rateLimitTicket, { type: "aborted" });
+		return emitAbortedAssistantMessage(null, false, context, config, stream);
+	}
 
-	const chatStepNumber = stepCounter.count;
-	stepCounter.count += 1;
-	const chatSpan = startChatSpan(telemetry, config.model, {
-		parent: invokeAgentSpan,
-		stepNumber: chatStepNumber,
-		request: {
-			maxTokens: config.maxTokens,
-			temperature: effectiveTemperature,
-			topP: config.topP,
-			topK: config.topK,
-			presencePenalty: config.presencePenalty,
-			serviceTier: config.serviceTier,
-			reasoningEffort: typeof effectiveReasoning === "string" ? effectiveReasoning : undefined,
-			toolChoice: effectiveToolChoice,
-			tools: llmContext.tools,
-			systemPrompt: llmContext.systemPrompt,
-			messages: llmContext.messages,
-		},
-	});
-
-	// Wrap the user-supplied onResponse so we always observe response headers
-	// for telemetry (`ChatUsageEvent.headers`, gateway auto-detection) without
-	// stealing them from the configured hook.
+	let chatSpan: Span | undefined;
 	let capturedHeaders: Readonly<Record<string, string>> | undefined;
-	const userOnResponse = config.onResponse;
-	const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo) => {
-		capturedHeaders = response.headers;
-		return userOnResponse?.(response, modelInfo);
-	};
-
-	const finishChat = async (message: AssistantMessage): Promise<void> => {
-		await finishChatSpan(telemetry, chatSpan, message, {
-			stepNumber: chatStepNumber,
-			serviceTier: config.serviceTier,
-			responseHeaders: capturedHeaders,
-			baseUrl: config.model.baseUrl,
-		});
-	};
-
 	try {
+		// Resolve API key (important for expiring tokens) only after admission so a
+		// recovery deadline cannot leave an admitted request with a stale token.
+		const resolvedApiKey = await resolveApiKeyAfterAdmission(config, requestSignal);
+		if (resolvedApiKey === ABORTED || requestSignal?.aborted) {
+			if (rateLimitTicket) providerRateLimitRecoveryGate.settle(rateLimitTicket, { type: "aborted" });
+			return emitAbortedAssistantMessage(null, false, context, config, stream);
+		}
+
+		// Re-resolve metadata after credential selection so the per-request value
+		// reflects the credential actually used, not the snapshot from AgentLoopConfig construction.
+		const authCredentialType = config.getAuthCredentialType?.(config.model.provider);
+		const resolvedMetadata = config.metadataResolver
+			? config.metadataResolver(config.model.provider)
+			: config.metadata;
+
+		const chatStepNumber = stepCounter.count;
+		stepCounter.count += 1;
+		chatSpan = startChatSpan(telemetry, config.model, {
+			parent: invokeAgentSpan,
+			stepNumber: chatStepNumber,
+			request: {
+				maxTokens: config.maxTokens,
+				temperature: effectiveTemperature,
+				topP: config.topP,
+				topK: config.topK,
+				presencePenalty: config.presencePenalty,
+				serviceTier: config.serviceTier,
+				reasoningEffort: typeof effectiveReasoning === "string" ? effectiveReasoning : undefined,
+				toolChoice: effectiveToolChoice,
+				tools: llmContext.tools,
+				systemPrompt: llmContext.systemPrompt,
+				messages: llmContext.messages,
+			},
+		});
+
+		// Wrap the user-supplied onResponse so we always observe response headers
+		// for telemetry (`ChatUsageEvent.headers`, gateway auto-detection) without
+		// stealing them from the configured hook.
+		const userOnResponse = config.onResponse;
+		const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo) => {
+			capturedHeaders = response.headers;
+			return userOnResponse?.(response, modelInfo);
+		};
+
+		const finishChat = async (message: AssistantMessage): Promise<void> => {
+			await finishChatSpan(telemetry, chatSpan, message, {
+				stepNumber: chatStepNumber,
+				serviceTier: config.serviceTier,
+				responseHeaders: capturedHeaders,
+				baseUrl: config.model.baseUrl,
+			});
+		};
+		const settleFinalMessage = (message: AssistantMessage): void => {
+			if (!rateLimitTicket) return;
+			if (message.errorStatus === 429) {
+				const retryAfterMs = classifyFallbackTrigger(message.transportFailure ?? { status: 429 }).retryAfterMs;
+				providerRateLimitRecoveryGate.settle(rateLimitTicket, { type: "error", status: 429 }, retryAfterMs);
+			} else if (message.stopReason === "aborted") {
+				providerRateLimitRecoveryGate.settle(rateLimitTicket, { type: "aborted" });
+			} else if (message.stopReason === "error") {
+				providerRateLimitRecoveryGate.settle(rateLimitTicket, { type: "error", status: message.errorStatus });
+			} else {
+				providerRateLimitRecoveryGate.settle(rateLimitTicket, { type: "success" });
+			}
+		};
+		const settleAndFinishChat = async (message: AssistantMessage): Promise<AssistantMessage> => {
+			settleFinalMessage(message);
+			await finishChat(message);
+			return message;
+		};
+		const { providerRateLimitScope: _providerRateLimitScope, ...providerConfig } = config;
 		return await runInActiveSpan(chatSpan, async () => {
+			if (requestSignal?.aborted) {
+				const aborted = emitAbortedAssistantMessage(null, false, context, config, stream);
+				return await settleAndFinishChat(aborted);
+			}
 			const fallbackAttempt = config.fallbackManaged ? config.nextFallbackAttempt?.(config.model) : undefined;
 			const response = await streamFunction(config.model, llmContext, {
-				...config,
+				...providerConfig,
 				fallbackAttempt,
 				apiKey: resolvedApiKey,
 				authCredentialType,
@@ -1727,8 +1791,7 @@ async function streamAssistantResponse(
 			if (requestSignal) {
 				if (requestSignal.aborted) {
 					const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
-					await finishChat(aborted);
-					return aborted;
+					return await settleAndFinishChat(aborted);
 				}
 				const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
 				const onAbort = () => resolve(ABORTED);
@@ -1745,8 +1808,7 @@ async function streamAssistantResponse(
 						if (result === ABORTED) {
 							responseIterator.return?.()?.catch(() => {});
 							const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
-							await finishChat(aborted);
-							return aborted;
+							return await settleAndFinishChat(aborted);
 						}
 						next = result;
 					} else {
@@ -1754,8 +1816,7 @@ async function streamAssistantResponse(
 					}
 					if (requestSignal?.aborted) {
 						const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
-						await finishChat(aborted);
-						return aborted;
+						return await settleAndFinishChat(aborted);
 					}
 					if (next.done) break;
 
@@ -1817,8 +1878,7 @@ async function streamAssistantResponse(
 								stream.push({ type: "message_start", message: { ...finalMessage } });
 							}
 							stream.push({ type: "message_end", message: finalMessage });
-							await finishChat(finalMessage);
-							return finalMessage;
+							return await settleAndFinishChat(finalMessage);
 						}
 					}
 				}
@@ -1829,10 +1889,10 @@ async function streamAssistantResponse(
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(await response.result(), config.model)
 				: await response.result();
-			await finishChat(trailing);
-			return trailing;
+			return await settleAndFinishChat(trailing);
 		});
 	} catch (err) {
+		if (rateLimitTicket) providerRateLimitRecoveryGate.settle(rateLimitTicket, { type: "threw" });
 		failChatSpan(telemetry, chatSpan, {
 			errorObject: err,
 			responseHeaders: capturedHeaders,

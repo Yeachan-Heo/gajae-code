@@ -1444,6 +1444,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					cwd: worktree ?? cwd,
 					authStorage,
 					modelRegistry,
+					providerRateLimitScope: modelRegistry.authStorage,
 					settings: subagentSettings,
 					model,
 					thinkingLevel: effectiveThinkingLevel,
