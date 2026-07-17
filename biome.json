@@ -58,6 +58,7 @@
 			"packages/*/*.ts",
 			"!packages/natives/native/index.d.ts",
 			"!**/vendor/**/*",
+			"!packages/coding-agent/src/defaults/gjc/extensions/grok-cli-vendor/**/*",
 			"!**/node_modules/**/*",
 			"!**/test-sessions.ts",
 			"!**/template.generated.ts",

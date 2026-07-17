@@ -1,1 +1,1 @@
-export { default } from "./provider/register.js";
+export { default } from './provider/register.js';
