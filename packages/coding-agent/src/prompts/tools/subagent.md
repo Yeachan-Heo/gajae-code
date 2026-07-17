@@ -34,7 +34,7 @@ Resume one subagent by `id` (preferred) or a single-item `ids` array.
 
 ## `action: "steer"`
 Send a non-empty `message` to one subagent by `id` (preferred) or a single-item `ids` array.
-- A running subagent receives the message through its live handle.
+- A running subagent with `phase: "active"` receives the message through its live handle; `phase: "initializing"` rejects steering with retry guidance.
 - Optional `pause: true` requests a safe-boundary pause after steering a running subagent.
 - `pause` only matters while the target is running.
 - A non-active subagent (`paused`, `queued`, or terminal) automatically resumes with the message; `pause` is ignored for that target.
@@ -47,7 +47,7 @@ Stop selected subagents by `ids`, including running, paused, or queued subagents
 
 # Statuses
 
-- `running` — currently executing.
+- `running` — lifecycle is running; snapshots may further distinguish `phase: "initializing"` from `phase: "active"`.
 - `paused` — stopped at a safe boundary with resumable context.
 - `queued` — resume requested and waiting for execution capacity.
 - `completed` — finished successfully.

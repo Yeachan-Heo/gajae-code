@@ -177,6 +177,22 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("running, no activity yet");
 	});
 
+	it("renders initialization without claiming live activity", () => {
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-Starting",
+					status: "running",
+					phase: "initializing",
+					liveProgressAvailable: false,
+				}),
+			],
+		});
+		expect(out).toContain("0-Starting");
+		expect(out).toContain("initializing session; live control unavailable");
+		expect(out).not.toContain("running, no activity yet");
+	});
+
 	it("renders static status without a no-activity claim when no live producer", () => {
 		const out = render({
 			subagents: [snapshot({ id: "0-Static", status: "running", liveProgressAvailable: false })],
@@ -348,6 +364,23 @@ describe("subagent await renderer body cache (PR2)", () => {
 		// New component (new renderResult), identical content -> module cache hit.
 		renderWith(live("0-A"));
 		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+	});
+
+	it("invalidates the body cache when startup phase becomes active", () => {
+		const initializing: SubagentToolDetails = {
+			subagents: [snapshot({ id: "0-Starting", phase: "initializing" })],
+		};
+		const active: SubagentToolDetails = {
+			subagents: [snapshot({ id: "0-Starting", phase: "active" })],
+		};
+
+		const first = Bun.stripANSI(renderWith(initializing).join("\n"));
+		expect(first).toContain("initializing session; live control unavailable");
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+
+		const second = Bun.stripANSI(renderWith(active).join("\n"));
+		expect(second).not.toContain("initializing session; live control unavailable");
+		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(2);
 	});
 
 	it("does not re-render the heavy body for spinner-only frame changes", () => {

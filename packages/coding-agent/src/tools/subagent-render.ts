@@ -179,6 +179,8 @@ function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolea
 		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, true)) {
 			lines.push(`  ${pl}`);
 		}
+	} else if (snapshot.phase === "initializing") {
+		lines.push(`  ${theme.fg("dim", "initializing session; live control unavailable")}`);
 	} else if (snapshot.liveProgressAvailable && (snapshot.status === "running" || snapshot.status === "queued")) {
 		lines.push(`  ${theme.fg("dim", "running, no activity yet")}`);
 	}

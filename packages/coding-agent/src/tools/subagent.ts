@@ -2,7 +2,7 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } from "../async";
+import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentPhase, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
 import type { AgentProgress, AgentSource, TaskToolDetails } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
@@ -72,6 +72,8 @@ export interface SubagentSnapshot {
 	progress?: AgentProgress;
 	/** True when a live in-session progress producer exists for this subagent. */
 	liveProgressAvailable?: boolean;
+	/** Startup phase for a running subagent; lifecycle status remains stable. */
+	phase?: SubagentPhase;
 	/** Model the subagent actually runs on (after any auth fallback). */
 	effectiveModel?: string;
 	/** Model originally requested via role/preset mapping; differs from effective on fallback. */
@@ -263,7 +265,13 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				if (!record.sessionFile) throw new ToolError(`Subagent ${record.subagentId} has no session file.`);
 				if (record.status === "running") {
 					const handle = manager.getLiveHandle(record.subagentId);
-					if (!handle) throw new ToolError(`Subagent ${record.subagentId} has no live handle.`);
+					if (!handle) {
+						throw new ToolError(
+							record.phase === "initializing"
+								? `Subagent ${record.subagentId} is still initializing; retry after its phase becomes active.`
+								: `Subagent ${record.subagentId} has no live handle; inspect it for a terminal transition before retrying.`,
+						);
+					}
 					const fromAgentId = this.session.getAgentId?.() ?? undefined;
 					await handle.injectMessage(message, "steer", { fromAgentId });
 					if (params.pause === true) manager.pauseSubagent(record.subagentId, ownerFilter);
@@ -586,6 +594,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const lines = [`## ${title} (${snapshots.length})`, ""];
 		for (const snapshot of snapshots) {
 			lines.push(`### ${snapshot.id} — ${snapshot.status}`);
+			if (snapshot.phase === "initializing") lines.push("Phase: initializing (live control unavailable)");
 			if (snapshot.jobId !== snapshot.id) lines.push(`Job: ${snapshot.jobId}`);
 			if (snapshot.agent) lines.push(`Agent: ${snapshot.agent} (${snapshot.agentSource})`);
 			if (snapshot.effectiveModel) {
@@ -659,6 +668,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		attachLiveProgress = false,
 	): SubagentSnapshot {
 		const liveFields = this.#liveProgressFields(manager, record, attachLiveProgress);
+		const phase = record.status === "running" ? record.phase : undefined;
 		const job = record.currentJobId ? manager.getJob(record.currentJobId) : undefined;
 		if (job) {
 			return {
@@ -666,6 +676,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				id: record.subagentId,
 				jobId: record.currentJobId ?? job.id,
 				status: record.status,
+				...(phase ? { phase } : {}),
 				...liveFields,
 			};
 		}
@@ -673,6 +684,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			id: record.subagentId,
 			jobId: record.currentJobId ?? record.subagentId,
 			status: record.status,
+			...(phase ? { phase } : {}),
 			label: "subagent",
 			agent: "unknown",
 			agentSource: "bundled",
@@ -839,6 +851,7 @@ function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
 		id: snapshot.id,
 		jobId: snapshot.jobId,
 		status: snapshot.status,
+		phase: snapshot.phase ?? null,
 		label: snapshot.label,
 		agent: snapshot.agent,
 		agentSource: snapshot.agentSource,

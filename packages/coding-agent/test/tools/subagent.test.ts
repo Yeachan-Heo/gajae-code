@@ -441,6 +441,38 @@ describe("SubagentTool", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
+	it("rejects steering during initialization without changing public lifecycle status", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		manager.registerSubagentRecord({
+			subagentId: "0-Starting",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-Starting.jsonl",
+			resumable: true,
+		});
+
+		const inspection = await tool.execute("subagent-inspect-starting", {
+			action: "inspect",
+			ids: ["0-Starting"],
+		});
+		expect(inspection.details?.subagents[0]?.status).toBe("running");
+		expect(inspection.details?.subagents[0]?.phase).toBe("initializing");
+		expect(getText(inspection)).toContain("Phase: initializing");
+
+		await expect(
+			tool.execute("subagent-steer-starting", {
+				action: "steer",
+				ids: ["0-Starting"],
+				message: "start now",
+			}),
+		).rejects.toThrow("still initializing; retry after its phase becomes active");
+
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
 	it("steer running injects a message and optionally requests pause", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());

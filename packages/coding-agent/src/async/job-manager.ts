@@ -76,6 +76,9 @@ export type SubagentRunOutcome = { kind: "completed"; text: string } | { kind: "
 /** Canonical lifecycle of a subagent across pause/resume cycles. */
 export type SubagentLifecycle = "running" | "paused" | "queued" | "completed" | "failed" | "cancelled";
 
+/** Startup state for a running subagent attempt, independent of its public lifecycle status. */
+export type SubagentPhase = "initializing" | "active";
+
 /** Maximum time allowed to prove owned subagents have stopped before replacement. */
 export const OWNER_SUBAGENT_SHUTDOWN_TIMEOUT_MS = 5_000;
 
@@ -145,6 +148,8 @@ export interface SubagentRecord {
 	currentJobId: string | null;
 	historicalJobIds: string[];
 	status: SubagentLifecycle;
+	/** Internal startup phase for the current running attempt; absent outside running attempts. */
+	phase?: SubagentPhase;
 	sessionFile: string | null;
 	/** False for ephemeral sessions (no persistent artifacts dir). */
 	resumable: boolean;
@@ -658,6 +663,14 @@ export class AsyncJobManager {
 
 	/** Register or replace the canonical record for a subagent. */
 	registerSubagentRecord(record: SubagentRecord): void {
+		const existing = this.#subagentRecords.get(record.subagentId);
+		const sameActiveAttempt = existing?.currentJobId === record.currentJobId && existing.phase === "active";
+		record.phase =
+			record.status === "running"
+				? this.#liveHandles.has(record.subagentId) || sameActiveAttempt
+					? "active"
+					: "initializing"
+				: undefined;
 		this.#subagentRecords.set(record.subagentId, record);
 	}
 
@@ -712,6 +725,8 @@ export class AsyncJobManager {
 
 	registerLiveHandle(subagentId: string, handle: SubagentLiveHandle): void {
 		this.#liveHandles.set(subagentId, handle);
+		const record = this.#subagentRecords.get(subagentId);
+		if (record?.status === "running") record.phase = "active";
 	}
 
 	getLiveHandle(subagentId: string): SubagentLiveHandle | undefined {
@@ -741,14 +756,15 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * True only when a live, in-session progress producer exists for this id: a
-	 * canonical registered record with a live handle or an in-memory running job.
-	 * False for `SubagentTool` backward-compat job synthesis and resumed-from-disk
-	 * records, which have no live producer to stream from.
+	 * True only when a live, in-session progress producer exists for this id. An
+	 * initializing record is not live; an active record requires its live handle.
+	 * Records without a phase retain the legacy live-handle/running-job fallback.
 	 */
 	hasLiveSubagent(subagentId: string, filter?: AsyncJobFilter): boolean {
 		const rec = this.getSubagentRecord(subagentId, filter);
 		if (!rec) return false;
+		if (rec.phase === "initializing") return false;
+		if (rec.phase === "active") return this.#liveHandles.has(rec.subagentId);
 		if (this.#liveHandles.has(rec.subagentId)) return true;
 		const job = rec.currentJobId ? this.#jobs.get(rec.currentJobId) : undefined;
 		return job?.status === "running";
@@ -1010,6 +1026,7 @@ export class AsyncJobManager {
 		const rec = this.#recordByJobId(jobId);
 		if (rec) {
 			rec.status = "paused";
+			rec.phase = undefined;
 			this.#liveHandles.delete(rec.subagentId);
 			this.#subagentProgress.delete(rec.subagentId);
 		}
@@ -1019,6 +1036,7 @@ export class AsyncJobManager {
 		const rec = this.#recordByJobId(jobId);
 		if (!rec) return;
 		if (rec.status === "paused" || rec.status === "queued") return;
+		rec.phase = undefined;
 		this.#liveHandles.delete(rec.subagentId);
 		this.#subagentProgress.delete(rec.subagentId);
 	}
@@ -1027,6 +1045,7 @@ export class AsyncJobManager {
 		const rec = this.#recordByJobId(jobId);
 		if (!rec) return;
 		rec.status = status;
+		rec.phase = undefined;
 		this.#liveHandles.delete(rec.subagentId);
 		this.#subagentProgress.delete(rec.subagentId);
 	}
@@ -1071,6 +1090,7 @@ export class AsyncJobManager {
 		if (this.getRunningJobs().length >= this.#maxRunningJobs) {
 			const seq = ++this.#resumeSeq;
 			rec.status = "queued";
+			rec.phase = undefined;
 			rec.queued = { ownerId: rec.ownerId, seq, message, createdAt: Date.now() };
 			this.#resumeQueue.push({
 				subagentId: rec.subagentId,
@@ -1101,6 +1121,8 @@ export class AsyncJobManager {
 		if (prevJobId && prevJobId !== newJobId) rec.historicalJobIds.push(prevJobId);
 		rec.currentJobId = newJobId;
 		rec.status = this.#jobs.get(newJobId)?.status ?? "running";
+		rec.phase =
+			rec.status === "running" ? (this.#liveHandles.has(rec.subagentId) ? "active" : "initializing") : undefined;
 		rec.queued = undefined;
 		return { ok: true, status: rec.status, jobId: newJobId };
 	}
@@ -1152,6 +1174,7 @@ export class AsyncJobManager {
 				}
 			}
 			rec.status = "cancelled";
+			rec.phase = undefined;
 			this.#liveHandles.delete(rec.subagentId);
 			this.#subagentProgress.delete(rec.subagentId);
 			this.#drainResumeQueue();
@@ -1161,6 +1184,7 @@ export class AsyncJobManager {
 			const idx = this.#resumeQueue.findIndex(e => e.subagentId === rec.subagentId);
 			if (idx !== -1) this.#resumeQueue.splice(idx, 1);
 			rec.status = "cancelled";
+			rec.phase = undefined;
 			rec.queued = undefined;
 			this.#subagentProgress.delete(rec.subagentId);
 			return true;

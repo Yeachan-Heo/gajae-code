@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { AsyncJobManager, type SubagentRecord } from "../../src/async";
+import { AsyncJobManager, type SubagentLiveHandle, type SubagentRecord } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import type { AgentProgress } from "../../src/task/types";
 import { SubagentTool, type ToolSession } from "../../src/tools";
@@ -21,7 +21,12 @@ function createManager(): AsyncJobManager {
 	AsyncJobManager.setInstance(manager);
 	return manager;
 }
-
+function liveHandle(): SubagentLiveHandle {
+	return {
+		requestPause: () => {},
+		injectMessage: async () => {},
+	};
+}
 function makeProgress(overrides: Partial<AgentProgress> & Pick<AgentProgress, "id">): AgentProgress {
 	return {
 		index: 0,
@@ -73,6 +78,7 @@ describe("subagent await live progress", () => {
 			},
 		);
 		manager.registerSubagentRecord(runningRecord("0-Live", jobId));
+		manager.registerLiveHandle("0-Live", liveHandle());
 		// Record progress BEFORE await; no further progress event will fire.
 		manager.recordSubagentProgress(
 			"0-Live",
@@ -122,6 +128,8 @@ describe("subagent await live progress", () => {
 		);
 		manager.registerSubagentRecord(runningRecord("0-A", jobA));
 		manager.registerSubagentRecord(runningRecord("0-B", jobB));
+		manager.registerLiveHandle("0-A", liveHandle());
+		manager.registerLiveHandle("0-B", liveHandle());
 		manager.recordSubagentProgress("0-A", makeProgress({ id: "0-A", currentTool: "read" }));
 		manager.recordSubagentProgress("0-B", makeProgress({ id: "0-B", currentTool: "bash" }));
 
@@ -202,7 +210,28 @@ describe("AsyncJobManager subagent progress retention", () => {
 		AsyncJobManager.resetForTests();
 	});
 
-	it("hasLiveSubagent is true for a canonical running record and false for synthesized/absent ids", () => {
+	it("preserves an active phase when the live handle wins registration race", () => {
+		const manager = createManager();
+		manager.registerLiveHandle("0-Race", liveHandle());
+
+		manager.registerSubagentRecord(runningRecord("0-Race", "job-race"));
+
+		expect(manager.getSubagentRecord("0-Race")?.phase).toBe("active");
+		expect(manager.hasLiveSubagent("0-Race")).toBe(true);
+	});
+
+	it("does not regress an active attempt when its record is registered again after handle teardown", () => {
+		const manager = createManager();
+		manager.registerSubagentRecord(runningRecord("0-Reregister", "job-reregister"));
+		manager.registerLiveHandle("0-Reregister", liveHandle());
+		manager.removeLiveHandle("0-Reregister");
+
+		manager.registerSubagentRecord(runningRecord("0-Reregister", "job-reregister"));
+
+		expect(manager.getSubagentRecord("0-Reregister")?.phase).toBe("active");
+		expect(manager.hasLiveSubagent("0-Reregister")).toBe(false);
+	});
+	it("tracks the initializing-to-active phase transition for canonical running records", () => {
 		const manager = createManager();
 		const jobId = manager.register(
 			"task",
@@ -218,6 +247,12 @@ describe("AsyncJobManager subagent progress retention", () => {
 			},
 		);
 		manager.registerSubagentRecord(runningRecord("0-Live", jobId));
+		expect(manager.getSubagentRecord("0-Live")?.phase).toBe("initializing");
+		expect(manager.hasLiveSubagent("0-Live")).toBe(false);
+
+		manager.registerLiveHandle("0-Live", liveHandle());
+
+		expect(manager.getSubagentRecord("0-Live")?.phase).toBe("active");
 
 		expect(manager.hasLiveSubagent("0-Live")).toBe(true);
 		expect(manager.hasLiveSubagent("0-Absent")).toBe(false);
@@ -225,7 +260,20 @@ describe("AsyncJobManager subagent progress retention", () => {
 		manager.cancelSubagent("0-Live", { ownerId: "0-Main" });
 	});
 
-	it("clears retained progress on terminal cleanup (cancel)", async () => {
+	it("keeps an active phase monotonic after handle removal and rejects stale live progress", () => {
+		const manager = createManager();
+		manager.registerSubagentRecord(runningRecord("0-Teardown", "job-teardown"));
+		manager.registerLiveHandle("0-Teardown", liveHandle());
+		manager.recordSubagentProgress("0-Teardown", makeProgress({ id: "0-Teardown", currentTool: "read" }));
+
+		manager.removeLiveHandle("0-Teardown");
+
+		expect(manager.getSubagentRecord("0-Teardown")?.phase).toBe("active");
+		expect(manager.hasLiveSubagent("0-Teardown")).toBe(false);
+		expect(manager.getSubagentProgress("0-Teardown")?.currentTool).toBe("read");
+	});
+
+	it("clears retained progress and phase on terminal cleanup (cancel)", async () => {
 		const manager = createManager();
 		const jobId = manager.register(
 			"task",
@@ -241,13 +289,19 @@ describe("AsyncJobManager subagent progress retention", () => {
 			},
 		);
 		manager.registerSubagentRecord(runningRecord("0-Clean", jobId));
+		manager.registerLiveHandle("0-Clean", liveHandle());
+		expect(manager.getSubagentRecord("0-Clean")?.phase).toBe("active");
 		manager.recordSubagentProgress("0-Clean", makeProgress({ id: "0-Clean", currentTool: "read" }));
 		expect(manager.getSubagentProgress("0-Clean")).toBeDefined();
+		manager.removeLiveHandle("0-Clean");
+		expect(manager.getSubagentRecord("0-Clean")?.phase).toBe("active");
+		expect(manager.hasLiveSubagent("0-Clean")).toBe(false);
 
 		manager.cancelSubagent("0-Clean", { ownerId: "0-Main" });
 		await manager.getJob(jobId)?.promise;
 
 		expect(manager.getSubagentProgress("0-Clean")).toBeUndefined();
+		expect(manager.getSubagentRecord("0-Clean")?.phase).toBeUndefined();
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
@@ -302,6 +356,7 @@ describe("AsyncJobManager subagent progress retention", () => {
 
 		const result = manager.resumeSubagent("0-Resume", { ownerId: "0-Main" }, "go");
 		expect(result.ok).toBe(true);
+		expect(manager.getSubagentRecord("0-Resume")?.phase).toBe("initializing");
 		// Retained progress from the previous run must be gone before the new run emits.
 		expect(manager.getSubagentProgress("0-Resume")).toBeUndefined();
 	});
@@ -506,6 +561,7 @@ describe("subagent await emit gating", () => {
 				},
 			);
 			manager.registerSubagentRecord(runningRecord(id, jobId));
+			manager.registerLiveHandle(id, liveHandle());
 			manager.recordSubagentProgress(id, makeProgress({ id, currentTool: "read", recentOutput: ["scan"] }));
 		});
 
