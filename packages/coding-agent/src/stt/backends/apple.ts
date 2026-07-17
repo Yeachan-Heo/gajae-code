@@ -73,9 +73,42 @@ let hostAppCheckCache: { usable: boolean } | null = null;
  * Speech API. Fail-open for non-bundle chains (plain CLI/ssh/tmux servers),
  * where macOS prompts normally instead of aborting.
  */
+/**
+ * Supported host classes for in-process Speech APIs (fail-closed).
+ *
+ * macOS attributes speech/microphone TCC to the hosting terminal (the
+ * responsible process). A host whose Info.plist lacks
+ * `NSSpeechRecognitionUsageDescription` gets the requesting process ABORTED
+ * by TCC (observed live: SIGABRT), so eligibility must be provable, never
+ * assumed:
+ *
+ * - `system`: bundle under /System — Apple system apps (Terminal.app);
+ *   Speech APIs verified working there without usage descriptions.
+ * - `described`: third-party bundle carrying BOTH usage-description keys.
+ * - everything else — no bundle found, ancestry/parse failure, tmux or ssh
+ *   chains, or a bundle missing keys — is NOT eligible; auto-selection uses
+ *   whisper and forced `apple` fails with guidance instead of risking an
+ *   in-process abort.
+ */
+export type HostBundleClass = "system" | "app" | "none";
+
+/** Pure classification of the resolved hosting bundle path. */
+export function classifyHostBundle(bundle: string | null): HostBundleClass {
+	if (!bundle) return "none";
+	if (bundle.startsWith("/System/")) return "system";
+	return "app";
+}
+
+/** Pure fail-closed eligibility table for in-process Speech APIs. */
+export function hostClassAllowsInProcessSpeech(hostClass: HostBundleClass, hasUsageKeys: boolean): boolean {
+	if (hostClass === "system") return true;
+	if (hostClass === "app") return hasUsageKeys;
+	return false; // unknown/ambiguous hosts never auto-select in-process Apple
+}
+
 function hostAppAllowsSpeech(): boolean {
 	if (hostAppCheckCache) return hostAppCheckCache.usable;
-	let usable = true;
+	let usable = false;
 	try {
 		let pid = process.pid;
 		let bundle: string | null = null;
@@ -89,29 +122,26 @@ function hostAppAllowsSpeech(): boolean {
 			bundle = bundlePathFromExecutablePath(match[2] ?? "");
 			if (bundle) break;
 		}
-		// Apple system apps (Terminal.app etc.) live under /System and get
-		// special TCC handling — Speech APIs work there without usage
-		// descriptions (verified live). Only third-party hosts can trigger
-		// the missing-usage-description abort.
-		if (bundle?.startsWith("/System/")) bundle = null;
-		if (bundle) {
-			for (const key of ["NSSpeechRecognitionUsageDescription", "NSMicrophoneUsageDescription"]) {
-				const read = Bun.spawnSync(["defaults", "read", `${bundle}/Contents/Info`, key], {
-					stdout: "ignore",
-					stderr: "ignore",
-				});
-				if (read.exitCode !== 0) {
-					logger.warn("Apple speech disabled: hosting terminal app lacks usage description", {
-						bundle,
-						key,
-					});
-					usable = false;
-					break;
-				}
+		const hostClass = classifyHostBundle(bundle);
+		let hasUsageKeys = false;
+		if (hostClass === "app" && bundle) {
+			hasUsageKeys = ["NSSpeechRecognitionUsageDescription", "NSMicrophoneUsageDescription"].every(
+				key =>
+					Bun.spawnSync(["defaults", "read", `${bundle}/Contents/Info`, key], {
+						stdout: "ignore",
+						stderr: "ignore",
+					}).exitCode === 0,
+			);
+			if (!hasUsageKeys) {
+				logger.warn("Apple speech disabled: hosting terminal app lacks usage descriptions", { bundle });
 			}
 		}
+		usable = hostClassAllowsInProcessSpeech(hostClass, hasUsageKeys);
+		if (!usable && hostClass === "none") {
+			logger.warn("Apple speech disabled: hosting terminal could not be verified (fail-closed)");
+		}
 	} catch {
-		usable = true; // fail-open: absence of evidence is not a crash risk signal
+		usable = false; // fail-closed: eligibility must be provable
 	}
 	hostAppCheckCache = { usable };
 	return usable;
