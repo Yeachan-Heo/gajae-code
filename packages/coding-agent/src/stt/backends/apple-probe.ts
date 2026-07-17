@@ -82,6 +82,18 @@ const PROBE_TIMEOUT_MS = 6 * 60 * 1000;
 
 let cachedOutcome: SpeechProbeOutcome | null = null;
 
+/**
+ * Cache policy: only definitive verdicts persist for the process lifetime.
+ * Transient failures (unanswered-prompt timeout, spawn errors) must retry.
+ */
+export function shouldCacheOutcome(outcome: SpeechProbeOutcome): boolean {
+	return (
+		outcome.safe ||
+		outcome.reason?.startsWith("crash:") === true ||
+		outcome.reason?.startsWith("permission:") === true
+	);
+}
+
 /** Test hook — reset the per-process probe cache. */
 export function resetSpeechProbeCache(): void {
 	cachedOutcome = null;
@@ -112,10 +124,10 @@ export async function probeInProcessSpeechSafety(): Promise<SpeechProbeOutcome> 
 		if (!outcome.safe) {
 			logger.warn("In-process speech probe reported unsafe", { reason: outcome.reason });
 		}
-		cachedOutcome = outcome;
+		if (shouldCacheOutcome(outcome)) cachedOutcome = outcome;
+		return outcome;
 	} catch (err) {
 		logger.warn("In-process speech probe failed to run", { error: String(err) });
-		cachedOutcome = { safe: false, reason: "error:spawn_failed" };
+		return { safe: false, reason: "error:spawn_failed" };
 	}
-	return cachedOutcome;
 }

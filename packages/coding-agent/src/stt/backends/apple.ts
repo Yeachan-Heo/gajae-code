@@ -193,13 +193,32 @@ export interface AppleAvailability {
  * `stt.backend=apple`, which uses this same path. May trigger the one-time
  * speech/microphone permission prompts (they are prerequisites for any real
  * session).
+ *
+ * `options.probe=false` skips the sacrificial probe (and therefore any
+ * permission prompt or microphone access) for display-only surfaces like
+ * `gjc setup stt`; in that mode the result reports static facts and must
+ * not be used to authorize an in-process session.
  */
-export async function appleBackendAvailability(language?: string): Promise<AppleAvailability> {
+export async function appleBackendAvailability(
+	language?: string,
+	options?: { probe?: boolean },
+): Promise<AppleAvailability> {
 	if (process.platform !== "darwin") {
 		return { usable: false, reason: "platform", authorization: "notDetermined" };
 	}
 	if (hostFastNegative()) {
 		return { usable: false, reason: "host-app", authorization: "notDetermined" };
+	}
+	if (options?.probe === false) {
+		const support = macSpeechSupport(appleLocaleForLanguage(language));
+		const authorization = (macSpeechAuthorizationStatus() ?? "notDetermined") as AppleAuthorization;
+		if (!support.locale) return { usable: false, reason: "locale", authorization };
+		if (!support.available) return { usable: false, reason: "assets", authorization };
+		if (!support.onDevice) return { usable: false, reason: "on-device", authorization };
+		if (authorization === "denied" || authorization === "restricted") {
+			return { usable: false, reason: "permission", authorization };
+		}
+		return { usable: true, authorization };
 	}
 	const probe = await probeInProcessSpeechSafety();
 	if (!probe.safe) {

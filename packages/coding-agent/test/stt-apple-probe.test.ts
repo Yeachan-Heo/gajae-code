@@ -35,3 +35,14 @@ describe("decideProbeOutcome (pure)", () => {
 		expect(decideProbeOutcome({ exitCode: 0, signalCode: null, stdout }).safe).toBe(true);
 	});
 });
+
+describe("shouldCacheOutcome (pure)", () => {
+	test("definitive verdicts cache; transient failures retry", async () => {
+		const { shouldCacheOutcome } = await import("../src/stt/backends/apple-probe");
+		expect(shouldCacheOutcome({ safe: true })).toBe(true);
+		expect(shouldCacheOutcome({ safe: false, reason: "crash:SIGABRT" })).toBe(true);
+		expect(shouldCacheOutcome({ safe: false, reason: "permission:denied" })).toBe(true);
+		expect(shouldCacheOutcome({ safe: false, reason: "error:unparseable_exit_137" })).toBe(false);
+		expect(shouldCacheOutcome({ safe: false, reason: "error:spawn_failed" })).toBe(false);
+	});
+});

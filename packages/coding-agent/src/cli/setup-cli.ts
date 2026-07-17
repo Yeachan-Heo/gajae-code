@@ -494,7 +494,8 @@ async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Pr
 async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
 	const { checkDependencies, formatDependencyStatus } = await import("../stt/setup");
 	const { appleBackendAvailability } = await import("../stt/backends/apple");
-	const apple = await appleBackendAvailability();
+	// Display-only: never probe (no permission prompts, no microphone access).
+	const apple = await appleBackendAvailability(undefined, { probe: false });
 	const status = await checkDependencies();
 
 	if (flags.json) {
