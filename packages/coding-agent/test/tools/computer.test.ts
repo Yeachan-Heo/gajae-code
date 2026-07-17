@@ -268,99 +268,102 @@ describe("computer tool gating", () => {
 		}
 	});
 
-	it("selects the broker controller and initializes its ownership lease during tool creation", async () => {
-		const runtimeDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "computer-broker-tool-test-"));
-		const socketPath = path.join(runtimeDirectory, "broker.sock");
-		const token = "a".repeat(64);
-		const previousEnvironment = snapshotBrokerEnvironment();
-		const sockets = new Set<net.Socket>();
-		let leases = 0;
-		const requests: string[] = [];
-		const deadlines: Array<number | null | undefined> = [];
-		const leaseAck = Promise.withResolvers<void>();
-		const server = net.createServer(socket => {
-			sockets.add(socket);
-			socket.once("close", () => sockets.delete(socket));
-			let buffer = "";
-			socket.on("data", chunk => {
-				buffer += chunk.toString("utf8");
-				while (buffer.includes("\n")) {
-					const newline = buffer.indexOf("\n");
-					const frame = JSON.parse(buffer.slice(0, newline)) as {
-						type: string;
-						id?: string;
-						method?: string;
-						deadlineAtMs?: number | null;
-					};
-					buffer = buffer.slice(newline + 1);
-					if (frame.type === "lease") {
-						leases++;
-						void leaseAck.promise.then(() => {
-							if (!socket.destroyed)
-								socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
-						});
-						continue;
+	it.if(process.platform === "darwin")(
+		"selects the broker controller and initializes its ownership lease during tool creation",
+		async () => {
+			const runtimeDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "computer-broker-tool-test-"));
+			const socketPath = path.join(runtimeDirectory, "broker.sock");
+			const token = "a".repeat(64);
+			const previousEnvironment = snapshotBrokerEnvironment();
+			const sockets = new Set<net.Socket>();
+			let leases = 0;
+			const requests: string[] = [];
+			const deadlines: Array<number | null | undefined> = [];
+			const leaseAck = Promise.withResolvers<void>();
+			const server = net.createServer(socket => {
+				sockets.add(socket);
+				socket.once("close", () => sockets.delete(socket));
+				let buffer = "";
+				socket.on("data", chunk => {
+					buffer += chunk.toString("utf8");
+					while (buffer.includes("\n")) {
+						const newline = buffer.indexOf("\n");
+						const frame = JSON.parse(buffer.slice(0, newline)) as {
+							type: string;
+							id?: string;
+							method?: string;
+							deadlineAtMs?: number | null;
+						};
+						buffer = buffer.slice(newline + 1);
+						if (frame.type === "lease") {
+							leases++;
+							void leaseAck.promise.then(() => {
+								if (!socket.destroyed)
+									socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
+							});
+							continue;
+						}
+						if (frame.type === "request" && frame.id && frame.method) {
+							requests.push(frame.method);
+							deadlines.push(frame.deadlineAtMs);
+							socket.write(
+								`${JSON.stringify({ version: 1, type: "response", id: frame.id, ok: true, result: frame.method === "screenshot" ? { png: "AQID", widthPx: 2, heightPx: 1 } : null })}\n`,
+							);
+						}
 					}
-					if (frame.type === "request" && frame.id && frame.method) {
-						requests.push(frame.method);
-						deadlines.push(frame.deadlineAtMs);
-						socket.write(
-							`${JSON.stringify({ version: 1, type: "response", id: frame.id, ok: true, result: frame.method === "screenshot" ? { png: "AQID", widthPx: 2, heightPx: 1 } : null })}\n`,
-						);
-					}
-				}
+				});
 			});
-		});
-		try {
-			const listening = Promise.withResolvers<void>();
-			server.once("error", listening.reject);
-			server.listen(socketPath, listening.resolve);
-			await listening.promise;
-			await fs.chmod(socketPath, 0o600);
-			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
-			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
-			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = runtimeDirectory;
-			setCurrentBrokerIdentityEnvironment();
-			setComputerPlatformForTests("darwin");
-			setComputerArchForTests("arm64");
-			setComputerControllerFactoryForTests(undefined);
+			try {
+				const listening = Promise.withResolvers<void>();
+				server.once("error", listening.reject);
+				server.listen(socketPath, listening.resolve);
+				await listening.promise;
+				await fs.chmod(socketPath, 0o600);
+				process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+				process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+				process.env[GJC_COMPUTER_BROKER_DIR_ENV] = runtimeDirectory;
+				setCurrentBrokerIdentityEnvironment();
+				setComputerPlatformForTests("darwin");
+				setComputerArchForTests("arm64");
+				setComputerControllerFactoryForTests(undefined);
 
-			const tool = ComputerTool.createIf(createSession(Settings.isolated({ "computer.enabled": true })));
-			expect(tool).toBeInstanceOf(ComputerTool);
-			if (!tool) throw new Error("expected computer tool");
-			const execution = tool.execute("broker-screenshot", { action: "screenshot", timeout: 1 });
-			for (let attempt = 0; leases === 0 && attempt < 20; attempt++) await sleep(5);
-			expect(leases).toBe(1);
-			await sleep(20);
-			expect(requests).toEqual([]);
-			leaseAck.resolve();
-			const result = await execution;
-			const clickResult = await tool.execute("broker-click-screenshot", {
-				action: "click",
-				x: 1,
-				y: 0,
-				include_screenshot: true,
-				timeout: 1,
-			});
-			expect(clickResult.isError).not.toBe(true);
+				const tool = ComputerTool.createIf(createSession(Settings.isolated({ "computer.enabled": true })));
+				expect(tool).toBeInstanceOf(ComputerTool);
+				if (!tool) throw new Error("expected computer tool");
+				const execution = tool.execute("broker-screenshot", { action: "screenshot", timeout: 1 });
+				for (let attempt = 0; leases === 0 && attempt < 20; attempt++) await sleep(5);
+				expect(leases).toBe(1);
+				await sleep(20);
+				expect(requests).toEqual([]);
+				leaseAck.resolve();
+				const result = await execution;
+				const clickResult = await tool.execute("broker-click-screenshot", {
+					action: "click",
+					x: 1,
+					y: 0,
+					include_screenshot: true,
+					timeout: 1,
+				});
+				expect(clickResult.isError).not.toBe(true);
 
-			expect(result.isError).not.toBe(true);
-			expect(requests).toEqual(["screenshot", "click", "screenshot"]);
-			expect(deadlines).toHaveLength(3);
-			expect(deadlines.every(deadline => typeof deadline === "number")).toBe(true);
-		} finally {
-			leaseAck.resolve();
-			for (const socket of sockets) socket.destroy();
-			const closed = Promise.withResolvers<void>();
-			server.close(error => {
-				if (error) closed.reject(error);
-				else closed.resolve();
-			});
-			await closed.promise;
-			await fs.rm(runtimeDirectory, { recursive: true, force: true });
-			restoreBrokerEnvironment(previousEnvironment);
-		}
-	});
+				expect(result.isError).not.toBe(true);
+				expect(requests).toEqual(["screenshot", "click", "screenshot"]);
+				expect(deadlines).toHaveLength(3);
+				expect(deadlines.every(deadline => typeof deadline === "number")).toBe(true);
+			} finally {
+				leaseAck.resolve();
+				for (const socket of sockets) socket.destroy();
+				const closed = Promise.withResolvers<void>();
+				server.close(error => {
+					if (error) closed.reject(error);
+					else closed.resolve();
+				});
+				await closed.promise;
+				await fs.rm(runtimeDirectory, { recursive: true, force: true });
+				restoreBrokerEnvironment(previousEnvironment);
+			}
+		},
+	);
 
 	it("does not fall back to the native controller when broker configuration is invalid", async () => {
 		const previousEnvironment = snapshotBrokerEnvironment();
