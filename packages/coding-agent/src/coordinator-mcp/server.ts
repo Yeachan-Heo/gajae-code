@@ -1264,13 +1264,20 @@ async function readSessionLocalRuntimeState(
 	return isRuntimeSourcedSessionState(payload, sessionId) ? payload : null;
 }
 
-// A session-local runtime state carries no turn correlation (current_turn_id is
-// never populated on this path), so only trust it for a turn that was already
-// running when the state was written.
-function runtimeStateCoversTurn(state: CoordinatorSessionState, turn: TurnRecord): boolean {
-	const stateMs = Date.parse(state.updated_at);
-	const turnMs = Date.parse(turn.started_at ?? turn.created_at);
-	return Number.isFinite(stateMs) && Number.isFinite(turnMs) && stateMs >= turnMs;
+// A session-local terminal state is only trusted when it names the exact
+// runtime turn this coordinator turn was acknowledged with. The sidecar stamps
+// terminal writes with the SDK prompt correlation captured at scheduling time,
+// so a previous turn's delayed terminal write can never be attributed to a
+// successor turn — wall-clock ordering is not a substitute for this match, and
+// states without the stamp (older runtimes) are never trusted.
+function runtimeStateMatchesTurn(state: CoordinatorSessionState, turn: TurnRecord): boolean {
+	const runtimeTurnId = (state as unknown as Record<string, unknown>).runtime_turn_id;
+	return (
+		typeof runtimeTurnId === "string" &&
+		runtimeTurnId.length > 0 &&
+		typeof turn.delivery.runtime_turn_id === "string" &&
+		runtimeTurnId === turn.delivery.runtime_turn_id
+	);
 }
 
 async function writeSessionStateUnlocked(
@@ -2432,7 +2439,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (
 				runtimeState &&
 				(runtimeState.state === "completed" || runtimeState.state === "errored") &&
-				runtimeStateCoversTurn(runtimeState, resolvedTurn)
+				runtimeStateMatchesTurn(runtimeState, resolvedTurn)
 			) {
 				sessionState = {
 					...runtimeState,

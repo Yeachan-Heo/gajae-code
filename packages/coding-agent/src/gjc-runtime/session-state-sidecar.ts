@@ -544,6 +544,36 @@ function branchForContext(context: RuntimeStateContext): string | null {
 	return context.branch ?? (process.env[GJC_COORDINATOR_SESSION_BRANCH_ENV]?.trim() || null);
 }
 
+export interface RuntimeTurnCorrelation {
+	turnId: string;
+	commandId?: string | null;
+}
+
+/**
+ * Active SDK prompt correlation per session, registered by the in-process SDK
+ * bus when the agent loop starts a prompt. Terminal event persistence captures
+ * the value synchronously when the write is scheduled, so a terminal runtime
+ * state carries the identity of the runtime turn that actually produced it —
+ * out-of-process readers (the coordinator MCP bridge) must not infer that
+ * attribution from wall-clock ordering.
+ */
+const activeRuntimeTurnCorrelations = new Map<string, RuntimeTurnCorrelation>();
+
+export function setActiveRuntimeTurnCorrelation(sessionId: string, correlation: RuntimeTurnCorrelation | null): void {
+	const id = sessionId.trim();
+	if (!id) return;
+	const turnId = correlation?.turnId.trim();
+	if (turnId) {
+		activeRuntimeTurnCorrelations.set(id, { turnId, commandId: correlation?.commandId?.trim() || null });
+	} else {
+		activeRuntimeTurnCorrelations.delete(id);
+	}
+}
+
+function capturedRuntimeTurnCorrelation(sessionId: string): RuntimeTurnCorrelation | null {
+	return activeRuntimeTurnCorrelations.get(sessionId.trim()) ?? null;
+}
+
 function basePayload(input: {
 	context: RuntimeStateContext;
 	previous: Record<string, unknown>;
@@ -553,6 +583,7 @@ function basePayload(input: {
 	event: string;
 	reason: string | null;
 	sessionId: string;
+	correlation?: RuntimeTurnCorrelation | null;
 }): Record<string, unknown> {
 	const identity = normalizedIdentity(input.context);
 	if (identity.sessionId !== input.sessionId) throw new PreviousRuntimeStateReadError();
@@ -564,6 +595,12 @@ function basePayload(input: {
 		updated_at: input.now,
 		current_turn_id: typeof input.previous.current_turn_id === "string" ? input.previous.current_turn_id : null,
 		last_turn_id: typeof input.previous.last_turn_id === "string" ? input.previous.last_turn_id : null,
+		// SDK prompt correlation is turn-scoped: terminal writes carry the identity
+		// captured when the write was scheduled, and turn-boundary writes always
+		// reset it so a previous turn's identity can never be attributed to a
+		// successor turn.
+		runtime_turn_id: input.correlation?.turnId ?? null,
+		runtime_command_id: input.correlation?.commandId ?? null,
 		live: input.state === "running",
 		reason: input.reason,
 		source: input.source,
@@ -878,6 +915,11 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	if (!stateFile || !state) return;
 	context = contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
+	// Capture synchronously at scheduling time: by the time this serialized
+	// write executes, a successor prompt may already have re-registered the
+	// active correlation.
+	const correlation =
+		state === "completed" || state === "errored" ? capturedRuntimeTurnCorrelation(identity.sessionId) : null;
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
@@ -899,6 +941,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 								event: event.type,
 								reason: null,
 								sessionId: identity.sessionId,
+								correlation,
 							}),
 							...(state === "completed" || state === "errored" ? { ended_at: now } : {}),
 							...(finalResponseForEvent(event) ? { final_response: finalResponseForEvent(event) } : {}),

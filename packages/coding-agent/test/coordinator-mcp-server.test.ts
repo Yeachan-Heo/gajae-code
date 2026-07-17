@@ -1501,7 +1501,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 });
 
 describe("Coordinator MCP session-local runtime state fallback", () => {
-	function sessionLocalRuntimeState(root: string, state: "completed" | "errored", updatedAt: string) {
+	function sessionLocalRuntimeState(root: string, state: "completed" | "errored", runtimeTurnId: string | null) {
 		return {
 			schema_version: 1,
 			session_id: "visible-session",
@@ -1509,7 +1509,7 @@ describe("Coordinator MCP session-local runtime state fallback", () => {
 			ready_for_input: state === "completed",
 			current_turn_id: null,
 			last_turn_id: null,
-			updated_at: updatedAt,
+			updated_at: new Date().toISOString(),
 			source: "agent_session_event",
 			event: "agent_end",
 			live: false,
@@ -1517,6 +1517,8 @@ describe("Coordinator MCP session-local runtime state fallback", () => {
 			cwd: root,
 			workdir: root,
 			session_file: null,
+			runtime_turn_id: runtimeTurnId,
+			runtime_command_id: null,
 			final_response: {
 				text: "DONE",
 				format: "markdown",
@@ -1527,10 +1529,7 @@ describe("Coordinator MCP session-local runtime state fallback", () => {
 		};
 	}
 
-	it("resolves terminal turns from the session-local runtime state when the coordinator store was never runtime-updated", async () => {
-		const root = await tempRoot();
-		const server = await createSdkControlServer(root, []);
-		await registerSdkSession(server, root);
+	async function sendTrackedPrompt(server: Awaited<ReturnType<typeof createSdkControlServer>>) {
 		const sent = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
 			prompt: "work",
@@ -1538,28 +1537,41 @@ describe("Coordinator MCP session-local runtime state fallback", () => {
 			allow_mutation: true,
 		});
 		const turnId = sent.turn_id;
+		const runtimeTurnId = (sent.turn as { delivery?: { runtime_turn_id?: unknown } }).delivery?.runtime_turn_id;
 		if (typeof turnId !== "string") throw new Error("missing coordinator turn id");
+		if (typeof runtimeTurnId !== "string") throw new Error("missing runtime turn id");
+		return { turnId, runtimeTurnId };
+	}
+
+	it("resolves terminal turns from a session-local runtime state naming this runtime turn", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		const { turnId, runtimeTurnId } = await sendTrackedPrompt(server);
 		const runtimeDir = sessionRuntimeDir(root, "visible-session");
 		await fs.mkdir(runtimeDir, { recursive: true });
 		const runtimeStateFile = path.join(runtimeDir, "runtime-state.json");
 
-		// A terminal state written before this turn started (e.g. a previous turn's
-		// completion) carries no turn correlation and must not resolve the new turn.
+		// A delayed terminal write from a previous runtime turn carries that turn's
+		// correlation (or none, on older runtimes); neither may resolve this turn,
+		// no matter how fresh the write's timestamp is.
+		await Bun.write(runtimeStateFile, JSON.stringify(sessionLocalRuntimeState(root, "completed", null)));
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: turnId })).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "active" },
+		});
 		await Bun.write(
 			runtimeStateFile,
-			JSON.stringify(sessionLocalRuntimeState(root, "completed", new Date(Date.now() - 60_000).toISOString())),
+			JSON.stringify(sessionLocalRuntimeState(root, "completed", "some-previous-runtime-turn")),
 		);
 		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: turnId })).resolves.toMatchObject({
 			ok: true,
 			turn: { status: "active" },
 		});
 
-		// A terminal transition recorded while the turn was running resolves it and
-		// carries the sidecar's final_response into the durable turn record.
-		await Bun.write(
-			runtimeStateFile,
-			JSON.stringify(sessionLocalRuntimeState(root, "completed", new Date(Date.now() + 60_000).toISOString())),
-		);
+		// A terminal state stamped with this turn's runtime correlation resolves it
+		// and carries the sidecar's final_response into the durable turn record.
+		await Bun.write(runtimeStateFile, JSON.stringify(sessionLocalRuntimeState(root, "completed", runtimeTurnId)));
 		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: turnId })).resolves.toMatchObject({
 			ok: true,
 			turn: { status: "completed", final_response: { text: "DONE" } },
@@ -1567,23 +1579,16 @@ describe("Coordinator MCP session-local runtime state fallback", () => {
 		});
 	});
 
-	it("marks turns failed from a session-local errored runtime state", async () => {
+	it("marks turns failed from a session-local errored runtime state naming this runtime turn", async () => {
 		const root = await tempRoot();
 		const server = await createSdkControlServer(root, []);
 		await registerSdkSession(server, root);
-		const sent = await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "work",
-			idempotency_key: "prompt-1",
-			allow_mutation: true,
-		});
-		const turnId = sent.turn_id;
-		if (typeof turnId !== "string") throw new Error("missing coordinator turn id");
+		const { turnId, runtimeTurnId } = await sendTrackedPrompt(server);
 		const runtimeDir = sessionRuntimeDir(root, "visible-session");
 		await fs.mkdir(runtimeDir, { recursive: true });
 		await Bun.write(
 			path.join(runtimeDir, "runtime-state.json"),
-			JSON.stringify(sessionLocalRuntimeState(root, "errored", new Date(Date.now() + 60_000).toISOString())),
+			JSON.stringify(sessionLocalRuntimeState(root, "errored", runtimeTurnId)),
 		);
 		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: turnId })).resolves.toMatchObject({
 			ok: true,

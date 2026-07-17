@@ -20,6 +20,7 @@ import {
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorRuntimeStateFromPostmortem,
 	readTerminalRuntimeStateMarker,
+	setActiveRuntimeTurnCorrelation,
 	stateForEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
 import {
@@ -199,6 +200,44 @@ describe("coordinator runtime state sidecar", () => {
 			});
 		} finally {
 			setSystemTime();
+		}
+	});
+
+	it("stamps terminal writes with the runtime turn correlation captured at scheduling time", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "correlation-session";
+		try {
+			setActiveRuntimeTurnCorrelation("correlation-session", { turnId: "runtime-turn-a", commandId: "command-a" });
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			// Turn-boundary writes never carry a correlation, so a previous turn's
+			// identity cannot leak onto a successor turn's running state.
+			expect(await readJson(stateFile)).toMatchObject({
+				state: "running",
+				runtime_turn_id: null,
+				runtime_command_id: null,
+			});
+
+			// Schedule the terminal write, then immediately re-register a successor
+			// correlation before it executes (the delayed agent_end write race): the
+			// terminal payload must keep the identity captured at scheduling time.
+			const pendingTerminal = persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_end", messages: [] },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			setActiveRuntimeTurnCorrelation("correlation-session", { turnId: "runtime-turn-b", commandId: "command-b" });
+			await pendingTerminal;
+			expect(await readJson(stateFile)).toMatchObject({
+				state: "completed",
+				runtime_turn_id: "runtime-turn-a",
+				runtime_command_id: "command-a",
+			});
+		} finally {
+			setActiveRuntimeTurnCorrelation("correlation-session", null);
 		}
 	});
 

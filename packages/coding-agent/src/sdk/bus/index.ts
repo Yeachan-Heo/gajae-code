@@ -33,6 +33,7 @@ import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { logger, postmortem, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { setActiveRuntimeTurnCorrelation } from "../../gjc-runtime/session-state-sidecar";
 import type {
 	WorkflowGateEmitter,
 	WorkflowGateTerminalController,
@@ -3798,6 +3799,11 @@ export function createNotificationsExtension(
 		rt.busy = true;
 		const correlation = rt.pendingPromptCorrelations.shift();
 		rt.activePromptCorrelation = correlation;
+		// Register the active prompt identity so the runtime-state sidecar can stamp
+		// terminal writes with the exact runtime turn (consumed out-of-process by
+		// the coordinator MCP bridge). Not cleared on agent_end: the terminal write
+		// captures it at scheduling time, and the next agent_start re-registers.
+		if (correlation) setActiveRuntimeTurnCorrelation(id, correlation);
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {
 			// `activity` is the native live-host lifecycle surface. The separately
@@ -4122,6 +4128,7 @@ export function createNotificationsExtension(
 
 	api.on("session_shutdown", async (_event, ctx) => {
 		const id = sessionId(ctx);
+		setActiveRuntimeTurnCorrelation(id, null);
 		const rt = runtimes.get(id);
 		if (rt) terminalizeInFlightTools(rt, id, "unknown");
 		const controllerStop =

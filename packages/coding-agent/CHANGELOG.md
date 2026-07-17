@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
-- Coordinator MCP turns from broker-spawned sessions now reach terminal state: `read_turn`/`await_turn` fall back to the session-local runtime sidecar state (with a stale-write guard) when the coordinator session-states store was never runtime-updated, carrying the sidecar's `final_response` into the durable turn record (#2549).
+- Coordinator MCP turns from broker-spawned sessions now reach terminal state: the runtime sidecar stamps terminal writes with the SDK prompt correlation captured at scheduling time (reset on turn boundaries), and `read_turn`/`await_turn` fall back to the session-local runtime state only when it names the turn's exact runtime correlation — carrying the sidecar's `final_response` into the durable turn record without wall-clock attribution (#2549).
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
 - Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
 
