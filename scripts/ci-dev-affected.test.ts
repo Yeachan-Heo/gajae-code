@@ -370,7 +370,9 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		tempDirs.push(tempDir);
 		const outputFile = path.join(tempDir, "github-output.txt");
 		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
-		const base = Bun.spawnSync(["git", "rev-parse", "HEAD^"], { cwd: repoRoot }).stdout.toString().trim();
+		// Shard checkouts are depth-one, so use the canonical head as an available
+		// event-base commit while the mutable base ref deliberately does not exist.
+		const base = head;
 		const result = await runScript(["--matrix-json"], "", {
 			GITHUB_EVENT_NAME: "pull_request",
 			GITHUB_BASE_REF: "ci-dev-affected-base-ref-moved",
