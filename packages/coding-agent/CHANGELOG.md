@@ -22,6 +22,7 @@
 ### Added
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 - Added a searchable command palette with direct action dispatch; slash commands run only from an empty composer, and drafts are never touched.
+- Added deep-interview intent manifests that preserve user-locked artifacts, surfaces, and integrations through Round 0.
 
 ### Fixed
 
