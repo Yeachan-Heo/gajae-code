@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `createAgentSession` now closes the factory-owned credential store on dispose, releasing the `agent.db` SQLite WAL/SHM handles that leaked a connection per embedded session and, on Windows, blocked agent-directory removal with `EBUSY`. Embedder-supplied `authStorage`/`modelRegistry` instances remain open for the embedder.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

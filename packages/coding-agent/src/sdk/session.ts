@@ -985,6 +985,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
+	// The factory owns the credential store only when it opened it itself via
+	// discoverAuthStorage(); embedder-supplied storage/registries must stay open
+	// for the embedder. Owned stores are closed on dispose — on Windows an open
+	// SQLite WAL handle (agent.db-shm mapping) otherwise blocks agent-dir removal.
+	const ownsAuthStorage = !options.modelRegistry && !options.authStorage;
 	// Subscribe before any getApiKey() call so startup model probes can't fire a
 	// credential_disabled event past us. An embedder's constructor handler makes the
 	// listener set non-empty from construction, which defeats AuthStorage's no-listener
@@ -2583,6 +2588,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					agentRegistry.unregister(resolvedAgentId);
 					unsubscribeCredentialDisabled?.();
 					releaseLocalProtocolOverride();
+					if (ownsAuthStorage) authStorage.close();
 				}
 			};
 		}
@@ -2713,6 +2719,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			logger.warn("Failed to clean up createAgentSession resources after startup error");
 		} finally {
 			releaseLocalProtocolOverride();
+			// Idempotent with the dispose wrapper: AuthStorage.close() guards re-entry.
+			if (ownsAuthStorage) authStorage.close();
 		}
 		throw error;
 	}
