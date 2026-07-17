@@ -49,6 +49,23 @@ const dirFor = (agentDir: string) => path.join(agentDir, "sdk", "sessions");
 const logFor = (agentDir: string) => path.join(dirFor(agentDir), "index.jsonl");
 const snapshotFor = (agentDir: string) => path.join(dirFor(agentDir), "index.snapshot.json");
 const ROTATE_BYTES = 4 * 1024 * 1024;
+function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
+	if (!snapshot || typeof snapshot !== "object") return false;
+	const { indexSeq, events } = snapshot as { indexSeq?: unknown; events?: unknown };
+	return (
+		typeof indexSeq === "number" &&
+		Number.isSafeInteger(indexSeq) &&
+		indexSeq >= 0 &&
+		Array.isArray(events) &&
+		events.length === indexSeq &&
+		events.every((event, index) => {
+			if (!event || typeof event !== "object") return false;
+			const { checksum, ...unsigned } = event as SessionIndexEvent;
+			return event.indexSeq === index + 1 && checksum === sessionIndexChecksum(unsigned);
+		})
+	);
+}
+
 async function appendSync(file: string, value: string): Promise<void> {
 	const h = await fs.open(file, "a", 0o600);
 	try {
@@ -119,20 +136,9 @@ export class SessionIndex {
 				indexSeq?: number;
 			};
 			assertSupportedStateVersion(snapshotFor(this.#agentDir), snapshot);
-			const snapshotIndexSeq = snapshot.indexSeq;
-			if (
-				typeof snapshotIndexSeq !== "number" ||
-				!Number.isSafeInteger(snapshotIndexSeq) ||
-				snapshotIndexSeq < 0 ||
-				!Array.isArray(snapshot.events) ||
-				snapshot.events.some(event => {
-					const { checksum, ...unsigned } = event;
-					return event.indexSeq > snapshotIndexSeq || checksum !== sessionIndexChecksum(unsigned);
-				})
-			)
-				throw new Error("invalid snapshot");
+			if (!isValidSnapshot(snapshot)) throw new Error("invalid snapshot");
 			this.#events = snapshot.events;
-			snapshotSeq = snapshotIndexSeq;
+			snapshotSeq = snapshot.indexSeq;
 		} catch (e) {
 			if (e instanceof UnsupportedStateVersionError) throw e;
 			if ((e as NodeJS.ErrnoException).code !== "ENOENT") this.#warnings.push("Invalid session index snapshot");
@@ -230,13 +236,7 @@ export class SessionIndex {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
 		}
-		if (
-			current &&
-			typeof current === "object" &&
-			typeof (current as { indexSeq?: unknown }).indexSeq === "number" &&
-			(current as { indexSeq: number }).indexSeq > this.indexSeq
-		)
-			return;
+		if (isValidSnapshot(current) && current.indexSeq > this.indexSeq) return;
 		const tmp = `${file}.${process.pid}.tmp`;
 		await fs.writeFile(
 			tmp,

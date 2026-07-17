@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { SessionIndex } from "../src/sdk/broker/session-index";
+import { SessionIndex, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 
 const event = (sessionId: string) => ({
 	type: "host_registered" as const,
@@ -72,6 +72,41 @@ describe("SDK session index", () => {
 		const replay = await new SessionIndex(dir).open();
 		expect(replay.indexSeq).toBe(2);
 		expect(replay.listSessions().warnings).toEqual([]);
+	});
+	it("replaces a structurally invalid high-sequence snapshot before rotating an oversized log", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const snapshotFile = path.join(sessionsDir, "index.snapshot.json");
+		await index.append(event("before"));
+		await index.snapshot();
+		const invalidSnapshot = JSON.parse(await fs.readFile(snapshotFile, "utf8"));
+		invalidSnapshot.indexSeq = 999;
+		await fs.writeFile(snapshotFile, JSON.stringify(invalidSnapshot));
+		const oversized = {
+			...event("oversized"),
+			locator: { repo: "r".repeat(4 * 1024 * 1024), stateRoot: "q" },
+			version: invalidSnapshot.version,
+			indexSeq: 2,
+			ts: Date.now(),
+		};
+		await fs.appendFile(
+			path.join(sessionsDir, "index.jsonl"),
+			`${JSON.stringify({ ...oversized, checksum: sessionIndexChecksum(oversized) })}\n`,
+		);
+
+		await index.append(event("after"));
+
+		expect(JSON.parse(await fs.readFile(snapshotFile, "utf8")).indexSeq).toBe(3);
+
+		expect((await fs.stat(path.join(sessionsDir, "index.jsonl"))).size).toBe(0);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().sessions.map(session => session.sessionId)).toEqual([
+			"before",
+			"oversized",
+			"after",
+		]);
+		expect(replay.indexSeq).toBe(3);
 	});
 	it("tolerates Windows permission errors while opening and syncing the snapshot directory", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
