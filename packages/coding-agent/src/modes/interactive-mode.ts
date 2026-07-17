@@ -2731,6 +2731,27 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/**
+	 * Enter during an active voice session: finalize the transcript and
+	 * submit it (plus any already-typed text) in one stroke. Returns true
+	 * when the key press was consumed.
+	 */
+	handleSTTSubmit(typedText: string): boolean {
+		if (this.#sttController?.state !== "recording") return false;
+		const controller = this.#sttController;
+		void (async () => {
+			// Finalize through the normal toggle path — transcript lands in the
+			// (already reset) composer via insertText.
+			await controller.toggle(this.editor, this.#sttToggleOptions());
+			const transcript = this.editor.getText().trim();
+			const combined = [typedText.trim(), transcript].filter(Boolean).join(" ");
+			this.editor.setText("");
+			if (combined.length === 0) return;
+			await this.#inputController.submitText(combined, { ownsComposer: true, editor: this.editor });
+		})();
+		return true;
+	}
+
+	/**
 	 * Cancel an active voice session (Esc while listening/transcribing).
 	 * Returns true when the key press was consumed.
 	 */
@@ -2779,7 +2800,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const language = (settings.get("stt.language") as string | undefined) ?? "";
 		const languageLabel = language && language !== "auto" ? ` (${language})` : "";
 		const meter = renderLevelSparkline(this.#voiceLevels);
-		this.showStatus(`${theme.icon.mic} listening${languageLabel} ${meter}  alt+h done · esc cancel`);
+		this.showStatus(`${theme.icon.mic} listening${languageLabel} ${meter}  enter send · alt+h done · esc cancel`);
 	}
 
 	#setMicCursor(color: { r: number; g: number; b: number }): void {
