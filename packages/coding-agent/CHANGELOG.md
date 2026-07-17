@@ -10,6 +10,7 @@
 ### Added
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 - Added a searchable command palette with direct action dispatch; slash commands run only from an empty composer, and drafts are never touched.
+- Added deep-interview fact provenance boundaries that preserve legacy state safely and prevent malformed new facts from bypassing closure.
 
 ### Fixed
 
