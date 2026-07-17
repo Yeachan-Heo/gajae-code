@@ -1038,7 +1038,11 @@ export async function runRootCommand(
 	let bareResumeSessionManager: SessionManager | undefined;
 	let bareResumeAction: "continue-tail" | "open-idle" | undefined;
 
-	await (deps.acquireComputerBrokerLease ?? acquireComputerBrokerLeaseFromEnvironment)().catch(() => undefined);
+	try {
+		await (deps.acquireComputerBrokerLease ?? acquireComputerBrokerLeaseFromEnvironment)();
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "COMPUTER_BROKER_CLEANUP_FAILED") throw error;
+	}
 	if (isBareResume(parsedArgs)) {
 		if (hasBareResumeConflict(parsedArgs)) {
 			process.stderr.write(`${BARE_RESUME_CONFLICT_ERROR}\n`);

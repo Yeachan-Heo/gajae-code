@@ -23,6 +23,40 @@ it("acquires the managed computer broker lease before root-command routing", asy
 	expect(events).toEqual(["acquire", "route"]);
 });
 
+it("continues root routing after an ordinary ambient broker failure", async () => {
+	const events: string[] = [];
+	await runRootCommand(parseArgs(["--resume"]), [], {
+		acquireComputerBrokerLease: async () => {
+			events.push("acquire");
+			throw Object.assign(new Error("unavailable"), { code: "COMPUTER_BROKER_UNAVAILABLE" });
+		},
+		isResumePickerTerminal: () => {
+			events.push("route");
+			return false;
+		},
+		suppressProcessExit: true,
+	});
+	expect(events).toEqual(["acquire", "route"]);
+});
+
+it("propagates ambient computer broker cleanup failures before root routing", async () => {
+	const cleanupError = Object.assign(new Error("cleanup failed"), { code: "COMPUTER_BROKER_CLEANUP_FAILED" });
+	let routed = false;
+	await expect(
+		runRootCommand(parseArgs(["--resume"]), [], {
+			acquireComputerBrokerLease: async () => {
+				throw cleanupError;
+			},
+			isResumePickerTerminal: () => {
+				routed = true;
+				return false;
+			},
+			suppressProcessExit: true,
+		}),
+	).rejects.toBe(cleanupError);
+	expect(routed).toBe(false);
+});
+
 it("dispatches only the exact hidden computer broker selector", async () => {
 	let runs = 0;
 	const previousExitCode = process.exitCode;
