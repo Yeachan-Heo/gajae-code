@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- The SDK broker session index (`~/.gjc/agent/sdk/sessions/index.jsonl`) now compacts itself once the log exceeds 1 MiB: superseded per-session `host_heartbeat` rows are pruned into the snapshot and the log is truncated under the append lock. Previously every live host appended a heartbeat row every 5 seconds forever, growing the shared log without bound (observed >100 MB) until concurrent hosts failed with `Failed to acquire lock for .../sessions/index.jsonl after 50 attempts`. Readers that consumed beyond a compaction now rebuild from the snapshot instead of reporting a truncated/dead index.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

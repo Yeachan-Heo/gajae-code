@@ -48,6 +48,13 @@ export const sessionIndexChecksum = (event: Omit<SessionIndexEvent, "checksum">)
 const dirFor = (agentDir: string) => path.join(agentDir, "sdk", "sessions");
 const logFor = (agentDir: string) => path.join(dirFor(agentDir), "index.jsonl");
 const snapshotFor = (agentDir: string) => path.join(dirFor(agentDir), "index.snapshot.json");
+/**
+ * Compact the on-disk log once it grows past this size. Every live SDK host
+ * appends a `host_heartbeat` row every few seconds, so without compaction the
+ * shared log grows without bound and `append`'s lock+replay cost grows with it
+ * until concurrent hosts starve on the file lock.
+ */
+const COMPACT_LOG_BYTES = 1024 * 1024;
 async function appendSync(file: string, value: string): Promise<void> {
 	const h = await fs.open(file, "a", 0o600);
 	try {
@@ -65,13 +72,36 @@ function alive(pid: number): boolean {
 		return (e as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
+/**
+ * Drop `host_heartbeat` events superseded by a newer heartbeat for the same
+ * session. Only the latest heartbeat per session is observable: `listSessions`
+ * keeps the last event per session and merges heartbeat rows with the fields of
+ * the previous non-heartbeat event, and the registration lookups filter on
+ * `host_registered`/`host_unregistered`. Pruning preserves event order and the
+ * global newest event, so `indexSeq` continuity is unaffected.
+ */
+function pruneSupersededHeartbeats(events: SessionIndexEvent[]): SessionIndexEvent[] {
+	const newestHeartbeatSeen = new Set<string>();
+	const kept: SessionIndexEvent[] = [];
+	for (let i = events.length - 1; i >= 0; i--) {
+		const event = events[i]!;
+		if (event.type === "host_heartbeat") {
+			if (newestHeartbeatSeen.has(event.sessionId)) continue;
+			newestHeartbeatSeen.add(event.sessionId);
+		}
+		kept.push(event);
+	}
+	return kept.reverse();
+}
 export class SessionIndex {
 	#agentDir: string;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
 	#logOffset = 0;
-	constructor(agentDir: string) {
+	#compactLogBytes: number;
+	constructor(agentDir: string, options?: { compactLogBytes?: number }) {
 		this.#agentDir = agentDir;
+		this.#compactLogBytes = options?.compactLogBytes ?? COMPACT_LOG_BYTES;
 	}
 	async open(): Promise<this> {
 		await this.assertSupportedStateVersions();
@@ -112,27 +142,29 @@ export class SessionIndex {
 		}
 		await this.#tail(snapshotSeq);
 	}
-	async #tail(snapshotSeq = this.indexSeq): Promise<void> {
+	/**
+	 * Read newly appended log rows. Returns `"truncated"` when the log shrank
+	 * beneath the consumed offset — another process compacted it — so the caller
+	 * can rebuild from the snapshot instead of treating the index as dead.
+	 */
+	async #tail(snapshotSeq = this.indexSeq): Promise<"ok" | "truncated"> {
 		let data: Buffer;
 		try {
 			const handle = await fs.open(logFor(this.#agentDir), "r");
 			try {
 				const stat = await handle.stat();
-				if (stat.size < this.#logOffset) {
-					this.#warnings.push("Session index log was truncated");
-					return;
-				}
+				if (stat.size < this.#logOffset) return "truncated";
 				data = Buffer.alloc(stat.size - this.#logOffset);
 				if (data.length) await handle.read(data, 0, data.length, this.#logOffset);
 			} finally {
 				await handle.close();
 			}
 		} catch (e) {
-			if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+			if ((e as NodeJS.ErrnoException).code === "ENOENT") return "ok";
 			throw e;
 		}
 		const lastNewline = data.lastIndexOf(0x0a);
-		if (lastNewline < 0) return;
+		if (lastNewline < 0) return "ok";
 		const consumed = data.subarray(0, lastNewline + 1);
 		this.#logOffset += consumed.length;
 		for (const line of consumed.toString("utf8").split("\n")) {
@@ -144,19 +176,20 @@ export class SessionIndex {
 			} catch (error) {
 				if (error instanceof UnsupportedStateVersionError) throw error;
 				this.#warnings.push("Corrupt session index entry; replay truncated");
-				return;
+				return "ok";
 			}
 			if (event.indexSeq <= snapshotSeq) continue;
 			const { checksum, ...unsigned } = event;
 			if (checksum !== sessionIndexChecksum(unsigned) || event.indexSeq !== this.indexSeq + 1) {
 				this.#warnings.push("Corrupt session index entry; replay truncated");
-				return;
+				return "ok";
 			}
 			this.#events.push(event);
 		}
+		return "ok";
 	}
 	async refresh(): Promise<void> {
-		await this.#tail();
+		if ((await this.#tail()) === "truncated") await this.replay();
 	}
 	get indexSeq(): number {
 		return this.#events.at(-1)?.indexSeq ?? 0;
@@ -177,8 +210,25 @@ export class SessionIndex {
 			const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 			await appendSync(logFor(this.#agentDir), JSON.stringify(event));
 			await this.refresh();
+			await this.#compactIfOversized();
 			return event;
 		});
+	}
+	/**
+	 * Compact the shared log while holding the append lock: prune superseded
+	 * heartbeat rows from memory, persist the pruned state as the snapshot, then
+	 * truncate the log. Snapshot-then-truncate ordering means a crash between the
+	 * two steps only leaves redundant log rows (skipped on replay as
+	 * `indexSeq <= snapshotSeq`), never lost events. Other processes observe the
+	 * shrunken log as `"truncated"` in {@link refresh} and rebuild from the
+	 * snapshot.
+	 */
+	async #compactIfOversized(): Promise<void> {
+		if (this.#logOffset < this.#compactLogBytes) return;
+		this.#events = pruneSupersededHeartbeats(this.#events);
+		await this.snapshot();
+		await fs.truncate(logFor(this.#agentDir), 0);
+		this.#logOffset = 0;
 	}
 	async snapshot(): Promise<void> {
 		const file = snapshotFor(this.#agentDir);
