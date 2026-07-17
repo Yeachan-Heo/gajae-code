@@ -221,6 +221,7 @@ function createContext(): {
 		handleHotkeysCommand: vi.fn(),
 		handleSTTToggle: vi.fn(),
 		handleSTTEscape: vi.fn(() => false),
+		handleSTTSubmit: vi.fn(() => false),
 		handleBtwEscape,
 		handleBtwCommand,
 		hasActiveBtw,

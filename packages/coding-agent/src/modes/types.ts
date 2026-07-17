@@ -346,6 +346,7 @@ export interface InteractiveModeContext {
 	hasActiveBtw(): boolean;
 	handleBtwEscape(): boolean;
 	handleSTTEscape(): boolean;
+	handleSTTSubmit(typedText: string): boolean;
 	cycleThinkingLevel(): void;
 	cycleRoleModel(options?: { temporary?: boolean }): Promise<void>;
 	toggleToolOutputExpansion(): void;

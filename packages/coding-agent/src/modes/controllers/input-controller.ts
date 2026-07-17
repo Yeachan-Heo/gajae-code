@@ -739,7 +739,12 @@ export class InputController {
 	}
 
 	setupEditorSubmitHandler(): void {
-		this.ctx.editor.onSubmit = text => this.submitText(text, { ownsComposer: true, editor: this.ctx.editor });
+		this.ctx.editor.onSubmit = text => {
+			// Enter during an active voice session finalizes the transcript and
+			// submits it in one stroke (dictate → Enter → sent).
+			if (this.ctx.handleSTTSubmit(text)) return;
+			return this.submitText(text, { ownsComposer: true, editor: this.ctx.editor });
+		};
 	}
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
